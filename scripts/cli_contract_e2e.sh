@@ -181,6 +181,39 @@ rg -q --fixed-strings 'codex-info: recorder skipped an unsafe input cycle' \
 wait "$lock_holder_pid"
 lock_holder_pid=""
 
+# Health alone accepted the old installed daemon while the Windows client
+# correctly rejected status/details without an atomic generation identity.
+# Exercise the actual public wire boundary and require one matching canonical
+# pair header on both documents.
+status_headers="$tmp_root/status.headers"
+details_headers="$tmp_root/details.headers"
+curl --fail --silent --max-time 3 -D "$status_headers" -o "$tmp_root/status.json" \
+    "http://127.0.0.1:$port/v1/status" \
+    || fail 'status document was not available'
+curl --fail --silent --max-time 3 -D "$details_headers" -o "$tmp_root/details.json" \
+    "http://127.0.0.1:$port/v1/details" \
+    || fail 'details document was not available'
+read_pair_header() {
+    local headers="$1" values
+    values="$(awk 'BEGIN { IGNORECASE=1 } /^Codex-Info-Published-Pair:[[:space:]]*/ {
+        sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print
+    }' "$headers")"
+    [[ "$(wc -l <<<"$values")" -eq 1 ]] \
+        || fail "published pair header must appear exactly once: $headers"
+    rg -q '^v1:[0-9a-f]{64}$' <<<"$values" \
+        || fail "published pair header is not canonical: $headers"
+    printf '%s' "$values"
+}
+status_pair="$(read_pair_header "$status_headers")"
+details_pair="$(read_pair_header "$details_headers")"
+[[ "$status_pair" == "$details_pair" ]] \
+    || fail 'status/details published pair headers differ'
+jq -e '.api_version == "v1"' "$tmp_root/status.json" >/dev/null \
+    || fail 'status body is not REST v1'
+jq -e '.api_version == "v1"' "$tmp_root/details.json" >/dev/null \
+    || fail 'details body is not REST v1'
+
+database="$data_root/history/usage_history.sqlite3"
 [[ -f "$database" ]] || fail 'history database was not created'
 logical_database_sha256() {
     sqlite3 -batch -bail -cmd '.timeout 2000' "$1" .dump \
@@ -253,4 +286,4 @@ done
 wait "$sentinel_pid"
 sentinel_pid=""
 
-printf 'cli-contract-e2e: PASS (help aliases/i18n, finite rejection, loopback port, verified stop, idempotence, data preservation, invalid-lock fail-closed)\n'
+printf 'cli-contract-e2e: PASS (help aliases/i18n, finite rejection, loopback port, atomic REST pair, verified stop, idempotence, data preservation, invalid-lock fail-closed)\n'

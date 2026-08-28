@@ -1774,6 +1774,78 @@ fn merge_exact_sample(samples: &mut Vec<UsageHistorySample>, incoming: UsageHist
     }
 }
 
+/// Merge all observations for one canonical reset period into one sample per
+/// collector minute.  The same-timestamp rules are shared by graph selection
+/// and the public history payload so canonical reset IDs cannot create REST
+/// duplicate keys while changing the quota semantics.
+fn merge_samples_by_timestamp(
+    mut samples: Vec<UsageHistorySample>,
+    canonical_reset_at: i64,
+) -> Vec<UsageHistorySample> {
+    samples.sort_by_key(|sample| (sample.timestamp, sample.reset_at));
+    let mut merged: Vec<UsageHistorySample> = Vec::with_capacity(samples.len());
+    let mut index = 0;
+    while index < samples.len() {
+        let timestamp = samples[index].timestamp;
+        let mut rows = Vec::new();
+        while index < samples.len() && samples[index].timestamp == timestamp {
+            rows.push(samples[index].clone());
+            index += 1;
+        }
+        let mut sample = rows.last().cloned().expect("timestamp group is non-empty");
+        let remaining_values = rows
+            .iter()
+            .filter(|row| row.remaining_percent >= 0.0)
+            .map(|row| row.remaining_percent)
+            .collect::<Vec<_>>();
+        let conflicting_remaining = remaining_values
+            .windows(2)
+            .any(|values| (values[0] - values[1]).abs() > f64::EPSILON);
+        let reset_span = rows
+            .iter()
+            .map(|row| row.reset_at)
+            .min()
+            .unwrap_or(sample.reset_at)
+            .abs_diff(
+                rows.iter()
+                    .map(|row| row.reset_at)
+                    .max()
+                    .unwrap_or(sample.reset_at),
+            );
+        // Preserve the historical jitter contract (a few-second drift keeps
+        // the latest value), but fail closed for a same-ID conflict, a real
+        // reset-id disagreement, or any quota-only collision. In particular
+        // this prevents a moving-reset row with no model usage from
+        // overwriting a spend observation with an unrelated quota value.
+        let has_quota_only_row = rows.iter().any(|row| {
+            row.sol_dollars == 0.0
+                && row.terra_dollars == 0.0
+                && row.luna_dollars == 0.0
+                && row.sol_tokens == 0
+                && row.terra_tokens == 0
+                && row.luna_tokens == 0
+        });
+        if conflicting_remaining
+            && (reset_span == 0
+                || reset_span > SAME_TIMESTAMP_RESET_JITTER_SECONDS as u64
+                || has_quota_only_row)
+        {
+            sample.remaining_percent = -1.0;
+        } else if let Some(remaining) = remaining_values.last().copied() {
+            sample.remaining_percent = remaining;
+        }
+        sample.reset_at = canonical_reset_at;
+        sample.sol_dollars = rows.iter().map(|row| row.sol_dollars).fold(0.0, f64::max);
+        sample.terra_dollars = rows.iter().map(|row| row.terra_dollars).fold(0.0, f64::max);
+        sample.luna_dollars = rows.iter().map(|row| row.luna_dollars).fold(0.0, f64::max);
+        sample.sol_tokens = rows.iter().map(|row| row.sol_tokens).max().unwrap_or(0);
+        sample.terra_tokens = rows.iter().map(|row| row.terra_tokens).max().unwrap_or(0);
+        sample.luna_tokens = rows.iter().map(|row| row.luna_tokens).max().unwrap_or(0);
+        merged.push(sample);
+    }
+    merged
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HistoryPeriod {
     canonical_reset_at: i64,
@@ -2694,84 +2766,26 @@ impl UsageHistory {
         let Some(canonical_reset_at) = canonical_reset_at else {
             return Vec::new();
         };
-        let mut selected = reset_sample_groups(&self.samples)
+        let selected = reset_sample_groups(&self.samples)
             .into_iter()
             .find(|group| group.canonical_reset_at == canonical_reset_at)
             .map(|group| group.samples)
             .unwrap_or_default();
-        selected.sort_by_key(|sample| (sample.timestamp, sample.reset_at));
-        let mut merged: Vec<UsageHistorySample> = Vec::with_capacity(selected.len());
-        let mut index = 0;
-        while index < selected.len() {
-            let timestamp = selected[index].timestamp;
-            let mut rows = Vec::new();
-            while index < selected.len() && selected[index].timestamp == timestamp {
-                rows.push(selected[index].clone());
-                index += 1;
-            }
-            let mut sample = rows.last().cloned().expect("timestamp group is non-empty");
-            let remaining_values = rows
-                .iter()
-                .filter(|row| row.remaining_percent >= 0.0)
-                .map(|row| row.remaining_percent)
-                .collect::<Vec<_>>();
-            let conflicting_remaining = remaining_values
-                .windows(2)
-                .any(|values| (values[0] - values[1]).abs() > f64::EPSILON);
-            let reset_span = rows
-                .iter()
-                .map(|row| row.reset_at)
-                .min()
-                .unwrap_or(sample.reset_at)
-                .abs_diff(
-                    rows.iter()
-                        .map(|row| row.reset_at)
-                        .max()
-                        .unwrap_or(sample.reset_at),
-                );
-            // Preserve the historical jitter contract (a few-second drift
-            // keeps the latest value), but fail closed for a same-ID conflict,
-            // a real reset-id disagreement, or any quota-only collision.  In
-            // particular this prevents a 30/60-second moving-reset row with
-            // no model usage from overwriting an 88% spend observation with
-            // 14%.
-            let has_quota_only_row = rows.iter().any(|row| {
-                row.sol_dollars == 0.0
-                    && row.terra_dollars == 0.0
-                    && row.luna_dollars == 0.0
-                    && row.sol_tokens == 0
-                    && row.terra_tokens == 0
-                    && row.luna_tokens == 0
-            });
-            if conflicting_remaining
-                && (reset_span == 0
-                    || reset_span > SAME_TIMESTAMP_RESET_JITTER_SECONDS as u64
-                    || has_quota_only_row)
-            {
-                sample.remaining_percent = -1.0;
-            } else if let Some(remaining) = remaining_values.last().copied() {
-                sample.remaining_percent = remaining;
-            }
-            sample.reset_at = canonical_reset_at;
-            sample.sol_dollars = rows.iter().map(|row| row.sol_dollars).fold(0.0, f64::max);
-            sample.terra_dollars = rows.iter().map(|row| row.terra_dollars).fold(0.0, f64::max);
-            sample.luna_dollars = rows.iter().map(|row| row.luna_dollars).fold(0.0, f64::max);
-            sample.sol_tokens = rows.iter().map(|row| row.sol_tokens).max().unwrap_or(0);
-            sample.terra_tokens = rows.iter().map(|row| row.terra_tokens).max().unwrap_or(0);
-            sample.luna_tokens = rows.iter().map(|row| row.luna_tokens).max().unwrap_or(0);
-            merged.push(sample);
-        }
-        merged
+        merge_samples_by_timestamp(selected, canonical_reset_at)
     }
 
     fn canonical_samples(&self) -> Vec<UsageHistorySample> {
-        reset_sample_groups(&self.samples)
+        let mut samples_by_reset = BTreeMap::<i64, Vec<UsageHistorySample>>::new();
+        for group in reset_sample_groups(&self.samples) {
+            samples_by_reset
+                .entry(group.canonical_reset_at)
+                .or_default()
+                .extend(group.samples);
+        }
+        samples_by_reset
             .into_iter()
-            .flat_map(|group| {
-                group.samples.into_iter().map(move |mut sample| {
-                    sample.reset_at = group.canonical_reset_at;
-                    sample
-                })
+            .flat_map(|(canonical_reset_at, samples)| {
+                merge_samples_by_timestamp(samples, canonical_reset_at)
             })
             .collect()
     }
@@ -14320,6 +14334,167 @@ mod tests {
         assert_eq!(displayed[0].reset_at, 1_700_100_003);
         assert_eq!(displayed[0].remaining_percent, 75.0);
         assert_eq!(displayed[0].sol_dollars, 4.0);
+    }
+
+    #[test]
+    fn canonical_samples_merge_missing_and_observed_quota_for_reset_jitter() {
+        let timestamp = 1_788_452_760;
+        let reset_at = 1_788_452_795;
+        let history = UsageHistory {
+            samples: vec![
+                UsageHistorySample {
+                    timestamp,
+                    reset_at: 1_788_452_794,
+                    remaining_percent: -1.0,
+                    sol_dollars: 4.0,
+                    terra_dollars: 0.0,
+                    luna_dollars: 0.0,
+                    sol_tokens: 40,
+                    terra_tokens: 0,
+                    luna_tokens: 0,
+                },
+                UsageHistorySample {
+                    timestamp,
+                    reset_at: 1_788_452_795,
+                    remaining_percent: 84.0,
+                    sol_dollars: 4.0,
+                    terra_dollars: 0.0,
+                    luna_dollars: 0.0,
+                    sol_tokens: 40,
+                    terra_tokens: 0,
+                    luna_tokens: 0,
+                },
+            ],
+            ..UsageHistory::default()
+        };
+
+        let canonical = history.canonical_samples();
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].timestamp, timestamp);
+        assert_eq!(canonical[0].reset_at, reset_at);
+        assert_eq!(canonical[0].remaining_percent, 84.0);
+        assert_eq!(canonical[0].sol_dollars, 4.0);
+        assert_eq!(canonical[0].sol_tokens, 40);
+
+        // The regression was user-visible only at the REST publication
+        // boundary: the graph-side merge passed while the public candidate
+        // was rejected and Windows remained empty.  Exercise the same
+        // authenticated state through the atomic publisher as well.
+        let mut state = CodexInfoState::preview("normal");
+        state.reset_at = Some(reset_at);
+        state.window_seconds = WEEK_SECONDS;
+        state.last_success_at = Some(timestamp + 60);
+        state.history = history;
+        let details = state.public_details_at(timestamp + 60);
+        assert_eq!(details.history_samples.len(), 1);
+        assert_eq!(details.history_samples[0].remaining_percent, Some(84.0));
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        server.publisher().publish_details(details).unwrap();
+        server.shutdown();
+    }
+
+    #[test]
+    fn canonical_samples_keep_conflicting_same_timestamp_quota_missing() {
+        let timestamp = 1_700_000_000;
+        let reset_at = 1_700_100_000;
+        let history = UsageHistory {
+            samples: vec![
+                UsageHistorySample {
+                    timestamp,
+                    reset_at,
+                    remaining_percent: 97.0,
+                    sol_dollars: 1.0,
+                    terra_dollars: 0.0,
+                    luna_dollars: 0.0,
+                    sol_tokens: 10,
+                    terra_tokens: 0,
+                    luna_tokens: 0,
+                },
+                UsageHistorySample {
+                    timestamp,
+                    reset_at: reset_at + 12,
+                    remaining_percent: 98.0,
+                    sol_dollars: 2.0,
+                    terra_dollars: 0.0,
+                    luna_dollars: 0.0,
+                    sol_tokens: 20,
+                    terra_tokens: 0,
+                    luna_tokens: 0,
+                },
+            ],
+            ..UsageHistory::default()
+        };
+
+        let canonical = history.canonical_samples();
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].remaining_percent, -1.0);
+        assert_eq!(canonical[0].sol_dollars, 2.0);
+        assert_eq!(canonical[0].sol_tokens, 20);
+    }
+
+    #[test]
+    fn canonical_samples_have_unique_reset_timestamp_keys() {
+        let timestamp = 1_700_000_000;
+        let first_reset = 1_700_100_000;
+        let second_reset = first_reset + WEEK_SECONDS;
+        let history = UsageHistory {
+            samples: vec![
+                UsageHistorySample {
+                    timestamp,
+                    reset_at: first_reset,
+                    remaining_percent: -1.0,
+                    sol_dollars: 1.0,
+                    terra_dollars: 0.0,
+                    luna_dollars: 0.0,
+                    sol_tokens: 10,
+                    terra_tokens: 0,
+                    luna_tokens: 0,
+                },
+                UsageHistorySample {
+                    timestamp,
+                    reset_at: first_reset + 1,
+                    remaining_percent: 84.0,
+                    sol_dollars: 1.0,
+                    terra_dollars: 0.0,
+                    luna_dollars: 0.0,
+                    sol_tokens: 10,
+                    terra_tokens: 0,
+                    luna_tokens: 0,
+                },
+                UsageHistorySample {
+                    timestamp: timestamp + 60,
+                    reset_at: second_reset,
+                    remaining_percent: -1.0,
+                    sol_dollars: 3.0,
+                    terra_dollars: 0.0,
+                    luna_dollars: 0.0,
+                    sol_tokens: 30,
+                    terra_tokens: 0,
+                    luna_tokens: 0,
+                },
+                UsageHistorySample {
+                    timestamp: timestamp + 60,
+                    reset_at: second_reset + 1,
+                    remaining_percent: 72.0,
+                    sol_dollars: 3.0,
+                    terra_dollars: 0.0,
+                    luna_dollars: 0.0,
+                    sol_tokens: 30,
+                    terra_tokens: 0,
+                    luna_tokens: 0,
+                },
+            ],
+            ..UsageHistory::default()
+        };
+
+        let canonical = history.canonical_samples();
+        let keys = canonical
+            .iter()
+            .map(|sample| (sample.reset_at, sample.timestamp))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(keys.len(), canonical.len());
     }
 
     #[test]
