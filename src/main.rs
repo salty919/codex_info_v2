@@ -2249,6 +2249,69 @@ fn current_history_period_reset(
         .map(|period| period.canonical_reset_at)
 }
 
+/// Build the shared presentation/publication view without mutating retained
+/// history.  A moving full-quota observation whose reset horizon advances
+/// with its acquisition minute is not a sample from the later authoritative
+/// cycle when it precedes that cycle's start.  Remove only that already-known
+/// acquisition shape from the current group; any lower/non-zero/ambiguous row
+/// remains so the existing authoritative-bounds and REST validation gates can
+/// fail closed.
+fn authoritative_history_projection_samples(
+    samples: &[UsageHistorySample],
+    current_reset_at: Option<i64>,
+    window_seconds: i64,
+) -> Vec<UsageHistorySample> {
+    let Some(current_reset_at) = current_reset_at else {
+        return samples.to_vec();
+    };
+    let groups = reset_sample_groups(samples);
+    let Some(current_group) = groups.iter().find(|group| {
+        current_reset_at.abs_diff(group.canonical_reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
+    }) else {
+        return samples.to_vec();
+    };
+    let Some(authoritative_start) = (window_seconds > 0)
+        .then(|| current_group.canonical_reset_at.checked_sub(window_seconds))
+        .flatten()
+        .and_then(minute_start)
+    else {
+        return samples.to_vec();
+    };
+
+    let valid_refs = samples
+        .iter()
+        .filter(|sample| sample.is_valid())
+        .collect::<Vec<_>>();
+    let mut exact_reset_counts = BTreeMap::new();
+    for sample in &valid_refs {
+        *exact_reset_counts.entry(sample.reset_at).or_insert(0) += 1;
+    }
+    let excluded = current_group
+        .samples
+        .iter()
+        .filter(|sample| sample.timestamp < authoritative_start)
+        .filter(|sample| {
+            sample.sol_dollars == 0.0
+                && sample.terra_dollars == 0.0
+                && sample.luna_dollars == 0.0
+                && sample.sol_tokens == 0
+                && sample.terra_tokens == 0
+                && sample.luna_tokens == 0
+        })
+        .filter(|sample| legacy_moving_reset_artifact(sample, &valid_refs, &exact_reset_counts))
+        .map(|sample| (sample.reset_at, sample.timestamp))
+        .collect::<BTreeSet<_>>();
+    if excluded.is_empty() {
+        return samples.to_vec();
+    }
+
+    samples
+        .iter()
+        .filter(|sample| !excluded.contains(&(sample.reset_at, sample.timestamp)))
+        .cloned()
+        .collect()
+}
+
 /// Apply the authoritative quota bounds to the current raw period only.
 ///
 /// `UsageHistory` remains the owner of raw inventory and historical grouping.
@@ -5430,6 +5493,17 @@ struct CodexInfoState {
 }
 
 impl CodexInfoState {
+    fn projected_history(&self) -> UsageHistory {
+        UsageHistory {
+            samples: authoritative_history_projection_samples(
+                &self.history.samples,
+                self.reset_at,
+                self.window_seconds,
+            ),
+            ..UsageHistory::default()
+        }
+    }
+
     fn usage_ready(&self) -> bool {
         self.has_usage && !self.local_usage_pending
     }
@@ -5517,6 +5591,7 @@ impl CodexInfoState {
 
     fn public_details_at(&self, now: i64) -> PublicDetails {
         let snapshot = self.public_snapshot();
+        let projected_history = self.projected_history();
         let models = if self.authenticated && self.has_visible_usage() {
             self.model_usage
                 .iter()
@@ -5567,7 +5642,7 @@ impl CodexInfoState {
         };
 
         let mut history_samples = if self.authenticated && self.has_visible_usage() {
-            self.history
+            projected_history
                 .canonical_samples()
                 .into_iter()
                 // SQLite retains three calendar months, but one REST
@@ -6699,10 +6774,11 @@ impl CodexInfoState {
     }
 
     fn history_periods_at(&self, observed_at: i64) -> Vec<HistoryPeriod> {
-        let mut periods = self.history.periods(observed_at, self.reset_at);
+        let projected_history = self.projected_history();
+        let mut periods = projected_history.periods(observed_at, self.reset_at);
         periods = apply_authoritative_current_bounds(
             periods,
-            &self.history.samples,
+            &projected_history.samples,
             self.reset_at,
             self.window_seconds,
             observed_at,
@@ -6816,7 +6892,7 @@ impl CodexInfoState {
         let Some(reset_at) = self.selected_history_reset() else {
             return "[]".into();
         };
-        self.history.graph_data_for_reset(reset_at)
+        self.projected_history().graph_data_for_reset(reset_at)
     }
 
     fn selected_history_reset(&self) -> Option<i64> {
@@ -6999,7 +7075,9 @@ impl CodexInfoState {
         let Some(selected_reset) = self.selected_history_reset_for_periods(&periods) else {
             return GraphPaths::default();
         };
-        let samples = self.history.samples_for_reset(Some(selected_reset));
+        let samples = self
+            .projected_history()
+            .samples_for_reset(Some(selected_reset));
         let Some(period) = periods
             .iter()
             .find(|period| period.canonical_reset_at == selected_reset)
@@ -9354,10 +9432,14 @@ mod tests {
         expected_period_end: i64,
         expected_reset_at: i64,
         expected_raw_timestamps: Vec<i64>,
+        #[serde(default)]
+        expected_retained_timestamps: Vec<i64>,
         expected_graph_timestamps: Vec<i64>,
         expected_remaining: Vec<f64>,
         expected_sol_max: f64,
         expected_period_count: usize,
+        #[serde(default)]
+        moving_full_acquisition_samples: Vec<GraphFixtureHistorySample>,
         details_response: GraphFixtureDetailsResponse,
     }
 
@@ -15507,6 +15589,85 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(published_samples, expected_samples);
+    }
+
+    #[test]
+    fn weekly_reset_rollover_projects_one_current_cycle_without_mixing() {
+        let fixture: GraphFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/graph_weekly_reset_rollover.json"
+        ))
+        .expect("valid weekly reset rollover fixture");
+        let mut state = state_from_graph_fixture(&fixture);
+        state.history.samples.extend(
+            fixture
+                .moving_full_acquisition_samples
+                .iter()
+                .map(GraphFixtureHistorySample::to_usage_history_sample),
+        );
+        state.history.normalize();
+        let raw_before_projection = state.history.samples.clone();
+        assert_eq!(
+            raw_before_projection
+                .iter()
+                .map(|sample| sample.timestamp)
+                .collect::<Vec<_>>(),
+            fixture.expected_retained_timestamps
+        );
+
+        state.select_latest_history();
+        let observed_at = fixture.details_response.observed_at;
+        let graph = state.graph_paths_for_selection_at(observed_at, true, true, true, false);
+        assert_eq!(graph.current_sol_label, "$0.20");
+
+        let details = state.public_details_at(observed_at);
+        assert_eq!(details.history_periods.len(), fixture.expected_period_count);
+        let current_periods = details
+            .history_periods
+            .iter()
+            .filter(|period| period.current)
+            .collect::<Vec<_>>();
+        assert_eq!(current_periods.len(), 1);
+        assert_eq!(current_periods[0].reset_at, fixture.expected_reset_at);
+        assert_eq!(current_periods[0].start_at, fixture.expected_period_start);
+        assert_eq!(
+            details.quota.as_ref().map(|quota| quota.reset_at),
+            Some(fixture.expected_reset_at)
+        );
+        assert_eq!(
+            details
+                .history_samples
+                .iter()
+                .map(|sample| sample.timestamp)
+                .collect::<Vec<_>>(),
+            fixture.expected_raw_timestamps
+        );
+        let current_samples = details
+            .history_samples
+            .iter()
+            .filter(|sample| sample.reset_at == fixture.expected_reset_at)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            current_samples
+                .iter()
+                .map(|sample| sample.timestamp)
+                .collect::<Vec<_>>(),
+            [
+                fixture.expected_period_start,
+                fixture.expected_period_start + 60
+            ]
+        );
+        assert!(current_samples.iter().all(|sample| {
+            sample.timestamp >= fixture.expected_period_start
+                && sample.sol_dollars <= fixture.expected_sol_max
+        }));
+        assert_eq!(state.history.samples, raw_before_projection);
+
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        assert!(server.publisher().publish_details(details).is_ok());
+        assert!(server.publisher().published_pair().is_some());
+        server.shutdown();
     }
 
     #[test]

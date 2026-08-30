@@ -287,7 +287,6 @@ public sealed class GraphPlotControl : AvaPlot
 
     private void OnControlSizeChanged(object? sender, SizeChangedEventArgs change)
     {
-        var previousControlWidth = change.PreviousSize.Width;
         var currentControlWidth = change.NewSize.Width;
         if (referenceControlWidth is null &&
             double.IsFinite(currentControlWidth) && currentControlWidth > 0)
@@ -298,24 +297,25 @@ public sealed class GraphPlotControl : AvaPlot
             // completed render, even if it is first selected after a resize.
             referenceControlWidth = currentControlWidth;
         }
-        var previousDataAreaWidth = Plot.LastRender.DataRect.Width;
-        if (!double.IsFinite(previousControlWidth) || previousControlWidth <= 0 ||
-            !double.IsFinite(currentControlWidth) || currentControlWidth <= 0 ||
-            !double.IsFinite(previousDataAreaWidth) || previousDataAreaWidth <= 0)
+        if (!double.IsFinite(currentControlWidth) || currentControlWidth <= 0)
         {
             return;
         }
 
         var scene = Scene;
-        if (!scene.HasPoints || referenceControlWidth is not { } controlWidth)
+        if (!scene.HasPoints || referenceControlWidth is null)
         {
             return;
         }
-        if (!referenceDataAreaWidths.TryGetValue(scene.Metric, out var referenceDataAreaWidth))
+        if (!referenceDataAreaWidths.ContainsKey(scene.Metric))
         {
-            referenceDataAreaWidth = previousDataAreaWidth +
-                controlWidth - previousControlWidth;
-            referenceDataAreaWidths[scene.Metric] = referenceDataAreaWidth;
+            var revision = ++sceneRevision;
+            ScheduleReferenceCapture(
+                scene.Metric,
+                revision,
+                (long)Plot.RenderManager.RenderCount,
+                attemptsRemaining: 20);
+            return;
         }
         ApplyResponsiveLayout(scene);
     }

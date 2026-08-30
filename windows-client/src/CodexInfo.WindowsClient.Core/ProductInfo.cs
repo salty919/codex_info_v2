@@ -4,7 +4,7 @@
 namespace CodexInfo.WindowsClient.Core;
 
 /// <summary>
-/// Exposes the assembly version generated from Directory.Build.props.
+/// Exposes the Windows client assembly version generated from Directory.Build.props.
 /// Keeping this in Core gives every Windows surface one display owner rather
 /// than allowing individual windows to hard-code a release string.
 /// </summary>

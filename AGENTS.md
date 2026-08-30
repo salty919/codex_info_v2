@@ -20,6 +20,8 @@
 
 - Codexは、最新revisionに対する各要求と受入条件を、その条件が要求する実行環境と観測点で実際に確認した再現可能な証拠がある場合だけ`PASS`または`verified`と判定する。未実行、環境不足、権限不足、結果未取得、旧revisionだけの証拠は`未確認（INCONCLUSIVE）`とし、確認できなかったことを問題がなかったことへ読み替えてはならない。
 - localの静的検査、mock、契約test、build、実装者自身のreviewは、それぞれが直接観測した範囲だけの証拠とする。GitHub上のworkflow挙動、remote mutation、Release、実OS、実画面、外部service等をlocalで直接確認できない場合、その制約と未確認項目を明記し、local証拠で代用してはならない。
+- workflowまたはCI制御を変更する場合、localで再現可能な因果的に異なる有限経路をPR作成前に列挙し、呼出元から最終結果までを各経路の観測点で実行して全件PASSにする。未実行、`FAIL`、`INCONCLUSIVE`が1件でもある間、Actionsを試験代わりにするpush後のPR作成を禁止する。GitHubでしか観測できないevent起動、artifact転送、checkのApp identity、branch protectionだけを実PRの確認対象として残せる。
+- Actionsの基盤・制御失敗後は、その失敗を再現して旧revisionを拒否し修正revisionを受理するlocal回帰testがPASSするまで、修正版PRの作成または同一PRを再起動する更新を禁止する。静的な文字列確認や部品単体testだけで、呼出元の入力配線を含む経路確認を代用してはならない。
 - 要求または受入条件に`FAIL`、`INCONCLUSIVE`、未実行、未取得の証拠、未解決finding、未完了の依存作業が1件でもある間、Codexは作業全体を「完了」「要求達成」「全項目PASS」と報告せず、Issueを`status:review`へ進めず、closure reportを完成扱いしない。独立評価も証拠の欠落をPASSへ変更してはならない。
 - 報告では`実装済み`、`local検証済み`、`remote/実環境で検証済み`、`未確認（INCONCLUSIVE）`、`失敗（FAIL）`、`未統合`を区別する。一部だけが完了した場合は、その完了範囲と未完了範囲を同じ報告内で明示する。
 - 実環境確認にPRのmergeまたは`main`の変更が必要な場合、Codexは停止して必要な確認操作と未確認項目を報告し、ユーザー本人の操作を待つ。Release、その他の外部mutation、追加権限またはユーザー操作が必要で許可されていない場合も、許可済み範囲の終了時点で停止する。未確認の受入条件を、許可のない実環境操作で完了証拠へ変えてはならない。
