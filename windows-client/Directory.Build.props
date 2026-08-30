@@ -3,7 +3,7 @@
 <Project>
   <PropertyGroup>
     <!-- The stable Windows client release version. Keep all release metadata derived from this property. -->
-    <Version>1.0.16</Version>
+    <Version>1.0.17</Version>
     <RestorePackagesWithLockFile Condition="'$(MSBuildProjectName)' != 'CodexInfo.WindowsClient.Core'">true</RestorePackagesWithLockFile>
     <Deterministic>true</Deterministic>
   </PropertyGroup>

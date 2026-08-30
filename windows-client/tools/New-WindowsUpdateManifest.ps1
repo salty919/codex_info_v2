@@ -10,11 +10,10 @@ param(
     [Parameter(Mandatory = $true)][string]$InstallerPath,
     [string]$Version,
     [string]$OutputPath = 'artifacts/windows-installer/CodexInfo.WindowsClient.update.json',
-    [string]$Repository = 'salty919/codex_info_v2'
+    [Parameter(Mandatory = $true)][string]$Repository
 )
 
 $ErrorActionPreference = 'Stop'
-$expectedRepository = 'salty919/codex_info_v2'
 
 function Get-AuthoritativeVersion {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -60,10 +59,6 @@ elseif ($Version -ne $authoritativeVersion) {
 if ($Version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
     throw "Version must be a stable X.Y.Z value: $Version"
 }
-if ($Repository -ne $expectedRepository) {
-    throw "Repository must be the canonical release repository: $expectedRepository"
-}
-
 if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
     throw "Installer was not found: $InstallerPath"
 }
