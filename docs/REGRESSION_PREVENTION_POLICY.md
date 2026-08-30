@@ -28,19 +28,20 @@
 
 7. WINDOWS ownerが選択されたPRだけ、Windows jobがunit test、installer lifecycle、UI Automation、物理window moveを各1回実行し、main経路では成功後にSetupとmanifestのcandidateを作る。WINDOWS非選択時はjobとcandidateをskipする。共通`selected-quality`はselectedのsuccessとnon-selectedのskipだけを集約し、証拠artifact、同じtestの再実行、live rule再監査を追加しない。
 
-8. `main`向けsame-repository PRはhead branch名に依存せず、version追加前の全変更pathをDOCS・GOVERNANCE・LINUX_BACKEND・LINUX_UI・WINDOWSへ分類する。Git callerはrename/copy検出を明示して両端を同じ分類器へ渡す。選択ownerとそこから導出したCodeQL言語だけを最終headで各1回実行し、非選択ownerは実行しない。結果集約はtrusted base版gateだけを使う。Windows-onlyはWINDOWS+csharp、governance-onlyはGOVERNANCE+actions/pythonとする。workflow全体をpath filterで消さず、required `version-prepared`と`acceptance`は常に生成する。分類の二次実装、branch名allowlist、live rule再監査、全製品ownerの一律実行を追加しない。
+8. `main`向けsame-repository PRはhead branch名に依存せず、version追加前の全変更pathをDOCS・GOVERNANCE・LINUX_BACKEND・LINUX_UI・WINDOWSへ分類する。Git callerはrename/copy検出を明示して両端を同じ分類器へ渡す。選択ownerとそこから導出したCodeQL言語だけを最終headで各1回実行し、非選択ownerは実行しない。結果集約はtrusted base版gateだけを使う。Windows-onlyはWINDOWS+csharp、governance-onlyはGOVERNANCE+actions/pythonとする。workflow全体をpath filterで消さず、required `version-prepared`と`acceptance`は通常評価または生成H1 producerが最終headへ生成する。event時／開始時draft、開始時stale、正規生成H1 observerはownerを実行しない。分類の二次実装、branch名allowlist、live rule再監査、全製品ownerの一律実行を追加しない。
 
 9. 履歴比較を必要とするcheckoutは`fetch-depth: 0`を使用する。ローカルの全target testは実行件数0を許可せず、Windows testはpassed>0かつskipped=0を満たさなければならない。PRのCLI/recorder/実Windows UIは実行jobの成功を必須とし、未実行、SKIP、失敗をPASSへ変換しない。
 
 10. X先行の変更凍結を必須とする。X版の正本要件（履歴期間、未使用帯、残量とモデル使用量の独立性、定期更新の前回表示保持、thread失敗時の全体破棄）を同一revisionの`pre_pr_gate.sh`内にある全target testと実画面検査で確認するまで、PRのCI・workflow再実行を開始してはならない。X確認後にソース・仕様を1行でも変更した場合、確認結果は無効化し、単一ローカルゲートからやり直す。変更が確定した同一revisionでは、ローカル全体ゲートとCIを各1回までとし、失敗時は原因を修正してから次のrevisionで一度だけ再実行する。未確認のまま先に進めるためのworkflow再実行は禁止する。
 
-11. バイナリ影響ありでversionがbaseのH0は完全差分を1回分類し、patchを十進整数で1増やす3ファイルだけのcommitをnon-force pushして、同じrunでH1の選択jobを各1回実行する。`GITHUB_TOKEN` pushが次runを起動しないため、H1へ必要な`version-prepared`と`acceptance`だけを最終結果として作る。同じH1のeventはPR runを直列化し、H0 acceptance identityを1回取得できた場合だけowner再実行を抑止する。identityのない手動version commitとH2は評価し、byte-exactな生成3 pathだけをowner差分から除外する。merge後は生成H1 observerではH0 producer、それ以外では最新runのWindows jobがsuccessの場合だけ同runのcandidateを公開し、test/build/CodeQLを再実行しない。
+11. バイナリ影響ありでversionがbaseのH0は完全差分を1回分類し、patchを十進整数で1増やす3ファイルだけのcommitをnon-force pushして、同じrunでH1の選択jobを各1回実行する。生成commit自身へPR、H0、run ID、attemptを固定trailerとして持たせ、push後cancelでもH0/H1対応を失わない。`GITHUB_TOKEN` pushが次runを起動しないため、H1へ必要な`version-prepared`と`acceptance`だけを最終結果として作る。正規trailerを持つtipの生成H1 eventだけowner再実行を抑止する。identityのない手動version commitとH2は評価し、byte-exactな生成3 pathだけをowner差分から除外する。
+12. Releaseはmerged `closed`とMain Quality completedの両順序を扱う。current final headを評価した全non-observer attemptの1件でも失敗した場合はsame-headの後続successで上書きせず、新headまで公開しない。Windows skippedはcandidate 0、Windows successはown-run candidate exact 1とし、欠落・期限切れ・複数・identity不一致で旧artifactへfallbackしない。公開jobだけをversion tag単位で直列化し、lock取得後の完全不存在だけを作成、完全一致publishedだけをno-opとする。不完全状態を自動修復せず、test/build/CodeQLを再実行しない。
 
-12. PR由来codeをwrite tokenのあるjobでcheckoutまたは実行しない。変更分類器はtrusted baseの単一実装を使用し、eventのbase/head Git object差分を分類する。採番jobはPR headをdataとして読むだけにし、non-fast-forward拒否をrace境界とする。H1 check作成jobとpost-merge jobもsourceをcheckoutしない。post-mergeは最新runとWindows job状態を使い、PR fileを再分類しない。分類失敗、selected job失敗、version未準備はmerge不可とする。
+13. PR由来codeをwrite tokenのあるjobでcheckoutまたは実行しない。変更分類器はtrusted baseの単一実装を使用し、eventのbase/head Git object差分を分類する。採番jobはPR headをdataとして読むだけにし、non-fast-forward拒否をrace境界とする。H1 check作成jobとpost-merge jobもsourceをcheckoutしない。post-mergeはfinal headの評価attempt集合とWindows job状態を使い、PR fileを再分類しない。分類失敗、selected job失敗、version未準備はmerge不可とする。
 
-13. Codex code reviewは変更が確定したPR最新headへ`@codex review`を1回だけ投稿して起動する。新commit後は旧headのreviewを根拠にせず、non-outdatedかつ未解決のP0/P1がある間はready/releaseをHOLDする。Codex用の独自API key workflowやrequired statusを追加せず、CodeQL、required acceptance、必要な承認の代替にしない。
+14. Codex code reviewは変更が確定したPR最新headへ`@codex review`を1回だけ投稿して起動する。新commit後は旧headのreviewを根拠にせず、non-outdatedかつ未解決のP0/P1がある間はready/releaseをHOLDする。Codex用の独自API key workflowやrequired statusを追加せず、CodeQL、required acceptance、必要な承認の代替にしない。
 
-14. workflow変更は、owner全31組合せ、rename/delete/unknown/空差分、selected異常、binary false/base/H0→H1 observer/H1→H2/手動version/inconsistent/head race、生成H1 checkの成功・異常、Releaseのclosed・Windows skip/success・observer・後続run失敗・candidate欠落をローカルの有限fixtureで先に確認する。このfixtureを通常のowner品質DAGへ追加せず、同じrevision・外部前提のActionsを再実行しない。実PRではevent起動、required checkのApp identity、artifact受渡しだけを確認する。
+15. workflow変更は、owner全31組合せ、rename/delete/unknown/空差分、selected異常、binary false/base/H0→H1 observer/H1→H2/手動version/inconsistent/head race、生成H1 checkの成功・異常、event-draft/staleのjob開始前cancelとcurrent-draft/closedの完了observer、H0 push前後cancel、same-head failure後success、両event順序、Windows skip/success、candidate欠落・期限切れ・複数、同tag二信号、orphan/Draft/partial/mismatchをローカルの有限fixtureで先に確認する。このfixtureを通常のowner品質DAGへ追加せず、同じrevision・外部前提のActionsを再実行しない。実PRではevent起動、required checkのApp identity、artifact受渡し、tag/Release終端だけを確認する。予期しないActions失敗ではmatrixを停止し、Issueへ原因、過剰確認の有無、再発防止を記録して新revisionへ戻る。
 
 ## 回帰発生時
 

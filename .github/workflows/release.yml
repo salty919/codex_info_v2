@@ -7,146 +7,933 @@ on:
   pull_request_target:
     branches: ["main"]
     types: [closed]
+  workflow_run:
+    workflows: ["Main PR quality"]
+    types: [completed]
 
-permissions:
-  contents: read
-
-concurrency:
-  group: release-windows-client-main
-  cancel-in-progress: false
+permissions: {}
 
 jobs:
-  release:
-    if: github.event.pull_request.merged == true
+  resolve:
+    name: Resolve final-head release authority
     runs-on: ubuntu-latest
     permissions:
       actions: read
-      checks: read
-      contents: write
+      contents: read
+      pull-requests: read
+    outputs:
+      publish: ${{ steps.resolve.outputs.publish }}
+      fingerprint: ${{ steps.resolve.outputs.fingerprint }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+      final_head: ${{ steps.resolve.outputs.final_head }}
+      merge_sha: ${{ steps.resolve.outputs.merge_sha }}
+      run_id: ${{ steps.resolve.outputs.run_id }}
+      run_number: ${{ steps.resolve.outputs.run_number }}
+      run_attempt: ${{ steps.resolve.outputs.run_attempt }}
+      artifact_id: ${{ steps.resolve.outputs.artifact_id }}
+      artifact_name: ${{ steps.resolve.outputs.artifact_name }}
+      artifact_digest: ${{ steps.resolve.outputs.artifact_digest }}
     steps:
-      - name: Resolve the successful final-head quality run
-        id: quality
+      - name: Resolve the immutable publication snapshot
+        id: resolve
         env:
+          EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ github.token }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          external_prefix="codex-main-quality:pr=$PR_NUMBER:head=$HEAD_SHA:run="
-          checks="$(gh api -H 'Accept: application/vnd.github+json' \
-            "repos/$REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=acceptance&filter=latest&per_page=100")"
-          runs="$(gh api \
-            "repos/$REPOSITORY/actions/workflows/version-prepare.yml/runs?event=pull_request_target&head_sha=$HEAD_SHA&per_page=100")"
-          mapfile -t external_ids < <(
-            jq -r --arg prefix "$external_prefix" '
-              .check_runs[] |
-              .external_id? as $external |
-              select(($external | type) == "string" and ($external | startswith($prefix))) |
-              ($external | ltrimstr($prefix)) |
-              select(test("^[1-9][0-9]*$"))
-            ' <<<"$checks" | sort -n -u
-          )
-          mapfile -t direct_ids < <(
-            jq -r --arg head "$HEAD_SHA" '
-              .workflow_runs[] |
-              select(.path == ".github/workflows/version-prepare.yml") |
-              select(.event == "pull_request_target" and .head_sha == $head) |
-              .id
-            ' <<<"$runs" | sort -n -u
-          )
-          external_id=''
-          direct_id=''
-          [[ "${#external_ids[@]}" -eq 0 ]] || external_id="${external_ids[-1]}"
-          [[ "${#direct_ids[@]}" -eq 0 ]] || direct_id="${direct_ids[-1]}"
-          [[ -n "$external_id" || -n "$direct_id" ]] || {
-            echo 'no quality run owns the merged PR head' >&2
-            exit 1
+
+          workflow_path='.github/workflows/version-prepare.yml'
+          title_prefix='codex-main-quality-v1:'
+          title_re='^codex-main-quality-v1:pr=(?<pr>[1-9][0-9]*):event_head=(?<event_head>[0-9a-f]{40}):action=(?<action>opened|synchronize|reopened|ready_for_review):draft=(?<draft>true|false)$'
+          candidate_prefix='release-candidate-v1-'
+          candidate_re='^release-candidate-v1-pr-(?<pr>[1-9][0-9]*)-head-(?<head>[0-9a-f]{40})-run-(?<run_id>[1-9][0-9]*)-attempt-(?<attempt>[1-9][0-9]*)-version-(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$'
+          generated_re='^chore: prepare version (?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))\n\nCodex-Version-Prepare-Schema: v1\nCodex-Version-Prepare-PR: (?<pr>[1-9][0-9]*)\nCodex-Version-Prepare-Event-Head: (?<event_head>[0-9a-f]{40})\nCodex-Version-Prepare-Run-ID: (?<run_id>[1-9][0-9]*)\nCodex-Version-Prepare-Run-Attempt: (?<attempt>[1-9][0-9]*)$'
+          draft_observer='Observe non-authoritative PR event'
+          windows_wrapper='Run selected quality owners / windows-quality'
+          windows_leaf='Run selected quality owners / windows-quality / windows-quality'
+
+          api() {
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "$@"
+          }
+          object_pages() {
+            api --paginate --slurp "$1" |
+              jq -ce --arg member "$2" '
+                if type == "array" and length > 0 and
+                   all(.[]; type == "object" and (.[$member] | type) == "array" and
+                       (.total_count | type) == "number" and .total_count >= 0 and
+                       (.total_count | floor) == .total_count)
+                then [.[] | .[$member][]] as $items |
+                     [.[].total_count] | unique as $totals |
+                     if ($totals | length) == 1 and $totals[0] == ($items | length)
+                     then $items
+                     else error("incomplete paginated response for " + $member)
+                     end
+                else error("malformed paginated response for " + $member)
+                end
+              '
+          }
+          validate_run() {
+            jq -e \
+              --arg repository "$REPOSITORY" \
+              --arg path "$workflow_path" \
+              --argjson id "$2" \
+              --argjson number "$3" \
+              --argjson attempt "$4" '
+                type == "object" and .id == $id and
+                .run_number == $number and .run_attempt == $attempt and
+                (.path | type) == "string" and ((.path | split("@")[0]) == $path) and
+                .event == "pull_request_target" and .repository.full_name == $repository and
+                (.display_title | type) == "string" and (.status | type) == "string" and
+                ((.conclusion == null) or ((.conclusion | type) == "string"))
+              ' <<<"$1" >/dev/null
+          }
+          parse_title() {
+            jq -Rce --arg re "$title_re" 'capture($re)' <<<"$1"
+          }
+          union_signal_run() {
+            local all="$1" signal="$2" signal_id="$3" matches count listed
+            local listed_number listed_attempt
+            matches="$(jq -ce --argjson id "$signal_id" \
+              '[.[] | select(.id == $id)]' <<<"$all")"
+            count="$(jq 'length' <<<"$matches")"
+            if [[ "$count" -eq 0 ]]; then
+              jq -ce --argjson signal "$signal" '. + [$signal]' <<<"$all"
+              return
+            fi
+            [[ "$count" -eq 1 ]]
+            listed="$(jq -c '.[0]' <<<"$matches")"
+            listed_number="$(jq -er '.run_number | select(type == "number" and . > 0)' \
+              <<<"$listed")"
+            listed_attempt="$(jq -er '.run_attempt | select(type == "number" and . > 0)' \
+              <<<"$listed")"
+            validate_run "$listed" "$signal_id" "$listed_number" "$listed_attempt"
+            jq -e --argjson signal "$signal" '
+              {id,run_number,run_attempt,event,
+               repository:.repository.full_name,display_title,status,conclusion} ==
+              ($signal | {id,run_number,run_attempt,event,
+                           repository:.repository.full_name,display_title,status,conclusion})
+            ' <<<"$listed" >/dev/null
+            printf '%s\n' "$all"
+          }
+          fetch_jobs() {
+            object_pages \
+              "repos/$REPOSITORY/actions/runs/$1/attempts/$2/jobs?filter=all&per_page=100" \
+              jobs
+          }
+          fetch_candidates() {
+            local run_id="$1" artifacts
+            artifacts="$(
+              object_pages \
+                "repos/$REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" \
+                artifacts
+            )"
+            jq -ce \
+              --arg prefix "$candidate_prefix" --arg re "$candidate_re" \
+              --arg pr "$pr_number" --arg head "$final_head" --arg run "$run_id" '
+                [ .[] |
+                  select((.name | type) == "string" and (.name | startswith($prefix))) |
+                  . as $artifact |
+                  (try (.name | capture($re))
+                   catch error("malformed release candidate name")) as $identity |
+                  if $identity.pr != $pr or $identity.head != $head or
+                     $identity.run_id != $run
+                  then error("release candidate has the wrong PR/head/run identity")
+                  elif ($artifact.id | type) != "number" or $artifact.id <= 0 or
+                       ($artifact.expired | type) != "boolean"
+                  then error("release candidate metadata is malformed")
+                  else {
+                    id: $artifact.id,
+                    name: $artifact.name,
+                    digest: $artifact.digest,
+                    expired: $artifact.expired,
+                    attempt: ($identity.attempt | tonumber),
+                    version: $identity.version
+                  }
+                  end
+                ]
+              ' <<<"$artifacts"
+          }
+          run_candidates() {
+            local run_id="$1" cache="$RUNNER_TEMP/release-candidates-$1.json"
+            if [[ ! -f "$cache" ]]; then
+              fetch_candidates "$run_id" >"$cache"
+            fi
+            cat "$cache"
           }
 
-          # A successful generated-H1 observer deliberately runs no owners. It
-          # cannot replace the H0 producer identified by the final-head check.
-          observer=false
-          if [[ -n "$direct_id" ]]; then
-            direct_run="$(gh api "repos/$REPOSITORY/actions/runs/$direct_id")"
-            direct_jobs="$(gh api "repos/$REPOSITORY/actions/runs/$direct_id/jobs?filter=latest&per_page=100")"
-            if jq -e --argjson id "$direct_id" --arg head "$HEAD_SHA" '
-                 select(.id == $id and
-                        .path == ".github/workflows/version-prepare.yml" and
-                        .event == "pull_request_target" and
-                        .head_sha == $head and
-                        .conclusion == "success")
-               ' <<<"$direct_run" >/dev/null &&
-               jq -e '
-                 [.jobs[] | select(.name == "Observe generated H1" and .conclusion == "success")] |
-                 length == 1
-               ' <<<"$direct_jobs" >/dev/null; then
-              observer=true
+          case "$EVENT_NAME" in
+            workflow_run)
+              signal="$(jq -ce '.workflow_run' "$GITHUB_EVENT_PATH")"
+              signal_id="$(jq -er '.id | select(type == "number" and . > 0)' <<<"$signal")"
+              signal_number="$(jq -er '.run_number | select(type == "number" and . > 0)' <<<"$signal")"
+              signal_attempt="$(jq -er '.run_attempt | select(type == "number" and . > 0)' <<<"$signal")"
+              validate_run "$signal" "$signal_id" "$signal_number" "$signal_attempt"
+              jq -e '.status == "completed"' <<<"$signal" >/dev/null
+              if [[ "$(jq -r '.conclusion' <<<"$signal")" != success ]]; then
+                printf 'publish=false\n' >>"$GITHUB_OUTPUT"
+                exit 0
+              fi
+              signal_title="$(jq -r '.display_title' <<<"$signal")"
+              if [[ "$signal_title" != "$title_prefix"* ]]; then
+                printf 'publish=false\n' >>"$GITHUB_OUTPUT"
+                exit 0
+              fi
+              pr_number="$(parse_title "$signal_title" | jq -r '.pr')"
+              ;;
+            pull_request_target)
+              jq -e '
+                .action == "closed" and
+                (.pull_request.number | type) == "number" and .pull_request.number > 0 and
+                .pull_request.base.ref == "main"
+              ' "$GITHUB_EVENT_PATH" >/dev/null
+              if ! jq -e '.pull_request.merged == true' "$GITHUB_EVENT_PATH" >/dev/null; then
+                printf 'publish=false\n' >>"$GITHUB_OUTPUT"
+                exit 0
+              fi
+              pr_number="$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")"
+              ;;
+            *)
+              echo "unexpected release signal: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          pr="$(api "repos/$REPOSITORY/pulls/$pr_number")"
+          jq -e --arg repo "$REPOSITORY" --argjson number "$pr_number" '
+            type == "object" and .number == $number and
+            .base.ref == "main" and .base.repo.full_name == $repo and
+            .head.repo.full_name == $repo and
+            (.head.ref | type) == "string" and (.head.ref | length) > 0 and
+            (.head.sha | type) == "string" and (.head.sha | test("^[0-9a-f]{40}$")) and
+            ((.merged | type) == "boolean")
+          ' <<<"$pr" >/dev/null
+          if ! jq -e '.state == "closed" and .merged == true' <<<"$pr" >/dev/null; then
+            printf 'publish=false\n' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          jq -e '
+            .draft == false and (.merged_at | type) == "string" and
+            (.merge_commit_sha | type) == "string" and
+            (.merge_commit_sha | test("^[0-9a-f]{40}$"))
+          ' <<<"$pr" >/dev/null
+          final_head="$(jq -r '.head.sha' <<<"$pr")"
+          head_ref="$(jq -r '.head.ref' <<<"$pr")"
+          head_ref_encoded="$(jq -nr --arg ref "$head_ref" '$ref | @uri')"
+          merge_sha="$(jq -r '.merge_commit_sha' <<<"$pr")"
+
+          generated=false
+          generated_version=''
+          generator_run_id=''
+          generator_attempt=''
+          generator_event_head=''
+          commit="$(api "repos/$REPOSITORY/commits/$final_head")"
+          jq -e --arg head "$final_head" '
+            type == "object" and .sha == $head and
+            (.commit.message | type) == "string" and (.parents | type) == "array"
+          ' <<<"$commit" >/dev/null
+          commit_message="$(jq -r '.commit.message' <<<"$commit")"
+          if generated_identity="$(jq -nce --arg message "$commit_message" \
+            --arg re "$generated_re" 'try ($message | capture($re)) catch empty')"; then
+            candidate_run_id="$(jq -r '.run_id' <<<"$generated_identity")"
+            candidate_attempt="$(jq -r '.attempt' <<<"$generated_identity")"
+            candidate_event_head="$(jq -r '.event_head' <<<"$generated_identity")"
+            if [[ "$(jq -r '.pr' <<<"$generated_identity")" == "$pr_number" ]] &&
+               jq -e --arg parent "$candidate_event_head" '
+                 .parents | length == 1 and .[0].sha == $parent
+               ' <<<"$commit" >/dev/null &&
+               generator="$(api "repos/$REPOSITORY/actions/runs/$candidate_run_id" 2>/dev/null)" &&
+               generator_number="$(jq -er '.run_number | select(type == "number" and . > 0)' <<<"$generator")" &&
+               generator_latest="$(jq -er '.run_attempt | select(type == "number" and . > 0)' <<<"$generator")" &&
+               (( generator_latest >= candidate_attempt )) &&
+               validate_run "$generator" "$candidate_run_id" "$generator_number" "$generator_latest" &&
+               generator_title="$(parse_title "$(jq -r '.display_title' <<<"$generator")")" &&
+               [[ "$(jq -r '.pr' <<<"$generator_title")" == "$pr_number" &&
+                  "$(jq -r '.event_head' <<<"$generator_title")" == "$candidate_event_head" &&
+                  "$(jq -r '.draft' <<<"$generator_title")" == false ]]; then
+              generated=true
+              generated_version="$(jq -r '.version' <<<"$generated_identity")"
+              generator_run_id="$candidate_run_id"
+              generator_attempt="$candidate_attempt"
+              generator_event_head="$candidate_event_head"
             fi
           fi
-          if [[ "$observer" == true ]]; then
-            [[ -n "$external_id" ]] || {
-              echo 'generated-H1 observer has no completed producer' >&2
+
+          runs="$(
+            object_pages \
+              "repos/$REPOSITORY/actions/workflows/version-prepare.yml/runs?event=pull_request_target&branch=$head_ref_encoded&per_page=100" \
+              workflow_runs
+          )"
+          if [[ "$EVENT_NAME" == workflow_run ]]; then
+            runs="$(union_signal_run "$runs" "$signal" "$signal_id")"
+          fi
+          summaries="$RUNNER_TEMP/release-evaluation-summaries.jsonl"
+          attempts="$RUNNER_TEMP/release-evaluation-attempts.jsonl"
+          observers="$RUNNER_TEMP/release-observers.jsonl"
+          successful_attempts="$RUNNER_TEMP/release-successful-attempts.jsonl"
+          successes="$RUNNER_TEMP/release-successes.jsonl"
+          selected_candidates="$RUNNER_TEMP/release-selected-candidates.jsonl"
+          : >"$summaries"
+          : >"$attempts"
+          : >"$observers"
+          : >"$successful_attempts"
+          : >"$successes"
+          : >"$selected_candidates"
+          declare -A seen_runs=()
+
+          add_summary() {
+            jq -nc \
+              --argjson run_id "$1" --argjson run_number "$2" \
+              --argjson latest_attempt "$3" --arg status "$4" \
+              --arg conclusion "$5" '
+                {run_id:$run_id,run_number:$run_number,
+                 latest_attempt:$latest_attempt,status:$status,
+                 conclusion:(if $conclusion == "" then null else $conclusion end)}
+              ' >>"$summaries"
+          }
+          add_attempts() {
+            local run_id="$1" run_number="$2" max_attempt="$3" event_head="$4" kind="$5"
+            local attempt=1
+            if [[ "$kind" == generated ]]; then
+              attempt="$max_attempt"
+            fi
+            while (( attempt <= max_attempt )); do
+              jq -nc --argjson run_id "$run_id" --argjson run_number "$run_number" \
+                --argjson attempt "$attempt" --arg event_head "$event_head" \
+                '{run_id:$run_id,run_number:$run_number,attempt:$attempt,event_head:$event_head}' \
+                >>"$attempts"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          mapfile -t protocol_runs < <(
+            jq -c --arg re "$title_re" '
+              .[] as $run |
+              try ($run.display_title | capture($re)) catch empty |
+              $run
+            ' <<<"$runs"
+          )
+          for summary in "${protocol_runs[@]}"; do
+            run_id="$(jq -er '.id | select(type == "number" and . > 0)' <<<"$summary")"
+            run_number="$(jq -er '.run_number | select(type == "number" and . > 0)' <<<"$summary")"
+            latest_attempt="$(jq -er '.run_attempt | select(type == "number" and . > 0)' <<<"$summary")"
+            [[ -z "${seen_runs[$run_id]:-}" ]]
+            seen_runs[$run_id]=1
+            validate_run "$summary" "$run_id" "$run_number" "$latest_attempt"
+            identity="$(parse_title "$(jq -r '.display_title' <<<"$summary")")"
+            if [[ "$(jq -r '.pr' <<<"$identity")" != "$pr_number" ||
+                  "$(jq -r '.draft' <<<"$identity")" == true ||
+                  "$(jq -r '.event_head' <<<"$identity")" != "$final_head" ]]; then
+              continue
+            fi
+            if [[ "$generated" == true &&
+                  "$(jq -r '.action' <<<"$identity")" == synchronize &&
+                  "$run_id" != "$generator_run_id" ]]; then
+              jq -nc --argjson run_id "$run_id" '{run_id:$run_id}' >>"$observers"
+              continue
+            fi
+            status="$(jq -r '.status' <<<"$summary")"
+            conclusion="$(jq -r '.conclusion // ""' <<<"$summary")"
+            add_summary "$run_id" "$run_number" "$latest_attempt" "$status" "$conclusion"
+            add_attempts "$run_id" "$run_number" "$latest_attempt" "$final_head" direct
+          done
+
+          if [[ "$generated" == true ]]; then
+            add_summary "$generator_run_id" "$generator_number" "$generator_latest" \
+              "$(jq -r '.status' <<<"$generator")" "$(jq -r '.conclusion // ""' <<<"$generator")"
+            add_attempts "$generator_run_id" "$generator_number" "$generator_attempt" \
+              "$generator_event_head" generated
+          fi
+
+          evaluation_summary="$(jq -sc 'sort_by(.run_number, .run_id)' "$summaries")"
+          if [[ "$(jq 'length' <<<"$evaluation_summary")" -eq 0 &&
+                "$EVENT_NAME" == pull_request_target ]]; then
+            echo 'release HOLD: final-head quality run is not visible yet'
+            printf 'publish=false\n' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$(jq 'length' <<<"$evaluation_summary")" -gt 0 ]] || {
+            echo 'no revision-F quality run evaluates the merged final head' >&2
+            exit 1
+          }
+          fingerprint="$(printf '%s' "$evaluation_summary" | sha256sum | cut -d' ' -f1)"
+
+          pending=false
+          failed=false
+          while IFS= read -r row; do
+            run_id="$(jq -r '.run_id' <<<"$row")"
+            run_number="$(jq -r '.run_number' <<<"$row")"
+            attempt="$(jq -r '.attempt' <<<"$row")"
+            expected_head="$(jq -r '.event_head' <<<"$row")"
+            attempt_run="$(api "repos/$REPOSITORY/actions/runs/$run_id/attempts/$attempt")"
+            validate_run "$attempt_run" "$run_id" "$run_number" "$attempt"
+            identity="$(parse_title "$(jq -r '.display_title' <<<"$attempt_run")")"
+            [[ "$(jq -r '.pr' <<<"$identity")" == "$pr_number" &&
+               "$(jq -r '.event_head' <<<"$identity")" == "$expected_head" &&
+               "$(jq -r '.draft' <<<"$identity")" == false ]]
+            status="$(jq -r '.status' <<<"$attempt_run")"
+            conclusion="$(jq -r '.conclusion // ""' <<<"$attempt_run")"
+            if [[ "$status" != completed ]]; then
+              [[ -z "$conclusion" ]]
+              pending=true
+            elif [[ "$conclusion" != success ]]; then
+              [[ -n "$conclusion" ]]
+              failed=true
+            else
+              jq -nc --argjson run_id "$run_id" --argjson run_number "$run_number" \
+                --argjson attempt "$attempt" \
+                '{run_id:$run_id,run_number:$run_number,attempt:$attempt}' \
+                >>"$successful_attempts"
+            fi
+          done <"$attempts"
+
+          if [[ "$pending" == true || "$failed" == true ]]; then
+            echo 'release HOLD: a same-final-head attempt is pending or concluded non-success'
+            printf 'publish=false\n' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Generated observers are excluded from quality authority, but any
+          # release candidate on such a run is a producer contradiction.
+          while IFS= read -r row; do
+            run_id="$(jq -r '.run_id' <<<"$row")"
+            [[ "$(run_candidates "$run_id" | jq 'length')" -eq 0 ]] || {
+              echo "generated observer owns a release candidate: run=$run_id" >&2
               exit 1
             }
-            run_id="$external_id"
-          else
-            run_id="$(printf '%s\n' "$external_id" "$direct_id" | sed '/^$/d' | sort -n | tail -n 1)"
-          fi
-          if [[ -n "$direct_id" && "$run_id" == "$direct_id" ]]; then
-            run="$direct_run"
-            jobs="$direct_jobs"
-          else
-            run="$(gh api "repos/$REPOSITORY/actions/runs/$run_id")"
-            jobs="$(gh api "repos/$REPOSITORY/actions/runs/$run_id/jobs?filter=latest&per_page=100")"
-          fi
-          jq -e \
-            --argjson id "$run_id" \
-            'select(.id == $id and
-                    .path == ".github/workflows/version-prepare.yml" and
-                    .event == "pull_request_target" and
-                    .conclusion == "success")' \
-            <<<"$run" >/dev/null
-          windows_result="$(jq -er '
-            [.jobs[] | select(.name | test("(^| / )windows-quality$"))] |
-            if length == 1 then .[0].conclusion else error("Windows job is missing or duplicated") end
-          ' <<<"$jobs")"
-          case "$windows_result" in
-            skipped) publish=false ;;
-            success) publish=true ;;
-            *) echo "Windows quality did not complete successfully: $windows_result" >&2; exit 1 ;;
-          esac
-          printf 'publish=%s\nrun_id=%s\n' "$publish" "$run_id" >> "$GITHUB_OUTPUT"
+          done <"$observers"
 
-      - name: Download the accepted release candidate
-        if: steps.quality.outputs.publish == 'true'
+          skipped=0
+          windows=0
+          while IFS= read -r row; do
+            run_id="$(jq -r '.run_id' <<<"$row")"
+            run_number="$(jq -r '.run_number' <<<"$row")"
+            attempt="$(jq -r '.attempt' <<<"$row")"
+            jobs="$(fetch_jobs "$run_id" "$attempt")"
+            observer_jobs="$(jq -c --arg observer "$draft_observer" \
+              '[.[] | select(.name == $observer)]' <<<"$jobs")"
+            windows_jobs="$(jq -c --arg wrapper "$windows_wrapper" --arg leaf "$windows_leaf" \
+              '[.[] | select(.name == $wrapper or .name == $leaf)]' <<<"$jobs")"
+            observer_count="$(jq 'length' <<<"$observer_jobs")"
+            windows_count="$(jq 'length' <<<"$windows_jobs")"
+            if [[ "$observer_count" -gt 1 ]]; then
+              echo 'current-draft observer job is duplicated' >&2
+              exit 1
+            fi
+            if [[ "$observer_count" -eq 1 ]]; then
+              [[ "$windows_count" -eq 0 ]] || {
+                echo 'current-draft observer and Windows authority jobs are mixed' >&2
+                exit 1
+              }
+              jq -e '
+                .[0].status == "completed" and .[0].conclusion == "success"
+              ' <<<"$observer_jobs" >/dev/null || {
+                echo 'current-draft observer did not complete successfully' >&2
+                exit 1
+              }
+              candidates="$(run_candidates "$run_id" | jq -c --argjson attempt "$attempt" \
+                '[.[] | select(.attempt == $attempt)]')"
+              [[ "$(jq 'length' <<<"$candidates")" -eq 0 ]] || {
+                echo 'current-draft observer owns a release candidate' >&2
+                exit 1
+              }
+              continue
+            fi
+            [[ "$windows_count" -eq 1 ]] || {
+              echo 'Windows authority job is missing or duplicated' >&2
+              exit 1
+            }
+            printf '%s\n' "$row" >>"$successes"
+            job_name="$(jq -r '.[0].name' <<<"$windows_jobs")"
+            job_status="$(jq -r '.[0].status' <<<"$windows_jobs")"
+            job_result="$(jq -r '.[0].conclusion // ""' <<<"$windows_jobs")"
+            [[ "$job_status" == completed ]]
+            candidates="$(run_candidates "$run_id" | jq -c --argjson attempt "$attempt" \
+              '[.[] | select(.attempt == $attempt)]')"
+            if [[ "$job_name" == "$windows_wrapper" && "$job_result" == skipped ]]; then
+              [[ "$(jq 'length' <<<"$candidates")" -eq 0 ]]
+              skipped=$((skipped + 1))
+            elif [[ "$job_name" == "$windows_leaf" && "$job_result" == success ]]; then
+              [[ "$(jq 'length' <<<"$candidates")" -eq 1 ]]
+              candidate="$(jq -c '.[0]' <<<"$candidates")"
+              jq -e '
+                .expired == false and (.digest | type) == "string" and
+                (.digest | test("^sha256:[0-9a-f]{64}$"))
+              ' <<<"$candidate" >/dev/null
+              if [[ "$generated" == true ]]; then
+                [[ "$(jq -r '.version' <<<"$candidate")" == "$generated_version" ]]
+              fi
+              jq -nc --argjson run_id "$run_id" --argjson run_number "$run_number" \
+                --argjson attempt "$attempt" --argjson candidate "$candidate" \
+                '$candidate + {run_id:$run_id,run_number:$run_number,attempt:$attempt}' \
+                >>"$selected_candidates"
+              windows=$((windows + 1))
+            else
+              echo 'Windows authority has an unexpected name/result pair' >&2
+              exit 1
+            fi
+          done <"$successful_attempts"
+
+          success_count="$(jq -s 'length' "$successes")"
+          [[ "$windows" -eq 0 || "$skipped" -eq 0 ]]
+          if [[ "$windows" -eq 0 ]]; then
+            [[ "$skipped" -eq "$success_count" ]]
+            printf 'publish=false\n' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$windows" -eq "$success_count" ]]
+          jq -se '[.[].version] | unique | length == 1' "$selected_candidates" >/dev/null
+          selected="$(jq -sc 'sort_by(.run_number, .attempt) | last' "$selected_candidates")"
+          version="$(jq -r '.version' <<<"$selected")"
+          {
+            printf 'publish=true\n'
+            printf 'fingerprint=%s\n' "$fingerprint"
+            printf 'tag=windows-v%s\n' "$version"
+            printf 'version=%s\n' "$version"
+            printf 'pr_number=%s\n' "$pr_number"
+            printf 'final_head=%s\n' "$final_head"
+            printf 'merge_sha=%s\n' "$merge_sha"
+            printf 'run_id=%s\n' "$(jq -r '.run_id' <<<"$selected")"
+            printf 'run_number=%s\n' "$(jq -r '.run_number' <<<"$selected")"
+            printf 'run_attempt=%s\n' "$(jq -r '.attempt' <<<"$selected")"
+            printf 'artifact_id=%s\n' "$(jq -r '.id' <<<"$selected")"
+            printf 'artifact_name=%s\n' "$(jq -r '.name' <<<"$selected")"
+            printf 'artifact_digest=%s\n' "$(jq -r '.digest' <<<"$selected")"
+          } >>"$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish immutable Windows release
+    needs: [resolve]
+    if: needs.resolve.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-windows-client-${{ needs.resolve.outputs.tag }}
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Revalidate authority after acquiring the tag lock
+        id: revalidate
+        env:
+          ARTIFACT_DIGEST: ${{ needs.resolve.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ needs.resolve.outputs.artifact_id }}
+          ARTIFACT_NAME: ${{ needs.resolve.outputs.artifact_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          FINAL_HEAD: ${{ needs.resolve.outputs.final_head }}
+          FINGERPRINT: ${{ needs.resolve.outputs.fingerprint }}
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ needs.resolve.outputs.merge_sha }}
+          PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ATTEMPT: ${{ needs.resolve.outputs.run_attempt }}
+          RUN_ID: ${{ needs.resolve.outputs.run_id }}
+          RUN_NUMBER: ${{ needs.resolve.outputs.run_number }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          workflow_path='.github/workflows/version-prepare.yml'
+          title_re='^codex-main-quality-v1:pr=(?<pr>[1-9][0-9]*):event_head=(?<event_head>[0-9a-f]{40}):action=(?<action>opened|synchronize|reopened|ready_for_review):draft=(?<draft>true|false)$'
+          candidate_prefix='release-candidate-v1-'
+          candidate_re='^release-candidate-v1-pr-(?<pr>[1-9][0-9]*)-head-(?<head>[0-9a-f]{40})-run-(?<run_id>[1-9][0-9]*)-attempt-(?<attempt>[1-9][0-9]*)-version-(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$'
+          generated_re='^chore: prepare version (?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))\n\nCodex-Version-Prepare-Schema: v1\nCodex-Version-Prepare-PR: (?<pr>[1-9][0-9]*)\nCodex-Version-Prepare-Event-Head: (?<event_head>[0-9a-f]{40})\nCodex-Version-Prepare-Run-ID: (?<run_id>[1-9][0-9]*)\nCodex-Version-Prepare-Run-Attempt: (?<attempt>[1-9][0-9]*)$'
+          windows_leaf='Run selected quality owners / windows-quality / windows-quality'
+
+          api() {
+            gh api -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' "$@"
+          }
+          object_pages() {
+            api --paginate --slurp "$1" |
+              jq -ce --arg member "$2" '
+                if type == "array" and length > 0 and
+                   all(.[]; type == "object" and (.[$member] | type) == "array" and
+                       (.total_count | type) == "number" and .total_count >= 0 and
+                       (.total_count | floor) == .total_count)
+                then [.[] | .[$member][]] as $items |
+                     [.[].total_count] | unique as $totals |
+                     if ($totals | length) == 1 and $totals[0] == ($items | length)
+                     then $items
+                     else error("incomplete paginated response for " + $member)
+                     end
+                else error("malformed paginated response for " + $member)
+                end
+              '
+          }
+          validate_run() {
+            jq -e --arg repo "$REPOSITORY" --arg path "$workflow_path" \
+              --argjson id "$2" --argjson number "$3" --argjson attempt "$4" '
+                type == "object" and .id == $id and .run_number == $number and
+                .run_attempt == $attempt and (.path | type) == "string" and
+                ((.path | split("@")[0]) == $path) and .event == "pull_request_target" and
+                .repository.full_name == $repo and (.display_title | type) == "string" and
+                (.status | type) == "string" and
+                ((.conclusion == null) or ((.conclusion | type) == "string"))
+              ' <<<"$1" >/dev/null
+          }
+          parse_title() {
+            jq -Rce --arg re "$title_re" 'capture($re)' <<<"$1"
+          }
+          union_signal_run() {
+            local all="$1" signal="$2" signal_id="$3" matches count listed
+            local listed_number listed_attempt
+            matches="$(jq -ce --argjson id "$signal_id" \
+              '[.[] | select(.id == $id)]' <<<"$all")"
+            count="$(jq 'length' <<<"$matches")"
+            if [[ "$count" -eq 0 ]]; then
+              jq -ce --argjson signal "$signal" '. + [$signal]' <<<"$all"
+              return
+            fi
+            [[ "$count" -eq 1 ]]
+            listed="$(jq -c '.[0]' <<<"$matches")"
+            listed_number="$(jq -er '.run_number | select(type == "number" and . > 0)' \
+              <<<"$listed")"
+            listed_attempt="$(jq -er '.run_attempt | select(type == "number" and . > 0)' \
+              <<<"$listed")"
+            validate_run "$listed" "$signal_id" "$listed_number" "$listed_attempt"
+            jq -e --argjson signal "$signal" '
+              {id,run_number,run_attempt,event,
+               repository:.repository.full_name,display_title,status,conclusion} ==
+              ($signal | {id,run_number,run_attempt,event,
+                           repository:.repository.full_name,display_title,status,conclusion})
+            ' <<<"$listed" >/dev/null
+            printf '%s\n' "$all"
+          }
+
+          pr="$(api "repos/$REPOSITORY/pulls/$PR_NUMBER")"
+          jq -e --arg repo "$REPOSITORY" --arg head "$FINAL_HEAD" \
+            --arg merge "$MERGE_SHA" --argjson number "$PR_NUMBER" '
+              type == "object" and .number == $number and .state == "closed" and
+              .merged == true and .draft == false and .base.ref == "main" and
+              .base.repo.full_name == $repo and .head.repo.full_name == $repo and
+              (.head.ref | type) == "string" and (.head.ref | length) > 0 and
+              .head.sha == $head and .merge_commit_sha == $merge
+            ' <<<"$pr" >/dev/null
+          head_ref="$(jq -r '.head.ref' <<<"$pr")"
+          head_ref_encoded="$(jq -nr --arg ref "$head_ref" '$ref | @uri')"
+
+          generated=false
+          generator_run_id=''
+          generator_attempt=''
+          generator_event_head=''
+          commit="$(api "repos/$REPOSITORY/commits/$FINAL_HEAD")"
+          commit_message="$(jq -er --arg head "$FINAL_HEAD" \
+            'select(type == "object" and .sha == $head and (.parents | type) == "array") |
+             .commit.message | select(type == "string")' <<<"$commit")"
+          if generated_identity="$(jq -nce --arg message "$commit_message" \
+            --arg re "$generated_re" 'try ($message | capture($re)) catch empty')"; then
+            candidate_run_id="$(jq -r '.run_id' <<<"$generated_identity")"
+            candidate_attempt="$(jq -r '.attempt' <<<"$generated_identity")"
+            candidate_event_head="$(jq -r '.event_head' <<<"$generated_identity")"
+            if [[ "$(jq -r '.pr' <<<"$generated_identity")" == "$PR_NUMBER" &&
+                  "$(jq -r '.version' <<<"$generated_identity")" == "$VERSION" ]] &&
+               jq -e --arg parent "$candidate_event_head" \
+                 '.parents | length == 1 and .[0].sha == $parent' <<<"$commit" >/dev/null &&
+               generator="$(api "repos/$REPOSITORY/actions/runs/$candidate_run_id" 2>/dev/null)" &&
+               generator_number="$(jq -er '.run_number | select(type == "number" and . > 0)' <<<"$generator")" &&
+               generator_latest="$(jq -er '.run_attempt | select(type == "number" and . > 0)' <<<"$generator")" &&
+               (( generator_latest >= candidate_attempt )) &&
+               validate_run "$generator" "$candidate_run_id" "$generator_number" "$generator_latest" &&
+               generator_title="$(parse_title "$(jq -r '.display_title' <<<"$generator")")" &&
+               [[ "$(jq -r '.pr' <<<"$generator_title")" == "$PR_NUMBER" &&
+                  "$(jq -r '.event_head' <<<"$generator_title")" == "$candidate_event_head" &&
+                  "$(jq -r '.draft' <<<"$generator_title")" == false ]]; then
+              generated=true
+              generator_run_id="$candidate_run_id"
+              generator_attempt="$candidate_attempt"
+              generator_event_head="$candidate_event_head"
+            fi
+          fi
+
+          runs="$(object_pages \
+            "repos/$REPOSITORY/actions/workflows/version-prepare.yml/runs?event=pull_request_target&branch=$head_ref_encoded&per_page=100" \
+            workflow_runs)"
+          case "$EVENT_NAME" in
+            workflow_run)
+              signal="$(jq -ce '.workflow_run' "$GITHUB_EVENT_PATH")"
+              signal_id="$(jq -er '.id | select(type == "number" and . > 0)' <<<"$signal")"
+              signal_number="$(jq -er '.run_number | select(type == "number" and . > 0)' \
+                <<<"$signal")"
+              signal_attempt="$(jq -er '.run_attempt | select(type == "number" and . > 0)' \
+                <<<"$signal")"
+              validate_run "$signal" "$signal_id" "$signal_number" "$signal_attempt"
+              jq -e '.status == "completed" and .conclusion == "success"' \
+                <<<"$signal" >/dev/null
+              signal_identity="$(parse_title "$(jq -r '.display_title' <<<"$signal")")"
+              [[ "$(jq -r '.pr' <<<"$signal_identity")" == "$PR_NUMBER" ]]
+              runs="$(union_signal_run "$runs" "$signal" "$signal_id")"
+              ;;
+            pull_request_target) ;;
+            *)
+              echo "unexpected release signal after lock: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+          summaries="$RUNNER_TEMP/locked-evaluation-summaries.jsonl"
+          : >"$summaries"
+          declare -A seen_runs=()
+          mapfile -t protocol_runs < <(jq -c --arg re "$title_re" '
+            .[] as $run |
+            try ($run.display_title | capture($re)) catch empty |
+            $run' <<<"$runs")
+          for summary in "${protocol_runs[@]}"; do
+            run_id="$(jq -er '.id | select(type == "number" and . > 0)' <<<"$summary")"
+            run_number="$(jq -er '.run_number | select(type == "number" and . > 0)' <<<"$summary")"
+            latest_attempt="$(jq -er '.run_attempt | select(type == "number" and . > 0)' <<<"$summary")"
+            [[ -z "${seen_runs[$run_id]:-}" ]]
+            seen_runs[$run_id]=1
+            validate_run "$summary" "$run_id" "$run_number" "$latest_attempt"
+            identity="$(parse_title "$(jq -r '.display_title' <<<"$summary")")"
+            if [[ "$(jq -r '.pr' <<<"$identity")" != "$PR_NUMBER" ||
+                  "$(jq -r '.draft' <<<"$identity")" == true ||
+                  "$(jq -r '.event_head' <<<"$identity")" != "$FINAL_HEAD" ]]; then
+              continue
+            fi
+            if [[ "$generated" == true && "$(jq -r '.action' <<<"$identity")" == synchronize &&
+                  "$run_id" != "$generator_run_id" ]]; then
+              continue
+            fi
+            jq -nc --argjson run_id "$run_id" --argjson run_number "$run_number" \
+              --argjson latest_attempt "$latest_attempt" \
+              --arg status "$(jq -r '.status' <<<"$summary")" \
+              --arg conclusion "$(jq -r '.conclusion // ""' <<<"$summary")" '
+                {run_id:$run_id,run_number:$run_number,latest_attempt:$latest_attempt,
+                 status:$status,conclusion:(if $conclusion == "" then null else $conclusion end)}' \
+              >>"$summaries"
+          done
+          if [[ "$generated" == true ]]; then
+            jq -nc --argjson run_id "$generator_run_id" --argjson run_number "$generator_number" \
+              --argjson latest_attempt "$generator_latest" \
+              --arg status "$(jq -r '.status' <<<"$generator")" \
+              --arg conclusion "$(jq -r '.conclusion // ""' <<<"$generator")" '
+                {run_id:$run_id,run_number:$run_number,latest_attempt:$latest_attempt,
+                 status:$status,conclusion:(if $conclusion == "" then null else $conclusion end)}' \
+              >>"$summaries"
+          fi
+
+          evaluation_summary="$(jq -sc 'sort_by(.run_number, .run_id)' "$summaries")"
+          locked_fingerprint="$(printf '%s' "$evaluation_summary" | sha256sum | cut -d' ' -f1)"
+          if [[ "$locked_fingerprint" != "$FINGERPRINT" ]]; then
+            echo 'release HOLD after lock: final-head run set or latest attempt changed'
+            printf 'proceed=false\n' >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          selected_run="$(api "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT")"
+          validate_run "$selected_run" "$RUN_ID" "$RUN_NUMBER" "$RUN_ATTEMPT"
+          selected_title="$(parse_title "$(jq -r '.display_title' <<<"$selected_run")")"
+          expected_head="$FINAL_HEAD"
+          if [[ "$generated" == true && "$RUN_ID" == "$generator_run_id" &&
+                "$RUN_ATTEMPT" == "$generator_attempt" ]]; then
+            expected_head="$generator_event_head"
+          fi
+          [[ "$(jq -r '.pr' <<<"$selected_title")" == "$PR_NUMBER" &&
+             "$(jq -r '.event_head' <<<"$selected_title")" == "$expected_head" &&
+             "$(jq -r '.draft' <<<"$selected_title")" == false ]]
+          jq -e '.status == "completed" and .conclusion == "success"' \
+            <<<"$selected_run" >/dev/null
+          jobs="$(object_pages \
+            "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?filter=all&per_page=100" jobs)"
+          jq -e --arg leaf "$windows_leaf" '
+            [.[] | select(.name == $leaf)] |
+            length == 1 and .[0].status == "completed" and .[0].conclusion == "success"
+          ' <<<"$jobs" >/dev/null
+
+          artifacts="$(object_pages \
+            "repos/$REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" artifacts)"
+          candidate="$(jq -ce --arg prefix "$candidate_prefix" --arg re "$candidate_re" \
+            --arg pr "$PR_NUMBER" --arg head "$FINAL_HEAD" --arg run "$RUN_ID" \
+            --argjson attempt "$RUN_ATTEMPT" '
+              [ .[] |
+                select((.name | type) == "string" and (.name | startswith($prefix))) |
+                . as $artifact |
+                (try (.name | capture($re)) catch error("malformed release candidate name")) as $id |
+                if $id.pr != $pr or $id.head != $head or $id.run_id != $run
+                then error("release candidate identity changed")
+                else {id:$artifact.id,name:$artifact.name,digest:$artifact.digest,
+                      expired:$artifact.expired,attempt:($id.attempt | tonumber),version:$id.version}
+                end |
+                select(.attempt == $attempt)
+              ] | if length == 1 then .[0] else error("own candidate is not unique") end
+            ' <<<"$artifacts")"
+          jq -e --argjson id "$ARTIFACT_ID" --arg name "$ARTIFACT_NAME" \
+            --arg digest "$ARTIFACT_DIGEST" --arg version "$VERSION" '
+              .id == $id and .name == $name and .digest == $digest and
+              .version == $version and .expired == false
+            ' <<<"$candidate" >/dev/null
+          printf 'proceed=true\n' >>"$GITHUB_OUTPUT"
+
+      - name: Download the trusted candidate by immutable artifact ID
+        if: steps.revalidate.outputs.proceed == 'true'
         uses: actions/download-artifact@v4
         with:
-          name: release-candidate-${{ github.event.pull_request.number }}
-          run-id: ${{ steps.quality.outputs.run_id }}
+          artifact-ids: ${{ needs.resolve.outputs.artifact_id }}
+          run-id: ${{ needs.resolve.outputs.run_id }}
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           path: release-candidate
 
-      - name: Publish the Windows release
-        if: steps.quality.outputs.publish == 'true'
+      - name: Publish or verify the exact release state
+        if: steps.revalidate.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          MERGE_SHA: ${{ needs.resolve.outputs.merge_sha }}
           REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
-          setup=release-candidate/CodexInfo.WindowsClient.Setup.exe
-          manifest=release-candidate/CodexInfo.WindowsClient.update.json
-          version="$(jq -er '
-            .version |
-            select(type == "string" and test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
-          ' "$manifest")"
-          tag="windows-v$version"
-          gh release create "$tag" "$setup" "$manifest" \
-            --repo "$REPOSITORY" \
-            --target "$MERGE_SHA" \
-            --title "Codex Info Monitor $version" \
-            --notes "Windows client $version" \
-            --draft
-          gh release edit "$tag" --repo "$REPOSITORY" --draft=false
+          set +x
+
+          api() {
+            gh api -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' "$@"
+          }
+          array_pages() {
+            api --paginate --slurp "$1" |
+              jq -ce '
+                if type == "array" and length > 0 and all(.[]; type == "array")
+                then [.[][]]
+                else error("malformed paginated array response")
+                end
+              '
+          }
+          read_state() {
+            refs="$(array_pages "repos/$REPOSITORY/git/matching-refs/tags/$TAG?per_page=100")"
+            tags="$(jq -c --arg ref "refs/tags/$TAG" '[.[] | select(.ref == $ref)]' <<<"$refs")"
+            releases="$(array_pages "repos/$REPOSITORY/releases?per_page=100")"
+            matching_releases="$(jq -c --arg tag "$TAG" '[.[] | select(.tag_name == $tag)]' <<<"$releases")"
+          }
+          verify_tag() {
+            jq -e --arg ref "refs/tags/$TAG" --arg merge "$MERGE_SHA" '
+              length == 1 and .[0].ref == $ref and
+              .[0].object.type == "commit" and .[0].object.sha == $merge
+            ' <<<"$tags" >/dev/null
+          }
+          verify_release() {
+            local release="$1" draft="$2"
+            jq -e --arg tag "$TAG" --arg merge "$MERGE_SHA" \
+              --arg name "Codex Info Monitor $VERSION" \
+              --arg body "Windows client $VERSION" --argjson draft "$draft" '
+              type == "object" and .tag_name == $tag and .target_commitish == $merge and
+              .name == $name and .body == $body and
+              .draft == $draft and .prerelease == false and
+              (if $draft then .published_at == null else (.published_at | type) == "string" end)
+            ' <<<"$release" >/dev/null
+          }
+          verify_asset_list() {
+            local assets="$1"
+            jq -e \
+              --arg setup_name 'CodexInfo.WindowsClient.Setup.exe' \
+              --arg manifest_name 'CodexInfo.WindowsClient.update.json' \
+              --arg setup_digest "$setup_digest" --arg manifest_digest "$manifest_digest" \
+              --argjson setup_size "$setup_size" --argjson manifest_size "$manifest_size" '
+                length == 2 and
+                ([.[] | select(.name == $setup_name and .state == "uploaded" and
+                               .size == $setup_size and .digest == $setup_digest)] | length) == 1 and
+                ([.[] | select(.name == $manifest_name and .state == "uploaded" and
+                               .size == $manifest_size and .digest == $manifest_digest)] | length) == 1
+              ' <<<"$assets" >/dev/null
+          }
+          verify_assets() {
+            local release_id="$1" draft="$2" release assets
+            release="$(api "repos/$REPOSITORY/releases/$release_id")"
+            verify_release "$release" "$draft"
+            assets="$(array_pages "repos/$REPOSITORY/releases/$release_id/assets?per_page=100")"
+            verify_asset_list "$assets"
+          }
+          upload_asset() {
+            local path="$1" filename="$2" content_type="$3" size="$4" digest="$5"
+            local response_file status response
+            response_file="$RUNNER_TEMP/release-upload-$release_id-$filename.json"
+            status="$(curl -L --fail-with-body --silent --show-error \
+              --request POST \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              -H "Content-Type: $content_type" \
+              --data-binary "@$path" \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
+              "$upload_base?name=$filename")"
+            [[ "$status" == 201 ]]
+            response="$(<"$response_file")"
+            jq -e --arg name "$filename" --arg digest "$digest" --argjson size "$size" '
+              type == "object" and (.id | type) == "number" and .id > 0 and
+              .name == $name and .state == "uploaded" and
+              .size == $size and .digest == $digest
+            ' <<<"$response" >/dev/null
+          }
+
+          setup='release-candidate/CodexInfo.WindowsClient.Setup.exe'
+          manifest='release-candidate/CodexInfo.WindowsClient.update.json'
+          mapfile -t entries < <(find release-candidate -mindepth 1 -printf '%P\n' | LC_ALL=C sort)
+          expected=(CodexInfo.WindowsClient.Setup.exe CodexInfo.WindowsClient.update.json)
+          [[ "${entries[*]}" == "${expected[*]}" &&
+             -f "$setup" && ! -L "$setup" && -f "$manifest" && ! -L "$manifest" ]]
+          jq -e --arg version "$VERSION" '
+            type == "object" and .version == $version and
+            (.version | test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+          ' "$manifest" >/dev/null
+          setup_size="$(stat -c %s "$setup")"
+          manifest_size="$(stat -c %s "$manifest")"
+          [[ "$setup_size" -gt 0 && "$manifest_size" -gt 0 ]]
+          setup_digest="sha256:$(sha256sum "$setup" | cut -d' ' -f1)"
+          manifest_digest="sha256:$(sha256sum "$manifest" | cut -d' ' -f1)"
+
+          read_state
+          tag_count="$(jq 'length' <<<"$tags")"
+          release_count="$(jq 'length' <<<"$matching_releases")"
+          [[ "$tag_count" -le 1 && "$release_count" -le 1 ]]
+          if [[ "$tag_count" -eq 1 && "$release_count" -eq 1 ]]; then
+            release_id="$(jq -er '.[0].id | select(type == "number" and . > 0)' <<<"$matching_releases")"
+            jq -e '.[0].draft == false' <<<"$matching_releases" >/dev/null || {
+              echo 'existing release is draft or partial; automatic repair is forbidden' >&2
+              exit 1
+            }
+            verify_tag
+            verify_assets "$release_id" false
+            echo "published release already matches exactly: $TAG"
+            exit 0
+          fi
+          if [[ "$tag_count" -ne 0 || "$release_count" -ne 0 ]]; then
+            echo 'orphan tag or release-without-tag state; automatic repair is forbidden' >&2
+            exit 1
+          fi
+
+          draft="$(jq -nc --arg tag "$TAG" --arg merge "$MERGE_SHA" \
+            --arg name "Codex Info Monitor $VERSION" --arg body "Windows client $VERSION" \
+            '{tag_name:$tag,target_commitish:$merge,name:$name,body:$body,
+              draft:true,prerelease:false}' |
+            api --method POST "repos/$REPOSITORY/releases" --input -)"
+          verify_release "$draft" true
+          release_id="$(jq -er '.id | select(type == "number" and . > 0)' <<<"$draft")"
+          upload_base="https://uploads.github.com/repos/$REPOSITORY/releases/$release_id/assets"
+          upload_url="$(jq -er '.upload_url | select(type == "string")' <<<"$draft")"
+          [[ "$upload_url" == "$upload_base{?name,label}" ]]
+
+          upload_asset "$setup" 'CodexInfo.WindowsClient.Setup.exe' \
+            'application/octet-stream' "$setup_size" "$setup_digest"
+          upload_asset "$manifest" 'CodexInfo.WindowsClient.update.json' \
+            'application/json' "$manifest_size" "$manifest_digest"
+
+          published="$(jq -nc '{draft:false}' |
+            api --method PATCH "repos/$REPOSITORY/releases/$release_id" --input -)"
+          [[ "$(jq -er '.id | select(type == "number" and . > 0)' <<<"$published")" == "$release_id" ]]
+          verify_release "$published" false
+          published_assets="$(jq -ce '.assets | select(type == "array")' <<<"$published")"
+          verify_asset_list "$published_assets"
+
+          read_state
+          [[ "$(jq 'length' <<<"$tags")" -eq 1 &&
+             "$(jq 'length' <<<"$matching_releases")" -eq 1 &&
+             "$(jq -r '.[0].id' <<<"$matching_releases")" == "$release_id" ]]
+          verify_tag
+          verify_assets "$release_id" false
