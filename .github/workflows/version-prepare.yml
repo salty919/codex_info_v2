@@ -20,6 +20,7 @@ jobs:
   prepare:
     runs-on: ubuntu-latest
     permissions:
+      checks: write
       contents: write
       pull-requests: read
     outputs:
@@ -293,6 +294,31 @@ jobs:
               "$(jq -r '.parents | length' <<<"$commit_info")" == 1 &&
               "$(jq -r '.parents[0].sha' <<<"$commit_info")" == "$HEAD_SHA" ]] || {
             echo 'Git Commit API parent/tree proof did not match the PR head' >&2
+            exit 1
+          }
+
+          check_external_id="codex-version-v1:head=$commit_sha:run=$GITHUB_RUN_ID"
+          check_payload="$(jq -n \
+            --arg head_sha "$commit_sha" \
+            --arg external_id "$check_external_id" \
+            --arg details_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{name:"feat-acceptance",head_sha:$head_sha,status:"completed",
+              conclusion:"success",external_id:$external_id,details_url:$details_url,
+              output:{title:"Trusted version commit accepted",
+                summary:"The generated version commit passed parent, tree, and version validation."}}')"
+          check_info="$(gh api \
+            --method POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/$REPOSITORY/check-runs" \
+            --input - <<<"$check_payload")"
+          [[ "$(jq -r '.name' <<<"$check_info")" == feat-acceptance &&
+              "$(jq -r '.head_sha' <<<"$check_info")" == "$commit_sha" &&
+              "$(jq -r '.status' <<<"$check_info")" == completed &&
+              "$(jq -r '.conclusion' <<<"$check_info")" == success &&
+              "$(jq -r '.external_id' <<<"$check_info")" == "$check_external_id" &&
+              "$(jq -r '.app.id' <<<"$check_info")" == 15368 ]] || {
+            echo 'generated version check identity was not accepted exactly' >&2
             exit 1
           }
 

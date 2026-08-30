@@ -52,11 +52,18 @@ def validate(
 
     exact(prepare, "      contents: write\n")
     exact(prepare, "      pull-requests: read\n")
-    exact(prepare, "      checks: write\n", 0)
+    exact(prepare, "      checks: write\n")
     exact(prepare, "          ref: refs/heads/main\n")
     exact(prepare, "          persist-credentials: false\n")
+    exact(prepare, '"repos/$REPOSITORY/check-runs"')
+    exact(prepare, '{name:"feat-acceptance",head_sha:$head_sha,status:"completed",')
+    exact(prepare, '"$(jq -r \'.app.id\' <<<"$check_info")" == 15368')
     exact(prepare, '"repos/$REPOSITORY/git/refs/heads/$HEAD_REF"\n')
     exact(prepare, "            -F force=false \\\n")
+    if prepare.index('"repos/$REPOSITORY/check-runs"') > prepare.index(
+        '"$update_ref_endpoint"'
+    ):
+        errors.append("generated version check is created after the protected ref update")
     for marker in (
         '[[ "$HEAD_REPOSITORY" != "$REPOSITORY" ]]',
         '[[ "$observed_head" == "$HEAD_SHA" ]]',
@@ -225,6 +232,11 @@ def main() -> int:
             "workflow",
             "            -F force=false \\\n",
             "            -F force=true \\\n",
+        ),
+        (
+            "workflow",
+            '{name:"feat-acceptance",head_sha:$head_sha,status:"completed",',
+            '{name:"acceptance",head_sha:$head_sha,status:"completed",',
         ),
         ("workflow", "      checks: write\n", "      checks: read\n"),
         ("workflow", "scripts/final_head_check_reporter.py register", "true"),

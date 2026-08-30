@@ -202,7 +202,14 @@ def validate_sources(
     _count(version, "uses: ./.github/workflows/windows-client.yml", 1, errors)
     _count(version, "scripts/final_head_check_reporter.py register", 1, errors)
     _count(version, "scripts/final_head_check_reporter.py finalize", 1, errors)
-    _count(version, "      checks: write\n", 2, errors)
+    _count(version, "      checks: write\n", 3, errors)
+    _count(version, '"repos/$REPOSITORY/check-runs"', 1, errors)
+    _count(
+        version,
+        '{name:"feat-acceptance",head_sha:$head_sha,status:"completed",',
+        1,
+        errors,
+    )
     _count(version, "      actions: write\n", 0, errors)
     _count(version, "      contents: write\n", 1, errors)
     _count(version, "      premerge: true\n", 1, errors)
@@ -522,6 +529,11 @@ def _static_self_test() -> int:
     mutations: tuple[tuple[int, str, str], ...] = (
         (0, "  pull_request_target:\n", "  pull_request:\n"),
         (0, "scripts/final_head_check_reporter.py register", "true"),
+        (
+            0,
+            '{name:"feat-acceptance",head_sha:$head_sha,status:"completed",',
+            '{name:"acceptance",head_sha:$head_sha,status:"completed",',
+        ),
         (0, "      checks: write\n", "      checks: read\n"),
         (0, "uses: ./.github/workflows/windows-client.yml", "uses: ./other.yml"),
         (1, "  workflow_call:\n", "  workflow_dispatch:\n"),
