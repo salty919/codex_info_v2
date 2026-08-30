@@ -78,31 +78,40 @@
   CodeQL言語の余分・欠落はすべて失敗とする。Windowsだけの変更はWINDOWSとcsharpだけ、governanceだけの変更は
   GOVERNANCEとactions/pythonだけを実行する。branch名、branchの作成元、`feat/next`との包含関係は品質選択へ使用しない。
 - `main`のtrusted `pull_request_target`を唯一のpre-merge authorityとし、別dispatchへ品質判定を転送しない。
-  event headを評価する通常経路はActions job名`version-prepared`と`acceptance`をrequired checkとする。workflowの
+  workflow run名には固定schemaでPR番号、event head、event action、event時のdraft状態をGitHub eventから記録する。
+  event時または開始時にdraftであるrun、開始時にclosedであるrun、開始時にcurrent PR headではなくなったrunはobserverとしてowner、分類、
+  version mutationを0件にする。open・non-draft・current headだけをownerとする。event headを評価する通常経路はActions job名
+  `version-prepared`と`acceptance`をrequired checkとする。workflowの
   `GITHUB_TOKEN`がversion commit H1をpushした経路だけは、同じH0 runがH1を評価し、H0 job checkがH1へ移らない分の
-  `version-prepared`と`acceptance`をH1へ最終結果として各1回作る。この2件にはproducer run IDを同じ外部IDで記録するが、
-  登録後のpoll、retry、readback、URL・時刻・表示値の照合を行わない。`acceptance`は選択jobの結果だけを集約する。
+  `version-prepared`と`acceptance`をH1へ最終結果として各1回作る。この2件にはproducer run IDとattemptを同じ外部IDで記録するが、
+  登録後のpoll、retry、URL・時刻・表示値の照合を行わない。`acceptance`は選択jobの結果だけを集約する。
   WINDOWS選択時はWindows job自身が実Windows評価後にrelease candidateを作り、
   Linuxだけの変更ではWindows評価・candidateを生成しない。live repository ruleの再監査、選択済み製品testの再実行、
   branch名allowlist、上記2件以外のcheck登録を追加しない。
 - バイナリ影響ありPRだけ、品質確認を開始する前にPR branch上のversion 3ファイルをexact next patchへ自動更新する。
-  versionがbaseのH0は完全差分を1回分類してnon-force pushでH1を作り、同じrunが保存済み選択を使ってH1のownerを各1回実行する。
-  後からH1/H2 eventが起動した場合は、base以降でversionを最後に変更したfirst-parent commitが管理3ファイルだけのbyte-exact
-  自動更新で、最終headでもその3ファイルが不変な場合だけ、その3 pathを差分から除外する。生成H1自身かつ先行H0のacceptance identityが
-  存在するeventは、同じPRのrunを直列化した上でownerを再実行しない。identityがない同じbytesの手動commitは通常どおり評価し、H2の
-  後続利用者commitも除外しない。event内の分類器は1回だけ使用する。これによりH2でも生成versionをLinux ownerへ誤分類しない。
+  versionがbaseのH0は完全差分を1回分類し、PR、H0、producer run ID、attemptを固定trailerに持つH1 commitをnon-force pushして、
+  同じrunが保存済み選択を使ってH1のownerを各1回実行する。H1 commit自身がmappingを持つため、push後にrunがcancelされても
+  H0とH1の対応を失わない。後からH1/H2 eventが起動した場合は、base以降でversionを最後に変更したfirst-parent commitが管理3ファイル
+  だけのbyte-exact自動更新で、最終headでもその3ファイルが不変な場合だけ、その3 pathを差分から除外する。tipが正規trailerを持つ
+  生成H1の`synchronize` eventだけownerを再実行しない。identityがない同じbytesの手動commitは通常どおり評価し、H2の後続利用者commitも
+  除外しない。event内の分類器は1回だけ使用する。これによりH2でも生成versionをLinux ownerへ誤分類しない。
   バイナリ影響なしPRはversionを変更しない。
-- merge後は、event head自身のrunと、生成H1 checkが示すH0 producer runを候補にし、run IDが最新の1件を取得する。
-  最新runがmissing/failure/cancelの場合は旧成功runへfallbackせず失敗する。成功runの
-  `windows-quality` jobが`skipped`ならRelease mutationを0件、`success`なら同runのPR番号付きcandidateだけを取得する。
-  missing/failure/cancelまたはcandidate欠落は失敗とする。merge後にPRを再分類せず、quality test/build/CodeQLも再実行しない。
-  Windows jobはmanifestをcandidate内で生成済みにし、Release jobはtagとDraft Releaseを作成して2資産をuploadした後に公開する。
-  uploadまたは公開失敗時はDraftを非公開のまま残し、自動retry・自動cleanupを行わない。
+- Release判定はmerged `closed`と`Main PR quality` completedの二信号を受け、どちらが先でも同じfinal headへ収束する。quality未完了時の
+  `closed`とPR未merge時のcompletedはmutation 0で終了し、後着信号が再評価する。workflow runの非成功はMain Qualityの失敗を正本とし、
+  Release側へ同じ赤を追加しない。final headを評価した生成producerとdirect runの全attemptを集合化し、draft・stale・generated observerを
+  除外する。本来のattemptにmissing、failure、cancelその他の非成功が1件でもあれば、同じheadの後続rerunまたはreopen successで
+  上書きせず、新headまで公開をHOLDする。旧成功runへfallbackしない。
+- 成功authorityの`windows-quality`が`skipped`ならcandidateは0件だけを許可し、`success`なら同じrun、attempt、PR、final head、versionに
+  結び付く既存candidateをexact 1件要求する。期限切れ・削除を含む0件、複数、malformed、別identityは失敗とする。candidateは増やさず、
+  既存のSetupとmanifestを持つ1件の名前へidentityを追加する。merge後にPRを再分類せず、quality test/build/CodeQLも再実行しない。
+  公開jobだけをversion tag単位で直列化し、lock取得後にPR/final head、全attempt、candidate、tag、Release、assetsを1回再取得する。
+  tagとReleaseがともに不存在の場合だけDraftを作って2資産をupload後に公開し、完全一致のpublished状態だけを成功済みno-opとする。
+  orphan tag、Releaseだけの存在、Draft、partial、targetまたはasset不一致は自動修復せず失敗し、自動retry・cleanupを行わない。
 - PR由来のcheckout、script、workflow、artifactを、repository contents・checks・Releaseへのwrite権限を持つjobで実行しない。
   write権限を持つ採番jobはtrusted baseだけをcheckout・実行し、PR headはGit object dataとしてだけ読む。
   same-repository headへexact 1 commitをnon-force pushし、競合pushはGit自身のnon-fast-forward拒否に任せてreadbackやretryを行わない。
-  H1 check作成jobもsourceをcheckoutせず、trusted runの出力だけを入力にする。Release jobはsourceをcheckout・実行せず、
-  最新runのjob状態とcandidateだけを入力にする。
+  H1 check作成jobもsourceをcheckoutせず、trusted runの出力だけを入力にする。Releaseのread-only解決jobはGitHub objectとrun状態だけを読み、
+  write jobはsourceをcheckout・実行せず、解決済みcandidateとlock取得後に再取得したremote状態だけを入力にする。
 - 選択ownerからCodeQL言語が導出されるPRではその言語だけをmerge必須gateとし、critical/high findingをdismissやworkflow無効化で
   通過させない。CodeQL言語が選択されないPRとmerge後pushではCodeQL AnalyzeとAutobuildを実行せず、active code-scanning rulesetの
   設定はworkflow内で再監査しない。外部AI findingsが
@@ -128,15 +137,18 @@
 | version 3ファイル | binary PRだけbaseからexact next patchへ同期更新する | Rust・lockfile・Windowsのversionが分裂する | GitHubは製品versionを保証しない |
 | non-force push | version生成中にheadが進んだ場合はpushを拒否する | 利用者commitの上書きまたはstale commit追加 | Gitのnon-fast-forward拒否を唯一のrace authorityとして使う |
 | 生成H1の必須2 check | `GITHUB_TOKEN` push後も同じrunでH1を評価し、H1へ最終結果を各1件作る | token起因pushは次runを起動せず、H1のrequired checkが永久に欠落する | ActionsのH0 job checkはworkflowが追加したH1へ移らない |
-| 生成H1 producer identityの1回取得 | byte-exact H1 eventで先行H0 identityが存在する場合だけowner再実行を抑止し、identityのない手動commitは評価する | H1 ownerの二重実行、または正当な手動version commitの未評価 | commit bytesと親子関係だけでは作成主体を区別できない。poll・retry・登録結果照合は行わない |
+| event authority identity | job開始前cancelを含め、event時draft、event head、action、PRを復元し、draft・closed・stale eventをowner対象から外す | draftのcancelを評価失敗と誤認する、stale headを評価する、またはmerge後のbranchへ未統合H1をpushする | job出力は開始前cancelでは存在せず、runの通常metadataだけではPR head epochを復元できない |
+| 生成H1 commit identity | H1 commitと同じGit objectにH0 producer run/attemptを記録し、正規生成H1だけowner再実行を抑止する | push後cancelでH0/H1対応を失う、または手動version commitを未評価にする | checkやartifactを後から作る方式にはpushとの間に原子的でない空白が残る |
 | selected job結果 | selectedはsuccess、non-selectedはskipped以外を失敗にする | 未評価mergeまたは無関係な評価失敗が起きる | Actionsはowner選択の意味を知らない |
 | 実Windows評価 | WINDOWS選択時だけWindows runnerでinstaller/UIを評価する | 壊れたWindows配布物を公開する | LinuxやGitHubはWindows製品動作を保証しない |
-| 最新producer runとWindows job | merge後、生成H1 observerは外部IDのH0を採用し、それ以外は最新event-head runを採用する。後続異常runは失敗し、Windowsがskippedなら終了、successならcandidate必須とする | observerによるcandidate喪失、後続失敗を無視した旧candidate公開、または非Windows Release | merge eventにproducer/observer、job状態、artifactは含まれない |
-| merged event | closed未mergeではRelease mutationを0件にする | 未統合sourceを公開する | `closed` triggerだけではmergeを保証しない |
-| Draft公開 | upload失敗時は非公開Draftを残して失敗する | 不完全なReleaseが公開される | GitHubは複数asset upload全体を一括commitしない |
+| final-head attempt集合 | current final headを実際に評価した全non-observer attemptを見て、1件の失敗もsame-head successで上書きしない | rerunの偶然のsuccessが未修正の評価失敗を隠し、旧candidateを公開する | latest成功だけでは過去attemptのfailure barrierを表現できない |
+| Windows jobとcandidate | Windows skippedは0件、successはown-run candidate exact 1を要求する | 非Windowsで不要なReleaseを動かす、または期限切れ・欠落candidateを黙って無視する | run successだけではWindowsの選択有無とartifact保存状態を区別できない |
+| merged/completed二信号 | quality先行とmerge先行のどちらも、両条件が揃った信号だけを公開候補にする | merge直後に未完了qualityを失敗扱いする、またはquality先行時に公開信号を失う | 両event間にGitHubの完了順序保証はない |
+| tag単位lock後の公開状態 | 同じtagの二信号を直列化し、lock取得後の完全不存在だけ作成、完全一致publishedだけno-opにする | 二重公開、orphan tagの流用、不完全Draftの自動修復 | Release作成と複数asset uploadは一つのtransactionではない |
 | local台帳schema | PR前は要求・範囲・オラクル・実装状態の欠落だけを失敗にし、remote証拠は完了時に`--final`で確認する | PRでしか得られない証拠をPR前に要求する循環で作業が停止する | local実装確認とGitHub実挙動は異なる観測点を持つ |
 
-この表の4列を満たさない形式検査、identity再照合、poll、retry、mutation readback、証拠専用artifact、同一run内の二次分類は追加しない。
+この表の4列を満たさない形式検査、identity再照合、poll、retry、証拠専用artifact、同一run内の二次分類は追加しない。
+公開lock取得後の競合判定に必要な単回remote再取得を、汎用readbackやretryへ拡張しない。
 
 ## 7. 有限の検証規則
 

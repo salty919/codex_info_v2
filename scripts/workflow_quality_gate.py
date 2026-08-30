@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import textwrap
 from typing import Mapping, Sequence
 
 import yaml
@@ -84,15 +86,20 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     version = workflows["version-prepare.yml"]
     for marker in (
         "name: version-prepared",
+        "run-name: codex-main-quality-v1:",
         "'Observe generated H1' || 'acceptance'",
         "ref: ${{ github.event.pull_request.base.sha }}",
         "git log --first-parent --format=%H",
-        "generated_version=true",
+        "expected_version_transition=true",
         "generated_observer=true",
         "':(exclude)Cargo.toml'",
         "cmp -s",
         'git push origin "$commit_sha:refs/heads/$HEAD_REF"',
-        "codex-main-quality:pr=$PR_NUMBER:head=$QUALITY_SHA:run=$GITHUB_RUN_ID",
+        "Codex-Version-Prepare-Run-Attempt: $GITHUB_RUN_ATTEMPT",
+        "expected_generated_message=",
+        '"$commit_message" == "$expected_generated_message"',
+        "actions/runs/$generator_run_id/attempts/$generator_run_attempt",
+        "codex-main-quality:pr=$PR_NUMBER:head=$QUALITY_SHA:run=$GITHUB_RUN_ID:attempt=$GITHUB_RUN_ATTEMPT",
         "release_candidate: true",
     ):
         if marker not in version:
@@ -104,10 +111,8 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         if marker in version:
             errors.append(f"version-prepare.yml: write path overconstraint {marker}")
     count("version-prepare.yml", "checks: write", 1)
-    count("version-prepare.yml", "checks: read", 1)
     count("version-prepare.yml", "cancel-in-progress: false", 1)
     count("version-prepare.yml", "repos/$REPOSITORY/check-runs", 1)
-    count("version-prepare.yml", "commits/$HEAD_SHA/check-runs", 1)
     count("version-prepare.yml", "--find-copies-harder", 2)
 
     selective = workflows["selective-quality.yml"]
@@ -132,7 +137,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "Run-WindowsClientE2E.ps1",
         "windows_window_move_smoke.ps1",
         "New-WindowsUpdateManifest.ps1",
-        "name: release-candidate-${{ inputs.pr_number }}",
+        "name: release-candidate-v1-pr-${{ inputs.pr_number }}",
     ):
         if marker not in windows:
             errors.append(f"windows-client.yml: missing {marker}")
@@ -163,14 +168,26 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
 
     release = workflows["release.yml"]
     for marker in (
-        "github.event.pull_request.merged == true",
-        "commits/$HEAD_SHA/check-runs?check_name=acceptance",
-        "codex-main-quality:pr=$PR_NUMBER:head=$HEAD_SHA:run=",
-        'test("(^| / )windows-quality$")',
-        "name: release-candidate-${{ github.event.pull_request.number }}",
-        'gh release create "$tag" "$setup" "$manifest"',
-        "--draft",
-        'gh release edit "$tag" --repo "$REPOSITORY" --draft=false',
+        'types: [closed]',
+        'workflows: ["Main PR quality"]',
+        "name: Resolve the immutable publication snapshot",
+        "--paginate --slurp",
+        "a same-final-head attempt is pending or concluded non-success",
+        "total_count",
+        "branch=$head_ref_encoded&per_page=100",
+        "union_signal_run",
+        "release-candidate-v1-pr-",
+        "name: Revalidate authority after acquiring the tag lock",
+        "group: release-windows-client-${{ needs.resolve.outputs.tag }}",
+        "final-head run set or latest attempt changed",
+        "name: Publish or verify the exact release state",
+        'api --method POST "repos/$REPOSITORY/releases"',
+        "curl -L --fail-with-body --silent --show-error",
+        '"$upload_base?name=$filename"',
+        ".upload_url | select(type == \"string\")",
+        'api --method PATCH "repos/$REPOSITORY/releases/$release_id"',
+        "existing release is draft or partial; automatic repair is forbidden",
+        "orphan tag or release-without-tag state; automatic repair is forbidden",
     ):
         if marker not in release:
             errors.append(f"release.yml: missing {marker}")
@@ -178,6 +195,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         errors.append("release.yml: write job must not checkout source")
     if "status=success" in release:
         errors.append("release.yml: latest failure must not fall back to an older success")
+    count("release.yml", "--paginate --slurp", 3)
 
     return errors
 
@@ -365,12 +383,124 @@ def _remote_head(fixture: dict[str, Path | str | int]) -> str:
     return _git(remote, "rev-parse", "refs/heads/case")
 
 
+def _write_readonly_gh(directory: Path) -> Path:
+    binary = directory / "gh"
+    binary.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import json
+            import os
+            import sys
+
+            args = sys.argv[1:]
+            log = os.environ.get("MOCK_GH_LOG")
+            if log:
+                with open(log, "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(args, separators=(",", ":")) + "\\n")
+            if not args or args[0] != "api":
+                raise SystemExit(3)
+            endpoint = next((arg for arg in args if arg.startswith("repos/")), None)
+            if endpoint is None:
+                raise SystemExit(4)
+            with open(os.environ["MOCK_GH_DATABASE"], encoding="utf-8") as stream:
+                responses = json.load(stream)["responses"]
+            if endpoint not in responses:
+                print(f"unexpected gh endpoint: {endpoint}", file=sys.stderr)
+                raise SystemExit(5)
+            response = responses[endpoint]
+            if isinstance(response, dict) and "__returncode__" in response:
+                raise SystemExit(int(response["__returncode__"]))
+            json.dump(response, sys.stdout, separators=(",", ":"))
+            sys.stdout.write("\\n")
+            """
+        ),
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    return binary
+
+
+def _current_observer_tests(version_workflow: str) -> int:
+    script = _step_script(version_workflow, "Read the current pull request once")
+    head = "a" * 40
+    stale = "b" * 40
+    cases = (
+        ("open-owner", "open", False, head, False, "false", "owner"),
+        ("closed-observer", "closed", False, head, False, "true", "closed-pr"),
+        ("event-draft", "open", False, head, True, "true", "event-draft"),
+        ("current-draft", "open", True, head, False, "true", "current-draft"),
+        ("stale-event", "open", False, stale, False, "true", "stale-event-head"),
+    )
+    with tempfile.TemporaryDirectory(prefix="codex-info-current-observer-") as raw_root:
+        root = Path(raw_root)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        _write_readonly_gh(bin_dir)
+        for (
+            name,
+            state,
+            current_draft,
+            current_head,
+            event_draft,
+            expected_observer,
+            expected_reason,
+        ) in cases:
+            case_root = root / name
+            case_root.mkdir()
+            output = case_root / "output"
+            output.write_text("", encoding="utf-8")
+            database = case_root / "database.json"
+            database.write_text(
+                json.dumps(
+                    {
+                        "responses": {
+                            "repos/example/project/pulls/44": {
+                                "number": 44,
+                                "state": state,
+                                "draft": current_draft,
+                                "base": {"repo": {"full_name": "example/project"}},
+                                "head": {"sha": current_head},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "EVENT_DRAFT": str(event_draft).lower(),
+                    "EVENT_HEAD_SHA": head,
+                    "GH_TOKEN": "fixture",
+                    "GITHUB_OUTPUT": str(output),
+                    "MOCK_GH_DATABASE": str(database),
+                    "PATH": f"{bin_dir}:{environment['PATH']}",
+                    "PR_NUMBER": "44",
+                    "REPOSITORY": "example/project",
+                }
+            )
+            result = _command(
+                ("bash", "-c", script), cwd=case_root, env=environment, check=False
+            )
+            values = _output(output)
+            if result.returncode != 0 or values != {
+                "observer": expected_observer,
+                "reason": expected_reason,
+            }:
+                raise AssertionError(f"current observer case {name} is wrong: {values}")
+    return len(cases)
+
+
 def _run_version_step(
     fixture: dict[str, Path | str | int],
     script: str,
     head: str,
     *,
-    producer_run_id: int | None = None,
+    event_action: str = "opened",
+    producer_run: dict[str, object] | None = None,
+    run_attempt: int = 7,
+    run_id: int = 12345,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
     remote = fixture["remote"]
     base = fixture["base"]
@@ -387,37 +517,32 @@ def _run_version_step(
     runner_temp.mkdir()
     bin_dir = runner_temp / "bin"
     bin_dir.mkdir()
-    checks = runner_temp / "checks.json"
-    check_runs: list[dict[str, object]] = []
-    if producer_run_id is not None:
-        check_runs.append(
-            {
-                "name": "acceptance",
-                "head_sha": head,
-                "external_id": (
-                    f"codex-main-quality:pr=44:head={head}:run={producer_run_id}"
-                ),
-            }
-        )
-    checks.write_text(json.dumps({"check_runs": check_runs}), encoding="utf-8")
-    gh = bin_dir / "gh"
-    gh.write_text(
-        "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n"
-        "cat \"$MOCK_CHECKS\"\n",
+    _write_readonly_gh(bin_dir)
+    database = runner_temp / "gh-database.json"
+    responses: dict[str, object] = {}
+    if producer_run is not None:
+        producer_id = producer_run["id"]
+        producer_attempt = producer_run["run_attempt"]
+        responses[
+            f"repos/example/project/actions/runs/{producer_id}/attempts/{producer_attempt}"
+        ] = producer_run
+    database.write_text(
+        json.dumps({"responses": responses}),
         encoding="utf-8",
     )
-    gh.chmod(0o755)
     environment = os.environ.copy()
     environment.update(
         {
             "BASE_SHA": base,
+            "EVENT_ACTION": event_action,
             "GH_TOKEN": "fixture",
             "GITHUB_OUTPUT": str(output),
+            "GITHUB_RUN_ATTEMPT": str(run_attempt),
+            "GITHUB_RUN_ID": str(run_id),
             "HEAD_REF": "case",
             "HEAD_REPOSITORY": "example/project",
             "HEAD_SHA": head,
-            "MOCK_CHECKS": str(checks),
+            "MOCK_GH_DATABASE": str(database),
             "PATH": f"{bin_dir}:{environment['PATH']}",
             "PR_NUMBER": "44",
             "REPOSITORY": "example/project",
@@ -450,99 +575,176 @@ def _version_state_tests(version_workflow: str) -> int:
             raise AssertionError("non-binary H0 selected unrelated owners")
         cases += 1
 
-        for name, relative, expected_owners in (
-            ("windows", "windows-client/src/App.cs", ["WINDOWS"]),
-            ("linux", "src/lib.rs", ["LINUX_BACKEND"]),
-        ):
-            fixture = _new_version_fixture(root, name)
-            seed = fixture["seed"]
-            assert isinstance(seed, Path)
-            (seed / relative).write_text(f"{name} change\n", encoding="utf-8")
-            h0 = _commit(fixture, name)
-            first, first_values = _run_version_step(fixture, script, h0)
-            h1 = _remote_head(fixture)
-            if (
-                first.returncode != 0
-                or first_values.get("ready") != "true"
-                or first_values.get("generated_head") != "true"
-                or first_values.get("quality_sha") != h1
-                or h1 == h0
-            ):
-                raise AssertionError(f"{name} H0 did not continue on its generated H1")
-            first_owners = json.loads(first_values["selection_json"])["owners"]
-            if first_owners != expected_owners:
-                raise AssertionError(
-                    f"{name} H0 selected {first_owners}, expected {expected_owners}"
-                )
-            cases += 1
-            second, second_values = _run_version_step(
-                fixture, script, h1, producer_run_id=12345
-            )
-            if (
-                second.returncode != 0
-                or second_values.get("ready") != "false"
-                or second_values.get("generated_head") != "false"
-                or second_values.get("generated_observer") != "true"
-                or second_values.get("quality_sha") != h1
-            ):
-                raise AssertionError(f"{name} generated H1 was not suppressed")
-            owners = json.loads(second_values["selection_json"])["owners"]
-            if owners != expected_owners:
-                raise AssertionError(f"{name} H1 selected {owners}, expected {expected_owners}")
-            cases += 1
+        fixture = _new_version_fixture(root, "windows-causal-chain")
+        seed = fixture["seed"]
+        base_version = fixture["version"]
+        assert isinstance(seed, Path) and isinstance(base_version, str)
+        (seed / "windows-client/src/App.cs").write_text(
+            "windows H0\n", encoding="utf-8"
+        )
+        h0 = _commit(fixture, "windows H0")
 
-            if name == "windows":
-                _git(seed, "pull", "--quiet", "--ff-only", "origin", "case")
-                later = seed / "windows-client/src/Later.cs"
-                later.write_text("class Later {}\n", encoding="utf-8")
-                h2 = _commit(fixture, "later Windows change")
-                third, third_values = _run_version_step(fixture, script, h2)
-                third_owners = json.loads(third_values["selection_json"])["owners"]
-                if (
-                    third.returncode != 0
-                    or third_values.get("quality_sha") != h2
-                    or third_values.get("generated_head") != "false"
-                    or third_owners != ["WINDOWS"]
-                ):
-                    raise AssertionError(
-                        "H2 retained generated version files in owner selection"
-                    )
-                cases += 1
+        # Cancellation before the prepare step leaves the event H0 untouched.
+        if _remote_head(fixture) != h0:
+            raise AssertionError("pre-push cancellation fixture mutated the PR head")
+        cases += 1
+
+        first, first_values = _run_version_step(fixture, script, h0)
+        h1 = _remote_head(fixture)
+        if (
+            first.returncode != 0
+            or first_values.get("ready") != "true"
+            or first_values.get("generated_head") != "true"
+            or first_values.get("quality_sha") != h1
+            or h1 == h0
+            or json.loads(first_values["selection_json"])["owners"] != ["WINDOWS"]
+        ):
+            raise AssertionError("Windows H0 did not continue on its generated H1")
+        next_version = _command(
+            (
+                "python3",
+                "scripts/product_version.py",
+                "next",
+                "--version",
+                base_version,
+            ),
+            cwd=seed,
+        ).stdout.strip().removeprefix("version=")
+        expected_message = (
+            f"chore: prepare version {next_version}\n\n"
+            "Codex-Version-Prepare-Schema: v1\n"
+            "Codex-Version-Prepare-PR: 44\n"
+            f"Codex-Version-Prepare-Event-Head: {h0}\n"
+            "Codex-Version-Prepare-Run-ID: 12345\n"
+            "Codex-Version-Prepare-Run-Attempt: 7"
+        )
+        message = _git(fixture["remote"], "show", "-s", "--format=%B", h1)
+        if message != expected_message or _git(fixture["remote"], "rev-parse", f"{h1}^") != h0:
+            raise AssertionError("generated H1 did not atomically retain its H0 run/attempt identity")
+        cases += 1
+
+        # No final-check side effect is needed to recover the producer after a
+        # post-push cancellation: the immutable H1 trailer is the authority.
+        producer_run = {
+            "id": 12345,
+            "run_number": 90,
+            "run_attempt": 7,
+            "path": ".github/workflows/version-prepare.yml@refs/heads/main",
+            "event": "pull_request_target",
+            "repository": {"full_name": "example/project"},
+            "display_title": (
+                f"codex-main-quality-v1:pr=44:event_head={h0}:"
+                "action=opened:draft=false"
+            ),
+            "status": "completed",
+            "conclusion": "success",
+        }
+        second, second_values = _run_version_step(
+            fixture,
+            script,
+            h1,
+            event_action="synchronize",
+            producer_run=producer_run,
+        )
+        if (
+            second.returncode != 0
+            or second_values.get("ready") != "false"
+            or second_values.get("generated_head") != "false"
+            or second_values.get("generated_observer") != "true"
+            or second_values.get("quality_sha") != h1
+            or json.loads(second_values["selection_json"])["owners"] != ["WINDOWS"]
+        ):
+            raise AssertionError("generated H1 was not a zero-owner observer")
+        cases += 1
+
+        _git(seed, "pull", "--quiet", "--ff-only", "origin", "case")
+        (seed / "windows-client/src/Later.cs").write_text(
+            "class Later {}\n", encoding="utf-8"
+        )
+        h2 = _commit(fixture, "later Windows change")
+        third, third_values = _run_version_step(
+            fixture, script, h2, event_action="synchronize"
+        )
+        if (
+            third.returncode != 0
+            or third_values.get("quality_sha") != h2
+            or third_values.get("generated_head") != "false"
+            or third_values.get("generated_observer") != "false"
+            or json.loads(third_values["selection_json"])["owners"] != ["WINDOWS"]
+        ):
+            raise AssertionError("H2 retained generated version files or became an observer")
+        cases += 1
+
+        fixture = _new_version_fixture(root, "linux")
+        seed = fixture["seed"]
+        assert isinstance(seed, Path)
+        (seed / "src/lib.rs").write_text("pub fn changed() {}\n", encoding="utf-8")
+        h0 = _commit(fixture, "linux")
+        result, values = _run_version_step(fixture, script, h0)
+        if (
+            result.returncode != 0
+            or values.get("generated_head") != "true"
+            or json.loads(values["selection_json"])["owners"] != ["LINUX_BACKEND"]
+        ):
+            raise AssertionError("Linux H0 did not preserve its selected owner on H1")
+        cases += 1
 
         fixture = _new_version_fixture(root, "manual-next")
         seed = fixture["seed"]
         version = fixture["version"]
         assert isinstance(seed, Path) and isinstance(version, str)
         (seed / "windows-client/src/App.cs").write_text("manual next\n", encoding="utf-8")
+        parent = _commit(fixture, "manual source")
         _bump(fixture, version)
-        head = _commit(fixture, "manual next")
-        result, values = _run_version_step(fixture, script, head)
+        next_version = _checked_version(seed)
+        invalid_identity = (
+            f"chore: prepare version {next_version}\n\n"
+            "Codex-Version-Prepare-Schema: v1\n"
+            "Codex-Version-Prepare-PR: 45\n"
+            f"Codex-Version-Prepare-Event-Head: {parent}\n"
+            "Codex-Version-Prepare-Run-ID: 12345\n"
+            "Codex-Version-Prepare-Run-Attempt: 7"
+        )
+        head = _commit(fixture, invalid_identity)
+        result, values = _run_version_step(
+            fixture, script, head, event_action="synchronize"
+        )
         if result.returncode != 0 or values.get("ready") != "true":
-            raise AssertionError("manual exact-next binary head was not accepted")
+            raise AssertionError("invalid canonical identity did not fall back to manual owner")
         if values.get("quality_sha") != head or values.get("generated_head") != "false":
             raise AssertionError("manual exact-next head was treated as generated")
         cases += 1
 
-        fixture = _new_version_fixture(root, "manual-split-next")
+        fixture = _new_version_fixture(root, "schema-like-manual-next")
         seed = fixture["seed"]
         version = fixture["version"]
         assert isinstance(seed, Path) and isinstance(version, str)
         (seed / "windows-client/src/App.cs").write_text(
-            "manual split next\n", encoding="utf-8"
+            "schema-like manual next\n", encoding="utf-8"
         )
-        _commit(fixture, "manual source")
+        parent = _commit(fixture, "schema-like manual source")
         _bump(fixture, version)
-        head = _commit(fixture, "manual version")
-        result, values = _run_version_step(fixture, script, head)
+        next_version = _checked_version(seed)
+        schema_like_message = (
+            f"chore: prepare version {next_version}\n\n"
+            "Codex-Version-Prepare-Schema: v1\n"
+            "Codex-Version-Prepare-PR: 44\n"
+            f"Codex-Version-Prepare-Event-Head: {parent}\n"
+            "Codex-Version-Prepare-Run-ID: 12345\n"
+            "Codex-Version-Prepare-Run-Attempt: 7\n"
+            "Unexpected-Text: manual"
+        )
+        head = _commit(fixture, schema_like_message)
+        result, values = _run_version_step(
+            fixture, script, head, event_action="synchronize"
+        )
         if (
             result.returncode != 0
             or values.get("ready") != "true"
             or values.get("generated_observer") != "false"
             or json.loads(values["selection_json"])["owners"] != ["WINDOWS"]
         ):
-            raise AssertionError(
-                "byte-identical manual version commit was mistaken for a generated observer"
-            )
+            raise AssertionError("non-exact schema-like message became a generated observer")
         cases += 1
 
         fixture = _new_version_fixture(root, "nonbinary-version")
@@ -630,7 +832,8 @@ def _final_check_tests(version_workflow: str) -> int:
         def execute(
             *,
             generated: bool,
-            observer: bool = False,
+            generated_observer: bool = False,
+            event_observer: bool = False,
             prepare: str = "success",
             quality: str = "success",
             gh_rc: int = 0,
@@ -640,9 +843,11 @@ def _final_check_tests(version_workflow: str) -> int:
             environment = os.environ.copy()
             environment.update(
                 {
+                    "EVENT_OBSERVER": str(event_observer).lower(),
                     "GENERATED_HEAD": str(generated).lower(),
-                    "GENERATED_OBSERVER": str(observer).lower(),
+                    "GENERATED_OBSERVER": str(generated_observer).lower(),
                     "GH_TOKEN": "fixture",
+                    "GITHUB_RUN_ATTEMPT": "7",
                     "GITHUB_RUN_ID": "12345",
                     "MOCK_GH_LOG": str(log),
                     "MOCK_GH_RC": str(gh_rc),
@@ -674,15 +879,24 @@ def _final_check_tests(version_workflow: str) -> int:
         cases += 1
 
         result, payloads = execute(
-            generated=False, observer=True, quality="skipped"
+            generated=False, generated_observer=True, quality="skipped"
         )
         if result.returncode != 0 or payloads:
             raise AssertionError("generated-H1 observer created or repeated quality checks")
         cases += 1
 
+        result, payloads = execute(
+            generated=False, event_observer=True, quality="skipped"
+        )
+        if result.returncode != 0 or payloads:
+            raise AssertionError("draft/stale observer created or repeated quality checks")
+        cases += 1
+
         result, payloads = execute(generated=True)
         expected_external = (
-            "codex-main-quality:pr=44:head=" + "c" * 40 + ":run=12345"
+            "codex-main-quality:pr=44:head="
+            + "c" * 40
+            + ":run=12345:attempt=7"
         )
         if (
             result.returncode != 0
@@ -712,287 +926,1086 @@ def _final_check_tests(version_workflow: str) -> int:
     return cases
 
 
-def _mock_gh(directory: Path) -> Path:
+_REPOSITORY = "example/project"
+_PR_NUMBER = 44
+_FINAL_HEAD = "a" * 40
+_MERGE_SHA = "b" * 40
+_VERSION = "1.2.3"
+_ARTIFACT_DIGEST = "sha256:" + "c" * 64
+_HEAD_REF = "issue-44-order-independent-release"
+
+
+def _quality_title(
+    head: str, *, action: str = "opened", draft: bool = False
+) -> str:
+    return (
+        f"codex-main-quality-v1:pr={_PR_NUMBER}:event_head={head}:"
+        f"action={action}:draft={str(draft).lower()}"
+    )
+
+
+def _quality_run(
+    run_id: int,
+    run_number: int,
+    run_attempt: int,
+    *,
+    head: str = _FINAL_HEAD,
+    action: str = "opened",
+    status: str = "completed",
+    conclusion: str | None = "success",
+) -> dict[str, object]:
+    return {
+        "id": run_id,
+        "run_number": run_number,
+        "run_attempt": run_attempt,
+        "path": ".github/workflows/version-prepare.yml@refs/heads/main",
+        "event": "pull_request_target",
+        "head_sha": head,
+        "repository": {"full_name": _REPOSITORY},
+        "display_title": _quality_title(head, action=action),
+        "status": status,
+        "conclusion": conclusion,
+    }
+
+
+def _pull_request(*, merged: bool) -> dict[str, object]:
+    return {
+        "number": _PR_NUMBER,
+        "state": "closed" if merged else "open",
+        "merged": merged,
+        "draft": False,
+        "merged_at": "2026-08-31T00:00:00Z" if merged else None,
+        "merge_commit_sha": _MERGE_SHA if merged else None,
+        "base": {"ref": "main", "repo": {"full_name": _REPOSITORY}},
+        "head": {
+            "ref": _HEAD_REF,
+            "sha": _FINAL_HEAD,
+            "repo": {"full_name": _REPOSITORY},
+        },
+    }
+
+
+def _commit_object(
+    *,
+    head: str = _FINAL_HEAD,
+    message: str = "manual final head",
+    parent: str = "d" * 40,
+) -> dict[str, object]:
+    return {
+        "sha": head,
+        "commit": {"message": message},
+        "parents": [{"sha": parent}],
+    }
+
+
+def _invalid_generated_message(parent: str) -> str:
+    return (
+        f"chore: prepare version {_VERSION}\n\n"
+        "Codex-Version-Prepare-Schema: v1\n"
+        "Codex-Version-Prepare-PR: 45\n"
+        f"Codex-Version-Prepare-Event-Head: {parent}\n"
+        "Codex-Version-Prepare-Run-ID: 999\n"
+        "Codex-Version-Prepare-Run-Attempt: 1"
+    )
+
+
+def _release_candidate(
+    run_id: int,
+    attempt: int,
+    *,
+    artifact_id: int | None = None,
+    expired: bool = False,
+    head: str = _FINAL_HEAD,
+    malformed: bool = False,
+) -> dict[str, object]:
+    name = (
+        "release-candidate-v1-malformed"
+        if malformed
+        else (
+            f"release-candidate-v1-pr-{_PR_NUMBER}-head-{head}-run-{run_id}-"
+            f"attempt-{attempt}-version-{_VERSION}"
+        )
+    )
+    return {
+        "id": artifact_id if artifact_id is not None else run_id * 100 + attempt,
+        "name": name,
+        "digest": _ARTIFACT_DIGEST,
+        "expired": expired,
+    }
+
+
+def _candidate_set(run_id: int, attempt: int, mode: str) -> list[dict[str, object]]:
+    if mode == "missing":
+        return []
+    if mode == "exact":
+        return [_release_candidate(run_id, attempt)]
+    if mode == "expired":
+        return [_release_candidate(run_id, attempt, expired=True)]
+    if mode == "multiple":
+        return [
+            _release_candidate(run_id, attempt, artifact_id=run_id * 100 + attempt),
+            _release_candidate(run_id, attempt, artifact_id=run_id * 100 + attempt + 50),
+        ]
+    if mode == "malformed":
+        return [_release_candidate(run_id, attempt, malformed=True)]
+    raise AssertionError(f"unknown candidate fixture mode: {mode}")
+
+
+def _object_pages(
+    member: str, items: Sequence[Mapping[str, object]], *, paginated: bool = False
+) -> list[dict[str, object]]:
+    values = [dict(item) for item in items]
+    total = len(values)
+    if paginated:
+        return [
+            {member: [], "total_count": total},
+            {member: values, "total_count": total},
+        ]
+    return [{member: values, "total_count": total}]
+
+
+def _runs_endpoint() -> str:
+    return (
+        f"repos/{_REPOSITORY}/actions/workflows/version-prepare.yml/"
+        f"runs?event=pull_request_target&branch={_HEAD_REF}&per_page=100"
+    )
+
+
+def _manual_release_responses(
+    run_specs: Sequence[Mapping[str, object]],
+    *,
+    merged: bool = True,
+    paginated: bool = False,
+) -> tuple[dict[str, object], list[dict[str, object]]]:
+    responses: dict[str, object] = {
+        f"repos/{_REPOSITORY}/pulls/{_PR_NUMBER}": _pull_request(merged=merged),
+    }
+    summaries: list[dict[str, object]] = []
+    for spec in run_specs:
+        run_id = int(spec["id"])
+        run_number = int(spec["number"])
+        action = str(spec.get("action", "opened"))
+        attempts = list(spec["attempts"])
+        if not attempts:
+            raise AssertionError("release run fixture must contain at least one attempt")
+        latest = len(attempts)
+        latest_row = attempts[-1]
+        summary = _quality_run(
+            run_id,
+            run_number,
+            latest,
+            action=action,
+            status=str(latest_row["status"]),
+            conclusion=latest_row.get("conclusion"),
+        )
+        summaries.append(summary)
+        artifacts: list[dict[str, object]] = []
+        for attempt, row in enumerate(attempts, start=1):
+            attempt_run = _quality_run(
+                run_id,
+                run_number,
+                attempt,
+                action=action,
+                status=str(row["status"]),
+                conclusion=row.get("conclusion"),
+            )
+            responses[
+                f"repos/{_REPOSITORY}/actions/runs/{run_id}/attempts/{attempt}"
+            ] = attempt_run
+            windows = row.get("windows")
+            jobs: list[dict[str, object]] = []
+            if windows == "success":
+                jobs.append(
+                    {
+                        "name": "Run selected quality owners / windows-quality / windows-quality",
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                )
+            elif windows == "skipped":
+                jobs.append(
+                    {
+                        "name": "Run selected quality owners / windows-quality",
+                        "status": "completed",
+                        "conclusion": "skipped",
+                    }
+                )
+            elif windows == "observer":
+                jobs.append(
+                    {
+                        "name": "Observe non-authoritative PR event",
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                )
+            elif windows is not None:
+                raise AssertionError(f"unknown Windows fixture result: {windows}")
+            responses[
+                f"repos/{_REPOSITORY}/actions/runs/{run_id}/attempts/{attempt}/jobs?filter=all&per_page=100"
+            ] = _object_pages("jobs", jobs, paginated=paginated)
+            mode = row.get("candidate")
+            if mode is not None:
+                artifacts.extend(_candidate_set(run_id, attempt, str(mode)))
+        responses[
+            f"repos/{_REPOSITORY}/actions/runs/{run_id}/artifacts?per_page=100"
+        ] = _object_pages("artifacts", artifacts, paginated=paginated)
+    responses[f"repos/{_REPOSITORY}/commits/{_FINAL_HEAD}"] = _commit_object()
+    responses[_runs_endpoint()] = _object_pages(
+        "workflow_runs", summaries, paginated=paginated
+    )
+    return responses, summaries
+
+
+def _closed_event(*, merged: bool = True) -> dict[str, object]:
+    return {
+        "action": "closed",
+        "pull_request": {
+            "number": _PR_NUMBER,
+            "base": {"ref": "main"},
+            "merged": merged,
+        },
+    }
+
+
+def _workflow_event(run: Mapping[str, object]) -> dict[str, object]:
+    return {"workflow_run": dict(run)}
+
+
+def _execute_release_shell(
+    script: str,
+    responses: Mapping[str, object],
+    *,
+    event_name: str,
+    event: Mapping[str, object],
+) -> tuple[subprocess.CompletedProcess[str], dict[str, str], list[list[str]]]:
+    with tempfile.TemporaryDirectory(prefix="codex-info-release-shell-") as raw_root:
+        root = Path(raw_root)
+        bin_dir = root / "bin"
+        runner_temp = root / "runner-temp"
+        bin_dir.mkdir()
+        runner_temp.mkdir()
+        _write_readonly_gh(bin_dir)
+        database = root / "database.json"
+        database.write_text(
+            json.dumps({"responses": dict(responses)}), encoding="utf-8"
+        )
+        event_path = root / "event.json"
+        event_path.write_text(json.dumps(event), encoding="utf-8")
+        output = root / "output"
+        output.write_text("", encoding="utf-8")
+        log = root / "gh.jsonl"
+        log.write_text("", encoding="utf-8")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "EVENT_NAME": event_name,
+                "GH_TOKEN": "fixture",
+                "GITHUB_EVENT_PATH": str(event_path),
+                "GITHUB_OUTPUT": str(output),
+                "MOCK_GH_DATABASE": str(database),
+                "MOCK_GH_LOG": str(log),
+                "PATH": f"{bin_dir}:{environment['PATH']}",
+                "REPOSITORY": _REPOSITORY,
+                "RUNNER_TEMP": str(runner_temp),
+            }
+        )
+        result = _command(
+            ("bash", "-c", script), cwd=root, env=environment, check=False
+        )
+        calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        return result, _output(output), calls
+
+
+def _generated_release_responses() -> tuple[dict[str, object], dict[str, object]]:
+    generator_head = "e" * 40
+    generator = _quality_run(301, 30, 7, head=generator_head, action="opened")
+    observer = _quality_run(302, 31, 1, head=_FINAL_HEAD, action="synchronize")
+    message = (
+        f"chore: prepare version {_VERSION}\n\n"
+        "Codex-Version-Prepare-Schema: v1\n"
+        f"Codex-Version-Prepare-PR: {_PR_NUMBER}\n"
+        f"Codex-Version-Prepare-Event-Head: {generator_head}\n"
+        "Codex-Version-Prepare-Run-ID: 301\n"
+        "Codex-Version-Prepare-Run-Attempt: 7"
+    )
+    candidate = _release_candidate(301, 7)
+    responses: dict[str, object] = {
+        f"repos/{_REPOSITORY}/pulls/{_PR_NUMBER}": _pull_request(merged=True),
+        f"repos/{_REPOSITORY}/commits/{_FINAL_HEAD}": _commit_object(
+            message=message, parent=generator_head
+        ),
+        _runs_endpoint(): _object_pages("workflow_runs", [generator, observer]),
+        f"repos/{_REPOSITORY}/actions/runs/301": generator,
+        f"repos/{_REPOSITORY}/actions/runs/301/attempts/7": generator,
+        f"repos/{_REPOSITORY}/actions/runs/301/attempts/7/jobs?filter=all&per_page=100": _object_pages(
+            "jobs",
+            [
+                {
+                    "name": "Run selected quality owners / windows-quality / windows-quality",
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+            ],
+        ),
+        f"repos/{_REPOSITORY}/actions/runs/301/artifacts?per_page=100": _object_pages(
+            "artifacts", [candidate]
+        ),
+        f"repos/{_REPOSITORY}/actions/runs/302/artifacts?per_page=100": _object_pages(
+            "artifacts", []
+        ),
+    }
+    return responses, generator
+
+
+def _release_resolution_tests(release_workflow: str) -> int:
+    script = _step_script(release_workflow, "Resolve the immutable publication snapshot")
+    cases = 0
+
+    successful_spec = [
+        {
+            "id": 101,
+            "number": 11,
+            "attempts": [
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "windows": "success",
+                    "candidate": "exact",
+                }
+            ],
+        }
+    ]
+
+    # Quality-first: the early completed signal is a green no-op until merge,
+    # then the closed signal converges on the exact same immutable snapshot.
+    responses, summaries = _manual_release_responses(successful_spec, merged=False)
+    result, values, _ = _execute_release_shell(
+        script,
+        responses,
+        event_name="workflow_run",
+        event=_workflow_event(summaries[0]),
+    )
+    if result.returncode != 0 or values.get("publish") != "false":
+        raise AssertionError("quality-first signal did not wait for merge")
+    cases += 1
+    responses, _ = _manual_release_responses(successful_spec, merged=True)
+    result, values, _ = _execute_release_shell(
+        script, responses, event_name="pull_request_target", event=_closed_event()
+    )
+    if result.returncode != 0 or values.get("publish") != "true":
+        raise AssertionError("quality-first closed signal did not publish")
+    cases += 1
+
+    # Merge-first: closed observes a pending attempt without becoming red; the
+    # later successful workflow signal performs the same release resolution.
+    pending_spec = [
+        {
+            "id": 102,
+            "number": 12,
+            "attempts": [{"status": "in_progress", "conclusion": None}],
+        }
+    ]
+    responses, _ = _manual_release_responses(pending_spec, merged=True)
+    result, values, _ = _execute_release_shell(
+        script, responses, event_name="pull_request_target", event=_closed_event()
+    )
+    if result.returncode != 0 or values.get("publish") != "false":
+        raise AssertionError("merge-first closed signal did not hold pending quality")
+    cases += 1
+
+    no_runs, _ = _manual_release_responses([], merged=True)
+    result, values, _ = _execute_release_shell(
+        script, no_runs, event_name="pull_request_target", event=_closed_event()
+    )
+    if result.returncode != 0 or values.get("publish") != "false":
+        raise AssertionError("closed signal with no visible run was not a green HOLD")
+    cases += 1
+
+    responses, summaries = _manual_release_responses(successful_spec, merged=True)
+    responses[_runs_endpoint()] = _object_pages("workflow_runs", [])
+    result, values, _ = _execute_release_shell(
+        script,
+        responses,
+        event_name="workflow_run",
+        event=_workflow_event(summaries[0]),
+    )
+    if result.returncode != 0 or values.get("publish") != "true":
+        raise AssertionError("merge-first completion did not publish")
+    cases += 1
+
+    nonsuccess_signal = _quality_run(
+        103, 13, 1, status="completed", conclusion="failure"
+    )
+    result, values, calls = _execute_release_shell(
+        script,
+        {},
+        event_name="workflow_run",
+        event=_workflow_event(nonsuccess_signal),
+    )
+    if result.returncode != 0 or values.get("publish") != "false" or calls:
+        raise AssertionError("non-success workflow signal was not a green mutation-free no-op")
+    cases += 1
+
+    barriers: tuple[tuple[str, Sequence[Mapping[str, object]]], ...] = (
+        (
+            "success-then-failure",
+            [
+                {
+                    "id": 110,
+                    "number": 20,
+                    "attempts": [
+                        {"status": "completed", "conclusion": "success"},
+                        {"status": "completed", "conclusion": "failure"},
+                    ],
+                }
+            ],
+        ),
+        (
+            "failure-then-success",
+            [
+                {
+                    "id": 111,
+                    "number": 21,
+                    "attempts": [
+                        {"status": "completed", "conclusion": "failure"},
+                        {"status": "completed", "conclusion": "success"},
+                    ],
+                }
+            ],
+        ),
+        (
+            "failure-then-reopen-success",
+            [
+                {
+                    "id": 112,
+                    "number": 22,
+                    "action": "opened",
+                    "attempts": [{"status": "completed", "conclusion": "failure"}],
+                },
+                {
+                    "id": 113,
+                    "number": 23,
+                    "action": "reopened",
+                    "attempts": [{"status": "completed", "conclusion": "success"}],
+                },
+            ],
+        ),
+    )
+    for name, specs in barriers:
+        responses, _ = _manual_release_responses(specs)
+        result, values, _ = _execute_release_shell(
+            script, responses, event_name="pull_request_target", event=_closed_event()
+        )
+        if result.returncode != 0 or values.get("publish") != "false":
+            raise AssertionError(f"all-attempt failure barrier failed: {name}")
+        cases += 1
+
+    skipped_spec = [
+        {
+            "id": 120,
+            "number": 30,
+            "attempts": [
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "windows": "skipped",
+                    "candidate": "missing",
+                }
+            ],
+        }
+    ]
+    responses, _ = _manual_release_responses(skipped_spec)
+    result, values, _ = _execute_release_shell(
+        script, responses, event_name="pull_request_target", event=_closed_event()
+    )
+    if result.returncode != 0 or values.get("publish") != "false":
+        raise AssertionError("skipped Windows authority with zero candidates was not a no-op")
+    cases += 1
+
+    draft_observer_spec = [
+        {
+            "id": 121,
+            "number": 31,
+            "attempts": [
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "windows": "observer",
+                    "candidate": "missing",
+                }
+            ],
+        }
+    ]
+    responses, _ = _manual_release_responses(draft_observer_spec)
+    result, values, _ = _execute_release_shell(
+        script, responses, event_name="pull_request_target", event=_closed_event()
+    )
+    if result.returncode != 0 or values.get("publish") != "false":
+        raise AssertionError("current-draft successful observer was treated as Windows authority")
+    cases += 1
+
+    # Empty first pages prove that runs, jobs, and artifacts are all flattened
+    # across pagination before the exact-one decision.
+    responses, _ = _manual_release_responses(successful_spec, paginated=True)
+    invalid_parent = "d" * 40
+    responses[f"repos/{_REPOSITORY}/commits/{_FINAL_HEAD}"] = _commit_object(
+        message=_invalid_generated_message(invalid_parent),
+        parent=invalid_parent,
+    )
+    result, values, _ = _execute_release_shell(
+        script, responses, event_name="pull_request_target", event=_closed_event()
+    )
+    if (
+        result.returncode != 0
+        or values.get("publish") != "true"
+        or values.get("run_id") != "101"
+        or values.get("run_attempt") != "1"
+        or values.get("artifact_name")
+        != _release_candidate(101, 1)["name"]
+    ):
+        raise AssertionError("paginated exact-one Windows candidate was not selected")
+    cases += 1
+
+    incomplete = json.loads(json.dumps(responses))
+    for page in incomplete[_runs_endpoint()]:
+        page["total_count"] = 2
+    result, _, _ = _execute_release_shell(
+        script, incomplete, event_name="pull_request_target", event=_closed_event()
+    )
+    if result.returncode == 0:
+        raise AssertionError("incomplete paginated run history was accepted")
+    cases += 1
+
+    for mode in ("missing", "expired", "multiple", "malformed"):
+        bad_spec = [
+            {
+                "id": 130,
+                "number": 40,
+                "attempts": [
+                    {
+                        "status": "completed",
+                        "conclusion": "success",
+                        "windows": "success",
+                        "candidate": mode,
+                    }
+                ],
+            }
+        ]
+        responses, _ = _manual_release_responses(bad_spec)
+        result, _, _ = _execute_release_shell(
+            script, responses, event_name="pull_request_target", event=_closed_event()
+        )
+        if result.returncode == 0:
+            raise AssertionError(f"invalid Windows candidate was accepted: {mode}")
+        cases += 1
+
+    responses, generator = _generated_release_responses()
+    result, values, _ = _execute_release_shell(
+        script,
+        responses,
+        event_name="workflow_run",
+        event=_workflow_event(generator),
+    )
+    if (
+        result.returncode != 0
+        or values.get("publish") != "true"
+        or values.get("run_id") != "301"
+        or values.get("run_attempt") != "7"
+    ):
+        raise AssertionError("generated H1 observer replaced or duplicated its H0 producer")
+    cases += 1
+    return cases
+
+
+def _execute_revalidation(
+    script: str,
+    responses: Mapping[str, object],
+    authority: Mapping[str, str],
+    *,
+    event_name: str,
+    event: Mapping[str, object],
+) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+    with tempfile.TemporaryDirectory(prefix="codex-info-release-lock-") as raw_root:
+        root = Path(raw_root)
+        bin_dir = root / "bin"
+        runner_temp = root / "runner-temp"
+        bin_dir.mkdir()
+        runner_temp.mkdir()
+        _write_readonly_gh(bin_dir)
+        database = root / "database.json"
+        database.write_text(
+            json.dumps({"responses": dict(responses)}), encoding="utf-8"
+        )
+        event_path = root / "event.json"
+        event_path.write_text(json.dumps(event), encoding="utf-8")
+        output = root / "output"
+        output.write_text("", encoding="utf-8")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "ARTIFACT_DIGEST": authority["artifact_digest"],
+                "ARTIFACT_ID": authority["artifact_id"],
+                "ARTIFACT_NAME": authority["artifact_name"],
+                "EVENT_NAME": event_name,
+                "FINAL_HEAD": authority["final_head"],
+                "FINGERPRINT": authority["fingerprint"],
+                "GH_TOKEN": "fixture",
+                "GITHUB_EVENT_PATH": str(event_path),
+                "GITHUB_OUTPUT": str(output),
+                "MERGE_SHA": authority["merge_sha"],
+                "MOCK_GH_DATABASE": str(database),
+                "PATH": f"{bin_dir}:{environment['PATH']}",
+                "PR_NUMBER": authority["pr_number"],
+                "REPOSITORY": _REPOSITORY,
+                "RUN_ATTEMPT": authority["run_attempt"],
+                "RUN_ID": authority["run_id"],
+                "RUN_NUMBER": authority["run_number"],
+                "RUNNER_TEMP": str(runner_temp),
+                "VERSION": authority["version"],
+            }
+        )
+        result = _command(
+            ("bash", "-c", script), cwd=root, env=environment, check=False
+        )
+        return result, _output(output)
+
+
+def _release_lock_tests(release_workflow: str) -> int:
+    resolve_script = _step_script(
+        release_workflow, "Resolve the immutable publication snapshot"
+    )
+    revalidate_script = _step_script(
+        release_workflow, "Revalidate authority after acquiring the tag lock"
+    )
+    spec = [
+        {
+            "id": 201,
+            "number": 51,
+            "attempts": [
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "windows": "success",
+                    "candidate": "exact",
+                }
+            ],
+        }
+    ]
+    responses, summaries = _manual_release_responses(spec)
+    signal = summaries[0]
+    invalid_parent = "d" * 40
+    responses[f"repos/{_REPOSITORY}/commits/{_FINAL_HEAD}"] = _commit_object(
+        message=_invalid_generated_message(invalid_parent),
+        parent=invalid_parent,
+    )
+    responses[_runs_endpoint()] = _object_pages("workflow_runs", [])
+    resolved, authority, _ = _execute_release_shell(
+        resolve_script,
+        responses,
+        event_name="workflow_run",
+        event=_workflow_event(signal),
+    )
+    if resolved.returncode != 0 or authority.get("publish") != "true":
+        raise AssertionError("lock fixture did not resolve an initial authority")
+
+    result, values = _execute_revalidation(
+        revalidate_script,
+        responses,
+        authority,
+        event_name="workflow_run",
+        event=_workflow_event(signal),
+    )
+    if result.returncode != 0 or values.get("proceed") != "true":
+        raise AssertionError("unchanged authority failed after acquiring the tag lock")
+    cases = 1
+
+    changed = json.loads(json.dumps(responses))
+    changed[_runs_endpoint()] = _object_pages(
+        "workflow_runs", [_quality_run(202, 52, 1, action="reopened")]
+    )
+    result, values = _execute_revalidation(
+        revalidate_script,
+        changed,
+        authority,
+        event_name="workflow_run",
+        event=_workflow_event(signal),
+    )
+    if result.returncode != 0 or values.get("proceed") != "false":
+        raise AssertionError("changed latest-run fingerprint passed the tag lock")
+    cases += 1
+    return cases
+
+
+def _write_publish_gh(directory: Path) -> Path:
     binary = directory / "gh"
     binary.write_text(
-        "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n"
-        "case \"$*\" in\n"
-        "  *'/check-runs?'*) cat \"$MOCK_CHECKS\" ;;\n"
-        "  *'/actions/workflows/version-prepare.yml/runs?'*) cat \"$MOCK_RUNS\" ;;\n"
-        "  *\"/actions/runs/$MOCK_DIRECT_RUN_ID/jobs?\"*) cat \"$MOCK_DIRECT_JOBS\" ;;\n"
-        "  *\"/actions/runs/$MOCK_DIRECT_RUN_ID\"*) cat \"$MOCK_DIRECT_RUN\" ;;\n"
-        "  *'/jobs?'*) cat \"$MOCK_JOBS\" ;;\n"
-        "  *'/actions/runs/'*) cat \"$MOCK_RUN\" ;;\n"
-        "  *) exit 4 ;;\n"
-        "esac\n",
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import hashlib
+            import json
+            import os
+            from pathlib import Path
+            import re
+            import sys
+
+            state_path = Path(os.environ["MOCK_GH_STATE"])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            args = sys.argv[1:]
+            payload = None
+            if "--input" in args:
+                payload = json.load(sys.stdin)
+            with open(os.environ["MOCK_GH_LOG"], "a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"tool": "gh", "args": args, "input": payload}, separators=(",", ":")) + "\\n")
+
+            def save():
+                state_path.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+
+            def emit(value):
+                json.dump(value, sys.stdout, separators=(",", ":"))
+                sys.stdout.write("\\n")
+
+            if not args or args[0] != "api":
+                raise SystemExit(3)
+            endpoint = next((arg for arg in args if arg.startswith("repos/")), None)
+            if endpoint is None:
+                raise SystemExit(4)
+            method = "GET"
+            if "--method" in args:
+                method = args[args.index("--method") + 1]
+
+            if method == "GET" and "/git/matching-refs/tags/" in endpoint:
+                emit([state["tags"]])
+                raise SystemExit(0)
+            if method == "GET" and endpoint.endswith("/releases?per_page=100"):
+                emit([state["releases"]])
+                raise SystemExit(0)
+            match = re.search(r"/releases/([1-9][0-9]*)/assets\\?per_page=100$", endpoint)
+            if method == "GET" and match:
+                emit([state["assets"].get(match.group(1), [])])
+                raise SystemExit(0)
+            match = re.search(r"/releases/([1-9][0-9]*)$", endpoint)
+            if method == "GET" and match:
+                emit(state["details"][match.group(1)])
+                raise SystemExit(0)
+
+            if method == "POST" and endpoint.endswith("/releases"):
+                release_id = int(state["next_id"])
+                state["next_id"] = release_id + 1
+                detail = {
+                    "id": release_id,
+                    "tag_name": payload["tag_name"],
+                    "target_commitish": payload["target_commitish"],
+                    "name": payload["name"],
+                    "body": payload["body"],
+                    "draft": True,
+                    "prerelease": False,
+                    "published_at": None,
+                    "upload_url": (
+                        f"https://uploads.github.com/repos/example/project/releases/"
+                        f"{release_id}/assets{{?name,label}}"
+                    ),
+                }
+                state["tags"].append(
+                    {
+                        "ref": "refs/tags/" + payload["tag_name"],
+                        "object": {"type": "commit", "sha": payload["target_commitish"]},
+                    }
+                )
+                state["releases"].append(
+                    {"id": release_id, "tag_name": payload["tag_name"], "draft": True}
+                )
+                state["details"][str(release_id)] = detail
+                state["assets"][str(release_id)] = []
+                save()
+                emit(detail)
+                raise SystemExit(0)
+
+            if method == "PATCH" and match:
+                release_id = match.group(1)
+                detail = state["details"][release_id]
+                detail["draft"] = bool(payload["draft"])
+                detail["published_at"] = None if detail["draft"] else "2026-08-31T00:01:00Z"
+                for release in state["releases"]:
+                    if str(release["id"]) == release_id:
+                        release["draft"] = detail["draft"]
+                save()
+                response = dict(detail)
+                response["assets"] = state["assets"].get(release_id, [])
+                emit(response)
+                raise SystemExit(0)
+
+            print(f"unexpected gh operation: {args}", file=sys.stderr)
+            raise SystemExit(5)
+            """
+        ),
         encoding="utf-8",
     )
     binary.chmod(0o755)
     return binary
 
 
-def _release_resolution_tests(release_workflow: str) -> int:
-    script = _step_script(release_workflow, "Resolve the successful final-head quality run")
-    head = "a" * 40
-    base_run = {
-        "id": 10,
-        "path": ".github/workflows/version-prepare.yml",
-        "event": "pull_request_target",
-        "head_sha": head,
-        "conclusion": "success",
+def _write_publish_curl(directory: Path) -> Path:
+    binary = directory / "curl"
+    binary.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env python3
+            import hashlib
+            import json
+            import os
+            from pathlib import Path
+            import re
+            import sys
+
+            args = sys.argv[1:]
+            with open(os.environ["MOCK_GH_LOG"], "a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"tool": "curl", "args": args}, separators=(",", ":")) + "\\n")
+            state_path = Path(os.environ["MOCK_GH_STATE"])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+            def option(name):
+                return args[args.index(name) + 1]
+
+            if option("--request") != "POST":
+                raise SystemExit(3)
+            data = option("--data-binary")
+            if not data.startswith("@"):
+                raise SystemExit(4)
+            source = Path(data[1:])
+            output = Path(option("--output"))
+            url = args[-1]
+            match = re.fullmatch(
+                r"https://uploads\\.github\\.com/repos/example/project/releases/([1-9][0-9]*)/assets\\?name=([^&]+)",
+                url,
+            )
+            if match is None or not source.is_file():
+                raise SystemExit(5)
+            release_id = match.group(1)
+            if release_id not in state["details"]:
+                raise SystemExit(6)
+            content = source.read_bytes()
+            asset = {
+                "id": int(release_id) * 10 + len(state["assets"].get(release_id, [])) + 1,
+                "name": match.group(2),
+                "state": "uploaded",
+                "size": len(content),
+                "digest": "sha256:" + hashlib.sha256(content).hexdigest(),
+            }
+            state["assets"].setdefault(release_id, []).append(asset)
+            state_path.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+            output.write_text(json.dumps(asset, separators=(",", ":")), encoding="utf-8")
+            sys.stdout.write("201")
+            """
+        ),
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    return binary
+
+
+def _release_assets(setup: Path, manifest: Path) -> list[dict[str, object]]:
+    assets: list[dict[str, object]] = []
+    for path in (setup, manifest):
+        content = path.read_bytes()
+        assets.append(
+            {
+                "name": path.name,
+                "state": "uploaded",
+                "size": len(content),
+                "digest": "sha256:" + hashlib.sha256(content).hexdigest(),
+            }
+        )
+    return assets
+
+
+def _publication_state(kind: str, setup: Path, manifest: Path) -> dict[str, object]:
+    state: dict[str, object] = {
+        "next_id": 901,
+        "tags": [],
+        "releases": [],
+        "details": {},
+        "assets": {},
     }
-    cases = 0
-    with tempfile.TemporaryDirectory(prefix="codex-info-release-resolver-") as raw_root:
-        root = Path(raw_root)
-        bin_dir = root / "bin"
-        bin_dir.mkdir()
-        _mock_gh(bin_dir)
+    if kind == "absent":
+        return state
+    release_id = 900
+    tag = {
+        "ref": f"refs/tags/windows-v{_VERSION}",
+        "object": {"type": "commit", "sha": _MERGE_SHA},
+    }
+    detail = {
+        "id": release_id,
+        "tag_name": f"windows-v{_VERSION}",
+        "target_commitish": _MERGE_SHA,
+        "name": f"Codex Info Monitor {_VERSION}",
+        "body": f"Windows client {_VERSION}",
+        "draft": False,
+        "prerelease": False,
+        "published_at": "2026-08-31T00:00:00Z",
+        "upload_url": (
+            f"https://uploads.github.com/repos/{_REPOSITORY}/releases/"
+            f"{release_id}/assets{{?name,label}}"
+        ),
+    }
+    assets = _release_assets(setup, manifest)
+    if kind != "release-only":
+        state["tags"] = [tag]
+    if kind != "orphan-tag":
+        state["releases"] = [
+            {"id": release_id, "tag_name": f"windows-v{_VERSION}", "draft": False}
+        ]
+        state["details"] = {str(release_id): detail}
+        state["assets"] = {str(release_id): assets}
+    if kind == "draft":
+        state["releases"][0]["draft"] = True
+        state["details"][str(release_id)]["draft"] = True
+        state["details"][str(release_id)]["published_at"] = None
+    elif kind == "partial":
+        state["assets"][str(release_id)] = assets[:1]
+    elif kind == "target-mismatch":
+        state["details"][str(release_id)]["target_commitish"] = "f" * 40
+    elif kind == "asset-mismatch":
+        state["assets"][str(release_id)][0]["digest"] = "sha256:" + "0" * 64
+    elif kind not in {"orphan-tag", "release-only", "published"}:
+        raise AssertionError(f"unknown publication fixture: {kind}")
+    return state
 
-        def execute(
-            runs: list[dict[str, object]],
-            jobs: list[dict[str, object]],
-            *,
-            checks: list[dict[str, object]] | None = None,
-            selected_run: dict[str, object] | None = None,
-            direct_run: dict[str, object] | None = None,
-            direct_jobs: list[dict[str, object]] | None = None,
+
+def _publish_mutations(calls: Sequence[Mapping[str, object]]) -> list[Mapping[str, object]]:
+    mutations: list[Mapping[str, object]] = []
+    for call in calls:
+        args = call["args"]
+        if call.get("tool") == "curl" or (
+            call.get("tool") == "gh"
+            and "--method" in args
+            and args[args.index("--method") + 1] in {"POST", "PATCH"}
         ):
-            checks_path = root / "checks.json"
-            runs_path = root / "runs.json"
-            run_path = root / "run.json"
-            jobs_path = root / "jobs.json"
-            direct_run_path = root / "direct-run.json"
-            direct_jobs_path = root / "direct-jobs.json"
-            output = root / "output"
-            checks_path.write_text(
-                json.dumps({"check_runs": checks or []}), encoding="utf-8"
-            )
-            runs_path.write_text(json.dumps({"workflow_runs": runs}), encoding="utf-8")
-            run_path.write_text(
-                json.dumps(selected_run or (runs[-1] if runs else {})), encoding="utf-8"
-            )
-            jobs_path.write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
-            direct_run_path.write_text(json.dumps(direct_run or {}), encoding="utf-8")
-            direct_jobs_path.write_text(
-                json.dumps({"jobs": direct_jobs or []}), encoding="utf-8"
-            )
-            output.write_text("", encoding="utf-8")
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "GITHUB_OUTPUT": str(output),
-                    "HEAD_SHA": head,
-                    "MOCK_CHECKS": str(checks_path),
-                    "MOCK_DIRECT_JOBS": str(direct_jobs_path),
-                    "MOCK_DIRECT_RUN": str(direct_run_path),
-                    "MOCK_DIRECT_RUN_ID": str((direct_run or {}).get("id", 0)),
-                    "MOCK_JOBS": str(jobs_path),
-                    "MOCK_RUN": str(run_path),
-                    "MOCK_RUNS": str(runs_path),
-                    "PATH": f"{bin_dir}:{environment['PATH']}",
-                    "PR_NUMBER": "44",
-                    "REPOSITORY": "example/project",
-                }
-            )
-            result = _command(
-                ("bash", "-c", script), cwd=root, env=environment, check=False
-            )
-            return result, _output(output)
+            mutations.append(call)
+    return mutations
 
-        for conclusion, expected in (("skipped", "false"), ("success", "true")):
-            result, values = execute(
-                [base_run],
-                [{"name": "Run selected quality owners / windows-quality", "conclusion": conclusion}],
-            )
-            if result.returncode != 0 or values.get("publish") != expected:
-                raise AssertionError(f"Windows {conclusion} release decision is wrong")
-            cases += 1
 
-        latest = dict(base_run, id=20)
-        result, values = execute(
-            [base_run, latest],
-            [{"name": "selected / windows-quality / windows-quality", "conclusion": "success"}],
-            selected_run=latest,
-        )
-        if result.returncode != 0 or values.get("run_id") != "20":
-            raise AssertionError("latest equivalent successful producer was not selected")
-        cases += 1
-
-        generated_run = dict(base_run, head_sha="b" * 40)
-        generated_check = {
-            "name": "acceptance",
-            "head_sha": head,
-            "external_id": (
-                "codex-main-quality:pr=44:head=" + head + ":run=10"
-            ),
+def _execute_publication(
+    script: str,
+    case_root: Path,
+    *,
+    initial_state: Mapping[str, object] | None,
+) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]], dict[str, object]]:
+    bin_dir = case_root / "bin"
+    candidate = case_root / "release-candidate"
+    bin_dir.mkdir(exist_ok=True)
+    candidate.mkdir(exist_ok=True)
+    setup = candidate / "CodexInfo.WindowsClient.Setup.exe"
+    manifest = candidate / "CodexInfo.WindowsClient.update.json"
+    setup.write_bytes(b"fixture installer")
+    manifest.write_text(json.dumps({"version": _VERSION}), encoding="utf-8")
+    _write_publish_gh(bin_dir)
+    _write_publish_curl(bin_dir)
+    state_path = case_root / "state.json"
+    if initial_state is not None:
+        state_path.write_text(json.dumps(initial_state), encoding="utf-8")
+    log = case_root / "gh.jsonl"
+    log.write_text("", encoding="utf-8")
+    runner_temp = case_root / "runner-temp"
+    runner_temp.mkdir(exist_ok=True)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GH_TOKEN": "fixture",
+            "MERGE_SHA": _MERGE_SHA,
+            "MOCK_GH_LOG": str(log),
+            "MOCK_GH_STATE": str(state_path),
+            "PATH": f"{bin_dir}:{environment['PATH']}",
+            "REPOSITORY": _REPOSITORY,
+            "RUNNER_TEMP": str(runner_temp),
+            "TAG": f"windows-v{_VERSION}",
+            "VERSION": _VERSION,
         }
-        result, values = execute(
-            [],
-            [{"name": "selected / windows-quality", "conclusion": "success"}],
-            checks=[generated_check],
-            selected_run=generated_run,
-        )
-        if result.returncode != 0 or values.get("run_id") != "10":
-            raise AssertionError("generated-head check did not resolve its H0 producer")
-        cases += 1
-
-        observer_run = dict(base_run, id=20)
-        result, values = execute(
-            [observer_run],
-            [{"name": "selected / windows-quality", "conclusion": "success"}],
-            checks=[generated_check],
-            selected_run=generated_run,
-            direct_run=observer_run,
-            direct_jobs=[{"name": "Observe generated H1", "conclusion": "success"}],
-        )
-        if result.returncode != 0 or values.get("run_id") != "10":
-            raise AssertionError("generated-H1 observer replaced its quality producer")
-        cases += 1
-
-        for conclusion in ("failure", "cancelled"):
-            later_abnormal = dict(base_run, id=20, conclusion=conclusion)
-            result, _ = execute(
-                [later_abnormal],
-                [{"name": "selected / windows-quality", "conclusion": "success"}],
-                checks=[generated_check],
-                selected_run=later_abnormal,
-            )
-            if result.returncode == 0:
-                raise AssertionError(
-                    f"later {conclusion} fell back to an older successful producer"
-                )
-            cases += 1
-
-        bad_cases = (
-            ([], [{"name": "selected / windows-quality", "conclusion": "success"}]),
-            ([base_run], []),
-            (
-                [base_run],
-                [
-                    {"name": "a / windows-quality", "conclusion": "success"},
-                    {"name": "b / windows-quality", "conclusion": "success"},
-                ],
-            ),
-            ([base_run], [{"name": "selected / windows-quality", "conclusion": "failure"}]),
-            ([base_run], [{"name": "selected / windows-quality", "conclusion": "cancelled"}]),
-        )
-        for runs, jobs in bad_cases:
-            result, _ = execute(runs, jobs)
-            if result.returncode == 0:
-                raise AssertionError(f"invalid release producer was accepted: {runs}, {jobs}")
-            cases += 1
-
-        malformed_check = dict(generated_check, external_id="codex-main-quality:broken")
-        result, _ = execute(
-            [],
-            [{"name": "selected / windows-quality", "conclusion": "success"}],
-            checks=[malformed_check],
-            selected_run=generated_run,
-        )
-        if result.returncode == 0:
-            raise AssertionError("malformed generated-head authority was accepted")
-        cases += 1
-    return cases
+    )
+    result = _command(
+        ("bash", "-c", script), cwd=case_root, env=environment, check=False
+    )
+    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    final_state = json.loads(state_path.read_text(encoding="utf-8"))
+    return result, calls, final_state
 
 
 def _release_publish_tests(release_workflow: str) -> int:
-    script = _step_script(release_workflow, "Publish the Windows release")
+    script = _step_script(release_workflow, "Publish or verify the exact release state")
     cases = 0
     with tempfile.TemporaryDirectory(prefix="codex-info-release-publish-") as raw_root:
         root = Path(raw_root)
-        bin_dir = root / "bin"
-        candidate = root / "release-candidate"
-        bin_dir.mkdir()
+
+        absent_root = root / "absent"
+        absent_root.mkdir()
+        candidate = absent_root / "release-candidate"
         candidate.mkdir()
         setup = candidate / "CodexInfo.WindowsClient.Setup.exe"
         manifest = candidate / "CodexInfo.WindowsClient.update.json"
         setup.write_bytes(b"fixture installer")
-
-        gh = bin_dir / "gh"
-        gh.write_text(
-            "#!/usr/bin/env bash\n"
-            "set -euo pipefail\n"
-            "printf '%s\\n' \"$*\" >> \"$MOCK_GH_LOG\"\n"
-            "if [[ \"${1:-} ${2:-}\" == 'release create' ]]; then\n"
-            "  [[ -f \"${4:-}\" && -f \"${5:-}\" ]] || exit 2\n"
-            "  exit \"${MOCK_CREATE_RC:-0}\"\n"
-            "fi\n"
-            "if [[ \"${1:-} ${2:-}\" == 'release edit' ]]; then\n"
-            "  exit \"${MOCK_EDIT_RC:-0}\"\n"
-            "fi\n"
-            "exit 3\n",
-            encoding="utf-8",
+        manifest.write_text(json.dumps({"version": _VERSION}), encoding="utf-8")
+        state = _publication_state("absent", setup, manifest)
+        result, calls, final_state = _execute_publication(
+            script, absent_root, initial_state=state
         )
-        gh.chmod(0o755)
-
-        def execute(
-            manifest_value: object,
-            *,
-            create_rc: int = 0,
-            edit_rc: int = 0,
-            setup_present: bool = True,
-        ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
-            manifest.write_text(json.dumps(manifest_value), encoding="utf-8")
-            if setup_present:
-                setup.write_bytes(b"fixture installer")
-            else:
-                setup.unlink(missing_ok=True)
-            log = root / "gh.log"
-            log.write_text("", encoding="utf-8")
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "GH_TOKEN": "fixture",
-                    "MERGE_SHA": "b" * 40,
-                    "MOCK_CREATE_RC": str(create_rc),
-                    "MOCK_EDIT_RC": str(edit_rc),
-                    "MOCK_GH_LOG": str(log),
-                    "PATH": f"{bin_dir}:{environment['PATH']}",
-                    "REPOSITORY": "example/project",
-                }
+        mutations = _publish_mutations(calls)
+        if (
+            result.returncode != 0
+            or len([call for call in mutations if call.get("tool") == "curl"]) != 2
+            or len(
+                [
+                    call
+                    for call in mutations
+                    if call.get("tool") == "gh" and "POST" in call["args"]
+                ]
             )
-            result = _command(
-                ("bash", "-c", script), cwd=root, env=environment, check=False
+            != 1
+            or len(
+                [
+                    call
+                    for call in mutations
+                    if call.get("tool") == "gh" and "PATCH" in call["args"]
+                ]
             )
-            return result, log.read_text(encoding="utf-8").splitlines()
-
-        result, calls = execute({"version": "1.2.3"})
-        if result.returncode != 0 or len(calls) != 2:
-            raise AssertionError("valid candidate did not complete the two release transitions")
-        if not (
-            calls[0].startswith(
-                "release create windows-v1.2.3 "
-                "release-candidate/CodexInfo.WindowsClient.Setup.exe "
-                "release-candidate/CodexInfo.WindowsClient.update.json"
-            )
-            and "--target " + "b" * 40 in calls[0]
-            and calls[0].endswith("--draft")
-            and calls[1]
-            == "release edit windows-v1.2.3 --repo example/project --draft=false"
+            != 1
+            or final_state["details"]["901"]["draft"] is not False
+            or len(final_state["assets"]["901"]) != 2
         ):
-            raise AssertionError(f"release transition order or arguments are wrong: {calls}")
+            raise AssertionError("fully absent release did not create-upload-publish exactly once")
         cases += 1
 
-        result, calls = execute({"version": "1.2.3"}, create_rc=1)
-        if result.returncode == 0 or len(calls) != 1 or "release create" not in calls[0]:
-            raise AssertionError("failed draft creation continued to publication")
+        # A second same-tag holder acquires the lock after the first publication
+        # and must observe an exact published no-op without another mutation.
+        result, calls, _ = _execute_publication(
+            script, absent_root, initial_state=None
+        )
+        if result.returncode != 0 or _publish_mutations(calls):
+            raise AssertionError("concurrent holder did not reduce to exact published no-op")
         cases += 1
 
-        result, calls = execute({"version": "1.2.3"}, edit_rc=1)
-        if result.returncode == 0 or len(calls) != 2 or not calls[0].endswith("--draft"):
-            raise AssertionError("failed publication did not leave the release at draft transition")
-        cases += 1
-
-        result, calls = execute({"version": "1.2"})
-        if result.returncode == 0 or calls:
-            raise AssertionError("invalid candidate version reached the release API")
-        cases += 1
-
-        result, calls = execute({"version": "1.2.3"}, setup_present=False)
-        if result.returncode == 0 or len(calls) != 1:
-            raise AssertionError("missing installer was published")
-        cases += 1
+        for kind in (
+            "orphan-tag",
+            "release-only",
+            "draft",
+            "partial",
+            "target-mismatch",
+            "asset-mismatch",
+        ):
+            case_root = root / kind
+            case_root.mkdir()
+            candidate = case_root / "release-candidate"
+            candidate.mkdir()
+            setup = candidate / "CodexInfo.WindowsClient.Setup.exe"
+            manifest = candidate / "CodexInfo.WindowsClient.update.json"
+            setup.write_bytes(b"fixture installer")
+            manifest.write_text(json.dumps({"version": _VERSION}), encoding="utf-8")
+            state = _publication_state(kind, setup, manifest)
+            result, calls, _ = _execute_publication(
+                script, case_root, initial_state=state
+            )
+            if result.returncode == 0 or _publish_mutations(calls):
+                raise AssertionError(f"invalid existing release state was repaired: {kind}")
+            cases += 1
     return cases
 
 
@@ -1006,7 +2019,11 @@ def self_test() -> int:
         ("feat-integration.yml", "name: feat-acceptance", "name: finalize"),
         ("feat-integration.yml", "release_candidate: false", "release_candidate: true"),
         ("feat-integration.yml", "--find-copies-harder", "--no-renames"),
-        ("version-prepare.yml", "generated_version=true", "generated_version=false"),
+        (
+            "version-prepare.yml",
+            "expected_version_transition=true",
+            "expected_version_transition=false",
+        ),
         ("version-prepare.yml", "cancel-in-progress: false", "cancel-in-progress: true"),
         ("version-prepare.yml", "git push origin", "git push --force origin"),
         ("version-prepare.yml", "checks: write", "checks: read"),
@@ -1015,8 +2032,16 @@ def self_test() -> int:
         ("windows-client.yml", "New-WindowsUpdateManifest.ps1", "Omitted-Manifest.ps1"),
         ("rust.yml", "cargo test --locked --all-targets -- --nocapture", "true"),
         ("codeql.yml", "  workflow_call:\n", "  schedule:\n"),
-        ("release.yml", "github.event.pull_request.merged == true", "always()"),
-        ("release.yml", 'test("(^| / )windows-quality$")', 'test("quality")'),
+        (
+            "release.yml",
+            "name: Resolve the immutable publication snapshot",
+            "name: Resolve an incomplete snapshot",
+        ),
+        (
+            "release.yml",
+            "group: release-windows-client-${{ needs.resolve.outputs.tag }}",
+            "group: release-windows-client-global",
+        ),
     )
     cases = 1
     for name, old, new in mutations:
@@ -1027,17 +2052,31 @@ def self_test() -> int:
         if not validate(candidate):
             raise AssertionError(f"workflow mutation was accepted: {name}: {old}")
         cases += 1
+    observer_cases = _current_observer_tests(baseline["version-prepare.yml"])
     version_cases = _version_state_tests(baseline["version-prepare.yml"])
     copy_cases = _git_copy_detection_test()
     final_check_cases = _final_check_tests(baseline["version-prepare.yml"])
     release_resolution_cases = _release_resolution_tests(baseline["release.yml"])
+    release_lock_cases = _release_lock_tests(baseline["release.yml"])
     release_publish_cases = _release_publish_tests(baseline["release.yml"])
+    total_cases = (
+        cases
+        + observer_cases
+        + version_cases
+        + copy_cases
+        + final_check_cases
+        + release_resolution_cases
+        + release_lock_cases
+        + release_publish_cases
+    )
     print(
         "workflow-quality-gate: PASS "
-        f"static_cases={cases} version_cases={version_cases} "
+        f"total_cases={total_cases} static_cases={cases} "
+        f"observer_cases={observer_cases} version_cases={version_cases} "
         f"copy_cases={copy_cases} "
         f"final_check_cases={final_check_cases} "
         f"release_resolution_cases={release_resolution_cases} "
+        f"release_lock_cases={release_lock_cases} "
         f"release_publish_cases={release_publish_cases}"
     )
     return 0

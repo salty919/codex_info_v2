@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 name: Main PR quality
+run-name: codex-main-quality-v1:pr=${{ github.event.pull_request.number }}:event_head=${{ github.event.pull_request.head.sha }}:action=${{ github.event.action }}:draft=${{ github.event.pull_request.draft }}
 
 on:
   pull_request_target:
@@ -21,24 +22,84 @@ jobs:
     name: version-prepared
     runs-on: ubuntu-latest
     permissions:
-      checks: read
+      actions: read
       contents: write
+      pull-requests: read
     outputs:
       ready: ${{ steps.prepare.outputs.ready }}
       selection_json: ${{ steps.prepare.outputs.selection_json }}
       quality_sha: ${{ steps.prepare.outputs.quality_sha }}
       generated_head: ${{ steps.prepare.outputs.generated_head }}
       generated_observer: ${{ steps.prepare.outputs.generated_observer }}
+      event_observer: ${{ steps.current.outputs.observer }}
+      observer_reason: ${{ steps.current.outputs.reason }}
     steps:
+      - name: Read the current pull request once
+        id: current
+        env:
+          EVENT_DRAFT: ${{ github.event.pull_request.draft }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || {
+            echo 'event PR number is malformed' >&2
+            exit 1
+          }
+          [[ "$EVENT_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo 'event PR head is malformed' >&2
+            exit 1
+          }
+          [[ "$EVENT_DRAFT" == true || "$EVENT_DRAFT" == false ]] || {
+            echo 'event PR draft state is malformed' >&2
+            exit 1
+          }
+
+          current_pr="$(gh api -H 'Accept: application/vnd.github+json' \
+            "repos/$REPOSITORY/pulls/$PR_NUMBER")"
+          read -r current_head current_draft current_state < <(
+            jq -er --argjson number "$PR_NUMBER" --arg repository "$REPOSITORY" '
+              select(.number == $number and
+                     (.state == "open" or .state == "closed") and
+                     .base.repo.full_name == $repository and
+                     (.draft | type) == "boolean" and
+                     (.head.sha | type) == "string" and
+                     (.head.sha | test("^[0-9a-f]{40}$"))) |
+              [.head.sha, (.draft | tostring), .state] | @tsv
+            ' <<<"$current_pr"
+          )
+
+          observer=false
+          reason=owner
+          if [[ "$current_state" == closed ]]; then
+            observer=true
+            reason=closed-pr
+          elif [[ "$EVENT_DRAFT" == true ]]; then
+            observer=true
+            reason=event-draft
+          elif [[ "$current_draft" == true ]]; then
+            observer=true
+            reason=current-draft
+          elif [[ "$current_head" != "$EVENT_HEAD_SHA" ]]; then
+            observer=true
+            reason=stale-event-head
+          fi
+          printf 'observer=%s\nreason=%s\n' "$observer" "$reason" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v4
+        if: steps.current.outputs.observer != 'true'
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
           persist-credentials: true
       - name: Select owners and prepare the binary version
         id: prepare
+        if: steps.current.outputs.observer != 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_ACTION: ${{ github.event.action }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -78,7 +139,7 @@ jobs:
           # Locate the newest first-parent commit that changed a version file.
           # This keeps later user commits in the owner diff while excluding a
           # byte-exact workflow-generated version transition.
-          generated_version=false
+          expected_version_transition=false
           version_commit="$(git log --first-parent --format=%H -n 1 \
             "$BASE_SHA..$HEAD_SHA" -- \
             Cargo.toml Cargo.lock windows-client/Directory.Build.props)"
@@ -113,14 +174,14 @@ jobs:
                    cmp -s "$versions/expected/Cargo.toml" "$versions/head/Cargo.toml" && \
                    cmp -s "$versions/expected/Cargo.lock" "$versions/head/Cargo.lock" && \
                    cmp -s "$versions/expected/windows-client/Directory.Build.props" "$versions/head/windows-client/Directory.Build.props"; then
-                  generated_version=true
+                  expected_version_transition=true
                 fi
               fi
             fi
           fi
 
           changes="$RUNNER_TEMP/changed-paths.z"
-          if [[ "$generated_version" == true ]]; then
+          if [[ "$expected_version_transition" == true ]]; then
             git diff --find-renames=50% --find-copies=50% --find-copies-harder \
               --name-status -z "$BASE_SHA...$HEAD_SHA" -- . \
               ':(exclude)Cargo.toml' \
@@ -144,25 +205,81 @@ jobs:
           fi
 
           if [[ "$head_version" == "$next_version" ]]; then
-            # Bytes alone cannot distinguish a workflow-generated H1 from an
-            # identical manual version commit. The producer's acceptance
-            # identity is the single authority for suppressing a duplicate H1
-            # owner run; there is no poll, retry, or mutation readback.
-            if [[ "$generated_version" == true && "$version_commit" == "$HEAD_SHA" ]]; then
-              producer_prefix="codex-main-quality:pr=$PR_NUMBER:head=$HEAD_SHA:run="
-              producer_count="$(gh api -H 'Accept: application/vnd.github+json' \
-                "repos/$REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=acceptance&filter=all&per_page=100" |
-                jq -r --arg prefix "$producer_prefix" '
-                  [.check_runs[] |
-                   .external_id? |
-                   select(type == "string" and startswith($prefix))] |
-                  length
-                ')"
-              if [[ "$producer_count" -gt 0 ]]; then
-                printf 'ready=false\nselection_json=%s\nquality_sha=%s\ngenerated_head=false\ngenerated_observer=true\n' \
-                  "$selection" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
-                exit 0
+            # A generated H1 is a tip-only exact transition whose five
+            # trailers resolve to the trusted default-branch workflow run that
+            # observed its sole parent H0. Invalid or absent identity leaves a
+            # byte-identical manual H1 (and every later H2) with the owner path.
+            generated_h1=false
+            if [[ "$EVENT_ACTION" == synchronize && \
+                  "$expected_version_transition" == true && \
+                  "$version_commit" == "$HEAD_SHA" && \
+                  "${#version_line[@]}" -eq 2 ]]; then
+              commit_message="$(git show -s --format=%B "$HEAD_SHA")"
+              trailer_value() {
+                local key="$1"
+                local -a values
+                mapfile -t values < <(sed -n "s/^${key}: //p" <<<"$commit_message")
+                [[ "${#values[@]}" -eq 1 ]] || return 1
+                printf '%s' "${values[0]}"
+              }
+              generator_schema=''
+              generator_pr=''
+              generator_event_head=''
+              generator_run_id=''
+              generator_run_attempt=''
+              if generator_schema="$(trailer_value Codex-Version-Prepare-Schema)" && \
+                 generator_pr="$(trailer_value Codex-Version-Prepare-PR)" && \
+                 generator_event_head="$(trailer_value Codex-Version-Prepare-Event-Head)" && \
+                 generator_run_id="$(trailer_value Codex-Version-Prepare-Run-ID)" && \
+                 generator_run_attempt="$(trailer_value Codex-Version-Prepare-Run-Attempt)"; then
+                expected_generated_message="$(printf '%s\n\n%s\n%s\n%s\n%s\n%s' \
+                  "chore: prepare version $head_version" \
+                  'Codex-Version-Prepare-Schema: v1' \
+                  "Codex-Version-Prepare-PR: $generator_pr" \
+                  "Codex-Version-Prepare-Event-Head: $generator_event_head" \
+                  "Codex-Version-Prepare-Run-ID: $generator_run_id" \
+                  "Codex-Version-Prepare-Run-Attempt: $generator_run_attempt")"
+                if [[ "$commit_message" == "$expected_generated_message" && \
+                      "$generator_schema" == v1 && \
+                      "$generator_pr" == "$PR_NUMBER" && \
+                      "$generator_event_head" == "$parent_sha" && \
+                      "$generator_run_id" =~ ^[1-9][0-9]*$ && \
+                      "$generator_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
+                  generator_run=''
+                  if generator_run="$(gh api -H 'Accept: application/vnd.github+json' \
+                       "repos/$REPOSITORY/actions/runs/$generator_run_id/attempts/$generator_run_attempt" 2>/dev/null)"; then
+                    generator_title="$(jq -er '.display_title | select(type == "string")' <<<"$generator_run")"
+                    metadata_matches=false
+                    case "$generator_title" in
+                      "codex-main-quality-v1:pr=$PR_NUMBER:event_head=$parent_sha:action=opened:draft=false"|\
+                      "codex-main-quality-v1:pr=$PR_NUMBER:event_head=$parent_sha:action=synchronize:draft=false"|\
+                      "codex-main-quality-v1:pr=$PR_NUMBER:event_head=$parent_sha:action=reopened:draft=false"|\
+                      "codex-main-quality-v1:pr=$PR_NUMBER:event_head=$parent_sha:action=ready_for_review:draft=false")
+                        metadata_matches=true
+                        ;;
+                    esac
+                    if [[ "$metadata_matches" == true ]] && \
+                       jq -e \
+                         --arg attempt "$generator_run_attempt" \
+                         --arg id "$generator_run_id" \
+                         --arg repository "$REPOSITORY" '
+                           select((.id | tostring) == $id and
+                                  (.run_attempt | tostring) == $attempt and
+                                  (.path | type) == "string" and
+                                  ((.path | split("@")[0]) == ".github/workflows/version-prepare.yml") and
+                                  .event == "pull_request_target" and
+                                  .repository.full_name == $repository)
+                         ' <<<"$generator_run" >/dev/null; then
+                      generated_h1=true
+                    fi
+                  fi
+                fi
               fi
+            fi
+            if [[ "$generated_h1" == true ]]; then
+              printf 'ready=false\nselection_json=%s\nquality_sha=%s\ngenerated_head=false\ngenerated_observer=true\n' \
+                "$selection" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
             printf 'ready=true\nselection_json=%s\nquality_sha=%s\ngenerated_head=false\ngenerated_observer=false\n' \
               "$selection" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
@@ -195,7 +312,18 @@ jobs:
           export GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com'
           export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
           export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
-          commit_sha="$(printf 'chore: prepare version %s\n' "$next_version" | git commit-tree "$tree_sha" -p "$HEAD_SHA")"
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ && "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || {
+            echo 'workflow run identity is malformed' >&2
+            exit 1
+          }
+          commit_message="$(printf '%s\n\n%s\n%s\n%s\n%s\n%s\n' \
+            "chore: prepare version $next_version" \
+            'Codex-Version-Prepare-Schema: v1' \
+            "Codex-Version-Prepare-PR: $PR_NUMBER" \
+            "Codex-Version-Prepare-Event-Head: $HEAD_SHA" \
+            "Codex-Version-Prepare-Run-ID: $GITHUB_RUN_ID" \
+            "Codex-Version-Prepare-Run-Attempt: $GITHUB_RUN_ATTEMPT")"
+          commit_sha="$(printf '%s\n' "$commit_message" | git commit-tree "$tree_sha" -p "$HEAD_SHA")"
 
           # A concurrent head update makes this non-force push fail. No ref
           # pre-read, retry, or overwrite path exists.
@@ -220,7 +348,7 @@ jobs:
       security-events: write
 
   acceptance:
-    name: ${{ needs.version-prepared.outputs.generated_observer == 'true' && 'Observe generated H1' || 'acceptance' }}
+    name: ${{ needs.version-prepared.outputs.event_observer == 'true' && 'Observe non-authoritative PR event' || needs.version-prepared.outputs.generated_observer == 'true' && 'Observe generated H1' || 'acceptance' }}
     if: always()
     needs: [version-prepared, selective-quality]
     runs-on: ubuntu-latest
@@ -231,6 +359,7 @@ jobs:
         env:
           GENERATED_HEAD: ${{ needs.version-prepared.outputs.generated_head }}
           GENERATED_OBSERVER: ${{ needs.version-prepared.outputs.generated_observer }}
+          EVENT_OBSERVER: ${{ needs.version-prepared.outputs.event_observer }}
           GH_TOKEN: ${{ github.token }}
           PREPARE_RESULT: ${{ needs.version-prepared.result }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -246,11 +375,14 @@ jobs:
           if [[ "$PREPARE_RESULT" == success && "$GENERATED_OBSERVER" == true && "$QUALITY_RESULT" == skipped ]]; then
             conclusion=success
           fi
+          if [[ "$PREPARE_RESULT" == success && "$EVENT_OBSERVER" == true && "$QUALITY_RESULT" == skipped ]]; then
+            conclusion=success
+          fi
 
           # GITHUB_TOKEN pushes do not start another workflow run. Only the
           # generated H1 therefore needs final checks copied from this H0 run.
           if [[ "$GENERATED_HEAD" == true ]]; then
-            external_id="codex-main-quality:pr=$PR_NUMBER:head=$QUALITY_SHA:run=$GITHUB_RUN_ID"
+            external_id="codex-main-quality:pr=$PR_NUMBER:head=$QUALITY_SHA:run=$GITHUB_RUN_ID:attempt=$GITHUB_RUN_ATTEMPT"
             create_check() {
               local name="$1" result="$2"
               jq -nc \
