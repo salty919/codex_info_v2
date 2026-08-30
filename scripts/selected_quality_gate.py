@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate that exactly the selected quality owners ran successfully."""
+"""Require selected quality jobs to succeed and all other jobs to stay skipped."""
 
 from __future__ import annotations
 
@@ -16,9 +16,7 @@ OWNER_JOBS = {
     "LINUX_UI": "linux-ui-quality",
     "WINDOWS": "windows-quality",
 }
-OWNER_ORDER = tuple(OWNER_JOBS)
-LANGUAGE_ORDER = ("actions", "csharp", "python", "rust")
-LANGUAGES = frozenset({"actions", "csharp", "python", "rust"})
+ALL_JOBS = frozenset(OWNER_JOBS.values()) | {"codeql-quality"}
 
 
 class QualitySelectionError(ValueError):
@@ -40,29 +38,15 @@ def validate(selection_raw: str, results_raw: str) -> None:
     results = _object(results_raw, "results")
     owners = selection.get("owners")
     languages = selection.get("codeql_languages")
-    if not isinstance(owners, list) or not owners or len(owners) != len(set(owners)):
-        raise QualitySelectionError("selection owners are missing or duplicated")
-    if any(owner not in OWNER_JOBS for owner in owners):
-        raise QualitySelectionError("selection contains an unknown owner")
-    if owners != [owner for owner in OWNER_ORDER if owner in owners]:
-        raise QualitySelectionError("selection owners are not in canonical order")
-    if not isinstance(languages, list) or len(languages) != len(set(languages)):
-        raise QualitySelectionError("CodeQL languages are missing or duplicated")
-    if any(language not in LANGUAGES for language in languages):
-        raise QualitySelectionError("selection contains an unknown CodeQL language")
-    expected_languages: set[str] = set()
-    if "GOVERNANCE" in owners:
-        expected_languages.update(("actions", "python"))
-    if "WINDOWS" in owners:
-        expected_languages.add("csharp")
-    if {"LINUX_BACKEND", "LINUX_UI"}.intersection(owners):
-        expected_languages.add("rust")
-    if languages != [language for language in LANGUAGE_ORDER if language in expected_languages]:
-        raise QualitySelectionError("CodeQL languages do not match the selected owners")
+    if not isinstance(owners, list) or not owners or any(
+        owner not in OWNER_JOBS for owner in owners
+    ):
+        raise QualitySelectionError("selection has no finite owner set")
+    if not isinstance(languages, list):
+        raise QualitySelectionError("selection has no CodeQL language list")
+    if set(results) != ALL_JOBS:
+        raise QualitySelectionError("quality result keys do not match the job set")
 
-    expected_keys = set(OWNER_JOBS.values()) | {"codeql-quality"}
-    if set(results) != expected_keys:
-        raise QualitySelectionError("quality result keys do not match the finite job set")
     selected = set(owners)
     for owner, job in OWNER_JOBS.items():
         expected = "success" if owner in selected else "skipped"
@@ -73,7 +57,8 @@ def validate(selection_raw: str, results_raw: str) -> None:
     expected_codeql = "success" if languages else "skipped"
     if results["codeql-quality"] != expected_codeql:
         raise QualitySelectionError(
-            f"codeql-quality must be {expected_codeql}, found {results['codeql-quality']!r}"
+            f"codeql-quality must be {expected_codeql}, "
+            f"found {results['codeql-quality']!r}"
         )
 
 

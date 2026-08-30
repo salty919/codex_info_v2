@@ -1,193 +1,48 @@
 # Copyright (C) 2026 salty919
 # SPDX-License-Identifier: GPL-3.0-only
 
-name: Windows client
+name: Windows client (reusable)
 
 on:
   workflow_call:
     inputs:
-      premerge:
-        description: Run the immutable pre-merge quality graph
+      source_sha:
         required: true
-        type: boolean
+        type: string
       pr_number:
-        description: Exact pull request number selected by the trusted caller
         required: true
         type: string
-      base_repository:
-        description: Exact pull request base repository
+      release_candidate:
         required: true
-        type: string
-      head_repository:
-        description: Exact pull request head repository
-        required: true
-        type: string
-      base_sha:
-        description: Exact pull request base SHA
-        required: true
-        type: string
-      head_sha:
-        description: Exact prepared pull request head SHA
-        required: true
-        type: string
-      head_ref:
-        description: Exact pull request head branch
-        required: true
-        type: string
-      selective_mode:
-        description: Run only the Windows owner for the shared selective gate
-        required: false
-        default: false
         type: boolean
-      selection_json:
-        description: Trusted owner selection from the original PR diff
-        required: true
-        type: string
-    outputs:
-      binary_impact:
-        value: ${{ jobs.version-prepared.outputs.binary_impact }}
-      windows_impact:
-        value: ${{ jobs.version-prepared.outputs.windows_impact }}
-      version:
-        value: ${{ jobs.version-prepared.outputs.version }}
-      verdict_artifact_id:
-        value: ${{ jobs.acceptance.outputs.verdict_artifact_id }}
-      verdict_artifact_digest:
-        value: ${{ jobs.acceptance.outputs.verdict_artifact_digest }}
-      candidate_artifact_id:
-        value: ${{ jobs.acceptance.outputs.candidate_artifact_id }}
-      candidate_artifact_digest:
-        value: ${{ jobs.acceptance.outputs.candidate_artifact_digest }}
 
 permissions:
   contents: read
 
-concurrency:
-  group: windows-client-${{ inputs.pr_number }}
-  cancel-in-progress: false
-
 jobs:
-  version-prepared:
-    if: inputs.premerge == true && inputs.selective_mode == false
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      binary_impact: ${{ steps.scope.outputs.binary_impact }}
-      ready: ${{ steps.version.outputs.ready }}
-      version: ${{ steps.version.outputs.version }}
-      windows_impact: ${{ steps.scope.outputs.windows_impact }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ inputs.head_sha }}
-          persist-credentials: false
-      - name: Validate immutable head and original owner selection
-        id: scope
-        shell: bash
-        env:
-          REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          BASE_REPOSITORY: ${{ inputs.base_repository }}
-          HEAD_REPOSITORY: ${{ inputs.head_repository }}
-          BASE_SHA: ${{ inputs.base_sha }}
-          HEAD_SHA: ${{ inputs.head_sha }}
-          HEAD_REF: ${{ inputs.head_ref }}
-          SELECTION: ${{ inputs.selection_json }}
-        run: |
-          set -euo pipefail
-          [[ "$(git rev-parse HEAD)" == "$HEAD_SHA" &&
-              "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&
-              "$BASE_REPOSITORY" == "$REPOSITORY" &&
-              "$HEAD_REPOSITORY" == "$REPOSITORY" &&
-              "$PR_NUMBER" =~ ^[1-9][0-9]*$ &&
-              "$BASE_SHA" =~ ^[0-9a-fA-F]{40}$ &&
-              "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ &&
-              -n "$HEAD_REF" ]] || {
-            echo 'pull request scope identity is malformed' >&2
-            exit 1
-          }
-          git cat-file -e "$BASE_SHA^{commit}"
-          jq -e '
-            (type == "object") and
-            ((keys | sort) == ["binary_impact", "codeql_languages", "owners"]) and
-            (.binary_impact | type == "boolean") and
-            (.owners | type == "array" and length > 0 and
-              all(.[]; type == "string") and length == (unique | length)) and
-            (.codeql_languages | type == "array" and
-              all(.[]; type == "string") and length == (unique | length)) and
-            (.binary_impact == ([.owners[] | select(
-              . == "LINUX_BACKEND" or . == "LINUX_UI" or . == "WINDOWS"
-            )] | length > 0))
-          ' <<<"$SELECTION" >/dev/null || {
-            echo 'trusted owner selection is malformed or inconsistent' >&2
-            exit 1
-          }
-          binary_impact="$(jq -r '.binary_impact' <<<"$SELECTION")"
-          windows_impact="$(jq -r '.owners | contains(["WINDOWS"])' <<<"$SELECTION")"
-          printf 'binary_impact=%s\nwindows_impact=%s\n' \
-            "$binary_impact" "$windows_impact" >> "$GITHUB_OUTPUT"
-      # The trusted preparer owns `python3 scripts/product_version.py bump --expected "$base_version"`
-      # on temporary API data.  This reusable job only reads PR data and
-      # never has a token that can mutate contents or checks.
-      - name: Verify the exact next patch version
-        if: steps.scope.outputs.binary_impact == 'true'
-        id: version
-        shell: bash
-        env:
-          BASE_SHA: ${{ inputs.base_sha }}
-          HEAD_REF: ${{ inputs.head_ref }}
-          HEAD_SHA: ${{ inputs.head_sha }}
-        run: |
-          set -euo pipefail
-          [[ "$(git rev-parse HEAD)" == "$HEAD_SHA" ]] || {
-            echo 'version policy checkout does not match the PR head SHA' >&2
-            exit 1
-          }
-          base="$RUNNER_TEMP/base-version"
-          mkdir -p "$base/windows-client"
-          git show "$BASE_SHA:Cargo.toml" > "$base/Cargo.toml"
-          git show "$BASE_SHA:Cargo.lock" > "$base/Cargo.lock"
-          git show "$BASE_SHA:windows-client/Directory.Build.props" > "$base/windows-client/Directory.Build.props"
-          base_version="$(python3 scripts/product_version.py check --cargo-toml "$base/Cargo.toml" --cargo-lock "$base/Cargo.lock" --windows-props "$base/windows-client/Directory.Build.props" | sed -n 's/^version=//p')"
-          current_version="$(python3 scripts/product_version.py check | sed -n 's/^version=//p')"
-          next_version="$(python3 scripts/product_version.py next --version "$base_version" | sed -n 's/^version=//p')"
-          if [[ "$current_version" == "$next_version" ]]; then
-            printf 'ready=true\nversion=%s\n' "$current_version" >> "$GITHUB_OUTPUT"
-          elif [[ "$current_version" == "$base_version" ]]; then
-            echo "trusted version preparation has not committed $next_version to this head" >&2
-            exit 1
-          else
-            echo "PR version must be base $base_version or exact next patch $next_version; found $current_version" >&2
-            exit 1
-          fi
-
-  ui-quality:
-    if: inputs.premerge == true && inputs.selective_mode == true && contains(fromJSON(inputs.selection_json).owners, 'WINDOWS')
+  windows-quality:
+    name: windows-quality
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          ref: ${{ inputs.head_sha }}
+          ref: ${{ inputs.source_sha }}
           persist-credentials: false
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
+      - name: Run Windows unit tests
+        shell: pwsh
+        run: |
+          dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
+          dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
       - name: Install locked Inno Setup compiler
         shell: pwsh
         run: |
           winget source update --name winget --disable-interactivity
-          $sourceUpdateExitCode = $LASTEXITCODE
-          if ($sourceUpdateExitCode -ne 0) {
-            throw ('WinGet source update failed with exit code 0x{0:X8}.' -f $sourceUpdateExitCode)
-          }
+          if ($LASTEXITCODE -ne 0) { throw ('WinGet source update failed with exit code 0x{0:X8}.' -f $LASTEXITCODE) }
           winget install --id JRSoftware.InnoSetup.7 --version 7.1.0 -e -s winget --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
-          $installExitCode = $LASTEXITCODE
-          if ($installExitCode -ne 0) {
-            throw ('WinGet Inno Setup install failed with exit code 0x{0:X8}.' -f $installExitCode)
-          }
+          if ($LASTEXITCODE -ne 0) { throw ('WinGet Inno Setup install failed with exit code 0x{0:X8}.' -f $LASTEXITCODE) }
           $compiler = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe'
           if (-not (Test-Path $compiler -PathType Leaf)) { throw 'Inno Setup 7.1.0 compiler was not installed.' }
           "INNO_SETUP_COMPILER=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -249,7 +104,7 @@ jobs:
       - name: Run installed Windows UI Automation E2E
         shell: pwsh
         env:
-          SOURCE_SHA: ${{ inputs.head_sha }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
           $installProcess = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
@@ -277,197 +132,22 @@ jobs:
               if ($uninstallProcess.ExitCode -ne 0) { throw "E2E cleanup uninstall failed with exit code $($uninstallProcess.ExitCode)" }
             }
           }
-      - name: Write UI quality evidence
-        if: success()
+      - name: Create release manifest
+        if: inputs.release_candidate
         shell: pwsh
         env:
-          SOURCE_SHA: ${{ inputs.head_sha }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          $sourceSha = (& git rev-parse HEAD).Trim()
-          $treeSha = (& git rev-parse 'HEAD^{tree}').Trim()
-          if ($sourceSha -ne $env:SOURCE_SHA) { throw 'UI quality checkout SHA does not match the immutable source SHA.' }
-          $evidence = Join-Path $env:RUNNER_TEMP 'codex-info-windows-e2e'
-          if (-not (Test-Path -LiteralPath $evidence -PathType Container)) { throw 'Windows UI evidence directory is missing.' }
-          $encoding = [System.Text.UTF8Encoding]::new($false)
-          $qualityLines = @(
-            'schema: codex-info-quality-v1'
-            'quality: ui'
-            "source-sha: $sourceSha"
-            "tree-sha: $treeSha"
-            'windows-ui-e2e: PASS'
-            'window-move-smoke: PASS'
-            'ui-quality: PASS'
-          )
-          $qualityPath = Join-Path $evidence 'ui-quality.txt'
-          [System.IO.File]::WriteAllText(
-            $qualityPath,
-            (($qualityLines -join "`n") + "`n"),
-            $encoding
-          )
-          $hashLines = @(
-            Get-ChildItem -LiteralPath $evidence -File |
-              Where-Object { $_.Name -ne 'SHA256SUMS' } |
-              Sort-Object FullName |
-              ForEach-Object {
-                $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-                $relative = $_.FullName.Substring($evidence.Length).TrimStart([char[]]@('\', '/')) -replace '\\', '/'
-                "$hash  $relative"
-              }
-          )
-          $manifestPath = Join-Path $evidence 'SHA256SUMS'
-          [System.IO.File]::WriteAllText(
-            $manifestPath,
-            (($hashLines -join "`n") + "`n"),
-            $encoding
-          )
-      - name: Upload Windows UI E2E evidence
-        if: always()
+          ./windows-client/tools/New-WindowsUpdateManifest.ps1 `
+            -InstallerPath ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe `
+            -OutputPath ./artifacts/windows-installer/CodexInfo.WindowsClient.update.json `
+            -Repository $env:REPOSITORY
+      - name: Upload release candidate
+        if: inputs.release_candidate
         uses: actions/upload-artifact@v4
         with:
-          name: windows-ui-e2e
-          path: ${{ runner.temp }}/codex-info-windows-e2e
-          if-no-files-found: warn
-      - name: Upload CI installer artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-client-installer
-          path: artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe
-          if-no-files-found: warn
-
-  acceptance:
-    # This job produces evidence only. The trusted caller publishes the two
-    # exact required check-runs on the immutable PR head.
-    if: always() && inputs.premerge == true && inputs.selective_mode == false
-    needs: [version-prepared]
-    runs-on: ubuntu-latest
-    outputs:
-      verdict_artifact_id: ${{ steps.verdict-artifact.outputs.artifact-id }}
-      verdict_artifact_digest: ${{ steps.verdict-artifact.outputs.artifact-digest }}
-      candidate_artifact_id: ${{ steps.candidate-artifact.outputs.artifact-id }}
-      candidate_artifact_digest: ${{ steps.candidate-artifact.outputs.artifact-digest }}
-    steps:
-      - name: Verify quality job outcomes
-        env:
-          VERSION_RESULT: ${{ needs.version-prepared.result }}
-          BINARY_IMPACT: ${{ needs.version-prepared.outputs.binary_impact }}
-          VERSION_READY: ${{ needs.version-prepared.outputs.ready }}
-          WINDOWS_IMPACT: ${{ needs.version-prepared.outputs.windows_impact }}
-        run: |
-          set -euo pipefail
-          [[ "$VERSION_RESULT" == success ]] || { echo "version-prepared job did not succeed: $VERSION_RESULT" >&2; exit 1; }
-          [[ "$BINARY_IMPACT" == true || "$BINARY_IMPACT" == false ]] || {
-            echo 'pull request binary impact is missing or malformed' >&2
-            exit 1
-          }
-          [[ "$WINDOWS_IMPACT" == true || "$WINDOWS_IMPACT" == false ]] || {
-            echo 'pull request Windows impact is missing or malformed' >&2
-            exit 1
-          }
-          if [[ "$BINARY_IMPACT" == true ]]; then
-            [[ "$VERSION_READY" == true ]] || {
-              echo 'version preparation did not complete on this revision' >&2
-              exit 1
-            }
-          else
-            [[ "$WINDOWS_IMPACT" == false && -z "$VERSION_READY" ]] || {
-              echo 'non-binary change unexpectedly prepared a version or selected Windows' >&2
-              exit 1
-            }
-          fi
-      - uses: actions/checkout@v4
-        if: needs.version-prepared.outputs.windows_impact == 'true'
-        with:
-          fetch-depth: 0
-          ref: ${{ inputs.head_sha }}
-          persist-credentials: false
-      - name: Download Windows UI E2E evidence
-        if: needs.version-prepared.outputs.windows_impact == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          name: windows-ui-e2e
-          path: ${{ runner.temp }}/windows-ui-e2e
-      - name: Download CI installer artifact
-        if: needs.version-prepared.outputs.windows_impact == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          name: windows-client-installer
-          path: ${{ runner.temp }}/windows-installer
-      - name: Run final acceptance gate before merge
-        if: needs.version-prepared.outputs.windows_impact == 'true'
-        env:
-          EXPECTED_E2E_SOURCE_SHA: ${{ inputs.head_sha }}
-          WINDOWS_UI_EVIDENCE: ${{ runner.temp }}/windows-ui-e2e
-        run: bash scripts/final_acceptance_gate.sh "$WINDOWS_UI_EVIDENCE"
-      - name: Assemble accepted release candidate
-        if: needs.version-prepared.outputs.windows_impact == 'true'
-        env:
-          CANDIDATE: ${{ runner.temp }}/release-candidate
-          INSTALLER: ${{ runner.temp }}/windows-installer/CodexInfo.WindowsClient.Setup.exe
-          PR_NUMBER: ${{ inputs.pr_number }}
-          UI_EVIDENCE: ${{ runner.temp }}/windows-ui-e2e
-          VERSION: ${{ needs.version-prepared.outputs.version }}
-        run: |
-          set -euo pipefail
-          [[ ! -e "$CANDIDATE" ]] || {
-            echo 'release candidate directory already exists' >&2
-            exit 1
-          }
-          mkdir -p "$CANDIDATE"
-          cp "$INSTALLER" "$CANDIDATE/"
-          cp -R "$UI_EVIDENCE" "$CANDIDATE/windows-ui-e2e"
-          source_sha="$(git rev-parse HEAD)"
-          tree_sha="$(git rev-parse 'HEAD^{tree}')"
-          cat > "$CANDIDATE/acceptance.txt" <<EOF
-          schema: codex-info-quality-v1
-          pr-number: $PR_NUMBER
-          source-sha: $source_sha
-          tree-sha: $tree_sha
-          version: $VERSION
-          acceptance: PASS
-          EOF
-          (
-            cd "$CANDIDATE"
-            manifest="$(mktemp)"
-            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > "$manifest"
-            mv "$manifest" SHA256SUMS
-          )
-      - name: Upload accepted release candidate
-        id: candidate-artifact
-        if: needs.version-prepared.outputs.windows_impact == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-candidate
-          path: ${{ runner.temp }}/release-candidate
-          if-no-files-found: error
-      - name: Write final-head acceptance verdict
-        env:
-          BINARY_IMPACT: ${{ needs.version-prepared.outputs.binary_impact }}
-          HEAD_SHA: ${{ inputs.head_sha }}
-          PR_NUMBER: ${{ inputs.pr_number }}
-          VERSION: ${{ needs.version-prepared.outputs.version }}
-          WINDOWS_IMPACT: ${{ needs.version-prepared.outputs.windows_impact }}
-        run: |
-          set -euo pipefail
-          verdict="$RUNNER_TEMP/acceptance-verdict"
-          mkdir -p "$verdict"
-          cat > "$verdict/acceptance.txt" <<EOF
-          schema: codex-info-final-head-v1
-          pr-number: $PR_NUMBER
-          source-sha: $HEAD_SHA
-          binary-impact: $BINARY_IMPACT
-          windows-impact: $WINDOWS_IMPACT
-          version: $VERSION
-          acceptance: PASS
-          EOF
-          (
-            cd "$verdict"
-            sha256sum acceptance.txt > SHA256SUMS
-          )
-      - name: Upload final-head acceptance verdict
-        id: verdict-artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: acceptance-verdict
-          path: ${{ runner.temp }}/acceptance-verdict
+          name: release-candidate-${{ inputs.pr_number }}
+          path: |
+            artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe
+            artifacts/windows-installer/CodexInfo.WindowsClient.update.json
           if-no-files-found: error

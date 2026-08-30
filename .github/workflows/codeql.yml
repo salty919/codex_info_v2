@@ -1,26 +1,20 @@
 # Copyright (C) 2026 salty919
 # SPDX-License-Identifier: GPL-3.0-only
 
-name: CodeQL analysis (advanced)
+name: CodeQL analysis
 
 on:
   workflow_call:
     inputs:
       source_sha:
-        description: Immutable source commit selected by the trusted caller
         required: true
         type: string
       head_ref:
-        description: Source branch used for CodeQL result attribution
         required: true
         type: string
       languages_json:
-        description: Exact non-empty JSON language array selected by the trusted caller
-        required: false
-        default: '["actions","csharp","python","rust"]'
+        required: true
         type: string
-  schedule:
-    - cron: "23 4 * * 1"
 
 permissions:
   contents: read
@@ -33,11 +27,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: ${{ fromJSON(inputs.languages_json || '["actions","csharp","python","rust"]') }}
+        language: ${{ fromJSON(inputs.languages_json) }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_sha || github.sha }}
+          ref: ${{ inputs.source_sha }}
           persist-credentials: false
       - uses: github/codeql-action/init@v4
         with:
@@ -46,5 +40,5 @@ jobs:
       - uses: github/codeql-action/analyze@v4
         with:
           category: "/language:${{ matrix.language }}"
-          ref: ${{ inputs.source_sha && format('refs/heads/{0}', inputs.head_ref) || github.ref }}
-          sha: ${{ inputs.source_sha || github.sha }}
+          ref: refs/heads/${{ inputs.head_ref }}
+          sha: ${{ inputs.source_sha }}

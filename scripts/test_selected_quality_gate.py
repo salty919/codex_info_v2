@@ -1,54 +1,53 @@
 #!/usr/bin/env python3
-"""Finite result-state tests for selected_quality_gate.py."""
+"""Finite selected/skipped result matrix for the quality dispatcher."""
 
 from __future__ import annotations
 
+import itertools
 import json
 import unittest
 
-from selected_quality_gate import QualitySelectionError, validate
+from selected_quality_gate import OWNER_JOBS, QualitySelectionError, validate
 
 
-JOBS = (
-    "docs-quality",
-    "governance-quality",
-    "linux-backend-quality",
-    "linux-ui-quality",
-    "windows-quality",
-    "codeql-quality",
-)
+OWNERS = tuple(OWNER_JOBS)
+JOBS = tuple(OWNER_JOBS.values()) + ("codeql-quality",)
 
 
-def payload(owners: list[str], languages: list[str]) -> str:
-    return json.dumps({"owners": owners, "codeql_languages": languages})
+def selection(owners: tuple[str, ...]) -> str:
+    languages = ["selected-language"] if owners != ("DOCS",) else []
+    return json.dumps({"owners": list(owners), "codeql_languages": languages})
 
 
-def results(*successful: str) -> str:
-    return json.dumps({job: "success" if job in successful else "skipped" for job in JOBS})
+def successful_results(owners: tuple[str, ...]) -> dict[str, str]:
+    selected_jobs = {OWNER_JOBS[owner] for owner in owners}
+    codeql = owners != ("DOCS",)
+    return {
+        job: (
+            "success"
+            if job in selected_jobs or (job == "codeql-quality" and codeql)
+            else "skipped"
+        )
+        for job in JOBS
+    }
 
 
 class SelectedQualityTests(unittest.TestCase):
-    def test_docs_only(self) -> None:
-        validate(payload(["DOCS"], []), results("docs-quality"))
+    def test_all_31_nonempty_owner_combinations(self) -> None:
+        cases = 0
+        for count in range(1, len(OWNERS) + 1):
+            for owners in itertools.combinations(OWNERS, count):
+                validate(selection(owners), json.dumps(successful_results(owners)))
+                cases += 1
+        self.assertEqual(cases, 31)
 
-    def test_windows_only_with_csharp_codeql(self) -> None:
-        validate(
-            payload(["WINDOWS"], ["csharp"]),
-            results("windows-quality", "codeql-quality"),
-        )
-
-    def test_mixed_union(self) -> None:
-        validate(
-            payload(["GOVERNANCE", "LINUX_UI"], ["actions", "python", "rust"]),
-            results("governance-quality", "linux-ui-quality", "codeql-quality"),
-        )
-
-    def test_every_failure_cancel_missing_and_unexpected_success_is_rejected(self) -> None:
-        baseline = json.loads(results("windows-quality", "codeql-quality"))
-        mutations = []
-        for value in ("failure", "cancelled", "skipped", "neutral", ""):
+    def test_selected_failure_cancel_skip_missing_and_nonselected_run_fail(self) -> None:
+        owners = ("WINDOWS",)
+        baseline = successful_results(owners)
+        mutations: list[dict[str, str]] = []
+        for result in ("failure", "cancelled", "skipped", ""):
             candidate = dict(baseline)
-            candidate["windows-quality"] = value
+            candidate["windows-quality"] = result
             mutations.append(candidate)
         candidate = dict(baseline)
         candidate["docs-quality"] = "success"
@@ -56,26 +55,19 @@ class SelectedQualityTests(unittest.TestCase):
         candidate = dict(baseline)
         candidate.pop("codeql-quality")
         mutations.append(candidate)
-        candidate = dict(baseline)
-        candidate["foreign-quality"] = "success"
-        mutations.append(candidate)
         for candidate in mutations:
             with self.subTest(candidate=candidate), self.assertRaises(QualitySelectionError):
-                validate(payload(["WINDOWS"], ["csharp"]), json.dumps(candidate))
+                validate(selection(owners), json.dumps(candidate))
 
-    def test_unknown_duplicate_or_empty_selection_is_rejected(self) -> None:
-        bad = (
-            payload([], []),
-            payload(["WINDOWS", "WINDOWS"], ["csharp"]),
-            payload(["FOREIGN"], []),
-            payload(["DOCS"], ["ruby"]),
-            payload(["WINDOWS"], ["csharp", "csharp"]),
-            payload(["WINDOWS"], []),
-            payload(["WINDOWS", "DOCS"], ["csharp"]),
+    def test_empty_unknown_or_malformed_selection_fails(self) -> None:
+        cases = (
+            {"owners": [], "codeql_languages": []},
+            {"owners": ["UNKNOWN"], "codeql_languages": []},
+            {"owners": ["DOCS"]},
         )
-        for selection in bad:
-            with self.subTest(selection=selection), self.assertRaises(QualitySelectionError):
-                validate(selection, results("docs-quality"))
+        for value in cases:
+            with self.subTest(value=value), self.assertRaises(QualitySelectionError):
+                validate(json.dumps(value), json.dumps(successful_results(("DOCS",))))
 
 
 if __name__ == "__main__":

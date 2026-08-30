@@ -83,6 +83,8 @@ cleanup条件と削除予定:
 - pushまたはPR作成が許可されていない作業を「統合済み」または「完了」と報告してはならない。実装済み、local検証済み、未統合を区別して報告する。
 - pushまたはPR作成直前に`origin/feat/next`の完全SHAを再確認する。宣言baseから進んでいる場合は、旧SHA、新SHA、競合し得るowned pathsを報告して停止し、rebase、merge、reset、cherry-pick、stash、force pushを行わず再許可を待つ。
 - `codex/<task> -> feat/next`はtrusted `feat-integration.yml`が完全なPR差分を有限ownerへ分類し、関係するremote qualityだけを実行して、最新headの`feat-acceptance`を成功させるまで統合しない。この経路ではversion、candidate、Release、tag、branch refをmutationしない。`feat/next -> main`は同じ分類正本を使用するが、required `acceptance`・`version-prepared`、version準備、選択build、Release前gateを別のmain経路で所有し、ユーザーだけがReleaseへ進む判断を行う。feat向けtriggerをmain向けtriggerの単純な拡張にしてはならない。
+- Git差分callerはrename/copy検出を明示し、両端を単一分類器へ渡す。selected/non-selected結果の最終判定はPR head内のscriptではなくtrusted base版gateだけを実行する。
+- workflowの`GITHUB_TOKEN`によるref更新が別のActions runを起動すると仮定しない。main向けversion生成H1は同じtrusted DAGで評価し、H0のjob checkがH1へ移らない分のrequired checkだけをH1へ最終結果として作る。同じH1のeventはPR runを直列化し、H0 acceptance identityを1回取得できた場合だけowner再実行を抑止する。この取得はbyte-identicalな手動commitとの区別だけを目的とし、poll、retry、mutation readback、表示URL照合、証拠専用artifactを追加しない。
 
 ### race、cleanup、復旧、報告
 
@@ -140,6 +142,8 @@ cleanup条件と削除予定:
 ## 設計整合性と実装方針
 
 - 症状ごとに既存コードをコピー＆ペーストし、条件分岐・例外処理・別実装を継ぎ足す増改築を禁止する。変更前に正本、責務、状態遷移、データフロー、不変条件、失敗時の所有者を特定し、その全体設計に沿って実装する。
+- 観測したerrorを、そのまま新しい条件、例外、retry、抑止またはfallbackの根拠にしてはならない。まずauthority、責務、状態遷移、不変条件を修正し、その設計から必要と導ける処理だけを実装する。
+- workflowとCIに残す各確認は、実際に到達するcase、そのcaseで必要な動作、確認しない場合の具体的被害、GitHubまたは上流保証と重複しない理由の4点を設計時に示す。1点でも示せない確認、既存条件から導ける重複条件、表示・移動用のURLや文言、判定に使わない値はgateにせず削除する。回帰testの期待値は実装から複製せず、外部の実観測値または固定契約をoracleにする。
 - 同じ製品機能を複数プラットフォームへ提供する場合、データ解釈、計算、表示意味、操作契約は一つの正本から導出する。UIフレームワーク固有コードは描画と入力のadapterに限定し、ユーザーの明示承認なしに独自仕様・独自画面・並行する計算ロジックを作らない。
 - 既存の共通モデルまたは正本を拡張すれば解決できる問題に、第二のsource of truth、互換用コピー、場当たり的fallbackを追加しない。重複が既にある場合は、さらに分岐を足すのではなく責務境界を整理して収束させる。
 - 不具合修正は、表示された症状だけを隠すパッチではなく、原因となった設計境界を修正する。例外的な分岐が必要な場合は、適用範囲と終了条件を有限の受入テストで固定する。

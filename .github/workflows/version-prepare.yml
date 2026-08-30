@@ -1,10 +1,8 @@
 # Copyright (C) 2026 salty919
 # SPDX-License-Identifier: GPL-3.0-only
 
-name: Prepare PR version
+name: Main PR quality
 
-# This workflow is deliberately target-based: GitHub evaluates it from the
-# base/default branch.  It never checks out, interprets, or executes PR code.
 on:
   pull_request_target:
     branches: ["main"]
@@ -13,486 +11,257 @@ on:
 permissions: {}
 
 concurrency:
-  group: version-prepare-${{ github.event.pull_request.number }}
+  group: main-pr-quality-${{ github.event.pull_request.number }}
+  # A generated-H1 observer consumes the preceding H0 result. Serialize the
+  # same PR so that the observer cannot cancel its producer.
   cancel-in-progress: false
 
 jobs:
-  prepare:
+  version-prepared:
+    name: version-prepared
     runs-on: ubuntu-latest
     permissions:
-      checks: write
+      checks: read
       contents: write
-      pull-requests: read
     outputs:
-      binary_impact: ${{ steps.scope.outputs.binary_impact }}
-      codeql_languages_json: ${{ steps.scope.outputs.codeql_languages_json }}
-      final_head_sha: ${{ steps.result.outputs.final_head_sha }}
-      selection_json: ${{ steps.scope.outputs.selection_json }}
-      version: ${{ steps.prepare.outputs.version }}
-      windows_impact: ${{ steps.scope.outputs.windows_impact }}
+      ready: ${{ steps.prepare.outputs.ready }}
+      selection_json: ${{ steps.prepare.outputs.selection_json }}
+      quality_sha: ${{ steps.prepare.outputs.quality_sha }}
+      generated_head: ${{ steps.prepare.outputs.generated_head }}
+      generated_observer: ${{ steps.prepare.outputs.generated_observer }}
     steps:
-      - name: Checkout trusted default branch
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository }}
           ref: ${{ github.event.pull_request.base.sha }}
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Classify pull request scope
-        id: scope
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ &&
-              "$BASE_REPOSITORY" == "$REPOSITORY" &&
-              "$HEAD_REPOSITORY" == "$REPOSITORY" &&
-              "$PR_NUMBER" =~ ^[1-9][0-9]*$ &&
-              "$BASE_SHA" =~ ^[0-9a-fA-F]{40}$ &&
-              "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || {
-            echo 'pull request scope identity is malformed' >&2
-            exit 1
-          }
-          scope_root="$RUNNER_TEMP/ci-change-scope"
-          mkdir -p "$scope_root"
-          gh api --method GET "repos/$REPOSITORY/pulls/$PR_NUMBER" > "$scope_root/before.json"
-          gh api --method GET --paginate --slurp \
-            "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" > "$scope_root/files.json"
-          gh api --method GET "repos/$REPOSITORY/pulls/$PR_NUMBER" > "$scope_root/after.json"
-          identity_filter='{number,state,changed_files,
-            base:{repo:.base.repo.full_name,ref:.base.ref,sha:.base.sha},
-            head:{repo:.head.repo.full_name,ref:.head.ref,sha:.head.sha}}'
-          before_identity="$(jq -c "$identity_filter" "$scope_root/before.json")"
-          after_identity="$(jq -c "$identity_filter" "$scope_root/after.json")"
-          [[ "$before_identity" == "$after_identity" ]] || {
-            echo 'pull request moved while its complete file list was read' >&2
-            exit 1
-          }
-          scope="$(python3 scripts/ci_change_scope.py \
-            --pull-request "$scope_root/after.json" \
-            --files "$scope_root/files.json" \
-            --expected-repository "$REPOSITORY" \
-            --expected-head-repository "$HEAD_REPOSITORY" \
-            --expected-head-ref "$HEAD_REF" \
-            --expected-number "$PR_NUMBER" \
-            --expected-base-ref main \
-            --expected-base-sha "$BASE_SHA" \
-            --expected-head-sha "$HEAD_SHA" \
-            --expected-state open \
-            --format json)"
-          jq -e '
-            (.binary_impact | type == "boolean") and
-            (.owners | type == "array" and length > 0) and
-            (.codeql_languages | type == "array")
-          ' <<<"$scope" >/dev/null
-          binary_impact="$(jq -r '.binary_impact' <<<"$scope")"
-          windows_impact="$(jq -r '.owners | contains(["WINDOWS"])' <<<"$scope")"
-          printf 'binary_impact=%s\nwindows_impact=%s\nselection_json=%s\ncodeql_languages_json=%s\n' \
-            "$binary_impact" "$windows_impact" "$scope" \
-            "$(jq -c '.codeql_languages' <<<"$scope")" >> "$GITHUB_OUTPUT"
-
-      - name: Validate and prepare version data
-        if: steps.scope.outputs.binary_impact == 'true'
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Select owners and prepare the binary version
         id: prepare
-        shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-
-          [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
-            echo 'repository name is not a safe GitHub owner/name value' >&2
-            exit 1
-          }
-          [[ "$BASE_REPOSITORY" == "$REPOSITORY" ]] || {
-            echo 'PR base repository does not match the target repository' >&2
-            exit 1
-          }
-          [[ "$BASE_SHA" =~ ^[0-9a-fA-F]{40}$ && "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || {
-            echo 'PR base/head must be full commit SHAs' >&2
-            exit 1
-          }
           [[ "$HEAD_REPOSITORY" == "$REPOSITORY" ]] || {
             echo 'automatic version preparation requires a same-repository PR' >&2
             exit 1
           }
+          git fetch --no-tags origin "$HEAD_SHA"
 
-          work="$RUNNER_TEMP/version-prepare"
-          base="$work/base"
-          head="$work/head"
-          next="$work/next"
-          mkdir -p "$base/windows-client" "$head/windows-client" "$next/windows-client"
-
-          fetch_version_file() {
-            local repository="$1"
-            local ref="$2"
-            local path="$3"
-            local output="$4"
-            local response encoding file_type content
-            response="$(gh api \
-              -H 'Accept: application/vnd.github+json' \
-              -H 'X-GitHub-Api-Version: 2022-11-28' \
-              "repos/$repository/contents/$path?ref=$ref")"
-            file_type="$(jq -r '.type // empty' <<<"$response")"
-            encoding="$(jq -r '.encoding // empty' <<<"$response")"
-            [[ "$file_type" == file && "$encoding" == base64 ]] || {
-              echo "Contents API did not return base64 file data for $repository:$path@$ref" >&2
-              return 1
-            }
-            content="$(jq -r '.content // empty' <<<"$response")"
-            [[ -n "$content" ]] || {
-              echo "Contents API returned empty data for $repository:$path@$ref" >&2
-              return 1
-            }
-            printf '%s' "$content" | tr -d '\r\n' | base64 --decode > "$output"
-            [[ -s "$output" ]] || {
-              echo "decoded version file is empty: $output" >&2
-              return 1
-            }
+          versions="$RUNNER_TEMP/versions"
+          mkdir -p "$versions/base/windows-client" "$versions/head/windows-client"
+          extract_versions() {
+            local revision="$1" destination="$2"
+            git show "$revision:Cargo.toml" > "$destination/Cargo.toml"
+            git show "$revision:Cargo.lock" > "$destination/Cargo.lock"
+            git show "$revision:windows-client/Directory.Build.props" > "$destination/windows-client/Directory.Build.props"
+          }
+          read_version() {
+            python3 scripts/product_version.py check \
+              --cargo-toml "$1/Cargo.toml" \
+              --cargo-lock "$1/Cargo.lock" \
+              --windows-props "$1/windows-client/Directory.Build.props" |
+              sed -n 's/^version=//p'
           }
 
-          fetch_version_file "$REPOSITORY" "$BASE_SHA" Cargo.toml "$base/Cargo.toml"
-          fetch_version_file "$REPOSITORY" "$BASE_SHA" Cargo.lock "$base/Cargo.lock"
-          fetch_version_file "$REPOSITORY" "$BASE_SHA" windows-client/Directory.Build.props "$base/windows-client/Directory.Build.props"
-          fetch_version_file "$HEAD_REPOSITORY" "$HEAD_SHA" Cargo.toml "$head/Cargo.toml"
-          fetch_version_file "$HEAD_REPOSITORY" "$HEAD_SHA" Cargo.lock "$head/Cargo.lock"
-          fetch_version_file "$HEAD_REPOSITORY" "$HEAD_SHA" windows-client/Directory.Build.props "$head/windows-client/Directory.Build.props"
+          extract_versions "$BASE_SHA" "$versions/base"
+          extract_versions "$HEAD_SHA" "$versions/head"
+          base_version="$(read_version "$versions/base")"
+          head_version="$(read_version "$versions/head")"
+          next_version="$(python3 scripts/product_version.py next --version "$base_version" | sed -n 's/^version=//p')"
 
-          base_version="$(python3 scripts/product_version.py check \
-            --cargo-toml "$base/Cargo.toml" \
-            --cargo-lock "$base/Cargo.lock" \
-            --windows-props "$base/windows-client/Directory.Build.props" |
-            sed -n 's/^version=//p')"
-          head_version="$(python3 scripts/product_version.py check \
-            --cargo-toml "$head/Cargo.toml" \
-            --cargo-lock "$head/Cargo.lock" \
-            --windows-props "$head/windows-client/Directory.Build.props" |
-            sed -n 's/^version=//p')"
-          next_version="$(python3 scripts/product_version.py next --version "$base_version" |
-            sed -n 's/^version=//p')"
-          [[ -n "$base_version" && -n "$head_version" && -n "$next_version" ]] || {
-            echo 'version authority returned an incomplete result' >&2
-            exit 1
-          }
+          # Locate the newest first-parent commit that changed a version file.
+          # This keeps later user commits in the owner diff while excluding a
+          # byte-exact workflow-generated version transition.
+          generated_version=false
+          version_commit="$(git log --first-parent --format=%H -n 1 \
+            "$BASE_SHA..$HEAD_SHA" -- \
+            Cargo.toml Cargo.lock windows-client/Directory.Build.props)"
+          if [[ -n "$version_commit" && "$head_version" == "$next_version" ]]; then
+            read -r -a version_line <<<"$(git rev-list --parents -n 1 "$version_commit")"
+          else
+            version_line=()
+          fi
+          if [[ "${#version_line[@]}" -eq 2 ]]; then
+            parent_sha="${version_line[1]}"
+            mapfile -t last_paths < <(git diff --name-only "$parent_sha" "$version_commit" | LC_ALL=C sort)
+            expected_paths=(Cargo.lock Cargo.toml windows-client/Directory.Build.props)
+            if [[ "${last_paths[*]}" == "${expected_paths[*]}" ]]; then
+              mkdir -p \
+                "$versions/parent/windows-client" \
+                "$versions/generated/windows-client" \
+                "$versions/expected/windows-client"
+              extract_versions "$parent_sha" "$versions/parent"
+              extract_versions "$version_commit" "$versions/generated"
+              cp "$versions/parent/Cargo.toml" "$versions/expected/Cargo.toml"
+              cp "$versions/parent/Cargo.lock" "$versions/expected/Cargo.lock"
+              cp "$versions/parent/windows-client/Directory.Build.props" "$versions/expected/windows-client/Directory.Build.props"
+              parent_version="$(read_version "$versions/parent")"
+              if [[ "$parent_version" == "$base_version" ]]; then
+                python3 scripts/product_version.py bump --expected "$base_version" \
+                  --cargo-toml "$versions/expected/Cargo.toml" \
+                  --cargo-lock "$versions/expected/Cargo.lock" \
+                  --windows-props "$versions/expected/windows-client/Directory.Build.props"
+                if cmp -s "$versions/expected/Cargo.toml" "$versions/generated/Cargo.toml" && \
+                   cmp -s "$versions/expected/Cargo.lock" "$versions/generated/Cargo.lock" && \
+                   cmp -s "$versions/expected/windows-client/Directory.Build.props" "$versions/generated/windows-client/Directory.Build.props" && \
+                   cmp -s "$versions/expected/Cargo.toml" "$versions/head/Cargo.toml" && \
+                   cmp -s "$versions/expected/Cargo.lock" "$versions/head/Cargo.lock" && \
+                   cmp -s "$versions/expected/windows-client/Directory.Build.props" "$versions/head/windows-client/Directory.Build.props"; then
+                  generated_version=true
+                fi
+              fi
+            fi
+          fi
 
-          if [[ "$head_version" == "$next_version" ]]; then
-            printf 'check_conclusion=success\nversion=%s\nfinal_head_sha=%s\n' \
-              "$head_version" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          changes="$RUNNER_TEMP/changed-paths.z"
+          if [[ "$generated_version" == true ]]; then
+            git diff --find-renames=50% --find-copies=50% --find-copies-harder \
+              --name-status -z "$BASE_SHA...$HEAD_SHA" -- . \
+              ':(exclude)Cargo.toml' \
+              ':(exclude)Cargo.lock' \
+              ':(exclude)windows-client/Directory.Build.props' > "$changes"
+          else
+            git diff --find-renames=50% --find-copies=50% --find-copies-harder \
+              --name-status -z "$BASE_SHA...$HEAD_SHA" > "$changes"
+          fi
+          selection="$(python3 scripts/ci_change_scope.py --name-status "$changes")"
+          binary_impact="$(jq -r '.binary_impact' <<<"$selection")"
+
+          if [[ "$binary_impact" == false ]]; then
+            [[ "$head_version" == "$base_version" ]] || {
+              echo 'a non-binary PR must not change the product version' >&2
+              exit 1
+            }
+            printf 'ready=true\nselection_json=%s\nquality_sha=%s\ngenerated_head=false\ngenerated_observer=false\n' \
+              "$selection" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          if [[ "$head_version" == "$next_version" ]]; then
+            # Bytes alone cannot distinguish a workflow-generated H1 from an
+            # identical manual version commit. The producer's acceptance
+            # identity is the single authority for suppressing a duplicate H1
+            # owner run; there is no poll, retry, or mutation readback.
+            if [[ "$generated_version" == true && "$version_commit" == "$HEAD_SHA" ]]; then
+              producer_prefix="codex-main-quality:pr=$PR_NUMBER:head=$HEAD_SHA:run="
+              producer_count="$(gh api -H 'Accept: application/vnd.github+json' \
+                "repos/$REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=acceptance&filter=all&per_page=100" |
+                jq -r --arg prefix "$producer_prefix" '
+                  [.check_runs[] |
+                   .external_id? |
+                   select(type == "string" and startswith($prefix))] |
+                  length
+                ')"
+              if [[ "$producer_count" -gt 0 ]]; then
+                printf 'ready=false\nselection_json=%s\nquality_sha=%s\ngenerated_head=false\ngenerated_observer=true\n' \
+                  "$selection" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+            printf 'ready=true\nselection_json=%s\nquality_sha=%s\ngenerated_head=false\ngenerated_observer=false\n' \
+              "$selection" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           [[ "$head_version" == "$base_version" ]] || {
-            echo "PR version must be base $base_version or exact next patch $next_version; found $head_version" >&2
+            echo "binary PR version must be $base_version or $next_version; found $head_version" >&2
             exit 1
           }
-          # `bump` runs only against temporary files decoded from the API. It
-          # never writes the trusted checkout or a PR checkout; the eventual
-          # repository mutation is the single Git Data API ref update below.
-          cp "$head/Cargo.toml" "$next/Cargo.toml"
-          cp "$head/Cargo.lock" "$next/Cargo.lock"
-          cp "$head/windows-client/Directory.Build.props" "$next/windows-client/Directory.Build.props"
+
+          mkdir -p "$versions/next/windows-client"
+          cp "$versions/head/Cargo.toml" "$versions/next/Cargo.toml"
+          cp "$versions/head/Cargo.lock" "$versions/next/Cargo.lock"
+          cp "$versions/head/windows-client/Directory.Build.props" "$versions/next/windows-client/Directory.Build.props"
           python3 scripts/product_version.py bump --expected "$base_version" \
-            --cargo-toml "$next/Cargo.toml" \
-            --cargo-lock "$next/Cargo.lock" \
-            --windows-props "$next/windows-client/Directory.Build.props"
-          prepared_version="$(python3 scripts/product_version.py check \
-            --cargo-toml "$next/Cargo.toml" \
-            --cargo-lock "$next/Cargo.lock" \
-            --windows-props "$next/windows-client/Directory.Build.props" |
-            sed -n 's/^version=//p')"
-          [[ "$prepared_version" == "$next_version" ]] || {
-            echo "version authority prepared an unexpected version: $prepared_version" >&2
-            exit 1
-          }
+            --cargo-toml "$versions/next/Cargo.toml" \
+            --cargo-lock "$versions/next/Cargo.lock" \
+            --windows-props "$versions/next/windows-client/Directory.Build.props"
 
-          # Verify the branch still names the event head before creating any
-          # objects, then rely on force=false for the final non-fast-forward
-          # race boundary if it moves while these objects are being created.
-          get_ref_endpoint="repos/$REPOSITORY/git/ref/heads/$HEAD_REF"
-          observed_head="$(gh api \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "$get_ref_endpoint" --jq '.object.sha')"
-          [[ "$observed_head" == "$HEAD_SHA" ]] || {
-            echo "PR head moved before version preparation: expected $HEAD_SHA, found $observed_head" >&2
-            exit 1
-          }
-          head_tree_sha="$(gh api \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "repos/$REPOSITORY/git/commits/$HEAD_SHA" --jq '.tree.sha')"
-          [[ "$head_tree_sha" =~ ^[0-9a-fA-F]{40}$ ]] || {
-            echo 'Git Commit API did not return the PR head tree' >&2
-            exit 1
-          }
+          export GIT_INDEX_FILE="$RUNNER_TEMP/version.index"
+          git read-tree "$HEAD_SHA^{tree}"
+          cargo_toml_blob="$(git hash-object -w "$versions/next/Cargo.toml")"
+          cargo_lock_blob="$(git hash-object -w "$versions/next/Cargo.lock")"
+          windows_props_blob="$(git hash-object -w "$versions/next/windows-client/Directory.Build.props")"
+          git update-index --add --cacheinfo "100644,$cargo_toml_blob,Cargo.toml"
+          git update-index --add --cacheinfo "100644,$cargo_lock_blob,Cargo.lock"
+          git update-index --add --cacheinfo "100644,$windows_props_blob,windows-client/Directory.Build.props"
+          tree_sha="$(git write-tree)"
+          export GIT_AUTHOR_NAME='github-actions[bot]'
+          export GIT_AUTHOR_EMAIL='41898282+github-actions[bot]@users.noreply.github.com'
+          export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+          export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          commit_sha="$(printf 'chore: prepare version %s\n' "$next_version" | git commit-tree "$tree_sha" -p "$HEAD_SHA")"
 
-          create_blob() {
-            local path="$1"
-            base64 --wrap=0 "$path" |
-              jq -Rs '{content:.,encoding:"base64"}' |
-              gh api \
-                --method POST \
-                -H 'Accept: application/vnd.github+json' \
-                -H 'X-GitHub-Api-Version: 2022-11-28' \
-                "repos/$REPOSITORY/git/blobs" \
-                --input - --jq '.sha'
-          }
-          cargo_toml_blob="$(create_blob "$next/Cargo.toml")"
-          cargo_lock_blob="$(create_blob "$next/Cargo.lock")"
-          windows_props_blob="$(create_blob "$next/windows-client/Directory.Build.props")"
-          [[ "$cargo_toml_blob" =~ ^[0-9a-fA-F]{40}$ &&
-              "$cargo_lock_blob" =~ ^[0-9a-fA-F]{40}$ &&
-              "$windows_props_blob" =~ ^[0-9a-fA-F]{40}$ ]] || {
-            echo 'Git Blob API returned an invalid object id' >&2
-            exit 1
-          }
+          # A concurrent head update makes this non-force push fail. No ref
+          # pre-read, retry, or overwrite path exists.
+          git push origin "$commit_sha:refs/heads/$HEAD_REF"
+          printf 'ready=true\nselection_json=%s\nquality_sha=%s\ngenerated_head=true\ngenerated_observer=false\n' \
+            "$selection" "$commit_sha" >> "$GITHUB_OUTPUT"
 
-          tree_payload="$(jq -n \
-            --arg base "$head_tree_sha" \
-            --arg cargo_toml_sha "$cargo_toml_blob" \
-            --arg cargo_lock_sha "$cargo_lock_blob" \
-            --arg windows_props_sha "$windows_props_blob" \
-            '{base_tree:$base,tree:[
-              {path:"Cargo.toml",mode:"100644",type:"blob",sha:$cargo_toml_sha},
-              {path:"Cargo.lock",mode:"100644",type:"blob",sha:$cargo_lock_sha},
-              {path:"windows-client/Directory.Build.props",mode:"100644",type:"blob",sha:$windows_props_sha}
-            ]}')"
-          tree_sha="$(gh api \
-            --method POST \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "repos/$REPOSITORY/git/trees" \
-            --input - --jq '.sha' <<<"$tree_payload")"
-          [[ "$tree_sha" =~ ^[0-9a-fA-F]{40}$ ]] || {
-            echo 'Git Tree API returned an invalid object id' >&2
-            exit 1
-          }
-
-          commit_payload="$(jq -n \
-            --arg message "chore: prepare version $next_version" \
-            --arg tree "$tree_sha" \
-            --arg parent "$HEAD_SHA" \
-            '{message:$message,tree:$tree,parents:[$parent]}')"
-          commit_sha="$(gh api \
-            --method POST \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "repos/$REPOSITORY/git/commits" \
-            --input - --jq '.sha' <<<"$commit_payload")"
-          [[ "$commit_sha" =~ ^[0-9a-fA-F]{40}$ ]] || {
-            echo 'Git Commit API returned an invalid object id' >&2
-            exit 1
-          }
-          commit_info="$(gh api \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "repos/$REPOSITORY/git/commits/$commit_sha")"
-          [[ "$(jq -r '.tree.sha' <<<"$commit_info")" == "$tree_sha" &&
-              "$(jq -r '.parents | length' <<<"$commit_info")" == 1 &&
-              "$(jq -r '.parents[0].sha' <<<"$commit_info")" == "$HEAD_SHA" ]] || {
-            echo 'Git Commit API parent/tree proof did not match the PR head' >&2
-            exit 1
-          }
-
-          python3 scripts/final_head_check_reporter.py publish-version \
-            --repository "$REPOSITORY" \
-            --pr-number "$PR_NUMBER" \
-            --base-repository "$BASE_REPOSITORY" \
-            --base-sha "$BASE_SHA" \
-            --head-repository "$HEAD_REPOSITORY" \
-            --head-ref "$HEAD_REF" \
-            --old-head-sha "$HEAD_SHA" \
-            --new-head-sha "$commit_sha" \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          printf 'check_conclusion=success\nversion=%s\nfinal_head_sha=%s\n' \
-            "$next_version" "$commit_sha" >> "$GITHUB_OUTPUT"
-
-      - name: Select the exact quality head
-        id: result
-        shell: bash
-        env:
-          BINARY_IMPACT: ${{ steps.scope.outputs.binary_impact }}
-          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PREPARED_HEAD_SHA: ${{ steps.prepare.outputs.final_head_sha }}
-        run: |
-          set -euo pipefail
-          case "$BINARY_IMPACT" in
-            true) final_head_sha="$PREPARED_HEAD_SHA" ;;
-            false) final_head_sha="$EVENT_HEAD_SHA" ;;
-            *) echo 'change scope output is missing or malformed' >&2; exit 1 ;;
-          esac
-          [[ "$final_head_sha" =~ ^[0-9a-fA-F]{40}$ ]] || {
-            echo 'final quality head is missing or malformed' >&2
-            exit 1
-          }
-          printf 'final_head_sha=%s\n' "$final_head_sha" >> "$GITHUB_OUTPUT"
-
-  register-final-head-checks:
-    needs: [prepare]
-    runs-on: ubuntu-latest
-    permissions:
-      checks: write
-      contents: read
-      pull-requests: read
-    outputs:
-      quality_required: ${{ steps.register.outputs.quality_required }}
-    steps:
-      - name: Checkout trusted default branch
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository }}
-          ref: ${{ github.event.pull_request.base.sha }}
-          fetch-depth: 1
-          persist-credentials: false
-      - name: Register required checks on the immutable final head
-        id: register
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-          HEAD_SHA: ${{ needs.prepare.outputs.final_head_sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          python3 scripts/final_head_check_reporter.py register \
-            --repository "$REPOSITORY" \
-            --pr-number "$PR_NUMBER" \
-            --base-repository "$BASE_REPOSITORY" \
-            --head-repository "$HEAD_REPOSITORY" \
-            --base-sha "$BASE_SHA" \
-            --head-sha "$HEAD_SHA" \
-            --head-ref "$HEAD_REF" \
-            --run-id "$RUN_ID" \
-            --run-url "$RUN_URL" \
-            --github-output "$GITHUB_OUTPUT"
-
-  selected-quality:
-    needs: [prepare, register-final-head-checks]
-    if: needs.register-final-head-checks.outputs.quality_required == 'true'
+  selective-quality:
+    name: Run selected quality owners
+    needs: [version-prepared]
+    if: needs.version-prepared.outputs.ready == 'true'
+    uses: ./.github/workflows/selective-quality.yml
+    with:
+      source_sha: ${{ needs.version-prepared.outputs.quality_sha }}
+      base_sha: ${{ github.event.pull_request.base.sha }}
+      head_ref: ${{ github.event.pull_request.head.ref }}
+      pr_number: ${{ github.event.pull_request.number }}
+      selection_json: ${{ needs.version-prepared.outputs.selection_json }}
+      release_candidate: true
     permissions:
       contents: read
       security-events: write
-    uses: ./.github/workflows/selective-quality.yml
-    with:
-      source_sha: ${{ needs.prepare.outputs.final_head_sha }}
-      base_sha: ${{ github.event.pull_request.base.sha }}
-      head_ref: ${{ github.event.pull_request.head.ref }}
-      pr_number: ${{ github.event.pull_request.number }}
-      selection_json: ${{ needs.prepare.outputs.selection_json }}
-      codeql_languages_json: ${{ needs.prepare.outputs.codeql_languages_json }}
 
-  quality:
-    needs: [prepare, register-final-head-checks, selected-quality]
-    if: needs.register-final-head-checks.outputs.quality_required == 'true' && needs.selected-quality.result == 'success'
-    permissions:
-      contents: read
-    uses: ./.github/workflows/windows-client.yml
-    with:
-      premerge: true
-      pr_number: ${{ github.event.pull_request.number }}
-      base_repository: ${{ github.event.pull_request.base.repo.full_name }}
-      head_repository: ${{ github.event.pull_request.head.repo.full_name }}
-      base_sha: ${{ github.event.pull_request.base.sha }}
-      head_sha: ${{ needs.prepare.outputs.final_head_sha }}
-      head_ref: ${{ github.event.pull_request.head.ref }}
-      selection_json: ${{ needs.prepare.outputs.selection_json }}
-
-  finalize-final-head-checks:
-    needs: [prepare, register-final-head-checks, selected-quality, quality]
-    if: always() && needs.register-final-head-checks.outputs.quality_required == 'true'
+  acceptance:
+    name: ${{ needs.version-prepared.outputs.generated_observer == 'true' && 'Observe generated H1' || 'acceptance' }}
+    if: always()
+    needs: [version-prepared, selective-quality]
     runs-on: ubuntu-latest
     permissions:
-      actions: read
       checks: write
-      contents: read
-      pull-requests: read
     steps:
-      - name: Checkout trusted default branch
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository }}
-          ref: ${{ github.event.pull_request.base.sha }}
-          fetch-depth: 1
-          persist-credentials: false
-      - name: Download final acceptance verdict
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: acceptance-verdict
-          path: ${{ runner.temp }}/acceptance-verdict
-      - name: Download binary release candidate
-        if: needs.prepare.outputs.windows_impact == 'true'
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          name: release-candidate
-          path: ${{ runner.temp }}/release-candidate
-      - name: Finalize required acceptance on the immutable head
+      - name: Require selected quality success
         env:
+          GENERATED_HEAD: ${{ needs.version-prepared.outputs.generated_head }}
+          GENERATED_OBSERVER: ${{ needs.version-prepared.outputs.generated_observer }}
           GH_TOKEN: ${{ github.token }}
-          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          BINARY_IMPACT: ${{ needs.prepare.outputs.binary_impact }}
-          OWNER_QUALITY_RESULT: ${{ needs.selected-quality.result }}
-          CANDIDATE_ARTIFACT_DIGEST: ${{ needs.quality.outputs.candidate_artifact_digest }}
-          CANDIDATE_ARTIFACT_ID: ${{ needs.quality.outputs.candidate_artifact_id }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-          HEAD_SHA: ${{ needs.prepare.outputs.final_head_sha }}
+          PREPARE_RESULT: ${{ needs.version-prepared.result }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          CANDIDATE_RESULT: ${{ needs.quality.result }}
+          QUALITY_SHA: ${{ needs.version-prepared.outputs.quality_sha }}
+          QUALITY_RESULT: ${{ needs.selective-quality.result }}
           REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          VERDICT_ARTIFACT_DIGEST: ${{ needs.quality.outputs.verdict_artifact_digest }}
-          VERDICT_ARTIFACT_ID: ${{ needs.quality.outputs.verdict_artifact_id }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-          WINDOWS_IMPACT: ${{ needs.prepare.outputs.windows_impact }}
         run: |
           set -euo pipefail
-          quality_result=failure
-          if [[ "$OWNER_QUALITY_RESULT" == success && "$CANDIDATE_RESULT" == success ]]; then
-            quality_result=success
+          conclusion=failure
+          if [[ "$PREPARE_RESULT" == success && "$QUALITY_RESULT" == success ]]; then
+            conclusion=success
           fi
-          python3 scripts/final_head_check_reporter.py finalize \
-            --repository "$REPOSITORY" \
-            --pr-number "$PR_NUMBER" \
-            --base-repository "$BASE_REPOSITORY" \
-            --head-repository "$HEAD_REPOSITORY" \
-            --base-sha "$BASE_SHA" \
-            --head-sha "$HEAD_SHA" \
-            --head-ref "$HEAD_REF" \
-            --run-id "$RUN_ID" \
-            --run-url "$RUN_URL" \
-            --quality-result "$quality_result" \
-            --binary-impact "$BINARY_IMPACT" \
-            --windows-impact "$WINDOWS_IMPACT" \
-            --version "$VERSION" \
-            --verdict-directory '${{ runner.temp }}/acceptance-verdict' \
-            --candidate-directory '${{ runner.temp }}/release-candidate' \
-            --verdict-artifact-id "$VERDICT_ARTIFACT_ID" \
-            --verdict-artifact-digest "$VERDICT_ARTIFACT_DIGEST" \
-            --candidate-artifact-id "$CANDIDATE_ARTIFACT_ID" \
-            --candidate-artifact-digest "$CANDIDATE_ARTIFACT_DIGEST"
+          if [[ "$PREPARE_RESULT" == success && "$GENERATED_OBSERVER" == true && "$QUALITY_RESULT" == skipped ]]; then
+            conclusion=success
+          fi
+
+          # GITHUB_TOKEN pushes do not start another workflow run. Only the
+          # generated H1 therefore needs final checks copied from this H0 run.
+          if [[ "$GENERATED_HEAD" == true ]]; then
+            external_id="codex-main-quality:pr=$PR_NUMBER:head=$QUALITY_SHA:run=$GITHUB_RUN_ID"
+            create_check() {
+              local name="$1" result="$2"
+              jq -nc \
+                --arg name "$name" \
+                --arg head "$QUALITY_SHA" \
+                --arg result "$result" \
+                --arg external "$external_id" \
+                '{name:$name,head_sha:$head,status:"completed",conclusion:$result,external_id:$external}' |
+                gh api --method POST "repos/$REPOSITORY/check-runs" --input - >/dev/null
+            }
+            create_check version-prepared success
+            create_check acceptance "$conclusion"
+          fi
+          [[ "$conclusion" == success ]]

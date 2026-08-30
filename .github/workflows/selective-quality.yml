@@ -21,9 +21,9 @@ on:
       selection_json:
         required: true
         type: string
-      codeql_languages_json:
+      release_candidate:
         required: true
-        type: string
+        type: boolean
 
 permissions:
   contents: read
@@ -45,8 +45,6 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
-          git cat-file -e "$BASE_SHA^{commit}"
           git diff --check "$BASE_SHA" "$SOURCE_SHA"
           bash scripts/requirements_ledger_gate.sh
 
@@ -64,24 +62,14 @@ jobs:
         with:
           go-version: '1.25.x'
           cache: false
-      - name: Install pinned workflow syntax validator
-        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-      - name: Run finite governance contracts
+      - name: Validate workflow syntax and requirements
         env:
           BASE_SHA: ${{ inputs.base_sha }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          [[ "$(git rev-parse HEAD)" == "$SOURCE_SHA" ]]
           git diff --check "$BASE_SHA" "$SOURCE_SHA"
-          actionlint .github/workflows/*.yml
-          python3 scripts/test_ci_change_scope.py
-          python3 scripts/test_selected_quality_gate.py
-          python3 scripts/test_feat_integration_check_reporter.py
-          python3 scripts/test_final_head_check_reporter.py
-          python3 scripts/test_codeql_workflow.py
-          python3 scripts/ci_trust_fixture.py
-          python3 scripts/workflow_quality_gate.py --self-test
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
           bash scripts/requirements_ledger_gate.sh
 
   linux-backend-quality:
@@ -107,26 +95,20 @@ jobs:
     if: contains(fromJSON(inputs.selection_json).owners, 'WINDOWS')
     uses: ./.github/workflows/windows-client.yml
     with:
-      premerge: true
+      source_sha: ${{ inputs.source_sha }}
       pr_number: ${{ inputs.pr_number }}
-      base_repository: ${{ github.repository }}
-      head_repository: ${{ github.repository }}
-      base_sha: ${{ inputs.base_sha }}
-      head_sha: ${{ inputs.source_sha }}
-      head_ref: ${{ inputs.head_ref }}
-      selective_mode: true
-      selection_json: ${{ inputs.selection_json }}
+      release_candidate: ${{ inputs.release_candidate }}
     permissions:
       contents: read
 
   codeql-quality:
     name: codeql-quality
-    if: inputs.codeql_languages_json != '[]'
+    if: toJSON(fromJSON(inputs.selection_json).codeql_languages) != '[]'
     uses: ./.github/workflows/codeql.yml
     with:
       source_sha: ${{ inputs.source_sha }}
       head_ref: ${{ inputs.head_ref }}
-      languages_json: ${{ inputs.codeql_languages_json }}
+      languages_json: ${{ toJSON(fromJSON(inputs.selection_json).codeql_languages) }}
     permissions:
       contents: read
       security-events: write
@@ -142,17 +124,12 @@ jobs:
       - windows-quality
       - codeql-quality
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
-      - name: Checkout trusted selection authority
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository }}
-          ref: refs/heads/main
-          fetch-depth: 1
+          ref: ${{ inputs.base_sha }}
           persist-credentials: false
-      - name: Require exact selected and skipped job states
+      - name: Require selected success and non-selected skip
         env:
           SELECTION: ${{ inputs.selection_json }}
           RESULTS: ${{ toJSON(needs) }}

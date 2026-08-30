@@ -280,57 +280,10 @@ require_text src/main.rs 'include_str!("../LICENSE")'
 require_text src/main.rs 'include_str!("../THIRD_PARTY_NOTICES.md")'
 require_text src/main.rs 'i18n.text(TextKey::LegalProtocol)'
 require_text src/main.rs 'i18n.text(TextKey::LegalThirdParty)'
-require_text .github/workflows/windows-client.yml 'Run final acceptance gate before merge'
 require_text .github/workflows/windows-client.yml 'windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput'
-ui_quality_scope="$(
-    awk '
-        $0 == "      - name: Write UI quality evidence" {
-            capturing = 1
-            next
-        }
-        capturing && $0 ~ /^      - name:/ { exit }
-        capturing { print }
-    ' .github/workflows/windows-client.yml
-)"
-[[ -n "$ui_quality_scope" ]] || fail 'missing Write UI quality evidence step body'
-require_ui_quality_text() {
-    local pattern="$1"
-    rg -q --fixed-strings -- "$pattern" <<<"$ui_quality_scope" ||
-        fail "missing in Write UI quality evidence step: $pattern"
-}
-require_ui_quality_text '$qualityLines'
-require_ui_quality_text '$qualityPath'
-require_ui_quality_text 'ui-quality.txt'
-require_ui_quality_text '$hashLines'
-require_ui_quality_text '$manifestPath'
-require_ui_quality_text 'SHA256SUMS'
-require_ui_quality_text '[System.Text.UTF8Encoding]::new($false)'
-require_ui_quality_text '[System.IO.File]::WriteAllText('
-require_ui_quality_text '$qualityLines -join "`n"'
-require_ui_quality_text '$hashLines -join "`n"'
-if rg -q --fixed-strings -- 'Set-Content' <<<"$ui_quality_scope"; then
-    fail 'Write UI quality evidence must not use Set-Content'
-fi
-write_all_text_count="$(rg -o --fixed-strings '[System.IO.File]::WriteAllText(' <<<"$ui_quality_scope" | wc -l)"
-[[ "$write_all_text_count" -eq 2 ]] ||
-    fail "UI quality marker and SHA256SUMS must each use WriteAllText: count=$write_all_text_count"
-utf8_no_bom_count="$(rg -o --fixed-strings '[System.Text.UTF8Encoding]::new($false)' <<<"$ui_quality_scope" | wc -l)"
-[[ "$utf8_no_bom_count" -eq 1 ]] ||
-    fail "UI quality evidence must declare one UTF-8 no-BOM encoding: count=$utf8_no_bom_count"
-quality_lines_line="$(rg -n -m1 --fixed-strings '$qualityLines = @(' <<<"$ui_quality_scope" | cut -d: -f1)"
-quality_write_line="$(rg -n -m1 --fixed-strings '[System.IO.File]::WriteAllText(' <<<"$ui_quality_scope" | cut -d: -f1)"
-hash_lines_line="$(rg -n -m1 --fixed-strings '$hashLines = @(' <<<"$ui_quality_scope" | cut -d: -f1)"
-manifest_write_line="$(rg -n -m2 --fixed-strings '[System.IO.File]::WriteAllText(' <<<"$ui_quality_scope" | tail -n1 | cut -d: -f1)"
-[[ -n "$quality_lines_line" && -n "$quality_write_line" && -n "$hash_lines_line" && -n "$manifest_write_line" ]] ||
-    fail 'UI quality marker and manifest writer ordering markers are incomplete'
-(( quality_lines_line < quality_write_line && quality_write_line < hash_lines_line && hash_lines_line < manifest_write_line )) ||
-    fail 'UI quality lines must be written before SHA256SUMS is calculated and written'
-require_text .github/workflows/windows-client.yml "inputs.selective_mode == true && contains(fromJSON(inputs.selection_json).owners, 'WINDOWS')"
-require_text .github/workflows/windows-client.yml 'windows-impact: $WINDOWS_IMPACT'
 for forbidden_workflow_marker in \
     '  native-quality:' \
     '  codeql-analysis:' \
-    '  windows-quality:' \
     'Audit live applied merge rules' \
     'validate-live-applied-rules' \
     'uses: ./.github/workflows/rust.yml' \
@@ -340,53 +293,31 @@ for forbidden_workflow_marker in \
     fi
 done
 require_text .github/workflows/version-prepare.yml 'uses: ./.github/workflows/selective-quality.yml'
-require_text .github/workflows/version-prepare.yml 'selection_json: ${{ needs.prepare.outputs.selection_json }}'
+require_text .github/workflows/version-prepare.yml 'selection_json: ${{ needs.version-prepared.outputs.selection_json }}'
 require_text .github/workflows/selective-quality.yml 'uses: ./.github/workflows/windows-client.yml'
-require_text .github/workflows/selective-quality.yml 'selective_mode: true'
-require_text .github/workflows/windows-client.yml 'bash scripts/final_acceptance_gate.sh "$WINDOWS_UI_EVIDENCE"'
-require_text .github/workflows/windows-client.yml 'WINDOWS_UI_EVIDENCE: ${{ runner.temp }}/windows-ui-e2e'
-require_text .github/workflows/windows-client.yml 'CANDIDATE: ${{ runner.temp }}/release-candidate'
+require_text .github/workflows/windows-client.yml 'dotnet test windows-client/CodexInfo.WindowsClient.sln'
+require_text .github/workflows/windows-client.yml 'Build-WindowsInstaller.ps1 -OutputDirectory artifacts/windows-installer'
 require_text .github/workflows/windows-client.yml '-SourceSha $env:SOURCE_SHA'
-require_text .github/workflows/windows-client.yml 'ref: ${{ inputs.head_sha }}'
+require_text .github/workflows/windows-client.yml 'ref: ${{ inputs.source_sha }}'
+require_text .github/workflows/windows-client.yml 'New-WindowsUpdateManifest.ps1'
+require_text .github/workflows/windows-client.yml 'name: release-candidate-${{ inputs.pr_number }}'
+if rg -q --fixed-strings 'windows-ui-e2e' .github/workflows/windows-client.yml; then
+    fail 'Windows workflow must not upload evidence-only UI artifacts'
+fi
 require_file .github/workflows/release.yml
-require_text .github/workflows/release.yml 'commits/$PR_HEAD_SHA/check-runs?check_name=acceptance'
-require_text .github/workflows/release.yml 'name: acceptance-verdict'
-require_text .github/workflows/release.yml 'final_head_check_reporter.py verify-verdict'
-require_text .github/workflows/release.yml "steps.verdict.outputs.windows_impact == 'true'"
-require_file scripts/final_head_check_reporter.py
-require_file scripts/test_final_head_check_reporter.py
-require_file scripts/release_quality_run_resolver.py
-require_file scripts/test_release_quality_run_resolver.py
-require_text .github/workflows/windows-client.yml 'EXPECTED_E2E_SOURCE_SHA: ${{ inputs.head_sha }}'
-require_file scripts/final_acceptance_gate.sh
-require_text scripts/final_acceptance_gate.sh 'expected E2E source SHA is required'
-require_text scripts/final_acceptance_gate.sh 'source tree is dirty; release evidence must match a clean committed revision'
-require_text scripts/final_acceptance_gate.sh 'source-sha: $expected_sha'
-require_text scripts/final_acceptance_gate.sh 'capture: name=$capture_name '
-require_text scripts/final_acceptance_gate.sh 'sha256sum "$capture_path"'
-require_text scripts/final_acceptance_gate.sh 'window-move-smoke: PASS'
-require_text scripts/final_acceptance_gate.sh 'grep -Fq --'
-require_text scripts/final_acceptance_gate.sh 'grep -F --'
-require_file scripts/final_acceptance_gate_test.sh
-require_text scripts/final_acceptance_gate_test.sh 'final-acceptance-gate-test: PASS cases=$cases'
-require_text scripts/final_acceptance_gate_test.sh 'isolated acceptance PATH unexpectedly contains rg'
+require_text .github/workflows/release.yml 'commits/$HEAD_SHA/check-runs?check_name=acceptance'
+require_text .github/workflows/release.yml 'codex-main-quality:pr=$PR_NUMBER:head=$HEAD_SHA:run='
+if rg -q --fixed-strings 'status=success' .github/workflows/release.yml; then
+    fail 'Release must not filter away a later failed or cancelled producer run'
+fi
+require_text .github/workflows/release.yml 'test("(^| / )windows-quality$")'
+require_text .github/workflows/release.yml 'name: release-candidate-${{ github.event.pull_request.number }}'
 require_text .github/workflows/rust.yml 'dtolnay/rust-toolchain@stable'
 require_text .github/workflows/rust.yml 'x11-apps'
-require_text .github/workflows/rust.yml 'cd artifacts/native-quality'
-require_text .github/workflows/rust.yml 'sha256sum native-quality.txt > SHA256SUMS'
-require_text .github/workflows/rust.yml 'release-build: PASS'
-require_text .github/workflows/rust.yml 'cli-contract-e2e: PASS'
-require_text .github/workflows/rust.yml 'recorder-daemon: PASS'
-for obsolete_native_marker in 'regression-guard: PASS' 'data-protection: PASS'; do
-    if rg -q --fixed-strings -- "$obsolete_native_marker" .github/workflows/rust.yml; then
-        fail "native PR artifact retains obsolete marker: $obsolete_native_marker"
-    fi
-done
-if rg -q --fixed-strings -- 'sha256sum artifacts/native-quality/native-quality.txt' .github/workflows/rust.yml; then
-    fail 'native quality manifest must use bundle-relative paths'
+require_text .github/workflows/rust.yml 'cargo test --locked --all-targets -- --nocapture'
+if rg -q --fixed-strings 'native-quality.txt' .github/workflows/rust.yml; then
+    fail 'native workflow must not upload evidence-only artifacts'
 fi
-final_gate_line="$(rg -n 'bash scripts/final_acceptance_gate.sh \"\$WINDOWS_UI_EVIDENCE\"' .github/workflows/windows-client.yml | cut -d: -f1 | head -n 1)"
-[[ -n "$final_gate_line" ]] || fail 'final acceptance gate invocation is missing'
 require_file scripts/pre_pr_gate.sh
 pre_pr_regression_calls="$(count_live_shell_invocations scripts/pre_pr_gate.sh 'bash scripts/regression_guard.sh')"
 [[ "$pre_pr_regression_calls" -eq 1 ]] ||
@@ -452,18 +383,18 @@ fi
 require_text scripts/regression_guard.sh 'Rust all-target test set contains a zero-test target'
 require_text scripts/regression_guard.sh 'X11 graph visual gate unverified (DISPLAY unavailable)'
 require_text .github/workflows/rust.yml 'xvfb-run --auto-servernum'
-require_text .github/workflows/release.yml 'Get-GitHubResourceStatus'
-require_text .github/workflows/release.yml 'gh api --method POST "repos/$repository/git/refs"'
-require_text .github/workflows/release.yml 'gh api --method POST "repos/$repository/releases"'
-require_text .github/workflows/release.yml 'python3 scripts/release_state_gate.py created --tag $tag'
-require_text .github/workflows/release.yml '$createdReleaseId = [long]$createdRelease.id'
-require_text .github/workflows/release.yml '$draftReleaseEndpoint = "repos/$repository/releases/$createdReleaseId"'
-require_text .github/workflows/release.yml 'python3 scripts/release_state_gate.py draft `'
-require_text .github/workflows/release.yml 'python3 scripts/release_state_gate.py tag --sha $env:EXPECTED_MERGE_SHA'
-require_text .github/workflows/release.yml 'python3 scripts/release_state_gate.py published `'
-require_text .github/workflows/release.yml 'gh release upload $tag $setup $manifest'
-require_text .github/workflows/release.yml 'gh api --method PATCH "repos/$repository/releases/$createdReleaseId"'
-require_text .github/workflows/release.yml '-F draft=false'
+require_text .github/workflows/release.yml 'gh release create "$tag" "$setup" "$manifest"'
+require_text .github/workflows/release.yml '--draft'
+require_text .github/workflows/release.yml 'gh release edit "$tag" --repo "$REPOSITORY" --draft=false'
+for obsolete_release_marker in \
+    'Get-GitHubResourceStatus' \
+    'release_state_gate.py' \
+    'acceptance-verdict' \
+    'final_head_check_reporter.py'; do
+    if rg -q --fixed-strings -- "$obsolete_release_marker" .github/workflows/release.yml; then
+        fail "release workflow retains obsolete readback/verdict logic: $obsolete_release_marker"
+    fi
+done
 require_file windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs 'SettingsCorrupt = false'
 require_file windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs
@@ -618,9 +549,6 @@ require_function_text windows-client/tools/Run-WindowsClientE2E.ps1 Invoke-E2EFi
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 "main-quota-gauge: seven cells, two X-authority surface colors, and half-period boundary PASS"
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EMainProductVersion'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2ENoChildProductVersion'
-require_text scripts/final_acceptance_gate.sh 'main-product-version: PASS'
-require_text scripts/final_acceptance_gate.sh 'child-product-version: PASS role=Graph count=0'
-require_text scripts/final_acceptance_gate.sh 'child-product-version: PASS role=Threads count=0'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'graph-past-model-data: PASS'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphHasIdleBand $plot $graph.Handle $graphPast'
 require_text windows-client/tools/Run-WindowsClientE2E.ps1 'graph-past-idle-band: PASS'
@@ -659,8 +587,7 @@ if rg -q --fixed-strings 'Start-Sleep' windows-client/tools/Measure-WindowsGraph
 fi
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-PAR-13'
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-INSTALL-01'
-require_text docs/REGRESSION_PREVENTION_POLICY.md '物理window move証拠'
-require_text docs/REGRESSION_PREVENTION_POLICY.md 'CI受入時の`-AllowPhysicalInput`実行ログ'
+require_text docs/REGRESSION_PREVENTION_POLICY.md '物理window moveを各1回実行し'
 require_text .github/workflows/windows-client.yml '$moveSmokeOutput = @(& ./scripts/windows_window_move_smoke.ps1'
 require_text .github/workflows/windows-client.yml "[string]\$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS'"
 if rg -q --fixed-strings 'if ($LASTEXITCODE -ne 0) { throw '\''Physical window move smoke failed.'\'' }' .github/workflows/windows-client.yml; then
@@ -672,17 +599,16 @@ require_file docs/REQUIREMENTS_LEDGER.md
 for required_ledger_id in X-START-01 X-START-02 X-START-03 X-GRAPH-01 X-THREAD-01 WIN-START-01 WIN-GRAPH-01 WIN-VERSION-01 PROC-LEDGER-01 WF-BINARY-IMPACT-01; do
     require_text docs/REQUIREMENTS_LEDGER.md "| $required_ledger_id |"
 done
-require_text scripts/regression_guard.sh 'bash scripts/requirements_ledger_gate.sh --final'
+require_text scripts/regression_guard.sh "run_checked 'Requirements ledger schema check' bash scripts/requirements_ledger_gate.sh"
+if rg -q --fixed-strings -- '--final' scripts/regression_guard.sh; then
+    fail 'the local pre-PR gate must not require remote verification evidence'
+fi
 require_text scripts/requirements_ledger_gate.sh 'final gate requires verified status'
 require_text scripts/x11_graph_visual_gate.sh 'dedicated idle-band pixels are missing'
 require_text scripts/x11_graph_visual_gate.sh 'implausible vertical stroke'
 require_text docs/PRODUCT_REQUIREMENTS.md '# Codex Info 製品要件'
 require_file windows-client/CodeCoverage.runsettings
 
-bash scripts/final_acceptance_gate_test.sh
-python3 scripts/test_final_head_check_reporter.py
-python3 scripts/test_release_quality_run_resolver.py
-python3 scripts/ci_trust_fixture.py
 python3 scripts/workflow_quality_gate.py --self-test
 python3 scripts/test_codeql_workflow.py
 

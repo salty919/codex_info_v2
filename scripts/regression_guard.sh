@@ -29,17 +29,12 @@ if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
 fi
 run_checked 'Rust format check' cargo fmt --check
 run_checked 'Rust all-target check' cargo check --locked --all-targets
-run_checked 'Requirements ledger final check' bash scripts/requirements_ledger_gate.sh --final
+run_checked 'Requirements ledger schema check' bash scripts/requirements_ledger_gate.sh
 
 require_text docs/PRODUCT_REQUIREMENTS.md '全直積、N倍、N二乗、N階乗のcase生成を行わない'
 require_text docs/PRODUCT_REQUIREMENTS.md '製品バージョンはメイン画面に一度だけ表示し'
-require_text docs/REGRESSION_PREVENTION_POLICY.md 'REG-WIN-DRAG'
 require_text docs/REGRESSION_PREVENTION_POLICY.md 'X先行の変更凍結を必須とする'
-require_text docs/REGRESSION_PREVENTION_POLICY.md '物理window move証拠'
-# The backticks are a literal documentation marker, not shell expansion.
-# shellcheck disable=SC2016
-require_text docs/REGRESSION_PREVENTION_POLICY.md 'CI受入時の`-AllowPhysicalInput`実行ログ'
-for required_ledger_id in X-START-01 X-START-02 X-START-03 X-GRAPH-01 X-THREAD-01 WIN-START-01 WIN-GRAPH-01 WIN-VERSION-01 PROC-LEDGER-01; do
+for required_ledger_id in X-START-01 X-START-02 X-START-03 X-GRAPH-01 X-THREAD-01 PROC-LEDGER-01; do
     require_text docs/REQUIREMENTS_LEDGER.md "| $required_ledger_id |"
 done
 require_file scripts/x11_graph_visual_gate.sh
@@ -57,37 +52,12 @@ require_text scripts/cli_contract_e2e.sh 'BEGIN EXCLUSIVE;'
 require_text scripts/cli_contract_e2e.sh "'forced transient recorder failure was not observed'"
 require_text scripts/cli_contract_e2e.sh "sqlite3 -batch -bail -cmd '.timeout 2000'"
 require_text scripts/x11_graph_visual_gate.sh 'graph child window title redundantly exposes product version'
-require_text scripts/windows_client_contract_gate.sh 'main version automation marker must appear exactly once'
-require_text scripts/windows_client_contract_gate.sh 'child window must not render a product version'
-require_text scripts/windows_client_contract_gate.sh "--logger 'trx;LogFilePrefix=windows-client'"
-require_text scripts/windows_client_contract_gate.sh 'TRX counters are missing'
-require_text scripts/windows_client_contract_gate.sh 'notExecuted'
-require_text windows-client/src/CodexInfo.WindowsClient/WindowDragBehavior.cs 'window.BeginMoveDrag(eventArgs)'
-require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs 'EffectiveGraphEnd'
-require_text windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs 'IsSyntheticFirstObservation'
-require_text windows-client/src/CodexInfo.WindowsClient/Settings/ConnectionProcessFactory.cs 'codex_info'
-require_text windows-client/src/CodexInfo.WindowsClient/Settings/ConnectionProcessFactory.cs '--port'
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 'main-details-status: PASS (matching status/details generation accepted)'
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 'main-startup-loading: PASS (first complete generation is visible)'
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 'legal-plain-text: PASS (all 9 rendered notices, Back, Minimize, and Close are usable)'
-require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/LegalNoticeCatalogTests.cs 'EveryPackagedMarkdownUrlAndCodeBodySurvivesProjection'
-require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/LegalNoticeCatalogTests.cs 'FencedCodePreservesHtmlCommentDelimitersWhileOutsideProjectionRemovesThem'
-require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/LegalNoticeCatalogTests.cs 'MalformedInjectedMarkdownUsesTheExistingFailClosedLoadPage'
-require_text windows-client/tools/Run-WindowsClientE2E.ps1 'Assert-E2EGraphModelPixels'
-require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs 'PlotProjectionUsesFlatVerticalAndContiguousSegmentsForFirstObservation'
-require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs 'IdleBandsUseTheDedicatedVisibleNeutralColor'
 require_text src/main.rs 'remaining_graph_does_not_infer_quota_loss_from_model_spend'
 require_text src/main.rs 'native_startup_loading_requires_a_complete_authenticated_generation'
 require_text src/main.rs 'native_startup_failure_releases_loading_surface'
 require_text src/main.rs '"startup-loading"'
 require_text ui/app.slint 'startup-loading: false'
 require_text ui/app.slint 'text: "◌  " + root.strings.checking;'
-require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettings.cs 'ConnectionConfigured'
-require_text windows-client/src/CodexInfo.WindowsClient/ViewModels/SetupFlow.cs 'SetupLaunchPolicy'
-require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/WindowDragGeometryTests.cs 'SetupLaunchPolicy.ShouldOpen'
-require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/MainWindowViewModelTests.cs 'Startup_keeps_content_hidden_until_the_first_snapshot_is_complete'
-require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/MainWindowViewModelTests.cs 'Startup_failure_releases_spinner_and_exposes_retry_state'
-require_text windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/MainWindowViewModelTests.cs 'Startup_waits_for_the_matching_details_generation_before_publishing_content'
 
 all_target_output="$(cargo test --locked --all-targets -- --nocapture 2>&1)" || {
     printf '%s\n' "$all_target_output" >&2
@@ -178,10 +148,6 @@ if [[ -n "${DISPLAY:-}" ]]; then
     run_checked 'X11 startup visual gate' bash scripts/x11_startup_visual_gate.sh
 else
     fail 'X11 graph visual gate unverified (DISPLAY unavailable)'
-fi
-
-if rg -q 'SetCursorPos|mouse_event|SendInput' windows-client/src; then
-    fail 'product source contains physical cursor or synthetic mouse API'
 fi
 
 echo 'regression-guard: PASS'

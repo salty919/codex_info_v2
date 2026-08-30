@@ -17,241 +17,136 @@ concurrency:
 
 jobs:
   release:
-    # This job is deliberately packaging-only. All quality evidence is
-    # imported from the one accepted PR run; no quality gate is rerun.
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     permissions:
-      contents: write
       actions: read
       checks: read
-      pull-requests: read
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: refs/heads/main
-      - name: Resolve accepted PR quality run
-        id: quality-run
+      - name: Resolve the successful final-head quality run
+        id: quality
         env:
           GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          pull_request_json="$RUNNER_TEMP/release-quality-pull-request.json"
-          check_runs_json="$RUNNER_TEMP/release-quality-check-runs.json"
-          workflow_run_json="$RUNNER_TEMP/release-quality-workflow-run.json"
-          gh api --method GET \
-            "repos/$REPOSITORY/pulls/$PR_NUMBER" > "$pull_request_json"
-          gh api --method GET --paginate --slurp \
-            "repos/$REPOSITORY/commits/$PR_HEAD_SHA/check-runs?check_name=acceptance&filter=all&per_page=100" \
-            > "$check_runs_json"
-          resolved_run_id="$(
-            python3 scripts/release_quality_run_resolver.py \
-              --event "$GITHUB_EVENT_PATH" \
-              --pull-request "$pull_request_json" \
-              --check-runs "$check_runs_json"
-          )"
-          gh api --method GET \
-            "repos/$REPOSITORY/actions/runs/$resolved_run_id" > "$workflow_run_json"
-          verified_run_id="$(
-            python3 scripts/release_quality_run_resolver.py \
-              --event "$GITHUB_EVENT_PATH" \
-              --pull-request "$pull_request_json" \
-              --check-runs "$check_runs_json" \
-              --workflow-run "$workflow_run_json"
-          )"
-          [[ "$verified_run_id" == "$resolved_run_id" ]] || {
-            echo 'accepted run changed during verification' >&2
-            exit 1
-          }
-          printf 'run-id=%s\n' "$resolved_run_id" >> "$GITHUB_OUTPUT"
-      - name: Download accepted final-head verdict
-        uses: actions/download-artifact@v4
-        with:
-          name: acceptance-verdict
-          run-id: ${{ steps.quality-run.outputs.run-id }}
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          path: artifacts/acceptance-verdict
-      - name: Verify original PR selection verdict
-        id: verdict
-        env:
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-          python3 scripts/final_head_check_reporter.py verify-verdict \
-            --pr-number "$PR_NUMBER" \
-            --head-sha "$PR_HEAD_SHA" \
-            --verdict-directory artifacts/acceptance-verdict \
-            --github-output "$GITHUB_OUTPUT"
-      - name: Download accepted PR release candidate
-        if: steps.verdict.outputs.windows_impact == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          name: release-candidate
-          run-id: ${{ steps.quality-run.outputs.run-id }}
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          path: artifacts/release-candidate
-      - name: Verify accepted source and artifact hashes
-        if: steps.verdict.outputs.windows_impact == 'true'
-        env:
-          EXPECTED_MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
-          EXPECTED_PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-          [[ "$EXPECTED_PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || {
-            echo 'release pull request number is malformed' >&2
-            exit 1
-          }
-          [[ "$(grep -Fxc "pr-number: $EXPECTED_PR_NUMBER" artifacts/release-candidate/acceptance.txt || true)" == 1 ]] || {
-            echo 'accepted candidate pull request number does not match the merged pull request' >&2
-            exit 1
-          }
-          bash scripts/release_candidate_gate.sh artifacts/release-candidate "$EXPECTED_MERGE_SHA"
-      - name: Create deterministic update manifest
-        if: steps.verdict.outputs.windows_impact == 'true'
-        id: release-version
-        shell: pwsh
-        env:
           REPOSITORY: ${{ github.repository }}
         run: |
-          $version = (python3 scripts/product_version.py check | Select-String '^version=').Line.Substring(8)
-          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          ./windows-client/tools/New-WindowsUpdateManifest.ps1 `
-            -Version $version `
-            -InstallerPath ./artifacts/release-candidate/CodexInfo.WindowsClient.Setup.exe `
-            -OutputPath ./artifacts/release-candidate/CodexInfo.WindowsClient.update.json `
-            -Repository $env:REPOSITORY
-      - name: Create GitHub Release and upload Windows assets
-        if: steps.verdict.outputs.windows_impact == 'true'
-        shell: pwsh
+          set -euo pipefail
+          external_prefix="codex-main-quality:pr=$PR_NUMBER:head=$HEAD_SHA:run="
+          checks="$(gh api -H 'Accept: application/vnd.github+json' \
+            "repos/$REPOSITORY/commits/$HEAD_SHA/check-runs?check_name=acceptance&filter=latest&per_page=100")"
+          runs="$(gh api \
+            "repos/$REPOSITORY/actions/workflows/version-prepare.yml/runs?event=pull_request_target&head_sha=$HEAD_SHA&per_page=100")"
+          mapfile -t external_ids < <(
+            jq -r --arg prefix "$external_prefix" '
+              .check_runs[] |
+              .external_id? as $external |
+              select(($external | type) == "string" and ($external | startswith($prefix))) |
+              ($external | ltrimstr($prefix)) |
+              select(test("^[1-9][0-9]*$"))
+            ' <<<"$checks" | sort -n -u
+          )
+          mapfile -t direct_ids < <(
+            jq -r --arg head "$HEAD_SHA" '
+              .workflow_runs[] |
+              select(.path == ".github/workflows/version-prepare.yml") |
+              select(.event == "pull_request_target" and .head_sha == $head) |
+              .id
+            ' <<<"$runs" | sort -n -u
+          )
+          external_id=''
+          direct_id=''
+          [[ "${#external_ids[@]}" -eq 0 ]] || external_id="${external_ids[-1]}"
+          [[ "${#direct_ids[@]}" -eq 0 ]] || direct_id="${direct_ids[-1]}"
+          [[ -n "$external_id" || -n "$direct_id" ]] || {
+            echo 'no quality run owns the merged PR head' >&2
+            exit 1
+          }
+
+          # A successful generated-H1 observer deliberately runs no owners. It
+          # cannot replace the H0 producer identified by the final-head check.
+          observer=false
+          if [[ -n "$direct_id" ]]; then
+            direct_run="$(gh api "repos/$REPOSITORY/actions/runs/$direct_id")"
+            direct_jobs="$(gh api "repos/$REPOSITORY/actions/runs/$direct_id/jobs?filter=latest&per_page=100")"
+            if jq -e --argjson id "$direct_id" --arg head "$HEAD_SHA" '
+                 select(.id == $id and
+                        .path == ".github/workflows/version-prepare.yml" and
+                        .event == "pull_request_target" and
+                        .head_sha == $head and
+                        .conclusion == "success")
+               ' <<<"$direct_run" >/dev/null &&
+               jq -e '
+                 [.jobs[] | select(.name == "Observe generated H1" and .conclusion == "success")] |
+                 length == 1
+               ' <<<"$direct_jobs" >/dev/null; then
+              observer=true
+            fi
+          fi
+          if [[ "$observer" == true ]]; then
+            [[ -n "$external_id" ]] || {
+              echo 'generated-H1 observer has no completed producer' >&2
+              exit 1
+            }
+            run_id="$external_id"
+          else
+            run_id="$(printf '%s\n' "$external_id" "$direct_id" | sed '/^$/d' | sort -n | tail -n 1)"
+          fi
+          if [[ -n "$direct_id" && "$run_id" == "$direct_id" ]]; then
+            run="$direct_run"
+            jobs="$direct_jobs"
+          else
+            run="$(gh api "repos/$REPOSITORY/actions/runs/$run_id")"
+            jobs="$(gh api "repos/$REPOSITORY/actions/runs/$run_id/jobs?filter=latest&per_page=100")"
+          fi
+          jq -e \
+            --argjson id "$run_id" \
+            'select(.id == $id and
+                    .path == ".github/workflows/version-prepare.yml" and
+                    .event == "pull_request_target" and
+                    .conclusion == "success")' \
+            <<<"$run" >/dev/null
+          windows_result="$(jq -er '
+            [.jobs[] | select(.name | test("(^| / )windows-quality$"))] |
+            if length == 1 then .[0].conclusion else error("Windows job is missing or duplicated") end
+          ' <<<"$jobs")"
+          case "$windows_result" in
+            skipped) publish=false ;;
+            success) publish=true ;;
+            *) echo "Windows quality did not complete successfully: $windows_result" >&2; exit 1 ;;
+          esac
+          printf 'publish=%s\nrun_id=%s\n' "$publish" "$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Download the accepted release candidate
+        if: steps.quality.outputs.publish == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: release-candidate-${{ github.event.pull_request.number }}
+          run-id: ${{ steps.quality.outputs.run_id }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          path: release-candidate
+
+      - name: Publish the Windows release
+        if: steps.quality.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.release-version.outputs.version }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
           REPOSITORY: ${{ github.repository }}
-          EXPECTED_MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = "windows-v$env:VERSION"
-          $repository = $env:REPOSITORY
-          $setup = './artifacts/release-candidate/CodexInfo.WindowsClient.Setup.exe'
-          $manifest = './artifacts/release-candidate/CodexInfo.WindowsClient.update.json'
-
-          function Get-GitHubResourceStatus {
-            param([Parameter(Mandatory = $true)][string]$Endpoint)
-
-            # GitHub CLI writes its 404 explanation to stderr. Temporarily
-            # collect that native stream instead of letting the enclosing
-            # ErrorActionPreference=Stop obscure the HTTP status line.
-            $previousErrorActionPreference = $ErrorActionPreference
-            try {
-              $ErrorActionPreference = 'Continue'
-              $response = @(& gh api --include --silent `
-                -H 'Accept: application/vnd.github+json' `
-                -H 'X-GitHub-Api-Version: 2022-11-28' `
-                $Endpoint 2>&1)
-              $exitCode = $LASTEXITCODE
-            }
-            finally {
-              $ErrorActionPreference = $previousErrorActionPreference
-            }
-            $statusCodes = @()
-            foreach ($line in $response) {
-              if ([string]$line -match '^HTTP/(?:1\.1|2(?:\.0)?)\s+([0-9]{3})(?:\s|$)') {
-                $statusCodes += [int]$Matches[1]
-              }
-            }
-            if ($statusCodes.Count -ne 1) {
-              throw "GitHub did not return one unambiguous HTTP status for $Endpoint."
-            }
-
-            $statusCode = $statusCodes[0]
-            if ($statusCode -ge 200 -and $statusCode -le 299 -and $exitCode -eq 0) {
-              return $statusCode
-            }
-            if ($statusCode -eq 404 -and $exitCode -ne 0) {
-              return $statusCode
-            }
-            throw "GitHub resource check failed closed for $Endpoint (HTTP $statusCode, exit $exitCode)."
-          }
-
-          $releaseEndpoint = "repos/$repository/releases/tags/$tag"
-          $tagEndpoint = "repos/$repository/git/ref/tags/$tag"
-          if ((Get-GitHubResourceStatus $releaseEndpoint) -ne 404) {
-            throw "GitHub Release already exists: $tag"
-          }
-          if ((Get-GitHubResourceStatus $tagEndpoint) -ne 404) {
-            throw "Git tag already exists: $tag"
-          }
-
-          # Creating the ref is the atomic no-clobber boundary. A concurrent or
-          # pre-existing tag makes this request fail; the workflow never falls
-          # back to attaching a Release to somebody else's ref.
-          gh api --method POST "repos/$repository/git/refs" `
-            -f "ref=refs/tags/$tag" `
-            -f "sha=$env:EXPECTED_MERGE_SHA" *> $null
-          if ($LASTEXITCODE -ne 0) { throw "Atomic Git tag creation failed for $tag" }
-
-          # Keep the Release invisible until both exact assets have uploaded
-          # and their server-side names, byte sizes, and state are verified.
-          $createdReleaseJson = & gh api --method POST "repos/$repository/releases" `
-            -H 'Accept: application/vnd.github+json' `
-            -H 'X-GitHub-Api-Version: 2022-11-28' `
-            -f "tag_name=$tag" `
-            -f "name=Codex Info Monitor $env:VERSION" `
-            -f "body=Windows client $env:VERSION" `
-            -F draft=true `
-            -F prerelease=false
-          if ($LASTEXITCODE -ne 0) { throw "Draft GitHub Release creation failed for $tag" }
-          $createdReleaseJson | python3 scripts/release_state_gate.py created --tag $tag
-          if ($LASTEXITCODE -ne 0) {
-            throw "Created draft GitHub Release state is invalid for $tag"
-          }
-          $createdRelease = $createdReleaseJson | ConvertFrom-Json
-          $createdReleaseId = [long]$createdRelease.id
-          $draftReleaseEndpoint = "repos/$repository/releases/$createdReleaseId"
-
-          gh release upload $tag $setup $manifest --repo $repository
-          if ($LASTEXITCODE -ne 0) { throw "Draft GitHub Release asset upload failed for $tag" }
-
-          $releaseJson = & gh api `
-            -H 'Accept: application/vnd.github+json' `
-            -H 'X-GitHub-Api-Version: 2022-11-28' `
-            $draftReleaseEndpoint
-          if ($LASTEXITCODE -ne 0) { throw "Could not inspect the draft GitHub Release for $tag" }
-          $releaseJson | python3 scripts/release_state_gate.py draft `
-            --tag $tag --setup $setup --manifest $manifest
-          if ($LASTEXITCODE -ne 0) {
-            throw "Draft GitHub Release state is invalid for $tag"
-          }
-
-          $tagJson = & gh api `
-            -H 'Accept: application/vnd.github+json' `
-            -H 'X-GitHub-Api-Version: 2022-11-28' `
-            $tagEndpoint
-          if ($LASTEXITCODE -ne 0) { throw "Could not verify the created Git tag for $tag" }
-          $tagJson | python3 scripts/release_state_gate.py tag --sha $env:EXPECTED_MERGE_SHA
-          if ($LASTEXITCODE -ne 0) {
-            throw "Created Git tag does not identify the gated commit for $tag"
-          }
-
-          gh api --method PATCH "repos/$repository/releases/$createdReleaseId" `
-            -F draft=false *> $null
-          if ($LASTEXITCODE -ne 0) { throw "Publishing the verified GitHub Release failed for $tag" }
-
-          $publishedJson = & gh api `
-            -H 'Accept: application/vnd.github+json' `
-            -H 'X-GitHub-Api-Version: 2022-11-28' `
-            $releaseEndpoint
-          if ($LASTEXITCODE -ne 0) { throw "Could not verify the published GitHub Release for $tag" }
-          $publishedJson | python3 scripts/release_state_gate.py published `
-            --tag $tag --setup $setup --manifest $manifest
-          if ($LASTEXITCODE -ne 0) {
-            throw "Published GitHub Release verification failed for $tag"
-          }
+          set -euo pipefail
+          setup=release-candidate/CodexInfo.WindowsClient.Setup.exe
+          manifest=release-candidate/CodexInfo.WindowsClient.update.json
+          version="$(jq -er '
+            .version |
+            select(type == "string" and test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+          ' "$manifest")"
+          tag="windows-v$version"
+          gh release create "$tag" "$setup" "$manifest" \
+            --repo "$REPOSITORY" \
+            --target "$MERGE_SHA" \
+            --title "Codex Info Monitor $version" \
+            --notes "Windows client $version" \
+            --draft
+          gh release edit "$tag" --repo "$REPOSITORY" --draft=false

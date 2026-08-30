@@ -19,28 +19,28 @@
 ## 強制ゲート
 
 1. 変更前に`docs/PRODUCT_REQUIREMENTS.md`と対象仕様を読み、変更する観測結果と失敗時動作を決める。
-2. 変更後は`bash scripts/pre_pr_gate.sh`をローカルの単一入口として1回実行する。同入口はnative回帰、data protection契約、固定.NET SDKのCore/Presentation testを含むWindows契約を各1回だけ所有し、同じtest/gateを入口の外で再実行しない。
+2. 変更後は`bash scripts/pre_pr_gate.sh`をローカルの単一入口として1回実行する。同入口はnative回帰、data protection契約、固定.NET SDKのCore/Presentation testを含むWindows契約を各1回だけ所有し、同じtest/gateを入口の外で再実行しない。要求台帳はlocalで観測できるschemaと実装状態だけを確認し、PR job・artifact・実OSなどremoteでしか得られない証拠を要求する`--final`は完了判定時だけ使用する。
 3. インストーラを再発行した場合は、artifactとworkspace publish copyのSHAが一致し、ホストのインストール先SHAも一致することを確認する。
 4. 独立サブエージェントが、実装者のPASS結論を見ずに上表を再評価する。1項目でもFAIL/INCONCLUSIVEなら`RELEASE HOLD`とする。
 5. `docs/INDEPENDENT_AUDIT_LATEST.md`を`status: PASS`へ変更できるのは独立評価担当だけとし、主担当が手動でPASSへ書き換えてはならない。
 
 6. `scripts/regression_guard.sh`は静的な文字列検査だけでPASSしてはならない。`cargo test --locked --all-targets -- --nocapture`を1回だけ実行し、履歴・グラフ・thread・data protectionの必須Rust回帰テスト（複数期間の境界、通常のmoving-reset、累積ドリフトする長時間moving-reset、使用量0の残量100% reset断片が前後の使用量期間を分割しないこと、観測されていない長時間を累積使用量の斜め線として描かないこと、モデル使用後の遅延した低残量観測を捨てないことを含む）が同じ出力内で実行・成功したことを名前付きで確認する。必須testの個別`--exact`再実行、対象test 0件、未実行、失敗は必ずFAILにする。さらにworking tree/index/current commitのdiff、format、全target check、release buildを同じゲートで検査する。`DISPLAY`が利用できる実行では`bash scripts/x11_graph_visual_gate.sh`を同じ実行で起動し、現行バイナリの940x640グラフ画像から残量線の連続性とLUNA/TERRA/SOLの色画素を機械判定する。履歴・グラフの変更は、この実行結果なしに完了判定してはならない。これはデグレード防止だけでなく、実行していない検証をPASS扱いする評価漏れの防止を目的とする。
 
-7. WINDOWS ownerが選択されたPRのmerge前にだけ`bash scripts/final_acceptance_gate.sh <Windows UI E2E evidence>`を1回通過させる。同ゲートはWindows installer/UI Automationを再実行せず、source SHA/tree、status/detailsの同一世代受理マーカー、quota gauge証拠、過去期間グラフ、名前付き画面キャプチャ、物理window move証拠の対応と完全性を検証する。各画像のSHA-256は同じ実行のcapture行と一致しなければならない。他ownerの成功は共通`selected-quality`が集約し、Windows acceptanceでnative、CodeQL、live merge ruleを再実行・再監査しない。WINDOWS非選択時は同ゲートとrelease candidateをskipする。選択ownerのfailure/cancel/skip/missing、非選択ownerの実行、証拠欠落・古いSHA/tree・SKIPを`PASS`へ変換しない。required acceptance自体はpath filterやbranch名allowlistで消さず、Release jobは受理済みverdictがWINDOWSを含む場合だけcandidateを取得し、品質test/gateを再実行しない。
+7. WINDOWS ownerが選択されたPRだけ、Windows jobがunit test、installer lifecycle、UI Automation、物理window moveを各1回実行し、main経路では成功後にSetupとmanifestのcandidateを作る。WINDOWS非選択時はjobとcandidateをskipする。共通`selected-quality`はselectedのsuccessとnon-selectedのskipだけを集約し、証拠artifact、同じtestの再実行、live rule再監査を追加しない。
 
-8. `main`向けsame-repository PRはhead branch名に依存せず、version追加前の全変更pathをDOCS・GOVERNANCE・LINUX_BACKEND・LINUX_UI・WINDOWSへ分類する。選択ownerとそこから導出したCodeQL言語だけをH1で各1回実行し、非選択ownerは実行しない。Windows-onlyはWINDOWS+csharp、governance-onlyはGOVERNANCE+actions/pythonとする。workflow全体をpath filterで消さず、required `version-prepared`と`acceptance`は常に生成する。分類の二次実装、branch名allowlist、live rule再監査、全製品ownerの一律実行を追加しない。
+8. `main`向けsame-repository PRはhead branch名に依存せず、version追加前の全変更pathをDOCS・GOVERNANCE・LINUX_BACKEND・LINUX_UI・WINDOWSへ分類する。Git callerはrename/copy検出を明示して両端を同じ分類器へ渡す。選択ownerとそこから導出したCodeQL言語だけを最終headで各1回実行し、非選択ownerは実行しない。結果集約はtrusted base版gateだけを使う。Windows-onlyはWINDOWS+csharp、governance-onlyはGOVERNANCE+actions/pythonとする。workflow全体をpath filterで消さず、required `version-prepared`と`acceptance`は常に生成する。分類の二次実装、branch名allowlist、live rule再監査、全製品ownerの一律実行を追加しない。
 
-9. 履歴比較を必要とするcheckoutは`fetch-depth: 0`を使用する。ローカルの全target testは実行件数0を許可せず、Windows testはpassed>0かつskipped=0を満たさなければならない。PRのCLI/recorder/実Windows UIは各named PASSと同一source/treeのartifactを必須とする。件数またはnamed resultを出せない、未実行、SKIPはPASSではなくFAIL/HOLDとする。
+9. 履歴比較を必要とするcheckoutは`fetch-depth: 0`を使用する。ローカルの全target testは実行件数0を許可せず、Windows testはpassed>0かつskipped=0を満たさなければならない。PRのCLI/recorder/実Windows UIは実行jobの成功を必須とし、未実行、SKIP、失敗をPASSへ変換しない。
 
 10. X先行の変更凍結を必須とする。X版の正本要件（履歴期間、未使用帯、残量とモデル使用量の独立性、定期更新の前回表示保持、thread失敗時の全体破棄）を同一revisionの`pre_pr_gate.sh`内にある全target testと実画面検査で確認するまで、PRのCI・workflow再実行を開始してはならない。X確認後にソース・仕様を1行でも変更した場合、確認結果は無効化し、単一ローカルゲートからやり直す。変更が確定した同一revisionでは、ローカル全体ゲートとCIを各1回までとし、失敗時は原因を修正してから次のrevisionで一度だけ再実行する。未確認のまま先に進めるためのworkflow再実行は禁止する。
 
-11. バイナリ影響ありPRの品質job前段だけ、base versionと同じPRへpatchを十進整数でちょうど1増やすcommitを追加する。owner/CodeQL選択はその直前の利用者差分H0で確定し、正本3ファイルだけの自動version差分をH1で再分類してownerを増やさない。H1でmajor/minor不変とexact patch+1を確認してから選択jobを各1回実行する。merge後は受理済みverdictがWINDOWSを選択した場合だけinstallerからmanifestとReleaseを公開し、native、Windows、UI、CodeQL gateまたはbuildを再実行しない。
+11. バイナリ影響ありでversionがbaseのH0は完全差分を1回分類し、patchを十進整数で1増やす3ファイルだけのcommitをnon-force pushして、同じrunでH1の選択jobを各1回実行する。`GITHUB_TOKEN` pushが次runを起動しないため、H1へ必要な`version-prepared`と`acceptance`だけを最終結果として作る。同じH1のeventはPR runを直列化し、H0 acceptance identityを1回取得できた場合だけowner再実行を抑止する。identityのない手動version commitとH2は評価し、byte-exactな生成3 pathだけをowner差分から除外する。merge後は生成H1 observerではH0 producer、それ以外では最新runのWindows jobがsuccessの場合だけ同runのcandidateを公開し、test/build/CodeQLを再実行しない。
 
-12. PR由来codeをwrite tokenのあるjobでcheckoutまたは実行しない。変更分類器はdefault branchの単一実装だけを使用し、PR/file APIのidentity・全page・rename境界を検証する。採番ownerはdefault branchのtrusted codeだけとし、PR headはAPIから取得する検証対象dataとして扱う。post-merge jobは成功`acceptance`が指すtrusted runのverdictを使用し、PR fileを再分類しない。分類処理失敗、選択CodeQLのcritical/high finding、required acceptance失敗・未生成、バイナリ影響ありのversion準備未完了のいずれかがあるheadはmerge不可とする。外部AI findingsを無効化してもCodeQLとalertを無効化・dismissしない。
+12. PR由来codeをwrite tokenのあるjobでcheckoutまたは実行しない。変更分類器はtrusted baseの単一実装を使用し、eventのbase/head Git object差分を分類する。採番jobはPR headをdataとして読むだけにし、non-fast-forward拒否をrace境界とする。H1 check作成jobとpost-merge jobもsourceをcheckoutしない。post-mergeは最新runとWindows job状態を使い、PR fileを再分類しない。分類失敗、selected job失敗、version未準備はmerge不可とする。
 
 13. Codex code reviewは変更が確定したPR最新headへ`@codex review`を1回だけ投稿して起動する。新commit後は旧headのreviewを根拠にせず、non-outdatedかつ未解決のP0/P1がある間はready/releaseをHOLDする。Codex用の独自API key workflowやrequired statusを追加せず、CodeQL、required acceptance、必要な承認の代替にしない。
 
-14. `pull_request_target` workflowを変更する場合は、旧mainが実際に実行する経路、新main導入後の経路、check/ref/PR反映遅延を有限なlocal fixtureで先に確認し、同じrevision・外部前提のまま実PRを再実行しない。`feat/next`向け成功だけでmain向けworkflowをPASSにせず、移行互換は新main導入後に削除する。この移行fixtureを通常のowner品質DAGへ追加しない。
+14. workflow変更は、owner全31組合せ、rename/delete/unknown/空差分、selected異常、binary false/base/H0→H1 observer/H1→H2/手動version/inconsistent/head race、生成H1 checkの成功・異常、Releaseのclosed・Windows skip/success・observer・後続run失敗・candidate欠落をローカルの有限fixtureで先に確認する。このfixtureを通常のowner品質DAGへ追加せず、同じrevision・外部前提のActionsを再実行しない。実PRではevent起動、required checkのApp identity、artifact受渡しだけを確認する。
 
 ## 回帰発生時
 

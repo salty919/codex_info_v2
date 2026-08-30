@@ -1,10 +1,6 @@
 # Copyright (C) 2026 salty919
 # SPDX-License-Identifier: GPL-3.0-only
 
-# Native quality is called by the Windows workflow for pull requests.  This
-# file intentionally has no push/pull_request trigger: a second workflow run
-# would repeat the native gate after merge and would make its evidence
-# unrelated to the release candidate.
 name: Native quality (reusable)
 
 on:
@@ -34,41 +30,11 @@ jobs:
       - name: Install required native quality tools
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
       - uses: dtolnay/rust-toolchain@stable
+      - name: Run native unit tests
+        run: cargo test --locked --all-targets -- --nocapture
       - name: Build native release
         run: cargo build --release --locked
       - name: Run public CLI lifecycle acceptance
         run: bash scripts/cli_contract_e2e.sh
       - name: Run recorder daemon live acceptance
         run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/record_daemon_e2e.sh
-      - name: Write native quality evidence
-        env:
-          SOURCE_SHA: ${{ inputs.source_sha }}
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts/native-quality
-          source_sha="$(git rev-parse HEAD)"
-          tree_sha="$(git rev-parse 'HEAD^{tree}')"
-          [[ "$source_sha" == "$SOURCE_SHA" ]] || {
-            echo "native quality checkout SHA does not match the immutable source SHA" >&2
-            exit 1
-          }
-          cat > artifacts/native-quality/native-quality.txt <<EOF
-          schema: codex-info-quality-v1
-          quality: native
-          source-sha: $source_sha
-          tree-sha: $tree_sha
-          release-build: PASS
-          cli-contract-e2e: PASS
-          recorder-daemon: PASS
-          native-quality: PASS
-          EOF
-          (
-            cd artifacts/native-quality
-            sha256sum native-quality.txt > SHA256SUMS
-          )
-      - name: Upload native quality evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: native-quality
-          path: artifacts/native-quality
-          if-no-files-found: error

@@ -69,47 +69,40 @@
 - `main`向けPRは、配布するRust/Windows binaryまたはinstaller/payloadが消費するsource、依存関係・lockfile、組込みasset、
   製品build・packaging入力を1件でも変更する場合を「バイナリ影響あり」、それ以外を「バイナリ影響なし」とする。
   workflow・CI検査・test・文書・repository ruleだけの変更はバイナリ影響なしとする。分類はこの二つだけとし、rename/copyは
-  変更前後pathを両方判定する。PR/file APIのidentity、changed-files件数、全page、重複・schema検証に失敗した処理は
-  分類結果を返さず、versionまたはRelease mutationを開始しない。
+  変更前後pathを両方判定する。eventのbase/head commitによる完全なGit差分を単一分類器へ渡し、空差分、未知path、
+  欠損したrename/copy情報は分類結果を返さず、versionまたはRelease mutationを開始しない。
 - `main`向けPRはsame-repositoryであればhead branch名を制限しない。trusted `pull_request_target`が、version追加前の
   利用者差分（H0）の全pathをDOCS・GOVERNANCE・LINUX_BACKEND・LINUX_UI・WINDOWSの有限ownerへ一度だけ分類する。
   選択ownerだけをimmutableな最終head（H1）で各1回実行し、非選択ownerは実行しない。CodeQLも同じ選択から
   actions・python・rust・csharpの必要言語だけを一度実行する。選択ownerのmissing/failure/cancel/skip、非選択ownerの実行、
   CodeQL言語の余分・欠落はすべて失敗とする。Windowsだけの変更はWINDOWSとcsharpだけ、governanceだけの変更は
   GOVERNANCEとactions/pythonだけを実行する。branch名、branchの作成元、`feat/next`との包含関係は品質選択へ使用しない。
-- `main`のtrusted `pull_request_target`を唯一のpre-merge authorityとし、別workflowの`workflow_dispatch`へ品質判定を
-  転送しない。同じDAGがH1へGitHub Actions App（integration id `15368`）として`version-prepared`と`acceptance`の
-  exact 2 required check-runを作成または更新する。check-runは`repository / PR番号 / H1 / authority run id`へ結び、
-  同じ名前・App・headの0件は作成、1件は再利用、2件以上は曖昧として停止する。acceptanceは選択結果と実job結果を集約し、
-  WINDOWS選択時だけ同じrunのinstaller/UI証拠を検証してrelease candidateを作る。Linuxだけのバイナリ変更ではWindows評価・
-  Windows candidateを生成しない。live repository ruleの再監査、選択済み製品testの再実行、branch名のallowlistを
-  acceptanceへ追加しない。分類欠落、期待外のjob結果、失敗・未完了・古い証拠では明示的に失敗してmergeを許可しない。
-  reusableなpre-merge品質workflowはread-onlyとし、`contents: write`を持つpost-merge Release workflowを同じ呼出しgraphへ
-  含めない。
-- `pull_request_target`はPR headではなくtrusted base上のworkflowを実行するため、workflow revisionの更新は旧mainから新mainへ
-  到達できる有限な移行経路を持たなければならない。`feat/next`向けPRの成功をmain向けDAGの証拠へ読み替えない。移行用互換処理は
-  観測済みの旧main状態から新revisionを導入する1回だけに限定し、新main導入後に削除する。通常のowner選択・製品評価へ移行確認を追加しない。
+- `main`のtrusted `pull_request_target`を唯一のpre-merge authorityとし、別dispatchへ品質判定を転送しない。
+  event headを評価する通常経路はActions job名`version-prepared`と`acceptance`をrequired checkとする。workflowの
+  `GITHUB_TOKEN`がversion commit H1をpushした経路だけは、同じH0 runがH1を評価し、H0 job checkがH1へ移らない分の
+  `version-prepared`と`acceptance`をH1へ最終結果として各1回作る。この2件にはproducer run IDを同じ外部IDで記録するが、
+  登録後のpoll、retry、readback、URL・時刻・表示値の照合を行わない。`acceptance`は選択jobの結果だけを集約する。
+  WINDOWS選択時はWindows job自身が実Windows評価後にrelease candidateを作り、
+  Linuxだけの変更ではWindows評価・candidateを生成しない。live repository ruleの再監査、選択済み製品testの再実行、
+  branch名allowlist、上記2件以外のcheck登録を追加しない。
 - バイナリ影響ありPRだけ、品質確認を開始する前にPR branch上のversion 3ファイルをexact next patchへ自動更新する。
-  H0で確定したowner/CodeQL選択をH1へそのまま渡し、自動生成した3ファイルを再分類してownerを増やさない。
-  H1のversion commitを含むtreeを選択ownerが確認し、mergeによって採番を確定する。採番で生じる`synchronize` runはPR単位の
-  concurrencyで直列化し、同じH1の成功済み`acceptance`を再利用してownerを重複実行しない。バイナリ影響なしPRはversion 3ファイルを
-  変更せず、最終headの`version-prepared` required check-runを成功完了させる。
-- merge後はeventとPR APIの全identity（PR番号、head/base repository・ref・SHA、merge SHA）および
-  `merged_at`の一致を確認する。最終headのGitHub Actions Appによるexact 1件の成功`acceptance` check-runから、外部IDに
-  結び付けられたPR番号・head SHA・authority run idを解決する。そのrunがtrusted
-  `.github/workflows/version-prepare.yml`の`pull_request_target`で、main/base SHA上にあり、`completed`/`success`かつ
-  `created_at <= updated_at <= merged_at`である場合だけartifactを取得する。check-runまたはrunの候補zero・重複、
-  identity・App・URL・時刻・paginationの不一致、malformed、post-merge runはartifact取得前にfail-closedとし、別の
-  older successへfallbackしない。`pull_requests`はworkflow runのauthorityにせず、検証済みtreeとの
-  一致を確認し、受理済み`acceptance-verdict`からH0のWINDOWS選択を読む。WINDOWS選択時だけ候補を取得し、quality test/buildを
-  再実行せずmanifest生成とRelease公開を行う。同時mergeと公開は直列化する。WINDOWS非選択時はverdict確認後にcandidate、
-  binary build、manifest、tag、GitHub Releaseを生成しない。
+  versionがbaseのH0は完全差分を1回分類してnon-force pushでH1を作り、同じrunが保存済み選択を使ってH1のownerを各1回実行する。
+  後からH1/H2 eventが起動した場合は、base以降でversionを最後に変更したfirst-parent commitが管理3ファイルだけのbyte-exact
+  自動更新で、最終headでもその3ファイルが不変な場合だけ、その3 pathを差分から除外する。生成H1自身かつ先行H0のacceptance identityが
+  存在するeventは、同じPRのrunを直列化した上でownerを再実行しない。identityがない同じbytesの手動commitは通常どおり評価し、H2の
+  後続利用者commitも除外しない。event内の分類器は1回だけ使用する。これによりH2でも生成versionをLinux ownerへ誤分類しない。
+  バイナリ影響なしPRはversionを変更しない。
+- merge後は、event head自身のrunと、生成H1 checkが示すH0 producer runを候補にし、run IDが最新の1件を取得する。
+  最新runがmissing/failure/cancelの場合は旧成功runへfallbackせず失敗する。成功runの
+  `windows-quality` jobが`skipped`ならRelease mutationを0件、`success`なら同runのPR番号付きcandidateだけを取得する。
+  missing/failure/cancelまたはcandidate欠落は失敗とする。merge後にPRを再分類せず、quality test/build/CodeQLも再実行しない。
+  Windows jobはmanifestをcandidate内で生成済みにし、Release jobはtagとDraft Releaseを作成して2資産をuploadした後に公開する。
+  uploadまたは公開失敗時はDraftを非公開のまま残し、自動retry・自動cleanupを行わない。
 - PR由来のcheckout、script、workflow、artifactを、repository contents・checks・Releaseへのwrite権限を持つjobで実行しない。
-  変更分類はPR/file APIの完全なidentityとpaginationをdefault branchまたはPRのtrusted baseにある分類器で判定する。
-  自動採番はdefault branchのtrusted workflow/toolだけを実行し、PRのversion 3ファイルをdataとして検証した後、
-  same-repository headへexact 1 commitを原子的に追加する。head/baseの競合、fork、不正version、対象外file mutationでは
-  書き込まない。post-merge jobはdefault branchのmainだけをcheckoutし、accepted verdict不成立またはeventのmerge SHAと不一致の場合は
-  Release mutationを行わない。
+  write権限を持つ採番jobはtrusted baseだけをcheckout・実行し、PR headはGit object dataとしてだけ読む。
+  same-repository headへexact 1 commitをnon-force pushし、競合pushはGit自身のnon-fast-forward拒否に任せてreadbackやretryを行わない。
+  H1 check作成jobもsourceをcheckoutせず、trusted runの出力だけを入力にする。Release jobはsourceをcheckout・実行せず、
+  最新runのjob状態とcandidateだけを入力にする。
 - 選択ownerからCodeQL言語が導出されるPRではその言語だけをmerge必須gateとし、critical/high findingをdismissやworkflow無効化で
   通過させない。CodeQL言語が選択されないPRとmerge後pushではCodeQL AnalyzeとAutobuildを実行せず、active code-scanning rulesetの
   設定はworkflow内で再監査しない。外部AI findingsが
@@ -118,13 +111,32 @@
 - Codex code reviewはPRの変更が確定した最新headに対して`@codex review`を1回だけ起動する補助レビューとする。
   古いheadの結果や未解決かつnon-outdatedのP0/P1をready判定へ流用せず、独自API key workflowを追加しない。
   Codex reviewはCodeQL、required acceptance、必要な承認の代替にしない。
-- `windows-vX.Y.Z` tagは原子的に新規作成する。Setupとmanifestは非公開Draft上でexact 2資産の名前・size・
-  状態・commit SHAを検証し終えてから公開し、既存tag/Releaseへ上書きして継続しない。
+- `windows-vX.Y.Z` ReleaseはSetupとmanifestを非公開Draftへuploadしてから公開する。途中失敗を公開済み成功へ変換しない。
 - release artifactはsource、lockfile、実payload、license/notice、署名、version、対象platformを一つのrelease identityで追跡する。
 - publisher名、certificate、対応OS build、RPO/RTO、accessibility適合、support窓口を根拠なしに推測しない。
 - authority inputがないclaimは「保証なし」「未対応」とし、認証済み、対応済み、測定済みと表示しない。
 - recovery journalと顧客共有support bundleを分離する。support exportは明示操作、allowlist、owner-only ACL、秘密0を必須とし、自動送信しない。
 - customer guideとdeveloper READMEを分離し、顧客手順にrepository clone、Cargo build、`run.sh`を通常導線として要求しない。
+
+### Workflowに残す確認の理由
+
+| 確認 | 実際に到達するcaseと必要動作 | 確認しない場合の被害 | 上流保証と重複しない理由 |
+| --- | --- | --- | --- |
+| same-repository | fork PRではversionを書かず失敗する | 書込み不能または誤ったheadを対象にする | GitHubはfork PRを許可する |
+| 完全Git差分とowner対応 | add/delete/rename/copyを両端まで分類し、未知pathは失敗する | 必要ownerの評価が欠落する | GitHubは製品ownerを知らない |
+| trusted結果集約 | base版gateだけがselected success・non-selected skipを判定する | PRが判定scriptを無効化して未評価mergeできる | owner jobがsourceを評価することと、結果oracleの信頼性は別責務 |
+| version 3ファイル | binary PRだけbaseからexact next patchへ同期更新する | Rust・lockfile・Windowsのversionが分裂する | GitHubは製品versionを保証しない |
+| non-force push | version生成中にheadが進んだ場合はpushを拒否する | 利用者commitの上書きまたはstale commit追加 | Gitのnon-fast-forward拒否を唯一のrace authorityとして使う |
+| 生成H1の必須2 check | `GITHUB_TOKEN` push後も同じrunでH1を評価し、H1へ最終結果を各1件作る | token起因pushは次runを起動せず、H1のrequired checkが永久に欠落する | ActionsのH0 job checkはworkflowが追加したH1へ移らない |
+| 生成H1 producer identityの1回取得 | byte-exact H1 eventで先行H0 identityが存在する場合だけowner再実行を抑止し、identityのない手動commitは評価する | H1 ownerの二重実行、または正当な手動version commitの未評価 | commit bytesと親子関係だけでは作成主体を区別できない。poll・retry・登録結果照合は行わない |
+| selected job結果 | selectedはsuccess、non-selectedはskipped以外を失敗にする | 未評価mergeまたは無関係な評価失敗が起きる | Actionsはowner選択の意味を知らない |
+| 実Windows評価 | WINDOWS選択時だけWindows runnerでinstaller/UIを評価する | 壊れたWindows配布物を公開する | LinuxやGitHubはWindows製品動作を保証しない |
+| 最新producer runとWindows job | merge後、生成H1 observerは外部IDのH0を採用し、それ以外は最新event-head runを採用する。後続異常runは失敗し、Windowsがskippedなら終了、successならcandidate必須とする | observerによるcandidate喪失、後続失敗を無視した旧candidate公開、または非Windows Release | merge eventにproducer/observer、job状態、artifactは含まれない |
+| merged event | closed未mergeではRelease mutationを0件にする | 未統合sourceを公開する | `closed` triggerだけではmergeを保証しない |
+| Draft公開 | upload失敗時は非公開Draftを残して失敗する | 不完全なReleaseが公開される | GitHubは複数asset upload全体を一括commitしない |
+| local台帳schema | PR前は要求・範囲・オラクル・実装状態の欠落だけを失敗にし、remote証拠は完了時に`--final`で確認する | PRでしか得られない証拠をPR前に要求する循環で作業が停止する | local実装確認とGitHub実挙動は異なる観測点を持つ |
+
+この表の4列を満たさない形式検査、identity再照合、poll、retry、mutation readback、証拠専用artifact、同一run内の二次分類は追加しない。
 
 ## 7. 有限の検証規則
 

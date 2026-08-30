@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed pull-request path classifier for selective CI ownership."""
+"""Classify one complete Git diff into the quality owners that must run."""
 
 from __future__ import annotations
 
@@ -7,53 +7,16 @@ import argparse
 from dataclasses import dataclass
 import json
 from pathlib import Path
-import re
 import sys
-from typing import Any, Sequence
+from typing import Sequence
 
 
 OWNER_ORDER = ("DOCS", "GOVERNANCE", "LINUX_BACKEND", "LINUX_UI", "WINDOWS")
 PRODUCT_OWNERS = frozenset({"LINUX_BACKEND", "LINUX_UI", "WINDOWS"})
-KNOWN_FILE_STATUSES = frozenset(
-    {"added", "removed", "modified", "renamed", "copied", "changed", "unchanged"}
-)
-FULL_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
-REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-ALLOWED_BASE_REFS = frozenset({"main", "feat/next"})
+GIT_STATUSES = frozenset({"A", "C", "D", "M", "R", "T"})
 
 DOC_EXACT = frozenset({"README.md", "README.en.md", "DESIGN.md", "SECURITY.md"})
-GOVERNANCE_EXACT = frozenset(
-    {
-        ".gitignore",
-        "AGENTS.md",
-        "scripts/ci_change_scope.py",
-        "scripts/ci_trust_fixture.py",
-        "scripts/feat_integration_check_reporter.py",
-        "scripts/final_acceptance_gate.sh",
-        "scripts/final_acceptance_gate_test.sh",
-        "scripts/final_head_check_reporter.py",
-        "scripts/pre_pr_gate.sh",
-        "scripts/product_version.py",
-        "scripts/quality_artifact_gate.sh",
-        "scripts/release_candidate_gate.sh",
-        "scripts/release_candidate_gate_test.sh",
-        "scripts/release_quality_run_resolver.py",
-        "scripts/release_state_gate.py",
-        "scripts/regression_guard.sh",
-        "scripts/requirements_ledger_gate.sh",
-        "scripts/selected_quality_gate.py",
-        "scripts/test_ci_change_scope.py",
-        "scripts/test_codeql_workflow.py",
-        "scripts/test_feat_integration_check_reporter.py",
-        "scripts/test_final_head_check_reporter.py",
-        "scripts/test_product_version.py",
-        "scripts/test_release_quality_run_resolver.py",
-        "scripts/test_selected_quality_gate.py",
-        "scripts/windows_client_contract_gate.sh",
-        "scripts/workflow_quality_gate.py",
-    }
-)
-WINDOWS_EXACT = frozenset(
+WINDOWS_SCRIPT_EXACT = frozenset(
     {
         "scripts/capture_windows_window.ps1",
         "scripts/windows_window_move_message_smoke.ps1",
@@ -82,7 +45,7 @@ LEGAL_SHARED_EXACT = frozenset(
 
 
 class ScopeError(ValueError):
-    """Raised when GitHub data cannot prove a complete, bound classification."""
+    """The diff cannot be mapped completely to the finite owner set."""
 
 
 @dataclass(frozen=True)
@@ -93,9 +56,6 @@ class Selection:
     @property
     def binary_impact(self) -> bool:
         return bool(PRODUCT_OWNERS.intersection(self.owners))
-
-    def legacy_scope(self) -> str:
-        return "binary-impact" if self.binary_impact else "no-binary-impact"
 
     def as_json(self) -> str:
         return json.dumps(
@@ -109,39 +69,8 @@ class Selection:
         )
 
 
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ScopeError("duplicate JSON object key")
-        result[key] = value
-    return result
-
-
-def load_json(path: Path) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys)
-    except ScopeError:
-        raise
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ScopeError("JSON input is unreadable or malformed") from exc
-
-
-def _mapping(value: Any, label: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ScopeError(f"{label} is not an object")
-    return value
-
-
-def _string(mapping: dict[str, Any], key: str, label: str) -> str:
-    value = mapping.get(key)
-    if not isinstance(value, str) or not value:
-        raise ScopeError(f"{label} is missing or malformed")
-    return value
-
-
-def _validate_path(value: Any) -> str:
-    if not isinstance(value, str) or not value or "\x00" in value or value.startswith("/"):
+def _path(value: str) -> str:
+    if not value or "\x00" in value or value.startswith("/"):
         raise ScopeError("changed file path is malformed")
     if any(part in {"", ".", ".."} for part in value.split("/")):
         raise ScopeError("changed file path is not normalized")
@@ -149,13 +78,16 @@ def _validate_path(value: Any) -> str:
 
 
 def owners_for_path(path: str) -> frozenset[str]:
-    """Return the finite owner set for one normalized repository path."""
-    path = _validate_path(path)
+    """Return the owner set for one repository path, or reject an unknown area."""
+    path = _path(path)
     if path in DOC_EXACT or path.startswith(("docs/", "wiki/")):
         return frozenset({"DOCS"})
-    if path in GOVERNANCE_EXACT or path.startswith((".github/", ".vscode/", ".codex-tasks/")):
+    if path.startswith((".github/", ".vscode/", ".codex-tasks/")) or path in {
+        ".gitignore",
+        "AGENTS.md",
+    }:
         return frozenset({"GOVERNANCE"})
-    if path in WINDOWS_EXACT or path.startswith("windows-client/"):
+    if path in WINDOWS_SCRIPT_EXACT or path.startswith("windows-client/"):
         return frozenset({"WINDOWS"})
     if path in LINUX_BACKEND_EXACT or path.startswith(("tests/", "packaging/")):
         return frozenset({"LINUX_BACKEND"})
@@ -169,6 +101,8 @@ def owners_for_path(path: str) -> frozenset[str]:
         return frozenset({"LINUX_BACKEND", "WINDOWS"})
     if path in LEGAL_SHARED_EXACT or path.startswith("LICENSES/"):
         return frozenset({"LINUX_BACKEND", "LINUX_UI", "WINDOWS"})
+    if path.startswith("scripts/"):
+        return frozenset({"GOVERNANCE"})
     raise ScopeError(f"changed path has no CI owner: {path}")
 
 
@@ -177,7 +111,8 @@ def selection_for_paths(paths: Sequence[str]) -> Selection:
     for path in paths:
         owners.update(owners_for_path(path))
     if not owners:
-        raise ScopeError("pull request contains no classifiable paths")
+        raise ScopeError("pull request contains no changed paths")
+
     languages: set[str] = set()
     if "GOVERNANCE" in owners:
         languages.update(("actions", "python"))
@@ -195,143 +130,45 @@ def selection_for_paths(paths: Sequence[str]) -> Selection:
     )
 
 
-def _validate_identity(
-    pull_request: Any,
-    *,
-    expected_repository: str,
-    expected_head_repository: str,
-    expected_number: int,
-    expected_base_ref: str,
-    expected_head_ref: str | None,
-    expected_base_sha: str,
-    expected_head_sha: str,
-    expected_state: str | None,
-) -> int:
-    if not REPOSITORY.fullmatch(expected_repository) or not REPOSITORY.fullmatch(expected_head_repository):
-        raise ScopeError("expected repository is malformed")
-    if type(expected_number) is not int or expected_number <= 0:
-        raise ScopeError("expected pull request number is malformed")
-    if expected_base_ref not in ALLOWED_BASE_REFS:
-        raise ScopeError("expected base ref is not an allowed integration branch")
-    if not FULL_SHA.fullmatch(expected_base_sha) or not FULL_SHA.fullmatch(expected_head_sha):
-        raise ScopeError("expected pull request SHA is malformed")
+def paths_from_name_status(raw: bytes) -> tuple[str, ...]:
+    """Parse `git diff --name-status -z`, retaining both ends of renames/copies."""
+    if not raw or not raw.endswith(b"\0"):
+        raise ScopeError("git name-status diff is empty or truncated")
+    try:
+        fields = [field.decode("utf-8") for field in raw[:-1].split(b"\0")]
+    except UnicodeDecodeError as exc:
+        raise ScopeError("git name-status diff is not UTF-8") from exc
 
-    root = _mapping(pull_request, "pull request")
-    if root.get("number") != expected_number:
-        raise ScopeError("pull request number mismatch")
-    state = root.get("state")
-    if state not in {"open", "closed"} or (expected_state is not None and state != expected_state):
-        raise ScopeError("pull request state mismatch")
-    base = _mapping(root.get("base"), "pull request base")
-    head = _mapping(root.get("head"), "pull request head")
-    if _string(_mapping(base.get("repo"), "base repository"), "full_name", "base repository") != expected_repository:
-        raise ScopeError("pull request base repository mismatch")
-    if _string(base, "ref", "base ref") != expected_base_ref:
-        raise ScopeError("pull request base ref mismatch")
-    if _string(base, "sha", "base SHA") != expected_base_sha:
-        raise ScopeError("pull request base SHA mismatch")
-    if _string(_mapping(head.get("repo"), "head repository"), "full_name", "head repository") != expected_head_repository:
-        raise ScopeError("pull request head repository mismatch")
-    if expected_head_ref is not None and _string(head, "ref", "head ref") != expected_head_ref:
-        raise ScopeError("pull request head ref mismatch")
-    if _string(head, "sha", "head SHA") != expected_head_sha:
-        raise ScopeError("pull request head SHA mismatch")
-    changed_files = root.get("changed_files")
-    if type(changed_files) is not int or changed_files <= 0:
-        raise ScopeError("pull request changed_files is missing or empty")
-    return changed_files
-
-
-def _changed_paths(files_pages: Any, expected_count: int) -> tuple[str, ...]:
-    if not isinstance(files_pages, list) or not files_pages:
-        raise ScopeError("pull request file pagination is missing")
     paths: list[str] = []
-    current_names: set[str] = set()
-    records = 0
-    for page in files_pages:
-        if not isinstance(page, list):
-            raise ScopeError("pull request file page is malformed")
-        for raw_file in page:
-            file_info = _mapping(raw_file, "pull request file")
-            records += 1
-            filename = _validate_path(file_info.get("filename"))
-            if filename in current_names:
-                raise ScopeError("pull request file pagination contains a duplicate")
-            current_names.add(filename)
-            status = file_info.get("status")
-            if not isinstance(status, str) or status not in KNOWN_FILE_STATUSES:
-                raise ScopeError("pull request file status is malformed")
-            paths.append(filename)
-            previous = file_info.get("previous_filename")
-            if status in {"renamed", "copied"} and previous is None:
-                raise ScopeError("rename or copy is missing its previous path")
-            if status not in {"renamed", "copied"} and previous is not None:
-                raise ScopeError("non-rename file unexpectedly contains a previous path")
-            if previous is not None:
-                paths.append(_validate_path(previous))
-    if records != expected_count:
-        raise ScopeError("pull request file pagination is incomplete")
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        index += 1
+        kind = status[:1]
+        if kind not in GIT_STATUSES:
+            raise ScopeError(f"unsupported git diff status: {status!r}")
+        path_count = 2 if kind in {"C", "R"} else 1
+        if index + path_count > len(fields):
+            raise ScopeError("git name-status record is truncated")
+        paths.extend(_path(value) for value in fields[index : index + path_count])
+        index += path_count
     return tuple(paths)
 
 
-def classify_payloads(
-    pull_request: Any,
-    files_pages: Any,
-    *,
-    expected_repository: str,
-    expected_head_repository: str,
-    expected_number: int,
-    expected_base_sha: str,
-    expected_head_sha: str,
-    expected_base_ref: str = "main",
-    expected_head_ref: str | None = None,
-    expected_state: str | None = None,
-) -> Selection:
-    changed_files = _validate_identity(
-        pull_request,
-        expected_repository=expected_repository,
-        expected_head_repository=expected_head_repository,
-        expected_number=expected_number,
-        expected_base_ref=expected_base_ref,
-        expected_head_ref=expected_head_ref,
-        expected_base_sha=expected_base_sha,
-        expected_head_sha=expected_head_sha,
-        expected_state=expected_state,
-    )
-    return selection_for_paths(_changed_paths(files_pages, changed_files))
+def selection_from_name_status(raw: bytes) -> Selection:
+    return selection_for_paths(paths_from_name_status(raw))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pull-request", type=Path, required=True)
-    parser.add_argument("--files", type=Path, required=True)
-    parser.add_argument("--expected-repository", required=True)
-    parser.add_argument("--expected-head-repository", required=True)
-    parser.add_argument("--expected-head-ref")
-    parser.add_argument("--expected-number", type=int, required=True)
-    parser.add_argument("--expected-base-ref", default="main", choices=sorted(ALLOWED_BASE_REFS))
-    parser.add_argument("--expected-base-sha", required=True)
-    parser.add_argument("--expected-head-sha", required=True)
-    parser.add_argument("--expected-state", choices=("open", "closed"))
-    parser.add_argument("--format", choices=("legacy", "json"), default="legacy")
+    parser.add_argument("--name-status", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
-        result = classify_payloads(
-            load_json(args.pull_request),
-            load_json(args.files),
-            expected_repository=args.expected_repository,
-            expected_head_repository=args.expected_head_repository,
-            expected_head_ref=args.expected_head_ref,
-            expected_number=args.expected_number,
-            expected_base_ref=args.expected_base_ref,
-            expected_base_sha=args.expected_base_sha,
-            expected_head_sha=args.expected_head_sha,
-            expected_state=args.expected_state,
-        )
-    except ScopeError as exc:
+        result = selection_from_name_status(args.name_status.read_bytes())
+    except (OSError, ScopeError) as exc:
         print(f"ci-change-scope: FAIL {exc}", file=sys.stderr)
         return 1
-    print(result.as_json() if args.format == "json" else result.legacy_scope())
+    print(result.as_json())
     return 0
 
 
