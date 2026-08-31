@@ -983,7 +983,7 @@ public sealed class GraphPlotControlTests
         public Task<HealthFetchResult> FetchHealthAsync(CancellationToken cancellationToken = default)
         {
             CallCount++;
-            return Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info")));
+            return Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info", ProductInfo.Version)));
         }
     }
 

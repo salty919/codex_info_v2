@@ -842,7 +842,7 @@ public sealed class MainWindowViewModelTests
     public async Task HealthyCycleRequestsHealthBeforeDetails()
     {
         var client = new HealthAwareClient(
-            HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info")),
+            HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info", ProductInfo.Version)),
             DetailsFetchResult.Success(ValidSnapshot()));
         using var viewModel = new MainWindowViewModel(client);
 
@@ -1575,7 +1575,7 @@ public sealed class MainWindowViewModelTests
         public Task<HealthFetchResult> FetchHealthAsync(CancellationToken cancellationToken = default)
         {
             Interlocked.Increment(ref healthCalls);
-            return Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info")));
+            return Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info", ProductInfo.Version)));
         }
 
         public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default)
@@ -1608,7 +1608,7 @@ public sealed class MainWindowViewModelTests
         public Task<HealthFetchResult> FetchHealthAsync(CancellationToken cancellationToken = default)
         {
             Interlocked.Increment(ref healthCalls);
-            return Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info")));
+            return Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info", ProductInfo.Version)));
         }
 
         public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default)
@@ -1658,7 +1658,7 @@ public sealed class MainWindowViewModelTests
                 return healthGate.Task;
             }
 
-            return Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info")));
+            return Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info", ProductInfo.Version)));
         }
 
         public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default)
@@ -1679,7 +1679,7 @@ public sealed class MainWindowViewModelTests
             {
                 case DisposeEndpoint.Health:
                     healthGate.TrySetResult(result == DisposeResult.Success
-                        ? HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info"))
+                        ? HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info", ProductInfo.Version))
                         : HealthFetchResult.FromFailure(HealthFetchFailure.Response));
                     break;
                 case DisposeEndpoint.Details:

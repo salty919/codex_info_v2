@@ -21,7 +21,7 @@ cd codex_info_v2
 CODEX_INFO_DATA_DIR="$PWD/data" ./run.sh --ui
 ```
 
-公開起動契約は限定されています。引数なしの`./run.sh`は記録daemonとloopback RESTだけを`127.0.0.1:8787`で起動し、`./run.sh --port PORT`はloopbackのポートだけを変更します。X画面を使う場合は`./run.sh --ui`、ポートも指定する場合は`./run.sh --ui --port PORT`です。`./run.sh --stop`は同じprofileの検証済みdaemonだけを停止し、`./run.sh --help`は利用可能な形を表示します。任意アドレスの指定や旧起動オプションは受理しません。サービスを自動起動するには`bash scripts/install_systemd_recorder.sh`、自動起動から外すには`bash scripts/install_systemd_recorder.sh --remove`を使います。解除してもSQLite履歴、バックアップ、reset hint、実行ファイルは削除しません。収集周期`CODEX_INFO_DAEMON_INTERVAL_SECS`は5〜3600秒へ制限されます。
+公開起動契約は限定されています。引数なしの`./run.sh`は記録daemonとloopback RESTだけを`127.0.0.1:8787`で起動し、`./run.sh --port PORT`はloopbackのポートだけを変更します。X画面を使う場合は`./run.sh --ui`、ポートも指定する場合は`./run.sh --ui --port PORT`です。`./run.sh --stop`は同じprofileの検証済みdaemonだけを停止し、`./run.sh --help`は利用可能な形を表示します。任意アドレスの指定や旧起動オプションは受理しません。サービスを自動起動するには`bash scripts/install_systemd_recorder.sh`、自動起動から外すには`bash scripts/install_systemd_recorder.sh --remove`を使います。systemd自動起動を導入済みの場合、通常の`run.sh`起動はbuildが変わった時だけ導入binaryを同じversionへ更新してserviceを再起動します。Linux / Windows UIは同じproduct versionのresident serviceだけを表示正本として受理します。解除や更新でもSQLite履歴、バックアップ、reset hintは削除しません。収集周期`CODEX_INFO_DAEMON_INTERVAL_SECS`は5〜3600秒へ制限されます。
 
 初回起動時の画面内タイトルは`Codex Info`です。ネイティブタイトルバーは使わず、アプリ内では認証パネルが接続状態を案内します。
 

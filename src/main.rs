@@ -2067,8 +2067,6 @@ fn apply_authoritative_current_bounds(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HistoryCanonicalizationError {
     MultipleCyclesInMinute,
-    ConflictingQuota,
-    NonComparableCumulativeUsage,
 }
 
 impl std::fmt::Display for HistoryCanonicalizationError {
@@ -2076,10 +2074,6 @@ impl std::fmt::Display for HistoryCanonicalizationError {
         formatter.write_str(match self {
             Self::MultipleCyclesInMinute => {
                 "history minute belongs to multiple reset cycles or partitions"
-            }
-            Self::ConflictingQuota => "history minute has conflicting quota observations",
-            Self::NonComparableCumulativeUsage => {
-                "history minute has no single dominant cumulative usage row"
             }
         })
     }
@@ -2096,6 +2090,37 @@ fn usage_vector_dominates(left: &UsageHistorySample, right: &UsageHistorySample)
         && left.luna_tokens >= right.luna_tokens
 }
 
+fn reset_group_has_quota(group: &ResetSampleGroup) -> bool {
+    group
+        .samples
+        .iter()
+        .any(|sample| sample.remaining_percent >= 0.0)
+}
+
+fn reset_group_end(group: &ResetSampleGroup) -> i64 {
+    group
+        .samples
+        .iter()
+        .map(|sample| sample.timestamp)
+        .max()
+        .unwrap_or(group.start)
+}
+
+fn reset_group_is_shadowed(index: usize, groups: &[ResetSampleGroup]) -> bool {
+    let group = &groups[index];
+    let group_end = reset_group_end(group);
+    let has_quota = reset_group_has_quota(group);
+
+    groups.iter().enumerate().any(|(other_index, other)| {
+        if other_index == index || !reset_group_has_quota(other) {
+            return false;
+        }
+        let other_end = reset_group_end(other);
+        let overlaps = group.start <= other_end && other.start <= group_end;
+        (!has_quota && overlaps) || (other.start < group.start && other_end > group_end)
+    })
+}
+
 /// Canonicalize a storage-admitted public candidate without changing raw
 /// SQLite rows. Reset aliases may contribute one quota value and one existing
 /// dominant cumulative row only when the aliases are already validated as the
@@ -2104,23 +2129,81 @@ fn usage_vector_dominates(left: &UsageHistorySample, right: &UsageHistorySample)
 fn canonicalize_public_history_samples(
     samples: &[UsageHistorySample],
 ) -> Result<Vec<UsageHistorySample>, HistoryCanonicalizationError> {
-    let groups = reset_sample_groups(samples);
-    let mut minute_cycles = BTreeMap::<i64, BTreeSet<i64>>::new();
-    for group in &groups {
+    let raw_groups = reset_sample_groups(samples);
+    // A reset value carried only by local backfill is not cycle authority when
+    // it overlaps an observed quota cycle. Likewise, a reset fragment wholly
+    // enclosed by a continuing quota cycle never establishes a transition.
+    // Keep the raw rows in SQLite, but do not expose either as a graph period.
+    let shadowed = (0..raw_groups.len())
+        .map(|index| reset_group_is_shadowed(index, &raw_groups))
+        .collect::<Vec<_>>();
+    let groups = raw_groups
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, group)| (!shadowed[index]).then_some(group))
+        .collect::<Vec<_>>();
+    let mut minute_groups = BTreeMap::<i64, BTreeSet<usize>>::new();
+    for (group_index, group) in groups.iter().enumerate() {
         for sample in &group.samples {
-            minute_cycles
+            minute_groups
                 .entry(sample.timestamp.div_euclid(60) * 60)
                 .or_default()
-                .insert(group.canonical_reset_at);
+                .insert(group_index);
         }
     }
-    if minute_cycles.values().any(|cycles| cycles.len() != 1) {
-        return Err(HistoryCanonicalizationError::MultipleCyclesInMinute);
+
+    // Minute storage makes the last bucket of one cycle and the first bucket
+    // of the next cycle share a timestamp when the real boundary has seconds.
+    // The later cycle owns that bucket only when it starts there and continues
+    // afterward, while every earlier cycle ends there. Any other overlap is
+    // still ambiguous and must not be published.
+    let mut boundary_minute_owners = BTreeMap::<i64, usize>::new();
+    for (minute, group_indexes) in minute_groups
+        .iter()
+        .filter(|(_, group_indexes)| group_indexes.len() > 1)
+    {
+        let continuing = group_indexes
+            .iter()
+            .copied()
+            .filter(|group_index| {
+                let group = &groups[*group_index];
+                group.start == *minute
+                    && group
+                        .samples
+                        .iter()
+                        .any(|sample| sample.timestamp.div_euclid(60) * 60 > *minute)
+            })
+            .collect::<Vec<_>>();
+        let [owner] = continuing.as_slice() else {
+            return Err(HistoryCanonicalizationError::MultipleCyclesInMinute);
+        };
+        if group_indexes.iter().copied().any(|group_index| {
+            group_index != *owner
+                && groups[group_index]
+                    .samples
+                    .iter()
+                    .any(|sample| sample.timestamp.div_euclid(60) * 60 > *minute)
+        }) {
+            return Err(HistoryCanonicalizationError::MultipleCyclesInMinute);
+        }
+        boundary_minute_owners.insert(*minute, *owner);
     }
 
     let mut canonical = Vec::with_capacity(samples.len());
-    for group in groups {
-        let mut rows = group.samples;
+    for (group_index, group) in groups.into_iter().enumerate() {
+        let mut rows = group
+            .samples
+            .into_iter()
+            .filter(|sample| {
+                let minute = sample.timestamp.div_euclid(60) * 60;
+                boundary_minute_owners
+                    .get(&minute)
+                    .is_none_or(|owner| *owner == group_index)
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            continue;
+        }
         rows.sort_by_key(|sample| {
             (
                 sample.timestamp.div_euclid(60) * 60,
@@ -2137,14 +2220,19 @@ fn canonicalize_public_history_samples(
             }
             let minute_rows = &rows[start..index];
             let mut quota = None;
+            let mut quota_conflict = false;
             for row in minute_rows
                 .iter()
                 .filter(|row| row.remaining_percent >= 0.0)
             {
                 if quota.is_some_and(|existing| existing != row.remaining_percent) {
-                    return Err(HistoryCanonicalizationError::ConflictingQuota);
+                    quota_conflict = true;
+                    break;
                 }
                 quota = Some(row.remaining_percent);
+            }
+            if quota_conflict {
+                continue;
             }
             let dominant = minute_rows
                 .iter()
@@ -2154,8 +2242,11 @@ fn canonicalize_public_history_samples(
                         .iter()
                         .all(|row| usage_vector_dominates(candidate, row))
                 })
-                .ok_or(HistoryCanonicalizationError::NonComparableCumulativeUsage)?;
-            let mut sample = (*dominant).clone();
+                .cloned();
+            let Some(dominant) = dominant else {
+                continue;
+            };
+            let mut sample = dominant;
             sample.timestamp = minute;
             sample.reset_at = group.canonical_reset_at;
             sample.remaining_percent = quota.unwrap_or(-1.0);
@@ -4012,39 +4103,159 @@ fn session_jsonl_files(root: &Path) -> Result<Vec<PathBuf>, security::SecurityEr
     Ok(files)
 }
 
-fn collect_local_model_usage(
-    reset_at: i64,
-    window_seconds: i64,
-) -> Result<ModelUsageTotals, security::SecurityError> {
-    if reset_at <= 0 {
-        return Ok(ModelUsageTotals::default());
-    }
-    let mut totals = ModelUsageTotals::default();
-    let window_start = reset_at.saturating_sub(window_seconds.max(0));
-    if let Some(root) = local_sessions_root() {
-        let paths = session_jsonl_files(&root)?;
-        debug_runtime(format!("local session files={}", paths.len()));
-        for path in paths {
-            if let Err(error) = collect_session_file(&path, &mut totals, window_start) {
-                debug_runtime(format!(
-                    "local session parse failed kind={:?}",
-                    error.kind()
-                ));
-                return Err(error);
-            }
-        }
-    }
-    let window_end = reset_at;
-    add_recovery_usage(
-        delegation_usage_recovery_path().as_deref(),
-        window_start,
-        window_end,
-        &mut totals,
-    );
-    Ok(totals)
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalInputFileFingerprint {
+    path: PathBuf,
+    length: u64,
+    modified_nanos: u128,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalInputFingerprint {
+    session_files: Vec<LocalInputFileFingerprint>,
+    recovery_file: Option<LocalInputFileFingerprint>,
+}
+
+struct LocalInputInventory {
+    session_files: Vec<PathBuf>,
+    recovery_path: Option<PathBuf>,
+    fingerprint: LocalInputFingerprint,
+}
+
+fn local_input_file_fingerprint(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<LocalInputFileFingerprint, security::SecurityError> {
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > security::MAX_SESSION_FILE_BYTES
+    {
+        return Err(security::SecurityError::new(
+            security::SecurityErrorKind::UnsafePath,
+        ));
+    }
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |value| value.as_nanos());
+    #[cfg(unix)]
+    let (device, inode) = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino())
+    };
+    Ok(LocalInputFileFingerprint {
+        path: path.to_owned(),
+        length: metadata.len(),
+        modified_nanos,
+        #[cfg(unix)]
+        device,
+        #[cfg(unix)]
+        inode,
+    })
+}
+
+fn local_input_inventory_for_paths(
+    sessions_root: Option<&Path>,
+    recovery_path: Option<PathBuf>,
+) -> Result<LocalInputInventory, security::SecurityError> {
+    let session_files = if let Some(root) = sessions_root {
+        match fs::symlink_metadata(root) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(security::SecurityError::new(
+                    security::SecurityErrorKind::UnsafePath,
+                ));
+            }
+            Ok(_) => session_jsonl_files(root)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(_) => {
+                return Err(security::SecurityError::new(
+                    security::SecurityErrorKind::UnsafePath,
+                ));
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let mut session_fingerprints = Vec::with_capacity(session_files.len());
+    for path in &session_files {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+        session_fingerprints.push(local_input_file_fingerprint(path, &metadata)?);
+    }
+    let recovery_file = if let Some(path) = recovery_path.as_deref() {
+        match fs::symlink_metadata(path) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_file()
+                    || metadata.len() > security::MAX_SESSION_FILE_BYTES =>
+            {
+                None
+            }
+            Ok(metadata) => Some(local_input_file_fingerprint(path, &metadata)?),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    Ok(LocalInputInventory {
+        session_files,
+        recovery_path,
+        fingerprint: LocalInputFingerprint {
+            session_files: session_fingerprints,
+            recovery_file,
+        },
+    })
+}
+
+fn local_input_inventory() -> Result<LocalInputInventory, security::SecurityError> {
+    let sessions_root = local_sessions_root();
+    local_input_inventory_for_paths(sessions_root.as_deref(), delegation_usage_recovery_path())
+}
+
+fn collect_local_usage_snapshot(
+    reset_at: i64,
+    window_seconds: i64,
+    inventory: &LocalInputInventory,
+) -> Result<(ModelUsageTotals, Vec<UsageHistorySample>), security::SecurityError> {
+    if reset_at <= 0 {
+        return Ok((ModelUsageTotals::default(), Vec::new()));
+    }
+    let mut totals = ModelUsageTotals::default();
+    let mut events = Vec::new();
+    let window_start = reset_at.saturating_sub(window_seconds.max(0));
+    let timeline_end = Utc::now().timestamp().min(reset_at);
+    debug_runtime(format!(
+        "local session files={}",
+        inventory.session_files.len()
+    ));
+    for path in &inventory.session_files {
+        if let Err(error) =
+            collect_session_usage_file(path, window_start, timeline_end, &mut totals, &mut events)
+        {
+            debug_runtime(format!(
+                "local session parse failed kind={:?}",
+                error.kind()
+            ));
+            return Err(error);
+        }
+    }
+    collect_recovery_usage(
+        inventory.recovery_path.as_deref(),
+        window_start,
+        reset_at,
+        timeline_end,
+        &mut totals,
+        &mut events,
+    );
+    Ok((totals, model_usage_timeline_from_events(events, reset_at)))
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct DelegationUsageRecoveryEntry {
     timestamp: i64,
     thread_id: String,
@@ -4069,64 +4280,93 @@ impl DelegationUsageRecoveryEntry {
     }
 }
 
-fn read_recovery_entries(
+fn read_recovery_entries_for_ranges(
     path: &Path,
     window_start: i64,
-    window_end: i64,
-) -> Vec<DelegationUsageRecoveryEntry> {
-    if window_start > window_end {
-        return Vec::new();
+    totals_window_end: i64,
+    timeline_window_end: i64,
+) -> (
+    Vec<DelegationUsageRecoveryEntry>,
+    Vec<DelegationUsageRecoveryEntry>,
+) {
+    if window_start > totals_window_end && window_start > timeline_window_end {
+        return (Vec::new(), Vec::new());
     }
     let Ok(metadata) = fs::symlink_metadata(path) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     if metadata.file_type().is_symlink()
         || !metadata.is_file()
         || metadata.len() > security::MAX_SESSION_FILE_BYTES
     {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let Ok(file) = File::open(path) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
-    let mut seen_threads = BTreeSet::new();
-    let mut entries = Vec::new();
+    let mut totals_seen_threads = BTreeSet::new();
+    let mut timeline_seen_threads = BTreeSet::new();
+    let mut totals_entries = Vec::new();
+    let mut timeline_entries = Vec::new();
     let mut reader = BufReader::new(file);
     loop {
         let line = match read_recoverable_session_line(&mut reader) {
             Ok(Some(line)) => line,
             Ok(None) => break,
-            Err(_) => return Vec::new(),
+            Err(_) => return (Vec::new(), Vec::new()),
         };
         let Ok(entry) = serde_json::from_str::<DelegationUsageRecoveryEntry>(&line) else {
             continue;
         };
-        if entry.timestamp < window_start
-            || entry.timestamp > window_end
-            || entry.timestamp <= 0
+        if entry.timestamp <= 0
             || entry.thread_id.trim().is_empty()
             || ModelUsageTotals::recognized_model(&entry.model).is_none()
         {
             continue;
         }
-        if seen_threads.insert(entry.thread_id.clone()) {
-            entries.push(entry);
+        if entry.timestamp >= window_start
+            && entry.timestamp <= totals_window_end
+            && totals_seen_threads.insert(entry.thread_id.clone())
+        {
+            totals_entries.push(entry.clone());
+        }
+        if entry.timestamp >= window_start
+            && entry.timestamp <= timeline_window_end
+            && timeline_seen_threads.insert(entry.thread_id.clone())
+        {
+            timeline_entries.push(entry);
         }
     }
-    entries
+    (totals_entries, timeline_entries)
 }
 
-fn add_recovery_usage(
+fn collect_recovery_usage(
     path: Option<&Path>,
     window_start: i64,
-    window_end: i64,
+    totals_window_end: i64,
+    timeline_window_end: i64,
     totals: &mut ModelUsageTotals,
+    events: &mut Vec<TimedModelUsage>,
 ) {
     let Some(path) = path else {
         return;
     };
-    for entry in read_recovery_entries(path, window_start, window_end) {
+    let (totals_entries, timeline_entries) = read_recovery_entries_for_ranges(
+        path,
+        window_start,
+        totals_window_end,
+        timeline_window_end,
+    );
+    for entry in totals_entries {
         totals.add(&entry.model, entry.snapshot());
+    }
+    for entry in timeline_entries {
+        let delta = entry.snapshot();
+        events.push(TimedModelUsage {
+            timestamp: entry.timestamp,
+            model: entry.model,
+            delta,
+        });
     }
 }
 
@@ -4243,20 +4483,6 @@ fn session_event_timestamp(value: &Value) -> i64 {
         .unwrap_or(0)
 }
 
-fn recovery_timed_usage(path: &Path, window_start: i64, window_end: i64) -> Vec<TimedModelUsage> {
-    read_recovery_entries(path, window_start, window_end)
-        .into_iter()
-        .map(|entry| {
-            let delta = entry.snapshot();
-            TimedModelUsage {
-                timestamp: entry.timestamp,
-                model: entry.model,
-                delta,
-            }
-        })
-        .collect()
-}
-
 fn model_usage_timeline_from_events(
     mut events: Vec<TimedModelUsage>,
     reset_at: i64,
@@ -4286,45 +4512,17 @@ fn model_usage_timeline_from_events(
     samples
 }
 
-fn collect_local_model_usage_timeline(
-    reset_at: i64,
-    window_seconds: i64,
-) -> Result<Vec<UsageHistorySample>, security::SecurityError> {
-    if reset_at <= 0 {
-        return Ok(Vec::new());
-    }
-    let window_start = reset_at.saturating_sub(window_seconds.max(0));
-    let now = Utc::now().timestamp().min(reset_at);
-    let mut events = Vec::new();
-    if let Some(root) = local_sessions_root() {
-        let paths = session_jsonl_files(&root)?;
-        debug_runtime(format!("local timeline files={}", paths.len()));
-        for path in paths {
-            if let Err(error) = collect_session_timeline_file(&path, window_start, now, &mut events)
-            {
-                debug_runtime(format!(
-                    "local timeline parse failed kind={:?}",
-                    error.kind()
-                ));
-                return Err(error);
-            }
-        }
-    }
-    if let Some(path) = delegation_usage_recovery_path() {
-        events.extend(recovery_timed_usage(&path, window_start, now));
-    }
-    Ok(model_usage_timeline_from_events(events, reset_at))
-}
-
-fn collect_session_timeline_file(
+fn collect_session_usage_file(
     path: &Path,
     window_start: i64,
-    window_end: i64,
+    timeline_window_end: i64,
+    totals: &mut ModelUsageTotals,
     events: &mut Vec<TimedModelUsage>,
 ) -> Result<(), security::SecurityError> {
     let file = File::open(path)
         .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
-    let initial_len = events.len();
+    let original = totals.clone();
+    let initial_events_len = events.len();
     let mut model: Option<String> = None;
     let mut previous = TokenSnapshot::default();
     let mut reader = BufReader::new(file);
@@ -4333,7 +4531,8 @@ fn collect_session_timeline_file(
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(error) => {
-                events.truncate(initial_len);
+                *totals = original;
+                events.truncate(initial_events_len);
                 return Err(error);
             }
         };
@@ -4360,69 +4559,18 @@ fn collect_session_timeline_file(
         };
         previous = current;
         let timestamp = session_event_timestamp(&value);
-        if timestamp < window_start || timestamp > window_end {
-            continue;
-        }
-        if let Some(model) = model.as_deref() {
-            events.push(TimedModelUsage {
-                timestamp,
-                model: model.to_owned(),
-                delta,
-            });
-        }
-    }
-    Ok(())
-}
-
-fn collect_session_file(
-    path: &Path,
-    totals: &mut ModelUsageTotals,
-    window_start: i64,
-) -> Result<(), security::SecurityError> {
-    let file = File::open(path)
-        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
-    let original = totals.clone();
-    let mut model: Option<String> = None;
-    let mut previous = TokenSnapshot::default();
-    let mut reader = BufReader::new(file);
-    loop {
-        let line = match read_recoverable_session_line(&mut reader) {
-            Ok(Some(line)) => line,
-            Ok(None) => break,
-            Err(error) => {
-                *totals = original;
-                return Err(error);
-            }
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if session_event_type(&value) != Some("thread_settings_applied") || model.is_none() {
-            if let Some(next_model) = session_event_model(&value) {
-                model = Some(next_model);
-            }
-        }
-        let Some(current) = session_token_snapshot(&value) else {
-            continue;
-        };
-        let delta = TokenSnapshot {
-            total: current.total.saturating_sub(previous.total),
-            input: current.input.saturating_sub(previous.input),
-            cached_input: current.cached_input.saturating_sub(previous.cached_input),
-            output: current.output.saturating_sub(previous.output),
-        };
-        previous = current;
-        let timestamp = value
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-            .map(|value| value.timestamp())
-            .unwrap_or(0);
         if timestamp < window_start {
             continue;
         }
         if let Some(model) = model.as_deref() {
             totals.add(model, delta);
+            if timestamp <= timeline_window_end {
+                events.push(TimedModelUsage {
+                    timestamp,
+                    model: model.to_owned(),
+                    delta,
+                });
+            }
         }
     }
     Ok(())
@@ -4927,8 +5075,38 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
     }
 }
 
+#[derive(Default)]
+struct LocalUsageCache {
+    period: Option<(i64, i64)>,
+    fingerprint: Option<LocalInputFingerprint>,
+    model_usage: ModelUsageTotals,
+}
+
+impl LocalUsageCache {
+    fn collect(
+        &mut self,
+        reset_at: i64,
+        window_seconds: i64,
+        inventory: LocalInputInventory,
+    ) -> Result<(ModelUsageTotals, Vec<UsageHistorySample>), security::SecurityError> {
+        if self.period == Some((reset_at, window_seconds))
+            && self.fingerprint.as_ref() == Some(&inventory.fingerprint)
+        {
+            debug_runtime("local inputs unchanged; full session scan skipped");
+            return Ok((self.model_usage.clone(), Vec::new()));
+        }
+        let (model_usage, history_samples) =
+            collect_local_usage_snapshot(reset_at, window_seconds, &inventory)?;
+        self.period = Some((reset_at, window_seconds));
+        self.fingerprint = Some(inventory.fingerprint);
+        self.model_usage = model_usage.clone();
+        Ok((model_usage, history_samples))
+    }
+}
+
 fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEvent>) {
     debug_runtime("local usage worker starting");
+    let mut cache = LocalUsageCache::default();
     while let Ok(command) = commands.recv() {
         match command {
             LocalCommand::Stop => break,
@@ -4940,12 +5118,8 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                 debug_runtime(format!(
                     "local collect requested epoch={auth_epoch} reset_at={reset_at} window_seconds={window_seconds}"
                 ));
-                let result = (|| {
-                    let model_usage = collect_local_model_usage(reset_at, window_seconds)?;
-                    let history_samples =
-                        collect_local_model_usage_timeline(reset_at, window_seconds)?;
-                    Ok::<_, security::SecurityError>((model_usage, history_samples))
-                })();
+                let result = local_input_inventory()
+                    .and_then(|inventory| cache.collect(reset_at, window_seconds, inventory));
                 match result {
                     Ok((model_usage, history_samples)) => {
                         debug_runtime(format!(
@@ -5097,7 +5271,10 @@ struct CodexInfoState {
     /// usage while app-server/REST is unavailable. It is never exposed until
     /// a fresh authenticated quota snapshot is committed.
     recovery_period: Option<(i64, i64)>,
-    recovery_requested: bool,
+    /// The single local collector lane is scheduled independently of account
+    /// availability. This timestamp throttles that same lane during an
+    /// app-server outage; it does not introduce a second scanner.
+    last_local_poll: Instant,
     /// In UI mode, the service listener is the single owner of the visible
     /// snapshot. Keep a failed selected endpoint latched until that same
     /// endpoint becomes healthy; never fall back to the default port.
@@ -5171,12 +5348,19 @@ impl CodexInfoState {
         } else {
             Vec::new()
         };
-        let projected_history = UsageHistory {
+        let admitted_history = UsageHistory {
             samples: admitted_history_samples,
             ..UsageHistory::default()
         };
         let canonical_history_samples =
-            canonicalize_public_history_samples(&projected_history.samples)?;
+            canonicalize_public_history_samples(&admitted_history.samples)?;
+        // Period selectors and graph rows come from the same admitted view;
+        // reset fragments and ambiguous minutes never survive only as empty
+        // or misleading period options.
+        let projected_history = UsageHistory {
+            samples: canonical_history_samples.clone(),
+            ..UsageHistory::default()
+        };
         let models = if visible_usage {
             self.model_usage
                 .iter()
@@ -5340,6 +5524,7 @@ impl CodexInfoState {
 
     fn new() -> Self {
         let i18n = I18n::detect();
+        let resident_now = Instant::now();
         let bridge = AppServerBridge::<AccountCommand, Event>::start();
         bridge.send(AccountCommand::Read);
         let history = UsageHistory::load();
@@ -5366,7 +5551,7 @@ impl CodexInfoState {
             error: None,
             status: "Codex app-serverへ接続しています…".into(),
             checking: true,
-            last_poll: Instant::now(),
+            last_poll: resident_now,
             last_success_at: None,
             model_usage: Vec::new(),
             active_threads: Vec::new(),
@@ -5382,9 +5567,11 @@ impl CodexInfoState {
             local_usage_error: false,
             local_usage_pending: false,
             usage_snapshot_committed: false,
-            last_thread_poll: Instant::now(),
+            last_thread_poll: resident_now,
             recovery_period,
-            recovery_requested: false,
+            last_local_poll: resident_now
+                .checked_sub(daemon::daemon_interval_from_environment())
+                .unwrap_or(resident_now),
             service_endpoint_error: None,
             service_published_pair: None,
         }
@@ -5435,7 +5622,7 @@ impl CodexInfoState {
             usage_snapshot_committed: false,
             last_thread_poll: Instant::now(),
             recovery_period: None,
-            recovery_requested: false,
+            last_local_poll: Instant::now(),
             service_endpoint_error: None,
             service_published_pair: None,
         }
@@ -5509,7 +5696,7 @@ impl CodexInfoState {
             usage_snapshot_committed: true,
             last_thread_poll: Instant::now(),
             recovery_period: None,
-            recovery_requested: false,
+            last_local_poll: Instant::now(),
             service_endpoint_error: None,
             service_published_pair: None,
         };
@@ -5881,6 +6068,24 @@ impl CodexInfoState {
     /// events are drained before this method runs, so `checking` and
     /// `thread_checking` are the single-flight completion boundaries.
     fn schedule_resident_refresh(&mut self, now: Instant) {
+        // When no current authenticated quota is available (auth-required or
+        // app-server error), keep the persisted period current through the
+        // same local collector used by authenticated refreshes. Local
+        // collection owns one lane, so it must finish before another account
+        // or local generation can be admitted.
+        if (!self.authenticated || self.account_error.is_some())
+            && !self.auth_polling
+            && !self.checking
+            && !self.local_usage_pending
+            && now.duration_since(self.last_local_poll)
+                >= daemon::daemon_interval_from_environment()
+        {
+            if let Some((reset_at, window_seconds)) = self.recovery_period {
+                if self.request_local_usage(reset_at, window_seconds) {
+                    self.last_local_poll = now;
+                }
+            }
+        }
         // One quota/local generation owns the account lane until it reaches a
         // terminal local result. Periodic quota responses can share the same
         // reset tuple, so overlapping them would make an older local scan
@@ -6120,20 +6325,24 @@ impl CodexInfoState {
         }
     }
 
-    fn request_local_usage(&mut self, reset_at: i64, window_seconds: i64) {
-        if !self.preview && reset_at > 0 {
-            let command = LocalCommand::Collect {
-                auth_epoch: self.auth_epoch,
-                reset_at,
-                window_seconds,
-            };
+    fn request_local_usage(&mut self, reset_at: i64, window_seconds: i64) -> bool {
+        if self.preview || reset_at <= 0 || self.local_usage_pending {
+            return false;
+        }
+        let command = LocalCommand::Collect {
+            auth_epoch: self.auth_epoch,
+            reset_at,
+            window_seconds,
+        };
+        if !self.local_bridge.send(command) {
+            self.local_bridge = LocalUsageBridge::start();
             if !self.local_bridge.send(command) {
-                self.local_bridge = LocalUsageBridge::start();
-                if !self.local_bridge.send(command) {
-                    self.apply_local_usage_error(self.auth_epoch, reset_at, window_seconds);
-                }
+                self.apply_local_usage_error(self.auth_epoch, reset_at, window_seconds);
+                return false;
             }
         }
+        self.local_usage_pending = true;
+        true
     }
 
     fn clear_account_visible_state(&mut self) {
@@ -6162,7 +6371,6 @@ impl CodexInfoState {
         self.local_usage_error = false;
         self.local_usage_pending = false;
         self.usage_snapshot_committed = false;
-        self.recovery_requested = false;
         self.history = UsageHistory::default();
         self.selected_reset_at = None;
         self.selected_history_period = "履歴なし".into();
@@ -6232,19 +6440,16 @@ impl CodexInfoState {
         );
         self.has_quota_percent = remaining_percent.is_some();
         self.has_usage = true;
-        self.local_usage_pending = !self.preview;
         self.remaining_percent = remaining_percent.map(|value| value.clamp(0.0, 100.0));
         self.reset_at = (reset_at > 0).then_some(reset_at);
         self.window_seconds = window_seconds;
         self.recovery_period = (reset_at > 0).then_some((reset_at, window_seconds));
         if !self.preview && reset_at > 0 {
-            // The daemon and the one-shot app-server recovery share this
-            // bounded hint, but neither path ever reconstructs quota from
-            // local logs.  A failed metadata write leaves the previous hint
-            // untouched and does not invalidate the authenticated snapshot.
+            // The resident collector persists this bounded period so that its
+            // same single lane can continue local history collection during
+            // an app-server outage. It never reconstructs quota from logs.
             let _ = daemon::persist_reset_hint(reset_at, window_seconds);
         }
-        self.recovery_requested = false;
         self.limit_name = limit_name;
         self.quota_title = quota_title;
         self.monthly = monthly;
@@ -6276,9 +6481,11 @@ impl CodexInfoState {
             "state usage applied authenticated={} reset_at={} window_seconds={} auth_epoch={}",
             self.authenticated, reset_at, window_seconds, self.auth_epoch
         ));
-        // Quota is committed before the independent local worker is asked to
+        // Quota is committed before the single local worker is asked to
         // collect usage. The request carries the exact auth/period tuple.
-        self.request_local_usage(reset_at, window_seconds);
+        if self.request_local_usage(reset_at, window_seconds) {
+            self.last_local_poll = Instant::now();
+        }
         self.refresh_partial_failure_status();
     }
 
@@ -6291,28 +6498,15 @@ impl CodexInfoState {
         self.advance_auth_epoch();
         self.thread_checking = false;
         self.checking = false;
-        // The epoch change makes the in-flight local result stale. Release
-        // the account lane so a later authenticated generation can start.
-        self.local_usage_pending = false;
+        // If the local lane is already running, the epoch change makes that
+        // exact result stale. Keep the lane occupied until its terminal event
+        // arrives; otherwise a second full session scan could be queued.
         self.account_error = Some(error.clone());
         self.error = Some(error);
         self.status =
             "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
-        // Keep this latch set for the entire account outage. The account
-        // bridge may respawn and report several errors before authentication
-        // succeeds again; those retries must not rescan every JSONL file.
-        if !self.recovery_requested {
-            if let Some((reset_at, window_seconds)) = self.recovery_period {
-                self.recovery_requested = true;
-                if !self.preview {
-                    // Recovery owns the same local-worker lane. Do not let a
-                    // newly recovered account response reuse its identical
-                    // reset tuple before this result reaches a terminal state.
-                    self.local_usage_pending = true;
-                }
-                self.request_local_usage(reset_at, window_seconds);
-            }
-        }
+        // The resident scheduler owns outage recovery at the established
+        // interval. Error handling only records the failed account boundary.
     }
 
     fn apply_account_event(
@@ -6381,7 +6575,6 @@ impl CodexInfoState {
     fn apply_local_usage_success(&mut self, result: LocalUsageResult) {
         let period_matches = self.recovery_period == Some((result.reset_at, result.window_seconds));
         let unauthenticated_recovery = !self.authenticated && period_matches;
-        let recovery_result = self.recovery_requested && period_matches;
         if result.auth_epoch != self.auth_epoch
             || !self.current_local_period_matches(result.reset_at, result.window_seconds)
         {
@@ -6391,6 +6584,10 @@ impl CodexInfoState {
                 self.auth_epoch,
                 self.current_local_period_matches(result.reset_at, result.window_seconds)
             ));
+            // A newer local request cannot exist while this single-flight
+            // command is pending, so its stale terminal event releases the
+            // physical lane without admitting stale data.
+            self.local_usage_pending = false;
             return;
         }
         let model_costs = result.model_usage.dollar_totals();
@@ -6398,14 +6595,6 @@ impl CodexInfoState {
         let history_sample_count = result.history_samples.len();
         self.local_usage_error = false;
         self.local_usage_pending = false;
-        // A recovery result closes the one-shot backfill, but it must remain
-        // marked as attempted until a fresh authenticated quota event arrives.
-        // Otherwise an app-server restart loop would launch the same full
-        // session scan once per failed account worker instead of once per
-        // outage period.
-        if !recovery_result {
-            self.recovery_requested = false;
-        }
         if unauthenticated_recovery && self.history.db_path.is_none() {
             // Reattach the durable store only at the recovery commit boundary;
             // an unauthenticated clear still keeps all visible history empty.
@@ -6420,14 +6609,19 @@ impl CodexInfoState {
             self.history
                 .apply_backfill_samples(result.reset_at, result.history_samples);
         }
-        if let Some(remaining_percent) = self.remaining_percent {
-            self.history.record(UsageHistorySample::new_with_usage(
-                Utc::now().timestamp(),
-                result.reset_at,
-                remaining_percent,
-                model_costs,
-                model_tokens,
-            ));
+        // During an account outage the last quota value is display-only
+        // last-good data, not a new observation. Persist local model changes,
+        // but never stamp that stale quota onto a new history timestamp.
+        if self.account_error.is_none() {
+            if let Some(remaining_percent) = self.remaining_percent {
+                self.history.record(UsageHistorySample::new_with_usage(
+                    Utc::now().timestamp(),
+                    result.reset_at,
+                    remaining_percent,
+                    model_costs,
+                    model_tokens,
+                ));
+            }
         }
         self.refresh_partial_failure_status();
         debug_runtime(format!(
@@ -6439,17 +6633,14 @@ impl CodexInfoState {
     }
 
     fn apply_local_usage_error(&mut self, auth_epoch: u64, reset_at: i64, window_seconds: i64) {
-        let recovery_error =
-            self.recovery_requested && self.recovery_period == Some((reset_at, window_seconds));
         if auth_epoch != self.auth_epoch
             || !self.current_local_period_matches(reset_at, window_seconds)
-            || (!self.authenticated && !recovery_error)
         {
+            self.local_usage_pending = false;
             return;
         }
         self.local_usage_error = true;
         self.local_usage_pending = false;
-        self.recovery_requested = false;
         self.refresh_partial_failure_status();
     }
 
@@ -7641,7 +7832,7 @@ fn automatic_refresh_interval(authenticated: bool, auth_polling: bool) -> Durati
     if !authenticated && auth_polling {
         Duration::from_secs(2)
     } else {
-        Duration::from_secs(60)
+        daemon::daemon_interval_from_environment()
     }
 }
 
@@ -8796,24 +8987,80 @@ where
     }
 }
 
-fn is_service_health_response(response: &[u8]) -> bool {
-    if !response.starts_with(b"HTTP/1.1 200 ") {
-        return false;
-    }
-    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return false;
-    };
-    let body = &response[header_end + 4..];
-    serde_json::from_slice::<Value>(body).is_ok_and(|value| {
-        value.get("api_version").and_then(Value::as_str) == Some("v1")
-            && value.get("service").and_then(Value::as_str) == Some("codex-info")
-    })
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceHealthVersion {
+    Current,
+    Different,
 }
 
-fn service_is_healthy(address: SocketAddr) -> bool {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceEndpointState {
+    Absent,
+    Current,
+    Different,
+    Unrecognized,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionedServiceHealth {
+    api_version: String,
+    service: String,
+    product_version: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyServiceHealth {
+    api_version: String,
+    service: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ServiceHealthDocument {
+    Versioned(VersionedServiceHealth),
+    Legacy(LegacyServiceHealth),
+}
+
+fn service_health_response_version(response: &[u8]) -> Option<ServiceHealthVersion> {
+    if !response.starts_with(b"HTTP/1.1 200 ") {
+        return None;
+    }
+    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return None;
+    };
+    let body = &response[header_end + 4..];
+    match serde_json::from_slice::<ServiceHealthDocument>(body).ok()? {
+        // v1.0.18 and older services used this exact two-key document. It is
+        // recognized only so the verified profile owner can be retired; its
+        // details are never accepted by the current UI.
+        ServiceHealthDocument::Legacy(document)
+            if document.api_version == "v1" && document.service == "codex-info" =>
+        {
+            Some(ServiceHealthVersion::Different)
+        }
+        ServiceHealthDocument::Versioned(document)
+            if document.api_version == "v1" && document.service == "codex-info" =>
+        {
+            Some(if document.product_version == PRODUCT_VERSION {
+                ServiceHealthVersion::Current
+            } else {
+                ServiceHealthVersion::Different
+            })
+        }
+        _ => None,
+    }
+}
+
+fn is_service_health_response(response: &[u8]) -> bool {
+    service_health_response_version(response) == Some(ServiceHealthVersion::Current)
+}
+
+fn service_endpoint_state(address: SocketAddr) -> ServiceEndpointState {
     let timeout = Duration::from_millis(150);
     let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
-        return false;
+        return ServiceEndpointState::Absent;
     };
     let request =
         format!("GET /v1/health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
@@ -8821,7 +9068,7 @@ fn service_is_healthy(address: SocketAddr) -> bool {
         || stream.set_write_timeout(Some(timeout)).is_err()
         || stream.write_all(request.as_bytes()).is_err()
     {
-        return false;
+        return ServiceEndpointState::Unrecognized;
     }
     let mut response = Vec::with_capacity(512);
     let mut buffer = [0_u8; 512];
@@ -8835,8 +9082,11 @@ fn service_is_healthy(address: SocketAddr) -> bool {
                 // The server supplies Content-Length and may keep the socket
                 // open. A complete, validated body is success; EOF is not a
                 // health requirement.
-                if is_service_health_response(&response) {
-                    return true;
+                if let Some(version) = service_health_response_version(&response) {
+                    return match version {
+                        ServiceHealthVersion::Current => ServiceEndpointState::Current,
+                        ServiceHealthVersion::Different => ServiceEndpointState::Different,
+                    };
                 }
             }
             Err(error)
@@ -8847,16 +9097,57 @@ fn service_is_healthy(address: SocketAddr) -> bool {
             {
                 break;
             }
-            Err(_) => return false,
+            Err(_) => return ServiceEndpointState::Unrecognized,
         }
     }
-    is_service_health_response(&response)
+    match service_health_response_version(&response) {
+        Some(ServiceHealthVersion::Current) => ServiceEndpointState::Current,
+        Some(ServiceHealthVersion::Different) => ServiceEndpointState::Different,
+        None => ServiceEndpointState::Unrecognized,
+    }
+}
+
+fn service_health_version(address: SocketAddr) -> Option<ServiceHealthVersion> {
+    match service_endpoint_state(address) {
+        ServiceEndpointState::Current => Some(ServiceHealthVersion::Current),
+        ServiceEndpointState::Different => Some(ServiceHealthVersion::Different),
+        ServiceEndpointState::Absent | ServiceEndpointState::Unrecognized => None,
+    }
+}
+
+fn service_is_healthy(address: SocketAddr) -> bool {
+    service_health_version(address) == Some(ServiceHealthVersion::Current)
 }
 
 fn healthy_combined_service_owner(address: SocketAddr) -> Option<u32> {
     service_is_healthy(address)
         .then(daemon::current_daemon_owner_pid)
         .flatten()
+}
+
+fn retire_different_version_service(address: SocketAddr) -> Result<(), String> {
+    if service_endpoint_state(address) != ServiceEndpointState::Different {
+        return Ok(());
+    }
+    if daemon::current_daemon_owner_pid().is_none() {
+        return Err(cli_error(CliTextKey::ServiceStateUnavailable));
+    }
+    let _ = daemon::stop_daemon();
+    // The legacy process releases its recorder lock immediately before closing
+    // the REST listener. A malformed/incomplete response still means that the
+    // port is occupied, so wait for an actually absent listener or a concurrent
+    // current-version winner before the one-shot start decision below.
+    let deadline = Instant::now() + BACKGROUND_SERVICE_START_TIMEOUT;
+    loop {
+        match service_endpoint_state(address) {
+            ServiceEndpointState::Absent | ServiceEndpointState::Current => return Ok(()),
+            ServiceEndpointState::Different | ServiceEndpointState::Unrecognized => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(cli_error(CliTextKey::ServiceCleanupFailed));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn terminate_and_reap_owned_child(child: &mut Child) -> bool {
@@ -8883,6 +9174,7 @@ fn terminate_and_reap_owned_child(child: &mut Child) -> bool {
 
 fn ensure_background_service(config: ApiServerConfig) -> Result<(), String> {
     let address = config.listen_addr();
+    retire_different_version_service(address)?;
     if healthy_combined_service_owner(address).is_some() {
         return Ok(());
     }
@@ -9118,7 +9410,6 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
     let mut state = CodexInfoState::new();
     publisher.publish_details(state.public_details_candidate()?)?;
     let mut publication = ResidentPublicationState::default();
-    let mut observed_recorder_revision = recorder.committed_revision();
     let mut last_recorder_error = None;
     let mut last_publish_error = None;
     eprintln!(
@@ -9144,13 +9435,12 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                         &mut state,
                         &mut publication,
                         |state, pending| {
+                            let has_pending = !pending.is_empty();
                             recorder.store_samples(pending)?;
-                            let committed_revision = recorder.committed_revision();
-                            if committed_revision != observed_recorder_revision {
+                            if has_pending {
                                 if !state.history.refresh_from_store(Utc::now()) {
                                     return Err("history refresh after recorder commit failed".into());
                                 }
-                                observed_recorder_revision = committed_revision;
                             }
                             Ok(())
                         },
@@ -9188,12 +9478,13 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
             }
         }
     });
-    recorder.shutdown();
     api_server.shutdown();
+    recorder.shutdown();
     Ok(())
 }
 
 fn run_service_mode(config: ApiServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    retire_different_version_service(config.listen_addr()).map_err(std::io::Error::other)?;
     if healthy_combined_service_owner(config.listen_addr()).is_some() {
         eprintln!(
             "codex-info: {}",
@@ -9710,36 +10001,39 @@ mod tests {
     use super::winit;
     use super::{
         account_window_title, active_thread_model_counts, active_thread_rows_at,
-        add_recovery_usage, canonicalize_public_history_samples, clamp_graph_preview_size,
-        collapse_remaining_change_points, collect_session_file, complete_rollout_prefix_len,
-        current_history_period_reset, current_label_connector_path, detail_window_title,
-        fetch_active_thread_update_for_paths, fetch_active_thread_update_for_paths_and_state,
-        fetch_service_details, fixed_resize_decision, fixed_resize_decision_for_scale,
-        format_elapsed, format_estimated_cost, format_model_usage_columns, format_percent,
-        format_period_label, graph_paths, graph_paths_for_selection, graph_points,
-        graph_time_endpoints, is_service_health_response, minute_model_spend,
+        canonicalize_public_history_samples, clamp_graph_preview_size,
+        collapse_remaining_change_points, collect_recovery_usage, collect_session_usage_file,
+        complete_rollout_prefix_len, current_history_period_reset, current_label_connector_path,
+        detail_window_title, fetch_active_thread_update_for_paths,
+        fetch_active_thread_update_for_paths_and_state, fetch_service_details,
+        fixed_resize_decision, fixed_resize_decision_for_scale, format_elapsed,
+        format_estimated_cost, format_model_usage_columns, format_percent, format_period_label,
+        graph_paths, graph_paths_for_selection, graph_points, graph_time_endpoints,
+        is_service_health_response, local_input_inventory_for_paths, minute_model_spend,
         minute_model_spend_for_metric, model_usage_timeline_from_events, monthly_window_seconds,
         native_account_window_title, native_legal_pages, native_startup_loading,
         normal_status_text, one_month_before_utc, open_codex_session_paths, parse_details_document,
         parse_launch_mode, parse_preview_size, parse_rate_limits, parse_resize_direction,
         period_remaining_text, physical_size_for_logical, plan_type_label, poll_service_state,
-        preview_model_row, published_pair_is_fresh, read_recovery_entries,
-        read_thread_rollout_path, recovery_timed_usage, remaining_graph_points,
-        remaining_graph_points_for_metric, remaining_graph_y, remaining_marker_positions,
-        remaining_marker_positions_on_points, request_with_timeout, reset_transition_is_boundary,
-        same_rollout_identity, separate_current_label_positions, service_is_healthy,
-        session_event_model, session_event_type, session_jsonl_files, session_token_snapshot,
-        smooth_model_spend, smooth_remaining_points, split_metric_line_paths, stacked_area_path,
-        terminate_and_reap_owned_child, thread_presentation_rows, three_months_before_utc,
-        unused_interval_positions, visible_window_position, week_remaining_text, ActiveThread,
-        ActiveThreadUpdate, ApiServer, ApiServerConfig, CodexInfoState, Event, FixedResizeDecision,
-        GraphPaths, GraphWindow, HourlyModelSpend, I18n, LaunchMode, LocalUsageResult,
-        ManualX11Geometry, ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals,
-        ModelUsageRow, ModelUsageTotals, PublicDetails, RpcReadEvent, SessionTraversalBudget,
-        TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample,
-        UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH,
-        GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION,
-        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
+        preview_model_row, published_pair_is_fresh, read_recovery_entries_for_ranges,
+        read_thread_rollout_path, remaining_graph_points, remaining_graph_points_for_metric,
+        remaining_graph_y, remaining_marker_positions, remaining_marker_positions_on_points,
+        request_with_timeout, reset_transition_is_boundary, same_rollout_identity,
+        separate_current_label_positions, service_endpoint_state, service_health_response_version,
+        service_is_healthy, session_event_model, session_event_type, session_jsonl_files,
+        session_token_snapshot, smooth_model_spend, smooth_remaining_points,
+        split_metric_line_paths, stacked_area_path, terminate_and_reap_owned_child,
+        thread_presentation_rows, three_months_before_utc, unused_interval_positions,
+        visible_window_position, week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer,
+        ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow,
+        HourlyModelSpend, I18n, LaunchMode, LocalUsageCache, LocalUsageResult, ManualX11Geometry,
+        ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
+        ModelUsageTotals, PublicDetails, RpcReadEvent, ServiceEndpointState, ServiceHealthVersion,
+        SessionTraversalBudget, TimedModelUsage, TokenSnapshot, UnusedIntervalPosition, UsageEvent,
+        UsageHistory, UsageHistorySample, UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT,
+        FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
+        LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION, THREADS_WINDOW_PURPOSE,
+        UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
     use serde::Deserialize;
 
@@ -10141,8 +10435,34 @@ mod tests {
 
     #[test]
     fn service_health_requires_a_complete_success_json_body_without_waiting_for_eof() {
-        let valid = b"HTTP/1.1 200 OK\r\nContent-Length: 43\r\nConnection: keep-alive\r\n\r\n{\"api_version\":\"v1\",\"service\":\"codex-info\"}";
-        assert!(is_service_health_response(valid));
+        let valid = format!(
+            "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n{{\"api_version\":\"v1\",\"service\":\"codex-info\",\"product_version\":\"{PRODUCT_VERSION}\"}}"
+        );
+        assert!(is_service_health_response(valid.as_bytes()));
+        assert_eq!(
+            service_health_response_version(
+                b"HTTP/1.1 200 OK\r\n\r\n{\"api_version\":\"v1\",\"service\":\"codex-info\"}"
+            ),
+            Some(ServiceHealthVersion::Different)
+        );
+        assert_eq!(
+            service_health_response_version(
+                b"HTTP/1.1 200 OK\r\n\r\n{\"api_version\":\"v1\",\"service\":\"codex-info\",\"product_version\":\"0.0.0\"}"
+            ),
+            Some(ServiceHealthVersion::Different)
+        );
+        assert_eq!(
+            service_health_response_version(
+                b"HTTP/1.1 200 OK\r\n\r\n{\"api_version\":\"v1\",\"service\":\"codex-info\",\"product_version\":\"1.0.18\",\"extra\":true}"
+            ),
+            None
+        );
+        assert_eq!(
+            service_health_response_version(
+                b"HTTP/1.1 200 OK\r\n\r\n{\"api_version\":\"v1\",\"service\":\"codex-info\",\"product_version\":\"1.0.18\",\"product_version\":\"1.0.18\"}"
+            ),
+            None
+        );
         assert!(!is_service_health_response(
             b"HTTP/1.1 200 OK\r\nX-Service: codex-info\r\n\r\n{}"
         ));
@@ -10160,6 +10480,21 @@ mod tests {
             ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
                 .unwrap();
         assert!(service_is_healthy(server.local_addr()));
+    }
+
+    #[test]
+    fn service_endpoint_distinguishes_an_occupied_unknown_listener_from_an_absent_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        assert_eq!(
+            service_endpoint_state(address),
+            ServiceEndpointState::Unrecognized
+        );
+        drop(listener);
+        assert_eq!(
+            service_endpoint_state(address),
+            ServiceEndpointState::Absent
+        );
     }
 
     #[test]
@@ -11002,8 +11337,11 @@ mod tests {
     fn persisted_period_backfill_is_admitted_before_auth_without_publishing_usage() {
         let mut state = CodexInfoState::preview("normal");
         let reset_at = state.reset_at.expect("preview quota has reset");
+        state.preview = false;
         state.authenticated = false;
         state.auth_epoch = 7;
+        state.remaining_percent = None;
+        state.has_quota_percent = false;
         state.recovery_period = Some((reset_at, WEEK_SECONDS));
         let db_path = std::env::temp_dir().join(format!(
             "codex-info-recovery-test-{}.sqlite3",
@@ -11043,25 +11381,52 @@ mod tests {
     }
 
     #[test]
-    fn recovery_backfill_is_one_shot_until_authenticated_quota_returns() {
+    fn outage_recovery_uses_one_periodic_local_collector_lane() {
+        let now = Instant::now();
         let mut state = CodexInfoState::preview("normal");
         let reset_at = state.reset_at.expect("preview quota has reset");
-        state.authenticated = false;
+        state.preview = false;
+        state.authenticated = true;
+        state.auth_polling = false;
+        state.checking = false;
+        state.account_error = Some("account bridge unavailable".into());
         state.auth_epoch = 7;
+        state.remaining_percent = Some(42.0);
+        state.has_quota_percent = true;
         state.recovery_period = Some((reset_at, WEEK_SECONDS));
+        state.last_poll = now;
+        state.last_local_poll = now - Duration::from_secs(3_601);
         let db_path = std::env::temp_dir().join(format!(
-            "codex-info-recovery-latch-{}.sqlite3",
+            "codex-info-periodic-recovery-{}.sqlite3",
             std::process::id()
         ));
+        let _ = fs::remove_file(&db_path);
         state.history = UsageHistory {
             db_path: Some(db_path.clone()),
             samples: Vec::new(),
             pending_store_samples: Vec::new(),
             startup_maintenance_done: true,
         };
+        let (local_tx, local_commands) = std::sync::mpsc::channel();
+        let (_local_events, local_rx) = std::sync::mpsc::channel();
+        state.local_bridge = super::LocalUsageBridge {
+            tx: local_tx,
+            rx: local_rx,
+        };
 
-        state.apply_account_error("account bridge unavailable".into());
-        assert!(state.recovery_requested);
+        state.schedule_resident_refresh(now);
+        assert!(matches!(
+            local_commands.try_recv(),
+            Ok(super::LocalCommand::Collect {
+                auth_epoch: 7,
+                reset_at: actual_reset,
+                window_seconds: WEEK_SECONDS,
+            }) if actual_reset == reset_at
+        ));
+        assert!(state.local_usage_pending);
+        state.schedule_resident_refresh(now + Duration::from_secs(3_601));
+        assert!(local_commands.try_recv().is_err());
+
         let recovery_epoch = state.auth_epoch;
         state.apply_local_usage_success(LocalUsageResult {
             auth_epoch: recovery_epoch,
@@ -11070,12 +11435,18 @@ mod tests {
             model_usage: ModelUsageTotals::default(),
             history_samples: Vec::new(),
         });
-        assert!(state.recovery_requested);
-        state.apply_account_error("account bridge retry failed".into());
-        assert!(state.recovery_requested);
+        assert!(!state.local_usage_pending);
+        assert!(state.history.samples.is_empty());
+        assert!(state.history.pending_store_samples.is_empty());
 
-        state.apply_usage_event(usage_event(Some(80.0), reset_at));
-        assert!(!state.recovery_requested);
+        state.schedule_resident_refresh(now + Duration::from_secs(4));
+        assert!(local_commands.try_recv().is_err());
+        state.schedule_resident_refresh(now + Duration::from_secs(3_601));
+        assert!(matches!(
+            local_commands.try_recv(),
+            Ok(super::LocalCommand::Collect { .. })
+        ));
+        assert!(local_commands.try_recv().is_err());
         let _ = fs::remove_file(db_path);
     }
 
@@ -11418,6 +11789,25 @@ mod tests {
         assert_eq!(state.model_usage, old_usage);
         assert_eq!(state.estimated_cost_label, old_cost);
         assert!(!state.local_usage_error);
+
+        // An account failure invalidates the in-flight generation but must
+        // keep its single physical lane occupied until the stale terminal
+        // event arrives. That event releases the lane without changing data.
+        state.local_usage_pending = true;
+        let stale_epoch = state.auth_epoch;
+        state.apply_account_error("account unavailable".into());
+        assert!(state.local_usage_pending);
+        state.apply_local_usage_success(LocalUsageResult {
+            auth_epoch: stale_epoch,
+            reset_at,
+            window_seconds: WEEK_SECONDS,
+            model_usage: ModelUsageTotals::default(),
+            history_samples: Vec::new(),
+        });
+        assert!(!state.local_usage_pending);
+        assert_eq!(state.history.samples, old_history);
+        assert_eq!(state.model_usage, old_usage);
+        assert_eq!(state.estimated_cost_label, old_cost);
     }
 
     #[test]
@@ -14258,20 +14648,29 @@ mod tests {
     }
 
     #[test]
-    fn run_script_has_one_exec_without_retry_loop() {
+    #[cfg(unix)]
+    fn run_script_syncs_only_the_standard_service_launch_without_retry() {
+        let output = std::process::Command::new("bash")
+            .arg("scripts/test_run_launcher_version_sync.sh")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         let run = include_str!("../run.sh");
-        assert_eq!(run.matches("run --manifest-path").count(), 1);
-        assert!(run.contains("exec \"$CODEX_INFO_CARGO\" run --manifest-path"));
+        assert_eq!(run.matches("build --manifest-path").count(), 1);
+        assert!(run.contains("exec \"$TARGET_BINARY\" \"$@\""));
         assert!(run.contains("$HOME/.cargo/bin/cargo"));
         assert!(run.contains("rustup which cargo"));
         assert!(run.contains("unset WAYLAND_DISPLAY WAYLAND_SOCKET WINIT_X11_SCALE_FACTOR"));
         assert!(!run.contains("export WINIT_X11_SCALE_FACTOR"));
         assert!(run.contains("--release --locked"));
         assert!(run.contains("E_CARGO_NOT_FOUND"));
-        assert!(!run.contains("デーモン"));
-        assert!(!run.contains("Linux/X11版"));
-        assert!(!run.contains("for attempt"));
-        assert!(!run.contains("sleep 1"));
+        assert!(!run.contains("cargo run"));
     }
 
     #[test]
@@ -14582,7 +14981,8 @@ mod tests {
         )
         .unwrap();
         let mut totals = ModelUsageTotals::default();
-        collect_session_file(&path, &mut totals, 0).unwrap();
+        let mut events = Vec::new();
+        collect_session_usage_file(&path, 0, i64::MAX, &mut totals, &mut events).unwrap();
         assert_eq!(totals.luna.tokens, 120);
         assert_eq!(totals.luna.output_tokens, 20);
         let _ = fs::remove_file(path);
@@ -14617,7 +15017,8 @@ mod tests {
         )
         .unwrap();
         let mut totals = ModelUsageTotals::default();
-        collect_session_file(&path, &mut totals, 0).unwrap();
+        let mut events = Vec::new();
+        collect_session_usage_file(&path, 0, i64::MAX, &mut totals, &mut events).unwrap();
         assert_eq!(totals.luna.tokens, 120);
         assert_eq!(totals.luna.output_tokens, 20);
         let _ = fs::remove_file(path);
@@ -14642,11 +15043,19 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         let mut totals = ModelUsageTotals::default();
         totals.luna.tokens = 7;
+        let mut events = Vec::new();
+        events.push(TimedModelUsage {
+            timestamp: 1,
+            model: "gpt-5.6-luna".to_owned(),
+            delta: TokenSnapshot::default(),
+        });
+        let before_events_len = events.len();
         let before = totals.clone();
-        let error = collect_session_file(&path, &mut totals, 0)
+        let error = collect_session_usage_file(&path, 0, i64::MAX, &mut totals, &mut events)
             .expect_err("EOF-incomplete local record must fail closed");
         assert_eq!(error.kind(), security::SecurityErrorKind::Unterminated);
         assert_eq!(totals.luna.tokens, before.luna.tokens);
+        assert_eq!(events.len(), before_events_len);
         let _ = fs::remove_file(path);
     }
 
@@ -14669,11 +15078,19 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         let mut totals = ModelUsageTotals::default();
         totals.luna.tokens = 7;
+        let mut events = Vec::new();
+        events.push(TimedModelUsage {
+            timestamp: 1,
+            model: "gpt-5.6-luna".to_owned(),
+            delta: TokenSnapshot::default(),
+        });
         let before = totals.clone();
-        let error = collect_session_file(&path, &mut totals, 0)
+        let before_events_len = events.len();
+        let error = collect_session_usage_file(&path, 0, i64::MAX, &mut totals, &mut events)
             .expect_err("valid EOF-incomplete local record must fail closed");
         assert_eq!(error.kind(), security::SecurityErrorKind::Unterminated);
         assert_eq!(totals.luna.tokens, before.luna.tokens);
+        assert_eq!(events.len(), before_events_len);
         let _ = fs::remove_file(path);
     }
 
@@ -14700,11 +15117,19 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         let mut totals = ModelUsageTotals::default();
         totals.luna.tokens = 7;
+        let mut events = Vec::new();
+        events.push(TimedModelUsage {
+            timestamp: 1,
+            model: "gpt-5.6-luna".to_owned(),
+            delta: TokenSnapshot::default(),
+        });
         let before = totals.clone();
-        let error = collect_session_file(&path, &mut totals, 0)
+        let before_events_len = events.len();
+        let error = collect_session_usage_file(&path, 0, i64::MAX, &mut totals, &mut events)
             .expect_err("oversized EOF-incomplete local record must fail closed");
         assert_eq!(error.kind(), security::SecurityErrorKind::Unterminated);
         assert_eq!(totals.luna.tokens, before.luna.tokens);
+        assert_eq!(events.len(), before_events_len);
         let _ = fs::remove_file(path);
     }
 
@@ -14748,9 +15173,124 @@ mod tests {
         )
         .unwrap();
         let mut totals = ModelUsageTotals::default();
-        collect_session_file(&path, &mut totals, 0).unwrap();
+        let mut events = Vec::new();
+        collect_session_usage_file(&path, 0, i64::MAX, &mut totals, &mut events).unwrap();
         assert_eq!(totals.sol.tokens, 150);
         assert_eq!(totals.sol.output_tokens, 30);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn local_collector_skips_unchanged_inputs_and_rescans_an_append() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-local-input-cache-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let session = root.join("cache.jsonl");
+        let now = Utc::now();
+        let context = json!({
+            "timestamp": now.to_rfc3339(),
+            "type": "turn_context",
+            "model": "gpt-5.6-luna"
+        });
+        let first_tokens = json!({
+            "timestamp": now.to_rfc3339(),
+            "type": "token_count",
+            "payload": {"info": {"total_token_usage": {
+                "total_tokens": 120, "input_tokens": 100,
+                "cached_input_tokens": 80, "output_tokens": 20
+            }}}
+        });
+        fs::write(&session, format!("{context}\n{first_tokens}\n")).unwrap();
+        let reset_at = now.timestamp() + 3_600;
+        let mut cache = LocalUsageCache::default();
+
+        let first_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let (first_totals, first_history) = cache
+            .collect(reset_at, WEEK_SECONDS, first_inventory)
+            .unwrap();
+        assert_eq!(first_totals.luna.tokens, 120);
+        assert!(!first_history.is_empty());
+
+        let unchanged_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let (unchanged_totals, unchanged_history) = cache
+            .collect(reset_at, WEEK_SECONDS, unchanged_inventory)
+            .unwrap();
+        assert_eq!(unchanged_totals.luna.tokens, 120);
+        assert!(unchanged_history.is_empty());
+
+        let next_tokens = json!({
+            "timestamp": now.to_rfc3339(),
+            "type": "token_count",
+            "payload": {"info": {"total_token_usage": {
+                "total_tokens": 240, "input_tokens": 200,
+                "cached_input_tokens": 160, "output_tokens": 40
+            }}}
+        });
+        let mut append = fs::OpenOptions::new().append(true).open(&session).unwrap();
+        writeln!(append, "{next_tokens}").unwrap();
+        drop(append);
+        let changed_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let (changed_totals, changed_history) = cache
+            .collect(reset_at, WEEK_SECONDS, changed_inventory)
+            .unwrap();
+        assert_eq!(changed_totals.luna.tokens, 240);
+        assert!(!changed_history.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn one_session_pass_keeps_current_totals_beyond_the_timeline_end() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-info-session-sink-boundary-{}.jsonl",
+            std::process::id()
+        ));
+        let lines = [
+            json!({
+                "timestamp": "2026-08-11T10:00:00Z",
+                "type": "turn_context",
+                "model": "gpt-5.6-sol"
+            }),
+            json!({
+                "timestamp": "2026-08-11T10:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"total_token_usage": {
+                    "total_tokens": 100, "input_tokens": 80,
+                    "cached_input_tokens": 20, "output_tokens": 20
+                }}}
+            }),
+            json!({
+                "timestamp": "2026-08-11T10:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"total_token_usage": {
+                    "total_tokens": 150, "input_tokens": 120,
+                    "cached_input_tokens": 30, "output_tokens": 30
+                }}}
+            }),
+        ];
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(|line| serde_json::to_string(line).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let timeline_end = chrono::DateTime::parse_from_rfc3339("2026-08-11T10:00:01Z")
+            .unwrap()
+            .timestamp();
+        let mut totals = ModelUsageTotals::default();
+        let mut events = Vec::new();
+
+        collect_session_usage_file(&path, 0, timeline_end, &mut totals, &mut events).unwrap();
+
+        assert_eq!(totals.sol.tokens, 150);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].delta.total, 100);
         let _ = fs::remove_file(path);
     }
 
@@ -14813,7 +15353,8 @@ mod tests {
         )
         .unwrap();
         let mut totals = ModelUsageTotals::default();
-        collect_session_file(&path, &mut totals, 0).unwrap();
+        let mut events = Vec::new();
+        collect_session_usage_file(&path, 0, i64::MAX, &mut totals, &mut events).unwrap();
         assert_eq!(totals.luna.tokens, 150);
         assert_eq!(totals.sol.tokens, 50);
         let _ = fs::remove_file(path);
@@ -14978,7 +15519,7 @@ mod tests {
     }
 
     #[test]
-    fn record_preserves_alias_quota_collision_for_canonical_rejection() {
+    fn record_preserves_alias_quota_collision_while_public_history_omits_the_minute() {
         let mut history = UsageHistory::default();
         let base_reset = 2_000_000_i64;
         history.record(UsageHistorySample::new(
@@ -15000,13 +15541,13 @@ mod tests {
         let selected = history.samples_for_reset(Some(base_reset));
         assert!(selected.is_empty());
         assert_eq!(
-            canonicalize_public_history_samples(&history.samples),
-            Err(super::HistoryCanonicalizationError::ConflictingQuota)
+            canonicalize_public_history_samples(&history.samples).unwrap(),
+            Vec::<UsageHistorySample>::new()
         );
     }
 
     #[test]
-    fn same_timestamp_reset_drift_above_jitter_fails_closed() {
+    fn same_timestamp_reset_drift_with_conflicting_quota_omits_only_that_minute() {
         let reset_at = 2_000_000_i64;
         let history = UsageHistory {
             samples: vec![
@@ -15038,8 +15579,8 @@ mod tests {
         let selected = history.samples_for_reset(Some(reset_at));
         assert!(selected.is_empty());
         assert_eq!(
-            canonicalize_public_history_samples(&history.samples),
-            Err(super::HistoryCanonicalizationError::ConflictingQuota)
+            canonicalize_public_history_samples(&history.samples).unwrap(),
+            Vec::<UsageHistorySample>::new()
         );
     }
 
@@ -15072,8 +15613,8 @@ mod tests {
 
         assert_eq!(history.samples, [first, second]);
         assert_eq!(
-            canonicalize_public_history_samples(&history.samples),
-            Err(super::HistoryCanonicalizationError::NonComparableCumulativeUsage)
+            canonicalize_public_history_samples(&history.samples).unwrap(),
+            Vec::<UsageHistorySample>::new()
         );
         assert!(history.samples_for_reset(Some(reset_at)).is_empty());
     }
@@ -15138,8 +15679,8 @@ mod tests {
             .filter(|sample| sample.timestamp == timestamp)
             .any(|sample| (sample.remaining_percent - 14.0).abs() < f64::EPSILON));
         assert_eq!(
-            canonicalize_public_history_samples(&history.samples),
-            Err(super::HistoryCanonicalizationError::ConflictingQuota)
+            canonicalize_public_history_samples(&history.samples).unwrap(),
+            Vec::<UsageHistorySample>::new()
         );
         let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
@@ -15293,6 +15834,24 @@ mod tests {
                     "reasoning_tokens": 1
                 }),
                 json!({
+                    "timestamp": 180,
+                    "thread_id": "split-thread",
+                    "model": "gpt-5.6-luna",
+                    "input_tokens": 9,
+                    "cached_input_tokens": 1,
+                    "output_tokens": 1,
+                    "reasoning_tokens": 0
+                }),
+                json!({
+                    "timestamp": 120,
+                    "thread_id": "split-thread",
+                    "model": "gpt-5.6-luna",
+                    "input_tokens": 3,
+                    "cached_input_tokens": 1,
+                    "output_tokens": 1,
+                    "reasoning_tokens": 0
+                }),
+                json!({
                     "timestamp": 150,
                     "thread_id": "unknown-thread",
                     "model": "gpt-5.6-unknown",
@@ -15332,15 +15891,37 @@ mod tests {
             ],
         );
 
-        let entries = read_recovery_entries(&path, 100, 200);
-        assert_eq!(entries.len(), 2);
+        let (total_entries, timeline_entries) =
+            read_recovery_entries_for_ranges(&path, 100, 200, 150);
+        assert_eq!(
+            total_entries
+                .iter()
+                .map(|entry| entry.timestamp)
+                .collect::<Vec<_>>(),
+            vec![100, 200, 180]
+        );
+        assert_eq!(
+            timeline_entries
+                .iter()
+                .map(|entry| entry.timestamp)
+                .collect::<Vec<_>>(),
+            vec![100, 120]
+        );
         let mut totals = ModelUsageTotals::default();
-        add_recovery_usage(Some(&path), 100, 200, &mut totals);
-        assert_eq!(totals.luna.tokens, 130);
-        assert_eq!(totals.luna.input_tokens, 100);
-        assert_eq!(totals.luna.cached_input_tokens, 25);
-        assert_eq!(totals.luna.output_tokens, 30);
+        let mut events = Vec::new();
+        collect_recovery_usage(Some(&path), 100, 200, 150, &mut totals, &mut events);
+        assert_eq!(totals.luna.tokens, 140);
+        assert_eq!(totals.luna.input_tokens, 109);
+        assert_eq!(totals.luna.cached_input_tokens, 26);
+        assert_eq!(totals.luna.output_tokens, 31);
         assert_eq!(totals.sol.tokens, 12);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.timestamp)
+                .collect::<Vec<_>>(),
+            vec![100, 120]
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -15370,7 +15951,9 @@ mod tests {
             ],
         );
 
-        let events = recovery_timed_usage(&path, 120, 180);
+        let mut totals = ModelUsageTotals::default();
+        let mut events = Vec::new();
+        collect_recovery_usage(Some(&path), 120, 180, 180, &mut totals, &mut events);
         let samples = model_usage_timeline_from_events(events, 240);
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].timestamp, 120);
@@ -15800,10 +16383,10 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_missing_quota_row_at_a_spend_timestamp_is_not_a_period() {
-        // Raw inventory is shape-neutral. A same-minute row assigned to a
-        // different cycle makes the complete public candidate ambiguous, so
-        // it cannot become a published history period.
+    fn model_only_reset_fragment_at_a_spend_minute_has_no_period_authority() {
+        // Raw inventory is shape-neutral. A model-only reset group that
+        // overlaps a quota-observed cycle is backfill, not evidence of a
+        // second public period.
         let timestamp = 1_787_350_620;
         let spend_reset = 1_787_835_664;
         let ambiguous_reset = 1_787_919_479;
@@ -15836,10 +16419,155 @@ mod tests {
 
         assert_eq!(history.samples.len(), 2);
         assert_eq!(history.periods(timestamp + 60, None).len(), 2);
+        let canonical = canonicalize_public_history_samples(&history.samples).unwrap();
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].timestamp, timestamp);
+        assert_eq!(canonical[0].reset_at, spend_reset);
+        assert!((canonical[0].remaining_percent - 88.0).abs() < f64::EPSILON);
+        assert!((canonical[0].terra_dollars - 30.5).abs() < f64::EPSILON);
+        assert!((canonical[0].luna_dollars - 6.3).abs() < f64::EPSILON);
+        assert_eq!(history.samples.len(), 2, "raw history remains unchanged");
+    }
+
+    #[test]
+    fn canonicalizer_assigns_a_shared_boundary_minute_to_the_continuing_cycle() {
+        let boundary_minute = 1_788_143_280;
+        let old_reset = 1_788_644_950;
+        let new_reset = 1_788_748_119;
+        let rows = vec![
+            UsageHistorySample::new_with_usage(
+                boundary_minute - 60,
+                old_reset,
+                14.0,
+                ModelDollarTotals {
+                    sol: 399.5,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 502_896_759,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                boundary_minute,
+                old_reset,
+                14.0,
+                ModelDollarTotals {
+                    sol: 400.5,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 504_255_060,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::from_model_history_with_usage(
+                boundary_minute,
+                new_reset,
+                ModelDollarTotals {
+                    sol: 0.42,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 569_933,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                boundary_minute + 60,
+                new_reset,
+                100.0,
+                ModelDollarTotals {
+                    sol: 1.1,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 1_544_333,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+        ];
+
+        let canonical = canonicalize_public_history_samples(&rows).unwrap();
+
+        assert_eq!(canonical.len(), 3);
+        assert!(canonical.iter().any(|sample| {
+            sample.timestamp == boundary_minute - 60 && sample.reset_at == old_reset
+        }));
+        let boundary = canonical
+            .iter()
+            .find(|sample| sample.timestamp == boundary_minute)
+            .expect("new cycle owns the shared boundary minute");
+        assert_eq!(boundary.reset_at, new_reset);
+        assert!((boundary.sol_dollars - 0.42).abs() < f64::EPSILON);
+        assert_eq!(rows.len(), 4, "raw history remains unchanged");
+    }
+
+    #[test]
+    fn canonicalizer_excludes_reset_fragments_without_period_authority() {
+        let start = 1_788_000_000;
+        let old_reset = 1_788_600_000;
+        let embedded_reset = old_reset + 80_000;
+        let backfill_reset = old_reset + 120_000;
+        let new_reset = old_reset + 180_000;
+        let mut rows = [0, 60, 120, 180, 240]
+            .into_iter()
+            .map(|offset| {
+                UsageHistorySample::new(
+                    start + offset,
+                    old_reset,
+                    80.0,
+                    ModelDollarTotals {
+                        sol: 1.0 + offset as f64 / 60.0,
+                        ..ModelDollarTotals::default()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.push(UsageHistorySample::new(
+            start + 120,
+            embedded_reset,
+            14.0,
+            ModelDollarTotals::default(),
+        ));
+        rows.extend([180, 240].map(|offset| {
+            UsageHistorySample::from_model_history(
+                start + offset,
+                backfill_reset,
+                ModelDollarTotals {
+                    sol: 10.0,
+                    ..ModelDollarTotals::default()
+                },
+            )
+        }));
+        rows.extend([240, 300].map(|offset| {
+            UsageHistorySample::new(
+                start + offset,
+                new_reset,
+                100.0,
+                ModelDollarTotals {
+                    sol: offset as f64 / 60.0,
+                    ..ModelDollarTotals::default()
+                },
+            )
+        }));
+
+        let canonical = canonicalize_public_history_samples(&rows).unwrap();
+
+        assert!(canonical.iter().all(
+            |sample| matches!(sample.reset_at, value if value == old_reset || value == new_reset)
+        ));
+        assert!(canonical.iter().all(|sample| {
+            sample.reset_at != embedded_reset && sample.reset_at != backfill_reset
+        }));
         assert_eq!(
-            canonicalize_public_history_samples(&history.samples),
-            Err(super::HistoryCanonicalizationError::MultipleCyclesInMinute)
+            canonical
+                .iter()
+                .find(|sample| sample.timestamp == start + 240)
+                .map(|sample| sample.reset_at),
+            Some(new_reset)
         );
+        assert_eq!(rows.len(), 10, "raw history remains unchanged");
     }
 
     #[test]
@@ -16233,7 +16961,7 @@ mod tests {
     }
 
     #[test]
-    fn history_canonicalizer_rejects_conflict_noncomparable_and_cross_partition_minutes() {
+    fn history_canonicalizer_omits_ambiguous_values_and_rejects_cross_partition_minutes() {
         let base = UsageHistorySample {
             timestamp: 1_788_040_140,
             reset_at: 1_788_644_929,
@@ -16249,8 +16977,8 @@ mod tests {
         quota_conflict.reset_at += 20;
         quota_conflict.remaining_percent = 40.0;
         assert_eq!(
-            canonicalize_public_history_samples(&[base.clone(), quota_conflict]),
-            Err(super::HistoryCanonicalizationError::ConflictingQuota)
+            canonicalize_public_history_samples(&[base.clone(), quota_conflict]).unwrap(),
+            Vec::<UsageHistorySample>::new()
         );
 
         let mut noncomparable = base.clone();
@@ -16260,8 +16988,8 @@ mod tests {
         noncomparable.sol_tokens = 100;
         noncomparable.terra_tokens = 0;
         assert_eq!(
-            canonicalize_public_history_samples(&[base.clone(), noncomparable]),
-            Err(super::HistoryCanonicalizationError::NonComparableCumulativeUsage)
+            canonicalize_public_history_samples(&[base.clone(), noncomparable]).unwrap(),
+            Vec::<UsageHistorySample>::new()
         );
 
         let mut other_partition = base.clone();
@@ -16430,17 +17158,22 @@ mod tests {
         let mut conflict = invalid[2].clone();
         conflict.reset_at += 1;
         conflict.remaining_percent = 99.0;
+        let conflict_timestamp = conflict.timestamp;
         invalid.push(conflict);
         producer.history.samples = invalid;
-        assert_eq!(
-            producer.public_details_candidate_at(oracle_a.observed_at.unwrap()),
-            Err(super::HistoryCanonicalizationError::ConflictingQuota)
-        );
-        let (wire_pair_last_good, wire_last_good) =
+        let isolated = producer
+            .public_details_candidate_at(oracle_a.observed_at.unwrap())
+            .expect("one ambiguous history minute does not block the complete root");
+        assert!(isolated
+            .history_samples
+            .iter()
+            .all(|sample| sample.timestamp != conflict_timestamp));
+        server.publisher().publish_details(isolated).unwrap();
+        let (wire_pair_isolated, wire_isolated) =
             fetch_service_details(server.local_addr()).unwrap();
-        assert_eq!(wire_pair_last_good, wire_pair_a);
-        assert!(!ui_root
-            .apply_service_details(wire_pair_last_good, wire_last_good)
+        assert_ne!(wire_pair_isolated, wire_pair_a);
+        assert!(ui_root
+            .apply_service_details(wire_pair_isolated, wire_isolated)
             .unwrap());
         assert_eq!(ui_root.remaining_percent, Some(100.0));
         assert_eq!(ui_root.active_threads[0].id, "thread-a");
@@ -17695,7 +18428,7 @@ mod tests {
     }
 
     #[test]
-    fn moving_reset_collision_at_30_and_60_seconds_fails_closed() {
+    fn moving_reset_collision_at_30_and_60_seconds_omits_only_the_conflicting_minute() {
         for drift in [30_i64, 60_i64] {
             let base_reset = 2_000_000_i64;
             let history = UsageHistory {
@@ -17732,11 +18465,23 @@ mod tests {
                 ],
                 ..UsageHistory::default()
             };
-            let selected = history.samples_for_reset(Some(base_reset + drift + 30));
-            assert!(selected.is_empty(), "drift={drift}");
+            let expected = vec![UsageHistorySample::new(
+                960_060,
+                base_reset + drift + 30,
+                87.0,
+                ModelDollarTotals {
+                    sol: 2.0,
+                    ..ModelDollarTotals::default()
+                },
+            )];
             assert_eq!(
-                canonicalize_public_history_samples(&history.samples),
-                Err(super::HistoryCanonicalizationError::ConflictingQuota),
+                history.samples_for_reset(Some(base_reset + drift + 30)),
+                expected,
+                "drift={drift}"
+            );
+            assert_eq!(
+                canonicalize_public_history_samples(&history.samples).unwrap(),
+                expected,
                 "drift={drift}"
             );
         }
