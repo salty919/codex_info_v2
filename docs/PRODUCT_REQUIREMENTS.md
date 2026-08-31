@@ -107,6 +107,8 @@
   公開jobだけをversion tag単位で直列化し、lock取得後にPR/final head、全attempt、candidate、tag、Release、assetsを1回再取得する。
   tagとReleaseがともに不存在の場合だけDraftを作って2資産をupload後に公開し、完全一致のpublished状態だけを成功済みno-opとする。
   orphan tag、Releaseだけの存在、Draft、partial、targetまたはasset不一致は自動修復せず失敗し、自動retry・cleanupを行わない。
+  Release mutationだけはcurrent repository限定の短命GitHub App installation token（Contents write / Workflows write）を使い、
+  解決、lock後再検証、artifact取得はread-onlyの組み込みtokenを使う。
 - PR由来のcheckout、script、workflow、artifactを、repository contents・checks・Releaseへのwrite権限を持つjobで実行しない。
   write権限を持つ採番jobはtrusted baseだけをcheckout・実行し、PR headはGit object dataとしてだけ読む。
   same-repository headへexact 1 commitをnon-force pushし、競合pushはGit自身のnon-fast-forward拒否に任せてreadbackやretryを行わない。
