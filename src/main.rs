@@ -9053,6 +9053,7 @@ fn service_health_response_version(response: &[u8]) -> Option<ServiceHealthVersi
     }
 }
 
+#[cfg(test)]
 fn is_service_health_response(response: &[u8]) -> bool {
     service_health_response_version(response) == Some(ServiceHealthVersion::Current)
 }
