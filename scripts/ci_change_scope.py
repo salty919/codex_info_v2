@@ -31,6 +31,8 @@ LINUX_BACKEND_EXACT = frozenset(
         "scripts/db_protection_e2e.sh",
         "scripts/install_systemd_recorder.sh",
         "scripts/record_daemon_e2e.sh",
+        "scripts/build_linux_bundle.sh",
+        "scripts/test_linux_bundle.sh",
     }
 )
 LINUX_UI_EXACT = frozenset(

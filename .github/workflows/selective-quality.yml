@@ -113,6 +113,17 @@ jobs:
       contents: read
       security-events: write
 
+  linux-distribution:
+    name: linux-distribution
+    if: fromJSON(inputs.selection_json).binary_impact == true
+    uses: ./.github/workflows/linux-distribution.yml
+    with:
+      source_sha: ${{ inputs.source_sha }}
+      pr_number: ${{ inputs.pr_number }}
+      release_candidate: ${{ inputs.release_candidate }}
+    permissions:
+      contents: read
+
   selected-quality:
     name: selected-quality
     if: always()
@@ -123,6 +134,7 @@ jobs:
       - linux-ui-quality
       - windows-quality
       - codeql-quality
+      - linux-distribution
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
