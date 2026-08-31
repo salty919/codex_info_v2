@@ -28,7 +28,7 @@ chmod 700 "$temp_root/runtime"
 env HOME="$temp_root/home" XDG_CONFIG_HOME="$temp_root/config" XDG_DATA_HOME="$temp_root/data" XDG_CACHE_HOME="$temp_root/cache" XDG_STATE_HOME="$temp_root/state" XDG_RUNTIME_DIR="$temp_root/runtime" CODEX_INFO_PREVIEW=startup-loading CODEX_INFO_PREVIEW_SIZE=900x480 "$binary" --ui >"$temp_root/client.log" 2>&1 &
 preview_pid="$!"
 window_id=""
-for _ in $(seq 1 80); do
+for startup_attempt in $(seq 1 80); do
     while read -r candidate; do
         window_pid="$(xprop -id "$candidate" _NET_WM_PID 2>/dev/null | awk -F'= ' '{print $2}' | tr -d '[:space:]')"
         if [[ "$window_pid" == "$preview_pid" ]]; then window_id="$candidate"; break; fi
@@ -48,8 +48,8 @@ window_height="$(awk '/Height:/ {print $2; exit}' <<<"$window_geometry")"
 [[ "$root_width" =~ ^[0-9]+$ && "$root_height" =~ ^[0-9]+$ && "$window_x" =~ ^-?[0-9]+$ && "$window_y" =~ ^-?[0-9]+$ && "$window_width" =~ ^[0-9]+$ && "$window_height" =~ ^[0-9]+$ ]] || fail 'window geometry could not be read'
 (( window_x >= 0 && window_y >= 0 && window_x + window_width <= root_width && window_y + window_height <= root_height )) ||
     fail "startup window is outside the visible X11 desktop: ${window_x},${window_y} ${window_width}x${window_height} on ${root_width}x${root_height}"
-xwd -silent -id "$window_id" -out "$temp_root/startup.xwd"
-python3 - "$temp_root/startup.xwd" <<'PY'
+validate_startup_image() {
+python3 - "$1" <<'PY'
 import struct, sys
 from math import sqrt
 data = open(sys.argv[1], 'rb').read()
@@ -66,11 +66,13 @@ def near(a, b, tolerance=20):
     return sqrt(sum((a[i] - b[i]) ** 2 for i in range(3))) <= tolerance
 header_pixels = [(x, y) for y in range(14, 48) for x in range(12, 420) if min(rgb(x, y)) > 150]
 if len(header_pixels) < 80:
-    raise SystemExit(f'header/version pixels missing: {len(header_pixels)}')
+    print(f'header/version pixels missing: {len(header_pixels)}', file=sys.stderr)
+    raise SystemExit(75)
 canvas = rgb(10, 100)
 center_pixels = [(x, y) for y in range(190, 300) for x in range(330, 570) if not near(rgb(x, y), canvas, 8)]
 if len(center_pixels) < 20:
-    raise SystemExit(f'center spinner/status missing: {len(center_pixels)}')
+    print(f'center spinner/status missing: {len(center_pixels)}', file=sys.stderr)
+    raise SystemExit(75)
 # The chrome and status text legitimately contain a few quota-blue pixels.  A
 # rendered payload, however, contains a connected horizontal gauge/series in
 # the content area.  Detect that observable shape instead of rejecting
@@ -102,6 +104,25 @@ if largest[1] >= 100 and largest[0] >= 100:
     raise SystemExit(f'partial quota payload leaked: component area={largest[0]} width={largest[1]} height={largest[2]}')
 print('x11-startup-visual-gate: PASS (900x480, header/version visible, centered spinner visible, partial payload hidden)')
 PY
+}
+startup_frame_ready=0
+for _ in $(seq 1 "$((81 - startup_attempt))"); do
+    if xwd -silent -id "$window_id" -out "$temp_root/startup.xwd" 2>/dev/null; then
+        if validate_startup_image "$temp_root/startup.xwd" >"$temp_root/startup-check.out" 2>"$temp_root/startup-check.err"; then
+            cat "$temp_root/startup-check.out"
+            startup_frame_ready=1
+            break
+        elif (( $? != 75 )); then
+            cat "$temp_root/startup-check.err" >&2
+            fail 'startup preview violated its visual contract'
+        fi
+    fi
+    sleep 0.125
+done
+if (( startup_frame_ready != 1 )); then
+    [[ ! -s "$temp_root/startup-check.err" ]] || cat "$temp_root/startup-check.err" >&2
+    fail 'startup preview did not produce a complete rendered frame'
+fi
 
 # X-START-05: the UI and its service must use the same selected endpoint.
 # Occupy an ephemeral loopback port with a non-codex HTTP listener. The GUI
@@ -122,7 +143,7 @@ done
 env HOME="$temp_root/home" XDG_CONFIG_HOME="$temp_root/config" XDG_DATA_HOME="$temp_root/data" XDG_CACHE_HOME="$temp_root/cache" XDG_STATE_HOME="$temp_root/state" XDG_RUNTIME_DIR="$temp_root/runtime" "$binary" --ui --port "$blocked_port" >"$temp_root/failure-client.log" 2>&1 &
 failure_pid="$!"
 failure_window_id=""
-for _ in $(seq 1 120); do
+for failure_attempt in $(seq 1 120); do
     while read -r candidate; do
         window_pid="$(xprop -id "$candidate" _NET_WM_PID 2>/dev/null | awk -F'= ' '{print $2}' | tr -d '[:space:]')"
         if [[ "$window_pid" == "$failure_pid" ]]; then failure_window_id="$candidate"; break; fi
@@ -131,10 +152,8 @@ for _ in $(seq 1 120); do
     sleep 0.125
 done
 [[ -n "$failure_window_id" ]] || { sed -n '1,120p' "$temp_root/failure-client.log" >&2 || true; fail 'failure-port GUI did not render'; }
-sleep 1
-kill -0 "$failure_pid" 2>/dev/null || fail 'failure-port GUI exited after rendering'
-xwd -silent -id "$failure_window_id" -out "$temp_root/failure.xwd"
-python3 - "$temp_root/failure.xwd" <<'PY'
+validate_failure_image() {
+python3 - "$1" <<'PY'
 import struct, sys
 from math import sqrt
 data = open(sys.argv[1], 'rb').read()
@@ -160,8 +179,31 @@ cta_pixels = sum(
     for x in range(35, 430)
 )
 if failure_pixels < 20:
-    raise SystemExit(f'selected-endpoint failure text is missing: pixels={failure_pixels}')
+    print(f'selected-endpoint failure text is missing: pixels={failure_pixels}', file=sys.stderr)
+    raise SystemExit(75)
 if cta_pixels < 500:
-    raise SystemExit(f'failure recovery action is missing: pixels={cta_pixels}')
+    print(f'failure recovery action is missing: pixels={cta_pixels}', file=sys.stderr)
+    raise SystemExit(75)
 print(f'x11-startup-failure-port-gate: PASS (window retained, selected-endpoint failure pixels={failure_pixels}, recovery pixels={cta_pixels})')
 PY
+}
+failure_frame_ready=0
+for _ in $(seq 1 "$((121 - failure_attempt))"); do
+    kill -0 "$failure_pid" 2>/dev/null || fail 'failure-port GUI exited before rendering'
+    if xwd -silent -id "$failure_window_id" -out "$temp_root/failure.xwd" 2>/dev/null; then
+        if validate_failure_image "$temp_root/failure.xwd" >"$temp_root/failure-check.out" 2>"$temp_root/failure-check.err"; then
+            cat "$temp_root/failure-check.out"
+            failure_frame_ready=1
+            break
+        elif (( $? != 75 )); then
+            cat "$temp_root/failure-check.err" >&2
+            fail 'failure-port GUI violated its visual contract'
+        fi
+    fi
+    sleep 0.125
+done
+if (( failure_frame_ready != 1 )); then
+    [[ ! -s "$temp_root/failure-check.err" ]] || cat "$temp_root/failure-check.err" >&2
+    fail 'failure-port GUI did not produce a complete rendered frame'
+fi
+kill -0 "$failure_pid" 2>/dev/null || fail 'failure-port GUI exited after rendering'

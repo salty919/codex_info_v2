@@ -2111,8 +2111,10 @@ export component AuthPanel inherits Rectangle {
     in property <bool> checking;
     in property <string> status;
     in property <bool> has-error;
+    in property <bool> service-unavailable;
     callback begin-auth();
     callback check-auth();
+    callback retry();
     height: 232px;
     border-radius: DesignTokens.radius-surface;
     border-width: 1px;
@@ -2147,16 +2149,24 @@ export component AuthPanel inherits Rectangle {
         x: 24px;
         y: 100px;
         width: 168px;
-        text: has-auth-url ? root.strings.open-auth-page : root.strings.start-auth;
+        text: root.service-unavailable ? root.strings.retry :
+            has-auth-url ? root.strings.open-auth-page : root.strings.start-auth;
         enabled: !checking;
         primary: true;
-        clicked => { root.begin-auth(); }
+        clicked => {
+            if (root.service-unavailable) {
+                root.retry();
+            } else {
+                root.begin-auth();
+            }
+        }
     }
     ActionButton {
         x: 204px;
         y: 100px;
         width: 154px;
         text: checking ? root.strings.checking : root.strings.check-auth;
+        visible: !root.service-unavailable;
         enabled: !checking;
         primary: false;
         clicked => { root.check-auth(); }

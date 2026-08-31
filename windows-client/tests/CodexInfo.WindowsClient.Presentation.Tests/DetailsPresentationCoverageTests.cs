@@ -376,23 +376,8 @@ public sealed class DetailsPresentationCoverageTests
 
     private static async Task<MainWindowViewModel> StartMainAsync(ApiDetailsSnapshot details)
     {
-        var status = new ApiStatusSnapshot(
-            ApiState.Ready,
-            details.ObservedAt,
-            details.Authenticated,
-            details.PlanLabel,
-            details.Quota,
-            details.Models.Select(model => new ApiModelUsage(
-                model.Name,
-                model.InputTokens,
-                model.CachedInputTokens,
-                model.OutputTokens)).ToArray(),
-            details.ActiveThreadCount)
-        {
-            PublishedPair = details.PublishedPair,
-        };
         var main = new MainWindowViewModel(
-            new StaticStatusClient(StatusFetchResult.Success(status)),
+            new StaticCombinedClient(DetailsFetchResult.Success(details)),
             new StaticDetailsClient(DetailsFetchResult.Success(details)));
         main.Start();
         await EventuallyAsync(() => main.HasDetails);
@@ -437,9 +422,9 @@ public sealed class DetailsPresentationCoverageTests
         }
     }
 
-    private sealed class StaticStatusClient(StatusFetchResult result) : HealthyStatusClientBase
+    private sealed class StaticCombinedClient(DetailsFetchResult result) : HealthyDetailsClientBase
     {
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(result);
     }
 

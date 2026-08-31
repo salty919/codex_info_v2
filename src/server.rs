@@ -8,7 +8,7 @@
 //! snapshot into [`ApiSnapshotPublisher`]; HTTP handlers only read that copy.
 
 use crate::security;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
 use std::fmt;
@@ -51,7 +51,7 @@ const REQUEST_HEADER_DEADLINE: Duration = Duration::from_secs(3);
 const REQUEST_READ_POLL: Duration = Duration::from_millis(100);
 
 /// The public availability of the monitor data. No error detail is exported.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicState {
     #[default]
@@ -62,7 +62,8 @@ pub enum PublicState {
 }
 
 /// Quota values safe for the intranet monitoring client.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicQuota {
     pub remaining_percent: f64,
     pub reset_at: i64,
@@ -70,19 +71,9 @@ pub struct PublicQuota {
     pub monthly: bool,
 }
 
-/// Per-model usage values. `input_tokens` excludes cached input tokens.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct PublicModelUsage {
-    pub name: String,
-    pub input_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub output_tokens: u64,
-}
-
-/// Detailed per-model usage for `/v1/details`. The legacy `/v1/status`
-/// response intentionally continues to use [`PublicModelUsage`] so adding
-/// pricing fields cannot change its strict schema.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+/// Per-model usage values published by `/v1/details`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicDetailedModelUsage {
     pub name: String,
     pub input_tokens: u64,
@@ -93,7 +84,8 @@ pub struct PublicDetailedModelUsage {
     pub output_dollars: f64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicHistoryPeriod {
     pub id: String,
     pub start_at: i64,
@@ -106,7 +98,8 @@ pub struct PublicHistoryPeriod {
     pub current: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicHistorySample {
     pub timestamp: i64,
     pub reset_at: i64,
@@ -120,7 +113,8 @@ pub struct PublicHistorySample {
     pub luna_tokens: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicHistoryGap {
     pub gap_id: String,
     pub reset_at: i64,
@@ -129,7 +123,8 @@ pub struct PublicHistoryGap {
     pub reason: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicThread {
     pub id: String,
     pub title: String,
@@ -145,25 +140,11 @@ pub struct PublicThread {
     pub depth: Option<i32>,
 }
 
-/// Immutable data that may cross the REST trust boundary.
-///
+/// The sole immutable data document that may cross the REST trust boundary.
 /// Do not add account email, authentication URLs, filesystem locations, raw
 /// backend errors, or secrets to this type.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
-pub struct PublicSnapshot {
-    pub state: PublicState,
-    pub observed_at: Option<i64>,
-    pub authenticated: bool,
-    pub plan_label: Option<String>,
-    pub quota: Option<PublicQuota>,
-    pub models: Vec<PublicModelUsage>,
-    pub active_thread_count: u64,
-}
-
-/// The additive `/v1/details` document. The scalar fields intentionally mirror
-/// the legacy status document while model rows carry the additional pricing
-/// columns needed by the Windows client.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicDetails {
     pub state: PublicState,
     pub observed_at: Option<i64>,
@@ -199,58 +180,29 @@ impl Default for PublicDetails {
 }
 
 impl PublicDetails {
-    /// Build an additive document from a legacy snapshot for callers that have
-    /// not opted into detailed publication yet. The resulting detail rows are
-    /// still schema-valid; pricing is zero because it was not supplied.
-    fn from_snapshot(snapshot: &PublicSnapshot) -> Self {
-        Self {
-            state: snapshot.state,
-            observed_at: snapshot.observed_at,
-            authenticated: snapshot.authenticated,
-            plan_label: snapshot.plan_label.clone(),
-            quota: snapshot.quota.clone(),
-            models: snapshot
-                .models
-                .iter()
-                .map(|model| PublicDetailedModelUsage {
-                    name: model.name.clone(),
-                    input_tokens: model.input_tokens,
-                    cached_input_tokens: model.cached_input_tokens,
-                    output_tokens: model.output_tokens,
-                    input_dollars: 0.0,
-                    cached_input_dollars: 0.0,
-                    output_dollars: 0.0,
-                })
-                .collect(),
-            active_thread_count: snapshot.active_thread_count,
-            estimated_cost_label: "概算 —".to_owned(),
-            ..Self::default()
+    pub fn validate(&self) -> Result<(), ApiSnapshotError> {
+        if self
+            .observed_at
+            .is_some_and(|timestamp| !valid_timestamp(timestamp))
+        {
+            return Err(ApiSnapshotError::InvalidObservedAt);
         }
-    }
-
-    fn status_snapshot(&self) -> PublicSnapshot {
-        PublicSnapshot {
-            state: self.state,
-            observed_at: self.observed_at,
-            authenticated: self.authenticated,
-            plan_label: self.plan_label.clone(),
-            quota: self.quota.clone(),
-            models: self
-                .models
-                .iter()
-                .map(|model| PublicModelUsage {
-                    name: model.name.clone(),
-                    input_tokens: model.input_tokens,
-                    cached_input_tokens: model.cached_input_tokens,
-                    output_tokens: model.output_tokens,
-                })
-                .collect(),
-            active_thread_count: self.active_thread_count,
+        if let Some(quota) = self.quota.as_ref() {
+            if !quota.remaining_percent.is_finite()
+                || !(0.0..=100.0).contains(&quota.remaining_percent)
+                || !valid_timestamp(quota.reset_at)
+                || quota.window_seconds <= 0
+            {
+                return Err(ApiSnapshotError::InvalidQuota);
+            }
         }
-    }
-
-    fn validate(&self) -> Result<(), ApiSnapshotError> {
-        self.status_snapshot().validate()?;
+        if self
+            .plan_label
+            .as_deref()
+            .is_some_and(|label| !valid_text(label, security::MAX_PLAN_SCALARS))
+        {
+            return Err(ApiSnapshotError::InvalidLabel);
+        }
         if self.history_periods.len() > MAX_PUBLIC_HISTORY_PERIODS {
             return Err(ApiSnapshotError::ListTooLong);
         }
@@ -264,8 +216,11 @@ impl PublicDetails {
             return Err(ApiSnapshotError::ListTooLong);
         }
 
+        let mut model_names = HashSet::with_capacity(self.models.len());
         for model in &self.models {
-            if !valid_non_negative_rate(model.input_dollars)
+            if !matches!(model.name.as_str(), "SOL" | "TERRA" | "LUNA")
+                || !model_names.insert(model.name.as_str())
+                || !valid_non_negative_rate(model.input_dollars)
                 || !valid_non_negative_rate(model.cached_input_dollars)
                 || !valid_non_negative_rate(model.output_dollars)
             {
@@ -316,6 +271,9 @@ impl PublicDetails {
             if !valid_timestamp(sample.timestamp)
                 || sample.timestamp.rem_euclid(60) != 0
                 || !valid_timestamp(sample.reset_at)
+                || self
+                    .observed_at
+                    .is_none_or(|observed_at| sample.timestamp > observed_at)
                 || sample
                     .remaining_percent
                     .is_some_and(|value| !value.is_finite() || !(0.0..=100.0).contains(&value))
@@ -479,44 +437,6 @@ fn valid_lower_hex32(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-impl PublicSnapshot {
-    fn validate(&self) -> Result<(), ApiSnapshotError> {
-        if self
-            .observed_at
-            .is_some_and(|timestamp| !valid_timestamp(timestamp))
-        {
-            return Err(ApiSnapshotError::InvalidObservedAt);
-        }
-        if let Some(quota) = self.quota.as_ref() {
-            if !quota.remaining_percent.is_finite()
-                || !(0.0..=100.0).contains(&quota.remaining_percent)
-                || !valid_timestamp(quota.reset_at)
-                || quota.window_seconds <= 0
-            {
-                return Err(ApiSnapshotError::InvalidQuota);
-            }
-        }
-        if self.models.len() > MAX_PUBLIC_MODELS {
-            return Err(ApiSnapshotError::ListTooLong);
-        }
-        let mut model_names = HashSet::with_capacity(self.models.len());
-        if self.models.iter().any(|model| {
-            !matches!(model.name.as_str(), "SOL" | "TERRA" | "LUNA")
-                || !model_names.insert(model.name.as_str())
-        }) {
-            return Err(ApiSnapshotError::InvalidModel);
-        }
-        if self
-            .plan_label
-            .as_deref()
-            .is_some_and(|label| !valid_text(label, security::MAX_PLAN_SCALARS))
-        {
-            return Err(ApiSnapshotError::InvalidLabel);
-        }
-        Ok(())
-    }
-}
-
 /// A redacted validation error for data that would leave the process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApiSnapshotError {
@@ -557,25 +477,10 @@ impl fmt::Display for ApiSnapshotError {
 impl std::error::Error for ApiSnapshotError {}
 
 #[derive(Serialize)]
-struct StatusResponse<'a> {
-    api_version: &'static str,
-    #[serde(flatten)]
-    snapshot: &'a PublicSnapshot,
-}
-
-#[derive(Serialize)]
 struct DetailsResponse<'a> {
     api_version: &'static str,
     #[serde(flatten)]
     details: &'a PublicDetails,
-}
-
-fn serialize_status(snapshot: &PublicSnapshot) -> Result<Vec<u8>, ApiSnapshotError> {
-    serde_json::to_vec(&StatusResponse {
-        api_version: API_VERSION,
-        snapshot,
-    })
-    .map_err(|_| ApiSnapshotError::Serialization)
 }
 
 fn serialize_details(details: &PublicDetails) -> Result<Vec<u8>, ApiSnapshotError> {
@@ -625,7 +530,6 @@ enum PublishedPairGenerationState {
 
 #[derive(Clone, Debug, PartialEq)]
 struct PublishedSnapshot {
-    status_body: Vec<u8>,
     details_body: Vec<u8>,
     pair: Option<PublishedPair>,
     generation: PublishedPairGenerationState,
@@ -649,16 +553,11 @@ impl PublishedSnapshot {
 
 impl Default for PublishedSnapshot {
     fn default() -> Self {
-        let status = PublicSnapshot::default();
         let details = PublicDetails::default();
-        status
-            .validate()
-            .expect("default status must validate before publication");
         details
             .validate()
             .expect("default details must validate before publication");
         Self {
-            status_body: serialize_status(&status).expect("default status must serialize"),
             details_body: serialize_details(&details).expect("default details must serialize"),
             pair: None,
             generation: PublishedPairGenerationState::Uninitialized,
@@ -692,48 +591,21 @@ impl ApiSnapshotPublisher {
         current.pair.clone()
     }
 
-    /// Replaces the entire public snapshot only after its finite whitelist has
-    /// been validated. The previous snapshot remains available on failure.
-    pub fn publish(&self, snapshot: PublicSnapshot) -> Result<(), ApiSnapshotError> {
-        snapshot.validate()?;
-        let details = PublicDetails::from_snapshot(&snapshot);
-        details.validate()?;
-        let status_body = serialize_status(&snapshot)?;
-        let details_body = serialize_details(&details)?;
-        self.publish_serialized(status_body, details_body)
-            .map(|_| ())
-    }
-
-    /// Atomically publishes the status and all additive details. The status
-    /// projection is derived from the same document, so `/status` and
-    /// `/details` can never observe different account/quota generations.
+    /// Atomically publishes one completely validated details generation.
     pub fn publish_details(&self, details: PublicDetails) -> Result<(), ApiSnapshotError> {
         details.validate()?;
-        let status = details.status_snapshot();
-        let status_body = serialize_status(&status)?;
         let details_body = serialize_details(&details)?;
-        self.publish_serialized(status_body, details_body)
-            .map(|_| ())
+        self.publish_serialized(details_body).map(|_| ())
     }
 
     #[cfg(test)]
-    fn publish_for_test(
-        &self,
-        snapshot: PublicSnapshot,
-    ) -> Result<PublishedPair, ApiSnapshotError> {
-        snapshot.validate()?;
-        let details = PublicDetails::from_snapshot(&snapshot);
+    fn publish_for_test(&self, details: PublicDetails) -> Result<PublishedPair, ApiSnapshotError> {
         details.validate()?;
-        let status_body = serialize_status(&snapshot)?;
         let details_body = serialize_details(&details)?;
-        self.publish_serialized(status_body, details_body)
+        self.publish_serialized(details_body)
     }
 
-    fn publish_serialized(
-        &self,
-        status_body: Vec<u8>,
-        details_body: Vec<u8>,
-    ) -> Result<PublishedPair, ApiSnapshotError> {
+    fn publish_serialized(&self, details_body: Vec<u8>) -> Result<PublishedPair, ApiSnapshotError> {
         let mut current = self
             .snapshot
             .write()
@@ -753,7 +625,6 @@ impl ApiSnapshotPublisher {
         };
         let pair = PublishedPair::from_epoch_counter(epoch, next_counter);
         *current = PublishedSnapshot {
-            status_body,
             details_body,
             pair: Some(pair.clone()),
             generation: PublishedPairGenerationState::Active {
@@ -989,7 +860,6 @@ struct ErrorResponse {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ApiRoute {
     Health,
-    Status,
     Details,
 }
 
@@ -1133,7 +1003,6 @@ fn snapshot_response(snapshot: &SharedSnapshot, route: ApiRoute) -> HttpResponse
         return (503, error_body("snapshot_unavailable"), None);
     }
     let body = match route {
-        ApiRoute::Status => current.status_body.clone(),
         ApiRoute::Details => current.details_body.clone(),
         ApiRoute::Health => return (503, error_body("snapshot_unavailable"), None),
     };
@@ -1168,7 +1037,6 @@ fn handle_connection(
                     (413, error_body("request_body_not_allowed"), None)
                 }
                 Some(ApiRoute::Health) => (200, health_body(), None),
-                Some(ApiRoute::Status) => snapshot_response(&snapshot, ApiRoute::Status),
                 Some(ApiRoute::Details) => snapshot_response(&snapshot, ApiRoute::Details),
             },
             Err(ParseFailure::BadRequest) => (400, error_body("bad_request"), None),
@@ -1387,7 +1255,6 @@ fn classify_target(target: &[u8]) -> Result<Option<ApiRoute>, ParseFailure> {
     }
     Ok(match target {
         b"/v1/health" => Some(ApiRoute::Health),
-        b"/v1/status" => Some(ApiRoute::Status),
         b"/v1/details" => Some(ApiRoute::Details),
         _ => None,
     })
@@ -1524,7 +1391,7 @@ mod tests {
             publisher.published_pair().unwrap().as_str(),
             "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001"
         );
-        publisher.publish(PublicSnapshot::default()).unwrap();
+        publisher.publish_details(PublicDetails::default()).unwrap();
         assert_eq!(
             publisher.published_pair().unwrap().as_str(),
             "v1:00112233445566778899aabbccddeeff00000000000000000000000000000002"
@@ -1539,12 +1406,12 @@ mod tests {
             0xee, 0xff,
         ];
         let publisher = ApiSnapshotPublisher::with_unpublished_epoch_for_test(epoch);
-        publisher.publish(PublicSnapshot::default()).unwrap();
+        publisher.publish_details(PublicDetails::default()).unwrap();
         assert_eq!(
             publisher.published_pair().unwrap().as_str(),
             "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001"
         );
-        publisher.publish(PublicSnapshot::default()).unwrap();
+        publisher.publish_details(PublicDetails::default()).unwrap();
         assert_eq!(
             publisher.published_pair().unwrap().as_str(),
             "v1:00112233445566778899aabbccddeeff00000000000000000000000000000002"
@@ -1555,7 +1422,7 @@ mod tests {
             0xee, 0xf0,
         ];
         let publisher = ApiSnapshotPublisher::with_unpublished_epoch_for_test(epoch);
-        publisher.publish(PublicSnapshot::default()).unwrap();
+        publisher.publish_details(PublicDetails::default()).unwrap();
         assert_eq!(
             publisher.published_pair().unwrap().as_str(),
             "v1:00112233445566778899aabbccddeef000000000000000000000000000000001"
@@ -1565,9 +1432,9 @@ mod tests {
     #[test]
     fn same_body_successful_publish_allocates_a_new_pair() {
         let publisher = ApiSnapshotPublisher::with_unpublished_epoch_for_test([0x11; 16]);
-        publisher.publish(PublicSnapshot::default()).unwrap();
+        publisher.publish_details(PublicDetails::default()).unwrap();
         let first = publisher.published_pair().unwrap();
-        publisher.publish(PublicSnapshot::default()).unwrap();
+        publisher.publish_details(PublicDetails::default()).unwrap();
         let second = publisher.published_pair().unwrap();
         assert_ne!(first, second);
         assert!(second.as_str().ends_with("2"));
@@ -1576,15 +1443,15 @@ mod tests {
     #[test]
     fn invalid_publish_and_reads_leave_pair_unchanged() {
         let publisher = ApiSnapshotPublisher::with_unpublished_epoch_for_test([0x22; 16]);
-        publisher.publish(PublicSnapshot::default()).unwrap();
+        publisher.publish_details(PublicDetails::default()).unwrap();
         let before = publisher.published_pair();
 
-        let invalid = PublicSnapshot {
+        let invalid = PublicDetails {
             observed_at: Some(-1),
-            ..PublicSnapshot::default()
+            ..PublicDetails::default()
         };
         assert_eq!(
-            publisher.publish(invalid),
+            publisher.publish_details(invalid),
             Err(ApiSnapshotError::InvalidObservedAt)
         );
         assert_eq!(publisher.published_pair(), before);
@@ -1604,7 +1471,7 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     publisher
-                        .publish_for_test(PublicSnapshot::default())
+                        .publish_for_test(PublicDetails::default())
                         .unwrap()
                         .as_str()
                         .to_owned()
@@ -1622,7 +1489,7 @@ mod tests {
     fn counter_overflow_permanently_fails_without_replacing_old_pair() {
         let epoch = [0x44; 16];
         let publisher = ApiSnapshotPublisher::with_unpublished_epoch_for_test(epoch);
-        publisher.publish(PublicSnapshot::default()).unwrap();
+        publisher.publish_details(PublicDetails::default()).unwrap();
         let before = publisher.published_pair();
         {
             let mut state = publisher
@@ -1636,9 +1503,15 @@ mod tests {
         }
 
         let expected = Err(ApiSnapshotError::PublishedPairGenerationFailed);
-        assert_eq!(publisher.publish(PublicSnapshot::default()), expected);
+        assert_eq!(
+            publisher.publish_details(PublicDetails::default()),
+            expected
+        );
         assert_eq!(publisher.published_pair(), before);
-        assert_eq!(publisher.publish(PublicSnapshot::default()), expected);
+        assert_eq!(
+            publisher.publish_details(PublicDetails::default()),
+            expected
+        );
         let state = publisher
             .snapshot
             .read()
@@ -1717,7 +1590,7 @@ mod tests {
     }
 
     #[test]
-    fn status_and_details_start_with_the_same_initial_pair_header() {
+    fn details_is_the_sole_snapshot_route_and_owns_one_generation_header() {
         let epoch = [
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
             0xee, 0xff,
@@ -1737,12 +1610,13 @@ mod tests {
             server.local_addr(),
             "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         );
-        assert_eq!(published_pair_headers(&status), vec![expected_initial]);
+        assert!(status.starts_with("HTTP/1.1 404"));
+        assert!(published_pair_headers(&status).is_empty());
         assert_eq!(published_pair_headers(&details), vec![expected_initial]);
 
         server
             .publisher()
-            .publish(PublicSnapshot::default())
+            .publish_details(PublicDetails::default())
             .unwrap();
         let expected_next = "v1:00112233445566778899aabbccddeeff00000000000000000000000000000002";
         let status = wire_request(
@@ -1753,7 +1627,8 @@ mod tests {
             server.local_addr(),
             "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         );
-        assert_eq!(published_pair_headers(&status), vec![expected_next]);
+        assert!(status.starts_with("HTTP/1.1 404"));
+        assert!(published_pair_headers(&status).is_empty());
         assert_eq!(published_pair_headers(&details), vec![expected_next]);
         server.shutdown();
     }
@@ -1776,15 +1651,15 @@ mod tests {
             ),
             wire_request(
                 address,
-                "DELETE /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                "DELETE /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
             ),
             wire_request(
                 address,
-                "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nmalformed\r\n\r\n",
+                "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nmalformed\r\n\r\n",
             ),
             wire_request(
                 address,
-                "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+                "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
             ),
         ];
         for response in responses {
@@ -1811,7 +1686,7 @@ mod tests {
         }
         let response = wire_request(
             address,
-            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         );
         assert!(response.starts_with("HTTP/1.1 503"), "{response:?}");
         assert_eq!(body(&response)["error"], "snapshot_unavailable");
@@ -1980,7 +1855,7 @@ mod tests {
         let mut server = ApiServer::start(loopback_config()).unwrap();
         let address = server.local_addr();
 
-        for route in ["/v1/health", "/v1/status", "/v1/missing"] {
+        for route in ["/v1/health", "/v1/missing"] {
             let (p90, p95, maximum) = latency_percentiles(address, route, 100);
             eprintln!("SLO route={route} n=100 p90={p90:.3}ms p95={p95:.3}ms max={maximum:.3}ms");
             assert!(p90 <= 25.0, "{route} p90 {p90:.3}ms exceeds 25ms");
@@ -2052,7 +1927,7 @@ mod tests {
     }
 
     #[test]
-    fn health_status_errors_and_snapshot_are_json_no_store() {
+    fn health_details_errors_and_snapshot_are_json_no_store() {
         // All API tests use an ephemeral loopback port. Serialize their server
         // lifetimes so another test cannot claim this test's just-released
         // port between shutdown and the explicit rebind assertion.
@@ -2061,27 +1936,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut server = ApiServer::start(loopback_config()).unwrap();
         let publisher = server.publisher();
-        publisher
-            .publish(PublicSnapshot {
-                state: PublicState::Ready,
-                observed_at: Some(1_780_000_000),
-                authenticated: true,
-                plan_label: Some("Pro".into()),
-                quota: Some(PublicQuota {
-                    remaining_percent: 98.0,
-                    reset_at: 1_780_400_000,
-                    window_seconds: 604_800,
-                    monthly: false,
-                }),
-                models: vec![PublicModelUsage {
-                    name: "SOL".into(),
-                    input_tokens: 1_200,
-                    cached_input_tokens: 300,
-                    output_tokens: 400,
-                }],
-                active_thread_count: 1,
-            })
-            .unwrap();
+        publisher.publish_details(detailed_fixture()).unwrap();
 
         let health = wire_request(
             server.local_addr(),
@@ -2091,33 +1946,13 @@ mod tests {
         assert!(health.contains("cache-control: no-store"));
         assert_eq!(body(&health)["api_version"], "v1");
 
-        let status = wire_request(
+        let details = wire_request(
             server.local_addr(),
-            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         );
-        assert!(status.starts_with("HTTP/1.1 200"));
-        assert!(status.contains("cache-control: no-store"));
-        let status_body = body(&status);
-        assert_eq!(status_body["state"], "ready");
-        assert_eq!(status_body["quota"]["remaining_percent"], 98.0);
-        assert_eq!(status_body["models"][0]["input_tokens"], 1200);
-        let status_keys = status_body.as_object().unwrap().keys().collect::<Vec<_>>();
-        assert_eq!(
-            status_keys,
-            vec![
-                "active_thread_count",
-                "api_version",
-                "authenticated",
-                "models",
-                "observed_at",
-                "plan_label",
-                "quota",
-                "state",
-            ]
-        );
-        assert!(status_body.get("email").is_none());
-        assert!(status_body.get("auth_url").is_none());
-        assert!(status_body.get("error_detail").is_none());
+        assert!(details.starts_with("HTTP/1.1 200"));
+        assert!(details.contains("cache-control: no-store"));
+        assert_eq!(body(&details)["state"], "ready");
 
         let missing = wire_request(
             server.local_addr(),
@@ -2128,7 +1963,7 @@ mod tests {
 
         let wrong_method = wire_request(
             server.local_addr(),
-            "POST /v1/status HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "POST /v1/details HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
         assert!(wrong_method.starts_with("HTTP/1.1 405"));
         assert_eq!(body(&wrong_method)["error"], "method_not_allowed");
@@ -2156,28 +1991,28 @@ mod tests {
 
         let mut cases: Vec<(Vec<u8>, u16, &str)> = vec![
             (
-                request("GET /v1/status?query=1 HTTP/1.1", &host, ""),
+                request("GET /v1/details?query=1 HTTP/1.1", &host, ""),
                 404,
                 "not_found",
             ),
             (
-                request("GET http://127.0.0.1:8787/v1/status HTTP/1.1", &host, ""),
+                request("GET http://127.0.0.1:8787/v1/details HTTP/1.1", &host, ""),
                 400,
                 "bad_request",
             ),
             (
-                request("GET //127.0.0.1/v1/status HTTP/1.1", &host, ""),
+                request("GET //127.0.0.1/v1/details HTTP/1.1", &host, ""),
                 400,
                 "bad_request",
             ),
             (
-                request("GET /v1/status HTTP/1.1", "Connection: close", ""),
+                request("GET /v1/details HTTP/1.1", "Connection: close", ""),
                 400,
                 "bad_request",
             ),
             (
                 request(
-                    "GET /v1/status HTTP/1.1",
+                    "GET /v1/details HTTP/1.1",
                     &format!("Host: {authority}\r\nhost: {authority}\r\nConnection: close"),
                     "",
                 ),
@@ -2186,7 +2021,7 @@ mod tests {
             ),
             (
                 request(
-                    "GET /v1/status HTTP/1.1",
+                    "GET /v1/details HTTP/1.1",
                     "Host: 127.0.0.1:1\r\nConnection: close",
                     "",
                 ),
@@ -2195,7 +2030,7 @@ mod tests {
             ),
             (
                 request(
-                    "GET /v1/status HTTP/1.1",
+                    "GET /v1/details HTTP/1.1",
                     &format!("{host}\r\nContent-Length: 1"),
                     "x",
                 ),
@@ -2204,7 +2039,7 @@ mod tests {
             ),
             (
                 request(
-                    "GET /v1/status HTTP/1.1",
+                    "GET /v1/details HTTP/1.1",
                     &format!("{host}\r\nTransfer-Encoding: chunked"),
                     "",
                 ),
@@ -2213,7 +2048,7 @@ mod tests {
             ),
             (
                 request(
-                    "GET /v1/status HTTP/1.1",
+                    "GET /v1/details HTTP/1.1",
                     &format!("{host}\r\nContent-Length: nope"),
                     "",
                 ),
@@ -2222,7 +2057,7 @@ mod tests {
             ),
             (
                 request(
-                    "GET /v1/status HTTP/1.1",
+                    "GET /v1/details HTTP/1.1",
                     &format!("{host}\r\nAuthorization: Bearer redacted"),
                     "",
                 ),
@@ -2231,7 +2066,7 @@ mod tests {
             ),
             (
                 request(
-                    "GET /v1/status HTTP/1.1",
+                    "GET /v1/details HTTP/1.1",
                     &format!("{host}\r\nAccept: */*\r\nAccept: application/json"),
                     "",
                 ),
@@ -2240,7 +2075,7 @@ mod tests {
             ),
             (
                 request(
-                    "POST /v1/status HTTP/1.1",
+                    "POST /v1/details HTTP/1.1",
                     &format!("{host}\r\nContent-Length: 0"),
                     "",
                 ),
@@ -2257,7 +2092,7 @@ mod tests {
                 "not_found",
             ),
             (
-                request("GET /v1/status HTTP/1.1\n", &host, ""),
+                request("GET /v1/details HTTP/1.1\n", &host, ""),
                 400,
                 "bad_request",
             ),
@@ -2265,7 +2100,7 @@ mod tests {
 
         let oversized = format!("{host}\r\nX-Oversized: {}", "x".repeat(1_025));
         cases.push((
-            request("GET /v1/status HTTP/1.1", &oversized, ""),
+            request("GET /v1/details HTTP/1.1", &oversized, ""),
             431,
             "request_headers_too_large",
         ));
@@ -2275,7 +2110,7 @@ mod tests {
             .join("\r\n");
         cases.push((
             request(
-                "GET /v1/status HTTP/1.1",
+                "GET /v1/details HTTP/1.1",
                 &format!("{host}\r\n{aggregate}"),
                 "",
             ),
@@ -2287,7 +2122,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\r\n");
         cases.push((
-            request("GET /v1/status HTTP/1.1", &format!("{host}\r\n{count}"), ""),
+            request(
+                "GET /v1/details HTTP/1.1",
+                &format!("{host}\r\n{count}"),
+                "",
+            ),
             431,
             "request_headers_too_large",
         ));
@@ -2318,7 +2157,7 @@ mod tests {
     }
 
     #[test]
-    fn details_endpoint_publishes_additive_fields_without_status_drift() {
+    fn details_endpoint_publishes_the_complete_whitelisted_document() {
         let _guard = api_server_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2370,12 +2209,6 @@ mod tests {
         assert!(details_body.get("auth_url").is_none());
         assert!(details_body.get("error_detail").is_none());
 
-        let status = wire_request(
-            server.local_addr(),
-            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        );
-        assert_eq!(body(&status)["models"][0].as_object().unwrap().len(), 4);
-        assert!(body(&status)["history_periods"].is_null());
         server.shutdown();
     }
 
@@ -2389,36 +2222,25 @@ mod tests {
             .publisher()
             .publish_details(detailed_fixture())
             .unwrap();
-        let before_status = body(&wire_request(
-            server.local_addr(),
-            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        ));
         let before_details = body(&wire_request(
             server.local_addr(),
             "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         ));
 
         let cases = [
-            "DELETE /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            "DELETE /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
                 .to_owned(),
             "GET /v1/unknown HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
                 .to_owned(),
-            "GET /v1/status HTTP/1.1\r\nmalformed-header\r\nConnection: close\r\n\r\n"
+            "GET /v1/details HTTP/1.1\r\nmalformed-header\r\nConnection: close\r\n\r\n"
                 .to_owned(),
             format!(
-                "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nX-Oversize: {}\r\nConnection: close\r\n\r\n",
+                "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nX-Oversize: {}\r\nConnection: close\r\n\r\n",
                 "x".repeat(128 * 1024)
             ),
         ];
         for request in cases {
             let _ = wire_request(server.local_addr(), &request);
-            assert_eq!(
-                body(&wire_request(
-                    server.local_addr(),
-                    "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-                )),
-                before_status
-            );
             assert_eq!(
                 body(&wire_request(
                     server.local_addr(),
@@ -2437,29 +2259,29 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut server = ApiServer::start(loopback_config()).unwrap();
         let publisher = server.publisher();
-        let initial = PublicSnapshot {
+        let initial = PublicDetails {
             state: PublicState::AuthRequired,
-            ..PublicSnapshot::default()
+            ..PublicDetails::default()
         };
-        publisher.publish(initial).unwrap();
-        let invalid = PublicSnapshot {
+        publisher.publish_details(initial).unwrap();
+        let invalid = PublicDetails {
             quota: Some(PublicQuota {
                 remaining_percent: 101.0,
                 reset_at: 1,
                 window_seconds: 1,
                 monthly: false,
             }),
-            ..PublicSnapshot::default()
+            ..PublicDetails::default()
         };
         assert_eq!(
-            publisher.publish(invalid),
+            publisher.publish_details(invalid),
             Err(ApiSnapshotError::InvalidQuota)
         );
-        let status = wire_request(
+        let details = wire_request(
             server.local_addr(),
-            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         );
-        assert_eq!(body(&status)["state"], "auth_required");
+        assert_eq!(body(&details)["state"], "auth_required");
         server.shutdown();
     }
 
@@ -2495,10 +2317,6 @@ mod tests {
         let known_good = detailed_fixture();
         publisher.publish_details(known_good.clone()).unwrap();
         let before_pair = publisher.published_pair();
-        let before_status = wire_request(
-            server.local_addr(),
-            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        );
         let before_details = wire_request(
             server.local_addr(),
             "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -2511,13 +2329,6 @@ mod tests {
             Err(ApiSnapshotError::InvalidThread)
         );
         assert_eq!(publisher.published_pair(), before_pair);
-        assert_eq!(
-            wire_request(
-                server.local_addr(),
-                "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-            ),
-            before_status
-        );
         assert_eq!(
             wire_request(
                 server.local_addr(),
@@ -2557,6 +2368,16 @@ mod tests {
     fn detail_validation_is_bounded_for_times_rates_lists_models_and_text() {
         let mut invalid = detailed_fixture();
         invalid.history_samples[0].timestamp = 0;
+        assert_eq!(
+            invalid.validate(),
+            Err(ApiSnapshotError::InvalidHistorySample)
+        );
+
+        let mut invalid = detailed_fixture();
+        let observed_at = invalid.observed_at.unwrap();
+        invalid.history_periods[0].current = false;
+        invalid.history_periods[0].end_at = observed_at + 60;
+        invalid.history_samples[0].timestamp = observed_at + 60;
         assert_eq!(
             invalid.validate(),
             Err(ApiSnapshotError::InvalidHistorySample)

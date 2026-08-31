@@ -18,8 +18,8 @@ using CodexInfo.WindowsClient.Updates;
 namespace CodexInfo.WindowsClient.ViewModels;
 
 /// <summary>
-/// Presents only a validated <see cref="ApiStatusSnapshot"/>. HTTP, JSON, and
-/// schema failures are classified by the Core client before reaching this UI.
+/// Presents one validated details generation. HTTP, JSON, and schema failures
+/// are classified by the Core client before reaching this UI.
 /// </summary>
 public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 {
@@ -36,9 +36,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private static readonly IBrush ErrorBorder = new SolidColorBrush(Color.Parse("#8E3D4D"));
     private static readonly IBrush ErrorAccent = new SolidColorBrush(Color.Parse("#E06B7A"));
 
-    private readonly ILoopbackStatusClient client;
     private readonly ILoopbackHealthClient healthClient;
-    private readonly ILoopbackDetailsClient? detailsClient;
+    private readonly ILoopbackDetailsClient detailsClient;
     private readonly IConnectionSupervisor? connectionSupervisor;
     private readonly Func<bool> authenticationLauncher;
     private readonly UpdateViewModel? update;
@@ -49,7 +48,6 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private readonly AsyncCommand checkAuthCommand;
     private readonly SnapshotCollection<ModelUsageViewModel> models = [];
     private readonly SnapshotCollection<QuotaSegmentViewModel> quotaSegments = [];
-    private ApiStatusSnapshot? snapshot;
     private ApiDetailsSnapshot? detailsSnapshot;
     private DetailsFetchFailure? detailsFailure;
     private DateTimeOffset? lastReceivedAt;
@@ -66,18 +64,32 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private int started;
 
     public MainWindowViewModel(
-        ILoopbackStatusClient client,
-        ILoopbackDetailsClient? detailsClient = null,
+        ILoopbackDetailsClient client,
+        IConnectionSupervisor? connectionSupervisor = null,
+        IWindowsUpdateCoordinator? updateCoordinator = null,
+        Func<bool>? authenticationLauncher = null)
+        : this(
+            client as ILoopbackHealthClient
+                ?? throw new ArgumentException(
+                    "The details client must implement the fixed health boundary.",
+                    nameof(client)),
+            client,
+            connectionSupervisor,
+            updateCoordinator,
+            authenticationLauncher)
+    {
+    }
+
+    public MainWindowViewModel(
+        ILoopbackHealthClient healthClient,
+        ILoopbackDetailsClient detailsClient,
         IConnectionSupervisor? connectionSupervisor = null,
         IWindowsUpdateCoordinator? updateCoordinator = null,
         Func<bool>? authenticationLauncher = null)
     {
-        ArgumentNullException.ThrowIfNull(client);
-        this.client = client;
-        healthClient = client as ILoopbackHealthClient
-            ?? throw new ArgumentException(
-                "The status client must implement the fixed health boundary.",
-                nameof(client));
+        ArgumentNullException.ThrowIfNull(healthClient);
+        ArgumentNullException.ThrowIfNull(detailsClient);
+        this.healthClient = healthClient;
         this.detailsClient = detailsClient;
         this.connectionSupervisor = connectionSupervisor;
         this.authenticationLauncher = authenticationLauncher ?? StartLinuxAuthenticationProcess;
@@ -227,7 +239,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
-    public bool HasQuota => snapshot?.Quota is not null;
+    public bool HasQuota => detailsSnapshot?.Quota is not null;
 
     public bool HasModels => models.Count > 0;
 
@@ -245,15 +257,15 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     }
 
     /// <summary>
-    /// True only after the status owner has accepted an authenticated snapshot.
-    /// Setup uses this instead of treating a reachable API or an old details
-    /// document as proof that the current account is ready.
+    /// True only after the active data owner has accepted an authenticated
+    /// details generation. Setup uses this instead of treating a reachable API or an old
+    /// details document as proof that the current account is ready.
     /// </summary>
-    public bool IsAuthenticated => snapshot is { Authenticated: true } && !IsAuthRequired;
+    public bool IsAuthenticated => detailsSnapshot is { Authenticated: true } && !IsAuthRequired;
 
     /// <summary>
-    /// Keeps the first frame stable while the health, status, and auxiliary
-    /// details generation is being assembled.  Subsequent polls update the
+    /// Keeps the first frame stable while the readiness probe and data
+    /// generation are being assembled. Subsequent polls update the
     /// already-published generation without hiding the content.
     /// </summary>
     public bool IsStartupLoading => initialLoadPending;
@@ -265,11 +277,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     public bool HasNoActiveThreads => !HasActiveThreads;
 
     /// <summary>
-    /// The scalar status count is authoritative even when the details endpoint
-    /// returns only a bounded row sample.  Details rows are still used for the
-    /// model breakdown and the child window.
+    /// The scalar generation count is authoritative even when the details
+    /// endpoint returns only a bounded row sample. Details rows are still used
+    /// for the model breakdown and the child window.
     /// </summary>
-    public ulong ActiveThreadCount => snapshot?.ActiveThreadCount ?? detailsSnapshot?.ActiveThreadCount ?? 0;
+    public ulong ActiveThreadCount => detailsSnapshot?.ActiveThreadCount ?? 0;
 
     public string ActiveThreadCountLabel => string.Create(CultureInfo.CurrentCulture, $"{ActiveThreadCount:N0}{(string.IsNullOrEmpty(Texts.CountUnit) ? "" : " " + Texts.CountUnit)}");
 
@@ -281,10 +293,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public int ActiveOtherCount => Math.Max(0, (int)ActiveThreadCount - ActiveSolCount - ActiveTerraCount - ActiveLunaCount);
 
-    /// <summary>Whether at least one details document has been accepted.</summary>
-    public bool HasDetails => detailsSnapshot is not null;
+    /// <summary>Whether an authenticated details generation is visible.</summary>
+    public bool HasDetails => detailsSnapshot is { Authenticated: true, State: not ApiState.AuthRequired };
 
-    public ApiDetailsSnapshot? DetailsSnapshot => detailsSnapshot;
+    public ApiDetailsSnapshot? DetailsSnapshot => HasDetails ? detailsSnapshot : null;
 
     public string DetailsStatusText
     {
@@ -294,9 +306,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             {
                 return detailsFailure switch
                 {
-                    null when detailsSnapshot is not null => "詳細データ: 最新",
-                    DetailsFetchFailure.Transport when detailsSnapshot is not null => "詳細データ: 前回値を表示（接続エラー）",
-                    DetailsFetchFailure.Response when detailsSnapshot is not null => "詳細データ: 前回値を表示（応答エラー）",
+                    null when HasDetails => "詳細データ: 最新",
+                    DetailsFetchFailure.Transport when HasDetails => "詳細データ: 前回値を表示（接続エラー）",
+                    DetailsFetchFailure.Response when HasDetails => "詳細データ: 前回値を表示（応答エラー）",
                     DetailsFetchFailure.Transport => "詳細データ: 未取得（接続エラー）",
                     DetailsFetchFailure.Response => "詳細データ: 未取得（応答エラー）",
                     _ => "詳細データ: 未取得",
@@ -304,9 +316,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             }
             return detailsFailure switch
             {
-                null when detailsSnapshot is not null => $"{Texts.Details}: {Texts.Latest}",
-                DetailsFetchFailure.Transport when detailsSnapshot is not null => $"{Texts.Details}: {Texts.Unavailable} ({Texts.TransportError})",
-                DetailsFetchFailure.Response when detailsSnapshot is not null => $"{Texts.Details}: {Texts.Unavailable} ({Texts.ApiError})",
+                null when HasDetails => $"{Texts.Details}: {Texts.Latest}",
+                DetailsFetchFailure.Transport when HasDetails => $"{Texts.Details}: {Texts.Unavailable} ({Texts.TransportError})",
+                DetailsFetchFailure.Response when HasDetails => $"{Texts.Details}: {Texts.Unavailable} ({Texts.ApiError})",
                 DetailsFetchFailure.Transport => $"{Texts.Details}: {Texts.Unavailable} ({Texts.TransportError})",
                 DetailsFetchFailure.Response => $"{Texts.Details}: {Texts.Unavailable} ({Texts.ApiError})",
                 _ => $"{Texts.Details}: {Texts.UnavailableValue}",
@@ -319,7 +331,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     /// The visible status remains localized, while UI tests consume this
     /// stable value instead of decoding rendered text.
     /// </summary>
-    public string DetailsStatusAutomationText => detailsSnapshot is not null && detailsFailure is null
+    public string DetailsStatusAutomationText => HasDetails && detailsFailure is null
         ? "ready"
         : detailsFailure is null
             ? "pending"
@@ -329,26 +341,26 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         get
         {
-            return snapshot?.Quota is { } quota
+            return detailsSnapshot?.Quota is { } quota
                 ? string.Create(CultureInfo.CurrentCulture, $"{quota.RemainingPercent:0.#}%")
                 : Texts.UnavailableValue;
         }
     }
 
-    public double RemainingPercentValue => snapshot?.Quota?.RemainingPercent ?? 0;
+    public double RemainingPercentValue => detailsSnapshot?.Quota?.RemainingPercent ?? 0;
 
-    public string QuotaWindowText => (snapshot?.Quota) switch
+    public string QuotaWindowText => (detailsSnapshot?.Quota) switch
     {
         null => Texts.QuotaWaiting,
         { Monthly: true } => Texts.MonthlyQuota,
         _ => Texts.WeeklyQuota,
     };
 
-    public string QuotaRemainingText => snapshot?.Quota is { } quota
+    public string QuotaRemainingText => detailsSnapshot?.Quota is { } quota
         ? FormatRemainingDuration(quota.ResetAt)
         : Texts.UnavailableValue;
 
-    public double QuotaRemainingPeriodValue => snapshot?.Quota is { } quota
+    public double QuotaRemainingPeriodValue => detailsSnapshot?.Quota is { } quota
         ? Math.Clamp(
             (quota.ResetAt - DateTimeOffset.UtcNow.ToUnixTimeSeconds()) * 100.0 /
             Math.Max(1, quota.WindowSeconds),
@@ -367,24 +379,24 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public ReadOnlyObservableCollection<ModelUsageViewModel> CurrentModels => Models;
 
-    public string AuthenticationText => snapshot switch
+    public string AuthenticationText => detailsSnapshot switch
     {
         null => Texts.UnavailableValue,
         { Authenticated: true } => Texts.Connected,
         _ => Texts.AuthRequired,
     };
 
-    public string PlanText => snapshot?.PlanLabel ?? Texts.UnavailableValue;
+    public string PlanText => detailsSnapshot?.PlanLabel ?? Texts.UnavailableValue;
 
-    public string ActiveThreadCountText => snapshot is null && detailsSnapshot is null
+    public string ActiveThreadCountText => detailsSnapshot is null
         ? Texts.UnavailableValue
         : string.Create(CultureInfo.CurrentCulture, $"{ActiveThreadCount:N0}{(string.IsNullOrEmpty(Texts.CountUnit) ? "" : " " + Texts.CountUnit)}");
 
-    public string ResetAtText => snapshot?.Quota is { } quota
+    public string ResetAtText => detailsSnapshot?.Quota is { } quota
         ? FormatUnixTime(quota.ResetAt)
         : Texts.UnavailableValue;
 
-    public string ObservedAtText => snapshot?.ObservedAt is { } observedAt
+    public string ObservedAtText => detailsSnapshot?.ObservedAt is { } observedAt
         ? FormatUnixTime(observedAt)
         : Texts.UnavailableValue;
 
@@ -407,7 +419,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         _ => Texts.Connecting,
     };
 
-    public string StatusDetail => Texts.StatusDetailFor(presentationState.ToString(), authLaunchFailed, snapshot is not null);
+    public string StatusDetail => Texts.StatusDetailFor(presentationState.ToString(), authLaunchFailed, detailsSnapshot is not null);
 
     public IBrush StatusBackground => presentationState switch
     {
@@ -524,12 +536,12 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             update.Dispose();
         }
-        if (client is IDisposable disposableClient)
+        if (healthClient is IDisposable disposableHealthClient)
         {
-            disposableClient.Dispose();
+            disposableHealthClient.Dispose();
         }
         if (detailsClient is IDisposable disposableDetailsClient &&
-            !ReferenceEquals(detailsClient, client))
+            !ReferenceEquals(detailsClient, healthClient))
         {
             disposableDetailsClient.Dispose();
         }
@@ -674,7 +686,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 : connectionSupervisor.EnsureStarted(context.Settings);
             if (!ready)
             {
-                MutateIfCurrent(context, () => ApplyFailure(StatusFetchFailure.Transport));
+                MutateIfCurrent(context, () => ApplyFailure(DetailsFetchFailure.Transport));
                 return;
             }
 
@@ -687,7 +699,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         }
         catch
         {
-            MutateIfCurrent(context, () => ApplyFailure(StatusFetchFailure.Transport));
+            MutateIfCurrent(context, () => ApplyFailure(DetailsFetchFailure.Transport));
         }
         finally
         {
@@ -729,7 +741,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 if (outcome is not ConnectionRestartOutcome.Started and
                     not ConnectionRestartOutcome.NoChildRequired)
                 {
-                    MutateIfCurrent(operation.Context, () => ApplyFailure(StatusFetchFailure.Transport));
+                    MutateIfCurrent(operation.Context, () => ApplyFailure(DetailsFetchFailure.Transport));
                     return;
                 }
             }
@@ -740,7 +752,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                     : connectionSupervisor.EnsureStarted(operation.Context.Settings);
                 if (!ready)
                 {
-                    MutateIfCurrent(operation.Context, () => ApplyFailure(StatusFetchFailure.Transport));
+                    MutateIfCurrent(operation.Context, () => ApplyFailure(DetailsFetchFailure.Transport));
                     return;
                 }
             }
@@ -753,7 +765,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         }
         catch
         {
-            MutateIfCurrent(operation.Context, () => ApplyFailure(StatusFetchFailure.Transport));
+            MutateIfCurrent(operation.Context, () => ApplyFailure(DetailsFetchFailure.Transport));
         }
         finally
         {
@@ -769,63 +781,43 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             if (!health.IsSuccess)
             {
                 MutateIfCurrent(context, () => ApplyFailure(health.Failure == HealthFetchFailure.Response
-                    ? StatusFetchFailure.Response
-                    : StatusFetchFailure.Transport));
+                    ? DetailsFetchFailure.Response
+                    : DetailsFetchFailure.Transport));
                 return;
             }
 
-            var result = await client.FetchAsync(cancellationToken);
-            if (!result.IsSuccess || result.Snapshot is not { } validatedSnapshot)
+            // The one strictly validated details response is the complete
+            // visible generation: core, history, models, and threads are never
+            // assembled from separate response roots.
+            DetailsFetchResult detailsResult;
+            try
             {
-                MutateIfCurrent(context, () => ApplyFailure(result.Failure ?? StatusFetchFailure.Transport));
-                return;
+                detailsResult = await detailsClient.FetchDetailsAsync(cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                detailsResult = DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport);
             }
 
-            // Details are account-scoped.  Never publish status alone while a
-            // details client exists; only a matching pair is a complete root.
-            if (detailsClient is not null && validatedSnapshot.Authenticated &&
-                validatedSnapshot.State != ApiState.AuthRequired)
+            if (detailsResult.IsSuccess && detailsResult.Snapshot is { } validatedDetails)
             {
-                DetailsFetchResult detailsResult;
-                try
-                {
-                    detailsResult = await detailsClient.FetchDetailsAsync(cancellationToken);
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch
-                {
-                    detailsResult = DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport);
-                }
-
-                if (detailsResult.IsSuccess && detailsResult.Snapshot is { } validatedDetails &&
-                    validatedDetails.Authenticated &&
-                    validatedDetails.State != ApiState.AuthRequired &&
-                    HasSamePublishedPair(validatedSnapshot, validatedDetails) &&
-                    HasSamePublicCore(validatedSnapshot, validatedDetails))
-                {
-                    MutateIfCurrent(context, () => ApplyAuthenticatedPair(validatedSnapshot, validatedDetails));
-                }
-                else
-                {
-                    MutateIfCurrent(context, () =>
-                    {
-                        detailsFailure = detailsResult.Failure == DetailsFetchFailure.Transport
-                            ? DetailsFetchFailure.Transport
-                            : DetailsFetchFailure.Response;
-                        Notify(nameof(DetailsStatusText));
-                        Notify(nameof(DetailsStatusAutomationText));
-                        ApplyFailure(detailsFailure == DetailsFetchFailure.Transport
-                            ? StatusFetchFailure.Transport
-                            : StatusFetchFailure.Response);
-                    });
-                }
+                MutateIfCurrent(context, () => ApplyDetailsGeneration(validatedDetails));
             }
             else
             {
-                MutateIfCurrent(context, () => ApplySnapshot(validatedSnapshot));
+                MutateIfCurrent(context, () =>
+                {
+                    detailsFailure = detailsResult.Failure == DetailsFetchFailure.Transport
+                        ? DetailsFetchFailure.Transport
+                        : DetailsFetchFailure.Response;
+                    Notify(nameof(DetailsStatusText));
+                    Notify(nameof(DetailsStatusAutomationText));
+                    ApplyFailure(detailsFailure.Value);
+                });
             }
         }
         catch (OperationCanceledException)
@@ -835,7 +827,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         }
         catch
         {
-            MutateIfCurrent(context, () => ApplyFailure(StatusFetchFailure.Transport));
+            MutateIfCurrent(context, () => ApplyFailure(DetailsFetchFailure.Transport));
         }
     }
 
@@ -1030,114 +1022,37 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
-    private static bool HasSamePublicCore(
-        ApiStatusSnapshot status,
-        ApiDetailsSnapshot details)
-    {
-        if (status.State != details.State ||
-            status.ObservedAt != details.ObservedAt ||
-            status.Authenticated != details.Authenticated ||
-            !string.Equals(status.PlanLabel, details.PlanLabel, StringComparison.Ordinal) ||
-            status.Quota != details.Quota ||
-            status.ActiveThreadCount != details.ActiveThreadCount ||
-            status.Models.Count != details.Models.Count)
-        {
-            return false;
-        }
-
-        for (var index = 0; index < status.Models.Count; index++)
-        {
-            var statusModel = status.Models[index];
-            var detailsModel = details.Models[index];
-            if (!string.Equals(statusModel.Name, detailsModel.Name, StringComparison.Ordinal) ||
-                statusModel.InputTokens != detailsModel.InputTokens ||
-                statusModel.CachedInputTokens != detailsModel.CachedInputTokens ||
-                statusModel.OutputTokens != detailsModel.OutputTokens)
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private static bool HasSamePublishedPair(
-        ApiStatusSnapshot status,
-        ApiDetailsSnapshot details) =>
-        status.PublishedPair is { } statusPair &&
-        details.PublishedPair is { } detailsPair &&
-        statusPair == detailsPair;
-
-    private void ApplySnapshot(ApiStatusSnapshot validatedSnapshot)
-    {
-        snapshot = validatedSnapshot;
-        lastReceivedAt = DateTimeOffset.Now;
-        hasConnectionFailure = validatedSnapshot.State == ApiState.Error;
-        presentationState = validatedSnapshot.State switch
-        {
-            ApiState.Ready => GetReadyPresentationState(validatedSnapshot),
-            ApiState.Initializing => ClientPresentationState.Initializing,
-            ApiState.AuthRequired => ClientPresentationState.AuthRequired,
-            ApiState.Error => ClientPresentationState.ApiError,
-            _ => ClientPresentationState.ResponseError,
-        };
-
-        if (validatedSnapshot.State == ApiState.AuthRequired || !validatedSnapshot.Authenticated)
-        {
-            authLaunchFailed = false;
-            authLaunchSucceeded = false;
-            // A valid authentication transition is not an auxiliary fetch
-            // failure: clear account-scoped details so old rows cannot remain
-            // visible while Linux asks the user to authenticate.
-            detailsSnapshot = null;
-            detailsFailure = null;
-            ClearModels();
-            Notify(nameof(HasDetails));
-            Notify(nameof(DetailsSnapshot));
-            Notify(nameof(DetailsStatusText));
-            Notify(nameof(DetailsStatusAutomationText));
-            Notify(nameof(EstimatedCostText));
-            NotifyActiveThreadProperties();
-        }
-        else if (detailsSnapshot is null)
-        {
-            ReplaceStatusModels(validatedSnapshot.Models.OrderBy(ModelOrder));
-        }
-
-        NotifySnapshotProperties();
-        authCommand.RaiseCanExecuteChanged();
-        checkAuthCommand.RaiseCanExecuteChanged();
-        Notify(nameof(IsRetryVisible));
-        Notify(nameof(IsRefreshingVisible));
-        Notify(nameof(IsUpdateNotificationVisible));
-        Notify(nameof(IsUpdateActionVisible));
-    }
-
-    private void ApplyAuthenticatedPair(
-        ApiStatusSnapshot validatedSnapshot,
-        ApiDetailsSnapshot validatedDetails)
+    private void ApplyDetailsGeneration(ApiDetailsSnapshot validatedDetails)
     {
         // All observable backing state is assigned before the first collection
         // or property notification.  The commit itself is synchronous so an
-        // observer can never see status from one generation with details from
-        // another.
-        snapshot = validatedSnapshot;
+        // observer can never see core from one details generation with history,
+        // models, or threads from another.
         detailsSnapshot = validatedDetails;
         detailsFailure = null;
         lastReceivedAt = DateTimeOffset.Now;
-        hasConnectionFailure = validatedSnapshot.State == ApiState.Error;
+        hasConnectionFailure = validatedDetails.State == ApiState.Error;
         authLaunchFailed = false;
         authLaunchSucceeded = false;
-        presentationState = validatedSnapshot.State switch
+        presentationState = validatedDetails.State switch
         {
-            ApiState.Ready => GetReadyPresentationState(validatedSnapshot),
+            ApiState.Ready => GetReadyPresentationState(validatedDetails),
             ApiState.Initializing => ClientPresentationState.Initializing,
             ApiState.AuthRequired => ClientPresentationState.AuthRequired,
             ApiState.Error => ClientPresentationState.ApiError,
             _ => ClientPresentationState.ResponseError,
         };
 
-        ReplaceModels(validatedDetails.Models.OrderBy(ModelOrder), notify: false);
+        if (validatedDetails.State == ApiState.AuthRequired || !validatedDetails.Authenticated)
+        {
+            // The validated generation remains the core authority, while its
+            // account-scoped presentation is cleared for authentication.
+            ClearModels(notify: false);
+        }
+        else
+        {
+            ReplaceModels(validatedDetails.Models.OrderBy(ModelOrder), notify: false);
+        }
         RebuildQuotaSegments(notify: false);
         models.NotifyReset();
         quotaSegments.NotifyReset();
@@ -1148,7 +1063,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(DetailsStatusAutomationText));
         Notify(nameof(ModelUsagePeriodText));
         Notify(nameof(EstimatedCostText));
-        NotifySnapshotProperties(quotaAlreadyRebuilt: true);
+        NotifyGenerationProperties(quotaAlreadyRebuilt: true);
         authCommand.RaiseCanExecuteChanged();
         checkAuthCommand.RaiseCanExecuteChanged();
         Notify(nameof(IsRetryVisible));
@@ -1157,10 +1072,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(IsUpdateActionVisible));
     }
 
-    private void ApplyFailure(StatusFetchFailure failure)
+    private void ApplyFailure(DetailsFetchFailure failure)
     {
         hasConnectionFailure = true;
-        presentationState = failure == StatusFetchFailure.Response
+        presentationState = failure == DetailsFetchFailure.Response
             ? ClientPresentationState.ResponseError
             : ClientPresentationState.TransportError;
         NotifyStatusProperties();
@@ -1190,7 +1105,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(ShowLastReceived));
     }
 
-    private void NotifySnapshotProperties(bool quotaAlreadyRebuilt = false)
+    private void NotifyGenerationProperties(bool quotaAlreadyRebuilt = false)
     {
         if (quotaAlreadyRebuilt)
         {
@@ -1227,7 +1142,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void RebuildQuotaSegments(bool notify = true)
     {
-        var fraction = snapshot?.Quota is { } quota
+        var fraction = detailsSnapshot?.Quota is { } quota
             ? Math.Clamp((quota.ResetAt - DateTimeOffset.UtcNow.ToUnixTimeSeconds()) /
                          (double)Math.Max(1, quota.WindowSeconds), 0, 1)
             : 0;
@@ -1264,10 +1179,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(ActiveOtherCount));
     }
 
-    private void ClearModels()
+    private void ClearModels(bool notify = true)
     {
         var previous = models.ToArray();
-        models.ReplaceAll([]);
+        models.ReplaceAll([], notify);
         foreach (var model in previous)
         {
             model.Dispose();
@@ -1279,17 +1194,6 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         var next = source.Select(static model => new ModelUsageViewModel(model)).ToArray();
         var previous = models.ToArray();
         models.ReplaceAll(next, notify);
-        foreach (var model in previous)
-        {
-            model.Dispose();
-        }
-    }
-
-    private void ReplaceStatusModels(IEnumerable<ApiModelUsage> source)
-    {
-        var next = source.Select(static model => new ModelUsageViewModel(model)).ToArray();
-        var previous = models.ToArray();
-        models.ReplaceAll(next);
         foreach (var model in previous)
         {
             model.Dispose();
@@ -1350,11 +1254,6 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         return tokens.Length == 1 ? tokens[0] : "その他";
     }
 
-    private static int ModelOrder(ApiModelUsage model)
-    {
-        return ModelOrder(model.Name);
-    }
-
     private static int ModelOrder(ApiDetailsModelUsage model)
     {
         return ModelOrder(model.Name);
@@ -1371,9 +1270,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         };
     }
 
-    private static ClientPresentationState GetReadyPresentationState(ApiStatusSnapshot validatedSnapshot)
+    private static ClientPresentationState GetReadyPresentationState(ApiDetailsSnapshot validatedDetails)
     {
-        if (validatedSnapshot.Quota is not { } quota)
+        if (validatedDetails.Quota is not { } quota)
         {
             return ClientPresentationState.Ready;
         }

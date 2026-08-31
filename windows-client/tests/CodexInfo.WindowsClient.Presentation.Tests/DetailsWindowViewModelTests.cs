@@ -236,7 +236,7 @@ public sealed class DetailsWindowViewModelTests
         };
 
         using var main = new MainWindowViewModel(
-            new SingleStatusClient(StatusFetchResult.Success(StatusFromDetails(details))),
+            new SingleCombinedClient(DetailsFetchResult.Success(details)),
             new SingleDetailsClient(DetailsFetchResult.Success(details)));
         main.Start();
         await EventuallyAsync(() => main.HasDetails);
@@ -293,7 +293,7 @@ public sealed class DetailsWindowViewModelTests
             PublishedPair = PublishedPairTestFixtures.Canonical,
         };
         using var main = new MainWindowViewModel(
-            new SingleStatusClient(StatusFetchResult.Success(StatusFromDetails(details))),
+            new SingleCombinedClient(DetailsFetchResult.Success(details)),
             new SingleDetailsClient(DetailsFetchResult.Success(details)));
         main.Start();
         await EventuallyAsync(() => main.HasDetails);
@@ -337,7 +337,7 @@ public sealed class DetailsWindowViewModelTests
             PublishedPair = PublishedPairTestFixtures.Canonical,
         };
         using var main = new MainWindowViewModel(
-            new SingleStatusClient(StatusFetchResult.Success(StatusFromDetails(details))),
+            new SingleCombinedClient(DetailsFetchResult.Success(details)),
             new SingleDetailsClient(DetailsFetchResult.Success(details)));
         main.Start();
         await EventuallyAsync(() => main.HasDetails);
@@ -354,8 +354,8 @@ public sealed class DetailsWindowViewModelTests
     public async Task SetupCannotCompleteUntilAuthenticatedSnapshotIsAccepted()
     {
         var resetAt = DateTimeOffset.UtcNow.AddDays(3).ToUnixTimeSeconds();
-        var client = new ToggleStatusClient(
-            StatusFetchResult.Success(new ApiStatusSnapshot(
+        var client = new ToggleDetailsClient(
+            DetailsFetchResult.Success(PublishedPairTestFixtures.DetailsGeneration(
                 ApiState.AuthRequired, resetAt - 30, false, null, null, [], 0)));
         using var main = new MainWindowViewModel(client);
         main.Start();
@@ -369,7 +369,7 @@ public sealed class DetailsWindowViewModelTests
         setup.Continue();
         Assert.True(setup.IsAuthStep);
 
-        client.Result = StatusFetchResult.Success(new ApiStatusSnapshot(
+        client.Result = DetailsFetchResult.Success(PublishedPairTestFixtures.DetailsGeneration(
             ApiState.Ready, resetAt - 10, true, "Pro",
             new ApiQuota(75, resetAt, 604800, false), [], 0));
         main.RefreshCommand.Execute(null);
@@ -383,7 +383,7 @@ public sealed class DetailsWindowViewModelTests
     public void LegalNoticesPageThroughEveryChapterWithoutChangingNoticeText()
     {
         using var main = new MainWindowViewModel(
-            new SingleStatusClient(StatusFetchResult.Success(ValidStatus(DateTimeOffset.UtcNow.AddDays(1).ToUnixTimeSeconds()))));
+            new SingleCombinedClient(DetailsFetchResult.Success(ValidDetails(DateTimeOffset.UtcNow.AddDays(1).ToUnixTimeSeconds()))));
         using var legal = new LegalNoticesWindowViewModel(main);
 
         Assert.True(legal.PageCount > 1);
@@ -453,24 +453,9 @@ public sealed class DetailsWindowViewModelTests
         Assert.Contains("Inno Setup License", legal.Notices[8].Text, StringComparison.Ordinal);
     }
 
-    private static ApiStatusSnapshot ValidStatus(long resetAt) => new(
-        ApiState.Ready, 100, true, "Pro", new ApiQuota(75, resetAt, 604800, false), [], 0);
-
-    private static ApiStatusSnapshot StatusFromDetails(ApiDetailsSnapshot details) => new(
-        details.State,
-        details.ObservedAt,
-        details.Authenticated,
-        details.PlanLabel,
-        details.Quota,
-        details.Models.Select(model => new ApiModelUsage(
-            model.Name,
-            model.InputTokens,
-            model.CachedInputTokens,
-            model.OutputTokens)).ToArray(),
-        details.ActiveThreadCount)
-    {
-        PublishedPair = details.PublishedPair,
-    };
+    private static ApiDetailsSnapshot ValidDetails(long resetAt) =>
+        PublishedPairTestFixtures.DetailsGeneration(
+            ApiState.Ready, 100, true, "Pro", new ApiQuota(75, resetAt, 604800, false), [], 0);
 
     private static async Task EventuallyAsync(Func<bool> condition)
     {
@@ -486,9 +471,9 @@ public sealed class DetailsWindowViewModelTests
         }
     }
 
-    private sealed class SingleStatusClient(StatusFetchResult result) : HealthyStatusClientBase
+    private sealed class SingleCombinedClient(DetailsFetchResult result) : HealthyDetailsClientBase
     {
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) => Task.FromResult(result);
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default) => Task.FromResult(result);
     }
 
     private sealed class SingleDetailsClient(DetailsFetchResult result) : ILoopbackDetailsClient
@@ -496,9 +481,9 @@ public sealed class DetailsWindowViewModelTests
         public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default) => Task.FromResult(result);
     }
 
-    private sealed class ToggleStatusClient(StatusFetchResult initial) : HealthyStatusClientBase
+    private sealed class ToggleDetailsClient(DetailsFetchResult initial) : HealthyDetailsClientBase
     {
-        public StatusFetchResult Result { get; set; } = initial;
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) => Task.FromResult(Result);
+        public DetailsFetchResult Result { get; set; } = initial;
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default) => Task.FromResult(Result);
     }
 }

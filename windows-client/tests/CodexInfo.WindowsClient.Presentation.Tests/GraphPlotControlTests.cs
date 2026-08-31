@@ -9,6 +9,7 @@ using System.Text.Json;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Graphing;
+using CodexInfo.WindowsClient.Settings;
 using CodexInfo.WindowsClient.ViewModels;
 using Xunit;
 
@@ -436,7 +437,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Graph_samples_preserve_valid_minute_rows_and_apply_only_cumulative_projection()
+    public void Graph_samples_preserve_each_details_vector_without_component_wise_max()
     {
         var period = new ApiHistoryPeriod("2000", 1_020, 1_200, false, "history")
         {
@@ -452,10 +453,10 @@ public sealed class GraphPlotControlTests
 
         Assert.Equal([1_020L, 1_080L, 1_140L, 1_200L], samples.Select(sample => sample.Timestamp));
         Assert.Equal([0d, 2d, 3d, 4d], samples.Select(sample => sample.SolDollars));
-        Assert.Equal([0d, 1d, 3d, 3d], samples.Select(sample => sample.TerraDollars));
+        Assert.Equal([0d, 1d, 3d, 2d], samples.Select(sample => sample.TerraDollars));
         Assert.Equal([0d, 0d, 1d, 2d], samples.Select(sample => sample.LunaDollars));
         Assert.Equal([0UL, 20UL, 30UL, 40UL], samples.Select(sample => sample.SolTokens));
-        Assert.Equal([0UL, 10UL, 30UL, 30UL], samples.Select(sample => sample.TerraTokens));
+        Assert.Equal([0UL, 10UL, 30UL, 20UL], samples.Select(sample => sample.TerraTokens));
         Assert.Equal([0UL, 0UL, 10UL, 20UL], samples.Select(sample => sample.LunaTokens));
         Assert.Equal([100d, 90d, 80d, 70d], samples.Select(sample => sample.RemainingPercent!.Value));
     }
@@ -751,6 +752,67 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public async Task Shared_rollover_fixture_atomically_refreshes_open_main_graph_and_threads_from_details()
+    {
+        var fixturePath = Path.Combine(
+            AppContext.BaseDirectory,
+            "Fixtures",
+            "graph_weekly_reset_rollover.json");
+        using var document = JsonDocument.Parse(File.ReadAllText(fixturePath));
+        var root = document.RootElement;
+        Assert.Equal("/v1/details", root.GetProperty("endpoint").GetString());
+        var generations = root.GetProperty("generations").EnumerateArray().ToArray();
+        Assert.Equal(["A", "B"], generations.Select(generation => generation.GetProperty("name").GetString()));
+
+        var first = await ParseDetailsFixtureAsync(generations[0].GetProperty("details_response"));
+        var second = await ParseDetailsFixtureAsync(generations[1].GetProperty("details_response"));
+        var firstCurrent = Assert.Single(first.HistoryPeriods, period => period.Current);
+        var secondCurrent = Assert.Single(second.HistoryPeriods, period => period.Current);
+        var expectedResetAt = root.GetProperty("expected_reset_at").GetInt64();
+        Assert.Equal(expectedResetAt.ToString(CultureInfo.InvariantCulture), firstCurrent.Id);
+        Assert.Equal(firstCurrent.Id, secondCurrent.Id);
+        Assert.Equal(expectedResetAt, firstCurrent.ResetAt);
+        Assert.Equal(expectedResetAt, secondCurrent.ResetAt);
+
+        var health = new CountingReadyHealthClient();
+        var details = new SequenceFixtureDetailsClient(first, second);
+        using var supervisor = new AlwaysReadyConnectionSupervisor();
+        using var main = new MainWindowViewModel(health, details, supervisor);
+        main.Start();
+        await EventuallyAsync(() => ReferenceEquals(main.DetailsSnapshot, first));
+        using var graph = new GraphWindowViewModel(main, static action => action());
+        using var threads = new ThreadsWindowViewModel(main);
+
+        Assert.Equal(100, main.RemainingPercentValue);
+        Assert.Equal("概算 $1", main.EstimatedCostText);
+        Assert.Same(firstCurrent, graph.SelectedPeriod);
+        Assert.Equal(firstCurrent.EndAt, graph.Scene.PeriodEndAt);
+        Assert.Equal(100, graph.Points[^1].RemainingPercent);
+        Assert.Equal("thread-a", Assert.Single(threads.Threads).Id);
+        var firstEndpoint = graph.Scene.PeriodEndAt;
+        var firstMaximum = graph.Scene.ModelMaximum;
+
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => ReferenceEquals(main.DetailsSnapshot, second));
+
+        Assert.Equal(41, main.RemainingPercentValue);
+        Assert.Equal("概算 $323.674247", main.EstimatedCostText);
+        Assert.Equal(323.674247, main.DetailsSnapshot!.Models.Sum(model => model.TotalDollars), precision: 6);
+        Assert.Same(secondCurrent, graph.SelectedPeriod);
+        Assert.True(graph.SelectedPeriod!.Current);
+        Assert.Equal(firstCurrent.Id, graph.SelectedPeriod.Id);
+        Assert.Equal(secondCurrent.EndAt, graph.Scene.PeriodEndAt);
+        Assert.NotEqual(firstEndpoint, graph.Scene.PeriodEndAt);
+        Assert.Equal(secondCurrent.EndAt, graph.Points[^1].Timestamp);
+        Assert.Equal(41, graph.Points[^1].RemainingPercent);
+        Assert.Equal(323.674247, graph.Points[^1].SolValue, precision: 6);
+        Assert.True(graph.Scene.ModelMaximum > firstMaximum);
+        Assert.Equal("thread-b", Assert.Single(threads.Threads).Id);
+        Assert.Equal(2, health.CallCount);
+        Assert.Equal(2, details.CallCount);
+    }
+
+    [Fact]
     public void Remaining_long_active_plateau_is_distributed_across_every_interval()
     {
         var points = new[]
@@ -887,6 +949,67 @@ public sealed class GraphPlotControlTests
         Assert.Equal(expected.SolTokens, actual.SolTokens);
         Assert.Equal(expected.TerraTokens, actual.TerraTokens);
         Assert.Equal(expected.LunaTokens, actual.LunaTokens);
+    }
+
+    private static async Task<ApiDetailsSnapshot> ParseDetailsFixtureAsync(JsonElement response)
+    {
+        var handler = new DetailsFixtureHandler(Encoding.UTF8.GetBytes(response.GetRawText()));
+        using var client = new LoopbackStatusClient(handler);
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+        Assert.True(result.IsSuccess);
+        Assert.Null(result.Failure);
+        Assert.Equal(1, handler.RequestCount);
+        return Assert.IsType<ApiDetailsSnapshot>(result.Snapshot);
+    }
+
+    private static async Task EventuallyAsync(Func<bool> condition)
+    {
+        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(2);
+        while (!condition())
+        {
+            if (DateTimeOffset.UtcNow >= deadline)
+            {
+                throw new TimeoutException("Expected rollover presentation state was not reached.");
+            }
+
+            await Task.Delay(10);
+        }
+    }
+
+    private sealed class CountingReadyHealthClient : ILoopbackHealthClient
+    {
+        public int CallCount { get; private set; }
+
+        public Task<HealthFetchResult> FetchHealthAsync(CancellationToken cancellationToken = default)
+        {
+            CallCount++;
+            return Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info")));
+        }
+    }
+
+    private sealed class SequenceFixtureDetailsClient(params ApiDetailsSnapshot[] snapshots)
+        : ILoopbackDetailsClient
+    {
+        public int CallCount { get; private set; }
+
+        public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default)
+        {
+            var snapshot = snapshots[Math.Min(CallCount, snapshots.Length - 1)];
+            CallCount++;
+            return Task.FromResult(DetailsFetchResult.Success(snapshot));
+        }
+    }
+
+    private sealed class AlwaysReadyConnectionSupervisor : IConnectionSupervisor
+    {
+        public bool EnsureStarted(ClientSettings settings) => true;
+
+        public ConnectionRestartOutcome RestartExplicit(ClientSettings settings) =>
+            ConnectionRestartOutcome.NoChildRequired;
+
+        public void Dispose()
+        {
+        }
     }
 
     private sealed class DetailsFixtureHandler(byte[] body) : HttpMessageHandler

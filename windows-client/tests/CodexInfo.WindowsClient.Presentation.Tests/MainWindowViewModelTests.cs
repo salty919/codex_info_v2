@@ -22,6 +22,17 @@ public sealed class MainWindowViewModelTests
         "v1:ffeeddccbbaa9988776655443322110000000000000000000000000000000002";
 
     [Fact]
+    public void CombinedClientRequiresTheFixedHealthReadinessBoundary()
+    {
+        var detailsOnly = new SequenceDetailsClient(
+            DetailsFetchResult.Success(DetailsSnapshot(1)));
+
+        var exception = Assert.Throws<ArgumentException>(() => new MainWindowViewModel(detailsOnly));
+
+        Assert.Equal("client", exception.ParamName);
+    }
+
+    [Fact]
     public async Task Startup_keeps_content_hidden_until_the_first_snapshot_is_complete()
     {
         var client = new BlockingClient();
@@ -43,7 +54,7 @@ public sealed class MainWindowViewModelTests
     public async Task Startup_failure_releases_spinner_and_exposes_retry_state()
     {
         using var viewModel = new MainWindowViewModel(new SequenceClient(
-            StatusFetchResult.FromFailure(StatusFetchFailure.Transport)));
+            DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport)));
 
         viewModel.Start();
         await EventuallyAsync(() => !viewModel.IsStartupLoading);
@@ -59,9 +70,9 @@ public sealed class MainWindowViewModelTests
     {
         var supervisor = new RecordingSupervisor();
         var client = new SequenceClient(
-            StatusFetchResult.Success(ValidSnapshot()),
-            StatusFetchResult.FromFailure(StatusFetchFailure.Transport),
-            StatusFetchResult.Success(ValidSnapshot(observedAt: 3)));
+            DetailsFetchResult.Success(ValidSnapshot()),
+            DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport),
+            DetailsFetchResult.Success(ValidSnapshot(observedAt: 3)));
         using var updates = new TestUpdateCoordinator(new UpdateCheckResult("1.2.3", false));
         using var viewModel = new MainWindowViewModel(
             client,
@@ -110,9 +121,9 @@ public sealed class MainWindowViewModelTests
     {
         var supervisor = new RecordingSupervisor();
         var client = new BlockingRetryClient(
-            StatusFetchResult.FromFailure(StatusFetchFailure.Transport),
-            StatusFetchResult.Success(ValidSnapshot(observedAt: 2)));
-        using var viewModel = new MainWindowViewModel(client, null, supervisor);
+            DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport),
+            DetailsFetchResult.Success(ValidSnapshot(observedAt: 2)));
+        using var viewModel = new MainWindowViewModel(client, client, supervisor);
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.IsRetryVisible);
@@ -139,9 +150,9 @@ public sealed class MainWindowViewModelTests
     {
         var supervisor = new RecordingSupervisor();
         var client = new BlockingRetryClient(
-            StatusFetchResult.Success(ValidSnapshot()),
-            StatusFetchResult.Success(ValidSnapshot(observedAt: 2)));
-        using var viewModel = new MainWindowViewModel(client, null, supervisor);
+            DetailsFetchResult.Success(ValidSnapshot()),
+            DetailsFetchResult.Success(ValidSnapshot(observedAt: 2)));
+        using var viewModel = new MainWindowViewModel(client, client, supervisor);
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.IsAuthenticated);
@@ -161,8 +172,8 @@ public sealed class MainWindowViewModelTests
     public async Task InvalidSettingsLeaveLastGoodRootAndValidRestartFailureSendsNoRequest()
     {
         var supervisor = new RecordingSupervisor();
-        var client = new CountingSequenceClient(StatusFetchResult.Success(ValidSnapshot()));
-        using var viewModel = new MainWindowViewModel(client, null, supervisor);
+        var client = new CountingSequenceClient(DetailsFetchResult.Success(ValidSnapshot()));
+        using var viewModel = new MainWindowViewModel(client, client, supervisor);
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.IsAuthenticated);
@@ -186,11 +197,11 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
-    public async Task LateStatusAfterSettingsSupersessionAddsNoMutationOrNotification()
+    public async Task LateDetailsAfterSettingsSupersessionAddsNoMutationOrNotification()
     {
         var supervisor = new RecordingSupervisor();
-        var client = new BlockingSupersessionStatusClient(ValidSnapshot(observedAt: 2));
-        using var viewModel = new MainWindowViewModel(client, null, supervisor);
+        var client = new BlockingSupersessionCombinedClient(ValidSnapshot(observedAt: 2));
+        using var viewModel = new MainWindowViewModel(client, client, supervisor);
 
         viewModel.Start();
         await EventuallyAsync(() => client.CallCount == 1);
@@ -216,8 +227,8 @@ public sealed class MainWindowViewModelTests
         var details = new BlockingSupersessionDetailsClient(DetailsSnapshot(2.5, observedAt: 2));
         using var viewModel = new MainWindowViewModel(
             new CountingSequenceClient(
-                StatusFetchResult.Success(ValidSnapshot()),
-                StatusFetchResult.Success(ValidSnapshot(observedAt: 2))),
+                DetailsFetchResult.Success(ValidSnapshot()),
+                DetailsFetchResult.Success(ValidSnapshot(observedAt: 2))),
             details,
             supervisor);
 
@@ -241,8 +252,6 @@ public sealed class MainWindowViewModelTests
     [Theory]
     [InlineData(DisposeEndpoint.Health, DisposeResult.Success)]
     [InlineData(DisposeEndpoint.Health, DisposeResult.Failure)]
-    [InlineData(DisposeEndpoint.Status, DisposeResult.Success)]
-    [InlineData(DisposeEndpoint.Status, DisposeResult.Failure)]
     [InlineData(DisposeEndpoint.Details, DisposeResult.Success)]
     [InlineData(DisposeEndpoint.Details, DisposeResult.Failure)]
     public Task DisposeFencesEveryEndpointAndResultWithPipelineBarriers(
@@ -264,7 +273,7 @@ public sealed class MainWindowViewModelTests
         }
 
         using (var initialFailure = new MainWindowViewModel(new SequenceClient(
-                   StatusFetchResult.FromFailure(StatusFetchFailure.Transport))))
+                   DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport))))
         {
             initialFailure.Start();
             await WaitForPipelineCompletion(initialFailure, CurrentContext(initialFailure));
@@ -272,8 +281,8 @@ public sealed class MainWindowViewModelTests
         }
 
         using (var periodic = new MainWindowViewModel(new CountingSequenceClient(
-                   StatusFetchResult.Success(ValidSnapshot()),
-                   StatusFetchResult.FromFailure(StatusFetchFailure.Transport))))
+                   DetailsFetchResult.Success(ValidSnapshot()),
+                   DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport))))
         {
             periodic.Start();
             await WaitForPipelineCompletion(periodic, CurrentContext(periodic));
@@ -283,9 +292,9 @@ public sealed class MainWindowViewModelTests
         }
 
         var retryClient = new BlockingRetryClient(
-            StatusFetchResult.Success(ValidSnapshot()),
-            StatusFetchResult.Success(ValidSnapshot(observedAt: 2)));
-        using (var retrying = new MainWindowViewModel(retryClient, null, new RecordingSupervisor()))
+            DetailsFetchResult.Success(ValidSnapshot()),
+            DetailsFetchResult.Success(ValidSnapshot(observedAt: 2)));
+        using (var retrying = new MainWindowViewModel(retryClient, retryClient, new RecordingSupervisor()))
         {
             retrying.Start();
             await WaitForPipelineCompletion(retrying, CurrentContext(retrying));
@@ -314,7 +323,7 @@ public sealed class MainWindowViewModelTests
 
         using (var updateCoordinator = new TestUpdateCoordinator(new UpdateCheckResult("1.2.3", false)))
         using (var update = new MainWindowViewModel(
-                   new SequenceClient(StatusFetchResult.Success(ValidSnapshot())),
+                   new SequenceClient(DetailsFetchResult.Success(ValidSnapshot())),
                    updateCoordinator: updateCoordinator))
         {
             update.Start();
@@ -326,7 +335,7 @@ public sealed class MainWindowViewModelTests
         }
 
         using (var ready = new MainWindowViewModel(new SequenceClient(
-                   StatusFetchResult.Success(ValidSnapshot()))))
+                   DetailsFetchResult.Success(ValidSnapshot()))))
         {
             ready.Start();
             await EventuallyAsync(() => ready.IsAuthenticated && !ready.IsStartupLoading);
@@ -339,7 +348,7 @@ public sealed class MainWindowViewModelTests
     {
         using var updateCoordinator = new TestUpdateCoordinator(new UpdateCheckResult("1.2.3", false));
         using var update = new MainWindowViewModel(
-            new SequenceClient(StatusFetchResult.Success(ValidSnapshot())),
+            new SequenceClient(DetailsFetchResult.Success(ValidSnapshot())),
             updateCoordinator: updateCoordinator);
 
         update.Start();
@@ -367,7 +376,7 @@ public sealed class MainWindowViewModelTests
         Assert.True(viewModel.RefreshCommand.CanExecute(null));
 
         viewModel.RefreshCommand.Execute(null);
-        await client.SecondStatusStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await client.SecondDetailsStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
         var activeContext = CurrentContext(viewModel);
         Assert.NotSame(initialContext, activeContext);
         Assert.False(viewModel.RefreshCommand.CanExecute(null));
@@ -385,10 +394,10 @@ public sealed class MainWindowViewModelTests
         Assert.Equal(1, supervisor.ExplicitChildGenerationCount);
         Assert.Equal(1, supervisor.EnsureStartedCount);
         Assert.Equal(2, client.HealthCallCount);
-        Assert.Equal(2, client.StatusCallCount);
-        Assert.Equal(1, client.DetailsCallCount);
+        Assert.IsAssignableFrom<ILoopbackDetailsClient>(client);
+        Assert.Equal(2, client.DetailsCallCount);
 
-        client.CompleteSecond(ValidSnapshot(observedAt: 2));
+        client.CompleteSecond(DetailsSnapshot(2.5, observedAt: 2));
         await WaitForPipelineCompletion(viewModel, activeContext);
         Assert.Equal(2, client.DetailsCallCount);
     }
@@ -412,7 +421,7 @@ public sealed class MainWindowViewModelTests
         await EventuallyAsync(() => viewModel.IsAuthCheckVisible);
 
         viewModel.CheckAuthCommand.Execute(null);
-        await client.SecondStatusStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await client.SecondDetailsStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
         var activeContext = CurrentContext(viewModel);
         var duplicate = InvokePrivateTask(viewModel, "CheckAuthenticationAsync");
         await duplicate;
@@ -421,21 +430,21 @@ public sealed class MainWindowViewModelTests
         Assert.Equal(0, supervisor.RestartExplicitCount);
         Assert.Equal(0, supervisor.ExplicitChildGenerationCount);
         Assert.Equal(2, client.HealthCallCount);
-        Assert.Equal(2, client.StatusCallCount);
-        Assert.Equal(0, client.DetailsCallCount);
+        Assert.IsAssignableFrom<ILoopbackDetailsClient>(client);
+        Assert.Equal(2, client.DetailsCallCount);
 
-        client.CompleteSecond(ValidSnapshot(observedAt: 2));
+        client.CompleteSecond(DetailsSnapshot(2.5, observedAt: 2));
         await WaitForPipelineCompletion(viewModel, activeContext);
-        Assert.Equal(1, client.DetailsCallCount);
+        Assert.Equal(2, client.DetailsCallCount);
         Assert.True(viewModel.IsAuthenticated);
     }
 
     [Fact]
-    public async Task Startup_waits_for_the_matching_details_generation_before_publishing_content()
+    public async Task Startup_waits_for_the_details_generation_before_publishing_content()
     {
         var details = new BlockingDetailsClient();
         using var viewModel = new MainWindowViewModel(
-            new SequenceClient(StatusFetchResult.Success(ValidSnapshot())),
+            new SequenceClient(DetailsFetchResult.Success(ValidSnapshot())),
             details);
 
         viewModel.Start();
@@ -451,12 +460,12 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
-    public async Task MatchingPublishedPairAndPublicCoreCommitsOneAuthenticatedGeneration()
+    public async Task ProductCompositionRequestsHealthThenOneDetailsGenerationOnly()
     {
-        var status = ValidSnapshot(observedAt: 10);
+        var healthBoundary = new CountingSequenceClient(DetailsFetchResult.Success(ValidSnapshot(observedAt: 999)));
         var details = DetailsSnapshot(2.5, observedAt: 10);
         using var viewModel = new MainWindowViewModel(
-            new SequenceClient(StatusFetchResult.Success(status)),
+            healthBoundary,
             new SequenceDetailsClient(DetailsFetchResult.Success(details)));
 
         viewModel.Start();
@@ -465,73 +474,96 @@ public sealed class MainWindowViewModelTests
         Assert.True(viewModel.IsAuthenticated);
         Assert.Equal(2.5, viewModel.DetailsSnapshot!.Models[0].InputDollars);
         Assert.Equal("10", viewModel.DetailsSnapshot.ObservedAt?.ToString());
+        Assert.Equal(0, healthBoundary.CallCount);
     }
 
     [Fact]
-    public async Task MismatchedPublishedPairIsRejectedEvenWhenPublicCoreMatches()
+    public async Task DetailsPublishedPairRequiresNoCrossResponseComparison()
     {
-        var status = ValidSnapshot();
+        var healthBoundary = new CountingSequenceClient(DetailsFetchResult.Success(ValidSnapshot()));
         var details = DetailsSnapshot(2.5) with { PublishedPair = PublishedPair(OtherPublishedPair) };
         using var viewModel = new MainWindowViewModel(
-            new SequenceClient(StatusFetchResult.Success(status)),
+            healthBoundary,
             new SequenceDetailsClient(DetailsFetchResult.Success(details)));
 
         viewModel.Start();
         await EventuallyAsync(() => !viewModel.IsStartupLoading);
 
-        Assert.False(viewModel.IsAuthenticated);
-        Assert.False(viewModel.HasDetails);
-        Assert.Empty(viewModel.Models);
+        Assert.True(viewModel.IsAuthenticated);
+        Assert.True(viewModel.HasDetails);
+        Assert.Equal(OtherPublishedPair, viewModel.DetailsSnapshot!.PublishedPair?.ToString());
+        Assert.Equal(0, healthBoundary.CallCount);
+    }
+
+    [Theory]
+    [InlineData(DetailsFetchFailure.Transport)]
+    [InlineData(DetailsFetchFailure.Response)]
+    public async Task DetailsFailureRetainsThePublishedPairLastGoodGeneration(DetailsFetchFailure failure)
+    {
+        var healthBoundary = new CountingSequenceClient(DetailsFetchResult.Success(ValidSnapshot()));
+        using var viewModel = new MainWindowViewModel(
+            healthBoundary,
+            new SequenceDetailsClient(
+                DetailsFetchResult.Success(DetailsSnapshot(2.5)),
+                DetailsFetchResult.FromFailure(failure)));
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.HasDetails);
+        var lastGood = viewModel.DetailsSnapshot;
+        Assert.Equal(CanonicalPublishedPair, lastGood!.PublishedPair?.ToString());
+
+        viewModel.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => viewModel.DetailsStatusAutomationText == "error");
+
+        Assert.Same(lastGood, viewModel.DetailsSnapshot);
+        Assert.Equal(CanonicalPublishedPair, viewModel.DetailsSnapshot!.PublishedPair?.ToString());
+        Assert.Equal(
+            failure == DetailsFetchFailure.Transport
+                ? "詳細データ: 前回値を表示（接続エラー）"
+                : "詳細データ: 前回値を表示（応答エラー）",
+            viewModel.DetailsStatusText);
+        var originalLanguage = LocalizationService.Current.LanguageCode;
+        try
+        {
+            LocalizationService.SetLanguage("en");
+            Assert.Equal(
+                failure == DetailsFetchFailure.Transport
+                    ? "Details: Unavailable (Connection error)"
+                    : "Details: Unavailable (Linux API error)",
+                viewModel.DetailsStatusText);
+        }
+        finally
+        {
+            LocalizationService.SetLanguage(originalLanguage);
+        }
+        Assert.Equal(0, healthBoundary.CallCount);
     }
 
     [Fact]
-    public async Task MissingPublishedPairInEitherSnapshotRejectsTheCandidate()
+    public async Task DetailsCoreIsAuthoritativeForEveryVisibleSurface()
     {
-        using (var missingStatus = new MainWindowViewModel(
-                   new SequenceClient(StatusFetchResult.Success(ValidSnapshot() with { PublishedPair = null })),
-                   new SequenceDetailsClient(DetailsFetchResult.Success(DetailsSnapshot(2.5)))))
-        {
-            missingStatus.Start();
-            await EventuallyAsync(() => !missingStatus.IsStartupLoading);
-            Assert.False(missingStatus.IsAuthenticated);
-            Assert.False(missingStatus.HasDetails);
-        }
-
-        using (var missingDetails = new MainWindowViewModel(
-                   new SequenceClient(StatusFetchResult.Success(ValidSnapshot())),
-                   new SequenceDetailsClient(DetailsFetchResult.Success(DetailsSnapshot(2.5) with { PublishedPair = null }))))
-        {
-            missingDetails.Start();
-            await EventuallyAsync(() => !missingDetails.IsStartupLoading);
-            Assert.False(missingDetails.IsAuthenticated);
-            Assert.False(missingDetails.HasDetails);
-        }
-    }
-
-    [Fact]
-    public async Task MatchingPublishedPairWithCommonCoreMismatchIsRejected()
-    {
-        var status = ValidSnapshot(observedAt: 2);
+        var healthBoundary = new CountingSequenceClient(DetailsFetchResult.Success(ValidSnapshot(observedAt: 2)));
         var details = DetailsSnapshot(2.5, observedAt: 3);
         using var viewModel = new MainWindowViewModel(
-            new SequenceClient(StatusFetchResult.Success(status)),
+            healthBoundary,
             new SequenceDetailsClient(DetailsFetchResult.Success(details)));
 
         viewModel.Start();
         await EventuallyAsync(() => !viewModel.IsStartupLoading);
 
-        Assert.False(viewModel.IsAuthenticated);
-        Assert.False(viewModel.HasDetails);
+        Assert.True(viewModel.IsAuthenticated);
+        Assert.True(viewModel.HasDetails);
+        Assert.Equal(3, viewModel.DetailsSnapshot!.ObservedAt);
+        Assert.Equal(0, healthBoundary.CallCount);
     }
 
     [Fact]
-    public async Task DetailsFailureAfterNewStatusRetainsEveryLastCompleteValue()
+    public async Task DetailsFailureRetainsEveryLastCompleteValue()
     {
-        var oldStatus = ValidSnapshot(observedAt: 1, quota: new ApiQuota(98.5, 2, 604800, false));
         var oldDetails = DetailsSnapshot(1.25, observedAt: 1);
-        var newStatus = ValidSnapshot(observedAt: 2, quota: new ApiQuota(41, 2, 604800, false));
+        var healthBoundary = new CountingSequenceClient(DetailsFetchResult.Success(ValidSnapshot(observedAt: 99)));
         using var viewModel = new MainWindowViewModel(
-            new SequenceClient(StatusFetchResult.Success(oldStatus), StatusFetchResult.Success(newStatus)),
+            healthBoundary,
             new SequenceDetailsClient(
                 DetailsFetchResult.Success(oldDetails),
                 DetailsFetchResult.FromFailure(DetailsFetchFailure.Response)));
@@ -548,15 +580,15 @@ public sealed class MainWindowViewModelTests
         Assert.Equal(oldObserved, viewModel.ObservedAtText);
         Assert.Equal(oldRemaining, viewModel.RemainingPercentValue);
         Assert.Equal(oldDollars, viewModel.Models[0].InputDollarsText);
+        Assert.Equal(0, healthBoundary.CallCount);
     }
 
     [Fact]
-    public async Task InitialPairRejectionEndsLoadingWithoutAuthenticatedContent()
+    public async Task InitialDetailsFailureEndsLoadingWithoutAuthenticatedContent()
     {
         using var viewModel = new MainWindowViewModel(
-            new SequenceClient(StatusFetchResult.Success(ValidSnapshot())),
-            new SequenceDetailsClient(DetailsFetchResult.Success(
-                DetailsSnapshot(2.5) with { PublishedPair = null })));
+            new SequenceClient(DetailsFetchResult.Success(ValidSnapshot())),
+            new SequenceDetailsClient(DetailsFetchResult.FromFailure(DetailsFetchFailure.Response)));
 
         viewModel.Start();
         await EventuallyAsync(() => !viewModel.IsStartupLoading);
@@ -564,16 +596,18 @@ public sealed class MainWindowViewModelTests
         Assert.False(viewModel.ShowAuthenticatedContent);
         Assert.False(viewModel.IsAuthenticated);
         Assert.Empty(viewModel.Models);
+        Assert.Equal(0, viewModel.ActiveSolCount);
         Assert.Equal("未取得", viewModel.RemainingPercentText);
+        Assert.Equal("詳細データ: 未取得（応答エラー）", viewModel.DetailsStatusText);
     }
 
     [Fact]
-    public async Task RefreshNotificationsNeverExposeMixedStatusDetailsOrQuotaGenerations()
+    public async Task RefreshNotificationsNeverExposeMixedDetailsGenerations()
     {
         using var viewModel = new MainWindowViewModel(
             new SequenceClient(
-                StatusFetchResult.Success(ValidSnapshot(observedAt: 1, quota: new ApiQuota(98.5, 2, 604800, false))),
-                StatusFetchResult.Success(ValidSnapshot(observedAt: 86_402, quota: new ApiQuota(41, 2, 604800, false)))),
+                DetailsFetchResult.Success(ValidSnapshot(observedAt: 1, quota: new ApiQuota(98.5, 2, 604800, false))),
+                DetailsFetchResult.Success(ValidSnapshot(observedAt: 86_402, quota: new ApiQuota(41, 2, 604800, false)))),
             new SequenceDetailsClient(
                 DetailsFetchResult.Success(DetailsSnapshot(1.25, observedAt: 1)),
                 DetailsFetchResult.Success(DetailsSnapshot(
@@ -624,7 +658,8 @@ public sealed class MainWindowViewModelTests
         var child = new TestConnectionChildProcess();
         var factory = new TestConnectionChildProcessFactory(child);
         using var supervisor = new ConnectionSupervisor(factory);
-        using var viewModel = new MainWindowViewModel(new NeverCalledClient(), null, supervisor);
+        var client = new NeverCalledClient();
+        using var viewModel = new MainWindowViewModel(client, client, supervisor);
 
         var settings = new ClientSettings("ja", false)
         {
@@ -641,24 +676,24 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
-    public async Task NullableValuesAndEmptyModelsHaveExplicitPresentation()
+    public async Task NullableQuotaAndEmptyModelsHaveExplicitPresentation()
     {
-        var noDataSnapshot = new ApiStatusSnapshot(
+        var noDataSnapshot = PublishedPairTestFixtures.DetailsGeneration(
             ApiState.Ready,
             null,
             true,
-            null,
+            "Pro",
             null,
             [],
             3);
         using var viewModel = new MainWindowViewModel(new SequenceClient(
-            StatusFetchResult.Success(noDataSnapshot)));
+            DetailsFetchResult.Success(noDataSnapshot)));
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.StatusTitle == "正常");
 
         Assert.Equal("未取得", viewModel.RemainingPercentText);
-        Assert.Equal("未取得", viewModel.PlanText);
+        Assert.Equal("Pro", viewModel.PlanText);
         Assert.Equal("未取得", viewModel.ResetAtText);
         Assert.Equal("未取得", viewModel.ObservedAtText);
         Assert.True(viewModel.HasNoModels);
@@ -668,8 +703,8 @@ public sealed class MainWindowViewModelTests
     [Fact]
     public async Task TransportFailureKeepsSnapshotAndMarksItStale()
     {
-        var success = StatusFetchResult.Success(ValidSnapshot());
-        var failure = StatusFetchResult.FromFailure(StatusFetchFailure.Transport);
+        var success = DetailsFetchResult.Success(ValidSnapshot());
+        var failure = DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport);
         using var viewModel = new MainWindowViewModel(new SequenceClient(success, failure));
 
         viewModel.Start();
@@ -688,7 +723,7 @@ public sealed class MainWindowViewModelTests
     public async Task ApiErrorIsNotPresentedAsTransportFailure()
     {
         using var viewModel = new MainWindowViewModel(new SequenceClient(
-            StatusFetchResult.Success(ValidSnapshot(state: ApiState.Error))));
+            DetailsFetchResult.Success(ValidSnapshot(state: ApiState.Error))));
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.StatusTitle == "Linux 側の取得エラー");
@@ -711,7 +746,7 @@ public sealed class MainWindowViewModelTests
             604800,
             false);
         using var viewModel = new MainWindowViewModel(new SequenceClient(
-            StatusFetchResult.Success(ValidSnapshot(quota: quota))));
+            DetailsFetchResult.Success(ValidSnapshot(quota: quota))));
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.StatusTitle == expectedStatusTitle);
@@ -728,7 +763,7 @@ public sealed class MainWindowViewModelTests
             604800,
             false);
         using var viewModel = new MainWindowViewModel(new SequenceClient(
-            StatusFetchResult.Success(ValidSnapshot(quota: quota))));
+            DetailsFetchResult.Success(ValidSnapshot(quota: quota))));
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.StatusTitle == "リセット警告");
@@ -745,7 +780,7 @@ public sealed class MainWindowViewModelTests
             604800,
             false);
         using var viewModel = new MainWindowViewModel(new SequenceClient(
-            StatusFetchResult.Success(ValidSnapshot(quota: quota))));
+            DetailsFetchResult.Success(ValidSnapshot(quota: quota))));
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.StatusTitle == "残量不足");
@@ -758,9 +793,9 @@ public sealed class MainWindowViewModelTests
         ApiState state,
         string expectedStatusTitle)
     {
-        var snapshot = new ApiStatusSnapshot(state, null, false, null, null, [], 0);
+        var snapshot = PublishedPairTestFixtures.DetailsGeneration(state, null, false, null, null, [], 0);
         using var viewModel = new MainWindowViewModel(new SequenceClient(
-            StatusFetchResult.Success(snapshot)));
+            DetailsFetchResult.Success(snapshot)));
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.StatusTitle == expectedStatusTitle);
@@ -777,22 +812,23 @@ public sealed class MainWindowViewModelTests
     public async Task FirstTransportFailureShowsNoSyntheticValues()
     {
         using var viewModel = new MainWindowViewModel(new SequenceClient(
-            StatusFetchResult.FromFailure(StatusFetchFailure.Transport)));
+            DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport)));
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.StatusTitle == "接続エラー");
 
         Assert.Equal("未取得", viewModel.RemainingPercentText);
         Assert.Equal("前回受信: 未取得", viewModel.LastReceivedText);
+        Assert.Equal("詳細データ: 未取得（接続エラー）", viewModel.DetailsStatusText);
         Assert.Contains("接続できません", viewModel.StatusDetail, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task HealthFailureStopsTheCycleBeforeStatusAndKeepsValuesUnavailable()
+    public async Task HealthFailureStopsTheCycleBeforeDetailsAndKeepsValuesUnavailable()
     {
         var client = new HealthAwareClient(
             HealthFetchResult.FromFailure(HealthFetchFailure.Response),
-            StatusFetchResult.Success(ValidSnapshot()));
+            DetailsFetchResult.Success(ValidSnapshot()));
         using var viewModel = new MainWindowViewModel(client);
 
         viewModel.Start();
@@ -803,17 +839,17 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
-    public async Task HealthyCycleRequestsHealthBeforeStatus()
+    public async Task HealthyCycleRequestsHealthBeforeDetails()
     {
         var client = new HealthAwareClient(
             HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info")),
-            StatusFetchResult.Success(ValidSnapshot()));
+            DetailsFetchResult.Success(ValidSnapshot()));
         using var viewModel = new MainWindowViewModel(client);
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.StatusTitle == "正常");
 
-        Assert.Equal(["health", "status"], client.Calls);
+        Assert.Equal(["health", "details"], client.Calls);
     }
 
     [Fact]
@@ -840,8 +876,8 @@ public sealed class MainWindowViewModelTests
         var secondDetails = DetailsSnapshot(2.5);
         using var viewModel = new MainWindowViewModel(
             new SequenceClient(
-                StatusFetchResult.Success(ValidSnapshot()),
-                StatusFetchResult.Success(ValidSnapshot())),
+                DetailsFetchResult.Success(ValidSnapshot()),
+                DetailsFetchResult.Success(ValidSnapshot())),
             new SequenceDetailsClient(
                 DetailsFetchResult.Success(firstDetails),
                 DetailsFetchResult.Success(secondDetails)));
@@ -866,7 +902,7 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
-    public async Task DetailsFailureKeepsTheLastDetailsAndHasIndependentStatus()
+    public async Task DetailsFailureKeepsTheCompleteLastDetailsGeneration()
     {
         var details = new ApiDetailsSnapshot(
             ApiState.Ready,
@@ -884,7 +920,7 @@ public sealed class MainWindowViewModelTests
             PublishedPair = PublishedPair(CanonicalPublishedPair),
         };
         using var viewModel = new MainWindowViewModel(
-            new SequenceClient(StatusFetchResult.Success(ValidSnapshot()), StatusFetchResult.Success(ValidSnapshot())),
+            new SequenceClient(DetailsFetchResult.Success(ValidSnapshot()), DetailsFetchResult.Success(ValidSnapshot())),
             new SequenceDetailsClient(
                 DetailsFetchResult.Success(details),
                 DetailsFetchResult.FromFailure(DetailsFetchFailure.Response)));
@@ -904,7 +940,7 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
-    public async Task MismatchedStatusDetailsPairKeepsTheLastCompleteGeneration()
+    public async Task NewDetailsGenerationReplacesCoreWithoutStatusComparison()
     {
         var completeDetails = new ApiDetailsSnapshot(
             ApiState.Ready, 1, true, "Pro",
@@ -918,8 +954,8 @@ public sealed class MainWindowViewModelTests
         var mismatchedDetails = completeDetails with { ObservedAt = 99 };
         using var viewModel = new MainWindowViewModel(
             new SequenceClient(
-                StatusFetchResult.Success(ValidSnapshot()),
-                StatusFetchResult.Success(ValidSnapshot(observedAt: 2))),
+                DetailsFetchResult.Success(ValidSnapshot()),
+                DetailsFetchResult.Success(ValidSnapshot(observedAt: 2))),
             new SequenceDetailsClient(
                 DetailsFetchResult.Success(completeDetails),
                 DetailsFetchResult.Success(mismatchedDetails)));
@@ -930,14 +966,15 @@ public sealed class MainWindowViewModelTests
         var lastCompleteDollars = viewModel.Models[0].InputDollarsText;
 
         viewModel.RefreshCommand.Execute(null);
-        await EventuallyAsync(() => viewModel.StatusDetail.Contains("前回受信の値", StringComparison.Ordinal));
+        await EventuallyAsync(() => viewModel.DetailsSnapshot?.ObservedAt == 99);
 
-        Assert.Equal(lastCompleteObservedAt, viewModel.ObservedAtText);
+        Assert.NotEqual(lastCompleteObservedAt, viewModel.ObservedAtText);
         Assert.Equal(lastCompleteDollars, viewModel.Models[0].InputDollarsText);
+        Assert.Equal(99, viewModel.DetailsSnapshot!.ObservedAt);
     }
 
     [Fact]
-    public async Task StatusActiveThreadCountRemainsAuthoritativeWhenDetailsRowsAreBounded()
+    public async Task DetailsScalarActiveThreadCountRemainsAuthoritativeWhenRowsAreBounded()
     {
         var details = new ApiDetailsSnapshot(
             ApiState.Ready,
@@ -955,25 +992,21 @@ public sealed class MainWindowViewModelTests
             PublishedPair = PublishedPair(CanonicalPublishedPair),
         };
         using var viewModel = new MainWindowViewModel(
-            new SequenceClient(StatusFetchResult.Success(new ApiStatusSnapshot(
-                ApiState.Ready, 1, true, "Pro", null, [], 3)
-            {
-                PublishedPair = PublishedPair(CanonicalPublishedPair),
-            })),
+            new SequenceClient(DetailsFetchResult.Success(details)),
             new SequenceDetailsClient(DetailsFetchResult.Success(details)));
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.HasDetails);
 
         // Details rows are intentionally bounded and may contain fewer rows
-        // than the scalar status count. The summary must not invent a lower
-        // count from the presentation list.
+        // than the scalar generation count. The summary must not invent a
+        // lower count from the presentation list.
         Assert.Equal(3UL, viewModel.ActiveThreadCount);
         Assert.Contains("3", viewModel.ActiveThreadCountText, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task ValidAuthRequiredStatusClearsAccountDetails()
+    public async Task ValidAuthRequiredDetailsGenerationClearsAccountDetails()
     {
         var details = new ApiDetailsSnapshot(
             ApiState.Ready,
@@ -991,12 +1024,21 @@ public sealed class MainWindowViewModelTests
             PublishedPair = PublishedPair(CanonicalPublishedPair),
         };
         using var viewModel = new MainWindowViewModel(
-            new SequenceClient(
-                StatusFetchResult.Success(ValidSnapshot()),
-                StatusFetchResult.Success(new ApiStatusSnapshot(ApiState.AuthRequired, null, false, null, null, [], 0))),
+            new SequenceClient(DetailsFetchResult.Success(ValidSnapshot())),
             new SequenceDetailsClient(
                 DetailsFetchResult.Success(details),
-                DetailsFetchResult.Success(details)));
+                DetailsFetchResult.Success(new ApiDetailsSnapshot(
+                    ApiState.AuthRequired,
+                    null,
+                    false,
+                    null,
+                    null,
+                    [],
+                    0,
+                    [],
+                    [],
+                    [],
+                    "概算 —"))));
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.HasDetails);
@@ -1016,7 +1058,7 @@ public sealed class MainWindowViewModelTests
         var supervisor = new RecordingSupervisor();
         using var viewModel = new MainWindowViewModel(
             client,
-            endpoint == DisposeEndpoint.Details ? client : null,
+            client,
             supervisor);
 
         viewModel.Start();
@@ -1048,8 +1090,9 @@ public sealed class MainWindowViewModelTests
     private static async Task<MainWindowViewModel> CreateAuthViewModelAsync(Func<bool> launcher)
     {
         var viewModel = new MainWindowViewModel(
-            new SequenceClient(StatusFetchResult.Success(
-                new ApiStatusSnapshot(ApiState.AuthRequired, 1, false, null, null, [], 0))),
+            new SequenceClient(DetailsFetchResult.Success(
+                PublishedPairTestFixtures.DetailsGeneration(
+                    ApiState.AuthRequired, 1, false, null, null, [], 0))),
             authenticationLauncher: launcher);
         viewModel.Start();
         await WaitForPipelineCompletion(viewModel, CurrentContext(viewModel));
@@ -1297,7 +1340,6 @@ public sealed class MainWindowViewModelTests
     public enum DisposeEndpoint
     {
         Health,
-        Status,
         Details,
     }
 
@@ -1307,24 +1349,21 @@ public sealed class MainWindowViewModelTests
         Failure,
     }
 
-    private static ApiStatusSnapshot ValidSnapshot(
+    private static ApiDetailsSnapshot ValidSnapshot(
         ApiState state = ApiState.Ready,
         long? observedAt = 1,
         string? planLabel = "Pro",
         ApiQuota? quota = null,
-        IReadOnlyList<ApiModelUsage>? models = null)
+        IReadOnlyList<ApiDetailsModelUsage>? models = null)
     {
-        return new ApiStatusSnapshot(
+        return PublishedPairTestFixtures.DetailsGeneration(
             state,
             observedAt,
             true,
             planLabel,
             quota ?? new ApiQuota(98.5, 2, 604800, false),
-            models ?? [new ApiModelUsage("SOL", 1, 2, 3)],
-            3)
-        {
-            PublishedPair = PublishedPair(CanonicalPublishedPair),
-        };
+            models ?? [new ApiDetailsModelUsage("SOL", 1, 2, 3, 0, 0, 0)],
+            3);
     }
 
     private static ClientSettings ValidWslSettings() => new("ja", true)
@@ -1378,11 +1417,11 @@ public sealed class MainWindowViewModelTests
         }
     }
 
-    private sealed class SequenceClient(params StatusFetchResult[] results) : HealthyStatusClientBase
+    private sealed class SequenceClient(params DetailsFetchResult[] results) : HealthyDetailsClientBase
     {
         private int index;
 
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default)
         {
             var result = results[Math.Min(index, results.Length - 1)];
             index++;
@@ -1390,13 +1429,13 @@ public sealed class MainWindowViewModelTests
         }
     }
 
-    private sealed class CountingSequenceClient(params StatusFetchResult[] results) : HealthyStatusClientBase
+    private sealed class CountingSequenceClient(params DetailsFetchResult[] results) : HealthyDetailsClientBase
     {
         private int index;
 
         public int CallCount => Volatile.Read(ref index);
 
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default)
         {
             var call = Interlocked.Increment(ref index);
             return Task.FromResult(results[Math.Min(call - 1, results.Length - 1)]);
@@ -1404,10 +1443,10 @@ public sealed class MainWindowViewModelTests
     }
 
     private sealed class BlockingRetryClient(
-        StatusFetchResult first,
-        StatusFetchResult second) : HealthyStatusClientBase
+        DetailsFetchResult first,
+        DetailsFetchResult second) : HealthyDetailsClientBase
     {
-        private readonly TaskCompletionSource<StatusFetchResult> secondCompletion = new(
+        private readonly TaskCompletionSource<DetailsFetchResult> secondCompletion = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource<object?> secondStarted = NewSignal<object?>();
         private int calls;
@@ -1415,7 +1454,7 @@ public sealed class MainWindowViewModelTests
         public int CallCount => Volatile.Read(ref calls);
         public Task SecondStarted => secondStarted.Task;
 
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default)
         {
             var call = Interlocked.Increment(ref calls);
             if (call == 1)
@@ -1430,25 +1469,25 @@ public sealed class MainWindowViewModelTests
         public void CompleteSecond() => secondCompletion.TrySetResult(second);
     }
 
-    private sealed class BlockingSupersessionStatusClient(ApiStatusSnapshot replacement)
-        : HealthyStatusClientBase
+    private sealed class BlockingSupersessionCombinedClient(ApiDetailsSnapshot replacement)
+        : HealthyDetailsClientBase
     {
-        private readonly TaskCompletionSource<StatusFetchResult> supersededCompletion = new(
+        private readonly TaskCompletionSource<DetailsFetchResult> supersededCompletion = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
         private int calls;
 
         public int CallCount => Volatile.Read(ref calls);
 
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default)
         {
             var call = Interlocked.Increment(ref calls);
             return call == 1
                 ? supersededCompletion.Task
-                : Task.FromResult(StatusFetchResult.Success(replacement));
+                : Task.FromResult(DetailsFetchResult.Success(replacement));
         }
 
         public void CompleteSuperseded() => supersededCompletion.TrySetResult(
-            StatusFetchResult.Success(ValidSnapshot(observedAt: 1)));
+            DetailsFetchResult.Success(ValidSnapshot(observedAt: 1)));
     }
 
     private sealed class BlockingSupersessionDetailsClient(ApiDetailsSnapshot replacement)
@@ -1472,7 +1511,7 @@ public sealed class MainWindowViewModelTests
             DetailsFetchResult.Success(DetailsSnapshot(1.25, observedAt: 1)));
     }
 
-    private sealed class BlockingHealthClient : HealthyStatusClientBase
+    private sealed class BlockingHealthClient : HealthyDetailsClientBase
     {
         private readonly TaskCompletionSource<HealthFetchResult> completion = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1486,27 +1525,10 @@ public sealed class MainWindowViewModelTests
             return completion.Task;
         }
 
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default) =>
             throw new InvalidOperationException("Status must not be requested while health is blocked.");
 
         public void Complete(HealthFetchResult result) => completion.TrySetResult(result);
-    }
-
-    private sealed class BlockingStatusClient : HealthyStatusClientBase
-    {
-        private readonly TaskCompletionSource<StatusFetchResult> completion = new(
-            TaskCreationOptions.RunContinuationsAsynchronously);
-        private int calls;
-
-        public int CallCount => Volatile.Read(ref calls);
-
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
-        {
-            Interlocked.Increment(ref calls);
-            return completion.Task;
-        }
-
-        public void Complete(StatusFetchResult result) => completion.TrySetResult(result);
     }
 
     private sealed class BlockingDetailsClientIgnoringCancellation : ILoopbackDetailsClient
@@ -1539,103 +1561,95 @@ public sealed class MainWindowViewModelTests
         }
     }
 
-    private sealed class ExplicitBarrierClient : HealthyStatusClientBase, ILoopbackDetailsClient
+    private sealed class ExplicitBarrierClient : ILoopbackHealthClient, ILoopbackDetailsClient
     {
-        private readonly TaskCompletionSource<StatusFetchResult> secondStatus = NewSignal<StatusFetchResult>();
+        private readonly TaskCompletionSource<DetailsFetchResult> secondDetails = NewSignal<DetailsFetchResult>();
         private int healthCalls;
-        private int statusCalls;
         private int detailsCalls;
 
-        public TaskCompletionSource<object?> SecondStatusStarted { get; } = NewSignal<object?>();
+        public TaskCompletionSource<object?> SecondDetailsStarted { get; } = NewSignal<object?>();
 
         public int HealthCallCount => Volatile.Read(ref healthCalls);
-        public int StatusCallCount => Volatile.Read(ref statusCalls);
         public int DetailsCallCount => Volatile.Read(ref detailsCalls);
 
-        public override Task<HealthFetchResult> FetchHealthAsync(CancellationToken cancellationToken = default)
+        public Task<HealthFetchResult> FetchHealthAsync(CancellationToken cancellationToken = default)
         {
             Interlocked.Increment(ref healthCalls);
             return Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info")));
-        }
-
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
-        {
-            var call = Interlocked.Increment(ref statusCalls);
-            if (call == 1)
-            {
-                return Task.FromResult(StatusFetchResult.Success(ValidSnapshot()));
-            }
-
-            SecondStatusStarted.TrySetResult(null);
-            return secondStatus.Task;
         }
 
         public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default)
         {
             var call = Interlocked.Increment(ref detailsCalls);
-            return Task.FromResult(DetailsFetchResult.Success(DetailsSnapshot(2.5, observedAt: call)));
+            if (call == 1)
+            {
+                return Task.FromResult(DetailsFetchResult.Success(DetailsSnapshot(2.5, observedAt: call)));
+            }
+
+            SecondDetailsStarted.TrySetResult(null);
+            return secondDetails.Task;
         }
 
-        public void CompleteSecond(ApiStatusSnapshot snapshot) =>
-            secondStatus.TrySetResult(StatusFetchResult.Success(snapshot));
+        public void CompleteSecond(ApiDetailsSnapshot snapshot) =>
+            secondDetails.TrySetResult(DetailsFetchResult.Success(snapshot));
     }
 
-    private sealed class AuthCheckBarrierClient : HealthyStatusClientBase, ILoopbackDetailsClient
+    private sealed class AuthCheckBarrierClient : ILoopbackHealthClient, ILoopbackDetailsClient
     {
-        private readonly TaskCompletionSource<StatusFetchResult> secondStatus = NewSignal<StatusFetchResult>();
+        private readonly TaskCompletionSource<DetailsFetchResult> secondDetails = NewSignal<DetailsFetchResult>();
         private int healthCalls;
-        private int statusCalls;
         private int detailsCalls;
 
-        public TaskCompletionSource<object?> SecondStatusStarted { get; } = NewSignal<object?>();
+        public TaskCompletionSource<object?> SecondDetailsStarted { get; } = NewSignal<object?>();
 
         public int HealthCallCount => Volatile.Read(ref healthCalls);
-        public int StatusCallCount => Volatile.Read(ref statusCalls);
         public int DetailsCallCount => Volatile.Read(ref detailsCalls);
 
-        public override Task<HealthFetchResult> FetchHealthAsync(CancellationToken cancellationToken = default)
+        public Task<HealthFetchResult> FetchHealthAsync(CancellationToken cancellationToken = default)
         {
             Interlocked.Increment(ref healthCalls);
             return Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info")));
         }
 
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
-        {
-            var call = Interlocked.Increment(ref statusCalls);
-            if (call == 1)
-            {
-                return Task.FromResult(StatusFetchResult.Success(
-                    new ApiStatusSnapshot(ApiState.AuthRequired, 1, false, null, null, [], 0)));
-            }
-
-            SecondStatusStarted.TrySetResult(null);
-            return secondStatus.Task;
-        }
-
         public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default)
         {
-            Interlocked.Increment(ref detailsCalls);
-            return Task.FromResult(DetailsFetchResult.Success(DetailsSnapshot(2.5, observedAt: 2)));
+            var call = Interlocked.Increment(ref detailsCalls);
+            if (call == 1)
+            {
+                return Task.FromResult(DetailsFetchResult.Success(new ApiDetailsSnapshot(
+                    ApiState.AuthRequired,
+                    1,
+                    false,
+                    null,
+                    null,
+                    [],
+                    0,
+                    [],
+                    [],
+                    [],
+                    "概算 —")));
+            }
+
+            SecondDetailsStarted.TrySetResult(null);
+            return secondDetails.Task;
         }
 
-        public void CompleteSecond(ApiStatusSnapshot snapshot) =>
-            secondStatus.TrySetResult(StatusFetchResult.Success(snapshot));
+        public void CompleteSecond(ApiDetailsSnapshot snapshot) =>
+            secondDetails.TrySetResult(DetailsFetchResult.Success(snapshot));
     }
 
     private sealed class DisposeMatrixClient(DisposeEndpoint endpoint)
-        : HealthyStatusClientBase, ILoopbackDetailsClient
+        : ILoopbackHealthClient, ILoopbackDetailsClient
     {
         private readonly TaskCompletionSource<HealthFetchResult> healthGate = NewSignal<HealthFetchResult>();
-        private readonly TaskCompletionSource<StatusFetchResult> statusGate = NewSignal<StatusFetchResult>();
         private readonly TaskCompletionSource<DetailsFetchResult> detailsGate = NewSignal<DetailsFetchResult>();
         private readonly TaskCompletionSource<object?> secondEndpointStarted = NewSignal<object?>();
         private int healthCalls;
-        private int statusCalls;
         private int detailsCalls;
 
         public Task SecondEndpointStarted => secondEndpointStarted.Task;
 
-        public override Task<HealthFetchResult> FetchHealthAsync(CancellationToken cancellationToken = default)
+        public Task<HealthFetchResult> FetchHealthAsync(CancellationToken cancellationToken = default)
         {
             var call = Interlocked.Increment(ref healthCalls);
             if (endpoint == DisposeEndpoint.Health && call == 2)
@@ -1645,18 +1659,6 @@ public sealed class MainWindowViewModelTests
             }
 
             return Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info")));
-        }
-
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
-        {
-            var call = Interlocked.Increment(ref statusCalls);
-            if (endpoint == DisposeEndpoint.Status && call == 2)
-            {
-                secondEndpointStarted.TrySetResult(null);
-                return statusGate.Task;
-            }
-
-            return Task.FromResult(StatusFetchResult.Success(ValidSnapshot(observedAt: call)));
         }
 
         public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default)
@@ -1679,11 +1681,6 @@ public sealed class MainWindowViewModelTests
                     healthGate.TrySetResult(result == DisposeResult.Success
                         ? HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info"))
                         : HealthFetchResult.FromFailure(HealthFetchFailure.Response));
-                    break;
-                case DisposeEndpoint.Status:
-                    statusGate.TrySetResult(result == DisposeResult.Success
-                        ? StatusFetchResult.Success(ValidSnapshot(observedAt: 2))
-                        : StatusFetchResult.FromFailure(StatusFetchFailure.Response));
                     break;
                 case DisposeEndpoint.Details:
                     detailsGate.TrySetResult(result == DisposeResult.Success
@@ -1722,28 +1719,28 @@ public sealed class MainWindowViewModelTests
         }
     }
 
-    private sealed class BlockingClient : HealthyStatusClientBase
+    private sealed class BlockingClient : HealthyDetailsClientBase
     {
-        private readonly TaskCompletionSource<StatusFetchResult> completion = new(
+        private readonly TaskCompletionSource<DetailsFetchResult> completion = new(
             TaskCreationOptions.RunContinuationsAsynchronously);
 
         public int CallCount { get; private set; }
 
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default)
         {
             CallCount++;
             return completion.Task.WaitAsync(cancellationToken);
         }
 
-        public void Complete(ApiStatusSnapshot snapshot)
+        public void Complete(ApiDetailsSnapshot snapshot)
         {
-            completion.TrySetResult(StatusFetchResult.Success(snapshot));
+            completion.TrySetResult(DetailsFetchResult.Success(snapshot));
         }
     }
 
     private sealed class HealthAwareClient(
         HealthFetchResult healthResult,
-        StatusFetchResult statusResult) : HealthyStatusClientBase
+        DetailsFetchResult detailsFixture) : HealthyDetailsClientBase
     {
         public List<string> Calls { get; } = [];
 
@@ -1753,10 +1750,10 @@ public sealed class MainWindowViewModelTests
             return Task.FromResult(healthResult);
         }
 
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default)
         {
-            Calls.Add("status");
-            return Task.FromResult(statusResult);
+            Calls.Add("details");
+            return Task.FromResult(detailsFixture);
         }
     }
 
@@ -1788,9 +1785,9 @@ public sealed class MainWindowViewModelTests
         public void Complete(DetailsFetchResult result) => completion.TrySetResult(result);
     }
 
-    private sealed class NeverCalledClient : HealthyStatusClientBase
+    private sealed class NeverCalledClient : HealthyDetailsClientBase
     {
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default) =>
             throw new InvalidOperationException("The connection start test must not depend on HTTP.");
     }
 

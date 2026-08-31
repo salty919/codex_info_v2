@@ -22,5 +22,8 @@
     <None Include="../../../tests/fixtures/graph_delayed_quota.json"
           Link="Fixtures/graph_delayed_quota.json"
           CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../tests/fixtures/graph_weekly_reset_rollover.json"
+          Link="Fixtures/graph_weekly_reset_rollover.json"
+          CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

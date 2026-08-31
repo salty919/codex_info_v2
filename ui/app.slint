@@ -41,6 +41,7 @@ export component MainWindow inherits Window {
     in-out property <bool> has-auth-url: false;
     in-out property <bool> checking: true;
     in-out property <bool> has-error: false;
+    in-out property <bool> service-unavailable: false;
     in-out property <bool> startup-loading: false;
     in-out property <string> quota-title;
     in-out property <bool> has-quota-percent: true;
@@ -241,8 +242,10 @@ export component MainWindow inherits Window {
                 checking: root.checking;
                 status: root.status;
                 has-error: root.has-error;
+                service-unavailable: root.service-unavailable;
                 begin-auth => { root.begin-auth(); }
                 check-auth => { root.check-auth(); }
+                retry => { root.retry(); }
             }
         }
     }

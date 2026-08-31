@@ -15,7 +15,7 @@ public sealed class SetupFlowTests
     public async Task AdvancePersistsConnectionThenCompletionAsTwoExplicitGenerations()
     {
         var observedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var status = new ApiStatusSnapshot(
+        var details = PublishedPairTestFixtures.DetailsGeneration(
             ApiState.Ready,
             observedAt,
             true,
@@ -23,7 +23,7 @@ public sealed class SetupFlowTests
             new ApiQuota(75, observedAt + 604_800, 604_800, false),
             [],
             0);
-        using var main = new MainWindowViewModel(new SingleStatusClient(StatusFetchResult.Success(status)));
+        using var main = new MainWindowViewModel(new SingleDetailsClient(DetailsFetchResult.Success(details)));
         var session = new RecordingSettingsSession(ClientSettings.Default with { SettingsCorrupt = true });
         using var setup = new SetupViewModel(main, session);
         main.Start();
@@ -50,7 +50,7 @@ public sealed class SetupFlowTests
     public async Task InvalidConnectionCannotAdvanceOrPublishSettings()
     {
         var observedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var status = new ApiStatusSnapshot(
+        var details = PublishedPairTestFixtures.DetailsGeneration(
             ApiState.Ready,
             observedAt,
             true,
@@ -58,7 +58,7 @@ public sealed class SetupFlowTests
             new ApiQuota(75, observedAt + 604_800, 604_800, false),
             [],
             0);
-        using var main = new MainWindowViewModel(new SingleStatusClient(StatusFetchResult.Success(status)));
+        using var main = new MainWindowViewModel(new SingleDetailsClient(DetailsFetchResult.Success(details)));
         var session = new RecordingSettingsSession(ClientSettings.Default);
         using var setup = new SetupViewModel(main, session) { SshHost = "host;whoami" };
         main.Start();
@@ -74,7 +74,7 @@ public sealed class SetupFlowTests
     public async Task SetupSaveFailureKeepsTheWindowOpenAndDoesNotAdvanceCompletion()
     {
         var observedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var status = new ApiStatusSnapshot(
+        var details = PublishedPairTestFixtures.DetailsGeneration(
             ApiState.Ready,
             observedAt,
             true,
@@ -82,7 +82,7 @@ public sealed class SetupFlowTests
             new ApiQuota(75, observedAt + 604_800, 604_800, false),
             [],
             0);
-        using var main = new MainWindowViewModel(new SingleStatusClient(StatusFetchResult.Success(status)));
+        using var main = new MainWindowViewModel(new SingleDetailsClient(DetailsFetchResult.Success(details)));
         var session = new FailOnSaveNumberSession(ClientSettings.Default, 2);
         using var setup = new SetupViewModel(main, session);
         main.Start();
@@ -179,9 +179,9 @@ public sealed class SetupFlowTests
         }
     }
 
-    private sealed class SingleStatusClient(StatusFetchResult result) : HealthyStatusClientBase
+    private sealed class SingleDetailsClient(DetailsFetchResult result) : HealthyDetailsClientBase
     {
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(result);
     }
 }

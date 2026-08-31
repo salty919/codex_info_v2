@@ -1,6 +1,6 @@
 # Runs the finite Windows UI Automation acceptance path against the installed
 # client.  The normal mode uses the configured loopback service.  CI may pass
-# -Fixture to provide a bounded, local /v1/status + /v1/details pair; this still
+# -Fixture to provide bounded local /v1/health and /v1/details responses; this still
 # drives the installed EXE and the real rendered windows, but does not require
 # an account or an SSH tunnel.
 [CmdletBinding()]
@@ -484,23 +484,19 @@ public static class CodexInfoWindowsE2EFixtureServer {
     private static TcpListener listener;
     private static Thread worker;
     private static volatile bool running;
-    private static string statusBody;
     private static string detailsBody;
     private static string publishedPair;
     private static int healthRequests;
-    private static int statusRequests;
     private static int detailsRequests;
     private static int preflightRequests;
     private static int clientRequests;
 
-    public static bool Start(string status, string details, string pair, int port) {
+    public static bool Start(string details, string pair, int port) {
         if (running) return false;
         try {
-            statusBody = status;
             detailsBody = details;
             publishedPair = pair;
             healthRequests = 0;
-            statusRequests = 0;
             detailsRequests = 0;
             preflightRequests = 0;
             clientRequests = 0;
@@ -527,8 +523,8 @@ public static class CodexInfoWindowsE2EFixtureServer {
 
     public static string RequestSummary() {
         return String.Format(
-            "health={0} status={1} details={2} preflight={3} client={4}",
-            healthRequests, statusRequests, detailsRequests, preflightRequests, clientRequests);
+            "health={0} details={1} preflight={2} client={3}",
+            healthRequests, detailsRequests, preflightRequests, clientRequests);
     }
 
     public static void Stop() {
@@ -579,15 +575,7 @@ public static class CodexInfoWindowsE2EFixtureServer {
             var body = "{\"api_version\":\"v1\",\"error\":\"not_found\"}";
             var includePublishedPair = false;
             if (parts.Length >= 2 && parts[0] == "GET") {
-                if (parts[1] == "/v1/status") {
-                    Interlocked.Increment(ref statusRequests);
-                    RecordRequestPhase(request);
-                    code = 200;
-                    reason = "OK";
-                    body = statusBody;
-                    includePublishedPair = true;
-                }
-                else if (parts[1] == "/v1/health") {
+                if (parts[1] == "/v1/health") {
                     Interlocked.Increment(ref healthRequests);
                     RecordRequestPhase(request);
                     code = 200;
@@ -1873,7 +1861,7 @@ function Get-E2EFixtureHeaderValues {
 function Invoke-E2EFixtureRawRequest {
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('/v1/health', '/v1/status', '/v1/details')]
+        [ValidateSet('/v1/health', '/v1/details')]
         [string]$Path
     )
 
@@ -2046,49 +2034,30 @@ function Assert-E2EFixtureHistorySamples {
 function Assert-E2EFixtureWireContract {
     param(
         [Parameter(Mandatory = $true)][psobject]$Health,
-        [Parameter(Mandatory = $true)][psobject]$Status,
         [Parameter(Mandatory = $true)][psobject]$Details
     )
 
     Assert-E2E ($Health.StatusCode -eq 200) "Fixture health status is not HTTP 200: $($Health.StatusCode)."
-    Assert-E2E ($Status.StatusCode -eq 200) "Fixture status status is not HTTP 200: $($Status.StatusCode)."
     Assert-E2E ($Details.StatusCode -eq 200) "Fixture details status is not HTTP 200: $($Details.StatusCode)."
 
     $healthPairs = @(Get-E2EFixtureHeaderValues -Response $Health -Name 'Codex-Info-Published-Pair')
-    $statusPairs = @(Get-E2EFixtureHeaderValues -Response $Status -Name 'Codex-Info-Published-Pair')
     $detailsPairs = @(Get-E2EFixtureHeaderValues -Response $Details -Name 'Codex-Info-Published-Pair')
     Assert-E2E ($healthPairs.Count -eq 0) "Fixture health must not expose Codex-Info-Published-Pair: count=$($healthPairs.Count)."
-    Assert-E2E ($statusPairs.Count -eq 1) "Fixture status must expose exactly one Codex-Info-Published-Pair: count=$($statusPairs.Count)."
     Assert-E2E ($detailsPairs.Count -eq 1) "Fixture details must expose exactly one Codex-Info-Published-Pair: count=$($detailsPairs.Count)."
-    $statusPair = [string]$statusPairs[0]
     $detailsPair = [string]$detailsPairs[0]
-    Assert-E2E ($statusPair -cmatch '^v1:[0-9a-f]{64}$') "Fixture status published pair is not canonical lowercase v1/sha256: '$statusPair'."
     Assert-E2E ($detailsPair -cmatch '^v1:[0-9a-f]{64}$') "Fixture details published pair is not canonical lowercase v1/sha256: '$detailsPair'."
-    Assert-E2E ($statusPair -ceq $detailsPair) 'Fixture status/details published pair mismatch.'
-
-    try {
-        $statusJson = ConvertFrom-Json -InputObject ([string]$Status.Body)
-    }
-    catch {
-        throw "Fixture status body is not valid JSON: $($_.Exception.Message)"
-    }
     try {
         $detailsJson = ConvertFrom-Json -InputObject ([string]$Details.Body)
     }
     catch {
         throw "Fixture details body is not valid JSON: $($_.Exception.Message)"
     }
-    $expectedStatusKeys = @(
-        'api_version', 'state', 'observed_at', 'authenticated',
-        'plan_label', 'quota', 'models', 'active_thread_count'
-    )
     $expectedDetailsKeys = @(
         'api_version', 'state', 'observed_at', 'authenticated',
         'plan_label', 'quota', 'models', 'active_thread_count',
         'history_periods', 'history_gaps', 'history_samples',
         'threads', 'estimated_cost_label'
     )
-    Assert-E2EFixtureJsonKeys -Json $statusJson -Expected $expectedStatusKeys -Endpoint 'Fixture status'
     Assert-E2EFixtureJsonKeys -Json $detailsJson -Expected $expectedDetailsKeys -Endpoint 'Fixture details'
 
     Assert-E2EFixtureHistorySamples -DetailsJson $detailsJson | Out-Null
@@ -2098,10 +2067,9 @@ function Assert-E2EFixtureWireContract {
 function Assert-E2EFixturePreflightResponses {
     param(
         [Parameter(Mandatory = $true)][psobject]$Health,
-        [Parameter(Mandatory = $true)][psobject]$Status,
         [Parameter(Mandatory = $true)][psobject]$Details
     )
-    Assert-E2EFixtureWireContract -Health $Health -Status $Status -Details $Details | Out-Null
+    Assert-E2EFixtureWireContract -Health $Health -Details $Details | Out-Null
     return $true
 }
 
@@ -2109,7 +2077,6 @@ function Invoke-E2EFixturePreflight {
     $responses = [ordered]@{}
     foreach ($requestSpec in @(
             @{ Name = 'health'; Path = '/v1/health' },
-            @{ Name = 'status'; Path = '/v1/status' },
             @{ Name = 'details'; Path = '/v1/details' })) {
         $response = Invoke-E2EFixtureRawRequest -Path $requestSpec.Path
         $responses[$requestSpec.Name] = $response
@@ -2119,11 +2086,10 @@ function Invoke-E2EFixturePreflight {
         Write-E2E ("fixture-preflight: request={0} status={1} pair-count={2} body-bytes={3} raw={4}" -f
             $requestSpec.Name, $response.StatusCode, $pairCount, ([Text.Encoding]::UTF8.GetByteCount([string]$response.Body)), $rawPath)
     }
-    Assert-E2EFixturePreflightResponses -Health $responses['health'] -Status $responses['status'] -Details $responses['details'] | Out-Null
-    Write-E2E 'fixture-preflight: PASS (health/status/details raw responses satisfy strict wire contract)'
+    Assert-E2EFixturePreflightResponses -Health $responses['health'] -Details $responses['details'] | Out-Null
+    Write-E2E 'fixture-preflight: PASS (health/details raw responses satisfy strict wire contract)'
     return [pscustomobject]@{
         Health = $responses['health']
-        Status = $responses['status']
         Details = $responses['details']
     }
 }
@@ -2136,9 +2102,6 @@ function New-E2EFixtureDocuments {
     $pastStart = $now - 25200
     $pastReset = $now - 14400
     $publishedPair = 'v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-    $status = @"
-{"api_version":"v1","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100}],"active_thread_count":3}
-"@
     # Keep this wire fixture as explicit JSON.  The details endpoint is a
     # strict thirteen-field contract; serializing nested PowerShell dictionaries
     # can silently change null/number kinds between Windows PowerShell builds.
@@ -2168,7 +2131,6 @@ function New-E2EFixtureDocuments {
         ($orderedSampleObjects -join ',') +
         $details.Substring($historySamplesEnd)
     return [pscustomobject]@{
-        Status = $status.Trim()
         Details = $details.Trim()
         PublishedPair = $publishedPair
         Now = $now
@@ -2177,10 +2139,6 @@ function New-E2EFixtureDocuments {
 
 function Enter-E2EFixture {
     $documents = New-E2EFixtureDocuments
-    [IO.File]::WriteAllText(
-        (Join-Path $script:e2eOutput 'fixture-status.json'),
-        $documents.Status,
-        [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText(
         (Join-Path $script:e2eOutput 'fixture-details.json'),
         $documents.Details,
@@ -2193,7 +2151,7 @@ function Enter-E2EFixture {
     New-Item -ItemType Directory -Path $settingsDirectory -Force | Out-Null
     $settingsJson = '{"language":"en","setupCompleted":true,"connectionConfigured":true,"timeZoneId":"UTC","connectionProfile":"none","connectionSelector":"none"}'
     [IO.File]::WriteAllText($script:e2eSettingsPath, $settingsJson, [Text.UTF8Encoding]::new($false))
-    Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start($documents.Status, $documents.Details, $documents.PublishedPair, $script:e2eFixturePort)) "Could not bind the fixture to loopback port $script:e2eFixturePort."
+    Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start($documents.Details, $documents.PublishedPair, $script:e2eFixturePort)) "Could not bind the fixture to loopback port $script:e2eFixturePort."
     $script:e2eFixtureRunning = $true
     Write-E2E "fixture: PASS periods=2 threads=3 endpoint=http://127.0.0.1:$script:e2eFixturePort"
 }
@@ -2231,12 +2189,11 @@ function Assert-E2EExpectedContractFailure {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
         [Parameter(Mandatory = $true)][psobject]$Health,
-        [Parameter(Mandatory = $true)][psobject]$Status,
         [Parameter(Mandatory = $true)][psobject]$Details,
         [string]$ExpectedReason = ''
     )
     try {
-        Assert-E2EFixturePreflightResponses -Health $Health -Status $Status -Details $Details | Out-Null
+        Assert-E2EFixturePreflightResponses -Health $Health -Details $Details | Out-Null
     }
     catch {
         if (-not [string]::IsNullOrWhiteSpace($ExpectedReason) -and $_.Exception.Message -notlike "*$ExpectedReason*") {
@@ -2524,23 +2481,16 @@ function Invoke-E2EFixtureContractTests {
     $pairHeaders = [ordered]@{
         'Codex-Info-Published-Pair' = @($documents.PublishedPair)
     }
-    $status = New-E2EContractTestResponse -StatusCode 200 -Body $documents.Status -Headers $pairHeaders
     $details = New-E2EContractTestResponse -StatusCode 200 -Body $documents.Details -Headers $pairHeaders
-    Assert-E2EFixturePreflightResponses -Health $health -Status $status -Details $details | Out-Null
+    Assert-E2EFixturePreflightResponses -Health $health -Details $details | Out-Null
     Write-E2E 'fixture-contract: PASS valid response'
 
-    $missingPairStatus = New-E2EContractTestResponse -StatusCode 200 -Body $documents.Status -Headers ([ordered]@{})
-    Assert-E2EExpectedContractFailure -Name 'pair-missing' -Health $health -Status $missingPairStatus -Details $details
-
-    $mismatchedDetailsHeaders = [ordered]@{
-        'Codex-Info-Published-Pair' = @('v1:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')
-    }
-    $mismatchedDetails = New-E2EContractTestResponse -StatusCode 200 -Body $documents.Details -Headers $mismatchedDetailsHeaders
-    Assert-E2EExpectedContractFailure -Name 'pair-mismatch' -Health $health -Status $status -Details $mismatchedDetails
+    $missingPairDetails = New-E2EContractTestResponse -StatusCode 200 -Body $documents.Details -Headers ([ordered]@{})
+    Assert-E2EExpectedContractFailure -Name 'pair-missing' -Health $health -Details $missingPairDetails
 
     $detailsWithoutGapsBody = $documents.Details.Replace(',"history_gaps":[]', '')
     $detailsWithoutGaps = New-E2EContractTestResponse -StatusCode 200 -Body $detailsWithoutGapsBody -Headers $pairHeaders
-    Assert-E2EExpectedContractFailure -Name 'history-gaps-missing' -Health $health -Status $status -Details $detailsWithoutGaps
+    Assert-E2EExpectedContractFailure -Name 'history-gaps-missing' -Health $health -Details $detailsWithoutGaps
 
     $detailsJson = ConvertFrom-Json -InputObject $documents.Details
     $unorderedSamples = @($detailsJson.history_samples)
@@ -2549,17 +2499,17 @@ function Invoke-E2EFixtureContractTests {
     $unorderedSamples[2] = $firstSample
     $detailsJson.history_samples = $unorderedSamples
     $unorderedDetails = New-E2EContractTestResponse -StatusCode 200 -Body ($detailsJson | ConvertTo-Json -Compress -Depth 10) -Headers $pairHeaders
-    Assert-E2EExpectedContractFailure -Name 'history-sample-order' -Health $health -Status $status -Details $unorderedDetails
+    Assert-E2EExpectedContractFailure -Name 'history-sample-order' -Health $health -Details $unorderedDetails
 
     $minuteMisalignedJson = ConvertFrom-Json -InputObject $documents.Details
     $minuteMisalignedJson.history_samples[0].timestamp = [Int64]$minuteMisalignedJson.history_samples[0].timestamp + 35
     $minuteMisalignedDetails = New-E2EContractTestResponse -StatusCode 200 -Body ($minuteMisalignedJson | ConvertTo-Json -Compress -Depth 10) -Headers $pairHeaders
-    Assert-E2EExpectedContractFailure -Name 'history-sample-minute-bucket' -Health $health -Status $status -Details $minuteMisalignedDetails -ExpectedReason 'minute bucket'
+    Assert-E2EExpectedContractFailure -Name 'history-sample-minute-bucket' -Health $health -Details $minuteMisalignedDetails -ExpectedReason 'minute bucket'
     Invoke-E2EGraphIdleBandSelfTest
     Invoke-E2ECaptureSelfTest
     Invoke-E2EGraphPixelScannerSelfTest
     Invoke-E2EGraphOracleSelfTest
-    Write-E2E 'fixture-contract: PASS five negative cases rejected individually'
+    Write-E2E 'fixture-contract: PASS four negative cases rejected individually'
 }
 
 function Open-E2EChildWindow {
@@ -2649,7 +2599,7 @@ try {
     if ($FixtureContractTest) {
         Write-E2E 'fixture-contract-test: start'
         $contractDocuments = New-E2EFixtureDocuments
-        Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start($contractDocuments.Status, $contractDocuments.Details, $contractDocuments.PublishedPair, 0)) 'Could not bind the fixture contract test to an ephemeral loopback port.'
+        Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start($contractDocuments.Details, $contractDocuments.PublishedPair, 0)) 'Could not bind the fixture contract test to an ephemeral loopback port.'
         $script:e2eFixturePort = [CodexInfoWindowsE2EFixtureServer]::BoundPort()
         $script:e2eFixtureRunning = $true
         Write-E2E 'fixture-contract-test: fixture server started without launching the client'
@@ -2720,7 +2670,7 @@ try {
     Assert-E2E ($null -ne $detailsStatus) 'Main details status is missing.'
     $detailsStatusText = [string]$detailsStatus.Current.Name
     Write-E2E ("main: details status='{0}' observed" -f $detailsStatusText)
-    # A screenshot or a successful status request is not sufficient evidence:
+    # A screenshot or a successful details request is not sufficient evidence:
     # the main surface must have accepted the matching details generation.
     # Consume the locale-independent AutomationProperties.Name contract rather
     # than attempting to decode localized rendered text.
@@ -2733,7 +2683,7 @@ try {
     Write-E2E ("main: details contract latest={0} failure={1} length={2}" -f $detailsIsLatest, $detailsHasFailure, $detailsStatusText.Length)
     Assert-E2E ($detailsIsLatest -and -not $detailsHasFailure) `
         "Main details status is not a complete accepted generation: '$detailsStatusText'"
-    Write-E2E 'main-details-status: PASS (matching status/details generation accepted)'
+    Write-E2E 'main-details-status: PASS (single details generation accepted)'
 
     # Finite path: one Graph window, one period round-trip, two metrics, then
     # one OFF/ON cycle for each of four independent series.  No combinations
@@ -3008,7 +2958,7 @@ try {
     else {
         # Real data mode accepts the server's row identities, but still
         # requires a row container with several visible cells (title, model,
-        # and metadata). An empty or status-only window cannot pass.
+        # and metadata). An empty or summary-only window cannot pass.
         $threadRows = @(Get-E2EControlElements $threadsRoot ([System.Windows.Automation.ControlType]::ListItem))
         if ($threadRows.Count -gt 0) {
             $richRows = @($threadRows | Where-Object { @(Get-E2ETextValues $_).Count -ge 4 })

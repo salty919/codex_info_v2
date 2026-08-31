@@ -11,11 +11,6 @@ namespace CodexInfo.WindowsClient.ViewModels;
 
 public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
 {
-    public ModelUsageViewModel(ApiModelUsage usage)
-        : this(usage.Name, usage.InputTokens, usage.CachedInputTokens, usage.OutputTokens, null, null, null)
-    {
-    }
-
     public ModelUsageViewModel(ApiDetailsModelUsage usage)
         : this(
             usage.Name,

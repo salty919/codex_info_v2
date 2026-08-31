@@ -114,7 +114,7 @@ public sealed class SetupConnectionEnvironmentTests
     private static async Task<MainWindowViewModel> ReadyMainAsync()
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var main = new MainWindowViewModel(new SingleStatusClient(new ApiStatusSnapshot(
+        var main = new MainWindowViewModel(new SingleDetailsClient(PublishedPairTestFixtures.DetailsGeneration(
             ApiState.Ready,
             now,
             true,
@@ -206,9 +206,9 @@ public sealed class SetupConnectionEnvironmentTests
         }
     }
 
-    private sealed class SingleStatusClient(ApiStatusSnapshot snapshot) : HealthyStatusClientBase
+    private sealed class SingleDetailsClient(ApiDetailsSnapshot snapshot) : HealthyDetailsClientBase
     {
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
-            Task.FromResult(StatusFetchResult.Success(snapshot));
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(DetailsFetchResult.Success(snapshot));
     }
 }

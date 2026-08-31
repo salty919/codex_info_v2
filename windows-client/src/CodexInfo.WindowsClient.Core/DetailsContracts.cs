@@ -11,9 +11,8 @@ public enum DetailsFetchFailure
 }
 
 /// <summary>
-/// The immutable, whitelisted data returned by GET /v1/details.  Details are
-/// deliberately separate from status: a transient history/thread failure must
-/// never erase a good quota status (or vice versa).
+/// The immutable, whitelisted data returned by GET /v1/details. Core values,
+/// history, models, and threads form one atomic visible generation.
 /// </summary>
 public sealed record ApiDetailsSnapshot(
     ApiState State,

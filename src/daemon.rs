@@ -17,6 +17,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -441,6 +442,13 @@ struct LockSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopPhase {
+    Initial,
+    PreSignal,
+    PostSignal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StopError {
     LockUnavailable,
     LockInvalid,
@@ -456,9 +464,29 @@ pub(crate) enum StopError {
 /// malformed, incomplete, symlinked, oversized, or replaced lock is never
 /// converted into an authority or removed by the stop path.
 fn read_lock_snapshot(path: &Path) -> Result<Option<LockSnapshot>, StopError> {
+    read_lock_snapshot_for_phase_with_hook(path, StopPhase::Initial, None)
+}
+
+fn read_lock_snapshot_for_phase(
+    path: &Path,
+    phase: StopPhase,
+) -> Result<Option<LockSnapshot>, StopError> {
+    read_lock_snapshot_for_phase_with_hook(path, phase, None)
+}
+
+fn read_lock_snapshot_for_phase_with_hook(
+    path: &Path,
+    phase: StopPhase,
+    after_read: Option<&dyn Fn()>,
+) -> Result<Option<LockSnapshot>, StopError> {
     let path_metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match phase {
+                StopPhase::PreSignal => Err(StopError::OwnerChanged),
+                StopPhase::Initial | StopPhase::PostSignal => Ok(None),
+            }
+        }
         Err(_) => return Err(StopError::LockUnavailable),
     };
     if path_metadata.file_type().is_symlink()
@@ -467,8 +495,28 @@ fn read_lock_snapshot(path: &Path) -> Result<Option<LockSnapshot>, StopError> {
     {
         return Err(StopError::LockInvalid);
     }
-    let mut file = File::open(path).map_err(|_| StopError::LockUnavailable)?;
-    let file_metadata = file.metadata().map_err(|_| StopError::LockUnavailable)?;
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match phase {
+                StopPhase::PreSignal => Err(StopError::OwnerChanged),
+                StopPhase::Initial => Err(StopError::LockUnavailable),
+                StopPhase::PostSignal => Ok(None),
+            }
+        }
+        Err(_) => return Err(StopError::LockUnavailable),
+    };
+    let file_metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match phase {
+                StopPhase::PreSignal => Err(StopError::OwnerChanged),
+                StopPhase::Initial => Err(StopError::LockUnavailable),
+                StopPhase::PostSignal => Ok(None),
+            }
+        }
+        Err(_) => return Err(StopError::LockUnavailable),
+    };
     if !lock_is_same_file(&path_metadata, &file_metadata) {
         return Err(StopError::OwnerChanged);
     }
@@ -478,13 +526,20 @@ fn read_lock_snapshot(path: &Path) -> Result<Option<LockSnapshot>, StopError> {
     if bytes.len() > MAX_LOCK_BYTES as usize {
         return Err(StopError::LockInvalid);
     }
-    let current_path_metadata = fs::symlink_metadata(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            StopError::OwnerChanged
-        } else {
-            StopError::LockUnavailable
+    if let Some(after_read) = after_read {
+        after_read();
+    }
+    let current_path_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return match phase {
+                StopPhase::PreSignal => Err(StopError::OwnerChanged),
+                StopPhase::Initial => Err(StopError::OwnerChanged),
+                StopPhase::PostSignal => Ok(None),
+            }
         }
-    })?;
+        Err(_) => return Err(StopError::LockUnavailable),
+    };
     if current_path_metadata.file_type().is_symlink()
         || !lock_is_same_file(&current_path_metadata, &file_metadata)
     {
@@ -556,7 +611,7 @@ pub(crate) fn stop_daemon() -> Result<(), StopError> {
     #[cfg(target_os = "linux")]
     {
         let pidfd = pidfd_for_process(initial.record.pid)?;
-        let Some(revalidated) = read_lock_snapshot(&path)? else {
+        let Some(revalidated) = read_lock_snapshot_for_phase(&path, StopPhase::PreSignal)? else {
             return Err(StopError::OwnerChanged);
         };
         let revalidated_process =
@@ -571,13 +626,13 @@ pub(crate) fn stop_daemon() -> Result<(), StopError> {
         pidfd_send_signal(&pidfd, Signal::Term).map_err(|_| StopError::SignalFailed)?;
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let phase = StopPhase::PostSignal;
         loop {
-            match read_lock_snapshot(&path) {
+            match read_lock_snapshot_for_phase(&path, phase) {
                 Ok(None) => return Ok(()),
                 Ok(Some(current)) if current != initial => return Err(StopError::OwnerChanged),
                 Ok(Some(_)) => {}
-                Err(StopError::OwnerChanged) => return Err(StopError::OwnerChanged),
-                Err(_) => return Err(StopError::LockUnavailable),
+                Err(error) => return Err(error),
             }
             if std::time::Instant::now() >= deadline {
                 return Err(StopError::Timeout);
@@ -780,6 +835,38 @@ fn scan_and_store(database: &Path, hint: ResetHint) -> Result<usize, DaemonError
     Ok(rows.len())
 }
 
+enum RecorderCommand {
+    StartupMaintenance {
+        now: chrono::DateTime<chrono::Utc>,
+        completed: mpsc::SyncSender<Result<(), String>>,
+    },
+    Store {
+        samples: Vec<crate::usage_store::UsageHistorySample>,
+        committed: mpsc::SyncSender<Result<(), String>>,
+    },
+    Shutdown,
+}
+
+fn maintain_history_database(
+    database: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    UsageStore::backup_generations(database, 3).map_err(|error| error.to_string())?;
+    let mut store = UsageStore::open(database).map_err(|error| error.to_string())?;
+    store
+        .prune_older_than_three_months(now)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn maintain_history_database_for_test(
+    database: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    maintain_history_database(database, now)
+}
+
 fn run_cycle(
     database: &Path,
     previous: &mut Option<InputFingerprint>,
@@ -814,15 +901,18 @@ fn run_cycle(
 /// handler. The service process owns SIGINT/SIGTERM and stops this bounded
 /// worker before releasing the REST listener.
 pub(crate) struct RecorderWorker {
-    shutdown: Option<mpsc::Sender<()>>,
+    commands: Option<mpsc::Sender<RecorderCommand>>,
     worker: Option<JoinHandle<()>>,
     active: bool,
+    committed_revision: Arc<AtomicU64>,
 }
 
 impl RecorderWorker {
     pub(crate) fn start() -> Result<Self, String> {
-        let (shutdown, shutdown_receiver) = mpsc::channel();
+        let (commands, command_receiver) = mpsc::channel();
         let (started, started_receiver) = mpsc::sync_channel(1);
+        let committed_revision = Arc::new(AtomicU64::new(0));
+        let worker_revision = Arc::clone(&committed_revision);
         let worker = thread::Builder::new()
             .name("codex-info-recorder".into())
             .spawn(move || {
@@ -860,6 +950,7 @@ impl RecorderWorker {
 
                 match run_cycle(&database, &mut previous) {
                     Ok(rows) if rows > 0 => {
+                        worker_revision.fetch_add(1, Ordering::Release);
                         eprintln!("codex-info: recorder committed {rows} samples")
                     }
                     Ok(_) => {}
@@ -870,11 +961,34 @@ impl RecorderWorker {
                 }
                 let interval = daemon_interval_from_environment();
                 loop {
-                    match shutdown_receiver.recv_timeout(interval) {
-                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                    match command_receiver.recv_timeout(interval) {
+                        Ok(RecorderCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
+                            break;
+                        }
+                        Ok(RecorderCommand::StartupMaintenance { now, completed }) => {
+                            let _ = completed.send(maintain_history_database(&database, now));
+                        }
+                        Ok(RecorderCommand::Store { samples, committed }) => {
+                            let result = UsageStore::open(&database)
+                                .map_err(|error| error.to_string())
+                                .and_then(|mut store| {
+                                    store
+                                        .upsert_samples(&samples)
+                                        .map_err(|error| error.to_string())
+                                });
+                            if result.is_ok() && !samples.is_empty() {
+                                worker_revision.fetch_add(1, Ordering::Release);
+                                eprintln!(
+                                    "codex-info: recorder committed {} samples",
+                                    samples.len()
+                                );
+                            }
+                            let _ = committed.send(result);
+                        }
                         Err(RecvTimeoutError::Timeout) => {
                             match run_cycle(&database, &mut previous) {
                                 Ok(rows) if rows > 0 => {
+                                    worker_revision.fetch_add(1, Ordering::Release);
                                     eprintln!("codex-info: recorder committed {rows} samples")
                                 }
                                 Ok(_) => {}
@@ -891,17 +1005,18 @@ impl RecorderWorker {
 
         match started_receiver.recv_timeout(Duration::from_secs(2)) {
             Ok(Ok(active)) => Ok(Self {
-                shutdown: Some(shutdown),
+                commands: Some(commands),
                 worker: Some(worker),
                 active,
+                committed_revision,
             }),
             Ok(Err(error)) => {
-                let _ = shutdown.send(());
+                let _ = commands.send(RecorderCommand::Shutdown);
                 let _ = worker.join();
                 Err(error)
             }
             Err(_) => {
-                let _ = shutdown.send(());
+                let _ = commands.send(RecorderCommand::Shutdown);
                 let _ = worker.join();
                 Err(DaemonError::Runtime.to_string())
             }
@@ -912,9 +1027,56 @@ impl RecorderWorker {
         self.active
     }
 
+    /// Run the sole normal destructive store operation on the recorder's
+    /// serialized writer thread. A failed backup prevents pruning.
+    pub(crate) fn startup_maintenance(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        let commands = self
+            .commands
+            .as_ref()
+            .ok_or_else(|| DaemonError::Runtime.to_string())?;
+        let (completed, receiver) = mpsc::sync_channel(1);
+        commands
+            .send(RecorderCommand::StartupMaintenance { now, completed })
+            .map_err(|_| DaemonError::Runtime.to_string())?;
+        receiver
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| DaemonError::Runtime.to_string())?
+    }
+
+    /// Commit state-owned observations through the same durable writer that
+    /// performs the independent session scan. The acknowledgement is sent
+    /// only after the SQLite transaction has committed, so the service can
+    /// refresh its read model without racing its own write.
+    pub(crate) fn store_samples(
+        &self,
+        samples: Vec<crate::usage_store::UsageHistorySample>,
+    ) -> Result<(), String> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let commands = self
+            .commands
+            .as_ref()
+            .ok_or_else(|| DaemonError::Runtime.to_string())?;
+        let (committed, receiver) = mpsc::sync_channel(1);
+        commands
+            .send(RecorderCommand::Store { samples, committed })
+            .map_err(|_| DaemonError::Runtime.to_string())?;
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| DaemonError::Runtime.to_string())?
+    }
+
+    pub(crate) fn committed_revision(&self) -> u64 {
+        self.committed_revision.load(Ordering::Acquire)
+    }
+
     pub(crate) fn shutdown(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
+        if let Some(commands) = self.commands.take() {
+            let _ = commands.send(RecorderCommand::Shutdown);
         }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -1049,6 +1211,38 @@ mod tests {
             Some(value) => std::env::set_var("CODEX_INFO_DATA_DIR", value),
             None => std::env::remove_var("CODEX_INFO_DATA_DIR"),
         }
+    }
+
+    #[test]
+    fn post_signal_lock_disappearance_after_payload_read_is_success() {
+        let root = temp_root("post-signal-disappearance");
+        let path = root.join(DAEMON_LOCK_FILE_NAME);
+        let current = process_identity(std::process::id()).unwrap();
+        let record = LockRecord {
+            pid: current.pid,
+            started_at: unix_now(),
+            starttime_ticks: current.starttime_ticks,
+            executable_device: current.executable_device,
+            executable_inode: current.executable_inode,
+            owner_nonce: "cd".repeat(16),
+        };
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        let remove_lock = || fs::remove_file(&path).unwrap();
+        let pre_signal =
+            read_lock_snapshot_for_phase_with_hook(&path, StopPhase::PreSignal, Some(&remove_lock));
+        assert_eq!(pre_signal, Err(StopError::OwnerChanged));
+        assert!(!path.exists());
+
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let post_signal = read_lock_snapshot_for_phase_with_hook(
+            &path,
+            StopPhase::PostSignal,
+            Some(&remove_lock),
+        );
+        assert_eq!(post_signal, Ok(None));
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

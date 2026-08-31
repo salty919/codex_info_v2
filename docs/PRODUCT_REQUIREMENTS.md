@@ -28,15 +28,18 @@
 
 ## 3. 収集・API・live判定
 
-- 同一profileのwriter、recorder、REST publisherはそれぞれ有効ownerを1つだけ持つ。旧lease、旧epoch、旧cycleの結果は公開しない。
+- 同一profileのresident serviceをquota、local usage、historyの唯一のauthority/writerとする。service内のrecorderとREST publisherは同じ有効owner、lease、epoch、cycleに従い、旧世代の結果を公開しない。
 - DBは履歴inventoryであり、実行中判定の単独根拠にしない。同一cycleで検証したprocess identityとrollout terminal stateの両方を用いる。
 - live rolloutでUTF-8、JSON、event kind、task stateを検証できないrecordがあるcycleは拒否し、最後の完全snapshotを保持する。
 - RESTはread-onlyである。未知route/method、不正header/schema、oversize requestからDB、settings、cursor、processを変更しない。
 - GUIなしserverはwindow、Slint component、display backendを生成せず、明示したservice lifecycleで起動・停止・復旧する。
+- resident serviceは一つの完全candidateからimmutable details generationを公開する。Linux / WindowsのMain、Graph、Threadsはstrict validation済みの単一`GET /v1/details` generationだけをatomic表示rootとして消費し、SQLite/JSONL/app-serverの再収集、値の再計算、複数row/endpointのmergeを行わない。公開するread-only endpointはreadiness用`GET /v1/health`と表示正本`GET /v1/details`だけとする。
+- `GET /v1/health`の200はresident serviceがread-only snapshot requestを受理できるreadinessを表す。認証済み、data `state=ready`、最新収集成功を意味しない。認証開始・確認はcontrol-onlyであり、control応答を表示dataとしてcommitせず、その後に受理した新しいdetails generationだけが画面を変えられる。
 
 ## 4. データ保護
 
 - 履歴DB、verified backup、設定、Linux側履歴は、install、update、rollback、uninstall、restore失敗で削除しない。
+- history canonicalization、candidate reject、UI表示を理由に既存のraw SQLite rowをrewrite/deleteしない。競合または境界不明時はraw DBとlast-good publicationを保持する。
 - migration、restore、updateはcandidateを完全検証してからatomic switchする。検証またはswitch失敗時は旧世代だけをcurrentとして保持する。
 - cursorはsource identityと結合し、rotate、truncate、replaceを区別する。古いoffsetによるskipと二重登録を防ぐ。
 - backup作成または検証に失敗した場合は既存のverified世代をpruneしない。
@@ -173,8 +176,34 @@ Windows版の実装は同じ `tests/fixtures/graph_delayed_quota.json` を入力
 をそれぞれ独立に検証する。片方の描画結果や補間ヘルパーをもう片方の
 期待値生成に使うことは禁止する。仕様・fixture・実装のいずれかが不一致、
 または実機証跡が欠ける場合は合格ではなく保留とする。
+- shared rollover fixtureはperiod AからBへの境界で残量/累積額が
+  `100% / $1 → 41% / $323.674247`となる固定oracleを持つ。これと
+  `graph_delayed_quota`、既存のhistory、rolling、delayed、gap、no-history、REST、Windows回帰を、
+  同じproduct revisionに対して有限な既存testへ統合して確認する。別workflow gateや全直積を追加せず、
+  どれか未実行・不一致ならそのrevisionを合格にしない。
 - 自動検査は実行されたtestが0件でないことを確認する。UI変更は実画面、Windows固有動作は実Windowsで確認する。
 - 未確認の外部authority値を創作してPASSにしない。値がない場合のfail-closed動作を検証する。
+
+### 履歴・snapshot validationを残す理由
+
+| validation | 防ぐcase | 外した場合に起きること |
+| --- | --- | --- |
+| profile-owned DB scope・`timestamp/reset_at`で検証したcycle・minuteの一致 | 別profile/cycle/minuteの混在 | 異なる観測を一つの履歴sampleとして公開する |
+| distinct non-null quotaが最大1個 | 同一minuteの相反する残量 | row順やnull化で任意のquotaを選ぶ |
+| 既存cumulative vectorのcomponentwise-dominance | 非比較vectorやcomponent別maxによる合成 | sourceに存在しない累積値を作る |
+| public candidateのraw/canonical duplicate拒否 | 同一canonical minuteの複数値 | Graphへ垂直変化またはsink依存の値を渡す |
+| detailsのstrict schema/domain/header検証 | 欠落・未知・重複・stale generation | Main/Graph/Threadsが異なるrootを表示する |
+| health readiness | listenerだけが存在しsnapshotを返せない状態 | Setupが利用不能serviceを接続済みと扱う |
+
+`HistoryCanonicalizer`は同じprofile-owned DB read内で、値形状ではなく既存`timestamp/reset_at`のbounded
+rolling規則から同一cycleと検証できたminuteのrowだけを対象にする。今回の回復に新しいpartition列や
+永続CycleSeqを要求しない。
+distinct non-null quotaが0または1個で、既存のcumulative vector
+`(sol_dollars, terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens)`のうち全rowを
+componentwiseに支配する値が一意に存在するときだけ、そのquota（0個なら`null`）とdominant vectorを
+1 logical sampleにする。quota競合、非比較、dominant vector不存在・非一意、scope/cycle/minute/period境界不明は
+candidate全体をrejectしてlast-goodを保持する。残量100%、7日窓、quota-onlyなど値の形で除外せず、
+component別max、last-row、null化、任意mergeを行わない。
 
 ## 「正しい表示」の判定（必須不変条件）
 
@@ -183,12 +212,12 @@ Windows版の実装は同じ `tests/fixtures/graph_delayed_quota.json` を入力
 1. 同一の認証主体でquotaを定期更新している間は、前回の完全なモデル使用量・履歴・threadを保持する。更新途中の欠測を空、0、未取得へ置き換えない。
 2. `reset_at`がサービスのrolling値として移動しても同一期間を維持する。実際の期間切替は、quotaの回復または期間境界を示す観測がある場合だけ新期間へ移す。
 3. モデル使用量（ドル・token）と残量（%）は別観測として扱う。残量観測がない時間帯をモデル使用量から逆算せず、遅れて届いた残量観測はその時刻へ反映する。
-4. 同一観測時刻に異なる`reset_at`の行が存在する場合、100%かつ使用量0の単独行だけをrolling更新の候補とし、それ以外の残量を選択中期間へ混在させない。行順で値を上書きせず、期間境界も同一時刻の単独行だけで短縮しない。
+4. 同じprofile-owned DB read内で、既存`timestamp/reset_at`のbounded rolling規則から同一cycleと検証できた同じminuteのrowだけを`HistoryCanonicalizer`が1 logical sampleへ正規化する。distinct non-null quotaは最大1個、cumulative vectorは既存のcomponentwise-dominant値だけを採用し、同値duplicateは冪等に扱う。競合・非比較・境界不明はcandidate全体をrejectする。100%・7日・quota-onlyという値形状では除外せず、UI/REST/Windowsでmerge/max/last/null化しない。
 5. 過去期間はその期間に属する全モデル系列を累積値で描画し、未使用区間は専用の未使用帯として表示する。SOL/TERRA/LUNAのいずれかを0や欠測へ黙って変換しない。
 6. 明示的なログアウトまたは認証主体変更だけが可視状態を消去する。通信失敗・quota更新中・local収集中は最後の完全表示を保持し、失敗状態は別途表示する。
-7. X版とWindows版は同一fixtureの固定oracle（期間数、期間境界、累積SOL、遅延残量、未観測区間）を独立に満たす。どれか一つでも不一致、実機証跡欠落、またはテスト未実行なら合格ではなく保留とする。
+7. X版とWindows版はshared rollover fixtureの`100% / $1 → 41% / $323.674247`と`graph_delayed_quota`を含む同一fixtureの固定oracle（期間数、期間境界、累積SOL、遅延残量、未観測区間）を独立に満たす。既存history/rolling/delayed/gap/no-history/REST/Windows回帰を同一revisionで確認し、どれか一つでも不一致、実機証跡欠落、またはテスト未実行なら合格ではなく保留とする。
 8. 製品バージョンはメイン画面に一度だけ表示し、子ウインドウのタイトルやボタンへ重複表示しない。値はX版・Windows版とも同じリリースversion authorityから導出する。
-9. Windows版の初回起動では、health・status・detailsの最初の完全な世代が揃うまで内容領域を表示せず、固定レイアウト上にスピナーを表示する。途中の部分世代を順番に描画して画面をばたつかせてはならない。初回取得が失敗した場合はスピナーを解除し、失敗状態と再試行手段を表示する。
-10. X版の初回起動でも、認証済み状態へ遷移した後のquota・local usage・threadの最初の完全な世代が揃うまで主画面の内容領域を公開せず、ヘッダー（製品バージョンを含む）を固定したままスピナーを表示する。local収集またはapp-serverが失敗した場合はスピナーを解除し、最後の完全表示または失敗状態を表示する。
+9. Windows版の初回起動では、health readiness後に最初のstrict validation済み`/v1/details` generationが揃うまで内容領域を表示せず、固定レイアウト上にスピナーを表示する。control応答とのmerge、途中fieldの順番描画をせず、初回取得失敗時はスピナーを解除して失敗状態と再試行手段を表示する。
+10. X版の初回起動でも、health readiness後に最初のstrict validation済み`/v1/details` generationが揃うまで主画面の内容領域を公開せず、ヘッダー（製品バージョンを含む）を固定したままスピナーを表示する。details取得が失敗した場合はスピナーを解除し、最後の完全表示または失敗状態を表示する。
 11. X版の起動ウィンドウは主モニターの可視デスクトップ内へ配置し、別モニターや負座標へ出して利用者から見えない状態にしてはならない。起動成功は、可視範囲内の実ウィンドウと内容の実画面で確認する。
 12. `--ui` のdaemon/REST起動に失敗しても、X版のGUIを消失・即時終了させず、接続失敗と再試行手段を表示する。
