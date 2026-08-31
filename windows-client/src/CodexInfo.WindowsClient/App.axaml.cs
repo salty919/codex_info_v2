@@ -41,10 +41,17 @@ public partial class App : Application
                 : settings;
             LocalizationService.SetLanguage(settings.Language);
             LocalizationService.SetTimeZone(settings.TimeZoneId);
-            ILoopbackStatusClient client = preview ? new PreviewLoopbackClient() : new LoopbackStatusClient();
-            ILoopbackDetailsClient detailsClient = preview
-                ? (ILoopbackDetailsClient)client
-                : new LoopbackStatusClient();
+            ILoopbackDetailsClient detailsClient;
+            if (preview)
+            {
+                var client = new PreviewLoopbackClient();
+                detailsClient = client;
+            }
+            else
+            {
+                var client = new LoopbackStatusClient();
+                detailsClient = client;
+            }
             var supervisor = preview ? null : new ConnectionSupervisor();
             IWindowsUpdateCoordinator updateCoordinator = preview
                 ? new PreviewUpdateCoordinator()
@@ -57,7 +64,6 @@ public partial class App : Application
                         "CodexInfo",
                         "updates"));
             var viewModel = new MainWindowViewModel(
-                client,
                 detailsClient,
                 supervisor,
                 updateCoordinator);

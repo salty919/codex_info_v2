@@ -16,50 +16,20 @@ public sealed class LoopbackStatusClientTests
     private const string CanonicalPublishedPair =
         "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
 
-    [Theory]
-    [InlineData("ready", ApiState.Ready)]
-    [InlineData("auth_required", ApiState.AuthRequired)]
-    [InlineData("error", ApiState.Error)]
-    [InlineData("initializing", ApiState.Initializing)]
-    public async Task ValidStatesProduceValidatedSnapshots(string state, ApiState expectedState)
-    {
-        var json = ValidJson(state);
-        var handler = new StubHandler(_ => JsonResponse(json, includePublishedPair: true));
-
-        using var client = new LoopbackStatusClient(handler);
-        var result = await client.FetchAsync(CancellationToken.None);
-
-        Assert.True(result.IsSuccess);
-        Assert.Null(result.Failure);
-        Assert.NotNull(result.Snapshot);
-        Assert.Equal(expectedState, result.Snapshot.State);
-        Assert.Equal("Pro", result.Snapshot.PlanLabel);
-        Assert.Equal(98.5, result.Snapshot.Quota!.RemainingPercent);
-        Assert.Single(result.Snapshot.Models);
-        Assert.Equal("SOL", result.Snapshot.Models[0].Name);
-        Assert.Equal((ulong)3, result.Snapshot.ActiveThreadCount);
-    }
-
     [Fact]
-    public async Task PublishedPairIsRetainedForStatusAndDetails()
+    public async Task PublishedPairIsRetainedForDetails()
     {
-        var status = await Fetch(ValidJson("ready"));
         var details = await FetchDetails(ValidDetailsJson());
 
-        Assert.True(status.IsSuccess);
         Assert.True(details.IsSuccess);
-        Assert.Equal(CanonicalPublishedPair, status.Snapshot!.PublishedPair?.ToString());
         Assert.Equal(CanonicalPublishedPair, details.Snapshot!.PublishedPair?.ToString());
     }
 
     [Fact]
-    public async Task PublishedPairIsRequiredForStatusAndDetails()
+    public async Task PublishedPairIsRequiredForDetails()
     {
-        var status = await FetchWithoutPublishedPair(ValidJson("ready"));
         var details = await FetchDetailsWithoutPublishedPair(ValidDetailsJson());
 
-        Assert.Equal(StatusFetchFailure.Response, status.Failure);
-        Assert.Null(status.Snapshot);
         Assert.Equal(DetailsFetchFailure.Response, details.Failure);
         Assert.Null(details.Snapshot);
     }
@@ -81,26 +51,17 @@ public sealed class LoopbackStatusClientTests
 
         foreach (var value in invalidValues)
         {
-            var status = await FetchStatusWithPairValues(ValidJson("ready"), value);
             var details = await FetchDetailsWithPairValues(ValidDetailsJson(), value);
 
-            Assert.Equal(StatusFetchFailure.Response, status.Failure);
-            Assert.Null(status.Snapshot);
             Assert.Equal(DetailsFetchFailure.Response, details.Failure);
             Assert.Null(details.Snapshot);
         }
 
-        var duplicateStatus = await FetchStatusWithPairValues(
-            ValidJson("ready"),
-            CanonicalPublishedPair,
-            CanonicalPublishedPair);
         var duplicateDetails = await FetchDetailsWithPairValues(
             ValidDetailsJson(),
             CanonicalPublishedPair,
             CanonicalPublishedPair);
 
-        Assert.Equal(StatusFetchFailure.Response, duplicateStatus.Failure);
-        Assert.Null(duplicateStatus.Snapshot);
         Assert.Equal(DetailsFetchFailure.Response, duplicateDetails.Failure);
         Assert.Null(duplicateDetails.Snapshot);
     }
@@ -108,16 +69,11 @@ public sealed class LoopbackStatusClientTests
     [Fact]
     public async Task PublishedPairHeaderNameIsCaseInsensitive()
     {
-        var status = await FetchStatusWithPairValues(
-            ValidJson("ready"),
-            CanonicalPublishedPair,
-            headerName: PublishedPairHeader.ToLowerInvariant());
         var details = await FetchDetailsWithPairValues(
             ValidDetailsJson(),
             CanonicalPublishedPair,
             headerName: PublishedPairHeader.ToUpperInvariant());
 
-        Assert.True(status.IsSuccess);
         Assert.True(details.IsSuccess);
     }
 
@@ -134,38 +90,6 @@ public sealed class LoopbackStatusClientTests
         Assert.True(withPair.IsSuccess);
         Assert.Equal(new ApiHealthSnapshot("v1", "codex-info"), withoutPair.Snapshot);
         Assert.Equal(new ApiHealthSnapshot("v1", "codex-info"), withPair.Snapshot);
-    }
-
-    [Fact]
-    public async Task NullableQuotaAndEmptyModelsAreAccepted()
-    {
-        var json = ValidJson("ready")
-            .Replace("\"plan_label\":\"Pro\"", "\"plan_label\":null", StringComparison.Ordinal)
-            .Replace("\"quota\":{\"remaining_percent\":98.5,\"reset_at\":253402300799,\"window_seconds\":1,\"monthly\":false}", "\"quota\":null", StringComparison.Ordinal)
-            .Replace("\"models\":[{\"name\":\"SOL\",\"input_tokens\":1,\"cached_input_tokens\":2,\"output_tokens\":3}]", "\"models\":[]", StringComparison.Ordinal);
-        var result = await Fetch(json);
-
-        Assert.True(result.IsSuccess);
-        Assert.Null(result.Snapshot!.PlanLabel);
-        Assert.Null(result.Snapshot.Quota);
-        Assert.Empty(result.Snapshot.Models);
-    }
-
-    [Fact]
-    public async Task EndpointAndMethodAreFixed()
-    {
-        var handler = new StubHandler(request =>
-        {
-            Assert.Equal(HttpMethod.Get, request.Method);
-            Assert.Equal("http://127.0.0.1:8787/v1/status", request.RequestUri!.AbsoluteUri);
-            return JsonResponse(ValidJson("ready"), includePublishedPair: true);
-        });
-
-        using var client = new LoopbackStatusClient(handler);
-        var result = await client.FetchAsync(CancellationToken.None);
-
-        Assert.True(result.IsSuccess);
-        Assert.NotNull(handler.LastRequest);
     }
 
     [Fact]
@@ -246,33 +170,21 @@ public sealed class LoopbackStatusClientTests
         Assert.Null(result.Snapshot);
     }
 
-    [Theory]
-    [InlineData("status")]
-    [InlineData("details")]
-    public async Task StatusAndDetailsRequireHttp200(string endpoint)
+    [Fact]
+    public async Task DetailsRequiresHttp200()
     {
-        var handler = new StubHandler(request =>
+        var handler = new StubHandler(_ =>
         {
-            var response = endpoint == "status"
-                ? JsonResponse(ValidJson("ready"))
-                : JsonResponse(ValidDetailsJson());
+            var response = JsonResponse(ValidDetailsJson());
             response.StatusCode = HttpStatusCode.Created;
             return response;
         });
 
         using var client = new LoopbackStatusClient(handler);
-        if (endpoint == "status")
-        {
-            var result = await client.FetchAsync(CancellationToken.None);
-            Assert.Equal(StatusFetchFailure.Transport, result.Failure);
-            Assert.Null(result.Snapshot);
-        }
-        else
-        {
-            var result = await client.FetchDetailsAsync(CancellationToken.None);
-            Assert.Equal(DetailsFetchFailure.Transport, result.Failure);
-            Assert.Null(result.Snapshot);
-        }
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.Equal(DetailsFetchFailure.Transport, result.Failure);
+        Assert.Null(result.Snapshot);
     }
 
     [Fact]
@@ -280,13 +192,13 @@ public sealed class LoopbackStatusClientTests
     {
         var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
         {
-            Content = new StringContent(ValidJson("ready"), Encoding.UTF8, "text/plain"),
+            Content = new StringContent(ValidDetailsJson(), Encoding.UTF8, "text/plain"),
         });
 
         using var client = new LoopbackStatusClient(handler);
-        var result = await client.FetchAsync(CancellationToken.None);
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
 
-        Assert.Equal(StatusFetchFailure.Response, result.Failure);
+        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
         Assert.Null(result.Snapshot);
     }
 
@@ -297,7 +209,7 @@ public sealed class LoopbackStatusClientTests
     {
         var response = new HttpResponseMessage(HttpStatusCode.OK)
         {
-            Content = new StringContent(ValidJson("ready"), Encoding.UTF8, "application/json"),
+            Content = new StringContent(ValidDetailsJson(), Encoding.UTF8, "application/json"),
         };
         if (!includeUtf8)
         {
@@ -309,144 +221,14 @@ public sealed class LoopbackStatusClientTests
         }
         using var client = new LoopbackStatusClient(new StubHandler(_ => response));
 
-        var result = await client.FetchAsync(CancellationToken.None);
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
 
-        Assert.Equal(StatusFetchFailure.Response, result.Failure);
-        Assert.Null(result.Snapshot);
-    }
-
-    [Theory]
-    [InlineData("api_version", "api_version2")]
-    [InlineData("state", "State")]
-    [InlineData("models", "model")]
-    public async Task UnknownOrCaseChangedPropertyIsRejected(string oldName, string newName)
-    {
-        var result = await Fetch(ValidJson("ready").Replace($"\"{oldName}\":", $"\"{newName}\":", StringComparison.Ordinal));
-
-        Assert.Equal(StatusFetchFailure.Response, result.Failure);
-    }
-
-    [Fact]
-    public async Task MissingPropertyAndWrongTypeAreRejected()
-    {
-        var missing = await Fetch(ValidJson("ready").Replace(",\"active_thread_count\":3", "", StringComparison.Ordinal));
-        var wrongType = await Fetch(ValidJson("ready").Replace("\"authenticated\":true", "\"authenticated\":1", StringComparison.Ordinal));
-
-        Assert.Equal(StatusFetchFailure.Response, missing.Failure);
-        Assert.Equal(StatusFetchFailure.Response, wrongType.Failure);
-    }
-
-    [Theory]
-    [InlineData("1.0")]
-    [InlineData("1e0")]
-    [InlineData("-1")]
-    public async Task IntegerFieldsRejectNonIntegerOrNegativeNumbers(string value)
-    {
-        var json = ValidJson("ready").Replace("\"active_thread_count\":3", $"\"active_thread_count\":{value}", StringComparison.Ordinal);
-        var result = await Fetch(json);
-
-        Assert.Equal(StatusFetchFailure.Response, result.Failure);
-    }
-
-    [Fact]
-    public async Task IntegerBoundariesAreAcceptedAndOverflowIsRejected()
-    {
-        var max = ValidJson("ready")
-            .Replace("\"observed_at\":1", "\"observed_at\":253402300799", StringComparison.Ordinal)
-            .Replace("\"reset_at\":253402300799", "\"reset_at\":253402300799", StringComparison.Ordinal)
-            .Replace("\"window_seconds\":1", "\"window_seconds\":9223372036854775807", StringComparison.Ordinal)
-            .Replace("\"input_tokens\":1", "\"input_tokens\":18446744073709551615", StringComparison.Ordinal)
-            .Replace("\"active_thread_count\":3", "\"active_thread_count\":18446744073709551615", StringComparison.Ordinal);
-        var valid = await Fetch(max);
-        var overflow = await Fetch(max.Replace("18446744073709551615", "18446744073709551616", StringComparison.Ordinal));
-
-        Assert.True(valid.IsSuccess);
-        Assert.Equal(StatusFetchFailure.Response, overflow.Failure);
-    }
-
-    [Fact]
-    public async Task PlanLabelCountsUnicodeScalars()
-    {
-        var sixtyFourScalars = string.Concat(Enumerable.Repeat("😀", 64));
-        var sixtyFiveScalars = string.Concat(Enumerable.Repeat("😀", 65));
-        var valid = await Fetch(ValidJson("ready").Replace("Pro", sixtyFourScalars, StringComparison.Ordinal));
-        var invalid = await Fetch(ValidJson("ready").Replace("Pro", sixtyFiveScalars, StringComparison.Ordinal));
-
-        Assert.True(valid.IsSuccess);
-        Assert.Equal(StatusFetchFailure.Response, invalid.Failure);
-    }
-
-    [Fact]
-    public async Task PlanLabelRejectsLayoutAndBidiControls()
-    {
-        var newline = await Fetch(ValidJson("ready").Replace("Pro", "Pro\\nInjected", StringComparison.Ordinal));
-        var bidi = await Fetch(ValidJson("ready").Replace("Pro", "Pro\\u202Eevil", StringComparison.Ordinal));
-
-        Assert.Equal(StatusFetchFailure.Response, newline.Failure);
-        Assert.Equal(StatusFetchFailure.Response, bidi.Failure);
-    }
-
-    [Fact]
-    public async Task DuplicateKeysAreRejectedAtEveryKnownObjectLevel()
-    {
-        var top = await Fetch(ValidJson("ready").Replace(",\"active_thread_count\":3", ",\"active_thread_count\":3,\"state\":\"ready\"", StringComparison.Ordinal));
-        var quota = await Fetch(ValidJson("ready").Replace("\"monthly\":false}", "\"monthly\":false,\"monthly\":true}", StringComparison.Ordinal));
-        var model = await Fetch(ValidJson("ready").Replace("\"output_tokens\":3}]", "\"output_tokens\":3,\"name\":\"SOL\"}]", StringComparison.Ordinal));
-
-        Assert.Equal(StatusFetchFailure.Response, top.Failure);
-        Assert.Equal(StatusFetchFailure.Response, quota.Failure);
-        Assert.Equal(StatusFetchFailure.Response, model.Failure);
-    }
-
-    [Fact]
-    public async Task HeaderLimitIsEnforcedBeforeBodyParsing()
-    {
-        var handler = new StubHandler(_ =>
-        {
-            var response = JsonResponse(ValidJson("ready"), includePublishedPair: true);
-            response.Headers.TryAddWithoutValidation("X-Large", new string('x', 8_200));
-            return response;
-        });
-
-        using var client = new LoopbackStatusClient(handler);
-        var result = await client.FetchAsync(CancellationToken.None);
-
-        Assert.Equal(StatusFetchFailure.Response, result.Failure);
-    }
-
-    [Fact]
-    public async Task UnknownLengthBodyIsRejectedWhileStreaming()
-    {
-        var payload = Encoding.UTF8.GetBytes(new string('x', 65_537));
-        var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
-        {
-            Content = new UnknownLengthContent(payload),
-        });
-
-        // The custom content sets Content-Type but deliberately has no Content-Length.
-        using var client = new LoopbackStatusClient(handler);
-        var result = await client.FetchAsync(CancellationToken.None);
-
-        Assert.Equal(StatusFetchFailure.Response, result.Failure);
-    }
-
-    [Fact]
-    public async Task DeclaredOversizeBodyIsRejectedBeforeParsing()
-    {
-        var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
-        {
-            Content = new StringContent(new string('x', 65_537), Encoding.UTF8, "application/json"),
-        });
-
-        using var client = new LoopbackStatusClient(handler);
-        var result = await client.FetchAsync(CancellationToken.None);
-
-        Assert.Equal(StatusFetchFailure.Response, result.Failure);
+        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
         Assert.Null(result.Snapshot);
     }
 
     [Fact]
-    public async Task Non2xxAndTransportFailuresAreClassifiedWithoutDetails()
+    public async Task DetailsNon2xxAndTransportFailuresAreClassifiedWithoutPrivateDetails()
     {
         var nonSuccess = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.BadGateway)
         {
@@ -456,12 +238,12 @@ public sealed class LoopbackStatusClientTests
 
         using var nonSuccessClient = new LoopbackStatusClient(nonSuccess);
         using var thrownClient = new LoopbackStatusClient(thrown);
-        var nonSuccessResult = await nonSuccessClient.FetchAsync(CancellationToken.None);
-        var thrownResult = await thrownClient.FetchAsync(CancellationToken.None);
+        var nonSuccessResult = await nonSuccessClient.FetchDetailsAsync(CancellationToken.None);
+        var thrownResult = await thrownClient.FetchDetailsAsync(CancellationToken.None);
 
-        Assert.Equal(StatusFetchFailure.Transport, nonSuccessResult.Failure);
+        Assert.Equal(DetailsFetchFailure.Transport, nonSuccessResult.Failure);
         Assert.Null(nonSuccessResult.Snapshot);
-        Assert.Equal(StatusFetchFailure.Transport, thrownResult.Failure);
+        Assert.Equal(DetailsFetchFailure.Transport, thrownResult.Failure);
         Assert.Null(thrownResult.Snapshot);
     }
 
@@ -489,6 +271,67 @@ public sealed class LoopbackStatusClientTests
         Assert.Equal("SOL", details.Threads[0].Model);
         Assert.Equal("Pro", details.PlanLabel);
         Assert.Equal("概算 $1", details.EstimatedCostLabel);
+    }
+
+    [Theory]
+    [InlineData("ready", false)]
+    [InlineData("auth_required", true)]
+    public async Task DetailsRejectsInconsistentStateAuthenticationDomain(
+        string state,
+        bool authenticated)
+    {
+        var json = ValidDetailsJson()
+            .Replace("\"state\":\"ready\"", $"\"state\":\"{state}\"", StringComparison.Ordinal)
+            .Replace("\"authenticated\":true", $"\"authenticated\":{authenticated.ToString().ToLowerInvariant()}", StringComparison.Ordinal);
+
+        var result = await FetchDetails(json);
+
+        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
+        Assert.Null(result.Snapshot);
+    }
+
+    [Theory]
+    [InlineData("無料", false)]
+    [InlineData("Go", false)]
+    [InlineData("Plus", false)]
+    [InlineData("Pro", false)]
+    [InlineData("Pro Lite", false)]
+    [InlineData("Team", false)]
+    [InlineData("Business", false)]
+    [InlineData("エンタープライズ", true)]
+    [InlineData("教育", false)]
+    [InlineData("プラン未設定", false)]
+    public async Task DetailsAcceptsCanonicalPlanMonthlyDomain(string planLabel, bool monthly)
+    {
+        var json = ValidDetailsJson()
+            .Replace("\"plan_label\":\"Pro\"", $"\"plan_label\":\"{planLabel}\"", StringComparison.Ordinal)
+            .Replace("\"monthly\":false", $"\"monthly\":{monthly.ToString().ToLowerInvariant()}", StringComparison.Ordinal);
+
+        var result = await FetchDetails(json);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(planLabel, result.Snapshot!.PlanLabel);
+        Assert.Equal(monthly, result.Snapshot.Quota!.Monthly);
+    }
+
+    [Theory]
+    [InlineData("\"pro\"", false)]
+    [InlineData("\"Enterprise\"", true)]
+    [InlineData("\"エンタープライズ\"", false)]
+    [InlineData("\"Pro\"", true)]
+    [InlineData("null", false)]
+    public async Task DetailsRejectsNonCanonicalPlanOrMonthlyDomain(
+        string planLabelJson,
+        bool monthly)
+    {
+        var json = ValidDetailsJson()
+            .Replace("\"plan_label\":\"Pro\"", $"\"plan_label\":{planLabelJson}", StringComparison.Ordinal)
+            .Replace("\"monthly\":false", $"\"monthly\":{monthly.ToString().ToLowerInvariant()}", StringComparison.Ordinal);
+
+        var result = await FetchDetails(json);
+
+        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
+        Assert.Null(result.Snapshot);
     }
 
     [Fact]
@@ -825,7 +668,7 @@ public sealed class LoopbackStatusClientTests
     [Fact]
     public void ClientTimeoutIsFixedAtOneSecond()
     {
-        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(ValidJson("ready"))));
+        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(ValidDetailsJson())));
         var field = typeof(LoopbackStatusClient).GetField("_httpClient", BindingFlags.NonPublic | BindingFlags.Instance);
         Assert.NotNull(field);
         var httpClient = Assert.IsType<HttpClient>(field!.GetValue(client));
@@ -844,48 +687,16 @@ public sealed class LoopbackStatusClientTests
         Assert.Equal(44_640, field!.GetRawConstantValue());
     }
 
-    private static async Task<StatusFetchResult> Fetch(string json)
-    {
-        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json, includePublishedPair: true)));
-        return await client.FetchAsync(CancellationToken.None);
-    }
-
     private static async Task<DetailsFetchResult> FetchDetails(string json)
     {
         using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json, includePublishedPair: true)));
         return await client.FetchDetailsAsync(CancellationToken.None);
     }
 
-    private static async Task<StatusFetchResult> FetchWithoutPublishedPair(string json)
-    {
-        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json)));
-        return await client.FetchAsync(CancellationToken.None);
-    }
-
     private static async Task<DetailsFetchResult> FetchDetailsWithoutPublishedPair(string json)
     {
         using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json)));
         return await client.FetchDetailsAsync(CancellationToken.None);
-    }
-
-    private static async Task<StatusFetchResult> FetchStatusWithPairValues(
-        string json,
-        string firstValue,
-        string? secondValue = null,
-        string headerName = PublishedPairHeader)
-    {
-        using var client = new LoopbackStatusClient(new StubHandler(_ =>
-        {
-            var response = JsonResponse(json);
-            response.Headers.TryAddWithoutValidation(headerName, firstValue);
-            if (secondValue is not null)
-            {
-                response.Headers.TryAddWithoutValidation(headerName, secondValue);
-            }
-
-            return response;
-        }));
-        return await client.FetchAsync(CancellationToken.None);
     }
 
     private static async Task<DetailsFetchResult> FetchDetailsWithPairValues(
@@ -928,9 +739,6 @@ public sealed class LoopbackStatusClientTests
 
         return response;
     }
-
-    private static string ValidJson(string state) =>
-        $$"""{"api_version":"v1","state":"{{state}}","observed_at":1,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":98.5,"reset_at":253402300799,"window_seconds":1,"monthly":false},"models":[{"name":"SOL","input_tokens":1,"cached_input_tokens":2,"output_tokens":3}],"active_thread_count":3}""";
 
     private static string HealthJson() =>
         "{\"api_version\":\"v1\",\"service\":\"codex-info\"}";

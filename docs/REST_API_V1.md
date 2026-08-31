@@ -5,12 +5,14 @@
 
 ## 目的と境界
 
-Linux / WSL 上で起動する Codex Info のdaemonと、Windows クライアント向け読み取り専用 APIを、
+Linux / WSL 上で起動する Codex Info のresident serviceと、Linux / Windows UI向け読み取り専用 APIを、
 `codex_info`の1プロセスで所有する。このdaemon modeはSlint WindowやX event loopを生成せず、
-X UIを表示しない。`RecorderDaemon`はservice process内のbounded workerとしてsource JSONLを検証しSQLiteへ書く。
+X UIを表示しない。resident serviceだけがquota、local usage、historyのauthority/writerである。
+`RecorderDaemon`はservice process内のbounded workerとしてsource JSONLを検証し、storage admissionを通過したraw rowを
+SQLiteへtransactionalに書く。`HistoryCanonicalizer`はcommit済みraw rowのread-only viewからpublic logical sampleを作る。
 `SnapshotPublisher`がcommit済みの完全な`DataGeneration/DataHash`と現行 admission tuple
-`(ProfileScopeId, AccountScopeId, StorageEpoch, SupervisorLeaseIdentity, CollectorEpoch, CycleSeq)`からimmutableなstatus/details
-`PublishedPair`を構築し、native UIとREST workerへ同じpairをread-onlyで渡す。HTTP要求からCodex
+`(ProfileScopeId, AccountScopeId, StorageEpoch, SupervisorLeaseIdentity, CollectorEpoch, CycleSeq)`からimmutableなdetails
+generationを構築し、native UIとREST workerへ同じgenerationをread-onlyで渡す。HTTP要求からCodex
 app-server、認証 URL、セッションファイル、SQLite、Slint / X11へ直接到達する経路は持たない。
 
 この v1 はインターネット公開、LAN への直接公開、ブラウザー向け CORS、書込み
@@ -22,7 +24,7 @@ Windows clientの接続設定はREST resourceではなく、`language`、`setupC
 ローカルに保存する。profileは`none|wsl|sshConfigAlias`、selectorはWSL exact distribution tokenまたは
 literal OpenSSH Host alias grammarに限定し、secret、展開済み値、raw host/user/pathを保存・送信しない。
 saved selectorのauto reconnectは`ArgumentList`＋`BatchMode=yes`で起動し、auth argvもsaved profileから作るが、
-起動成功とstatus再確認は別stateとする。4-key recoveryはMain disconnected＋Settingsだけであり、製品判定は`PRODUCT_PENDING`。
+起動成功、health readiness、strict details受理は別stateとする。4-key recoveryはMain disconnected＋Settingsだけであり、製品判定は`PRODUCT_PENDING`。
 
 | 要望 | v1での対応 |
 | --- | --- |
@@ -59,8 +61,8 @@ ssh -N -o BatchMode=yes -L 8787:127.0.0.1:8787 <connectionSelector>
 Windowsのcanonical `ArgumentList`はValue AuthoritiesおよびWIN-E-006..010の
 `[ssh.exe,-o,BatchMode=yes,-N,-L,8787:127.0.0.1:8787,<validated alias>]`に従う。
 
-このとき Windows クライアントの接続先は
-`http://127.0.0.1:8787/v1/status` と `/v1/details` である。HTTP は Linux 側の loopback と
+このとき Linux / Windows UIの表示rootは
+`http://127.0.0.1:8787/v1/details` の一応答だけである。HTTP は Linux 側の loopback と
 SSH トンネルの端点の間だけで使用し、端末間の暗号化・相手認証は SSH が担当する。
 そのため v1 では HTTPS 証明書を扱わない。
 
@@ -75,9 +77,8 @@ SSH トンネルの端点の間だけで使用し、端末間の暗号化・相�
 
 | Request | Result |
 | --- | --- |
-| `GET /v1/health` | API プロセスが応答可能であることを示す。 |
-| `GET /v1/status` | 最新の安全な状態・利用枠スナップショットを返す。 |
-| `GET /v1/details` | モデル別ドル内訳、履歴期間・サンプル、実行中Threadsを返す。 |
+| `GET /v1/health` | resident serviceがread-only snapshot requestを受理できるreadinessを示す。 |
+| `GET /v1/details` | Linux / Windows UIの単一atomic rootとして、状態・利用枠・モデル別ドル内訳・履歴・Threadsを返す。 |
 
 未定義のパスは JSON の `404`、既知パスへの非 `GET` は JSON の `405` で返す。
 応答に email、認証 URL、認証トークン、raw error、ローカルパス、セッション内容を
@@ -86,19 +87,18 @@ SSH トンネルの端点の間だけで使用し、端末間の暗号化・相�
 path照合はcase-sensitiveかつ完全一致であり、URL decode/normalizationを行わない。case-altered path、
 末尾slash追加、query付きknown path、未定義prefixはunknown pathとして扱う。拒否bodyは`api_version="v1"`と固定error codeだけを持つ
 JSON objectとし、未知キー・raw error・秘密値を含めない。404/405を含む全responseは
-SQLite transaction、WAL/SHM、migration、prune、backup、DB row/hash、PublishedPairを変更しない。
+SQLite transaction、WAL/SHM、migration、prune、backup、DB row/hash、published generationを変更しない。
 
 ### Response・read-only matrix
 
 | request | method | result | response / side effect |
 | --- | --- | --- | --- |
 | `/v1/health` | `GET` | `200` | JSON health object、required `Content-Type`/`Cache-Control` headers、DB write/transaction=0 |
-| `/v1/status` | `GET` | `200` | current `PublishedPair` status、共通headerに加えて必須`Codex-Info-Published-Pair`、DB write/transaction=0 |
-| `/v1/details` | `GET` | `200` | current `PublishedPair` details、共通headerに加えて必須`Codex-Info-Published-Pair`、DB write/transaction=0 |
+| `/v1/details` | `GET` | `200` | current immutable details generation、共通headerに加えて必須`Codex-Info-Published-Pair`、DB write/transaction=0 |
 | 上記known path | `HEAD/POST/PUT/PATCH/DELETE/OPTIONS`等全non-GET | `405` | 固定JSON error、同上header、DB/WAL/SHM/migration/prune/backup=0 |
 | unknown、case-altered、末尾slash、query付きpath（methodを問わない） | any | `404` | 固定JSON error、同上header、DB/WAL/SHM/migration/prune/backup=0 |
 
-RESTのtransfer body上限はstatus `64 KiB`、details `32 MiB`、response header `8 KiB`である。
+RESTのtransfer body上限はdetails `32 MiB`、response header `8 KiB`である。
 SQLiteの保持期間は過去3暦月である。一方、1回のDB取得と`details`応答が扱う履歴は観測時刻で終わる
 最長1暦月の半開区間 `(one_month_before(observed_at), observed_at]` に限定する。history samples上限は
 31日分の1分bucketに相当する`44,640`、history periods `128`、confirmed history gaps `4,096`、threads `256`、models `3`である。
@@ -106,7 +106,7 @@ SQLiteの保持期間は過去3暦月である。一方、1回のDB取得と`det
 ### 応答時間SLOと容量条件
 
 warm-up後、loopback、in-flight 1でrequest送信開始からresponse body全受信までを測る。
-`/v1/health`、`/v1/status`、全4xxはP90 25 ms以下・P95 50 ms以下、`/v1/details`は
+`/v1/health`と全4xxはP90 25 ms以下・P95 50 ms以下、`/v1/details`は
 7日相当10,080 samplesでP90 50 ms以下・P95 100 ms以下、契約最大1暦月44,640 samplesで
 P90 100 ms以下・P95 150 ms以下とする。各route/profileを30回以上測定し、client hard timeoutは
 1秒、timeout・欠測・上限超過はPASSへ丸めない。DB読出しはtimestamp/reset複合indexを使い、
@@ -114,54 +114,27 @@ P90 100 ms以下・P95 150 ms以下とする。各route/profileを30回以上測
 行単位publishを禁止し、candidate失敗時はlast-good publicationを保持する。
 これらはinternal validated snapshot `1 MiB`とは別resourceであり、どの上限もdecode後の推測値へ
 置換しない。上限超過、malformed、unknown/case key、duplicate key、domain errorは該当resourceの
-直前完全pairを保持し、部分候補を公開しない。現行 admission tupleのいずれかがstale・欠落・不一致の
+直前完全generationを保持し、部分候補を公開しない。現行 admission tupleのいずれかがstale・欠落・不一致の
 candidateも同じ扱いとし、DB、memory、REST、UIを変更しない。
-
-`GET /v1/status` の形は次のとおりである。`quota` は利用枠がまだ確定していない
-場合に `null` になる。`input_tokens` はキャッシュ分を除いた入力トークンである。
-
-```json
-{
-  "api_version": "v1",
-  "state": "ready",
-  "observed_at": 1780000000,
-  "authenticated": true,
-  "plan_label": "Pro",
-  "quota": {
-    "remaining_percent": 98.0,
-    "reset_at": 1780400000,
-    "window_seconds": 604800,
-    "monthly": false
-  },
-  "models": [
-    {
-      "name": "SOL",
-      "input_tokens": 1200,
-      "cached_input_tokens": 300,
-      "output_tokens": 400
-    }
-  ],
-  "active_thread_count": 1
-}
-```
 
 `state` は `initializing`、`ready`、`auth_required`、`error` のいずれかである。
 `error` は接続先ではなく Codex 情報取得の失敗を表す。詳細な失敗内容は API に
 公開しない。Windows クライアントは HTTP 接続エラーと `state` を別々に表示する。
+認証開始・確認はcontrol-onlyであり、その応答をsnapshot fieldまたはgenerationとして採用しない。control完了後も
+新しいstrict validation済みdetails generationを取得するまでlast-good表示を保持する。
 
-wireに `ready` boolean keyは存在しない。接続後の利用可能判定は、完全schemaを受理した同じ
-status/details rootについて `state == "ready" && authenticated == true` の論理積だけである。
+wireに `ready` boolean keyは存在しない。dataの利用可能判定は、完全schemaを受理した一つのdetails rootについて
+`state == "ready" && authenticated == true` の論理積だけである。
 `state="ready",authenticated=false` と `state="auth_required",authenticated=true` はdomain不整合として
-candidate pair全体をrejectし、直前の完全pairを保持する。`/v1/health`の200、process生存、listener存在、
+candidate generation全体をrejectし、直前の完全generationを保持する。`/v1/health`の200、process生存、listener存在、
 認証開始processのexit codeだけをreadyへ読み替えない。fixture、Windows state、文書でも架空の
 `ready=true` fieldを作らず、必ず上記2実在fieldを別々に記録する。
 
 ### `/v1/details` 完全schema
 
-`/v1/details` はcontract revision `rest-v1-details-reset-at-20260823`の次のトップレベル13キーだけを持つ。先頭7項目と
-`active_thread_count`は同じ`PublishedPair`からpublishされた`/v1/status`の同名値と一致し、
-`models`はstatusのtoken 4項目へdollar 3項目を加えた形である。片側の取得・検証が失敗した
-場合はstatusだけを先行更新せず、直前の完全pairを保持する。wire上に`version`、
+`/v1/details` はcontract revision `rest-v1-details-reset-at-20260823`の次のトップレベル13キーだけを持つ。
+serverは一つの完全candidateからこのgenerationだけをpublishし、UI consumerはdetails一応答だけをstrict validationして
+atomic commitする。wire上に`version`、
 `snapshot_epoch`、`billing_period`、`thread.status`、`is_orphan`は存在しない。
 
 | key | 型・境界 |
@@ -197,6 +170,20 @@ exactly one periodへ所属し、そのperiodの`start_at <= timestamp <= end_at
 `(sample.reset_at,timestamp)`が一意でも、canonicalize後の`(period.id,timestamp)`が衝突するcandidateは
 同一分に異なる残量・累積値を並べて垂直変化を作り得るため全体rejectする。merge、max、last-row、null化、
 array順選択で衝突を隠さない。
+
+public candidateを構築する前に、resident serviceの`HistoryCanonicalizer`は同一profileが所有する一つの
+履歴DB readをstorage scopeとし、既存の`timestamp/reset_at`観測だけで同一と検証できたcycleと同じminute-startに
+属するrowだけを一組にする。exact reset/許容内jitterと、reset前進量が観測時刻の前進量に追随するbounded rolling
+chainだけを同cycleとし、group内最大`reset_at`をcanonical resetとする。新しいpartition列や永続CycleSeqを
+legacy回復の前提にしない。distinct non-null quotaが0または1個で、
+既存のcumulative vector `(sol_dollars, terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens)`のうち
+全rowをcomponentwiseに支配する既存vector値が存在する場合だけ、そのquota（0個なら`null`）とdominant vectorを
+1 logical sampleとして採用する。quota競合、dominant vector不存在・非一意、非比較vector、
+storage scope/cycle/minute/period境界不明はcandidate全体をrejectしてlast-good details generationを保持する。
+同値duplicateは同じvector値として冪等に扱う。
+残量100%、7日窓、quota-onlyなど値の形を除外条件にせず、component別max、last-row、null化、任意mergeで
+sourceにないvectorを作らない。canonicalization後もraw `(reset_at,timestamp)`とcanonical
+`(period.id,timestamp)`のduplicate拒否を維持し、REST/Windows sinkで修復しない。
 
 `label`はLinux/X側が同じperiod groupの表示に用いたreference labelであり、selection keyでもWindowsの
 日時parse入力でもない。serverは`DESIGN.md`のcanonical period ID、start/end、起動時timezone、DST offset、
@@ -260,16 +247,14 @@ rootとsiblingの相対rankを保ったまま親先行depth-first・subtree-cont
 存在しない`updatedAt`をclientで推測したり、title・受信時刻・IDだけで別順へ再sortしたりしない。
 
 全objectは上記キーを全て必須とし、未知、大小文字違い、同一object内の重複、型違い、
-配列上限超過が1件でもあればcandidate全体を拒否する。status/detailsはサーバー側で一つの
-write lockにより同じ`PublishedPair`からatomic publishする。serverの`SnapshotPublisher`は現行
+配列上限超過が1件でもあればcandidate全体を拒否する。serverの`SnapshotPublisher`は現行
 `(ProfileScopeId, AccountScopeId, StorageEpoch, SupervisorLeaseIdentity, CollectorEpoch, CycleSeq)`、
 `DataGeneration`、`DataHash`、canonical fingerprint、`RootHash`が一致する内部candidateだけをpublishし、
-その成功publishへ一つの`Codex-Info-Published-Pair`を割り当てる。Windowsが別々のHTTP requestで同一cycleの
-表示を更新する場合は、両bodyのstrict schema/domain、共通core fieldのfield-by-field一致、両headerのexact一致を
-全て満たす組だけをcommitする。wireに存在しないserver内部値をWindowsが推測または再計算しない。
-片側失敗、更新競合、一致しない組、stale lease/epoch/cycleは架空の世代番号を補わず、DB、memory、REST、UIを
-変更せず両方のlast-good pairを保持して次cycleで再取得する。statusだけS1へ進みdetails D0を
-残す混合世代、detailsだけを先行更新する混合世代、片側のDB read/writeは許可しない。
+その成功publishへ一つの`Codex-Info-Published-Pair`を割り当てる。Linux / Windows UIはdetails一応答のstrict
+schema/domain、exactly oneの正規pair header、body/header sizeを満たす場合だけ、その全fieldを一つのrootとしてcommitする。
+wireに存在しないserver内部値を推測・再計算せず、SQLite、別generation、control応答で欠落値を補わない。
+取得失敗、更新競合、stale lease/epoch/cycleは架空の世代番号を補わず、DB、memory、REST、UIを変更せず
+last-good generation/rootを保持して次cycleで再取得する。
 
 ## 段階的な移行
 
@@ -293,18 +278,18 @@ lineage、load profileは`DATA_PROTECTION_POLICY.md` §8を正本とする。本
 `GET /v1/health`の200 bodyはUTF-8 JSON objectでexact key集合を`api_version,service`、値を
 `api_version="v1"`、`service="codex-info"`へ固定する。unknown、missing、duplicate、case-altered key、
 別値、control/bidi、trailing non-whitespace、depth追加を拒否する。transfer-decoded bodyは1 KiB以下である。
-healthはlistener到達性だけで、認証、ready、DB健全性、PublishedPair更新を意味しない。
+health 200はresident serviceがread-only snapshot requestを受理でき、schema-validなimmutable details generationを
+保持しているreadinessを表す。認証済み、detailsの`state=ready`、DBの最新収集成功は意味しない。
 
 全JSON responseのproducer headerは次のexact意味を持つ。
 
 - `Content-Type`は`application/json; charset=utf-8`。parameter追加、charset欠落、別charsetを生成しない。
 - `Cache-Control`は`no-store`。
 - fixed bodyでは`Content-Length`をUTF-8 bytesと一致させる。
-- `/v1/status`と`/v1/details`の200応答は`Codex-Info-Published-Pair`をexactly one持つ。値は
+- `/v1/details`の200応答は`Codex-Info-Published-Pair`をexactly one持つ。値は
   ASCII `v1:`に128-bit server epochの32桁lowercase hex、続けて128-bit publish counterの
-  32桁lowercase hexを置いた67 bytesだけとする。同じimmutable `PublishedPair`から生成した両応答は
-  同じ値になる。clientはprefix/length/lowercase hexだけを検証し、epoch/counterを業務値としてparse、sort、
-  永続化、表示せず、同一candidate内のopaque equality tokenとしてだけ扱う。
+  32桁lowercase hexを置いた67 bytesだけとする。production UIはdetails headerのprefix/length/lowercase hexだけを検証し、
+  epoch/counterを業務値としてparse、sort、永続化、表示せず、そのdetails応答のopaque generation identityとしてだけ扱う。
   `/v1/health`、error、unknown/method拒否応答はこのheaderを持たない。
 - response header aggregateは8 KiB以下。`Set-Cookie`、`Location`、`Content-Encoding`、
   `WWW-Authenticate`、authentication/proxy headerは0件。
@@ -314,22 +299,22 @@ clientはContent-Typeをcase-insensitive tokenとしてparseするが、media ty
 whitespaceはidentityに使わず、parse後のexact key/value集合、型、値、配列順をfield-by-fieldで検査する。
 clientはbodyのcanonical再serialization SHA、未公開のadmission tuple、`DataGeneration`、`DataHash`、
 canonical fingerprint、`RootHash`を再計算または推測しない。それらはserver内部のpublisher admissionであり、
-wire上では`Codex-Info-Published-Pair`が同じimmutable pairの比較専用identityを所有する。
+wire上では`Codex-Info-Published-Pair`がimmutable details generationの比較専用identityを所有する。
 
 server epochはprocess起動時、listener bindより前にOS CSPRNGからexact 16 bytesを一度取得し、all-zeroなら
 再試行せず起動を非0終了する。credential、profile/account値、path、admission tuple、body hashをepochへ混ぜない。
 epochはprocess lifetime中不変で、単独ではwire・log・永続領域へ出さない。publish counterのownerは
 `SnapshotPublisher`一つで、初期値0、最初の成功publishを1とする。完全candidateのschema/domain/admission検証後、
 一つのpublisher write lock内でcounterをchecked-addし、epoch+counter tokenをpairへ設定してからrootを一度だけ
-交換する。reject、cancel、read、HTTP request、同じpairの再応答はcounterとrootを変更しない。公開bodyが同じでも
+交換する。reject、cancel、read、HTTP request、同じgenerationの再応答はcounterとrootを変更しない。公開bodyが同じでも
 新しい成功publishはcounterを増やす。同時publishはlock取得順に別counterを持つ。counterがu128::MAXなら旧pairを
 変更せず、publisherをpermanent-failedとしてlistenerを閉じprocessを非0終了する。OS CSPRNGのcollision resistanceを
 process再起動間の分離境界とし、同一process内のgeneration一意性はcounterで決定的に保証する。このheaderは外部が
 bodyから再計算するcontent proofではなく、同じpublisher pairを結ぶ比較専用identityである。
 
-server起動時はlistenerがrequestをacceptする前に、schema-validなdefault `initializing` status/detailsを最初の
-成功publishとしてcounter=1へ構築する。従って起動直後からstatus/detailsにはpair identityが存在し、最初の実data
-publishはcounter=2となる。default pairのserializationまたはidentity構築に失敗した場合はbind済みsocketを公開せず
+server起動時はlistenerがrequestをacceptする前に、schema-validなdefault `initializing` detailsを最初の
+成功publishとしてcounter=1へ構築する。従って起動直後からdetailsにはgeneration identityが存在し、最初の実data
+publishはcounter=2となる。default generationのserializationまたはidentity構築に失敗した場合はbind済みsocketを公開せず
 起動を非0終了し、pairなしの200応答を返さない。test用の未publish publisherはcounter=0から最初の明示publishを1として
 固定vectorを検査できるが、production listenerは未publish stateを外部へ公開しない。
 
@@ -341,8 +326,8 @@ publishはcounter=2となる。default pairのserializationまたはidentity構�
 | `00112233445566778899aabbccddeeff` | 2 | `v1:00112233445566778899aabbccddeeff00000000000000000000000000000002` |
 | `00112233445566778899aabbccddeef0` | 1 | `v1:00112233445566778899aabbccddeef000000000000000000000000000000001` |
 
-counter=1のpairをpublish後にinvalid candidateをrejectした場合、次のstatus/detailsもcounter=1のexact headerを返す。
-counter=1のpairを再度HTTP取得するだけでも同じ値を返し、counter=2へ進めない。
+counter=1のgenerationをpublish後にinvalid candidateをrejectした場合、次のdetailsもcounter=1のexact headerを返す。
+counter=1のgenerationを再度HTTP取得するだけでも同じ値を返し、counter=2へ進めない。
 
 ### Server error response
 
@@ -361,15 +346,15 @@ transfer-decoded bodyは1 KiB以下とする。
 | 500 | `internal_error` | response commit前のserialization/invariant failure |
 | 503 | `snapshot_unavailable` | publisher/DB root/stale owner/internal read timeout、またはshutdown中 |
 
-route/publisher faultを200や`state=error`へ丸めない。valid PublishedPair自身の`state=error`だけはschema-valid
+route/publisher faultを200や`state=error`へ丸めない。valid details generation自身の`state=error`だけはschema-valid
 200 snapshotであり、server transport faultと別物である。serialization failureがheader/body commit後に起きた場合は
 connectionをabortし、追加JSONやpartial-success markerを送らない。clientは全non-200、切断、長さ不一致で
-status/details candidate全体をrejectし、直前pairを保持する。
+details candidate全体をrejectし、UI consumerは直前のdetails rootを保持する。
 
 ### Request resource contract
 
 製品endpointはHTTP/1.1だけを受け、request targetはorigin-formのexact
-`/v1/health`、`/v1/status`、`/v1/details`である。percent decode、path normalization、query、fragment、
+`/v1/health`、`/v1/details`である。percent decode、path normalization、query、fragment、
 absolute-form、authority-form、asterisk-formを許可しない。
 
 | resource | 採用上限・規則 |
@@ -388,27 +373,23 @@ request header allowlistは`Host,Accept,User-Agent,Connection,Content-Length`だ
 ただしContent-Lengthは欠落可とする。`Authorization,Cookie,Proxy-Authorization,Forwarded,X-Forwarded-For,
 X-Forwarded-Host,X-Forwarded-Proto,Upgrade,Expect,TE,Transfer-Encoding`は常に拒否する。obs-fold、NUL、CTL、
 bare LF、invalid UTF-8を値として解釈せず400またはparse前closeにする。拒否requestはbodyを無制限drainせず
-socketをcloseし、DB/pair/settings/checkpointを0変更とする。
+socketをcloseし、DB/published generation/settings/checkpointを0変更とする。
 
 ### Read-only effect set
 
 全route・全statusで許可するproduct effectはrequest lifetime内heap、bounded in-memory counter、loopback socket
 read/write、read-only open/statだけである。persistent log/Event Log/metric/cache/temp、registry、child process、
 非loopback socket/DNS、file create/write/rename/delete/fsync、SQLite transaction、DB/WAL/SHM、backup、migration、
-checkpoint、PublishedPair mutationは禁止する。OS-managed atimeはproduct successの根拠にせず、content/inodeと
+checkpoint、published generation mutationは禁止する。OS-managed atimeはproduct successの根拠にせず、content/inodeと
 product syscall traceを検査する。同一request再入で副作用countが増えた場合はFAIL/HOLDである。
 
-### Atomic status/details client admission
+### Single details client admission
 
-client cycleはhealth受理後にstatusとdetailsを各1回取得し、両方のschema/domain/common coreがfield-by-fieldで一致した場合だけ
-同じroot generationとして一括commitする。statusだけvalid、detailsだけvalid、片側timeout/non-200/invalid、
-common field不一致では両方をdiscardし、直前の完全pairを保持する。wireにJSON generation fieldを追加せず、client内部の
-request cycle IDと両応答のexactな`Codex-Info-Published-Pair`一致で同一候補を結ぶ。common-core hashやbody SHAを
-別のidentityとして作らず、同名fieldの型と値を直接比較する。
-header欠落、重複、値の大小文字差、prefix/長さ/hex不正、不一致はcandidate全体をrejectし、次cycleまで自動再取得を
-繰り返さない。`WIN-I-016`を含む具体契約はこの規則と異なる
-status-only commitを許可しない。
-ただし`auth_required`のsecurity visibility transitionはdata pairのcommitではない。
-schema-validな`state=auth_required,authenticated=false`を受理した場合、detailsがinvalidでも
-旧accountの可視値だけを一回のroot updateで空にし、status/details store、DB、pair generationは変更しない。
-これはstatus-only data commitではなく、認証世代の可視性を閉じる失敗安全遷移である。
+client cycleはhealth readiness受理後にdetailsを1回取得し、body全体のstrict schema/domain、size、
+exactly oneの`Codex-Info-Published-Pair` header形式を満たす場合だけ同じroot generationとして一括commitする。
+timeout/non-200/切断、header欠落・重複・大小文字差・prefix/長さ/hex不正、body欠落・未知・重複key、domain不整合では
+candidate全体をdiscardして直前の完全rootを保持する。wireにJSON generation fieldを追加せず、published-generation headerは
+details一応答のopaque generation identityとしてだけ使い、body SHAやcommon-core hashを別identityとして作らない。
+
+schema-validなdetailsの`state=auth_required,authenticated=false`を受理した場合だけ、
+その同じdetails rootで旧account可視値を空にする。認証開始・確認controlの成功・失敗だけではdata rootを変更しない。

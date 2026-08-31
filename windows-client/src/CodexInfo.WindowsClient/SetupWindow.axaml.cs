@@ -11,7 +11,7 @@ namespace CodexInfo.WindowsClient;
 
 public partial class SetupWindow : Window
 {
-    public SetupWindow() : this(new SetupViewModel(new MainWindowViewModel(new LoopbackStatusClient(), new LoopbackStatusClient()))) { }
+    public SetupWindow() : this(CreateDefaultViewModel()) { }
 
     public SetupWindow(SetupViewModel viewModel)
     {
@@ -51,4 +51,10 @@ public partial class SetupWindow : Window
     }
 
     private void OnClose(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => Close();
+
+    private static SetupViewModel CreateDefaultViewModel()
+    {
+        var client = new LoopbackStatusClient();
+        return new SetupViewModel(new MainWindowViewModel(client));
+    }
 }

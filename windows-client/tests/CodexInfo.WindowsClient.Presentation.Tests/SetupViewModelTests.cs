@@ -29,9 +29,9 @@ public sealed class SetupViewModelTests
         Assert.Contains("user@linux-host", setup.SshCommand, StringComparison.Ordinal);
     }
 
-    private sealed class NeverCalledClient : HealthyStatusClientBase
+    private sealed class NeverCalledClient : HealthyDetailsClientBase
     {
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default) =>
             throw new InvalidOperationException("The setup-only test must not start polling.");
     }
 }

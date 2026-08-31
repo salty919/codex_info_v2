@@ -8,25 +8,17 @@ using System.Text.Json;
 
 namespace CodexInfo.WindowsClient.Core;
 
-/// <summary>Fetches and strictly validates the loopback v1 status document.</summary>
-public interface ILoopbackStatusClient
-{
-    Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default);
-}
-
 /// <remarks>
 /// The endpoint and all network policy are fixed here so callers cannot accidentally
 /// turn the client into a general-purpose HTTP client.  A handler constructor is
 /// provided solely to make the transport boundary testable.
 /// </remarks>
-public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealthClient, ILoopbackDetailsClient, IDisposable
+public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetailsClient, IDisposable
 {
-    private const string Endpoint = "http://127.0.0.1:8787/v1/status";
     private const string DetailsEndpoint = "http://127.0.0.1:8787/v1/details";
     private const string HealthEndpoint = "http://127.0.0.1:8787/v1/health";
     private const string PublishedPairHeader = "Codex-Info-Published-Pair";
     private const int MaxResponseHeaderBytes = 8 * 1024;
-    private const int MaxBodyBytes = 64 * 1024;
     private const int MaxHealthBodyBytes = 1024;
     // SQLite retains three months, but one details response is bounded to one
     // 31-day month of minute buckets. The byte envelope is independent.
@@ -38,16 +30,6 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
     private const int MaxThreads = 256;
     private const long ResetAtToleranceSeconds = 60;
 
-    private static readonly HashSet<string> TopLevelProperties = CreatePropertySet(
-        "api_version",
-        "state",
-        "observed_at",
-        "authenticated",
-        "plan_label",
-        "quota",
-        "models",
-        "active_thread_count");
-
     private static readonly HashSet<string> HealthProperties = CreatePropertySet(
         "api_version",
         "service");
@@ -57,12 +39,6 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
         "reset_at",
         "window_seconds",
         "monthly");
-
-    private static readonly HashSet<string> ModelProperties = CreatePropertySet(
-        "name",
-        "input_tokens",
-        "cached_input_tokens",
-        "output_tokens");
 
     private static readonly HashSet<string> DetailsTopLevelProperties = CreatePropertySet(
         "api_version",
@@ -158,95 +134,6 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
         {
             Timeout = TimeSpan.FromSeconds(1),
         };
-    }
-
-    public async Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
-    {
-        try
-        {
-            using var request = new HttpRequestMessage(HttpMethod.Get, Endpoint);
-            request.Headers.Accept.Clear();
-            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-
-            using var response = await _httpClient.SendAsync(
-                    request,
-                    HttpCompletionOption.ResponseHeadersRead,
-                    cancellationToken)
-                .ConfigureAwait(false);
-
-            // HTTP status failures are transport failures by the public contract;
-            // no response body is ever exposed to the caller.
-            if (response.StatusCode != HttpStatusCode.OK)
-            {
-                return Failure(StatusFetchFailure.Transport);
-            }
-
-            if (!HasAcceptableHeaderSize(response))
-            {
-                return Failure(StatusFetchFailure.Response);
-            }
-
-            if (!HasRequiredResponseHeaders(response))
-            {
-                return Failure(StatusFetchFailure.Response);
-            }
-
-            if (!TryGetPublishedPairIdentity(response, out var publishedPair))
-            {
-                return Failure(StatusFetchFailure.Response);
-            }
-
-            if (!TryGetContentLength(response.Content, out var contentLength))
-            {
-                return Failure(StatusFetchFailure.Response);
-            }
-
-            if (contentLength is > MaxBodyBytes)
-            {
-                return Failure(StatusFetchFailure.Response);
-            }
-
-            var bodyStatus = await ReadBodyAsync(
-                    response.Content,
-                    contentLength,
-                    cancellationToken)
-                .ConfigureAwait(false);
-
-            if (bodyStatus.Kind is BodyReadKind.Oversize)
-            {
-                return Failure(StatusFetchFailure.Response);
-            }
-
-            if (bodyStatus.Kind is BodyReadKind.Transport || bodyStatus.Body is null)
-            {
-                return Failure(StatusFetchFailure.Transport);
-            }
-
-            if (!TryParseSnapshot(bodyStatus.Body, out var snapshot) || snapshot is null)
-            {
-                return Failure(StatusFetchFailure.Response);
-            }
-
-            return StatusFetchResult.Success(snapshot with { PublishedPair = publishedPair });
-        }
-        catch (OperationCanceledException)
-        {
-            return Failure(StatusFetchFailure.Transport);
-        }
-        catch (HttpRequestException)
-        {
-            return Failure(StatusFetchFailure.Transport);
-        }
-        catch (IOException)
-        {
-            return Failure(StatusFetchFailure.Transport);
-        }
-        catch (Exception)
-        {
-            // This is intentionally generic.  No exception object or message can
-            // cross the boundary, including failures from a custom test handler.
-            return Failure(StatusFetchFailure.Transport);
-        }
     }
 
     public async Task<HealthFetchResult> FetchHealthAsync(
@@ -427,9 +314,6 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
     private static HashSet<string> CreatePropertySet(params string[] properties) =>
         new(properties, StringComparer.Ordinal);
 
-    private static StatusFetchResult Failure(StatusFetchFailure failure) =>
-        StatusFetchResult.FromFailure(failure);
-
     private static DetailsFetchResult DetailsFailure(DetailsFetchFailure failure) =>
         DetailsFetchResult.FromFailure(failure);
 
@@ -552,7 +436,7 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
         HttpContent content,
         long? contentLength,
         CancellationToken cancellationToken,
-        int maximumBodyBytes = MaxBodyBytes)
+        int maximumBodyBytes)
     {
         try
         {
@@ -596,95 +480,6 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
         catch (Exception)
         {
             return BodyReadResult.Transport();
-        }
-    }
-
-    private static bool TryParseSnapshot(byte[] body, out ApiStatusSnapshot? snapshot)
-    {
-        snapshot = null;
-
-        try
-        {
-            using var document = JsonDocument.Parse(
-                body,
-                new JsonDocumentOptions
-                {
-                    AllowTrailingCommas = false,
-                    CommentHandling = JsonCommentHandling.Disallow,
-                    MaxDepth = 16,
-                });
-
-            var root = document.RootElement;
-            if (!HasExactlyProperties(root, TopLevelProperties, 8))
-            {
-                return false;
-            }
-
-            if (!TryGetString(root, "api_version", out var apiVersion) || apiVersion != "v1")
-            {
-                return false;
-            }
-
-            if (!TryGetState(root, out var state))
-            {
-                return false;
-            }
-
-            if (!TryGetNullableUnixSeconds(root, "observed_at", out var observedAt))
-            {
-                return false;
-            }
-
-            if (!TryGetBoolean(root, "authenticated", out var authenticated))
-            {
-                return false;
-            }
-
-            if (!TryGetNullablePlanLabel(root, out var planLabel))
-            {
-                return false;
-            }
-
-            if (!TryGetQuota(root, out var quota))
-            {
-                return false;
-            }
-
-            if (!TryGetModels(root, out var models))
-            {
-                return false;
-            }
-
-            if (!TryGetUInt64(root, "active_thread_count", out var activeThreadCount))
-            {
-                return false;
-            }
-
-            snapshot = new ApiStatusSnapshot(
-                state,
-                observedAt,
-                authenticated,
-                planLabel,
-                quota,
-                new System.Collections.ObjectModel.ReadOnlyCollection<ApiModelUsage>(models),
-                activeThreadCount);
-            return true;
-        }
-        catch (JsonException)
-        {
-            return false;
-        }
-        catch (ArgumentException)
-        {
-            return false;
-        }
-        catch (InvalidOperationException)
-        {
-            return false;
-        }
-        catch (Exception)
-        {
-            return false;
         }
     }
 
@@ -758,6 +553,7 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
                 !TryGetBoolean(root, "authenticated", out var authenticated) ||
                 !TryGetNullablePlanLabel(root, out var planLabel) ||
                 !TryGetQuota(root, out var quota) ||
+                !HasValidDetailsRootDomain(state, authenticated, planLabel, quota) ||
                 !TryGetDetailsModels(root, out var models) ||
                 !TryGetUInt64(root, "active_thread_count", out var activeThreadCount) ||
                 !TryGetHistoryPeriods(root, observedAt, out var historyPeriods) ||
@@ -1492,34 +1288,52 @@ public sealed class LoopbackStatusClient : ILoopbackStatusClient, ILoopbackHealt
         return true;
     }
 
-    private static bool TryGetModels(JsonElement parent, out List<ApiModelUsage> models)
+    private static bool HasValidDetailsRootDomain(
+        ApiState state,
+        bool authenticated,
+        string? planLabel,
+        ApiQuota? quota)
     {
-        models = new List<ApiModelUsage>();
-        if (!parent.TryGetProperty("models", out var property) ||
-            property.ValueKind != JsonValueKind.Array ||
-            property.GetArrayLength() > 3)
+        if ((state == ApiState.Ready && !authenticated) ||
+            (state == ApiState.AuthRequired && authenticated))
         {
             return false;
         }
 
-        var names = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var model in property.EnumerateArray())
+        if (planLabel is null)
         {
-            if (!HasExactlyProperties(model, ModelProperties, 4) ||
-                !TryGetString(model, "name", out var name) ||
-                !names.Add(name) ||
-                name is not ("SOL" or "TERRA" or "LUNA") ||
-                !TryGetUInt64(model, "input_tokens", out var inputTokens) ||
-                !TryGetUInt64(model, "cached_input_tokens", out var cachedInputTokens) ||
-                !TryGetUInt64(model, "output_tokens", out var outputTokens))
-            {
-                return false;
-            }
-
-            models.Add(new ApiModelUsage(name, inputTokens, cachedInputTokens, outputTokens));
+            return state != ApiState.Ready && quota is null;
         }
 
-        return true;
+        if (!TryGetCanonicalMonthly(planLabel, out var expectedMonthly))
+        {
+            return false;
+        }
+
+        return quota is null || quota.Monthly == expectedMonthly;
+    }
+
+    private static bool TryGetCanonicalMonthly(string planLabel, out bool monthly)
+    {
+        monthly = false;
+        switch (planLabel)
+        {
+            case "無料":
+            case "Go":
+            case "Plus":
+            case "Pro":
+            case "Pro Lite":
+            case "Team":
+            case "Business":
+            case "教育":
+            case "プラン未設定":
+                return true;
+            case "エンタープライズ":
+                monthly = true;
+                return true;
+            default:
+                return false;
+        }
     }
 
     private static bool TryGetUnixSeconds(JsonElement parent, string name, out long value)

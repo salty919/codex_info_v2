@@ -94,13 +94,12 @@ public static class PreviewEnvironment
 }
 
 /// <summary>Stable authenticated data for graph/thread/visual fixture runs.</summary>
-public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackHealthClient, ILoopbackDetailsClient, IDisposable
+public sealed class PreviewLoopbackClient : ILoopbackHealthClient, ILoopbackDetailsClient, IDisposable
 {
     private const string PreviewPublishedPairValue =
         "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
     private static readonly PublishedPairIdentity PreviewPublishedPair =
         PublishedPairIdentity.Create(PreviewPublishedPairValue);
-    private readonly ApiStatusSnapshot status;
     private readonly ApiDetailsSnapshot details;
 
     public PreviewLoopbackClient()
@@ -199,27 +198,12 @@ public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackHeal
             new ApiThreadDetails("preview-third-root", "Release smoke verification", null, "gpt-preview-luna", "LUNA", 2_400, 900, 16_000, now - 1_500, now - 180, false, 0, false),
         }.Take(PreviewEnvironment.ThreadCount).ToArray();
 
-        status = new ApiStatusSnapshot(
-            previewState,
-            now,
-            authenticated,
-            "Pro",
-            new ApiQuota(remainingPercent, reset, windowSeconds, false),
-            [
-                new ApiModelUsage("SOL", 8_400, 1_500, 900),
-                new ApiModelUsage("TERRA", 4_200, 900, 500),
-                new ApiModelUsage("LUNA", 2_100, 600, 240),
-            ],
-            (ulong)threads.Length)
-        {
-            PublishedPair = PreviewPublishedPair,
-        };
         details = new ApiDetailsSnapshot(
             previewState,
             now,
             authenticated,
             "Pro",
-            status.Quota,
+            new ApiQuota(remainingPercent, reset, windowSeconds, false),
             [
                 new ApiDetailsModelUsage("SOL", 8_400, 1_500, 900, 8.75, 1.50, 2.25),
                 new ApiDetailsModelUsage("TERRA", 4_200, 900, 500, 4.50, 0.90, 1.35),
@@ -234,9 +218,6 @@ public sealed class PreviewLoopbackClient : ILoopbackStatusClient, ILoopbackHeal
             PublishedPair = PreviewPublishedPair,
         };
     }
-
-    public Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
-        Task.FromResult(StatusFetchResult.Success(status));
 
     public Task<HealthFetchResult> FetchHealthAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info")));

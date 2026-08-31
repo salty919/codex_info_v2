@@ -140,7 +140,7 @@ public sealed class UpdateViewModelTests
         bool expectedUpdateVisible)
     {
         using var coordinator = new FakeCoordinator(new UpdateCheckResult("1.2.3", false));
-        var status = new ApiStatusSnapshot(
+        var details = PublishedPairTestFixtures.DetailsGeneration(
             state,
             DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
             authenticated,
@@ -149,7 +149,7 @@ public sealed class UpdateViewModelTests
             [],
             0);
         using var main = new MainWindowViewModel(
-            new SingleStatusClient(StatusFetchResult.Success(status)),
+            new SingleDetailsClient(DetailsFetchResult.Success(details)),
             updateCoordinator: coordinator);
 
         main.Start();
@@ -190,9 +190,9 @@ public sealed class UpdateViewModelTests
         public void Dispose() => DisposeCount++;
     }
 
-    private sealed class SingleStatusClient(StatusFetchResult result) : HealthyStatusClientBase
+    private sealed class SingleDetailsClient(DetailsFetchResult result) : HealthyDetailsClientBase
     {
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(result);
     }
 }

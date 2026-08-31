@@ -50,16 +50,13 @@ public sealed class PreviewEnvironmentTests
     public async Task GraphThreadsAndLegalPreviewFixtureHasCompleteAuthenticatedData()
     {
         using var client = new CodexInfo.WindowsClient.PreviewLoopbackClient();
-        var status = await client.FetchAsync();
         var details = await client.FetchDetailsAsync();
 
-        Assert.True(status.IsSuccess);
-        Assert.True(status.Snapshot!.Authenticated);
-        Assert.Equal(ApiState.Ready, status.Snapshot.State);
-        Assert.Equal(6UL, status.Snapshot.ActiveThreadCount);
-        Assert.Equal(3, status.Snapshot.Models.Count);
-
         Assert.True(details.IsSuccess);
+        Assert.True(details.Snapshot!.Authenticated);
+        Assert.Equal(ApiState.Ready, details.Snapshot.State);
+        Assert.Equal(6UL, details.Snapshot.ActiveThreadCount);
+        Assert.Equal(3, details.Snapshot.Models.Count);
         Assert.Equal(2, details.Snapshot!.HistoryPeriods.Count);
         Assert.Equal(3, details.Snapshot.HistoryPeriods.Single(period => period.Current).Samples.Count);
         Assert.Equal(2, details.Snapshot.HistoryPeriods.Single(period => !period.Current).Samples.Count);
@@ -73,10 +70,10 @@ public sealed class PreviewEnvironmentTests
     public async Task PreviewQuotaGaugeUsesTheExactHalfPeriodAcceptanceBoundary()
     {
         using var client = new CodexInfo.WindowsClient.PreviewLoopbackClient();
-        var status = await client.FetchAsync();
+        var details = await client.FetchDetailsAsync();
 
-        var quota = Assert.IsType<ApiQuota>(status.Snapshot!.Quota);
-        var remainingSeconds = quota.ResetAt - status.Snapshot.ObservedAt;
+        var quota = Assert.IsType<ApiQuota>(details.Snapshot!.Quota);
+        var remainingSeconds = quota.ResetAt - details.Snapshot.ObservedAt;
         Assert.Equal(quota.WindowSeconds / 2, remainingSeconds);
     }
 
@@ -101,12 +98,9 @@ public sealed class PreviewEnvironmentTests
                 client,
                 updateCoordinator: coordinator);
 
-            var status = await client.FetchAsync(CancellationToken.None);
             var details = await client.FetchDetailsAsync(CancellationToken.None);
-            Assert.True(status.IsSuccess);
             Assert.True(details.IsSuccess);
-            Assert.NotNull(status.Snapshot!.PublishedPair);
-            Assert.Equal(status.Snapshot.PublishedPair, details.Snapshot!.PublishedPair);
+            Assert.NotNull(details.Snapshot!.PublishedPair);
 
             viewModel.Start();
             await EventuallyAsync(() => viewModel.IsAuthenticated &&
@@ -126,7 +120,7 @@ public sealed class PreviewEnvironmentTests
             Assert.True(viewModel.ShowAuthenticatedContent);
             Assert.True(viewModel.HasDetails);
             Assert.Equal(expectedRemaining, viewModel.RemainingPercentValue);
-            Assert.Equal(status.Snapshot.PublishedPair, viewModel.DetailsSnapshot!.PublishedPair);
+            Assert.Equal(details.Snapshot.PublishedPair, viewModel.DetailsSnapshot!.PublishedPair);
             Assert.NotEmpty(viewModel.Models);
             Assert.Equal(expectedUpdate, viewModel.IsUpdateNotificationVisible);
         });
@@ -135,7 +129,7 @@ public sealed class PreviewEnvironmentTests
     [Theory]
     [InlineData("auth", ApiState.AuthRequired)]
     [InlineData("error", ApiState.Error)]
-    public async Task PreviewAuthAndErrorKeepStatusOnlySemantics(string scenario, ApiState expectedState)
+    public async Task PreviewAuthAndErrorApplyDetailsVisibilitySemantics(string scenario, ApiState expectedState)
     {
         await WithPreviewScenarioAsync(scenario, async () =>
         {
@@ -149,15 +143,15 @@ public sealed class PreviewEnvironmentTests
             viewModel.Start();
             await EventuallyAsync(() => !viewModel.IsStartupLoading);
 
-            var status = await client.FetchAsync(CancellationToken.None);
-            Assert.Equal(expectedState, status.Snapshot!.State);
-            Assert.False(status.Snapshot.Authenticated);
+            var details = await client.FetchDetailsAsync(CancellationToken.None);
+            Assert.Equal(expectedState, details.Snapshot!.State);
+            Assert.False(details.Snapshot.Authenticated);
             Assert.False(viewModel.IsAuthenticated);
             Assert.False(viewModel.ShowAuthenticatedContent);
             Assert.False(viewModel.HasDetails);
             Assert.Empty(viewModel.Models);
-            // Auth/error are status-only visibility transitions; the
-            // validated status quota remains available while account-scoped
+            // Auth/error are details visibility transitions; the validated
+            // root quota remains available while account-scoped
             // details/models are cleared.
             Assert.Equal(48d, viewModel.RemainingPercentValue);
             Assert.Equal("48%", viewModel.RemainingPercentText);

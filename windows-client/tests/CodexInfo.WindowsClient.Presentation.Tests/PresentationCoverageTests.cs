@@ -131,13 +131,11 @@ public sealed class PresentationCoverageTests
         WithEnvironment("CODEX_INFO_WINDOWS_PREVIEW", scenario, async () =>
         {
             using var client = new PreviewLoopbackClient();
-            var status = await client.FetchAsync(CancellationToken.None);
             var details = await client.FetchDetailsAsync(CancellationToken.None);
 
-            Assert.Equal(expectedState, status.Snapshot!.State);
-            Assert.Equal(expectedAuthenticated, status.Snapshot.Authenticated);
-            Assert.Equal(expectedRemaining, status.Snapshot.Quota!.RemainingPercent);
-            Assert.Equal(status.Snapshot.State, details.Snapshot!.State);
+            Assert.Equal(expectedState, details.Snapshot!.State);
+            Assert.Equal(expectedAuthenticated, details.Snapshot.Authenticated);
+            Assert.Equal(expectedRemaining, details.Snapshot.Quota!.RemainingPercent);
             client.Dispose();
         });
     }
@@ -149,11 +147,10 @@ public sealed class PresentationCoverageTests
         WithEnvironment("CODEX_INFO_WINDOWS_PREVIEW_GRAPH_POINTS", "2", () =>
         {
             using var client = new PreviewLoopbackClient();
-            var status = client.FetchAsync(new CancellationToken(canceled: true)).GetAwaiter().GetResult();
             var details = client.FetchDetailsAsync(new CancellationToken(canceled: true)).GetAwaiter().GetResult();
             Assert.Equal(2, details.Snapshot!.HistoryPeriods.Single(period => period.Current).Samples.Count);
             Assert.Equal(4, details.Snapshot.HistorySamples.Count);
-            Assert.Equal(100, status.Snapshot!.Quota!.RemainingPercent);
+            Assert.Equal(100, details.Snapshot.Quota!.RemainingPercent);
         }));
     }
 
@@ -215,14 +212,14 @@ public sealed class PresentationCoverageTests
         try
         {
             CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("en-US");
-            using var apiModel = new ModelUsageViewModel(new ApiModelUsage("SOL", 1_234_567, 23_456, 789));
+            using var apiModel = new ModelUsageViewModel(new ApiDetailsModelUsage("SOL", 1_234_567, 23_456, 789, 0, 0, 0));
             Assert.Equal("SOL", apiModel.Name);
             Assert.Equal("1,234,567", apiModel.InputTokensText);
             Assert.Equal("23,456", apiModel.CachedInputTokensText);
             Assert.Equal("789", apiModel.OutputTokensText);
-            Assert.Equal(LocalizationService.Current.UnavailableValue, apiModel.InputDollarsText);
-            Assert.Equal(LocalizationService.Current.UnavailableValue, apiModel.CachedInputDollarsText);
-            Assert.Equal(LocalizationService.Current.UnavailableValue, apiModel.OutputDollarsText);
+            Assert.Equal("$0.00", apiModel.InputDollarsText);
+            Assert.Equal("$0.00", apiModel.CachedInputDollarsText);
+            Assert.Equal("$0.00", apiModel.OutputDollarsText);
 
             using var detailsModel = new ModelUsageViewModel(
                 new ApiDetailsModelUsage("TERRA", 12, 34, 56, double.NaN, double.PositiveInfinity, double.NegativeInfinity));
@@ -297,7 +294,7 @@ public sealed class PresentationCoverageTests
         try
         {
             LocalizationService.SetLanguage("en");
-            using var main = new MainWindowViewModel(new NeverCalledStatusClient());
+            using var main = new MainWindowViewModel(new NeverCalledDetailsClient());
             var changed = new List<string?>();
             main.PropertyChanged += (_, eventArgs) => changed.Add(eventArgs.PropertyName);
 
@@ -337,7 +334,7 @@ public sealed class PresentationCoverageTests
         var originalLanguage = LocalizationService.Current.LanguageCode;
         try
         {
-            using var main = new MainWindowViewModel(new CountingStatusClient(ReadyStatus()));
+            using var main = new MainWindowViewModel(new CountingDetailsClient(ReadyDetails()));
             var session = new RecordingSettingsSession(ClientSettings.Default);
             using var setup = new SetupViewModel(main, session);
             var changed = new List<string?>();
@@ -403,27 +400,13 @@ public sealed class PresentationCoverageTests
     public async Task MainPublishesCompleteAuthenticatedGenerationAndPresentationProperties()
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var status = new ApiStatusSnapshot(
-            ApiState.Ready,
-            now,
-            true,
-            "Pro",
-            new ApiQuota(75, now + 8 * 86_400, 31 * 86_400, true),
-            [
-                new ApiModelUsage("LUNA", 3, 2, 1),
-                new ApiModelUsage("SOL", 9, 8, 7),
-                new ApiModelUsage("TERRA", 6, 5, 4),
-            ],
-            4)
-        {
-            PublishedPair = PublishedPairTestFixtures.Canonical,
-        };
+        var quota = new ApiQuota(75, now + 8 * 86_400, 31 * 86_400, true);
         var details = new ApiDetailsSnapshot(
             ApiState.Ready,
             now,
             true,
-            "Pro",
-            status.Quota,
+            "エンタープライズ",
+            quota,
             [
                 new ApiDetailsModelUsage("LUNA", 3, 2, 1, 0.3, 0.2, 0.1),
                 new ApiDetailsModelUsage("SOL", 9, 8, 7, 0.9, 0.8, 0.7),
@@ -444,7 +427,7 @@ public sealed class PresentationCoverageTests
         };
 
         using var main = new MainWindowViewModel(
-            new SequenceStatusClient(StatusFetchResult.Success(status)),
+            new SequenceCoreDetailsClient(DetailsFetchResult.Success(details)),
             new SequenceDetailsClient(DetailsFetchResult.Success(details)));
         var notifications = new List<string?>();
         main.PropertyChanged += (_, eventArgs) => notifications.Add(eventArgs.PropertyName);
@@ -467,7 +450,7 @@ public sealed class PresentationCoverageTests
         Assert.Equal("75%", main.RemainingPercentText);
         Assert.Equal(75, main.RemainingPercentValue);
         Assert.NotEqual(LocalizationService.Current.UnavailableValue, main.QuotaRemainingText);
-        Assert.Equal("Pro", main.PlanText);
+        Assert.Equal("エンタープライズ", main.PlanText);
         Assert.Equal(LocalizationService.Current.Connected, main.AuthenticationText);
         Assert.Equal("current", main.ModelUsagePeriodText);
         Assert.Equal("概算 $9", main.EstimatedCostText);
@@ -492,21 +475,21 @@ public sealed class PresentationCoverageTests
     }
 
     [Fact]
-    public async Task MainClassifiesThrownStatusAndDetailsFailuresAndDisposesClients()
+    public async Task MainClassifiesThrownDetailsFailuresAndDisposesClients()
     {
-        var statusClient = new DisposableThrowingStatusClient();
-        using (var main = new MainWindowViewModel(statusClient))
+        var combinedClient = new DisposableThrowingCombinedClient();
+        using (var main = new MainWindowViewModel(combinedClient))
         {
             main.Start();
             await EventuallyAsync(() => main.StatusTitle == LocalizationService.Current.TransportError);
             Assert.False(main.IsAuthenticated);
         }
-        Assert.True(statusClient.Disposed);
+        Assert.True(combinedClient.Disposed);
 
-        var status = ReadyStatus();
+        var status = ReadyDetails();
         var detailsClient = new ThrowingDetailsClient();
         using var complete = new MainWindowViewModel(
-            new SequenceStatusClient(StatusFetchResult.Success(status)),
+            new SequenceCoreDetailsClient(DetailsFetchResult.Success(status)),
             detailsClient);
         complete.Start();
         await EventuallyAsync(() => complete.StatusTitle == LocalizationService.Current.TransportError);
@@ -514,38 +497,63 @@ public sealed class PresentationCoverageTests
     }
 
     [Fact]
-    public async Task MainRejectsDetailsWithDifferentPublicCoreAndKeepsRefreshUsable()
+    public async Task MainKeepsCompleteLastGoodAfterInvalidDetailsAndRecoversWithOneValidGeneration()
     {
-        var status = ReadyStatus();
-        var mismatched = new ApiDetailsSnapshot(
+        var status = ReadyDetails();
+        var first = new ApiDetailsSnapshot(
             status.State,
             status.ObservedAt,
             status.Authenticated,
             status.PlanLabel,
             status.Quota,
-            [new ApiDetailsModelUsage("SOL", 999, 2, 3, 1, 1, 1)],
+            [new ApiDetailsModelUsage("SOL", 1, 2, 3, 1, 1, 1)],
             status.ActiveThreadCount,
             [],
             [],
             [],
-            "mismatch")
+            "first")
         {
             PublishedPair = PublishedPairTestFixtures.Canonical,
         };
+        var recovered = first with
+        {
+            ObservedAt = status.ObservedAt + 60,
+            Quota = status.Quota! with { RemainingPercent = 41 },
+            Models = [new ApiDetailsModelUsage("SOL", 999, 2, 3, 323.674247, 0, 0)],
+            EstimatedCostLabel = "recovered",
+        };
         using var main = new MainWindowViewModel(
-            new SequenceStatusClient(StatusFetchResult.Success(status)),
-            new SequenceDetailsClient(DetailsFetchResult.Success(mismatched)));
+            new SequenceCoreDetailsClient(DetailsFetchResult.Success(status)),
+            new SequenceDetailsClient(
+                DetailsFetchResult.Success(first),
+                DetailsFetchResult.FromFailure(DetailsFetchFailure.Response),
+                DetailsFetchResult.Success(recovered)));
 
         main.Start();
-        await EventuallyAsync(() => main.StatusTitle == LocalizationService.Current.Unavailable);
-        Assert.False(main.HasDetails);
+        await EventuallyAsync(() => main.DetailsSnapshot?.EstimatedCostLabel == "first");
+        var lastGood = main.DetailsSnapshot;
+        var lastGoodObserved = main.ObservedAtText;
+
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => main.DetailsStatusAutomationText == "error");
+        Assert.Same(lastGood, main.DetailsSnapshot);
+        Assert.Equal(lastGoodObserved, main.ObservedAtText);
+        Assert.Equal(75, main.RemainingPercentValue);
+        Assert.Equal("$1.00", main.Models[0].InputDollarsText);
         Assert.True(main.CanRefresh);
+
+        main.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => main.DetailsSnapshot?.EstimatedCostLabel == "recovered");
+        Assert.Same(recovered, main.DetailsSnapshot);
+        Assert.Equal(41, main.RemainingPercentValue);
+        Assert.Equal("$323.67", main.Models[0].InputDollarsText);
+        Assert.Equal("ready", main.DetailsStatusAutomationText);
     }
 
     [Fact]
     public async Task MainStartIsIdempotentAndDisposeDisablesCommands()
     {
-        var client = new CountingStatusClient(ReadyStatus());
+        var client = new CountingDetailsClient(ReadyDetails());
         var main = new MainWindowViewModel(client);
         main.Start();
         main.Start();
@@ -566,9 +574,10 @@ public sealed class PresentationCoverageTests
         App.CurrentSettings = ClientSettings.Default;
         try
         {
-            var main = new MainWindowViewModel(new SequenceStatusClient(
-                StatusFetchResult.Success(new ApiStatusSnapshot(ApiState.AuthRequired, 1, false, null, null, [], 0)),
-                StatusFetchResult.Success(ReadyStatus())));
+            var main = new MainWindowViewModel(new SequenceCoreDetailsClient(
+                DetailsFetchResult.Success(PublishedPairTestFixtures.DetailsGeneration(
+                    ApiState.AuthRequired, 1, false, null, null, [], 0)),
+                DetailsFetchResult.Success(ReadyDetails())));
             var session = new RecordingSettingsSession(ClientSettings.Default);
             using (main)
             using (var setup = new SetupViewModel(main, session))
@@ -686,7 +695,7 @@ public sealed class PresentationCoverageTests
         var originalLanguage = LocalizationService.Current.LanguageCode;
         try
         {
-            using var main = new MainWindowViewModel(new NeverCalledStatusClient());
+            using var main = new MainWindowViewModel(new NeverCalledDetailsClient());
             using var viewModel = new LegalNoticesWindowViewModel(main);
             Assert.True(viewModel.HasNotices);
             Assert.Equal(9, viewModel.PageCount);
@@ -731,7 +740,7 @@ public sealed class PresentationCoverageTests
         var originalLanguage = LocalizationService.Current.LanguageCode;
         try
         {
-            using var main = new MainWindowViewModel(new NeverCalledStatusClient());
+            using var main = new MainWindowViewModel(new NeverCalledDetailsClient());
             foreach (var language in LocalizationService.Languages)
             {
                 LocalizationService.SetLanguage(language.LanguageCode);
@@ -774,20 +783,17 @@ public sealed class PresentationCoverageTests
         }
     }
 
-    private static ApiStatusSnapshot ReadyStatus()
+    private static ApiDetailsSnapshot ReadyDetails()
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        return new ApiStatusSnapshot(
+        return PublishedPairTestFixtures.DetailsGeneration(
             ApiState.Ready,
             now,
             true,
             "Pro",
             new ApiQuota(75, now + 604_800, 604_800, false),
-            [new ApiModelUsage("SOL", 1, 2, 3)],
-            1)
-        {
-            PublishedPair = PublishedPairTestFixtures.Canonical,
-        };
+            [new ApiDetailsModelUsage("SOL", 1, 2, 3, 0, 0, 0)],
+            1);
     }
 
     private static async Task EventuallyAsync(Func<bool> condition)
@@ -832,11 +838,11 @@ public sealed class PresentationCoverageTests
         }
     }
 
-    private sealed class SequenceStatusClient(params StatusFetchResult[] results) : HealthyStatusClientBase
+    private sealed class SequenceCoreDetailsClient(params DetailsFetchResult[] results) : HealthyDetailsClientBase
     {
         private int index;
 
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default)
         {
             var result = results[Math.Min(index, results.Length - 1)];
             index++;
@@ -856,12 +862,12 @@ public sealed class PresentationCoverageTests
         }
     }
 
-    private sealed class DisposableThrowingStatusClient : HealthyStatusClientBase, IDisposable
+    private sealed class DisposableThrowingCombinedClient : HealthyDetailsClientBase, IDisposable
     {
         public bool Disposed { get; private set; }
 
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
-            throw new InvalidOperationException("status transport failed");
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("details transport failed");
 
         public void Dispose() => Disposed = true;
     }
@@ -872,21 +878,21 @@ public sealed class PresentationCoverageTests
             throw new IOException("details transport failed");
     }
 
-    private sealed class CountingStatusClient(ApiStatusSnapshot snapshot) : HealthyStatusClientBase
+    private sealed class CountingDetailsClient(ApiDetailsSnapshot snapshot) : HealthyDetailsClientBase
     {
         public int CallCount { get; private set; }
 
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default)
         {
             CallCount++;
-            return Task.FromResult(StatusFetchResult.Success(snapshot));
+            return Task.FromResult(DetailsFetchResult.Success(snapshot));
         }
     }
 
-    private sealed class NeverCalledStatusClient : HealthyStatusClientBase
+    private sealed class NeverCalledDetailsClient : HealthyDetailsClientBase
     {
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default) =>
-            throw new InvalidOperationException("No status request expected.");
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("No details request expected.");
     }
 
     private sealed class RecordingSettingsSession(ClientSettings initial) : IClientSettingsSession

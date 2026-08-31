@@ -185,9 +185,9 @@ public sealed class PresentationBoundaryTests
     [Fact]
     public async Task SettingsViewModelMirrorsMainAuthenticationCapability()
     {
-        var auth = new ApiStatusSnapshot(ApiState.AuthRequired, 1, false, null, null, [], 0);
-        var ready = ValidStatus(DateTimeOffset.UtcNow.AddHours(2).ToUnixTimeSeconds());
-        var client = new SequenceStatusClient(StatusFetchResult.Success(auth), StatusFetchResult.Success(ready));
+        var auth = PublishedPairTestFixtures.DetailsGeneration(ApiState.AuthRequired, 1, false, null, null, [], 0);
+        var ready = ValidDetails(DateTimeOffset.UtcNow.AddHours(2).ToUnixTimeSeconds());
+        var client = new SequenceCombinedClient(DetailsFetchResult.Success(auth), DetailsFetchResult.Success(ready));
         using var main = new MainWindowViewModel(client);
         var root = Directory.CreateTempSubdirectory("codex-info-settings-status-test");
         SettingsViewModel? settings = null;
@@ -216,8 +216,8 @@ public sealed class PresentationBoundaryTests
     [Fact]
     public async Task SetupNoneProfileRequiresObservedConnectionAndBuildsFailClosedSettings()
     {
-        var auth = new ApiStatusSnapshot(ApiState.AuthRequired, 1, false, null, null, [], 0);
-        using var main = new MainWindowViewModel(new SequenceStatusClient(StatusFetchResult.Success(auth)));
+        var auth = PublishedPairTestFixtures.DetailsGeneration(ApiState.AuthRequired, 1, false, null, null, [], 0);
+        using var main = new MainWindowViewModel(new SequenceCombinedClient(DetailsFetchResult.Success(auth)));
         var originalSettings = App.CurrentSettings;
         try
         {
@@ -255,8 +255,8 @@ public sealed class PresentationBoundaryTests
     [Fact]
     public async Task SetupSshInputUsesBoundedSafeHostAndUserGrammar()
     {
-        var auth = new ApiStatusSnapshot(ApiState.AuthRequired, 1, false, null, null, [], 0);
-        using var main = new MainWindowViewModel(new SequenceStatusClient(StatusFetchResult.Success(auth)));
+        var auth = PublishedPairTestFixtures.DetailsGeneration(ApiState.AuthRequired, 1, false, null, null, [], 0);
+        using var main = new MainWindowViewModel(new SequenceCombinedClient(DetailsFetchResult.Success(auth)));
         main.Start();
         await EventuallyAsync(() => main.IsAuthRequired);
 
@@ -283,8 +283,8 @@ public sealed class PresentationBoundaryTests
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var quota = new ApiQuota(40, now + 500, 1_000, false);
-        using var viewModel = new MainWindowViewModel(new SequenceStatusClient(
-            StatusFetchResult.Success(new ApiStatusSnapshot(ApiState.Ready, now, true, "Pro", quota, [], 0))));
+        using var viewModel = new MainWindowViewModel(new SequenceCombinedClient(
+            DetailsFetchResult.Success(PublishedPairTestFixtures.DetailsGeneration(ApiState.Ready, now, true, "Pro", quota, [], 0))));
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.IsAuthenticated);
@@ -307,8 +307,9 @@ public sealed class PresentationBoundaryTests
             LocalizationService.SetLanguage("ja");
             var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             var quota = new ApiQuota(40, now + 500, 2_592_000, true);
-            using var viewModel = new MainWindowViewModel(new SequenceStatusClient(
-                StatusFetchResult.Success(new ApiStatusSnapshot(ApiState.Ready, now, true, "Pro", quota, [], 0))));
+            using var viewModel = new MainWindowViewModel(new SequenceCombinedClient(
+                DetailsFetchResult.Success(PublishedPairTestFixtures.DetailsGeneration(
+                    ApiState.Ready, now, true, "エンタープライズ", quota, [], 0))));
 
             viewModel.Start();
             await EventuallyAsync(() => viewModel.IsAuthenticated);
@@ -444,9 +445,9 @@ public sealed class PresentationBoundaryTests
     [Fact]
     public async Task MainDetailsFailureDoesNotPublishAPartialAccountGeneration()
     {
-        var status = ValidStatus(DateTimeOffset.UtcNow.AddHours(2).ToUnixTimeSeconds());
+        var status = ValidDetails(DateTimeOffset.UtcNow.AddHours(2).ToUnixTimeSeconds());
         using var viewModel = new MainWindowViewModel(
-            new SequenceStatusClient(StatusFetchResult.Success(status)),
+            new SequenceCombinedClient(DetailsFetchResult.Success(status)),
             new SequenceDetailsClient(DetailsFetchResult.FromFailure(DetailsFetchFailure.Response)));
 
         viewModel.Start();
@@ -473,10 +474,7 @@ public sealed class PresentationBoundaryTests
             PublishedPair = PublishedPairTestFixtures.Canonical,
         };
         using var viewModel = new MainWindowViewModel(
-            new SequenceStatusClient(StatusFetchResult.Success(new ApiStatusSnapshot(ApiState.Ready, 1, true, "Pro", null, [], 4)
-            {
-                PublishedPair = PublishedPairTestFixtures.Canonical,
-            })),
+            new SequenceCombinedClient(DetailsFetchResult.Success(details)),
             new SequenceDetailsClient(DetailsFetchResult.Success(details)));
 
         viewModel.Start();
@@ -542,10 +540,7 @@ public sealed class PresentationBoundaryTests
             PublishedPair = PublishedPairTestFixtures.Canonical,
         };
         using var main = new MainWindowViewModel(
-            new SequenceStatusClient(StatusFetchResult.Success(new ApiStatusSnapshot(ApiState.Ready, 1, true, "Pro", null, [], 1)
-            {
-                PublishedPair = PublishedPairTestFixtures.Canonical,
-            })),
+            new SequenceCombinedClient(DetailsFetchResult.Success(details)),
             new SequenceDetailsClient(DetailsFetchResult.Success(details)));
         main.Start();
         await EventuallyAsync(() => main.HasDetails);
@@ -562,14 +557,15 @@ public sealed class PresentationBoundaryTests
         Assert.EndsWith("—", item.InstructionAgeText, StringComparison.Ordinal);
     }
 
-    private static ApiStatusSnapshot ValidStatus(long observedAt) => new(
-        ApiState.Ready,
-        observedAt,
-        true,
-        "Pro",
-        new ApiQuota(75, observedAt + 604_800, 604_800, false),
-        [],
-        0);
+    private static ApiDetailsSnapshot ValidDetails(long observedAt) =>
+        PublishedPairTestFixtures.DetailsGeneration(
+            ApiState.Ready,
+            observedAt,
+            true,
+            "Pro",
+            new ApiQuota(75, observedAt + 604_800, 604_800, false),
+            [],
+            0);
 
     private static async Task EventuallyAsync(Func<bool> condition)
     {
@@ -609,11 +605,11 @@ public sealed class PresentationBoundaryTests
         return line[(colon + 1)..].Trim().TrimEnd(';').ToUpperInvariant();
     }
 
-    private sealed class SequenceStatusClient(params StatusFetchResult[] results) : HealthyStatusClientBase
+    private sealed class SequenceCombinedClient(params DetailsFetchResult[] results) : HealthyDetailsClientBase
     {
         private int index;
 
-        public override Task<StatusFetchResult> FetchAsync(CancellationToken cancellationToken = default)
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default)
         {
             var result = results[Math.Min(index, results.Length - 1)];
             index++;
