@@ -5,7 +5,9 @@
 
 Codex Info reads rate limits, reset periods, local usage history, and running
 threads from the Codex App Server and displays them in a Rust/Slint X11 window.
-The Japanese README is the primary setup guide: [README.md](README.md).
+This file is the source/developer quick start. Customer installation uses the
+Linux release bundle; see [the customer operations runbook](docs/CUSTOMER_OPERATIONS_RUNBOOK.md)
+for the download, checksum, install, health, and removal flow.
 
 ## Quick start
 

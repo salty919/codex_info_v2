@@ -1,0 +1,74 @@
+# Copyright (C) 2026 salty919
+# SPDX-License-Identifier: GPL-3.0-only
+
+name: Linux distribution (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Immutable source commit selected by the trusted caller
+        required: true
+        type: string
+      pr_number:
+        description: Pull request number used in the candidate identity
+        required: true
+        type: string
+      release_candidate:
+        description: Whether this run may publish a pre-merge candidate
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  LINUX_BUNDLE_TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  linux-distribution:
+    name: linux-distribution
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Install bundle validation tools
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes binutils jq
+      - name: Build the exact Linux target
+        run: cargo build --release --locked --target "$LINUX_BUNDLE_TARGET"
+      - name: Create and validate the Linux bundle
+        id: bundle
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          output_dir="$RUNNER_TEMP/codex-info-linux-bundle"
+          mkdir -p "$output_dir"
+          bash scripts/build_linux_bundle.sh \
+            --binary "target/$LINUX_BUNDLE_TARGET/release/codex_info" \
+            --output-dir "$output_dir" \
+            --source-sha "$SOURCE_SHA" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT"
+          bash scripts/test_linux_bundle.sh --bundle-dir "$output_dir"
+          version="$(jq -er '.version | select(type == "string")' "$output_dir"/*.manifest.json)"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          mkdir -p artifacts/linux-bundle
+          cp "$output_dir"/*.tar.gz "$output_dir"/*.sha256 "$output_dir"/*.manifest.json artifacts/linux-bundle/
+      - name: Upload release candidate
+        if: inputs.release_candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-linux-v1-pr-${{ inputs.pr_number }}-head-${{ inputs.source_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}-version-${{ steps.bundle.outputs.version }}
+          path: artifacts/linux-bundle/*
+          if-no-files-found: error
