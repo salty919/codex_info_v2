@@ -35,6 +35,9 @@ jobs:
       artifact_id: ${{ steps.resolve.outputs.artifact_id }}
       artifact_name: ${{ steps.resolve.outputs.artifact_name }}
       artifact_digest: ${{ steps.resolve.outputs.artifact_digest }}
+      artifact_ids: ${{ steps.resolve.outputs.artifact_ids }}
+      linux_present: ${{ steps.resolve.outputs.linux_present }}
+      windows_present: ${{ steps.resolve.outputs.windows_present }}
     steps:
       - name: Resolve the immutable publication snapshot
         id: resolve
@@ -48,12 +51,15 @@ jobs:
           workflow_path='.github/workflows/version-prepare.yml'
           title_prefix='codex-main-quality-v1:'
           title_re='^codex-main-quality-v1:pr=(?<pr>[1-9][0-9]*):event_head=(?<event_head>[0-9a-f]{40}):action=(?<action>opened|synchronize|reopened|ready_for_review):draft=(?<draft>true|false)$'
-          candidate_prefix='release-candidate-v1-'
-          candidate_re='^release-candidate-v1-pr-(?<pr>[1-9][0-9]*)-head-(?<head>[0-9a-f]{40})-run-(?<run_id>[1-9][0-9]*)-attempt-(?<attempt>[1-9][0-9]*)-version-(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$'
+          candidate_prefix='release-candidate'
+          windows_candidate_re='^release-candidate-v1-pr-(?<pr>[1-9][0-9]*)-head-(?<head>[0-9a-f]{40})-run-(?<run_id>[1-9][0-9]*)-attempt-(?<attempt>[1-9][0-9]*)-version-(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$'
+          linux_candidate_re='^release-candidate-linux-v1-pr-(?<pr>[1-9][0-9]*)-head-(?<head>[0-9a-f]{40})-run-(?<run_id>[1-9][0-9]*)-attempt-(?<attempt>[1-9][0-9]*)-version-(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$'
           generated_re='^chore: prepare version (?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))\n\nCodex-Version-Prepare-Schema: v1\nCodex-Version-Prepare-PR: (?<pr>[1-9][0-9]*)\nCodex-Version-Prepare-Event-Head: (?<event_head>[0-9a-f]{40})\nCodex-Version-Prepare-Run-ID: (?<run_id>[1-9][0-9]*)\nCodex-Version-Prepare-Run-Attempt: (?<attempt>[1-9][0-9]*)$'
           draft_observer='Observe non-authoritative PR event'
           windows_wrapper='Run selected quality owners / windows-quality'
           windows_leaf='Run selected quality owners / windows-quality / windows-quality'
+          linux_wrapper='Run selected quality owners / linux-distribution'
+          linux_leaf='Run selected quality owners / linux-distribution / linux-distribution'
 
           api() {
             gh api \
@@ -134,13 +140,19 @@ jobs:
                 artifacts
             )"
             jq -ce \
-              --arg prefix "$candidate_prefix" --arg re "$candidate_re" \
+              --arg prefix "$candidate_prefix" --arg windows_re "$windows_candidate_re" \
+              --arg linux_re "$linux_candidate_re" \
               --arg pr "$pr_number" --arg head "$final_head" --arg run "$run_id" '
                 [ .[] |
                   select((.name | type) == "string" and (.name | startswith($prefix))) |
                   . as $artifact |
-                  (try (.name | capture($re))
-                   catch error("malformed release candidate name")) as $identity |
+                  (try ((.name | capture($windows_re)) // null) catch null) as $windows_identity |
+                  (try ((.name | capture($linux_re)) // null) catch null) as $linux_identity |
+                  if ($windows_identity != null and $linux_identity != null) or
+                     ($windows_identity == null and $linux_identity == null)
+                  then error("malformed release candidate name")
+                  else ($windows_identity // $linux_identity) as $identity |
+                    (if $windows_identity != null then "windows" else "linux" end) as $platform |
                   if $identity.pr != $pr or $identity.head != $head or
                      $identity.run_id != $run
                   then error("release candidate has the wrong PR/head/run identity")
@@ -152,9 +164,11 @@ jobs:
                     name: $artifact.name,
                     digest: $artifact.digest,
                     expired: $artifact.expired,
+                    platform: $platform,
                     attempt: ($identity.attempt | tonumber),
                     version: $identity.version
                   }
+                  end
                   end
                 ]
               ' <<<"$artifacts"
@@ -410,6 +424,7 @@ jobs:
 
           skipped=0
           windows=0
+          linux=0
           while IFS= read -r row; do
             run_id="$(jq -r '.run_id' <<<"$row")"
             run_number="$(jq -r '.run_number' <<<"$row")"
@@ -421,13 +436,16 @@ jobs:
               '[.[] | select(.name == $wrapper or .name == $leaf)]' <<<"$jobs")"
             observer_count="$(jq 'length' <<<"$observer_jobs")"
             windows_count="$(jq 'length' <<<"$windows_jobs")"
+            linux_jobs="$(jq -c --arg wrapper "$linux_wrapper" --arg leaf "$linux_leaf" \
+              '[.[] | select(.name == $wrapper or .name == $leaf)]' <<<"$jobs")"
+            linux_count="$(jq 'length' <<<"$linux_jobs")"
             if [[ "$observer_count" -gt 1 ]]; then
               echo 'current-draft observer job is duplicated' >&2
               exit 1
             fi
             if [[ "$observer_count" -eq 1 ]]; then
-              [[ "$windows_count" -eq 0 ]] || {
-                echo 'current-draft observer and Windows authority jobs are mixed' >&2
+              [[ "$windows_count" -eq 0 && "$linux_count" -eq 0 ]] || {
+                echo 'current-draft observer and product authority jobs are mixed' >&2
                 exit 1
               }
               jq -e '
@@ -448,13 +466,17 @@ jobs:
               echo 'Windows authority job is missing or duplicated' >&2
               exit 1
             }
+            [[ "$linux_count" -le 1 ]] || {
+              echo 'Linux distribution authority job is duplicated' >&2
+              exit 1
+            }
             printf '%s\n' "$row" >>"$successes"
             job_name="$(jq -r '.[0].name' <<<"$windows_jobs")"
             job_status="$(jq -r '.[0].status' <<<"$windows_jobs")"
             job_result="$(jq -r '.[0].conclusion // ""' <<<"$windows_jobs")"
             [[ "$job_status" == completed ]]
             candidates="$(run_candidates "$run_id" | jq -c --argjson attempt "$attempt" \
-              '[.[] | select(.attempt == $attempt)]')"
+              '[.[] | select(.attempt == $attempt and .platform == "windows")]')"
             if [[ "$job_name" == "$windows_wrapper" && "$job_result" == skipped ]]; then
               [[ "$(jq 'length' <<<"$candidates")" -eq 0 ]]
               skipped=$((skipped + 1))
@@ -477,19 +499,67 @@ jobs:
               echo 'Windows authority has an unexpected name/result pair' >&2
               exit 1
             fi
+            if [[ "$linux_count" -eq 0 ]]; then
+              # Runs created before the Linux distribution workflow existed do
+              # not have a Linux job. They remain valid Windows-only history;
+              # new binary runs always contain the exact Linux authority job.
+              :
+            else
+              linux_job_name="$(jq -r '.[0].name' <<<"$linux_jobs")"
+              linux_job_status="$(jq -r '.[0].status' <<<"$linux_jobs")"
+              linux_job_result="$(jq -r '.[0].conclusion // ""' <<<"$linux_jobs")"
+              [[ "$linux_job_status" == completed ]]
+              linux_candidates="$(run_candidates "$run_id" | jq -c --argjson attempt "$attempt" \
+                '[.[] | select(.attempt == $attempt and .platform == "linux")]')"
+              if [[ "$linux_job_name" == "$linux_wrapper" && "$linux_job_result" == skipped ]]; then
+                [[ "$(jq 'length' <<<"$linux_candidates")" -eq 0 ]]
+                [[ "$job_name" == "$windows_wrapper" ]] || {
+                  echo 'Windows success cannot publish without its Linux distribution candidate' >&2
+                  exit 1
+                }
+              elif [[ "$linux_job_name" == "$linux_leaf" && "$linux_job_result" == success ]]; then
+                [[ "$(jq 'length' <<<"$linux_candidates")" -eq 1 ]]
+                linux_candidate="$(jq -c '.[0]' <<<"$linux_candidates")"
+                jq -e '
+                  .expired == false and (.digest | type) == "string" and
+                  (.digest | test("^sha256:[0-9a-f]{64}$"))
+                ' <<<"$linux_candidate" >/dev/null
+                if [[ "$generated" == true ]]; then
+                  [[ "$(jq -r '.version' <<<"$linux_candidate")" == "$generated_version" ]]
+                fi
+                jq -nc --argjson run_id "$run_id" --argjson run_number "$run_number" \
+                  --argjson attempt "$attempt" --argjson candidate "$linux_candidate" \
+                  '$candidate + {run_id:$run_id,run_number:$run_number,attempt:$attempt}' \
+                  >>"$selected_candidates"
+                linux=$((linux + 1))
+              else
+                echo 'Linux distribution authority has an unexpected name/result pair' >&2
+                exit 1
+              fi
+            fi
           done <"$successful_attempts"
 
           success_count="$(jq -s 'length' "$successes")"
           [[ "$windows" -eq 0 || "$skipped" -eq 0 ]]
-          if [[ "$windows" -eq 0 ]]; then
+          [[ "$linux" -eq 0 || "$linux" -eq "$success_count" ]]
+          if [[ "$windows" -eq 0 && "$linux" -eq 0 ]]; then
             [[ "$skipped" -eq "$success_count" ]]
             printf 'publish=false\n' >>"$GITHUB_OUTPUT"
             exit 0
           fi
-          [[ "$windows" -eq "$success_count" ]]
+          [[ "$windows" -eq 0 || "$windows" -eq "$success_count" ]]
+          [[ "$linux" -eq 0 || "$linux" -eq "$success_count" ]]
           jq -se '[.[].version] | unique | length == 1' "$selected_candidates" >/dev/null
           selected="$(jq -sc 'sort_by(.run_number, .attempt) | last' "$selected_candidates")"
           version="$(jq -r '.version' <<<"$selected")"
+          selected_run_id="$(jq -r '.run_id' <<<"$selected")"
+          selected_attempt="$(jq -r '.attempt' <<<"$selected")"
+          selected_for_run="$(jq -sc --argjson run_id "$selected_run_id" \
+            --argjson attempt "$selected_attempt" \
+            '[.[] | select(.run_id == $run_id and .attempt == $attempt)]' \
+            "$selected_candidates")"
+          artifact_ids="$(jq -r 'map(.id | tostring) | sort | join(",")' <<<"$selected_for_run")"
+          selected_first="$(jq -c '.[0]' <<<"$selected_for_run")"
           {
             printf 'publish=true\n'
             printf 'fingerprint=%s\n' "$fingerprint"
@@ -501,9 +571,12 @@ jobs:
             printf 'run_id=%s\n' "$(jq -r '.run_id' <<<"$selected")"
             printf 'run_number=%s\n' "$(jq -r '.run_number' <<<"$selected")"
             printf 'run_attempt=%s\n' "$(jq -r '.attempt' <<<"$selected")"
-            printf 'artifact_id=%s\n' "$(jq -r '.id' <<<"$selected")"
-            printf 'artifact_name=%s\n' "$(jq -r '.name' <<<"$selected")"
-            printf 'artifact_digest=%s\n' "$(jq -r '.digest' <<<"$selected")"
+            printf 'artifact_id=%s\n' "$(jq -r '.id' <<<"$selected_first")"
+            printf 'artifact_name=%s\n' "$(jq -r '.name' <<<"$selected_first")"
+            printf 'artifact_digest=%s\n' "$(jq -r '.digest' <<<"$selected_first")"
+            printf 'artifact_ids=%s\n' "$artifact_ids"
+            printf 'linux_present=%s\n' "$(jq -r 'any(.[]; .platform == "linux")' <<<"$selected_for_run")"
+            printf 'windows_present=%s\n' "$(jq -r 'any(.[]; .platform == "windows")' <<<"$selected_for_run")"
           } >>"$GITHUB_OUTPUT"
 
   publish:
@@ -525,26 +598,36 @@ jobs:
           ARTIFACT_DIGEST: ${{ needs.resolve.outputs.artifact_digest }}
           ARTIFACT_ID: ${{ needs.resolve.outputs.artifact_id }}
           ARTIFACT_NAME: ${{ needs.resolve.outputs.artifact_name }}
+          ARTIFACT_IDS: ${{ needs.resolve.outputs.artifact_ids }}
           EVENT_NAME: ${{ github.event_name }}
           FINAL_HEAD: ${{ needs.resolve.outputs.final_head }}
           FINGERPRINT: ${{ needs.resolve.outputs.fingerprint }}
           GH_TOKEN: ${{ github.token }}
+          LINUX_PRESENT: ${{ needs.resolve.outputs.linux_present }}
           MERGE_SHA: ${{ needs.resolve.outputs.merge_sha }}
           PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
           REPOSITORY: ${{ github.repository }}
           RUN_ATTEMPT: ${{ needs.resolve.outputs.run_attempt }}
           RUN_ID: ${{ needs.resolve.outputs.run_id }}
           RUN_NUMBER: ${{ needs.resolve.outputs.run_number }}
+          WINDOWS_PRESENT: ${{ needs.resolve.outputs.windows_present }}
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
 
+          ARTIFACT_IDS="${ARTIFACT_IDS:-$ARTIFACT_ID}"
+          LINUX_PRESENT="${LINUX_PRESENT:-false}"
+          WINDOWS_PRESENT="${WINDOWS_PRESENT:-true}"
+
           workflow_path='.github/workflows/version-prepare.yml'
           title_re='^codex-main-quality-v1:pr=(?<pr>[1-9][0-9]*):event_head=(?<event_head>[0-9a-f]{40}):action=(?<action>opened|synchronize|reopened|ready_for_review):draft=(?<draft>true|false)$'
-          candidate_prefix='release-candidate-v1-'
-          candidate_re='^release-candidate-v1-pr-(?<pr>[1-9][0-9]*)-head-(?<head>[0-9a-f]{40})-run-(?<run_id>[1-9][0-9]*)-attempt-(?<attempt>[1-9][0-9]*)-version-(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$'
+          candidate_prefix='release-candidate'
+          windows_candidate_re='^release-candidate-v1-pr-(?<pr>[1-9][0-9]*)-head-(?<head>[0-9a-f]{40})-run-(?<run_id>[1-9][0-9]*)-attempt-(?<attempt>[1-9][0-9]*)-version-(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$'
+          linux_candidate_re='^release-candidate-linux-v1-pr-(?<pr>[1-9][0-9]*)-head-(?<head>[0-9a-f]{40})-run-(?<run_id>[1-9][0-9]*)-attempt-(?<attempt>[1-9][0-9]*)-version-(?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$'
           generated_re='^chore: prepare version (?<version>(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))\n\nCodex-Version-Prepare-Schema: v1\nCodex-Version-Prepare-PR: (?<pr>[1-9][0-9]*)\nCodex-Version-Prepare-Event-Head: (?<event_head>[0-9a-f]{40})\nCodex-Version-Prepare-Run-ID: (?<run_id>[1-9][0-9]*)\nCodex-Version-Prepare-Run-Attempt: (?<attempt>[1-9][0-9]*)$'
           windows_leaf='Run selected quality owners / windows-quality / windows-quality'
+          linux_wrapper='Run selected quality owners / linux-distribution'
+          linux_leaf='Run selected quality owners / linux-distribution / linux-distribution'
 
           api() {
             gh api -H 'Accept: application/vnd.github+json' \
@@ -741,40 +824,88 @@ jobs:
             <<<"$selected_run" >/dev/null
           jobs="$(object_pages \
             "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?filter=all&per_page=100" jobs)"
-          jq -e --arg leaf "$windows_leaf" '
+          jq -e --arg leaf "$windows_leaf" \
+            '
             [.[] | select(.name == $leaf)] |
             length == 1 and .[0].status == "completed" and .[0].conclusion == "success"
-          ' <<<"$jobs" >/dev/null
+            ' <<<"$jobs" >/dev/null || {
+            jq -e --arg wrapper "Run selected quality owners / windows-quality" '
+              [.[] | select(.name == $wrapper)] |
+              length == 1 and .[0].status == "completed" and .[0].conclusion == "skipped"
+            ' <<<"$jobs" >/dev/null || {
+              echo 'Windows authority job is not in a valid selected/skipped state' >&2
+              exit 1
+            }
+          }
+          linux_jobs="$(jq -c --arg wrapper "$linux_wrapper" --arg leaf "$linux_leaf" \
+            '[.[] | select(.name == $wrapper or .name == $leaf)]' <<<"$jobs")"
+          linux_job_count="$(jq 'length' <<<"$linux_jobs")"
+          if [[ "$LINUX_PRESENT" == true ]]; then
+            [[ "$linux_job_count" -eq 1 ]] || {
+              echo 'Linux distribution authority job is missing or duplicated' >&2
+              exit 1
+            }
+            jq -e --arg leaf "$linux_leaf" '
+              .[0].name == $leaf and .[0].status == "completed" and .[0].conclusion == "success"
+            ' <<<"$linux_jobs" >/dev/null
+          elif [[ "$linux_job_count" -eq 1 ]]; then
+            jq -e --arg wrapper "$linux_wrapper" '
+              .[0].name == $wrapper and .[0].status == "completed" and .[0].conclusion == "skipped"
+            ' <<<"$linux_jobs" >/dev/null
+            [[ "$WINDOWS_PRESENT" == false ]] || {
+              echo 'Windows candidate cannot be revalidated without its Linux distribution candidate' >&2
+              exit 1
+            }
+          fi
 
           artifacts="$(object_pages \
             "repos/$REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" artifacts)"
-          candidate="$(jq -ce --arg prefix "$candidate_prefix" --arg re "$candidate_re" \
+          candidates="$(jq -ce --arg prefix "$candidate_prefix" --arg windows_re "$windows_candidate_re" \
+            --arg linux_re "$linux_candidate_re" \
             --arg pr "$PR_NUMBER" --arg head "$FINAL_HEAD" --arg run "$RUN_ID" \
             --argjson attempt "$RUN_ATTEMPT" '
               [ .[] |
                 select((.name | type) == "string" and (.name | startswith($prefix))) |
                 . as $artifact |
-                (try (.name | capture($re)) catch error("malformed release candidate name")) as $id |
+                (try ((.name | capture($windows_re)) // null) catch null) as $windows_id |
+                (try ((.name | capture($linux_re)) // null) catch null) as $linux_id |
+                if ($windows_id != null and $linux_id != null) or
+                   ($windows_id == null and $linux_id == null)
+                then error("malformed release candidate name")
+                else ($windows_id // $linux_id) as $id |
+                  (if $windows_id != null then "windows" else "linux" end) as $platform |
                 if $id.pr != $pr or $id.head != $head or $id.run_id != $run
                 then error("release candidate identity changed")
+                elif ($artifact.id | type) != "number" or $artifact.id <= 0 or
+                     ($artifact.expired | type) != "boolean"
+                then error("release candidate metadata changed")
                 else {id:$artifact.id,name:$artifact.name,digest:$artifact.digest,
-                      expired:$artifact.expired,attempt:($id.attempt | tonumber),version:$id.version}
+                      expired:$artifact.expired,platform:$platform,
+                      attempt:($id.attempt | tonumber),version:$id.version}
                 end |
                 select(.attempt == $attempt)
-              ] | if length == 1 then .[0] else error("own candidate is not unique") end
+                end
+              ]
             ' <<<"$artifacts")"
-          jq -e --argjson id "$ARTIFACT_ID" --arg name "$ARTIFACT_NAME" \
-            --arg digest "$ARTIFACT_DIGEST" --arg version "$VERSION" '
-              .id == $id and .name == $name and .digest == $digest and
-              .version == $version and .expired == false
-            ' <<<"$candidate" >/dev/null
+          candidate_ids="$(jq -r 'map(.id | tostring) | sort | join(",")' <<<"$candidates")"
+          [[ "$candidate_ids" == "$ARTIFACT_IDS" ]] || {
+            echo 'candidate artifact identity changed' >&2
+            exit 1
+          }
+          jq -e --arg version "$VERSION" --argjson linux "$LINUX_PRESENT" \
+            --argjson windows "$WINDOWS_PRESENT" '
+            all(.[]; .expired == false and .version == $version and
+                (.digest | type) == "string" and (.digest | test("^sha256:[0-9a-f]{64}$"))) and
+            (([.[] | select(.platform == "linux")] | length) == (if $linux then 1 else 0 end)) and
+            (([.[] | select(.platform == "windows")] | length) == (if $windows then 1 else 0 end))
+          ' <<<"$candidates" >/dev/null
           printf 'proceed=true\n' >>"$GITHUB_OUTPUT"
 
       - name: Download the trusted candidate by immutable artifact ID
         if: steps.revalidate.outputs.proceed == 'true'
         uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.resolve.outputs.artifact_id }}
+          artifact-ids: ${{ needs.resolve.outputs.artifact_ids }}
           run-id: ${{ needs.resolve.outputs.run_id }}
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -795,13 +926,21 @@ jobs:
         if: steps.revalidate.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ steps.release-token.outputs.token }}
+          FINAL_HEAD: ${{ needs.resolve.outputs.final_head }}
+          LINUX_PRESENT: ${{ needs.resolve.outputs.linux_present }}
           MERGE_SHA: ${{ needs.resolve.outputs.merge_sha }}
           REPOSITORY: ${{ github.repository }}
           TAG: ${{ needs.resolve.outputs.tag }}
           VERSION: ${{ needs.resolve.outputs.version }}
+          WINDOWS_PRESENT: ${{ needs.resolve.outputs.windows_present }}
         run: |
           set -euo pipefail
           set +x
+          WINDOWS_PRESENT="${WINDOWS_PRESENT:-true}"
+          LINUX_PRESENT="${LINUX_PRESENT:-false}"
+          FINAL_HEAD="${FINAL_HEAD:-}"
+          [[ "$WINDOWS_PRESENT" == true || "$WINDOWS_PRESENT" == false ]]
+          [[ "$LINUX_PRESENT" == true || "$LINUX_PRESENT" == false ]]
 
           api() {
             gh api -H 'Accept: application/vnd.github+json' \
@@ -844,13 +983,33 @@ jobs:
             jq -e \
               --arg setup_name 'CodexInfo.WindowsClient.Setup.exe' \
               --arg manifest_name 'CodexInfo.WindowsClient.update.json' \
+              --arg linux_archive_name "$linux_archive_name" \
+              --arg linux_checksum_name "$linux_checksum_name" \
+              --arg linux_manifest_name "$linux_manifest_name" \
               --arg setup_digest "$setup_digest" --arg manifest_digest "$manifest_digest" \
-              --argjson setup_size "$setup_size" --argjson manifest_size "$manifest_size" '
-                length == 2 and
-                ([.[] | select(.name == $setup_name and .state == "uploaded" and
-                               .size == $setup_size and .digest == $setup_digest)] | length) == 1 and
-                ([.[] | select(.name == $manifest_name and .state == "uploaded" and
-                               .size == $manifest_size and .digest == $manifest_digest)] | length) == 1
+              --arg linux_archive_digest "$linux_archive_digest" \
+              --arg linux_checksum_digest "$linux_checksum_digest" \
+              --arg linux_manifest_digest "$linux_manifest_digest" \
+              --argjson setup_size "$setup_size" --argjson manifest_size "$manifest_size" \
+              --argjson linux_archive_size "$linux_archive_size" \
+              --argjson linux_checksum_size "$linux_checksum_size" \
+              --argjson linux_manifest_size "$linux_manifest_size" \
+              --argjson windows "$WINDOWS_PRESENT" --argjson linux "$LINUX_PRESENT" '
+                length == ((if $windows then 2 else 0 end) + (if $linux then 3 else 0 end)) and
+                (if $windows then
+                  ([.[] | select(.name == $setup_name and .state == "uploaded" and
+                                 .size == $setup_size and .digest == $setup_digest)] | length) == 1 and
+                  ([.[] | select(.name == $manifest_name and .state == "uploaded" and
+                                 .size == $manifest_size and .digest == $manifest_digest)] | length) == 1
+                 else true end) and
+                (if $linux then
+                  ([.[] | select(.name == $linux_archive_name and .state == "uploaded" and
+                                 .size == $linux_archive_size and .digest == $linux_archive_digest)] | length) == 1 and
+                  ([.[] | select(.name == $linux_checksum_name and .state == "uploaded" and
+                                 .size == $linux_checksum_size and .digest == $linux_checksum_digest)] | length) == 1 and
+                  ([.[] | select(.name == $linux_manifest_name and .state == "uploaded" and
+                                 .size == $linux_manifest_size and .digest == $linux_manifest_digest)] | length) == 1
+                 else true end)
               ' <<<"$assets" >/dev/null
           }
           verify_assets() {
@@ -885,15 +1044,107 @@ jobs:
 
           setup='release-candidate/CodexInfo.WindowsClient.Setup.exe'
           manifest='release-candidate/CodexInfo.WindowsClient.update.json'
-          jq -e --arg version "$VERSION" '
-            type == "object" and .version == $version and
-            (.version | test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
-          ' "$manifest" >/dev/null
-          setup_size="$(stat -c %s "$setup")"
-          manifest_size="$(stat -c %s "$manifest")"
-          [[ "$setup_size" -gt 0 && "$manifest_size" -gt 0 ]]
-          setup_digest="sha256:$(sha256sum "$setup" | cut -d' ' -f1)"
-          manifest_digest="sha256:$(sha256sum "$manifest" | cut -d' ' -f1)"
+          setup_size=0
+          manifest_size=0
+          setup_digest=''
+          manifest_digest=''
+          if [[ "$WINDOWS_PRESENT" == true ]]; then
+            [[ -f "$setup" && -f "$manifest" ]]
+            jq -e --arg version "$VERSION" '
+              type == "object" and .version == $version and
+              (.version | test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+            ' "$manifest" >/dev/null
+            setup_size="$(stat -c %s "$setup")"
+            manifest_size="$(stat -c %s "$manifest")"
+            [[ "$setup_size" -gt 0 && "$manifest_size" -gt 0 ]]
+            setup_digest="sha256:$(sha256sum "$setup" | cut -d' ' -f1)"
+            manifest_digest="sha256:$(sha256sum "$manifest" | cut -d' ' -f1)"
+          fi
+
+          linux_archive=''
+          linux_archive_name=''
+          linux_checksum_name=''
+          linux_manifest_name=''
+          linux_archive_size=0
+          linux_checksum_size=0
+          linux_manifest_size=0
+          linux_archive_digest=''
+          linux_checksum_digest=''
+          linux_manifest_digest=''
+          if [[ "$LINUX_PRESENT" == true ]]; then
+            mapfile -t linux_archives < <(find release-candidate -maxdepth 1 -type f \
+              -name 'codex-info-*-x86_64-unknown-linux-gnu.tar.gz' -print | LC_ALL=C sort)
+            [[ "${#linux_archives[@]}" -eq 1 ]]
+            linux_archive="${linux_archives[0]}"
+            linux_archive_name="$(basename "$linux_archive")"
+            linux_checksum="$linux_archive.sha256"
+            linux_manifest="${linux_archive%.tar.gz}.manifest.json"
+            [[ -f "$linux_checksum" && -f "$linux_manifest" ]]
+            linux_checksum_name="$(basename "$linux_checksum")"
+            linux_manifest_name="$(basename "$linux_manifest")"
+            linux_archive_size="$(stat -c %s "$linux_archive")"
+            linux_checksum_size="$(stat -c %s "$linux_checksum")"
+            linux_manifest_size="$(stat -c %s "$linux_manifest")"
+            [[ "$linux_archive_size" -gt 0 && "$linux_checksum_size" -gt 0 && "$linux_manifest_size" -gt 0 ]]
+            linux_archive_digest="sha256:$(sha256sum "$linux_archive" | cut -d' ' -f1)"
+            linux_checksum_digest="sha256:$(sha256sum "$linux_checksum" | cut -d' ' -f1)"
+            linux_manifest_digest="sha256:$(sha256sum "$linux_manifest" | cut -d' ' -f1)"
+            expected_line="$(printf '%s  %s\n' "${linux_archive_digest#sha256:}" "$linux_archive_name")"
+            [[ "$(cat "$linux_checksum")" == "$expected_line" ]]
+            jq -e --arg version "$VERSION" --arg source "$FINAL_HEAD" \
+              --arg target 'x86_64-unknown-linux-gnu' '
+              type == "object" and .schema == "codex-info-linux-bundle-v1" and
+              .product == "codex_info" and .version == $version and
+              (.source_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+              .source_sha == $source and .target == $target and
+              .compatibility == "glibc" and
+              (.glibc_minimum | type == "string" and test("^[0-9]+\\.[0-9]+$")) and
+              (.run_id | type == "string" and test("^[1-9][0-9]*$")) and
+              (.run_attempt | type == "number" and floor == . and . >= 1) and
+              (.files | type == "array" and length > 0 and
+                all(.[]; type == "object" and
+                  (.path | (type == "string" and length > 0 and
+                    (split("/") | all(.[]; length > 0 and . != "." and . != "..")) and
+                    (startswith("/") | not) and (contains("\\\\") | not) and
+                    (contains("/../") | not) and (startswith("../") | not) and
+                    (endswith("/..") | not) and . != "..")) and
+                  (.size | type == "number" and floor == . and . >= 0) and
+                  (.sha256 | type == "string" and test("^[0-9a-fA-F]{64}$"))) and
+                (["codex_info", "codex-info.service", "install.sh", "LICENSE",
+                  "COPYRIGHT", "THIRD_PARTY_NOTICES.md"] - [.[].path] | length == 0))
+            ' "$linux_manifest" >/dev/null
+            archive_check_dir="$RUNNER_TEMP/linux-release-archive-check"
+            rm -rf "$archive_check_dir"
+            mkdir -p "$archive_check_dir"
+            tar -tzf "$linux_archive" > "$archive_check_dir/paths"
+            backslash="\\"
+            while IFS= read -r archive_path; do
+              [[ -n "$archive_path" && "$archive_path" != /* && "$archive_path" != *'..'* ]]
+            done < "$archive_check_dir/paths"
+            tar -xzf "$linux_archive" -C "$archive_check_dir"
+            [[ -x "$archive_check_dir/codex_info" && -f "$archive_check_dir/codex-info.service" &&
+               -x "$archive_check_dir/install.sh" && -f "$archive_check_dir/LICENSE" &&
+               -f "$archive_check_dir/COPYRIGHT" && -f "$archive_check_dir/THIRD_PARTY_NOTICES.md" &&
+               -f "$archive_check_dir/manifest.json" && -f "$archive_check_dir/SHA256SUMS" ]]
+            (cd "$archive_check_dir" && sha256sum -c SHA256SUMS >/dev/null)
+            jq -e --argjson expected "$(cat "$archive_check_dir/manifest.json")" \
+              --arg version "$VERSION" --arg source "$FINAL_HEAD" '
+              .schema == $expected.schema and .product == $expected.product and
+              .version == $version and .source_sha == $source and
+              .target == $expected.target and .compatibility == $expected.compatibility and
+              .glibc_minimum == $expected.glibc_minimum and
+              .run_id == $expected.run_id and .run_attempt == $expected.run_attempt and
+              .files == $expected.files
+            ' "$linux_manifest" >/dev/null
+            while IFS=$'\t' read -r archive_path archive_size archive_digest; do
+              [[ -n "$archive_path" && "$archive_path" != /* &&
+                 "$archive_path" != *'..'* && "$archive_path" != *"$backslash"* ]]
+              [[ "$archive_size" =~ ^[0-9]+$ && "$archive_digest" =~ ^[0-9a-fA-F]{64}$ ]]
+              [[ -f "$archive_check_dir/$archive_path" ]]
+              [[ "$(stat -c %s "$archive_check_dir/$archive_path")" == "$archive_size" ]]
+              [[ "$(sha256sum "$archive_check_dir/$archive_path" | cut -d' ' -f1)" == "$archive_digest" ]]
+            done < <(jq -r '.files[] | [.path, (.size | tostring), .sha256] | @tsv' "$linux_manifest")
+          fi
 
           read_state
           tag_count="$(jq 'length' <<<"$tags")"
@@ -926,10 +1177,20 @@ jobs:
           upload_url="$(jq -er '.upload_url | select(type == "string")' <<<"$draft")"
           [[ "$upload_url" == "$upload_base{?name,label}" ]]
 
-          upload_asset "$setup" 'CodexInfo.WindowsClient.Setup.exe' \
-            'application/octet-stream' "$setup_size" "$setup_digest"
-          upload_asset "$manifest" 'CodexInfo.WindowsClient.update.json' \
-            'application/json' "$manifest_size" "$manifest_digest"
+          if [[ "$WINDOWS_PRESENT" == true ]]; then
+            upload_asset "$setup" 'CodexInfo.WindowsClient.Setup.exe' \
+              'application/octet-stream' "$setup_size" "$setup_digest"
+            upload_asset "$manifest" 'CodexInfo.WindowsClient.update.json' \
+              'application/json' "$manifest_size" "$manifest_digest"
+          fi
+          if [[ "$LINUX_PRESENT" == true ]]; then
+            upload_asset "$linux_archive" "$linux_archive_name" \
+              'application/gzip' "$linux_archive_size" "$linux_archive_digest"
+            upload_asset "$linux_checksum" "$linux_checksum_name" \
+              'text/plain' "$linux_checksum_size" "$linux_checksum_digest"
+            upload_asset "$linux_manifest" "$linux_manifest_name" \
+              'application/json' "$linux_manifest_size" "$linux_manifest_digest"
+          fi
 
           published="$(jq -nc '{draft:false}' |
             api --method PATCH "repos/$REPOSITORY/releases/$release_id" --input -)"

@@ -22,6 +22,7 @@ WORKFLOW_NAMES = (
     "codeql.yml",
     "feat-integration.yml",
     "linux-ui-quality.yml",
+    "linux-distribution.yml",
     "release.yml",
     "rust.yml",
     "selective-quality.yml",
@@ -98,6 +99,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         version = docs["version-prepare.yml"]
         selective = docs["selective-quality.yml"]
         windows = docs["windows-client.yml"]
+        linux_distribution = docs["linux-distribution.yml"]
         release = docs["release.yml"]
         feat_classify = _job(feat, "classify")
         feat_quality = _job(feat, "selective-quality")
@@ -109,6 +111,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         selective_codeql = _job(selective, "codeql-quality")
         selected = _job(selective, "selected-quality")
         windows_job = _job(windows, "windows-quality")
+        linux_distribution_job = _job(linux_distribution, "linux-distribution")
         resolve = _job(release, "resolve")
         publish = _job(release, "publish")
         revalidate = _step(publish, step_id="revalidate")
@@ -217,6 +220,22 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             mapping(f"selective.{job_id}", child.get("with"), {
                 "source_sha": "${{ inputs.source_sha }}"
             })
+        distribution = _job(selective, "linux-distribution")
+        expect(
+            "selective.linux-distribution.uses",
+            distribution.get("uses"),
+            "./.github/workflows/linux-distribution.yml",
+        )
+        expect(
+            "selective.linux-distribution.if",
+            distribution.get("if"),
+            "fromJSON(inputs.selection_json).binary_impact == true",
+        )
+        mapping("selective.linux-distribution", distribution.get("with"), {
+            "source_sha": "${{ inputs.source_sha }}",
+            "pr_number": "${{ inputs.pr_number }}",
+            "release_candidate": "${{ inputs.release_candidate }}",
+        })
         mapping("selective.windows", selective_windows.get("with"), {
             "pr_number": "${{ inputs.pr_number }}",
             "release_candidate": "${{ inputs.release_candidate }}",
@@ -231,6 +250,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             (docs["rust.yml"], "native-quality"),
             (docs["linux-ui-quality.yml"], "linux-ui-quality"),
             (windows, "windows-quality"),
+            (linux_distribution, "linux-distribution"),
             (docs["codeql.yml"], "analyze"),
         ):
             leaf_checkout = _step(_job(document, job_id), uses="actions/checkout@v4")
@@ -240,6 +260,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect("selected.needs", selected.get("needs"), [
             "docs-quality", "governance-quality", "linux-backend-quality",
             "linux-ui-quality", "windows-quality", "codeql-quality",
+            "linux-distribution",
         ])
         mapping(
             "selected.results",
@@ -278,7 +299,8 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         output_keys = (
             "publish", "fingerprint", "tag", "version", "pr_number", "final_head",
             "merge_sha", "run_id", "run_number", "run_attempt", "artifact_id",
-            "artifact_name", "artifact_digest",
+            "artifact_name", "artifact_digest", "artifact_ids", "linux_present",
+            "windows_present",
         )
         for key in output_keys:
             mapping("release.outputs", resolve.get("outputs"), {
@@ -288,10 +310,13 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect("release.publish.if", publish.get("if"), "needs.resolve.outputs.publish == 'true'")
         for env_key, output_key in {
             "ARTIFACT_DIGEST": "artifact_digest", "ARTIFACT_ID": "artifact_id",
+            "ARTIFACT_IDS": "artifact_ids",
             "ARTIFACT_NAME": "artifact_name", "FINAL_HEAD": "final_head",
             "FINGERPRINT": "fingerprint", "MERGE_SHA": "merge_sha",
+            "LINUX_PRESENT": "linux_present",
             "PR_NUMBER": "pr_number", "RUN_ATTEMPT": "run_attempt",
             "RUN_ID": "run_id", "RUN_NUMBER": "run_number", "VERSION": "version",
+            "WINDOWS_PRESENT": "windows_present",
         }.items():
             mapping("release.revalidate", revalidate.get("env"), {
                 env_key: f"${{{{ needs.resolve.outputs.{output_key} }}}}"
@@ -302,7 +327,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "REPOSITORY": "${{ github.repository }}",
         })
         mapping("release.download", download.get("with"), {
-            "artifact-ids": "${{ needs.resolve.outputs.artifact_id }}",
+            "artifact-ids": "${{ needs.resolve.outputs.artifact_ids }}",
             "run-id": "${{ needs.resolve.outputs.run_id }}",
             "github-token": "${{ github.token }}",
             "repository": "${{ github.repository }}",
@@ -320,10 +345,13 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         })
         expect("release.publication.env", publication.get("env"), {
             "GH_TOKEN": "${{ steps.release-token.outputs.token }}",
+            "FINAL_HEAD": "${{ needs.resolve.outputs.final_head }}",
+            "LINUX_PRESENT": "${{ needs.resolve.outputs.linux_present }}",
             "MERGE_SHA": "${{ needs.resolve.outputs.merge_sha }}",
             "REPOSITORY": "${{ github.repository }}",
             "TAG": "${{ needs.resolve.outputs.tag }}",
             "VERSION": "${{ needs.resolve.outputs.version }}",
+            "WINDOWS_PRESENT": "${{ needs.resolve.outputs.windows_present }}",
         })
         proceed = "steps.revalidate.outputs.proceed == 'true'"
         expect("release.download.if", download.get("if"), proceed)
@@ -348,8 +376,23 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         wrapper = f"{version_quality['name']} / {selective_windows['name']}"
         leaf = f"{wrapper} / {windows_job['name']}"
         for script, assignments in (
-            (resolver_script, (f"windows_wrapper='{wrapper}'", f"windows_leaf='{leaf}'")),
-            (revalidate_script, (f"windows_leaf='{leaf}'",)),
+            (
+                resolver_script,
+                (
+                    f"windows_wrapper='{wrapper}'",
+                    f"windows_leaf='{leaf}'",
+                    "linux_wrapper='Run selected quality owners / linux-distribution'",
+                    "linux_leaf='Run selected quality owners / linux-distribution / linux-distribution'",
+                ),
+            ),
+            (
+                revalidate_script,
+                (
+                    f"windows_leaf='{leaf}'",
+                    "linux_wrapper='Run selected quality owners / linux-distribution'",
+                    "linux_leaf='Run selected quality owners / linux-distribution / linux-distribution'",
+                ),
+            ),
         ):
             for assignment in assignments:
                 if assignment not in script:
@@ -368,7 +411,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
             errors.append(f"{name}: {marker!r}: expected {expected}, found {actual}")
 
     if set(workflows) != set(WORKFLOW_NAMES):
-        errors.append("workflow set differs from the eight declared owners")
+        errors.append("workflow set differs from the declared workflow graph")
         return errors
 
     joined = "\n".join(workflows.values())
@@ -455,6 +498,20 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         errors.append("selective-quality.yml: selected result aggregation is missing")
     count("selective-quality.yml", "ref: ${{ inputs.base_sha }}", 1)
 
+    linux_distribution = workflows["linux-distribution.yml"]
+    for marker in (
+        "runs-on: ubuntu-22.04",
+        "LINUX_BUNDLE_TARGET: x86_64-unknown-linux-gnu",
+        "cargo build --release --locked --target",
+        "scripts/build_linux_bundle.sh",
+        "scripts/test_linux_bundle.sh",
+        "uses: actions/upload-artifact@v4",
+        "release-candidate-linux-v1-pr-${{ inputs.pr_number }}",
+    ):
+        if marker not in linux_distribution:
+            errors.append(f"linux-distribution.yml: missing {marker}")
+    count("linux-distribution.yml", "uses: actions/upload-artifact@v4", 1)
+
     windows = workflows["windows-client.yml"]
     for marker in (
         "dotnet test windows-client/CodexInfo.WindowsClient.sln",
@@ -511,6 +568,8 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "branch=$head_ref_encoded&per_page=100",
         "union_signal_run",
         "release-candidate-v1-pr-",
+        "release-candidate-linux-v1-pr-",
+        "linux-distribution",
         "name: Revalidate authority after acquiring the tag lock",
         "group: release-windows-client-${{ needs.resolve.outputs.tag }}",
         "final-head run set or latest attempt changed",
@@ -1353,12 +1412,16 @@ def _release_candidate(
     expired: bool = False,
     head: str = _FINAL_HEAD,
     malformed: bool = False,
+    platform: str = "windows",
 ) -> dict[str, object]:
+    prefix = "release-candidate-v1-"
+    if platform == "linux":
+        prefix = "release-candidate-linux-v1-"
     name = (
-        "release-candidate-v1-malformed"
+        f"{prefix}malformed"
         if malformed
         else (
-            f"release-candidate-v1-pr-{_PR_NUMBER}-head-{head}-run-{run_id}-"
+            f"{prefix}pr-{_PR_NUMBER}-head-{head}-run-{run_id}-"
             f"attempt-{attempt}-version-{_VERSION}"
         )
     )
@@ -1370,20 +1433,22 @@ def _release_candidate(
     }
 
 
-def _candidate_set(run_id: int, attempt: int, mode: str) -> list[dict[str, object]]:
+def _candidate_set(
+    run_id: int, attempt: int, mode: str, *, platform: str = "windows"
+) -> list[dict[str, object]]:
     if mode == "missing":
         return []
     if mode == "exact":
-        return [_release_candidate(run_id, attempt)]
+        return [_release_candidate(run_id, attempt, platform=platform)]
     if mode == "expired":
-        return [_release_candidate(run_id, attempt, expired=True)]
+        return [_release_candidate(run_id, attempt, expired=True, platform=platform)]
     if mode == "multiple":
         return [
-            _release_candidate(run_id, attempt, artifact_id=run_id * 100 + attempt),
-            _release_candidate(run_id, attempt, artifact_id=run_id * 100 + attempt + 50),
+            _release_candidate(run_id, attempt, artifact_id=run_id * 100 + attempt, platform=platform),
+            _release_candidate(run_id, attempt, artifact_id=run_id * 100 + attempt + 50, platform=platform),
         ]
     if mode == "malformed":
-        return [_release_candidate(run_id, attempt, malformed=True)]
+        return [_release_candidate(run_id, attempt, malformed=True, platform=platform)]
     raise AssertionError(f"unknown candidate fixture mode: {mode}")
 
 
@@ -1476,12 +1541,40 @@ def _manual_release_responses(
                 )
             elif windows is not None:
                 raise AssertionError(f"unknown Windows fixture result: {windows}")
+            linux = row.get("linux")
+            if linux == "success":
+                jobs.append(
+                    {
+                        "name": "Run selected quality owners / linux-distribution / linux-distribution",
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                )
+            elif linux == "skipped":
+                jobs.append(
+                    {
+                        "name": "Run selected quality owners / linux-distribution",
+                        "status": "completed",
+                        "conclusion": "skipped",
+                    }
+                )
+            elif linux == "observer":
+                # The draft observer is represented by the shared observer job;
+                # no product authority job is added for it.
+                pass
+            elif linux is not None:
+                raise AssertionError(f"unknown Linux fixture result: {linux}")
             responses[
                 f"repos/{_REPOSITORY}/actions/runs/{run_id}/attempts/{attempt}/jobs?filter=all&per_page=100"
             ] = _object_pages("jobs", jobs, paginated=paginated)
             mode = row.get("candidate")
             if mode is not None:
                 artifacts.extend(_candidate_set(run_id, attempt, str(mode)))
+            linux_mode = row.get("linux_candidate")
+            if linux_mode is not None:
+                artifacts.extend(
+                    _candidate_set(run_id, attempt, str(linux_mode), platform="linux")
+                )
         responses[
             f"repos/{_REPOSITORY}/actions/runs/{run_id}/artifacts?per_page=100"
         ] = _object_pages("artifacts", artifacts, paginated=paginated)
@@ -1758,6 +1851,59 @@ def _release_resolution_tests(release_workflow: str) -> int:
         raise AssertionError("skipped Windows authority with zero candidates was not a no-op")
     cases += 1
 
+    linux_only_spec = [
+        {
+            "id": 122,
+            "number": 32,
+            "attempts": [
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "windows": "skipped",
+                    "linux": "success",
+                    "linux_candidate": "exact",
+                }
+            ],
+        }
+    ]
+    responses, _ = _manual_release_responses(linux_only_spec)
+    result, values, _ = _execute_release_shell(
+        script, responses, event_name="pull_request_target", event=_closed_event()
+    )
+    if (
+        result.returncode != 0
+        or values.get("publish") != "true"
+        or values.get("linux_present") != "true"
+        or values.get("windows_present") != "false"
+        or not values.get("artifact_ids")
+    ):
+        raise AssertionError("Linux-only distribution candidate was not selected")
+    cases += 1
+
+    partial_linux_spec = [
+        {
+            "id": 123,
+            "number": 33,
+            "attempts": [
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "windows": "success",
+                    "candidate": "exact",
+                    "linux": "skipped",
+                    "linux_candidate": "missing",
+                }
+            ],
+        }
+    ]
+    responses, _ = _manual_release_responses(partial_linux_spec)
+    result, _, _ = _execute_release_shell(
+        script, responses, event_name="pull_request_target", event=_closed_event()
+    )
+    if result.returncode == 0:
+        raise AssertionError("Windows-only candidate bypassed a skipped Linux authority")
+    cases += 1
+
     draft_observer_spec = [
         {
             "id": 121,
@@ -1835,6 +1981,30 @@ def _release_resolution_tests(release_workflow: str) -> int:
             raise AssertionError(f"invalid Windows candidate was accepted: {mode}")
         cases += 1
 
+    for mode in ("missing", "expired", "multiple", "malformed"):
+        bad_linux_spec = [
+            {
+                "id": 131,
+                "number": 41,
+                "attempts": [
+                    {
+                        "status": "completed",
+                        "conclusion": "success",
+                        "windows": "skipped",
+                        "linux": "success",
+                        "linux_candidate": mode,
+                    }
+                ],
+            }
+        ]
+        responses, _ = _manual_release_responses(bad_linux_spec)
+        result, _, _ = _execute_release_shell(
+            script, responses, event_name="pull_request_target", event=_closed_event()
+        )
+        if result.returncode == 0:
+            raise AssertionError(f"invalid Linux candidate was accepted: {mode}")
+        cases += 1
+
     responses, generator = _generated_release_responses()
     result, values, _ = _execute_release_shell(
         script,
@@ -1881,6 +2051,7 @@ def _execute_revalidation(
             {
                 "ARTIFACT_DIGEST": authority["artifact_digest"],
                 "ARTIFACT_ID": authority["artifact_id"],
+                "ARTIFACT_IDS": authority.get("artifact_ids", authority["artifact_id"]),
                 "ARTIFACT_NAME": authority["artifact_name"],
                 "EVENT_NAME": event_name,
                 "FINAL_HEAD": authority["final_head"],
@@ -1897,6 +2068,8 @@ def _execute_revalidation(
                 "RUN_ID": authority["run_id"],
                 "RUN_NUMBER": authority["run_number"],
                 "RUNNER_TEMP": str(runner_temp),
+                "LINUX_PRESENT": authority.get("linux_present", "false"),
+                "WINDOWS_PRESENT": authority.get("windows_present", "true"),
                 "VERSION": authority["version"],
             }
         )
@@ -1954,6 +2127,42 @@ def _release_lock_tests(release_workflow: str) -> int:
     if result.returncode != 0 or values.get("proceed") != "true":
         raise AssertionError("unchanged authority failed after acquiring the tag lock")
     cases = 1
+
+    linux_spec = [
+        {
+            "id": 203,
+            "number": 53,
+            "attempts": [
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "windows": "skipped",
+                    "linux": "success",
+                    "linux_candidate": "exact",
+                }
+            ],
+        }
+    ]
+    linux_responses, linux_summaries = _manual_release_responses(linux_spec)
+    linux_responses[_runs_endpoint()] = _object_pages("workflow_runs", [])
+    linux_resolved, linux_authority, _ = _execute_release_shell(
+        resolve_script,
+        linux_responses,
+        event_name="workflow_run",
+        event=_workflow_event(linux_summaries[0]),
+    )
+    if linux_resolved.returncode != 0 or linux_authority.get("publish") != "true":
+        raise AssertionError("Linux-only authority did not resolve before lock revalidation")
+    result, values = _execute_revalidation(
+        revalidate_script,
+        linux_responses,
+        linux_authority,
+        event_name="workflow_run",
+        event=_workflow_event(linux_summaries[0]),
+    )
+    if result.returncode != 0 or values.get("proceed") != "true":
+        raise AssertionError("Linux-only authority failed after acquiring the tag lock")
+    cases += 1
 
     changed = json.loads(json.dumps(responses))
     changed[_runs_endpoint()] = _object_pages(
@@ -2301,6 +2510,7 @@ def _execute_publication(
     case_root: Path,
     *,
     initial_state: Mapping[str, object] | None,
+    environment_overrides: Mapping[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]], dict[str, object]]:
     bin_dir = case_root / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -2327,6 +2537,8 @@ def _execute_publication(
             "VERSION": _VERSION,
         }
     )
+    if environment_overrides:
+        environment.update(environment_overrides)
     result = _command(
         ("bash", "-c", script), cwd=case_root, env=environment, check=False
     )
@@ -2408,6 +2620,115 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
             if result.returncode == 0 or _publish_mutations(calls):
                 raise AssertionError(f"invalid existing release state was repaired: {kind}")
             cases += 1
+
+        linux_root = root / "linux"
+        linux_root.mkdir()
+        linux_candidate = linux_root / "release-candidate"
+        linux_candidate.mkdir()
+        linux_output = linux_root / "bundle"
+        linux_output.mkdir()
+        subprocess.run(
+            [
+                "bash",
+                str(ROOT / "scripts" / "build_linux_bundle.sh"),
+                "--binary",
+                "/usr/bin/true",
+                "--version",
+                _VERSION,
+                "--source-sha",
+                _FINAL_HEAD,
+                "--run-id",
+                "99",
+                "--run-attempt",
+                "1",
+                "--output-dir",
+                str(linux_output),
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        for path in linux_output.iterdir():
+            shutil.copy2(path, linux_candidate / path.name)
+        linux_state = _publication_state("absent", linux_candidate, linux_candidate)
+        result, calls, final_state = _execute_publication(
+            script,
+            linux_root,
+            initial_state=linux_state,
+            environment_overrides={
+                "FINAL_HEAD": _FINAL_HEAD,
+                "LINUX_PRESENT": "true",
+                "WINDOWS_PRESENT": "false",
+            },
+        )
+        if (
+            result.returncode != 0
+            or len([call for call in calls if call.get("tool") == "curl"]) != 3
+            or final_state["details"]["901"]["draft"] is not False
+            or len(final_state["assets"]["901"]) != 3
+        ):
+            raise AssertionError("Linux archive/checksum/manifest publication did not complete exactly once")
+        cases += 1
+
+        mixed_root = root / "mixed"
+        mixed_root.mkdir()
+        mixed_candidate = mixed_root / "release-candidate"
+        mixed_candidate.mkdir()
+        for path in linux_output.iterdir():
+            shutil.copy2(path, mixed_candidate / path.name)
+        (mixed_candidate / "CodexInfo.WindowsClient.Setup.exe").write_bytes(
+            b"fixture installer"
+        )
+        (mixed_candidate / "CodexInfo.WindowsClient.update.json").write_text(
+            json.dumps({"version": _VERSION}), encoding="utf-8"
+        )
+        mixed_state = _publication_state("absent", mixed_candidate, mixed_candidate)
+        result, calls, final_state = _execute_publication(
+            script,
+            mixed_root,
+            initial_state=mixed_state,
+            environment_overrides={
+                "FINAL_HEAD": _FINAL_HEAD,
+                "LINUX_PRESENT": "true",
+                "WINDOWS_PRESENT": "true",
+            },
+        )
+        if (
+            result.returncode != 0
+            or len([call for call in calls if call.get("tool") == "curl"]) != 5
+            or final_state["details"]["901"]["draft"] is not False
+            or len(final_state["assets"]["901"]) != 5
+        ):
+            raise AssertionError("combined Windows/Linux publication did not complete exactly once")
+        cases += 1
+
+        mismatch_root = root / "linux-manifest-mismatch"
+        mismatch_root.mkdir()
+        mismatch_candidate = mismatch_root / "release-candidate"
+        mismatch_candidate.mkdir()
+        for path in linux_output.iterdir():
+            shutil.copy2(path, mismatch_candidate / path.name)
+        mismatch_manifest = next(mismatch_candidate.glob("*.manifest.json"))
+        mismatch_document = json.loads(mismatch_manifest.read_text(encoding="utf-8"))
+        mismatch_document["files"][0]["sha256"] = "0" * 64
+        mismatch_manifest.write_text(
+            json.dumps(mismatch_document), encoding="utf-8"
+        )
+        mismatch_state = _publication_state("absent", mismatch_candidate, mismatch_candidate)
+        result, calls, _ = _execute_publication(
+            script,
+            mismatch_root,
+            initial_state=mismatch_state,
+            environment_overrides={
+                "FINAL_HEAD": _FINAL_HEAD,
+                "LINUX_PRESENT": "true",
+                "WINDOWS_PRESENT": "false",
+            },
+        )
+        if result.returncode == 0 or _publish_mutations(calls):
+            raise AssertionError("Linux manifest mismatch was published")
+        cases += 1
     return cases
 
 

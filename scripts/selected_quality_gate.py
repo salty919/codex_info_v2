@@ -16,7 +16,11 @@ OWNER_JOBS = {
     "LINUX_UI": "linux-ui-quality",
     "WINDOWS": "windows-quality",
 }
-ALL_JOBS = frozenset(OWNER_JOBS.values()) | {"codeql-quality"}
+LINUX_DISTRIBUTION_JOB = "linux-distribution"
+ALL_JOBS = frozenset(OWNER_JOBS.values()) | {
+    "codeql-quality",
+    LINUX_DISTRIBUTION_JOB,
+}
 
 
 class QualitySelectionError(ValueError):
@@ -38,12 +42,18 @@ def validate(selection_raw: str, results_raw: str) -> None:
     results = _object(results_raw, "results")
     owners = selection.get("owners")
     languages = selection.get("codeql_languages")
+    binary_impact = selection.get("binary_impact")
     if not isinstance(owners, list) or not owners or any(
         owner not in OWNER_JOBS for owner in owners
     ):
         raise QualitySelectionError("selection has no finite owner set")
     if not isinstance(languages, list):
         raise QualitySelectionError("selection has no CodeQL language list")
+    expected_binary_impact = bool(
+        {"LINUX_BACKEND", "LINUX_UI", "WINDOWS"}.intersection(owners)
+    )
+    if binary_impact is not expected_binary_impact:
+        raise QualitySelectionError("selection has an inconsistent binary_impact")
     if set(results) != ALL_JOBS:
         raise QualitySelectionError("quality result keys do not match the job set")
 
@@ -59,6 +69,12 @@ def validate(selection_raw: str, results_raw: str) -> None:
         raise QualitySelectionError(
             f"codeql-quality must be {expected_codeql}, "
             f"found {results['codeql-quality']!r}"
+        )
+    expected_distribution = "success" if binary_impact else "skipped"
+    if results[LINUX_DISTRIBUTION_JOB] != expected_distribution:
+        raise QualitySelectionError(
+            f"linux-distribution must be {expected_distribution}, "
+            f"found {results[LINUX_DISTRIBUTION_JOB]!r}"
         )
 
 

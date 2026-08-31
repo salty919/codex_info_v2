@@ -21,6 +21,8 @@ class OwnerTableTests(unittest.TestCase):
             "docs/PRODUCT_REQUIREMENTS.md": {"DOCS"},
             ".github/workflows/feat-integration.yml": {"GOVERNANCE"},
             "scripts/product_version.py": {"GOVERNANCE"},
+            "scripts/build_linux_bundle.sh": {"LINUX_BACKEND"},
+            "scripts/test_linux_bundle.sh": {"LINUX_BACKEND"},
             "src/server.rs": {"LINUX_BACKEND"},
             "ui/app.slint": {"LINUX_UI"},
             "windows-client/src/App.cs": {"WINDOWS"},

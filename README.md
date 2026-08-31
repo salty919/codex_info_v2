@@ -1,27 +1,51 @@
 <!-- Copyright (C) 2026 salty919 -->
 <!-- SPDX-License-Identifier: GPL-3.0-only -->
 
-# Codex Info（Rust / X Window / WSLg）
+# Codex Info（Linux bundle / X Window / WSLg）
 
 English quick start: [README.en.md](README.en.md) · [製品要件](docs/PRODUCT_REQUIREMENTS.md) · [Windowsクライアント](docs/WINDOWS_CLIENT.md) · [REST API](docs/REST_API_V1.md) · [データ保護](docs/DATA_PROTECTION_POLICY.md) · [多言語化](docs/LOCALIZATION.md) · [顧客運用](docs/CUSTOMER_OPERATIONS_RUNBOOK.md)
 
 Codex App ServerからChatGPT/Codexアカウントのレート制限と週次または月間のリセット時刻を取得し、WSLのX Windowに表示します。UIはRustの宣言的GUIツールキットSlintで構成しています。必要な場合だけ、SSHトンネル経由のWindows監視用にloopback限定の読み取り専用REST APIも開始できます。
 
-## 起動
+## Linux bundleで導入・起動（通常導線）
+
+既存の`windows-vX.Y.Z` Releaseから、同じversionのLinux asset一式をダウンロードします。対象は
+`x86_64-unknown-linux-gnu` archive、対応する`.sha256` checksum、manifest（`*.manifest.json`）です。
+`X.Y.Z`はReleaseのversionへ置き換えてください。
 
 ```bash
-git clone https://github.com/salty919/codex_info_v2.git
-cd codex_info_v2
-./run.sh --ui
+version='X.Y.Z'
+asset="codex-info-${version}-x86_64-unknown-linux-gnu.tar.gz"
+checksum="${asset}.sha256"
+manifest="${asset%.tar.gz}.manifest.json"
+bundle_dir="$HOME/.local/share/codex-info/bundle-v${version}"
+mkdir -p "$bundle_dir"
+# Releaseから取得したasset、checksum、manifestをbundle_dirへ置く。
+(cd "$bundle_dir" && sha256sum -c "$checksum")
+test -s "$bundle_dir/$manifest"
+mkdir -p "$bundle_dir/extracted"
+tar -xzf "$bundle_dir/$asset" -C "$bundle_dir/extracted"
+bash "$bundle_dir/extracted/install.sh" \
+  --bundle "$bundle_dir/$asset" \
+  --manifest "$bundle_dir/$manifest" \
+  --sha256 "$bundle_dir/$checksum"
+systemctl --user status codex-info.service --no-pager
+curl --fail http://127.0.0.1:8787/v1/health
 ```
 
-別の場所へコピーして使う場合は、履歴の保存先を明示できます。
+targetは`x86_64-unknown-linux-gnu`に固定です。互換性として表明するのはmanifestの実測
+`glibc_minimum`以上だけで、他のdistributionやarchitectureへの対応、署名済み、publisher検証済みとは表明しません。
+checksum、manifest、install、service切替のいずれかが失敗した場合は利用を開始せず、Releaseからassetを再取得します。
+
+自動起動を外す場合は、展開済みbundleを残したまま次を実行します。
 
 ```bash
-CODEX_INFO_DATA_DIR="$PWD/data" ./run.sh --ui
+bash "$bundle_dir/extracted/install.sh" --remove
 ```
 
-公開起動契約は限定されています。引数なしの`./run.sh`は記録daemonとloopback RESTだけを`127.0.0.1:8787`で起動し、`./run.sh --port PORT`はloopbackのポートだけを変更します。X画面を使う場合は`./run.sh --ui`、ポートも指定する場合は`./run.sh --ui --port PORT`です。`./run.sh --stop`は同じprofileの検証済みdaemonだけを停止し、`./run.sh --help`は利用可能な形を表示します。任意アドレスの指定や旧起動オプションは受理しません。サービスを自動起動するには`bash scripts/install_systemd_recorder.sh`、自動起動から外すには`bash scripts/install_systemd_recorder.sh --remove`を使います。systemd自動起動を導入済みの場合、通常の`run.sh`起動はbuildが変わった時だけ導入binaryを同じversionへ更新してserviceを再起動します。Linux / Windows UIは同じproduct versionのresident serviceだけを表示正本として受理します。解除や更新でもSQLite履歴、バックアップ、reset hintは削除しません。収集周期`CODEX_INFO_DAEMON_INTERVAL_SECS`は5〜3600秒へ制限されます。
+この導入・解除で、履歴DB、DB backup、reset hint、Codex session JSONL、設定は削除されません。
+公開起動契約は引数なし、`--ui`、`--port PORT`、`--ui --port PORT`、`--stop`、`--help`だけです。
+Linux / Windows UIは同じproduct versionのresident serviceだけを表示正本として受理します。
 
 初回起動時の画面内タイトルは`Codex Info`です。ネイティブタイトルバーは使わず、アプリ内では認証パネルが接続状態を案内します。
 
@@ -34,18 +58,12 @@ CODEX_INFO_DATA_DIR="$PWD/data" ./run.sh --ui
 
 ## 必要環境
 
-- Rust/Cargo（Rustupで導入した場合は`$HOME/.cargo/bin`をPATHへ追加）
+- `x86_64-unknown-linux-gnu`を実行でき、bundle manifestの実測`glibc_minimum`以上を持つLinux環境
+- `bash`、`tar`、`sha256sum`、`python3`、`curl`、user-systemd（`systemctl --user`）
 - WSLgまたはXサーバー（`DISPLAY`が設定されていること）
 - `codex` CLI（`codex app-server --stdio`が実行できること）
 
 日本語・韓国語表示用フォントは`assets/`に同梱してSlintへ埋め込み、ホスト側フォントに依存しません。著作権とライセンスは[第三者ライセンス通知](THIRD_PARTY_NOTICES.md)と[assets/NOTICE.txt](assets/NOTICE.txt)に記載します。
-
-初回起動時にCargoが依存クレートを取得・ビルドします。`run.sh`はPATH上のCargoに加えて、Rustupの`$HOME/.cargo/bin/cargo`とアクティブなRustupツールチェーンも自動検出します。Cargoが見つからない場合は、Rustupをインストールしてシェルを再読み込みしてください。
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-```
 
 画面が出ない場合は次を確認してください。
 
@@ -99,7 +117,7 @@ Linux / WSL 側でネイティブ画面を維持したまま、Windows クライ
 
 ## Windowサイズとプレビュー
 
-登録top-level surface inventoryはMain、Setup、Settings、Graph、Threads、Legalの正確な6個で、HelpはMain内surface（追加HWND=0）です。runtime open HWNDはMain=1＋open child subset 0..5、合計1..6で、各childはsingleton、5 childを全て開いた時だけ6となります。Main/Setup/Settings/Threads/Legalはlogical client `initial=min=max=900×480` fixed、Graphは`initial=940×640`、`min=700×480`、`max=unbounded`、resizableです。登録された6 surfaceはMinimize/Closeを持ち、native resize/maximize/restoreはGraphだけです。ネイティブタイトルバーは全Windowで無効にし、ボタン以外の画面領域をドラッグして移動できます。物理サイズはOSのDPI／拡大率に連動し、Graphの最大化／復元は現在モニターのwork areaへ適用します。状態別の確認には`CODEX_INFO_PREVIEW=initializing|auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle|legal`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はGraphの初期サイズを上書きするレイアウト検証用です。メイン画面の指定例は`CODEX_INFO_PREVIEW=normal ./run.sh --ui`です。
+登録top-level surface inventoryはMain、Setup、Settings、Graph、Threads、Legalの正確な6個で、HelpはMain内surface（追加HWND=0）です。runtime open HWNDはMain=1＋open child subset 0..5、合計1..6で、各childはsingleton、5 childを全て開いた時だけ6となります。Main/Setup/Settings/Threads/Legalはlogical client `initial=min=max=900×480` fixed、Graphは`initial=940×640`、`min=700×480`、`max=unbounded`、resizableです。登録された6 surfaceはMinimize/Closeを持ち、native resize/maximize/restoreはGraphだけです。ネイティブタイトルバーは全Windowで無効にし、ボタン以外の画面領域をドラッグして移動できます。物理サイズはOSのDPI／拡大率に連動し、Graphの最大化／復元は現在モニターのwork areaへ適用します。状態別の確認には`CODEX_INFO_PREVIEW=initializing|auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle|legal`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はGraphの初期サイズを上書きするレイアウト検証用です。メイン画面の指定例は`CODEX_INFO_PREVIEW=normal "$HOME/.local/bin/codex_info" --ui`です。
 
 ## UIを調整する場所
 

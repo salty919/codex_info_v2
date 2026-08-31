@@ -11,21 +11,35 @@ from selected_quality_gate import OWNER_JOBS, QualitySelectionError, validate
 
 
 OWNERS = tuple(OWNER_JOBS)
-JOBS = tuple(OWNER_JOBS.values()) + ("codeql-quality",)
+JOBS = tuple(OWNER_JOBS.values()) + ("codeql-quality", "linux-distribution")
 
 
 def selection(owners: tuple[str, ...]) -> str:
     languages = ["selected-language"] if owners != ("DOCS",) else []
-    return json.dumps({"owners": list(owners), "codeql_languages": languages})
+    binary_impact = bool(
+        {"LINUX_BACKEND", "LINUX_UI", "WINDOWS"}.intersection(owners)
+    )
+    return json.dumps(
+        {
+            "owners": list(owners),
+            "codeql_languages": languages,
+            "binary_impact": binary_impact,
+        }
+    )
 
 
 def successful_results(owners: tuple[str, ...]) -> dict[str, str]:
     selected_jobs = {OWNER_JOBS[owner] for owner in owners}
     codeql = owners != ("DOCS",)
+    distribution = bool(
+        {"LINUX_BACKEND", "LINUX_UI", "WINDOWS"}.intersection(owners)
+    )
     return {
         job: (
             "success"
-            if job in selected_jobs or (job == "codeql-quality" and codeql)
+            if job in selected_jobs
+            or (job == "codeql-quality" and codeql)
+            or (job == "linux-distribution" and distribution)
             else "skipped"
         )
         for job in JOBS
@@ -55,15 +69,19 @@ class SelectedQualityTests(unittest.TestCase):
         candidate = dict(baseline)
         candidate.pop("codeql-quality")
         mutations.append(candidate)
+        candidate = dict(baseline)
+        candidate["linux-distribution"] = "failure"
+        mutations.append(candidate)
         for candidate in mutations:
             with self.subTest(candidate=candidate), self.assertRaises(QualitySelectionError):
                 validate(selection(owners), json.dumps(candidate))
 
     def test_empty_unknown_or_malformed_selection_fails(self) -> None:
         cases = (
-            {"owners": [], "codeql_languages": []},
-            {"owners": ["UNKNOWN"], "codeql_languages": []},
+            {"owners": [], "codeql_languages": [], "binary_impact": False},
+            {"owners": ["UNKNOWN"], "codeql_languages": [], "binary_impact": False},
             {"owners": ["DOCS"]},
+            {"owners": ["WINDOWS"], "codeql_languages": ["csharp"], "binary_impact": False},
         )
         for value in cases:
             with self.subTest(value=value), self.assertRaises(QualitySelectionError):

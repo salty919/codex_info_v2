@@ -126,6 +126,10 @@
   古いheadの結果や未解決かつnon-outdatedのP0/P1をready判定へ流用せず、独自API key workflowを追加しない。
   Codex reviewはCodeQL、required acceptance、必要な承認の代替にしない。
 - `windows-vX.Y.Z` ReleaseはSetupとmanifestを非公開Draftへuploadしてから公開する。途中失敗を公開済み成功へ変換しない。
+- Linux coreはtargetを`x86_64-unknown-linux-gnu`へ固定し、同じstable version・final source SHAのarchive、SHA-256 checksum、manifestを既存の`windows-vX.Y.Z` ReleaseへWindowsのSetup/manifestと同居させる。別Linux tag/channelを作らない。
+- Linux bundleの互換性は、bundle manifestに記録した実測`glibc_minimum`（glibc minimum）を満たすことだけを表明する。manifestのtargetまたは実測minimumが欠落・不一致なら候補を公開・導入せず、他のdistribution、architecture、署名済み、publisher検証済みの対応を表明しない。
+- Linux bundle archiveは`codex_info`、`codex-info.service`、`install.sh`、license/noticeを含み、version/target情報と対応するchecksum/manifestを同じcandidate identityへ結び付ける。顧客の通常導線はRelease assetのdownload、checksum検証、extract、bundle内scriptによるinstall、service status、loopback `/v1/health`、removeだけで完結し、repository clone、Cargo build、`run.sh`を要求しない。
+- Linux bundleのinstall、update、reinstall、removeまたはその失敗は、導入binary、履歴DB、verified backup、`history/usage_reset_hint.json`、Codex session JSONL、設定を削除しない。removeはuser service/unitだけを解除し、部分導入を成功と表示しない。
 - release artifactはsource、lockfile、実payload、license/notice、署名、version、対象platformを一つのrelease identityで追跡する。
 - publisher名、certificate、対応OS build、RPO/RTO、accessibility適合、support窓口を根拠なしに推測しない。
 - authority inputがないclaimは「保証なし」「未対応」とし、認証済み、対応済み、測定済みと表示しない。
