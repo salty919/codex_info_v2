@@ -32,8 +32,9 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -6157,15 +6158,8 @@ impl CodexInfoState {
             self.advance_auth_epoch();
             self.thread_checking = false;
         }
-        self.service_endpoint_error = Some(error.clone());
-        if self.service_published_pair.is_some() {
-            return;
-        }
+        self.service_endpoint_error = Some(error);
         self.checking = false;
-        self.account_error = Some(error.clone());
-        self.error = Some(error);
-        self.status =
-            "利用状況を取得できません。指定されたREST endpointへの接続を確認してください。".into();
     }
 
     fn advance_auth_epoch(&mut self) {
@@ -7784,8 +7778,12 @@ fn open_validated_auth_url(value: &str) -> bool {
 }
 
 impl CodexInfoState {
+    fn has_display_error(&self) -> bool {
+        self.service_endpoint_error.is_some() || self.error.is_some()
+    }
+
     fn status_level(&self) -> &'static str {
-        if self.error.is_some() {
+        if self.has_display_error() {
             "error"
         } else if self.reset_at.is_some() && self.seconds_to_reset().abs() <= 86_400
             || (self.has_quota_percent && self.remaining_percent.unwrap_or(0.0) <= 10.0)
@@ -7804,6 +7802,13 @@ impl CodexInfoState {
     }
 
     fn display_status(&self) -> String {
+        if self.service_endpoint_error.is_some() {
+            return if self.last_success_at.is_some() {
+                self.i18n.format_stale_status(self.last_success_at)
+            } else {
+                self.i18n.text(TextKey::CannotFetchUsage).into()
+            };
+        }
         if self.account_error.is_some() {
             return if self.last_success_at.is_some() {
                 self.i18n.format_stale_status(self.last_success_at)
@@ -7914,13 +7919,14 @@ impl CodexInfoState {
         ui.set_has_usage(self.has_visible_usage());
         ui.set_has_auth_url(self.auth_url.is_some());
         ui.set_checking(self.checking);
-        ui.set_has_error(self.error.is_some());
+        ui.set_has_error(self.has_display_error());
+        ui.set_service_unavailable(self.service_endpoint_error.is_some());
         ui.set_startup_loading(native_startup_loading(
             self.authenticated,
             self.has_visible_usage(),
             self.local_usage_error,
             self.account_error.is_some(),
-            self.error.is_some(),
+            self.has_display_error(),
         ));
         ui.set_window_title(native_account_window_title(&self.window_title()).into());
         let quota_title = if self.monthly {
@@ -9020,6 +9026,38 @@ fn ensure_background_service(config: ApiServerConfig) -> Result<(), String> {
     }
 }
 
+fn start_background_service_retry<F>(
+    state: &mut CodexInfoState,
+    config: ApiServerConfig,
+    in_flight: &Arc<AtomicBool>,
+    start_service: F,
+) -> bool
+where
+    F: FnOnce(ApiServerConfig) -> Result<(), String> + Send + 'static,
+{
+    if state.service_endpoint_error.is_none()
+        || in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return false;
+    }
+    state.request_service_read("利用状況を更新しています…");
+    let worker_in_flight = Arc::clone(in_flight);
+    if thread::Builder::new()
+        .spawn(move || {
+            let _ = start_service(config);
+            worker_in_flight.store(false, Ordering::Release);
+        })
+        .is_err()
+    {
+        in_flight.store(false, Ordering::Release);
+        state.hold_service_endpoint_error(cli_error(CliTextKey::ServiceStartFailed));
+        return false;
+    }
+    true
+}
+
 fn poll_service_state(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
     state.poll_auth_control();
     if !service_is_healthy(service_endpoint) {
@@ -9244,6 +9282,7 @@ fn run_ui(
     let threads_window = Rc::new(RefCell::new(None::<ThreadsWindow>));
     let legal_notice_window = Rc::new(RefCell::new(None::<LegalNoticeWindow>));
     let x11_monitor = Rc::new(X11WindowStateMonitor::connect());
+    let service_retry_in_flight = Arc::new(AtomicBool::new(false));
 
     {
         let weak_ui = ui.as_weak();
@@ -9285,10 +9324,19 @@ fn run_ui(
     }
     {
         let state = Rc::clone(&state);
+        let service_retry_in_flight = Arc::clone(&service_retry_in_flight);
         ui.on_retry(move || {
-            state
-                .borrow_mut()
-                .request_service_read("利用状況を更新しています…")
+            let mut state = state.borrow_mut();
+            if state.service_endpoint_error.is_some() {
+                start_background_service_retry(
+                    &mut state,
+                    service_config,
+                    &service_retry_in_flight,
+                    ensure_background_service,
+                );
+            } else {
+                state.request_service_read("利用状況を更新しています…");
+            }
         });
     }
     {
@@ -9646,12 +9694,15 @@ fn run_ui(
     let weak_ui = ui.as_weak();
     let graph_window_for_timer = Rc::clone(&graph_window);
     let threads_window_for_timer = Rc::clone(&threads_window);
+    let service_retry_for_timer = Arc::clone(&service_retry_in_flight);
     let timer = Timer::default();
     if !state.borrow().preview {
         timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
             if let Some(ui) = weak_ui.upgrade() {
                 let mut state = state.borrow_mut();
-                run_ui_service_timer_cycle(&mut state, service_config.listen_addr());
+                if !service_retry_for_timer.load(Ordering::Acquire) {
+                    run_ui_service_timer_cycle(&mut state, service_config.listen_addr());
+                }
                 state.sync_ui(&ui);
                 if let Some(graph) = graph_window_for_timer.borrow().as_ref() {
                     if graph.window().is_visible() {
@@ -9949,8 +10000,9 @@ mod tests {
     use std::io::{BufReader, Read, Seek, SeekFrom, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     fn launch_args(values: &[&str]) -> Vec<std::ffi::OsString> {
@@ -10041,8 +10093,9 @@ mod tests {
         let blocker = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = blocker.local_addr().unwrap();
         let mut state = CodexInfoState::preview("normal");
+        let ready_details = state.public_details();
         state.preview = false;
-        state.service_endpoint_error = Some("selected endpoint unavailable".into());
+        state.hold_service_endpoint_error("selected endpoint unavailable".into());
 
         poll_service_state(&mut state, endpoint);
         assert_eq!(
@@ -10053,17 +10106,71 @@ mod tests {
         drop(blocker);
         let mut server =
             ApiServer::start(ApiServerConfig::new(endpoint).unwrap()).expect("selected endpoint");
+        server.publisher().publish_details(ready_details).unwrap();
         poll_service_state(&mut state, endpoint);
         assert!(state.service_endpoint_error.is_none());
         let admitted_pair = state.service_published_pair.clone();
         let admitted_details = state.public_details();
+        let admitted_status = state.display_status();
 
-        state.service_endpoint_error = Some("same endpoint failed once".into());
+        state.hold_service_endpoint_error("same endpoint failed once".into());
+        assert!(state.has_display_error());
+        assert_eq!(state.status_level(), "error");
+        assert_ne!(state.display_status(), admitted_status);
+        assert_eq!(state.service_published_pair, admitted_pair);
+        assert_eq!(state.public_details(), admitted_details);
+
         poll_service_state(&mut state, endpoint);
         assert!(state.service_endpoint_error.is_none());
+        assert!(!state.has_display_error());
+        assert_eq!(state.display_status(), admitted_status);
         assert_eq!(state.service_published_pair, admitted_pair);
         assert_eq!(state.public_details(), admitted_details);
         server.shutdown();
+    }
+
+    #[test]
+    fn explicit_service_retry_starts_once_without_replacing_last_good_data() {
+        let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
+        state.service_published_pair = Some("pair:7".into());
+        state.hold_service_endpoint_error("selected endpoint unavailable".into());
+        let admitted_details = state.public_details();
+        let in_flight = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let config = ApiServerConfig::new("127.0.0.1:18787".parse().unwrap()).unwrap();
+
+        assert!(super::start_background_service_retry(
+            &mut state,
+            config,
+            &in_flight,
+            move |started_config| {
+                started_tx.send(started_config.listen_addr()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            },
+        ));
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            config.listen_addr()
+        );
+        assert!(!super::start_background_service_retry(
+            &mut state,
+            config,
+            &in_flight,
+            |_| Ok(()),
+        ));
+        assert!(state.checking);
+        assert!(state.has_display_error());
+        assert_eq!(state.public_details(), admitted_details);
+
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while in_flight.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(!in_flight.load(Ordering::Acquire));
     }
 
     #[test]
