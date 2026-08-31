@@ -11,8 +11,7 @@ use codex_info::protocol_contract;
 use codex_info::security;
 use codex_info::server::{
     validate_public_threads, ApiServer, ApiServerConfig, PublicDetailedModelUsage, PublicDetails,
-    PublicHistoryPeriod, PublicHistorySample, PublicModelUsage, PublicQuota, PublicSnapshot,
-    PublicState, PublicThread,
+    PublicHistoryPeriod, PublicHistorySample, PublicQuota, PublicState, PublicThread,
 };
 use codex_info::thread_contract::{
     self, PageAcceptance, ThreadCycleAccumulator, ThreadCycleOutcome, ThreadTopologyNode,
@@ -40,7 +39,7 @@ use std::time::{Duration, Instant};
 
 slint::include_modules!();
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AccountCommand {
     Read,
     Login,
@@ -295,12 +294,6 @@ const SAME_TIMESTAMP_RESET_JITTER_SECONDS: i64 = 5;
 // change, never as an invented diagonal rate.
 const MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS: i64 = 60;
 const MOVING_RESET_MIN_HORIZON_SECONDS: i64 = 86_400;
-const ROLLING_RESET_ARTIFACT_MAX_JUMP_SECONDS: i64 = 2 * 86_400;
-const ROLLING_RESET_ARTIFACT_MIN_PREVIOUS_REMAINING_PERCENT: f64 = 95.0;
-const ROLLING_RESET_ARTIFACT_MAX_OBSERVATION_GAP_SECONDS: i64 = 2 * 3_600;
-const LEGACY_MOVING_RESET_HORIZON_TOLERANCE_SECONDS: i64 = 120;
-const LEGACY_MOVING_RESET_PAIR_GAP_SECONDS: i64 = 3_600;
-const LEGACY_MOVING_RESET_PAIR_HORIZON_TOLERANCE_SECONDS: i64 = 60;
 
 /// Return the start of the collector's minute bucket using mathematical
 /// floor semantics, including for timestamps before the Unix epoch.
@@ -1782,39 +1775,6 @@ struct HistoryPeriod {
     label: String,
 }
 
-fn legacy_moving_reset_artifact(
-    candidate: &UsageHistorySample,
-    samples: &[&UsageHistorySample],
-    exact_reset_counts: &BTreeMap<i64, usize>,
-) -> bool {
-    if candidate.remaining_percent != 100.0
-        || exact_reset_counts.get(&candidate.reset_at) != Some(&1)
-    {
-        return false;
-    }
-    let candidate_horizon = i128::from(candidate.reset_at) - i128::from(candidate.timestamp);
-    if candidate_horizon.abs_diff(i128::from(WEEK_SECONDS))
-        > LEGACY_MOVING_RESET_HORIZON_TOLERANCE_SECONDS as u128
-    {
-        return false;
-    }
-    samples.iter().any(|other| {
-        if other.reset_at == candidate.reset_at
-            || other.remaining_percent != 100.0
-            || exact_reset_counts.get(&other.reset_at) != Some(&1)
-            || candidate.timestamp.abs_diff(other.timestamp)
-                > LEGACY_MOVING_RESET_PAIR_GAP_SECONDS as u64
-        {
-            return false;
-        }
-        let other_horizon = i128::from(other.reset_at) - i128::from(other.timestamp);
-        other_horizon.abs_diff(i128::from(WEEK_SECONDS))
-            <= LEGACY_MOVING_RESET_HORIZON_TOLERANCE_SECONDS as u128
-            && candidate_horizon.abs_diff(other_horizon)
-                <= LEGACY_MOVING_RESET_PAIR_HORIZON_TOLERANCE_SECONDS as u128
-    })
-}
-
 fn display_history_samples(samples: &[UsageHistorySample]) -> Vec<&UsageHistorySample> {
     samples.iter().filter(|sample| sample.is_valid()).collect()
 }
@@ -1954,179 +1914,7 @@ fn reset_sample_groups(samples: &[UsageHistorySample]) -> Vec<ResetSampleGroup> 
             same_reset_merged.push(group);
         }
     }
-    // Group first, then discard only groups made entirely of identified
-    // legacy moving-reset artifacts. Filtering rows before grouping breaks a
-    // continuous rolling chain at every singleton and manufactures an empty
-    // 100% period. A group containing any real model snapshot or any
-    // non-artifact quota snapshot remains visible.
-    let valid_refs = samples
-        .iter()
-        .filter(|sample| sample.is_valid())
-        .collect::<Vec<_>>();
-    let mut exact_reset_counts = BTreeMap::new();
-    for sample in &valid_refs {
-        *exact_reset_counts.entry(sample.reset_at).or_insert(0) += 1;
-    }
-    let same_reset_merged = same_reset_merged
-        .into_iter()
-        .filter(|group| {
-            !group.samples.iter().all(|sample| {
-                legacy_moving_reset_artifact(sample, &valid_refs, &exact_reset_counts)
-            })
-        })
-        .collect::<Vec<_>>();
-    let has_model_usage = |sample: &UsageHistorySample| {
-        sample.sol_dollars > 0.0
-            || sample.terra_dollars > 0.0
-            || sample.luna_dollars > 0.0
-            || sample.sol_tokens > 0
-            || sample.terra_tokens > 0
-            || sample.luna_tokens > 0
-    };
-    let model_timestamps = same_reset_merged
-        .iter()
-        .flat_map(|group| group.samples.iter())
-        .filter(|sample| has_model_usage(sample))
-        .map(|sample| sample.timestamp)
-        .collect::<BTreeSet<_>>();
-    let drop_ambiguous_quota_groups = same_reset_merged
-        .iter()
-        .map(|group| {
-            let only_missing_quota = group
-                .samples
-                .iter()
-                .all(|sample| !has_model_usage(sample) && sample.remaining_percent < 0.0);
-            only_missing_quota
-                && group
-                    .samples
-                    .iter()
-                    .any(|sample| model_timestamps.contains(&sample.timestamp))
-        })
-        .collect::<Vec<_>>();
-    let same_reset_merged = same_reset_merged
-        .into_iter()
-        .enumerate()
-        .filter(|(index, _)| !drop_ambiguous_quota_groups[*index])
-        .map(|(_, group)| group)
-        .collect::<Vec<_>>();
-    let mut merged: Vec<ResetSampleGroup> = Vec::with_capacity(same_reset_merged.len());
-    let mut rolling_artifact_chain = false;
-    for mut group in same_reset_merged {
-        let group_end = group
-            .samples
-            .iter()
-            .map(|sample| sample.timestamp)
-            .max()
-            .unwrap_or(group.start);
-        let group_is_full_quota = group
-            .samples
-            .iter()
-            .filter(|sample| sample.timestamp == group_end)
-            .any(|sample| sample.remaining_percent >= 100.0)
-            && group
-                .samples
-                .iter()
-                .filter(|sample| sample.timestamp == group_end)
-                .all(|sample| sample.remaining_percent < 0.0 || sample.remaining_percent >= 100.0);
-        // The live service can emit a chain of quota-only rows while it
-        // advances reset_at every poll. These rows are not independent
-        // periods: they sit directly between the last spend observation and
-        // the next spend observation. Keep the chain attached to the spend
-        // period, but require a real spend anchor and a bounded timeline
-        // so a genuine full-quota reset remains a separate period. A bounded
-        // observation gap is allowed because the collector can be offline
-        // for several polls while the service keeps advancing reset_at.
-        let should_attach_rolling_artifact = merged.last().is_some_and(|previous| {
-            let previous_end = previous
-                .samples
-                .iter()
-                .map(|sample| sample.timestamp)
-                .max()
-                .unwrap_or(previous.start);
-            let previous_has_model_usage = previous.samples.iter().any(|sample| {
-                sample.sol_dollars > 0.0
-                    || sample.terra_dollars > 0.0
-                    || sample.luna_dollars > 0.0
-                    || sample.sol_tokens > 0
-                    || sample.terra_tokens > 0
-                    || sample.luna_tokens > 0
-            });
-            let previous_end_has_observed_quota = previous
-                .samples
-                .iter()
-                .filter(|sample| sample.timestamp == previous_end)
-                .any(|sample| sample.remaining_percent >= 0.0);
-            let previous_end_is_near_full = previous_end_has_observed_quota
-                && previous
-                    .samples
-                    .iter()
-                    .filter(|sample| {
-                        sample.timestamp == previous_end && sample.remaining_percent >= 0.0
-                    })
-                    .all(|sample| {
-                        sample.remaining_percent
-                            >= ROLLING_RESET_ARTIFACT_MIN_PREVIOUS_REMAINING_PERCENT
-                    });
-            group_is_full_quota
-                && group.start.saturating_sub(previous_end)
-                    <= ROLLING_RESET_ARTIFACT_MAX_OBSERVATION_GAP_SECONDS
-                && group
-                    .canonical_reset_at
-                    .saturating_sub(previous.canonical_reset_at)
-                    <= ROLLING_RESET_ARTIFACT_MAX_JUMP_SECONDS
-                && previous_end_is_near_full
-                && (rolling_artifact_chain || previous_has_model_usage)
-        });
-        if should_attach_rolling_artifact {
-            if let Some(previous) = merged.last_mut() {
-                previous.canonical_reset_at =
-                    previous.canonical_reset_at.max(group.canonical_reset_at);
-                previous.start = previous.start.min(group.start);
-                previous.samples.append(&mut group.samples);
-            }
-            rolling_artifact_chain = true;
-            continue;
-        }
-        rolling_artifact_chain = false;
-        let should_attach_to_previous = group.samples.len() == 1
-            && group.samples[0].sol_dollars == 0.0
-            && group.samples[0].terra_dollars == 0.0
-            && group.samples[0].luna_dollars == 0.0
-            && group.samples[0].sol_tokens == 0
-            && group.samples[0].terra_tokens == 0
-            && group.samples[0].luna_tokens == 0
-            // Only a full-quota singleton is a known rolling-reset artifact.
-            // A lower remaining value at the same timestamp can be a real
-            // separate period; attaching it would overwrite the spend
-            // period's quota observation (the observed 88% -> 14% failure).
-            && group.samples[0].remaining_percent >= 100.0
-            && merged.last().is_some_and(|previous: &ResetSampleGroup| {
-                previous.samples.iter().any(|sample| {
-                    sample.timestamp == group.samples[0].timestamp
-                        && (sample.sol_dollars > 0.0
-                            || sample.terra_dollars > 0.0
-                            || sample.luna_dollars > 0.0
-                            || sample.sol_tokens > 0
-                            || sample.terra_tokens > 0
-                            || sample.luna_tokens > 0)
-                })
-            });
-        if should_attach_to_previous {
-            if let Some(previous) = merged.last_mut() {
-                let sample = group.samples.remove(0);
-                merge_exact_sample(&mut previous.samples, sample);
-                previous.start = previous
-                    .samples
-                    .iter()
-                    .map(|sample| sample.timestamp)
-                    .min()
-                    .unwrap_or(previous.start);
-            }
-        } else {
-            merged.push(group);
-        }
-    }
-    merged
+    same_reset_merged
 }
 
 /// Groups reset observations by an anchored sixty-second window, with a
@@ -2261,67 +2049,20 @@ fn authoritative_history_projection_samples(
     current_reset_at: Option<i64>,
     window_seconds: i64,
 ) -> Vec<UsageHistorySample> {
-    let Some(current_reset_at) = current_reset_at else {
-        return samples.to_vec();
-    };
-    let groups = reset_sample_groups(samples);
-    let Some(current_group) = groups.iter().find(|group| {
-        current_reset_at.abs_diff(group.canonical_reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
-    }) else {
-        return samples.to_vec();
-    };
-    let Some(authoritative_start) = (window_seconds > 0)
-        .then(|| current_group.canonical_reset_at.checked_sub(window_seconds))
-        .flatten()
-        .and_then(minute_start)
-    else {
-        return samples.to_vec();
-    };
-
-    let valid_refs = samples
-        .iter()
-        .filter(|sample| sample.is_valid())
-        .collect::<Vec<_>>();
-    let mut exact_reset_counts = BTreeMap::new();
-    for sample in &valid_refs {
-        *exact_reset_counts.entry(sample.reset_at).or_insert(0) += 1;
-    }
-    let excluded = current_group
-        .samples
-        .iter()
-        .filter(|sample| sample.timestamp < authoritative_start)
-        .filter(|sample| {
-            sample.sol_dollars == 0.0
-                && sample.terra_dollars == 0.0
-                && sample.luna_dollars == 0.0
-                && sample.sol_tokens == 0
-                && sample.terra_tokens == 0
-                && sample.luna_tokens == 0
-        })
-        .filter(|sample| legacy_moving_reset_artifact(sample, &valid_refs, &exact_reset_counts))
-        .map(|sample| (sample.reset_at, sample.timestamp))
-        .collect::<BTreeSet<_>>();
-    if excluded.is_empty() {
-        return samples.to_vec();
-    }
-
-    samples
-        .iter()
-        .filter(|sample| !excluded.contains(&(sample.reset_at, sample.timestamp)))
-        .cloned()
-        .collect()
+    let _ = (current_reset_at, window_seconds);
+    samples.to_vec()
 }
 
 /// Apply the authoritative quota bounds to the current raw period only.
 ///
 /// `UsageHistory` remains the owner of raw inventory and historical grouping.
 /// This bounded projection gives current consumers the quota reset/window
-/// boundary without deleting or clipping any stored sample. A current period
-/// with an owned row before the authoritative start is rejected wholesale so
-/// no caller can publish a mixed or invented interval.
+/// boundary without deleting, clipping, or shape-filtering any stored sample.
+/// Rows outside the resulting public period remain in the complete candidate,
+/// where the shared REST validator rejects the generation atomically.
 fn apply_authoritative_current_bounds(
     mut periods: Vec<HistoryPeriod>,
-    samples: &[UsageHistorySample],
+    _samples: &[UsageHistorySample],
     current_reset_at: Option<i64>,
     window_seconds: i64,
     observed_at: i64,
@@ -2352,35 +2093,119 @@ fn apply_authoritative_current_bounds(
         return periods;
     }
 
-    let owned_group = reset_sample_groups(samples).into_iter().find(|group| {
-        group.canonical_reset_at.abs_diff(canonical_reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
-    });
-    if owned_group.is_some_and(|group| group.samples.iter().any(|sample| sample.timestamp < start))
-    {
-        periods.remove(current_index);
-        return periods;
-    }
-
     periods[current_index].start = start;
     periods[current_index].end = end;
     periods
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryCanonicalizationError {
+    MultipleCyclesInMinute,
+    ConflictingQuota,
+    NonComparableCumulativeUsage,
+}
+
+impl std::fmt::Display for HistoryCanonicalizationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::MultipleCyclesInMinute => {
+                "history minute belongs to multiple reset cycles or partitions"
+            }
+            Self::ConflictingQuota => "history minute has conflicting quota observations",
+            Self::NonComparableCumulativeUsage => {
+                "history minute has no single dominant cumulative usage row"
+            }
+        })
+    }
+}
+
+impl std::error::Error for HistoryCanonicalizationError {}
+
+fn usage_vector_dominates(left: &UsageHistorySample, right: &UsageHistorySample) -> bool {
+    left.sol_dollars >= right.sol_dollars
+        && left.terra_dollars >= right.terra_dollars
+        && left.luna_dollars >= right.luna_dollars
+        && left.sol_tokens >= right.sol_tokens
+        && left.terra_tokens >= right.terra_tokens
+        && left.luna_tokens >= right.luna_tokens
+}
+
+/// Canonicalize a storage-admitted public candidate without changing raw
+/// SQLite rows. Reset aliases may contribute one quota value and one existing
+/// dominant cumulative row only when the aliases are already validated as the
+/// same cycle and collector minute. No model component is assembled from
+/// different rows.
+fn canonicalize_public_history_samples(
+    samples: &[UsageHistorySample],
+) -> Result<Vec<UsageHistorySample>, HistoryCanonicalizationError> {
+    let groups = reset_sample_groups(samples);
+    let mut minute_cycles = BTreeMap::<i64, BTreeSet<i64>>::new();
+    for group in &groups {
+        for sample in &group.samples {
+            minute_cycles
+                .entry(sample.timestamp.div_euclid(60) * 60)
+                .or_default()
+                .insert(group.canonical_reset_at);
+        }
+    }
+    if minute_cycles.values().any(|cycles| cycles.len() != 1) {
+        return Err(HistoryCanonicalizationError::MultipleCyclesInMinute);
+    }
+
+    let mut canonical = Vec::with_capacity(samples.len());
+    for group in groups {
+        let mut rows = group.samples;
+        rows.sort_by_key(|sample| {
+            (
+                sample.timestamp.div_euclid(60) * 60,
+                sample.timestamp,
+                sample.reset_at,
+            )
+        });
+        let mut index = 0;
+        while index < rows.len() {
+            let minute = rows[index].timestamp.div_euclid(60) * 60;
+            let start = index;
+            while index < rows.len() && rows[index].timestamp.div_euclid(60) * 60 == minute {
+                index += 1;
+            }
+            let minute_rows = &rows[start..index];
+            let mut quota = None;
+            for row in minute_rows
+                .iter()
+                .filter(|row| row.remaining_percent >= 0.0)
+            {
+                if quota.is_some_and(|existing| existing != row.remaining_percent) {
+                    return Err(HistoryCanonicalizationError::ConflictingQuota);
+                }
+                quota = Some(row.remaining_percent);
+            }
+            let dominant = minute_rows
+                .iter()
+                .rev()
+                .find(|candidate| {
+                    minute_rows
+                        .iter()
+                        .all(|row| usage_vector_dominates(candidate, row))
+                })
+                .ok_or(HistoryCanonicalizationError::NonComparableCumulativeUsage)?;
+            let mut sample = (*dominant).clone();
+            sample.timestamp = minute;
+            sample.reset_at = group.canonical_reset_at;
+            sample.remaining_percent = quota.unwrap_or(-1.0);
+            canonical.push(sample);
+        }
+    }
+    canonical.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
+    Ok(canonical)
 }
 
 #[derive(Debug, Default)]
 struct UsageHistory {
     db_path: Option<PathBuf>,
     samples: Vec<UsageHistorySample>,
+    pending_store_samples: Vec<usage_store::UsageHistorySample>,
     startup_maintenance_done: bool,
-}
-
-#[derive(Default)]
-struct SameTimestampRemainingState {
-    first_remaining: Option<f64>,
-    values_differ: bool,
-    min_reset_at: Option<i64>,
-    max_reset_at: Option<i64>,
-    quota_only: bool,
-    reset_values: BTreeMap<i64, f64>,
 }
 
 impl UsageHistory {
@@ -2399,7 +2224,7 @@ impl UsageHistory {
     fn load_from_db_path_at(db_path: Option<PathBuf>, now: DateTime<Utc>) -> Self {
         let samples = db_path
             .as_ref()
-            .and_then(|path| UsageStore::open(path).ok())
+            .and_then(|path| UsageStore::open_read_only(path).ok())
             // Startup must never materialize an unbounded database. The
             // bounded recent read uses the timestamp/reset index and the same
             // cardinality ceiling as the public details contract.
@@ -2413,10 +2238,10 @@ impl UsageHistory {
         let mut history = Self {
             db_path,
             samples,
+            pending_store_samples: Vec::new(),
             startup_maintenance_done: false,
         };
         history.normalize();
-        history.mark_existing_ambiguous_same_timestamp_remaining();
         history
     }
 
@@ -2492,6 +2317,7 @@ impl UsageHistory {
         Self {
             db_path: None,
             samples,
+            pending_store_samples: Vec::new(),
             startup_maintenance_done: true,
         }
     }
@@ -2506,36 +2332,21 @@ impl UsageHistory {
         }
         self.startup_maintenance_done = true;
 
-        if let Some(path) = self.db_path.as_ref() {
-            // Pruning is the only normal destructive operation. A consistent
-            // three-generation SQLite backup must succeed first; otherwise
-            // leave every historical row untouched and continue read-only.
-            if UsageStore::backup_generations(path, 3).is_ok() {
-                if let Ok(mut store) = UsageStore::open(path) {
-                    let _ = store.prune_older_than_three_months(now);
-                }
-            }
-        }
-
         let cutoff = three_months_before_utc(now);
         self.samples
             .retain(|sample| sample.timestamp >= cutoff && sample.timestamp <= now.timestamp());
         self.normalize();
-        self.mark_existing_ambiguous_same_timestamp_remaining();
     }
 
     fn record(&mut self, sample: UsageHistorySample) {
         if !sample.is_valid() {
             return;
         }
-        let mut sample = sample;
-        self.mark_ambiguous_same_timestamp_remaining(&mut sample);
+        self.pending_store_samples.push(sample.to_store());
         let acquisition_end = sample.timestamp;
-        sample.reset_at = self.canonical_reset_at(sample.reset_at);
         merge_exact_sample(&mut self.samples, sample);
         self.normalize();
         self.retain_acquisition_window(acquisition_end);
-        self.save();
     }
 
     fn apply_backfill_samples(&mut self, reset_at: i64, samples: Vec<UsageHistorySample>) {
@@ -2547,134 +2358,48 @@ impl UsageHistory {
             .filter(|sample| sample.is_valid())
             .map(|sample| sample.timestamp)
             .max();
-        let storage_reset_at = self.canonical_reset_at(reset_at);
-        for mut sample in samples {
+        let _ = reset_at;
+        for sample in samples {
             if !sample.is_valid() {
                 continue;
             }
-            self.mark_ambiguous_same_timestamp_remaining(&mut sample);
-            sample.reset_at = storage_reset_at;
+            self.pending_store_samples.push(sample.to_store());
             merge_exact_sample(&mut self.samples, sample);
         }
         self.normalize();
         if let Some(acquisition_end) = acquisition_end {
             self.retain_acquisition_window(acquisition_end);
         }
-        self.save();
     }
 
-    fn mark_ambiguous_same_timestamp_remaining(&mut self, incoming: &mut UsageHistorySample) {
-        let incoming_remaining = incoming.remaining_percent;
-        if incoming_remaining < 0.0 {
-            return;
-        }
-        let incoming_quota_only = incoming.sol_dollars == 0.0
-            && incoming.terra_dollars == 0.0
-            && incoming.luna_dollars == 0.0
-            && incoming.sol_tokens == 0
-            && incoming.terra_tokens == 0
-            && incoming.luna_tokens == 0;
-        let mut conflict = false;
-        for existing in &self.samples {
-            if existing.timestamp != incoming.timestamp
-                || existing.reset_at == incoming.reset_at
-                || existing.remaining_percent < 0.0
-                || (existing.remaining_percent - incoming_remaining).abs() <= f64::EPSILON
-            {
-                continue;
-            }
-            let reset_span = existing.reset_at.abs_diff(incoming.reset_at);
-            let existing_quota_only = existing.sol_dollars == 0.0
-                && existing.terra_dollars == 0.0
-                && existing.luna_dollars == 0.0
-                && existing.sol_tokens == 0
-                && existing.terra_tokens == 0
-                && existing.luna_tokens == 0;
-            if reset_span == 0
-                || reset_span > SAME_TIMESTAMP_RESET_JITTER_SECONDS as u64
-                || existing_quota_only
-                || incoming_quota_only
-            {
-                conflict = true;
-                break;
-            }
-        }
-        if conflict {
-            for existing in &mut self.samples {
-                if existing.timestamp == incoming.timestamp {
-                    existing.remaining_percent = -1.0;
-                }
-            }
-            incoming.remaining_percent = -1.0;
-        }
+    fn take_pending_store_samples(&mut self) -> Vec<usage_store::UsageHistorySample> {
+        std::mem::take(&mut self.pending_store_samples)
     }
 
-    /// Sanitize legacy rows already present in SQLite before any consumer can
-    /// observe them.  New writes call `mark_ambiguous_same_timestamp_remaining`
-    /// before merging; startup must apply the identical rule to pre-existing
-    /// rows so `canonical_samples`, period lists, and graph payloads share one
-    /// fail-closed boundary.  This only changes the in-memory view; the raw
-    /// retention database remains untouched until a normal write occurs.
-    fn mark_existing_ambiguous_same_timestamp_remaining(&mut self) {
-        // Aggregate by timestamp/reset instead of comparing every pair. A
-        // malformed database may contain the full bounded month at one
-        // timestamp; startup must remain O(n log n), not O(n²).
-        let mut states = BTreeMap::<i64, SameTimestampRemainingState>::new();
-        for sample in &self.samples {
-            if sample.remaining_percent < 0.0 {
-                continue;
-            }
-            let state = states.entry(sample.timestamp).or_default();
-            if let Some(first) = state.first_remaining {
-                state.values_differ |= (first - sample.remaining_percent).abs() > f64::EPSILON;
-            } else {
-                state.first_remaining = Some(sample.remaining_percent);
-            }
-            state.min_reset_at = Some(
-                state
-                    .min_reset_at
-                    .map_or(sample.reset_at, |value| value.min(sample.reset_at)),
-            );
-            state.max_reset_at = Some(
-                state
-                    .max_reset_at
-                    .map_or(sample.reset_at, |value| value.max(sample.reset_at)),
-            );
-            state.quota_only |= sample.sol_dollars == 0.0
-                && sample.terra_dollars == 0.0
-                && sample.luna_dollars == 0.0
-                && sample.sol_tokens == 0
-                && sample.terra_tokens == 0
-                && sample.luna_tokens == 0;
-            if let Some(previous) = state
-                .reset_values
-                .insert(sample.reset_at, sample.remaining_percent)
-            {
-                state.values_differ |= (previous - sample.remaining_percent).abs() > f64::EPSILON;
-            }
-        }
-        let mut ambiguous_timestamps = BTreeSet::new();
-        for (timestamp, state) in states {
-            let reset_span = state
-                .min_reset_at
-                .zip(state.max_reset_at)
-                .map(|(minimum, maximum)| minimum.abs_diff(maximum))
-                .unwrap_or(0);
-            if state.values_differ
-                && (reset_span == 0
-                    || reset_span > SAME_TIMESTAMP_RESET_JITTER_SECONDS as u64
-                    || state.quota_only)
-            {
-                ambiguous_timestamps.insert(timestamp);
-            }
-        }
-        for sample in &mut self.samples {
-            if ambiguous_timestamps.contains(&sample.timestamp) {
-                sample.remaining_percent = -1.0;
-            }
-        }
+    fn restore_pending_store_samples(&mut self, mut samples: Vec<usage_store::UsageHistorySample>) {
+        samples.append(&mut self.pending_store_samples);
+        self.pending_store_samples = samples;
     }
 
+    fn refresh_from_store(&mut self, now: DateTime<Utc>) -> bool {
+        let Some(path) = self.db_path.as_ref() else {
+            return false;
+        };
+        let Ok(store) = UsageStore::open_read_only(path) else {
+            return false;
+        };
+        let Ok(samples) = store.load_recent_one_month(now) else {
+            return false;
+        };
+        self.samples = samples
+            .into_iter()
+            .map(UsageHistorySample::from_store)
+            .collect();
+        self.normalize();
+        true
+    }
+
+    #[cfg(test)]
     fn canonical_reset_at(&self, reset_at: i64) -> i64 {
         history_periods_for_samples(&self.samples, 0, None)
             .into_iter()
@@ -2827,6 +2552,7 @@ impl UsageHistory {
         merged
     }
 
+    #[cfg(test)]
     fn canonical_samples(&self) -> Vec<UsageHistorySample> {
         reset_sample_groups(&self.samples)
             .into_iter()
@@ -2866,20 +2592,6 @@ impl UsageHistory {
         let cutoff = one_month_before_utc(end);
         self.samples
             .retain(|sample| sample.timestamp > cutoff && sample.timestamp <= end_timestamp);
-    }
-
-    fn save(&self) {
-        let Some(path) = &self.db_path else {
-            return;
-        };
-        if let Ok(mut store) = UsageStore::open(path) {
-            let samples = self
-                .samples
-                .iter()
-                .map(UsageHistorySample::to_store)
-                .collect::<Vec<_>>();
-            let _ = store.upsert_samples(&samples);
-        }
     }
 }
 
@@ -5490,6 +5202,9 @@ struct CodexInfoState {
     /// snapshot. Keep a failed selected endpoint latched until that same
     /// endpoint becomes healthy; never fall back to the default port.
     service_endpoint_error: Option<String>,
+    /// Last completely admitted `/v1/details` root generation. The UI never
+    /// assembles visible fields across two values of this header.
+    service_published_pair: Option<String>,
 }
 
 impl CodexInfoState {
@@ -5512,87 +5227,57 @@ impl CodexInfoState {
         self.usage_ready() || self.usage_snapshot_committed
     }
 
-    /// Build the only data shape allowed to cross into the loopback API.
-    ///
-    /// This intentionally does not include email, auth URL, local paths,
-    /// session content, or detailed backend errors. The HTTP worker cannot
-    /// access this state directly; it receives only this immutable copy.
-    fn public_snapshot(&self) -> PublicSnapshot {
-        let state = if self.error.is_some() || self.account_error.is_some() {
-            PublicState::Error
-        } else if !self.authenticated {
-            if self.checking {
-                PublicState::Initializing
-            } else {
-                PublicState::AuthRequired
-            }
-        } else if self.has_visible_usage() {
-            PublicState::Ready
-        } else {
-            PublicState::Initializing
-        };
-        let quota = self
-            .has_quota_percent
-            .then_some(())
-            .filter(|_| self.has_visible_usage())
-            .and_then(|_| self.remaining_percent.zip(self.reset_at))
-            .map(|(remaining_percent, reset_at)| PublicQuota {
-                remaining_percent: remaining_percent.clamp(0.0, 100.0),
-                reset_at,
-                window_seconds: self.window_seconds.max(1),
-                monthly: self.monthly,
-            });
-        let models = self
-            .authenticated
-            .then_some(())
-            .filter(|_| self.has_visible_usage())
-            .map(|_| {
-                self.model_usage
-                    .iter()
-                    .filter(|row| matches!(row.name.as_str(), "SOL" | "TERRA" | "LUNA"))
-                    .map(|row| PublicModelUsage {
-                        name: row.name.clone(),
-                        input_tokens: row.input_tokens.saturating_sub(row.cached_input_tokens),
-                        cached_input_tokens: row.cached_input_tokens,
-                        output_tokens: row.output_tokens,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        PublicSnapshot {
-            state,
-            observed_at: if self.authenticated && self.has_visible_usage() {
-                self.last_success_at.filter(|timestamp| *timestamp > 0)
-            } else {
-                None
-            },
-            authenticated: self.authenticated,
-            plan_label: self
-                .authenticated
-                .then(|| self.plan_label.trim())
-                .filter(|label| !label.is_empty())
-                .map(str::to_owned),
-            quota,
-            models,
-            active_thread_count: if self.authenticated && self.has_visible_usage() {
-                u64::try_from(self.active_threads.len()).unwrap_or(u64::MAX)
-            } else {
-                0
-            },
-        }
-    }
-
-    /// Build the additive read-only document consumed by the Windows client.
-    /// This is deliberately derived from the same state as `public_snapshot`
-    /// so status and details are published atomically as one generation.
+    /// Build the sole read-only document consumed by public clients in tests.
+    #[cfg(test)]
     fn public_details(&self) -> PublicDetails {
-        self.public_details_at(Utc::now().timestamp())
+        self.public_details_candidate()
+            .expect("in-process details candidate must be canonical")
     }
 
+    #[cfg(test)]
     fn public_details_at(&self, now: i64) -> PublicDetails {
-        let snapshot = self.public_snapshot();
-        let projected_history = self.projected_history();
-        let models = if self.authenticated && self.has_visible_usage() {
+        self.public_details_candidate_at(now)
+            .expect("in-process details candidate must be canonical")
+    }
+
+    fn public_details_candidate(&self) -> Result<PublicDetails, HistoryCanonicalizationError> {
+        self.public_details_candidate_at(Utc::now().timestamp())
+    }
+
+    fn public_details_candidate_at(
+        &self,
+        now: i64,
+    ) -> Result<PublicDetails, HistoryCanonicalizationError> {
+        let visible_usage = self.authenticated && self.has_visible_usage();
+        let observed_at = visible_usage
+            .then_some(())
+            .and_then(|_| self.last_success_at)
+            .filter(|timestamp| *timestamp > 0);
+        let effective_observed_at = observed_at.unwrap_or(now);
+        let history_cutoff = DateTime::<Utc>::from_timestamp(effective_observed_at, 0)
+            .map(one_month_before_utc)
+            .unwrap_or(effective_observed_at);
+        let admitted_history_samples = if visible_usage {
+            self.history
+                .samples
+                .iter()
+                .filter(|sample| {
+                    sample.is_valid()
+                        && sample.timestamp > history_cutoff
+                        && sample.timestamp <= effective_observed_at
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let projected_history = UsageHistory {
+            samples: admitted_history_samples,
+            ..UsageHistory::default()
+        };
+        let canonical_history_samples =
+            canonicalize_public_history_samples(&projected_history.samples)?;
+        let models = if visible_usage {
             self.model_usage
                 .iter()
                 .filter(|row| matches!(row.name.as_str(), "SOL" | "TERRA" | "LUNA"))
@@ -5613,14 +5298,11 @@ impl CodexInfoState {
             Vec::new()
         };
 
-        let history_cutoff = DateTime::<Utc>::from_timestamp(now, 0)
-            .map(one_month_before_utc)
-            .unwrap_or(now);
-        let history_periods = if self.authenticated && self.has_visible_usage() {
-            let observed_at = snapshot.observed_at.unwrap_or(now);
-            let periods = self.history_periods_at(observed_at);
+        let history_periods = if visible_usage {
+            let periods =
+                self.history_periods_for_history_at(&projected_history, effective_observed_at);
             let current_period_reset =
-                current_history_period_reset(&periods, self.reset_at, observed_at);
+                current_history_period_reset(&periods, self.reset_at, effective_observed_at);
             periods
                 .into_iter()
                 .map(|period| {
@@ -5641,16 +5323,17 @@ impl CodexInfoState {
             Vec::new()
         };
 
-        let mut history_samples = if self.authenticated && self.has_visible_usage() {
-            projected_history
-                .canonical_samples()
+        let mut history_samples = if visible_usage {
+            canonical_history_samples
                 .into_iter()
                 // SQLite retains three calendar months, but one REST
                 // document materializes only `(one month before now, now]`.
                 // Enforce the boundary here as well as at the store/working-
                 // set boundary so a malformed or synthetic in-memory state
                 // cannot freeze publication with old or future rows.
-                .filter(|sample| sample.timestamp > history_cutoff && sample.timestamp <= now)
+                .filter(|sample| {
+                    sample.timestamp > history_cutoff && sample.timestamp <= effective_observed_at
+                })
                 .map(|sample| PublicHistorySample {
                     timestamp: sample.timestamp,
                     reset_at: sample.reset_at,
@@ -5672,7 +5355,7 @@ impl CodexInfoState {
         // publisher validates the complete candidate and keeps the previous
         // atomic status/details generation when the public limit is exceeded.
 
-        let mut threads = if self.authenticated && self.has_visible_usage() {
+        let mut threads = if visible_usage {
             self.active_threads
                 .iter()
                 .map(ActiveThread::to_public_thread)
@@ -5682,17 +5365,49 @@ impl CodexInfoState {
         };
         // Ensure no stale unauthenticated rows survive if an auxiliary worker
         // completed just as the account state changed.
-        if !snapshot.authenticated {
+        if !self.authenticated {
             threads.clear();
         }
-        PublicDetails {
-            state: snapshot.state,
-            observed_at: snapshot.observed_at,
-            authenticated: snapshot.authenticated,
-            plan_label: snapshot.plan_label,
-            quota: snapshot.quota,
+        let state = if self.error.is_some() || self.account_error.is_some() {
+            PublicState::Error
+        } else if !self.authenticated {
+            if self.checking {
+                PublicState::Initializing
+            } else {
+                PublicState::AuthRequired
+            }
+        } else if self.has_visible_usage() {
+            PublicState::Ready
+        } else {
+            PublicState::Initializing
+        };
+        let quota = self
+            .has_quota_percent
+            .then_some(())
+            .filter(|_| visible_usage)
+            .and_then(|_| self.remaining_percent.zip(self.reset_at))
+            .map(|(remaining_percent, reset_at)| PublicQuota {
+                remaining_percent: remaining_percent.clamp(0.0, 100.0),
+                reset_at,
+                window_seconds: self.window_seconds.max(1),
+                monthly: self.monthly,
+            });
+        Ok(PublicDetails {
+            state,
+            observed_at,
+            authenticated: self.authenticated,
+            plan_label: self
+                .authenticated
+                .then(|| self.plan_label.trim())
+                .filter(|label| !label.is_empty())
+                .map(str::to_owned),
+            quota,
             models,
-            active_thread_count: snapshot.active_thread_count,
+            active_thread_count: if visible_usage {
+                u64::try_from(self.active_threads.len()).unwrap_or(u64::MAX)
+            } else {
+                0
+            },
             history_periods,
             history_samples,
             // No confirmed recorder_gap_ledger authority is connected to the
@@ -5701,7 +5416,7 @@ impl CodexInfoState {
             history_gaps: Vec::new(),
             threads,
             estimated_cost_label: self.estimated_cost_label.clone(),
-        }
+        })
     }
 
     #[allow(clippy::needless_return)]
@@ -5771,6 +5486,58 @@ impl CodexInfoState {
             recovery_period,
             recovery_requested: false,
             service_endpoint_error: None,
+            service_published_pair: None,
+        }
+    }
+
+    /// Construct the Linux UI adapter. Visible account, quota, local usage,
+    /// history, and thread fields remain empty until one strict REST details
+    /// generation replaces the root. The account bridge exists only for the
+    /// explicit authentication-start control.
+    fn service_client() -> Self {
+        Self {
+            i18n: I18n::detect(),
+            bridge: AppServerBridge::<AccountCommand, Event>::start(),
+            thread_bridge: None,
+            local_bridge: LocalUsageBridge::inactive(),
+            auth_epoch: 0,
+            email: None,
+            authenticated: false,
+            plan_label: String::new(),
+            auth_url: None,
+            remaining_percent: None,
+            has_quota_percent: false,
+            has_usage: false,
+            reset_at: None,
+            window_seconds: WEEK_SECONDS,
+            limit_name: "Codex".into(),
+            quota_title: "残り利用枠".into(),
+            monthly: false,
+            account_error: None,
+            error: None,
+            status: "常駐サービスへ接続しています…".into(),
+            checking: true,
+            last_poll: Instant::now(),
+            last_success_at: None,
+            model_usage: Vec::new(),
+            active_threads: Vec::new(),
+            estimated_cost_label: "概算 —".into(),
+            history: UsageHistory::default(),
+            selected_reset_at: None,
+            selected_history_period: "履歴なし".into(),
+            selected_metric: "ドル".into(),
+            preview: false,
+            auth_polling: false,
+            thread_checking: false,
+            thread_error: false,
+            local_usage_error: false,
+            local_usage_pending: false,
+            usage_snapshot_committed: false,
+            last_thread_poll: Instant::now(),
+            recovery_period: None,
+            recovery_requested: false,
+            service_endpoint_error: None,
+            service_published_pair: None,
         }
     }
 
@@ -5844,6 +5611,7 @@ impl CodexInfoState {
             recovery_period: None,
             recovery_requested: false,
             service_endpoint_error: None,
+            service_published_pair: None,
         };
         match kind {
             "startup-loading" => {
@@ -6180,21 +5948,162 @@ impl CodexInfoState {
         state
     }
 
-    fn request_read(&mut self, status: &str) {
-        if self.preview || self.service_endpoint_error.is_some() {
+    fn request_service_read(&mut self, status: &str) {
+        if self.preview {
             return;
-        }
-        if !self.bridge.send(AccountCommand::Read) {
-            self.bridge = AppServerBridge::<AccountCommand, Event>::start();
-            if !self.bridge.send(AccountCommand::Read) {
-                self.apply_account_error(
-                    "Codex app-serverへ更新要求を送信できませんでした。".into(),
-                );
-                return;
-            }
         }
         self.checking = true;
         self.status = status.into();
+    }
+
+    fn poll_auth_control(&mut self) {
+        while let Ok(event) = self.bridge.rx.try_recv() {
+            match event {
+                Event::AuthUrl(url) => {
+                    self.auth_url = Some(url);
+                    self.auth_polling = true;
+                    self.status =
+                        "認証URLを発行しました。「認証ページを開く」を押してください。".into();
+                }
+                Event::Error(error) => {
+                    self.auth_polling = false;
+                    self.status = error;
+                }
+                // Account/quota reads belong to the resident service. The UI
+                // control bridge must never mutate the visible root with them.
+                Event::Ready | Event::Account { .. } | Event::Usage(_) => {}
+            }
+        }
+    }
+
+    fn apply_service_details(
+        &mut self,
+        published_pair: String,
+        details: PublicDetails,
+    ) -> Result<bool, String> {
+        if !published_pair_is_fresh(self.service_published_pair.as_deref(), &published_pair)? {
+            return Ok(false);
+        }
+        if details.active_thread_count != details.threads.len() as u64 {
+            return Err("details thread count does not match rows".into());
+        }
+
+        let selected_reset_at = self.selected_reset_at;
+        let selected_period = selected_reset_at
+            .and_then(|selected| {
+                details
+                    .history_periods
+                    .iter()
+                    .find(|period| period.reset_at == selected)
+            })
+            .or_else(|| details.history_periods.iter().find(|period| period.current))
+            .or_else(|| details.history_periods.first());
+        let next_selected_reset_at = selected_period.map(|period| period.reset_at);
+        let next_selected_label = selected_period
+            .map(|period| period.label.clone())
+            .unwrap_or_else(|| self.i18n.text(TextKey::NoHistory).into());
+        let observed_at = details.observed_at;
+        let next_models = details
+            .models
+            .iter()
+            .map(|model| {
+                let input_tokens = model.input_tokens.saturating_add(model.cached_input_tokens);
+                ModelUsageRow {
+                    name: model.name.clone(),
+                    tokens: input_tokens.saturating_add(model.output_tokens),
+                    input_tokens,
+                    cached_input_tokens: model.cached_input_tokens,
+                    output_tokens: model.output_tokens,
+                }
+            })
+            .collect::<Vec<_>>();
+        let next_history = UsageHistory {
+            samples: details
+                .history_samples
+                .iter()
+                .map(|sample| UsageHistorySample {
+                    timestamp: sample.timestamp,
+                    reset_at: sample.reset_at,
+                    remaining_percent: sample.remaining_percent.unwrap_or(-1.0),
+                    sol_dollars: sample.sol_dollars,
+                    terra_dollars: sample.terra_dollars,
+                    luna_dollars: sample.luna_dollars,
+                    sol_tokens: sample.sol_tokens,
+                    terra_tokens: sample.terra_tokens,
+                    luna_tokens: sample.luna_tokens,
+                })
+                .collect(),
+            ..UsageHistory::default()
+        };
+        let next_threads = details
+            .threads
+            .iter()
+            .map(|thread| ActiveThread {
+                id: thread.id.clone(),
+                created_at: thread.created_at,
+                updated_at: thread
+                    .last_user_message_at
+                    .or(thread.created_at)
+                    .or(observed_at)
+                    .unwrap_or(1),
+                title: thread.title.clone(),
+                model: thread.model.clone(),
+                model_label: thread.model_label.clone(),
+                total_tokens: thread.total_tokens,
+                context_usage_tokens: thread.context_usage_tokens,
+                context_window_tokens: thread.context_window_tokens,
+                last_user_message_at: thread.last_user_message_at,
+                is_subagent: thread.is_subagent,
+                parent_thread_id: thread.parent_thread_id.clone(),
+                depth: thread.depth,
+            })
+            .collect::<Vec<_>>();
+
+        self.email = None;
+        self.authenticated = details.authenticated;
+        self.plan_label = details.plan_label.unwrap_or_default();
+        if self.authenticated {
+            self.auth_url = None;
+            self.auth_polling = false;
+        }
+        self.remaining_percent = details.quota.as_ref().map(|quota| quota.remaining_percent);
+        self.has_quota_percent = details.quota.is_some();
+        self.reset_at = details.quota.as_ref().map(|quota| quota.reset_at);
+        self.window_seconds = details
+            .quota
+            .as_ref()
+            .map_or(WEEK_SECONDS, |quota| quota.window_seconds);
+        self.monthly = details.quota.as_ref().is_some_and(|quota| quota.monthly);
+        self.limit_name = "Codex".into();
+        self.quota_title = if self.monthly {
+            "月間利用枠".into()
+        } else {
+            "残り利用枠".into()
+        };
+        self.has_usage = details.state == PublicState::Ready;
+        self.local_usage_pending = false;
+        self.usage_snapshot_committed = details.state == PublicState::Ready;
+        self.last_success_at = observed_at;
+        self.model_usage = next_models;
+        self.history = next_history;
+        self.active_threads = next_threads;
+        self.estimated_cost_label = details.estimated_cost_label;
+        self.selected_reset_at = next_selected_reset_at;
+        self.selected_history_period = next_selected_label;
+        self.checking = details.state == PublicState::Initializing;
+        self.account_error = (details.state == PublicState::Error)
+            .then(|| "常駐サービスが取得エラーを報告しました。".into());
+        self.error = self.account_error.clone();
+        self.status = match details.state {
+            PublicState::Initializing => "常駐サービスが利用状況を取得しています…",
+            PublicState::Ready => "利用状況を更新しました。",
+            PublicState::AuthRequired => "未認証です。認証を開始してください。",
+            PublicState::Error => "常駐サービスが利用状況を取得できませんでした。",
+        }
+        .into();
+        self.service_endpoint_error = None;
+        self.service_published_pair = Some(published_pair);
+        Ok(true)
     }
 
     fn hold_service_endpoint_error(&mut self, error: String) {
@@ -6203,21 +6112,14 @@ impl CodexInfoState {
             self.thread_checking = false;
         }
         self.service_endpoint_error = Some(error.clone());
+        if self.service_published_pair.is_some() {
+            return;
+        }
         self.checking = false;
         self.account_error = Some(error.clone());
         self.error = Some(error);
         self.status =
             "利用状況を取得できません。指定されたREST endpointへの接続を確認してください。".into();
-    }
-
-    fn clear_service_endpoint_error(&mut self) {
-        if self.service_endpoint_error.take().is_some() {
-            self.account_error = None;
-            self.error = None;
-            self.checking = true;
-            self.status = "Codex app-serverへ接続しています…".into();
-            self.last_poll = Instant::now();
-        }
     }
 
     fn advance_auth_epoch(&mut self) {
@@ -6775,10 +6677,18 @@ impl CodexInfoState {
 
     fn history_periods_at(&self, observed_at: i64) -> Vec<HistoryPeriod> {
         let projected_history = self.projected_history();
-        let mut periods = projected_history.periods(observed_at, self.reset_at);
+        self.history_periods_for_history_at(&projected_history, observed_at)
+    }
+
+    fn history_periods_for_history_at(
+        &self,
+        history: &UsageHistory,
+        observed_at: i64,
+    ) -> Vec<HistoryPeriod> {
+        let mut periods = history.periods(observed_at, self.reset_at);
         periods = apply_authoritative_current_bounds(
             periods,
-            &projected_history.samples,
+            &history.samples,
             self.reset_at,
             self.window_seconds,
             observed_at,
@@ -7763,30 +7673,6 @@ fn normal_status_text(remaining: f64, seconds: i64, last_success_at: Option<&str
     }
 }
 
-fn automatic_refresh_interval(authenticated: bool, auth_polling: bool) -> Duration {
-    if !authenticated && auth_polling {
-        Duration::from_secs(2)
-    } else {
-        Duration::from_secs(60)
-    }
-}
-
-/// Decide whether the account bridge may receive its next periodic read.
-/// Keeping this predicate independent from the timer callback makes the
-/// transient-worker-failure boundary testable: a failed worker clears
-/// `checking`, and the next bounded interval is still admitted without an
-/// immediate respawn loop.
-fn account_refresh_due(
-    now: Instant,
-    last_poll: Instant,
-    checking: bool,
-    authenticated: bool,
-    auth_polling: bool,
-) -> bool {
-    !checking
-        && now.duration_since(last_poll) >= automatic_refresh_interval(authenticated, auth_polling)
-}
-
 /// The authenticated main surface is withheld until its first complete
 /// usage generation is ready. A local-collector failure releases the spinner
 /// so the error/retry state is visible instead of looking like a hang.
@@ -7917,17 +7803,7 @@ impl CodexInfoState {
         }
         if let Some(url) = self.auth_url.clone() {
             let opened = open_validated_auth_url(&url);
-            if !opened {
-                self.apply_account_error(
-                    "認証URLを開けません。Codex CLIから認証を完了してください。".into(),
-                );
-                self.status = "認証URLを開けませんでした。".into();
-                self.auth_polling = false;
-            } else {
-                self.auth_polling = true;
-                self.request_read("認証完了を確認しています…");
-                self.last_poll = Instant::now();
-            }
+            self.continue_auth_after_page_open(opened);
         } else {
             if !self.bridge.send(AccountCommand::Login) {
                 self.bridge = AppServerBridge::<AccountCommand, Event>::start();
@@ -7942,6 +7818,20 @@ impl CodexInfoState {
             self.auth_polling = false;
             self.status = "認証URLを発行しています…".into();
         }
+    }
+
+    fn continue_auth_after_page_open(&mut self, opened: bool) {
+        if !opened {
+            self.apply_account_error(
+                "認証URLを開けません。Codex CLIから認証を完了してください。".into(),
+            );
+            self.status = "認証URLを開けませんでした。".into();
+            self.auth_polling = false;
+            return;
+        }
+        self.auth_polling = true;
+        self.request_service_read("認証完了を確認しています…");
+        self.last_poll = Instant::now();
     }
 
     fn sync_ui(&self, ui: &MainWindow) {
@@ -8572,6 +8462,286 @@ fn clamp_graph_preview_size((width, height): (u32, u32)) -> (u32, u32) {
 const DEFAULT_SERVICE_ADDRESS: &str = "127.0.0.1:8787";
 const BACKGROUND_SERVICE_START_TIMEOUT: Duration = Duration::from_secs(5);
 const BACKGROUND_CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const DETAILS_RESPONSE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const DETAILS_RESPONSE_HEADER_MAX_BYTES: usize = 8 * 1024;
+
+struct UniqueJsonValue(Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonVisitor)
+    }
+}
+
+struct UniqueJsonVisitor;
+
+impl<'de> serde::de::Visitor<'de> for UniqueJsonVisitor {
+    type Value = UniqueJsonValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(UniqueJsonValue)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        UniqueJsonValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(UniqueJsonValue(value)) = sequence.next_element()? {
+            values.push(value);
+        }
+        Ok(UniqueJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(serde::de::Error::custom("duplicate JSON object key"));
+            }
+            let UniqueJsonValue(value) = map.next_value()?;
+            values.insert(key, value);
+        }
+        Ok(UniqueJsonValue(Value::Object(values)))
+    }
+}
+
+fn decode_unique_json(bytes: &[u8]) -> Result<Value, String> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let UniqueJsonValue(value) =
+        UniqueJsonValue::deserialize(&mut deserializer).map_err(|error| error.to_string())?;
+    deserializer.end().map_err(|error| error.to_string())?;
+    Ok(value)
+}
+
+fn valid_published_pair(value: &str) -> bool {
+    value.len() == 67
+        && value.starts_with("v1:")
+        && value[3..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && value[35..].bytes().any(|byte| byte != b'0')
+}
+
+fn published_pair_is_fresh(previous: Option<&str>, candidate: &str) -> Result<bool, String> {
+    if !valid_published_pair(candidate) {
+        return Err("invalid details generation header".into());
+    }
+    let Some(previous) = previous else {
+        return Ok(true);
+    };
+    if previous == candidate {
+        return Ok(false);
+    }
+    if !valid_published_pair(previous) || previous[3..35] != candidate[3..35] {
+        return Ok(true);
+    }
+    let previous_counter =
+        u128::from_str_radix(&previous[35..], 16).map_err(|_| "invalid previous generation")?;
+    let candidate_counter =
+        u128::from_str_radix(&candidate[35..], 16).map_err(|_| "invalid candidate generation")?;
+    if candidate_counter <= previous_counter {
+        return Err("stale details generation".into());
+    }
+    Ok(true)
+}
+
+fn parse_details_document(bytes: &[u8]) -> Result<PublicDetails, String> {
+    let mut document = decode_unique_json(bytes)?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "details document is not an object".to_owned())?;
+    let expected = BTreeSet::from([
+        "active_thread_count",
+        "api_version",
+        "authenticated",
+        "estimated_cost_label",
+        "history_gaps",
+        "history_periods",
+        "history_samples",
+        "models",
+        "observed_at",
+        "plan_label",
+        "quota",
+        "state",
+        "threads",
+    ]);
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err("details document fields differ from v1".into());
+    }
+    if object
+        .remove("api_version")
+        .as_ref()
+        .and_then(Value::as_str)
+        != Some("v1")
+    {
+        return Err("details document api_version is not v1".into());
+    }
+    let details: PublicDetails =
+        serde_json::from_value(document).map_err(|error| error.to_string())?;
+    details.validate().map_err(|error| error.to_string())?;
+    if details.active_thread_count != details.threads.len() as u64 {
+        return Err("details thread count does not match rows".into());
+    }
+    let topology = details
+        .threads
+        .iter()
+        .map(|thread| ThreadTopologyNode {
+            id: thread.id.as_str(),
+            parent_thread_id: thread.parent_thread_id.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    thread_contract::validate_selected_thread_topology(&topology)
+        .map_err(|_| "details thread topology is invalid".to_owned())?;
+    if !details.authenticated
+        && (details.quota.is_some()
+            || !details.models.is_empty()
+            || details.active_thread_count != 0
+            || !details.history_periods.is_empty()
+            || !details.history_samples.is_empty()
+            || !details.history_gaps.is_empty()
+            || !details.threads.is_empty())
+    {
+        return Err("unauthenticated details contain visible account data".into());
+    }
+    if details.state == PublicState::Ready
+        && (!details.authenticated || details.observed_at.is_none())
+    {
+        return Err("ready details are incomplete".into());
+    }
+    Ok(details)
+}
+
+fn fetch_service_details(address: SocketAddr) -> Result<(String, PublicDetails), String> {
+    let timeout = Duration::from_millis(500);
+    let mut stream = TcpStream::connect_timeout(&address, timeout).map_err(|_| "connect failed")?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|_| "read timeout setup failed")?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|_| "write timeout setup failed")?;
+    let request =
+        format!("GET /v1/details HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|_| "details request failed")?;
+    let maximum = DETAILS_RESPONSE_MAX_BYTES + DETAILS_RESPONSE_HEADER_MAX_BYTES + 1;
+    let mut response = Vec::new();
+    stream
+        .take(maximum as u64)
+        .read_to_end(&mut response)
+        .map_err(|_| "details response read failed")?;
+    if response.len() >= maximum {
+        return Err("details response exceeds bounded size".into());
+    }
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "details response headers are incomplete".to_owned())?;
+    if header_end + 4 > DETAILS_RESPONSE_HEADER_MAX_BYTES {
+        return Err("details response headers are too large".into());
+    }
+    let header_bytes = &response[..header_end];
+    if header_bytes.windows(2).any(|window| window == b"\n\n") {
+        return Err("details response has invalid line endings".into());
+    }
+    let header_text =
+        std::str::from_utf8(header_bytes).map_err(|_| "details response headers are not UTF-8")?;
+    let mut lines = header_text.split("\r\n");
+    if lines.next() != Some("HTTP/1.1 200 OK") {
+        return Err("details response is not HTTP 200".into());
+    }
+    let mut pair = None;
+    let mut content_length = None;
+    let mut content_type = false;
+    let mut cache_control = false;
+    let mut connection_close = false;
+    for line in lines {
+        let (name, value) = line
+            .split_once(": ")
+            .ok_or_else(|| "details response header is malformed".to_owned())?;
+        match name {
+            "Codex-Info-Published-Pair" if pair.is_none() => pair = Some(value.to_owned()),
+            "content-type" if !content_type && value == "application/json; charset=utf-8" => {
+                content_type = true;
+            }
+            "cache-control" if !cache_control && value == "no-store" => {
+                cache_control = true;
+            }
+            "content-length" if content_length.is_none() => {
+                content_length = Some(
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| "invalid details content length")?,
+                );
+            }
+            "connection" if !connection_close && value == "close" => connection_close = true,
+            _ => return Err("unexpected or duplicate details response header".into()),
+        }
+    }
+    let pair = pair.ok_or_else(|| "missing details generation header".to_owned())?;
+    if !valid_published_pair(&pair) || !content_type || !cache_control || !connection_close {
+        return Err("details response headers failed validation".into());
+    }
+    let body = &response[header_end + 4..];
+    if body.len() > DETAILS_RESPONSE_MAX_BYTES || content_length != Some(body.len()) {
+        return Err("details response body length mismatch".into());
+    }
+    Ok((pair, parse_details_document(body)?))
+}
 
 fn cli_error(key: CliTextKey) -> String {
     I18n::detect().cli_text(key).to_owned()
@@ -8786,6 +8956,7 @@ fn ensure_background_service(config: ApiServerConfig) -> Result<(), String> {
 }
 
 fn poll_service_state(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
+    state.poll_auth_control();
     if !service_is_healthy(service_endpoint) {
         let error = state
             .service_endpoint_error
@@ -8794,29 +8965,23 @@ fn poll_service_state(state: &mut CodexInfoState, service_endpoint: SocketAddr) 
         state.hold_service_endpoint_error(error);
         return;
     }
-    state.clear_service_endpoint_error();
-    state.poll();
-    if account_refresh_due(
-        Instant::now(),
-        state.last_poll,
-        state.checking,
-        state.authenticated,
-        state.auth_polling,
-    ) {
-        let status = if state.auth_polling && !state.authenticated {
-            "認証完了を確認しています…"
-        } else {
-            "利用状況を更新しています…"
-        };
-        state.request_read(status);
-        state.last_poll = Instant::now();
-    }
-    if state.authenticated
-        && !state.thread_checking
-        && state.last_thread_poll.elapsed() >= Duration::from_secs(5)
+    match fetch_service_details(service_endpoint)
+        .and_then(|(pair, details)| state.apply_service_details(pair, details))
     {
-        state.request_thread_update();
+        Ok(_) => {
+            // A complete strict read proves that the selected endpoint has
+            // recovered even when its immutable generation is unchanged.
+            state.service_endpoint_error = None;
+            state.last_poll = Instant::now();
+        }
+        Err(error) => {
+            state.hold_service_endpoint_error(error);
+        }
     }
+}
+
+fn run_ui_service_timer_cycle(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
+    poll_service_state(state, service_endpoint);
 }
 
 async fn service_shutdown_signal() {
@@ -8839,12 +9004,43 @@ async fn service_shutdown_signal() {
     }
 }
 
+#[derive(Debug)]
+enum ResidentServiceCycleError {
+    Store(String),
+    Candidate(String),
+    Publish(codex_info::server::ApiSnapshotError),
+}
+
+fn resident_service_cycle<W, P>(
+    state: &mut CodexInfoState,
+    write_and_refresh: W,
+    publish: P,
+) -> Result<(), ResidentServiceCycleError>
+where
+    W: FnOnce(&mut CodexInfoState, Vec<usage_store::UsageHistorySample>) -> Result<(), String>,
+    P: FnOnce(PublicDetails) -> Result<(), codex_info::server::ApiSnapshotError>,
+{
+    state.poll();
+    let pending = state.history.take_pending_store_samples();
+    if let Err(error) = write_and_refresh(state, pending.clone()) {
+        state.history.restore_pending_store_samples(pending);
+        return Err(ResidentServiceCycleError::Store(error));
+    }
+    let candidate = state
+        .public_details_candidate()
+        .map_err(|error| ResidentServiceCycleError::Candidate(error.to_string()))?;
+    publish(candidate).map_err(ResidentServiceCycleError::Publish)
+}
+
 fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut recorder = daemon::RecorderWorker::start()
         .map_err(|_| std::io::Error::other(cli_error(CliTextKey::ServiceStartFailed)))?;
     if !recorder.is_active() {
         recorder.shutdown();
         return Err(std::io::Error::other(cli_error(CliTextKey::ServiceAlreadyOwned)).into());
+    }
+    if let Err(error) = recorder.startup_maintenance(Utc::now()) {
+        eprintln!("codex-info: recorder startup maintenance skipped: {error}");
     }
     // Bind REST only after this process owns the recorder. Concurrent service
     // children therefore exit before publishing a listener, and an API bind
@@ -8853,7 +9049,9 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
         .map_err(|_| std::io::Error::other(cli_error(CliTextKey::ServiceStartFailed)))?;
     let publisher = api_server.publisher();
     let mut state = CodexInfoState::new();
-    publisher.publish_details(state.public_details())?;
+    publisher.publish_details(state.public_details_candidate()?)?;
+    let mut observed_recorder_revision = recorder.committed_revision();
+    let mut last_recorder_error = None;
     let mut last_publish_error = None;
     eprintln!(
         "codex-info: daemon+REST listening on {} recorder_owner={}",
@@ -8874,14 +9072,42 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
             tokio::select! {
                 _ = &mut shutdown => break,
                 _ = ticker.tick() => {
-                    poll_service_state(&mut state, config.listen_addr());
-                    match publisher.publish_details(state.public_details()) {
+                    let result = resident_service_cycle(
+                        &mut state,
+                        |state, pending| {
+                            recorder.store_samples(pending)?;
+                            let committed_revision = recorder.committed_revision();
+                            if committed_revision != observed_recorder_revision {
+                                if !state.history.refresh_from_store(Utc::now()) {
+                                    return Err("history refresh after recorder commit failed".into());
+                                }
+                                observed_recorder_revision = committed_revision;
+                            }
+                            Ok(())
+                        },
+                        |candidate| publisher.publish_details(candidate),
+                    );
+                    match result {
                         Ok(()) => {
+                            if last_recorder_error.take().is_some() {
+                                eprintln!("codex-info: recorder state commit recovered");
+                            }
                             if last_publish_error.take().is_some() {
                                 eprintln!("codex-info: REST snapshot publication recovered");
                             }
                         }
-                        Err(error) => {
+                        Err(ResidentServiceCycleError::Store(error)) => {
+                            if last_recorder_error.as_deref() != Some(error.as_str()) {
+                                eprintln!("codex-info: recorder state commit rejected: {error}");
+                                last_recorder_error = Some(error);
+                            }
+                        }
+                        Err(ResidentServiceCycleError::Candidate(error)) => {
+                            eprintln!(
+                                "codex-info: REST snapshot canonicalization rejected: {error}"
+                            );
+                        }
+                        Err(ResidentServiceCycleError::Publish(error)) => {
                             if last_publish_error != Some(error) {
                                 eprintln!("codex-info: REST snapshot publication rejected: {error}");
                                 last_publish_error = Some(error);
@@ -8938,7 +9164,7 @@ fn run_ui(
         preview_kind
             .clone()
             .map(|kind| CodexInfoState::preview(&kind))
-            .unwrap_or_else(CodexInfoState::new),
+            .unwrap_or_else(CodexInfoState::service_client),
     ));
     if let Some(error) = initial_service_error {
         // A failed --ui service must not make the GUI disappear. Publish a
@@ -8985,11 +9211,19 @@ fn run_ui(
     }
     {
         let state = Rc::clone(&state);
-        ui.on_check_auth(move || state.borrow_mut().request_read("認証状態を確認しています…"));
+        ui.on_check_auth(move || {
+            state
+                .borrow_mut()
+                .request_service_read("認証状態を確認しています…")
+        });
     }
     {
         let state = Rc::clone(&state);
-        ui.on_retry(move || state.borrow_mut().request_read("利用状況を更新しています…"));
+        ui.on_retry(move || {
+            state
+                .borrow_mut()
+                .request_service_read("利用状況を更新しています…")
+        });
     }
     {
         let state = Rc::clone(&state);
@@ -9351,7 +9585,7 @@ fn run_ui(
         timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
             if let Some(ui) = weak_ui.upgrade() {
                 let mut state = state.borrow_mut();
-                poll_service_state(&mut state, service_config.listen_addr());
+                run_ui_service_timer_cycle(&mut state, service_config.listen_addr());
                 state.sync_ui(&ui);
                 if let Some(graph) = graph_window_for_timer.borrow().as_ref() {
                     if graph.window().is_visible() {
@@ -9389,38 +9623,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use super::daemon;
     use super::winit;
     use super::{
-        account_refresh_due, account_window_title, active_thread_model_counts,
-        active_thread_rows_at, add_recovery_usage, automatic_refresh_interval,
-        clamp_graph_preview_size, collapse_remaining_change_points, collect_session_file,
-        complete_rollout_prefix_len, current_history_period_reset, current_label_connector_path,
-        detail_window_title, fetch_active_thread_update_for_paths,
-        fetch_active_thread_update_for_paths_and_state, fixed_resize_decision,
-        fixed_resize_decision_for_scale, format_elapsed, format_estimated_cost,
-        format_model_usage_columns, format_percent, format_period_label, graph_paths,
-        graph_paths_for_selection, graph_points, graph_time_endpoints, is_service_health_response,
-        minute_model_spend, minute_model_spend_for_metric, model_usage_timeline_from_events,
-        monthly_window_seconds, native_account_window_title, native_legal_pages,
-        native_startup_loading, normal_status_text, one_month_before_utc, open_codex_session_paths,
+        account_window_title, active_thread_model_counts, active_thread_rows_at,
+        add_recovery_usage, canonicalize_public_history_samples, clamp_graph_preview_size,
+        collapse_remaining_change_points, collect_session_file, complete_rollout_prefix_len,
+        current_history_period_reset, current_label_connector_path, detail_window_title,
+        fetch_active_thread_update_for_paths, fetch_active_thread_update_for_paths_and_state,
+        fetch_service_details, fixed_resize_decision, fixed_resize_decision_for_scale,
+        format_elapsed, format_estimated_cost, format_model_usage_columns, format_percent,
+        format_period_label, graph_paths, graph_paths_for_selection, graph_points,
+        graph_time_endpoints, is_service_health_response, minute_model_spend,
+        minute_model_spend_for_metric, model_usage_timeline_from_events, monthly_window_seconds,
+        native_account_window_title, native_legal_pages, native_startup_loading,
+        normal_status_text, one_month_before_utc, open_codex_session_paths, parse_details_document,
         parse_launch_mode, parse_preview_size, parse_rate_limits, parse_resize_direction,
         period_remaining_text, physical_size_for_logical, plan_type_label, poll_service_state,
-        preview_model_row, read_recovery_entries, read_thread_rollout_path, recovery_timed_usage,
-        remaining_graph_points, remaining_graph_points_for_metric, remaining_graph_y,
-        remaining_marker_positions, remaining_marker_positions_on_points, request_with_timeout,
-        reset_transition_is_boundary, same_rollout_identity, separate_current_label_positions,
-        service_is_healthy, session_event_model, session_event_type, session_jsonl_files,
-        session_token_snapshot, smooth_model_spend, smooth_remaining_points,
-        split_metric_line_paths, stacked_area_path, terminate_and_reap_owned_child,
-        thread_presentation_rows, three_months_before_utc, unused_interval_positions,
-        visible_window_position, week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer,
-        ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow,
-        HourlyModelSpend, I18n, LaunchMode, LocalUsageResult, ManualX11Geometry,
-        ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
-        ModelUsageTotals, RpcReadEvent, SessionTraversalBudget, TokenSnapshot,
-        UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
-        DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS,
-        GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION,
+        preview_model_row, published_pair_is_fresh, read_recovery_entries,
+        read_thread_rollout_path, recovery_timed_usage, remaining_graph_points,
+        remaining_graph_points_for_metric, remaining_graph_y, remaining_marker_positions,
+        remaining_marker_positions_on_points, request_with_timeout, reset_transition_is_boundary,
+        same_rollout_identity, separate_current_label_positions, service_is_healthy,
+        session_event_model, session_event_type, session_jsonl_files, session_token_snapshot,
+        smooth_model_spend, smooth_remaining_points, split_metric_line_paths, stacked_area_path,
+        terminate_and_reap_owned_child, thread_presentation_rows, three_months_before_utc,
+        unused_interval_positions, visible_window_position, week_remaining_text, ActiveThread,
+        ActiveThreadUpdate, ApiServer, ApiServerConfig, CodexInfoState, Event, FixedResizeDecision,
+        GraphPaths, GraphWindow, HourlyModelSpend, I18n, LaunchMode, LocalUsageResult,
+        ManualX11Geometry, ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals,
+        ModelUsageRow, ModelUsageTotals, PublicDetails, RpcReadEvent, SessionTraversalBudget,
+        TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample,
+        UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH,
+        GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION,
         THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
     use serde::Deserialize;
@@ -9432,14 +9667,10 @@ mod tests {
         expected_period_end: i64,
         expected_reset_at: i64,
         expected_raw_timestamps: Vec<i64>,
-        #[serde(default)]
-        expected_retained_timestamps: Vec<i64>,
         expected_graph_timestamps: Vec<i64>,
         expected_remaining: Vec<f64>,
         expected_sol_max: f64,
         expected_period_count: usize,
-        #[serde(default)]
-        moving_full_acquisition_samples: Vec<GraphFixtureHistorySample>,
         details_response: GraphFixtureDetailsResponse,
     }
 
@@ -9493,6 +9724,37 @@ mod tests {
         sol_tokens: u64,
         terra_tokens: u64,
         luna_tokens: u64,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WeeklyRolloverFixture {
+        endpoint: String,
+        expected_reset_at: i64,
+        storage_samples_a: Vec<GraphFixtureHistorySample>,
+        storage_samples_b: Vec<GraphFixtureHistorySample>,
+        generations: Vec<WeeklyRolloverGeneration>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WeeklyRolloverGeneration {
+        name: String,
+        details_response: Value,
+    }
+
+    impl WeeklyRolloverFixture {
+        fn generation(&self, name: &str) -> PublicDetails {
+            let value = self
+                .generations
+                .iter()
+                .find(|generation| generation.name == name)
+                .unwrap_or_else(|| panic!("missing fixture generation {name}"))
+                .details_response
+                .clone();
+            parse_details_document(&serde_json::to_vec(&value).unwrap())
+                .expect("strict fixture details")
+        }
     }
 
     impl GraphFixtureHistorySample {
@@ -9727,6 +9989,14 @@ mod tests {
             ApiServer::start(ApiServerConfig::new(endpoint).unwrap()).expect("selected endpoint");
         poll_service_state(&mut state, endpoint);
         assert!(state.service_endpoint_error.is_none());
+        let admitted_pair = state.service_published_pair.clone();
+        let admitted_details = state.public_details();
+
+        state.service_endpoint_error = Some("same endpoint failed once".into());
+        poll_service_state(&mut state, endpoint);
+        assert!(state.service_endpoint_error.is_none());
+        assert_eq!(state.service_published_pair, admitted_pair);
+        assert_eq!(state.public_details(), admitted_details);
         server.shutdown();
     }
 
@@ -9769,7 +10039,7 @@ mod tests {
     #[test]
     fn public_snapshot_is_whitelisted_and_tracks_auth_state() {
         let normal = CodexInfoState::preview("normal");
-        let snapshot = normal.public_snapshot();
+        let snapshot = normal.public_details();
         assert_eq!(snapshot.state, PublicState::Ready);
         assert!(snapshot.authenticated);
         assert_eq!(snapshot.plan_label.as_deref(), Some("Pro"));
@@ -9803,7 +10073,7 @@ mod tests {
         assert!(details_json.get("auth_url").is_none());
         assert!(details_json.get("session_path").is_none());
 
-        let auth = CodexInfoState::preview("auth").public_snapshot();
+        let auth = CodexInfoState::preview("auth").public_details();
         assert_eq!(auth.state, PublicState::AuthRequired);
         assert!(!auth.authenticated);
         assert!(auth.plan_label.is_none());
@@ -9812,7 +10082,7 @@ mod tests {
         assert!(auth.models.is_empty());
         assert_eq!(auth.active_thread_count, 0);
 
-        let initializing = CodexInfoState::preview("initializing").public_snapshot();
+        let initializing = CodexInfoState::preview("initializing").public_details();
         assert_eq!(initializing.state, PublicState::Initializing);
         assert!(!initializing.authenticated);
         assert!(initializing.plan_label.is_none());
@@ -9831,14 +10101,56 @@ mod tests {
             startup.account_error.is_some(),
             startup.error.is_some(),
         ));
-        assert_eq!(startup.public_snapshot().state, PublicState::Initializing);
-        assert!(startup.public_snapshot().models.is_empty());
-        assert!(startup.public_snapshot().quota.is_none());
+        assert_eq!(startup.public_details().state, PublicState::Initializing);
+        assert!(startup.public_details().models.is_empty());
+        assert!(startup.public_details().quota.is_none());
         assert!(startup.public_details().history_samples.is_empty());
 
-        let unlimited = CodexInfoState::preview("unlimited").public_snapshot();
+        let unlimited = CodexInfoState::preview("unlimited").public_details();
         assert_eq!(unlimited.state, PublicState::Ready);
         assert!(unlimited.quota.is_none());
+    }
+
+    #[test]
+    fn public_history_uses_one_effective_observed_time_for_admission_and_period_end() {
+        const OBSERVED_AT: i64 = 1_800_000_000;
+        const RESET_AT: i64 = OBSERVED_AT + 3_600;
+        let mut state = CodexInfoState::preview("normal");
+        state.last_success_at = Some(OBSERVED_AT);
+        state.reset_at = Some(RESET_AT);
+        state.window_seconds = 3_600;
+        state.history = UsageHistory {
+            samples: vec![
+                UsageHistorySample::new(OBSERVED_AT, RESET_AT, 50.0, ModelDollarTotals::default()),
+                UsageHistorySample::new(
+                    OBSERVED_AT + 60,
+                    RESET_AT,
+                    49.0,
+                    ModelDollarTotals::default(),
+                ),
+            ],
+            ..UsageHistory::default()
+        };
+
+        let details = state
+            .public_details_candidate_at(OBSERVED_AT + 600)
+            .unwrap();
+
+        assert_eq!(details.observed_at, Some(OBSERVED_AT));
+        assert_eq!(
+            details
+                .history_samples
+                .iter()
+                .map(|sample| sample.timestamp)
+                .collect::<Vec<_>>(),
+            [OBSERVED_AT]
+        );
+        assert!(details
+            .history_periods
+            .iter()
+            .filter(|period| period.current)
+            .all(|period| period.end_at == OBSERVED_AT));
+        details.validate().unwrap();
     }
 
     #[test]
@@ -9895,7 +10207,6 @@ mod tests {
         let publisher = server.publisher();
         publisher.publish_details(known_good).unwrap();
         let before_pair = publisher.published_pair();
-        let before_status = raw_loopback_get(server.local_addr(), "/v1/status");
         let before_details = raw_loopback_get(server.local_addr(), "/v1/details");
 
         assert_eq!(
@@ -9903,10 +10214,6 @@ mod tests {
             Err(ApiSnapshotError::ListTooLong)
         );
         assert_eq!(publisher.published_pair(), before_pair);
-        assert_eq!(
-            raw_loopback_get(server.local_addr(), "/v1/status"),
-            before_status
-        );
         assert_eq!(
             raw_loopback_get(server.local_addr(), "/v1/details"),
             before_details
@@ -9943,16 +10250,9 @@ mod tests {
         state.apply_usage_event(usage_event(Some(37.0), reset_at));
         publisher.publish_details(state.public_details()).unwrap();
 
-        let status = raw_loopback_get(server.local_addr(), "/v1/status");
         let details = raw_loopback_get(server.local_addr(), "/v1/details");
-        assert_eq!(raw_loopback_pair(&status), raw_loopback_pair(&details));
         assert_ne!(publisher.published_pair(), before_pair);
-        assert_eq!(raw_loopback_body(&status)["state"], "error");
         assert_eq!(raw_loopback_body(&details)["state"], "error");
-        assert_eq!(
-            raw_loopback_body(&status)["quota"]["remaining_percent"],
-            37.0
-        );
         assert_eq!(
             raw_loopback_body(&details)["quota"]["remaining_percent"],
             37.0
@@ -9962,10 +10262,9 @@ mod tests {
 
         state.apply_usage_event(usage_event(Some(29.0), reset_at));
         publisher.publish_details(state.public_details()).unwrap();
-        assert_eq!(raw_loopback_body(&status)["state"], "error");
-        let advanced_status = raw_loopback_get(server.local_addr(), "/v1/status");
+        let advanced_details = raw_loopback_get(server.local_addr(), "/v1/details");
         assert_eq!(
-            raw_loopback_body(&advanced_status)["quota"]["remaining_percent"],
+            raw_loopback_body(&advanced_details)["quota"]["remaining_percent"],
             29.0
         );
 
@@ -9995,30 +10294,39 @@ mod tests {
         let now = Utc::now();
         let now_timestamp = now.timestamp();
         let cutoff = one_month_before_utc(now);
+        let cutoff_minute = cutoff.div_euclid(60) * 60;
+        let now_minute = now_timestamp.div_euclid(60) * 60;
         let reset_at = now_timestamp + WEEK_SECONDS;
-        state.history.samples = [cutoff, cutoff + 1, now_timestamp, now_timestamp + 60]
-            .into_iter()
-            .map(|timestamp| UsageHistorySample {
-                timestamp,
-                reset_at,
-                remaining_percent: 80.0,
-                sol_dollars: 0.0,
-                terra_dollars: 0.0,
-                luna_dollars: 0.0,
-                sol_tokens: 0,
-                terra_tokens: 0,
-                luna_tokens: 0,
-            })
-            .collect();
+        state.last_success_at = Some(now_timestamp);
+        state.history.samples = [
+            cutoff_minute,
+            cutoff_minute + 60,
+            now_minute,
+            now_minute + 60,
+        ]
+        .into_iter()
+        .map(|timestamp| UsageHistorySample {
+            timestamp,
+            reset_at,
+            remaining_percent: 80.0,
+            sol_dollars: 0.0,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 0,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        })
+        .collect();
 
         let timestamps = state
-            .public_details()
+            .public_details_candidate_at(now_timestamp)
+            .unwrap()
             .history_samples
             .into_iter()
             .map(|sample| sample.timestamp)
             .collect::<Vec<_>>();
 
-        assert_eq!(timestamps, vec![cutoff + 1, now_timestamp]);
+        assert_eq!(timestamps, vec![cutoff_minute + 60, now_minute]);
     }
 
     #[test]
@@ -10029,7 +10337,7 @@ mod tests {
         state.reset_at = Some(reset_at);
         state.last_success_at = Some(now - 120);
         state.history.samples = vec![UsageHistorySample::new(
-            now - 60,
+            now - 120,
             reset_at,
             80.0,
             ModelDollarTotals::default(),
@@ -10411,7 +10719,7 @@ mod tests {
         assert!(state.thread_error);
         assert_eq!(state.active_threads, previous);
         assert_eq!(
-            state.public_snapshot().active_thread_count,
+            state.public_details().active_thread_count,
             previous.len() as u64
         );
         assert_eq!(state.public_details().threads.len(), previous.len());
@@ -10485,7 +10793,7 @@ mod tests {
             state.local_usage_pending = true;
             state.usage_snapshot_committed = true;
 
-            let snapshot = state.public_snapshot();
+            let snapshot = state.public_details();
             assert_eq!(snapshot.state, PublicState::Ready);
             assert_eq!(snapshot.models.len(), previous_models.len());
             assert_eq!(snapshot.active_thread_count as usize, previous_threads);
@@ -10607,7 +10915,7 @@ mod tests {
         });
         assert_eq!(state.history.samples.len(), 1);
         assert!(state.model_usage.is_empty());
-        assert!(!state.public_snapshot().authenticated);
+        assert!(!state.public_details().authenticated);
         assert!(state.public_details().history_samples.is_empty());
         let _ = fs::remove_file(db_path);
     }
@@ -10626,6 +10934,7 @@ mod tests {
         state.history = UsageHistory {
             db_path: Some(db_path.clone()),
             samples: Vec::new(),
+            pending_store_samples: Vec::new(),
             startup_maintenance_done: true,
         };
 
@@ -10648,57 +10957,90 @@ mod tests {
     }
 
     #[test]
-    fn quota_event_is_pure_and_account_read_branch_has_no_thread_or_local_calls() {
-        let source = include_str!("main.rs");
-        let usage_definition = source
-            .split_once("struct UsageEvent {")
-            .and_then(|(_, rest)| rest.split_once("}\n\nenum Event"))
-            .map(|(body, _)| body)
-            .expect("UsageEvent definition must remain explicit");
-        assert!(!usage_definition.contains("ActiveThread"));
-        assert!(!usage_definition.contains("ModelUsage"));
-        assert!(!usage_definition.contains("model_cost"));
+    fn authentication_controls_send_only_one_login_command() {
+        let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
+        state.auth_url = None;
+        let (command_tx, commands) = std::sync::mpsc::channel();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        state.bridge = super::AppServerBridge {
+            tx: command_tx,
+            rx: event_rx,
+        };
 
-        let account_worker = source
-            .split_once("fn account_server_worker")
-            .and_then(|(_, rest)| rest.split_once("fn start_app_server"))
-            .map(|(body, _)| body)
-            .expect("account worker boundary must remain explicit");
-        assert!(!account_worker.contains("fetch_active_thread_update"));
-        assert!(!account_worker.contains("collect_local_model_usage"));
-        assert!(!account_worker.contains("LocalCommand"));
+        state.open_auth();
+        state.continue_auth_after_page_open(true);
+        state.request_service_read("認証状態を確認しています…");
+        state.request_service_read("利用状況を更新しています…");
+        state.continue_auth_after_page_open(false);
 
-        let thread_worker = source
-            .split_once("fn thread_server_worker")
-            .and_then(|(_, rest)| rest.split_once("fn local_usage_worker"))
-            .map(|(body, _)| body)
-            .expect("thread worker boundary must remain explicit");
-        assert!(thread_worker.contains("server.take()"));
-        assert!(thread_worker.contains("kill_and_reap()"));
-        assert!(thread_worker.contains("next_id = 2"));
+        assert_eq!(
+            commands.try_iter().collect::<Vec<_>>(),
+            [super::AccountCommand::Login]
+        );
     }
 
     #[test]
-    fn periodic_ui_timer_only_polls_account_and_threads_not_session_files() {
-        let source = include_str!("main.rs");
-        let timer = source
-            .split_once("let timer = Timer::default();")
-            .and_then(|(_, rest)| rest.split_once("    ui.run()?;"))
-            .map(|(body, _)| body)
-            .expect("account timer boundary must remain explicit");
-        assert!(!timer.contains("collect_local_model_usage"));
-        assert!(!timer.contains("session_jsonl_files"));
-        assert!(timer.contains("poll_service_state"));
+    fn periodic_ui_timer_consumes_only_single_details_root() {
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        let expected_pair = server.publisher().published_pair().unwrap();
+        let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
+        state.service_published_pair = None;
+        state.service_endpoint_error = Some("transient endpoint failure".into());
+        let (command_tx, commands) = std::sync::mpsc::channel();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        state.bridge = super::AppServerBridge {
+            tx: command_tx,
+            rx: event_rx,
+        };
 
-        let poll = source
-            .split_once("fn poll_service_state")
-            .and_then(|(_, rest)| rest.split_once("async fn service_shutdown_signal"))
-            .map(|(body, _)| body)
-            .expect("shared poll boundary must remain explicit");
-        assert!(!poll.contains("collect_local_model_usage"));
-        assert!(!poll.contains("session_jsonl_files"));
-        assert!(poll.contains("request_thread_update"));
-        assert!(poll.contains("account_refresh_due"));
+        super::run_ui_service_timer_cycle(&mut state, server.local_addr());
+
+        assert_eq!(
+            state.service_published_pair.as_deref(),
+            Some(expected_pair.as_str())
+        );
+        assert!(state.service_endpoint_error.is_none());
+        assert!(commands.try_iter().next().is_none());
+        server.shutdown();
+    }
+
+    #[test]
+    fn resident_service_collects_commits_and_publishes_one_details_generation() {
+        let mut state = CodexInfoState::preview("normal");
+        state.history.pending_store_samples = vec![state.history.samples[0].to_store()];
+        let actions = std::cell::RefCell::new(Vec::new());
+        super::resident_service_cycle(
+            &mut state,
+            |_, pending| {
+                assert!(!pending.is_empty());
+                actions.borrow_mut().push("write");
+                Ok(())
+            },
+            |details| {
+                details.validate().unwrap();
+                actions.borrow_mut().push("publish");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*actions.borrow(), ["write", "publish"]);
+
+        let retained = state.history.samples[0].to_store();
+        state.history.pending_store_samples = vec![retained.clone()];
+        let result = super::resident_service_cycle(
+            &mut state,
+            |_, _| Err("write rejected".into()),
+            |_| panic!("a rejected write must not publish"),
+        );
+        assert!(matches!(
+            result,
+            Err(super::ResidentServiceCycleError::Store(_))
+        ));
+        assert_eq!(state.history.pending_store_samples, [retained]);
     }
 
     #[test]
@@ -10860,7 +11202,7 @@ mod tests {
         // A quota response alone is not a graph-ready snapshot.  The REST
         // pair and native view must remain loading until local usage commits.
         state.local_usage_pending = true;
-        let pending = state.public_snapshot();
+        let pending = state.public_details();
         assert_eq!(pending.state, PublicState::Initializing);
         assert!(pending.models.is_empty());
         assert_eq!(pending.active_thread_count, 0);
@@ -10888,7 +11230,7 @@ mod tests {
             .iter()
             .any(|sample| sample.remaining_percent == 23.0));
         assert!(!state.local_usage_pending);
-        assert_eq!(state.public_snapshot().state, PublicState::Ready);
+        assert_eq!(state.public_details().state, PublicState::Ready);
         assert!(!state.local_usage_error);
     }
 
@@ -11005,6 +11347,7 @@ mod tests {
                     luna: 0.75,
                 },
             )],
+            pending_store_samples: Vec::new(),
             startup_maintenance_done: true,
         };
 
@@ -11147,7 +11490,7 @@ mod tests {
             state.account_error.is_some(),
             state.error.is_some(),
         ));
-        assert_eq!(state.public_snapshot().state, PublicState::Error);
+        assert_eq!(state.public_details().state, PublicState::Error);
     }
 
     #[test]
@@ -12252,17 +12595,12 @@ mod tests {
             .publish_details(known_good_state.public_details())
             .unwrap();
         let before_pair = publisher.published_pair();
-        let before_status = raw_loopback_get(server.local_addr(), "/v1/status");
         let before_details = raw_loopback_get(server.local_addr(), "/v1/details");
         assert_eq!(
             publisher.publish_details(candidate),
             Err(ApiSnapshotError::InvalidThread)
         );
         assert_eq!(publisher.published_pair(), before_pair);
-        assert_eq!(
-            raw_loopback_get(server.local_addr(), "/v1/status"),
-            before_status
-        );
         assert_eq!(
             raw_loopback_get(server.local_addr(), "/v1/details"),
             before_details
@@ -12946,53 +13284,6 @@ mod tests {
         assert_eq!(parse_preview_size(Some("700x480x1")), None);
         assert_eq!(parse_preview_size(Some("not-a-size")), None);
         assert_eq!(parse_preview_size(None), None);
-    }
-
-    #[test]
-    fn login_confirmation_poll_is_fast_only_while_authentication_is_pending() {
-        assert_eq!(
-            automatic_refresh_interval(false, true),
-            Duration::from_secs(2)
-        );
-        assert_eq!(
-            automatic_refresh_interval(false, false),
-            Duration::from_secs(60)
-        );
-        assert_eq!(
-            automatic_refresh_interval(true, true),
-            Duration::from_secs(60)
-        );
-    }
-
-    #[test]
-    fn transient_account_worker_failure_still_admits_the_next_periodic_read() {
-        let mut state = CodexInfoState::preview("normal");
-        state.checking = true;
-        state.authenticated = true;
-        state.last_poll = Instant::now() - Duration::from_secs(61);
-
-        // A failed worker is a publication error, not a permanent polling
-        // disable. It clears the in-flight marker while retaining last-good
-        // quota/history state.
-        state.apply_account_error("transient worker failure".into());
-        assert!(!state.checking);
-        assert!(account_refresh_due(
-            Instant::now(),
-            state.last_poll,
-            state.checking,
-            state.authenticated,
-            state.auth_polling,
-        ));
-
-        // The timer owns one read at a time; once a read is in flight it must
-        // not schedule a second request until the worker reports or fails.
-        assert!(!account_refresh_due(
-            Instant::now(),
-            state.last_poll,
-            true,
-            state.authenticated,
-            state.auth_polling,
-        ));
     }
 
     #[test]
@@ -14342,12 +14633,12 @@ mod tests {
     }
 
     #[test]
-    fn reset_at_jitter_is_one_period_and_duplicate_timestamps_merge_for_display() {
+    fn reset_at_jitter_keeps_raw_aliases_and_canonicalizes_one_dominant_row() {
         let mut history = UsageHistory::default();
         let first = UsageHistorySample::new(
             1_700_000_001,
             1_700_100_000,
-            80.0,
+            75.0,
             ModelDollarTotals {
                 sol: 1.0,
                 terra: 2.0,
@@ -14368,16 +14659,18 @@ mod tests {
         history.record(first);
         history.record(jittered);
 
-        assert_eq!(history.samples.len(), 1);
-        assert_eq!(history.samples[0].reset_at, 1_700_100_000);
-        assert_eq!(history.samples[0].remaining_percent, 75.0);
-        assert_eq!(history.samples_for_reset(Some(1_700_100_003)).len(), 1);
+        assert_eq!(history.samples.len(), 2);
+        let canonical = canonicalize_public_history_samples(&history.samples).unwrap();
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].reset_at, 1_700_100_003);
+        assert_eq!(canonical[0].remaining_percent, 75.0);
+        assert_eq!(canonical[0].sol_dollars, 4.0);
 
         history.samples = vec![
             UsageHistorySample::new(
                 1_700_000_000,
                 1_700_100_000,
-                80.0,
+                75.0,
                 ModelDollarTotals {
                     sol: 1.0,
                     terra: 2.0,
@@ -14395,10 +14688,8 @@ mod tests {
                 },
             ),
         ];
-        let displayed = history.samples_for_reset(Some(1_700_100_000));
+        let displayed = canonicalize_public_history_samples(&history.samples).unwrap();
         assert_eq!(displayed.len(), 1);
-        // A sixty-second jitter group uses its greatest observed reset time as
-        // the stable period identifier.
         assert_eq!(displayed[0].reset_at, 1_700_100_003);
         assert_eq!(displayed[0].remaining_percent, 75.0);
         assert_eq!(displayed[0].sol_dollars, 4.0);
@@ -14431,10 +14722,14 @@ mod tests {
 
         history.apply_backfill_samples(1_003, vec![backfill]);
 
-        assert_eq!(history.samples.len(), 1);
-        assert_eq!(history.samples[0].remaining_percent, 42.0);
-        assert_eq!(history.samples[0].sol_dollars, 9.0);
-        assert_eq!(history.samples[0].reset_at, 1_000);
+        assert_eq!(history.samples.len(), 2);
+        let canonical = canonicalize_public_history_samples(&history.samples).unwrap();
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].remaining_percent, 42.0);
+        assert_eq!(canonical[0].sol_dollars, 9.0);
+        assert_eq!(canonical[0].terra_dollars, 8.0);
+        assert_eq!(canonical[0].luna_dollars, 7.0);
+        assert_eq!(canonical[0].reset_at, 1_003);
     }
 
     #[test]
@@ -14555,12 +14850,16 @@ mod tests {
             .samples
             .iter()
             .filter(|sample| sample.timestamp == timestamp)
-            .all(|sample| sample.remaining_percent < 0.0));
+            .any(|sample| (sample.remaining_percent - 88.0).abs() < f64::EPSILON));
         assert!(history
-            .canonical_samples()
+            .samples
             .iter()
             .filter(|sample| sample.timestamp == timestamp)
-            .all(|sample| sample.remaining_percent < 0.0));
+            .any(|sample| (sample.remaining_percent - 14.0).abs() < f64::EPSILON));
+        assert_eq!(
+            canonicalize_public_history_samples(&history.samples),
+            Err(super::HistoryCanonicalizationError::ConflictingQuota)
+        );
         let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
 
@@ -14604,6 +14903,7 @@ mod tests {
             .unwrap();
         drop(store);
 
+        daemon::maintain_history_database_for_test(&db_path, now).unwrap();
         let mut history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), now);
         history.startup_maintenance(now);
 
@@ -14652,6 +14952,7 @@ mod tests {
                 sample(now.timestamp()),
                 sample(now.timestamp() + 1),
             ],
+            pending_store_samples: Vec::new(),
             startup_maintenance_done: false,
         };
 
@@ -14840,6 +15141,7 @@ mod tests {
             .unwrap();
         drop(store);
 
+        daemon::maintain_history_database_for_test(&db_path, now).unwrap();
         let mut history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), now);
         history.startup_maintenance(now);
         assert_eq!(
@@ -15218,9 +15520,9 @@ mod tests {
 
     #[test]
     fn ambiguous_missing_quota_row_at_a_spend_timestamp_is_not_a_period() {
-        // A legacy quota-only row at the same minute as a model snapshot can
-        // be invalidated to remaining=-1 during startup. It must not survive
-        // as a separate zero-usage history period.
+        // Raw inventory is shape-neutral. A same-minute row assigned to a
+        // different cycle makes the complete public candidate ambiguous, so
+        // it cannot become a published history period.
         let timestamp = 1_787_350_620;
         let spend_reset = 1_787_835_664;
         let ambiguous_reset = 1_787_919_479;
@@ -15251,8 +15553,12 @@ mod tests {
             ..UsageHistory::default()
         };
 
-        assert_eq!(history.periods(timestamp + 60, None).len(), 1);
-        assert!(history.samples_for_reset(Some(ambiguous_reset)).is_empty());
+        assert_eq!(history.samples.len(), 2);
+        assert_eq!(history.periods(timestamp + 60, None).len(), 2);
+        assert_eq!(
+            canonicalize_public_history_samples(&history.samples),
+            Err(super::HistoryCanonicalizationError::MultipleCyclesInMinute)
+        );
     }
 
     #[test]
@@ -15592,82 +15898,332 @@ mod tests {
     }
 
     #[test]
-    fn weekly_reset_rollover_projects_one_current_cycle_without_mixing() {
-        let fixture: GraphFixture = serde_json::from_str(include_str!(
+    fn history_canonicalizer_uses_one_existing_dominant_vector_with_nullable_aliases() {
+        let timestamp = 1_788_040_140;
+        let reset = 1_788_644_950;
+        let rows = vec![
+            UsageHistorySample {
+                timestamp,
+                reset_at: reset - 21,
+                remaining_percent: -1.0,
+                sol_dollars: 2.0,
+                terra_dollars: 3.0,
+                luna_dollars: 4.0,
+                sol_tokens: 20,
+                terra_tokens: 30,
+                luna_tokens: 40,
+            },
+            UsageHistorySample {
+                timestamp: timestamp + 10,
+                reset_at: reset - 1,
+                remaining_percent: 41.0,
+                sol_dollars: 9.0,
+                terra_dollars: 8.0,
+                luna_dollars: 7.0,
+                sol_tokens: 90,
+                terra_tokens: 80,
+                luna_tokens: 70,
+            },
+            UsageHistorySample {
+                timestamp: timestamp + 19,
+                reset_at: reset,
+                remaining_percent: -1.0,
+                sol_dollars: 9.0,
+                terra_dollars: 8.0,
+                luna_dollars: 7.0,
+                sol_tokens: 90,
+                terra_tokens: 80,
+                luna_tokens: 70,
+            },
+        ];
+        let canonical = canonicalize_public_history_samples(&rows).unwrap();
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].reset_at, reset);
+        assert_eq!(canonical[0].remaining_percent, 41.0);
+        assert_eq!(canonical[0].sol_dollars, 9.0);
+        assert_eq!(canonical[0].terra_dollars, 8.0);
+        assert_eq!(canonical[0].luna_dollars, 7.0);
+
+        let duplicated = [rows.clone(), rows.clone()].concat();
+        assert_eq!(
+            canonicalize_public_history_samples(&duplicated).unwrap(),
+            canonical
+        );
+    }
+
+    #[test]
+    fn history_canonicalizer_rejects_conflict_noncomparable_and_cross_partition_minutes() {
+        let base = UsageHistorySample {
+            timestamp: 1_788_040_140,
+            reset_at: 1_788_644_929,
+            remaining_percent: 41.0,
+            sol_dollars: 9.0,
+            terra_dollars: 1.0,
+            luna_dollars: 0.0,
+            sol_tokens: 90,
+            terra_tokens: 10,
+            luna_tokens: 0,
+        };
+        let mut quota_conflict = base.clone();
+        quota_conflict.reset_at += 20;
+        quota_conflict.remaining_percent = 40.0;
+        assert_eq!(
+            canonicalize_public_history_samples(&[base.clone(), quota_conflict]),
+            Err(super::HistoryCanonicalizationError::ConflictingQuota)
+        );
+
+        let mut noncomparable = base.clone();
+        noncomparable.reset_at += 20;
+        noncomparable.sol_dollars = 10.0;
+        noncomparable.terra_dollars = 0.0;
+        noncomparable.sol_tokens = 100;
+        noncomparable.terra_tokens = 0;
+        assert_eq!(
+            canonicalize_public_history_samples(&[base.clone(), noncomparable]),
+            Err(super::HistoryCanonicalizationError::NonComparableCumulativeUsage)
+        );
+
+        let mut other_partition = base.clone();
+        other_partition.timestamp += 19;
+        other_partition.reset_at += 10_000;
+        assert_eq!(
+            canonicalize_public_history_samples(&[base.clone(), other_partition]),
+            Err(super::HistoryCanonicalizationError::MultipleCyclesInMinute)
+        );
+
+        let mut true_reset = base.clone();
+        true_reset.timestamp += 60;
+        true_reset.reset_at += WEEK_SECONDS;
+        true_reset.remaining_percent = 100.0;
+        let distinct_cycles = canonicalize_public_history_samples(&[base, true_reset]).unwrap();
+        assert_eq!(distinct_cycles.len(), 2);
+        assert_ne!(distinct_cycles[0].reset_at, distinct_cycles[1].reset_at);
+    }
+
+    #[test]
+    fn history_canonicalizer_keeps_same_cycle_minutes_and_raw_sqlite_rows() {
+        let db_path = test_history_path("canonicalizer-raw-preservation");
+        let timestamp = 1_788_040_140;
+        let reset = 1_788_644_929;
+        let rows = (0..3)
+            .map(|index| UsageHistorySample {
+                timestamp: timestamp + index * 60,
+                reset_at: reset + index * 60,
+                remaining_percent: 100.0 - index as f64,
+                sol_dollars: index as f64,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: index as u64,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut store = UsageStore::open(&db_path).unwrap();
+        store
+            .upsert_samples(
+                &rows
+                    .iter()
+                    .map(UsageHistorySample::to_store)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let before = store.load_all().unwrap();
+        drop(store);
+
+        let canonical = canonicalize_public_history_samples(&rows).unwrap();
+        assert_eq!(canonical.len(), 3);
+        assert!(canonical
+            .iter()
+            .all(|sample| sample.reset_at == reset + 120));
+        assert_eq!(
+            UsageStore::open(&db_path).unwrap().load_all().unwrap(),
+            before
+        );
+        let _ = fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    #[test]
+    fn single_details_root_strict_validation_rejects_partial_and_stale_generations() {
+        let fixture: WeeklyRolloverFixture = serde_json::from_str(include_str!(
             "../tests/fixtures/graph_weekly_reset_rollover.json"
         ))
         .expect("valid weekly reset rollover fixture");
-        let mut state = state_from_graph_fixture(&fixture);
-        state.history.samples.extend(
-            fixture
-                .moving_full_acquisition_samples
-                .iter()
-                .map(GraphFixtureHistorySample::to_usage_history_sample),
-        );
-        state.history.normalize();
-        let raw_before_projection = state.history.samples.clone();
-        assert_eq!(
-            raw_before_projection
-                .iter()
-                .map(|sample| sample.timestamp)
-                .collect::<Vec<_>>(),
-            fixture.expected_retained_timestamps
-        );
+        let document = fixture.generations[0].details_response.clone();
+        let encoded = serde_json::to_vec(&document).unwrap();
+        assert!(parse_details_document(&encoded).is_ok());
 
-        state.select_latest_history();
-        let observed_at = fixture.details_response.observed_at;
-        let graph = state.graph_paths_for_selection_at(observed_at, true, true, true, false);
-        assert_eq!(graph.current_sol_label, "$0.20");
+        let encoded_text = std::str::from_utf8(&encoded).unwrap();
+        let duplicate = format!("{{\"state\":\"ready\",{}", &encoded_text[1..]);
+        assert!(parse_details_document(duplicate.as_bytes()).is_err());
 
-        let details = state.public_details_at(observed_at);
-        assert_eq!(details.history_periods.len(), fixture.expected_period_count);
-        let current_periods = details
-            .history_periods
-            .iter()
-            .filter(|period| period.current)
-            .collect::<Vec<_>>();
-        assert_eq!(current_periods.len(), 1);
-        assert_eq!(current_periods[0].reset_at, fixture.expected_reset_at);
-        assert_eq!(current_periods[0].start_at, fixture.expected_period_start);
-        assert_eq!(
-            details.quota.as_ref().map(|quota| quota.reset_at),
-            Some(fixture.expected_reset_at)
-        );
-        assert_eq!(
-            details
-                .history_samples
+        let mut unknown = document.clone();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("partial_quota".into(), Value::Bool(true));
+        assert!(parse_details_document(&serde_json::to_vec(&unknown).unwrap()).is_err());
+
+        let mut partial = document;
+        partial["threads"] = Value::Array(Vec::new());
+        assert!(parse_details_document(&serde_json::to_vec(&partial).unwrap()).is_err());
+
+        let pair = |epoch: u128, counter: u128| format!("v1:{epoch:032x}{counter:032x}");
+        let current = pair(1, 2);
+        assert!(!published_pair_is_fresh(Some(&current), &current).unwrap());
+        assert!(published_pair_is_fresh(Some(&current), &pair(1, 1)).is_err());
+        assert!(published_pair_is_fresh(Some(&current), &pair(1, 3)).unwrap());
+        assert!(published_pair_is_fresh(Some(&current), &pair(2, 1)).unwrap());
+        assert!(published_pair_is_fresh(None, "v1:ABC").is_err());
+    }
+
+    #[test]
+    fn weekly_reset_rollover_projects_one_current_cycle_without_mixing() {
+        let fixture: WeeklyRolloverFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/graph_weekly_reset_rollover.json"
+        ))
+        .expect("valid weekly reset rollover fixture");
+        assert_eq!(fixture.endpoint, "/v1/details");
+        let oracle_a = fixture.generation("A");
+        let oracle_b = fixture.generation("B");
+        let pair = |counter: u128| format!("v1:{:032x}{counter:032x}", 1_u128);
+
+        let mut producer = CodexInfoState::service_client();
+        producer
+            .apply_service_details(pair(1), oracle_a.clone())
+            .unwrap();
+        producer.history = UsageHistory {
+            samples: fixture
+                .storage_samples_a
                 .iter()
-                .map(|sample| sample.timestamp)
-                .collect::<Vec<_>>(),
-            fixture.expected_raw_timestamps
-        );
-        let current_samples = details
+                .map(GraphFixtureHistorySample::to_usage_history_sample)
+                .collect(),
+            ..UsageHistory::default()
+        };
+        let candidate_a = producer
+            .public_details_candidate_at(oracle_a.observed_at.unwrap())
+            .expect("A aliases canonicalize");
+        let alias_sample = candidate_a
             .history_samples
             .iter()
-            .filter(|sample| sample.reset_at == fixture.expected_reset_at)
+            .filter(|sample| {
+                sample.reset_at == fixture.expected_reset_at
+                    && sample.timestamp == fixture.storage_samples_a[2].timestamp
+            })
             .collect::<Vec<_>>();
-        assert_eq!(
-            current_samples
-                .iter()
-                .map(|sample| sample.timestamp)
-                .collect::<Vec<_>>(),
-            [
-                fixture.expected_period_start,
-                fixture.expected_period_start + 60
-            ]
-        );
-        assert!(current_samples.iter().all(|sample| {
-            sample.timestamp >= fixture.expected_period_start
-                && sample.sol_dollars <= fixture.expected_sol_max
-        }));
-        assert_eq!(state.history.samples, raw_before_projection);
+        assert_eq!(alias_sample.len(), 1);
+        assert_eq!(alias_sample[0].remaining_percent, Some(100.0));
+        assert_eq!(alias_sample[0].sol_dollars, 0.20);
+        assert_eq!(alias_sample[0].terra_dollars, 0.40);
+        assert_eq!(alias_sample[0].luna_dollars, 0.60);
 
         let mut server =
             ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
                 .unwrap();
-        assert!(server.publisher().publish_details(details).is_ok());
-        assert!(server.publisher().published_pair().is_some());
+        server
+            .publisher()
+            .publish_details(candidate_a.clone())
+            .unwrap();
+        let (wire_pair_a, wire_a) = fetch_service_details(server.local_addr()).unwrap();
+        let mut ui_root = CodexInfoState::service_client();
+        assert!(ui_root
+            .apply_service_details(wire_pair_a.clone(), wire_a)
+            .unwrap());
+        ui_root.select_latest_history();
+        assert_eq!(ui_root.remaining_percent, Some(100.0));
+        assert_eq!(ui_root.estimated_cost_label, "概算 $1");
+        assert_eq!(ui_root.active_threads[0].id, "thread-a");
+        assert_eq!(
+            ui_root
+                .graph_paths_for_selection_at(
+                    oracle_a.observed_at.unwrap(),
+                    true,
+                    true,
+                    true,
+                    false,
+                )
+                .current_sol_label,
+            "$0.20"
+        );
+
+        let mut invalid = producer.history.samples.clone();
+        let mut conflict = invalid[2].clone();
+        conflict.reset_at += 1;
+        conflict.remaining_percent = 99.0;
+        invalid.push(conflict);
+        producer.history.samples = invalid;
+        assert_eq!(
+            producer.public_details_candidate_at(oracle_a.observed_at.unwrap()),
+            Err(super::HistoryCanonicalizationError::ConflictingQuota)
+        );
+        let (wire_pair_last_good, wire_last_good) =
+            fetch_service_details(server.local_addr()).unwrap();
+        assert_eq!(wire_pair_last_good, wire_pair_a);
+        assert!(!ui_root
+            .apply_service_details(wire_pair_last_good, wire_last_good)
+            .unwrap());
+        assert_eq!(ui_root.remaining_percent, Some(100.0));
+        assert_eq!(ui_root.active_threads[0].id, "thread-a");
+
+        producer
+            .apply_service_details(pair(2), oracle_b.clone())
+            .unwrap();
+        producer.history = UsageHistory {
+            samples: fixture
+                .storage_samples_a
+                .iter()
+                .chain(fixture.storage_samples_b.iter())
+                .map(GraphFixtureHistorySample::to_usage_history_sample)
+                .collect(),
+            ..UsageHistory::default()
+        };
+        let candidate_b = producer
+            .public_details_candidate_at(oracle_b.observed_at.unwrap())
+            .expect("B candidate recovers");
+        assert_eq!(
+            candidate_b
+                .history_samples
+                .iter()
+                .find(|sample| sample.timestamp == 1788126600)
+                .map(|sample| (sample.remaining_percent, sample.sol_dollars)),
+            Some((Some(41.0), 323.674247))
+        );
+        server
+            .publisher()
+            .publish_details(candidate_b.clone())
+            .unwrap();
+        let (wire_pair_b, wire_b) = fetch_service_details(server.local_addr()).unwrap();
+        assert_ne!(wire_pair_b, wire_pair_a);
+        assert!(ui_root.apply_service_details(wire_pair_b, wire_b).unwrap());
+        ui_root.select_latest_history();
+        assert_eq!(ui_root.remaining_percent, Some(41.0));
+        assert_eq!(ui_root.estimated_cost_label, "概算 $323.674247");
+        assert_eq!(ui_root.active_threads[0].id, "thread-b");
+        assert_eq!(
+            ui_root
+                .graph_paths_for_selection_at(
+                    oracle_b.observed_at.unwrap(),
+                    true,
+                    true,
+                    true,
+                    false,
+                )
+                .current_sol_label,
+            "$323.67"
+        );
         server.shutdown();
+
+        let mut restarted =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        restarted.publisher().publish_details(candidate_b).unwrap();
+        let (restart_pair, restart_details) =
+            fetch_service_details(restarted.local_addr()).unwrap();
+        assert!(ui_root
+            .apply_service_details(restart_pair, restart_details)
+            .unwrap());
+        assert_eq!(ui_root.remaining_percent, Some(41.0));
+        assert_eq!(ui_root.active_threads[0].id, "thread-b");
+        restarted.shutdown();
     }
 
     #[test]
@@ -15913,7 +16469,6 @@ mod tests {
         let canonical_reset = raw_start + WINDOW_SECONDS;
         let current_alias = canonical_reset - 1;
         let old_reset = raw_start - 60;
-        let floor_start = raw_start.div_euclid(60) * 60;
 
         let mut state = CodexInfoState::preview("normal");
         state.reset_at = Some(current_alias);
@@ -15962,28 +16517,13 @@ mod tests {
         let periods = state.history_periods_at(observed_at);
         assert!(periods
             .iter()
-            .all(|period| period.canonical_reset_at != canonical_reset));
-        assert_eq!(
-            periods
-                .iter()
-                .map(|period| period.canonical_reset_at)
-                .collect::<Vec<_>>(),
-            vec![old_reset]
-        );
-        assert!(periods.iter().all(|period| period.start < floor_start));
+            .any(|period| period.canonical_reset_at == canonical_reset));
+        assert!(periods
+            .iter()
+            .any(|period| period.canonical_reset_at == old_reset));
 
-        state.select_latest_history();
-        assert_eq!(state.selected_reset_at, Some(old_reset));
-        let graph_samples: Vec<UsageHistorySample> =
-            serde_json::from_str(&state.graph_data()).expect("selected old graph JSON");
-        assert_eq!(graph_samples.len(), 1);
-        assert_eq!(graph_samples[0].reset_at, old_reset);
-        assert_eq!(
-            state
-                .graph_paths_for_selection_at(observed_at, true, true, true, false)
-                .current_sol_label,
-            "$99.00"
-        );
+        let candidate = state.public_details_candidate_at(observed_at).unwrap();
+        assert!(candidate.validate().is_err());
     }
 
     #[test]
@@ -15993,6 +16533,17 @@ mod tests {
                 .expect("valid shared graph fixture");
         let mut state = state_from_graph_fixture(&fixture);
         let quota = &fixture.details_response.quota;
+        let baseline = state
+            .public_details_candidate_at(fixture.details_response.observed_at)
+            .unwrap();
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        server
+            .publisher()
+            .publish_details(baseline.clone())
+            .unwrap();
+        let (baseline_pair, baseline_wire) = fetch_service_details(server.local_addr()).unwrap();
         let computed_start = quota
             .reset_at
             .checked_sub(quota.window_seconds)
@@ -16019,24 +16570,17 @@ mod tests {
             Some(computed_start - 60)
         );
         let periods = state.history_periods_at(fixture.details_response.observed_at);
-        assert!(periods.is_empty(), "invalid current period must be omitted");
+        assert_eq!(periods.len(), 1);
 
-        let graph = state.graph_paths_for_selection_at(
-            fixture.details_response.observed_at,
-            true,
-            true,
-            true,
-            false,
-        );
-        assert!(graph.remaining.is_empty());
-        assert!(graph.unused_intervals.is_empty());
-        assert_eq!(
-            state.graph_time_labels_at(fixture.details_response.observed_at),
-            <[String; 5]>::default()
-        );
-        let details = state.public_details_at(fixture.details_response.observed_at);
-        assert!(details.history_periods.is_empty());
+        let details = state
+            .public_details_candidate_at(fixture.details_response.observed_at)
+            .unwrap();
         assert_eq!(details.history_samples.len(), raw.len());
+        assert!(details.validate().is_err());
+        assert!(server.publisher().publish_details(details).is_err());
+        let (retained_pair, retained_wire) = fetch_service_details(server.local_addr()).unwrap();
+        assert_eq!(retained_pair, baseline_pair);
+        assert_eq!(retained_wire, baseline_wire);
         let raw_payload: Vec<UsageHistorySample> =
             serde_json::from_str(&state.history.graph_data_for_reset(quota.reset_at))
                 .expect("raw graph payload remains serializable");
@@ -16045,6 +16589,7 @@ mod tests {
             raw_payload.first().map(|sample| sample.timestamp),
             Some(computed_start - 60)
         );
+        server.shutdown();
     }
 
     #[test]
@@ -16123,10 +16668,9 @@ mod tests {
 
     #[test]
     fn quota_only_reset_fragments_stay_with_the_adjacent_spend_period() {
-        // The production failure was not a single moving sequence: the
-        // service emitted several independent full-quota/zero-usage reset
-        // rows between a spend row and the next spend row. Selecting one of
-        // those fragments produced a flat 100% graph with no model data.
+        // Historical guard name retained by the release gate. Independent
+        // reset cycles are no longer attached according to quota/model value
+        // shape; only reset grouping/tolerance determines their ownership.
         let base = 1_810_000_000;
         let stable_reset = base + WEEK_SECONDS;
         let samples = vec![
@@ -16197,19 +16741,30 @@ mod tests {
         };
 
         let periods = history.periods(base + 300, None);
-        assert_eq!(periods.len(), 2);
-        let rolling_start = base.div_euclid(60) * 60;
-        let rolling_period = periods
+        assert_eq!(periods.len(), 5);
+        let stable_period = periods
             .iter()
-            .find(|period| period.start == rolling_start)
-            .expect("rolling spend period");
-        let selected = history.samples_for_reset(Some(rolling_period.canonical_reset_at));
-        assert_eq!(selected.len(), 5);
-        assert_eq!(selected.last().unwrap().luna_dollars, 4.0);
-        assert_eq!(selected.last().unwrap().luna_tokens, 40);
-        assert!(selected
-            .iter()
-            .any(|sample| sample.remaining_percent == 100.0));
+            .find(|period| period.canonical_reset_at == stable_reset)
+            .expect("stable spend period");
+        assert_eq!(
+            history
+                .samples_for_reset(Some(stable_period.canonical_reset_at))
+                .len(),
+            2
+        );
+        for reset_at in [
+            stable_reset + 10_000,
+            stable_reset + 11_000,
+            stable_reset + 12_000,
+        ] {
+            assert_eq!(history.samples_for_reset(Some(reset_at)).len(), 1);
+        }
+        assert_eq!(
+            canonicalize_public_history_samples(&history.samples)
+                .unwrap()
+                .len(),
+            history.samples.len()
+        );
     }
 
     #[test]
@@ -16339,7 +16894,7 @@ mod tests {
     }
 
     #[test]
-    fn period_list_hides_legacy_moving_resets_but_keeps_real_singletons_and_db_rows() {
+    fn period_list_is_value_shape_neutral_and_keeps_all_db_rows() {
         let db_path = test_history_path("rolling-reset-artifacts");
         let base = 1_699_999_980;
         let stable_reset = base + 400_000;
@@ -16377,8 +16932,11 @@ mod tests {
             .into_iter()
             .map(|period| period.canonical_reset_at)
             .collect::<Vec<_>>();
-        assert_eq!(period_ids, vec![real_singleton_reset, stable_reset]);
-        assert!(history.samples_for_reset(Some(ghost_one)).is_empty());
+        assert_eq!(
+            period_ids,
+            vec![real_singleton_reset, ghost_two, stable_reset]
+        );
+        assert_eq!(history.samples_for_reset(Some(ghost_two)).len(), 2);
         assert_eq!(
             history.samples_for_reset(Some(real_singleton_reset)).len(),
             1
@@ -18820,13 +19378,9 @@ mod tests {
                 .unwrap();
         let publisher = server.publisher();
         publisher.publish_details(state.public_details()).unwrap();
-        let old_status = raw_loopback_get(server.local_addr(), "/v1/status");
         let old_details = raw_loopback_get(server.local_addr(), "/v1/details");
-        assert_eq!(
-            raw_loopback_pair(&old_status),
-            raw_loopback_pair(&old_details)
-        );
-        assert_eq!(raw_loopback_body(&old_status)["state"], "ready");
+        let old_pair = raw_loopback_pair(&old_details);
+        assert_eq!(raw_loopback_body(&old_details)["state"], "ready");
         assert_eq!(
             raw_loopback_body(&old_details)["threads"][0]["id"],
             "accepted-root"
@@ -18907,28 +19461,15 @@ mod tests {
             output_tokens: 250,
         }];
         publisher.publish_details(state.public_details()).unwrap();
-        let cycle_status = raw_loopback_get(server.local_addr(), "/v1/status");
         let cycle_details = raw_loopback_get(server.local_addr(), "/v1/details");
-        assert_ne!(
-            raw_loopback_pair(&cycle_status),
-            raw_loopback_pair(&old_status)
-        );
-        assert_eq!(
-            raw_loopback_pair(&cycle_status),
-            raw_loopback_pair(&cycle_details)
-        );
-        for body in [
-            raw_loopback_body(&cycle_status),
-            raw_loopback_body(&cycle_details),
-        ] {
-            assert_eq!(body["state"], "error");
-            assert_eq!(body["quota"]["remaining_percent"], 37.0);
-            assert_eq!(body["models"][0]["name"], "SOL");
-            assert_eq!(body["models"][0]["input_tokens"], 1_000);
-            assert_eq!(body["models"][0]["cached_input_tokens"], 500);
-            assert_eq!(body["models"][0]["output_tokens"], 250);
-        }
+        assert_ne!(raw_loopback_pair(&cycle_details), old_pair);
         let cycle_details_body = raw_loopback_body(&cycle_details);
+        assert_eq!(cycle_details_body["state"], "error");
+        assert_eq!(cycle_details_body["quota"]["remaining_percent"], 37.0);
+        assert_eq!(cycle_details_body["models"][0]["name"], "SOL");
+        assert_eq!(cycle_details_body["models"][0]["input_tokens"], 1_000);
+        assert_eq!(cycle_details_body["models"][0]["cached_input_tokens"], 500);
+        assert_eq!(cycle_details_body["models"][0]["output_tokens"], 250);
         assert_eq!(cycle_details_body["active_thread_count"], 2);
         assert_eq!(cycle_details_body["threads"][0]["id"], "accepted-root");
         assert_eq!(cycle_details_body["threads"][1]["id"], "accepted-child");
@@ -18984,17 +19525,7 @@ mod tests {
             ["replacement"]
         );
         publisher.publish_details(state.public_details()).unwrap();
-        let recovered_status = raw_loopback_get(server.local_addr(), "/v1/status");
         let recovered_details = raw_loopback_get(server.local_addr(), "/v1/details");
-        assert_eq!(
-            raw_loopback_pair(&recovered_status),
-            raw_loopback_pair(&recovered_details)
-        );
-        assert_eq!(raw_loopback_body(&recovered_status)["state"], "ready");
-        assert_eq!(
-            raw_loopback_body(&recovered_status)["active_thread_count"],
-            1
-        );
         let recovered_details_body = raw_loopback_body(&recovered_details);
         assert_eq!(recovered_details_body["state"], "ready");
         assert_eq!(recovered_details_body["active_thread_count"], 1);

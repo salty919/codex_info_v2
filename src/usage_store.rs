@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Months, Utc};
 use rusqlite::types::Value;
-use rusqlite::{params, Connection, DatabaseName, OptionalExtension};
+use rusqlite::{params, Connection, DatabaseName, OpenFlags, OptionalExtension};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
@@ -626,6 +626,40 @@ impl UsageStore {
         }
         Self::ensure_recent_history_covering_index(&transaction)?;
         transaction.commit()?;
+        Ok(Self { connection })
+    }
+
+    /// Opens an existing current-schema database without creating files,
+    /// changing permissions, running schema DDL, or repairing indexes.
+    /// Resident presentation assemblers use this path so the recorder remains
+    /// the sole durable writer.
+    pub fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.is_absolute() {
+            return Err(UsageStoreError::InvalidImport(
+                "database path must be absolute".into(),
+            ));
+        }
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(UsageStoreError::InvalidImport(
+                "database path must be a regular file".into(),
+            ));
+        }
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(2))?;
+        for column in ["sol_tokens", "terra_tokens", "luna_tokens"] {
+            let present: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('usage_history') WHERE name = ?1)",
+                [column],
+                |row| row.get(0),
+            )?;
+            if !present {
+                return Err(UsageStoreError::InvalidImport(
+                    "database schema mismatch".into(),
+                ));
+            }
+        }
         Ok(Self { connection })
     }
 
@@ -2042,6 +2076,39 @@ mod tests {
         oversized.sol_tokens = i64::MAX as u64 + 1;
         assert!(store.upsert_sample(&oversized).is_err());
         drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn read_only_open_never_creates_or_repairs_the_store() {
+        let path = database_path("read-only-open");
+        assert!(UsageStore::open_read_only(&path).is_err());
+        assert!(!path.exists());
+
+        let row = sample(1_700_000_000, 1_700_604_800, Some(25.0), 4.0);
+        let store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&row).unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute("DROP INDEX usage_history_timestamp_reset_idx", [])
+            .unwrap();
+        drop(connection);
+
+        let reader = UsageStore::open_read_only(&path).unwrap();
+        assert_eq!(reader.load_all().unwrap(), vec![row]);
+        drop(reader);
+        let connection = Connection::open(&path).unwrap();
+        let index_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_index_list('usage_history') WHERE name = ?1)",
+                [HISTORY_TIMESTAMP_RESET_INDEX],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!index_exists);
+        drop(connection);
         remove_database(&path);
     }
 }

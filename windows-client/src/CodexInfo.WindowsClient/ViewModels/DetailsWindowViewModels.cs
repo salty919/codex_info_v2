@@ -207,35 +207,10 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         // Core admission supplies strictly increasing minute-start rows with
-        // one canonical owner for each period/timestamp.  Preserve those
-        // source rows as-is; graph code only applies the cross-time
-        // cumulative projection below and documented synthetic anchors.
+        // one canonical owner for each period/timestamp. Preserve every
+        // source vector as-is; graph code only adds documented quota/reset
+        // anchors and never repairs model components from older rows.
         var normalized = observed.ToList();
-
-        // Each history row is a cumulative snapshot, not an increment. Carry
-        // the greatest value through later source rows so the model paths and
-        // remaining interpolation stay monotonic without regrouping rows.
-        var cumulativeDollars = new double[3];
-        var cumulativeTokens = new ulong[3];
-        for (var index = 0; index < normalized.Count; index++)
-        {
-            var sample = normalized[index];
-            cumulativeDollars[0] = Math.Max(cumulativeDollars[0], sample.SolDollars);
-            cumulativeDollars[1] = Math.Max(cumulativeDollars[1], sample.TerraDollars);
-            cumulativeDollars[2] = Math.Max(cumulativeDollars[2], sample.LunaDollars);
-            cumulativeTokens[0] = Math.Max(cumulativeTokens[0], sample.SolTokens);
-            cumulativeTokens[1] = Math.Max(cumulativeTokens[1], sample.TerraTokens);
-            cumulativeTokens[2] = Math.Max(cumulativeTokens[2], sample.LunaTokens);
-            normalized[index] = sample with
-            {
-                SolDollars = cumulativeDollars[0],
-                TerraDollars = cumulativeDollars[1],
-                LunaDollars = cumulativeDollars[2],
-                SolTokens = cumulativeTokens[0],
-                TerraTokens = cumulativeTokens[1],
-                LunaTokens = cumulativeTokens[2],
-            };
-        }
 
         var hasRemainingObservation = normalized.Any(sample => sample.RemainingPercent is { } value && double.IsFinite(value));
         if (normalized[0].Timestamp == period.StartAt &&

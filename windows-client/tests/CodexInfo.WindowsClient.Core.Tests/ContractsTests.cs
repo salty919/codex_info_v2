@@ -161,30 +161,6 @@ public sealed class ContractsTests
     }
 
     [Fact]
-    public void StatusResultFactoriesExposeSuccessAndFailureStates()
-    {
-        var snapshot = new ApiStatusSnapshot(
-            ApiState.Error,
-            null,
-            false,
-            null,
-            null,
-            Array.Empty<ApiModelUsage>(),
-            0);
-
-        var success = StatusFetchResult.Success(snapshot);
-        var failure = StatusFetchResult.FromFailure(StatusFetchFailure.Response);
-
-        Assert.True(success.IsSuccess);
-        Assert.Same(snapshot, success.Snapshot);
-        Assert.Null(success.Failure);
-        Assert.False(failure.IsSuccess);
-        Assert.Null(failure.Snapshot);
-        Assert.Equal(StatusFetchFailure.Response, failure.Failure);
-        Assert.Throws<ArgumentNullException>(() => StatusFetchResult.Success(null!));
-    }
-
-    [Fact]
     public void DetailsResultFactoriesExposeSuccessAndFailureStates()
     {
         var snapshot = new ApiDetailsSnapshot(
@@ -226,43 +202,6 @@ public sealed class ContractsTests
         Assert.Equal(11, quota.ResetAt);
         Assert.Equal(21, quota.WindowSeconds);
         Assert.True(quota.Monthly);
-
-        var model = new ApiModelUsage("SOL", 1, 2, 3) with
-        {
-            Name = "TERRA",
-            InputTokens = 4,
-            CachedInputTokens = 5,
-            OutputTokens = 6,
-        };
-        Assert.Equal("TERRA", model.Name);
-        Assert.Equal((ulong)4, model.InputTokens);
-        Assert.Equal((ulong)5, model.CachedInputTokens);
-        Assert.Equal((ulong)6, model.OutputTokens);
-
-        var status = new ApiStatusSnapshot(
-            ApiState.Ready,
-            1,
-            true,
-            "Pro",
-            quota,
-            new[] { model },
-            1) with
-        {
-            State = ApiState.Error,
-            ObservedAt = 2,
-            Authenticated = false,
-            PlanLabel = "Team",
-            Quota = null,
-            Models = Array.Empty<ApiModelUsage>(),
-            ActiveThreadCount = 2,
-        };
-        Assert.Equal(ApiState.Error, status.State);
-        Assert.Equal(2, status.ObservedAt);
-        Assert.False(status.Authenticated);
-        Assert.Equal("Team", status.PlanLabel);
-        Assert.Null(status.Quota);
-        Assert.Empty(status.Models);
-        Assert.Equal((ulong)2, status.ActiveThreadCount);
 
         var historySample = new ApiHistorySample(1, 2, 3, 4, 5, 6, 7, 8, 9) with
         {
@@ -430,12 +369,5 @@ public sealed class ContractsTests
         Assert.Null(detailsResult.Snapshot);
         Assert.Equal(DetailsFetchFailure.Response, detailsResult.Failure);
 
-        var statusResult = new StatusFetchResult(status, null) with
-        {
-            Snapshot = null,
-            Failure = StatusFetchFailure.Transport,
-        };
-        Assert.Null(statusResult.Snapshot);
-        Assert.Equal(StatusFetchFailure.Transport, statusResult.Failure);
     }
 }

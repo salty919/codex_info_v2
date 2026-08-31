@@ -186,7 +186,7 @@ X版から必ず継承するのは、値の正本、期間境界、欠測/重複
 
 ```text
 起動
- ├─ 初回/未設定 ─ Setup（profile/selector → server/API prepare → listener → health → status → auth-start → auth-check → ready）
+ ├─ 初回/未設定 ─ Setup（profile/selector → server/API prepare → listener → readiness health → details → auth-start → auth-check → details）
  ├─ 設定済み/未接続 ─ Main（disconnected） → Settings recovery / Setup
  ├─ 設定済み/接続済み ─ Main（saved selectorで次回自動再接続）
  │    ├─ Trends（Graph）
@@ -211,6 +211,10 @@ SSH/WSL childはshell、cmd、PowerShellを介さず、実行ファイルと個�
 Mainを既定の到達先とし、保存済みselectorで次回自動再接続する。接続確認・poll・同一generationの
 自動再構築ごとにSetup/app確認を再表示しない。更新は明示ボタンとbounded自動更新を同じ状態機械で扱い、
 更新中の再クリック、重複要求、値の一時消去を禁止する。
+
+Main、Graph、Threadsは同じstrict validation済み`/v1/details`一応答を一つのatomic rootとして置換する。
+SQLite、別poll、認証control応答でfieldを補完せず、quota/history/threadの再収集、
+値の再計算、同一minuteのmerge/max/last/null化をUIで行わない。候補拒否時は全surfaceが同じlast-good rootを保持する。
 
 ### 3.3 詳細・設定・法的情報
 
@@ -252,7 +256,9 @@ component順や表示所有者を変更しない。
   高速連打や開閉の異なる操作を一つのP90/P95へ合成しない。pollやlocale通知による同値候補の
   再公開をユーザー選択へ読み替えず、開いているリストを自動で閉じない。
 - 期間変更は`idle → loading → ready|failed`の有限状態遷移とする。選択表示は入力直後に更新し、
-  DB/API/parse/reductionはUI thread外で行う。処理が次paintまでに終わらない場合は操作を塞がない
+  accepted details rootのparseとpresentation projectionはUI thread外で行う。SQLite再読込やsampleの
+  canonicalization/merge/recalculationは行わない。既存の遅延残量補間と終端保持はpresentation-onlyで行い、
+  導出点をdetailsやDBへ書き戻さない。処理が次paintまでに終わらない場合は操作を塞がない
   indeterminate progressと「期間データを読み込み中…」を表示する。loading中は直前に完成したgraph・
   metric・軸を保持し、候補完成時だけ1回のUI publishで全てを同時に差し替える。
 - 期間を連続選択した場合は旧候補をcancelし、最新revisionだけをpublishする。失敗・timeout・cancelを
@@ -263,6 +269,9 @@ component順や表示所有者を変更しない。
 - Remainingは独立0–100%意味、モデル系列は累積値として扱う。残量をドル軸へ誤って合わせない。
 - Remainingとモデル使用量は別の観測値であり、モデル使用後に遅れて届いた最初の低い残量観測はその観測時刻へ反映する。残量観測が存在しない区間を料金・tokenから逆算してはならず、未観測区間を正常な残量低下として表示しない。
 - X版とWindows版は同一の履歴fixtureと固定期待値（期間境界、累積SOL、遅延残量、未観測区間）を通過しなければならない。片方の描画ヘルパーが生成した値をもう片方の期待値には使用せず、fixtureの独立oracleを使う。
+- shared rollover fixtureのperiod A→Bで`100% / $1 → 41% / $323.674247`を保持し、
+  `graph_delayed_quota`と既存history/rolling/delayed/gap/no-history/REST/Windows回帰を同一revisionで確認する。
+  値形状による100%・7日・quota-only除外や、新workflow gate・全直積は追加しない。
 - 操作帯を開閉してもplotの位置・高さを変えず、ラベルや右端値を隠さない。
 - 記録なし、欠測、アイドル、活動、0/中間/100を明示的な設計状態として扱う。
 
@@ -278,7 +287,7 @@ component順や表示所有者を変更しない。
 
 ### 4.4 Setup / Settings
 
-- profile/selector、API到達性、status、auth-start、auth-check、readyを別概念として表示する。
+- profile/selector、API到達性、readiness health、details state、auth-start、auth-checkを別概念として表示する。
 - exact settings keysは`language/setupCompleted/connectionConfigured/timeZoneId/connectionProfile/connectionSelector`。
   profile enumは`none|wsl|sshConfigAlias`、selectorは`none`、installed distribution exact token、または
   literal Host aliasだけとする。
@@ -292,8 +301,9 @@ component順や表示所有者を変更しない。
 - WSL/remote/one-session raw recovery、ArgumentList、API到達、認証開始、認証確認、app-wide single
   supervisor/tunnel/reapの境界は`UX-20260822-SSH-001`を正本とする。
 
-Setupの順序はserver/API prepare→listener→`GET /v1/health`→`GET /v1/status`→必要時だけauth-start→
-別auth-check→readyで固定する。healthだけ、auth-startだけ、または同じpollだけでreadyとしない。
+Setupの順序はserver/API prepare→listener→readiness `GET /v1/health`→strict `GET /v1/details`→
+必要時だけauth-start→別auth-check→新しいstrict detailsで固定する。auth-start/auth-checkはcontrol-onlyであり、
+応答を表示rootへmergeしない。healthだけ、またはcontrol成功だけでdata readyとしない。
 
 RC-121のprofile別action意味論も固定する。WSLのserver prepare/service start、Remoteのinstall/tunnel/raw
 tunnelはそれぞれ独立したvisible+enabled Tab step/UIA actionであり、`action.StartForward`へ丸めない。

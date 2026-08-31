@@ -6,13 +6,37 @@ using CodexInfo.WindowsClient.Core;
 
 namespace CodexInfo.WindowsClient.Presentation.Tests;
 
-/// <summary>Shared immutable identity fixture for paired presentation snapshots.</summary>
+/// <summary>Shared immutable identity fixture for validated details responses.</summary>
 internal static class PublishedPairTestFixtures
 {
     private const string CanonicalValue =
         "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
 
     public static PublishedPairIdentity Canonical => Create(CanonicalValue);
+
+    public static ApiDetailsSnapshot DetailsGeneration(
+        ApiState state,
+        long? observedAt,
+        bool authenticated,
+        string? planLabel,
+        ApiQuota? quota,
+        IReadOnlyList<ApiDetailsModelUsage> models,
+        ulong activeThreadCount) =>
+        new(
+            state,
+            observedAt,
+            authenticated,
+            planLabel,
+            quota,
+            models,
+            activeThreadCount,
+            [],
+            [],
+            [],
+            "概算 —")
+        {
+            PublishedPair = Canonical,
+        };
 
     private static PublishedPairIdentity Create(string value)
     {

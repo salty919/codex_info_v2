@@ -99,6 +99,15 @@ for required_test in \
     record_rejects_alias_quota_collision_before_canonical_merge \
     same_timestamp_reset_drift_above_jitter_fails_closed \
     startup_load_sanitizes_legacy_same_timestamp_quota_collision \
+    history_canonicalizer_uses_one_existing_dominant_vector_with_nullable_aliases \
+    history_canonicalizer_rejects_conflict_noncomparable_and_cross_partition_minutes \
+    history_canonicalizer_keeps_same_cycle_minutes_and_raw_sqlite_rows \
+    reset_at_jitter_keeps_raw_aliases_and_canonicalizes_one_dominant_row \
+    period_list_is_value_shape_neutral_and_keeps_all_db_rows \
+    weekly_reset_rollover_projects_one_current_cycle_without_mixing \
+    single_details_root_strict_validation_rejects_partial_and_stale_generations \
+    periodic_ui_timer_consumes_only_single_details_root \
+    resident_service_collects_commits_and_publishes_one_details_generation \
     periodic_quota_refresh_retains_last_good_main_snapshot \
     product_version_is_visible_once_on_native_main_surface \
     public_snapshot_is_whitelisted_and_tracks_auth_state; do
@@ -106,6 +115,8 @@ for required_test in \
 done
 require_rust_test_pass \
     'thread_contract::tests::recoverable_rollout_parser_skips_only_malformed_token_count_records'
+require_rust_test_pass \
+    'usage_store::tests::read_only_open_never_creates_or_repairs_the_store'
 for required_thread_failure_test in \
     thread_c_all_current_cycle_failure_classes_return_no_partial_snapshot \
     thread_c_candidate_failure_rejects_the_complete_cycle \

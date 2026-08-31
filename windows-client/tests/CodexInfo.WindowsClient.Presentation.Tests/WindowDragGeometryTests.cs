@@ -182,7 +182,7 @@ public sealed class WindowDragGeometryTests
     }
 
     [Fact]
-    public void Graph_samples_keep_distinct_valid_minute_snapshots_and_project_cumulatively()
+    public void Graph_samples_keep_each_literal_details_vector_independent()
     {
         var period = new ApiHistoryPeriod("2040", 1_020, 1_200, false, "historical")
         {
@@ -197,10 +197,10 @@ public sealed class WindowDragGeometryTests
         var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_200);
 
         Assert.Equal([1_020L, 1_080L, 1_140L, 1_200L], samples.Select(sample => sample.Timestamp));
-        Assert.Equal([0d, 2d, 2d, 4d], samples.Select(sample => sample.SolDollars));
-        Assert.Equal([0d, 1d, 3d, 3d], samples.Select(sample => sample.TerraDollars));
-        Assert.Equal([0UL, 20UL, 20UL, 40UL], samples.Select(sample => sample.SolTokens));
-        Assert.Equal([0UL, 10UL, 30UL, 30UL], samples.Select(sample => sample.TerraTokens));
+        Assert.Equal([0d, 2d, 1d, 4d], samples.Select(sample => sample.SolDollars));
+        Assert.Equal([0d, 1d, 3d, 2d], samples.Select(sample => sample.TerraDollars));
+        Assert.Equal([0UL, 20UL, 10UL, 40UL], samples.Select(sample => sample.SolTokens));
+        Assert.Equal([0UL, 10UL, 30UL, 20UL], samples.Select(sample => sample.TerraTokens));
         Assert.Equal([100d, 90d, 80d, 70d], samples.Select(sample => sample.RemainingPercent!.Value));
     }
 
