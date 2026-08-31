@@ -1,13 +1,12 @@
 // Copyright (C) 2026 salty919
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! The independent local-session recorder.
+//! The resident service's serialized usage-history writer.
 //!
-//! The recorder intentionally owns no UI or app-server state.  It reads the
-//! same bounded JSONL collector used by the native client and commits only
-//! through [`UsageStore`].  A short-lived process lock prevents multiple
-//! recorders from continuously scanning the same input, while SQLite's own
-//! transaction/upsert contract remains the authority for concurrent writers.
+//! Local-session collection belongs to the resident state producer.  This
+//! module owns only the profile lock, startup database maintenance, and atomic
+//! commits of complete generations supplied by that producer. SQLite's
+//! transaction/upsert contract remains the authority for durable writes.
 
 use crate::security;
 use crate::usage_store::UsageStore;
@@ -16,8 +15,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -166,8 +164,6 @@ pub(crate) fn daemon_interval_from_environment() -> Duration {
 enum DaemonError {
     DataRoot,
     Lock(std::io::Error),
-    Input,
-    Store,
     Runtime,
 }
 
@@ -179,109 +175,12 @@ impl std::fmt::Display for DaemonError {
                 let _ = error.kind();
                 "daemon lock operation failed"
             }
-            Self::Input => "daemon input scan failed",
-            Self::Store => "daemon history commit failed",
             Self::Runtime => "daemon runtime could not start",
         })
     }
 }
 
 impl std::error::Error for DaemonError {}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FileFingerprint {
-    path: PathBuf,
-    length: u64,
-    modified_nanos: u128,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct InputFingerprint {
-    hint: Option<ResetHint>,
-    files: Vec<FileFingerprint>,
-    recovery: Option<FileFingerprint>,
-}
-
-fn modified_nanos(metadata: &fs::Metadata) -> u128 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |value| value.as_nanos())
-}
-
-fn fingerprint_file(path: &Path) -> Result<FileFingerprint, DaemonError> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| DaemonError::Input)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > security::MAX_SESSION_FILE_BYTES
-    {
-        return Err(DaemonError::Input);
-    }
-    #[cfg(unix)]
-    let (device, inode) = {
-        use std::os::unix::fs::MetadataExt;
-        (metadata.dev(), metadata.ino())
-    };
-    Ok(FileFingerprint {
-        path: path.to_owned(),
-        length: metadata.len(),
-        modified_nanos: modified_nanos(&metadata),
-        #[cfg(unix)]
-        device,
-        #[cfg(unix)]
-        inode,
-    })
-}
-
-fn input_fingerprint(hint: Option<ResetHint>) -> Result<InputFingerprint, DaemonError> {
-    let mut files = Vec::new();
-    if let Some(root) = crate::local_sessions_root() {
-        match fs::symlink_metadata(&root) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(DaemonError::Input);
-            }
-            Ok(_) => {
-                let paths = crate::session_jsonl_files(&root).map_err(|_| DaemonError::Input)?;
-                for path in paths {
-                    files.push(fingerprint_file(&path)?);
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(DaemonError::Input),
-        }
-    }
-
-    let recovery = if let Some(path) = crate::delegation_usage_recovery_path() {
-        match fs::symlink_metadata(&path) {
-            Ok(metadata)
-                if metadata.file_type().is_symlink()
-                    || !metadata.is_file()
-                    || metadata.len() > security::MAX_SESSION_FILE_BYTES =>
-            {
-                // The collector treats an absent recovery file as empty, but
-                // an unsafe replacement must remain fail-closed.
-                return Err(DaemonError::Input);
-            }
-            Ok(_) => Some(fingerprint_file(&path)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => return Err(DaemonError::Input),
-        }
-    } else {
-        None
-    };
-
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(InputFingerprint {
-        hint,
-        files,
-        recovery,
-    })
-}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct LockRecord {
@@ -814,27 +713,6 @@ fn data_paths() -> Result<(PathBuf, PathBuf, PathBuf), DaemonError> {
     Ok((history, database, lock))
 }
 
-fn scan_and_store(database: &Path, hint: ResetHint) -> Result<usize, DaemonError> {
-    let samples = crate::collect_local_model_usage_timeline(hint.reset_at, hint.window_seconds)
-        .map_err(|_| DaemonError::Input)?;
-    if samples.is_empty() {
-        return Ok(0);
-    }
-    let rows = samples
-        .iter()
-        .map(crate::UsageHistorySample::to_store)
-        .collect::<Vec<_>>();
-    let mut store = UsageStore::open(database).map_err(|_| {
-        crate::debug_runtime("recorder history store open failed");
-        DaemonError::Store
-    })?;
-    store.upsert_samples(&rows).map_err(|error| {
-        crate::debug_runtime(format!("recorder history batch commit failed: {error}"));
-        DaemonError::Store
-    })?;
-    Ok(rows.len())
-}
-
 enum RecorderCommand {
     StartupMaintenance {
         now: chrono::DateTime<chrono::Utc>,
@@ -867,64 +745,31 @@ pub(crate) fn maintain_history_database_for_test(
     maintain_history_database(database, now)
 }
 
-fn run_cycle(
-    database: &Path,
-    previous: &mut Option<InputFingerprint>,
-) -> Result<usize, DaemonError> {
-    let hint = load_reset_hint().map(|(reset_at, window_seconds)| ResetHint {
-        reset_at,
-        window_seconds,
-    });
-    let fingerprint = input_fingerprint(hint)?;
-    if previous.as_ref() == Some(&fingerprint) {
-        return Ok(0);
-    }
-    if fingerprint.files.is_empty() && fingerprint.recovery.is_none() {
-        *previous = Some(fingerprint);
-        return Ok(0);
-    }
-    let Some(hint) = hint else {
-        // No quota boundary exists yet.  Remember the empty-input snapshot so
-        // the daemon does not repeatedly traverse the directory before the
-        // first successful account response writes its reset hint.
-        *previous = Some(fingerprint);
-        return Ok(0);
-    };
-    let rows = scan_and_store(database, hint)?;
-    *previous = Some(fingerprint);
-    Ok(rows)
-}
-
-/// Recorder ownership embedded in the combined daemon+REST service.
+/// Serialized history-writer ownership embedded in the combined service.
 ///
-/// Unlike `run_record_daemon`, this worker does not install a second signal
-/// handler. The service process owns SIGINT/SIGTERM and stops this bounded
-/// worker before releasing the REST listener.
+/// This worker never reads local sessions. The resident state producer sends
+/// complete generations, and the worker acknowledges each only after its
+/// SQLite transaction commits. The service process owns SIGINT/SIGTERM and
+/// stops this worker before releasing the REST listener.
 pub(crate) struct RecorderWorker {
     commands: Option<mpsc::Sender<RecorderCommand>>,
     worker: Option<JoinHandle<()>>,
     active: bool,
-    committed_revision: Arc<AtomicU64>,
 }
 
 impl RecorderWorker {
     pub(crate) fn start() -> Result<Self, String> {
         let (commands, command_receiver) = mpsc::channel();
         let (started, started_receiver) = mpsc::sync_channel(1);
-        let committed_revision = Arc::new(AtomicU64::new(0));
-        let worker_revision = Arc::clone(&committed_revision);
         let worker = thread::Builder::new()
             .name("codex-info-recorder".into())
             .spawn(move || {
-                let result = (|| -> Result<
-                    (PathBuf, Option<DaemonLock>, Option<InputFingerprint>),
-                    DaemonError,
-                > {
+                let result = (|| -> Result<(PathBuf, Option<DaemonLock>), DaemonError> {
                     let (_history, database, lock_path) = data_paths()?;
                     let lock = DaemonLock::acquire(lock_path)?;
-                    Ok((database, lock, None::<InputFingerprint>))
+                    Ok((database, lock))
                 })();
-                let (database, lock, mut previous) = match result {
+                let (database, lock) = match result {
                     Ok(values) => values,
                     Err(error) => {
                         let _ = started.send(Err(error.to_string()));
@@ -938,37 +783,19 @@ impl RecorderWorker {
                     return;
                 };
 
-                // Signal ownership before the first bounded scan.  The scan
-                // can legitimately take longer than the service readiness
-                // window when a large session history is present (especially
-                // immediately after WSL boot).  Readiness means the lock and
-                // worker are alive; it must not depend on the first backfill
-                // finishing within two seconds.
+                // Readiness means this process owns the exact profile lock and
+                // its serialized writer is waiting for producer commands.
                 if started.send(Ok(true)).is_err() {
                     return;
                 }
 
-                match run_cycle(&database, &mut previous) {
-                    Ok(rows) if rows > 0 => {
-                        worker_revision.fetch_add(1, Ordering::Release);
-                        eprintln!("codex-info: recorder committed {rows} samples")
-                    }
-                    Ok(_) => {}
-                    Err(_) => {
-                        previous = None;
-                        eprintln!("codex-info: recorder skipped an unsafe input cycle");
-                    }
-                }
-                let interval = daemon_interval_from_environment();
-                loop {
-                    match command_receiver.recv_timeout(interval) {
-                        Ok(RecorderCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
-                            break;
-                        }
-                        Ok(RecorderCommand::StartupMaintenance { now, completed }) => {
+                while let Ok(command) = command_receiver.recv() {
+                    match command {
+                        RecorderCommand::Shutdown => break,
+                        RecorderCommand::StartupMaintenance { now, completed } => {
                             let _ = completed.send(maintain_history_database(&database, now));
                         }
-                        Ok(RecorderCommand::Store { samples, committed }) => {
+                        RecorderCommand::Store { samples, committed } => {
                             let result = UsageStore::open(&database)
                                 .map_err(|error| error.to_string())
                                 .and_then(|mut store| {
@@ -976,27 +803,13 @@ impl RecorderWorker {
                                         .upsert_samples(&samples)
                                         .map_err(|error| error.to_string())
                                 });
-                            if result.is_ok() && !samples.is_empty() {
-                                worker_revision.fetch_add(1, Ordering::Release);
+                            if result.is_ok() {
                                 eprintln!(
                                     "codex-info: recorder committed {} samples",
                                     samples.len()
                                 );
                             }
                             let _ = committed.send(result);
-                        }
-                        Err(RecvTimeoutError::Timeout) => {
-                            match run_cycle(&database, &mut previous) {
-                                Ok(rows) if rows > 0 => {
-                                    worker_revision.fetch_add(1, Ordering::Release);
-                                    eprintln!("codex-info: recorder committed {rows} samples")
-                                }
-                                Ok(_) => {}
-                                Err(_) => {
-                                    previous = None;
-                                    eprintln!("codex-info: recorder skipped an unsafe input cycle");
-                                }
-                            }
                         }
                     }
                 }
@@ -1008,7 +821,6 @@ impl RecorderWorker {
                 commands: Some(commands),
                 worker: Some(worker),
                 active,
-                committed_revision,
             }),
             Ok(Err(error)) => {
                 let _ = commands.send(RecorderCommand::Shutdown);
@@ -1046,10 +858,8 @@ impl RecorderWorker {
             .map_err(|_| DaemonError::Runtime.to_string())?
     }
 
-    /// Commit state-owned observations through the same durable writer that
-    /// performs the independent session scan. The acknowledgement is sent
-    /// only after the SQLite transaction has committed, so the service can
-    /// refresh its read model without racing its own write.
+    /// Commit one producer-owned generation through the durable writer. The
+    /// acknowledgement is sent only after its SQLite transaction has committed.
     pub(crate) fn store_samples(
         &self,
         samples: Vec<crate::usage_store::UsageHistorySample>,
@@ -1068,10 +878,6 @@ impl RecorderWorker {
         receiver
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| DaemonError::Runtime.to_string())?
-    }
-
-    pub(crate) fn committed_revision(&self) -> u64 {
-        self.committed_revision.load(Ordering::Acquire)
     }
 
     pub(crate) fn shutdown(&mut self) {
@@ -1274,9 +1080,9 @@ mod tests {
     }
 
     #[test]
-    fn daemon_cycle_persists_changed_jsonl_into_history_store() {
+    fn recorder_writer_persists_only_the_caller_generation_and_holds_the_profile_lock() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let root = temp_root("cycle");
+        let root = temp_root("writer-generation");
         let codex_home = root.join("codex");
         let sessions = codex_home
             .join("sessions")
@@ -1284,20 +1090,20 @@ mod tests {
             .join("08")
             .join("22");
         fs::create_dir_all(&sessions).unwrap();
-        let now = unix_now();
+        let now = unix_now().max(1);
         let reset_at = now + 3_600;
-        let session = sessions.join("daemon-cycle.jsonl");
+        let session = sessions.join("must-not-be-collected.jsonl");
         let context = serde_json::json!({
             "timestamp": chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0).unwrap().to_rfc3339(),
             "type": "turn_context",
-            "model": "gpt-5.6-luna"
+            "model": "gpt-5.6-sol"
         });
         let tokens = serde_json::json!({
             "timestamp": chrono::DateTime::<chrono::Utc>::from_timestamp(now, 0).unwrap().to_rfc3339(),
             "type": "token_count",
             "payload": {"info": {"total_token_usage": {
-                "total_tokens": 120, "input_tokens": 100,
-                "cached_input_tokens": 80, "output_tokens": 20
+                "total_tokens": 999, "input_tokens": 900,
+                "cached_input_tokens": 800, "output_tokens": 99
             }}}
         });
         fs::write(&session, format!("{}\n{}\n", context, tokens)).unwrap();
@@ -1306,35 +1112,34 @@ mod tests {
         let old_data = std::env::var_os("CODEX_INFO_DATA_DIR");
         std::env::set_var("CODEX_HOME", &codex_home);
         std::env::set_var("CODEX_INFO_DATA_DIR", &data_dir);
-        assert_eq!(
-            crate::session_jsonl_files(&codex_home.join("sessions"))
-                .unwrap()
-                .len(),
-            1
-        );
-        let values = fs::read_to_string(&session).unwrap();
-        let parsed = values
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            crate::session_event_model(&parsed[0]).as_deref(),
-            Some("gpt-5.6-luna")
-        );
-        assert_eq!(
-            crate::session_token_snapshot(&parsed[1]).unwrap().total,
-            120
-        );
         persist_reset_hint(reset_at, 604_800).unwrap();
-        let direct = crate::collect_local_model_usage_timeline(reset_at, 604_800).unwrap();
-        assert_eq!(direct.len(), 1, "direct timeline should admit the fixture");
-        let (_history, database, _lock) = data_paths().unwrap();
-        let mut previous = None;
-        let committed = run_cycle(&database, &mut previous).unwrap();
-        assert_eq!(committed, 1);
+
+        let mut writer = RecorderWorker::start().unwrap();
+        assert!(writer.is_active());
+        let mut duplicate = RecorderWorker::start().unwrap();
+        assert!(!duplicate.is_active());
+
+        let expected = crate::usage_store::UsageHistorySample {
+            timestamp: now + 60,
+            reset_at,
+            remaining_percent: Some(41.0),
+            sol_dollars: 323.674_247,
+            terra_dollars: 2.5,
+            luna_dollars: 1.25,
+            sol_tokens: 12_345,
+            terra_tokens: 6_789,
+            luna_tokens: 321,
+        };
+        writer.store_samples(vec![expected.clone()]).unwrap();
+
+        let (_history, database, lock) = data_paths().unwrap();
         let samples = UsageStore::open(database).unwrap().load_all().unwrap();
-        assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].luna_tokens, 120);
+        assert_eq!(samples, vec![expected]);
+        assert!(lock.exists());
+
+        duplicate.shutdown();
+        writer.shutdown();
+        assert!(!lock.exists());
         match old_home {
             Some(value) => std::env::set_var("CODEX_HOME", value),
             None => std::env::remove_var("CODEX_HOME"),

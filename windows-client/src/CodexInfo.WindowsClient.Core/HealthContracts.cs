@@ -4,7 +4,7 @@
 namespace CodexInfo.WindowsClient.Core;
 
 /// <summary>The fixed listener-health document returned by GET /v1/health.</summary>
-public sealed record ApiHealthSnapshot(string ApiVersion, string Service);
+public sealed record ApiHealthSnapshot(string ApiVersion, string Service, string ProductVersion);
 
 /// <summary>A health result that never exposes response text or exceptions.</summary>
 public sealed record HealthFetchResult(

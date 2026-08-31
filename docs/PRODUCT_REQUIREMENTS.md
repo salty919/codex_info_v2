@@ -34,7 +34,7 @@
 - RESTはread-onlyである。未知route/method、不正header/schema、oversize requestからDB、settings、cursor、processを変更しない。
 - GUIなしserverはwindow、Slint component、display backendを生成せず、明示したservice lifecycleで起動・停止・復旧する。
 - resident serviceは一つの完全candidateからimmutable details generationを公開する。Linux / WindowsのMain、Graph、Threadsはstrict validation済みの単一`GET /v1/details` generationだけをatomic表示rootとして消費し、SQLite/JSONL/app-serverの再収集、値の再計算、複数row/endpointのmergeを行わない。公開するread-only endpointはreadiness用`GET /v1/health`と表示正本`GET /v1/details`だけとする。
-- `GET /v1/health`の200はresident serviceがread-only snapshot requestを受理できるreadinessを表す。認証済み、data `state=ready`、最新収集成功を意味しない。認証開始・確認はcontrol-onlyであり、control応答を表示dataとしてcommitせず、その後に受理した新しいdetails generationだけが画面を変えられる。
+- `GET /v1/health`の200はresident serviceがread-only snapshot requestを受理できるreadinessと、Cargo/Windowsの単一authorityから導出したstable product versionを表す。Linux launcherは同一profileの旧version ownerを既存の検証済みlock/pidfd契約で停止してcurrent binaryへ一度だけ交代し、導入済みsystemd binaryもcurrent buildへ同期する。Linux / Windows clientは自身と異なるversion、version欠落、unknown healthをdetails読取りへ進めず、旧serviceのlast-goodをcurrent表示にしない。認証済み、data `state=ready`、最新収集成功を意味しない。認証開始・確認はcontrol-onlyであり、control応答を表示dataとしてcommitせず、その後に受理した新しいdetails generationだけが画面を変えられる。
 
 ## 4. データ保護
 
@@ -188,21 +188,23 @@ Windows版の実装は同じ `tests/fixtures/graph_delayed_quota.json` を入力
 
 | validation | 防ぐcase | 外した場合に起きること |
 | --- | --- | --- |
-| profile-owned DB scope・`timestamp/reset_at`で検証したcycle・minuteの一致 | 別profile/cycle/minuteの混在 | 異なる観測を一つの履歴sampleとして公開する |
-| distinct non-null quotaが最大1個 | 同一minuteの相反する残量 | row順やnull化で任意のquotaを選ぶ |
-| 既存cumulative vectorのcomponentwise-dominance | 非比較vectorやcomponent別maxによる合成 | sourceに存在しない累積値を作る |
+| profile-owned DB scope・`timestamp/reset_at`で検証したcycle・minuteの一致と、実resetを分へ丸めた境界bucketの後続cycle所有 | 別profile/cycle/minuteの混在、または正常な旧cycle末尾と新cycle先頭の同一分 | 異なる観測を一つに混ぜる、または正常なreset直後のdetailsを停止する |
+| distinct non-null quotaが最大1個。不一致minuteだけを公開対象外にする | 同一minuteの相反する残量 | 任意のquotaを選ぶ、または1分の異常で全表示を停止する |
+| 既存cumulative vectorのcomponentwise-dominance。不成立minuteだけを公開対象外にする | 非比較vectorやcomponent別maxによる合成 | sourceに存在しない累積値を作る、または1分の異常で全表示を停止する |
 | public candidateのraw/canonical duplicate拒否 | 同一canonical minuteの複数値 | Graphへ垂直変化またはsink依存の値を渡す |
 | detailsのstrict schema/domain/header検証 | 欠落・未知・重複・stale generation | Main/Graph/Threadsが異なるrootを表示する |
 | health readiness | listenerだけが存在しsnapshotを返せない状態 | Setupが利用不能serviceを接続済みと扱う |
 
 `HistoryCanonicalizer`は同じprofile-owned DB read内で、値形状ではなく既存`timestamp/reset_at`のbounded
 rolling規則から同一cycleと検証できたminuteのrowだけを対象にする。今回の回復に新しいpartition列や
-永続CycleSeqを要求しない。
+永続CycleSeqを要求しない。quota観測のないbackfill reset群がquota確認済みcycleと重なる場合と、継続する
+quota確認済みcycleの内部だけに存在するreset断片はperiod authorityにしない。
 distinct non-null quotaが0または1個で、既存のcumulative vector
 `(sol_dollars, terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens)`のうち全rowを
 componentwiseに支配する値が一意に存在するときだけ、そのquota（0個なら`null`）とdominant vectorを
-1 logical sampleにする。quota競合、非比較、dominant vector不存在・非一意、scope/cycle/minute/period境界不明は
-candidate全体をrejectしてlast-goodを保持する。残量100%、7日窓、quota-onlyなど値の形で除外せず、
+1 logical sampleにする。quota競合、非比較、dominant vector不存在となるminuteは値を推測せずそのminuteだけを
+公開対象外にする。別cycle間の所属を一意にできない場合はcandidate全体をrejectしてlast-goodを保持する。
+残量100%、7日窓、quota-onlyなど数値の形で除外せず、
 component別max、last-row、null化、任意mergeを行わない。
 
 ## 「正しい表示」の判定（必須不変条件）
@@ -212,7 +214,7 @@ component別max、last-row、null化、任意mergeを行わない。
 1. 同一の認証主体でquotaを定期更新している間は、前回の完全なモデル使用量・履歴・threadを保持する。更新途中の欠測を空、0、未取得へ置き換えない。
 2. `reset_at`がサービスのrolling値として移動しても同一期間を維持する。実際の期間切替は、quotaの回復または期間境界を示す観測がある場合だけ新期間へ移す。
 3. モデル使用量（ドル・token）と残量（%）は別観測として扱う。残量観測がない時間帯をモデル使用量から逆算せず、遅れて届いた残量観測はその時刻へ反映する。
-4. 同じprofile-owned DB read内で、既存`timestamp/reset_at`のbounded rolling規則から同一cycleと検証できた同じminuteのrowだけを`HistoryCanonicalizer`が1 logical sampleへ正規化する。distinct non-null quotaは最大1個、cumulative vectorは既存のcomponentwise-dominant値だけを採用し、同値duplicateは冪等に扱う。競合・非比較・境界不明はcandidate全体をrejectする。100%・7日・quota-onlyという値形状では除外せず、UI/REST/Windowsでmerge/max/last/null化しない。
+4. 同じprofile-owned DB read内で、既存`timestamp/reset_at`のbounded rolling規則から同一cycleと検証できた同じminuteのrowだけを`HistoryCanonicalizer`が1 logical sampleへ正規化する。quota観測を持たずquota確認済みcycleと重なるbackfill reset群と、継続cycleの内部だけにあるreset断片はperiod authorityにしない。実resetの秒をminute-startへ丸めて旧cycle末尾と新cycle先頭が同じ分になり、旧cycleがそこで終了して新cycleだけが後続分へ継続すると確認できる場合は、その境界分を新cycleへ一意に所属させる。distinct non-null quotaは最大1個、cumulative vectorは既存のcomponentwise-dominant値だけを採用し、同値duplicateは冪等に扱う。quota競合・非比較・dominant不存在はそのminuteだけを公開対象外とし、別cycle間の境界不明はcandidate全体をrejectする。100%・7日窓など数値の形では除外せず、UI/REST/Windowsでmerge/max/last/null化しない。
 5. 過去期間はその期間に属する全モデル系列を累積値で描画し、未使用区間は専用の未使用帯として表示する。SOL/TERRA/LUNAのいずれかを0や欠測へ黙って変換しない。
 6. 明示的なログアウトまたは認証主体変更だけが可視状態を消去する。通信失敗・quota更新中・local収集中は最後の完全表示を保持し、失敗状態は別途表示する。
 7. X版とWindows版はshared rollover fixtureの`100% / $1 → 41% / $323.674247`と`graph_delayed_quota`を含む同一fixtureの固定oracle（期間数、期間境界、累積SOL、遅延残量、未観測区間）を独立に満たす。既存history/rolling/delayed/gap/no-history/REST/Windows回帰を同一revisionで確認し、どれか一つでも不一致、実機証跡欠落、またはテスト未実行なら合格ではなく保留とする。

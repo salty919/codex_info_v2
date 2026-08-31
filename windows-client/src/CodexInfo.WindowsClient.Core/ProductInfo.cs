@@ -10,14 +10,20 @@ namespace CodexInfo.WindowsClient.Core;
 /// </summary>
 public static class ProductInfo
 {
-    public static string DisplayVersion
+    /// <summary>The canonical stable X.Y.Z version used by service contracts.</summary>
+    public static string Version
     {
         get
         {
             var version = typeof(ProductInfo).Assembly.GetName().Version;
             return version is { Major: >= 0, Minor: >= 0, Build: >= 0 }
-                ? $"v{version.Major}.{version.Minor}.{version.Build}"
-                : "vunknown";
+                ? $"{version.Major}.{version.Minor}.{version.Build}"
+                : "unknown";
         }
+    }
+
+    public static string DisplayVersion
+    {
+        get => Version == "unknown" ? "vunknown" : $"v{Version}";
     }
 }

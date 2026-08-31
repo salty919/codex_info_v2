@@ -32,7 +32,8 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
 
     private static readonly HashSet<string> HealthProperties = CreatePropertySet(
         "api_version",
-        "service");
+        "service",
+        "product_version");
 
     private static readonly HashSet<string> QuotaProperties = CreatePropertySet(
         "remaining_percent",
@@ -499,16 +500,20 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
                 });
 
             var root = document.RootElement;
-            if (!HasExactlyProperties(root, HealthProperties, 2) ||
+            var expectedProductVersion = ProductInfo.Version;
+            if (!HasExactlyProperties(root, HealthProperties, 3) ||
                 !TryGetString(root, "api_version", out var apiVersion) ||
                 apiVersion != "v1" ||
                 !TryGetBoundedString(root, "service", 1, 64, out var service) ||
-                service != "codex-info")
+                service != "codex-info" ||
+                !TryGetBoundedString(root, "product_version", 1, 32, out var productVersion) ||
+                expectedProductVersion == "unknown" ||
+                productVersion != expectedProductVersion)
             {
                 return false;
             }
 
-            snapshot = new ApiHealthSnapshot(apiVersion, service);
+            snapshot = new ApiHealthSnapshot(apiVersion, service, productVersion);
             return true;
         }
         catch (JsonException)

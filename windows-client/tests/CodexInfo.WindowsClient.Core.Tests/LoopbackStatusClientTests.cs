@@ -88,8 +88,8 @@ public sealed class LoopbackStatusClientTests
 
         Assert.True(withoutPair.IsSuccess);
         Assert.True(withPair.IsSuccess);
-        Assert.Equal(new ApiHealthSnapshot("v1", "codex-info"), withoutPair.Snapshot);
-        Assert.Equal(new ApiHealthSnapshot("v1", "codex-info"), withPair.Snapshot);
+        Assert.Equal(new ApiHealthSnapshot("v1", "codex-info", ProductInfo.Version), withoutPair.Snapshot);
+        Assert.Equal(new ApiHealthSnapshot("v1", "codex-info", ProductInfo.Version), withPair.Snapshot);
     }
 
     [Fact]
@@ -106,7 +106,7 @@ public sealed class LoopbackStatusClientTests
         var result = await client.FetchHealthAsync(CancellationToken.None);
 
         Assert.True(result.IsSuccess);
-        Assert.Equal(new ApiHealthSnapshot("v1", "codex-info"), result.Snapshot);
+        Assert.Equal(new ApiHealthSnapshot("v1", "codex-info", ProductInfo.Version), result.Snapshot);
     }
 
     [Fact]
@@ -161,10 +161,29 @@ public sealed class LoopbackStatusClientTests
     [Theory]
     [InlineData("api_version", "api_version2")]
     [InlineData("service", "Service")]
+    [InlineData("product_version", "product_version2")]
     public async Task HealthRejectsUnknownOrWrongFixedValues(string property, string replacement)
     {
         var json = HealthJson().Replace($"\"{property}\":", $"\"{replacement}\":", StringComparison.Ordinal);
         var result = await FetchHealth(json);
+
+        Assert.Equal(HealthFetchFailure.Response, result.Failure);
+        Assert.Null(result.Snapshot);
+    }
+
+    [Fact]
+    public async Task HealthRejectsMissingProductVersion()
+    {
+        var result = await FetchHealth("{\"api_version\":\"v1\",\"service\":\"codex-info\"}");
+
+        Assert.Equal(HealthFetchFailure.Response, result.Failure);
+        Assert.Null(result.Snapshot);
+    }
+
+    [Fact]
+    public async Task HealthRejectsMismatchedProductVersion()
+    {
+        var result = await FetchHealth(HealthJson(ProductInfo.Version + "-mismatch"));
 
         Assert.Equal(HealthFetchFailure.Response, result.Failure);
         Assert.Null(result.Snapshot);
@@ -740,8 +759,8 @@ public sealed class LoopbackStatusClientTests
         return response;
     }
 
-    private static string HealthJson() =>
-        "{\"api_version\":\"v1\",\"service\":\"codex-info\"}";
+    private static string HealthJson(string? productVersion = null) =>
+        $"{{\"api_version\":\"v1\",\"service\":\"codex-info\",\"product_version\":\"{productVersion ?? ProductInfo.Version}\"}}";
 
     private static string ValidDetailsJson() =>
         "{\"api_version\":\"v1\",\"state\":\"ready\",\"observed_at\":253402300740,\"authenticated\":true,\"plan_label\":\"Pro\",\"quota\":{\"remaining_percent\":98.5,\"reset_at\":253402300799,\"window_seconds\":604800,\"monthly\":false},\"models\":[{\"name\":\"SOL\",\"input_tokens\":10,\"cached_input_tokens\":2,\"output_tokens\":3,\"input_dollars\":0.5,\"cached_input_dollars\":0.25,\"output_dollars\":0.5}],\"active_thread_count\":1,\"history_periods\":[{\"id\":\"253402300799\",\"start_at\":253341820740,\"end_at\":253402300740,\"reset_at\":253402300799,\"label\":\"2026/08/01 — 2026/08/08\",\"current\":true}],\"history_samples\":[{\"timestamp\":253402300680,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"sol_dollars\":1.25,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":6,\"terra_tokens\":0,\"luna_tokens\":0}],\"history_gaps\":[],\"threads\":[{\"id\":\"thread-1\",\"title\":\"Task\",\"parent_thread_id\":null,\"model\":\"SOL\",\"model_label\":\"SOL\",\"total_tokens\":20,\"context_usage_tokens\":10,\"context_window_tokens\":80,\"created_at\":1,\"last_user_message_at\":1,\"is_subagent\":false,\"depth\":0}],\"estimated_cost_label\":\"概算 $1\"}";
