@@ -37,6 +37,303 @@ def sources() -> dict[str, str]:
     }
 
 
+def _workflow_document(source: str) -> dict[str, object]:
+    document = yaml.safe_load(source)
+    if not isinstance(document, dict) or not isinstance(document.get("jobs"), dict):
+        raise AssertionError("workflow document has no jobs mapping")
+    return document
+
+
+def _job(document: Mapping[str, object], job_id: str) -> dict[str, object]:
+    jobs = document.get("jobs")
+    if not isinstance(jobs, dict) or not isinstance(jobs.get(job_id), dict):
+        raise AssertionError(f"workflow job was not found: {job_id}")
+    return jobs[job_id]
+
+
+def _step(
+    job: Mapping[str, object],
+    *,
+    step_id: str | None = None,
+    name: str | None = None,
+    uses: str | None = None,
+) -> dict[str, object]:
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        raise AssertionError("workflow job has no steps")
+    matches = [
+        value
+        for value in steps
+        if isinstance(value, dict)
+        and (step_id is None or value.get("id") == step_id)
+        and (name is None or value.get("name") == name)
+        and (uses is None or value.get("uses") == uses)
+    ]
+    if len(matches) != 1:
+        identity = step_id or name or uses or "unspecified"
+        raise AssertionError(f"workflow step is not unique: {identity}")
+    return matches[0]
+
+
+def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
+    """Validate the nine GitHub-interpreted handoffs bypassed by local fixtures."""
+
+    errors: list[str] = []
+
+    def expect(label: str, actual: object, expected: object) -> None:
+        if actual != expected:
+            errors.append(
+                f"workflow wiring {label}: expected {expected!r}, found {actual!r}"
+            )
+
+    def mapping(label: str, actual: object, expected: Mapping[str, object]) -> None:
+        if not isinstance(actual, dict):
+            raise AssertionError(f"{label} mapping is missing")
+        for key, value in expected.items():
+            expect(f"{label}.{key}", actual.get(key), value)
+
+    try:
+        docs = {name: _workflow_document(text) for name, text in workflows.items()}
+        feat = docs["feat-integration.yml"]
+        version = docs["version-prepare.yml"]
+        selective = docs["selective-quality.yml"]
+        windows = docs["windows-client.yml"]
+        release = docs["release.yml"]
+        feat_classify = _job(feat, "classify")
+        feat_quality = _job(feat, "selective-quality")
+        feat_acceptance = _job(feat, "feat-acceptance")
+        prepared = _job(version, "version-prepared")
+        version_quality = _job(version, "selective-quality")
+        acceptance = _job(version, "acceptance")
+        selective_windows = _job(selective, "windows-quality")
+        selective_codeql = _job(selective, "codeql-quality")
+        selected = _job(selective, "selected-quality")
+        windows_job = _job(windows, "windows-quality")
+        resolve = _job(release, "resolve")
+        publish = _job(release, "publish")
+        revalidate = _step(publish, step_id="revalidate")
+        download = _step(publish, uses="actions/download-artifact@v4")
+        publication = _step(publish, name="Publish or verify the exact release state")
+
+        # Observer output -> owner execution and the complete, push-capable checkout.
+        condition = "steps.current.outputs.observer != 'true'"
+        checkout = _step(prepared, uses="actions/checkout@v4")
+        expect("version.checkout.if", checkout.get("if"), condition)
+        expect("version.prepare.if", _step(prepared, step_id="prepare").get("if"), condition)
+        mapping("version.checkout", checkout.get("with"), {
+            "ref": "${{ github.event.pull_request.base.sha }}",
+            "fetch-depth": 0,
+            "persist-credentials": True,
+        })
+
+        # Producer metadata -> H1 and Release identity protocol.
+        expect(
+            "version.run-name",
+            version.get("run-name"),
+            "codex-main-quality-v1:pr=${{ github.event.pull_request.number }}:"
+            "event_head=${{ github.event.pull_request.head.sha }}:"
+            "action=${{ github.event.action }}:draft=${{ github.event.pull_request.draft }}",
+        )
+
+        # Version step outputs -> owner selection -> acceptance.
+        for key, source in {
+            "ready": "steps.prepare.outputs.ready",
+            "selection_json": "steps.prepare.outputs.selection_json",
+            "quality_sha": "steps.prepare.outputs.quality_sha",
+            "generated_head": "steps.prepare.outputs.generated_head",
+            "generated_observer": "steps.prepare.outputs.generated_observer",
+            "event_observer": "steps.current.outputs.observer",
+            "observer_reason": "steps.current.outputs.reason",
+        }.items():
+            mapping("version.outputs", prepared.get("outputs"), {key: f"${{{{ {source} }}}}"})
+        acceptance_env = _step(acceptance, name="Require selected quality success").get("env")
+        for key, source in {
+            "GENERATED_HEAD": "needs.version-prepared.outputs.generated_head",
+            "GENERATED_OBSERVER": "needs.version-prepared.outputs.generated_observer",
+            "EVENT_OBSERVER": "needs.version-prepared.outputs.event_observer",
+            "PREPARE_RESULT": "needs.version-prepared.result",
+            "QUALITY_SHA": "needs.version-prepared.outputs.quality_sha",
+            "QUALITY_RESULT": "needs.selective-quality.result",
+        }.items():
+            mapping("acceptance.env", acceptance_env, {key: f"${{{{ {source} }}}}"})
+
+        # Complete PR identity -> reusable owner calls -> each leaf checkout.
+        mapping(
+            "feat.classify.checkout",
+            _step(feat_classify, uses="actions/checkout@v4").get("with"),
+            {
+                "ref": "${{ github.event.pull_request.base.sha }}",
+                "fetch-depth": 0,
+                "persist-credentials": True,
+            },
+        )
+        mapping("feat.classify.outputs", feat_classify.get("outputs"), {
+            "selection_json": "${{ steps.classify.outputs.selection_json }}",
+        })
+        expect("feat.quality.needs", feat_quality.get("needs"), ["classify"])
+        expect("feat.quality.uses", feat_quality.get("uses"), "./.github/workflows/selective-quality.yml")
+        mapping("feat.quality", feat_quality.get("with"), {
+            "source_sha": "${{ github.event.pull_request.head.sha }}",
+            "base_sha": "${{ github.event.pull_request.base.sha }}",
+            "head_ref": "${{ github.event.pull_request.head.ref }}",
+            "pr_number": "${{ github.event.pull_request.number }}",
+            "selection_json": "${{ needs.classify.outputs.selection_json }}",
+            "release_candidate": False,
+        })
+        expect("feat.acceptance.needs", feat_acceptance.get("needs"), ["classify", "selective-quality"])
+        mapping(
+            "feat.acceptance.env",
+            _step(feat_acceptance, name="Require classification and selected quality").get("env"),
+            {
+                "CLASSIFY_RESULT": "${{ needs.classify.result }}",
+                "QUALITY_RESULT": "${{ needs.selective-quality.result }}",
+            },
+        )
+        expect("version.quality.needs", version_quality.get("needs"), ["version-prepared"])
+        expect("version.quality.if", version_quality.get("if"), "needs.version-prepared.outputs.ready == 'true'")
+        expect("version.quality.uses", version_quality.get("uses"), "./.github/workflows/selective-quality.yml")
+        mapping("version.quality", version_quality.get("with"), {
+            "source_sha": "${{ needs.version-prepared.outputs.quality_sha }}",
+            "base_sha": "${{ github.event.pull_request.base.sha }}",
+            "head_ref": "${{ github.event.pull_request.head.ref }}",
+            "pr_number": "${{ github.event.pull_request.number }}",
+            "selection_json": "${{ needs.version-prepared.outputs.selection_json }}",
+            "release_candidate": True,
+        })
+        expect("version.acceptance.needs", acceptance.get("needs"), ["version-prepared", "selective-quality"])
+        child_workflows = {
+            "linux-backend-quality": "./.github/workflows/rust.yml",
+            "linux-ui-quality": "./.github/workflows/linux-ui-quality.yml",
+            "windows-quality": "./.github/workflows/windows-client.yml",
+            "codeql-quality": "./.github/workflows/codeql.yml",
+        }
+        for job_id, uses in child_workflows.items():
+            child = _job(selective, job_id)
+            expect(f"selective.{job_id}.uses", child.get("uses"), uses)
+            mapping(f"selective.{job_id}", child.get("with"), {
+                "source_sha": "${{ inputs.source_sha }}"
+            })
+        mapping("selective.windows", selective_windows.get("with"), {
+            "pr_number": "${{ inputs.pr_number }}",
+            "release_candidate": "${{ inputs.release_candidate }}",
+        })
+        mapping("selective.codeql", selective_codeql.get("with"), {
+            "head_ref": "${{ inputs.head_ref }}",
+            "languages_json": "${{ toJSON(fromJSON(inputs.selection_json).codeql_languages) }}",
+        })
+        for document, job_id in (
+            (selective, "docs-quality"),
+            (selective, "governance-quality"),
+            (docs["rust.yml"], "native-quality"),
+            (docs["linux-ui-quality.yml"], "linux-ui-quality"),
+            (windows, "windows-quality"),
+            (docs["codeql.yml"], "analyze"),
+        ):
+            leaf_checkout = _step(_job(document, job_id), uses="actions/checkout@v4")
+            mapping(f"{job_id}.checkout", leaf_checkout.get("with"), {
+                "ref": "${{ inputs.source_sha }}"
+            })
+        expect("selected.needs", selected.get("needs"), [
+            "docs-quality", "governance-quality", "linux-backend-quality",
+            "linux-ui-quality", "windows-quality", "codeql-quality",
+        ])
+        mapping(
+            "selected.results",
+            _step(selected, name="Require selected success and non-selected skip").get("env"),
+            {
+                "SELECTION": "${{ inputs.selection_json }}",
+                "RESULTS": "${{ toJSON(needs) }}",
+            },
+        )
+
+        # Windows selected/skipped signal and artifact identity.
+        expect("windows.job-set", set(windows["jobs"]), {"windows-quality"})
+        expect("version.windows-name", version_quality.get("name"), "Run selected quality owners")
+        expect("selective.windows-name", selective_windows.get("name"), "windows-quality")
+        expect("windows.leaf-name", windows_job.get("name"), "windows-quality")
+        e2e = _step(windows_job, name="Run installed Windows UI Automation E2E")
+        mapping("windows.e2e.env", e2e.get("env"), {
+            "SOURCE_SHA": "${{ inputs.source_sha }}",
+        })
+        if "-SourceSha $env:SOURCE_SHA" not in str(e2e.get("run", "")):
+            errors.append("workflow wiring windows.e2e.run: source SHA is not passed to E2E")
+        manifest = _step(windows_job, step_id="manifest")
+        mapping("windows.manifest.env", manifest.get("env"), {
+            "REPOSITORY": "${{ github.repository }}",
+        })
+        upload = _step(windows_job, uses="actions/upload-artifact@v4")
+        expect("windows.upload.if", upload.get("if"), "inputs.release_candidate")
+        mapping("windows.upload", upload.get("with"), {
+            "name": "release-candidate-v1-pr-${{ inputs.pr_number }}-head-${{ inputs.source_sha }}-"
+            "run-${{ github.run_id }}-attempt-${{ github.run_attempt }}-"
+            "version-${{ steps.manifest.outputs.version }}",
+            "if-no-files-found": "error",
+        })
+
+        # Resolver outputs -> lock holder; revalidation controls both side effects.
+        output_keys = (
+            "publish", "fingerprint", "tag", "version", "pr_number", "final_head",
+            "merge_sha", "run_id", "run_number", "run_attempt", "artifact_id",
+            "artifact_name", "artifact_digest",
+        )
+        for key in output_keys:
+            mapping("release.outputs", resolve.get("outputs"), {
+                key: f"${{{{ steps.resolve.outputs.{key} }}}}"
+            })
+        expect("release.publish.needs", publish.get("needs"), ["resolve"])
+        expect("release.publish.if", publish.get("if"), "needs.resolve.outputs.publish == 'true'")
+        for env_key, output_key in {
+            "ARTIFACT_DIGEST": "artifact_digest", "ARTIFACT_ID": "artifact_id",
+            "ARTIFACT_NAME": "artifact_name", "FINAL_HEAD": "final_head",
+            "FINGERPRINT": "fingerprint", "MERGE_SHA": "merge_sha",
+            "PR_NUMBER": "pr_number", "RUN_ATTEMPT": "run_attempt",
+            "RUN_ID": "run_id", "RUN_NUMBER": "run_number", "VERSION": "version",
+        }.items():
+            mapping("release.revalidate", revalidate.get("env"), {
+                env_key: f"${{{{ needs.resolve.outputs.{output_key} }}}}"
+            })
+        mapping("release.revalidate", revalidate.get("env"), {
+            "EVENT_NAME": "${{ github.event_name }}",
+            "GH_TOKEN": "${{ github.token }}",
+            "REPOSITORY": "${{ github.repository }}",
+        })
+        mapping("release.download", download.get("with"), {
+            "artifact-ids": "${{ needs.resolve.outputs.artifact_id }}",
+            "run-id": "${{ needs.resolve.outputs.run_id }}",
+            "github-token": "${{ github.token }}",
+            "repository": "${{ github.repository }}",
+            "path": "release-candidate",
+        })
+        mapping("release.publish", publication.get("env"), {
+            "GH_TOKEN": "${{ github.token }}",
+            "MERGE_SHA": "${{ needs.resolve.outputs.merge_sha }}",
+            "REPOSITORY": "${{ github.repository }}",
+            "TAG": "${{ needs.resolve.outputs.tag }}",
+            "VERSION": "${{ needs.resolve.outputs.version }}",
+        })
+        proceed = "steps.revalidate.outputs.proceed == 'true'"
+        expect("release.download.if", download.get("if"), proceed)
+        expect("release.publication.if", publication.get("if"), proceed)
+
+        # Jobs API names are derived from the actual producer names, not a second fixture.
+        resolver_script = _step(resolve, step_id="resolve").get("run")
+        revalidate_script = revalidate.get("run")
+        if not isinstance(resolver_script, str) or not isinstance(revalidate_script, str):
+            raise AssertionError("release authority scripts are missing")
+        wrapper = f"{version_quality['name']} / {selective_windows['name']}"
+        leaf = f"{wrapper} / {windows_job['name']}"
+        for script, assignments in (
+            (resolver_script, (f"windows_wrapper='{wrapper}'", f"windows_leaf='{leaf}'")),
+            (revalidate_script, (f"windows_leaf='{leaf}'",)),
+        ):
+            for assignment in assignments:
+                if assignment not in script:
+                    errors.append(f"workflow wiring release job identity: missing {assignment}")
+    except (AssertionError, KeyError, TypeError) as error:
+        errors.append(f"workflow semantic graph is incomplete: {error}")
+    return errors
+
+
 def validate(workflows: Mapping[str, str]) -> list[str]:
     errors: list[str] = []
 
@@ -57,6 +354,9 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "final_acceptance_gate.sh",
         "release_state_gate.py",
         "ci_trust_fixture.py",
+        "scripts/regression_guard.sh",
+        "scripts/data_protection_gate.sh",
+        "scripts/windows_client_contract_gate.sh",
         "workflow_quality_gate.py --self-test",
         "test_ci_change_scope.py",
         "test_selected_quality_gate.py",
@@ -136,11 +436,19 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "Build-WindowsInstaller.ps1",
         "Run-WindowsClientE2E.ps1",
         "windows_window_move_smoke.ps1",
+        "$moveSmokeOutput = @(& ./scripts/windows_window_move_smoke.ps1",
+        "[string]$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS'",
         "New-WindowsUpdateManifest.ps1",
         "name: release-candidate-v1-pr-${{ inputs.pr_number }}",
     ):
         if marker not in windows:
             errors.append(f"windows-client.yml: missing {marker}")
+    for forbidden in (
+        "Measure-WindowsGraphLatency.ps1",
+        "if ($LASTEXITCODE -ne 0) { throw 'Physical window move smoke failed.' }",
+    ):
+        if forbidden in windows:
+            errors.append(f"windows-client.yml: unrelated or stale gate remains: {forbidden}")
     count("windows-client.yml", "uses: actions/upload-artifact@v4", 1)
 
     rust = workflows["rust.yml"]
@@ -149,6 +457,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "cargo build --release --locked",
         "scripts/cli_contract_e2e.sh",
         "scripts/record_daemon_e2e.sh",
+        "xvfb-run --auto-servernum",
     ):
         if marker not in rust:
             errors.append(f"rust.yml: missing {marker}")
@@ -197,11 +506,13 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         errors.append("release.yml: latest failure must not fall back to an older success")
     count("release.yml", "--paginate --slurp", 3)
 
+    errors.extend(_semantic_workflow_errors(workflows))
+
     return errors
 
 
 def _step_script(workflow: str, step_name: str) -> str:
-    document = yaml.safe_load(workflow)
+    document = _workflow_document(workflow)
     for job in document["jobs"].values():
         for step in job.get("steps", []):
             if step.get("name") == step_name:
@@ -1885,6 +2196,81 @@ def _publish_mutations(calls: Sequence[Mapping[str, object]]) -> list[Mapping[st
     return mutations
 
 
+def _materialize_candidate_handoff(
+    windows_workflow: str,
+    release_workflow: str,
+    case_root: Path,
+) -> tuple[Path, Path]:
+    """Model only the v4 upload/download filesystem contract used in production."""
+
+    windows = _workflow_document(windows_workflow)
+    upload = _step(
+        _job(windows, "windows-quality"), uses="actions/upload-artifact@v4"
+    )
+    release = _workflow_document(release_workflow)
+    download = _step(_job(release, "publish"), uses="actions/download-artifact@v4")
+    upload_with = upload.get("with")
+    download_with = download.get("with")
+    if not isinstance(upload_with, dict) or not isinstance(download_with, dict):
+        raise AssertionError("artifact Action inputs are missing")
+
+    raw_paths = upload_with.get("path")
+    if not isinstance(raw_paths, str):
+        raise AssertionError("upload-artifact path is not a literal list")
+    source_paths = [Path(line.strip()) for line in raw_paths.splitlines() if line.strip()]
+    if not source_paths:
+        raise AssertionError("upload-artifact has no payload paths")
+    for path in source_paths:
+        if path.is_absolute() or ".." in path.parts or any(
+            token in str(path) for token in ("${{", "*", "?", "[")
+        ):
+            raise AssertionError(f"upload-artifact path is outside the bounded model: {path}")
+
+    archive_root = Path(
+        os.path.commonpath([str(path.parent) for path in source_paths])
+    )
+    raw_download_path = download_with.get("path")
+    if not isinstance(raw_download_path, str):
+        raise AssertionError("download-artifact path is not literal")
+    download_path = Path(raw_download_path)
+    if download_path.is_absolute() or ".." in download_path.parts:
+        raise AssertionError("download-artifact path escapes the fixture")
+
+    raw_merge = download_with.get("merge-multiple", False)
+    if raw_merge in (True, "true"):
+        merge_multiple = True
+    elif raw_merge in (False, "false"):
+        merge_multiple = False
+    else:
+        raise AssertionError("download-artifact merge-multiple is not boolean")
+    extraction_root = case_root / download_path
+    if not merge_multiple:
+        extraction_root /= str(_release_candidate(101, 1)["name"])
+
+    materialized: dict[str, Path] = {}
+    for source in source_paths:
+        relative = source.relative_to(archive_root)
+        destination = extraction_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.name == "CodexInfo.WindowsClient.Setup.exe":
+            destination.write_bytes(b"fixture installer")
+        elif source.name == "CodexInfo.WindowsClient.update.json":
+            destination.write_text(
+                json.dumps({"version": _VERSION}), encoding="utf-8"
+            )
+        else:
+            destination.write_bytes(b"unconsumed fixture payload")
+        materialized[source.name] = destination
+
+    try:
+        return (
+            materialized["CodexInfo.WindowsClient.Setup.exe"],
+            materialized["CodexInfo.WindowsClient.update.json"],
+        )
+    except KeyError as error:
+        raise AssertionError(f"upload payload omits a consumed file: {error}") from error
+
+
 def _execute_publication(
     script: str,
     case_root: Path,
@@ -1892,13 +2278,7 @@ def _execute_publication(
     initial_state: Mapping[str, object] | None,
 ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]], dict[str, object]]:
     bin_dir = case_root / "bin"
-    candidate = case_root / "release-candidate"
     bin_dir.mkdir(exist_ok=True)
-    candidate.mkdir(exist_ok=True)
-    setup = candidate / "CodexInfo.WindowsClient.Setup.exe"
-    manifest = candidate / "CodexInfo.WindowsClient.update.json"
-    setup.write_bytes(b"fixture installer")
-    manifest.write_text(json.dumps({"version": _VERSION}), encoding="utf-8")
     _write_publish_gh(bin_dir)
     _write_publish_curl(bin_dir)
     state_path = case_root / "state.json"
@@ -1930,7 +2310,7 @@ def _execute_publication(
     return result, calls, final_state
 
 
-def _release_publish_tests(release_workflow: str) -> int:
+def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
     script = _step_script(release_workflow, "Publish or verify the exact release state")
     cases = 0
     with tempfile.TemporaryDirectory(prefix="codex-info-release-publish-") as raw_root:
@@ -1938,20 +2318,20 @@ def _release_publish_tests(release_workflow: str) -> int:
 
         absent_root = root / "absent"
         absent_root.mkdir()
-        candidate = absent_root / "release-candidate"
-        candidate.mkdir()
-        setup = candidate / "CodexInfo.WindowsClient.Setup.exe"
-        manifest = candidate / "CodexInfo.WindowsClient.update.json"
-        setup.write_bytes(b"fixture installer")
-        manifest.write_text(json.dumps({"version": _VERSION}), encoding="utf-8")
+        setup, manifest = _materialize_candidate_handoff(
+            windows_workflow, release_workflow, absent_root
+        )
         state = _publication_state("absent", setup, manifest)
         result, calls, final_state = _execute_publication(
             script, absent_root, initial_state=state
         )
+        if result.returncode != 0:
+            raise AssertionError(
+                "artifact handoff did not materialize the publisher input paths"
+            )
         mutations = _publish_mutations(calls)
         if (
-            result.returncode != 0
-            or len([call for call in mutations if call.get("tool") == "curl"]) != 2
+            len([call for call in mutations if call.get("tool") == "curl"]) != 2
             or len(
                 [
                     call
@@ -1993,12 +2373,9 @@ def _release_publish_tests(release_workflow: str) -> int:
         ):
             case_root = root / kind
             case_root.mkdir()
-            candidate = case_root / "release-candidate"
-            candidate.mkdir()
-            setup = candidate / "CodexInfo.WindowsClient.Setup.exe"
-            manifest = candidate / "CodexInfo.WindowsClient.update.json"
-            setup.write_bytes(b"fixture installer")
-            manifest.write_text(json.dumps({"version": _VERSION}), encoding="utf-8")
+            setup, manifest = _materialize_candidate_handoff(
+                windows_workflow, release_workflow, case_root
+            )
             state = _publication_state(kind, setup, manifest)
             result, calls, _ = _execute_publication(
                 script, case_root, initial_state=state
@@ -2042,6 +2419,56 @@ def self_test() -> int:
             "group: release-windows-client-${{ needs.resolve.outputs.tag }}",
             "group: release-windows-client-global",
         ),
+        (
+            "version-prepare.yml",
+            "if: steps.current.outputs.observer != 'true'",
+            "if: steps.current.outputs.observer == 'true'",
+        ),
+        (
+            "version-prepare.yml",
+            "persist-credentials: true",
+            "persist-credentials: false",
+        ),
+        (
+            "feat-integration.yml",
+            "ref: ${{ github.event.pull_request.base.sha }}",
+            "ref: ${{ github.event.pull_request.head.sha }}",
+        ),
+        (
+            "version-prepare.yml",
+            "event_head=${{ github.event.pull_request.head.sha }}",
+            "event_head=${{ github.event.pull_request.base.sha }}",
+        ),
+        (
+            "version-prepare.yml",
+            "QUALITY_RESULT: ${{ needs.selective-quality.result }}",
+            "QUALITY_RESULT: ${{ needs.version-prepared.result }}",
+        ),
+        (
+            "selective-quality.yml",
+            "    name: windows-quality\n",
+            "    name: renamed-windows-quality\n",
+        ),
+        (
+            "selective-quality.yml",
+            "pr_number: ${{ inputs.pr_number }}",
+            "pr_number: ${{ inputs.source_sha }}",
+        ),
+        (
+            "linux-ui-quality.yml",
+            "ref: ${{ inputs.source_sha }}",
+            "ref: ${{ github.sha }}",
+        ),
+        (
+            "release.yml",
+            "artifact_id: ${{ steps.resolve.outputs.artifact_id }}",
+            "artifact_id: ${{ steps.resolve.outputs.run_id }}",
+        ),
+        (
+            "release.yml",
+            "if: steps.revalidate.outputs.proceed == 'true'",
+            "if: steps.revalidate.outputs.proceed != 'true'",
+        ),
     )
     cases = 1
     for name, old, new in mutations:
@@ -2058,7 +2485,9 @@ def self_test() -> int:
     final_check_cases = _final_check_tests(baseline["version-prepare.yml"])
     release_resolution_cases = _release_resolution_tests(baseline["release.yml"])
     release_lock_cases = _release_lock_tests(baseline["release.yml"])
-    release_publish_cases = _release_publish_tests(baseline["release.yml"])
+    release_publish_cases = _release_publish_tests(
+        baseline["windows-client.yml"], baseline["release.yml"]
+    )
     total_cases = (
         cases
         + observer_cases

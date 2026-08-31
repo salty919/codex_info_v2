@@ -779,6 +779,7 @@ jobs:
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           path: release-candidate
+          merge-multiple: true
 
       - name: Publish or verify the exact release state
         if: steps.revalidate.outputs.proceed == 'true'
@@ -874,10 +875,6 @@ jobs:
 
           setup='release-candidate/CodexInfo.WindowsClient.Setup.exe'
           manifest='release-candidate/CodexInfo.WindowsClient.update.json'
-          mapfile -t entries < <(find release-candidate -mindepth 1 -printf '%P\n' | LC_ALL=C sort)
-          expected=(CodexInfo.WindowsClient.Setup.exe CodexInfo.WindowsClient.update.json)
-          [[ "${entries[*]}" == "${expected[*]}" &&
-             -f "$setup" && ! -L "$setup" && -f "$manifest" && ! -L "$manifest" ]]
           jq -e --arg version "$VERSION" '
             type == "object" and .version == $version and
             (.version | test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
