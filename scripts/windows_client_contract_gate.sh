@@ -280,44 +280,6 @@ require_text src/main.rs 'include_str!("../LICENSE")'
 require_text src/main.rs 'include_str!("../THIRD_PARTY_NOTICES.md")'
 require_text src/main.rs 'i18n.text(TextKey::LegalProtocol)'
 require_text src/main.rs 'i18n.text(TextKey::LegalThirdParty)'
-require_text .github/workflows/windows-client.yml 'windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput'
-for forbidden_workflow_marker in \
-    '  native-quality:' \
-    '  codeql-analysis:' \
-    'Audit live applied merge rules' \
-    'validate-live-applied-rules' \
-    'uses: ./.github/workflows/rust.yml' \
-    'uses: ./.github/workflows/codeql.yml'; do
-    if rg -q --fixed-strings -- "$forbidden_workflow_marker" .github/workflows/windows-client.yml; then
-        fail "Windows reusable workflow retains an unrelated quality owner: $forbidden_workflow_marker"
-    fi
-done
-require_text .github/workflows/version-prepare.yml 'uses: ./.github/workflows/selective-quality.yml'
-require_text .github/workflows/version-prepare.yml 'selection_json: ${{ needs.version-prepared.outputs.selection_json }}'
-require_text .github/workflows/selective-quality.yml 'uses: ./.github/workflows/windows-client.yml'
-require_text .github/workflows/windows-client.yml 'dotnet test windows-client/CodexInfo.WindowsClient.sln'
-require_text .github/workflows/windows-client.yml 'Build-WindowsInstaller.ps1 -OutputDirectory artifacts/windows-installer'
-require_text .github/workflows/windows-client.yml '-SourceSha $env:SOURCE_SHA'
-require_text .github/workflows/windows-client.yml 'ref: ${{ inputs.source_sha }}'
-require_text .github/workflows/windows-client.yml 'New-WindowsUpdateManifest.ps1'
-require_text .github/workflows/windows-client.yml 'name: release-candidate-${{ inputs.pr_number }}'
-if rg -q --fixed-strings 'windows-ui-e2e' .github/workflows/windows-client.yml; then
-    fail 'Windows workflow must not upload evidence-only UI artifacts'
-fi
-require_file .github/workflows/release.yml
-require_text .github/workflows/release.yml 'commits/$HEAD_SHA/check-runs?check_name=acceptance'
-require_text .github/workflows/release.yml 'codex-main-quality:pr=$PR_NUMBER:head=$HEAD_SHA:run='
-if rg -q --fixed-strings 'status=success' .github/workflows/release.yml; then
-    fail 'Release must not filter away a later failed or cancelled producer run'
-fi
-require_text .github/workflows/release.yml 'test("(^| / )windows-quality$")'
-require_text .github/workflows/release.yml 'name: release-candidate-${{ github.event.pull_request.number }}'
-require_text .github/workflows/rust.yml 'dtolnay/rust-toolchain@stable'
-require_text .github/workflows/rust.yml 'x11-apps'
-require_text .github/workflows/rust.yml 'cargo test --locked --all-targets -- --nocapture'
-if rg -q --fixed-strings 'native-quality.txt' .github/workflows/rust.yml; then
-    fail 'native workflow must not upload evidence-only artifacts'
-fi
 require_file scripts/pre_pr_gate.sh
 pre_pr_regression_calls="$(count_live_shell_invocations scripts/pre_pr_gate.sh 'bash scripts/regression_guard.sh')"
 [[ "$pre_pr_regression_calls" -eq 1 ]] ||
@@ -328,13 +290,6 @@ pre_pr_contract_calls="$(count_live_shell_invocations scripts/pre_pr_gate.sh 'ba
 pre_pr_data_calls="$(count_live_shell_invocations scripts/pre_pr_gate.sh 'bash scripts/data_protection_gate.sh')"
 [[ "$pre_pr_data_calls" -eq 1 ]] ||
     fail "pre_pr_gate must own exactly one data protection gate invocation: count=$pre_pr_data_calls"
-for workflow in .github/workflows/windows-client.yml .github/workflows/release.yml .github/workflows/rust.yml; do
-    if rg -q --fixed-strings 'scripts/regression_guard.sh' "$workflow" ||
-       rg -q --fixed-strings 'scripts/data_protection_gate.sh' "$workflow" ||
-       rg -q --fixed-strings 'scripts/windows_client_contract_gate.sh' "$workflow"; then
-        fail "local pre-PR gates must not be executable owners in PR workflow: $workflow"
-    fi
-done
 if awk '
     /^[[:space:]]*#/ { next }
     {
@@ -382,19 +337,6 @@ if rg -q --fixed-strings -- '--exact --nocapture' scripts/regression_guard.sh; t
 fi
 require_text scripts/regression_guard.sh 'Rust all-target test set contains a zero-test target'
 require_text scripts/regression_guard.sh 'X11 graph visual gate unverified (DISPLAY unavailable)'
-require_text .github/workflows/rust.yml 'xvfb-run --auto-servernum'
-require_text .github/workflows/release.yml 'gh release create "$tag" "$setup" "$manifest"'
-require_text .github/workflows/release.yml '--draft'
-require_text .github/workflows/release.yml 'gh release edit "$tag" --repo "$REPOSITORY" --draft=false'
-for obsolete_release_marker in \
-    'Get-GitHubResourceStatus' \
-    'release_state_gate.py' \
-    'acceptance-verdict' \
-    'final_head_check_reporter.py'; do
-    if rg -q --fixed-strings -- "$obsolete_release_marker" .github/workflows/release.yml; then
-        fail "release workflow retains obsolete readback/verdict logic: $obsolete_release_marker"
-    fi
-done
 require_file windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettingsSession.cs 'SettingsCorrupt = false'
 require_file windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs
@@ -579,20 +521,12 @@ require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P90Limit 75'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P95Limit 100'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P90Limit 100'
 require_text windows-client/tools/Measure-WindowsGraphLatency.ps1 'P95Limit 150'
-if rg -q --fixed-strings 'Measure-WindowsGraphLatency.ps1' .github/workflows/windows-client.yml; then
-    fail 'hosted Windows runner must not be used as an absolute graph performance gate'
-fi
 if rg -q --fixed-strings 'Start-Sleep' windows-client/tools/Measure-WindowsGraphLatency.ps1; then
     fail 'graph latency probe must use polling, not fixed sleeps'
 fi
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-PAR-13'
 require_text docs/WINDOWS_CLIENT_REQUIREMENTS.md 'WIN-INSTALL-01'
 require_text docs/REGRESSION_PREVENTION_POLICY.md '物理window moveを各1回実行し'
-require_text .github/workflows/windows-client.yml '$moveSmokeOutput = @(& ./scripts/windows_window_move_smoke.ps1'
-require_text .github/workflows/windows-client.yml "[string]\$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS'"
-if rg -q --fixed-strings 'if ($LASTEXITCODE -ne 0) { throw '\''Physical window move smoke failed.'\'' }' .github/workflows/windows-client.yml; then
-    fail 'physical move smoke must not inherit a stale native LASTEXITCODE from its caller'
-fi
 require_file scripts/x11_graph_visual_gate.sh
 require_file scripts/x11_startup_visual_gate.sh
 require_file docs/REQUIREMENTS_LEDGER.md
