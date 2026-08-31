@@ -288,7 +288,6 @@ const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
 // snapshot.  A reset-id drift of only a few seconds is collector jitter and
 // keeps the latest observed quota; a larger drift is ambiguous and must not
 // let row order manufacture a quota drop.
-const SAME_TIMESTAMP_RESET_JITTER_SECONDS: i64 = 5;
 // A minute bucket is the collector's contiguous observation unit. Beyond this
 // boundary the elapsed interval is not observed, so a cumulative model
 // increase must be shown as an idle horizontal segment followed by a point
@@ -1734,40 +1733,6 @@ fn reset_transition_is_boundary(
     false
 }
 
-fn merge_sample_values(existing: &mut UsageHistorySample, incoming: UsageHistorySample) {
-    // Session backfill has no remaining-quota observation. Keep an existing
-    // observed value while allowing a later API observation to replace it.
-    let remaining_percent = if incoming.remaining_percent >= 0.0 {
-        incoming.remaining_percent
-    } else {
-        existing.remaining_percent
-    };
-    let sol_dollars = existing.sol_dollars.max(incoming.sol_dollars);
-    let terra_dollars = existing.terra_dollars.max(incoming.terra_dollars);
-    let luna_dollars = existing.luna_dollars.max(incoming.luna_dollars);
-    let sol_tokens = existing.sol_tokens.max(incoming.sol_tokens);
-    let terra_tokens = existing.terra_tokens.max(incoming.terra_tokens);
-    let luna_tokens = existing.luna_tokens.max(incoming.luna_tokens);
-    *existing = incoming;
-    existing.remaining_percent = remaining_percent;
-    existing.sol_dollars = sol_dollars;
-    existing.terra_dollars = terra_dollars;
-    existing.luna_dollars = luna_dollars;
-    existing.sol_tokens = sol_tokens;
-    existing.terra_tokens = terra_tokens;
-    existing.luna_tokens = luna_tokens;
-}
-
-fn merge_exact_sample(samples: &mut Vec<UsageHistorySample>, incoming: UsageHistorySample) {
-    if let Some(existing) = samples.iter_mut().find(|existing| {
-        existing.reset_at == incoming.reset_at && existing.timestamp == incoming.timestamp
-    }) {
-        merge_sample_values(existing, incoming);
-    } else {
-        samples.push(incoming);
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HistoryPeriod {
     canonical_reset_at: i64,
@@ -2345,7 +2310,7 @@ impl UsageHistory {
         }
         self.pending_store_samples.push(sample.to_store());
         let acquisition_end = sample.timestamp;
-        merge_exact_sample(&mut self.samples, sample);
+        self.samples.push(sample);
         self.normalize();
         self.retain_acquisition_window(acquisition_end);
     }
@@ -2365,7 +2330,7 @@ impl UsageHistory {
                 continue;
             }
             self.pending_store_samples.push(sample.to_store());
-            merge_exact_sample(&mut self.samples, sample);
+            self.samples.push(sample);
         }
         self.normalize();
         if let Some(acquisition_end) = acquisition_end {
@@ -2483,74 +2448,16 @@ impl UsageHistory {
         let Some(canonical_reset_at) = canonical_reset_at else {
             return Vec::new();
         };
-        let mut selected = reset_sample_groups(&self.samples)
+        let selected = reset_sample_groups(&self.samples)
             .into_iter()
             .find(|group| group.canonical_reset_at == canonical_reset_at)
             .map(|group| group.samples)
             .unwrap_or_default();
-        selected.sort_by_key(|sample| (sample.timestamp, sample.reset_at));
-        let mut merged: Vec<UsageHistorySample> = Vec::with_capacity(selected.len());
-        let mut index = 0;
-        while index < selected.len() {
-            let timestamp = selected[index].timestamp;
-            let mut rows = Vec::new();
-            while index < selected.len() && selected[index].timestamp == timestamp {
-                rows.push(selected[index].clone());
-                index += 1;
-            }
-            let mut sample = rows.last().cloned().expect("timestamp group is non-empty");
-            let remaining_values = rows
-                .iter()
-                .filter(|row| row.remaining_percent >= 0.0)
-                .map(|row| row.remaining_percent)
-                .collect::<Vec<_>>();
-            let conflicting_remaining = remaining_values
-                .windows(2)
-                .any(|values| (values[0] - values[1]).abs() > f64::EPSILON);
-            let reset_span = rows
-                .iter()
-                .map(|row| row.reset_at)
-                .min()
-                .unwrap_or(sample.reset_at)
-                .abs_diff(
-                    rows.iter()
-                        .map(|row| row.reset_at)
-                        .max()
-                        .unwrap_or(sample.reset_at),
-                );
-            // Preserve the historical jitter contract (a few-second drift
-            // keeps the latest value), but fail closed for a same-ID conflict,
-            // a real reset-id disagreement, or any quota-only collision.  In
-            // particular this prevents a 30/60-second moving-reset row with
-            // no model usage from overwriting an 88% spend observation with
-            // 14%.
-            let has_quota_only_row = rows.iter().any(|row| {
-                row.sol_dollars == 0.0
-                    && row.terra_dollars == 0.0
-                    && row.luna_dollars == 0.0
-                    && row.sol_tokens == 0
-                    && row.terra_tokens == 0
-                    && row.luna_tokens == 0
-            });
-            if conflicting_remaining
-                && (reset_span == 0
-                    || reset_span > SAME_TIMESTAMP_RESET_JITTER_SECONDS as u64
-                    || has_quota_only_row)
-            {
-                sample.remaining_percent = -1.0;
-            } else if let Some(remaining) = remaining_values.last().copied() {
-                sample.remaining_percent = remaining;
-            }
-            sample.reset_at = canonical_reset_at;
-            sample.sol_dollars = rows.iter().map(|row| row.sol_dollars).fold(0.0, f64::max);
-            sample.terra_dollars = rows.iter().map(|row| row.terra_dollars).fold(0.0, f64::max);
-            sample.luna_dollars = rows.iter().map(|row| row.luna_dollars).fold(0.0, f64::max);
-            sample.sol_tokens = rows.iter().map(|row| row.sol_tokens).max().unwrap_or(0);
-            sample.terra_tokens = rows.iter().map(|row| row.terra_tokens).max().unwrap_or(0);
-            sample.luna_tokens = rows.iter().map(|row| row.luna_tokens).max().unwrap_or(0);
-            merged.push(sample);
-        }
-        merged
+        // Presentation consumes the same canonical rows as `/v1/details`.
+        // Invalid raw observations fail closed to no new graph candidate;
+        // callers only commit strict service generations, so the prior graph
+        // remains visible instead of receiving a synthetic vector.
+        canonicalize_public_history_samples(&selected).unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -2567,20 +2474,12 @@ impl UsageHistory {
     }
 
     fn normalize(&mut self) {
+        // Keep every raw observation distinguishable until the sole public
+        // HistoryCanonicalizer validates its cycle/minute group. Sorting is
+        // inventory order only; it never merges or rewrites sample values.
         self.samples.retain(UsageHistorySample::is_valid);
         self.samples
             .sort_by_key(|sample| (sample.reset_at, sample.timestamp));
-        let mut normalized: Vec<UsageHistorySample> = Vec::with_capacity(self.samples.len());
-        for sample in self.samples.drain(..) {
-            if let Some(existing) = normalized.last_mut() {
-                if existing.reset_at == sample.reset_at && existing.timestamp == sample.timestamp {
-                    merge_sample_values(existing, sample);
-                    continue;
-                }
-            }
-            normalized.push(sample);
-        }
-        self.samples = normalized;
     }
 
     /// Bounds the in-memory/API/graph working set without deleting SQLite
@@ -5221,11 +5120,11 @@ impl CodexInfoState {
     }
 
     fn usage_ready(&self) -> bool {
-        self.has_usage && !self.local_usage_pending
+        self.has_usage && self.usage_snapshot_committed && !self.local_usage_pending
     }
 
     fn has_visible_usage(&self) -> bool {
-        self.usage_ready() || self.usage_snapshot_committed
+        self.usage_ready()
     }
 
     /// Build the sole read-only document consumed by public clients in tests.
@@ -5604,10 +5503,10 @@ impl CodexInfoState {
             thread_error: false,
             local_usage_error: false,
             local_usage_pending: false,
-            // Preview starts with a complete in-memory payload, so
-            // `usage_ready()` is sufficient. Keep this false to exercise the
-            // first-load (not-yet-committed) pending contract in tests.
-            usage_snapshot_committed: false,
+            // Preview is one complete in-memory generation. Individual
+            // startup fixtures clear this bit when they intentionally model
+            // an incomplete first collection.
+            usage_snapshot_committed: true,
             last_thread_poll: Instant::now(),
             recovery_period: None,
             recovery_requested: false,
@@ -5639,6 +5538,7 @@ impl CodexInfoState {
                 state.remaining_percent = None;
                 state.has_quota_percent = false;
                 state.has_usage = false;
+                state.usage_snapshot_committed = false;
                 state.reset_at = None;
                 state.last_success_at = None;
                 state.model_usage.clear();
@@ -5659,6 +5559,7 @@ impl CodexInfoState {
                 state.remaining_percent = None;
                 state.has_quota_percent = false;
                 state.has_usage = false;
+                state.usage_snapshot_committed = false;
                 state.reset_at = None;
                 state.active_threads.clear();
                 state.status = "未認証です。認証を開始してください。".into();
@@ -5980,13 +5881,19 @@ impl CodexInfoState {
     /// events are drained before this method runs, so `checking` and
     /// `thread_checking` are the single-flight completion boundaries.
     fn schedule_resident_refresh(&mut self, now: Instant) {
-        if account_refresh_due(
-            now,
-            self.last_poll,
-            self.checking,
-            self.authenticated,
-            self.auth_polling,
-        ) {
+        // One quota/local generation owns the account lane until it reaches a
+        // terminal local result. Periodic quota responses can share the same
+        // reset tuple, so overlapping them would make an older local scan
+        // indistinguishable from the newer generation.
+        if !self.local_usage_pending
+            && account_refresh_due(
+                now,
+                self.last_poll,
+                self.checking,
+                self.authenticated,
+                self.auth_polling,
+            )
+        {
             let status = if self.auth_polling && !self.authenticated {
                 "認証完了を確認しています…"
             } else {
@@ -6127,9 +6034,14 @@ impl CodexInfoState {
         } else {
             "残り利用枠".into()
         };
-        self.has_usage = details.state == PublicState::Ready;
+        // An error generation may intentionally carry the last completely
+        // observed root so failure state and stale data are shown together.
+        // Initial failures have no observed_at and expose no usage.
+        self.has_usage = details.authenticated
+            && details.observed_at.is_some()
+            && matches!(details.state, PublicState::Ready | PublicState::Error);
         self.local_usage_pending = false;
-        self.usage_snapshot_committed = details.state == PublicState::Ready;
+        self.usage_snapshot_committed = self.has_usage;
         self.last_success_at = observed_at;
         self.model_usage = next_models;
         self.history = next_history;
@@ -6337,6 +6249,7 @@ impl CodexInfoState {
         self.quota_title = quota_title;
         self.monthly = monthly;
         self.account_error = None;
+        self.local_usage_error = false;
         if reset_changed {
             // A graph that was following the previously current period must
             // follow the newly announced period as soon as its local payload
@@ -6378,6 +6291,9 @@ impl CodexInfoState {
         self.advance_auth_epoch();
         self.thread_checking = false;
         self.checking = false;
+        // The epoch change makes the in-flight local result stale. Release
+        // the account lane so a later authenticated generation can start.
+        self.local_usage_pending = false;
         self.account_error = Some(error.clone());
         self.error = Some(error);
         self.status =
@@ -6388,6 +6304,12 @@ impl CodexInfoState {
         if !self.recovery_requested {
             if let Some((reset_at, window_seconds)) = self.recovery_period {
                 self.recovery_requested = true;
+                if !self.preview {
+                    // Recovery owns the same local-worker lane. Do not let a
+                    // newly recovered account response reuse its identical
+                    // reset tuple before this result reaches a terminal state.
+                    self.local_usage_pending = true;
+                }
                 self.request_local_usage(reset_at, window_seconds);
             }
         }
@@ -6460,7 +6382,7 @@ impl CodexInfoState {
         let period_matches = self.recovery_period == Some((result.reset_at, result.window_seconds));
         let unauthenticated_recovery = !self.authenticated && period_matches;
         let recovery_result = self.recovery_requested && period_matches;
-        if (!unauthenticated_recovery && result.auth_epoch != self.auth_epoch)
+        if result.auth_epoch != self.auth_epoch
             || !self.current_local_period_matches(result.reset_at, result.window_seconds)
         {
             debug_runtime(format!(
@@ -6517,9 +6439,11 @@ impl CodexInfoState {
     }
 
     fn apply_local_usage_error(&mut self, auth_epoch: u64, reset_at: i64, window_seconds: i64) {
-        if !self.authenticated
-            || auth_epoch != self.auth_epoch
+        let recovery_error =
+            self.recovery_requested && self.recovery_period == Some((reset_at, window_seconds));
+        if auth_epoch != self.auth_epoch
             || !self.current_local_period_matches(reset_at, window_seconds)
+            || (!self.authenticated && !recovery_error)
         {
             return;
         }
@@ -9114,26 +9038,65 @@ enum ResidentServiceCycleError {
     Publish(codex_info::server::ApiSnapshotError),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResidentServiceCycleOutcome {
+    Published,
+    HeldIncomplete,
+}
+
+#[derive(Default)]
+struct ResidentPublicationState {
+    /// Exact last complete root accepted by the REST publisher. This is the
+    /// publication buffer, not another collector: failures may change only
+    /// its state marker while every displayed data field remains identical.
+    last_complete: Option<PublicDetails>,
+}
+
 fn resident_service_cycle<W, P>(
     state: &mut CodexInfoState,
+    publication: &mut ResidentPublicationState,
     write_and_refresh: W,
     publish: P,
-) -> Result<(), ResidentServiceCycleError>
+) -> Result<ResidentServiceCycleOutcome, ResidentServiceCycleError>
 where
     W: FnOnce(&mut CodexInfoState, Vec<usage_store::UsageHistorySample>) -> Result<(), String>,
     P: FnOnce(PublicDetails) -> Result<(), codex_info::server::ApiSnapshotError>,
 {
     state.poll();
+    // Logout/account replacement is the only event that invalidates the old
+    // visible root. An incomplete first generation must never inherit a
+    // previous identity's data.
+    if !state.usage_snapshot_committed {
+        publication.last_complete = None;
+    }
     state.schedule_resident_refresh(Instant::now());
     let pending = state.history.take_pending_store_samples();
     if let Err(error) = write_and_refresh(state, pending.clone()) {
         state.history.restore_pending_store_samples(pending);
         return Err(ResidentServiceCycleError::Store(error));
     }
-    let candidate = state
+    // A quota response is only the first half of a public generation. Keep
+    // the publisher's exact root and generation identity unchanged until the
+    // matching local usage/history result reaches a terminal state.
+    if state.local_usage_pending && state.account_error.is_none() {
+        return Ok(ResidentServiceCycleOutcome::HeldIncomplete);
+    }
+    let mut candidate = state
         .public_details_candidate()
         .map_err(|error| ResidentServiceCycleError::Candidate(error.to_string()))?;
-    publish(candidate).map_err(ResidentServiceCycleError::Publish)
+    if candidate.state == PublicState::Error {
+        if let Some(last_complete) = publication.last_complete.as_ref() {
+            candidate = last_complete.clone();
+            candidate.state = PublicState::Error;
+        }
+    }
+    publish(candidate.clone()).map_err(ResidentServiceCycleError::Publish)?;
+    if candidate.state == PublicState::Ready {
+        publication.last_complete = Some(candidate);
+    } else if !candidate.authenticated {
+        publication.last_complete = None;
+    }
+    Ok(ResidentServiceCycleOutcome::Published)
 }
 
 fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -9154,6 +9117,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
     let publisher = api_server.publisher();
     let mut state = CodexInfoState::new();
     publisher.publish_details(state.public_details_candidate()?)?;
+    let mut publication = ResidentPublicationState::default();
     let mut observed_recorder_revision = recorder.committed_revision();
     let mut last_recorder_error = None;
     let mut last_publish_error = None;
@@ -9178,6 +9142,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                 _ = ticker.tick() => {
                     let result = resident_service_cycle(
                         &mut state,
+                        &mut publication,
                         |state, pending| {
                             recorder.store_samples(pending)?;
                             let committed_revision = recorder.committed_revision();
@@ -9192,7 +9157,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                         |candidate| publisher.publish_details(candidate),
                     );
                     match result {
-                        Ok(()) => {
+                        Ok(ResidentServiceCycleOutcome::Published) => {
                             if last_recorder_error.take().is_some() {
                                 eprintln!("codex-info: recorder state commit recovered");
                             }
@@ -9200,6 +9165,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                 eprintln!("codex-info: REST snapshot publication recovered");
                             }
                         }
+                        Ok(ResidentServiceCycleOutcome::HeldIncomplete) => {}
                         Err(ResidentServiceCycleError::Store(error)) => {
                             if last_recorder_error.as_deref() != Some(error.as_str()) {
                                 eprintln!("codex-info: recorder state commit rejected: {error}");
@@ -10395,70 +10361,70 @@ mod tests {
     }
 
     #[test]
-    fn service_publishes_old_rows_error_and_latest_quota_without_freeze() {
+    fn resident_publication_holds_incomplete_usage_and_errors_without_mixing_roots() {
         let mut state = CodexInfoState::preview("normal");
-        state.history = UsageHistory::default();
-        let old = active_thread_fixture(0, 100);
-        state.active_threads = vec![old.clone()];
+        let last_complete = state.public_details();
+        let mut publication = super::ResidentPublicationState {
+            last_complete: Some(last_complete.clone()),
+        };
 
-        let mut server =
-            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
-                .unwrap();
-        let publisher = server.publisher();
-        publisher.publish_details(state.public_details()).unwrap();
-        let before_pair = publisher.published_pair();
+        // Mutate every independently collected part to values that must not
+        // cross the publication boundary while local usage is incomplete.
+        state.remaining_percent = Some(37.0);
+        state.reset_at = state.reset_at.map(|reset| reset + 120);
+        state.last_success_at = state.last_success_at.map(|observed| observed + 120);
+        state.active_threads = vec![active_thread_fixture(1, 230)];
+        state.local_usage_pending = true;
+        let outcome = super::resident_service_cycle(
+            &mut state,
+            &mut publication,
+            |_, pending| {
+                assert!(pending.is_empty());
+                Ok(())
+            },
+            |_| panic!("an incomplete usage generation must not publish"),
+        )
+        .unwrap();
+        assert_eq!(outcome, super::ResidentServiceCycleOutcome::HeldIncomplete);
+        assert_eq!(publication.last_complete, Some(last_complete.clone()));
 
-        let mut cycle_a = active_thread_fixture(10, 220);
-        cycle_a.parent_thread_id = Some("thread-011".into());
-        let mut cycle_b = active_thread_fixture(11, 219);
-        cycle_b.parent_thread_id = Some("thread-010".into());
-        state.apply_thread_result(
-            state.auth_epoch,
-            ActiveThreadUpdate::Snapshot(vec![cycle_a, cycle_b]),
-        );
-        assert_eq!(state.active_threads.as_slice(), std::slice::from_ref(&old));
-        assert!(state.thread_error);
+        // A terminal failure is a new state marker over the exact previous
+        // root, never the new quota combined with old rows.
+        state.local_usage_pending = false;
+        state.local_usage_error = true;
+        state.error = Some("local usage failed".into());
+        let emitted = std::cell::RefCell::new(None);
+        let outcome = super::resident_service_cycle(
+            &mut state,
+            &mut publication,
+            |_, pending| {
+                assert!(pending.is_empty());
+                Ok(())
+            },
+            |details| {
+                *emitted.borrow_mut() = Some(details);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, super::ResidentServiceCycleOutcome::Published);
+        let error_root = emitted.into_inner().expect("error root published");
+        let mut expected_error = last_complete.clone();
+        expected_error.state = PublicState::Error;
+        assert_eq!(error_root, expected_error);
+        assert_eq!(publication.last_complete, Some(last_complete.clone()));
 
-        let reset_at = state.reset_at.expect("preview reset");
-        state.apply_usage_event(usage_event(Some(37.0), reset_at));
-        publisher.publish_details(state.public_details()).unwrap();
-
-        let details = raw_loopback_get(server.local_addr(), "/v1/details");
-        assert_ne!(publisher.published_pair(), before_pair);
-        assert_eq!(raw_loopback_body(&details)["state"], "error");
-        assert_eq!(
-            raw_loopback_body(&details)["quota"]["remaining_percent"],
-            37.0
-        );
-        assert_eq!(raw_loopback_body(&details)["active_thread_count"], 1);
-        assert_eq!(raw_loopback_body(&details)["threads"][0]["id"], old.id);
-
-        state.apply_usage_event(usage_event(Some(29.0), reset_at));
-        publisher.publish_details(state.public_details()).unwrap();
-        let advanced_details = raw_loopback_get(server.local_addr(), "/v1/details");
-        assert_eq!(
-            raw_loopback_body(&advanced_details)["quota"]["remaining_percent"],
-            29.0
-        );
-
-        let replacement = active_thread_fixture(1, 230);
-        state.apply_thread_result(
-            state.auth_epoch,
-            ActiveThreadUpdate::Snapshot(vec![replacement.clone()]),
-        );
-        assert_eq!(
-            state.active_threads.as_slice(),
-            std::slice::from_ref(&replacement)
-        );
-        assert!(!state.thread_error);
-        publisher.publish_details(state.public_details()).unwrap();
-        let recovered = raw_loopback_get(server.local_addr(), "/v1/details");
-        assert_eq!(raw_loopback_body(&recovered)["state"], "ready");
-        assert_eq!(
-            raw_loopback_body(&recovered)["threads"][0]["id"],
-            replacement.id
-        );
-        server.shutdown();
+        // The Linux adapter keeps those complete fields visible and presents
+        // the error separately, matching the Windows details-root contract.
+        let mut client = CodexInfoState::service_client();
+        let published_pair = format!("v1:{:032x}{:032x}", 1_u128, 1_u128);
+        assert!(client
+            .apply_service_details(published_pair, error_root)
+            .unwrap());
+        assert!(client.has_visible_usage());
+        assert_eq!(client.model_usage.len(), last_complete.models.len());
+        assert_eq!(client.active_threads.len(), last_complete.threads.len());
+        assert!(client.error.is_some());
     }
 
     #[test]
@@ -10933,51 +10899,33 @@ mod tests {
     }
 
     #[test]
-    fn periodic_quota_refresh_retains_last_good_main_snapshot() {
+    fn periodic_quota_refresh_does_not_overlap_account_generations() {
+        let now = Instant::now();
         let mut state = CodexInfoState::preview("normal");
-        let previous_models = state.model_usage.clone();
-        let previous_threads = state.active_threads.len();
-        let previous_history = state.history.samples.clone();
-        let previous_estimate = state.estimated_cost_label.clone();
-        let previous_reset = state.reset_at.expect("preview reset");
-
-        // A moving reset timestamp must not be treated as an account change or
-        // as proof that the current model table is invalid.  This is the
-        // exact failure mode that made the main screen blink every cycle.
-        state.apply_usage_event(usage_event(Some(14.0), previous_reset + 120));
-        assert_eq!(state.model_usage, previous_models);
-
-        // A periodic quota response is intentionally incomplete.  Simulate
-        // the interval after that response and before the local collector's
-        // matching commit; the previously committed values must remain
-        // visible instead of reverting to an empty/initial screen.
+        state.preview = false;
+        state.checking = false;
+        state.thread_checking = true;
+        state.last_poll = now - Duration::from_secs(61);
         state.local_usage_pending = true;
-        state.usage_snapshot_committed = true;
+        let (command_tx, commands) = std::sync::mpsc::channel();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        state.bridge = super::AppServerBridge {
+            tx: command_tx,
+            rx: event_rx,
+        };
 
-        // A single successful assertion is not enough: the production bug
-        // appeared only after several timer-driven refreshes. Exercise a
-        // finite sequence of rolling reset values and verify that every
-        // intermediate publish keeps the same last-good snapshot.
-        for cycle in 0..8 {
-            state.apply_usage_event(usage_event(
-                Some(14.0 - f64::from(cycle) * 0.25),
-                previous_reset + 120 + i64::from(cycle + 1) * 120,
-            ));
-            state.local_usage_pending = true;
-            state.usage_snapshot_committed = true;
+        state.schedule_resident_refresh(now);
+        assert!(commands.try_recv().is_err());
 
-            let snapshot = state.public_details();
-            assert_eq!(snapshot.state, PublicState::Ready);
-            assert_eq!(snapshot.models.len(), previous_models.len());
-            assert_eq!(snapshot.active_thread_count as usize, previous_threads);
-            assert_eq!(state.history.samples, previous_history);
-            assert_eq!(state.estimated_cost_label, previous_estimate);
-            assert_eq!(state.selected_reset_at, Some(previous_reset));
-            let details = state.public_details();
-            assert_eq!(details.models.len(), previous_models.len());
-            assert_eq!(details.threads.len(), previous_threads);
-            assert!(state.has_visible_usage());
-        }
+        // Once the current local result reaches a terminal state, the same
+        // overdue timer owns exactly one next account request.
+        state.local_usage_pending = false;
+        state.schedule_resident_refresh(now);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(super::AccountCommand::Read)
+        ));
+        assert!(commands.try_recv().is_err());
     }
 
     #[test]
@@ -11079,8 +11027,9 @@ mod tests {
                 luna: 0,
             },
         );
+        let recovery_epoch = state.auth_epoch;
         state.apply_local_usage_success(LocalUsageResult {
-            auth_epoch: 0,
+            auth_epoch: recovery_epoch,
             reset_at,
             window_seconds: WEEK_SECONDS,
             model_usage: ModelUsageTotals::default(),
@@ -11113,8 +11062,9 @@ mod tests {
 
         state.apply_account_error("account bridge unavailable".into());
         assert!(state.recovery_requested);
+        let recovery_epoch = state.auth_epoch;
         state.apply_local_usage_success(LocalUsageResult {
-            auth_epoch: 0,
+            auth_epoch: recovery_epoch,
             reset_at,
             window_seconds: WEEK_SECONDS,
             model_usage: ModelUsageTotals::default(),
@@ -11292,10 +11242,12 @@ mod tests {
     #[test]
     fn resident_service_collects_commits_and_publishes_one_details_generation() {
         let mut state = CodexInfoState::preview("normal");
+        let mut publication = super::ResidentPublicationState::default();
         state.history.pending_store_samples = vec![state.history.samples[0].to_store()];
         let actions = std::cell::RefCell::new(Vec::new());
-        super::resident_service_cycle(
+        let outcome = super::resident_service_cycle(
             &mut state,
+            &mut publication,
             |_, pending| {
                 assert!(!pending.is_empty());
                 actions.borrow_mut().push("write");
@@ -11308,12 +11260,15 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(outcome, super::ResidentServiceCycleOutcome::Published);
         assert_eq!(*actions.borrow(), ["write", "publish"]);
+        assert!(publication.last_complete.is_some());
 
         let retained = state.history.samples[0].to_store();
         state.history.pending_store_samples = vec![retained.clone()];
         let result = super::resident_service_cycle(
             &mut state,
+            &mut publication,
             |_, _| Err("write rejected".into()),
             |_| panic!("a rejected write must not publish"),
         );
@@ -11468,7 +11423,9 @@ mod tests {
     #[test]
     fn local_success_is_the_only_path_that_commits_usage_and_history() {
         let mut state = CodexInfoState::preview("normal");
+        state.usage_snapshot_committed = false;
         let reset_at = state.reset_at.expect("preview reset");
+        state.history = UsageHistory::default();
         let mut totals = ModelUsageTotals::default();
         totals.add(
             "gpt-5.6-sol",
@@ -11771,7 +11728,12 @@ mod tests {
             state.account_error.is_some(),
             state.error.is_some(),
         ));
-        assert_eq!(state.public_details().state, PublicState::Error);
+        let details = state.public_details();
+        assert_eq!(details.state, PublicState::Error);
+        assert!(details.quota.is_none());
+        assert!(details.models.is_empty());
+        assert!(details.history_samples.is_empty());
+        assert!(details.threads.is_empty());
     }
 
     #[test]
@@ -14866,14 +14828,14 @@ mod tests {
     }
 
     #[test]
-    fn history_replaces_a_minute_without_discarding_the_previous_reset_period() {
+    fn history_canonicalizes_a_dominant_minute_without_discarding_the_previous_period() {
         let mut history = UsageHistory::default();
         let previous_reset_at = 1_700_100_000;
         let next_reset_at = 1_700_200_000;
         history.record(UsageHistorySample::new(
             1_700_000_001,
             previous_reset_at,
-            80.0,
+            75.0,
             ModelDollarTotals {
                 sol: 1.0,
                 terra: 2.0,
@@ -14890,9 +14852,11 @@ mod tests {
                 luna: 6.0,
             },
         ));
-        assert_eq!(history.samples.len(), 1);
-        assert_eq!(history.samples[0].remaining_percent, 75.0);
-        assert_eq!(history.samples[0].sol_dollars, 4.0);
+        assert_eq!(history.samples.len(), 2);
+        let previous = history.samples_for_reset(Some(previous_reset_at));
+        assert_eq!(previous.len(), 1);
+        assert_eq!(previous[0].remaining_percent, 75.0);
+        assert_eq!(previous[0].sol_dollars, 4.0);
 
         history.record(UsageHistorySample::new(
             1_700_000_120,
@@ -14900,7 +14864,7 @@ mod tests {
             70.0,
             ModelDollarTotals::default(),
         ));
-        assert_eq!(history.samples.len(), 2);
+        assert_eq!(history.samples.len(), 3);
         assert!(history
             .samples
             .iter()
@@ -15014,7 +14978,7 @@ mod tests {
     }
 
     #[test]
-    fn record_rejects_alias_quota_collision_before_canonical_merge() {
+    fn record_preserves_alias_quota_collision_for_canonical_rejection() {
         let mut history = UsageHistory::default();
         let base_reset = 2_000_000_i64;
         history.record(UsageHistorySample::new(
@@ -15034,12 +14998,11 @@ mod tests {
         ));
 
         let selected = history.samples_for_reset(Some(base_reset));
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].remaining_percent, -1.0);
-        assert_eq!(selected[0].sol_dollars, 1.0);
-        assert!(!selected
-            .iter()
-            .any(|sample| (sample.remaining_percent - 14.0).abs() < f64::EPSILON));
+        assert!(selected.is_empty());
+        assert_eq!(
+            canonicalize_public_history_samples(&history.samples),
+            Err(super::HistoryCanonicalizationError::ConflictingQuota)
+        );
     }
 
     #[test]
@@ -15073,9 +15036,46 @@ mod tests {
         };
 
         let selected = history.samples_for_reset(Some(reset_at));
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].remaining_percent, -1.0);
-        assert_eq!(selected[0].luna_dollars, 7.6);
+        assert!(selected.is_empty());
+        assert_eq!(
+            canonicalize_public_history_samples(&history.samples),
+            Err(super::HistoryCanonicalizationError::ConflictingQuota)
+        );
+    }
+
+    #[test]
+    fn exact_key_noncomparable_observations_never_form_a_synthetic_vector() {
+        let mut history = UsageHistory::default();
+        let timestamp = 1_788_040_140;
+        let reset_at = 1_788_644_929;
+        let first = UsageHistorySample {
+            timestamp,
+            reset_at,
+            remaining_percent: 41.0,
+            sol_dollars: 9.0,
+            terra_dollars: 1.0,
+            luna_dollars: 0.0,
+            sol_tokens: 90,
+            terra_tokens: 10,
+            luna_tokens: 0,
+        };
+        let second = UsageHistorySample {
+            sol_dollars: 8.0,
+            terra_dollars: 2.0,
+            sol_tokens: 80,
+            terra_tokens: 20,
+            ..first.clone()
+        };
+
+        history.record(first.clone());
+        history.record(second.clone());
+
+        assert_eq!(history.samples, [first, second]);
+        assert_eq!(
+            canonicalize_public_history_samples(&history.samples),
+            Err(super::HistoryCanonicalizationError::NonComparableCumulativeUsage)
+        );
+        assert!(history.samples_for_reset(Some(reset_at)).is_empty());
     }
 
     #[test]
@@ -17733,18 +17733,12 @@ mod tests {
                 ..UsageHistory::default()
             };
             let selected = history.samples_for_reset(Some(base_reset + drift + 30));
-            assert_eq!(selected.len(), 2, "drift={drift}");
-            assert_eq!(selected[0].remaining_percent, -1.0, "drift={drift}");
-            assert_eq!(selected[1].remaining_percent, 87.0, "drift={drift}");
-            let references = selected.iter().collect::<Vec<_>>();
-            let points = remaining_graph_points(&references, 960_000, 960_120);
-            assert!(
-                points.iter().all(|(_, value)| *value >= 87.0),
+            assert!(selected.is_empty(), "drift={drift}");
+            assert_eq!(
+                canonicalize_public_history_samples(&history.samples),
+                Err(super::HistoryCanonicalizationError::ConflictingQuota),
                 "drift={drift}"
             );
-            assert!(!points
-                .iter()
-                .any(|(_, value)| (*value - 14.0).abs() < f64::EPSILON));
         }
     }
 

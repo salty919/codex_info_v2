@@ -96,7 +96,8 @@ for required_test in \
     singleton_reset_snapshot_overlapping_a_spend_period_stays_separate \
     graph_collision_preview_matches_the_historical_singleton_oracle \
     moving_reset_collision_at_30_and_60_seconds_fails_closed \
-    record_rejects_alias_quota_collision_before_canonical_merge \
+    record_preserves_alias_quota_collision_for_canonical_rejection \
+    exact_key_noncomparable_observations_never_form_a_synthetic_vector \
     same_timestamp_reset_drift_above_jitter_fails_closed \
     startup_load_sanitizes_legacy_same_timestamp_quota_collision \
     history_canonicalizer_uses_one_existing_dominant_vector_with_nullable_aliases \
@@ -108,7 +109,8 @@ for required_test in \
     single_details_root_strict_validation_rejects_partial_and_stale_generations \
     periodic_ui_timer_consumes_only_single_details_root \
     resident_service_collects_commits_and_publishes_one_details_generation \
-    periodic_quota_refresh_retains_last_good_main_snapshot \
+    resident_publication_holds_incomplete_usage_and_errors_without_mixing_roots \
+    periodic_quota_refresh_does_not_overlap_account_generations \
     product_version_is_visible_once_on_native_main_surface \
     public_snapshot_is_whitelisted_and_tracks_auth_state; do
     require_rust_test_pass "tests::$required_test"
@@ -117,6 +119,8 @@ require_rust_test_pass \
     'thread_contract::tests::recoverable_rollout_parser_skips_only_malformed_token_count_records'
 require_rust_test_pass \
     'usage_store::tests::read_only_open_never_creates_or_repairs_the_store'
+require_rust_test_pass \
+    'usage_store::tests::usage_store_batch_rejects_noncomparable_existing_and_rolls_back_new_rows'
 for required_thread_failure_test in \
     thread_c_all_current_cycle_failure_classes_return_no_partial_snapshot \
     thread_c_candidate_failure_rejects_the_complete_cycle \

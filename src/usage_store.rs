@@ -3,7 +3,9 @@
 
 use chrono::{DateTime, Months, Utc};
 use rusqlite::types::Value;
-use rusqlite::{params, Connection, DatabaseName, OpenFlags, OptionalExtension};
+use rusqlite::{
+    params, Connection, DatabaseName, OpenFlags, OptionalExtension, TransactionBehavior,
+};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
@@ -83,13 +85,13 @@ INSERT INTO usage_history (
 )
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
 ON CONFLICT (reset_at, timestamp) DO UPDATE SET
-    remaining_percent = COALESCE(excluded.remaining_percent, usage_history.remaining_percent),
-    sol_dollars = MAX(usage_history.sol_dollars, excluded.sol_dollars),
-    terra_dollars = MAX(usage_history.terra_dollars, excluded.terra_dollars),
-    luna_dollars = MAX(usage_history.luna_dollars, excluded.luna_dollars),
-    sol_tokens = MAX(usage_history.sol_tokens, excluded.sol_tokens),
-    terra_tokens = MAX(usage_history.terra_tokens, excluded.terra_tokens),
-    luna_tokens = MAX(usage_history.luna_tokens, excluded.luna_tokens)
+    remaining_percent = excluded.remaining_percent,
+    sol_dollars = excluded.sol_dollars,
+    terra_dollars = excluded.terra_dollars,
+    luna_dollars = excluded.luna_dollars,
+    sol_tokens = excluded.sol_tokens,
+    terra_tokens = excluded.terra_tokens,
+    luna_tokens = excluded.luna_tokens
 "#;
 
 /// Returns the UTC instant three calendar months before `now`.
@@ -289,6 +291,117 @@ impl UsageHistorySample {
 
         Ok(())
     }
+}
+
+fn usage_vector_dominates(candidate: &UsageHistorySample, observed: &UsageHistorySample) -> bool {
+    candidate.sol_dollars >= observed.sol_dollars
+        && candidate.terra_dollars >= observed.terra_dollars
+        && candidate.luna_dollars >= observed.luna_dollars
+        && candidate.sol_tokens >= observed.sol_tokens
+        && candidate.terra_tokens >= observed.terra_tokens
+        && candidate.luna_tokens >= observed.luna_tokens
+}
+
+fn canonicalize_sample_group(samples: &[UsageHistorySample]) -> Result<UsageHistorySample> {
+    debug_assert!(!samples.is_empty());
+
+    let quota = samples
+        .iter()
+        .filter_map(|sample| sample.remaining_percent)
+        .try_fold(None, |quota: Option<f64>, observed| {
+            if let Some(existing) = quota {
+                if existing != observed {
+                    return Err(UsageStoreError::InvalidImport(format!(
+                        "conflicting remaining_percent values for ({}, {})",
+                        samples[0].reset_at, samples[0].timestamp
+                    )));
+                }
+                Ok(Some(existing))
+            } else {
+                Ok(Some(observed))
+            }
+        })?;
+
+    let canonical = samples
+        .iter()
+        .find(|candidate| {
+            samples
+                .iter()
+                .all(|observed| usage_vector_dominates(candidate, observed))
+        })
+        .cloned()
+        .ok_or_else(|| {
+            UsageStoreError::InvalidImport(format!(
+                "non-comparable usage vectors for ({}, {})",
+                samples[0].reset_at, samples[0].timestamp
+            ))
+        })?;
+
+    // The usage vector remains an observed whole vector. A single non-null
+    // quota is the only value allowed to be carried across observations when
+    // the dominating observation omitted it.
+    Ok(UsageHistorySample {
+        remaining_percent: quota,
+        ..canonical
+    })
+}
+
+fn canonicalize_samples(
+    transaction: &rusqlite::Transaction<'_>,
+    samples: &[UsageHistorySample],
+) -> Result<Vec<UsageHistorySample>> {
+    let mut grouped = std::collections::BTreeMap::<(i64, i64), Vec<UsageHistorySample>>::new();
+    for sample in samples {
+        sample.validate()?;
+        grouped
+            .entry((sample.reset_at, sample.timestamp))
+            .or_default()
+            .push(sample.clone());
+    }
+
+    let mut existing_statement = transaction.prepare(
+        "SELECT timestamp, reset_at, remaining_percent, sol_dollars, \
+                terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens \
+         FROM usage_history WHERE reset_at = ?1 AND timestamp = ?2",
+    )?;
+    for ((reset_at, timestamp), observations) in &mut grouped {
+        let existing = existing_statement
+            .query_row(params![*reset_at, *timestamp], |row| {
+                let sample = valid_sample_from_row(row)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                sample.ok_or(rusqlite::Error::InvalidQuery)
+            })
+            .optional()?;
+        if let Some(existing) = existing {
+            observations.insert(0, existing);
+        }
+    }
+
+    grouped
+        .values()
+        .map(|group| canonicalize_sample_group(group))
+        .collect()
+}
+
+fn upsert_canonical_samples(
+    transaction: &rusqlite::Transaction<'_>,
+    samples: &[UsageHistorySample],
+) -> Result<()> {
+    let mut statement = transaction.prepare(UPSERT_SAMPLE)?;
+    for sample in samples {
+        statement.execute(params![
+            sample.timestamp,
+            sample.reset_at,
+            sample.remaining_percent,
+            sample.sol_dollars,
+            sample.terra_dollars,
+            sample.luna_dollars,
+            sample.sol_tokens as i64,
+            sample.terra_tokens as i64,
+            sample.luna_tokens as i64,
+        ])?;
+    }
+    Ok(())
 }
 
 fn numeric_sqlite_value(value: Value) -> Option<f64> {
@@ -1088,65 +1201,35 @@ impl UsageStore {
         build_reset_periods(samples)
     }
 
-    /// Inserts a sample or updates the sample with the same reset window and minute.
-    ///
-    /// A missing remaining-quota value never erases an already stored value.
+    /// Inserts a sample or canonicalizes it with the row at the same exact key.
     pub fn upsert_sample(&self, sample: &UsageHistorySample) -> Result<()> {
-        sample.validate()?;
         // Even the one-row convenience path uses an explicit transaction, so
         // every history mutation has the same all-or-nothing boundary as a
-        // batch write. `unchecked_transaction` is the rusqlite variant that
-        // preserves this method's shared-reference API.
-        let transaction = self.connection.unchecked_transaction()?;
-        transaction.execute(
-            UPSERT_SAMPLE,
-            params![
-                sample.timestamp,
-                sample.reset_at,
-                sample.remaining_percent,
-                sample.sol_dollars,
-                sample.terra_dollars,
-                sample.luna_dollars,
-                sample.sol_tokens as i64,
-                sample.terra_tokens as i64,
-                sample.luna_tokens as i64,
-            ],
-        )?;
+        // batch write. `new_unchecked` preserves this method's shared-
+        // reference API while taking the immediate writer lock.
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let canonical = canonicalize_samples(&transaction, std::slice::from_ref(sample))?;
+        upsert_canonical_samples(&transaction, &canonical)?;
         transaction.commit()?;
         Ok(())
     }
 
     /// Atomically upserts several samples after validating the complete batch.
     pub fn upsert_samples(&mut self, samples: &[UsageHistorySample]) -> Result<()> {
-        for sample in samples {
-            sample.validate()?;
-        }
-
-        let transaction = self.connection.transaction()?;
-        {
-            let mut statement = transaction.prepare(UPSERT_SAMPLE)?;
-            for sample in samples {
-                statement.execute(params![
-                    sample.timestamp,
-                    sample.reset_at,
-                    sample.remaining_percent,
-                    sample.sol_dollars,
-                    sample.terra_dollars,
-                    sample.luna_dollars,
-                    sample.sol_tokens as i64,
-                    sample.terra_tokens as i64,
-                    sample.luna_tokens as i64,
-                ])?;
-            }
-        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let canonical = canonicalize_samples(&transaction, samples)?;
+        upsert_canonical_samples(&transaction, &canonical)?;
         transaction.commit()?;
         Ok(())
     }
 
-    /// Inserts already-decoded samples without replacing existing data.
+    /// Inserts already-decoded samples, replacing rows with matching keys.
     ///
-    /// Validation happens before the transaction starts, and the same
-    /// composite key is merged idempotently.
+    /// Validation and exact-key canonicalization happen inside the immediate
+    /// transaction before any row is changed, and writes are atomic.
     pub fn import_samples(&mut self, samples: &[UsageHistorySample]) -> Result<usize> {
         self.upsert_samples(samples)?;
         Ok(samples.len())
@@ -1159,13 +1242,12 @@ impl UsageStore {
         data_hash: &str,
         snapshot_json: &str,
     ) -> Result<DurableRecord> {
-        for sample in samples {
-            sample.validate()?;
-        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let canonical = canonicalize_samples(&transaction, samples)?;
         validate_data_hash(data_hash)?;
         validate_snapshot_json(snapshot_json)?;
-
-        let transaction = self.connection.transaction()?;
         let current_raw: Option<(i64, String, String)> = transaction
             .query_row(
                 "SELECT data_generation, data_hash, snapshot_json \
@@ -1197,22 +1279,7 @@ impl UsageStore {
         let sqlite_generation =
             i64::try_from(next_generation).map_err(|_| UsageStoreError::GenerationOverflow)?;
 
-        {
-            let mut statement = transaction.prepare(UPSERT_SAMPLE)?;
-            for sample in samples {
-                statement.execute(params![
-                    sample.timestamp,
-                    sample.reset_at,
-                    sample.remaining_percent,
-                    sample.sol_dollars,
-                    sample.terra_dollars,
-                    sample.luna_dollars,
-                    sample.sol_tokens as i64,
-                    sample.terra_tokens as i64,
-                    sample.luna_tokens as i64,
-                ])?;
-            }
-        }
+        upsert_canonical_samples(&transaction, &canonical)?;
         transaction.execute(
             "INSERT INTO durable_state (singleton, data_generation, data_hash, snapshot_json) \
              VALUES (1, ?1, ?2, ?3) \
@@ -1654,16 +1721,72 @@ mod tests {
     }
 
     #[test]
-    fn usage_store_same_key_replaces_value() {
+    fn usage_store_same_key_dominant_replaces_whole_value() {
         let path = database_path("replacement");
         let first = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
-        let replacement = sample(1_700_000_060, 1_700_604_800, Some(60.0), 9.5);
+        let replacement = sample(1_700_000_060, 1_700_604_800, Some(75.0), 9.5);
 
         let store = UsageStore::open(&path).unwrap();
         store.upsert_sample(&first).unwrap();
         store.upsert_sample(&replacement).unwrap();
 
         assert_eq!(store.load_all().unwrap(), vec![replacement]);
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn usage_store_rejects_exact_key_quota_conflict_atomically() {
+        let path = database_path("quota-conflict");
+        let existing = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.0);
+        let conflicting = sample(1_700_000_060, 1_700_604_800, Some(60.0), 2.0);
+
+        let store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&existing).unwrap();
+        assert!(store.upsert_sample(&conflicting).is_err());
+        assert_eq!(store.load_all().unwrap(), vec![existing]);
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn usage_store_batch_rejects_noncomparable_existing_and_rolls_back_new_rows() {
+        let path = database_path("batch-rollback");
+        let mut existing = sample(1_700_000_060, 1_700_604_800, Some(75.0), 5.0);
+        existing.terra_dollars = 1.0;
+        let mut conflicting = existing.clone();
+        conflicting.sol_dollars = 1.0;
+        conflicting.terra_dollars = 5.0;
+        let new_row = sample(1_700_000_120, 1_700_604_800, Some(75.0), 9.0);
+
+        let mut store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&existing).unwrap();
+        assert!(store.upsert_samples(&[new_row, conflicting]).is_err());
+        assert_eq!(store.load_all().unwrap(), vec![existing]);
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn usage_store_batch_keeps_observed_dominant_vector_and_unique_quota() {
+        let path = database_path("batch-dominant");
+        let existing = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.0);
+        let mut lower_observation = existing.clone();
+        lower_observation.remaining_percent = None;
+        let mut dominant = existing.clone();
+        dominant.remaining_percent = None;
+        dominant.sol_dollars = 2.0;
+        dominant.terra_dollars = 4.0;
+        dominant.sol_tokens = 44;
+
+        let mut store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&existing).unwrap();
+        store
+            .upsert_samples(&[lower_observation, dominant.clone()])
+            .unwrap();
+
+        dominant.remaining_percent = Some(75.0);
+        assert_eq!(store.load_all().unwrap(), vec![dominant]);
         drop(store);
         remove_database(&path);
     }
@@ -1726,6 +1849,7 @@ mod tests {
         let mut second = first.clone();
         second.sol_dollars = 4.5;
         second.sol_tokens = 900;
+        let expected_second = second.clone();
         let left_path = path.clone();
         let left_barrier = Arc::clone(&barrier);
         let left = std::thread::spawn(move || {
@@ -1744,8 +1868,7 @@ mod tests {
         right.join().unwrap();
         let rows = UsageStore::open(&path).unwrap().load_all().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].sol_dollars, 4.5);
-        assert_eq!(rows[0].sol_tokens, 900);
+        assert_eq!(rows[0], expected_second);
         remove_database(&path);
     }
 
@@ -1880,7 +2003,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_store_missing_remaining_does_not_erase_existing_value() {
+    fn usage_store_missing_remaining_keeps_existing_quota_for_dominant_update() {
         let path = database_path("nullable-update");
         let observed = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
         let missing = sample(1_700_000_060, 1_700_604_800, None, 9.5);
@@ -1891,17 +2014,20 @@ mod tests {
 
         let actual = store.load_all().unwrap();
         assert_eq!(actual.len(), 1);
-        assert_eq!(actual[0].remaining_percent, Some(75.0));
-        assert_eq!(actual[0].sol_dollars, 9.5);
+        let expected = UsageHistorySample {
+            remaining_percent: Some(75.0),
+            ..missing
+        };
+        assert_eq!(actual, vec![expected]);
         drop(store);
         remove_database(&path);
     }
 
     #[test]
-    fn usage_store_smaller_cumulative_cost_does_not_erase_existing_value() {
+    fn usage_store_smaller_whole_vector_does_not_replace_existing_value() {
         let path = database_path("cumulative-cost");
         let larger = sample(1_700_000_060, 1_700_604_800, Some(75.0), 9.5);
-        let smaller = sample(1_700_000_060, 1_700_604_800, Some(74.0), 1.25);
+        let smaller = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
 
         let store = UsageStore::open(&path).unwrap();
         store.upsert_sample(&larger).unwrap();
@@ -1909,8 +2035,7 @@ mod tests {
 
         let actual = store.load_all().unwrap();
         assert_eq!(actual.len(), 1);
-        assert_eq!(actual[0].remaining_percent, Some(74.0));
-        assert_eq!(actual[0].sol_dollars, 9.5);
+        assert_eq!(actual, vec![larger]);
         drop(store);
         remove_database(&path);
     }
