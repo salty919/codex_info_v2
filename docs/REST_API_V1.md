@@ -166,8 +166,11 @@ dollarは有限かつ0以上のJSON numberである。ドルはcreditや為替�
 観測時刻、途中で次期間へ切り替わった過去期間では次期間開始へclipできるため、`end_at`をcanonical
 reset境界として代用してはならない。clientは`id`をparseせず、sampleの`reset_at`がperiodの
 `reset_at - 60 <= sample.reset_at <= reset_at`に入るものだけを同periodへcanonicalizeする。各sampleは
-exactly one periodへ所属し、そのperiodの`start_at <= timestamp <= end_at`を満たす。raw
-`(sample.reset_at,timestamp)`が一意でも、canonicalize後の`(period.id,timestamp)`が衝突するcandidateは
+exactly one periodへ所属し、そのperiodの`start_at <= timestamp <= end_at`を満たす。実reset境界の秒を
+minute-startへ丸めたため旧cycle末尾と新cycle先頭が同じ分になる場合は、旧cycleがその分で終了し、
+新cycleがその分から始まって後続分へ継続することを既存時系列から確認できるときだけ、新cycleが境界分を
+所有する。旧cycle側の境界rowはpublic candidateへ含めずraw SQLiteには残す。それ以外でraw
+`(sample.reset_at,timestamp)`が一意でもcanonicalize後の`(period.id,timestamp)`が衝突するcandidateは、
 同一分に異なる残量・累積値を並べて垂直変化を作り得るため全体rejectする。merge、max、last-row、null化、
 array順選択で衝突を隠さない。
 
@@ -175,11 +178,14 @@ public candidateを構築する前に、resident serviceの`HistoryCanonicalizer
 履歴DB readをstorage scopeとし、既存の`timestamp/reset_at`観測だけで同一と検証できたcycleと同じminute-startに
 属するrowだけを一組にする。exact reset/許容内jitterと、reset前進量が観測時刻の前進量に追随するbounded rolling
 chainだけを同cycleとし、group内最大`reset_at`をcanonical resetとする。新しいpartition列や永続CycleSeqを
-legacy回復の前提にしない。distinct non-null quotaが0または1個で、
+legacy回復の前提にしない。quota観測を持たずquota確認済みcycleと時間範囲が重なるbackfill reset群と、
+継続するquota確認済みcycleの時間範囲内だけに存在するreset断片はperiod authorityにせず、raw SQLiteへ残したまま
+public viewから除外する。distinct non-null quotaが0または1個で、
 既存のcumulative vector `(sol_dollars, terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens)`のうち
 全rowをcomponentwiseに支配する既存vector値が存在する場合だけ、そのquota（0個なら`null`）とdominant vectorを
-1 logical sampleとして採用する。quota競合、dominant vector不存在・非一意、非比較vector、
-storage scope/cycle/minute/period境界不明はcandidate全体をrejectしてlast-good details generationを保持する。
+1 logical sampleとして採用する。quota競合またはdominant vector不存在・非比較となったminuteは値を選択・合成せず
+そのminuteだけpublic viewへ含めない。別cycle間の所属を時系列から一意にできない場合はcandidate全体をrejectして
+last-good details generationを保持する。
 同値duplicateは同じvector値として冪等に扱う。
 残量100%、7日窓、quota-onlyなど値の形を除外条件にせず、component別max、last-row、null化、任意mergeで
 sourceにないvectorを作らない。canonicalization後もraw `(reset_at,timestamp)`とcanonical
@@ -275,9 +281,12 @@ lineage、load profileは`DATA_PROTECTION_POLICY.md` §8を正本とする。本
 
 ### Health response
 
-`GET /v1/health`の200 bodyはUTF-8 JSON objectでexact key集合を`api_version,service`、値を
-`api_version="v1"`、`service="codex-info"`へ固定する。unknown、missing、duplicate、case-altered key、
-別値、control/bidi、trailing non-whitespace、depth追加を拒否する。transfer-decoded bodyは1 KiB以下である。
+`GET /v1/health`の200 bodyはUTF-8 JSON objectでexact key集合を
+`api_version,service,product_version`、値を`api_version="v1"`、`service="codex-info"`、
+`product_version`をCargo/Windowsの単一stable `X.Y.Z` authorityへ固定する。unknown、missing、duplicate、
+case-altered key、別値、client自身と異なるproduct version、control/bidi、trailing non-whitespace、depth追加を
+拒否する。transfer-decoded bodyは1 KiB以下である。旧2-key healthはLinux launcherが同一profileの検証済み
+ownerを更新するためだけに識別し、そのserviceのdetailsは表示へ受理しない。
 health 200はresident serviceがread-only snapshot requestを受理でき、schema-validなimmutable details generationを
 保持しているreadinessを表す。認証済み、detailsの`state=ready`、DBの最新収集成功は意味しない。
 

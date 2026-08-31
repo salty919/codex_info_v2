@@ -38,6 +38,12 @@ function Resolve-E2EOutputDirectory {
 
 $script:e2eOutput = Resolve-E2EOutputDirectory $OutputDirectory
 $script:e2eRepositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..')).TrimEnd([char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar))
+$versionPropsPath = Join-Path $script:e2eRepositoryRoot 'windows-client/Directory.Build.props'
+[xml]$versionProps = Get-Content -LiteralPath $versionPropsPath -Raw
+$script:e2eProductVersion = [string]$versionProps.Project.PropertyGroup.Version
+if ($script:e2eProductVersion -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+    throw "E2E product version is not stable X.Y.Z: '$script:e2eProductVersion'."
+}
 if ($script:e2eOutput.Equals($script:e2eRepositoryRoot, [StringComparison]::OrdinalIgnoreCase) -or
     $script:e2eOutput.StartsWith($script:e2eRepositoryRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'E2E artifacts must be written outside the repository.'
@@ -486,16 +492,18 @@ public static class CodexInfoWindowsE2EFixtureServer {
     private static volatile bool running;
     private static string detailsBody;
     private static string publishedPair;
+    private static string productVersion;
     private static int healthRequests;
     private static int detailsRequests;
     private static int preflightRequests;
     private static int clientRequests;
 
-    public static bool Start(string details, string pair, int port) {
+    public static bool Start(string details, string pair, string version, int port) {
         if (running) return false;
         try {
             detailsBody = details;
             publishedPair = pair;
+            productVersion = version;
             healthRequests = 0;
             detailsRequests = 0;
             preflightRequests = 0;
@@ -580,7 +588,7 @@ public static class CodexInfoWindowsE2EFixtureServer {
                     RecordRequestPhase(request);
                     code = 200;
                     reason = "OK";
-                    body = "{\"api_version\":\"v1\",\"service\":\"codex-info\"}";
+                    body = "{\"api_version\":\"v1\",\"service\":\"codex-info\",\"product_version\":\"" + productVersion + "\"}";
                 }
                 else if (parts[1] == "/v1/details") {
                     Interlocked.Increment(ref detailsRequests);
@@ -2044,6 +2052,16 @@ function Assert-E2EFixtureWireContract {
     $detailsPairs = @(Get-E2EFixtureHeaderValues -Response $Details -Name 'Codex-Info-Published-Pair')
     Assert-E2E ($healthPairs.Count -eq 0) "Fixture health must not expose Codex-Info-Published-Pair: count=$($healthPairs.Count)."
     Assert-E2E ($detailsPairs.Count -eq 1) "Fixture details must expose exactly one Codex-Info-Published-Pair: count=$($detailsPairs.Count)."
+    try {
+        $healthJson = ConvertFrom-Json -InputObject ([string]$Health.Body)
+    }
+    catch {
+        throw "Fixture health body is not valid JSON: $($_.Exception.Message)"
+    }
+    Assert-E2EFixtureJsonKeys -Json $healthJson -Expected @('api_version', 'service', 'product_version') -Endpoint 'Fixture health'
+    Assert-E2E ([string]$healthJson.api_version -ceq 'v1') "Fixture health api_version is invalid."
+    Assert-E2E ([string]$healthJson.service -ceq 'codex-info') "Fixture health service is invalid."
+    Assert-E2E ([string]$healthJson.product_version -ceq $script:e2eProductVersion) "Fixture health product_version does not match the client."
     $detailsPair = [string]$detailsPairs[0]
     Assert-E2E ($detailsPair -cmatch '^v1:[0-9a-f]{64}$') "Fixture details published pair is not canonical lowercase v1/sha256: '$detailsPair'."
     try {
@@ -2151,7 +2169,7 @@ function Enter-E2EFixture {
     New-Item -ItemType Directory -Path $settingsDirectory -Force | Out-Null
     $settingsJson = '{"language":"en","setupCompleted":true,"connectionConfigured":true,"timeZoneId":"UTC","connectionProfile":"none","connectionSelector":"none"}'
     [IO.File]::WriteAllText($script:e2eSettingsPath, $settingsJson, [Text.UTF8Encoding]::new($false))
-    Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start($documents.Details, $documents.PublishedPair, $script:e2eFixturePort)) "Could not bind the fixture to loopback port $script:e2eFixturePort."
+    Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start($documents.Details, $documents.PublishedPair, $script:e2eProductVersion, $script:e2eFixturePort)) "Could not bind the fixture to loopback port $script:e2eFixturePort."
     $script:e2eFixtureRunning = $true
     Write-E2E "fixture: PASS periods=2 threads=3 endpoint=http://127.0.0.1:$script:e2eFixturePort"
 }
@@ -2477,13 +2495,19 @@ function Invoke-E2EGraphOracleSelfTest {
 
 function Invoke-E2EFixtureContractTests {
     $documents = New-E2EFixtureDocuments
-    $health = New-E2EContractTestResponse -StatusCode 200 -Body '{"api_version":"v1","service":"codex-info"}' -Headers ([ordered]@{})
+    $healthBody = '{"api_version":"v1","service":"codex-info","product_version":"' + $script:e2eProductVersion + '"}'
+    $health = New-E2EContractTestResponse -StatusCode 200 -Body $healthBody -Headers ([ordered]@{})
     $pairHeaders = [ordered]@{
         'Codex-Info-Published-Pair' = @($documents.PublishedPair)
     }
     $details = New-E2EContractTestResponse -StatusCode 200 -Body $documents.Details -Headers $pairHeaders
     Assert-E2EFixturePreflightResponses -Health $health -Details $details | Out-Null
     Write-E2E 'fixture-contract: PASS valid response'
+
+    $legacyHealth = New-E2EContractTestResponse -StatusCode 200 -Body '{"api_version":"v1","service":"codex-info"}' -Headers ([ordered]@{})
+    Assert-E2EExpectedContractFailure -Name 'health-version-missing' -Health $legacyHealth -Details $details
+    $mismatchedHealth = New-E2EContractTestResponse -StatusCode 200 -Body '{"api_version":"v1","service":"codex-info","product_version":"0.0.0"}' -Headers ([ordered]@{})
+    Assert-E2EExpectedContractFailure -Name 'health-version-mismatch' -Health $mismatchedHealth -Details $details
 
     $missingPairDetails = New-E2EContractTestResponse -StatusCode 200 -Body $documents.Details -Headers ([ordered]@{})
     Assert-E2EExpectedContractFailure -Name 'pair-missing' -Health $health -Details $missingPairDetails
@@ -2599,7 +2623,7 @@ try {
     if ($FixtureContractTest) {
         Write-E2E 'fixture-contract-test: start'
         $contractDocuments = New-E2EFixtureDocuments
-        Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start($contractDocuments.Details, $contractDocuments.PublishedPair, 0)) 'Could not bind the fixture contract test to an ephemeral loopback port.'
+        Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start($contractDocuments.Details, $contractDocuments.PublishedPair, $script:e2eProductVersion, 0)) 'Could not bind the fixture contract test to an ephemeral loopback port.'
         $script:e2eFixturePort = [CodexInfoWindowsE2EFixtureServer]::BoundPort()
         $script:e2eFixtureRunning = $true
         Write-E2E 'fixture-contract-test: fixture server started without launching the client'

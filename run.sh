@@ -35,4 +35,24 @@ if [[ -z "$CODEX_INFO_CARGO" || ! -x "$CODEX_INFO_CARGO" ]]; then
     exit 127
 fi
 
-exec "$CODEX_INFO_CARGO" run --manifest-path "$BASE_DIR/Cargo.toml" --release --locked -- "$@"
+"$CODEX_INFO_CARGO" build --manifest-path "$BASE_DIR/Cargo.toml" --release --locked
+
+TARGET_BINARY="$BASE_DIR/target/release/codex_info"
+CODEX_INFO_HOME="${HOME:-}"
+
+service_using_normal_launch() {
+    if (( $# == 0 )); then
+        return 0
+    fi
+    [[ $# == 1 && "$1" == "--ui" ]]
+}
+
+if service_using_normal_launch "$@" \
+    && [[ -n "$CODEX_INFO_HOME" ]] \
+    && command -v systemctl >/dev/null 2>&1 \
+    && systemctl --user is-enabled --quiet codex-info.service \
+    && ! cmp -s -- "$CODEX_INFO_HOME/.local/bin/codex_info" "$TARGET_BINARY"; then
+    "$BASE_DIR/scripts/install_systemd_recorder.sh" --binary "$TARGET_BINARY"
+fi
+
+exec "$TARGET_BINARY" "$@"

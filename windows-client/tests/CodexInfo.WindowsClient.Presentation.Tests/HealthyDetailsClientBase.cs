@@ -13,7 +13,7 @@ internal abstract class HealthyDetailsClientBase : ILoopbackDetailsClient, ILoop
 {
     public virtual Task<HealthFetchResult> FetchHealthAsync(
         CancellationToken cancellationToken = default) =>
-        Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info")));
+        Task.FromResult(HealthFetchResult.Success(new ApiHealthSnapshot("v1", "codex-info", ProductInfo.Version)));
 
     public Task<DetailsFetchResult> FetchDetailsAsync(
         CancellationToken cancellationToken = default) =>

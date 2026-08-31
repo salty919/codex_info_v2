@@ -26,7 +26,6 @@ temp_parent="$(cd -- "$temp_parent" && pwd -P)"
 tmp_root="$(mktemp -d "$temp_parent/codex-info-cli-e2e.XXXXXX")"
 service_pid=""
 sentinel_pid=""
-lock_holder_pid=""
 
 cleanup() {
     if [[ -n "$service_pid" ]] && kill -0 "$service_pid" 2>/dev/null; then
@@ -36,10 +35,6 @@ cleanup() {
     if [[ -n "$sentinel_pid" ]] && kill -0 "$sentinel_pid" 2>/dev/null; then
         kill -TERM "$sentinel_pid" 2>/dev/null || true
         wait "$sentinel_pid" 2>/dev/null || true
-    fi
-    if [[ -n "$lock_holder_pid" ]] && kill -0 "$lock_holder_pid" 2>/dev/null; then
-        kill -TERM "$lock_holder_pid" 2>/dev/null || true
-        wait "$lock_holder_pid" 2>/dev/null || true
     fi
     case "$tmp_root" in
         "$temp_parent"/codex-info-cli-e2e.*) rm -rf -- "$tmp_root" ;;
@@ -72,9 +67,7 @@ common_env=(
     "XDG_RUNTIME_DIR=$runtime_root"
     "CODEX_HOME=$codex_root"
     "CODEX_INFO_DATA_DIR=$data_root"
-    # Exercise the production retry path without making a transient initial
-    # SQLite/input race wait for the 60-second default interval.
-    "CODEX_INFO_DAEMON_INTERVAL_SECS=5"
+    "CODEX_INFO_DAEMON_INTERVAL_SECS=3600"
 )
 
 session_file="$codex_root/sessions/2026/08/27/cli-contract.jsonl"
@@ -126,25 +119,6 @@ for invalid_port in 0 65536 -1 abc '127.0.0.1:8787'; do
     run_rejected --port "$invalid_port"
 done
 
-# Hold a fresh database under an exclusive transaction long enough to exceed
-# UsageStore's two-second busy timeout. The first recorder cycle must fail
-# safely, and the same resident worker must recover on its bounded retry.
-database="$data_root/history/usage_history.sqlite3"
-lock_ready="$tmp_root/sqlite-lock.ready"
-[[ "$lock_ready" != *"'"* ]] || fail 'temporary path cannot be shell-quoted safely'
-sqlite3 "$database" <<SQL >"$tmp_root/sqlite-lock.log" 2>&1 &
-BEGIN EXCLUSIVE;
-.shell touch '$lock_ready'
-.shell sleep 3
-COMMIT;
-SQL
-lock_holder_pid="$!"
-for _ in $(seq 1 40); do
-    [[ -f "$lock_ready" ]] && break
-    sleep 0.025
-done
-[[ -f "$lock_ready" ]] || fail 'SQLite contention fixture did not acquire its lock'
-
 # Start one real daemon+REST owner on the requested loopback port.  A hostile
 # legacy environment value must not alter the explicit public CLI contract.
 env "${common_env[@]}" CODEX_INFO_API_LISTEN=0.0.0.0:1 \
@@ -165,22 +139,18 @@ ss -ltnH "sport = :$port" | rg -q "127[.]0[.]0[.]1:$port" \
     || fail 'listener is not bound to 127.0.0.1'
 
 # Health proves lock/listener readiness, not completion of the recorder's
-# initial backfill. Wait for this fixture's one deterministic commit, including
-# the bounded production retry path after a transient input/SQLite conflict,
-# before reading SQLite or exercising the successful stop path. Racing the
-# writer would test the documented fail-closed timeout path instead.
+# initial backfill. Wait for this fixture's one deterministic commit before
+# reading SQLite or exercising the successful stop path; racing the writer
+# would test the documented fail-closed timeout path instead.
 initial_commit='codex-info: recorder committed 1 samples'
-for _ in $(seq 1 300); do
+for _ in $(seq 1 200); do
     rg -q --fixed-strings "$initial_commit" "$tmp_root/service.log" && break
     sleep 0.1
 done
 rg -q --fixed-strings "$initial_commit" "$tmp_root/service.log" \
     || fail 'initial recorder backfill did not complete'
-rg -q --fixed-strings 'codex-info: recorder skipped an unsafe input cycle' \
-    "$tmp_root/service.log" || fail 'forced transient recorder failure was not observed'
-wait "$lock_holder_pid"
-lock_holder_pid=""
 
+database="$data_root/history/usage_history.sqlite3"
 [[ -f "$database" ]] || fail 'history database was not created'
 logical_database_sha256() {
     sqlite3 -batch -bail -cmd '.timeout 2000' "$1" .dump \

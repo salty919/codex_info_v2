@@ -15,6 +15,9 @@ public sealed class ContractsTests
 
         Assert.NotNull(assemblyVersion);
         Assert.Equal(
+            $"{assemblyVersion!.Major}.{assemblyVersion.Minor}.{assemblyVersion.Build}",
+            ProductInfo.Version);
+        Assert.Equal(
             $"v{assemblyVersion!.Major}.{assemblyVersion.Minor}.{assemblyVersion.Build}",
             ProductInfo.DisplayVersion);
     }

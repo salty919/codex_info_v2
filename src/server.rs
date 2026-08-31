@@ -849,6 +849,7 @@ impl Drop for ApiServer {
 struct HealthResponse {
     api_version: &'static str,
     service: &'static str,
+    product_version: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1300,6 +1301,7 @@ fn health_body() -> Vec<u8> {
     serde_json::to_vec(&HealthResponse {
         api_version: API_VERSION,
         service: "codex-info",
+        product_version: env!("CARGO_PKG_VERSION"),
     })
     .expect("fixed health response must serialize")
 }
@@ -1945,6 +1947,9 @@ mod tests {
         assert!(health.starts_with("HTTP/1.1 200"), "response: {health:?}");
         assert!(health.contains("cache-control: no-store"));
         assert_eq!(body(&health)["api_version"], "v1");
+        assert_eq!(body(&health)["service"], "codex-info");
+        assert_eq!(body(&health)["product_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body(&health).as_object().unwrap().len(), 3);
 
         let details = wire_request(
             server.local_addr(),
