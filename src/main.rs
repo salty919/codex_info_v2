@@ -5956,6 +5956,52 @@ impl CodexInfoState {
         self.status = status.into();
     }
 
+    /// Ask the resident producer for its next account/quota generation.
+    /// The UI never calls this path: it consumes the immutable details root.
+    fn request_account_refresh(&mut self, status: &str) {
+        if self.preview {
+            return;
+        }
+        if !self.bridge.send(AccountCommand::Read) {
+            self.bridge = AppServerBridge::<AccountCommand, Event>::start();
+            if !self.bridge.send(AccountCommand::Read) {
+                self.apply_account_error(
+                    "Codex app-serverへ更新要求を送信できませんでした。".into(),
+                );
+                return;
+            }
+        }
+        self.checking = true;
+        self.status = status.into();
+    }
+
+    /// Own every periodic producer request in the resident service. Completed
+    /// events are drained before this method runs, so `checking` and
+    /// `thread_checking` are the single-flight completion boundaries.
+    fn schedule_resident_refresh(&mut self, now: Instant) {
+        if account_refresh_due(
+            now,
+            self.last_poll,
+            self.checking,
+            self.authenticated,
+            self.auth_polling,
+        ) {
+            let status = if self.auth_polling && !self.authenticated {
+                "認証完了を確認しています…"
+            } else {
+                "利用状況を更新しています…"
+            };
+            self.request_account_refresh(status);
+            self.last_poll = now;
+        }
+        if self.authenticated
+            && !self.thread_checking
+            && now.duration_since(self.last_thread_poll) >= Duration::from_secs(5)
+        {
+            self.request_thread_update();
+        }
+    }
+
     fn poll_auth_control(&mut self) {
         while let Ok(event) = self.bridge.rx.try_recv() {
             match event {
@@ -7673,6 +7719,25 @@ fn normal_status_text(remaining: f64, seconds: i64, last_success_at: Option<&str
     }
 }
 
+fn automatic_refresh_interval(authenticated: bool, auth_polling: bool) -> Duration {
+    if !authenticated && auth_polling {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(60)
+    }
+}
+
+fn account_refresh_due(
+    now: Instant,
+    last_poll: Instant,
+    checking: bool,
+    authenticated: bool,
+    auth_polling: bool,
+) -> bool {
+    !checking
+        && now.duration_since(last_poll) >= automatic_refresh_interval(authenticated, auth_polling)
+}
+
 /// The authenticated main surface is withheld until its first complete
 /// usage generation is ready. A local-collector failure releases the spinner
 /// so the error/retry state is visible instead of looking like a hang.
@@ -9021,6 +9086,7 @@ where
     P: FnOnce(PublicDetails) -> Result<(), codex_info::server::ApiSnapshotError>,
 {
     state.poll();
+    state.schedule_resident_refresh(Instant::now());
     let pending = state.history.take_pending_store_samples();
     if let Err(error) = write_and_refresh(state, pending.clone()) {
         state.history.restore_pending_store_samples(pending);
@@ -11006,6 +11072,114 @@ mod tests {
         assert!(state.service_endpoint_error.is_none());
         assert!(commands.try_iter().next().is_none());
         server.shutdown();
+    }
+
+    #[test]
+    fn resident_scheduler_requests_one_account_refresh_and_retries_next_interval() {
+        let now = Instant::now();
+        let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
+        state.authenticated = false;
+        state.checking = false;
+        state.last_poll = now - Duration::from_secs(61);
+        state.last_thread_poll = now;
+        let (command_tx, commands) = std::sync::mpsc::channel();
+        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        state.bridge = super::AppServerBridge {
+            tx: command_tx,
+            rx: event_rx,
+        };
+
+        state.schedule_resident_refresh(now);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(super::AccountCommand::Read)
+        ));
+        assert!(state.checking);
+
+        // Later ticks cannot enqueue a second read while the first is active.
+        state.schedule_resident_refresh(now + Duration::from_secs(61));
+        assert!(commands.try_recv().is_err());
+
+        // A failed generation keeps last-good state but releases single-flight.
+        // The scheduler retries only at the next established interval.
+        state.apply_account_error("transient worker failure".into());
+        state.schedule_resident_refresh(now + Duration::from_secs(61));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(super::AccountCommand::Read)
+        ));
+        assert!(state.checking);
+    }
+
+    #[test]
+    fn resident_scheduler_observes_authentication_on_a_later_account_generation() {
+        let now = Instant::now();
+        let mut state = CodexInfoState::preview("initializing");
+        state.preview = false;
+        state.checking = false;
+        state.last_poll = now - Duration::from_secs(61);
+        state.last_thread_poll = now;
+        let (account_tx, account_commands) = std::sync::mpsc::channel();
+        let (_account_events, account_rx) = std::sync::mpsc::channel();
+        state.bridge = super::AppServerBridge {
+            tx: account_tx,
+            rx: account_rx,
+        };
+
+        state.schedule_resident_refresh(now);
+        assert!(matches!(
+            account_commands.try_recv(),
+            Ok(super::AccountCommand::Read)
+        ));
+        state.apply_account_event(None, false, None);
+
+        let (thread_tx, thread_commands) = std::sync::mpsc::channel();
+        let (_thread_events, thread_rx) = std::sync::mpsc::channel();
+        state.thread_bridge = Some(super::AppServerBridge {
+            tx: thread_tx,
+            rx: thread_rx,
+        });
+        state.schedule_resident_refresh(now + Duration::from_secs(61));
+        assert!(matches!(
+            account_commands.try_recv(),
+            Ok(super::AccountCommand::Read)
+        ));
+
+        state.apply_account_event(Some("user@example.com".into()), true, Some("pro".into()));
+        assert!(state.authenticated);
+        let current_epoch = state.auth_epoch;
+        assert!(matches!(
+            thread_commands.try_recv(),
+            Ok(super::ThreadCommand::Read { auth_epoch }) if auth_epoch == current_epoch
+        ));
+    }
+
+    #[test]
+    fn resident_scheduler_keeps_periodic_thread_reads_single_flight() {
+        let now = Instant::now();
+        let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
+        state.checking = true;
+        state.thread_checking = false;
+        state.last_poll = now;
+        state.last_thread_poll = now - Duration::from_secs(6);
+        let (thread_tx, thread_commands) = std::sync::mpsc::channel();
+        let (_thread_events, thread_rx) = std::sync::mpsc::channel();
+        state.thread_bridge = Some(super::AppServerBridge {
+            tx: thread_tx,
+            rx: thread_rx,
+        });
+
+        state.schedule_resident_refresh(now);
+        assert!(matches!(
+            thread_commands.try_recv(),
+            Ok(super::ThreadCommand::Read { auth_epoch: 0 })
+        ));
+        assert!(state.thread_checking);
+
+        state.schedule_resident_refresh(now + Duration::from_secs(6));
+        assert!(thread_commands.try_recv().is_err());
     }
 
     #[test]
