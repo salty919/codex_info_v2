@@ -113,6 +113,10 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         publish = _job(release, "publish")
         revalidate = _step(publish, step_id="revalidate")
         download = _step(publish, uses="actions/download-artifact@v4")
+        release_token = _step(
+            publish,
+            uses="actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+        )
         publication = _step(publish, name="Publish or verify the exact release state")
 
         # Observer output -> owner execution and the complete, push-capable checkout.
@@ -304,8 +308,18 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "repository": "${{ github.repository }}",
             "path": "release-candidate",
         })
-        mapping("release.publish", publication.get("env"), {
-            "GH_TOKEN": "${{ github.token }}",
+        mapping("release.publish.permissions", publish.get("permissions"), {
+            "contents": "read",
+        })
+        expect("release.token.id", release_token.get("id"), "release-token")
+        expect("release.token.inputs", release_token.get("with"), {
+            "client-id": "${{ vars.RELEASE_APP_CLIENT_ID }}",
+            "private-key": "${{ secrets.RELEASE_APP_PRIVATE_KEY }}",
+            "permission-contents": "write",
+            "permission-workflows": "write",
+        })
+        expect("release.publication.env", publication.get("env"), {
+            "GH_TOKEN": "${{ steps.release-token.outputs.token }}",
             "MERGE_SHA": "${{ needs.resolve.outputs.merge_sha }}",
             "REPOSITORY": "${{ github.repository }}",
             "TAG": "${{ needs.resolve.outputs.tag }}",
@@ -313,7 +327,18 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         })
         proceed = "steps.revalidate.outputs.proceed == 'true'"
         expect("release.download.if", download.get("if"), proceed)
+        expect("release.token.if", release_token.get("if"), proceed)
         expect("release.publication.if", publication.get("if"), proceed)
+        token_output = "${{ steps.release-token.outputs.token }}"
+
+        def occurrences(value: object) -> int:
+            if isinstance(value, dict):
+                return sum(occurrences(item) for item in value.values())
+            if isinstance(value, list):
+                return sum(occurrences(item) for item in value)
+            return int(value == token_output)
+
+        expect("release.token.output-consumers", occurrences(release), 1)
 
         # Jobs API names are derived from the actual producer names, not a second fixture.
         resolver_script = _step(resolve, step_id="resolve").get("run")
@@ -2468,6 +2493,11 @@ def self_test() -> int:
             "release.yml",
             "if: steps.revalidate.outputs.proceed == 'true'",
             "if: steps.revalidate.outputs.proceed != 'true'",
+        ),
+        (
+            "release.yml",
+            "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+            "actions/create-github-app-token@v3.2.0",
         ),
     )
     cases = 1
