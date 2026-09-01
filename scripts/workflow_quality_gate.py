@@ -169,14 +169,23 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "feat.classify.checkout",
             _step(feat_classify, uses="actions/checkout@v4").get("with"),
             {
-                "ref": "${{ github.event.pull_request.base.sha }}",
+                "ref": "${{ github.workflow_sha }}",
                 "fetch-depth": 0,
-                "persist-credentials": True,
+                "persist-credentials": False,
             },
         )
         mapping("feat.classify.outputs", feat_classify.get("outputs"), {
             "selection_json": "${{ steps.classify.outputs.selection_json }}",
         })
+        feat_classify_script = _step(feat_classify, step_id="classify").get("run")
+        if (
+            not isinstance(feat_classify_script, str)
+            or 'git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"'
+            not in feat_classify_script
+        ):
+            errors.append(
+                "workflow wiring feat.classify: exact base and head objects are not fetched"
+            )
         expect("feat.quality.needs", feat_quality.get("needs"), ["classify"])
         expect("feat.quality.uses", feat_quality.get("uses"), "./.github/workflows/selective-quality.yml")
         mapping("feat.quality", feat_quality.get("with"), {
@@ -3068,7 +3077,7 @@ def self_test() -> int:
         ),
         (
             "feat-integration.yml",
-            "ref: ${{ github.event.pull_request.base.sha }}",
+            "ref: ${{ github.workflow_sha }}",
             "ref: ${{ github.event.pull_request.head.sha }}",
         ),
         (
