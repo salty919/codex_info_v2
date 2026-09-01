@@ -531,6 +531,10 @@ jobs:
                 }
               elif [[ "$linux_job_name" == "$linux_leaf" && "$linux_job_result" == success ]]; then
                 [[ "$(jq 'length' <<<"$linux_candidates")" -eq 1 ]]
+                [[ "$job_name" == "$windows_leaf" ]] || {
+                  echo 'Linux distribution candidate requires a Windows release candidate' >&2
+                  exit 1
+                }
                 linux_candidate="$(jq -c '.[0]' <<<"$linux_candidates")"
                 jq -e '
                   .expired == false and (.digest | type) == "string" and
@@ -853,6 +857,10 @@ jobs:
             '[.[] | select(.name == $wrapper or .name == $leaf)]' <<<"$jobs")"
           linux_job_count="$(jq 'length' <<<"$linux_jobs")"
           if [[ "$LINUX_PRESENT" == true ]]; then
+            [[ "$WINDOWS_PRESENT" == true ]] || {
+              echo 'Linux release assets require Windows release assets' >&2
+              exit 1
+            }
             [[ "$linux_job_count" -eq 1 ]] || {
               echo 'Linux distribution authority job is missing or duplicated' >&2
               exit 1
@@ -953,6 +961,10 @@ jobs:
           FINAL_HEAD="${FINAL_HEAD:-}"
           [[ "$WINDOWS_PRESENT" == true || "$WINDOWS_PRESENT" == false ]]
           [[ "$LINUX_PRESENT" == true || "$LINUX_PRESENT" == false ]]
+          [[ "$LINUX_PRESENT" != true || "$WINDOWS_PRESENT" == true ]] || {
+            echo 'Linux release assets require Windows release assets' >&2
+            exit 1
+          }
 
           api() {
             gh api -H 'Accept: application/vnd.github+json' \
