@@ -9,9 +9,11 @@ Codex App ServerからChatGPT/Codexアカウントのレート制限と週次ま
 
 ## Linux bundleで導入・起動（通常導線）
 
-既存の`windows-vX.Y.Z` Releaseから、同じversionのLinux asset一式をダウンロードします。対象は
-`x86_64-unknown-linux-gnu` archive、対応する`.sha256` checksum、manifest（`*.manifest.json`）です。
-`X.Y.Z`はReleaseのversionへ置き換えてください。
+公開済み・stableな`windows-vX.Y.Z` Releaseから、同じversionのLinux asset一式をダウンロードします。
+Release全体がWindows 2 assetとLinux 3 assetのexact 5 asset（`CodexInfo.WindowsClient.Setup.exe`、
+`CodexInfo.WindowsClient.update.json`、`x86_64-unknown-linux-gnu` archive、対応する`.sha256` checksum、
+対応する`*.manifest.json`）だけを持つことを確認してください。draft、prerelease、partial、extra、
+malformed Releaseや導入済みversion以下のReleaseは使いません。`X.Y.Z`はReleaseのversionへ置き換えてください。
 
 ```bash
 version='X.Y.Z'
@@ -20,7 +22,7 @@ checksum="${asset}.sha256"
 manifest="${asset%.tar.gz}.manifest.json"
 bundle_dir="$HOME/.local/share/codex-info/bundle-v${version}"
 mkdir -p "$bundle_dir"
-# Releaseから取得したasset、checksum、manifestをbundle_dirへ置く。
+# 上記ReleaseからLinuxの3 assetをbundle_dirへ置く（Windows 2 assetはRelease全体のidentity確認用）。
 (cd "$bundle_dir" && sha256sum -c "$checksum")
 test -s "$bundle_dir/$manifest"
 mkdir -p "$bundle_dir/extracted"
@@ -35,15 +37,34 @@ curl --fail http://127.0.0.1:8787/v1/health
 
 targetは`x86_64-unknown-linux-gnu`に固定です。互換性として表明するのはmanifestの実測
 `glibc_minimum`以上だけで、他のdistributionやarchitectureへの対応、署名済み、publisher検証済みとは表明しません。
-checksum、manifest、install、service切替のいずれかが失敗した場合は利用を開始せず、Releaseからassetを再取得します。
+checksum、manifest、archive content、install、service切替、healthのいずれかが失敗した場合は利用を開始せず、
+既存のbinary/unit/profile dataを変更せずにReleaseからassetを再取得します。
 
-自動起動を外す場合は、展開済みbundleを残したまま次を実行します。
+インストール後は検証済みのpersistent installer `$HOME/.local/libexec/codex-info-install.sh`と
+`$HOME/.local/share/codex-info/manifest.json`、`codex-info-update.service`/`codex-info-update.timer`も配置されます。
+timerはboot時と毎日1回、固定repository `salty919/codex_info_v2`の公開Releaseだけを確認します。
+導入済みversionより新しいstable Releaseで、上記exact 5 assetが同居する場合だけ、checksum・manifest・archive contentを
+検証した後に既存のatomic install、service restart、health確認を行います。新版がない、draft/prerelease、partial、extra、
+malformed、identity不一致、または検証・切替・health失敗の場合は何も変更せず、失敗時は旧versionへrollbackします。
+
+更新を今すぐ確認する場合は、展開済みbundleやrepositoryを再取得せず、次を実行します。
+
+```bash
+systemctl --user start codex-info-update.service
+systemctl --user status codex-info-update.service --no-pager
+systemctl --user status codex-info-update.timer --no-pager
+journalctl --user -u codex-info-update.service --no-pager
+```
+
+自動起動・自動更新を外す場合は、展開済みbundleを残したまま次を実行します。
 
 ```bash
 bash "$bundle_dir/extracted/install.sh" --remove
 ```
 
-この導入・解除で、履歴DB、DB backup、reset hint、Codex session JSONL、設定は削除されません。
+この解除は`codex-info.service`と更新service/timerを停止・無効化してunitを外しますが、導入binary、
+`$HOME/.local/libexec/codex-info-install.sh`、
+履歴DB、DB backup、reset hint、Codex session JSONL、設定は削除されません。
 公開起動契約は引数なし、`--ui`、`--port PORT`、`--ui --port PORT`、`--stop`、`--help`だけです。
 Linux / Windows UIは同じproduct versionのresident serviceだけを表示正本として受理します。
 
@@ -59,7 +80,7 @@ Linux / Windows UIは同じproduct versionのresident serviceだけを表示正�
 ## 必要環境
 
 - `x86_64-unknown-linux-gnu`を実行でき、bundle manifestの実測`glibc_minimum`以上を持つLinux環境
-- `bash`、`tar`、`sha256sum`、`python3`、`curl`、user-systemd（`systemctl --user`）
+- `bash`、`tar`、`sha256sum`、`python3`、`curl`、`flock`、user-systemd（`systemctl --user`）
 - WSLgまたはXサーバー（`DISPLAY`が設定されていること）
 - `codex` CLI（`codex app-server --stdio`が実行できること）
 

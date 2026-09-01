@@ -956,13 +956,13 @@ jobs:
         run: |
           set -euo pipefail
           set +x
-          WINDOWS_PRESENT="${WINDOWS_PRESENT:-true}"
+          WINDOWS_PRESENT="${WINDOWS_PRESENT:-false}"
           LINUX_PRESENT="${LINUX_PRESENT:-false}"
           FINAL_HEAD="${FINAL_HEAD:-}"
           [[ "$WINDOWS_PRESENT" == true || "$WINDOWS_PRESENT" == false ]]
           [[ "$LINUX_PRESENT" == true || "$LINUX_PRESENT" == false ]]
-          [[ "$LINUX_PRESENT" != true || "$WINDOWS_PRESENT" == true ]] || {
-            echo 'Linux release assets require Windows release assets' >&2
+          [[ "$WINDOWS_PRESENT" == true && "$LINUX_PRESENT" == true ]] || {
+            echo 'release publication requires both Windows and Linux candidates' >&2
             exit 1
           }
 

@@ -1,0 +1,12 @@
+# Check the fixed public stable release channel once after boot and daily.
+[Unit]
+Description=Check for Codex Info updates
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1d
+Persistent=true
+Unit=codex-info-update.service
+
+[Install]
+WantedBy=timers.target
