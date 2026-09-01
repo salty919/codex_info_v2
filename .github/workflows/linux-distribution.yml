@@ -40,7 +40,7 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
       - name: Install bundle validation tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes binutils jq
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes binutils jq ripgrep
       - name: Build the exact Linux target
         run: cargo build --release --locked --target "$LINUX_BUNDLE_TARGET"
       - name: Create and validate the Linux bundle
