@@ -1564,6 +1564,25 @@ def _manual_release_responses(
                 pass
             elif linux is not None:
                 raise AssertionError(f"unknown Linux fixture result: {linux}")
+            product_quality = row.get("product_quality")
+            if product_quality == "linux-backend":
+                jobs.append(
+                    {
+                        "name": "Run selected quality owners / linux-backend-quality / native-quality",
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                )
+            elif product_quality == "linux-ui":
+                jobs.append(
+                    {
+                        "name": "Run selected quality owners / linux-ui-quality / linux-ui-quality",
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                )
+            elif product_quality is not None:
+                raise AssertionError(f"unknown product quality fixture: {product_quality}")
             responses[
                 f"repos/{_REPOSITORY}/actions/runs/{run_id}/attempts/{attempt}/jobs?filter=all&per_page=100"
             ] = _object_pages("jobs", jobs, paginated=paginated)
@@ -1673,11 +1692,16 @@ def _generated_release_responses() -> tuple[dict[str, object], dict[str, object]
                     "name": "Run selected quality owners / windows-quality / windows-quality",
                     "status": "completed",
                     "conclusion": "success",
+                },
+                {
+                    "name": "Run selected quality owners / linux-distribution / linux-distribution",
+                    "status": "completed",
+                    "conclusion": "success",
                 }
             ],
         ),
         f"repos/{_REPOSITORY}/actions/runs/301/artifacts?per_page=100": _object_pages(
-            "artifacts", [candidate]
+            "artifacts", [candidate, _release_candidate(301, 7, platform="linux")]
         ),
         f"repos/{_REPOSITORY}/actions/runs/302/artifacts?per_page=100": _object_pages(
             "artifacts", []
@@ -1700,6 +1724,8 @@ def _release_resolution_tests(release_workflow: str) -> int:
                     "conclusion": "success",
                     "windows": "success",
                     "candidate": "exact",
+                    "linux": "success",
+                    "linux_candidate": "exact",
                 }
             ],
         }
@@ -1904,6 +1930,31 @@ def _release_resolution_tests(release_workflow: str) -> int:
         raise AssertionError("Windows-only candidate bypassed a skipped Linux authority")
     cases += 1
 
+    missing_linux_authority_spec = [
+        {
+            "id": 124,
+            "number": 34,
+            "attempts": [
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "windows": "skipped",
+                    "product_quality": "linux-backend",
+                }
+            ],
+        }
+    ]
+    responses, _ = _manual_release_responses(missing_linux_authority_spec)
+    result, _, _ = _execute_release_shell(
+        script, responses, event_name="pull_request_target", event=_closed_event()
+    )
+    if result.returncode == 0:
+        raise AssertionError(
+            "product-impact run without a Linux authority job was accepted"
+        )
+    print("workflow-quality-gate: case=missing-linux-authority PASS")
+    cases += 1
+
     draft_observer_spec = [
         {
             "id": 121,
@@ -1969,6 +2020,8 @@ def _release_resolution_tests(release_workflow: str) -> int:
                         "conclusion": "success",
                         "windows": "success",
                         "candidate": mode,
+                        "linux": "success",
+                        "linux_candidate": "exact",
                     }
                 ],
             }
@@ -2096,6 +2149,8 @@ def _release_lock_tests(release_workflow: str) -> int:
                     "conclusion": "success",
                     "windows": "success",
                     "candidate": "exact",
+                    "linux": "success",
+                    "linux_candidate": "exact",
                 }
             ],
         }
@@ -2732,6 +2787,16 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
     return cases
 
 
+def release_self_test() -> int:
+    baseline = sources()
+    errors = validate(baseline)
+    if errors:
+        raise AssertionError("production workflow contract failed: " + "; ".join(errors))
+    cases = _release_resolution_tests(baseline["release.yml"])
+    print(f"workflow-quality-gate: PASS release_resolution_cases={cases}")
+    return 0
+
+
 def self_test() -> int:
     baseline = sources()
     errors = validate(baseline)
@@ -2865,7 +2930,12 @@ def self_test() -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--release-self-test", action="store_true")
     args = parser.parse_args(argv)
+    if args.self_test and args.release_self_test:
+        parser.error("--self-test and --release-self-test are mutually exclusive")
+    if args.release_self_test:
+        return release_self_test()
     if args.self_test:
         return self_test()
     errors = validate(sources())
