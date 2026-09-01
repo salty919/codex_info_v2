@@ -55,6 +55,23 @@ cat > "$fake_bin/systemctl" <<'FAKE_SYSTEMCTL'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'systemctl %s\n' "$*" >> "$FAKE_LOG"
+if [[ " $* " == *' enable --now codex-info-update.timer '* &&
+      "${FAKE_SYSTEMCTL_MANAGER_UP_LONG:-0}" == 1 ]]; then
+    timer_path="$HOME/.config/systemd/user/codex-info-update.timer"
+    if [[ -f "$timer_path" ]] && grep -Fq -- 'OnBootSec=5min' "$timer_path"; then
+        timer_status=0
+        timer_output=''
+        if timer_output="$(env -u CODEX_INFO_INSTALL_LOCKED \
+            SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+            bash "$HOME/.local/libexec/codex-info-install.sh" --update 9>&- 2>&1)"; then
+            timer_status=0
+        else
+            timer_status=$?
+        fi
+        printf 'timer-expired-immediately status=%s output=%s\n' \
+            "$timer_status" "$timer_output" >> "$FAKE_LOG"
+    fi
+fi
 if [[ " $* " == *' show-environment '* ]]; then
     exit "${FAKE_SYSTEMCTL_SHOW_ENVIRONMENT_STATUS:-0}"
 fi
@@ -171,6 +188,16 @@ elif [[ "$url" == */download/* ]]; then
     payload_file="$FAKE_RELEASE_ASSET_ROOT/$asset_name"
     [[ -f "$payload_file" ]] || exit 1
 else
+    health_count_file="$FAKE_LOG.health-count"
+    health_count=0
+    if [[ -f "$health_count_file" ]]; then
+        health_count="$(<"$health_count_file")"
+    fi
+    health_count=$((health_count + 1))
+    printf '%s\n' "$health_count" > "$health_count_file"
+    if ((health_count <= ${FAKE_CURL_HEALTH_TRANSIENT_FAILURES:-0})); then
+        exit 1
+    fi
     payload="$(printf '{\"api_version\":\"v1\",\"service\":\"codex-info\",\"product_version\":\"%s\"}\n' "$FAKE_HEALTH_VERSION")"
 fi
 
@@ -202,6 +229,14 @@ fi
 exit 0
 FAKE_CURL
 chmod 0755 "$fake_bin/curl"
+
+cat > "$fake_bin/sleep" <<'FAKE_SLEEP'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'sleep %s\n' "$*" >> "$FAKE_LOG"
+exit 0
+FAKE_SLEEP
+chmod 0755 "$fake_bin/sleep"
 
 cat > "$fake_bin/objdump" <<'FAKE_OBJDUMP'
 #!/usr/bin/env bash
@@ -406,6 +441,8 @@ run_install() {
     install_script="$(extract_install_script "$archive")"
     HOME="$fake_home" PATH="$fake_bin:$ORIGINAL_PATH" \
         FAKE_LOG="$log" FAKE_HEALTH_VERSION="$health_version" \
+        FAKE_CURL_HEALTH_TRANSIENT_FAILURES="${FAKE_CURL_HEALTH_TRANSIENT_FAILURES:-0}" \
+        FAKE_SYSTEMCTL_MANAGER_UP_LONG="${FAKE_SYSTEMCTL_MANAGER_UP_LONG:-0}" \
         SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
         bash "$install_script" --bundle "$archive"
 }
@@ -422,6 +459,7 @@ run_update() {
     [[ -x "$install_script" ]] || fail 'persistent installer is missing or not executable'
     HOME="$fake_home" TMPDIR="$update_tmp" PATH="$fake_bin:$ORIGINAL_PATH" \
         FAKE_LOG="$log" FAKE_HEALTH_VERSION="$health_version" \
+        FAKE_CURL_HEALTH_TRANSIENT_FAILURES="${FAKE_CURL_HEALTH_TRANSIENT_FAILURES:-0}" \
         FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSET_ROOT="$release_asset_root" \
         FAKE_CURL_EFFECTIVE_URL="${FAKE_CURL_EFFECTIVE_URL:-}" \
         CODEX_INFO_INSTALL_LOCKED="${CODEX_INFO_INSTALL_LOCKED:-}" \
@@ -508,6 +546,21 @@ installation_state_digest() {
     done | sha256sum | awk '{print $1}'
 }
 
+profile_state_digest() {
+    local relative path
+    for relative in \
+        .codex/usage_history.sqlite3 \
+        .codex/usage_history.sqlite3.bak.1 \
+        .codex/usage_reset_hint.json \
+        .codex/session.jsonl \
+        .config/codex-info/settings.json; do
+        path="$fake_home/$relative"
+        [[ -f "$path" && ! -L "$path" ]] || fail "profile sentinel is missing: $path"
+        printf '%s\t%s\t%s\t%s\n' "$relative" "$(stat -c %a -- "$path")" \
+            "$(stat -c %s -- "$path")" "$(sha256sum -- "$path" | awk '{print $1}')"
+    done | sha256sum | awk '{print $1}'
+}
+
 assert_state_unchanged() {
     local expected="$1" label="$2"
     [[ "$(installation_state_digest)" == "$expected" ]] ||
@@ -549,7 +602,8 @@ grep -Fq -- 'install.sh --remove' <<<"$bundle_help" ||
 grep -Fq -- 'install.sh --update' <<<"$bundle_help" ||
     fail 'bundled help does not name the update command'
 printf 'case bundled-help: PASS\n'
-run_install "$archive_v1" >/dev/null
+FAKE_CURL_HEALTH_TRANSIENT_FAILURES=1 FAKE_SYSTEMCTL_MANAGER_UP_LONG=1 \
+    run_install "$archive_v1" >/dev/null
 assert_binary_marker "$fake_home/.local/bin/codex_info" 'fixture binary generation one'
 [[ -f "$fake_home/.config/systemd/user/codex-info.service" ]] ||
     fail 'normal install did not publish unit'
@@ -563,15 +617,25 @@ grep -Eq -- 'systemctl --user enable( --now)? codex-info-update.timer($| )' "$lo
     fail 'normal install did not enable update timer'
 grep -Fq -- 'systemctl --user is-active --quiet codex-info.service' "$log" ||
     fail 'normal install did not check active state'
-grep -Fq -- 'curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8787/v1/health' "$log" ||
+[[ "$(grep -Fc -- 'curl --fail --silent --max-time 1 http://127.0.0.1:8787/v1/health' "$log")" -eq 2 ]] ||
+    fail 'normal install did not retry delayed health readiness exactly once'
+grep -Fq -- 'sleep 1' "$log" ||
+    fail 'normal install did not wait between health readiness attempts'
+printf 'case delayed-health-readiness: PASS\n'
+! grep -Fq -- 'timer-expired-immediately' "$log" ||
+    fail 'update timer fired inside the install transaction on a long-running user manager'
+printf 'case delayed-timer-first-fire: PASS\n'
+grep -Fq -- 'curl --fail --silent --max-time 1 http://127.0.0.1:8787/v1/health' "$log" ||
     fail 'normal install did not check health'
 grep -Fq -- 'ExecStart=%h/.local/libexec/codex-info-install.sh --update' \
     "$fake_home/.config/systemd/user/codex-info-update.service" ||
     fail 'update service does not invoke the persistent installer'
 grep -Fq -- 'TimeoutStartSec=20min' "$fake_home/.config/systemd/user/codex-info-update.service" ||
     fail 'update service timeout is shorter than the bounded download path'
-grep -Fq -- 'OnBootSec=5min' "$fake_home/.config/systemd/user/codex-info-update.timer" ||
-    fail 'update timer does not check after boot'
+grep -Fq -- 'OnActiveSec=5min' "$fake_home/.config/systemd/user/codex-info-update.timer" ||
+    fail 'update timer does not check after activation'
+! grep -Fq -- 'OnBootSec=' "$fake_home/.config/systemd/user/codex-info-update.timer" ||
+    fail 'update timer can fire immediately when installed after its boot-relative deadline'
 grep -Fq -- 'OnUnitActiveSec=1d' "$fake_home/.config/systemd/user/codex-info-update.timer" ||
     fail 'update timer does not check daily'
 grep -Fq -- 'Unit=codex-info-update.service' "$fake_home/.config/systemd/user/codex-info-update.timer" ||
@@ -664,12 +728,20 @@ done
     fail 'inactive-state updater rollback started the prior stopped timer'
 printf 'case updater-runtime-state-rollback: PASS\n'
 
+before_profile_state="$(profile_state_digest)"
 before_update_log_lines="$(( $(wc -l < "$log") + 1 ))"
-run_update "$archive_v1" >/dev/null
+rm -f -- "$log.health-count"
+FAKE_CURL_HEALTH_TRANSIENT_FAILURES=1 run_update "$archive_v1" >/dev/null
 assert_binary_marker "$fake_home/.local/bin/codex_info" 'fixture binary generation two'
 [[ "$(tail -n "+$before_update_log_lines" "$log" | grep -Fc -- 'restart codex-info.service')" -eq 1 ]] ||
     fail 'successful update did not perform exactly one service restart'
+[[ "$(tail -n "+$before_update_log_lines" "$log" |
+    grep -Fc -- 'curl --fail --silent --max-time 1 http://127.0.0.1:8787/v1/health')" -eq 2 ]] ||
+    fail 'successful update did not retry delayed health readiness exactly once'
+[[ "$(profile_state_digest)" == "$before_profile_state" ]] ||
+    fail 'successful delayed-health update changed profile data'
 assert_update_tmp_empty 'complete five-asset update'
+printf 'case delayed-update-health-readiness: PASS\n'
 printf 'case complete-five-asset-update: PASS\n'
 
 write_release_fixture "$archive_v1" complete
