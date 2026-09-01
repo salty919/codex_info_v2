@@ -267,9 +267,25 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             _step(selected, name="Require selected success and non-selected skip").get("env"),
             {
                 "SELECTION": "${{ inputs.selection_json }}",
+                "RELEASE_CANDIDATE": "${{ inputs.release_candidate }}",
                 "RESULTS": "${{ toJSON(needs) }}",
             },
         )
+        selected_script = _step(
+            selected, name="Require selected success and non-selected skip"
+        ).get("run")
+        if not isinstance(selected_script, str) or "--release-candidate \"$RELEASE_CANDIDATE\"" not in selected_script:
+            errors.append(
+                "workflow wiring selected.run: release-candidate context is not passed to the gate"
+            )
+        if not isinstance(selected_script, str) or "scripts/selected_quality_gate.py --help" not in selected_script:
+            errors.append(
+                "workflow wiring selected.run: trusted-base CLI compatibility probe is missing"
+            )
+        if not isinstance(selected_script, str) or "release_candidate must be true or false" not in selected_script:
+            errors.append(
+                "workflow wiring selected.run: legacy release-candidate input guard is missing"
+            )
 
         # Windows selected/skipped signal and artifact identity.
         expect("windows.job-set", set(windows["jobs"]), {"windows-quality"})
@@ -620,6 +636,225 @@ def _step_script(workflow: str, step_name: str) -> str:
                 if isinstance(script, str) and script:
                     return script
     raise AssertionError(f"workflow step was not found: {step_name}")
+
+
+def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
+    """Exercise the selected-quality shell with both candidate contexts.
+
+    The first pair models the old main caller (classifier invoked without the
+    candidate flag) and the fixed caller.  Running the actual workflow shell,
+    rather than calling the Python gate directly, keeps the environment and
+    argument wiring under test.
+    """
+    script = _step_script(
+        selective_workflow, "Require selected success and non-selected skip"
+    )
+    owner_jobs = {
+        "DOCS": "docs-quality",
+        "GOVERNANCE": "governance-quality",
+        "LINUX_BACKEND": "linux-backend-quality",
+        "LINUX_UI": "linux-ui-quality",
+        "WINDOWS": "windows-quality",
+    }
+    changes = ROOT / "scripts" / ".selected-quality-release-candidate-changes.z"
+    cases = 0
+
+    def classify(path: str, *, release_candidate: bool) -> str:
+        changes.write_bytes(f"M\0{path}\0".encode())
+        command = (
+            "python3",
+            "scripts/ci_change_scope.py",
+            "--name-status",
+            str(changes),
+        )
+        if release_candidate:
+            command += ("--release-candidate",)
+        return _command(command, cwd=ROOT).stdout.strip()
+
+    def results(selection_raw: str) -> str:
+        selection = json.loads(selection_raw)
+        owners = set(selection["owners"])
+        selected_jobs = {owner_jobs[owner] for owner in owners}
+        return json.dumps(
+            {
+                job: {
+                    "result": (
+                        "success"
+                        if job in selected_jobs
+                        or (job == "codeql-quality" and bool(selection["codeql_languages"]))
+                        or (job == "linux-distribution" and selection["binary_impact"])
+                        else "skipped"
+                    )
+                }
+                for job in (
+                    "docs-quality",
+                    "governance-quality",
+                    "linux-backend-quality",
+                    "linux-ui-quality",
+                    "windows-quality",
+                    "codeql-quality",
+                    "linux-distribution",
+                )
+            },
+            separators=(",", ":"),
+        )
+
+    try:
+        environment = os.environ.copy()
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        missing_argument_script = script.replace(
+            ' \\\n    --release-candidate "$RELEASE_CANDIDATE"', ""
+        )
+        if missing_argument_script == script:
+            raise AssertionError("selected-quality gate command shape changed")
+
+        legacy_backend = classify("src/lib.rs", release_candidate=False)
+        fixed_backend = classify("src/lib.rs", release_candidate=True)
+        with tempfile.TemporaryDirectory(prefix="codex-info-selected-quality-base-") as raw_legacy:
+            legacy_root = Path(raw_legacy)
+            legacy_scripts = legacy_root / "scripts"
+            legacy_scripts.mkdir()
+            legacy_source = _command(
+                ("git", "show", "HEAD^:scripts/selected_quality_gate.py"),
+                cwd=ROOT,
+            ).stdout
+            if "--release-candidate" in legacy_source:
+                raise AssertionError(
+                    "legacy trusted-base fixture unexpectedly supports the candidate CLI"
+                )
+            (legacy_scripts / "selected_quality_gate.py").write_text(
+                legacy_source,
+                encoding="utf-8",
+            )
+            legacy_environment = dict(environment)
+            legacy_environment.update(
+                {
+                    "SELECTION": legacy_backend,
+                    "RELEASE_CANDIDATE": "false",
+                    "RESULTS": results(legacy_backend),
+                }
+            )
+            legacy_feat = _command(
+                ("bash", "-c", script),
+                cwd=legacy_root,
+                env=legacy_environment,
+                check=False,
+            )
+            if legacy_feat.returncode != 0:
+                raise AssertionError(
+                    f"legacy trusted base rejected the feat path: {legacy_feat.stderr}"
+                )
+            cases += 1
+
+            legacy_environment.update({"RELEASE_CANDIDATE": "maybe"})
+            legacy_malformed = _command(
+                ("bash", "-c", script),
+                cwd=legacy_root,
+                env=legacy_environment,
+                check=False,
+            )
+            if legacy_malformed.returncode == 0 or "must be true or false" not in legacy_malformed.stderr:
+                raise AssertionError(
+                    "legacy trusted base accepted a malformed release-candidate input"
+                )
+            cases += 1
+
+            legacy_environment.update({"RELEASE_CANDIDATE": "true"})
+            legacy_invalid = _command(
+                ("bash", "-c", script),
+                cwd=legacy_root,
+                env=legacy_environment,
+                check=False,
+            )
+            if legacy_invalid.returncode == 0 or "must select WINDOWS" not in legacy_invalid.stderr:
+                raise AssertionError(
+                    "legacy trusted base accepted a Linux-only release candidate"
+                )
+            cases += 1
+
+            legacy_environment.update(
+                {"SELECTION": fixed_backend, "RESULTS": results(fixed_backend)}
+            )
+            legacy_valid = _command(
+                ("bash", "-c", script),
+                cwd=legacy_root,
+                env=legacy_environment,
+                check=False,
+            )
+            if legacy_valid.returncode != 0:
+                raise AssertionError(
+                    "legacy trusted base rejected a co-located release candidate"
+                )
+            cases += 1
+
+        for path in ("src/lib.rs", "ui/app.slint"):
+            legacy = classify(path, release_candidate=False)
+            fixed = classify(path, release_candidate=True)
+            if "WINDOWS" in json.loads(legacy)["owners"]:
+                raise AssertionError(f"legacy classifier selected WINDOWS for {path}")
+            if "WINDOWS" not in json.loads(fixed)["owners"]:
+                raise AssertionError(
+                    f"release-candidate classifier omitted WINDOWS for {path}"
+                )
+
+            environment.update(
+                {
+                    "SELECTION": legacy,
+                    "RELEASE_CANDIDATE": "true",
+                    "RESULTS": results(legacy),
+                }
+            )
+            if path == "src/lib.rs":
+                missing_argument = _command(
+                    ("bash", "-c", missing_argument_script),
+                    cwd=ROOT,
+                    env=environment,
+                    check=False,
+                )
+                if missing_argument.returncode == 0:
+                    raise AssertionError(
+                        "selected-quality gate accepted an omitted release-candidate input"
+                    )
+                cases += 1
+
+            rejected = _command(
+                ("bash", "-c", script), cwd=ROOT, env=environment, check=False
+            )
+            if rejected.returncode == 0 or "must select WINDOWS" not in rejected.stderr:
+                raise AssertionError(
+                    f"old main classifier output was not rejected for {path}"
+                )
+            cases += 1
+
+            environment.update({"SELECTION": fixed, "RESULTS": results(fixed)})
+            accepted = _command(
+                ("bash", "-c", script), cwd=ROOT, env=environment, check=False
+            )
+            if accepted.returncode != 0:
+                raise AssertionError(
+                    f"fixed main classifier output was rejected for {path}: "
+                    f"{accepted.stderr}"
+                )
+            cases += 1
+
+        docs = json.dumps(
+            {
+                "owners": ["DOCS"],
+                "codeql_languages": [],
+                "binary_impact": False,
+            },
+            separators=(",", ":"),
+        )
+        environment.update({"SELECTION": docs, "RESULTS": results(docs)})
+        accepted_docs = _command(("bash", "-c", script), cwd=ROOT, env=environment, check=False)
+        if accepted_docs.returncode != 0:
+            raise AssertionError(
+                f"non-binary release candidate was rejected: {accepted_docs.stderr}"
+            )
+        cases += 1
+    finally:
+        changes.unlink(missing_ok=True)
+    return cases
 
 
 def _command(
@@ -2965,6 +3200,9 @@ def self_test() -> int:
         cases += 1
     observer_cases = _current_observer_tests(baseline["version-prepare.yml"])
     version_cases = _version_state_tests(baseline["version-prepare.yml"])
+    release_candidate_cases = _selected_quality_release_candidate_tests(
+        baseline["selective-quality.yml"]
+    )
     copy_cases = _git_copy_detection_test()
     final_check_cases = _final_check_tests(baseline["version-prepare.yml"])
     release_resolution_cases = _release_resolution_tests(baseline["release.yml"])
@@ -2976,6 +3214,7 @@ def self_test() -> int:
         cases
         + observer_cases
         + version_cases
+        + release_candidate_cases
         + copy_cases
         + final_check_cases
         + release_resolution_cases
@@ -2986,6 +3225,7 @@ def self_test() -> int:
         "workflow-quality-gate: PASS "
         f"total_cases={total_cases} static_cases={cases} "
         f"observer_cases={observer_cases} version_cases={version_cases} "
+        f"release_candidate_cases={release_candidate_cases} "
         f"copy_cases={copy_cases} "
         f"final_check_cases={final_check_cases} "
         f"release_resolution_cases={release_resolution_cases} "
