@@ -9,8 +9,8 @@
 - WindowsクライアントはLinux側の利用状況、残量、履歴、実行中threadを読み取り表示する。
 - 製品の通信は固定loopback API、利用者が選択したWSL、またはOpenSSH configのliteral `Host` aliasに限定する。
 - password、token、private key、展開済みSSH接続情報を保存しない。保存できるのは再接続に必要な非秘密selectorだけである。
-- telemetryは送信しない。更新確認だけは固定GitHub repository
-  `salty919/codex_info_v2` の公開Release API/assetを読み取れる。これ以外の未登録の外向き通信、
+- telemetryは送信しない。更新確認とLinux bundleの更新に必要な読み取りだけは固定GitHub repository
+  `salty919/codex_info_v2` の公開Release API/assetへ行える。これ以外の未登録の外向き通信、
   暗黙のsupport upload、raw diagnostic uploadを行わない。
 
 ## 2. 状態と表示
@@ -45,7 +45,32 @@
 - backup作成または検証に失敗した場合は既存のverified世代をpruneしない。
 - crash、reboot、再実行はjournalの同一operationを再開し、commit、publication、deleteを各1回以下にする。
 
-## 5. Windows導入・更新・削除
+## 5. Linux bundle導入・自動更新・削除
+
+- Linux bundleは`codex_info`、`codex-info.service`、`install.sh`、
+  `codex-info-update.service`、`codex-info-update.timer`、license/notice、version/target情報を含む。
+  install後は検証済み`install.sh`を永続installer `$HOME/.local/libexec/codex-info-install.sh`へ置き、
+  元の展開ディレクトリやrepositoryに依存せず、user-systemd timerがboot時と毎日1回、
+  固定repository `salty919/codex_info_v2` の公開Releaseだけを確認する。
+- 更新候補は、導入済みversionより新しいstableな`windows-vX.Y.Z` Releaseで、次のexact 5 assetが同一Releaseへ
+  同居するものだけを受理する。`CodexInfo.WindowsClient.Setup.exe`、
+  `CodexInfo.WindowsClient.update.json`、`codex-info-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz`、
+  対応する`.sha256`、および対応する`.manifest.json`である。新版がない場合は何も変更しない。
+- draft、prerelease、partial、extra asset、malformed Release、version/tag/asset identityまたはHTTPS GitHub asset redirect境界の不一致は、
+  download後を含めてcandidateを拒否し、filesystem、binary、unit、profile dataへmutationを行わない。
+  Linux archiveは既存のchecksum、manifest、archive content検証をすべて通過してからinstallへ進める。
+- 検証済みcandidateだけを既存のatomic install、`codex-info.service`再起動、loopback health確認へ渡す。
+  install、service切替、healthのいずれかが失敗した場合は旧binary、旧unit、永続installer、profile dataをcurrentとして
+  保持し、部分導入を成功と表示しない。更新処理の結果はuser journalへ記録し、秘密やraw responseを記録しない。
+- install、update、removeは同じuser lockで直列化し、競合する操作はfilesystem/unitを変更する前に失敗させる。
+- 利用者の明示操作による即時確認は`systemctl --user start codex-info-update.service`で行える。
+  実行状態は`systemctl --user status codex-info-update.service --no-pager`、timerの次回時刻は
+  `systemctl --user status codex-info-update.timer --no-pager`、結果と失敗理由は
+  `journalctl --user -u codex-info-update.service --no-pager`で確認できる。
+- `install.sh --remove`は`codex-info.service`と`codex-info-update.service`/`.timer`を停止・無効化しunitを解除するが、
+  導入binary、`$HOME/.local/libexec/codex-info-install.sh`、profile data（履歴DB、verified backup、reset hint、Codex session JSONL、設定）は削除しない。
+
+## 6. Windows導入・更新・削除
 
 - アプリ起動後の更新確認は通知だけを生成し、download、Setup起動、既存payload変更を行わない。
   新版がある場合だけ状態帯に更新操作を表示し、利用者がその操作を明示実行した後に限ってdownloadと
@@ -62,7 +87,7 @@
   利用者が開始するunsigned OSS buildは、exact GitHub repository、release tag、manifest、size、SHA-256の
   検証を満たす場合だけ標準GUI Setupへ渡し、Windowsが示すpublisher警告を隠さない。
 
-## 6. 配布・顧客向け表明
+## 7. 配布・顧客向け表明
 
 - Windows製品版とX版は単一のstable `X.Y.Z`を共有する。バイナリ影響ありのPRはmajor/minorを変更せず、mergeごとに
   自動採番処理がpatchを十進整数としてちょうど1増やす。patchからminorへ桁上がりさせず、`1.0.9`の次は
@@ -130,8 +155,8 @@
 - `windows-vX.Y.Z` ReleaseはSetupとmanifestを非公開Draftへuploadしてから公開する。途中失敗を公開済み成功へ変換しない。
 - Linux coreはtargetを`x86_64-unknown-linux-gnu`へ固定し、同じstable version・final source SHAのarchive、SHA-256 checksum、manifestを既存の`windows-vX.Y.Z` ReleaseへWindowsのSetup/manifestと同居させる。別Linux tag/channelを作らない。
 - Linux bundleの互換性は、bundle manifestに記録した実測`glibc_minimum`（glibc minimum）を満たすことだけを表明する。manifestのtargetまたは実測minimumが欠落・不一致なら候補を公開・導入せず、他のdistribution、architecture、署名済み、publisher検証済みの対応を表明しない。
-- Linux bundle archiveは`codex_info`、`codex-info.service`、`install.sh`、license/noticeを含み、version/target情報と対応するchecksum/manifestを同じcandidate identityへ結び付ける。顧客の通常導線はRelease assetのdownload、checksum検証、extract、bundle内scriptによるinstall、service status、loopback `/v1/health`、removeだけで完結し、repository clone、Cargo build、`run.sh`を要求しない。
-- Linux bundleのinstall、update、reinstall、removeまたはその失敗は、導入binary、履歴DB、verified backup、`history/usage_reset_hint.json`、Codex session JSONL、設定を削除しない。removeはuser service/unitだけを解除し、部分導入を成功と表示しない。
+- Linux bundle archiveは`codex_info`、`codex-info.service`、永続化する`install.sh`、`codex-info-update.service`、`codex-info-update.timer`、license/noticeを含み、version/target情報と対応するchecksum/manifestを同じcandidate identityへ結び付ける。導入時は`install.sh`を`$HOME/.local/libexec/codex-info-install.sh`へ永続化する。顧客の通常導線はRelease assetのdownload、checksum検証、extract、bundle内scriptによるinstall、自動更新、service status、loopback `/v1/health`、removeだけで完結し、repository clone、Cargo build、`run.sh`を要求しない。
+- Linux bundleのinstall、update、reinstall、removeまたはその失敗は、導入binary、永続installer、履歴DB、verified backup、`history/usage_reset_hint.json`、Codex session JSONL、設定を削除しない。removeはdaemon/updateのuser service/unitだけを解除し、部分導入を成功と表示しない。
 - release artifactはsource、lockfile、実payload、license/notice、署名、version、対象platformを一つのrelease identityで追跡する。
 - publisher名、certificate、対応OS build、RPO/RTO、accessibility適合、support窓口を根拠なしに推測しない。
 - authority inputがないclaimは「保証なし」「未対応」とし、認証済み、対応済み、測定済みと表示しない。
@@ -161,7 +186,7 @@
 この表の4列を満たさない形式検査、identity再照合、poll、retry、証拠専用artifact、同一run内の二次分類は追加しない。
 公開lock取得後の競合判定に必要な単回remote再取得を、汎用readbackやretryへ拡張しない。
 
-## 7. 有限の検証規則
+## 8. 有限の検証規則
 
 - 要件は重複を作らず、同じ観測結果は同じ要件へ統合する。
 - 各境界軸の値を最低1回検査する。複数軸は、共有状態または既知の因果関係がある組だけを有限のrisk-based caseにする。
@@ -169,7 +194,7 @@
 - 文書ごとのSHA一致を合否条件にしない。合否は観測結果、失敗時保持、副作用数、参照整合で決める。
 - 製品artifactのhashは評価対象を一意に識別するために1つ記録できるが、内容評価の代用にしない。
 
-## 8. 完了条件
+## 9. 完了条件
 
 - 上記要件と参照先仕様の間に、同じ入力へ異なる必須結果を要求する矛盾がない。
 

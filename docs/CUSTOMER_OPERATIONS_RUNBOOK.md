@@ -31,11 +31,14 @@ bundleから導入したbinaryを直接起動する場合は、同じ引数を`$
 
 ## Linux bundleの導入とuser-systemd
 
-既存の`windows-vX.Y.Z` Releaseから、同じversionのLinux asset一式を取得する。対象は
-`x86_64-unknown-linux-gnu` archive、対応する`.sha256` checksum、manifest（`*.manifest.json`）
-の3つである。manifestの実測`glibc_minimum`以上のglibcを持つ環境だけを導入対象とし、
-他のdistribution/architecture、署名済み、publisher検証済みとは表明しない。
-導入には`bash`、`tar`、`sha256sum`、`python3`、`curl`、user-systemd（`systemctl --user`）が必要である。
+公開済み・stableな`windows-vX.Y.Z` Releaseから、同じversionのLinux asset一式を取得する。
+Release全体は次のWindows 2 assetとLinux 3 assetのexact 5 assetだけを持つ必要がある。
+`CodexInfo.WindowsClient.Setup.exe`、`CodexInfo.WindowsClient.update.json`、
+`x86_64-unknown-linux-gnu` archive、対応する`.sha256` checksum、対応する`*.manifest.json`である。
+draft、prerelease、partial、extra、malformed Release、導入済みversion以下のReleaseは使わない。
+導入対象はmanifestの実測`glibc_minimum`以上のglibcを持つ環境だけとし、他のdistribution/architecture、
+署名済み、publisher検証済みとは表明しない。
+導入には`bash`、`tar`、`sha256sum`、`python3`、`curl`、`flock`、user-systemd（`systemctl --user`）が必要である。
 
 ### downloadとchecksum検証
 
@@ -49,13 +52,13 @@ checksum="${asset}.sha256"
 manifest="${asset%.tar.gz}.manifest.json"
 bundle_dir="$HOME/.local/share/codex-info/bundle-v${version}"
 mkdir -p "$bundle_dir"
-# Releaseから取得した3 assetをbundle_dirへ置いてから続行する。
+# 上記ReleaseからLinuxの3 assetをbundle_dirへ置いてから続行する。
 (cd "$bundle_dir" && sha256sum -c "$checksum")
 test -s "$bundle_dir/$manifest"
 ```
 
-checksumまたはmanifestの検証が失敗した場合は展開・導入を行わず、取得したassetを削除して
-Releaseから再取得する。
+checksum、manifest、archive contentの検証が失敗した場合は展開・導入を行わず、取得したassetを削除して
+Releaseから再取得する。検証できないReleaseを採用せず、既存の導入状態も変更しない。
 
 ### extractとinstall
 
@@ -68,8 +71,12 @@ bash "$bundle_dir/extracted/install.sh" \
     --sha256 "$bundle_dir/$checksum"
 ```
 
-bundle内のscriptはrelease binaryを`$HOME/.local/bin/codex_info`へ置き、
-`codex-info.service`だけを有効化・再起動する。
+bundle内のscriptはrelease binaryを`$HOME/.local/bin/codex_info`へ置き、installerを
+`$HOME/.local/libexec/codex-info-install.sh`へ永続化し、installed manifestを
+`$HOME/.local/share/codex-info/manifest.json`へ置く。さらに
+`codex-info.service`、`codex-info-update.service`、`codex-info-update.timer`を配置する。
+`codex-info.service`を有効化・再起動し、update timerはboot時と毎日1回、固定repository
+`salty919/codex_info_v2`の公開Releaseだけを確認する。導入後は元の展開ディレクトリやrepositoryを必要としない。
 
 ### statusとhealth
 
@@ -80,18 +87,39 @@ curl --fail http://127.0.0.1:8787/v1/health
 
 `health`の応答versionがReleaseの`X.Y.Z`と一致しない場合は利用を開始せず、導入をやり直す。
 
-## daemon自動起動から外す
+### 自動更新と手動確認
+
+timerは導入済みversionより新しいstableなReleaseだけを候補にし、exact 5 assetのidentity、checksum、manifest、
+archive contentを検証してから既存のatomic install、service restart、health確認へ進む。新版がない、draft/prerelease、
+partial、extra、malformed、identity不一致、検証失敗、service切替失敗、health不一致のいずれでもインストール状態を
+変更せず、途中fileを残さない。切替後のhealth失敗を含む更新失敗時は旧binary、旧unit、
+`$HOME/.local/libexec/codex-info-install.sh`、profile dataへrollbackする。
+
+今すぐ確認する場合は次を実行する。
+
+```bash
+systemctl --user start codex-info-update.service
+systemctl --user status codex-info-update.service --no-pager
+systemctl --user status codex-info-update.timer --no-pager
+journalctl --user -u codex-info-update.service --no-pager
+```
+
+最後のコマンドで更新確認、候補拒否、適用、rollbackの結果を確認できる。journalへ秘密やraw responseは記録しない。
+
+## daemon自動起動・自動更新から外す
 
 ```bash
 bash "$bundle_dir/extracted/install.sh" --remove
 ```
 
-この操作は`codex-info.service`を停止・無効化し、unit fileだけを削除する。導入binaryと次のデータは削除しない。
+この操作は`codex-info.service`と`codex-info-update.service`/`.timer`を停止・無効化し、unit fileを削除する。
+導入binary、`$HOME/.local/libexec/codex-info-install.sh`、installed manifest、profile dataと次のデータは削除しない。
 
 - `history/usage_history.sqlite3`
 - DB backup
 - `history/usage_reset_hint.json`
 - Codex session JSONL
+- 設定
 
 履歴データ自体の削除は、このbundle removeとは別の明示操作として扱う。
 install、update、reinstall、service切替失敗でも、履歴DB、DB backup、reset hint、Codex session JSONL、設定は保持する。

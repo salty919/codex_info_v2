@@ -2641,9 +2641,9 @@ def _write_publish_curl(directory: Path) -> Path:
     return binary
 
 
-def _release_assets(setup: Path, manifest: Path) -> list[dict[str, object]]:
+def _release_assets(*paths: Path) -> list[dict[str, object]]:
     assets: list[dict[str, object]] = []
-    for path in (setup, manifest):
+    for path in paths:
         content = path.read_bytes()
         assets.append(
             {
@@ -2656,7 +2656,7 @@ def _release_assets(setup: Path, manifest: Path) -> list[dict[str, object]]:
     return assets
 
 
-def _publication_state(kind: str, setup: Path, manifest: Path) -> dict[str, object]:
+def _publication_state(kind: str, *asset_paths: Path) -> dict[str, object]:
     state: dict[str, object] = {
         "next_id": 901,
         "tags": [],
@@ -2685,7 +2685,7 @@ def _publication_state(kind: str, setup: Path, manifest: Path) -> dict[str, obje
             f"{release_id}/assets{{?name,label}}"
         ),
     }
-    assets = _release_assets(setup, manifest)
+    assets = _release_assets(*asset_paths)
     if kind != "release-only":
         state["tags"] = [tag]
     if kind != "orphan-tag":
@@ -2845,79 +2845,7 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
     with tempfile.TemporaryDirectory(prefix="codex-info-release-publish-") as raw_root:
         root = Path(raw_root)
 
-        absent_root = root / "absent"
-        absent_root.mkdir()
-        setup, manifest = _materialize_candidate_handoff(
-            windows_workflow, release_workflow, absent_root
-        )
-        state = _publication_state("absent", setup, manifest)
-        result, calls, final_state = _execute_publication(
-            script, absent_root, initial_state=state
-        )
-        if result.returncode != 0:
-            raise AssertionError(
-                "artifact handoff did not materialize the publisher input paths"
-            )
-        mutations = _publish_mutations(calls)
-        if (
-            len([call for call in mutations if call.get("tool") == "curl"]) != 2
-            or len(
-                [
-                    call
-                    for call in mutations
-                    if call.get("tool") == "gh" and "POST" in call["args"]
-                ]
-            )
-            != 1
-            or len(
-                [
-                    call
-                    for call in mutations
-                    if call.get("tool") == "gh" and "PATCH" in call["args"]
-                ]
-            )
-            != 1
-            or final_state["details"]["901"]["draft"] is not False
-            or len(final_state["assets"]["901"]) != 2
-        ):
-            raise AssertionError("fully absent release did not create-upload-publish exactly once")
-        cases += 1
-
-        # A second same-tag holder acquires the lock after the first publication
-        # and must observe an exact published no-op without another mutation.
-        result, calls, _ = _execute_publication(
-            script, absent_root, initial_state=None
-        )
-        if result.returncode != 0 or _publish_mutations(calls):
-            raise AssertionError("concurrent holder did not reduce to exact published no-op")
-        cases += 1
-
-        for kind in (
-            "orphan-tag",
-            "release-only",
-            "draft",
-            "partial",
-            "target-mismatch",
-            "asset-mismatch",
-        ):
-            case_root = root / kind
-            case_root.mkdir()
-            setup, manifest = _materialize_candidate_handoff(
-                windows_workflow, release_workflow, case_root
-            )
-            state = _publication_state(kind, setup, manifest)
-            result, calls, _ = _execute_publication(
-                script, case_root, initial_state=state
-            )
-            if result.returncode == 0 or _publish_mutations(calls):
-                raise AssertionError(f"invalid existing release state was repaired: {kind}")
-            cases += 1
-
-        linux_root = root / "linux"
-        linux_root.mkdir()
-        linux_candidate = linux_root / "release-candidate"
-        linux_candidate.mkdir()
-        linux_output = linux_root / "bundle"
+        linux_output = root / "bundle"
         linux_output.mkdir()
         subprocess.run(
             [
@@ -2941,8 +2869,111 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
             capture_output=True,
             text=True,
         )
-        for path in linux_output.iterdir():
-            shutil.copy2(path, linux_candidate / path.name)
+
+        def copy_linux_assets(candidate: Path) -> tuple[Path, ...]:
+            copied = []
+            for path in linux_output.iterdir():
+                destination = candidate / path.name
+                shutil.copy2(path, destination)
+                copied.append(destination)
+            return tuple(sorted(copied))
+
+        absent_root = root / "absent"
+        absent_root.mkdir()
+        setup, manifest = _materialize_candidate_handoff(
+            windows_workflow, release_workflow, absent_root
+        )
+        linux_assets = copy_linux_assets(setup.parent)
+        state = _publication_state("absent", setup, manifest, *linux_assets)
+        result, calls, final_state = _execute_publication(
+            script,
+            absent_root,
+            initial_state=state,
+            environment_overrides={
+                "FINAL_HEAD": _FINAL_HEAD,
+                "LINUX_PRESENT": "true",
+                "WINDOWS_PRESENT": "true",
+            },
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                "artifact handoff did not materialize the publisher input paths"
+            )
+        mutations = _publish_mutations(calls)
+        if (
+            len([call for call in mutations if call.get("tool") == "curl"]) != 5
+            or len(
+                [
+                    call
+                    for call in mutations
+                    if call.get("tool") == "gh" and "POST" in call["args"]
+                ]
+            )
+            != 1
+            or len(
+                [
+                    call
+                    for call in mutations
+                    if call.get("tool") == "gh" and "PATCH" in call["args"]
+                ]
+            )
+            != 1
+            or final_state["details"]["901"]["draft"] is not False
+            or len(final_state["assets"]["901"]) != 5
+        ):
+            raise AssertionError("fully absent release did not create-upload-publish exactly once")
+        cases += 1
+
+        # A second same-tag holder acquires the lock after the first publication
+        # and must observe an exact published no-op without another mutation.
+        result, calls, _ = _execute_publication(
+            script,
+            absent_root,
+            initial_state=None,
+            environment_overrides={
+                "FINAL_HEAD": _FINAL_HEAD,
+                "LINUX_PRESENT": "true",
+                "WINDOWS_PRESENT": "true",
+            },
+        )
+        if result.returncode != 0 or _publish_mutations(calls):
+            raise AssertionError("concurrent holder did not reduce to exact published no-op")
+        cases += 1
+
+        for kind in (
+            "orphan-tag",
+            "release-only",
+            "draft",
+            "partial",
+            "target-mismatch",
+            "asset-mismatch",
+        ):
+            case_root = root / kind
+            case_root.mkdir()
+            setup, manifest = _materialize_candidate_handoff(
+                windows_workflow, release_workflow, case_root
+            )
+            linux_assets = copy_linux_assets(setup.parent)
+            state = _publication_state(kind, setup, manifest, *linux_assets)
+            result, calls, _ = _execute_publication(
+                script,
+                case_root,
+                initial_state=state,
+                environment_overrides={
+                    "FINAL_HEAD": _FINAL_HEAD,
+                    "LINUX_PRESENT": "true",
+                    "WINDOWS_PRESENT": "true",
+                },
+            )
+            if result.returncode == 0 or _publish_mutations(calls):
+                raise AssertionError(f"invalid existing release state was repaired: {kind}")
+            cases += 1
+
+        linux_root = root / "linux"
+        linux_root.mkdir()
+        linux_candidate = linux_root / "release-candidate"
+        linux_candidate.mkdir()
+        copy_linux_assets(linux_candidate)
         linux_state = _publication_state("absent", linux_candidate, linux_candidate)
         result, calls, final_state = _execute_publication(
             script,
@@ -2960,48 +2991,31 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
             )
         cases += 1
 
-        co_located_root = root / "co-located"
-        co_located_root.mkdir()
-        co_located_candidate = co_located_root / "release-candidate"
-        co_located_candidate.mkdir()
-        for path in linux_output.iterdir():
-            shutil.copy2(path, co_located_candidate / path.name)
-        co_located_candidate.joinpath("CodexInfo.WindowsClient.Setup.exe").write_bytes(
-            b"fixture installer"
+        windows_only_root = root / "windows-only"
+        windows_only_root.mkdir()
+        setup, manifest = _materialize_candidate_handoff(
+            windows_workflow, release_workflow, windows_only_root
         )
-        co_located_candidate.joinpath(
-            "CodexInfo.WindowsClient.update.json"
-        ).write_text(json.dumps({"version": _VERSION}), encoding="utf-8")
-        co_located_state = _publication_state(
-            "absent", co_located_candidate, co_located_candidate
-        )
-        result, calls, final_state = _execute_publication(
+        windows_only_state = _publication_state("absent", setup, manifest)
+        result, calls, _ = _execute_publication(
             script,
-            co_located_root,
-            initial_state=co_located_state,
+            windows_only_root,
+            initial_state=windows_only_state,
             environment_overrides={
                 "FINAL_HEAD": _FINAL_HEAD,
-                "LINUX_PRESENT": "true",
+                "LINUX_PRESENT": "false",
                 "WINDOWS_PRESENT": "true",
             },
         )
-        if (
-            result.returncode != 0
-            or len([call for call in calls if call.get("tool") == "curl"]) != 5
-            or final_state["details"]["901"]["draft"] is not False
-            or len(final_state["assets"]["901"]) != 5
-        ):
-            raise AssertionError(
-                "co-located Windows/Linux publication did not complete exactly once"
-            )
+        if result.returncode == 0 or _publish_mutations(calls):
+            raise AssertionError("Windows-only publication bypassed the Linux asset requirement")
         cases += 1
 
         mismatch_root = root / "linux-manifest-mismatch"
         mismatch_root.mkdir()
         mismatch_candidate = mismatch_root / "release-candidate"
         mismatch_candidate.mkdir()
-        for path in linux_output.iterdir():
-            shutil.copy2(path, mismatch_candidate / path.name)
+        copy_linux_assets(mismatch_candidate)
         mismatch_manifest = next(mismatch_candidate.glob("*.manifest.json"))
         mismatch_document = json.loads(mismatch_manifest.read_text(encoding="utf-8"))
         mismatch_document["files"][0]["sha256"] = "0" * 64
