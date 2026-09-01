@@ -205,11 +205,11 @@ run_install "$archive_v1" >/dev/null
 assert_binary_marker "$fake_home/.local/bin/codex_info" 'fixture binary generation one'
 [[ -f "$fake_home/.config/systemd/user/codex-info.service" ]] ||
     fail 'normal install did not publish unit'
-rg -qF -- 'systemctl --user enable codex-info.service' "$log" ||
+grep -Fq -- 'systemctl --user enable codex-info.service' "$log" ||
     fail 'normal install did not enable user unit'
-rg -qF -- 'systemctl --user is-active --quiet codex-info.service' "$log" ||
+grep -Fq -- 'systemctl --user is-active --quiet codex-info.service' "$log" ||
     fail 'normal install did not check active state'
-rg -qF -- 'curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8787/v1/health' "$log" ||
+grep -Fq -- 'curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8787/v1/health' "$log" ||
     fail 'normal install did not check health'
 printf 'case normal: PASS\n'
 

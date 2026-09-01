@@ -60,6 +60,7 @@ jobs:
           windows_leaf='Run selected quality owners / windows-quality / windows-quality'
           linux_wrapper='Run selected quality owners / linux-distribution'
           linux_leaf='Run selected quality owners / linux-distribution / linux-distribution'
+          product_quality_re='^Run selected quality owners / (windows-quality|linux-backend-quality|linux-ui-quality)( /|$)'
 
           api() {
             gh api \
@@ -470,6 +471,22 @@ jobs:
               echo 'Linux distribution authority job is duplicated' >&2
               exit 1
             }
+            # Every selected product owner implies a Linux distribution
+            # candidate. A missing authority job must not silently downgrade
+            # this run to a Windows-only publication.
+            product_success=false
+            if jq -e --arg re "$product_quality_re" '
+              any(.[];
+                (.name | type) == "string" and (.name | test($re)) and
+                .status == "completed" and .conclusion == "success"
+              )
+            ' <<<"$jobs" >/dev/null; then
+              product_success=true
+            fi
+            if [[ "$product_success" == true && "$linux_count" -eq 0 ]]; then
+              echo 'Linux distribution authority job is missing for a product-impact quality run' >&2
+              exit 1
+            fi
             printf '%s\n' "$row" >>"$successes"
             job_name="$(jq -r '.[0].name' <<<"$windows_jobs")"
             job_status="$(jq -r '.[0].status' <<<"$windows_jobs")"
@@ -499,12 +516,7 @@ jobs:
               echo 'Windows authority has an unexpected name/result pair' >&2
               exit 1
             fi
-            if [[ "$linux_count" -eq 0 ]]; then
-              # Runs created before the Linux distribution workflow existed do
-              # not have a Linux job. They remain valid Windows-only history;
-              # new binary runs always contain the exact Linux authority job.
-              :
-            else
+            if [[ "$linux_count" -gt 0 ]]; then
               linux_job_name="$(jq -r '.[0].name' <<<"$linux_jobs")"
               linux_job_status="$(jq -r '.[0].status' <<<"$linux_jobs")"
               linux_job_result="$(jq -r '.[0].conclusion // ""' <<<"$linux_jobs")"
