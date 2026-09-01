@@ -56,7 +56,10 @@ require_text src/main.rs '"startup-loading"'
 require_text ui/app.slint 'startup-loading: false'
 require_text ui/app.slint 'text: "◌  " + root.strings.checking;'
 
-all_target_output="$(cargo test --locked --all-targets -- --nocapture 2>&1)" || {
+# Keep libtest's per-test result lines intact.  With --nocapture, daemon child
+# logs can interleave byte-for-byte with `test ... ok`, making this gate reject
+# a test that actually passed.
+all_target_output="$(cargo test --locked --all-targets 2>&1)" || {
     printf '%s\n' "$all_target_output" >&2
     fail 'Rust all-target tests failed'
 }
