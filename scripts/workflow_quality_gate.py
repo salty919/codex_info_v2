@@ -373,6 +373,22 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         revalidate_script = revalidate.get("run")
         if not isinstance(resolver_script, str) or not isinstance(revalidate_script, str):
             raise AssertionError("release authority scripts are missing")
+        version_script = _step_script(
+            workflows["version-prepare.yml"],
+            "Select owners and prepare the binary version",
+        )
+        if '--name-status "$changes" --release-candidate' not in version_script:
+            errors.append(
+                "workflow wiring version selection: main candidate context is missing"
+            )
+        feat_script = _step_script(
+            workflows["feat-integration.yml"],
+            "Classify the event's exact base and head",
+        )
+        if "--release-candidate" in feat_script:
+            errors.append(
+                "workflow wiring feat selection: release candidate context leaked into feat integration"
+            )
         wrapper = f"{version_quality['name']} / {selective_windows['name']}"
         leaf = f"{wrapper} / {windows_job['name']}"
         for script, assignments in (
@@ -1079,9 +1095,12 @@ def _version_state_tests(version_workflow: str) -> int:
         if (
             result.returncode != 0
             or values.get("generated_head") != "true"
-            or json.loads(values["selection_json"])["owners"] != ["LINUX_BACKEND"]
+            or json.loads(values["selection_json"])["owners"]
+            != ["LINUX_BACKEND", "WINDOWS"]
         ):
-            raise AssertionError("Linux H0 did not preserve its selected owner on H1")
+            raise AssertionError(
+                "Linux H0 did not add the Windows release owner on H1"
+            )
         cases += 1
 
         fixture = _new_version_fixture(root, "manual-next")
@@ -1896,14 +1915,41 @@ def _release_resolution_tests(release_workflow: str) -> int:
     result, values, _ = _execute_release_shell(
         script, responses, event_name="pull_request_target", event=_closed_event()
     )
+    if result.returncode == 0:
+        raise AssertionError(
+            "Linux-only distribution candidate bypassed the Windows release authority"
+        )
+    print("workflow-quality-gate: case=linux-only-without-windows PASS")
+    cases += 1
+
+    co_located_spec = [
+        {
+            "id": 125,
+            "number": 35,
+            "attempts": [
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "windows": "success",
+                    "candidate": "exact",
+                    "linux": "success",
+                    "linux_candidate": "exact",
+                }
+            ],
+        }
+    ]
+    responses, _ = _manual_release_responses(co_located_spec)
+    result, values, _ = _execute_release_shell(
+        script, responses, event_name="pull_request_target", event=_closed_event()
+    )
     if (
         result.returncode != 0
         or values.get("publish") != "true"
         or values.get("linux_present") != "true"
-        or values.get("windows_present") != "false"
+        or values.get("windows_present") != "true"
         or not values.get("artifact_ids")
     ):
-        raise AssertionError("Linux-only distribution candidate was not selected")
+        raise AssertionError("co-located Windows/Linux candidates were not selected")
     cases += 1
 
     partial_linux_spec = [
@@ -2040,13 +2086,14 @@ def _release_resolution_tests(release_workflow: str) -> int:
                 "id": 131,
                 "number": 41,
                 "attempts": [
-                    {
-                        "status": "completed",
-                        "conclusion": "success",
-                        "windows": "skipped",
-                        "linux": "success",
-                        "linux_candidate": mode,
-                    }
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "windows": "success",
+                    "candidate": "exact",
+                    "linux": "success",
+                    "linux_candidate": mode,
+                }
                 ],
             }
         ]
@@ -2183,7 +2230,7 @@ def _release_lock_tests(release_workflow: str) -> int:
         raise AssertionError("unchanged authority failed after acquiring the tag lock")
     cases = 1
 
-    linux_spec = [
+    co_located_spec = [
         {
             "id": 203,
             "number": 53,
@@ -2191,14 +2238,15 @@ def _release_lock_tests(release_workflow: str) -> int:
                 {
                     "status": "completed",
                     "conclusion": "success",
-                    "windows": "skipped",
+                    "windows": "success",
+                    "candidate": "exact",
                     "linux": "success",
                     "linux_candidate": "exact",
                 }
             ],
         }
     ]
-    linux_responses, linux_summaries = _manual_release_responses(linux_spec)
+    linux_responses, linux_summaries = _manual_release_responses(co_located_spec)
     linux_responses[_runs_endpoint()] = _object_pages("workflow_runs", [])
     linux_resolved, linux_authority, _ = _execute_release_shell(
         resolve_script,
@@ -2207,7 +2255,7 @@ def _release_lock_tests(release_workflow: str) -> int:
         event=_workflow_event(linux_summaries[0]),
     )
     if linux_resolved.returncode != 0 or linux_authority.get("publish") != "true":
-        raise AssertionError("Linux-only authority did not resolve before lock revalidation")
+        raise AssertionError("co-located authority did not resolve before lock revalidation")
     result, values = _execute_revalidation(
         revalidate_script,
         linux_responses,
@@ -2216,7 +2264,20 @@ def _release_lock_tests(release_workflow: str) -> int:
         event=_workflow_event(linux_summaries[0]),
     )
     if result.returncode != 0 or values.get("proceed") != "true":
-        raise AssertionError("Linux-only authority failed after acquiring the tag lock")
+        raise AssertionError("co-located authority failed after acquiring the tag lock")
+    cases += 1
+
+    missing_windows_authority = dict(linux_authority)
+    missing_windows_authority["windows_present"] = "false"
+    result, values = _execute_revalidation(
+        revalidate_script,
+        linux_responses,
+        missing_windows_authority,
+        event_name="workflow_run",
+        event=_workflow_event(linux_summaries[0]),
+    )
+    if result.returncode == 0 or values.get("proceed") == "true":
+        raise AssertionError("Linux-only authority passed lock revalidation")
     cases += 1
 
     changed = json.loads(json.dumps(responses))
@@ -2717,32 +2778,31 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
                 "WINDOWS_PRESENT": "false",
             },
         )
-        if (
-            result.returncode != 0
-            or len([call for call in calls if call.get("tool") == "curl"]) != 3
-            or final_state["details"]["901"]["draft"] is not False
-            or len(final_state["assets"]["901"]) != 3
-        ):
-            raise AssertionError("Linux archive/checksum/manifest publication did not complete exactly once")
+        if result.returncode == 0 or _publish_mutations(calls):
+            raise AssertionError(
+                "Linux-only publication bypassed the Windows asset requirement"
+            )
         cases += 1
 
-        mixed_root = root / "mixed"
-        mixed_root.mkdir()
-        mixed_candidate = mixed_root / "release-candidate"
-        mixed_candidate.mkdir()
+        co_located_root = root / "co-located"
+        co_located_root.mkdir()
+        co_located_candidate = co_located_root / "release-candidate"
+        co_located_candidate.mkdir()
         for path in linux_output.iterdir():
-            shutil.copy2(path, mixed_candidate / path.name)
-        (mixed_candidate / "CodexInfo.WindowsClient.Setup.exe").write_bytes(
+            shutil.copy2(path, co_located_candidate / path.name)
+        co_located_candidate.joinpath("CodexInfo.WindowsClient.Setup.exe").write_bytes(
             b"fixture installer"
         )
-        (mixed_candidate / "CodexInfo.WindowsClient.update.json").write_text(
-            json.dumps({"version": _VERSION}), encoding="utf-8"
+        co_located_candidate.joinpath(
+            "CodexInfo.WindowsClient.update.json"
+        ).write_text(json.dumps({"version": _VERSION}), encoding="utf-8")
+        co_located_state = _publication_state(
+            "absent", co_located_candidate, co_located_candidate
         )
-        mixed_state = _publication_state("absent", mixed_candidate, mixed_candidate)
         result, calls, final_state = _execute_publication(
             script,
-            mixed_root,
-            initial_state=mixed_state,
+            co_located_root,
+            initial_state=co_located_state,
             environment_overrides={
                 "FINAL_HEAD": _FINAL_HEAD,
                 "LINUX_PRESENT": "true",
@@ -2755,7 +2815,9 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
             or final_state["details"]["901"]["draft"] is not False
             or len(final_state["assets"]["901"]) != 5
         ):
-            raise AssertionError("combined Windows/Linux publication did not complete exactly once")
+            raise AssertionError(
+                "co-located Windows/Linux publication did not complete exactly once"
+            )
         cases += 1
 
         mismatch_root = root / "linux-manifest-mismatch"
@@ -2770,6 +2832,12 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
         mismatch_manifest.write_text(
             json.dumps(mismatch_document), encoding="utf-8"
         )
+        mismatch_candidate.joinpath("CodexInfo.WindowsClient.Setup.exe").write_bytes(
+            b"fixture installer"
+        )
+        mismatch_candidate.joinpath(
+            "CodexInfo.WindowsClient.update.json"
+        ).write_text(json.dumps({"version": _VERSION}), encoding="utf-8")
         mismatch_state = _publication_state("absent", mismatch_candidate, mismatch_candidate)
         result, calls, _ = _execute_publication(
             script,
@@ -2778,7 +2846,7 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
             environment_overrides={
                 "FINAL_HEAD": _FINAL_HEAD,
                 "LINUX_PRESENT": "true",
-                "WINDOWS_PRESENT": "false",
+                "WINDOWS_PRESENT": "true",
             },
         )
         if result.returncode == 0 or _publish_mutations(calls):

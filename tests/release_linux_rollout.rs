@@ -1,7 +1,7 @@
 use std::process::Command;
 
 #[test]
-fn release_resolver_rollout_guard_executes_missing_linux_authority_case() {
+fn release_resolver_rollout_guard_executes_linux_release_cases() {
     let output = Command::new("python3")
         .args(["scripts/workflow_quality_gate.py", "--release-self-test"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -16,5 +16,9 @@ fn release_resolver_rollout_guard_executes_missing_linux_authority_case() {
     assert!(
         stdout.contains("case=missing-linux-authority PASS"),
         "missing Linux authority regression case was not executed: {stdout}"
+    );
+    assert!(
+        stdout.contains("case=linux-only-without-windows PASS"),
+        "Linux-only co-location regression case was not executed: {stdout}"
     );
 }
