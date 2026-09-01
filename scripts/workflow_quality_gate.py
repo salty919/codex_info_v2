@@ -263,6 +263,14 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "linux-distribution",
         ])
         mapping(
+            "selected.checkout",
+            _step(selected, uses="actions/checkout@v4").get("with"),
+            {
+                "ref": "${{ github.workflow_sha }}",
+                "persist-credentials": False,
+            },
+        )
+        mapping(
             "selected.results",
             _step(selected, name="Require selected success and non-selected skip").get("env"),
             {
@@ -278,13 +286,9 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             errors.append(
                 "workflow wiring selected.run: release-candidate context is not passed to the gate"
             )
-        if not isinstance(selected_script, str) or "scripts/selected_quality_gate.py --help" not in selected_script:
+        if isinstance(selected_script, str) and "selected_quality_gate.py --help" in selected_script:
             errors.append(
-                "workflow wiring selected.run: trusted-base CLI compatibility probe is missing"
-            )
-        if not isinstance(selected_script, str) or "release_candidate must be true or false" not in selected_script:
-            errors.append(
-                "workflow wiring selected.run: legacy release-candidate input guard is missing"
+                "workflow wiring selected.run: cross-generation compatibility probe remains"
             )
 
         # Windows selected/skipped signal and artifact identity.
@@ -528,7 +532,8 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
             errors.append(f"selective-quality.yml: missing {owner}")
     if "selected_quality_gate.py" not in selective:
         errors.append("selective-quality.yml: selected result aggregation is missing")
-    count("selective-quality.yml", "ref: ${{ inputs.base_sha }}", 1)
+    count("selective-quality.yml", "ref: ${{ inputs.base_sha }}", 0)
+    count("selective-quality.yml", "ref: ${{ github.workflow_sha }}", 1)
 
     linux_distribution = workflows["linux-distribution.yml"]
     for marker in (
@@ -641,10 +646,9 @@ def _step_script(workflow: str, step_name: str) -> str:
 def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
     """Exercise the selected-quality shell with both candidate contexts.
 
-    The first pair models the old main caller (classifier invoked without the
-    candidate flag) and the fixed caller.  Running the actual workflow shell,
-    rather than calling the Python gate directly, keeps the environment and
-    argument wiring under test.
+    The workflow and helper are checked out from one immutable workflow SHA.
+    Running the actual shell keeps the environment and argument wiring under
+    test without inventing a historical helper fixture.
     """
     script = _step_script(
         selective_workflow, "Require selected success and non-selected skip"
@@ -702,96 +706,11 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
     try:
         environment = os.environ.copy()
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        missing_argument_script = script.replace(
-            ' \\\n    --release-candidate "$RELEASE_CANDIDATE"', ""
-        )
-        if missing_argument_script == script:
-            raise AssertionError("selected-quality gate command shape changed")
-
-        legacy_backend = classify("src/lib.rs", release_candidate=False)
-        fixed_backend = classify("src/lib.rs", release_candidate=True)
-        with tempfile.TemporaryDirectory(prefix="codex-info-selected-quality-base-") as raw_legacy:
-            legacy_root = Path(raw_legacy)
-            legacy_scripts = legacy_root / "scripts"
-            legacy_scripts.mkdir()
-            legacy_source = _command(
-                ("git", "show", "HEAD^:scripts/selected_quality_gate.py"),
-                cwd=ROOT,
-            ).stdout
-            if "--release-candidate" in legacy_source:
-                raise AssertionError(
-                    "legacy trusted-base fixture unexpectedly supports the candidate CLI"
-                )
-            (legacy_scripts / "selected_quality_gate.py").write_text(
-                legacy_source,
-                encoding="utf-8",
-            )
-            legacy_environment = dict(environment)
-            legacy_environment.update(
-                {
-                    "SELECTION": legacy_backend,
-                    "RELEASE_CANDIDATE": "false",
-                    "RESULTS": results(legacy_backend),
-                }
-            )
-            legacy_feat = _command(
-                ("bash", "-c", script),
-                cwd=legacy_root,
-                env=legacy_environment,
-                check=False,
-            )
-            if legacy_feat.returncode != 0:
-                raise AssertionError(
-                    f"legacy trusted base rejected the feat path: {legacy_feat.stderr}"
-                )
-            cases += 1
-
-            legacy_environment.update({"RELEASE_CANDIDATE": "maybe"})
-            legacy_malformed = _command(
-                ("bash", "-c", script),
-                cwd=legacy_root,
-                env=legacy_environment,
-                check=False,
-            )
-            if legacy_malformed.returncode == 0 or "must be true or false" not in legacy_malformed.stderr:
-                raise AssertionError(
-                    "legacy trusted base accepted a malformed release-candidate input"
-                )
-            cases += 1
-
-            legacy_environment.update({"RELEASE_CANDIDATE": "true"})
-            legacy_invalid = _command(
-                ("bash", "-c", script),
-                cwd=legacy_root,
-                env=legacy_environment,
-                check=False,
-            )
-            if legacy_invalid.returncode == 0 or "must select WINDOWS" not in legacy_invalid.stderr:
-                raise AssertionError(
-                    "legacy trusted base accepted a Linux-only release candidate"
-                )
-            cases += 1
-
-            legacy_environment.update(
-                {"SELECTION": fixed_backend, "RESULTS": results(fixed_backend)}
-            )
-            legacy_valid = _command(
-                ("bash", "-c", script),
-                cwd=legacy_root,
-                env=legacy_environment,
-                check=False,
-            )
-            if legacy_valid.returncode != 0:
-                raise AssertionError(
-                    "legacy trusted base rejected a co-located release candidate"
-                )
-            cases += 1
-
         for path in ("src/lib.rs", "ui/app.slint"):
-            legacy = classify(path, release_candidate=False)
+            non_candidate = classify(path, release_candidate=False)
             fixed = classify(path, release_candidate=True)
-            if "WINDOWS" in json.loads(legacy)["owners"]:
-                raise AssertionError(f"legacy classifier selected WINDOWS for {path}")
+            if "WINDOWS" in json.loads(non_candidate)["owners"]:
+                raise AssertionError(f"non-candidate classifier selected WINDOWS for {path}")
             if "WINDOWS" not in json.loads(fixed)["owners"]:
                 raise AssertionError(
                     f"release-candidate classifier omitted WINDOWS for {path}"
@@ -799,30 +718,28 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
 
             environment.update(
                 {
-                    "SELECTION": legacy,
-                    "RELEASE_CANDIDATE": "true",
-                    "RESULTS": results(legacy),
+                    "SELECTION": non_candidate,
+                    "RELEASE_CANDIDATE": "false",
+                    "RESULTS": results(non_candidate),
                 }
             )
-            if path == "src/lib.rs":
-                missing_argument = _command(
-                    ("bash", "-c", missing_argument_script),
-                    cwd=ROOT,
-                    env=environment,
-                    check=False,
+            accepted_non_candidate = _command(
+                ("bash", "-c", script), cwd=ROOT, env=environment, check=False
+            )
+            if accepted_non_candidate.returncode != 0:
+                raise AssertionError(
+                    f"non-candidate path was rejected for {path}: "
+                    f"{accepted_non_candidate.stderr}"
                 )
-                if missing_argument.returncode == 0:
-                    raise AssertionError(
-                        "selected-quality gate accepted an omitted release-candidate input"
-                    )
-                cases += 1
+            cases += 1
 
+            environment.update({"RELEASE_CANDIDATE": "true"})
             rejected = _command(
                 ("bash", "-c", script), cwd=ROOT, env=environment, check=False
             )
             if rejected.returncode == 0 or "must select WINDOWS" not in rejected.stderr:
                 raise AssertionError(
-                    f"old main classifier output was not rejected for {path}"
+                    f"Linux-only candidate was not rejected for {path}"
                 )
             cases += 1
 
@@ -845,7 +762,13 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
             },
             separators=(",", ":"),
         )
-        environment.update({"SELECTION": docs, "RESULTS": results(docs)})
+        environment.update(
+            {
+                "SELECTION": docs,
+                "RELEASE_CANDIDATE": "true",
+                "RESULTS": results(docs),
+            }
+        )
         accepted_docs = _command(("bash", "-c", script), cwd=ROOT, env=environment, check=False)
         if accepted_docs.returncode != 0:
             raise AssertionError(
@@ -3118,7 +3041,7 @@ def self_test() -> int:
         ("version-prepare.yml", "cancel-in-progress: false", "cancel-in-progress: true"),
         ("version-prepare.yml", "git push origin", "git push --force origin"),
         ("version-prepare.yml", "checks: write", "checks: read"),
-        ("selective-quality.yml", "ref: ${{ inputs.base_sha }}", "ref: ${{ inputs.source_sha }}"),
+        ("selective-quality.yml", "ref: ${{ github.workflow_sha }}", "ref: ${{ inputs.source_sha }}"),
         ("selective-quality.yml", "  windows-quality:\n", "  omitted-windows-quality:\n"),
         ("windows-client.yml", "New-WindowsUpdateManifest.ps1", "Omitted-Manifest.ps1"),
         ("rust.yml", "cargo test --locked --all-targets -- --nocapture", "true"),

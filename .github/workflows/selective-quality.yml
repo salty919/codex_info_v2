@@ -139,7 +139,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.base_sha }}
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
       - name: Require selected success and non-selected skip
         env:
@@ -149,29 +149,7 @@ jobs:
         run: |
           set -euo pipefail
           results="$(jq -c 'with_entries(.value = .value.result)' <<<"$RESULTS")"
-          if python3 scripts/selected_quality_gate.py --help 2>&1 |
-            grep -q -- '--release-candidate'; then
-            # The trusted base understands the candidate-aware gate.
-            python3 scripts/selected_quality_gate.py \
-              --selection "$SELECTION" \
-              --results "$results" \
-              --release-candidate "$RELEASE_CANDIDATE"
-          else
-            # Keep the first rollout compatible with a trusted base that
-            # predates the candidate-aware CLI.  This branch is fail-closed:
-            # it only permits the old gate for a complete non-candidate or
-            # already co-located candidate selection.
-            [[ "$RELEASE_CANDIDATE" == true || "$RELEASE_CANDIDATE" == false ]] || {
-              echo 'selected-quality-gate: FAIL release_candidate must be true or false' >&2
-              exit 1
-            }
-            if [[ "$RELEASE_CANDIDATE" == true ]] && jq -e '
-              (.binary_impact == true) and ((.owners | index("WINDOWS")) == null)
-            ' <<<"$SELECTION" >/dev/null; then
-              echo 'selected-quality-gate: FAIL release candidate binary impact must select WINDOWS' >&2
-              exit 1
-            fi
-            python3 scripts/selected_quality_gate.py \
-              --selection "$SELECTION" \
-              --results "$results"
-          fi
+          python3 scripts/selected_quality_gate.py \
+            --selection "$SELECTION" \
+            --results "$results" \
+            --release-candidate "$RELEASE_CANDIDATE"
