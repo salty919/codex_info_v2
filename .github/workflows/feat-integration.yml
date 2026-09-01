@@ -25,9 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.workflow_sha }}
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
       - name: Classify the event's exact base and head
         id: classify
         env:
@@ -41,7 +41,7 @@ jobs:
             echo 'selective integration currently supports same-repository PRs' >&2
             exit 1
           }
-          git fetch --no-tags origin "$HEAD_SHA"
+          git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
           changes="$RUNNER_TEMP/changed-paths.z"
           git diff --find-renames=50% --find-copies=50% --find-copies-harder \
             --name-status -z "$BASE_SHA...$HEAD_SHA" > "$changes"

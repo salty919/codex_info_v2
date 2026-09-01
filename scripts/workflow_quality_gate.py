@@ -128,10 +128,19 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect("version.checkout.if", checkout.get("if"), condition)
         expect("version.prepare.if", _step(prepared, step_id="prepare").get("if"), condition)
         mapping("version.checkout", checkout.get("with"), {
-            "ref": "${{ github.event.pull_request.base.sha }}",
+            "ref": "${{ github.workflow_sha }}",
             "fetch-depth": 0,
             "persist-credentials": True,
         })
+        version_prepare_script = _step(prepared, step_id="prepare").get("run")
+        if (
+            not isinstance(version_prepare_script, str)
+            or 'git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"'
+            not in version_prepare_script
+        ):
+            errors.append(
+                "workflow wiring version.prepare: exact base and head objects are not fetched"
+            )
 
         # Producer metadata -> H1 and Release identity protocol.
         expect(
@@ -169,14 +178,23 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "feat.classify.checkout",
             _step(feat_classify, uses="actions/checkout@v4").get("with"),
             {
-                "ref": "${{ github.event.pull_request.base.sha }}",
+                "ref": "${{ github.workflow_sha }}",
                 "fetch-depth": 0,
-                "persist-credentials": True,
+                "persist-credentials": False,
             },
         )
         mapping("feat.classify.outputs", feat_classify.get("outputs"), {
             "selection_json": "${{ steps.classify.outputs.selection_json }}",
         })
+        feat_classify_script = _step(feat_classify, step_id="classify").get("run")
+        if (
+            not isinstance(feat_classify_script, str)
+            or 'git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"'
+            not in feat_classify_script
+        ):
+            errors.append(
+                "workflow wiring feat.classify: exact base and head objects are not fetched"
+            )
         expect("feat.quality.needs", feat_quality.get("needs"), ["classify"])
         expect("feat.quality.uses", feat_quality.get("uses"), "./.github/workflows/selective-quality.yml")
         mapping("feat.quality", feat_quality.get("with"), {
@@ -263,13 +281,33 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "linux-distribution",
         ])
         mapping(
+            "selected.checkout",
+            _step(selected, uses="actions/checkout@v4").get("with"),
+            {
+                "ref": "${{ github.workflow_sha }}",
+                "persist-credentials": False,
+            },
+        )
+        mapping(
             "selected.results",
             _step(selected, name="Require selected success and non-selected skip").get("env"),
             {
                 "SELECTION": "${{ inputs.selection_json }}",
+                "RELEASE_CANDIDATE": "${{ inputs.release_candidate }}",
                 "RESULTS": "${{ toJSON(needs) }}",
             },
         )
+        selected_script = _step(
+            selected, name="Require selected success and non-selected skip"
+        ).get("run")
+        if not isinstance(selected_script, str) or "--release-candidate \"$RELEASE_CANDIDATE\"" not in selected_script:
+            errors.append(
+                "workflow wiring selected.run: release-candidate context is not passed to the gate"
+            )
+        if isinstance(selected_script, str) and "selected_quality_gate.py --help" in selected_script:
+            errors.append(
+                "workflow wiring selected.run: cross-generation compatibility probe remains"
+            )
 
         # Windows selected/skipped signal and artifact identity.
         expect("windows.job-set", set(windows["jobs"]), {"windows-quality"})
@@ -472,7 +510,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "name: version-prepared",
         "run-name: codex-main-quality-v1:",
         "'Observe generated H1' || 'acceptance'",
-        "ref: ${{ github.event.pull_request.base.sha }}",
+        "ref: ${{ github.workflow_sha }}",
         "git log --first-parent --format=%H",
         "expected_version_transition=true",
         "generated_observer=true",
@@ -512,7 +550,8 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
             errors.append(f"selective-quality.yml: missing {owner}")
     if "selected_quality_gate.py" not in selective:
         errors.append("selective-quality.yml: selected result aggregation is missing")
-    count("selective-quality.yml", "ref: ${{ inputs.base_sha }}", 1)
+    count("selective-quality.yml", "ref: ${{ inputs.base_sha }}", 0)
+    count("selective-quality.yml", "ref: ${{ github.workflow_sha }}", 1)
 
     linux_distribution = workflows["linux-distribution.yml"]
     for marker in (
@@ -620,6 +659,143 @@ def _step_script(workflow: str, step_name: str) -> str:
                 if isinstance(script, str) and script:
                     return script
     raise AssertionError(f"workflow step was not found: {step_name}")
+
+
+def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
+    """Exercise the selected-quality shell with both candidate contexts.
+
+    The workflow and helper are checked out from one immutable workflow SHA.
+    Running the actual shell keeps the environment and argument wiring under
+    test without inventing a historical helper fixture.
+    """
+    script = _step_script(
+        selective_workflow, "Require selected success and non-selected skip"
+    )
+    owner_jobs = {
+        "DOCS": "docs-quality",
+        "GOVERNANCE": "governance-quality",
+        "LINUX_BACKEND": "linux-backend-quality",
+        "LINUX_UI": "linux-ui-quality",
+        "WINDOWS": "windows-quality",
+    }
+    changes = ROOT / "scripts" / ".selected-quality-release-candidate-changes.z"
+    cases = 0
+
+    def classify(path: str, *, release_candidate: bool) -> str:
+        changes.write_bytes(f"M\0{path}\0".encode())
+        command = (
+            "python3",
+            "scripts/ci_change_scope.py",
+            "--name-status",
+            str(changes),
+        )
+        if release_candidate:
+            command += ("--release-candidate",)
+        return _command(command, cwd=ROOT).stdout.strip()
+
+    def results(selection_raw: str) -> str:
+        selection = json.loads(selection_raw)
+        owners = set(selection["owners"])
+        selected_jobs = {owner_jobs[owner] for owner in owners}
+        return json.dumps(
+            {
+                job: {
+                    "result": (
+                        "success"
+                        if job in selected_jobs
+                        or (job == "codeql-quality" and bool(selection["codeql_languages"]))
+                        or (job == "linux-distribution" and selection["binary_impact"])
+                        else "skipped"
+                    )
+                }
+                for job in (
+                    "docs-quality",
+                    "governance-quality",
+                    "linux-backend-quality",
+                    "linux-ui-quality",
+                    "windows-quality",
+                    "codeql-quality",
+                    "linux-distribution",
+                )
+            },
+            separators=(",", ":"),
+        )
+
+    try:
+        environment = os.environ.copy()
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        for path in ("src/lib.rs", "ui/app.slint"):
+            non_candidate = classify(path, release_candidate=False)
+            fixed = classify(path, release_candidate=True)
+            if "WINDOWS" in json.loads(non_candidate)["owners"]:
+                raise AssertionError(f"non-candidate classifier selected WINDOWS for {path}")
+            if "WINDOWS" not in json.loads(fixed)["owners"]:
+                raise AssertionError(
+                    f"release-candidate classifier omitted WINDOWS for {path}"
+                )
+
+            environment.update(
+                {
+                    "SELECTION": non_candidate,
+                    "RELEASE_CANDIDATE": "false",
+                    "RESULTS": results(non_candidate),
+                }
+            )
+            accepted_non_candidate = _command(
+                ("bash", "-c", script), cwd=ROOT, env=environment, check=False
+            )
+            if accepted_non_candidate.returncode != 0:
+                raise AssertionError(
+                    f"non-candidate path was rejected for {path}: "
+                    f"{accepted_non_candidate.stderr}"
+                )
+            cases += 1
+
+            environment.update({"RELEASE_CANDIDATE": "true"})
+            rejected = _command(
+                ("bash", "-c", script), cwd=ROOT, env=environment, check=False
+            )
+            if rejected.returncode == 0 or "must select WINDOWS" not in rejected.stderr:
+                raise AssertionError(
+                    f"Linux-only candidate was not rejected for {path}"
+                )
+            cases += 1
+
+            environment.update({"SELECTION": fixed, "RESULTS": results(fixed)})
+            accepted = _command(
+                ("bash", "-c", script), cwd=ROOT, env=environment, check=False
+            )
+            if accepted.returncode != 0:
+                raise AssertionError(
+                    f"fixed main classifier output was rejected for {path}: "
+                    f"{accepted.stderr}"
+                )
+            cases += 1
+
+        docs = json.dumps(
+            {
+                "owners": ["DOCS"],
+                "codeql_languages": [],
+                "binary_impact": False,
+            },
+            separators=(",", ":"),
+        )
+        environment.update(
+            {
+                "SELECTION": docs,
+                "RELEASE_CANDIDATE": "true",
+                "RESULTS": results(docs),
+            }
+        )
+        accepted_docs = _command(("bash", "-c", script), cwd=ROOT, env=environment, check=False)
+        if accepted_docs.returncode != 0:
+            raise AssertionError(
+                f"non-binary release candidate was rejected: {accepted_docs.stderr}"
+            )
+        cases += 1
+    finally:
+        changes.unlink(missing_ok=True)
+    return cases
 
 
 def _command(
@@ -2883,7 +3059,7 @@ def self_test() -> int:
         ("version-prepare.yml", "cancel-in-progress: false", "cancel-in-progress: true"),
         ("version-prepare.yml", "git push origin", "git push --force origin"),
         ("version-prepare.yml", "checks: write", "checks: read"),
-        ("selective-quality.yml", "ref: ${{ inputs.base_sha }}", "ref: ${{ inputs.source_sha }}"),
+        ("selective-quality.yml", "ref: ${{ github.workflow_sha }}", "ref: ${{ inputs.source_sha }}"),
         ("selective-quality.yml", "  windows-quality:\n", "  omitted-windows-quality:\n"),
         ("windows-client.yml", "New-WindowsUpdateManifest.ps1", "Omitted-Manifest.ps1"),
         ("rust.yml", "cargo test --locked --all-targets -- --nocapture", "true"),
@@ -2909,8 +3085,13 @@ def self_test() -> int:
             "persist-credentials: false",
         ),
         (
-            "feat-integration.yml",
+            "version-prepare.yml",
+            "ref: ${{ github.workflow_sha }}",
             "ref: ${{ github.event.pull_request.base.sha }}",
+        ),
+        (
+            "feat-integration.yml",
+            "ref: ${{ github.workflow_sha }}",
             "ref: ${{ github.event.pull_request.head.sha }}",
         ),
         (
@@ -2965,6 +3146,9 @@ def self_test() -> int:
         cases += 1
     observer_cases = _current_observer_tests(baseline["version-prepare.yml"])
     version_cases = _version_state_tests(baseline["version-prepare.yml"])
+    release_candidate_cases = _selected_quality_release_candidate_tests(
+        baseline["selective-quality.yml"]
+    )
     copy_cases = _git_copy_detection_test()
     final_check_cases = _final_check_tests(baseline["version-prepare.yml"])
     release_resolution_cases = _release_resolution_tests(baseline["release.yml"])
@@ -2976,6 +3160,7 @@ def self_test() -> int:
         cases
         + observer_cases
         + version_cases
+        + release_candidate_cases
         + copy_cases
         + final_check_cases
         + release_resolution_cases
@@ -2986,6 +3171,7 @@ def self_test() -> int:
         "workflow-quality-gate: PASS "
         f"total_cases={total_cases} static_cases={cases} "
         f"observer_cases={observer_cases} version_cases={version_cases} "
+        f"release_candidate_cases={release_candidate_cases} "
         f"copy_cases={copy_cases} "
         f"final_check_cases={final_check_cases} "
         f"release_resolution_cases={release_resolution_cases} "

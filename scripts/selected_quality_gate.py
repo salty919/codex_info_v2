@@ -37,7 +37,12 @@ def _object(raw: str, label: str) -> dict[str, Any]:
     return value
 
 
-def validate(selection_raw: str, results_raw: str) -> None:
+def validate(
+    selection_raw: str,
+    results_raw: str,
+    *,
+    release_candidate: bool = False,
+) -> None:
     selection = _object(selection_raw, "selection")
     results = _object(results_raw, "results")
     owners = selection.get("owners")
@@ -54,6 +59,10 @@ def validate(selection_raw: str, results_raw: str) -> None:
     )
     if binary_impact is not expected_binary_impact:
         raise QualitySelectionError("selection has an inconsistent binary_impact")
+    if release_candidate and binary_impact and "WINDOWS" not in owners:
+        raise QualitySelectionError(
+            "release candidate binary impact must select WINDOWS"
+        )
     if set(results) != ALL_JOBS:
         raise QualitySelectionError("quality result keys do not match the job set")
 
@@ -82,9 +91,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--selection", required=True)
     parser.add_argument("--results", required=True)
+    parser.add_argument(
+        "--release-candidate",
+        required=True,
+        choices=("true", "false"),
+        help="require the platform-complete release-candidate owner set",
+    )
     args = parser.parse_args(argv)
     try:
-        validate(args.selection, args.results)
+        validate(
+            args.selection,
+            args.results,
+            release_candidate=args.release_candidate == "true",
+        )
     except QualitySelectionError as exc:
         print(f"selected-quality-gate: FAIL {exc}", file=sys.stderr)
         return 1

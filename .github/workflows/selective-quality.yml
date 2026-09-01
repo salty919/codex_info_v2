@@ -139,13 +139,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.base_sha }}
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
       - name: Require selected success and non-selected skip
         env:
           SELECTION: ${{ inputs.selection_json }}
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
           RESULTS: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
           results="$(jq -c 'with_entries(.value = .value.result)' <<<"$RESULTS")"
-          python3 scripts/selected_quality_gate.py --selection "$SELECTION" --results "$results"
+          python3 scripts/selected_quality_gate.py \
+            --selection "$SELECTION" \
+            --results "$results" \
+            --release-candidate "$RELEASE_CANDIDATE"

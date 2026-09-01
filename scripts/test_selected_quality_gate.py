@@ -87,6 +87,34 @@ class SelectedQualityTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(QualitySelectionError):
                 validate(json.dumps(value), json.dumps(successful_results(("DOCS",))))
 
+    def test_release_candidate_requires_windows_for_binary_impact(self) -> None:
+        for linux_only in (("LINUX_BACKEND",), ("LINUX_UI",)):
+            with self.subTest(owners=linux_only), self.assertRaisesRegex(
+                QualitySelectionError,
+                "release candidate binary impact must select WINDOWS",
+            ):
+                validate(
+                    selection(linux_only),
+                    json.dumps(successful_results(linux_only)),
+                    release_candidate=True,
+                )
+
+            validate(
+                selection(linux_only),
+                json.dumps(successful_results(linux_only)),
+                release_candidate=False,
+            )
+        validate(
+            selection(("LINUX_BACKEND", "WINDOWS")),
+            json.dumps(successful_results(("LINUX_BACKEND", "WINDOWS"))),
+            release_candidate=True,
+        )
+        validate(
+            selection(("DOCS",)),
+            json.dumps(successful_results(("DOCS",))),
+            release_candidate=True,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
