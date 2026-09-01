@@ -97,16 +97,48 @@ if [[ " $* " == *' restart '* ]]; then
 fi
 if [[ " $* " == *' is-enabled '* ]]; then
     if [[ " $* " == *' codex-info-update.timer '* ]]; then
-        [[ "${FAKE_SYSTEMCTL_TIMER_ENABLED:-1}" == 1 ]]
+        if [[ "${FAKE_SYSTEMCTL_TIMER_ENABLED_PROBE_ERROR:-0}" == 1 ]]; then
+            exit 2
+        fi
+        if [[ "${FAKE_SYSTEMCTL_TIMER_ENABLED:-1}" == 1 ]]; then
+            printf 'enabled\n'
+            exit 0
+        fi
+        printf 'disabled\n'
+        exit 1
     else
-        [[ "${FAKE_SYSTEMCTL_MAIN_ENABLED:-1}" == 1 ]]
+        if [[ "${FAKE_SYSTEMCTL_MAIN_ENABLED_PROBE_ERROR:-0}" == 1 ]]; then
+            exit 2
+        fi
+        if [[ "${FAKE_SYSTEMCTL_MAIN_ENABLED:-1}" == 1 ]]; then
+            printf 'enabled\n'
+            exit 0
+        fi
+        printf 'disabled\n'
+        exit 1
     fi
 fi
 if [[ " $* " == *' is-active '* ]]; then
     if [[ " $* " == *' codex-info-update.timer '* ]]; then
-        [[ "${FAKE_SYSTEMCTL_TIMER_ACTIVE:-1}" == 1 ]]
+        if [[ "${FAKE_SYSTEMCTL_TIMER_ACTIVE_PROBE_ERROR:-0}" == 1 ]]; then
+            exit 2
+        fi
+        if [[ "${FAKE_SYSTEMCTL_TIMER_ACTIVE:-1}" == 1 ]]; then
+            printf 'active\n'
+            exit 0
+        fi
+        printf 'inactive\n'
+        exit 3
     else
-        [[ "${FAKE_SYSTEMCTL_MAIN_ACTIVE:-${FAKE_SYSTEMCTL_ACTIVE:-1}}" == 1 ]]
+        if [[ "${FAKE_SYSTEMCTL_MAIN_ACTIVE_PROBE_ERROR:-0}" == 1 ]]; then
+            exit 2
+        fi
+        if [[ "${FAKE_SYSTEMCTL_MAIN_ACTIVE:-${FAKE_SYSTEMCTL_ACTIVE:-1}}" == 1 ]]; then
+            printf 'active\n'
+            exit 0
+        fi
+        printf 'inactive\n'
+        exit 3
     fi
 fi
 exit 0
@@ -443,6 +475,10 @@ run_install() {
         FAKE_LOG="$log" FAKE_HEALTH_VERSION="$health_version" \
         FAKE_CURL_HEALTH_TRANSIENT_FAILURES="${FAKE_CURL_HEALTH_TRANSIENT_FAILURES:-0}" \
         FAKE_SYSTEMCTL_MANAGER_UP_LONG="${FAKE_SYSTEMCTL_MANAGER_UP_LONG:-0}" \
+        FAKE_SYSTEMCTL_MAIN_ENABLED_PROBE_ERROR="${FAKE_SYSTEMCTL_MAIN_ENABLED_PROBE_ERROR:-0}" \
+        FAKE_SYSTEMCTL_MAIN_ACTIVE_PROBE_ERROR="${FAKE_SYSTEMCTL_MAIN_ACTIVE_PROBE_ERROR:-0}" \
+        FAKE_SYSTEMCTL_TIMER_ENABLED_PROBE_ERROR="${FAKE_SYSTEMCTL_TIMER_ENABLED_PROBE_ERROR:-0}" \
+        FAKE_SYSTEMCTL_TIMER_ACTIVE_PROBE_ERROR="${FAKE_SYSTEMCTL_TIMER_ACTIVE_PROBE_ERROR:-0}" \
         SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
         bash "$install_script" --bundle "$archive"
 }
@@ -462,6 +498,10 @@ run_update() {
         FAKE_CURL_HEALTH_TRANSIENT_FAILURES="${FAKE_CURL_HEALTH_TRANSIENT_FAILURES:-0}" \
         FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSET_ROOT="$release_asset_root" \
         FAKE_CURL_EFFECTIVE_URL="${FAKE_CURL_EFFECTIVE_URL:-}" \
+        FAKE_SYSTEMCTL_MAIN_ENABLED_PROBE_ERROR="${FAKE_SYSTEMCTL_MAIN_ENABLED_PROBE_ERROR:-0}" \
+        FAKE_SYSTEMCTL_MAIN_ACTIVE_PROBE_ERROR="${FAKE_SYSTEMCTL_MAIN_ACTIVE_PROBE_ERROR:-0}" \
+        FAKE_SYSTEMCTL_TIMER_ENABLED_PROBE_ERROR="${FAKE_SYSTEMCTL_TIMER_ENABLED_PROBE_ERROR:-0}" \
+        FAKE_SYSTEMCTL_TIMER_ACTIVE_PROBE_ERROR="${FAKE_SYSTEMCTL_TIMER_ACTIVE_PROBE_ERROR:-0}" \
         CODEX_INFO_INSTALL_LOCKED="${CODEX_INFO_INSTALL_LOCKED:-}" \
         SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
         bash "$install_script" --update
@@ -580,6 +620,13 @@ assert_no_restart_since() {
     fi
 }
 
+assert_no_runtime_mutation_since() {
+    local first_line="$1" label="$2" segment
+    segment="$(tail -n "+$first_line" "$log")"
+    ! grep -Eq -- 'systemctl --user (daemon-reload|enable|disable|start|stop|restart|reset-failed)( |$)' \
+        <<<"$segment" || fail "$label reached runtime state mutation"
+}
+
 assert_rollback_did_not_stop_updater() {
     local first_line="$1" label="$2" segment reload_line timer_line
     segment="$(tail -n "+$first_line" "$log")"
@@ -590,6 +637,41 @@ assert_rollback_did_not_stop_updater() {
         <<<"$segment" | tail -n 1 | cut -d: -f1)"
     [[ -n "$reload_line" && -n "$timer_line" && "$reload_line" -lt "$timer_line" ]] ||
         fail "$label did not reload restored units before restoring the timer"
+}
+
+assert_runtime_probe_error_case() {
+    local label="$1" before_state before_update_log_lines
+    before_state="$(installation_state_digest)"
+    before_update_log_lines="$(( $(wc -l < "$log") + 1 ))"
+    case "$label" in
+        main-enabled)
+            if FAKE_SYSTEMCTL_MAIN_ENABLED_PROBE_ERROR=1 run_update "$archive_v1" >/dev/null 2>&1; then
+                fail 'main enabled probe error unexpectedly succeeded'
+            fi
+            ;;
+        main-active)
+            if FAKE_SYSTEMCTL_MAIN_ACTIVE_PROBE_ERROR=1 run_update "$archive_v1" >/dev/null 2>&1; then
+                fail 'main active probe error unexpectedly succeeded'
+            fi
+            ;;
+        timer-enabled)
+            if FAKE_SYSTEMCTL_TIMER_ENABLED_PROBE_ERROR=1 run_update "$archive_v1" >/dev/null 2>&1; then
+                fail 'timer enabled probe error unexpectedly succeeded'
+            fi
+            ;;
+        timer-active)
+            if FAKE_SYSTEMCTL_TIMER_ACTIVE_PROBE_ERROR=1 run_update "$archive_v1" >/dev/null 2>&1; then
+                fail 'timer active probe error unexpectedly succeeded'
+            fi
+            ;;
+        *)
+            fail "unknown runtime probe error case: $label"
+            ;;
+    esac
+    assert_state_unchanged "$before_state" "$label probe error"
+    assert_no_runtime_mutation_since "$before_update_log_lines" "$label probe error"
+    assert_update_tmp_empty "$label probe error"
+    printf 'case runtime-%s-probe-error: PASS\n' "$label"
 }
 
 archive_v1="$(build_bundle 1111111111111111111111111111111111111111 1.0.19)"
@@ -690,6 +772,9 @@ printf 'case spoofed-inherited-lock-rejection: PASS\n'
 write_fixture_binary 'fixture binary generation two'
 archive_v2="$(build_bundle 2222222222222222222222222222222222222222 1.0.20)"
 write_release_fixture "$archive_v2" complete
+for probe_case in main-enabled main-active timer-enabled timer-active; do
+    assert_runtime_probe_error_case "$probe_case"
+done
 before_state="$(installation_state_digest)"
 before_update_log_lines="$(( $(wc -l < "$log") + 1 ))"
 if health_failure_output="$(run_update "$archive_v1" 9.9.9 2>&1)"; then
