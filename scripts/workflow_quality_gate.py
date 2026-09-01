@@ -282,6 +282,10 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             errors.append(
                 "workflow wiring selected.run: trusted-base CLI compatibility probe is missing"
             )
+        if not isinstance(selected_script, str) or "trusted gate capability probe failed" not in selected_script:
+            errors.append(
+                "workflow wiring selected.run: failed trusted-base capability probe is not fail-closed"
+            )
         if not isinstance(selected_script, str) or "release_candidate must be true or false" not in selected_script:
             errors.append(
                 "workflow wiring selected.run: legacy release-candidate input guard is missing"
@@ -784,6 +788,37 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
             if legacy_valid.returncode != 0:
                 raise AssertionError(
                     "legacy trusted base rejected a co-located release candidate"
+                )
+            cases += 1
+
+        with tempfile.TemporaryDirectory(prefix="codex-info-selected-quality-broken-") as raw_broken:
+            broken_root = Path(raw_broken)
+            broken_scripts = broken_root / "scripts"
+            broken_scripts.mkdir()
+            (broken_scripts / "selected_quality_gate.py").write_text(
+                "raise SystemExit('capability probe failed')\n",
+                encoding="utf-8",
+            )
+            broken_environment = dict(environment)
+            broken_environment.update(
+                {
+                    "SELECTION": fixed_backend,
+                    "RELEASE_CANDIDATE": "true",
+                    "RESULTS": results(fixed_backend),
+                }
+            )
+            broken_probe = _command(
+                ("bash", "-c", script),
+                cwd=broken_root,
+                env=broken_environment,
+                check=False,
+            )
+            if (
+                broken_probe.returncode == 0
+                or "trusted gate capability probe failed" not in broken_probe.stderr
+            ):
+                raise AssertionError(
+                    "failed trusted-base capability probe was not rejected"
                 )
             cases += 1
 

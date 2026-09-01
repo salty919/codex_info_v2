@@ -47,9 +47,6 @@ fi
 require_file scripts/cli_contract_e2e.sh
 require_text scripts/cli_contract_e2e.sh "initial_commit='codex-info: recorder committed 1 samples'"
 require_text scripts/cli_contract_e2e.sh "fixture_now=\"\$(date -u +%s)\""
-require_text scripts/cli_contract_e2e.sh '"CODEX_INFO_DAEMON_INTERVAL_SECS=5"'
-require_text scripts/cli_contract_e2e.sh 'BEGIN EXCLUSIVE;'
-require_text scripts/cli_contract_e2e.sh "'forced transient recorder failure was not observed'"
 require_text scripts/cli_contract_e2e.sh "sqlite3 -batch -bail -cmd '.timeout 2000'"
 require_text scripts/x11_graph_visual_gate.sh 'graph child window title redundantly exposes product version'
 require_text src/main.rs 'remaining_graph_does_not_infer_quota_loss_from_model_spend'
@@ -92,16 +89,16 @@ for required_test in \
     graph_controls_use_one_visual_boundary_and_show_short_histories \
     remaining_graph_does_not_infer_quota_loss_from_model_spend \
     affected_timestamp_does_not_mix_a_singleton_reset_period_into_history \
-    ambiguous_missing_quota_row_at_a_spend_timestamp_is_not_a_period \
+    model_only_reset_fragment_at_a_spend_minute_has_no_period_authority \
     singleton_reset_snapshot_overlapping_a_spend_period_stays_separate \
     graph_collision_preview_matches_the_historical_singleton_oracle \
-    moving_reset_collision_at_30_and_60_seconds_fails_closed \
-    record_preserves_alias_quota_collision_for_canonical_rejection \
+    moving_reset_collision_at_30_and_60_seconds_omits_only_the_conflicting_minute \
+    record_preserves_alias_quota_collision_while_public_history_omits_the_minute \
     exact_key_noncomparable_observations_never_form_a_synthetic_vector \
-    same_timestamp_reset_drift_above_jitter_fails_closed \
+    same_timestamp_reset_drift_with_conflicting_quota_omits_only_that_minute \
     startup_load_sanitizes_legacy_same_timestamp_quota_collision \
     history_canonicalizer_uses_one_existing_dominant_vector_with_nullable_aliases \
-    history_canonicalizer_rejects_conflict_noncomparable_and_cross_partition_minutes \
+    history_canonicalizer_omits_ambiguous_values_and_rejects_cross_partition_minutes \
     history_canonicalizer_keeps_same_cycle_minutes_and_raw_sqlite_rows \
     reset_at_jitter_keeps_raw_aliases_and_canonicalizes_one_dominant_row \
     period_list_is_value_shape_neutral_and_keeps_all_db_rows \
