@@ -207,3 +207,9 @@ if (( failure_frame_ready != 1 )); then
     fail 'failure-port GUI did not produce a complete rendered frame'
 fi
 kill -0 "$failure_pid" 2>/dev/null || fail 'failure-port GUI exited after rendering'
+
+# X-START-06: exercise the normal Linux UI against a real resident service,
+# including the selected endpoint becoming unavailable and recovering. The
+# helper owns its isolated service/data fixture and fails closed on every
+# missing visual state.
+bash "$root_dir/scripts/x11_service_recovery_visual_gate.sh"
