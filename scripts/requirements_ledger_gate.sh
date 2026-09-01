@@ -21,6 +21,7 @@ duplicates="$(printf '%s\n' "${rows[@]}" | sort | uniq -d)"
 [[ -z "$duplicates" ]] || fail "duplicate requirement IDs: $duplicates"
 unverified=()
 
+# shellcheck disable=SC2034  # Fields are read indirectly through ${!field}.
 while IFS='|' read -r _ id contract boundary scope oracle status _; do
     [[ -n "${id//[[:space:]]/}" ]] || continue
     for field in contract boundary scope oracle status; do
@@ -37,10 +38,11 @@ done < <(awk '/^\| [A-Z0-9]+-[A-Z0-9-]+ \|/ { print }' "$ledger")
 # Every changed path must be named by at least one ledger scope. This covers
 # worktree, index, and untracked files so an unregistered implementation cannot
 # sneak into a PR merely because the requirement table itself still parses.
+# shellcheck disable=SC2016  # Backticks are literal Markdown delimiters.
 mapfile -t scoped_paths < <(grep -oE '`[^`]+`' "$ledger" | tr -d '`' | sort -u)
 mapfile -t changed_paths < <({
-    git diff --name-only
-    git diff --cached --name-only
+    git -c core.quotePath=false diff --name-only
+    git -c core.quotePath=false diff --cached --name-only
     git ls-files --others --exclude-standard |
         awk '$0 !~ /(^|\/)__pycache__\/[^/]+\.pyc$/'
 } | sort -u)

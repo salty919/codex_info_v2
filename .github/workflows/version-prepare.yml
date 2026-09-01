@@ -91,7 +91,7 @@ jobs:
       - uses: actions/checkout@v4
         if: steps.current.outputs.observer != 'true'
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ github.workflow_sha }}
           fetch-depth: 0
           persist-credentials: true
       - name: Select owners and prepare the binary version
@@ -112,7 +112,7 @@ jobs:
             echo 'automatic version preparation requires a same-repository PR' >&2
             exit 1
           }
-          git fetch --no-tags origin "$HEAD_SHA"
+          git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"
 
           versions="$RUNNER_TEMP/versions"
           mkdir -p "$versions/base/windows-client" "$versions/head/windows-client"

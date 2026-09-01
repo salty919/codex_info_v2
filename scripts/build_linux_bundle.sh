@@ -101,7 +101,7 @@ done
 if [[ -z "$VERSION" ]]; then
     VERSION="$(awk -F '"' '/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/{print $2; exit}' "$ROOT_DIR/Cargo.toml")"
 fi
-[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+[[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
     die "invalid product version: $VERSION"
 
 [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] ||
@@ -124,6 +124,10 @@ fi
     die "release binary is not executable: $BINARY"
 [[ -f "$ROOT_DIR/packaging/codex-info.service" ]] ||
     die 'packaging/codex-info.service is missing'
+[[ -f "$ROOT_DIR/packaging/codex-info-update.service" ]] ||
+    die 'packaging/codex-info-update.service is missing'
+[[ -f "$ROOT_DIR/packaging/codex-info-update.timer" ]] ||
+    die 'packaging/codex-info-update.timer is missing'
 [[ -f "$ROOT_DIR/LICENSE" ]] || die 'LICENSE is missing'
 [[ -f "$ROOT_DIR/THIRD_PARTY_NOTICES.md" ]] ||
     die 'THIRD_PARTY_NOTICES.md is missing'
@@ -152,6 +156,10 @@ mkdir -- "$payload" "$payload/LICENSES"
 install -m 0755 -- "$BINARY" "$payload/codex_info"
 install -m 0644 -- "$ROOT_DIR/packaging/codex-info.service" \
     "$payload/codex-info.service"
+install -m 0644 -- "$ROOT_DIR/packaging/codex-info-update.service" \
+    "$payload/codex-info-update.service"
+install -m 0644 -- "$ROOT_DIR/packaging/codex-info-update.timer" \
+    "$payload/codex-info-update.timer"
 install -m 0755 -- "$ROOT_DIR/packaging/install_linux_bundle.sh" \
     "$payload/install.sh"
 install -m 0644 -- "$ROOT_DIR/LICENSE" "$payload/LICENSE"

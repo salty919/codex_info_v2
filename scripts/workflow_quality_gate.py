@@ -128,10 +128,19 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect("version.checkout.if", checkout.get("if"), condition)
         expect("version.prepare.if", _step(prepared, step_id="prepare").get("if"), condition)
         mapping("version.checkout", checkout.get("with"), {
-            "ref": "${{ github.event.pull_request.base.sha }}",
+            "ref": "${{ github.workflow_sha }}",
             "fetch-depth": 0,
             "persist-credentials": True,
         })
+        version_prepare_script = _step(prepared, step_id="prepare").get("run")
+        if (
+            not isinstance(version_prepare_script, str)
+            or 'git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"'
+            not in version_prepare_script
+        ):
+            errors.append(
+                "workflow wiring version.prepare: exact base and head objects are not fetched"
+            )
 
         # Producer metadata -> H1 and Release identity protocol.
         expect(
@@ -169,14 +178,23 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "feat.classify.checkout",
             _step(feat_classify, uses="actions/checkout@v4").get("with"),
             {
-                "ref": "${{ github.event.pull_request.base.sha }}",
+                "ref": "${{ github.workflow_sha }}",
                 "fetch-depth": 0,
-                "persist-credentials": True,
+                "persist-credentials": False,
             },
         )
         mapping("feat.classify.outputs", feat_classify.get("outputs"), {
             "selection_json": "${{ steps.classify.outputs.selection_json }}",
         })
+        feat_classify_script = _step(feat_classify, step_id="classify").get("run")
+        if (
+            not isinstance(feat_classify_script, str)
+            or 'git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"'
+            not in feat_classify_script
+        ):
+            errors.append(
+                "workflow wiring feat.classify: exact base and head objects are not fetched"
+            )
         expect("feat.quality.needs", feat_quality.get("needs"), ["classify"])
         expect("feat.quality.uses", feat_quality.get("uses"), "./.github/workflows/selective-quality.yml")
         mapping("feat.quality", feat_quality.get("with"), {
@@ -263,6 +281,14 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "linux-distribution",
         ])
         mapping(
+            "selected.checkout",
+            _step(selected, uses="actions/checkout@v4").get("with"),
+            {
+                "ref": "${{ github.workflow_sha }}",
+                "persist-credentials": False,
+            },
+        )
+        mapping(
             "selected.results",
             _step(selected, name="Require selected success and non-selected skip").get("env"),
             {
@@ -278,13 +304,9 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             errors.append(
                 "workflow wiring selected.run: release-candidate context is not passed to the gate"
             )
-        if not isinstance(selected_script, str) or "scripts/selected_quality_gate.py --help" not in selected_script:
+        if isinstance(selected_script, str) and "selected_quality_gate.py --help" in selected_script:
             errors.append(
-                "workflow wiring selected.run: trusted-base CLI compatibility probe is missing"
-            )
-        if not isinstance(selected_script, str) or "release_candidate must be true or false" not in selected_script:
-            errors.append(
-                "workflow wiring selected.run: legacy release-candidate input guard is missing"
+                "workflow wiring selected.run: cross-generation compatibility probe remains"
             )
 
         # Windows selected/skipped signal and artifact identity.
@@ -488,7 +510,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "name: version-prepared",
         "run-name: codex-main-quality-v1:",
         "'Observe generated H1' || 'acceptance'",
-        "ref: ${{ github.event.pull_request.base.sha }}",
+        "ref: ${{ github.workflow_sha }}",
         "git log --first-parent --format=%H",
         "expected_version_transition=true",
         "generated_observer=true",
@@ -528,7 +550,8 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
             errors.append(f"selective-quality.yml: missing {owner}")
     if "selected_quality_gate.py" not in selective:
         errors.append("selective-quality.yml: selected result aggregation is missing")
-    count("selective-quality.yml", "ref: ${{ inputs.base_sha }}", 1)
+    count("selective-quality.yml", "ref: ${{ inputs.base_sha }}", 0)
+    count("selective-quality.yml", "ref: ${{ github.workflow_sha }}", 1)
 
     linux_distribution = workflows["linux-distribution.yml"]
     for marker in (
@@ -641,10 +664,9 @@ def _step_script(workflow: str, step_name: str) -> str:
 def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
     """Exercise the selected-quality shell with both candidate contexts.
 
-    The first pair models the old main caller (classifier invoked without the
-    candidate flag) and the fixed caller.  Running the actual workflow shell,
-    rather than calling the Python gate directly, keeps the environment and
-    argument wiring under test.
+    The workflow and helper are checked out from one immutable workflow SHA.
+    Running the actual shell keeps the environment and argument wiring under
+    test without inventing a historical helper fixture.
     """
     script = _step_script(
         selective_workflow, "Require selected success and non-selected skip"
@@ -702,96 +724,11 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
     try:
         environment = os.environ.copy()
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        missing_argument_script = script.replace(
-            ' \\\n    --release-candidate "$RELEASE_CANDIDATE"', ""
-        )
-        if missing_argument_script == script:
-            raise AssertionError("selected-quality gate command shape changed")
-
-        legacy_backend = classify("src/lib.rs", release_candidate=False)
-        fixed_backend = classify("src/lib.rs", release_candidate=True)
-        with tempfile.TemporaryDirectory(prefix="codex-info-selected-quality-base-") as raw_legacy:
-            legacy_root = Path(raw_legacy)
-            legacy_scripts = legacy_root / "scripts"
-            legacy_scripts.mkdir()
-            legacy_source = _command(
-                ("git", "show", "HEAD^:scripts/selected_quality_gate.py"),
-                cwd=ROOT,
-            ).stdout
-            if "--release-candidate" in legacy_source:
-                raise AssertionError(
-                    "legacy trusted-base fixture unexpectedly supports the candidate CLI"
-                )
-            (legacy_scripts / "selected_quality_gate.py").write_text(
-                legacy_source,
-                encoding="utf-8",
-            )
-            legacy_environment = dict(environment)
-            legacy_environment.update(
-                {
-                    "SELECTION": legacy_backend,
-                    "RELEASE_CANDIDATE": "false",
-                    "RESULTS": results(legacy_backend),
-                }
-            )
-            legacy_feat = _command(
-                ("bash", "-c", script),
-                cwd=legacy_root,
-                env=legacy_environment,
-                check=False,
-            )
-            if legacy_feat.returncode != 0:
-                raise AssertionError(
-                    f"legacy trusted base rejected the feat path: {legacy_feat.stderr}"
-                )
-            cases += 1
-
-            legacy_environment.update({"RELEASE_CANDIDATE": "maybe"})
-            legacy_malformed = _command(
-                ("bash", "-c", script),
-                cwd=legacy_root,
-                env=legacy_environment,
-                check=False,
-            )
-            if legacy_malformed.returncode == 0 or "must be true or false" not in legacy_malformed.stderr:
-                raise AssertionError(
-                    "legacy trusted base accepted a malformed release-candidate input"
-                )
-            cases += 1
-
-            legacy_environment.update({"RELEASE_CANDIDATE": "true"})
-            legacy_invalid = _command(
-                ("bash", "-c", script),
-                cwd=legacy_root,
-                env=legacy_environment,
-                check=False,
-            )
-            if legacy_invalid.returncode == 0 or "must select WINDOWS" not in legacy_invalid.stderr:
-                raise AssertionError(
-                    "legacy trusted base accepted a Linux-only release candidate"
-                )
-            cases += 1
-
-            legacy_environment.update(
-                {"SELECTION": fixed_backend, "RESULTS": results(fixed_backend)}
-            )
-            legacy_valid = _command(
-                ("bash", "-c", script),
-                cwd=legacy_root,
-                env=legacy_environment,
-                check=False,
-            )
-            if legacy_valid.returncode != 0:
-                raise AssertionError(
-                    "legacy trusted base rejected a co-located release candidate"
-                )
-            cases += 1
-
         for path in ("src/lib.rs", "ui/app.slint"):
-            legacy = classify(path, release_candidate=False)
+            non_candidate = classify(path, release_candidate=False)
             fixed = classify(path, release_candidate=True)
-            if "WINDOWS" in json.loads(legacy)["owners"]:
-                raise AssertionError(f"legacy classifier selected WINDOWS for {path}")
+            if "WINDOWS" in json.loads(non_candidate)["owners"]:
+                raise AssertionError(f"non-candidate classifier selected WINDOWS for {path}")
             if "WINDOWS" not in json.loads(fixed)["owners"]:
                 raise AssertionError(
                     f"release-candidate classifier omitted WINDOWS for {path}"
@@ -799,30 +736,28 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
 
             environment.update(
                 {
-                    "SELECTION": legacy,
-                    "RELEASE_CANDIDATE": "true",
-                    "RESULTS": results(legacy),
+                    "SELECTION": non_candidate,
+                    "RELEASE_CANDIDATE": "false",
+                    "RESULTS": results(non_candidate),
                 }
             )
-            if path == "src/lib.rs":
-                missing_argument = _command(
-                    ("bash", "-c", missing_argument_script),
-                    cwd=ROOT,
-                    env=environment,
-                    check=False,
+            accepted_non_candidate = _command(
+                ("bash", "-c", script), cwd=ROOT, env=environment, check=False
+            )
+            if accepted_non_candidate.returncode != 0:
+                raise AssertionError(
+                    f"non-candidate path was rejected for {path}: "
+                    f"{accepted_non_candidate.stderr}"
                 )
-                if missing_argument.returncode == 0:
-                    raise AssertionError(
-                        "selected-quality gate accepted an omitted release-candidate input"
-                    )
-                cases += 1
+            cases += 1
 
+            environment.update({"RELEASE_CANDIDATE": "true"})
             rejected = _command(
                 ("bash", "-c", script), cwd=ROOT, env=environment, check=False
             )
             if rejected.returncode == 0 or "must select WINDOWS" not in rejected.stderr:
                 raise AssertionError(
-                    f"old main classifier output was not rejected for {path}"
+                    f"Linux-only candidate was not rejected for {path}"
                 )
             cases += 1
 
@@ -845,7 +780,13 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
             },
             separators=(",", ":"),
         )
-        environment.update({"SELECTION": docs, "RESULTS": results(docs)})
+        environment.update(
+            {
+                "SELECTION": docs,
+                "RELEASE_CANDIDATE": "true",
+                "RESULTS": results(docs),
+            }
+        )
         accepted_docs = _command(("bash", "-c", script), cwd=ROOT, env=environment, check=False)
         if accepted_docs.returncode != 0:
             raise AssertionError(
@@ -2700,9 +2641,9 @@ def _write_publish_curl(directory: Path) -> Path:
     return binary
 
 
-def _release_assets(setup: Path, manifest: Path) -> list[dict[str, object]]:
+def _release_assets(*paths: Path) -> list[dict[str, object]]:
     assets: list[dict[str, object]] = []
-    for path in (setup, manifest):
+    for path in paths:
         content = path.read_bytes()
         assets.append(
             {
@@ -2715,7 +2656,7 @@ def _release_assets(setup: Path, manifest: Path) -> list[dict[str, object]]:
     return assets
 
 
-def _publication_state(kind: str, setup: Path, manifest: Path) -> dict[str, object]:
+def _publication_state(kind: str, *asset_paths: Path) -> dict[str, object]:
     state: dict[str, object] = {
         "next_id": 901,
         "tags": [],
@@ -2744,7 +2685,7 @@ def _publication_state(kind: str, setup: Path, manifest: Path) -> dict[str, obje
             f"{release_id}/assets{{?name,label}}"
         ),
     }
-    assets = _release_assets(setup, manifest)
+    assets = _release_assets(*asset_paths)
     if kind != "release-only":
         state["tags"] = [tag]
     if kind != "orphan-tag":
@@ -2904,79 +2845,7 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
     with tempfile.TemporaryDirectory(prefix="codex-info-release-publish-") as raw_root:
         root = Path(raw_root)
 
-        absent_root = root / "absent"
-        absent_root.mkdir()
-        setup, manifest = _materialize_candidate_handoff(
-            windows_workflow, release_workflow, absent_root
-        )
-        state = _publication_state("absent", setup, manifest)
-        result, calls, final_state = _execute_publication(
-            script, absent_root, initial_state=state
-        )
-        if result.returncode != 0:
-            raise AssertionError(
-                "artifact handoff did not materialize the publisher input paths"
-            )
-        mutations = _publish_mutations(calls)
-        if (
-            len([call for call in mutations if call.get("tool") == "curl"]) != 2
-            or len(
-                [
-                    call
-                    for call in mutations
-                    if call.get("tool") == "gh" and "POST" in call["args"]
-                ]
-            )
-            != 1
-            or len(
-                [
-                    call
-                    for call in mutations
-                    if call.get("tool") == "gh" and "PATCH" in call["args"]
-                ]
-            )
-            != 1
-            or final_state["details"]["901"]["draft"] is not False
-            or len(final_state["assets"]["901"]) != 2
-        ):
-            raise AssertionError("fully absent release did not create-upload-publish exactly once")
-        cases += 1
-
-        # A second same-tag holder acquires the lock after the first publication
-        # and must observe an exact published no-op without another mutation.
-        result, calls, _ = _execute_publication(
-            script, absent_root, initial_state=None
-        )
-        if result.returncode != 0 or _publish_mutations(calls):
-            raise AssertionError("concurrent holder did not reduce to exact published no-op")
-        cases += 1
-
-        for kind in (
-            "orphan-tag",
-            "release-only",
-            "draft",
-            "partial",
-            "target-mismatch",
-            "asset-mismatch",
-        ):
-            case_root = root / kind
-            case_root.mkdir()
-            setup, manifest = _materialize_candidate_handoff(
-                windows_workflow, release_workflow, case_root
-            )
-            state = _publication_state(kind, setup, manifest)
-            result, calls, _ = _execute_publication(
-                script, case_root, initial_state=state
-            )
-            if result.returncode == 0 or _publish_mutations(calls):
-                raise AssertionError(f"invalid existing release state was repaired: {kind}")
-            cases += 1
-
-        linux_root = root / "linux"
-        linux_root.mkdir()
-        linux_candidate = linux_root / "release-candidate"
-        linux_candidate.mkdir()
-        linux_output = linux_root / "bundle"
+        linux_output = root / "bundle"
         linux_output.mkdir()
         subprocess.run(
             [
@@ -3000,8 +2869,111 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
             capture_output=True,
             text=True,
         )
-        for path in linux_output.iterdir():
-            shutil.copy2(path, linux_candidate / path.name)
+
+        def copy_linux_assets(candidate: Path) -> tuple[Path, ...]:
+            copied = []
+            for path in linux_output.iterdir():
+                destination = candidate / path.name
+                shutil.copy2(path, destination)
+                copied.append(destination)
+            return tuple(sorted(copied))
+
+        absent_root = root / "absent"
+        absent_root.mkdir()
+        setup, manifest = _materialize_candidate_handoff(
+            windows_workflow, release_workflow, absent_root
+        )
+        linux_assets = copy_linux_assets(setup.parent)
+        state = _publication_state("absent", setup, manifest, *linux_assets)
+        result, calls, final_state = _execute_publication(
+            script,
+            absent_root,
+            initial_state=state,
+            environment_overrides={
+                "FINAL_HEAD": _FINAL_HEAD,
+                "LINUX_PRESENT": "true",
+                "WINDOWS_PRESENT": "true",
+            },
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                "artifact handoff did not materialize the publisher input paths"
+            )
+        mutations = _publish_mutations(calls)
+        if (
+            len([call for call in mutations if call.get("tool") == "curl"]) != 5
+            or len(
+                [
+                    call
+                    for call in mutations
+                    if call.get("tool") == "gh" and "POST" in call["args"]
+                ]
+            )
+            != 1
+            or len(
+                [
+                    call
+                    for call in mutations
+                    if call.get("tool") == "gh" and "PATCH" in call["args"]
+                ]
+            )
+            != 1
+            or final_state["details"]["901"]["draft"] is not False
+            or len(final_state["assets"]["901"]) != 5
+        ):
+            raise AssertionError("fully absent release did not create-upload-publish exactly once")
+        cases += 1
+
+        # A second same-tag holder acquires the lock after the first publication
+        # and must observe an exact published no-op without another mutation.
+        result, calls, _ = _execute_publication(
+            script,
+            absent_root,
+            initial_state=None,
+            environment_overrides={
+                "FINAL_HEAD": _FINAL_HEAD,
+                "LINUX_PRESENT": "true",
+                "WINDOWS_PRESENT": "true",
+            },
+        )
+        if result.returncode != 0 or _publish_mutations(calls):
+            raise AssertionError("concurrent holder did not reduce to exact published no-op")
+        cases += 1
+
+        for kind in (
+            "orphan-tag",
+            "release-only",
+            "draft",
+            "partial",
+            "target-mismatch",
+            "asset-mismatch",
+        ):
+            case_root = root / kind
+            case_root.mkdir()
+            setup, manifest = _materialize_candidate_handoff(
+                windows_workflow, release_workflow, case_root
+            )
+            linux_assets = copy_linux_assets(setup.parent)
+            state = _publication_state(kind, setup, manifest, *linux_assets)
+            result, calls, _ = _execute_publication(
+                script,
+                case_root,
+                initial_state=state,
+                environment_overrides={
+                    "FINAL_HEAD": _FINAL_HEAD,
+                    "LINUX_PRESENT": "true",
+                    "WINDOWS_PRESENT": "true",
+                },
+            )
+            if result.returncode == 0 or _publish_mutations(calls):
+                raise AssertionError(f"invalid existing release state was repaired: {kind}")
+            cases += 1
+
+        linux_root = root / "linux"
+        linux_root.mkdir()
+        linux_candidate = linux_root / "release-candidate"
+        linux_candidate.mkdir()
+        copy_linux_assets(linux_candidate)
         linux_state = _publication_state("absent", linux_candidate, linux_candidate)
         result, calls, final_state = _execute_publication(
             script,
@@ -3019,48 +2991,31 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
             )
         cases += 1
 
-        co_located_root = root / "co-located"
-        co_located_root.mkdir()
-        co_located_candidate = co_located_root / "release-candidate"
-        co_located_candidate.mkdir()
-        for path in linux_output.iterdir():
-            shutil.copy2(path, co_located_candidate / path.name)
-        co_located_candidate.joinpath("CodexInfo.WindowsClient.Setup.exe").write_bytes(
-            b"fixture installer"
+        windows_only_root = root / "windows-only"
+        windows_only_root.mkdir()
+        setup, manifest = _materialize_candidate_handoff(
+            windows_workflow, release_workflow, windows_only_root
         )
-        co_located_candidate.joinpath(
-            "CodexInfo.WindowsClient.update.json"
-        ).write_text(json.dumps({"version": _VERSION}), encoding="utf-8")
-        co_located_state = _publication_state(
-            "absent", co_located_candidate, co_located_candidate
-        )
-        result, calls, final_state = _execute_publication(
+        windows_only_state = _publication_state("absent", setup, manifest)
+        result, calls, _ = _execute_publication(
             script,
-            co_located_root,
-            initial_state=co_located_state,
+            windows_only_root,
+            initial_state=windows_only_state,
             environment_overrides={
                 "FINAL_HEAD": _FINAL_HEAD,
-                "LINUX_PRESENT": "true",
+                "LINUX_PRESENT": "false",
                 "WINDOWS_PRESENT": "true",
             },
         )
-        if (
-            result.returncode != 0
-            or len([call for call in calls if call.get("tool") == "curl"]) != 5
-            or final_state["details"]["901"]["draft"] is not False
-            or len(final_state["assets"]["901"]) != 5
-        ):
-            raise AssertionError(
-                "co-located Windows/Linux publication did not complete exactly once"
-            )
+        if result.returncode == 0 or _publish_mutations(calls):
+            raise AssertionError("Windows-only publication bypassed the Linux asset requirement")
         cases += 1
 
         mismatch_root = root / "linux-manifest-mismatch"
         mismatch_root.mkdir()
         mismatch_candidate = mismatch_root / "release-candidate"
         mismatch_candidate.mkdir()
-        for path in linux_output.iterdir():
-            shutil.copy2(path, mismatch_candidate / path.name)
+        copy_linux_assets(mismatch_candidate)
         mismatch_manifest = next(mismatch_candidate.glob("*.manifest.json"))
         mismatch_document = json.loads(mismatch_manifest.read_text(encoding="utf-8"))
         mismatch_document["files"][0]["sha256"] = "0" * 64
@@ -3118,7 +3073,7 @@ def self_test() -> int:
         ("version-prepare.yml", "cancel-in-progress: false", "cancel-in-progress: true"),
         ("version-prepare.yml", "git push origin", "git push --force origin"),
         ("version-prepare.yml", "checks: write", "checks: read"),
-        ("selective-quality.yml", "ref: ${{ inputs.base_sha }}", "ref: ${{ inputs.source_sha }}"),
+        ("selective-quality.yml", "ref: ${{ github.workflow_sha }}", "ref: ${{ inputs.source_sha }}"),
         ("selective-quality.yml", "  windows-quality:\n", "  omitted-windows-quality:\n"),
         ("windows-client.yml", "New-WindowsUpdateManifest.ps1", "Omitted-Manifest.ps1"),
         ("rust.yml", "cargo test --locked --all-targets -- --nocapture", "true"),
@@ -3144,8 +3099,13 @@ def self_test() -> int:
             "persist-credentials: false",
         ),
         (
-            "feat-integration.yml",
+            "version-prepare.yml",
+            "ref: ${{ github.workflow_sha }}",
             "ref: ${{ github.event.pull_request.base.sha }}",
+        ),
+        (
+            "feat-integration.yml",
+            "ref: ${{ github.workflow_sha }}",
             "ref: ${{ github.event.pull_request.head.sha }}",
         ),
         (
