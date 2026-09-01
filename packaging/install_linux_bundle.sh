@@ -736,6 +736,22 @@ manifest_moved=0
 update_service_moved=0
 update_timer_moved=0
 
+probe_systemd_state() {
+    local operation="$1" unit="$2" state='' status=0
+    state="$("$SYSTEMCTL_BIN" --user "$operation" "$unit" 2>/dev/null)" || status=$?
+    case "$operation:$status:$state" in
+        is-enabled:0:enabled|is-active:0:active)
+            return 0
+            ;;
+        is-enabled:1:disabled|is-active:3:inactive|is-active:3:failed)
+            return 1
+            ;;
+        *)
+            die "could not inspect $unit $operation (status $status, state ${state:-unknown})"
+            ;;
+    esac
+}
+
 cleanup_install_staging() {
     if [[ -n "$binary_stage" ]]; then
         rm -f -- "$binary_stage"
@@ -889,6 +905,25 @@ install -m 0644 -- "$MANIFEST" "$manifest_stage"
 install -m 0644 -- "$stage_root/codex-info-update.service" "$update_service_stage"
 install -m 0644 -- "$stage_root/codex-info-update.timer" "$update_timer_stage"
 
+if [[ -e "$unit_destination" || -L "$unit_destination" ]]; then
+    had_unit=1
+    if probe_systemd_state is-enabled codex-info.service; then
+        unit_was_enabled=1
+    fi
+    if probe_systemd_state is-active codex-info.service; then
+        unit_was_active=1
+    fi
+fi
+if [[ -e "$update_timer_destination" || -L "$update_timer_destination" ]]; then
+    had_update_timer=1
+    if probe_systemd_state is-enabled codex-info-update.timer; then
+        update_timer_was_enabled=1
+    fi
+    if probe_systemd_state is-active codex-info-update.timer; then
+        update_timer_was_active=1
+    fi
+fi
+
 if [[ -e "$binary_destination" || -L "$binary_destination" ]]; then
     if ! mv -- "$binary_destination" "$binary_backup"; then
         cleanup_install_staging
@@ -897,13 +932,6 @@ if [[ -e "$binary_destination" || -L "$binary_destination" ]]; then
     binary_backed_up=1
 fi
 if [[ -e "$unit_destination" || -L "$unit_destination" ]]; then
-    had_unit=1
-    if "$SYSTEMCTL_BIN" --user is-enabled --quiet codex-info.service >/dev/null 2>&1; then
-        unit_was_enabled=1
-    fi
-    if "$SYSTEMCTL_BIN" --user is-active --quiet codex-info.service >/dev/null 2>&1; then
-        unit_was_active=1
-    fi
     if ! mv -- "$unit_destination" "$unit_backup"; then
         rollback_and_die 'could not stage existing unit for atomic update'
     fi
@@ -928,13 +956,6 @@ if [[ -e "$update_service_destination" || -L "$update_service_destination" ]]; t
     update_service_backed_up=1
 fi
 if [[ -e "$update_timer_destination" || -L "$update_timer_destination" ]]; then
-    had_update_timer=1
-    if "$SYSTEMCTL_BIN" --user is-enabled --quiet codex-info-update.timer >/dev/null 2>&1; then
-        update_timer_was_enabled=1
-    fi
-    if "$SYSTEMCTL_BIN" --user is-active --quiet codex-info-update.timer >/dev/null 2>&1; then
-        update_timer_was_active=1
-    fi
     if ! mv -- "$update_timer_destination" "$update_timer_backup"; then
         rollback_and_die 'could not stage existing update timer for atomic update'
     fi
