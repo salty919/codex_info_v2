@@ -16,6 +16,7 @@ CHECKSUM=""
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 CURL_BIN="${CURL_BIN:-curl}"
 HEALTH_URL="http://127.0.0.1:8787/v1/health"
+HEALTH_READY_ATTEMPTS=10
 REPOSITORY="salty919/codex_info_v2"
 RELEASES_URL="https://api.github.com/repos/salty919/codex_info_v2/releases?per_page=100"
 
@@ -965,12 +966,25 @@ fi
 update_timer_moved=1
 
 health_response=''
+wait_for_health() {
+    local attempt
+    for ((attempt = 1; attempt <= HEALTH_READY_ATTEMPTS; attempt++)); do
+        if health_response="$("$CURL_BIN" --fail --silent --max-time 1 "$HEALTH_URL")"; then
+            return 0
+        fi
+        if ((attempt < HEALTH_READY_ATTEMPTS)); then
+            sleep 1
+        fi
+    done
+    return 1
+}
+
 if ! "$SYSTEMCTL_BIN" --user daemon-reload >/dev/null 2>&1 ||
     ! "$SYSTEMCTL_BIN" --user enable codex-info.service >/dev/null 2>&1 ||
     ! "$SYSTEMCTL_BIN" --user enable --now codex-info-update.timer >/dev/null 2>&1 ||
     ! "$SYSTEMCTL_BIN" --user restart codex-info.service >/dev/null 2>&1 ||
     ! "$SYSTEMCTL_BIN" --user is-active --quiet codex-info.service >/dev/null 2>&1 ||
-    ! health_response="$("$CURL_BIN" --fail --silent --show-error --max-time 5 "$HEALTH_URL")";
+    ! wait_for_health;
 then
     rollback_and_die 'systemd activation or health check failed'
 fi
