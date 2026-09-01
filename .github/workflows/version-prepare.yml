@@ -191,7 +191,12 @@ jobs:
             git diff --find-renames=50% --find-copies=50% --find-copies-harder \
               --name-status -z "$BASE_SHA...$HEAD_SHA" > "$changes"
           fi
-          selection="$(python3 scripts/ci_change_scope.py --name-status "$changes")"
+          # A main release candidate must contain both platform payloads. The
+          # classifier keeps feat/next diff selection unchanged, while this
+          # explicit context selects Windows validation for every product
+          # change so Linux-only changes cannot create a Windows-tagged
+          # release without Windows assets.
+          selection="$(python3 scripts/ci_change_scope.py --name-status "$changes" --release-candidate)"
           binary_impact="$(jq -r '.binary_impact' <<<"$selection")"
 
           if [[ "$binary_impact" == false ]]; then

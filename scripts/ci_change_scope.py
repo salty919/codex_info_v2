@@ -108,12 +108,16 @@ def owners_for_path(path: str) -> frozenset[str]:
     raise ScopeError(f"changed path has no CI owner: {path}")
 
 
-def selection_for_paths(paths: Sequence[str]) -> Selection:
+def selection_for_paths(
+    paths: Sequence[str], *, release_candidate: bool = False
+) -> Selection:
     owners: set[str] = set()
     for path in paths:
         owners.update(owners_for_path(path))
     if not owners:
         raise ScopeError("pull request contains no changed paths")
+    if release_candidate and PRODUCT_OWNERS.intersection(owners):
+        owners.add("WINDOWS")
 
     languages: set[str] = set()
     if "GOVERNANCE" in owners:
@@ -157,16 +161,23 @@ def paths_from_name_status(raw: bytes) -> tuple[str, ...]:
     return tuple(paths)
 
 
-def selection_from_name_status(raw: bytes) -> Selection:
-    return selection_for_paths(paths_from_name_status(raw))
+def selection_from_name_status(
+    raw: bytes, *, release_candidate: bool = False
+) -> Selection:
+    return selection_for_paths(
+        paths_from_name_status(raw), release_candidate=release_candidate
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name-status", required=True, type=Path)
+    parser.add_argument("--release-candidate", action="store_true")
     args = parser.parse_args(argv)
     try:
-        result = selection_from_name_status(args.name_status.read_bytes())
+        result = selection_from_name_status(
+            args.name_status.read_bytes(), release_candidate=args.release_candidate
+        )
     except (OSError, ScopeError) as exc:
         print(f"ci-change-scope: FAIL {exc}", file=sys.stderr)
         return 1

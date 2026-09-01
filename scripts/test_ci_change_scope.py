@@ -3,16 +3,29 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import subprocess
+import sys
+import tempfile
 import unittest
 
-from ci_change_scope import (
-    ScopeError,
-    owners_for_path,
-    paths_from_name_status,
-    selection_for_paths,
-    selection_from_name_status,
-)
+if __package__:
+    from .ci_change_scope import (
+        ScopeError,
+        owners_for_path,
+        paths_from_name_status,
+        selection_for_paths,
+        selection_from_name_status,
+    )
+else:
+    from ci_change_scope import (
+        ScopeError,
+        owners_for_path,
+        paths_from_name_status,
+        selection_for_paths,
+        selection_from_name_status,
+    )
 
 
 class OwnerTableTests(unittest.TestCase):
@@ -89,6 +102,26 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(result.codeql_languages, ())
         self.assertFalse(result.binary_impact)
 
+        release_result = selection_for_paths(
+            ["README.md"], release_candidate=True
+        )
+        self.assertEqual(release_result.owners, ("DOCS",))
+        self.assertEqual(release_result.codeql_languages, ())
+        self.assertFalse(release_result.binary_impact)
+
+    def test_default_linux_selection_does_not_select_windows(self) -> None:
+        result = selection_for_paths(["src/server.rs"])
+        self.assertEqual(result.owners, ("LINUX_BACKEND",))
+        self.assertEqual(result.codeql_languages, ("rust",))
+
+    def test_release_candidate_linux_selection_includes_windows_and_csharp(self) -> None:
+        result = selection_for_paths(
+            ["src/server.rs"], release_candidate=True
+        )
+        self.assertEqual(result.owners, ("LINUX_BACKEND", "WINDOWS"))
+        self.assertEqual(result.codeql_languages, ("csharp", "rust"))
+        self.assertTrue(result.binary_impact)
+
     def test_governance_maps_to_actions_and_python(self) -> None:
         result = selection_for_paths([".github/workflows/codeql.yml"])
         self.assertEqual(result.owners, ("GOVERNANCE",))
@@ -104,6 +137,48 @@ class SelectionTests(unittest.TestCase):
         )
         self.assertEqual(result.codeql_languages, ("csharp", "rust"))
         self.assertTrue(result.binary_impact)
+
+    def test_release_candidate_mixed_selection_is_deterministic(self) -> None:
+        paths = ["ui/app.slint", "README.md", "src/server.rs"]
+        result = selection_for_paths(paths, release_candidate=True)
+        reversed_result = selection_for_paths(
+            list(reversed(paths)), release_candidate=True
+        )
+        self.assertEqual(
+            result.owners,
+            ("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"),
+        )
+        self.assertEqual(result.codeql_languages, ("csharp", "rust"))
+        self.assertEqual(result, reversed_result)
+
+
+class CliTests(unittest.TestCase):
+    def test_release_candidate_flag_selects_windows_for_linux_path(self) -> None:
+        classifier = Path(__file__).with_name("ci_change_scope.py")
+        with tempfile.TemporaryDirectory() as raw_root:
+            name_status = Path(raw_root) / "changed-paths.z"
+            name_status.write_bytes(b"M\0src/server.rs\0")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(classifier),
+                    "--name-status",
+                    str(name_status),
+                    "--release-candidate",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "binary_impact": True,
+                "codeql_languages": ["csharp", "rust"],
+                "owners": ["LINUX_BACKEND", "WINDOWS"],
+            },
+        )
 
 
 if __name__ == "__main__":
