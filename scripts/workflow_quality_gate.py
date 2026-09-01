@@ -718,14 +718,18 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
             legacy_root = Path(raw_legacy)
             legacy_scripts = legacy_root / "scripts"
             legacy_scripts.mkdir()
-            legacy_source = _command(
-                ("git", "show", "HEAD^:scripts/selected_quality_gate.py"),
-                cwd=ROOT,
-            ).stdout
-            if "--release-candidate" in legacy_source:
-                raise AssertionError(
-                    "legacy trusted-base fixture unexpectedly supports the candidate CLI"
-                )
+            legacy_source = """#!/usr/bin/env python3
+import argparse
+import json
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--selection', required=True)
+parser.add_argument('--results', required=True)
+args = parser.parse_args()
+json.loads(args.selection)
+json.loads(args.results)
+print('legacy-selected-quality-gate: PASS')
+"""
             (legacy_scripts / "selected_quality_gate.py").write_text(
                 legacy_source,
                 encoding="utf-8",
