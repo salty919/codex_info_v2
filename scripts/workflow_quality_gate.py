@@ -128,10 +128,19 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect("version.checkout.if", checkout.get("if"), condition)
         expect("version.prepare.if", _step(prepared, step_id="prepare").get("if"), condition)
         mapping("version.checkout", checkout.get("with"), {
-            "ref": "${{ github.event.pull_request.base.sha }}",
+            "ref": "${{ github.workflow_sha }}",
             "fetch-depth": 0,
             "persist-credentials": True,
         })
+        version_prepare_script = _step(prepared, step_id="prepare").get("run")
+        if (
+            not isinstance(version_prepare_script, str)
+            or 'git fetch --no-tags origin "$BASE_SHA" "$HEAD_SHA"'
+            not in version_prepare_script
+        ):
+            errors.append(
+                "workflow wiring version.prepare: exact base and head objects are not fetched"
+            )
 
         # Producer metadata -> H1 and Release identity protocol.
         expect(
@@ -501,7 +510,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "name: version-prepared",
         "run-name: codex-main-quality-v1:",
         "'Observe generated H1' || 'acceptance'",
-        "ref: ${{ github.event.pull_request.base.sha }}",
+        "ref: ${{ github.workflow_sha }}",
         "git log --first-parent --format=%H",
         "expected_version_transition=true",
         "generated_observer=true",
@@ -3074,6 +3083,11 @@ def self_test() -> int:
             "version-prepare.yml",
             "persist-credentials: true",
             "persist-credentials: false",
+        ),
+        (
+            "version-prepare.yml",
+            "ref: ${{ github.workflow_sha }}",
+            "ref: ${{ github.event.pull_request.base.sha }}",
         ),
         (
             "feat-integration.yml",
