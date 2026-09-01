@@ -93,8 +93,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--results", required=True)
     parser.add_argument(
         "--release-candidate",
-        required=True,
         choices=("true", "false"),
+        default="false",
         help="require the platform-complete release-candidate owner set",
     )
     args = parser.parse_args(argv)

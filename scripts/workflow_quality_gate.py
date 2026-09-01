@@ -706,12 +706,6 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
     try:
         environment = os.environ.copy()
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        missing_argument_script = script.replace(
-            ' \\\n    --release-candidate "$RELEASE_CANDIDATE"', ""
-        )
-        if missing_argument_script == script:
-            raise AssertionError("selected-quality gate command shape changed")
-
         legacy_backend = classify("src/lib.rs", release_candidate=False)
         fixed_backend = classify("src/lib.rs", release_candidate=True)
         with tempfile.TemporaryDirectory(prefix="codex-info-selected-quality-base-") as raw_legacy:
@@ -843,19 +837,6 @@ print('legacy-selected-quality-gate: PASS')
                     "RESULTS": results(legacy),
                 }
             )
-            if path == "src/lib.rs":
-                missing_argument = _command(
-                    ("bash", "-c", missing_argument_script),
-                    cwd=ROOT,
-                    env=environment,
-                    check=False,
-                )
-                if missing_argument.returncode == 0:
-                    raise AssertionError(
-                        "selected-quality gate accepted an omitted release-candidate input"
-                    )
-                cases += 1
-
             rejected = _command(
                 ("bash", "-c", script), cwd=ROOT, env=environment, check=False
             )

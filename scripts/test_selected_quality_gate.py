@@ -7,7 +7,7 @@ import itertools
 import json
 import unittest
 
-from selected_quality_gate import OWNER_JOBS, QualitySelectionError, validate
+from selected_quality_gate import OWNER_JOBS, QualitySelectionError, main, validate
 
 
 OWNERS = tuple(OWNER_JOBS)
@@ -86,6 +86,19 @@ class SelectedQualityTests(unittest.TestCase):
         for value in cases:
             with self.subTest(value=value), self.assertRaises(QualitySelectionError):
                 validate(json.dumps(value), json.dumps(successful_results(("DOCS",))))
+
+    def test_cli_defaults_to_non_candidate_for_legacy_callers(self) -> None:
+        self.assertEqual(
+            main(
+                [
+                    "--selection",
+                    selection(("DOCS",)),
+                    "--results",
+                    json.dumps(successful_results(("DOCS",))),
+                ]
+            ),
+            0,
+        )
 
     def test_release_candidate_requires_windows_for_binary_impact(self) -> None:
         for linux_only in (("LINUX_BACKEND",), ("LINUX_UI",)):
