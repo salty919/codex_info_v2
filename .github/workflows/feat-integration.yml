@@ -23,7 +23,7 @@ jobs:
     outputs:
       selection_json: ${{ steps.classify.outputs.selection_json }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.workflow_sha }}
           fetch-depth: 0
