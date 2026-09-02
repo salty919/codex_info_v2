@@ -83,9 +83,9 @@ cleanup条件と削除予定:
 - CodexはPRのURL、base/headの完全SHA、変更file、検証結果、未確認事項、`main`へ統合した場合の影響を提示し、ユーザーが変更と動作を確認できる状態でmerge前に停止する。Codex自身の実装・検証・review結果を、ユーザーによる統合判断の代替にしてはならない。
 - pushまたはPR作成が許可されていない作業を「統合済み」または「完了」と報告してはならない。実装済み、local検証済み、未統合を区別して報告する。
 - pushまたはPR作成直前に`origin/feat/next`の完全SHAを再確認する。宣言baseから進んでいる場合は、旧SHA、新SHA、競合し得るowned pathsを報告して停止し、rebase、merge、reset、cherry-pick、stash、force pushを行わず再許可を待つ。
-- `codex/<task> -> feat/next`はtrusted `feat-integration.yml`が完全なPR差分を有限ownerへ分類し、関係するremote qualityだけを実行して、最新headの`feat-acceptance`を成功させるまで統合しない。この経路ではversion、candidate、Release、tag、branch refをmutationしない。`feat/next -> main`は同じ分類正本を使用するが、required `acceptance`・`version-prepared`、version準備、選択build、Release前gateを別のmain経路で所有し、ユーザーだけがReleaseへ進む判断を行う。feat向けtriggerをmain向けtriggerの単純な拡張にしてはならない。
-- Git差分callerはrename/copy検出を明示し、両端を単一分類器へ渡す。selected/non-selected結果の最終判定はPR head内のscriptではなくtrusted base版gateだけを実行する。
-- workflowの`GITHUB_TOKEN`によるref更新が別のActions runを起動すると仮定しない。main向けversion生成H1は同じtrusted DAGで評価し、H0のjob checkがH1へ移らない分のrequired checkだけをH1へ最終結果として作る。同じH1のeventはPR runを直列化し、H0 acceptance identityを1回取得できた場合だけowner再実行を抑止する。この取得はbyte-identicalな手動commitとの区別だけを目的とし、poll、retry、mutation readback、表示URL照合、証拠専用artifactを追加しない。
+- `codex/<task> -> feat/next`はtrusted `feat-integration.yml`が完全なPR差分を有限ownerへ分類し、関係するremote qualityだけをadvisoryに実行する。実owner job、CodeQL、distributionの失敗は赤のまま表示するが、`selected-quality`集約と`feat-acceptance`は実行せず、workflow結果でユーザーのmergeを禁止しない。この経路ではversion、candidate、Release、tag、branch refをmutationしない。`feat/next -> main`は同じ分類正本を使用するが、`selected-quality`・`acceptance`・`version-prepared`はRelease品質と公開可否を別のmain経路で所有し、merge判断はユーザーだけが行う。feat向けtriggerをmain向けtriggerの単純な拡張にしてはならない。
+- Git差分callerはrename/copy検出を明示し、両端を単一分類器へ渡す。mainのRelease向けselected/non-selected結果だけをtrusted base版gateで集約し、feat向けPRは選択された実job自身の結果を表示する。
+- workflowの`GITHUB_TOKEN`によるref更新が別のActions runを起動すると仮定しない。main向けversion生成H1は同じtrusted DAGでRelease品質を評価し、生成commitの固定trailerとproducer runでH0/H1を対応付ける。H1へcustom `version-prepared`・`acceptance` checkを登録せず、同じH1のeventは正規trailerを確認できた場合だけowner再実行を抑止する。この確認はbyte-identicalな手動commitとの区別だけを目的とし、poll、retry、mutation readback、表示URL照合、証拠専用artifactを追加しない。
 
 ### race、cleanup、復旧、報告
 
