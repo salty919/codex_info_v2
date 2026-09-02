@@ -77,7 +77,7 @@ def _step(
 
 
 def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
-    """Validate the nine GitHub-interpreted handoffs bypassed by local fixtures."""
+    """Validate GitHub-interpreted handoffs bypassed by local fixtures."""
 
     errors: list[str] = []
 
@@ -101,9 +101,13 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         windows = docs["windows-client.yml"]
         linux_distribution = docs["linux-distribution.yml"]
         release = docs["release.yml"]
+        feat_jobs = feat.get("jobs")
+        if not isinstance(feat_jobs, dict):
+            raise AssertionError("feat workflow jobs mapping is missing")
+        if "feat-acceptance" in feat_jobs:
+            errors.append("workflow wiring feat: redundant feat-acceptance job remains")
         feat_classify = _job(feat, "classify")
         feat_quality = _job(feat, "selective-quality")
-        feat_acceptance = _job(feat, "feat-acceptance")
         prepared = _job(version, "version-prepared")
         version_quality = _job(version, "selective-quality")
         acceptance = _job(version, "acceptance")
@@ -162,16 +166,15 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "observer_reason": "steps.current.outputs.reason",
         }.items():
             mapping("version.outputs", prepared.get("outputs"), {key: f"${{{{ {source} }}}}"})
-        acceptance_env = _step(acceptance, name="Require selected quality success").get("env")
-        for key, source in {
-            "GENERATED_HEAD": "needs.version-prepared.outputs.generated_head",
-            "GENERATED_OBSERVER": "needs.version-prepared.outputs.generated_observer",
-            "EVENT_OBSERVER": "needs.version-prepared.outputs.event_observer",
-            "PREPARE_RESULT": "needs.version-prepared.result",
-            "QUALITY_SHA": "needs.version-prepared.outputs.quality_sha",
-            "QUALITY_RESULT": "needs.selective-quality.result",
-        }.items():
-            mapping("acceptance.env", acceptance_env, {key: f"${{{{ {source} }}}}"})
+        acceptance_step = _step(acceptance, name="Resolve release quality result")
+        acceptance_env = acceptance_step.get("env")
+        expect("acceptance.permissions", acceptance.get("permissions"), None)
+        expect("acceptance.env", acceptance_env, {
+            "GENERATED_OBSERVER": "${{ needs.version-prepared.outputs.generated_observer }}",
+            "EVENT_OBSERVER": "${{ needs.version-prepared.outputs.event_observer }}",
+            "PREPARE_RESULT": "${{ needs.version-prepared.result }}",
+            "QUALITY_RESULT": "${{ needs.selective-quality.result }}",
+        })
 
         # Complete PR identity -> reusable owner calls -> each leaf checkout.
         mapping(
@@ -197,6 +200,8 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             )
         expect("feat.quality.needs", feat_quality.get("needs"), ["classify"])
         expect("feat.quality.uses", feat_quality.get("uses"), "./.github/workflows/selective-quality.yml")
+        expect("feat.classify.continue-on-error", feat_classify.get("continue-on-error"), None)
+        expect("feat.quality.continue-on-error", feat_quality.get("continue-on-error"), None)
         mapping("feat.quality", feat_quality.get("with"), {
             "source_sha": "${{ github.event.pull_request.head.sha }}",
             "base_sha": "${{ github.event.pull_request.base.sha }}",
@@ -205,18 +210,10 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "selection_json": "${{ needs.classify.outputs.selection_json }}",
             "release_candidate": False,
         })
-        expect("feat.acceptance.needs", feat_acceptance.get("needs"), ["classify", "selective-quality"])
-        mapping(
-            "feat.acceptance.env",
-            _step(feat_acceptance, name="Require classification and selected quality").get("env"),
-            {
-                "CLASSIFY_RESULT": "${{ needs.classify.result }}",
-                "QUALITY_RESULT": "${{ needs.selective-quality.result }}",
-            },
-        )
         expect("version.quality.needs", version_quality.get("needs"), ["version-prepared"])
         expect("version.quality.if", version_quality.get("if"), "needs.version-prepared.outputs.ready == 'true'")
         expect("version.quality.uses", version_quality.get("uses"), "./.github/workflows/selective-quality.yml")
+        expect("version.quality.continue-on-error", version_quality.get("continue-on-error"), None)
         mapping("version.quality", version_quality.get("with"), {
             "source_sha": "${{ needs.version-prepared.outputs.quality_sha }}",
             "base_sha": "${{ github.event.pull_request.base.sha }}",
@@ -226,6 +223,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "release_candidate": True,
         })
         expect("version.acceptance.needs", acceptance.get("needs"), ["version-prepared", "selective-quality"])
+        expect("version.acceptance.continue-on-error", acceptance.get("continue-on-error"), None)
         child_workflows = {
             "linux-backend-quality": "./.github/workflows/rust.yml",
             "linux-ui-quality": "./.github/workflows/linux-ui-quality.yml",
@@ -235,6 +233,11 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         for job_id, uses in child_workflows.items():
             child = _job(selective, job_id)
             expect(f"selective.{job_id}.uses", child.get("uses"), uses)
+            expect(
+                f"selective.{job_id}.continue-on-error",
+                child.get("continue-on-error"),
+                None,
+            )
             mapping(f"selective.{job_id}", child.get("with"), {
                 "source_sha": "${{ inputs.source_sha }}"
             })
@@ -248,6 +251,11 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "selective.linux-distribution.if",
             distribution.get("if"),
             "fromJSON(inputs.selection_json).binary_impact == true",
+        )
+        expect(
+            "selective.linux-distribution.continue-on-error",
+            distribution.get("continue-on-error"),
+            None,
         )
         mapping("selective.linux-distribution", distribution.get("with"), {
             "source_sha": "${{ inputs.source_sha }}",
@@ -271,7 +279,9 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             (linux_distribution, "linux-distribution"),
             (docs["codeql.yml"], "analyze"),
         ):
-            leaf_checkout = _step(_job(document, job_id), uses="actions/checkout@v5")
+            leaf_job = _job(document, job_id)
+            expect(f"{job_id}.continue-on-error", leaf_job.get("continue-on-error"), None)
+            leaf_checkout = _step(leaf_job, uses="actions/checkout@v5")
             mapping(f"{job_id}.checkout", leaf_checkout.get("with"), {
                 "ref": "${{ inputs.source_sha }}"
             })
@@ -280,6 +290,8 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "linux-ui-quality", "windows-quality", "codeql-quality",
             "linux-distribution",
         ])
+        expect("selected.if", selected.get("if"), "always() && inputs.release_candidate")
+        expect("selected.continue-on-error", selected.get("continue-on-error"), None)
         mapping(
             "selected.checkout",
             _step(selected, uses="actions/checkout@v5").get("with"),
@@ -494,7 +506,6 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     feat = workflows["feat-integration.yml"]
     for marker in (
         'branches: ["feat/next"]',
-        "name: feat-acceptance",
         "release_candidate: false",
         '--name-status -z "$BASE_SHA...$HEAD_SHA"',
     ):
@@ -503,6 +514,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     for marker in ('"$HEAD_REF" !=', "workflow_dispatch:"):
         if marker in feat:
             errors.append(f"feat-integration.yml: branch/dispatch overconstraint {marker}")
+    count("feat-integration.yml", "feat-acceptance", 0)
     count("feat-integration.yml", "--find-copies-harder", 1)
 
     version = workflows["version-prepare.yml"]
@@ -521,7 +533,6 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "expected_generated_message=",
         '"$commit_message" == "$expected_generated_message"',
         "actions/runs/$generator_run_id/attempts/$generator_run_attempt",
-        "codex-main-quality:pr=$PR_NUMBER:head=$QUALITY_SHA:run=$GITHUB_RUN_ID:attempt=$GITHUB_RUN_ATTEMPT",
         "release_candidate: true",
     ):
         if marker not in version:
@@ -532,9 +543,9 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     ):
         if marker in version:
             errors.append(f"version-prepare.yml: write path overconstraint {marker}")
-    count("version-prepare.yml", "checks: write", 1)
+    count("version-prepare.yml", "checks: write", 0)
     count("version-prepare.yml", "cancel-in-progress: false", 1)
-    count("version-prepare.yml", "repos/$REPOSITORY/check-runs", 1)
+    count("version-prepare.yml", "repos/$REPOSITORY/check-runs", 0)
     count("version-prepare.yml", "--find-copies-harder", 2)
 
     selective = workflows["selective-quality.yml"]
@@ -550,6 +561,11 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
             errors.append(f"selective-quality.yml: missing {owner}")
     if "selected_quality_gate.py" not in selective:
         errors.append("selective-quality.yml: selected result aggregation is missing")
+    count(
+        "selective-quality.yml",
+        "if: always() && inputs.release_candidate",
+        1,
+    )
     count("selective-quality.yml", "ref: ${{ inputs.base_sha }}", 0)
     count("selective-quality.yml", "ref: ${{ github.workflow_sha }}", 1)
 
@@ -662,11 +678,11 @@ def _step_script(workflow: str, step_name: str) -> str:
 
 
 def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
-    """Exercise the selected-quality shell with both candidate contexts.
+    """Exercise both classifiers and the reachable main Release aggregation.
 
     The workflow and helper are checked out from one immutable workflow SHA.
-    Running the actual shell keeps the environment and argument wiring under
-    test without inventing a historical helper fixture.
+    The feat caller does not run the aggregate shell, so only main Release
+    candidate inputs are exercised through that shell.
     """
     script = _step_script(
         selective_workflow, "Require selected success and non-selected skip"
@@ -737,21 +753,10 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
             environment.update(
                 {
                     "SELECTION": non_candidate,
-                    "RELEASE_CANDIDATE": "false",
+                    "RELEASE_CANDIDATE": "true",
                     "RESULTS": results(non_candidate),
                 }
             )
-            accepted_non_candidate = _command(
-                ("bash", "-c", script), cwd=ROOT, env=environment, check=False
-            )
-            if accepted_non_candidate.returncode != 0:
-                raise AssertionError(
-                    f"non-candidate path was rejected for {path}: "
-                    f"{accepted_non_candidate.stderr}"
-                )
-            cases += 1
-
-            environment.update({"RELEASE_CANDIDATE": "true"})
             rejected = _command(
                 ("bash", "-c", script), cwd=ROOT, env=environment, check=False
             )
@@ -1401,118 +1406,56 @@ def _version_state_tests(version_workflow: str) -> int:
     return cases
 
 
-def _final_check_tests(version_workflow: str) -> int:
-    script = _step_script(version_workflow, "Require selected quality success")
+def _acceptance_result_tests(version_workflow: str) -> int:
+    """Exercise only the reachable Release acceptance result paths."""
+
+    script = _step_script(version_workflow, "Resolve release quality result")
     cases = 0
-    with tempfile.TemporaryDirectory(prefix="codex-info-final-checks-") as raw_root:
-        root = Path(raw_root)
-        bin_dir = root / "bin"
-        bin_dir.mkdir()
-        gh = bin_dir / "gh"
-        gh.write_text(
-            "#!/usr/bin/env bash\n"
-            "set -euo pipefail\n"
-            "payload=$(cat)\n"
-            "printf '%s\\n' \"$payload\" >> \"$MOCK_GH_LOG\"\n"
-            "exit \"${MOCK_GH_RC:-0}\"\n",
-            encoding="utf-8",
+
+    def execute(
+        *,
+        generated_observer: bool = False,
+        event_observer: bool = False,
+        prepare: str = "success",
+        quality: str = "success",
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "EVENT_OBSERVER": str(event_observer).lower(),
+                "GENERATED_OBSERVER": str(generated_observer).lower(),
+                "PREPARE_RESULT": prepare,
+                "QUALITY_RESULT": quality,
+            }
         )
-        gh.chmod(0o755)
-
-        def execute(
-            *,
-            generated: bool,
-            generated_observer: bool = False,
-            event_observer: bool = False,
-            prepare: str = "success",
-            quality: str = "success",
-            gh_rc: int = 0,
-        ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
-            log = root / "checks.jsonl"
-            log.write_text("", encoding="utf-8")
-            environment = os.environ.copy()
-            environment.update(
-                {
-                    "EVENT_OBSERVER": str(event_observer).lower(),
-                    "GENERATED_HEAD": str(generated).lower(),
-                    "GENERATED_OBSERVER": str(generated_observer).lower(),
-                    "GH_TOKEN": "fixture",
-                    "GITHUB_RUN_ATTEMPT": "7",
-                    "GITHUB_RUN_ID": "12345",
-                    "MOCK_GH_LOG": str(log),
-                    "MOCK_GH_RC": str(gh_rc),
-                    "PATH": f"{bin_dir}:{environment['PATH']}",
-                    "PREPARE_RESULT": prepare,
-                    "PR_NUMBER": "44",
-                    "QUALITY_RESULT": quality,
-                    "QUALITY_SHA": "c" * 40,
-                    "REPOSITORY": "example/project",
-                }
-            )
-            result = _command(
-                ("bash", "-c", script), cwd=root, env=environment, check=False
-            )
-            payloads = [
-                json.loads(line)
-                for line in log.read_text(encoding="utf-8").splitlines()
-            ]
-            return result, payloads
-
-        result, payloads = execute(generated=False)
-        if result.returncode != 0 or payloads:
-            raise AssertionError("current-head success created redundant custom checks")
-        cases += 1
-
-        result, payloads = execute(generated=False, quality="failure")
-        if result.returncode == 0 or payloads:
-            raise AssertionError("current-head quality failure was accepted")
-        cases += 1
-
-        result, payloads = execute(
-            generated=False, generated_observer=True, quality="skipped"
+        return _command(
+            ("bash", "-c", script), cwd=ROOT, env=environment, check=False
         )
-        if result.returncode != 0 or payloads:
-            raise AssertionError("generated-H1 observer created or repeated quality checks")
-        cases += 1
 
-        result, payloads = execute(
-            generated=False, event_observer=True, quality="skipped"
-        )
-        if result.returncode != 0 or payloads:
-            raise AssertionError("draft/stale observer created or repeated quality checks")
-        cases += 1
+    if execute().returncode != 0:
+        raise AssertionError("successful Release quality was rejected")
+    cases += 1
 
-        result, payloads = execute(generated=True)
-        expected_external = (
-            "codex-main-quality:pr=44:head="
-            + "c" * 40
-            + ":run=12345:attempt=7"
-        )
-        if (
-            result.returncode != 0
-            or [payload["name"] for payload in payloads]
-            != ["version-prepared", "acceptance"]
-            or any(payload["head_sha"] != "c" * 40 for payload in payloads)
-            or any(payload["external_id"] != expected_external for payload in payloads)
-            or [payload["conclusion"] for payload in payloads]
-            != ["success", "success"]
-        ):
-            raise AssertionError(f"generated-head success checks are wrong: {payloads}")
-        cases += 1
+    if execute(quality="failure").returncode == 0:
+        raise AssertionError("failed Release quality was accepted")
+    cases += 1
 
-        result, payloads = execute(generated=True, quality="cancelled")
-        if (
-            result.returncode == 0
-            or len(payloads) != 2
-            or payloads[-1]["conclusion"] != "failure"
-        ):
-            raise AssertionError("generated-head abnormal quality was accepted")
-        cases += 1
+    if execute(quality="cancelled").returncode == 0:
+        raise AssertionError("cancelled Release quality was accepted")
+    cases += 1
 
-        result, payloads = execute(generated=True, gh_rc=1)
-        if result.returncode == 0 or len(payloads) != 1:
-            raise AssertionError("failed final-check mutation continued")
-        cases += 1
+    if execute(generated_observer=True, quality="skipped").returncode != 0:
+        raise AssertionError("generated-H1 observer was rejected")
+    cases += 1
+
+    if execute(event_observer=True, quality="skipped").returncode != 0:
+        raise AssertionError("non-authoritative event observer was rejected")
+    cases += 1
+
+    if execute(prepare="failure", quality="skipped").returncode == 0:
+        raise AssertionError("failed version preparation was accepted")
+    cases += 1
+
     return cases
 
 
@@ -3062,7 +3005,6 @@ def self_test() -> int:
         raise AssertionError("production workflow contract failed: " + "; ".join(errors))
 
     mutations = (
-        ("feat-integration.yml", "name: feat-acceptance", "name: finalize"),
         ("feat-integration.yml", "release_candidate: false", "release_candidate: true"),
         ("feat-integration.yml", "--find-copies-harder", "--no-renames"),
         (
@@ -3072,8 +3014,12 @@ def self_test() -> int:
         ),
         ("version-prepare.yml", "cancel-in-progress: false", "cancel-in-progress: true"),
         ("version-prepare.yml", "git push origin", "git push --force origin"),
-        ("version-prepare.yml", "checks: write", "checks: read"),
         ("selective-quality.yml", "ref: ${{ github.workflow_sha }}", "ref: ${{ inputs.source_sha }}"),
+        (
+            "selective-quality.yml",
+            "if: always() && inputs.release_candidate",
+            "if: always()",
+        ),
         ("selective-quality.yml", "  windows-quality:\n", "  omitted-windows-quality:\n"),
         ("windows-client.yml", "New-WindowsUpdateManifest.ps1", "Omitted-Manifest.ps1"),
         ("rust.yml", "cargo test --locked --all-targets -- --nocapture", "true"),
@@ -3164,7 +3110,7 @@ def self_test() -> int:
         baseline["selective-quality.yml"]
     )
     copy_cases = _git_copy_detection_test()
-    final_check_cases = _final_check_tests(baseline["version-prepare.yml"])
+    acceptance_cases = _acceptance_result_tests(baseline["version-prepare.yml"])
     release_resolution_cases = _release_resolution_tests(baseline["release.yml"])
     release_lock_cases = _release_lock_tests(baseline["release.yml"])
     release_publish_cases = _release_publish_tests(
@@ -3176,7 +3122,7 @@ def self_test() -> int:
         + version_cases
         + release_candidate_cases
         + copy_cases
-        + final_check_cases
+        + acceptance_cases
         + release_resolution_cases
         + release_lock_cases
         + release_publish_cases
@@ -3187,7 +3133,7 @@ def self_test() -> int:
         f"observer_cases={observer_cases} version_cases={version_cases} "
         f"release_candidate_cases={release_candidate_cases} "
         f"copy_cases={copy_cases} "
-        f"final_check_cases={final_check_cases} "
+        f"acceptance_cases={acceptance_cases} "
         f"release_resolution_cases={release_resolution_cases} "
         f"release_lock_cases={release_lock_cases} "
         f"release_publish_cases={release_publish_cases}"

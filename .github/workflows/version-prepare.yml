@@ -357,20 +357,13 @@ jobs:
     if: always()
     needs: [version-prepared, selective-quality]
     runs-on: ubuntu-latest
-    permissions:
-      checks: write
     steps:
-      - name: Require selected quality success
+      - name: Resolve release quality result
         env:
-          GENERATED_HEAD: ${{ needs.version-prepared.outputs.generated_head }}
           GENERATED_OBSERVER: ${{ needs.version-prepared.outputs.generated_observer }}
           EVENT_OBSERVER: ${{ needs.version-prepared.outputs.event_observer }}
-          GH_TOKEN: ${{ github.token }}
           PREPARE_RESULT: ${{ needs.version-prepared.result }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          QUALITY_SHA: ${{ needs.version-prepared.outputs.quality_sha }}
           QUALITY_RESULT: ${{ needs.selective-quality.result }}
-          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           conclusion=failure
@@ -382,23 +375,5 @@ jobs:
           fi
           if [[ "$PREPARE_RESULT" == success && "$EVENT_OBSERVER" == true && "$QUALITY_RESULT" == skipped ]]; then
             conclusion=success
-          fi
-
-          # GITHUB_TOKEN pushes do not start another workflow run. Only the
-          # generated H1 therefore needs final checks copied from this H0 run.
-          if [[ "$GENERATED_HEAD" == true ]]; then
-            external_id="codex-main-quality:pr=$PR_NUMBER:head=$QUALITY_SHA:run=$GITHUB_RUN_ID:attempt=$GITHUB_RUN_ATTEMPT"
-            create_check() {
-              local name="$1" result="$2"
-              jq -nc \
-                --arg name "$name" \
-                --arg head "$QUALITY_SHA" \
-                --arg result "$result" \
-                --arg external "$external_id" \
-                '{name:$name,head_sha:$head,status:"completed",conclusion:$result,external_id:$external}' |
-                gh api --method POST "repos/$REPOSITORY/check-runs" --input - >/dev/null
-            }
-            create_check version-prepared success
-            create_check acceptance "$conclusion"
           fi
           [[ "$conclusion" == success ]]

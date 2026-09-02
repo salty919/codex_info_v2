@@ -105,19 +105,20 @@
   actions・python・rust・csharpの必要言語だけを一度実行する。選択ownerのmissing/failure/cancel/skip、非選択ownerの実行、
   CodeQL言語の余分・欠落はすべて失敗とする。Windowsだけの変更はWINDOWSとcsharpだけ、governanceだけの変更は
   GOVERNANCEとactions/pythonだけを実行する。branch名、branchの作成元、`feat/next`との包含関係は品質選択へ使用しない。
-- `main`のtrusted `pull_request_target`を唯一のpre-merge authorityとし、別dispatchへ品質判定を転送しない。
+- `main`のtrusted `pull_request_target`を唯一のRelease品質authorityとし、別dispatchへ品質判定を転送しない。
   workflow run名には固定schemaでPR番号、event head、event action、event時のdraft状態をGitHub eventから記録する。
   event時または開始時にdraftであるrun、開始時にclosedであるrun、開始時にcurrent PR headではなくなったrunはobserverとしてowner、分類、
-  version mutationを0件にする。open・non-draft・current headだけをownerとする。event headを評価する通常経路はActions job名
-  `version-prepared`と`acceptance`をrequired checkとする。workflowの
-  `GITHUB_TOKEN`がversion commit H1をpushした経路だけは、同じH0 runがH1を評価し、H0 job checkがH1へ移らない分の
-  `version-prepared`と`acceptance`をH1へ最終結果として各1回作る。この2件にはproducer run IDとattemptを同じ外部IDで記録するが、
-  登録後のpoll、retry、URL・時刻・表示値の照合を行わない。`acceptance`は選択jobの結果だけを集約する。
+  version mutationを0件にする。open・non-draft・current headだけをownerとする。`version-prepared`と`acceptance`は同じrunの
+  Release品質結果であり、branch mergeのrequired checkにはしない。workflowの`GITHUB_TOKEN`がversion commit H1をpushした経路は、
+  同じH0 runが保存済み選択でH1を評価し、生成commitの固定trailerとproducer runからH0/H1を対応付ける。
+  H1へcustom `version-prepared`・`acceptance` checkを登録せず、poll、retry、URL・時刻・表示値の照合も行わない。
+  `acceptance`はmain向けに選択jobの結果だけを集約し、失敗時はRelease公開をHOLDするがmergeを禁止しない。
   Windowsを含むmain向けrelease candidateでは、Windows job自身が実Windows評価後にrelease candidateを作る。
   Linux-only変更も、Linux archiveを既存`windows-vX.Y.Z` ReleaseへWindows Setup/manifestと同居させるため、
   main向けrelease candidateではWindows評価・candidateを追加で実行する。`feat/next`向け通常integrationは差分選択を維持し、
-  Windows評価・candidateを生成しない。live repository ruleの再監査、選択済み製品testの再実行、branch名allowlist、
-  上記2件以外のcheck登録を追加しない。
+  選択された実owner job、CodeQL、distributionだけをadvisoryに実行する。feat向け`selected-quality`集約と`feat-acceptance`、
+  Windows release candidateは生成しない。実jobの失敗は赤のまま表示するがmergeを禁止しない。live repository ruleの再監査、
+  選択済み製品testの再実行、branch名allowlist、custom check登録を追加しない。
 - バイナリ影響ありPRだけ、品質確認を開始する前にPR branch上のversion 3ファイルをexact next patchへ自動更新する。
   versionがbaseのH0は完全差分を1回分類し、PR、H0、producer run ID、attemptを固定trailerに持つH1 commitをnon-force pushして、
   同じrunが保存済み選択を使ってH1のownerを各1回実行する。H1 commit自身がmappingを持つため、push後にrunがcancelされても
@@ -142,16 +143,17 @@
 - PR由来のcheckout、script、workflow、artifactを、repository contents・checks・Releaseへのwrite権限を持つjobで実行しない。
   write権限を持つ採番jobはtrusted baseだけをcheckout・実行し、PR headはGit object dataとしてだけ読む。
   same-repository headへexact 1 commitをnon-force pushし、競合pushはGit自身のnon-fast-forward拒否に任せてreadbackやretryを行わない。
-  H1 check作成jobもsourceをcheckoutせず、trusted runの出力だけを入力にする。Releaseのread-only解決jobはGitHub objectとrun状態だけを読み、
+  H1 custom check作成jobは置かない。Releaseのread-only解決jobはGitHub objectとrun状態だけを読み、
   write jobはsourceをcheckout・実行せず、解決済みcandidateとlock取得後に再取得したremote状態だけを入力にする。
-- 選択ownerからCodeQL言語が導出されるPRではその言語だけをmerge必須gateとし、critical/high findingをdismissやworkflow無効化で
-  通過させない。CodeQL言語が選択されないPRとmerge後pushではCodeQL AnalyzeとAutobuildを実行せず、active code-scanning rulesetの
+- 選択ownerからCodeQL言語が導出されるPRではその言語だけを実行し、main向けRelease品質ではanalysis成功とcritical/high finding不在を
+  公開条件とする。CodeQL失敗はworkflowへ表示するがbranch mergeを禁止しない。CodeQL言語が選択されないPRとmerge後pushでは
+  CodeQL AnalyzeとAutobuildを実行せず、active code-scanning rulesetの
   設定はworkflow内で再監査しない。外部AI findingsが
   provider側の未対応modelで継続失敗する場合は、そのAI機能だけをrepository単位で無効化できるが、選択済みCodeQL、
-  code-scanning alerts、required acceptanceは維持する。
+  code-scanning alerts、Release品質acceptanceは維持する。
 - Codex code reviewはPRの変更が確定した最新headに対して`@codex review`を1回だけ起動する補助レビューとする。
   古いheadの結果や未解決かつnon-outdatedのP0/P1をready判定へ流用せず、独自API key workflowを追加しない。
-  Codex reviewはCodeQL、required acceptance、必要な承認の代替にしない。
+  Codex reviewはCodeQL、Release品質acceptance、必要な承認の代替にしない。
 - `windows-vX.Y.Z` ReleaseはSetupとmanifestを非公開Draftへuploadしてから公開する。途中失敗を公開済み成功へ変換しない。
 - Linux coreはtargetを`x86_64-unknown-linux-gnu`へ固定し、同じstable version・final source SHAのarchive、SHA-256 checksum、manifestを既存の`windows-vX.Y.Z` ReleaseへWindowsのSetup/manifestと同居させる。別Linux tag/channelを作らない。
 - Linux bundleの互換性は、bundle manifestに記録した実測`glibc_minimum`（glibc minimum）を満たすことだけを表明する。manifestのtargetまたは実測minimumが欠落・不一致なら候補を公開・導入せず、他のdistribution、architecture、署名済み、publisher検証済みの対応を表明しない。
@@ -169,13 +171,13 @@
 | --- | --- | --- | --- |
 | same-repository | fork PRではversionを書かず失敗する | 書込み不能または誤ったheadを対象にする | GitHubはfork PRを許可する |
 | 完全Git差分とowner対応 | add/delete/rename/copyを両端まで分類し、未知pathは失敗する | 必要ownerの評価が欠落する | GitHubは製品ownerを知らない |
-| trusted結果集約 | base版gateだけがselected success・non-selected skipを判定する | PRが判定scriptを無効化して未評価mergeできる | owner jobがsourceを評価することと、結果oracleの信頼性は別責務 |
+| main Release結果集約 | main向けbase版gateだけがselected success・non-selected skipを判定する | 未評価または無関係なcandidateを公開する | owner jobがsourceを評価することと、公開oracleの信頼性は別責務 |
+| feat選択品質 | 完全差分から選択した実owner job・CodeQL・distributionだけを実行し、各結果をそのまま表示する | reviewerが対象revisionの実品質結果を確認できない | GitHubは製品ownerと必要言語を知らない |
 | version 3ファイル | binary PRだけbaseからexact next patchへ同期更新する | Rust・lockfile・Windowsのversionが分裂する | GitHubは製品versionを保証しない |
 | non-force push | version生成中にheadが進んだ場合はpushを拒否する | 利用者commitの上書きまたはstale commit追加 | Gitのnon-fast-forward拒否を唯一のrace authorityとして使う |
-| 生成H1の必須2 check | `GITHUB_TOKEN` push後も同じrunでH1を評価し、H1へ最終結果を各1件作る | token起因pushは次runを起動せず、H1のrequired checkが永久に欠落する | ActionsのH0 job checkはworkflowが追加したH1へ移らない |
 | event authority identity | job開始前cancelを含め、event時draft、event head、action、PRを復元し、draft・closed・stale eventをowner対象から外す | draftのcancelを評価失敗と誤認する、stale headを評価する、またはmerge後のbranchへ未統合H1をpushする | job出力は開始前cancelでは存在せず、runの通常metadataだけではPR head epochを復元できない |
 | 生成H1 commit identity | H1 commitと同じGit objectにH0 producer run/attemptを記録し、正規生成H1だけowner再実行を抑止する | push後cancelでH0/H1対応を失う、または手動version commitを未評価にする | checkやartifactを後から作る方式にはpushとの間に原子的でない空白が残る |
-| selected job結果 | selectedはsuccess、non-selectedはskipped以外を失敗にする | 未評価mergeまたは無関係な評価失敗が起きる | Actionsはowner選択の意味を知らない |
+| main selected job結果 | mainのRelease候補ではselectedはsuccess、non-selectedはskipped以外を失敗にする | 未評価または無関係なartifactを公開する | Actionsはowner選択と公開可否の意味を知らない |
 | 実Windows評価 | WINDOWS選択時（main向けrelease candidateではLinux product ownerにも追加選択）だけWindows runnerでinstaller/UIを評価する | 壊れたWindows配布物を公開する | LinuxやGitHubはWindows製品動作を保証しない |
 | final-head attempt集合 | current final headを実際に評価した全non-observer attemptを見て、1件の失敗もsame-head successで上書きしない | rerunの偶然のsuccessが未修正の評価失敗を隠し、旧candidateを公開する | latest成功だけでは過去attemptのfailure barrierを表現できない |
 | Windows jobとcandidate | Windows skippedは0件、successはown-run candidate exact 1を要求する | 非Windowsで不要なReleaseを動かす、または期限切れ・欠落candidateを黙って無視する | run successだけではWindowsの選択有無とartifact保存状態を区別できない |

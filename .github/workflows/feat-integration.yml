@@ -49,7 +49,7 @@ jobs:
           printf 'selection_json=%s\n' "$selection" >> "$GITHUB_OUTPUT"
 
   selective-quality:
-    name: Run selected quality owners
+    name: Run selected advisory quality
     needs: [classify]
     uses: ./.github/workflows/selective-quality.yml
     with:
@@ -62,16 +62,3 @@ jobs:
     permissions:
       contents: read
       security-events: write
-
-  feat-acceptance:
-    name: feat-acceptance
-    if: always()
-    needs: [classify, selective-quality]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require classification and selected quality
-        env:
-          CLASSIFY_RESULT: ${{ needs.classify.result }}
-          QUALITY_RESULT: ${{ needs.selective-quality.result }}
-        run: |
-          [[ "$CLASSIFY_RESULT" == success && "$QUALITY_RESULT" == success ]]
