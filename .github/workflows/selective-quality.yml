@@ -126,7 +126,7 @@ jobs:
 
   selected-quality:
     name: selected-quality
-    if: always()
+    if: always() && inputs.release_candidate
     needs:
       - docs-quality
       - governance-quality
