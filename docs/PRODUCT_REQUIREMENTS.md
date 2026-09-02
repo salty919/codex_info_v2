@@ -44,6 +44,8 @@
 - cursorはsource identityと結合し、rotate、truncate、replaceを区別する。古いoffsetによるskipと二重登録を防ぐ。
 - backup作成または検証に失敗した場合は既存のverified世代をpruneしない。
 - crash、reboot、再実行はjournalの同一operationを再開し、commit、publication、deleteを各1回以下にする。
+- local session inventoryは既存のdepth・file数・1 file・1 line上限を先に検証し、mtime nanoseconds降順・canonical path降順のwhole-file prefixから最大2GiBだけを収集する。全inventoryの2GiB超過だけでLinux detailsを停止しない。
+- 2GiBから外れた古いsessionは、その完全fingerprintのusageとrecorded markerがSQLiteへ同一transactionでcommit済みで、fresh DB readback・path/identity再検査・Codex open-FD不在を満たす場合だけruntimeに1 fileずつ削除できる。未記録・legacy・変更済み・active・selected sessionと、履歴DB/backup/reset hint/recovery JSONLは保持する。
 
 ## 5. Linux bundle導入・自動更新・削除
 

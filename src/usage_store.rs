@@ -6,7 +6,7 @@ use rusqlite::types::Value;
 use rusqlite::{
     params, Connection, DatabaseName, OpenFlags, OptionalExtension, TransactionBehavior,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
@@ -50,6 +50,16 @@ CREATE TABLE IF NOT EXISTS durable_state (
     data_hash TEXT NOT NULL,
     snapshot_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS recorded_sessions (
+    root_identity TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    file_bytes INTEGER NOT NULL CHECK (file_bytes >= 0),
+    modified_nanos TEXT NOT NULL,
+    file_device TEXT NOT NULL,
+    file_inode TEXT NOT NULL,
+    PRIMARY KEY (root_identity, relative_path)
+) WITHOUT ROWID;
 "#;
 
 const RESET_GROUP_TOLERANCE_SECONDS: i128 = 60;
@@ -65,6 +75,8 @@ const HISTORY_TIMESTAMP_RESET_INDEX_COLUMNS: &[&str] = &[
     "terra_tokens",
     "luna_tokens",
 ];
+const MAX_RECORDED_ROOT_IDENTITY_BYTES: usize = 256;
+const MAX_RECORDED_RELATIVE_PATH_BYTES: usize = 4_096;
 /// Maximum minute buckets materialized by a single one-month history read.
 /// Persistent retention is independently three calendar months; callers must
 /// never materialize that whole retention window merely to serve one request.
@@ -128,6 +140,21 @@ pub struct UsageHistorySample {
     pub sol_tokens: u64,
     pub terra_tokens: u64,
     pub luna_tokens: u64,
+}
+
+/// Exact identity of one session source whose bounded usage was committed.
+///
+/// The root identity is derived from the canonical sessions directory rather
+/// than persisting its absolute path. Values wider than SQLite INTEGER use
+/// canonical decimal text so a read-back never loses identity bits.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RecordedSessionSource {
+    pub root_identity: String,
+    pub relative_path: String,
+    pub file_bytes: u64,
+    pub modified_nanos: u128,
+    pub file_device: u64,
+    pub file_inode: u64,
 }
 
 /// A reset period identified only by the canonical reset timestamp.
@@ -291,6 +318,130 @@ impl UsageHistorySample {
 
         Ok(())
     }
+}
+
+impl RecordedSessionSource {
+    fn validate(&self) -> Result<()> {
+        if self.root_identity.is_empty()
+            || self.root_identity.len() > MAX_RECORDED_ROOT_IDENTITY_BYTES
+            || !self.root_identity.is_ascii()
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "recorded session root identity is invalid".into(),
+            ));
+        }
+        if self.relative_path.is_empty()
+            || self.relative_path.len() > MAX_RECORDED_RELATIVE_PATH_BYTES
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "recorded session relative path is invalid".into(),
+            ));
+        }
+        let relative = Path::new(&self.relative_path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "recorded session relative path is invalid".into(),
+            ));
+        }
+        if self.file_bytes > i64::MAX as u64 {
+            return Err(UsageStoreError::InvalidImport(
+                "recorded session size exceeds SQLite INTEGER range".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn canonicalize_recorded_sessions(
+    sources: &[RecordedSessionSource],
+) -> Result<Vec<RecordedSessionSource>> {
+    let mut canonical = BTreeMap::<(String, String), RecordedSessionSource>::new();
+    for source in sources {
+        source.validate()?;
+        let key = (source.root_identity.clone(), source.relative_path.clone());
+        if let Some(existing) = canonical.get(&key) {
+            if existing != source {
+                return Err(UsageStoreError::InvalidImport(
+                    "conflicting recorded session fingerprints".into(),
+                ));
+            }
+            continue;
+        }
+        canonical.insert(key, source.clone());
+    }
+    Ok(canonical.into_values().collect())
+}
+
+fn recorded_session_matches_in(
+    connection: &Connection,
+    source: &RecordedSessionSource,
+) -> Result<bool> {
+    source.validate()?;
+    let matched: i64 = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM recorded_sessions
+            WHERE root_identity = ?1
+              AND relative_path = ?2
+              AND file_bytes = ?3
+              AND modified_nanos = ?4
+              AND file_device = ?5
+              AND file_inode = ?6
+        )",
+        params![
+            &source.root_identity,
+            &source.relative_path,
+            source.file_bytes as i64,
+            source.modified_nanos.to_string(),
+            source.file_device.to_string(),
+            source.file_inode.to_string(),
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(matched == 1)
+}
+
+fn validate_recorded_sessions_schema(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    let mut statement = transaction.prepare(
+        "SELECT cid, name, type, \"notnull\", dflt_value, pk \
+         FROM pragma_table_info('recorded_sessions') ORDER BY cid ASC",
+    )?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected = vec![
+        (0, "root_identity".to_owned(), "TEXT".to_owned(), 1, None, 1),
+        (1, "relative_path".to_owned(), "TEXT".to_owned(), 1, None, 2),
+        (2, "file_bytes".to_owned(), "INTEGER".to_owned(), 1, None, 0),
+        (
+            3,
+            "modified_nanos".to_owned(),
+            "TEXT".to_owned(),
+            1,
+            None,
+            0,
+        ),
+        (4, "file_device".to_owned(), "TEXT".to_owned(), 1, None, 0),
+        (5, "file_inode".to_owned(), "TEXT".to_owned(), 1, None, 0),
+    ];
+    if columns != expected {
+        return Err(UsageStoreError::InvalidImport(
+            "recorded session schema mismatch".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn usage_vector_dominates(candidate: &UsageHistorySample, observed: &UsageHistorySample) -> bool {
@@ -737,6 +888,7 @@ impl UsageStore {
                 ));
             }
         }
+        validate_recorded_sessions_schema(&transaction)?;
         Self::ensure_recent_history_covering_index(&transaction)?;
         transaction.commit()?;
         Ok(Self { connection })
@@ -1217,13 +1369,106 @@ impl UsageStore {
 
     /// Atomically upserts several samples after validating the complete batch.
     pub fn upsert_samples(&mut self, samples: &[UsageHistorySample]) -> Result<()> {
+        self.upsert_samples_and_recorded_sessions(samples, &[])
+    }
+
+    /// Atomically commits one local collection generation.
+    ///
+    /// A session is durable evidence for cleanup only when its exact marker
+    /// and the generation's canonical usage rows commit together. Marker
+    /// read-back is performed inside the transaction as well as later through
+    /// a fresh read-only connection before any source file is removed.
+    pub fn upsert_samples_and_recorded_sessions(
+        &mut self,
+        samples: &[UsageHistorySample],
+        sources: &[RecordedSessionSource],
+    ) -> Result<()> {
+        let sources = canonicalize_recorded_sessions(sources)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let canonical = canonicalize_samples(&transaction, samples)?;
         upsert_canonical_samples(&transaction, &canonical)?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO recorded_sessions (
+                    root_identity,
+                    relative_path,
+                    file_bytes,
+                    modified_nanos,
+                    file_device,
+                    file_inode
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT (root_identity, relative_path) DO UPDATE SET
+                    file_bytes = excluded.file_bytes,
+                    modified_nanos = excluded.modified_nanos,
+                    file_device = excluded.file_device,
+                    file_inode = excluded.file_inode",
+            )?;
+            for source in &sources {
+                statement.execute(params![
+                    &source.root_identity,
+                    &source.relative_path,
+                    source.file_bytes as i64,
+                    source.modified_nanos.to_string(),
+                    source.file_device.to_string(),
+                    source.file_inode.to_string(),
+                ])?;
+            }
+        }
+        for source in &sources {
+            if !recorded_session_matches_in(&transaction, source)? {
+                return Err(UsageStoreError::InvalidImport(
+                    "recorded session transaction read-back failed".into(),
+                ));
+            }
+        }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Checks one exact source marker on the current connection.
+    pub fn recorded_session_matches(&self, source: &RecordedSessionSource) -> Result<bool> {
+        recorded_session_matches_in(&self.connection, source)
+    }
+
+    /// Removes only markers whose complete identity still matches.
+    ///
+    /// This is marker lifecycle maintenance after source unlink; it never
+    /// changes usage history or durable state. A stale/replaced marker yields
+    /// zero affected rows rather than deleting a newer source's authority.
+    pub fn forget_recorded_sessions(&mut self, sources: &[RecordedSessionSource]) -> Result<usize> {
+        let sources = canonicalize_recorded_sessions(sources)?;
+        if sources.is_empty() {
+            return Ok(0);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut removed = 0usize;
+        {
+            let mut statement = transaction.prepare(
+                "DELETE FROM recorded_sessions
+                 WHERE root_identity = ?1
+                   AND relative_path = ?2
+                   AND file_bytes = ?3
+                   AND modified_nanos = ?4
+                   AND file_device = ?5
+                   AND file_inode = ?6",
+            )?;
+            for source in &sources {
+                removed = removed.saturating_add(statement.execute(params![
+                    &source.root_identity,
+                    &source.relative_path,
+                    source.file_bytes as i64,
+                    source.modified_nanos.to_string(),
+                    source.file_device.to_string(),
+                    source.file_inode.to_string(),
+                ])?);
+            }
+        }
+        transaction.commit()?;
+        Ok(removed)
     }
 
     /// Inserts already-decoded samples, replacing rows with matching keys.
@@ -1367,7 +1612,8 @@ impl UsageStore {
 
     /// Removes observations older than the exclusive UTC calendar-month cutoff.
     ///
-    /// This is the only destructive operation in the store. The cutoff is
+    /// This is the only destructive usage-history operation in the store.
+    /// Exact recorded-source marker lifecycle is independent. The cutoff is
     /// strictly exclusive, so observations at the cutoff or in the future
     /// remain stored regardless of reset period.
     pub fn prune_older_than_three_months(&mut self, now: DateTime<Utc>) -> Result<usize> {
@@ -1425,6 +1671,17 @@ mod tests {
             sol_tokens: 11,
             terra_tokens: 22,
             luna_tokens: 33,
+        }
+    }
+
+    fn recorded_source(relative_path: &str, inode: u64) -> RecordedSessionSource {
+        RecordedSessionSource {
+            root_identity: "unix:10:20".into(),
+            relative_path: relative_path.into(),
+            file_bytes: 123,
+            modified_nanos: 1_700_000_000_000_000_000,
+            file_device: 10,
+            file_inode: inode,
         }
     }
 
@@ -1669,6 +1926,116 @@ mod tests {
         assert_eq!(actual[0].sol_tokens, 11);
         assert_eq!(actual[0].terra_tokens, 22);
         assert_eq!(actual[0].luna_tokens, 33);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn recorded_session_marker_commits_atomically_with_new_usage_and_preserves_existing_state() {
+        let path = database_path("recorded-session-atomic");
+        let existing = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let added = sample(1_700_000_120, 1_700_604_800, Some(74.0), 2.5);
+        let marker = recorded_source("2026/09/session.jsonl", 30);
+        let durable_hash = "0".repeat(64);
+
+        let mut store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&existing).unwrap();
+        let durable = store
+            .commit_durable_state(&[], &durable_hash, "{}")
+            .unwrap();
+        // Simulate the current additive-upgrade source: both existing tables
+        // and rows are valid, while the new marker table is absent.
+        store
+            .connection
+            .execute("DROP TABLE recorded_sessions", [])
+            .unwrap();
+        drop(store);
+
+        let mut upgraded = UsageStore::open(&path).unwrap();
+        assert_eq!(upgraded.load_all().unwrap(), vec![existing.clone()]);
+        assert_eq!(
+            upgraded.load_durable_record().unwrap(),
+            Some(durable.clone())
+        );
+        upgraded
+            .upsert_samples_and_recorded_sessions(
+                std::slice::from_ref(&added),
+                std::slice::from_ref(&marker),
+            )
+            .unwrap();
+        drop(upgraded);
+
+        let reopened = UsageStore::open_read_only(&path).unwrap();
+        assert_eq!(
+            reopened.load_all().unwrap(),
+            vec![existing.clone(), added.clone()]
+        );
+        assert_eq!(
+            reopened.load_durable_record().unwrap(),
+            Some(durable.clone())
+        );
+        assert!(reopened.recorded_session_matches(&marker).unwrap());
+        drop(reopened);
+
+        let mut writer = UsageStore::open(&path).unwrap();
+        writer
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_recorded_session_insert
+                 BEFORE INSERT ON recorded_sessions
+                 BEGIN
+                    SELECT RAISE(ABORT, 'marker rejected');
+                 END;",
+            )
+            .unwrap();
+        let rejected_sample = sample(1_700_000_180, 1_700_604_800, Some(73.0), 3.5);
+        let rejected_marker = recorded_source("2026/09/rejected.jsonl", 31);
+        assert!(writer
+            .upsert_samples_and_recorded_sessions(
+                std::slice::from_ref(&rejected_sample),
+                std::slice::from_ref(&rejected_marker),
+            )
+            .is_err());
+        assert_eq!(writer.load_all().unwrap(), vec![existing, added]);
+        assert_eq!(writer.load_durable_record().unwrap(), Some(durable));
+        assert!(!writer.recorded_session_matches(&rejected_marker).unwrap());
+        drop(writer);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn recorded_session_marker_delete_failure_keeps_marker_and_protected_rows() {
+        let path = database_path("recorded-session-delete-failure");
+        let existing = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let marker = recorded_source("2026/09/session.jsonl", 30);
+        let durable_hash = "1".repeat(64);
+        let mut store = UsageStore::open(&path).unwrap();
+        store
+            .upsert_samples_and_recorded_sessions(
+                std::slice::from_ref(&existing),
+                std::slice::from_ref(&marker),
+            )
+            .unwrap();
+        let durable = store
+            .commit_durable_state(&[], &durable_hash, "{}")
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_recorded_session_delete
+                 BEFORE DELETE ON recorded_sessions
+                 BEGIN
+                    SELECT RAISE(ABORT, 'marker delete rejected');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(store
+            .forget_recorded_sessions(std::slice::from_ref(&marker))
+            .is_err());
+        assert!(store.recorded_session_matches(&marker).unwrap());
+        assert_eq!(store.load_all().unwrap(), vec![existing]);
+        assert_eq!(store.load_durable_record().unwrap(), Some(durable));
+        drop(store);
         remove_database(&path);
     }
 

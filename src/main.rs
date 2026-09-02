@@ -102,6 +102,8 @@ struct LocalUsageResult {
     window_seconds: i64,
     model_usage: ModelUsageTotals,
     history_samples: Vec<UsageHistorySample>,
+    recorded_sessions: Vec<usage_store::RecordedSessionSource>,
+    cleanup_plan: Option<SessionCleanupPlan>,
 }
 
 enum LocalEvent {
@@ -1260,6 +1262,17 @@ const MAX_PROC_PROCESS_ENTRIES: usize = 65_536;
 const MAX_CODEX_PROCESS_FDS: usize = 16_384;
 const MAX_OPEN_SESSION_FILES: usize = 1_024;
 
+fn proc_value_or_disappeared<T>(result: std::io::Result<T>) -> Result<Option<T>, ()> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        // Processes and descriptors can disappear between two `/proc` reads.
+        // Once gone they cannot keep a session file open. Every other error
+        // makes the active-file inventory incomplete and rejects the batch.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
 fn open_codex_session_paths(
     proc_root: &Path,
     sessions_root: &Path,
@@ -1271,9 +1284,8 @@ fn open_codex_session_paths(
         if process_entries > MAX_PROC_PROCESS_ENTRIES {
             return Err(());
         }
-        let process = match process {
-            Ok(process) => process,
-            Err(_) => continue,
+        let Some(process) = proc_value_or_disappeared(process)? else {
+            continue;
         };
         let name = process.file_name();
         let Some(name) = name.to_str() else {
@@ -1283,29 +1295,24 @@ fn open_codex_session_paths(
             continue;
         }
         let process_path = process.path();
-        let comm = match File::open(process_path.join("comm")) {
-            Ok(file) => {
-                let mut bytes = Vec::new();
-                if file.take(64).read_to_end(&mut bytes).is_err() {
-                    continue;
-                }
-                bytes
-            }
-            Err(_) => continue,
+        let Some(file) = proc_value_or_disappeared(File::open(process_path.join("comm")))? else {
+            continue;
         };
+        let mut comm = Vec::new();
+        file.take(64).read_to_end(&mut comm).map_err(|_| ())?;
         if comm.strip_suffix(b"\n") != Some(b"codex") && comm.as_slice() != b"codex" {
             continue;
         }
-        let executable = match fs::read_link(process_path.join("exe")) {
-            Ok(executable) => executable,
-            Err(_) => continue,
+        let Some(executable) = proc_value_or_disappeared(fs::read_link(process_path.join("exe")))?
+        else {
+            continue;
         };
         if executable.file_name().and_then(|name| name.to_str()) != Some("codex") {
             continue;
         }
-        let descriptors = match fs::read_dir(process_path.join("fd")) {
-            Ok(descriptors) => descriptors,
-            Err(_) => continue,
+        let Some(descriptors) = proc_value_or_disappeared(fs::read_dir(process_path.join("fd")))?
+        else {
+            continue;
         };
         let mut descriptor_count = 0usize;
         for descriptor in descriptors {
@@ -1313,13 +1320,11 @@ fn open_codex_session_paths(
             if descriptor_count > MAX_CODEX_PROCESS_FDS {
                 return Err(());
             }
-            let descriptor = match descriptor {
-                Ok(descriptor) => descriptor,
-                Err(_) => continue,
+            let Some(descriptor) = proc_value_or_disappeared(descriptor)? else {
+                continue;
             };
-            let target = match fs::read_link(descriptor.path()) {
-                Ok(target) => target,
-                Err(_) => continue,
+            let Some(target) = proc_value_or_disappeared(fs::read_link(descriptor.path()))? else {
+                continue;
             };
             let Ok(canonical) = security::canonical_regular_file_under(sessions_root, &target)
             else {
@@ -1346,6 +1351,122 @@ fn active_thread_paths(codex_root: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>)
     let active_paths = open_codex_session_paths(Path::new("/proc"), &sessions_root)?;
     debug_runtime(format!("thread active paths={}", active_paths.len()));
     Ok((sessions_root, active_paths))
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct SessionCleanupReport {
+    deleted: Vec<usage_store::RecordedSessionSource>,
+    retained: usize,
+    database_failed: bool,
+    process_scan_failed: bool,
+}
+
+fn current_session_candidate(
+    sessions_root: &Path,
+    expected_path: &Path,
+) -> Result<(PathBuf, usage_store::RecordedSessionSource), security::SecurityError> {
+    let canonical_root = security::validate_absolute_root(sessions_root)?;
+    let root_metadata = fs::symlink_metadata(&canonical_root)
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    let root_identity = session_root_identity(&canonical_root, &root_metadata)?;
+    let canonical = security::canonical_regular_file_under(&canonical_root, expected_path)?;
+    if canonical != expected_path {
+        return Err(security::SecurityError::new(
+            security::SecurityErrorKind::UnsafePath,
+        ));
+    }
+    let metadata = fs::symlink_metadata(&canonical)
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    let fingerprint = local_input_file_fingerprint(&canonical, &metadata)?;
+    let source = recorded_session_source(&canonical_root, &root_identity, &fingerprint)?;
+    Ok((canonical, source))
+}
+
+fn cleanup_recorded_session_overflow_with<F>(
+    database: &Path,
+    plan: &SessionCleanupPlan,
+    active_paths: Result<BTreeSet<PathBuf>, ()>,
+    mut remove_file: F,
+) -> SessionCleanupReport
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
+    let mut report = SessionCleanupReport::default();
+    let active_paths = match active_paths {
+        Ok(paths) => paths,
+        Err(()) => {
+            report.retained = plan.overflow_files.len();
+            report.process_scan_failed = true;
+            return report;
+        }
+    };
+    let store = match UsageStore::open_read_only(database) {
+        Ok(store) => store,
+        Err(_) => {
+            report.retained = plan.overflow_files.len();
+            report.database_failed = true;
+            return report;
+        }
+    };
+
+    // Complete every durable-marker read before unlinking anything. A schema
+    // or SQLite read failure therefore keeps the entire cleanup batch.
+    let mut authorized = Vec::new();
+    for candidate in &plan.overflow_files {
+        if plan.selected_paths.contains(&candidate.fingerprint.path) {
+            report.retained = report.retained.saturating_add(1);
+            continue;
+        }
+        match store.recorded_session_matches(&candidate.recorded_source) {
+            Ok(true) => authorized.push(candidate),
+            Ok(false) => report.retained = report.retained.saturating_add(1),
+            Err(_) => {
+                report.retained = plan.overflow_files.len();
+                report.database_failed = true;
+                return report;
+            }
+        }
+    }
+
+    for candidate in authorized {
+        let Ok((canonical, current)) =
+            current_session_candidate(&plan.sessions_root, &candidate.fingerprint.path)
+        else {
+            report.retained = report.retained.saturating_add(1);
+            continue;
+        };
+        if current != candidate.recorded_source || active_paths.contains(&canonical) {
+            report.retained = report.retained.saturating_add(1);
+            continue;
+        }
+        let Ok((before_remove, current)) =
+            current_session_candidate(&plan.sessions_root, &candidate.fingerprint.path)
+        else {
+            report.retained = report.retained.saturating_add(1);
+            continue;
+        };
+        if before_remove != canonical || current != candidate.recorded_source {
+            report.retained = report.retained.saturating_add(1);
+            continue;
+        }
+        if remove_file(&canonical).is_err() {
+            report.retained = report.retained.saturating_add(1);
+            continue;
+        }
+        report.deleted.push(candidate.recorded_source.clone());
+    }
+    report
+}
+
+fn cleanup_recorded_session_overflow(
+    database: &Path,
+    plan: &SessionCleanupPlan,
+    proc_root: &Path,
+) -> SessionCleanupReport {
+    let active_paths = open_codex_session_paths(proc_root, &plan.sessions_root);
+    cleanup_recorded_session_overflow_with(database, plan, active_paths, |path| {
+        fs::remove_file(path)
+    })
 }
 
 fn fetch_active_thread_update(
@@ -4044,7 +4165,7 @@ impl SessionTraversalBudget {
         let total_bytes = self.total_bytes.checked_add(bytes).ok_or_else(|| {
             security::SecurityError::new(security::SecurityErrorKind::LimitExceeded)
         })?;
-        if files > security::MAX_SESSION_FILES || total_bytes > security::MAX_SESSION_TOTAL_BYTES {
+        if files > security::MAX_SESSION_FILES {
             return Err(security::SecurityError::new(
                 security::SecurityErrorKind::LimitExceeded,
             ));
@@ -4120,8 +4241,23 @@ struct LocalInputFingerprint {
     recovery_file: Option<LocalInputFileFingerprint>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionFileCandidate {
+    fingerprint: LocalInputFileFingerprint,
+    recorded_source: usage_store::RecordedSessionSource,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionCleanupPlan {
+    sessions_root: PathBuf,
+    selected_paths: BTreeSet<PathBuf>,
+    overflow_files: Vec<SessionFileCandidate>,
+}
+
 struct LocalInputInventory {
-    session_files: Vec<PathBuf>,
+    selected_session_files: Vec<SessionFileCandidate>,
+    overflow_session_files: Vec<SessionFileCandidate>,
+    sessions_root: Option<PathBuf>,
     recovery_path: Option<PathBuf>,
     fingerprint: LocalInputFingerprint,
 }
@@ -4140,9 +4276,10 @@ fn local_input_file_fingerprint(
     }
     let modified_nanos = metadata
         .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |value| value.as_nanos());
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?
+        .as_nanos();
     #[cfg(unix)]
     let (device, inode) = {
         use std::os::unix::fs::MetadataExt;
@@ -4159,19 +4296,138 @@ fn local_input_file_fingerprint(
     })
 }
 
+fn session_root_identity(
+    root: &Path,
+    metadata: &fs::Metadata,
+) -> Result<String, security::SecurityError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = root;
+        Ok(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let root = root
+            .to_str()
+            .ok_or_else(|| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in root.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        Ok(format!("path-fnv1a64:{hash:016x}"))
+    }
+}
+
+fn recorded_session_source(
+    sessions_root: &Path,
+    root_identity: &str,
+    fingerprint: &LocalInputFileFingerprint,
+) -> Result<usage_store::RecordedSessionSource, security::SecurityError> {
+    let relative = fingerprint
+        .path
+        .strip_prefix(sessions_root)
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(security::SecurityError::new(
+            security::SecurityErrorKind::UnsafePath,
+        ));
+    }
+    let relative_path = relative
+        .to_str()
+        .ok_or_else(|| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?
+        .to_owned();
+    Ok(usage_store::RecordedSessionSource {
+        root_identity: root_identity.to_owned(),
+        relative_path,
+        file_bytes: fingerprint.length,
+        modified_nanos: fingerprint.modified_nanos,
+        #[cfg(unix)]
+        file_device: fingerprint.device,
+        #[cfg(not(unix))]
+        file_device: 0,
+        #[cfg(unix)]
+        file_inode: fingerprint.inode,
+        #[cfg(not(unix))]
+        file_inode: 0,
+    })
+}
+
+fn select_latest_session_prefix(
+    mut files: Vec<SessionFileCandidate>,
+    selected_byte_limit: u64,
+) -> Result<(Vec<SessionFileCandidate>, Vec<SessionFileCandidate>), security::SecurityError> {
+    files.sort_by(|left, right| {
+        right
+            .fingerprint
+            .modified_nanos
+            .cmp(&left.fingerprint.modified_nanos)
+            .then_with(|| right.fingerprint.path.cmp(&left.fingerprint.path))
+    });
+    let mut selected = Vec::new();
+    let mut overflow = Vec::new();
+    let mut selected_bytes = 0_u64;
+    let mut overflow_started = false;
+    for file in files {
+        if file.fingerprint.length > security::MAX_SESSION_FILE_BYTES {
+            return Err(security::SecurityError::new(
+                security::SecurityErrorKind::LimitExceeded,
+            ));
+        }
+        if overflow_started {
+            overflow.push(file);
+            continue;
+        }
+        let next_bytes = selected_bytes
+            .checked_add(file.fingerprint.length)
+            .ok_or_else(|| {
+                security::SecurityError::new(security::SecurityErrorKind::LimitExceeded)
+            })?;
+        if next_bytes <= selected_byte_limit {
+            selected_bytes = next_bytes;
+            selected.push(file);
+        } else {
+            overflow_started = true;
+            overflow.push(file);
+        }
+    }
+    Ok((selected, overflow))
+}
+
 fn local_input_inventory_for_paths(
     sessions_root: Option<&Path>,
     recovery_path: Option<PathBuf>,
 ) -> Result<LocalInputInventory, security::SecurityError> {
-    let session_files = if let Some(root) = sessions_root {
+    local_input_inventory_for_paths_with_limit(
+        sessions_root,
+        recovery_path,
+        security::MAX_SESSION_TOTAL_BYTES,
+    )
+}
+
+fn local_input_inventory_for_paths_with_limit(
+    sessions_root: Option<&Path>,
+    recovery_path: Option<PathBuf>,
+    selected_byte_limit: u64,
+) -> Result<LocalInputInventory, security::SecurityError> {
+    let (sessions_root, session_files) = if let Some(root) = sessions_root {
         match fs::symlink_metadata(root) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                 return Err(security::SecurityError::new(
                     security::SecurityErrorKind::UnsafePath,
                 ));
             }
-            Ok(_) => session_jsonl_files(root)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Ok(_) => {
+                let canonical_root = security::validate_absolute_root(root)?;
+                let files = session_jsonl_files(&canonical_root)?;
+                (Some(canonical_root), files)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, Vec::new()),
             Err(_) => {
                 return Err(security::SecurityError::new(
                     security::SecurityErrorKind::UnsafePath,
@@ -4179,14 +4435,28 @@ fn local_input_inventory_for_paths(
             }
         }
     } else {
-        Vec::new()
+        (None, Vec::new())
     };
-    let mut session_fingerprints = Vec::with_capacity(session_files.len());
-    for path in &session_files {
-        let metadata = fs::symlink_metadata(path)
+    let mut candidates = Vec::with_capacity(session_files.len());
+    if let Some(root) = sessions_root.as_deref() {
+        let root_metadata = fs::symlink_metadata(root)
             .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
-        session_fingerprints.push(local_input_file_fingerprint(path, &metadata)?);
+        let root_identity = session_root_identity(root, &root_metadata)?;
+        for path in &session_files {
+            let canonical = security::canonical_regular_file_under(root, path)?;
+            let metadata = fs::symlink_metadata(&canonical).map_err(|_| {
+                security::SecurityError::new(security::SecurityErrorKind::UnsafePath)
+            })?;
+            let fingerprint = local_input_file_fingerprint(&canonical, &metadata)?;
+            let recorded_source = recorded_session_source(root, &root_identity, &fingerprint)?;
+            candidates.push(SessionFileCandidate {
+                fingerprint,
+                recorded_source,
+            });
+        }
     }
+    let (selected_session_files, overflow_session_files) =
+        select_latest_session_prefix(candidates, selected_byte_limit)?;
     let recovery_file = if let Some(path) = recovery_path.as_deref() {
         match fs::symlink_metadata(path) {
             Ok(metadata)
@@ -4202,11 +4472,17 @@ fn local_input_inventory_for_paths(
     } else {
         None
     };
+    let selected_fingerprints = selected_session_files
+        .iter()
+        .map(|file| file.fingerprint.clone())
+        .collect();
     Ok(LocalInputInventory {
-        session_files,
+        selected_session_files,
+        overflow_session_files,
+        sessions_root,
         recovery_path,
         fingerprint: LocalInputFingerprint {
-            session_files: session_fingerprints,
+            session_files: selected_fingerprints,
             recovery_file,
         },
     })
@@ -4217,31 +4493,78 @@ fn local_input_inventory() -> Result<LocalInputInventory, security::SecurityErro
     local_input_inventory_for_paths(sessions_root.as_deref(), delegation_usage_recovery_path())
 }
 
+#[derive(Clone, Debug, Default)]
+struct LocalUsageCollection {
+    model_usage: ModelUsageTotals,
+    history_samples: Vec<UsageHistorySample>,
+    recorded_sessions: Vec<usage_store::RecordedSessionSource>,
+    cleanup_plan: Option<SessionCleanupPlan>,
+}
+
+fn cleanup_plan_for_inventory(inventory: &LocalInputInventory) -> Option<SessionCleanupPlan> {
+    let sessions_root = inventory.sessions_root.clone()?;
+    if inventory.overflow_session_files.is_empty() {
+        return None;
+    }
+    Some(SessionCleanupPlan {
+        sessions_root,
+        selected_paths: inventory
+            .selected_session_files
+            .iter()
+            .map(|file| file.fingerprint.path.clone())
+            .collect(),
+        overflow_files: inventory.overflow_session_files.clone(),
+    })
+}
+
 fn collect_local_usage_snapshot(
     reset_at: i64,
     window_seconds: i64,
     inventory: &LocalInputInventory,
-) -> Result<(ModelUsageTotals, Vec<UsageHistorySample>), security::SecurityError> {
+) -> Result<LocalUsageCollection, security::SecurityError> {
     if reset_at <= 0 {
-        return Ok((ModelUsageTotals::default(), Vec::new()));
+        return Ok(LocalUsageCollection {
+            cleanup_plan: cleanup_plan_for_inventory(inventory),
+            ..LocalUsageCollection::default()
+        });
     }
     let mut totals = ModelUsageTotals::default();
     let mut events = Vec::new();
+    let mut recorded_sessions = Vec::new();
     let window_start = reset_at.saturating_sub(window_seconds.max(0));
     let timeline_end = Utc::now().timestamp().min(reset_at);
     debug_runtime(format!(
-        "local session files={}",
-        inventory.session_files.len()
+        "local selected session files={} overflow files={}",
+        inventory.selected_session_files.len(),
+        inventory.overflow_session_files.len()
     ));
-    for path in &inventory.session_files {
-        if let Err(error) =
-            collect_session_usage_file(path, window_start, timeline_end, &mut totals, &mut events)
-        {
-            debug_runtime(format!(
-                "local session parse failed kind={:?}",
-                error.kind()
-            ));
-            return Err(error);
+    for candidate in &inventory.selected_session_files {
+        let path = &candidate.fingerprint.path;
+        let recordable = match collect_session_usage_file_with_recordability(
+            path,
+            window_start,
+            timeline_end,
+            &mut totals,
+            &mut events,
+        ) {
+            Ok(recordable) => recordable,
+            Err(error) => {
+                debug_runtime(format!(
+                    "local session parse failed kind={:?}",
+                    error.kind()
+                ));
+                return Err(error);
+            }
+        };
+        if !recordable {
+            continue;
+        }
+        let unchanged = fs::symlink_metadata(path)
+            .ok()
+            .and_then(|metadata| local_input_file_fingerprint(path, &metadata).ok())
+            .is_some_and(|after| after == candidate.fingerprint);
+        if unchanged {
+            recorded_sessions.push(candidate.recorded_source.clone());
         }
     }
     collect_recovery_usage(
@@ -4252,7 +4575,12 @@ fn collect_local_usage_snapshot(
         &mut totals,
         &mut events,
     );
-    Ok((totals, model_usage_timeline_from_events(events, reset_at)))
+    Ok(LocalUsageCollection {
+        model_usage: totals,
+        history_samples: model_usage_timeline_from_events(events, reset_at),
+        recorded_sessions,
+        cleanup_plan: cleanup_plan_for_inventory(inventory),
+    })
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -4386,15 +4714,22 @@ struct TimedModelUsage {
 fn read_recoverable_session_line<R: BufRead>(
     reader: &mut R,
 ) -> Result<Option<String>, security::SecurityError> {
+    read_recoverable_session_line_with_status(reader).map(|(line, _)| line)
+}
+
+fn read_recoverable_session_line_with_status<R: BufRead>(
+    reader: &mut R,
+) -> Result<(Option<String>, bool), security::SecurityError> {
+    let mut skipped_invalid_record = false;
     loop {
         match security::read_bounded_jsonl_record(reader) {
-            Ok(Some((line, true))) => return Ok(Some(line)),
+            Ok(Some((line, true))) => return Ok((Some(line), skipped_invalid_record)),
             Ok(Some((_line, false))) => {
                 return Err(security::SecurityError::new(
                     security::SecurityErrorKind::Unterminated,
                 ));
             }
-            Ok(None) => return Ok(None),
+            Ok(None) => return Ok((None, skipped_invalid_record)),
             Err(error)
                 if matches!(
                     error.kind(),
@@ -4405,6 +4740,7 @@ fn read_recoverable_session_line<R: BufRead>(
                     "skipped malformed session record kind={:?}",
                     error.kind()
                 ));
+                skipped_invalid_record = true;
             }
             Err(error) => return Err(error),
         }
@@ -4512,6 +4848,7 @@ fn model_usage_timeline_from_events(
     samples
 }
 
+#[cfg(test)]
 fn collect_session_usage_file(
     path: &Path,
     window_start: i64,
@@ -4519,25 +4856,73 @@ fn collect_session_usage_file(
     totals: &mut ModelUsageTotals,
     events: &mut Vec<TimedModelUsage>,
 ) -> Result<(), security::SecurityError> {
+    collect_session_usage_file_with_recordability(
+        path,
+        window_start,
+        timeline_window_end,
+        totals,
+        events,
+    )
+    .map(|_| ())
+}
+
+fn collect_session_usage_file_with_recordability(
+    path: &Path,
+    window_start: i64,
+    timeline_window_end: i64,
+    totals: &mut ModelUsageTotals,
+    events: &mut Vec<TimedModelUsage>,
+) -> Result<bool, security::SecurityError> {
+    let before_path = fs::symlink_metadata(path)
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    if before_path.file_type().is_symlink()
+        || !before_path.is_file()
+        || before_path.len() > security::MAX_SESSION_FILE_BYTES
+    {
+        return Err(security::SecurityError::new(
+            security::SecurityErrorKind::UnsafePath,
+        ));
+    }
     let file = File::open(path)
         .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    let before_file = file
+        .metadata()
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    if !same_rollout_identity(&before_path, &before_file)
+        || before_file.len() > security::MAX_SESSION_FILE_BYTES
+    {
+        return Err(security::SecurityError::new(
+            security::SecurityErrorKind::UnsafePath,
+        ));
+    }
     let original = totals.clone();
     let initial_events_len = events.len();
+    let mut fully_recordable = true;
     let mut model: Option<String> = None;
     let mut previous = TokenSnapshot::default();
     let mut reader = BufReader::new(file);
     loop {
-        let line = match read_recoverable_session_line(&mut reader) {
-            Ok(Some(line)) => line,
-            Ok(None) => break,
+        let line = match read_recoverable_session_line_with_status(&mut reader) {
+            Ok((Some(line), skipped_invalid_record)) => {
+                fully_recordable &= !skipped_invalid_record;
+                line
+            }
+            Ok((None, skipped_invalid_record)) => {
+                fully_recordable &= !skipped_invalid_record;
+                break;
+            }
             Err(error) => {
                 *totals = original;
                 events.truncate(initial_events_len);
                 return Err(error);
             }
         };
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
+        let value = match serde_json::from_str::<Value>(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                fully_recordable = false;
+                continue;
+            }
         };
         // `thread_settings_applied` can precede the actual turn context. Keep
         // the previous model until `turn_context` confirms the model for the
@@ -4573,7 +4958,20 @@ fn collect_session_usage_file(
             }
         }
     }
-    Ok(())
+    let after_file = reader.get_ref().metadata().ok();
+    let after_path = fs::symlink_metadata(path).ok();
+    if after_file
+        .as_ref()
+        .is_none_or(|metadata| !same_rollout_identity(&before_file, metadata))
+        || after_path.as_ref().is_none_or(|metadata| {
+            metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || !same_rollout_identity(&before_file, metadata)
+        })
+    {
+        fully_recordable = false;
+    }
+    Ok(fully_recordable)
 }
 
 fn resolved_executable(override_name: &str, command_name: &str) -> Option<PathBuf> {
@@ -5088,19 +5486,23 @@ impl LocalUsageCache {
         reset_at: i64,
         window_seconds: i64,
         inventory: LocalInputInventory,
-    ) -> Result<(ModelUsageTotals, Vec<UsageHistorySample>), security::SecurityError> {
+    ) -> Result<LocalUsageCollection, security::SecurityError> {
+        let cleanup_plan = cleanup_plan_for_inventory(&inventory);
         if self.period == Some((reset_at, window_seconds))
             && self.fingerprint.as_ref() == Some(&inventory.fingerprint)
         {
             debug_runtime("local inputs unchanged; full session scan skipped");
-            return Ok((self.model_usage.clone(), Vec::new()));
+            return Ok(LocalUsageCollection {
+                model_usage: self.model_usage.clone(),
+                cleanup_plan,
+                ..LocalUsageCollection::default()
+            });
         }
-        let (model_usage, history_samples) =
-            collect_local_usage_snapshot(reset_at, window_seconds, &inventory)?;
+        let collection = collect_local_usage_snapshot(reset_at, window_seconds, &inventory)?;
         self.period = Some((reset_at, window_seconds));
         self.fingerprint = Some(inventory.fingerprint);
-        self.model_usage = model_usage.clone();
-        Ok((model_usage, history_samples))
+        self.model_usage = collection.model_usage.clone();
+        Ok(collection)
     }
 }
 
@@ -5121,18 +5523,20 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                 let result = local_input_inventory()
                     .and_then(|inventory| cache.collect(reset_at, window_seconds, inventory));
                 match result {
-                    Ok((model_usage, history_samples)) => {
+                    Ok(collection) => {
                         debug_runtime(format!(
                             "local collect succeeded rows={} samples={}",
-                            model_usage.clone().rows().len(),
-                            history_samples.len()
+                            collection.model_usage.clone().rows().len(),
+                            collection.history_samples.len()
                         ));
                         let _ = events.send(LocalEvent::Usage(LocalUsageResult {
                             auth_epoch,
                             reset_at,
                             window_seconds,
-                            model_usage,
-                            history_samples,
+                            model_usage: collection.model_usage,
+                            history_samples: collection.history_samples,
+                            recorded_sessions: collection.recorded_sessions,
+                            cleanup_plan: collection.cleanup_plan,
                         }));
                     }
                     Err(_) => {
@@ -5221,6 +5625,22 @@ fn request_with_timeout(
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct PendingRecorderBatch {
+    samples: Vec<usage_store::UsageHistorySample>,
+    recorded_sessions: Vec<usage_store::RecordedSessionSource>,
+    cleanup_plans: Vec<SessionCleanupPlan>,
+}
+
+impl PendingRecorderBatch {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+            && self.recorded_sessions.is_empty()
+            && self.cleanup_plans.is_empty()
+    }
+}
+
 struct CodexInfoState {
     i18n: I18n,
     bridge: AppServerBridge<AccountCommand, Event>,
@@ -5249,6 +5669,8 @@ struct CodexInfoState {
     active_threads: Vec<ActiveThread>,
     estimated_cost_label: String,
     history: UsageHistory,
+    pending_recorded_sessions: Vec<usage_store::RecordedSessionSource>,
+    pending_session_cleanup: Vec<SessionCleanupPlan>,
     selected_reset_at: Option<i64>,
     selected_history_period: String,
     selected_metric: String,
@@ -5257,6 +5679,7 @@ struct CodexInfoState {
     thread_checking: bool,
     thread_error: bool,
     local_usage_error: bool,
+    recorder_store_error: bool,
     /// A quota event is not a complete usage snapshot.  On the first load the
     /// public/native views stay loading until the independent local collector
     /// commits; after that, the last committed snapshot remains visible while
@@ -5557,6 +5980,8 @@ impl CodexInfoState {
             active_threads: Vec::new(),
             estimated_cost_label: "概算 —".into(),
             history,
+            pending_recorded_sessions: Vec::new(),
+            pending_session_cleanup: Vec::new(),
             selected_reset_at: None,
             selected_history_period: "履歴なし".into(),
             selected_metric: "ドル".into(),
@@ -5565,6 +5990,7 @@ impl CodexInfoState {
             thread_checking: false,
             thread_error: false,
             local_usage_error: false,
+            recorder_store_error: false,
             local_usage_pending: false,
             usage_snapshot_committed: false,
             last_thread_poll: resident_now,
@@ -5610,6 +6036,8 @@ impl CodexInfoState {
             active_threads: Vec::new(),
             estimated_cost_label: "概算 —".into(),
             history: UsageHistory::default(),
+            pending_recorded_sessions: Vec::new(),
+            pending_session_cleanup: Vec::new(),
             selected_reset_at: None,
             selected_history_period: "履歴なし".into(),
             selected_metric: "ドル".into(),
@@ -5618,6 +6046,7 @@ impl CodexInfoState {
             thread_checking: false,
             thread_error: false,
             local_usage_error: false,
+            recorder_store_error: false,
             local_usage_pending: false,
             usage_snapshot_committed: false,
             last_thread_poll: Instant::now(),
@@ -5664,6 +6093,8 @@ impl CodexInfoState {
             last_success_at: Some(now - 60),
             window_seconds: WEEK_SECONDS,
             history: UsageHistory::preview(now, reset_at, preview_costs),
+            pending_recorded_sessions: Vec::new(),
+            pending_session_cleanup: Vec::new(),
             model_usage,
             active_threads: vec![ActiveThread {
                 id: "preview-thread".into(),
@@ -5689,6 +6120,7 @@ impl CodexInfoState {
             thread_checking: false,
             thread_error: false,
             local_usage_error: false,
+            recorder_store_error: false,
             local_usage_pending: false,
             // Preview is one complete in-memory generation. Individual
             // startup fixtures clear this bit when they intentionally model
@@ -6345,6 +6777,26 @@ impl CodexInfoState {
         true
     }
 
+    fn take_pending_recorder_batch(&mut self) -> PendingRecorderBatch {
+        PendingRecorderBatch {
+            samples: self.history.take_pending_store_samples(),
+            recorded_sessions: std::mem::take(&mut self.pending_recorded_sessions),
+            cleanup_plans: std::mem::take(&mut self.pending_session_cleanup),
+        }
+    }
+
+    fn restore_pending_recorder_batch(&mut self, mut batch: PendingRecorderBatch) {
+        self.history.restore_pending_store_samples(batch.samples);
+        batch
+            .recorded_sessions
+            .append(&mut self.pending_recorded_sessions);
+        self.pending_recorded_sessions = batch.recorded_sessions;
+        batch
+            .cleanup_plans
+            .append(&mut self.pending_session_cleanup);
+        self.pending_session_cleanup = batch.cleanup_plans;
+    }
+
     fn clear_account_visible_state(&mut self) {
         self.advance_auth_epoch();
         self.stop_thread_bridge();
@@ -6369,9 +6821,12 @@ impl CodexInfoState {
         self.thread_checking = false;
         self.thread_error = false;
         self.local_usage_error = false;
+        self.recorder_store_error = false;
         self.local_usage_pending = false;
         self.usage_snapshot_committed = false;
         self.history = UsageHistory::default();
+        self.pending_recorded_sessions.clear();
+        self.pending_session_cleanup.clear();
         self.selected_reset_at = None;
         self.selected_history_period = "履歴なし".into();
     }
@@ -6608,6 +7063,11 @@ impl CodexInfoState {
         if !self.preview {
             self.history
                 .apply_backfill_samples(result.reset_at, result.history_samples);
+            self.pending_recorded_sessions
+                .extend(result.recorded_sessions);
+            if let Some(cleanup_plan) = result.cleanup_plan {
+                self.pending_session_cleanup.push(cleanup_plan);
+            }
         }
         // During an account outage the last quota value is display-only
         // last-good data, not a new observation. Persist local model changes,
@@ -6642,6 +7102,19 @@ impl CodexInfoState {
         self.local_usage_error = true;
         self.local_usage_pending = false;
         self.refresh_partial_failure_status();
+    }
+
+    fn apply_recorder_store_error(&mut self) {
+        self.recorder_store_error = true;
+        self.local_usage_pending = false;
+        self.refresh_partial_failure_status();
+    }
+
+    fn clear_recorder_store_error(&mut self) {
+        if self.recorder_store_error {
+            self.recorder_store_error = false;
+            self.refresh_partial_failure_status();
+        }
     }
 
     fn apply_thread_result(&mut self, auth_epoch: u64, update: ActiveThreadUpdate) {
@@ -6683,7 +7156,10 @@ impl CodexInfoState {
             self.status = "利用量と履歴を取得しています…".into();
             return;
         }
-        match (self.local_usage_error, self.thread_error) {
+        match (
+            self.local_usage_error || self.recorder_store_error,
+            self.thread_error,
+        ) {
             (true, true) => {
                 self.error =
                     Some("ローカル履歴とスレッド情報を安全に取得できませんでした。".into());
@@ -9352,7 +9828,7 @@ fn resident_service_cycle<W, P>(
     publish: P,
 ) -> Result<ResidentServiceCycleOutcome, ResidentServiceCycleError>
 where
-    W: FnOnce(&mut CodexInfoState, Vec<usage_store::UsageHistorySample>) -> Result<(), String>,
+    W: FnOnce(&mut CodexInfoState, PendingRecorderBatch) -> Result<(), String>,
     P: FnOnce(PublicDetails) -> Result<(), codex_info::server::ApiSnapshotError>,
 {
     state.poll();
@@ -9363,11 +9839,18 @@ where
         publication.last_complete = None;
     }
     state.schedule_resident_refresh(Instant::now());
-    let pending = state.history.take_pending_store_samples();
-    if let Err(error) = write_and_refresh(state, pending.clone()) {
-        state.history.restore_pending_store_samples(pending);
-        return Err(ResidentServiceCycleError::Store(error));
-    }
+    let pending = state.take_pending_recorder_batch();
+    let store_error = match write_and_refresh(state, pending.clone()) {
+        Ok(()) => {
+            state.clear_recorder_store_error();
+            None
+        }
+        Err(error) => {
+            state.restore_pending_recorder_batch(pending);
+            state.apply_recorder_store_error();
+            Some(error)
+        }
+    };
     // A quota response is only the first half of a public generation. Keep
     // the publisher's exact root and generation identity unchanged until the
     // matching local usage/history result reaches a terminal state.
@@ -9381,6 +9864,18 @@ where
         if let Some(last_complete) = publication.last_complete.as_ref() {
             candidate = last_complete.clone();
             candidate.state = PublicState::Error;
+        } else if store_error.is_some() {
+            // The collector result has not become durable and therefore is
+            // not a publishable first snapshot. Keep identity/plan context,
+            // but expose no usage payload until the pending batch commits.
+            candidate.observed_at = None;
+            candidate.quota = None;
+            candidate.models.clear();
+            candidate.active_thread_count = 0;
+            candidate.history_periods.clear();
+            candidate.history_samples.clear();
+            candidate.history_gaps.clear();
+            candidate.threads.clear();
         }
     }
     publish(candidate.clone()).map_err(ResidentServiceCycleError::Publish)?;
@@ -9389,7 +9884,11 @@ where
     } else if !candidate.authenticated {
         publication.last_complete = None;
     }
-    Ok(ResidentServiceCycleOutcome::Published)
+    if let Some(error) = store_error {
+        Err(ResidentServiceCycleError::Store(error))
+    } else {
+        Ok(ResidentServiceCycleOutcome::Published)
+    }
 }
 
 fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -9436,12 +9935,45 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                         &mut state,
                         &mut publication,
                         |state, pending| {
-                            let has_pending = !pending.is_empty();
-                            recorder.store_samples(pending)?;
-                            if has_pending {
+                            let PendingRecorderBatch {
+                                samples,
+                                recorded_sessions,
+                                cleanup_plans,
+                            } = pending;
+                            let has_samples = !samples.is_empty();
+                            recorder.store_generation(samples, recorded_sessions)?;
+                            if has_samples {
                                 if !state.history.refresh_from_store(Utc::now()) {
                                     return Err("history refresh after recorder commit failed".into());
                                 }
+                            }
+                            for plan in cleanup_plans {
+                                let Some(database) = state.history.db_path.as_deref() else {
+                                    debug_runtime("session cleanup retained all files: database unavailable");
+                                    continue;
+                                };
+                                let report = cleanup_recorded_session_overflow(
+                                    database,
+                                    &plan,
+                                    Path::new("/proc"),
+                                );
+                                let deleted_count = report.deleted.len();
+                                if deleted_count > 0 {
+                                    if recorder
+                                        .forget_recorded_sessions(report.deleted)
+                                        .is_err()
+                                    {
+                                        debug_runtime(format!(
+                                            "session cleanup marker retirement failed deleted={deleted_count}"
+                                        ));
+                                    }
+                                }
+                                debug_runtime(format!(
+                                    "session cleanup deleted={deleted_count} retained={} database_failed={} process_scan_failed={}",
+                                    report.retained,
+                                    report.database_failed,
+                                    report.process_scan_failed
+                                ));
                             }
                             Ok(())
                         },
@@ -10027,11 +10559,12 @@ mod tests {
         thread_presentation_rows, three_months_before_utc, unused_interval_positions,
         visible_window_position, week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer,
         ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow,
-        HourlyModelSpend, I18n, LaunchMode, LocalUsageCache, LocalUsageResult, ManualX11Geometry,
-        ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
-        ModelUsageTotals, PublicDetails, RpcReadEvent, ServiceEndpointState, ServiceHealthVersion,
-        SessionTraversalBudget, TimedModelUsage, TokenSnapshot, UnusedIntervalPosition, UsageEvent,
-        UsageHistory, UsageHistorySample, UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT,
+        HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint, LocalUsageCache,
+        LocalUsageResult, ManualX11Geometry, ManualX11WindowAction, ModelDollarTotals,
+        ModelTokenTotals, ModelUsageRow, ModelUsageTotals, PublicDetails, RpcReadEvent,
+        ServiceEndpointState, ServiceHealthVersion, SessionFileCandidate, SessionTraversalBudget,
+        TimedModelUsage, TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory,
+        UsageHistorySample, UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT,
         FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
         LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION, THREADS_WINDOW_PURPOSE,
         UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
@@ -11373,6 +11906,8 @@ mod tests {
             window_seconds: WEEK_SECONDS,
             model_usage: ModelUsageTotals::default(),
             history_samples: vec![sample],
+            recorded_sessions: Vec::new(),
+            cleanup_plan: None,
         });
         assert_eq!(state.history.samples.len(), 1);
         assert!(state.model_usage.is_empty());
@@ -11435,6 +11970,8 @@ mod tests {
             window_seconds: WEEK_SECONDS,
             model_usage: ModelUsageTotals::default(),
             history_samples: Vec::new(),
+            recorded_sessions: Vec::new(),
+            cleanup_plan: None,
         });
         assert!(!state.local_usage_pending);
         assert!(state.history.samples.is_empty());
@@ -11637,18 +12174,108 @@ mod tests {
         assert!(publication.last_complete.is_some());
 
         let retained = state.history.samples[0].to_store();
+        let retained_marker = super::usage_store::RecordedSessionSource {
+            root_identity: "unix:10:20".into(),
+            relative_path: "2026/09/session.jsonl".into(),
+            file_bytes: 123,
+            modified_nanos: 1_700_000_000_000_000_000,
+            file_device: 10,
+            file_inode: 30,
+        };
+        let retained_cleanup = super::SessionCleanupPlan {
+            sessions_root: PathBuf::from("/tmp/codex-info-retained-cleanup"),
+            selected_paths: BTreeSet::new(),
+            overflow_files: Vec::new(),
+        };
         state.history.pending_store_samples = vec![retained.clone()];
+        state.pending_recorded_sessions = vec![retained_marker.clone()];
+        state.pending_session_cleanup = vec![retained_cleanup.clone()];
+        let last_complete = publication
+            .last_complete
+            .clone()
+            .expect("ready root was retained");
+        let emitted_error = std::cell::RefCell::new(None);
         let result = super::resident_service_cycle(
             &mut state,
             &mut publication,
             |_, _| Err("write rejected".into()),
-            |_| panic!("a rejected write must not publish"),
+            |details| {
+                details.validate().unwrap();
+                *emitted_error.borrow_mut() = Some(details);
+                Ok(())
+            },
         );
         assert!(matches!(
             result,
             Err(super::ResidentServiceCycleError::Store(_))
         ));
+        let mut expected_error = last_complete.clone();
+        expected_error.state = PublicState::Error;
+        assert_eq!(emitted_error.into_inner(), Some(expected_error));
+        assert_eq!(publication.last_complete, Some(last_complete));
+        assert!(state.recorder_store_error);
         assert_eq!(state.history.pending_store_samples, [retained]);
+        assert_eq!(state.pending_recorded_sessions, [retained_marker]);
+        assert_eq!(state.pending_session_cleanup, [retained_cleanup]);
+
+        let recovered = std::cell::RefCell::new(None);
+        let outcome = super::resident_service_cycle(
+            &mut state,
+            &mut publication,
+            |_, pending| {
+                assert_eq!(pending.samples.len(), 1);
+                assert_eq!(pending.recorded_sessions.len(), 1);
+                assert_eq!(pending.cleanup_plans.len(), 1);
+                Ok(())
+            },
+            |details| {
+                details.validate().unwrap();
+                *recovered.borrow_mut() = Some(details);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, super::ResidentServiceCycleOutcome::Published);
+        assert_eq!(
+            recovered.into_inner().expect("recovery root").state,
+            PublicState::Ready
+        );
+        assert!(!state.recorder_store_error);
+        assert!(state.take_pending_recorder_batch().is_empty());
+
+        let mut initial = CodexInfoState::preview("normal");
+        initial.preview = false;
+        initial.history.pending_store_samples = vec![initial.history.samples[0].to_store()];
+        let mut initial_publication = super::ResidentPublicationState::default();
+        let emitted_initial_error = std::cell::RefCell::new(None);
+        let result = super::resident_service_cycle(
+            &mut initial,
+            &mut initial_publication,
+            |_, _| Err("initial write rejected".into()),
+            |details| {
+                details.validate().unwrap();
+                *emitted_initial_error.borrow_mut() = Some(details);
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(super::ResidentServiceCycleError::Store(_))
+        ));
+        let initial_error = emitted_initial_error
+            .into_inner()
+            .expect("initial error root");
+        assert_eq!(initial_error.state, PublicState::Error);
+        assert_eq!(initial_error.observed_at, None);
+        assert!(initial_error.quota.is_none());
+        assert!(initial_error.models.is_empty());
+        assert_eq!(initial_error.active_thread_count, 0);
+        assert!(initial_error.history_periods.is_empty());
+        assert!(initial_error.history_samples.is_empty());
+        assert!(initial_error.threads.is_empty());
+        assert!(initial_publication.last_complete.is_none());
+        assert!(initial.recorder_store_error);
+        assert_eq!(initial.history.pending_store_samples.len(), 1);
     }
 
     #[test]
@@ -11753,6 +12380,8 @@ mod tests {
                 1.0,
                 ModelDollarTotals::default(),
             )],
+            recorded_sessions: Vec::new(),
+            cleanup_plan: None,
         });
         state.apply_local_usage_error(8, reset_at, WEEK_SECONDS);
 
@@ -11784,6 +12413,8 @@ mod tests {
                 0.0,
                 ModelDollarTotals::default(),
             )],
+            recorded_sessions: Vec::new(),
+            cleanup_plan: None,
         });
         state.apply_local_usage_error(state.auth_epoch, reset_at + WEEK_SECONDS, WEEK_SECONDS);
         assert_eq!(state.history.samples, old_history);
@@ -11804,6 +12435,8 @@ mod tests {
             window_seconds: WEEK_SECONDS,
             model_usage: ModelUsageTotals::default(),
             history_samples: Vec::new(),
+            recorded_sessions: Vec::new(),
+            cleanup_plan: None,
         });
         assert!(!state.local_usage_pending);
         assert_eq!(state.history.samples, old_history);
@@ -11849,6 +12482,8 @@ mod tests {
                 ModelDollarTotals::default(),
                 ModelTokenTotals::default(),
             )],
+            recorded_sessions: Vec::new(),
+            cleanup_plan: None,
         });
 
         assert_eq!(state.model_usage.len(), 1);
@@ -11886,6 +12521,8 @@ mod tests {
                 22.0,
                 ModelDollarTotals::default(),
             )],
+            recorded_sessions: Vec::new(),
+            cleanup_plan: None,
         });
         assert_eq!(state.selected_history_reset(), Some(next_reset));
     }
@@ -12021,6 +12658,8 @@ mod tests {
                     },
                 ),
             ],
+            recorded_sessions: Vec::new(),
+            cleanup_plan: None,
         });
         state.remaining_percent = Some(80.0);
 
@@ -12202,6 +12841,8 @@ mod tests {
                 0.0,
                 ModelDollarTotals::default(),
             )],
+            recorded_sessions: Vec::new(),
+            cleanup_plan: None,
         });
         state.apply_local_usage_error(stale_epoch, reset_at, WEEK_SECONDS);
 
@@ -12669,8 +13310,10 @@ mod tests {
         let proc_root = root.join("proc");
         let process = proc_root.join("100");
         let ignored_process = proc_root.join("200");
+        let disappeared_process = proc_root.join("300");
         fs::create_dir_all(process.join("fd")).unwrap();
         fs::create_dir_all(ignored_process.join("fd")).unwrap();
+        fs::create_dir_all(&disappeared_process).unwrap();
         fs::create_dir_all(&sessions).unwrap();
         fs::write(process.join("comm"), "codex\n").unwrap();
         fs::write(ignored_process.join("comm"), "not-codex\n").unwrap();
@@ -12692,6 +13335,212 @@ mod tests {
             open_codex_session_paths(&proc_root, &sessions).unwrap(),
             BTreeSet::from([fs::canonicalize(active).unwrap()])
         );
+
+        // `NotFound` is the sole tolerated `/proc` race. An unreadable
+        // descriptor entry would make the active set incomplete and must
+        // reject the whole scan rather than silently authorize cleanup.
+        fs::remove_file(process.join("fd/4")).unwrap();
+        fs::write(process.join("fd/4"), "not-a-symlink").unwrap();
+        assert!(open_codex_session_paths(&proc_root, &sessions).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recorded_overflow_cleanup_deletes_only_fresh_authorized_files() {
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-session-cleanup-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let sessions = root.join("sessions");
+        let history = root.join("history");
+        fs::create_dir_all(sessions.join("kept-directory")).unwrap();
+        fs::create_dir_all(&history).unwrap();
+        for name in [
+            "marked",
+            "unmarked",
+            "changed",
+            "active",
+            "selected",
+            "missing",
+            "remove-failure",
+        ] {
+            fs::write(sessions.join(format!("{name}.jsonl")), "{}\n").unwrap();
+        }
+        let backup = history.join("usage_history.sqlite3.bak.1");
+        let hint = history.join("usage_reset_hint.json");
+        let recovery = history.join("delegation_usage_recovery.jsonl");
+        fs::write(&backup, b"verified-backup-fixture").unwrap();
+        fs::write(&hint, b"reset-hint-fixture").unwrap();
+        fs::write(&recovery, b"recovery-fixture\n").unwrap();
+        let protected_bytes = (
+            fs::read(&backup).unwrap(),
+            fs::read(&hint).unwrap(),
+            fs::read(&recovery).unwrap(),
+        );
+
+        let inventory =
+            super::local_input_inventory_for_paths_with_limit(Some(&sessions), None, 0).unwrap();
+        let mut plan = super::cleanup_plan_for_inventory(&inventory).unwrap();
+        let candidate = |name: &str| {
+            plan.overflow_files
+                .iter()
+                .find(|candidate| {
+                    candidate
+                        .fingerprint
+                        .path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        == Some(name)
+                })
+                .unwrap()
+                .clone()
+        };
+        let marked = candidate("marked");
+        let changed = candidate("changed");
+        let active = candidate("active");
+        let selected = candidate("selected");
+        let missing = candidate("missing");
+        let remove_failure = candidate("remove-failure");
+        plan.selected_paths
+            .insert(selected.fingerprint.path.clone());
+
+        let database = history.join("usage_history.sqlite3");
+        let existing = super::usage_store::UsageHistorySample {
+            timestamp: 1_700_000_060,
+            reset_at: 1_700_604_800,
+            remaining_percent: Some(75.0),
+            sol_dollars: 1.0,
+            terra_dollars: 2.0,
+            luna_dollars: 3.0,
+            sol_tokens: 11,
+            terra_tokens: 22,
+            luna_tokens: 33,
+        };
+        let markers = [
+            marked.recorded_source.clone(),
+            changed.recorded_source.clone(),
+            active.recorded_source.clone(),
+            selected.recorded_source.clone(),
+            missing.recorded_source.clone(),
+            remove_failure.recorded_source.clone(),
+        ];
+        let mut store = UsageStore::open(&database).unwrap();
+        store
+            .upsert_samples_and_recorded_sessions(std::slice::from_ref(&existing), &markers)
+            .unwrap();
+        let durable = store
+            .commit_durable_state(&[], "2".repeat(64), "{}")
+            .unwrap();
+        drop(store);
+
+        let readback_failure = super::cleanup_recorded_session_overflow_with(
+            &history.join("missing.sqlite3"),
+            &plan,
+            Ok(BTreeSet::new()),
+            |path| fs::remove_file(path),
+        );
+        assert!(readback_failure.database_failed);
+        assert!(marked.fingerprint.path.exists());
+        let scan_failure =
+            super::cleanup_recorded_session_overflow_with(&database, &plan, Err(()), |path| {
+                fs::remove_file(path)
+            });
+        assert!(scan_failure.process_scan_failed);
+        assert!(marked.fingerprint.path.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let proc_root = root.join("proc-partial");
+            let process = proc_root.join("100");
+            fs::create_dir_all(process.join("fd")).unwrap();
+            fs::write(process.join("comm"), "codex\n").unwrap();
+            let executable = root.join("codex");
+            fs::write(&executable, "fixture").unwrap();
+            symlink(&executable, process.join("exe")).unwrap();
+            fs::write(process.join("fd/3"), "not-a-symlink").unwrap();
+
+            let partial_scan =
+                super::cleanup_recorded_session_overflow(&database, &plan, &proc_root);
+            assert!(partial_scan.process_scan_failed);
+            assert!(partial_scan.deleted.is_empty());
+            assert!(marked.fingerprint.path.exists());
+        }
+
+        let mut changed_append = fs::OpenOptions::new()
+            .append(true)
+            .open(&changed.fingerprint.path)
+            .unwrap();
+        writeln!(changed_append, "{{\"changed\":true}}").unwrap();
+        drop(changed_append);
+        fs::remove_file(&missing.fingerprint.path).unwrap();
+        let active_paths = BTreeSet::from([active.fingerprint.path.clone()]);
+        let remove_failure_path = remove_failure.fingerprint.path.clone();
+        let report = super::cleanup_recorded_session_overflow_with(
+            &database,
+            &plan,
+            Ok(active_paths),
+            |path| {
+                if path == remove_failure_path {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected remove failure",
+                    ))
+                } else {
+                    fs::remove_file(path)
+                }
+            },
+        );
+        assert_eq!(report.deleted, [marked.recorded_source.clone()]);
+        assert_eq!(report.retained, 6);
+        assert!(!marked.fingerprint.path.exists());
+        assert!(sessions.join("unmarked.jsonl").exists());
+        assert!(changed.fingerprint.path.exists());
+        assert!(active.fingerprint.path.exists());
+        assert!(selected.fingerprint.path.exists());
+        assert!(remove_failure.fingerprint.path.exists());
+        assert!(!missing.fingerprint.path.exists());
+        assert!(sessions.join("kept-directory").is_dir());
+
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_cleanup_marker_delete
+                 BEFORE DELETE ON recorded_sessions
+                 BEGIN
+                    SELECT RAISE(ABORT, 'marker delete rejected');
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+        let mut store = UsageStore::open(&database).unwrap();
+        assert!(store.forget_recorded_sessions(&report.deleted).is_err());
+        assert!(store
+            .recorded_session_matches(&marked.recorded_source)
+            .unwrap());
+        assert_eq!(store.load_all().unwrap(), vec![existing.clone()]);
+        assert_eq!(store.load_durable_record().unwrap(), Some(durable.clone()));
+        drop(store);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute("DROP TRIGGER reject_cleanup_marker_delete", [])
+            .unwrap();
+        drop(connection);
+        let mut store = UsageStore::open(&database).unwrap();
+        assert_eq!(store.forget_recorded_sessions(&report.deleted).unwrap(), 1);
+        assert!(!store
+            .recorded_session_matches(&marked.recorded_source)
+            .unwrap());
+        assert_eq!(store.load_all().unwrap(), vec![existing]);
+        assert_eq!(store.load_durable_record().unwrap(), Some(durable));
+        drop(store);
+
+        assert_eq!(fs::read(&backup).unwrap(), protected_bytes.0);
+        assert_eq!(fs::read(&hint).unwrap(), protected_bytes.1);
+        assert_eq!(fs::read(&recovery).unwrap(), protected_bytes.2);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -13682,7 +14531,9 @@ mod tests {
                 .expect("total byte boundary");
         }
         assert_eq!(total.total_bytes, super::security::MAX_SESSION_TOTAL_BYTES);
-        assert!(total.admit_file(1, 1).is_err());
+        total
+            .admit_file(1, 1)
+            .expect("inventory aggregate is not the selected-byte cap");
         assert!(SessionTraversalBudget::default()
             .admit_file(1, super::security::MAX_SESSION_FILE_BYTES + 1)
             .is_err());
@@ -13706,6 +14557,88 @@ mod tests {
             assert!(session_jsonl_files(&root).is_err());
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn latest_session_selector_uses_whole_prefix_without_hole_filling() {
+        let candidate = |name: &str, length: u64, modified_nanos: u128, inode: u64| {
+            let path = PathBuf::from(format!("/sessions/{name}.jsonl"));
+            SessionFileCandidate {
+                fingerprint: LocalInputFileFingerprint {
+                    path,
+                    length,
+                    modified_nanos,
+                    #[cfg(unix)]
+                    device: 10,
+                    #[cfg(unix)]
+                    inode,
+                },
+                recorded_source: super::usage_store::RecordedSessionSource {
+                    root_identity: "unix:10:20".into(),
+                    relative_path: format!("{name}.jsonl"),
+                    file_bytes: length,
+                    modified_nanos,
+                    file_device: 10,
+                    file_inode: inode,
+                },
+            }
+        };
+        let names = |files: &[SessionFileCandidate]| {
+            files
+                .iter()
+                .map(|file| {
+                    file.fingerprint
+                        .path
+                        .file_stem()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let (selected, overflow) = super::select_latest_session_prefix(
+            vec![
+                candidate("new", 6, 30, 1),
+                candidate("middle", 4, 20, 2),
+                candidate("old", 1, 10, 3),
+            ],
+            10,
+        )
+        .unwrap();
+        assert_eq!(names(&selected), ["new", "middle"]);
+        assert_eq!(names(&overflow), ["old"]);
+
+        let (selected, overflow) = super::select_latest_session_prefix(
+            vec![
+                candidate("new", 6, 30, 1),
+                candidate("middle", 5, 20, 2),
+                candidate("old", 1, 10, 3),
+            ],
+            10,
+        )
+        .unwrap();
+        assert_eq!(names(&selected), ["new"]);
+        assert_eq!(names(&overflow), ["middle", "old"]);
+
+        let (selected, overflow) = super::select_latest_session_prefix(
+            vec![candidate("a", 1, 40, 4), candidate("z", 1, 40, 5)],
+            2,
+        )
+        .unwrap();
+        assert_eq!(names(&selected), ["z", "a"]);
+        assert!(overflow.is_empty());
+
+        assert!(super::select_latest_session_prefix(
+            vec![candidate(
+                "oversized",
+                super::security::MAX_SESSION_FILE_BYTES + 1,
+                50,
+                6,
+            )],
+            u64::MAX,
+        )
+        .is_err());
     }
 
     #[test]
@@ -14983,9 +15916,17 @@ mod tests {
         .unwrap();
         let mut totals = ModelUsageTotals::default();
         let mut events = Vec::new();
-        collect_session_usage_file(&path, 0, i64::MAX, &mut totals, &mut events).unwrap();
+        let recordable = super::collect_session_usage_file_with_recordability(
+            &path,
+            0,
+            i64::MAX,
+            &mut totals,
+            &mut events,
+        )
+        .unwrap();
         assert_eq!(totals.luna.tokens, 120);
         assert_eq!(totals.luna.output_tokens, 20);
+        assert!(!recordable);
         let _ = fs::remove_file(path);
     }
 
@@ -15019,9 +15960,17 @@ mod tests {
         .unwrap();
         let mut totals = ModelUsageTotals::default();
         let mut events = Vec::new();
-        collect_session_usage_file(&path, 0, i64::MAX, &mut totals, &mut events).unwrap();
+        let recordable = super::collect_session_usage_file_with_recordability(
+            &path,
+            0,
+            i64::MAX,
+            &mut totals,
+            &mut events,
+        )
+        .unwrap();
         assert_eq!(totals.luna.tokens, 120);
         assert_eq!(totals.luna.output_tokens, 20);
+        assert!(!recordable);
         let _ = fs::remove_file(path);
     }
 
@@ -15209,18 +16158,20 @@ mod tests {
         let mut cache = LocalUsageCache::default();
 
         let first_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
-        let (first_totals, first_history) = cache
+        let first = cache
             .collect(reset_at, WEEK_SECONDS, first_inventory)
             .unwrap();
-        assert_eq!(first_totals.luna.tokens, 120);
-        assert!(!first_history.is_empty());
+        assert_eq!(first.model_usage.luna.tokens, 120);
+        assert!(!first.history_samples.is_empty());
+        assert_eq!(first.recorded_sessions.len(), 1);
 
         let unchanged_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
-        let (unchanged_totals, unchanged_history) = cache
+        let unchanged = cache
             .collect(reset_at, WEEK_SECONDS, unchanged_inventory)
             .unwrap();
-        assert_eq!(unchanged_totals.luna.tokens, 120);
-        assert!(unchanged_history.is_empty());
+        assert_eq!(unchanged.model_usage.luna.tokens, 120);
+        assert!(unchanged.history_samples.is_empty());
+        assert!(unchanged.recorded_sessions.is_empty());
 
         let next_tokens = json!({
             "timestamp": now.to_rfc3339(),
@@ -15234,11 +16185,264 @@ mod tests {
         writeln!(append, "{next_tokens}").unwrap();
         drop(append);
         let changed_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
-        let (changed_totals, changed_history) = cache
+        let changed = cache
             .collect(reset_at, WEEK_SECONDS, changed_inventory)
             .unwrap();
-        assert_eq!(changed_totals.luna.tokens, 240);
-        assert!(!changed_history.is_empty());
+        assert_eq!(changed.model_usage.luna.tokens, 240);
+        assert!(!changed.history_samples.is_empty());
+        assert_eq!(changed.recorded_sessions.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn aggregate_overflow_collects_latest_prefix_and_fatal_selected_file_has_no_fallback() {
+        use std::fs::FileTimes;
+        use std::time::{Duration as StdDuration, UNIX_EPOCH};
+
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-latest-prefix-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let now = Utc::now();
+        let reset_at = now.timestamp() + 3_600;
+        let valid_session = |tokens: u64| {
+            let context = json!({
+                "timestamp": now.to_rfc3339(),
+                "type": "turn_context",
+                "model": "gpt-5.6-sol"
+            });
+            let usage = json!({
+                "timestamp": now.to_rfc3339(),
+                "type": "token_count",
+                "payload": {"info": {"total_token_usage": {
+                    "total_tokens": tokens,
+                    "input_tokens": tokens,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 0
+                }}}
+            });
+            format!("{context}\n{usage}\n")
+        };
+        let newest = root.join("z-newest.jsonl");
+        let older = root.join("a-older.jsonl");
+        let newest_bytes = valid_session(120);
+        fs::write(&newest, &newest_bytes).unwrap();
+        fs::write(&older, valid_session(999)).unwrap();
+        File::options()
+            .write(true)
+            .open(&newest)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + StdDuration::from_secs(200)))
+            .unwrap();
+        File::options()
+            .write(true)
+            .open(&older)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + StdDuration::from_secs(100)))
+            .unwrap();
+
+        let inventory = super::local_input_inventory_for_paths_with_limit(
+            Some(&root),
+            None,
+            newest_bytes.len() as u64,
+        )
+        .unwrap();
+        assert_eq!(inventory.selected_session_files.len(), 1);
+        assert_eq!(inventory.overflow_session_files.len(), 1);
+        assert_eq!(inventory.selected_session_files[0].fingerprint.path, newest);
+        let collection =
+            super::collect_local_usage_snapshot(reset_at, WEEK_SECONDS, &inventory).unwrap();
+        assert_eq!(collection.model_usage.sol.tokens, 120);
+        assert_eq!(collection.recorded_sessions.len(), 1);
+        assert_eq!(
+            collection
+                .cleanup_plan
+                .as_ref()
+                .unwrap()
+                .overflow_files
+                .len(),
+            1
+        );
+
+        let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
+        state.reset_at = Some(reset_at);
+        state.window_seconds = WEEK_SECONDS;
+        state.apply_local_usage_success(LocalUsageResult {
+            auth_epoch: state.auth_epoch,
+            reset_at,
+            window_seconds: WEEK_SECONDS,
+            model_usage: collection.model_usage,
+            history_samples: collection.history_samples,
+            recorded_sessions: collection.recorded_sessions,
+            cleanup_plan: collection.cleanup_plan,
+        });
+        assert_eq!(state.pending_recorded_sessions.len(), 1);
+        assert_eq!(state.pending_session_cleanup.len(), 1);
+        assert!(
+            older.exists(),
+            "cleanup is commit-gated, not collector-owned"
+        );
+
+        let database = root.join("usage_history.sqlite3");
+        let committed_markers = std::cell::RefCell::new(Vec::new());
+        let emitted_ready = std::cell::RefCell::new(None);
+        let mut publication = super::ResidentPublicationState::default();
+        let outcome = super::resident_service_cycle(
+            &mut state,
+            &mut publication,
+            |_, pending| {
+                assert!(!pending.samples.is_empty());
+                assert_eq!(pending.recorded_sessions.len(), 1);
+                assert_eq!(pending.cleanup_plans.len(), 1);
+                let mut store = UsageStore::open(&database).map_err(|error| error.to_string())?;
+                store
+                    .upsert_samples_and_recorded_sessions(
+                        &pending.samples,
+                        &pending.recorded_sessions,
+                    )
+                    .map_err(|error| error.to_string())?;
+                drop(store);
+                for cleanup_plan in &pending.cleanup_plans {
+                    let report = super::cleanup_recorded_session_overflow_with(
+                        &database,
+                        cleanup_plan,
+                        Ok(BTreeSet::new()),
+                        |path| fs::remove_file(path),
+                    );
+                    assert!(report.deleted.is_empty());
+                    assert_eq!(report.retained, 1);
+                }
+                *committed_markers.borrow_mut() = pending.recorded_sessions;
+                Ok(())
+            },
+            |details| {
+                details.validate().unwrap();
+                *emitted_ready.borrow_mut() = Some(details);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, super::ResidentServiceCycleOutcome::Published);
+        let ready_details = emitted_ready.into_inner().expect("ready root");
+        assert_eq!(ready_details.state, PublicState::Ready);
+        let sol = ready_details
+            .models
+            .iter()
+            .find(|model| model.name == "SOL")
+            .expect("selected SOL usage");
+        assert_eq!(
+            sol.input_tokens + sol.cached_input_tokens + sol.output_tokens,
+            120
+        );
+        assert!(state.take_pending_recorder_batch().is_empty());
+        assert!(older.exists(), "legacy overflow is never inferred recorded");
+        let store = UsageStore::open_read_only(&database).unwrap();
+        assert!(store
+            .recorded_session_matches(&committed_markers.borrow()[0])
+            .unwrap());
+        drop(store);
+
+        let fatal_root = root.join("fatal");
+        fs::create_dir(&fatal_root).unwrap();
+        let fatal_newest = fatal_root.join("z-newest.jsonl");
+        let fallback = fatal_root.join("a-fallback.jsonl");
+        let fatal_bytes = b"{\"type\":\"turn_context\",\"model\":\"gpt-5.6-sol\"}";
+        fs::write(&fatal_newest, fatal_bytes).unwrap();
+        fs::write(&fallback, "{}\n").unwrap();
+        File::options()
+            .write(true)
+            .open(&fatal_newest)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + StdDuration::from_secs(200)))
+            .unwrap();
+        File::options()
+            .write(true)
+            .open(&fallback)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(UNIX_EPOCH + StdDuration::from_secs(100)))
+            .unwrap();
+        let fatal_inventory = super::local_input_inventory_for_paths_with_limit(
+            Some(&fatal_root),
+            None,
+            fatal_bytes.len() as u64,
+        )
+        .unwrap();
+        assert!(
+            super::collect_local_usage_snapshot(reset_at, WEEK_SECONDS, &fatal_inventory,).is_err()
+        );
+        assert!(fatal_newest.exists());
+        assert!(fallback.exists());
+        assert!(state.pending_recorded_sessions.is_empty());
+        assert!(state.pending_session_cleanup.is_empty());
+
+        state.local_usage_pending = true;
+        state.apply_local_usage_error(state.auth_epoch, reset_at, WEEK_SECONDS);
+        let emitted_last_good_error = std::cell::RefCell::new(None);
+        let outcome = super::resident_service_cycle(
+            &mut state,
+            &mut publication,
+            |_, pending| {
+                assert!(pending.is_empty());
+                Ok(())
+            },
+            |details| {
+                details.validate().unwrap();
+                *emitted_last_good_error.borrow_mut() = Some(details);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, super::ResidentServiceCycleOutcome::Published);
+        let mut expected_last_good_error = ready_details.clone();
+        expected_last_good_error.state = PublicState::Error;
+        assert_eq!(
+            emitted_last_good_error.into_inner(),
+            Some(expected_last_good_error)
+        );
+
+        let mut first_failure = CodexInfoState::preview("normal");
+        first_failure.preview = false;
+        first_failure.reset_at = Some(reset_at);
+        first_failure.window_seconds = WEEK_SECONDS;
+        first_failure.usage_snapshot_committed = false;
+        first_failure.model_usage.clear();
+        first_failure.history = UsageHistory::default();
+        first_failure.active_threads.clear();
+        first_failure.local_usage_pending = true;
+        first_failure.apply_local_usage_error(first_failure.auth_epoch, reset_at, WEEK_SECONDS);
+        let mut first_publication = super::ResidentPublicationState::default();
+        let emitted_first_failure = std::cell::RefCell::new(None);
+        let outcome = super::resident_service_cycle(
+            &mut first_failure,
+            &mut first_publication,
+            |_, pending| {
+                assert!(pending.is_empty());
+                Ok(())
+            },
+            |details| {
+                details.validate().unwrap();
+                *emitted_first_failure.borrow_mut() = Some(details);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, super::ResidentServiceCycleOutcome::Published);
+        let details = emitted_first_failure
+            .into_inner()
+            .expect("first fatal error root");
+        assert_eq!(details.state, PublicState::Error);
+        assert_eq!(details.observed_at, None);
+        assert!(details.quota.is_none());
+        assert!(details.models.is_empty());
+        assert!(details.history_samples.is_empty());
+        assert!(details.threads.is_empty());
+        assert!(first_publication.last_complete.is_none());
+        assert!(first_failure.pending_recorded_sessions.is_empty());
+        assert!(first_failure.pending_session_cleanup.is_empty());
         let _ = fs::remove_dir_all(root);
     }
 

@@ -123,6 +123,7 @@ bash "$bundle_dir/extracted/install.sh" --remove
 
 履歴データ自体の削除は、このbundle removeとは別の明示操作として扱う。
 install、update、reinstall、service切替失敗でも、履歴DB、DB backup、reset hint、Codex session JSONL、設定は保持する。
+通常稼働中のresident serviceは、最新2GiBの収集対象から外れ、かつ同一fingerprintの利用量がSQLiteへ記録済みで、変更・open中でない古いsession JSONLだけを整理できる。このruntime整理はbundle removeとは別であり、未記録・legacy・変更済み・active sessionや履歴DBを削除しない。
 
 ## 停止と確認
 
