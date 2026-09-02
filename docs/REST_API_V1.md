@@ -10,8 +10,8 @@ Linux / WSL 上で起動する Codex Info のresident serviceと、Linux / Windo
 X UIを表示しない。resident serviceだけがquota、local usage、historyのauthority/writerである。
 `RecorderDaemon`はservice process内のbounded workerとしてsource JSONLを検証し、storage admissionを通過したraw rowを
 SQLiteへtransactionalに書く。`HistoryCanonicalizer`はcommit済みraw rowのread-only viewからpublic logical sampleを作る。
-`SnapshotPublisher`がcommit済みの完全な`DataGeneration/DataHash`と現行 admission tuple
-`(ProfileScopeId, AccountScopeId, StorageEpoch, SupervisorLeaseIdentity, CollectorEpoch, CycleSeq)`からimmutableなdetails
+`SnapshotPublisher`がcommit済みの完全な`DataGeneration/DataHash`と現行account admission tuple
+`(ProfileScopeId, AccountScopeId, StorageEpoch, auth_epoch, AccountUpdateGeneration, CollectorEpoch, CycleSeq)`、および別責務の`SupervisorLeaseIdentity`からimmutableなdetails
 generationを構築し、native UIとREST workerへ同じgenerationをread-onlyで渡す。HTTP要求からCodex
 app-server、認証 URL、セッションファイル、SQLite、Slint / X11へ直接到達する経路は持たない。
 
@@ -122,6 +122,14 @@ candidateも同じ扱いとし、DB、memory、REST、UIを変更しない。
 公開しない。Windows クライアントは HTTP 接続エラーと `state` を別々に表示する。
 認証開始・確認はcontrol-onlyであり、その応答をsnapshot fieldまたはgenerationとして採用しない。control完了後も
 新しいstrict validation済みdetails generationを取得するまでlast-good表示を保持する。
+
+account identity boundaryでは一般的なlast-good保持の例外として、新しいpublished-pairでempty rootを公開する。
+明示logoutは`auth_required`、confirmed account switchからfresh collection完了までは`initializing`、
+AccountKey/profile metadata/partition検証失敗は`error`とする。この3状態のrootはHTTP 200かつ
+`observed_at=null`、`authenticated=false`、`plan_label=null`、`quota=null`、`models=[]`、
+`active_thread_count=0`、`history_periods=[]`、`history_samples=[]`、`history_gaps=[]`、`threads=[]`、
+`estimated_cost_label="概算 —"`で固定する。旧accountのquota/model/history/threadを混ぜず、同じconfirmed
+accountのtransport/quota/local一時失敗だけは従来どおり最後の完全rootを保持して`error`へ遷移する。
 
 wireに `ready` boolean keyは存在しない。dataの利用可能判定は、完全schemaを受理した一つのdetails rootについて
 `state == "ready" && authenticated == true` の論理積だけである。
@@ -254,7 +262,7 @@ rootとsiblingの相対rankを保ったまま親先行depth-first・subtree-cont
 
 全objectは上記キーを全て必須とし、未知、大小文字違い、同一object内の重複、型違い、
 配列上限超過が1件でもあればcandidate全体を拒否する。serverの`SnapshotPublisher`は現行
-`(ProfileScopeId, AccountScopeId, StorageEpoch, SupervisorLeaseIdentity, CollectorEpoch, CycleSeq)`、
+`(ProfileScopeId, AccountScopeId, StorageEpoch, auth_epoch, AccountUpdateGeneration, CollectorEpoch, CycleSeq)`、profile publisherを所有する`SupervisorLeaseIdentity`、
 `DataGeneration`、`DataHash`、canonical fingerprint、`RootHash`が一致する内部candidateだけをpublishし、
 その成功publishへ一つの`Codex-Info-Published-Pair`を割り当てる。Linux / Windows UIはdetails一応答のstrict
 schema/domain、exactly oneの正規pair header、body/header sizeを満たす場合だけ、その全fieldを一つのrootとしてcommitする。
@@ -400,5 +408,5 @@ timeout/non-200/切断、header欠落・重複・大小文字差・prefix/長さ
 candidate全体をdiscardして直前の完全rootを保持する。wireにJSON generation fieldを追加せず、published-generation headerは
 details一応答のopaque generation identityとしてだけ使い、body SHAやcommon-core hashを別identityとして作らない。
 
-schema-validなdetailsの`state=auth_required,authenticated=false`を受理した場合だけ、
+schema-validなdetailsの`state=auth_required|initializing|error,authenticated=false`が上記exact empty契約を満たす場合、
 その同じdetails rootで旧account可視値を空にする。認証開始・確認controlの成功・失敗だけではdata rootを変更しない。

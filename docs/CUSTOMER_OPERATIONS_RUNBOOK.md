@@ -115,7 +115,9 @@ bash "$bundle_dir/extracted/install.sh" --remove
 この操作は`codex-info.service`と`codex-info-update.service`/`.timer`を停止・無効化し、unit fileを削除する。
 導入binary、`$HOME/.local/libexec/codex-info-install.sh`、installed manifest、profile dataと次のデータは削除しない。
 
-- `history/usage_history.sqlite3`
+- legacy `history/usage_history.sqlite3`（read-only保持対象）
+- account別`history/accounts/v1/<opaque-account-scope>/epoch-<storage-epoch>/usage_history.sqlite3`
+- `history/account_profile_v1.json`
 - DB backup
 - `history/usage_reset_hint.json`
 - Codex session JSONL
@@ -124,6 +126,8 @@ bash "$bundle_dir/extracted/install.sh" --remove
 履歴データ自体の削除は、このbundle removeとは別の明示操作として扱う。
 install、update、reinstall、service切替失敗でも、履歴DB、DB backup、reset hint、Codex session JSONL、設定は保持する。
 通常稼働中のresident serviceは、最新2GiBの収集対象から外れ、かつ同一fingerprintの利用量がSQLiteへ記録済みで、変更・open中でない古いsession JSONLだけを整理できる。このruntime整理はbundle removeとは別であり、未記録・legacy・変更済み・active sessionや履歴DBを削除しない。
+
+account切替直後は、既存Sessionを現在EOFへbaselineしてから新しいappendだけを現accountへ記録するため、detailsが一時的に`initializing`のempty rootになる。`auth_required`は明示logout、`error`のempty rootは`auth.json`、profile metadata、account DBの安全性を確認できない状態である。後者では旧account DBへ戻さず、通常の次cycleまたはservice再起動で同じpartitionの回復を試す。`history/account_profile_v1.json`、`history/accounts/v1`、legacy DB、backup、Sessionを手作業で削除・rename・mergeして回復させてはならない。
 
 ## 停止と確認
 
