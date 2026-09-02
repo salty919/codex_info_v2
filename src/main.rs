@@ -3,6 +3,7 @@
 
 #![deny(unsafe_code)]
 
+mod account_scope;
 mod daemon;
 
 use chrono::{DateTime, Months, Utc};
@@ -18,9 +19,10 @@ use codex_info::thread_contract::{
     ValidatedThreadCandidate,
 };
 use codex_info::thread_state;
-use codex_info::usage_store::{self, UsageStore};
+use codex_info::usage_store::{self, StoragePartitionIdentity, UsageStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
 use slint::{CloseRequestResponse, ComponentHandle, Model, Timer, TimerMode};
 use std::cell::RefCell;
@@ -40,23 +42,41 @@ use std::time::{Duration, Instant};
 
 slint::include_modules!();
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum AccountCommand {
     Read,
     Login,
+    Verify {
+        admission: AccountAdmission,
+        account_key: account_scope::AccountKey,
+    },
     Stop,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AccountAdmission {
+    account_update_generation: u64,
+    profile_scope_id: String,
+    account_scope_id: String,
+    storage_epoch: u64,
+    partition_id: String,
+}
+
+#[derive(Clone)]
 enum ThreadCommand {
-    Read { auth_epoch: u64 },
+    Read {
+        auth_epoch: u64,
+        admission: AccountAdmission,
+    },
     Stop,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum LocalCommand {
     Collect {
         auth_epoch: u64,
+        admission: AccountAdmission,
+        collection_state: Box<usage_store::SessionCollectionState>,
         reset_at: i64,
         window_seconds: i64,
     },
@@ -64,6 +84,8 @@ enum LocalCommand {
 }
 
 struct UsageEvent {
+    account_key: account_scope::AccountKey,
+    account_update_generation: u64,
     remaining_percent: Option<f64>,
     reset_at: i64,
     window_seconds: i64,
@@ -78,9 +100,16 @@ enum Event {
         email: Option<String>,
         authenticated: bool,
         plan_type: Option<String>,
+        account_key: Option<account_scope::AccountKey>,
+        account_update_generation: u64,
     },
     AuthUrl(String),
     Usage(Box<UsageEvent>),
+    Verified {
+        admission: AccountAdmission,
+        valid: bool,
+    },
+    IdentityError(String),
     Error(String),
 }
 
@@ -88,10 +117,12 @@ enum ThreadEvent {
     Ready,
     Update {
         auth_epoch: u64,
+        admission: AccountAdmission,
         update: ActiveThreadUpdate,
     },
     Error {
         auth_epoch: u64,
+        admission: AccountAdmission,
         message: String,
     },
 }
@@ -106,8 +137,18 @@ struct LocalUsageResult {
     cleanup_plan: Option<SessionCleanupPlan>,
 }
 
+struct LocalUsageCandidate {
+    result: LocalUsageResult,
+    admission: AccountAdmission,
+    collector_epoch: u128,
+    cycle_seq: u64,
+    session_checkpoints: Vec<usage_store::SessionCheckpoint>,
+    session_ranges: Vec<usage_store::SessionRange>,
+    session_model_totals: Vec<usage_store::SessionModelTotal>,
+}
+
 enum LocalEvent {
-    Usage(LocalUsageResult),
+    Usage(Box<LocalUsageCandidate>),
     Error {
         auth_epoch: u64,
         reset_at: i64,
@@ -254,6 +295,36 @@ impl ModelUsageTotals {
             terra: self.terra.tokens,
             luna: self.luna.tokens,
         }
+    }
+
+    fn from_session_totals(totals: &[usage_store::SessionModelTotal]) -> Self {
+        let mut result = Self::default();
+        for total in totals {
+            let row = match total.model.as_str() {
+                "SOL" => &mut result.sol,
+                "TERRA" => &mut result.terra,
+                "LUNA" => &mut result.luna,
+                _ => continue,
+            };
+            row.tokens = total.total_tokens;
+            row.input_tokens = total.input_tokens;
+            row.cached_input_tokens = total.cached_input_tokens;
+            row.output_tokens = total.output_tokens;
+        }
+        result
+    }
+
+    fn to_session_totals(&self) -> Vec<usage_store::SessionModelTotal> {
+        [&self.sol, &self.terra, &self.luna]
+            .into_iter()
+            .map(|row| usage_store::SessionModelTotal {
+                model: row.name.clone(),
+                total_tokens: row.tokens,
+                input_tokens: row.input_tokens,
+                cached_input_tokens: row.cached_input_tokens,
+                output_tokens: row.output_tokens,
+            })
+            .collect()
     }
 }
 
@@ -1382,8 +1453,9 @@ fn current_session_candidate(
     Ok((canonical, source))
 }
 
-fn cleanup_recorded_session_overflow_with<F>(
+fn cleanup_recorded_session_overflow_partitioned_with<F>(
     database: &Path,
+    partition_identity: Option<&StoragePartitionIdentity>,
     plan: &SessionCleanupPlan,
     active_paths: Result<BTreeSet<PathBuf>, ()>,
     mut remove_file: F,
@@ -1400,7 +1472,16 @@ where
             return report;
         }
     };
-    let store = match UsageStore::open_read_only(database) {
+    let store = match partition_identity {
+        Some(identity) => UsageStore::open_read_only_partitioned(database, identity),
+        #[cfg(test)]
+        None => UsageStore::open_read_only(database),
+        #[cfg(not(test))]
+        None => Err(usage_store::UsageStoreError::InvalidImport(
+            "cleanup partition identity is missing".into(),
+        )),
+    };
+    let store = match store {
         Ok(store) => store,
         Err(_) => {
             report.retained = plan.overflow_files.len();
@@ -1458,13 +1539,49 @@ where
     report
 }
 
+#[cfg(test)]
+fn cleanup_recorded_session_overflow_with<F>(
+    database: &Path,
+    plan: &SessionCleanupPlan,
+    active_paths: Result<BTreeSet<PathBuf>, ()>,
+    remove_file: F,
+) -> SessionCleanupReport
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
+    cleanup_recorded_session_overflow_partitioned_with(
+        database,
+        None,
+        plan,
+        active_paths,
+        remove_file,
+    )
+}
+
+fn cleanup_recorded_session_overflow_partitioned(
+    database: &Path,
+    partition_identity: &StoragePartitionIdentity,
+    plan: &SessionCleanupPlan,
+    proc_root: &Path,
+) -> SessionCleanupReport {
+    let active_paths = open_codex_session_paths(proc_root, &plan.sessions_root);
+    cleanup_recorded_session_overflow_partitioned_with(
+        database,
+        Some(partition_identity),
+        plan,
+        active_paths,
+        |path| fs::remove_file(path),
+    )
+}
+
+#[cfg(test)]
 fn cleanup_recorded_session_overflow(
     database: &Path,
     plan: &SessionCleanupPlan,
     proc_root: &Path,
 ) -> SessionCleanupReport {
     let active_paths = open_codex_session_paths(proc_root, &plan.sessions_root);
-    cleanup_recorded_session_overflow_with(database, plan, active_paths, |path| {
+    cleanup_recorded_session_overflow_partitioned_with(database, None, plan, active_paths, |path| {
         fs::remove_file(path)
     })
 }
@@ -2381,24 +2498,19 @@ fn canonicalize_public_history_samples(
 #[derive(Debug, Default)]
 struct UsageHistory {
     db_path: Option<PathBuf>,
+    partition_identity: Option<StoragePartitionIdentity>,
     samples: Vec<UsageHistorySample>,
     pending_store_samples: Vec<usage_store::UsageHistorySample>,
     startup_maintenance_done: bool,
 }
 
 impl UsageHistory {
-    fn load() -> Self {
-        let now = Utc::now();
-        let mut history = Self::load_from_db_path_at(usage_history_db_path(), now);
-        history.startup_maintenance(now);
-        history
-    }
-
     #[cfg(test)]
     fn load_from_db_path(db_path: Option<PathBuf>) -> Self {
         Self::load_from_db_path_at(db_path, Utc::now())
     }
 
+    #[cfg(test)]
     fn load_from_db_path_at(db_path: Option<PathBuf>, now: DateTime<Utc>) -> Self {
         let samples = db_path
             .as_ref()
@@ -2415,6 +2527,7 @@ impl UsageHistory {
             .collect();
         let mut history = Self {
             db_path,
+            partition_identity: None,
             samples,
             pending_store_samples: Vec::new(),
             startup_maintenance_done: false,
@@ -2423,16 +2536,25 @@ impl UsageHistory {
         history
     }
 
-    /// Return a bounded period hint for a startup backfill when the account
-    /// bridge is unavailable. The persisted reset timestamp is evidence from
-    /// the local log/DB, not a substitute for a fresh quota snapshot.
-    fn latest_period_hint(&self) -> Option<(i64, i64)> {
-        daemon::load_reset_hint().or_else(|| {
-            self.samples
-                .iter()
-                .max_by_key(|sample| sample.timestamp)
-                .map(|sample| (sample.reset_at, WEEK_SECONDS))
-        })
+    fn load_from_partition(partition: &account_scope::AccountPartition) -> Self {
+        let now = Utc::now();
+        let identity = partition.storage_identity();
+        let samples = UsageStore::open_read_only_partitioned(&partition.database_path, &identity)
+            .ok()
+            .and_then(|store| store.load_recent_one_month(now).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(UsageHistorySample::from_store)
+            .collect();
+        let mut history = Self {
+            db_path: Some(partition.database_path.clone()),
+            partition_identity: Some(identity),
+            samples,
+            pending_store_samples: Vec::new(),
+            startup_maintenance_done: false,
+        };
+        history.startup_maintenance(now);
+        history
     }
 
     fn preview(now: i64, reset_at: i64, costs: ModelDollarTotals) -> Self {
@@ -2494,6 +2616,7 @@ impl UsageHistory {
         let samples = previous.chain(current).collect();
         Self {
             db_path: None,
+            partition_identity: None,
             samples,
             pending_store_samples: Vec::new(),
             startup_maintenance_done: true,
@@ -2563,7 +2686,11 @@ impl UsageHistory {
         let Some(path) = self.db_path.as_ref() else {
             return false;
         };
-        let Ok(store) = UsageStore::open_read_only(path) else {
+        let store = match self.partition_identity.as_ref() {
+            Some(identity) => UsageStore::open_read_only_partitioned(path, identity),
+            None => UsageStore::open_read_only(path),
+        };
+        let Ok(store) = store else {
             return false;
         };
         let Ok(samples) = store.load_recent_one_month(now) else {
@@ -2705,14 +2832,6 @@ impl UsageHistory {
         self.samples
             .retain(|sample| sample.timestamp > cutoff && sample.timestamp <= end_timestamp);
     }
-}
-
-fn usage_history_db_path() -> Option<PathBuf> {
-    Some(
-        usage_data_root()?
-            .join("history")
-            .join("usage_history.sqlite3"),
-    )
 }
 
 fn default_codex_root() -> PathBuf {
@@ -4137,10 +4256,6 @@ fn codex_home_root() -> Option<PathBuf> {
     validated_configured_root(path)
 }
 
-fn delegation_usage_recovery_path() -> Option<PathBuf> {
-    codex_home_root().map(|root| root.join("history").join("delegation_usage_recovery.jsonl"))
-}
-
 #[derive(Default)]
 struct SessionTraversalBudget {
     files: usize,
@@ -4247,6 +4362,24 @@ struct SessionFileCandidate {
     recorded_source: usage_store::RecordedSessionSource,
 }
 
+type SessionInventoryKey = (String, String);
+
+fn session_inventory_key(candidate: &SessionFileCandidate) -> SessionInventoryKey {
+    (
+        candidate.recorded_source.root_identity.clone(),
+        candidate.recorded_source.relative_path.clone(),
+    )
+}
+
+fn session_inventory_keys(inventory: &LocalInputInventory) -> BTreeSet<SessionInventoryKey> {
+    inventory
+        .selected_session_files
+        .iter()
+        .chain(&inventory.overflow_session_files)
+        .map(session_inventory_key)
+        .collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SessionCleanupPlan {
     sessions_root: PathBuf,
@@ -4258,6 +4391,7 @@ struct LocalInputInventory {
     selected_session_files: Vec<SessionFileCandidate>,
     overflow_session_files: Vec<SessionFileCandidate>,
     sessions_root: Option<PathBuf>,
+    #[allow(dead_code)]
     recovery_path: Option<PathBuf>,
     fingerprint: LocalInputFingerprint,
 }
@@ -4490,7 +4624,10 @@ fn local_input_inventory_for_paths_with_limit(
 
 fn local_input_inventory() -> Result<LocalInputInventory, security::SecurityError> {
     let sessions_root = local_sessions_root();
-    local_input_inventory_for_paths(sessions_root.as_deref(), delegation_usage_recovery_path())
+    // The profile-wide delegation recovery log has no durable account
+    // authority. Account-partitioned collection therefore admits only
+    // Session sources observed under the confirmed Codex sessions root.
+    local_input_inventory_for_paths(sessions_root.as_deref(), None)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4498,6 +4635,9 @@ struct LocalUsageCollection {
     model_usage: ModelUsageTotals,
     history_samples: Vec<UsageHistorySample>,
     recorded_sessions: Vec<usage_store::RecordedSessionSource>,
+    session_checkpoints: Vec<usage_store::SessionCheckpoint>,
+    session_ranges: Vec<usage_store::SessionRange>,
+    session_model_totals: Vec<usage_store::SessionModelTotal>,
     cleanup_plan: Option<SessionCleanupPlan>,
 }
 
@@ -4517,6 +4657,7 @@ fn cleanup_plan_for_inventory(inventory: &LocalInputInventory) -> Option<Session
     })
 }
 
+#[cfg(test)]
 fn collect_local_usage_snapshot(
     reset_at: i64,
     window_seconds: i64,
@@ -4579,11 +4720,15 @@ fn collect_local_usage_snapshot(
         model_usage: totals,
         history_samples: model_usage_timeline_from_events(events, reset_at),
         recorded_sessions,
+        session_checkpoints: Vec::new(),
+        session_ranges: Vec::new(),
+        session_model_totals: Vec::new(),
         cleanup_plan: cleanup_plan_for_inventory(inventory),
     })
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[cfg(test)]
 struct DelegationUsageRecoveryEntry {
     timestamp: i64,
     thread_id: String,
@@ -4594,6 +4739,7 @@ struct DelegationUsageRecoveryEntry {
     reasoning_tokens: u64,
 }
 
+#[cfg(test)]
 impl DelegationUsageRecoveryEntry {
     fn snapshot(&self) -> TokenSnapshot {
         // Recovery records contain reasoning tokens for auditing, but the
@@ -4608,6 +4754,7 @@ impl DelegationUsageRecoveryEntry {
     }
 }
 
+#[cfg(test)]
 fn read_recovery_entries_for_ranges(
     path: &Path,
     window_start: i64,
@@ -4668,6 +4815,7 @@ fn read_recovery_entries_for_ranges(
     (totals_entries, timeline_entries)
 }
 
+#[cfg(test)]
 fn collect_recovery_usage(
     path: Option<&Path>,
     window_start: i64,
@@ -4711,12 +4859,14 @@ struct TimedModelUsage {
 /// same file disappear from the graph.  The bounded reader consumes the bad
 /// record before returning the error, so skipping only `LimitExceeded` and
 /// `Parse` is both recoverable and bounded; I/O failures remain fatal.
+#[cfg(test)]
 fn read_recoverable_session_line<R: BufRead>(
     reader: &mut R,
 ) -> Result<Option<String>, security::SecurityError> {
     read_recoverable_session_line_with_status(reader).map(|(line, _)| line)
 }
 
+#[cfg(test)]
 fn read_recoverable_session_line_with_status<R: BufRead>(
     reader: &mut R,
 ) -> Result<(Option<String>, bool), security::SecurityError> {
@@ -4819,13 +4969,21 @@ fn session_event_timestamp(value: &Value) -> i64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 fn model_usage_timeline_from_events(
+    events: Vec<TimedModelUsage>,
+    reset_at: i64,
+) -> Vec<UsageHistorySample> {
+    model_usage_timeline_from_events_with_initial(events, reset_at, ModelUsageTotals::default())
+}
+
+fn model_usage_timeline_from_events_with_initial(
     mut events: Vec<TimedModelUsage>,
     reset_at: i64,
+    mut totals: ModelUsageTotals,
 ) -> Vec<UsageHistorySample> {
     events.sort_by_key(|event| event.timestamp);
 
-    let mut totals = ModelUsageTotals::default();
     let mut samples: Vec<UsageHistorySample> = Vec::new();
     for event in events {
         let minute = event.timestamp.div_euclid(60) * 60;
@@ -4848,6 +5006,477 @@ fn model_usage_timeline_from_events(
     samples
 }
 
+fn discard_session_partial_tail<R: BufRead>(
+    reader: &mut R,
+) -> Result<bool, security::SecurityError> {
+    loop {
+        let buffer = reader
+            .fill_buf()
+            .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+        if buffer.is_empty() {
+            return Ok(false);
+        }
+        if let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
+            reader.consume(index + 1);
+            return Ok(true);
+        }
+        let length = buffer.len();
+        reader.consume(length);
+    }
+}
+
+fn sha256_file_range(
+    file: &mut File,
+    start_offset: u64,
+    end_offset: u64,
+) -> Result<String, security::SecurityError> {
+    if start_offset > end_offset {
+        return Err(security::SecurityError::new(
+            security::SecurityErrorKind::UnsafePath,
+        ));
+    }
+    file.seek(SeekFrom::Start(start_offset))
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    let mut remaining = end_offset - start_offset;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut hasher = Sha256::new();
+    while remaining > 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded hash chunk fits usize");
+        let read = file
+            .read(&mut buffer[..limit])
+            .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+        if read == 0 {
+            return Err(security::SecurityError::new(
+                security::SecurityErrorKind::UnsafePath,
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn session_file_has_partial_tail(
+    file: &mut File,
+    file_bytes: u64,
+) -> Result<bool, security::SecurityError> {
+    if file_bytes == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(file_bytes - 1))
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    Ok(last[0] != b'\n')
+}
+
+fn session_prefix_generation(
+    collector_epoch: u128,
+    source: &usage_store::RecordedSessionSource,
+    prefix_sha256: &str,
+) -> u128 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex-info-session-prefix-v1\0");
+    hasher.update(collector_epoch.to_be_bytes());
+    hasher.update(source.root_identity.as_bytes());
+    hasher.update([0]);
+    hasher.update(source.relative_path.as_bytes());
+    hasher.update(source.file_device.to_be_bytes());
+    hasher.update(source.file_inode.to_be_bytes());
+    hasher.update(prefix_sha256.as_bytes());
+    let digest = hasher.finalize();
+    let mut generation = [0_u8; 16];
+    generation.copy_from_slice(&digest[..16]);
+    u128::from_be_bytes(generation).max(1)
+}
+
+#[derive(Clone, Copy)]
+struct SessionAppendContext {
+    baseline_existing: bool,
+    allow_prior_continuity: bool,
+    collector_epoch: u128,
+    cycle_seq: u64,
+    window_start: i64,
+    timeline_end: i64,
+}
+
+struct SessionAppendResult {
+    checkpoint: usage_store::SessionCheckpoint,
+    range: Option<usage_store::SessionRange>,
+    marker: Option<usage_store::RecordedSessionSource>,
+}
+
+fn collect_session_append(
+    candidate: &SessionFileCandidate,
+    prior: Option<&usage_store::SessionCheckpoint>,
+    context: SessionAppendContext,
+    totals: &mut ModelUsageTotals,
+    events: &mut Vec<TimedModelUsage>,
+) -> Result<Option<SessionAppendResult>, security::SecurityError> {
+    let SessionAppendContext {
+        baseline_existing,
+        allow_prior_continuity,
+        collector_epoch,
+        cycle_seq,
+        window_start,
+        timeline_end,
+    } = context;
+    let path = &candidate.fingerprint.path;
+    let before_path = fs::symlink_metadata(path)
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    let mut file = File::open(path)
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    let before_file = file
+        .metadata()
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    if !same_rollout_identity(&before_path, &before_file)
+        || before_file.len() != candidate.fingerprint.length
+    {
+        return Err(security::SecurityError::new(
+            security::SecurityErrorKind::UnsafePath,
+        ));
+    }
+
+    let continuous_checkpoint = if let Some(checkpoint) = prior.filter(|_| allow_prior_continuity) {
+        if checkpoint.collector_epoch == collector_epoch
+            && checkpoint.file_device == candidate.recorded_source.file_device
+            && checkpoint.file_inode == candidate.recorded_source.file_inode
+            && checkpoint.committed_offset <= candidate.fingerprint.length
+        {
+            let observed_prefix = sha256_file_range(&mut file, 0, checkpoint.committed_offset)?;
+            (observed_prefix == checkpoint.prefix_sha256).then_some(checkpoint)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let boundary_or_replacement = prior.is_some() || baseline_existing;
+    let (
+        start_offset,
+        mut discard_until_lf,
+        fully_attributed,
+        mut baseline_known,
+        mut model,
+        mut previous,
+        prefix_generation,
+    ) = if let Some(checkpoint) = continuous_checkpoint {
+        (
+            checkpoint.committed_offset,
+            checkpoint.discard_until_lf,
+            checkpoint.fully_attributed_from_zero,
+            checkpoint.token_baseline_known,
+            checkpoint.last_model.clone(),
+            TokenSnapshot {
+                total: checkpoint.previous_total,
+                input: checkpoint.previous_input,
+                cached_input: checkpoint.previous_cached_input,
+                output: checkpoint.previous_output,
+            },
+            checkpoint.prefix_generation,
+        )
+    } else if boundary_or_replacement {
+        let prefix_sha256 = sha256_file_range(&mut file, 0, candidate.fingerprint.length)?;
+        let partial_tail = session_file_has_partial_tail(&mut file, candidate.fingerprint.length)?;
+        (
+            candidate.fingerprint.length,
+            partial_tail,
+            false,
+            false,
+            None,
+            TokenSnapshot::default(),
+            session_prefix_generation(collector_epoch, &candidate.recorded_source, &prefix_sha256),
+        )
+    } else {
+        let empty_sha256 = hex::encode(Sha256::digest([]));
+        (
+            0,
+            false,
+            true,
+            true,
+            None,
+            TokenSnapshot::default(),
+            session_prefix_generation(collector_epoch, &candidate.recorded_source, &empty_sha256),
+        )
+    };
+
+    let mut candidate_totals = totals.clone();
+    let mut candidate_events = Vec::new();
+
+    file.seek(SeekFrom::Start(start_offset))
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    let mut reader = BufReader::new(file);
+    let mut admitted_start_offset = start_offset;
+    if discard_until_lf && discard_session_partial_tail(&mut reader)? {
+        discard_until_lf = false;
+    }
+    if admitted_start_offset != 0 || discard_until_lf {
+        admitted_start_offset = reader
+            .stream_position()
+            .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    }
+    while reader
+        .stream_position()
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?
+        < candidate.fingerprint.length
+    {
+        let line = match security::read_bounded_jsonl_record(&mut reader) {
+            Ok(Some((line, true))) => line,
+            Ok(Some((_line, false))) => return Ok(None),
+            Ok(None) => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    security::SecurityErrorKind::LimitExceeded | security::SecurityErrorKind::Parse
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let value = match serde_json::from_str::<Value>(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(None);
+            }
+        };
+        if session_event_type(&value) != Some("thread_settings_applied") || model.is_none() {
+            if let Some(next_model) = session_event_model(&value) {
+                model = Some(next_model);
+            }
+        }
+        let Some(current) = session_token_snapshot(&value) else {
+            continue;
+        };
+        if !baseline_known
+            || current.total < previous.total
+            || current.input < previous.input
+            || current.cached_input < previous.cached_input
+            || current.output < previous.output
+        {
+            previous = current;
+            baseline_known = true;
+            continue;
+        }
+        let delta = TokenSnapshot {
+            total: current.total - previous.total,
+            input: current.input - previous.input,
+            cached_input: current.cached_input - previous.cached_input,
+            output: current.output - previous.output,
+        };
+        previous = current;
+        let timestamp = session_event_timestamp(&value);
+        if timestamp < window_start {
+            continue;
+        }
+        if let Some(model) = model.as_deref() {
+            candidate_totals.add(model, delta);
+            if timestamp <= timeline_end {
+                candidate_events.push(TimedModelUsage {
+                    timestamp,
+                    model: model.to_owned(),
+                    delta,
+                });
+            }
+        }
+    }
+    let end_offset = reader
+        .stream_position()
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    let record_sha256 = (end_offset > admitted_start_offset)
+        .then(|| sha256_file_range(reader.get_mut(), admitted_start_offset, end_offset))
+        .transpose()?;
+    let prefix_sha256 = sha256_file_range(reader.get_mut(), 0, end_offset)?;
+    let after_file = reader
+        .get_ref()
+        .metadata()
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    let after_path = fs::symlink_metadata(path)
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    let after_fingerprint = local_input_file_fingerprint(path, &after_path)?;
+    if !same_rollout_identity(&before_file, &after_file)
+        || after_fingerprint != candidate.fingerprint
+        || end_offset != candidate.fingerprint.length
+    {
+        return Ok(None);
+    }
+
+    *totals = candidate_totals;
+    events.extend(candidate_events);
+
+    let checkpoint = usage_store::SessionCheckpoint {
+        root_identity: candidate.recorded_source.root_identity.clone(),
+        relative_path: candidate.recorded_source.relative_path.clone(),
+        file_device: candidate.recorded_source.file_device,
+        file_inode: candidate.recorded_source.file_inode,
+        committed_offset: end_offset,
+        discard_until_lf,
+        collector_epoch,
+        cycle_seq,
+        prefix_generation,
+        prefix_sha256,
+        fully_attributed_from_zero: fully_attributed,
+        token_baseline_known: baseline_known,
+        last_model: model,
+        previous_total: previous.total,
+        previous_input: previous.input,
+        previous_cached_input: previous.cached_input,
+        previous_output: previous.output,
+    };
+    let range = (end_offset > admitted_start_offset).then(|| usage_store::SessionRange {
+        root_identity: checkpoint.root_identity.clone(),
+        relative_path: checkpoint.relative_path.clone(),
+        file_device: checkpoint.file_device,
+        file_inode: checkpoint.file_inode,
+        start_offset: admitted_start_offset,
+        end_offset,
+        collector_epoch,
+        cycle_seq,
+        prefix_generation,
+        record_sha256: record_sha256.expect("non-empty range has a digest"),
+    });
+    let marker = (checkpoint.fully_attributed_from_zero
+        && !checkpoint.discard_until_lf
+        && checkpoint.committed_offset == candidate.recorded_source.file_bytes)
+        .then(|| candidate.recorded_source.clone());
+    Ok(Some(SessionAppendResult {
+        checkpoint,
+        range,
+        marker,
+    }))
+}
+
+#[derive(Clone, Copy)]
+struct IncrementalSessionContext {
+    reset_at: i64,
+    window_seconds: i64,
+    baseline_existing: bool,
+    collector_epoch: u128,
+    cycle_seq: u64,
+}
+
+fn collect_incremental_local_usage(
+    inventory: &LocalInputInventory,
+    collection_state: &usage_store::SessionCollectionState,
+    previous_inventory: &BTreeSet<SessionInventoryKey>,
+    context: IncrementalSessionContext,
+) -> Result<LocalUsageCollection, security::SecurityError> {
+    let IncrementalSessionContext {
+        reset_at,
+        window_seconds,
+        baseline_existing,
+        collector_epoch,
+        cycle_seq,
+    } = context;
+    let mut totals = if collection_state.reset_at == reset_at
+        && collection_state.window_seconds == window_seconds
+    {
+        ModelUsageTotals::from_session_totals(&collection_state.model_totals)
+    } else {
+        ModelUsageTotals::default()
+    };
+    let initial_totals = totals.clone();
+    let mut checkpoints_by_path = BTreeMap::new();
+    let mut checkpoints_by_identity = BTreeMap::new();
+    for checkpoint in &collection_state.checkpoints {
+        let path_key = (
+            checkpoint.root_identity.as_str(),
+            checkpoint.relative_path.as_str(),
+        );
+        checkpoints_by_path.entry(path_key).or_insert(checkpoint);
+        let identity_key = (
+            checkpoint.root_identity.as_str(),
+            checkpoint.relative_path.as_str(),
+            checkpoint.file_device,
+            checkpoint.file_inode,
+        );
+        checkpoints_by_identity
+            .entry(identity_key)
+            .and_modify(|current: &mut &usage_store::SessionCheckpoint| {
+                let current_rank = (
+                    current.collector_epoch == collector_epoch,
+                    current.cycle_seq,
+                );
+                let candidate_rank = (
+                    checkpoint.collector_epoch == collector_epoch,
+                    checkpoint.cycle_seq,
+                );
+                if candidate_rank > current_rank {
+                    *current = checkpoint;
+                }
+            })
+            .or_insert(checkpoint);
+    }
+    let window_start = reset_at.saturating_sub(window_seconds.max(0));
+    let timeline_end = Utc::now().timestamp().min(reset_at);
+    let mut events = Vec::new();
+    let mut next_checkpoints = Vec::new();
+    let mut ranges = Vec::new();
+    let mut markers = Vec::new();
+    for candidate in &inventory.selected_session_files {
+        let inventory_key = session_inventory_key(candidate);
+        let seen_in_previous_inventory = previous_inventory.contains(&inventory_key);
+        let key = (
+            candidate.recorded_source.root_identity.as_str(),
+            candidate.recorded_source.relative_path.as_str(),
+        );
+        let identity_key = (
+            key.0,
+            key.1,
+            candidate.recorded_source.file_device,
+            candidate.recorded_source.file_inode,
+        );
+        let prior = checkpoints_by_identity
+            .get(&identity_key)
+            .or_else(|| checkpoints_by_path.get(&key))
+            .copied();
+        let Some(result) = collect_session_append(
+            candidate,
+            prior,
+            SessionAppendContext {
+                baseline_existing: baseline_existing || seen_in_previous_inventory,
+                allow_prior_continuity: !baseline_existing && seen_in_previous_inventory,
+                collector_epoch,
+                cycle_seq,
+                window_start,
+                timeline_end,
+            },
+            &mut totals,
+            &mut events,
+        )?
+        else {
+            continue;
+        };
+        next_checkpoints.push(result.checkpoint);
+        if let Some(range) = result.range {
+            ranges.push(range);
+        }
+        if let Some(marker) = result.marker {
+            markers.push(marker);
+        }
+    }
+    if baseline_existing && next_checkpoints.len() != inventory.selected_session_files.len() {
+        return Err(security::SecurityError::new(
+            security::SecurityErrorKind::UnsafePath,
+        ));
+    }
+    Ok(LocalUsageCollection {
+        model_usage: totals.clone(),
+        history_samples: model_usage_timeline_from_events_with_initial(
+            events,
+            reset_at,
+            initial_totals,
+        ),
+        recorded_sessions: markers,
+        session_checkpoints: next_checkpoints,
+        session_ranges: ranges,
+        session_model_totals: totals.to_session_totals(),
+        cleanup_plan: cleanup_plan_for_inventory(inventory),
+    })
+}
+
 #[cfg(test)]
 fn collect_session_usage_file(
     path: &Path,
@@ -4866,6 +5495,7 @@ fn collect_session_usage_file(
     .map(|_| ())
 }
 
+#[cfg(test)]
 fn collect_session_usage_file_with_recordability(
     path: &Path,
     window_start: i64,
@@ -5109,14 +5739,21 @@ fn account_server_worker(commands: Receiver<AccountCommand>, events: Sender<Even
         return;
     };
     let output = rpc_reader(stdout);
-    if let Err(e) = request(
+    let mut account_updates = AccountUpdateTracker::default();
+    if let Err(error) = request_tracked(
         &mut input,
         &output,
+        &mut account_updates,
         1,
         "initialize",
         json!({"clientInfo":{"name":"codex-info","version":"0.3.0"},"capabilities":{"experimentalApi":true}}),
     ) {
-        let _ = events.send(Event::Error(e));
+        let event = if account_updates.valid {
+            Event::Error(error)
+        } else {
+            Event::IdentityError(error)
+        };
+        let _ = events.send(event);
         return;
     }
     let _ = events.send(Event::Ready);
@@ -5129,9 +5766,10 @@ fn account_server_worker(commands: Receiver<AccountCommand>, events: Sender<Even
                 break;
             }
             AccountCommand::Login => {
-                match request(
+                match request_tracked(
                     &mut input,
                     &output,
+                    &mut account_updates,
                     id,
                     "account/login/start",
                     json!({"type":"chatgpt"}),
@@ -5155,162 +5793,256 @@ fn account_server_worker(commands: Receiver<AccountCommand>, events: Sender<Even
                         }
                     }
                     Err(e) => {
-                        let _ = events.send(Event::Error(e));
+                        let event = if account_updates.valid {
+                            Event::Error(e)
+                        } else {
+                            Event::IdentityError(e)
+                        };
+                        let _ = events.send(event);
                     }
                 }
-                id += 1;
+                let Some(next_id) = id.checked_add(1) else {
+                    let _ = events.send(Event::IdentityError(
+                        "Codex APIの要求IDが上限に達しました。".into(),
+                    ));
+                    break;
+                };
+                id = next_id;
             }
             AccountCommand::Read => {
                 debug_runtime("account read requested");
-                let account = request(&mut input, &output, id, "account/read", json!({}));
-                id += 1;
+                let generation_before = account_updates.generation;
+                let key_before = account_scope::read_account_key(&default_codex_root());
+                let account = request_tracked(
+                    &mut input,
+                    &output,
+                    &mut account_updates,
+                    id,
+                    "account/read",
+                    json!({}),
+                );
+                let Some(next_id) = id.checked_add(1) else {
+                    let _ = events.send(Event::IdentityError(
+                        "Codex APIの要求IDが上限に達しました。".into(),
+                    ));
+                    break;
+                };
+                id = next_id;
                 match account {
                     Ok(result) => {
-                        let (email, authenticated, plan_type) =
-                            match protocol_contract::decode_account(&result) {
-                                Ok(protocol_contract::AccountOutcome::Supported {
-                                    email,
-                                    plan_type,
-                                }) => (Some(email), true, Some(plan_type.as_str().to_owned())),
-                                Ok(protocol_contract::AccountOutcome::AuthRequired)
-                                | Ok(protocol_contract::AccountOutcome::UnsupportedNoData) => {
-                                    (None, false, None)
-                                }
-                                Err(_) => {
-                                    let _ = events.send(Event::Error(
-                                        "アカウントの正本データを取得できませんでした。".into(),
+                        let decoded = protocol_contract::decode_account(&result);
+                        match decoded {
+                            Ok(protocol_contract::AccountOutcome::AuthRequired)
+                            | Ok(protocol_contract::AccountOutcome::UnsupportedNoData) => {
+                                let key_after =
+                                    account_scope::read_account_key(&default_codex_root());
+                                if generation_before != account_updates.generation
+                                    || key_before.is_ok()
+                                    || key_after.is_ok()
+                                {
+                                    let _ = events.send(Event::IdentityError(
+                                        "未認証境界でアカウントauthorityが一致しませんでした。"
+                                            .into(),
                                     ));
                                     continue;
                                 }
-                            };
-                        let _ = events.send(Event::Account {
-                            email: email.clone(),
-                            authenticated,
-                            plan_type: plan_type.clone(),
-                        });
-                        debug_runtime(format!("account read authenticated={authenticated}"));
-                        if authenticated {
-                            let rate_request_id = id;
-                            id = id.saturating_add(1);
-                            match request(
-                                &mut input,
-                                &output,
-                                rate_request_id,
-                                "account/rateLimits/read",
-                                Value::Null,
-                            ) {
-                                Ok(rate) => {
-                                    match parse_rate_limits(
-                                        &rate,
-                                        plan_type.as_deref(),
-                                        Utc::now().timestamp(),
-                                    ) {
-                                        Ok(snapshot) => {
-                                            let RateLimitSnapshot {
-                                                remaining_percent,
-                                                reset_at,
-                                                window_seconds,
-                                                limit_name,
-                                                quota_title,
-                                                monthly,
-                                            } = snapshot;
-                                            let recheck_id = id;
-                                            let Some(next_id) = id.checked_add(1) else {
-                                                let _ = events.send(Event::Error(
-                                                    "Codex APIの要求IDが上限に達しました。".into(),
-                                                ));
-                                                continue;
-                                            };
-                                            id = next_id;
-                                            let recheck = request(
-                                                &mut input,
-                                                &output,
-                                                recheck_id,
-                                                "account/read",
-                                                json!({}),
-                                            );
-                                            let identity_is_current = match recheck {
-                                                Ok(result) => {
-                                                    match protocol_contract::decode_account(&result)
-                                                    {
-                                                        Ok(protocol_contract::AccountOutcome::Supported {
-                                                            email: current_email,
-                                                            plan_type: current_plan,
-                                                        }) => {
-                                                            let current_plan = current_plan
-                                                                .as_str()
-                                                                .to_owned();
-                                                            if email.as_deref()
-                                                                == Some(current_email.as_str())
-                                                                && plan_type.as_deref()
-                                                                    == Some(current_plan.as_str())
-                                                            {
-                                                                true
-                                                            } else {
-                                                                let _ = events.send(Event::Account {
-                                                                    email: Some(current_email),
-                                                                    authenticated: true,
-                                                                    plan_type: Some(current_plan),
-                                                                });
-                                                                false
-                                                            }
-                                                        }
-                                                        Ok(protocol_contract::AccountOutcome::AuthRequired)
-                                                        | Ok(protocol_contract::AccountOutcome::UnsupportedNoData) => {
-                                                            let _ = events.send(Event::Account {
-                                                                email: None,
-                                                                authenticated: false,
-                                                                plan_type: None,
-                                                            });
-                                                            false
-                                                        }
-                                                        Err(_) => {
-                                                            let _ = events.send(Event::Error(
-                                                                "アカウントの再確認に失敗しました。"
-                                                                    .into(),
-                                                            ));
-                                                            false
-                                                        }
-                                                    }
-                                                }
-                                                Err(error) => {
-                                                    let _ = events.send(Event::Error(error));
-                                                    false
-                                                }
-                                            };
-                                            if !identity_is_current {
-                                                continue;
-                                            }
-                                            let _ =
-                                                events.send(Event::Usage(Box::new(UsageEvent {
-                                                    remaining_percent,
-                                                    reset_at,
-                                                    window_seconds,
-                                                    limit_name,
-                                                    quota_title,
-                                                    monthly,
-                                                })));
-                                            debug_runtime(format!(
-                                                "usage received reset_at={reset_at} window_seconds={window_seconds}"
-                                            ));
-                                        }
-                                        Err(()) => {
-                                            let _ = events.send(Event::Error(
-                                                "利用枠の正本データを取得できませんでした。".into(),
-                                            ));
-                                        }
+                                let _ = events.send(Event::Account {
+                                    email: None,
+                                    authenticated: false,
+                                    plan_type: None,
+                                    account_key: None,
+                                    account_update_generation: account_updates.generation,
+                                });
+                            }
+                            Ok(protocol_contract::AccountOutcome::Supported {
+                                email,
+                                plan_type,
+                            }) => {
+                                let Ok(account_key) = key_before else {
+                                    let _ = events.send(Event::IdentityError(
+                                        "認証済みアカウントの保存authorityを確認できませんでした。"
+                                            .into(),
+                                    ));
+                                    continue;
+                                };
+                                let plan_wire = plan_type.as_str().to_owned();
+                                let rate = request_tracked(
+                                    &mut input,
+                                    &output,
+                                    &mut account_updates,
+                                    id,
+                                    "account/rateLimits/read",
+                                    Value::Null,
+                                );
+                                let Some(next_id) = id.checked_add(1) else {
+                                    let _ = events.send(Event::IdentityError(
+                                        "Codex APIの要求IDが上限に達しました。".into(),
+                                    ));
+                                    break;
+                                };
+                                id = next_id;
+                                let rate = match rate {
+                                    Ok(rate) => rate,
+                                    Err(error) => {
+                                        let event = if account_updates.valid {
+                                            Event::Error(error)
+                                        } else {
+                                            Event::IdentityError(error)
+                                        };
+                                        let _ = events.send(event);
+                                        continue;
                                     }
+                                };
+                                let snapshot = match parse_rate_limits(
+                                    &rate,
+                                    Some(plan_wire.as_str()),
+                                    Utc::now().timestamp(),
+                                ) {
+                                    Ok(snapshot) => snapshot,
+                                    Err(()) => {
+                                        let _ = events.send(Event::Error(
+                                            "利用枠の正本データを取得できませんでした。".into(),
+                                        ));
+                                        continue;
+                                    }
+                                };
+                                let recheck = request_tracked(
+                                    &mut input,
+                                    &output,
+                                    &mut account_updates,
+                                    id,
+                                    "account/read",
+                                    json!({}),
+                                );
+                                let Some(next_id) = id.checked_add(1) else {
+                                    let _ = events.send(Event::IdentityError(
+                                        "Codex APIの要求IDが上限に達しました。".into(),
+                                    ));
+                                    break;
+                                };
+                                id = next_id;
+                                let identity_matches = recheck
+                                    .ok()
+                                    .and_then(|value| {
+                                        protocol_contract::decode_account(&value).ok()
+                                    })
+                                    .is_some_and(|outcome| {
+                                        matches!(
+                                            outcome,
+                                            protocol_contract::AccountOutcome::Supported {
+                                                email: current_email,
+                                                plan_type: current_plan,
+                                            } if current_email == email && current_plan == plan_type
+                                        )
+                                    });
+                                let key_after =
+                                    account_scope::read_account_key(&default_codex_root());
+                                if !account_updates.valid
+                                    || generation_before != account_updates.generation
+                                    || !identity_matches
+                                    || !key_after
+                                        .as_ref()
+                                        .is_ok_and(|current| current.same_account(&account_key))
+                                {
+                                    let _ = events.send(Event::IdentityError(
+                                        "アカウント確認中にidentityが変更されました。".into(),
+                                    ));
+                                    continue;
                                 }
-                                Err(e) => {
-                                    let _ = events.send(Event::Error(e));
-                                }
+                                let RateLimitSnapshot {
+                                    remaining_percent,
+                                    reset_at,
+                                    window_seconds,
+                                    limit_name,
+                                    quota_title,
+                                    monthly,
+                                } = snapshot;
+                                let _ = events.send(Event::Account {
+                                    email: Some(email),
+                                    authenticated: true,
+                                    plan_type: Some(plan_wire),
+                                    account_key: Some(account_key.clone()),
+                                    account_update_generation: generation_before,
+                                });
+                                let _ = events.send(Event::Usage(Box::new(UsageEvent {
+                                    account_key,
+                                    account_update_generation: generation_before,
+                                    remaining_percent,
+                                    reset_at,
+                                    window_seconds,
+                                    limit_name,
+                                    quota_title,
+                                    monthly,
+                                })));
+                                debug_runtime(format!(
+                                    "usage received reset_at={reset_at} window_seconds={window_seconds}"
+                                ));
+                            }
+                            Err(_) => {
+                                let _ = events.send(Event::Error(
+                                    "アカウントの正本データを取得できませんでした。".into(),
+                                ));
                             }
                         }
                     }
                     Err(e) => {
-                        let _ = events.send(Event::Error(e));
+                        let event = if account_updates.valid {
+                            Event::Error(e)
+                        } else {
+                            Event::IdentityError(e)
+                        };
+                        let _ = events.send(event);
                     }
                 }
+            }
+            AccountCommand::Verify {
+                admission,
+                account_key,
+            } => {
+                let generation_before = account_updates.generation;
+                let key_before = account_scope::read_account_key(&default_codex_root());
+                let result = request_tracked(
+                    &mut input,
+                    &output,
+                    &mut account_updates,
+                    id,
+                    "account/read",
+                    json!({}),
+                );
+                let Some(next_id) = id.checked_add(1) else {
+                    let _ = events.send(Event::IdentityError(
+                        "Codex APIの要求IDが上限に達しました。".into(),
+                    ));
+                    break;
+                };
+                id = next_id;
+                let authenticated = match result {
+                    Ok(value) => matches!(
+                        protocol_contract::decode_account(&value),
+                        Ok(protocol_contract::AccountOutcome::Supported { .. })
+                    ),
+                    Err(error) => {
+                        let event = if account_updates.valid {
+                            Event::Error(error)
+                        } else {
+                            Event::IdentityError(error)
+                        };
+                        let _ = events.send(event);
+                        continue;
+                    }
+                };
+                let key_after = account_scope::read_account_key(&default_codex_root());
+                let valid = authenticated
+                    && account_updates.valid
+                    && generation_before == admission.account_update_generation
+                    && account_updates.generation == admission.account_update_generation
+                    && key_before
+                        .as_ref()
+                        .is_ok_and(|current| current.same_account(&account_key))
+                    && key_after
+                        .as_ref()
+                        .is_ok_and(|current| current.same_account(&account_key));
+                let _ = events.send(Event::Verified { admission, valid });
             }
         }
     }
@@ -5371,11 +6103,15 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                 }
                 break;
             }
-            ThreadCommand::Read { auth_epoch } => {
+            ThreadCommand::Read {
+                auth_epoch,
+                admission,
+            } => {
                 debug_runtime(format!("thread read requested epoch={auth_epoch}"));
                 let Some(codex_root) = codex_home_root() else {
                     let _ = events.send(ThreadEvent::Error {
                         auth_epoch,
+                        admission: admission.clone(),
                         message: "スレッド情報を安全に取得できませんでした。".into(),
                     });
                     continue;
@@ -5386,6 +6122,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                         debug_runtime("thread active path scan failed");
                         let _ = events.send(ThreadEvent::Error {
                             auth_epoch,
+                            admission: admission.clone(),
                             message: "スレッド情報を安全に取得できませんでした。".into(),
                         });
                         continue;
@@ -5399,6 +6136,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                     next_id = 2;
                     let _ = events.send(ThreadEvent::Update {
                         auth_epoch,
+                        admission,
                         update: ActiveThreadUpdate::NoThread,
                     });
                     continue;
@@ -5427,6 +6165,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                         Err(message) => {
                             let _ = events.send(ThreadEvent::Error {
                                 auth_epoch,
+                                admission: admission.clone(),
                                 message,
                             });
                             continue;
@@ -5448,6 +6187,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                     debug_runtime("thread read failed");
                     let _ = events.send(ThreadEvent::Error {
                         auth_epoch,
+                        admission,
                         message: "スレッド情報を安全に取得できませんでした。".into(),
                     });
                     // A framing, timeout, EOF or protocol-budget failure can
@@ -5466,7 +6206,11 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                         ActiveThreadUpdate::NoThread => "thread snapshot rows=0".to_owned(),
                         ActiveThreadUpdate::Failed => "thread snapshot failed".to_owned(),
                     });
-                    let _ = events.send(ThreadEvent::Update { auth_epoch, update });
+                    let _ = events.send(ThreadEvent::Update {
+                        auth_epoch,
+                        admission,
+                        update,
+                    });
                 }
             }
         }
@@ -5475,12 +6219,89 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
 
 #[derive(Default)]
 struct LocalUsageCache {
-    period: Option<(i64, i64)>,
-    fingerprint: Option<LocalInputFingerprint>,
-    model_usage: ModelUsageTotals,
+    partitioned_collector_epoch: Option<u128>,
+    verified_session_inventory: BTreeSet<SessionInventoryKey>,
+    #[cfg(test)]
+    legacy_period: Option<(i64, i64)>,
+    #[cfg(test)]
+    legacy_fingerprint: Option<LocalInputFingerprint>,
+    #[cfg(test)]
+    legacy_model_usage: ModelUsageTotals,
+}
+
+struct PartitionedLocalCollection {
+    reset_at: i64,
+    window_seconds: i64,
+    inventory: LocalInputInventory,
+    collection_state: usage_store::SessionCollectionState,
+    collector_epoch: u128,
+    cycle_seq: u64,
 }
 
 impl LocalUsageCache {
+    fn collect_partitioned(
+        &mut self,
+        request: PartitionedLocalCollection,
+    ) -> Result<LocalUsageCollection, security::SecurityError> {
+        let PartitionedLocalCollection {
+            reset_at,
+            window_seconds,
+            inventory,
+            collection_state,
+            collector_epoch,
+            cycle_seq,
+        } = request;
+        let baseline_existing = collection_state.collector_epoch != Some(collector_epoch);
+        let previous_inventory = if self.partitioned_collector_epoch == Some(collector_epoch) {
+            self.verified_session_inventory.clone()
+        } else {
+            BTreeSet::new()
+        };
+        let after = local_input_inventory()?;
+        if inventory.sessions_root != after.sessions_root {
+            return Err(security::SecurityError::new(
+                security::SecurityErrorKind::UnsafePath,
+            ));
+        }
+        let inventories_match = inventory.fingerprint == after.fingerprint
+            && inventory.overflow_session_files == after.overflow_session_files;
+        let verified_files = after.selected_session_files.clone();
+        let verified_inventory = LocalInputInventory {
+            selected_session_files: verified_files.clone(),
+            overflow_session_files: if inventories_match {
+                inventory.overflow_session_files.clone()
+            } else {
+                Vec::new()
+            },
+            sessions_root: inventory.sessions_root.clone(),
+            recovery_path: None,
+            fingerprint: LocalInputFingerprint {
+                session_files: verified_files
+                    .iter()
+                    .map(|candidate| candidate.fingerprint.clone())
+                    .collect(),
+                recovery_file: None,
+            },
+        };
+        let current_inventory = session_inventory_keys(&verified_inventory);
+        let collection = collect_incremental_local_usage(
+            &verified_inventory,
+            &collection_state,
+            &previous_inventory,
+            IncrementalSessionContext {
+                reset_at,
+                window_seconds,
+                baseline_existing,
+                collector_epoch,
+                cycle_seq,
+            },
+        )?;
+        self.partitioned_collector_epoch = Some(collector_epoch);
+        self.verified_session_inventory = current_inventory;
+        Ok(collection)
+    }
+
+    #[cfg(test)]
     fn collect(
         &mut self,
         reset_at: i64,
@@ -5488,20 +6309,19 @@ impl LocalUsageCache {
         inventory: LocalInputInventory,
     ) -> Result<LocalUsageCollection, security::SecurityError> {
         let cleanup_plan = cleanup_plan_for_inventory(&inventory);
-        if self.period == Some((reset_at, window_seconds))
-            && self.fingerprint.as_ref() == Some(&inventory.fingerprint)
+        if self.legacy_period == Some((reset_at, window_seconds))
+            && self.legacy_fingerprint.as_ref() == Some(&inventory.fingerprint)
         {
-            debug_runtime("local inputs unchanged; full session scan skipped");
             return Ok(LocalUsageCollection {
-                model_usage: self.model_usage.clone(),
+                model_usage: self.legacy_model_usage.clone(),
                 cleanup_plan,
                 ..LocalUsageCollection::default()
             });
         }
         let collection = collect_local_usage_snapshot(reset_at, window_seconds, &inventory)?;
-        self.period = Some((reset_at, window_seconds));
-        self.fingerprint = Some(inventory.fingerprint);
-        self.model_usage = collection.model_usage.clone();
+        self.legacy_period = Some((reset_at, window_seconds));
+        self.legacy_fingerprint = Some(inventory.fingerprint);
+        self.legacy_model_usage = collection.model_usage.clone();
         Ok(collection)
     }
 }
@@ -5509,19 +6329,56 @@ impl LocalUsageCache {
 fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEvent>) {
     debug_runtime("local usage worker starting");
     let mut cache = LocalUsageCache::default();
+    let mut active_boundary: Option<(u64, AccountAdmission)> = None;
+    let mut collector_epoch = 0_u128;
+    let mut cycle_seq = 0u64;
     while let Ok(command) = commands.recv() {
         match command {
             LocalCommand::Stop => break,
             LocalCommand::Collect {
                 auth_epoch,
+                admission,
+                collection_state,
                 reset_at,
                 window_seconds,
             } => {
                 debug_runtime(format!(
                     "local collect requested epoch={auth_epoch} reset_at={reset_at} window_seconds={window_seconds}"
                 ));
-                let result = local_input_inventory()
-                    .and_then(|inventory| cache.collect(reset_at, window_seconds, inventory));
+                let boundary = (auth_epoch, admission.clone());
+                if active_boundary.as_ref() != Some(&boundary) {
+                    let mut epoch_bytes = [0_u8; 16];
+                    if getrandom::fill(&mut epoch_bytes).is_err() {
+                        let _ = events.send(LocalEvent::Error {
+                            auth_epoch,
+                            reset_at,
+                            window_seconds,
+                        });
+                        continue;
+                    }
+                    collector_epoch = u128::from_be_bytes(epoch_bytes).max(1);
+                    cycle_seq = 0;
+                    active_boundary = Some(boundary);
+                }
+                let Some(next_cycle) = cycle_seq.checked_add(1) else {
+                    let _ = events.send(LocalEvent::Error {
+                        auth_epoch,
+                        reset_at,
+                        window_seconds,
+                    });
+                    break;
+                };
+                cycle_seq = next_cycle;
+                let result = local_input_inventory().and_then(|inventory| {
+                    cache.collect_partitioned(PartitionedLocalCollection {
+                        reset_at,
+                        window_seconds,
+                        inventory,
+                        collection_state: *collection_state,
+                        collector_epoch,
+                        cycle_seq,
+                    })
+                });
                 match result {
                     Ok(collection) => {
                         debug_runtime(format!(
@@ -5529,15 +6386,23 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                             collection.model_usage.clone().rows().len(),
                             collection.history_samples.len()
                         ));
-                        let _ = events.send(LocalEvent::Usage(LocalUsageResult {
-                            auth_epoch,
-                            reset_at,
-                            window_seconds,
-                            model_usage: collection.model_usage,
-                            history_samples: collection.history_samples,
-                            recorded_sessions: collection.recorded_sessions,
-                            cleanup_plan: collection.cleanup_plan,
-                        }));
+                        let _ = events.send(LocalEvent::Usage(Box::new(LocalUsageCandidate {
+                            result: LocalUsageResult {
+                                auth_epoch,
+                                reset_at,
+                                window_seconds,
+                                model_usage: collection.model_usage,
+                                history_samples: collection.history_samples,
+                                recorded_sessions: collection.recorded_sessions,
+                                cleanup_plan: collection.cleanup_plan,
+                            },
+                            admission,
+                            collector_epoch,
+                            cycle_seq,
+                            session_checkpoints: collection.session_checkpoints,
+                            session_ranges: collection.session_ranges,
+                            session_model_totals: collection.session_model_totals,
+                        })));
                     }
                     Err(_) => {
                         debug_runtime("local collect failed");
@@ -5560,16 +6425,80 @@ fn request(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
-    request_with_timeout(
+    request_with_timeout_observed(
         input,
         output,
         id,
         method,
         params,
         security::RPC_RESPONSE_TIMEOUT,
+        None,
     )
 }
 
+#[derive(Debug)]
+struct AccountUpdateTracker {
+    generation: u64,
+    valid: bool,
+}
+
+impl Default for AccountUpdateTracker {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            valid: true,
+        }
+    }
+}
+
+impl AccountUpdateTracker {
+    fn observe(&mut self, value: &Value, raw: &str) -> Result<bool, String> {
+        if !value.is_object() {
+            return Ok(false);
+        }
+        let is_account_updated = protocol_contract::is_account_updated_notification_json(raw)
+            .map_err(|_| {
+                self.valid = false;
+                "Codexのアカウント更新通知を安全に確認できませんでした。".to_owned()
+            })?;
+        if !is_account_updated {
+            return Ok(false);
+        }
+        if !self.valid
+            || protocol_contract::validate_account_updated_notification_json(raw).is_err()
+        {
+            self.valid = false;
+            return Err("Codexのアカウント更新通知を安全に確認できませんでした。".into());
+        }
+        let Some(next) = self.generation.checked_add(1) else {
+            self.valid = false;
+            return Err("Codexのアカウント更新世代が上限に達しました。".into());
+        };
+        self.generation = next;
+        Ok(true)
+    }
+}
+
+fn request_tracked(
+    input: &mut impl Write,
+    output: &Receiver<RpcReadEvent>,
+    tracker: &mut AccountUpdateTracker,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    request_with_timeout_observed(
+        input,
+        output,
+        id,
+        method,
+        params,
+        security::RPC_RESPONSE_TIMEOUT,
+        Some(tracker),
+    )
+}
+
+#[cfg(test)]
 fn request_with_timeout(
     input: &mut impl Write,
     output: &Receiver<RpcReadEvent>,
@@ -5577,6 +6506,18 @@ fn request_with_timeout(
     method: &str,
     params: Value,
     timeout: Duration,
+) -> Result<Value, String> {
+    request_with_timeout_observed(input, output, id, method, params, timeout, None)
+}
+
+fn request_with_timeout_observed(
+    input: &mut impl Write,
+    output: &Receiver<RpcReadEvent>,
+    id: u64,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+    mut account_updates: Option<&mut AccountUpdateTracker>,
 ) -> Result<Value, String> {
     let message = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
     writeln!(input, "{message}")
@@ -5612,6 +6553,11 @@ fn request_with_timeout(
                 continue;
             }
         };
+        if let Some(tracker) = account_updates.as_deref_mut() {
+            if tracker.observe(&value, line.as_str())? {
+                continue;
+            }
+        }
         if value.get("id").and_then(Value::as_u64) != Some(id) {
             limits
                 .record_ignored_message(&mut ignored)
@@ -5627,16 +6573,30 @@ fn request_with_timeout(
 
 #[derive(Clone, Debug, Default)]
 struct PendingRecorderBatch {
+    auth_epoch: Option<u64>,
+    admission: Option<AccountAdmission>,
+    partition_id: Option<String>,
+    collector_epoch: Option<u128>,
+    cycle_seq: Option<u64>,
     samples: Vec<usage_store::UsageHistorySample>,
     recorded_sessions: Vec<usage_store::RecordedSessionSource>,
+    session_checkpoints: Vec<usage_store::SessionCheckpoint>,
+    session_ranges: Vec<usage_store::SessionRange>,
+    session_model_totals: Vec<usage_store::SessionModelTotal>,
+    reset_at: Option<i64>,
+    window_seconds: Option<i64>,
     cleanup_plans: Vec<SessionCleanupPlan>,
 }
 
 impl PendingRecorderBatch {
-    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.samples.is_empty()
             && self.recorded_sessions.is_empty()
+            && self.session_checkpoints.is_empty()
+            && self.session_ranges.is_empty()
+            && self.session_model_totals.is_empty()
+            && self.collector_epoch.is_none()
+            && self.cycle_seq.is_none()
             && self.cleanup_plans.is_empty()
     }
 }
@@ -5647,6 +6607,10 @@ struct CodexInfoState {
     thread_bridge: Option<AppServerBridge<ThreadCommand, ThreadEvent>>,
     local_bridge: LocalUsageBridge,
     auth_epoch: u64,
+    auth_epoch_valid: bool,
+    account_key: Option<account_scope::AccountKey>,
+    account_update_generation: u64,
+    account_partition: Option<account_scope::AccountPartition>,
     email: Option<String>,
     authenticated: bool,
     plan_label: String,
@@ -5670,6 +6634,12 @@ struct CodexInfoState {
     estimated_cost_label: String,
     history: UsageHistory,
     pending_recorded_sessions: Vec<usage_store::RecordedSessionSource>,
+    pending_session_checkpoints: Vec<usage_store::SessionCheckpoint>,
+    pending_session_ranges: Vec<usage_store::SessionRange>,
+    pending_session_model_totals: Vec<usage_store::SessionModelTotal>,
+    pending_collector_generation: Option<(u128, u64)>,
+    pending_session_period: Option<(i64, i64)>,
+    pending_recorder_admission: Option<(u64, AccountAdmission)>,
     pending_session_cleanup: Vec<SessionCleanupPlan>,
     selected_reset_at: Option<i64>,
     selected_history_period: String,
@@ -5685,6 +6655,7 @@ struct CodexInfoState {
     /// commits; after that, the last committed snapshot remains visible while
     /// a periodic refresh is pending.
     local_usage_pending: bool,
+    pending_local_verification: Option<LocalUsageCandidate>,
     /// A completed snapshot remains visible while a later quota-only refresh
     /// collects the next local payload. This is cleared only with account
     /// identity, never at each periodic refresh or reset timestamp update.
@@ -5748,10 +6719,26 @@ impl CodexInfoState {
         &self,
         now: i64,
     ) -> Result<PublicDetails, HistoryCanonicalizationError> {
+        // A same-identity transport or refresh failure retains the last
+        // complete values even while the state reports that error. Identity
+        // authority failures clear authenticated state before projection.
         let visible_usage = self.authenticated && self.has_visible_usage();
+        let state = if self.error.is_some() || self.account_error.is_some() {
+            PublicState::Error
+        } else if !self.authenticated {
+            if self.checking {
+                PublicState::Initializing
+            } else {
+                PublicState::AuthRequired
+            }
+        } else if visible_usage {
+            PublicState::Ready
+        } else {
+            PublicState::Initializing
+        };
         let observed_at = visible_usage
             .then_some(())
-            .and_then(|_| self.last_success_at)
+            .and(self.last_success_at)
             .filter(|timestamp| *timestamp > 0);
         let effective_observed_at = observed_at.unwrap_or(now);
         let history_cutoff = DateTime::<Utc>::from_timestamp(effective_observed_at, 0)
@@ -5875,19 +6862,6 @@ impl CodexInfoState {
         if !self.authenticated {
             threads.clear();
         }
-        let state = if self.error.is_some() || self.account_error.is_some() {
-            PublicState::Error
-        } else if !self.authenticated {
-            if self.checking {
-                PublicState::Initializing
-            } else {
-                PublicState::AuthRequired
-            }
-        } else if self.has_visible_usage() {
-            PublicState::Ready
-        } else {
-            PublicState::Initializing
-        };
         let quota = self
             .has_quota_percent
             .then_some(())
@@ -5902,10 +6876,9 @@ impl CodexInfoState {
         Ok(PublicDetails {
             state,
             observed_at,
-            authenticated: self.authenticated,
-            plan_label: self
-                .authenticated
-                .then(|| self.plan_label.trim())
+            authenticated: visible_usage,
+            plan_label: visible_usage
+                .then_some(self.plan_label.trim())
                 .filter(|label| !label.is_empty())
                 .map(str::to_owned),
             quota,
@@ -5922,7 +6895,11 @@ impl CodexInfoState {
             // inferring gaps from missing local samples.
             history_gaps: Vec::new(),
             threads,
-            estimated_cost_label: self.estimated_cost_label.clone(),
+            estimated_cost_label: if visible_usage {
+                self.estimated_cost_label.clone()
+            } else {
+                "概算 —".into()
+            },
         })
     }
 
@@ -5950,14 +6927,16 @@ impl CodexInfoState {
         let resident_now = Instant::now();
         let bridge = AppServerBridge::<AccountCommand, Event>::start();
         bridge.send(AccountCommand::Read);
-        let history = UsageHistory::load();
-        let recovery_period = history.latest_period_hint();
         Self {
             i18n,
             bridge,
             thread_bridge: None,
             local_bridge: LocalUsageBridge::start(),
             auth_epoch: 0,
+            auth_epoch_valid: true,
+            account_key: None,
+            account_update_generation: 0,
+            account_partition: None,
             email: None,
             authenticated: false,
             plan_label: String::new(),
@@ -5979,8 +6958,14 @@ impl CodexInfoState {
             model_usage: Vec::new(),
             active_threads: Vec::new(),
             estimated_cost_label: "概算 —".into(),
-            history,
+            history: UsageHistory::default(),
             pending_recorded_sessions: Vec::new(),
+            pending_session_checkpoints: Vec::new(),
+            pending_session_ranges: Vec::new(),
+            pending_session_model_totals: Vec::new(),
+            pending_collector_generation: None,
+            pending_session_period: None,
+            pending_recorder_admission: None,
             pending_session_cleanup: Vec::new(),
             selected_reset_at: None,
             selected_history_period: "履歴なし".into(),
@@ -5992,9 +6977,10 @@ impl CodexInfoState {
             local_usage_error: false,
             recorder_store_error: false,
             local_usage_pending: false,
+            pending_local_verification: None,
             usage_snapshot_committed: false,
             last_thread_poll: resident_now,
-            recovery_period,
+            recovery_period: None,
             last_local_poll: resident_now
                 .checked_sub(daemon::daemon_interval_from_environment())
                 .unwrap_or(resident_now),
@@ -6014,6 +7000,10 @@ impl CodexInfoState {
             thread_bridge: None,
             local_bridge: LocalUsageBridge::inactive(),
             auth_epoch: 0,
+            auth_epoch_valid: true,
+            account_key: None,
+            account_update_generation: 0,
+            account_partition: None,
             email: None,
             authenticated: false,
             plan_label: String::new(),
@@ -6037,6 +7027,12 @@ impl CodexInfoState {
             estimated_cost_label: "概算 —".into(),
             history: UsageHistory::default(),
             pending_recorded_sessions: Vec::new(),
+            pending_session_checkpoints: Vec::new(),
+            pending_session_ranges: Vec::new(),
+            pending_session_model_totals: Vec::new(),
+            pending_collector_generation: None,
+            pending_session_period: None,
+            pending_recorder_admission: None,
             pending_session_cleanup: Vec::new(),
             selected_reset_at: None,
             selected_history_period: "履歴なし".into(),
@@ -6048,6 +7044,7 @@ impl CodexInfoState {
             local_usage_error: false,
             recorder_store_error: false,
             local_usage_pending: false,
+            pending_local_verification: None,
             usage_snapshot_committed: false,
             last_thread_poll: Instant::now(),
             recovery_period: None,
@@ -6068,12 +7065,19 @@ impl CodexInfoState {
             preview_model_row("LUNA", 155_294_770, 100_000_000, 40_000_000, 15_294_770),
         ];
         let preview_costs = ModelDollarTotals::from_rows(&model_usage);
+        let preview_account_key = account_scope::AccountKey::synthetic_preview("preview-account");
+        let preview_partition =
+            account_scope::AccountPartition::synthetic_preview(&preview_account_key);
         let mut state = Self {
             i18n,
             bridge,
             thread_bridge: None,
             local_bridge: LocalUsageBridge::inactive(),
             auth_epoch: 0,
+            auth_epoch_valid: true,
+            account_key: Some(preview_account_key),
+            account_update_generation: 1,
+            account_partition: Some(preview_partition),
             email: Some("preview@example.com".into()),
             authenticated: true,
             plan_label: "Pro".into(),
@@ -6094,6 +7098,12 @@ impl CodexInfoState {
             window_seconds: WEEK_SECONDS,
             history: UsageHistory::preview(now, reset_at, preview_costs),
             pending_recorded_sessions: Vec::new(),
+            pending_session_checkpoints: Vec::new(),
+            pending_session_ranges: Vec::new(),
+            pending_session_model_totals: Vec::new(),
+            pending_collector_generation: None,
+            pending_session_period: None,
+            pending_recorder_admission: None,
             pending_session_cleanup: Vec::new(),
             model_usage,
             active_threads: vec![ActiveThread {
@@ -6122,6 +7132,7 @@ impl CodexInfoState {
             local_usage_error: false,
             recorder_store_error: false,
             local_usage_pending: false,
+            pending_local_verification: None,
             // Preview is one complete in-memory generation. Individual
             // startup fixtures clear this bit when they intentionally model
             // an incomplete first collection.
@@ -6560,9 +7571,14 @@ impl CodexInfoState {
                     self.auth_polling = false;
                     self.status = error;
                 }
+                Event::IdentityError(error) => {
+                    self.auth_polling = false;
+                    self.status = error;
+                }
                 // Account/quota reads belong to the resident service. The UI
                 // control bridge must never mutate the visible root with them.
-                Event::Ready | Event::Account { .. } | Event::Usage(_) => {}
+                Event::Ready | Event::Account { .. } | Event::Usage(_) | Event::Verified { .. } => {
+                }
             }
         }
     }
@@ -6704,15 +7720,36 @@ impl CodexInfoState {
 
     fn hold_service_endpoint_error(&mut self, error: String) {
         if self.service_endpoint_error.is_none() {
-            self.advance_auth_epoch();
+            if !self.advance_auth_epoch() {
+                return;
+            }
             self.thread_checking = false;
         }
         self.service_endpoint_error = Some(error);
         self.checking = false;
     }
 
-    fn advance_auth_epoch(&mut self) {
-        self.auth_epoch = self.auth_epoch.saturating_add(1);
+    fn advance_auth_epoch(&mut self) -> bool {
+        if !self.auth_epoch_valid {
+            return false;
+        }
+        let Some(next) = self.auth_epoch.checked_add(1) else {
+            self.enter_auth_epoch_recovery();
+            return false;
+        };
+        self.auth_epoch = next;
+        true
+    }
+
+    fn enter_auth_epoch_recovery(&mut self) {
+        self.auth_epoch_valid = false;
+        self.stop_thread_bridge();
+        self.clear_account_visible_fields();
+        self.checking = false;
+        let error = "認証境界の世代が上限に達しました。プロセスの再起動による復旧が必要です。";
+        self.account_error = Some(error.into());
+        self.error = Some(error.into());
+        self.status = error.into();
     }
 
     fn stop_thread_bridge(&mut self) {
@@ -6731,21 +7768,25 @@ impl CodexInfoState {
         if self.preview || !self.authenticated {
             return;
         }
+        let Some(admission) = self.current_account_admission() else {
+            return;
+        };
         self.ensure_thread_bridge();
         let command = ThreadCommand::Read {
             auth_epoch: self.auth_epoch,
+            admission,
         };
         let sent = self
             .thread_bridge
             .as_ref()
-            .is_some_and(|bridge| bridge.send(command));
+            .is_some_and(|bridge| bridge.send(command.clone()));
         if !sent {
             self.thread_bridge = Some(AppServerBridge::<ThreadCommand, ThreadEvent>::start());
         }
         if self
             .thread_bridge
             .as_ref()
-            .is_some_and(|bridge| sent || bridge.send(command))
+            .is_some_and(|bridge| sent || bridge.send(command.clone()))
         {
             self.thread_checking = true;
             self.last_thread_poll = Instant::now();
@@ -6761,12 +7802,46 @@ impl CodexInfoState {
         if self.preview || reset_at <= 0 || self.local_usage_pending {
             return false;
         }
+        let Some(admission) = self.current_account_admission() else {
+            return false;
+        };
+        let Some(partition) = self.account_partition.as_ref() else {
+            return false;
+        };
+        let collection_state = match fs::symlink_metadata(&partition.database_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                usage_store::SessionCollectionState::default()
+            }
+            Ok(_) => {
+                let identity = partition.storage_identity();
+                let state =
+                    UsageStore::open_read_only_partitioned(&partition.database_path, &identity)
+                        .and_then(|store| store.load_session_collection_state());
+                match state {
+                    Ok(state) => state,
+                    Err(_) => {
+                        self.apply_identity_error(
+                            "Session checkpointのaccount partitionを確認できませんでした。".into(),
+                        );
+                        return false;
+                    }
+                }
+            }
+            Err(_) => {
+                self.apply_identity_error(
+                    "Session checkpoint DBを安全に確認できませんでした。".into(),
+                );
+                return false;
+            }
+        };
         let command = LocalCommand::Collect {
             auth_epoch: self.auth_epoch,
+            admission,
+            collection_state: Box::new(collection_state),
             reset_at,
             window_seconds,
         };
-        if !self.local_bridge.send(command) {
+        if !self.local_bridge.send(command.clone()) {
             self.local_bridge = LocalUsageBridge::start();
             if !self.local_bridge.send(command) {
                 self.apply_local_usage_error(self.auth_epoch, reset_at, window_seconds);
@@ -6778,28 +7853,87 @@ impl CodexInfoState {
     }
 
     fn take_pending_recorder_batch(&mut self) -> PendingRecorderBatch {
+        let period = self.pending_session_period.take();
+        let collector = self.pending_collector_generation.take();
+        let recorder_admission = self.pending_recorder_admission.take();
         PendingRecorderBatch {
+            auth_epoch: recorder_admission.as_ref().map(|value| value.0),
+            admission: recorder_admission.as_ref().map(|value| value.1.clone()),
+            partition_id: recorder_admission.map(|value| value.1.partition_id),
+            collector_epoch: collector.map(|value| value.0),
+            cycle_seq: collector.map(|value| value.1),
             samples: self.history.take_pending_store_samples(),
             recorded_sessions: std::mem::take(&mut self.pending_recorded_sessions),
+            session_checkpoints: std::mem::take(&mut self.pending_session_checkpoints),
+            session_ranges: std::mem::take(&mut self.pending_session_ranges),
+            session_model_totals: std::mem::take(&mut self.pending_session_model_totals),
+            reset_at: period.map(|value| value.0),
+            window_seconds: period.map(|value| value.1),
             cleanup_plans: std::mem::take(&mut self.pending_session_cleanup),
         }
     }
 
     fn restore_pending_recorder_batch(&mut self, mut batch: PendingRecorderBatch) {
+        let current_admission = self.current_account_admission();
+        if batch.auth_epoch != Some(self.auth_epoch)
+            || batch.admission.as_ref() != current_admission.as_ref()
+            || batch.partition_id.as_deref()
+                != current_admission
+                    .as_ref()
+                    .map(|admission| admission.partition_id.as_str())
+        {
+            return;
+        }
+        self.pending_recorder_admission = batch.auth_epoch.zip(batch.admission.take());
         self.history.restore_pending_store_samples(batch.samples);
         batch
             .recorded_sessions
             .append(&mut self.pending_recorded_sessions);
         self.pending_recorded_sessions = batch.recorded_sessions;
         batch
+            .session_checkpoints
+            .append(&mut self.pending_session_checkpoints);
+        self.pending_session_checkpoints = batch.session_checkpoints;
+        batch
+            .session_ranges
+            .append(&mut self.pending_session_ranges);
+        self.pending_session_ranges = batch.session_ranges;
+        if !batch.session_model_totals.is_empty() {
+            self.pending_session_model_totals = batch.session_model_totals;
+        }
+        self.pending_collector_generation = batch.collector_epoch.zip(batch.cycle_seq);
+        self.pending_session_period = batch.reset_at.zip(batch.window_seconds);
+        batch
             .cleanup_plans
             .append(&mut self.pending_session_cleanup);
         self.pending_session_cleanup = batch.cleanup_plans;
     }
 
-    fn clear_account_visible_state(&mut self) {
-        self.advance_auth_epoch();
+    fn discard_pending_recorder_batch(&mut self) {
+        let _ = self.history.take_pending_store_samples();
+        self.pending_recorded_sessions.clear();
+        self.pending_session_checkpoints.clear();
+        self.pending_session_ranges.clear();
+        self.pending_session_model_totals.clear();
+        self.pending_collector_generation = None;
+        self.pending_session_period = None;
+        self.pending_recorder_admission = None;
+        self.pending_session_cleanup.clear();
+    }
+
+    fn clear_account_visible_state(&mut self) -> bool {
+        if !self.advance_auth_epoch() {
+            return false;
+        }
+        self.clear_account_visible_fields();
+        true
+    }
+
+    fn clear_account_visible_fields(&mut self) {
         self.stop_thread_bridge();
+        self.account_key = None;
+        self.account_update_generation = 0;
+        self.account_partition = None;
         self.email = None;
         self.authenticated = false;
         self.plan_label.clear();
@@ -6823,12 +7957,30 @@ impl CodexInfoState {
         self.local_usage_error = false;
         self.recorder_store_error = false;
         self.local_usage_pending = false;
+        self.pending_local_verification = None;
         self.usage_snapshot_committed = false;
         self.history = UsageHistory::default();
         self.pending_recorded_sessions.clear();
+        self.pending_session_checkpoints.clear();
+        self.pending_session_ranges.clear();
+        self.pending_session_model_totals.clear();
+        self.pending_collector_generation = None;
+        self.pending_session_period = None;
+        self.pending_recorder_admission = None;
         self.pending_session_cleanup.clear();
         self.selected_reset_at = None;
         self.selected_history_period = "履歴なし".into();
+    }
+
+    fn current_account_admission(&self) -> Option<AccountAdmission> {
+        let partition = self.account_partition.as_ref()?;
+        (self.auth_epoch_valid && self.authenticated).then(|| AccountAdmission {
+            account_update_generation: self.account_update_generation,
+            profile_scope_id: partition.profile_scope_id.clone(),
+            account_scope_id: partition.account_scope_id.clone(),
+            storage_epoch: partition.storage_epoch,
+            partition_id: partition.partition_id.clone(),
+        })
     }
 
     fn admit_active_thread_update(&mut self, update: ActiveThreadUpdate) -> bool {
@@ -6874,7 +8026,12 @@ impl CodexInfoState {
     }
 
     fn apply_usage_event(&mut self, event: UsageEvent) {
+        if !self.auth_epoch_valid {
+            return;
+        }
         let UsageEvent {
+            account_key,
+            account_update_generation,
             remaining_percent,
             reset_at,
             window_seconds,
@@ -6882,6 +8039,15 @@ impl CodexInfoState {
             quota_title,
             monthly,
         } = event;
+        if account_update_generation != self.account_update_generation
+            || !self
+                .account_key
+                .as_ref()
+                .is_some_and(|current| current.same_account(&account_key))
+        {
+            self.apply_identity_error("利用枠取得中にアカウントidentityが変更されました。".into());
+            return;
+        }
         let previous_reset_at = self.reset_at;
         let now = Utc::now().timestamp();
         let reset_changed = reset_transition_is_boundary(
@@ -6899,12 +8065,6 @@ impl CodexInfoState {
         self.reset_at = (reset_at > 0).then_some(reset_at);
         self.window_seconds = window_seconds;
         self.recovery_period = (reset_at > 0).then_some((reset_at, window_seconds));
-        if !self.preview && reset_at > 0 {
-            // The resident collector persists this bounded period so that its
-            // same single lane can continue local history collection during
-            // an app-server outage. It never reconstructs quota from logs.
-            let _ = daemon::persist_reset_hint(reset_at, window_seconds);
-        }
         self.limit_name = limit_name;
         self.quota_title = quota_title;
         self.monthly = monthly;
@@ -6950,9 +8110,15 @@ impl CodexInfoState {
         // thread/local channels, so invalidate their epoch without clearing
         // the last valid visible values. Let the thread scheduler issue a
         // fresh request instead of remaining stuck behind the stale one.
-        self.advance_auth_epoch();
+        if !self.advance_auth_epoch() {
+            return;
+        }
+        self.discard_pending_recorder_batch();
         self.thread_checking = false;
         self.checking = false;
+        if self.pending_local_verification.take().is_some() {
+            self.local_usage_pending = false;
+        }
         // If the local lane is already running, the epoch change makes that
         // exact result stale. Keep the lane occupied until its terminal event
         // arrives; otherwise a second full session scan could be queued.
@@ -6964,6 +8130,123 @@ impl CodexInfoState {
         // interval. Error handling only records the failed account boundary.
     }
 
+    fn apply_identity_error(&mut self, error: String) {
+        if !self.clear_account_visible_state() {
+            return;
+        }
+        self.checking = false;
+        self.account_error = Some(error.clone());
+        self.error = Some(error);
+        self.status = "アカウントidentityまたは保存先を安全に確認できませんでした。".into();
+    }
+
+    fn apply_confirmed_account_event(
+        &mut self,
+        email: Option<String>,
+        authenticated: bool,
+        plan_type: Option<String>,
+        account_key: Option<account_scope::AccountKey>,
+        account_update_generation: u64,
+    ) {
+        if !self.auth_epoch_valid {
+            return;
+        }
+        if !authenticated {
+            if !self.clear_account_visible_state() {
+                return;
+            }
+            self.account_update_generation = account_update_generation;
+            self.checking = false;
+            self.status = "未認証です。認証を開始してください。".into();
+            self.auth_polling = false;
+            return;
+        }
+        let Some(account_key) = account_key else {
+            self.apply_identity_error("認証済みアカウントのidentityがありません。".into());
+            return;
+        };
+        let Some(data_root) = usage_data_root() else {
+            self.apply_identity_error("アカウント別保存rootを準備できませんでした。".into());
+            return;
+        };
+        let partition = match account_scope::resolve_partition(&data_root, &account_key) {
+            Ok(partition) => partition,
+            Err(_) => {
+                self.apply_identity_error(
+                    "アカウント別保存先のauthorityを確認できませんでした。".into(),
+                );
+                return;
+            }
+        };
+        self.apply_resolved_confirmed_account_event(
+            email,
+            plan_type,
+            account_key,
+            account_update_generation,
+            partition,
+        );
+    }
+
+    fn apply_resolved_confirmed_account_event(
+        &mut self,
+        email: Option<String>,
+        plan_type: Option<String>,
+        account_key: account_scope::AccountKey,
+        account_update_generation: u64,
+        partition: account_scope::AccountPartition,
+    ) {
+        if !self.auth_epoch_valid {
+            return;
+        }
+        let was_authenticated = self.authenticated;
+        let next_plan_label = plan_type_label(plan_type.as_deref());
+        let account_changed = self.authenticated
+            && (!self
+                .account_key
+                .as_ref()
+                .is_some_and(|current| current.same_account(&account_key))
+                || self
+                    .account_partition
+                    .as_ref()
+                    .is_none_or(|current| current.partition_id != partition.partition_id));
+        let entering_authenticated = !was_authenticated;
+        let generation_changed =
+            self.authenticated && self.account_update_generation != account_update_generation;
+        if account_changed || entering_authenticated {
+            if !self.clear_account_visible_state() {
+                return;
+            }
+            self.history = UsageHistory::load_from_partition(&partition);
+        } else if generation_changed {
+            if !self.advance_auth_epoch() {
+                return;
+            }
+            self.pending_local_verification = None;
+            self.discard_pending_recorder_batch();
+        }
+        self.account_key = Some(account_key);
+        self.account_update_generation = account_update_generation;
+        self.account_partition = Some(partition);
+        self.email = email;
+        self.authenticated = true;
+        self.plan_label = next_plan_label;
+        self.checking = true;
+        self.auth_polling = false;
+        self.auth_url = None;
+        self.account_error = None;
+        self.error = None;
+        self.status = "認証済みです。利用量を取得しています…".into();
+        if entering_authenticated
+            || account_changed
+            || generation_changed
+            || self.thread_bridge.is_none()
+        {
+            self.ensure_thread_bridge();
+            self.request_thread_update();
+        }
+    }
+
+    #[cfg(test)]
     fn apply_account_event(
         &mut self,
         email: Option<String>,
@@ -6977,15 +8260,18 @@ impl CodexInfoState {
             && (self.email != email || self.plan_label != next_plan_label);
         let entering_authenticated = !was_authenticated && authenticated;
         if !authenticated || account_changed {
-            self.clear_account_visible_state();
-        } else if entering_authenticated {
-            // No auxiliary request is admitted before authentication, so an
-            // epoch change is enough. Keep the durable history loaded at
-            // startup, or reload it after an unauthenticated clear.
-            self.advance_auth_epoch();
-            if self.history.samples.is_empty() {
-                self.history = UsageHistory::load();
+            if !self.clear_account_visible_state() {
+                return;
             }
+        } else if entering_authenticated && !self.advance_auth_epoch() {
+            return;
+        }
+        if authenticated {
+            let key_value = email.as_deref().unwrap_or("test-account");
+            let key = account_scope::AccountKey::synthetic_preview(key_value);
+            self.account_partition = Some(account_scope::AccountPartition::synthetic_preview(&key));
+            self.account_key = Some(key);
+            self.account_update_generation = 1;
         }
         self.email = email;
         self.authenticated = authenticated;
@@ -7000,6 +8286,8 @@ impl CodexInfoState {
         }
         if authenticated {
             self.auth_url = None;
+            self.ensure_thread_bridge();
+            self.request_thread_update();
         }
         self.status = if authenticated {
             "認証済みです。利用量を取得しています…"
@@ -7007,12 +8295,6 @@ impl CodexInfoState {
             "未認証です。認証を開始してください。"
         }
         .into();
-        if authenticated
-            && (entering_authenticated || account_changed || self.thread_bridge.is_none())
-        {
-            self.ensure_thread_bridge();
-            self.request_thread_update();
-        }
     }
 
     fn current_local_period_matches(&self, reset_at: i64, window_seconds: i64) -> bool {
@@ -7028,9 +8310,8 @@ impl CodexInfoState {
     }
 
     fn apply_local_usage_success(&mut self, result: LocalUsageResult) {
-        let period_matches = self.recovery_period == Some((result.reset_at, result.window_seconds));
-        let unauthenticated_recovery = !self.authenticated && period_matches;
-        if result.auth_epoch != self.auth_epoch
+        if !self.auth_epoch_valid
+            || result.auth_epoch != self.auth_epoch
             || !self.current_local_period_matches(result.reset_at, result.window_seconds)
         {
             debug_runtime(format!(
@@ -7045,16 +8326,16 @@ impl CodexInfoState {
             self.local_usage_pending = false;
             return;
         }
+        if self.pending_recorder_admission.is_none() {
+            self.pending_recorder_admission = self
+                .current_account_admission()
+                .map(|admission| (result.auth_epoch, admission));
+        }
         let model_costs = result.model_usage.dollar_totals();
         let model_tokens = result.model_usage.token_totals();
         let history_sample_count = result.history_samples.len();
         self.local_usage_error = false;
         self.local_usage_pending = false;
-        if unauthenticated_recovery && self.history.db_path.is_none() {
-            // Reattach the durable store only at the recovery commit boundary;
-            // an unauthenticated clear still keeps all visible history empty.
-            self.history = UsageHistory::load();
-        }
         if self.authenticated {
             self.model_usage = result.model_usage.rows();
             self.estimated_cost_label = format_estimated_cost(model_costs);
@@ -7092,8 +8373,63 @@ impl CodexInfoState {
         ));
     }
 
+    fn request_local_usage_verification(&mut self, candidate: LocalUsageCandidate) {
+        let admission_matches =
+            self.current_account_admission().as_ref() == Some(&candidate.admission);
+        if candidate.result.auth_epoch != self.auth_epoch || !admission_matches {
+            self.local_usage_pending = false;
+            return;
+        }
+        let Some(account_key) = self.account_key.clone() else {
+            self.apply_identity_error("Session確認時のアカウントidentityがありません。".into());
+            return;
+        };
+        let command = AccountCommand::Verify {
+            admission: candidate.admission.clone(),
+            account_key,
+        };
+        if !self.bridge.send(command) {
+            self.local_usage_pending = false;
+            self.apply_account_error(
+                "Session集計後のアカウント再確認を開始できませんでした。".into(),
+            );
+            return;
+        }
+        self.pending_local_verification = Some(candidate);
+    }
+
+    fn apply_account_verification(&mut self, admission: AccountAdmission, valid: bool) {
+        let Some(candidate) = self.pending_local_verification.take() else {
+            return;
+        };
+        if candidate.admission != admission
+            || self.current_account_admission().as_ref() != Some(&admission)
+            || candidate.result.auth_epoch != self.auth_epoch
+            || !self.current_local_period_matches(
+                candidate.result.reset_at,
+                candidate.result.window_seconds,
+            )
+        {
+            self.local_usage_pending = false;
+            return;
+        }
+        if !valid {
+            self.apply_identity_error("Session集計後にアカウントidentityが変更されました。".into());
+            return;
+        }
+        self.pending_session_checkpoints = candidate.session_checkpoints;
+        self.pending_session_ranges = candidate.session_ranges;
+        self.pending_session_model_totals = candidate.session_model_totals;
+        self.pending_collector_generation = Some((candidate.collector_epoch, candidate.cycle_seq));
+        self.pending_session_period =
+            Some((candidate.result.reset_at, candidate.result.window_seconds));
+        self.pending_recorder_admission = Some((candidate.result.auth_epoch, admission));
+        self.apply_local_usage_success(candidate.result);
+    }
+
     fn apply_local_usage_error(&mut self, auth_epoch: u64, reset_at: i64, window_seconds: i64) {
-        if auth_epoch != self.auth_epoch
+        if !self.auth_epoch_valid
+            || auth_epoch != self.auth_epoch
             || !self.current_local_period_matches(reset_at, window_seconds)
         {
             self.local_usage_pending = false;
@@ -7117,10 +8453,22 @@ impl CodexInfoState {
         }
     }
 
-    fn apply_thread_result(&mut self, auth_epoch: u64, update: ActiveThreadUpdate) {
-        if !self.authenticated || auth_epoch != self.auth_epoch {
+    fn apply_thread_result_for_admission(
+        &mut self,
+        auth_epoch: u64,
+        admission: AccountAdmission,
+        update: ActiveThreadUpdate,
+    ) {
+        if !self.authenticated
+            || auth_epoch != self.auth_epoch
+            || self.current_account_admission().as_ref() != Some(&admission)
+        {
             return;
         }
+        self.apply_admitted_thread_result(update);
+    }
+
+    fn apply_admitted_thread_result(&mut self, update: ActiveThreadUpdate) {
         let failed = self.apply_active_thread_update(update);
         self.thread_checking = false;
         self.thread_error = failed;
@@ -7132,8 +8480,24 @@ impl CodexInfoState {
         self.refresh_partial_failure_status();
     }
 
-    fn apply_thread_error(&mut self, auth_epoch: u64, message: String) {
+    #[cfg(test)]
+    fn apply_thread_result(&mut self, auth_epoch: u64, update: ActiveThreadUpdate) {
         if !self.authenticated || auth_epoch != self.auth_epoch {
+            return;
+        }
+        self.apply_admitted_thread_result(update);
+    }
+
+    fn apply_thread_error_for_admission(
+        &mut self,
+        auth_epoch: u64,
+        admission: &AccountAdmission,
+        message: String,
+    ) {
+        if !self.authenticated
+            || auth_epoch != self.auth_epoch
+            || self.current_account_admission().as_ref() != Some(admission)
+        {
             return;
         }
         self.thread_checking = false;
@@ -7142,6 +8506,13 @@ impl CodexInfoState {
         self.thread_error = true;
         let _ = message;
         self.refresh_partial_failure_status();
+    }
+
+    fn apply_thread_error(&mut self, auth_epoch: u64, message: String) {
+        let Some(admission) = self.current_account_admission() else {
+            return;
+        };
+        self.apply_thread_error_for_admission(auth_epoch, &admission, message);
     }
 
     fn refresh_partial_failure_status(&mut self) {
@@ -7198,7 +8569,15 @@ impl CodexInfoState {
                     email,
                     authenticated,
                     plan_type,
-                } => self.apply_account_event(email, authenticated, plan_type),
+                    account_key,
+                    account_update_generation,
+                } => self.apply_confirmed_account_event(
+                    email,
+                    authenticated,
+                    plan_type,
+                    account_key,
+                    account_update_generation,
+                ),
                 Event::AuthUrl(url) => {
                     self.auth_url = Some(url);
                     self.checking = false;
@@ -7209,6 +8588,13 @@ impl CodexInfoState {
                         "認証URLを発行しました。「認証ページを開く」を押してください。".into();
                 }
                 Event::Usage(event) => self.apply_usage_event(*event),
+                Event::Verified { admission, valid } => {
+                    self.apply_account_verification(admission, valid)
+                }
+                Event::IdentityError(error) => {
+                    self.apply_identity_error(error);
+                    return true;
+                }
                 Event::Error(error) => {
                     self.apply_account_error(error);
                     return true;
@@ -7244,13 +8630,18 @@ impl CodexInfoState {
         for event in thread_events {
             match event {
                 ThreadEvent::Ready => {}
-                ThreadEvent::Update { auth_epoch, update } => {
-                    self.apply_thread_result(auth_epoch, update);
+                ThreadEvent::Update {
+                    auth_epoch,
+                    admission,
+                    update,
+                } => {
+                    self.apply_thread_result_for_admission(auth_epoch, admission, update);
                 }
                 ThreadEvent::Error {
                     auth_epoch,
+                    admission,
                     message,
-                } => self.apply_thread_error(auth_epoch, message),
+                } => self.apply_thread_error_for_admission(auth_epoch, &admission, message),
             }
         }
 
@@ -7260,7 +8651,7 @@ impl CodexInfoState {
         }
         for event in local_events {
             match event {
-                LocalEvent::Usage(result) => self.apply_local_usage_success(result),
+                LocalEvent::Usage(result) => self.request_local_usage_verification(*result),
                 LocalEvent::Error {
                     auth_epoch,
                     reset_at,
@@ -9503,9 +10894,9 @@ fn service_health_response_version(response: &[u8]) -> Option<ServiceHealthVersi
     if !response.starts_with(b"HTTP/1.1 200 ") {
         return None;
     }
-    let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return None;
-    };
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?;
     let body = &response[header_end + 4..];
     match serde_json::from_slice::<ServiceHealthDocument>(body).ok()? {
         // v1.0.18 and older services used this exact two-key document. It is
@@ -9851,6 +11242,13 @@ where
             Some(error)
         }
     };
+    // A storage/identity failure can be discovered by the writer callback
+    // after the pre-write publication check. Re-apply the hard boundary here
+    // so last-good data from another/unverified partition is never merged
+    // back into the error document.
+    if !state.usage_snapshot_committed {
+        publication.last_complete = None;
+    }
     // A quota response is only the first half of a public generation. Keep
     // the publisher's exact root and generation identity unchanged until the
     // matching local usage/history result reaches a terminal state.
@@ -9898,9 +11296,6 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
         recorder.shutdown();
         return Err(std::io::Error::other(cli_error(CliTextKey::ServiceAlreadyOwned)).into());
     }
-    if let Err(error) = recorder.startup_maintenance(Utc::now()) {
-        eprintln!("codex-info: recorder startup maintenance skipped: {error}");
-    }
     // Bind REST only after this process owns the recorder. Concurrent service
     // children therefore exit before publishing a listener, and an API bind
     // failure drops the worker and releases its exact lock identity.
@@ -9912,6 +11307,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
     let mut publication = ResidentPublicationState::default();
     let mut last_recorder_error = None;
     let mut last_publish_error = None;
+    let mut active_recorder_partition: Option<String> = None;
     eprintln!(
         "codex-info: daemon+REST listening on {} recorder_owner={}",
         api_server.local_addr(),
@@ -9935,38 +11331,152 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                         &mut state,
                         &mut publication,
                         |state, pending| {
+                            let batch_is_empty = pending.is_empty();
                             let PendingRecorderBatch {
+                                auth_epoch,
+                                admission,
+                                partition_id,
+                                collector_epoch,
+                                cycle_seq,
                                 samples,
                                 recorded_sessions,
+                                session_checkpoints,
+                                session_ranges,
+                                session_model_totals,
+                                reset_at,
+                                window_seconds,
                                 cleanup_plans,
                             } = pending;
-                            let has_samples = !samples.is_empty();
-                            recorder.store_generation(samples, recorded_sessions)?;
-                            if has_samples {
-                                if !state.history.refresh_from_store(Utc::now()) {
-                                    return Err("history refresh after recorder commit failed".into());
+                            let current_admission = state.current_account_admission();
+                            if !batch_is_empty
+                                && (auth_epoch != Some(state.auth_epoch)
+                                    || admission.as_ref() != current_admission.as_ref()
+                                    || partition_id.as_deref()
+                                        != current_admission.as_ref().map(|current| {
+                                            current.partition_id.as_str()
+                                        }))
+                            {
+                                state.apply_identity_error(
+                                    "保存batchのアカウント世代が失効しました。".into(),
+                                );
+                                let _ = recorder.deactivate_partition();
+                                active_recorder_partition = None;
+                                return Err("recorder batch admission mismatch".into());
+                            }
+                            let desired_partition = state.account_partition.clone();
+                            let desired_id = desired_partition
+                                .as_ref()
+                                .map(|partition| partition.partition_id.clone());
+                            if desired_id != active_recorder_partition {
+                                let activation = match desired_partition {
+                                    Some(partition) => recorder
+                                        .activate_partition(partition, Utc::now()),
+                                    None => recorder.deactivate_partition(),
+                                };
+                                if let Err(error) = activation {
+                                    let _ = recorder.deactivate_partition();
+                                    active_recorder_partition = None;
+                                    state.apply_identity_error(
+                                        "アカウント別DBを安全に有効化できませんでした。".into(),
+                                    );
+                                    return Err(error);
                                 }
+                                active_recorder_partition = desired_id;
+                            }
+                            let has_samples = !samples.is_empty();
+                            if collector_epoch.is_some()
+                                || cycle_seq.is_some()
+                                || !samples.is_empty()
+                                || !recorded_sessions.is_empty()
+                                || !session_checkpoints.is_empty()
+                                || !session_ranges.is_empty()
+                                || !session_model_totals.is_empty()
+                            {
+                                let Some(batch_partition_id) = partition_id.as_ref() else {
+                                    state.apply_identity_error(
+                                        "保存batchにアカウントpartitionがありません。".into(),
+                                    );
+                                    let _ = recorder.deactivate_partition();
+                                    active_recorder_partition = None;
+                                    return Err("recorder batch has no account partition".into());
+                                };
+                                if active_recorder_partition.as_deref()
+                                    != Some(batch_partition_id.as_str())
+                                {
+                                    state.apply_identity_error(
+                                        "保存batchと有効なアカウントpartitionが一致しません。".into(),
+                                    );
+                                    let _ = recorder.deactivate_partition();
+                                    active_recorder_partition = None;
+                                    return Err("recorder batch account partition mismatch".into());
+                                }
+                                if let Err(error) = recorder.store_generation(
+                                    batch_partition_id.clone(),
+                                    daemon::RecorderGeneration {
+                                        reset_at: reset_at.ok_or_else(|| {
+                                            "recorder batch reset period is missing".to_owned()
+                                        })?,
+                                        window_seconds: window_seconds.ok_or_else(|| {
+                                            "recorder batch window is missing".to_owned()
+                                        })?,
+                                        collector_epoch: collector_epoch.ok_or_else(|| {
+                                            "recorder batch collector epoch is missing".to_owned()
+                                        })?,
+                                        cycle_seq: cycle_seq.ok_or_else(|| {
+                                            "recorder batch cycle sequence is missing".to_owned()
+                                        })?,
+                                        samples,
+                                        recorded_sessions,
+                                        session_checkpoints,
+                                        session_ranges,
+                                        session_model_totals,
+                                    },
+                                ) {
+                                    state.apply_identity_error(
+                                        "アカウント別DBへの記録に失敗しました。".into(),
+                                    );
+                                    let _ = recorder.deactivate_partition();
+                                    active_recorder_partition = None;
+                                    return Err(error);
+                                }
+                            }
+                            if has_samples && !state.history.refresh_from_store(Utc::now()) {
+                                return Err("history refresh after recorder commit failed".into());
                             }
                             for plan in cleanup_plans {
                                 let Some(database) = state.history.db_path.as_deref() else {
                                     debug_runtime("session cleanup retained all files: database unavailable");
                                     continue;
                                 };
-                                let report = cleanup_recorded_session_overflow(
+                                let Some(partition_identity) =
+                                    state.history.partition_identity.as_ref()
+                                else {
+                                    state.apply_identity_error(
+                                        "Session cleanupの保存partitionを確認できませんでした。"
+                                            .into(),
+                                    );
+                                    return Err("cleanup partition identity is missing".into());
+                                };
+                                let report = cleanup_recorded_session_overflow_partitioned(
                                     database,
+                                    partition_identity,
                                     &plan,
                                     Path::new("/proc"),
                                 );
                                 let deleted_count = report.deleted.len();
-                                if deleted_count > 0 {
-                                    if recorder
-                                        .forget_recorded_sessions(report.deleted)
+                                if deleted_count > 0
+                                    && recorder
+                                        .forget_recorded_sessions(
+                                            partition_id.clone().ok_or_else(|| {
+                                                "cleanup partition is missing".to_owned()
+                                            })?,
+                                            report.deleted,
+                                        )
                                         .is_err()
-                                    {
-                                        debug_runtime(format!(
-                                            "session cleanup marker retirement failed deleted={deleted_count}"
-                                        ));
-                                    }
+                                {
+                                    debug_runtime(format!(
+                                        "session cleanup marker retirement failed deleted={deleted_count}"
+                                    ));
                                 }
                                 debug_runtime(format!(
                                     "session cleanup deleted={deleted_count} retained={} database_failed={} process_scan_failed={}",
@@ -10560,11 +12070,11 @@ mod tests {
         visible_window_position, week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer,
         ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow,
         HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint, LocalUsageCache,
-        LocalUsageResult, ManualX11Geometry, ManualX11WindowAction, ModelDollarTotals,
-        ModelTokenTotals, ModelUsageRow, ModelUsageTotals, PublicDetails, RpcReadEvent,
-        ServiceEndpointState, ServiceHealthVersion, SessionFileCandidate, SessionTraversalBudget,
-        TimedModelUsage, TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory,
-        UsageHistorySample, UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT,
+        LocalUsageCandidate, LocalUsageResult, ManualX11Geometry, ManualX11WindowAction,
+        ModelDollarTotals, ModelTokenTotals, ModelUsageRow, ModelUsageTotals, PublicDetails,
+        RpcReadEvent, ServiceEndpointState, ServiceHealthVersion, SessionFileCandidate,
+        SessionTraversalBudget, TimedModelUsage, TokenSnapshot, UnusedIntervalPosition, UsageEvent,
+        UsageHistory, UsageHistorySample, UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT,
         FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
         LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION, THREADS_WINDOW_PURPOSE,
         UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
@@ -11046,6 +12556,19 @@ mod tests {
 
     #[test]
     fn public_snapshot_is_whitelisted_and_tracks_auth_state() {
+        let assert_empty = |details: &codex_info::server::PublicDetails| {
+            assert!(details.observed_at.is_none());
+            assert!(!details.authenticated);
+            assert!(details.plan_label.is_none());
+            assert!(details.quota.is_none());
+            assert!(details.models.is_empty());
+            assert_eq!(details.active_thread_count, 0);
+            assert!(details.history_periods.is_empty());
+            assert!(details.history_samples.is_empty());
+            assert!(details.history_gaps.is_empty());
+            assert!(details.threads.is_empty());
+            assert_eq!(details.estimated_cost_label, "概算 —");
+        };
         let normal = CodexInfoState::preview("normal");
         let snapshot = normal.public_details();
         assert_eq!(snapshot.state, PublicState::Ready);
@@ -11083,21 +12606,18 @@ mod tests {
 
         let auth = CodexInfoState::preview("auth").public_details();
         assert_eq!(auth.state, PublicState::AuthRequired);
-        assert!(!auth.authenticated);
-        assert!(auth.plan_label.is_none());
-        assert!(auth.observed_at.is_none());
-        assert!(auth.quota.is_none());
-        assert!(auth.models.is_empty());
-        assert_eq!(auth.active_thread_count, 0);
+        assert_empty(&auth);
 
         let initializing = CodexInfoState::preview("initializing").public_details();
         assert_eq!(initializing.state, PublicState::Initializing);
-        assert!(!initializing.authenticated);
-        assert!(initializing.plan_label.is_none());
-        assert!(initializing.observed_at.is_none());
-        assert!(initializing.quota.is_none());
-        assert!(initializing.models.is_empty());
-        assert_eq!(initializing.active_thread_count, 0);
+        assert_empty(&initializing);
+
+        let mut identity_error = CodexInfoState::preview("normal");
+        identity_error.preview = false;
+        identity_error.apply_identity_error("identity verification failed".into());
+        let error = identity_error.public_details();
+        assert_eq!(error.state, PublicState::Error);
+        assert_empty(&error);
 
         let startup = CodexInfoState::preview("startup-loading");
         assert!(startup.authenticated);
@@ -11702,6 +13222,8 @@ mod tests {
 
     fn usage_event(remaining_percent: Option<f64>, reset_at: i64) -> UsageEvent {
         UsageEvent {
+            account_key: super::account_scope::AccountKey::synthetic_preview("preview-account"),
+            account_update_generation: 1,
             remaining_percent,
             reset_at,
             window_seconds: 604_800,
@@ -11939,6 +13461,7 @@ mod tests {
         let _ = fs::remove_file(&db_path);
         state.history = UsageHistory {
             db_path: Some(db_path.clone()),
+            partition_identity: None,
             samples: Vec::new(),
             pending_store_samples: Vec::new(),
             startup_maintenance_done: true,
@@ -11957,6 +13480,7 @@ mod tests {
                 auth_epoch: 7,
                 reset_at: actual_reset,
                 window_seconds: WEEK_SECONDS,
+                ..
             }) if actual_reset == reset_at
         ));
         assert!(state.local_usage_pending);
@@ -12117,7 +13641,7 @@ mod tests {
         let current_epoch = state.auth_epoch;
         assert!(matches!(
             thread_commands.try_recv(),
-            Ok(super::ThreadCommand::Read { auth_epoch }) if auth_epoch == current_epoch
+            Ok(super::ThreadCommand::Read { auth_epoch, .. }) if auth_epoch == current_epoch
         ));
     }
 
@@ -12140,7 +13664,7 @@ mod tests {
         state.schedule_resident_refresh(now);
         assert!(matches!(
             thread_commands.try_recv(),
-            Ok(super::ThreadCommand::Read { auth_epoch: 0 })
+            Ok(super::ThreadCommand::Read { auth_epoch: 0, .. })
         ));
         assert!(state.thread_checking);
 
@@ -12153,6 +13677,8 @@ mod tests {
         let mut state = CodexInfoState::preview("normal");
         let mut publication = super::ResidentPublicationState::default();
         state.history.pending_store_samples = vec![state.history.samples[0].to_store()];
+        state.pending_recorder_admission =
+            Some((state.auth_epoch, state.current_account_admission().unwrap()));
         let actions = std::cell::RefCell::new(Vec::new());
         let outcome = super::resident_service_cycle(
             &mut state,
@@ -12190,6 +13716,8 @@ mod tests {
         state.history.pending_store_samples = vec![retained.clone()];
         state.pending_recorded_sessions = vec![retained_marker.clone()];
         state.pending_session_cleanup = vec![retained_cleanup.clone()];
+        state.pending_recorder_admission =
+            Some((state.auth_epoch, state.current_account_admission().unwrap()));
         let last_complete = publication
             .last_complete
             .clone()
@@ -12246,6 +13774,10 @@ mod tests {
         let mut initial = CodexInfoState::preview("normal");
         initial.preview = false;
         initial.history.pending_store_samples = vec![initial.history.samples[0].to_store()];
+        initial.pending_recorder_admission = Some((
+            initial.auth_epoch,
+            initial.current_account_admission().unwrap(),
+        ));
         let mut initial_publication = super::ResidentPublicationState::default();
         let emitted_initial_error = std::cell::RefCell::new(None);
         let result = super::resident_service_cycle(
@@ -12276,6 +13808,140 @@ mod tests {
         assert!(initial_publication.last_complete.is_none());
         assert!(initial.recorder_store_error);
         assert_eq!(initial.history.pending_store_samples.len(), 1);
+    }
+
+    #[test]
+    fn stale_recorder_batch_cannot_be_relabelled_after_an_auth_boundary() {
+        let mut state = CodexInfoState::preview("normal");
+        state.history.pending_store_samples = vec![state.history.samples[0].to_store()];
+        state.pending_recorder_admission =
+            Some((state.auth_epoch, state.current_account_admission().unwrap()));
+        let stale = state.take_pending_recorder_batch();
+        assert!(!stale.is_empty());
+        state.restore_pending_recorder_batch(stale.clone());
+
+        let old_epoch = state.auth_epoch;
+        state.apply_account_error("worker boundary".into());
+        assert_eq!(state.auth_epoch, old_epoch + 1);
+        assert!(state.take_pending_recorder_batch().is_empty());
+
+        state.restore_pending_recorder_batch(stale);
+        assert!(state.take_pending_recorder_batch().is_empty());
+    }
+
+    #[test]
+    fn post_scan_identity_mismatch_discards_rows_cursors_markers_and_publication() {
+        let mut state = CodexInfoState::preview("normal");
+        let admission = state.current_account_admission().unwrap();
+        let auth_epoch = state.auth_epoch;
+        let reset_at = state.reset_at.unwrap();
+        let source = super::usage_store::RecordedSessionSource {
+            root_identity: "unix:10:20".into(),
+            relative_path: "2026/09/post-scan.jsonl".into(),
+            file_bytes: 120,
+            modified_nanos: 1_800_000_000_000_000_000,
+            file_device: 10,
+            file_inode: 40,
+        };
+        let checkpoint = super::usage_store::SessionCheckpoint {
+            root_identity: source.root_identity.clone(),
+            relative_path: source.relative_path.clone(),
+            file_device: source.file_device,
+            file_inode: source.file_inode,
+            committed_offset: source.file_bytes,
+            discard_until_lf: false,
+            collector_epoch: 0x129,
+            cycle_seq: 1,
+            prefix_generation: 0x456,
+            prefix_sha256: "11".repeat(32),
+            fully_attributed_from_zero: true,
+            token_baseline_known: true,
+            last_model: Some("SOL".into()),
+            previous_total: 100,
+            previous_input: 80,
+            previous_cached_input: 20,
+            previous_output: 20,
+        };
+        let range = super::usage_store::SessionRange {
+            root_identity: source.root_identity.clone(),
+            relative_path: source.relative_path.clone(),
+            file_device: source.file_device,
+            file_inode: source.file_inode,
+            start_offset: 0,
+            end_offset: source.file_bytes,
+            collector_epoch: 0x129,
+            cycle_seq: 1,
+            prefix_generation: 0x456,
+            record_sha256: "22".repeat(32),
+        };
+        state.pending_local_verification = Some(LocalUsageCandidate {
+            result: LocalUsageResult {
+                auth_epoch,
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                model_usage: ModelUsageTotals::default(),
+                history_samples: vec![UsageHistorySample::new(
+                    Utc::now().timestamp(),
+                    reset_at,
+                    12.9,
+                    ModelDollarTotals::default(),
+                )],
+                recorded_sessions: vec![source],
+                cleanup_plan: None,
+            },
+            admission: admission.clone(),
+            collector_epoch: 0x129,
+            cycle_seq: 1,
+            session_checkpoints: vec![checkpoint],
+            session_ranges: vec![range],
+            session_model_totals: vec![super::usage_store::SessionModelTotal {
+                model: "SOL".into(),
+                total_tokens: 100,
+                input_tokens: 80,
+                cached_input_tokens: 20,
+                output_tokens: 20,
+            }],
+        });
+        state.local_usage_pending = true;
+
+        state.apply_account_verification(admission, false);
+
+        assert!(state.pending_local_verification.is_none());
+        assert!(state.take_pending_recorder_batch().is_empty());
+        let details = state.public_details();
+        assert_eq!(details.state, PublicState::Error);
+        assert!(details.observed_at.is_none());
+        assert!(!details.authenticated);
+        assert!(details.plan_label.is_none());
+        assert!(details.quota.is_none());
+        assert!(details.models.is_empty());
+        assert_eq!(details.active_thread_count, 0);
+        assert!(details.history_periods.is_empty());
+        assert!(details.history_samples.is_empty());
+        assert!(details.history_gaps.is_empty());
+        assert!(details.threads.is_empty());
+        assert_eq!(details.estimated_cost_label, "概算 —");
+
+        let mut publication = super::ResidentPublicationState::default();
+        let published = std::cell::RefCell::new(None);
+        let outcome = super::resident_service_cycle(
+            &mut state,
+            &mut publication,
+            |_, pending| {
+                assert!(
+                    pending.is_empty(),
+                    "mismatched candidate reached the DB writer"
+                );
+                Ok(())
+            },
+            |candidate| {
+                *published.borrow_mut() = Some(candidate);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, super::ResidentServiceCycleOutcome::Published);
+        assert_eq!(published.into_inner(), Some(details));
     }
 
     #[test]
@@ -12603,6 +14269,7 @@ mod tests {
         state.selected_history_period = "stale selected period".into();
         state.history = UsageHistory {
             db_path: None,
+            partition_identity: None,
             samples: vec![UsageHistorySample::new(
                 OLD_SAMPLE_AT,
                 PREVIOUS_RESET,
@@ -12892,6 +14559,43 @@ mod tests {
         assert_eq!(state.estimated_cost_label, "概算 —");
         assert!(state.history.samples.is_empty());
         assert_eq!(state.selected_history_period, "履歴なし");
+    }
+
+    #[test]
+    fn auth_epoch_overflow_requires_process_recovery_and_cannot_resurrect_usage() {
+        let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
+        state.auth_epoch = u64::MAX;
+
+        state.apply_account_error("worker boundary".into());
+
+        assert!(!state.auth_epoch_valid);
+        assert_eq!(state.auth_epoch, u64::MAX);
+        assert!(!state.authenticated);
+        assert!(state.current_account_admission().is_none());
+        assert!(state.status.contains("再起動"));
+        let details = state.public_details();
+        assert_eq!(details.state, PublicState::Error);
+        assert!(details.observed_at.is_none());
+        assert!(!details.authenticated);
+        assert!(details.plan_label.is_none());
+        assert!(details.quota.is_none());
+        assert!(details.models.is_empty());
+        assert_eq!(details.active_thread_count, 0);
+        assert!(details.history_periods.is_empty());
+        assert!(details.history_samples.is_empty());
+        assert!(details.history_gaps.is_empty());
+        assert!(details.threads.is_empty());
+        assert_eq!(details.estimated_cost_label, "概算 —");
+
+        state.apply_account_event(
+            Some("ignored@example.test".into()),
+            true,
+            Some("pro".into()),
+        );
+        assert!(!state.authenticated);
+        assert!(state.account_key.is_none());
+        assert!(state.current_account_admission().is_none());
     }
 
     #[test]
@@ -13494,7 +15198,10 @@ mod tests {
                 }
             },
         );
-        assert_eq!(report.deleted, [marked.recorded_source.clone()]);
+        assert_eq!(
+            report.deleted,
+            std::slice::from_ref(&marked.recorded_source)
+        );
         assert_eq!(report.retained, 6);
         assert!(!marked.fingerprint.path.exists());
         assert!(sessions.join("unmarked.jsonl").exists());
@@ -14842,6 +16549,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(!error.contains("token-value"));
+    }
+
+    #[test]
+    fn account_update_generation_is_local_strict_and_permanently_invalidated() {
+        let valid_raw = r#"{"jsonrpc":"2.0","method":"account/updated","params":{"authMode":"chatgpt","planType":"pro"}}"#;
+        let valid: Value = serde_json::from_str(valid_raw).unwrap();
+        let mut tracker = super::AccountUpdateTracker::default();
+        assert!(tracker.observe(&valid, valid_raw).unwrap());
+        assert_eq!(tracker.generation, 1);
+
+        let ordinary_raw = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        let ordinary: Value = serde_json::from_str(ordinary_raw).unwrap();
+        assert!(!tracker.observe(&ordinary, ordinary_raw).unwrap());
+        assert_eq!(tracker.generation, 1);
+
+        let malformed_raw =
+            r#"{"jsonrpc":"2.0","method":"account/updated","params":{},"extra":true}"#;
+        let malformed: Value = serde_json::from_str(malformed_raw).unwrap();
+        assert!(tracker.observe(&malformed, malformed_raw).is_err());
+        assert!(!tracker.valid);
+        assert!(tracker.observe(&valid, valid_raw).is_err());
+        assert_eq!(tracker.generation, 1);
+
+        let hidden_raw = r#"{"method":"account/updated","method":"ordinary/event","params":{}}"#;
+        let hidden: Value = serde_json::from_str(hidden_raw).unwrap();
+        let mut hidden_tracker = super::AccountUpdateTracker::default();
+        assert!(hidden_tracker.observe(&hidden, hidden_raw).is_err());
+        assert!(!hidden_tracker.valid);
+
+        let mut overflow = super::AccountUpdateTracker {
+            generation: u64::MAX,
+            valid: true,
+        };
+        assert!(overflow.observe(&valid, valid_raw).is_err());
+        assert!(!overflow.valid);
     }
 
     #[test]
@@ -16195,6 +17937,729 @@ mod tests {
     }
 
     #[test]
+    fn account_boundary_baselines_existing_sessions_and_only_commits_verified_appends() {
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-account-baseline-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let session = root.join("existing.jsonl");
+        let now = Utc::now();
+        let reset_at = now.timestamp() + 3_600;
+        let context = json!({
+            "timestamp": now.to_rfc3339(),
+            "type": "turn_context",
+            "model": "gpt-5.6-sol"
+        });
+        let tokens = |total: u64| {
+            json!({
+                "timestamp": now.to_rfc3339(),
+                "type": "token_count",
+                "payload": {"info": {"total_token_usage": {
+                    "total_tokens": total,
+                    "input_tokens": total,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 0
+                }}}
+            })
+        };
+        fs::write(&session, format!("{context}\n{}\n", tokens(100))).unwrap();
+
+        let boundary_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let boundary = super::collect_incremental_local_usage(
+            &boundary_inventory,
+            &super::usage_store::SessionCollectionState::default(),
+            &BTreeSet::new(),
+            super::IncrementalSessionContext {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: true,
+                collector_epoch: 0x1111,
+                cycle_seq: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(boundary.model_usage.sol.tokens, 0);
+        assert!(boundary.history_samples.is_empty());
+        assert!(boundary.session_ranges.is_empty());
+        assert!(boundary.recorded_sessions.is_empty());
+        assert_eq!(boundary.session_checkpoints.len(), 1);
+        let first_checkpoint = boundary.session_checkpoints[0].clone();
+        assert_eq!(first_checkpoint.collector_epoch, 0x1111);
+        assert_eq!(
+            first_checkpoint.committed_offset,
+            fs::metadata(&session).unwrap().len()
+        );
+        assert!(!first_checkpoint.discard_until_lf);
+        assert!(!first_checkpoint.fully_attributed_from_zero);
+
+        let mut append = fs::OpenOptions::new().append(true).open(&session).unwrap();
+        writeln!(append, "{context}").unwrap();
+        writeln!(append, "{}", tokens(200)).unwrap();
+        writeln!(append, "{}", tokens(260)).unwrap();
+        drop(append);
+        let state = super::usage_store::SessionCollectionState {
+            data_generation: 1,
+            reset_at,
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(0x1111),
+            cycle_seq: 1,
+            checkpoints: vec![first_checkpoint],
+            model_totals: Vec::new(),
+        };
+        let append_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let boundary_inventory_keys = super::session_inventory_keys(&boundary_inventory);
+        let appended = super::collect_incremental_local_usage(
+            &append_inventory,
+            &state,
+            &boundary_inventory_keys,
+            super::IncrementalSessionContext {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: false,
+                collector_epoch: 0x1111,
+                cycle_seq: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(appended.model_usage.sol.tokens, 60);
+        assert_eq!(appended.session_ranges.len(), 1);
+        assert_eq!(appended.session_ranges[0].collector_epoch, 0x1111);
+        assert_eq!(appended.session_ranges[0].record_sha256.len(), 64);
+        assert!(appended.recorded_sessions.is_empty());
+
+        let append_state = super::usage_store::SessionCollectionState {
+            data_generation: 2,
+            reset_at,
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(0x1111),
+            cycle_seq: 2,
+            checkpoints: appended.session_checkpoints,
+            model_totals: appended.session_model_totals,
+        };
+        let fresh = root.join("fresh.jsonl");
+        fs::write(&fresh, format!("{context}\n{}\n", tokens(40))).unwrap();
+        let fresh_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let append_inventory_keys = super::session_inventory_keys(&append_inventory);
+        let fresh_collection = super::collect_incremental_local_usage(
+            &fresh_inventory,
+            &append_state,
+            &append_inventory_keys,
+            super::IncrementalSessionContext {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: false,
+                collector_epoch: 0x1111,
+                cycle_seq: 3,
+            },
+        )
+        .unwrap();
+        assert_eq!(fresh_collection.model_usage.sol.tokens, 100);
+        assert_eq!(fresh_collection.recorded_sessions.len(), 1);
+        assert_eq!(
+            fresh_collection.recorded_sessions[0].relative_path,
+            "fresh.jsonl"
+        );
+
+        let switched_state = super::usage_store::SessionCollectionState {
+            data_generation: 3,
+            reset_at,
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(0x1111),
+            cycle_seq: 3,
+            checkpoints: fresh_collection.session_checkpoints,
+            model_totals: fresh_collection.session_model_totals,
+        };
+        let switched_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let switched_back = super::collect_incremental_local_usage(
+            &switched_inventory,
+            &switched_state,
+            &super::session_inventory_keys(&fresh_inventory),
+            super::IncrementalSessionContext {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: true,
+                collector_epoch: 0x2222,
+                cycle_seq: 1,
+            },
+        )
+        .unwrap();
+        assert!(switched_back.session_ranges.is_empty());
+        assert!(switched_back.recorded_sessions.is_empty());
+        assert!(switched_back
+            .session_checkpoints
+            .iter()
+            .all(|checkpoint| checkpoint.collector_epoch == 0x2222
+                && !checkpoint.fully_attributed_from_zero));
+
+        let partial = root.join("partial.jsonl");
+        fs::write(&partial, b"{\"type\":\"event_msg\"").unwrap();
+        let partial_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let partial_boundary = super::collect_incremental_local_usage(
+            &partial_inventory,
+            &super::usage_store::SessionCollectionState::default(),
+            &BTreeSet::new(),
+            super::IncrementalSessionContext {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: true,
+                collector_epoch: 0x3333,
+                cycle_seq: 1,
+            },
+        )
+        .unwrap();
+        let partial_checkpoint = partial_boundary
+            .session_checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.relative_path == "partial.jsonl")
+            .unwrap();
+        assert!(partial_checkpoint.discard_until_lf);
+        assert!(!partial_boundary
+            .recorded_sessions
+            .iter()
+            .any(|source| source.relative_path == "partial.jsonl"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn seven_account_switch_crash_images_restart_without_old_account_fallback() {
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+        const CRASH_POINTS: [&str; 7] = [
+            "old_admission_closed",
+            "stale_results_discarded",
+            "old_db_closed",
+            "new_db_verified",
+            "session_baseline_committed",
+            "fresh_collection_committed",
+            "empty_or_ready_root_published",
+        ];
+
+        for (crash_index, crash_point) in CRASH_POINTS.into_iter().enumerate() {
+            let root = std::env::temp_dir().join(format!(
+                "codex-info-switch-crash-{crash_index}-{}-{}",
+                std::process::id(),
+                NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&root).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let sessions = root.join("sessions");
+            fs::create_dir(&sessions).unwrap();
+            let session = sessions.join("current.jsonl");
+            let observed_at = Utc::now().timestamp();
+            let reset_at = observed_at + 3_600;
+            let context = json!({
+                "timestamp": Utc::now().to_rfc3339(),
+                "type": "turn_context",
+                "model": "gpt-5.6-sol"
+            });
+            let tokens = json!({
+                "timestamp": Utc::now().to_rfc3339(),
+                "type": "token_count",
+                "payload": {"info": {"total_token_usage": {
+                    "total_tokens": 129,
+                    "input_tokens": 100,
+                    "cached_input_tokens": 20,
+                    "output_tokens": 29
+                }}}
+            });
+            fs::write(&session, format!("{context}\n{tokens}\n")).unwrap();
+            let mut inventory = local_input_inventory_for_paths(Some(&sessions), None).unwrap();
+            let source = inventory.selected_session_files[0].recorded_source.clone();
+            let checkpoint = |collector_epoch, cycle_seq, fully_attributed_from_zero| {
+                super::usage_store::SessionCheckpoint {
+                    root_identity: source.root_identity.clone(),
+                    relative_path: source.relative_path.clone(),
+                    file_device: source.file_device,
+                    file_inode: source.file_inode,
+                    committed_offset: source.file_bytes,
+                    discard_until_lf: false,
+                    collector_epoch,
+                    cycle_seq,
+                    prefix_generation: collector_epoch,
+                    prefix_sha256: "11".repeat(32),
+                    fully_attributed_from_zero,
+                    token_baseline_known: fully_attributed_from_zero,
+                    last_model: fully_attributed_from_zero.then(|| "SOL".into()),
+                    previous_total: u64::from(fully_attributed_from_zero) * 129,
+                    previous_input: u64::from(fully_attributed_from_zero) * 100,
+                    previous_cached_input: u64::from(fully_attributed_from_zero) * 20,
+                    previous_output: u64::from(fully_attributed_from_zero) * 29,
+                }
+            };
+            let range = |collector_epoch, cycle_seq| super::usage_store::SessionRange {
+                root_identity: source.root_identity.clone(),
+                relative_path: source.relative_path.clone(),
+                file_device: source.file_device,
+                file_inode: source.file_inode,
+                start_offset: 0,
+                end_offset: source.file_bytes,
+                collector_epoch,
+                cycle_seq,
+                prefix_generation: collector_epoch,
+                record_sha256: "22".repeat(32),
+            };
+            let account_a = super::account_scope::AccountKey::synthetic_preview("account-A-129");
+            let account_b = super::account_scope::AccountKey::synthetic_preview("account-B-129");
+            let partition_a = super::account_scope::resolve_partition(&root, &account_a).unwrap();
+            let active_a =
+                daemon::activate_account_partition(partition_a.clone(), Utc::now()).unwrap();
+            let sample_a = super::usage_store::UsageHistorySample {
+                timestamp: observed_at,
+                reset_at,
+                remaining_percent: Some(91.0),
+                sol_dollars: 91.0,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: 910,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            };
+            let checkpoint_a = checkpoint(0xa1, 1, true);
+            let range_a = range(0xa1, 1);
+            UsageStore::open_partitioned(
+                &partition_a.database_path,
+                &partition_a.storage_identity(),
+            )
+            .unwrap()
+            .commit_session_collection(super::usage_store::SessionCollectionCommit {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                collector_epoch: 0xa1,
+                cycle_seq: 1,
+                samples: std::slice::from_ref(&sample_a),
+                checkpoints: std::slice::from_ref(&checkpoint_a),
+                ranges: std::slice::from_ref(&range_a),
+                model_totals: &[],
+                recorded_sessions: std::slice::from_ref(&source),
+            })
+            .unwrap();
+
+            // A process death discards all in-memory admissions/results/root.
+            // Dropping this guard models descriptor loss; stale lock-file PID
+            // reclamation is covered by daemon::stale_pid_lock_is_reclaimed_….
+            drop(active_a);
+            assert!(!partition_a.writer_lock_path.exists(), "{crash_point}");
+            let partition_b = super::account_scope::resolve_partition(&root, &account_b).unwrap();
+
+            if crash_index >= 3 {
+                drop(daemon::activate_account_partition(partition_b.clone(), Utc::now()).unwrap());
+            }
+            if crash_index >= 4 {
+                let baseline = checkpoint(0xb1, 1, false);
+                UsageStore::open_partitioned(
+                    &partition_b.database_path,
+                    &partition_b.storage_identity(),
+                )
+                .unwrap()
+                .commit_session_collection(super::usage_store::SessionCollectionCommit {
+                    reset_at,
+                    window_seconds: WEEK_SECONDS,
+                    collector_epoch: 0xb1,
+                    cycle_seq: 1,
+                    samples: &[],
+                    checkpoints: std::slice::from_ref(&baseline),
+                    ranges: &[],
+                    model_totals: &[],
+                    recorded_sessions: &[],
+                })
+                .unwrap();
+            }
+            let sample_b = super::usage_store::UsageHistorySample {
+                timestamp: observed_at,
+                reset_at,
+                remaining_percent: Some(29.0),
+                sol_dollars: 29.0,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: 290,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            };
+            if crash_index >= 5 {
+                let next_tokens = json!({
+                    "timestamp": Utc::now().to_rfc3339(),
+                    "type": "token_count",
+                    "payload": {"info": {"total_token_usage": {
+                        "total_tokens": 229,
+                        "input_tokens": 180,
+                        "cached_input_tokens": 40,
+                        "output_tokens": 49
+                    }}}
+                });
+                let baseline_offset = source.file_bytes;
+                let mut append = fs::OpenOptions::new().append(true).open(&session).unwrap();
+                writeln!(append, "{next_tokens}").unwrap();
+                drop(append);
+                inventory = local_input_inventory_for_paths(Some(&sessions), None).unwrap();
+                let appended_source = inventory.selected_session_files[0].recorded_source.clone();
+                let committed = super::usage_store::SessionCheckpoint {
+                    root_identity: appended_source.root_identity.clone(),
+                    relative_path: appended_source.relative_path.clone(),
+                    file_device: appended_source.file_device,
+                    file_inode: appended_source.file_inode,
+                    committed_offset: appended_source.file_bytes,
+                    discard_until_lf: false,
+                    collector_epoch: 0xb1,
+                    cycle_seq: 2,
+                    prefix_generation: 0xb1,
+                    prefix_sha256: "33".repeat(32),
+                    fully_attributed_from_zero: false,
+                    token_baseline_known: true,
+                    last_model: Some("SOL".into()),
+                    previous_total: 229,
+                    previous_input: 180,
+                    previous_cached_input: 40,
+                    previous_output: 49,
+                };
+                let committed_range = super::usage_store::SessionRange {
+                    root_identity: appended_source.root_identity.clone(),
+                    relative_path: appended_source.relative_path.clone(),
+                    file_device: appended_source.file_device,
+                    file_inode: appended_source.file_inode,
+                    start_offset: baseline_offset,
+                    end_offset: appended_source.file_bytes,
+                    collector_epoch: 0xb1,
+                    cycle_seq: 2,
+                    prefix_generation: 0xb1,
+                    record_sha256: "44".repeat(32),
+                };
+                UsageStore::open_partitioned(
+                    &partition_b.database_path,
+                    &partition_b.storage_identity(),
+                )
+                .unwrap()
+                .commit_session_collection(super::usage_store::SessionCollectionCommit {
+                    reset_at,
+                    window_seconds: WEEK_SECONDS,
+                    collector_epoch: 0xb1,
+                    cycle_seq: 2,
+                    samples: std::slice::from_ref(&sample_b),
+                    checkpoints: std::slice::from_ref(&committed),
+                    ranges: std::slice::from_ref(&committed_range),
+                    model_totals: &[],
+                    recorded_sessions: &[],
+                })
+                .unwrap();
+            }
+
+            // Restart always enters through the same production candidate,
+            // partition verification, maintenance, and writer-lock path.
+            let restarted =
+                daemon::activate_account_partition(partition_b.clone(), Utc::now()).unwrap();
+            assert!(partition_b.writer_lock_path.is_file(), "{crash_point}");
+            assert!(!partition_b.candidate_path.exists(), "{crash_point}");
+            let reopened_a = UsageStore::open_read_only_partitioned(
+                &partition_a.database_path,
+                &partition_a.storage_identity(),
+            )
+            .unwrap();
+            assert_eq!(reopened_a.load_all().unwrap(), vec![sample_a.clone()]);
+            let reopened_b = UsageStore::open_read_only_partitioned(
+                &partition_b.database_path,
+                &partition_b.storage_identity(),
+            )
+            .unwrap();
+            let expected_b = if crash_index >= 5 {
+                vec![sample_b.clone()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(reopened_b.load_all().unwrap(), expected_b, "{crash_point}");
+            let old_collection_state = reopened_b.load_session_collection_state().unwrap();
+            drop((reopened_a, reopened_b));
+
+            let fresh_baseline = super::collect_incremental_local_usage(
+                &inventory,
+                &old_collection_state,
+                &BTreeSet::new(),
+                super::IncrementalSessionContext {
+                    reset_at,
+                    window_seconds: WEEK_SECONDS,
+                    baseline_existing: true,
+                    collector_epoch: 0xc1,
+                    cycle_seq: 1,
+                },
+            )
+            .unwrap();
+            assert!(fresh_baseline.history_samples.is_empty(), "{crash_point}");
+            assert!(fresh_baseline.session_ranges.is_empty(), "{crash_point}");
+            assert!(fresh_baseline.recorded_sessions.is_empty(), "{crash_point}");
+            assert!(fresh_baseline
+                .session_checkpoints
+                .iter()
+                .all(|item| { item.collector_epoch == 0xc1 && !item.fully_attributed_from_zero }));
+
+            let mut state = CodexInfoState::preview("initializing");
+            state.apply_resolved_confirmed_account_event(
+                Some("account-b@example.test".into()),
+                Some("pro".into()),
+                account_b.clone(),
+                7,
+                partition_b.clone(),
+            );
+            let initializing = state.public_details();
+            assert_eq!(
+                initializing.state,
+                PublicState::Initializing,
+                "{crash_point}"
+            );
+            assert!(!initializing.authenticated, "{crash_point}");
+            assert!(initializing.history_samples.is_empty(), "{crash_point}");
+            state.apply_usage_event(UsageEvent {
+                account_key: account_b.clone(),
+                account_update_generation: 7,
+                remaining_percent: Some(29.0),
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                limit_name: "Codex".into(),
+                quota_title: "remaining".into(),
+                monthly: false,
+            });
+            state.apply_local_usage_success(LocalUsageResult {
+                auth_epoch: state.auth_epoch,
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                model_usage: ModelUsageTotals::default(),
+                history_samples: Vec::new(),
+                recorded_sessions: Vec::new(),
+                cleanup_plan: None,
+            });
+            let ready_b = state.public_details();
+            assert_eq!(ready_b.state, PublicState::Ready, "{crash_point}");
+            assert!(ready_b
+                .history_samples
+                .iter()
+                .all(|item| item.remaining_percent != Some(91.0)));
+            let raw_rest = serde_json::to_string(&ready_b).unwrap();
+            assert!(!raw_rest.contains("account-b@example.test"));
+            assert!(!raw_rest.contains("account-B-129"));
+
+            let before_stale = ready_b;
+            state.apply_local_usage_success(LocalUsageResult {
+                auth_epoch: state.auth_epoch - 1,
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                model_usage: ModelUsageTotals::default(),
+                history_samples: vec![UsageHistorySample::new(
+                    observed_at,
+                    reset_at,
+                    91.0,
+                    ModelDollarTotals::default(),
+                )],
+                recorded_sessions: Vec::new(),
+                cleanup_plan: None,
+            });
+            assert_eq!(state.public_details(), before_stale, "{crash_point}");
+            assert_eq!(
+                super::account_scope::resolve_partition(&root, &account_a).unwrap(),
+                partition_a,
+                "{crash_point}"
+            );
+            assert_eq!(
+                super::account_scope::resolve_partition(&root, &account_b).unwrap(),
+                partition_b,
+                "{crash_point}"
+            );
+            drop(restarted);
+            assert!(!partition_b.writer_lock_path.exists(), "{crash_point}");
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn malformed_new_session_is_file_local_and_cannot_later_be_repaired_into_history() {
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-malformed-session-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let now = Utc::now();
+        let reset_at = now.timestamp() + 3_600;
+        let session_bytes = |tokens: u64| {
+            let context = json!({
+                "timestamp": now.to_rfc3339(),
+                "type": "turn_context",
+                "model": "gpt-5.6-sol"
+            });
+            let usage = json!({
+                "timestamp": now.to_rfc3339(),
+                "type": "token_count",
+                "payload": {"info": {"total_token_usage": {
+                    "total_tokens": tokens,
+                    "input_tokens": tokens,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 0
+                }}}
+            });
+            format!("{context}\n{usage}\n")
+        };
+        fs::write(root.join("valid.jsonl"), session_bytes(50)).unwrap();
+        fs::write(root.join("malformed.jsonl"), b"{not-json}\n").unwrap();
+
+        let first_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let first = super::collect_incremental_local_usage(
+            &first_inventory,
+            &super::usage_store::SessionCollectionState {
+                collector_epoch: Some(0x4444),
+                ..super::usage_store::SessionCollectionState::default()
+            },
+            &BTreeSet::new(),
+            super::IncrementalSessionContext {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: false,
+                collector_epoch: 0x4444,
+                cycle_seq: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.model_usage.sol.tokens, 50);
+        assert_eq!(first.session_checkpoints.len(), 1);
+        assert_eq!(first.recorded_sessions.len(), 1);
+        assert!(first
+            .session_checkpoints
+            .iter()
+            .all(|checkpoint| checkpoint.relative_path == "valid.jsonl"));
+
+        fs::write(root.join("malformed.jsonl"), session_bytes(900)).unwrap();
+        let second_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let second = super::collect_incremental_local_usage(
+            &second_inventory,
+            &super::usage_store::SessionCollectionState {
+                data_generation: 1,
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                collector_epoch: Some(0x4444),
+                cycle_seq: 1,
+                checkpoints: first.session_checkpoints,
+                model_totals: first.session_model_totals,
+            },
+            &super::session_inventory_keys(&first_inventory),
+            super::IncrementalSessionContext {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: false,
+                collector_epoch: 0x4444,
+                cycle_seq: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(second.model_usage.sol.tokens, 50);
+        let repaired = second
+            .session_checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.relative_path == "malformed.jsonl")
+            .unwrap();
+        assert!(!repaired.fully_attributed_from_zero);
+        assert!(!second
+            .session_ranges
+            .iter()
+            .any(|range| range.relative_path == "malformed.jsonl"));
+        assert!(!second
+            .recorded_sessions
+            .iter()
+            .any(|source| source.relative_path == "malformed.jsonl"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn changed_session_prefix_is_freshly_baselined_without_cursor_or_marker_reuse() {
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-prefix-change-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let session = root.join("changed.jsonl");
+        let now = Utc::now();
+        let reset_at = now.timestamp() + 3_600;
+        let session_bytes = |tokens: u64| {
+            let context = json!({
+                "timestamp": now.to_rfc3339(),
+                "type": "turn_context",
+                "model": "gpt-5.6-sol"
+            });
+            let usage = json!({
+                "timestamp": now.to_rfc3339(),
+                "type": "token_count",
+                "payload": {"info": {"total_token_usage": {
+                    "total_tokens": tokens,
+                    "input_tokens": tokens,
+                    "cached_input_tokens": 0,
+                    "output_tokens": 0
+                }}}
+            });
+            format!("{context}\n{usage}\n")
+        };
+        fs::write(&session, session_bytes(100)).unwrap();
+        let first_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let first = super::collect_incremental_local_usage(
+            &first_inventory,
+            &super::usage_store::SessionCollectionState {
+                collector_epoch: Some(0x5555),
+                ..super::usage_store::SessionCollectionState::default()
+            },
+            &BTreeSet::new(),
+            super::IncrementalSessionContext {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: false,
+                collector_epoch: 0x5555,
+                cycle_seq: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.model_usage.sol.tokens, 100);
+        assert_eq!(first.recorded_sessions.len(), 1);
+        let old_prefix_generation = first.session_checkpoints[0].prefix_generation;
+
+        fs::write(&session, session_bytes(900)).unwrap();
+        let second_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let second = super::collect_incremental_local_usage(
+            &second_inventory,
+            &super::usage_store::SessionCollectionState {
+                data_generation: 1,
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                collector_epoch: Some(0x5555),
+                cycle_seq: 1,
+                checkpoints: first.session_checkpoints,
+                model_totals: first.session_model_totals,
+            },
+            &super::session_inventory_keys(&first_inventory),
+            super::IncrementalSessionContext {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: false,
+                collector_epoch: 0x5555,
+                cycle_seq: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(second.model_usage.sol.tokens, 100);
+        assert!(second.session_ranges.is_empty());
+        assert!(second.recorded_sessions.is_empty());
+        assert!(!second.session_checkpoints[0].fully_attributed_from_zero);
+        assert_ne!(
+            second.session_checkpoints[0].prefix_generation,
+            old_prefix_generation
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn aggregate_overflow_collects_latest_prefix_and_fatal_selected_file_has_no_fallback() {
         use std::fs::FileTimes;
         use std::time::{Duration as StdDuration, UNIX_EPOCH};
@@ -16974,6 +19439,7 @@ mod tests {
         };
         let mut history = UsageHistory {
             db_path: Some(db_path.clone()),
+            partition_identity: None,
             samples: vec![
                 sample(1),
                 sample(now.timestamp()),

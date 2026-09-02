@@ -39,9 +39,13 @@
 ## 4. データ保護
 
 - 履歴DB、verified backup、設定、Linux側履歴は、install、update、rollback、uninstall、restore失敗で削除しない。
+- canonical ChatGPT account identityは、owner-onlyかつstableに読めた`CODEX_HOME/auth.json`のexact `tokens.account_id`と前後2回の`account/read`、その間の`account/updated`世代不変で確定する。emailを保存scopeへ使わず、raw AccountKey、email、tokenをpath、DB、metadata、log、RESTへ保存しない。
+- 保存単位を`(OS user, ProfileScopeId, AccountScopeId, StorageEpoch)`とし、accountごとに`history/accounts/v1/<AccountScopeId>/epoch-<StorageEpoch>/usage_history.sqlite3`へ物理分離する。同一accountへの再切替は同じStorageEpoch/DBを再利用し、別accountのrow、writer lock、backup、Session checkpoint/marker/gapを混合しない。
+- logout、account切替、identity/metadata/DB検証失敗では旧accountのdurable dataとSession sourceを保持し、current公開rootだけをstrict emptyの`auth_required`、`initializing`、または`error`へ切り替える。旧account DBへのfallbackと自動migrationを行わない。
 - history canonicalization、candidate reject、UI表示を理由に既存のraw SQLite rowをrewrite/deleteしない。競合または境界不明時はraw DBとlast-good publicationを保持する。
 - migration、restore、updateはcandidateを完全検証してからatomic switchする。検証またはswitch失敗時は旧世代だけをcurrentとして保持する。
 - cursorはsource identityと結合し、rotate、truncate、replaceを区別する。古いoffsetによるskipと二重登録を防ぐ。
+- process startおよび各identity boundaryでは既存Sessionを現在EOFへfresh baselineし、同一CollectorEpochの次cycle以後に検証した完全append rangeだけを現accountへ帰属する。A→B→AでもAの旧cursorを再開せず、partial tail、変更prefix、legacy、未帰属rangeをどのaccountにも推測帰属しない。
 - backup作成または検証に失敗した場合は既存のverified世代をpruneしない。
 - crash、reboot、再実行はjournalの同一operationを再開し、commit、publication、deleteを各1回以下にする。
 - local session inventoryは既存のdepth・file数・1 file・1 line上限を先に検証し、mtime nanoseconds降順・canonical path降順のwhole-file prefixから最大2GiBだけを収集する。全inventoryの2GiB超過だけでLinux detailsを停止しない。
