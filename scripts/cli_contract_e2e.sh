@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+shopt -s nullglob
 
 # Finite public CLI and daemon lifecycle acceptance.  Every mutable path is
 # isolated below one temporary profile; no GitHub workflow or installed
@@ -56,7 +57,11 @@ runtime_root="$profile_root/runtime"
 mkdir -p "$profile_root/home" "$profile_root/config" "$profile_root/cache" \
     "$profile_root/state" "$runtime_root" "$codex_root/sessions/2026/08/27" \
     "$data_root/history"
-chmod 700 "$runtime_root"
+chmod 700 "$runtime_root" "$codex_root"
+auth_file="$codex_root/auth.json"
+printf '%s\n' '{"auth_mode":"chatgpt","tokens":{"account_id":"fixture-account-129"}}' \
+    >"$auth_file"
+chmod 600 "$auth_file"
 
 common_env=(
     "HOME=$profile_root/home"
@@ -67,7 +72,8 @@ common_env=(
     "XDG_RUNTIME_DIR=$runtime_root"
     "CODEX_HOME=$codex_root"
     "CODEX_INFO_DATA_DIR=$data_root"
-    "CODEX_INFO_DAEMON_INTERVAL_SECS=3600"
+    "CODEX_INFO_CODEX_BIN=$ROOT_DIR/scripts/fake_codex_app_server.py"
+    "CODEX_INFO_DAEMON_INTERVAL_SECS=1"
 )
 
 session_file="$codex_root/sessions/2026/08/27/cli-contract.jsonl"
@@ -76,10 +82,12 @@ fixture_now="$(date -u +%s)"
 fixture_event_epoch=$((fixture_now - 60))
 fixture_reset_at=$((fixture_now + 3600))
 fixture_event_time="$(date -u -d "@$fixture_event_epoch" '+%Y-%m-%dT%H:%M:%SZ')"
+common_env+=("CODEX_INFO_FAKE_RESET_AT=$fixture_reset_at")
 printf '%s\n' \
     "{\"timestamp\":\"$fixture_event_time\",\"type\":\"turn_context\",\"model\":\"gpt-5.6-luna\"}" \
     "{\"timestamp\":\"$fixture_event_time\",\"type\":\"token_count\",\"payload\":{\"info\":{\"total_token_usage\":{\"total_tokens\":10,\"input_tokens\":8,\"cached_input_tokens\":4,\"output_tokens\":2}}}}" \
     >"$session_file"
+chmod 600 "$session_file"
 printf '{"reset_at":%s,"window_seconds":604800}\n' "$fixture_reset_at" >"$reset_hint"
 
 # Help aliases are successful, localized product output and have no startup
@@ -138,19 +146,59 @@ curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/health" >/dev/null 
 ss -ltnH "sport = :$port" | rg -q "127[.]0[.]0[.]1:$port" \
     || fail 'listener is not bound to 127.0.0.1'
 
-# Health proves lock/listener readiness, not completion of the recorder's
-# initial backfill. Wait for this fixture's one deterministic commit before
-# reading SQLite or exercising the successful stop path; racing the writer
-# would test the documented fail-closed timeout path instead.
-initial_commit='codex-info: recorder committed 1 samples'
+# Health proves lock/listener readiness, not completion of the account-bound
+# Session baseline. Wait for the one physical account DB and its checkpoint,
+# then prove that pre-boundary bytes produced no usage before appending a
+# verified range.
+database=''
 for _ in $(seq 1 200); do
-    rg -q --fixed-strings "$initial_commit" "$tmp_root/service.log" && break
+    databases=("$data_root"/history/accounts/v1/*/epoch-*/usage_history.sqlite3)
+    if [[ "${#databases[@]}" -eq 1 ]]; then
+        checkpoint_count="$(sqlite3 -batch -bail -cmd '.timeout 2000' \
+            "${databases[0]}" 'SELECT COUNT(*) FROM session_checkpoints;' 2>/dev/null || true)"
+        if [[ "$checkpoint_count" =~ ^[0-9]+$ ]] && ((10#$checkpoint_count >= 1)); then
+            database="${databases[0]}"
+            break
+        fi
+    fi
     sleep 0.1
 done
-rg -q --fixed-strings "$initial_commit" "$tmp_root/service.log" \
-    || fail 'initial recorder backfill did not complete'
+[[ -n "$database" ]] || fail 'account Session baseline did not complete'
+[[ "$(sqlite3 "$database" 'SELECT COUNT(*) FROM storage_partition;')" == 1 ]] \
+    || fail 'account database partition authority is missing'
+[[ "$(sqlite3 "$database" 'SELECT COUNT(*) FROM usage_history WHERE sol_tokens <> 0 OR terra_tokens <> 0 OR luna_tokens <> 0 OR ABS(sol_dollars) > 0.0000001 OR ABS(terra_dollars) > 0.0000001 OR ABS(luna_dollars) > 0.0000001;')" == 0 ]] \
+    || fail 'pre-boundary Session bytes were attributed'
+[[ "$(sqlite3 "$database" 'SELECT COUNT(*) FROM session_ranges;')" == 0 ]] \
+    || fail 'pre-boundary Session bytes produced a committed range'
+[[ ! -e "$data_root/history/usage_history.sqlite3" ]] \
+    || fail 'legacy unpartitioned history database was created'
 
-database="$data_root/history/usage_history.sqlite3"
+initial_commit='codex-info: recorder committed 1 samples'
+append_time="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+printf '%s\n' \
+    "{\"timestamp\":\"$append_time\",\"type\":\"turn_context\",\"model\":\"gpt-5.6-luna\"}" \
+    "{\"timestamp\":\"$append_time\",\"type\":\"token_count\",\"payload\":{\"info\":{\"total_token_usage\":{\"total_tokens\":20,\"input_tokens\":16,\"cached_input_tokens\":8,\"output_tokens\":4}}}}" \
+    "{\"timestamp\":\"$append_time\",\"type\":\"token_count\",\"payload\":{\"info\":{\"total_token_usage\":{\"total_tokens\":30,\"input_tokens\":24,\"cached_input_tokens\":12,\"output_tokens\":6}}}}" \
+    >>"$session_file"
+
+post_boundary_luna_tokens=0
+for _ in $(seq 1 200); do
+    post_boundary_luna_tokens="$(sqlite3 -batch -bail -cmd '.timeout 2000' \
+        "$database" 'SELECT COALESCE(MAX(luna_tokens),0) FROM usage_history;' 2>/dev/null || true)"
+    if [[ "$post_boundary_luna_tokens" =~ ^[0-9]+$ ]] \
+        && ((10#$post_boundary_luna_tokens >= 10)); then
+        break
+    fi
+    sleep 0.1
+done
+[[ "$post_boundary_luna_tokens" =~ ^[0-9]+$ ]] \
+    && ((10#$post_boundary_luna_tokens >= 10)) \
+    || fail "post-baseline recorder commit did not include the verified append (observed luna_tokens=$post_boundary_luna_tokens)"
+[[ "$(sqlite3 "$database" 'SELECT COUNT(*) FROM session_ranges;')" -ge 1 ]] \
+    || fail 'post-boundary Session append did not produce a committed range'
+rg -q --fixed-strings "$initial_commit" "$tmp_root/service.log" \
+    || fail 'recorder did not report a committed usage sample'
+
 [[ -f "$database" ]] || fail 'history database was not created'
 logical_database_sha256() {
     sqlite3 -batch -bail -cmd '.timeout 2000' "$1" .dump \

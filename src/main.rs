@@ -5319,7 +5319,14 @@ fn collect_session_append(
         prefix_sha256,
         fully_attributed_from_zero: fully_attributed,
         token_baseline_known: baseline_known,
-        last_model: model,
+        // Session JSONL carries product model identifiers (for example,
+        // `gpt-5.6-luna`), while the durable checkpoint schema admits only the
+        // shared SOL/TERRA/LUNA keys. Keep that storage boundary canonical so
+        // a valid post-boundary append cannot be rejected by the recorder.
+        last_model: model
+            .as_deref()
+            .and_then(ModelUsageTotals::recognized_model)
+            .map(str::to_owned),
         previous_total: previous.total,
         previous_input: previous.input,
         previous_cached_input: previous.cached_input,
@@ -18028,6 +18035,10 @@ mod tests {
         assert_eq!(appended.session_ranges.len(), 1);
         assert_eq!(appended.session_ranges[0].collector_epoch, 0x1111);
         assert_eq!(appended.session_ranges[0].record_sha256.len(), 64);
+        assert_eq!(
+            appended.session_checkpoints[0].last_model.as_deref(),
+            Some("SOL")
+        );
         assert!(appended.recorded_sessions.is_empty());
 
         let append_state = super::usage_store::SessionCollectionState {
