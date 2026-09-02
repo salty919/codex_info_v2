@@ -9,7 +9,6 @@ Codex Infoは、ChatGPT/Codexアカウントの利用枠、リセット時刻、
 - [導入と起動ガイド](https://github.com/salty919/codex_info_v2/wiki/導入と起動ガイド)
 - [画面情報](https://github.com/salty919/codex_info_v2/wiki/画面情報)
 - [開発・運用メモ](https://github.com/salty919/codex_info_v2/wiki/開発・運用メモ)
-- [GitHub Wiki 反映ガイド](https://github.com/salty919/codex_info_v2/wiki/GitHub-Wiki-反映ガイド)
 
 ## 現在の構成
 
