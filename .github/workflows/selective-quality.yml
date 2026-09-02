@@ -34,7 +34,7 @@ jobs:
     if: contains(fromJSON(inputs.selection_json).owners, 'DOCS')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
           ref: ${{ inputs.source_sha }}
@@ -53,12 +53,12 @@ jobs:
     if: contains(fromJSON(inputs.selection_json).owners, 'GOVERNANCE')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: '1.25.x'
           cache: false
@@ -137,7 +137,7 @@ jobs:
       - linux-distribution
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false

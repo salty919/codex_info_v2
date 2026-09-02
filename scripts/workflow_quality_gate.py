@@ -124,7 +124,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
 
         # Observer output -> owner execution and the complete, push-capable checkout.
         condition = "steps.current.outputs.observer != 'true'"
-        checkout = _step(prepared, uses="actions/checkout@v4")
+        checkout = _step(prepared, uses="actions/checkout@v5")
         expect("version.checkout.if", checkout.get("if"), condition)
         expect("version.prepare.if", _step(prepared, step_id="prepare").get("if"), condition)
         mapping("version.checkout", checkout.get("with"), {
@@ -176,7 +176,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         # Complete PR identity -> reusable owner calls -> each leaf checkout.
         mapping(
             "feat.classify.checkout",
-            _step(feat_classify, uses="actions/checkout@v4").get("with"),
+            _step(feat_classify, uses="actions/checkout@v5").get("with"),
             {
                 "ref": "${{ github.workflow_sha }}",
                 "fetch-depth": 0,
@@ -271,7 +271,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             (linux_distribution, "linux-distribution"),
             (docs["codeql.yml"], "analyze"),
         ):
-            leaf_checkout = _step(_job(document, job_id), uses="actions/checkout@v4")
+            leaf_checkout = _step(_job(document, job_id), uses="actions/checkout@v5")
             mapping(f"{job_id}.checkout", leaf_checkout.get("with"), {
                 "ref": "${{ inputs.source_sha }}"
             })
@@ -282,7 +282,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         ])
         mapping(
             "selected.checkout",
-            _step(selected, uses="actions/checkout@v4").get("with"),
+            _step(selected, uses="actions/checkout@v5").get("with"),
             {
                 "ref": "${{ github.workflow_sha }}",
                 "persist-credentials": False,
@@ -528,7 +528,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
             errors.append(f"version-prepare.yml: missing {marker}")
     for marker in (
         "--force",
-        "actions/checkout@v4\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}",
+        "actions/checkout@v5\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}",
     ):
         if marker in version:
             errors.append(f"version-prepare.yml: write path overconstraint {marker}")

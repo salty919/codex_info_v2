@@ -88,7 +88,7 @@ jobs:
           fi
           printf 'observer=%s\nreason=%s\n' "$observer" "$reason" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: steps.current.outputs.observer != 'true'
         with:
           ref: ${{ github.workflow_sha }}
