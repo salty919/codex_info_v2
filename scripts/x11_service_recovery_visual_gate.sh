@@ -76,51 +76,17 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$temp_root"/{home,config,data,cache,state,runtime,codex/sessions}
-chmod 700 "$temp_root/runtime"
-fake_codex="$temp_root/fake-codex"
-cat >"$fake_codex" <<'PY'
-#!/usr/bin/env python3
-import json
-import sys
-import time
+chmod 700 "$temp_root/runtime" "$temp_root/codex"
+auth_fixture="$temp_root/codex/auth.json"
+cat >"$auth_fixture" <<'JSON'
+{"auth_mode":"chatgpt","tokens":{"account_id":"fixture-account-129"}}
+JSON
+chmod 600 "$auth_fixture"
+fake_codex="$root_dir/scripts/fake_codex_app_server.py"
 
-# Leave one hour inside the rolling window so the local fixture remains valid
-# even when a busy runner spends time building or starting the X11 client.
-reset_at = int(time.time()) + 604800 - 3600
-account = {
-    "requiresOpenaiAuth": False,
-    "account": {"type": "chatgpt", "email": "fixture@example.com", "planType": "pro"},
-}
-quota = {"rateLimits": {"primary": {
-    "usedPercent": 56, "resetsAt": reset_at, "windowDurationMins": 10080
-}}}
-for line in sys.stdin:
-    try:
-        request = json.loads(line)
-    except json.JSONDecodeError:
-        continue
-    request_id = request.get("id")
-    if not isinstance(request_id, int):
-        continue
-    method = request.get("method")
-    if method == "initialize":
-        result = {}
-    elif method == "account/read":
-        result = account
-    elif method == "account/rateLimits/read":
-        result = quota
-    elif method == "thread/list":
-        result = {"data": []}
-    else:
-        result = {}
-    print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result}), flush=True)
-PY
-chmod 700 "$fake_codex"
-
-# Seed one valid local usage timeline so the retained frame contains the same
-# model rows and period data that an authenticated installation displays. The
-# timestamps are generated immediately before service startup and fall inside
-# the fixture's seven-day quota window.
+# Seed pre-boundary records that must be baselined without attribution. A
+# verified append after the first ready generation supplies the visible model
+# rows; this keeps the rendered fixture aligned with SESSION-129.
 session_fixture="$temp_root/codex/sessions/fixture.jsonl"
 python3 - "$session_fixture" <<'PY'
 import datetime
@@ -167,6 +133,7 @@ sock.close()
 PY
 )"
 [[ -n "$port" ]] || fail 'could not find an unused loopback port'
+fixture_reset_at=$(($(date +%s) + 604800 - 3600))
 common_env=(
     "HOME=$temp_root/home"
     "XDG_CONFIG_HOME=$temp_root/config"
@@ -177,6 +144,7 @@ common_env=(
     "CODEX_HOME=$temp_root/codex"
     "CODEX_INFO_DATA_DIR=$temp_root/data"
     "CODEX_INFO_CODEX_BIN=$fake_codex"
+    "CODEX_INFO_FAKE_RESET_AT=$fixture_reset_at"
     "CODEX_INFO_DAEMON_INTERVAL_SECS=2"
 )
 run_with_common_env() {
@@ -211,9 +179,75 @@ wait_service_ready() {
     curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v1/details" >&2 || true
     return 1
 }
+append_verified_usage() {
+    python3 - "$session_fixture" <<'PY'
+import datetime
+import json
+import sys
+import time
+
+timestamp = datetime.datetime.fromtimestamp(
+    time.time(), datetime.timezone.utc
+).isoformat().replace("+00:00", "Z")
+events = [
+    ("gpt-5.6-sol", 4_000, 2_800, 400, 800),
+    ("gpt-5.6-sol", 5_000, 3_500, 500, 1_000),
+    ("gpt-5.6-terra", 6_000, 4_200, 600, 1_200),
+    ("gpt-5.6-terra", 7_000, 4_900, 700, 1_400),
+    ("gpt-5.6-luna", 8_000, 5_600, 800, 1_600),
+    ("gpt-5.6-luna", 9_000, 6_300, 900, 1_800),
+]
+with open(sys.argv[1], "a", encoding="utf-8") as stream:
+    for model, total, input_tokens, cached, output in events:
+        stream.write(json.dumps({"type": "thread_context", "model": model}) + "\n")
+        stream.write(json.dumps({
+            "type": "event_msg",
+            "timestamp": timestamp,
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "total_tokens": total,
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": cached,
+                        "output_tokens": output,
+                    }
+                },
+            },
+        }) + "\n")
+PY
+}
+service_models_ready() {
+    local details
+    details="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v1/details" 2>/dev/null)" || return 1
+    python3 - "$details" <<'PY'
+import json
+import sys
+try:
+    details = json.loads(sys.argv[1])
+except (IndexError, json.JSONDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if (
+    details.get("state") == "ready"
+    and details.get("authenticated") is True
+    and len(details.get("models", [])) == 3
+) else 1)
+PY
+}
+wait_service_models_ready() {
+    for _ in $(seq 1 80); do
+        service_models_ready && return 0
+        sleep 0.25
+    done
+    sed -n '1,160p' "$temp_root"/service-*.log >&2 2>/dev/null || true
+    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v1/details" >&2 || true
+    return 1
+}
 
 launch_service
 wait_service_ready || fail 'fixture-backed resident service did not publish ready details'
+append_verified_usage
+wait_service_models_ready || fail 'post-baseline fixture usage did not publish model details'
 env -u CODEX_INFO_PREVIEW -u CODEX_INFO_PREVIEW_SIZE "${common_env[@]}" "$binary" --ui --port "$port" \
     >"$temp_root/ui.log" 2>&1 &
 ui_pid="$!"

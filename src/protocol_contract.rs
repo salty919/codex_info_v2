@@ -10,6 +10,8 @@
 
 use std::fmt;
 
+use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 use crate::security;
@@ -34,6 +36,7 @@ const MAX_WINDOW_DURATION_MINS: i64 = 527_040;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContractError {
     AccountSchema,
+    AccountUpdatedSchema,
     QuotaSchema,
     InvalidPlanType,
     AccountQuotaPlanMismatch,
@@ -43,12 +46,134 @@ impl fmt::Display for ContractError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::AccountSchema => "account response schema contract violation",
+            Self::AccountUpdatedSchema => "account updated notification schema contract violation",
             Self::QuotaSchema => "quota response schema contract violation",
             Self::InvalidPlanType => "plan type contract violation",
             Self::AccountQuotaPlanMismatch => "account and quota plan contract mismatch",
         };
         formatter.write_str(message)
     }
+}
+
+/// Validates the exact app-server v2 `account/updated` notification used as
+/// the local account-generation boundary. Unknown or duplicate JSON members
+/// are rejected by the caller's JSON parser/object cardinality check rather
+/// than being treated as a harmless notification.
+pub fn validate_account_updated_notification(value: &Value) -> Result<(), ContractError> {
+    const AUTH_MODES: [&str; 7] = [
+        "apikey",
+        "chatgpt",
+        "chatgptAuthTokens",
+        "headers",
+        "agentIdentity",
+        "personalAccessToken",
+        "bedrockApiKey",
+    ];
+    let message = value
+        .as_object()
+        .ok_or(ContractError::AccountUpdatedSchema)?;
+    if message.len() != 3
+        || message.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || message.get("method").and_then(Value::as_str) != Some("account/updated")
+        || message.contains_key("id")
+    {
+        return Err(ContractError::AccountUpdatedSchema);
+    }
+    let params = message
+        .get("params")
+        .and_then(Value::as_object)
+        .ok_or(ContractError::AccountUpdatedSchema)?;
+    if params
+        .keys()
+        .any(|key| key != "authMode" && key != "planType")
+    {
+        return Err(ContractError::AccountUpdatedSchema);
+    }
+    if let Some(auth_mode) = params.get("authMode") {
+        if !auth_mode.is_null()
+            && !auth_mode
+                .as_str()
+                .is_some_and(|mode| AUTH_MODES.contains(&mode))
+        {
+            return Err(ContractError::AccountUpdatedSchema);
+        }
+    }
+    if let Some(plan_type) = params.get("planType") {
+        if !plan_type.is_null() && !plan_type.as_str().and_then(PlanType::parse).is_some() {
+            return Err(ContractError::AccountUpdatedSchema);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictAccountUpdatedEnvelope {
+    jsonrpc: String,
+    method: String,
+    params: StrictAccountUpdatedParams,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StrictAccountUpdatedParams {
+    auth_mode: Option<String>,
+    plan_type: Option<String>,
+}
+
+pub fn is_account_updated_notification_json(raw: &str) -> Result<bool, ContractError> {
+    struct MethodVisitor;
+
+    impl<'de> Visitor<'de> for MethodVisitor {
+        type Value = bool;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a JSON-RPC object")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut method_seen = false;
+            let mut account_updated = false;
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "method" {
+                    let method = map.next_value::<Value>()?;
+                    let current = method.as_str() == Some("account/updated");
+                    if method_seen && (account_updated || current) {
+                        return Err(serde::de::Error::duplicate_field("method"));
+                    }
+                    method_seen = true;
+                    account_updated |= current;
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(account_updated)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    let result = deserializer
+        .deserialize_map(MethodVisitor)
+        .map_err(|_| ContractError::AccountUpdatedSchema)?;
+    deserializer
+        .end()
+        .map_err(|_| ContractError::AccountUpdatedSchema)?;
+    Ok(result)
+}
+
+pub fn validate_account_updated_notification_json(raw: &str) -> Result<(), ContractError> {
+    let envelope = serde_json::from_str::<StrictAccountUpdatedEnvelope>(raw)
+        .map_err(|_| ContractError::AccountUpdatedSchema)?;
+    let _ = (&envelope.params.auth_mode, &envelope.params.plan_type);
+    if envelope.jsonrpc != "2.0" || envelope.method != "account/updated" {
+        return Err(ContractError::AccountUpdatedSchema);
+    }
+    let value =
+        serde_json::from_str::<Value>(raw).map_err(|_| ContractError::AccountUpdatedSchema)?;
+    validate_account_updated_notification(&value)
 }
 
 impl std::error::Error for ContractError {}
@@ -948,6 +1073,45 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn account_updated_notification_is_strict_and_duplicate_safe() {
+        for valid in [
+            r#"{"jsonrpc":"2.0","method":"account/updated","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"account/updated","params":{"authMode":null,"planType":null}}"#,
+            r#"{"jsonrpc":"2.0","method":"account/updated","params":{"authMode":"chatgpt","planType":"pro"}}"#,
+        ] {
+            assert_eq!(is_account_updated_notification_json(valid), Ok(true));
+            assert_eq!(validate_account_updated_notification_json(valid), Ok(()));
+        }
+        assert_eq!(
+            is_account_updated_notification_json(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"method":"account/updated"}}"#
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            is_account_updated_notification_json(
+                r#"{"method":"account/updated","method":"ordinary/event","params":{}}"#
+            ),
+            Err(ContractError::AccountUpdatedSchema)
+        );
+
+        for invalid in [
+            r#"{"jsonrpc":"2.0","method":"account/updated","params":{},"extra":true}"#,
+            r#"{"jsonrpc":"2.0","method":"account/updated","params":{"extra":true}}"#,
+            r#"{"jsonrpc":"2.0","method":"account/updated","params":{"authMode":"chatgpt","authMode":"apikey"}}"#,
+            r#"{"jsonrpc":"2.0","method":"account/updated","params":{"planType":"pro","planType":"free"}}"#,
+            r#"{"jsonrpc":"2.0","method":"account/updated","params":{"authMode":"unknown"}}"#,
+            r#"{"jsonrpc":"2.0","method":"account/updated","params":{"planType":"PLUS"}}"#,
+        ] {
+            assert_eq!(
+                validate_account_updated_notification_json(invalid),
+                Err(ContractError::AccountUpdatedSchema),
+                "unexpectedly accepted {invalid}"
+            );
+        }
     }
 
     fn plan_family_compatibility() -> [[bool; 15]; 15] {

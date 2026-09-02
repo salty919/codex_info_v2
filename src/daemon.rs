@@ -8,34 +8,44 @@
 //! commits of complete generations supplied by that producer. SQLite's
 //! transaction/upsert contract remains the authority for durable writes.
 
+use crate::account_scope::{self, AccountPartition};
 use crate::security;
-use crate::usage_store::{RecordedSessionSource, UsageHistorySample, UsageStore};
+use crate::usage_store::{
+    RecordedSessionSource, SessionCheckpoint, SessionCollectionCommit, SessionModelTotal,
+    SessionRange, StoragePartitionIdentity, UsageHistorySample, UsageStore,
+};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
 pub(crate) const RESET_HINT_FILE_NAME: &str = "usage_reset_hint.json";
 pub(crate) const DAEMON_LOCK_FILE_NAME: &str = "usage_record_daemon.lock";
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const MIN_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const MAX_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+#[cfg(test)]
 const MAX_HINT_BYTES: u64 = 4 * 1024;
 const MAX_LOCK_BYTES: u64 = 4 * 1024;
 const STALE_LOCK_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+#[cfg(test)]
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ResetHint {
     pub(crate) reset_at: i64,
     pub(crate) window_seconds: i64,
 }
 
+#[cfg(test)]
 impl ResetHint {
     fn new(reset_at: i64, window_seconds: i64) -> Option<Self> {
         (reset_at > 0 && (1..=366 * 86_400).contains(&window_seconds)).then_some(Self {
@@ -52,6 +62,7 @@ impl ResetHint {
 /// Resolve the metadata location from the same protected data root as the
 /// history database.  The path is intentionally not configurable separately:
 /// a daemon must never read a hint from a different account/data directory.
+#[cfg(test)]
 pub(crate) fn reset_hint_path() -> Option<PathBuf> {
     crate::usage_data_root().map(|root| root.join("history").join(RESET_HINT_FILE_NAME))
 }
@@ -81,6 +92,7 @@ fn stop_lock_path() -> Option<PathBuf> {
 /// Read a bounded, private reset hint.  Any malformed, replaced, symlinked,
 /// or oversized metadata is ignored; the next authenticated quota response
 /// can safely replace it.
+#[cfg(test)]
 pub(crate) fn load_reset_hint() -> Option<(i64, i64)> {
     let path = reset_hint_path()?;
     let metadata = fs::symlink_metadata(&path).ok()?;
@@ -98,6 +110,7 @@ pub(crate) fn load_reset_hint() -> Option<(i64, i64)> {
 /// Atomically replace the reset hint after a successful quota response.
 /// Existing metadata is not opened for writing, and a failed temporary write
 /// leaves the previous hint untouched.
+#[cfg(test)]
 pub(crate) fn persist_reset_hint(reset_at: i64, window_seconds: i64) -> Result<(), ()> {
     let hint = ResetHint::new(reset_at, window_seconds).ok_or(())?;
     let path = reset_hint_path().ok_or(())?;
@@ -705,25 +718,38 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-fn data_paths() -> Result<(PathBuf, PathBuf, PathBuf), DaemonError> {
-    let root = crate::usage_data_root().ok_or(DaemonError::DataRoot)?;
-    let history = root.join("history");
-    let database = history.join("usage_history.sqlite3");
-    let lock = daemon_lock_path().ok_or(DaemonError::DataRoot)?;
-    Ok((history, database, lock))
+fn profile_lock_path() -> Result<PathBuf, DaemonError> {
+    daemon_lock_path().ok_or(DaemonError::DataRoot)
+}
+
+pub(crate) struct RecorderGeneration {
+    pub(crate) reset_at: i64,
+    pub(crate) window_seconds: i64,
+    pub(crate) collector_epoch: u128,
+    pub(crate) cycle_seq: u64,
+    pub(crate) samples: Vec<UsageHistorySample>,
+    pub(crate) recorded_sessions: Vec<RecordedSessionSource>,
+    pub(crate) session_checkpoints: Vec<SessionCheckpoint>,
+    pub(crate) session_ranges: Vec<SessionRange>,
+    pub(crate) session_model_totals: Vec<SessionModelTotal>,
 }
 
 enum RecorderCommand {
-    StartupMaintenance {
+    Activate {
+        partition: AccountPartition,
         now: chrono::DateTime<chrono::Utc>,
         completed: mpsc::SyncSender<Result<(), String>>,
     },
+    Deactivate {
+        completed: mpsc::SyncSender<Result<(), String>>,
+    },
     Store {
-        samples: Vec<UsageHistorySample>,
-        recorded_sessions: Vec<RecordedSessionSource>,
+        partition_id: String,
+        generation: RecorderGeneration,
         committed: mpsc::SyncSender<Result<(), String>>,
     },
     ForgetRecordedSessions {
+        partition_id: String,
         recorded_sessions: Vec<RecordedSessionSource>,
         committed: mpsc::SyncSender<Result<(), String>>,
     },
@@ -732,10 +758,13 @@ enum RecorderCommand {
 
 fn maintain_history_database(
     database: &Path,
+    identity: &StoragePartitionIdentity,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), String> {
-    UsageStore::backup_generations(database, 3).map_err(|error| error.to_string())?;
-    let mut store = UsageStore::open(database).map_err(|error| error.to_string())?;
+    UsageStore::backup_generations_partitioned(database, identity, 3)
+        .map_err(|error| error.to_string())?;
+    let mut store =
+        UsageStore::open_partitioned(database, identity).map_err(|error| error.to_string())?;
     store
         .prune_older_than_three_months(now)
         .map_err(|error| error.to_string())?;
@@ -747,7 +776,116 @@ pub(crate) fn maintain_history_database_for_test(
     database: &Path,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), String> {
-    maintain_history_database(database, now)
+    UsageStore::backup_generations(database, 3).map_err(|error| error.to_string())?;
+    let mut store = UsageStore::open(database).map_err(|error| error.to_string())?;
+    store
+        .prune_older_than_three_months(now)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub(crate) struct ActiveRecorderPartition {
+    partition: AccountPartition,
+    identity: StoragePartitionIdentity,
+    _writer_lock: DaemonLock,
+}
+
+fn private_partition_directory(partition: &AccountPartition) -> Result<PathBuf, String> {
+    let directory = partition
+        .database_path
+        .parent()
+        .ok_or_else(|| "account partition directory is missing".to_owned())?;
+    if partition.candidate_path.parent() != Some(directory)
+        || partition.writer_lock_path.parent() != Some(directory)
+    {
+        return Err("account partition paths disagree".into());
+    }
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let account_directory = directory
+            .parent()
+            .ok_or_else(|| "account scope directory is missing".to_owned())?;
+        for private_directory in [account_directory, directory] {
+            fs::set_permissions(private_directory, fs::Permissions::from_mode(0o700))
+                .map_err(|error| error.to_string())?;
+            security::validate_absolute_root(private_directory)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    security::validate_absolute_root(directory).map_err(|error| error.to_string())
+}
+
+fn path_exists_without_following(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err("account partition artifact is not a regular file".into())
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn sync_file_and_parent(path: &Path) -> Result<(), String> {
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "account partition directory is missing".to_owned())?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn activate_account_partition(
+    partition: AccountPartition,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<ActiveRecorderPartition, String> {
+    let directory = private_partition_directory(&partition)?;
+    let identity = partition.storage_identity();
+
+    let final_exists = path_exists_without_following(&partition.database_path)?;
+    let candidate_exists = path_exists_without_following(&partition.candidate_path)?;
+    if final_exists && candidate_exists {
+        return Err("account partition has both final and candidate databases".into());
+    }
+    let existing_database = final_exists;
+    if !final_exists {
+        if candidate_exists {
+            let candidate = UsageStore::open_partitioned(&partition.candidate_path, &identity)
+                .map_err(|error| error.to_string())?;
+            drop(candidate);
+        } else {
+            let candidate = UsageStore::create_partitioned(&partition.candidate_path, &identity)
+                .map_err(|error| error.to_string())?;
+            drop(candidate);
+        }
+        sync_file_and_parent(&partition.candidate_path)?;
+        fs::rename(&partition.candidate_path, &partition.database_path)
+            .map_err(|error| error.to_string())?;
+        File::open(&directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| error.to_string())?;
+    }
+
+    let store = UsageStore::open_partitioned(&partition.database_path, &identity)
+        .map_err(|error| error.to_string())?;
+    drop(store);
+    account_scope::mark_partition_initialized(&partition).map_err(|error| error.to_string())?;
+    let writer_lock = DaemonLock::acquire(partition.writer_lock_path.clone())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "account partition writer is already owned".to_owned())?;
+    if existing_database {
+        maintain_history_database(&partition.database_path, &identity, now)?;
+    }
+    Ok(ActiveRecorderPartition {
+        partition,
+        identity,
+        _writer_lock: writer_lock,
+    })
 }
 
 /// Serialized history-writer ownership embedded in the combined service.
@@ -769,13 +907,13 @@ impl RecorderWorker {
         let worker = thread::Builder::new()
             .name("codex-info-recorder".into())
             .spawn(move || {
-                let result = (|| -> Result<(PathBuf, Option<DaemonLock>), DaemonError> {
-                    let (_history, database, lock_path) = data_paths()?;
+                let result = (|| -> Result<Option<DaemonLock>, DaemonError> {
+                    let lock_path = profile_lock_path()?;
                     let lock = DaemonLock::acquire(lock_path)?;
-                    Ok((database, lock))
+                    Ok(lock)
                 })();
-                let (database, lock) = match result {
-                    Ok(values) => values,
+                let lock = match result {
+                    Ok(value) => value,
                     Err(error) => {
                         let _ = started.send(Err(error.to_string()));
                         return;
@@ -794,26 +932,83 @@ impl RecorderWorker {
                     return;
                 }
 
+                let mut active: Option<ActiveRecorderPartition> = None;
                 while let Ok(command) = command_receiver.recv() {
                     match command {
                         RecorderCommand::Shutdown => break,
-                        RecorderCommand::StartupMaintenance { now, completed } => {
-                            let _ = completed.send(maintain_history_database(&database, now));
+                        RecorderCommand::Activate {
+                            partition,
+                            now,
+                            completed,
+                        } => {
+                            if active.as_ref().is_some_and(|current| {
+                                current.partition.partition_id == partition.partition_id
+                            }) {
+                                let _ = completed.send(Ok(()));
+                                continue;
+                            }
+                            // Switching identity is a hard writer boundary:
+                            // close the old SQLite handle and release its exact
+                            // account lock before touching the new partition.
+                            active = None;
+                            match activate_account_partition(partition, now) {
+                                Ok(next) => {
+                                    active = Some(next);
+                                    let _ = completed.send(Ok(()));
+                                }
+                                Err(error) => {
+                                    let _ = completed.send(Err(error));
+                                }
+                            }
+                        }
+                        RecorderCommand::Deactivate { completed } => {
+                            active = None;
+                            let _ = completed.send(Ok(()));
                         }
                         RecorderCommand::Store {
-                            samples,
-                            recorded_sessions,
+                            partition_id,
+                            generation,
                             committed,
                         } => {
-                            let result = UsageStore::open(&database)
-                                .map_err(|error| error.to_string())
-                                .and_then(|mut store| {
-                                    store
-                                        .upsert_samples_and_recorded_sessions(
-                                            &samples,
-                                            &recorded_sessions,
-                                        )
-                                        .map_err(|error| error.to_string())
+                            let RecorderGeneration {
+                                reset_at,
+                                window_seconds,
+                                collector_epoch,
+                                cycle_seq,
+                                samples,
+                                recorded_sessions,
+                                session_checkpoints,
+                                session_ranges,
+                                session_model_totals,
+                            } = generation;
+                            let result = active
+                                .as_ref()
+                                .filter(|current| current.partition.partition_id == partition_id)
+                                .ok_or_else(|| {
+                                    "recorder account partition is not active".to_owned()
+                                })
+                                .and_then(|current| {
+                                    UsageStore::open_partitioned(
+                                        &current.partition.database_path,
+                                        &current.identity,
+                                    )
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|mut store| {
+                                        store
+                                            .commit_session_collection(SessionCollectionCommit {
+                                                reset_at,
+                                                window_seconds,
+                                                collector_epoch,
+                                                cycle_seq,
+                                                samples: &samples,
+                                                checkpoints: &session_checkpoints,
+                                                ranges: &session_ranges,
+                                                model_totals: &session_model_totals,
+                                                recorded_sessions: &recorded_sessions,
+                                            })
+                                            .map(|_| ())
+                                            .map_err(|error| error.to_string())
+                                    })
                                 });
                             if result.is_ok() {
                                 eprintln!(
@@ -825,16 +1020,28 @@ impl RecorderWorker {
                             let _ = committed.send(result);
                         }
                         RecorderCommand::ForgetRecordedSessions {
+                            partition_id,
                             recorded_sessions,
                             committed,
                         } => {
-                            let result = UsageStore::open(&database)
-                                .map_err(|error| error.to_string())
-                                .and_then(|mut store| {
-                                    store
-                                        .forget_recorded_sessions(&recorded_sessions)
-                                        .map(|_| ())
-                                        .map_err(|error| error.to_string())
+                            let result = active
+                                .as_ref()
+                                .filter(|current| current.partition.partition_id == partition_id)
+                                .ok_or_else(|| {
+                                    "recorder account partition is not active".to_owned()
+                                })
+                                .and_then(|current| {
+                                    UsageStore::open_partitioned(
+                                        &current.partition.database_path,
+                                        &current.identity,
+                                    )
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|mut store| {
+                                        store
+                                            .forget_recorded_sessions(&recorded_sessions)
+                                            .map(|_| ())
+                                            .map_err(|error| error.to_string())
+                                    })
                                 });
                             let _ = committed.send(result);
                         }
@@ -866,10 +1073,12 @@ impl RecorderWorker {
         self.active
     }
 
-    /// Run the sole normal destructive store operation on the recorder's
-    /// serialized writer thread. A failed backup prevents pruning.
-    pub(crate) fn startup_maintenance(
+    /// Quiesce any old account and activate exactly one confirmed storage
+    /// partition. Candidate creation/recovery and bounded maintenance all run
+    /// on the sole serialized writer thread.
+    pub(crate) fn activate_partition(
         &self,
+        partition: AccountPartition,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
         let commands = self
@@ -878,10 +1087,28 @@ impl RecorderWorker {
             .ok_or_else(|| DaemonError::Runtime.to_string())?;
         let (completed, receiver) = mpsc::sync_channel(1);
         commands
-            .send(RecorderCommand::StartupMaintenance { now, completed })
+            .send(RecorderCommand::Activate {
+                partition,
+                now,
+                completed,
+            })
             .map_err(|_| DaemonError::Runtime.to_string())?;
         receiver
             .recv_timeout(Duration::from_secs(30))
+            .map_err(|_| DaemonError::Runtime.to_string())?
+    }
+
+    pub(crate) fn deactivate_partition(&self) -> Result<(), String> {
+        let commands = self
+            .commands
+            .as_ref()
+            .ok_or_else(|| DaemonError::Runtime.to_string())?;
+        let (completed, receiver) = mpsc::sync_channel(1);
+        commands
+            .send(RecorderCommand::Deactivate { completed })
+            .map_err(|_| DaemonError::Runtime.to_string())?;
+        receiver
+            .recv_timeout(Duration::from_secs(5))
             .map_err(|_| DaemonError::Runtime.to_string())?
     }
 
@@ -889,12 +1116,9 @@ impl RecorderWorker {
     /// cleanup in one SQLite transaction.
     pub(crate) fn store_generation(
         &self,
-        samples: Vec<UsageHistorySample>,
-        recorded_sessions: Vec<RecordedSessionSource>,
+        partition_id: String,
+        generation: RecorderGeneration,
     ) -> Result<(), String> {
-        if samples.is_empty() && recorded_sessions.is_empty() {
-            return Ok(());
-        }
         let commands = self
             .commands
             .as_ref()
@@ -902,8 +1126,8 @@ impl RecorderWorker {
         let (committed, receiver) = mpsc::sync_channel(1);
         commands
             .send(RecorderCommand::Store {
-                samples,
-                recorded_sessions,
+                partition_id,
+                generation,
                 committed,
             })
             .map_err(|_| DaemonError::Runtime.to_string())?;
@@ -916,6 +1140,7 @@ impl RecorderWorker {
     /// unlinked. Failure is safe: the stale marker remains fingerprint-bound.
     pub(crate) fn forget_recorded_sessions(
         &self,
+        partition_id: String,
         recorded_sessions: Vec<RecordedSessionSource>,
     ) -> Result<(), String> {
         if recorded_sessions.is_empty() {
@@ -928,6 +1153,7 @@ impl RecorderWorker {
         let (committed, receiver) = mpsc::sync_channel(1);
         commands
             .send(RecorderCommand::ForgetRecordedSessions {
+                partition_id,
                 recorded_sessions,
                 committed,
             })
@@ -1175,6 +1401,11 @@ mod tests {
         assert!(writer.is_active());
         let mut duplicate = RecorderWorker::start().unwrap();
         assert!(!duplicate.is_active());
+        let account_key = crate::account_scope::AccountKey::synthetic_preview("daemon-account");
+        let partition = crate::account_scope::resolve_partition(&data_dir, &account_key).unwrap();
+        writer
+            .activate_partition(partition.clone(), chrono::Utc::now())
+            .unwrap();
 
         let expected = crate::usage_store::UsageHistorySample {
             timestamp: now + 60,
@@ -1196,27 +1427,114 @@ mod tests {
             file_inode: 30,
         };
         writer
-            .store_generation(vec![expected.clone()], vec![marker.clone()])
+            .store_generation(
+                partition.partition_id.clone(),
+                RecorderGeneration {
+                    reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch: 1,
+                    cycle_seq: 1,
+                    samples: vec![expected.clone()],
+                    recorded_sessions: vec![marker.clone()],
+                    session_checkpoints: vec![crate::usage_store::SessionCheckpoint {
+                        root_identity: marker.root_identity.clone(),
+                        relative_path: marker.relative_path.clone(),
+                        file_device: marker.file_device,
+                        file_inode: marker.file_inode,
+                        committed_offset: marker.file_bytes,
+                        discard_until_lf: false,
+                        collector_epoch: 1,
+                        cycle_seq: 1,
+                        prefix_generation: 1,
+                        prefix_sha256: "00".repeat(32),
+                        fully_attributed_from_zero: true,
+                        token_baseline_known: true,
+                        last_model: Some("SOL".into()),
+                        previous_total: 12_345,
+                        previous_input: 10_000,
+                        previous_cached_input: 2_000,
+                        previous_output: 2_345,
+                    }],
+                    session_ranges: Vec::new(),
+                    session_model_totals: vec![crate::usage_store::SessionModelTotal {
+                        model: "SOL".into(),
+                        total_tokens: 12_345,
+                        input_tokens: 10_000,
+                        cached_input_tokens: 2_000,
+                        output_tokens: 2_345,
+                    }],
+                },
+            )
             .unwrap();
 
-        let (_history, database, lock) = data_paths().unwrap();
-        let store = UsageStore::open(&database).unwrap();
+        let database = partition.database_path.clone();
+        let lock = daemon_lock_path().unwrap();
+        let identity = partition.storage_identity();
+        let store = UsageStore::open_read_only_partitioned(&database, &identity).unwrap();
         let samples = store.load_all().unwrap();
         assert_eq!(samples, vec![expected]);
         assert!(store.recorded_session_matches(&marker).unwrap());
         drop(store);
         writer
-            .forget_recorded_sessions(vec![marker.clone()])
+            .forget_recorded_sessions(partition.partition_id.clone(), vec![marker.clone()])
             .unwrap();
-        assert!(!UsageStore::open(&database)
-            .unwrap()
-            .recorded_session_matches(&marker)
-            .unwrap());
+        assert!(
+            !UsageStore::open_read_only_partitioned(&database, &identity)
+                .unwrap()
+                .recorded_session_matches(&marker)
+                .unwrap()
+        );
         assert!(lock.exists());
+
+        let account_b = crate::account_scope::AccountKey::synthetic_preview("daemon-account-b");
+        let partition_b = crate::account_scope::resolve_partition(&data_dir, &account_b).unwrap();
+        writer
+            .activate_partition(partition_b.clone(), chrono::Utc::now())
+            .unwrap();
+        assert!(!partition.writer_lock_path.exists());
+        assert!(partition_b.writer_lock_path.is_file());
+        assert!(writer
+            .store_generation(
+                partition.partition_id.clone(),
+                RecorderGeneration {
+                    reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch: 2,
+                    cycle_seq: 1,
+                    samples: Vec::new(),
+                    recorded_sessions: Vec::new(),
+                    session_checkpoints: Vec::new(),
+                    session_ranges: Vec::new(),
+                    session_model_totals: Vec::new(),
+                },
+            )
+            .is_err());
+        assert!(UsageStore::open_read_only_partitioned(
+            &partition_b.database_path,
+            &partition_b.storage_identity(),
+        )
+        .unwrap()
+        .load_all()
+        .unwrap()
+        .is_empty());
+        writer
+            .activate_partition(partition.clone(), chrono::Utc::now())
+            .unwrap();
+        assert!(partition.writer_lock_path.is_file());
+        assert!(!partition_b.writer_lock_path.exists());
+        assert!(partition
+            .database_path
+            .with_extension("sqlite3.bak.1")
+            .is_file());
+        assert_eq!(
+            crate::account_scope::resolve_partition(&data_dir, &account_b).unwrap(),
+            partition_b
+        );
 
         duplicate.shutdown();
         writer.shutdown();
         assert!(!lock.exists());
+        assert!(!partition.writer_lock_path.exists());
         match old_home {
             Some(value) => std::env::set_var("CODEX_HOME", value),
             None => std::env::remove_var("CODEX_HOME"),
@@ -1226,5 +1544,34 @@ mod tests {
             None => std::env::remove_var("CODEX_INFO_DATA_DIR"),
         }
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn allocated_candidate_and_renamed_final_resume_without_a_stale_writer_lock() {
+        for phase in ["candidate", "renamed-final"] {
+            let root = temp_root(phase);
+            let account = crate::account_scope::AccountKey::synthetic_preview("crash-account");
+            let partition = crate::account_scope::resolve_partition(&root, &account).unwrap();
+            let identity = partition.storage_identity();
+            let candidate =
+                UsageStore::create_partitioned(&partition.candidate_path, &identity).unwrap();
+            drop(candidate);
+            if phase == "renamed-final" {
+                fs::rename(&partition.candidate_path, &partition.database_path).unwrap();
+            }
+            assert!(!partition.writer_lock_path.exists());
+
+            let active = activate_account_partition(partition.clone(), chrono::Utc::now()).unwrap();
+            assert!(partition.database_path.is_file());
+            assert!(!partition.candidate_path.exists());
+            assert!(partition.writer_lock_path.is_file());
+            drop(active);
+            assert!(!partition.writer_lock_path.exists());
+            assert_eq!(
+                crate::account_scope::resolve_partition(&root, &account).unwrap(),
+                partition
+            );
+            let _ = fs::remove_dir_all(root);
+        }
     }
 }

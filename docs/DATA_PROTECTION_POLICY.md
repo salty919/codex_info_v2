@@ -33,14 +33,14 @@ Codex app-server / session JSONL / thread rollout
 以下を満たせない変更は不合格とし、fallback値・ゼロ値・空DBで通過させない。
 
 1. 既存の有効なDB行を、収集失敗・認証失敗・通信切断・UI終了・migration失敗で削除、上書き、推測変換しない。
-2. canonical DBのusage rowは`(partition_id, reset_at, timestamp)`で一意である。`partition_id`は
-   `ProfileScopeId`、`AccountScopeId`、`StorageEpoch`に結合し、`timestamp`は有効なUTC event秒を
+2. canonical DBは`(ProfileScopeId, AccountScopeId, StorageEpoch)`ごとに物理fileを分け、DB内のusage rowは`(reset_at, timestamp)`で一意である。必須`storage_partition` singletonの`partition_id`は
+   その3値に結合し、`timestamp`は有効なUTC event秒を
    `floor(event_epoch / 60) * 60`へ変換したminute-startであり、同一キーの再計測は行を増やさず、
    残量はcanonical順序の最後の有効値、累積cost/tokenは列ごとの最大既知値を保持する。元event秒は
    同一minuteのcanonical順序を決めるためだけに使い、REST/DBのtimestampへ書き戻さない。
 3. DB書き込みはtransaction内だけで行う。busy、I/O、full、corrupt、schema不一致、migration中断はrollbackし、旧DBと旧メモリ世代を保持する。
-4. 有効な完全snapshotだけを公開する。`SnapshotPublisher`のpublish admissionは現行の
-   `(ProfileScopeId, AccountScopeId, StorageEpoch, SupervisorLeaseIdentity, CollectorEpoch, CycleSeq)` tupleだけを正本とし、candidateの6要素が全て現行値と一致する場合だけDB、memory、REST、UIへ進める。
+4. 有効な完全snapshotだけを公開する。account usageのcommit/publish admissionは現行の
+   `(ProfileScopeId, AccountScopeId, StorageEpoch, auth_epoch, AccountUpdateGeneration, CollectorEpoch, CycleSeq)` tupleだけを正本とし、candidateの7要素が全て現行値と一致する場合だけDB、memory、REST、UIへ進める。`SupervisorLeaseIdentity`は同一profile serviceの単一publisher所有権を別に固定し、account generationの代用にしない。
    stale lease/epoch/cycleまたはtuple欠落・不一致はcandidateを破棄し、DB、memory、REST、UIを0変更とする。部分的な履歴、thread、model usage、REST応答を成功値として公開しない。
 5. local usage JSONLとlive rolloutを同じrecord隔離規則へ丸めない。live rolloutではUTF-8、JSON、
    envelope、event kind、task-stateへの非影響を完全検証できない改行済みrecordを含むcycleはfail-closedにする。
@@ -97,7 +97,7 @@ Codex app-server / session JSONL / thread rollout
 | schema mismatch/migration失敗 | 旧DB、旧backup世代 | 新DB候補 | migrationを修正して別途再実行 |
 | backup/rotation/restore失敗 | 現行DB、検証済み3世代、旧memory/root | partial backup/candidate、未検証世代 | 次のmaintenanceまたは明示restore。自動復元0 |
 | confirmed daemon stop gap | 前後のvalid sample、gap ledger、旧完全root | gap区間の補間値・複製値 | source cursor確認後にのみ確定。確定後は次の実sampleで再開 |
-| status/details pair不一致・stale admission tuple | 直前の完全status/details pair、現行`(ProfileScopeId, AccountScopeId, StorageEpoch, SupervisorLeaseIdentity, CollectorEpoch, CycleSeq)` | 片側だけ進んだcandidate、stale lease/epoch/cycle candidate | 次cycleで現行tupleを再取得・検証し、DB/memory/REST/UIは不一致中0変更 |
+| status/details pair不一致・stale admission tuple | 直前の完全status/details pair、現行`(ProfileScopeId, AccountScopeId, StorageEpoch, auth_epoch, AccountUpdateGeneration, CollectorEpoch, CycleSeq)`とprofile publisher lease | 片側だけ進んだcandidate、stale account/lease/epoch/cycle candidate | 次cycleで現行tupleを再取得・検証し、DB/memory/REST/UIは不一致中0変更 |
 | 認証喪失・アカウント切替 | 非認証root（旧account表示は消去）と非破壊DB | 旧accountの画面公開値 | 認証成功後に再読込 |
 | reset hint expired / auth epoch切替 | source log、旧DB、旧root、tombstone hint | `now >= reset_at`の旧期間scan/row、次期間への誤帰属、旧epochの公開値 | 旧hintをexpiredまたはtombstonedとして無効化し、source logを保持。current epochのfresh authenticated hint後だけ次のbounded one-shot |
 | UI/REST publish失敗 | DBのcommit済み世代、旧表示snapshot | 失敗した公開試行 | 次のroot更新または明示操作 |
@@ -161,7 +161,7 @@ Codex app-server / session JSONL / thread rollout
 ### 4.3 Migration 3経路とSQLite fault matrix
 
 - **old-schema startup reject**: 現行schemaでないDBはread/writeを拒否し、旧DB、旧backup、old memory/rootをそのまま保持する。暗黙変換や空DB置換はしない。
-- **candidate migration success**: `UsageStore::migrate_verified`が別名candidateをtransactionで作り、全rowの型・値・`(partition_id,reset_at,timestamp)`一意性、quick_check、row count、deterministic fingerprint、partition/reset-period境界を比較する。writer/API/UI停止後、旧DB/candidateをflush/fsyncしparent directoryをfsyncする。owner-only `migration-switch-v1` journalへold/candidate/current path・inode・hash・phaseをflush/fsyncし、各renameとdirectory fsyncを記録する。再読込/pair検証後だけjournalを`committed`へ進め、DataGenerationを1回だけ増やす。terminal journalの削除は別のretention処理で行い、commit成立条件へ混ぜない。
+- **candidate migration success**: `UsageStore::migrate_verified`が同一account partitionの別名candidateをtransactionで作り、全rowの型・値・物理DB内`(reset_at,timestamp)`一意性、exact partition row、quick_check、row count、deterministic fingerprint、reset-period境界を比較する。writer/API/UI停止後、旧DB/candidateをflush/fsyncしparent directoryをfsyncする。owner-only `migration-switch-v1` journalへold/candidate/current path・inode・hash・phaseをflush/fsyncし、各renameとdirectory fsyncを記録する。再読込/pair検証後だけjournalを`committed`へ進め、DataGenerationを1回だけ増やす。terminal journalの削除は別のretention処理で行い、commit成立条件へ混ぜない。
 - **candidate validation/switch/crash failure**: candidate、lock競合、backup、rename、fsync、再読込、pair検証のいずれかが失敗した場合、または再起動時に未完了journalがある場合は、journalと実path/inode/hashから完全rollbackまたはroll-forwardを一意に選ぶ。current path不在、current DB二重、空DB自動作成を許さず、回復完了までwriter/publish=0、旧DB/backup/memory/rootを保持し、同callbackで再試行しない。
 
 `migration-switch-v1`はowner-only 0600、UTF-8 JSON、64 KiB以下とし、exact key集合を
@@ -195,7 +195,7 @@ DataGeneration、pair publicationを二重化しない。foreign/第二operation
 | REST response headers / status body / details body | 8KiB / 64KiB / 32MiB、transfer後・decode前 | Content-Lengthは事前拒否、streamは最初の超過byteで停止 |
 | transaction batch / retry | usage rowsは最大1024かつ1MiB、recorded session markerはinventory上限と同じ最大4096 rows、backfill latch=1、scan/restart retry=1 | 上限到達はpartial公開せず次cycleまたは明示操作。markerは同cycleのusage transactionへ同梱する |
 
-session selectionとcache fingerprintは同じmtime/path降順vectorを使い、overflowはcache fingerprintへ混ぜず毎inventoryで再構成する。SQLite `recorded_sessions` はcanonical sessions root identityとUTF-8 root-relative normal pathを複合keyとし、size、mtime nanoseconds、device/inodeを完全fingerprintとして保持する。fully parsedかつ前後fingerprint不変のselected fileだけを、通常usage sampleと同一transactionでupsertする。cleanupはcommit後の別maintenanceであり、fresh read-only marker、regular/non-symlink containment、直前まで同一のfingerprint、bounded `/proc` scanによるCodex open-FD不在がすべて成立したoverflow fileだけを削除する。missing、unmarked、legacy、changed、active、selected、DB/process scan失敗は保持し、同callback retryは0とする。file削除後のmarker削除に失敗した場合はfingerprint-boundのstale markerを保持し、usage history、durable state、verified backup、reset hint、delegation recoveryを変更しない。
+session selectionとcache fingerprintは同じmtime/path降順vectorを使い、overflowを含む直前verified inventoryをCollectorEpoch内だけ保持する。SQLite `recorded_sessions` はcanonical sessions root identity、UTF-8 root-relative normal path、size、mtime nanoseconds、device/inodeの完全fingerprintを複合keyとし、旧source markerを上書きしない。identity boundary時に存在したfile、直前inventoryに存在した未checkpoint file、rotation/truncation/prefix不一致fileは現在EOFへbaselineし、同epochの直前inventoryに存在しなかった新規fileだけoffset 0から帰属できる。cleanupはcommit後の別maintenanceであり、offset 0からEOFまでfully attributedなfresh read-only marker、regular/non-symlink containment、直前まで同一のfingerprint、bounded `/proc` scanによるCodex open-FD不在がすべて成立したoverflow fileだけを削除する。missing、unmarked、baseline、legacy、partial、changed、active、selected、DB/process scan失敗は保持し、同callback retryは0とする。file削除後のmarker削除に失敗した場合はfingerprint-boundのstale markerを保持し、usage history、durable state、verified backup、reset hint、delegation recoveryを変更しない。
 
 ## 5. 変更管理の制約
 
@@ -289,9 +289,10 @@ SQLite transactionとDB/WAL/SHM mutationである。OSがread-only openに伴っ
 
 ### 8.6 DP-REST-005 / RC-143 — storage partition identity
 
-一つのcanonical DB file内にlogical partitionを持つ。partition keyは
-`(ProfileScopeId, AccountScopeId, StorageEpoch)`であり、usage rowの一意keyは
-`(partition_id, reset_at, timestamp)`である。
+partition keyは`(ProfileScopeId, AccountScopeId, StorageEpoch)`であり、各partitionを
+`history/accounts/v1/<AccountScopeId>/epoch-<StorageEpoch>/usage_history.sqlite3`へ物理分離する。
+usage rowの一意keyは各物理DB内の`(reset_at,timestamp)`である。DBにはexactly oneの
+`storage_partition` rowを置き、schema/profile/account/epoch/partition IDと`quick_check`が一致しないfileを開かない。
 
 - `ProfileScopeId`: 保存profileを作成した時に生成する128-bit random opaque ID。raw WSL distro、SSH alias、pathを
   DBへ保存しない。
@@ -305,17 +306,22 @@ SQLite transactionとDB/WAL/SHM mutationである。OSがread-only openに伴っ
 partitionだけを公開し、旧partitionを削除・混合しない。HMAC install keyは0600 owner-only fileへatomic保存し、
 欠損時は既存AccountScopeIdを再生成せずrecovery-requiredとする。
 
+canonical AccountKeyはowner-only・regular・0600・1..65536 bytesで前後identityが安定した
+`CODEX_HOME/auth.json`のexact `tokens.account_id` bytesである。前後`account/read`とprocess-local
+`AccountUpdateGeneration`を含むconfirmed windowが不一致なら、DB/WAL/SHM、checkpoint、publishを0件にする。
+raw AccountKey、email、tokenはpath、profile metadata、DB、journal、log、RESTへ保存しない。
+
 ### 8.7 DP-REST-006 / RC-144 — cursorとDB transaction
 
-authoritative checkpointは外部cursor fileではなく同じSQLite DBの`collector_checkpoint` tableに置き、usage row batch、
-dedupe record、`DataGeneration`、RootHashと同じtransactionでcommitする。checkpoint keyは
-`(partition_id,source_file_device,source_file_inode)`、値はfingerprint、durable byte offset、last complete record hash、
-AuthEpoch nonce、operation IDである。外部hintはscan開始候補でありcommit authorityではない。
+authoritative checkpointは外部cursor fileではなく同じaccount SQLite DBの`session_checkpoints` tableに置き、usage row batch、
+`session_ranges` dedupe、model totals、fully-attributed marker、`DataGeneration`と同じtransactionでcommitする。checkpoint keyは
+`(sessions root identity,root-relative path,device,inode,prefix generation)`であり、旧source identityのcheckpoint/markerを
+新sourceで上書きしない。外部hintはscan開始候補でありcommit authorityではない。
 
 transaction commit前はrow/checkpoint/generationの全てが旧値、commit後は全てが新値である。commit後publish前のcrashは
-再起動時にDB checkpoint/rootから同じpairを一度だけ再生成する。source record identity
-`(partition_id,file identity,start offset,end offset,record hash)`はuniqueで、再読込はno-op、partial rowとcursor先行を
-0件にする。
+再起動とidentity boundaryでは旧cursorを再開せず、現存fileをEOFへfresh baselineする。source record identity
+`(root identity,relative path,device,inode,prefix generation,start offset,end offset,record SHA-256)`はuniqueで、
+同一CollectorEpoch内の再読込はno-op、partial rowとcursor先行を0件にする。
 
 ### 8.8 DP-REST-007 / RC-145 — typed generation namespace
 
@@ -323,7 +329,9 @@ bare integerを異なるnamespace間で比較しない。採用型は次のと�
 
 - `BootId`: Linux `/proc/sys/kernel/random/boot_id`のUUID。
 - `SupervisorLeaseIdentity`: canonical DB profile、BootId、PID、process start ticks、128-bit owner nonceのtuple。
-- `CollectorEpoch`: lease取得ごとに生成する128-bit random ID。
+- `auth_epoch`: logout、account change、identity failure、account worker restartごとに増えるprocess-local u64。overflowはprocess restartによるrecovery-requiredとする。
+- `AccountUpdateGeneration`: 同じapp-server processでstrictな`account/updated`受理ごとに増えるprocess-local u64。別process値と比較せず、malformed/overflowでauthorityを失効する。
+- `CollectorEpoch`: service startと各identity boundaryで生成する128-bit random ID。同じepochだけSession continuityを認める。
 - `CycleSeq`: CollectorEpoch内で1から始まり、admitted cycleごとに1増えるu64。
 - `DataGeneration`: partition内で0から始まり、usage rowとcheckpointの同一transaction commitごとに1増えるu64。
 - `BackupGeneration`: DB profile内のu64と128-bit backup ID。parent DataGenerationとDB SHAを必須にし、一activationで
@@ -426,8 +434,8 @@ rootの実sampleとgap集合を一括採用した時だけmarkerを除去する�
 `source_event` は `append`、`rotate`、`truncate`、`replace` の4値だけとする。source identity は
 `(device,inode,size,prefix_generation)` とし、Windowsでの実体名はそれぞれ
 `device_or_volume_serial`、`file_index_or_inode` と記録する。`prefix_generation` は canonical pathごとの
-monotonic `u64` で、`[0,last_complete_lf_offset)` の完全prefix hashが変わった場合または
-identity replacementが検出された場合だけ増加する。mtime、filename、現在時刻から推測しない。
+opaque 128-bit値で、CollectorEpoch、source identity、prefix SHA-256から導出する。完全prefix hashが変わった場合または
+identity replacementが検出された場合は別generationとなり、mtime、filename、現在時刻から推測しない。
 
 event分類は、再openした同一canonical pathの before/after identity と prefix hashを同じoracleで比較し、
 `rotation_marker=1` かつ identity変更なら `rotate`、identity変更で markerがなければ `replace`、
@@ -436,9 +444,7 @@ identity不変かつ size減少なら `truncate`、identityとprefixが不変で
 
 - `append` は同じ device/inode/prefix_generation の durable cursor
   `(last_complete_lf_offset,last_complete_row_sha256)` 以降だけを読む。
-- `rotate` と `replace` は新しい file identity の cursor を必ず `0` に reset する。
-- `truncate` は新size以下の最後の durable LF boundaryへ cursorを clamp し、その直前の完全recordを
-  最大1件だけ bounded overlap として再検査する。boundaryが存在しない場合だけ file offset `0` から1回読む。
+- `rotate`、`replace`、`truncate`、prefix不一致は新しいsourceを現在EOFへbaselineし、境界以前のbytesを自動帰属しない。
 - 旧cursorで有効recordを `skip` する数は `skip_count=0`、dedupe keyによる重複insert数は `dedupe_insert_count=0` とする。
   dedupe key は `(partition_id,file_device,file_inode,start_offset,end_offset,record_sha256)` である。
 - 1 eventにつき scan は最大1回、DB transaction は最大1回、同じcallback内のretryは `0`、次の通常cycleまたは

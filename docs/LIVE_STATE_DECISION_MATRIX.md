@@ -12,7 +12,8 @@ candidate schema valid
   AND at least one stable eligible ProcessIdentity owns that path
   AND rollout parser last task state == running
   AND owner/root/edge graph is valid
-  AND ProfileScopeId/AccountScopeId/StorageEpoch/SupervisorLeaseIdentity/CollectorEpoch/CycleSeq admission is current
+  AND ProfileScopeId/AccountScopeId/StorageEpoch/auth_epoch/AccountUpdateGeneration/CollectorEpoch/CycleSeq admission is current
+  AND SupervisorLeaseIdentity owns the current profile publisher
 ```
 
 どれか一つでも不成立なら、そのcandidateを公開しない。envelope、graph、DB、epochがcycle単位で不確実な場合は部分結果を公開せず、旧完全snapshotを保持して未確認状態を表示する。
@@ -31,7 +32,8 @@ candidate schema valid
   読み替えない。observer childは生成したCodex Info processが必ずreapし、orphan observerを許さない。
 - `eligible_workload_active_paths`は`canonical path -> nonempty ProcessIdentity set`のmapであり、
   pathだけの世代なし集合ではない。process snapshot、FD、rollout、DB graph、RPC envelopeをcycle間で混ぜない。
-- publish admission keyは`(ProfileScopeId, AccountScopeId, StorageEpoch, SupervisorLeaseIdentity, CollectorEpoch, CycleSeq)`とする。
+- account usage admission keyは`(ProfileScopeId, AccountScopeId, StorageEpoch, auth_epoch, AccountUpdateGeneration, CollectorEpoch, CycleSeq)`とする。
+  `SupervisorLeaseIdentity`はprofile publisherの単一所有権を別に固定する。
   同じprofile/accountでは現行leaseの単一publisherだけがsnapshotを置換できる。別server/collectorの
   stale lease、旧epoch、同一以下のCycleSeqはcomplete responseであってもno-opで、DB・memory・REST・UIを
   上書きしない。identity値は内部判定専用でUI/RESTへ追加表示しない。
@@ -72,6 +74,10 @@ presentationでは、accepted set内にnon-null `parent_thread_id`が存在し�
 | concurrent | Codex Info/collector複数、stale lease/epoch/cycle | ADMISSION REJECT | 現行単一publisherだけがatomic置換し、他世代はno-op | lease identity、stale epoch/cycle、concurrent publisher tests |
 | transport | RPC timeout/error/invalid envelope、候補の一部読取失敗 | FAIL-CLOSED | 旧thread snapshot保持、未確認表示（部分snapshotは公開しない） | RPC/error tests、`thread_c_snapshot_rejects_partial_candidate_reads` |
 | epoch | stale thread/local/account event | NO-OP | 現行世代不変 | `stale_thread_and_local_results_are_complete_no_ops` |
+| account identity | logout | HARD BOUNDARY | `auth_required`のstrict empty root。旧DB/Sessionは保持 | `public_snapshot_is_whitelisted_and_tracks_auth_state` |
+| account identity | confirmed A→BまたはB→A | HARD BOUNDARY | `initializing`のstrict empty root後、fresh EOF baselineと新account DBだけを公開 | account boundary/A-B partition tests |
+| account identity | auth/metadata/partition不一致または世代overflow | FAIL-CLOSED | `error`のstrict empty root。旧account fallback、DB/WAL/SHM mutation 0 | auth/registry/schema/overflow tests |
+| session attribution | identity boundary以前の既存file、partial tail、rotation/truncation/prefix不一致 | BASELINE/REJECT | usage/marker 0、sourceと旧checkpointを保持 | incremental baseline/prefix/partial tests |
 
 ## 解除（復帰）条件
 

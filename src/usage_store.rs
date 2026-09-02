@@ -58,8 +58,126 @@ CREATE TABLE IF NOT EXISTS recorded_sessions (
     modified_nanos TEXT NOT NULL,
     file_device TEXT NOT NULL,
     file_inode TEXT NOT NULL,
-    PRIMARY KEY (root_identity, relative_path)
+    PRIMARY KEY (
+        root_identity,
+        relative_path,
+        file_bytes,
+        modified_nanos,
+        file_device,
+        file_inode
+    )
 ) WITHOUT ROWID;
+"#;
+
+const PARTITION_SCHEMA: &str = r#"
+CREATE TABLE storage_partition (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    schema_version TEXT NOT NULL,
+    profile_scope_id TEXT NOT NULL,
+    account_scope_id TEXT NOT NULL,
+    storage_epoch TEXT NOT NULL,
+    partition_id TEXT NOT NULL
+);
+
+CREATE TABLE collection_generation (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    data_generation TEXT NOT NULL,
+    reset_at INTEGER NOT NULL CHECK (reset_at >= 0),
+    window_seconds INTEGER NOT NULL CHECK (window_seconds >= 0),
+    collector_epoch TEXT,
+    cycle_seq TEXT NOT NULL,
+    CHECK (
+        collector_epoch IS NULL OR (
+            length(collector_epoch) = 32
+            AND collector_epoch NOT GLOB '*[^0-9a-f]*'
+        )
+    )
+);
+INSERT INTO collection_generation (
+    singleton, data_generation, reset_at, window_seconds, collector_epoch, cycle_seq
+) VALUES (1, '0', 0, 0, NULL, '0');
+
+CREATE TABLE session_checkpoints (
+    root_identity TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    file_device TEXT NOT NULL,
+    file_inode TEXT NOT NULL,
+    committed_offset INTEGER NOT NULL CHECK (committed_offset >= 0),
+    discard_until_lf INTEGER NOT NULL CHECK (discard_until_lf IN (0, 1)),
+    collector_epoch TEXT NOT NULL CHECK (
+        length(collector_epoch) = 32
+        AND collector_epoch NOT GLOB '*[^0-9a-f]*'
+    ),
+    cycle_seq TEXT NOT NULL,
+    prefix_generation TEXT NOT NULL CHECK (
+        length(prefix_generation) = 32
+        AND prefix_generation NOT GLOB '*[^0-9a-f]*'
+    ),
+    prefix_sha256 TEXT NOT NULL CHECK (
+        length(prefix_sha256) = 64
+        AND prefix_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    fully_attributed_from_zero INTEGER NOT NULL CHECK (fully_attributed_from_zero IN (0, 1)),
+    token_baseline_known INTEGER NOT NULL CHECK (token_baseline_known IN (0, 1)),
+    last_model TEXT,
+    previous_total TEXT NOT NULL,
+    previous_input TEXT NOT NULL,
+    previous_cached_input TEXT NOT NULL,
+    previous_output TEXT NOT NULL,
+    PRIMARY KEY (
+        root_identity,
+        relative_path,
+        file_device,
+        file_inode,
+        prefix_generation
+    )
+) WITHOUT ROWID;
+
+CREATE TABLE session_ranges (
+    root_identity TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    file_device TEXT NOT NULL,
+    file_inode TEXT NOT NULL,
+    start_offset INTEGER NOT NULL CHECK (start_offset >= 0),
+    end_offset INTEGER NOT NULL CHECK (end_offset > start_offset),
+    collector_epoch TEXT NOT NULL CHECK (
+        length(collector_epoch) = 32
+        AND collector_epoch NOT GLOB '*[^0-9a-f]*'
+    ),
+    cycle_seq TEXT NOT NULL,
+    prefix_generation TEXT NOT NULL CHECK (
+        length(prefix_generation) = 32
+        AND prefix_generation NOT GLOB '*[^0-9a-f]*'
+    ),
+    record_sha256 TEXT NOT NULL CHECK (
+        length(record_sha256) = 64
+        AND record_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    PRIMARY KEY (
+        root_identity,
+        relative_path,
+        file_device,
+        file_inode,
+        prefix_generation,
+        start_offset,
+        end_offset,
+        record_sha256
+    )
+) WITHOUT ROWID;
+
+CREATE TABLE session_model_totals (
+    model TEXT PRIMARY KEY,
+    total_tokens TEXT NOT NULL,
+    input_tokens TEXT NOT NULL,
+    cached_input_tokens TEXT NOT NULL,
+    output_tokens TEXT NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE recorder_gap_ledger (
+    data_generation TEXT PRIMARY KEY,
+    observed_at INTEGER NOT NULL CHECK (observed_at > 0),
+    reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 128)
+);
 "#;
 
 const RESET_GROUP_TOLERANCE_SECONDS: i128 = 60;
@@ -178,6 +296,107 @@ pub struct DurableRecord {
     pub data_generation: u64,
     pub data_hash: String,
     pub snapshot_json: String,
+}
+
+/// Durable identity that must match the one and only partition row in a
+/// physical account database. All values are opaque lower-hex identifiers;
+/// no raw account identifier is accepted by this layer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoragePartitionIdentity {
+    pub schema_version: String,
+    pub profile_scope_id: String,
+    pub account_scope_id: String,
+    pub storage_epoch: u64,
+    pub partition_id: String,
+}
+
+impl StoragePartitionIdentity {
+    fn validate(&self) -> Result<()> {
+        fn lower_hex(value: &str, bytes: usize) -> bool {
+            value.len() == bytes * 2
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }
+        if self.schema_version != "codex-info-account-db-v1"
+            || !lower_hex(&self.profile_scope_id, 16)
+            || !lower_hex(&self.account_scope_id, 32)
+            || self.storage_epoch == 0
+            || !lower_hex(&self.partition_id, 32)
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "storage partition identity is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionCheckpoint {
+    pub root_identity: String,
+    pub relative_path: String,
+    pub file_device: u64,
+    pub file_inode: u64,
+    pub committed_offset: u64,
+    pub discard_until_lf: bool,
+    pub collector_epoch: u128,
+    pub cycle_seq: u64,
+    pub prefix_generation: u128,
+    pub prefix_sha256: String,
+    pub fully_attributed_from_zero: bool,
+    pub token_baseline_known: bool,
+    pub last_model: Option<String>,
+    pub previous_total: u64,
+    pub previous_input: u64,
+    pub previous_cached_input: u64,
+    pub previous_output: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionRange {
+    pub root_identity: String,
+    pub relative_path: String,
+    pub file_device: u64,
+    pub file_inode: u64,
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub collector_epoch: u128,
+    pub cycle_seq: u64,
+    pub prefix_generation: u128,
+    pub record_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionModelTotal {
+    pub model: String,
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionCollectionState {
+    pub data_generation: u64,
+    pub reset_at: i64,
+    pub window_seconds: i64,
+    pub collector_epoch: Option<u128>,
+    pub cycle_seq: u64,
+    pub checkpoints: Vec<SessionCheckpoint>,
+    pub model_totals: Vec<SessionModelTotal>,
+}
+
+pub struct SessionCollectionCommit<'a> {
+    pub reset_at: i64,
+    pub window_seconds: i64,
+    pub collector_epoch: u128,
+    pub cycle_seq: u64,
+    pub samples: &'a [UsageHistorySample],
+    pub checkpoints: &'a [SessionCheckpoint],
+    pub ranges: &'a [SessionRange],
+    pub model_totals: &'a [SessionModelTotal],
+    pub recorded_sessions: &'a [RecordedSessionSource],
 }
 
 /// Result of a verified, candidate-database migration.
@@ -359,19 +578,126 @@ impl RecordedSessionSource {
 fn canonicalize_recorded_sessions(
     sources: &[RecordedSessionSource],
 ) -> Result<Vec<RecordedSessionSource>> {
-    let mut canonical = BTreeMap::<(String, String), RecordedSessionSource>::new();
+    let mut canonical = BTreeSet::new();
     for source in sources {
         source.validate()?;
-        let key = (source.root_identity.clone(), source.relative_path.clone());
-        if let Some(existing) = canonical.get(&key) {
-            if existing != source {
-                return Err(UsageStoreError::InvalidImport(
-                    "conflicting recorded session fingerprints".into(),
-                ));
-            }
-            continue;
+        canonical.insert(source.clone());
+    }
+    Ok(canonical.into_iter().collect())
+}
+
+fn canonical_u64_text(value: &str, field: &'static str) -> Result<u64> {
+    let parsed = value.parse::<u64>().map_err(|_| {
+        UsageStoreError::InvalidImport(format!("{field} is not a canonical unsigned integer"))
+    })?;
+    if parsed.to_string() != value {
+        return Err(UsageStoreError::InvalidImport(format!(
+            "{field} is not a canonical unsigned integer"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn canonical_u128_hex(value: &str, field: &'static str) -> Result<u128> {
+    if value.len() != 32
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(UsageStoreError::InvalidImport(format!(
+            "{field} is not canonical lower hexadecimal"
+        )));
+    }
+    let parsed = u128::from_str_radix(value, 16).map_err(|_| {
+        UsageStoreError::InvalidImport(format!("{field} is not canonical lower hexadecimal"))
+    })?;
+    if parsed == 0 {
+        return Err(UsageStoreError::InvalidImport(format!(
+            "{field} must be non-zero"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn validate_sha256(value: &str, field: &'static str) -> Result<()> {
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(UsageStoreError::InvalidImport(format!(
+            "{field} is not a SHA-256 digest"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_session_key(root_identity: &str, relative_path: &str) -> Result<()> {
+    RecordedSessionSource {
+        root_identity: root_identity.to_owned(),
+        relative_path: relative_path.to_owned(),
+        file_bytes: 0,
+        modified_nanos: 0,
+        file_device: 0,
+        file_inode: 0,
+    }
+    .validate()
+}
+
+fn validate_session_checkpoint(checkpoint: &SessionCheckpoint) -> Result<()> {
+    validate_session_key(&checkpoint.root_identity, &checkpoint.relative_path)?;
+    if checkpoint.committed_offset > i64::MAX as u64
+        || checkpoint.collector_epoch == 0
+        || checkpoint.cycle_seq == 0
+        || checkpoint.prefix_generation == 0
+        || checkpoint
+            .last_model
+            .as_deref()
+            .is_some_and(|model| !matches!(model, "SOL" | "TERRA" | "LUNA"))
+        || checkpoint.previous_cached_input > checkpoint.previous_input
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "session checkpoint is invalid".into(),
+        ));
+    }
+    validate_sha256(&checkpoint.prefix_sha256, "session checkpoint prefix")?;
+    Ok(())
+}
+
+fn validate_session_range(range: &SessionRange) -> Result<()> {
+    validate_session_key(&range.root_identity, &range.relative_path)?;
+    if range.start_offset >= range.end_offset
+        || range.end_offset > i64::MAX as u64
+        || range.collector_epoch == 0
+        || range.cycle_seq == 0
+        || range.prefix_generation == 0
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "session range is invalid".into(),
+        ));
+    }
+    validate_sha256(&range.record_sha256, "session range record")?;
+    Ok(())
+}
+
+fn canonicalize_model_totals(totals: &[SessionModelTotal]) -> Result<Vec<SessionModelTotal>> {
+    let mut canonical = BTreeMap::new();
+    for total in totals {
+        if !matches!(total.model.as_str(), "SOL" | "TERRA" | "LUNA")
+            || total.cached_input_tokens > total.input_tokens
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "session model total is invalid".into(),
+            ));
         }
-        canonical.insert(key, source.clone());
+        if canonical
+            .insert(total.model.clone(), total.clone())
+            .is_some()
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "duplicate session model total".into(),
+            ));
+        }
     }
     Ok(canonical.into_values().collect())
 }
@@ -424,17 +750,17 @@ fn validate_recorded_sessions_schema(transaction: &rusqlite::Transaction<'_>) ->
     let expected = vec![
         (0, "root_identity".to_owned(), "TEXT".to_owned(), 1, None, 1),
         (1, "relative_path".to_owned(), "TEXT".to_owned(), 1, None, 2),
-        (2, "file_bytes".to_owned(), "INTEGER".to_owned(), 1, None, 0),
+        (2, "file_bytes".to_owned(), "INTEGER".to_owned(), 1, None, 3),
         (
             3,
             "modified_nanos".to_owned(),
             "TEXT".to_owned(),
             1,
             None,
-            0,
+            4,
         ),
-        (4, "file_device".to_owned(), "TEXT".to_owned(), 1, None, 0),
-        (5, "file_inode".to_owned(), "TEXT".to_owned(), 1, None, 0),
+        (4, "file_device".to_owned(), "TEXT".to_owned(), 1, None, 5),
+        (5, "file_inode".to_owned(), "TEXT".to_owned(), 1, None, 6),
     ];
     if columns != expected {
         return Err(UsageStoreError::InvalidImport(
@@ -823,8 +1149,376 @@ pub struct UsageStore {
     connection: Connection,
 }
 
+fn validate_partition_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(UsageStoreError::InvalidImport(
+            "partition database must be a regular file".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "partition database must be owner-private".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_partition_schema(connection: &Connection) -> Result<()> {
+    type ColumnContract = (&'static str, &'static str, i64);
+    type TableContract = (&'static str, &'static [ColumnContract]);
+    const TABLES: &[TableContract] = &[
+        (
+            "usage_history",
+            &[
+                ("timestamp", "INTEGER", 2),
+                ("reset_at", "INTEGER", 1),
+                ("remaining_percent", "REAL", 0),
+                ("sol_dollars", "REAL", 0),
+                ("terra_dollars", "REAL", 0),
+                ("luna_dollars", "REAL", 0),
+                ("sol_tokens", "INTEGER", 0),
+                ("terra_tokens", "INTEGER", 0),
+                ("luna_tokens", "INTEGER", 0),
+            ],
+        ),
+        (
+            "durable_state",
+            &[
+                ("singleton", "INTEGER", 1),
+                ("data_generation", "INTEGER", 0),
+                ("data_hash", "TEXT", 0),
+                ("snapshot_json", "TEXT", 0),
+            ],
+        ),
+        (
+            "recorded_sessions",
+            &[
+                ("root_identity", "TEXT", 1),
+                ("relative_path", "TEXT", 2),
+                ("file_bytes", "INTEGER", 3),
+                ("modified_nanos", "TEXT", 4),
+                ("file_device", "TEXT", 5),
+                ("file_inode", "TEXT", 6),
+            ],
+        ),
+        (
+            "storage_partition",
+            &[
+                ("singleton", "INTEGER", 1),
+                ("schema_version", "TEXT", 0),
+                ("profile_scope_id", "TEXT", 0),
+                ("account_scope_id", "TEXT", 0),
+                ("storage_epoch", "TEXT", 0),
+                ("partition_id", "TEXT", 0),
+            ],
+        ),
+        (
+            "collection_generation",
+            &[
+                ("singleton", "INTEGER", 1),
+                ("data_generation", "TEXT", 0),
+                ("reset_at", "INTEGER", 0),
+                ("window_seconds", "INTEGER", 0),
+                ("collector_epoch", "TEXT", 0),
+                ("cycle_seq", "TEXT", 0),
+            ],
+        ),
+        (
+            "session_checkpoints",
+            &[
+                ("root_identity", "TEXT", 1),
+                ("relative_path", "TEXT", 2),
+                ("file_device", "TEXT", 3),
+                ("file_inode", "TEXT", 4),
+                ("committed_offset", "INTEGER", 0),
+                ("discard_until_lf", "INTEGER", 0),
+                ("collector_epoch", "TEXT", 0),
+                ("cycle_seq", "TEXT", 0),
+                ("prefix_generation", "TEXT", 5),
+                ("prefix_sha256", "TEXT", 0),
+                ("fully_attributed_from_zero", "INTEGER", 0),
+                ("token_baseline_known", "INTEGER", 0),
+                ("last_model", "TEXT", 0),
+                ("previous_total", "TEXT", 0),
+                ("previous_input", "TEXT", 0),
+                ("previous_cached_input", "TEXT", 0),
+                ("previous_output", "TEXT", 0),
+            ],
+        ),
+        (
+            "session_ranges",
+            &[
+                ("root_identity", "TEXT", 1),
+                ("relative_path", "TEXT", 2),
+                ("file_device", "TEXT", 3),
+                ("file_inode", "TEXT", 4),
+                ("start_offset", "INTEGER", 6),
+                ("end_offset", "INTEGER", 7),
+                ("collector_epoch", "TEXT", 0),
+                ("cycle_seq", "TEXT", 0),
+                ("prefix_generation", "TEXT", 5),
+                ("record_sha256", "TEXT", 8),
+            ],
+        ),
+        (
+            "session_model_totals",
+            &[
+                ("model", "TEXT", 1),
+                ("total_tokens", "TEXT", 0),
+                ("input_tokens", "TEXT", 0),
+                ("cached_input_tokens", "TEXT", 0),
+                ("output_tokens", "TEXT", 0),
+            ],
+        ),
+        (
+            "recorder_gap_ledger",
+            &[
+                ("data_generation", "TEXT", 1),
+                ("observed_at", "INTEGER", 0),
+                ("reason", "TEXT", 0),
+            ],
+        ),
+    ];
+
+    let mut table_statement = connection.prepare(
+        "SELECT name FROM sqlite_schema
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let actual_tables = table_statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    let expected_tables = TABLES
+        .iter()
+        .map(|(table, _)| (*table).to_owned())
+        .collect::<BTreeSet<_>>();
+    if actual_tables != expected_tables {
+        return Err(UsageStoreError::InvalidImport(
+            "account partition table set mismatch".into(),
+        ));
+    }
+
+    for (table, expected) in TABLES {
+        let mut statement = connection.prepare(&format!(
+            "SELECT name, type, pk FROM pragma_table_info('{table}') ORDER BY cid"
+        ))?;
+        let actual = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let expected = expected
+            .iter()
+            .map(|(name, kind, pk)| ((*name).to_owned(), (*kind).to_owned(), *pk))
+            .collect::<Vec<_>>();
+        if actual != expected {
+            return Err(UsageStoreError::InvalidImport(format!(
+                "account partition {table} schema mismatch"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_storage_partition(
+    connection: &Connection,
+    expected: &StoragePartitionIdentity,
+) -> Result<()> {
+    expected.validate()?;
+    let quick_check: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if quick_check != "ok" {
+        return Err(UsageStoreError::InvalidImport(
+            "account partition quick_check failed".into(),
+        ));
+    }
+    validate_partition_schema(connection)?;
+    let table_type: Option<String> = connection
+        .query_row(
+            "SELECT type FROM sqlite_master WHERE name = 'storage_partition'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if table_type.as_deref() != Some("table") {
+        return Err(UsageStoreError::InvalidImport(
+            "storage partition table is missing".into(),
+        ));
+    }
+    let count: i64 = connection.query_row("SELECT COUNT(*) FROM storage_partition", [], |row| {
+        row.get(0)
+    })?;
+    if count != 1 {
+        return Err(UsageStoreError::InvalidImport(
+            "storage partition row cardinality mismatch".into(),
+        ));
+    }
+    let actual: (i64, String, String, String, String, String) = connection.query_row(
+        "SELECT singleton, schema_version, profile_scope_id, account_scope_id, \
+                storage_epoch, partition_id FROM storage_partition",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+    let actual_epoch = canonical_u64_text(&actual.4, "storage epoch")?;
+    if actual
+        != (
+            1,
+            expected.schema_version.clone(),
+            expected.profile_scope_id.clone(),
+            expected.account_scope_id.clone(),
+            expected.storage_epoch.to_string(),
+            expected.partition_id.clone(),
+        )
+        || actual_epoch != expected.storage_epoch
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "storage partition identity mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 impl UsageStore {
+    /// Creates a brand-new account partition. Existing paths are recovery
+    /// evidence and are never opened or replaced by this constructor.
+    pub fn create_partitioned<P: AsRef<Path>>(
+        path: P,
+        identity: &StoragePartitionIdentity,
+    ) -> Result<Self> {
+        identity.validate()?;
+        let path = path.as_ref();
+        if !path.is_absolute() {
+            return Err(UsageStoreError::InvalidImport(
+                "partition database path must be absolute".into(),
+            ));
+        }
+        let parent = path.parent().ok_or_else(|| {
+            UsageStoreError::InvalidImport("partition database parent is missing".into())
+        })?;
+        fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).read(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(path)?;
+        validate_partition_file(path)?;
+
+        let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(Duration::from_secs(2))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(SCHEMA)?;
+        transaction.execute_batch(PARTITION_SCHEMA)?;
+        transaction.execute(
+            "INSERT INTO storage_partition (
+                singleton, schema_version, profile_scope_id, account_scope_id,
+                storage_epoch, partition_id
+            ) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+            params![
+                &identity.schema_version,
+                &identity.profile_scope_id,
+                &identity.account_scope_id,
+                identity.storage_epoch.to_string(),
+                &identity.partition_id,
+            ],
+        )?;
+        validate_recorded_sessions_schema(&transaction)?;
+        Self::ensure_recent_history_covering_index(&transaction)?;
+        validate_storage_partition(&transaction, identity)?;
+        transaction.commit()?;
+        Ok(Self { connection })
+    }
+
+    /// Opens an initialized account partition only after its durable identity
+    /// matches. A legacy root DB or another account's DB is rejected before
+    /// any schema or data mutation can occur.
+    pub fn open_partitioned<P: AsRef<Path>>(
+        path: P,
+        identity: &StoragePartitionIdentity,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.is_absolute() {
+            return Err(UsageStoreError::InvalidImport(
+                "partition database path must be absolute".into(),
+            ));
+        }
+        validate_partition_file(path)?;
+        let probe = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        validate_storage_partition(&probe, identity)?;
+        drop(probe);
+        let store = Self::open(path)?;
+        validate_storage_partition(&store.connection, identity)?;
+        Ok(store)
+    }
+
+    /// Read-only counterpart of [`Self::open_partitioned`].
+    pub fn open_read_only_partitioned<P: AsRef<Path>>(
+        path: P,
+        identity: &StoragePartitionIdentity,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        validate_partition_file(path)?;
+        let store = Self::open_read_only(path)?;
+        validate_storage_partition(&store.connection, identity)?;
+        Ok(store)
+    }
+
+    /// Creates and rotates backups only for one already-verified partition.
+    pub fn backup_generations_partitioned<P: AsRef<Path>>(
+        path: P,
+        identity: &StoragePartitionIdentity,
+        generations: usize,
+    ) -> Result<()> {
+        let path = path.as_ref();
+        let source = Self::open_read_only_partitioned(path, identity)?;
+        drop(source);
+        for generation in 1..=generations {
+            let backup = path.with_extension(format!("sqlite3.bak.{generation}"));
+            if backup.exists() {
+                let existing = Self::open_read_only_partitioned(&backup, identity)?;
+                drop(existing);
+            }
+        }
+        Self::backup_generations(path, generations)?;
+        for generation in 1..=generations {
+            let backup = path.with_extension(format!("sqlite3.bak.{generation}"));
+            if backup.exists() {
+                let verified = Self::open_read_only_partitioned(&backup, identity)?;
+                drop(verified);
+            }
+        }
+        Ok(())
+    }
+
     /// Opens `path`, creating its parent directories and schema as needed.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
@@ -1399,11 +2093,7 @@ impl UsageStore {
                     file_device,
                     file_inode
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                ON CONFLICT (root_identity, relative_path) DO UPDATE SET
-                    file_bytes = excluded.file_bytes,
-                    modified_nanos = excluded.modified_nanos,
-                    file_device = excluded.file_device,
-                    file_inode = excluded.file_inode",
+                ON CONFLICT DO NOTHING",
             )?;
             for source in &sources {
                 statement.execute(params![
@@ -1425,6 +2115,442 @@ impl UsageStore {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Loads the durable append checkpoint and absolute model totals for this
+    /// account partition. The caller decides whether the stored reset period
+    /// is still current; file checkpoints remain valid across quota resets.
+    pub fn load_session_collection_state(&self) -> Result<SessionCollectionState> {
+        let (generation, reset_at, window_seconds, collector_epoch, cycle_seq): (
+            String,
+            i64,
+            i64,
+            Option<String>,
+            String,
+        ) = self.connection.query_row(
+            "SELECT data_generation, reset_at, window_seconds, collector_epoch, cycle_seq
+             FROM collection_generation WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        let data_generation = canonical_u64_text(&generation, "collection generation")?;
+        let collector_epoch = collector_epoch
+            .as_deref()
+            .map(|value| canonical_u128_hex(value, "collector epoch"))
+            .transpose()?;
+        let cycle_seq = canonical_u64_text(&cycle_seq, "cycle sequence")?;
+        if collector_epoch.is_none() != (cycle_seq == 0) {
+            return Err(UsageStoreError::InvalidImport(
+                "collector generation is inconsistent".into(),
+            ));
+        }
+        let mut checkpoint_statement = self.connection.prepare(
+            "SELECT root_identity, relative_path, file_device, file_inode,
+                    committed_offset, discard_until_lf, collector_epoch, cycle_seq,
+                    prefix_generation, prefix_sha256, fully_attributed_from_zero,
+                    token_baseline_known, last_model, previous_total, previous_input,
+                    previous_cached_input, previous_output
+             FROM session_checkpoints
+             ORDER BY root_identity, relative_path, file_device, file_inode, prefix_generation",
+        )?;
+        let checkpoints = checkpoint_statement
+            .query_map([], |row| {
+                let committed_offset = row.get::<_, i64>(4)?;
+                let collector_epoch = row.get::<_, String>(6)?;
+                let cycle_seq = row.get::<_, String>(7)?;
+                let cycle_seq = cycle_seq
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|parsed| parsed.to_string() == cycle_seq)
+                    .ok_or(rusqlite::Error::InvalidQuery)?;
+                Ok(SessionCheckpoint {
+                    root_identity: row.get(0)?,
+                    relative_path: row.get(1)?,
+                    file_device: row
+                        .get::<_, String>(2)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    file_inode: row
+                        .get::<_, String>(3)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    committed_offset: u64::try_from(committed_offset)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    discard_until_lf: row.get::<_, i64>(5)? == 1,
+                    collector_epoch: u128::from_str_radix(&collector_epoch, 16)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    cycle_seq,
+                    prefix_generation: u128::from_str_radix(&row.get::<_, String>(8)?, 16)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    prefix_sha256: row.get(9)?,
+                    fully_attributed_from_zero: row.get::<_, i64>(10)? == 1,
+                    token_baseline_known: row.get::<_, i64>(11)? == 1,
+                    last_model: row.get(12)?,
+                    previous_total: row
+                        .get::<_, String>(13)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    previous_input: row
+                        .get::<_, String>(14)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    previous_cached_input: row
+                        .get::<_, String>(15)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    previous_output: row
+                        .get::<_, String>(16)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for checkpoint in &checkpoints {
+            validate_session_checkpoint(checkpoint)?;
+        }
+
+        let mut totals_statement = self.connection.prepare(
+            "SELECT model, total_tokens, input_tokens, cached_input_tokens, output_tokens
+             FROM session_model_totals ORDER BY model",
+        )?;
+        let model_totals = totals_statement
+            .query_map([], |row| {
+                Ok(SessionModelTotal {
+                    model: row.get(0)?,
+                    total_tokens: row
+                        .get::<_, String>(1)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    input_tokens: row
+                        .get::<_, String>(2)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    cached_input_tokens: row
+                        .get::<_, String>(3)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    output_tokens: row
+                        .get::<_, String>(4)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let model_totals = canonicalize_model_totals(&model_totals)?;
+        Ok(SessionCollectionState {
+            data_generation,
+            reset_at,
+            window_seconds,
+            collector_epoch,
+            cycle_seq,
+            checkpoints,
+            model_totals,
+        })
+    }
+
+    /// Commits one verified append collection as a single account-local
+    /// transaction. Intersecting source ranges are rejected; exact repeats
+    /// are idempotent because all stored usage/model values are absolute.
+    pub fn commit_session_collection(
+        &mut self,
+        commit: SessionCollectionCommit<'_>,
+    ) -> Result<u64> {
+        let SessionCollectionCommit {
+            reset_at,
+            window_seconds,
+            collector_epoch,
+            cycle_seq,
+            samples,
+            checkpoints,
+            ranges,
+            model_totals,
+            recorded_sessions,
+        } = commit;
+        if reset_at <= 0 || window_seconds <= 0 || collector_epoch == 0 || cycle_seq == 0 {
+            return Err(UsageStoreError::InvalidImport(
+                "session collection period is invalid".into(),
+            ));
+        }
+        let mut canonical_checkpoints = BTreeMap::new();
+        for checkpoint in checkpoints {
+            validate_session_checkpoint(checkpoint)?;
+            let key = (
+                checkpoint.root_identity.clone(),
+                checkpoint.relative_path.clone(),
+                checkpoint.file_device,
+                checkpoint.file_inode,
+                checkpoint.prefix_generation,
+            );
+            if canonical_checkpoints
+                .insert(key, checkpoint.clone())
+                .is_some()
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "duplicate session checkpoint".into(),
+                ));
+            }
+            if checkpoint.collector_epoch != collector_epoch || checkpoint.cycle_seq != cycle_seq {
+                return Err(UsageStoreError::InvalidImport(
+                    "checkpoint admission generation mismatch".into(),
+                ));
+            }
+        }
+        let mut canonical_ranges = BTreeMap::new();
+        for range in ranges {
+            validate_session_range(range)?;
+            let key = (
+                range.root_identity.clone(),
+                range.relative_path.clone(),
+                range.file_device,
+                range.file_inode,
+                range.prefix_generation,
+                range.start_offset,
+                range.end_offset,
+                range.record_sha256.clone(),
+            );
+            if canonical_ranges.insert(key, range.clone()).is_some() {
+                return Err(UsageStoreError::InvalidImport(
+                    "duplicate session range".into(),
+                ));
+            }
+            if range.collector_epoch != collector_epoch || range.cycle_seq != cycle_seq {
+                return Err(UsageStoreError::InvalidImport(
+                    "range admission generation mismatch".into(),
+                ));
+            }
+        }
+        let model_totals = canonicalize_model_totals(model_totals)?;
+        let recorded_sessions = canonicalize_recorded_sessions(recorded_sessions)?;
+        for marker in &recorded_sessions {
+            let checkpoint = canonical_checkpoints
+                .values()
+                .find(|checkpoint| {
+                    checkpoint.root_identity == marker.root_identity
+                        && checkpoint.relative_path == marker.relative_path
+                        && checkpoint.file_device == marker.file_device
+                        && checkpoint.file_inode == marker.file_inode
+                })
+                .ok_or_else(|| {
+                    UsageStoreError::InvalidImport(
+                        "cleanup marker has no session checkpoint".into(),
+                    )
+                })?;
+            if !checkpoint.fully_attributed_from_zero
+                || checkpoint.discard_until_lf
+                || !checkpoint.token_baseline_known
+                || checkpoint.file_device != marker.file_device
+                || checkpoint.file_inode != marker.file_inode
+                || checkpoint.committed_offset != marker.file_bytes
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "cleanup marker is not fully attributed".into(),
+                ));
+            }
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let canonical_samples = canonicalize_samples(&transaction, samples)?;
+        for range in canonical_ranges.values() {
+            let intersects: i64 = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM session_ranges
+                    WHERE root_identity = ?1 AND relative_path = ?2
+                      AND file_device = ?3 AND file_inode = ?4
+                      AND prefix_generation = ?5
+                      AND start_offset < ?7 AND end_offset > ?6
+                      AND NOT (
+                          start_offset = ?6 AND end_offset = ?7 AND record_sha256 = ?8
+                      )
+                )",
+                params![
+                    &range.root_identity,
+                    &range.relative_path,
+                    range.file_device.to_string(),
+                    range.file_inode.to_string(),
+                    format!("{:032x}", range.prefix_generation),
+                    range.start_offset as i64,
+                    range.end_offset as i64,
+                    &range.record_sha256,
+                ],
+                |row| row.get(0),
+            )?;
+            if intersects == 1 {
+                return Err(UsageStoreError::InvalidImport(
+                    "session source range intersects a committed range".into(),
+                ));
+            }
+        }
+        for checkpoint in canonical_checkpoints.values() {
+            let current: Option<i64> = transaction
+                .query_row(
+                    "SELECT committed_offset
+                     FROM session_checkpoints
+                     WHERE root_identity = ?1 AND relative_path = ?2
+                       AND file_device = ?3 AND file_inode = ?4
+                       AND prefix_generation = ?5",
+                    params![
+                        &checkpoint.root_identity,
+                        &checkpoint.relative_path,
+                        checkpoint.file_device.to_string(),
+                        checkpoint.file_inode.to_string(),
+                        format!("{:032x}", checkpoint.prefix_generation),
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if current.is_some_and(|offset| {
+                u64::try_from(offset).unwrap_or(u64::MAX) > checkpoint.committed_offset
+            }) {
+                return Err(UsageStoreError::InvalidImport(
+                    "session checkpoint moved backwards".into(),
+                ));
+            }
+        }
+
+        upsert_canonical_samples(&transaction, &canonical_samples)?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO session_ranges (
+                    root_identity, relative_path, file_device, file_inode,
+                    start_offset, end_offset, collector_epoch, cycle_seq,
+                    prefix_generation, record_sha256
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT DO NOTHING",
+            )?;
+            for range in canonical_ranges.values() {
+                statement.execute(params![
+                    &range.root_identity,
+                    &range.relative_path,
+                    range.file_device.to_string(),
+                    range.file_inode.to_string(),
+                    range.start_offset as i64,
+                    range.end_offset as i64,
+                    format!("{:032x}", range.collector_epoch),
+                    range.cycle_seq.to_string(),
+                    format!("{:032x}", range.prefix_generation),
+                    &range.record_sha256,
+                ])?;
+            }
+        }
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO session_checkpoints (
+                    root_identity, relative_path, file_device, file_inode,
+                    committed_offset, discard_until_lf, collector_epoch, cycle_seq,
+                    prefix_generation, prefix_sha256, fully_attributed_from_zero,
+                    token_baseline_known, last_model, previous_total, previous_input,
+                    previous_cached_input, previous_output
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                    ?14, ?15, ?16, ?17
+                 )
+                 ON CONFLICT (
+                    root_identity, relative_path, file_device, file_inode, prefix_generation
+                 ) DO UPDATE SET
+                    committed_offset = excluded.committed_offset,
+                    discard_until_lf = excluded.discard_until_lf,
+                    collector_epoch = excluded.collector_epoch,
+                    cycle_seq = excluded.cycle_seq,
+                    prefix_sha256 = excluded.prefix_sha256,
+                    fully_attributed_from_zero = excluded.fully_attributed_from_zero,
+                    token_baseline_known = excluded.token_baseline_known,
+                    last_model = excluded.last_model,
+                    previous_total = excluded.previous_total,
+                    previous_input = excluded.previous_input,
+                    previous_cached_input = excluded.previous_cached_input,
+                    previous_output = excluded.previous_output",
+            )?;
+            for checkpoint in canonical_checkpoints.values() {
+                statement.execute(params![
+                    &checkpoint.root_identity,
+                    &checkpoint.relative_path,
+                    checkpoint.file_device.to_string(),
+                    checkpoint.file_inode.to_string(),
+                    checkpoint.committed_offset as i64,
+                    i64::from(checkpoint.discard_until_lf),
+                    format!("{:032x}", checkpoint.collector_epoch),
+                    checkpoint.cycle_seq.to_string(),
+                    format!("{:032x}", checkpoint.prefix_generation),
+                    &checkpoint.prefix_sha256,
+                    i64::from(checkpoint.fully_attributed_from_zero),
+                    i64::from(checkpoint.token_baseline_known),
+                    checkpoint.last_model.as_deref(),
+                    checkpoint.previous_total.to_string(),
+                    checkpoint.previous_input.to_string(),
+                    checkpoint.previous_cached_input.to_string(),
+                    checkpoint.previous_output.to_string(),
+                ])?;
+            }
+        }
+        transaction.execute("DELETE FROM session_model_totals", [])?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO session_model_totals (
+                    model, total_tokens, input_tokens, cached_input_tokens, output_tokens
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for total in &model_totals {
+                statement.execute(params![
+                    &total.model,
+                    total.total_tokens.to_string(),
+                    total.input_tokens.to_string(),
+                    total.cached_input_tokens.to_string(),
+                    total.output_tokens.to_string(),
+                ])?;
+            }
+        }
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO recorded_sessions (
+                    root_identity, relative_path, file_bytes, modified_nanos,
+                    file_device, file_inode
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT DO NOTHING",
+            )?;
+            for source in &recorded_sessions {
+                statement.execute(params![
+                    &source.root_identity,
+                    &source.relative_path,
+                    source.file_bytes as i64,
+                    source.modified_nanos.to_string(),
+                    source.file_device.to_string(),
+                    source.file_inode.to_string(),
+                ])?;
+            }
+        }
+        let current: String = transaction.query_row(
+            "SELECT data_generation FROM collection_generation WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let next = canonical_u64_text(&current, "collection generation")?
+            .checked_add(1)
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+        transaction.execute(
+            "UPDATE collection_generation
+             SET data_generation = ?1, reset_at = ?2, window_seconds = ?3,
+                 collector_epoch = ?4, cycle_seq = ?5
+             WHERE singleton = 1",
+            params![
+                next.to_string(),
+                reset_at,
+                window_seconds,
+                format!("{collector_epoch:032x}"),
+                cycle_seq.to_string(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(next)
     }
 
     /// Checks one exact source marker on the current connection.
@@ -1683,6 +2809,476 @@ mod tests {
             file_device: 10,
             file_inode: inode,
         }
+    }
+
+    fn partition_identity(account_byte: char, epoch: u64) -> StoragePartitionIdentity {
+        StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: account_byte.to_string().repeat(64),
+            storage_epoch: epoch,
+            partition_id: account_byte.to_string().repeat(64),
+        }
+    }
+
+    fn checkpoint(source: &RecordedSessionSource, offset: u64) -> SessionCheckpoint {
+        SessionCheckpoint {
+            root_identity: source.root_identity.clone(),
+            relative_path: source.relative_path.clone(),
+            file_device: source.file_device,
+            file_inode: source.file_inode,
+            committed_offset: offset,
+            discard_until_lf: false,
+            collector_epoch: 0x1234,
+            cycle_seq: 1,
+            prefix_generation: 0x5678,
+            prefix_sha256: "00".repeat(32),
+            fully_attributed_from_zero: true,
+            token_baseline_known: true,
+            last_model: Some("SOL".into()),
+            previous_total: 20,
+            previous_input: 12,
+            previous_cached_input: 2,
+            previous_output: 8,
+        }
+    }
+
+    #[test]
+    fn account_partitions_isolate_same_keys_metadata_backups_and_gap_ledgers() {
+        let path_a = database_path("partition-a");
+        let path_b = database_path("partition-b");
+        let identity_a = partition_identity('a', 1);
+        let identity_b = partition_identity('b', 2);
+        let mut store_a = UsageStore::create_partitioned(&path_a, &identity_a).unwrap();
+        let mut store_b = UsageStore::create_partitioned(&path_b, &identity_b).unwrap();
+        let reset_at = 1_800_604_800;
+        let sample_a = sample(1_800_000_000, reset_at, Some(70.0), 1.0);
+        let sample_b = sample(1_800_000_000, reset_at, Some(30.0), 9.0);
+        let source_a = recorded_source("same/session.jsonl", 30);
+        let source_b = recorded_source("same/session.jsonl", 30);
+        let mut checkpoint_a = checkpoint(&source_a, 10);
+        checkpoint_a.collector_epoch = 1;
+        let mut checkpoint_b = checkpoint(&source_b, 20);
+        checkpoint_b.collector_epoch = 2;
+
+        store_a
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at,
+                window_seconds: 604_800,
+                collector_epoch: 1,
+                cycle_seq: 1,
+                samples: std::slice::from_ref(&sample_a),
+                checkpoints: std::slice::from_ref(&checkpoint_a),
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: &[],
+            })
+            .unwrap();
+        store_b
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at,
+                window_seconds: 604_800,
+                collector_epoch: 2,
+                cycle_seq: 1,
+                samples: std::slice::from_ref(&sample_b),
+                checkpoints: std::slice::from_ref(&checkpoint_b),
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: &[],
+            })
+            .unwrap();
+        store_a
+            .connection
+            .execute(
+                "INSERT INTO recorder_gap_ledger (data_generation, observed_at, reason) VALUES (1, 1800000000, 'account-a-gap')",
+                [],
+            )
+            .unwrap();
+        store_b
+            .connection
+            .execute(
+                "INSERT INTO recorder_gap_ledger (data_generation, observed_at, reason) VALUES (1, 1800000001, 'account-b-gap')",
+                [],
+            )
+            .unwrap();
+        drop((store_a, store_b));
+
+        let opened_a = UsageStore::open_read_only_partitioned(&path_a, &identity_a).unwrap();
+        let opened_b = UsageStore::open_read_only_partitioned(&path_b, &identity_b).unwrap();
+        assert_eq!(opened_a.load_all().unwrap(), vec![sample_a]);
+        assert_eq!(opened_b.load_all().unwrap(), vec![sample_b]);
+        assert_eq!(
+            opened_a
+                .load_session_collection_state()
+                .unwrap()
+                .checkpoints,
+            vec![checkpoint_a]
+        );
+        assert_eq!(
+            opened_b
+                .load_session_collection_state()
+                .unwrap()
+                .checkpoints,
+            vec![checkpoint_b]
+        );
+        let gap_a: String = opened_a
+            .connection
+            .query_row("SELECT reason FROM recorder_gap_ledger", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let gap_b: String = opened_b
+            .connection
+            .query_row("SELECT reason FROM recorder_gap_ledger", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(gap_a, "account-a-gap");
+        assert_eq!(gap_b, "account-b-gap");
+        drop((opened_a, opened_b));
+        assert!(UsageStore::open_partitioned(&path_a, &identity_b).is_err());
+
+        UsageStore::backup_generations_partitioned(&path_a, &identity_a, 3).unwrap();
+        let backup_a = path_a.with_extension("sqlite3.bak.1");
+        assert!(backup_a.is_file());
+        assert!(!path_b.with_extension("sqlite3.bak.1").exists());
+        assert!(UsageStore::open_read_only_partitioned(&backup_a, &identity_a).is_ok());
+        assert!(UsageStore::open_read_only_partitioned(&backup_a, &identity_b).is_err());
+
+        remove_database(&path_a);
+        remove_database(&path_b);
+    }
+
+    #[test]
+    fn session_range_checkpoint_marker_and_generation_commit_atomically() {
+        let path = database_path("partition-session-atomic");
+        let identity = partition_identity('c', 3);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let reset_at = 1_800_604_800;
+        let mut source = recorded_source("2026/09/session.jsonl", 30);
+        source.file_bytes = 10;
+        let checkpoint = checkpoint(&source, 10);
+        let range = SessionRange {
+            root_identity: source.root_identity.clone(),
+            relative_path: source.relative_path.clone(),
+            file_device: source.file_device,
+            file_inode: source.file_inode,
+            start_offset: 0,
+            end_offset: 10,
+            collector_epoch: 0x1234,
+            cycle_seq: 1,
+            prefix_generation: 0x5678,
+            record_sha256: "11".repeat(32),
+        };
+        let committed = store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at,
+                window_seconds: 604_800,
+                collector_epoch: 0x1234,
+                cycle_seq: 1,
+                samples: &[sample(1_800_000_000, reset_at, Some(50.0), 3.0)],
+                checkpoints: std::slice::from_ref(&checkpoint),
+                ranges: std::slice::from_ref(&range),
+                model_totals: &[SessionModelTotal {
+                    model: "SOL".into(),
+                    total_tokens: 20,
+                    input_tokens: 12,
+                    cached_input_tokens: 2,
+                    output_tokens: 8,
+                }],
+                recorded_sessions: std::slice::from_ref(&source),
+            })
+            .unwrap();
+        assert_eq!(committed, 1);
+        assert!(store.recorded_session_matches(&source).unwrap());
+
+        let mut overlapping_checkpoint = checkpoint.clone();
+        overlapping_checkpoint.committed_offset = 12;
+        overlapping_checkpoint.cycle_seq = 2;
+        let overlapping = SessionRange {
+            start_offset: 5,
+            end_offset: 12,
+            cycle_seq: 2,
+            record_sha256: "22".repeat(32),
+            ..range
+        };
+        assert!(store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at,
+                window_seconds: 604_800,
+                collector_epoch: 0x1234,
+                cycle_seq: 2,
+                samples: &[sample(1_800_000_060, reset_at, Some(49.0), 4.0)],
+                checkpoints: &[overlapping_checkpoint],
+                ranges: &[overlapping],
+                model_totals: &[],
+                recorded_sessions: &[],
+            })
+            .is_err());
+        let state = store.load_session_collection_state().unwrap();
+        assert_eq!(state.data_generation, 1);
+        assert_eq!(state.collector_epoch, Some(0x1234));
+        assert_eq!(state.cycle_seq, 1);
+        assert_eq!(state.checkpoints, vec![checkpoint]);
+        assert_eq!(store.load_all().unwrap().len(), 1);
+        let range_count: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM session_ranges", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(range_count, 1);
+        assert!(store.recorded_session_matches(&source).unwrap());
+
+        remove_database(&path);
+    }
+
+    #[test]
+    fn injected_checkpoint_write_failure_rolls_back_the_entire_collection_generation() {
+        let path = database_path("partition-session-rollback");
+        let identity = partition_identity('d', 4);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let reset_at = 1_800_604_800;
+        let mut source = recorded_source("2026/09/rollback.jsonl", 40);
+        source.file_bytes = 10;
+        let checkpoint = checkpoint(&source, 10);
+        let range = SessionRange {
+            root_identity: source.root_identity.clone(),
+            relative_path: source.relative_path.clone(),
+            file_device: source.file_device,
+            file_inode: source.file_inode,
+            start_offset: 0,
+            end_offset: 10,
+            collector_epoch: 0x1234,
+            cycle_seq: 1,
+            prefix_generation: 0x5678,
+            record_sha256: "11".repeat(32),
+        };
+        store
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER inject_checkpoint_failure
+                 BEFORE INSERT ON session_checkpoints
+                 BEGIN SELECT RAISE(ABORT, 'injected checkpoint failure'); END;",
+            )
+            .unwrap();
+
+        let error = store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at,
+                window_seconds: 604_800,
+                collector_epoch: 0x1234,
+                cycle_seq: 1,
+                samples: &[sample(1_800_000_000, reset_at, Some(50.0), 3.0)],
+                checkpoints: &[checkpoint],
+                ranges: &[range],
+                model_totals: &[SessionModelTotal {
+                    model: "SOL".into(),
+                    total_tokens: 20,
+                    input_tokens: 12,
+                    cached_input_tokens: 2,
+                    output_tokens: 8,
+                }],
+                recorded_sessions: &[source],
+            })
+            .unwrap_err();
+        assert!(matches!(error, UsageStoreError::Sqlite(_)));
+
+        let state = store.load_session_collection_state().unwrap();
+        assert_eq!(state, SessionCollectionState::default());
+        assert!(store.load_all().unwrap().is_empty());
+        for table in [
+            "session_ranges",
+            "session_checkpoints",
+            "session_model_totals",
+            "recorded_sessions",
+        ] {
+            let count: i64 = store
+                .connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "table {table}");
+        }
+
+        remove_database(&path);
+    }
+
+    #[test]
+    fn replacement_keeps_old_checkpoints_and_exact_cleanup_markers() {
+        let path = database_path("partition-session-replacement-retention");
+        let identity = partition_identity('e', 5);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let reset_at = 1_800_604_800;
+        let mut old_source = recorded_source("2026/09/replaced.jsonl", 50);
+        old_source.file_bytes = 10;
+        let old_checkpoint = checkpoint(&old_source, 10);
+        store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at,
+                window_seconds: 604_800,
+                collector_epoch: 0x1234,
+                cycle_seq: 1,
+                samples: &[],
+                checkpoints: std::slice::from_ref(&old_checkpoint),
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: std::slice::from_ref(&old_source),
+            })
+            .unwrap();
+
+        let mut replacement_checkpoint = old_checkpoint.clone();
+        replacement_checkpoint.collector_epoch = 0x4321;
+        replacement_checkpoint.cycle_seq = 2;
+        replacement_checkpoint.prefix_generation = 0x9876;
+        replacement_checkpoint.prefix_sha256 = "22".repeat(32);
+        replacement_checkpoint.fully_attributed_from_zero = false;
+        replacement_checkpoint.token_baseline_known = false;
+        replacement_checkpoint.last_model = None;
+        store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at,
+                window_seconds: 604_800,
+                collector_epoch: 0x4321,
+                cycle_seq: 2,
+                samples: &[],
+                checkpoints: std::slice::from_ref(&replacement_checkpoint),
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: &[],
+            })
+            .unwrap();
+
+        let mut new_source = old_source.clone();
+        new_source.modified_nanos += 1;
+        let mut new_checkpoint = replacement_checkpoint.clone();
+        new_checkpoint.cycle_seq = 3;
+        new_checkpoint.prefix_generation = 0xabcd;
+        new_checkpoint.prefix_sha256 = "33".repeat(32);
+        new_checkpoint.fully_attributed_from_zero = true;
+        new_checkpoint.token_baseline_known = true;
+        store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at,
+                window_seconds: 604_800,
+                collector_epoch: 0x4321,
+                cycle_seq: 3,
+                samples: &[],
+                checkpoints: std::slice::from_ref(&new_checkpoint),
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: std::slice::from_ref(&new_source),
+            })
+            .unwrap();
+
+        let state = store.load_session_collection_state().unwrap();
+        assert_eq!(state.data_generation, 3);
+        assert_eq!(state.checkpoints.len(), 3);
+        assert!(state.checkpoints.contains(&old_checkpoint));
+        assert!(state.checkpoints.contains(&replacement_checkpoint));
+        assert!(state.checkpoints.contains(&new_checkpoint));
+        assert!(store.recorded_session_matches(&old_source).unwrap());
+        assert!(store.recorded_session_matches(&new_source).unwrap());
+        assert_eq!(
+            store
+                .forget_recorded_sessions(std::slice::from_ref(&new_source))
+                .unwrap(),
+            1
+        );
+        assert!(store.recorded_session_matches(&old_source).unwrap());
+        assert!(!store.recorded_session_matches(&new_source).unwrap());
+
+        remove_database(&path);
+    }
+
+    #[test]
+    fn partition_generations_and_storage_epoch_use_the_full_u64_domain() {
+        let path = database_path("partition-u64-generation");
+        let identity = partition_identity('f', u64::MAX);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE collection_generation SET data_generation = ?1 WHERE singleton = 1",
+                [u64::MAX.saturating_sub(1).to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .commit_session_collection(SessionCollectionCommit {
+                    reset_at: 1_800_604_800,
+                    window_seconds: 604_800,
+                    collector_epoch: 0xffff,
+                    cycle_seq: u64::MAX,
+                    samples: &[],
+                    checkpoints: &[],
+                    ranges: &[],
+                    model_totals: &[],
+                    recorded_sessions: &[],
+                })
+                .unwrap(),
+            u64::MAX
+        );
+        let state = store.load_session_collection_state().unwrap();
+        assert_eq!(state.data_generation, u64::MAX);
+        assert_eq!(state.cycle_seq, u64::MAX);
+        assert!(matches!(
+            store.commit_session_collection(SessionCollectionCommit {
+                reset_at: 1_800_604_800,
+                window_seconds: 604_800,
+                collector_epoch: 0xffff,
+                cycle_seq: u64::MAX,
+                samples: &[],
+                checkpoints: &[],
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: &[],
+            }),
+            Err(UsageStoreError::GenerationOverflow)
+        ));
+        assert_eq!(
+            store
+                .load_session_collection_state()
+                .unwrap()
+                .data_generation,
+            u64::MAX
+        );
+        drop(store);
+        assert!(UsageStore::open_partitioned(&path, &identity).is_ok());
+
+        remove_database(&path);
+    }
+
+    #[test]
+    fn wrong_partition_schema_is_rejected_by_a_read_only_probe() {
+        let path = database_path("partition-wrong-schema");
+        let identity = partition_identity('9', 9);
+        drop(UsageStore::create_partitioned(&path, &identity).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "ALTER TABLE storage_partition ADD COLUMN unexpected TEXT",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let before = fs::read(&path).unwrap();
+        let wal = path.with_file_name(format!(
+            "{}-wal",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let shm = path.with_file_name(format!(
+            "{}-shm",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(!wal.exists());
+        assert!(!shm.exists());
+
+        assert!(UsageStore::open_partitioned(&path, &identity).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!wal.exists());
+        assert!(!shm.exists());
+
+        remove_database(&path);
     }
 
     #[test]

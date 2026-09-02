@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+shopt -s nullglob
 
 # Finite daemon/REST/UI mode acceptance checks. Every case owns a temporary
 # HOME, XDG directories, CODEX_HOME, history database, and loopback ports.
@@ -202,17 +203,24 @@ cleanup() {
 trap cleanup EXIT
 
 write_fixture() {
-    local now initial_time reset_at session_dir session
+    local auth_file now initial_time reset_at session_dir session
     session_dir="$case_home/sessions/$(date -u +%Y/%m/%d)"
     mkdir -p "$session_dir" "$case_data/history"
+    chmod 700 "$case_home"
+    auth_file="$case_home/auth.json"
+    printf '%s\n' '{"auth_mode":"chatgpt","tokens":{"account_id":"fixture-account-129"}}' \
+        >"$auth_file"
+    chmod 600 "$auth_file"
     now="$(date +%s)"
     reset_at=$((now + 604200))
     initial_time=$((now - 600))
+    common_env+=("CODEX_INFO_FAKE_RESET_AT=$reset_at")
     session="$session_dir/daemon-e2e.jsonl"
     cat >"$session" <<EOF
 {"timestamp":"$(date -u -d "@$initial_time" +%Y-%m-%dT%H:%M:%SZ)","type":"turn_context","model":"gpt-5.6-luna"}
 {"timestamp":"$(date -u -d "@$initial_time" +%Y-%m-%dT%H:%M:%SZ)","type":"token_count","payload":{"info":{"total_token_usage":{"total_tokens":120,"input_tokens":100,"cached_input_tokens":80,"output_tokens":20}}}}
 EOF
+    chmod 600 "$session"
     printf '{"reset_at":%s,"window_seconds":604800}\n' "$reset_at" \
         >"$case_data/history/usage_reset_hint.json"
 }
@@ -223,7 +231,7 @@ setup_case() {
     case_home="$case_root/codex"
     case_data="$case_root/data"
     case_lock="$case_data/history/usage_record_daemon.lock"
-    case_db="$case_data/history/usage_history.sqlite3"
+    case_db=""
     service_pid=""
     ui_pid=""
     mkdir -p "$case_root/home" "$case_root/xdg-config" "$case_root/xdg-data" \
@@ -239,6 +247,7 @@ setup_case() {
         "XDG_RUNTIME_DIR=$case_root/xdg-runtime"
         "CODEX_HOME=$case_home"
         "CODEX_INFO_DATA_DIR=$case_data"
+        "CODEX_INFO_CODEX_BIN=$ROOT_DIR/scripts/fake_codex_app_server.py"
         "CODEX_INFO_DAEMON_INTERVAL_SECS=5"
         "CODEX_INFO_DEBUG=1"
     )
@@ -304,6 +313,23 @@ wait_for_history_value() {
     else
         printf '0\n'
     fi
+    return 1
+}
+
+wait_for_account_baseline() {
+    local checkpoint_count databases=()
+    for _ in $(seq 1 80); do
+        databases=("$case_data"/history/accounts/v1/*/epoch-*/usage_history.sqlite3)
+        if [[ "${#databases[@]}" -eq 1 ]]; then
+            checkpoint_count="$(sqlite3 -batch -bail -cmd '.timeout 2000' \
+                "${databases[0]}" 'SELECT COUNT(*) FROM session_checkpoints;' 2>/dev/null || true)"
+            if [[ "$checkpoint_count" =~ ^[0-9]+$ ]] && ((10#$checkpoint_count >= 1)); then
+                case_db="${databases[0]}"
+                return 0
+            fi
+        fi
+        sleep 0.25
+    done
     return 1
 }
 
@@ -438,17 +464,25 @@ mark_ui_hold() {
 }
 
 run_service_cold_start() {
-    local before after clk_tck cpu_before cpu_after idle_cpu_ticks session now2
+    local append_time before after clk_tck cpu_before cpu_after idle_cpu_ticks session now2
     setup_case service-cold-start
     write_fixture
     launch_service service-cold
     require_ready
     require_one_service "$service_pid"
-    before=0
-    if ! before="$(wait_for_history_value 'SELECT count(*) FROM usage_history;' 1)"; then
+    if ! wait_for_account_baseline; then
         sed -n '1,160p' "$case_root/service-cold.log" >&2 || true
-        fail "$case_label: daemon did not persist initial sample (observed count=$before)"
+        fail "$case_label: daemon did not persist the account Session baseline"
     fi
+    before="$(sqlite3 "$case_db" 'SELECT COUNT(*) FROM usage_history;')"
+    [[ "$(sqlite3 "$case_db" 'SELECT COUNT(*) FROM usage_history WHERE sol_tokens <> 0 OR terra_tokens <> 0 OR luna_tokens <> 0 OR ABS(sol_dollars) > 0.0000001 OR ABS(terra_dollars) > 0.0000001 OR ABS(luna_dollars) > 0.0000001;')" == 0 ]] \
+        || fail "$case_label: pre-boundary Session bytes were attributed"
+    [[ "$(sqlite3 "$case_db" 'SELECT COUNT(*) FROM session_ranges;')" == 0 ]] \
+        || fail "$case_label: pre-boundary Session bytes produced a committed range"
+    [[ "$(sqlite3 "$case_db" 'SELECT COUNT(*) FROM storage_partition;')" == 1 ]] \
+        || fail "$case_label: account database partition authority is missing"
+    [[ ! -e "$case_data/history/usage_history.sqlite3" ]] \
+        || fail "$case_label: legacy unpartitioned history database was created"
 
     clk_tck="$(getconf CLK_TCK)"
     cpu_before="$(awk '{print $14+$15}' "/proc/$service_pid/stat")"
@@ -460,11 +494,15 @@ run_service_cold_start() {
 
     now2="$(date +%s)"
     session="$case_home/sessions/$(date -u +%Y/%m/%d)/daemon-e2e.jsonl"
-    printf '{"timestamp":"%s","type":"token_count","payload":{"info":{"total_token_usage":{"total_tokens":240,"input_tokens":200,"cached_input_tokens":160,"output_tokens":40}}}}\n' \
-        "$(date -u -d "@$now2" +%Y-%m-%dT%H:%M:%SZ)" >>"$session"
+    append_time="$(date -u -d "@$now2" +%Y-%m-%dT%H:%M:%SZ)"
+    printf '%s\n' \
+        "{\"timestamp\":\"$append_time\",\"type\":\"turn_context\",\"model\":\"gpt-5.6-luna\"}" \
+        "{\"timestamp\":\"$append_time\",\"type\":\"token_count\",\"payload\":{\"info\":{\"total_token_usage\":{\"total_tokens\":240,\"input_tokens\":200,\"cached_input_tokens\":160,\"output_tokens\":40}}}}" \
+        "{\"timestamp\":\"$append_time\",\"type\":\"token_count\",\"payload\":{\"info\":{\"total_token_usage\":{\"total_tokens\":360,\"input_tokens\":300,\"cached_input_tokens\":240,\"output_tokens\":60}}}}" \
+        >>"$session"
     after=0
     if ! after="$(wait_for_history_value \
-        'SELECT COALESCE(MAX(luna_tokens),0) FROM usage_history;' 240)"; then
+        'SELECT COALESCE(MAX(luna_tokens),0) FROM usage_history;' 120)"; then
         sed -n '1,160p' "$case_root/service-cold.log" >&2 || true
         fail "$case_label: daemon did not record changed session input (observed luna_tokens=$after)"
     fi
