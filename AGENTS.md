@@ -2,30 +2,10 @@
 
 - ユーザーの変更と無関係な差分を戻さない。依頼なしにcommit、push、PR作成をしない。
 - 製品要件の正本は`docs/PRODUCT_REQUIREMENTS.md`とし、wire、データ、UIの詳細は同文書が参照する仕様へ置く。
-- 監査版ごとのEvidence、文書SHA一覧、サブエージェント作業台帳をrepositoryへ追加しない。再現可能なtestと必要最小限の仕様を残す。
-- 要件漏れを理由にN倍、N二乗、N階乗、全直積へ展開しない。同じ観測結果は既存要件へ統合し、因果関係のある有限caseだけを追加する。
-- ユーザーが述べていない要件、状態、分岐、品質目標を追加しない。実装上の入力errorや例外を製品要件の選択肢へ昇格させず、追加する各条項をユーザーの明示要求へ直接対応付けられない場合は削除する。
-- 各mutationの直前と、編集、test、委譲、commit、push、PR作成へ段階が移る時に、その操作を明示要求、Issueの受入条件、owned scopeへ直接対応付ける。対応付けできない、またはscopeが広がった場合は即停止する。この判定結果は実装前、検証前、完了報告前に短くchatへ報告する。
-- 実施申請に事実誤認、要求の取違い、scope誤りが判明した場合、その申請への許可だけを失効させ、要求自体は継続する。誤りと訂正差分を示して申請をやり直し、ユーザーが申請内容の誤りを発見することを安全境界にしない。
-- 各taskの初期要求と直接関係しない事項は、同じtask、branch、PRへ追加せず、別のGitHub Issueへ登録するだけとし、追加調査、編集、test、委譲、commit、push、PR作成へ着手しない。逸脱した場合は実行中のサブエージェントも止め、取り繕う追加修正やcleanupを行わず、現在の差分を報告する。
 - 発見Issueのうちユーザーへ確認するのは`priority:P0`と`priority:P1`だけとし、それらも専門用語だけに偏らず、何が問題で何を行うかをユーザーが理解できる短い言葉で説明し、そのIssueへの明示許可を得るまで着手しない。`priority:P2`、`priority:P3`、`priority:info`はIssueへの記録だけとする。
-- 文書ごとのSHAを完了ブロッカーにしない。製品artifactを一意に識別するhashは記録できるが、内容評価の代用にしない。
 - 外部authority値を推測しない。publisher、certificate、対応OS、保証値が未指定なら、公開・対応表明・mutationを行わないfail-closed動作を要件化する。
 - lockfileと既存package managerを守る。検索は`rg`を優先する。
-- 変更後は対象に最も近いformatter、check、testを実行する。testが0件の結果をPASSにしない。
-- UI変更は実画面、Windows固有動作は実Windowsで確認する。環境上確認できない項目をPASSと報告しない。
-- 画面キャプチャを取得した事実だけをUI評価の証拠にしない。各画像では可視色・文言・状態・配置を意味単位で棚卸しし、正本または他platformとの対応を説明できない色・表示差を1件でも残したままPASSにしない。可能な項目はpixel/UI Automationで機械判定し、その結果と同じ最新画面をレビューする。
-
-## 完了判定と確認証拠
-
-- Codexは、最新revisionに対する各要求と受入条件を、その条件が要求する実行環境と観測点で実際に確認した再現可能な証拠がある場合だけ`PASS`または`verified`と判定する。未実行、環境不足、権限不足、結果未取得、旧revisionだけの証拠は`未確認（INCONCLUSIVE）`とし、確認できなかったことを問題がなかったことへ読み替えてはならない。
-- localの静的検査、mock、契約test、build、実装者自身のreviewは、それぞれが直接観測した範囲だけの証拠とする。GitHub上のworkflow挙動、remote mutation、Release、実OS、実画面、外部service等をlocalで直接確認できない場合、その制約と未確認項目を明記し、local証拠で代用してはならない。
-- workflowまたはCI制御を変更する場合、localで再現可能な因果的に異なる有限経路をPR作成前に列挙し、呼出元から最終結果までを各経路の観測点で実行して全件PASSにする。未実行、`FAIL`、`INCONCLUSIVE`が1件でもある間、Actionsを試験代わりにするpush後のPR作成を禁止する。GitHubでしか観測できないevent起動、artifact転送、checkのApp identity、branch protectionだけを実PRの確認対象として残せる。
-- Actionsの基盤・制御失敗後は、その失敗を再現して旧revisionを拒否し修正revisionを受理するlocal回帰testがPASSするまで、修正版PRの作成または同一PRを再起動する更新を禁止する。静的な文字列確認や部品単体testだけで、呼出元の入力配線を含む経路確認を代用してはならない。
-- workflow helperを削除または改名する前に、現在default branchへdeploy済みのcallerまたはreusable workflowが実行する実command一覧を候補treeと照合する。候補tree側だけのPASSをdeployment証拠にしてはならない。旧authorityが自身の置換を阻む場合は、関連workflowとruleが停止済みであることをread-backしてから、明示した一回限りのbootstrapを用い、互換用またはno-op fileを残さない。
-- 要求または受入条件に`FAIL`、`INCONCLUSIVE`、未実行、未取得の証拠、未解決finding、未完了の依存作業が1件でもある間、Codexは作業全体を「完了」「要求達成」「全項目PASS」と報告せず、Issueを`status:review`へ進めず、closure reportを完成扱いしない。独立評価も証拠の欠落をPASSへ変更してはならない。
-- 報告では`実装済み`、`local検証済み`、`remote/実環境で検証済み`、`未確認（INCONCLUSIVE）`、`失敗（FAIL）`、`未統合`を区別する。一部だけが完了した場合は、その完了範囲と未完了範囲を同じ報告内で明示する。
-- 実環境確認にPRのmergeまたは`main`の変更が必要な場合、Codexは停止して必要な確認操作と未確認項目を報告し、ユーザー本人の操作を待つ。Release、その他の外部mutation、追加権限またはユーザー操作が必要で許可されていない場合も、許可済み範囲の終了時点で停止する。未確認の受入条件を、許可のない実環境操作で完了証拠へ変えてはならない。
+- **常駐必須規則:** [Issue #104（常駐課題）](https://github.com/salty919/codex_info_v2/issues/104) の「常駐必須条項」を、全ての調査・編集・test・委譲・GitHub mutation・完了判定の前に読み、必ず適用する。Issue #104は本ファイルから移動した過剰品質防止・要求/証拠・設計整合性の正本であり、同Issueの未確認条項を推測でPASSにしない。
 
 ## 共有repositoryのbranch・worktreeガバナンス
 
@@ -128,26 +108,3 @@ cleanup条件と削除予定:
 - closure reportには、Issue番号、要求とacceptance criteriaの対応、最新revisionのcheck evidence、関連PRの状態、open sub-issue 0件、dependency解消、未解決finding、残作業、branch/worktree cleanup、推奨close reason（`completed`または`not planned`）を含める。
 - Issueの最終closeとreopenはユーザー本人だけが行う。Codexは明示依頼を受けてもIssueのcloseまたはreopen APIを実行せず、`status:review`とclosure reportを整えてユーザー判断を待つ。
 - closure report後にrevision、criteria、sub-issue、dependency、PR、findingが変化した場合、以前のreportを無効化し、最新状態で再作成する。Codexはcloseを完了扱いせず、GitHub上のstateをread-backしてユーザーによるcloseを確認する。
-
-## サブエージェントのコスト・速度ガバナンス
-
-- 目的は総Codex消費量とwall-clock timeを同時に削減することであり、サブエージェント使用自体を成功指標にしてはならない。短期・決定論的・逐次的な作業は主担当がlocal commandで処理し、サブエージェントを使わない。
-- 委譲は、独立した並列作業、専門的な独立判断、または低コスト監視によって、調整・待機・再読込を含むend-to-end総コストか完了時間が改善すると事前に説明できる場合だけ行う。固定のmodel familyを理由に委譲してはならない。
-- 主担当SOLがサブエージェントの完了だけを待つactive turnや短周期pollingを継続してはならない。SOL側に有用な並行作業がなく、passive waitがSOL消費を発生させないと確認できない場合は、そもそも委譲しない。
-- 委譲時は`fork_turns = "none"`、最小のtask-local context、限定owned scope、1つの有用なvalidation gate、最小出力を使用する。raw logや会話全履歴を渡さず、同じrevision・入力・役割・modelでの重複実行や、timeoutだけを理由とする再試行を禁止する。
-- 主担当はサブエージェントと同じ調査・実装・監視を重複して行わない。利用可能なterminal結果を保持し、raw command evidenceをagent summaryより優先する。証拠と矛盾するverdictは無効とする。
-- コスト削減効果は比較可能なend-to-end実測がある場合だけ主張する。利用量が取得できない場合は推測せず`unavailable`とし、wall-clockだけをtoken/cost削減の証拠にしない。
-- 継続計測は製品deliveryと分離した、ユーザーが別途許可する評価作業として行う。計測のためだけにmodel、route、subagentをprobeせず、通常作業から自然に得られるtask分類、revision、solo/delegated、agent数、利用可能なusage、wall-clock、SOLのwait/poll回数、再作業、gate結果だけを最小量で収集する。
-- 計測記録をこのrepositoryへ追加せず、製品taskのcritical pathへ入れない。比較可能なsampleが蓄積するまで一般的な節約効果を断定せず、評価方法自体のコストが便益を上回る場合は計測を停止してユーザーへ報告する。
-
-## 設計整合性と実装方針
-
-- 思い込み実装を禁止する。仮説、未確認の反例、将来可能性を根拠に実装せず、観測事実、本番で到達する呼出し経路、ユーザーの明示要件への直接対応がすべて確認できるまでは読取り調査に留め、編集、テスト追加、委譲を開始しない。
-- 読取り調査、編集、test/build、委譲、Git・外部mutationの各phase開始前、scopeまたは前提の変更時、および同一phaseが30分を超えた場合は30分ごとに禁止事項を再確認する。開始前に、観測事実、本番到達経路、明示要件との対応、過剰処理・思い込み実装・無関係scopeへ該当しない根拠をchatで宣言し、一つでも事実として確認できない場合は開始または継続しない。
-- 症状ごとに既存コードをコピー＆ペーストし、条件分岐・例外処理・別実装を継ぎ足す増改築を禁止する。変更前に正本、責務、状態遷移、データフロー、不変条件、失敗時の所有者を特定し、その全体設計に沿って実装する。
-- 観測したerrorを、そのまま新しい条件、例外、retry、抑止またはfallbackの根拠にしてはならない。まずauthority、責務、状態遷移、不変条件を修正し、その設計から必要と導ける処理だけを実装する。
-- workflowとCIに残す各確認は、実際に到達するcase、そのcaseで必要な動作、確認しない場合の具体的被害、GitHubまたは上流保証と重複しない理由の4点を設計時に示す。1点でも示せない確認、既存条件から導ける重複条件、表示・移動用のURLや文言、判定に使わない値はgateにせず削除する。回帰testの期待値は実装から複製せず、外部の実観測値または固定契約をoracleにする。
-- 同じ製品機能を複数プラットフォームへ提供する場合、データ解釈、計算、表示意味、操作契約は一つの正本から導出する。UIフレームワーク固有コードは描画と入力のadapterに限定し、ユーザーの明示承認なしに独自仕様・独自画面・並行する計算ロジックを作らない。
-- 既存の共通モデルまたは正本を拡張すれば解決できる問題に、第二のsource of truth、互換用コピー、場当たり的fallbackを追加しない。重複が既にある場合は、さらに分岐を足すのではなく責務境界を整理して収束させる。
-- 不具合修正は、表示された症状だけを隠すパッチではなく、原因となった設計境界を修正する。例外的な分岐が必要な場合は、適用範囲と終了条件を有限の受入テストで固定する。
-- reviewと完了判定では、変更行の局所的な正しさだけでなく、正本から最終表示・操作までの経路が一貫し、類似機能との不要な差異や新しい重複を生んでいないことを確認する。
