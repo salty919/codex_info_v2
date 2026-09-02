@@ -9,7 +9,7 @@
 //! transaction/upsert contract remains the authority for durable writes.
 
 use crate::security;
-use crate::usage_store::UsageStore;
+use crate::usage_store::{RecordedSessionSource, UsageHistorySample, UsageStore};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -719,7 +719,12 @@ enum RecorderCommand {
         completed: mpsc::SyncSender<Result<(), String>>,
     },
     Store {
-        samples: Vec<crate::usage_store::UsageHistorySample>,
+        samples: Vec<UsageHistorySample>,
+        recorded_sessions: Vec<RecordedSessionSource>,
+        committed: mpsc::SyncSender<Result<(), String>>,
+    },
+    ForgetRecordedSessions {
+        recorded_sessions: Vec<RecordedSessionSource>,
         committed: mpsc::SyncSender<Result<(), String>>,
     },
     Shutdown,
@@ -795,20 +800,42 @@ impl RecorderWorker {
                         RecorderCommand::StartupMaintenance { now, completed } => {
                             let _ = completed.send(maintain_history_database(&database, now));
                         }
-                        RecorderCommand::Store { samples, committed } => {
+                        RecorderCommand::Store {
+                            samples,
+                            recorded_sessions,
+                            committed,
+                        } => {
                             let result = UsageStore::open(&database)
                                 .map_err(|error| error.to_string())
                                 .and_then(|mut store| {
                                     store
-                                        .upsert_samples(&samples)
+                                        .upsert_samples_and_recorded_sessions(
+                                            &samples,
+                                            &recorded_sessions,
+                                        )
                                         .map_err(|error| error.to_string())
                                 });
                             if result.is_ok() {
                                 eprintln!(
-                                    "codex-info: recorder committed {} samples",
-                                    samples.len()
+                                    "codex-info: recorder committed {} samples and {} session markers",
+                                    samples.len(),
+                                    recorded_sessions.len()
                                 );
                             }
+                            let _ = committed.send(result);
+                        }
+                        RecorderCommand::ForgetRecordedSessions {
+                            recorded_sessions,
+                            committed,
+                        } => {
+                            let result = UsageStore::open(&database)
+                                .map_err(|error| error.to_string())
+                                .and_then(|mut store| {
+                                    store
+                                        .forget_recorded_sessions(&recorded_sessions)
+                                        .map(|_| ())
+                                        .map_err(|error| error.to_string())
+                                });
                             let _ = committed.send(result);
                         }
                     }
@@ -858,13 +885,14 @@ impl RecorderWorker {
             .map_err(|_| DaemonError::Runtime.to_string())?
     }
 
-    /// Commit one producer-owned generation through the durable writer. The
-    /// acknowledgement is sent only after its SQLite transaction has committed.
-    pub(crate) fn store_samples(
+    /// Commit usage rows and the exact source markers that authorize later
+    /// cleanup in one SQLite transaction.
+    pub(crate) fn store_generation(
         &self,
-        samples: Vec<crate::usage_store::UsageHistorySample>,
+        samples: Vec<UsageHistorySample>,
+        recorded_sessions: Vec<RecordedSessionSource>,
     ) -> Result<(), String> {
-        if samples.is_empty() {
+        if samples.is_empty() && recorded_sessions.is_empty() {
             return Ok(());
         }
         let commands = self
@@ -873,7 +901,36 @@ impl RecorderWorker {
             .ok_or_else(|| DaemonError::Runtime.to_string())?;
         let (committed, receiver) = mpsc::sync_channel(1);
         commands
-            .send(RecorderCommand::Store { samples, committed })
+            .send(RecorderCommand::Store {
+                samples,
+                recorded_sessions,
+                committed,
+            })
+            .map_err(|_| DaemonError::Runtime.to_string())?;
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| DaemonError::Runtime.to_string())?
+    }
+
+    /// Remove exact markers after their source files were successfully
+    /// unlinked. Failure is safe: the stale marker remains fingerprint-bound.
+    pub(crate) fn forget_recorded_sessions(
+        &self,
+        recorded_sessions: Vec<RecordedSessionSource>,
+    ) -> Result<(), String> {
+        if recorded_sessions.is_empty() {
+            return Ok(());
+        }
+        let commands = self
+            .commands
+            .as_ref()
+            .ok_or_else(|| DaemonError::Runtime.to_string())?;
+        let (committed, receiver) = mpsc::sync_channel(1);
+        commands
+            .send(RecorderCommand::ForgetRecordedSessions {
+                recorded_sessions,
+                committed,
+            })
             .map_err(|_| DaemonError::Runtime.to_string())?;
         receiver
             .recv_timeout(Duration::from_secs(5))
@@ -1130,11 +1187,31 @@ mod tests {
             terra_tokens: 6_789,
             luna_tokens: 321,
         };
-        writer.store_samples(vec![expected.clone()]).unwrap();
+        let marker = crate::usage_store::RecordedSessionSource {
+            root_identity: "unix:10:20".into(),
+            relative_path: "2026/09/session.jsonl".into(),
+            file_bytes: 123,
+            modified_nanos: 1_700_000_000_000_000_000,
+            file_device: 10,
+            file_inode: 30,
+        };
+        writer
+            .store_generation(vec![expected.clone()], vec![marker.clone()])
+            .unwrap();
 
         let (_history, database, lock) = data_paths().unwrap();
-        let samples = UsageStore::open(database).unwrap().load_all().unwrap();
+        let store = UsageStore::open(&database).unwrap();
+        let samples = store.load_all().unwrap();
         assert_eq!(samples, vec![expected]);
+        assert!(store.recorded_session_matches(&marker).unwrap());
+        drop(store);
+        writer
+            .forget_recorded_sessions(vec![marker.clone()])
+            .unwrap();
+        assert!(!UsageStore::open(&database)
+            .unwrap()
+            .recorded_session_matches(&marker)
+            .unwrap());
         assert!(lock.exists());
 
         duplicate.shutdown();

@@ -189,11 +189,13 @@ DataGeneration、pair publicationを二重化しない。foreign/第二operation
 | --- | --- | --- |
 | reset hint | 4KiB、UTF-8 JSON bytes、hint path=`history/usage_reset_hint.json` | schema/size超過、expired/tombstoned hint、current AuthEpoch/nonce不一致はhint scan・backfill writeを拒否。source logは保持 |
 | recorder lease | 4KiB、UTF-8 JSON bytes、`recorder-lease-v1` | schema/size超過、PID/process-start/file identity不一致はlease取得・stale reclaimを拒否 |
-| local JSONL record / session file / session total | line 4MiB / file 256MiB / aggregate 2GiB、decode前の受信bytes | oversize/invalid record隔離は後続validated cumulative snapshotで欠落を覆えるcaseだけ。その他とfile/total超過はfile/candidate rollback |
+| local JSONL record / session file / selected session prefix | line 4MiB / file 256MiB / latest whole-file prefix 2GiB、decode前の受信bytes | oversize/invalid complete recordは表示集計を継続できても当該fileのrecorded marker=0。I/O・unterminated record・depth/file-count/file/metadata/containment違反はselected candidate rollback。全inventoryのaggregate超過だけはrollbackせず、最初に収まらないfile以降を保持中overflowとする |
 | live rollout record / file / active paths | line payload 4MiB / file 256MiB / active path 1024、stream受信bytesとProcessIdentity前後値 | oversizeはstreaming envelopeでliveness非変更を完全証明した場合だけpayload隔離。invalid UTF-8/JSON/envelope/state event、identity/ancestry/FD partialはlive cycle全rollback |
 | internal validated snapshot | canonical JSON 1MiB | candidate全体をrejectし旧snapshot保持。REST transfer bodyとは別resource |
 | REST response headers / status body / details body | 8KiB / 64KiB / 32MiB、transfer後・decode前 | Content-Lengthは事前拒否、streamは最初の超過byteで停止 |
-| transaction batch / retry | 最大1024 rowsかつ1MiB、backfill latch=1、scan/restart retry=1 | 上限到達はpartial公開せず次cycleまたは明示操作 |
+| transaction batch / retry | usage rowsは最大1024かつ1MiB、recorded session markerはinventory上限と同じ最大4096 rows、backfill latch=1、scan/restart retry=1 | 上限到達はpartial公開せず次cycleまたは明示操作。markerは同cycleのusage transactionへ同梱する |
+
+session selectionとcache fingerprintは同じmtime/path降順vectorを使い、overflowはcache fingerprintへ混ぜず毎inventoryで再構成する。SQLite `recorded_sessions` はcanonical sessions root identityとUTF-8 root-relative normal pathを複合keyとし、size、mtime nanoseconds、device/inodeを完全fingerprintとして保持する。fully parsedかつ前後fingerprint不変のselected fileだけを、通常usage sampleと同一transactionでupsertする。cleanupはcommit後の別maintenanceであり、fresh read-only marker、regular/non-symlink containment、直前まで同一のfingerprint、bounded `/proc` scanによるCodex open-FD不在がすべて成立したoverflow fileだけを削除する。missing、unmarked、legacy、changed、active、selected、DB/process scan失敗は保持し、同callback retryは0とする。file削除後のmarker削除に失敗した場合はfingerprint-boundのstale markerを保持し、usage history、durable state、verified backup、reset hint、delegation recoveryを変更しない。
 
 ## 5. 変更管理の制約
 
@@ -382,7 +384,7 @@ maintenance停止中の`steady_idle`である。warm-up 2分後の30分窓で次
   product DB/write bytesは0、networkはloopback/SSH tunnelのpoll bytesだけである。
 
 `changed,backfill,maintenance,recovery`はidle保証へ混ぜず別profileとし、各generationでscan 1、DB transaction 1、
-publish 1以下、batch 1024 rowまたは1 MiB、REST request境界は§8.4、backfill total inputは既存2 GiB上限を守る。
+publish 1以下、batch 1024 rowまたは1 MiB、REST request境界は§8.4、backfillはlatest whole-file selected prefix 2 GiB上限を守り、older overflowを同じscanへ穴埋めしない。
 測定不能または超過は要求PASSへ丸めずPRODUCT_FAIL/HOLDにし、負荷低減のためデータを捨てたりpollを重ねたりしない。
 
 ### 8.13 RC-067 — gap ledgerとREST projection
@@ -440,8 +442,8 @@ identity不変かつ size減少なら `truncate`、identityとprefixが不変で
 - 旧cursorで有効recordを `skip` する数は `skip_count=0`、dedupe keyによる重複insert数は `dedupe_insert_count=0` とする。
   dedupe key は `(partition_id,file_device,file_inode,start_offset,end_offset,record_sha256)` である。
 - 1 eventにつき scan は最大1回、DB transaction は最大1回、同じcallback内のretryは `0`、次の通常cycleまたは
-  明示操作でのretryは最大1回とする。1 transaction は最大1024 rowsかつ1 MiB、1 JSONL recordは4 MiB、
-  1 source fileは256 MiB、session aggregateは2 GiBを超えない。入力fingerprint不変時は全走査、DB write、retryを各 `0` とする。
+  明示操作でのretryは最大1回とする。usage rowsは1 transaction最大1024かつ1 MiB、recorded markerは最大4096、1 JSONL recordは4 MiB、
+  1 source fileは256 MiB、1回のselected session prefixは2 GiBを超えない。全inventoryが2 GiBを超える場合はolder overflowを保持し、入力fingerprint不変時は全走査と新規DB writeを各 `0`、既存marker cleanupは次の通常cycleに最大1回とする。
 
 RC-167 oracle は `source_identity_before/after`、`prefix_generation_before/after`、cursor before/after、
 `scan_event`、`scan_count`、`scan_bytes`、`scan_records`、`transaction_count`、`skip_count`、
