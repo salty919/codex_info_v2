@@ -12716,6 +12716,26 @@ mod tests {
         state
     }
 
+    fn acknowledge_recorder_commit_fixture(
+        state: &mut CodexInfoState,
+        data_generation: u64,
+        collector_epoch: u128,
+        cycle_seq: u64,
+    ) {
+        let admission = state
+            .current_account_admission()
+            .expect("commit fixture has a current account admission");
+        state.acknowledge_recorder_commit(
+            &admission,
+            daemon::RecorderCommitAck {
+                data_generation,
+                collector_epoch,
+                cycle_seq,
+                last_commit_unix: Utc::now().timestamp(),
+            },
+        );
+    }
+
     fn active_thread_fixture(index: usize, updated_at: i64) -> ActiveThread {
         let parent_thread_id = (index % 3 == 2).then(|| format!("parent-{index:03}"));
         ActiveThread {
@@ -14185,17 +14205,20 @@ mod tests {
     #[test]
     fn resident_service_collects_commits_and_publishes_one_details_generation() {
         let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
         let mut publication = super::ResidentPublicationState::default();
         state.history.pending_store_samples = vec![state.history.samples[0].to_store()];
         state.pending_recorder_admission =
             Some((state.auth_epoch, state.current_account_admission().unwrap()));
+        assert_eq!(state.public_details().state, PublicState::Initializing);
         let actions = std::cell::RefCell::new(Vec::new());
         let outcome = super::resident_service_cycle(
             &mut state,
             &mut publication,
-            |_, pending| {
+            |state, pending| {
                 assert!(!pending.is_empty());
                 actions.borrow_mut().push("write");
+                acknowledge_recorder_commit_fixture(state, 1, 0x128, 1);
                 Ok(())
             },
             |details| {
@@ -14260,10 +14283,11 @@ mod tests {
         let outcome = super::resident_service_cycle(
             &mut state,
             &mut publication,
-            |_, pending| {
+            |state, pending| {
                 assert_eq!(pending.samples.len(), 1);
                 assert_eq!(pending.recorded_sessions.len(), 1);
                 assert_eq!(pending.cleanup_plans.len(), 1);
+                acknowledge_recorder_commit_fixture(state, 2, 0x128, 2);
                 Ok(())
             },
             |details| {
@@ -14279,6 +14303,13 @@ mod tests {
             PublicState::Ready
         );
         assert!(!state.recorder_store_error);
+        assert_eq!(
+            state
+                .acknowledged_recorder_commit
+                .as_ref()
+                .map(|commit| commit.data_generation),
+            Some(2)
+        );
         assert!(state.take_pending_recorder_batch().is_empty());
 
         let mut initial = CodexInfoState::preview("normal");
@@ -14840,6 +14871,10 @@ mod tests {
             cleanup_plan: None,
         });
         state.remaining_percent = Some(80.0);
+        // This case owns history grouping/presentation, not recorder
+        // durability. Collection needed the non-preview admission path above;
+        // restore the explicit presentation fixture before projecting it.
+        state.preview = true;
 
         let periods = state.history_periods_at(OBSERVED_AT);
         let selected_period = periods
@@ -19293,7 +19328,7 @@ mod tests {
         let outcome = super::resident_service_cycle(
             &mut state,
             &mut publication,
-            |_, pending| {
+            |state, pending| {
                 assert!(!pending.samples.is_empty());
                 assert_eq!(pending.recorded_sessions.len(), 1);
                 assert_eq!(pending.cleanup_plans.len(), 1);
@@ -19316,6 +19351,7 @@ mod tests {
                     assert_eq!(report.retained, 1);
                 }
                 *committed_markers.borrow_mut() = pending.recorded_sessions;
+                acknowledge_recorder_commit_fixture(state, 1, 0x128, 1);
                 Ok(())
             },
             |details| {
