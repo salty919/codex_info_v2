@@ -1,8 +1,7 @@
 [Unit]
 Description=Codex Info daemon and loopback REST service
 After=default.target
-StartLimitIntervalSec=60s
-StartLimitBurst=2
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

@@ -11,6 +11,7 @@ CONTROL_SCHEMA="codex-info-control-state-v1"
 REPOSITORY="salty919/codex_info_v2"
 RELEASES_URL="https://api.github.com/repos/salty919/codex_info_v2/releases?per_page=100"
 HEALTH_URL="http://127.0.0.1:8787/v1/health"
+DETAILS_URL="http://127.0.0.1:8787/v1/details"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 CURL_BIN="${CURL_BIN:-curl}"
 GETCONF_BIN="${GETCONF_BIN:-getconf}"
@@ -1319,16 +1320,17 @@ proc_identity_check() {
     [[ "$owner" == "$pid" ]] || safe_blocked 'listener socket is not owned by MainPID'
 }
 health_readback() {
-    local pid="$1" before="$2" version="$3" source="$4" manifest_hash="$5" binary_hash="$6" response after after_pid expected_exe health_limit health_now health_remaining
+    local pid="$1" before="$2" version="$3" source="$4" manifest_hash="$5" binary_hash="$6" response details after after_pid expected_exe health_limit health_now health_remaining readback_deadline
     expected_exe="$generations_dir/$version-$source-$manifest_hash/codex_info"
     proc_identity_check "$pid" "$binary_hash" "$expected_exe"
-    health_limit="$HEALTH_TIMEOUT"
-    if (( readiness_deadline > 0 )); then
-        health_now="$(now_unix)" || safe_blocked 'health clock is unavailable'
-        health_remaining=$((readiness_deadline - health_now))
-        (( health_remaining > 0 )) || safe_blocked 'health readiness deadline expired'
-        (( health_remaining < health_limit )) && health_limit=$health_remaining
+    health_now="$(now_unix)" || safe_blocked 'health clock is unavailable'
+    readback_deadline=$((health_now + HEALTH_TIMEOUT))
+    if (( readiness_deadline > 0 && readiness_deadline < readback_deadline )); then
+        readback_deadline=$readiness_deadline
     fi
+    health_remaining=$((readback_deadline - health_now))
+    (( health_remaining > 0 )) || safe_blocked 'health readiness deadline expired'
+    health_limit=$health_remaining
     response="$("$CURL_BIN" --fail --silent --show-error --proto '=http' --max-time "$health_limit" "$HEALTH_URL")" || safe_blocked 'health request failed'
     after="$(proc_starttime "$pid" 2>/dev/null || true)"
     [[ -n "$before" && "$after" == "$before" ]] || safe_blocked 'MainPID/starttime changed during health'
@@ -1349,6 +1351,27 @@ if set(document) != {"api_version","service","product_version"}:
     raise SystemExit("health schema is unknown")
 if document["api_version"] != "v1" or document["service"] != "codex-info" or document["product_version"] != sys.argv[2]:
     raise SystemExit("health identity mismatch")
+PY
+    health_now="$(now_unix)" || safe_blocked 'details clock is unavailable'
+    health_limit=$((readback_deadline - health_now))
+    (( health_limit > 0 )) || safe_blocked 'details readiness deadline expired'
+    details="$("$CURL_BIN" --fail --silent --show-error --proto '=http' --max-time "$health_limit" "$DETAILS_URL")" || safe_blocked 'details request failed'
+    python3 - "$details" <<'PY'
+import json,sys
+def pairs(items):
+    result={}
+    for key,value in items:
+        if key in result: raise ValueError("duplicate details key")
+        result[key]=value
+    return result
+try: document=json.loads(sys.argv[1],object_pairs_hook=pairs)
+except Exception as error: raise SystemExit(str(error))
+if not isinstance(document,dict): raise SystemExit("details is not an object")
+if document.get("state") not in {"ready","auth_required"}:
+    raise SystemExit("details is not functionally ready")
+observed_at=document.get("observed_at")
+if isinstance(observed_at,bool) or not isinstance(observed_at,int) or observed_at <= 0:
+    raise SystemExit("details observed_at is invalid")
 PY
     recorder_identity_check "$pid" "$version" "$source" "$manifest_hash"
     proc_identity_check "$pid" "$binary_hash" "$expected_exe"

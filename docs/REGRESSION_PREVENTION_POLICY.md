@@ -15,6 +15,8 @@
 | REG-NO-MOUSE-STEAL | 製品コードはカーソルを操作しない。物理入力試験はテストプロセスからだけ明示opt-inで実行し、製品実行へ混入させない | 製品ソースAPIスキャン、smokeの既定SKIP raw出力、CI受入時の`-AllowPhysicalInput`実行ログ |
 | REG-I18N-CLI | CLIヘルプを含む利用者向け固定メッセージは、画面本体と同じ対応localeのi18nカタログから導出し、起動スクリプトに単一言語の製品文言を複製しない | 全対応言語の`launch_help`テスト、`LC_ALL`切替の`run.sh --help`実行、スクリプト固定文言検査 |
 | REG-CLI-LIFECYCLE | 公開argvを無印、`--ui`、`--port PORT`、`--ui --port PORT`、`--stop`、help aliasだけへ限定する。addressは127.0.0.1固定、停止は検証済み同一profile ownerへのTERM 1回とlock解放待ちだけとし、拒否入力・停止でDB/sourceを変更しない | parser有限受理・拒否unit、release binaryを使う`scripts/cli_contract_e2e.sh`（loopback health、stop冪等性、DB/source保持、invalid lock fail-closed） |
+| REG-THREAD-BOUNDED | thread取得はprocess-open中のSessionだけを個別`thread/read`し、全Session総量に比例する`thread/list`を実行しない。途中終了した非state表示recordは隔離し、state recordやID/path/schema不正はcycle全体を拒否する | `active_thread_adapter_rejects_partial_rollout_fallback`、`multiple_running_threads_are_all_published_with_stable_order`、`recoverable_rollout_parser_skips_malformed_non_state_records_only`、実active-path取得 |
+| REG-LINUX-FUNCTIONAL-READY | Linux install/update/statusはsource-bound healthとrecorder identityだけで成功せず、同じreadiness枠のstrict detailsが`ready|auth_required`であることを必須とする。serviceはStartLimitで永久inactiveにしない | `scripts/test_linux_bundle.sh`のdetails error rejection、`packaging/codex-info.service`の`Restart=always`/`RestartSec=5s`/`StartLimitIntervalSec=0` contract |
 
 ## 強制ゲート
 

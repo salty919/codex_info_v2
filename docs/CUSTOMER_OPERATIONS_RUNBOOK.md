@@ -109,15 +109,16 @@ systemctl --user status codex-info-update.service --no-pager
 ```
 
 `--status`はmanifestと全installed member、systemd MainPID、process starttime/executable、
-profile lock、port 8787のsocket FD、前後healthが同じgenerationへ結合する場合だけ成功する。
-PID、listener、health 200、version文字列のいずれかだけでは成功しない。
+profile lock、port 8787のsocket FD、前後health、fresh recorder state、`/v1/details`が同じgenerationへ結合し、
+detailsが`ready`または未認証時の`auth_required`で正の`observed_at`を持つ場合だけ成功する。
+PID、listener、health 200、version文字列のいずれかだけ、またはdetailsが`initializing`/`error`の状態では成功しない。
 
 ### 自動更新と手動確認
 
 timerは導入5分後に開始し、その後は1時間ごと（accuracy 1秒）に固定repositoryを確認する。
 launcher起動、serviceの`ExecStartPre`、timer、手動更新は同じresolverを使うため、停止中に公開された新版も
 次の起動時に確認する。highest stable exact-five Releaseへだけ進み、downgradeしない。同versionでもlocal memberが
-manifestと不一致ならverified repairする。新版なし・同一でlocalが完全ならno-opでmanaged healthy状態を再確認する。
+manifestと不一致ならverified repairする。新版なし・同一でlocalが完全ならno-opでmanagedかつfunctionally readyな状態を再確認する。
 
 今すぐ確認する場合は次を実行する。
 
@@ -128,8 +129,8 @@ systemctl --user status codex-info-update.timer --no-pager
 journalctl --user -u codex-info-update.service --no-pager
 ```
 
-更新全体は20分、launcher/startupは20分30秒以内に必ずterminalになる。検証済み新版をmanaged+healthyにするか、
-検証済み旧版をmanaged+healthyへ戻した場合だけ完了である。unknown/foreign/malformed listener/lockは停止せず、
+更新全体は20分、launcher/startupは20分30秒以内に必ずterminalになる。検証済み新版をmanagedかつfunctionally readyにするか、
+検証済み旧版をmanagedかつfunctionally readyへ戻した場合だけ完了である。unknown/foreign/malformed listener/lockは停止せず、
 30秒以内に明示的`SAFE_BLOCKED`となる。この状態は成功ではないが、次のmanual/startup/timer実行を妨げない。
 journalにはboundedな更新結果だけを記録し、秘密やraw responseを記録しない。
 
