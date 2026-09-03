@@ -23,11 +23,14 @@ for contract in \
     'ExecStart=%h/.local/bin/codex_info --port 8787' \
     'Restart=always' \
     'RestartSec=5s' \
-    'StartLimitBurst=2' \
+    'StartLimitIntervalSec=0' \
     'NoNewPrivileges=true'; do
     rg -q --fixed-strings -- "$contract" packaging/codex-info.service \
         || fail "service contract missing: $contract"
 done
+if rg -q '^StartLimitBurst=' packaging/codex-info.service; then
+    fail 'StartLimitBurst can permanently suppress recorder recovery'
+fi
 if rg -q '^PrivateTmp=true$' packaging/codex-info.service; then
     fail 'PrivateTmp=true hides live Codex /proc state from the Threads snapshot'
 fi
