@@ -1291,12 +1291,14 @@ fn quota_source_rescan_is_closed(
         && quota_samples.len() <= MAX_SOURCE_RESCAN_SAMPLES
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RecorderCommitAck {
     pub(crate) data_generation: u64,
     pub(crate) collector_epoch: u128,
     pub(crate) cycle_seq: u64,
     pub(crate) last_commit_unix: i64,
+    pub(crate) canonical_samples: Vec<UsageHistorySample>,
+    pub(crate) legacy_history_bridged: bool,
 }
 
 enum RecorderCommand {
@@ -1323,9 +1325,6 @@ enum RecorderCommand {
         gap: RecorderGap,
         completed: mpsc::SyncSender<Result<(), String>>,
     },
-    Probe {
-        response: mpsc::SyncSender<Result<(), String>>,
-    },
     Shutdown,
 }
 
@@ -1333,7 +1332,7 @@ fn maintain_history_database(
     database: &Path,
     identity: &StoragePartitionIdentity,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<(), String> {
+) -> Result<UsageStore, String> {
     UsageStore::backup_generations_partitioned(database, identity, 3)
         .map_err(|error| error.to_string())?;
     let mut store =
@@ -1341,7 +1340,7 @@ fn maintain_history_database(
     store
         .prune_older_than_three_months(now)
         .map_err(|error| error.to_string())?;
-    Ok(())
+    Ok(store)
 }
 
 #[cfg(test)]
@@ -1359,7 +1358,7 @@ pub(crate) fn maintain_history_database_for_test(
 
 pub(crate) struct ActiveRecorderPartition {
     partition: AccountPartition,
-    identity: StoragePartitionIdentity,
+    store: UsageStore,
     _writer_lock: DaemonLock,
 }
 
@@ -1399,6 +1398,16 @@ fn path_exists_without_following(path: &Path) -> Result<bool, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn legacy_database_for_partition(partition: &AccountPartition) -> Option<PathBuf> {
+    let epoch = partition.database_path.parent()?;
+    let account = epoch.parent()?;
+    let version = account.parent()?;
+    let accounts = version.parent()?;
+    let history = accounts.parent()?;
+    (version.file_name()? == "v1" && accounts.file_name()? == "accounts")
+        .then(|| history.join("usage_history.sqlite3"))
 }
 
 fn sync_file_and_parent(path: &Path) -> Result<(), String> {
@@ -1444,19 +1453,19 @@ pub(crate) fn activate_account_partition(
             .map_err(|error| error.to_string())?;
     }
 
-    let store = UsageStore::open_partitioned(&partition.database_path, &identity)
-        .map_err(|error| error.to_string())?;
-    drop(store);
-    account_scope::mark_partition_initialized(&partition).map_err(|error| error.to_string())?;
     let writer_lock = DaemonLock::acquire(partition.writer_lock_path.clone())
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "account partition writer is already owned".to_owned())?;
-    if existing_database {
-        maintain_history_database(&partition.database_path, &identity, now)?;
-    }
+    let store = if existing_database {
+        maintain_history_database(&partition.database_path, &identity, now)?
+    } else {
+        UsageStore::open_partitioned(&partition.database_path, &identity)
+            .map_err(|error| error.to_string())?
+    };
+    account_scope::mark_partition_initialized(&partition).map_err(|error| error.to_string())?;
     Ok(ActiveRecorderPartition {
         partition,
-        identity,
+        store,
         _writer_lock: writer_lock,
     })
 }
@@ -1540,22 +1549,6 @@ impl RecorderWorker {
                 while let Ok(command) = command_receiver.recv() {
                     match command {
                         RecorderCommand::Shutdown => break,
-                        RecorderCommand::Probe { response } => {
-                            // `updated_at_unix` is a liveness heartbeat for
-                            // every writer state, including idle and
-                            // degraded. It never fills a generation or
-                            // last-commit field: those remain exclusively
-                            // owned by the acknowledged SQLite commit path.
-                            let result = read_recorder_state()
-                                .and_then(|state| {
-                                    let mut state = state
-                                        .ok_or_else(|| "recorder state is missing".to_owned())?;
-                                    state.updated_at_unix =
-                                        state.updated_at_unix.max(unix_now().max(1));
-                                    persist_recorder_state(&_lock, &state)
-                                });
-                            let _ = response.send(result);
-                        }
                         RecorderCommand::Activate {
                             partition,
                             now,
@@ -1573,17 +1566,13 @@ impl RecorderWorker {
                             active = None;
                             let requested_partition_id = partition.partition_id.clone();
                             match activate_account_partition(partition, now) {
-                                Ok(next) => {
+                                Ok(mut next) => {
                                     if let Some(previous) = previous_state.as_ref() {
                                         if let Some(restart_gap) =
                                             pending_gap_from_previous_state(previous, &next.partition)
                                         {
-                                            let gap_result = UsageStore::open_partitioned(
-                                                &next.partition.database_path,
-                                                &next.identity,
-                                            )
-                                            .map_err(|error| error.to_string())
-                                            .and_then(|mut store| {
+                                            let gap_result = (|| -> Result<(), String> {
+                                                let store = &mut next.store;
                                                 let mut restart_gap = restart_gap;
                                                 let collection_state = store
                                                     .load_session_collection_state()
@@ -1610,7 +1599,7 @@ impl RecorderWorker {
                                                         .begin_recorder_gap(&restart_gap)
                                                         .map_err(|error| error.to_string())
                                                 }
-                                            });
+                                            })();
                                             if let Err(error) = gap_result {
                                                 let _ = completed.send(Err(error));
                                                 continue;
@@ -1724,110 +1713,120 @@ impl RecorderWorker {
                                 Err(format!("database write failed (injected {mode})"))
                             } else {
                                 active
-                                    .as_ref()
+                                    .as_mut()
                                     .filter(|current| current.partition.partition_id == partition_id)
                                     .ok_or_else(|| {
                                         "recorder account partition is not active".to_owned()
                                     })
                                     .and_then(|current| {
-                                        UsageStore::open_partitioned(
-                                            &current.partition.database_path,
-                                            &current.identity,
-                                        )
-                                        .map_err(|error| error.to_string())
-                                        .and_then(|mut store| {
-                                            let data_generation = store
-                                                .commit_session_collection(SessionCollectionCommit {
-                                                    reset_at,
-                                                    window_seconds,
-                                                    collector_epoch,
-                                                    cycle_seq,
-                                                    samples: &samples,
-                                                    checkpoints: &session_checkpoints,
-                                                    ranges: &session_ranges,
-                                                    model_totals: &session_model_totals,
-                                                    recorded_sessions: &recorded_sessions,
-                                                })
-                                                .map_err(|error| error.to_string())?;
-                                            // The quota portion of this
-                                            // acknowledged generation is the
-                                            // only production source proof a
-                                            // recorder restart may consume.
-                                            // Session backfill rows carry a
-                                            // null remaining value and are
-                                            // intentionally excluded, so
-                                            // token recovery can never
-                                            // fabricate a quota gap repair.
-                                            let mut source_minutes = samples
-                                                .iter()
-                                                .filter(|sample| {
-                                                    // A quota value from a
-                                                    // different reset period is
-                                                    // not evidence for this
-                                                    // gap, even when its minute
-                                                    // happens to overlap.
-                                                    sample.reset_at == reset_at
-                                                        && sample.remaining_percent.is_some()
-                                                })
-                                                .map(|sample| {
-                                                    sample.timestamp.div_euclid(60) * 60
-                                                })
-                                                .collect::<Vec<_>>();
-                                            source_minutes.sort_unstable();
-                                            source_minutes.dedup();
-                                            let source_identity_after =
-                                                format!("authenticated-quota:{partition_id}");
-                                            let cursor_after = format!(
-                                                "collector:{collector_epoch:032x}:cycle:{cycle_seq}"
-                                            );
-                                            let source_closed = quota_source_rescan_is_closed(
-                                                &samples,
+                                        let legacy =
+                                            legacy_database_for_partition(&current.partition);
+                                        let store = &mut current.store;
+                                        let commit_result = store
+                                            .commit_session_collection_with_samples(SessionCollectionCommit {
                                                 reset_at,
-                                                bounded_source_rescan_complete,
-                                            );
-                                            let resumed_at_monotonic_ns = monotonic_now_ns();
-                                            if resumed_at_monotonic_ns == 0 {
-                                                return Err(
-                                                    "boot-wide monotonic clock is unavailable"
-                                                        .to_owned(),
-                                                );
-                                            }
-                                            store
-                                                .reconcile_pending_recorder_gaps(
-                                                    &source_identity_after,
-                                                    &cursor_after,
-                                                    resumed_at_monotonic_ns,
-                                                    reset_at,
-                                                    collector_epoch,
-                                                    cycle_seq,
-                                                    &source_minutes,
-                                                    source_closed,
-                                                )
-                                                .map_err(|error| error.to_string())?;
-                                            // The transaction return value is
-                                            // checked again through a fresh
-                                            // SELECT before publishing state;
-                                            // a successful SQL call alone is
-                                            // not a recorder liveness claim.
-                                            let committed_state = store
-                                                .load_session_collection_state()
-                                                .map_err(|error| error.to_string())?;
-                                            if committed_state.data_generation != data_generation
-                                                || committed_state.collector_epoch
-                                                    != Some(collector_epoch)
-                                                || committed_state.cycle_seq != cycle_seq
-                                            {
-                                                return Err(
-                                                    "recorder generation read-back mismatch"
-                                                        .to_owned(),
-                                                );
-                                            }
-                                            Ok(RecorderCommitAck {
-                                                data_generation,
+                                                window_seconds,
                                                 collector_epoch,
                                                 cycle_seq,
-                                                last_commit_unix: unix_now().max(1),
+                                                samples: &samples,
+                                                checkpoints: &session_checkpoints,
+                                                ranges: &session_ranges,
+                                                model_totals: &session_model_totals,
+                                                recorded_sessions: &recorded_sessions,
                                             })
+                                            .map_err(|error| error.to_string())?;
+                                        let mut data_generation = commit_result.data_generation;
+                                        let canonical_samples = commit_result.canonical_samples;
+                                        let mut legacy_history_bridged = false;
+                                        if let Some(legacy) = legacy {
+                                            if store
+                                                .bridge_verified_legacy_history(&legacy)
+                                                .map_err(|error| error.to_string())?
+                                            {
+                                                legacy_history_bridged = true;
+                                                data_generation = store
+                                                    .load_session_collection_state()
+                                                    .map_err(|error| error.to_string())?
+                                                    .data_generation;
+                                            }
+                                        }
+                                        // The quota portion of this
+                                        // acknowledged generation is the
+                                        // only production source proof a
+                                        // recorder restart may consume.
+                                        // Session backfill rows carry a
+                                        // null remaining value and are
+                                        // intentionally excluded, so
+                                        // token recovery can never
+                                        // fabricate a quota gap repair.
+                                        let mut source_minutes = samples
+                                            .iter()
+                                            .filter(|sample| {
+                                                // A quota value from a
+                                                // different reset period is
+                                                // not evidence for this
+                                                // gap, even when its minute
+                                                // happens to overlap.
+                                                sample.reset_at == reset_at
+                                                    && sample.remaining_percent.is_some()
+                                            })
+                                            .map(|sample| sample.timestamp.div_euclid(60) * 60)
+                                            .collect::<Vec<_>>();
+                                        source_minutes.sort_unstable();
+                                        source_minutes.dedup();
+                                        let source_identity_after =
+                                            format!("authenticated-quota:{partition_id}");
+                                        let cursor_after = format!(
+                                            "collector:{collector_epoch:032x}:cycle:{cycle_seq}"
+                                        );
+                                        let source_closed = quota_source_rescan_is_closed(
+                                            &samples,
+                                            reset_at,
+                                            bounded_source_rescan_complete,
+                                        );
+                                        let resumed_at_monotonic_ns = monotonic_now_ns();
+                                        if resumed_at_monotonic_ns == 0 {
+                                            return Err(
+                                                "boot-wide monotonic clock is unavailable"
+                                                    .to_owned(),
+                                            );
+                                        }
+                                        store
+                                            .reconcile_pending_recorder_gaps(
+                                                &source_identity_after,
+                                                &cursor_after,
+                                                resumed_at_monotonic_ns,
+                                                reset_at,
+                                                collector_epoch,
+                                                cycle_seq,
+                                                &source_minutes,
+                                                source_closed,
+                                            )
+                                            .map_err(|error| error.to_string())?;
+                                        // The transaction return value is
+                                        // checked again through a fresh
+                                        // SELECT before publishing state;
+                                        // a successful SQL call alone is
+                                        // not a recorder liveness claim.
+                                        let committed_state = store
+                                            .load_session_collection_state()
+                                            .map_err(|error| error.to_string())?;
+                                        if committed_state.data_generation != data_generation
+                                            || committed_state.collector_epoch
+                                                != Some(collector_epoch)
+                                            || committed_state.cycle_seq != cycle_seq
+                                        {
+                                            return Err(
+                                                "recorder generation read-back mismatch".to_owned(),
+                                            );
+                                        }
+                                        Ok(RecorderCommitAck {
+                                            data_generation,
+                                            collector_epoch,
+                                            cycle_seq,
+                                            last_commit_unix: unix_now().max(1),
+                                            canonical_samples,
+                                            legacy_history_bridged,
                                         })
                                     })
                             };
@@ -1878,24 +1877,18 @@ impl RecorderWorker {
                             committed,
                         } => {
                             let result = active
-                                .as_ref()
+                                .as_mut()
                                 .filter(|current| current.partition.partition_id == partition_id)
                                 .ok_or_else(|| {
                                     "recorder account partition is not active".to_owned()
                                 })
                                 .and_then(|current| {
-                                    UsageStore::open_partitioned(
-                                        &current.partition.database_path,
-                                        &current.identity,
-                                    )
-                                    .map_err(|error| error.to_string())
-                                    .and_then(|mut store| {
-                                        store
-                                            .forget_recorded_sessions(&recorded_sessions)
-                                            .map(|_| ())
-                                            .map_err(|error| error.to_string())
-                                    })
-                            });
+                                    current
+                                        .store
+                                        .forget_recorded_sessions(&recorded_sessions)
+                                        .map(|_| ())
+                                        .map_err(|error| error.to_string())
+                                });
                             let _ = committed.send(result);
                         }
                         RecorderCommand::BeginGap {
@@ -1904,7 +1897,7 @@ impl RecorderWorker {
                             completed,
                         } => {
                             let result = active
-                                .as_ref()
+                                .as_mut()
                                 .filter(|current| current.partition.partition_id == partition_id)
                                 .ok_or_else(|| {
                                     "recorder account partition is not active".to_owned()
@@ -1915,16 +1908,10 @@ impl RecorderWorker {
                                             "recorder gap account partition mismatch".to_owned(),
                                         );
                                     }
-                                    UsageStore::open_partitioned(
-                                        &current.partition.database_path,
-                                        &current.identity,
-                                    )
-                                    .map_err(|error| error.to_string())
-                                    .and_then(|mut store| {
-                                        store
-                                            .begin_recorder_gap(&gap)
-                                            .map_err(|error| error.to_string())
-                                    })
+                                    current
+                                        .store
+                                        .begin_recorder_gap(&gap)
+                                        .map_err(|error| error.to_string())
                                 });
                             let _ = completed.send(result);
                         }
@@ -1963,21 +1950,20 @@ impl RecorderWorker {
         self.active && current_daemon_owner_pid() == Some(std::process::id())
     }
 
-    /// Probe the recorder command channel at the one-second service cadence.
-    /// A closed worker is never considered healthy merely because its process
-    /// still owns a lock or port.
+    /// Probe worker liveness at the one-second service cadence without adding
+    /// a command behind a legitimate SQLite transaction.  A response timeout
+    /// cannot distinguish a busy writer from a dead writer; the owned join
+    /// handle can, without delaying or terminating the resident service.
     pub(crate) fn probe(&self) -> Result<(), String> {
-        let commands = self
-            .commands
-            .as_ref()
-            .ok_or_else(|| DaemonError::Runtime.to_string())?;
-        let (response, receiver) = mpsc::sync_channel(1);
-        commands
-            .send(RecorderCommand::Probe { response })
-            .map_err(|_| DaemonError::Runtime.to_string())?;
-        receiver
-            .recv_timeout(Duration::from_secs(1))
-            .map_err(|_| DaemonError::Runtime.to_string())?
+        if self.commands.is_none()
+            || self
+                .worker
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
+        {
+            return Err(DaemonError::Runtime.to_string());
+        }
+        Ok(())
     }
 
     /// Quiesce any old account and activate exactly one confirmed storage
@@ -2412,11 +2398,11 @@ mod tests {
         assert_eq!(idle_state.schema, RECORDER_STATE_SCHEMA);
         assert_eq!(idle_state.write_state, RecorderWriteState::IdleNoAccount);
         assert!(idle_state.partition_id_hash.is_none());
-        let idle_heartbeat = idle_state.updated_at_unix;
         writer.probe().unwrap();
-        assert!(
-            read_recorder_state().unwrap().unwrap().updated_at_unix >= idle_heartbeat,
-            "idle heartbeat did not advance recorder-state"
+        assert_eq!(
+            read_recorder_state().unwrap().unwrap().updated_at_unix,
+            idle_state.updated_at_unix,
+            "liveness probe must not create a durable-state write"
         );
         let state_path = recorder_state_path().unwrap();
         let state_json: serde_json::Value =
@@ -2495,6 +2481,7 @@ mod tests {
                         prefix_sha256: "00".repeat(32),
                         fully_attributed_from_zero: true,
                         token_baseline_known: true,
+                        last_task_running: Some(true),
                         last_model: Some("SOL".into()),
                         previous_total: 12_345,
                         previous_input: 10_000,
@@ -2809,6 +2796,57 @@ mod tests {
     }
 
     #[test]
+    fn recorder_probe_does_not_misclassify_a_busy_writer_as_stopped() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_data = std::env::var_os("CODEX_INFO_DATA_DIR");
+        let root = temp_root("probe-busy-writer");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        std::env::set_var("CODEX_INFO_DATA_DIR", &data_dir);
+
+        let account = crate::account_scope::AccountKey::synthetic_preview("probe-account");
+        let partition = crate::account_scope::resolve_partition(&data_dir, &account).unwrap();
+        let mut writer = RecorderWorker::start().unwrap();
+        writer
+            .activate_partition(partition.clone(), chrono::Utc::now())
+            .unwrap();
+
+        let blocker = rusqlite::Connection::open(&partition.database_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let reset_at = unix_now().max(1) + 3_600;
+        let generation = RecorderGeneration {
+            reset_at,
+            window_seconds: 604_800,
+            collector_epoch: 1,
+            cycle_seq: 1,
+            samples: Vec::new(),
+            recorded_sessions: Vec::new(),
+            session_checkpoints: Vec::new(),
+            session_ranges: Vec::new(),
+            session_model_totals: Vec::new(),
+            bounded_source_rescan_complete: false,
+        };
+
+        std::thread::scope(|scope| {
+            let store =
+                scope.spawn(|| writer.store_generation(partition.partition_id.clone(), generation));
+            std::thread::sleep(Duration::from_millis(100));
+            writer
+                .probe()
+                .expect("a live writer waiting on SQLite must not be reported dead");
+            blocker.execute_batch("ROLLBACK").unwrap();
+            store.join().unwrap().unwrap();
+        });
+
+        writer.shutdown();
+        match old_data {
+            Some(value) => std::env::set_var("CODEX_INFO_DATA_DIR", value),
+            None => std::env::remove_var("CODEX_INFO_DATA_DIR"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn recorder_failure_injections_are_finite_and_do_not_retry_in_one_callback() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_data = std::env::var_os("CODEX_INFO_DATA_DIR");
@@ -2845,15 +2883,16 @@ mod tests {
                 "injection mode {mode} unexpectedly succeeded"
             );
             if mode != "worker-death" {
-                let degraded_heartbeat = read_recorder_state().unwrap().unwrap().updated_at_unix;
+                let degraded_updated_at = read_recorder_state().unwrap().unwrap().updated_at_unix;
                 assert_eq!(
                     read_recorder_state().unwrap().unwrap().write_state,
                     RecorderWriteState::Degraded
                 );
                 writer.probe().unwrap();
-                assert!(
-                    read_recorder_state().unwrap().unwrap().updated_at_unix >= degraded_heartbeat,
-                    "degraded heartbeat did not advance recorder-state"
+                assert_eq!(
+                    read_recorder_state().unwrap().unwrap().updated_at_unix,
+                    degraded_updated_at,
+                    "liveness probe must not hide degraded state with a heartbeat write"
                 );
             }
             if mode == "busy" {

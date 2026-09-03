@@ -619,6 +619,7 @@ pub struct ValidatedThreadCandidate {
     updated_at: i64,
     path: Option<String>,
     title: String,
+    active: bool,
     is_subagent: bool,
     parent_thread_id: Option<String>,
     depth: Option<i32>,
@@ -643,6 +644,10 @@ impl ValidatedThreadCandidate {
 
     pub fn title(&self) -> &str {
         &self.title
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
     }
 
     pub fn is_subagent(&self) -> bool {
@@ -671,6 +676,7 @@ impl ValidatedThreadCandidate {
             && self.updated_at == other.updated_at
             && self.path == other.path
             && self.title == other.title
+            && self.active == other.active
             && self.is_subagent == other.is_subagent
             && self.parent_thread_id == other.parent_thread_id
             && self.depth == other.depth
@@ -979,6 +985,12 @@ pub fn validate_thread_item(item: &Value) -> Result<ValidatedThreadCandidate, Th
     } else {
         "アクティブなスレッド".to_owned()
     };
+    let active = object
+        .get("status")
+        .and_then(Value::as_object)
+        .and_then(|status| status.get("type"))
+        .and_then(Value::as_str)
+        == Some("active");
     let (is_subagent, parent_thread_id, depth) = thread_relation(object);
 
     Ok(ValidatedThreadCandidate {
@@ -988,6 +1000,7 @@ pub fn validate_thread_item(item: &Value) -> Result<ValidatedThreadCandidate, Th
         updated_at,
         path,
         title,
+        active,
         is_subagent,
         parent_thread_id,
         depth,
@@ -1160,6 +1173,11 @@ impl ValidatedRollout {
         self.running
     }
 
+    pub fn with_running_override(mut self, running: bool) -> Self {
+        self.running = running;
+        self
+    }
+
     pub fn model(&self) -> &str {
         &self.model
     }
@@ -1185,7 +1203,7 @@ impl ValidatedRollout {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 struct RolloutState {
     last_task_running: Option<bool>,
     last_model: Option<String>,
@@ -1193,6 +1211,103 @@ struct RolloutState {
     last_context_usage_tokens: Option<u64>,
     last_context_window_tokens: Option<u64>,
     last_user_message_at: Option<i64>,
+}
+
+/// Stateful parser used by the live rollout reader.
+///
+/// Rollout files are append-only.  The first cycle applies the complete
+/// bounded prefix and later cycles apply only complete records appended after
+/// the cached offset.  Keeping this state here makes the incremental path use
+/// exactly the same known-event validation as the full reader.
+#[derive(Clone, Debug, Default)]
+pub struct RolloutAccumulator {
+    state: RolloutState,
+}
+
+impl RolloutAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn seeded(
+        last_model: Option<String>,
+        previous_total: u64,
+        last_task_running: Option<bool>,
+    ) -> Self {
+        Self {
+            state: RolloutState {
+                last_task_running,
+                last_model,
+                last_total_tokens: Some(previous_total),
+                ..RolloutState::default()
+            },
+        }
+    }
+
+    /// Apply complete records from `reader` to this accumulator.
+    ///
+    /// The caller supplies the bounded byte count for this chunk.  A complete
+    /// chunk is expected in normal operation; an unterminated record remains a
+    /// hard error so the caller cannot publish a partial known event.
+    pub fn apply_reader<R: BufRead>(
+        &mut self,
+        reader: &mut R,
+        snapshot_bytes: u64,
+    ) -> Result<(), RolloutError> {
+        if snapshot_bytes > security::MAX_SESSION_FILE_BYTES {
+            return Err(RolloutError::FileTooLarge);
+        }
+        loop {
+            let record = match security::read_bounded_jsonl_record(reader) {
+                Ok(record) => record,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        security::SecurityErrorKind::LimitExceeded
+                            | security::SecurityErrorKind::Parse
+                    ) =>
+                {
+                    // Tool output and malformed token-count/response-item
+                    // records are non-liveness data.  The bounded reader has
+                    // consumed the complete bad record before returning, so
+                    // skipping it preserves the existing live-reader
+                    // recovery contract without weakening lifecycle/model
+                    // validation below.
+                    continue;
+                }
+                Err(error) => {
+                    return Err(match error.kind() {
+                        security::SecurityErrorKind::LimitExceeded => RolloutError::LineTooLarge,
+                        security::SecurityErrorKind::Parse => RolloutError::InvalidUtf8,
+                        security::SecurityErrorKind::Unterminated => RolloutError::UnterminatedLine,
+                        _ => RolloutError::InvalidJson,
+                    });
+                }
+            };
+            let Some((line, terminated)) = record else {
+                break;
+            };
+            if !terminated {
+                return Err(RolloutError::UnterminatedLine);
+            }
+            let value: Value = match serde_json::from_str(&line) {
+                Ok(value) => value,
+                Err(_)
+                    if is_malformed_token_count_record(&line)
+                        || is_malformed_response_item_record(&line) =>
+                {
+                    continue;
+                }
+                Err(_) => return Err(RolloutError::InvalidJson),
+            };
+            apply_rollout_event(&value, &mut self.state)?;
+        }
+        Ok(())
+    }
+
+    pub fn snapshot(&self) -> Result<ValidatedRollout, RolloutError> {
+        finish_rollout(self.state.clone())
+    }
 }
 
 fn finish_rollout(state: RolloutState) -> Result<ValidatedRollout, RolloutError> {
@@ -1267,44 +1382,9 @@ pub fn parse_rollout_reader_recoverable<R: BufRead>(
     reader: &mut R,
     snapshot_bytes: u64,
 ) -> Result<ValidatedRollout, RolloutError> {
-    if snapshot_bytes > security::MAX_SESSION_FILE_BYTES {
-        return Err(RolloutError::FileTooLarge);
-    }
-    let mut state = RolloutState::default();
-    loop {
-        let record = match security::read_bounded_jsonl_record(reader) {
-            Ok(record) => record,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    security::SecurityErrorKind::LimitExceeded | security::SecurityErrorKind::Parse
-                ) =>
-            {
-                continue
-            }
-            Err(error) => {
-                return Err(match error.kind() {
-                    security::SecurityErrorKind::LimitExceeded => RolloutError::LineTooLarge,
-                    security::SecurityErrorKind::Parse => RolloutError::InvalidUtf8,
-                    security::SecurityErrorKind::Unterminated => RolloutError::UnterminatedLine,
-                    _ => RolloutError::InvalidJson,
-                });
-            }
-        };
-        let Some((line, terminated)) = record else {
-            break;
-        };
-        if !terminated {
-            return Err(RolloutError::UnterminatedLine);
-        }
-        let value: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(_) if is_malformed_token_count_record(&line) => continue,
-            Err(_) => return Err(RolloutError::InvalidJson),
-        };
-        apply_rollout_event(&value, &mut state)?;
-    }
-    finish_rollout(state)
+    let mut accumulator = RolloutAccumulator::new();
+    accumulator.apply_reader(reader, snapshot_bytes)?;
+    accumulator.snapshot()
 }
 
 fn is_malformed_token_count_record(line: &str) -> bool {
@@ -1317,6 +1397,16 @@ fn is_malformed_token_count_record(line: &str) -> bool {
     // token_count from being skipped.
     contains_string_field(&line[..payload_start], "type", "event_msg")
         && contains_string_field(&line[payload_start..], "type", "token_count")
+}
+
+fn is_malformed_response_item_record(line: &str) -> bool {
+    let Some(payload_start) = line.find("\"payload\"") else {
+        return false;
+    };
+    // response_item records carry transcript content, not task lifecycle,
+    // model, or token state. An interrupted append must not invalidate later
+    // complete state events in the same live rollout.
+    contains_string_field(&line[..payload_start], "type", "response_item")
 }
 
 fn contains_string_field(input: &str, key: &str, expected: &str) -> bool {
@@ -1447,11 +1537,11 @@ fn apply_known_rollout_event(
     nested: bool,
     state: &mut RolloutState,
 ) -> Result<(), RolloutError> {
+    if let Some(running) = task_running_for_event_type(event_type) {
+        state.last_task_running = Some(running);
+        return Ok(());
+    }
     match event_type {
-        "task_started" => state.last_task_running = Some(true),
-        "task_complete" | "task_completed" | "turn_aborted" => {
-            state.last_task_running = Some(false)
-        }
         "turn_context" | "thread_context" | "thread_settings_applied" => {
             state.last_model = Some(extract_known_model(event_type, event)?);
         }
@@ -1497,6 +1587,16 @@ fn apply_known_rollout_event(
         _ => {}
     }
     Ok(())
+}
+
+/// Canonical task-lifecycle projection shared by the rollout reader and the
+/// durable session checkpoint writer.
+pub fn task_running_for_event_type(event_type: &str) -> Option<bool> {
+    match event_type {
+        "task_started" => Some(true),
+        "task_complete" | "task_completed" | "turn_aborted" => Some(false),
+        _ => None,
+    }
 }
 
 fn extract_known_model(
@@ -1668,6 +1768,13 @@ where
                 continue;
             }
         };
+        // The schema-validated thread/read status is the live app-server
+        // authority. A restart can leave the durable rollout prefix without
+        // a task_started event, so an explicitly active candidate promotes
+        // the parsed rollout while preserving the existing rollout signal
+        // for older app-server status variants.
+        let running = rollout.is_running() || candidate.is_active();
+        let rollout = rollout.with_running_override(running);
         if !rollout.is_running() {
             continue;
         }
@@ -3217,6 +3324,26 @@ mod tests {
     }
 
     #[test]
+    fn thread_c_schema_active_status_promotes_rollout_running_state() {
+        let mut item = thread_fixture("active-status", 20, "active-status");
+        item["status"] = json!({
+            "type": "active",
+            "activeFlags": ["waitingOnApproval"]
+        });
+        let candidate = validate_thread_item(&item).expect("active status validates");
+        assert!(candidate.is_active());
+        let outcome =
+            select_active_threads(terminal_cycle(vec![item]), |_| -> Result<Vec<u8>, ()> {
+                Ok(rollout_bytes(&[json!({"type":"task_complete"})]))
+            });
+        assert!(matches!(
+            outcome,
+            ThreadCycleOutcome::Snapshots(rows)
+                if rows.len() == 1 && rows[0].thread_id == "active-status"
+        ));
+    }
+
+    #[test]
     fn thread_c_model_scalar_and_label_complete_matrix() {
         let started = json!({"type":"task_started"});
         let no_model = parse_rollout(&rollout_bytes(std::slice::from_ref(&started))).unwrap();
@@ -3480,7 +3607,7 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_rollout_parser_skips_only_malformed_token_count_records() {
+    fn recoverable_rollout_parser_skips_malformed_non_state_records_only() {
         let bytes = b"{\"type\":\"thread_context\",\"model\":\"gpt-5.6-luna\"}\n{\"type\":\"task_started\"}\n{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"rate_limits\":{\"primary\":{\"use\n{\"type\":\"task_complete\"}\n";
         let parsed = parse_rollout_reader_recoverable(&mut Cursor::new(bytes), bytes.len() as u64)
             .expect("malformed token_count is non-liveness data");
@@ -3497,6 +3624,14 @@ mod tests {
         let parsed =
             parse_rollout_reader_recoverable(&mut Cursor::new(spaced), spaced.len() as u64)
                 .expect("whitespace-only token_count envelope is non-liveness data");
+        assert!(!parsed.is_running());
+
+        let interrupted_reasoning = b"{\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"summary\":[{\"text\":\"interrupted\n{\"type\":\"task_complete\"}\n";
+        let parsed = parse_rollout_reader_recoverable(
+            &mut Cursor::new(interrupted_reasoning),
+            interrupted_reasoning.len() as u64,
+        )
+        .expect("interrupted transcript content is non-state data");
         assert!(!parsed.is_running());
 
         let lifecycle_with_token_word =

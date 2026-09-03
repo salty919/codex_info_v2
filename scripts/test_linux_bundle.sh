@@ -215,7 +215,9 @@ if [[ "$url" == */releases?per_page=100 ]]; then
     payload_file="$FAKE_RELEASE_JSON"
 elif [[ "$url" == */releases/download/*/* ]]; then
     payload_file="$FAKE_RELEASE_ASSETS/${url##*/}"
-elif [[ "$url" == http://127.0.0.1:8787/* ]]; then
+elif [[ "$url" == http://127.0.0.1:8787/v1/details ]]; then
+    payload="$(printf '{\"state\":\"%s\",\"observed_at\":1}\n' "${FAKE_DETAILS_STATE:-auth_required}")"
+elif [[ "$url" == http://127.0.0.1:8787/v1/health ]]; then
     if [[ -n "${FAKE_HEALTH_COUNT_FILE:-}" ]]; then
         count=0
         [[ -f "$FAKE_HEALTH_COUNT_FILE" ]] && count="$(<"$FAKE_HEALTH_COUNT_FILE")"
@@ -560,6 +562,13 @@ for health_shape in extra duplicate old; do
         fail "health shape unexpectedly accepted: $health_shape"
     fi
 done
+if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_SHAPE=exact FAKE_DETAILS_STATE=error \
+    CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+    bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null 2>&1; then
+    fail 'runtime with error details unexpectedly passed functional readiness'
+fi
 state_backup="$TEST_ROOT/recorder-state.good"
 cp -- "$fake_home/.codex/history/recorder-state.json" "$state_backup"
 python3 - "$fake_home/.codex/history/recorder-state.json" <<'PY'
@@ -609,6 +618,7 @@ if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PA
 fi
 grep -Fq 'curl --fail --silent --show-error --proto =https' "$log" || fail 'release API failure fixture did not query discovery'
 grep -Fq '127.0.0.1:8787/v1/health' "$log" || fail 'release API failure did not read back coherent B'
+grep -Fq '127.0.0.1:8787/v1/details' "$log" || fail 'release API failure did not verify functional readiness'
 write_stopped_state "$fake_home"
 printf 'case release-failure coherent-B readback: PASS\n'
 
@@ -767,5 +777,9 @@ grep -Fq 'OnUnitActiveSec=1h' "$ROOT_DIR/packaging/codex-info-update.timer"
 grep -Fq 'AccuracySec=1s' "$ROOT_DIR/packaging/codex-info-update.timer"
 grep -Fq 'Restart=always' "$ROOT_DIR/packaging/codex-info.service"
 grep -Fq 'RestartSec=5s' "$ROOT_DIR/packaging/codex-info.service"
+grep -Fq 'StartLimitIntervalSec=0' "$ROOT_DIR/packaging/codex-info.service"
+if grep -q '^StartLimitBurst=' "$ROOT_DIR/packaging/codex-info.service"; then
+    fail 'daemon start-rate limiting must stay disabled'
+fi
 grep -Fq 'TimeoutStartSec=1h20min31s' "$ROOT_DIR/packaging/codex-info-update.service"
 printf 'linux bundle contract cases passed\n'

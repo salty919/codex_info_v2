@@ -16,10 +16,8 @@ use codex_info::server::{
     PublicThread,
 };
 use codex_info::thread_contract::{
-    self, PageAcceptance, ThreadCycleAccumulator, ThreadCycleOutcome, ThreadTopologyNode,
-    ValidatedThreadCandidate,
+    self, ThreadCycleAccumulator, ThreadCycleOutcome, ThreadTopologyNode,
 };
-use codex_info::thread_state;
 use codex_info::usage_store::{self, StoragePartitionIdentity, UsageStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -68,6 +66,7 @@ enum ThreadCommand {
     Read {
         auth_epoch: u64,
         admission: AccountAdmission,
+        account_partition: account_scope::AccountPartition,
     },
     Stop,
 }
@@ -1189,6 +1188,48 @@ enum ActiveThreadUpdate {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RolloutFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    is_file: bool,
+}
+
+fn rollout_file_identity(metadata: &fs::Metadata) -> RolloutFileIdentity {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        RolloutFileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        RolloutFileIdentity {
+            is_file: metadata.is_file(),
+        }
+    }
+}
+
+struct ThreadRolloutCacheEntry {
+    identity: RolloutFileIdentity,
+    observed_len: u64,
+    complete_offset: u64,
+    discard_until_lf: bool,
+    thread_id: String,
+    parser: thread_contract::RolloutAccumulator,
+    snapshot: thread_contract::ValidatedRollout,
+}
+
+#[derive(Default)]
+struct ThreadRolloutCache {
+    entries: BTreeMap<PathBuf, ThreadRolloutCacheEntry>,
+}
+
 /// Opt-in runtime diagnostics for investigating live update regressions.
 ///
 /// The normal client remains silent and never writes account/session data to
@@ -1276,18 +1317,193 @@ fn complete_rollout_prefix_len(file: &mut File, snapshot_len: u64) -> Result<u64
     Ok(0)
 }
 
-fn read_thread_rollout(
-    sessions_root: &Path,
-    candidate: &ValidatedThreadCandidate,
-) -> Result<thread_contract::ValidatedRollout, ()> {
-    let candidate_path = candidate.path().ok_or(())?;
-    read_thread_rollout_path(sessions_root, Path::new(candidate_path))
+fn complete_rollout_range_end(
+    file: &mut File,
+    start_offset: u64,
+    snapshot_len: u64,
+) -> Result<u64, ()> {
+    if start_offset > snapshot_len {
+        return Err(());
+    }
+    if start_offset == snapshot_len {
+        return Ok(snapshot_len);
+    }
+    file.seek(SeekFrom::Start(start_offset)).map_err(|_| ())?;
+    let mut remaining = snapshot_len.checked_sub(start_offset).ok_or(())?;
+    let mut offset = start_offset;
+    let mut last_newline = None;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| ())?;
+        let read = file.read(&mut buffer[..limit]).map_err(|_| ())?;
+        if read == 0 {
+            return Err(());
+        }
+        if let Some(index) = buffer[..read].iter().rposition(|byte| *byte == b'\n') {
+            let newline_end = offset
+                .checked_add(index as u64)
+                .and_then(|position| position.checked_add(1))
+                .ok_or(())?;
+            last_newline = Some(newline_end);
+        }
+        offset = offset.checked_add(read as u64).ok_or(())?;
+        remaining = remaining.checked_sub(read as u64).ok_or(())?;
+    }
+    if let Some(end) = last_newline {
+        return Ok(end);
+    }
+    if snapshot_len - start_offset > security::MAX_JSONL_LINE_BYTES as u64 {
+        return Err(());
+    }
+    Ok(start_offset)
 }
 
+fn first_rollout_newline_end(
+    file: &mut File,
+    start_offset: u64,
+    snapshot_len: u64,
+) -> Result<Option<u64>, ()> {
+    if start_offset > snapshot_len {
+        return Err(());
+    }
+    if start_offset == snapshot_len {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(start_offset)).map_err(|_| ())?;
+    let mut remaining = snapshot_len.checked_sub(start_offset).ok_or(())?;
+    let mut offset = start_offset;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| ())?;
+        let read = file.read(&mut buffer[..limit]).map_err(|_| ())?;
+        if read == 0 {
+            return Err(());
+        }
+        if let Some(index) = buffer[..read].iter().position(|byte| *byte == b'\n') {
+            let newline_end = offset
+                .checked_add(index as u64)
+                .and_then(|position| position.checked_add(1))
+                .ok_or(())?;
+            if newline_end - start_offset
+                > (security::MAX_JSONL_LINE_BYTES as u64).saturating_add(1)
+            {
+                return Err(());
+            }
+            return Ok(Some(newline_end));
+        }
+        offset = offset.checked_add(read as u64).ok_or(())?;
+        remaining = remaining.checked_sub(read as u64).ok_or(())?;
+        if offset - start_offset > security::MAX_JSONL_LINE_BYTES as u64 {
+            return Err(());
+        }
+    }
+    Ok(None)
+}
+
+fn rollout_checkpoint_key(
+    sessions_root: &Path,
+    canonical: &Path,
+    file_metadata: &fs::Metadata,
+) -> Result<(String, String, u64, u64), ()> {
+    let canonical_root = security::validate_absolute_root(sessions_root).map_err(|_| ())?;
+    let root_metadata = fs::symlink_metadata(&canonical_root).map_err(|_| ())?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(());
+    }
+    let root_identity = session_root_identity(&canonical_root, &root_metadata).map_err(|_| ())?;
+    let relative = canonical.strip_prefix(&canonical_root).map_err(|_| ())?;
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(());
+    }
+    let relative_path = relative.to_str().ok_or(())?.to_owned();
+    #[cfg(unix)]
+    let (device, inode) = {
+        use std::os::unix::fs::MetadataExt;
+        (file_metadata.dev(), file_metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let (device, inode) = (0, 0);
+    Ok((root_identity, relative_path, device, inode))
+}
+
+fn matching_rollout_checkpoint<'a>(
+    sessions_root: &Path,
+    canonical: &Path,
+    file_metadata: &fs::Metadata,
+    checkpoints: &'a [usage_store::SessionCheckpoint],
+) -> Option<&'a usage_store::SessionCheckpoint> {
+    let (root_identity, relative_path, device, inode) =
+        rollout_checkpoint_key(sessions_root, canonical, file_metadata).ok()?;
+    checkpoints.iter().find(|checkpoint| {
+        checkpoint.root_identity == root_identity
+            && checkpoint.relative_path == relative_path
+            && checkpoint.file_device == device
+            && checkpoint.file_inode == inode
+    })
+}
+
+fn load_thread_rollout_checkpoints(
+    partition: &account_scope::AccountPartition,
+) -> Vec<usage_store::SessionCheckpoint> {
+    match fs::symlink_metadata(&partition.database_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Vec::new()
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(_) => return Vec::new(),
+    }
+    let identity = partition.storage_identity();
+    UsageStore::open_read_only_partitioned(&partition.database_path, &identity)
+        .and_then(|store| store.load_session_collection_state())
+        .map(|state| state.checkpoints)
+        .unwrap_or_default()
+}
+
+fn read_thread_session_meta_id(file: &mut File) -> Result<String, ()> {
+    file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
+    let max_record_bytes = security::MAX_JSONL_LINE_BYTES.checked_add(1).ok_or(())?;
+    let mut reader = BufReader::new((&mut *file).take(max_record_bytes as u64));
+    let Some((line, true)) = security::read_bounded_jsonl_record(&mut reader).map_err(|_| ())?
+    else {
+        return Err(());
+    };
+    let value: Value = serde_json::from_str(&line).map_err(|_| ())?;
+    let object = value.as_object().ok_or(())?;
+    if object.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return Err(());
+    }
+    object
+        .get("payload")
+        .and_then(Value::as_object)
+        .and_then(|payload| payload.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| {
+            let length = id.chars().count();
+            (1..=128).contains(&length) && !id.chars().any(char::is_control)
+        })
+        .map(ToOwned::to_owned)
+        .ok_or(())
+}
+
+#[cfg(test)]
 fn read_thread_rollout_path(
     sessions_root: &Path,
     candidate_path: &Path,
 ) -> Result<thread_contract::ValidatedRollout, ()> {
+    read_thread_rollout_snapshot(sessions_root, candidate_path, false).map(|(_, rollout)| rollout)
+}
+
+#[cfg(test)]
+fn read_thread_rollout_snapshot(
+    sessions_root: &Path,
+    candidate_path: &Path,
+    require_thread_id: bool,
+) -> Result<(Option<String>, thread_contract::ValidatedRollout), ()> {
     let canonical =
         security::canonical_regular_file_under(sessions_root, candidate_path).map_err(|_| ())?;
     let before_path = fs::symlink_metadata(&canonical).map_err(|_| ())?;
@@ -1303,6 +1519,33 @@ fn read_thread_rollout_path(
     }
     let snapshot_len = before_file.len();
     let complete_len = complete_rollout_prefix_len(&mut file, snapshot_len)?;
+    let thread_id = if require_thread_id {
+        file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
+        let mut reader = BufReader::new((&mut file).take(complete_len));
+        let Some((line, true)) =
+            security::read_bounded_jsonl_record(&mut reader).map_err(|_| ())?
+        else {
+            return Err(());
+        };
+        let value: Value = serde_json::from_str(&line).map_err(|_| ())?;
+        let object = value.as_object().ok_or(())?;
+        if object.get("type").and_then(Value::as_str) != Some("session_meta") {
+            return Err(());
+        }
+        let id = object
+            .get("payload")
+            .and_then(Value::as_object)
+            .and_then(|payload| payload.get("id"))
+            .and_then(Value::as_str)
+            .filter(|id| {
+                let length = id.chars().count();
+                (1..=128).contains(&length) && !id.chars().any(char::is_control)
+            })
+            .ok_or(())?;
+        Some(id.to_owned())
+    } else {
+        None
+    };
     file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
     let rollout = {
         let mut reader = BufReader::new((&mut file).take(complete_len));
@@ -1324,11 +1567,208 @@ fn read_thread_rollout_path(
         || !after_path.is_file()
         || !same_rollout_identity(&before_file, &after_file)
         || !same_rollout_identity(&after_file, &after_path)
-        || after_file.len() < snapshot_len
+        || after_file.len() != snapshot_len
     {
         return Err(());
     }
-    Ok(rollout)
+    Ok((thread_id, rollout))
+}
+
+/// Read an active rollout through the worker-owned append-only cache.
+///
+/// The cache key is the canonical path and the entry's identity.  A matching
+/// entry only consumes complete records after its prior complete offset.  A
+/// partial tail is deliberately left at that offset so a later append can
+/// complete and validate the same record. Identity changes and truncation
+/// discard the entry and use a matching durable seed or bounded bootstrap.
+#[cfg(test)]
+fn read_active_thread_rollout_cached(
+    sessions_root: &Path,
+    candidate_path: &Path,
+    cache: &mut ThreadRolloutCache,
+) -> Result<(String, thread_contract::ValidatedRollout), ()> {
+    read_active_thread_rollout_cached_with_checkpoints(sessions_root, candidate_path, cache, &[])
+}
+
+fn read_active_thread_rollout_cached_with_checkpoints(
+    sessions_root: &Path,
+    candidate_path: &Path,
+    cache: &mut ThreadRolloutCache,
+    checkpoints: &[usage_store::SessionCheckpoint],
+) -> Result<(String, thread_contract::ValidatedRollout), ()> {
+    let canonical =
+        security::canonical_regular_file_under(sessions_root, candidate_path).map_err(|_| ())?;
+    let before_path = fs::symlink_metadata(&canonical).map_err(|_| ())?;
+    if before_path.file_type().is_symlink() || !before_path.is_file() {
+        return Err(());
+    }
+    let mut file = File::open(&canonical).map_err(|_| ())?;
+    let before_file = file.metadata().map_err(|_| ())?;
+    if !same_rollout_identity(&before_path, &before_file)
+        || before_file.len() > security::MAX_SESSION_FILE_BYTES
+    {
+        return Err(());
+    }
+    let snapshot_len = before_file.len();
+    let identity = rollout_file_identity(&before_file);
+    let cached_entry = cache.entries.get(&canonical);
+    let (reusable, parse_start, complete_len, discard_until_lf) = match cached_entry {
+        Some(entry)
+            if entry.identity == identity
+                && entry.complete_offset <= entry.observed_len
+                && snapshot_len == entry.observed_len =>
+        {
+            // An unchanged snapshot is already represented by the cached
+            // parser/snapshot.  Do not inspect even the file tail.
+            (
+                true,
+                entry.complete_offset,
+                entry.complete_offset,
+                entry.discard_until_lf,
+            )
+        }
+        Some(entry)
+            if entry.identity == identity
+                && entry.complete_offset <= entry.observed_len
+                && snapshot_len > entry.observed_len =>
+        {
+            if entry.discard_until_lf {
+                match first_rollout_newline_end(&mut file, entry.complete_offset, snapshot_len)? {
+                    Some(start) => (
+                        true,
+                        start,
+                        complete_rollout_range_end(&mut file, start, snapshot_len)?,
+                        false,
+                    ),
+                    None => (true, entry.complete_offset, entry.complete_offset, true),
+                }
+            } else {
+                (
+                    true,
+                    entry.complete_offset,
+                    complete_rollout_range_end(&mut file, entry.complete_offset, snapshot_len)?,
+                    false,
+                )
+            }
+        }
+        _ => {
+            let checkpoint =
+                matching_rollout_checkpoint(sessions_root, &canonical, &before_file, checkpoints);
+            match checkpoint {
+                Some(checkpoint) => {
+                    if checkpoint.committed_offset > snapshot_len {
+                        return Err(());
+                    }
+                    if checkpoint.discard_until_lf {
+                        match first_rollout_newline_end(
+                            &mut file,
+                            checkpoint.committed_offset,
+                            snapshot_len,
+                        )? {
+                            Some(start) => (
+                                false,
+                                start,
+                                complete_rollout_range_end(&mut file, start, snapshot_len)?,
+                                false,
+                            ),
+                            None => (
+                                false,
+                                checkpoint.committed_offset,
+                                checkpoint.committed_offset,
+                                true,
+                            ),
+                        }
+                    } else {
+                        (
+                            false,
+                            checkpoint.committed_offset,
+                            complete_rollout_range_end(
+                                &mut file,
+                                checkpoint.committed_offset,
+                                snapshot_len,
+                            )?,
+                            false,
+                        )
+                    }
+                }
+                None => {
+                    if snapshot_len > security::MAX_JSONL_LINE_BYTES as u64 {
+                        return Err(());
+                    }
+                    let complete_len = complete_rollout_prefix_len(&mut file, snapshot_len)?;
+                    (false, 0, complete_len, false)
+                }
+            }
+        }
+    };
+    let (thread_id, parser, complete_offset, snapshot) = if reusable {
+        let entry = cache.entries.get(&canonical).ok_or(())?;
+        let mut parser = entry.parser.clone();
+        if complete_len > parse_start {
+            let appended_len = complete_len.checked_sub(parse_start).ok_or(())?;
+            file.seek(SeekFrom::Start(parse_start)).map_err(|_| ())?;
+            let mut reader = BufReader::new((&mut file).take(appended_len));
+            parser
+                .apply_reader(&mut reader, appended_len)
+                .map_err(|_| ())?;
+        }
+        let snapshot = if complete_len > parse_start {
+            parser.snapshot().map_err(|_| ())?
+        } else {
+            entry.snapshot.clone()
+        };
+        (entry.thread_id.clone(), parser, complete_len, snapshot)
+    } else {
+        let checkpoint =
+            matching_rollout_checkpoint(sessions_root, &canonical, &before_file, checkpoints);
+        let mut parser = checkpoint
+            .map(|checkpoint| {
+                thread_contract::RolloutAccumulator::seeded(
+                    checkpoint.last_model.clone(),
+                    checkpoint.previous_total,
+                    checkpoint
+                        .last_task_running
+                        .or_else(|| (complete_len > parse_start).then_some(true)),
+                )
+            })
+            .unwrap_or_else(thread_contract::RolloutAccumulator::new);
+        let thread_id = read_thread_session_meta_id(&mut file)?;
+        if complete_len > parse_start {
+            let appended_len = complete_len.checked_sub(parse_start).ok_or(())?;
+            file.seek(SeekFrom::Start(parse_start)).map_err(|_| ())?;
+            let mut reader = BufReader::new((&mut file).take(appended_len));
+            parser
+                .apply_reader(&mut reader, appended_len)
+                .map_err(|_| ())?;
+        }
+        let snapshot = parser.snapshot().map_err(|_| ())?;
+        (thread_id, parser, complete_len, snapshot)
+    };
+
+    let after_file = file.metadata().map_err(|_| ())?;
+    let after_path = fs::symlink_metadata(&canonical).map_err(|_| ())?;
+    if after_path.file_type().is_symlink()
+        || !after_path.is_file()
+        || !same_rollout_identity(&before_file, &after_file)
+        || !same_rollout_identity(&after_file, &after_path)
+        || after_file.len() != snapshot_len
+    {
+        return Err(());
+    }
+
+    cache.entries.insert(
+        canonical,
+        ThreadRolloutCacheEntry {
+            identity,
+            observed_len: snapshot_len,
+            complete_offset,
+            discard_until_lf,
+            thread_id: thread_id.clone(),
+            parser,
+            snapshot: snapshot.clone(),
+        },
+    );
+    Ok((thread_id, snapshot))
 }
 
 const MAX_PROC_PROCESS_ENTRIES: usize = 65_536;
@@ -1594,15 +2034,19 @@ fn fetch_active_thread_update(
     next_id: &mut u64,
     sessions_root: &Path,
     active_paths: &BTreeSet<PathBuf>,
-    codex_root: &Path,
+    deadline: Instant,
+    rollout_cache: &mut ThreadRolloutCache,
+    checkpoints: &[usage_store::SessionCheckpoint],
 ) -> ActiveThreadUpdate {
-    fetch_active_thread_update_for_paths_and_state(
+    fetch_active_thread_update_before_deadline_with_cache(
         input,
         output,
         next_id,
         sessions_root,
         active_paths,
-        Some(codex_root),
+        deadline,
+        rollout_cache,
+        checkpoints,
     )
 }
 
@@ -1624,21 +2068,53 @@ fn fetch_active_thread_update_for_paths(
     )
 }
 
+#[cfg(test)]
 fn fetch_active_thread_update_for_paths_and_state(
     input: &mut impl Write,
     output: &Receiver<RpcReadEvent>,
     next_id: &mut u64,
     sessions_root: &Path,
     active_paths: &BTreeSet<PathBuf>,
-    codex_root: Option<&Path>,
+    _codex_root: Option<&Path>,
 ) -> ActiveThreadUpdate {
-    let mut accumulator = ThreadCycleAccumulator::new();
-    let mut cursor: Option<String> = None;
-    loop {
-        let params = match thread_contract::thread_list_request(cursor.as_deref()) {
-            Ok(params) => params,
-            Err(_) => {
-                debug_runtime("thread list request construction failed");
+    let mut rollout_cache = ThreadRolloutCache::default();
+    fetch_active_thread_update_before_deadline_with_cache(
+        input,
+        output,
+        next_id,
+        sessions_root,
+        active_paths,
+        Instant::now() + security::RPC_RESPONSE_TIMEOUT,
+        &mut rollout_cache,
+        &[],
+    )
+}
+
+fn fetch_active_thread_update_before_deadline_with_cache(
+    input: &mut impl Write,
+    output: &Receiver<RpcReadEvent>,
+    next_id: &mut u64,
+    sessions_root: &Path,
+    active_paths: &BTreeSet<PathBuf>,
+    deadline: Instant,
+    rollout_cache: &mut ThreadRolloutCache,
+    checkpoints: &[usage_store::SessionCheckpoint],
+) -> ActiveThreadUpdate {
+    rollout_cache
+        .entries
+        .retain(|path, _| active_paths.contains(path));
+    let mut rollouts = BTreeMap::new();
+    let mut thread_items = Vec::with_capacity(active_paths.len());
+    for active_path in active_paths {
+        let (thread_id, rollout) = match read_active_thread_rollout_cached_with_checkpoints(
+            sessions_root,
+            active_path,
+            rollout_cache,
+            checkpoints,
+        ) {
+            Ok(value) => value,
+            Err(()) => {
+                debug_runtime("thread active rollout identity rejected");
                 return ActiveThreadUpdate::Failed;
             }
         };
@@ -1647,45 +2123,62 @@ fn fetch_active_thread_update_for_paths_and_state(
             return ActiveThreadUpdate::Failed;
         };
         *next_id = following_id;
-        let page = match request(input, output, request_id, "thread/list", params) {
-            Ok(page) => page,
+        let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
+            debug_runtime("thread read cycle timed out");
+            return ActiveThreadUpdate::Failed;
+        };
+        let result = match request_with_timeout_observed(
+            input,
+            output,
+            request_id,
+            "thread/read",
+            json!({"threadId": thread_id, "includeTurns": false}),
+            wait,
+            None,
+        ) {
+            Ok(result) => result,
             Err(_) => {
-                debug_runtime("thread list RPC failed");
+                debug_runtime("thread read RPC failed");
                 return ActiveThreadUpdate::Failed;
             }
         };
-        match accumulator.accept_page(&page) {
-            Ok(PageAcceptance::NeedNextPage { cursor: next }) => cursor = Some(next),
-            Ok(PageAcceptance::Terminal) => break,
+        let Some(result_object) = result.as_object().filter(|object| object.len() == 1) else {
+            debug_runtime("thread read response envelope rejected");
+            return ActiveThreadUpdate::Failed;
+        };
+        let Some(thread_item) = result_object.get("thread") else {
+            debug_runtime("thread read response missing thread");
+            return ActiveThreadUpdate::Failed;
+        };
+        let candidate = match thread_contract::validate_thread_item(thread_item) {
+            Ok(candidate) => candidate,
             Err(_) => {
-                debug_runtime("thread list page rejected");
+                debug_runtime("thread read response rejected");
                 return ActiveThreadUpdate::Failed;
             }
-        }
-    }
-
-    let owner_root_ids = match accumulator.clone().ordered_candidates() {
-        Ok(candidates) => candidates
-            .into_iter()
-            .filter(|candidate| {
-                candidate
-                    .path()
-                    .and_then(|path| {
-                        security::canonical_regular_file_under(sessions_root, Path::new(path)).ok()
-                    })
-                    .is_some_and(|path| active_paths.contains(&path))
-            })
-            .map(|candidate| candidate.id().to_owned())
-            .collect::<BTreeSet<_>>(),
-        Err(_) => {
-            debug_runtime("thread candidate ordering failed");
+        };
+        let response_path = candidate.path().and_then(|path| {
+            security::canonical_regular_file_under(sessions_root, Path::new(path)).ok()
+        });
+        if candidate.id() != thread_id || response_path.as_ref() != Some(active_path) {
+            debug_runtime("thread read identity mismatch");
             return ActiveThreadUpdate::Failed;
         }
-    };
-    debug_runtime(format!(
-        "thread active owner roots={}",
-        owner_root_ids.len()
-    ));
+        if rollouts.insert(thread_id, rollout).is_some() {
+            debug_runtime("thread read duplicate identity");
+            return ActiveThreadUpdate::Failed;
+        }
+        thread_items.push(thread_item.clone());
+    }
+
+    let mut accumulator = ThreadCycleAccumulator::new();
+    if accumulator
+        .accept_page(&json!({"data": thread_items}))
+        .is_err()
+    {
+        debug_runtime("thread read cycle rejected");
+        return ActiveThreadUpdate::Failed;
+    }
 
     let root_outcome = thread_contract::select_active_threads_parsed_where(
         accumulator,
@@ -1697,16 +2190,7 @@ fn fetch_active_thread_update_for_paths_and_state(
                 })
                 .is_some_and(|path| active_paths.contains(&path))
         },
-        |candidate| {
-            let result = read_thread_rollout(sessions_root, candidate);
-            if result.is_err() {
-                debug_runtime(format!(
-                    "thread rollout rejected candidate={}",
-                    candidate.id()
-                ));
-            }
-            result
-        },
+        |candidate| rollouts.get(candidate.id()).cloned().ok_or(()),
     );
     let root_snapshots = match root_outcome {
         ThreadCycleOutcome::Snapshots(snapshots) => snapshots,
@@ -1716,7 +2200,7 @@ fn fetch_active_thread_update_for_paths_and_state(
             return ActiveThreadUpdate::Failed;
         }
     };
-    debug_runtime(format!("thread root snapshots={}", root_snapshots.len()));
+    debug_runtime(format!("thread active snapshots={}", root_snapshots.len()));
 
     let mut threads = root_snapshots
         .into_iter()
@@ -1736,66 +2220,6 @@ fn fetch_active_thread_update_for_paths_and_state(
             depth: snapshot.depth,
         })
         .collect::<Vec<_>>();
-
-    if let Some(codex_root) = codex_root {
-        let descendants =
-            match thread_state::load_native_descendants(codex_root, sessions_root, &owner_root_ids)
-            {
-                Ok(descendants) => descendants,
-                Err(_) => {
-                    debug_runtime("thread descendant load failed");
-                    return ActiveThreadUpdate::Failed;
-                }
-            };
-        let mut descendant_snapshots = 0usize;
-        let mut skipped_inactive_descendants = 0usize;
-        for descendant in descendants {
-            // The native state database is historical and keeps completed or
-            // abandoned child rows.  A rollout parser can only tell us that
-            // an old file ended after `task_started`; it cannot prove that
-            // the child is still owned by a live app-server.  Require the
-            // child rollout to be one of the files currently held by a
-            // running Codex process, just as root candidates are filtered.
-            if !active_paths.contains(&descendant.rollout_path) {
-                skipped_inactive_descendants = skipped_inactive_descendants.saturating_add(1);
-                continue;
-            }
-            let rollout = match read_thread_rollout_path(sessions_root, &descendant.rollout_path) {
-                Ok(rollout) => rollout,
-                Err(_) => {
-                    debug_runtime("thread descendant rollout parse failed");
-                    return ActiveThreadUpdate::Failed;
-                }
-            };
-            if !rollout.is_running() {
-                continue;
-            }
-            descendant_snapshots = descendant_snapshots.saturating_add(1);
-            threads.push(ActiveThread {
-                id: descendant.id,
-                created_at: descendant.created_at,
-                updated_at: descendant.updated_at,
-                title: descendant.title,
-                model: rollout.model().to_owned(),
-                model_label: rollout.model_label().to_owned(),
-                total_tokens: rollout.total_tokens(),
-                context_usage_tokens: rollout.context_usage_tokens(),
-                context_window_tokens: rollout.context_window_tokens(),
-                last_user_message_at: rollout.last_user_message_at(),
-                is_subagent: true,
-                parent_thread_id: Some(descendant.parent_thread_id),
-                depth: Some(descendant.depth),
-            });
-        }
-        debug_runtime(format!(
-            "thread descendant snapshots={}",
-            descendant_snapshots
-        ));
-        debug_runtime(format!(
-            "thread descendants skipped inactive={}",
-            skipped_inactive_descendants
-        ));
-    }
 
     threads.sort_by(|left, right| {
         right
@@ -2736,6 +3160,32 @@ impl UsageHistory {
             .map(UsageHistorySample::from_store)
             .collect();
         self.normalize();
+        true
+    }
+
+    fn apply_committed_samples(
+        &mut self,
+        samples: Vec<usage_store::UsageHistorySample>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let mut committed = BTreeMap::new();
+        for sample in samples.into_iter().map(UsageHistorySample::from_store) {
+            if !sample.is_valid()
+                || committed
+                    .insert((sample.reset_at, sample.timestamp), sample)
+                    .is_some()
+            {
+                return false;
+            }
+        }
+        if committed.is_empty() {
+            return true;
+        }
+        self.samples
+            .retain(|sample| !committed.contains_key(&(sample.reset_at, sample.timestamp)));
+        self.samples.extend(committed.into_values());
+        self.normalize();
+        self.retain_acquisition_window(now.timestamp());
         true
     }
 
@@ -4937,9 +5387,16 @@ fn read_recoverable_session_line_with_status<R: BufRead>(
 fn session_event_type(value: &Value) -> Option<&str> {
     let outer_type = value.get("type").and_then(Value::as_str);
     match outer_type {
-        Some("token_count" | "turn_context" | "thread_context" | "thread_settings_applied") => {
-            outer_type
-        }
+        Some(
+            "task_started"
+            | "task_complete"
+            | "task_completed"
+            | "turn_aborted"
+            | "token_count"
+            | "turn_context"
+            | "thread_context"
+            | "thread_settings_applied",
+        ) => outer_type,
         _ => value
             .get("payload")
             .and_then(Value::as_object)
@@ -5129,6 +5586,39 @@ fn session_prefix_generation(
     u128::from_be_bytes(generation).max(1)
 }
 
+fn session_boundary_lineage(
+    collector_epoch: u128,
+    source: &usage_store::RecordedSessionSource,
+    prior: Option<&usage_store::SessionCheckpoint>,
+    boundary_len: u64,
+) -> (u128, String) {
+    // A baseline cannot claim a digest of bytes it deliberately did not read.
+    // Store a deterministic lineage digest in the existing schema field and
+    // derive the generation from that lineage plus the boundary identity.
+    // This distinguishes replacement/truncation without re-scanning the old
+    // prefix and avoids treating an empty SHA as a real content digest.
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex-info-session-boundary-lineage-v1\0");
+    hasher.update(collector_epoch.to_be_bytes());
+    hasher.update(source.root_identity.as_bytes());
+    hasher.update([0]);
+    hasher.update(source.relative_path.as_bytes());
+    hasher.update(source.file_device.to_be_bytes());
+    hasher.update(source.file_inode.to_be_bytes());
+    hasher.update(boundary_len.to_be_bytes());
+    if let Some(prior) = prior {
+        hasher.update(prior.prefix_generation.to_be_bytes());
+        hasher.update(prior.prefix_sha256.as_bytes());
+    } else {
+        hasher.update(0_u128.to_be_bytes());
+        hasher.update(b"no-prior-lineage");
+    }
+    let digest = hasher.finalize();
+    let mut generation = [0_u8; 16];
+    generation.copy_from_slice(&digest[..16]);
+    (u128::from_be_bytes(generation).max(1), hex::encode(digest))
+}
+
 #[derive(Clone, Copy)]
 struct SessionAppendContext {
     baseline_existing: bool,
@@ -5143,6 +5633,28 @@ struct SessionAppendResult {
     checkpoint: usage_store::SessionCheckpoint,
     range: Option<usage_store::SessionRange>,
     marker: Option<usage_store::RecordedSessionSource>,
+}
+
+fn same_session_checkpoint_state(
+    left: &usage_store::SessionCheckpoint,
+    right: &usage_store::SessionCheckpoint,
+) -> bool {
+    left.root_identity == right.root_identity
+        && left.relative_path == right.relative_path
+        && left.file_device == right.file_device
+        && left.file_inode == right.file_inode
+        && left.committed_offset == right.committed_offset
+        && left.discard_until_lf == right.discard_until_lf
+        && left.prefix_generation == right.prefix_generation
+        && left.prefix_sha256 == right.prefix_sha256
+        && left.fully_attributed_from_zero == right.fully_attributed_from_zero
+        && left.token_baseline_known == right.token_baseline_known
+        && left.last_task_running == right.last_task_running
+        && left.last_model == right.last_model
+        && left.previous_total == right.previous_total
+        && left.previous_input == right.previous_input
+        && left.previous_cached_input == right.previous_cached_input
+        && left.previous_output == right.previous_output
 }
 
 fn collect_session_append(
@@ -5176,35 +5688,41 @@ fn collect_session_append(
         ));
     }
 
+    // Session JSONL is a production append-only source.  A durable
+    // checkpoint is therefore authoritative for the already admitted prefix:
+    // the canonical path and file identity, together with a non-decreasing
+    // length, are the only continuity checks.  Re-hashing the prefix here
+    // turns every steady-state poll into an O(file-size) scan and would also
+    // make a collector restart manufacture a replacement baseline merely
+    // because its process epoch changed.
     let continuous_checkpoint = if let Some(checkpoint) = prior.filter(|_| allow_prior_continuity) {
-        if checkpoint.collector_epoch == collector_epoch
-            && checkpoint.file_device == candidate.recorded_source.file_device
+        (checkpoint.file_device == candidate.recorded_source.file_device
             && checkpoint.file_inode == candidate.recorded_source.file_inode
-            && checkpoint.committed_offset <= candidate.fingerprint.length
-        {
-            let observed_prefix = sha256_file_range(&mut file, 0, checkpoint.committed_offset)?;
-            (observed_prefix == checkpoint.prefix_sha256).then_some(checkpoint)
-        } else {
-            None
-        }
+            && checkpoint.committed_offset <= candidate.fingerprint.length)
+            .then_some(checkpoint)
     } else {
         None
     };
+    let legacy_running_unknown =
+        continuous_checkpoint.is_some_and(|checkpoint| checkpoint.last_task_running.is_none());
     let boundary_or_replacement = prior.is_some() || baseline_existing;
     let (
         start_offset,
         mut discard_until_lf,
         fully_attributed,
         mut baseline_known,
+        mut last_task_running,
         mut model,
         mut previous,
-        prefix_generation,
+        mut prefix_generation,
+        mut prefix_sha256,
     ) = if let Some(checkpoint) = continuous_checkpoint {
         (
             checkpoint.committed_offset,
             checkpoint.discard_until_lf,
             checkpoint.fully_attributed_from_zero,
             checkpoint.token_baseline_known,
+            checkpoint.last_task_running,
             checkpoint.last_model.clone(),
             TokenSnapshot {
                 total: checkpoint.previous_total,
@@ -5213,18 +5731,26 @@ fn collect_session_append(
                 output: checkpoint.previous_output,
             },
             checkpoint.prefix_generation,
+            checkpoint.prefix_sha256.clone(),
         )
     } else if boundary_or_replacement {
-        let prefix_sha256 = sha256_file_range(&mut file, 0, candidate.fingerprint.length)?;
         let partial_tail = session_file_has_partial_tail(&mut file, candidate.fingerprint.length)?;
+        let (prefix_generation, lineage_sha256) = session_boundary_lineage(
+            collector_epoch,
+            &candidate.recorded_source,
+            prior,
+            candidate.fingerprint.length,
+        );
         (
             candidate.fingerprint.length,
             partial_tail,
             false,
             false,
             None,
+            None,
             TokenSnapshot::default(),
-            session_prefix_generation(collector_epoch, &candidate.recorded_source, &prefix_sha256),
+            prefix_generation,
+            lineage_sha256,
         )
     } else {
         let empty_sha256 = hex::encode(Sha256::digest([]));
@@ -5234,8 +5760,10 @@ fn collect_session_append(
             true,
             true,
             None,
+            None,
             TokenSnapshot::default(),
             session_prefix_generation(collector_epoch, &candidate.recorded_source, &empty_sha256),
+            empty_sha256,
         )
     };
 
@@ -5279,6 +5807,11 @@ fn collect_session_append(
                 return Ok(None);
             }
         };
+        if let Some(running) =
+            session_event_type(&value).and_then(thread_contract::task_running_for_event_type)
+        {
+            last_task_running = Some(running);
+        }
         if session_event_type(&value) != Some("thread_settings_applied") || model.is_none() {
             if let Some(next_model) = session_event_model(&value) {
                 model = Some(next_model);
@@ -5322,10 +5855,32 @@ fn collect_session_append(
     let end_offset = reader
         .stream_position()
         .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
+    // Existing databases predate the lifecycle bit. If such a checkpoint has
+    // a verified complete append but no lifecycle record in that append, the
+    // append belongs to the still-running turn that produced it. Persist the
+    // bridge once; an explicit completion/abort parsed above always wins.
+    if last_task_running.is_none() && legacy_running_unknown && end_offset > admitted_start_offset {
+        last_task_running = Some(true);
+    }
     let record_sha256 = (end_offset > admitted_start_offset)
         .then(|| sha256_file_range(reader.get_mut(), admitted_start_offset, end_offset))
         .transpose()?;
-    let prefix_sha256 = sha256_file_range(reader.get_mut(), 0, end_offset)?;
+    // The prefix digest is retained from the durable checkpoint on normal
+    // append cycles.  For a brand-new source, the admitted range starts at
+    // zero, so its range digest is also the initial prefix digest.  Baseline
+    // and replacement paths intentionally do not hash the existing file.
+    if start_offset == 0 && admitted_start_offset == 0 {
+        prefix_sha256 = record_sha256
+            .clone()
+            .unwrap_or_else(|| hex::encode(Sha256::digest([])));
+        if fully_attributed {
+            prefix_generation = session_prefix_generation(
+                collector_epoch,
+                &candidate.recorded_source,
+                &prefix_sha256,
+            );
+        }
+    }
     let after_file = reader
         .get_ref()
         .metadata()
@@ -5356,6 +5911,7 @@ fn collect_session_append(
         prefix_sha256,
         fully_attributed_from_zero: fully_attributed,
         token_baseline_known: baseline_known,
+        last_task_running,
         // Session JSONL carries product model identifiers (for example,
         // `gpt-5.6-luna`), while the durable checkpoint schema admits only the
         // shared SOL/TERRA/LUNA keys. Keep that storage boundary canonical so
@@ -5424,27 +5980,47 @@ fn collect_incremental_local_usage(
     let initial_totals = totals.clone();
     let mut checkpoints_by_path = BTreeMap::new();
     let mut checkpoints_by_identity = BTreeMap::new();
+    let mut checkpoint_identity_counts = BTreeMap::new();
+    let durable_collector_epoch = collection_state.collector_epoch;
     for checkpoint in &collection_state.checkpoints {
         let path_key = (
             checkpoint.root_identity.as_str(),
             checkpoint.relative_path.as_str(),
         );
-        checkpoints_by_path.entry(path_key).or_insert(checkpoint);
+        checkpoints_by_path
+            .entry(path_key)
+            .and_modify(|current: &mut &usage_store::SessionCheckpoint| {
+                let current_rank = (
+                    Some(current.collector_epoch) == durable_collector_epoch,
+                    current.cycle_seq,
+                );
+                let candidate_rank = (
+                    Some(checkpoint.collector_epoch) == durable_collector_epoch,
+                    checkpoint.cycle_seq,
+                );
+                if candidate_rank > current_rank {
+                    *current = checkpoint;
+                }
+            })
+            .or_insert(checkpoint);
         let identity_key = (
             checkpoint.root_identity.as_str(),
             checkpoint.relative_path.as_str(),
             checkpoint.file_device,
             checkpoint.file_inode,
         );
+        *checkpoint_identity_counts
+            .entry(identity_key)
+            .or_insert(0usize) += 1;
         checkpoints_by_identity
             .entry(identity_key)
             .and_modify(|current: &mut &usage_store::SessionCheckpoint| {
                 let current_rank = (
-                    current.collector_epoch == collector_epoch,
+                    Some(current.collector_epoch) == durable_collector_epoch,
                     current.cycle_seq,
                 );
                 let candidate_rank = (
-                    checkpoint.collector_epoch == collector_epoch,
+                    Some(checkpoint.collector_epoch) == durable_collector_epoch,
                     checkpoint.cycle_seq,
                 );
                 if candidate_rank > current_rank {
@@ -5456,9 +6032,10 @@ fn collect_incremental_local_usage(
     let window_start = reset_at.saturating_sub(window_seconds.max(0));
     let timeline_end = Utc::now().timestamp().min(reset_at);
     let mut events = Vec::new();
-    let mut next_checkpoints = Vec::new();
+    let mut changed_checkpoints = Vec::new();
     let mut ranges = Vec::new();
     let mut markers = Vec::new();
+    let mut processed_files = 0usize;
     for candidate in &inventory.selected_session_files {
         let inventory_key = session_inventory_key(candidate);
         let seen_in_previous_inventory = previous_inventory.contains(&inventory_key);
@@ -5481,7 +6058,11 @@ fn collect_incremental_local_usage(
             prior,
             SessionAppendContext {
                 baseline_existing: baseline_existing || seen_in_previous_inventory,
-                allow_prior_continuity: !baseline_existing && seen_in_previous_inventory,
+                // A durable identity checkpoint remains authoritative across
+                // collector restarts and account-worker epoch changes.  The
+                // append-only contract makes this safe; files without an
+                // exact checkpoint still take the bounded baseline path.
+                allow_prior_continuity: !baseline_existing,
                 collector_epoch,
                 cycle_seq,
                 window_start,
@@ -5493,21 +6074,31 @@ fn collect_incremental_local_usage(
         else {
             continue;
         };
-        next_checkpoints.push(result.checkpoint);
+        processed_files = processed_files.checked_add(1).ok_or_else(|| {
+            security::SecurityError::new(security::SecurityErrorKind::LimitExceeded)
+        })?;
+        let checkpoint_changed =
+            prior.is_none_or(|prior| !same_session_checkpoint_state(prior, &result.checkpoint));
+        let duplicate_checkpoint = checkpoint_identity_counts
+            .get(&identity_key)
+            .is_some_and(|count| *count > 1);
+        if checkpoint_changed || duplicate_checkpoint {
+            changed_checkpoints.push(result.checkpoint);
+            if let Some(marker) = result.marker {
+                markers.push(marker);
+            }
+        }
         if let Some(range) = result.range {
             ranges.push(range);
         }
-        if let Some(marker) = result.marker {
-            markers.push(marker);
-        }
     }
-    if baseline_existing && next_checkpoints.len() != inventory.selected_session_files.len() {
+    if baseline_existing && processed_files != inventory.selected_session_files.len() {
         return Err(security::SecurityError::new(
             security::SecurityErrorKind::UnsafePath,
         ));
     }
     let bounded_source_rescan_complete = inventory.overflow_session_files.is_empty()
-        && next_checkpoints.len() == inventory.selected_session_files.len();
+        && processed_files == inventory.selected_session_files.len();
     Ok(LocalUsageCollection {
         model_usage: totals.clone(),
         history_samples: model_usage_timeline_from_events_with_initial(
@@ -5516,7 +6107,7 @@ fn collect_incremental_local_usage(
             initial_totals,
         ),
         recorded_sessions: markers,
-        session_checkpoints: next_checkpoints,
+        session_checkpoints: changed_checkpoints,
         session_ranges: ranges,
         session_model_totals: totals.to_session_totals(),
         cleanup_plan: cleanup_plan_for_inventory(inventory),
@@ -6101,7 +6692,7 @@ struct RunningAppServer {
     output: Receiver<RpcReadEvent>,
 }
 
-fn start_app_server() -> Result<RunningAppServer, String> {
+fn start_app_server(deadline: Instant) -> Result<RunningAppServer, String> {
     let Some(codex) = resolved_executable("CODEX_INFO_CODEX_BIN", "codex") else {
         return Err("Codex app-serverの安全な実行ファイルを確認できません。".into());
     };
@@ -6120,12 +6711,17 @@ fn start_app_server() -> Result<RunningAppServer, String> {
         return Err("Codex app-serverの入出力を初期化できませんでした。".into());
     };
     let output = rpc_reader(stdout);
-    request(
+    let wait = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| "Codex app-serverの応答がタイムアウトしました。".to_owned())?;
+    request_with_timeout_observed(
         &mut input,
         &output,
         1,
         "initialize",
         json!({"clientInfo":{"name":"codex-info","version":"0.3.0"},"capabilities":{"experimentalApi":true}}),
+        wait,
+        None,
     )?;
     Ok(RunningAppServer {
         child,
@@ -6137,10 +6733,11 @@ fn start_app_server() -> Result<RunningAppServer, String> {
 fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<ThreadEvent>) {
     debug_runtime("thread worker starting");
     // The thread bridge is lazy: construction of CodexInfoState does not issue
-    // thread/list before account authentication succeeds. Once started, this
+    // thread/read before account authentication succeeds. Once started, this
     // worker owns its own child, stdin/stdout, reader and request-id sequence.
     let mut server: Option<RunningAppServer> = None;
     let mut server_active_paths = BTreeSet::new();
+    let mut rollout_cache = ThreadRolloutCache::default();
     let mut next_id = 2u64;
     while let Ok(command) = commands.recv() {
         match command {
@@ -6153,6 +6750,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
             ThreadCommand::Read {
                 auth_epoch,
                 admission,
+                account_partition,
             } => {
                 debug_runtime(format!("thread read requested epoch={auth_epoch}"));
                 let Some(codex_root) = codex_home_root() else {
@@ -6180,6 +6778,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                         let _ = idle.child.kill_and_reap();
                     }
                     server_active_paths.clear();
+                    rollout_cache.entries.clear();
                     next_id = 2;
                     let _ = events.send(ThreadEvent::Update {
                         auth_epoch,
@@ -6188,6 +6787,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                     });
                     continue;
                 }
+                let deadline = Instant::now() + security::RPC_RESPONSE_TIMEOUT;
 
                 // Codex app-server snapshots its thread index when it starts.
                 // Reusing that process after the live rollout set changes can
@@ -6203,7 +6803,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                     next_id = 2;
                 }
                 if server.is_none() {
-                    match start_app_server() {
+                    match start_app_server(deadline) {
                         Ok(started) => {
                             server = Some(started);
                             server_active_paths = active_paths.clone();
@@ -6219,6 +6819,14 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                         }
                     }
                 }
+                let durable_checkpoints = if active_paths
+                    .iter()
+                    .any(|path| !rollout_cache.entries.contains_key(path))
+                {
+                    load_thread_rollout_checkpoints(&account_partition)
+                } else {
+                    Vec::new()
+                };
                 let Some(server_ref) = server.as_mut() else {
                     continue;
                 };
@@ -6228,7 +6836,9 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                     &mut next_id,
                     &sessions_root,
                     &active_paths,
-                    &codex_root,
+                    deadline,
+                    &mut rollout_cache,
+                    &durable_checkpoints,
                 );
                 if update == ActiveThreadUpdate::Failed {
                     debug_runtime("thread read failed");
@@ -6298,7 +6908,12 @@ impl LocalUsageCache {
             collector_epoch,
             cycle_seq,
         } = request;
-        let baseline_existing = collection_state.collector_epoch != Some(collector_epoch);
+        // An epoch change alone is not an account boundary: daemon restarts
+        // intentionally receive a new collector epoch while retaining the
+        // partition's durable identity checkpoints.  Only a state without
+        // checkpoints needs the account-boundary baseline.
+        let baseline_existing = collection_state.checkpoints.is_empty()
+            && collection_state.collector_epoch != Some(collector_epoch);
         let previous_inventory = if self.partitioned_collector_epoch == Some(collector_epoch) {
             self.verified_session_inventory.clone()
         } else {
@@ -6471,24 +7086,6 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
             }
         }
     }
-}
-
-fn request(
-    input: &mut impl Write,
-    output: &Receiver<RpcReadEvent>,
-    id: u64,
-    method: &str,
-    params: Value,
-) -> Result<Value, String> {
-    request_with_timeout_observed(
-        input,
-        output,
-        id,
-        method,
-        params,
-        security::RPC_RESPONSE_TIMEOUT,
-        None,
-    )
 }
 
 #[derive(Debug)]
@@ -7654,6 +8251,7 @@ impl CodexInfoState {
             && !self.auth_polling
             && !self.checking
             && !self.local_usage_pending
+            && !self.recorder_store_error
             && now.duration_since(self.last_local_poll)
                 >= daemon::daemon_interval_from_environment()
         {
@@ -7668,6 +8266,7 @@ impl CodexInfoState {
         // reset tuple, so overlapping them would make an older local scan
         // indistinguishable from the newer generation.
         if !self.local_usage_pending
+            && !self.recorder_store_error
             && account_refresh_due(
                 now,
                 self.last_poll,
@@ -7906,9 +8505,13 @@ impl CodexInfoState {
             return;
         };
         self.ensure_thread_bridge();
+        let Some(account_partition) = self.account_partition.clone() else {
+            return;
+        };
         let command = ThreadCommand::Read {
             auth_epoch: self.auth_epoch,
             admission,
+            account_partition,
         };
         let sent = self
             .thread_bridge
@@ -8008,6 +8611,19 @@ impl CodexInfoState {
             window_seconds: period.map(|value| value.1),
             cleanup_plans: std::mem::take(&mut self.pending_session_cleanup),
         }
+    }
+
+    fn has_pending_recorder_batch(&self) -> bool {
+        !self.history.pending_store_samples.is_empty()
+            || !self.pending_recorded_sessions.is_empty()
+            || !self.pending_session_checkpoints.is_empty()
+            || !self.pending_session_ranges.is_empty()
+            || !self.pending_session_model_totals.is_empty()
+            || self.pending_collector_generation.is_some()
+            || self.pending_session_period.is_some()
+            || self.pending_recorder_admission.is_some()
+            || self.pending_bounded_source_rescan_complete
+            || !self.pending_session_cleanup.is_empty()
     }
 
     fn restore_pending_recorder_batch(&mut self, mut batch: PendingRecorderBatch) {
@@ -11559,6 +12175,10 @@ fn recorder_error_is_fatal(error: &str) -> bool {
     .any(|marker| error.contains(marker))
 }
 
+fn recorder_attempt_due(now: Instant, retry_at: Option<Instant>) -> bool {
+    retry_at.is_none_or(|retry_at| now >= retry_at)
+}
+
 fn pending_gap_for_shutdown(
     state: &CodexInfoState,
     active_partition: Option<&str>,
@@ -11628,9 +12248,30 @@ struct ResidentPublicationState {
     last_complete: Option<PublicDetails>,
 }
 
+#[cfg(test)]
 fn resident_service_cycle<W, P>(
     state: &mut CodexInfoState,
     publication: &mut ResidentPublicationState,
+    write_and_refresh: W,
+    publish: P,
+) -> Result<ResidentServiceCycleOutcome, ResidentServiceCycleError>
+where
+    W: FnOnce(&mut CodexInfoState, PendingRecorderBatch) -> Result<(), String>,
+    P: FnOnce(PublicDetails) -> Result<(), codex_info::server::ApiSnapshotError>,
+{
+    resident_service_cycle_with_recorder_attempt(
+        state,
+        publication,
+        true,
+        write_and_refresh,
+        publish,
+    )
+}
+
+fn resident_service_cycle_with_recorder_attempt<W, P>(
+    state: &mut CodexInfoState,
+    publication: &mut ResidentPublicationState,
+    recorder_attempt: bool,
     write_and_refresh: W,
     publish: P,
 ) -> Result<ResidentServiceCycleOutcome, ResidentServiceCycleError>
@@ -11646,17 +12287,24 @@ where
         publication.last_complete = None;
     }
     state.schedule_resident_refresh(Instant::now());
-    let pending = state.take_pending_recorder_batch();
-    let store_error = match write_and_refresh(state, pending.clone()) {
-        Ok(()) => {
-            state.clear_recorder_store_error();
-            None
+    let store_error = if recorder_attempt {
+        let pending = state.take_pending_recorder_batch();
+        match write_and_refresh(state, pending.clone()) {
+            Ok(()) => {
+                state.clear_recorder_store_error();
+                None
+            }
+            Err(error) => {
+                state.restore_pending_recorder_batch(pending);
+                state.apply_recorder_store_error();
+                Some(error)
+            }
         }
-        Err(error) => {
-            state.restore_pending_recorder_batch(pending);
-            state.apply_recorder_store_error();
-            Some(error)
-        }
+    } else {
+        // A failed store keeps its exact batch in state.  During the bounded
+        // retry interval publish only the latched error/last-good root; never
+        // consume the batch merely to skip an attempt.
+        None
     };
     // A storage/identity failure can be discovered by the writer callback
     // after the pre-write publication check. Re-apply the hard boundary here
@@ -11739,6 +12387,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let shutdown = service_shutdown_signal();
         tokio::pin!(shutdown);
+        let mut recorder_retry_at: Option<Instant> = None;
         let mut consecutive_store_failures = 0_u8;
         loop {
             tokio::select! {
@@ -11747,9 +12396,19 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                     if let Err(error) = recorder.probe() {
                         return Err(format!("recorder worker stopped: {error}"));
                     }
-                    let result = resident_service_cycle(
+                    let now = Instant::now();
+                    let desired_partition_id = state
+                        .account_partition
+                        .as_ref()
+                        .map(|partition| partition.partition_id.as_str());
+                    let recorder_work_pending = state.has_pending_recorder_batch();
+                    let recorder_attempt = recorder_attempt_due(now, recorder_retry_at)
+                        && (recorder_work_pending
+                            || desired_partition_id != active_recorder_partition.as_deref());
+                    let result = resident_service_cycle_with_recorder_attempt(
                         &mut state,
                         &mut publication,
+                        recorder_attempt,
                         |state, pending| {
                             let batch_is_empty = pending.is_empty();
                             let PendingRecorderBatch {
@@ -11856,23 +12515,32 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                     Ok(ack) => ack,
                                     Err(error) => {
                                         // Keep the admitted account and active
-                                        // writer lane intact.  The outer cycle
-                                        // restores this exact batch so a
-                                        // transient SQLite busy result is
-                                        // attempted once on the next cycle;
-                                        // the service-level failure budget
-                                        // decides whether a second failure is
-                                        // fatal.
+                                        // writer lane intact. The outer cycle
+                                        // restores this exact batch and gates
+                                        // the next database attempt by the
+                                        // normal recorder interval. Storage
+                                        // failure degrades publication; it
+                                        // does not terminate the resident
+                                        // recorder.
                                         return Err(error);
                                     }
                                 };
                                 let Some(batch_admission) = admission.as_ref() else {
                                     return Err("recorder batch admission disappeared after commit".into());
                                 };
+                                let canonical_samples = commit_ack.canonical_samples.clone();
+                                let legacy_history_bridged = commit_ack.legacy_history_bridged;
                                 state.acknowledge_recorder_commit(batch_admission, commit_ack);
-                            }
-                            if !batch_is_empty && !state.history.refresh_from_store(Utc::now()) {
-                                return Err("history refresh after recorder commit failed".into());
+                                let refreshed = if legacy_history_bridged {
+                                    state.history.refresh_from_store(Utc::now())
+                                } else {
+                                    state
+                                        .history
+                                        .apply_committed_samples(canonical_samples, Utc::now())
+                                };
+                                if !refreshed {
+                                    return Err("history refresh after recorder commit failed".into());
+                                }
                             }
                             if !batch_is_empty && !state.refresh_history_gaps() {
                                 return Err("history gap refresh after recorder commit failed".into());
@@ -11933,28 +12601,39 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                         },
                     );
                     match result {
-                        Ok(ResidentServiceCycleOutcome::Published) => {
-                            consecutive_store_failures = 0;
-                            if last_recorder_error.take().is_some() {
-                                eprintln!("codex-info: recorder state commit recovered");
+                        Ok(outcome) => {
+                            if recorder_attempt {
+                                recorder_retry_at = None;
+                                consecutive_store_failures = 0;
+                                if last_recorder_error.take().is_some() {
+                                    eprintln!("codex-info: recorder state commit recovered");
+                                }
                             }
-                            if last_publish_error.take().is_some() {
+                            if outcome == ResidentServiceCycleOutcome::Published
+                                && last_publish_error.take().is_some()
+                            {
                                 eprintln!("codex-info: REST snapshot publication recovered");
                             }
                         }
-                        Ok(ResidentServiceCycleOutcome::HeldIncomplete) => {}
                         Err(ResidentServiceCycleError::Store(error)) => {
-                            consecutive_store_failures = consecutive_store_failures.saturating_add(1);
+                            consecutive_store_failures =
+                                consecutive_store_failures.saturating_add(1);
                             if last_recorder_error.as_deref() != Some(error.as_str()) {
                                 eprintln!("codex-info: recorder state commit rejected: {error}");
                                 last_recorder_error = Some(error.clone());
                             }
-                            if recorder_error_is_fatal(&error) || consecutive_store_failures >= 2 {
+                            if recorder_error_is_fatal(&error)
+                                || consecutive_store_failures >= 2
+                            {
                                 return Err(format!(
                                     "recorder persistence failed after {} cycle(s): {error}",
                                     consecutive_store_failures
                                 ));
                             }
+                            recorder_retry_at = Some(
+                                Instant::now()
+                                    + daemon::daemon_interval_from_environment(),
+                            );
                         }
                         Err(ResidentServiceCycleError::Candidate(error)) => {
                             eprintln!(
@@ -12552,21 +13231,22 @@ mod tests {
         parse_launch_mode, parse_preview_size, parse_rate_limits, parse_resize_direction,
         period_remaining_text, physical_size_for_logical, plan_type_label, poll_service_state,
         poll_service_state_with_owner_check, preview_model_row, published_pair_is_fresh,
-        read_recovery_entries_for_ranges, read_thread_rollout_path, remaining_graph_points,
-        remaining_graph_points_for_metric, remaining_graph_y, remaining_marker_positions,
-        remaining_marker_positions_on_points, request_with_timeout, reset_transition_is_boundary,
-        same_rollout_identity, separate_current_label_positions, service_endpoint_state,
-        service_health_response_version, service_is_healthy, session_event_model,
-        session_event_type, session_jsonl_files, session_token_snapshot, smooth_model_spend,
-        smooth_remaining_points, split_metric_line_paths, stacked_area_path,
-        terminate_and_reap_owned_child, thread_presentation_rows, three_months_before_utc,
-        unused_interval_positions, visible_window_position, week_remaining_text, ActiveThread,
-        ActiveThreadUpdate, ApiServer, ApiServerConfig, CodexInfoState, Event, FixedResizeDecision,
-        GraphPaths, GraphWindow, HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint,
-        LocalUsageCache, LocalUsageCandidate, LocalUsageResult, ManualX11Geometry,
-        ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
-        ModelUsageTotals, PublicDetails, RpcReadEvent, ServiceEndpointState, ServiceHealthVersion,
-        SessionFileCandidate, SessionTraversalBudget, TimedModelUsage, TokenSnapshot,
+        read_active_thread_rollout_cached, read_recovery_entries_for_ranges,
+        read_thread_rollout_path, remaining_graph_points, remaining_graph_points_for_metric,
+        remaining_graph_y, remaining_marker_positions, remaining_marker_positions_on_points,
+        request_with_timeout, reset_transition_is_boundary, same_rollout_identity,
+        separate_current_label_positions, service_endpoint_state, service_health_response_version,
+        service_is_healthy, session_event_model, session_event_type, session_jsonl_files,
+        session_token_snapshot, smooth_model_spend, smooth_remaining_points,
+        split_metric_line_paths, stacked_area_path, terminate_and_reap_owned_child,
+        thread_presentation_rows, three_months_before_utc, unused_interval_positions,
+        visible_window_position, week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer,
+        ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow,
+        HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint, LocalUsageCache,
+        LocalUsageCandidate, LocalUsageResult, ManualX11Geometry, ManualX11WindowAction,
+        ModelDollarTotals, ModelTokenTotals, ModelUsageRow, ModelUsageTotals, PublicDetails,
+        RpcReadEvent, ServiceEndpointState, ServiceHealthVersion, SessionFileCandidate,
+        SessionTraversalBudget, ThreadRolloutCache, TimedModelUsage, TokenSnapshot,
         UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
         DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS,
         GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION,
@@ -12732,6 +13412,8 @@ mod tests {
                 collector_epoch,
                 cycle_seq,
                 last_commit_unix: Utc::now().timestamp(),
+                canonical_samples: Vec::new(),
+                legacy_history_bridged: false,
             },
         );
     }
@@ -12810,7 +13492,6 @@ mod tests {
     use codex_info::security;
     use codex_info::server::{ApiSnapshotError, PublicState, MAX_PUBLIC_THREADS};
     use codex_info::thread_contract;
-    use rusqlite::Connection;
     use serde_json::{json, Value};
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs::{self, File};
@@ -14352,6 +15033,78 @@ mod tests {
     }
 
     #[test]
+    fn resident_recorder_retries_after_interval_without_dropping_pending_batch() {
+        let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
+        state.history.pending_store_samples = vec![state.history.samples[0].to_store()];
+        state.pending_recorder_admission =
+            Some((state.auth_epoch, state.current_account_admission().unwrap()));
+        let mut publication = super::ResidentPublicationState::default();
+        let attempts = std::cell::Cell::new(0_u8);
+
+        let first = super::resident_service_cycle_with_recorder_attempt(
+            &mut state,
+            &mut publication,
+            true,
+            |_, _| {
+                attempts.set(attempts.get() + 1);
+                Err("transient store failure".into())
+            },
+            |details| {
+                details.validate().unwrap();
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            first,
+            Err(super::ResidentServiceCycleError::Store(_))
+        ));
+        assert_eq!(attempts.get(), 1);
+        assert!(state.recorder_store_error);
+        assert!(state.has_pending_recorder_batch());
+
+        let now = Instant::now();
+        let retry_at = now + daemon::daemon_interval_from_environment();
+        assert!(!super::recorder_attempt_due(now, Some(retry_at)));
+        let skipped = super::resident_service_cycle_with_recorder_attempt(
+            &mut state,
+            &mut publication,
+            false,
+            |_, _| panic!("store retry must be interval-gated"),
+            |details| {
+                details.validate().unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(skipped, super::ResidentServiceCycleOutcome::Published);
+        assert_eq!(attempts.get(), 1);
+        assert!(state.has_pending_recorder_batch());
+
+        assert!(super::recorder_attempt_due(retry_at, Some(retry_at)));
+        let recovered = super::resident_service_cycle_with_recorder_attempt(
+            &mut state,
+            &mut publication,
+            true,
+            |state, pending| {
+                attempts.set(attempts.get() + 1);
+                assert!(!pending.is_empty());
+                acknowledge_recorder_commit_fixture(state, 2, 0x128, 2);
+                Ok(())
+            },
+            |details| {
+                details.validate().unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(recovered, super::ResidentServiceCycleOutcome::Published);
+        assert_eq!(attempts.get(), 2);
+        assert!(!state.recorder_store_error);
+        assert!(!state.has_pending_recorder_batch());
+    }
+
+    #[test]
     fn stale_recorder_batch_cannot_be_relabelled_after_an_auth_boundary() {
         let mut state = CodexInfoState::preview("normal");
         state.history.pending_store_samples = vec![state.history.samples[0].to_store()];
@@ -14397,6 +15150,7 @@ mod tests {
             prefix_sha256: "11".repeat(32),
             fully_attributed_from_zero: true,
             token_baseline_known: true,
+            last_task_running: None,
             last_model: Some("SOL".into()),
             previous_total: 100,
             previous_input: 80,
@@ -15829,12 +16583,18 @@ mod tests {
         let fallback_path = root.join("fallback.jsonl");
         fs::write(
             &newest_path,
-            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"}}\n",
+            [
+                json!({"type":"session_meta","payload":{"id":"newest"}}).to_string(),
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"}}".to_owned(),
+            ]
+            .join("\n")
+                + "\n",
         )
         .unwrap();
         fs::write(
             &fallback_path,
             [
+                json!({"type":"session_meta","payload":{"id":"fallback"}}),
                 json!({"type":"event_msg","payload":{"type":"task_started"}}),
                 json!({"type":"event_msg","payload":{"type":"turn_context","model":"gpt-5.6-sol"}}),
                 json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":12345}}}}),
@@ -15848,27 +16608,18 @@ mod tests {
         .unwrap();
 
         let (sender, receiver) = mpsc::channel();
-        for response in [
-            json!({
-                "id": 50,
-                "result": {
-                    "data": [thread_list_item("newest", 20, &newest_path)],
-                    "nextCursor": "page-2"
-                }
-            }),
-            json!({
-                "id": 51,
-                "result": {
-                    "data": [thread_list_item("fallback", 10, &fallback_path)]
-                }
-            }),
-        ] {
-            sender
-                .send(RpcReadEvent::Line(
-                    super::security::RpcLine::new(response.to_string()).unwrap(),
-                ))
-                .unwrap();
-        }
+        sender
+            .send(RpcReadEvent::Line(
+                super::security::RpcLine::new(
+                    json!({
+                        "id": 50,
+                        "result": {"thread": thread_list_item("fallback", 10, &fallback_path)}
+                    })
+                    .to_string(),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
 
         let mut input = Vec::new();
         let mut next_id = 50;
@@ -15884,32 +16635,19 @@ mod tests {
             &active_paths,
         );
         assert_eq!(update, ActiveThreadUpdate::Failed);
-        assert_eq!(next_id, 52);
+        assert_eq!(next_id, 51);
 
         let requests = String::from_utf8(input)
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["id"], 50);
-        assert!(requests[0]["params"].get("cursor").is_none());
-        assert_eq!(requests[1]["id"], 51);
-        assert_eq!(requests[1]["params"]["cursor"], "page-2");
+        assert_eq!(requests[0]["method"], "thread/read");
         assert_eq!(
-            requests[0]["params"]["sourceKinds"],
-            json!([
-                "cli",
-                "vscode",
-                "exec",
-                "appServer",
-                "subAgent",
-                "subAgentReview",
-                "subAgentCompact",
-                "subAgentThreadSpawn",
-                "subAgentOther",
-                "unknown"
-            ])
+            requests[0]["params"],
+            json!({"threadId":"fallback","includeTurns":false})
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -15930,6 +16668,7 @@ mod tests {
         fs::write(
             &completed_path,
             [
+                json!({"type":"session_meta","payload":{"id":"completed"}}),
                 json!({"type":"task_started"}),
                 json!({"type":"task_complete"}),
             ]
@@ -15947,6 +16686,7 @@ mod tests {
             fs::write(
                 path,
                 [
+                    json!({"type":"session_meta","payload":{"id":path.file_stem().unwrap().to_str().unwrap()}}),
                     json!({"type":"thread_context","model":model}),
                     json!({"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":total_tokens}}}}),
                     json!({"type":"task_started"}),
@@ -15960,29 +16700,25 @@ mod tests {
             .unwrap();
         }
 
-        let mut child_item = thread_list_item("thread-a", 20, &running_a_path);
+        let mut child_item = thread_list_item("running-a", 20, &running_a_path);
         child_item["source"] = json!({"subAgent":{"thread_spawn":{
-            "parent_thread_id":"thread-z","depth":1
+            "parent_thread_id":"running-z","depth":1
         }}});
         let (sender, receiver) = mpsc::channel();
-        sender
-            .send(RpcReadEvent::Line(
-                super::security::RpcLine::new(
-                    json!({
-                        "id": 70,
-                        "result": {
-                            "data": [
-                                child_item,
-                                thread_list_item("completed-newest", 30, &completed_path),
-                                thread_list_item("thread-z", 20, &running_z_path)
-                            ]
-                        }
-                    })
-                    .to_string(),
-                )
-                .unwrap(),
-            ))
-            .unwrap();
+        for (id, item) in [
+            (70, thread_list_item("completed", 30, &completed_path)),
+            (71, child_item),
+            (72, thread_list_item("running-z", 20, &running_z_path)),
+        ] {
+            sender
+                .send(RpcReadEvent::Line(
+                    super::security::RpcLine::new(
+                        json!({"id":id,"result":{"thread":item}}).to_string(),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap();
+        }
 
         let mut input = Vec::new();
         let mut next_id = 70;
@@ -16002,10 +16738,10 @@ mod tests {
             update,
             ActiveThreadUpdate::Snapshot(vec![
                 ActiveThread {
-                    id: "thread-z".into(),
+                    id: "running-z".into(),
                     created_at: Some(1),
                     updated_at: 20,
-                    title: "title-thread-z".into(),
+                    title: "title-running-z".into(),
                     model: "model-z".into(),
                     model_label: "model-z".into(),
                     total_tokens: Some(999),
@@ -16017,10 +16753,10 @@ mod tests {
                     depth: None,
                 },
                 ActiveThread {
-                    id: "thread-a".into(),
+                    id: "running-a".into(),
                     created_at: Some(1),
                     updated_at: 20,
-                    title: "title-thread-a".into(),
+                    title: "title-running-a".into(),
                     model: "model-a".into(),
                     model_label: "model-a".into(),
                     total_tokens: Some(111),
@@ -16028,86 +16764,15 @@ mod tests {
                     context_window_tokens: None,
                     last_user_message_at: None,
                     is_subagent: true,
-                    parent_thread_id: Some("thread-z".into()),
+                    parent_thread_id: Some("running-z".into()),
                     depth: Some(1),
                 },
             ])
         );
-        assert_eq!(next_id, 71);
-        assert_eq!(String::from_utf8(input).unwrap().lines().count(), 1);
+        assert_eq!(next_id, 73);
+        assert_eq!(String::from_utf8(input).unwrap().lines().count(), 3);
 
         let _ = fs::remove_dir_all(root);
-    }
-
-    fn create_native_state_schema(root: &Path) {
-        fs::create_dir_all(root.join("sessions")).unwrap();
-        let connection = Connection::open(root.join("state_5.sqlite")).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE threads (
-                    id TEXT PRIMARY KEY,
-                    rollout_path TEXT NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    archived INTEGER NOT NULL,
-                    name TEXT,
-                    preview TEXT NOT NULL,
-                    thread_source TEXT
-                );
-                CREATE TABLE thread_spawn_edges (
-                    parent_thread_id TEXT NOT NULL,
-                    child_thread_id TEXT NOT NULL PRIMARY KEY,
-                    status TEXT NOT NULL
-                );",
-            )
-            .unwrap();
-    }
-
-    fn add_native_state_thread(root: &Path, id: &str, rollout_path: &Path) {
-        let connection = Connection::open(root.join("state_5.sqlite")).unwrap();
-        connection
-            .execute(
-                "INSERT INTO threads
-                 (id, rollout_path, updated_at, archived, name, preview, thread_source)
-                 VALUES (?1, ?2, 1, 0, ?3, ?4, 'subagent')",
-                rusqlite::params![
-                    id,
-                    rollout_path.to_string_lossy().as_ref(),
-                    format!("title-{id}"),
-                    format!("preview-{id}"),
-                ],
-            )
-            .unwrap();
-    }
-
-    fn add_native_state_edge(root: &Path, parent: &str, child: &str) {
-        let connection = Connection::open(root.join("state_5.sqlite")).unwrap();
-        connection
-            .execute(
-                "INSERT INTO thread_spawn_edges
-                 (parent_thread_id, child_thread_id, status) VALUES (?1, ?2, 'active')",
-                rusqlite::params![parent, child],
-            )
-            .unwrap();
-    }
-
-    fn write_native_rollout(path: &Path, completed: bool) {
-        let mut records = vec![
-            json!({"type":"thread_context","model":"native-model"}),
-            json!({"type":"task_started"}),
-        ];
-        if completed {
-            records.push(json!({"type":"task_complete"}));
-        }
-        fs::write(
-            path,
-            records
-                .into_iter()
-                .map(|value| value.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n",
-        )
-        .unwrap();
     }
 
     fn write_distinct_running_rollout(
@@ -16120,6 +16785,10 @@ mod tests {
         completed: bool,
     ) {
         let mut records = vec![
+            json!({
+                "type":"session_meta",
+                "payload":{"id":path.file_stem().unwrap().to_str().unwrap()}
+            }),
             json!({"type":"thread_context","model":model}),
             json!({
                 "type":"event_msg",
@@ -16152,612 +16821,6 @@ mod tests {
                 + "\n",
         )
         .unwrap();
-    }
-
-    fn add_native_state_thread_with_values(
-        root: &Path,
-        id: &str,
-        rollout_path: &Path,
-        name: &str,
-        preview: &str,
-        updated_at: i64,
-    ) {
-        let connection = Connection::open(root.join("state_5.sqlite")).unwrap();
-        connection
-            .execute(
-                "INSERT INTO threads
-                 (id, rollout_path, updated_at, archived, name, preview, thread_source)
-                 VALUES (?1, ?2, ?3, 0, ?4, ?5, 'subagent')",
-                rusqlite::params![
-                    id,
-                    rollout_path.to_string_lossy().as_ref(),
-                    updated_at,
-                    name,
-                    preview,
-                ],
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn root_native_duplicate_candidate_is_preserved_then_rejected_atomically() {
-        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "codex-info-root-native-duplicate-{}-{}",
-            std::process::id(),
-            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
-        ));
-        create_native_state_schema(&root);
-        let sessions = root.join("sessions");
-        let owner_rollout = sessions.join("owner.jsonl");
-        let root_rollout = sessions.join("root.jsonl");
-        let native_rollout = sessions.join("native.jsonl");
-        let root_timestamp = "2026-01-01T00:00:42Z";
-        let native_timestamp = "2026-01-02T00:00:43Z";
-        write_distinct_running_rollout(
-            &owner_rollout,
-            "owner-model",
-            1,
-            2,
-            3,
-            root_timestamp,
-            true,
-        );
-        write_distinct_running_rollout(
-            &root_rollout,
-            "root-model",
-            111,
-            222,
-            333,
-            root_timestamp,
-            false,
-        );
-        write_distinct_running_rollout(
-            &native_rollout,
-            "native-model",
-            999,
-            888,
-            777,
-            native_timestamp,
-            false,
-        );
-        add_native_state_thread_with_values(
-            &root,
-            "collision",
-            &native_rollout,
-            "native-title",
-            "native-preview",
-            1,
-        );
-        add_native_state_edge(&root, "owner", "collision");
-
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(RpcReadEvent::Line(
-                super::security::RpcLine::new(
-                    json!({
-                        "id": 200,
-                        "result": {"data": [
-                            thread_list_item("collision", 20, &root_rollout),
-                            thread_list_item("owner", 10, &owner_rollout)
-                        ]}
-                    })
-                    .to_string(),
-                )
-                .unwrap(),
-            ))
-            .unwrap();
-        let active_paths = BTreeSet::from([
-            fs::canonicalize(&owner_rollout).unwrap(),
-            fs::canonicalize(&root_rollout).unwrap(),
-            fs::canonicalize(&native_rollout).unwrap(),
-        ]);
-        let mut input = Vec::new();
-        let mut next_id = 200;
-        let update = fetch_active_thread_update_for_paths_and_state(
-            &mut input,
-            &receiver,
-            &mut next_id,
-            &sessions,
-            &active_paths,
-            Some(&root),
-        );
-        let rows = match update {
-            ActiveThreadUpdate::Snapshot(rows) => rows,
-            other => panic!("duplicate fixture did not produce a snapshot: {other:?}"),
-        };
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].id, "collision");
-        assert_eq!(rows[1].id, "collision");
-        assert_eq!(
-            rows[0],
-            ActiveThread {
-                id: "collision".into(),
-                created_at: Some(1),
-                updated_at: 20,
-                title: "title-collision".into(),
-                model: "root-model".into(),
-                model_label: "root-model".into(),
-                total_tokens: Some(111),
-                context_usage_tokens: Some(222),
-                context_window_tokens: Some(333),
-                last_user_message_at: Some(
-                    chrono::DateTime::parse_from_rfc3339(root_timestamp)
-                        .unwrap()
-                        .timestamp(),
-                ),
-                is_subagent: false,
-                parent_thread_id: None,
-                depth: None,
-            }
-        );
-        assert_eq!(
-            rows[1],
-            ActiveThread {
-                id: "collision".into(),
-                created_at: None,
-                updated_at: 1,
-                title: "native-title".into(),
-                model: "native-model".into(),
-                model_label: "native-model".into(),
-                total_tokens: Some(999),
-                context_usage_tokens: Some(888),
-                context_window_tokens: Some(777),
-                last_user_message_at: Some(
-                    chrono::DateTime::parse_from_rfc3339(native_timestamp)
-                        .unwrap()
-                        .timestamp(),
-                ),
-                is_subagent: true,
-                parent_thread_id: Some("owner".into()),
-                depth: Some(1),
-            }
-        );
-
-        let mut state = CodexInfoState::preview("normal");
-        state.history = UsageHistory::default();
-        state.active_threads = rows;
-        let candidate = state.public_details();
-        assert_eq!(candidate.threads.len(), 2);
-        assert_eq!(candidate.active_thread_count, 2);
-
-        let mut server =
-            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
-                .unwrap();
-        let publisher = server.publisher();
-        let mut known_good_state = CodexInfoState::preview("normal");
-        known_good_state.history = UsageHistory::default();
-        publisher
-            .publish_details(known_good_state.public_details())
-            .unwrap();
-        let before_pair = publisher.published_pair();
-        let before_details = raw_loopback_get(server.local_addr(), "/v1/details");
-        assert_eq!(
-            publisher.publish_details(candidate),
-            Err(ApiSnapshotError::InvalidThread)
-        );
-        assert_eq!(publisher.published_pair(), before_pair);
-        assert_eq!(
-            raw_loopback_get(server.local_addr(), "/v1/details"),
-            before_details
-        );
-        server.shutdown();
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn root_and_native_candidates_follow_fixed_updated_at_then_id_order() {
-        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "codex-info-root-native-order-{}-{}",
-            std::process::id(),
-            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
-        ));
-        create_native_state_schema(&root);
-        let sessions = root.join("sessions");
-        let owner_rollout = sessions.join("owner.jsonl");
-        write_distinct_running_rollout(
-            &owner_rollout,
-            "owner-model",
-            1,
-            2,
-            3,
-            "2026-01-01T00:00:01Z",
-            true,
-        );
-
-        let root_specs = [
-            ("root-late", 40_i64, "2026-01-01T00:00:10Z"),
-            ("z-root", 20_i64, "2026-01-01T00:00:11Z"),
-            ("root-old", 10_i64, "2026-01-01T00:00:12Z"),
-        ];
-        let mut active_paths = BTreeSet::from([fs::canonicalize(&owner_rollout).unwrap()]);
-        let mut root_items = Vec::new();
-        for (index, (id, updated_at, timestamp)) in root_specs.into_iter().enumerate() {
-            let path = sessions.join(format!("{id}.jsonl"));
-            write_distinct_running_rollout(
-                &path,
-                &format!("{id}-model"),
-                100 + index as u64,
-                200 + index as u64,
-                300 + index as u64,
-                timestamp,
-                false,
-            );
-            active_paths.insert(fs::canonicalize(&path).unwrap());
-            root_items.push(thread_list_item(id, updated_at, &path));
-        }
-
-        let native_specs = [
-            ("native-mid", 30_i64, "2026-01-02T00:00:10Z"),
-            ("a-native", 20_i64, "2026-01-02T00:00:11Z"),
-            ("native-old", 5_i64, "2026-01-02T00:00:12Z"),
-        ];
-        for (index, (id, updated_at, timestamp)) in native_specs.into_iter().enumerate() {
-            let path = sessions.join(format!("{id}.jsonl"));
-            write_distinct_running_rollout(
-                &path,
-                &format!("{id}-model"),
-                400 + index as u64,
-                500 + index as u64,
-                600 + index as u64,
-                timestamp,
-                false,
-            );
-            active_paths.insert(fs::canonicalize(&path).unwrap());
-            add_native_state_thread_with_values(
-                &root,
-                id,
-                &path,
-                &format!("native-title-{id}"),
-                &format!("native-preview-{id}"),
-                updated_at,
-            );
-            add_native_state_edge(&root, "owner", id);
-        }
-
-        let (sender, receiver) = mpsc::channel();
-        root_items.push(thread_list_item("owner", 1, &owner_rollout));
-        sender
-            .send(RpcReadEvent::Line(
-                super::security::RpcLine::new(
-                    json!({"id": 210, "result": {"data": root_items}}).to_string(),
-                )
-                .unwrap(),
-            ))
-            .unwrap();
-        let mut input = Vec::new();
-        let mut next_id = 210;
-        let update = fetch_active_thread_update_for_paths_and_state(
-            &mut input,
-            &receiver,
-            &mut next_id,
-            &sessions,
-            &active_paths,
-            Some(&root),
-        );
-        let rows = match update {
-            ActiveThreadUpdate::Snapshot(rows) => rows,
-            other => panic!("order fixture did not produce a snapshot: {other:?}"),
-        };
-        assert_eq!(
-            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
-            [
-                "root-late",
-                "native-mid",
-                "z-root",
-                "a-native",
-                "root-old",
-                "native-old"
-            ]
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn native_completed_rollout_is_excluded_from_published_snapshot() {
-        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "codex-info-native-completed-{}-{}",
-            std::process::id(),
-            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
-        ));
-        create_native_state_schema(&root);
-        let sessions = root.join("sessions");
-        let root_rollout = sessions.join("root.jsonl");
-        let completed_rollout = sessions.join("completed-child.jsonl");
-        write_native_rollout(&root_rollout, false);
-        write_native_rollout(&completed_rollout, true);
-        add_native_state_thread(&root, "completed-child", &completed_rollout);
-        add_native_state_edge(&root, "root", "completed-child");
-
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(RpcReadEvent::Line(
-                super::security::RpcLine::new(
-                    json!({
-                        "id": 80,
-                        "result": {"data": [thread_list_item("root", 10, &root_rollout)]}
-                    })
-                    .to_string(),
-                )
-                .unwrap(),
-            ))
-            .unwrap();
-        let active_paths = BTreeSet::from([
-            fs::canonicalize(&root_rollout).unwrap(),
-            fs::canonicalize(&completed_rollout).unwrap(),
-        ]);
-        let mut input = Vec::new();
-        let mut next_id = 80;
-        let update = fetch_active_thread_update_for_paths_and_state(
-            &mut input,
-            &receiver,
-            &mut next_id,
-            &sessions,
-            &active_paths,
-            Some(&root),
-        );
-        assert_eq!(
-            update,
-            ActiveThreadUpdate::Snapshot(vec![ActiveThread {
-                id: "root".into(),
-                created_at: Some(1),
-                updated_at: 10,
-                title: "title-root".into(),
-                model: "native-model".into(),
-                model_label: "native-model".into(),
-                total_tokens: None,
-                context_usage_tokens: None,
-                context_window_tokens: None,
-                last_user_message_at: None,
-                is_subagent: false,
-                parent_thread_id: None,
-                depth: None,
-            }])
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn native_stale_running_descendant_not_held_open_is_excluded() {
-        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "codex-info-native-stale-descendant-{}-{}",
-            std::process::id(),
-            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
-        ));
-        create_native_state_schema(&root);
-        let sessions = root.join("sessions");
-        let root_rollout = sessions.join("root.jsonl");
-        let stale_child_rollout = sessions.join("stale-child.jsonl");
-        write_native_rollout(&root_rollout, false);
-        // The child has no terminal event, so rollout parsing alone would
-        // call it running. It is deliberately absent from active_paths: the
-        // native DB row is historical, not proof of a live app-server handle.
-        write_native_rollout(&stale_child_rollout, false);
-        add_native_state_thread(&root, "stale-child", &stale_child_rollout);
-        add_native_state_edge(&root, "root", "stale-child");
-
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(RpcReadEvent::Line(
-                super::security::RpcLine::new(
-                    json!({
-                        "id": 82,
-                        "result": {"data": [thread_list_item("root", 10, &root_rollout)]}
-                    })
-                    .to_string(),
-                )
-                .unwrap(),
-            ))
-            .unwrap();
-        let active_paths = BTreeSet::from([fs::canonicalize(&root_rollout).unwrap()]);
-        let mut input = Vec::new();
-        let mut next_id = 82;
-        let update = fetch_active_thread_update_for_paths_and_state(
-            &mut input,
-            &receiver,
-            &mut next_id,
-            &sessions,
-            &active_paths,
-            Some(&root),
-        );
-        assert!(
-            matches!(update, ActiveThreadUpdate::Snapshot(rows) if rows.len() == 1 && rows[0].id == "root")
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn native_live_state_matrix_is_fail_closed_across_path_and_rollout_states() {
-        #[derive(Clone, Copy)]
-        enum ChildFixture {
-            Running,
-            Completed,
-            Invalid,
-            Missing,
-        }
-
-        let cases = [
-            ("running-active", ChildFixture::Running, true, "two"),
-            ("running-inactive", ChildFixture::Running, false, "root"),
-            ("completed-active", ChildFixture::Completed, true, "root"),
-            ("invalid-inactive", ChildFixture::Invalid, false, "root"),
-            ("invalid-active", ChildFixture::Invalid, true, "failed"),
-            ("missing-row", ChildFixture::Missing, true, "failed"),
-        ];
-
-        for (index, (label, fixture, child_active, expected)) in cases.into_iter().enumerate() {
-            let root = std::env::temp_dir().join(format!(
-                "codex-info-live-state-matrix-{}-{index}",
-                std::process::id()
-            ));
-            create_native_state_schema(&root);
-            let sessions = root.join("sessions");
-            let root_rollout = sessions.join("root.jsonl");
-            let child_rollout = sessions.join("child.jsonl");
-            write_native_rollout(&root_rollout, false);
-            match fixture {
-                ChildFixture::Running => write_native_rollout(&child_rollout, false),
-                ChildFixture::Completed => write_native_rollout(&child_rollout, true),
-                ChildFixture::Invalid => fs::write(&child_rollout, b"{not-json}\n").unwrap(),
-                ChildFixture::Missing => write_native_rollout(&child_rollout, false),
-            }
-            if !matches!(fixture, ChildFixture::Missing) {
-                add_native_state_thread(&root, "child", &child_rollout);
-            }
-            add_native_state_edge(&root, "root", "child");
-
-            let (sender, receiver) = mpsc::channel();
-            sender
-                .send(RpcReadEvent::Line(
-                    super::security::RpcLine::new(
-                        json!({
-                            "id": 90,
-                            "result": {"data": [thread_list_item("root", 10, &root_rollout)]}
-                        })
-                        .to_string(),
-                    )
-                    .unwrap(),
-                ))
-                .unwrap();
-            let mut active_paths = BTreeSet::from([fs::canonicalize(&root_rollout).unwrap()]);
-            if child_active {
-                active_paths.insert(fs::canonicalize(&child_rollout).unwrap());
-            }
-            let mut input = Vec::new();
-            let mut next_id = 90;
-            let update = fetch_active_thread_update_for_paths_and_state(
-                &mut input,
-                &receiver,
-                &mut next_id,
-                &sessions,
-                &active_paths,
-                Some(&root),
-            );
-            match expected {
-                "two" => assert!(
-                    matches!(update, ActiveThreadUpdate::Snapshot(rows) if rows.len() == 2),
-                    "{label}"
-                ),
-                "root" => assert!(
-                    matches!(update, ActiveThreadUpdate::Snapshot(rows) if rows.len() == 1 && rows[0].id == "root"),
-                    "{label}"
-                ),
-                "failed" => assert_eq!(update, ActiveThreadUpdate::Failed, "{label}"),
-                _ => unreachable!(),
-            }
-            let _ = fs::remove_dir_all(root);
-        }
-
-        let root_cases = [
-            ("root-running-active", false, true, "one"),
-            ("root-running-inactive", false, false, "empty"),
-            ("root-terminal-active", true, true, "empty"),
-            ("root-invalid-active", false, true, "failed"),
-        ];
-        for (index, (label, completed, root_active, expected)) in root_cases.into_iter().enumerate()
-        {
-            let root = std::env::temp_dir().join(format!(
-                "codex-info-live-state-root-matrix-{}-{index}",
-                std::process::id()
-            ));
-            create_native_state_schema(&root);
-            let sessions = root.join("sessions");
-            let root_rollout = sessions.join("root.jsonl");
-            if label == "root-invalid-active" {
-                fs::write(&root_rollout, b"{not-json}\n").unwrap();
-            } else {
-                write_native_rollout(&root_rollout, completed);
-            }
-            let (sender, receiver) = mpsc::channel();
-            sender
-                .send(RpcReadEvent::Line(
-                    super::security::RpcLine::new(
-                        json!({
-                            "id": 100,
-                            "result": {"data": [thread_list_item("root", 10, &root_rollout)]}
-                        })
-                        .to_string(),
-                    )
-                    .unwrap(),
-                ))
-                .unwrap();
-            let active_paths = if root_active {
-                BTreeSet::from([fs::canonicalize(&root_rollout).unwrap()])
-            } else {
-                BTreeSet::new()
-            };
-            let mut input = Vec::new();
-            let mut next_id = 100;
-            let update = fetch_active_thread_update_for_paths_and_state(
-                &mut input,
-                &receiver,
-                &mut next_id,
-                &sessions,
-                &active_paths,
-                Some(&root),
-            );
-            match expected {
-                "one" => assert!(
-                    matches!(update, ActiveThreadUpdate::Snapshot(rows) if rows.len() == 1),
-                    "{label}"
-                ),
-                "empty" => assert_eq!(update, ActiveThreadUpdate::NoThread, "{label}"),
-                "failed" => assert_eq!(update, ActiveThreadUpdate::Failed, "{label}"),
-                _ => unreachable!(),
-            }
-            let _ = fs::remove_dir_all(root);
-        }
-    }
-
-    #[test]
-    fn native_descendant_failure_rejects_root_snapshot_atomically() {
-        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "codex-info-native-atomic-{}-{}",
-            std::process::id(),
-            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
-        ));
-        create_native_state_schema(&root);
-        let sessions = root.join("sessions");
-        let root_rollout = sessions.join("root.jsonl");
-        let invalid_rollout = sessions.join("invalid-child.jsonl");
-        write_native_rollout(&root_rollout, false);
-        fs::write(&invalid_rollout, b"{not-json}\n").unwrap();
-        add_native_state_thread(&root, "invalid-child", &invalid_rollout);
-        add_native_state_edge(&root, "root", "invalid-child");
-
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(RpcReadEvent::Line(
-                super::security::RpcLine::new(
-                    json!({
-                        "id": 81,
-                        "result": {"data": [thread_list_item("root", 10, &root_rollout)]}
-                    })
-                    .to_string(),
-                )
-                .unwrap(),
-            ))
-            .unwrap();
-        let active_paths = BTreeSet::from([
-            fs::canonicalize(&root_rollout).unwrap(),
-            fs::canonicalize(&invalid_rollout).unwrap(),
-        ]);
-        let mut input = Vec::new();
-        let mut next_id = 81;
-        let update = fetch_active_thread_update_for_paths_and_state(
-            &mut input,
-            &receiver,
-            &mut next_id,
-            &sessions,
-            &active_paths,
-            Some(&root),
-        );
-        assert_eq!(update, ActiveThreadUpdate::Failed);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -16953,6 +17016,186 @@ mod tests {
             &after,
             &fs::metadata(&other).unwrap()
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn thread_rollout_cache_tracks_observed_length_and_complete_offset() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-thread-rollout-cache-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("cached.jsonl");
+        let initial = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"cache-thread\"}}\n",
+            "{\"type\":\"thread_context\",\"model\":\"gpt-5.6-sol\"}\n",
+            "{\"type\":\"task_started\"}\n"
+        );
+        fs::write(&path, initial).unwrap();
+        let canonical = fs::canonicalize(&path).unwrap();
+        let mut cache = ThreadRolloutCache::default();
+
+        let (thread_id, first) =
+            read_active_thread_rollout_cached(&root, &path, &mut cache).unwrap();
+        assert_eq!(thread_id, "cache-thread");
+        assert!(first.is_running());
+        let initial_len = initial.len() as u64;
+        let entry = cache.entries.get(&canonical).expect("initial cache entry");
+        assert_eq!(entry.observed_len, initial_len);
+        assert_eq!(entry.complete_offset, initial_len);
+        assert_eq!(entry.snapshot, first);
+
+        let (_, unchanged) = read_active_thread_rollout_cached(&root, &path, &mut cache).unwrap();
+        assert_eq!(unchanged, first);
+        let entry = cache
+            .entries
+            .get(&canonical)
+            .expect("unchanged cache entry");
+        assert_eq!(entry.observed_len, initial_len);
+        assert_eq!(entry.complete_offset, initial_len);
+
+        let partial = "{\"type\":\"event_msg\"";
+        let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        append.write_all(partial.as_bytes()).unwrap();
+        drop(append);
+        let partial_len = fs::metadata(&path).unwrap().len();
+        let (_, partial_snapshot) =
+            read_active_thread_rollout_cached(&root, &path, &mut cache).unwrap();
+        assert_eq!(partial_snapshot, first);
+        let entry = cache.entries.get(&canonical).expect("partial cache entry");
+        assert_eq!(entry.observed_len, partial_len);
+        assert_eq!(entry.complete_offset, initial_len);
+
+        let remainder = concat!(
+            ",\"payload\":{\"type\":\"token_count\",\"info\":{",
+            "\"total_token_usage\":{\"total_tokens\":77}}}}\n"
+        );
+        let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        append.write_all(remainder.as_bytes()).unwrap();
+        drop(append);
+        let completed_len = fs::metadata(&path).unwrap().len();
+        let (_, completed) = read_active_thread_rollout_cached(&root, &path, &mut cache).unwrap();
+        assert_eq!(completed.total_tokens(), Some(77));
+        let entry = cache
+            .entries
+            .get(&canonical)
+            .expect("completed cache entry");
+        assert_eq!(entry.observed_len, completed_len);
+        assert_eq!(entry.complete_offset, completed_len);
+
+        let (_, stable) = read_active_thread_rollout_cached(&root, &path, &mut cache).unwrap();
+        assert_eq!(stable, completed);
+        let entry = cache.entries.get(&canonical).expect("stable cache entry");
+        assert_eq!(entry.observed_len, completed_len);
+        assert_eq!(entry.complete_offset, completed_len);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn seeded_rollout_cache_miss_reads_only_checkpoint_tail() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-thread-rollout-seeded-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("seeded.jsonl");
+        let prefix = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"seeded-thread\"}}\n",
+            "{\"type\":\"thread_context\",\"model\":\"wrong-prefix-model\"}\n"
+        );
+        fs::write(&path, prefix).unwrap();
+        let tail = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":123}}}}\n";
+        let checkpoint_metadata = fs::metadata(&path).unwrap();
+        #[cfg(unix)]
+        let (file_device, file_inode) = {
+            use std::os::unix::fs::MetadataExt;
+            (checkpoint_metadata.dev(), checkpoint_metadata.ino())
+        };
+        #[cfg(not(unix))]
+        let (file_device, file_inode) = (0, 0);
+        let root_metadata = fs::symlink_metadata(&root).unwrap();
+        let mut checkpoint = super::usage_store::SessionCheckpoint {
+            root_identity: super::session_root_identity(&root, &root_metadata).unwrap(),
+            relative_path: "seeded.jsonl".into(),
+            file_device,
+            file_inode,
+            committed_offset: prefix.len() as u64,
+            discard_until_lf: false,
+            collector_epoch: 1,
+            cycle_seq: 1,
+            prefix_generation: 1,
+            prefix_sha256: "11".repeat(32),
+            fully_attributed_from_zero: true,
+            token_baseline_known: true,
+            last_task_running: Some(true),
+            last_model: Some("SOL".into()),
+            previous_total: 100,
+            previous_input: 80,
+            previous_cached_input: 20,
+            previous_output: 20,
+        };
+        let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        append.write_all(tail.as_bytes()).unwrap();
+        drop(append);
+
+        let mut cache = ThreadRolloutCache::default();
+        let (thread_id, rollout) = super::read_active_thread_rollout_cached_with_checkpoints(
+            &root,
+            &path,
+            &mut cache,
+            std::slice::from_ref(&checkpoint),
+        )
+        .expect("durable checkpoint seeds the parser without replaying the prefix");
+        assert_eq!(thread_id, "seeded-thread");
+        assert!(rollout.is_running());
+        assert_eq!(rollout.model(), "SOL");
+        assert_eq!(rollout.total_tokens(), Some(123));
+        assert_eq!(
+            cache
+                .entries
+                .get(&fs::canonicalize(&path).unwrap())
+                .unwrap()
+                .complete_offset,
+            fs::metadata(&path).unwrap().len()
+        );
+        checkpoint.last_task_running = None;
+        let (_, legacy_rollout) = super::read_active_thread_rollout_cached_with_checkpoints(
+            &root,
+            &path,
+            &mut ThreadRolloutCache::default(),
+            std::slice::from_ref(&checkpoint),
+        )
+        .expect("legacy checkpoint bridges a verified appended turn");
+        assert!(legacy_rollout.is_running());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unseeded_large_rollout_prefix_is_rejected_before_bootstrap_read() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-thread-rollout-unseeded-large-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.jsonl");
+        let mut bytes =
+            b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"large-thread\"}}\n".to_vec();
+        bytes.extend(std::iter::repeat_n(
+            b'x',
+            security::MAX_JSONL_LINE_BYTES.saturating_add(1),
+        ));
+        fs::write(&path, bytes).unwrap();
+        assert!(read_active_thread_rollout_cached(
+            &root,
+            &path,
+            &mut ThreadRolloutCache::default()
+        )
+        .is_err());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -18502,6 +18745,161 @@ mod tests {
     }
 
     #[test]
+    fn session_append_reuses_durable_checkpoint_across_collector_epoch() {
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-session-durable-tail-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let session = root.join("large.jsonl");
+        let now = Utc::now();
+        let reset_at = now.timestamp() + 3_600;
+        let context = json!({
+            "timestamp": now.to_rfc3339(),
+            "type": "turn_context",
+            "model": "gpt-5.6-sol"
+        });
+        let started = json!({"type": "task_started"});
+        let initial = json!({
+            "timestamp": now.to_rfc3339(),
+            "type": "token_count",
+            "payload": {"info": {"total_token_usage": {
+                "total_tokens": 100,
+                "input_tokens": 100,
+                "cached_input_tokens": 0,
+                "output_tokens": 0
+            }}}
+        });
+        let next = json!({
+            "timestamp": now.to_rfc3339(),
+            "type": "token_count",
+            "payload": {"info": {"total_token_usage": {
+                "total_tokens": 105,
+                "input_tokens": 105,
+                "cached_input_tokens": 0,
+                "output_tokens": 0
+            }}}
+        });
+        let mut large_prefix = format!("{context}\n{started}\n{initial}\n");
+        for _ in 0..32_768 {
+            large_prefix.push_str("{}\n");
+        }
+        fs::write(&session, &large_prefix).unwrap();
+
+        let first_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let first = super::collect_incremental_local_usage(
+            &first_inventory,
+            &super::usage_store::SessionCollectionState::default(),
+            &BTreeSet::new(),
+            super::IncrementalSessionContext {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: false,
+                collector_epoch: 0x1111,
+                cycle_seq: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.model_usage.sol.tokens, 100);
+        let mut first_checkpoint = first
+            .session_checkpoints
+            .first()
+            .expect("large prefix checkpoint")
+            .clone();
+        let old_offset = first_checkpoint.committed_offset;
+        let old_generation = first_checkpoint.prefix_generation;
+        let old_prefix_sha256 = first_checkpoint.prefix_sha256.clone();
+        assert_eq!(old_offset, large_prefix.len() as u64);
+        assert_eq!(first_checkpoint.last_task_running, Some(true));
+        // Simulate a checkpoint written before the lifecycle column existed.
+        first_checkpoint.last_task_running = None;
+
+        let mut stale_checkpoint = first_checkpoint.clone();
+        stale_checkpoint.collector_epoch = 0x9999;
+        stale_checkpoint.cycle_seq = 999;
+        stale_checkpoint.committed_offset = 0;
+        stale_checkpoint.prefix_generation = 0x9999;
+        stale_checkpoint.prefix_sha256 = "99".repeat(32);
+        stale_checkpoint.last_task_running = None;
+        stale_checkpoint.last_model = None;
+        stale_checkpoint.previous_total = 0;
+        stale_checkpoint.previous_input = 0;
+
+        let mut append = fs::OpenOptions::new().append(true).open(&session).unwrap();
+        writeln!(append, "{next}").unwrap();
+        drop(append);
+        let second_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let second = super::collect_incremental_local_usage(
+            &second_inventory,
+            &super::usage_store::SessionCollectionState {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                collector_epoch: Some(0x1111),
+                cycle_seq: 1,
+                checkpoints: vec![stale_checkpoint, first_checkpoint],
+                model_totals: first.session_model_totals,
+                ..super::usage_store::SessionCollectionState::default()
+            },
+            &super::session_inventory_keys(&first_inventory),
+            super::IncrementalSessionContext {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: false,
+                collector_epoch: 0x2222,
+                cycle_seq: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(second.model_usage.sol.tokens, 105);
+        assert_eq!(second.session_ranges.len(), 1);
+        assert_eq!(second.session_ranges[0].start_offset, old_offset);
+        assert_eq!(
+            second.session_ranges[0].end_offset,
+            fs::metadata(&session).unwrap().len()
+        );
+        assert_eq!(second.session_ranges[0].prefix_generation, old_generation);
+        assert_eq!(
+            second.session_checkpoints[0].prefix_generation,
+            old_generation
+        );
+        assert_eq!(
+            second.session_checkpoints[0].prefix_sha256,
+            old_prefix_sha256
+        );
+        assert_eq!(second.session_checkpoints[0].last_task_running, Some(true));
+
+        let third = super::collect_incremental_local_usage(
+            &second_inventory,
+            &super::usage_store::SessionCollectionState {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                collector_epoch: Some(0x2222),
+                cycle_seq: 1,
+                checkpoints: second.session_checkpoints,
+                model_totals: second.session_model_totals,
+                ..super::usage_store::SessionCollectionState::default()
+            },
+            &super::session_inventory_keys(&second_inventory),
+            super::IncrementalSessionContext {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: false,
+                collector_epoch: 0x3333,
+                cycle_seq: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(third.model_usage.sol.tokens, 105);
+        assert!(third.session_ranges.is_empty());
+        assert!(third.session_checkpoints.is_empty());
+        assert!(third.recorded_sessions.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn account_boundary_baselines_existing_sessions_and_only_commits_verified_appends() {
         static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
@@ -18755,6 +19153,7 @@ mod tests {
                     prefix_sha256: "11".repeat(32),
                     fully_attributed_from_zero,
                     token_baseline_known: fully_attributed_from_zero,
+                    last_task_running: None,
                     last_model: fully_attributed_from_zero.then(|| "SOL".into()),
                     previous_total: u64::from(fully_attributed_from_zero) * 129,
                     previous_input: u64::from(fully_attributed_from_zero) * 100,
@@ -18881,6 +19280,7 @@ mod tests {
                     prefix_sha256: "33".repeat(32),
                     fully_attributed_from_zero: false,
                     token_baseline_known: true,
+                    last_task_running: None,
                     last_model: Some("SOL".into()),
                     previous_total: 229,
                     previous_input: 180,
@@ -19142,10 +19542,10 @@ mod tests {
     }
 
     #[test]
-    fn changed_session_prefix_is_freshly_baselined_without_cursor_or_marker_reuse() {
+    fn session_truncation_rebaselines_without_prefix_rescan_or_lineage_reuse() {
         static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
-            "codex-info-prefix-change-{}-{}",
+            "codex-info-session-truncation-{}-{}",
             std::process::id(),
             NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -19192,9 +19592,23 @@ mod tests {
         assert_eq!(first.model_usage.sol.tokens, 100);
         assert_eq!(first.recorded_sessions.len(), 1);
         let old_prefix_generation = first.session_checkpoints[0].prefix_generation;
+        let old_prefix_sha256 = first.session_checkpoints[0].prefix_sha256.clone();
+        let old_identity = first_inventory.selected_session_files[0]
+            .recorded_source
+            .file_inode;
 
-        fs::write(&session, session_bytes(900)).unwrap();
+        // Truncate in place so the device/inode stays the same while the
+        // durable committed offset becomes invalid.  This is a finite
+        // truncation boundary, not an arbitrary prefix-mutation oracle.
+        let truncated = session_bytes(7);
+        fs::write(&session, truncated).unwrap();
         let second_inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        assert_eq!(
+            second_inventory.selected_session_files[0]
+                .recorded_source
+                .file_inode,
+            old_identity
+        );
         let second = super::collect_incremental_local_usage(
             &second_inventory,
             &super::usage_store::SessionCollectionState {
@@ -19224,6 +19638,11 @@ mod tests {
             second.session_checkpoints[0].prefix_generation,
             old_prefix_generation
         );
+        assert_ne!(
+            second.session_checkpoints[0].prefix_sha256,
+            old_prefix_sha256
+        );
+        assert_eq!(second.session_checkpoints[0].prefix_sha256.len(), 64);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -21145,6 +21564,60 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(published_samples, expected_samples);
+    }
+
+    #[test]
+    fn committed_history_ack_replaces_only_acknowledged_minutes() {
+        let reset_at = 1_800_604_800;
+        let stale = UsageHistorySample {
+            timestamp: 1_800_000_000,
+            reset_at,
+            remaining_percent: 75.0,
+            sol_dollars: 1.0,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 10,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        let untouched = UsageHistorySample {
+            timestamp: 1_800_000_060,
+            sol_dollars: 3.0,
+            sol_tokens: 30,
+            ..stale.clone()
+        };
+        let committed = super::usage_store::UsageHistorySample {
+            timestamp: stale.timestamp,
+            reset_at,
+            remaining_percent: Some(70.0),
+            sol_dollars: 2.0,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 20,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        let mut history = UsageHistory {
+            samples: vec![stale, untouched.clone()],
+            ..UsageHistory::default()
+        };
+        let now = Utc.timestamp_opt(1_800_000_600, 0).single().unwrap();
+
+        assert!(history.apply_committed_samples(vec![committed], now));
+        assert_eq!(history.samples.len(), 2);
+        assert_eq!(
+            history
+                .samples
+                .iter()
+                .find(|sample| sample.timestamp == 1_800_000_000)
+                .map(|sample| (
+                    sample.remaining_percent,
+                    sample.sol_dollars,
+                    sample.sol_tokens
+                )),
+            Some((70.0, 2.0, 20))
+        );
+        assert!(history.samples.contains(&untouched));
     }
 
     #[test]
@@ -24573,34 +25046,29 @@ mod tests {
             }}
         });
 
-        let active_paths = BTreeSet::from([
+        let accepted_paths = BTreeSet::from([
             fs::canonicalize(&accepted_root_path).unwrap(),
             fs::canonicalize(&accepted_child_path).unwrap(),
-            fs::canonicalize(&cycle_a_path).unwrap(),
-            fs::canonicalize(&cycle_b_path).unwrap(),
-            fs::canonicalize(&replacement_path).unwrap(),
         ]);
         let (sender, receiver) = mpsc::channel();
         let mut next_id = 700_u64;
-        sender
-            .send(RpcReadEvent::Line(
-                super::security::RpcLine::new(
-                    json!({
-                        "id": 700,
-                        "result": {"data": [accepted_root, accepted_child]}
-                    })
-                    .to_string(),
-                )
-                .unwrap(),
-            ))
-            .unwrap();
+        for (id, item) in [(700, accepted_child), (701, accepted_root)] {
+            sender
+                .send(RpcReadEvent::Line(
+                    super::security::RpcLine::new(
+                        json!({"id":id,"result":{"thread":item}}).to_string(),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap();
+        }
         let mut input = Vec::new();
         let accepted_update = fetch_active_thread_update_for_paths_and_state(
             &mut input,
             &receiver,
             &mut next_id,
             &root,
-            &active_paths,
+            &accepted_paths,
             None,
         );
         assert!(matches!(
@@ -24609,8 +25077,8 @@ mod tests {
                 if rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>()
                     == ["accepted-root", "accepted-child"]
         ));
-        assert_eq!(next_id, 701);
-        assert_eq!(String::from_utf8(input).unwrap().lines().count(), 1);
+        assert_eq!(next_id, 702);
+        assert_eq!(String::from_utf8(input).unwrap().lines().count(), 2);
 
         let mut state = CodexInfoState::preview("normal");
         state.history = UsageHistory::default();
@@ -24665,24 +25133,26 @@ mod tests {
                 "depth": 1
             }}
         });
-        sender
-            .send(RpcReadEvent::Line(
-                super::security::RpcLine::new(
-                    json!({
-                        "id": 701,
-                        "result": {"data": [cycle_a, cycle_b]}
-                    })
-                    .to_string(),
-                )
-                .unwrap(),
-            ))
-            .unwrap();
+        for (id, item) in [(702, cycle_a), (703, cycle_b)] {
+            sender
+                .send(RpcReadEvent::Line(
+                    super::security::RpcLine::new(
+                        json!({"id":id,"result":{"thread":item}}).to_string(),
+                    )
+                    .unwrap(),
+                ))
+                .unwrap();
+        }
+        let cycle_paths = BTreeSet::from([
+            fs::canonicalize(&cycle_a_path).unwrap(),
+            fs::canonicalize(&cycle_b_path).unwrap(),
+        ]);
         let cycle_update = fetch_active_thread_update_for_paths_and_state(
             &mut Vec::new(),
             &receiver,
             &mut next_id,
             &root,
-            &active_paths,
+            &cycle_paths,
             None,
         );
         assert!(matches!(
@@ -24691,7 +25161,7 @@ mod tests {
                 if rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>()
                     == ["cycle-a", "cycle-b"]
         ));
-        assert_eq!(next_id, 702);
+        assert_eq!(next_id, 704);
         state.apply_thread_result(state.auth_epoch, cycle_update);
         assert!(state.thread_error);
         assert_eq!(
@@ -24745,20 +25215,21 @@ mod tests {
             .send(RpcReadEvent::Line(
                 super::security::RpcLine::new(
                     json!({
-                        "id": 702,
-                        "result": {"data": [replacement]}
+                        "id": 704,
+                        "result": {"thread": replacement}
                     })
                     .to_string(),
                 )
                 .unwrap(),
             ))
             .unwrap();
+        let replacement_paths = BTreeSet::from([fs::canonicalize(&replacement_path).unwrap()]);
         let replacement_update = fetch_active_thread_update_for_paths_and_state(
             &mut Vec::new(),
             &receiver,
             &mut next_id,
             &root,
-            &active_paths,
+            &replacement_paths,
             None,
         );
         assert!(matches!(
@@ -24766,7 +25237,7 @@ mod tests {
             ActiveThreadUpdate::Snapshot(rows)
                 if rows.len() == 1 && rows[0].id == "replacement"
         ));
-        assert_eq!(next_id, 703);
+        assert_eq!(next_id, 705);
         state.apply_thread_result(state.auth_epoch, replacement_update);
         assert!(!state.thread_error);
         assert_eq!(
