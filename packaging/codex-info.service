@@ -1,26 +1,23 @@
-# Install with: bash scripts/install_systemd_recorder.sh
 [Unit]
 Description=Codex Info daemon and loopback REST service
 After=default.target
-StartLimitIntervalSec=10min
-StartLimitBurst=5
+StartLimitIntervalSec=60s
+StartLimitBurst=2
 
 [Service]
 Type=simple
+ExecStartPre=%h/.local/libexec/codex-info-install.sh --startup-reconcile
+ExecCondition=%h/.local/libexec/codex-info-install.sh --startup-condition
 ExecStart=%h/.local/bin/codex_info --port 8787
-Restart=on-failure
-RestartSec=15s
+Restart=always
+RestartSec=5s
 KillSignal=SIGTERM
 TimeoutStopSec=20s
 Environment=CODEX_INFO_DAEMON_INTERVAL_SECS=60
-# The user-installed Codex launcher is authoritative. Without this explicit
-# order systemd can silently select an older /usr/local installation.
+Environment=CODEX_INFO_SYSTEMD_MANAGED=1
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 UMask=0077
 NoNewPrivileges=true
-# Do not enable PrivateTmp here: its mount namespace makes /proc/*/exe and
-# /proc/*/fd of the user's live Codex processes unreadable, which would force
-# the REST Threads snapshot to a false zero.
 
 [Install]
 WantedBy=default.target

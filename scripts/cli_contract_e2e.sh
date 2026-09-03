@@ -17,7 +17,7 @@ fail() {
     exit 1
 }
 
-for command in curl rg sha256sum sqlite3 ss; do
+for command in curl python3 rg sha256sum sqlite3 ss stat; do
     command -v "$command" >/dev/null || fail "$command is required"
 done
 [[ -x "$BINARY" ]] || fail "build target/release/codex_info first"
@@ -104,6 +104,31 @@ rg -q --fixed-strings '使用法:' <<<"$ja_help" || fail 'Japanese help was not 
 [[ ! -e "$data_root/history/usage_record_daemon.lock" ]] \
     || fail 'help created a daemon lock'
 
+# The installed launcher selects its own catalog through the verified payload;
+# it must not expose the raw service/development-only --port operation.
+launcher_home="$tmp_root/launcher-home"
+launcher_path="$tmp_root/run.sh"
+mkdir -p "$launcher_home/.local/bin" \
+    "$launcher_home/.local/share/codex-info/current"
+cp -- "$BINARY" "$launcher_home/.local/share/codex-info/current/codex_info"
+ln -s -- '../share/codex-info/current/codex_info' \
+    "$launcher_home/.local/bin/codex_info"
+cp -- "$ROOT_DIR/run.sh" "$launcher_path"
+chmod 0755 "$launcher_path"
+launcher_help="$(HOME="$launcher_home" LC_ALL=C "$launcher_path" --help)"
+for option in --start --ui --stop --disable-autostart --remove --status --update --help; do
+    rg -q --fixed-strings -- "$option" <<<"$launcher_help" \
+        || fail "installed launcher help omitted $option"
+done
+if rg -q --fixed-strings -- '--port' <<<"$launcher_help"; then
+    fail 'installed launcher help exposed payload-only --port'
+fi
+launcher_ja_help="$(HOME="$launcher_home" LC_ALL=ja_JP.UTF-8 "$launcher_path" --help)"
+rg -q --fixed-strings '使用法:' <<<"$launcher_ja_help" \
+    || fail 'installed launcher Japanese help was not selected'
+[[ ! -e "$launcher_home/.local/share/codex-info/control-state.json" ]] \
+    || fail 'installed launcher help mutated control state'
+
 # Every rejected form must fail before creating its own profile data root.
 reject_root="$tmp_root/rejected-data"
 run_rejected() {
@@ -143,6 +168,28 @@ done
 [[ -f "$lock_path" ]] || fail 'service lock was not created'
 curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/health" >/dev/null \
     || fail 'service health did not become ready'
+health_body="$(curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/health")"
+details_body="$(curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/details")"
+python3 - "$health_body" "$details_body" <<'PY'
+import json
+import sys
+
+health = json.loads(sys.argv[1])
+if set(health) != {"api_version", "service", "product_version"}:
+    raise SystemExit("health wire key set changed")
+if health["api_version"] != "v1" or health["service"] != "codex-info":
+    raise SystemExit("health wire identity changed")
+details = json.loads(sys.argv[2])
+expected = {
+    "api_version", "state", "observed_at", "authenticated", "plan_label", "quota",
+    "models", "active_thread_count", "history_periods", "history_samples",
+    "history_gaps", "threads", "estimated_cost_label",
+}
+if set(details) != expected:
+    raise SystemExit("details wire key set changed")
+if details["api_version"] != "v1":
+    raise SystemExit("details wire identity changed")
+PY
 ss -ltnH "sport = :$port" | rg -q "127[.]0[.]0[.]1:$port" \
     || fail 'listener is not bound to 127.0.0.1'
 
@@ -164,6 +211,26 @@ for _ in $(seq 1 200); do
     sleep 0.1
 done
 [[ -n "$database" ]] || fail 'account Session baseline did not complete'
+state_path="$data_root/history/recorder-state.json"
+[[ -f "$state_path" ]] || fail 'owner recorder-state.json was not created'
+[[ "$(stat -c '%a' "$state_path")" == 600 ]] \
+    || fail 'recorder-state.json is not owner-private'
+python3 - "$state_path" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    state = json.load(handle)
+expected = {
+    "schema", "pid", "process_starttime", "owner_nonce", "write_state",
+    "partition_id_hash", "data_generation", "collector_epoch", "cycle_seq",
+    "last_commit_unix", "updated_at_unix",
+}
+if set(state) != expected or state["schema"] != "codex-info-recorder-state-v1":
+    raise SystemExit("recorder-state schema/key set changed")
+if state["write_state"] != "ready" or state["data_generation"] <= 0:
+    raise SystemExit("recorder-state is not an acknowledged ready state")
+PY
 [[ "$(sqlite3 "$database" 'SELECT COUNT(*) FROM storage_partition;')" == 1 ]] \
     || fail 'account database partition authority is missing'
 [[ "$(sqlite3 "$database" 'SELECT COUNT(*) FROM usage_history WHERE sol_tokens <> 0 OR terra_tokens <> 0 OR luna_tokens <> 0 OR ABS(sol_dollars) > 0.0000001 OR ABS(terra_dollars) > 0.0000001 OR ABS(luna_dollars) > 0.0000001;')" == 0 ]] \
@@ -191,9 +258,10 @@ for _ in $(seq 1 200); do
     fi
     sleep 0.1
 done
-[[ "$post_boundary_luna_tokens" =~ ^[0-9]+$ ]] \
-    && ((10#$post_boundary_luna_tokens >= 10)) \
-    || fail "post-baseline recorder commit did not include the verified append (observed luna_tokens=$post_boundary_luna_tokens)"
+if [[ ! "$post_boundary_luna_tokens" =~ ^[0-9]+$ ]] \
+    || ((10#$post_boundary_luna_tokens < 10)); then
+    fail "post-baseline recorder commit did not include the verified append (observed luna_tokens=$post_boundary_luna_tokens)"
+fi
 [[ "$(sqlite3 "$database" 'SELECT COUNT(*) FROM session_ranges;')" -ge 1 ]] \
     || fail 'post-boundary Session append did not produce a committed range'
 rg -q --fixed-strings "$initial_commit" "$tmp_root/service.log" \
@@ -205,12 +273,21 @@ logical_database_sha256() {
         | sha256sum \
         | awk '{print $1}'
 }
-db_before="$(logical_database_sha256 "$database")"
+logical_database_without_gap_ledger_sha256() {
+    # A controlled resident stop records a pending gap in the ledger. Compare
+    # all other SQLite schema/data, then assert the new ledger row separately.
+    sqlite3 -batch -bail -cmd '.timeout 2000' "$1" .dump \
+        | rg -v 'recorder_gap_ledger' \
+        | sha256sum \
+        | awk '{print $1}'
+}
+db_before="$(logical_database_without_gap_ledger_sha256 "$database")"
 source_before="$(sha256sum "$session_file" | awk '{print $1}')"
 hint_before="$(sha256sum "$reset_hint" | awk '{print $1}')"
 
 # Public stop owns the complete sequence: verified owner -> one TERM -> lock
-# release.  It is idempotent and preserves all durable/source data.
+# release. It is idempotent, preserves durable/source data, and starts one
+# pending production gap for the interval that has not yet been source-proven.
 env "${common_env[@]}" "$BINARY" --stop
 wait "$service_pid"
 service_pid=""
@@ -218,8 +295,13 @@ service_pid=""
 if curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/health" >/dev/null 2>&1; then
     fail '--stop left the REST listener healthy'
 fi
-[[ "$(logical_database_sha256 "$database")" == "$db_before" ]] \
-    || fail '--stop changed logical database content'
+[[ "$(logical_database_without_gap_ledger_sha256 "$database")" == "$db_before" ]] \
+    || fail '--stop changed non-ledger logical database content'
+pending_gap_count="$(sqlite3 -batch -bail -cmd '.timeout 2000' "$database" \
+    "SELECT COUNT(*) FROM recorder_gap_ledger WHERE state='pending' AND reason='daemon_stop_unrecoverable';")"
+if [[ ! "$pending_gap_count" =~ ^[0-9]+$ ]] || ((10#$pending_gap_count < 1)); then
+    fail '--stop did not record a pending production gap'
+fi
 [[ "$(sha256sum "$session_file" | awk '{print $1}')" == "$source_before" ]] \
     || fail '--stop changed source JSONL'
 [[ "$(sha256sum "$reset_hint" | awk '{print $1}')" == "$hint_before" ]] \

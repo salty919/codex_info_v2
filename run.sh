@@ -2,57 +2,113 @@
 # Copyright (C) 2026 salty919
 # SPDX-License-Identifier: GPL-3.0-only
 
+# This source is copied byte-for-byte into each verified Linux generation.
+# It never builds, copies, or executes a checkout binary. User-facing help
+# comes from the installed Rust payload so the i18n catalog remains the only
+# natural-language authority.
 set -euo pipefail
 
-BASE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+operation='run'
+case "$#" in
+    0) operation='start' ;;
+    1)
+        case "$1" in
+            --start) operation='start' ;;
+            --ui) operation='ui' ;;
+            --stop) operation='stop' ;;
+            --disable-autostart) operation='disable-autostart' ;;
+            --remove) operation='remove' ;;
+            --status) operation='status' ;;
+            --update) operation='update' ;;
+            --help) operation='help' ;;
+            *) printf 'codex-info: E_LAUNCHER_ARGUMENT\n' >&2; exit 2 ;;
+        esac
+        ;;
+    *) printf 'codex-info: E_LAUNCHER_ARGUMENT\n' >&2; exit 2 ;;
+esac
 
-# WSLg exposes both Wayland and X11.  winit 0.30 selects Wayland whenever
-# WAYLAND_DISPLAY or WAYLAND_SOCKET is set; WINIT_UNIX_BACKEND was removed in
-# winit 0.29 and therefore cannot force the backend anymore.  This project
-# intentionally builds only the X11 backend, so make that choice explicit.
-# Leave the X11 scale factor unset so winit follows the OS Xft.dpi setting
-# (and falls back to XRandR when no Xft.dpi value is available).
-unset WAYLAND_DISPLAY WAYLAND_SOCKET WINIT_X11_SCALE_FACTOR
-export LIBGL_ALWAYS_SOFTWARE="1"
-export MESA_LOADER_DRIVER_OVERRIDE="llvmpipe"
+home_dir="${HOME:-}"
+[[ -n "$home_dir" ]] || { printf 'codex-info: E_HOME_REQUIRED\n' >&2; exit 1; }
+payload="$home_dir/.local/bin/codex_info"
+installer="$home_dir/.local/libexec/codex-info-install.sh"
 
-CODEX_INFO_CARGO="$(command -v cargo 2>/dev/null || true)"
-if [[ -z "$CODEX_INFO_CARGO" && -n "${HOME:-}" && -x "$HOME/.cargo/bin/cargo" ]]; then
-    # Rustup is commonly installed here, but non-login shells do not always
-    # source ~/.cargo/env before executing a repository script.
-    CODEX_INFO_CARGO="$HOME/.cargo/bin/cargo"
-fi
-if [[ -z "$CODEX_INFO_CARGO" ]] && command -v rustup >/dev/null 2>&1; then
-    # A system rustup installation can still locate the active toolchain even
-    # when its cargo proxy is not present in PATH.
-    CODEX_INFO_CARGO="$(rustup which cargo 2>/dev/null || true)"
-fi
-
-if [[ -z "$CODEX_INFO_CARGO" || ! -x "$CODEX_INFO_CARGO" ]]; then
-    # Keep launcher diagnostics language-neutral; all user-facing product copy
-    # (including CLI help) is owned by the Rust i18n catalog.
-    echo "run.sh: E_CARGO_NOT_FOUND" >&2
-    exit 127
-fi
-
-"$CODEX_INFO_CARGO" build --manifest-path "$BASE_DIR/Cargo.toml" --release --locked
-
-TARGET_BINARY="$BASE_DIR/target/release/codex_info"
-CODEX_INFO_HOME="${HOME:-}"
-
-service_using_normal_launch() {
-    if (( $# == 0 )); then
-        return 0
-    fi
-    [[ $# == 1 && "$1" == "--ui" ]]
+require_payload() {
+    [[ -L "$payload" && "$(readlink -- "$payload")" == '../share/codex-info/current/codex_info' && -x "$payload" ]] || {
+        printf 'codex-info: E_PAYLOAD_UNAVAILABLE\n' >&2
+        exit 1
+    }
 }
 
-if service_using_normal_launch "$@" \
-    && [[ -n "$CODEX_INFO_HOME" ]] \
-    && command -v systemctl >/dev/null 2>&1 \
-    && systemctl --user is-enabled --quiet codex-info.service \
-    && ! cmp -s -- "$CODEX_INFO_HOME/.local/bin/codex_info" "$TARGET_BINARY"; then
-    "$BASE_DIR/scripts/install_systemd_recorder.sh" --binary "$TARGET_BINARY"
+# --help is a side-effect-free payload readback. The exact marker asks the
+# installed payload for launcher help rather than its raw service/development
+# CLI help. It deliberately does not initialize the installer, acquire L1, or
+# invoke any repository executable.
+if [[ "$operation" == help ]]; then
+    require_payload
+    export CODEX_INFO_LAUNCHER_HELP=1
+    exec "$payload" --help
 fi
 
-exec "$TARGET_BINARY" "$@"
+launcher_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repository_installer="$launcher_dir/packaging/install_linux_bundle.sh"
+installer_ready=0
+if [[ -L "$installer" && "$(readlink -- "$installer")" == '../share/codex-info/current/install.sh' && -x "$installer" ]]; then
+    installer_ready=1
+fi
+
+# A repository checkout can be older than the first generation-aware install.
+# In that one-way bootstrap state, the repository installer validates the
+# legacy flat manifest/binary/units and reacquires the exact Release archive;
+# no checkout binary is ever used as a runtime fallback.
+if (( ! installer_ready )); then
+    [[ -f "$repository_installer" && ! -L "$repository_installer" && -x "$repository_installer" ]] || {
+        printf 'codex-info: E_INSTALLER_UNAVAILABLE\n' >&2
+        exit 1
+    }
+    case "$operation" in
+        ui)
+            if ! "$repository_installer" --start; then
+                "$repository_installer" --verify-ui --quiet || {
+                    printf 'codex-info: E_UI_SOURCE_UNAVAILABLE\n' >&2
+                    exit 1
+                }
+                require_payload
+                export CODEX_INFO_UI_CLIENT_ONLY=1
+                exec "$payload" --ui
+            fi
+            ;;
+        start|stop|disable-autostart|remove|status|update)
+            exec "$repository_installer" "--$operation"
+            ;;
+    esac
+    [[ -L "$installer" && "$(readlink -- "$installer")" == '../share/codex-info/current/install.sh' && -x "$installer" ]] || {
+        printf 'codex-info: E_HANDOFF_UNAVAILABLE\n' >&2
+        exit 1
+    }
+fi
+
+case "$operation" in
+    start|stop|disable-autostart|remove|status|update)
+        exec "$installer" "--$operation"
+        ;;
+esac
+
+# Start/readiness failure is allowed to surface in the verified UI client as a
+# localized connection-failure/retry screen, but only after the installer has
+# proved that generation and owner identity are safe. The client-only marker
+# prevents the UI payload from creating a raw listener or recorder of its own.
+if ! "$installer" --start; then
+    "$installer" --verify-ui --quiet || {
+        printf 'codex-info: E_UI_SOURCE_UNAVAILABLE\n' >&2
+        exit 1
+    }
+    require_payload
+    export CODEX_INFO_UI_CLIENT_ONLY=1
+    exec "$payload" --ui
+fi
+
+require_payload
+unset WAYLAND_DISPLAY WAYLAND_SOCKET WINIT_X11_SCALE_FACTOR
+export LIBGL_ALWAYS_SOFTWARE='1'
+export MESA_LOADER_DRIVER_OVERRIDE='llvmpipe'
+exec "$payload" --ui

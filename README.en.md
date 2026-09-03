@@ -5,35 +5,40 @@
 
 Codex Info reads rate limits, reset periods, local usage history, and running
 threads from the Codex App Server and displays them in a Rust/Slint X11 window.
-This file is the source/developer quick start. Customer installation uses the
-Linux release bundle; see [the customer operations runbook](docs/CUSTOMER_OPERATIONS_RUNBOOK.md)
-for the download, checksum, install, health, and removal flow.
+Customer installation uses the Linux release bundle and its installed launcher;
+see [the customer operations runbook](docs/CUSTOMER_OPERATIONS_RUNBOOK.md) for
+the download, checksum, installation, convergence, and recovery contract.
 
-## Quick start
-
-```bash
-git clone https://github.com/salty919/codex_info_v2.git
-cd codex_info_v2
-./run.sh --ui
-```
-
-The host needs Rust/Cargo (the launcher also checks the standard Rustup
-toolchain location), an X11 display (WSLg is supported), and a `codex`
-CLI that can run `codex app-server --stdio`. Authentication remains owned by
-the Codex CLI; this application does not save passwords, API keys, or tokens.
-
-Without arguments, `./run.sh` starts only the resident daemon and loopback
-REST service on `127.0.0.1:8787`. Use `--port PORT` to change only the port,
-`--ui` (optionally followed by `--port PORT`) to add the X11 UI, `--stop` to
-stop this profile's verified resident daemon, and `--help` for localized help.
-
-If Rustup is not installed, install it and load its environment before running
-the launcher:
+## Installed quick start
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
+"$HOME/.local/bin/codex-info" --status
+"$HOME/.local/bin/codex-info" --ui
 ```
+
+The bundle does not require a repository checkout or Rust/Cargo at runtime.
+It needs user systemd, the tools listed in the operations runbook, an X11
+display for `--ui` (WSLg is supported), and a `codex` CLI that can run
+`codex app-server --stdio`. Authentication remains owned by the Codex CLI;
+this application does not save passwords, API keys, or tokens.
+
+The installed launcher and the byte-identical bundle/repository `run.sh`
+never build locally or fall back to `target/`. With no arguments or
+`--start`, it reconciles the verified stable generation and starts one
+systemd-managed daemon on `127.0.0.1:8787`. Use `--ui`, `--update`,
+`--status`, `--stop`, `--disable-autostart`, `--remove`, or `--help`.
+Unknown, mixed, and `--port` launcher arguments fail before mutation.
+
+The update timer first runs after five minutes and then hourly. Startup and
+manual update use the same resolver, so a stopped daemon does not need to wait
+for the timer. With a running intent, completion requires either the verified
+new generation healthy or the verified old generation restored and healthy.
+An intentional stopped, disabled, or removed state succeeds only after its
+non-running state and retained files are read back. An unknown or foreign
+listener is left untouched and reported as `SAFE_BLOCKED`, never as success.
+
+Raw payload forms such as `codex_info --port PORT` remain service/development
+interfaces; they are not the customer update or daemon-management authority.
 
 ## Localization and time zones
 

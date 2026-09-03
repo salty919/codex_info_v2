@@ -37,19 +37,20 @@ saved selectorのauto reconnectは`ArgumentList`＋`BatchMode=yes`で起動し�
 ## 起動と SSH トンネル
 
 user-systemdを使うprofileでは`codex-info.service`が
-`codex_info --port 8787`を開始する。手動時も同じcommandを使う。待受アドレスは`127.0.0.1`に固定する。
+installed環境ではlauncherがRelease/local generationをreconcileしてuser-systemdのmanaged serviceを開始する。
+待受アドレスとportは`127.0.0.1:8787`に固定する。
 
 ```bash
-codex_info --port 8787
-codex_info
-codex_info --ui
-codex_info --ui --port 9876
+"$HOME/.local/bin/codex-info" --start
+"$HOME/.local/bin/codex-info" --ui
+"$HOME/.local/bin/codex-info" --status
 ```
 
-引数なしまたは`--port`はWindowを表示せず、recorder lockとREST listenerを同じprocess lifetimeで所有する。
-`--ui`は既存serviceを再利用し、無ければ同じloopback addressのserviceを一つだけ開始する。
-引数なしはdaemon+RESTのみであり、UIを追加する場合は`--ui`を明示する。待受addressは指定できず、`--port PORT`でloopbackのportだけを変更できる。
-systemd自動起動の解除は`bash scripts/install_systemd_recorder.sh --remove`で行い、DB/historyを保持する。
+引数なし/`--start`はWindowを表示せず、managed serviceの1 processがrecorder lockとREST listenerを所有する。
+`--ui`は同じmanaged ownerへ収束後、verified current payloadのUIだけを追加する。installed launcherへ
+`--port`は指定できない。raw payload `codex_info --port PORT`はservice・開発・E2E用で、待受addressは
+その場合もloopback固定である。自動起動解除はlauncher `--disable-autostart`、unit解除は`--remove`を使い、
+DB/history/installed generationを保持する。
 
 Windows からは SSH のローカルポート転送を使う。
 
@@ -297,6 +298,12 @@ case-altered key、別値、client自身と異なるproduct version、control/bi
 ownerを更新するためだけに識別し、そのserviceのdetailsは表示へ受理しない。
 health 200はresident serviceがread-only snapshot requestを受理でき、schema-validなimmutable details generationを
 保持しているreadinessを表す。認証済み、detailsの`state=ready`、DBの最新収集成功は意味しない。
+
+Linux launcherのmanaged-generation判定はこの3-key wireを変更せず、health要求の前後でsystemd `MainPID`、
+`/proc/<pid>/stat` starttime、executable device/inode/SHA-256、profile lock identity、port 8787のsocket
+inodeと`/proc/<pid>/fd`対応が全て不変で、manifest source generationへ一致することをout-of-bandで要求する。
+PID、listener、health 200、`product_version`のいずれか単独を成功へ読み替えない。known旧Codex Info ownerだけを
+交代対象にし、foreign/unknown/malformed ownerはsignalせず`SAFE_BLOCKED`にする。
 
 全JSON responseのproducer headerは次のexact意味を持つ。
 

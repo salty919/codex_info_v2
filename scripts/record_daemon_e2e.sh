@@ -13,7 +13,7 @@ fail() {
     exit 1
 }
 
-for command in awk curl date getconf rg sed sqlite3 ss tr; do
+for command in awk curl date getconf python3 rg sed sqlite3 ss stat tr; do
     command -v "$command" >/dev/null || fail "$command is required"
 done
 BINARY="$ROOT_DIR/target/release/codex_info"
@@ -21,7 +21,9 @@ BINARY="$ROOT_DIR/target/release/codex_info"
 
 for contract in \
     'ExecStart=%h/.local/bin/codex_info --port 8787' \
-    'Restart=on-failure' \
+    'Restart=always' \
+    'RestartSec=5s' \
+    'StartLimitBurst=2' \
     'NoNewPrivileges=true'; do
     rg -q --fixed-strings -- "$contract" packaging/codex-info.service \
         || fail "service contract missing: $contract"
@@ -260,10 +262,26 @@ launch_service() {
     service_pid="$!"
 }
 
+launch_managed_service() {
+    local log_name="$1"
+    env "${common_env[@]}" CODEX_INFO_SYSTEMD_MANAGED=1 "$BINARY" --port "$case_port" \
+        >"$case_root/$log_name.log" 2>&1 &
+    service_pid="$!"
+}
+
 launch_ui() {
     local log_name="$1"
     env "${common_env[@]}" \
         CODEX_INFO_PREVIEW=normal "$BINARY" --ui --port "$case_port" \
+        >"$case_root/$log_name.log" 2>&1 &
+    ui_pid="$!"
+}
+
+launch_client_only_ui() {
+    local log_name="$1"
+    env "${common_env[@]}" \
+        CODEX_INFO_UI_CLIENT_ONLY=1 CODEX_INFO_PREVIEW=normal \
+        "$BINARY" --ui --port "$case_port" \
         >"$case_root/$log_name.log" 2>&1 &
     ui_pid="$!"
 }
@@ -363,6 +381,59 @@ require_one_service() {
             || fail "$case_label: service owner changed ($expected_owner -> $owner)"
     fi
     service_pid="$owner"
+}
+
+assert_recorder_state() {
+    local expected_state="$1" expected_pid="$2"
+    python3 - "$case_data/history/recorder-state.json" "$expected_state" "$expected_pid" <<'PY'
+import json
+import os
+import stat
+import sys
+
+path, expected_state, expected_pid = sys.argv[1:]
+with open(path, encoding="utf-8") as handle:
+    value = json.load(handle)
+expected_keys = {
+    "schema", "pid", "process_starttime", "owner_nonce", "write_state",
+    "partition_id_hash", "data_generation", "collector_epoch", "cycle_seq",
+    "last_commit_unix", "updated_at_unix",
+}
+if set(value) != expected_keys:
+    raise SystemExit("recorder-state key set changed")
+if value["schema"] != "codex-info-recorder-state-v1":
+    raise SystemExit("recorder-state schema changed")
+if value["pid"] != int(expected_pid) or value["write_state"] != expected_state:
+    raise SystemExit("recorder-state owner/state mismatch")
+if not isinstance(value["process_starttime"], int) or value["process_starttime"] <= 0:
+    raise SystemExit("recorder-state process identity is invalid")
+if not isinstance(value["owner_nonce"], str) or len(value["owner_nonce"]) != 32 \
+        or any(char not in "0123456789abcdef" for char in value["owner_nonce"]):
+    raise SystemExit("recorder-state owner nonce is invalid")
+if not isinstance(value["updated_at_unix"], int) or value["updated_at_unix"] <= 0:
+    raise SystemExit("recorder-state updated_at_unix is invalid")
+if expected_state == "ready":
+    if not isinstance(value["partition_id_hash"], str) or len(value["partition_id_hash"]) != 64:
+        raise SystemExit("ready recorder-state partition hash is invalid")
+    if not isinstance(value["data_generation"], int) or value["data_generation"] <= 0:
+        raise SystemExit("ready recorder-state generation is invalid")
+    if not isinstance(value["collector_epoch"], str) or len(value["collector_epoch"]) != 32:
+        raise SystemExit("ready recorder-state collector epoch is invalid")
+    if not isinstance(value["cycle_seq"], int) or value["cycle_seq"] <= 0:
+        raise SystemExit("ready recorder-state cycle is invalid")
+    if not isinstance(value["last_commit_unix"], int) or value["last_commit_unix"] <= 0:
+        raise SystemExit("ready recorder-state commit time is invalid")
+elif expected_state == "idle_no_account":
+    if any(value[key] is not None for key in (
+        "partition_id_hash", "data_generation", "collector_epoch",
+        "cycle_seq", "last_commit_unix",
+    )):
+        raise SystemExit("idle recorder-state carries commit fields")
+else:
+    raise SystemExit("unexpected recorder-state test state")
+if (stat.S_IMODE(os.stat(path).st_mode) != 0o600):
+    raise SystemExit("recorder-state is not owner-private")
+PY
 }
 
 require_no_service() {
@@ -474,6 +545,8 @@ run_service_cold_start() {
         sed -n '1,160p' "$case_root/service-cold.log" >&2 || true
         fail "$case_label: daemon did not persist the account Session baseline"
     fi
+    assert_recorder_state ready "$service_pid" \
+        || fail "$case_label: recorder-state.json is not an acknowledged ready state"
     before="$(sqlite3 "$case_db" 'SELECT COUNT(*) FROM usage_history;')"
     [[ "$(sqlite3 "$case_db" 'SELECT COUNT(*) FROM usage_history WHERE sol_tokens <> 0 OR terra_tokens <> 0 OR luna_tokens <> 0 OR ABS(sol_dollars) > 0.0000001 OR ABS(terra_dollars) > 0.0000001 OR ABS(luna_dollars) > 0.0000001;')" == 0 ]] \
         || fail "$case_label: pre-boundary Session bytes were attributed"
@@ -518,6 +591,8 @@ run_service_cold_start() {
     [[ ! -e "$case_lock" ]] || fail "$case_label: daemon lock was not released"
     [[ "$(listener_count "$case_port")" == 0 ]] \
         || fail "$case_label: service REST listener remained after shutdown"
+    [[ "$(sqlite3 "$case_db" "SELECT COUNT(*) FROM recorder_gap_ledger WHERE state = 'pending';")" -ge 1 ]] \
+        || fail "$case_label: clean stop did not leave an explicit pending recorder gap"
     [[ "$(sqlite3 "$case_db" 'PRAGMA quick_check;')" == ok ]] \
         || fail "$case_label: history database quick_check failed"
     printf 'CASE %s: PASS (rows_before=%s, luna_tokens_after=%s, idle_cpu_ticks=%s/%s, one owner/listener and clean stop)\n' \
@@ -592,6 +667,46 @@ run_ui_with_service() {
     require_no_service
     printf 'CASE %s: PASS (rendered --ui reusing service PID %s, no additional resident)\n' \
         "$case_label" "$owner"
+}
+
+run_verified_ui_failure_without_service() {
+    local launcher_pid pids=()
+    setup_case verified-ui-failure-no-owner
+    write_fixture
+    if [[ "$ui_display_available" != 1 ]]; then
+        mark_ui_hold "$case_label" 'X11 display is unavailable; UI was not rendered'
+        return
+    fi
+    # This is the installed-launcher fallback contract: the verified payload
+    # receives only a strict client marker after service startup failed. It
+    # must retain the localized connection/retry surface without creating a
+    # raw resident owner, recorder, writer, or listener.
+    launch_client_only_ui ui-client-only
+    launcher_pid="$ui_pid"
+    if ! wait_for_ui_window "$launcher_pid"; then
+        if ! xdpyinfo >/dev/null 2>&1; then
+            stop_ui
+            mark_ui_hold "$case_label" 'X11 display became unavailable; UI was not rendered'
+            return
+        fi
+        sed -n '1,120p' "$case_root/ui-client-only.log" >&2 || true
+        fail "$case_label: verified client-only UI did not render a failure surface"
+    fi
+    process_env_contains "$launcher_pid" 'CODEX_INFO_UI_CLIENT_ONLY=1' \
+        || fail "$case_label: client-only marker was not preserved"
+    sleep 2
+    [[ ! -e "$case_lock" ]] \
+        || fail "$case_label: client-only UI created a recorder owner after service failure"
+    mapfile -t pids < <(find_service_pids)
+    [[ "${#pids[@]}" -eq 0 ]] \
+        || fail "$case_label: client-only UI created resident service process(es) ${pids[*]}"
+    [[ "$(listener_count "$case_port")" == 0 ]] \
+        || fail "$case_label: client-only UI created an unmanaged listener"
+    terminate_scoped_pid "$launcher_pid" ui 'client-only UI' || true
+    ui_pid=""
+    require_no_service
+    printf 'CASE %s: PASS (verified UI failure surface remained client-only with zero owner/listener)\n' \
+        "$case_label"
 }
 
 run_simultaneous_ui_without_service() {
@@ -692,11 +807,144 @@ run_simultaneous_service_launches() {
         "$case_label" "$first" "$second" "$owner"
 }
 
+launch_failure_service() {
+    local mode="$1" log_name="$2"
+    env "${common_env[@]}" CODEX_INFO_RECORDER_FAILURE="$mode" "$BINARY" --port "$case_port" \
+        >"$case_root/$log_name.log" 2>&1 &
+    service_pid="$!"
+}
+
+wait_for_expected_failure() {
+    local pid="$1" label="$2" status
+    for _ in $(seq 1 120); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.25
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        terminate_scoped_pid "$pid" service "$label" || true
+        fail "$case_label: $label did not exit within the finite failure budget"
+    fi
+    if wait "$pid"; then
+        fail "$case_label: $label exited cleanly after an injected failure"
+    else
+        status="$?"
+    fi
+    [[ "$status" != 0 ]] || fail "$case_label: $label returned status zero"
+    service_pid=""
+}
+
+run_managed_activation_retires_unmanaged_owner() {
+    local unmanaged managed
+    setup_case managed-activation-retires-unmanaged
+    write_fixture
+    launch_service managed-unmanaged-owner
+    require_ready
+    unmanaged="$service_pid"
+    require_one_service "$unmanaged"
+    launch_managed_service managed-retire
+    managed="$service_pid"
+    for _ in $(seq 1 80); do
+        if [[ "$(lock_owner 2>/dev/null || true)" == "$managed" ]] \
+            && service_health; then
+            break
+        fi
+        sleep 0.25
+    done
+    require_one_service "$managed"
+    process_env_contains "$managed" 'CODEX_INFO_SYSTEMD_MANAGED=1' \
+        || fail "$case_label: managed activation owner lacks its marker"
+    if [[ -e "/proc/$unmanaged" ]]; then
+        wait "$unmanaged" 2>/dev/null || true
+    fi
+    [[ ! -e "/proc/$unmanaged" ]] \
+        || fail "$case_label: managed activation left the old unmanaged owner alive"
+    stop_current_service
+    require_no_service
+    printf 'CASE %s: PASS (managed activation retired exact unmanaged owner %s and adopted %s)\n' \
+        "$case_label" "$unmanaged" "$managed"
+}
+
+run_managed_activation_reuses_managed_owner() {
+    local owner second
+    setup_case managed-activation-reuses-managed
+    write_fixture
+    launch_managed_service managed-owner
+    require_ready
+    owner="$service_pid"
+    require_one_service "$owner"
+    launch_managed_service managed-reuse
+    second="$service_pid"
+    if ! wait "$second"; then
+        fail "$case_label: managed activation failed while reusing a healthy managed owner"
+    fi
+    require_one_service "$owner"
+    [[ "$(listener_count "$case_port")" == 1 ]] \
+        || fail "$case_label: managed owner listener count changed during reuse"
+    stop_current_service
+    require_no_service
+    printf 'CASE %s: PASS (healthy managed owner %s was reused; contender %s exited cleanly)\n' \
+        "$case_label" "$owner" "$second"
+}
+
+run_managed_activation_rejects_malformed_owner() {
+    local payload='{"pid":1}'
+    setup_case managed-malformed-owner
+    write_fixture
+    printf '%s\n' "$payload" >"$case_lock"
+    chmod 600 "$case_lock"
+    launch_managed_service managed-malformed
+    wait_for_expected_failure "$service_pid" 'malformed-owner activation'
+    [[ -f "$case_lock" ]] || fail "$case_label: malformed owner lock was removed"
+    rg -q --fixed-strings -- "$payload" "$case_lock" \
+        || fail "$case_label: malformed owner lock was rewritten"
+    [[ "$(listener_count "$case_port")" == 0 ]] \
+        || fail "$case_label: malformed owner activation bound an unknown listener"
+    printf 'CASE %s: PASS (malformed owner stayed untouched and activation failed closed)\n' \
+        "$case_label"
+}
+
+run_recorder_failure_budget() {
+    local mode
+    setup_case recorder-busy-retry
+    write_fixture
+    launch_failure_service busy recorder-busy
+    require_ready
+    if ! wait_for_account_baseline; then
+        sed -n '1,160p' "$case_root/recorder-busy.log" >&2 || true
+        fail "$case_label: busy injection did not reach the next-cycle commit"
+    fi
+    assert_recorder_state ready "$service_pid" \
+        || fail "$case_label: busy retry did not return to ready state"
+    process_matches_scope "$service_pid" service \
+        || fail "$case_label: busy retry service exited unexpectedly"
+    stop_current_service
+    require_no_service
+    printf 'CASE %s: PASS (one 2s busy failure, one next-cycle retry, ready state restored)\n' \
+        "$case_label"
+
+    for mode in worker-death fatal full readonly; do
+        setup_case "recorder-failure-$mode"
+        write_fixture
+        launch_failure_service "$mode" "recorder-$mode"
+        wait_for_expected_failure "$service_pid" "$mode failure"
+        require_no_service
+        printf 'CASE %s: PASS (injected %s failure exited nonzero and released owner/listener)\n' \
+            "$case_label" "$mode"
+    done
+}
+
 run_service_cold_start
 run_ui_without_service
 run_ui_with_service
+run_verified_ui_failure_without_service
 run_simultaneous_ui_without_service
 run_simultaneous_service_launches
+run_managed_activation_retires_unmanaged_owner
+run_managed_activation_reuses_managed_owner
+run_managed_activation_rejects_malformed_owner
+run_recorder_failure_budget
 
 if ((hold_count > 0)); then
     printf 'record-daemon-e2e: HOLD (%s UI case(s) could not be rendered; no HOLD was reported as PASS)\n' \

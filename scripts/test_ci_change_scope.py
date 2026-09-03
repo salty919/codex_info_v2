@@ -153,6 +153,30 @@ class SelectionTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_linux_product_scripts_do_not_select_governance_codeql(self) -> None:
+        classifier = Path(__file__).with_name("ci_change_scope.py")
+        with tempfile.TemporaryDirectory() as raw_root:
+            name_status = Path(raw_root) / "changed-paths.z"
+            name_status.write_bytes(
+                b"A\0scripts/test_linux_update_convergence.sh\0"
+                b"M\0scripts/test_run_launcher_version_sync.sh\0"
+            )
+            result = subprocess.run(
+                [sys.executable, str(classifier), "--name-status", str(name_status)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "binary_impact": True,
+                "codeql_languages": ["rust"],
+                "owners": ["LINUX_BACKEND"],
+            },
+        )
+
     def test_release_candidate_flag_selects_windows_for_linux_path(self) -> None:
         classifier = Path(__file__).with_name("ci_change_scope.py")
         with tempfile.TemporaryDirectory() as raw_root:

@@ -174,11 +174,49 @@ CREATE TABLE session_model_totals (
 ) WITHOUT ROWID;
 
 CREATE TABLE recorder_gap_ledger (
-    data_generation TEXT PRIMARY KEY,
-    observed_at INTEGER NOT NULL CHECK (observed_at > 0),
-    reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 128)
+    gap_id TEXT PRIMARY KEY CHECK (
+        length(gap_id) = 32 AND gap_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    partition_id TEXT NOT NULL CHECK (
+        length(partition_id) = 64 AND partition_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    source_identity_before TEXT NOT NULL CHECK (length(source_identity_before) BETWEEN 1 AND 512),
+    source_identity_after TEXT NOT NULL CHECK (length(source_identity_after) BETWEEN 1 AND 512),
+    cursor_before TEXT NOT NULL CHECK (length(cursor_before) BETWEEN 1 AND 512),
+    cursor_after TEXT NOT NULL CHECK (length(cursor_after) BETWEEN 1 AND 512),
+    stopped_at_monotonic_ns INTEGER NOT NULL CHECK (stopped_at_monotonic_ns > 0),
+    resumed_at_monotonic_ns INTEGER CHECK (
+        resumed_at_monotonic_ns IS NULL OR resumed_at_monotonic_ns >= stopped_at_monotonic_ns
+    ),
+    start_at INTEGER NOT NULL CHECK (start_at > 0),
+    end_at INTEGER NOT NULL CHECK (end_at >= start_at),
+    reset_at INTEGER CHECK (reset_at IS NULL OR reset_at > 0),
+    reason TEXT NOT NULL CHECK (
+        reason IN ('daemon_stop_unrecoverable', 'reset_hint_expired', 'auth_epoch_tombstoned')
+    ),
+    state TEXT NOT NULL CHECK (
+        state IN ('pending', 'confirmed', 'recovered', 'rejected')
+    ),
+    owner_collector_epoch TEXT NOT NULL CHECK (
+        length(owner_collector_epoch) = 32
+        AND owner_collector_epoch NOT GLOB '*[^0-9a-f]*'
+    ),
+    confirmation_cycle_seq TEXT NOT NULL CHECK (
+        length(confirmation_cycle_seq) BETWEEN 1 AND 20
+        AND confirmation_cycle_seq NOT GLOB '*[^0-9]*'
+    )
 );
 "#;
+
+const GAP_LEDGER_REASONS: [&str; 3] = [
+    "daemon_stop_unrecoverable",
+    "reset_hint_expired",
+    "auth_epoch_tombstoned",
+];
+const GAP_LEDGER_STATES: [&str; 4] = ["pending", "confirmed", "recovered", "rejected"];
+const RECORDER_GAP_ID_BYTES: usize = 16;
+const RECORDER_GAP_TEXT_BYTES: usize = 512;
+const MAX_RECORDER_GAP_SOURCE_MINUTES: usize = 31 * 24 * 60;
 
 const RESET_GROUP_TOLERANCE_SECONDS: i128 = 60;
 const HISTORY_TIMESTAMP_RESET_INDEX: &str = "usage_history_timestamp_reset_idx";
@@ -385,6 +423,28 @@ pub struct SessionCollectionState {
     pub cycle_seq: u64,
     pub checkpoints: Vec<SessionCheckpoint>,
     pub model_totals: Vec<SessionModelTotal>,
+}
+
+/// A source-proven recorder availability interval.  This is deliberately
+/// separate from session ranges: session backfill can recover token usage but
+/// cannot prove a point-in-time quota observation existed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecorderGap {
+    pub gap_id: String,
+    pub partition_id: String,
+    pub source_identity_before: String,
+    pub source_identity_after: String,
+    pub cursor_before: String,
+    pub cursor_after: String,
+    pub stopped_at_monotonic_ns: u64,
+    pub resumed_at_monotonic_ns: Option<u64>,
+    pub start_at: i64,
+    pub end_at: i64,
+    pub reset_at: Option<i64>,
+    pub reason: String,
+    pub state: String,
+    pub owner_collector_epoch: u128,
+    pub confirmation_cycle_seq: u64,
 }
 
 pub struct SessionCollectionCommit<'a> {
@@ -630,6 +690,201 @@ fn validate_sha256(value: &str, field: &'static str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn validate_lower_hex(value: &str, bytes: usize, field: &'static str) -> Result<()> {
+    if value.len() != bytes.saturating_mul(2)
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(UsageStoreError::InvalidImport(format!(
+            "{field} is not canonical lower hexadecimal"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_gap_text(value: &str, field: &'static str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > RECORDER_GAP_TEXT_BYTES
+        || !value.is_ascii()
+        || value.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(UsageStoreError::InvalidImport(format!(
+            "{field} is invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_recorder_gap(gap: &RecorderGap, expected_partition_id: Option<&str>) -> Result<()> {
+    validate_lower_hex(&gap.gap_id, RECORDER_GAP_ID_BYTES, "gap_id")?;
+    validate_lower_hex(&gap.partition_id, 32, "partition_id")?;
+    if expected_partition_id.is_some_and(|expected| expected != gap.partition_id) {
+        return Err(UsageStoreError::InvalidImport(
+            "recorder gap partition identity mismatch".into(),
+        ));
+    }
+    for (field, value) in [
+        ("source_identity_before", &gap.source_identity_before),
+        ("source_identity_after", &gap.source_identity_after),
+        ("cursor_before", &gap.cursor_before),
+        ("cursor_after", &gap.cursor_after),
+    ] {
+        validate_gap_text(value, field)?;
+    }
+    if gap.stopped_at_monotonic_ns == 0
+        || gap
+            .resumed_at_monotonic_ns
+            .is_some_and(|resumed| resumed < gap.stopped_at_monotonic_ns)
+        || gap.start_at <= 0
+        || gap.end_at < gap.start_at
+        || gap.reset_at.is_some_and(|reset| reset <= 0)
+        || !GAP_LEDGER_REASONS.contains(&gap.reason.as_str())
+        || !GAP_LEDGER_STATES.contains(&gap.state.as_str())
+        || gap.owner_collector_epoch == 0
+        || gap.confirmation_cycle_seq == 0
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "recorder gap bounds or state are invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_gap_repair_proof(gap: &RecorderGap) -> Result<()> {
+    if gap.resumed_at_monotonic_ns.is_none()
+        || gap.source_identity_after == "unresolved"
+        || gap.cursor_after == "unresolved"
+        || gap.reset_at.is_none_or(|reset_at| reset_at < gap.end_at)
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "recorder gap terminal transition lacks source proof".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recorder_source_rescan(
+    source_identity_after: &str,
+    cursor_after: &str,
+    resumed_at_monotonic_ns: u64,
+    reset_at: i64,
+    owner_collector_epoch: u128,
+    confirmation_cycle_seq: u64,
+    source_minutes: &[i64],
+) -> Result<()> {
+    validate_gap_text(source_identity_after, "source_identity_after")?;
+    validate_gap_text(cursor_after, "cursor_after")?;
+    if source_identity_after == "unresolved" || cursor_after == "unresolved" {
+        return Err(UsageStoreError::InvalidImport(
+            "recorder source proof is unresolved".into(),
+        ));
+    }
+    if resumed_at_monotonic_ns == 0
+        || reset_at <= 0
+        || owner_collector_epoch == 0
+        || confirmation_cycle_seq == 0
+        || source_minutes.len() > MAX_RECORDER_GAP_SOURCE_MINUTES
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "recorder source proof bounds are invalid".into(),
+        ));
+    }
+    let mut previous = None;
+    for minute in source_minutes {
+        if *minute <= 0 || minute.rem_euclid(60) != 0 {
+            return Err(UsageStoreError::InvalidImport(
+                "recorder source proof minute is not canonical".into(),
+            ));
+        }
+        if previous.is_some_and(|previous| *minute <= previous) {
+            return Err(UsageStoreError::InvalidImport(
+                "recorder source proof minutes are not unique and sorted".into(),
+            ));
+        }
+        previous = Some(*minute);
+    }
+    Ok(())
+}
+
+fn gap_expected_source_minutes(gap: &RecorderGap) -> Option<(i64, i64)> {
+    // History rows represent minute starts. A partial first/last minute is
+    // not considered sourced unless its complete bucket is present; this
+    // avoids treating a nearby observation as proof for a closed interval.
+    let first = gap
+        .start_at
+        .div_euclid(60)
+        .checked_add(1)?
+        .checked_mul(60)?;
+    let last = gap.end_at.div_euclid(60).checked_mul(60)?;
+    (first <= last).then_some((first, last))
+}
+
+fn source_minutes_cover_gap(gap: &RecorderGap, source_minutes: &[i64]) -> bool {
+    let Some((first, last)) = gap_expected_source_minutes(gap) else {
+        return false;
+    };
+    let required = last
+        .checked_sub(first)
+        .and_then(|span| usize::try_from(span / 60).ok())
+        .and_then(|count| count.checked_add(1));
+    let Some(required) = required else {
+        return false;
+    };
+    if required == 0 || required > MAX_RECORDER_GAP_SOURCE_MINUTES {
+        return false;
+    }
+    let start_index = source_minutes.partition_point(|minute| *minute < first);
+    source_minutes
+        .get(start_index..start_index.saturating_add(required))
+        .is_some_and(|minutes| {
+            minutes.iter().enumerate().all(|(index, minute)| {
+                first
+                    .checked_add((index as i64).saturating_mul(60))
+                    .is_some_and(|expected| *minute == expected)
+            })
+        })
+}
+
+fn source_minutes_overlap_gap(gap: &RecorderGap, source_minutes: &[i64]) -> bool {
+    source_minutes
+        .iter()
+        .any(|minute| *minute >= gap.start_at && *minute <= gap.end_at)
+}
+
+fn recorder_gap_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RecorderGap> {
+    let stopped_at_monotonic_ns = row.get::<_, i64>(6)?;
+    let resumed_at_monotonic_ns = row.get::<_, Option<i64>>(7)?;
+    let owner_collector_epoch = row.get::<_, String>(13)?;
+    let confirmation_cycle_seq = row.get::<_, String>(14)?;
+    Ok(RecorderGap {
+        gap_id: row.get(0)?,
+        partition_id: row.get(1)?,
+        source_identity_before: row.get(2)?,
+        source_identity_after: row.get(3)?,
+        cursor_before: row.get(4)?,
+        cursor_after: row.get(5)?,
+        stopped_at_monotonic_ns: u64::try_from(stopped_at_monotonic_ns)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        resumed_at_monotonic_ns: resumed_at_monotonic_ns
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        start_at: row.get(8)?,
+        end_at: row.get(9)?,
+        reset_at: row.get(10)?,
+        reason: row.get(11)?,
+        state: row.get(12)?,
+        owner_collector_epoch: u128::from_str_radix(&owner_collector_epoch, 16)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        confirmation_cycle_seq: confirmation_cycle_seq
+            .parse::<u64>()
+            .ok()
+            .filter(|value| value.to_string() == confirmation_cycle_seq)
+            .ok_or(rusqlite::Error::InvalidQuery)?,
+    })
 }
 
 fn validate_session_key(root_identity: &str, relative_path: &str) -> Result<()> {
@@ -1280,9 +1535,21 @@ fn validate_partition_schema(connection: &Connection) -> Result<()> {
         (
             "recorder_gap_ledger",
             &[
-                ("data_generation", "TEXT", 1),
-                ("observed_at", "INTEGER", 0),
+                ("gap_id", "TEXT", 1),
+                ("partition_id", "TEXT", 0),
+                ("source_identity_before", "TEXT", 0),
+                ("source_identity_after", "TEXT", 0),
+                ("cursor_before", "TEXT", 0),
+                ("cursor_after", "TEXT", 0),
+                ("stopped_at_monotonic_ns", "INTEGER", 0),
+                ("resumed_at_monotonic_ns", "INTEGER", 0),
+                ("start_at", "INTEGER", 0),
+                ("end_at", "INTEGER", 0),
+                ("reset_at", "INTEGER", 0),
                 ("reason", "TEXT", 0),
+                ("state", "TEXT", 0),
+                ("owner_collector_epoch", "TEXT", 0),
+                ("confirmation_cycle_seq", "TEXT", 0),
             ],
         ),
     ];
@@ -1321,12 +1588,208 @@ fn validate_partition_schema(connection: &Connection) -> Result<()> {
             .iter()
             .map(|(name, kind, pk)| ((*name).to_owned(), (*kind).to_owned(), *pk))
             .collect::<Vec<_>>();
-        if actual != expected {
+        if actual != expected
+            && !(*table == "recorder_gap_ledger" && actual == legacy_recorder_gap_ledger_columns())
+        {
             return Err(UsageStoreError::InvalidImport(format!(
                 "account partition {table} schema mismatch"
             )));
         }
     }
+    Ok(())
+}
+
+fn recorder_gap_ledger_columns(connection: &Connection) -> Result<Vec<(String, String, i64)>> {
+    let mut statement = connection.prepare(
+        "SELECT name, type, pk FROM pragma_table_info('recorder_gap_ledger') ORDER BY cid",
+    )?;
+    let columns = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into);
+    columns
+}
+
+fn legacy_recorder_gap_ledger_columns() -> Vec<(String, String, i64)> {
+    vec![
+        ("data_generation".to_owned(), "TEXT".to_owned(), 1),
+        ("observed_at".to_owned(), "INTEGER".to_owned(), 0),
+        ("reason".to_owned(), "TEXT".to_owned(), 0),
+    ]
+}
+
+fn create_recorder_gap_ledger(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE recorder_gap_ledger (
+            gap_id TEXT PRIMARY KEY CHECK (
+                length(gap_id) = 32 AND gap_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            partition_id TEXT NOT NULL CHECK (
+                length(partition_id) = 64 AND partition_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            source_identity_before TEXT NOT NULL CHECK (length(source_identity_before) BETWEEN 1 AND 512),
+            source_identity_after TEXT NOT NULL CHECK (length(source_identity_after) BETWEEN 1 AND 512),
+            cursor_before TEXT NOT NULL CHECK (length(cursor_before) BETWEEN 1 AND 512),
+            cursor_after TEXT NOT NULL CHECK (length(cursor_after) BETWEEN 1 AND 512),
+            stopped_at_monotonic_ns INTEGER NOT NULL CHECK (stopped_at_monotonic_ns > 0),
+            resumed_at_monotonic_ns INTEGER CHECK (
+                resumed_at_monotonic_ns IS NULL OR resumed_at_monotonic_ns >= stopped_at_monotonic_ns
+            ),
+            start_at INTEGER NOT NULL CHECK (start_at > 0),
+            end_at INTEGER NOT NULL CHECK (end_at >= start_at),
+            reset_at INTEGER CHECK (reset_at IS NULL OR reset_at > 0),
+            reason TEXT NOT NULL CHECK (
+                reason IN ('daemon_stop_unrecoverable', 'reset_hint_expired', 'auth_epoch_tombstoned')
+            ),
+            state TEXT NOT NULL CHECK (
+                state IN ('pending', 'confirmed', 'recovered', 'rejected')
+            ),
+            owner_collector_epoch TEXT NOT NULL CHECK (
+                length(owner_collector_epoch) = 32
+                AND owner_collector_epoch NOT GLOB '*[^0-9a-f]*'
+            ),
+            confirmation_cycle_seq TEXT NOT NULL CHECK (
+                length(confirmation_cycle_seq) BETWEEN 1 AND 20
+                AND confirmation_cycle_seq NOT GLOB '*[^0-9]*'
+            )
+        );
+        "#,
+    )?;
+    Ok(())
+}
+
+fn legacy_gap_id(data_generation: &str, observed_at: i64, reason: &str, rowid: i64) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data_generation.hash(&mut hasher);
+    observed_at.hash(&mut hasher);
+    reason.hash(&mut hasher);
+    rowid.hash(&mut hasher);
+    format!("{:032x}", hasher.finish())
+}
+
+/// Upgrade the fixture-era three-column ledger without deleting its rows.
+/// Legacy observations have no source proof, so they remain visible only as
+/// rejected records; no point-in-time quota interval is fabricated.
+fn ensure_recorder_gap_ledger_schema(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    let table_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'recorder_gap_ledger')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return create_recorder_gap_ledger(transaction);
+    }
+
+    let actual = recorder_gap_ledger_columns(transaction)?;
+    let expected = vec![
+        ("gap_id".to_owned(), "TEXT".to_owned(), 1),
+        ("partition_id".to_owned(), "TEXT".to_owned(), 0),
+        ("source_identity_before".to_owned(), "TEXT".to_owned(), 0),
+        ("source_identity_after".to_owned(), "TEXT".to_owned(), 0),
+        ("cursor_before".to_owned(), "TEXT".to_owned(), 0),
+        ("cursor_after".to_owned(), "TEXT".to_owned(), 0),
+        (
+            "stopped_at_monotonic_ns".to_owned(),
+            "INTEGER".to_owned(),
+            0,
+        ),
+        (
+            "resumed_at_monotonic_ns".to_owned(),
+            "INTEGER".to_owned(),
+            0,
+        ),
+        ("start_at".to_owned(), "INTEGER".to_owned(), 0),
+        ("end_at".to_owned(), "INTEGER".to_owned(), 0),
+        ("reset_at".to_owned(), "INTEGER".to_owned(), 0),
+        ("reason".to_owned(), "TEXT".to_owned(), 0),
+        ("state".to_owned(), "TEXT".to_owned(), 0),
+        ("owner_collector_epoch".to_owned(), "TEXT".to_owned(), 0),
+        ("confirmation_cycle_seq".to_owned(), "TEXT".to_owned(), 0),
+    ];
+    if actual == expected {
+        return Ok(());
+    }
+
+    let legacy = legacy_recorder_gap_ledger_columns();
+    if actual != legacy {
+        return Err(UsageStoreError::InvalidImport(
+            "recorder gap ledger schema mismatch".into(),
+        ));
+    }
+
+    let partition_id: String = transaction
+        .query_row(
+            "SELECT partition_id FROM storage_partition WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "0".repeat(64));
+    transaction.execute(
+        "ALTER TABLE recorder_gap_ledger RENAME TO recorder_gap_ledger_legacy",
+        [],
+    )?;
+    create_recorder_gap_ledger(transaction)?;
+    let mut statement = transaction.prepare(
+        "SELECT rowid, data_generation, observed_at, reason
+         FROM recorder_gap_ledger_legacy ORDER BY rowid",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    for (rowid, data_generation, observed_at, legacy_reason) in rows {
+        // The fixture-era table did not constrain its timestamp. Preserve
+        // every legacy row as a rejected record, using the smallest valid
+        // sentinel for an invalid timestamp; no such row can be projected as
+        // a public quota gap without a later source-proof transition.
+        let legacy_timestamp = observed_at.max(1);
+        let gap_id = legacy_gap_id(&data_generation, observed_at, "legacy", rowid);
+        // Legacy fixture generations were unconstrained text.  Keep a safe,
+        // bounded cursor when an old value cannot satisfy the new ledger's
+        // printable-text contract; this row remains rejected and therefore
+        // cannot become a fabricated public quota gap.
+        let legacy_cursor = if data_generation.len() <= RECORDER_GAP_TEXT_BYTES
+            && !data_generation.is_empty()
+            && data_generation.is_ascii()
+            && !data_generation.bytes().any(|byte| byte.is_ascii_control())
+        {
+            data_generation
+        } else {
+            format!("legacy-{gap_id}")
+        };
+        let migrated_reason = GAP_LEDGER_REASONS
+            .contains(&legacy_reason.as_str())
+            .then_some(legacy_reason.as_str())
+            .unwrap_or("auth_epoch_tombstoned");
+        transaction.execute(
+            "INSERT INTO recorder_gap_ledger (
+                gap_id, partition_id, source_identity_before, source_identity_after,
+                cursor_before, cursor_after, stopped_at_monotonic_ns,
+                resumed_at_monotonic_ns, start_at, end_at, reset_at, reason, state,
+                owner_collector_epoch, confirmation_cycle_seq
+             ) VALUES (?1, ?2, 'legacy', 'legacy', ?3, ?3, ?4, NULL, ?5, ?5, ?5,
+                       ?6, 'rejected', ?7, '1')",
+            params![
+                gap_id,
+                &partition_id,
+                &legacy_cursor,
+                legacy_timestamp,
+                legacy_timestamp,
+                migrated_reason,
+                format!("{:032x}", 1_u128),
+            ],
+        )?;
+    }
+    transaction.execute("DROP TABLE recorder_gap_ledger_legacy", [])?;
     Ok(())
 }
 
@@ -1396,6 +1859,44 @@ fn validate_storage_partition(
     Ok(())
 }
 
+/// Read only the partition identity before a compatible schema transition.
+/// This preserves the fail-closed account boundary while still allowing the
+/// recorder owner to upgrade the old fixture-era gap table transactionally.
+fn validate_storage_partition_identity(
+    connection: &Connection,
+    expected: &StoragePartitionIdentity,
+) -> Result<()> {
+    expected.validate()?;
+    let actual: (i64, String, String, String, String, String) = connection.query_row(
+        "SELECT singleton, schema_version, profile_scope_id, account_scope_id,
+                storage_epoch, partition_id FROM storage_partition",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+    let actual_epoch = canonical_u64_text(&actual.4, "storage epoch")?;
+    if actual.0 != 1
+        || actual.1 != expected.schema_version
+        || actual.2 != expected.profile_scope_id
+        || actual.3 != expected.account_scope_id
+        || actual.5 != expected.partition_id
+        || actual_epoch != expected.storage_epoch
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "storage partition identity mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 impl UsageStore {
     /// Creates a brand-new account partition. Existing paths are recovery
@@ -1435,6 +1936,7 @@ impl UsageStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA)?;
         transaction.execute_batch(PARTITION_SCHEMA)?;
+        ensure_recorder_gap_ledger_schema(&transaction)?;
         transaction.execute(
             "INSERT INTO storage_partition (
                 singleton, schema_version, profile_scope_id, account_scope_id,
@@ -1473,9 +1975,18 @@ impl UsageStore {
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        validate_storage_partition(&probe, identity)?;
+        // Check the account identity before opening a writable connection. A
+        // database belonging to another account must never be migrated merely
+        // because it happens to contain the legacy fixture ledger.
+        validate_storage_partition_identity(&probe, identity)?;
         drop(probe);
-        let store = Self::open(path)?;
+        let mut store = Self::open(path)?;
+        let transaction = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_recorder_gap_ledger_schema(&transaction)?;
+        validate_storage_partition(&transaction, identity)?;
+        transaction.commit()?;
         validate_storage_partition(&store.connection, identity)?;
         Ok(store)
     }
@@ -2256,6 +2767,391 @@ impl UsageStore {
         })
     }
 
+    /// Read every ledger row for this account partition. Rows are returned in
+    /// deterministic interval order and each value is validated at the read
+    /// boundary; malformed legacy data can therefore never become public data.
+    pub fn load_recorder_gaps(&self) -> Result<Vec<RecorderGap>> {
+        if recorder_gap_ledger_columns(&self.connection)? == legacy_recorder_gap_ledger_columns() {
+            // A read-only caller may inspect an existing pre-v1 partition
+            // before the serialized writer has had a chance to migrate the
+            // fixture-era table. Those rows have no source proof and are not
+            // exposed as public gaps until the writer performs its atomic
+            // schema transition.
+            return Ok(Vec::new());
+        }
+        let partition_id: String = self.connection.query_row(
+            "SELECT partition_id FROM storage_partition WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut statement = self.connection.prepare(
+            "SELECT gap_id, partition_id, source_identity_before, source_identity_after,
+                    cursor_before, cursor_after, stopped_at_monotonic_ns,
+                    resumed_at_monotonic_ns, start_at, end_at, reset_at, reason, state,
+                    owner_collector_epoch, confirmation_cycle_seq
+             FROM recorder_gap_ledger
+             ORDER BY start_at, end_at, gap_id",
+        )?;
+        let gaps = statement
+            .query_map([], recorder_gap_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for gap in &gaps {
+            validate_recorder_gap(gap, Some(&partition_id))?;
+        }
+        Ok(gaps)
+    }
+
+    /// Only source-proven closed gaps are allowed to cross into the public
+    /// history projection. Missing rows, transport errors, and session
+    /// backfill are intentionally not converted into gaps here.
+    pub fn load_confirmed_recorder_gaps(&self) -> Result<Vec<RecorderGap>> {
+        let mut gaps = self
+            .load_recorder_gaps()?
+            .into_iter()
+            .filter(|gap| gap.state == "confirmed" && gap.reset_at.is_some())
+            .collect::<Vec<_>>();
+        gaps.sort_by_key(|gap| (gap.start_at, gap.end_at, gap.gap_id.clone()));
+        let mut furthest_end = None;
+        for gap in &gaps {
+            if furthest_end.is_some_and(|end| gap.start_at <= end) {
+                return Err(UsageStoreError::InvalidImport(
+                    "confirmed recorder gaps overlap".into(),
+                ));
+            }
+            furthest_end = Some(furthest_end.unwrap_or(gap.end_at).max(gap.end_at));
+        }
+        gaps.sort_by(|left, right| {
+            (
+                left.reset_at,
+                left.start_at,
+                left.end_at,
+                left.gap_id.as_str(),
+            )
+                .cmp(&(
+                    right.reset_at,
+                    right.start_at,
+                    right.end_at,
+                    right.gap_id.as_str(),
+                ))
+        });
+        Ok(gaps)
+    }
+
+    /// Insert or idempotently replay one ledger record. A duplicate gap ID is
+    /// accepted only when every logical field matches byte-for-byte; a
+    /// confirmed interval may not overlap another confirmed interval in the
+    /// same partition.
+    pub fn upsert_recorder_gap(&mut self, gap: &RecorderGap) -> Result<()> {
+        let partition_id: String = self.connection.query_row(
+            "SELECT partition_id FROM storage_partition WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        validate_recorder_gap(gap, Some(&partition_id))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row(
+                "SELECT gap_id, partition_id, source_identity_before, source_identity_after,
+                        cursor_before, cursor_after, stopped_at_monotonic_ns,
+                        resumed_at_monotonic_ns, start_at, end_at, reset_at, reason, state,
+                        owner_collector_epoch, confirmation_cycle_seq
+                 FROM recorder_gap_ledger WHERE gap_id = ?1",
+                [&gap.gap_id],
+                recorder_gap_from_row,
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing != *gap {
+                return Err(UsageStoreError::InvalidImport(
+                    "recorder gap replay conflicts with stored record".into(),
+                ));
+            }
+            transaction.commit()?;
+            return Ok(());
+        }
+        if gap.state != "pending" {
+            return Err(UsageStoreError::InvalidImport(
+                "new recorder gaps must start pending".into(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO recorder_gap_ledger (
+                gap_id, partition_id, source_identity_before, source_identity_after,
+                cursor_before, cursor_after, stopped_at_monotonic_ns,
+                resumed_at_monotonic_ns, start_at, end_at, reset_at, reason, state,
+                owner_collector_epoch, confirmation_cycle_seq
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                &gap.gap_id,
+                &gap.partition_id,
+                &gap.source_identity_before,
+                &gap.source_identity_after,
+                &gap.cursor_before,
+                &gap.cursor_after,
+                i64::try_from(gap.stopped_at_monotonic_ns).map_err(|_| {
+                    UsageStoreError::InvalidImport(
+                        "gap monotonic timestamp exceeds SQLite range".into(),
+                    )
+                })?,
+                gap.resumed_at_monotonic_ns
+                    .map(i64::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        UsageStoreError::InvalidImport(
+                            "gap monotonic timestamp exceeds SQLite range".into(),
+                        )
+                    })?,
+                gap.start_at,
+                gap.end_at,
+                gap.reset_at,
+                &gap.reason,
+                &gap.state,
+                format!("{:032x}", gap.owner_collector_epoch),
+                gap.confirmation_cycle_seq.to_string(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Start a pending interval. This convenience method makes stop/restart
+    /// bookkeeping explicit while retaining the same idempotent writer path.
+    pub fn begin_recorder_gap(&mut self, gap: &RecorderGap) -> Result<()> {
+        if gap.state != "pending" {
+            return Err(UsageStoreError::InvalidImport(
+                "new recorder gaps must start pending".into(),
+            ));
+        }
+        self.upsert_recorder_gap(gap)
+    }
+
+    /// Record a source-rescan recovery or a source-proven unrecoverable
+    /// interval. The caller must supply the complete record, so identity,
+    /// reset, and range changes cannot be smuggled into a state transition.
+    pub fn record_recorder_gap(&mut self, gap: &RecorderGap) -> Result<()> {
+        self.transition_recorder_gap(gap)
+    }
+
+    pub fn recover_recorder_gap(&mut self, gap: &RecorderGap) -> Result<()> {
+        if gap.state != "recovered" {
+            return Err(UsageStoreError::InvalidImport(
+                "recovered recorder gaps must use recovered state".into(),
+            ));
+        }
+        validate_gap_repair_proof(gap)?;
+        self.transition_recorder_gap(gap)
+    }
+
+    pub fn confirm_recorder_gap(&mut self, gap: &RecorderGap) -> Result<()> {
+        if gap.state != "confirmed" {
+            return Err(UsageStoreError::InvalidImport(
+                "confirmed recorder gaps must use confirmed state".into(),
+            ));
+        }
+        validate_gap_repair_proof(gap)?;
+        self.transition_recorder_gap(gap)
+    }
+
+    /// Apply the only permitted state transitions (`pending` → one terminal
+    /// state). Static identity/time fields remain immutable; a changed reset,
+    /// cursor, or source identity is rejected rather than reinterpreted.
+    pub fn transition_recorder_gap(&mut self, gap: &RecorderGap) -> Result<()> {
+        let partition_id: String = self.connection.query_row(
+            "SELECT partition_id FROM storage_partition WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        validate_recorder_gap(gap, Some(&partition_id))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row(
+                "SELECT gap_id, partition_id, source_identity_before, source_identity_after,
+                        cursor_before, cursor_after, stopped_at_monotonic_ns,
+                        resumed_at_monotonic_ns, start_at, end_at, reset_at, reason, state,
+                        owner_collector_epoch, confirmation_cycle_seq
+                 FROM recorder_gap_ledger WHERE gap_id = ?1",
+                [&gap.gap_id],
+                recorder_gap_from_row,
+            )
+            .optional()?;
+        let Some(existing) = existing else {
+            return Err(UsageStoreError::InvalidImport(
+                "recorder gap transition requires an existing pending record".into(),
+            ));
+        };
+        if existing == *gap {
+            transaction.commit()?;
+            return Ok(());
+        }
+        if existing.state != "pending"
+            || !matches!(gap.state.as_str(), "recovered" | "confirmed" | "rejected")
+            || existing.partition_id != gap.partition_id
+            || existing.source_identity_before != gap.source_identity_before
+            || existing.cursor_before != gap.cursor_before
+            || existing.stopped_at_monotonic_ns != gap.stopped_at_monotonic_ns
+            || existing.start_at != gap.start_at
+            || existing.end_at != gap.end_at
+            || existing.reset_at != gap.reset_at
+            || existing.reason != gap.reason
+            || existing.owner_collector_epoch != gap.owner_collector_epoch
+            || (existing.resumed_at_monotonic_ns.is_some()
+                && existing.resumed_at_monotonic_ns != gap.resumed_at_monotonic_ns)
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "recorder gap transition contradicts its pending record".into(),
+            ));
+        }
+        if matches!(gap.state.as_str(), "recovered" | "confirmed") {
+            validate_gap_repair_proof(gap)?;
+        }
+        if gap.state == "confirmed" {
+            let overlaps: i64 = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM recorder_gap_ledger
+                    WHERE partition_id = ?1 AND state = 'confirmed'
+                      AND gap_id <> ?4 AND start_at <= ?3 AND end_at >= ?2
+                )",
+                params![&gap.partition_id, gap.start_at, gap.end_at, &gap.gap_id],
+                |row| row.get(0),
+            )?;
+            if overlaps != 0 {
+                return Err(UsageStoreError::InvalidImport(
+                    "confirmed recorder gap overlaps an existing interval".into(),
+                ));
+            }
+        }
+        transaction.execute(
+            "UPDATE recorder_gap_ledger
+             SET source_identity_after = ?2, cursor_after = ?3,
+                 resumed_at_monotonic_ns = ?4, reason = ?5, state = ?6,
+                 confirmation_cycle_seq = ?7
+             WHERE gap_id = ?1",
+            params![
+                &gap.gap_id,
+                &gap.source_identity_after,
+                &gap.cursor_after,
+                gap.resumed_at_monotonic_ns
+                    .map(i64::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        UsageStoreError::InvalidImport(
+                            "gap monotonic timestamp exceeds SQLite range".into(),
+                        )
+                    })?,
+                &gap.reason,
+                &gap.state,
+                gap.confirmation_cycle_seq.to_string(),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Reconcile pending stop/restart intervals with one bounded source
+    /// rescan result.  The caller supplies only minute starts backed by
+    /// actual quota observations from the just-acknowledged collector
+    /// generation; session-derived rows (whose remaining value is null) must
+    /// not be passed as quota proof.
+    ///
+    /// A source result is deliberately conservative:
+    ///
+    /// * every complete minute in the interval proves `recovered`;
+    /// * an explicit `source_closed` proof with no source minute in the
+    ///   interval proves `confirmed`;
+    /// * a reset-period contradiction proves `rejected`;
+    /// * incomplete but otherwise consistent evidence leaves the row
+    ///   `pending` for the next bounded cycle.
+    ///
+    /// The persisted transition remains the single `pending` → terminal
+    /// writer path, so repeating an acknowledged source result is a no-op and
+    /// cannot create a duplicate history gap.
+    pub fn reconcile_pending_recorder_gaps(
+        &mut self,
+        source_identity_after: &str,
+        cursor_after: &str,
+        resumed_at_monotonic_ns: u64,
+        reset_at: i64,
+        owner_collector_epoch: u128,
+        confirmation_cycle_seq: u64,
+        source_minutes: &[i64],
+        source_closed: bool,
+    ) -> Result<Vec<RecorderGap>> {
+        validate_recorder_source_rescan(
+            source_identity_after,
+            cursor_after,
+            resumed_at_monotonic_ns,
+            reset_at,
+            owner_collector_epoch,
+            confirmation_cycle_seq,
+            source_minutes,
+        )?;
+
+        let pending = self
+            .load_recorder_gaps()?
+            .into_iter()
+            .filter(|gap| gap.state == "pending")
+            .collect::<Vec<_>>();
+        let mut transitioned = Vec::new();
+        for gap in pending {
+            // A source proof from the same collector generation/cycle that
+            // created the stop marker has no new evidence.  Waiting here is
+            // important: a heartbeat must never turn into a commit claim.
+            if gap.owner_collector_epoch == owner_collector_epoch
+                && confirmation_cycle_seq <= gap.confirmation_cycle_seq
+            {
+                continue;
+            }
+
+            let state = match gap.reset_at {
+                None => "rejected",
+                Some(gap_reset) if gap_reset != reset_at => "rejected",
+                Some(_) if source_minutes_cover_gap(&gap, source_minutes) => "recovered",
+                Some(_) if source_closed && !source_minutes_overlap_gap(&gap, source_minutes) => {
+                    "confirmed"
+                }
+                Some(_) => continue,
+            };
+            let mut terminal = gap;
+            terminal.source_identity_after = source_identity_after.to_owned();
+            terminal.cursor_after = cursor_after.to_owned();
+            terminal.resumed_at_monotonic_ns = Some(resumed_at_monotonic_ns);
+            terminal.state = state.to_owned();
+            terminal.confirmation_cycle_seq = confirmation_cycle_seq;
+            if state == "confirmed" {
+                let overlaps: i64 = self.connection.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM recorder_gap_ledger
+                        WHERE partition_id = ?1 AND state = 'confirmed'
+                          AND start_at <= ?3 AND end_at >= ?2
+                    )",
+                    params![&terminal.partition_id, terminal.start_at, terminal.end_at],
+                    |row| row.get(0),
+                )?;
+                if overlaps != 0 {
+                    // An overlap is a source contradiction. Keep the
+                    // evidence as a rejected terminal row instead of
+                    // allowing the confirmed projection to become
+                    // ambiguous.
+                    terminal.state = "rejected".into();
+                }
+            }
+            match state {
+                "recovered" => self.recover_recorder_gap(&terminal)?,
+                "confirmed" if terminal.state == "confirmed" => {
+                    self.confirm_recorder_gap(&terminal)?
+                }
+                "confirmed" | "rejected" => self.record_recorder_gap(&terminal)?,
+                _ => unreachable!("source resolver selected only terminal states"),
+            }
+            transitioned.push(terminal);
+        }
+        Ok(transitioned)
+    }
+
     /// Commits one verified append collection as a single account-local
     /// transaction. Intersecting source ranges are rejected; exact repeats
     /// are idempotent because all stored usage/model values are absolute.
@@ -2359,6 +3255,51 @@ impl UsageStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_generation: (String, i64, i64, Option<String>, String) = transaction
+            .query_row(
+                "SELECT data_generation, reset_at, window_seconds, collector_epoch, cycle_seq
+                 FROM collection_generation WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+        let current_data_generation =
+            canonical_u64_text(&current_generation.0, "collection generation")?;
+        let current_cycle_seq = canonical_u64_text(&current_generation.4, "cycle sequence")?;
+        let current_epoch = current_generation
+            .3
+            .as_deref()
+            .map(|value| canonical_u128_hex(value, "collector epoch"))
+            .transpose()?;
+        if current_epoch == Some(collector_epoch) {
+            if current_cycle_seq == cycle_seq {
+                if current_generation.1 != reset_at || current_generation.2 != window_seconds {
+                    return Err(UsageStoreError::InvalidImport(
+                        "replayed collection generation has a different period".into(),
+                    ));
+                }
+                if current_data_generation == u64::MAX {
+                    return Err(UsageStoreError::GenerationOverflow);
+                }
+                // The complete transaction for this epoch/cycle already
+                // committed. Return its exact generation rather than
+                // incrementing durable state on an acknowledgement retry.
+                transaction.commit()?;
+                return Ok(current_data_generation);
+            }
+            if current_cycle_seq > cycle_seq {
+                return Err(UsageStoreError::InvalidImport(
+                    "collection cycle moved backwards".into(),
+                ));
+            }
+        }
         let canonical_samples = canonicalize_samples(&transaction, samples)?;
         for range in canonical_ranges.values() {
             let intersects: i64 = transaction.query_row(
@@ -2528,12 +3469,7 @@ impl UsageStore {
                 ])?;
             }
         }
-        let current: String = transaction.query_row(
-            "SELECT data_generation FROM collection_generation WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        let next = canonical_u64_text(&current, "collection generation")?
+        let next = current_data_generation
             .checked_add(1)
             .ok_or(UsageStoreError::GenerationOverflow)?;
         transaction.execute(
@@ -2758,6 +3694,8 @@ impl UsageStore {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
     use std::time::Instant;
@@ -2818,6 +3756,32 @@ mod tests {
             account_scope_id: account_byte.to_string().repeat(64),
             storage_epoch: epoch,
             partition_id: account_byte.to_string().repeat(64),
+        }
+    }
+
+    fn recorder_gap(
+        partition_id: &str,
+        id: char,
+        state: &str,
+        start_at: i64,
+        end_at: i64,
+    ) -> RecorderGap {
+        RecorderGap {
+            gap_id: id.to_string().repeat(32),
+            partition_id: partition_id.to_owned(),
+            source_identity_before: "source-before".into(),
+            source_identity_after: "source-after".into(),
+            cursor_before: "cursor-before".into(),
+            cursor_after: "cursor-after".into(),
+            stopped_at_monotonic_ns: 100,
+            resumed_at_monotonic_ns: Some(200),
+            start_at,
+            end_at,
+            reset_at: Some(1_800_604_800),
+            reason: "daemon_stop_unrecoverable".into(),
+            state: state.into(),
+            owner_collector_epoch: 0x1234,
+            confirmation_cycle_seq: 1,
         }
     }
 
@@ -2888,18 +3852,42 @@ mod tests {
             })
             .unwrap();
         store_a
-            .connection
-            .execute(
-                "INSERT INTO recorder_gap_ledger (data_generation, observed_at, reason) VALUES (1, 1800000000, 'account-a-gap')",
-                [],
-            )
+            .begin_recorder_gap(&RecorderGap {
+                gap_id: "01".repeat(16),
+                partition_id: identity_a.partition_id.clone(),
+                source_identity_before: "account-a-source".into(),
+                source_identity_after: "account-a-source".into(),
+                cursor_before: "account-a-cursor".into(),
+                cursor_after: "account-a-cursor".into(),
+                stopped_at_monotonic_ns: 1,
+                resumed_at_monotonic_ns: None,
+                start_at: 1_800_000_000,
+                end_at: 1_800_000_060,
+                reset_at: Some(reset_at),
+                reason: "daemon_stop_unrecoverable".into(),
+                state: "pending".into(),
+                owner_collector_epoch: 1,
+                confirmation_cycle_seq: 1,
+            })
             .unwrap();
         store_b
-            .connection
-            .execute(
-                "INSERT INTO recorder_gap_ledger (data_generation, observed_at, reason) VALUES (1, 1800000001, 'account-b-gap')",
-                [],
-            )
+            .begin_recorder_gap(&RecorderGap {
+                gap_id: "02".repeat(16),
+                partition_id: identity_b.partition_id.clone(),
+                source_identity_before: "account-b-source".into(),
+                source_identity_after: "account-b-source".into(),
+                cursor_before: "account-b-cursor".into(),
+                cursor_after: "account-b-cursor".into(),
+                stopped_at_monotonic_ns: 2,
+                resumed_at_monotonic_ns: None,
+                start_at: 1_800_000_000,
+                end_at: 1_800_000_060,
+                reset_at: Some(reset_at),
+                reason: "daemon_stop_unrecoverable".into(),
+                state: "pending".into(),
+                owner_collector_epoch: 2,
+                confirmation_cycle_seq: 1,
+            })
             .unwrap();
         drop((store_a, store_b));
 
@@ -2921,20 +3909,14 @@ mod tests {
                 .checkpoints,
             vec![checkpoint_b]
         );
-        let gap_a: String = opened_a
-            .connection
-            .query_row("SELECT reason FROM recorder_gap_ledger", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let gap_b: String = opened_b
-            .connection
-            .query_row("SELECT reason FROM recorder_gap_ledger", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(gap_a, "account-a-gap");
-        assert_eq!(gap_b, "account-b-gap");
+        let gap_a = opened_a.load_recorder_gaps().unwrap();
+        let gap_b = opened_b.load_recorder_gaps().unwrap();
+        assert_eq!(gap_a.len(), 1);
+        assert_eq!(gap_b.len(), 1);
+        assert_eq!(gap_a[0].partition_id, identity_a.partition_id);
+        assert_eq!(gap_b[0].partition_id, identity_b.partition_id);
+        assert_eq!(gap_a[0].reason, "daemon_stop_unrecoverable");
+        assert_eq!(gap_b[0].reason, "daemon_stop_unrecoverable");
         drop((opened_a, opened_b));
         assert!(UsageStore::open_partitioned(&path_a, &identity_b).is_err());
 
@@ -2947,6 +3929,360 @@ mod tests {
 
         remove_database(&path_a);
         remove_database(&path_b);
+    }
+
+    #[test]
+    fn recorder_gap_ledger_is_idempotent_and_projects_only_confirmed_source_proof() {
+        let path = database_path("recorder-gap-authority");
+        let identity = partition_identity('c', 3);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+
+        let pending = recorder_gap(
+            &identity.partition_id,
+            '1',
+            "pending",
+            1_800_000_000,
+            1_800_000_060,
+        );
+        store.begin_recorder_gap(&pending).unwrap();
+        // Exact replay is accepted, while any changed logical field is a
+        // contradiction rather than a second interpretation of the interval.
+        store.begin_recorder_gap(&pending).unwrap();
+        let mut conflicting = pending.clone();
+        conflicting.cursor_before = "different-cursor".into();
+        assert!(store.begin_recorder_gap(&conflicting).is_err());
+
+        let mut recovered = pending.clone();
+        recovered.state = "recovered".into();
+        store.recover_recorder_gap(&recovered).unwrap();
+        assert!(store.load_confirmed_recorder_gaps().unwrap().is_empty());
+
+        let pending_confirmed = recorder_gap(
+            &identity.partition_id,
+            '2',
+            "pending",
+            1_800_000_120,
+            1_800_000_180,
+        );
+        store.begin_recorder_gap(&pending_confirmed).unwrap();
+        let mut confirmed = pending_confirmed.clone();
+        confirmed.state = "confirmed".into();
+        store.confirm_recorder_gap(&confirmed).unwrap();
+        // Confirmed replay is idempotent and is the only state projected by
+        // the public-gap read helper.
+        store.confirm_recorder_gap(&confirmed).unwrap();
+        let public = store.load_confirmed_recorder_gaps().unwrap();
+        assert_eq!(public, vec![confirmed.clone()]);
+
+        let overlapping_pending = recorder_gap(
+            &identity.partition_id,
+            '3',
+            "pending",
+            1_800_000_150,
+            1_800_000_210,
+        );
+        store.begin_recorder_gap(&overlapping_pending).unwrap();
+        let mut overlapping_confirmed = overlapping_pending.clone();
+        overlapping_confirmed.state = "confirmed".into();
+        assert!(store.confirm_recorder_gap(&overlapping_confirmed).is_err());
+        assert_eq!(
+            store.load_confirmed_recorder_gaps().unwrap(),
+            vec![confirmed.clone()]
+        );
+
+        let pending_rejected = recorder_gap(
+            &identity.partition_id,
+            '4',
+            "pending",
+            1_800_000_300,
+            1_800_000_360,
+        );
+        store.begin_recorder_gap(&pending_rejected).unwrap();
+        let mut rejected = pending_rejected;
+        rejected.state = "rejected".into();
+        store.record_recorder_gap(&rejected).unwrap();
+        assert_eq!(
+            store.load_confirmed_recorder_gaps().unwrap(),
+            vec![confirmed]
+        );
+        remove_database(&path);
+    }
+
+    #[test]
+    fn recorder_gap_source_rescan_reaches_recovered_confirmed_rejected_idempotently() {
+        let path = database_path("recorder-gap-source-rescan");
+        let identity = partition_identity('e', 5);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let reset_at = 1_800_604_800;
+
+        let recovered_pending = recorder_gap(
+            &identity.partition_id,
+            '5',
+            "pending",
+            1_800_000_000,
+            1_800_000_180,
+        );
+        store.begin_recorder_gap(&recovered_pending).unwrap();
+        let recovered = store
+            .reconcile_pending_recorder_gaps(
+                "authenticated-quota:partition-e",
+                "collector:00000000000000000000000000005678:cycle:2",
+                200,
+                reset_at,
+                0x5678,
+                2,
+                &[1_800_000_060, 1_800_000_120, 1_800_000_180],
+                false,
+            )
+            .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].state, "recovered");
+        assert!(store.load_confirmed_recorder_gaps().unwrap().is_empty());
+
+        let mut confirmed_pending = recorder_gap(
+            &identity.partition_id,
+            '6',
+            "pending",
+            1_800_000_240,
+            1_800_000_360,
+        );
+        confirmed_pending.resumed_at_monotonic_ns = None;
+        store.begin_recorder_gap(&confirmed_pending).unwrap();
+        let confirmed = store
+            .reconcile_pending_recorder_gaps(
+                "authenticated-quota:partition-e",
+                "collector:00000000000000000000000000009999:cycle:3",
+                300,
+                reset_at,
+                0x9999,
+                3,
+                &[],
+                true,
+            )
+            .unwrap();
+        assert_eq!(confirmed.len(), 1);
+        assert_eq!(confirmed[0].state, "confirmed");
+        assert_eq!(store.load_confirmed_recorder_gaps().unwrap().len(), 1);
+
+        // A reset-period contradiction is a source proof that the pending
+        // interval cannot be attributed to the current period. It is
+        // retained as rejected and never crosses the public projection.
+        let mut rejected_pending = recorder_gap(
+            &identity.partition_id,
+            '7',
+            "pending",
+            1_800_000_420,
+            1_800_000_480,
+        );
+        rejected_pending.resumed_at_monotonic_ns = None;
+        store.begin_recorder_gap(&rejected_pending).unwrap();
+        let rejected = store
+            .reconcile_pending_recorder_gaps(
+                "authenticated-quota:partition-e",
+                "collector:0000000000000000000000000000aaaa:cycle:4",
+                400,
+                reset_at + 604_800,
+                0xaaaa,
+                4,
+                &[],
+                false,
+            )
+            .unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].state, "rejected");
+        assert_eq!(store.load_confirmed_recorder_gaps().unwrap().len(), 1);
+
+        let mut overlapping_pending = recorder_gap(
+            &identity.partition_id,
+            '8',
+            "pending",
+            1_800_000_300,
+            1_800_000_420,
+        );
+        overlapping_pending.resumed_at_monotonic_ns = None;
+        store.begin_recorder_gap(&overlapping_pending).unwrap();
+        let overlap_result = store
+            .reconcile_pending_recorder_gaps(
+                "authenticated-quota:partition-e",
+                "collector:0000000000000000000000000000bbbb:cycle:5",
+                500,
+                reset_at,
+                0xbbbb,
+                5,
+                &[],
+                true,
+            )
+            .unwrap();
+        assert_eq!(overlap_result.len(), 1);
+        assert_eq!(overlap_result[0].state, "rejected");
+        assert_eq!(store.load_confirmed_recorder_gaps().unwrap().len(), 1);
+
+        // The same source result is a no-op after terminal persistence: no
+        // duplicate row or second public interval is created.
+        assert!(store
+            .reconcile_pending_recorder_gaps(
+                "authenticated-quota:partition-e",
+                "collector:0000000000000000000000000000aaaa:cycle:4",
+                400,
+                reset_at + 604_800,
+                0xaaaa,
+                4,
+                &[],
+                false,
+            )
+            .unwrap()
+            .is_empty());
+        let all = store.load_recorder_gaps().unwrap();
+        assert_eq!(all.len(), 4);
+        assert_eq!(
+            all.iter().map(|gap| gap.state.as_str()).collect::<Vec<_>>(),
+            vec!["recovered", "confirmed", "rejected", "rejected"]
+        );
+        remove_database(&path);
+    }
+
+    #[test]
+    fn persisted_restart_gap_accepts_new_boot_monotonic_value_without_reversal() {
+        let path = database_path("restart-gap-monotonic");
+        let identity = partition_identity('a', 6);
+        let stopped_at_monotonic_ns = 9_000_100_000_001;
+        let mut pending = recorder_gap(
+            &identity.partition_id,
+            '9',
+            "pending",
+            1_800_000_000,
+            1_800_000_180,
+        );
+        pending.resumed_at_monotonic_ns = None;
+        pending.stopped_at_monotonic_ns = stopped_at_monotonic_ns;
+
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        store.begin_recorder_gap(&pending).unwrap();
+        drop(store);
+
+        // Reopening the same SQLite file models a new process consuming a
+        // previous owner's persisted stop marker. A lower value is rejected
+        // by the DB invariant; the next boot-wide value transitions safely.
+        let mut restarted = UsageStore::open_partitioned(&path, &identity).unwrap();
+        let mut reversed = pending.clone();
+        reversed.state = "recovered".into();
+        reversed.resumed_at_monotonic_ns = Some(stopped_at_monotonic_ns - 1);
+        assert!(restarted.recover_recorder_gap(&reversed).is_err());
+        assert_eq!(
+            restarted
+                .load_recorder_gaps()
+                .unwrap()
+                .first()
+                .map(|gap| gap.state.as_str()),
+            Some("pending")
+        );
+
+        let mut resumed = pending;
+        resumed.state = "recovered".into();
+        resumed.resumed_at_monotonic_ns = Some(stopped_at_monotonic_ns + 1);
+        restarted.recover_recorder_gap(&resumed).unwrap();
+        let persisted = restarted.load_recorder_gaps().unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].state, "recovered");
+        assert_eq!(
+            persisted[0].resumed_at_monotonic_ns,
+            Some(stopped_at_monotonic_ns + 1)
+        );
+        remove_database(&path);
+    }
+
+    #[test]
+    fn legacy_gap_ledger_migrates_transactionally_without_rewriting_history_or_sessions() {
+        let path = database_path("legacy-gap-migration");
+        let identity = partition_identity('d', 4);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        connection.execute_batch(PARTITION_SCHEMA).unwrap();
+        connection
+            .execute("DROP TABLE recorder_gap_ledger", [])
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE recorder_gap_ledger (
+                    data_generation TEXT PRIMARY KEY,
+                    observed_at INTEGER,
+                    reason TEXT
+                )",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO storage_partition (
+                    singleton, schema_version, profile_scope_id, account_scope_id,
+                    storage_epoch, partition_id
+                 ) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+                params![
+                    &identity.schema_version,
+                    &identity.profile_scope_id,
+                    &identity.account_scope_id,
+                    identity.storage_epoch.to_string(),
+                    &identity.partition_id,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage_history (
+                    timestamp, reset_at, remaining_percent, sol_dollars,
+                    terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+                 ) VALUES (1_800_000_000, 1_800_604_800, 70.0, 1.0, 2.0, 3.0, 11, 22, 33)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO recorded_sessions (
+                    root_identity, relative_path, file_bytes, modified_nanos,
+                    file_device, file_inode
+                 ) VALUES ('unix:10:20', 'same/session.jsonl', 123, '1700000000000000000', 10, 20)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO recorder_gap_ledger(data_generation, observed_at, reason)
+                 VALUES ('legacy-generation', 1_800_000_060, 'fixture')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO recorder_gap_ledger(data_generation, observed_at, reason)
+                 VALUES ('invalid-timestamp', 0, 'fixture')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let opened = UsageStore::open_partitioned(&path, &identity).unwrap();
+        assert_eq!(opened.load_all().unwrap().len(), 1);
+        let recorded_count: i64 = opened
+            .connection
+            .query_row("SELECT COUNT(*) FROM recorded_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(recorded_count, 1);
+        let migrated = opened.load_recorder_gaps().unwrap();
+        assert_eq!(migrated.len(), 2);
+        assert!(migrated.iter().all(|gap| gap.state == "rejected"));
+        assert!(migrated
+            .iter()
+            .all(|gap| gap.reason == "auth_epoch_tombstoned"));
+        assert!(migrated.iter().all(|gap| gap.reset_at.is_some()));
+        assert!(migrated.iter().any(|gap| gap.start_at == 1));
+        assert!(migrated.iter().any(|gap| gap.start_at == 1_800_000_060));
+        remove_database(&path);
     }
 
     #[test]
@@ -2990,6 +4326,33 @@ mod tests {
             })
             .unwrap();
         assert_eq!(committed, 1);
+        let replayed = store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at,
+                window_seconds: 604_800,
+                collector_epoch: 0x1234,
+                cycle_seq: 1,
+                samples: &[sample(1_800_000_000, reset_at, Some(50.0), 3.0)],
+                checkpoints: std::slice::from_ref(&checkpoint),
+                ranges: std::slice::from_ref(&range),
+                model_totals: &[SessionModelTotal {
+                    model: "SOL".into(),
+                    total_tokens: 20,
+                    input_tokens: 12,
+                    cached_input_tokens: 2,
+                    output_tokens: 8,
+                }],
+                recorded_sessions: std::slice::from_ref(&source),
+            })
+            .unwrap();
+        assert_eq!(replayed, committed);
+        assert_eq!(
+            store
+                .load_session_collection_state()
+                .unwrap()
+                .data_generation,
+            committed
+        );
         assert!(store.recorded_session_matches(&source).unwrap());
 
         let mut overlapping_checkpoint = checkpoint.clone();

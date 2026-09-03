@@ -73,6 +73,25 @@ impl Language {
         }
     }
 
+    /// Localized help for the installed Linux launcher.  The launcher and the
+    /// raw payload intentionally expose different option sets; `run.sh` asks
+    /// the installed payload for this catalog instead of duplicating product
+    /// copy in shell.
+    pub const fn launcher_help(self) -> &'static str {
+        match self {
+            Self::Japanese => "使用法: codex-info [--start | --ui | --stop | --disable-autostart | --remove | --status | --update | --help]\n\n  (引数なし), --start  stable版を確認し、管理対象daemonを有効化して起動\n  --ui               同じ確認後に管理対象daemonとX UIを起動\n  --stop             今回のbootではdaemonを停止（更新timerと次回bootは維持）\n  --disable-autostart daemonと更新timerを停止・無効化\n  --remove           unitを解除（導入済みprogramとprofile dataは保持）\n  --status           generation・owner・healthの整合を読取り専用で確認\n  --update           stable版の確認と更新を直ちに実行\n  --help             このヘルプを表示",
+            Self::English => "Usage: codex-info [--start | --ui | --stop | --disable-autostart | --remove | --status | --update | --help]\n\n  (no arguments), --start  check stable and enable/start the managed daemon\n  --ui                     start the verified managed daemon and X UI\n  --stop                   stop the daemon for this boot; keep updates and next boot\n  --disable-autostart       stop and disable the daemon and update timer\n  --remove                 detach units; keep the installed program and profile data\n  --status                 read-only generation, owner, and health consistency check\n  --update                 check stable and update immediately\n  --help                   show this help",
+            Self::SimplifiedChinese => "用法: codex-info [--start | --ui | --stop | --disable-autostart | --remove | --status | --update | --help]\n\n  （无参数）, --start     检查stable版并启用、启动受管理daemon\n  --ui                   经同样检查后启动受管理daemon和X UI\n  --stop                 本次boot停止daemon；保留更新timer和下次boot\n  --disable-autostart     停止并禁用daemon和更新timer\n  --remove               移除unit；保留已安装程序和profile data\n  --status               只读检查generation、owner和health一致性\n  --update               立即检查stable版并更新\n  --help                 显示此帮助",
+            Self::Korean => "사용법: codex-info [--start | --ui | --stop | --disable-autostart | --remove | --status | --update | --help]\n\n  (인수 없음), --start   stable 버전을 확인하고 관리 daemon을 활성화·시작\n  --ui                   같은 확인 후 관리 daemon과 X UI 시작\n  --stop                 이번 boot에서 daemon 중지; 업데이트 timer와 다음 boot 유지\n  --disable-autostart     daemon과 업데이트 timer 중지·비활성화\n  --remove               unit 제거; 설치된 프로그램과 profile data 유지\n  --status               generation, owner, health 일치 여부를 읽기 전용으로 확인\n  --update               stable 버전 확인과 업데이트를 즉시 실행\n  --help                 이 도움말 표시",
+            Self::Spanish => "Uso: codex-info [--start | --ui | --stop | --disable-autostart | --remove | --status | --update | --help]\n\n  (sin argumentos), --start comprobar stable y activar/iniciar el daemon gestionado\n  --ui                         iniciar el daemon verificado y la X UI\n  --stop                       detener el daemon en este arranque; conservar actualizaciones y próximo arranque\n  --disable-autostart           detener y desactivar el daemon y el temporizador de actualización\n  --remove                     retirar las unidades; conservar programa instalado y datos del perfil\n  --status                     comprobar en modo lectura la coherencia de generation, owner y health\n  --update                     comprobar stable y actualizar ahora\n  --help                       mostrar esta ayuda",
+            Self::French => "Usage : codex-info [--start | --ui | --stop | --disable-autostart | --remove | --status | --update | --help]\n\n  (sans argument), --start vérifier stable et activer/démarrer le daemon géré\n  --ui                      démarrer le daemon vérifié et la X UI\n  --stop                    arrêter le daemon pour ce démarrage ; conserver mises à jour et prochain démarrage\n  --disable-autostart        arrêter et désactiver le daemon et le minuteur de mise à jour\n  --remove                  retirer les unités ; conserver le programme installé et les données du profil\n  --status                  vérifier en lecture seule la cohérence generation, owner et health\n  --update                  vérifier stable et mettre à jour immédiatement\n  --help                    afficher cette aide",
+            Self::German => "Aufruf: codex-info [--start | --ui | --stop | --disable-autostart | --remove | --status | --update | --help]\n\n  (keine Argumente), --start stable prüfen und verwalteten Daemon aktivieren/starten\n  --ui                       geprüften Daemon und X UI starten\n  --stop                     Daemon für diesen Boot stoppen; Updates und nächsten Boot beibehalten\n  --disable-autostart         Daemon und Update-Timer stoppen/deaktivieren\n  --remove                   Units entfernen; installiertes Programm und Profildaten behalten\n  --status                   Konsistenz von generation, owner und health schreibgeschützt prüfen\n  --update                   stable prüfen und sofort aktualisieren\n  --help                     diese Hilfe anzeigen",
+            Self::Portuguese => "Uso: codex-info [--start | --ui | --stop | --disable-autostart | --remove | --status | --update | --help]\n\n  (sem argumentos), --start verificar stable e ativar/iniciar o daemon gerido\n  --ui                       iniciar o daemon verificado e a X UI\n  --stop                     parar o daemon neste boot; manter atualizações e próximo boot\n  --disable-autostart         parar e desativar o daemon e o timer de atualização\n  --remove                   remover as units; manter programa instalado e dados do perfil\n  --status                   verificar em modo somente leitura generation, owner e health\n  --update                   verificar stable e atualizar imediatamente\n  --help                     mostrar esta ajuda",
+            Self::Italian => "Uso: codex-info [--start | --ui | --stop | --disable-autostart | --remove | --status | --update | --help]\n\n  (nessun argomento), --start controlla stable e abilita/avvia il daemon gestito\n  --ui                          avvia il daemon verificato e la X UI\n  --stop                        arresta il daemon per questo boot; mantiene aggiornamenti e boot successivo\n  --disable-autostart            arresta e disabilita il daemon e il timer di aggiornamento\n  --remove                      rimuove le unit; mantiene programma installato e dati del profilo\n  --status                      controlla in sola lettura generation, owner e health\n  --update                      controlla stable e aggiorna subito\n  --help                        mostra questo aiuto",
+            Self::Russian => "Использование: codex-info [--start | --ui | --stop | --disable-autostart | --remove | --status | --update | --help]\n\n  (без аргументов), --start проверить stable и включить/запустить управляемый daemon\n  --ui                       запустить проверенный daemon и X UI\n  --stop                     остановить daemon до следующего boot; сохранить обновления\n  --disable-autostart         остановить и отключить daemon и timer обновлений\n  --remove                   удалить units; сохранить программу и данные профиля\n  --status                   только проверить согласованность generation, owner и health\n  --update                   немедленно проверить stable и обновиться\n  --help                     показать эту справку",
+        }
+    }
+
     fn from_primary(primary: &str) -> Option<Self> {
         Some(match primary {
             "ja" => Self::Japanese,
@@ -1986,6 +2005,30 @@ mod tests {
                 );
             }
             assert!(!help.trim().is_empty(), "{}", language.code());
+
+            let launcher_help = language.launcher_help();
+            for option in [
+                "--start",
+                "--ui",
+                "--stop",
+                "--disable-autostart",
+                "--remove",
+                "--status",
+                "--update",
+                "--help",
+            ] {
+                assert!(
+                    launcher_help.contains(option),
+                    "installed launcher help omitted {option} for {}",
+                    language.code()
+                );
+            }
+            assert!(
+                !launcher_help.contains("--port"),
+                "payload-only --port leaked into installed launcher help for {}",
+                language.code()
+            );
+            assert!(!launcher_help.trim().is_empty(), "{}", language.code());
         }
     }
 

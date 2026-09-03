@@ -5,28 +5,29 @@
 
 ## 起動構成
 
-同一release binary `codex_info`は、次の公開操作だけを提供する。
+通常運用はinstalled launcher `$HOME/.local/bin/codex-info`だけを使う。launcherは起動前に固定Releaseと
+local generationを同じresolverで照合し、検証済みのmanaged serviceへ収束してから操作を完了する。
 
-| モード | command | 常駐所有者 |
+| 操作 | command | 結果 |
 | --- | --- | --- |
-| daemon+REST | `codex_info` または `codex_info --port PORT` | Windowを生成せず、1 processがrecorder workerとloopback RESTを所有 |
-| daemon+REST+X UI | `codex_info --ui` | healthyな既存serviceを再利用。なければserviceを1つ起動してX UIを追加 |
-| 停止 | `codex_info --stop` | 同じprofileの検証済みlock ownerだけへTERMを送り、lock解放を待つ |
-| ヘルプ | `codex_info --help` | daemon/REST/UIを起動せず、locale別の契約を表示 |
+| daemon開始 | `codex-info` または `codex-info --start` | reconcile後、main serviceを有効化・起動 |
+| Linux UI | `codex-info --ui` | reconcile後、同じgenerationのpayload UIを実行 |
+| 即時更新 | `codex-info --update` | timerを待たず同じresolverを1回実行 |
+| 整合確認 | `codex-info --status` | version/source/manifest、systemd owner、lock、socket、healthの完全tupleをread-only確認 |
+| 今回のbootだけ停止 | `codex-info --stop` | main serviceだけ停止。timerと次回bootの自動起動は維持 |
+| 自動起動も停止 | `codex-info --disable-autostart` | main serviceとupdate timerを停止・無効化 |
+| unit解除 | `codex-info --remove` | main/update unitを解除し、programとprofile dataは保持 |
+| ヘルプ | `codex-info --help` | 状態を変更せず操作一覧を表示 |
 
-`--port`はnumeric portだけを受理し、待受アドレスは`127.0.0.1`に固定する。
-引数なしは常にWindowを生成しないdaemon+REST modeである。待受addressは指定できず、常に`127.0.0.1`である。
-`--help`/`--h`/`-h`は起動せず、環境のロケールに応じたモード一覧を表示する。
-
-bundleから導入したbinaryを直接起動する場合は、同じ引数を`$HOME/.local/bin/codex_info`へ渡す。
+installed launcherへ`--port`、未知・重複・混在した引数を渡すと、service、filesystem、DBを変更する前に失敗する。
+待受はmanaged serviceの`127.0.0.1:8787`に固定する。`codex_info --port PORT`等のraw payload CLIは
+service・開発・E2E用であり、顧客の起動・停止・更新authorityではない。
 
 ```bash
-"$HOME/.local/bin/codex_info"
-"$HOME/.local/bin/codex_info" --port 9876
-"$HOME/.local/bin/codex_info" --ui
-"$HOME/.local/bin/codex_info" --ui --port 9876
-"$HOME/.local/bin/codex_info" --stop
-"$HOME/.local/bin/codex_info" --help
+"$HOME/.local/bin/codex-info" --start
+"$HOME/.local/bin/codex-info" --ui
+"$HOME/.local/bin/codex-info" --status
+"$HOME/.local/bin/codex-info" --help
 ```
 
 ## Linux bundleの導入とuser-systemd
@@ -35,7 +36,8 @@ bundleから導入したbinaryを直接起動する場合は、同じ引数を`$
 Release全体は次のWindows 2 assetとLinux 3 assetのexact 5 assetだけを持つ必要がある。
 `CodexInfo.WindowsClient.Setup.exe`、`CodexInfo.WindowsClient.update.json`、
 `x86_64-unknown-linux-gnu` archive、対応する`.sha256` checksum、対応する`*.manifest.json`である。
-draft、prerelease、partial、extra、malformed Release、導入済みversion以下のReleaseは使わない。
+draft、prerelease、partial、extra、malformed Release、導入済みversionより古いReleaseは使わない。
+同versionはinstalled generationが完全ならno-op、不整合なら同じRelease assetによるverified repairだけに使う。
 導入対象はmanifestの実測`glibc_minimum`以上のglibcを持つ環境だけとし、他のdistribution/architecture、
 署名済み、publisher検証済みとは表明しない。
 導入には`bash`、`tar`、`sha256sum`、`python3`、`curl`、`flock`、user-systemd（`systemctl --user`）が必要である。
@@ -71,49 +73,75 @@ bash "$bundle_dir/extracted/install.sh" \
     --sha256 "$bundle_dir/$checksum"
 ```
 
-bundle内のscriptはrelease binaryを`$HOME/.local/bin/codex_info`へ置き、installerを
-`$HOME/.local/libexec/codex-info-install.sh`へ永続化し、installed manifestを
-`$HOME/.local/share/codex-info/manifest.json`へ置く。さらに
-`codex-info.service`、`codex-info-update.service`、`codex-info-update.timer`を配置する。
-`codex-info.service`を有効化・再起動し、update timerはboot時と毎日1回、固定repository
-`salty919/codex_info_v2`の公開Releaseだけを確認する。導入後は元の展開ディレクトリやrepositoryを必要としない。
+bundle内の`run.sh`はrepository版とbyte-identicalなruntime launcherで、Cargo buildを行わない。installerは
+`$HOME/.local/share/codex-info/generations/<version>-<source_sha>-<manifest_sha256>/`へ検証済みregular fileを置き、
+atomicな`current` symlinkからlauncher `$HOME/.local/bin/codex-info`、payload
+`$HOME/.local/bin/codex_info`、persistent installer `$HOME/.local/libexec/codex-info-install.sh`、manifest
+`$HOME/.local/share/codex-info/manifest.json`、
+`codex-info.service`、`codex-info-update.service`、`codex-info-update.timer`を参照させる。
+導入後は元の展開directory、repository、Cargo、`target/`を必要としない。
 
-### statusとhealth
+generation/current導入前の1.0.25以前のflat配置から更新する場合も、旧manifestとそのbinary、installer、3 unitが
+記録済みsize/SHA-256、固定path、owner/modeへ完全一致する場合だけbootstrapする。最初の更新中に新serviceが
+起動しても同じinstall lockを待たず、lock解放後の最初のlauncher/startup/timer操作で同じ公開Release archiveを
+再検証してgeneration配置へ一方向移行する。旧fileが不明・変更済みならrepository buildで埋めず`SAFE_BLOCKED`とする。
 
-```bash
-systemctl --user status codex-info.service --no-pager
-curl --fail http://127.0.0.1:8787/v1/health
-```
-
-`health`の応答versionがReleaseの`X.Y.Z`と一致しない場合は利用を開始せず、導入をやり直す。
-
-### 自動更新と手動確認
-
-timerは導入済みversionより新しいstableなReleaseだけを候補にし、exact 5 assetのidentity、checksum、manifest、
-archive contentを検証してから既存のatomic install、service restart、health確認へ進む。新版がない、draft/prerelease、
-partial、extra、malformed、identity不一致、検証失敗、service切替失敗、health不一致のいずれでもインストール状態を
-変更せず、途中fileを残さない。切替後のhealth失敗を含む更新失敗時は旧binary、旧unit、
-`$HOME/.local/libexec/codex-info-install.sh`、profile dataへrollbackする。
-
-今すぐ確認する場合は次を実行する。
+既に導入済みの旧flat版自身が持つ日次timerは、新版を取得する前には遡及して短縮できない。その1回限りの
+bootstrapは、上記の新版bundleを手動導入する方法を優先する。特にmanaged serviceがinactiveで旧unmanaged
+listenerだけが残る既知障害状態では、変更不能な旧updaterを再実行せず、新版bundleのinstallerを直接使う。
+旧managed serviceが正常またはlistener不在で、旧版のpersistent updaterから取得する場合だけ、
+新版Release公開後に次を1回実行する。同じ入力の失敗を反復せず、journalを確認する。
 
 ```bash
 systemctl --user start codex-info-update.service
 systemctl --user status codex-info-update.service --no-pager
+"$HOME/.local/libexec/codex-info-install.sh" --update
+"$HOME/.local/bin/codex-info" --status
+```
+
+1行目は旧flat版から新版を取得するbootstrap例外、3行目は取得済みの新版installerでgeneration配置へ収束する操作である。
+移行後の通常操作ではraw `systemctl`を使わずinstalled launcherを使う。
+
+### statusとhealth
+
+```bash
+"$HOME/.local/bin/codex-info" --status
+```
+
+`--status`はmanifestと全installed member、systemd MainPID、process starttime/executable、
+profile lock、port 8787のsocket FD、前後healthが同じgenerationへ結合する場合だけ成功する。
+PID、listener、health 200、version文字列のいずれかだけでは成功しない。
+
+### 自動更新と手動確認
+
+timerは導入5分後に開始し、その後は1時間ごと（accuracy 1秒）に固定repositoryを確認する。
+launcher起動、serviceの`ExecStartPre`、timer、手動更新は同じresolverを使うため、停止中に公開された新版も
+次の起動時に確認する。highest stable exact-five Releaseへだけ進み、downgradeしない。同versionでもlocal memberが
+manifestと不一致ならverified repairする。新版なし・同一でlocalが完全ならno-opでmanaged healthy状態を再確認する。
+
+今すぐ確認する場合は次を実行する。
+
+```bash
+"$HOME/.local/bin/codex-info" --update
+"$HOME/.local/bin/codex-info" --status
 systemctl --user status codex-info-update.timer --no-pager
 journalctl --user -u codex-info-update.service --no-pager
 ```
 
-最後のコマンドで更新確認、候補拒否、適用、rollbackの結果を確認できる。journalへ秘密やraw responseは記録しない。
+更新全体は20分、launcher/startupは20分30秒以内に必ずterminalになる。検証済み新版をmanaged+healthyにするか、
+検証済み旧版をmanaged+healthyへ戻した場合だけ完了である。unknown/foreign/malformed listener/lockは停止せず、
+30秒以内に明示的`SAFE_BLOCKED`となる。この状態は成功ではないが、次のmanual/startup/timer実行を妨げない。
+journalにはboundedな更新結果だけを記録し、秘密やraw responseを記録しない。
 
 ## daemon自動起動・自動更新から外す
 
 ```bash
-bash "$bundle_dir/extracted/install.sh" --remove
+"$HOME/.local/bin/codex-info" --disable-autostart
+"$HOME/.local/bin/codex-info" --remove
 ```
 
-この操作は`codex-info.service`と`codex-info-update.service`/`.timer`を停止・無効化し、unit fileを削除する。
-導入binary、`$HOME/.local/libexec/codex-info-install.sh`、installed manifest、profile dataと次のデータは削除しない。
+`--disable-autostart`はunitを残したままmain serviceとtimerを停止・無効化する。`--remove`はmain/update unitだけを
+解除する。どちらもinstalled generation、launcher、persistent installer、manifest、profile dataと次のデータは削除しない。
 
 - legacy `history/usage_history.sqlite3`（read-only保持対象）
 - account別`history/accounts/v1/<opaque-account-scope>/epoch-<storage-epoch>/usage_history.sqlite3`
@@ -132,14 +160,14 @@ account切替直後は、既存Sessionを現在EOFへbaselineしてから新し�
 ## 停止と確認
 
 ```bash
-"$HOME/.local/bin/codex_info" --stop
-systemctl --user stop codex-info.service
-systemctl --user is-active codex-info.service
-curl --max-time 1 http://127.0.0.1:8787/v1/health
+"$HOME/.local/bin/codex-info" --stop
+"$HOME/.local/bin/codex-info" --status
 ```
 
-正常停止ではREST listenerを閉じ、recorder workerを停止し、singleton lockを解放する。
-停止中の未取得値を推測・補間せず、既存DBとlast-good値を保持する。
+`--stop`は同一bootの停止意図をowner-only control stateへ記録し、main serviceだけを停止する。timerとenable状態は
+維持され、次回bootは再びrunningをdesired stateとする。raw `systemctl --user stop`は永続的な製品停止意図ではなく、
+次のupdateでmanaged runningへ正規化され得る。停止中の未取得quota/残量を推測・補間せず、既存DBとlast-good値を保持する。
+再開後はverified Session rangeだけをbounded backfillし、回収不能区間だけをconfirmed gapとして公開する。
 
 ## Windowsクライアント
 
