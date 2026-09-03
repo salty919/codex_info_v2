@@ -6761,6 +6761,23 @@ impl CodexInfoState {
     }
 
     fn usage_ready(&self) -> bool {
+        let complete_usage =
+            self.has_usage && self.usage_snapshot_committed && !self.local_usage_pending;
+        if !complete_usage {
+            return false;
+        }
+        // Preview data is an explicit presentation fixture. A service client
+        // instead receives its display authority from one strictly validated
+        // immutable details response and its published-pair header. Neither
+        // process owns the resident writer's private account/commit identity.
+        if self.preview || self.service_published_pair.is_some() {
+            return true;
+        }
+
+        // The resident producer may publish local usage only after its own
+        // account-partition transaction has been acknowledged. This private
+        // proof never crosses the REST boundary; clients trust the complete
+        // published root above rather than inventing a second wire identity.
         let recorder_commit_current =
             self.acknowledged_recorder_commit
                 .as_ref()
@@ -6779,19 +6796,7 @@ impl CodexInfoState {
                         && now.saturating_sub(commit.last_commit_unix)
                             <= daemon::RECORDER_LAST_COMMIT_MAX_AGE_SECS
                 });
-        // Existing in-process presentation fixtures predate the resident
-        // writer acknowledgement and intentionally model an already durable
-        // snapshot.  Keep that test-only oracle while production/public
-        // service state remains gated by the real acknowledgement above.
-        #[cfg(test)]
-        let recorder_commit_current = recorder_commit_current
-            || (self.acknowledged_recorder_commit.is_none()
-                && self.authenticated
-                && self.usage_snapshot_committed);
-        self.has_usage
-            && self.usage_snapshot_committed
-            && recorder_commit_current
-            && !self.local_usage_pending
+        recorder_commit_current
     }
 
     fn has_visible_usage(&self) -> bool {
