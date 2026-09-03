@@ -21,9 +21,9 @@
 - 定期的なquota再取得は不完全な中間結果であり、次のローカル使用量取得が完了するまで前回コミット済みのモデル・履歴・thread表示を保持する。認証主体の変更または明示的なログアウト以外で、主画面を空の初期状態へ戻してはならない。
 - 最小viewport、対応locale、keyboard、UIA、高contrast、text scaleで主要操作を失わない。root scrollで欠落を隠さない。
 - Back、Close、Escape、再入、遅延callbackは世代tokenで一度だけ処理する。古いPID/HWND/generationへfocus、message、route変更を行わない。
-- 起動モードは固定する。引数なし/`--port PORT`はdaemon+RESTのみ、`--ui`はdaemon+REST+X UI、`--ui --port PORT`は指定ポートで同じ動作をする。待受アドレスは常に127.0.0.1へ固定する。
-- `--stop`は同一profileの完全に検証できたlock ownerだけへTERMを1回送り、lock解放を最大5秒待つ。lockが無ければ成功とし、lockがあるのにowner identityを証明できない場合、別ownerへの交代、timeout、signal失敗は何も削除せず失敗する。SIGKILLへ昇格しない。
-- 公開引数は上記、`--stop`、`--help`/`--h`/`-h`だけとする。旧・未知・誤記・重複・欠落・逆順・余分な引数、範囲外portを、daemon、REST、UI、DB、lockを作る前に拒否する。
+- 顧客向けLinux入口はinstalled launcher `$HOME/.local/bin/codex-info`一つとする。引数なし/`--start`は更新収束後にmanaged daemonを有効化・起動する。`--ui`は同じ収束後の検証済みinstalled payloadを実行し、local generation/payload identityが完全だがservice/details接続だけが失敗した場合もX UIの失敗状態と再試行手段を表示する。generation不整合またはforeign/unknown ownerの`SAFE_BLOCKED`ではpayload UIを実行しない。`--stop`は同一bootだけ有効な停止意図を記録してmain serviceだけを停止し、timerと次回bootの自動起動を維持する。`--disable-autostart`はmain serviceとupdate timerを停止・無効化し、`--remove`はその両unitを解除する。`--status`はread-onlyの完全identityを表示し整合時だけ成功、`--update`は同じ更新authorityを即時実行、`--help`は副作用なしとする。
+- installed launcherは未知・混在・重複引数と`--port`をmutation前に拒否する。service・開発・E2Eが直接使うpayload `codex_info`のCLIは、引数なし/`--port PORT`のdaemon+REST、`--ui`/`--ui --port PORT`、検証済みownerだけを停止する`--stop`、`--help`/`--h`/`-h`に限定し、待受アドレスを常に127.0.0.1へ固定する。payloadの`--stop`はSIGKILLへ昇格せず、lock identityを証明できない場合は何もsignal・削除しない。
+- repositoryの`run.sh`はarchive内の`run.sh`とbyte-identicalなruntime launcherであり、installed launcherへ委譲するだけとする。Cargo build、`target/`、source tree、別binaryへのfallbackを行わない。
 - CLIヘルプを含む利用者向け固定メッセージは、画面本体と同じ対応localeのi18nカタログから導出する。起動スクリプトへ単一言語の製品文言を複製しない。
 
 ## 3. 収集・API・live判定
@@ -34,7 +34,7 @@
 - RESTはread-onlyである。未知route/method、不正header/schema、oversize requestからDB、settings、cursor、processを変更しない。
 - GUIなしserverはwindow、Slint component、display backendを生成せず、明示したservice lifecycleで起動・停止・復旧する。
 - resident serviceは一つの完全candidateからimmutable details generationを公開する。Linux / WindowsのMain、Graph、Threadsはstrict validation済みの単一`GET /v1/details` generationだけをatomic表示rootとして消費し、SQLite/JSONL/app-serverの再収集、値の再計算、複数row/endpointのmergeを行わない。公開するread-only endpointはreadiness用`GET /v1/health`と表示正本`GET /v1/details`だけとする。
-- `GET /v1/health`の200はresident serviceがread-only snapshot requestを受理できるreadinessと、Cargo/Windowsの単一authorityから導出したstable product versionを表す。Linux launcherは同一profileの旧version ownerを既存の検証済みlock/pidfd契約で停止してcurrent binaryへ一度だけ交代し、導入済みsystemd binaryもcurrent buildへ同期する。Linux / Windows clientは自身と異なるversion、version欠落、unknown healthをdetails読取りへ進めず、旧serviceのlast-goodをcurrent表示にしない。認証済み、data `state=ready`、最新収集成功を意味しない。認証開始・確認はcontrol-onlyであり、control応答を表示dataとしてcommitせず、その後に受理した新しいdetails generationだけが画面を変えられる。
+- `GET /v1/health`の200はresident serviceがread-only snapshot requestを受理できるreadinessと、Cargo/Windowsの単一authorityから導出したstable product versionを表す。Linux launcherはsystemd `MainPID`、process starttime、実行fileのdevice/inode/SHA-256、profile lock identity、port 8787のsocket inodeとそのPIDのFD対応をhealth取得の前後で同一と確認し、manifestのsource generationへ結合する。PID、listener、health body、versionのいずれか単独ではcurrent ownerと判定しない。既知の旧Codex Info ownerだけを一度交代し、unknown・foreign・malformed ownerはsignalせず30秒以内に`SAFE_BLOCKED`とする。Linux / Windows clientは自身と異なるversion、version欠落、unknown healthをdetails読取りへ進めず、旧serviceのlast-goodをcurrent表示にしない。認証済み、data `state=ready`、最新収集成功を意味しない。認証開始・確認はcontrol-onlyであり、control応答を表示dataとしてcommitせず、その後に受理した新しいdetails generationだけが画面を変えられる。
 
 ## 4. データ保護
 
@@ -53,28 +53,17 @@
 
 ## 5. Linux bundle導入・自動更新・削除
 
-- Linux bundleは`codex_info`、`codex-info.service`、`install.sh`、
-  `codex-info-update.service`、`codex-info-update.timer`、license/notice、version/target情報を含む。
-  install後は検証済み`install.sh`を永続installer `$HOME/.local/libexec/codex-info-install.sh`へ置き、
-  元の展開ディレクトリやrepositoryに依存せず、user-systemd timerがboot時と毎日1回、
-  固定repository `salty919/codex_info_v2` の公開Releaseだけを確認する。
-- 更新候補は、導入済みversionより新しいstableな`windows-vX.Y.Z` Releaseで、次のexact 5 assetが同一Releaseへ
-  同居するものだけを受理する。`CodexInfo.WindowsClient.Setup.exe`、
-  `CodexInfo.WindowsClient.update.json`、`codex-info-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz`、
-  対応する`.sha256`、および対応する`.manifest.json`である。新版がない場合は何も変更しない。
-- draft、prerelease、partial、extra asset、malformed Release、version/tag/asset identityまたはHTTPS GitHub asset redirect境界の不一致は、
-  download後を含めてcandidateを拒否し、filesystem、binary、unit、profile dataへmutationを行わない。
-  Linux archiveは既存のchecksum、manifest、archive content検証をすべて通過してからinstallへ進める。
-- 検証済みcandidateだけを既存のatomic install、`codex-info.service`再起動、loopback health確認へ渡す。
-  install、service切替、healthのいずれかが失敗した場合は旧binary、旧unit、永続installer、profile dataをcurrentとして
-  保持し、部分導入を成功と表示しない。更新処理の結果はuser journalへ記録し、秘密やraw responseを記録しない。
-- install、update、removeは同じuser lockで直列化し、競合する操作はfilesystem/unitを変更する前に失敗させる。
-- 利用者の明示操作による即時確認は`systemctl --user start codex-info-update.service`で行える。
-  実行状態は`systemctl --user status codex-info-update.service --no-pager`、timerの次回時刻は
-  `systemctl --user status codex-info-update.timer --no-pager`、結果と失敗理由は
-  `journalctl --user -u codex-info-update.service --no-pager`で確認できる。
-- `install.sh --remove`は`codex-info.service`と`codex-info-update.service`/`.timer`を停止・無効化しunitを解除するが、
-  導入binary、`$HOME/.local/libexec/codex-info-install.sh`、profile data（履歴DB、verified backup、reset hint、Codex session JSONL、設定）は削除しない。
+- Linux bundleはbyte-identicalなruntime launcher `run.sh`、payload `codex_info`、`install.sh`、main/update serviceとtimer、license/notice、version/target情報を含む。外部manifestとarchive内manifestはbyte-identicalで、launcherを含む全regular memberのpath、mode、size、SHA-256を同じcandidate identityへ結合する。install後の固定入口はlauncher `$HOME/.local/bin/codex-info`、payload `$HOME/.local/bin/codex_info`、persistent installer `$HOME/.local/libexec/codex-info-install.sh`、manifest `$HOME/.local/share/codex-info/manifest.json`、unitは`$HOME/.config/systemd/user/`配下のexact 3名である。各固定入口はowner-onlyな`$HOME/.local/share/codex-info/generations/<version>-<source_sha>-<manifest_sha256>/`のregular fileをatomic `current` symlink経由で参照する。repository、Cargo、元bundle、`target/`へ依存しない。
+- manual、launcher startup、service `ExecStartPre`、timer、bootは一つのRelease resolver/installer authorityを使用する。timerは`OnActiveSec=5min`、`OnUnitActiveSec=1h`、`AccuracySec=1s`で、公開後の次回発見上限を1時間1秒とする。`codex-info.service`の起動前reconcileも同じauthorityを通るため、停止していたdaemonを新しく起動した場合に旧versionを無条件で開始しない。新版がなく同versionでも、local世代が不整合なら検証済みReleaseから修復する。
+- resolverは固定HTTPS API `https://api.github.com/repos/salty919/codex_info_v2/releases?per_page=100`の単一応答だけを読み、100件ならpagination曖昧として拒否する。非draft・非prereleaseでexact `windows-vSemVer`の最高stable Releaseを選び、`CodexInfo.WindowsClient.Setup.exe`、`CodexInfo.WindowsClient.update.json`、`codex-info-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz`、対応`.sha256`、対応`.manifest.json`のexact 5 asset、canonical URL、size、digestを検証する。導入済みversionより古いcandidateへdowngradeしない。同versionは外部manifest identityが一致すればno-op、不一致ならlocal coherenceのverified repairとして扱う。candidateがなくてもlocal世代が完全ならその旧世代を使用できるが、localも不完全なら`SAFE_BLOCKED`とする。
+- draft、prerelease、partial、extra asset、malformed Release、version/tag/asset identity、size/digest、HTTPS GitHub asset redirect境界の不一致はcandidateを拒否する。redirectは最大3回でAPI/repository Release asset境界だけを許可し、Release取得30秒、各asset取得300秒、更新全体20分を上限とする。archiveはchecksum、external/internal manifest同一性、全member名・mode・size・digestを完全検証するまでinstallation stateを変更しない。
+- installはowner-onlyな`.install.lock`をnonblockingで取得し、`install-transaction.json`へ各phaseをatomic write・file fsync・parent directory fsyncしてからlegacy退避、entrypoint link、candidate publish、`current` switch、activation、health確認へ進む。stale transactionは同じoperationを一意にresumeまたはrollbackしてから新operationを開始する。`current` switch後を含む失敗では旧generationへ戻し、旧serviceをsystemd管理下で復旧してから終了する。更新開始時に存在した使用可能な旧世代をunmanaged processとして残さない。
+- generation/current導入前の既知predecessor flat installは、旧manifestのexact schemaと記録済みpath/size/SHA-256、固定配置、owner/mode、同一sourceのbinary/installer/3 unitを全て再検証できる場合だけ一方向bootstrap入力にできる。旧installerがL1を保持したまま新serviceを最初に起動する区間は`ExecStartPre`が同じlockを待たず、検証済みflat payloadの起動を妨げない。lock解放後の最初のmanual/startup/timer/repository launcher操作は同Release archiveを取得・完全検証してgeneration/current/launcherへ移行し、旧flat状態をcompleted terminalにしない。検証不能なflat file、repository binary、`target/`、version文字列だけをbootstrapやrollbackへ使わない。
+- `desired_state=running`で完了したlauncher/startup/timer/update収束のterminal stateは、完全に検証した新世代がmanagedかつhealthyなA、または完全に検証した旧世代がmanagedかつhealthyなBのいずれかだけとする。`desired_state=stopped|disabled|removed`の操作は、対応するservice/timer/unit状態、listener不在、保持対象、local generation整合をread-backした場合だけ別の正常な非稼働terminalとする。unknown/foreign/malformed listenerまたはlockを安全に識別できない場合だけ、何も停止・上書きせず30秒以内に明示的`SAFE_BLOCKED`で終了できる。この安全例外を成功やA/Bへ読み替えず、次のmanual/startup/timer triggerを妨げない。manual/startupは20分30秒、control RPCは30秒、local validate/publishは60秒、stopは20秒、readinessは30秒、rollbackは60秒以内で必ずterminalになる。
+- installer/controlはL1 `.install.lock`だけ、resident runtimeはL2 profile recorder lockの後に必要な場合だけL3 account writer lockを取得する。installerはL2/L3を取得せず、serviceはL1を取得しない。systemd start/restartは`--no-block`で要求後にread-only pollする。これを唯一のlock順序として、launcher、startup、timer、removeのcycleを作らない。
+- `codex-info.service`はunexpected exitを`Restart=always`、`RestartSec=5s`、60秒中2回のstart limitで1回だけ自動復旧させ、2回目はfailed latchとする。launcherまたはupdateによる明示activationだけがresetして新epochを開始する。recorder workerは1秒ごとに監視し、2秒以内に死亡を検知する。admitted accountでは新規rowが0件でも各scheduled generationをtransaction commitし、commit確認後だけowner-only `recorder-state.json`の`last_commit_unix`を更新する。全write stateのheartbeat `updated_at_unix`とadmitted accountの`last_commit_unix`はfuture skewを拒否しfreshness上限150秒とする。account未確定時は`idle_no_account`とし、架空のpartition/commitを作らない。
+- recorderの最初の一時障害は同callbackでretryせず`degraded`へ進み、次のscheduled cycle（60秒以内）で一度だけ再試行する。2回目またはfatal errorは非0終了してsystemdへ復旧を委ねる。停止区間のSession usageだけは検証済みsource cursorからbounded backfillできるが、quota/残量を補間・複製しない。gapは`pending/recovered/confirmed/rejected`のledgerへ記録し、回収不能をsource identity/cursorで確定した`confirmed`だけを既存`history_gaps`へ公開する。
+- 利用者操作は`codex-info --update`、`codex-info --status`、`codex-info --stop`、`codex-info --disable-autostart`、`codex-info --remove`を使用する。raw `systemctl`は診断用で、直接stopは永続的な製品停止意図ではなく次の更新でmanaged runningへ正規化され得る。`--remove`はmain/update unitだけを停止・無効化・解除し、installed generation、launcher、installer、manifest、履歴DB、verified backup、reset hint、gap/recorder/control state、Codex session JSONL、設定を削除しない。
 
 ## 6. Windows導入・更新・削除
 
@@ -163,13 +152,13 @@
 - `windows-vX.Y.Z` ReleaseはSetupとmanifestを非公開Draftへuploadしてから公開する。途中失敗を公開済み成功へ変換しない。
 - Linux coreはtargetを`x86_64-unknown-linux-gnu`へ固定し、同じstable version・final source SHAのarchive、SHA-256 checksum、manifestを既存の`windows-vX.Y.Z` ReleaseへWindowsのSetup/manifestと同居させる。別Linux tag/channelを作らない。
 - Linux bundleの互換性は、bundle manifestに記録した実測`glibc_minimum`（glibc minimum）を満たすことだけを表明する。manifestのtargetまたは実測minimumが欠落・不一致なら候補を公開・導入せず、他のdistribution、architecture、署名済み、publisher検証済みの対応を表明しない。
-- Linux bundle archiveは`codex_info`、`codex-info.service`、永続化する`install.sh`、`codex-info-update.service`、`codex-info-update.timer`、license/noticeを含み、version/target情報と対応するchecksum/manifestを同じcandidate identityへ結び付ける。導入時は`install.sh`を`$HOME/.local/libexec/codex-info-install.sh`へ永続化する。顧客の通常導線はRelease assetのdownload、checksum検証、extract、bundle内scriptによるinstall、自動更新、service status、loopback `/v1/health`、removeだけで完結し、repository clone、Cargo build、`run.sh`を要求しない。
+- Linux bundle archiveはbyte-identicalなruntime launcher `run.sh`、`codex_info`、`codex-info.service`、永続化する`install.sh`、`codex-info-update.service`、`codex-info-update.timer`、license/noticeを含み、version/target情報と対応するchecksum/manifestを同じcandidate identityへ結び付ける。導入時は`run.sh`を`$HOME/.local/bin/codex-info`、`install.sh`を`$HOME/.local/libexec/codex-info-install.sh`からcurrent generationへ参照させる。顧客の通常導線はRelease assetのdownload、checksum検証、extract、bundle内scriptによるinstall、installed launcher、自動更新、source-bound health、removeだけで完結し、repository clone、Cargo build、source treeの`run.sh`を要求しない。
 - Linux bundleのinstall、update、reinstall、removeまたはその失敗は、導入binary、永続installer、履歴DB、verified backup、`history/usage_reset_hint.json`、Codex session JSONL、設定を削除しない。removeはdaemon/updateのuser service/unitだけを解除し、部分導入を成功と表示しない。
 - release artifactはsource、lockfile、実payload、license/notice、署名、version、対象platformを一つのrelease identityで追跡する。
 - publisher名、certificate、対応OS build、RPO/RTO、accessibility適合、support窓口を根拠なしに推測しない。
 - authority inputがないclaimは「保証なし」「未対応」とし、認証済み、対応済み、測定済みと表示しない。
 - recovery journalと顧客共有support bundleを分離する。support exportは明示操作、allowlist、owner-only ACL、秘密0を必須とし、自動送信しない。
-- customer guideとdeveloper READMEを分離し、顧客手順にrepository clone、Cargo build、`run.sh`を通常導線として要求しない。
+- customer guideとdeveloper READMEを分離し、顧客手順にrepository clone、Cargo build、source treeの`run.sh`を通常導線として要求しない。配布・導入済みruntime launcherは通常導線に含める。
 
 ### Workflowに残す確認の理由
 

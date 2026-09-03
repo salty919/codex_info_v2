@@ -33,6 +33,8 @@ LINUX_BACKEND_EXACT = frozenset(
         "scripts/record_daemon_e2e.sh",
         "scripts/build_linux_bundle.sh",
         "scripts/test_linux_bundle.sh",
+        "scripts/test_linux_update_convergence.sh",
+        "scripts/test_run_launcher_version_sync.sh",
     }
 )
 LINUX_UI_EXACT = frozenset(

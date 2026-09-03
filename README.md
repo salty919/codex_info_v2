@@ -13,7 +13,8 @@ Codex App ServerからChatGPT/Codexアカウントのレート制限と週次ま
 Release全体がWindows 2 assetとLinux 3 assetのexact 5 asset（`CodexInfo.WindowsClient.Setup.exe`、
 `CodexInfo.WindowsClient.update.json`、`x86_64-unknown-linux-gnu` archive、対応する`.sha256` checksum、
 対応する`*.manifest.json`）だけを持つことを確認してください。draft、prerelease、partial、extra、
-malformed Releaseや導入済みversion以下のReleaseは使いません。`X.Y.Z`はReleaseのversionへ置き換えてください。
+malformed Releaseや導入済みversionより古いReleaseは使いません。同versionはlocal generationのverified repairにだけ使います。
+`X.Y.Z`はReleaseのversionへ置き換えてください。
 
 ```bash
 version='X.Y.Z'
@@ -31,41 +32,42 @@ bash "$bundle_dir/extracted/install.sh" \
   --bundle "$bundle_dir/$asset" \
   --manifest "$bundle_dir/$manifest" \
   --sha256 "$bundle_dir/$checksum"
-systemctl --user status codex-info.service --no-pager
-curl --fail http://127.0.0.1:8787/v1/health
+"$HOME/.local/bin/codex-info" --status
+"$HOME/.local/bin/codex-info" --ui
 ```
 
 targetは`x86_64-unknown-linux-gnu`に固定です。互換性として表明するのはmanifestの実測
 `glibc_minimum`以上だけで、他のdistributionやarchitectureへの対応、署名済み、publisher検証済みとは表明しません。
-checksum、manifest、archive content、install、service切替、healthのいずれかが失敗した場合は利用を開始せず、
-既存のbinary/unit/profile dataを変更せずにReleaseからassetを再取得します。
+checksum、manifest、archive content、install、service切替、source-bound healthのいずれかが失敗した場合は利用を開始しません。
+既存世代が安全ならmanaged+healthyへrollbackし、local世代も安全でなければ明示的`SAFE_BLOCKED`になります。
 
-インストール後は検証済みのpersistent installer `$HOME/.local/libexec/codex-info-install.sh`と
-`$HOME/.local/share/codex-info/manifest.json`、`codex-info-update.service`/`codex-info-update.timer`も配置されます。
-timerはboot時と毎日1回、固定repository `salty919/codex_info_v2`の公開Releaseだけを確認します。
-導入済みversionより新しいstable Releaseで、上記exact 5 assetが同居する場合だけ、checksum・manifest・archive contentを
-検証した後に既存のatomic install、service restart、health確認を行います。新版がない、draft/prerelease、partial、extra、
-malformed、identity不一致、または検証・切替・health失敗の場合は何も変更せず、失敗時は旧versionへrollbackします。
+archiveにはrepository版とbyte-identicalな`run.sh`が入り、installed launcher
+`$HOME/.local/bin/codex-info`になります。このlauncherはCargo buildやrepository/`target` fallbackを行いません。
+検証済みgeneration、persistent installer、manifest、`codex-info-update.service`/`codex-info-update.timer`も配置されます。
+timerは導入5分後と以後1時間ごとに、固定repository `salty919/codex_info_v2`の公開Releaseだけを確認します。
+起動時と手動更新も同じresolverを使い、新版へ収束します。同versionでもlocal memberが壊れていればverified repairし、
+導入済みversionより古いReleaseへはdowngradeしません。
 
 更新を今すぐ確認する場合は、展開済みbundleやrepositoryを再取得せず、次を実行します。
 
 ```bash
-systemctl --user start codex-info-update.service
-systemctl --user status codex-info-update.service --no-pager
-systemctl --user status codex-info-update.timer --no-pager
+"$HOME/.local/bin/codex-info" --update
+"$HOME/.local/bin/codex-info" --status
 journalctl --user -u codex-info-update.service --no-pager
 ```
 
-自動起動・自動更新を外す場合は、展開済みbundleを残したまま次を実行します。
+今回のbootだけ停止する場合、自動起動も停止する場合、unitを解除する場合は次を使い分けます。
 
 ```bash
-bash "$bundle_dir/extracted/install.sh" --remove
+"$HOME/.local/bin/codex-info" --stop
+"$HOME/.local/bin/codex-info" --disable-autostart
+"$HOME/.local/bin/codex-info" --remove
 ```
 
-この解除は`codex-info.service`と更新service/timerを停止・無効化してunitを外しますが、導入binary、
-`$HOME/.local/libexec/codex-info-install.sh`、
-履歴DB、DB backup、reset hint、Codex session JSONL、設定は削除されません。
-公開起動契約は引数なし、`--ui`、`--port PORT`、`--ui --port PORT`、`--stop`、`--help`だけです。
+`--remove`もmain/update unitだけを外し、installed generation、launcher、installer、manifest、
+履歴DB、DB backup、reset hint、gap/recorder/control state、Codex session JSONL、設定は削除しません。
+launcherの公開操作は引数なし/`--start`、`--ui`、`--update`、`--status`、`--stop`、
+`--disable-autostart`、`--remove`、`--help`だけです。managed serviceのportは127.0.0.1:8787固定です。
 Linux / Windows UIは同じproduct versionのresident serviceだけを表示正本として受理します。
 
 初回起動時の画面内タイトルは`Codex Info`です。ネイティブタイトルバーは使わず、アプリ内では認証パネルが接続状態を案内します。
@@ -138,7 +140,7 @@ Linux / WSL 側でネイティブ画面を維持したまま、Windows クライ
 
 ## Windowサイズとプレビュー
 
-登録top-level surface inventoryはMain、Setup、Settings、Graph、Threads、Legalの正確な6個で、HelpはMain内surface（追加HWND=0）です。runtime open HWNDはMain=1＋open child subset 0..5、合計1..6で、各childはsingleton、5 childを全て開いた時だけ6となります。Main/Setup/Settings/Threads/Legalはlogical client `initial=min=max=900×480` fixed、Graphは`initial=940×640`、`min=700×480`、`max=unbounded`、resizableです。登録された6 surfaceはMinimize/Closeを持ち、native resize/maximize/restoreはGraphだけです。ネイティブタイトルバーは全Windowで無効にし、ボタン以外の画面領域をドラッグして移動できます。物理サイズはOSのDPI／拡大率に連動し、Graphの最大化／復元は現在モニターのwork areaへ適用します。状態別の確認には`CODEX_INFO_PREVIEW=initializing|auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle|legal`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はGraphの初期サイズを上書きするレイアウト検証用です。メイン画面の指定例は`CODEX_INFO_PREVIEW=normal "$HOME/.local/bin/codex_info" --ui`です。
+登録top-level surface inventoryはMain、Setup、Settings、Graph、Threads、Legalの正確な6個で、HelpはMain内surface（追加HWND=0）です。runtime open HWNDはMain=1＋open child subset 0..5、合計1..6で、各childはsingleton、5 childを全て開いた時だけ6となります。Main/Setup/Settings/Threads/Legalはlogical client `initial=min=max=900×480` fixed、Graphは`initial=940×640`、`min=700×480`、`max=unbounded`、resizableです。登録された6 surfaceはMinimize/Closeを持ち、native resize/maximize/restoreはGraphだけです。ネイティブタイトルバーは全Windowで無効にし、ボタン以外の画面領域をドラッグして移動できます。物理サイズはOSのDPI／拡大率に連動し、Graphの最大化／復元は現在モニターのwork areaへ適用します。状態別の開発確認には`CODEX_INFO_PREVIEW=initializing|auth|normal|warning|reset-warning|error|zero|full|monthly|unlimited|idle|legal`を使い、グラフ表示は`CODEX_INFO_PREVIEW=graph|graph-old`で確認できます。`CODEX_INFO_PREVIEW_SIZE`はGraphの初期サイズを上書きするレイアウト検証用です。source treeでの例は`CODEX_INFO_PREVIEW=normal cargo run --locked -- --ui`であり、顧客向けlauncher `run.sh`はbuildに使いません。
 
 ## UIを調整する場所
 

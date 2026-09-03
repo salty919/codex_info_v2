@@ -14,10 +14,10 @@ Codex Infoは、ChatGPT/Codexアカウントの利用枠、リセット時刻、
 
 ### Linux / WSL
 
-- 通常導入は[最新のstable Release](https://github.com/salty919/codex_info_v2/releases/latest)にあるLinux bundleを使います。repository clone、Cargo build、`run.sh`は必要ありません。
+- 通常導入は[最新のstable Release](https://github.com/salty919/codex_info_v2/releases/latest)にあるLinux bundleを使います。repository cloneとCargo buildは不要です。bundle内の`run.sh`は導入後のinstalled launcherと同じruntime入口です。
 - bundleは`codex_info`、`codex-info.service`、installer、更新service/timer、license/noticeを含みます。
 - 引数なしではdaemon+REST、`--ui`では同じserviceを利用するX Window UIを起動します。
-- user-systemdの更新timerがboot時と毎日1回、新しいstable Releaseを確認します。検証や切替に失敗した場合は既存の導入状態とprofile dataを保持します。
+- user-systemdの更新timerが導入5分後と以後1時間ごとに新しいstable Releaseを確認します。起動時と手動`--update`も同じresolverを実行し、検証や切替に失敗した場合は既存の導入状態とprofile dataを保持します。
 
 ### Windows
 

@@ -37,6 +37,11 @@ candidate schema valid
   同じprofile/accountでは現行leaseの単一publisherだけがsnapshotを置換できる。別server/collectorの
   stale lease、旧epoch、同一以下のCycleSeqはcomplete responseであってもno-opで、DB・memory・REST・UIを
   上書きしない。identity値は内部判定専用でUI/RESTへ追加表示しない。
+- installed serviceのlive ownerは、同一probe windowのsystemd MainPID、process starttime、executable
+  device/inode/SHA-256、profile lock、port 8787 socket inodeと同PID FD、health前後が同じmanifest source
+  generationへ結合する場合だけ成立する。PID、listener、health 200、version文字列のいずれか単独を
+  `SupervisorLeaseIdentity`またはmanaged ownerへ読み替えない。known旧Codex Info ownerだけを交代でき、
+  unknown/foreign/malformed ownerはsignalせず`SAFE_BLOCKED`とする。
 
 ## native収集とREST presentationの段階境界
 
@@ -72,6 +77,9 @@ presentationでは、accepted set内にnon-null `parent_thread_id`が存在し�
 | process | eligible workload停止/再起動でowner identityまたはactive path変化 | 再計算 | 同一新cycleの完全snapshotだけ。PID再利用は別identity | identity-before/after、restart tests |
 | process | Codex Info由来observer app-serverだけがpathをopen | REJECT | 0件。実利用として公開しない | 2 monitor process/2 observer child fixture |
 | concurrent | Codex Info/collector複数、stale lease/epoch/cycle | ADMISSION REJECT | 現行単一publisherだけがatomic置換し、他世代はno-op | lease identity、stale epoch/cycle、concurrent publisher tests |
+| installed owner | managed inactive＋healthy known unmanaged | RECONCILE | unmanaged ownerをexact identityで退役し、同generationのmanaged owner 1件だけを受理 | inactive-managed/unmanaged fixture |
+| installed owner | healthy foreign/unknown/malformed listenerまたはlock | SAFE_BLOCKED | signal・link・unit・DB mutation 0、成功表示0 | foreign PID/lock/socket identity fixture |
+| installed owner | health/version一致、source generation不一致またはprobe前後変化 | REJECT | current成功にせずold/newのverified managed terminalへ収束 | source/hash/TOCTOU fixture |
 | transport | RPC timeout/error/invalid envelope、候補の一部読取失敗 | FAIL-CLOSED | 旧thread snapshot保持、未確認表示（部分snapshotは公開しない） | RPC/error tests、`thread_c_snapshot_rejects_partial_candidate_reads` |
 | epoch | stale thread/local/account event | NO-OP | 現行世代不変 | `stale_thread_and_local_results_are_complete_no_ops` |
 | account identity | logout | HARD BOUNDARY | `auth_required`のstrict empty root。旧DB/Sessionは保持 | `public_snapshot_is_whitelisted_and_tracks_auth_state` |

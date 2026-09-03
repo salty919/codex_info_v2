@@ -58,12 +58,12 @@ Codex app-server / session JSONL / thread rollout
    現在の認証epoch・nonceに束縛されたauthenticated hintだけを受理し、未認証中の復旧値は公開しない。
 7. 同一障害中にlocal JSONL全走査やapp-server再起動を無限反復しない。通常の全走査はquota cycle、明示更新、または一度だけの障害復旧に限定する。
    fingerprint不変ならscan/writeは0、変化時も1 cycleにつき1 scan・1 transactionだけとする。
-8. collector全停止中の未取得データは後から捏造しない。常駐daemonとloopback RESTは
-   引数なしまたは`codex_info --port PORT`の同一processが所有し、同じcanonical DB profileの
-   `UsageStore`とsingleton recorder leaseを使う。引数なし/`--port PORT`はdaemon+RESTのみを起動する。
-   `--ui`はhealthyな既存serviceを再利用し、存在しない場合だけserviceを開始してX UIを追加する。
-   `--ui`は既存serviceを利用し、無ければserviceを開始してX UIを追加する。
-   systemd自動起動の解除はunitだけを停止・削除し、DB、backup、hint、source JSONL、binaryを保持する。
+8. collector全停止中の未取得データは後から捏造しない。installed profileではuser-systemdの
+   `codex-info.service`だけが常駐daemon、loopback REST、`UsageStore`、singleton recorder leaseを所有する。
+   顧客操作は`$HOME/.local/bin/codex-info`がmanaged serviceへ収束させ、`--ui`のpayloadを含む別processを
+   writer/REST ownerにしない。service/development/E2Eが直接使うpayloadの引数なし/`--port PORT`は同一processで
+   daemon+RESTを所有するが、installed launcherの更新・制御authorityではない。stop/disable/removeはDB、backup、
+   hint、gap/recorder/control state、source JSONL、installed generationを保持する。
 9. canonical DB profileごとに`MaintenanceOwner`を1つだけ許可する。起動時pruneの前に、writer admissionを止めた同一排他境界で
    SQLite online backupを3世代作成・検証する。backup失敗時はpruneを実行しない。検証失敗・writer競合時もpruneを実行しない。バックアップは`0600`、DBディレクトリは`0700`とする。
 10. 現行版は旧schemaを暗黙migrationしない。schema mismatchは拒否する（read/writeを拒否する）。将来migrationは別名DB、全行validate、件数/hash/期間境界比較、
@@ -87,7 +87,7 @@ Codex app-server / session JSONL / thread rollout
 | 障害 | 保持するもの | 破棄するもの | 再試行 |
 | --- | --- | --- | --- |
 | app-server/REST停止 | 既存のquota、履歴、thread、DB | 未取得の新規値 | 次の明示/周期要求。local backfillは障害期間1回 |
-| daemon unexpected exit / restart budget超過 | 直前の完全snapshot、DB、hint、source cursor、確定gap ledger | 停止区間の推測値、未検証の再起動candidate | supervisor検知後2秒以内に最大1回、以後はFailed latch。明示startまたはsystemd再activation |
+| daemon/recorder unexpected exit / restart budget超過 | 直前の完全snapshot、DB、hint、source cursor、gap ledger、last committed recorder state | 停止区間の推測quota、未検証の再起動candidate | worker死亡は2秒以内に検知し次cycleまでに1回だけ再試行。process exitはsystemdが5秒後に1回だけ再起動し、2回目はFailed latch。明示launcher/update activationでreset |
 | oversized/不正な1レコード | 同一ファイル内の前後の有効レコード | そのレコード | 次のcycleで再読込可能 |
 | ローカル履歴のEOF未完了レコード | 直前の完全snapshot、DB | 不完全レコードを含むローカル入力 | 次のcycle |
 | I/O、差替え、EOF以外の部分行、資源上限 | 直前の完全snapshot、DB | 失敗cycleの部分結果 | 次のcycle |
@@ -114,18 +114,43 @@ Codex app-server / session JSONL / thread rollout
 
 ### 4.1 RecorderSupervisor、lease、backfill、gap
 
-- supervisorの状態は`Absent → Starting → Running → StopRequested → Stopped`または`Failed`だけを進む。
-  unexpected exitはsupervisorが2秒以内に検知し、同一supervisor epochでは5秒backoff後の自動restartを1回だけ許可する。
-  2回目のunexpected exitまたはrestart失敗後は`Failed`へlatchし、無限restartを行わない。明示startまたはsystemdの新activationだけが新epochを開始する。
+- worker supervisorの状態は`Absent → Starting → Running → StopRequested → Stopped`または`Failed`だけを進む。
+  worker死亡は1秒probeで2秒以内に検知する。最初の一時障害は同callbackでretryせず`degraded`へ進み、次の
+  scheduled cycle（60秒以内）で1回だけ再試行する。2回目またはfatal errorはprocessを非0終了させる。
+  user-systemdは`Restart=always`、`RestartSec=5s`、`StartLimitIntervalSec=60s`、`StartLimitBurst=2`で
+  1回だけprocessを自動restartし、次の失敗でFailedへlatchする。明示launcher/update activationだけがlimitをresetする。
 - `codex-info.service`がinstalledならsystemdがdaemon+RESTのsupervisorである。service processは
-  `codex_info --port 8787`でrecorder leaseとREST listenerを同時に所有する。
-  引数なし/`--port PORT`はlease/listenerだけを取得し、`--ui`はhealthyな既存serviceへ
-  重複起動せずX UIを追加する（無ければ一つだけserviceを開始する）。
-  serviceへのexplicit stopだけがTERM、worker停止、listener停止、lease解放を順に行う。
+  verified current generationの`codex_info --port 8787`でrecorder leaseとREST listenerを同時に所有する。
+  serviceの`ExecStartPre`はpersistent installerのstartup reconcileをbounded実行する。active transaction journalが
+  switch後phaseならread-only検証して継続し、journalなしならL1 install lock下のshared resolverを使用するが、
+  startup modeは自分自身をrestartしない。launcher `--ui`はmanaged ownerへ収束後に別UI processを追加するだけである。
 - singletonのscopeは正規化canonical DB pathとprofileの組である。lease schemaは最大4KiBのUTF-8 JSON
   `recorder-lease-v1`（`pid`、`process_start`、`owner_nonce`、`canonical_db_path`、`device_or_volume_serial`、`file_index_or_inode`）とし、
   writer processは同じ`UsageStore`のtransaction/upsert契約を使う。通常のrecorder二重起動はlease前にno-op、競合試験だけが別の許可済みwriter processを使い、
   製品経路でleaseを無効化しない。
+- recorder状態はowner-only 0600の`recorder-state.json`へatomic writeし、schema
+  `codex-info-recorder-state-v1`、exact key
+  `schema,pid,process_starttime,owner_nonce,write_state,partition_id_hash,data_generation,collector_epoch,
+  cycle_seq,last_commit_unix,updated_at_unix`を持つ。`write_state`は
+  `idle_no_account|ready|degraded`だけである。lock/state遷移またはDB transactionのacknowledged commit後だけ
+  対応fieldを更新し、heartbeatからcommitを捏造しない。account admitted時は新規usage rowが0件でも各scheduled
+  generationをcommitし、`last_commit_unix` freshnessを150秒以内に保つ。全write stateのheartbeat
+  `updated_at_unix`もfuture skewを拒否し150秒以内に保つ。account未確定時は`idle_no_account`とし、
+  架空partition/commitを作らない。古いheartbeat、古いcommit、`degraded`をmanaged recorderのhealthyへ読み替えない。
+- launcherのdesired stateはowner-only 0700 directory内の
+  `$HOME/.local/share/codex-info/control-state.json`へ0600・atomic write/fsyncし、schema
+  `codex-info-control-state-v1`、exact key
+  `schema,desired_state,boot_id,operation_id,generation_id,updated_at_unix`を持つ。
+  `desired_state`は`running|stopped|disabled|removed`だけである。`stopped`は同じBootIdだけ有効で、
+  boot変更時にenabled serviceをrunningへ戻す。raw `systemctl stop`を永続的な製品停止意図へ推測しない。
+- installation recovery journalは
+  `$HOME/.local/share/codex-info/install-transaction.json`、0600、schema付きexact key
+  `schema,operation_id,owner_pid,owner_starttime,boot_id,phase,old_generation,new_generation,desired_state,
+  updated_at_unix`とする。phaseは
+  `prepared,legacy_backed_up,entrypoints_linked,candidate_published,current_switched,activation_requested,
+  candidate_verified,rollback_switched,rollback_verified,committed`だけで、各遷移をatomic write・file
+  fsync・parent directory fsyncしてから次へ進む。ownerがstaleな未terminal operationは同じjournal identityから
+  resume/rollbackし、回復前に別operationやwriter publicationを開始しない。
 - stale lockはPID不存在またはprocess-start不一致を必要とし、削除直前に同じpathをreopenして取得時のfile identityと再比較する。
   24時間は診断用の経過時間であり削除条件ではない。年齢だけの削除、別ownerの削除、path/identity不一致の削除は常に0件とする。
 - fingerprintはcanonical sessions root配下のregular・non-symlink JSONLだけを相対path辞書順で並べ、各fileのdevice/inode、size、mtime_ns、
@@ -139,9 +164,15 @@ Codex app-server / session JSONL / thread rollout
   bounded one-shot backfillを開始する。hint、cursor、source identity、AuthEpoch/nonceが不一致ならcandidate全体を破棄し、gapを埋めず旧rootを保持する。
   logout、token失効、AccountKey変更ではAuthEpochを先に増やし、persisted hintを`state=tombstoned`へatomicに更新してcursorと公開候補を無効化する。
   hint/DBへemail、account ID、その他の個人識別値を保存せず、opaque nonceとprocess内AuthEpochだけでepoch境界を検証する。
-- daemon停止区間は`RecorderGapLedger`がsource cursorと停止・再開monotonic時刻から回収不能を確定した場合だけgapとする。
-  v1 wire schemaへgap fieldを追加せず、history sampleのminute-start timestampの不連続をpresentation-owned markerとして表示する。
-  確定gapは補間、残量推測、旧値複製の対象外であり、backfillが成功した区間だけ実sampleで置換する。
+- daemon停止区間は`RecorderGapLedger`がsource identity/cursorと停止・再開monotonic時刻から回収不能を
+  確定した場合だけgapとする。既存REST v1のexact 13-key detailsにある`history_gaps`へconfirmed rowだけを
+  projectionし、timestamp不連続だけではmarkerを作らない。確定gapは補間、quota/残量推測、旧値複製の対象外であり、
+  backfillが成功した区間だけ実sampleで置換する。
+  ledger rowはexact key `gap_id,partition_id,source_identity_before,source_identity_after,cursor_before,cursor_after,
+  stopped_at_monotonic_ns,resumed_at_monotonic_ns,start_at,end_at,reset_at,reason,state,owner_collector_epoch,
+  confirmation_cycle_seq`を持つ。`state`は`pending|recovered|confirmed|rejected`、`reason`は
+  `daemon_stop_unrecoverable|reset_hint_expired|auth_epoch_tombstoned`だけで、一つの`gap_id`を同じterminalへ
+  再適用してもDB row・public gapを増やさない。
 
 ### 4.2 Maintenance、backup、restore
 
