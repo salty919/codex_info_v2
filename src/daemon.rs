@@ -2908,7 +2908,17 @@ mod tests {
                     RecorderWriteState::Ready
                 );
             } else if mode == "worker-death" {
-                assert!(writer.probe().is_err());
+                // The command response disconnects before the worker's join
+                // handle is guaranteed to report finished. Observe the same
+                // bounded one-second window used by the resident probe tick.
+                let deadline = std::time::Instant::now() + Duration::from_secs(1);
+                while writer.probe().is_ok() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "stopped recorder worker remained live past one probe tick"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             } else {
                 assert!(writer.probe().is_ok());
             }

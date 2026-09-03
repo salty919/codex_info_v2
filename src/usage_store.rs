@@ -5110,7 +5110,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_keeps_old_checkpoints_and_exact_cleanup_markers() {
+    fn replacement_prunes_old_checkpoints_and_keeps_exact_cleanup_markers() {
         let path = database_path("partition-session-replacement-retention");
         let identity = partition_identity('e', 5);
         let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
@@ -5178,10 +5178,7 @@ mod tests {
 
         let state = store.load_session_collection_state().unwrap();
         assert_eq!(state.data_generation, 3);
-        assert_eq!(state.checkpoints.len(), 3);
-        assert!(state.checkpoints.contains(&old_checkpoint));
-        assert!(state.checkpoints.contains(&replacement_checkpoint));
-        assert!(state.checkpoints.contains(&new_checkpoint));
+        assert_eq!(state.checkpoints, [new_checkpoint]);
         assert!(store.recorded_session_matches(&old_source).unwrap());
         assert!(store.recorded_session_matches(&new_source).unwrap());
         assert_eq!(
