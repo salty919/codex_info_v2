@@ -1,25 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Finite local contract test.  The fake systemctl/curl commands model only the
-# user-manager, enable/restart/active, health, and public Release observations
-# needed by the bundle installer/updater; no host service, HOME, DB, session, or
-# network is touched.
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_SCRIPT="$SCRIPT_DIR/build_linux_bundle.sh"
+# Finite isolated contract test for the Linux archive, persistent installer,
+# journal recovery, equal-version repair, and retention/removal boundaries.
+# No host HOME, systemd user manager, profile, process, or network is touched.
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD_SCRIPT="$ROOT_DIR/scripts/build_linux_bundle.sh"
 ORIGINAL_PATH="$PATH"
-TEST_ROOT="$(mktemp -d /tmp/codex-info-linux-bundle-test.XXXXXX)"
-BUNDLE_DIR=""
-
+BUNDLE_DIR=''
 while (($# > 0)); do
     case "$1" in
         --bundle-dir)
             (($# >= 2)) || { echo 'linux-bundle-test: --bundle-dir requires a path' >&2; exit 2; }
+            [[ -z "$BUNDLE_DIR" ]] || { echo 'linux-bundle-test: --bundle-dir supplied twice' >&2; exit 2; }
             BUNDLE_DIR="$2"
             shift 2
             ;;
         -h|--help)
-            printf 'usage: test_linux_bundle.sh [--bundle-dir DIRECTORY]\n'
+            printf 'usage: test_linux_bundle.sh [--bundle-dir DIR]\n'
             exit 0
             ;;
         *)
@@ -28,120 +26,165 @@ while (($# > 0)); do
             ;;
     esac
 done
+TEST_ROOT="$(mktemp -d /tmp/codex-info-linux-bundle-test.XXXXXX)"
+trap 'rm -r -- "$TEST_ROOT"' EXIT
 
-cleanup() {
-    rm -r -- "$TEST_ROOT"
-}
-trap cleanup EXIT
+fail() { echo "linux-bundle-test: $*" >&2; exit 1; }
+assert_file() { [[ -f "$1" && ! -L "$1" ]] || fail "missing regular file: $1"; }
+assert_symlink() { [[ -L "$1" ]] || fail "missing symlink: $1"; }
 
-fail() {
-    echo "linux-bundle-test: $*" >&2
-    exit 1
+validate_workflow_candidate() {
+    local directory="$1" archive manifest checksum
+    [[ -d "$directory" && ! -L "$directory" ]] || fail "bundle directory is not a directory: $directory"
+    mapfile -t archives < <(find "$directory" -mindepth 1 -maxdepth 1 -type f \
+        -name 'codex-info-*-x86_64-unknown-linux-gnu.tar.gz' -printf '%p\n' | LC_ALL=C sort)
+    ((${#archives[@]} == 1)) || fail "bundle directory must contain exactly one Linux archive (found ${#archives[@]})"
+    archive="${archives[0]}"
+    manifest="${archive%.tar.gz}.manifest.json"
+    checksum="$archive.sha256"
+    [[ -f "$manifest" && ! -L "$manifest" ]] || fail 'candidate manifest sidecar is missing or not regular'
+    [[ -f "$checksum" && ! -L "$checksum" ]] || fail 'candidate checksum sidecar is missing or not regular'
+    python3 - "$archive" "$manifest" "$ROOT_DIR/run.sh" <<'PY'
+import hashlib
+import json
+import pathlib
+import stat
+import sys
+import tarfile
+
+archive_path, external_manifest_path, source_run_path = map(pathlib.Path, sys.argv[1:])
+def reject(message):
+    raise SystemExit(f"workflow candidate validation failed: {message}")
+def pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            reject("duplicate JSON key")
+        result[key] = value
+    return result
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+try:
+    external_bytes = external_manifest_path.read_bytes()
+    external = json.loads(external_bytes, object_pairs_hook=pairs)
+except Exception as error:
+    reject(f"external manifest is invalid: {error}")
+try:
+    with tarfile.open(archive_path, "r:gz") as stream:
+        members = stream.getmembers()
+        if any(not item.isfile() or item.issym() or item.islnk() for item in members):
+            reject("archive contains a non-regular member")
+        names = [item.name for item in members]
+        if names != sorted(names) or len(names) != len(set(names)):
+            reject("archive members are not sorted and unique")
+        data = {item.name: stream.extractfile(item).read() for item in members}
+        modes = {item.name: stat.S_IMODE(item.mode) for item in members}
+except Exception as error:
+    reject(f"archive cannot be read: {error}")
+if data.get("manifest.json") != external_bytes:
+    reject("internal and external manifest bytes differ")
+if set(external) != {"schema", "product", "version", "source_sha", "run_id", "run_attempt", "target", "compatibility", "glibc_minimum", "files"}:
+    reject("manifest top-level keys are not exact")
+files = external.get("files")
+if not isinstance(files, list):
+    reject("manifest files is not a list")
+expected = {}
+for entry in files:
+    if not isinstance(entry, dict) or set(entry) != {"path", "size", "sha256", "mode"}:
+        reject("manifest file entry keys are not exact")
+    path, size, sha, mode = (entry.get(key) for key in ("path", "size", "sha256", "mode"))
+    if not isinstance(path, str) or not path or path.startswith("/") or "\\" in path or ".." in pathlib.PurePosixPath(path).parts:
+        reject("manifest path is unsafe")
+    if path in expected or path in {"manifest.json", "SHA256SUMS"}:
+        reject("manifest file paths are not unique/payload-only")
+    if type(size) is not int or size < 0 or not isinstance(sha, str) or len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+        reject("manifest size/hash is malformed")
+    if type(mode) is not int or mode not in {0o644, 0o755}:
+        reject("manifest mode is malformed")
+    expected[path] = (size, sha, mode)
+if list(expected) != sorted(expected):
+    reject("manifest entries are not sorted")
+if set(data) != set(expected) | {"manifest.json", "SHA256SUMS"}:
+    reject("manifest does not cover exact archive payload")
+for path, (size, sha, mode) in expected.items():
+    if len(data[path]) != size or digest(data[path]) != sha or modes[path] != mode:
+        reject(f"archive member identity mismatch: {path}")
+    required_mode = 0o755 if path in {"codex_info", "run.sh", "install.sh"} else 0o644
+    if mode != required_mode:
+        reject(f"archive member mode is not canonical: {path}")
+if modes.get("manifest.json") != 0o644 or modes.get("SHA256SUMS") != 0o644:
+    reject("manifest/checksum modes are not 0644")
+if data.get("run.sh") != source_run_path.read_bytes():
+    reject("archive run.sh differs from repository source")
+if modes.get("install.sh") != 0o755:
+    reject("installer is not executable in archive")
+lines = data.get("SHA256SUMS", b"").decode("utf-8").splitlines()
+checks = {}
+for line in lines:
+    fields = line.split("  ", 1)
+    if len(fields) != 2 or len(fields[0]) != 64 or any(c not in "0123456789abcdef" for c in fields[0]):
+        reject("SHA256SUMS line is malformed")
+    name = fields[1]
+    if name in checks or name == "SHA256SUMS" or name not in data:
+        reject("SHA256SUMS names are not exact")
+    checks[name] = fields[0]
+if list(checks) != sorted(checks) or set(checks) != set(data) - {"SHA256SUMS"}:
+    reject("SHA256SUMS does not cover exact archive payload")
+for name, sha in checks.items():
+    if sha != digest(data[name]):
+        reject(f"SHA256SUMS digest mismatch: {name}")
+PY
+    (cd -- "$directory" && sha256sum --check --status "$(basename -- "$checksum")") ||
+        fail 'candidate archive sidecar checksum failed'
+    printf 'case workflow candidate (--bundle-dir): PASS\n'
 }
+
+if [[ -n "$BUNDLE_DIR" ]]; then
+    validate_workflow_candidate "$BUNDLE_DIR"
+fi
 
 fake_bin="$TEST_ROOT/fake-bin"
 fake_home="$TEST_ROOT/home"
+fake_proc="$TEST_ROOT/proc"
 fixture_root="$TEST_ROOT/fixture"
 output_root="$TEST_ROOT/output"
-log="$TEST_ROOT/commands.log"
 release_json="$TEST_ROOT/release.json"
-release_asset_root="$TEST_ROOT/release-assets"
+release_assets="$TEST_ROOT/release-assets"
 update_tmp="$TEST_ROOT/update-tmp"
-release_version=''
-mkdir -p -- "$fake_bin" "$fake_home" "$fixture_root" "$output_root"
-mkdir -p -- "$release_asset_root" "$update_tmp"
+log="$TEST_ROOT/commands.log"
+mkdir -p -- "$fake_bin" "$fake_home" "$fake_proc/net" "$fixture_root" "$output_root" "$release_assets" "$update_tmp"
+: > "$fake_proc/net/tcp"
 
 cat > "$fake_bin/systemctl" <<'FAKE_SYSTEMCTL'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'systemctl %s\n' "$*" >> "$FAKE_LOG"
-if [[ " $* " == *' enable --now codex-info-update.timer '* &&
-      "${FAKE_SYSTEMCTL_MANAGER_UP_LONG:-0}" == 1 ]]; then
-    timer_path="$HOME/.config/systemd/user/codex-info-update.timer"
-    if [[ -f "$timer_path" ]] && grep -Fq -- 'OnBootSec=5min' "$timer_path"; then
-        timer_status=0
-        timer_output=''
-        if timer_output="$(env -u CODEX_INFO_INSTALL_LOCKED \
-            SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
-            bash "$HOME/.local/libexec/codex-info-install.sh" --update 9>&- 2>&1)"; then
-            timer_status=0
-        else
-            timer_status=$?
-        fi
-        printf 'timer-expired-immediately status=%s output=%s\n' \
-            "$timer_status" "$timer_output" >> "$FAKE_LOG"
-    fi
-fi
-if [[ " $* " == *' show-environment '* ]]; then
-    exit "${FAKE_SYSTEMCTL_SHOW_ENVIRONMENT_STATUS:-0}"
-fi
-if [[ " $* " == *' show --property=LoadState --value '* ]]; then
-    printf '%s\n' "${FAKE_SYSTEMCTL_LOAD_STATE:-loaded}"
-    exit 0
-fi
-if [[ " $* " == *' daemon-reload '* && "${FAKE_SYSTEMCTL_FAIL_DAEMON_RELOAD:-0}" == 1 ]]; then
-    exit 1
-fi
-if [[ " $* " == *' restart '* ]]; then
-    count_file="$FAKE_LOG.restart-count"
-    count=0
-    if [[ -f "$count_file" ]]; then
-        count="$(<"$count_file")"
-    fi
-    count=$((count + 1))
-    printf '%s\n' "$count" > "$count_file"
-    if [[ "${FAKE_SYSTEMCTL_FAIL_RESTART_ONCE:-0}" == 1 && ! -e "$FAKE_LOG.restart-failed" ]]; then
-        : > "$FAKE_LOG.restart-failed"
-        exit 1
-    fi
-fi
-if [[ " $* " == *' is-enabled '* ]]; then
-    if [[ " $* " == *' codex-info-update.timer '* ]]; then
-        if [[ "${FAKE_SYSTEMCTL_TIMER_ENABLED_PROBE_ERROR:-0}" == 1 ]]; then
-            exit 2
-        fi
-        if [[ "${FAKE_SYSTEMCTL_TIMER_ENABLED:-1}" == 1 ]]; then
-            printf 'enabled\n'
-            exit 0
-        fi
-        printf 'disabled\n'
-        exit 1
-    else
-        if [[ "${FAKE_SYSTEMCTL_MAIN_ENABLED_PROBE_ERROR:-0}" == 1 ]]; then
-            exit 2
-        fi
-        if [[ "${FAKE_SYSTEMCTL_MAIN_ENABLED:-1}" == 1 ]]; then
-            printf 'enabled\n'
-            exit 0
-        fi
-        printf 'disabled\n'
-        exit 1
-    fi
-fi
-if [[ " $* " == *' is-active '* ]]; then
-    if [[ " $* " == *' codex-info-update.timer '* ]]; then
-        if [[ "${FAKE_SYSTEMCTL_TIMER_ACTIVE_PROBE_ERROR:-0}" == 1 ]]; then
-            exit 2
-        fi
-        if [[ "${FAKE_SYSTEMCTL_TIMER_ACTIVE:-1}" == 1 ]]; then
-            printf 'active\n'
-            exit 0
-        fi
-        printf 'inactive\n'
-        exit 3
-    else
-        if [[ "${FAKE_SYSTEMCTL_MAIN_ACTIVE_PROBE_ERROR:-0}" == 1 ]]; then
-            exit 2
-        fi
-        if [[ "${FAKE_SYSTEMCTL_MAIN_ACTIVE:-${FAKE_SYSTEMCTL_ACTIVE:-1}}" == 1 ]]; then
-            printf 'active\n'
-            exit 0
-        fi
-        printf 'inactive\n'
-        exit 3
-    fi
-fi
-exit 0
+[[ "${1-}" == --user ]] && shift
+case "${1-}" in
+    show-environment) exit 0 ;;
+    is-enabled)
+        unit="${*: -1}"
+        case "$unit" in
+            codex-info.service) [[ "${FAKE_MAIN_ENABLED:-0}" == 1 ]] && exit 0 || exit 1 ;;
+            codex-info-update.timer) [[ "${FAKE_TIMER_ENABLED:-0}" == 1 ]] && exit 0 || exit 1 ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    is-active)
+        unit="${*: -1}"
+        case "$unit" in
+            codex-info.service) [[ "${FAKE_MAIN_ACTIVE:-0}" == 1 ]] && exit 0 || exit 3 ;;
+            codex-info-update.timer) [[ "${FAKE_TIMER_ACTIVE:-0}" == 1 ]] && exit 0 || exit 3 ;;
+            *) exit 3 ;;
+        esac
+        ;;
+    show)
+        [[ "$*" == *MainPID* ]] && printf '%s\n' "${FAKE_MAIN_PID:-0}"
+        exit 0
+        ;;
+    daemon-reload|enable|disable|start|stop|restart) exit 0 ;;
+    *) exit 0 ;;
+esac
 FAKE_SYSTEMCTL
 chmod 0755 "$fake_bin/systemctl"
 
@@ -154,811 +197,575 @@ output=''
 write_out=''
 while (($# > 0)); do
     case "$1" in
-        -o|--output)
+        --output|-o|--write-out|-w|--max-time|--max-redirs|--proto|--proto-redir|--header|-H)
             (($# >= 2)) || exit 2
-            output="$2"
+            if [[ "$1" == --output || "$1" == -o ]]; then output="$2"; fi
+            if [[ "$1" == --write-out || "$1" == -w ]]; then write_out="$2"; fi
             shift 2
             ;;
-        --output=*)
-            output="${1#*=}"
-            shift
-            ;;
-        --url)
-            (($# >= 2)) || exit 2
-            url="$2"
-            shift 2
-            ;;
-        --url=*)
-            url="${1#*=}"
-            shift
-            ;;
-        -w|--write-out)
-            (($# >= 2)) || exit 2
-            write_out="$2"
-            shift 2
-            ;;
-        -H|--header|-A|--user-agent|--max-time|--connect-timeout|--retry|--max-redirs|--proto|--proto-redir)
-            (($# >= 2)) || exit 2
-            shift 2
-            ;;
-        --)
-            shift
-            (($# > 0)) && url="$1"
-            break
-            ;;
-        -*)
-            shift
-            ;;
-        *)
-            url="$1"
-            shift
-            ;;
+        --fail|--silent|--show-error|--location) shift ;;
+        -*) shift ;;
+        *) url="$1"; shift ;;
     esac
 done
-
 payload=''
 payload_file=''
-if [[ "$url" == */releases/latest* ]]; then
-    [[ -f "$FAKE_RELEASE_JSON" ]] || exit 1
-    payload="$(python3 - "$FAKE_RELEASE_JSON" <<'PY'
-import json
-import pathlib
-import sys
-
-value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-if not isinstance(value, list) or not value:
-    raise SystemExit(1)
-print(json.dumps(value[0], separators=(",", ":")))
-PY
-)"
-elif [[ "$url" == */releases* && "$url" != */download/* ]]; then
-    [[ -f "$FAKE_RELEASE_JSON" ]] || exit 1
-    payload="$(<"$FAKE_RELEASE_JSON")"
-elif [[ "$url" == */download/* ]]; then
-    asset_name="${url##*/}"
-    asset_name="${asset_name%%\?*}"
-    payload_file="$FAKE_RELEASE_ASSET_ROOT/$asset_name"
-    [[ -f "$payload_file" ]] || exit 1
+if [[ "$url" == */releases?per_page=100 ]]; then
+    [[ "${FAKE_RELEASE_FAILURE:-0}" == 1 ]] && exit 22
+    payload_file="$FAKE_RELEASE_JSON"
+elif [[ "$url" == */releases/download/*/* ]]; then
+    payload_file="$FAKE_RELEASE_ASSETS/${url##*/}"
+elif [[ "$url" == http://127.0.0.1:8787/* ]]; then
+    if [[ -n "${FAKE_HEALTH_COUNT_FILE:-}" ]]; then
+        count=0
+        [[ -f "$FAKE_HEALTH_COUNT_FILE" ]] && count="$(<"$FAKE_HEALTH_COUNT_FILE")"
+        count=$((count + 1))
+        printf '%s\n' "$count" > "$FAKE_HEALTH_COUNT_FILE"
+        if ((count <= ${FAKE_HEALTH_FAILURES:-0})); then exit 22; fi
+    fi
+    case "${FAKE_HEALTH_SHAPE:-exact}" in
+        exact)
+            payload="$(printf '{"api_version":"v1","service":"codex-info","product_version":"%s"}\n' \
+                "$FAKE_HEALTH_VERSION")" ;;
+        extra)
+            payload="$(printf '{"api_version":"v1","service":"codex-info","product_version":"%s","extra":true}\n' \
+                "$FAKE_HEALTH_VERSION")" ;;
+        duplicate)
+            payload="$(printf '{"api_version":"v1","service":"codex-info","product_version":"%s","product_version":"%s"}\n' \
+                "$FAKE_HEALTH_VERSION" "$FAKE_HEALTH_VERSION")" ;;
+        old)
+            payload='{"api_version":"v1","service":"codex-info","product_version":"0.0.1"}'$'\n' ;;
+        *) exit 1 ;;
+    esac
 else
-    health_count_file="$FAKE_LOG.health-count"
-    health_count=0
-    if [[ -f "$health_count_file" ]]; then
-        health_count="$(<"$health_count_file")"
-    fi
-    health_count=$((health_count + 1))
-    printf '%s\n' "$health_count" > "$health_count_file"
-    if ((health_count <= ${FAKE_CURL_HEALTH_TRANSIENT_FAILURES:-0})); then
-        exit 1
-    fi
-    payload="$(printf '{\"api_version\":\"v1\",\"service\":\"codex-info\",\"product_version\":\"%s\"}\n' "$FAKE_HEALTH_VERSION")"
-fi
-
-if [[ -n "${FAKE_CURL_FAIL:-}" && "${FAKE_CURL_FAIL}" == 1 ]] ||
-   [[ -n "${FAKE_CURL_FAIL_RELEASE:-}" && "${FAKE_CURL_FAIL_RELEASE}" == 1 &&
-      "$url" == */releases* ]] ||
-   [[ -n "${FAKE_CURL_FAIL_DOWNLOAD:-}" && "${FAKE_CURL_FAIL_DOWNLOAD}" == 1 &&
-      "$url" == */download/* ]] ||
-   [[ -n "${FAKE_CURL_FAIL_HEALTH:-}" && "${FAKE_CURL_FAIL_HEALTH}" == 1 &&
-      "$url" != */releases* && "$url" != */download/* ]]; then
     exit 1
 fi
-if [[ -n "$output" ]]; then
-    if [[ -n "$payload_file" ]]; then
-        cp -- "$payload_file" "$output"
-    else
-        printf '%s' "$payload" > "$output"
-    fi
-else
-    if [[ -n "$payload_file" ]]; then
-        cat -- "$payload_file"
-    else
-        printf '%s' "$payload"
-    fi
+if [[ -n "$payload_file" ]]; then
+    [[ -f "$payload_file" ]] || exit 1
+    if [[ -n "$output" ]]; then cp -- "$payload_file" "$output"; else payload="$(<"$payload_file")"; fi
+elif [[ -n "$output" ]]; then
+    printf '%s' "$payload" > "$output"
 fi
-if [[ "$write_out" == '%{url_effective}' ]]; then
-    printf '%s' "${FAKE_CURL_EFFECTIVE_URL:-$url}"
-fi
-exit 0
+if [[ -z "$output" ]]; then printf '%s' "$payload"; fi
+if [[ "$write_out" == '%{url_effective}' ]]; then printf '%s' "${FAKE_CURL_EFFECTIVE_URL:-$url}"; fi
 FAKE_CURL
 chmod 0755 "$fake_bin/curl"
 
-cat > "$fake_bin/sleep" <<'FAKE_SLEEP'
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'sleep %s\n' "$*" >> "$FAKE_LOG"
-exit 0
-FAKE_SLEEP
-chmod 0755 "$fake_bin/sleep"
-
 cat > "$fake_bin/objdump" <<'FAKE_OBJDUMP'
 #!/usr/bin/env bash
-set -euo pipefail
-printf 'fake objdump GLIBC_2.31\n'
+printf 'fake GLIBC_2.31\n'
 FAKE_OBJDUMP
 chmod 0755 "$fake_bin/objdump"
 
-write_fixture_binary() {
-    local marker="$1"
-    printf 'fixture binary %s\n' "$marker" > "$fixture_root/codex_info"
-    chmod 0755 "$fixture_root/codex_info"
-}
+cat > "$fake_bin/getconf" <<'FAKE_GETCONF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n "${FAKE_GLIBC_VERSION:-}" ]]; then
+    printf 'glibc %s\n' "$FAKE_GLIBC_VERSION"
+else
+    exec /usr/bin/getconf "$@"
+fi
+FAKE_GETCONF
+chmod 0755 "$fake_bin/getconf"
+cat > "$fake_bin/ldd" <<'FAKE_LDD'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n "${FAKE_GLIBC_VERSION:-}" ]]; then
+    printf 'ldd (GNU libc) %s\n' "$FAKE_GLIBC_VERSION"
+else
+    exec /usr/bin/ldd "$@"
+fi
+FAKE_LDD
+chmod 0755 "$fake_bin/ldd"
 
-write_fixture_binary 'fixture binary generation one'
+printf 'fixture binary generation one\n' > "$fixture_root/codex_info"
+chmod 0755 "$fixture_root/codex_info"
 
 build_bundle() {
-    local source_sha="$1" version="$2"
-    SOURCE_SHA="$source_sha" RUN_ID=92001 RUN_ATTEMPT=1 OBJDUMP_BIN="$fake_bin/objdump" \
-        bash "$BUILD_SCRIPT" --binary "$fixture_root/codex_info" \
-        --version "$version" --output-dir "$output_root" >/dev/null
-    printf '%s/%s-%s-%s.tar.gz\n' "$output_root" 'codex-info' "$version" \
-        'x86_64-unknown-linux-gnu'
+    local source="$1" version="$2"
+    SOURCE_SHA="$source" RUN_ID=92001 RUN_ATTEMPT=1 OBJDUMP_BIN="$fake_bin/objdump" \
+        bash "$BUILD_SCRIPT" --binary "$fixture_root/codex_info" --version "$version" \
+        --output-dir "$output_root" >/dev/null
+    printf '%s/codex-info-%s-x86_64-unknown-linux-gnu.tar.gz\n' "$output_root" "$version"
 }
 
 archive_version() {
-    local archive="$1"
-    basename -- "$archive" |
-        sed 's/^codex-info-//; s/-x86_64-unknown-linux-gnu\.tar\.gz$//'
+    basename -- "$1" | sed 's/^codex-info-//; s/-x86_64-unknown-linux-gnu\.tar\.gz$//'
 }
 
-write_release_fixture() {
-    local archive="$1" shape="${2:-complete}" version archive_name
+write_release() {
+    local archive="$1" version archive_name
     version="$(archive_version "$archive")"
     archive_name="$(basename -- "$archive")"
-    release_version="$version"
-
-    rm -f -- "$release_asset_root"/*
-    if [[ "$shape" != windows-only ]]; then
-        cp -- "$archive" "$release_asset_root/$archive_name"
-        cp -- "$archive.sha256" "$release_asset_root/$archive_name.sha256"
-        cp -- "${archive%.tar.gz}.manifest.json" \
-            "$release_asset_root/${archive_name%.tar.gz}.manifest.json"
-    fi
-    if [[ "$shape" != linux-only ]]; then
-        printf 'fixture Windows Setup %s\n' "$version" > \
-            "$release_asset_root/CodexInfo.WindowsClient.Setup.exe"
-        printf '{"schema_version":1,"version":"%s"}\n' "$version" > \
-            "$release_asset_root/CodexInfo.WindowsClient.update.json"
-    fi
-    case "$shape" in
-        bad-checksum)
-            printf '%064d  %s\n' 0 "$archive_name" > \
-                "$release_asset_root/$archive_name.sha256"
-            ;;
-        bad-manifest)
-            printf '%s\n' '{not-json' > \
-                "$release_asset_root/${archive_name%.tar.gz}.manifest.json"
-            ;;
-        bad-manifest-version)
-            python3 - "$release_asset_root/${archive_name%.tar.gz}.manifest.json" <<'PY'
-import json
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-document = json.loads(path.read_text(encoding="utf-8"))
-document["version"] = "9.9.9"
-path.write_text(json.dumps(document, separators=(",", ":")) + "\n", encoding="utf-8")
-PY
-            ;;
-        bad-archive-content)
-            tamper_root="$TEST_ROOT/tamper-$version"
-            [[ ! -e "$tamper_root" ]] || rm -r -- "$tamper_root"
-            mkdir -- "$tamper_root"
-            mapfile -t archive_members < <(tar -tzf "$release_asset_root/$archive_name")
-            tar -xzf "$release_asset_root/$archive_name" -C "$tamper_root"
-            printf '%s\n' 'tampered after manifest generation' >> "$tamper_root/codex_info"
-            tar -czf "$release_asset_root/$archive_name" -C "$tamper_root" -- "${archive_members[@]}"
-            archive_hash="$(sha256sum -- "$release_asset_root/$archive_name" | awk '{print $1}')"
-            printf '%s  %s\n' "$archive_hash" "$archive_name" > \
-                "$release_asset_root/$archive_name.sha256"
-            rm -r -- "$tamper_root"
-            ;;
-        extra)
-            printf '%s\n' 'unexpected release asset' > \
-                "$release_asset_root/unexpected.txt"
-            ;;
-        complete|linux-only|windows-only|draft|prerelease|unpublished|malformed-json|bad-tag|bad-url|bad-state|bad-size|bad-digest)
-            ;;
-        *)
-            fail "unknown Release fixture shape: $shape"
-            ;;
-    esac
-
-    python3 - "$release_asset_root" "$version" "$shape" "$release_json" <<'PY'
-import hashlib
-import json
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1])
-version = sys.argv[2]
-shape = sys.argv[3]
-output = pathlib.Path(sys.argv[4])
-linux_names = [
+    rm -f -- "$release_assets"/*
+    cp -- "$archive" "$release_assets/$archive_name"
+    cp -- "${archive%.tar.gz}.manifest.json" "$release_assets/${archive_name%.tar.gz}.manifest.json"
+    cp -- "$archive.sha256" "$release_assets/$archive_name.sha256"
+    printf 'fixture Windows Setup %s\n' "$version" > "$release_assets/CodexInfo.WindowsClient.Setup.exe"
+    printf '{"version":"%s"}\n' "$version" > "$release_assets/CodexInfo.WindowsClient.update.json"
+    python3 - "$release_assets" "$version" "$release_json" <<'PY'
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[1]); version = sys.argv[2]; output = pathlib.Path(sys.argv[3])
+names = [
     f"codex-info-{version}-x86_64-unknown-linux-gnu.tar.gz",
     f"codex-info-{version}-x86_64-unknown-linux-gnu.tar.gz.sha256",
     f"codex-info-{version}-x86_64-unknown-linux-gnu.manifest.json",
-]
-windows_names = [
     "CodexInfo.WindowsClient.Setup.exe",
     "CodexInfo.WindowsClient.update.json",
 ]
-if shape == "linux-only":
-    names = linux_names
-elif shape == "windows-only":
-    names = windows_names
-else:
-    names = windows_names + linux_names
-    if shape == "extra":
-        names.append("unexpected.txt")
 assets = []
-for index, name in enumerate(names, start=1):
-    path = root / name
-    if not path.is_file():
-        raise SystemExit(f"missing fixture asset: {path}")
-    data = path.read_bytes()
+for name in names:
+    data = (root / name).read_bytes()
     assets.append({
-        "id": index,
         "name": name,
-        "label": "",
+        "browser_download_url": f"https://github.com/salty919/codex_info_v2/releases/download/windows-v{version}/{name}",
         "state": "uploaded",
         "size": len(data),
         "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
-        "content_type": "application/octet-stream",
-        "browser_download_url": (
-            "https://github.com/salty919/codex_info_v2/releases/download/"
-            f"windows-v{version}/{name}"
-        ),
     })
 release = {
-    "id": 92001,
-    "tag_name": f"windows-v{version}",
-    "name": f"Codex Info Monitor {version}",
-    "draft": False,
-    "prerelease": False,
-    "published_at": "2026-09-01T00:00:00Z",
-    "assets": assets,
+    "tag_name": f"windows-v{version}", "draft": False, "prerelease": False,
+    "published_at": "2026-09-01T00:00:00Z", "assets": assets,
 }
-if shape == "malformed-json":
-    output.write_text("{not-json\n", encoding="utf-8")
-    raise SystemExit(0)
-if shape == "draft":
-    release["draft"] = True
-elif shape == "prerelease":
-    release["prerelease"] = True
-elif shape == "unpublished":
-    release["published_at"] = None
-elif shape == "bad-tag":
-    release["tag_name"] = f"v{version}"
-elif shape in {"bad-url", "bad-state", "bad-size", "bad-digest"}:
-    linux_archive = next(asset for asset in assets if asset["name"].endswith(".tar.gz"))
-    if shape == "bad-url":
-        linux_archive["browser_download_url"] = f"https://example.invalid/{linux_archive['name']}"
-    elif shape == "bad-state":
-        linux_archive["state"] = "not-uploaded-UPDATE_SECRET_SENTINEL"
-    elif shape == "bad-size":
-        linux_archive["size"] += 1
-    else:
-        linux_archive["digest"] = "sha256:" + "0" * 64
 output.write_text(json.dumps([release], separators=(",", ":")) + "\n", encoding="utf-8")
 PY
 }
 
-extract_install_script() {
-    local archive="$1"
-    local version script_dir install_script
-    version="$(basename -- "$archive")"
-    version="$(printf '%s' "$version" |
-        sed 's/^codex-info-//; s/-x86_64-unknown-linux-gnu\.tar\.gz$//')"
-    script_dir="$TEST_ROOT/install-${version}"
-    mkdir -p -- "$script_dir"
-    install_script="$script_dir/install.sh"
-    tar -xOf "$archive" install.sh > "$install_script"
-    chmod 0755 "$install_script"
-    printf '%s\n' "$install_script"
+extract_installer() {
+    local archive="$1" version destination
+    version="$(archive_version "$archive")"
+    destination="$TEST_ROOT/install-$version.sh"
+    tar -xOf "$archive" install.sh > "$destination"
+    chmod 0755 "$destination"
+    printf '%s\n' "$destination"
 }
 
 run_install() {
-    local archive="$1"
-    local version health_version='' install_script
-    if (( $# >= 2 )); then
-        health_version="$2"
-    fi
-    version="$(basename -- "$archive")"
-    version="$(printf '%s' "$version" |
-        sed 's/^codex-info-//; s/-x86_64-unknown-linux-gnu\.tar\.gz$//')"
-    if [[ -z "$health_version" ]]; then
-        health_version="$version"
-    fi
-    install_script="$(extract_install_script "$archive")"
-    HOME="$fake_home" PATH="$fake_bin:$ORIGINAL_PATH" \
-        FAKE_LOG="$log" FAKE_HEALTH_VERSION="$health_version" \
-        FAKE_CURL_HEALTH_TRANSIENT_FAILURES="${FAKE_CURL_HEALTH_TRANSIENT_FAILURES:-0}" \
-        FAKE_SYSTEMCTL_MANAGER_UP_LONG="${FAKE_SYSTEMCTL_MANAGER_UP_LONG:-0}" \
-        FAKE_SYSTEMCTL_MAIN_ENABLED_PROBE_ERROR="${FAKE_SYSTEMCTL_MAIN_ENABLED_PROBE_ERROR:-0}" \
-        FAKE_SYSTEMCTL_MAIN_ACTIVE_PROBE_ERROR="${FAKE_SYSTEMCTL_MAIN_ACTIVE_PROBE_ERROR:-0}" \
-        FAKE_SYSTEMCTL_TIMER_ENABLED_PROBE_ERROR="${FAKE_SYSTEMCTL_TIMER_ENABLED_PROBE_ERROR:-0}" \
-        FAKE_SYSTEMCTL_TIMER_ACTIVE_PROBE_ERROR="${FAKE_SYSTEMCTL_TIMER_ACTIVE_PROBE_ERROR:-0}" \
-        SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
-        bash "$install_script" --bundle "$archive"
+    local archive="$1" home="$2" script
+    script="$(extract_installer "$archive")"
+    HOME="$home" CODEX_HOME="$home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+        bash "$script" --bundle "$archive"
+}
+run_install_glibc() {
+    local archive="$1" home="$2" version="$3" script
+    script="$(extract_installer "$archive")"
+    HOME="$home" CODEX_HOME="$home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        FAKE_GLIBC_VERSION="$version" GETCONF_BIN="$fake_bin/getconf" LDD_BIN="$fake_bin/ldd" \
+        CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+        bash "$script" --bundle "$archive"
+}
+run_install_with_manifest() {
+    local archive="$1" home="$2" manifest="$3" script
+    script="$(extract_installer "$archive")"
+    HOME="$home" CODEX_HOME="$home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+        bash "$script" --bundle "$archive" --manifest "$manifest"
 }
 
 run_update() {
-    local _installed_from_archive="$1" health_version='' install_script
-    if (( $# >= 2 )); then
-        health_version="$2"
-    fi
-    if [[ -z "$health_version" ]]; then
-        health_version="$release_version"
-    fi
-    install_script="$fake_home/.local/libexec/codex-info-install.sh"
-    [[ -x "$install_script" ]] || fail 'persistent installer is missing or not executable'
-    HOME="$fake_home" TMPDIR="$update_tmp" PATH="$fake_bin:$ORIGINAL_PATH" \
-        FAKE_LOG="$log" FAKE_HEALTH_VERSION="$health_version" \
-        FAKE_CURL_HEALTH_TRANSIENT_FAILURES="${FAKE_CURL_HEALTH_TRANSIENT_FAILURES:-0}" \
-        FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSET_ROOT="$release_asset_root" \
-        FAKE_CURL_EFFECTIVE_URL="${FAKE_CURL_EFFECTIVE_URL:-}" \
-        FAKE_SYSTEMCTL_MAIN_ENABLED_PROBE_ERROR="${FAKE_SYSTEMCTL_MAIN_ENABLED_PROBE_ERROR:-0}" \
-        FAKE_SYSTEMCTL_MAIN_ACTIVE_PROBE_ERROR="${FAKE_SYSTEMCTL_MAIN_ACTIVE_PROBE_ERROR:-0}" \
-        FAKE_SYSTEMCTL_TIMER_ENABLED_PROBE_ERROR="${FAKE_SYSTEMCTL_TIMER_ENABLED_PROBE_ERROR:-0}" \
-        FAKE_SYSTEMCTL_TIMER_ACTIVE_PROBE_ERROR="${FAKE_SYSTEMCTL_TIMER_ACTIVE_PROBE_ERROR:-0}" \
-        CODEX_INFO_INSTALL_LOCKED="${CODEX_INFO_INSTALL_LOCKED:-}" \
+    local home="$1"
+    HOME="$home" CODEX_HOME="$home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" \
+        TMPDIR="$update_tmp" CODEX_INFO_PROC_ROOT="$fake_proc" \
         SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
-        bash "$install_script" --update
+        bash "$home/.local/libexec/codex-info-install.sh" --update
 }
 
-run_remove() {
-    local _installed_from_archive="$1" install_script
-    install_script="$fake_home/.local/libexec/codex-info-install.sh"
-    [[ -x "$install_script" ]] || fail 'persistent installer is missing or not executable'
-    HOME="$fake_home" PATH="$fake_bin:$ORIGINAL_PATH" \
-        FAKE_LOG="$log" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
-        bash "$install_script" --remove
+boot_id_value="$(< /proc/sys/kernel/random/boot_id)"
+readonly_home="$TEST_ROOT/readonly-home"
+mkdir -p -- "$readonly_home"
+for readonly_action in --status --verify-runtime; do
+    HOME="$readonly_home" CODEX_HOME="$readonly_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+        bash "$ROOT_DIR/packaging/install_linux_bundle.sh" "$readonly_action" >/dev/null 2>&1 || true
+done
+[[ ! -e "$readonly_home/.local/share" && ! -e "$readonly_home/.local/bin" &&
+   ! -e "$readonly_home/.local/libexec" && ! -e "$readonly_home/.config" ]] ||
+    fail 'read-only status/verify created installation state'
+printf 'case read-only empty-home: PASS\n'
+write_stopped_state() {
+    local home="$1"
+    mkdir -p -- "$home/.local/share/codex-info"
+    printf '{"schema":"codex-info-control-state-v1","desired_state":"stopped","boot_id":"%s","operation_id":"fixture","generation_id":"","updated_at_unix":1}\n' \
+        "$boot_id_value" > "$home/.local/share/codex-info/control-state.json"
+    chmod 0600 "$home/.local/share/codex-info/control-state.json"
 }
-
-if [[ -n "$BUNDLE_DIR" ]]; then
-    [[ -d "$BUNDLE_DIR" ]] || fail "bundle directory is missing: $BUNDLE_DIR"
-    mapfile -t supplied_archives < <(find "$BUNDLE_DIR" -maxdepth 1 -type f \
-        -name 'codex-info-*-x86_64-unknown-linux-gnu.tar.gz' -print | LC_ALL=C sort)
-    [[ "${#supplied_archives[@]}" -eq 1 ]] || fail 'bundle directory must contain exactly one Linux archive'
-    supplied_archive="${supplied_archives[0]}"
-    supplied_manifest="${supplied_archive%.tar.gz}.manifest.json"
-    [[ -f "$supplied_archive.sha256" && -f "$supplied_manifest" ]] ||
-        fail 'bundle directory is missing external checksum or manifest'
-    mapfile -t supplied_paths < <(tar -tzf "$supplied_archive")
-    for required_path in codex_info codex-info.service codex-info-update.service \
-        codex-info-update.timer install.sh LICENSE COPYRIGHT THIRD_PARTY_NOTICES.md \
-        manifest.json SHA256SUMS; do
-        printf '%s\n' "${supplied_paths[@]}" | grep -Fxq -- "$required_path" ||
-            fail "supplied archive is missing $required_path"
-    done
-    [[ "$(printf '%s\n' "${supplied_paths[@]}" | grep -Fxc -- install.sh)" -eq 1 ]] ||
-        fail 'supplied install.sh inventory is invalid'
-    printf 'case supplied-bundle-inventory: PASS\n'
-fi
-
-if SOURCE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa RUN_ID=92001 \
-    OBJDUMP_BIN="$fake_bin/objdump" bash "$BUILD_SCRIPT" \
-    --binary "$fixture_root/codex_info" --version 1.0.19 --output-dir "$output_root" \
-    --target aarch64-unknown-linux-gnu >/dev/null 2>&1; then
-    fail 'unsupported target was accepted'
-fi
-printf 'case target-rejection: PASS\n'
-if SOURCE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa RUN_ID=92001 \
-    OBJDUMP_BIN="$fake_bin/objdump" bash "$BUILD_SCRIPT" \
-    --binary "$fixture_root/codex_info" --version 1.0.19 --output-dir "$output_root" \
-    --compatibility musl >/dev/null 2>&1; then
-    fail 'unsupported compatibility baseline was accepted'
-fi
-printf 'case compatibility-rejection: PASS\n'
-if SOURCE_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa RUN_ID=92001 \
-    OBJDUMP_BIN="$fake_bin/objdump" bash "$BUILD_SCRIPT" \
-    --binary "$fixture_root/codex_info" --version 01.0.19 --output-dir "$output_root" \
-    >/dev/null 2>&1; then
-    fail 'noncanonical product version was accepted'
-fi
-printf 'case noncanonical-version-rejection: PASS\n'
-
-assert_binary_marker() {
-    local path="$1" expected="$2"
-    [[ -f "$path" ]] || fail "missing file: $path"
-    grep -aFq -- "$expected" "$path" || fail "unexpected binary contents: $path"
-}
-
-installation_state_digest() {
-    local relative path
-    for relative in \
-        .local/bin/codex_info \
-        .config/systemd/user/codex-info.service \
-        .config/systemd/user/codex-info-update.service \
-        .config/systemd/user/codex-info-update.timer \
-        .local/libexec/codex-info-install.sh \
-        .local/share/codex-info/manifest.json \
-        .codex/usage_history.sqlite3 \
-        .codex/usage_history.sqlite3.bak.1 \
-        .codex/usage_reset_hint.json \
-        .codex/session.jsonl \
-        .config/codex-info/settings.json; do
-        path="$fake_home/$relative"
-        [[ -f "$path" && ! -L "$path" ]] || fail "state sentinel is missing: $path"
-        printf '%s\t%s\t%s\t%s\n' "$relative" "$(stat -c %a -- "$path")" \
-            "$(stat -c %s -- "$path")" "$(sha256sum -- "$path" | awk '{print $1}')"
-    done | sha256sum | awk '{print $1}'
-}
-
-profile_state_digest() {
-    local relative path
-    for relative in \
-        .codex/usage_history.sqlite3 \
-        .codex/usage_history.sqlite3.bak.1 \
-        .codex/usage_reset_hint.json \
-        .codex/session.jsonl \
-        .config/codex-info/settings.json; do
-        path="$fake_home/$relative"
-        [[ -f "$path" && ! -L "$path" ]] || fail "profile sentinel is missing: $path"
-        printf '%s\t%s\t%s\t%s\n' "$relative" "$(stat -c %a -- "$path")" \
-            "$(stat -c %s -- "$path")" "$(sha256sum -- "$path" | awk '{print $1}')"
-    done | sha256sum | awk '{print $1}'
-}
-
-assert_state_unchanged() {
-    local expected="$1" label="$2"
-    [[ "$(installation_state_digest)" == "$expected" ]] ||
-        fail "$label changed installed or profile state"
-}
-
-assert_update_tmp_empty() {
-    local label="$1"
-    [[ -z "$(find "$update_tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
-        fail "$label left temporary update files"
-}
-
-assert_no_restart_since() {
-    local first_line="$1" label="$2"
-    if tail -n "+$first_line" "$log" | grep -Fq -- 'restart codex-info.service'; then
-        fail "$label reached service restart"
-    fi
-}
-
-assert_no_runtime_mutation_since() {
-    local first_line="$1" label="$2" segment
-    segment="$(tail -n "+$first_line" "$log")"
-    ! grep -Eq -- 'systemctl --user (daemon-reload|enable|disable|start|stop|restart|reset-failed)( |$)' \
-        <<<"$segment" || fail "$label reached runtime state mutation"
-}
-
-assert_rollback_did_not_stop_updater() {
-    local first_line="$1" label="$2" segment reload_line timer_line
-    segment="$(tail -n "+$first_line" "$log")"
-    ! grep -Fq -- 'stop codex-info-update.service' <<<"$segment" ||
-        fail "$label stopped its own update service during rollback"
-    reload_line="$(grep -nF -- 'daemon-reload' <<<"$segment" | tail -n 1 | cut -d: -f1)"
-    timer_line="$(grep -nE -- 'systemctl --user (enable|disable|start|stop)( --now)? codex-info-update.timer' \
-        <<<"$segment" | tail -n 1 | cut -d: -f1)"
-    [[ -n "$reload_line" && -n "$timer_line" && "$reload_line" -lt "$timer_line" ]] ||
-        fail "$label did not reload restored units before restoring the timer"
-}
-
-assert_runtime_probe_error_case() {
-    local label="$1" before_state before_update_log_lines
-    before_state="$(installation_state_digest)"
-    before_update_log_lines="$(( $(wc -l < "$log") + 1 ))"
-    case "$label" in
-        main-enabled)
-            if FAKE_SYSTEMCTL_MAIN_ENABLED_PROBE_ERROR=1 run_update "$archive_v1" >/dev/null 2>&1; then
-                fail 'main enabled probe error unexpectedly succeeded'
-            fi
-            ;;
-        main-active)
-            if FAKE_SYSTEMCTL_MAIN_ACTIVE_PROBE_ERROR=1 run_update "$archive_v1" >/dev/null 2>&1; then
-                fail 'main active probe error unexpectedly succeeded'
-            fi
-            ;;
-        timer-enabled)
-            if FAKE_SYSTEMCTL_TIMER_ENABLED_PROBE_ERROR=1 run_update "$archive_v1" >/dev/null 2>&1; then
-                fail 'timer enabled probe error unexpectedly succeeded'
-            fi
-            ;;
-        timer-active)
-            if FAKE_SYSTEMCTL_TIMER_ACTIVE_PROBE_ERROR=1 run_update "$archive_v1" >/dev/null 2>&1; then
-                fail 'timer active probe error unexpectedly succeeded'
-            fi
-            ;;
-        *)
-            fail "unknown runtime probe error case: $label"
-            ;;
-    esac
-    assert_state_unchanged "$before_state" "$label probe error"
-    assert_no_runtime_mutation_since "$before_update_log_lines" "$label probe error"
-    assert_update_tmp_empty "$label probe error"
-    printf 'case runtime-%s-probe-error: PASS\n' "$label"
+write_running_state() {
+    local home="$1"
+    python3 - "$home/.local/share/codex-info/control-state.json" <<'PY'
+import json, pathlib, sys, time
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text())
+value["desired_state"] = "running"
+value["updated_at_unix"] = int(time.time())
+path.write_text(json.dumps(value, separators=(",", ":")) + "\n")
+PY
+    chmod 0600 "$home/.local/share/codex-info/control-state.json"
 }
 
 archive_v1="$(build_bundle 1111111111111111111111111111111111111111 1.0.19)"
-bundle_install_script="$(extract_install_script "$archive_v1")"
-bundle_help="$(bash "$bundle_install_script" --help)"
-grep -Fq -- 'usage: install.sh --bundle' <<<"$bundle_help" ||
-    fail 'bundled help does not name the install.sh payload'
-grep -Fq -- 'install.sh --remove' <<<"$bundle_help" ||
-    fail 'bundled help does not name the remove command'
-grep -Fq -- 'install.sh --update' <<<"$bundle_help" ||
-    fail 'bundled help does not name the update command'
-printf 'case bundled-help: PASS\n'
-FAKE_CURL_HEALTH_TRANSIENT_FAILURES=1 FAKE_SYSTEMCTL_MANAGER_UP_LONG=1 \
-    run_install "$archive_v1" >/dev/null
-assert_binary_marker "$fake_home/.local/bin/codex_info" 'fixture binary generation one'
-[[ -f "$fake_home/.config/systemd/user/codex-info.service" ]] ||
-    fail 'normal install did not publish unit'
-[[ -f "$fake_home/.config/systemd/user/codex-info-update.service" ]] ||
-    fail 'normal install did not publish update unit'
-[[ -f "$fake_home/.config/systemd/user/codex-info-update.timer" ]] ||
-    fail 'normal install did not publish update timer'
-grep -Fq -- 'systemctl --user enable codex-info.service' "$log" ||
-    fail 'normal install did not enable user unit'
-grep -Eq -- 'systemctl --user enable( --now)? codex-info-update.timer($| )' "$log" ||
-    fail 'normal install did not enable update timer'
-grep -Fq -- 'systemctl --user is-active --quiet codex-info.service' "$log" ||
-    fail 'normal install did not check active state'
-[[ "$(grep -Fc -- 'curl --fail --silent --max-time 1 http://127.0.0.1:8787/v1/health' "$log")" -eq 2 ]] ||
-    fail 'normal install did not retry delayed health readiness exactly once'
-grep -Fq -- 'sleep 1' "$log" ||
-    fail 'normal install did not wait between health readiness attempts'
-printf 'case delayed-health-readiness: PASS\n'
-! grep -Fq -- 'timer-expired-immediately' "$log" ||
-    fail 'update timer fired inside the install transaction on a long-running user manager'
-printf 'case delayed-timer-first-fire: PASS\n'
-grep -Fq -- 'curl --fail --silent --max-time 1 http://127.0.0.1:8787/v1/health' "$log" ||
-    fail 'normal install did not check health'
-grep -Fq -- 'ExecStart=%h/.local/libexec/codex-info-install.sh --update' \
-    "$fake_home/.config/systemd/user/codex-info-update.service" ||
-    fail 'update service does not invoke the persistent installer'
-grep -Fq -- 'TimeoutStartSec=20min' "$fake_home/.config/systemd/user/codex-info-update.service" ||
-    fail 'update service timeout is shorter than the bounded download path'
-grep -Fq -- 'OnActiveSec=5min' "$fake_home/.config/systemd/user/codex-info-update.timer" ||
-    fail 'update timer does not check after activation'
-! grep -Fq -- 'OnBootSec=' "$fake_home/.config/systemd/user/codex-info-update.timer" ||
-    fail 'update timer can fire immediately when installed after its boot-relative deadline'
-grep -Fq -- 'OnUnitActiveSec=1d' "$fake_home/.config/systemd/user/codex-info-update.timer" ||
-    fail 'update timer does not check daily'
-grep -Fq -- 'Unit=codex-info-update.service' "$fake_home/.config/systemd/user/codex-info-update.timer" ||
-    fail 'update timer does not target the update service'
+archive_v2=''
 
-mkdir -p -- "$fake_home/.codex" "$fake_home/.config/codex-info" \
-    "$fake_home/.local/share/codex-info" "$fake_home/.cache/codex-info"
-printf '%s\n' 'database' > "$fake_home/.codex/usage_history.sqlite3"
-printf '%s\n' 'backup' > "$fake_home/.codex/usage_history.sqlite3.bak.1"
-printf '%s\n' 'reset hint' > "$fake_home/.codex/usage_reset_hint.json"
-printf '%s\n' 'session' > "$fake_home/.codex/session.jsonl"
-printf '%s\n' 'config' > "$fake_home/.config/codex-info/settings.json"
-rm -r -- "$TEST_ROOT/install-1.0.19"
-printf 'case normal: PASS\n'
+glibc_home="$TEST_ROOT/glibc-home"
+mkdir -p -- "$glibc_home"
+write_stopped_state "$glibc_home"
+for glibc_case in unknown 2.30; do
+    if run_install_glibc "$archive_v1" "$glibc_home" "$glibc_case" >/dev/null 2>&1; then
+        fail "glibc $glibc_case candidate unexpectedly accepted"
+    fi
+    [[ ! -L "$glibc_home/.local/share/codex-info/current" ]] || fail "glibc $glibc_case rejection published current"
+done
+run_install_glibc "$archive_v1" "$glibc_home" 2.31 >/dev/null
+assert_symlink "$glibc_home/.local/share/codex-info/current"
+printf 'case glibc unknown/older/equal compatibility: PASS\n'
+glibc_newer_home="$TEST_ROOT/glibc-newer-home"
+mkdir -p -- "$glibc_newer_home"
+write_stopped_state "$glibc_newer_home"
+run_install_glibc "$archive_v1" "$glibc_newer_home" 2.32 >/dev/null
+assert_symlink "$glibc_newer_home/.local/share/codex-info/current"
+printf 'case glibc newer compatibility: PASS\n'
 
-write_release_fixture "$archive_v1" complete
-before_state="$(installation_state_digest)"
-before_update_log_lines="$(( $(wc -l < "$log") + 1 ))"
-run_update "$archive_v1" >/dev/null
-assert_state_unchanged "$before_state" 'equal-version no-update'
-assert_no_restart_since "$before_update_log_lines" 'equal-version no-update'
-if tail -n "+$before_update_log_lines" "$log" | grep -Fq -- '/download/'; then
-    fail 'no-update downloaded release assets'
+python3 - "$archive_v1" "$ROOT_DIR/run.sh" <<'PY'
+import json, pathlib, stat, sys, tarfile
+archive, source = map(pathlib.Path, sys.argv[1:])
+with tarfile.open(archive, "r:gz") as stream:
+    members = stream.getmembers()
+    names = [item.name for item in members]
+    assert names == sorted(names) and len(names) == len(set(names))
+    assert "manifest.json" in names and "SHA256SUMS" in names
+    manifest = json.loads(stream.extractfile("manifest.json").read())
+    external = json.loads(pathlib.Path(str(archive).removesuffix(".tar.gz") + ".manifest.json").read_text())
+    assert manifest == external
+    for entry in manifest["files"]:
+        assert set(entry) == {"path", "size", "sha256", "mode"}
+        assert entry["mode"] == (0o755 if entry["path"] in {"codex_info", "run.sh", "install.sh"} else 0o644)
+    for item in members:
+        assert stat.S_IMODE(item.mode) == (0o755 if item.name in {"codex_info","run.sh","install.sh"} else 0o644)
+    assert stream.extractfile("run.sh").read() == source.read_bytes()
+print("case archive/hash/modes: PASS")
+PY
+
+write_stopped_state "$fake_home"
+mkdir -p -- "$fake_home/.codex" "$fake_home/.config/codex-info"
+printf 'profile sentinel\n' > "$fake_home/.codex/session.jsonl"
+printf 'settings sentinel\n' > "$fake_home/.config/codex-info/settings.json"
+profile_hash="$(sha256sum "$fake_home/.codex/session.jsonl" "$fake_home/.config/codex-info/settings.json")"
+run_install "$archive_v1" "$fake_home" >/dev/null
+
+bad_mode_manifest="$TEST_ROOT/bad-mode.manifest.json"
+python3 - "$archive_v1" "$bad_mode_manifest" <<'PY'
+import json, pathlib, tarfile, sys
+archive, output = sys.argv[1:]
+with tarfile.open(archive, "r:gz") as stream:
+    document = json.loads(stream.extractfile("manifest.json").read())
+document["files"][0].pop("mode")
+pathlib.Path(output).write_text(json.dumps(document) + "\n")
+PY
+current_before="$(readlink -- "$fake_home/.local/share/codex-info/current")"
+if run_install_with_manifest "$archive_v1" "$fake_home" "$bad_mode_manifest" >/dev/null 2>&1; then
+    fail 'manifest without exact mode unexpectedly accepted'
 fi
-assert_update_tmp_empty 'equal-version no-update'
-printf 'case no-update: PASS\n'
+[[ "$(readlink -- "$fake_home/.local/share/codex-info/current")" == "$current_before" ]] ||
+    fail 'rejected mode manifest changed current generation'
+printf 'case manifest mode rejection: PASS\n'
 
-exec {held_lock_fd}>"$fake_home/.local/share/codex-info/.install.lock"
-flock --exclusive --nonblock "$held_lock_fd" || fail 'could not hold installer concurrency lock'
-before_state="$(installation_state_digest)"
-if concurrent_output="$(run_update "$archive_v1" 2>&1)"; then
-    fail 'concurrent updater unexpectedly succeeded'
+for path in \
+    "$fake_home/.local/bin/codex_info" \
+    "$fake_home/.local/bin/codex-info" \
+    "$fake_home/.local/libexec/codex-info-install.sh" \
+    "$fake_home/.local/share/codex-info/manifest.json" \
+    "$fake_home/.config/systemd/user/codex-info.service" \
+    "$fake_home/.config/systemd/user/codex-info-update.service" \
+    "$fake_home/.config/systemd/user/codex-info-update.timer"; do
+    assert_symlink "$path"
+done
+generation="$(readlink -- "$fake_home/.local/share/codex-info/current")"
+[[ "$generation" == generations/1.0.19-* ]] || fail "unexpected generation: $generation"
+python3 - "$fake_home/.local/share/codex-info/control-state.json" "${generation#generations/}" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert set(value) == {"schema","desired_state","boot_id","operation_id","generation_id","updated_at_unix"}
+assert value["generation_id"] == sys.argv[2]
+PY
+[[ "$(sha256sum "$fake_home/.codex/session.jsonl" "$fake_home/.config/codex-info/settings.json")" == "$profile_hash" ]] ||
+    fail 'profile sentinels changed during install'
+printf 'case initial generation/retention: PASS\n'
+
+write_release "$archive_v1"
+run_update "$fake_home" >/dev/null
+[[ -z "$(find "$update_tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]] || fail 'no-update left temporary files'
+printf 'case equal-version no-update: PASS\n'
+
+rm -- "$fake_home/.config/systemd/user/codex-info.service"
+run_update "$fake_home" >/dev/null
+assert_symlink "$fake_home/.config/systemd/user/codex-info.service"
+printf 'case equal-version repair: PASS\n'
+
+rm -- "$fake_home/.local/share/codex-info/manifest.json"
+run_update "$fake_home" >/dev/null
+assert_symlink "$fake_home/.local/share/codex-info/manifest.json"
+printf 'case equal-version manifest repair: PASS\n'
+
+# Source-bound readiness fixture: the fake MainPID owns the loopback socket,
+# executable identity, lock record, and recorder state for the installed tuple.
+health_pid=4242
+health_starttime=12345
+health_generation="$(readlink -- "$fake_home/.local/share/codex-info/current")"
+health_generation_dir="$fake_home/.local/share/codex-info/$health_generation"
+mkdir -p -- "$fake_proc/$health_pid/fd" "$fake_home/.codex/history"
+ln -s -- "$health_generation_dir/codex_info" "$fake_proc/$health_pid/exe"
+ln -s -- 'socket:[9001]' "$fake_proc/$health_pid/fd/3"
+python3 - "$fake_proc/$health_pid/stat" "$fake_home/.codex/history/usage_record_daemon.lock" \
+    "$fake_home/.codex/history/recorder-state.json" "$health_generation_dir/codex_info" "$health_pid" "$health_starttime" <<'PY'
+import hashlib, json, os, pathlib, stat, sys
+stat_path, lock_path, state_path, executable, pid, starttime = sys.argv[1:]
+fields = ["S"] + ["0"] * 18 + [starttime]
+pathlib.Path(stat_path).write_text(f"{pid} (codex_info) " + " ".join(fields) + "\n")
+metadata = os.stat(executable)
+nonce = "ab" * 16
+pathlib.Path(lock_path).write_text(json.dumps({
+    "pid": int(pid), "started_at": 1, "starttime_ticks": int(starttime),
+    "executable_device": metadata.st_dev, "executable_inode": metadata.st_ino,
+    "owner_nonce": nonce,
+}) + "\n")
+pathlib.Path(lock_path).chmod(stat.S_IRUSR | stat.S_IWUSR)
+pathlib.Path(state_path).write_text(json.dumps({
+    "schema": "codex-info-recorder-state-v1", "pid": int(pid),
+    "process_starttime": int(starttime), "owner_nonce": nonce,
+    "write_state": "idle_no_account", "partition_id_hash": None,
+    "data_generation": None, "collector_epoch": None, "cycle_seq": None,
+    "last_commit_unix": None, "updated_at_unix": int(__import__('time').time()),
+}) + "\n")
+pathlib.Path(state_path).chmod(stat.S_IRUSR | stat.S_IWUSR)
+PY
+printf '  sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n0: 0100007F:225B 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 9001 1\n' > "$fake_proc/net/tcp"
+health_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$fake_home/.local/share/codex-info/current/manifest.json")"
+health_source="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_sha"])' "$fake_home/.local/share/codex-info/current/manifest.json")"
+health_manifest="$(sha256sum "$fake_home/.local/share/codex-info/current/manifest.json" | awk '{print $1}')"
+HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+    FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" TMPDIR="$update_tmp" \
+    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_SOURCE="$health_source" \
+    FAKE_HEALTH_MANIFEST="$health_manifest" CODEX_INFO_PROC_ROOT="$fake_proc" \
+    SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+    bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null
+printf 'case source-bound health/readiness: PASS\n'
+for health_shape in extra duplicate old; do
+    if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+        FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_SHAPE="$health_shape" CODEX_INFO_PROC_ROOT="$fake_proc" \
+        SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+        bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null 2>&1; then
+        fail "health shape unexpectedly accepted: $health_shape"
+    fi
+done
+state_backup="$TEST_ROOT/recorder-state.good"
+cp -- "$fake_home/.codex/history/recorder-state.json" "$state_backup"
+python3 - "$fake_home/.codex/history/recorder-state.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_text()); value["updated_at_unix"] = 1
+path.write_text(json.dumps(value) + "\n")
+PY
+if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_SHAPE=exact CODEX_INFO_PROC_ROOT="$fake_proc" \
+    SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+    bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null 2>&1; then
+    fail 'stale idle recorder heartbeat unexpectedly accepted'
 fi
-assert_state_unchanged "$before_state" 'concurrent updater rejection'
-assert_update_tmp_empty 'concurrent updater rejection'
-grep -Fq -- 'another install, update, or remove is already running' <<<"$concurrent_output" ||
-    fail 'concurrent updater did not report lock contention'
-flock --unlock "$held_lock_fd"
-exec {held_lock_fd}>&-
-printf 'case concurrent-operation-rejection: PASS\n'
+mv -- "$state_backup" "$fake_home/.codex/history/recorder-state.json"
+for recorder_case in ready degraded; do
+    cp -- "$fake_home/.codex/history/recorder-state.json" "$state_backup"
+    python3 - "$fake_home/.codex/history/recorder-state.json" "$recorder_case" <<'PY'
+import json, pathlib, sys, time
+path, case = sys.argv[1:]
+value = json.loads(pathlib.Path(path).read_text())
+value["write_state"] = case
+value["updated_at_unix"] = int(time.time())
+if case == "ready":
+    value.update({"partition_id_hash": "cd" * 32, "data_generation": 1,
+                  "collector_epoch": "ef" * 16, "cycle_seq": 1,
+                  "last_commit_unix": 1})
+pathlib.Path(path).write_text(json.dumps(value) + "\n")
+PY
+    if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+        FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_SHAPE=exact CODEX_INFO_PROC_ROOT="$fake_proc" \
+        SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+        bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null 2>&1; then
+        fail "recorder $recorder_case state unexpectedly accepted"
+    fi
+    mv -- "$state_backup" "$fake_home/.codex/history/recorder-state.json"
+done
+printf 'case health schema/heartbeat rejection: PASS\n'
 
-before_state="$(installation_state_digest)"
-if spoofed_lock_output="$(CODEX_INFO_INSTALL_LOCKED=1 run_update "$archive_v1" 2>&1 \
-    9>"$TEST_ROOT/not-the-install-lock")"; then
-    fail 'spoofed inherited updater lock unexpectedly succeeded'
+write_running_state "$fake_home"
+if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+    FAKE_RELEASE_FAILURE=1 FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    FAKE_HEALTH_VERSION="$health_version" CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+    bash "$fake_home/.local/libexec/codex-info-install.sh" --update >/dev/null 2>&1; then
+    fail 'release API failure unexpectedly reported success'
 fi
-assert_state_unchanged "$before_state" 'spoofed inherited updater lock rejection'
-grep -Fq -- 'inherited installer lock does not match' <<<"$spoofed_lock_output" ||
-    fail 'spoofed inherited updater lock did not report its identity mismatch'
-printf 'case spoofed-inherited-lock-rejection: PASS\n'
+grep -Fq 'curl --fail --silent --show-error --proto =https' "$log" || fail 'release API failure fixture did not query discovery'
+grep -Fq '127.0.0.1:8787/v1/health' "$log" || fail 'release API failure did not read back coherent B'
+write_stopped_state "$fake_home"
+printf 'case release-failure coherent-B readback: PASS\n'
 
-write_fixture_binary 'fixture binary generation two'
+clock_file="$TEST_ROOT/readiness-clock"
+printf '%s\n' "$(date +%s)" > "$clock_file"
+clock_bin="$TEST_ROOT/readiness-clock.sh"
+sleep_bin="$TEST_ROOT/readiness-sleep.sh"
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' 'cat -- "$READINESS_CLOCK_FILE"' > "$clock_bin"
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env bash' 'value="$(<"$READINESS_CLOCK_FILE")"' 'printf "%s\\n" "$((value + ${1:-1}))" > "$READINESS_CLOCK_FILE"' > "$sleep_bin"
+chmod 0755 "$clock_bin" "$sleep_bin"
+health_count="$TEST_ROOT/health-count"
+: > "$health_count"
+write_stopped_state "$fake_home"
+HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+    FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" TMPDIR="$update_tmp" \
+    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_FAILURES=2 FAKE_HEALTH_COUNT_FILE="$health_count" \
+    FAKE_HEALTH_SHAPE=exact CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+    CODEX_INFO_CLOCK_BIN="$clock_bin" CODEX_INFO_SLEEP_BIN="$sleep_bin" READINESS_CLOCK_FILE="$clock_file" \
+    bash "$fake_home/.local/libexec/codex-info-install.sh" --start >/dev/null
+[[ "$(<"$health_count")" -ge 3 ]] || fail 'readiness did not retry transient health failure'
+write_stopped_state "$fake_home"
+printf 'case bounded readiness retry: PASS\n'
+
+# The next fixture models a clean stopped service; leave the prior health
+# owner out of the synthetic proc tree so the updater need not retire it.
+: > "$fake_proc/net/tcp"
+printf 'fixture binary generation two\n' > "$fixture_root/codex_info"
 archive_v2="$(build_bundle 2222222222222222222222222222222222222222 1.0.20)"
-write_release_fixture "$archive_v2" complete
-for probe_case in main-enabled main-active timer-enabled timer-active; do
-    assert_runtime_probe_error_case "$probe_case"
-done
-before_state="$(installation_state_digest)"
-before_update_log_lines="$(( $(wc -l < "$log") + 1 ))"
-if health_failure_output="$(run_update "$archive_v1" 9.9.9 2>&1)"; then
-    fail 'updater health failure unexpectedly succeeded'
+write_release "$archive_v2"
+if CODEX_INFO_INTERRUPT_PHASE=current_switched run_update "$fake_home" >/dev/null 2>&1; then
+    fail 'current_switched interruption unexpectedly succeeded'
 fi
-assert_state_unchanged "$before_state" 'updater health failure rollback'
-assert_update_tmp_empty 'updater health failure rollback'
-assert_rollback_did_not_stop_updater "$before_update_log_lines" 'updater health failure rollback'
-[[ "$(tail -n "+$before_update_log_lines" "$log" | grep -Fc -- 'restart codex-info.service')" -eq 2 ]] ||
-    fail 'updater health failure did not perform one switch and one rollback restart'
-grep -Fq -- 'previous generation restored' <<<"$health_failure_output" ||
-    fail 'confirmed updater rollback did not report the restored generation'
-printf 'case updater-health-failure: PASS\n'
+grep -Fq '"phase": "current_switched"' "$fake_home/.local/share/codex-info/install-transaction.json" ||
+    fail 'interruption did not persist current_switched journal'
+python3 - "$fake_home/.local/share/codex-info/install-transaction.json" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert set(value) == {"schema","operation_id","owner_pid","owner_starttime","boot_id",
+                      "phase","old_generation","new_generation","desired_state","updated_at_unix"}
+assert value["owner_pid"] > 0 and value["owner_starttime"] > 0
+PY
+run_update "$fake_home" >/dev/null
+grep -Fq '"phase": "committed"' "$fake_home/.local/share/codex-info/install-transaction.json" ||
+    fail 'journal did not resume to committed'
+[[ "$(readlink -- "$fake_home/.local/share/codex-info/current")" == generations/1.0.20-* ]] ||
+    fail 'resume did not converge to v2'
+printf 'case journal interruption/resume: PASS\n'
 
-before_state="$(installation_state_digest)"
-before_update_log_lines="$(( $(wc -l < "$log") + 1 ))"
-if FAKE_SYSTEMCTL_MAIN_ENABLED=0 FAKE_SYSTEMCTL_MAIN_ACTIVE=0 \
-    FAKE_SYSTEMCTL_TIMER_ENABLED=0 FAKE_SYSTEMCTL_TIMER_ACTIVE=0 \
-    run_update "$archive_v1" >/dev/null 2>&1; then
-    fail 'inactive-state updater failure unexpectedly succeeded'
+# An active MainPID from a retained, but no-longer-current, managed generation
+# is repairable through systemd.  The updater must restart the unit and never
+# signal the known process directly; readiness then remains bounded because
+# this fixture intentionally does not recreate its listener.
+write_running_state "$fake_home"
+restart_log_start="$(wc -l < "$log")"
+if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+    FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" TMPDIR="$update_tmp" \
+    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+    CODEX_INFO_CLOCK_BIN="$clock_bin" CODEX_INFO_SLEEP_BIN="$sleep_bin" READINESS_CLOCK_FILE="$clock_file" \
+    bash "$fake_home/.local/libexec/codex-info-install.sh" --update >/dev/null 2>&1; then
+    fail 'known old managed MainPID unexpectedly reached a healthy terminal'
 fi
-assert_state_unchanged "$before_state" 'inactive-state updater rollback'
-assert_update_tmp_empty 'inactive-state updater rollback'
-rollback_segment="$(tail -n "+$before_update_log_lines" "$log")"
-rollback_reload_line="$(grep -nF -- 'daemon-reload' <<<"$rollback_segment" | tail -n 1 | cut -d: -f1)"
-rollback_tail="$(tail -n "+$rollback_reload_line" <<<"$rollback_segment")"
-for expected_command in \
-    'disable codex-info-update.timer' 'stop codex-info-update.timer' \
-    'disable codex-info.service' 'stop codex-info.service'; do
-    grep -Fq -- "$expected_command" <<<"$rollback_tail" ||
-        fail "inactive-state updater rollback missed: $expected_command"
-done
-! grep -Fq -- 'restart codex-info.service' <<<"$rollback_tail" ||
-    fail 'inactive-state updater rollback restarted the prior stopped service'
-! grep -Fq -- 'start codex-info-update.timer' <<<"$rollback_tail" ||
-    fail 'inactive-state updater rollback started the prior stopped timer'
-printf 'case updater-runtime-state-rollback: PASS\n'
+tail -n +$((restart_log_start + 1)) "$log" | grep -Fq 'systemctl --user restart --no-block codex-info.service' ||
+    fail 'known old managed MainPID was not repaired through systemd restart'
+tail -n +$((restart_log_start + 1)) "$log" | grep -Fq 'systemctl --user reset-failed codex-info.service' ||
+    fail 'managed restart did not reset the start-limit epoch'
+write_stopped_state "$fake_home"
+printf 'case known-managed wrong-PID systemd repair: PASS\n'
 
-before_profile_state="$(profile_state_digest)"
-before_update_log_lines="$(( $(wc -l < "$log") + 1 ))"
-rm -f -- "$log.health-count"
-FAKE_CURL_HEALTH_TRANSIENT_FAILURES=1 run_update "$archive_v1" >/dev/null
-assert_binary_marker "$fake_home/.local/bin/codex_info" 'fixture binary generation two'
-[[ "$(tail -n "+$before_update_log_lines" "$log" | grep -Fc -- 'restart codex-info.service')" -eq 1 ]] ||
-    fail 'successful update did not perform exactly one service restart'
-[[ "$(tail -n "+$before_update_log_lines" "$log" |
-    grep -Fc -- 'curl --fail --silent --max-time 1 http://127.0.0.1:8787/v1/health')" -eq 2 ]] ||
-    fail 'successful update did not retry delayed health readiness exactly once'
-[[ "$(profile_state_digest)" == "$before_profile_state" ]] ||
-    fail 'successful delayed-health update changed profile data'
-assert_update_tmp_empty 'complete five-asset update'
-printf 'case delayed-update-health-readiness: PASS\n'
-printf 'case complete-five-asset-update: PASS\n'
-
-write_release_fixture "$archive_v1" complete
-before_state="$(installation_state_digest)"
-before_update_log_lines="$(( $(wc -l < "$log") + 1 ))"
-run_update "$archive_v2" >/dev/null
-assert_state_unchanged "$before_state" 'older-version no-update'
-assert_no_restart_since "$before_update_log_lines" 'older-version no-update'
-if tail -n "+$before_update_log_lines" "$log" | grep -Fq -- '/download/'; then
-    fail 'older-version no-update downloaded release assets'
+exec {held_fd}>"$fake_home/.local/share/codex-info/.install.lock"
+flock --exclusive --nonblock "$held_fd"
+if run_update "$fake_home" >/dev/null 2>&1; then
+    fail 'concurrent L1 operation unexpectedly succeeded'
 fi
-assert_update_tmp_empty 'older-version no-update'
-printf 'case older-version-no-update: PASS\n'
+exec {held_fd}>&-
+printf 'case concurrent-L1 rejection: PASS\n'
 
-write_fixture_binary 'fixture binary generation three'
-archive_v3="$(build_bundle 3333333333333333333333333333333333333333 1.0.21)"
-for release_shape in draft prerelease; do
-    write_release_fixture "$archive_v3" "$release_shape"
-    before_state="$(installation_state_digest)"
-    before_update_log_lines="$(( $(wc -l < "$log") + 1 ))"
-    run_update "$archive_v2" >/dev/null
-    assert_state_unchanged "$before_state" "$release_shape Release ignore"
-    assert_no_restart_since "$before_update_log_lines" "$release_shape Release ignore"
-    if tail -n "+$before_update_log_lines" "$log" | grep -Fq -- '/download/'; then
-        fail "$release_shape Release downloaded assets"
-    fi
-    assert_update_tmp_empty "$release_shape Release ignore"
-    printf 'case release-%s-ignore: PASS\n' "$release_shape"
+legacy_home="$TEST_ROOT/legacy-home"
+write_stopped_state "$legacy_home"
+mkdir -p -- "$legacy_home/.local/bin" "$legacy_home/.local/libexec" \
+    "$legacy_home/.local/share/codex-info" "$legacy_home/.config/systemd/user"
+tar -xOf "$archive_v1" codex_info > "$legacy_home/.local/bin/codex_info"
+tar -xOf "$archive_v1" install.sh > "$legacy_home/.local/libexec/codex-info-install.sh"
+tar -xOf "$archive_v1" codex-info.service > "$legacy_home/.config/systemd/user/codex-info.service"
+tar -xOf "$archive_v1" codex-info-update.service > "$legacy_home/.config/systemd/user/codex-info-update.service"
+tar -xOf "$archive_v1" codex-info-update.timer > "$legacy_home/.config/systemd/user/codex-info-update.timer"
+chmod 0755 "$legacy_home/.local/bin/codex_info" "$legacy_home/.local/libexec/codex-info-install.sh"
+chmod 0644 "$legacy_home/.config/systemd/user/codex-info.service" \
+    "$legacy_home/.config/systemd/user/codex-info-update.service" \
+    "$legacy_home/.config/systemd/user/codex-info-update.timer"
+python3 - "$archive_v1" "$legacy_home/.local/share/codex-info/manifest.json" <<'PY'
+import json, pathlib, tarfile, sys
+archive_name, manifest_name = sys.argv[1:]
+with tarfile.open(archive_name, "r:gz") as archive:
+    document = json.loads(archive.extractfile("manifest.json").read())
+document["files"] = [
+    {key: value for key, value in entry.items() if key != "mode"}
+    for entry in document["files"] if entry["path"] != "run.sh"
+]
+pathlib.Path(manifest_name).write_text(json.dumps(document, indent=2) + "\n")
+PY
+chmod 0644 "$legacy_home/.local/share/codex-info/manifest.json"
+run_install "$archive_v1" "$legacy_home" >/dev/null
+[[ "$(find "$legacy_home/.local/share/codex-info/legacy-backups" -type f | wc -l)" -ge 6 ]] ||
+    fail 'legacy regular files were not backed up'
+printf 'case legacy migration/journal: PASS\n'
+
+run_remove() {
+    HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+        bash "$fake_home/.local/libexec/codex-info-install.sh" --remove
+}
+run_remove >/dev/null
+for path in \
+    "$fake_home/.config/systemd/user/codex-info.service" \
+    "$fake_home/.config/systemd/user/codex-info-update.service" \
+    "$fake_home/.config/systemd/user/codex-info-update.timer"; do
+    [[ ! -e "$path" && ! -L "$path" ]] || fail "remove retained unit link: $path"
 done
+assert_symlink "$fake_home/.local/bin/codex-info"
+assert_symlink "$fake_home/.local/libexec/codex-info-install.sh"
+assert_symlink "$fake_home/.local/share/codex-info/current"
+assert_file "$fake_home/.codex/session.jsonl"
+python3 - "$fake_home/.local/share/codex-info/control-state.json" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert set(value) == {"schema","desired_state","boot_id","operation_id","generation_id","updated_at_unix"}
+assert value["desired_state"] == "removed"
+PY
+printf 'case remove-retention/control-state: PASS\n'
 
-for release_shape in \
-    linux-only windows-only extra unpublished malformed-json bad-tag \
-    bad-url bad-state bad-size bad-digest bad-checksum bad-manifest \
-    bad-manifest-version bad-archive-content; do
-    write_release_fixture "$archive_v3" "$release_shape"
-    before_state="$(installation_state_digest)"
-    before_update_log_lines="$(( $(wc -l < "$log") + 1 ))"
-    if rejection_output="$(run_update "$archive_v2" 2>&1)"; then
-        fail "$release_shape Release unexpectedly succeeded"
-    fi
-    assert_state_unchanged "$before_state" "$release_shape Release rejection"
-    assert_no_restart_since "$before_update_log_lines" "$release_shape Release rejection"
-    assert_update_tmp_empty "$release_shape Release rejection"
-    [[ "$rejection_output" != *UPDATE_SECRET_SENTINEL* ]] ||
-        fail "$release_shape Release exposed raw metadata in updater output"
-    printf 'case release-%s-rejection: PASS\n' "$release_shape"
-done
-
-write_release_fixture "$archive_v3" complete
-before_state="$(installation_state_digest)"
-before_update_log_lines="$(( $(wc -l < "$log") + 1 ))"
-if FAKE_CURL_EFFECTIVE_URL='https://example.invalid/redirected-asset' \
-    run_update "$archive_v2" >/dev/null 2>&1; then
-    fail 'off-boundary release redirect unexpectedly succeeded'
+# Removal is reversible through the retained verified generation: --start
+# must republish only the missing unit links before attempting activation.
+write_running_state "$fake_home"
+if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+    FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" TMPDIR="$update_tmp" \
+    CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+    CODEX_INFO_CLOCK_BIN="$clock_bin" CODEX_INFO_SLEEP_BIN="$sleep_bin" READINESS_CLOCK_FILE="$clock_file" \
+    bash "$fake_home/.local/libexec/codex-info-install.sh" --start >/dev/null 2>&1; then
+    fail 'remove-to-start fixture unexpectedly reached healthy fake service'
 fi
-assert_state_unchanged "$before_state" 'off-boundary release redirect rejection'
-assert_no_restart_since "$before_update_log_lines" 'off-boundary release redirect rejection'
-assert_update_tmp_empty 'off-boundary release redirect rejection'
-printf 'case release-redirect-boundary-rejection: PASS\n'
+for path in \
+    "$fake_home/.config/systemd/user/codex-info.service" \
+    "$fake_home/.config/systemd/user/codex-info-update.service" \
+    "$fake_home/.config/systemd/user/codex-info-update.timer"; do
+    assert_symlink "$path"
+done
+write_stopped_state "$fake_home"
+printf 'case remove-to-start unit republish: PASS\n'
 
-write_release_fixture "$archive_v3" complete
-rm -f -- "$log.restart-failed"
-before_state="$(installation_state_digest)"
-before_update_log_lines="$(( $(wc -l < "$log") + 1 ))"
-if FAKE_SYSTEMCTL_FAIL_RESTART_ONCE=1 run_update "$archive_v2" >/dev/null 2>&1; then
-    fail 'updater restart failure unexpectedly succeeded'
-fi
-assert_state_unchanged "$before_state" 'updater restart failure rollback'
-assert_update_tmp_empty 'updater restart failure rollback'
-assert_rollback_did_not_stop_updater "$before_update_log_lines" 'updater restart failure rollback'
-[[ "$(tail -n "+$before_update_log_lines" "$log" | grep -Fc -- 'restart codex-info.service')" -eq 2 ]] ||
-    fail 'updater restart failure did not perform one failed switch and one rollback restart'
-printf 'case updater-installer-failure: PASS\n'
-
-before_state="$(installation_state_digest)"
-before_update_log_lines="$(( $(wc -l < "$log") + 1 ))"
-if rollback_output="$(FAKE_SYSTEMCTL_FAIL_DAEMON_RELOAD=1 run_update "$archive_v2" 2>&1)"; then
-    fail 'unconfirmed updater rollback unexpectedly succeeded'
-fi
-assert_state_unchanged "$before_state" 'unconfirmed updater rollback'
-assert_update_tmp_empty 'unconfirmed updater rollback'
-assert_rollback_did_not_stop_updater "$before_update_log_lines" 'unconfirmed updater rollback'
-grep -Fq -- 'manual recovery may be required' <<<"$rollback_output" ||
-    fail 'unconfirmed updater rollback did not report manual recovery'
-[[ "$rollback_output" != *'previous generation restored'* ]] ||
-    fail 'unconfirmed updater rollback incorrectly reported a restored generation'
-printf 'case updater-rollback-confirmation-failure: PASS\n'
-
-if FAKE_SYSTEMCTL_FAIL_DAEMON_RELOAD=1 run_remove "$archive_v3" >/dev/null 2>&1; then
-    fail 'remove daemon-reload failure unexpectedly succeeded'
-fi
-for retained in \
-    "$fake_home/.codex/usage_history.sqlite3" \
-    "$fake_home/.codex/usage_history.sqlite3.bak.1" \
-    "$fake_home/.codex/usage_reset_hint.json" \
-    "$fake_home/.codex/session.jsonl" \
-    "$fake_home/.config/codex-info/settings.json"; do
-    [[ -f "$retained" ]] || fail "failed remove deleted retained data: $retained"
-done
-printf 'case remove-failure-propagation: PASS\n'
-before_remove_log_lines="$(( $(wc -l < "$log") + 1 ))"
-run_remove "$archive_v3" >/dev/null
-for stale_command in \
-    'disable --now codex-info-update.timer' 'stop codex-info-update.service' \
-    'disable --now codex-info.service'; do
-    tail -n "+$before_remove_log_lines" "$log" | grep -Fq -- "$stale_command" ||
-        fail "remove did not clear loaded unit with a missing file: $stale_command"
-done
-for removed_unit in codex-info.service codex-info-update.service codex-info-update.timer; do
-    [[ ! -e "$fake_home/.config/systemd/user/$removed_unit" ]] ||
-        fail "remove retained unit: $removed_unit"
-    if [[ "$removed_unit" == codex-info-update.service ]]; then
-        grep -Eq -- "systemctl --user (stop|disable( --now)?) $removed_unit($| )" "$log" ||
-            fail "remove did not stop/disable unit: $removed_unit"
-    else
-        grep -Eq -- "systemctl --user disable( --now)? $removed_unit($| )" "$log" ||
-            fail "remove did not disable unit: $removed_unit"
-    fi
-done
-FAKE_SYSTEMCTL_LOAD_STATE=not-found run_remove "$archive_v3" >/dev/null
-[[ -f "$fake_home/.local/bin/codex_info" ]] || fail 'remove deleted installed binary'
-[[ -f "$fake_home/.local/libexec/codex-info-install.sh" ]] ||
-    fail 'remove deleted persistent installer'
-[[ -f "$fake_home/.local/share/codex-info/manifest.json" ]] ||
-    fail 'remove deleted installed manifest'
-for retained in \
-    "$fake_home/.codex/usage_history.sqlite3" \
-    "$fake_home/.codex/usage_history.sqlite3.bak.1" \
-    "$fake_home/.codex/usage_reset_hint.json" \
-    "$fake_home/.codex/session.jsonl" \
-    "$fake_home/.config/codex-info/settings.json"; do
-    [[ -f "$retained" ]] || fail "remove deleted retained data: $retained"
-done
-printf 'case remove-retention: PASS\n'
-printf 'linux-bundle-test: PASS (canonical version/target/compatibility, persistent boot/daily updater, exact-five release selection, integrity-before-replace, confirmed rollback, remove retention)\n'
+grep -Fq 'OnActiveSec=5min' "$ROOT_DIR/packaging/codex-info-update.timer"
+grep -Fq 'OnUnitActiveSec=1h' "$ROOT_DIR/packaging/codex-info-update.timer"
+grep -Fq 'AccuracySec=1s' "$ROOT_DIR/packaging/codex-info-update.timer"
+grep -Fq 'Restart=always' "$ROOT_DIR/packaging/codex-info.service"
+grep -Fq 'RestartSec=5s' "$ROOT_DIR/packaging/codex-info.service"
+grep -Fq 'TimeoutStartSec=1h20min31s' "$ROOT_DIR/packaging/codex-info-update.service"
+printf 'linux bundle contract cases passed\n'

@@ -11,14 +11,14 @@
 use crate::account_scope::{self, AccountPartition};
 use crate::security;
 use crate::usage_store::{
-    RecordedSessionSource, SessionCheckpoint, SessionCollectionCommit, SessionModelTotal,
-    SessionRange, StoragePartitionIdentity, UsageHistorySample, UsageStore,
+    RecordedSessionSource, RecorderGap, SessionCheckpoint, SessionCollectionCommit,
+    SessionModelTotal, SessionRange, StoragePartitionIdentity, UsageHistorySample, UsageStore,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
@@ -27,6 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 pub(crate) const RESET_HINT_FILE_NAME: &str = "usage_reset_hint.json";
 pub(crate) const DAEMON_LOCK_FILE_NAME: &str = "usage_record_daemon.lock";
+pub(crate) const RECORDER_STATE_FILE_NAME: &str = "recorder-state.json";
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const MIN_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const MAX_INTERVAL: Duration = Duration::from_secs(60 * 60);
@@ -34,9 +35,107 @@ pub(crate) const MAX_INTERVAL: Duration = Duration::from_secs(60 * 60);
 #[cfg(test)]
 const MAX_HINT_BYTES: u64 = 4 * 1024;
 const MAX_LOCK_BYTES: u64 = 4 * 1024;
-const STALE_LOCK_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 #[cfg(test)]
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(test))]
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[allow(dead_code)]
+const MAX_RECORDER_STATE_BYTES: u64 = 8 * 1024;
+const RECORDER_STATE_SCHEMA: &str = "codex-info-recorder-state-v1";
+pub(crate) const RECORDER_LAST_COMMIT_MAX_AGE_SECS: i64 = 150;
+const MAX_RECORDER_UNIX_TIMESTAMP: i64 = 253_402_300_799;
+#[cfg(target_os = "linux")]
+const MAX_PROC_UPTIME_BYTES: usize = 128;
+const MAX_SOURCE_RESCAN_SAMPLES: usize = 31 * 24 * 60;
+
+pub(crate) fn monotonic_now_ns() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        return read_proc_uptime_ns().unwrap_or(0);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // A process-relative Instant cannot order persisted values after a
+        // restart.  There is no supported boot-wide source on this target,
+        // so callers receive the invalid zero sentinel and fail closed.
+        0
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_uptime_ns(contents: &[u8]) -> Option<u64> {
+    let token = contents
+        .split(|byte| byte.is_ascii_whitespace())
+        .next()
+        .filter(|token| !token.is_empty())?;
+    let mut seconds = 0_u64;
+    let mut fraction = 0_u64;
+    let mut fraction_digits = 0_usize;
+    let mut saw_decimal = false;
+    for byte in token {
+        match byte {
+            b'0'..=b'9' if saw_decimal => {
+                if fraction_digits >= 9 {
+                    return None;
+                }
+                fraction = fraction
+                    .checked_mul(10)?
+                    .checked_add(u64::from(byte - b'0'))?;
+                fraction_digits += 1;
+            }
+            b'0'..=b'9' => {
+                seconds = seconds
+                    .checked_mul(10)?
+                    .checked_add(u64::from(byte - b'0'))?;
+            }
+            b'.' if !saw_decimal => saw_decimal = true,
+            _ => return None,
+        }
+    }
+    let scale = 10_u64.checked_pow(u32::try_from(9_usize.saturating_sub(fraction_digits)).ok()?)?;
+    seconds
+        .checked_mul(1_000_000_000)?
+        .checked_add(fraction.checked_mul(scale)?)
+        .filter(|value| *value > 0)
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_uptime_ns() -> Option<u64> {
+    let file = File::open("/proc/uptime").ok()?;
+    let mut contents = Vec::with_capacity(MAX_PROC_UPTIME_BYTES);
+    file.take(u64::try_from(MAX_PROC_UPTIME_BYTES + 1).ok()?)
+        .read_to_end(&mut contents)
+        .ok()?;
+    if contents.len() > MAX_PROC_UPTIME_BYTES {
+        return None;
+    }
+    parse_proc_uptime_ns(&contents)
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecorderWriteState {
+    IdleNoAccount,
+    Ready,
+    Degraded,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecorderState {
+    pub(crate) schema: String,
+    pub(crate) pid: u32,
+    pub(crate) process_starttime: u64,
+    pub(crate) owner_nonce: String,
+    pub(crate) write_state: RecorderWriteState,
+    pub(crate) partition_id_hash: Option<String>,
+    pub(crate) data_generation: Option<u64>,
+    pub(crate) collector_epoch: Option<String>,
+    pub(crate) cycle_seq: Option<u64>,
+    pub(crate) last_commit_unix: Option<i64>,
+    pub(crate) updated_at_unix: i64,
+}
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -69,6 +168,307 @@ pub(crate) fn reset_hint_path() -> Option<PathBuf> {
 
 pub(crate) fn daemon_lock_path() -> Option<PathBuf> {
     crate::usage_data_root().map(|root| root.join("history").join(DAEMON_LOCK_FILE_NAME))
+}
+
+pub(crate) fn recorder_state_path() -> Option<PathBuf> {
+    crate::usage_data_root().map(|root| root.join("history").join(RECORDER_STATE_FILE_NAME))
+}
+
+#[allow(dead_code)]
+fn read_recorder_state_path() -> Option<PathBuf> {
+    let root = std::env::var_os("CODEX_INFO_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(crate::default_codex_root);
+    if !root.is_absolute() {
+        return None;
+    }
+    security::validate_absolute_root(&root)
+        .ok()
+        .map(|root| root.join("history").join(RECORDER_STATE_FILE_NAME))
+}
+
+fn valid_lower_hex(value: &str, bytes: usize) -> bool {
+    value.len() == bytes.saturating_mul(2)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn partition_id_hash(partition_id: &str) -> String {
+    let digest = Sha256::digest(partition_id.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+impl RecorderState {
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != RECORDER_STATE_SCHEMA
+            || self.pid == 0
+            || self.process_starttime == 0
+            || !valid_lower_hex(&self.owner_nonce, 16)
+            || self.updated_at_unix <= 0
+            || self.updated_at_unix > MAX_RECORDER_UNIX_TIMESTAMP
+            || self.updated_at_unix
+                > unix_now()
+                    .max(1)
+                    .saturating_add(RECORDER_LAST_COMMIT_MAX_AGE_SECS)
+            || self.data_generation.is_some_and(|value| value == 0)
+            || self
+                .partition_id_hash
+                .as_deref()
+                .is_some_and(|value| !valid_lower_hex(value, 32))
+            || self.collector_epoch.as_deref().is_some_and(|value| {
+                !valid_lower_hex(value, 16) || value.bytes().all(|b| b == b'0')
+            })
+            || self.cycle_seq.is_some_and(|value| value == 0)
+            || self.last_commit_unix.is_some_and(|value| {
+                value <= 0
+                    || value > MAX_RECORDER_UNIX_TIMESTAMP
+                    || value > unix_now().max(1)
+                    || value > self.updated_at_unix
+            })
+        {
+            return Err("recorder state identity or bounds are invalid".into());
+        }
+        match self.write_state {
+            RecorderWriteState::IdleNoAccount
+                if self.partition_id_hash.is_none()
+                    && self.data_generation.is_none()
+                    && self.collector_epoch.is_none()
+                    && self.cycle_seq.is_none()
+                    && self.last_commit_unix.is_none() => {}
+            RecorderWriteState::Ready
+                if self.partition_id_hash.is_some()
+                    && self.data_generation.is_some()
+                    && self.collector_epoch.is_some()
+                    && self.cycle_seq.is_some()
+                    && self.last_commit_unix.is_some() => {}
+            RecorderWriteState::Degraded if self.partition_id_hash.is_some() => {}
+            _ => return Err("recorder state write_state fields are inconsistent".into()),
+        }
+        Ok(())
+    }
+}
+
+fn recorder_state_for_lock(
+    lock: &DaemonLock,
+    write_state: RecorderWriteState,
+    partition_id: Option<&str>,
+    data_generation: Option<u64>,
+    collector_epoch: Option<u128>,
+    cycle_seq: Option<u64>,
+    last_commit_unix: Option<i64>,
+) -> RecorderState {
+    let partition_id_hash = partition_id.map(partition_id_hash);
+    RecorderState {
+        schema: RECORDER_STATE_SCHEMA.to_owned(),
+        pid: lock.record.pid,
+        process_starttime: lock.record.starttime_ticks,
+        owner_nonce: lock.record.owner_nonce.clone(),
+        write_state,
+        partition_id_hash,
+        data_generation,
+        collector_epoch: collector_epoch.map(|epoch| format!("{epoch:032x}")),
+        cycle_seq,
+        last_commit_unix,
+        updated_at_unix: unix_now().max(1),
+    }
+}
+
+/// Convert a prior owner-only state into an explicit pending stop/restart
+/// interval once the matching account partition is admitted.  The state file
+/// contains only the partition hash, so this proof is completed at the
+/// account boundary; a different account can never inherit the old gap.
+fn pending_gap_from_previous_state(
+    previous: &RecorderState,
+    partition: &AccountPartition,
+) -> Option<RecorderGap> {
+    if previous.write_state == RecorderWriteState::IdleNoAccount
+        || previous.partition_id_hash.as_deref()
+            != Some(partition_id_hash(&partition.partition_id).as_str())
+    {
+        return None;
+    }
+    let stopped_at_monotonic_ns = monotonic_now_ns();
+    if stopped_at_monotonic_ns == 0 {
+        return None;
+    }
+    let now = unix_now().max(1);
+    let start_at = previous
+        .last_commit_unix
+        .filter(|timestamp| *timestamp > 0 && *timestamp <= now)
+        .unwrap_or(now);
+    let owner_collector_epoch = previous
+        .collector_epoch
+        .as_deref()
+        .and_then(|value| u128::from_str_radix(value, 16).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+    let confirmation_cycle_seq = previous.cycle_seq.filter(|value| *value > 0).unwrap_or(1);
+    let mut digest = Sha256::new();
+    digest.update(b"codex-info-recorder-restart-gap-v1\0");
+    digest.update(previous.owner_nonce.as_bytes());
+    digest.update(previous.pid.to_be_bytes());
+    digest.update(previous.process_starttime.to_be_bytes());
+    digest.update(partition.partition_id.as_bytes());
+    let digest = digest.finalize();
+    Some(RecorderGap {
+        gap_id: digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        partition_id: partition.partition_id.clone(),
+        source_identity_before: format!("resident:{}", partition.partition_id),
+        source_identity_after: "unresolved".into(),
+        cursor_before: format!(
+            "generation-{}",
+            previous.data_generation.unwrap_or_default()
+        ),
+        cursor_after: "unresolved".into(),
+        stopped_at_monotonic_ns,
+        resumed_at_monotonic_ns: None,
+        start_at,
+        end_at: now,
+        reset_at: None,
+        reason: "daemon_stop_unrecoverable".into(),
+        state: "pending".into(),
+        owner_collector_epoch,
+        confirmation_cycle_seq,
+    })
+}
+
+fn lock_is_current(lock: &DaemonLock) -> bool {
+    let Ok(path_metadata) = fs::symlink_metadata(&lock.path) else {
+        return false;
+    };
+    let Ok(file_metadata) = lock.file.metadata() else {
+        return false;
+    };
+    !path_metadata.file_type().is_symlink()
+        && path_metadata.is_file()
+        && lock_identity_from_metadata(&path_metadata) == lock.identity
+        && lock_identity_from_metadata(&file_metadata) == lock.identity
+}
+
+fn persist_recorder_state(lock: &DaemonLock, state: &RecorderState) -> Result<(), String> {
+    if !lock_is_current(lock) {
+        return Err("recorder profile lock changed before state write".into());
+    }
+    state.validate()?;
+    let path =
+        recorder_state_path().ok_or_else(|| "recorder state root is unavailable".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "recorder state parent is unavailable".to_owned())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    // `create_dir_all` succeeds for an existing symlink.  Validate the
+    // complete parent chain before changing permissions or replacing the
+    // state path so a hostile `history` link can never redirect this owner
+    // record outside the configured data root.
+    security::validate_absolute_root(parent)
+        .map_err(|_| "recorder state parent is unsafe".to_owned())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("recorder state path is not a regular file".into());
+        }
+    }
+    let bytes = serde_json::to_vec(state).map_err(|error| error.to_string())?;
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{RECORDER_STATE_FILE_NAME}.tmp-{}-{counter}",
+        std::process::id()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    let result = (|| -> Result<(), String> {
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
+        file.write_all(b"\n").map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        drop(file);
+        if !lock_is_current(lock) {
+            return Err("recorder profile lock changed during state write".into());
+        }
+        fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Read and validate the owner-only recorder state without changing the data
+/// root. Packaging and tests use this helper as the liveness oracle.
+#[allow(dead_code)]
+pub(crate) fn read_recorder_state() -> Result<Option<RecorderState>, String> {
+    let Some(path) = read_recorder_state_path() else {
+        return Ok(None);
+    };
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_RECORDER_STATE_BYTES
+    {
+        return Err("recorder state file is invalid".into());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "recorder state parent is unavailable".to_owned())?;
+    security::validate_absolute_root(parent)
+        .map_err(|_| "recorder state parent is unsafe".to_owned())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err("recorder state file is not owner-private".into());
+        }
+    }
+    let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+    let value = crate::decode_unique_json(&bytes)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "recorder state is not an object".to_owned())?;
+    const KEYS: [&str; 11] = [
+        "schema",
+        "pid",
+        "process_starttime",
+        "owner_nonce",
+        "write_state",
+        "partition_id_hash",
+        "data_generation",
+        "collector_epoch",
+        "cycle_seq",
+        "last_commit_unix",
+        "updated_at_unix",
+    ];
+    if object.len() != KEYS.len() || KEYS.iter().any(|key| !object.contains_key(*key)) {
+        return Err("recorder state key set is invalid".into());
+    }
+    let state: RecorderState = serde_json::from_value(value).map_err(|error| error.to_string())?;
+    state.validate()?;
+    Ok(Some(state))
 }
 
 /// Resolve the profile lock for `--stop` without creating a missing data
@@ -307,7 +707,7 @@ impl LockRecord {
             && self.starttime_ticks > 0
             && self.executable_device > 0
             && self.executable_inode > 0
-            && self.owner_nonce.len() == 32
+            && valid_lower_hex(&self.owner_nonce, 16)
     }
 
     fn matches_process(&self, identity: &ProcessIdentity) -> bool {
@@ -324,7 +724,7 @@ impl LockRecord {
 /// authority again.  Unknown keys are rejected so a future schema cannot be
 /// mistaken for this stop contract without an explicit parser update.
 fn parse_lock_record(bytes: &[u8]) -> Option<LockRecord> {
-    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    let value = crate::decode_unique_json(bytes).ok()?;
     let object = value.as_object()?;
     const REQUIRED_KEYS: [&str; 6] = [
         "pid",
@@ -464,9 +864,38 @@ fn read_lock_snapshot_for_phase_with_hook(
     }))
 }
 
+#[cfg(test)]
 fn current_lock_owner_pid_at(path: &Path) -> Option<u32> {
     let snapshot = read_lock_snapshot(path).ok().flatten()?;
     lock_owner_is_current(&snapshot.record).then_some(snapshot.record.pid)
+}
+
+/// A process-instance-bound owner token for callers that need to pair a
+/// listener response with the exact lock owner. PID alone is insufficient
+/// across rapid exit/restart and PID reuse; retain the same starttime,
+/// executable device/inode, and nonce that the stop contract validates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DaemonOwnerIdentity {
+    pub(crate) pid: u32,
+    pub(crate) starttime_ticks: u64,
+    pub(crate) executable_device: u64,
+    pub(crate) executable_inode: u64,
+    pub(crate) owner_nonce: String,
+}
+
+pub(crate) fn current_daemon_owner_identity() -> Option<DaemonOwnerIdentity> {
+    let snapshot = read_lock_snapshot(&daemon_lock_path()?).ok().flatten()?;
+    let process = process_identity(snapshot.record.pid)?;
+    snapshot
+        .record
+        .matches_process(&process)
+        .then_some(DaemonOwnerIdentity {
+            pid: snapshot.record.pid,
+            starttime_ticks: snapshot.record.starttime_ticks,
+            executable_device: snapshot.record.executable_device,
+            executable_inode: snapshot.record.executable_inode,
+            owner_nonce: snapshot.record.owner_nonce,
+        })
 }
 
 /// Return only the PID from a complete, current recorder lock identity.
@@ -474,7 +903,104 @@ fn current_lock_owner_pid_at(path: &Path) -> Option<u32> {
 /// concurrently-started winner; malformed, stale, or replaced locks are not
 /// treated as authority.
 pub(crate) fn current_daemon_owner_pid() -> Option<u32> {
-    current_lock_owner_pid_at(&daemon_lock_path()?)
+    current_daemon_owner_identity().map(|owner| owner.pid)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerClassification {
+    NoOwner,
+    ManagedActive,
+    KnownUnmanagedCodex,
+    Stale,
+    Malformed,
+    Foreign,
+}
+
+#[cfg(target_os = "linux")]
+fn process_has_managed_marker(pid: u32) -> bool {
+    let path = Path::new("/proc").join(pid.to_string()).join("environ");
+    fs::read(path)
+        .ok()
+        .map(|bytes| {
+            bytes
+                .split(|byte| *byte == 0)
+                .any(|entry| entry == b"CODEX_INFO_SYSTEMD_MANAGED=1")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_has_managed_marker(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_known_codex(identity: &ProcessIdentity) -> bool {
+    let process_root = Path::new("/proc").join(identity.pid.to_string());
+    let executable = fs::read_link(process_root.join("exe"))
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_owned()));
+    let executable_name = executable.as_deref().and_then(|name| name.to_str());
+    let executable_name = matches!(executable_name, Some("codex_info" | "codex-info"));
+    if !executable_name {
+        return false;
+    }
+    let command_line = fs::read(process_root.join("cmdline")).ok();
+    let Some(command_line) = command_line else {
+        return false;
+    };
+    let args = command_line
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .collect::<Vec<_>>();
+    if args.len() != 3 || args[1] != b"--port" {
+        return false;
+    }
+    let valid_port = args[2].iter().all(u8::is_ascii_digit) && !args[2].is_empty() && {
+        let port = args[2].iter().fold(0_u32, |value, byte| {
+            value
+                .saturating_mul(10)
+                .saturating_add(u32::from(*byte - b'0'))
+        });
+        (1..=u32::from(u16::MAX)).contains(&port)
+    };
+    valid_port
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_is_known_codex(_identity: &ProcessIdentity) -> bool {
+    false
+}
+
+pub(crate) fn classify_profile_owner() -> OwnerClassification {
+    let Some(path) = daemon_lock_path() else {
+        return OwnerClassification::Malformed;
+    };
+    let path_exists = fs::symlink_metadata(&path).is_ok();
+    let snapshot = match read_lock_snapshot(&path) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return if path_exists {
+                OwnerClassification::Malformed
+            } else {
+                OwnerClassification::NoOwner
+            };
+        }
+        Err(_) => return OwnerClassification::Malformed,
+    };
+    let Some(identity) = process_identity(snapshot.record.pid) else {
+        return OwnerClassification::Stale;
+    };
+    if !snapshot.record.matches_process(&identity) {
+        return OwnerClassification::Stale;
+    }
+    if process_has_managed_marker(identity.pid) {
+        OwnerClassification::ManagedActive
+    } else if process_is_known_codex(&identity) {
+        OwnerClassification::KnownUnmanagedCodex
+    } else {
+        OwnerClassification::Foreign
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -573,28 +1099,30 @@ fn lock_is_stale(path: &Path) -> Result<bool, DaemonError> {
         .map_err(DaemonError::Lock)?
         .read_to_end(&mut bytes)
         .map_err(DaemonError::Lock)?;
-    if let Ok(record) = serde_json::from_slice::<LockRecord>(&bytes) {
-        let _ = record.started_at;
+    if let Some(record) = parse_lock_record(&bytes) {
         return Ok(!lock_owner_is_current(&record));
     }
-    let old_enough = metadata
-        .modified()
-        .ok()
-        .and_then(|value| SystemTime::now().duration_since(value).ok())
-        .is_some_and(|age| age >= STALE_LOCK_AGE);
-    Ok(old_enough)
+    // A malformed/unknown lock is not stale evidence. Preserve it so a
+    // managed activation fails closed instead of silently deleting a foreign
+    // owner's coordination record.
+    Ok(false)
 }
 
 struct DaemonLock {
     path: PathBuf,
     file: File,
     identity: LockIdentity,
+    record: LockRecord,
 }
 
 impl DaemonLock {
     fn acquire(path: PathBuf) -> Result<Option<Self>, DaemonError> {
         let parent = path.parent().ok_or(DaemonError::DataRoot)?;
         fs::create_dir_all(parent).map_err(DaemonError::Lock)?;
+        // Do not follow an existing symlink at the profile-lock directory.
+        // This check must precede chmod and create_new so lock authority
+        // remains within the configured, owner-private data root.
+        security::validate_absolute_root(parent).map_err(|_| DaemonError::DataRoot)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -642,6 +1170,11 @@ impl DaemonLock {
                                 path,
                                 file,
                                 identity: lock_identity_from_metadata(&metadata),
+                                record: serde_json::from_slice(&record).map_err(|_| {
+                                    DaemonError::Lock(std::io::Error::other(
+                                        "lock identity serialization failed",
+                                    ))
+                                })?,
                             }));
                         }
                         Err(error) => {
@@ -732,6 +1265,38 @@ pub(crate) struct RecorderGeneration {
     pub(crate) session_checkpoints: Vec<SessionCheckpoint>,
     pub(crate) session_ranges: Vec<SessionRange>,
     pub(crate) session_model_totals: Vec<SessionModelTotal>,
+    pub(crate) bounded_source_rescan_complete: bool,
+}
+
+/// A source closure is accepted only when the bounded collection result has at
+/// least one actual quota observation for the admitted reset period. Session
+/// backfill rows have a null quota and are excluded from this proof; an empty
+/// quota result never proves that the source was closed.
+fn quota_source_rescan_is_closed(
+    samples: &[UsageHistorySample],
+    reset_at: i64,
+    bounded_source_rescan_complete: bool,
+) -> bool {
+    let quota_samples = samples
+        .iter()
+        .filter(|sample| {
+            sample.reset_at == reset_at
+                && sample.remaining_percent.is_some()
+                && sample.timestamp > 0
+                && sample.timestamp.rem_euclid(60) == 0
+        })
+        .collect::<Vec<_>>();
+    bounded_source_rescan_complete
+        && !quota_samples.is_empty()
+        && quota_samples.len() <= MAX_SOURCE_RESCAN_SAMPLES
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RecorderCommitAck {
+    pub(crate) data_generation: u64,
+    pub(crate) collector_epoch: u128,
+    pub(crate) cycle_seq: u64,
+    pub(crate) last_commit_unix: i64,
 }
 
 enum RecorderCommand {
@@ -746,12 +1311,20 @@ enum RecorderCommand {
     Store {
         partition_id: String,
         generation: RecorderGeneration,
-        committed: mpsc::SyncSender<Result<(), String>>,
+        committed: mpsc::SyncSender<Result<RecorderCommitAck, String>>,
     },
     ForgetRecordedSessions {
         partition_id: String,
         recorded_sessions: Vec<RecordedSessionSource>,
         committed: mpsc::SyncSender<Result<(), String>>,
+    },
+    BeginGap {
+        partition_id: String,
+        gap: RecorderGap,
+        completed: mpsc::SyncSender<Result<(), String>>,
+    },
+    Probe {
+        response: mpsc::SyncSender<Result<(), String>>,
     },
     Shutdown,
 }
@@ -926,6 +1499,35 @@ impl RecorderWorker {
                     return;
                 };
 
+                // Read the prior owner state while the new profile lock is
+                // held, before replacing it with this process's initial idle
+                // state.  A valid state from a dead owner is the only durable
+                // restart evidence; malformed state is preserved as a
+                // fail-closed startup error rather than overwritten.
+                let previous_state = match read_recorder_state() {
+                    Ok(previous) => previous,
+                    Err(error) => {
+                        let _ = started.send(Err(error));
+                        return;
+                    }
+                };
+
+                if let Err(error) = persist_recorder_state(
+                    &_lock,
+                    &recorder_state_for_lock(
+                        &_lock,
+                        RecorderWriteState::IdleNoAccount,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                ) {
+                    let _ = started.send(Err(error));
+                    return;
+                }
+
                 // Readiness means this process owns the exact profile lock and
                 // its serialized writer is waiting for producer commands.
                 if started.send(Ok(true)).is_err() {
@@ -933,9 +1535,27 @@ impl RecorderWorker {
                 }
 
                 let mut active: Option<ActiveRecorderPartition> = None;
+                let mut previous_state = previous_state;
+                let mut injected_failure_consumed = false;
                 while let Ok(command) = command_receiver.recv() {
                     match command {
                         RecorderCommand::Shutdown => break,
+                        RecorderCommand::Probe { response } => {
+                            // `updated_at_unix` is a liveness heartbeat for
+                            // every writer state, including idle and
+                            // degraded. It never fills a generation or
+                            // last-commit field: those remain exclusively
+                            // owned by the acknowledged SQLite commit path.
+                            let result = read_recorder_state()
+                                .and_then(|state| {
+                                    let mut state = state
+                                        .ok_or_else(|| "recorder state is missing".to_owned())?;
+                                    state.updated_at_unix =
+                                        state.updated_at_unix.max(unix_now().max(1));
+                                    persist_recorder_state(&_lock, &state)
+                                });
+                            let _ = response.send(result);
+                        }
                         RecorderCommand::Activate {
                             partition,
                             now,
@@ -951,19 +1571,115 @@ impl RecorderWorker {
                             // close the old SQLite handle and release its exact
                             // account lock before touching the new partition.
                             active = None;
+                            let requested_partition_id = partition.partition_id.clone();
                             match activate_account_partition(partition, now) {
                                 Ok(next) => {
+                                    if let Some(previous) = previous_state.as_ref() {
+                                        if let Some(restart_gap) =
+                                            pending_gap_from_previous_state(previous, &next.partition)
+                                        {
+                                            let gap_result = UsageStore::open_partitioned(
+                                                &next.partition.database_path,
+                                                &next.identity,
+                                            )
+                                            .map_err(|error| error.to_string())
+                                            .and_then(|mut store| {
+                                                let mut restart_gap = restart_gap;
+                                                let collection_state = store
+                                                    .load_session_collection_state()
+                                                    .map_err(|error| error.to_string())?;
+                                                if collection_state.reset_at > 0 {
+                                                    // The old state file deliberately
+                                                    // contains no reset value. Use
+                                                    // only the already-committed
+                                                    // partition generation, never
+                                                    // the wall clock, to bind the
+                                                    // pending interval to a period.
+                                                    restart_gap.reset_at =
+                                                        Some(collection_state.reset_at);
+                                                }
+                                                let has_pending = store
+                                                    .load_recorder_gaps()
+                                                    .map_err(|error| error.to_string())?
+                                                    .iter()
+                                                    .any(|gap| gap.state == "pending");
+                                                if has_pending {
+                                                    Ok(())
+                                                } else {
+                                                    store
+                                                        .begin_recorder_gap(&restart_gap)
+                                                        .map_err(|error| error.to_string())
+                                                }
+                                            });
+                                            if let Err(error) = gap_result {
+                                                let _ = completed.send(Err(error));
+                                                continue;
+                                            }
+                                            // The prior owner evidence has
+                                            // now been consumed for this
+                                            // partition. Keep it only when a
+                                            // different account is admitted
+                                            // first, so A→B→A still gets the
+                                            // correct hash-bound boundary.
+                                            previous_state = None;
+                                        }
+                                    }
+                                    if let Err(error) = persist_recorder_state(
+                                        &_lock,
+                                        &recorder_state_for_lock(
+                                            &_lock,
+                                            RecorderWriteState::Degraded,
+                                            Some(&next.partition.partition_id),
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                        ),
+                                    ) {
+                                        let _ = completed.send(Err(error));
+                                        continue;
+                                    }
                                     active = Some(next);
                                     let _ = completed.send(Ok(()));
                                 }
                                 Err(error) => {
+                                    // Do not leave the previous Ready record
+                                    // looking authoritative after the account
+                                    // switch has released its writer.  The
+                                    // requested partition is retained only as
+                                    // bounded identity context; no generation
+                                    // or commit fields are claimed.
+                                    let _ = persist_recorder_state(
+                                        &_lock,
+                                        &recorder_state_for_lock(
+                                            &_lock,
+                                            RecorderWriteState::Degraded,
+                                            Some(&requested_partition_id),
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                        ),
+                                    );
                                     let _ = completed.send(Err(error));
                                 }
                             }
                         }
                         RecorderCommand::Deactivate { completed } => {
                             active = None;
-                            let _ = completed.send(Ok(()));
+                            let result = persist_recorder_state(
+                                &_lock,
+                                &recorder_state_for_lock(
+                                    &_lock,
+                                    RecorderWriteState::IdleNoAccount,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                ),
+                            );
+                            let _ = completed.send(result);
                         }
                         RecorderCommand::Store {
                             partition_id,
@@ -980,41 +1696,178 @@ impl RecorderWorker {
                                 session_checkpoints,
                                 session_ranges,
                                 session_model_totals,
+                                bounded_source_rescan_complete,
                             } = generation;
-                            let result = active
-                                .as_ref()
-                                .filter(|current| current.partition.partition_id == partition_id)
-                                .ok_or_else(|| {
-                                    "recorder account partition is not active".to_owned()
+                            if std::env::var("CODEX_INFO_RECORDER_FAILURE")
+                                .ok()
+                                .is_some_and(|mode| {
+                                    !injected_failure_consumed && mode == "worker-death"
                                 })
-                                .and_then(|current| {
-                                    UsageStore::open_partitioned(
-                                        &current.partition.database_path,
-                                        &current.identity,
-                                    )
-                                    .map_err(|error| error.to_string())
-                                    .and_then(|mut store| {
-                                        store
-                                            .commit_session_collection(SessionCollectionCommit {
+                            {
+                                break;
+                            }
+                            let mut result = if std::env::var("CODEX_INFO_RECORDER_FAILURE")
+                                .ok()
+                                .is_some_and(|mode| {
+                                    !injected_failure_consumed && mode == "busy"
+                                }) {
+                                injected_failure_consumed = true;
+                                Err("database is locked (injected busy)".to_owned())
+                            } else if let Some(mode) = std::env::var("CODEX_INFO_RECORDER_FAILURE")
+                                .ok()
+                                .filter(|mode| {
+                                    !injected_failure_consumed
+                                        && matches!(mode.as_str(), "fatal" | "readonly" | "full")
+                                })
+                            {
+                                injected_failure_consumed = true;
+                                Err(format!("database write failed (injected {mode})"))
+                            } else {
+                                active
+                                    .as_ref()
+                                    .filter(|current| current.partition.partition_id == partition_id)
+                                    .ok_or_else(|| {
+                                        "recorder account partition is not active".to_owned()
+                                    })
+                                    .and_then(|current| {
+                                        UsageStore::open_partitioned(
+                                            &current.partition.database_path,
+                                            &current.identity,
+                                        )
+                                        .map_err(|error| error.to_string())
+                                        .and_then(|mut store| {
+                                            let data_generation = store
+                                                .commit_session_collection(SessionCollectionCommit {
+                                                    reset_at,
+                                                    window_seconds,
+                                                    collector_epoch,
+                                                    cycle_seq,
+                                                    samples: &samples,
+                                                    checkpoints: &session_checkpoints,
+                                                    ranges: &session_ranges,
+                                                    model_totals: &session_model_totals,
+                                                    recorded_sessions: &recorded_sessions,
+                                                })
+                                                .map_err(|error| error.to_string())?;
+                                            // The quota portion of this
+                                            // acknowledged generation is the
+                                            // only production source proof a
+                                            // recorder restart may consume.
+                                            // Session backfill rows carry a
+                                            // null remaining value and are
+                                            // intentionally excluded, so
+                                            // token recovery can never
+                                            // fabricate a quota gap repair.
+                                            let mut source_minutes = samples
+                                                .iter()
+                                                .filter(|sample| {
+                                                    // A quota value from a
+                                                    // different reset period is
+                                                    // not evidence for this
+                                                    // gap, even when its minute
+                                                    // happens to overlap.
+                                                    sample.reset_at == reset_at
+                                                        && sample.remaining_percent.is_some()
+                                                })
+                                                .map(|sample| {
+                                                    sample.timestamp.div_euclid(60) * 60
+                                                })
+                                                .collect::<Vec<_>>();
+                                            source_minutes.sort_unstable();
+                                            source_minutes.dedup();
+                                            let source_identity_after =
+                                                format!("authenticated-quota:{partition_id}");
+                                            let cursor_after = format!(
+                                                "collector:{collector_epoch:032x}:cycle:{cycle_seq}"
+                                            );
+                                            let source_closed = quota_source_rescan_is_closed(
+                                                &samples,
                                                 reset_at,
-                                                window_seconds,
+                                                bounded_source_rescan_complete,
+                                            );
+                                            let resumed_at_monotonic_ns = monotonic_now_ns();
+                                            if resumed_at_monotonic_ns == 0 {
+                                                return Err(
+                                                    "boot-wide monotonic clock is unavailable"
+                                                        .to_owned(),
+                                                );
+                                            }
+                                            store
+                                                .reconcile_pending_recorder_gaps(
+                                                    &source_identity_after,
+                                                    &cursor_after,
+                                                    resumed_at_monotonic_ns,
+                                                    reset_at,
+                                                    collector_epoch,
+                                                    cycle_seq,
+                                                    &source_minutes,
+                                                    source_closed,
+                                                )
+                                                .map_err(|error| error.to_string())?;
+                                            // The transaction return value is
+                                            // checked again through a fresh
+                                            // SELECT before publishing state;
+                                            // a successful SQL call alone is
+                                            // not a recorder liveness claim.
+                                            let committed_state = store
+                                                .load_session_collection_state()
+                                                .map_err(|error| error.to_string())?;
+                                            if committed_state.data_generation != data_generation
+                                                || committed_state.collector_epoch
+                                                    != Some(collector_epoch)
+                                                || committed_state.cycle_seq != cycle_seq
+                                            {
+                                                return Err(
+                                                    "recorder generation read-back mismatch"
+                                                        .to_owned(),
+                                                );
+                                            }
+                                            Ok(RecorderCommitAck {
+                                                data_generation,
                                                 collector_epoch,
                                                 cycle_seq,
-                                                samples: &samples,
-                                                checkpoints: &session_checkpoints,
-                                                ranges: &session_ranges,
-                                                model_totals: &session_model_totals,
-                                                recorded_sessions: &recorded_sessions,
+                                                last_commit_unix: unix_now().max(1),
                                             })
-                                            .map(|_| ())
-                                            .map_err(|error| error.to_string())
+                                        })
                                     })
-                                });
+                            };
                             if result.is_ok() {
-                                eprintln!(
-                                    "codex-info: recorder committed {} samples and {} session markers",
-                                    samples.len(),
-                                    recorded_sessions.len()
+                                if let (Some(current), Ok(ack)) =
+                                    (active.as_ref(), result.as_ref())
+                                {
+                                    if let Err(error) = persist_recorder_state(
+                                        &_lock,
+                                        &recorder_state_for_lock(
+                                            &_lock,
+                                            RecorderWriteState::Ready,
+                                            Some(&current.partition.partition_id),
+                                            Some(ack.data_generation),
+                                            Some(ack.collector_epoch),
+                                            Some(ack.cycle_seq),
+                                            Some(ack.last_commit_unix),
+                                        ),
+                                    ) {
+                                        result = Err(error);
+                                    } else {
+                                        eprintln!(
+                                            "codex-info: recorder committed {} samples and {} session markers",
+                                            samples.len(),
+                                            recorded_sessions.len()
+                                        );
+                                    }
+                                }
+                            } else if let Some(current) = active.as_ref() {
+                                let _ = persist_recorder_state(
+                                    &_lock,
+                                    &recorder_state_for_lock(
+                                        &_lock,
+                                        RecorderWriteState::Degraded,
+                                        Some(&current.partition.partition_id),
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                    ),
                                 );
                             }
                             let _ = committed.send(result);
@@ -1042,8 +1895,38 @@ impl RecorderWorker {
                                             .map(|_| ())
                                             .map_err(|error| error.to_string())
                                     })
-                                });
+                            });
                             let _ = committed.send(result);
+                        }
+                        RecorderCommand::BeginGap {
+                            partition_id,
+                            gap,
+                            completed,
+                        } => {
+                            let result = active
+                                .as_ref()
+                                .filter(|current| current.partition.partition_id == partition_id)
+                                .ok_or_else(|| {
+                                    "recorder account partition is not active".to_owned()
+                                })
+                                .and_then(|current| {
+                                    if gap.partition_id != current.partition.partition_id {
+                                        return Err(
+                                            "recorder gap account partition mismatch".to_owned(),
+                                        );
+                                    }
+                                    UsageStore::open_partitioned(
+                                        &current.partition.database_path,
+                                        &current.identity,
+                                    )
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|mut store| {
+                                        store
+                                            .begin_recorder_gap(&gap)
+                                            .map_err(|error| error.to_string())
+                                    })
+                                });
+                            let _ = completed.send(result);
                         }
                     }
                 }
@@ -1071,6 +1954,30 @@ impl RecorderWorker {
 
     pub(crate) fn is_active(&self) -> bool {
         self.active
+    }
+
+    /// The worker owns the profile lock from a dedicated thread.  A command
+    /// channel can be closed between two service ticks, so publication also
+    /// checks the lock identity instead of relying on the startup boolean.
+    pub(crate) fn owner_is_live(&self) -> bool {
+        self.active && current_daemon_owner_pid() == Some(std::process::id())
+    }
+
+    /// Probe the recorder command channel at the one-second service cadence.
+    /// A closed worker is never considered healthy merely because its process
+    /// still owns a lock or port.
+    pub(crate) fn probe(&self) -> Result<(), String> {
+        let commands = self
+            .commands
+            .as_ref()
+            .ok_or_else(|| DaemonError::Runtime.to_string())?;
+        let (response, receiver) = mpsc::sync_channel(1);
+        commands
+            .send(RecorderCommand::Probe { response })
+            .map_err(|_| DaemonError::Runtime.to_string())?;
+        receiver
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| DaemonError::Runtime.to_string())?
     }
 
     /// Quiesce any old account and activate exactly one confirmed storage
@@ -1118,7 +2025,7 @@ impl RecorderWorker {
         &self,
         partition_id: String,
         generation: RecorderGeneration,
-    ) -> Result<(), String> {
+    ) -> Result<RecorderCommitAck, String> {
         let commands = self
             .commands
             .as_ref()
@@ -1131,9 +2038,32 @@ impl RecorderWorker {
                 committed,
             })
             .map_err(|_| DaemonError::Runtime.to_string())?;
-        receiver
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| DaemonError::Runtime.to_string())?
+        // A real SQLite busy transaction is allowed to use its complete
+        // two-second busy timeout.  A worker that closes while handling the
+        // command must not make the resident wait beyond the same liveness
+        // budget, so observe the owned thread between short receive windows.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err("recorder worker response timed out".to_owned());
+            }
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(DaemonError::Runtime.to_string());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if self
+                        .worker
+                        .as_ref()
+                        .is_some_and(std::thread::JoinHandle::is_finished)
+                    {
+                        return Err("recorder worker stopped".to_owned());
+                    }
+                }
+            }
+        }
     }
 
     /// Remove exact markers after their source files were successfully
@@ -1156,6 +2086,27 @@ impl RecorderWorker {
                 partition_id,
                 recorded_sessions,
                 committed,
+            })
+            .map_err(|_| DaemonError::Runtime.to_string())?;
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| DaemonError::Runtime.to_string())?
+    }
+
+    /// Persist a pending interval before releasing the resident owner.  The
+    /// interval remains non-public until a later source-rescan caller proves
+    /// recovery or an explicit source authority confirms it unrecoverable.
+    pub(crate) fn begin_gap(&self, partition_id: String, gap: RecorderGap) -> Result<(), String> {
+        let commands = self
+            .commands
+            .as_ref()
+            .ok_or_else(|| DaemonError::Runtime.to_string())?;
+        let (completed, receiver) = mpsc::sync_channel(1);
+        commands
+            .send(RecorderCommand::BeginGap {
+                partition_id,
+                gap,
+                completed,
             })
             .map_err(|_| DaemonError::Runtime.to_string())?;
         receiver
@@ -1194,6 +2145,26 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn boot_wide_monotonic_source_is_bounded_and_restart_ordered() {
+        assert_eq!(
+            parse_proc_uptime_ns(b"42.000000001 7.0\n"),
+            Some(42_000_000_001)
+        );
+        assert_eq!(parse_proc_uptime_ns(b"42 7.0\n"), Some(42_000_000_000));
+        assert!(parse_proc_uptime_ns(b"42.0000000001 7.0\n").is_none());
+        assert!(parse_proc_uptime_ns(b"not-uptime 7.0\n").is_none());
+        assert!(parse_proc_uptime_ns(&vec![b'1'; MAX_PROC_UPTIME_BYTES + 1]).is_none());
+
+        // These fixtures model two different processes reading the same
+        // boot-wide clock. A persisted stop value remains ordered after the
+        // restart; the database transition test rejects any reversal.
+        let stopped = parse_proc_uptime_ns(b"9000.100000001 1.0\n").unwrap();
+        let resumed = parse_proc_uptime_ns(b"9000.100000002 1.0\n").unwrap();
+        assert!(resumed >= stopped);
     }
 
     #[test]
@@ -1280,6 +2251,43 @@ mod tests {
             fs::write(&path, payload).unwrap();
             assert_eq!(current_lock_owner_pid_at(&path), None);
             assert!(parse_lock_record(payload).is_none());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_owner_classification_fails_closed_for_missing_malformed_and_foreign_lock() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("owner-classification");
+        let old_data = std::env::var_os("CODEX_INFO_DATA_DIR");
+        let old_marker = std::env::var_os("CODEX_INFO_SYSTEMD_MANAGED");
+        std::env::set_var("CODEX_INFO_DATA_DIR", &root);
+        std::env::remove_var("CODEX_INFO_SYSTEMD_MANAGED");
+        let path = daemon_lock_path().unwrap();
+        assert_eq!(classify_profile_owner(), OwnerClassification::NoOwner);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, br#"{"pid":1}"#).unwrap();
+        assert_eq!(classify_profile_owner(), OwnerClassification::Malformed);
+
+        let current = process_identity(std::process::id()).unwrap();
+        let record = LockRecord {
+            pid: current.pid,
+            started_at: unix_now(),
+            starttime_ticks: current.starttime_ticks,
+            executable_device: current.executable_device,
+            executable_inode: current.executable_inode,
+            owner_nonce: "ef".repeat(16),
+        };
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(classify_profile_owner(), OwnerClassification::Foreign);
+        let _ = fs::remove_file(path);
+        match old_marker {
+            Some(value) => std::env::set_var("CODEX_INFO_SYSTEMD_MANAGED", value),
+            None => std::env::remove_var("CODEX_INFO_SYSTEMD_MANAGED"),
+        }
+        match old_data {
+            Some(value) => std::env::set_var("CODEX_INFO_DATA_DIR", value),
+            None => std::env::remove_var("CODEX_INFO_DATA_DIR"),
         }
         let _ = fs::remove_dir_all(root);
     }
@@ -1399,6 +2407,44 @@ mod tests {
 
         let mut writer = RecorderWorker::start().unwrap();
         assert!(writer.is_active());
+        assert!(writer.owner_is_live());
+        let idle_state = read_recorder_state().unwrap().unwrap();
+        assert_eq!(idle_state.schema, RECORDER_STATE_SCHEMA);
+        assert_eq!(idle_state.write_state, RecorderWriteState::IdleNoAccount);
+        assert!(idle_state.partition_id_hash.is_none());
+        let idle_heartbeat = idle_state.updated_at_unix;
+        writer.probe().unwrap();
+        assert!(
+            read_recorder_state().unwrap().unwrap().updated_at_unix >= idle_heartbeat,
+            "idle heartbeat did not advance recorder-state"
+        );
+        let state_path = recorder_state_path().unwrap();
+        let state_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let mut state_keys = state_json
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        state_keys.sort();
+        assert_eq!(
+            state_keys,
+            vec![
+                "collector_epoch",
+                "cycle_seq",
+                "data_generation",
+                "last_commit_unix",
+                "owner_nonce",
+                "partition_id_hash",
+                "pid",
+                "process_starttime",
+                "schema",
+                "updated_at_unix",
+                "write_state",
+            ]
+        );
+        assert!(state_json.get("updated_at").is_none());
         let mut duplicate = RecorderWorker::start().unwrap();
         assert!(!duplicate.is_active());
         let account_key = crate::account_scope::AccountKey::synthetic_preview("daemon-account");
@@ -1426,7 +2472,7 @@ mod tests {
             file_device: 10,
             file_inode: 30,
         };
-        writer
+        let commit_ack = writer
             .store_generation(
                 partition.partition_id.clone(),
                 RecorderGeneration {
@@ -1463,9 +2509,18 @@ mod tests {
                         cached_input_tokens: 2_000,
                         output_tokens: 2_345,
                     }],
+                    bounded_source_rescan_complete: true,
                 },
             )
             .unwrap();
+        let ready_state = read_recorder_state().unwrap().unwrap();
+        assert_eq!(ready_state.write_state, RecorderWriteState::Ready);
+        assert_eq!(
+            ready_state.data_generation,
+            Some(commit_ack.data_generation)
+        );
+        assert_eq!(ready_state.cycle_seq, Some(commit_ack.cycle_seq));
+        assert!(ready_state.collector_epoch.is_some());
 
         let database = partition.database_path.clone();
         let lock = daemon_lock_path().unwrap();
@@ -1506,6 +2561,7 @@ mod tests {
                     session_checkpoints: Vec::new(),
                     session_ranges: Vec::new(),
                     session_model_totals: Vec::new(),
+                    bounded_source_rescan_complete: false,
                 },
             )
             .is_err());
@@ -1547,6 +2603,183 @@ mod tests {
     }
 
     #[test]
+    fn recorder_production_source_result_reaches_all_gap_states_without_session_quota_proof() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("production-gap-source");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let old_data = std::env::var_os("CODEX_INFO_DATA_DIR");
+        std::env::set_var("CODEX_INFO_DATA_DIR", &data_dir);
+
+        let account = crate::account_scope::AccountKey::synthetic_preview("production-gap");
+        let partition = crate::account_scope::resolve_partition(&data_dir, &account).unwrap();
+        let reset_at = 1_800_604_800;
+        let stopped_at_monotonic_ns = monotonic_now_ns();
+        assert!(stopped_at_monotonic_ns > 0);
+        let pending_gap = |id: char, start_at: i64, end_at: i64, gap_reset_at: i64| RecorderGap {
+            gap_id: id.to_string().repeat(32),
+            partition_id: partition.partition_id.clone(),
+            source_identity_before: "resident:production-gap".into(),
+            source_identity_after: "unresolved".into(),
+            cursor_before: "generation-1".into(),
+            cursor_after: "unresolved".into(),
+            stopped_at_monotonic_ns,
+            resumed_at_monotonic_ns: None,
+            start_at,
+            end_at,
+            reset_at: Some(gap_reset_at),
+            reason: "daemon_stop_unrecoverable".into(),
+            state: "pending".into(),
+            owner_collector_epoch: 1,
+            confirmation_cycle_seq: 1,
+        };
+
+        let mut writer = RecorderWorker::start().unwrap();
+        writer
+            .activate_partition(partition.clone(), chrono::Utc::now())
+            .unwrap();
+        let mut store =
+            UsageStore::open_partitioned(&partition.database_path, &partition.storage_identity())
+                .unwrap();
+        for gap in [
+            pending_gap('a', 1_800_000_000, 1_800_000_180, reset_at),
+            pending_gap('b', 1_800_000_240, 1_800_000_300, reset_at),
+            pending_gap('c', 1_800_000_360, 1_800_000_420, reset_at + 604_800),
+        ] {
+            store.begin_recorder_gap(&gap).unwrap();
+        }
+        drop(store);
+
+        let quota_sample = |timestamp| UsageHistorySample {
+            timestamp,
+            reset_at,
+            remaining_percent: Some(80.0),
+            sol_dollars: 1.0,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 10,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        assert!(quota_source_rescan_is_closed(
+            &[
+                quota_sample(1_800_000_060),
+                quota_sample(1_800_000_120),
+                quota_sample(1_800_000_180),
+            ],
+            reset_at,
+            true,
+        ));
+        writer
+            .store_generation(
+                partition.partition_id.clone(),
+                RecorderGeneration {
+                    reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch: 2,
+                    cycle_seq: 2,
+                    samples: vec![
+                        quota_sample(1_800_000_060),
+                        quota_sample(1_800_000_120),
+                        quota_sample(1_800_000_180),
+                    ],
+                    recorded_sessions: Vec::new(),
+                    session_checkpoints: Vec::new(),
+                    session_ranges: Vec::new(),
+                    session_model_totals: Vec::new(),
+                    bounded_source_rescan_complete: true,
+                },
+            )
+            .unwrap();
+        let store = UsageStore::open_read_only_partitioned(
+            &partition.database_path,
+            &partition.storage_identity(),
+        )
+        .unwrap();
+        let first_states = store
+            .load_recorder_gaps()
+            .unwrap()
+            .into_iter()
+            .map(|gap| (gap.gap_id.chars().next().unwrap(), gap.state))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let recovered_gap = store
+            .load_recorder_gaps()
+            .unwrap()
+            .into_iter()
+            .find(|gap| gap.gap_id == "a".repeat(32))
+            .unwrap();
+        assert_eq!(recovered_gap.start_at, 1_800_000_000);
+        assert_eq!(recovered_gap.end_at, 1_800_000_180);
+        assert_eq!(
+            first_states.get(&'a').map(String::as_str),
+            Some("recovered")
+        );
+        assert_eq!(
+            first_states.get(&'b').map(String::as_str),
+            Some("confirmed")
+        );
+        assert_eq!(first_states.get(&'c').map(String::as_str), Some("rejected"));
+        assert_eq!(store.load_confirmed_recorder_gaps().unwrap().len(), 1);
+        drop(store);
+
+        let mut store =
+            UsageStore::open_partitioned(&partition.database_path, &partition.storage_identity())
+                .unwrap();
+        store
+            .begin_recorder_gap(&pending_gap('d', 1_800_000_480, 1_800_000_540, reset_at))
+            .unwrap();
+        drop(store);
+
+        // A null-quota session backfill is ignored for source closure, while
+        // the independently admitted quota observation still confirms the
+        // interval. The durable backfill row remains quota-null.
+        let mut session_backfill = quota_sample(1_800_001_080);
+        session_backfill.remaining_percent = None;
+        writer
+            .store_generation(
+                partition.partition_id.clone(),
+                RecorderGeneration {
+                    reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch: 3,
+                    cycle_seq: 1,
+                    samples: vec![quota_sample(1_800_001_020), session_backfill],
+                    recorded_sessions: Vec::new(),
+                    session_checkpoints: Vec::new(),
+                    session_ranges: Vec::new(),
+                    session_model_totals: Vec::new(),
+                    bounded_source_rescan_complete: true,
+                },
+            )
+            .unwrap();
+        let store = UsageStore::open_read_only_partitioned(
+            &partition.database_path,
+            &partition.storage_identity(),
+        )
+        .unwrap();
+        let confirmed = store
+            .load_recorder_gaps()
+            .unwrap()
+            .into_iter()
+            .find(|gap| gap.gap_id == "d".repeat(32))
+            .expect("session backfill gap");
+        assert_eq!(confirmed.state, "confirmed");
+        assert_eq!(store.load_confirmed_recorder_gaps().unwrap().len(), 2);
+        assert!(store
+            .load_all()
+            .unwrap()
+            .iter()
+            .any(|sample| sample.timestamp == 1_800_001_080 && sample.remaining_percent.is_none()));
+        drop(store);
+        writer.shutdown();
+        match old_data {
+            Some(value) => std::env::set_var("CODEX_INFO_DATA_DIR", value),
+            None => std::env::remove_var("CODEX_INFO_DATA_DIR"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn allocated_candidate_and_renamed_final_resume_without_a_stale_writer_lock() {
         for phase in ["candidate", "renamed-final"] {
             let root = temp_root(phase);
@@ -1572,6 +2805,81 @@ mod tests {
                 partition
             );
             let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn recorder_failure_injections_are_finite_and_do_not_retry_in_one_callback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_data = std::env::var_os("CODEX_INFO_DATA_DIR");
+        for mode in ["busy", "fatal", "full", "readonly", "worker-death"] {
+            let root = temp_root(&format!("failure-{mode}"));
+            let data_dir = root.join("data");
+            fs::create_dir_all(&data_dir).unwrap();
+            std::env::set_var("CODEX_INFO_DATA_DIR", &data_dir);
+            std::env::set_var("CODEX_INFO_RECORDER_FAILURE", mode);
+            let account = crate::account_scope::AccountKey::synthetic_preview("failure-account");
+            let partition = crate::account_scope::resolve_partition(&data_dir, &account).unwrap();
+            let reset_at = unix_now().max(1) + 3_600;
+            let generation = || RecorderGeneration {
+                reset_at,
+                window_seconds: 604_800,
+                collector_epoch: 1,
+                cycle_seq: 1,
+                samples: Vec::new(),
+                recorded_sessions: Vec::new(),
+                session_checkpoints: Vec::new(),
+                session_ranges: Vec::new(),
+                session_model_totals: Vec::new(),
+                bounded_source_rescan_complete: false,
+            };
+            let mut writer = RecorderWorker::start().unwrap();
+            if mode != "worker-death" {
+                writer
+                    .activate_partition(partition.clone(), chrono::Utc::now())
+                    .unwrap();
+            }
+            let first = writer.store_generation(partition.partition_id.clone(), generation());
+            assert!(
+                first.is_err(),
+                "injection mode {mode} unexpectedly succeeded"
+            );
+            if mode != "worker-death" {
+                let degraded_heartbeat = read_recorder_state().unwrap().unwrap().updated_at_unix;
+                assert_eq!(
+                    read_recorder_state().unwrap().unwrap().write_state,
+                    RecorderWriteState::Degraded
+                );
+                writer.probe().unwrap();
+                assert!(
+                    read_recorder_state().unwrap().unwrap().updated_at_unix >= degraded_heartbeat,
+                    "degraded heartbeat did not advance recorder-state"
+                );
+            }
+            if mode == "busy" {
+                let degraded = read_recorder_state().unwrap().unwrap();
+                assert_eq!(degraded.write_state, RecorderWriteState::Degraded);
+                std::env::remove_var("CODEX_INFO_RECORDER_FAILURE");
+                let ack = writer
+                    .store_generation(partition.partition_id.clone(), generation())
+                    .unwrap();
+                assert!(ack.data_generation > 0);
+                assert_eq!(
+                    read_recorder_state().unwrap().unwrap().write_state,
+                    RecorderWriteState::Ready
+                );
+            } else if mode == "worker-death" {
+                assert!(writer.probe().is_err());
+            } else {
+                assert!(writer.probe().is_ok());
+            }
+            writer.shutdown();
+            std::env::remove_var("CODEX_INFO_RECORDER_FAILURE");
+            let _ = fs::remove_dir_all(root);
+        }
+        match old_data {
+            Some(value) => std::env::set_var("CODEX_INFO_DATA_DIR", value),
+            None => std::env::remove_var("CODEX_INFO_DATA_DIR"),
         }
     }
 }

@@ -1,8 +1,10 @@
-# Run the persistent bundle installer when the update timer fires.
 [Unit]
 Description=Codex Info unattended update
+StartLimitIntervalSec=60s
+StartLimitBurst=2
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/libexec/codex-info-install.sh --update
-TimeoutStartSec=20min
+ExecStart=%h/.local/libexec/codex-info-install.sh --timer-update
+TimeoutStartSec=1h20min31s
+TimeoutStopSec=20s

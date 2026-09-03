@@ -12,7 +12,8 @@ use codex_info::protocol_contract;
 use codex_info::security;
 use codex_info::server::{
     validate_public_threads, ApiServer, ApiServerConfig, PublicDetailedModelUsage, PublicDetails,
-    PublicHistoryPeriod, PublicHistorySample, PublicQuota, PublicState, PublicThread,
+    PublicHistoryGap, PublicHistoryPeriod, PublicHistorySample, PublicQuota, PublicState,
+    PublicThread,
 };
 use codex_info::thread_contract::{
     self, PageAcceptance, ThreadCycleAccumulator, ThreadCycleOutcome, ThreadTopologyNode,
@@ -142,6 +143,7 @@ struct LocalUsageCandidate {
     admission: AccountAdmission,
     collector_epoch: u128,
     cycle_seq: u64,
+    bounded_source_rescan_complete: bool,
     session_checkpoints: Vec<usage_store::SessionCheckpoint>,
     session_ranges: Vec<usage_store::SessionRange>,
     session_model_totals: Vec<usage_store::SessionModelTotal>,
@@ -2505,6 +2507,39 @@ struct UsageHistory {
 }
 
 impl UsageHistory {
+    fn confirmed_gaps_from_partition(
+        partition: &account_scope::AccountPartition,
+    ) -> Result<Vec<PublicHistoryGap>, String> {
+        match fs::symlink_metadata(&partition.database_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(format!(
+                    "account partition database is not a regular file: {}",
+                    partition.database_path.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.to_string()),
+        }
+        let identity = partition.storage_identity();
+        let store = UsageStore::open_read_only_partitioned(&partition.database_path, &identity)
+            .map_err(|error| error.to_string())?;
+        Ok(store
+            .load_confirmed_recorder_gaps()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter_map(|gap| {
+                Some(PublicHistoryGap {
+                    gap_id: gap.gap_id,
+                    reset_at: gap.reset_at?,
+                    start_at: gap.start_at,
+                    end_at: gap.end_at,
+                    reason: gap.reason,
+                })
+            })
+            .collect())
+    }
+
     #[cfg(test)]
     fn load_from_db_path(db_path: Option<PathBuf>) -> Self {
         Self::load_from_db_path_at(db_path, Utc::now())
@@ -4639,6 +4674,7 @@ struct LocalUsageCollection {
     session_ranges: Vec<usage_store::SessionRange>,
     session_model_totals: Vec<usage_store::SessionModelTotal>,
     cleanup_plan: Option<SessionCleanupPlan>,
+    bounded_source_rescan_complete: bool,
 }
 
 fn cleanup_plan_for_inventory(inventory: &LocalInputInventory) -> Option<SessionCleanupPlan> {
@@ -4724,6 +4760,7 @@ fn collect_local_usage_snapshot(
         session_ranges: Vec::new(),
         session_model_totals: Vec::new(),
         cleanup_plan: cleanup_plan_for_inventory(inventory),
+        bounded_source_rescan_complete: inventory.overflow_session_files.is_empty(),
     })
 }
 
@@ -5469,6 +5506,8 @@ fn collect_incremental_local_usage(
             security::SecurityErrorKind::UnsafePath,
         ));
     }
+    let bounded_source_rescan_complete = inventory.overflow_session_files.is_empty()
+        && next_checkpoints.len() == inventory.selected_session_files.len();
     Ok(LocalUsageCollection {
         model_usage: totals.clone(),
         history_samples: model_usage_timeline_from_events_with_initial(
@@ -5481,6 +5520,7 @@ fn collect_incremental_local_usage(
         session_ranges: ranges,
         session_model_totals: totals.to_session_totals(),
         cleanup_plan: cleanup_plan_for_inventory(inventory),
+        bounded_source_rescan_complete,
     })
 }
 
@@ -6291,7 +6331,7 @@ impl LocalUsageCache {
             },
         };
         let current_inventory = session_inventory_keys(&verified_inventory);
-        let collection = collect_incremental_local_usage(
+        let mut collection = collect_incremental_local_usage(
             &verified_inventory,
             &collection_state,
             &previous_inventory,
@@ -6303,6 +6343,12 @@ impl LocalUsageCache {
                 cycle_seq,
             },
         )?;
+        // A changed inventory or an omitted overflow prefix means this cycle
+        // did not cover the complete bounded source. Keep that evidence local
+        // to the collection result; the recorder uses it only to authorize a
+        // quota-only source closure, never for session backfill rows.
+        collection.bounded_source_rescan_complete &=
+            inventories_match && inventory.overflow_session_files.is_empty();
         self.partitioned_collector_epoch = Some(collector_epoch);
         self.verified_session_inventory = current_inventory;
         Ok(collection)
@@ -6406,6 +6452,8 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                             admission,
                             collector_epoch,
                             cycle_seq,
+                            bounded_source_rescan_complete: collection
+                                .bounded_source_rescan_complete,
                             session_checkpoints: collection.session_checkpoints,
                             session_ranges: collection.session_ranges,
                             session_model_totals: collection.session_model_totals,
@@ -6585,6 +6633,7 @@ struct PendingRecorderBatch {
     partition_id: Option<String>,
     collector_epoch: Option<u128>,
     cycle_seq: Option<u64>,
+    bounded_source_rescan_complete: bool,
     samples: Vec<usage_store::UsageHistorySample>,
     recorded_sessions: Vec<usage_store::RecordedSessionSource>,
     session_checkpoints: Vec<usage_store::SessionCheckpoint>,
@@ -6593,6 +6642,16 @@ struct PendingRecorderBatch {
     reset_at: Option<i64>,
     window_seconds: Option<i64>,
     cleanup_plans: Vec<SessionCleanupPlan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AcknowledgedRecorderCommit {
+    auth_epoch: u64,
+    partition_id: String,
+    collector_epoch: u128,
+    cycle_seq: u64,
+    data_generation: u64,
+    last_commit_unix: i64,
 }
 
 impl PendingRecorderBatch {
@@ -6604,6 +6663,7 @@ impl PendingRecorderBatch {
             && self.session_model_totals.is_empty()
             && self.collector_epoch.is_none()
             && self.cycle_seq.is_none()
+            && !self.bounded_source_rescan_complete
             && self.cleanup_plans.is_empty()
     }
 }
@@ -6640,6 +6700,7 @@ struct CodexInfoState {
     active_threads: Vec<ActiveThread>,
     estimated_cost_label: String,
     history: UsageHistory,
+    history_gaps: Vec<PublicHistoryGap>,
     pending_recorded_sessions: Vec<usage_store::RecordedSessionSource>,
     pending_session_checkpoints: Vec<usage_store::SessionCheckpoint>,
     pending_session_ranges: Vec<usage_store::SessionRange>,
@@ -6648,6 +6709,7 @@ struct CodexInfoState {
     pending_session_period: Option<(i64, i64)>,
     pending_recorder_admission: Option<(u64, AccountAdmission)>,
     pending_session_cleanup: Vec<SessionCleanupPlan>,
+    pending_bounded_source_rescan_complete: bool,
     selected_reset_at: Option<i64>,
     selected_history_period: String,
     selected_metric: String,
@@ -6683,6 +6745,7 @@ struct CodexInfoState {
     /// Last completely admitted `/v1/details` root generation. The UI never
     /// assembles visible fields across two values of this header.
     service_published_pair: Option<String>,
+    acknowledged_recorder_commit: Option<AcknowledgedRecorderCommit>,
 }
 
 impl CodexInfoState {
@@ -6698,7 +6761,37 @@ impl CodexInfoState {
     }
 
     fn usage_ready(&self) -> bool {
-        self.has_usage && self.usage_snapshot_committed && !self.local_usage_pending
+        let recorder_commit_current =
+            self.acknowledged_recorder_commit
+                .as_ref()
+                .is_some_and(|commit| {
+                    let now = Utc::now().timestamp();
+                    commit.auth_epoch == self.auth_epoch
+                        && self
+                            .account_partition
+                            .as_ref()
+                            .is_some_and(|partition| partition.partition_id == commit.partition_id)
+                        && commit.data_generation > 0
+                        && commit.collector_epoch > 0
+                        && commit.cycle_seq > 0
+                        && commit.last_commit_unix > 0
+                        && commit.last_commit_unix <= now
+                        && now.saturating_sub(commit.last_commit_unix)
+                            <= daemon::RECORDER_LAST_COMMIT_MAX_AGE_SECS
+                });
+        // Existing in-process presentation fixtures predate the resident
+        // writer acknowledgement and intentionally model an already durable
+        // snapshot.  Keep that test-only oracle while production/public
+        // service state remains gated by the real acknowledgement above.
+        #[cfg(test)]
+        let recorder_commit_current = recorder_commit_current
+            || (self.acknowledged_recorder_commit.is_none()
+                && self.authenticated
+                && self.usage_snapshot_committed);
+        self.has_usage
+            && self.usage_snapshot_committed
+            && recorder_commit_current
+            && !self.local_usage_pending
     }
 
     fn has_visible_usage(&self) -> bool {
@@ -6823,6 +6916,26 @@ impl CodexInfoState {
         } else {
             Vec::new()
         };
+        let history_gaps = if visible_usage {
+            // The ledger is retained longer than one public document.  Keep
+            // only rows that belong to one of the same bounded periods as the
+            // admitted samples; an old confirmed row is durable evidence but
+            // is not part of this response window.
+            self.history_gaps
+                .iter()
+                .filter(|gap| {
+                    history_periods.iter().any(|period| {
+                        gap.reset_at >= period.reset_at.saturating_sub(60)
+                            && gap.reset_at <= period.reset_at
+                            && gap.start_at >= period.start_at
+                            && gap.end_at <= period.end_at
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
         let mut history_samples = if visible_usage {
             canonical_history_samples
@@ -6897,10 +7010,10 @@ impl CodexInfoState {
             },
             history_periods,
             history_samples,
-            // No confirmed recorder_gap_ledger authority is connected to the
-            // Rust producer yet. Publish the field explicitly without
-            // inferring gaps from missing local samples.
-            history_gaps: Vec::new(),
+            // Only confirmed source-proven rows loaded from the account-local
+            // ledger may cross this boundary. Missing timestamps and session
+            // backfill never manufacture a public gap.
+            history_gaps,
             threads,
             estimated_cost_label: if visible_usage {
                 self.estimated_cost_label.clone()
@@ -6966,6 +7079,7 @@ impl CodexInfoState {
             active_threads: Vec::new(),
             estimated_cost_label: "概算 —".into(),
             history: UsageHistory::default(),
+            history_gaps: Vec::new(),
             pending_recorded_sessions: Vec::new(),
             pending_session_checkpoints: Vec::new(),
             pending_session_ranges: Vec::new(),
@@ -6974,6 +7088,7 @@ impl CodexInfoState {
             pending_session_period: None,
             pending_recorder_admission: None,
             pending_session_cleanup: Vec::new(),
+            pending_bounded_source_rescan_complete: false,
             selected_reset_at: None,
             selected_history_period: "履歴なし".into(),
             selected_metric: "ドル".into(),
@@ -6993,6 +7108,7 @@ impl CodexInfoState {
                 .unwrap_or(resident_now),
             service_endpoint_error: None,
             service_published_pair: None,
+            acknowledged_recorder_commit: None,
         }
     }
 
@@ -7033,6 +7149,7 @@ impl CodexInfoState {
             active_threads: Vec::new(),
             estimated_cost_label: "概算 —".into(),
             history: UsageHistory::default(),
+            history_gaps: Vec::new(),
             pending_recorded_sessions: Vec::new(),
             pending_session_checkpoints: Vec::new(),
             pending_session_ranges: Vec::new(),
@@ -7041,6 +7158,7 @@ impl CodexInfoState {
             pending_session_period: None,
             pending_recorder_admission: None,
             pending_session_cleanup: Vec::new(),
+            pending_bounded_source_rescan_complete: false,
             selected_reset_at: None,
             selected_history_period: "履歴なし".into(),
             selected_metric: "ドル".into(),
@@ -7058,6 +7176,7 @@ impl CodexInfoState {
             last_local_poll: Instant::now(),
             service_endpoint_error: None,
             service_published_pair: None,
+            acknowledged_recorder_commit: None,
         }
     }
 
@@ -7104,6 +7223,7 @@ impl CodexInfoState {
             last_success_at: Some(now - 60),
             window_seconds: WEEK_SECONDS,
             history: UsageHistory::preview(now, reset_at, preview_costs),
+            history_gaps: Vec::new(),
             pending_recorded_sessions: Vec::new(),
             pending_session_checkpoints: Vec::new(),
             pending_session_ranges: Vec::new(),
@@ -7112,6 +7232,7 @@ impl CodexInfoState {
             pending_session_period: None,
             pending_recorder_admission: None,
             pending_session_cleanup: Vec::new(),
+            pending_bounded_source_rescan_complete: false,
             model_usage,
             active_threads: vec![ActiveThread {
                 id: "preview-thread".into(),
@@ -7149,6 +7270,7 @@ impl CodexInfoState {
             last_local_poll: Instant::now(),
             service_endpoint_error: None,
             service_published_pair: None,
+            acknowledged_recorder_commit: None,
         };
         match kind {
             "startup-loading" => {
@@ -7863,12 +7985,15 @@ impl CodexInfoState {
         let period = self.pending_session_period.take();
         let collector = self.pending_collector_generation.take();
         let recorder_admission = self.pending_recorder_admission.take();
+        let bounded_source_rescan_complete =
+            std::mem::take(&mut self.pending_bounded_source_rescan_complete);
         PendingRecorderBatch {
             auth_epoch: recorder_admission.as_ref().map(|value| value.0),
             admission: recorder_admission.as_ref().map(|value| value.1.clone()),
             partition_id: recorder_admission.map(|value| value.1.partition_id),
             collector_epoch: collector.map(|value| value.0),
             cycle_seq: collector.map(|value| value.1),
+            bounded_source_rescan_complete,
             samples: self.history.take_pending_store_samples(),
             recorded_sessions: std::mem::take(&mut self.pending_recorded_sessions),
             session_checkpoints: std::mem::take(&mut self.pending_session_checkpoints),
@@ -7909,6 +8034,7 @@ impl CodexInfoState {
             self.pending_session_model_totals = batch.session_model_totals;
         }
         self.pending_collector_generation = batch.collector_epoch.zip(batch.cycle_seq);
+        self.pending_bounded_source_rescan_complete = batch.bounded_source_rescan_complete;
         self.pending_session_period = batch.reset_at.zip(batch.window_seconds);
         batch
             .cleanup_plans
@@ -7923,6 +8049,7 @@ impl CodexInfoState {
         self.pending_session_ranges.clear();
         self.pending_session_model_totals.clear();
         self.pending_collector_generation = None;
+        self.pending_bounded_source_rescan_complete = false;
         self.pending_session_period = None;
         self.pending_recorder_admission = None;
         self.pending_session_cleanup.clear();
@@ -7967,6 +8094,8 @@ impl CodexInfoState {
         self.pending_local_verification = None;
         self.usage_snapshot_committed = false;
         self.history = UsageHistory::default();
+        self.history_gaps.clear();
+        self.acknowledged_recorder_commit = None;
         self.pending_recorded_sessions.clear();
         self.pending_session_checkpoints.clear();
         self.pending_session_ranges.clear();
@@ -8224,6 +8353,15 @@ impl CodexInfoState {
                 return;
             }
             self.history = UsageHistory::load_from_partition(&partition);
+            self.history_gaps = match UsageHistory::confirmed_gaps_from_partition(&partition) {
+                Ok(gaps) => gaps,
+                Err(error) => {
+                    self.apply_identity_error(format!(
+                        "アカウント別の履歴gap ledgerを安全に確認できませんでした: {error}"
+                    ));
+                    return;
+                }
+            };
         } else if generation_changed {
             if !self.advance_auth_epoch() {
                 return;
@@ -8427,6 +8565,7 @@ impl CodexInfoState {
         self.pending_session_checkpoints = candidate.session_checkpoints;
         self.pending_session_ranges = candidate.session_ranges;
         self.pending_session_model_totals = candidate.session_model_totals;
+        self.pending_bounded_source_rescan_complete = candidate.bounded_source_rescan_complete;
         self.pending_collector_generation = Some((candidate.collector_epoch, candidate.cycle_seq));
         self.pending_session_period =
             Some((candidate.result.reset_at, candidate.result.window_seconds));
@@ -8458,6 +8597,43 @@ impl CodexInfoState {
             self.recorder_store_error = false;
             self.refresh_partial_failure_status();
         }
+    }
+
+    fn refresh_history_gaps(&mut self) -> bool {
+        let Some(partition) = self.account_partition.clone() else {
+            self.history_gaps.clear();
+            return true;
+        };
+        match UsageHistory::confirmed_gaps_from_partition(&partition) {
+            Ok(gaps) => {
+                self.history_gaps = gaps;
+                true
+            }
+            Err(error) => {
+                self.apply_identity_error(format!(
+                    "アカウント別の履歴gap ledgerを安全に確認できませんでした: {error}"
+                ));
+                false
+            }
+        }
+    }
+
+    fn acknowledge_recorder_commit(
+        &mut self,
+        admission: &AccountAdmission,
+        ack: daemon::RecorderCommitAck,
+    ) {
+        if self.current_account_admission().as_ref() != Some(admission) || !self.auth_epoch_valid {
+            return;
+        }
+        self.acknowledged_recorder_commit = Some(AcknowledgedRecorderCommit {
+            auth_epoch: self.auth_epoch,
+            partition_id: admission.partition_id.clone(),
+            collector_epoch: ack.collector_epoch,
+            cycle_seq: ack.cycle_seq,
+            data_generation: ack.data_generation,
+            last_commit_unix: ack.last_commit_unix,
+        });
     }
 
     fn apply_thread_result_for_admission(
@@ -10994,20 +11170,154 @@ fn service_is_healthy(address: SocketAddr) -> bool {
     service_health_version(address) == Some(ServiceHealthVersion::Current)
 }
 
+fn recorder_owner_is_healthy(owner: &daemon::DaemonOwnerIdentity) -> bool {
+    let Ok(Some(state)) = daemon::read_recorder_state() else {
+        return false;
+    };
+    let now = Utc::now().timestamp().max(1);
+    if state.pid != owner.pid
+        || state.process_starttime != owner.starttime_ticks
+        || state.owner_nonce != owner.owner_nonce
+        || state.updated_at_unix > now
+        || now.saturating_sub(state.updated_at_unix) > daemon::RECORDER_LAST_COMMIT_MAX_AGE_SECS
+    {
+        return false;
+    }
+    match state.write_state {
+        daemon::RecorderWriteState::IdleNoAccount => true,
+        daemon::RecorderWriteState::Ready => state.last_commit_unix.is_some_and(|last_commit| {
+            now.saturating_sub(last_commit) <= daemon::RECORDER_LAST_COMMIT_MAX_AGE_SECS
+        }),
+        daemon::RecorderWriteState::Degraded => false,
+    }
+}
+
 fn healthy_combined_service_owner(address: SocketAddr) -> Option<u32> {
-    service_is_healthy(address)
-        .then(daemon::current_daemon_owner_pid)
-        .flatten()
+    if !service_is_healthy(address) {
+        return None;
+    }
+    // A healthy HTTP document is not an owner credential.  Only a current
+    // lock whose process is an explicitly managed service or an exact known
+    // Codex invocation may be paired with the endpoint; a foreign/malformed
+    // owner must never be adopted by UI attachment or startup races.
+    if !matches!(
+        daemon::classify_profile_owner(),
+        daemon::OwnerClassification::ManagedActive
+            | daemon::OwnerClassification::KnownUnmanagedCodex
+    ) {
+        return None;
+    }
+    let owner = daemon::current_daemon_owner_identity()?;
+    if !recorder_owner_is_healthy(&owner) {
+        return None;
+    }
+    // Re-read the endpoint after the lock snapshot.  A stale HTTP 200 from a
+    // listener that is closing must never be paired with a newer/different
+    // profile owner during UI attachment or concurrent startup.
+    (service_is_healthy(address)
+        && daemon::current_daemon_owner_identity().is_some_and(|current| current == owner))
+    .then_some(owner.pid)
+}
+
+fn systemd_managed_activation() -> bool {
+    std::env::var_os("CODEX_INFO_SYSTEMD_MANAGED").is_some_and(|value| value == "1")
+}
+
+/// The installed launcher sets this marker only for its verified fallback
+/// path after a service-start failure.  That path is a UI client, never a
+/// second resident owner: malformed marker values fail closed instead of
+/// silently falling back to the direct-development `--ui` contract.
+fn ui_client_only_marker_value(value: Option<&std::ffi::OsStr>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some(value) if value == "1" => Ok(true),
+        Some(_) => Err(cli_error(CliTextKey::ServiceStateUnavailable)),
+    }
+}
+
+fn ui_client_only_mode() -> Result<bool, String> {
+    ui_client_only_marker_value(std::env::var_os("CODEX_INFO_UI_CLIENT_ONLY").as_deref())
+}
+
+/// Reconcile the profile owner before a systemd-managed service binds its
+/// listener.  A managed activation may retire only an exact, known Codex
+/// owner validated by the existing lock/PID/starttime/executable identity
+/// contract.  An owner with an unknown executable, malformed lock, or no lock
+/// is never guessed at or killed, even when the port happens to look healthy.
+fn reconcile_managed_service_owner(address: SocketAddr) -> Result<bool, String> {
+    let deadline = Instant::now() + BACKGROUND_SERVICE_START_TIMEOUT;
+    loop {
+        let endpoint = service_endpoint_state(address);
+        match daemon::classify_profile_owner() {
+            daemon::OwnerClassification::ManagedActive
+                if endpoint == ServiceEndpointState::Current =>
+            {
+                if let Some(owner) = daemon::current_daemon_owner_identity() {
+                    if recorder_owner_is_healthy(&owner) {
+                        return Ok(true);
+                    }
+                }
+                // The marker identifies a managed process, but stale/missing
+                // recorder state is not health. Retire only this exact owner
+                // and establish a fresh state/listener below.
+                daemon::stop_daemon().map_err(|error| {
+                    format!("managed service could not retire unhealthy owner: {error:?}")
+                })?;
+            }
+            daemon::OwnerClassification::ManagedActive
+            | daemon::OwnerClassification::KnownUnmanagedCodex => {
+                daemon::stop_daemon().map_err(|error| {
+                    format!("managed service could not retire verified owner: {error:?}")
+                })?;
+            }
+            daemon::OwnerClassification::Stale => {
+                // The lock acquisition path will reclaim a dead/stale lock
+                // using the same inode race check.  A listener that survives
+                // without a valid owner remains an unknown occupant.
+                if endpoint == ServiceEndpointState::Absent {
+                    return Ok(false);
+                }
+                // A dead owner can leave its socket in the process of closing;
+                // wait for that listener instead of adopting an old HTTP 200.
+            }
+            daemon::OwnerClassification::NoOwner => {
+                if endpoint == ServiceEndpointState::Absent {
+                    return Ok(false);
+                }
+                // The verified owner has just released its lock.  Its socket
+                // may close slightly later, so keep waiting without assigning
+                // authority to the lockless listener.
+            }
+            daemon::OwnerClassification::Malformed | daemon::OwnerClassification::Foreign => {
+                return Err(cli_error(CliTextKey::ServiceStateUnavailable));
+            }
+        }
+
+        // stop_daemon waits for lock release, but the old listener may close
+        // a few milliseconds later.  Keep the decision bounded and do not
+        // treat an old HTTP 200 as permission to attach to an unknown owner.
+        if Instant::now() >= deadline {
+            return Err(cli_error(CliTextKey::ServiceCleanupFailed));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn retire_different_version_service(address: SocketAddr) -> Result<(), String> {
     if service_endpoint_state(address) != ServiceEndpointState::Different {
         return Ok(());
     }
-    if daemon::current_daemon_owner_pid().is_none() {
+    if !matches!(
+        daemon::classify_profile_owner(),
+        daemon::OwnerClassification::ManagedActive
+            | daemon::OwnerClassification::KnownUnmanagedCodex
+    ) {
+        // A different-version response without an exact known Codex owner is
+        // still an unknown occupant. Never send the public stop signal based
+        // on HTTP health or a bare PID.
         return Err(cli_error(CliTextKey::ServiceStateUnavailable));
     }
-    let _ = daemon::stop_daemon();
+    daemon::stop_daemon().map_err(|error| format!("verified service stop failed: {error:?}"))?;
     // The legacy process releases its recorder lock immediately before closing
     // the REST listener. A malformed/incomplete response still means that the
     // port is occupied, so wait for an actually absent listener or a concurrent
@@ -11149,9 +11459,18 @@ where
     true
 }
 
-fn poll_service_state(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
+fn poll_service_state_with_owner_check<F>(
+    state: &mut CodexInfoState,
+    service_endpoint: SocketAddr,
+    owner_is_healthy: F,
+) where
+    F: FnOnce(SocketAddr) -> bool,
+{
     state.poll_auth_control();
-    if !service_is_healthy(service_endpoint) {
+    // Endpoint health alone is not an owner identity.  Pair the strict health
+    // document with two lock snapshots so a closing old listener cannot feed
+    // stale data into the UI while a different service is taking ownership.
+    if !owner_is_healthy(service_endpoint) {
         let error = state
             .service_endpoint_error
             .clone()
@@ -11172,6 +11491,12 @@ fn poll_service_state(state: &mut CodexInfoState, service_endpoint: SocketAddr) 
             state.hold_service_endpoint_error(error);
         }
     }
+}
+
+fn poll_service_state(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
+    poll_service_state_with_owner_check(state, service_endpoint, |address| {
+        healthy_combined_service_owner(address).is_some()
+    });
 }
 
 fn run_ui_service_timer_cycle(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
@@ -11209,6 +11534,85 @@ enum ResidentServiceCycleError {
 enum ResidentServiceCycleOutcome {
     Published,
     HeldIncomplete,
+}
+
+fn recorder_error_is_fatal(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "fatal",
+        "full",
+        "readonly",
+        "read-only",
+        "corrupt",
+        "malformed",
+        "not a database",
+        "worker",
+        "profile lock",
+        "state file",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+}
+
+fn pending_gap_for_shutdown(
+    state: &CodexInfoState,
+    active_partition: Option<&str>,
+) -> Option<usage_store::RecorderGap> {
+    let active_partition = active_partition?;
+    let partition = state.account_partition.as_ref()?;
+    if partition.partition_id != active_partition {
+        return None;
+    }
+    let now = Utc::now().timestamp().max(1);
+    let acknowledged = state
+        .acknowledged_recorder_commit
+        .as_ref()
+        .filter(|commit| commit.partition_id == active_partition);
+    let start_at = acknowledged
+        .map(|commit| commit.last_commit_unix)
+        .filter(|timestamp| *timestamp > 0 && *timestamp <= now)
+        .unwrap_or(now);
+    let owner_collector_epoch = acknowledged
+        .map(|commit| commit.collector_epoch)
+        .filter(|epoch| *epoch > 0)
+        .unwrap_or(1);
+    let confirmation_cycle_seq = acknowledged
+        .map(|commit| commit.cycle_seq)
+        .filter(|cycle| *cycle > 0)
+        .unwrap_or(1);
+    let cursor = acknowledged
+        .map(|commit| format!("generation-{}", commit.data_generation))
+        .unwrap_or_else(|| "generation-0".into());
+    let stopped_at_monotonic_ns = daemon::monotonic_now_ns();
+    if stopped_at_monotonic_ns == 0 {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(active_partition.as_bytes());
+    digest.update(stopped_at_monotonic_ns.to_be_bytes());
+    digest.update(std::process::id().to_be_bytes());
+    let digest = digest.finalize();
+    let gap_id = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Some(usage_store::RecorderGap {
+        gap_id,
+        partition_id: active_partition.to_owned(),
+        source_identity_before: format!("resident:{active_partition}"),
+        source_identity_after: "unresolved".into(),
+        cursor_before: cursor,
+        cursor_after: "unresolved".into(),
+        stopped_at_monotonic_ns,
+        resumed_at_monotonic_ns: None,
+        start_at,
+        end_at: now,
+        reset_at: state.reset_at.filter(|reset| *reset > 0),
+        reason: "daemon_stop_unrecoverable".into(),
+        state: "pending".into(),
+        owner_collector_epoch,
+        confirmation_cycle_seq,
+    })
 }
 
 #[derive(Default)]
@@ -11325,15 +11729,19 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
         .enable_io()
         .enable_time()
         .build()?;
-    runtime.block_on(async {
+    let runtime_result = runtime.block_on(async {
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let shutdown = service_shutdown_signal();
         tokio::pin!(shutdown);
+        let mut consecutive_store_failures = 0_u8;
         loop {
             tokio::select! {
-                _ = &mut shutdown => break,
+                _ = &mut shutdown => return Ok::<(), String>(()),
                 _ = ticker.tick() => {
+                    if let Err(error) = recorder.probe() {
+                        return Err(format!("recorder worker stopped: {error}"));
+                    }
                     let result = resident_service_cycle(
                         &mut state,
                         &mut publication,
@@ -11345,6 +11753,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                 partition_id,
                                 collector_epoch,
                                 cycle_seq,
+                                bounded_source_rescan_complete,
                                 samples,
                                 recorded_sessions,
                                 session_checkpoints,
@@ -11390,7 +11799,6 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                 }
                                 active_recorder_partition = desired_id;
                             }
-                            let has_samples = !samples.is_empty();
                             if collector_epoch.is_some()
                                 || cycle_seq.is_some()
                                 || !samples.is_empty()
@@ -11417,7 +11825,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                     active_recorder_partition = None;
                                     return Err("recorder batch account partition mismatch".into());
                                 }
-                                if let Err(error) = recorder.store_generation(
+                                let commit_ack = match recorder.store_generation(
                                     batch_partition_id.clone(),
                                     daemon::RecorderGeneration {
                                         reset_at: reset_at.ok_or_else(|| {
@@ -11437,18 +11845,32 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                         session_checkpoints,
                                         session_ranges,
                                         session_model_totals,
+                                        bounded_source_rescan_complete,
                                     },
                                 ) {
-                                    state.apply_identity_error(
-                                        "アカウント別DBへの記録に失敗しました。".into(),
-                                    );
-                                    let _ = recorder.deactivate_partition();
-                                    active_recorder_partition = None;
-                                    return Err(error);
-                                }
+                                    Ok(ack) => ack,
+                                    Err(error) => {
+                                        // Keep the admitted account and active
+                                        // writer lane intact.  The outer cycle
+                                        // restores this exact batch so a
+                                        // transient SQLite busy result is
+                                        // attempted once on the next cycle;
+                                        // the service-level failure budget
+                                        // decides whether a second failure is
+                                        // fatal.
+                                        return Err(error);
+                                    }
+                                };
+                                let Some(batch_admission) = admission.as_ref() else {
+                                    return Err("recorder batch admission disappeared after commit".into());
+                                };
+                                state.acknowledge_recorder_commit(batch_admission, commit_ack);
                             }
-                            if has_samples && !state.history.refresh_from_store(Utc::now()) {
+                            if !batch_is_empty && !state.history.refresh_from_store(Utc::now()) {
                                 return Err("history refresh after recorder commit failed".into());
+                            }
+                            if !batch_is_empty && !state.refresh_history_gaps() {
+                                return Err("history gap refresh after recorder commit failed".into());
                             }
                             for plan in cleanup_plans {
                                 let Some(database) = state.history.db_path.as_deref() else {
@@ -11494,10 +11916,20 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                             }
                             Ok(())
                         },
-                        |candidate| publisher.publish_details(candidate),
+                        |candidate| {
+                            if candidate.state == PublicState::Ready
+                                && !recorder.owner_is_live()
+                            {
+                                return Err(
+                                    codex_info::server::ApiSnapshotError::Serialization,
+                                );
+                            }
+                            publisher.publish_details(candidate)
+                        },
                     );
                     match result {
                         Ok(ResidentServiceCycleOutcome::Published) => {
+                            consecutive_store_failures = 0;
                             if last_recorder_error.take().is_some() {
                                 eprintln!("codex-info: recorder state commit recovered");
                             }
@@ -11507,9 +11939,16 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                         }
                         Ok(ResidentServiceCycleOutcome::HeldIncomplete) => {}
                         Err(ResidentServiceCycleError::Store(error)) => {
+                            consecutive_store_failures = consecutive_store_failures.saturating_add(1);
                             if last_recorder_error.as_deref() != Some(error.as_str()) {
                                 eprintln!("codex-info: recorder state commit rejected: {error}");
-                                last_recorder_error = Some(error);
+                                last_recorder_error = Some(error.clone());
+                            }
+                            if recorder_error_is_fatal(&error) || consecutive_store_failures >= 2 {
+                                return Err(format!(
+                                    "recorder persistence failed after {} cycle(s): {error}",
+                                    consecutive_store_failures
+                                ));
                             }
                         }
                         Err(ResidentServiceCycleError::Candidate(error)) => {
@@ -11528,19 +11967,36 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
             }
         }
     });
+    if let Some(gap) = pending_gap_for_shutdown(&state, active_recorder_partition.as_deref()) {
+        if let Err(error) = recorder.begin_gap(gap.partition_id.clone(), gap) {
+            eprintln!("codex-info: recorder stop gap was not persisted: {error}");
+        }
+    }
     api_server.shutdown();
     recorder.shutdown();
+    runtime_result.map_err(std::io::Error::other)?;
     Ok(())
 }
 
 fn run_service_mode(config: ApiServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    retire_different_version_service(config.listen_addr()).map_err(std::io::Error::other)?;
-    if healthy_combined_service_owner(config.listen_addr()).is_some() {
-        eprintln!(
-            "codex-info: {}",
-            I18n::detect().cli_text(CliTextKey::ServiceReused)
-        );
-        return Ok(());
+    let address = config.listen_addr();
+    if systemd_managed_activation() {
+        if reconcile_managed_service_owner(address).map_err(std::io::Error::other)? {
+            eprintln!(
+                "codex-info: {}",
+                I18n::detect().cli_text(CliTextKey::ServiceReused)
+            );
+            return Ok(());
+        }
+    } else {
+        retire_different_version_service(address).map_err(std::io::Error::other)?;
+        if healthy_combined_service_owner(address).is_some() {
+            eprintln!(
+                "codex-info: {}",
+                I18n::detect().cli_text(CliTextKey::ServiceReused)
+            );
+            return Ok(());
+        }
     }
     run_combined_service(config)
 }
@@ -11562,6 +12018,7 @@ fn stop_service_mode() -> Result<(), Box<dyn std::error::Error>> {
 fn run_ui(
     initial_service_error: Option<String>,
     service_config: ApiServerConfig,
+    client_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ui = MainWindow::new()?;
     install_fixed_window_guard(ui.window());
@@ -11635,12 +12092,20 @@ fn run_ui(
         ui.on_retry(move || {
             let mut state = state.borrow_mut();
             if state.service_endpoint_error.is_some() {
-                start_background_service_retry(
-                    &mut state,
-                    service_config,
-                    &service_retry_in_flight,
-                    ensure_background_service,
-                );
+                if client_only {
+                    // The verified launcher fallback is explicitly a UI
+                    // client. Retry only the selected endpoint; allowing this
+                    // callback to spawn a raw `--port` child would recreate
+                    // the resident owner after the launcher reported failure.
+                    state.request_service_read("利用状況を更新しています…");
+                } else {
+                    start_background_service_retry(
+                        &mut state,
+                        service_config,
+                        &service_retry_in_flight,
+                        ensure_background_service,
+                    );
+                }
             } else {
                 state.request_service_read("利用状況を更新しています…");
             }
@@ -12035,11 +12500,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         LaunchMode::Service(config) => run_service_mode(config),
         LaunchMode::Stop => stop_service_mode(),
         LaunchMode::All(config) => {
-            let startup_error = ensure_background_service(config).err();
-            run_ui(startup_error, config)
+            let client_only = ui_client_only_mode().map_err(std::io::Error::other)?;
+            let startup_error = if client_only {
+                // The installed launcher has already performed generation,
+                // payload, and owner verification.  Preserve the existing
+                // localized failure/retry surface while this process only
+                // polls the selected endpoint and never starts a resident.
+                Some(cli_error(CliTextKey::ServiceStartFailed))
+            } else {
+                ensure_background_service(config).err()
+            };
+            run_ui(startup_error, config, client_only)
         }
         LaunchMode::Help => {
-            println!("{}", I18n::detect().language().launch_help());
+            let language = I18n::detect().language();
+            let help =
+                if std::env::var_os("CODEX_INFO_LAUNCHER_HELP").is_some_and(|value| value == "1") {
+                    language.launcher_help()
+                } else {
+                    language.launch_help()
+                };
+            println!("{help}");
             Ok(())
         }
     }
@@ -12065,26 +12546,26 @@ mod tests {
         normal_status_text, one_month_before_utc, open_codex_session_paths, parse_details_document,
         parse_launch_mode, parse_preview_size, parse_rate_limits, parse_resize_direction,
         period_remaining_text, physical_size_for_logical, plan_type_label, poll_service_state,
-        preview_model_row, published_pair_is_fresh, read_recovery_entries_for_ranges,
-        read_thread_rollout_path, remaining_graph_points, remaining_graph_points_for_metric,
-        remaining_graph_y, remaining_marker_positions, remaining_marker_positions_on_points,
-        request_with_timeout, reset_transition_is_boundary, same_rollout_identity,
-        separate_current_label_positions, service_endpoint_state, service_health_response_version,
-        service_is_healthy, session_event_model, session_event_type, session_jsonl_files,
-        session_token_snapshot, smooth_model_spend, smooth_remaining_points,
-        split_metric_line_paths, stacked_area_path, terminate_and_reap_owned_child,
-        thread_presentation_rows, three_months_before_utc, unused_interval_positions,
-        visible_window_position, week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer,
-        ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow,
-        HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint, LocalUsageCache,
-        LocalUsageCandidate, LocalUsageResult, ManualX11Geometry, ManualX11WindowAction,
-        ModelDollarTotals, ModelTokenTotals, ModelUsageRow, ModelUsageTotals, PublicDetails,
-        RpcReadEvent, ServiceEndpointState, ServiceHealthVersion, SessionFileCandidate,
-        SessionTraversalBudget, TimedModelUsage, TokenSnapshot, UnusedIntervalPosition, UsageEvent,
-        UsageHistory, UsageHistorySample, UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT,
-        FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
-        LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION, THREADS_WINDOW_PURPOSE,
-        UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
+        poll_service_state_with_owner_check, preview_model_row, published_pair_is_fresh,
+        read_recovery_entries_for_ranges, read_thread_rollout_path, remaining_graph_points,
+        remaining_graph_points_for_metric, remaining_graph_y, remaining_marker_positions,
+        remaining_marker_positions_on_points, request_with_timeout, reset_transition_is_boundary,
+        same_rollout_identity, separate_current_label_positions, service_endpoint_state,
+        service_health_response_version, service_is_healthy, session_event_model,
+        session_event_type, session_jsonl_files, session_token_snapshot, smooth_model_spend,
+        smooth_remaining_points, split_metric_line_paths, stacked_area_path,
+        terminate_and_reap_owned_child, thread_presentation_rows, three_months_before_utc,
+        unused_interval_positions, visible_window_position, week_remaining_text, ActiveThread,
+        ActiveThreadUpdate, ApiServer, ApiServerConfig, CodexInfoState, Event, FixedResizeDecision,
+        GraphPaths, GraphWindow, HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint,
+        LocalUsageCache, LocalUsageCandidate, LocalUsageResult, ManualX11Geometry,
+        ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
+        ModelUsageTotals, PublicDetails, RpcReadEvent, ServiceEndpointState, ServiceHealthVersion,
+        SessionFileCandidate, SessionTraversalBudget, TimedModelUsage, TokenSnapshot,
+        UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
+        DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS,
+        GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION,
+        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
     use serde::Deserialize;
 
@@ -12400,6 +12881,17 @@ mod tests {
     }
 
     #[test]
+    fn verified_ui_client_marker_is_exact_and_fail_closed() {
+        assert!(!super::ui_client_only_marker_value(None).unwrap());
+        assert!(super::ui_client_only_marker_value(Some(std::ffi::OsStr::new("1"))).unwrap());
+        for invalid in ["0", "true", "1 ", "yes"] {
+            assert!(
+                super::ui_client_only_marker_value(Some(std::ffi::OsStr::new(invalid))).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn ui_polling_holds_selected_endpoint_error_until_that_endpoint_is_healthy() {
         let blocker = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = blocker.local_addr().unwrap();
@@ -12408,7 +12900,7 @@ mod tests {
         state.preview = false;
         state.hold_service_endpoint_error("selected endpoint unavailable".into());
 
-        poll_service_state(&mut state, endpoint);
+        poll_service_state_with_owner_check(&mut state, endpoint, |_| false);
         assert_eq!(
             state.service_endpoint_error.as_deref(),
             Some("selected endpoint unavailable")
@@ -12419,6 +12911,12 @@ mod tests {
             ApiServer::start(ApiServerConfig::new(endpoint).unwrap()).expect("selected endpoint");
         server.publisher().publish_details(ready_details).unwrap();
         poll_service_state(&mut state, endpoint);
+        assert_eq!(
+            state.service_endpoint_error.as_deref(),
+            Some("selected endpoint unavailable"),
+            "HTTP health without a verified resident owner must remain rejected"
+        );
+        poll_service_state_with_owner_check(&mut state, endpoint, service_is_healthy);
         assert!(state.service_endpoint_error.is_none());
         let admitted_pair = state.service_published_pair.clone();
         let admitted_details = state.public_details();
@@ -12431,7 +12929,7 @@ mod tests {
         assert_eq!(state.service_published_pair, admitted_pair);
         assert_eq!(state.public_details(), admitted_details);
 
-        poll_service_state(&mut state, endpoint);
+        poll_service_state_with_owner_check(&mut state, endpoint, service_is_healthy);
         assert!(state.service_endpoint_error.is_none());
         assert!(!state.has_display_error());
         assert_eq!(state.display_status(), admitted_status);
@@ -13560,7 +14058,7 @@ mod tests {
             rx: event_rx,
         };
 
-        super::run_ui_service_timer_cycle(&mut state, server.local_addr());
+        poll_service_state_with_owner_check(&mut state, server.local_addr(), service_is_healthy);
 
         assert_eq!(
             state.service_published_pair.as_deref(),
@@ -13899,6 +14397,7 @@ mod tests {
             admission: admission.clone(),
             collector_epoch: 0x129,
             cycle_seq: 1,
+            bounded_source_rescan_complete: false,
             session_checkpoints: vec![checkpoint],
             session_ranges: vec![range],
             session_model_totals: vec![super::usage_store::SessionModelTotal {
@@ -17345,15 +17844,34 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let run = include_str!("../run.sh");
-        assert_eq!(run.matches("build --manifest-path").count(), 1);
-        assert!(run.contains("exec \"$TARGET_BINARY\" \"$@\""));
-        assert!(run.contains("$HOME/.cargo/bin/cargo"));
-        assert!(run.contains("rustup which cargo"));
+        assert_eq!(run.matches("build --manifest-path").count(), 0);
+        assert!(!run.contains("cargo"));
+        assert!(!run.contains("target/release"));
+        assert!(run.contains("repository_installer"));
+        assert!(run.contains("installer_ready"));
+        assert!(run.contains("require_payload"));
+        assert!(run.contains("exec \"$installer\" \"--$operation\""));
+        assert!(run.contains("exec \"$payload\" --ui"));
+        assert!(run.contains("exec \"$payload\" --help"));
+        assert!(run.contains("export CODEX_INFO_UI_CLIENT_ONLY=1"));
         assert!(run.contains("unset WAYLAND_DISPLAY WAYLAND_SOCKET WINIT_X11_SCALE_FACTOR"));
         assert!(!run.contains("export WINIT_X11_SCALE_FACTOR"));
-        assert!(run.contains("--release --locked"));
-        assert!(run.contains("E_CARGO_NOT_FOUND"));
         assert!(!run.contains("cargo run"));
+        for operation in [
+            "--start",
+            "--ui",
+            "--stop",
+            "--disable-autostart",
+            "--remove",
+            "--status",
+            "--update",
+            "--help",
+        ] {
+            assert!(
+                run.contains(operation),
+                "missing launcher operation {operation}"
+            );
+        }
     }
 
     #[test]
