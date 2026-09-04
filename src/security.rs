@@ -32,7 +32,9 @@ pub const MAX_AUTH_URL_SCALARS: usize = 2_048;
 // Session traversal and JSON-RPC budgets (SECURITY.md controls 4 and 5).
 pub const MAX_SESSION_DEPTH: usize = 8;
 pub const MAX_SESSION_FILES: usize = 4_096;
-pub const MAX_SESSION_FILE_BYTES: u64 = 256 * 1024 * 1024;
+// A selected prefix may consist of one long-running session. Do not reject
+// that session at a smaller, independent limit before reading its delta.
+pub const MAX_SESSION_FILE_BYTES: u64 = MAX_SESSION_TOTAL_BYTES;
 pub const MAX_JSONL_LINE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_SESSION_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_RPC_LINE_BYTES: usize = MAX_JSONL_LINE_BYTES;

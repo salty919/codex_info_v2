@@ -19710,13 +19710,16 @@ mod tests {
 
     #[test]
     fn session_traversal_budgets_and_symlink_rejection_have_exact_boundaries() {
-        assert_eq!(super::security::MAX_SESSION_FILE_BYTES, 256 * 1024 * 1024);
+        assert_eq!(
+            super::security::MAX_SESSION_FILE_BYTES,
+            2 * 1024 * 1024 * 1024
+        );
         assert_eq!(
             super::security::MAX_SESSION_TOTAL_BYTES,
             2 * 1024 * 1024 * 1024
         );
         assert!(SessionTraversalBudget::default()
-            .admit_file(1, 64 * 1024 * 1024 + 1)
+            .admit_file(1, 256 * 1024 * 1024 + 1)
             .is_ok());
 
         let mut files = SessionTraversalBudget::default();
@@ -19726,11 +19729,9 @@ mod tests {
         assert!(files.admit_file(1, 0).is_err());
 
         let mut total = SessionTraversalBudget::default();
-        for _ in 0..8 {
-            total
-                .admit_file(1, super::security::MAX_SESSION_FILE_BYTES)
-                .expect("total byte boundary");
-        }
+        total
+            .admit_file(1, super::security::MAX_SESSION_FILE_BYTES)
+            .expect("total byte boundary");
         assert_eq!(total.total_bytes, super::security::MAX_SESSION_TOTAL_BYTES);
         total
             .admit_file(1, 1)
@@ -19993,6 +19994,16 @@ mod tests {
             "{\"type\":\"thread_context\",\"model\":\"wrong-prefix-model\"}\n"
         );
         fs::write(&path, prefix).unwrap();
+        // Reproduce the live incident without allocating or replaying 256 MiB.
+        // The sparse prefix is deliberately not valid JSON: only the durable
+        // checkpoint tail may be parsed.
+        let committed_offset = 256 * 1024 * 1024 + 1;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(committed_offset)
+            .unwrap();
         let tail = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":123}}}}\n";
         let checkpoint_metadata = fs::metadata(&path).unwrap();
         #[cfg(unix)]
@@ -20008,7 +20019,7 @@ mod tests {
             relative_path: "seeded.jsonl".into(),
             file_device,
             file_inode,
-            committed_offset: prefix.len() as u64,
+            committed_offset,
             discard_until_lf: false,
             collector_epoch: 1,
             cycle_seq: 1,
@@ -20026,6 +20037,11 @@ mod tests {
         let mut append = fs::OpenOptions::new().append(true).open(&path).unwrap();
         append.write_all(tail.as_bytes()).unwrap();
         drop(append);
+
+        let inventory = local_input_inventory_for_paths(Some(&root), None)
+            .expect("a session over 256 MiB remains collectable within the 2 GiB budget");
+        assert_eq!(inventory.selected_session_files.len(), 1);
+        assert!(inventory.overflow_session_files.is_empty());
 
         let mut cache = ThreadRolloutCache::default();
         let (thread_id, rollout) = super::read_active_thread_rollout_cached_with_checkpoints(

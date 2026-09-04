@@ -4,7 +4,7 @@
 
 | ID | owner | 実装範囲 | 直接オラクル | 状態 |
 | --- | --- | --- | --- | --- |
-| CUM-138-01 | DATA | `src/main.rs`、`src/usage_store.rs` | durable baseline＋2GiB overflow＋verified tail固定caseでbaseline保持とtail 1回加算 | implemented |
+| CUM-138-01 | DATA | `src/main.rs`、`src/security.rs`、`src/usage_store.rs` | durable baseline＋2GiB overflow＋verified tail固定caseでbaseline保持とtail 1回加算、256MiB超sourceのinventory採用とcheckpoint tail取得 | implemented |
 | CUM-138-02 | DATA | `src/main.rs`、`src/usage_store.rs` | 同じrangeのrepeat/restart、変更prefix、stale generation固定caseで非重複・非mutation | implemented |
 | CUM-138-03 | DATA | `src/main.rs`、`src/usage_store.rs` | same-period drift＋checkpoint＋restartとconfirmed rolloverの固定case | implemented |
 | CUM-138-04 | PRODUCT | `src/main.rs`、`src/usage_store.rs` | 1 details root内のモデルtoken/価格合計とhistory latestのexact一致、失敗cycleのroot不変 | implemented |

@@ -240,8 +240,8 @@ DataGeneration、pair publicationを二重化しない。foreign/第二operation
 | --- | --- | --- |
 | reset hint | 4KiB、UTF-8 JSON bytes、hint path=`history/usage_reset_hint.json` | schema/size超過、expired/tombstoned hint、current AuthEpoch/nonce不一致はhint scan・backfill writeを拒否。source logは保持 |
 | recorder lease | 4KiB、UTF-8 JSON bytes、`recorder-lease-v1` | schema/size超過、PID/process-start/file identity不一致はlease取得・stale reclaimを拒否 |
-| local JSONL record / session file / selected session prefix | line 4MiB / file 256MiB / latest whole-file prefix 2GiB、decode前の受信bytes | oversize/invalid complete recordは表示集計を継続できても当該fileのrecorded marker=0。I/O・unterminated record・depth/file-count/file/metadata/containment違反はselected candidate rollback。全inventoryのaggregate超過だけはrollbackせず、最初に収まらないfile以降を保持中overflowとする |
-| live rollout record / file / active paths | line payload 4MiB / file 256MiB / active path 1024、stream受信bytesとProcessIdentity前後値 | oversizeはstreaming envelopeでliveness非変更を完全証明した場合だけpayload隔離。invalid UTF-8/JSON/envelope/state event、identity/ancestry/FD partialはlive cycle全rollback |
+| local JSONL record / session file / selected session prefix | line 4MiB / fileはselected prefixと同じ2GiB / latest whole-file prefix 2GiB、decode前の受信bytes | oversize/invalid complete recordは表示集計を継続できても当該fileのrecorded marker=0。I/O・unterminated record・depth/file-count/file/metadata/containment違反はselected candidate rollback。全inventoryのaggregate超過だけはrollbackせず、最初に収まらないfile以降を保持中overflowとする |
+| live rollout record / file / active paths | line payload 4MiB / fileはselected prefixと同じ2GiB / active path 1024、stream受信bytesとProcessIdentity前後値 | oversizeはstreaming envelopeでliveness非変更を完全証明した場合だけpayload隔離。invalid UTF-8/JSON/envelope/state event、identity/ancestry/FD partialはlive cycle全rollback |
 | internal validated snapshot | canonical JSON 1MiB | candidate全体をrejectし旧snapshot保持。REST transfer bodyとは別resource |
 | REST response headers / status body / details body | 8KiB / 64KiB / 32MiB、transfer後・decode前 | Content-Lengthは事前拒否、streamは最初の超過byteで停止 |
 | transaction batch / retry | usage rowsは最大1024かつ1MiB、recorded session markerはinventory上限と同じ最大4096 rows、backfill latch=1、scan/restart retry=1 | 上限到達はpartial公開せず次cycleまたは明示操作。markerは同cycleのusage transactionへ同梱する |
@@ -505,7 +505,7 @@ identity不変かつ size減少なら `truncate`、identityとprefixが不変で
   dedupe key は `(partition_id,file_device,file_inode,start_offset,end_offset,record_sha256)` である。
 - 1 eventにつき scan は最大1回、DB transaction は最大1回、同じcallback内のretryは `0`、次の通常cycleまたは
   明示操作でのretryは最大1回とする。usage rowsは1 transaction最大1024かつ1 MiB、recorded markerは最大4096、1 JSONL recordは4 MiB、
-  1 source fileは256 MiB、1回のselected session prefixは2 GiBを超えない。全inventoryが2 GiBを超える場合はolder overflowを保持し、入力fingerprint不変時は全走査と新規DB writeを各 `0`、既存marker cleanupは次の通常cycleに最大1回とする。
+  1 source fileの上限は1回のselected session prefixと同じ2 GiBとし、差分取得の前にそれより小さい独立file上限で拒否しない。全inventoryが2 GiBを超える場合はolder overflowを保持し、入力fingerprint不変時は全走査と新規DB writeを各 `0`、既存marker cleanupは次の通常cycleに最大1回とする。
 
 RC-167 oracle は `source_identity_before/after`、`prefix_generation_before/after`、cursor before/after、
 `scan_event`、`scan_count`、`scan_bytes`、`scan_records`、`transaction_count`、`skip_count`、
