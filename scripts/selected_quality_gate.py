@@ -19,6 +19,9 @@ OWNER_JOBS = {
 LINUX_DISTRIBUTION_JOB = "linux-distribution"
 PRODUCT_OWNERS = frozenset({"LINUX_BACKEND", "LINUX_UI", "WINDOWS"})
 CODEQL_LANGUAGES = frozenset({"actions", "csharp", "python", "rust"})
+QUALITY_PROFILES = frozenset(
+    {"authority-only", "history-graph", "workflow-selection", "release"}
+)
 LANGUAGE_OWNERS = {
     "actions": frozenset({"GOVERNANCE"}),
     "python": frozenset({"GOVERNANCE"}),
@@ -56,6 +59,8 @@ def validate(
     owners = selection.get("owners")
     languages = selection.get("codeql_languages")
     binary_impact = selection.get("binary_impact")
+    distribution_required = selection.get("distribution_required")
+    quality_profile = selection.get("quality_profile")
     if not isinstance(owners, list) or not owners or any(
         owner not in OWNER_JOBS for owner in owners
     ):
@@ -70,6 +75,10 @@ def validate(
         raise QualitySelectionError("selection contains duplicate CodeQL languages")
     if not isinstance(binary_impact, bool):
         raise QualitySelectionError("selection has no binary-impact decision")
+    if not isinstance(distribution_required, bool):
+        raise QualitySelectionError("selection has no distribution decision")
+    if quality_profile not in QUALITY_PROFILES:
+        raise QualitySelectionError("selection has no finite quality profile")
     selected = set(owners)
     for language in languages:
         if not LANGUAGE_OWNERS[language].intersection(selected):
@@ -78,10 +87,33 @@ def validate(
             )
     if binary_impact and not PRODUCT_OWNERS.intersection(selected):
         raise QualitySelectionError("binary impact has no product owner")
+    if quality_profile == "authority-only" and selected != {"DOCS"}:
+        raise QualitySelectionError("authority-only profile must contain only DOCS")
+    if quality_profile == "history-graph" and not PRODUCT_OWNERS.intersection(selected):
+        raise QualitySelectionError("history-graph profile has no product owner")
+    if quality_profile == "history-graph" and distribution_required:
+        raise QualitySelectionError("history-graph profile must not select distribution")
+    if quality_profile == "workflow-selection":
+        if "GOVERNANCE" not in selected or PRODUCT_OWNERS.intersection(selected):
+            raise QualitySelectionError(
+                "workflow-selection profile must contain GOVERNANCE and no product owner"
+            )
+        if distribution_required:
+            raise QualitySelectionError(
+                "workflow-selection profile must not select distribution"
+            )
     if release_candidate and binary_impact and "WINDOWS" not in owners:
         raise QualitySelectionError(
             "release candidate binary impact must select WINDOWS"
         )
+    if release_candidate and quality_profile != "release":
+        raise QualitySelectionError("release candidate must use release quality profile")
+    if release_candidate and distribution_required != binary_impact:
+        raise QualitySelectionError(
+            "release candidate distribution decision must equal binary impact"
+        )
+    if not release_candidate and quality_profile == "release":
+        raise QualitySelectionError("feat quality cannot use release profile")
     if set(results) != ALL_JOBS:
         raise QualitySelectionError("quality result keys do not match the job set")
 
@@ -97,7 +129,7 @@ def validate(
             f"codeql-quality must be {expected_codeql}, "
             f"found {results['codeql-quality']!r}"
         )
-    expected_distribution = "success" if binary_impact else "skipped"
+    expected_distribution = "success" if distribution_required else "skipped"
     if results[LINUX_DISTRIBUTION_JOB] != expected_distribution:
         raise QualitySelectionError(
             f"linux-distribution must be {expected_distribution}, "

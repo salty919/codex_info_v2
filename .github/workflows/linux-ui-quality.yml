@@ -10,6 +10,10 @@ on:
         description: Immutable source commit selected by the trusted caller
         required: true
         type: string
+      quality_profile:
+        description: Exact finite profile selected by the trusted caller
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -24,12 +28,18 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
+      - name: Validate Linux UI quality profile
+        env:
+          QUALITY_PROFILE: ${{ inputs.quality_profile }}
+        run: |
+          [[ "$QUALITY_PROFILE" == release || "$QUALITY_PROFILE" == history-graph ]]
       - name: Install Linux UI quality tools
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
       - uses: dtolnay/rust-toolchain@stable
       - name: Build native release for UI evaluation
         run: cargo build --release --locked
       - name: Run startup UI image and failure-state acceptance
+        if: inputs.quality_profile == 'release'
         run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/x11_startup_visual_gate.sh
       - name: Run graph UI image acceptance
         run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/x11_graph_visual_gate.sh

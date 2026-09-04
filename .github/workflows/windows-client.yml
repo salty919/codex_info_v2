@@ -15,6 +15,9 @@ on:
       release_candidate:
         required: true
         type: boolean
+      quality_profile:
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -31,12 +34,26 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
+      - name: Validate Windows quality profile
+        shell: pwsh
+        env:
+          QUALITY_PROFILE: ${{ inputs.quality_profile }}
+        run: |
+          if ($env:QUALITY_PROFILE -cne 'release' -and $env:QUALITY_PROFILE -cne 'history-graph') {
+            throw "Unsupported Windows quality profile: $env:QUALITY_PROFILE"
+          }
+      - name: Run finite history graph tests
+        if: inputs.quality_profile == 'history-graph'
+        shell: bash
+        run: bash scripts/windows_client_contract_gate.sh --history-graph
       - name: Run Windows unit tests
+        if: inputs.quality_profile == 'release'
         shell: pwsh
         run: |
           dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
           dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
       - name: Install locked Inno Setup compiler
+        if: inputs.quality_profile == 'release'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -74,9 +91,11 @@ jobs:
           }
           "INNO_SETUP_COMPILER=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build standard Windows setup wizard
+        if: inputs.quality_profile == 'release'
         shell: pwsh
         run: ./windows-client/tools/Build-WindowsInstaller.ps1 -OutputDirectory artifacts/windows-installer
       - name: Smoke-test install and uninstall lifecycle
+        if: inputs.quality_profile == 'release'
         shell: pwsh
         run: |
           $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
@@ -123,6 +142,7 @@ jobs:
           if (-not (Test-Path $sentinel -PathType Leaf)) { throw 'Uninstall removed user settings.' }
           Remove-Item -LiteralPath $sentinel -Force
       - name: Run installed Windows UI Automation E2E
+        if: inputs.quality_profile == 'release'
         shell: pwsh
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
@@ -153,7 +173,7 @@ jobs:
           }
       - name: Create release manifest
         id: manifest
-        if: inputs.release_candidate
+        if: inputs.release_candidate && inputs.quality_profile == 'release'
         shell: pwsh
         env:
           REPOSITORY: ${{ github.repository }}
@@ -183,7 +203,7 @@ jobs:
           }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - name: Upload release candidate
-        if: inputs.release_candidate
+        if: inputs.release_candidate && inputs.quality_profile == 'release'
         uses: actions/upload-artifact@v4
         with:
           name: release-candidate-v1-pr-${{ inputs.pr_number }}-head-${{ inputs.source_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}-version-${{ steps.manifest.outputs.version }}

@@ -17,12 +17,16 @@ def selection(
     *,
     binary_impact: bool,
     languages: tuple[str, ...] = (),
+    distribution_required: bool = False,
+    quality_profile: str = "history-graph",
 ) -> str:
     return json.dumps(
         {
             "owners": list(owners),
             "codeql_languages": languages,
             "binary_impact": binary_impact,
+            "distribution_required": distribution_required,
+            "quality_profile": quality_profile,
         }
     )
 
@@ -32,6 +36,7 @@ def successful_results(
     *,
     binary_impact: bool,
     languages: tuple[str, ...] = (),
+    distribution_required: bool = False,
 ) -> dict[str, str]:
     selected_jobs = {OWNER_JOBS[owner] for owner in owners}
     return {
@@ -39,7 +44,7 @@ def successful_results(
             "success"
             if job in selected_jobs
             or (job == "codeql-quality" and languages)
-            or (job == "linux-distribution" and binary_impact)
+            or (job == "linux-distribution" and distribution_required)
             else "skipped"
         )
         for job in JOBS
@@ -49,15 +54,15 @@ def successful_results(
 class SelectedQualityTests(unittest.TestCase):
     def test_finite_causal_selection_examples(self) -> None:
         cases = (
-            (("DOCS",), False, ()),
-            (("GOVERNANCE",), False, ("python",)),
-            (("LINUX_BACKEND",), False, ()),
-            (("LINUX_BACKEND",), True, ("rust",)),
-            (("WINDOWS",), False, ()),
-            (("WINDOWS",), True, ("csharp",)),
-            (("DOCS", "LINUX_BACKEND", "WINDOWS"), True, ("csharp", "rust")),
+            (("DOCS",), False, (), "authority-only"),
+            (("GOVERNANCE",), False, ("python",), "workflow-selection"),
+            (("LINUX_BACKEND",), False, (), "history-graph"),
+            (("LINUX_BACKEND",), True, ("rust",), "history-graph"),
+            (("WINDOWS",), False, (), "history-graph"),
+            (("WINDOWS",), True, ("csharp",), "history-graph"),
+            (("DOCS", "LINUX_BACKEND", "WINDOWS"), True, ("csharp", "rust"), "history-graph"),
         )
-        for owners, binary_impact, languages in cases:
+        for owners, binary_impact, languages, quality_profile in cases:
             with self.subTest(
                 owners=owners, binary_impact=binary_impact, languages=languages
             ):
@@ -66,6 +71,7 @@ class SelectedQualityTests(unittest.TestCase):
                         owners,
                         binary_impact=binary_impact,
                         languages=languages,
+                        quality_profile=quality_profile,
                     ),
                     json.dumps(
                         successful_results(
@@ -113,22 +119,36 @@ class SelectedQualityTests(unittest.TestCase):
                 "owners": ["WINDOWS"],
                 "codeql_languages": ["unknown"],
                 "binary_impact": False,
+                "distribution_required": False,
+                "quality_profile": "history-graph",
             },
-            {"owners": ["DOCS"], "codeql_languages": [], "binary_impact": True},
+            {
+                "owners": ["DOCS"],
+                "codeql_languages": [],
+                "binary_impact": True,
+                "distribution_required": False,
+                "quality_profile": "authority-only",
+            },
             {
                 "owners": ["DOCS", "DOCS"],
                 "codeql_languages": [],
                 "binary_impact": False,
+                "distribution_required": False,
+                "quality_profile": "authority-only",
             },
             {
                 "owners": ["WINDOWS"],
                 "codeql_languages": ["csharp", "csharp"],
                 "binary_impact": False,
+                "distribution_required": False,
+                "quality_profile": "history-graph",
             },
             {
                 "owners": ["DOCS"],
                 "codeql_languages": ["rust"],
                 "binary_impact": False,
+                "distribution_required": False,
+                "quality_profile": "authority-only",
             },
         )
         for value in cases:
@@ -145,10 +165,19 @@ class SelectedQualityTests(unittest.TestCase):
                 "release candidate binary impact must select WINDOWS",
             ):
                 validate(
-                    selection(linux_only, binary_impact=True, languages=("rust",)),
+                    selection(
+                        linux_only,
+                        binary_impact=True,
+                        languages=("rust",),
+                        distribution_required=True,
+                        quality_profile="release",
+                    ),
                     json.dumps(
                         successful_results(
-                            linux_only, binary_impact=True, languages=("rust",)
+                            linux_only,
+                            binary_impact=True,
+                            languages=("rust",),
+                            distribution_required=True,
                         )
                     ),
                     release_candidate=True,
@@ -164,18 +193,23 @@ class SelectedQualityTests(unittest.TestCase):
                 ("LINUX_BACKEND", "WINDOWS"),
                 binary_impact=True,
                 languages=("rust",),
+                distribution_required=True,
+                quality_profile="release",
             ),
             json.dumps(
                 successful_results(
                     ("LINUX_BACKEND", "WINDOWS"),
                     binary_impact=True,
                     languages=("rust",),
+                    distribution_required=True,
                 )
             ),
             release_candidate=True,
         )
         validate(
-            selection(("DOCS",), binary_impact=False),
+            selection(
+                ("DOCS",), binary_impact=False, quality_profile="release"
+            ),
             json.dumps(successful_results(("DOCS",), binary_impact=False)),
             release_candidate=True,
         )

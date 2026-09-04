@@ -7,6 +7,7 @@ import argparse
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 import sys
 from typing import Sequence
 
@@ -80,6 +81,50 @@ WINDOWS_GOVERNANCE_TOOL_EXACT = frozenset(
 LEGAL_SHARED_EXACT = frozenset(
     {"COPYRIGHT", "LICENSE", "LICENSE.ja.md", "THIRD_PARTY_NOTICES.md"}
 )
+PRODUCT_OWNERS = frozenset({"LINUX_BACKEND", "LINUX_UI", "WINDOWS"})
+HISTORY_GRAPH_PROFILE = "history-graph"
+WORKFLOW_SELECTION_PROFILE = "workflow-selection"
+HISTORY_GRAPH_PATHS = frozenset(
+    {
+        "docs/REST_API_V1.md",
+        "src/main.rs",
+        "src/usage_store.rs",
+        "tests/fixtures/graph_delayed_quota.json",
+        "windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs",
+        "windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs",
+        "windows-client/src/CodexInfo.WindowsClient/Graphing/GraphScene.cs",
+        "windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs",
+        "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/DetailsWindowViewModelTests.cs",
+        "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs",
+        "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/WindowDragGeometryTests.cs",
+    }
+)
+WORKFLOW_SELECTION_PATHS = frozenset(
+    {
+        ".github/workflows/feat-integration.yml",
+        ".github/workflows/linux-ui-quality.yml",
+        ".github/workflows/rust.yml",
+        ".github/workflows/selective-quality.yml",
+        ".github/workflows/windows-client.yml",
+        "docs/PRODUCT_REQUIREMENTS.md",
+        "docs/REQUIREMENTS_LEDGER.md",
+        "docs/WINDOWS_CLIENT_REQUIREMENTS.md",
+        "docs/WINDOWS_UX_SPEC.md",
+        "scripts/ci_change_scope.py",
+        "scripts/pre_pr_gate.sh",
+        "scripts/quality_plan.py",
+        "scripts/regression_guard.sh",
+        "scripts/requirements_authority.py",
+        "scripts/selected_quality_gate.py",
+        "scripts/test_ci_change_scope.py",
+        "scripts/test_quality_plan.py",
+        "scripts/test_requirements_authority.py",
+        "scripts/test_selected_quality_gate.py",
+        "scripts/windows_client_contract_gate.sh",
+        "scripts/workflow_quality_gate.py",
+    }
+)
+PROFILE_LINE_RE = re.compile(r"^Quality-Profile:[ \t]*([a-z0-9]+(?:-[a-z0-9]+)*)[ \t]*$")
 
 
 class ScopeError(ValueError):
@@ -91,13 +136,17 @@ class Selection:
     owners: tuple[str, ...]
     codeql_languages: tuple[str, ...]
     binary_impact: bool
+    distribution_required: bool
+    quality_profile: str
 
     def as_json(self) -> str:
         return json.dumps(
             {
                 "binary_impact": self.binary_impact,
+                "distribution_required": self.distribution_required,
                 "owners": list(self.owners),
                 "codeql_languages": list(self.codeql_languages),
+                "quality_profile": self.quality_profile,
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -198,8 +247,76 @@ def owners_for_path(path: str) -> frozenset[str]:
     return _selection_for_path(path).owners
 
 
+def quality_profile_from_document(text: str) -> str | None:
+    """Read one exact finite profile declaration from PR prose."""
+
+    declarations: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("Quality-Profile:"):
+            match = PROFILE_LINE_RE.fullmatch(line)
+            if match is None:
+                raise ScopeError("Quality-Profile declaration is malformed")
+            declarations.append(match.group(1))
+    if len(declarations) > 1:
+        raise ScopeError("Quality-Profile declaration is duplicated")
+    if not declarations:
+        return None
+    profile = declarations[0]
+    if profile not in {HISTORY_GRAPH_PROFILE, WORKFLOW_SELECTION_PROFILE}:
+        raise ScopeError(f"Quality-Profile is unknown: {profile}")
+    return profile
+
+
+def _resolve_quality_profile(
+    paths: Sequence[str],
+    owners: set[str],
+    *,
+    release_candidate: bool,
+    quality_profile: str | None,
+) -> tuple[str, bool]:
+    """Return the finite execution profile and distribution decision.
+
+    A feat product diff without a registered profile stops here instead of
+    expanding to every owner suite.  Release candidates deliberately ignore
+    feat profiles and retain the complete distribution path.
+    """
+
+    product_change = bool(PRODUCT_OWNERS.intersection(owners))
+    governance_change = "GOVERNANCE" in owners
+    if release_candidate:
+        if quality_profile is not None:
+            raise ScopeError("feat Quality-Profile cannot narrow a release candidate")
+        return "release", product_change
+    if not product_change and not governance_change:
+        if quality_profile is not None:
+            raise ScopeError("Quality-Profile is unnecessary for a non-product diff")
+        return "authority-only", False
+    if quality_profile is None:
+        raise ScopeError("feat product diff requires one finite Quality-Profile")
+    if quality_profile not in {HISTORY_GRAPH_PROFILE, WORKFLOW_SELECTION_PROFILE}:
+        raise ScopeError(f"Quality-Profile is unknown: {quality_profile}")
+    expected_paths = (
+        HISTORY_GRAPH_PATHS
+        if quality_profile == HISTORY_GRAPH_PROFILE
+        else WORKFLOW_SELECTION_PATHS
+    )
+    if quality_profile == HISTORY_GRAPH_PROFILE and not product_change:
+        raise ScopeError("history-graph profile has no product path")
+    if quality_profile == WORKFLOW_SELECTION_PROFILE and product_change:
+        raise ScopeError("workflow-selection profile cannot own product code")
+    outside = sorted(set(paths) - expected_paths)
+    if outside:
+        raise ScopeError(
+            f"{quality_profile} profile does not own changed path: {outside[0]}"
+        )
+    return quality_profile, False
+
+
 def selection_for_paths(
-    paths: Sequence[str], *, release_candidate: bool = False
+    paths: Sequence[str],
+    *,
+    release_candidate: bool = False,
+    quality_profile: str | None = None,
 ) -> Selection:
     owners: set[str] = set()
     languages: set[str] = set()
@@ -211,6 +328,12 @@ def selection_for_paths(
         binary_impact = binary_impact or path_selection.binary_impact
     if not owners:
         raise ScopeError("pull request contains no changed paths")
+    resolved_profile, distribution_required = _resolve_quality_profile(
+        paths,
+        owners,
+        release_candidate=release_candidate,
+        quality_profile=quality_profile,
+    )
     if release_candidate and binary_impact:
         owners.add("WINDOWS")
 
@@ -222,6 +345,8 @@ def selection_for_paths(
             if language in languages
         ),
         binary_impact=binary_impact,
+        distribution_required=distribution_required and binary_impact,
+        quality_profile=resolved_profile,
     )
 
 
@@ -251,10 +376,15 @@ def paths_from_name_status(raw: bytes) -> tuple[str, ...]:
 
 
 def selection_from_name_status(
-    raw: bytes, *, release_candidate: bool = False
+    raw: bytes,
+    *,
+    release_candidate: bool = False,
+    quality_profile: str | None = None,
 ) -> Selection:
     return selection_for_paths(
-        paths_from_name_status(raw), release_candidate=release_candidate
+        paths_from_name_status(raw),
+        release_candidate=release_candidate,
+        quality_profile=quality_profile,
     )
 
 
@@ -262,10 +392,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name-status", required=True, type=Path)
     parser.add_argument("--release-candidate", action="store_true")
+    parser.add_argument(
+        "--profile-document",
+        type=Path,
+        help="PR body containing one exact Quality-Profile declaration",
+    )
     args = parser.parse_args(argv)
     try:
+        quality_profile = (
+            quality_profile_from_document(args.profile_document.read_text(encoding="utf-8"))
+            if args.profile_document is not None
+            else None
+        )
         result = selection_from_name_status(
-            args.name_status.read_bytes(), release_candidate=args.release_candidate
+            args.name_status.read_bytes(),
+            release_candidate=args.release_candidate,
+            quality_profile=quality_profile,
         )
     except (OSError, ScopeError) as exc:
         print(f"ci-change-scope: FAIL {exc}", file=sys.stderr)

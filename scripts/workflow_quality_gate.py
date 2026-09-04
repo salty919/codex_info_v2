@@ -115,6 +115,8 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         selective_codeql = _job(selective, "codeql-quality")
         selected = _job(selective, "selected-quality")
         windows_job = _job(windows, "windows-quality")
+        rust_job = _job(docs["rust.yml"], "native-quality")
+        linux_ui_job = _job(docs["linux-ui-quality.yml"], "linux-ui-quality")
         linux_distribution_job = _job(linux_distribution, "linux-distribution")
         resolve = _job(release, "resolve")
         publish = _job(release, "publish")
@@ -241,6 +243,19 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             mapping(f"selective.{job_id}", child.get("with"), {
                 "source_sha": "${{ inputs.source_sha }}"
             })
+        for job_id in (
+            "linux-backend-quality",
+            "linux-ui-quality",
+            "windows-quality",
+        ):
+            mapping(
+                f"selective.{job_id}",
+                _job(selective, job_id).get("with"),
+                {
+                    "quality_profile":
+                        "${{ fromJSON(inputs.selection_json).quality_profile }}"
+                },
+            )
         distribution = _job(selective, "linux-distribution")
         expect(
             "selective.linux-distribution.uses",
@@ -250,7 +265,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect(
             "selective.linux-distribution.if",
             distribution.get("if"),
-            "fromJSON(inputs.selection_json).binary_impact == true",
+            "fromJSON(inputs.selection_json).distribution_required == true",
         )
         expect(
             "selective.linux-distribution.continue-on-error",
@@ -265,6 +280,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         mapping("selective.windows", selective_windows.get("with"), {
             "pr_number": "${{ inputs.pr_number }}",
             "release_candidate": "${{ inputs.release_candidate }}",
+            "quality_profile": "${{ fromJSON(inputs.selection_json).quality_profile }}",
         })
         mapping("selective.codeql", selective_codeql.get("with"), {
             "head_ref": "${{ inputs.head_ref }}",
@@ -327,23 +343,79 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect("selective.windows-name", selective_windows.get("name"), "windows-quality")
         expect("windows.leaf-name", windows_job.get("name"), "windows-quality")
         e2e = _step(windows_job, name="Run installed Windows UI Automation E2E")
+        expect("windows.e2e.if", e2e.get("if"), "inputs.quality_profile == 'release'")
         mapping("windows.e2e.env", e2e.get("env"), {
             "SOURCE_SHA": "${{ inputs.source_sha }}",
         })
         if "-SourceSha $env:SOURCE_SHA" not in str(e2e.get("run", "")):
             errors.append("workflow wiring windows.e2e.run: source SHA is not passed to E2E")
         manifest = _step(windows_job, step_id="manifest")
+        expect(
+            "windows.manifest.if",
+            manifest.get("if"),
+            "inputs.release_candidate && inputs.quality_profile == 'release'",
+        )
         mapping("windows.manifest.env", manifest.get("env"), {
             "REPOSITORY": "${{ github.repository }}",
         })
         upload = _step(windows_job, uses="actions/upload-artifact@v4")
-        expect("windows.upload.if", upload.get("if"), "inputs.release_candidate")
+        expect(
+            "windows.upload.if",
+            upload.get("if"),
+            "inputs.release_candidate && inputs.quality_profile == 'release'",
+        )
         mapping("windows.upload", upload.get("with"), {
             "name": "release-candidate-v1-pr-${{ inputs.pr_number }}-head-${{ inputs.source_sha }}-"
             "run-${{ github.run_id }}-attempt-${{ github.run_attempt }}-"
             "version-${{ steps.manifest.outputs.version }}",
             "if-no-files-found": "error",
         })
+
+        expect(
+            "rust.focused.if",
+            _step(rust_job, name="Run finite history graph tests").get("if"),
+            "inputs.quality_profile == 'history-graph'",
+        )
+        for step_name in (
+            "Run native unit tests",
+            "Build native release",
+            "Run public CLI lifecycle acceptance",
+            "Run recorder daemon live acceptance",
+        ):
+            expect(
+                f"rust.{step_name}.if",
+                _step(rust_job, name=step_name).get("if"),
+                "inputs.quality_profile == 'release'",
+            )
+        expect(
+            "linux-ui.startup.if",
+            _step(
+                linux_ui_job,
+                name="Run startup UI image and failure-state acceptance",
+            ).get("if"),
+            "inputs.quality_profile == 'release'",
+        )
+        expect(
+            "linux-ui.graph.if",
+            _step(linux_ui_job, name="Run graph UI image acceptance").get("if"),
+            None,
+        )
+        expect(
+            "windows.focused.if",
+            _step(windows_job, name="Run finite history graph tests").get("if"),
+            "inputs.quality_profile == 'history-graph'",
+        )
+        for step_name in (
+            "Run Windows unit tests",
+            "Install locked Inno Setup compiler",
+            "Build standard Windows setup wizard",
+            "Smoke-test install and uninstall lifecycle",
+        ):
+            expect(
+                f"windows.{step_name}.if",
+                _step(windows_job, name=step_name).get("if"),
+                "inputs.quality_profile == 'release'",
+            )
 
         # Resolver outputs -> lock holder; revalidation controls both side effects.
         output_keys = (
@@ -488,12 +560,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "final_acceptance_gate.sh",
         "release_state_gate.py",
         "ci_trust_fixture.py",
-        "scripts/regression_guard.sh",
         "scripts/data_protection_gate.sh",
-        "scripts/windows_client_contract_gate.sh",
-        "workflow_quality_gate.py --self-test",
-        "test_ci_change_scope.py",
-        "test_selected_quality_gate.py",
     ):
         if forbidden in joined:
             errors.append(f"obsolete or local-only mechanism remains in Actions: {forbidden}")
@@ -508,6 +575,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         'branches: ["feat/next"]',
         "release_candidate: false",
         '--name-status -z "$BASE_SHA...$HEAD_SHA"',
+        '--profile-document "$profile_document"',
     ):
         if marker not in feat:
             errors.append(f"feat-integration.yml: missing {marker}")
@@ -568,6 +636,13 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     )
     count("selective-quality.yml", "ref: ${{ inputs.base_sha }}", 0)
     count("selective-quality.yml", "ref: ${{ github.workflow_sha }}", 1)
+    count(
+        "selective-quality.yml",
+        "workflow_quality_gate.py --self-test --profile workflow-selection",
+        1,
+    )
+    count("selective-quality.yml", "scripts/test_ci_change_scope.py", 1)
+    count("selective-quality.yml", "scripts/test_selected_quality_gate.py", 1)
 
     linux_distribution = workflows["linux-distribution.yml"]
     for marker in (
@@ -611,11 +686,14 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "scripts/cli_contract_e2e.sh",
         "scripts/record_daemon_e2e.sh",
         "xvfb-run --auto-servernum",
+        "bash scripts/regression_guard.sh --history-graph",
     ):
         if marker not in rust:
             errors.append(f"rust.yml: missing {marker}")
     if "upload-artifact" in rust:
         errors.append("rust.yml: evidence-only artifact remains")
+    count("rust.yml", "scripts/regression_guard.sh --history-graph", 1)
+    count("windows-client.yml", "scripts/windows_client_contract_gate.sh --history-graph", 1)
 
     codeql = workflows["codeql.yml"]
     if "  schedule:\n" in codeql:
@@ -720,7 +798,10 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
                         "success"
                         if job in selected_jobs
                         or (job == "codeql-quality" and bool(selection["codeql_languages"]))
-                        or (job == "linux-distribution" and selection["binary_impact"])
+                        or (
+                            job == "linux-distribution"
+                            and selection["distribution_required"]
+                        )
                         else "skipped"
                     )
                 }
@@ -741,14 +822,14 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
         environment = os.environ.copy()
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         for path in ("src/lib.rs", "ui/app.slint"):
-            non_candidate = classify(path, release_candidate=False)
             fixed = classify(path, release_candidate=True)
-            if "WINDOWS" in json.loads(non_candidate)["owners"]:
-                raise AssertionError(f"non-candidate classifier selected WINDOWS for {path}")
             if "WINDOWS" not in json.loads(fixed)["owners"]:
                 raise AssertionError(
                     f"release-candidate classifier omitted WINDOWS for {path}"
                 )
+            narrowed = json.loads(fixed)
+            narrowed["owners"].remove("WINDOWS")
+            non_candidate = json.dumps(narrowed, separators=(",", ":"))
 
             environment.update(
                 {
@@ -782,6 +863,8 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
                 "owners": ["DOCS"],
                 "codeql_languages": [],
                 "binary_impact": False,
+                "distribution_required": False,
+                "quality_profile": "release",
             },
             separators=(",", ":"),
         )
@@ -846,12 +929,15 @@ def _git_copy_detection_test() -> int:
         _git(root, "init", "--quiet")
         _git(root, "config", "user.name", "fixture")
         _git(root, "config", "user.email", "fixture@example.invalid")
-        (root / "README.md").write_text("copy source\n", encoding="utf-8")
-        _git(root, "add", "README.md")
+        source = root / "docs" / "PRODUCT_REQUIREMENTS.md"
+        source.parent.mkdir()
+        source.write_text("copy source\n", encoding="utf-8")
+        _git(root, "add", "docs/PRODUCT_REQUIREMENTS.md")
         _git(root, "commit", "--quiet", "-m", "base")
-        (root / ".github").mkdir()
-        shutil.copy2(root / "README.md", root / ".github/copied.md")
-        _git(root, "add", "-N", ".github/copied.md")
+        target = root / ".github" / "workflows" / "selective-quality.yml"
+        target.parent.mkdir(parents=True)
+        shutil.copy2(source, target)
+        _git(root, "add", "-N", ".github/workflows/selective-quality.yml")
         result = subprocess.run(
             (
                 "git",
@@ -867,11 +953,18 @@ def _git_copy_detection_test() -> int:
             capture_output=True,
             check=True,
         )
-        expected = b"C100\0README.md\0.github/copied.md\0"
+        expected = (
+            b"C100\0docs/PRODUCT_REQUIREMENTS.md\0"
+            b".github/workflows/selective-quality.yml\0"
+        )
         if result.stdout != expected:
             raise AssertionError(f"Git copy record is wrong: {result.stdout!r}")
         changes = root / "changes.z"
         changes.write_bytes(result.stdout)
+        profile_document = root / "pr-body.txt"
+        profile_document.write_text(
+            "Quality-Profile: workflow-selection\n", encoding="utf-8"
+        )
         selection = json.loads(
             _command(
                 (
@@ -879,6 +972,8 @@ def _git_copy_detection_test() -> int:
                     str(ROOT / "scripts/ci_change_scope.py"),
                     "--name-status",
                     str(changes),
+                    "--profile-document",
+                    str(profile_document),
                 ),
                 cwd=root,
             ).stdout
@@ -2998,6 +3093,69 @@ def release_self_test() -> int:
     return 0
 
 
+def workflow_selection_self_test() -> int:
+    """Exercise only the changed feat selector/profile wiring.
+
+    Release publication, bundle construction, installer, and product E2E are
+    separate risk paths and intentionally do not run for this profile.
+    """
+
+    baseline = sources()
+    errors = validate(baseline)
+    if errors:
+        raise AssertionError("production workflow contract failed: " + "; ".join(errors))
+    mutations = (
+        ("feat-integration.yml", "release_candidate: false", "release_candidate: true"),
+        ("feat-integration.yml", "--find-copies-harder", "--no-renames"),
+        (
+            "feat-integration.yml",
+            '--profile-document "$profile_document"',
+            '--name-status "$profile_document"',
+        ),
+        (
+            "selective-quality.yml",
+            "fromJSON(inputs.selection_json).distribution_required == true",
+            "fromJSON(inputs.selection_json).binary_impact == true",
+        ),
+        (
+            "rust.yml",
+            "bash scripts/regression_guard.sh --history-graph",
+            "true",
+        ),
+        (
+            "windows-client.yml",
+            "bash scripts/windows_client_contract_gate.sh --history-graph",
+            "true",
+        ),
+        (
+            "linux-ui-quality.yml",
+            "if: inputs.quality_profile == 'release'",
+            "if: always()",
+        ),
+    )
+    cases = 1
+    for name, old, new in mutations:
+        candidate = dict(baseline)
+        if old not in candidate[name]:
+            raise AssertionError(f"mutation target is missing: {name}: {old}")
+        candidate[name] = candidate[name].replace(old, new, 1)
+        if not validate(candidate):
+            raise AssertionError(f"workflow mutation was accepted: {name}: {old}")
+        cases += 1
+    release_candidate_cases = _selected_quality_release_candidate_tests(
+        baseline["selective-quality.yml"]
+    )
+    copy_cases = _git_copy_detection_test()
+    total_cases = cases + release_candidate_cases + copy_cases
+    print(
+        "workflow-quality-gate: PASS profile=workflow-selection "
+        f"total_cases={total_cases} static_cases={cases} "
+        f"release_non_narrowing_cases={release_candidate_cases} "
+        f"copy_cases={copy_cases}"
+    )
+    return 0
+
+
 def self_test() -> int:
     baseline = sources()
     errors = validate(baseline)
@@ -3145,13 +3303,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--release-self-test", action="store_true")
+    parser.add_argument("--profile", choices=("workflow-selection",))
     args = parser.parse_args(argv)
     if args.self_test and args.release_self_test:
         parser.error("--self-test and --release-self-test are mutually exclusive")
     if args.release_self_test:
         return release_self_test()
     if args.self_test:
+        if args.profile == "workflow-selection":
+            return workflow_selection_self_test()
         return self_test()
+    if args.profile is not None:
+        parser.error("--profile requires --self-test")
     errors = validate(sources())
     if errors:
         for error in errors:
