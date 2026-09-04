@@ -77,6 +77,7 @@ enum LocalCommand {
         auth_epoch: u64,
         admission: AccountAdmission,
         collection_state: Box<usage_store::SessionCollectionState>,
+        regression_recovery_state: Option<Box<usage_store::SessionCollectionState>>,
         history_continuity_recovery: Option<usage_store::HistoryContinuityRecovery>,
         reset_at: i64,
         window_seconds: i64,
@@ -343,6 +344,41 @@ impl ModelUsageTotals {
         add_row(&mut self.sol, &offset.sol)?;
         add_row(&mut self.terra, &offset.terra)?;
         add_row(&mut self.luna, &offset.luna)
+    }
+
+    fn checked_difference(&self, baseline: &Self) -> Option<Self> {
+        fn subtract_row(
+            current: &ModelUsageRow,
+            baseline: &ModelUsageRow,
+        ) -> Option<ModelUsageRow> {
+            Some(ModelUsageRow {
+                name: current.name.clone(),
+                tokens: current.tokens.checked_sub(baseline.tokens)?,
+                input_tokens: current.input_tokens.checked_sub(baseline.input_tokens)?,
+                cached_input_tokens: current
+                    .cached_input_tokens
+                    .checked_sub(baseline.cached_input_tokens)?,
+                output_tokens: current.output_tokens.checked_sub(baseline.output_tokens)?,
+            })
+        }
+        Some(Self {
+            sol: subtract_row(&self.sol, &baseline.sol)?,
+            terra: subtract_row(&self.terra, &baseline.terra)?,
+            luna: subtract_row(&self.luna, &baseline.luna)?,
+        })
+    }
+
+    fn is_zero(&self) -> bool {
+        self.token_totals() == ModelTokenTotals::default()
+            && self.sol.input_tokens == 0
+            && self.sol.cached_input_tokens == 0
+            && self.sol.output_tokens == 0
+            && self.terra.input_tokens == 0
+            && self.terra.cached_input_tokens == 0
+            && self.terra.output_tokens == 0
+            && self.luna.input_tokens == 0
+            && self.luna.cached_input_tokens == 0
+            && self.luna.output_tokens == 0
     }
 }
 
@@ -4922,6 +4958,7 @@ struct SessionCleanupPlan {
     overflow_files: Vec<SessionFileCandidate>,
 }
 
+#[derive(Clone)]
 struct LocalInputInventory {
     selected_session_files: Vec<SessionFileCandidate>,
     overflow_session_files: Vec<SessionFileCandidate>,
@@ -5178,6 +5215,122 @@ struct LocalUsageCollection {
     bounded_source_rescan_complete: bool,
 }
 
+fn apply_regression_recovery(
+    collection: &mut LocalUsageCollection,
+    recovered: ModelUsageTotals,
+) -> bool {
+    let Some(offset) = recovered.checked_difference(&collection.model_usage) else {
+        debug_runtime("durable cumulative recovery rejected non-monotonic candidate");
+        return false;
+    };
+    if offset.is_zero() {
+        return false;
+    }
+    let costs = offset.dollar_totals();
+    let tokens = offset.token_totals();
+    let mut adjusted_history = collection.history_samples.clone();
+    for sample in &mut adjusted_history {
+        let sol_dollars = sample.sol_dollars + costs.sol;
+        let terra_dollars = sample.terra_dollars + costs.terra;
+        let luna_dollars = sample.luna_dollars + costs.luna;
+        let Some(sol_tokens) = sample.sol_tokens.checked_add(tokens.sol) else {
+            return false;
+        };
+        let Some(terra_tokens) = sample.terra_tokens.checked_add(tokens.terra) else {
+            return false;
+        };
+        let Some(luna_tokens) = sample.luna_tokens.checked_add(tokens.luna) else {
+            return false;
+        };
+        if [sol_dollars, terra_dollars, luna_dollars]
+            .into_iter()
+            .any(|value| !value.is_finite() || value < 0.0)
+        {
+            return false;
+        }
+        sample.sol_dollars = sol_dollars;
+        sample.terra_dollars = terra_dollars;
+        sample.luna_dollars = luna_dollars;
+        sample.sol_tokens = sol_tokens;
+        sample.terra_tokens = terra_tokens;
+        sample.luna_tokens = luna_tokens;
+    }
+    collection.history_samples = adjusted_history;
+    collection.session_model_totals = recovered.to_session_totals();
+    collection.model_usage = recovered;
+    debug_runtime(format!(
+        "durable cumulative recovery applied sol={} terra={} luna={}",
+        tokens.sol, tokens.terra, tokens.luna
+    ));
+    true
+}
+
+fn load_regression_recovery_state(
+    partition: &account_scope::AccountPartition,
+    current: &usage_store::SessionCollectionState,
+    continuity: &usage_store::HistoryContinuityRecovery,
+) -> Option<usage_store::SessionCollectionState> {
+    let identity = partition.storage_identity();
+    let mut selected: Option<usage_store::SessionCollectionState> = None;
+    for generation in 1..=3 {
+        let path = partition
+            .database_path
+            .with_extension(format!("sqlite3.bak.{generation}"));
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return None;
+            }
+            Ok(_) => {}
+        }
+        let store = UsageStore::open_read_only_partitioned(&path, &identity).ok()?;
+        store.verify_integrity().ok()?;
+        if store.pending_history_continuity_recovery().ok()?.as_ref() != Some(continuity) {
+            return None;
+        }
+        let candidate = store.load_session_collection_state().ok()?;
+        if candidate.data_generation >= current.data_generation
+            || candidate.window_seconds != current.window_seconds
+            || !same_reset_period(candidate.reset_at, current.reset_at)
+            || candidate.collector_epoch.is_none()
+            || candidate.cycle_seq == 0
+            || candidate.checkpoints.is_empty()
+        {
+            continue;
+        }
+        let candidate_totals = ModelUsageTotals::from_session_totals(&candidate.model_totals);
+        if candidate_totals.is_zero() {
+            continue;
+        }
+        match selected.as_ref() {
+            None => selected = Some(candidate),
+            Some(existing) => {
+                let existing_totals = ModelUsageTotals::from_session_totals(&existing.model_totals);
+                let candidate_dominates = candidate_totals
+                    .checked_difference(&existing_totals)
+                    .is_some();
+                let existing_dominates = existing_totals
+                    .checked_difference(&candidate_totals)
+                    .is_some();
+                if candidate_dominates && !existing_dominates {
+                    selected = Some(candidate);
+                } else if !candidate_dominates && !existing_dominates {
+                    debug_runtime("durable cumulative backup candidates are incomparable");
+                    return None;
+                }
+            }
+        }
+    }
+    if let Some(candidate) = selected.as_ref() {
+        debug_runtime(format!(
+            "durable cumulative backup selected generation={}",
+            candidate.data_generation
+        ));
+    }
+    selected
+}
+
 fn cleanup_plan_for_inventory(inventory: &LocalInputInventory) -> Option<SessionCleanupPlan> {
     let sessions_root = inventory.sessions_root.clone()?;
     if inventory.overflow_session_files.is_empty() {
@@ -5398,6 +5551,83 @@ struct TimedModelUsage {
 /// same file disappear from the graph.  The bounded reader consumes the bad
 /// record before returning the error, so skipping only `LimitExceeded` and
 /// `Parse` is both recoverable and bounded; I/O failures remain fatal.
+const SESSION_RECORD_INITIAL_CAPACITY: usize = 8 * 1024;
+
+fn read_recoverable_session_record_into<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> Result<(bool, bool), security::SecurityError> {
+    let mut skipped_invalid_record = false;
+    loop {
+        line.clear();
+        let mut invalid_record = false;
+        loop {
+            let buffer = reader
+                .fill_buf()
+                .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::Io))?;
+            if buffer.is_empty() {
+                if line.is_empty() {
+                    return Ok((false, skipped_invalid_record));
+                }
+                return Err(security::SecurityError::new(
+                    security::SecurityErrorKind::Unterminated,
+                ));
+            }
+            if let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                if line.len().saturating_add(position) > security::MAX_JSONL_LINE_BYTES {
+                    reader.consume(position + 1);
+                    invalid_record = true;
+                    break;
+                }
+                line.extend_from_slice(&buffer[..position]);
+                reader.consume(position + 1);
+                break;
+            }
+            if line.len().saturating_add(buffer.len()) > security::MAX_JSONL_LINE_BYTES {
+                let length = buffer.len();
+                reader.consume(length);
+                if !discard_session_partial_tail(reader)? {
+                    return Err(security::SecurityError::new(
+                        security::SecurityErrorKind::Unterminated,
+                    ));
+                }
+                invalid_record = true;
+                break;
+            }
+            line.extend_from_slice(buffer);
+            let length = buffer.len();
+            reader.consume(length);
+        }
+        if invalid_record {
+            debug_runtime("skipped malformed session record kind=LimitExceeded");
+            skipped_invalid_record = true;
+            continue;
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if std::str::from_utf8(line).is_err() {
+            debug_runtime("skipped malformed session record kind=Parse");
+            skipped_invalid_record = true;
+            continue;
+        }
+        return Ok((true, skipped_invalid_record));
+    }
+}
+
+fn session_record_may_affect_usage(line: &[u8]) -> bool {
+    const USAGE_RECORD_MARKERS: [&[u8]; 4] = [
+        b"token_count",
+        b"turn_context",
+        b"thread_context",
+        b"thread_settings_applied",
+    ];
+    USAGE_RECORD_MARKERS.iter().any(|marker| {
+        line.windows(marker.len())
+            .any(|candidate| candidate == *marker)
+    })
+}
+
 #[cfg(test)]
 fn read_recoverable_session_line<R: BufRead>(
     reader: &mut R,
@@ -5405,34 +5635,18 @@ fn read_recoverable_session_line<R: BufRead>(
     read_recoverable_session_line_with_status(reader).map(|(line, _)| line)
 }
 
+#[cfg(test)]
 fn read_recoverable_session_line_with_status<R: BufRead>(
     reader: &mut R,
 ) -> Result<(Option<String>, bool), security::SecurityError> {
-    let mut skipped_invalid_record = false;
-    loop {
-        match security::read_bounded_jsonl_record(reader) {
-            Ok(Some((line, true))) => return Ok((Some(line), skipped_invalid_record)),
-            Ok(Some((_line, false))) => {
-                return Err(security::SecurityError::new(
-                    security::SecurityErrorKind::Unterminated,
-                ));
-            }
-            Ok(None) => return Ok((None, skipped_invalid_record)),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    security::SecurityErrorKind::LimitExceeded | security::SecurityErrorKind::Parse
-                ) =>
-            {
-                debug_runtime(format!(
-                    "skipped malformed session record kind={:?}",
-                    error.kind()
-                ));
-                skipped_invalid_record = true;
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    let mut line = Vec::with_capacity(SESSION_RECORD_INITIAL_CAPACITY);
+    let (present, skipped_invalid_record) =
+        read_recoverable_session_record_into(reader, &mut line)?;
+    let line = present
+        .then(|| String::from_utf8(line))
+        .transpose()
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::Parse))?;
+    Ok((line, skipped_invalid_record))
 }
 
 fn session_event_type(value: &Value) -> Option<&str> {
@@ -5527,15 +5741,12 @@ fn collect_session_usage_records<R: BufRead>(
     let mut fully_recordable = true;
     let mut model: Option<String> = None;
     let mut previous = TokenSnapshot::default();
+    let mut line = Vec::with_capacity(SESSION_RECORD_INITIAL_CAPACITY);
     loop {
-        let line = match read_recoverable_session_line_with_status(reader) {
-            Ok((Some(line), skipped_invalid_record)) => {
+        let present = match read_recoverable_session_record_into(reader, &mut line) {
+            Ok((present, skipped_invalid_record)) => {
                 fully_recordable &= !skipped_invalid_record;
-                line
-            }
-            Ok((None, skipped_invalid_record)) => {
-                fully_recordable &= !skipped_invalid_record;
-                break;
+                present
             }
             Err(error) => {
                 *totals = original;
@@ -5543,7 +5754,20 @@ fn collect_session_usage_records<R: BufRead>(
                 return Err(error);
             }
         };
-        let value = match serde_json::from_str::<Value>(&line) {
+        if !present {
+            break;
+        }
+        // Session files contain large tool payloads and assistant/user
+        // messages that cannot change model attribution or token counters.
+        // Their framing is still bounded and consumed above, but building a
+        // serde tree for each one makes a 2 GiB recovery retain memory in
+        // proportion to unrelated payloads. A missed escaped marker only
+        // makes the immutable aggregate oracle reject recovery; it can never
+        // admit an incomplete total.
+        if !session_record_may_affect_usage(&line) {
+            continue;
+        }
+        let value = match serde_json::from_slice::<Value>(&line) {
             Ok(value) => value,
             Err(_) => {
                 fully_recordable = false;
@@ -5906,26 +6130,27 @@ fn collect_session_append(
             .stream_position()
             .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
     }
+    let mut line = Vec::with_capacity(SESSION_RECORD_INITIAL_CAPACITY);
     while reader
         .stream_position()
         .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?
         < candidate.fingerprint.length
     {
-        let line = match security::read_bounded_jsonl_record(&mut reader) {
-            Ok(Some((line, true))) => line,
-            Ok(Some((_line, false))) => return Ok(None),
-            Ok(None) => break,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    security::SecurityErrorKind::LimitExceeded | security::SecurityErrorKind::Parse
-                ) =>
-            {
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
+        let (present, skipped_invalid_record) =
+            match read_recoverable_session_record_into(&mut reader, &mut line) {
+                Ok(result) => result,
+                Err(error) if error.kind() == security::SecurityErrorKind::Unterminated => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+        if skipped_invalid_record {
+            return Ok(None);
+        }
+        if !present {
+            break;
         };
-        let value = match serde_json::from_str::<Value>(&line) {
+        let value = match serde_json::from_slice::<Value>(&line) {
             Ok(value) => value,
             Err(_) => {
                 return Ok(None);
@@ -6375,6 +6600,18 @@ fn recover_checkpointed_history_model_totals(
         {
             return Err("legacy component recovery source identity raced".into());
         }
+        let _ = rustix::fs::fadvise(
+            &file,
+            0,
+            candidate.fingerprint.length,
+            rustix::fs::Advice::Sequential,
+        );
+        let _ = rustix::fs::fadvise(
+            &file,
+            0,
+            candidate.fingerprint.length,
+            rustix::fs::Advice::NoReuse,
+        );
         let before_totals = totals.clone();
         let mut reader = BufReader::new(file.take(candidate.fingerprint.length));
         let _fully_recordable = collect_session_usage_records(
@@ -6401,6 +6638,12 @@ fn recover_checkpointed_history_model_totals(
         {
             return Err("legacy component recovery source was not stable".into());
         }
+        let _ = rustix::fs::fadvise(
+            reader.get_ref().get_ref(),
+            0,
+            candidate.fingerprint.length,
+            rustix::fs::Advice::DontNeed,
+        );
         if totals != before_totals
             && !checkpoint_identities.contains(&(
                 candidate.recorded_source.root_identity.as_str(),
@@ -7209,6 +7452,7 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                 auth_epoch,
                 admission,
                 collection_state,
+                regression_recovery_state,
                 history_continuity_recovery,
                 reset_at,
                 window_seconds,
@@ -7242,8 +7486,11 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                 };
                 cycle_seq = next_cycle;
                 let result = local_input_inventory().and_then(|inventory| {
-                    let mut collection_state = *collection_state;
+                    let collection_state = *collection_state;
+                    let mut regression_recovery_state =
+                        regression_recovery_state.map(|state| *state);
                     let mut verified_recovery = None;
+                    let mut verified_fingerprint = None;
                     if let Some(authority) = history_continuity_recovery.filter(|authority| {
                         cache.rejected_history_recovery.as_deref()
                             != Some(authority.source_fingerprint.as_str())
@@ -7261,25 +7508,8 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                                 // recovery travels with the pending recorder
                                 // batch and can be retried without rescanning
                                 // the Session prefix.
-                                cache.rejected_history_recovery =
-                                    Some(authority_fingerprint.clone());
-                                let offset = ModelUsageTotals::from_session_totals(&model_totals);
-                                let mut cumulative = ModelUsageTotals::from_session_totals(
-                                    &collection_state.model_totals,
-                                );
-                                if cumulative.checked_add_totals(&offset).is_some() {
-                                    collection_state.model_totals = cumulative.to_session_totals();
-                                    verified_recovery =
-                                        Some(usage_store::HistoryContinuityModelRecovery {
-                                            authority,
-                                            model_totals,
-                                        });
-                                } else {
-                                    debug_runtime(
-                                        "legacy component recovery total overflow rejected",
-                                    );
-                                    cache.rejected_history_recovery = Some(authority_fingerprint);
-                                }
+                                verified_fingerprint = Some(authority_fingerprint);
+                                verified_recovery = Some((authority, model_totals));
                             }
                             Err(error) => {
                                 debug_runtime(format!(
@@ -7289,19 +7519,65 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                             }
                         }
                     }
-                    cache
-                        .collect_partitioned(PartitionedLocalCollection {
-                            reset_at,
-                            window_seconds,
-                            inventory,
-                            collection_state,
-                            collector_epoch,
-                            cycle_seq,
+                    if verified_recovery.is_none() {
+                        regression_recovery_state = None;
+                    }
+                    let recovered_totals = regression_recovery_state
+                        .map(|state| {
+                            let mut recovery_cache = LocalUsageCache::default();
+                            recovery_cache.collect_partitioned(PartitionedLocalCollection {
+                                reset_at,
+                                window_seconds,
+                                inventory: inventory.clone(),
+                                collection_state: state,
+                                collector_epoch,
+                                cycle_seq,
+                            })
                         })
-                        .map(|mut collection| {
-                            collection.history_continuity_recovery = verified_recovery;
-                            collection
-                        })
+                        .transpose()?
+                        .map(|collection| collection.model_usage);
+                    let mut collection = cache.collect_partitioned(PartitionedLocalCollection {
+                        reset_at,
+                        window_seconds,
+                        inventory,
+                        collection_state,
+                        collector_epoch,
+                        cycle_seq,
+                    })?;
+                    if let Some(recovered) = recovered_totals {
+                        apply_regression_recovery(&mut collection, recovered);
+                    }
+                    let verified_recovery =
+                        verified_recovery.and_then(|(authority, model_totals)| {
+                            let fallback_samples = collection.history_samples.clone();
+                            let fallback_model_totals = collection.session_model_totals.clone();
+                            let offset = ModelUsageTotals::from_session_totals(&model_totals);
+                            let mut cumulative = collection.model_usage.clone();
+                            if cumulative.checked_add_totals(&offset).is_none() {
+                                debug_runtime("legacy component recovery total overflow rejected");
+                                return None;
+                            }
+                            if !offset.is_zero()
+                                && !apply_regression_recovery(&mut collection, cumulative)
+                            {
+                                debug_runtime("legacy component recovery offset rejected");
+                                return None;
+                            }
+                            Some(usage_store::HistoryContinuityModelRecovery {
+                                authority,
+                                model_totals,
+                                fallback_samples: fallback_samples
+                                    .iter()
+                                    .map(UsageHistorySample::to_store)
+                                    .collect(),
+                                fallback_model_totals,
+                            })
+                        });
+                    if let Some(fingerprint) = verified_fingerprint {
+                        cache.rejected_history_recovery = Some(fingerprint);
+                    }
+                    collection.history_continuity_recovery = verified_recovery;
+                    Ok(collection)
                 });
                 match result {
                     Ok(collection) => {
@@ -8840,6 +9116,10 @@ impl CodexInfoState {
                     return false;
                 }
             };
+        let regression_recovery_state =
+            history_continuity_recovery.as_ref().and_then(|continuity| {
+                load_regression_recovery_state(partition, &collection_state, continuity)
+            });
         let period_boundary = admit_session_collection_period(
             &mut collection_state,
             reset_at,
@@ -8857,6 +9137,10 @@ impl CodexInfoState {
             auth_epoch: self.auth_epoch,
             admission,
             collection_state: Box::new(collection_state),
+            regression_recovery_state: (!period_boundary)
+                .then_some(regression_recovery_state)
+                .flatten()
+                .map(Box::new),
             history_continuity_recovery: (!period_boundary)
                 .then_some(history_continuity_recovery)
                 .flatten(),
@@ -9154,6 +9438,7 @@ impl CodexInfoState {
     }
 
     fn apply_account_error(&mut self, error: String) {
+        debug_runtime(format!("state account error: {error}"));
         // The failed account connection is a publication boundary. Results
         // requested before this error may still be queued on the independent
         // thread/local channels, so invalidate their epoch without clearing
@@ -9180,6 +9465,7 @@ impl CodexInfoState {
     }
 
     fn apply_identity_error(&mut self, error: String) {
+        debug_runtime(format!("state identity error: {error}"));
         if !self.clear_account_visible_state() {
             return;
         }
@@ -9475,16 +9761,45 @@ impl CodexInfoState {
             self.apply_identity_error("Session集計後にアカウントidentityが変更されました。".into());
             return;
         }
+        let fallback_start = self.history.pending_store_samples.len();
+        let mut history_continuity_recovery = candidate.history_continuity_recovery;
         self.pending_session_checkpoints = candidate.session_checkpoints;
         self.pending_session_ranges = candidate.session_ranges;
         self.pending_session_model_totals = candidate.session_model_totals;
-        self.pending_history_continuity_recovery = candidate.history_continuity_recovery;
         self.pending_bounded_source_rescan_complete = candidate.bounded_source_rescan_complete;
         self.pending_collector_generation = Some((candidate.collector_epoch, candidate.cycle_seq));
         self.pending_session_period =
             Some((candidate.result.reset_at, candidate.result.window_seconds));
         self.pending_recorder_admission = Some((candidate.result.auth_epoch, admission));
         self.apply_local_usage_success(candidate.result);
+        if let Some(mut recovery) = history_continuity_recovery.take() {
+            let fallback_usage =
+                ModelUsageTotals::from_session_totals(&recovery.fallback_model_totals);
+            let fallback_costs = fallback_usage.dollar_totals();
+            let fallback_tokens = fallback_usage.token_totals();
+            let backfill = recovery.fallback_samples.clone();
+            let mut complete_fallback = self.history.pending_store_samples.clone();
+            for sample in complete_fallback.iter_mut().skip(fallback_start) {
+                if let Some(expected) = backfill.iter().find(|expected| {
+                    expected.timestamp == sample.timestamp && expected.reset_at == sample.reset_at
+                }) {
+                    let remaining_percent = sample.remaining_percent;
+                    *sample = expected.clone();
+                    sample.remaining_percent = remaining_percent;
+                } else {
+                    sample.sol_dollars = fallback_costs.sol;
+                    sample.terra_dollars = fallback_costs.terra;
+                    sample.luna_dollars = fallback_costs.luna;
+                    sample.sol_tokens = fallback_tokens.sol;
+                    sample.terra_tokens = fallback_tokens.terra;
+                    sample.luna_tokens = fallback_tokens.luna;
+                }
+            }
+            recovery.fallback_samples = complete_fallback;
+            self.pending_history_continuity_recovery = Some(recovery);
+        } else {
+            self.pending_history_continuity_recovery = None;
+        }
     }
 
     fn apply_local_usage_error(&mut self, auth_epoch: u64, reset_at: i64, window_seconds: i64) {
@@ -9539,6 +9854,14 @@ impl CodexInfoState {
     ) {
         if self.current_account_admission().as_ref() != Some(admission) || !self.auth_epoch_valid {
             return;
+        }
+        if let Some(fallback) = ack.fallback_model_totals.as_deref() {
+            let committed_totals = ModelUsageTotals::from_session_totals(fallback);
+            let committed_costs = committed_totals.dollar_totals();
+            if self.authenticated {
+                self.model_usage = committed_totals.rows();
+                self.estimated_cost_label = format_estimated_cost(committed_costs);
+            }
         }
         self.acknowledged_recorder_commit = Some(AcknowledgedRecorderCommit {
             auth_epoch: self.auth_epoch,
@@ -13685,6 +14008,7 @@ mod tests {
                 cycle_seq,
                 last_commit_unix: Utc::now().timestamp(),
                 canonical_samples: Vec::new(),
+                fallback_model_totals: None,
                 legacy_history_bridged: false,
             },
         );
@@ -14876,6 +15200,113 @@ mod tests {
             now,
         ));
         assert!(rollover.model_totals.is_empty());
+    }
+
+    #[test]
+    fn regression_recovery_replaces_only_cumulative_values_and_preserves_evidence() {
+        let reset_at = 1_800_604_800;
+        let normal = ModelUsageTotals::from_session_totals(&[
+            super::usage_store::SessionModelTotal {
+                model: "SOL".into(),
+                total_tokens: 100,
+                input_tokens: 80,
+                cached_input_tokens: 30,
+                output_tokens: 20,
+            },
+            super::usage_store::SessionModelTotal {
+                model: "LUNA".into(),
+                total_tokens: 50,
+                input_tokens: 40,
+                cached_input_tokens: 10,
+                output_tokens: 10,
+            },
+        ]);
+        let recovered = ModelUsageTotals::from_session_totals(&[
+            super::usage_store::SessionModelTotal {
+                model: "SOL".into(),
+                total_tokens: 1_100,
+                input_tokens: 880,
+                cached_input_tokens: 330,
+                output_tokens: 220,
+            },
+            super::usage_store::SessionModelTotal {
+                model: "LUNA".into(),
+                total_tokens: 50,
+                input_tokens: 40,
+                cached_input_tokens: 10,
+                output_tokens: 10,
+            },
+        ]);
+        let checkpoint = super::usage_store::SessionCheckpoint {
+            root_identity: "11".repeat(32),
+            relative_path: "session.jsonl".into(),
+            file_device: 1,
+            file_inode: 2,
+            committed_offset: 100,
+            discard_until_lf: false,
+            collector_epoch: 3,
+            cycle_seq: 4,
+            prefix_generation: 5,
+            prefix_sha256: "22".repeat(32),
+            fully_attributed_from_zero: true,
+            token_baseline_known: true,
+            last_model: Some("SOL".into()),
+            last_task_running: Some(true),
+            previous_total: 100,
+            previous_input: 80,
+            previous_cached_input: 30,
+            previous_output: 20,
+        };
+        let range = super::usage_store::SessionRange {
+            root_identity: checkpoint.root_identity.clone(),
+            relative_path: checkpoint.relative_path.clone(),
+            file_device: checkpoint.file_device,
+            file_inode: checkpoint.file_inode,
+            start_offset: 50,
+            end_offset: 100,
+            collector_epoch: 3,
+            cycle_seq: 4,
+            prefix_generation: 5,
+            record_sha256: "33".repeat(32),
+        };
+        let normal_costs = normal.dollar_totals();
+        let normal_tokens = normal.token_totals();
+        let mut collection = super::LocalUsageCollection {
+            model_usage: normal.clone(),
+            history_samples: vec![UsageHistorySample::new_with_usage(
+                1_800_000_120,
+                reset_at,
+                50.0,
+                normal_costs,
+                normal_tokens,
+            )],
+            session_checkpoints: vec![checkpoint.clone()],
+            session_ranges: vec![range.clone()],
+            session_model_totals: normal.to_session_totals(),
+            bounded_source_rescan_complete: true,
+            ..super::LocalUsageCollection::default()
+        };
+
+        assert!(super::apply_regression_recovery(
+            &mut collection,
+            recovered.clone()
+        ));
+        assert_eq!(collection.model_usage, recovered);
+        assert_eq!(collection.session_checkpoints, [checkpoint]);
+        assert_eq!(collection.session_ranges, [range]);
+        assert!(collection.bounded_source_rescan_complete);
+        let expected_costs = collection.model_usage.dollar_totals();
+        let expected_tokens = collection.model_usage.token_totals();
+        let sample = &collection.history_samples[0];
+        assert!((sample.sol_dollars - expected_costs.sol).abs() < 1e-12);
+        assert!((sample.luna_dollars - expected_costs.luna).abs() < 1e-12);
+        assert_eq!(sample.sol_tokens, expected_tokens.sol);
+        assert_eq!(sample.luna_tokens, expected_tokens.luna);
+
+        let unchanged = collection.clone();
+        assert!(!super::apply_regression_recovery(&mut collection, normal));
+        assert_eq!(collection.model_usage, unchanged.model_usage);
+        assert_eq!(collection.history_samples, unchanged.history_samples);
     }
 
     #[test]

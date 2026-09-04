@@ -481,6 +481,12 @@ impl HistoryContinuityRecovery {
 pub struct HistoryContinuityModelRecovery {
     pub authority: HistoryContinuityRecovery,
     pub model_totals: Vec<SessionModelTotal>,
+    /// Exact generation before the optional continuity offset was added.
+    /// The recorder commits this payload when the independent recovery
+    /// transaction is rejected, so recovery failure never blocks ordinary
+    /// Session progress or leaks an uncommitted offset into durable state.
+    pub fallback_samples: Vec<UsageHistorySample>,
+    pub fallback_model_totals: Vec<SessionModelTotal>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2394,6 +2400,21 @@ impl UsageStore {
         // integrity scan on every minute poll is not an access check.
         validate_storage_partition_metadata(&store.connection, identity)?;
         Ok(store)
+    }
+
+    /// Performs the full SQLite integrity proof only when a retained backup
+    /// is selected as recovery authority. Steady-state readers intentionally
+    /// use the cheaper schema/identity validation above.
+    pub fn verify_integrity(&self) -> Result<()> {
+        let quick_check: String = self
+            .connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        if quick_check != "ok" {
+            return Err(UsageStoreError::InvalidImport(
+                "account partition quick_check failed".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Creates and rotates backups only for one already-verified partition.
@@ -7805,6 +7826,8 @@ mod wave_b_correction_tests {
                 total_tokens: 999_999,
                 ..offset.clone()
             }],
+            fallback_samples: Vec::new(),
+            fallback_model_totals: Vec::new(),
         };
         assert!(store.apply_history_continuity_model_totals(&wrong).is_err());
         assert_eq!(
@@ -7822,6 +7845,8 @@ mod wave_b_correction_tests {
         let recovery = HistoryContinuityModelRecovery {
             authority,
             model_totals: vec![offset],
+            fallback_samples: Vec::new(),
+            fallback_model_totals: Vec::new(),
         };
         assert_eq!(
             store
