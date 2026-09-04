@@ -13591,9 +13591,16 @@ fn fetch_service_details(address: SocketAddr) -> Result<(String, PublicDetails),
 }
 
 fn fetch_service_details_v2(address: SocketAddr) -> Result<(String, PublicDetailsV2), String> {
-    let response = request_service_details(address, "/v2/details")?;
+    fetch_service_details_v2_with(|route| request_service_details(address, route))
+}
+
+fn fetch_service_details_v2_with<F>(mut request: F) -> Result<(String, PublicDetailsV2), String>
+where
+    F: FnMut(&str) -> Result<ServiceDetailsHttpResponse, String>,
+{
+    let response = request("/v2/details")?;
     if response.status == 404 {
-        let fallback = request_service_details(address, "/v1/details")?;
+        let fallback = request("/v1/details")?;
         if fallback.status != 200 {
             return Err("v1 details fallback response is not HTTP 200".into());
         }
@@ -17516,6 +17523,173 @@ mod tests {
         assert!(initial_publication.last_complete.is_none());
         assert!(initial.recorder_store_error);
         assert_eq!(initial.history.pending_store_samples.len(), 1);
+    }
+
+    #[test]
+    fn committed_v2_root_keeps_model_tokens_costs_and_history_endpoint_aligned() {
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-v2-root-alignment-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        let database = root.join("history.sqlite3");
+        let storage_identity = usage_store::StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 1,
+            partition_id: "33".repeat(32),
+        };
+
+        let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
+        state.history = UsageHistory::default();
+        state.active_threads.clear();
+        state.last_success_at = Some(Utc::now().timestamp());
+        state.remaining_percent = Some(61.0);
+        state.has_quota_percent = true;
+        state.local_usage_pending = true;
+        let reset_at = state.reset_at.unwrap();
+        let mut totals = ModelUsageTotals::default();
+        totals.add(
+            "gpt-5.6-sol",
+            TokenSnapshot {
+                total: 2_000_000,
+                input: 1_000_000,
+                cached_input: 0,
+                output: 1_000_000,
+            },
+        );
+        state.pending_session_model_totals = totals.to_session_totals();
+        state.pending_collector_generation = Some((0x138, 1));
+        state.pending_session_period = Some((reset_at, WEEK_SECONDS));
+        state.pending_bounded_source_rescan_complete = true;
+        state.pending_recorder_admission =
+            Some((state.auth_epoch, state.current_account_admission().unwrap()));
+        state.apply_local_usage_success(LocalUsageResult {
+            auth_epoch: state.auth_epoch,
+            reset_at,
+            window_seconds: WEEK_SECONDS,
+            model_usage: totals,
+            history_samples: Vec::new(),
+            recorded_sessions: Vec::new(),
+            cleanup_plan: None,
+        });
+
+        let admission = state.current_account_admission().unwrap();
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        let publisher = server.publisher();
+        let mut publication = super::ResidentPublicationState::default();
+        let outcome = super::resident_service_cycle_with_recorder_attempt_v2(
+            &mut state,
+            &mut publication,
+            true,
+            |state, pending| {
+                let mut store = UsageStore::create_partitioned(&database, &storage_identity)
+                    .map_err(|error| error.to_string())?;
+                let result = store
+                    .commit_session_collection_with_observations(
+                        usage_store::SessionCollectionCommit {
+                            reset_at: pending.reset_at.unwrap(),
+                            window_seconds: pending.window_seconds.unwrap(),
+                            collector_epoch: pending.collector_epoch.unwrap(),
+                            cycle_seq: pending.cycle_seq.unwrap(),
+                            samples: &pending.samples,
+                            checkpoints: &pending.session_checkpoints,
+                            ranges: &pending.session_ranges,
+                            model_totals: &pending.session_model_totals,
+                            recorded_sessions: &pending.recorded_sessions,
+                        },
+                        &pending.observations,
+                    )
+                    .map_err(|error| error.to_string())?;
+                let persisted = store
+                    .load_recent_observations(Utc::now())
+                    .map_err(|error| error.to_string())?;
+                assert_eq!(persisted.len(), 1);
+                assert_eq!(
+                    persisted[0].model_source,
+                    usage_store::ModelSource::Confirmed
+                );
+                assert_eq!(persisted[0].sol_tokens, Some(2_000_000));
+                assert_eq!(persisted[0].sol_dollars, Some(35.0));
+
+                let canonical_samples = result.canonical_samples;
+                let canonical_observations = result.canonical_observations;
+                state.acknowledge_recorder_commit(
+                    &admission,
+                    daemon::RecorderCommitAck {
+                        data_generation: result.data_generation,
+                        collector_epoch: 0x138,
+                        cycle_seq: 1,
+                        last_commit_unix: Utc::now().timestamp(),
+                        canonical_samples: canonical_samples.clone(),
+                        canonical_observations: canonical_observations.clone(),
+                        fallback_model_totals: None,
+                        legacy_history_bridged: false,
+                    },
+                );
+                assert!(state
+                    .history
+                    .apply_committed_samples(canonical_samples, Utc::now()));
+                assert!(state
+                    .history
+                    .apply_committed_observations(canonical_observations, Utc::now()));
+                Ok(())
+            },
+            |v1, v2| publisher.publish_details_v2(v1, v2),
+        )
+        .unwrap();
+        assert_eq!(outcome, super::ResidentServiceCycleOutcome::Published);
+
+        let (pair, wire) = super::fetch_service_details_v2(server.local_addr()).unwrap();
+        assert_eq!(wire.models.len(), 1);
+        let model = &wire.models[0];
+        assert_eq!(model.name, "SOL");
+        assert_eq!(model.input_tokens, 1_000_000);
+        assert_eq!(model.cached_input_tokens, 0);
+        assert_eq!(model.output_tokens, 1_000_000);
+        assert_eq!(model.input_dollars, 5.0);
+        assert_eq!(model.cached_input_dollars, 0.0);
+        assert_eq!(model.output_dollars, 30.0);
+        assert_eq!(wire.estimated_cost_label, "概算 $35");
+        let current_reset = wire
+            .history_periods
+            .iter()
+            .find(|period| period.current)
+            .map(|period| period.reset_at)
+            .unwrap();
+        let endpoint = wire
+            .history_samples
+            .iter()
+            .filter(|sample| sample.reset_at == current_reset)
+            .max_by_key(|sample| sample.timestamp)
+            .unwrap();
+        assert_eq!(endpoint.model_source, "confirmed");
+        assert_eq!(endpoint.sol_tokens, Some(2_000_000));
+        assert_eq!(endpoint.sol_dollars, Some(35.0));
+
+        let mut linux_ui = CodexInfoState::service_client();
+        assert!(linux_ui.apply_service_details_v2(pair, wire).unwrap());
+        assert_eq!(linux_ui.model_usage.len(), 1);
+        assert_eq!(linux_ui.model_usage[0].tokens, 2_000_000);
+        assert_eq!(linux_ui.estimated_cost_label, "概算 $35");
+        assert_eq!(
+            linux_ui
+                .history
+                .samples
+                .iter()
+                .max_by_key(|sample| sample.timestamp)
+                .map(|sample| (sample.sol_tokens, sample.sol_dollars)),
+            Some((2_000_000, 35.0))
+        );
+
+        server.shutdown();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -24548,6 +24722,66 @@ mod tests {
         assert!(published_pair_is_fresh(Some(&current), &pair(1, 3)).unwrap());
         assert!(published_pair_is_fresh(Some(&current), &pair(2, 1)).unwrap());
         assert!(published_pair_is_fresh(None, "v1:ABC").is_err());
+    }
+
+    #[test]
+    fn linux_details_v2_falls_back_only_on_exact_404() {
+        let pair = format!("v1:{:032x}{:032x}", 1_u128, 1_u128);
+        let mut v1_document =
+            serde_json::to_value(CodexInfoState::preview("normal").public_details())
+                .expect("v1 fixture serializes");
+        v1_document
+            .as_object_mut()
+            .expect("v1 fixture is an object")
+            .insert("api_version".into(), Value::String("v1".into()));
+        let v1_body = serde_json::to_vec(&v1_document).unwrap();
+        let mut routes = Vec::new();
+        let (received_pair, fallback) = super::fetch_service_details_v2_with(|route| {
+            routes.push(route.to_owned());
+            Ok(if route == "/v2/details" {
+                super::ServiceDetailsHttpResponse {
+                    status: 404,
+                    pair: None,
+                    body: b"{}".to_vec(),
+                }
+            } else {
+                super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: Some(pair.clone()),
+                    body: v1_body.clone(),
+                }
+            })
+        })
+        .unwrap();
+        assert_eq!(routes, ["/v2/details", "/v1/details"]);
+        assert_eq!(received_pair, pair);
+        fallback.validate().unwrap();
+        assert!(fallback
+            .history_samples
+            .iter()
+            .all(|sample| sample.model_source == "legacy-unknown"));
+
+        let mut non_404_routes = Vec::new();
+        let error = super::fetch_service_details_v2_with(|route| {
+            non_404_routes.push(route.to_owned());
+            Ok(super::ServiceDetailsHttpResponse {
+                status: 503,
+                pair: None,
+                body: b"{}".to_vec(),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(non_404_routes, ["/v2/details"]);
+        assert_eq!(error, "v2 details response is not HTTP 200");
+
+        let mut transport_routes = Vec::new();
+        let error = super::fetch_service_details_v2_with(|route| {
+            transport_routes.push(route.to_owned());
+            Err("transport unavailable".into())
+        })
+        .unwrap_err();
+        assert_eq!(transport_routes, ["/v2/details"]);
+        assert_eq!(error, "transport unavailable");
     }
 
     #[test]
