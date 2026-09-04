@@ -216,7 +216,11 @@ if [[ "$url" == */releases?per_page=100 ]]; then
 elif [[ "$url" == */releases/download/*/* ]]; then
     payload_file="$FAKE_RELEASE_ASSETS/${url##*/}"
 elif [[ "$url" == http://127.0.0.1:8787/v1/details ]]; then
-    payload="$(printf '{\"state\":\"%s\",\"observed_at\":1}\n' "${FAKE_DETAILS_STATE:-auth_required}")"
+    details_padding=''
+    printf -v details_padding '%*s' "${FAKE_DETAILS_PADDING_BYTES:-0}" ''
+    details_padding="${details_padding// /x}"
+    payload="$(printf '{\"state\":\"%s\",\"observed_at\":1,\"padding\":\"%s\"}\n' \
+        "${FAKE_DETAILS_STATE:-auth_required}" "$details_padding")"
 elif [[ "$url" == http://127.0.0.1:8787/v1/health ]]; then
     if [[ -n "${FAKE_HEALTH_COUNT_FILE:-}" ]]; then
         count=0
@@ -541,7 +545,7 @@ pathlib.Path(state_path).write_text(json.dumps({
 }) + "\n")
 pathlib.Path(state_path).chmod(stat.S_IRUSR | stat.S_IWUSR)
 PY
-printf '  sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n0: 0100007F:225B 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 9001 1\n' > "$fake_proc/net/tcp"
+printf '  sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n0: 0100007F:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 9001 1\n' > "$fake_proc/net/tcp"
 health_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$fake_home/.local/share/codex-info/current/manifest.json")"
 health_source="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_sha"])' "$fake_home/.local/share/codex-info/current/manifest.json")"
 health_manifest="$(sha256sum "$fake_home/.local/share/codex-info/current/manifest.json" | awk '{print $1}')"
@@ -553,6 +557,12 @@ HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH"
     SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
     bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null
 printf 'case source-bound health/readiness: PASS\n'
+HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    FAKE_HEALTH_VERSION="$health_version" FAKE_DETAILS_PADDING_BYTES=$((300 * 1024)) \
+    CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+    bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null
+printf 'case large details response via stdin: PASS\n'
 for health_shape in extra duplicate old; do
     if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
         FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
