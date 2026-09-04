@@ -1,5 +1,11 @@
 <!-- Copyright (C) 2026 salty919 -->
 <!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- codex-info-requirement-owner: WIRE -->
+<!-- codex-info-master-ids:
+REST-129
+WIN-PARITY-WIRE-01
+WIN-PARITY-PAIR-01
+-->
 
 # イントラネット REST API v1
 
@@ -212,7 +218,8 @@ mapping結果と完全一致する場合だけ許可する。
 ### PlanTypeから公開値への写像
 
 `plan_label`と`quota.monthly`は任意文字列/任意booleanではなく、同じvalidated account/quota cycleの
-PlanTypeからserverが生成する。外部正本は`DESIGN.md`記載のPlanType schema hashとexact enumであり、
+PlanTypeからserverが生成する。WIRE上のexact enumと公開値の対応は下表だけを正本とし、`DESIGN.md`は
+この表から導出する。
 trim、lowercase、prefix/substring一致、schema外aliasを使わない。wireへPlanTypeやPlanFamily keyを追加せず、
 次の関係だけを公開する。
 
