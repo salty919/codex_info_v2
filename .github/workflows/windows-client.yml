@@ -72,9 +72,10 @@ jobs:
           if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
             throw 'Inno Setup 7.1.0 compiler was not installed.'
           }
-          $compilerVersion = (Get-Item -LiteralPath $compiler).VersionInfo
-          if ($compilerVersion.FileMajorPart -ne 7 -or $compilerVersion.FileMinorPart -ne 1 -or $compilerVersion.FileBuildPart -ne 0) {
-            throw "Unexpected Inno Setup compiler version: $($compilerVersion.FileVersion)"
+          $installedProduct = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Inno Setup 7_is1'
+          $installedDisplayName = Get-ItemPropertyValue -LiteralPath $installedProduct -Name DisplayName
+          if ($installedDisplayName -cne 'Inno Setup version 7.1.0') {
+            throw "Unexpected installed Inno Setup product: $installedDisplayName"
           }
           "INNO_SETUP_COMPILER=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build standard Windows setup wizard
