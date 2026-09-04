@@ -258,6 +258,54 @@ class RequirementAuthorityFixtures(unittest.TestCase):
                 )
                 self.assertIn("empty ledger", self._assert_fail())
 
+    def test_unbounded_oracle_wording_is_rejected(self) -> None:
+        for oracle in (
+            "全graph unitを実行",
+            "全てのテストを実行",
+            "既存history回帰を確認",
+            "既存テストを確認",
+            "run all tests",
+            "full regression suite",
+        ):
+            with self.subTest(oracle=oracle):
+                self._write_fixture(
+                    ledger=[
+                        ("PROD-1", "PRODUCT", "scope", oracle, "implemented"),
+                        ("WIRE-1", "WIRE", "scope", "finite fixture", "verified"),
+                    ]
+                )
+                self.assertIn("unbounded ledger oracle", self._assert_fail())
+
+    def test_finite_oracle_wording_remains_valid(self) -> None:
+        self._write_fixture(
+            ledger=[
+                (
+                    "PROD-1",
+                    "PRODUCT",
+                    "scope",
+                    "first observation、confirmed gap、no-historyの3 case",
+                    "implemented",
+                ),
+                (
+                    "WIRE-1",
+                    "WIRE",
+                    "scope",
+                    "account_boundary_baselines_existing_sessions_and_latest_prefix",
+                    "verified",
+                ),
+            ]
+        )
+        self.assertEqual(authority.validate(self.root).requirements, 2)
+
+    def test_exact_duplicate_oracle_is_rejected_after_normalization(self) -> None:
+        self._write_fixture(
+            ledger=[
+                ("PROD-1", "PRODUCT", "scope", "fixed   fixture", "implemented"),
+                ("WIRE-1", "WIRE", "scope", "FIXED fixture", "verified"),
+            ]
+        )
+        self.assertIn("duplicate ledger oracle", self._assert_fail())
+
     def test_malformed_id_and_owner(self) -> None:
         self._write_fixture(
             ledger=[

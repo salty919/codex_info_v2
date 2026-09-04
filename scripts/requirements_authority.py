@@ -38,6 +38,16 @@ MASTER_IDS_MARKER_RE = re.compile(
 REGISTRY_HEADER = ("owner ID", "唯一のowner", "所有する契約境界")
 LEDGER_HEADER = ("ID", "owner", "実装範囲", "直接オラクル", "状態")
 VALID_STATUSES = frozenset({"implemented", "verified"})
+UNBOUNDED_ORACLE_PATTERNS = (
+    re.compile(
+        r"(?:全て|すべて|全)(?:の)?\s*(?:graph|unit|tests?|suites?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(?:全て|すべて|全)(?:の)?\s*(?:回帰|テスト)"),
+    re.compile(r"既存.*(?:回帰|テスト)"),
+    re.compile(r"\bexisting\b.*\b(?:tests?|suites?|regressions?)\b", re.IGNORECASE),
+    re.compile(r"\b(?:all|full)\s+(?:tests?|suites?|regressions?)\b", re.IGNORECASE),
+)
 DOCUMENT_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".txt", ".adoc"})
 SKIPPED_DIRECTORY_NAMES = frozenset(
     {".git", "target", "__pycache__", ".venv", "venv", "node_modules"}
@@ -317,6 +327,7 @@ def _parse_ledger(
             master_owner_by_id[master_id] = owner
 
     ledger_owner_by_id: dict[str, str] = {}
+    oracle_owner_by_text: dict[str, str] = {}
     for row_number, row in enumerate(rows, start=1):
         requirement_id = _clean_cell(row[0])
         owner_id = _clean_cell(row[1])
@@ -328,6 +339,8 @@ def _parse_ledger(
             _fail(f"malformed ledger ID on row {row_number}: {requirement_id!r}")
         if not IDENTIFIER_RE.fullmatch(owner_id):
             _fail(f"malformed ledger owner on row {row_number}: {owner_id!r}")
+        if requirement_id in ledger_owner_by_id:
+            _fail(f"duplicate ledger ID: {requirement_id}")
         for field_name, value in (
             ("scope", scope),
             ("oracle", oracle),
@@ -337,10 +350,17 @@ def _parse_ledger(
                 _fail(f"empty ledger {field_name} for {requirement_id}")
         if status not in VALID_STATUSES:
             _fail(f"invalid ledger status for {requirement_id}: {status!r}")
+        if any(pattern.search(oracle) for pattern in UNBOUNDED_ORACLE_PATTERNS):
+            _fail(f"unbounded ledger oracle for {requirement_id}: {oracle!r}")
+        normalized_oracle = " ".join(oracle.split()).casefold()
+        duplicate_oracle = oracle_owner_by_text.get(normalized_oracle)
+        if duplicate_oracle is not None:
+            _fail(
+                f"duplicate ledger oracle: {requirement_id} repeats {duplicate_oracle}"
+            )
+        oracle_owner_by_text[normalized_oracle] = requirement_id
         if owner_id not in registry_owners:
             _fail(f"ledger owner is unregistered for {requirement_id}: {owner_id}")
-        if requirement_id in ledger_owner_by_id:
-            _fail(f"duplicate ledger ID: {requirement_id}")
         ledger_owner_by_id[requirement_id] = owner_id
 
         master_owner = master_owner_by_id.get(requirement_id)
