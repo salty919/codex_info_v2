@@ -8,7 +8,7 @@
 - 非目的: 2GiB上限の緩和、定常cycleでのSession全文再走査、履歴最大値またはcomponent別maxの採用、UI clamp、既存history/Sessionの書換え、Windows固有計算の追加。既往障害の一回限り復旧だけはlatest 2GiB以内を再生し、永続checkpointとlegacy境界のモデル別token/価格合計へ完全一致する場合に限ってcomponent baselineを採用する。
 - 不変条件: durable累計とrange checkpointは同じaccount partition・stable period・collector generationに結合し、rolling `reset_at` driftでは継続、確認済みの真のrolloverだけで新期間を開始する。安全な加算を証明できないcycleは縮退値をcommitせずlast-good rootを保持する。
 - 依存DAG: account/storage admission → stable period identity → durable cumulative/checkpoint → bounded selected ranges → atomic totals/history commit → immutable details root → Linux/Windows表示。
-- raw clause対応: 2GiB超でも常識的な資源量で全件累計を保持→`CUM-138-01`、古いSessionを再読込せず記録済みrangeだけ反映→`CUM-138-02`、reset drift/真のrollover→`CUM-138-03`、API・Main・Graph・価格一致→`CUM-138-04`、既存データ保護と実機復旧→`CUM-138-05`。
+- raw clause対応: 2GiB超でも常識的な資源量で全件累計を保持→`CUM-138-01`、古いSessionを再読込せず記録済みrangeだけ反映→`CUM-138-02`、reset drift/真のrollover→`CUM-138-03`、API・Main・Graph・価格一致→`CUM-138-04`、既存データ保護と実機復旧→`CUM-138-05`、矛盾しない実線・破線・confirmed gap表示→`CUM-138-06`、remote/local/DB障害中の記録継続と復旧→`CUM-138-07`。
 
 | ID | 要求（観測可能な契約） | 境界・失敗動作 | 実装範囲 | 独立オラクル | 状態 |
 | --- | --- | --- | --- | --- | --- |
@@ -17,6 +17,8 @@
 | CUM-138-03 | rolling `reset_at`の揺れをstable period内として累計継続し、quota回復または期間境界の観測で確認した真のrolloverだけ旧累計を新periodへcarryしない | `reset_at/window_seconds`の単純な完全不一致で0起点にしない。境界不明なら新periodを推測せずlast-good保持 | `src/main.rs`、`src/usage_store.rs` | same-period drift＋checkpoint＋restartとconfirmed rolloverの固定case | in-progress |
 | CUM-138-04 | `models`、`estimated_cost_label`、current `history` sampleを同じaccepted cumulative rootから同じdata generationとしてcommit・publishする | UI、REST projection、history最大値からの再計算・mergeを禁止し、不完全cycleで一部surfaceだけ更新しない | `src/main.rs`、`src/usage_store.rs` | 1 details root内のモデルtoken/価格合計とhistory latestのexact一致、失敗cycleのroot不変 | in-progress |
 | CUM-138-05 | 修正・live復旧・update・restartで既存history、Session、profile sentinelを変更せず、1 cycleのselected Session bytesを2GiB以下に保つ | exactな復元根拠なしに過去最大値をcurrentへ設定せず、実Linux APIと実Windows/Linux UIが未確認なら最終合格にしない | product data path、実Linux daemon/API、Linux/Windows UI | 修正前後sentinel digest、selected byte count、同一candidateの実API/UI read-back | in-progress |
+| CUM-138-06 | 累積vector後退はwhole-vector欠測とし、回復までcomponent別maxを表示しない。連続確定観測だけを実線、両端のある通常欠測・回復とモデル根拠のないquota低下を破線、confirmed gapを線の切断とgap帯で示す | 欠測中のflat値、回復時刻の垂直増減、片端だけのlocal model延長、confirmed gap内の補間を作らない。remote quotaの実測時刻はlocal欠測を理由に移動・破棄しない | `src/main.rs` graph projection、Windows Graphing/ViewModel/Control | 2026-09-03実障害形状（$176→$87台→$184、85→81%）、open local gap、unattributed quota、confirmed gap固定caseをX/Windowsで独立検証 | in-progress |
+| CUM-138-07 | remote quota transport障害でもlocal collectorとrecorderを既存60秒周期で継続し、local-only累積をquota NULLでdurable化する。local取得失敗時も同cycleのfresh remote quotaを観測時刻と直前durable model累計で保存待ちにし、daemonを止めず次周期で復旧する | stale quotaを新timestampへ複製しない。local失敗時は実collector世代とaccount admissionが揃う場合だけ保存し、fresh local観測とは扱わずsingle-flightを解放する。DB失敗はexact pending batchを保持し成功まで新batchで上書きしない | resident scheduler、local collector、recorder、usage store | transport error→local-only pending row/quota NULL、local error→fresh quota＋durable model pending row、stale admission拒否、次周期single-flight、DB exact batch retry、live DB timestamp/generation進行 | in-progress |
 
 ## Issue #129 — account別usage storageとSession帰属（2026-09-02）
 

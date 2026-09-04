@@ -54,9 +54,9 @@ public sealed class WindowDragGeometryTests
 
         var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_620);
 
-        // The admitted row is already a UTC minute-start. The graph preserves
-        // it and appends only the documented current right-edge anchor.
-        Assert.Equal([1_020L, 1_380L, 1_620L], samples.Select(sample => sample.Timestamp));
+        // The admitted row is already a UTC minute-start. A 240-second open
+        // local-log gap must not be turned into a current model observation.
+        Assert.Equal([1_020L, 1_380L], samples.Select(sample => sample.Timestamp));
         Assert.Equal(100, samples[0].RemainingPercent);
         Assert.Equal(0UL, samples[0].SolTokens);
         Assert.Equal(1, samples[^1].SolDollars);

@@ -106,7 +106,7 @@ public sealed class DetailsPresentationCoverageTests
         Assert.Equal(second.StartAt, graph.SelectedPeriodStartAt);
         Assert.Equal(second.EndAt, graph.SelectedPeriodEndAt);
         Assert.NotEmpty(graph.Points);
-        Assert.Equal(second.EndAt, graph.Points[^1].Timestamp);
+        Assert.Equal(second.Samples[^1].Timestamp, graph.Points[^1].Timestamp);
     }
 
     [Fact]

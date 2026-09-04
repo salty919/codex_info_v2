@@ -132,7 +132,10 @@
 
     <Border Grid.Row="4" Background="#101925" BorderBrush="#263548" BorderThickness="1" CornerRadius="10" Padding="14">
       <Grid RowDefinitions="Auto,*" RowSpacing="8">
-        <TextBlock Classes="label" FontWeight="SemiBold" Text="{Binding MetricAxisText}" />
+        <StackPanel Spacing="2">
+          <TextBlock Classes="label" FontWeight="SemiBold" Text="{Binding MetricAxisText}" />
+          <TextBlock Classes="label" FontSize="11" Opacity="0.72" Text="{Binding GraphGapHintText}" />
+        </StackPanel>
         <plot:GraphPlotControl Grid.Row="1" Scene="{Binding Scene}"
                                ShowRemaining="{Binding ShowRemaining}" ShowSol="{Binding ShowSol}"
                                ShowTerra="{Binding ShowTerra}" ShowLuna="{Binding ShowLuna}"

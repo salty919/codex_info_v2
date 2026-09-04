@@ -253,3 +253,6 @@ component別max、last-row、null化、任意mergeを行わない。
 10. X版の初回起動でも、health readiness後に最初のstrict validation済み`/v1/details` generationが揃うまで主画面の内容領域を公開せず、ヘッダー（製品バージョンを含む）を固定したままスピナーを表示する。details取得が失敗した場合はスピナーを解除し、最後の完全表示または失敗状態を表示する。
 11. X版の起動ウィンドウは主モニターの可視デスクトップ内へ配置し、別モニターや負座標へ出して利用者から見えない状態にしてはならない。起動成功は、可視範囲内の実ウィンドウと内容の実画面で確認する。
 12. `--ui` のdaemon/REST起動に失敗しても、X版のGUIを消失・即時終了させず、接続失敗と再試行手段を表示する。
+13. 同一periodのモデル別累積vectorは全componentを一つの観測として扱う。1 componentでも直前の確定vectorより後退したrowは、前回値とのcomponent別maxで合成せず、全componentが直前の確定vector以上へ回復するまでwhole-vector欠測とする。
+14. remote quotaとlocal Session/logは独立した取得元とする。remote transport障害中もresident local collectorとDB recorderを60秒以内の既存周期で継続し、local-only rowはquota `NULL`でcommitする。local取得失敗後も、そのcycleで取得済みのfresh remote quotaは観測時刻、直前のdurable model累計、実collector世代に結合してDB再試行へ保持し、fresh local観測とは扱わない。古いquotaを新しいtimestampへ複製しない。local取得失敗はsingle-flightを解放して次周期で再取得し、DB書込み失敗はexact pending batchを保持して同じdaemon内で再試行する。
+15. Graphの実線は連続する確定観測だけに使用する。両端が確定している通常欠測または累積後退からの回復は途中を実測と称さない破線、モデル増分に対応しないremote quota低下も観測時刻を移動せず破線とする。normalな末尾quota欠測はlast measured値を水平な破線で保持し、local modelのopen-ended欠測は現在時刻へ延長しない。source proof済み`confirmed history_gaps`は破線補間もせず両系列を切断し、gap帯だけを表示する。
