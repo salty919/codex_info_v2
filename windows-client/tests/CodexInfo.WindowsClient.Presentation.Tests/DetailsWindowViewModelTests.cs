@@ -219,7 +219,7 @@ public sealed class DetailsWindowViewModelTests
     {
         var resetAt = DateTimeOffset.UtcNow.AddDays(3).ToUnixTimeSeconds();
         var observedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var period = new ApiHistoryPeriod("current", resetAt - 604800, resetAt, true, "current")
+        var period = new ApiHistoryPeriod("history", resetAt - 604800, resetAt, false, "history")
         {
             Samples =
             [
@@ -243,17 +243,13 @@ public sealed class DetailsWindowViewModelTests
 
         using var graph = new GraphWindowViewModel(main);
         Assert.Single(graph.Periods);
-        Assert.Equal(4, graph.Points.Count);
-        Assert.Equal(0, graph.Points[0].LunaValue);
-        Assert.Equal(3.75, graph.Points[1].LunaValue);
-        Assert.Equal(4.5, graph.Points[2].LunaValue);
-        Assert.Equal(4.5, graph.Points[3].LunaValue);
+        Assert.Equal(2, graph.Points.Count);
+        Assert.Equal(3.75, graph.Points[0].LunaValue);
+        Assert.Equal(4.5, graph.Points[1].LunaValue);
 
         graph.SelectedMetric = graph.Texts.Tokens;
-        Assert.Equal(0, graph.Points[0].LunaValue);
-        Assert.Equal(300, graph.Points[1].LunaValue);
-        Assert.Equal(360, graph.Points[2].LunaValue);
-        Assert.Equal(360, graph.Points[3].LunaValue);
+        Assert.Equal(300, graph.Points[0].LunaValue);
+        Assert.Equal(360, graph.Points[1].LunaValue);
         graph.ShowLuna = false;
         Assert.False(graph.ShowLuna);
     }

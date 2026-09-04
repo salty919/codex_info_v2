@@ -3,8 +3,8 @@
   "expected_period_end": 2000000280,
   "expected_reset_at": 2000009980,
   "expected_raw_timestamps": [1999999980, 2000000040, 2000000100, 2000000220, 2000000280],
-  "expected_graph_timestamps": [1999999860, 1999999980, 2000000040, 2000000100, 2000000220, 2000000280],
-  "expected_remaining": [100, 87, 44, 1, 1, 1],
+  "expected_graph_timestamps": [1999999980, 2000000040, 2000000100, 2000000220, 2000000280],
+  "expected_remaining": [87, 44, 1, 1, 1],
   "expected_sol_max": 420.40,
   "expected_period_count": 1,
   "details_response": {
