@@ -71,6 +71,7 @@ jobs:
           git diff --check "$BASE_SHA" "$SOURCE_SHA"
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
           bash scripts/requirements_ledger_gate.sh
+          python3 scripts/workflow_inno_acquisition_gate.py --self-test
 
   linux-backend-quality:
     name: linux-backend-quality
