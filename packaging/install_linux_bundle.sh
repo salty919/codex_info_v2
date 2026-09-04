@@ -523,6 +523,49 @@ PY
     [[ "$observed" != "$journal_owner_starttime" ]]
 }
 
+# systemd runs ExecCondition in a separate process while an installer may
+# still hold the transaction lock.  That condition may admit only the
+# generation that the live installer has already switched to.  The journal
+# owner identity and its inherited descriptor-9 lock are the authority; an
+# environment variable or a merely present journal is never sufficient.
+transaction_startup_generation() {
+    case "$journal_phase" in
+        current_switched|activation_requested|candidate_verified)
+            [[ -n "$journal_candidate_id" ]] || return 1
+            printf '%s\n' "$journal_candidate_id"
+            ;;
+        rollback_switched|rollback_verified)
+            [[ -n "$journal_previous_id" ]] || return 1
+            printf '%s\n' "$journal_previous_id"
+            ;;
+        *) return 1 ;;
+    esac
+}
+transaction_owner_holds_install_lock() {
+    local lock_identity owner_fd owner_identity
+    [[ "$journal_boot_id" == "$(boot_id)" ]] || return 1
+    journal_owner_stale && return 1
+    [[ -f "$install_lock" && ! -L "$install_lock" ]] || return 1
+    [[ "$(stat -c '%u' -- "$install_lock" 2>/dev/null || true)" == "$(id -u)" &&
+       "$(stat -c '%a' -- "$install_lock" 2>/dev/null || true)" == 600 ]] || return 1
+    lock_identity="$(stat -Lc '%d:%i' -- "$install_lock" 2>/dev/null || true)"
+    [[ -n "$lock_identity" ]] || return 1
+    owner_fd="/proc/$journal_owner_pid/fd/9"
+    [[ -e "$owner_fd" ]] || return 1
+    owner_identity="$(stat -Lc '%d:%i' -- "$owner_fd" 2>/dev/null || true)"
+    [[ "$owner_identity" == "$lock_identity" ]]
+}
+transaction_startup_authorized() {
+    local expected current
+    [[ "$journal_desired" == running ]] || return 1
+    transaction_owner_holds_install_lock || return 1
+    expected="$(transaction_startup_generation)" || return 1
+    current="$(current_generation 2>/dev/null || true)"
+    [[ "$current" == "$expected" ]] || return 1
+    verify_generation_files "$generations_dir/$expected" >/dev/null 2>&1 || return 1
+    verify_fixed_links_local || return 1
+}
+
 current_generation() {
     [[ -L "$current_link" ]] || return 0
     local target; target="$(readlink -- "$current_link")"
@@ -1589,13 +1632,13 @@ rollback_transaction() {
     restore_backups || ok=0
     previous_id="$previous"
     ensure_entrypoints_for_generation || ok=0
+    write_journal rollback_switched "$reason" || ok=0
     systemctl_user daemon-reload >/dev/null 2>&1 || ok=0; restore_runtime_state || ok=0
     if ((ok)) && [[ "$desired_state" != running && "$main_active" == 1 ]]; then
         systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 || ok=0
         wait_inactive codex-info.service || ok=0
         main_active=0
     fi
-    write_journal rollback_switched "$reason" || ok=0
     if ((ok)); then
         if [[ -n "$previous" ]]; then
             if [[ "$desired_state" == running ]]; then
@@ -1894,7 +1937,11 @@ download_asset() {
 readonly_transaction_check() {
     if [[ -e "$transaction" || -L "$transaction" ]]; then
         read_journal
-        [[ "$journal_phase" == committed ]] || safe_blocked 'transaction journal requires a mutating reconcile'
+        [[ "$journal_phase" == committed ]] && return 0
+        if [[ "$ACTION" == startup-condition ]] && transaction_startup_authorized; then
+            return 0
+        fi
+        safe_blocked 'transaction journal requires a mutating reconcile'
     fi
 }
 
@@ -2018,12 +2065,12 @@ if [[ "$ACTION" == startup ]]; then
     if (( lock_bypassed )); then
         [[ -f "$transaction" ]] || safe_blocked 'startup reconcile observed a busy installer without a journal'
         read_journal
-        [[ "$journal_phase" == current_switched || "$journal_phase" == activation_requested || "$journal_phase" == rollback_switched ]] ||
+        [[ "$journal_phase" != committed ]] ||
             safe_blocked 'startup reconcile observed an unsettled publication phase'
-        candidate_id="$journal_candidate_id"; previous_id="$journal_previous_id"; desired_state="$journal_desired"
-        verify_local_generation || safe_blocked 'startup reconcile could not verify current generation'
-        [[ "$(current_generation)" == "$candidate_id" ]] || safe_blocked 'startup reconcile current generation differs from journal'
-        ((QUIET)) || printf 'startup reconcile observed live publication generation=%s\n' "$candidate_id"
+        transaction_startup_authorized || safe_blocked 'startup reconcile could not verify live publication owner'
+        expected_startup_generation="$(transaction_startup_generation)" ||
+            safe_blocked 'startup reconcile observed an unsupported publication phase'
+        ((QUIET)) || printf 'startup reconcile observed live publication generation=%s\n' "$expected_startup_generation"
         exit
     fi
     load_control_state

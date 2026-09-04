@@ -182,7 +182,20 @@ case "${1-}" in
         [[ "$*" == *MainPID* ]] && printf '%s\n' "${FAKE_MAIN_PID:-0}"
         exit 0
         ;;
-    daemon-reload|enable|disable|start|stop|restart) exit 0 ;;
+    daemon-reload|enable|disable|start|stop|restart)
+        unit="${*: -1}"
+        if [[ "${FAKE_STARTUP_CONDITION:-0}" == 1 &&
+              "$unit" == codex-info.service &&
+              ("$1" == start || "$1" == restart) ]]; then
+            [[ -n "${FAKE_INSTALLER:-}" ]] || exit 1
+            transaction="${FAKE_INSTALLER%/.local/libexec/codex-info-install.sh}/.local/share/codex-info/install-transaction.json"
+            if [[ -f "$transaction" ]] && ! grep -Fq '"phase": "committed"' "$transaction"; then
+                env -u CODEX_INFO_PROC_ROOT bash "$FAKE_INSTALLER" --startup-reconcile >/dev/null
+            fi
+            env -u CODEX_INFO_PROC_ROOT bash "$FAKE_INSTALLER" --startup-condition >/dev/null
+        fi
+        exit 0
+        ;;
     *) exit 0 ;;
 esac
 FAKE_SYSTEMCTL
@@ -372,6 +385,7 @@ run_install_with_manifest() {
 run_update() {
     local home="$1"
     HOME="$home" CODEX_HOME="$home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        FAKE_STARTUP_CONDITION=1 FAKE_INSTALLER="$home/.local/libexec/codex-info-install.sh" \
         FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" \
         TMPDIR="$update_tmp" CODEX_INFO_PROC_ROOT="$fake_proc" \
         SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
@@ -408,6 +422,111 @@ value["updated_at_unix"] = int(time.time())
 path.write_text(json.dumps(value, separators=(",", ":")) + "\n")
 PY
     chmod 0600 "$home/.local/share/codex-info/control-state.json"
+}
+
+# Hold a real descriptor-9 lock while exposing an unsettled journal.  This
+# models systemd's separate ExecCondition process observing the installer
+# that owns the active transaction, without granting the condition an
+# environment-only bypass.
+transaction_owner_fixture="$TEST_ROOT/transaction-owner-fixture.sh"
+cat > "$transaction_owner_fixture" <<'TRANSACTION_OWNER_FIXTURE'
+#!/usr/bin/env bash
+set -euo pipefail
+lock_path="$1"
+transaction_path="$2"
+boot_id="$3"
+phase="$4"
+previous_generation="$5"
+candidate_generation="$6"
+hold_pipe="$7"
+ready_path="$8"
+exec 9<>"$lock_path"
+flock --exclusive 9
+exec 8<"$hold_pipe"
+owner_pid="$BASHPID"
+owner_starttime="$(python3 - "$owner_pid" <<'PY'
+from pathlib import Path
+import sys
+text = Path("/proc", sys.argv[1], "stat").read_text(encoding="utf-8")
+fields = text.rsplit(") ", 1)[1].split()
+print(fields[19])
+PY
+)"
+python3 - "$transaction_path" "$boot_id" "$phase" "$previous_generation" "$candidate_generation" "$owner_pid" "$owner_starttime" <<'PY'
+import json
+import os
+import pathlib
+import sys
+path, boot_id, phase, previous, candidate, owner_pid, owner_starttime = sys.argv[1:]
+document = {
+    "schema": "codex-info-install-transaction-v1",
+    "operation_id": "active-fixture",
+    "owner_pid": int(owner_pid),
+    "owner_starttime": int(owner_starttime),
+    "boot_id": boot_id,
+    "phase": phase,
+    "old_generation": previous,
+    "new_generation": candidate,
+    "desired_state": "running",
+    "updated_at_unix": 1,
+}
+pathlib.Path(path).write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+os.chmod(path, 0o600)
+PY
+: > "$ready_path"
+read -r _ <&8
+TRANSACTION_OWNER_FIXTURE
+chmod 0755 "$transaction_owner_fixture"
+run_startup_condition() {
+    local home="$1"
+    env -u CODEX_INFO_PROC_ROOT HOME="$home" CODEX_HOME="$home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" \
+        FAKE_LOG="$log" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+        bash "$home/.local/libexec/codex-info-install.sh" --startup-condition
+}
+run_startup_reconcile() {
+    local home="$1"
+    env -u CODEX_INFO_PROC_ROOT HOME="$home" CODEX_HOME="$home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" \
+        FAKE_LOG="$log" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+        bash "$home/.local/libexec/codex-info-install.sh" --startup-reconcile
+}
+run_active_startup_condition_case() {
+    local home="$1" phase="$2" previous="$3" candidate="$4" expected="$5" label="$6"
+    local ready_path="$TEST_ROOT/transaction-owner-$label.ready" hold_pipe="$TEST_ROOT/transaction-owner-$label.pipe"
+    local owner_pid hold_fd
+    rm -f -- "$ready_path" "$hold_pipe"
+    mkfifo -- "$hold_pipe"
+    "$transaction_owner_fixture" "$home/.local/share/codex-info/.install.lock" \
+        "$home/.local/share/codex-info/install-transaction.json" "$boot_id_value" \
+        "$phase" "$previous" "$candidate" "$hold_pipe" "$ready_path" &
+    owner_pid="$!"
+    exec {hold_fd}>"$hold_pipe"
+    for _ in {1..100}; do
+        [[ -f "$ready_path" ]] && break
+        sleep 0.01
+    done
+    if [[ ! -f "$ready_path" ]]; then
+        kill "$owner_pid" 2>/dev/null || true
+        wait "$owner_pid" 2>/dev/null || true
+        exec {hold_fd}>&-
+        fail "transaction owner fixture did not become ready: $label"
+    fi
+    if [[ "$expected" == pass ]]; then
+        if ! run_startup_reconcile "$home" >/dev/null || ! run_startup_condition "$home" >/dev/null; then
+            kill "$owner_pid" 2>/dev/null || true
+            wait "$owner_pid" 2>/dev/null || true
+            exec {hold_fd}>&-
+            fail "active transaction condition unexpectedly rejected: $label"
+        fi
+    elif run_startup_reconcile "$home" >/dev/null 2>&1 || run_startup_condition "$home" >/dev/null 2>&1; then
+        kill "$owner_pid" 2>/dev/null || true
+        wait "$owner_pid" 2>/dev/null || true
+        exec {hold_fd}>&-
+        fail "unsafe transaction condition unexpectedly accepted: $label"
+    fi
+    kill "$owner_pid" 2>/dev/null || true
+    wait "$owner_pid" 2>/dev/null || true
+    exec {hold_fd}>&-
+    rm -f -- "$ready_path" "$hold_pipe"
 }
 
 archive_v1="$(build_bundle 1111111111111111111111111111111111111111 1.0.19)"
@@ -679,6 +798,34 @@ grep -Fq '"phase": "committed"' "$fake_home/.local/share/codex-info/install-tran
 [[ "$(readlink -- "$fake_home/.local/share/codex-info/current")" == generations/1.0.20-* ]] ||
     fail 'resume did not converge to v2'
 printf 'case journal interruption/resume: PASS\n'
+
+# A live installer may let systemd activate only the exact switched
+# generation while it still owns descriptor-9.  Rollback uses the exact
+# predecessor under the same rule; direct, stale, mismatched, and malformed
+# journal states remain fail-closed.
+write_running_state "$fake_home"
+condition_generation="$(readlink -- "$fake_home/.local/share/codex-info/current")"
+condition_generation="${condition_generation#generations/}"
+cp -- "$fake_home/.local/share/codex-info/install-transaction.json" \
+    "$TEST_ROOT/committed-journal-before-condition-cases.json"
+run_active_startup_condition_case "$fake_home" current_switched '' "$condition_generation" pass candidate
+if run_startup_condition "$fake_home" >/dev/null 2>&1; then
+    fail 'stale transaction journal unexpectedly authorized startup condition'
+fi
+if run_startup_reconcile "$fake_home" >/dev/null 2>&1; then
+    fail 'stale transaction journal unexpectedly authorized startup reconcile'
+fi
+run_active_startup_condition_case "$fake_home" rollback_switched "$condition_generation" '' pass rollback
+mismatch_generation="9.9.9-$(printf 'f%.0s' {1..40})-$(printf 'e%.0s' {1..64})"
+run_active_startup_condition_case "$fake_home" current_switched '' "$mismatch_generation" fail mismatch
+printf '{}\n' > "$fake_home/.local/share/codex-info/install-transaction.json"
+chmod 0600 "$fake_home/.local/share/codex-info/install-transaction.json"
+if run_startup_reconcile "$fake_home" >/dev/null 2>&1 || run_startup_condition "$fake_home" >/dev/null 2>&1; then
+    fail 'malformed transaction journal unexpectedly authorized startup condition'
+fi
+cp -- "$TEST_ROOT/committed-journal-before-condition-cases.json" \
+    "$fake_home/.local/share/codex-info/install-transaction.json"
+printf 'case active transaction exact-generation condition/rollback safety: PASS\n'
 
 # An active MainPID from a retained, but no-longer-current, managed generation
 # is repairable through systemd.  The updater must restart the unit and never
