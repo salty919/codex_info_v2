@@ -1,3 +1,22 @@
+<!-- codex-info-requirement-owner: DATA -->
+<!-- codex-info-master-ids:
+CUM-138-01
+CUM-138-02
+CUM-138-03
+CUM-138-05
+CUM-138-07
+AUTH-129
+GEN-129
+DB-129
+SESSION-129
+LEGACY-129
+WIN-PARITY-HISTORY-01
+LINUX-BUNDLE-RETENTION-01
+U128-15
+U128-18
+U128-19
+-->
+
 # Codex Info データ保護規約
 
 この文書は、利用履歴・ローカルセッションログ・thread情報・SQLiteデータベースを変更する全実装の正本である。`DESIGN.md`の補足ではなく、変更を許可するための拘束条件として扱う。
@@ -74,7 +93,8 @@ Codex app-server / session JSONL / thread rollout
     exact Codex Info artifactを祖先に持つ観測用app-server childは全Codex Info process分を除外する。
     identity変化、祖先不明、FD scan部分失敗、native DBのduplicate/root非到達/cycle/dangling/partialはcycle全体を
     fail-closedにし、旧完全snapshot＋未確認を保持する。完全受理済みREST PublicThread集合内のmissing parentだけは
-    presentation orphanでありnative DB danglingの救済ではない。詳細は`docs/LIVE_STATE_DECISION_MATRIX.md`を正本とする。
+    presentation orphanでありnative DB danglingの救済ではない。`docs/LIVE_STATE_DECISION_MATRIX.md`は
+    このDATA契約から導出した非規範的な判定表とする。
 12. Windows clientの設定永続化は`language`、`setupCompleted`、`connectionConfigured`、`timeZoneId`、
     `connectionProfile`、`connectionSelector`の6 keyだけを許可する。`connectionProfile`は`none|wsl|sshConfigAlias`のexact enum、
     `connectionSelector`はWSLのexact distribution tokenまたはliteral OpenSSH Host alias grammarだけを許可し、秘密、展開済み値、raw host/user/pathを0件とする。
@@ -236,7 +256,9 @@ session selectionとcache fingerprintは同じmtime/path降順vectorを使い、
 2. 既存DB行のread-only row count/hashを変更前後で比較する。通常の3か月prune以外の減少はFAILとする。
    DB保持は3暦月、1回の取得はその中の最長1暦月（最大44,640分点）であり、取得上限を保持期間の短縮へ読み替えない。
 3. malformed、empty、multiple writer、app-server停止、再起動、認証境界、migration/schema mismatchを検査する。
-4. `bash scripts/pre_pr_gate.sh`を1回だけ実行する。`regression_guard`がRust実装回帰を、`data_protection_gate`が破壊操作scanと独立SQLite fixtureを各1回担当する。standaloneの`data_protection_gate.sh`だけを実装回帰の証拠にしない。
+4. 完全な変更pathと影響master IDを事前分類し、そのIDに直接紐付く既存の破壊操作scan、
+   SQLite fixture、Rust testだけを共有呼出しごと1回実行する。データ保護境界を変更していない場合は
+   `data_protection_gate.sh`とDB fixtureを実行しない。
 5. 実環境確認が必要な変更では、新しいruntime traceを取り、前回の画像・ログを再利用しない。
 
 ### 禁止事項
@@ -244,8 +266,8 @@ session selectionとcache fingerprintは同じmtime/path降順vectorを使い、
 - `rm`、DB削除、DB再生成、無検証の上書きで障害を隠すこと
 - 有効値がないのに0%、0 token、0 dollar、空履歴を成功値として作ること
 - migrationで旧行を推測変換すること
-- 一時的な手動実行だけで、恒久的なテスト・台帳・CIゲートを追加せず終了すること
-- 独立評価を自己評価で代用すること
+- 記録済み障害の再現に必要なmaster IDと直接オラクルを更新せず、一時的な手動実行だけで終了すること
+- 機械的オラクルで判定できる結果に、理由のない独立評価や第二ゲートを追加すること
 
 ## 6. 既知の回帰と再発防止メモ
 
@@ -254,16 +276,19 @@ session selectionとcache fingerprintは同じmtime/path降順vectorを使い、
 再発防止は次の3層で固定する。
 
 - 実装制約: record isolation、persisted reset hint backfill、auth epoch、transaction/upsert、backup-before-prune、live path + rollout terminal stateの二重判定
-- 自動検査: regression/SQLite consistency/static policy/CIに加え、root/child/mixed/empty、DB欠落・重複・cycle・dangling、terminal/partial/invalid、process停止/再起動、複数server、RPC/stale epochの表形式live-state matrix
-- 完了手順: freeze済み同一releaseで要求台帳の全IDが`current release PASS`、独立評価PASS、未確認事項ゼロ。抽出中の`contract authored`や旧`verified`を現行PASSへ昇格しない
+- 自動検査: 影響するDATA master IDに登録したSQLite consistency、破壊操作scan、fault fixtureだけを実行し、
+  同じDB結果を判定するfixtureを別gateに複製しない。
+- 完了手順: 影響するIDとその直接オラクルを同一revisionで確認する。無関係な全IDの再評価、一律の独立評価、
+  抽出中の`contract authored`や旧`verified`の現行PASSへの昇格を行わない。
 
 「対応したつもり」「今回の実行で通った」は完了条件ではない。
 
 
-## 8. DP-REST-001..011 採用authority値
+## 8. DP-REST-001..011 DATA契約とWIRE参照
 
-この節はDATA/RESTの採用値を一意化する正本である。実装と検証は再現可能な自動テストおよび
-必要な実環境確認で判定する。
+この節が所有するのはDB、transaction、lineage、失敗時保持のDATA契約だけである。route、HTTP status、
+header、JSON schema、resource上限は `REST_API_V1.md` だけがWIRE ownerであり、本節のWIRE名はその入力条件を
+指す非規範的な参照とする。実装と検証は影響master IDに登録した直接オラクルで判定する。
 
 ```text
 decision_id = DP-REST-AUTHORITY-20260823-001

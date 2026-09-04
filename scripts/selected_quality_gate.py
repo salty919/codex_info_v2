@@ -17,6 +17,14 @@ OWNER_JOBS = {
     "WINDOWS": "windows-quality",
 }
 LINUX_DISTRIBUTION_JOB = "linux-distribution"
+PRODUCT_OWNERS = frozenset({"LINUX_BACKEND", "LINUX_UI", "WINDOWS"})
+CODEQL_LANGUAGES = frozenset({"actions", "csharp", "python", "rust"})
+LANGUAGE_OWNERS = {
+    "actions": frozenset({"GOVERNANCE"}),
+    "python": frozenset({"GOVERNANCE"}),
+    "csharp": frozenset({"WINDOWS"}),
+    "rust": frozenset({"LINUX_BACKEND", "LINUX_UI"}),
+}
 ALL_JOBS = frozenset(OWNER_JOBS.values()) | {
     "codeql-quality",
     LINUX_DISTRIBUTION_JOB,
@@ -52,13 +60,24 @@ def validate(
         owner not in OWNER_JOBS for owner in owners
     ):
         raise QualitySelectionError("selection has no finite owner set")
-    if not isinstance(languages, list):
+    if len(owners) != len(set(owners)):
+        raise QualitySelectionError("selection contains duplicate owners")
+    if not isinstance(languages, list) or any(
+        language not in CODEQL_LANGUAGES for language in languages
+    ):
         raise QualitySelectionError("selection has no CodeQL language list")
-    expected_binary_impact = bool(
-        {"LINUX_BACKEND", "LINUX_UI", "WINDOWS"}.intersection(owners)
-    )
-    if binary_impact is not expected_binary_impact:
-        raise QualitySelectionError("selection has an inconsistent binary_impact")
+    if len(languages) != len(set(languages)):
+        raise QualitySelectionError("selection contains duplicate CodeQL languages")
+    if not isinstance(binary_impact, bool):
+        raise QualitySelectionError("selection has no binary-impact decision")
+    selected = set(owners)
+    for language in languages:
+        if not LANGUAGE_OWNERS[language].intersection(selected):
+            raise QualitySelectionError(
+                f"CodeQL language has no selected source owner: {language}"
+            )
+    if binary_impact and not PRODUCT_OWNERS.intersection(selected):
+        raise QualitySelectionError("binary impact has no product owner")
     if release_candidate and binary_impact and "WINDOWS" not in owners:
         raise QualitySelectionError(
             "release candidate binary impact must select WINDOWS"
@@ -66,7 +85,6 @@ def validate(
     if set(results) != ALL_JOBS:
         raise QualitySelectionError("quality result keys do not match the job set")
 
-    selected = set(owners)
     for owner, job in OWNER_JOBS.items():
         expected = "success" if owner in selected else "skipped"
         if results[job] != expected:

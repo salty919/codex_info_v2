@@ -1,6 +1,7 @@
-# Live state 判定マトリクス（設計正本）
+> **文書の位置づけ:** 本書は製品要件の非規範的な案内／実装説明です。要求の入口とowner registryは `docs/PRODUCT_REQUIREMENTS.md` および同文書から参照される REST/DATA/UX/LOCALIZATION 仕様です。要求変更時は該当する master ID と owner に従い、本書だけで契約や監査成果物を追加・変更しません。
 
-状態: `REQUIREMENTS_AUTHORITY / PRODUCT_PENDING / FRESH_AUDIT_PENDING`
+# Live state 判定マトリクス（実装参照）
+
 
 目的は、DBの履歴inventoryを「現在実行中」と誤って表示しないこと。native収集候補の
 表示可否は、同一cycle内で得た次のAND条件だけで決める。

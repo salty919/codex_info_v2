@@ -1,8 +1,70 @@
+<!-- codex-info-requirement-owner: PRODUCT -->
+<!-- codex-info-master-ids:
+CUM-138-04
+WIN-PARITY-DATA
+WIN-PARITY-STATE
+WIN-PARITY-OPS
+PROC-LAUNCH-01
+PROC-STOP-01
+PROC-OPTIONS-01
+PROC-HELP-01
+WF-BINARY-IMPACT-01
+WF-FEAT-SELECTIVE-01
+WF-QUALITY-ONCE-01
+WF-NONBLOCKING-QUALITY-01
+WF-POSTMERGE-01
+VER-AUTO-PATCH-01
+VER-SERIES-FIXED-01
+WF-SERIAL-01
+LINUX-BUNDLE-TARGET-01
+LINUX-BUNDLE-RELEASE-01
+LINUX-BUNDLE-CONTENTS-01
+LINUX-BUNDLE-OPERATIONS-01
+LINUX-BUNDLE-AUTOUPDATE-01
+LINUX-BUNDLE-AUTOUPDATE-02
+LINUX-BUNDLE-AUTOUPDATE-03
+U128-01
+U128-02
+U128-03
+U128-05
+U128-06
+U128-07
+U128-09
+U128-10
+U128-12
+U128-13
+U128-14
+U128-16
+U128-17
+U128-21
+U128-25
+U128-26
+U128-27
+U128-28
+U128-30
+U128-33
+U128-35
+U128-36
+-->
+
 # Codex Info 製品要件
 
-この文書は、WindowsクライアントとLinux側collector/APIの実装判断に必要な要件だけをまとめた正本である。
-監査履歴、作業経過、文書SHA一覧は製品要件ではないため含めない。詳細なwire schemaは
-`REST_API_V1.md`、データ保持は`DATA_PROTECTION_POLICY.md`、画面仕様は`WINDOWS_UX_SPEC.md`を参照する。
+この文書は製品要件の唯一の入口であり、各契約領域のownerを次表で一意に登録する。
+一つの外部観測可能な契約IDを複数ownerへ置かず、下流文書、要求台帳、実装、testは登録済みownerの
+契約IDを参照する。監査履歴、作業経過、文書SHA一覧、test名やagent運用は製品要件ではない。
+
+| owner ID | 唯一のowner | 所有する契約境界 |
+| --- | --- | --- |
+| `PRODUCT` | `docs/PRODUCT_REQUIREMENTS.md` | 製品境界、cross-component状態、収集、導入・更新・配布 |
+| `WIRE` | `docs/REST_API_V1.md` | REST route、schema、header、resource limit、read-only effect |
+| `DATA` | `docs/DATA_PROTECTION_POLICY.md` | 保存scope、transaction、backup、retention、recovery |
+| `UX` | `docs/WINDOWS_UX_SPEC.md` | 表示意味、画面状態、操作、geometry、accessibility |
+| `I18N` | `docs/LOCALIZATION.md` | locale、固定文言、時刻、font |
+| `SECURITY` | `SECURITY.md` | trust boundary、秘密、入力検証、残余risk |
+
+owner文書が他領域の契約を必要とする場合は、その契約を複製せずowner IDを参照する。
+`DESIGN.md`、README、Wiki、runbook、Windows説明文書、回帰規約、要求台帳は派生物でありownerではない。
+同じ契約の複数owner、未登録owner、参照先のない契約IDを検出した場合は実装・高コスト検証を開始しない。
 
 ## 1. 製品境界
 
@@ -98,10 +160,12 @@
   欠損したrename/copy情報は分類結果を返さず、versionまたはRelease mutationを開始しない。
 - `main`向けPRはsame-repositoryであればhead branch名を制限しない。trusted `pull_request_target`が、version追加前の
   利用者差分（H0）の全pathをDOCS・GOVERNANCE・LINUX_BACKEND・LINUX_UI・WINDOWSの有限ownerへ一度だけ分類する。
-  選択ownerだけをimmutableな最終head（H1）で各1回実行し、非選択ownerは実行しない。CodeQLも同じ選択から
-  actions・python・rust・csharpの必要言語だけを一度実行する。選択ownerのmissing/failure/cancel/skip、非選択ownerの実行、
-  CodeQL言語の余分・欠落はすべて失敗とする。Windowsだけの変更はWINDOWSとcsharpだけ、governanceだけの変更は
-  GOVERNANCEとactions/pythonだけを実行する。branch名、branchの作成元、`feat/next`との包含関係は品質選択へ使用しない。
+  選択ownerだけをimmutableな最終head（H1）で各1回実行し、非選択ownerは実行しない。binary impactはowner名から
+  推測せず、runtime/build/packaging入力のpathだけで判定する。そのためtestや検査scriptの変更は対応ownerの品質を
+  実行してもversion更新とdistributionを起動しない。CodeQL言語は変更した解析対象sourceからだけ導出し、
+  workflowのactions、Python sourceのpython、Rust製品sourceのrust、C#製品sourceのcsharp以外を追加しない。test、shell、文書、
+  manifest、assetだけの変更でCodeQL言語を起動しない。選択ownerのmissing/failure/cancel/skip、非選択ownerの実行、
+  CodeQL言語の余分・欠落は失敗とする。branch名、branchの作成元、`feat/next`との包含関係は品質選択へ使用しない。
 - `main`のtrusted `pull_request_target`を唯一のRelease品質authorityとし、別dispatchへ品質判定を転送しない。
   workflow run名には固定schemaでPR番号、event head、event action、event時のdraft状態をGitHub eventから記録する。
   event時または開始時にdraftであるrun、開始時にclosedであるrun、開始時にcurrent PR headではなくなったrunはobserverとしてowner、分類、
@@ -142,15 +206,15 @@
   same-repository headへexact 1 commitをnon-force pushし、競合pushはGit自身のnon-fast-forward拒否に任せてreadbackやretryを行わない。
   H1 custom check作成jobは置かない。Releaseのread-only解決jobはGitHub objectとrun状態だけを読み、
   write jobはsourceをcheckout・実行せず、解決済みcandidateとlock取得後に再取得したremote状態だけを入力にする。
-- 選択ownerからCodeQL言語が導出されるPRではその言語だけを実行し、main向けRelease品質ではanalysis成功とcritical/high finding不在を
+- 完全path分類からCodeQL言語が導出されるPRではその言語だけを実行し、main向けRelease品質ではanalysis成功とcritical/high finding不在を
   公開条件とする。CodeQL失敗はworkflowへ表示するがbranch mergeを禁止しない。CodeQL言語が選択されないPRとmerge後pushでは
   CodeQL AnalyzeとAutobuildを実行せず、active code-scanning rulesetの
   設定はworkflow内で再監査しない。外部AI findingsが
   provider側の未対応modelで継続失敗する場合は、そのAI機能だけをrepository単位で無効化できるが、選択済みCodeQL、
   code-scanning alerts、Release品質acceptanceは維持する。
-- Codex code reviewはPRの変更が確定した最新headに対して`@codex review`を1回だけ起動する補助レビューとする。
-  古いheadの結果や未解決かつnon-outdatedのP0/P1をready判定へ流用せず、独自API key workflowを追加しない。
-  Codex reviewはCodeQL、Release品質acceptance、必要な承認の代替にしない。
+- AIによる補助reviewは、機械的な直接オラクルだけでは判定できないsecurityまたはcross-cuttingな
+  高risk境界に限る。通常変更へ一律に起動せず、固定test、CodeQL、Release品質acceptance、必要な承認の
+  代替にしない。
 - `windows-vX.Y.Z` ReleaseはSetupとmanifestを非公開Draftへuploadしてから公開する。途中失敗を公開済み成功へ変換しない。
 - Linux coreはtargetを`x86_64-unknown-linux-gnu`へ固定し、同じstable version・final source SHAのarchive、SHA-256 checksum、manifestを既存の`windows-vX.Y.Z` ReleaseへWindowsのSetup/manifestと同居させる。別Linux tag/channelを作らない。
 - Linux bundleの互換性は、bundle manifestに記録した実測`glibc_minimum`（glibc minimum）を満たすことだけを表明する。manifestのtargetまたは実測minimumが欠落・不一致なら候補を公開・導入せず、他のdistribution、architecture、署名済み、publisher検証済みの対応を表明しない。
@@ -197,10 +261,10 @@
 
 - 上記要件と参照先仕様の間に、同じ入力へ異なる必須結果を要求する矛盾がない。
 
-## グラフ表示の正本と受入境界
+## グラフ表示の製品境界（詳細owner: UX）
 
 グラフの値の意味、期間境界、欠測・未使用区間、残量とモデル使用量の
-独立性は `docs/WINDOWS_UX_SPEC.md` のグラフ意味論を正本とする。X版と
+独立性は `docs/WINDOWS_UX_SPEC.md` のUX master IDが所有する。X版と
 Windows版の実装は同じ `tests/fixtures/graph_delayed_quota.json` を入力に
 し、fixture内の固定期待値（期間数、累積SOL、遅延して届く残量、未観測区間）
 をそれぞれ独立に検証する。片方の描画結果や補間ヘルパーをもう片方の

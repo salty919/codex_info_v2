@@ -74,7 +74,10 @@ class DiffParserTests(unittest.TestCase):
         )
 
     def test_rename_and_copy_include_old_and_new_paths(self) -> None:
-        raw = b"R100\0src/old.rs\0docs/new.md\0C75\0ui/old.slint\0windows-client/New.cs\0"
+        raw = (
+            b"R100\0src/old.rs\0docs/new.md\0"
+            b"C75\0ui/old.slint\0windows-client/src/CodexInfo.WindowsClient/New.cs\0"
+        )
         result = selection_from_name_status(raw)
         self.assertEqual(
             result.owners,
@@ -114,22 +117,30 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(result.owners, ("LINUX_BACKEND",))
         self.assertEqual(result.codeql_languages, ("rust",))
 
-    def test_release_candidate_linux_selection_includes_windows_and_csharp(self) -> None:
+    def test_release_candidate_linux_selection_adds_windows_without_unchanged_csharp(self) -> None:
         result = selection_for_paths(
             ["src/server.rs"], release_candidate=True
         )
         self.assertEqual(result.owners, ("LINUX_BACKEND", "WINDOWS"))
-        self.assertEqual(result.codeql_languages, ("csharp", "rust"))
+        self.assertEqual(result.codeql_languages, ("rust",))
         self.assertTrue(result.binary_impact)
 
-    def test_governance_maps_to_actions_and_python(self) -> None:
-        result = selection_for_paths([".github/workflows/codeql.yml"])
-        self.assertEqual(result.owners, ("GOVERNANCE",))
-        self.assertEqual(result.codeql_languages, ("actions", "python"))
+    def test_codeql_languages_come_from_changed_source_not_owner_label(self) -> None:
+        workflow = selection_for_paths([".github/workflows/codeql.yml"])
+        python = selection_for_paths(["scripts/product_version.py"])
+        shell = selection_for_paths(["scripts/pre_pr_gate.sh"])
+        self.assertEqual(workflow.codeql_languages, ("actions",))
+        self.assertEqual(python.codeql_languages, ("python",))
+        self.assertEqual(shell.codeql_languages, ())
 
     def test_mixed_selection_is_deduplicated(self) -> None:
         result = selection_for_paths(
-            ["README.md", "src/server.rs", "ui/app.slint", "windows-client/src/App.cs"]
+            [
+                "README.md",
+                "src/server.rs",
+                "ui/app.slint",
+                "windows-client/src/CodexInfo.WindowsClient/App.axaml.cs",
+            ]
         )
         self.assertEqual(
             result.owners,
@@ -148,12 +159,35 @@ class SelectionTests(unittest.TestCase):
             result.owners,
             ("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"),
         )
-        self.assertEqual(result.codeql_languages, ("csharp", "rust"))
+        self.assertEqual(result.codeql_languages, ("rust",))
         self.assertEqual(result, reversed_result)
+
+    def test_test_only_paths_select_direct_quality_without_binary_or_codeql(self) -> None:
+        cases = {
+            "tests/db_protection_runtime.rs": ("LINUX_BACKEND",),
+            "scripts/x11_graph_visual_gate.sh": ("LINUX_UI",),
+            "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/ContractsTests.cs": (
+                "WINDOWS",
+            ),
+        }
+        for path, owners in cases.items():
+            with self.subTest(path=path):
+                result = selection_for_paths([path], release_candidate=True)
+                self.assertEqual(result.owners, owners)
+                self.assertEqual(result.codeql_languages, ())
+                self.assertFalse(result.binary_impact)
+
+    def test_shared_graph_fixture_selects_both_implementations_without_distribution(self) -> None:
+        result = selection_for_paths(["tests/fixtures/graph_delayed_quota.json"])
+        self.assertEqual(
+            result.owners, ("LINUX_BACKEND", "LINUX_UI", "WINDOWS")
+        )
+        self.assertEqual(result.codeql_languages, ())
+        self.assertFalse(result.binary_impact)
 
 
 class CliTests(unittest.TestCase):
-    def test_linux_product_scripts_do_not_select_governance_codeql(self) -> None:
+    def test_linux_test_scripts_do_not_claim_binary_or_codeql_impact(self) -> None:
         classifier = Path(__file__).with_name("ci_change_scope.py")
         with tempfile.TemporaryDirectory() as raw_root:
             name_status = Path(raw_root) / "changed-paths.z"
@@ -171,8 +205,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             json.loads(result.stdout),
             {
-                "binary_impact": True,
-                "codeql_languages": ["rust"],
+                "binary_impact": False,
+                "codeql_languages": [],
                 "owners": ["LINUX_BACKEND"],
             },
         )
@@ -199,7 +233,7 @@ class CliTests(unittest.TestCase):
             json.loads(result.stdout),
             {
                 "binary_impact": True,
-                "codeql_languages": ["csharp", "rust"],
+                "codeql_languages": ["rust"],
                 "owners": ["LINUX_BACKEND", "WINDOWS"],
             },
         )

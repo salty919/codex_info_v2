@@ -1,3 +1,25 @@
+<!-- codex-info-requirement-owner: UX -->
+<!-- codex-info-master-ids:
+CUM-138-06
+WIN-PARITY-CURRENT-01
+WIN-PARITY-FIRSTOBS-01
+WIN-PARITY-RETRY-01
+WIN-PARITY-UX
+WIN-PARITY-CTA-01
+WIN-PARITY-LEGAL-01
+X-START-01
+X-START-02
+X-START-03
+X-START-04
+X-START-05
+X-START-06
+X-GRAPH-01
+X-GRAPH-02
+X-THREAD-01
+WIN-GRAPH-01
+WIN-VERSION-01
+-->
+
 # Windowsクライアント UX設計仕様
 
 ## 0. 状態と適用範囲
@@ -405,7 +427,7 @@ Setupの製品名と導入見出しを一つの文字列へ結合しない。`ap
 | X版との関係 | 継承する意味論、変更する表現、変更理由 |
 | 影響要求 | `WIN-A..M` のID |
 | 非スクロール影響 | 主要操作/値がどのviewportに収まるか |
-| 証拠 | fresh画像、操作ログ、rawデータ、SHA、独立評価 |
+| 証拠 | 影響master IDの直接オラクル。機械判定できない表示意味に限りfresh画像と独立評価 |
 | 未確定 | 解消条件と担当 |
 
 ## 7. UX受入ゲート（実装開始後に使用するが、抽出中は実行禁止）
@@ -416,7 +438,8 @@ Setupの製品名と導入見出しを一つの文字列へ結合しない。`ap
 2. 画面サイズ、DPI、マルチモニタ、locale、状態、エラー、空データ、長文の各状態で同じ優先順位を保つ。
 3. メニューから全画面へ到達でき、子画面は単一インスタンスで再利用される。
 4. 同一fixtureでX版とWindows版のデータ意味論が一致し、差分は判断記録にある。
-5. 文字、アイコン、色、フォーカス、キーボード、読み上げ名、入力非奪取を独立評価する。
+5. 文字、アイコン、色、フォーカス、キーボード、読み上げ名、入力非奪取は影響する項目だけを直接検査する。
+   画素・UIA・操作ログで判定不能な表示意味が残る場合だけ、その項目に独立評価を1回使う。
 6. 主画面の値と状態、Graphの軸と折れ点、Threadsのlive判定、Setupの接続境界、設定/履歴保持が、
    最新artifact SHAとraw証拠に結び付いている。
 7. 各surfaceのlogical client threshold AND DPI後DWM visible_frameのrcWork完全包含を満たし、

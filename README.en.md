@@ -1,6 +1,8 @@
 <!-- Copyright (C) 2026 salty919 -->
 <!-- SPDX-License-Identifier: GPL-3.0-only -->
 
+> **Document status:** This is a non-normative guide/implementation note. The product entry point and owner registry are `docs/PRODUCT_REQUIREMENTS.md` and its referenced REST/DATA/UX/LOCALIZATION specifications. When requirements change, follow the relevant master ID and owner; this document does not add or change contracts or audit artifacts.
+
 # Codex Info
 
 Codex Info reads rate limits, reset periods, local usage history, and running
@@ -38,7 +40,7 @@ non-running state and retained files are read back. An unknown or foreign
 listener is left untouched and reported as `SAFE_BLOCKED`, never as success.
 
 Raw payload forms such as `codex_info --port PORT` remain service/development
-interfaces; they are not the customer update or daemon-management authority.
+interfaces; they are not the customer update or daemon-management entry point.
 
 ## Localization and time zones
 
@@ -76,7 +78,7 @@ it. Graph Maximize/Restore uses the current monitor work area.
 
 ## Licensing
 
-Original source and documentation are GPL-3.0-only. The authoritative GPLv3
+Original source and documentation are GPL-3.0-only. The GPLv3
 text is [LICENSE](LICENSE), and [LICENSE.ja.md](LICENSE.ja.md) provides a
 Japanese guide. Noto fonts, generated protocol schemas, Slint, Cargo
 dependencies, and the Windows client's Avalonia/NuGet dependencies retain
