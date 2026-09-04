@@ -1,8 +1,10 @@
+> **文書の位置づけ:** 本書は製品要件の非規範的な案内／実装説明です。要求の入口とowner registryは `docs/PRODUCT_REQUIREMENTS.md` および同文書から参照される REST/DATA/UX/LOCALIZATION 仕様です。要求変更時は該当する master ID と owner に従い、本書だけで契約や監査成果物を追加・変更しません。
+
 # Codex Info Wiki
 
 Codex Infoは、ChatGPT/Codexアカウントの利用枠、リセット時刻、モデル別使用量、履歴、実行中threadを表示する監視アプリです。Linux / WSL上の1つの常駐serviceがデータを収集し、LinuxのX Window UIとWindowsクライアントが同じ表示snapshotを利用します。
 
-このWikiは利用者向けの入口です。製品要件を複製せず、詳細と最新状態はrepositoryの正本文書を参照します。
+このWikiは利用者向けの入口です。製品要件を複製せず、詳細と最新状態はrepository内の参照先文書で確認します。
 
 ## 目次
 
@@ -29,7 +31,7 @@ Codex Infoは、ChatGPT/Codexアカウントの利用枠、リセット時刻、
 ### 表示データ
 
 - Codex App Serverから認証状態と利用枠を取得し、Codex session履歴からSOL / TERRA / LUNAのtokenと予想ドル額を集計します。
-- Linux / WindowsのMain、Graph、Threadsは、常駐serviceが公開する同一の`GET /v1/details`応答を表示正本として使います。
+- Linux / WindowsのMain、Graph、Threadsは、現行REST仕様に従って常駐serviceが公開する同一の`GET /v1/details`応答を表示データの取得元として使います。
 - 定期更新の途中や取得失敗で確定済み表示を空や0に戻さず、最後の完全な表示を保持したまま失敗状態を示します。
 - 認証情報、password、token、private keyはCodex Infoへ保存しません。Windows側に保存できる接続情報も非秘密selectorだけです。
 
@@ -41,9 +43,9 @@ Codex Infoは、ChatGPT/Codexアカウントの利用枠、リセット時刻、
 
 ## 言語と時刻
 
-固定UI文言のcatalogは日本語、英語、中国語（簡体）、韓国語、スペイン語、フランス語、ドイツ語、ポルトガル語、イタリア語、ロシア語の10言語です。未対応または不正なlocaleは英語へfallbackします。対応範囲と実装状態は[多言語化仕様](https://github.com/salty919/codex_info_v2/blob/main/docs/LOCALIZATION.md)を正本とします。
+固定UI文言のcatalogは日本語、英語、中国語（簡体）、韓国語、スペイン語、フランス語、ドイツ語、ポルトガル語、イタリア語、ロシア語の10言語です。未対応または不正なlocaleは英語へfallbackします。対応範囲と実装状態は[多言語化仕様](https://github.com/salty919/codex_info_v2/blob/main/docs/LOCALIZATION.md)を参照先とします。
 
-## 正本文書
+## 参照先文書
 
 - [README](https://github.com/salty919/codex_info_v2/blob/main/README.md) — 製品概要と通常導線
 - [製品要件](https://github.com/salty919/codex_info_v2/blob/main/docs/PRODUCT_REQUIREMENTS.md) — 製品境界と受入条件

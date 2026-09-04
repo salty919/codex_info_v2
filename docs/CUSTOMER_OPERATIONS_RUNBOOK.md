@@ -1,6 +1,8 @@
 <!-- Copyright (C) 2026 salty919 -->
 <!-- SPDX-License-Identifier: GPL-3.0-only -->
 
+> **文書の位置づけ:** 本書は製品要件の非規範的な案内／実装説明です。要求の入口とowner registryは `docs/PRODUCT_REQUIREMENTS.md` および同文書から参照される REST/DATA/UX/LOCALIZATION 仕様です。要求変更時は該当する master ID と owner に従い、本書だけで契約や監査成果物を追加・変更しません。
+
 # Codex Info 運用手順
 
 ## 起動構成
@@ -21,7 +23,7 @@ local generationを同じresolverで照合し、検証済みのmanaged service�
 
 installed launcherへ`--port`、未知・重複・混在した引数を渡すと、service、filesystem、DBを変更する前に失敗する。
 待受はmanaged serviceの`127.0.0.1:8787`に固定する。`codex_info --port PORT`等のraw payload CLIは
-service・開発・E2E用であり、顧客の起動・停止・更新authorityではない。
+service・開発・E2E用であり、顧客の起動・停止・更新操作の入口ではない。
 
 ```bash
 "$HOME/.local/bin/codex-info" --start
@@ -175,4 +177,4 @@ account切替直後は、既存Sessionを現在EOFへbaselineしてから新し�
 WindowsクライアントはWSL/Ubuntu側のserviceへSSH local port forwarding経由で接続する。
 X UIを併用する場合もserviceを増やさず、`--ui`を起動する。
 保持期間、1回の取得上限、REST SLOは[REST API v1](REST_API_V1.md)と
-[データ保護規約](DATA_PROTECTION_POLICY.md)を正本とする。
+[データ保護規約](DATA_PROTECTION_POLICY.md)を参照先とする。

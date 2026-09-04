@@ -1,6 +1,8 @@
 <!-- Copyright (C) 2026 salty919 -->
 <!-- SPDX-License-Identifier: GPL-3.0-only -->
 
+> **文書の位置づけ:** 本書は製品要件の非規範的な案内／実装説明です。要求の入口とowner registryは `docs/PRODUCT_REQUIREMENTS.md` および同文書から参照される REST/DATA/UX/LOCALIZATION 仕様です。要求変更時は該当する master ID と owner に従い、本書だけで契約や監査成果物を追加・変更しません。
+
 # Windows クライアント
 
 `windows-client/` は、Linux / WSL で動く Codex Info の既存機能を Windows から利用する
@@ -12,7 +14,7 @@ Linux と Windows の両方で同じ font fallback に依存しない。ライ�
 `assets/NOTICE.txt` の記載を引き継ぐ。
 
 状態: `REQUIREMENTS_SELECTED / PRODUCT_PENDING`。SSH-001/RC-061〜063の設定、接続、headless、
-supervisor、recorder、service lifecycleは要求抽出正本であり、実装・host・artifact・fresh image・
+supervisor、recorder、service lifecycleは要求から導出した実装説明であり、実装・host・artifact・fresh image・
 独立製品証拠を取得するまで製品PASSを主張しない。installed API serviceとrecorder serviceのexact
 install/start/stop/restart/uninstall/rollback commandは未確定で、読者にpathやbinaryを推測させない。
 
@@ -69,7 +71,7 @@ downloadもSetup起動も行わない。新版がある時だけ表示される�
 manifestとSetupを取得し、version、許可済みHTTPS authority、size、SHA-256を検証してから通常のInno Setup
 GUIを起動する。silent install、unattended apply、自動再起動、常設Headerボタンは使用しない。
 
-Windows製品版は`windows-client/Directory.Build.props`のstable `X.Y.Z`を正本にする。PRは版番号の
+Windows製品版は`windows-client/Directory.Build.props`のstable `X.Y.Z`を参照する。PRは版番号の
 単調増加とbuild/test/installer/E2Eを検証するだけでReleaseへ書き込まない。`main`へmergeされた版番号が
 上がり、全Windows gateがPASSした時だけ`windows-vX.Y.Z`とSetup/update manifestを公開する。mainの
 release処理は同一refで直列化し、HTTP 404だけを不存在として受理する。tagを原子的に新規作成した後、
@@ -189,7 +191,7 @@ StatusBannerへ現れる別操作であり、利用者が押すまでdownloadも
 ## REST v1 の受理契約
 
 クライアントは [REST API v1](REST_API_V1.md) の `GET /v1/health`をservice readinessだけに使い、
-履歴・Threads・ドル内訳を含む `GET /v1/details`を唯一のruntime dataとして受理する。
+実装では、現行REST v1仕様に従い、履歴・Threads・ドル内訳を含む `GET /v1/details`を受け取る。
 `Content-Type` は `application/json`、response headerは8 KiB以下とする。本文はtransfer後・
 decode前で、`/v1/details`は33,554,432 bytes以下とする。
 `Content-Length` が各上限を超える場合は本文を読まず、chunkedまたは不明長の本文は読み取り

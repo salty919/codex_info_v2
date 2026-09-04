@@ -1,5 +1,9 @@
 <!-- Copyright (C) 2026 salty919 -->
 <!-- SPDX-License-Identifier: GPL-3.0-only -->
+<!-- codex-info-requirement-owner: I18N -->
+<!-- codex-info-master-ids:
+PROC-I18N-01
+-->
 
 # 多言語化・日本語表示仕様
 

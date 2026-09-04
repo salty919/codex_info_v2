@@ -1,6 +1,8 @@
 <!-- Copyright (C) 2026 salty919 -->
 <!-- SPDX-License-Identifier: GPL-3.0-only -->
 
+> **文書の位置づけ:** 本書は製品要件の非規範的な案内／実装説明です。要求の入口とowner registryは `docs/PRODUCT_REQUIREMENTS.md` および同文書から参照される REST/DATA/UX/LOCALIZATION 仕様です。要求変更時は該当する master ID と owner に従い、本書だけで契約や監査成果物を追加・変更しません。
+
 # Codex Info（Linux bundle / X Window / WSLg）
 
 English quick start: [README.en.md](README.en.md) · [製品要件](docs/PRODUCT_REQUIREMENTS.md) · [Windowsクライアント](docs/WINDOWS_CLIENT.md) · [REST API](docs/REST_API_V1.md) · [データ保護](docs/DATA_PROTECTION_POLICY.md) · [多言語化](docs/LOCALIZATION.md) · [顧客運用](docs/CUSTOMER_OPERATIONS_RUNBOOK.md)
@@ -68,7 +70,7 @@ journalctl --user -u codex-info-update.service --no-pager
 履歴DB、DB backup、reset hint、gap/recorder/control state、Codex session JSONL、設定は削除しません。
 launcherの公開操作は引数なし/`--start`、`--ui`、`--update`、`--status`、`--stop`、
 `--disable-autostart`、`--remove`、`--help`だけです。managed serviceのportは127.0.0.1:8787固定です。
-Linux / Windows UIは同じproduct versionのresident serviceだけを表示正本として受理します。
+Linux / Windows UIは、現行の製品要件に従い、同じproduct versionのresident serviceが公開する単一generationの`GET /v1/details`を表示します。version整合とAPIの受理条件は、`docs/PRODUCT_REQUIREMENTS.md`から参照されるREST仕様に従います。
 
 初回起動時の画面内タイトルは`Codex Info`です。ネイティブタイトルバーは使わず、アプリ内では認証パネルが接続状態を案内します。
 
@@ -103,13 +105,13 @@ codex app-server --help
 - `account/read` — 認証状態とアカウント情報
 - `account/login/start` — 未認証時のChatGPTログイン開始
 - `account/rateLimits/read` — 使用率とリセット時刻
-- `thread/list` — 最新候補から実行中のスレッド全件とモデルを取得（native sub-agentは検証済みrollout/状態DBの親子関係を補完）
+- 内部の`thread/list`／`rollout`収集 — resident serviceが検証済みthread snapshotを構成する実装手段。UIは公開済み`GET /v1/details`の値だけを使う。
 
 取得したトークンやパスワードはアプリのファイルへ保存しません。Codex側の認証ストアが管理します。
 
 ## データ保護と変更ゲート
 
-履歴DBの一意性、複数collector、app-server停止時の復旧、3世代バックアップ、schema mismatch、migration、prune、障害時の保持境界は[データ保護規約](docs/DATA_PROTECTION_POLICY.md)を正本とします。変更完了の単一入口は`bash scripts/pre_pr_gate.sh`であり、`regression_guard`がRust実装回帰を、`data_protection_gate`が破壊操作scanと独立SQLite fixtureを各1回担当します。
+履歴DBの一意性、複数collector、app-server停止時の復旧、3世代バックアップ、schema mismatch、migration、prune、障害時の保持境界は[データ保護規約](docs/DATA_PROTECTION_POLICY.md)に従います。変更時のローカル確認には`bash scripts/pre_pr_gate.sh`を使えますが、要求のownerや完了判定は`docs/PRODUCT_REQUIREMENTS.md`と参照先仕様に従います。
 
 ## Windowsからのイントラネット監視
 
