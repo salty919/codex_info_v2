@@ -2118,12 +2118,6 @@ try {
     $mainCapture = Capture-E2EWindow $mainHandle '01-main-ready'
     Assert-E2E ($mainCapture.Hash.Length -eq 64) 'Main screenshot hash is missing.'
     Assert-E2EMainProductVersion $mainRoot
-    else {
-        $gauge = $mainGauge
-        $gaugeRect = $gauge.Current.BoundingRectangle
-        Assert-E2E (-not $gauge.Current.IsOffscreen -and $gaugeRect.Width -gt 0 -and $gaugeRect.Height -gt 0) 'Main quota period gauge is not visible.'
-        Write-E2E ("main-quota-gauge: observed bounds={0}x{1}" -f $gaugeRect.Width, $gaugeRect.Height)
-    }
     if ($Fixture) {
         Write-E2E ("fixture: requests={0}" -f [CodexInfoWindowsE2EFixtureServer]::RequestSummary())
     }
