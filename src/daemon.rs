@@ -13,7 +13,7 @@ use crate::security;
 use crate::usage_store::{
     HistoryContinuityModelRecovery, RecordedSessionSource, RecorderGap, SessionCheckpoint,
     SessionCollectionCommit, SessionModelTotal, SessionRange, StoragePartitionIdentity,
-    UsageHistorySample, UsageStore,
+    UsageHistoryObservation, UsageHistorySample, UsageStore,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1262,6 +1262,7 @@ pub(crate) struct RecorderGeneration {
     pub(crate) collector_epoch: u128,
     pub(crate) cycle_seq: u64,
     pub(crate) samples: Vec<UsageHistorySample>,
+    pub(crate) observations: Vec<UsageHistoryObservation>,
     pub(crate) recorded_sessions: Vec<RecordedSessionSource>,
     pub(crate) session_checkpoints: Vec<SessionCheckpoint>,
     pub(crate) session_ranges: Vec<SessionRange>,
@@ -1300,6 +1301,7 @@ pub(crate) struct RecorderCommitAck {
     pub(crate) cycle_seq: u64,
     pub(crate) last_commit_unix: i64,
     pub(crate) canonical_samples: Vec<UsageHistorySample>,
+    pub(crate) canonical_observations: Vec<UsageHistoryObservation>,
     pub(crate) fallback_model_totals: Option<Vec<SessionModelTotal>>,
     pub(crate) legacy_history_bridged: bool,
 }
@@ -1684,6 +1686,7 @@ impl RecorderWorker {
                                 collector_epoch,
                                 cycle_seq,
                                 samples,
+                                observations,
                                 recorded_sessions,
                                 session_checkpoints,
                                 session_ranges,
@@ -1748,7 +1751,7 @@ impl RecorderWorker {
                                             }
                                         }
                                         let commit_result = store
-                                            .commit_session_collection_with_samples(SessionCollectionCommit {
+                                            .commit_session_collection_with_observations(SessionCollectionCommit {
                                                 reset_at,
                                                 window_seconds,
                                                 collector_epoch,
@@ -1758,10 +1761,12 @@ impl RecorderWorker {
                                                 ranges: &session_ranges,
                                                 model_totals: commit_model_totals,
                                                 recorded_sessions: &recorded_sessions,
-                                            })
+                                            }, &observations)
                                             .map_err(|error| error.to_string())?;
                                         let mut data_generation = commit_result.data_generation;
                                         let canonical_samples = commit_result.canonical_samples;
+                                        let canonical_observations =
+                                            commit_result.canonical_observations;
                                         let mut legacy_history_bridged = false;
                                         if let Some(legacy) = legacy {
                                             if store
@@ -1851,6 +1856,7 @@ impl RecorderWorker {
                                             cycle_seq,
                                             last_commit_unix: unix_now().max(1),
                                             canonical_samples,
+                                            canonical_observations,
                                             fallback_model_totals: fallback_was_used
                                                 .then(|| commit_model_totals.to_vec()),
                                             legacy_history_bridged,
@@ -2494,6 +2500,7 @@ mod tests {
                     collector_epoch: 1,
                     cycle_seq: 1,
                     samples: vec![expected.clone()],
+                    observations: Vec::new(),
                     recorded_sessions: vec![marker.clone()],
                     session_checkpoints: vec![crate::usage_store::SessionCheckpoint {
                         root_identity: marker.root_identity.clone(),
@@ -2589,6 +2596,7 @@ mod tests {
                     collector_epoch: 1,
                     cycle_seq: 2,
                     samples: vec![recovered_sample],
+                    observations: Vec::new(),
                     recorded_sessions: Vec::new(),
                     session_checkpoints: Vec::new(),
                     session_ranges: Vec::new(),
@@ -2651,6 +2659,7 @@ mod tests {
                     collector_epoch: 2,
                     cycle_seq: 1,
                     samples: Vec::new(),
+                    observations: Vec::new(),
                     recorded_sessions: Vec::new(),
                     session_checkpoints: Vec::new(),
                     session_ranges: Vec::new(),
@@ -2778,6 +2787,7 @@ mod tests {
                         quota_sample(1_800_000_120),
                         quota_sample(1_800_000_180),
                     ],
+                    observations: Vec::new(),
                     recorded_sessions: Vec::new(),
                     session_checkpoints: Vec::new(),
                     session_ranges: Vec::new(),
@@ -2840,6 +2850,7 @@ mod tests {
                     collector_epoch: 3,
                     cycle_seq: 1,
                     samples: vec![quota_sample(1_800_001_020), session_backfill],
+                    observations: Vec::new(),
                     recorded_sessions: Vec::new(),
                     session_checkpoints: Vec::new(),
                     session_ranges: Vec::new(),
@@ -2930,6 +2941,7 @@ mod tests {
             collector_epoch: 1,
             cycle_seq: 1,
             samples: Vec::new(),
+            observations: Vec::new(),
             recorded_sessions: Vec::new(),
             session_checkpoints: Vec::new(),
             session_ranges: Vec::new(),
@@ -2976,6 +2988,7 @@ mod tests {
                 collector_epoch: 1,
                 cycle_seq: 1,
                 samples: Vec::new(),
+                observations: Vec::new(),
                 recorded_sessions: Vec::new(),
                 session_checkpoints: Vec::new(),
                 session_ranges: Vec::new(),

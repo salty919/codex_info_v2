@@ -24,6 +24,7 @@ use tokio::sync::oneshot;
 /// Environment variable that opt-ins to the local REST listener.
 pub const API_LISTEN_ENV: &str = "CODEX_INFO_API_LISTEN";
 pub const API_VERSION: &str = "v1";
+pub const API_VERSION_V2: &str = "v2";
 /// Maximum number of model rows accepted at the public boundary.
 pub const MAX_PUBLIC_MODELS: usize = 3;
 /// SQLite retains three calendar months, while one REST details snapshot is
@@ -111,6 +112,24 @@ pub struct PublicHistorySample {
     pub sol_tokens: u64,
     pub terra_tokens: u64,
     pub luna_tokens: u64,
+}
+
+/// A v2 history row carrying the provenance of its model vector.  The field
+/// names intentionally remain the v1 names so clients can reuse the same
+/// bounded numeric validators while rejecting partial model vectors.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicHistoryObservation {
+    pub timestamp: i64,
+    pub reset_at: i64,
+    pub remaining_percent: Option<f64>,
+    pub sol_dollars: Option<f64>,
+    pub terra_dollars: Option<f64>,
+    pub luna_dollars: Option<f64>,
+    pub sol_tokens: Option<u64>,
+    pub terra_tokens: Option<u64>,
+    pub luna_tokens: Option<u64>,
+    pub model_source: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -364,6 +383,187 @@ impl PublicDetails {
     }
 }
 
+/// The v2 details document uses the same immutable root as v1 and adds only
+/// nullable model values plus their exact source classification on each
+/// history row. `api_version` is serialized by the response envelope, keeping
+/// this value usable as the shared snapshot payload inside the publisher. The
+/// response envelope uses `api_version` as the v2 schema authority.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicDetailsV2 {
+    pub state: PublicState,
+    pub observed_at: Option<i64>,
+    pub authenticated: bool,
+    pub plan_label: Option<String>,
+    pub quota: Option<PublicQuota>,
+    pub models: Vec<PublicDetailedModelUsage>,
+    pub active_thread_count: u64,
+    pub history_periods: Vec<PublicHistoryPeriod>,
+    pub history_samples: Vec<PublicHistoryObservation>,
+    pub history_gaps: Vec<PublicHistoryGap>,
+    pub threads: Vec<PublicThread>,
+    pub estimated_cost_label: String,
+}
+
+impl Default for PublicDetailsV2 {
+    fn default() -> Self {
+        Self {
+            state: PublicState::Initializing,
+            observed_at: None,
+            authenticated: false,
+            plan_label: None,
+            quota: None,
+            models: Vec::new(),
+            active_thread_count: 0,
+            history_periods: Vec::new(),
+            history_samples: Vec::new(),
+            history_gaps: Vec::new(),
+            threads: Vec::new(),
+            estimated_cost_label: "概算 —".to_owned(),
+        }
+    }
+}
+
+impl From<PublicDetails> for PublicDetailsV2 {
+    fn from(details: PublicDetails) -> Self {
+        let history_samples = details
+            .history_samples
+            .into_iter()
+            .map(|sample| PublicHistoryObservation {
+                timestamp: sample.timestamp,
+                reset_at: sample.reset_at,
+                remaining_percent: sample.remaining_percent,
+                sol_dollars: Some(sample.sol_dollars),
+                terra_dollars: Some(sample.terra_dollars),
+                luna_dollars: Some(sample.luna_dollars),
+                sol_tokens: Some(sample.sol_tokens),
+                terra_tokens: Some(sample.terra_tokens),
+                luna_tokens: Some(sample.luna_tokens),
+                model_source: "legacy-unknown".to_owned(),
+            })
+            .collect();
+        Self {
+            state: details.state,
+            observed_at: details.observed_at,
+            authenticated: details.authenticated,
+            plan_label: details.plan_label,
+            quota: details.quota,
+            models: details.models,
+            active_thread_count: details.active_thread_count,
+            history_periods: details.history_periods,
+            history_samples,
+            history_gaps: details.history_gaps,
+            threads: details.threads,
+            estimated_cost_label: details.estimated_cost_label,
+        }
+    }
+}
+
+impl PublicDetailsV2 {
+    /// Projects only rows that have a complete model vector into the exact v1
+    /// body.  Unavailable rows deliberately disappear from the compatibility
+    /// representation; no model vector is fabricated for them.
+    pub fn to_v1_projection(&self) -> PublicDetails {
+        PublicDetails {
+            state: self.state,
+            observed_at: self.observed_at,
+            authenticated: self.authenticated,
+            plan_label: self.plan_label.clone(),
+            quota: self.quota.clone(),
+            models: self.models.clone(),
+            active_thread_count: self.active_thread_count,
+            history_periods: self.history_periods.clone(),
+            history_samples: self
+                .history_samples
+                .iter()
+                .filter_map(|sample| {
+                    Some(PublicHistorySample {
+                        timestamp: sample.timestamp,
+                        reset_at: sample.reset_at,
+                        remaining_percent: sample.remaining_percent,
+                        sol_dollars: sample.sol_dollars?,
+                        terra_dollars: sample.terra_dollars?,
+                        luna_dollars: sample.luna_dollars?,
+                        sol_tokens: sample.sol_tokens?,
+                        terra_tokens: sample.terra_tokens?,
+                        luna_tokens: sample.luna_tokens?,
+                    })
+                })
+                .collect(),
+            history_gaps: self.history_gaps.clone(),
+            threads: self.threads.clone(),
+            estimated_cost_label: self.estimated_cost_label.clone(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ApiSnapshotError> {
+        if self.history_samples.len() > MAX_PUBLIC_HISTORY_SAMPLES {
+            return Err(ApiSnapshotError::ListTooLong);
+        }
+        let mut previous_key = None;
+        let mut observation_ids = HashSet::with_capacity(self.history_samples.len());
+        let mut canonical_observation_ids = HashSet::with_capacity(self.history_samples.len());
+        for sample in &self.history_samples {
+            if !valid_timestamp(sample.timestamp)
+                || sample.timestamp.rem_euclid(60) != 0
+                || !valid_timestamp(sample.reset_at)
+                || self
+                    .observed_at
+                    .is_none_or(|observed_at| sample.timestamp > observed_at)
+                || !observation_ids.insert((sample.reset_at, sample.timestamp))
+                || previous_key
+                    .is_some_and(|previous| previous > (sample.reset_at, sample.timestamp))
+                || !matches!(
+                    sample.model_source.as_str(),
+                    "confirmed" | "unavailable" | "legacy-unknown"
+                )
+                || sample
+                    .remaining_percent
+                    .is_some_and(|value| !value.is_finite() || !(0.0..=100.0).contains(&value))
+            {
+                return Err(ApiSnapshotError::InvalidHistoryObservation);
+            }
+            let values = [
+                sample.sol_dollars,
+                sample.terra_dollars,
+                sample.luna_dollars,
+            ];
+            let tokens = [sample.sol_tokens, sample.terra_tokens, sample.luna_tokens];
+            let complete = values.iter().all(Option::is_some) && tokens.iter().all(Option::is_some);
+            let empty = values.iter().all(Option::is_none) && tokens.iter().all(Option::is_none);
+            if (sample.model_source == "unavailable" && !empty)
+                || (sample.model_source != "unavailable" && !complete)
+                || values
+                    .iter()
+                    .flatten()
+                    .any(|value| !valid_non_negative_rate(*value))
+            {
+                return Err(ApiSnapshotError::InvalidHistoryObservation);
+            }
+            let matching_periods = self
+                .history_periods
+                .iter()
+                .filter(|period| {
+                    sample.reset_at >= period.reset_at.saturating_sub(60)
+                        && sample.reset_at <= period.reset_at
+                        && sample.timestamp >= period.start_at
+                        && sample.timestamp <= period.end_at
+                })
+                .collect::<Vec<_>>();
+            if matching_periods.len() != 1 {
+                return Err(ApiSnapshotError::InvalidHistoryObservation);
+            }
+            let period = matching_periods[0];
+            if !canonical_observation_ids.insert((period.id.as_str(), sample.timestamp)) {
+                return Err(ApiSnapshotError::InvalidHistoryObservation);
+            }
+            previous_key = Some((sample.reset_at, sample.timestamp));
+        }
+        let projection = self.to_v1_projection();
+        projection.validate()
+    }
+}
+
 /// Validate the complete bounded thread slice before it can cross any public
 /// or local presentation boundary.  This is the single owner for the REST
 /// thread schema/domain, capacity, and duplicate rules; callers must not
@@ -446,6 +646,7 @@ pub enum ApiSnapshotError {
     InvalidLabel,
     InvalidHistoryPeriod,
     InvalidHistorySample,
+    InvalidHistoryObservation,
     InvalidHistoryGap,
     InvalidThread,
     ListTooLong,
@@ -462,6 +663,7 @@ impl fmt::Display for ApiSnapshotError {
             Self::InvalidLabel => "public snapshot has an invalid label",
             Self::InvalidHistoryPeriod => "public snapshot has an invalid history period",
             Self::InvalidHistorySample => "public snapshot has an invalid history sample",
+            Self::InvalidHistoryObservation => "public snapshot has an invalid history observation",
             Self::InvalidHistoryGap => "public snapshot has an invalid history gap",
             Self::InvalidThread => "public snapshot has an invalid thread",
             Self::ListTooLong => "public snapshot has too many rows",
@@ -483,9 +685,24 @@ struct DetailsResponse<'a> {
     details: &'a PublicDetails,
 }
 
+#[derive(Serialize)]
+struct DetailsV2Response<'a> {
+    api_version: &'static str,
+    #[serde(flatten)]
+    details: &'a PublicDetailsV2,
+}
+
 fn serialize_details(details: &PublicDetails) -> Result<Vec<u8>, ApiSnapshotError> {
     serde_json::to_vec(&DetailsResponse {
         api_version: API_VERSION,
+        details,
+    })
+    .map_err(|_| ApiSnapshotError::Serialization)
+}
+
+fn serialize_details_v2(details: &PublicDetailsV2) -> Result<Vec<u8>, ApiSnapshotError> {
+    serde_json::to_vec(&DetailsV2Response {
+        api_version: API_VERSION_V2,
         details,
     })
     .map_err(|_| ApiSnapshotError::Serialization)
@@ -531,6 +748,7 @@ enum PublishedPairGenerationState {
 #[derive(Clone, Debug, PartialEq)]
 struct PublishedSnapshot {
     details_body: Vec<u8>,
+    details_v2_body: Vec<u8>,
     pair: Option<PublishedPair>,
     generation: PublishedPairGenerationState,
 }
@@ -557,8 +775,14 @@ impl Default for PublishedSnapshot {
         details
             .validate()
             .expect("default details must validate before publication");
+        let details_v2 = PublicDetailsV2::from(details.clone());
+        details_v2
+            .validate()
+            .expect("default v2 details must validate before publication");
         Self {
             details_body: serialize_details(&details).expect("default details must serialize"),
+            details_v2_body: serialize_details_v2(&details_v2)
+                .expect("default v2 details must serialize"),
             pair: None,
             generation: PublishedPairGenerationState::Uninitialized,
         }
@@ -594,18 +818,43 @@ impl ApiSnapshotPublisher {
     /// Atomically publishes one completely validated details generation.
     pub fn publish_details(&self, details: PublicDetails) -> Result<(), ApiSnapshotError> {
         details.validate()?;
+        let details_v2 = PublicDetailsV2::from(details.clone());
+        self.publish_details_v2(details, details_v2)
+    }
+
+    /// Atomically publishes the v1 and v2 projections from one immutable
+    /// generation.  The v1 projection is checked against the supplied body so
+    /// callers cannot accidentally expose two different snapshots.
+    pub fn publish_details_v2(
+        &self,
+        details: PublicDetails,
+        details_v2: PublicDetailsV2,
+    ) -> Result<(), ApiSnapshotError> {
+        details.validate()?;
+        details_v2.validate()?;
+        if details_v2.to_v1_projection() != details {
+            return Err(ApiSnapshotError::InvalidHistoryObservation);
+        }
         let details_body = serialize_details(&details)?;
-        self.publish_serialized(details_body).map(|_| ())
+        let details_v2_body = serialize_details_v2(&details_v2)?;
+        self.publish_serialized(details_body, details_v2_body)
+            .map(|_| ())
     }
 
     #[cfg(test)]
     fn publish_for_test(&self, details: PublicDetails) -> Result<PublishedPair, ApiSnapshotError> {
         details.validate()?;
+        let details_v2 = PublicDetailsV2::from(details.clone());
         let details_body = serialize_details(&details)?;
-        self.publish_serialized(details_body)
+        let details_v2_body = serialize_details_v2(&details_v2)?;
+        self.publish_serialized(details_body, details_v2_body)
     }
 
-    fn publish_serialized(&self, details_body: Vec<u8>) -> Result<PublishedPair, ApiSnapshotError> {
+    fn publish_serialized(
+        &self,
+        details_body: Vec<u8>,
+        details_v2_body: Vec<u8>,
+    ) -> Result<PublishedPair, ApiSnapshotError> {
         let mut current = self
             .snapshot
             .write()
@@ -626,6 +875,7 @@ impl ApiSnapshotPublisher {
         let pair = PublishedPair::from_epoch_counter(epoch, next_counter);
         *current = PublishedSnapshot {
             details_body,
+            details_v2_body,
             pair: Some(pair.clone()),
             generation: PublishedPairGenerationState::Active {
                 epoch,
@@ -862,6 +1112,7 @@ struct ErrorResponse {
 enum ApiRoute {
     Health,
     Details,
+    DetailsV2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1005,6 +1256,7 @@ fn snapshot_response(snapshot: &SharedSnapshot, route: ApiRoute) -> HttpResponse
     }
     let body = match route {
         ApiRoute::Details => current.details_body.clone(),
+        ApiRoute::DetailsV2 => current.details_v2_body.clone(),
         ApiRoute::Health => return (503, error_body("snapshot_unavailable"), None),
     };
     (200, body, Some(pair))
@@ -1039,6 +1291,7 @@ fn handle_connection(
                 }
                 Some(ApiRoute::Health) => (200, health_body(), None),
                 Some(ApiRoute::Details) => snapshot_response(&snapshot, ApiRoute::Details),
+                Some(ApiRoute::DetailsV2) => snapshot_response(&snapshot, ApiRoute::DetailsV2),
             },
             Err(ParseFailure::BadRequest) => (400, error_body("bad_request"), None),
             Err(ParseFailure::HeadersTooLarge) => {
@@ -1257,6 +1510,7 @@ fn classify_target(target: &[u8]) -> Result<Option<ApiRoute>, ParseFailure> {
     Ok(match target {
         b"/v1/health" => Some(ApiRoute::Health),
         b"/v1/details" => Some(ApiRoute::Details),
+        b"/v2/details" => Some(ApiRoute::DetailsV2),
         _ => None,
     })
 }
@@ -2218,6 +2472,39 @@ mod tests {
     }
 
     #[test]
+    fn v2_details_uses_the_same_pair_and_publishes_model_source() {
+        let _guard = api_server_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut server = ApiServer::start(loopback_config()).unwrap();
+        let details = detailed_fixture();
+        let mut details_v2 = PublicDetailsV2::from(details.clone());
+        details_v2.history_samples[0].model_source = "confirmed".into();
+        server
+            .publisher()
+            .publish_details_v2(details, details_v2)
+            .unwrap();
+
+        let v1 = wire_request(
+            server.local_addr(),
+            "GET /v1/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let v2 = wire_request(
+            server.local_addr(),
+            "GET /v2/details HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        assert!(v1.starts_with("HTTP/1.1 200"));
+        assert!(v2.starts_with("HTTP/1.1 200"));
+        assert_eq!(published_pair_headers(&v1), published_pair_headers(&v2));
+        let v2_body = body(&v2);
+        assert_eq!(v2_body["api_version"], "v2");
+        assert_eq!(v2_body["history_samples"][0]["model_source"], "confirmed");
+        assert!(v2_body.get("contract_revision").is_none());
+        assert_eq!(v2_body.as_object().unwrap().len(), 13);
+        server.shutdown();
+    }
+
+    #[test]
     fn rejected_requests_cannot_mutate_the_published_pair() {
         let _guard = api_server_test_lock()
             .lock()
@@ -2467,6 +2754,57 @@ mod tests {
         let mut invalid = detailed_fixture();
         invalid.models[0].name = "OTHER".into();
         assert_eq!(invalid.validate(), Err(ApiSnapshotError::InvalidModel));
+    }
+
+    #[test]
+    fn v2_observation_validation_rejects_unbounded_and_noncanonical_rows() {
+        let oversized = PublicDetailsV2::from(history_fixture(MAX_PUBLIC_HISTORY_SAMPLES + 1));
+        assert_eq!(oversized.validate(), Err(ApiSnapshotError::ListTooLong));
+
+        let mut invalid_unavailable = PublicDetailsV2::from(detailed_fixture());
+        let mut unavailable = PublicHistoryObservation {
+            timestamp: 1_780_000_000,
+            reset_at: 1_780_400_000,
+            remaining_percent: Some(101.0),
+            sol_dollars: None,
+            terra_dollars: None,
+            luna_dollars: None,
+            sol_tokens: None,
+            terra_tokens: None,
+            luna_tokens: None,
+            model_source: "unavailable".into(),
+        };
+        invalid_unavailable
+            .history_samples
+            .push(unavailable.clone());
+        assert_eq!(
+            invalid_unavailable.validate(),
+            Err(ApiSnapshotError::InvalidHistoryObservation)
+        );
+
+        unavailable.remaining_percent = Some(50.0);
+        let mut canonical_duplicate = PublicDetailsV2::from(detailed_fixture());
+        unavailable.timestamp = 1_780_000_020;
+        canonical_duplicate.history_samples.push(unavailable);
+        assert_eq!(
+            canonical_duplicate.validate(),
+            Err(ApiSnapshotError::InvalidHistoryObservation)
+        );
+
+        let mut future = PublicDetailsV2::from(detailed_fixture());
+        future.history_samples[0].timestamp += 60;
+        assert_eq!(
+            future.validate(),
+            Err(ApiSnapshotError::InvalidHistoryObservation)
+        );
+
+        let mut no_observed_at = PublicDetailsV2::from(detailed_fixture());
+        no_observed_at.observed_at = None;
+        no_observed_at.history_periods[0].current = false;
+        assert_eq!(
+            no_observed_at.validate(),
+            Err(ApiSnapshotError::InvalidHistoryObservation)
+        );
     }
 
     #[test]

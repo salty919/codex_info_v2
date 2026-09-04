@@ -220,22 +220,26 @@ implementation or acceptance claim.
 
 ## API contract decisions
 
-`GET /v1/details` is versioned as `api_version: "v1"` and is read-only. Together with
-readiness-only `GET /v1/health`, it is the complete public read surface. Its
+`GET /v1/details` remains the exact read-only compatibility contract. `GET /v2/details` is
+versioned by the exact existing top-level field `api_version: "v2"`; it adds no second revision field.
+Together with readiness-only `GET /v1/health`, these routes are the complete public read surface. Their
 top-level shape is the exact set `api_version`, `state`, `observed_at`,
 `authenticated`, `plan_label`, `quota`, `models`, `active_thread_count`,
 `history_periods`, `history_samples`, `history_gaps`, `threads`, and `estimated_cost_label`.
 The exact details contract revision is `rest-v1-details-reset-at-20260823`; each history period carries
 its canonical `reset_at` independently from its potentially clipped graph `end_at`, and `history_gaps` contains only
-confirmed, redacted `recorder-gap-ledger-v1` projections. A server/client revision mismatch rejects the
-whole details candidate and retains the last complete root.
+confirmed, redacted `recorder-gap-ledger-v1` projections. V2 adds exact per-history-row `model_source`
+(`confirmed`, `unavailable`, or `legacy-unknown`) and nullable model values: unavailable requires all six model
+values to be null, while the other states require all six to be present. A details `api_version` mismatch rejects the
+whole candidate and retains the last complete root; a schema-valid health `product_version` mismatch is diagnostic
+only and does not block details retrieval.
 The server-side published-generation header contract revision is `rest-v1-published-pair-header-20260827`.
-Every successful `/v1/details` response contains exactly one
+Every successful v1 or v2 details response contains exactly one
 `Codex-Info-Published-Pair` header whose value is `v1:` followed by 64 lowercase
 hex characters: a 128-bit process server epoch followed by a 128-bit successful-publish
-counter. The resident service publishes one immutable details generation, and Windows Main,
-Graph, and Threads consume one strict `/v1/details` response as their atomic root. No second data endpoint exists
-to complete, compare, or repair that root. A missing, duplicate, malformed, or case-altered details header rejects
+counter. The resident service publishes both representations from one immutable details generation. Windows first
+requests one strict `/v2/details` response and falls back to one strict `/v1/details` response only for an exact 404.
+No second response completes, compares, or repairs an accepted root. A missing, duplicate, malformed, or case-altered details header rejects
 the complete candidate and retains the last complete root. Health and error responses do not
 carry this header. The production UI treats the details header only as that response's opaque generation identity;
 it does not derive data meaning from either component.

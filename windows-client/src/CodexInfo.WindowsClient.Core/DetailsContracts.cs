@@ -27,6 +27,9 @@ public sealed record ApiDetailsSnapshot(
     IReadOnlyList<ApiThreadDetails> Threads,
     string EstimatedCostLabel)
 {
+    /// <summary>The wire contract version of this accepted details document.</summary>
+    public string ApiVersion { get; init; } = "v1";
+
     /// <summary>The opaque identity of the accepted details response pair.</summary>
     public PublishedPairIdentity? PublishedPair { get; init; }
 
@@ -107,13 +110,18 @@ public sealed record ApiHistorySample(
     long Timestamp,
     long ResetAt,
     double? RemainingPercent,
-    double SolDollars,
-    double TerraDollars,
-    double LunaDollars,
-    ulong SolTokens,
-    ulong TerraTokens,
-    ulong LunaTokens)
+    double? SolDollars,
+    double? TerraDollars,
+    double? LunaDollars,
+    ulong? SolTokens,
+    ulong? TerraTokens,
+    ulong? LunaTokens,
+    string ModelSource = "confirmed")
 {
+    public const string ConfirmedModelSource = "confirmed";
+    public const string UnavailableModelSource = "unavailable";
+    public const string LegacyUnknownModelSource = "legacy-unknown";
+
     public IReadOnlyList<ApiHistoryModelSample> Models =>
     [
         new ApiHistoryModelSample("SOL", SolTokens, 0, 0, SolDollars),
@@ -125,10 +133,10 @@ public sealed record ApiHistorySample(
 /// <summary>One model's cumulative values at a history point.</summary>
 public sealed record ApiHistoryModelSample(
     string Name,
-    ulong InputTokens,
-    ulong CachedInputTokens,
-    ulong OutputTokens,
-    double Dollars);
+    ulong? InputTokens,
+    ulong? CachedInputTokens,
+    ulong? OutputTokens,
+    double? Dollars);
 
 /// <summary>A currently running thread and its validated tree metadata.</summary>
 public sealed record ApiThreadDetails(
