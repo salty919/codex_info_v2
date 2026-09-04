@@ -139,6 +139,10 @@ public sealed class GraphScene
         var previousTerra = 0d;
         var previousLuna = 0d;
         var hasTrustedVector = false;
+        var hasObservedVector = false;
+        var previousObservedSol = 0d;
+        var previousObservedTerra = 0d;
+        var previousObservedLuna = 0d;
         var modelVectorAvailable = new bool[samples.Count];
         var remainingObserved = new bool[samples.Count];
         long? previousTimestamp = null;
@@ -151,16 +155,27 @@ public sealed class GraphScene
             }
 
             previousTimestamp = sample.Timestamp;
-            var rawSol = metric == GraphMetric.Dollars ? sample.SolDollars : sample.SolTokens;
-            var rawTerra = metric == GraphMetric.Dollars ? sample.TerraDollars : sample.TerraTokens;
-            var rawLuna = metric == GraphMetric.Dollars ? sample.LunaDollars : sample.LunaTokens;
+            var rawSol = metric == GraphMetric.Dollars
+                ? sample.SolDollars
+                : sample.SolTokens is ulong solTokens ? solTokens : null;
+            var rawTerra = metric == GraphMetric.Dollars
+                ? sample.TerraDollars
+                : sample.TerraTokens is ulong terraTokens ? terraTokens : null;
+            var rawLuna = metric == GraphMetric.Dollars
+                ? sample.LunaDollars
+                : sample.LunaTokens is ulong lunaTokens ? lunaTokens : null;
             var currentSol = FiniteNonNegative(rawSol);
             var currentTerra = FiniteNonNegative(rawTerra);
             var currentLuna = FiniteNonNegative(rawLuna);
             var completeVector = double.IsFinite(currentSol) &&
                 double.IsFinite(currentTerra) &&
                 double.IsFinite(currentLuna);
-            var vectorRecovered = completeVector &&
+            var sourceConfirmed = sample.ModelSource == ApiHistorySample.ConfirmedModelSource;
+            var vectorRegressed = hasObservedVector && completeVector &&
+                (currentSol < previousObservedSol ||
+                 currentTerra < previousObservedTerra ||
+                 currentLuna < previousObservedLuna);
+            var vectorRecovered = sourceConfirmed && completeVector &&
                 (!hasTrustedVector ||
                  (currentSol >= previousSol &&
                   currentTerra >= previousTerra &&
@@ -173,6 +188,16 @@ public sealed class GraphScene
                 hasTrustedVector = true;
                 modelVectorAvailable[index] = true;
             }
+            else if (!sourceConfirmed &&
+                     sample.ModelSource != ApiHistorySample.UnavailableModelSource &&
+                     completeVector &&
+                     !vectorRegressed)
+            {
+                // Legacy rows have complete numeric values, but their origin
+                // is not recorder-confirmed. Retain them for a dashed
+                // reference path without allowing them to establish a
+                // trusted baseline or a solid quota attribution.
+            }
             else
             {
                 // Keep the last trusted vector only as a recovery threshold;
@@ -180,6 +205,16 @@ public sealed class GraphScene
                 currentSol = double.NaN;
                 currentTerra = double.NaN;
                 currentLuna = double.NaN;
+            }
+            var modelDataAvailable = double.IsFinite(currentSol) &&
+                double.IsFinite(currentTerra) &&
+                double.IsFinite(currentLuna);
+            if (modelDataAvailable)
+            {
+                previousObservedSol = currentSol;
+                previousObservedTerra = currentTerra;
+                previousObservedLuna = currentLuna;
+                hasObservedVector = true;
             }
             remainingObserved[index] = sample.RemainingPercent is { } observedQuota &&
                 double.IsFinite(observedQuota);
@@ -189,7 +224,8 @@ public sealed class GraphScene
                 currentSol,
                 currentTerra,
                 currentLuna,
-                modelVectorAvailable[index]);
+                modelVectorAvailable[index],
+                modelDataAvailable);
         }
 
         var effectiveRemaining = BuildEffectiveRemaining(points, normalizedGaps);
@@ -293,7 +329,7 @@ public sealed class GraphScene
                 quotaAvailable = observed is not null;
                 quotaObservedSinceModelChange = observed is not null;
             }
-            else if (!points[index].ModelAvailable && observed is { } unavailableRaw)
+            else if (!points[index].DataAvailable && observed is { } unavailableRaw)
             {
                 // Preserve a remote quota reading even when the local model
                 // vector is unavailable. The renderer classifies this drop
@@ -463,7 +499,7 @@ public sealed class GraphScene
             var syntheticGap = IsSyntheticRemainingGap(points, index, periodStart);
             var unobservedGap = after.Timestamp - before.Timestamp > 60;
             var modelChanged = !ModelsEqual(before, after);
-            var unavailableGap = !before.ModelAvailable || !after.ModelAvailable;
+            var unavailableGap = !before.DataAvailable || !after.DataAvailable;
             if (modelChanged && !syntheticGap && !unobservedGap && !unavailableGap)
             {
                 continue;
@@ -582,15 +618,15 @@ public sealed class GraphScene
         return result;
     }
 
-    private static double FiniteNonNegative(double value) =>
-        double.IsFinite(value) ? Math.Max(0, value) : double.NaN;
+    private static double FiniteNonNegative(double? value) =>
+        value is { } finite && double.IsFinite(finite) ? Math.Max(0, finite) : double.NaN;
 
     private static bool ModelAdvanced(ScenePoint before, ScenePoint after) =>
-        before.ModelAvailable && after.ModelAvailable &&
+        before.DataAvailable && after.DataAvailable &&
         (after.Sol > before.Sol || after.Terra > before.Terra || after.Luna > before.Luna);
 
     private static bool ModelsEqual(ScenePoint before, ScenePoint after) =>
-        before.ModelAvailable && after.ModelAvailable &&
+        before.DataAvailable && after.DataAvailable &&
         before.Sol == after.Sol && before.Terra == after.Terra && before.Luna == after.Luna;
 
     internal readonly record struct ScenePoint(
@@ -599,5 +635,6 @@ public sealed class GraphScene
         double Sol,
         double Terra,
         double Luna,
-        bool ModelAvailable);
+        bool ModelAvailable,
+        bool DataAvailable);
 }

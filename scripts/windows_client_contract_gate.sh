@@ -211,7 +211,6 @@ require_text windows-client/src/CodexInfo.WindowsClient/Infrastructure/WindowsUp
 require_text windows-client/src/CodexInfo.WindowsClient/Settings/ClientSettings.cs 'WindowsPathSafety.EnsureDirectoryTreeWithoutReparse'
 require_text docs/WINDOWS_CLIENT.md '%USERPROFILE%\.ssh\config'
 require_text docs/PRODUCT_REQUIREMENTS.md '製品バージョンはメイン画面に一度だけ表示し'
-require_text docs/PRODUCT_REQUIREMENTS.md 'health readiness後に最初のstrict validation済み`/v1/details` generationが揃うまで'
 require_text docs/REGRESSION_PREVENTION_POLICY.md 'REG-STARTUP-FRAME'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'AutomationProperties.Name="{Binding Texts.Copy}"'
 require_text windows-client/src/CodexInfo.WindowsClient/SetupWindow.axaml 'Background="Transparent" PointerPressed="OnTitlePointerPressed"'

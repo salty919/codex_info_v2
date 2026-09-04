@@ -39,6 +39,74 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void MandatoryBoundariesUseSoftViewportCapUpToTheEndpointHistoryLimit()
+    {
+        const int endpointHistoryLimit = 44_640;
+        var samples = Enumerable.Range(0, endpointHistoryLimit)
+            .Select(index => new ApiHistorySample(
+                index + 1,
+                200_000,
+                null,
+                index,
+                index * 2,
+                index * 3,
+                (ulong)index,
+                (ulong)index * 2,
+                (ulong)index * 3,
+                index % 2 == 0
+                    ? ApiHistorySample.ConfirmedModelSource
+                    : ApiHistorySample.LegacyUnknownModelSource))
+            .ToArray();
+
+        var reduced = GraphWindowViewModel.ReduceGraphSamples(samples, 2_048);
+
+        Assert.Equal(endpointHistoryLimit, reduced.Count);
+        Assert.Equal(samples.Select(sample => sample.Timestamp), reduced.Select(sample => sample.Timestamp));
+    }
+
+    [Fact]
+    public void Legacy_history_reduction_keeps_the_one_month_bound_without_recovery_rescans()
+    {
+        const int endpointHistoryLimit = 44_640;
+        var samples = Enumerable.Range(0, endpointHistoryLimit)
+            .Select(index => new ApiHistorySample(
+                index + 1,
+                200_000,
+                null,
+                index,
+                index * 2,
+                index * 3,
+                (ulong)index,
+                (ulong)index * 2,
+                (ulong)index * 3,
+                ApiHistorySample.LegacyUnknownModelSource))
+            .ToArray();
+
+        var reduced = GraphWindowViewModel.ReduceGraphSamples(samples, 2_048);
+
+        Assert.Equal(GraphWindowViewModel.MaxRenderedGraphPoints, reduced.Count);
+        Assert.Equal(samples[0], reduced[0]);
+        Assert.Equal(samples[^1], reduced[^1]);
+    }
+
+    [Fact]
+    public void Reduction_preserves_confirmed_regression_and_recovery_boundaries()
+    {
+        var samples = new[]
+        {
+            ConfirmedCumulativeSample(1, 176),
+            ConfirmedCumulativeSample(2, 87),
+            ConfirmedCumulativeSample(3, 88),
+            ConfirmedCumulativeSample(4, 184),
+        };
+
+        var reduced = GraphWindowViewModel.ReduceGraphSamples(samples, maximum: 2);
+
+        Assert.Equal(samples, reduced);
+        Assert.Equal([1L, 2L, 3L, 4L], reduced.Select(sample => sample.Timestamp));
+    }
+
+    [Fact]
     public void ViewportReductionKeepsBothEdgesOfEveryMonotonicBucket()
     {
         var samples = Enumerable.Range(0, 12)
@@ -56,9 +124,9 @@ public sealed class GraphPlotControlTests
 
         var reduced = GraphWindowViewModel.ReduceGraphSamples(samples, 6);
 
-        Assert.Equal([0L, 3L, 4L, 7L, 8L, 11L], reduced.Select(sample => sample.Timestamp));
-        Assert.Equal(0, reduced[2].SolDollars);
-        Assert.Equal(10, reduced[3].SolDollars);
+        Assert.Equal(Enumerable.Range(0, 12).Select(index => (long)index), reduced.Select(sample => sample.Timestamp));
+        Assert.Equal(0, reduced[4].SolDollars);
+        Assert.Equal(10, reduced[5].SolDollars);
     }
 
     [Fact]
@@ -808,7 +876,7 @@ public sealed class GraphPlotControlTests
         using var client = new LoopbackStatusClient(handler);
         var result = await client.FetchDetailsAsync(CancellationToken.None);
 
-        Assert.Equal(1, handler.RequestCount);
+        Assert.Equal(2, handler.RequestCount);
         Assert.Equal(HttpStatusCode.OK, handler.StatusCode);
         Assert.Equal(HttpMethod.Get, handler.LastRequest?.Method);
         Assert.Equal(
@@ -905,22 +973,109 @@ public sealed class GraphPlotControlTests
         Assert.Equal(expectedPeriodEnd, scene.Timestamps[^1]);
 
         var firstObservation = expectedRawTimestamps[0];
-        Assert.Equal([expectedPeriodStart, firstObservation], terraLines.Flat.X.Take(2));
-        Assert.Equal([0d, 0d], terraLines.Flat.Y.Take(2));
-        Assert.Equal([firstObservation, firstObservation], terraLines.Rising.X);
-        Assert.Equal([0d, 30.50d], terraLines.Rising.Y);
-        Assert.DoesNotContain(expectedPeriodStart, terraLines.Rising.X);
+        Assert.Empty(terraLines.Flat.X);
+        Assert.Empty(terraLines.Rising.X);
+        Assert.NotEmpty(terraLines.Dashed.X);
+        Assert.Contains(expectedPeriodStart, terraLines.Dashed.X);
+        Assert.Contains(firstObservation, terraLines.Dashed.X);
         Assert.Equal([expectedPeriodStart, firstObservation, firstObservation], remainingLine.X.Take(3));
         Assert.Equal([100d, 100d, 87d], remainingLine.Y.Take(3));
-        Assert.DoesNotContain(
-            terraLines.Rising.X.Zip(terraLines.Rising.X.Skip(1))
-                .Zip(terraLines.Rising.Y.Zip(terraLines.Rising.Y.Skip(1))),
-            pair => pair.First.First == expectedPeriodStart &&
-                pair.First.Second == firstObservation &&
-                pair.Second.First == 0d &&
-                pair.Second.Second == 30.50d);
-        Assert.NotEmpty(solLines.Rising.X);
+        Assert.Empty(solLines.Rising.X);
         Assert.Empty(lunaLines.Rising.X);
+    }
+
+    [Fact]
+    public async Task Issue137_cumulative_correction_fixture_never_paints_a_solid_recovery_bridge()
+    {
+        var fixturePath = Path.Combine(
+            AppContext.BaseDirectory,
+            "Fixtures",
+            "graph_cumulative_correction.json");
+        using var document = JsonDocument.Parse(File.ReadAllText(fixturePath));
+        var root = document.RootElement;
+        var expectedPeriodStart = root.GetProperty("expected_period_start").GetInt64();
+        var expectedPeriodEnd = root.GetProperty("expected_period_end").GetInt64();
+        var expectedResetAt = root.GetProperty("expected_reset_at").GetInt64();
+        var expectedGraphTimestamps = root
+            .GetProperty("expected_graph_timestamps")
+            .EnumerateArray()
+            .Select(value => value.GetInt64())
+            .ToArray();
+        var expectedCorrectionStarts = root
+            .GetProperty("expected_correction_starts")
+            .EnumerateArray()
+            .Select(value => value.GetInt64())
+            .ToArray();
+        var expectedLatestSampleTimestamp = root.GetProperty("expected_latest_sample_timestamp").GetInt64();
+        var expectedLatestRemaining = root.GetProperty("expected_latest_remaining").GetDouble();
+        var expectedLatestSolDollars = root.GetProperty("expected_latest_sol_dollars").GetDouble();
+        var expectedLatestSolTokens = root.GetProperty("expected_latest_sol_tokens").GetUInt64();
+
+        var handler = new DetailsFixtureHandler(
+            Encoding.UTF8.GetBytes(root.GetProperty("details_response").GetRawText()));
+        using var client = new LoopbackStatusClient(handler);
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(1, handler.RequestCount);
+        Assert.Equal("http://127.0.0.1:8787/v2/details", handler.LastRequest?.RequestUri?.AbsoluteUri);
+        var snapshot = Assert.IsType<ApiDetailsSnapshot>(result.Snapshot);
+        Assert.Equal("v2", snapshot.ApiVersion);
+        Assert.Equal(6, snapshot.HistorySamples.Count);
+        Assert.All(
+            snapshot.HistorySamples,
+            sample => Assert.Equal(ApiHistorySample.ConfirmedModelSource, sample.ModelSource));
+
+        var period = Assert.Single(snapshot.HistoryPeriods);
+        Assert.True(period.Current);
+        Assert.Equal(expectedPeriodStart, period.StartAt);
+        Assert.Equal(expectedPeriodEnd, period.EndAt);
+        Assert.Equal(expectedResetAt, period.ResetAt);
+        Assert.Equal(expectedPeriodEnd, snapshot.ObservedAt);
+
+        var graphSamples = GraphWindowViewModel.BuildGraphSamples(period, expectedPeriodEnd);
+        Assert.Equal(
+            expectedGraphTimestamps,
+            graphSamples.Select(sample => sample.Timestamp).ToArray());
+        Assert.Equal(
+            expectedCorrectionStarts,
+            graphSamples
+                .Where(sample => expectedCorrectionStarts.Contains(sample.Timestamp))
+                .Select(sample => sample.Timestamp)
+                .ToArray());
+        Assert.Equal(expectedLatestSampleTimestamp, graphSamples[^2].Timestamp);
+        Assert.NotNull(graphSamples[^2].RemainingPercent);
+        Assert.NotNull(graphSamples[^2].SolDollars);
+        Assert.NotNull(graphSamples[^2].SolTokens);
+        Assert.Equal(expectedLatestRemaining, graphSamples[^2].RemainingPercent!.Value);
+        Assert.Equal(expectedLatestSolDollars, graphSamples[^2].SolDollars!.Value, precision: 6);
+        Assert.Equal(expectedLatestSolTokens, graphSamples[^2].SolTokens!.Value);
+        // The endpoint anchor repeats the last observation. It must not
+        // manufacture a recovery to the pre-correction cumulative value.
+        Assert.NotNull(graphSamples[^1].SolDollars);
+        Assert.Equal(expectedLatestSolDollars, graphSamples[^1].SolDollars!.Value, precision: 6);
+
+        using var main = new MainWindowViewModel(
+            new CountingReadyHealthClient(),
+            new SingleDetailsClient(result),
+            new AlwaysReadyConnectionSupervisor());
+        main.Start();
+        await EventuallyAsync(() => ReferenceEquals(main.DetailsSnapshot, snapshot));
+
+        using var graph = new GraphWindowViewModel(main, static action => action());
+        var scene = graph.Scene;
+        Assert.Equal([true, true, false, false, false, false, false], scene.ModelVectorAvailable);
+        Assert.Equal([73d, 73d, 73d, 70d, 70d, 62d, 62d], scene.Remaining);
+        Assert.All(scene.Sol.Skip(2), value => Assert.True(double.IsNaN(value)));
+
+        var model = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Sol);
+        var remaining = GraphPlotProjection.BuildRemainingLines(scene);
+
+        Assert.Empty(model.Rising.X);
+        Assert.NotEmpty(remaining.Dashed.X);
+        Assert.DoesNotContain(
+            remaining.Solid.Y.Zip(remaining.Solid.Y.Skip(1)),
+            segment => segment.Second < segment.First);
     }
 
     [Fact]
@@ -1106,6 +1261,19 @@ public sealed class GraphPlotControlTests
     private static ApiHistorySample Point(long timestamp, double? remaining, double sol, double terra, double luna) =>
         new(timestamp, 2_000, remaining, sol, terra, luna, (ulong)sol, (ulong)terra, (ulong)luna);
 
+    private static ApiHistorySample ConfirmedCumulativeSample(long timestamp, double value) =>
+        new(
+            timestamp,
+            2_000,
+            100,
+            value,
+            value,
+            value,
+            (ulong)value,
+            (ulong)value,
+            (ulong)value,
+            ApiHistorySample.ConfirmedModelSource);
+
     private static void AssertFirstObservationModel(
         GraphModelLineProjection lines,
         double firstObserved,
@@ -1124,9 +1292,9 @@ public sealed class GraphPlotControlTests
     {
         Assert.Equal(expected.Timestamp, actual.Timestamp);
         Assert.Equal(expected.Remaining, actual.RemainingPercent);
-        Assert.Equal(expected.SolDollars, actual.SolDollars, precision: 6);
-        Assert.Equal(expected.TerraDollars, actual.TerraDollars, precision: 6);
-        Assert.Equal(expected.LunaDollars, actual.LunaDollars, precision: 6);
+        Assert.Equal(expected.SolDollars, actual.SolDollars!.Value, precision: 6);
+        Assert.Equal(expected.TerraDollars, actual.TerraDollars!.Value, precision: 6);
+        Assert.Equal(expected.LunaDollars, actual.LunaDollars!.Value, precision: 6);
         Assert.Equal(expected.SolTokens, actual.SolTokens);
         Assert.Equal(expected.TerraTokens, actual.TerraTokens);
         Assert.Equal(expected.LunaTokens, actual.LunaTokens);
@@ -1139,7 +1307,7 @@ public sealed class GraphPlotControlTests
         var result = await client.FetchDetailsAsync(CancellationToken.None);
         Assert.True(result.IsSuccess);
         Assert.Null(result.Failure);
-        Assert.Equal(1, handler.RequestCount);
+        Assert.Equal(2, handler.RequestCount);
         return Assert.IsType<ApiDetailsSnapshot>(result.Snapshot);
     }
 
@@ -1181,6 +1349,12 @@ public sealed class GraphPlotControlTests
         }
     }
 
+    private sealed class SingleDetailsClient(DetailsFetchResult result) : ILoopbackDetailsClient
+    {
+        public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(result);
+    }
+
     private sealed class AlwaysReadyConnectionSupervisor : IConnectionSupervisor
     {
         public bool EnsureStarted(ClientSettings settings) => true;
@@ -1197,6 +1371,11 @@ public sealed class GraphPlotControlTests
     {
         private const string DetailsEndpoint = "http://127.0.0.1:8787/v1/details";
         private readonly byte[] body = body.ToArray();
+        private readonly bool servesV2 = Encoding.UTF8.GetString(body).Contains(
+            "\"api_version\":\"v2\"",
+            StringComparison.Ordinal) || Encoding.UTF8.GetString(body).Contains(
+                "\"api_version\": \"v2\"",
+                StringComparison.Ordinal);
 
         public int RequestCount { get; private set; }
 
@@ -1220,7 +1399,17 @@ public sealed class GraphPlotControlTests
         {
             RequestCount++;
             Assert.Equal(HttpMethod.Get, request.Method);
-            Assert.Equal(DetailsEndpoint, request.RequestUri?.AbsoluteUri);
+            if (request.RequestUri?.AbsolutePath == "/v2/details")
+            {
+                if (!servesV2)
+                {
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+                }
+            }
+            else
+            {
+                Assert.Equal(DetailsEndpoint, request.RequestUri?.AbsoluteUri);
+            }
             LastRequest = request;
 
             var response = new HttpResponseMessage(HttpStatusCode.OK)

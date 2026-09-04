@@ -15,6 +15,7 @@ namespace CodexInfo.WindowsClient.Core;
 /// </remarks>
 public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetailsClient, IDisposable
 {
+    private const string DetailsV2Endpoint = "http://127.0.0.1:8787/v2/details";
     private const string DetailsEndpoint = "http://127.0.0.1:8787/v1/details";
     private const string HealthEndpoint = "http://127.0.0.1:8787/v1/health";
     private const string PublishedPairHeader = "Codex-Info-Published-Pair";
@@ -83,6 +84,18 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         "sol_tokens",
         "terra_tokens",
         "luna_tokens");
+
+    private static readonly HashSet<string> HistorySampleV2Properties = CreatePropertySet(
+        "timestamp",
+        "reset_at",
+        "remaining_percent",
+        "sol_dollars",
+        "terra_dollars",
+        "luna_dollars",
+        "sol_tokens",
+        "terra_tokens",
+        "luna_tokens",
+        "model_source");
 
     private static readonly HashSet<string> HistoryGapProperties = CreatePropertySet(
         "gap_id",
@@ -225,9 +238,32 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
     public async Task<DetailsFetchResult> FetchDetailsAsync(
         CancellationToken cancellationToken = default)
     {
+        var v2Attempt = await FetchDetailsEndpointAsync(
+                DetailsV2Endpoint,
+                "v2",
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (!v2Attempt.NotFound)
+        {
+            return v2Attempt.Result;
+        }
+
+        var v1Attempt = await FetchDetailsEndpointAsync(
+                DetailsEndpoint,
+                "v1",
+                cancellationToken)
+            .ConfigureAwait(false);
+        return v1Attempt.Result;
+    }
+
+    private async Task<DetailsAttemptResult> FetchDetailsEndpointAsync(
+        string endpoint,
+        string expectedApiVersion,
+        CancellationToken cancellationToken)
+    {
         try
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, DetailsEndpoint);
+            using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
             request.Headers.Accept.Clear();
             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
@@ -237,26 +273,33 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
                     cancellationToken)
                 .ConfigureAwait(false);
 
+            if (response.StatusCode == HttpStatusCode.NotFound)
+            {
+                return expectedApiVersion == "v2"
+                    ? DetailsAttemptResult.NotFoundResult()
+                    : DetailsAttemptResult.Failure(DetailsFetchFailure.Transport);
+            }
+
             if (response.StatusCode != HttpStatusCode.OK)
             {
-                return DetailsFailure(DetailsFetchFailure.Transport);
+                return DetailsAttemptResult.Failure(DetailsFetchFailure.Transport);
             }
 
             if (!HasAcceptableHeaderSize(response) ||
                 !HasRequiredResponseHeaders(response) ||
                 !TryGetContentLength(response.Content, out var contentLength))
             {
-                return DetailsFailure(DetailsFetchFailure.Response);
+                return DetailsAttemptResult.Failure(DetailsFetchFailure.Response);
             }
 
             if (!TryGetPublishedPairIdentity(response, out var publishedPair))
             {
-                return DetailsFailure(DetailsFetchFailure.Response);
+                return DetailsAttemptResult.Failure(DetailsFetchFailure.Response);
             }
 
             if (contentLength is > MaxDetailsBodyBytes)
             {
-                return DetailsFailure(DetailsFetchFailure.Response);
+                return DetailsAttemptResult.Failure(DetailsFetchFailure.Response);
             }
 
             var bodyStatus = await ReadBodyAsync(
@@ -268,36 +311,37 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
 
             if (bodyStatus.Kind is BodyReadKind.Oversize)
             {
-                return DetailsFailure(DetailsFetchFailure.Response);
+                return DetailsAttemptResult.Failure(DetailsFetchFailure.Response);
             }
 
             if (bodyStatus.Kind is BodyReadKind.Transport || bodyStatus.Body is null)
             {
-                return DetailsFailure(DetailsFetchFailure.Transport);
+                return DetailsAttemptResult.Failure(DetailsFetchFailure.Transport);
             }
 
-            if (!TryParseDetails(bodyStatus.Body, out var snapshot) || snapshot is null)
+            if (!TryParseDetails(bodyStatus.Body, expectedApiVersion, out var snapshot) || snapshot is null)
             {
-                return DetailsFailure(DetailsFetchFailure.Response);
+                return DetailsAttemptResult.Failure(DetailsFetchFailure.Response);
             }
 
-            return DetailsFetchResult.Success(snapshot with { PublishedPair = publishedPair });
+            return DetailsAttemptResult.Success(
+                snapshot with { PublishedPair = publishedPair });
         }
         catch (OperationCanceledException)
         {
-            return DetailsFailure(DetailsFetchFailure.Transport);
+            return DetailsAttemptResult.Failure(DetailsFetchFailure.Transport);
         }
         catch (HttpRequestException)
         {
-            return DetailsFailure(DetailsFetchFailure.Transport);
+            return DetailsAttemptResult.Failure(DetailsFetchFailure.Transport);
         }
         catch (IOException)
         {
-            return DetailsFailure(DetailsFetchFailure.Transport);
+            return DetailsAttemptResult.Failure(DetailsFetchFailure.Transport);
         }
         catch (Exception)
         {
-            return DetailsFailure(DetailsFetchFailure.Transport);
+            return DetailsAttemptResult.Failure(DetailsFetchFailure.Transport);
         }
     }
 
@@ -500,15 +544,13 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
                 });
 
             var root = document.RootElement;
-            var expectedProductVersion = ProductInfo.Version;
             if (!HasExactlyProperties(root, HealthProperties, 3) ||
                 !TryGetString(root, "api_version", out var apiVersion) ||
                 apiVersion != "v1" ||
                 !TryGetBoundedString(root, "service", 1, 64, out var service) ||
                 service != "codex-info" ||
                 !TryGetBoundedString(root, "product_version", 1, 32, out var productVersion) ||
-                expectedProductVersion == "unknown" ||
-                productVersion != expectedProductVersion)
+                !IsCanonicalStableVersion(productVersion))
             {
                 return false;
             }
@@ -534,7 +576,19 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         }
     }
 
-    private static bool TryParseDetails(byte[] body, out ApiDetailsSnapshot? snapshot)
+    private static bool IsCanonicalStableVersion(string value)
+    {
+        var components = value.Split('.');
+        return components.Length == 3 && components.All(component =>
+            component.Length > 0 &&
+            (component.Length == 1 || component[0] != '0') &&
+            component.All(character => character is >= '0' and <= '9'));
+    }
+
+    private static bool TryParseDetails(
+        byte[] body,
+        string expectedApiVersion,
+        out ApiDetailsSnapshot? snapshot)
     {
         snapshot = null;
 
@@ -550,10 +604,16 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
                 });
 
             var root = document.RootElement;
-            if (!HasExactlyProperties(root, DetailsTopLevelProperties, 13) ||
+            var isV1 = expectedApiVersion == "v1";
+            var topLevelPropertyCount = 13;
+            if (!HasExactlyProperties(root, DetailsTopLevelProperties, topLevelPropertyCount) ||
                 !TryGetString(root, "api_version", out var apiVersion) ||
-                apiVersion != "v1" ||
-                !TryGetState(root, out var state) ||
+                apiVersion != expectedApiVersion)
+            {
+                return false;
+            }
+
+            if (!TryGetState(root, out var state) ||
                 !TryGetNullableUnixSeconds(root, "observed_at", out var observedAt) ||
                 !TryGetBoolean(root, "authenticated", out var authenticated) ||
                 !TryGetNullablePlanLabel(root, out var planLabel) ||
@@ -562,7 +622,7 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
                 !TryGetDetailsModels(root, out var models) ||
                 !TryGetUInt64(root, "active_thread_count", out var activeThreadCount) ||
                 !TryGetHistoryPeriods(root, observedAt, out var historyPeriods) ||
-                !TryGetFlatHistorySamples(root, historyPeriods, out var historySamples) ||
+                !TryGetFlatHistorySamples(root, historyPeriods, expectedApiVersion, out var historySamples) ||
                 !TryGetHistoryGaps(root, historyPeriods, out var historyGaps) ||
                 !TryGetThreads(root, out var threads) ||
                 !TryGetBoundedString(root, "estimated_cost_label", 1, 160, out var estimatedCostLabel))
@@ -591,6 +651,7 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
                 estimatedCostLabel);
             snapshot = snapshot with
             {
+                ApiVersion = apiVersion,
                 HistoryGaps = new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistoryGap>(historyGaps),
             };
             return true;
@@ -623,6 +684,27 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
                                  sample.ResetAt <= period.ResetAt)
                 .Select(sample => sample with { ResetAt = period.ResetAt })
                 .ToList());
+    }
+
+    private static bool TryGetHistoryModelSource(
+        JsonElement sample,
+        out string modelSource)
+    {
+        modelSource = string.Empty;
+        if (!TryGetString(sample, "model_source", out var candidate))
+        {
+            return false;
+        }
+
+        if (candidate is not ApiHistorySample.ConfirmedModelSource and
+            not ApiHistorySample.UnavailableModelSource and
+            not ApiHistorySample.LegacyUnknownModelSource)
+        {
+            return false;
+        }
+
+        modelSource = candidate;
+        return true;
     }
 
     private static bool TryGetDetailsModels(
@@ -738,9 +820,15 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
     private static bool TryGetFlatHistorySamples(
         JsonElement parent,
         IReadOnlyList<ApiHistoryPeriod> periods,
+        string apiVersion,
         out List<ApiHistorySample> samples)
     {
         samples = new List<ApiHistorySample>();
+        var isV1 = apiVersion == "v1";
+        var sampleProperties = isV1
+            ? HistorySampleProperties
+            : HistorySampleV2Properties;
+        var samplePropertyCount = isV1 ? 9 : 10;
         if (!parent.TryGetProperty("history_samples", out var property) ||
             property.ValueKind != JsonValueKind.Array ||
             property.GetArrayLength() > MaxHistorySamples)
@@ -754,17 +842,59 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         var canonicalIdentities = new HashSet<(string PeriodId, long Timestamp)>();
         foreach (var sample in property.EnumerateArray())
         {
-            if (!HasExactlyProperties(sample, HistorySampleProperties, 9) ||
+            if (!HasExactlyProperties(sample, sampleProperties, samplePropertyCount) ||
                 !TryGetUnixSeconds(sample, "timestamp", out var timestamp) ||
                 !TryGetUnixSeconds(sample, "reset_at", out var resetAt) ||
                 timestamp % 60 != 0 ||
                 !TryGetNullableRemainingPercent(sample, out var remainingPercent) ||
-                !TryGetNonNegativeFiniteDouble(sample, "sol_dollars", out var solDollars) ||
-                !TryGetNonNegativeFiniteDouble(sample, "terra_dollars", out var terraDollars) ||
-                !TryGetNonNegativeFiniteDouble(sample, "luna_dollars", out var lunaDollars) ||
-                !TryGetUInt64(sample, "sol_tokens", out var solTokens) ||
-                !TryGetUInt64(sample, "terra_tokens", out var terraTokens) ||
-                !TryGetUInt64(sample, "luna_tokens", out var lunaTokens))
+                !TryGetNullableNonNegativeFiniteDouble(sample, "sol_dollars", out var solDollars) ||
+                !TryGetNullableNonNegativeFiniteDouble(sample, "terra_dollars", out var terraDollars) ||
+                !TryGetNullableNonNegativeFiniteDouble(sample, "luna_dollars", out var lunaDollars) ||
+                !TryGetNullableUInt64(sample, "sol_tokens", out var solTokens) ||
+                !TryGetNullableUInt64(sample, "terra_tokens", out var terraTokens))
+            {
+                return false;
+            }
+
+            ulong? lunaTokens = null;
+            if (!TryGetNullableUInt64(sample, "luna_tokens", out lunaTokens))
+            {
+                return false;
+            }
+
+            var modelSource = ApiHistorySample.LegacyUnknownModelSource;
+            if (!isV1)
+            {
+                if (!TryGetHistoryModelSource(sample, out modelSource))
+                {
+                    return false;
+                }
+
+                var allModelValuesNull = solDollars is null &&
+                    terraDollars is null &&
+                    lunaDollars is null &&
+                    solTokens is null &&
+                    terraTokens is null &&
+                    lunaTokens is null;
+                var allModelValuesPresent = solDollars is not null &&
+                    terraDollars is not null &&
+                    lunaDollars is not null &&
+                    solTokens is not null &&
+                    terraTokens is not null &&
+                    lunaTokens is not null;
+                if (modelSource == ApiHistorySample.UnavailableModelSource
+                        ? !allModelValuesNull
+                        : !allModelValuesPresent)
+                {
+                    return false;
+                }
+            }
+            else if (solDollars is null ||
+                     terraDollars is null ||
+                     lunaDollars is null ||
+                     solTokens is null ||
+                     terraTokens is null ||
+                     lunaTokens is null)
             {
                 return false;
             }
@@ -798,7 +928,8 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
                 lunaDollars,
                 solTokens,
                 terraTokens,
-                lunaTokens));
+                lunaTokens,
+                modelSource));
             previousResetAt = resetAt;
             previousTimestamp = timestamp;
         }
@@ -1096,6 +1227,43 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         }
 
         return true;
+    }
+
+    private static bool TryGetNullableNonNegativeFiniteDouble(
+        JsonElement parent,
+        string name,
+        out double? value)
+    {
+        value = null;
+        if (!parent.TryGetProperty(name, out var property))
+        {
+            return false;
+        }
+
+        if (property.ValueKind == JsonValueKind.Null)
+        {
+            return true;
+        }
+
+        if (!TryGetNonNegativeFiniteDouble(property, out var candidate))
+        {
+            return false;
+        }
+
+        value = candidate;
+        return true;
+    }
+
+    private static bool TryGetNonNegativeFiniteDouble(
+        JsonElement property,
+        out double value)
+    {
+        value = default;
+        return property.ValueKind == JsonValueKind.Number &&
+               property.TryGetDouble(out value) &&
+               double.IsFinite(value) &&
+               value >= 0 &&
+               value <= 1_000_000_000_000;
     }
 
     private static bool TryGetNullableUInt64(JsonElement parent, string name, out ulong? value)
@@ -1468,6 +1636,20 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         Success,
         Oversize,
         Transport,
+    }
+
+    private readonly record struct DetailsAttemptResult(
+        DetailsFetchResult Result,
+        bool NotFound)
+    {
+        public static DetailsAttemptResult Success(ApiDetailsSnapshot snapshot) =>
+            new(DetailsFetchResult.Success(snapshot), false);
+
+        public static DetailsAttemptResult Failure(DetailsFetchFailure failure) =>
+            new(DetailsFetchResult.FromFailure(failure), false);
+
+        public static DetailsAttemptResult NotFoundResult() =>
+            new(DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport), true);
     }
 
     private readonly record struct BodyReadResult(BodyReadKind Kind, byte[]? Body)

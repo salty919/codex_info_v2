@@ -26,6 +26,64 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
+    public async Task DetailsV2IsPreferredAndCarriesConfirmedHistorySource()
+    {
+        var paths = new List<string>();
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            paths.Add(request.RequestUri!.AbsolutePath);
+            return JsonResponse(ValidDetailsV2Json(), includePublishedPair: true);
+        }));
+
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(["/v2/details"], paths);
+        Assert.Equal("v2", result.Snapshot!.ApiVersion);
+        Assert.Equal(ApiHistorySample.ConfirmedModelSource, result.Snapshot.HistorySamples[0].ModelSource);
+    }
+
+    [Fact]
+    public async Task DetailsFallsBackToV1OnlyWhenV2ReturnsNotFound()
+    {
+        var paths = new List<string>();
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            paths.Add(request.RequestUri!.AbsolutePath);
+            return request.RequestUri.AbsolutePath == "/v2/details"
+                ? NotFoundResponse()
+                : JsonResponse(ValidDetailsJson(), includePublishedPair: true);
+        }));
+
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(["/v2/details", "/v1/details"], paths);
+        Assert.Equal("v1", result.Snapshot!.ApiVersion);
+        Assert.Equal(ApiHistorySample.LegacyUnknownModelSource, result.Snapshot.HistorySamples[0].ModelSource);
+    }
+
+    [Fact]
+    public async Task DetailsV2RejectsPartiallyNullUnavailableModelVector()
+    {
+        var json = ValidDetailsV2Json()
+            .Replace("\"model_source\":\"confirmed\"", "\"model_source\":\"unavailable\"", StringComparison.Ordinal)
+            .Replace("\"sol_dollars\":1.25", "\"sol_dollars\":null", StringComparison.Ordinal);
+        var paths = new List<string>();
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            paths.Add(request.RequestUri!.AbsolutePath);
+            return JsonResponse(json, includePublishedPair: true);
+        }));
+
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
+        Assert.Null(result.Snapshot);
+        Assert.Equal(["/v2/details"], paths);
+    }
+
+    [Fact]
     public async Task PublishedPairIsRequiredForDetails()
     {
         var details = await FetchDetailsWithoutPublishedPair(ValidDetailsJson());
@@ -181,9 +239,21 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
-    public async Task HealthRejectsMismatchedProductVersion()
+    public async Task HealthAcceptsMismatchedProductVersionForDiagnostics()
     {
-        var result = await FetchHealth(HealthJson(ProductInfo.Version + "-mismatch"));
+        var result = await FetchHealth(HealthJson("0.0.0"));
+
+        Assert.Null(result.Failure);
+        Assert.Equal("0.0.0", result.Snapshot?.ProductVersion);
+    }
+
+    [Theory]
+    [InlineData("1.0")]
+    [InlineData("01.0.0")]
+    [InlineData("1.0.0-mismatch")]
+    public async Task HealthRejectsMalformedProductVersion(string productVersion)
+    {
+        var result = await FetchHealth(HealthJson(productVersion));
 
         Assert.Equal(HealthFetchFailure.Response, result.Failure);
         Assert.Null(result.Snapshot);
@@ -272,6 +342,11 @@ public sealed class LoopbackStatusClientTests
         var handler = new StubHandler(request =>
         {
             Assert.Equal(HttpMethod.Get, request.Method);
+            if (request.RequestUri!.AbsolutePath == "/v2/details")
+            {
+                return NotFoundResponse();
+            }
+
             Assert.Equal("http://127.0.0.1:8787/v1/details", request.RequestUri!.AbsoluteUri);
             return JsonResponse(ValidDetailsJson(), includePublishedPair: true);
         });
@@ -708,13 +783,19 @@ public sealed class LoopbackStatusClientTests
 
     private static async Task<DetailsFetchResult> FetchDetails(string json)
     {
-        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json, includePublishedPair: true)));
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+            request.RequestUri?.AbsolutePath == "/v2/details"
+                ? NotFoundResponse()
+                : JsonResponse(json, includePublishedPair: true)));
         return await client.FetchDetailsAsync(CancellationToken.None);
     }
 
     private static async Task<DetailsFetchResult> FetchDetailsWithoutPublishedPair(string json)
     {
-        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json)));
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+            request.RequestUri?.AbsolutePath == "/v2/details"
+                ? NotFoundResponse()
+                : JsonResponse(json)));
         return await client.FetchDetailsAsync(CancellationToken.None);
     }
 
@@ -724,8 +805,13 @@ public sealed class LoopbackStatusClientTests
         string? secondValue = null,
         string headerName = PublishedPairHeader)
     {
-        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
         {
+            if (request.RequestUri?.AbsolutePath == "/v2/details")
+            {
+                return NotFoundResponse();
+            }
+
             var response = JsonResponse(json);
             response.Headers.TryAddWithoutValidation(headerName, firstValue);
             if (secondValue is not null)
@@ -759,11 +845,22 @@ public sealed class LoopbackStatusClientTests
         return response;
     }
 
+    private static HttpResponseMessage NotFoundResponse() =>
+        new(HttpStatusCode.NotFound);
+
     private static string HealthJson(string? productVersion = null) =>
         $"{{\"api_version\":\"v1\",\"service\":\"codex-info\",\"product_version\":\"{productVersion ?? ProductInfo.Version}\"}}";
 
     private static string ValidDetailsJson() =>
         "{\"api_version\":\"v1\",\"state\":\"ready\",\"observed_at\":253402300740,\"authenticated\":true,\"plan_label\":\"Pro\",\"quota\":{\"remaining_percent\":98.5,\"reset_at\":253402300799,\"window_seconds\":604800,\"monthly\":false},\"models\":[{\"name\":\"SOL\",\"input_tokens\":10,\"cached_input_tokens\":2,\"output_tokens\":3,\"input_dollars\":0.5,\"cached_input_dollars\":0.25,\"output_dollars\":0.5}],\"active_thread_count\":1,\"history_periods\":[{\"id\":\"253402300799\",\"start_at\":253341820740,\"end_at\":253402300740,\"reset_at\":253402300799,\"label\":\"2026/08/01 — 2026/08/08\",\"current\":true}],\"history_samples\":[{\"timestamp\":253402300680,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"sol_dollars\":1.25,\"terra_dollars\":0.0,\"luna_dollars\":0.0,\"sol_tokens\":6,\"terra_tokens\":0,\"luna_tokens\":0}],\"history_gaps\":[],\"threads\":[{\"id\":\"thread-1\",\"title\":\"Task\",\"parent_thread_id\":null,\"model\":\"SOL\",\"model_label\":\"SOL\",\"total_tokens\":20,\"context_usage_tokens\":10,\"context_window_tokens\":80,\"created_at\":1,\"last_user_message_at\":1,\"is_subagent\":false,\"depth\":0}],\"estimated_cost_label\":\"概算 $1\"}";
+
+    private static string ValidDetailsV2Json() =>
+        ValidDetailsJson()
+            .Replace("\"api_version\":\"v1\"", "\"api_version\":\"v2\"", StringComparison.Ordinal)
+            .Replace(
+                "\"luna_tokens\":0}],\"history_gaps\"",
+                "\"luna_tokens\":0,\"model_source\":\"confirmed\"}],\"history_gaps\"",
+                StringComparison.Ordinal);
 
     private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> responder) : HttpMessageHandler
     {

@@ -6,6 +6,7 @@ use rusqlite::types::Value;
 use rusqlite::{
     params, Connection, DatabaseName, OpenFlags, OptionalExtension, TransactionBehavior,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -45,7 +46,7 @@ CREATE INDEX IF NOT EXISTS usage_history_timestamp_reset_idx
     );
 
 CREATE TABLE IF NOT EXISTS durable_state (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    singleton INTEGER PRIMARY KEY CHECK (singleton >= 1),
     data_generation INTEGER NOT NULL CHECK (data_generation >= 0),
     data_hash TEXT NOT NULL,
     snapshot_json TEXT NOT NULL
@@ -252,6 +253,22 @@ const HISTORY_TIMESTAMP_RESET_INDEX_COLUMNS: &[&str] = &[
     "terra_tokens",
     "luna_tokens",
 ];
+const DURABLE_STATE_OBSERVATION_MIN_SINGLETON: i64 = 2;
+const MAX_OBSERVATION_JSON_BYTES: usize = 16 * 1024;
+const OBSERVATION_JSON_KIND: &str = "codex-info-usage-observation-v1";
+const OBSERVATION_JSON_KEYS: &[&str] = &[
+    "kind",
+    "timestamp",
+    "reset_at",
+    "remaining_percent",
+    "sol_dollars",
+    "terra_dollars",
+    "luna_dollars",
+    "sol_tokens",
+    "terra_tokens",
+    "luna_tokens",
+    "model_source",
+];
 const MAX_RECORDED_ROOT_IDENTITY_BYTES: usize = 256;
 const MAX_RECORDED_RELATIVE_PATH_BYTES: usize = 4_096;
 /// Maximum minute buckets materialized by a single one-month history read.
@@ -317,6 +334,160 @@ pub struct UsageHistorySample {
     pub sol_tokens: u64,
     pub terra_tokens: u64,
     pub luna_tokens: u64,
+}
+
+/// Provenance of the local model vector for one history observation.
+///
+/// The legacy `usage_history` table cannot be extended without breaking the
+/// v1.0.28 reader.  New observations therefore use this explicit sidecar
+/// record while the old nine-column row remains the v1 projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelSource {
+    Confirmed,
+    Unavailable,
+    LegacyUnknown,
+}
+
+impl ModelSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Unavailable => "unavailable",
+            Self::LegacyUnknown => "legacy-unknown",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "confirmed" => Some(Self::Confirmed),
+            "unavailable" => Some(Self::Unavailable),
+            "legacy-unknown" => Some(Self::LegacyUnknown),
+            _ => None,
+        }
+    }
+}
+
+/// One bounded model/quota observation, including local-source provenance.
+/// Model fields are all present for `confirmed` and `legacy-unknown`, and all
+/// absent for `unavailable`; mixed vectors are rejected at the storage edge.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageHistoryObservation {
+    pub timestamp: i64,
+    pub reset_at: i64,
+    pub remaining_percent: Option<f64>,
+    pub sol_dollars: Option<f64>,
+    pub terra_dollars: Option<f64>,
+    pub luna_dollars: Option<f64>,
+    pub sol_tokens: Option<u64>,
+    pub terra_tokens: Option<u64>,
+    pub luna_tokens: Option<u64>,
+    pub model_source: ModelSource,
+}
+
+impl UsageHistoryObservation {
+    pub fn confirmed(sample: &UsageHistorySample) -> Self {
+        Self {
+            timestamp: sample.timestamp,
+            reset_at: sample.reset_at,
+            remaining_percent: sample.remaining_percent,
+            sol_dollars: Some(sample.sol_dollars),
+            terra_dollars: Some(sample.terra_dollars),
+            luna_dollars: Some(sample.luna_dollars),
+            sol_tokens: Some(sample.sol_tokens),
+            terra_tokens: Some(sample.terra_tokens),
+            luna_tokens: Some(sample.luna_tokens),
+            model_source: ModelSource::Confirmed,
+        }
+    }
+
+    pub fn unavailable(timestamp: i64, reset_at: i64, remaining_percent: Option<f64>) -> Self {
+        Self {
+            timestamp,
+            reset_at,
+            remaining_percent,
+            sol_dollars: None,
+            terra_dollars: None,
+            luna_dollars: None,
+            sol_tokens: None,
+            terra_tokens: None,
+            luna_tokens: None,
+            model_source: ModelSource::Unavailable,
+        }
+    }
+
+    pub fn legacy_unknown(sample: &UsageHistorySample) -> Self {
+        Self {
+            timestamp: sample.timestamp,
+            reset_at: sample.reset_at,
+            remaining_percent: sample.remaining_percent,
+            sol_dollars: Some(sample.sol_dollars),
+            terra_dollars: Some(sample.terra_dollars),
+            luna_dollars: Some(sample.luna_dollars),
+            sol_tokens: Some(sample.sol_tokens),
+            terra_tokens: Some(sample.terra_tokens),
+            luna_tokens: Some(sample.luna_tokens),
+            model_source: ModelSource::LegacyUnknown,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        // Existing usage_history rows may retain their original positive
+        // event second. Keep the sidecar on that exact storage key; the
+        // public history canonicalizer owns minute-start projection.
+        if self.timestamp <= 0 || self.reset_at <= 0 {
+            return Err(UsageStoreError::InvalidTimestamp {
+                field: "observation timestamp",
+                value: self.timestamp,
+            });
+        }
+        if let Some(value) = self.remaining_percent {
+            if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                return Err(UsageStoreError::InvalidImport(
+                    "observation remaining_percent is invalid".into(),
+                ));
+            }
+        }
+        let values = [self.sol_dollars, self.terra_dollars, self.luna_dollars];
+        let tokens = [self.sol_tokens, self.terra_tokens, self.luna_tokens];
+        let all_values = values.iter().all(Option::is_some);
+        let all_tokens = tokens.iter().all(Option::is_some);
+        let any_values = values.iter().any(Option::is_some);
+        let any_tokens = tokens.iter().any(Option::is_some);
+        match self.model_source {
+            ModelSource::Unavailable if any_values || any_tokens => {
+                return Err(UsageStoreError::InvalidImport(
+                    "unavailable observation contains model values".into(),
+                ));
+            }
+            ModelSource::Confirmed | ModelSource::LegacyUnknown if !all_values || !all_tokens => {
+                return Err(UsageStoreError::InvalidImport(
+                    "confirmed observation has a partial model vector".into(),
+                ));
+            }
+            _ => {}
+        }
+        for (field, value) in [
+            ("sol_dollars", self.sol_dollars),
+            ("terra_dollars", self.terra_dollars),
+            ("luna_dollars", self.luna_dollars),
+        ] {
+            if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+                return Err(UsageStoreError::InvalidImport(format!(
+                    "observation {field} is invalid"
+                )));
+            }
+        }
+        if tokens
+            .into_iter()
+            .flatten()
+            .any(|value| value > i64::MAX as u64)
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "observation token count exceeds SQLite INTEGER range".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Exact identity of one session source whose bounded usage was committed.
@@ -544,6 +715,7 @@ pub struct SessionCollectionCommit<'a> {
 pub struct SessionCollectionCommitResult {
     pub data_generation: u64,
     pub canonical_samples: Vec<UsageHistorySample>,
+    pub canonical_observations: Vec<UsageHistoryObservation>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1269,6 +1441,164 @@ fn upsert_canonical_samples(
     Ok(())
 }
 
+fn canonicalize_observations(
+    transaction: &rusqlite::Transaction<'_>,
+    observations: &[UsageHistoryObservation],
+    canonical_samples: &[UsageHistorySample],
+) -> Result<Vec<UsageHistoryObservation>> {
+    let canonical_samples = canonical_samples
+        .iter()
+        .map(|sample| ((sample.reset_at, sample.timestamp), sample))
+        .collect::<BTreeMap<_, _>>();
+    let mut canonical = BTreeMap::new();
+    for observation in observations {
+        observation.validate()?;
+        let key = (observation.reset_at, observation.timestamp);
+        if canonical.insert(key, observation.clone()).is_some() {
+            return Err(UsageStoreError::InvalidImport(
+                "duplicate usage observation key".into(),
+            ));
+        }
+    }
+    for (key, observation) in canonical.iter_mut() {
+        match observation.model_source {
+            ModelSource::Confirmed | ModelSource::LegacyUnknown => {
+                let sample = if let Some(sample) = canonical_samples.get(key) {
+                    Some((*sample).clone())
+                } else {
+                    transaction
+                        .query_row(
+                            "SELECT timestamp, reset_at, remaining_percent, sol_dollars,
+                                    terra_dollars, luna_dollars, sol_tokens, terra_tokens,
+                                    luna_tokens
+                             FROM usage_history WHERE reset_at = ?1 AND timestamp = ?2",
+                            params![key.0, key.1],
+                            |row| {
+                                valid_sample_from_row(row).map_err(|error| {
+                                    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                                })
+                            },
+                        )
+                        .optional()?
+                        .flatten()
+                };
+                let Some(sample) = sample else {
+                    return Err(UsageStoreError::InvalidImport(
+                        "model observation has no usage_history vector".into(),
+                    ));
+                };
+                let observed_vector_matches = observation.sol_dollars == Some(sample.sol_dollars)
+                    && observation.terra_dollars == Some(sample.terra_dollars)
+                    && observation.luna_dollars == Some(sample.luna_dollars)
+                    && observation.sol_tokens == Some(sample.sol_tokens)
+                    && observation.terra_tokens == Some(sample.terra_tokens)
+                    && observation.luna_tokens == Some(sample.luna_tokens);
+                // `canonicalize_samples` deliberately retains an already
+                // stored dominant vector when a later read regresses. Such a
+                // retained value was not confirmed by this observation, so do
+                // not promote it to a solid-line source until a full vector
+                // actually recovers.
+                if observation.model_source == ModelSource::Confirmed && !observed_vector_matches {
+                    observation.model_source = ModelSource::LegacyUnknown;
+                }
+                observation.remaining_percent =
+                    observation.remaining_percent.or(sample.remaining_percent);
+                observation.sol_dollars = Some(sample.sol_dollars);
+                observation.terra_dollars = Some(sample.terra_dollars);
+                observation.luna_dollars = Some(sample.luna_dollars);
+                observation.sol_tokens = Some(sample.sol_tokens);
+                observation.terra_tokens = Some(sample.terra_tokens);
+                observation.luna_tokens = Some(sample.luna_tokens);
+            }
+            ModelSource::Unavailable => {
+                if canonical_samples.contains_key(key) {
+                    return Err(UsageStoreError::InvalidImport(
+                        "unavailable observation conflicts with usage_history vector".into(),
+                    ));
+                }
+            }
+        }
+        observation.validate()?;
+    }
+    Ok(canonical.into_values().collect())
+}
+
+fn upsert_observations(
+    transaction: &rusqlite::Transaction<'_>,
+    observations: &[UsageHistoryObservation],
+) -> Result<Vec<UsageHistoryObservation>> {
+    if observations.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut next_singleton: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(singleton), 1) FROM durable_state",
+        [],
+        |row| row.get(0),
+    )?;
+    if next_singleton < 1 {
+        return Err(UsageStoreError::InvalidDurableRecord(
+            "durable_state contains an invalid singleton".into(),
+        ));
+    }
+    let mut persisted = BTreeMap::new();
+    for observation in observations {
+        let snapshot_json = observation_json(observation)?;
+        let data_hash = observation_data_hash(observation.reset_at, observation.timestamp);
+        let existing: Option<(i64, i64, String)> = transaction
+            .query_row(
+                "SELECT singleton, data_generation, snapshot_json FROM durable_state
+                 WHERE singleton >= ?1 AND data_hash = ?2",
+                params![DURABLE_STATE_OBSERVATION_MIN_SINGLETON, &data_hash],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((singleton, data_generation, existing_json)) = existing else {
+            next_singleton = next_singleton
+                .checked_add(1)
+                .ok_or(UsageStoreError::GenerationOverflow)?;
+            transaction.execute(
+                "INSERT INTO durable_state (singleton, data_generation, data_hash, snapshot_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    next_singleton,
+                    observation.timestamp,
+                    &data_hash,
+                    &snapshot_json,
+                ],
+            )?;
+            persisted.insert(
+                (observation.reset_at, observation.timestamp),
+                observation.clone(),
+            );
+            continue;
+        };
+        let existing = observation_from_sql(data_generation, data_hash.clone(), existing_json)?;
+        let selected = match (existing.model_source, observation.model_source) {
+            (ModelSource::Unavailable, ModelSource::Confirmed | ModelSource::LegacyUnknown) => {
+                observation.clone()
+            }
+            (ModelSource::Confirmed | ModelSource::LegacyUnknown, ModelSource::Unavailable) => {
+                existing.clone()
+            }
+            (ModelSource::Confirmed, ModelSource::Confirmed)
+            | (ModelSource::LegacyUnknown, ModelSource::Confirmed)
+            | (ModelSource::LegacyUnknown, ModelSource::LegacyUnknown) => observation.clone(),
+            (ModelSource::Confirmed, ModelSource::LegacyUnknown) => existing.clone(),
+            (ModelSource::Unavailable, ModelSource::Unavailable) => observation.clone(),
+        };
+        if selected != existing {
+            let selected_json = observation_json(&selected)?;
+            transaction.execute(
+                "UPDATE durable_state SET data_generation = ?1, snapshot_json = ?2
+                 WHERE singleton = ?3",
+                params![selected.timestamp, &selected_json, singleton],
+            )?;
+        }
+        persisted.insert((selected.reset_at, selected.timestamp), selected);
+    }
+    Ok(persisted.into_values().collect())
+}
+
 fn numeric_sqlite_value(value: Value) -> Option<f64> {
     match value {
         Value::Integer(value) => {
@@ -1563,6 +1893,163 @@ fn validate_snapshot_json(snapshot_json: &str) -> Result<()> {
     serde_json::from_str::<serde_json::Value>(snapshot_json)
         .map_err(|error| UsageStoreError::InvalidDurableRecord(error.to_string()))?;
     Ok(())
+}
+
+fn observation_data_hash(reset_at: i64, timestamp: i64) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"codex-info-usage-observation-v1\0");
+    digest.update(reset_at.to_be_bytes());
+    digest.update(timestamp.to_be_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+fn observation_json_value(observation: &UsageHistoryObservation) -> serde_json::Value {
+    serde_json::json!({
+        "kind": OBSERVATION_JSON_KIND,
+        "timestamp": observation.timestamp,
+        "reset_at": observation.reset_at,
+        "remaining_percent": observation.remaining_percent,
+        "sol_dollars": observation.sol_dollars,
+        "terra_dollars": observation.terra_dollars,
+        "luna_dollars": observation.luna_dollars,
+        "sol_tokens": observation.sol_tokens,
+        "terra_tokens": observation.terra_tokens,
+        "luna_tokens": observation.luna_tokens,
+        "model_source": observation.model_source.as_str(),
+    })
+}
+
+fn observation_json(observation: &UsageHistoryObservation) -> Result<String> {
+    observation.validate()?;
+    let encoded = serde_json::to_string(&observation_json_value(observation)).map_err(|error| {
+        UsageStoreError::InvalidDurableRecord(format!(
+            "observation JSON serialization failed: {error}"
+        ))
+    })?;
+    validate_observation_json(&encoded)?;
+    Ok(encoded)
+}
+
+fn validate_observation_json(snapshot_json: &str) -> Result<serde_json::Value> {
+    if snapshot_json.is_empty() || snapshot_json.len() > MAX_OBSERVATION_JSON_BYTES {
+        return Err(UsageStoreError::InvalidDurableRecord(
+            "observation snapshot_json is outside its bounded size".into(),
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(snapshot_json).map_err(|error| {
+        UsageStoreError::InvalidDurableRecord(format!("observation JSON is invalid: {error}"))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        UsageStoreError::InvalidDurableRecord("observation JSON must be an object".into())
+    })?;
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = OBSERVATION_JSON_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(UsageStoreError::InvalidDurableRecord(
+            "observation JSON fields differ from the strict contract".into(),
+        ));
+    }
+    if object.get("kind").and_then(serde_json::Value::as_str) != Some(OBSERVATION_JSON_KIND) {
+        return Err(UsageStoreError::InvalidDurableRecord(
+            "observation JSON kind is invalid".into(),
+        ));
+    }
+    Ok(value)
+}
+
+fn observation_from_sql(
+    data_generation: i64,
+    data_hash: String,
+    snapshot_json: String,
+) -> Result<UsageHistoryObservation> {
+    if data_generation <= 0 {
+        return Err(UsageStoreError::InvalidDurableRecord(
+            "observation data_generation must be a positive timestamp".into(),
+        ));
+    }
+    let expected_hash = observation_data_hash(
+        validate_observation_json(&snapshot_json)?
+            .get("reset_at")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| {
+                UsageStoreError::InvalidDurableRecord(
+                    "observation reset_at is not an integer".into(),
+                )
+            })?,
+        data_generation,
+    );
+    if data_hash != expected_hash {
+        return Err(UsageStoreError::InvalidDurableRecord(
+            "observation data_hash does not match its key".into(),
+        ));
+    }
+    let value = validate_observation_json(&snapshot_json)?;
+    let integer = |name: &str| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| {
+                UsageStoreError::InvalidDurableRecord(format!("observation {name} is invalid"))
+            })
+    };
+    let optional_f64 = |name: &str| {
+        let value = value.get(name).ok_or_else(|| {
+            UsageStoreError::InvalidDurableRecord(format!("observation {name} is missing"))
+        })?;
+        if value.is_null() {
+            Ok(None)
+        } else {
+            value.as_f64().map(Some).ok_or_else(|| {
+                UsageStoreError::InvalidDurableRecord(format!("observation {name} is invalid"))
+            })
+        }
+    };
+    let optional_u64 = |name: &str| {
+        let value = value.get(name).ok_or_else(|| {
+            UsageStoreError::InvalidDurableRecord(format!("observation {name} is missing"))
+        })?;
+        if value.is_null() {
+            Ok(None)
+        } else {
+            value.as_u64().map(Some).ok_or_else(|| {
+                UsageStoreError::InvalidDurableRecord(format!("observation {name} is invalid"))
+            })
+        }
+    };
+    let timestamp = integer("timestamp")?;
+    let reset_at = integer("reset_at")?;
+    if timestamp != data_generation
+        || value.get("timestamp").and_then(serde_json::Value::as_i64) != Some(timestamp)
+        || value.get("reset_at").and_then(serde_json::Value::as_i64) != Some(reset_at)
+    {
+        return Err(UsageStoreError::InvalidDurableRecord(
+            "observation key does not match its JSON".into(),
+        ));
+    }
+    let model_source = value
+        .get("model_source")
+        .and_then(serde_json::Value::as_str)
+        .and_then(ModelSource::parse)
+        .ok_or_else(|| {
+            UsageStoreError::InvalidDurableRecord("observation model_source is invalid".into())
+        })?;
+    let observation = UsageHistoryObservation {
+        timestamp,
+        reset_at,
+        remaining_percent: optional_f64("remaining_percent")?,
+        sol_dollars: optional_f64("sol_dollars")?,
+        terra_dollars: optional_f64("terra_dollars")?,
+        luna_dollars: optional_f64("luna_dollars")?,
+        sol_tokens: optional_u64("sol_tokens")?,
+        terra_tokens: optional_u64("terra_tokens")?,
+        luna_tokens: optional_u64("luna_tokens")?,
+        model_source,
+    };
+    observation.validate()?;
+    Ok(observation)
 }
 
 impl DurableRecord {
@@ -2289,6 +2776,80 @@ fn validate_storage_partition_identity(
     Ok(())
 }
 
+/// Upgrade the old singleton-only durable-state CHECK without changing the
+/// table/column contract.  The migration runs inside the caller's transaction
+/// and is deliberately placed before partition schema validation so a legacy
+/// account database is never half-opened or partially inspected.
+fn ensure_durable_state_schema(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    let sql: String = transaction.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'durable_state'",
+        [],
+        |row| row.get(0),
+    )?;
+    let normalized = sql
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    if normalized.contains("singleton>=1") {
+        transaction.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS durable_state_observation_key_idx
+             ON durable_state (data_hash) WHERE singleton >= 2",
+            [],
+        )?;
+        transaction.execute(
+            "CREATE INDEX IF NOT EXISTS durable_state_observation_time_idx
+             ON durable_state (data_generation, singleton) WHERE singleton >= 2",
+            [],
+        )?;
+        return Ok(());
+    }
+    if !normalized.contains("singleton=1") {
+        return Err(UsageStoreError::InvalidImport(
+            "durable_state singleton CHECK is not recognized".into(),
+        ));
+    }
+
+    transaction.execute(
+        "ALTER TABLE durable_state RENAME TO durable_state_legacy",
+        [],
+    )?;
+    transaction.execute_batch(
+        "CREATE TABLE durable_state (
+            singleton INTEGER PRIMARY KEY CHECK (singleton >= 1),
+            data_generation INTEGER NOT NULL CHECK (data_generation >= 0),
+            data_hash TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL
+        );",
+    )?;
+    // A legacy row may already violate its CHECK because of earlier storage
+    // corruption. Preserve that evidence during the shape-only migration so
+    // `load_durable_state` can report it without making the whole usage store
+    // unopenable (which would stop subsequent recording).
+    transaction.execute_batch("PRAGMA ignore_check_constraints = ON;")?;
+    let copy_result = transaction.execute(
+        "INSERT INTO durable_state (singleton, data_generation, data_hash, snapshot_json)
+         SELECT singleton, data_generation, data_hash, snapshot_json
+         FROM durable_state_legacy",
+        [],
+    );
+    let restore_result = transaction.execute_batch("PRAGMA ignore_check_constraints = OFF;");
+    copy_result?;
+    restore_result?;
+    transaction.execute("DROP TABLE durable_state_legacy", [])?;
+    transaction.execute(
+        "CREATE UNIQUE INDEX durable_state_observation_key_idx
+         ON durable_state (data_hash) WHERE singleton >= 2",
+        [],
+    )?;
+    transaction.execute(
+        "CREATE INDEX durable_state_observation_time_idx
+         ON durable_state (data_generation, singleton) WHERE singleton >= 2",
+        [],
+    )?;
+    Ok(())
+}
+
 #[allow(dead_code)]
 impl UsageStore {
     /// Creates a brand-new account partition. Existing paths are recovery
@@ -2328,6 +2889,7 @@ impl UsageStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA)?;
         transaction.execute_batch(PARTITION_SCHEMA)?;
+        ensure_durable_state_schema(&transaction)?;
         ensure_recorder_gap_ledger_schema(&transaction)?;
         ensure_session_checkpoint_schema(&transaction)?;
         ensure_history_continuity_schema(&transaction)?;
@@ -2485,6 +3047,7 @@ impl UsageStore {
         connection.busy_timeout(Duration::from_secs(2))?;
         let transaction = connection.transaction()?;
         transaction.execute_batch(SCHEMA)?;
+        ensure_durable_state_schema(&transaction)?;
         // A database must already have the current schema. Older formats are
         // intentionally not migrated or read.
         for column in ["sol_tokens", "terra_tokens", "luna_tokens"] {
@@ -2956,6 +3519,54 @@ impl UsageStore {
     /// Alias for the same bounded read, retaining the history terminology.
     pub fn load_recent_history(&self, now: DateTime<Utc>) -> Result<Vec<UsageHistorySample>> {
         self.load_recent_history_impl(now)
+    }
+
+    /// Loads the bounded recent observation timeline. Existing rows without a
+    /// sidecar provenance record are intentionally labelled `legacy-unknown`;
+    /// auxiliary unavailable rows remain visible here while staying absent from
+    /// the v1 `usage_history` projection.
+    pub fn load_recent_observations(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<UsageHistoryObservation>> {
+        let cutoff = one_month_before(now).timestamp();
+        let now_timestamp = now.timestamp();
+        let mut observations = BTreeMap::<(i64, i64), UsageHistoryObservation>::new();
+        for sample in self.load_recent_history_impl(now)? {
+            let observation = UsageHistoryObservation::legacy_unknown(&sample);
+            observations.insert((sample.reset_at, sample.timestamp), observation);
+        }
+
+        let mut statement = self.connection.prepare(
+            "SELECT data_generation, data_hash, snapshot_json
+             FROM durable_state
+             WHERE singleton >= ?1 AND data_generation > ?2 AND data_generation <= ?3
+             ORDER BY data_generation ASC, singleton ASC
+             LIMIT ?4",
+        )?;
+        let mut rows = statement.query(params![
+            DURABLE_STATE_OBSERVATION_MIN_SINGLETON,
+            cutoff,
+            now_timestamp,
+            MAX_RECENT_HISTORY_SAMPLES as i64 + 1,
+        ])?;
+        let mut auxiliary_count = 0usize;
+        while let Some(row) = rows.next()? {
+            auxiliary_count = auxiliary_count.saturating_add(1);
+            let observation = observation_from_sql(row.get(0)?, row.get(1)?, row.get(2)?)?;
+            observations.insert((observation.reset_at, observation.timestamp), observation);
+        }
+        if auxiliary_count > MAX_RECENT_HISTORY_SAMPLES {
+            return Err(UsageStoreError::HistoryCapacityExceeded {
+                maximum: MAX_RECENT_HISTORY_SAMPLES,
+            });
+        }
+        if observations.len() > MAX_RECENT_HISTORY_SAMPLES {
+            return Err(UsageStoreError::HistoryCapacityExceeded {
+                maximum: MAX_RECENT_HISTORY_SAMPLES,
+            });
+        }
+        Ok(observations.into_values().collect())
     }
 
     /// Pure grouping helper exposed beside the store API for callers that
@@ -3824,9 +4435,37 @@ impl UsageStore {
             .map(|result| result.data_generation)
     }
 
+    /// Backwards-compatible collection entry point. A normal sample is a
+    /// confirmed local observation; callers that need quota-only/unavailable
+    /// observations use [`Self::commit_session_collection_with_observations`].
     pub fn commit_session_collection_with_samples(
         &mut self,
         commit: SessionCollectionCommit<'_>,
+    ) -> Result<SessionCollectionCommitResult> {
+        let observations = commit
+            .samples
+            .iter()
+            .map(UsageHistoryObservation::confirmed)
+            .collect::<Vec<_>>();
+        self.commit_session_collection_with_observations_inner(commit, &observations)
+    }
+
+    /// Atomically commits ordinary session samples and provenance observations
+    /// in the same SQLite transaction. The observation list may contain
+    /// unavailable quota-only rows that have no corresponding usage_history
+    /// row; every supplied key is still deduplicated and strictly validated.
+    pub fn commit_session_collection_with_observations(
+        &mut self,
+        commit: SessionCollectionCommit<'_>,
+        observations: &[UsageHistoryObservation],
+    ) -> Result<SessionCollectionCommitResult> {
+        self.commit_session_collection_with_observations_inner(commit, observations)
+    }
+
+    fn commit_session_collection_with_observations_inner(
+        &mut self,
+        commit: SessionCollectionCommit<'_>,
+        observations: &[UsageHistoryObservation],
     ) -> Result<SessionCollectionCommitResult> {
         let SessionCollectionCommit {
             reset_at,
@@ -3926,6 +4565,8 @@ impl UsageStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let adjusted_samples = apply_history_continuity(&transaction, samples)?;
         let canonical_samples = canonicalize_samples(&transaction, &adjusted_samples)?;
+        let canonical_observations =
+            canonicalize_observations(&transaction, observations, &canonical_samples)?;
         let current_generation: (String, i64, i64, Option<String>, String) = transaction
             .query_row(
                 "SELECT data_generation, reset_at, window_seconds, collector_epoch, cycle_seq
@@ -3962,10 +4603,13 @@ impl UsageStore {
                 // The complete transaction for this epoch/cycle already
                 // committed. Return its exact generation rather than
                 // incrementing durable state on an acknowledgement retry.
+                let replay_observations =
+                    upsert_observations(&transaction, &canonical_observations)?;
                 transaction.commit()?;
                 return Ok(SessionCollectionCommitResult {
                     data_generation: current_data_generation,
                     canonical_samples,
+                    canonical_observations: replay_observations,
                 });
             }
             if current_cycle_seq > cycle_seq {
@@ -4054,6 +4698,7 @@ impl UsageStore {
         }
 
         upsert_canonical_samples(&transaction, &canonical_samples)?;
+        let persisted_observations = upsert_observations(&transaction, &canonical_observations)?;
         {
             let mut statement = transaction.prepare(
                 "INSERT INTO session_ranges (
@@ -4186,6 +4831,7 @@ impl UsageStore {
         Ok(SessionCollectionCommitResult {
             data_generation: next,
             canonical_samples,
+            canonical_observations: persisted_observations,
         })
     }
 
@@ -4550,6 +5196,11 @@ impl UsageStore {
         let deleted = transaction.execute(
             "DELETE FROM usage_history WHERE timestamp < ?1",
             params![cutoff],
+        )?;
+        transaction.execute(
+            "DELETE FROM durable_state
+             WHERE singleton >= ?1 AND data_generation < ?2",
+            params![DURABLE_STATE_OBSERVATION_MIN_SINGLETON, cutoff],
         )?;
         transaction.commit()?;
         Ok(deleted)
@@ -6380,13 +7031,33 @@ mod tests {
         let larger = sample(1_700_000_060, 1_700_604_800, Some(75.0), 9.5);
         let smaller = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
 
-        let store = UsageStore::open(&path).unwrap();
+        let mut store = UsageStore::open(&path).unwrap();
         store.upsert_sample(&larger).unwrap();
         store.upsert_sample(&smaller).unwrap();
 
         let actual = store.load_all().unwrap();
         assert_eq!(actual.len(), 1);
         assert_eq!(actual, vec![larger]);
+
+        let transaction = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let canonical_samples =
+            canonicalize_samples(&transaction, std::slice::from_ref(&smaller)).unwrap();
+        let canonical_observations = canonicalize_observations(
+            &transaction,
+            std::slice::from_ref(&UsageHistoryObservation::confirmed(&smaller)),
+            &canonical_samples,
+        )
+        .unwrap();
+        assert_eq!(canonical_observations.len(), 1);
+        assert_eq!(
+            canonical_observations[0].model_source,
+            ModelSource::LegacyUnknown
+        );
+        assert_eq!(canonical_observations[0].sol_dollars, Some(9.5));
+        drop(transaction);
         drop(store);
         remove_database(&path);
     }
@@ -6430,6 +7101,255 @@ mod tests {
             UsageStore::open(&path).unwrap().load_all().unwrap(),
             vec![expected]
         );
+        remove_database(&path);
+    }
+
+    #[test]
+    fn unavailable_observation_rejects_partial_model_vector() {
+        let mut observation =
+            UsageHistoryObservation::unavailable(1_700_000_040, 1_700_604_800, Some(75.0));
+        observation.sol_dollars = Some(1.0);
+        assert!(matches!(
+            observation.validate(),
+            Err(UsageStoreError::InvalidImport(_))
+        ));
+    }
+
+    #[test]
+    fn observation_source_transitions_are_monotonic_and_same_minute_updates_commit() {
+        let path = database_path("observation-source-transitions");
+        let timestamp = 1_700_000_040;
+        let reset_at = 1_700_604_800;
+        let mut store = UsageStore::open(&path).unwrap();
+
+        let unavailable = UsageHistoryObservation::unavailable(timestamp, reset_at, Some(90.0));
+        let transaction = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            upsert_observations(&transaction, std::slice::from_ref(&unavailable)).unwrap(),
+            vec![unavailable.clone()]
+        );
+        transaction.commit().unwrap();
+
+        // A later quota-only reading for the same minute must update the
+        // unavailable sidecar instead of producing a permanent batch conflict.
+        let later_unavailable =
+            UsageHistoryObservation::unavailable(timestamp, reset_at, Some(80.0));
+        let transaction = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            upsert_observations(&transaction, std::slice::from_ref(&later_unavailable),).unwrap(),
+            vec![later_unavailable.clone()]
+        );
+        transaction.commit().unwrap();
+
+        let confirmed_sample = sample(timestamp, reset_at, Some(82.0), 4.0);
+        let confirmed = UsageHistoryObservation::confirmed(&confirmed_sample);
+        let transaction = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            upsert_observations(&transaction, std::slice::from_ref(&confirmed)).unwrap(),
+            vec![confirmed.clone()]
+        );
+        transaction.commit().unwrap();
+
+        // An unavailable retry cannot downgrade an already confirmed vector.
+        let attempted_downgrade =
+            UsageHistoryObservation::unavailable(timestamp, reset_at, Some(70.0));
+        let transaction = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            upsert_observations(&transaction, std::slice::from_ref(&attempted_downgrade),).unwrap(),
+            vec![confirmed.clone()]
+        );
+        transaction.commit().unwrap();
+
+        let observations = store
+            .load_recent_observations(Utc.timestamp_opt(timestamp + 60, 0).unwrap())
+            .unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0], confirmed);
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn old_durable_state_check_migrates_before_validation_and_preserves_row_one() {
+        let path = database_path("durable-state-check-migration");
+        let expected = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let durable = {
+            let mut store = UsageStore::open(&path).unwrap();
+            store.upsert_sample(&expected).unwrap();
+            store
+                .commit_durable_state(&[], "0".repeat(64), r#"{"kind":"legacy-row-one"}"#)
+                .unwrap()
+        };
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE durable_state RENAME TO durable_state_legacy;
+                 CREATE TABLE durable_state (
+                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                     data_generation INTEGER NOT NULL CHECK (data_generation >= 0),
+                     data_hash TEXT NOT NULL,
+                     snapshot_json TEXT NOT NULL
+                 );
+                 INSERT INTO durable_state
+                     (singleton, data_generation, data_hash, snapshot_json)
+                 SELECT singleton, data_generation, data_hash, snapshot_json
+                 FROM durable_state_legacy;
+                 DROP TABLE durable_state_legacy;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let reopened = UsageStore::open(&path).unwrap();
+        assert_eq!(reopened.load_all().unwrap(), vec![expected]);
+        assert_eq!(reopened.load_durable_record().unwrap(), Some(durable));
+        drop(reopened);
+
+        let connection = Connection::open(&path).unwrap();
+        let durable_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'durable_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let normalized = durable_sql
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(normalized.contains("singleton>=1"));
+        let singleton_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM durable_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(singleton_count, 1);
+        drop(connection);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn session_sample_and_observation_commit_or_rollback_as_one_transaction() {
+        let path = database_path("session-observation-atomic");
+        let committed = sample(1_700_000_040, 1_700_604_800, Some(64.0), 1.5);
+        let observation = UsageHistoryObservation::confirmed(&committed);
+        let commit = || SessionCollectionCommit {
+            reset_at: committed.reset_at,
+            window_seconds: 604_800,
+            collector_epoch: 1,
+            cycle_seq: 1,
+            samples: std::slice::from_ref(&committed),
+            checkpoints: &[],
+            ranges: &[],
+            model_totals: &[],
+            recorded_sessions: &[],
+        };
+        let identity = partition_identity('a', 1);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_collection_generation_update
+                 BEFORE UPDATE ON collection_generation
+                 BEGIN SELECT RAISE(ABORT, 'collection generation rejected'); END;",
+            )
+            .unwrap();
+        assert!(store
+            .commit_session_collection_with_observations(
+                commit(),
+                std::slice::from_ref(&observation),
+            )
+            .is_err());
+        assert!(store.load_all().unwrap().is_empty());
+        let sidecar_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM durable_state WHERE singleton >= 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sidecar_count, 0);
+
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_collection_generation_update")
+            .unwrap();
+        let result = store
+            .commit_session_collection_with_observations(
+                commit(),
+                std::slice::from_ref(&observation),
+            )
+            .unwrap();
+        assert_eq!(result.canonical_observations, vec![observation.clone()]);
+        assert_eq!(store.load_all().unwrap(), vec![committed]);
+        assert_eq!(
+            store
+                .load_recent_observations(Utc.timestamp_opt(1_700_000_100, 0).unwrap())
+                .unwrap(),
+            vec![observation]
+        );
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn three_month_prune_removes_old_sidecars_but_keeps_new_rows_and_row_one() {
+        let path = database_path("prune-observation-sidecars");
+        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 56).unwrap();
+        let cutoff = three_months_before(now).timestamp();
+        let old = sample(cutoff - 60, 1_700_604_800, Some(10.0), 1.0);
+        let retained = sample(cutoff, 1_700_604_800, Some(20.0), 2.0);
+        let old_timestamp = cutoff.div_euclid(60) * 60 - 60;
+        let new_timestamp = cutoff.div_euclid(60) * 60 + 60;
+        let old_observation =
+            UsageHistoryObservation::unavailable(old_timestamp, 1_700_604_800, Some(90.0));
+        let new_observation =
+            UsageHistoryObservation::unavailable(new_timestamp, 1_700_604_800, Some(80.0));
+        let mut store = UsageStore::open(&path).unwrap();
+        store.upsert_samples(&[old, retained.clone()]).unwrap();
+        let durable = store
+            .commit_durable_state(&[], "0".repeat(64), r#"{"kind":"row-one"}"#)
+            .unwrap();
+        for (singleton, observation) in [(2_i64, &old_observation), (3_i64, &new_observation)] {
+            let snapshot_json = observation_json(observation).unwrap();
+            let data_hash = observation_data_hash(observation.reset_at, observation.timestamp);
+            store
+                .connection
+                .execute(
+                    "INSERT INTO durable_state
+                        (singleton, data_generation, data_hash, snapshot_json)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![singleton, observation.timestamp, data_hash, snapshot_json],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.prune_older_than_three_months(now).unwrap(), 1);
+        assert_eq!(store.load_all().unwrap(), vec![retained]);
+        assert_eq!(store.load_durable_record().unwrap(), Some(durable));
+        let singletons = store
+            .connection
+            .prepare("SELECT singleton FROM durable_state ORDER BY singleton")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(singletons, vec![1, 3]);
+        drop(store);
         remove_database(&path);
     }
 
