@@ -20,7 +20,7 @@ run_exact_test() {
         rm -f -- "$output_file"
         fail "focused Rust test failed: $target $test_name"
     fi
-    if ! rg -q 'test result: ok\. 1 passed; 0 failed; 0 ignored' "$output_file"; then
+    if ! grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored' "$output_file"; then
         cat "$output_file" >&2
         rm -f -- "$output_file"
         fail "focused Rust test did not execute exactly once: $target $test_name"

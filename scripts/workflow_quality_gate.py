@@ -3095,6 +3095,13 @@ def _focused_rust_routing_test() -> int:
     """Execute the caller; a wrong Rust module selects zero tests, not success."""
     with tempfile.TemporaryDirectory(prefix="codex-info-rust-routing-") as raw_root:
         root = Path(raw_root)
+        # Use the caller's standard tools only. The hosted governance runner
+        # does not provide developer conveniences such as ripgrep.
+        for command in ("bash", "dirname", "mktemp", "grep", "rm", "cat", "python3"):
+            executable = shutil.which(command)
+            if executable is None:
+                raise AssertionError(f"fixture standard tool is unavailable: {command}")
+            (root / command).symlink_to(executable)
         fake_cargo = root / "cargo"
         fake_cargo.write_text(
             "#!/usr/bin/env python3\n"
@@ -3110,7 +3117,7 @@ def _focused_rust_routing_test() -> int:
         result = subprocess.run(
             ("bash", str(ROOT / "scripts/regression_guard.sh"), "--history-graph"),
             cwd=ROOT,
-            env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}"},
+            env={**os.environ, "PATH": str(root)},
             capture_output=True,
             text=True,
         )
