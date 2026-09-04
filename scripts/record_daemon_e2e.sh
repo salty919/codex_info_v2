@@ -927,15 +927,32 @@ run_recorder_failure_budget() {
     printf 'CASE %s: PASS (one 2s busy failure, one next-cycle retry, ready state restored)\n' \
         "$case_label"
 
-    for mode in worker-death fatal full readonly; do
+    for mode in fatal full readonly; do
         setup_case "recorder-failure-$mode"
         write_fixture
         launch_failure_service "$mode" "recorder-$mode"
-        wait_for_expected_failure "$service_pid" "$mode failure"
+        require_ready
+        if ! wait_for_account_baseline; then
+            sed -n '1,160p' "$case_root/recorder-$mode.log" >&2 || true
+            fail "$case_label: $mode injection did not reach the next-cycle commit"
+        fi
+        assert_recorder_state ready "$service_pid" \
+            || fail "$case_label: $mode retry did not return to ready state"
+        process_matches_scope "$service_pid" service \
+            || fail "$case_label: $mode retry service exited unexpectedly"
+        stop_current_service
         require_no_service
-        printf 'CASE %s: PASS (injected %s failure exited nonzero and released owner/listener)\n' \
+        printf 'CASE %s: PASS (injected %s failure kept service alive and recovered next cycle)\n' \
             "$case_label" "$mode"
     done
+
+    setup_case recorder-failure-worker-death
+    write_fixture
+    launch_failure_service worker-death recorder-worker-death
+    wait_for_expected_failure "$service_pid" 'worker-death failure'
+    require_no_service
+    printf 'CASE %s: PASS (actual writer death exited nonzero and released owner/listener)\n' \
+        "$case_label"
 }
 
 run_service_cold_start

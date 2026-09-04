@@ -436,13 +436,73 @@ pub struct SessionModelTotal {
     pub output_tokens: u64,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Legacy history offset that still needs an exact component baseline.
+///
+/// Older account-partition hand-off records retained model total tokens and
+/// dollars, but not the input/cache/output components used by the Main view.
+/// The session worker may perform one bounded replay of the current latest
+/// 2 GiB prefix. It accepts components only when every contributing source
+/// has a durable checkpoint and the replay exactly matches this immutable
+/// per-model token/cost authority.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryContinuityRecovery {
+    pub source_fingerprint: String,
+    pub source_rows: usize,
+    pub boundary_timestamp: i64,
+    pub reset_at: i64,
+    pub sol_dollars: f64,
+    pub terra_dollars: f64,
+    pub luna_dollars: f64,
+    pub sol_tokens: u64,
+    pub terra_tokens: u64,
+    pub luna_tokens: u64,
+}
+
+impl HistoryContinuityRecovery {
+    pub fn matches_reset_at(&self, reset_at: i64) -> bool {
+        reset_at > 0 && reset_at.abs_diff(self.reset_at) <= RESET_GROUP_TOLERANCE_SECONDS as u64
+    }
+
+    pub fn matches_dollar_totals(&self, sol: f64, terra: f64, luna: f64) -> bool {
+        const MICRO_DOLLAR: f64 = 0.000_001;
+        [
+            (sol, self.sol_dollars),
+            (terra, self.terra_dollars),
+            (luna, self.luna_dollars),
+        ]
+        .into_iter()
+        .all(|(actual, expected)| {
+            actual.is_finite() && expected.is_finite() && (actual - expected).abs() <= MICRO_DOLLAR
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryContinuityModelRecovery {
+    pub authority: HistoryContinuityRecovery,
+    pub model_totals: Vec<SessionModelTotal>,
+    /// Exact generation before the optional continuity offset was added.
+    /// The recorder commits this payload when the independent recovery
+    /// transaction is rejected, so recovery failure never blocks ordinary
+    /// Session progress or leaks an uncommitted offset into durable state.
+    pub fallback_samples: Vec<UsageHistorySample>,
+    pub fallback_model_totals: Vec<SessionModelTotal>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionQuotaObservation {
+    pub observed_at: i64,
+    pub remaining_percent: f64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SessionCollectionState {
     pub data_generation: u64,
     pub reset_at: i64,
     pub window_seconds: i64,
     pub collector_epoch: Option<u128>,
     pub cycle_seq: u64,
+    pub last_quota_observation: Option<SessionQuotaObservation>,
     pub checkpoints: Vec<SessionCheckpoint>,
     pub model_totals: Vec<SessionModelTotal>,
 }
@@ -499,6 +559,7 @@ struct HistoryContinuity {
     sol_tokens: u64,
     terra_tokens: u64,
     luna_tokens: u64,
+    model_totals_applied: bool,
 }
 
 /// Result of a verified, candidate-database migration.
@@ -1328,29 +1389,44 @@ fn load_history_continuity(connection: &Connection) -> Result<Option<HistoryCont
     if !present {
         return Ok(None);
     }
+    let applied_column_present: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('history_continuity')
+            WHERE name = 'model_totals_applied'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    let applied_column = if applied_column_present {
+        "model_totals_applied"
+    } else {
+        // A read-only lane can observe the previous schema immediately
+        // before the serialized recorder owner performs its migration.
+        "0"
+    };
+    let query = format!(
+        "SELECT source_fingerprint, source_rows, boundary_timestamp, reset_at,
+                remaining_percent, sol_dollars, terra_dollars, luna_dollars,
+                sol_tokens, terra_tokens, luna_tokens, {applied_column}
+         FROM history_continuity WHERE singleton=1"
+    );
     let row = connection
-        .query_row(
-            "SELECT source_fingerprint, source_rows, boundary_timestamp, reset_at,
-                    remaining_percent, sol_dollars, terra_dollars, luna_dollars,
-                    sol_tokens, terra_tokens, luna_tokens
-             FROM history_continuity WHERE singleton=1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, f64>(4)?,
-                    row.get::<_, f64>(5)?,
-                    row.get::<_, f64>(6)?,
-                    row.get::<_, f64>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
-                    row.get::<_, String>(10)?,
-                ))
-            },
-        )
+        .query_row(&query, [], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, f64>(5)?,
+                row.get::<_, f64>(6)?,
+                row.get::<_, f64>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, i64>(11)?,
+            ))
+        })
         .optional()?;
     let Some(row) = row else {
         return Ok(None);
@@ -1368,6 +1444,7 @@ fn load_history_continuity(connection: &Connection) -> Result<Option<HistoryCont
         || [row.5, row.6, row.7]
             .into_iter()
             .any(|value| !value.is_finite() || value < 0.0)
+        || !matches!(row.11, 0 | 1)
     {
         return Err(UsageStoreError::InvalidImport(
             "history continuity record is invalid".into(),
@@ -1387,6 +1464,7 @@ fn load_history_continuity(connection: &Connection) -> Result<Option<HistoryCont
         sol_tokens: canonical_u64_text(&row.8, "history continuity SOL tokens")?,
         terra_tokens: canonical_u64_text(&row.9, "history continuity TERRA tokens")?,
         luna_tokens: canonical_u64_text(&row.10, "history continuity LUNA tokens")?,
+        model_totals_applied: row.11 == 1,
     }))
 }
 
@@ -1397,6 +1475,9 @@ fn apply_history_continuity(
     let Some(offset) = load_history_continuity(connection)? else {
         return Ok(samples.to_vec());
     };
+    if offset.model_totals_applied {
+        return Ok(samples.to_vec());
+    }
     samples
         .iter()
         .map(|sample| {
@@ -1728,6 +1809,7 @@ fn validate_partition_schema(connection: &Connection) -> Result<()> {
                 ("sol_tokens", "TEXT", 0),
                 ("terra_tokens", "TEXT", 0),
                 ("luna_tokens", "TEXT", 0),
+                ("model_totals_applied", "INTEGER", 0),
             ],
         ),
         (
@@ -1791,9 +1873,13 @@ fn validate_partition_schema(connection: &Connection) -> Result<()> {
             .iter()
             .map(|(name, kind, pk)| ((*name).to_owned(), (*kind).to_owned(), *pk))
             .collect::<Vec<_>>();
+        let legacy_history_continuity = *table == "history_continuity"
+            && actual.len() + 1 == expected.len()
+            && actual == expected[..actual.len()];
         if actual != expected
             && !(*table == "recorder_gap_ledger" && actual == legacy_recorder_gap_ledger_columns())
             && !(*table == "session_checkpoints" && actual == legacy_session_checkpoint_columns())
+            && !legacy_history_continuity
         {
             return Err(UsageStoreError::InvalidImport(format!(
                 "account partition {table} schema mismatch"
@@ -1860,10 +1946,29 @@ fn ensure_history_continuity_schema(transaction: &rusqlite::Transaction<'_>) -> 
             luna_dollars REAL NOT NULL CHECK (luna_dollars >= 0.0),
             sol_tokens TEXT NOT NULL,
             terra_tokens TEXT NOT NULL,
-            luna_tokens TEXT NOT NULL
+            luna_tokens TEXT NOT NULL,
+            model_totals_applied INTEGER NOT NULL DEFAULT 0 CHECK (
+                model_totals_applied IN (0, 1)
+            )
         );
         "#,
     )?;
+    let applied_column_present: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('history_continuity')
+            WHERE name = 'model_totals_applied'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !applied_column_present {
+        transaction.execute(
+            "ALTER TABLE history_continuity
+             ADD COLUMN model_totals_applied INTEGER NOT NULL DEFAULT 0
+             CHECK (model_totals_applied IN (0, 1))",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -2295,6 +2400,21 @@ impl UsageStore {
         // integrity scan on every minute poll is not an access check.
         validate_storage_partition_metadata(&store.connection, identity)?;
         Ok(store)
+    }
+
+    /// Performs the full SQLite integrity proof only when a retained backup
+    /// is selected as recovery authority. Steady-state readers intentionally
+    /// use the cheaper schema/identity validation above.
+    pub fn verify_integrity(&self) -> Result<()> {
+        let quick_check: String = self
+            .connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        if quick_check != "ok" {
+            return Err(UsageStoreError::InvalidImport(
+                "account partition quick_check failed".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Creates and rotates backups only for one already-verified partition.
@@ -2844,6 +2964,25 @@ impl UsageStore {
         build_reset_periods(samples)
     }
 
+    /// Returns the immutable legacy hand-off values only while their exact
+    /// input/cache/output baseline has not yet been applied.
+    pub fn pending_history_continuity_recovery(&self) -> Result<Option<HistoryContinuityRecovery>> {
+        Ok(load_history_continuity(&self.connection)?
+            .filter(|continuity| !continuity.model_totals_applied)
+            .map(|continuity| HistoryContinuityRecovery {
+                source_fingerprint: continuity.source_fingerprint,
+                source_rows: continuity.source_rows,
+                boundary_timestamp: continuity.boundary_timestamp,
+                reset_at: continuity.reset_at,
+                sol_dollars: continuity.sol_dollars,
+                terra_dollars: continuity.terra_dollars,
+                luna_dollars: continuity.luna_dollars,
+                sol_tokens: continuity.sol_tokens,
+                terra_tokens: continuity.terra_tokens,
+                luna_tokens: continuity.luna_tokens,
+            }))
+    }
+
     /// Bridges the one verified hand-off from the pre-account legacy store to
     /// the first account partition. The legacy database stays read-only; all
     /// imported rows, the offset, and the generation bump are one transaction.
@@ -2975,6 +3114,7 @@ impl UsageStore {
             sol_tokens: boundary_legacy.sol_tokens,
             terra_tokens: boundary_legacy.terra_tokens,
             luna_tokens: boundary_legacy.luna_tokens,
+            model_totals_applied: false,
         };
         let transaction = self
             .connection
@@ -2984,8 +3124,9 @@ impl UsageStore {
             "INSERT INTO history_continuity (
                 singleton, source_fingerprint, source_rows, boundary_timestamp,
                 reset_at, remaining_percent, sol_dollars, terra_dollars,
-                luna_dollars, sol_tokens, terra_tokens, luna_tokens
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                luna_dollars, sol_tokens, terra_tokens, luna_tokens,
+                model_totals_applied
+             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)",
             params![
                 &continuity.source_fingerprint,
                 continuity.source_rows as i64,
@@ -3102,13 +3243,18 @@ impl UsageStore {
     /// account partition. The caller decides whether the stored reset period
     /// is still current; file checkpoints remain valid across quota resets.
     pub fn load_session_collection_state(&self) -> Result<SessionCollectionState> {
+        // The generation, quota observation, cursors and absolute totals are
+        // one logical state. Hold one deferred read transaction so a recorder
+        // commit cannot be observed between these SELECTs.
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
         let (generation, reset_at, window_seconds, collector_epoch, cycle_seq): (
             String,
             i64,
             i64,
             Option<String>,
             String,
-        ) = self.connection.query_row(
+        ) = transaction.query_row(
             "SELECT data_generation, reset_at, window_seconds, collector_epoch, cycle_seq
              FROM collection_generation WHERE singleton = 1",
             [],
@@ -3133,7 +3279,7 @@ impl UsageStore {
                 "collector generation is inconsistent".into(),
             ));
         }
-        let task_running_column = if session_checkpoint_running_column_present(&self.connection)? {
+        let task_running_column = if session_checkpoint_running_column_present(&transaction)? {
             "last_task_running"
         } else {
             // A read-only resident can reach the legacy partition before
@@ -3151,9 +3297,9 @@ impl UsageStore {
              FROM session_checkpoints
              ORDER BY root_identity, relative_path, file_device, file_inode, prefix_generation"
         );
-        let mut checkpoint_statement = self.connection.prepare(&checkpoint_query)?;
-        let checkpoints = checkpoint_statement
-            .query_map([], |row| {
+        let checkpoints = {
+            let mut checkpoint_statement = transaction.prepare(&checkpoint_query)?;
+            let rows = checkpoint_statement.query_map([], |row| {
                 let committed_offset = row.get::<_, i64>(4)?;
                 let collector_epoch = row.get::<_, String>(6)?;
                 let cycle_seq = row.get::<_, String>(7)?;
@@ -3208,18 +3354,19 @@ impl UsageStore {
                         .parse()
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
                 })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
         for checkpoint in &checkpoints {
             validate_session_checkpoint(checkpoint)?;
         }
 
-        let mut totals_statement = self.connection.prepare(
-            "SELECT model, total_tokens, input_tokens, cached_input_tokens, output_tokens
-             FROM session_model_totals ORDER BY model",
-        )?;
-        let model_totals = totals_statement
-            .query_map([], |row| {
+        let model_totals = {
+            let mut totals_statement = transaction.prepare(
+                "SELECT model, total_tokens, input_tokens, cached_input_tokens, output_tokens
+                 FROM session_model_totals ORDER BY model",
+            )?;
+            let rows = totals_statement.query_map([], |row| {
                 Ok(SessionModelTotal {
                     model: row.get(0)?,
                     total_tokens: row
@@ -3239,15 +3386,43 @@ impl UsageStore {
                         .parse()
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
                 })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
         let model_totals = canonicalize_model_totals(&model_totals)?;
+        let last_quota_observation = transaction
+            .query_row(
+                "SELECT timestamp, remaining_percent
+                 FROM usage_history
+                 WHERE remaining_percent IS NOT NULL
+                 ORDER BY timestamp DESC, reset_at DESC
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok(SessionQuotaObservation {
+                        observed_at: row.get(0)?,
+                        remaining_percent: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?;
+        if last_quota_observation.as_ref().is_some_and(|observation| {
+            observation.observed_at <= 0
+                || !observation.remaining_percent.is_finite()
+                || !(0.0..=100.0).contains(&observation.remaining_percent)
+        }) {
+            return Err(UsageStoreError::InvalidImport(
+                "last quota observation is invalid".into(),
+            ));
+        }
+        transaction.commit()?;
         Ok(SessionCollectionState {
             data_generation,
             reset_at,
             window_seconds,
             collector_epoch,
             cycle_seq,
+            last_quota_observation,
             checkpoints,
             model_totals,
         })
@@ -4017,6 +4192,172 @@ impl UsageStore {
     /// Checks one exact source marker on the current connection.
     pub fn recorded_session_matches(&self, source: &RecordedSessionSource) -> Result<bool> {
         recorded_session_matches_in(&self.connection, source)
+    }
+
+    /// Adds one source-verified legacy component baseline to the current
+    /// absolute totals. The totals, one-shot marker, and data generation move
+    /// in the same transaction, so a crash or acknowledgement retry cannot
+    /// apply the baseline twice.
+    pub fn apply_history_continuity_model_totals(
+        &mut self,
+        recovery: &HistoryContinuityModelRecovery,
+    ) -> Result<u64> {
+        let recovered = canonicalize_model_totals(&recovery.model_totals)?;
+        let authority = &recovery.authority;
+        let recovered_tokens = |model: &str| {
+            recovered
+                .iter()
+                .find(|total| total.model == model)
+                .map(|total| total.total_tokens)
+                .unwrap_or(0)
+        };
+        if recovered_tokens("SOL") != authority.sol_tokens
+            || recovered_tokens("TERRA") != authority.terra_tokens
+            || recovered_tokens("LUNA") != authority.luna_tokens
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "legacy component recovery token totals mismatch".into(),
+            ));
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let continuity = load_history_continuity(&transaction)?.ok_or_else(|| {
+            UsageStoreError::InvalidImport("history continuity recovery is missing".into())
+        })?;
+        let durable_recovery = HistoryContinuityRecovery {
+            source_fingerprint: continuity.source_fingerprint.clone(),
+            source_rows: continuity.source_rows,
+            boundary_timestamp: continuity.boundary_timestamp,
+            reset_at: continuity.reset_at,
+            sol_dollars: continuity.sol_dollars,
+            terra_dollars: continuity.terra_dollars,
+            luna_dollars: continuity.luna_dollars,
+            sol_tokens: continuity.sol_tokens,
+            terra_tokens: continuity.terra_tokens,
+            luna_tokens: continuity.luna_tokens,
+        };
+        if &durable_recovery != authority {
+            return Err(UsageStoreError::InvalidImport(
+                "history continuity recovery authority changed".into(),
+            ));
+        }
+        let (generation, current_reset): (String, i64) = transaction.query_row(
+            "SELECT data_generation, reset_at
+             FROM collection_generation WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let generation = canonical_u64_text(&generation, "collection generation")?;
+        if continuity.model_totals_applied {
+            transaction.commit()?;
+            return Ok(generation);
+        }
+        if !authority.matches_reset_at(current_reset) {
+            return Err(UsageStoreError::InvalidImport(
+                "history continuity recovery period changed".into(),
+            ));
+        }
+
+        let current = {
+            let mut statement = transaction.prepare(
+                "SELECT model, total_tokens, input_tokens, cached_input_tokens, output_tokens
+                 FROM session_model_totals ORDER BY model",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let total_tokens = row.get::<_, String>(1)?;
+                let input_tokens = row.get::<_, String>(2)?;
+                let cached_input_tokens = row.get::<_, String>(3)?;
+                let output_tokens = row.get::<_, String>(4)?;
+                Ok(SessionModelTotal {
+                    model: row.get(0)?,
+                    total_tokens: total_tokens
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|value| value.to_string() == total_tokens)
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                    input_tokens: input_tokens
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|value| value.to_string() == input_tokens)
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                    cached_input_tokens: cached_input_tokens
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|value| value.to_string() == cached_input_tokens)
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                    output_tokens: output_tokens
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|value| value.to_string() == output_tokens)
+                        .ok_or(rusqlite::Error::InvalidQuery)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut combined = canonicalize_model_totals(&current)?
+            .into_iter()
+            .map(|total| (total.model.clone(), total))
+            .collect::<BTreeMap<_, _>>();
+        for offset in &recovered {
+            let total = combined
+                .entry(offset.model.clone())
+                .or_insert_with(|| SessionModelTotal {
+                    model: offset.model.clone(),
+                    total_tokens: 0,
+                    input_tokens: 0,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                });
+            total.total_tokens = total
+                .total_tokens
+                .checked_add(offset.total_tokens)
+                .ok_or(UsageStoreError::GenerationOverflow)?;
+            total.input_tokens = total
+                .input_tokens
+                .checked_add(offset.input_tokens)
+                .ok_or(UsageStoreError::GenerationOverflow)?;
+            total.cached_input_tokens = total
+                .cached_input_tokens
+                .checked_add(offset.cached_input_tokens)
+                .ok_or(UsageStoreError::GenerationOverflow)?;
+            total.output_tokens = total
+                .output_tokens
+                .checked_add(offset.output_tokens)
+                .ok_or(UsageStoreError::GenerationOverflow)?;
+        }
+        let combined = canonicalize_model_totals(&combined.into_values().collect::<Vec<_>>())?;
+        transaction.execute("DELETE FROM session_model_totals", [])?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO session_model_totals (
+                    model, total_tokens, input_tokens, cached_input_tokens, output_tokens
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for total in &combined {
+                statement.execute(params![
+                    &total.model,
+                    total.total_tokens.to_string(),
+                    total.input_tokens.to_string(),
+                    total.cached_input_tokens.to_string(),
+                    total.output_tokens.to_string(),
+                ])?;
+            }
+        }
+        transaction.execute(
+            "UPDATE history_continuity SET model_totals_applied=1 WHERE singleton=1",
+            [],
+        )?;
+        let next = generation
+            .checked_add(1)
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+        transaction.execute(
+            "UPDATE collection_generation SET data_generation=?1 WHERE singleton=1",
+            [next.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(next)
     }
 
     /// Removes only markers whose complete identity still matches.
@@ -4980,7 +5321,24 @@ mod tests {
         assert_eq!(state.data_generation, 1);
         assert_eq!(state.collector_epoch, Some(0x1234));
         assert_eq!(state.cycle_seq, 1);
+        assert_eq!(
+            state.last_quota_observation,
+            Some(SessionQuotaObservation {
+                observed_at: committed_sample.timestamp,
+                remaining_percent: 50.0,
+            })
+        );
         assert_eq!(state.checkpoints, vec![checkpoint]);
+        assert_eq!(
+            state.model_totals,
+            [SessionModelTotal {
+                model: "SOL".into(),
+                total_tokens: 20,
+                input_tokens: 12,
+                cached_input_tokens: 2,
+                output_tokens: 8,
+            }]
+        );
         assert_eq!(store.load_all().unwrap().len(), 1);
         let range_count: i64 = store
             .connection
@@ -7398,6 +7756,160 @@ mod wave_b_correction_tests {
         store.upsert_sample(&recent).unwrap();
         assert_eq!(count_rows(&path), 2);
         assert!(old_is_present(&path));
+        drop(store);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn history_component_recovery_is_atomic_idempotent_and_disables_sample_offset() {
+        let path = database_path("history-component-recovery");
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "f".repeat(64),
+            storage_epoch: 1,
+            partition_id: "f".repeat(64),
+        };
+        let reset_at = 1_800_604_800;
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let current = SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 100,
+            input_tokens: 80,
+            cached_input_tokens: 30,
+            output_tokens: 20,
+        };
+        assert_eq!(
+            store
+                .commit_session_collection(SessionCollectionCommit {
+                    reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch: 0x138,
+                    cycle_seq: 1,
+                    samples: &[],
+                    checkpoints: &[],
+                    ranges: &[],
+                    model_totals: std::slice::from_ref(&current),
+                    recorded_sessions: &[],
+                })
+                .unwrap(),
+            1
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO history_continuity (
+                    singleton, source_fingerprint, source_rows, boundary_timestamp,
+                    reset_at, remaining_percent, sol_dollars, terra_dollars,
+                    luna_dollars, sol_tokens, terra_tokens, luna_tokens,
+                    model_totals_applied
+                 ) VALUES (1, ?1, 2, ?2, ?3, 50.0, 8.65, 0.0, 0.0,
+                           '1000000', '0', '0', 0)",
+                params!["aaaaaaaaaaaaaaaa", 1_800_000_120_i64, reset_at],
+            )
+            .unwrap();
+        let authority = store
+            .pending_history_continuity_recovery()
+            .unwrap()
+            .unwrap();
+        let offset = SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 1_000_000,
+            input_tokens: 800_000,
+            cached_input_tokens: 300_000,
+            output_tokens: 200_000,
+        };
+
+        let wrong = HistoryContinuityModelRecovery {
+            authority: authority.clone(),
+            model_totals: vec![SessionModelTotal {
+                total_tokens: 999_999,
+                ..offset.clone()
+            }],
+            fallback_samples: Vec::new(),
+            fallback_model_totals: Vec::new(),
+        };
+        assert!(store.apply_history_continuity_model_totals(&wrong).is_err());
+        assert_eq!(
+            store
+                .load_session_collection_state()
+                .unwrap()
+                .data_generation,
+            1
+        );
+        assert!(store
+            .pending_history_continuity_recovery()
+            .unwrap()
+            .is_some());
+
+        let recovery = HistoryContinuityModelRecovery {
+            authority,
+            model_totals: vec![offset],
+            fallback_samples: Vec::new(),
+            fallback_model_totals: Vec::new(),
+        };
+        assert_eq!(
+            store
+                .apply_history_continuity_model_totals(&recovery)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store.load_session_collection_state().unwrap().model_totals,
+            vec![SessionModelTotal {
+                model: "SOL".into(),
+                total_tokens: 1_000_100,
+                input_tokens: 800_080,
+                cached_input_tokens: 300_030,
+                output_tokens: 200_020,
+            }]
+        );
+        assert!(store
+            .pending_history_continuity_recovery()
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .apply_history_continuity_model_totals(&recovery)
+                .unwrap(),
+            2
+        );
+
+        let combined_sample = UsageHistorySample {
+            timestamp: 1_800_000_180,
+            reset_at,
+            remaining_percent: Some(49.0),
+            sol_dollars: 8.651,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 1_000_100,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        assert_eq!(
+            store
+                .commit_session_collection_with_samples(SessionCollectionCommit {
+                    reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch: 0x138,
+                    cycle_seq: 2,
+                    samples: std::slice::from_ref(&combined_sample),
+                    checkpoints: &[],
+                    ranges: &[],
+                    model_totals: &[SessionModelTotal {
+                        model: "SOL".into(),
+                        total_tokens: 1_000_100,
+                        input_tokens: 800_080,
+                        cached_input_tokens: 300_030,
+                        output_tokens: 200_020,
+                    }],
+                    recorded_sessions: &[],
+                })
+                .unwrap()
+                .data_generation,
+            3
+        );
+        assert_eq!(store.load_all().unwrap(), vec![combined_sample]);
         drop(store);
         cleanup(&path);
     }

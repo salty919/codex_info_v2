@@ -11,8 +11,9 @@
 use crate::account_scope::{self, AccountPartition};
 use crate::security;
 use crate::usage_store::{
-    RecordedSessionSource, RecorderGap, SessionCheckpoint, SessionCollectionCommit,
-    SessionModelTotal, SessionRange, StoragePartitionIdentity, UsageHistorySample, UsageStore,
+    HistoryContinuityModelRecovery, RecordedSessionSource, RecorderGap, SessionCheckpoint,
+    SessionCollectionCommit, SessionModelTotal, SessionRange, StoragePartitionIdentity,
+    UsageHistorySample, UsageStore,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1265,6 +1266,7 @@ pub(crate) struct RecorderGeneration {
     pub(crate) session_checkpoints: Vec<SessionCheckpoint>,
     pub(crate) session_ranges: Vec<SessionRange>,
     pub(crate) session_model_totals: Vec<SessionModelTotal>,
+    pub(crate) history_continuity_recovery: Option<HistoryContinuityModelRecovery>,
     pub(crate) bounded_source_rescan_complete: bool,
 }
 
@@ -1298,6 +1300,7 @@ pub(crate) struct RecorderCommitAck {
     pub(crate) cycle_seq: u64,
     pub(crate) last_commit_unix: i64,
     pub(crate) canonical_samples: Vec<UsageHistorySample>,
+    pub(crate) fallback_model_totals: Option<Vec<SessionModelTotal>>,
     pub(crate) legacy_history_bridged: bool,
 }
 
@@ -1685,6 +1688,7 @@ impl RecorderWorker {
                                 session_checkpoints,
                                 session_ranges,
                                 session_model_totals,
+                                history_continuity_recovery,
                                 bounded_source_rescan_complete,
                             } = generation;
                             if std::env::var("CODEX_INFO_RECORDER_FAILURE")
@@ -1722,16 +1726,37 @@ impl RecorderWorker {
                                         let legacy =
                                             legacy_database_for_partition(&current.partition);
                                         let store = &mut current.store;
+                                        let mut commit_samples = samples.as_slice();
+                                        let mut commit_model_totals =
+                                            session_model_totals.as_slice();
+                                        let mut fallback_was_used = false;
+                                        if let Some(recovery) = history_continuity_recovery.as_ref() {
+                                            if let Err(error) = store
+                                                .apply_history_continuity_model_totals(recovery)
+                                            {
+                                                // Recovery is optional; ordinary recording is
+                                                // not. The producer supplied the exact same
+                                                // generation before adding the recovery offset,
+                                                // so no inferred subtraction is needed here.
+                                                eprintln!(
+                                                    "codex-info: continuity recovery deferred; committing ordinary generation: {error}"
+                                                );
+                                                commit_samples = &recovery.fallback_samples;
+                                                commit_model_totals =
+                                                    &recovery.fallback_model_totals;
+                                                fallback_was_used = true;
+                                            }
+                                        }
                                         let commit_result = store
                                             .commit_session_collection_with_samples(SessionCollectionCommit {
                                                 reset_at,
                                                 window_seconds,
                                                 collector_epoch,
                                                 cycle_seq,
-                                                samples: &samples,
+                                                samples: commit_samples,
                                                 checkpoints: &session_checkpoints,
                                                 ranges: &session_ranges,
-                                                model_totals: &session_model_totals,
+                                                model_totals: commit_model_totals,
                                                 recorded_sessions: &recorded_sessions,
                                             })
                                             .map_err(|error| error.to_string())?;
@@ -1826,6 +1851,8 @@ impl RecorderWorker {
                                             cycle_seq,
                                             last_commit_unix: unix_now().max(1),
                                             canonical_samples,
+                                            fallback_model_totals: fallback_was_used
+                                                .then(|| commit_model_totals.to_vec()),
                                             legacy_history_bridged,
                                         })
                                     })
@@ -2496,6 +2523,7 @@ mod tests {
                         cached_input_tokens: 2_000,
                         output_tokens: 2_345,
                     }],
+                    history_continuity_recovery: None,
                     bounded_source_rescan_complete: true,
                 },
             )
@@ -2528,6 +2556,85 @@ mod tests {
         );
         assert!(lock.exists());
 
+        // A rejected optional continuity recovery must not block the exact
+        // ordinary generation carried beside it. This fixture intentionally
+        // supplies no durable continuity row, so applying the offset fails.
+        let fallback_sample = crate::usage_store::UsageHistorySample {
+            timestamp: now + 120,
+            reset_at,
+            remaining_percent: Some(40.0),
+            sol_dollars: 324.0,
+            terra_dollars: 2.5,
+            luna_dollars: 1.25,
+            sol_tokens: 13_000,
+            terra_tokens: 6_789,
+            luna_tokens: 321,
+        };
+        let fallback_totals = vec![crate::usage_store::SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 13_000,
+            input_tokens: 10_500,
+            cached_input_tokens: 2_100,
+            output_tokens: 2_500,
+        }];
+        let mut recovered_sample = fallback_sample.clone();
+        recovered_sample.sol_tokens = 14_000;
+        recovered_sample.sol_dollars = 332.65;
+        let fallback_ack = writer
+            .store_generation(
+                partition.partition_id.clone(),
+                RecorderGeneration {
+                    reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch: 1,
+                    cycle_seq: 2,
+                    samples: vec![recovered_sample],
+                    recorded_sessions: Vec::new(),
+                    session_checkpoints: Vec::new(),
+                    session_ranges: Vec::new(),
+                    session_model_totals: vec![crate::usage_store::SessionModelTotal {
+                        model: "SOL".into(),
+                        total_tokens: 14_000,
+                        input_tokens: 11_300,
+                        cached_input_tokens: 2_400,
+                        output_tokens: 2_700,
+                    }],
+                    history_continuity_recovery: Some(
+                        crate::usage_store::HistoryContinuityModelRecovery {
+                            authority: crate::usage_store::HistoryContinuityRecovery {
+                                source_fingerprint: "aa".repeat(8),
+                                source_rows: 1,
+                                boundary_timestamp: now,
+                                reset_at,
+                                sol_dollars: 8.65,
+                                terra_dollars: 0.0,
+                                luna_dollars: 0.0,
+                                sol_tokens: 1_000,
+                                terra_tokens: 0,
+                                luna_tokens: 0,
+                            },
+                            model_totals: vec![crate::usage_store::SessionModelTotal {
+                                model: "SOL".into(),
+                                total_tokens: 1_000,
+                                input_tokens: 800,
+                                cached_input_tokens: 300,
+                                output_tokens: 200,
+                            }],
+                            fallback_samples: vec![fallback_sample.clone()],
+                            fallback_model_totals: fallback_totals.clone(),
+                        },
+                    ),
+                    bounded_source_rescan_complete: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(fallback_ack.fallback_model_totals, Some(fallback_totals));
+        assert!(UsageStore::open_read_only_partitioned(&database, &identity)
+            .unwrap()
+            .load_all()
+            .unwrap()
+            .contains(&fallback_sample));
+
         let account_b = crate::account_scope::AccountKey::synthetic_preview("daemon-account-b");
         let partition_b = crate::account_scope::resolve_partition(&data_dir, &account_b).unwrap();
         writer
@@ -2548,6 +2655,7 @@ mod tests {
                     session_checkpoints: Vec::new(),
                     session_ranges: Vec::new(),
                     session_model_totals: Vec::new(),
+                    history_continuity_recovery: None,
                     bounded_source_rescan_complete: false,
                 },
             )
@@ -2674,6 +2782,7 @@ mod tests {
                     session_checkpoints: Vec::new(),
                     session_ranges: Vec::new(),
                     session_model_totals: Vec::new(),
+                    history_continuity_recovery: None,
                     bounded_source_rescan_complete: true,
                 },
             )
@@ -2735,6 +2844,7 @@ mod tests {
                     session_checkpoints: Vec::new(),
                     session_ranges: Vec::new(),
                     session_model_totals: Vec::new(),
+                    history_continuity_recovery: None,
                     bounded_source_rescan_complete: true,
                 },
             )
@@ -2824,6 +2934,7 @@ mod tests {
             session_checkpoints: Vec::new(),
             session_ranges: Vec::new(),
             session_model_totals: Vec::new(),
+            history_continuity_recovery: None,
             bounded_source_rescan_complete: false,
         };
 
@@ -2869,6 +2980,7 @@ mod tests {
                 session_checkpoints: Vec::new(),
                 session_ranges: Vec::new(),
                 session_model_totals: Vec::new(),
+                history_continuity_recovery: None,
                 bounded_source_rescan_complete: false,
             };
             let mut writer = RecorderWorker::start().unwrap();
