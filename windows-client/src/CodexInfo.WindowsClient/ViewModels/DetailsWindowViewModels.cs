@@ -28,8 +28,12 @@ public sealed class GraphPointViewModel
         foreach (var model in sample.Models)
         {
             var value = metric == GraphMetric.Dollars
-                ? model.Dollars
-                : model.InputTokens + model.CachedInputTokens + model.OutputTokens;
+                ? model.Dollars ?? double.NaN
+                : model.InputTokens is ulong inputTokens &&
+                  model.CachedInputTokens is ulong cachedInputTokens &&
+                  model.OutputTokens is ulong outputTokens
+                    ? inputTokens + cachedInputTokens + outputTokens
+                    : double.NaN;
             switch (model.Name)
             {
                 case "SOL":
@@ -64,10 +68,17 @@ public sealed class GraphPointViewModel
     public string ModelsText => metric == GraphMetric.Dollars
         ? string.Create(
             CultureInfo.CurrentCulture,
-            $"SOL ${SolValue:N2} / TERRA ${TerraValue:N2} / LUNA ${LunaValue:N2}")
+            $"SOL {FormatModelValue(SolValue, dollars: true)} / TERRA {FormatModelValue(TerraValue, dollars: true)} / LUNA {FormatModelValue(LunaValue, dollars: true)}")
         : string.Create(
             CultureInfo.CurrentCulture,
-            $"SOL {SolValue:N0} / TERRA {TerraValue:N0} / LUNA {LunaValue:N0}");
+            $"SOL {FormatModelValue(SolValue, dollars: false)} / TERRA {FormatModelValue(TerraValue, dollars: false)} / LUNA {FormatModelValue(LunaValue, dollars: false)}");
+
+    private static string FormatModelValue(double value, bool dollars) =>
+        double.IsFinite(value)
+            ? dollars
+                ? string.Create(CultureInfo.CurrentCulture, $"${value:N2}")
+                : value.ToString("N0", CultureInfo.CurrentCulture)
+            : "—";
 }
 
 public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
@@ -231,7 +242,9 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
         result.AddRange(normalized);
         var last = result[^1];
-        if (last.Timestamp < end && end - last.Timestamp <= 60)
+        if (last.Timestamp < end &&
+            end - last.Timestamp <= 60 &&
+            last.ModelSource != ApiHistorySample.UnavailableModelSource)
         {
             // A recent local cumulative observation may be held only until
             // the next normal collection boundary.  The quota field is not
@@ -246,7 +259,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     internal static IReadOnlyList<ApiHistorySample> ReduceGraphSamples(
         IReadOnlyList<ApiHistorySample> samples,
-        int maximum = MaxRenderedGraphPoints)
+        int maximum = MaxRenderedGraphPoints,
+        IReadOnlyList<GraphConfirmedGap>? confirmedGaps = null)
     {
         if (maximum < 2)
         {
@@ -257,17 +271,105 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             return samples;
         }
 
+        var mandatory = new SortedSet<int> { 0, samples.Count - 1 };
+        CompleteModelVector? lastReliableConfirmedVector = null;
+        var inUnreliableInterval = false;
+        var hasPreviousCompleteVector = false;
+        var previousVector = default(CompleteModelVector);
+        for (var index = 0; index < samples.Count; index++)
+        {
+            var current = samples[index];
+            var currentHasCompleteVector = TryGetCompleteModelVector(current, out var currentVector);
+            var currentIsConfirmed = current.ModelSource == ApiHistorySample.ConfirmedModelSource;
+            if (index == 0)
+            {
+                if (currentIsConfirmed && currentHasCompleteVector)
+                {
+                    lastReliableConfirmedVector = currentVector;
+                    inUnreliableInterval = false;
+                }
+                else
+                {
+                    inUnreliableInterval = true;
+                }
+
+                hasPreviousCompleteVector = currentHasCompleteVector;
+                previousVector = currentVector;
+                continue;
+            }
+
+            var previous = samples[index - 1];
+            var sourceTransition = previous.ModelSource != current.ModelSource;
+            var quotaTransition = (previous.RemainingPercent is null) != (current.RemainingPercent is null);
+            var timestampGap = current.Timestamp - previous.Timestamp > 60;
+            var modelRegression = hasPreviousCompleteVector && currentHasCompleteVector &&
+                currentVector.IsLowerThan(previousVector);
+            var modelRecovery = inUnreliableInterval && currentIsConfirmed && currentHasCompleteVector &&
+                (lastReliableConfirmedVector is null || currentVector.IsAtLeast(lastReliableConfirmedVector.Value));
+            var quotaDrop = current.RemainingPercent is { } currentRemaining &&
+                previous.RemainingPercent is { } previousRemaining &&
+                currentRemaining < previousRemaining &&
+                !IsAttributableModelIncrement(previous, current);
+            if (sourceTransition || quotaTransition || timestampGap || modelRegression || modelRecovery || quotaDrop)
+            {
+                mandatory.Add(index - 1);
+                mandatory.Add(index);
+            }
+
+            if (modelRecovery)
+            {
+                lastReliableConfirmedVector = currentVector;
+                inUnreliableInterval = false;
+            }
+            else if (currentIsConfirmed && currentHasCompleteVector &&
+                     !inUnreliableInterval && !modelRegression)
+            {
+                lastReliableConfirmedVector = currentVector;
+            }
+            else if (!currentIsConfirmed || !currentHasCompleteVector || modelRegression)
+            {
+                inUnreliableInterval = true;
+            }
+
+            hasPreviousCompleteVector = currentHasCompleteVector;
+            previousVector = currentVector;
+        }
+
+        if (confirmedGaps is not null)
+        {
+            foreach (var gap in confirmedGaps)
+            {
+                AddNearestBoundary(mandatory, samples, gap.StartAt, preferPrevious: true);
+                AddNearestBoundary(mandatory, samples, gap.EndAt, preferPrevious: false);
+            }
+        }
+
         // All graph series are cumulative and therefore monotonic. Keep both
         // edges of each display bucket so a short change is not lost or moved
         // to a later bucket, while bounding paint work by viewport resolution.
-        var selected = new SortedSet<int> { 0, samples.Count - 1 };
+        var selected = new SortedSet<int>(mandatory);
+        if (mandatory.Count > maximum)
+        {
+            // The viewport maximum is a soft cap when correctness-critical
+            // boundaries outnumber it.  The details endpoint bounds the
+            // source history at 44,640 rows, so preserving every mandatory
+            // boundary remains finite without silently creating a bridge.
+            return mandatory.Select(index => samples[index]).ToArray();
+        }
+
         var bucketCount = Math.Max(1, maximum / 2);
         for (var bucket = 0; bucket < bucketCount; bucket++)
         {
             var start = (int)((long)bucket * samples.Count / bucketCount);
             var endExclusive = (int)((long)(bucket + 1) * samples.Count / bucketCount);
-            selected.Add(start);
-            selected.Add(Math.Max(start, endExclusive - 1));
+            if (selected.Count < maximum)
+            {
+                selected.Add(start);
+            }
+            if (selected.Count < maximum)
+            {
+                selected.Add(Math.Max(start, endExclusive - 1));
+            }
         }
         // Odd/small caller-supplied maxima can leave one slot. Fill it with a
         // uniformly located sample without disturbing the bucket edges.
@@ -277,7 +379,146 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 slot * (samples.Count - 1d) / (maximum - 1d),
                 MidpointRounding.AwayFromZero));
         }
+        if (!selected.Contains(samples.Count - 1))
+        {
+            selected.Remove(selected.Max);
+            selected.Add(samples.Count - 1);
+        }
         return selected.Take(maximum).Select(index => samples[index]).ToArray();
+    }
+
+    private static bool TryGetCompleteModelVector(
+        ApiHistorySample sample,
+        out CompleteModelVector vector)
+    {
+        if (sample.SolDollars is not { } solDollars || !double.IsFinite(solDollars) ||
+            sample.TerraDollars is not { } terraDollars || !double.IsFinite(terraDollars) ||
+            sample.LunaDollars is not { } lunaDollars || !double.IsFinite(lunaDollars) ||
+            sample.SolTokens is not { } solTokens ||
+            sample.TerraTokens is not { } terraTokens ||
+            sample.LunaTokens is not { } lunaTokens)
+        {
+            vector = default;
+            return false;
+        }
+
+        vector = new CompleteModelVector(
+            solDollars,
+            terraDollars,
+            lunaDollars,
+            solTokens,
+            terraTokens,
+            lunaTokens);
+        return true;
+    }
+
+    private static bool HasCompleteModelVector(ApiHistorySample sample) =>
+        TryGetCompleteModelVector(sample, out _);
+
+    private readonly record struct CompleteModelVector(
+        double SolDollars,
+        double TerraDollars,
+        double LunaDollars,
+        ulong SolTokens,
+        ulong TerraTokens,
+        ulong LunaTokens)
+    {
+        public bool IsLowerThan(CompleteModelVector other) =>
+            SolDollars < other.SolDollars ||
+            TerraDollars < other.TerraDollars ||
+            LunaDollars < other.LunaDollars ||
+            SolTokens < other.SolTokens ||
+            TerraTokens < other.TerraTokens ||
+            LunaTokens < other.LunaTokens;
+
+        public bool IsAtLeast(CompleteModelVector other) =>
+            SolDollars >= other.SolDollars &&
+            TerraDollars >= other.TerraDollars &&
+            LunaDollars >= other.LunaDollars &&
+            SolTokens >= other.SolTokens &&
+            TerraTokens >= other.TerraTokens &&
+            LunaTokens >= other.LunaTokens;
+    }
+
+    private static bool IsAttributableModelIncrement(
+        ApiHistorySample previous,
+        ApiHistorySample current) =>
+        current.ModelSource == ApiHistorySample.ConfirmedModelSource &&
+        previous.ModelSource == ApiHistorySample.ConfirmedModelSource &&
+        HasCompleteModelVector(previous) &&
+        HasCompleteModelVector(current) &&
+        current.SolDollars >= previous.SolDollars &&
+        current.TerraDollars >= previous.TerraDollars &&
+        current.LunaDollars >= previous.LunaDollars &&
+        current.SolTokens >= previous.SolTokens &&
+        current.TerraTokens >= previous.TerraTokens &&
+        current.LunaTokens >= previous.LunaTokens &&
+        (current.SolDollars > previous.SolDollars ||
+         current.TerraDollars > previous.TerraDollars ||
+         current.LunaDollars > previous.LunaDollars ||
+         current.SolTokens > previous.SolTokens ||
+         current.TerraTokens > previous.TerraTokens ||
+         current.LunaTokens > previous.LunaTokens);
+
+    private static void AddNearestBoundary(
+        SortedSet<int> selected,
+        IReadOnlyList<ApiHistorySample> samples,
+        long boundary,
+        bool preferPrevious)
+    {
+        if (samples.Count == 0)
+        {
+            return;
+        }
+
+        var index = preferPrevious
+            ? FindLastAtOrBefore(samples, boundary)
+            : FindFirstAtOrAfter(samples, boundary);
+        selected.Add(index);
+    }
+
+    private static int FindLastAtOrBefore(IReadOnlyList<ApiHistorySample> samples, long boundary)
+    {
+        var low = 0;
+        var high = samples.Count - 1;
+        var result = 0;
+        while (low <= high)
+        {
+            var middle = low + (high - low) / 2;
+            if (samples[middle].Timestamp <= boundary)
+            {
+                result = middle;
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle - 1;
+            }
+        }
+
+        return result;
+    }
+
+    private static int FindFirstAtOrAfter(IReadOnlyList<ApiHistorySample> samples, long boundary)
+    {
+        var low = 0;
+        var high = samples.Count - 1;
+        var result = samples.Count - 1;
+        while (low <= high)
+        {
+            var middle = low + (high - low) / 2;
+            if (samples[middle].Timestamp >= boundary)
+            {
+                result = middle;
+                high = middle - 1;
+            }
+            else
+            {
+                low = middle + 1;
+            }
+        }
+
+        return result;
     }
 
     public string DetailsStatusText => main.DetailsStatusText;
@@ -492,7 +733,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         IReadOnlyList<GraphConfirmedGap> confirmedGaps)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var samples = ReduceGraphSamples(BuildGraphSamples(period, now));
+        var samples = ReduceGraphSamples(BuildGraphSamples(period, now), MaxRenderedGraphPoints, confirmedGaps);
         return new GraphProjection(
             samples.Select(sample => new GraphPointViewModel(sample, metric)).ToArray(),
             GraphScene.Create(

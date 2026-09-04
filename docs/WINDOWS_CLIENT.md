@@ -98,7 +98,7 @@ Windows OpenSSH の設定ファイルは `%USERPROFILE%\.ssh\config` を参照�
 literal `Host` aliasだけとする。
 
 1. `connectionProfile`と`connectionSelector`を選択する。profileは`none|wsl|sshConfigAlias`、WSL selectorはinstalled distribution exact token、SSH selectorはliteral Host alias（`^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$`）。
-2. server/API prepare→listener→`GET /v1/health`でservice readinessを確認し、`GET /v1/details`から最初の完全な表示世代を取得する。
+2. server/API prepare→listener→`GET /v1/health`でservice readinessを確認し、`GET /v2/details`から最初の完全な表示世代を取得する。旧serviceがexact 404を返す場合だけ`GET /v1/details`へfallbackする。
 3. 必要な場合だけauth-startを明示し、auth-start成功をreadyとしない。
 4. 別のauth-checkでlater details generationを取得し、wireの`ready` booleanは使わず、`state=ready AND authenticated=true`の導出条件だけでMainへ進む（ready wire boolean field=0）。
 5. `language/setupCompleted/connectionConfigured/timeZoneId/connectionProfile/connectionSelector`の6-key objectをflush・validate後atomic replaceする。
@@ -116,8 +116,8 @@ automatic recovery command count=0とする。保存selectorが有効なら次�
 ## 通信境界
 
 クライアントがHTTPで読む接続先は編集不可の
-service readiness用`http://127.0.0.1:8787/v1/health`と、唯一のruntime data用
-`http://127.0.0.1:8787/v1/details`だけである。
+service readiness用`http://127.0.0.1:8787/v1/health`と、runtime data用
+`http://127.0.0.1:8787/v2/details`、旧serviceの404時だけ使う`http://127.0.0.1:8787/v1/details`である。
 Linux の実アドレス、LAN アドレス、ホスト名、インターネット URL をHTTP endpointとして
 入力・保存しない。SSH転送開始に必要なraw Linux host/IPまたはraw userはone-session raw recoveryとして
 メモリ上だけで扱い、settings、shortcut、ログへ保存しない。durableに保存するのはprofileと、WSL installed
@@ -136,7 +136,7 @@ Linux / WSL -- 127.0.0.1:8787 --> Codex Info native UI + REST v1
 自動Remoteは`BatchMode=yes`、hidden prompt=0、shell/cmd/PowerShell=0とする。
 認証開始ボタンは、WSL profileではinstalled distribution tokenを含む`wsl.exe` ArgumentList、remote SSH
 profileではliteral Host aliasを含む`ssh.exe` ArgumentListを一回だけ起動する。どちらも認証情報を受け取らず、
-開始直後を認証完了とは扱わない。「認証を確認」で同じprofileのlater `/v1/details` generationを取得し、
+開始直後を認証完了とは扱わない。「認証を確認」で同じprofileのlater details generationをv2優先・404時だけv1 fallbackで取得し、
 `state=ready`かつ`authenticated=true`になった場合だけ完了し、ready wire boolean field=0とする。未登録/変更host keyのautomatic routeは
 connectedにせず、明示CTAの一回のOpenSSH-owned interactiveだけを許可する。
 
@@ -188,15 +188,16 @@ StatusBannerへ現れる別操作であり、利用者が押すまでdownloadも
 `plan_label` が `null` のときは「プラン: 未取得」、`quota` が `null` のときは
 「残り利用枠: 未取得」、モデル配列が空のときは「モデル利用: 未取得」と表示する。
 
-## REST v1 の受理契約
+## REST details の受理契約
 
-クライアントは [REST API v1](REST_API_V1.md) の `GET /v1/health`をservice readinessだけに使い、
-実装では、現行REST v1仕様に従い、履歴・Threads・ドル内訳を含む `GET /v1/details`を受け取る。
+クライアントは[REST API](REST_API_V1.md)の`GET /v1/health`をservice readinessだけに使い、
+履歴・Threads・ドル内訳・model-source provenanceを含む`GET /v2/details`一応答をruntime dataとして受理する。
+exact 404の場合だけ`GET /v1/details`一応答へfallbackし、v1/v2の値をmergeしない。
 `Content-Type` は `application/json`、response headerは8 KiB以下とする。本文はtransfer後・
-decode前で、`/v1/details`は33,554,432 bytes以下とする。
+decode前で、各details responseは33,554,432 bytes以下とする。
 `Content-Length` が各上限を超える場合は本文を読まず、chunkedまたは不明長の本文は読み取り
 途中で各上限を超えた時点で停止する。自動解凍は無効なので`Content-Encoding`付き応答を
-解凍して受理しない。SQLiteは過去3暦月を保持するが、`/v1/details`の1回の取得は最長1暦月である。
+解凍して受理しない。SQLiteは過去3暦月を保持するが、一つのdetails取得は最長1暦月である。
 本文上限とは別にhistory periods 128件、history samples 44,640件、threads 256件、models 3件を
 上限とし、どれか一つでも超えたcandidate全体を拒否する。
 

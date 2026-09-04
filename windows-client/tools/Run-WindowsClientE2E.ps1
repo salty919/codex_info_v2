@@ -2061,7 +2061,7 @@ function Assert-E2EFixtureWireContract {
     Assert-E2EFixtureJsonKeys -Json $healthJson -Expected @('api_version', 'service', 'product_version') -Endpoint 'Fixture health'
     Assert-E2E ([string]$healthJson.api_version -ceq 'v1') "Fixture health api_version is invalid."
     Assert-E2E ([string]$healthJson.service -ceq 'codex-info') "Fixture health service is invalid."
-    Assert-E2E ([string]$healthJson.product_version -ceq $script:e2eProductVersion) "Fixture health product_version does not match the client."
+    Assert-E2E ([string]$healthJson.product_version -cmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') "Fixture health product_version is malformed."
     $detailsPair = [string]$detailsPairs[0]
     Assert-E2E ($detailsPair -cmatch '^v1:[0-9a-f]{64}$') "Fixture details published pair is not canonical lowercase v1/sha256: '$detailsPair'."
     try {
@@ -2507,7 +2507,8 @@ function Invoke-E2EFixtureContractTests {
     $legacyHealth = New-E2EContractTestResponse -StatusCode 200 -Body '{"api_version":"v1","service":"codex-info"}' -Headers ([ordered]@{})
     Assert-E2EExpectedContractFailure -Name 'health-version-missing' -Health $legacyHealth -Details $details
     $mismatchedHealth = New-E2EContractTestResponse -StatusCode 200 -Body '{"api_version":"v1","service":"codex-info","product_version":"0.0.0"}' -Headers ([ordered]@{})
-    Assert-E2EExpectedContractFailure -Name 'health-version-mismatch' -Health $mismatchedHealth -Details $details
+    Assert-E2EFixturePreflightResponses -Health $mismatchedHealth -Details $details | Out-Null
+    Write-E2E 'fixture-contract: PASS health-version-mismatch-is-diagnostic'
 
     $missingPairDetails = New-E2EContractTestResponse -StatusCode 200 -Body $documents.Details -Headers ([ordered]@{})
     Assert-E2EExpectedContractFailure -Name 'pair-missing' -Health $health -Details $missingPairDetails

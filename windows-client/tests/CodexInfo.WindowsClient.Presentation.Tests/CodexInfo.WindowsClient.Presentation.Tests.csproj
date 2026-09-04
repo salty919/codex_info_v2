@@ -25,5 +25,8 @@
     <None Include="../../../tests/fixtures/graph_weekly_reset_rollover.json"
           Link="Fixtures/graph_weekly_reset_rollover.json"
           CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../../tests/fixtures/graph_cumulative_correction.json"
+          Link="Fixtures/graph_cumulative_correction.json"
+          CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
