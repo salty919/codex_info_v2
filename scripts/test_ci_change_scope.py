@@ -15,6 +15,7 @@ if __package__:
         ScopeError,
         owners_for_path,
         paths_from_name_status,
+        quality_profile_from_document,
         selection_for_paths,
         selection_from_name_status,
     )
@@ -23,6 +24,7 @@ else:
         ScopeError,
         owners_for_path,
         paths_from_name_status,
+        quality_profile_from_document,
         selection_for_paths,
         selection_from_name_status,
     )
@@ -78,7 +80,7 @@ class DiffParserTests(unittest.TestCase):
             b"R100\0src/old.rs\0docs/new.md\0"
             b"C75\0ui/old.slint\0windows-client/src/CodexInfo.WindowsClient/New.cs\0"
         )
-        result = selection_from_name_status(raw)
+        result = selection_from_name_status(raw, release_candidate=True)
         self.assertEqual(
             result.owners,
             ("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"),
@@ -104,6 +106,8 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(result.owners, ("DOCS",))
         self.assertEqual(result.codeql_languages, ())
         self.assertFalse(result.binary_impact)
+        self.assertFalse(result.distribution_required)
+        self.assertEqual(result.quality_profile, "authority-only")
 
         release_result = selection_for_paths(
             ["README.md"], release_candidate=True
@@ -111,11 +115,53 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(release_result.owners, ("DOCS",))
         self.assertEqual(release_result.codeql_languages, ())
         self.assertFalse(release_result.binary_impact)
+        self.assertFalse(release_result.distribution_required)
+        self.assertEqual(release_result.quality_profile, "release")
 
-    def test_default_linux_selection_does_not_select_windows(self) -> None:
-        result = selection_for_paths(["src/server.rs"])
-        self.assertEqual(result.owners, ("LINUX_BACKEND",))
-        self.assertEqual(result.codeql_languages, ("rust",))
+    def test_feat_product_change_without_finite_profile_stops(self) -> None:
+        with self.assertRaisesRegex(ScopeError, "requires one finite Quality-Profile"):
+            selection_for_paths(["src/server.rs"])
+
+    def test_history_graph_profile_is_finite_and_skips_distribution(self) -> None:
+        result = selection_for_paths(
+            [
+                "docs/REST_API_V1.md",
+                "src/main.rs",
+                "src/usage_store.rs",
+                "tests/fixtures/graph_delayed_quota.json",
+                "windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs",
+                "windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs",
+                "windows-client/src/CodexInfo.WindowsClient/Graphing/GraphScene.cs",
+                "windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs",
+                "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/DetailsWindowViewModelTests.cs",
+                "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs",
+                "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/WindowDragGeometryTests.cs",
+            ],
+            quality_profile="history-graph",
+        )
+        self.assertEqual(
+            result.owners, ("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS")
+        )
+        self.assertEqual(result.codeql_languages, ("csharp", "rust"))
+        self.assertTrue(result.binary_impact)
+        self.assertFalse(result.distribution_required)
+        self.assertEqual(result.quality_profile, "history-graph")
+
+    def test_history_graph_profile_rejects_paths_outside_issue138_manifest(self) -> None:
+        for path in (
+            "docs/DATA_PROTECTION_POLICY.md",
+            "docs/PRODUCT_REQUIREMENTS.md",
+            "docs/REQUIREMENTS_LEDGER.md",
+            "docs/WINDOWS_UX_SPEC.md",
+            "tests/fixtures/graph_cumulative_correction.json",
+            "tests/fixtures/graph_weekly_reset_rollover.json",
+            "src/server.rs",
+        ):
+            with self.subTest(path=path), self.assertRaises(ScopeError):
+                selection_for_paths(
+                    ["src/main.rs", path],
+                    quality_profile="history-graph",
+                )
 
     def test_release_candidate_linux_selection_adds_windows_without_unchanged_csharp(self) -> None:
         result = selection_for_paths(
@@ -124,30 +170,31 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(result.owners, ("LINUX_BACKEND", "WINDOWS"))
         self.assertEqual(result.codeql_languages, ("rust",))
         self.assertTrue(result.binary_impact)
+        self.assertTrue(result.distribution_required)
+        self.assertEqual(result.quality_profile, "release")
 
     def test_codeql_languages_come_from_changed_source_not_owner_label(self) -> None:
-        workflow = selection_for_paths([".github/workflows/codeql.yml"])
-        python = selection_for_paths(["scripts/product_version.py"])
-        shell = selection_for_paths(["scripts/pre_pr_gate.sh"])
+        workflow = selection_for_paths(
+            [".github/workflows/feat-integration.yml"],
+            quality_profile="workflow-selection",
+        )
+        python = selection_for_paths(
+            ["scripts/ci_change_scope.py"],
+            quality_profile="workflow-selection",
+        )
+        shell = selection_for_paths(
+            ["scripts/pre_pr_gate.sh"],
+            quality_profile="workflow-selection",
+        )
         self.assertEqual(workflow.codeql_languages, ("actions",))
         self.assertEqual(python.codeql_languages, ("python",))
         self.assertEqual(shell.codeql_languages, ())
 
-    def test_mixed_selection_is_deduplicated(self) -> None:
-        result = selection_for_paths(
-            [
-                "README.md",
-                "src/server.rs",
-                "ui/app.slint",
-                "windows-client/src/CodexInfo.WindowsClient/App.axaml.cs",
-            ]
-        )
-        self.assertEqual(
-            result.owners,
-            ("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"),
-        )
-        self.assertEqual(result.codeql_languages, ("csharp", "rust"))
-        self.assertTrue(result.binary_impact)
+    def test_profile_on_non_product_diff_is_rejected_as_over_quality(self) -> None:
+        with self.assertRaisesRegex(ScopeError, "unnecessary"):
+            selection_for_paths(
+                ["README.md"], quality_profile="history-graph"
+            )
 
     def test_release_candidate_mixed_selection_is_deterministic(self) -> None:
         paths = ["ui/app.slint", "README.md", "src/server.rs"]
@@ -161,6 +208,8 @@ class SelectionTests(unittest.TestCase):
         )
         self.assertEqual(result.codeql_languages, ("rust",))
         self.assertEqual(result, reversed_result)
+        self.assertTrue(result.distribution_required)
+        self.assertEqual(result.quality_profile, "release")
 
     def test_test_only_paths_select_direct_quality_without_binary_or_codeql(self) -> None:
         cases = {
@@ -178,16 +227,57 @@ class SelectionTests(unittest.TestCase):
                 self.assertFalse(result.binary_impact)
 
     def test_shared_graph_fixture_selects_both_implementations_without_distribution(self) -> None:
-        result = selection_for_paths(["tests/fixtures/graph_delayed_quota.json"])
+        result = selection_for_paths(
+            ["tests/fixtures/graph_delayed_quota.json"],
+            quality_profile="history-graph",
+        )
         self.assertEqual(
             result.owners, ("LINUX_BACKEND", "LINUX_UI", "WINDOWS")
         )
         self.assertEqual(result.codeql_languages, ())
         self.assertFalse(result.binary_impact)
+        self.assertFalse(result.distribution_required)
+        self.assertEqual(result.quality_profile, "history-graph")
+
+    def test_profile_document_is_exact_single_and_known(self) -> None:
+        self.assertEqual(
+            quality_profile_from_document(
+                "Summary\n\nQuality-Profile: history-graph\n"
+            ),
+            "history-graph",
+        )
+        self.assertIsNone(quality_profile_from_document("Summary only\n"))
+        self.assertEqual(
+            quality_profile_from_document(
+                "Quality-Profile: workflow-selection\n"
+            ),
+            "workflow-selection",
+        )
+        for body in (
+            "Quality-Profile: history-graph\nQuality-Profile: history-graph\n",
+            "Quality-Profile: full\n",
+            "Quality-Profile: history graph\n",
+        ):
+            with self.subTest(body=body), self.assertRaises(ScopeError):
+                quality_profile_from_document(body)
+
+    def test_workflow_profile_owns_only_the_finite_governance_change(self) -> None:
+        result = selection_for_paths(
+            [
+                ".github/workflows/selective-quality.yml",
+                "scripts/workflow_quality_gate.py",
+                "docs/REQUIREMENTS_LEDGER.md",
+            ],
+            quality_profile="workflow-selection",
+        )
+        self.assertEqual(result.owners, ("DOCS", "GOVERNANCE"))
+        self.assertEqual(result.quality_profile, "workflow-selection")
+        self.assertFalse(result.binary_impact)
+        self.assertFalse(result.distribution_required)
 
 
 class CliTests(unittest.TestCase):
-    def test_linux_test_scripts_do_not_claim_binary_or_codeql_impact(self) -> None:
+    def test_feat_product_paths_without_profile_fail_before_owner_jobs(self) -> None:
         classifier = Path(__file__).with_name("ci_change_scope.py")
         with tempfile.TemporaryDirectory() as raw_root:
             name_status = Path(raw_root) / "changed-paths.z"
@@ -201,15 +291,9 @@ class CliTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            json.loads(result.stdout),
-            {
-                "binary_impact": False,
-                "codeql_languages": [],
-                "owners": ["LINUX_BACKEND"],
-            },
-        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("requires one finite Quality-Profile", result.stderr)
 
     def test_release_candidate_flag_selects_windows_for_linux_path(self) -> None:
         classifier = Path(__file__).with_name("ci_change_scope.py")
@@ -234,9 +318,34 @@ class CliTests(unittest.TestCase):
             {
                 "binary_impact": True,
                 "codeql_languages": ["rust"],
+                "distribution_required": True,
                 "owners": ["LINUX_BACKEND", "WINDOWS"],
+                "quality_profile": "release",
             },
         )
+
+    def test_profile_document_drives_the_graph_profile(self) -> None:
+        classifier = Path(__file__).with_name("ci_change_scope.py")
+        with tempfile.TemporaryDirectory() as raw_root:
+            name_status = Path(raw_root) / "changed-paths.z"
+            profile = Path(raw_root) / "pr-body.txt"
+            name_status.write_bytes(b"M\0src/main.rs\0")
+            profile.write_text("Quality-Profile: history-graph\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(classifier),
+                    "--name-status",
+                    str(name_status),
+                    "--profile-document",
+                    str(profile),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["quality_profile"], "history-graph")
 
 
 if __name__ == "__main__":

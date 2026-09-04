@@ -24,7 +24,26 @@ OWNER_CHECKS: dict[str, tuple[str, ...]] = {
     "LINUX_UI": ("requirements-authority", "rust-format", "rust-test"),
     "WINDOWS": ("requirements-authority", "windows-contract"),
 }
-ALL_CHECK_IDS = frozenset(check for checks in OWNER_CHECKS.values() for check in checks)
+HISTORY_GRAPH_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
+    "DOCS": ("requirements-authority",),
+    "LINUX_BACKEND": ("requirements-authority", "rust-history-graph"),
+    "LINUX_UI": ("requirements-authority", "linux-ui-history-graph"),
+    "WINDOWS": ("requirements-authority", "windows-history-graph"),
+}
+WORKFLOW_SELECTION_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
+    "DOCS": ("requirements-authority",),
+    "GOVERNANCE": ("requirements-authority", "governance-workflow-selection"),
+}
+ALL_CHECK_IDS = frozenset(
+    check
+    for mapping in (
+        OWNER_CHECKS,
+        HISTORY_GRAPH_OWNER_CHECKS,
+        WORKFLOW_SELECTION_OWNER_CHECKS,
+    )
+    for checks in mapping.values()
+    for check in checks
+)
 
 
 class QualityPlanError(ValueError):
@@ -37,11 +56,13 @@ class QualityPlan:
 
     affected_owners: tuple[str, ...]
     checks: tuple[str, ...]
+    quality_profile: str
 
     def as_dict(self) -> dict[str, object]:
         return {
             "affected_owners": list(self.affected_owners),
             "checks": list(self.checks),
+            "quality_profile": self.quality_profile,
         }
 
     def as_json(self) -> str:
@@ -77,7 +98,10 @@ def _validate_requested_checks(
 
 
 def plan_for_paths(
-    paths: Sequence[str], *, requested_checks: Sequence[str] = ()
+    paths: Sequence[str],
+    *,
+    quality_profile: str | None = None,
+    requested_checks: Sequence[str] = (),
 ) -> QualityPlan:
     """Return the checks required by ``paths``.
 
@@ -87,14 +111,18 @@ def plan_for_paths(
     """
 
     try:
-        selection = selection_for_paths(paths)
+        selection = selection_for_paths(paths, quality_profile=quality_profile)
     except (ScopeError, TypeError) as exc:
         raise QualityPlanError(str(exc)) from exc
 
     checks: list[str] = []
     seen: set[str] = set()
+    owner_checks = {
+        "history-graph": HISTORY_GRAPH_OWNER_CHECKS,
+        "workflow-selection": WORKFLOW_SELECTION_OWNER_CHECKS,
+    }.get(selection.quality_profile, OWNER_CHECKS)
     for owner in selection.owners:
-        for check in OWNER_CHECKS[owner]:
+        for check in owner_checks[owner]:
             if check not in seen:
                 checks.append(check)
                 seen.add(check)
@@ -103,6 +131,7 @@ def plan_for_paths(
     return QualityPlan(
         affected_owners=selection.owners,
         checks=planned_checks,
+        quality_profile=selection.quality_profile,
     )
 
 
@@ -123,6 +152,12 @@ def _arguments() -> argparse.ArgumentParser:
         help="changed repository path; repeat for multiple paths",
     )
     parser.add_argument(
+        "--quality-profile",
+        default=None,
+        metavar="PROFILE",
+        help="registered finite product-risk profile",
+    )
+    parser.add_argument(
         "--requested-check",
         action="append",
         default=[],
@@ -136,7 +171,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _arguments().parse_args(argv)
     paths = tuple(args.paths) + tuple(args.option_paths)
     try:
-        plan = plan_for_paths(paths, requested_checks=tuple(args.requested_check))
+        plan = plan_for_paths(
+            paths,
+            quality_profile=args.quality_profile,
+            requested_checks=tuple(args.requested_check),
+        )
     except QualityPlanError as exc:
         print(f"quality-plan: FAIL {exc}", file=sys.stderr)
         return 1

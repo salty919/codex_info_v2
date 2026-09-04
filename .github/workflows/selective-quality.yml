@@ -65,13 +65,33 @@ jobs:
       - name: Validate workflow syntax and requirements
         env:
           BASE_SHA: ${{ inputs.base_sha }}
+          QUALITY_PROFILE: ${{ fromJSON(inputs.selection_json).quality_profile }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
           git diff --check "$BASE_SHA" "$SOURCE_SHA"
-          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
           bash scripts/requirements_ledger_gate.sh
-          python3 scripts/workflow_inno_acquisition_gate.py --self-test
+          if [[ "$QUALITY_PROFILE" == workflow-selection ]]; then
+            mapfile -t changed_workflows < <(
+              git diff --name-only "$BASE_SHA" "$SOURCE_SHA" -- '.github/workflows/*.yml'
+            )
+            if ((${#changed_workflows[@]} > 0)); then
+              go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 "${changed_workflows[@]}"
+            fi
+            python3 scripts/test_requirements_authority.py
+            python3 scripts/test_quality_plan.py
+            python3 scripts/test_ci_change_scope.py
+            python3 scripts/test_selected_quality_gate.py
+            python3 scripts/test_codeql_workflow.py
+            python3 scripts/workflow_quality_gate.py --self-test --profile workflow-selection
+          elif [[ "$QUALITY_PROFILE" == release ]]; then
+            go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
+            python3 scripts/workflow_inno_acquisition_gate.py --self-test
+            python3 scripts/workflow_quality_gate.py --self-test
+          else
+            echo "unsupported governance quality profile: $QUALITY_PROFILE" >&2
+            exit 1
+          fi
 
   linux-backend-quality:
     name: linux-backend-quality
@@ -79,6 +99,7 @@ jobs:
     uses: ./.github/workflows/rust.yml
     with:
       source_sha: ${{ inputs.source_sha }}
+      quality_profile: ${{ fromJSON(inputs.selection_json).quality_profile }}
     permissions:
       contents: read
 
@@ -88,6 +109,7 @@ jobs:
     uses: ./.github/workflows/linux-ui-quality.yml
     with:
       source_sha: ${{ inputs.source_sha }}
+      quality_profile: ${{ fromJSON(inputs.selection_json).quality_profile }}
     permissions:
       contents: read
 
@@ -99,6 +121,7 @@ jobs:
       source_sha: ${{ inputs.source_sha }}
       pr_number: ${{ inputs.pr_number }}
       release_candidate: ${{ inputs.release_candidate }}
+      quality_profile: ${{ fromJSON(inputs.selection_json).quality_profile }}
     permissions:
       contents: read
 
@@ -116,7 +139,7 @@ jobs:
 
   linux-distribution:
     name: linux-distribution
-    if: fromJSON(inputs.selection_json).binary_impact == true
+    if: fromJSON(inputs.selection_json).distribution_required == true
     uses: ./.github/workflows/linux-distribution.yml
     with:
       source_sha: ${{ inputs.source_sha }}

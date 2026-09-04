@@ -34,6 +34,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BODY: ${{ github.event.pull_request.body }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -45,7 +46,10 @@ jobs:
           changes="$RUNNER_TEMP/changed-paths.z"
           git diff --find-renames=50% --find-copies=50% --find-copies-harder \
             --name-status -z "$BASE_SHA...$HEAD_SHA" > "$changes"
-          selection="$(python3 scripts/ci_change_scope.py --name-status "$changes")"
+          profile_document="$RUNNER_TEMP/pr-body.txt"
+          printf '%s' "$PR_BODY" > "$profile_document"
+          selection="$(python3 scripts/ci_change_scope.py \
+            --name-status "$changes" --profile-document "$profile_document")"
           printf 'selection_json=%s\n' "$selection" >> "$GITHUB_OUTPUT"
 
   selective-quality:

@@ -10,6 +10,7 @@ fail() {
 }
 
 base_revision=''
+quality_profile=''
 requested_args=()
 while (($# > 0)); do
     case "$1" in
@@ -22,6 +23,12 @@ while (($# > 0)); do
         --requested-check)
             [[ $# -ge 2 ]] || fail '--requested-check requires one check ID'
             requested_args+=(--requested-check "$2")
+            shift 2
+            ;;
+        --quality-profile)
+            [[ $# -ge 2 && -z "$quality_profile" ]] ||
+                fail '--quality-profile requires one value and may appear only once'
+            quality_profile="$2"
             shift 2
             ;;
         *) fail "unknown argument: $1" ;;
@@ -52,8 +59,10 @@ plan_args=()
 for path in "${changed_paths[@]}"; do
     plan_args+=(--path "$path")
 done
+profile_args=()
+[[ -z "$quality_profile" ]] || profile_args+=(--quality-profile "$quality_profile")
 plan_json="$(python3 scripts/quality_plan.py \
-    "${plan_args[@]}" "${requested_args[@]}")" || exit $?
+    "${plan_args[@]}" "${profile_args[@]}" "${requested_args[@]}")" || exit $?
 printf 'pre-pr-gate: plan %s\n' "$plan_json"
 
 mapfile -t checks < <(
@@ -97,7 +106,8 @@ PY
         python3 scripts/test_selected_quality_gate.py
     fi
     if ((run_workflow_fixtures != 0)); then
-        python3 scripts/workflow_quality_gate.py --self-test
+        python3 scripts/workflow_quality_gate.py \
+            --self-test --profile workflow-selection
         python3 scripts/test_codeql_workflow.py
     fi
 }
@@ -119,6 +129,20 @@ for check in "${checks[@]}"; do
             ;;
         windows-contract)
             bash scripts/windows_client_contract_gate.sh
+            ;;
+        rust-history-graph)
+            bash scripts/regression_guard.sh --history-graph
+            ;;
+        linux-ui-history-graph)
+            cargo build --release --locked
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
+                bash scripts/x11_graph_visual_gate.sh
+            ;;
+        windows-history-graph)
+            bash scripts/windows_client_contract_gate.sh --history-graph
+            ;;
+        governance-workflow-selection)
+            run_governance_contract
             ;;
         *)
             fail "quality plan returned an unimplemented check: $check"

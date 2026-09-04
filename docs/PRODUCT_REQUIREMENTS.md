@@ -176,9 +176,16 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   `acceptance`はmain向けに選択jobの結果だけを集約し、失敗時はRelease公開をHOLDするがmergeを禁止しない。
   Windowsを含むmain向けrelease candidateでは、Windows job自身が実Windows評価後にrelease candidateを作る。
   Linux-only変更も、Linux archiveを既存`windows-vX.Y.Z` ReleaseへWindows Setup/manifestと同居させるため、
-  main向けrelease candidateではWindows評価・candidateを追加で実行する。`feat/next`向け通常integrationは差分選択を維持し、
-  選択された実owner job、CodeQL、distributionだけをadvisoryに実行する。feat向け`selected-quality`集約と`feat-acceptance`、
-  Windows release candidateは生成しない。実jobの失敗は赤のまま表示するがmergeを禁止しない。live repository ruleの再監査、
+  main向けrelease candidateではWindows評価・candidateを追加で実行する。`feat/next`向けproduct変更はPR本文のexact 1行
+  `Quality-Profile: <registered-profile>`を完全差分と一緒に分類する。profile欠落・重複・未知・所有外pathは、全suiteへ拡大せず
+  owner実行前に停止する。`history-graph`は`CUM-138-06`の有限なRust graph/history、X graph画像、Windows projectionだけを実行し、
+  startup、CLI、recorder全体、installer、distributionを選択しない。product変更のない`history-graph`宣言は不要な品質要求として
+  拒否する。workflow/selector変更は`workflow-selection`で、
+  変更workflowの構文、profile selector、rename/copy、main Release非縮小だけを確認し、Release publisher、bundle、installer、
+  product E2Eを起動しない。単なる文書変更はprofileなしの`authority-only`とする。main向けRelease candidateはfeat profileを
+  受け取らず、従来の
+  full owner、distribution、installer、実OS/UI品質を維持する。feat向け`selected-quality`集約と`feat-acceptance`、Windows release
+  candidateは生成しない。実jobの失敗は赤のまま表示するがmergeを禁止しない。live repository ruleの再監査、
   選択済み製品testの再実行、branch名allowlist、custom check登録を追加しない。
 - バイナリ影響ありPRだけ、品質確認を開始する前にPR branch上のversion 3ファイルをexact next patchへ自動更新する。
   versionがbaseのH0は完全差分を1回分類し、PR、H0、producer run ID、attemptを固定trailerに持つH1 commitをnon-force pushして、
@@ -261,22 +268,12 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 
 - 上記要件と参照先仕様の間に、同じ入力へ異なる必須結果を要求する矛盾がない。
 
-## グラフ表示の製品境界（詳細owner: UX）
+## グラフ表示への参照
 
-グラフの値の意味、期間境界、欠測・未使用区間、残量とモデル使用量の
-独立性は `docs/WINDOWS_UX_SPEC.md` のUX master IDが所有する。X版と
-Windows版の実装は同じ `tests/fixtures/graph_delayed_quota.json` を入力に
-し、fixture内の固定期待値（期間数、累積SOL、遅延して届く残量、未観測区間）
-をそれぞれ独立に検証する。片方の描画結果や補間ヘルパーをもう片方の
-期待値生成に使うことは禁止する。仕様・fixture・実装のいずれかが不一致、
-または実機証跡が欠ける場合は合格ではなく保留とする。
-- shared rollover fixtureはperiod AからBへの境界で残量/累積額が
-  `100% / $1 → 41% / $323.674247`となる固定oracleを持つ。これと
-  `graph_delayed_quota`、既存のhistory、rolling、delayed、gap、no-history、REST、Windows回帰を、
-  同じproduct revisionに対して有限な既存testへ統合して確認する。別workflow gateや全直積を追加せず、
-  どれか未実行・不一致ならそのrevisionを合格にしない。
-- 自動検査は実行されたtestが0件でないことを確認する。UI変更は実画面、Windows固有動作は実Windowsで確認する。
-- 未確認の外部authority値を創作してPASSにしない。値がない場合のfail-closed動作を検証する。
+グラフの表示意味、期間端、欠測線、補完線、系列独立性、X/Windows共通の
+受入caseは、UX ownerの唯一master `CUM-138-06` が
+`docs/WINDOWS_UX_SPEC.md`で所有する。本書は収集・公開する値と失敗時保持だけを
+所有し、graphの期待値、test一覧、platform別の派生契約を重複定義しない。
 
 ### 履歴・snapshot validationを残す理由
 
@@ -309,14 +306,11 @@ component別max、last-row、null化、任意mergeを行わない。
 2. `reset_at`がサービスのrolling値として移動しても同一期間を維持する。実際の期間切替は、quotaの回復または期間境界を示す観測がある場合だけ新期間へ移す。
 3. モデル使用量（ドル・token）と残量（%）は別観測として扱う。残量観測がない時間帯をモデル使用量から逆算せず、遅れて届いた残量観測はその時刻へ反映する。
 4. 同じprofile-owned DB read内で、既存`timestamp/reset_at`のbounded rolling規則から同一cycleと検証できた同じminuteのrowだけを`HistoryCanonicalizer`が1 logical sampleへ正規化する。quota観測を持たずquota確認済みcycleと重なるbackfill reset群と、継続cycleの内部だけにあるreset断片はperiod authorityにしない。実resetの秒をminute-startへ丸めて旧cycle末尾と新cycle先頭が同じ分になり、旧cycleがそこで終了して新cycleだけが後続分へ継続すると確認できる場合は、その境界分を新cycleへ一意に所属させる。distinct non-null quotaは最大1個、cumulative vectorは既存のcomponentwise-dominant値だけを採用し、同値duplicateは冪等に扱う。quota競合・非比較・dominant不存在はそのminuteだけを公開対象外とし、別cycle間の境界不明はcandidate全体をrejectする。100%・7日窓など数値の形では除外せず、UI/REST/Windowsでmerge/max/last/null化しない。
-5. 過去期間はその期間に属する全モデル系列を累積値で描画し、未使用区間は専用の未使用帯として表示する。SOL/TERRA/LUNAのいずれかを0や欠測へ黙って変換しない。
-6. 明示的なログアウトまたは認証主体変更だけが可視状態を消去する。通信失敗・quota更新中・local収集中は最後の完全表示を保持し、失敗状態は別途表示する。
-7. X版とWindows版はshared rollover fixtureの`100% / $1 → 41% / $323.674247`と`graph_delayed_quota`を含む同一fixtureの固定oracle（期間数、期間境界、累積SOL、遅延残量、未観測区間）を独立に満たす。既存history/rolling/delayed/gap/no-history/REST/Windows回帰を同一revisionで確認し、どれか一つでも不一致、実機証跡欠落、またはテスト未実行なら合格ではなく保留とする。
-8. 製品バージョンはメイン画面に一度だけ表示し、子ウインドウのタイトルやボタンへ重複表示しない。値はX版・Windows版とも同じリリースversion authorityから導出する。
-9. Windows版の初回起動では、health readiness後に最初のstrict validation済み`/v2/details` generation（旧serviceの404時だけ`/v1/details`）が揃うまで内容領域を表示せず、固定レイアウト上にスピナーを表示する。control応答とのmerge、途中fieldの順番描画をせず、初回取得失敗時はスピナーを解除して失敗状態と再試行手段を表示する。
-10. X版の初回起動でも、health readiness後に最初のstrict validation済み`/v2/details` generation（旧serviceの404時だけ`/v1/details`）が揃うまで主画面の内容領域を公開せず、ヘッダー（製品バージョンを含む）を固定したままスピナーを表示する。details取得が失敗した場合はスピナーを解除し、最後の完全表示または失敗状態を表示する。
-11. X版の起動ウィンドウは主モニターの可視デスクトップ内へ配置し、別モニターや負座標へ出して利用者から見えない状態にしてはならない。起動成功は、可視範囲内の実ウィンドウと内容の実画面で確認する。
-12. `--ui` のdaemon/REST起動に失敗しても、X版のGUIを消失・即時終了させず、接続失敗と再試行手段を表示する。
-13. 同一periodのモデル別累積vectorは全componentを一つの観測として扱う。1 componentでも直前の確定vectorより後退したrowは、前回値とのcomponent別maxで合成せず、全componentが直前の確定vector以上へ回復するまでwhole-vector欠測とする。
-14. remote quotaとlocal Session/logは独立した取得元とする。remote transport障害中もresident local collectorとDB recorderを60秒以内の既存周期で継続し、local-only rowはquota `NULL`かつmodel source `confirmed`でcommitする。local取得失敗後も、そのcycleで取得済みのfresh remote quotaは元の観測時刻、実collector世代、model source `unavailable`として同じDB transactionへ保持し、直前のdurable model vectorを新しい確定rowとして複製しない。古いquotaを新しいtimestampへ複製しない。local取得失敗はsingle-flightを解放して次周期で再取得し、DB書込み失敗はprovenanceを含むexact pending batchを保持して同じdaemon内で再試行する。provenanceなしの旧rowは`legacy-unknown`であり、確定観測へ昇格しない。
-15. Graphの実線はsource `confirmed`の連続観測だけに使用する。両端が確定している通常欠測、`unavailable`/`legacy-unknown`区間、または累積後退からの回復は途中を実測と称さない破線、モデル増分に対応しないremote quota低下も観測時刻を移動せず破線とする。normalな末尾quota欠測はlast measured値を水平な破線で保持し、local modelのopen-ended欠測は現在時刻へ延長しない。source proof済み`confirmed history_gaps`は破線補間もせず両系列を切断し、gap帯だけを表示する。表示点を間引く場合も回帰・回復・gap両端・source遷移・quota有無遷移・未帰属quota低下を落として前後を実線接続しない。
+5. 明示的なログアウトまたは認証主体変更だけが可視状態を消去する。通信失敗・quota更新中・local収集中は最後の完全表示を保持し、失敗状態は別途表示する。
+6. 製品バージョンはメイン画面に一度だけ表示し、子ウインドウのタイトルやボタンへ重複表示しない。値はX版・Windows版とも同じリリースversion authorityから導出する。
+7. Windows版の初回起動では、health readiness後に最初のstrict validation済み`/v2/details` generation（旧serviceの404時だけ`/v1/details`）が揃うまで内容領域を表示せず、固定レイアウト上にスピナーを表示する。control応答とのmerge、途中fieldの順番描画をせず、初回取得失敗時はスピナーを解除して失敗状態と再試行手段を表示する。
+8. X版の初回起動でも、health readiness後に最初のstrict validation済み`/v2/details` generation（旧serviceの404時だけ`/v1/details`）が揃うまで主画面の内容領域を公開せず、ヘッダー（製品バージョンを含む）を固定したままスピナーを表示する。details取得が失敗した場合はスピナーを解除し、最後の完全表示または失敗状態を表示する。
+9. X版の起動ウィンドウは主モニターの可視デスクトップ内へ配置し、別モニターや負座標へ出して利用者から見えない状態にしてはならない。起動成功は、可視範囲内の実ウィンドウと内容の実画面で確認する。
+10. `--ui` のdaemon/REST起動に失敗しても、X版のGUIを消失・即時終了させず、接続失敗と再試行手段を表示する。
+11. 同一periodのモデル別累積vectorは全componentを一つの観測として扱う。1 componentでも直前の確定vectorより後退したrowは、前回値とのcomponent別maxで合成せず、全componentが直前の確定vector以上へ回復するまでwhole-vector欠測とする。
+12. remote quotaとlocal Session/logは独立した取得元とする。remote transport障害中もresident local collectorとDB recorderを60秒以内の既存周期で継続し、local-only rowはquota `NULL`かつmodel source `confirmed`でcommitする。local取得失敗後も、そのcycleで取得済みのfresh remote quotaは元の観測時刻、実collector世代、model source `unavailable`として同じDB transactionへ保持し、直前のdurable model vectorを新しい確定rowとして複製しない。古いquotaを新しいtimestampへ複製しない。local取得失敗はsingle-flightを解放して次周期で再取得し、DB書込み失敗はprovenanceを含むexact pending batchを保持して同じdaemon内で再試行する。provenanceなしの旧rowは`legacy-unknown`であり、確定観測へ昇格しない。

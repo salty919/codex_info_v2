@@ -1,8 +1,6 @@
 <!-- codex-info-requirement-owner: UX -->
 <!-- codex-info-master-ids:
 CUM-138-06
-WIN-PARITY-CURRENT-01
-WIN-PARITY-FIRSTOBS-01
 WIN-PARITY-RETRY-01
 WIN-PARITY-UX
 WIN-PARITY-CTA-01
@@ -13,10 +11,7 @@ X-START-03
 X-START-04
 X-START-05
 X-START-06
-X-GRAPH-01
-X-GRAPH-02
 X-THREAD-01
-WIN-GRAPH-01
 WIN-VERSION-01
 -->
 
@@ -262,7 +257,7 @@ component順や表示所有者を変更しない。
 - 数値、単位、説明、状態、操作の文字サイズと太さに役割差を付ける。細すぎるフォント、薄すぎる文字、
   余白だけで分断されたカードは採用しない。
 
-### 4.2 Trends / Graph
+### 4.2 Trends / Graph（master: `CUM-138-06`）
 
 - 期間、ドル/トークン、Remaining/LUNA/TERRA/SOLの操作を上部固定帯に置く。
 - 期間・metricのリストはpointer pressの1回で展開する。REST/DB/poll完了を待たず、物理入力から
@@ -291,9 +286,11 @@ component順や表示所有者を変更しない。
 - Remainingは独立0–100%意味、モデル系列は累積値として扱う。残量をドル軸へ誤って合わせない。
 - Remainingとモデル使用量は別の観測値であり、モデル使用後に遅れて届いた最初の低い残量観測はその観測時刻へ反映する。残量観測が存在しない区間を料金・tokenから逆算してはならず、未観測区間を正常な残量低下として表示しない。
 - X版とWindows版は同一の履歴fixtureと固定期待値（期間境界、累積SOL、遅延残量、未観測区間）を通過しなければならない。片方の描画ヘルパーが生成した値をもう片方の期待値には使用せず、fixtureの独立oracleを使う。
-- shared rollover fixtureのperiod A→Bで`100% / $1 → 41% / $323.674247`を保持し、
-  `graph_delayed_quota`と既存history/rolling/delayed/gap/no-history/REST/Windows回帰を同一revisionで確認する。
-  値形状による100%・7日・quota-only除外や、新workflow gate・全直積は追加しない。
+- finite oracleは、shared rolloverのperiod A→B `100% / $1 → 41% / $323.674247`、
+  `graph_delayed_quota`のfirst observation・遅延quota・missing quota、whole-vector回帰/回復、
+  confirmed gap、unattributed quota、current/historical右端、no-historyの9 causal caseとする。
+  X/Windowsは同じfixtureの固定期待値を独立に検査し、値形状による100%・7日・quota-only除外、
+  platform helperから期待値を生成する循環oracle、新workflow gate、全test/all-suite/全直積を追加しない。
 - 操作帯を開閉してもplotの位置・高さを変えず、ラベルや右端値を隠さない。
 - 記録なし、欠測、アイドル、活動、0/中間/100を明示的な設計状態として扱う。
 
