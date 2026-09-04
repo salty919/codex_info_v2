@@ -68,8 +68,9 @@ ssh -N -o BatchMode=yes -L 8787:127.0.0.1:8787 <connectionSelector>
 Windowsのcanonical `ArgumentList`はValue AuthoritiesおよびWIN-E-006..010の
 `[ssh.exe,-o,BatchMode=yes,-N,-L,8787:127.0.0.1:8787,<validated alias>]`に従う。
 
-このとき Linux / Windows UIの表示rootは
-`http://127.0.0.1:8787/v1/details` の一応答だけである。HTTP は Linux 側の loopback と
+このときLinux / Windows UIの表示rootは
+`http://127.0.0.1:8787/v2/details`の一応答であり、旧serviceがexact 404を返す場合だけ
+`http://127.0.0.1:8787/v1/details`の一応答へfallbackする。両応答をmergeしない。HTTPはLinux側のloopbackと
 SSH トンネルの端点の間だけで使用し、端末間の暗号化・相手認証は SSH が担当する。
 そのため v1 では HTTPS 証明書を扱わない。
 
@@ -85,7 +86,8 @@ SSH トンネルの端点の間だけで使用し、端末間の暗号化・相�
 | Request | Result |
 | --- | --- |
 | `GET /v1/health` | resident serviceがread-only snapshot requestを受理できるreadinessを示す。 |
-| `GET /v1/details` | Linux / Windows UIの単一atomic rootとして、状態・利用枠・モデル別ドル内訳・履歴・Threadsを返す。 |
+| `GET /v1/details` | 旧client向けのschema-compatibleな単一atomic rootを返す。 |
+| `GET /v2/details` | Linux / Windows UIの単一atomic rootとして、状態・利用枠・モデル別ドル内訳・履歴・観測元provenance・Threadsを返す。 |
 
 未定義のパスは JSON の `404`、既知パスへの非 `GET` は JSON の `405` で返す。
 応答に email、認証 URL、認証トークン、raw error、ローカルパス、セッション内容を
@@ -102,6 +104,7 @@ SQLite transaction、WAL/SHM、migration、prune、backup、DB row/hash、publis
 | --- | --- | --- | --- |
 | `/v1/health` | `GET` | `200` | JSON health object、required `Content-Type`/`Cache-Control` headers、DB write/transaction=0 |
 | `/v1/details` | `GET` | `200` | current immutable details generation、共通headerに加えて必須`Codex-Info-Published-Pair`、DB write/transaction=0 |
+| `/v2/details` | `GET` | `200` | 同じcurrent immutable generationのprovenance付きprojection、同じ必須published pair、DB write/transaction=0 |
 | 上記known path | `HEAD/POST/PUT/PATCH/DELETE/OPTIONS`等全non-GET | `405` | 固定JSON error、同上header、DB/WAL/SHM/migration/prune/backup=0 |
 | unknown、case-altered、末尾slash、query付きpath（methodを問わない） | any | `404` | 固定JSON error、同上header、DB/WAL/SHM/migration/prune/backup=0 |
 
@@ -113,7 +116,7 @@ SQLiteの保持期間は過去3暦月である。一方、1回のDB取得と`det
 ### 応答時間SLOと容量条件
 
 warm-up後、loopback、in-flight 1でrequest送信開始からresponse body全受信までを測る。
-`/v1/health`と全4xxはP90 25 ms以下・P95 50 ms以下、`/v1/details`は
+`/v1/health`と全4xxはP90 25 ms以下・P95 50 ms以下、v1/v2 detailsは
 7日相当10,080 samplesでP90 50 ms以下・P95 100 ms以下、契約最大1暦月44,640 samplesで
 P90 100 ms以下・P95 150 ms以下とする。各route/profileを30回以上測定し、client hard timeoutは
 1秒、timeout・欠測・上限超過はPASSへ丸めない。DB読出しはtimestamp/reset複合indexを使い、
@@ -241,6 +244,24 @@ trim、lowercase、prefix/substring一致、schema外aliasを使わない。wire
 label/monthly不整合はcycle全体をrejectし、旧完全pairを保持する。Windowsは自由文字列からfamily/monthlyを
 推測せず、server内部のredacted PlanType、schema hash、公開label/monthlyを同一cycle evidenceへ結合する。
 
+### `/v2/details` model-source schema
+
+`/v2/details`は`api_version`でversion付けした単一atomic表示rootである。
+トップレベル13キー、上限、period、gap、thread、model、状態の意味はv1と同一で、`api_version`を
+exact `v2`とする。`history_samples`の各rowはv1の9キーに`model_source`を加えたexact 10キーを持つ。
+
+| `model_source` | model dollar/token 6値 | 意味と表示 |
+| --- | --- | --- |
+| `confirmed` | 全て非null | 同じlocal収集の証拠とatomic commitを持つ。ほかの連続条件も満たす隣接点だけ実線にできる |
+| `unavailable` | 全てnull | そのtimestampのlocal model値は未取得。freshな`remaining_percent`だけは同時刻へ保持できるが、model線は確定値として描かない |
+| `legacy-unknown` | 全て非null | provenance導入前またはv1 fallbackの値。確定観測へ昇格せず破線または切断として扱う |
+
+`confirmed`/`legacy-unknown`でmodel 6値の一部だけがnull、または`unavailable`で一つでも非nullのcandidateは
+全体rejectする。local取得失敗時に直前model vectorを新しいtimestampへ複製せず、quotaが取得できた場合だけ
+その実測値を`unavailable` rowへ保存する。v1互換応答には`unavailable` rowも`model_source` fieldも含めない。
+clientは最初にv2を一回要求し、exact routeの404時だけv1を一回要求する。他のstatus、schema/size/header不正、
+timeoutではfallbackせずlast-good rootを保持する。二つのdetails応答を比較・mergeしてはならない。
+
 各history sample行は`timestamp`、`reset_at`、`remaining_percent`、`sol_dollars`、
 `terra_dollars`、`luna_dollars`、`sol_tokens`、`terra_tokens`、`luna_tokens`だけを持つ。
 `timestamp`は有効なUTC event秒を`floor(event_epoch / 60) * 60`へ変換したminute-startであり、
@@ -299,9 +320,9 @@ lineage、load profileは`DATA_PROTECTION_POLICY.md` §8を正本とする。本
 
 `GET /v1/health`の200 bodyはUTF-8 JSON objectでexact key集合を
 `api_version,service,product_version`、値を`api_version="v1"`、`service="codex-info"`、
-`product_version`をCargo/Windowsの単一stable `X.Y.Z` authorityへ固定する。unknown、missing、duplicate、
-case-altered key、別値、client自身と異なるproduct version、control/bidi、trailing non-whitespace、depth追加を
-拒否する。transfer-decoded bodyは1 KiB以下である。旧2-key healthはLinux launcherが同一profileの検証済み
+`product_version`をstable `X.Y.Z`形式へ固定する。unknown、missing、malformed、duplicate、
+case-altered key、control/bidi、trailing non-whitespace、depth追加を拒否する。client自身と異なる有効な
+product versionは診断情報として保持し、details取得を妨げない。transfer-decoded bodyは1 KiB以下である。旧2-key healthはLinux launcherが同一profileの検証済み
 ownerを更新するためだけに識別し、そのserviceのdetailsは表示へ受理しない。
 health 200はresident serviceがread-only snapshot requestを受理でき、schema-validなimmutable details generationを
 保持しているreadinessを表す。認証済み、detailsの`state=ready`、DBの最新収集成功は意味しない。
@@ -317,11 +338,11 @@ PID、listener、health 200、`product_version`のいずれか単独を成功へ
 - `Content-Type`は`application/json; charset=utf-8`。parameter追加、charset欠落、別charsetを生成しない。
 - `Cache-Control`は`no-store`。
 - fixed bodyでは`Content-Length`をUTF-8 bytesと一致させる。
-- `/v1/details`の200応答は`Codex-Info-Published-Pair`をexactly one持つ。値は
+- `/v1/details`と`/v2/details`の200応答は`Codex-Info-Published-Pair`をexactly one持つ。値は
   ASCII `v1:`に128-bit server epochの32桁lowercase hex、続けて128-bit publish counterの
   32桁lowercase hexを置いた67 bytesだけとする。production UIはdetails headerのprefix/length/lowercase hexだけを検証し、
   epoch/counterを業務値としてparse、sort、永続化、表示せず、そのdetails応答のopaque generation identityとしてだけ扱う。
-  `/v1/health`、error、unknown/method拒否応答はこのheaderを持たない。
+  両details routeは同じpublished generationで同じpairを返す。`/v1/health`、error、unknown/method拒否応答はこのheaderを持たない。
 - response header aggregateは8 KiB以下。`Set-Cookie`、`Location`、`Content-Encoding`、
   `WWW-Authenticate`、authentication/proxy headerは0件。
 
@@ -385,7 +406,7 @@ details candidate全体をrejectし、UI consumerは直前のdetails rootを保�
 ### Request resource contract
 
 製品endpointはHTTP/1.1だけを受け、request targetはorigin-formのexact
-`/v1/health`、`/v1/details`である。percent decode、path normalization、query、fragment、
+`/v1/health`、`/v1/details`、`/v2/details`である。percent decode、path normalization、query、fragment、
 absolute-form、authority-form、asterisk-formを許可しない。
 
 | resource | 採用上限・規則 |

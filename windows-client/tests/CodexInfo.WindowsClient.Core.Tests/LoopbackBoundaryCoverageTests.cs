@@ -213,7 +213,10 @@ public sealed class LoopbackBoundaryCoverageTests
 
     private static async Task<DetailsFetchResult> FetchDetails(string json)
     {
-        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json, includePublishedPair: true)));
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+            request.RequestUri?.AbsolutePath == "/v2/details"
+                ? new HttpResponseMessage(HttpStatusCode.NotFound)
+                : JsonResponse(json, includePublishedPair: true)));
         return await client.FetchDetailsAsync(CancellationToken.None);
     }
 

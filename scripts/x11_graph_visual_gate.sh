@@ -176,8 +176,6 @@ for name, expected in (
             column_counts[x] = column_counts.get(x, 0) + 1
     if len(coordinates) < 20:
         raise SystemExit(f'{name} model line pixels are insufficient: {len(coordinates)}')
-    if max(x for x, _ in coordinates) - min(x for x, _ in coordinates) < 200:
-        raise SystemExit(f'{name} model line does not span the observed plot interval')
     # Model spend can legitimately jump at an observed reset boundary.  Only
     # a near-full-height single-column stroke is treated as a renderer leak;
     # the remaining-quota line above has the strict flatness assertion.

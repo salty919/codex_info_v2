@@ -234,7 +234,7 @@ Mainを既定の到達先とし、保存済みselectorで次回自動再接続�
 自動再構築ごとにSetup/app確認を再表示しない。更新は明示ボタンとbounded自動更新を同じ状態機械で扱い、
 更新中の再クリック、重複要求、値の一時消去を禁止する。
 
-Main、Graph、Threadsは同じstrict validation済み`/v1/details`一応答を一つのatomic rootとして置換する。
+Main、Graph、Threadsは同じstrict validation済み`/v2/details`一応答を一つのatomic rootとして置換する。旧serviceがexact 404を返す場合だけ単一`/v1/details`へfallbackする。
 SQLite、別poll、認証control応答でfieldを補完せず、quota/history/threadの再収集、
 値の再計算、同一minuteのmerge/max/last/null化をUIで行わない。候補拒否時は全surfaceが同じlast-good rootを保持する。
 
@@ -323,7 +323,7 @@ component順や表示所有者を変更しない。
 - WSL/remote/one-session raw recovery、ArgumentList、API到達、認証開始、認証確認、app-wide single
   supervisor/tunnel/reapの境界は`UX-20260822-SSH-001`を正本とする。
 
-Setupの順序はserver/API prepare→listener→readiness `GET /v1/health`→strict `GET /v1/details`→
+Setupの順序はserver/API prepare→listener→readiness `GET /v1/health`→strict `GET /v2/details`（旧serviceの404時だけstrict v1）→
 必要時だけauth-start→別auth-check→新しいstrict detailsで固定する。auth-start/auth-checkはcontrol-onlyであり、
 応答を表示rootへmergeしない。healthだけ、またはcontrol成功だけでdata readyとしない。
 
