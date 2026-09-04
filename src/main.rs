@@ -77,6 +77,7 @@ enum LocalCommand {
         auth_epoch: u64,
         admission: AccountAdmission,
         collection_state: Box<usage_store::SessionCollectionState>,
+        history_continuity_recovery: Option<usage_store::HistoryContinuityRecovery>,
         reset_at: i64,
         window_seconds: i64,
     },
@@ -146,6 +147,7 @@ struct LocalUsageCandidate {
     session_checkpoints: Vec<usage_store::SessionCheckpoint>,
     session_ranges: Vec<usage_store::SessionRange>,
     session_model_totals: Vec<usage_store::SessionModelTotal>,
+    history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
 }
 
 enum LocalEvent {
@@ -216,7 +218,7 @@ impl ModelUsageRow {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ModelUsageTotals {
     sol: ModelUsageRow,
     terra: ModelUsageRow,
@@ -326,6 +328,21 @@ impl ModelUsageTotals {
                 output_tokens: row.output_tokens,
             })
             .collect()
+    }
+
+    fn checked_add_totals(&mut self, offset: &Self) -> Option<()> {
+        fn add_row(target: &mut ModelUsageRow, offset: &ModelUsageRow) -> Option<()> {
+            target.tokens = target.tokens.checked_add(offset.tokens)?;
+            target.input_tokens = target.input_tokens.checked_add(offset.input_tokens)?;
+            target.cached_input_tokens = target
+                .cached_input_tokens
+                .checked_add(offset.cached_input_tokens)?;
+            target.output_tokens = target.output_tokens.checked_add(offset.output_tokens)?;
+            Some(())
+        }
+        add_row(&mut self.sol, &offset.sol)?;
+        add_row(&mut self.terra, &offset.terra)?;
+        add_row(&mut self.luna, &offset.luna)
     }
 }
 
@@ -2395,6 +2412,39 @@ fn reset_transition_is_boundary(
         return true;
     }
     false
+}
+
+/// Admit the durable absolute model totals for the next collector cycle.
+/// Reset timestamps are observations, not period identifiers: rolling drift
+/// and daemon downtime retain the baseline, while a verified rollover or a
+/// changed quota window starts the next cumulative period at zero. Session
+/// checkpoints deliberately survive both paths because token records remain
+/// append-only across quota periods.
+fn admit_session_collection_period(
+    state: &mut usage_store::SessionCollectionState,
+    next_reset_at: i64,
+    next_window_seconds: i64,
+    next_remaining_percent: Option<f64>,
+    now: i64,
+) -> bool {
+    if state.data_generation == 0 {
+        return false;
+    }
+    let observation = state.last_quota_observation.as_ref();
+    let boundary = state.window_seconds != next_window_seconds
+        || reset_transition_is_boundary(
+            (state.reset_at > 0).then_some(state.reset_at),
+            observation.map(|value| value.remaining_percent),
+            next_reset_at,
+            next_remaining_percent,
+            observation.map(|value| value.observed_at),
+            now,
+            state.window_seconds,
+        );
+    if boundary {
+        state.model_totals.clear();
+    }
+    boundary
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5123,6 +5173,7 @@ struct LocalUsageCollection {
     session_checkpoints: Vec<usage_store::SessionCheckpoint>,
     session_ranges: Vec<usage_store::SessionRange>,
     session_model_totals: Vec<usage_store::SessionModelTotal>,
+    history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
     cleanup_plan: Option<SessionCleanupPlan>,
     bounded_source_rescan_complete: bool,
 }
@@ -5209,6 +5260,7 @@ fn collect_local_usage_snapshot(
         session_checkpoints: Vec::new(),
         session_ranges: Vec::new(),
         session_model_totals: Vec::new(),
+        history_continuity_recovery: None,
         cleanup_plan: cleanup_plan_for_inventory(inventory),
         bounded_source_rescan_complete: inventory.overflow_session_files.is_empty(),
     })
@@ -5353,7 +5405,6 @@ fn read_recoverable_session_line<R: BufRead>(
     read_recoverable_session_line_with_status(reader).map(|(line, _)| line)
 }
 
-#[cfg(test)]
 fn read_recoverable_session_line_with_status<R: BufRead>(
     reader: &mut R,
 ) -> Result<(Option<String>, bool), security::SecurityError> {
@@ -5461,6 +5512,79 @@ fn session_event_timestamp(value: &Value) -> i64 {
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
         .map(|value| value.timestamp())
         .unwrap_or(0)
+}
+
+fn collect_session_usage_records<R: BufRead>(
+    reader: &mut R,
+    window_start: i64,
+    totals_window_end: i64,
+    timeline_window_end: i64,
+    totals: &mut ModelUsageTotals,
+    events: &mut Vec<TimedModelUsage>,
+) -> Result<bool, security::SecurityError> {
+    let original = totals.clone();
+    let initial_events_len = events.len();
+    let mut fully_recordable = true;
+    let mut model: Option<String> = None;
+    let mut previous = TokenSnapshot::default();
+    loop {
+        let line = match read_recoverable_session_line_with_status(reader) {
+            Ok((Some(line), skipped_invalid_record)) => {
+                fully_recordable &= !skipped_invalid_record;
+                line
+            }
+            Ok((None, skipped_invalid_record)) => {
+                fully_recordable &= !skipped_invalid_record;
+                break;
+            }
+            Err(error) => {
+                *totals = original;
+                events.truncate(initial_events_len);
+                return Err(error);
+            }
+        };
+        let value = match serde_json::from_str::<Value>(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                fully_recordable = false;
+                continue;
+            }
+        };
+        // thread_settings_applied can precede the actual turn context. Keep
+        // the previous model until turn_context confirms the model for the
+        // token-count event; otherwise setup metadata is charged to the next
+        // model (ccusage-compatible attribution).
+        if session_event_type(&value) != Some("thread_settings_applied") || model.is_none() {
+            if let Some(next_model) = session_event_model(&value) {
+                model = Some(next_model);
+            }
+        }
+        let Some(current) = session_token_snapshot(&value) else {
+            continue;
+        };
+        let delta = TokenSnapshot {
+            total: current.total.saturating_sub(previous.total),
+            input: current.input.saturating_sub(previous.input),
+            cached_input: current.cached_input.saturating_sub(previous.cached_input),
+            output: current.output.saturating_sub(previous.output),
+        };
+        previous = current;
+        let timestamp = session_event_timestamp(&value);
+        if timestamp < window_start || timestamp > totals_window_end {
+            continue;
+        }
+        if let Some(model) = model.as_deref() {
+            totals.add(model, delta);
+            if timestamp <= timeline_window_end {
+                events.push(TimedModelUsage {
+                    timestamp,
+                    model: model.to_owned(),
+                    delta,
+                });
+            }
+        }
+    }
+    Ok(fully_recordable)
 }
 
 #[cfg(test)]
@@ -5970,13 +6094,10 @@ fn collect_incremental_local_usage(
         collector_epoch,
         cycle_seq,
     } = context;
-    let mut totals = if collection_state.reset_at == reset_at
-        && collection_state.window_seconds == window_seconds
-    {
-        ModelUsageTotals::from_session_totals(&collection_state.model_totals)
-    } else {
-        ModelUsageTotals::default()
-    };
+    // The main/account lane has already admitted these absolute totals to the
+    // stable period. A raw reset timestamp comparison here used to discard
+    // the durable baseline on ordinary one-second service drift.
+    let mut totals = ModelUsageTotals::from_session_totals(&collection_state.model_totals);
     let initial_totals = totals.clone();
     let mut checkpoints_by_path = BTreeMap::new();
     let mut checkpoints_by_identity = BTreeMap::new();
@@ -6110,6 +6231,7 @@ fn collect_incremental_local_usage(
         session_checkpoints: changed_checkpoints,
         session_ranges: ranges,
         session_model_totals: totals.to_session_totals(),
+        history_continuity_recovery: None,
         cleanup_plan: cleanup_plan_for_inventory(inventory),
         bounded_source_rescan_complete,
     })
@@ -6163,69 +6285,15 @@ fn collect_session_usage_file_with_recordability(
             security::SecurityErrorKind::UnsafePath,
         ));
     }
-    let original = totals.clone();
-    let initial_events_len = events.len();
-    let mut fully_recordable = true;
-    let mut model: Option<String> = None;
-    let mut previous = TokenSnapshot::default();
     let mut reader = BufReader::new(file);
-    loop {
-        let line = match read_recoverable_session_line_with_status(&mut reader) {
-            Ok((Some(line), skipped_invalid_record)) => {
-                fully_recordable &= !skipped_invalid_record;
-                line
-            }
-            Ok((None, skipped_invalid_record)) => {
-                fully_recordable &= !skipped_invalid_record;
-                break;
-            }
-            Err(error) => {
-                *totals = original;
-                events.truncate(initial_events_len);
-                return Err(error);
-            }
-        };
-        let value = match serde_json::from_str::<Value>(&line) {
-            Ok(value) => value,
-            Err(_) => {
-                fully_recordable = false;
-                continue;
-            }
-        };
-        // `thread_settings_applied` can precede the actual turn context. Keep
-        // the previous model until `turn_context` confirms the model for the
-        // token-count event; otherwise setup metadata is charged to the next
-        // model (ccusage-compatible attribution).
-        if session_event_type(&value) != Some("thread_settings_applied") || model.is_none() {
-            if let Some(next_model) = session_event_model(&value) {
-                model = Some(next_model);
-            }
-        }
-        let Some(current) = session_token_snapshot(&value) else {
-            continue;
-        };
-        let delta = TokenSnapshot {
-            total: current.total.saturating_sub(previous.total),
-            input: current.input.saturating_sub(previous.input),
-            cached_input: current.cached_input.saturating_sub(previous.cached_input),
-            output: current.output.saturating_sub(previous.output),
-        };
-        previous = current;
-        let timestamp = session_event_timestamp(&value);
-        if timestamp < window_start {
-            continue;
-        }
-        if let Some(model) = model.as_deref() {
-            totals.add(model, delta);
-            if timestamp <= timeline_window_end {
-                events.push(TimedModelUsage {
-                    timestamp,
-                    model: model.to_owned(),
-                    delta,
-                });
-            }
-        }
-    }
+    let mut fully_recordable = collect_session_usage_records(
+        &mut reader,
+        window_start,
+        i64::MAX,
+        timeline_window_end,
+        totals,
+        events,
+    )?;
     let after_file = reader.get_ref().metadata().ok();
     let after_path = fs::symlink_metadata(path).ok();
     if after_file
@@ -6240,6 +6308,139 @@ fn collect_session_usage_file_with_recordability(
         fully_recordable = false;
     }
     Ok(fully_recordable)
+}
+
+fn recover_checkpointed_history_model_totals(
+    inventory: &LocalInputInventory,
+    recovery: &usage_store::HistoryContinuityRecovery,
+    checkpoints: &[usage_store::SessionCheckpoint],
+    window_seconds: i64,
+) -> Result<Vec<usage_store::SessionModelTotal>, String> {
+    if window_seconds <= 0
+        || recovery.boundary_timestamp <= 0
+        || recovery.boundary_timestamp > recovery.reset_at
+    {
+        return Err("legacy component recovery period is invalid".into());
+    }
+    if inventory.selected_session_files.is_empty() {
+        return Err("legacy component recovery source count is invalid".into());
+    }
+    let checkpoint_identities = checkpoints
+        .iter()
+        .map(|checkpoint| {
+            (
+                checkpoint.root_identity.as_str(),
+                checkpoint.relative_path.as_str(),
+                checkpoint.file_device,
+                checkpoint.file_inode,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let selected_bytes =
+        inventory
+            .selected_session_files
+            .iter()
+            .try_fold(0_u64, |total, candidate| {
+                if candidate.fingerprint.length > security::MAX_SESSION_FILE_BYTES {
+                    return Err("legacy component recovery file exceeds its bound".to_owned());
+                }
+                total
+                    .checked_add(candidate.fingerprint.length)
+                    .filter(|value| *value <= security::MAX_SESSION_TOTAL_BYTES)
+                    .ok_or_else(|| "legacy component recovery exceeds the 2 GiB bound".to_owned())
+            })?;
+    if inventory.selected_session_files.len() > security::MAX_SESSION_FILES {
+        return Err("legacy component recovery source count exceeds its bound".into());
+    }
+
+    let window_start = recovery.reset_at.saturating_sub(window_seconds);
+    let mut totals = ModelUsageTotals::default();
+    let mut events = Vec::new();
+    for candidate in &inventory.selected_session_files {
+        let path = &candidate.fingerprint.path;
+        let before_path = fs::symlink_metadata(path)
+            .map_err(|_| "legacy component recovery source is unavailable".to_owned())?;
+        let before_fingerprint = local_input_file_fingerprint(path, &before_path)
+            .map_err(|_| "legacy component recovery source is invalid".to_owned())?;
+        if before_fingerprint != candidate.fingerprint {
+            return Err("legacy component recovery inventory changed".into());
+        }
+        let file = File::open(path)
+            .map_err(|_| "legacy component recovery source cannot be opened".to_owned())?;
+        let before_file = file
+            .metadata()
+            .map_err(|_| "legacy component recovery source metadata is invalid".to_owned())?;
+        if !same_rollout_identity(&before_path, &before_file)
+            || before_file.len() != candidate.fingerprint.length
+        {
+            return Err("legacy component recovery source identity raced".into());
+        }
+        let before_totals = totals.clone();
+        let mut reader = BufReader::new(file.take(candidate.fingerprint.length));
+        let _fully_recordable = collect_session_usage_records(
+            &mut reader,
+            window_start,
+            recovery.boundary_timestamp,
+            i64::MIN,
+            &mut totals,
+            &mut events,
+        )
+        .map_err(|_| "legacy component recovery source parse failed".to_owned())?;
+        let after_file = reader
+            .get_ref()
+            .get_ref()
+            .metadata()
+            .map_err(|_| "legacy component recovery source metadata disappeared".to_owned())?;
+        let after_path = fs::symlink_metadata(path)
+            .map_err(|_| "legacy component recovery source path disappeared".to_owned())?;
+        if reader.get_ref().limit() != 0
+            || !same_rollout_identity(&before_file, &after_file)
+            || !same_rollout_identity(&before_file, &after_path)
+            || after_file.len() < candidate.fingerprint.length
+            || after_path.len() < candidate.fingerprint.length
+        {
+            return Err("legacy component recovery source was not stable".into());
+        }
+        if totals != before_totals
+            && !checkpoint_identities.contains(&(
+                candidate.recorded_source.root_identity.as_str(),
+                candidate.recorded_source.relative_path.as_str(),
+                candidate.recorded_source.file_device,
+                candidate.recorded_source.file_inode,
+            ))
+        {
+            return Err("legacy component recovery source has no durable checkpoint".into());
+        }
+    }
+    debug_assert!(events.is_empty());
+    let tokens = totals.token_totals();
+    let dollars = totals.dollar_totals();
+    if tokens.sol != recovery.sol_tokens
+        || tokens.terra != recovery.terra_tokens
+        || tokens.luna != recovery.luna_tokens
+        || !recovery.matches_dollar_totals(dollars.sol, dollars.terra, dollars.luna)
+    {
+        return Err(format!(
+            "legacy component recovery aggregate mismatch tokens={}/{}/{} expected={}/{}/{} dollars={:.9}/{:.9}/{:.9} expected={:.9}/{:.9}/{:.9}",
+            tokens.sol,
+            tokens.terra,
+            tokens.luna,
+            recovery.sol_tokens,
+            recovery.terra_tokens,
+            recovery.luna_tokens,
+            dollars.sol,
+            dollars.terra,
+            dollars.luna,
+            recovery.sol_dollars,
+            recovery.terra_dollars,
+            recovery.luna_dollars,
+        ));
+    }
+    debug_runtime(format!(
+        "legacy component recovery verified sources={} bytes={selected_bytes}",
+        inventory.selected_session_files.len()
+    ));
+    Ok(totals.to_session_totals())
 }
 
 fn resolved_executable(override_name: &str, command_name: &str) -> Option<PathBuf> {
@@ -6878,6 +7079,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
 struct LocalUsageCache {
     partitioned_collector_epoch: Option<u128>,
     verified_session_inventory: BTreeSet<SessionInventoryKey>,
+    rejected_history_recovery: Option<String>,
     #[cfg(test)]
     legacy_period: Option<(i64, i64)>,
     #[cfg(test)]
@@ -7007,6 +7209,7 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                 auth_epoch,
                 admission,
                 collection_state,
+                history_continuity_recovery,
                 reset_at,
                 window_seconds,
             } => {
@@ -7027,6 +7230,7 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                     collector_epoch = u128::from_be_bytes(epoch_bytes).max(1);
                     cycle_seq = 0;
                     active_boundary = Some(boundary);
+                    cache.rejected_history_recovery = None;
                 }
                 let Some(next_cycle) = cycle_seq.checked_add(1) else {
                     let _ = events.send(LocalEvent::Error {
@@ -7038,14 +7242,66 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                 };
                 cycle_seq = next_cycle;
                 let result = local_input_inventory().and_then(|inventory| {
-                    cache.collect_partitioned(PartitionedLocalCollection {
-                        reset_at,
-                        window_seconds,
-                        inventory,
-                        collection_state: *collection_state,
-                        collector_epoch,
-                        cycle_seq,
-                    })
+                    let mut collection_state = *collection_state;
+                    let mut verified_recovery = None;
+                    if let Some(authority) = history_continuity_recovery.filter(|authority| {
+                        cache.rejected_history_recovery.as_deref()
+                            != Some(authority.source_fingerprint.as_str())
+                    }) {
+                        let authority_fingerprint = authority.source_fingerprint.clone();
+                        match recover_checkpointed_history_model_totals(
+                            &inventory,
+                            &authority,
+                            &collection_state.checkpoints,
+                            window_seconds,
+                        ) {
+                            Ok(model_totals) => {
+                                // One immutable authority is replayed at most
+                                // once per resident process. The verified
+                                // recovery travels with the pending recorder
+                                // batch and can be retried without rescanning
+                                // the Session prefix.
+                                cache.rejected_history_recovery =
+                                    Some(authority_fingerprint.clone());
+                                let offset = ModelUsageTotals::from_session_totals(&model_totals);
+                                let mut cumulative = ModelUsageTotals::from_session_totals(
+                                    &collection_state.model_totals,
+                                );
+                                if cumulative.checked_add_totals(&offset).is_some() {
+                                    collection_state.model_totals = cumulative.to_session_totals();
+                                    verified_recovery =
+                                        Some(usage_store::HistoryContinuityModelRecovery {
+                                            authority,
+                                            model_totals,
+                                        });
+                                } else {
+                                    debug_runtime(
+                                        "legacy component recovery total overflow rejected",
+                                    );
+                                    cache.rejected_history_recovery = Some(authority_fingerprint);
+                                }
+                            }
+                            Err(error) => {
+                                debug_runtime(format!(
+                                    "legacy component recovery rejected: {error}"
+                                ));
+                                cache.rejected_history_recovery = Some(authority_fingerprint);
+                            }
+                        }
+                    }
+                    cache
+                        .collect_partitioned(PartitionedLocalCollection {
+                            reset_at,
+                            window_seconds,
+                            inventory,
+                            collection_state,
+                            collector_epoch,
+                            cycle_seq,
+                        })
+                        .map(|mut collection| {
+                            collection.history_continuity_recovery = verified_recovery;
+                            collection
+                        })
                 });
                 match result {
                     Ok(collection) => {
@@ -7072,6 +7328,7 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                             session_checkpoints: collection.session_checkpoints,
                             session_ranges: collection.session_ranges,
                             session_model_totals: collection.session_model_totals,
+                            history_continuity_recovery: collection.history_continuity_recovery,
                         })));
                     }
                     Err(_) => {
@@ -7236,6 +7493,7 @@ struct PendingRecorderBatch {
     session_checkpoints: Vec<usage_store::SessionCheckpoint>,
     session_ranges: Vec<usage_store::SessionRange>,
     session_model_totals: Vec<usage_store::SessionModelTotal>,
+    history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
     reset_at: Option<i64>,
     window_seconds: Option<i64>,
     cleanup_plans: Vec<SessionCleanupPlan>,
@@ -7302,6 +7560,7 @@ struct CodexInfoState {
     pending_session_checkpoints: Vec<usage_store::SessionCheckpoint>,
     pending_session_ranges: Vec<usage_store::SessionRange>,
     pending_session_model_totals: Vec<usage_store::SessionModelTotal>,
+    pending_history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
     pending_collector_generation: Option<(u128, u64)>,
     pending_session_period: Option<(i64, i64)>,
     pending_recorder_admission: Option<(u64, AccountAdmission)>,
@@ -7686,6 +7945,7 @@ impl CodexInfoState {
             pending_session_checkpoints: Vec::new(),
             pending_session_ranges: Vec::new(),
             pending_session_model_totals: Vec::new(),
+            pending_history_continuity_recovery: None,
             pending_collector_generation: None,
             pending_session_period: None,
             pending_recorder_admission: None,
@@ -7756,6 +8016,7 @@ impl CodexInfoState {
             pending_session_checkpoints: Vec::new(),
             pending_session_ranges: Vec::new(),
             pending_session_model_totals: Vec::new(),
+            pending_history_continuity_recovery: None,
             pending_collector_generation: None,
             pending_session_period: None,
             pending_recorder_admission: None,
@@ -7830,6 +8091,7 @@ impl CodexInfoState {
             pending_session_checkpoints: Vec::new(),
             pending_session_ranges: Vec::new(),
             pending_session_model_totals: Vec::new(),
+            pending_history_continuity_recovery: None,
             pending_collector_generation: None,
             pending_session_period: None,
             pending_recorder_admission: None,
@@ -8545,36 +8807,59 @@ impl CodexInfoState {
         let Some(partition) = self.account_partition.as_ref() else {
             return false;
         };
-        let collection_state = match fs::symlink_metadata(&partition.database_path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                usage_store::SessionCollectionState::default()
-            }
-            Ok(_) => {
-                let identity = partition.storage_identity();
-                let state =
-                    UsageStore::open_read_only_partitioned(&partition.database_path, &identity)
-                        .and_then(|store| store.load_session_collection_state());
-                match state {
-                    Ok(state) => state,
-                    Err(_) => {
-                        self.apply_identity_error(
-                            "Session checkpointのaccount partitionを確認できませんでした。".into(),
-                        );
-                        return false;
+        let (mut collection_state, history_continuity_recovery) =
+            match fs::symlink_metadata(&partition.database_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    (usage_store::SessionCollectionState::default(), None)
+                }
+                Ok(_) => {
+                    let identity = partition.storage_identity();
+                    let state =
+                        UsageStore::open_read_only_partitioned(&partition.database_path, &identity)
+                            .and_then(|store| {
+                                Ok((
+                                    store.load_session_collection_state()?,
+                                    store.pending_history_continuity_recovery()?,
+                                ))
+                            });
+                    match state {
+                        Ok(state) => state,
+                        Err(_) => {
+                            self.apply_identity_error(
+                                "Session checkpointのaccount partitionを確認できませんでした。"
+                                    .into(),
+                            );
+                            return false;
+                        }
                     }
                 }
-            }
-            Err(_) => {
-                self.apply_identity_error(
-                    "Session checkpoint DBを安全に確認できませんでした。".into(),
-                );
-                return false;
-            }
-        };
+                Err(_) => {
+                    self.apply_identity_error(
+                        "Session checkpoint DBを安全に確認できませんでした。".into(),
+                    );
+                    return false;
+                }
+            };
+        let period_boundary = admit_session_collection_period(
+            &mut collection_state,
+            reset_at,
+            window_seconds,
+            self.remaining_percent,
+            Utc::now().timestamp(),
+        );
+        debug_runtime(format!(
+            "local collection period admitted boundary={period_boundary} durable_generation={}",
+            collection_state.data_generation
+        ));
+        let history_continuity_recovery = history_continuity_recovery
+            .filter(|recovery| recovery.matches_reset_at(collection_state.reset_at));
         let command = LocalCommand::Collect {
             auth_epoch: self.auth_epoch,
             admission,
             collection_state: Box::new(collection_state),
+            history_continuity_recovery: (!period_boundary)
+                .then_some(history_continuity_recovery)
+                .flatten(),
             reset_at,
             window_seconds,
         };
@@ -8607,6 +8892,7 @@ impl CodexInfoState {
             session_checkpoints: std::mem::take(&mut self.pending_session_checkpoints),
             session_ranges: std::mem::take(&mut self.pending_session_ranges),
             session_model_totals: std::mem::take(&mut self.pending_session_model_totals),
+            history_continuity_recovery: self.pending_history_continuity_recovery.take(),
             reset_at: period.map(|value| value.0),
             window_seconds: period.map(|value| value.1),
             cleanup_plans: std::mem::take(&mut self.pending_session_cleanup),
@@ -8619,6 +8905,7 @@ impl CodexInfoState {
             || !self.pending_session_checkpoints.is_empty()
             || !self.pending_session_ranges.is_empty()
             || !self.pending_session_model_totals.is_empty()
+            || self.pending_history_continuity_recovery.is_some()
             || self.pending_collector_generation.is_some()
             || self.pending_session_period.is_some()
             || self.pending_recorder_admission.is_some()
@@ -8654,6 +8941,9 @@ impl CodexInfoState {
         if !batch.session_model_totals.is_empty() {
             self.pending_session_model_totals = batch.session_model_totals;
         }
+        if batch.history_continuity_recovery.is_some() {
+            self.pending_history_continuity_recovery = batch.history_continuity_recovery;
+        }
         self.pending_collector_generation = batch.collector_epoch.zip(batch.cycle_seq);
         self.pending_bounded_source_rescan_complete = batch.bounded_source_rescan_complete;
         self.pending_session_period = batch.reset_at.zip(batch.window_seconds);
@@ -8669,6 +8959,7 @@ impl CodexInfoState {
         self.pending_session_checkpoints.clear();
         self.pending_session_ranges.clear();
         self.pending_session_model_totals.clear();
+        self.pending_history_continuity_recovery = None;
         self.pending_collector_generation = None;
         self.pending_bounded_source_rescan_complete = false;
         self.pending_session_period = None;
@@ -8721,6 +9012,7 @@ impl CodexInfoState {
         self.pending_session_checkpoints.clear();
         self.pending_session_ranges.clear();
         self.pending_session_model_totals.clear();
+        self.pending_history_continuity_recovery = None;
         self.pending_collector_generation = None;
         self.pending_session_period = None;
         self.pending_recorder_admission = None;
@@ -9186,6 +9478,7 @@ impl CodexInfoState {
         self.pending_session_checkpoints = candidate.session_checkpoints;
         self.pending_session_ranges = candidate.session_ranges;
         self.pending_session_model_totals = candidate.session_model_totals;
+        self.pending_history_continuity_recovery = candidate.history_continuity_recovery;
         self.pending_bounded_source_rescan_complete = candidate.bounded_source_rescan_complete;
         self.pending_collector_generation = Some((candidate.collector_epoch, candidate.cycle_seq));
         self.pending_session_period =
@@ -12157,24 +12450,6 @@ enum ResidentServiceCycleOutcome {
     HeldIncomplete,
 }
 
-fn recorder_error_is_fatal(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    [
-        "fatal",
-        "full",
-        "readonly",
-        "read-only",
-        "corrupt",
-        "malformed",
-        "not a database",
-        "worker",
-        "profile lock",
-        "state file",
-    ]
-    .iter()
-    .any(|marker| error.contains(marker))
-}
-
 fn recorder_attempt_due(now: Instant, retry_at: Option<Instant>) -> bool {
     retry_at.is_none_or(|retry_at| now >= retry_at)
 }
@@ -12388,7 +12663,6 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
         let shutdown = service_shutdown_signal();
         tokio::pin!(shutdown);
         let mut recorder_retry_at: Option<Instant> = None;
-        let mut consecutive_store_failures = 0_u8;
         loop {
             tokio::select! {
                 _ = &mut shutdown => return Ok::<(), String>(()),
@@ -12423,6 +12697,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                 session_checkpoints,
                                 session_ranges,
                                 session_model_totals,
+                                history_continuity_recovery,
                                 reset_at,
                                 window_seconds,
                                 cleanup_plans,
@@ -12470,6 +12745,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                 || !session_checkpoints.is_empty()
                                 || !session_ranges.is_empty()
                                 || !session_model_totals.is_empty()
+                                || history_continuity_recovery.is_some()
                             {
                                 let Some(batch_partition_id) = partition_id.as_ref() else {
                                     state.apply_identity_error(
@@ -12509,6 +12785,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                         session_checkpoints,
                                         session_ranges,
                                         session_model_totals,
+                                        history_continuity_recovery,
                                         bounded_source_rescan_complete,
                                     },
                                 ) {
@@ -12604,7 +12881,6 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                         Ok(outcome) => {
                             if recorder_attempt {
                                 recorder_retry_at = None;
-                                consecutive_store_failures = 0;
                                 if last_recorder_error.take().is_some() {
                                     eprintln!("codex-info: recorder state commit recovered");
                                 }
@@ -12616,20 +12892,16 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                             }
                         }
                         Err(ResidentServiceCycleError::Store(error)) => {
-                            consecutive_store_failures =
-                                consecutive_store_failures.saturating_add(1);
                             if last_recorder_error.as_deref() != Some(error.as_str()) {
                                 eprintln!("codex-info: recorder state commit rejected: {error}");
                                 last_recorder_error = Some(error.clone());
                             }
-                            if recorder_error_is_fatal(&error)
-                                || consecutive_store_failures >= 2
-                            {
-                                return Err(format!(
-                                    "recorder persistence failed after {} cycle(s): {error}",
-                                    consecutive_store_failures
-                                ));
-                            }
+                            // A response timeout cannot distinguish a busy
+                            // serialized writer from a dead one. Keep the
+                            // exact pending batch and the last-good public
+                            // root, then retry once at the normal recorder
+                            // interval. Actual thread death is detected by
+                            // recorder.probe() on the one-second owner loop.
                             recorder_retry_at = Some(
                                 Instant::now()
                                     + daemon::daemon_interval_from_environment(),
@@ -14555,6 +14827,235 @@ mod tests {
     }
 
     #[test]
+    fn durable_model_totals_survive_restart_drift_and_clear_only_on_rollover() {
+        let now = 2_000_000_000;
+        let two_days = 2 * 86_400;
+        let durable_total = super::usage_store::SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 1_000,
+            input_tokens: 800,
+            cached_input_tokens: 300,
+            output_tokens: 200,
+        };
+        let mut restarted = super::usage_store::SessionCollectionState {
+            data_generation: 7,
+            reset_at: now - two_days + WEEK_SECONDS,
+            window_seconds: WEEK_SECONDS,
+            last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
+                observed_at: now - two_days,
+                remaining_percent: 70.0,
+            }),
+            model_totals: vec![durable_total.clone()],
+            ..super::usage_store::SessionCollectionState::default()
+        };
+        assert!(!super::admit_session_collection_period(
+            &mut restarted,
+            now + WEEK_SECONDS,
+            WEEK_SECONDS,
+            Some(69.0),
+            now,
+        ));
+        assert_eq!(restarted.model_totals, [durable_total.clone()]);
+
+        let mut rollover = super::usage_store::SessionCollectionState {
+            data_generation: 8,
+            reset_at: now + 30,
+            window_seconds: WEEK_SECONDS,
+            last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
+                observed_at: now - 60,
+                remaining_percent: 1.0,
+            }),
+            model_totals: vec![durable_total],
+            ..super::usage_store::SessionCollectionState::default()
+        };
+        assert!(super::admit_session_collection_period(
+            &mut rollover,
+            now + WEEK_SECONDS,
+            WEEK_SECONDS,
+            Some(100.0),
+            now,
+        ));
+        assert!(rollover.model_totals.is_empty());
+    }
+
+    #[test]
+    fn legacy_component_recovery_requires_checkpointed_sources_and_exact_aggregate() {
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-history-components-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let reset_at = 1_800_604_800;
+        let boundary_timestamp = 1_800_000_120;
+        let timestamp = |value| Utc.timestamp_opt(value, 0).single().unwrap().to_rfc3339();
+        let session = |model: &str, at: i64, total: u64, input: u64, cached: u64, output: u64| {
+            format!(
+                "{}\n{{malformed\n{}\n",
+                json!({
+                    "timestamp": timestamp(at - 1),
+                    "type": "turn_context",
+                    "model": model,
+                }),
+                json!({
+                    "timestamp": timestamp(at),
+                    "type": "token_count",
+                    "payload": {"info": {"total_token_usage": {
+                        "total_tokens": total,
+                        "input_tokens": input,
+                        "cached_input_tokens": cached,
+                        "output_tokens": output,
+                    }}},
+                })
+            )
+        };
+        fs::write(
+            root.join("sol.jsonl"),
+            session(
+                "gpt-5.6-sol",
+                1_800_000_060,
+                1_000_000,
+                800_000,
+                300_000,
+                200_000,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("luna.jsonl"),
+            session(
+                "gpt-5.6-luna",
+                boundary_timestamp,
+                2_000_000,
+                1_800_000,
+                800_000,
+                200_000,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("post-boundary.jsonl"),
+            session(
+                "gpt-5.6-terra",
+                boundary_timestamp + 60,
+                9_000_000,
+                9_000_000,
+                0,
+                0,
+            ),
+        )
+        .unwrap();
+
+        let inventory = super::local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let checkpoints = inventory
+            .selected_session_files
+            .iter()
+            .filter(|candidate| candidate.recorded_source.relative_path != "post-boundary.jsonl")
+            .map(|candidate| super::usage_store::SessionCheckpoint {
+                root_identity: candidate.recorded_source.root_identity.clone(),
+                relative_path: candidate.recorded_source.relative_path.clone(),
+                file_device: candidate.recorded_source.file_device,
+                file_inode: candidate.recorded_source.file_inode,
+                committed_offset: candidate.fingerprint.length,
+                discard_until_lf: false,
+                collector_epoch: 1,
+                cycle_seq: 1,
+                prefix_generation: 1,
+                prefix_sha256: "00".repeat(32),
+                fully_attributed_from_zero: true,
+                token_baseline_known: true,
+                last_model: None,
+                last_task_running: None,
+                previous_total: 0,
+                previous_input: 0,
+                previous_cached_input: 0,
+                previous_output: 0,
+            })
+            .collect::<Vec<_>>();
+        let authority = super::usage_store::HistoryContinuityRecovery {
+            source_fingerprint: "a".repeat(16),
+            source_rows: 2,
+            boundary_timestamp,
+            reset_at,
+            sol_dollars: 8.65,
+            terra_dollars: 0.0,
+            luna_dollars: 0.456,
+            sol_tokens: 1_000_000,
+            terra_tokens: 0,
+            luna_tokens: 2_000_000,
+        };
+
+        assert!(super::recover_checkpointed_history_model_totals(
+            &inventory,
+            &authority,
+            &[],
+            WEEK_SECONDS,
+        )
+        .is_err());
+        let mut mismatched = authority.clone();
+        mismatched.sol_tokens += 1;
+        assert!(super::recover_checkpointed_history_model_totals(
+            &inventory,
+            &mismatched,
+            &checkpoints,
+            WEEK_SECONDS,
+        )
+        .is_err());
+
+        let recovered = super::recover_checkpointed_history_model_totals(
+            &inventory,
+            &authority,
+            &checkpoints,
+            WEEK_SECONDS,
+        )
+        .unwrap();
+        assert_eq!(
+            recovered,
+            vec![
+                super::usage_store::SessionModelTotal {
+                    model: "SOL".into(),
+                    total_tokens: 1_000_000,
+                    input_tokens: 800_000,
+                    cached_input_tokens: 300_000,
+                    output_tokens: 200_000,
+                },
+                super::usage_store::SessionModelTotal {
+                    model: "TERRA".into(),
+                    total_tokens: 0,
+                    input_tokens: 0,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                },
+                super::usage_store::SessionModelTotal {
+                    model: "LUNA".into(),
+                    total_tokens: 2_000_000,
+                    input_tokens: 1_800_000,
+                    cached_input_tokens: 800_000,
+                    output_tokens: 200_000,
+                },
+            ]
+        );
+
+        let partial_path = root.join("post-boundary.jsonl");
+        let mut partial = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&partial_path)
+            .unwrap();
+        partial.write_all(br#"{"type":"token_count"}"#).unwrap();
+        drop(partial);
+        let partial_inventory = super::local_input_inventory_for_paths(Some(&root), None).unwrap();
+        assert!(super::recover_checkpointed_history_model_totals(
+            &partial_inventory,
+            &authority,
+            &checkpoints,
+            WEEK_SECONDS,
+        )
+        .is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn local_usage_failure_keeps_valid_quota_and_never_invents_zero_history() {
         let mut state = CodexInfoState::preview("normal");
         let reset_at = state.reset_at.expect("preview quota has reset");
@@ -15197,6 +15698,7 @@ mod tests {
                 cached_input_tokens: 20,
                 output_tokens: 20,
             }],
+            history_continuity_recovery: None,
         });
         state.local_usage_pending = true;
 
@@ -18969,6 +19471,7 @@ mod tests {
             window_seconds: WEEK_SECONDS,
             collector_epoch: Some(0x1111),
             cycle_seq: 1,
+            last_quota_observation: None,
             checkpoints: vec![first_checkpoint],
             model_totals: Vec::new(),
         };
@@ -19003,6 +19506,7 @@ mod tests {
             window_seconds: WEEK_SECONDS,
             collector_epoch: Some(0x1111),
             cycle_seq: 2,
+            last_quota_observation: None,
             checkpoints: appended.session_checkpoints,
             model_totals: appended.session_model_totals,
         };
@@ -19036,6 +19540,7 @@ mod tests {
             window_seconds: WEEK_SECONDS,
             collector_epoch: Some(0x1111),
             cycle_seq: 3,
+            last_quota_observation: None,
             checkpoints: fresh_collection.session_checkpoints,
             model_totals: fresh_collection.session_model_totals,
         };
@@ -19509,6 +20014,7 @@ mod tests {
                 window_seconds: WEEK_SECONDS,
                 collector_epoch: Some(0x4444),
                 cycle_seq: 1,
+                last_quota_observation: None,
                 checkpoints: first.session_checkpoints,
                 model_totals: first.session_model_totals,
             },
@@ -19617,6 +20123,7 @@ mod tests {
                 window_seconds: WEEK_SECONDS,
                 collector_epoch: Some(0x5555),
                 cycle_seq: 1,
+                last_quota_observation: None,
                 checkpoints: first.session_checkpoints,
                 model_totals: first.session_model_totals,
             },
@@ -19706,6 +20213,45 @@ mod tests {
         assert_eq!(inventory.selected_session_files.len(), 1);
         assert_eq!(inventory.overflow_session_files.len(), 1);
         assert_eq!(inventory.selected_session_files[0].fingerprint.path, newest);
+        let durable_total = super::usage_store::SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 1_000,
+            input_tokens: 1_000,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+        };
+        let mut durable_state = super::usage_store::SessionCollectionState {
+            data_generation: 3,
+            reset_at: reset_at - 1,
+            window_seconds: WEEK_SECONDS,
+            last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
+                observed_at: now.timestamp() - 60,
+                remaining_percent: 80.0,
+            }),
+            model_totals: vec![durable_total],
+            ..super::usage_store::SessionCollectionState::default()
+        };
+        assert!(!super::admit_session_collection_period(
+            &mut durable_state,
+            reset_at,
+            WEEK_SECONDS,
+            Some(79.0),
+            now.timestamp(),
+        ));
+        let cumulative = super::collect_incremental_local_usage(
+            &inventory,
+            &durable_state,
+            &BTreeSet::new(),
+            super::IncrementalSessionContext {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: false,
+                collector_epoch: 0x138,
+                cycle_seq: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(cumulative.model_usage.sol.tokens, 1_120);
         let collection =
             super::collect_local_usage_snapshot(reset_at, WEEK_SECONDS, &inventory).unwrap();
         assert_eq!(collection.model_usage.sol.tokens, 120);

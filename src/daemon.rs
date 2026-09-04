@@ -11,8 +11,9 @@
 use crate::account_scope::{self, AccountPartition};
 use crate::security;
 use crate::usage_store::{
-    RecordedSessionSource, RecorderGap, SessionCheckpoint, SessionCollectionCommit,
-    SessionModelTotal, SessionRange, StoragePartitionIdentity, UsageHistorySample, UsageStore,
+    HistoryContinuityModelRecovery, RecordedSessionSource, RecorderGap, SessionCheckpoint,
+    SessionCollectionCommit, SessionModelTotal, SessionRange, StoragePartitionIdentity,
+    UsageHistorySample, UsageStore,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1265,6 +1266,7 @@ pub(crate) struct RecorderGeneration {
     pub(crate) session_checkpoints: Vec<SessionCheckpoint>,
     pub(crate) session_ranges: Vec<SessionRange>,
     pub(crate) session_model_totals: Vec<SessionModelTotal>,
+    pub(crate) history_continuity_recovery: Option<HistoryContinuityModelRecovery>,
     pub(crate) bounded_source_rescan_complete: bool,
 }
 
@@ -1685,6 +1687,7 @@ impl RecorderWorker {
                                 session_checkpoints,
                                 session_ranges,
                                 session_model_totals,
+                                history_continuity_recovery,
                                 bounded_source_rescan_complete,
                             } = generation;
                             if std::env::var("CODEX_INFO_RECORDER_FAILURE")
@@ -1722,6 +1725,13 @@ impl RecorderWorker {
                                         let legacy =
                                             legacy_database_for_partition(&current.partition);
                                         let store = &mut current.store;
+                                        if let Some(recovery) =
+                                            history_continuity_recovery.as_ref()
+                                        {
+                                            store
+                                                .apply_history_continuity_model_totals(recovery)
+                                                .map_err(|error| error.to_string())?;
+                                        }
                                         let commit_result = store
                                             .commit_session_collection_with_samples(SessionCollectionCommit {
                                                 reset_at,
@@ -2496,6 +2506,7 @@ mod tests {
                         cached_input_tokens: 2_000,
                         output_tokens: 2_345,
                     }],
+                    history_continuity_recovery: None,
                     bounded_source_rescan_complete: true,
                 },
             )
@@ -2548,6 +2559,7 @@ mod tests {
                     session_checkpoints: Vec::new(),
                     session_ranges: Vec::new(),
                     session_model_totals: Vec::new(),
+                    history_continuity_recovery: None,
                     bounded_source_rescan_complete: false,
                 },
             )
@@ -2674,6 +2686,7 @@ mod tests {
                     session_checkpoints: Vec::new(),
                     session_ranges: Vec::new(),
                     session_model_totals: Vec::new(),
+                    history_continuity_recovery: None,
                     bounded_source_rescan_complete: true,
                 },
             )
@@ -2735,6 +2748,7 @@ mod tests {
                     session_checkpoints: Vec::new(),
                     session_ranges: Vec::new(),
                     session_model_totals: Vec::new(),
+                    history_continuity_recovery: None,
                     bounded_source_rescan_complete: true,
                 },
             )
@@ -2824,6 +2838,7 @@ mod tests {
             session_checkpoints: Vec::new(),
             session_ranges: Vec::new(),
             session_model_totals: Vec::new(),
+            history_continuity_recovery: None,
             bounded_source_rescan_complete: false,
         };
 
@@ -2869,6 +2884,7 @@ mod tests {
                 session_checkpoints: Vec::new(),
                 session_ranges: Vec::new(),
                 session_model_totals: Vec::new(),
+                history_continuity_recovery: None,
                 bounded_source_rescan_complete: false,
             };
             let mut writer = RecorderWorker::start().unwrap();

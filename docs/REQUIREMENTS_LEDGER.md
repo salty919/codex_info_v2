@@ -2,6 +2,22 @@
 
 この台帳にない振る舞いは、実装・評価・PRの対象にしない。要求を追加・変更した場合は、先にここへ安定ID、境界、失敗動作、独立オラクルを登録する。`verified`以外の行を残したまま最終ゲートを通過させてはならない。
 
+## Issue #138 — bounded Session収集とdurable累計正本（2026-09-04）
+
+- 目的: 1 cycleのSession入力をlatest 2GiB以下に保ったまま、同じaccount・同じusage periodで確定済みのモデル別累計を失わず、検証済みの新規rangeだけをexactly once加算してMain・概算・history latestを同じ累計正本へ揃える。
+- 非目的: 2GiB上限の緩和、定常cycleでのSession全文再走査、履歴最大値またはcomponent別maxの採用、UI clamp、既存history/Sessionの書換え、Windows固有計算の追加。既往障害の一回限り復旧だけはlatest 2GiB以内を再生し、永続checkpointとlegacy境界のモデル別token/価格合計へ完全一致する場合に限ってcomponent baselineを採用する。
+- 不変条件: durable累計とrange checkpointは同じaccount partition・stable period・collector generationに結合し、rolling `reset_at` driftでは継続、確認済みの真のrolloverだけで新期間を開始する。安全な加算を証明できないcycleは縮退値をcommitせずlast-good rootを保持する。
+- 依存DAG: account/storage admission → stable period identity → durable cumulative/checkpoint → bounded selected ranges → atomic totals/history commit → immutable details root → Linux/Windows表示。
+- raw clause対応: 2GiB超でも常識的な資源量で全件累計を保持→`CUM-138-01`、古いSessionを再読込せず記録済みrangeだけ反映→`CUM-138-02`、reset drift/真のrollover→`CUM-138-03`、API・Main・Graph・価格一致→`CUM-138-04`、既存データ保護と実機復旧→`CUM-138-05`。
+
+| ID | 要求（観測可能な契約） | 境界・失敗動作 | 実装範囲 | 独立オラクル | 状態 |
+| --- | --- | --- | --- | --- | --- |
+| CUM-138-01 | 同一stable periodのdurableモデル別token/価格累計をaccount DBの正本として保持し、Session inventoryが2GiBを超えてselected prefixから既記録fileが外れても累計を減らさない | selected prefixだけの再集計値でdurable累計を全置換しない。2GiBは1 cycleの入力上限であり累計母集団ではない | `src/main.rs`、`src/usage_store.rs` | durable baseline＋2GiB overflow＋verified tail固定caseでbaseline保持とtail 1回加算 | in-progress |
+| CUM-138-02 | source identityとcheckpointで検証した未記録rangeだけを累計へexactly once加算し、range cursor・累計・history sampleを一transactionでcommitする | restart、同じcycle再実行、selected集合変更で二重加算しない。identity/generation不一致、partial tail、変更prefixは加算せずlast-good保持 | `src/main.rs`、`src/usage_store.rs` | 同じrangeのrepeat/restart、変更prefix、stale generation固定caseで非重複・非mutation | in-progress |
+| CUM-138-03 | rolling `reset_at`の揺れをstable period内として累計継続し、quota回復または期間境界の観測で確認した真のrolloverだけ旧累計を新periodへcarryしない | `reset_at/window_seconds`の単純な完全不一致で0起点にしない。境界不明なら新periodを推測せずlast-good保持 | `src/main.rs`、`src/usage_store.rs` | same-period drift＋checkpoint＋restartとconfirmed rolloverの固定case | in-progress |
+| CUM-138-04 | `models`、`estimated_cost_label`、current `history` sampleを同じaccepted cumulative rootから同じdata generationとしてcommit・publishする | UI、REST projection、history最大値からの再計算・mergeを禁止し、不完全cycleで一部surfaceだけ更新しない | `src/main.rs`、`src/usage_store.rs` | 1 details root内のモデルtoken/価格合計とhistory latestのexact一致、失敗cycleのroot不変 | in-progress |
+| CUM-138-05 | 修正・live復旧・update・restartで既存history、Session、profile sentinelを変更せず、1 cycleのselected Session bytesを2GiB以下に保つ | exactな復元根拠なしに過去最大値をcurrentへ設定せず、実Linux APIと実Windows/Linux UIが未確認なら最終合格にしない | product data path、実Linux daemon/API、Linux/Windows UI | 修正前後sentinel digest、selected byte count、同一candidateの実API/UI read-back | in-progress |
+
 ## Issue #129 — account別usage storageとSession帰属（2026-09-02）
 
 - 目的: 同じOS user・同じ`CODEX_HOME`でChatGPT accountを切り替えても、usage DB、writer、backup、checkpoint、Session range、REST/UI rootを混合・上書きしない。
