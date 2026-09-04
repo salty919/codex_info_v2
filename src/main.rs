@@ -77,6 +77,8 @@ enum LocalCommand {
         auth_epoch: u64,
         admission: AccountAdmission,
         collection_state: Box<usage_store::SessionCollectionState>,
+        regression_recovery_state: Option<Box<usage_store::SessionCollectionState>>,
+        history_continuity_recovery: Option<usage_store::HistoryContinuityRecovery>,
         reset_at: i64,
         window_seconds: i64,
     },
@@ -146,14 +148,19 @@ struct LocalUsageCandidate {
     session_checkpoints: Vec<usage_store::SessionCheckpoint>,
     session_ranges: Vec<usage_store::SessionRange>,
     session_model_totals: Vec<usage_store::SessionModelTotal>,
+    history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
 }
 
 enum LocalEvent {
     Usage(Box<LocalUsageCandidate>),
     Error {
         auth_epoch: u64,
+        admission: AccountAdmission,
         reset_at: i64,
         window_seconds: i64,
+        collector_epoch: Option<u128>,
+        cycle_seq: Option<u64>,
+        durable_model_totals: Vec<usage_store::SessionModelTotal>,
     },
 }
 
@@ -216,7 +223,7 @@ impl ModelUsageRow {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ModelUsageTotals {
     sol: ModelUsageRow,
     terra: ModelUsageRow,
@@ -326,6 +333,56 @@ impl ModelUsageTotals {
                 output_tokens: row.output_tokens,
             })
             .collect()
+    }
+
+    fn checked_add_totals(&mut self, offset: &Self) -> Option<()> {
+        fn add_row(target: &mut ModelUsageRow, offset: &ModelUsageRow) -> Option<()> {
+            target.tokens = target.tokens.checked_add(offset.tokens)?;
+            target.input_tokens = target.input_tokens.checked_add(offset.input_tokens)?;
+            target.cached_input_tokens = target
+                .cached_input_tokens
+                .checked_add(offset.cached_input_tokens)?;
+            target.output_tokens = target.output_tokens.checked_add(offset.output_tokens)?;
+            Some(())
+        }
+        add_row(&mut self.sol, &offset.sol)?;
+        add_row(&mut self.terra, &offset.terra)?;
+        add_row(&mut self.luna, &offset.luna)
+    }
+
+    fn checked_difference(&self, baseline: &Self) -> Option<Self> {
+        fn subtract_row(
+            current: &ModelUsageRow,
+            baseline: &ModelUsageRow,
+        ) -> Option<ModelUsageRow> {
+            Some(ModelUsageRow {
+                name: current.name.clone(),
+                tokens: current.tokens.checked_sub(baseline.tokens)?,
+                input_tokens: current.input_tokens.checked_sub(baseline.input_tokens)?,
+                cached_input_tokens: current
+                    .cached_input_tokens
+                    .checked_sub(baseline.cached_input_tokens)?,
+                output_tokens: current.output_tokens.checked_sub(baseline.output_tokens)?,
+            })
+        }
+        Some(Self {
+            sol: subtract_row(&self.sol, &baseline.sol)?,
+            terra: subtract_row(&self.terra, &baseline.terra)?,
+            luna: subtract_row(&self.luna, &baseline.luna)?,
+        })
+    }
+
+    fn is_zero(&self) -> bool {
+        self.token_totals() == ModelTokenTotals::default()
+            && self.sol.input_tokens == 0
+            && self.sol.cached_input_tokens == 0
+            && self.sol.output_tokens == 0
+            && self.terra.input_tokens == 0
+            && self.terra.cached_input_tokens == 0
+            && self.terra.output_tokens == 0
+            && self.luna.input_tokens == 0
+            && self.luna.cached_input_tokens == 0
+            && self.luna.output_tokens == 0
     }
 }
 
@@ -2397,6 +2454,39 @@ fn reset_transition_is_boundary(
     false
 }
 
+/// Admit the durable absolute model totals for the next collector cycle.
+/// Reset timestamps are observations, not period identifiers: rolling drift
+/// and daemon downtime retain the baseline, while a verified rollover or a
+/// changed quota window starts the next cumulative period at zero. Session
+/// checkpoints deliberately survive both paths because token records remain
+/// append-only across quota periods.
+fn admit_session_collection_period(
+    state: &mut usage_store::SessionCollectionState,
+    next_reset_at: i64,
+    next_window_seconds: i64,
+    next_remaining_percent: Option<f64>,
+    now: i64,
+) -> bool {
+    if state.data_generation == 0 {
+        return false;
+    }
+    let observation = state.last_quota_observation.as_ref();
+    let boundary = state.window_seconds != next_window_seconds
+        || reset_transition_is_boundary(
+            (state.reset_at > 0).then_some(state.reset_at),
+            observation.map(|value| value.remaining_percent),
+            next_reset_at,
+            next_remaining_percent,
+            observation.map(|value| value.observed_at),
+            now,
+            state.window_seconds,
+        );
+    if boundary {
+        state.model_totals.clear();
+    }
+    boundary
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HistoryPeriod {
     canonical_reset_at: i64,
@@ -3409,7 +3499,22 @@ struct UnusedIntervalPosition {
     preserve_boundary: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GraphConfirmedGap {
+    start_at: i64,
+    end_at: i64,
+}
+
 fn graph_paths(samples: &[&UsageHistorySample], period_start: i64, period_end: i64) -> GraphPaths {
+    graph_paths_with_confirmed_gaps(samples, period_start, period_end, &[])
+}
+
+fn graph_paths_with_confirmed_gaps(
+    samples: &[&UsageHistorySample],
+    period_start: i64,
+    period_end: i64,
+    confirmed_gaps: &[GraphConfirmedGap],
+) -> GraphPaths {
     let remaining_points = remaining_graph_points(samples, period_start, period_end);
     let raw_minute = graph_time_endpoints(
         minute_model_spend_for_metric(samples, false),
@@ -3445,37 +3550,64 @@ fn graph_paths(samples: &[&UsageHistorySample], period_start: i64, period_end: i
         }
     };
     // Detect idle bands from raw cumulative snapshots, not smoothed lines.
-    let unused_intervals = unused_interval_positions(&raw_minute, period_start, period_end);
+    let unused_intervals = unused_interval_positions_with_confirmed_gaps(
+        &raw_minute,
+        period_start,
+        period_end,
+        confirmed_gaps,
+    );
     GraphPaths {
-        remaining: graph_path_from_points(&remaining_points, period_start, period_end, 100.0),
+        remaining: remaining_path_with_evidence(
+            &remaining_points,
+            samples,
+            &raw_minute,
+            period_start,
+            period_end,
+            confirmed_gaps,
+        ),
         remaining_markers: remaining_marker_positions_on_points(
             &remaining_points,
             period_start,
             period_end,
         ),
         unused_intervals,
-        luna: metric_line_path(&minute, period_start, period_end, dollar_max, |point| {
-            point.luna
-        }),
-        terra: metric_line_path(&minute, period_start, period_end, dollar_max, |point| {
-            point.terra
-        }),
-        sol: metric_line_path(&minute, period_start, period_end, dollar_max, |point| {
-            point.sol
-        }),
+        luna: metric_line_path_with_confirmed_gaps(
+            &minute,
+            period_start,
+            period_end,
+            dollar_max,
+            |point| point.luna,
+            confirmed_gaps,
+        ),
+        terra: metric_line_path_with_confirmed_gaps(
+            &minute,
+            period_start,
+            period_end,
+            dollar_max,
+            |point| point.terra,
+            confirmed_gaps,
+        ),
+        sol: metric_line_path_with_confirmed_gaps(
+            &minute,
+            period_start,
+            period_end,
+            dollar_max,
+            |point| point.sol,
+            confirmed_gaps,
+        ),
         dollar_labels: dollar_axis_labels(dollar_max),
         current_remaining_label: remaining.map(format_percent).unwrap_or_else(|| "—".into()),
-        current_sol_label: if has_model_data {
+        current_sol_label: if has_model_data && model_spend_is_reliable(&latest) {
             format!("${:.2}", latest.sol)
         } else {
             String::new()
         },
-        current_terra_label: if has_model_data {
+        current_terra_label: if has_model_data && model_spend_is_reliable(&latest) {
             format!("${:.2}", latest.terra)
         } else {
             String::new()
         },
-        current_luna_label: if has_model_data {
+        current_luna_label: if has_model_data && model_spend_is_reliable(&latest) {
             format!("${:.2}", latest.luna)
         } else {
             String::new()
@@ -3503,7 +3635,30 @@ fn graph_paths_for_selection(
     show_sol: bool,
     show_tokens: bool,
 ) -> GraphPaths {
-    let mut paths = graph_paths(samples, period_start, period_end);
+    graph_paths_for_selection_with_confirmed_gaps(
+        samples,
+        period_start,
+        period_end,
+        show_luna,
+        show_terra,
+        show_sol,
+        show_tokens,
+        &[],
+    )
+}
+
+fn graph_paths_for_selection_with_confirmed_gaps(
+    samples: &[&UsageHistorySample],
+    period_start: i64,
+    period_end: i64,
+    show_luna: bool,
+    show_terra: bool,
+    show_sol: bool,
+    show_tokens: bool,
+    confirmed_gaps: &[GraphConfirmedGap],
+) -> GraphPaths {
+    let mut paths =
+        graph_paths_with_confirmed_gaps(samples, period_start, period_end, confirmed_gaps);
     let minute = graph_time_endpoints(
         minute_model_spend_for_metric(samples, show_tokens),
         period_start,
@@ -3519,8 +3674,14 @@ fn graph_paths_for_selection(
         .any(|sample| sample.remaining_percent.is_finite() && sample.remaining_percent >= 0.0);
     if has_remaining_observation {
         if let Some(remaining) = remaining_points.last().map(|(_, value)| *value) {
-            paths.remaining =
-                graph_path_from_points(&remaining_points, period_start, period_end, 100.0);
+            paths.remaining = remaining_path_with_evidence(
+                &remaining_points,
+                samples,
+                &minute,
+                period_start,
+                period_end,
+                confirmed_gaps,
+            );
             paths.remaining_markers =
                 remaining_marker_positions_on_points(&remaining_points, period_start, period_end);
             paths.current_remaining_label = format_percent(remaining);
@@ -3529,7 +3690,12 @@ fn graph_paths_for_selection(
             paths.current_remaining_point_y = normalized;
         }
     }
-    paths.unused_intervals = unused_interval_positions(&minute, period_start, period_end);
+    paths.unused_intervals = unused_interval_positions_with_confirmed_gaps(
+        &minute,
+        period_start,
+        period_end,
+        confirmed_gaps,
+    );
     let maximum = minute
         .iter()
         .map(|point| {
@@ -3575,14 +3741,29 @@ fn graph_paths_for_selection(
     let graph_y =
         |value: f64| ((99.0 - value / scale_maximum * 98.0) / 100.0).clamp(0.01, 0.99) as f32;
     if show_luna {
-        (paths.luna_flat, paths.luna_rising) =
-            split_metric_line_paths(&minute, period_start, period_end, scale_maximum, |point| {
-                point.luna
-            });
-        paths.luna = metric_line_path(&minute, period_start, period_end, scale_maximum, |point| {
-            point.luna
-        });
-        paths.current_luna_label = if maximum > 0.0 {
+        let (flat, rising, inferred) = split_metric_line_paths_with_confirmed_gaps(
+            &minute,
+            period_start,
+            period_end,
+            scale_maximum,
+            |point| point.luna,
+            confirmed_gaps,
+        );
+        paths.luna_flat = [flat, inferred]
+            .into_iter()
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        paths.luna_rising = rising;
+        paths.luna = metric_line_path_with_confirmed_gaps(
+            &minute,
+            period_start,
+            period_end,
+            scale_maximum,
+            |point| point.luna,
+            confirmed_gaps,
+        );
+        paths.current_luna_label = if maximum > 0.0 && model_spend_is_reliable(&latest) {
             format_metric_value(latest.luna, show_tokens)
         } else {
             String::new()
@@ -3591,14 +3772,29 @@ fn graph_paths_for_selection(
         paths.current_luna_point_y = paths.current_luna_y;
     }
     if show_terra {
-        (paths.terra_flat, paths.terra_rising) =
-            split_metric_line_paths(&minute, period_start, period_end, scale_maximum, |point| {
-                point.terra
-            });
-        paths.terra = metric_line_path(&minute, period_start, period_end, scale_maximum, |point| {
-            point.terra
-        });
-        paths.current_terra_label = if maximum > 0.0 {
+        let (flat, rising, inferred) = split_metric_line_paths_with_confirmed_gaps(
+            &minute,
+            period_start,
+            period_end,
+            scale_maximum,
+            |point| point.terra,
+            confirmed_gaps,
+        );
+        paths.terra_flat = [flat, inferred]
+            .into_iter()
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        paths.terra_rising = rising;
+        paths.terra = metric_line_path_with_confirmed_gaps(
+            &minute,
+            period_start,
+            period_end,
+            scale_maximum,
+            |point| point.terra,
+            confirmed_gaps,
+        );
+        paths.current_terra_label = if maximum > 0.0 && model_spend_is_reliable(&latest) {
             format_metric_value(latest.terra, show_tokens)
         } else {
             String::new()
@@ -3607,14 +3803,29 @@ fn graph_paths_for_selection(
         paths.current_terra_point_y = paths.current_terra_y;
     }
     if show_sol {
-        (paths.sol_flat, paths.sol_rising) =
-            split_metric_line_paths(&minute, period_start, period_end, scale_maximum, |point| {
-                point.sol
-            });
-        paths.sol = metric_line_path(&minute, period_start, period_end, scale_maximum, |point| {
-            point.sol
-        });
-        paths.current_sol_label = if maximum > 0.0 {
+        let (flat, rising, inferred) = split_metric_line_paths_with_confirmed_gaps(
+            &minute,
+            period_start,
+            period_end,
+            scale_maximum,
+            |point| point.sol,
+            confirmed_gaps,
+        );
+        paths.sol_flat = [flat, inferred]
+            .into_iter()
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        paths.sol_rising = rising;
+        paths.sol = metric_line_path_with_confirmed_gaps(
+            &minute,
+            period_start,
+            period_end,
+            scale_maximum,
+            |point| point.sol,
+            confirmed_gaps,
+        );
+        paths.current_sol_label = if maximum > 0.0 && model_spend_is_reliable(&latest) {
             format_metric_value(latest.sol, show_tokens)
         } else {
             String::new()
@@ -3730,14 +3941,17 @@ fn graph_time_endpoints(
         }
         extended.push(point);
     }
-    // 時間バケットの途中で終わらず、期間の観測終端を右端に固定する。
-    // 期間外（たとえば reset 後に遅れて届いた未来行）の値を terminal
-    // endpoint へ持ち込まない。歴史期間の canonical reset 観測は
-    // `<= period_end` なので、X と Windows が同じ終端値を描く。
+    // Normal minute sampling may end at most one bucket before `period_end`.
+    // Extend only that bounded edge. A larger open-ended gap has no closing
+    // observation, so carrying the last value to the right edge would claim
+    // evidence that neither the local log nor its collector supplied.
     if let Some(last) = points
         .iter()
         .copied()
         .rfind(|point| point.timestamp <= period_end)
+        .filter(|point| {
+            period_end.saturating_sub(point.timestamp) <= MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS
+        })
     {
         let endpoint = HourlyModelSpend {
             timestamp: period_end,
@@ -3764,6 +3978,21 @@ struct HourlyModelSpend {
     luna: f64,
 }
 
+fn model_spend_is_reliable(point: &HourlyModelSpend) -> bool {
+    [point.sol, point.terra, point.luna]
+        .into_iter()
+        .all(|value| value.is_finite() && value >= 0.0)
+}
+
+fn unreliable_model_spend(timestamp: i64) -> HourlyModelSpend {
+    HourlyModelSpend {
+        timestamp,
+        sol: -1.0,
+        terra: -1.0,
+        luna: -1.0,
+    }
+}
+
 #[cfg(test)]
 fn minute_model_spend(samples: &[&UsageHistorySample]) -> Vec<HourlyModelSpend> {
     minute_model_spend_for_metric(samples, false)
@@ -3787,12 +4016,14 @@ fn minute_model_spend_for_metric(
         buckets.push(sample);
     }
     if show_tokens {
-        // The raw session counters are cumulative totals.  Older history
-        // rows can contain zero because the token fields did not exist (or a
-        // provider did not report them), so a zero after a known value must be
-        // treated as an unknown sample and carried forward.  Taking the
-        // maximum also protects the graph from stale/out-of-order rows.
-        let mut cumulative = [0.0_f64; 3];
+        // A cumulative vector may never move backwards inside one period.
+        // Older rows can contain zero because token fields did not exist, and
+        // a damaged collection can temporarily lose an already-counted
+        // Session prefix. Neither is evidence of zero usage. Keep the whole
+        // observation unavailable until one later whole vector dominates the
+        // last reliable vector; component-wise maxima would fabricate a row
+        // that was never observed.
+        let mut reliable = [0.0_f64; 3];
         return buckets
             .into_iter()
             .map(|sample| {
@@ -3801,22 +4032,25 @@ fn minute_model_spend_for_metric(
                     sample.terra_tokens as f64,
                     sample.luna_tokens as f64,
                 ];
-                for index in 0..3 {
-                    if current[index] > cumulative[index] {
-                        cumulative[index] = current[index];
-                    }
+                if current
+                    .iter()
+                    .zip(reliable)
+                    .any(|(current, previous)| *current < previous)
+                {
+                    return unreliable_model_spend(sample.timestamp);
                 }
+                reliable = current;
                 HourlyModelSpend {
                     timestamp: sample.timestamp,
-                    sol: cumulative[0],
-                    terra: cumulative[1],
-                    luna: cumulative[2],
+                    sol: current[0],
+                    terra: current[1],
+                    luna: current[2],
                 }
             })
             .collect();
     }
 
-    let mut cumulative = [0.0_f64; 3];
+    let mut reliable = [0.0_f64; 3];
     buckets
         .into_iter()
         .map(|sample| {
@@ -3825,22 +4059,19 @@ fn minute_model_spend_for_metric(
                 sample.terra_dollars,
                 sample.luna_dollars,
             ];
-            for index in 0..3 {
-                // Dollar history is also persisted as a cumulative snapshot.
-                // A later API scan can temporarily report a smaller snapshot
-                // (for example while a session file is still being indexed),
-                // so never add the positive difference twice after such a
-                // regression. Keep the greatest observed cumulative value,
-                // just as the token path does above.
-                if current[index] > cumulative[index] {
-                    cumulative[index] = current[index];
-                }
+            if current
+                .iter()
+                .zip(reliable)
+                .any(|(current, previous)| *current < previous)
+            {
+                return unreliable_model_spend(sample.timestamp);
             }
+            reliable = current;
             HourlyModelSpend {
                 timestamp: sample.timestamp,
-                sol: cumulative[0],
-                terra: cumulative[1],
-                luna: cumulative[2],
+                sol: current[0],
+                terra: current[1],
+                luna: current[2],
             }
         })
         .collect()
@@ -3890,12 +4121,13 @@ fn stacked_area_path(
 
 /// Draws one metric independently from the other model series. Token mode
 /// uses this path so enabling LUNA cannot turn SOL into a LUNA+SOL boundary.
-fn metric_line_path(
+fn metric_line_path_with_confirmed_gaps(
     points: &[HourlyModelSpend],
     period_start: i64,
     period_end: i64,
     maximum: f64,
     value: impl Fn(&HourlyModelSpend) -> f64,
+    confirmed_gaps: &[GraphConfirmedGap],
 ) -> String {
     if points.is_empty() {
         return String::new();
@@ -3903,30 +4135,45 @@ fn metric_line_path(
     if maximum <= 0.0 {
         return "M0.00 99.00 L100.00 99.00".into();
     }
-    let span = (period_end - period_start).max(1) as f64;
-    let coordinate = |timestamp: i64, raw: f64| {
-        let x = ((timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
-        let y = (99.0 - raw.max(0.0) / maximum * 98.0).clamp(1.0, 99.0);
-        (x, y)
-    };
-    let mut iter = points.iter();
-    let first = iter.next().expect("points is not empty");
-    let (x, y) = coordinate(first.timestamp, value(first));
-    let mut commands = format!("M{x:.2} {y:.2}");
-    let mut previous = first;
-    for point in iter {
-        let (x, y) = coordinate(point.timestamp, value(point));
-        let unobserved_gap = point.timestamp.saturating_sub(previous.timestamp)
-            > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
-        if unobserved_gap && value(point) > value(previous) {
-            let (_, previous_y) = coordinate(point.timestamp, value(previous));
-            commands.push_str(&format!(" L{x:.2} {previous_y:.2} L{x:.2} {y:.2}"));
-        } else {
-            commands.push_str(&format!(" L{x:.2} {y:.2}"));
-        }
-        previous = point;
+    let (flat, rising, inferred) = split_metric_line_paths_with_confirmed_gaps(
+        points,
+        period_start,
+        period_end,
+        maximum,
+        value,
+        confirmed_gaps,
+    );
+    [flat, rising, inferred]
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn append_dashed_segment(commands: &mut String, start: (f64, f64), end: (f64, f64)) {
+    let dx = end.0 - start.0;
+    let dy = end.1 - start.1;
+    let length = dx.hypot(dy);
+    if !length.is_finite() || length <= f64::EPSILON {
+        return;
     }
-    commands
+    const DASH: f64 = 1.2;
+    const GAP: f64 = 0.9;
+    let mut offset = 0.0;
+    while offset < length {
+        let dash_end = (offset + DASH).min(length);
+        let from = offset / length;
+        let to = dash_end / length;
+        let x1 = start.0 + dx * from;
+        let y1 = start.1 + dy * from;
+        let x2 = start.0 + dx * to;
+        let y2 = start.1 + dy * to;
+        if !commands.is_empty() {
+            commands.push(' ');
+        }
+        commands.push_str(&format!("M{x1:.2} {y1:.2} L{x2:.2} {y2:.2}"));
+        offset += DASH + GAP;
+    }
 }
 
 fn split_metric_line_paths(
@@ -3935,7 +4182,35 @@ fn split_metric_line_paths(
     period_end: i64,
     maximum: f64,
     value: impl Fn(&HourlyModelSpend) -> f64,
-) -> (String, String) {
+) -> (String, String, String) {
+    split_metric_line_paths_with_confirmed_gaps(
+        points,
+        period_start,
+        period_end,
+        maximum,
+        value,
+        &[],
+    )
+}
+
+fn graph_interval_overlaps_confirmed_gap(
+    start_at: i64,
+    end_at: i64,
+    confirmed_gaps: &[GraphConfirmedGap],
+) -> bool {
+    confirmed_gaps
+        .iter()
+        .any(|gap| start_at < gap.end_at && end_at > gap.start_at)
+}
+
+fn split_metric_line_paths_with_confirmed_gaps(
+    points: &[HourlyModelSpend],
+    period_start: i64,
+    period_end: i64,
+    maximum: f64,
+    value: impl Fn(&HourlyModelSpend) -> f64,
+    confirmed_gaps: &[GraphConfirmedGap],
+) -> (String, String, String) {
     let span = (period_end - period_start).max(1) as f64;
     let scale = maximum.max(1.0);
     let coordinate = |point: &HourlyModelSpend| {
@@ -3945,7 +4220,18 @@ fn split_metric_line_paths(
     };
     let mut flat = String::new();
     let mut rising = String::new();
+    let mut inferred = String::new();
     for pair in points.windows(2) {
+        if graph_interval_overlaps_confirmed_gap(
+            pair[0].timestamp,
+            pair[1].timestamp,
+            confirmed_gaps,
+        ) {
+            continue;
+        }
+        if !model_spend_is_reliable(&pair[0]) || !model_spend_is_reliable(&pair[1]) {
+            continue;
+        }
         let previous = value(&pair[0]);
         let current = value(&pair[1]);
         if !previous.is_finite() || !current.is_finite() || current < previous {
@@ -3953,36 +4239,10 @@ fn split_metric_line_paths(
         }
         let (x1, y1) = coordinate(&pair[0]);
         let (x2, y2) = coordinate(&pair[1]);
-        // The reset anchor is synthetic when the first observation arrives
-        // later. Keep the unknown interval at zero and show the observed
-        // increase at its actual timestamp instead of implying a diagonal
-        // increase throughout the unobserved interval.
-        if pair[0].timestamp == period_start
-            && pair[1].timestamp.saturating_sub(pair[0].timestamp) > 60
-            && previous == 0.0
-            && current > 0.0
-        {
-            if !flat.is_empty() {
-                flat.push(' ');
-            }
-            flat.push_str(&format!("M{x1:.2} {y1:.2} L{x2:.2} {y1:.2}"));
-            if !rising.is_empty() {
-                rising.push(' ');
-            }
-            rising.push_str(&format!("M{x2:.2} {y1:.2} L{x2:.2} {y2:.2}"));
-            continue;
-        }
         let unobserved_gap = pair[1].timestamp.saturating_sub(pair[0].timestamp)
             > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
-        if unobserved_gap && current > previous {
-            if !flat.is_empty() {
-                flat.push(' ');
-            }
-            flat.push_str(&format!("M{x1:.2} {y1:.2} L{x2:.2} {y1:.2}"));
-            if !rising.is_empty() {
-                rising.push(' ');
-            }
-            rising.push_str(&format!("M{x2:.2} {y1:.2} L{x2:.2} {y2:.2}"));
+        if unobserved_gap {
+            append_dashed_segment(&mut inferred, (x1, y1), (x2, y2));
             continue;
         }
         let target = if current == previous {
@@ -3995,16 +4255,51 @@ fn split_metric_line_paths(
         }
         target.push_str(&format!("M{x1:.2} {y1:.2} L{x2:.2} {y2:.2}"));
     }
-    (flat, rising)
+
+    // A regressed cumulative vector is an unavailable whole observation,
+    // not a smaller total. Only when a later whole vector recovers may the
+    // two reliable endpoints be connected, and that connection is dashed so
+    // no intermediate value is presented as recorded fact.
+    let mut last_reliable: Option<&HourlyModelSpend> = None;
+    let mut crossed_unreliable = false;
+    for point in points {
+        if !model_spend_is_reliable(point) {
+            crossed_unreliable |= last_reliable.is_some();
+            continue;
+        }
+        if let Some(previous) = last_reliable {
+            if crossed_unreliable
+                && !graph_interval_overlaps_confirmed_gap(
+                    previous.timestamp,
+                    point.timestamp,
+                    confirmed_gaps,
+                )
+            {
+                append_dashed_segment(&mut inferred, coordinate(previous), coordinate(point));
+            }
+        }
+        last_reliable = Some(point);
+        crossed_unreliable = false;
+    }
+    (flat, rising, inferred)
 }
 
-/// Return horizontal bands where none of the three cumulative model series
-/// changes. These bands make idle time visible even when all flat paths sit on
-/// top of one another at the chart baseline.
+/// Return horizontal bands where the model series is idle or unavailable.
+/// An unavailable interval also receives a dashed endpoint bridge; the band
+/// ensures it can never be mistaken for a confirmed flat cumulative value.
 fn unused_interval_positions(
     points: &[HourlyModelSpend],
     period_start: i64,
     period_end: i64,
+) -> Vec<UnusedIntervalPosition> {
+    unused_interval_positions_with_confirmed_gaps(points, period_start, period_end, &[])
+}
+
+fn unused_interval_positions_with_confirmed_gaps(
+    points: &[HourlyModelSpend],
+    period_start: i64,
+    period_end: i64,
+    confirmed_gaps: &[GraphConfirmedGap],
 ) -> Vec<UnusedIntervalPosition> {
     let span = (period_end - period_start).max(1) as f64;
     let to_x =
@@ -4022,13 +4317,15 @@ fn unused_interval_positions(
         if interval_end <= interval_start {
             continue;
         }
+        let unreliable = !model_spend_is_reliable(previous) || !model_spend_is_reliable(current);
         let unchanged = [
             (previous.sol, current.sol),
             (previous.terra, current.terra),
             (previous.luna, current.luna),
         ]
         .into_iter()
-        .all(|(before, after)| before.is_finite() && after.is_finite() && before == after);
+        .all(|(before, after)| before.is_finite() && after.is_finite() && before == after)
+            && !unreliable;
         let synthetic_zero_gap = previous.timestamp == period_start
             && current.timestamp.saturating_sub(previous.timestamp) > 60
             && previous.sol == 0.0
@@ -4050,7 +4347,7 @@ fn unused_interval_positions(
             ]
             .into_iter()
             .any(|(before, after)| after > before);
-        if !unchanged && !synthetic_zero_gap && !unobserved_active_gap {
+        if !unchanged && !synthetic_zero_gap && !unobserved_active_gap && !unreliable {
             continue;
         }
         let start = to_x(interval_start);
@@ -4058,11 +4355,10 @@ fn unused_interval_positions(
         if end <= start {
             continue;
         }
+        let preserve_boundary = synthetic_zero_gap || unobserved_active_gap || unreliable;
         if let Some(last) = intervals.last_mut() {
             let last_end = last.start + last.width;
-            if !last.preserve_boundary
-                && !synthetic_zero_gap
-                && !unobserved_active_gap
+            if last.preserve_boundary == preserve_boundary
                 && (last_end - start).abs() <= f64::EPSILON
             {
                 last.width = end - last.start;
@@ -4072,9 +4368,27 @@ fn unused_interval_positions(
         intervals.push(UnusedIntervalPosition {
             start,
             width: end - start,
-            preserve_boundary: synthetic_zero_gap || unobserved_active_gap,
+            preserve_boundary,
         });
     }
+    for gap in confirmed_gaps {
+        let gap_start = gap.start_at.max(period_start);
+        let gap_end = gap.end_at.min(period_end);
+        if gap_end <= gap_start {
+            continue;
+        }
+        intervals.push(UnusedIntervalPosition {
+            start: to_x(gap_start),
+            width: to_x(gap_end) - to_x(gap_start),
+            preserve_boundary: true,
+        });
+    }
+    intervals.sort_by(|left, right| {
+        left.start
+            .total_cmp(&right.start)
+            .then_with(|| left.width.total_cmp(&right.width))
+            .then_with(|| left.preserve_boundary.cmp(&right.preserve_boundary))
+    });
     intervals
 }
 
@@ -4335,17 +4649,34 @@ fn remaining_graph_points_for_metric(
         .unwrap_or(100.0)
         .clamp(0.0, 100.0);
     if model_points.len() < 2 {
-        return vec![
-            (period_start, initial_remaining),
-            (period_end, initial_remaining),
-        ];
+        // The remote quota source remains authoritative even when no local
+        // Session/log observation is available. Preserve every known quota
+        // endpoint at its real time; `remaining_path_with_evidence` renders
+        // these unattributed changes as dashed rather than hiding them and
+        // collapsing the whole loss into a later recovery point.
+        let mut points: Vec<(i64, f64)> = Vec::with_capacity(raw_remaining.len());
+        let mut previous = initial_remaining;
+        for (timestamp, raw) in raw_remaining {
+            let value = raw.min(previous);
+            if let Some(last) = points.last_mut() {
+                if last.0 == timestamp {
+                    last.1 = value;
+                    previous = value;
+                    continue;
+                }
+            }
+            points.push((timestamp, value));
+            previous = value;
+        }
+        return points;
     }
 
     // Walk the same minute intervals used by the model paths. A segment is
     // active only when at least one cumulative model value increases across
-    // that interval; quota rereads in an idle segment are ignored. Idle model
-    // intervals remain horizontal, while repeated active quota samples are
-    // completed by interpolation in the smoothing pass below.
+    // that interval. A lower quota reread remains a fact even when local
+    // model evidence is idle or unavailable; preserve it at its observed
+    // time and let the evidence renderer mark the mismatch as inferred.
+    // Repeated active quota samples are completed by interpolation below.
     let mut points = vec![(period_start, initial_remaining)];
     let mut active_segments = Vec::with_capacity(model_points.len() + 1);
     let mut previous_remaining = initial_remaining;
@@ -4365,6 +4696,8 @@ fn remaining_graph_points_for_metric(
             previous_model = current_model;
             continue;
         }
+        let unreliable_model =
+            !model_spend_is_reliable(&previous_model) || !model_spend_is_reliable(&current_model);
         let model_changed = current_model.sol > previous_model.sol
             || current_model.terra > previous_model.terra
             || current_model.luna > previous_model.luna;
@@ -4375,7 +4708,7 @@ fn remaining_graph_points_for_metric(
             && previous_model.luna == 0.0
             && model_changed;
         let active = model_changed && !synthetic_zero_gap;
-        let matched_remaining = if model_changed {
+        let matched_remaining = if model_changed && !unreliable_model {
             latest_remaining_for_model_change(
                 &remaining_by_timestamp,
                 timestamp,
@@ -4386,40 +4719,75 @@ fn remaining_graph_points_for_metric(
         } else {
             None
         };
-        let delayed_quota = if !model_changed && !quota_observed_since_model_change {
-            remaining_by_timestamp
-                .range((previous_timestamp + 1)..=timestamp)
-                .next_back()
-                .map(|(_, value)| *value)
-                .filter(|value| value.is_finite() && *value < previous_remaining)
-                .map(|value| value.clamp(0.0, 100.0))
-        } else {
-            None
-        };
+        let delayed_quota =
+            if !unreliable_model && !model_changed && !quota_observed_since_model_change {
+                remaining_by_timestamp
+                    .range((previous_timestamp + 1)..=timestamp)
+                    .next_back()
+                    .map(|(_, value)| *value)
+                    .filter(|value| value.is_finite() && *value < previous_remaining)
+                    .map(|value| value.clamp(0.0, 100.0))
+            } else {
+                None
+            };
+        let anomaly_quota = unreliable_model
+            .then(|| {
+                remaining_by_timestamp
+                    .range((previous_timestamp + 1)..=timestamp)
+                    .next_back()
+                    .map(|(_, value)| *value)
+                    .filter(|value| value.is_finite())
+                    .map(|value| value.clamp(0.0, 100.0))
+            })
+            .flatten();
+        let unattributed_quota = (!unreliable_model && !model_changed)
+            .then(|| {
+                remaining_by_timestamp
+                    .range((previous_timestamp + 1)..=timestamp)
+                    .next_back()
+                    .map(|(_, value)| *value)
+                    .filter(|value| value.is_finite() && *value < previous_remaining)
+                    .map(|value| value.clamp(0.0, 100.0))
+            })
+            .flatten();
         let matched_quota = matched_remaining.is_some();
         let delayed_quota_applied = delayed_quota.is_some();
+        let unattributed_quota_applied = unattributed_quota.is_some() && !delayed_quota_applied;
         let next_remaining = matched_remaining
             .or(delayed_quota)
+            .or(anomaly_quota)
+            .or(unattributed_quota)
             .map(|value| previous_remaining.min(value))
             .unwrap_or(previous_remaining);
-        if model_changed {
+        if unreliable_model {
+            quota_observed_since_model_change = anomaly_quota.is_some();
+        } else if model_changed {
             quota_observed_since_model_change = matched_quota;
-        } else if delayed_quota_applied {
+        } else if delayed_quota_applied || unattributed_quota.is_some() {
             quota_observed_since_model_change = true;
         }
 
         if synthetic_zero_gap {
-            // Keep an unobserved reset-to-first-use gap horizontal, then make
-            // the first observed quota value explicit at its real timestamp.
-            points.push((timestamp, previous_remaining));
-            active_segments.push(false);
-            if next_remaining != previous_remaining {
-                points.push((timestamp, next_remaining));
-                active_segments.push(false);
-            }
+            // Reset=100% and the first remote observation are the only two
+            // known endpoints. Connect them as one inferred interval; a
+            // flat-then-vertical corner at the first observation would claim
+            // all earlier consumption happened instantaneously.
+            points.push((timestamp, next_remaining));
+            active_segments.push(true);
+        } else if unreliable_model {
+            // Model attribution is unavailable, but quota observations still
+            // have their own authority. Keep them at their observed minute
+            // and let the evidence path render any completion across missing
+            // observations as a dashed, non-authoritative bridge.
+            points.push((timestamp, next_remaining));
+            active_segments.push(true);
         } else {
             points.push((timestamp, next_remaining));
-            active_segments.push(active);
+            // `true` means the quota line may move across this interval. An
+            // observed but locally unattributed decrease must survive the
+            // smoothing pass; evidence rendering still keeps it dashed
+            // because the model vector itself did not advance.
+            active_segments.push(active || unattributed_quota_applied);
         }
         previous_remaining = next_remaining;
         previous_model = current_model;
@@ -4636,28 +5004,115 @@ fn collapse_remaining_change_points(points: &[(i64, f64)]) -> Vec<(i64, f64)> {
     collapsed
 }
 
-fn graph_path_from_points(
+fn quota_point_is_observed(samples: &[&UsageHistorySample], timestamp: i64, value: f64) -> bool {
+    let minute = timestamp.div_euclid(60) * 60;
+    samples.iter().any(|sample| {
+        sample.timestamp.div_euclid(60) * 60 == minute
+            && sample.remaining_percent.is_finite()
+            && sample.remaining_percent >= 0.0
+            && (sample.remaining_percent.clamp(0.0, 100.0) - value).abs() <= f64::EPSILON
+    })
+}
+
+fn quota_interval_is_contiguously_observed(
+    samples: &[&UsageHistorySample],
+    start: i64,
+    end: i64,
+) -> bool {
+    let start_minute = start.div_euclid(60) * 60;
+    let end_minute = end.div_euclid(60) * 60;
+    let mut observed = samples
+        .iter()
+        .filter(|sample| {
+            sample.remaining_percent.is_finite()
+                && sample.remaining_percent >= 0.0
+                && sample.timestamp.div_euclid(60) * 60 >= start_minute
+                && sample.timestamp.div_euclid(60) * 60 <= end_minute
+        })
+        .map(|sample| sample.timestamp.div_euclid(60) * 60)
+        .collect::<Vec<_>>();
+    observed.sort_unstable();
+    observed.dedup();
+    observed.first() == Some(&start_minute)
+        && observed.last() == Some(&end_minute)
+        && observed
+            .windows(2)
+            .all(|pair| pair[1].saturating_sub(pair[0]) <= 60)
+}
+
+fn model_interval_evidence(points: &[HourlyModelSpend], start: i64, end: i64) -> (bool, bool) {
+    let interval = points
+        .iter()
+        .filter(|point| point.timestamp >= start && point.timestamp <= end)
+        .collect::<Vec<_>>();
+    if interval.len() < 2
+        || interval.iter().any(|point| !model_spend_is_reliable(point))
+        || interval.windows(2).any(|pair| {
+            pair[1].timestamp.saturating_sub(pair[0].timestamp)
+                > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS
+        })
+    {
+        return (false, false);
+    }
+    let advanced = interval.windows(2).any(|pair| {
+        pair[1].sol > pair[0].sol || pair[1].terra > pair[0].terra || pair[1].luna > pair[0].luna
+    });
+    (true, advanced)
+}
+
+/// Solid segments require matching, contiguous quota observations and a
+/// reliable local model vector. A missing source or an unattributed quota
+/// decrease is joined only between known endpoints with short dashed
+/// strokes. A normal open-ended remote gap holds the last measured remaining
+/// value horizontally as an explicitly dashed last-good projection; a
+/// confirmed irrecoverable gap still breaks the path entirely.
+fn remaining_path_with_evidence(
     points: &[(i64, f64)],
+    samples: &[&UsageHistorySample],
+    model_points: &[HourlyModelSpend],
     period_start: i64,
     period_end: i64,
-    maximum: f64,
+    confirmed_gaps: &[GraphConfirmedGap],
 ) -> String {
     let span = (period_end - period_start).max(1) as f64;
-    points
-        .iter()
-        .enumerate()
-        .map(|(index, (timestamp, raw))| {
-            let x = ((timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
-            let y = if maximum > 0.0 {
-                (99.0 - raw / maximum * 98.0).clamp(1.0, 99.0)
-            } else {
-                99.0
-            };
-            let command = if index == 0 { "M" } else { "L" };
-            format!("{command}{x:.2} {y:.2}")
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let coordinate = |(timestamp, raw): (i64, f64)| {
+        let x = ((timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
+        let y = (99.0 - raw.clamp(0.0, 100.0) * 0.98).clamp(1.0, 99.0);
+        (x, y)
+    };
+    let mut commands = String::new();
+    for pair in points.windows(2) {
+        let [before, after] = pair else {
+            continue;
+        };
+        if graph_interval_overlaps_confirmed_gap(before.0, after.0, confirmed_gaps) {
+            // A source-proven irrecoverable interval is stronger than an
+            // ordinary sampling gap. Do not connect it even with an inferred
+            // dash: the neutral gap band is the only projection inside it.
+            continue;
+        }
+        let quota_evidence = quota_point_is_observed(samples, before.0, before.1)
+            && quota_point_is_observed(samples, after.0, after.1)
+            && quota_interval_is_contiguously_observed(samples, before.0, after.0);
+        let (model_evidence, model_advanced) =
+            model_interval_evidence(model_points, before.0, after.0);
+        let quota_decreased = after.1 < before.1;
+        let solid = quota_evidence && model_evidence && (!quota_decreased || model_advanced);
+        let start = coordinate(*before);
+        let end = coordinate(*after);
+        if solid {
+            if !commands.is_empty() {
+                commands.push(' ');
+            }
+            commands.push_str(&format!(
+                "M{:.2} {:.2} L{:.2} {:.2}",
+                start.0, start.1, end.0, end.1
+            ));
+        } else {
+            append_dashed_segment(&mut commands, start, end);
+        }
+    }
+    commands
 }
 
 fn remaining_graph_y(remaining: f64) -> f64 {
@@ -4695,6 +5150,16 @@ fn smooth_model_spend(points: &[HourlyModelSpend]) -> Vec<HourlyModelSpend> {
         let previous = *smoothed.last().expect("zero anchor exists");
         let current = points[index];
         let next = points[index + 1];
+        if !model_spend_is_reliable(&previous)
+            || !model_spend_is_reliable(&current)
+            || !model_spend_is_reliable(&next)
+        {
+            // Never smooth across an unavailable cumulative vector. The
+            // evidence projection owns an explicitly dashed bridge once a
+            // later whole-vector observation recovers the interval.
+            smoothed.push(current);
+            continue;
+        }
         let previous_gap = current.timestamp.saturating_sub(previous.timestamp)
             > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
         let next_gap = next.timestamp.saturating_sub(current.timestamp)
@@ -4720,6 +5185,10 @@ fn smooth_model_spend(points: &[HourlyModelSpend]) -> Vec<HourlyModelSpend> {
     }
     let last = *points.last().expect("points has at least three items");
     let previous = *smoothed.last().expect("anchor exists");
+    if !model_spend_is_reliable(&last) || !model_spend_is_reliable(&previous) {
+        smoothed.push(last);
+        return smoothed;
+    }
     smoothed.push(HourlyModelSpend {
         timestamp: last.timestamp,
         sol: last.sol.max(previous.sol),
@@ -4872,6 +5341,7 @@ struct SessionCleanupPlan {
     overflow_files: Vec<SessionFileCandidate>,
 }
 
+#[derive(Clone)]
 struct LocalInputInventory {
     selected_session_files: Vec<SessionFileCandidate>,
     overflow_session_files: Vec<SessionFileCandidate>,
@@ -5123,8 +5593,125 @@ struct LocalUsageCollection {
     session_checkpoints: Vec<usage_store::SessionCheckpoint>,
     session_ranges: Vec<usage_store::SessionRange>,
     session_model_totals: Vec<usage_store::SessionModelTotal>,
+    history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
     cleanup_plan: Option<SessionCleanupPlan>,
     bounded_source_rescan_complete: bool,
+}
+
+fn apply_regression_recovery(
+    collection: &mut LocalUsageCollection,
+    recovered: ModelUsageTotals,
+) -> bool {
+    let Some(offset) = recovered.checked_difference(&collection.model_usage) else {
+        debug_runtime("durable cumulative recovery rejected non-monotonic candidate");
+        return false;
+    };
+    if offset.is_zero() {
+        return false;
+    }
+    let costs = offset.dollar_totals();
+    let tokens = offset.token_totals();
+    let mut adjusted_history = collection.history_samples.clone();
+    for sample in &mut adjusted_history {
+        let sol_dollars = sample.sol_dollars + costs.sol;
+        let terra_dollars = sample.terra_dollars + costs.terra;
+        let luna_dollars = sample.luna_dollars + costs.luna;
+        let Some(sol_tokens) = sample.sol_tokens.checked_add(tokens.sol) else {
+            return false;
+        };
+        let Some(terra_tokens) = sample.terra_tokens.checked_add(tokens.terra) else {
+            return false;
+        };
+        let Some(luna_tokens) = sample.luna_tokens.checked_add(tokens.luna) else {
+            return false;
+        };
+        if [sol_dollars, terra_dollars, luna_dollars]
+            .into_iter()
+            .any(|value| !value.is_finite() || value < 0.0)
+        {
+            return false;
+        }
+        sample.sol_dollars = sol_dollars;
+        sample.terra_dollars = terra_dollars;
+        sample.luna_dollars = luna_dollars;
+        sample.sol_tokens = sol_tokens;
+        sample.terra_tokens = terra_tokens;
+        sample.luna_tokens = luna_tokens;
+    }
+    collection.history_samples = adjusted_history;
+    collection.session_model_totals = recovered.to_session_totals();
+    collection.model_usage = recovered;
+    debug_runtime(format!(
+        "durable cumulative recovery applied sol={} terra={} luna={}",
+        tokens.sol, tokens.terra, tokens.luna
+    ));
+    true
+}
+
+fn load_regression_recovery_state(
+    partition: &account_scope::AccountPartition,
+    current: &usage_store::SessionCollectionState,
+    continuity: &usage_store::HistoryContinuityRecovery,
+) -> Option<usage_store::SessionCollectionState> {
+    let identity = partition.storage_identity();
+    let mut selected: Option<usage_store::SessionCollectionState> = None;
+    for generation in 1..=3 {
+        let path = partition
+            .database_path
+            .with_extension(format!("sqlite3.bak.{generation}"));
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return None;
+            }
+            Ok(_) => {}
+        }
+        let store = UsageStore::open_read_only_partitioned(&path, &identity).ok()?;
+        store.verify_integrity().ok()?;
+        if store.pending_history_continuity_recovery().ok()?.as_ref() != Some(continuity) {
+            return None;
+        }
+        let candidate = store.load_session_collection_state().ok()?;
+        if candidate.data_generation >= current.data_generation
+            || candidate.window_seconds != current.window_seconds
+            || !same_reset_period(candidate.reset_at, current.reset_at)
+            || candidate.collector_epoch.is_none()
+            || candidate.cycle_seq == 0
+            || candidate.checkpoints.is_empty()
+        {
+            continue;
+        }
+        let candidate_totals = ModelUsageTotals::from_session_totals(&candidate.model_totals);
+        if candidate_totals.is_zero() {
+            continue;
+        }
+        match selected.as_ref() {
+            None => selected = Some(candidate),
+            Some(existing) => {
+                let existing_totals = ModelUsageTotals::from_session_totals(&existing.model_totals);
+                let candidate_dominates = candidate_totals
+                    .checked_difference(&existing_totals)
+                    .is_some();
+                let existing_dominates = existing_totals
+                    .checked_difference(&candidate_totals)
+                    .is_some();
+                if candidate_dominates && !existing_dominates {
+                    selected = Some(candidate);
+                } else if !candidate_dominates && !existing_dominates {
+                    debug_runtime("durable cumulative backup candidates are incomparable");
+                    return None;
+                }
+            }
+        }
+    }
+    if let Some(candidate) = selected.as_ref() {
+        debug_runtime(format!(
+            "durable cumulative backup selected generation={}",
+            candidate.data_generation
+        ));
+    }
+    selected
 }
 
 fn cleanup_plan_for_inventory(inventory: &LocalInputInventory) -> Option<SessionCleanupPlan> {
@@ -5209,6 +5796,7 @@ fn collect_local_usage_snapshot(
         session_checkpoints: Vec::new(),
         session_ranges: Vec::new(),
         session_model_totals: Vec::new(),
+        history_continuity_recovery: None,
         cleanup_plan: cleanup_plan_for_inventory(inventory),
         bounded_source_rescan_complete: inventory.overflow_session_files.is_empty(),
     })
@@ -5346,6 +5934,83 @@ struct TimedModelUsage {
 /// same file disappear from the graph.  The bounded reader consumes the bad
 /// record before returning the error, so skipping only `LimitExceeded` and
 /// `Parse` is both recoverable and bounded; I/O failures remain fatal.
+const SESSION_RECORD_INITIAL_CAPACITY: usize = 8 * 1024;
+
+fn read_recoverable_session_record_into<R: BufRead>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> Result<(bool, bool), security::SecurityError> {
+    let mut skipped_invalid_record = false;
+    loop {
+        line.clear();
+        let mut invalid_record = false;
+        loop {
+            let buffer = reader
+                .fill_buf()
+                .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::Io))?;
+            if buffer.is_empty() {
+                if line.is_empty() {
+                    return Ok((false, skipped_invalid_record));
+                }
+                return Err(security::SecurityError::new(
+                    security::SecurityErrorKind::Unterminated,
+                ));
+            }
+            if let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                if line.len().saturating_add(position) > security::MAX_JSONL_LINE_BYTES {
+                    reader.consume(position + 1);
+                    invalid_record = true;
+                    break;
+                }
+                line.extend_from_slice(&buffer[..position]);
+                reader.consume(position + 1);
+                break;
+            }
+            if line.len().saturating_add(buffer.len()) > security::MAX_JSONL_LINE_BYTES {
+                let length = buffer.len();
+                reader.consume(length);
+                if !discard_session_partial_tail(reader)? {
+                    return Err(security::SecurityError::new(
+                        security::SecurityErrorKind::Unterminated,
+                    ));
+                }
+                invalid_record = true;
+                break;
+            }
+            line.extend_from_slice(buffer);
+            let length = buffer.len();
+            reader.consume(length);
+        }
+        if invalid_record {
+            debug_runtime("skipped malformed session record kind=LimitExceeded");
+            skipped_invalid_record = true;
+            continue;
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if std::str::from_utf8(line).is_err() {
+            debug_runtime("skipped malformed session record kind=Parse");
+            skipped_invalid_record = true;
+            continue;
+        }
+        return Ok((true, skipped_invalid_record));
+    }
+}
+
+fn session_record_may_affect_usage(line: &[u8]) -> bool {
+    const USAGE_RECORD_MARKERS: [&[u8]; 4] = [
+        b"token_count",
+        b"turn_context",
+        b"thread_context",
+        b"thread_settings_applied",
+    ];
+    USAGE_RECORD_MARKERS.iter().any(|marker| {
+        line.windows(marker.len())
+            .any(|candidate| candidate == *marker)
+    })
+}
+
 #[cfg(test)]
 fn read_recoverable_session_line<R: BufRead>(
     reader: &mut R,
@@ -5357,31 +6022,14 @@ fn read_recoverable_session_line<R: BufRead>(
 fn read_recoverable_session_line_with_status<R: BufRead>(
     reader: &mut R,
 ) -> Result<(Option<String>, bool), security::SecurityError> {
-    let mut skipped_invalid_record = false;
-    loop {
-        match security::read_bounded_jsonl_record(reader) {
-            Ok(Some((line, true))) => return Ok((Some(line), skipped_invalid_record)),
-            Ok(Some((_line, false))) => {
-                return Err(security::SecurityError::new(
-                    security::SecurityErrorKind::Unterminated,
-                ));
-            }
-            Ok(None) => return Ok((None, skipped_invalid_record)),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    security::SecurityErrorKind::LimitExceeded | security::SecurityErrorKind::Parse
-                ) =>
-            {
-                debug_runtime(format!(
-                    "skipped malformed session record kind={:?}",
-                    error.kind()
-                ));
-                skipped_invalid_record = true;
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    let mut line = Vec::with_capacity(SESSION_RECORD_INITIAL_CAPACITY);
+    let (present, skipped_invalid_record) =
+        read_recoverable_session_record_into(reader, &mut line)?;
+    let line = present
+        .then(|| String::from_utf8(line))
+        .transpose()
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::Parse))?;
+    Ok((line, skipped_invalid_record))
 }
 
 fn session_event_type(value: &Value) -> Option<&str> {
@@ -5461,6 +6109,96 @@ fn session_event_timestamp(value: &Value) -> i64 {
         .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
         .map(|value| value.timestamp())
         .unwrap_or(0)
+}
+
+fn collect_session_usage_records<R: BufRead>(
+    reader: &mut R,
+    window_start: i64,
+    totals_window_end: i64,
+    timeline_window_end: i64,
+    totals: &mut ModelUsageTotals,
+    events: &mut Vec<TimedModelUsage>,
+) -> Result<bool, security::SecurityError> {
+    let original = totals.clone();
+    let initial_events_len = events.len();
+    let mut fully_recordable = true;
+    let mut model: Option<String> = None;
+    let mut previous = TokenSnapshot::default();
+    let mut line = Vec::with_capacity(SESSION_RECORD_INITIAL_CAPACITY);
+    loop {
+        let present = match read_recoverable_session_record_into(reader, &mut line) {
+            Ok((present, skipped_invalid_record)) => {
+                fully_recordable &= !skipped_invalid_record;
+                present
+            }
+            Err(error) => {
+                *totals = original;
+                events.truncate(initial_events_len);
+                return Err(error);
+            }
+        };
+        if !present {
+            break;
+        }
+        // Session files contain large tool payloads and assistant/user
+        // messages that cannot change model attribution or token counters.
+        // Their framing is still bounded and consumed above, but building a
+        // serde tree for each one makes a 2 GiB recovery retain memory in
+        // proportion to unrelated payloads. A missed escaped marker only
+        // makes the immutable aggregate oracle reject recovery; it can never
+        // admit an incomplete total.
+        if !session_record_may_affect_usage(&line) {
+            // Skipping allocation-heavy payload decoding must not turn a
+            // malformed complete record into cleanup authority. Validate the
+            // JSON grammar without materializing its payload so following
+            // usage records remain readable while the source stays retained.
+            if serde_json::from_slice::<serde::de::IgnoredAny>(&line).is_err() {
+                fully_recordable = false;
+            }
+            continue;
+        }
+        let value = match serde_json::from_slice::<Value>(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                fully_recordable = false;
+                continue;
+            }
+        };
+        // thread_settings_applied can precede the actual turn context. Keep
+        // the previous model until turn_context confirms the model for the
+        // token-count event; otherwise setup metadata is charged to the next
+        // model (ccusage-compatible attribution).
+        if session_event_type(&value) != Some("thread_settings_applied") || model.is_none() {
+            if let Some(next_model) = session_event_model(&value) {
+                model = Some(next_model);
+            }
+        }
+        let Some(current) = session_token_snapshot(&value) else {
+            continue;
+        };
+        let delta = TokenSnapshot {
+            total: current.total.saturating_sub(previous.total),
+            input: current.input.saturating_sub(previous.input),
+            cached_input: current.cached_input.saturating_sub(previous.cached_input),
+            output: current.output.saturating_sub(previous.output),
+        };
+        previous = current;
+        let timestamp = session_event_timestamp(&value);
+        if timestamp < window_start || timestamp > totals_window_end {
+            continue;
+        }
+        if let Some(model) = model.as_deref() {
+            totals.add(model, delta);
+            if timestamp <= timeline_window_end {
+                events.push(TimedModelUsage {
+                    timestamp,
+                    model: model.to_owned(),
+                    delta,
+                });
+            }
+        }
+    }
+    Ok(fully_recordable)
 }
 
 #[cfg(test)]
@@ -5782,26 +6520,27 @@ fn collect_session_append(
             .stream_position()
             .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
     }
+    let mut line = Vec::with_capacity(SESSION_RECORD_INITIAL_CAPACITY);
     while reader
         .stream_position()
         .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?
         < candidate.fingerprint.length
     {
-        let line = match security::read_bounded_jsonl_record(&mut reader) {
-            Ok(Some((line, true))) => line,
-            Ok(Some((_line, false))) => return Ok(None),
-            Ok(None) => break,
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    security::SecurityErrorKind::LimitExceeded | security::SecurityErrorKind::Parse
-                ) =>
-            {
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
+        let (present, skipped_invalid_record) =
+            match read_recoverable_session_record_into(&mut reader, &mut line) {
+                Ok(result) => result,
+                Err(error) if error.kind() == security::SecurityErrorKind::Unterminated => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+        if skipped_invalid_record {
+            return Ok(None);
+        }
+        if !present {
+            break;
         };
-        let value = match serde_json::from_str::<Value>(&line) {
+        let value = match serde_json::from_slice::<Value>(&line) {
             Ok(value) => value,
             Err(_) => {
                 return Ok(None);
@@ -5970,13 +6709,10 @@ fn collect_incremental_local_usage(
         collector_epoch,
         cycle_seq,
     } = context;
-    let mut totals = if collection_state.reset_at == reset_at
-        && collection_state.window_seconds == window_seconds
-    {
-        ModelUsageTotals::from_session_totals(&collection_state.model_totals)
-    } else {
-        ModelUsageTotals::default()
-    };
+    // The main/account lane has already admitted these absolute totals to the
+    // stable period. A raw reset timestamp comparison here used to discard
+    // the durable baseline on ordinary one-second service drift.
+    let mut totals = ModelUsageTotals::from_session_totals(&collection_state.model_totals);
     let initial_totals = totals.clone();
     let mut checkpoints_by_path = BTreeMap::new();
     let mut checkpoints_by_identity = BTreeMap::new();
@@ -6110,6 +6846,7 @@ fn collect_incremental_local_usage(
         session_checkpoints: changed_checkpoints,
         session_ranges: ranges,
         session_model_totals: totals.to_session_totals(),
+        history_continuity_recovery: None,
         cleanup_plan: cleanup_plan_for_inventory(inventory),
         bounded_source_rescan_complete,
     })
@@ -6163,69 +6900,15 @@ fn collect_session_usage_file_with_recordability(
             security::SecurityErrorKind::UnsafePath,
         ));
     }
-    let original = totals.clone();
-    let initial_events_len = events.len();
-    let mut fully_recordable = true;
-    let mut model: Option<String> = None;
-    let mut previous = TokenSnapshot::default();
     let mut reader = BufReader::new(file);
-    loop {
-        let line = match read_recoverable_session_line_with_status(&mut reader) {
-            Ok((Some(line), skipped_invalid_record)) => {
-                fully_recordable &= !skipped_invalid_record;
-                line
-            }
-            Ok((None, skipped_invalid_record)) => {
-                fully_recordable &= !skipped_invalid_record;
-                break;
-            }
-            Err(error) => {
-                *totals = original;
-                events.truncate(initial_events_len);
-                return Err(error);
-            }
-        };
-        let value = match serde_json::from_str::<Value>(&line) {
-            Ok(value) => value,
-            Err(_) => {
-                fully_recordable = false;
-                continue;
-            }
-        };
-        // `thread_settings_applied` can precede the actual turn context. Keep
-        // the previous model until `turn_context` confirms the model for the
-        // token-count event; otherwise setup metadata is charged to the next
-        // model (ccusage-compatible attribution).
-        if session_event_type(&value) != Some("thread_settings_applied") || model.is_none() {
-            if let Some(next_model) = session_event_model(&value) {
-                model = Some(next_model);
-            }
-        }
-        let Some(current) = session_token_snapshot(&value) else {
-            continue;
-        };
-        let delta = TokenSnapshot {
-            total: current.total.saturating_sub(previous.total),
-            input: current.input.saturating_sub(previous.input),
-            cached_input: current.cached_input.saturating_sub(previous.cached_input),
-            output: current.output.saturating_sub(previous.output),
-        };
-        previous = current;
-        let timestamp = session_event_timestamp(&value);
-        if timestamp < window_start {
-            continue;
-        }
-        if let Some(model) = model.as_deref() {
-            totals.add(model, delta);
-            if timestamp <= timeline_window_end {
-                events.push(TimedModelUsage {
-                    timestamp,
-                    model: model.to_owned(),
-                    delta,
-                });
-            }
-        }
-    }
+    let mut fully_recordable = collect_session_usage_records(
+        &mut reader,
+        window_start,
+        i64::MAX,
+        timeline_window_end,
+        totals,
+        events,
+    )?;
     let after_file = reader.get_ref().metadata().ok();
     let after_path = fs::symlink_metadata(path).ok();
     if after_file
@@ -6240,6 +6923,157 @@ fn collect_session_usage_file_with_recordability(
         fully_recordable = false;
     }
     Ok(fully_recordable)
+}
+
+fn recover_checkpointed_history_model_totals(
+    inventory: &LocalInputInventory,
+    recovery: &usage_store::HistoryContinuityRecovery,
+    checkpoints: &[usage_store::SessionCheckpoint],
+    window_seconds: i64,
+) -> Result<Vec<usage_store::SessionModelTotal>, String> {
+    if window_seconds <= 0
+        || recovery.boundary_timestamp <= 0
+        || recovery.boundary_timestamp > recovery.reset_at
+    {
+        return Err("legacy component recovery period is invalid".into());
+    }
+    if inventory.selected_session_files.is_empty() {
+        return Err("legacy component recovery source count is invalid".into());
+    }
+    let checkpoint_identities = checkpoints
+        .iter()
+        .map(|checkpoint| {
+            (
+                checkpoint.root_identity.as_str(),
+                checkpoint.relative_path.as_str(),
+                checkpoint.file_device,
+                checkpoint.file_inode,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let selected_bytes =
+        inventory
+            .selected_session_files
+            .iter()
+            .try_fold(0_u64, |total, candidate| {
+                if candidate.fingerprint.length > security::MAX_SESSION_FILE_BYTES {
+                    return Err("legacy component recovery file exceeds its bound".to_owned());
+                }
+                total
+                    .checked_add(candidate.fingerprint.length)
+                    .filter(|value| *value <= security::MAX_SESSION_TOTAL_BYTES)
+                    .ok_or_else(|| "legacy component recovery exceeds the 2 GiB bound".to_owned())
+            })?;
+    if inventory.selected_session_files.len() > security::MAX_SESSION_FILES {
+        return Err("legacy component recovery source count exceeds its bound".into());
+    }
+
+    let window_start = recovery.reset_at.saturating_sub(window_seconds);
+    let mut totals = ModelUsageTotals::default();
+    let mut events = Vec::new();
+    for candidate in &inventory.selected_session_files {
+        let path = &candidate.fingerprint.path;
+        let before_path = fs::symlink_metadata(path)
+            .map_err(|_| "legacy component recovery source is unavailable".to_owned())?;
+        let before_fingerprint = local_input_file_fingerprint(path, &before_path)
+            .map_err(|_| "legacy component recovery source is invalid".to_owned())?;
+        if before_fingerprint != candidate.fingerprint {
+            return Err("legacy component recovery inventory changed".into());
+        }
+        let file = File::open(path)
+            .map_err(|_| "legacy component recovery source cannot be opened".to_owned())?;
+        let before_file = file
+            .metadata()
+            .map_err(|_| "legacy component recovery source metadata is invalid".to_owned())?;
+        if !same_rollout_identity(&before_path, &before_file)
+            || before_file.len() != candidate.fingerprint.length
+        {
+            return Err("legacy component recovery source identity raced".into());
+        }
+        let _ = rustix::fs::fadvise(
+            &file,
+            0,
+            candidate.fingerprint.length,
+            rustix::fs::Advice::Sequential,
+        );
+        let _ = rustix::fs::fadvise(
+            &file,
+            0,
+            candidate.fingerprint.length,
+            rustix::fs::Advice::NoReuse,
+        );
+        let before_totals = totals.clone();
+        let mut reader = BufReader::new(file.take(candidate.fingerprint.length));
+        let _fully_recordable = collect_session_usage_records(
+            &mut reader,
+            window_start,
+            recovery.boundary_timestamp,
+            i64::MIN,
+            &mut totals,
+            &mut events,
+        )
+        .map_err(|_| "legacy component recovery source parse failed".to_owned())?;
+        let after_file = reader
+            .get_ref()
+            .get_ref()
+            .metadata()
+            .map_err(|_| "legacy component recovery source metadata disappeared".to_owned())?;
+        let after_path = fs::symlink_metadata(path)
+            .map_err(|_| "legacy component recovery source path disappeared".to_owned())?;
+        if reader.get_ref().limit() != 0
+            || !same_rollout_identity(&before_file, &after_file)
+            || !same_rollout_identity(&before_file, &after_path)
+            || after_file.len() < candidate.fingerprint.length
+            || after_path.len() < candidate.fingerprint.length
+        {
+            return Err("legacy component recovery source was not stable".into());
+        }
+        let _ = rustix::fs::fadvise(
+            reader.get_ref().get_ref(),
+            0,
+            candidate.fingerprint.length,
+            rustix::fs::Advice::DontNeed,
+        );
+        if totals != before_totals
+            && !checkpoint_identities.contains(&(
+                candidate.recorded_source.root_identity.as_str(),
+                candidate.recorded_source.relative_path.as_str(),
+                candidate.recorded_source.file_device,
+                candidate.recorded_source.file_inode,
+            ))
+        {
+            return Err("legacy component recovery source has no durable checkpoint".into());
+        }
+    }
+    debug_assert!(events.is_empty());
+    let tokens = totals.token_totals();
+    let dollars = totals.dollar_totals();
+    if tokens.sol != recovery.sol_tokens
+        || tokens.terra != recovery.terra_tokens
+        || tokens.luna != recovery.luna_tokens
+        || !recovery.matches_dollar_totals(dollars.sol, dollars.terra, dollars.luna)
+    {
+        return Err(format!(
+            "legacy component recovery aggregate mismatch tokens={}/{}/{} expected={}/{}/{} dollars={:.9}/{:.9}/{:.9} expected={:.9}/{:.9}/{:.9}",
+            tokens.sol,
+            tokens.terra,
+            tokens.luna,
+            recovery.sol_tokens,
+            recovery.terra_tokens,
+            recovery.luna_tokens,
+            dollars.sol,
+            dollars.terra,
+            dollars.luna,
+            recovery.sol_dollars,
+            recovery.terra_dollars,
+            recovery.luna_dollars,
+        ));
+    }
+    debug_runtime(format!(
+        "legacy component recovery verified sources={} bytes={selected_bytes}",
+        inventory.selected_session_files.len()
+    ));
+    Ok(totals.to_session_totals())
 }
 
 fn resolved_executable(override_name: &str, command_name: &str) -> Option<PathBuf> {
@@ -6878,6 +7712,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
 struct LocalUsageCache {
     partitioned_collector_epoch: Option<u128>,
     verified_session_inventory: BTreeSet<SessionInventoryKey>,
+    rejected_history_recovery: Option<String>,
     #[cfg(test)]
     legacy_period: Option<(i64, i64)>,
     #[cfg(test)]
@@ -7007,6 +7842,8 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                 auth_epoch,
                 admission,
                 collection_state,
+                regression_recovery_state,
+                history_continuity_recovery,
                 reset_at,
                 window_seconds,
             } => {
@@ -7019,33 +7856,127 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                     if getrandom::fill(&mut epoch_bytes).is_err() {
                         let _ = events.send(LocalEvent::Error {
                             auth_epoch,
+                            admission: admission.clone(),
                             reset_at,
                             window_seconds,
+                            collector_epoch: None,
+                            cycle_seq: None,
+                            durable_model_totals: collection_state.model_totals.clone(),
                         });
                         continue;
                     }
                     collector_epoch = u128::from_be_bytes(epoch_bytes).max(1);
                     cycle_seq = 0;
                     active_boundary = Some(boundary);
+                    cache.rejected_history_recovery = None;
                 }
                 let Some(next_cycle) = cycle_seq.checked_add(1) else {
                     let _ = events.send(LocalEvent::Error {
                         auth_epoch,
+                        admission: admission.clone(),
                         reset_at,
                         window_seconds,
+                        collector_epoch: None,
+                        cycle_seq: None,
+                        durable_model_totals: collection_state.model_totals.clone(),
                     });
                     break;
                 };
                 cycle_seq = next_cycle;
+                let durable_model_totals = collection_state.model_totals.clone();
                 let result = local_input_inventory().and_then(|inventory| {
-                    cache.collect_partitioned(PartitionedLocalCollection {
+                    let collection_state = *collection_state;
+                    let mut regression_recovery_state =
+                        regression_recovery_state.map(|state| *state);
+                    let mut verified_recovery = None;
+                    let mut verified_fingerprint = None;
+                    if let Some(authority) = history_continuity_recovery.filter(|authority| {
+                        cache.rejected_history_recovery.as_deref()
+                            != Some(authority.source_fingerprint.as_str())
+                    }) {
+                        let authority_fingerprint = authority.source_fingerprint.clone();
+                        match recover_checkpointed_history_model_totals(
+                            &inventory,
+                            &authority,
+                            &collection_state.checkpoints,
+                            window_seconds,
+                        ) {
+                            Ok(model_totals) => {
+                                // One immutable authority is replayed at most
+                                // once per resident process. The verified
+                                // recovery travels with the pending recorder
+                                // batch and can be retried without rescanning
+                                // the Session prefix.
+                                verified_fingerprint = Some(authority_fingerprint);
+                                verified_recovery = Some((authority, model_totals));
+                            }
+                            Err(error) => {
+                                debug_runtime(format!(
+                                    "legacy component recovery rejected: {error}"
+                                ));
+                                cache.rejected_history_recovery = Some(authority_fingerprint);
+                            }
+                        }
+                    }
+                    if verified_recovery.is_none() {
+                        regression_recovery_state = None;
+                    }
+                    let recovered_totals = regression_recovery_state
+                        .map(|state| {
+                            let mut recovery_cache = LocalUsageCache::default();
+                            recovery_cache.collect_partitioned(PartitionedLocalCollection {
+                                reset_at,
+                                window_seconds,
+                                inventory: inventory.clone(),
+                                collection_state: state,
+                                collector_epoch,
+                                cycle_seq,
+                            })
+                        })
+                        .transpose()?
+                        .map(|collection| collection.model_usage);
+                    let mut collection = cache.collect_partitioned(PartitionedLocalCollection {
                         reset_at,
                         window_seconds,
                         inventory,
-                        collection_state: *collection_state,
+                        collection_state,
                         collector_epoch,
                         cycle_seq,
-                    })
+                    })?;
+                    if let Some(recovered) = recovered_totals {
+                        apply_regression_recovery(&mut collection, recovered);
+                    }
+                    let verified_recovery =
+                        verified_recovery.and_then(|(authority, model_totals)| {
+                            let fallback_samples = collection.history_samples.clone();
+                            let fallback_model_totals = collection.session_model_totals.clone();
+                            let offset = ModelUsageTotals::from_session_totals(&model_totals);
+                            let mut cumulative = collection.model_usage.clone();
+                            if cumulative.checked_add_totals(&offset).is_none() {
+                                debug_runtime("legacy component recovery total overflow rejected");
+                                return None;
+                            }
+                            if !offset.is_zero()
+                                && !apply_regression_recovery(&mut collection, cumulative)
+                            {
+                                debug_runtime("legacy component recovery offset rejected");
+                                return None;
+                            }
+                            Some(usage_store::HistoryContinuityModelRecovery {
+                                authority,
+                                model_totals,
+                                fallback_samples: fallback_samples
+                                    .iter()
+                                    .map(UsageHistorySample::to_store)
+                                    .collect(),
+                                fallback_model_totals,
+                            })
+                        });
+                    if let Some(fingerprint) = verified_fingerprint {
+                        cache.rejected_history_recovery = Some(fingerprint);
+                    }
+                    collection.history_continuity_recovery = verified_recovery;
+                    Ok(collection)
                 });
                 match result {
                     Ok(collection) => {
@@ -7072,14 +8003,19 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                             session_checkpoints: collection.session_checkpoints,
                             session_ranges: collection.session_ranges,
                             session_model_totals: collection.session_model_totals,
+                            history_continuity_recovery: collection.history_continuity_recovery,
                         })));
                     }
                     Err(_) => {
                         debug_runtime("local collect failed");
                         let _ = events.send(LocalEvent::Error {
                             auth_epoch,
+                            admission: admission.clone(),
                             reset_at,
                             window_seconds,
+                            collector_epoch: Some(collector_epoch),
+                            cycle_seq: Some(cycle_seq),
+                            durable_model_totals,
                         });
                     }
                 }
@@ -7236,6 +8172,7 @@ struct PendingRecorderBatch {
     session_checkpoints: Vec<usage_store::SessionCheckpoint>,
     session_ranges: Vec<usage_store::SessionRange>,
     session_model_totals: Vec<usage_store::SessionModelTotal>,
+    history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
     reset_at: Option<i64>,
     window_seconds: Option<i64>,
     cleanup_plans: Vec<SessionCleanupPlan>,
@@ -7302,6 +8239,7 @@ struct CodexInfoState {
     pending_session_checkpoints: Vec<usage_store::SessionCheckpoint>,
     pending_session_ranges: Vec<usage_store::SessionRange>,
     pending_session_model_totals: Vec<usage_store::SessionModelTotal>,
+    pending_history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
     pending_collector_generation: Option<(u128, u64)>,
     pending_session_period: Option<(i64, i64)>,
     pending_recorder_admission: Option<(u64, AccountAdmission)>,
@@ -7686,6 +8624,7 @@ impl CodexInfoState {
             pending_session_checkpoints: Vec::new(),
             pending_session_ranges: Vec::new(),
             pending_session_model_totals: Vec::new(),
+            pending_history_continuity_recovery: None,
             pending_collector_generation: None,
             pending_session_period: None,
             pending_recorder_admission: None,
@@ -7756,6 +8695,7 @@ impl CodexInfoState {
             pending_session_checkpoints: Vec::new(),
             pending_session_ranges: Vec::new(),
             pending_session_model_totals: Vec::new(),
+            pending_history_continuity_recovery: None,
             pending_collector_generation: None,
             pending_session_period: None,
             pending_recorder_admission: None,
@@ -7830,6 +8770,7 @@ impl CodexInfoState {
             pending_session_checkpoints: Vec::new(),
             pending_session_ranges: Vec::new(),
             pending_session_model_totals: Vec::new(),
+            pending_history_continuity_recovery: None,
             pending_collector_generation: None,
             pending_session_period: None,
             pending_recorder_admission: None,
@@ -8267,6 +9208,7 @@ impl CodexInfoState {
         // indistinguishable from the newer generation.
         if !self.local_usage_pending
             && !self.recorder_store_error
+            && !self.has_pending_recorder_batch()
             && account_refresh_due(
                 now,
                 self.last_poll,
@@ -8431,6 +9373,7 @@ impl CodexInfoState {
         self.last_success_at = observed_at;
         self.model_usage = next_models;
         self.history = next_history;
+        self.history_gaps = details.history_gaps;
         self.active_threads = next_threads;
         self.estimated_cost_label = details.estimated_cost_label;
         self.selected_reset_at = next_selected_reset_at;
@@ -8545,36 +9488,67 @@ impl CodexInfoState {
         let Some(partition) = self.account_partition.as_ref() else {
             return false;
         };
-        let collection_state = match fs::symlink_metadata(&partition.database_path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                usage_store::SessionCollectionState::default()
-            }
-            Ok(_) => {
-                let identity = partition.storage_identity();
-                let state =
-                    UsageStore::open_read_only_partitioned(&partition.database_path, &identity)
-                        .and_then(|store| store.load_session_collection_state());
-                match state {
-                    Ok(state) => state,
-                    Err(_) => {
-                        self.apply_identity_error(
-                            "Session checkpointのaccount partitionを確認できませんでした。".into(),
-                        );
-                        return false;
+        let (mut collection_state, history_continuity_recovery) =
+            match fs::symlink_metadata(&partition.database_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    (usage_store::SessionCollectionState::default(), None)
+                }
+                Ok(_) => {
+                    let identity = partition.storage_identity();
+                    let state =
+                        UsageStore::open_read_only_partitioned(&partition.database_path, &identity)
+                            .and_then(|store| {
+                                Ok((
+                                    store.load_session_collection_state()?,
+                                    store.pending_history_continuity_recovery()?,
+                                ))
+                            });
+                    match state {
+                        Ok(state) => state,
+                        Err(_) => {
+                            self.apply_identity_error(
+                                "Session checkpointのaccount partitionを確認できませんでした。"
+                                    .into(),
+                            );
+                            return false;
+                        }
                     }
                 }
-            }
-            Err(_) => {
-                self.apply_identity_error(
-                    "Session checkpoint DBを安全に確認できませんでした。".into(),
-                );
-                return false;
-            }
-        };
+                Err(_) => {
+                    self.apply_identity_error(
+                        "Session checkpoint DBを安全に確認できませんでした。".into(),
+                    );
+                    return false;
+                }
+            };
+        let regression_recovery_state =
+            history_continuity_recovery.as_ref().and_then(|continuity| {
+                load_regression_recovery_state(partition, &collection_state, continuity)
+            });
+        let period_boundary = admit_session_collection_period(
+            &mut collection_state,
+            reset_at,
+            window_seconds,
+            self.remaining_percent,
+            Utc::now().timestamp(),
+        );
+        debug_runtime(format!(
+            "local collection period admitted boundary={period_boundary} durable_generation={}",
+            collection_state.data_generation
+        ));
+        let history_continuity_recovery = history_continuity_recovery
+            .filter(|recovery| recovery.matches_reset_at(collection_state.reset_at));
         let command = LocalCommand::Collect {
             auth_epoch: self.auth_epoch,
             admission,
             collection_state: Box::new(collection_state),
+            regression_recovery_state: (!period_boundary)
+                .then_some(regression_recovery_state)
+                .flatten()
+                .map(Box::new),
+            history_continuity_recovery: (!period_boundary)
+                .then_some(history_continuity_recovery)
+                .flatten(),
             reset_at,
             window_seconds,
         };
@@ -8607,6 +9581,7 @@ impl CodexInfoState {
             session_checkpoints: std::mem::take(&mut self.pending_session_checkpoints),
             session_ranges: std::mem::take(&mut self.pending_session_ranges),
             session_model_totals: std::mem::take(&mut self.pending_session_model_totals),
+            history_continuity_recovery: self.pending_history_continuity_recovery.take(),
             reset_at: period.map(|value| value.0),
             window_seconds: period.map(|value| value.1),
             cleanup_plans: std::mem::take(&mut self.pending_session_cleanup),
@@ -8619,6 +9594,7 @@ impl CodexInfoState {
             || !self.pending_session_checkpoints.is_empty()
             || !self.pending_session_ranges.is_empty()
             || !self.pending_session_model_totals.is_empty()
+            || self.pending_history_continuity_recovery.is_some()
             || self.pending_collector_generation.is_some()
             || self.pending_session_period.is_some()
             || self.pending_recorder_admission.is_some()
@@ -8654,6 +9630,9 @@ impl CodexInfoState {
         if !batch.session_model_totals.is_empty() {
             self.pending_session_model_totals = batch.session_model_totals;
         }
+        if batch.history_continuity_recovery.is_some() {
+            self.pending_history_continuity_recovery = batch.history_continuity_recovery;
+        }
         self.pending_collector_generation = batch.collector_epoch.zip(batch.cycle_seq);
         self.pending_bounded_source_rescan_complete = batch.bounded_source_rescan_complete;
         self.pending_session_period = batch.reset_at.zip(batch.window_seconds);
@@ -8669,6 +9648,7 @@ impl CodexInfoState {
         self.pending_session_checkpoints.clear();
         self.pending_session_ranges.clear();
         self.pending_session_model_totals.clear();
+        self.pending_history_continuity_recovery = None;
         self.pending_collector_generation = None;
         self.pending_bounded_source_rescan_complete = false;
         self.pending_session_period = None;
@@ -8721,6 +9701,7 @@ impl CodexInfoState {
         self.pending_session_checkpoints.clear();
         self.pending_session_ranges.clear();
         self.pending_session_model_totals.clear();
+        self.pending_history_continuity_recovery = None;
         self.pending_collector_generation = None;
         self.pending_session_period = None;
         self.pending_recorder_admission = None;
@@ -8862,6 +9843,7 @@ impl CodexInfoState {
     }
 
     fn apply_account_error(&mut self, error: String) {
+        debug_runtime(format!("state account error: {error}"));
         // The failed account connection is a publication boundary. Results
         // requested before this error may still be queued on the independent
         // thread/local channels, so invalidate their epoch without clearing
@@ -8888,6 +9870,7 @@ impl CodexInfoState {
     }
 
     fn apply_identity_error(&mut self, error: String) {
+        debug_runtime(format!("state identity error: {error}"));
         if !self.clear_account_visible_state() {
             return;
         }
@@ -9183,6 +10166,8 @@ impl CodexInfoState {
             self.apply_identity_error("Session集計後にアカウントidentityが変更されました。".into());
             return;
         }
+        let fallback_start = self.history.pending_store_samples.len();
+        let mut history_continuity_recovery = candidate.history_continuity_recovery;
         self.pending_session_checkpoints = candidate.session_checkpoints;
         self.pending_session_ranges = candidate.session_ranges;
         self.pending_session_model_totals = candidate.session_model_totals;
@@ -9192,18 +10177,120 @@ impl CodexInfoState {
             Some((candidate.result.reset_at, candidate.result.window_seconds));
         self.pending_recorder_admission = Some((candidate.result.auth_epoch, admission));
         self.apply_local_usage_success(candidate.result);
+        if let Some(mut recovery) = history_continuity_recovery.take() {
+            let fallback_usage =
+                ModelUsageTotals::from_session_totals(&recovery.fallback_model_totals);
+            let fallback_costs = fallback_usage.dollar_totals();
+            let fallback_tokens = fallback_usage.token_totals();
+            let backfill = recovery.fallback_samples.clone();
+            let mut complete_fallback = self.history.pending_store_samples.clone();
+            for sample in complete_fallback.iter_mut().skip(fallback_start) {
+                if let Some(expected) = backfill.iter().find(|expected| {
+                    expected.timestamp == sample.timestamp && expected.reset_at == sample.reset_at
+                }) {
+                    let remaining_percent = sample.remaining_percent;
+                    *sample = expected.clone();
+                    sample.remaining_percent = remaining_percent;
+                } else {
+                    sample.sol_dollars = fallback_costs.sol;
+                    sample.terra_dollars = fallback_costs.terra;
+                    sample.luna_dollars = fallback_costs.luna;
+                    sample.sol_tokens = fallback_tokens.sol;
+                    sample.terra_tokens = fallback_tokens.terra;
+                    sample.luna_tokens = fallback_tokens.luna;
+                }
+            }
+            recovery.fallback_samples = complete_fallback;
+            self.pending_history_continuity_recovery = Some(recovery);
+        } else {
+            self.pending_history_continuity_recovery = None;
+        }
     }
 
     fn apply_local_usage_error(&mut self, auth_epoch: u64, reset_at: i64, window_seconds: i64) {
+        self.apply_local_usage_error_with_generation(
+            auth_epoch,
+            None,
+            reset_at,
+            window_seconds,
+            None,
+            None,
+            Vec::new(),
+        );
+    }
+
+    fn apply_local_usage_error_with_generation(
+        &mut self,
+        auth_epoch: u64,
+        admission: Option<AccountAdmission>,
+        reset_at: i64,
+        window_seconds: i64,
+        collector_epoch: Option<u128>,
+        cycle_seq: Option<u64>,
+        durable_model_totals: Vec<usage_store::SessionModelTotal>,
+    ) {
         if !self.auth_epoch_valid
             || auth_epoch != self.auth_epoch
             || !self.current_local_period_matches(reset_at, window_seconds)
+            || admission.as_ref().is_some_and(|candidate| {
+                self.current_account_admission().as_ref() != Some(candidate)
+            })
         {
             self.local_usage_pending = false;
             return;
         }
         self.local_usage_error = true;
         self.local_usage_pending = false;
+
+        // A failed local scan still follows a valid collector generation. If
+        // that generation supplied a fresh remote quota, retain the quota as
+        // a recorder sample with the last durable cumulative model totals.
+        // Missing generation metadata, an outage, or a pre-existing batch is
+        // deliberately fail-closed: inventing a collector cycle or merging
+        // two batches would make the recorder state ambiguous.
+        let Some(collector_epoch) = collector_epoch.filter(|epoch| *epoch > 0) else {
+            self.refresh_partial_failure_status();
+            return;
+        };
+        let Some(cycle_seq) = cycle_seq.filter(|cycle| *cycle > 0) else {
+            self.refresh_partial_failure_status();
+            return;
+        };
+        if self.account_error.is_some()
+            || reset_at <= 0
+            || self.remaining_percent.is_none()
+            || self.has_pending_recorder_batch()
+        {
+            self.refresh_partial_failure_status();
+            return;
+        }
+        let Some(observed_at) = self.last_success_at.filter(|timestamp| *timestamp > 0) else {
+            self.refresh_partial_failure_status();
+            return;
+        };
+        let Some(admission) = admission else {
+            self.refresh_partial_failure_status();
+            return;
+        };
+        let remaining_percent = self.remaining_percent.expect("checked above");
+        let durable_totals = ModelUsageTotals::from_session_totals(&durable_model_totals);
+        let sample = UsageHistorySample::new_with_usage(
+            observed_at,
+            reset_at,
+            remaining_percent,
+            durable_totals.dollar_totals(),
+            durable_totals.token_totals(),
+        );
+        if !sample.is_valid() {
+            self.refresh_partial_failure_status();
+            return;
+        }
+        self.history.record(sample);
+        self.pending_recorder_admission = Some((auth_epoch, admission));
+        self.pending_collector_generation = Some((collector_epoch, cycle_seq));
+        self.pending_session_period = Some((reset_at, window_seconds));
+        self.pending_session_model_totals = durable_model_totals;
+        self.pending_bounded_source_rescan_complete = false;
         self.refresh_partial_failure_status();
     }
 
@@ -9246,6 +10333,14 @@ impl CodexInfoState {
     ) {
         if self.current_account_admission().as_ref() != Some(admission) || !self.auth_epoch_valid {
             return;
+        }
+        if let Some(fallback) = ack.fallback_model_totals.as_deref() {
+            let committed_totals = ModelUsageTotals::from_session_totals(fallback);
+            let committed_costs = committed_totals.dollar_totals();
+            if self.authenticated {
+                self.model_usage = committed_totals.rows();
+                self.estimated_cost_label = format_estimated_cost(committed_costs);
+            }
         }
         self.acknowledged_recorder_commit = Some(AcknowledgedRecorderCommit {
             auth_epoch: self.auth_epoch,
@@ -9458,9 +10553,21 @@ impl CodexInfoState {
                 LocalEvent::Usage(result) => self.request_local_usage_verification(*result),
                 LocalEvent::Error {
                     auth_epoch,
+                    admission,
                     reset_at,
                     window_seconds,
-                } => self.apply_local_usage_error(auth_epoch, reset_at, window_seconds),
+                    collector_epoch,
+                    cycle_seq,
+                    durable_model_totals,
+                } => self.apply_local_usage_error_with_generation(
+                    auth_epoch,
+                    Some(admission),
+                    reset_at,
+                    window_seconds,
+                    collector_epoch,
+                    cycle_seq,
+                    durable_model_totals,
+                ),
             }
         }
     }
@@ -9823,7 +10930,20 @@ impl CodexInfoState {
         let period_start = period.start;
         let period_end = period.end.max(period_start + 1);
         let sample_references = samples.iter().collect::<Vec<_>>();
-        let mut paths = graph_paths_for_selection(
+        let confirmed_gaps = self
+            .history_gaps
+            .iter()
+            .filter(|gap| {
+                same_reset_period(gap.reset_at, selected_reset)
+                    && gap.start_at <= period_end
+                    && gap.end_at >= period_start
+            })
+            .map(|gap| GraphConfirmedGap {
+                start_at: gap.start_at,
+                end_at: gap.end_at,
+            })
+            .collect::<Vec<_>>();
+        let mut paths = graph_paths_for_selection_with_confirmed_gaps(
             &sample_references,
             period_start,
             period_end,
@@ -9831,6 +10951,7 @@ impl CodexInfoState {
             show_terra,
             show_sol,
             show_tokens,
+            &confirmed_gaps,
         );
         if !self.has_quota_percent {
             paths.remaining.clear();
@@ -12157,24 +13278,6 @@ enum ResidentServiceCycleOutcome {
     HeldIncomplete,
 }
 
-fn recorder_error_is_fatal(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    [
-        "fatal",
-        "full",
-        "readonly",
-        "read-only",
-        "corrupt",
-        "malformed",
-        "not a database",
-        "worker",
-        "profile lock",
-        "state file",
-    ]
-    .iter()
-    .any(|marker| error.contains(marker))
-}
-
 fn recorder_attempt_due(now: Instant, retry_at: Option<Instant>) -> bool {
     retry_at.is_none_or(|retry_at| now >= retry_at)
 }
@@ -12388,7 +13491,6 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
         let shutdown = service_shutdown_signal();
         tokio::pin!(shutdown);
         let mut recorder_retry_at: Option<Instant> = None;
-        let mut consecutive_store_failures = 0_u8;
         loop {
             tokio::select! {
                 _ = &mut shutdown => return Ok::<(), String>(()),
@@ -12423,6 +13525,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                 session_checkpoints,
                                 session_ranges,
                                 session_model_totals,
+                                history_continuity_recovery,
                                 reset_at,
                                 window_seconds,
                                 cleanup_plans,
@@ -12470,6 +13573,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                 || !session_checkpoints.is_empty()
                                 || !session_ranges.is_empty()
                                 || !session_model_totals.is_empty()
+                                || history_continuity_recovery.is_some()
                             {
                                 let Some(batch_partition_id) = partition_id.as_ref() else {
                                     state.apply_identity_error(
@@ -12509,6 +13613,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                         session_checkpoints,
                                         session_ranges,
                                         session_model_totals,
+                                        history_continuity_recovery,
                                         bounded_source_rescan_complete,
                                     },
                                 ) {
@@ -12604,7 +13709,6 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                         Ok(outcome) => {
                             if recorder_attempt {
                                 recorder_retry_at = None;
-                                consecutive_store_failures = 0;
                                 if last_recorder_error.take().is_some() {
                                     eprintln!("codex-info: recorder state commit recovered");
                                 }
@@ -12616,20 +13720,16 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                             }
                         }
                         Err(ResidentServiceCycleError::Store(error)) => {
-                            consecutive_store_failures =
-                                consecutive_store_failures.saturating_add(1);
                             if last_recorder_error.as_deref() != Some(error.as_str()) {
                                 eprintln!("codex-info: recorder state commit rejected: {error}");
                                 last_recorder_error = Some(error.clone());
                             }
-                            if recorder_error_is_fatal(&error)
-                                || consecutive_store_failures >= 2
-                            {
-                                return Err(format!(
-                                    "recorder persistence failed after {} cycle(s): {error}",
-                                    consecutive_store_failures
-                                ));
-                            }
+                            // A response timeout cannot distinguish a busy
+                            // serialized writer from a dead one. Keep the
+                            // exact pending batch and the last-good public
+                            // root, then retry once at the normal recorder
+                            // interval. Actual thread death is detected by
+                            // recorder.probe() on the one-second owner loop.
                             recorder_retry_at = Some(
                                 Instant::now()
                                     + daemon::daemon_interval_from_environment(),
@@ -13223,9 +14323,10 @@ mod tests {
         fetch_active_thread_update_for_paths_and_state, fetch_service_details,
         fixed_resize_decision, fixed_resize_decision_for_scale, format_elapsed,
         format_estimated_cost, format_model_usage_columns, format_percent, format_period_label,
-        graph_paths, graph_paths_for_selection, graph_points, graph_time_endpoints,
-        is_service_health_response, local_input_inventory_for_paths, minute_model_spend,
-        minute_model_spend_for_metric, model_usage_timeline_from_events, monthly_window_seconds,
+        graph_paths, graph_paths_for_selection, graph_paths_for_selection_with_confirmed_gaps,
+        graph_points, graph_time_endpoints, is_service_health_response,
+        local_input_inventory_for_paths, minute_model_spend, minute_model_spend_for_metric,
+        model_spend_is_reliable, model_usage_timeline_from_events, monthly_window_seconds,
         native_account_window_title, native_legal_pages, native_startup_loading,
         normal_status_text, one_month_before_utc, open_codex_session_paths, parse_details_document,
         parse_launch_mode, parse_preview_size, parse_rate_limits, parse_resize_direction,
@@ -13239,18 +14340,19 @@ mod tests {
         service_is_healthy, session_event_model, session_event_type, session_jsonl_files,
         session_token_snapshot, smooth_model_spend, smooth_remaining_points,
         split_metric_line_paths, stacked_area_path, terminate_and_reap_owned_child,
-        thread_presentation_rows, three_months_before_utc, unused_interval_positions,
-        visible_window_position, week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer,
-        ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphPaths, GraphWindow,
-        HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint, LocalUsageCache,
-        LocalUsageCandidate, LocalUsageResult, ManualX11Geometry, ManualX11WindowAction,
-        ModelDollarTotals, ModelTokenTotals, ModelUsageRow, ModelUsageTotals, PublicDetails,
-        RpcReadEvent, ServiceEndpointState, ServiceHealthVersion, SessionFileCandidate,
-        SessionTraversalBudget, ThreadRolloutCache, TimedModelUsage, TokenSnapshot,
-        UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
-        DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS,
-        GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION,
-        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
+        thread_presentation_rows, three_months_before_utc, unreliable_model_spend,
+        unused_interval_positions, visible_window_position, week_remaining_text, ActiveThread,
+        ActiveThreadUpdate, ApiServer, ApiServerConfig, CodexInfoState, Event, FixedResizeDecision,
+        GraphConfirmedGap, GraphPaths, GraphWindow, HourlyModelSpend, I18n, LaunchMode,
+        LocalInputFileFingerprint, LocalUsageCache, LocalUsageCandidate, LocalUsageResult,
+        ManualX11Geometry, ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals,
+        ModelUsageRow, ModelUsageTotals, PublicDetails, PublicHistoryGap, RpcReadEvent,
+        ServiceEndpointState, ServiceHealthVersion, SessionFileCandidate, SessionTraversalBudget,
+        ThreadRolloutCache, TimedModelUsage, TokenSnapshot, UnusedIntervalPosition, UsageEvent,
+        UsageHistory, UsageHistorySample, UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT,
+        FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
+        LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION, THREADS_WINDOW_PURPOSE,
+        UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
     use serde::Deserialize;
 
@@ -13413,6 +14515,7 @@ mod tests {
                 cycle_seq,
                 last_commit_unix: Utc::now().timestamp(),
                 canonical_samples: Vec::new(),
+                fallback_model_totals: None,
                 legacy_history_bridged: false,
             },
         );
@@ -14555,6 +15658,342 @@ mod tests {
     }
 
     #[test]
+    fn durable_model_totals_survive_restart_drift_and_clear_only_on_rollover() {
+        let now = 2_000_000_000;
+        let two_days = 2 * 86_400;
+        let durable_total = super::usage_store::SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 1_000,
+            input_tokens: 800,
+            cached_input_tokens: 300,
+            output_tokens: 200,
+        };
+        let mut restarted = super::usage_store::SessionCollectionState {
+            data_generation: 7,
+            reset_at: now - two_days + WEEK_SECONDS,
+            window_seconds: WEEK_SECONDS,
+            last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
+                observed_at: now - two_days,
+                remaining_percent: 70.0,
+            }),
+            model_totals: vec![durable_total.clone()],
+            ..super::usage_store::SessionCollectionState::default()
+        };
+        assert!(!super::admit_session_collection_period(
+            &mut restarted,
+            now + WEEK_SECONDS,
+            WEEK_SECONDS,
+            Some(69.0),
+            now,
+        ));
+        assert_eq!(restarted.model_totals, [durable_total.clone()]);
+
+        let mut rollover = super::usage_store::SessionCollectionState {
+            data_generation: 8,
+            reset_at: now + 30,
+            window_seconds: WEEK_SECONDS,
+            last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
+                observed_at: now - 60,
+                remaining_percent: 1.0,
+            }),
+            model_totals: vec![durable_total],
+            ..super::usage_store::SessionCollectionState::default()
+        };
+        assert!(super::admit_session_collection_period(
+            &mut rollover,
+            now + WEEK_SECONDS,
+            WEEK_SECONDS,
+            Some(100.0),
+            now,
+        ));
+        assert!(rollover.model_totals.is_empty());
+    }
+
+    #[test]
+    fn regression_recovery_replaces_only_cumulative_values_and_preserves_evidence() {
+        let reset_at = 1_800_604_800;
+        let normal = ModelUsageTotals::from_session_totals(&[
+            super::usage_store::SessionModelTotal {
+                model: "SOL".into(),
+                total_tokens: 100,
+                input_tokens: 80,
+                cached_input_tokens: 30,
+                output_tokens: 20,
+            },
+            super::usage_store::SessionModelTotal {
+                model: "LUNA".into(),
+                total_tokens: 50,
+                input_tokens: 40,
+                cached_input_tokens: 10,
+                output_tokens: 10,
+            },
+        ]);
+        let recovered = ModelUsageTotals::from_session_totals(&[
+            super::usage_store::SessionModelTotal {
+                model: "SOL".into(),
+                total_tokens: 1_100,
+                input_tokens: 880,
+                cached_input_tokens: 330,
+                output_tokens: 220,
+            },
+            super::usage_store::SessionModelTotal {
+                model: "LUNA".into(),
+                total_tokens: 50,
+                input_tokens: 40,
+                cached_input_tokens: 10,
+                output_tokens: 10,
+            },
+        ]);
+        let checkpoint = super::usage_store::SessionCheckpoint {
+            root_identity: "11".repeat(32),
+            relative_path: "session.jsonl".into(),
+            file_device: 1,
+            file_inode: 2,
+            committed_offset: 100,
+            discard_until_lf: false,
+            collector_epoch: 3,
+            cycle_seq: 4,
+            prefix_generation: 5,
+            prefix_sha256: "22".repeat(32),
+            fully_attributed_from_zero: true,
+            token_baseline_known: true,
+            last_model: Some("SOL".into()),
+            last_task_running: Some(true),
+            previous_total: 100,
+            previous_input: 80,
+            previous_cached_input: 30,
+            previous_output: 20,
+        };
+        let range = super::usage_store::SessionRange {
+            root_identity: checkpoint.root_identity.clone(),
+            relative_path: checkpoint.relative_path.clone(),
+            file_device: checkpoint.file_device,
+            file_inode: checkpoint.file_inode,
+            start_offset: 50,
+            end_offset: 100,
+            collector_epoch: 3,
+            cycle_seq: 4,
+            prefix_generation: 5,
+            record_sha256: "33".repeat(32),
+        };
+        let normal_costs = normal.dollar_totals();
+        let normal_tokens = normal.token_totals();
+        let mut collection = super::LocalUsageCollection {
+            model_usage: normal.clone(),
+            history_samples: vec![UsageHistorySample::new_with_usage(
+                1_800_000_120,
+                reset_at,
+                50.0,
+                normal_costs,
+                normal_tokens,
+            )],
+            session_checkpoints: vec![checkpoint.clone()],
+            session_ranges: vec![range.clone()],
+            session_model_totals: normal.to_session_totals(),
+            bounded_source_rescan_complete: true,
+            ..super::LocalUsageCollection::default()
+        };
+
+        assert!(super::apply_regression_recovery(
+            &mut collection,
+            recovered.clone()
+        ));
+        assert_eq!(collection.model_usage, recovered);
+        assert_eq!(collection.session_checkpoints, [checkpoint]);
+        assert_eq!(collection.session_ranges, [range]);
+        assert!(collection.bounded_source_rescan_complete);
+        let expected_costs = collection.model_usage.dollar_totals();
+        let expected_tokens = collection.model_usage.token_totals();
+        let sample = &collection.history_samples[0];
+        assert!((sample.sol_dollars - expected_costs.sol).abs() < 1e-12);
+        assert!((sample.luna_dollars - expected_costs.luna).abs() < 1e-12);
+        assert_eq!(sample.sol_tokens, expected_tokens.sol);
+        assert_eq!(sample.luna_tokens, expected_tokens.luna);
+
+        let unchanged = collection.clone();
+        assert!(!super::apply_regression_recovery(&mut collection, normal));
+        assert_eq!(collection.model_usage, unchanged.model_usage);
+        assert_eq!(collection.history_samples, unchanged.history_samples);
+    }
+
+    #[test]
+    fn legacy_component_recovery_requires_checkpointed_sources_and_exact_aggregate() {
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-history-components-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let reset_at = 1_800_604_800;
+        let boundary_timestamp = 1_800_000_120;
+        let timestamp = |value| Utc.timestamp_opt(value, 0).single().unwrap().to_rfc3339();
+        let session = |model: &str, at: i64, total: u64, input: u64, cached: u64, output: u64| {
+            format!(
+                "{}\n{{malformed\n{}\n",
+                json!({
+                    "timestamp": timestamp(at - 1),
+                    "type": "turn_context",
+                    "model": model,
+                }),
+                json!({
+                    "timestamp": timestamp(at),
+                    "type": "token_count",
+                    "payload": {"info": {"total_token_usage": {
+                        "total_tokens": total,
+                        "input_tokens": input,
+                        "cached_input_tokens": cached,
+                        "output_tokens": output,
+                    }}},
+                })
+            )
+        };
+        fs::write(
+            root.join("sol.jsonl"),
+            session(
+                "gpt-5.6-sol",
+                1_800_000_060,
+                1_000_000,
+                800_000,
+                300_000,
+                200_000,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("luna.jsonl"),
+            session(
+                "gpt-5.6-luna",
+                boundary_timestamp,
+                2_000_000,
+                1_800_000,
+                800_000,
+                200_000,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("post-boundary.jsonl"),
+            session(
+                "gpt-5.6-terra",
+                boundary_timestamp + 60,
+                9_000_000,
+                9_000_000,
+                0,
+                0,
+            ),
+        )
+        .unwrap();
+
+        let inventory = super::local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let checkpoints = inventory
+            .selected_session_files
+            .iter()
+            .filter(|candidate| candidate.recorded_source.relative_path != "post-boundary.jsonl")
+            .map(|candidate| super::usage_store::SessionCheckpoint {
+                root_identity: candidate.recorded_source.root_identity.clone(),
+                relative_path: candidate.recorded_source.relative_path.clone(),
+                file_device: candidate.recorded_source.file_device,
+                file_inode: candidate.recorded_source.file_inode,
+                committed_offset: candidate.fingerprint.length,
+                discard_until_lf: false,
+                collector_epoch: 1,
+                cycle_seq: 1,
+                prefix_generation: 1,
+                prefix_sha256: "00".repeat(32),
+                fully_attributed_from_zero: true,
+                token_baseline_known: true,
+                last_model: None,
+                last_task_running: None,
+                previous_total: 0,
+                previous_input: 0,
+                previous_cached_input: 0,
+                previous_output: 0,
+            })
+            .collect::<Vec<_>>();
+        let authority = super::usage_store::HistoryContinuityRecovery {
+            source_fingerprint: "a".repeat(16),
+            source_rows: 2,
+            boundary_timestamp,
+            reset_at,
+            sol_dollars: 8.65,
+            terra_dollars: 0.0,
+            luna_dollars: 0.456,
+            sol_tokens: 1_000_000,
+            terra_tokens: 0,
+            luna_tokens: 2_000_000,
+        };
+
+        assert!(super::recover_checkpointed_history_model_totals(
+            &inventory,
+            &authority,
+            &[],
+            WEEK_SECONDS,
+        )
+        .is_err());
+        let mut mismatched = authority.clone();
+        mismatched.sol_tokens += 1;
+        assert!(super::recover_checkpointed_history_model_totals(
+            &inventory,
+            &mismatched,
+            &checkpoints,
+            WEEK_SECONDS,
+        )
+        .is_err());
+
+        let recovered = super::recover_checkpointed_history_model_totals(
+            &inventory,
+            &authority,
+            &checkpoints,
+            WEEK_SECONDS,
+        )
+        .unwrap();
+        assert_eq!(
+            recovered,
+            vec![
+                super::usage_store::SessionModelTotal {
+                    model: "SOL".into(),
+                    total_tokens: 1_000_000,
+                    input_tokens: 800_000,
+                    cached_input_tokens: 300_000,
+                    output_tokens: 200_000,
+                },
+                super::usage_store::SessionModelTotal {
+                    model: "TERRA".into(),
+                    total_tokens: 0,
+                    input_tokens: 0,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                },
+                super::usage_store::SessionModelTotal {
+                    model: "LUNA".into(),
+                    total_tokens: 2_000_000,
+                    input_tokens: 1_800_000,
+                    cached_input_tokens: 800_000,
+                    output_tokens: 200_000,
+                },
+            ]
+        );
+
+        let partial_path = root.join("post-boundary.jsonl");
+        let mut partial = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&partial_path)
+            .unwrap();
+        partial.write_all(br#"{"type":"token_count"}"#).unwrap();
+        drop(partial);
+        let partial_inventory = super::local_input_inventory_for_paths(Some(&root), None).unwrap();
+        assert!(super::recover_checkpointed_history_model_totals(
+            &partial_inventory,
+            &authority,
+            &checkpoints,
+            WEEK_SECONDS,
+        )
+        .is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn local_usage_failure_keeps_valid_quota_and_never_invents_zero_history() {
         let mut state = CodexInfoState::preview("normal");
         let reset_at = state.reset_at.expect("preview quota has reset");
@@ -14699,18 +16138,36 @@ mod tests {
         assert!(local_commands.try_recv().is_err());
 
         let recovery_epoch = state.auth_epoch;
+        let local_only = UsageHistorySample::from_model_history_with_usage(
+            reset_at - 120,
+            reset_at,
+            ModelDollarTotals {
+                sol: 1.25,
+                ..ModelDollarTotals::default()
+            },
+            ModelTokenTotals {
+                sol: 12_500,
+                ..ModelTokenTotals::default()
+            },
+        );
         state.apply_local_usage_success(LocalUsageResult {
             auth_epoch: recovery_epoch,
             reset_at,
             window_seconds: WEEK_SECONDS,
             model_usage: ModelUsageTotals::default(),
-            history_samples: Vec::new(),
+            history_samples: vec![local_only.clone()],
             recorded_sessions: Vec::new(),
             cleanup_plan: None,
         });
         assert!(!state.local_usage_pending);
-        assert!(state.history.samples.is_empty());
-        assert!(state.history.pending_store_samples.is_empty());
+        assert_eq!(state.history.samples, [local_only]);
+        assert_eq!(state.history.pending_store_samples.len(), 1);
+        assert_eq!(
+            state.history.pending_store_samples[0].remaining_percent,
+            None
+        );
+        assert_eq!(state.history.pending_store_samples[0].sol_tokens, 12_500);
+        assert_eq!(state.remaining_percent, Some(42.0));
 
         state.schedule_resident_refresh(now + Duration::from_secs(4));
         assert!(local_commands.try_recv().is_err());
@@ -15197,6 +16654,7 @@ mod tests {
                 cached_input_tokens: 20,
                 output_tokens: 20,
             }],
+            history_continuity_recovery: None,
         });
         state.local_usage_pending = true;
 
@@ -15306,6 +16764,182 @@ mod tests {
         assert_eq!(state.model_usage, model_usage);
         assert_eq!(state.estimated_cost_label, cost);
         assert!(state.local_usage_error);
+    }
+
+    #[test]
+    fn local_failure_queues_fresh_quota_with_durable_model_totals() {
+        let mut state = CodexInfoState::preview("normal");
+        let reset_at = state.reset_at.expect("preview reset");
+        state.apply_usage_event(usage_event(Some(23.0), reset_at));
+        state.preview = false;
+        let durable_model_totals = vec![super::usage_store::SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 120,
+            input_tokens: 100,
+            cached_input_tokens: 20,
+            output_tokens: 20,
+        }];
+        let observed_at = state.last_success_at.expect("fresh quota timestamp");
+        let admission = state
+            .current_account_admission()
+            .expect("preview admission");
+
+        state.apply_local_usage_error_with_generation(
+            state.auth_epoch,
+            Some(admission),
+            reset_at,
+            WEEK_SECONDS,
+            Some(0x138),
+            Some(2),
+            durable_model_totals.clone(),
+        );
+
+        assert!(!state.local_usage_pending);
+        assert!(state.local_usage_error);
+        assert_eq!(state.history.pending_store_samples.len(), 1);
+        let sample = &state.history.pending_store_samples[0];
+        assert_eq!(sample.timestamp, observed_at.div_euclid(60) * 60);
+        assert_eq!(sample.reset_at, reset_at);
+        assert_eq!(sample.remaining_percent, Some(23.0));
+        assert_eq!(sample.sol_tokens, 120);
+        assert_eq!(sample.sol_dollars, 0.00101);
+
+        let pending = state.take_pending_recorder_batch();
+        assert_eq!(pending.collector_epoch, Some(0x138));
+        assert_eq!(pending.cycle_seq, Some(2));
+        assert_eq!(pending.reset_at, Some(reset_at));
+        assert_eq!(pending.window_seconds, Some(WEEK_SECONDS));
+        assert_eq!(pending.session_model_totals, durable_model_totals);
+        assert!(!pending.bounded_source_rescan_complete);
+        assert_eq!(pending.samples.len(), 1);
+        assert_eq!(pending.samples[0].remaining_percent, Some(23.0));
+    }
+
+    #[test]
+    fn local_failure_quota_batch_survives_recorder_retry_exactly_once() {
+        let mut state = CodexInfoState::preview("normal");
+        let reset_at = state.reset_at.expect("preview reset");
+        state.apply_usage_event(usage_event(Some(23.0), reset_at));
+        state.preview = false;
+        let durable_model_totals = vec![super::usage_store::SessionModelTotal {
+            model: "LUNA".into(),
+            total_tokens: 44,
+            input_tokens: 40,
+            cached_input_tokens: 4,
+            output_tokens: 4,
+        }];
+        let admission = state
+            .current_account_admission()
+            .expect("preview admission");
+        state.apply_local_usage_error_with_generation(
+            state.auth_epoch,
+            Some(admission),
+            reset_at,
+            WEEK_SECONDS,
+            Some(0x139),
+            Some(3),
+            durable_model_totals,
+        );
+        let pending_before = state.history.pending_store_samples.clone();
+        let mut publication = super::ResidentPublicationState::default();
+        let attempts = std::cell::Cell::new(0_u8);
+
+        let first = super::resident_service_cycle_with_recorder_attempt(
+            &mut state,
+            &mut publication,
+            true,
+            |_, pending| {
+                attempts.set(attempts.get() + 1);
+                assert_eq!(pending.samples.len(), 1);
+                assert_eq!(pending.session_model_totals.len(), 1);
+                Err("transient store failure".into())
+            },
+            |details| {
+                details.validate().unwrap();
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            first,
+            Err(super::ResidentServiceCycleError::Store(_))
+        ));
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(state.history.pending_store_samples, pending_before);
+        assert!(state.has_pending_recorder_batch());
+
+        let recovered = super::resident_service_cycle_with_recorder_attempt(
+            &mut state,
+            &mut publication,
+            true,
+            |state, pending| {
+                attempts.set(attempts.get() + 1);
+                assert_eq!(pending.samples.len(), 1);
+                assert_eq!(pending.session_model_totals.len(), 1);
+                acknowledge_recorder_commit_fixture(state, 2, 0x139, 3);
+                Ok(())
+            },
+            |details| {
+                details.validate().unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(recovered, super::ResidentServiceCycleOutcome::Published);
+        assert_eq!(attempts.get(), 2);
+        assert!(!state.has_pending_recorder_batch());
+        assert_eq!(
+            state
+                .history
+                .samples
+                .iter()
+                .filter(|sample| {
+                    sample.timestamp == pending_before[0].timestamp
+                        && sample.remaining_percent == 23.0
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn local_failure_does_not_queue_quota_for_outage_or_stale_admission() {
+        let mut state = CodexInfoState::preview("normal");
+        let reset_at = state.reset_at.expect("preview reset");
+        state.apply_usage_event(usage_event(Some(23.0), reset_at));
+        state.preview = false;
+        let admission = state
+            .current_account_admission()
+            .expect("preview admission");
+        let mut stale_admission = admission.clone();
+        stale_admission.partition_id.push_str("-stale");
+
+        state.apply_local_usage_error_with_generation(
+            state.auth_epoch,
+            Some(stale_admission),
+            reset_at,
+            WEEK_SECONDS,
+            Some(0x13a),
+            Some(4),
+            Vec::new(),
+        );
+        assert!(!state.local_usage_error);
+        assert!(state.history.pending_store_samples.is_empty());
+        assert!(!state.has_pending_recorder_batch());
+
+        state.account_error = Some("remote outage".into());
+        state.local_usage_pending = true;
+        state.apply_local_usage_error_with_generation(
+            state.auth_epoch,
+            Some(admission),
+            reset_at,
+            WEEK_SECONDS,
+            Some(0x13a),
+            Some(5),
+            Vec::new(),
+        );
+        assert!(!state.local_usage_pending);
+        assert!(state.history.pending_store_samples.is_empty());
+        assert!(!state.has_pending_recorder_batch());
     }
 
     #[test]
@@ -15670,9 +17304,9 @@ mod tests {
 
         let paths = state.graph_paths_for_selection_at(OBSERVED_AT, true, true, true, false);
         assert!(paths.remaining.starts_with("M0.00 "));
-        assert!(paths.remaining.contains("L100.00 "));
+        assert!(paths.remaining.matches('M').count() > 1);
         assert!(paths.sol.starts_with("M0.00 "));
-        assert!(paths.sol.contains("L100.00 "));
+        assert!(!paths.sol.contains("L100.00 "));
     }
 
     #[test]
@@ -18969,6 +20603,7 @@ mod tests {
             window_seconds: WEEK_SECONDS,
             collector_epoch: Some(0x1111),
             cycle_seq: 1,
+            last_quota_observation: None,
             checkpoints: vec![first_checkpoint],
             model_totals: Vec::new(),
         };
@@ -19003,6 +20638,7 @@ mod tests {
             window_seconds: WEEK_SECONDS,
             collector_epoch: Some(0x1111),
             cycle_seq: 2,
+            last_quota_observation: None,
             checkpoints: appended.session_checkpoints,
             model_totals: appended.session_model_totals,
         };
@@ -19036,6 +20672,7 @@ mod tests {
             window_seconds: WEEK_SECONDS,
             collector_epoch: Some(0x1111),
             cycle_seq: 3,
+            last_quota_observation: None,
             checkpoints: fresh_collection.session_checkpoints,
             model_totals: fresh_collection.session_model_totals,
         };
@@ -19509,6 +21146,7 @@ mod tests {
                 window_seconds: WEEK_SECONDS,
                 collector_epoch: Some(0x4444),
                 cycle_seq: 1,
+                last_quota_observation: None,
                 checkpoints: first.session_checkpoints,
                 model_totals: first.session_model_totals,
             },
@@ -19617,6 +21255,7 @@ mod tests {
                 window_seconds: WEEK_SECONDS,
                 collector_epoch: Some(0x5555),
                 cycle_seq: 1,
+                last_quota_observation: None,
                 checkpoints: first.session_checkpoints,
                 model_totals: first.session_model_totals,
             },
@@ -19706,6 +21345,45 @@ mod tests {
         assert_eq!(inventory.selected_session_files.len(), 1);
         assert_eq!(inventory.overflow_session_files.len(), 1);
         assert_eq!(inventory.selected_session_files[0].fingerprint.path, newest);
+        let durable_total = super::usage_store::SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 1_000,
+            input_tokens: 1_000,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+        };
+        let mut durable_state = super::usage_store::SessionCollectionState {
+            data_generation: 3,
+            reset_at: reset_at - 1,
+            window_seconds: WEEK_SECONDS,
+            last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
+                observed_at: now.timestamp() - 60,
+                remaining_percent: 80.0,
+            }),
+            model_totals: vec![durable_total],
+            ..super::usage_store::SessionCollectionState::default()
+        };
+        assert!(!super::admit_session_collection_period(
+            &mut durable_state,
+            reset_at,
+            WEEK_SECONDS,
+            Some(79.0),
+            now.timestamp(),
+        ));
+        let cumulative = super::collect_incremental_local_usage(
+            &inventory,
+            &durable_state,
+            &BTreeSet::new(),
+            super::IncrementalSessionContext {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: false,
+                collector_epoch: 0x138,
+                cycle_seq: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(cumulative.model_usage.sol.tokens, 1_120);
         let collection =
             super::collect_local_usage_snapshot(reset_at, WEEK_SECONDS, &inventory).unwrap();
         assert_eq!(collection.model_usage.sol.tokens, 120);
@@ -21300,7 +22978,9 @@ mod tests {
         // moves by a few seconds, session backfill contributes SOL totals
         // without a quota observation, and only the final quota poll reports
         // the 1% balance. The period must stay a single selection, while the
-        // missing quota interval must not be turned into a fabricated slope.
+        // missing quota interval must not become a flat-then-vertical drop.
+        // The final 1% remains at its actual remote observation time; the
+        // bounded intermediate values are reference-only graph completion.
         let base = 1_999_999_980;
         let reset = base + 10_000;
         let samples = vec![
@@ -21366,8 +23046,8 @@ mod tests {
             remaining,
             vec![
                 (base, 87.0),
-                (base + 60, 44.0),
-                (base + 120, 1.0),
+                (base + 60, 65.5),
+                (base + 120, 44.0),
                 (base + 240, 1.0),
                 (base + 300, 1.0)
             ]
@@ -21480,20 +23160,17 @@ mod tests {
             remaining.first(),
             Some(&(fixture.expected_period_start, 100.0))
         );
-        assert_eq!(remaining.get(1).map(|point| point.1), Some(100.0));
-        assert_eq!(remaining.get(2).map(|point| point.1), Some(87.0));
-        assert_eq!(
-            remaining.get(1).map(|point| point.0),
-            remaining.get(2).map(|point| point.0)
-        );
-        assert!(remaining.windows(2).any(|pair| {
+        assert_eq!(remaining.get(1).map(|point| point.1), Some(87.0));
+        assert_eq!(remaining.get(2).map(|point| point.1), Some(44.0));
+        assert!(remaining.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(!remaining.windows(2).any(|pair| {
             pair[0].0 == pair[1].0 && (pair[0].1 - pair[1].1).abs() > f64::EPSILON
         }));
-        assert!(!remaining.windows(2).take(2).any(|pair| {
-            pair[0].0 < selected[0].timestamp
-                && pair[1].0 == selected[0].timestamp
-                && (pair[0].1 - pair[1].1).abs() > f64::EPSILON
-        }));
+        // The period boundary and first observation form a time-spanning
+        // inferred interval. Never fabricate a flat prefix followed by a
+        // same-timestamp vertical quota drop.
+        assert!(remaining[0].0 < selected[0].timestamp);
+        assert_eq!(remaining[1].0, selected[0].timestamp);
 
         let minute = graph_time_endpoints(
             minute_model_spend_for_metric(&references, false),
@@ -21926,18 +23603,17 @@ mod tests {
         assert_eq!(ui_root.remaining_percent, Some(41.0));
         assert_eq!(ui_root.estimated_cost_label, "概算 $323.674247");
         assert_eq!(ui_root.active_threads[0].id, "thread-b");
-        assert_eq!(
-            ui_root
-                .graph_paths_for_selection_at(
-                    oracle_b.observed_at.unwrap(),
-                    true,
-                    true,
-                    true,
-                    false,
-                )
-                .current_sol_label,
-            "$323.67"
+        let graph_b = ui_root.graph_paths_for_selection_at(
+            oracle_b.observed_at.unwrap(),
+            true,
+            true,
+            true,
+            false,
         );
+        // Generation B regresses TERRA/LUNA inside one cumulative period.
+        // The top-level payload remains visible as received, but the graph
+        // must not synthesize a current whole vector from SOL alone.
+        assert!(graph_b.current_sol_label.is_empty());
         server.shutdown();
 
         let mut restarted =
@@ -22907,7 +24583,7 @@ mod tests {
     }
 
     #[test]
-    fn dollar_graph_does_not_recount_a_regressed_snapshot() {
+    fn dollar_graph_dashes_a_regressed_snapshot_until_whole_vector_recovery() {
         let reset_at = 1_700_100_000;
         let samples = [
             UsageHistorySample::new(
@@ -22920,8 +24596,8 @@ mod tests {
                     luna: 1.0,
                 },
             ),
-            // A transiently incomplete scan must not reset the cumulative
-            // total and make the next 51-dollar observation count as +51.
+            // A transiently incomplete scan is missing evidence, not a flat
+            // 50-dollar observation and not a new zero-based cumulative run.
             UsageHistorySample::new(
                 160,
                 reset_at,
@@ -22946,18 +24622,164 @@ mod tests {
         let references = samples.iter().collect::<Vec<_>>();
         let points = minute_model_spend(&references);
         assert_eq!(points[0].sol, 50.0);
-        assert_eq!(points[1].sol, 50.0);
+        assert!(!model_spend_is_reliable(&points[1]));
         assert_eq!(points[2].sol, 51.0);
 
         let graph = graph_paths_for_selection(&references, 0, 240, false, false, true, false);
         assert_eq!(graph.current_sol_label, "$51.00");
+        assert!(graph.sol_flat.matches('M').count() > 2);
+        assert!(!graph.sol_rising.contains("M41.67"));
     }
 
     #[test]
-    fn graph_model_points_are_anchored_to_start_and_now() {
+    fn incident_shape_never_turns_a_regressed_scan_into_a_late_vertical_drop() {
+        let reset_at = 10_000;
+        let sample = |timestamp, remaining_percent, sol, luna| {
+            UsageHistorySample::new(
+                timestamp,
+                reset_at,
+                remaining_percent,
+                ModelDollarTotals {
+                    sol,
+                    terra: 0.0,
+                    luna,
+                },
+            )
+        };
+        let samples = [
+            sample(0, 85.0, 176.04, 7.00),
+            // Mirrors the damaged live shape: the scanner temporarily lost
+            // an already-counted Session prefix while remote quota continued
+            // to return observations.
+            sample(60, 84.0, 87.48, 5.00),
+            sample(120, 83.0, 88.00, 5.10),
+            sample(180, 82.0, 89.00, 5.20),
+            sample(240, 81.0, 184.14, 7.34),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+
+        let model = minute_model_spend(&references);
+        assert!(model_spend_is_reliable(&model[0]));
+        assert!(model[1..4]
+            .iter()
+            .all(|point| !model_spend_is_reliable(point)));
+        assert!(model_spend_is_reliable(&model[4]));
+
+        let remaining = remaining_graph_points(&references, 0, 300);
+        assert!(remaining.windows(2).all(|pair| pair[1].0 > pair[0].0));
+        assert!(remaining
+            .windows(2)
+            .all(|pair| pair[0].1 - pair[1].1 <= 1.0 + f64::EPSILON));
+
+        let graph = graph_paths_for_selection(&references, 0, 300, true, true, true, false);
+        // Inferred model recovery and unattributed quota movement are drawn
+        // as multiple separated strokes, never a solid flat-then-vertical
+        // fiction at the recovery timestamp.
+        assert!(graph.sol_flat.matches('M').count() > 2);
+        assert!(!graph.sol_rising.contains("M60.00"));
+        assert!(graph.remaining.matches('M').count() > 5);
+        assert!(!graph.remaining.contains("M80.00 4.92 L80.00 19.62"));
+    }
+
+    #[test]
+    fn confirmed_recorder_gap_breaks_both_sources_instead_of_interpolating() {
+        let reset_at = 1_000;
+        let samples = [
+            UsageHistorySample::new(0, reset_at, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(
+                60,
+                reset_at,
+                90.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::new(
+                120,
+                reset_at,
+                80.0,
+                ModelDollarTotals {
+                    sol: 2.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+            UsageHistorySample::new(
+                180,
+                reset_at,
+                70.0,
+                ModelDollarTotals {
+                    sol: 3.0,
+                    ..ModelDollarTotals::default()
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let graph = graph_paths_for_selection_with_confirmed_gaps(
+            &references,
+            0,
+            180,
+            false,
+            false,
+            true,
+            false,
+            &[GraphConfirmedGap {
+                start_at: 60,
+                end_at: 120,
+            }],
+        );
+
+        assert!(graph.sol_rising.contains("M0.00 99.00 L33.33 66.33"));
+        assert!(!graph.sol_rising.contains("M33.33 66.33 L66.67 33.67"));
+        assert!(graph.sol_rising.contains("M66.67 33.67 L100.00 1.00"));
+        assert!(graph.remaining.contains("M0.00 1.00 L33.33 10.80"));
+        assert!(!graph.remaining.contains("M33.33 10.80 L66.67 20.60"));
+        assert!(graph.remaining.contains("M66.67 20.60 L100.00 30.40"));
+        assert!(graph.unused_intervals.iter().any(|interval| {
+            interval.preserve_boundary
+                && (interval.start - 33.333_333).abs() < 0.001
+                && (interval.width - 33.333_333).abs() < 0.001
+        }));
+    }
+
+    #[test]
+    fn service_client_retains_confirmed_gaps_for_native_graph_projection() {
+        let source = CodexInfoState::preview("normal");
+        let mut details = source.public_details();
+        let period = details
+            .history_periods
+            .iter()
+            .find(|period| period.current)
+            .cloned()
+            .expect("preview has a current period");
+        let gap_start = period.start_at + 60;
+        let gap_end = gap_start + 60;
+        details.history_gaps = vec![PublicHistoryGap {
+            gap_id: "11".repeat(16),
+            reset_at: period.reset_at,
+            start_at: gap_start,
+            end_at: gap_end,
+            reason: "daemon_stop_unrecoverable".into(),
+        }];
+        let observed_at = details.observed_at.expect("preview is observed");
+        let mut client = CodexInfoState::service_client();
+
+        assert!(client
+            .apply_service_details(format!("v1:{:064x}", 1_u8), details)
+            .unwrap());
+        assert_eq!(client.history_gaps.len(), 1);
+        let graph = client.graph_paths_for_selection_at(observed_at, true, true, true, false);
+        assert!(graph
+            .unused_intervals
+            .iter()
+            .any(|interval| interval.preserve_boundary && interval.width > 0.0));
+    }
+
+    #[test]
+    fn graph_model_points_are_anchored_to_start_and_recent_now() {
         let points = graph_time_endpoints(
             vec![HourlyModelSpend {
-                timestamp: 120,
+                timestamp: 260,
                 sol: 3.0,
                 terra: 2.0,
                 luna: 1.0,
@@ -22975,6 +24797,27 @@ mod tests {
             (points[2].sol, points[2].terra, points[2].luna),
             (3.0, 2.0, 1.0)
         );
+    }
+
+    #[test]
+    fn graph_model_points_do_not_extend_an_open_local_log_gap() {
+        let points = graph_time_endpoints(
+            vec![HourlyModelSpend {
+                timestamp: 60,
+                sol: 3.0,
+                terra: 2.0,
+                luna: 1.0,
+            }],
+            0,
+            3_600,
+        );
+
+        assert_eq!(points.last().map(|point| point.timestamp), Some(60));
+        let (_, rising, inferred) =
+            split_metric_line_paths(&points, 0, 3_600, 3.0, |point| point.sol);
+        assert!(rising.contains("L1.67"));
+        assert!(!rising.contains("L100.00"));
+        assert!(!inferred.contains("L100.00"));
     }
 
     #[test]
@@ -23020,15 +24863,22 @@ mod tests {
                 luna: 1.0,
             },
         );
-        let paths = graph_paths(&[&first, &latest], 0, 3_900);
+        let selected = [&first, &latest];
+        let remaining_points = remaining_graph_points(&selected, 0, 3_900);
+        let paths = graph_paths(&selected, 0, 3_900);
         assert!(paths.remaining.starts_with("M0.00 1.00"));
-        assert!(paths.remaining.contains("L15.38"));
-        assert!(paths.remaining.contains("L15.38 1.00 L15.38"));
-        assert!(paths.remaining.contains("L100.00"));
+        assert_eq!(remaining_points[0], (0, 100.0));
+        // This internal point is an explicitly inferred smoothing point; the
+        // renderer therefore dashes it instead of claiming 82.5 was read.
+        assert_eq!(remaining_points[1], (600, 82.5));
+        assert!(remaining_points
+            .windows(2)
+            .all(|pair| pair[0].0 < pair[1].0));
+        assert!(paths.remaining.matches('M').count() > 2);
         assert!(paths.sol.starts_with("M0.00 99.00"));
-        assert!(paths.sol.contains("L100.00"));
-        assert!(paths.terra.contains("L100.00"));
-        assert!(paths.luna.contains("L100.00"));
+        assert!(!paths.sol.contains("L100.00"));
+        assert!(!paths.terra.contains("L100.00"));
+        assert!(!paths.luna.contains("L100.00"));
         assert_eq!(paths.current_remaining_label, "70%");
         assert_eq!(paths.current_sol_label, "$4.00");
         assert_eq!(paths.current_terra_label, "$2.00");
@@ -23039,7 +24889,7 @@ mod tests {
     }
 
     #[test]
-    fn remaining_graph_stays_flat_when_models_never_change() {
+    fn remaining_graph_preserves_unattributed_quota_changes_as_inferred() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
             UsageHistorySample::new(60, 1_000, 90.0, ModelDollarTotals::default()),
@@ -23047,15 +24897,23 @@ mod tests {
             UsageHistorySample::new(180, 1_000, 70.0, ModelDollarTotals::default()),
         ];
         let references = samples.iter().collect::<Vec<_>>();
-        // Quota rereads during an entirely idle model history cannot create a
-        // slope. The production path must collapse the whole period to one
-        // horizontal segment rather than relying on the legacy helper.
+        // Remote quota observations are not discarded just because local
+        // logs stayed flat. They remain at their real timestamps, while the
+        // evidence path uses separated dash strokes because no model change
+        // attributes the loss.
         assert_eq!(
             remaining_graph_points(&references, 0, 240),
-            vec![(0, 100.0), (240, 100.0)]
+            vec![
+                (0, 100.0),
+                (60, 90.0),
+                (120, 90.0),
+                (180, 70.0),
+                (240, 70.0)
+            ]
         );
         let path = graph_paths(&references, 0, 240).remaining;
-        assert_eq!(path, "M0.00 1.00 L100.00 1.00");
+        assert!(path.matches('M').count() > 5);
+        assert!(!path.contains("M0.00 1.00 L25.00 10.80"));
     }
 
     #[test]
@@ -23202,7 +25060,7 @@ mod tests {
     }
 
     #[test]
-    fn remaining_graph_holds_idle_flat_and_connects_active_change_points() {
+    fn remaining_graph_keeps_idle_quota_observations_without_calling_them_model_attributed() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
             UsageHistorySample::new(60, 1_000, 95.0, ModelDollarTotals::default()),
@@ -23244,17 +25102,15 @@ mod tests {
             points,
             vec![
                 (0, 100.0),
-                (60, 100.0),
+                (60, 95.0),
                 (120, 90.0),
-                (180, 90.0),
+                (180, 85.0),
                 (240, 80.0)
             ]
         );
         let path = graph_paths(&references, 0, 240).remaining;
-        assert_eq!(
-            path,
-            "M0.00 1.00 L25.00 1.00 L50.00 10.80 L75.00 10.80 L100.00 20.60"
-        );
+        assert!(path.matches('M').count() > 5);
+        assert!(path.contains("M25.00 5.90 L50.00 10.80"));
     }
 
     #[test]
@@ -23292,10 +25148,10 @@ mod tests {
             remaining_graph_points(&references, 0, 240),
             vec![(0, 100.0), (60, 90.0), (120, 80.0), (240, 80.0)]
         );
-        assert_eq!(
-            graph_paths(&references, 0, 240).remaining,
-            "M0.00 1.00 L25.00 10.80 L50.00 20.60 L100.00 20.60"
-        );
+        let path = graph_paths(&references, 0, 240).remaining;
+        assert!(path.starts_with("M0.00 1.00 L25.00 10.80 M25.00 10.80 L50.00 20.60"));
+        assert!(path.matches('M').count() > 5);
+        assert!(!path.contains("L50.00 20.60 L100.00 20.60"));
     }
 
     #[test]
@@ -23354,10 +25210,11 @@ mod tests {
                 (240, 80.0)
             ]
         );
-        assert_eq!(
-            graph_paths(&references, 0, 240).remaining,
-            "M0.00 1.00 L25.00 10.80 L50.00 15.70 L75.00 20.60 L100.00 20.60"
-        );
+        let path = graph_paths(&references, 0, 240).remaining;
+        assert!(path.starts_with("M0.00 1.00 L25.00 10.80"));
+        assert!(path.matches('M').count() > 5);
+        assert!(!path.contains("L50.00 10.80 L50.00 15.70"));
+        assert!(path.ends_with("L100.00 20.60"));
     }
 
     #[test]
@@ -23408,7 +25265,9 @@ mod tests {
         assert!(points.iter().all(|(_, remaining)| *remaining >= 99.0));
         let graph = graph_paths_for_selection(&references, 0, 180, true, true, true, true);
         assert_eq!(graph.current_remaining_label, "99%");
-        assert!(graph.remaining.ends_with("L100.00 1.98"));
+        assert!(!graph.remaining.is_empty());
+        assert!(graph.remaining.matches('M').count() > 2);
+        assert!(!graph.remaining.contains("L100.00 99.00 L100.00 1.98"));
     }
 
     #[test]
@@ -23540,8 +25399,10 @@ mod tests {
         ];
         let references = samples.iter().collect::<Vec<_>>();
         let paths = graph_paths(&references, 0, 120);
-        assert_eq!(paths.current_remaining_label, "100%");
-        assert!(paths.remaining.ends_with("L100.00 1.00"));
+        assert_eq!(paths.current_remaining_label, "0%");
+        let remaining = remaining_graph_points(&references, 0, 120);
+        assert_eq!(remaining, [(0, 100.0), (60, 0.0), (120, 0.0)]);
+        assert!(paths.remaining.matches('M').count() > 2);
     }
 
     #[test]
@@ -23689,7 +25550,7 @@ mod tests {
 
         let zero = UsageHistorySample::new(120, 0, 70.0, ModelDollarTotals::default());
         let all_zero = graph_paths(&[&zero], 0, 300);
-        assert_eq!(all_zero.current_remaining_label, "100%");
+        assert_eq!(all_zero.current_remaining_label, "70%");
         assert!(all_zero.current_sol_label.is_empty());
         assert!(all_zero.current_terra_label.is_empty());
         assert!(all_zero.current_luna_label.is_empty());
@@ -23788,7 +25649,7 @@ mod tests {
     }
 
     #[test]
-    fn token_graph_carries_cumulative_values_across_legacy_zero_rows() {
+    fn token_graph_marks_legacy_zero_rows_unavailable_until_vector_recovery() {
         let samples = [
             UsageHistorySample::new_with_usage(
                 100,
@@ -23852,23 +25713,18 @@ mod tests {
             (points[0].sol, points[0].terra, points[0].luna),
             (1_000.0, 2_000.0, 3_000.0)
         );
-        assert_eq!(
-            (points[1].sol, points[1].terra, points[1].luna),
-            (1_000.0, 2_000.0, 3_000.0)
-        );
+        assert!(!model_spend_is_reliable(&points[1]));
         assert_eq!(
             (points[2].sol, points[2].terra, points[2].luna),
             (2_000.0, 4_000.0, 8_000.0)
         );
-        assert_eq!(
-            (points[3].sol, points[3].terra, points[3].luna),
-            (2_000.0, 4_000.0, 8_000.0)
-        );
+        assert!(!model_spend_is_reliable(&points[3]));
 
         let graph = graph_paths_for_selection(&references, 0, 300, true, true, true, true);
-        assert_eq!(graph.current_luna_label, "8,000");
-        assert_eq!(graph.current_terra_label, "4,000");
-        assert_eq!(graph.current_sol_label, "2,000");
+        assert!(graph.current_luna_label.is_empty());
+        assert!(graph.current_terra_label.is_empty());
+        assert!(graph.current_sol_label.is_empty());
+        assert!(graph.sol_flat.matches('M').count() > 2);
     }
 
     #[test]
@@ -23898,8 +25754,8 @@ mod tests {
         let tokens = graph_paths_for_selection(&references, 0, 60, true, true, true, true);
 
         assert_eq!(dollars.current_remaining_label, "90%");
-        assert_eq!(tokens.current_remaining_label, "100%");
-        assert!(tokens.remaining.ends_with("L100.00 1.00"));
+        assert_eq!(tokens.current_remaining_label, "90%");
+        assert!(tokens.remaining.matches('M').count() > 2);
     }
 
     #[test]
@@ -23936,10 +25792,11 @@ mod tests {
         let references = samples.iter().collect::<Vec<_>>();
         let tokens = graph_paths_for_selection(&references, 0, 240, true, true, true, true);
 
-        assert_eq!(
-            tokens.remaining,
-            "M0.00 1.00 L25.00 10.80 L50.00 20.60 L100.00 20.60"
-        );
+        assert!(tokens
+            .remaining
+            .starts_with("M0.00 1.00 L25.00 10.80 M25.00 10.80 L50.00 20.60"));
+        assert!(tokens.remaining.matches('M').count() > 2);
+        assert!(!tokens.remaining.contains("L50.00 20.60 L50.00"));
     }
 
     #[test]
@@ -24116,13 +25973,16 @@ mod tests {
             },
         );
         let paths = graph_paths(&[&sample], 0, 240);
-        // x=75 is the first recorded point; x=0..75 must remain at the
-        // baseline rather than becoming a fabricated diagonal spend trend.
-        assert!(paths.sol.contains("L75.00 99.00 L75.00"));
+        // x=75 is the first recorded point. The reset boundary is a reliable
+        // zero endpoint, so the unknown prefix is one time-spanning inferred
+        // interval; it is never a flat prefix plus a vertical jump.
+        assert!(!paths.sol.is_empty());
+        assert!(paths.sol_flat.is_empty());
+        assert!(paths.sol_rising.is_empty());
     }
 
     #[test]
-    fn segment_splitter_never_connects_an_invalid_decrease() {
+    fn segment_splitter_dashes_an_unreliable_interval_only_after_recovery() {
         let points = [
             HourlyModelSpend {
                 timestamp: 0,
@@ -24139,23 +25999,19 @@ mod tests {
                 sol: 3.0,
                 ..HourlyModelSpend::default()
             },
-            HourlyModelSpend {
-                timestamp: 180,
-                sol: 2.0,
-                ..HourlyModelSpend::default()
-            },
+            unreliable_model_spend(180),
             HourlyModelSpend {
                 timestamp: 240,
-                sol: 2.0,
+                sol: 4.0,
                 ..HourlyModelSpend::default()
             },
         ];
-        let (flat, rising) = split_metric_line_paths(&points, 0, 240, 3.0, |point| point.sol);
+        let (flat, rising, inferred) =
+            split_metric_line_paths(&points, 0, 240, 4.0, |point| point.sol);
 
-        assert!(flat.contains("M0.00 66.33 L25.00 66.33"));
-        assert!(flat.contains("M75.00 33.67 L100.00 33.67"));
-        assert!(rising.contains("M25.00 66.33 L50.00 1.00"));
-        // The 3 -> 2 decrease at x=50..75 is a disconnected boundary.
+        assert!(flat.contains("M0.00 74.50 L25.00 74.50"));
+        assert!(rising.contains("M25.00 74.50 L50.00 25.50"));
+        assert!(inferred.matches('M').count() > 1);
         assert!(!flat.contains("M50.00"));
         assert!(!rising.contains("M50.00"));
     }
@@ -24187,12 +26043,14 @@ mod tests {
         let smoothed = smooth_model_spend(&points);
         assert_eq!(smoothed[1].luna, 1.0);
         assert_eq!(smoothed[2].luna, 2.0);
-        let (flat, rising) = split_metric_line_paths(&smoothed, 0, 3_660, 2.0, |point| point.luna);
-        // The 60..3600 interval is unobserved: stay at $1.00, then rise at
-        // the observed 3600-second point. A diagonal here falsely claims
-        // daytime consumption.
-        assert!(flat.contains("M1.64 50.00 L98.36 50.00"));
-        assert!(rising.contains("M98.36 50.00 L98.36 1.00"));
+        let (flat, rising, inferred) =
+            split_metric_line_paths(&smoothed, 0, 3_660, 2.0, |point| point.luna);
+        // Both endpoints are real, but the 60..3600 path is unknown. A
+        // dashed bridge communicates the bounded estimate without claiming
+        // a sudden recovery-time jump or an observed daytime rate.
+        assert!(!flat.contains("M1.64 50.00 L98.36 50.00"));
+        assert!(!rising.contains("M98.36 50.00 L98.36 1.00"));
+        assert!(inferred.matches('M').count() > 2);
     }
 
     #[test]
@@ -24223,12 +26081,12 @@ mod tests {
         let dollars = graph_paths_for_selection(&references, 0, 240, false, false, true, false);
         assert_eq!(dollars.current_sol_label, "$12.00");
         assert!(!dollars.sol_rising.contains("M50.00 99.00"));
-        assert!(dollars.sol_flat.contains("M25.00 17.33 L50.00 17.33"));
+        assert!(dollars.sol_flat.matches('M').count() > 2);
 
         let tokens = graph_paths_for_selection(&references, 0, 240, false, false, true, true);
         assert_eq!(tokens.current_sol_label, "120");
         assert!(!tokens.sol_rising.contains("M50.00 99.00"));
-        assert!(tokens.sol_flat.contains("M25.00 17.33 L50.00 17.33"));
+        assert!(tokens.sol_flat.matches('M').count() > 2);
     }
 
     #[test]
@@ -24242,12 +26100,14 @@ mod tests {
             0,
             240,
         );
-        let (flat, rising) = split_metric_line_paths(&points, 0, 240, 4.0, |point| point.sol);
+        let (flat, rising, inferred) =
+            split_metric_line_paths(&points, 0, 240, 4.0, |point| point.sol);
 
-        assert!(flat.contains("M0.00 99.00 L75.00 99.00"));
+        assert!(!flat.contains("M0.00 99.00 L75.00 99.00"));
         assert!(flat.contains("M75.00 1.00 L100.00 1.00"));
-        assert!(rising.contains("M75.00 99.00 L75.00 1.00"));
+        assert!(!rising.contains("M75.00 99.00 L75.00 1.00"));
         assert!(!rising.contains("M0.00 99.00 L75.00 1.00"));
+        assert!(inferred.matches('M').count() > 2);
     }
 
     #[test]
@@ -24517,7 +26377,7 @@ mod tests {
     #[test]
     fn remaining_graph_keeps_the_reset_start_anchor_without_observations() {
         let paths = graph_paths(&[], 100, 300);
-        assert_eq!(paths.remaining, "M0.00 1.00");
+        assert!(paths.remaining.is_empty());
     }
 
     #[test]

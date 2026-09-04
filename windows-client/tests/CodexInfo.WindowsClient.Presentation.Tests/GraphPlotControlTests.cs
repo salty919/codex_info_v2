@@ -266,6 +266,178 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void Scene_marks_a_regressed_model_component_as_a_whole_vector_gap_until_recovery()
+    {
+        var scene = Scene(
+            [
+                Point(1_000, 100, 1, 2, 3),
+                Point(1_060, 90, 2, 1, 4),
+                Point(1_120, 80, 2, 2, 4),
+                Point(1_180, 70, 75, 3, 5),
+            ]);
+
+        Assert.Equal([true, false, true, true], scene.ModelVectorAvailable);
+        Assert.Equal([1d, double.NaN, 2d, 75d], scene.Sol);
+        Assert.Equal([2d, double.NaN, 2d, 3d], scene.Terra);
+        Assert.Equal([3d, double.NaN, 4d, 5d], scene.Luna);
+
+        var lines = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Sol);
+        Assert.Equal([1_120d, 1_180d], lines.Rising.X);
+        Assert.Equal([2d, 75d], lines.Rising.Y);
+        Assert.Equal([1_000d, 1_120d], lines.Dashed.X);
+        Assert.Equal([1d, 2d], lines.Dashed.Y);
+
+        var quotaLines = GraphPlotProjection.BuildRemainingLines(scene);
+        Assert.Equal([1_120d, 1_180d], quotaLines.Solid.X);
+        Assert.Equal([80d, 70d], quotaLines.Solid.Y);
+        Assert.Equal([1_000d, 1_060d, 1_120d], quotaLines.Dashed.X);
+        Assert.Equal([100d, 90d, 80d], quotaLines.Dashed.Y);
+    }
+
+    [Fact]
+    public void Live_incident_shape_never_creates_a_flat_then_vertical_recovery_drop()
+    {
+        var scene = GraphScene.Create(
+            [
+                Point(0, 85, 176.04, 0, 7.00),
+                Point(60, 84, 87.48, 0, 5.00),
+                Point(120, 83, 88.00, 0, 5.10),
+                Point(180, 82, 89.00, 0, 5.20),
+                Point(240, 81, 184.14, 0, 7.34),
+            ],
+            GraphMetric.Dollars,
+            0,
+            300);
+
+        Assert.Equal([true, false, false, false, true], scene.ModelVectorAvailable);
+        var model = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Sol);
+        var remaining = GraphPlotProjection.BuildRemainingLines(scene);
+
+        Assert.Empty(model.Flat.X);
+        Assert.Empty(model.Rising.X);
+        Assert.Equal([0d, 240d], model.Dashed.X);
+        Assert.Equal([176.04d, 184.14d], model.Dashed.Y);
+        Assert.Empty(remaining.Solid.X);
+        Assert.Equal([0d, 60d, 120d, 180d, 240d, 300d], remaining.Dashed.X);
+        Assert.Equal([85d, 84d, 83d, 82d, 81d, 81d], remaining.Dashed.Y);
+        Assert.True(remaining.Dashed.X
+            .Zip(remaining.Dashed.X.Skip(1))
+            .All(pair => pair.First < pair.Second));
+    }
+
+    [Fact]
+    public void Renderable_model_lines_use_dashes_for_long_trusted_gaps_only()
+    {
+        var scene = Scene(
+            [
+                Point(1_000, 100, 0, 0, 0),
+                Point(1_060, 90, 1, 0, 0),
+                Point(1_121, 80, 2, 0, 0),
+            ]);
+
+        var lines = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Sol);
+
+        Assert.Equal([1_000d, 1_060d], lines.Rising.X);
+        Assert.Equal([0d, 1d], lines.Rising.Y);
+        Assert.Equal([1_060d, 1_121d], lines.Dashed.X);
+        Assert.Equal([1d, 2d], lines.Dashed.Y);
+    }
+
+    [Fact]
+    public void Remaining_quota_observations_survive_flat_model_rows_as_unattributed_dashes()
+    {
+        var scene = Scene(
+            [
+                Point(1_000, 100, 0, 0, 0),
+                Point(1_060, 90, 1, 0, 0),
+                Point(1_120, 70, 1, 0, 0),
+            ]);
+
+        var lines = GraphPlotProjection.BuildRemainingLines(scene);
+
+        Assert.Equal([100d, 90d, 70d], scene.ObservedRemainingValues);
+        Assert.Equal([1_000d, 1_060d], lines.Solid.X);
+        Assert.Equal([100d, 90d], lines.Solid.Y);
+        Assert.Equal([1_060d, 1_120d], lines.Dashed.X);
+        Assert.Equal([90d, 70d], lines.Dashed.Y);
+    }
+
+    [Fact]
+    public void Missing_remote_quota_is_never_painted_as_a_solid_bridge()
+    {
+        var scene = Scene(
+            [
+                Point(1_000, 100, 0, 0, 0),
+                Point(1_060, null, 1, 0, 0),
+                Point(1_120, 80, 2, 0, 0),
+            ]);
+
+        var lines = GraphPlotProjection.BuildRemainingLines(scene);
+
+        Assert.Empty(lines.Solid.X);
+        Assert.Equal([1_000d, 1_060d, 1_120d], lines.Dashed.X);
+        Assert.Equal([100d, 90d, 80d], lines.Dashed.Y);
+    }
+
+    [Fact]
+    public void Open_local_gap_stops_models_but_holds_last_remote_value_as_a_dashed_reference()
+    {
+        var period = new ApiHistoryPeriod("current", 1_000, 2_000, true, "current")
+        {
+            Samples = [Point(1_000, 80, 5, 2, 1)],
+        };
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_600);
+        var scene = GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            1_000,
+            1_600);
+
+        var model = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Sol);
+        var remaining = GraphPlotProjection.BuildRemainingLines(scene);
+        var labels = GraphPlotProjection.BuildEndpointLabels(scene, CultureInfo.InvariantCulture);
+
+        Assert.Single(samples);
+        Assert.Equal(1_000, samples[0].Timestamp);
+        Assert.Empty(model.Flat.X);
+        Assert.Empty(model.Rising.X);
+        Assert.Empty(model.Dashed.X);
+        Assert.Empty(remaining.Solid.X);
+        Assert.Equal([1_000d, 1_600d], remaining.Dashed.X);
+        Assert.Equal([80d, 80d], remaining.Dashed.Y);
+        Assert.DoesNotContain(labels, label => label.Series == GraphSeries.Sol);
+        Assert.Contains(labels, label => label.Series == GraphSeries.Remaining && label.Text == "80%");
+    }
+
+    [Fact]
+    public void Confirmed_history_gap_ends_both_subpaths_without_a_cross_gap_connector()
+    {
+        var scene = GraphScene.Create(
+            [
+                Point(1_000, 100, 0, 0, 0),
+                Point(1_060, 90, 1, 0, 0),
+                Point(1_120, 80, 2, 0, 0),
+            ],
+            GraphMetric.Dollars,
+            1_000,
+            1_120,
+            [new GraphConfirmedGap(1_060, 1_120)]);
+
+        var model = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Sol);
+        var remaining = GraphPlotProjection.BuildRemainingLines(scene);
+
+        var gap = Assert.Single(scene.ConfirmedGaps);
+        Assert.Equal(1_060L, gap.StartAt);
+        Assert.Equal(1_120L, gap.EndAt);
+        Assert.Equal([1_000d, 1_060d], model.Rising.X);
+        Assert.Empty(model.Dashed.X);
+        Assert.Equal([1_000d, 1_060d], remaining.Solid.X);
+        Assert.Empty(remaining.Dashed.X);
+        Assert.Contains(scene.IdleIntervals, interval =>
+            interval.PreserveBoundary && interval.StartAt == 1_060 && interval.EndAt == 1_120);
+    }
+
+    [Fact]
     public void PlotProjectionDoesNotInventSpendDuringAnUnobservedGap()
     {
         var scene = Scene(
@@ -804,9 +976,14 @@ public sealed class GraphPlotControlTests
         Assert.Equal(secondCurrent.EndAt, graph.Scene.PeriodEndAt);
         Assert.NotEqual(firstEndpoint, graph.Scene.PeriodEndAt);
         Assert.Equal(secondCurrent.EndAt, graph.Points[^1].Timestamp);
-        Assert.Equal(41, graph.Points[^1].RemainingPercent);
+        Assert.Null(graph.Points[^1].RemainingPercent);
+        Assert.Equal(41, graph.Scene.Remaining[^1]);
         Assert.Equal(323.674247, graph.Points[^1].SolValue, precision: 6);
-        Assert.True(graph.Scene.ModelMaximum > firstMaximum);
+        // The refresh row regresses Terra/Luna while SOL advances. The
+        // whole-vector policy must keep that row unavailable instead of
+        // raising the maximum from a component-wise repair.
+        Assert.Equal(firstMaximum, graph.Scene.ModelMaximum);
+        Assert.False(graph.Scene.ModelVectorAvailable[^1]);
         Assert.Equal("thread-b", Assert.Single(threads.Threads).Id);
         Assert.Equal(2, health.CallCount);
         Assert.Equal(2, details.CallCount);
@@ -839,7 +1016,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Remaining_stays_flat_through_idle_and_does_not_fabricate_terminal_consumption()
+    public void Remaining_preserves_unattributed_remote_changes_and_does_not_fabricate_terminal_consumption()
     {
         var points = new[]
         {
@@ -858,14 +1035,18 @@ public sealed class GraphPlotControlTests
         {
             Point(1_000, 100, 0, 0, 0),
             Point(1_060, 90, 1, 0, 0),
-            // A lower quota reread while all model totals are unchanged must
-            // not create a diagonal segment in the graph.
+            // A lower quota reread while all model totals are unchanged is
+            // still remote evidence, but it cannot be model-attributed.
             Point(1_120, 70, 1, 0, 0),
             Point(1_180, 60, 2, 0, 0),
         };
-        var idleRereadEffective = Scene(idleReread).Remaining;
-        Assert.Equal(90d, idleRereadEffective[2]);
+        var idleRereadScene = Scene(idleReread);
+        var idleRereadEffective = idleRereadScene.Remaining;
+        var idleRereadLines = GraphPlotProjection.BuildRemainingLines(idleRereadScene);
+        Assert.Equal(70d, idleRereadEffective[2]);
         Assert.Equal(60d, idleRereadEffective[3]);
+        Assert.Equal([1_060d, 1_120d], idleRereadLines.Dashed.X);
+        Assert.Equal([90d, 70d], idleRereadLines.Dashed.Y);
 
         var terminal = new[]
         {

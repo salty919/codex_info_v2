@@ -15,6 +15,9 @@ public enum GraphMetric
 /// <summary>A period in which every cumulative model value is unchanged.</summary>
 public readonly record struct GraphIdleInterval(long StartAt, long EndAt, bool PreserveBoundary);
 
+/// <summary>A recorder-confirmed interval in which no complete observation exists.</summary>
+internal readonly record struct GraphConfirmedGap(long StartAt, long EndAt);
+
 /// <summary>
 /// Framework-independent graph projection. It is the single owner of graph
 /// data semantics; XAML owns layout and the ScottPlot adapter only paints the
@@ -31,6 +34,11 @@ public sealed class GraphScene
         double[] sol,
         double[] terra,
         double[] luna,
+        bool[] modelVectorAvailable,
+        bool[] remainingObserved,
+        double[] observedRemainingValues,
+        bool[] remainingInterpolated,
+        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
         IReadOnlyList<GraphIdleInterval> idleIntervals,
         double modelMaximum)
     {
@@ -42,6 +50,11 @@ public sealed class GraphScene
         Sol = sol;
         Terra = terra;
         Luna = luna;
+        ModelVectorAvailable = modelVectorAvailable;
+        RemainingObserved = remainingObserved;
+        ObservedRemainingValues = observedRemainingValues;
+        RemainingInterpolated = remainingInterpolated;
+        ConfirmedGaps = confirmedGaps;
         IdleIntervals = idleIntervals;
         ModelMaximum = modelMaximum;
     }
@@ -62,6 +75,24 @@ public sealed class GraphScene
 
     public IReadOnlyList<double> Luna { get; }
 
+    /// <summary>
+    /// Indicates whether the complete cumulative model vector at each sample
+    /// is trusted. A false row is intentionally unavailable for every model,
+    /// even when one or two raw components were still monotonic.
+    /// </summary>
+    internal IReadOnlyList<bool> ModelVectorAvailable { get; }
+
+    /// <summary>Indicates which remaining-quota values came from the remote observation.</summary>
+    internal IReadOnlyList<bool> RemainingObserved { get; }
+
+    /// <summary>Raw remote quota observations, with missing rows represented by NaN.</summary>
+    internal IReadOnlyList<double> ObservedRemainingValues { get; }
+
+    /// <summary>Indicates values filled or adjusted because an observation was unavailable.</summary>
+    internal IReadOnlyList<bool> RemainingInterpolated { get; }
+
+    internal IReadOnlyList<GraphConfirmedGap> ConfirmedGaps { get; }
+
     public IReadOnlyList<GraphIdleInterval> IdleIntervals { get; }
 
     public double ModelMaximum { get; }
@@ -69,13 +100,21 @@ public sealed class GraphScene
     public bool HasPoints => Timestamps.Count > 0;
 
     public static GraphScene Empty(GraphMetric metric = GraphMetric.Dollars) =>
-        new(0, 1, metric, [], [], [], [], [], [], 1);
+        new(0, 1, metric, [], [], [], [], [], [], [], [], [], [], [], 1);
 
     public static GraphScene Create(
         IReadOnlyList<ApiHistorySample> samples,
         GraphMetric metric,
         long periodStartAt,
-        long periodEndAt)
+        long periodEndAt) =>
+        Create(samples, metric, periodStartAt, periodEndAt, null);
+
+    internal static GraphScene Create(
+        IReadOnlyList<ApiHistorySample> samples,
+        GraphMetric metric,
+        long periodStartAt,
+        long periodEndAt,
+        IReadOnlyList<GraphConfirmedGap>? confirmedGaps = null)
     {
         ArgumentNullException.ThrowIfNull(samples);
         if (samples.Count == 0)
@@ -85,10 +124,23 @@ public sealed class GraphScene
 
         var start = periodStartAt > 0 ? periodStartAt : samples[0].Timestamp;
         var end = periodEndAt > start ? periodEndAt : Math.Max(start + 1, samples[^1].Timestamp);
+        var normalizedGaps = confirmedGaps is null
+            ? Array.Empty<GraphConfirmedGap>()
+            : confirmedGaps
+                .Where(gap => gap.EndAt > gap.StartAt && gap.EndAt > start && gap.StartAt < end)
+                .Select(gap => new GraphConfirmedGap(
+                    Math.Max(start, gap.StartAt),
+                    Math.Min(end, gap.EndAt)))
+                .Where(gap => gap.EndAt > gap.StartAt)
+                .OrderBy(gap => gap.StartAt)
+                .ToArray();
         var points = new ScenePoint[samples.Count];
         var previousSol = 0d;
         var previousTerra = 0d;
         var previousLuna = 0d;
+        var hasTrustedVector = false;
+        var modelVectorAvailable = new bool[samples.Count];
+        var remainingObserved = new bool[samples.Count];
         long? previousTimestamp = null;
         for (var index = 0; index < samples.Count; index++)
         {
@@ -102,26 +154,73 @@ public sealed class GraphScene
             var rawSol = metric == GraphMetric.Dollars ? sample.SolDollars : sample.SolTokens;
             var rawTerra = metric == GraphMetric.Dollars ? sample.TerraDollars : sample.TerraTokens;
             var rawLuna = metric == GraphMetric.Dollars ? sample.LunaDollars : sample.LunaTokens;
-            previousSol = Math.Max(previousSol, FiniteNonNegative(rawSol));
-            previousTerra = Math.Max(previousTerra, FiniteNonNegative(rawTerra));
-            previousLuna = Math.Max(previousLuna, FiniteNonNegative(rawLuna));
+            var currentSol = FiniteNonNegative(rawSol);
+            var currentTerra = FiniteNonNegative(rawTerra);
+            var currentLuna = FiniteNonNegative(rawLuna);
+            var completeVector = double.IsFinite(currentSol) &&
+                double.IsFinite(currentTerra) &&
+                double.IsFinite(currentLuna);
+            var vectorRecovered = completeVector &&
+                (!hasTrustedVector ||
+                 (currentSol >= previousSol &&
+                  currentTerra >= previousTerra &&
+                  currentLuna >= previousLuna));
+            if (vectorRecovered)
+            {
+                previousSol = currentSol;
+                previousTerra = currentTerra;
+                previousLuna = currentLuna;
+                hasTrustedVector = true;
+                modelVectorAvailable[index] = true;
+            }
+            else
+            {
+                // Keep the last trusted vector only as a recovery threshold;
+                // never synthesize a partially repaired row from its maxima.
+                currentSol = double.NaN;
+                currentTerra = double.NaN;
+                currentLuna = double.NaN;
+            }
+            remainingObserved[index] = sample.RemainingPercent is { } observedQuota &&
+                double.IsFinite(observedQuota);
             points[index] = new ScenePoint(
                 Math.Clamp(sample.Timestamp, start, end),
                 sample.RemainingPercent,
-                previousSol,
-                previousTerra,
-                previousLuna);
+                currentSol,
+                currentTerra,
+                currentLuna,
+                modelVectorAvailable[index]);
         }
 
-        var effectiveRemaining = BuildEffectiveRemaining(points);
+        var effectiveRemaining = BuildEffectiveRemaining(points, normalizedGaps);
         var timestamps = points.Select(point => (double)point.Timestamp).ToArray();
+        var observedRemainingValues = points
+            .Select(point => point.Remaining is { } observed && double.IsFinite(observed)
+                ? Math.Clamp(observed, 0, 100)
+                : double.NaN)
+            .ToArray();
         var remaining = effectiveRemaining
             .Select(value => value is { } finite && double.IsFinite(finite) ? finite : double.NaN)
             .ToArray();
+        var remainingInterpolated = new bool[points.Length];
+        for (var index = 0; index < points.Length; index++)
+        {
+            var raw = points[index].Remaining;
+            var rawFinite = raw is { } observed && double.IsFinite(observed);
+            var rawValue = rawFinite ? Math.Clamp(raw!.Value, 0, 100) : double.NaN;
+            remainingInterpolated[index] = !rawFinite ||
+                !double.IsFinite(remaining[index]) ||
+                remaining[index] != rawValue;
+        }
         var sol = points.Select(point => point.Sol).ToArray();
         var terra = points.Select(point => point.Terra).ToArray();
         var luna = points.Select(point => point.Luna).ToArray();
-        var maximum = Math.Max(1, points.SelectMany(point => new[] { point.Sol, point.Terra, point.Luna }).Max());
+        var maximum = Math.Max(
+            1,
+            points.SelectMany(point => new[] { point.Sol, point.Terra, point.Luna })
+                .Where(double.IsFinite)
+                .DefaultIfEmpty(0)
+                .Max());
         return new GraphScene(
             start,
             end,
@@ -131,11 +230,18 @@ public sealed class GraphScene
             sol,
             terra,
             luna,
-            BuildIdleIntervals(points, start, end),
+            modelVectorAvailable,
+            remainingObserved,
+            observedRemainingValues,
+            remainingInterpolated,
+            normalizedGaps,
+            BuildIdleIntervals(points, start, end, normalizedGaps),
             maximum);
     }
 
-    internal static IReadOnlyList<double?> BuildEffectiveRemaining(IReadOnlyList<ScenePoint> points)
+    internal static IReadOnlyList<double?> BuildEffectiveRemaining(
+        IReadOnlyList<ScenePoint> points,
+        IReadOnlyList<GraphConfirmedGap>? confirmedGaps = null)
     {
         if (points.Count == 0)
         {
@@ -154,17 +260,48 @@ public sealed class GraphScene
         values[0] = rawValues[0] is { } first && double.IsFinite(first)
             ? Math.Clamp(first, 0, 100)
             : 100;
+        var quotaAvailable = values[0] is not null;
         var quotaObservedSinceModelChange = true;
         for (var index = 1; index < points.Count; index++)
         {
             var previous = values[index - 1] ?? 100;
             var modelAdvanced = ModelAdvanced(points[index - 1], points[index]);
             var syntheticGap = IsSyntheticRemainingGap(points, index, points[0].Timestamp);
-            activeSegments[index - 1] = modelAdvanced && !syntheticGap;
+            var confirmedGap = HasConfirmedGapBetween(
+                confirmedGaps,
+                points[index - 1].Timestamp,
+                points[index].Timestamp);
+            activeSegments[index - 1] = modelAdvanced && !syntheticGap && !confirmedGap;
             var observed = rawValues[index] is { } raw && double.IsFinite(raw)
                 ? Math.Clamp(raw, 0, 100)
                 : (double?)null;
-            if (modelAdvanced)
+            if (confirmedGap)
+            {
+                // A recorder-confirmed gap is not an inferred interval. Do
+                // not carry a previous quota into it or synthesize a value
+                // at its far edge; only a remote observation after the gap
+                // can restart the quota path.
+                values[index] = observed;
+                quotaAvailable = observed is not null;
+                quotaObservedSinceModelChange = observed is not null;
+            }
+            else if (!quotaAvailable)
+            {
+                // Once a confirmed gap has cut the quota path, no inferred
+                // value may restart it. Wait for a fresh remote endpoint.
+                values[index] = observed;
+                quotaAvailable = observed is not null;
+                quotaObservedSinceModelChange = observed is not null;
+            }
+            else if (!points[index].ModelAvailable && observed is { } unavailableRaw)
+            {
+                // Preserve a remote quota reading even when the local model
+                // vector is unavailable. The renderer classifies this drop
+                // as unattributed and paints it dashed.
+                values[index] = Math.Min(previous, unavailableRaw);
+                quotaObservedSinceModelChange = true;
+            }
+            else if (modelAdvanced)
             {
                 values[index] = observed is { } activeRaw
                     ? Math.Min(previous, activeRaw)
@@ -177,6 +314,14 @@ public sealed class GraphScene
                 // first lower endpoint after that unobserved active interval,
                 // but keep a genuinely idle period horizontal.
                 values[index] = Math.Min(previous, delayedRaw);
+                quotaObservedSinceModelChange = true;
+            }
+            else if (observed is { } independentRaw)
+            {
+                // A remote quota observation is evidence in its own right.
+                // Preserve its timestamp even when the local vector is flat;
+                // projection will mark an unattributed decrease as dashed.
+                values[index] = Math.Min(previous, independentRaw);
                 quotaObservedSinceModelChange = true;
             }
             else
@@ -262,11 +407,21 @@ public sealed class GraphScene
 
         for (var index = 1; index < values.Length; index++)
         {
+            if (HasConfirmedGapBetween(
+                    confirmedGaps,
+                    points[index - 1].Timestamp,
+                    points[index].Timestamp))
+            {
+                continue;
+            }
             if (!activeSegments[index - 1] &&
                 points[index].Timestamp != points[index - 1].Timestamp &&
                 !IsSyntheticRemainingGap(points, index, points[0].Timestamp))
             {
-                values[index] = values[index - 1];
+                values[index] = rawValues[index] is { } observed && double.IsFinite(observed) &&
+                    values[index - 1] is { } before
+                    ? Math.Min(before, Math.Clamp(observed, 0, 100))
+                    : values[index - 1];
             }
             else if (values[index] is { } current && values[index - 1] is { } before)
             {
@@ -280,10 +435,11 @@ public sealed class GraphScene
     internal static IReadOnlyList<GraphIdleInterval> BuildIdleIntervals(
         IReadOnlyList<ScenePoint> points,
         long periodStart,
-        long periodEnd)
+        long periodEnd,
+        IReadOnlyList<GraphConfirmedGap>? confirmedGaps = null)
     {
         var intervals = new List<GraphIdleInterval>();
-        if (points.Count < 2 || periodEnd <= periodStart)
+        if (periodEnd <= periodStart)
         {
             return intervals;
         }
@@ -307,7 +463,8 @@ public sealed class GraphScene
             var syntheticGap = IsSyntheticRemainingGap(points, index, periodStart);
             var unobservedGap = after.Timestamp - before.Timestamp > 60;
             var modelChanged = !ModelsEqual(before, after);
-            if (modelChanged && !syntheticGap && !unobservedGap)
+            var unavailableGap = !before.ModelAvailable || !after.ModelAvailable;
+            if (modelChanged && !syntheticGap && !unobservedGap && !unavailableGap)
             {
                 continue;
             }
@@ -317,7 +474,9 @@ public sealed class GraphScene
             // as unused/unobserved and draws any cumulative increase at the
             // observed endpoint.  Preserve the boundary so the remaining
             // line does not turn the unknown interval into a diagonal.
-            var preserveBoundary = syntheticGap || (unobservedGap && modelChanged);
+            var preserveBoundary = syntheticGap ||
+                unavailableGap ||
+                (unobservedGap && modelChanged);
 
             if (intervals.Count > 0)
             {
@@ -332,7 +491,25 @@ public sealed class GraphScene
             intervals.Add(new GraphIdleInterval(intervalStart, intervalEnd, preserveBoundary));
         }
 
-        return intervals;
+        if (confirmedGaps is null)
+        {
+            return intervals;
+        }
+
+        foreach (var gap in confirmedGaps)
+        {
+            var start = Math.Max(periodStart, gap.StartAt);
+            var end = Math.Min(periodEnd, gap.EndAt);
+            if (end > start)
+            {
+                intervals.Add(new GraphIdleInterval(start, end, true));
+            }
+        }
+
+        return intervals
+            .OrderBy(interval => interval.StartAt)
+            .ThenBy(interval => interval.EndAt)
+            .ToArray();
     }
 
     internal static bool IsSyntheticRemainingGap(
@@ -352,6 +529,15 @@ public sealed class GraphScene
             before.Sol <= 0 && before.Terra <= 0 && before.Luna <= 0 &&
             ModelAdvanced(before, after);
     }
+
+    internal bool HasConfirmedGapBetween(double startAt, double endAt) =>
+        HasConfirmedGapBetween(ConfirmedGaps, startAt, endAt);
+
+    private static bool HasConfirmedGapBetween(
+        IReadOnlyList<GraphConfirmedGap>? gaps,
+        double startAt,
+        double endAt) =>
+        gaps is not null && gaps.Any(gap => gap.StartAt < endAt && gap.EndAt > startAt);
 
     internal static IReadOnlyList<double> ArrangeEndpointLabelTops(
         IReadOnlyList<double> idealTops,
@@ -397,12 +583,14 @@ public sealed class GraphScene
     }
 
     private static double FiniteNonNegative(double value) =>
-        double.IsFinite(value) ? Math.Max(0, value) : 0;
+        double.IsFinite(value) ? Math.Max(0, value) : double.NaN;
 
     private static bool ModelAdvanced(ScenePoint before, ScenePoint after) =>
-        after.Sol > before.Sol || after.Terra > before.Terra || after.Luna > before.Luna;
+        before.ModelAvailable && after.ModelAvailable &&
+        (after.Sol > before.Sol || after.Terra > before.Terra || after.Luna > before.Luna);
 
     private static bool ModelsEqual(ScenePoint before, ScenePoint after) =>
+        before.ModelAvailable && after.ModelAvailable &&
         before.Sol == after.Sol && before.Terra == after.Terra && before.Luna == after.Luna;
 
     internal readonly record struct ScenePoint(
@@ -410,5 +598,6 @@ public sealed class GraphScene
         double? Remaining,
         double Sol,
         double Terra,
-        double Luna);
+        double Luna,
+        bool ModelAvailable);
 }

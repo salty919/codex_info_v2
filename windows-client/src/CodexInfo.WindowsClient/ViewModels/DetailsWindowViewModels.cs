@@ -231,9 +231,14 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
         result.AddRange(normalized);
         var last = result[^1];
-        if (last.Timestamp < end)
+        if (last.Timestamp < end && end - last.Timestamp <= 60)
         {
-            result.Add(last with { Timestamp = end });
+            // A recent local cumulative observation may be held only until
+            // the next normal collection boundary.  The quota field is not
+            // copied: the renderer owns the explicitly dashed last-known
+            // projection.  A longer local-log outage must leave the model
+            // path at its actual observation time.
+            result.Add(last with { Timestamp = end, RemainingPercent = null });
         }
 
         return result;
@@ -288,6 +293,14 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     public string MetricAxisText => displayedMetric == GraphMetric.Dollars
         ? $"{Texts.Dollars} ({Texts.ModelUsage})"
         : $"{Texts.Tokens} ({Texts.ModelUsage})";
+
+    public string GraphGapHintText => Texts.LanguageCode switch
+    {
+        "ja" => "破線: 欠損・取得元不一致区間の参考補完（区間内は未確認）",
+        "zh-Hans" => "虚线：缺失或来源不一致区间的参考补全（区间内未确认）",
+        "ko" => "점선: 누락·출처 불일치 구간의 참고 보완(구간 내부 미확인)",
+        _ => "Dashed: reference completion across missing or source-mismatched intervals",
+    };
 
     public bool IsDollars => displayedMetric == GraphMetric.Dollars;
 
@@ -353,6 +366,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(SelectedMetric));
             Notify(nameof(SelectedPeriodText));
             Notify(nameof(MetricAxisText));
+            Notify(nameof(GraphGapHintText));
         }
     }
 
@@ -403,11 +417,12 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         var sourceCount = period.Samples.Count;
+        var confirmedGaps = BuildConfirmedGaps(period);
         if (sourceCount <= BackgroundBuildThreshold)
         {
             try
             {
-                PublishPoints(BuildProjection(period, metric), period, metric);
+                PublishPoints(BuildProjection(period, metric, confirmedGaps), period, metric);
             }
             catch
             {
@@ -431,7 +446,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 {
                     Task.Delay(previewDelay, cancellationToken).GetAwaiter().GetResult();
                 }
-                return BuildProjection(period, metric);
+                return BuildProjection(period, metric, confirmedGaps);
             }, cancellationToken)
             .ContinueWith(
                 task =>
@@ -461,13 +476,31 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 TaskScheduler.Default);
     }
 
-    private static GraphProjection BuildProjection(ApiHistoryPeriod period, GraphMetric metric)
+    private IReadOnlyList<GraphConfirmedGap> BuildConfirmedGaps(ApiHistoryPeriod period)
+    {
+        var end = EffectiveGraphEnd(period, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        return main.DetailsSnapshot?.HistoryGaps
+                .Where(gap => gap.EndAt > period.StartAt && gap.StartAt < end)
+                .Select(gap => new GraphConfirmedGap(gap.StartAt, gap.EndAt))
+                .ToArray()
+            ?? Array.Empty<GraphConfirmedGap>();
+    }
+
+    private static GraphProjection BuildProjection(
+        ApiHistoryPeriod period,
+        GraphMetric metric,
+        IReadOnlyList<GraphConfirmedGap> confirmedGaps)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var samples = ReduceGraphSamples(BuildGraphSamples(period, now));
         return new GraphProjection(
             samples.Select(sample => new GraphPointViewModel(sample, metric)).ToArray(),
-            GraphScene.Create(samples, metric, period.StartAt, EffectiveGraphEnd(period, now)));
+            GraphScene.Create(
+                samples,
+                metric,
+                period.StartAt,
+                EffectiveGraphEnd(period, now),
+                confirmedGaps));
     }
 
     private void PublishPoints(

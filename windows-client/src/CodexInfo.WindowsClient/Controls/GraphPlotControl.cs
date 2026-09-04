@@ -32,6 +32,7 @@ public sealed class GraphPlotControl : AvaPlot
     private static readonly ScottPlot.Color PlotColor = new("#101925");
 
     private ScottPlot.Plottables.Scatter? remainingSeries;
+    private ScottPlot.Plottables.Scatter? remainingDashedSeries;
     private ModelSeriesVisual? solSeries;
     private ModelSeriesVisual? terraSeries;
     private ModelSeriesVisual? lunaSeries;
@@ -105,6 +106,7 @@ public sealed class GraphPlotControl : AvaPlot
         var revision = ++sceneRevision;
         Plot.Clear();
         remainingSeries = null;
+        remainingDashedSeries = null;
         solSeries = null;
         terraSeries = null;
         lunaSeries = null;
@@ -145,11 +147,18 @@ public sealed class GraphPlotControl : AvaPlot
         lunaSeries = AddModelSeries(scene, scene.Luna, LunaColor);
         terraSeries = AddModelSeries(scene, scene.Terra, TerraColor);
         solSeries = AddModelSeries(scene, scene.Sol, SolColor);
+        var remainingLines = GraphPlotProjection.BuildRemainingLines(scene);
         remainingSeries = AddLine(
-            GraphPlotProjection.BuildRemainingLine(scene),
+            remainingLines.Solid,
             RemainingColor,
             Plot.Axes.Right,
             2f);
+        remainingDashedSeries = AddLine(
+            remainingLines.Dashed,
+            RemainingColor.WithOpacity(0.72),
+            Plot.Axes.Right,
+            2f,
+            dashed: true);
         AddEndpointLabels(scene, axes);
         ApplyAxes(scene, axes);
         ApplyVisibility();
@@ -188,17 +197,19 @@ public sealed class GraphPlotControl : AvaPlot
         IReadOnlyList<double> values,
         ScottPlot.Color color)
     {
-        var lines = GraphPlotProjection.BuildModelLines(scene, values);
+        var lines = GraphPlotProjection.BuildRenderableModelLines(scene, values);
         return new ModelSeriesVisual(
             AddLine(lines.Flat, color.WithOpacity(0.50), Plot.Axes.Left, 1f),
-            AddLine(lines.Rising, color.WithOpacity(0.95), Plot.Axes.Left, 3f));
+            AddLine(lines.Rising, color.WithOpacity(0.95), Plot.Axes.Left, 3f),
+            AddLine(lines.Dashed, color.WithOpacity(0.72), Plot.Axes.Left, 2f, dashed: true));
     }
 
     private ScottPlot.Plottables.Scatter? AddLine(
         GraphLineProjection line,
         ScottPlot.Color color,
         ScottPlot.IYAxis axis,
-        float lineWidth)
+        float lineWidth,
+        bool dashed = false)
     {
         if (line.X.Count < 2)
         {
@@ -207,6 +218,10 @@ public sealed class GraphPlotControl : AvaPlot
         var series = Plot.Add.Scatter(line.X.ToArray(), line.Y.ToArray(), color);
         series.Axes.YAxis = axis;
         series.LineWidth = lineWidth;
+        if (dashed)
+        {
+            series.LinePattern = ScottPlot.LinePattern.Dashed;
+        }
         series.MarkerSize = 0;
         return series;
     }
@@ -464,7 +479,7 @@ public sealed class GraphPlotControl : AvaPlot
 
     private void ApplyVisibility()
     {
-        SetVisible(remainingSeries, remainingConnector, remainingLabel, ShowRemaining);
+        SetVisible(remainingSeries, remainingDashedSeries, remainingConnector, remainingLabel, ShowRemaining);
         SetVisible(solSeries, solConnector, solLabel, ShowModels && ShowSol);
         SetVisible(terraSeries, terraConnector, terraLabel, ShowModels && ShowTerra);
         SetVisible(lunaSeries, lunaConnector, lunaLabel, ShowModels && ShowLuna);
@@ -477,11 +492,13 @@ public sealed class GraphPlotControl : AvaPlot
 
     private static void SetVisible(
         ScottPlot.Plottables.Scatter? series,
+        ScottPlot.Plottables.Scatter? dashedSeries,
         ScottPlot.Plottables.Scatter? connector,
         ScottPlot.Plottables.Text? label,
         bool visible)
     {
         if (series is not null) series.IsVisible = visible;
+        if (dashedSeries is not null) dashedSeries.IsVisible = visible;
         if (connector is not null) connector.IsVisible = visible;
         if (label is not null) label.IsVisible = visible;
     }
@@ -494,13 +511,15 @@ public sealed class GraphPlotControl : AvaPlot
     {
         if (series?.Flat is not null) series.Flat.IsVisible = visible;
         if (series?.Rising is not null) series.Rising.IsVisible = visible;
+        if (series?.Dashed is not null) series.Dashed.IsVisible = visible;
         if (connector is not null) connector.IsVisible = visible;
         if (label is not null) label.IsVisible = visible;
     }
 
     private sealed record ModelSeriesVisual(
         ScottPlot.Plottables.Scatter? Flat,
-        ScottPlot.Plottables.Scatter? Rising);
+        ScottPlot.Plottables.Scatter? Rising,
+        ScottPlot.Plottables.Scatter? Dashed);
 
     private sealed class GraphPlotAutomationPeer : ControlAutomationPeer
     {

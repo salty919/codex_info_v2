@@ -33,7 +33,13 @@ internal readonly record struct GraphLineProjection(
 /// <summary>Separate X-compatible paths for quiet and changing segments.</summary>
 internal readonly record struct GraphModelLineProjection(
     GraphLineProjection Flat,
-    GraphLineProjection Rising);
+    GraphLineProjection Rising,
+    GraphLineProjection Dashed);
+
+/// <summary>Separate solid and reference-only remaining-quota paths.</summary>
+internal readonly record struct GraphRemainingLineProjection(
+    GraphLineProjection Solid,
+    GraphLineProjection Dashed);
 
 /// <summary>
 /// A final endpoint label projection.  <see cref="NormalizedTop"/> is the
@@ -180,6 +186,107 @@ internal static class GraphPlotProjection
     }
 
     /// <summary>
+    /// Builds the quota path while keeping remote observations independent
+    /// from model availability. Any missing or unattributed interval is
+    /// emitted only into the dashed reference path.
+    /// </summary>
+    public static GraphRemainingLineProjection BuildRemainingLines(GraphScene scene)
+    {
+        ArgumentNullException.ThrowIfNull(scene);
+        if (!scene.HasPoints)
+        {
+            return new GraphRemainingLineProjection(
+                new GraphLineProjection([], []),
+                new GraphLineProjection([], []));
+        }
+
+        var firstRenderable = scene.Remaining
+            .Select((value, index) => double.IsFinite(value) ? index : -1)
+            .FirstOrDefault(index => index >= 0, -1);
+        if (firstRenderable < 0 || !scene.RemainingObserved.Any(observed => observed))
+        {
+            return new GraphRemainingLineProjection(
+                new GraphLineProjection([], []),
+                new GraphLineProjection([], []));
+        }
+
+        var solidX = new List<double>();
+        var solidY = new List<double>();
+        var dashedX = new List<double>();
+        var dashedY = new List<double>();
+        var previous = -1;
+        for (var index = firstRenderable; index < scene.Timestamps.Count; index++)
+        {
+            if (!double.IsFinite(scene.Remaining[index]))
+            {
+                continue;
+            }
+            if (previous < 0)
+            {
+                previous = index;
+                continue;
+            }
+
+            var before = RemainingValue(scene, previous);
+            var current = RemainingValue(scene, index);
+            var elapsed = scene.Timestamps[index] - scene.Timestamps[previous];
+            var contiguous = index == previous + 1;
+            if (scene.HasConfirmedGapBetween(
+                    scene.Timestamps[previous],
+                    scene.Timestamps[index]))
+            {
+                // Confirmed recorder gaps terminate the old subpath. The
+                // marker is the only visual evidence for the interval.
+                previous = index;
+                continue;
+            }
+            var observed = scene.RemainingObserved[previous] && scene.RemainingObserved[index];
+            // A filled value makes only the interval ending at that point
+            // reference-only. Do not taint the following segment once a
+            // fresh remote observation and a trusted model increment arrive.
+            var interpolated = scene.RemainingInterpolated[index];
+            var modelAvailable = scene.ModelVectorAvailable[previous] &&
+                scene.ModelVectorAvailable[index];
+            var modelAdvanced = ModelAdvanced(scene, previous, index);
+            var quotaDropped = current < before;
+            var unattributed = quotaDropped && (!modelAvailable || !modelAdvanced);
+            var dashed = !contiguous || elapsed > ModelContiguousSampleMaxGapSeconds ||
+                !observed || interpolated || !modelAvailable || unattributed ||
+                scene.HasConfirmedGapBetween(scene.Timestamps[previous], scene.Timestamps[index]);
+            if (dashed)
+            {
+                AppendSegment(dashedX, dashedY, scene.Timestamps[previous], before, scene.Timestamps[index], current);
+            }
+            else
+            {
+                AppendSegment(solidX, solidY, scene.Timestamps[previous], before, scene.Timestamps[index], current);
+            }
+            previous = index;
+        }
+
+        if (previous >= 0 && scene.PeriodEndAt > scene.Timestamps[previous] &&
+            !scene.HasConfirmedGapBetween(scene.Timestamps[previous], scene.PeriodEndAt))
+        {
+            // The remote source may stop while the current period continues.
+            // Keep only the last measured value, horizontally and dashed;
+            // never extend the local model vector to manufacture a current
+            // observation or a consumption rate.
+            var lastKnown = RemainingValue(scene, previous);
+            AppendSegment(
+                dashedX,
+                dashedY,
+                scene.Timestamps[previous],
+                lastKnown,
+                scene.PeriodEndAt,
+                lastKnown);
+        }
+
+        return new GraphRemainingLineProjection(
+            new GraphLineProjection(solidX, solidY),
+            new GraphLineProjection(dashedX, dashedY));
+    }
+
+    /// <summary>
     /// Splits cumulative model data into the thin/quiet flat path and the
     /// thicker rising path used by the native X graph.
     /// </summary>
@@ -198,6 +305,8 @@ internal static class GraphPlotProjection
         var flatY = new List<double>();
         var risingX = new List<double>();
         var risingY = new List<double>();
+        var dashedX = new List<double>();
+        var dashedY = new List<double>();
         for (var index = 1; index < values.Count; index++)
         {
             var before = values[index - 1];
@@ -209,6 +318,10 @@ internal static class GraphPlotProjection
 
             var startAt = scene.Timestamps[index - 1];
             var endAt = scene.Timestamps[index];
+            if (scene.HasConfirmedGapBetween(startAt, endAt))
+            {
+                continue;
+            }
             if (IsSyntheticFirstObservation(scene, values, index))
             {
                 // The interval between the synthetic reset anchor and the
@@ -237,9 +350,88 @@ internal static class GraphPlotProjection
             }
         }
 
+        AppendDashedModelGaps(scene, values, dashedX, dashedY);
+
         return new GraphModelLineProjection(
             new GraphLineProjection(flatX, flatY),
-            new GraphLineProjection(risingX, risingY));
+            new GraphLineProjection(risingX, risingY),
+            new GraphLineProjection(dashedX, dashedY));
+    }
+
+    /// <summary>
+    /// Projects the paths used by the renderer. This keeps the compatibility
+    /// output of <see cref="BuildModelLines"/> while ensuring gaps are never
+    /// painted as solid connections.
+    /// </summary>
+    internal static GraphModelLineProjection BuildRenderableModelLines(
+        GraphScene scene,
+        IReadOnlyList<double> values)
+    {
+        ArgumentNullException.ThrowIfNull(scene);
+        ArgumentNullException.ThrowIfNull(values);
+        if (values.Count != scene.Timestamps.Count)
+        {
+            throw new ArgumentException("A model series must match the graph timestamp count.", nameof(values));
+        }
+
+        var flatX = new List<double>();
+        var flatY = new List<double>();
+        var risingX = new List<double>();
+        var risingY = new List<double>();
+        var dashedX = new List<double>();
+        var dashedY = new List<double>();
+        var previous = -1;
+        for (var index = 0; index < values.Count; index++)
+        {
+            var value = values[index];
+            if (!double.IsFinite(value))
+            {
+                continue;
+            }
+            if (previous >= 0 && value < values[previous])
+            {
+                previous = -1;
+                continue;
+            }
+            if (previous < 0)
+            {
+                previous = index;
+                continue;
+            }
+
+            var before = values[previous];
+            var startAt = scene.Timestamps[previous];
+            var endAt = scene.Timestamps[index];
+            var elapsed = endAt - startAt;
+            if (scene.HasConfirmedGapBetween(startAt, endAt))
+            {
+                previous = index;
+                continue;
+            }
+            if (index != previous + 1 || elapsed > ModelContiguousSampleMaxGapSeconds)
+            {
+                AppendSegment(dashedX, dashedY, startAt, before, endAt, value);
+            }
+            else if (IsSyntheticFirstObservation(scene, values, index))
+            {
+                AppendSegment(flatX, flatY, startAt, before, endAt, before);
+                AppendSegment(risingX, risingY, endAt, before, endAt, value);
+            }
+            else if (value == before)
+            {
+                AppendSegment(flatX, flatY, startAt, before, endAt, value);
+            }
+            else
+            {
+                AppendSegment(risingX, risingY, startAt, before, endAt, value);
+            }
+            previous = index;
+        }
+
+        return new GraphModelLineProjection(
+            new GraphLineProjection(flatX, flatY),
+            new GraphLineProjection(risingX, risingY),
+            new GraphLineProjection(dashedX, dashedY));
     }
 
     private static bool IsSyntheticFirstObservation(
@@ -298,16 +490,26 @@ internal static class GraphPlotProjection
 
         var last = scene.Timestamps.Count - 1;
         var candidates = new List<EndpointCandidate>();
-        AddModelCandidate("LUNA", scene.Luna[last], scene.ModelMaximum, scene.Metric, GraphSeries.Luna, culture, candidates);
-        AddModelCandidate("TERRA", scene.Terra[last], scene.ModelMaximum, scene.Metric, GraphSeries.Terra, culture, candidates);
-        AddModelCandidate("SOL", scene.Sol[last], scene.ModelMaximum, scene.Metric, GraphSeries.Sol, culture, candidates);
-        if (double.IsFinite(scene.Remaining[last]))
+        if (scene.PeriodEndAt - scene.Timestamps[last] <= ModelContiguousSampleMaxGapSeconds)
         {
+            AddModelCandidate("LUNA", scene.Luna[last], scene.ModelMaximum, scene.Metric, GraphSeries.Luna, culture, candidates);
+            AddModelCandidate("TERRA", scene.Terra[last], scene.ModelMaximum, scene.Metric, GraphSeries.Terra, culture, candidates);
+            AddModelCandidate("SOL", scene.Sol[last], scene.ModelMaximum, scene.Metric, GraphSeries.Sol, culture, candidates);
+        }
+        var lastRemainingObservation = scene.RemainingObserved
+            .Select((observed, index) => observed ? index : -1)
+            .LastOrDefault(index => index >= 0, -1);
+        if (lastRemainingObservation >= 0 &&
+            !scene.HasConfirmedGapBetween(
+                scene.Timestamps[lastRemainingObservation],
+                scene.PeriodEndAt))
+        {
+            var remainingAtEndpoint = RemainingValue(scene, lastRemainingObservation);
             candidates.Add(new EndpointCandidate(
                 GraphSeries.Remaining,
-                FormatRemaining(scene.Remaining[last], culture),
-                1 - Math.Clamp(scene.Remaining[last] / 100, 0, 1),
-                scene.Remaining[last]));
+                FormatRemaining(remainingAtEndpoint, culture),
+                1 - Math.Clamp(remainingAtEndpoint / 100, 0, 1),
+                remainingAtEndpoint));
         }
 
         var ordered = candidates.OrderBy(candidate => candidate.NormalizedTop).ToArray();
@@ -368,6 +570,61 @@ internal static class GraphPlotProjection
 
     private static string FormatRemaining(double value, CultureInfo culture) =>
         value.ToString("0.#", culture) + "%";
+
+    private static bool ModelAdvanced(GraphScene scene, int before, int after) =>
+        scene.ModelVectorAvailable[before] && scene.ModelVectorAvailable[after] &&
+        (scene.Sol[after] > scene.Sol[before] ||
+         scene.Terra[after] > scene.Terra[before] ||
+         scene.Luna[after] > scene.Luna[before]);
+
+    private static double RemainingValue(GraphScene scene, int index)
+    {
+        var effective = scene.Remaining[index];
+        var observed = scene.ObservedRemainingValues[index];
+        if (!scene.RemainingObserved[index] || !double.IsFinite(observed))
+        {
+            return effective;
+        }
+        return double.IsFinite(effective) ? Math.Min(effective, observed) : observed;
+    }
+
+    private static void AppendDashedModelGaps(
+        GraphScene scene,
+        IReadOnlyList<double> values,
+        List<double> dashedX,
+        List<double> dashedY)
+    {
+        var previous = -1;
+        for (var index = 0; index < values.Count; index++)
+        {
+            if (!double.IsFinite(values[index]))
+            {
+                continue;
+            }
+            if (previous >= 0 && values[index] >= values[previous])
+            {
+                var elapsed = scene.Timestamps[index] - scene.Timestamps[previous];
+                if (scene.HasConfirmedGapBetween(
+                        scene.Timestamps[previous],
+                        scene.Timestamps[index]))
+                {
+                    previous = index;
+                    continue;
+                }
+                if (index != previous + 1 || elapsed > ModelContiguousSampleMaxGapSeconds)
+                {
+                    AppendSegment(
+                        dashedX,
+                        dashedY,
+                        scene.Timestamps[previous],
+                        values[previous],
+                        scene.Timestamps[index],
+                        values[index]);
+                }
+            }
+            previous = index;
+        }
+    }
 
     private static void AddModelCandidate(
         string name,
