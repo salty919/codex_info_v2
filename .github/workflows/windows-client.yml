@@ -39,12 +39,43 @@ jobs:
       - name: Install locked Inno Setup compiler
         shell: pwsh
         run: |
-          winget source update --name winget --disable-interactivity
-          if ($LASTEXITCODE -ne 0) { throw ('WinGet source update failed with exit code 0x{0:X8}.' -f $LASTEXITCODE) }
-          winget install --id JRSoftware.InnoSetup.7 --version 7.1.0 -e -s winget --scope user --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
-          if ($LASTEXITCODE -ne 0) { throw ('WinGet Inno Setup install failed with exit code 0x{0:X8}.' -f $LASTEXITCODE) }
+          $ErrorActionPreference = 'Stop'
+          $installerUrl = 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe'
+          $expectedSha256 = '0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f'
+          $installer = Join-Path $env:RUNNER_TEMP 'innosetup-7.1.0-x64.exe'
+
+          Invoke-WebRequest -Uri $installerUrl -OutFile $installer
+
+          $actualSha256 = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash
+          if (-not $actualSha256.Equals($expectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Inno Setup installer SHA-256 mismatch: $actualSha256"
+          }
+
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            throw "Inno Setup installer Authenticode status is $($signature.Status)."
+          }
+          $publisher = $signature.SignerCertificate.GetNameInfo(
+            [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+            $false
+          )
+          if ($publisher -cne 'Pyrsys B.V.') {
+            throw "Unexpected Inno Setup installer publisher: $publisher"
+          }
+
+          $installProcess = Start-Process -FilePath $installer -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER') -Wait -PassThru
+          if ($installProcess.ExitCode -ne 0) {
+            throw "Inno Setup installer failed with exit code $($installProcess.ExitCode)."
+          }
+
           $compiler = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe'
-          if (-not (Test-Path $compiler -PathType Leaf)) { throw 'Inno Setup 7.1.0 compiler was not installed.' }
+          if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
+            throw 'Inno Setup 7.1.0 compiler was not installed.'
+          }
+          $compilerVersion = (Get-Item -LiteralPath $compiler).VersionInfo
+          if ($compilerVersion.FileMajorPart -ne 7 -or $compilerVersion.FileMinorPart -ne 1 -or $compilerVersion.FileBuildPart -ne 0) {
+            throw "Unexpected Inno Setup compiler version: $($compilerVersion.FileVersion)"
+          }
           "INNO_SETUP_COMPILER=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build standard Windows setup wizard
         shell: pwsh
