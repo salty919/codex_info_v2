@@ -14,19 +14,19 @@ fail() {
 run_exact_test() {
     local target="$1" test_name="$2" output_file
     output_file="$(mktemp "${TMPDIR:-/tmp}/codex-info-rust-test.XXXXXX")"
-    if ! cargo test --locked "$target" "tests::$test_name" -- --exact --nocapture \
+    if ! cargo test --locked "$target" "$test_name" -- --exact --nocapture \
         >"$output_file" 2>&1; then
         cat "$output_file" >&2
         rm -f -- "$output_file"
-        fail "focused Rust test failed: $target tests::$test_name"
+        fail "focused Rust test failed: $target $test_name"
     fi
-    if ! rg -q 'test result: ok\. 1 passed; 0 failed; 0 ignored' "$output_file"; then
+    if ! grep -Eq 'test result: ok\. 1 passed; 0 failed; 0 ignored' "$output_file"; then
         cat "$output_file" >&2
         rm -f -- "$output_file"
-        fail "focused Rust test did not execute exactly once: $target tests::$test_name"
+        fail "focused Rust test did not execute exactly once: $target $test_name"
     fi
     rm -f -- "$output_file"
-    printf 'regression-guard: evidence test=%s tests::%s count=1\n' "$target" "$test_name"
+    printf 'regression-guard: evidence test=%s %s count=1\n' "$target" "$test_name"
 }
 
 case "$1" in
@@ -68,10 +68,10 @@ case "$1" in
             recent_read_filters_invalid_values_without_deleting_rows
         )
         for test_name in "${main_tests[@]}"; do
-            run_exact_test --bin=codex_info "$test_name"
+            run_exact_test --bin=codex_info "tests::$test_name"
         done
         for test_name in "${store_tests[@]}"; do
-            run_exact_test --test=usage_store "$test_name"
+            run_exact_test --test=usage_store "wave_b_correction_tests::$test_name"
         done
         echo 'regression-guard: PASS check=rust-history-graph cases=15'
         ;;

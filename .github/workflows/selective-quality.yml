@@ -70,7 +70,6 @@ jobs:
         run: |
           set -euo pipefail
           git diff --check "$BASE_SHA" "$SOURCE_SHA"
-          bash scripts/requirements_ledger_gate.sh
           if [[ "$QUALITY_PROFILE" == workflow-selection ]]; then
             mapfile -t changed_workflows < <(
               git diff --name-only "$BASE_SHA" "$SOURCE_SHA" -- '.github/workflows/*.yml'
@@ -78,13 +77,9 @@ jobs:
             if ((${#changed_workflows[@]} > 0)); then
               go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 "${changed_workflows[@]}"
             fi
-            python3 scripts/test_requirements_authority.py
-            python3 scripts/test_quality_plan.py
-            python3 scripts/test_ci_change_scope.py
-            python3 scripts/test_selected_quality_gate.py
-            python3 scripts/test_codeql_workflow.py
-            python3 scripts/workflow_quality_gate.py --self-test --profile workflow-selection
+            bash scripts/pre_pr_gate.sh --base "$BASE_SHA" --quality-profile workflow-selection
           elif [[ "$QUALITY_PROFILE" == release ]]; then
+            bash scripts/requirements_ledger_gate.sh
             go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
             python3 scripts/workflow_inno_acquisition_gate.py --self-test
             python3 scripts/workflow_quality_gate.py --self-test
