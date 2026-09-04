@@ -638,11 +638,9 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     count("selective-quality.yml", "ref: ${{ github.workflow_sha }}", 1)
     count(
         "selective-quality.yml",
-        "workflow_quality_gate.py --self-test --profile workflow-selection",
+        'bash scripts/pre_pr_gate.sh --base "$BASE_SHA" --quality-profile workflow-selection',
         1,
     )
-    count("selective-quality.yml", "scripts/test_ci_change_scope.py", 1)
-    count("selective-quality.yml", "scripts/test_selected_quality_gate.py", 1)
 
     linux_distribution = workflows["linux-distribution.yml"]
     for marker in (
@@ -3093,6 +3091,124 @@ def release_self_test() -> int:
     return 0
 
 
+def _focused_rust_routing_test() -> int:
+    """Execute the caller; a wrong Rust module selects zero tests, not success."""
+    with tempfile.TemporaryDirectory(prefix="codex-info-rust-routing-") as raw_root:
+        root = Path(raw_root)
+        fake_cargo = root / "cargo"
+        fake_cargo.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "target, name = sys.argv[3:5]\n"
+            "module = {'--bin=codex_info': 'tests::', "
+            "'--test=usage_store': 'wave_b_correction_tests::'}\n"
+            "count = int(name.startswith(module[target]))\n"
+            "print(f'test result: ok. {count} passed; 0 failed; 0 ignored')\n",
+            encoding="utf-8",
+        )
+        fake_cargo.chmod(0o755)
+        result = subprocess.run(
+            ("bash", str(ROOT / "scripts/regression_guard.sh"), "--history-graph"),
+            cwd=ROOT,
+            env={**os.environ, "PATH": f"{root}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise AssertionError(f"Rust caller selected the wrong module: {result.stderr}")
+        for name in (
+            "recent_read_uses_one_month_half_open_interval_at_month_ends",
+            "recent_read_filters_invalid_values_without_deleting_rows",
+        ):
+            if f"--test=usage_store wave_b_correction_tests::{name} count=1" not in result.stdout:
+                raise AssertionError(f"Rust caller did not execute the DB test: {name}")
+    return 1
+
+
+def _governance_path_selection_tests(workflow: str) -> int:
+    """Run the remote shell through the real local path selector, without suites."""
+    script = _step_script(workflow, "Validate workflow syntax and requirements")
+    with tempfile.TemporaryDirectory(prefix="codex-info-governance-routing-") as raw_root:
+        root = Path(raw_root)
+        repo = root / "repo"
+        scripts = repo / "scripts"
+        scripts.mkdir(parents=True)
+        calls = root / "calls"
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        for name in ("pre_pr_gate.sh", "quality_plan.py", "ci_change_scope.py", "regression_guard.sh"):
+            shutil.copy2(ROOT / "scripts" / name, scripts / name)
+        (scripts / "requirements_ledger_gate.sh").write_text(
+            'printf "requirements-authority\\n" >> "$ROUTING_CALLS"\n', encoding="utf-8"
+        )
+        fixture_names = (
+            "test_requirements_authority.py", "test_quality_plan.py", "test_ci_change_scope.py",
+            "test_selected_quality_gate.py", "test_codeql_workflow.py", "workflow_quality_gate.py",
+            "workflow_inno_acquisition_gate.py",
+        )
+        for name in fixture_names:
+            (scripts / name).write_text(
+                "import os\nfrom pathlib import Path\n"
+                "with open(os.environ['ROUTING_CALLS'], 'a') as output:\n"
+                "    output.write(Path(__file__).name + '\\n')\n",
+                encoding="utf-8",
+            )
+        fake_go = fake_bin / "go"
+        fake_go.write_text(
+            '#!/usr/bin/env bash\nprintf "actionlint\\n" >> "$ROUTING_CALLS"\n', encoding="utf-8"
+        )
+        fake_go.chmod(0o755)
+        workflow_path = repo / ".github/workflows/selective-quality.yml"
+        workflow_path.parent.mkdir(parents=True)
+        workflow_path.write_text(workflow, encoding="utf-8")
+        _git(repo, "init", "--quiet")
+        _git(repo, "config", "user.name", "fixture")
+        _git(repo, "config", "user.email", "fixture@example.invalid")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "--quiet", "-m", "base")
+        base = _git(repo, "rev-parse", "HEAD")
+        cases = (
+            ("scripts/regression_guard.sh", ["requirements-authority"]),
+            ("scripts/quality_plan.py", ["requirements-authority", "test_quality_plan.py",
+                                         "test_ci_change_scope.py", "test_selected_quality_gate.py"]),
+            (".github/workflows/selective-quality.yml", ["actionlint", "requirements-authority",
+                                                       "workflow_quality_gate.py", "test_codeql_workflow.py"]),
+        )
+        for path, expected in cases:
+            target = repo / path
+            original = target.read_text(encoding="utf-8")
+            target.write_text(original + "\n# routing fixture\n", encoding="utf-8")
+            _git(repo, "add", path)
+            _git(repo, "commit", "--quiet", "-m", "candidate")
+            head = _git(repo, "rev-parse", "HEAD")
+            calls.write_text("", encoding="utf-8")
+            result = subprocess.run(
+                ("bash", "-c", script), cwd=repo, capture_output=True, text=True,
+                env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                     "BASE_SHA": base, "SOURCE_SHA": head, "QUALITY_PROFILE": "workflow-selection",
+                     "ROUTING_CALLS": str(calls)},
+            )
+            actual = calls.read_text(encoding="utf-8").splitlines()
+            if result.returncode != 0 or actual != expected:
+                raise AssertionError(f"governance routing {path}: {actual}, {result.stderr}")
+            base = head
+        # Moving authority validation into the branches must not narrow the
+        # release branch or execute it twice.
+        calls.write_text("", encoding="utf-8")
+        result = subprocess.run(
+            ("bash", "-c", script), cwd=repo, capture_output=True, text=True,
+            env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}",
+                 "BASE_SHA": base, "SOURCE_SHA": base, "QUALITY_PROFILE": "release",
+                 "ROUTING_CALLS": str(calls)},
+        )
+        actual = calls.read_text(encoding="utf-8").splitlines()
+        expected = ["requirements-authority", "actionlint",
+                    "workflow_inno_acquisition_gate.py", "workflow_quality_gate.py"]
+        if result.returncode != 0 or actual != expected:
+            raise AssertionError(f"release governance routing: {actual}, {result.stderr}")
+    return len(cases) + 1
+
+
 def workflow_selection_self_test() -> int:
     """Exercise only the changed feat selector/profile wiring.
 
@@ -3146,12 +3262,15 @@ def workflow_selection_self_test() -> int:
         baseline["selective-quality.yml"]
     )
     copy_cases = _git_copy_detection_test()
-    total_cases = cases + release_candidate_cases + copy_cases
+    routing_cases = _focused_rust_routing_test() + _governance_path_selection_tests(
+        baseline["selective-quality.yml"]
+    )
+    total_cases = cases + release_candidate_cases + copy_cases + routing_cases
     print(
         "workflow-quality-gate: PASS profile=workflow-selection "
         f"total_cases={total_cases} static_cases={cases} "
         f"release_non_narrowing_cases={release_candidate_cases} "
-        f"copy_cases={copy_cases}"
+        f"copy_cases={copy_cases} routing_cases={routing_cases}"
     )
     return 0
 
