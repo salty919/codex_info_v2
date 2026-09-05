@@ -1114,7 +1114,7 @@ if not tcp.exists(): print(""); raise SystemExit(0)
 inodes=set()
 for line in tcp.read_text(errors="replace").splitlines()[1:]:
     fields=line.split()
-    if len(fields)>9 and fields[1].upper()=="0100007F:225B" and fields[3]=="0A": inodes.add(fields[9])
+    if len(fields)>9 and fields[1].upper()=="0100007F:2253" and fields[3]=="0A": inodes.add(fields[9])
 owners=[]
 for proc in root.glob("[0-9]*"):
     fd_dir=proc/"fd"
@@ -1356,7 +1356,7 @@ PY
     health_limit=$((readback_deadline - health_now))
     (( health_limit > 0 )) || safe_blocked 'details readiness deadline expired'
     details="$("$CURL_BIN" --fail --silent --show-error --proto '=http' --max-time "$health_limit" "$DETAILS_URL")" || safe_blocked 'details request failed'
-    python3 - "$details" <<'PY'
+    python3 -c '
 import json,sys
 def pairs(items):
     result={}
@@ -1364,7 +1364,7 @@ def pairs(items):
         if key in result: raise ValueError("duplicate details key")
         result[key]=value
     return result
-try: document=json.loads(sys.argv[1],object_pairs_hook=pairs)
+try: document=json.load(sys.stdin,object_pairs_hook=pairs)
 except Exception as error: raise SystemExit(str(error))
 if not isinstance(document,dict): raise SystemExit("details is not an object")
 if document.get("state") not in {"ready","auth_required"}:
@@ -1372,7 +1372,7 @@ if document.get("state") not in {"ready","auth_required"}:
 observed_at=document.get("observed_at")
 if isinstance(observed_at,bool) or not isinstance(observed_at,int) or observed_at <= 0:
     raise SystemExit("details observed_at is invalid")
-PY
+' <<< "$details"
     recorder_identity_check "$pid" "$version" "$source" "$manifest_hash"
     proc_identity_check "$pid" "$binary_hash" "$expected_exe"
 }
