@@ -29395,7 +29395,32 @@ mod tests {
             .min()
             .expect("preview history")
             - WEEK_SECONDS;
-        for (timestamp, tokens) in [(first, 1_000_000), (first + 60, 2_000_000)] {
+        for (timestamp, tokens, source, complete) in [
+            (
+                first,
+                1_000_000,
+                usage_store::ModelSource::LegacyUnknown,
+                false,
+            ),
+            (
+                first + 60,
+                2_000_000,
+                usage_store::ModelSource::LegacyUnknown,
+                false,
+            ),
+            (
+                first + 120,
+                3_000_000,
+                usage_store::ModelSource::Confirmed,
+                true,
+            ),
+            (
+                first + 180,
+                4_000_000,
+                usage_store::ModelSource::Confirmed,
+                true,
+            ),
+        ] {
             producer
                 .history
                 .samples
@@ -29419,7 +29444,7 @@ mod tests {
                     sol_tokens: Some(0),
                     terra_tokens: Some(0),
                     luna_tokens: Some(0),
-                    model_source: usage_store::ModelSource::LegacyUnknown,
+                    model_source: source,
                     model_totals: Some(vec![usage_store::SessionModelTotal {
                         model: "ASTRA".into(),
                         total_tokens: tokens,
@@ -29428,7 +29453,7 @@ mod tests {
                         output_tokens: 0,
                         cache_write_input_tokens: Some(0),
                     }]),
-                    model_totals_complete: false,
+                    model_totals_complete: complete,
                 });
         }
         let details = producer
@@ -29461,14 +29486,26 @@ mod tests {
                     .is_some_and(|models| models.iter().any(|model| model.model == "ASTRA"))
             })
             .count();
-        assert_eq!(astra_observations, 2);
+        assert_eq!(astra_observations, 4);
         let astra_points = client.graph_model_points_for_selection(
             historical.reset_at,
             historical.start_at,
             historical.end_at,
             "ASTRA",
         );
-        assert_eq!(astra_points.len(), 2);
+        assert_eq!(astra_points.len(), 4);
+        assert_eq!(
+            astra_points
+                .values()
+                .map(|point| (point.dollar, point.tokens, point.reliable))
+                .collect::<Vec<_>>(),
+            [
+                (10.0, 1_000_000.0, false),
+                (20.0, 2_000_000.0, false),
+                (30.0, 3_000_000.0, true),
+                (40.0, 4_000_000.0, true),
+            ]
+        );
         let paths = client.graph_paths_for_selection_at_with_astra(
             observed_at,
             true,
@@ -29484,8 +29521,24 @@ mod tests {
             paths.astra_rising,
             paths.current_astra_label
         );
-        assert!(paths.astra_rising.is_empty());
-        assert_eq!(paths.current_astra_label, "$20.00");
+        assert!(
+            paths.astra_flat.matches('M').count() > 1,
+            "incomplete ASTRA intervals must be geometrically dashed"
+        );
+        assert!(!paths.astra_rising.is_empty());
+        assert_eq!(paths.current_astra_label, "$40.00");
+
+        let token_paths = client.graph_paths_for_selection_at_with_astra(
+            observed_at,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
+        assert!(token_paths.astra_flat.matches('M').count() > 1);
+        assert!(!token_paths.astra_rising.is_empty());
+        assert_eq!(token_paths.current_astra_label, "4,000,000");
     }
 
     #[test]
