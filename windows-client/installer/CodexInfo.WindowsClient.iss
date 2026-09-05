@@ -76,6 +76,9 @@ Type: files; Name: "{app}\CodexInfo.WindowsClient.Uninstaller.exe"
 Type: dirifempty; Name: "{app}\THIRD-PARTY-LICENSES"
 Type: dirifempty; Name: "{app}\LICENSES"
 Type: dirifempty; Name: "{app}"
+; The update cache contains only downloaded Setup/pending owner state. User
+; settings and Linux-side history are stored elsewhere and are retained.
+Type: filesandordirs; Name: "{localappdata}\CodexInfo\updates"
 
 [Files]
 Source: "{#PayloadDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -90,3 +93,14 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexIn
 
 [Run]
 Filename: "{app}\{#ProductExecutable}"; Description: "{cm:LaunchProgram,{#ProductName}}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
+; Keep stopped clients converged without elevation. `/Create /F` makes
+; upgrades idempotent while preserving the current user's task ownership.
+Filename: "{sys}\schtasks.exe"; Parameters: "/Create /F /SC ONLOGON /TN ""CodexInfo.WindowsClient.Update.Logon"" /TR """"{app}\{#ProductExecutable}"" --update-only"" /RL LIMITED"; Flags: runhidden waituntilterminated
+Filename: "{sys}\schtasks.exe"; Parameters: "/Create /F /SC HOURLY /MO 1 /TN ""CodexInfo.WindowsClient.Update.Hourly"" /TR """"{app}\{#ProductExecutable}"" --update-only"" /RL LIMITED"; Flags: runhidden waituntilterminated
+
+[UninstallRun]
+; Remove both trigger owners before the app directory/cache is deleted.
+Filename: "{sys}\schtasks.exe"; Parameters: "/End /TN ""CodexInfo.WindowsClient.Update.Logon"""; Flags: runhidden waituntilterminated
+Filename: "{sys}\schtasks.exe"; Parameters: "/End /TN ""CodexInfo.WindowsClient.Update.Hourly"""; Flags: runhidden waituntilterminated
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /F /TN ""CodexInfo.WindowsClient.Update.Logon"""; Flags: runhidden waituntilterminated
+Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /F /TN ""CodexInfo.WindowsClient.Update.Hourly"""; Flags: runhidden waituntilterminated

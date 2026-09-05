@@ -37,44 +37,52 @@ public sealed class UpdateViewModelTests
     }
 
     [Fact]
-    public async Task AvailableUpdate_IsConditionalAndUsesVersion()
+    public async Task AvailableUpdate_IsAutomaticallyStartedOnUiStartup()
     {
-        using var coordinator = new FakeCoordinator(new UpdateCheckResult("1.2.3", false));
+        using var coordinator = new FakeCoordinator(new UpdateCheckResult("1.2.3", false))
+        {
+            StartResult = UpdateStartStatus.IntegrityFailed,
+        };
         using var viewModel = new UpdateViewModel(coordinator);
 
         await viewModel.StartAsync();
 
         Assert.True(viewModel.HasAvailableUpdate);
         Assert.True(viewModel.IsNotificationVisible);
-        Assert.Contains("v1.2.3", viewModel.NotificationText, StringComparison.Ordinal);
+        Assert.Equal(1, coordinator.StartCount);
+        Assert.Equal(UpdateStartStatus.IntegrityFailed, viewModel.StartStatus);
     }
 
     [Fact]
-    public async Task StartOnlyChecksAndDoesNotMutate()
-    {
-        using var coordinator = new FakeCoordinator(new UpdateCheckResult("1.2.3", false));
-        using var viewModel = new UpdateViewModel(coordinator);
-
-        await viewModel.StartAsync();
-
-        Assert.Equal(1, coordinator.CheckCount);
-        Assert.Equal(0, coordinator.StartCount);
-    }
-
-    [Fact]
-    public async Task ClickStartsAvailableUpdate()
+    public async Task StartupConvergenceUsesTheUpdateCoordinator()
     {
         using var coordinator = new FakeCoordinator(new UpdateCheckResult("1.2.3", false))
         {
             StartResult = UpdateStartStatus.Started,
         };
         using var viewModel = new UpdateViewModel(coordinator);
+
+        await viewModel.StartAsync();
+
+        Assert.Equal(1, coordinator.CheckCount);
+        Assert.Equal(1, coordinator.StartCount);
+        Assert.Equal(UpdateStartStatus.Started, viewModel.StartStatus);
+    }
+
+    [Fact]
+    public async Task FailedStartupRemainsRetryableByTheCommand()
+    {
+        using var coordinator = new FakeCoordinator(new UpdateCheckResult("1.2.3", false))
+        {
+            StartResult = UpdateStartStatus.IntegrityFailed,
+        };
+        using var viewModel = new UpdateViewModel(coordinator);
         await viewModel.StartAsync();
 
         await viewModel.StartAvailableUpdateAsync();
 
-        Assert.Equal(1, coordinator.StartCount);
-        Assert.Equal(UpdateStartStatus.Started, viewModel.StartStatus);
+        Assert.Equal(2, coordinator.StartCount);
+        Assert.Equal(UpdateStartStatus.IntegrityFailed, viewModel.StartStatus);
     }
 
     [Fact]
@@ -82,9 +90,10 @@ public sealed class UpdateViewModelTests
     {
         using var coordinator = new FakeCoordinator(new UpdateCheckResult("1.2.3", false));
         using var viewModel = new UpdateViewModel(coordinator);
-        await viewModel.StartAsync();
         coordinator.StartGate = new TaskCompletionSource<UpdateStartStatus>(TaskCreationOptions.RunContinuationsAsynchronously);
 
+        var startup = viewModel.StartAsync();
+        await WaitUntilAsync(() => viewModel.IsBusy);
         viewModel.UpdateCommand.Execute(null);
         viewModel.UpdateCommand.Execute(null);
         await Task.Delay(30);
@@ -92,6 +101,7 @@ public sealed class UpdateViewModelTests
         Assert.Equal(1, coordinator.StartCount);
         Assert.True(viewModel.IsBusy);
         coordinator.StartGate.SetResult(UpdateStartStatus.Started);
+        await startup;
         await WaitUntilAsync(() => !viewModel.IsBusy);
     }
 
@@ -104,8 +114,6 @@ public sealed class UpdateViewModelTests
         };
         using var viewModel = new UpdateViewModel(coordinator);
         await viewModel.StartAsync();
-
-        await viewModel.StartAvailableUpdateAsync();
 
         Assert.True(viewModel.IsNotificationVisible);
         Assert.True(viewModel.IsUpdateActionVisible);
@@ -139,7 +147,10 @@ public sealed class UpdateViewModelTests
         bool authenticated,
         bool expectedUpdateVisible)
     {
-        using var coordinator = new FakeCoordinator(new UpdateCheckResult("1.2.3", false));
+        using var coordinator = new FakeCoordinator(new UpdateCheckResult("1.2.3", false))
+        {
+            StartResult = UpdateStartStatus.Started,
+        };
         var details = PublishedPairTestFixtures.DetailsGeneration(
             state,
             DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
@@ -154,10 +165,14 @@ public sealed class UpdateViewModelTests
 
         main.Start();
         await WaitUntilAsync(() => coordinator.CheckCount == 1 &&
-            (main.IsAuthenticated || main.IsAuthRequired));
+            (main.IsAuthenticated || main.IsAuthRequired) &&
+            main.Update?.StartStatus is not null &&
+            !main.IsStartupLoading);
 
-        Assert.Equal(expectedUpdateVisible, main.IsUpdateNotificationVisible);
-        Assert.Equal(expectedUpdateVisible, main.IsUpdateActionVisible);
+        Assert.True(
+            main.IsUpdateNotificationVisible == expectedUpdateVisible,
+            $"update-visible={main.IsUpdateNotificationVisible}, update-status={main.Update?.StartStatus}, update-notice={main.Update?.IsNotificationVisible}, startup={main.IsStartupLoading}, auth-required={main.IsAuthRequired}, details={main.HasDetails}, state={main.StatusTitle}");
+        Assert.False(main.IsUpdateActionVisible);
         Assert.Equal(authenticated && !expectedUpdateVisible, main.ShowLastReceived);
     }
 

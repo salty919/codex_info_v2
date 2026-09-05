@@ -64,14 +64,32 @@ Setupは資格情報、SSH鍵、raw接続先を保存しない。Authenticode署
 のみ実施でき、証明書がないローカルbuildを署名済みと表明してはならない。
 
 GitHub配布版の更新確認は、固定repository `salty919/codex_info_v2` の公開済み
-`windows-vX.Y.Z` Releaseだけを対象とする。起動時は新版の有無を確認して状態帯へ通知するだけで、
-downloadもSetup起動も行わない。新版がある時だけ表示される「更新する」を利用者が押すと、exact-nameの
-manifestとSetupを取得し、version、許可済みHTTPS authority、size、SHA-256を検証してから通常のInno Setup
-GUIを起動する。silent install、unattended apply、自動再起動、常設Headerボタンは使用しない。
+`windows-vX.Y.Z` Releaseだけを対象とする。通常起動、状態帯の明示retry、logon、hourlyは、backendの
+接続・認証・details取得状態とは独立した同じ更新coordinatorを使用する。通常起動は新版を発見すると
+利用者のclickを待たず自動収束を開始する。画面を起動しないlogon/hourly経路は、ユーザー単位の
+`CodexInfo.WindowsClient.Update.Logon`と`CodexInfo.WindowsClient.Update.Hourly`からinstalled executableの
+`--update-only`を実行する。いずれも管理者権限を要求せず、Windowを作らず、1回を有限時間で終了する。
+
+coordinatorはexact-nameのmanifestとSetupを取得し、version、許可済みHTTPS authority、size、SHA-256を
+検証してからSetupを起動する。UI、logon、hourly、明示retryの間で排他leaseとatomic pending stateを共有し、
+同じSetupを重ねない。pendingにはSetup起動前のattempt/target/source/hash/path/start timeと、起動後の
+exact PID/process start/pathを保存する。後続triggerは、target generationのinstalled read-backでだけsuccess、
+exact Setup生存中はbusy、終了後も旧版ならfailed、10分を超えて生存中なら強制終了せずSAFE_BLOCKEDとする。
+pending保存失敗時はSetupを起動せず、PID追記失敗時も別Setupを起動しない。更新失敗は旧payload、
+`%LOCALAPPDATA%\CodexInfo`の設定、Linux側の履歴DB、last-good表示を変更しない。
+
+この自動収束契約を持たない既存1.0.25は、自身を修正済み版へ更新できないため、一度だけ検証済みSetupを
+明示実行するbootstrapが必要である。これは既存端末の移行境界であって、修正済み版以降の通常運用を
+手動更新へ戻す根拠にはしない。
 
 Windows製品版は`windows-client/Directory.Build.props`のstable `X.Y.Z`を正本にする。PRは版番号の
 単調増加とbuild/test/installer/E2Eを検証するだけでReleaseへ書き込まない。`main`へmergeされた版番号が
-上がり、全Windows gateがPASSした時だけ`windows-vX.Y.Z`とSetup/update manifestを公開する。mainの
+上がり、全Windows gateがPASSした時だけ`windows-vX.Y.Z`とSetup/update manifestを公開する。公開前には
+fresh non-admin Windowsへexact previous public stableを導入し、その製品更新経路でexact candidateへ遷移させ、
+installed payload、shortcut、Apps登録、上記2 scheduled task、設定hash、process、実UI、candidate source/hash、
+同一sourceのLinux readinessを外部read-backする。同じcandidateの再install、clean install、unit/mock、
+asset存在、公開後checkはこの遷移の代替にならない。未実行、環境不足、INCONCLUSIVEを含む非PASSは
+publish不可とする。mainの
 release処理は同一refで直列化し、HTTP 404だけを不存在として受理する。tagを原子的に新規作成した後、
 非公開Draftへexact 2資産をuploadし、名前・byte size・upload状態・tagのcommit SHAを検証してから公開する。
 既存tag/Release、通信失敗、5xx、部分uploadへ上書き・追記して継続しない。

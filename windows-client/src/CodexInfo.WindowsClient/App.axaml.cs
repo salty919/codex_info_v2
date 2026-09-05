@@ -55,14 +55,7 @@ public partial class App : Application
             var supervisor = preview ? null : new ConnectionSupervisor();
             IWindowsUpdateCoordinator updateCoordinator = preview
                 ? new PreviewUpdateCoordinator()
-                : new WindowsUpdateCoordinator(
-                    new WindowsUpdateClient(),
-                    new WindowsInstallerLauncher(),
-                    typeof(App).Assembly.GetName().Version ?? new Version(1, 0, 0),
-                    Path.Combine(
-                        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                        "CodexInfo",
-                        "updates"));
+                : WindowsUpdateCoordinator.CreateDefault();
             var viewModel = new MainWindowViewModel(
                 detailsClient,
                 supervisor,

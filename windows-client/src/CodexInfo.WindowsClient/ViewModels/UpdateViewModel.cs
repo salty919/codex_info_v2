@@ -10,9 +10,9 @@ using CodexInfo.WindowsClient.Updates;
 namespace CodexInfo.WindowsClient.ViewModels;
 
 /// <summary>
-/// Owns the presentation state for the opt-in Windows update flow. Checking
-/// is started once by the host, while a download/install can only be started
-/// by executing <see cref="UpdateCommand"/>.
+/// Owns the presentation state for the shared Windows update flow. A normal
+/// UI startup performs the same bounded check/start transition as the
+/// headless update-only trigger; the command remains available for retry.
 /// </summary>
 public sealed class UpdateViewModel : INotifyPropertyChanged, IDisposable
 {
@@ -38,7 +38,9 @@ public sealed class UpdateViewModel : INotifyPropertyChanged, IDisposable
     public string? AvailableVersion => availableVersion;
 
     public bool HasAvailableUpdate => !string.IsNullOrWhiteSpace(availableVersion) &&
-        startStatus is not UpdateStartStatus.Started and not UpdateStartStatus.NoAvailableUpdate;
+        startStatus is not UpdateStartStatus.Started and
+        not UpdateStartStatus.NoAvailableUpdate and
+        not UpdateStartStatus.Busy;
 
     public bool IsBusy => busy;
 
@@ -54,7 +56,10 @@ public sealed class UpdateViewModel : INotifyPropertyChanged, IDisposable
     public string ActionText => startStatus is
         UpdateStartStatus.DownloadFailed or
         UpdateStartStatus.IntegrityFailed or
-        UpdateStartStatus.LaunchFailed
+        UpdateStartStatus.LaunchFailed or
+        UpdateStartStatus.DiscoveryFailed or
+        UpdateStartStatus.OldVersionFailed or
+        UpdateStartStatus.SafeBlocked
         ? LocalizationService.Current.Retry
         : LocalizationService.Current.UpdateButtonText;
 
@@ -70,6 +75,9 @@ public sealed class UpdateViewModel : INotifyPropertyChanged, IDisposable
                 UpdateStartStatus.DownloadFailed => texts.UpdateDownloadFailed,
                 UpdateStartStatus.IntegrityFailed => texts.UpdateIntegrityFailed,
                 UpdateStartStatus.LaunchFailed => texts.UpdateLaunchFailed,
+                UpdateStartStatus.DiscoveryFailed => texts.UpdateDownloadFailed,
+                UpdateStartStatus.OldVersionFailed => texts.UpdateLaunchFailed,
+                UpdateStartStatus.SafeBlocked => texts.UpdateLaunchFailed,
                 _ => string.Empty,
             };
             return statusText.Length > 0
@@ -136,6 +144,14 @@ public sealed class UpdateViewModel : INotifyPropertyChanged, IDisposable
             : result.AvailableVersion.Trim();
         startStatus = null;
         NotifyState();
+
+        // Startup convergence is deliberately independent of the backend
+        // details/auth pipeline. The coordinator owns release validation,
+        // exclusive lease, pending state, and Setup launch for every trigger.
+        if (HasAvailableUpdate)
+        {
+            await RunUpdateAsync();
+        }
     }
 
     private async Task RunUpdateAsync()
@@ -162,10 +178,7 @@ public sealed class UpdateViewModel : INotifyPropertyChanged, IDisposable
 
             if (disposed) return;
 
-            if (result != UpdateStartStatus.Busy)
-            {
-                startStatus = result;
-            }
+            startStatus = result;
             if (result is UpdateStartStatus.Started or UpdateStartStatus.NoAvailableUpdate)
             {
                 availableVersion = null;

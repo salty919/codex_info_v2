@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using System.Security.Cryptography;
+using System.Diagnostics;
+using System.Text.Json;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Infrastructure;
 using CodexInfo.WindowsClient.Updates;
@@ -11,6 +13,228 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 
 public sealed class WindowsUpdateCoordinatorTests
 {
+    [Fact]
+    public async Task SetupStartPersistsAtomicPendingOwnerMetadata()
+    {
+        using var directory = new TemporaryDirectory();
+        var payload = new byte[] { 8, 6, 7, 5 };
+        var release = ReleaseFor(payload);
+        var client = new FakeUpdateClient(
+            WindowsUpdateCheckResult.Success(release),
+            async (destination, cancellationToken) =>
+            {
+                await destination.WriteAsync(payload, cancellationToken);
+                return WindowsUpdateDownloadResult.Success();
+            });
+        var launcher = new RecordingLauncher();
+        using var coordinator = new WindowsUpdateCoordinator(
+            client, launcher, new Version(1, 0, 0), directory.Path);
+        await coordinator.CheckAsync();
+
+        Assert.Equal(UpdateStartStatus.Started, await coordinator.StartAvailableUpdateAsync());
+
+        using var document = JsonDocument.Parse(
+            await File.ReadAllTextAsync(Path.Combine(directory.Path, ".update.pending.json")));
+        var root = document.RootElement;
+        Assert.Equal("pending", root.GetProperty("status").GetString());
+        Assert.False(string.IsNullOrWhiteSpace(root.GetProperty("attempt_id").GetString()));
+        Assert.Equal("1.2.3", root.GetProperty("target_version").GetString());
+        Assert.Equal(release.InstallerUri.AbsoluteUri, root.GetProperty("target_source").GetString());
+        Assert.Equal(release.Sha256, root.GetProperty("installer_sha256").GetString());
+        Assert.Equal(release.Size, root.GetProperty("installer_size").GetInt64());
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("process_id").ValueKind);
+    }
+
+    [Fact]
+    public async Task PendingTargetReadbackClosesSuccessWithoutLaunchingAgain()
+    {
+        using var directory = new TemporaryDirectory();
+        var payload = new byte[] { 1, 4, 1, 4 };
+        var release = ReleaseFor(payload);
+        var firstClient = new FakeUpdateClient(
+            WindowsUpdateCheckResult.Success(release),
+            async (destination, cancellationToken) =>
+            {
+                await destination.WriteAsync(payload, cancellationToken);
+                return WindowsUpdateDownloadResult.Success();
+            });
+        var firstLauncher = new RecordingLauncher();
+        using (var first = new WindowsUpdateCoordinator(
+                   firstClient,
+                   firstLauncher,
+                   new Version(1, 0, 0),
+                   directory.Path))
+        {
+            await first.CheckAsync();
+            Assert.Equal(UpdateStartStatus.Started, await first.StartAvailableUpdateAsync());
+        }
+
+        var secondLauncher = new RecordingLauncher();
+        using var second = new WindowsUpdateCoordinator(
+            new FakeUpdateClient(WindowsUpdateCheckResult.NoUpdate()),
+            secondLauncher,
+            new Version(1, 2, 3),
+            directory.Path);
+
+        Assert.False((await second.CheckAsync()).IsFailure);
+        Assert.Equal(UpdateStartStatus.NoAvailableUpdate, await second.StartAvailableUpdateAsync());
+        Assert.Empty(secondLauncher.Paths);
+        using var document = JsonDocument.Parse(
+            await File.ReadAllTextAsync(Path.Combine(directory.Path, ".update.pending.json")));
+        Assert.Equal("success", document.RootElement.GetProperty("status").GetString());
+    }
+
+    [Fact]
+    public async Task ExactLiveSetupIdentityReturnsBusyWithoutDownloadingAgain()
+    {
+        using var directory = new TemporaryDirectory();
+        var payload = new byte[] { 2, 7, 1, 8 };
+        var release = ReleaseFor(payload);
+        var identity = CurrentProcessIdentity();
+        var firstClient = new FakeUpdateClient(
+            WindowsUpdateCheckResult.Success(release),
+            async (destination, cancellationToken) =>
+            {
+                await destination.WriteAsync(payload, cancellationToken);
+                return WindowsUpdateDownloadResult.Success();
+            });
+        var firstLauncher = new RecordingProcessLauncher(identity);
+        using var first = new WindowsUpdateCoordinator(
+            firstClient,
+            firstLauncher,
+            new Version(1, 0, 0),
+            directory.Path);
+        await first.CheckAsync();
+        Assert.Equal(UpdateStartStatus.Started, await first.StartAvailableUpdateAsync());
+
+        var secondClient = new FakeUpdateClient(WindowsUpdateCheckResult.Success(release));
+        var secondLauncher = new RecordingProcessLauncher(identity);
+        using var second = new WindowsUpdateCoordinator(
+            secondClient,
+            secondLauncher,
+            new Version(1, 0, 0),
+            directory.Path);
+        await second.CheckAsync();
+
+        Assert.Equal(UpdateStartStatus.Busy, await second.StartAvailableUpdateAsync());
+        Assert.Equal(0, secondClient.DownloadCount);
+        Assert.Empty(secondLauncher.Paths);
+    }
+
+    [Fact]
+    public async Task MissingSetupIdentityStaysSafeBlockedAndNeverRetriesAutomatically()
+    {
+        using var directory = new TemporaryDirectory();
+        var payload = new byte[] { 3, 2, 3, 2 };
+        var release = ReleaseFor(payload);
+        var client = new FakeUpdateClient(
+            WindowsUpdateCheckResult.Success(release),
+            async (destination, cancellationToken) =>
+            {
+                await destination.WriteAsync(payload, cancellationToken);
+                return WindowsUpdateDownloadResult.Success();
+            });
+        var launcher = new RecordingProcessLauncher(null);
+        using var coordinator = new WindowsUpdateCoordinator(
+            client, launcher, new Version(1, 0, 0), directory.Path);
+        await coordinator.CheckAsync();
+
+        Assert.Equal(UpdateStartStatus.SafeBlocked, await coordinator.StartAvailableUpdateAsync());
+        Assert.Equal(UpdateStartStatus.SafeBlocked, await coordinator.StartAvailableUpdateAsync());
+        Assert.Single(launcher.Paths);
+        using var document = JsonDocument.Parse(
+            await File.ReadAllTextAsync(Path.Combine(directory.Path, ".update.pending.json")));
+        Assert.Equal("safe_blocked", document.RootElement.GetProperty("status").GetString());
+    }
+
+    [Fact]
+    public async Task EndedExactSetupIsOldVersionFailureBeforeAnyNewLaunch()
+    {
+        using var directory = new TemporaryDirectory();
+        var payload = new byte[] { 6, 2, 6, 2 };
+        var release = ReleaseFor(payload);
+        var client = new FakeUpdateClient(
+            WindowsUpdateCheckResult.Success(release),
+            async (destination, cancellationToken) =>
+            {
+                await destination.WriteAsync(payload, cancellationToken);
+                return WindowsUpdateDownloadResult.Success();
+            });
+        using var exited = Process.Start(new ProcessStartInfo
+        {
+            FileName = "/bin/sleep",
+            Arguments = "0.1",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        });
+        Assert.NotNull(exited);
+        var identity = new WindowsInstallerProcessIdentity(
+            exited!.Id,
+            new DateTimeOffset(exited.StartTime.ToUniversalTime(), TimeSpan.Zero),
+            exited.MainModule!.FileName!);
+
+        var launcher = new RecordingProcessLauncher(identity);
+        using var coordinator = new WindowsUpdateCoordinator(
+            client, launcher, new Version(1, 0, 0), directory.Path);
+        await coordinator.CheckAsync();
+
+        // The fixture writes the pending owner first, as a prior trigger did.
+        Assert.Equal(UpdateStartStatus.Started, await coordinator.StartAvailableUpdateAsync());
+        await exited.WaitForExitAsync();
+
+        var nextLauncher = new RecordingProcessLauncher(identity);
+        using var next = new WindowsUpdateCoordinator(
+            new FakeUpdateClient(WindowsUpdateCheckResult.Success(release)),
+            nextLauncher,
+            new Version(1, 0, 0),
+            directory.Path);
+        await next.CheckAsync();
+
+        Assert.Equal(UpdateStartStatus.OldVersionFailed, await next.StartAvailableUpdateAsync());
+        Assert.Empty(nextLauncher.Paths);
+    }
+
+    [Fact]
+    public async Task UpdateOnlyUsesFiniteExitCodes()
+    {
+        using (var currentDirectory = new TemporaryDirectory())
+        {
+            using var current = new WindowsUpdateCoordinator(
+                new FakeUpdateClient(WindowsUpdateCheckResult.NoUpdate()),
+                new RecordingLauncher(),
+                new Version(1, 0, 0),
+                currentDirectory.Path);
+            Assert.Equal(UpdateOnlyExitCode.Current, await current.RunUpdateOnlyAsync());
+        }
+
+        using (var startDirectory = new TemporaryDirectory())
+        {
+            var payload = new byte[] { 9, 9, 1 };
+            var release = ReleaseFor(payload);
+            var client = new FakeUpdateClient(
+                WindowsUpdateCheckResult.Success(release),
+                async (destination, cancellationToken) =>
+                {
+                    await destination.WriteAsync(payload, cancellationToken);
+                    return WindowsUpdateDownloadResult.Success();
+                });
+            using var start = new WindowsUpdateCoordinator(
+                client,
+                new RecordingLauncher(),
+                new Version(1, 0, 0),
+                startDirectory.Path);
+            Assert.Equal(UpdateOnlyExitCode.SetupStarted, await start.RunUpdateOnlyAsync());
+        }
+
+        using var failureDirectory = new TemporaryDirectory();
+        using var failure = new WindowsUpdateCoordinator(
+            new FakeUpdateClient(WindowsUpdateCheckResult.FromFailure(WindowsUpdateFailure.Response)),
+            new RecordingLauncher(),
+            new Version(1, 0, 0),
+            failureDirectory.Path);
+        Assert.Equal(UpdateOnlyExitCode.DiscoveryFailure, await failure.RunUpdateOnlyAsync());
+    }
+
     [Fact]
     public async Task CheckOnlyPublishesNoticeAndDoesNotDownloadOrLaunch()
     {
@@ -281,6 +505,15 @@ public sealed class WindowsUpdateCoordinatorTests
             payload.Length);
     }
 
+    private static WindowsInstallerProcessIdentity CurrentProcessIdentity()
+    {
+        using var process = Process.GetCurrentProcess();
+        return new WindowsInstallerProcessIdentity(
+            process.Id,
+            new DateTimeOffset(process.StartTime.ToUniversalTime(), TimeSpan.Zero),
+            process.MainModule!.FileName!);
+    }
+
     private sealed class FakeUpdateClient : IWindowsUpdateClient, IDisposable
     {
         private readonly WindowsUpdateCheckResult checkResult;
@@ -324,6 +557,26 @@ public sealed class WindowsUpdateCoordinatorTests
         {
             Paths.Add(installerPath);
             return Result;
+        }
+    }
+
+    private sealed class RecordingProcessLauncher(
+        WindowsInstallerProcessIdentity? identity) :
+        IWindowsInstallerLauncher,
+        IWindowsInstallerProcessLauncher
+    {
+        public List<string> Paths { get; } = [];
+
+        public bool TryLaunch(string installerPath)
+        {
+            Paths.Add(installerPath);
+            return true;
+        }
+
+        public WindowsInstallerLaunchResult TryLaunchWithIdentity(string installerPath)
+        {
+            Paths.Add(installerPath);
+            return new WindowsInstallerLaunchResult(true, identity);
         }
     }
 

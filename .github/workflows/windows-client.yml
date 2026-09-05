@@ -32,11 +32,13 @@ jobs:
         with:
           dotnet-version: "10.0.x"
       - name: Run Windows unit tests
+        id: windows_unit_tests
         shell: pwsh
         run: |
           dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
           dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
       - name: Install locked Inno Setup compiler
+        id: install_inno_setup
         shell: pwsh
         run: |
           winget source update --name winget --disable-interactivity
@@ -47,90 +49,15 @@ jobs:
           if (-not (Test-Path $compiler -PathType Leaf)) { throw 'Inno Setup 7.1.0 compiler was not installed.' }
           "INNO_SETUP_COMPILER=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build standard Windows setup wizard
+        id: build_installer
         shell: pwsh
         run: ./windows-client/tools/Build-WindowsInstaller.ps1 -OutputDirectory artifacts/windows-installer
       - name: Verify installer artifact
+        id: verify_installer
         shell: pwsh
         run: |
           if (-not (Test-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe -PathType Leaf)) {
             throw 'CodexInfo.WindowsClient.Setup.exe was not produced.'
-          }
-      - name: Smoke-test install and uninstall lifecycle
-        shell: pwsh
-        run: |
-          $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
-          $installProcess = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/MERGETASKS=desktopicon') -Wait -PassThru
-          if ($installProcess.ExitCode -ne 0) { throw "Installer failed with exit code $($installProcess.ExitCode)" }
-          $install = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
-          $start = Join-Path ([Environment]::GetFolderPath('Programs')) 'Codex Info\Codex Info Monitor.lnk'
-          $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Codex Info Monitor.lnk'
-          $exe = Join-Path $install 'CodexInfo.WindowsClient.exe'
-          $nativeNotice = Join-Path $install 'THIRD-PARTY-LICENSES\skiasharp.nativeassets.win32-3.119.4-THIRD-PARTY-NOTICES.txt'
-          $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File | Select-Object -First 1
-          if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing.' }
-          if (-not (Test-Path $nativeNotice -PathType Leaf)) { throw 'Required SkiaSharp native notice is missing from the installed payload.' }
-          if ($null -eq $uninstaller) { throw 'Installed uninstaller is missing.' }
-          if (-not (Test-Path $start -PathType Leaf)) { throw 'Start-menu shortcut is missing.' }
-          if (-not (Test-Path $desktop -PathType Leaf)) { throw 'Desktop shortcut is missing.' }
-          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexInfo.WindowsClient_is1'
-          if (-not (Test-Path $key)) { throw 'Per-user Apps uninstall registration is missing.' }
-          if ((Get-ItemPropertyValue $key DisplayIcon) -ne $exe) { throw 'Apps entry icon does not target the product executable.' }
-          $shell = New-Object -ComObject WScript.Shell
-          $shortcut = $shell.CreateShortcut($start)
-          if ($shortcut.TargetPath -ne $exe) { throw 'Start-menu shortcut target is incorrect.' }
-          if ($shortcut.WorkingDirectory -ne $install) { throw 'Start-menu shortcut working directory is incorrect.' }
-          $settings = Join-Path $env:LOCALAPPDATA 'CodexInfo'
-          $sentinel = Join-Path $settings 'installer-preserve-sentinel.txt'
-          New-Item -ItemType Directory -Path $settings -Force | Out-Null
-          Set-Content -LiteralPath $sentinel -Value 'preserve'
-          $updateProcess = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
-          if ($updateProcess.ExitCode -ne 0) { throw "Installer update failed with exit code $($updateProcess.ExitCode)" }
-          if (-not (Test-Path $sentinel -PathType Leaf)) { throw 'Update removed user settings.' }
-          Start-Process -FilePath $start
-          Start-Sleep -Seconds 5
-          $clientProcesses = Get-Process -Name 'CodexInfo.WindowsClient' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -eq $exe }
-          if (-not $clientProcesses) { throw 'Start-menu shortcut did not launch the installed client.' }
-          $clientProcesses | Stop-Process -Force
-          $uninstallProcess = Start-Process -FilePath $uninstaller.FullName -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
-          if ($uninstallProcess.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstallProcess.ExitCode)" }
-          Start-Sleep -Seconds 4
-          if (Test-Path $install) { throw 'Install directory still exists after uninstall.' }
-          if (Test-Path $start) { throw 'Start-menu shortcut still exists after uninstall.' }
-          if (Test-Path $desktop) { throw 'Desktop shortcut still exists after uninstall.' }
-          if (Test-Path $key) { throw 'Per-user uninstall registration still exists.' }
-          if (-not (Test-Path $sentinel -PathType Leaf)) { throw 'Uninstall removed user settings.' }
-          Remove-Item -LiteralPath $sentinel -Force
-      - name: Run installed Windows UI Automation E2E
-        shell: pwsh
-        env:
-          SOURCE_SHA: ${{ inputs.source_sha }}
-        run: |
-          $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
-          $installProcess = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
-          if ($installProcess.ExitCode -ne 0) { throw "E2E fixture install failed with exit code $($installProcess.ExitCode)" }
-          $install = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
-          $exe = Join-Path $install 'CodexInfo.WindowsClient.exe'
-          if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing for UI E2E.' }
-          $e2eOutput = Join-Path $env:RUNNER_TEMP 'codex-info-windows-e2e'
-          try {
-            New-Item -ItemType Directory -Path $e2eOutput -Force | Out-Null
-            $moveSmokeLog = Join-Path $e2eOutput 'window-move-smoke.log'
-            & ./windows-client/tools/Run-WindowsClientE2E.ps1 -ClientPath $exe -OutputDirectory $e2eOutput -Fixture -SourceSha $env:SOURCE_SHA
-            if (-not $?) { throw 'Windows UI Automation E2E failed.' }
-            "source-sha: $env:SOURCE_SHA" | Set-Content -LiteralPath $moveSmokeLog -Encoding utf8
-            $moveSmokeOutput = @(& ./scripts/windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput *>&1)
-            $moveSmokeOutput | Tee-Object -FilePath $moveSmokeLog -Append
-            if ($moveSmokeOutput.Count -eq 0 -or [string]$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS') {
-              throw 'Physical window move smoke did not report its terminal PASS contract.'
-            }
-          }
-          finally {
-            $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($null -ne $uninstaller) {
-              $uninstallProcess = Start-Process -FilePath $uninstaller.FullName -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
-              if ($uninstallProcess.ExitCode -ne 0) { throw "E2E cleanup uninstall failed with exit code $($uninstallProcess.ExitCode)" }
-            }
           }
       - name: Create release manifest
         id: manifest
@@ -163,6 +90,347 @@ jobs:
             throw "Generated release manifest version is not canonical stable semver: $version"
           }
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Run pre-publication first-fixed bootstrap/Inno previous-stable to candidate transition
+        id: prepublication_bootstrap_transition
+        if: inputs.release_candidate
+        timeout-minutes: 20
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          CANDIDATE_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          # This is the first-fixed bootstrap/Inno in-place transition. It is
+          # not evidence for automatic product discovery or clickless update.
+          # That future route remains a separate acceptance criterion.
+          $ErrorActionPreference = 'Stop'
+          $deadline = [DateTimeOffset]::UtcNow.AddMinutes(15)
+          function Assert-Deadline {
+            param([string]$Phase)
+            if ([DateTimeOffset]::UtcNow -gt $deadline) {
+              throw "Windows release E2E deadline exceeded during $Phase."
+            }
+          }
+          function Assert-Equal {
+            param([object]$Expected, [object]$Actual, [string]$Name)
+            if ([string]$Expected -cne [string]$Actual) {
+              throw "$Name mismatch: expected '$Expected', actual '$Actual'."
+            }
+          }
+          function Assert-FileDigest {
+            param([string]$Path, [string]$ExpectedDigest, [long]$ExpectedSize, [string]$Name)
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+              throw "$Name is missing: $Path"
+            }
+            $actualSize = (Get-Item -LiteralPath $Path).Length
+            Assert-Equal $ExpectedSize $actualSize "$Name size"
+            $actualDigest = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+            Assert-Equal $ExpectedDigest.ToLowerInvariant() $actualDigest "$Name SHA-256"
+            return $actualDigest
+          }
+          function Wait-InstallerProcess {
+            param([System.Diagnostics.Process]$Process, [string]$Name)
+            Assert-Deadline "$Name installer"
+            if (-not $Process.WaitForExit(300000)) {
+              try { $Process.Kill() } catch { }
+              throw "$Name installer exceeded the finite five-minute wait."
+            }
+            if ($Process.ExitCode -ne 0) {
+              throw "$Name installer failed with exit code $($Process.ExitCode)."
+            }
+          }
+          function Get-InstalledClientPath {
+            return (Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor\CodexInfo.WindowsClient.exe')
+          }
+          function Assert-InstalledClient {
+            param([string]$ExpectedVersion, [string]$Name)
+            $installed = Get-InstalledClientPath
+            if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) {
+              throw "$Name installed client executable is missing."
+            }
+            $productVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($installed).ProductVersion
+            Assert-Equal $ExpectedVersion $productVersion "$Name installed ProductVersion"
+            $payloadDigest = (Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($payloadDigest -notmatch '^[0-9a-f]{64}$') {
+              throw "$Name installed payload digest is not a SHA-256 value."
+            }
+            return $installed
+          }
+          function Assert-UpdateTask {
+            param([string]$TaskName, [string]$ExpectedExecutable, [string]$ExpectedTrigger)
+            $task = Get-ScheduledTask -TaskPath '\' -TaskName $TaskName -ErrorAction Stop
+            $actions = @($task.Actions)
+            if ($actions.Count -ne 1) { throw "Scheduled task $TaskName must have exactly one action." }
+            Assert-Equal $ExpectedExecutable $actions[0].Execute "$TaskName action executable"
+            Assert-Equal '--update-only' $actions[0].Arguments "$TaskName action arguments"
+            Assert-Equal 'Limited' $task.Principal.RunLevel "$TaskName run level"
+            Assert-Equal 'InteractiveToken' $task.Principal.LogonType "$TaskName logon type"
+            $triggers = @($task.Triggers)
+            if ($triggers.Count -ne 1) { throw "Scheduled task $TaskName must have exactly one trigger." }
+            if ($ExpectedTrigger -eq 'logon') {
+              if ($triggers[0].CimClass.CimClassName -ne 'MSFT_TaskLogonTrigger') {
+                throw "$TaskName does not have an exact logon trigger."
+              }
+            }
+            else {
+              if ($triggers[0].CimClass.CimClassName -ne 'MSFT_TaskTimeTrigger') {
+                throw "$TaskName does not have an exact hourly time trigger."
+              }
+              Assert-Equal 'PT1H' $triggers[0].Repetition.Interval "$TaskName repetition interval"
+            }
+          }
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw 'Pre-publication E2E must run as a fresh non-admin Windows user.'
+          }
+          Assert-Deadline 'preflight'
+          $candidateSource = ([string]$env:CANDIDATE_SOURCE_SHA).Trim().ToLowerInvariant()
+          if ($candidateSource -notmatch '^[0-9a-f]{40}$') {
+            throw 'Candidate source identity must be one exact 40-character SHA.'
+          }
+          $manifestPath = Join-Path $PWD 'artifacts/windows-installer/CodexInfo.WindowsClient.update.json'
+          $candidateSetup = (Resolve-Path './artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe').Path
+          $candidateManifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+          $candidateVersion = [string]$candidateManifest.version
+          if ($candidateVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw "Candidate manifest version is not canonical stable semver: $candidateVersion"
+          }
+          $candidateVersionObject = [Version]$candidateVersion
+          $expectedInstallerName = 'CodexInfo.WindowsClient.Setup.exe'
+          $expectedInstallerUrl = "https://github.com/$env:REPOSITORY/releases/latest/download/$expectedInstallerName"
+          Assert-Equal $expectedInstallerName ([string]$candidateManifest.installer.name) 'candidate installer name'
+          Assert-Equal $expectedInstallerUrl ([string]$candidateManifest.installer.url) 'candidate installer URL'
+          $candidateDigest = ([string]$candidateManifest.installer.sha256).Trim().ToLowerInvariant()
+          $candidateSize = [long]$candidateManifest.installer.size
+          if ($candidateDigest -notmatch '^[0-9a-f]{64}$' -or $candidateSize -le 0) {
+            throw 'Candidate manifest must provide an exact installer SHA-256 and positive size.'
+          }
+          Assert-FileDigest $candidateSetup $candidateDigest $candidateSize 'candidate Setup' | Out-Null
+          $installRoot = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
+          $startShortcut = Join-Path ([Environment]::GetFolderPath('Programs')) 'Codex Info\Codex Info Monitor.lnk'
+          $appsKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexInfo.WindowsClient_is1'
+          $logonTaskName = 'CodexInfo.WindowsClient.Update.Logon'
+          $hourlyTaskName = 'CodexInfo.WindowsClient.Update.Hourly'
+          if ((Test-Path -LiteralPath $installRoot) -or (Test-Path -LiteralPath $startShortcut) -or
+              (Test-Path -LiteralPath $appsKey) -or
+              (Get-ScheduledTask -TaskPath '\' -TaskName $logonTaskName -ErrorAction SilentlyContinue) -or
+              (Get-ScheduledTask -TaskPath '\' -TaskName $hourlyTaskName -ErrorAction SilentlyContinue)) {
+            throw 'Pre-publication E2E requires a fresh Windows installation state.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) { throw 'GitHub token is required for public previous-stable readback.' }
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            'User-Agent' = 'codex-info-windows-release-e2e'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $releaseUri = "https://api.github.com/repos/$env:REPOSITORY/releases?per_page=100"
+          $releases = @(Invoke-RestMethod -Uri $releaseUri -Headers $headers -TimeoutSec 30)
+          $stableReleases = @($releases | Where-Object {
+            -not $_.draft -and -not $_.prerelease -and $_.tag_name -match '^windows-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          })
+          $previousCandidates = @($stableReleases | ForEach-Object {
+            $versionText = $_.tag_name -replace '^windows-v', ''
+            $versionObject = [Version]$versionText
+            if ($versionObject -lt $candidateVersionObject) {
+              [PSCustomObject]@{ Release = $_; Version = $versionText; VersionObject = $versionObject }
+            }
+          } | Sort-Object VersionObject -Descending)
+          if ($previousCandidates.Count -lt 1) { throw 'No exact public previous stable exists; publish=false.' }
+          $highestPreviousVersion = $previousCandidates[0].VersionObject
+          $previousCandidates = @($previousCandidates | Where-Object { $_.VersionObject -eq $highestPreviousVersion })
+          if ($previousCandidates.Count -ne 1) {
+            throw 'Public previous-stable selection is ambiguous; publish=false.'
+          }
+          $previousCandidate = $previousCandidates[0]
+          $previousRelease = $previousCandidate.Release
+          $previousVersion = $previousCandidate.Version
+          $previousSource = ([string]$previousRelease.target_commitish).Trim().ToLowerInvariant()
+          if ($previousSource -notmatch '^[0-9a-f]{40}$') {
+            throw 'Previous stable release source identity is not an exact commit SHA; publish=false.'
+          }
+          $previousManifestAsset = @($previousRelease.assets | Where-Object { $_.name -ceq 'CodexInfo.WindowsClient.update.json' })
+          $previousSetupAsset = @($previousRelease.assets | Where-Object { $_.name -ceq 'CodexInfo.WindowsClient.Setup.exe' })
+          if ($previousManifestAsset.Count -ne 1 -or $previousSetupAsset.Count -ne 1) {
+            throw 'Previous stable must expose exactly one Setup and update manifest asset.'
+          }
+          $e2eRoot = Join-Path $env:RUNNER_TEMP 'codex-info-windows-release-e2e'
+          New-Item -ItemType Directory -Path $e2eRoot -Force | Out-Null
+          $previousManifestPath = Join-Path $e2eRoot 'previous.update.json'
+          $previousSetupPath = Join-Path $e2eRoot 'previous.Setup.exe'
+          Invoke-WebRequest -Uri $previousManifestAsset[0].browser_download_url -Headers $headers -TimeoutSec 30 -OutFile $previousManifestPath
+          Invoke-WebRequest -Uri $previousSetupAsset[0].browser_download_url -Headers $headers -TimeoutSec 300 -OutFile $previousSetupPath
+          $previousManifest = Get-Content -LiteralPath $previousManifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+          Assert-Equal $previousVersion ([string]$previousManifest.version) 'previous stable manifest version'
+          Assert-Equal $expectedInstallerName ([string]$previousManifest.installer.name) 'previous stable installer name'
+          Assert-Equal $expectedInstallerUrl ([string]$previousManifest.installer.url) 'previous stable installer URL'
+          $previousDigest = ([string]$previousManifest.installer.sha256).Trim().ToLowerInvariant()
+          $previousSize = [long]$previousManifest.installer.size
+          if ($previousDigest -notmatch '^[0-9a-f]{64}$' -or $previousSize -le 0) {
+            throw 'Previous stable manifest must provide an exact installer SHA-256 and positive size.'
+          }
+          Assert-FileDigest $previousSetupPath $previousDigest $previousSize 'previous stable Setup' | Out-Null
+          $previousInstalled = $null
+          $candidateInstalled = $null
+          $clientProcess = $null
+          try {
+            Assert-Deadline 'previous stable install'
+            $previousInstallProcess = Start-Process -FilePath $previousSetupPath -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -PassThru
+            Wait-InstallerProcess $previousInstallProcess 'previous stable'
+            $previousProductVersion = "$previousVersion+$previousSource"
+            $previousInstalled = Assert-InstalledClient $previousProductVersion 'previous stable'
+            $previousExeDigest = (Get-FileHash -LiteralPath $previousInstalled -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($previousExeDigest -notmatch '^[0-9a-f]{64}$') { throw 'Previous stable payload digest readback is invalid.' }
+            $settingsRoot = Join-Path $env:LOCALAPPDATA 'CodexInfo'
+            $settingsPath = Join-Path $settingsRoot 'windows-update-e2e-settings.json'
+            New-Item -ItemType Directory -Path $settingsRoot -Force | Out-Null
+            [IO.File]::WriteAllText($settingsPath, '{"update-e2e":"preserve-settings-v1"}', [Text.UTF8Encoding]::new($false))
+            $settingsHashBefore = (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            Assert-Equal $previousVersion (Get-ItemPropertyValue -Path $appsKey -Name DisplayVersion) 'previous stable Apps version'
+            $previousShortcut = New-Object -ComObject WScript.Shell
+            $previousLink = $previousShortcut.CreateShortcut($startShortcut)
+            Assert-Equal $previousInstalled $previousLink.TargetPath 'previous stable shortcut target'
+            Assert-Deadline 'candidate update'
+            $candidateInstallProcess = Start-Process -FilePath $candidateSetup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -PassThru
+            Wait-InstallerProcess $candidateInstallProcess 'candidate'
+            $candidateProductVersion = "$candidateVersion+$candidateSource"
+            $candidateInstalled = Assert-InstalledClient $candidateProductVersion 'candidate'
+            $candidateExeDigest = (Get-FileHash -LiteralPath $candidateInstalled -Algorithm SHA256).Hash.ToLowerInvariant()
+            Assert-Equal $false ($candidateExeDigest -eq $previousExeDigest) 'installed payload digest change'
+            $settingsHashAfter = (Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            Assert-Equal $settingsHashBefore $settingsHashAfter 'settings hash retention'
+            Assert-Equal $candidateVersion (Get-ItemPropertyValue -Path $appsKey -Name DisplayVersion) 'candidate Apps version'
+            $candidateLink = $previousShortcut.CreateShortcut($startShortcut)
+            Assert-Equal $candidateInstalled $candidateLink.TargetPath 'candidate shortcut target'
+            Assert-UpdateTask $logonTaskName $candidateInstalled 'logon'
+            Assert-UpdateTask $hourlyTaskName $candidateInstalled 'hourly'
+            Start-Process -FilePath $startShortcut | Out-Null
+            Start-Sleep -Seconds 5
+            Assert-Deadline 'candidate process startup'
+            $clientProcess = @(Get-Process -Name 'CodexInfo.WindowsClient' -ErrorAction SilentlyContinue |
+              Where-Object { $_.Path -eq $candidateInstalled }) | Select-Object -First 1
+            if ($null -eq $clientProcess) { throw 'Candidate shortcut did not produce the installed candidate process.' }
+            $uiOutputDirectory = Join-Path $e2eRoot 'ui'
+            New-Item -ItemType Directory -Path $uiOutputDirectory -Force | Out-Null
+            & ./windows-client/tools/Run-WindowsClientE2E.ps1 -ClientPath $candidateInstalled -OutputDirectory $uiOutputDirectory -SourceSha $candidateSource
+            if ($LASTEXITCODE -ne 0) { throw 'Candidate real UI E2E failed.' }
+            # This Windows owner reports only bootstrap-transition evidence;
+            # it is not clickless product discovery evidence. The top-level
+            # top-level main Release acceptance must join same-source Linux distribution
+            # readiness before any publication decision.
+            Write-Host "windows-bootstrap-transition: PASS previous=$previousProductVersion candidate=$candidateProductVersion candidateSetupSha256=$candidateDigest"
+          }
+          finally {
+            if ($null -ne $clientProcess -and -not $clientProcess.HasExited) { $clientProcess | Stop-Process -Force -ErrorAction SilentlyContinue }
+            $uninstaller = Get-ChildItem -LiteralPath $installRoot -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $uninstaller) {
+              $cleanupProcess = Start-Process -FilePath $uninstaller.FullName -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -PassThru
+              if (-not $cleanupProcess.WaitForExit(300000)) { try { $cleanupProcess.Kill() } catch { } }
+            }
+          }
+      - name: Smoke-test clean install and uninstall lifecycle
+        id: clean_install_smoke
+        shell: pwsh
+        run: |
+          $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
+          $installProcess = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/MERGETASKS=desktopicon') -Wait -PassThru
+          if ($installProcess.ExitCode -ne 0) { throw "Installer failed with exit code $($installProcess.ExitCode)" }
+          $install = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
+          $start = Join-Path ([Environment]::GetFolderPath('Programs')) 'Codex Info\Codex Info Monitor.lnk'
+          $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Codex Info Monitor.lnk'
+          $exe = Join-Path $install 'CodexInfo.WindowsClient.exe'
+          $nativeNotice = Join-Path $install 'THIRD-PARTY-LICENSES\skiasharp.nativeassets.win32-3.119.4-THIRD-PARTY-NOTICES.txt'
+          $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File | Select-Object -First 1
+          if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing.' }
+          if (-not (Test-Path $nativeNotice -PathType Leaf)) { throw 'Required SkiaSharp native notice is missing from the installed payload.' }
+          if ($null -eq $uninstaller) { throw 'Installed uninstaller is missing.' }
+          if (-not (Test-Path $start -PathType Leaf)) { throw 'Start-menu shortcut is missing.' }
+          if (-not (Test-Path $desktop -PathType Leaf)) { throw 'Desktop shortcut is missing.' }
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexInfo.WindowsClient_is1'
+          if (-not (Test-Path $key)) { throw 'Per-user Apps uninstall registration is missing.' }
+          if ((Get-ItemPropertyValue $key DisplayIcon) -ne $exe) { throw 'Apps entry icon does not target the product executable.' }
+          $shell = New-Object -ComObject WScript.Shell
+          $shortcut = $shell.CreateShortcut($start)
+          if ($shortcut.TargetPath -ne $exe) { throw 'Start-menu shortcut target is incorrect.' }
+          if ($shortcut.WorkingDirectory -ne $install) { throw 'Start-menu shortcut working directory is incorrect.' }
+          $settings = Join-Path $env:LOCALAPPDATA 'CodexInfo'
+          $sentinel = Join-Path $settings 'installer-preserve-sentinel.txt'
+          New-Item -ItemType Directory -Path $settings -Force | Out-Null
+          Set-Content -LiteralPath $sentinel -Value 'preserve'
+          if (-not (Test-Path $sentinel -PathType Leaf)) { throw 'Clean install did not preserve the settings sentinel.' }
+          Start-Process -FilePath $start
+          Start-Sleep -Seconds 5
+          $clientProcesses = Get-Process -Name 'CodexInfo.WindowsClient' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -eq $exe }
+          if (-not $clientProcesses) { throw 'Start-menu shortcut did not launch the installed client.' }
+          $clientProcesses | Stop-Process -Force
+          $uninstallProcess = Start-Process -FilePath $uninstaller.FullName -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+          if ($uninstallProcess.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstallProcess.ExitCode)" }
+          Start-Sleep -Seconds 4
+          if (Test-Path $install) { throw 'Install directory still exists after uninstall.' }
+          if (Test-Path $start) { throw 'Start-menu shortcut still exists after uninstall.' }
+          if (Test-Path $desktop) { throw 'Desktop shortcut still exists after uninstall.' }
+          if (Test-Path $key) { throw 'Per-user uninstall registration still exists.' }
+          if (-not (Test-Path $sentinel -PathType Leaf)) { throw 'Uninstall removed user settings.' }
+          Remove-Item -LiteralPath $sentinel -Force
+      - name: Run installed Windows UI Automation E2E
+        id: installed_ui_e2e
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
+          $installProcess = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+          if ($installProcess.ExitCode -ne 0) { throw "E2E fixture install failed with exit code $($installProcess.ExitCode)" }
+          $install = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
+          $exe = Join-Path $install 'CodexInfo.WindowsClient.exe'
+          if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing for UI E2E.' }
+          $e2eOutput = Join-Path $env:RUNNER_TEMP 'codex-info-windows-e2e'
+          try {
+            New-Item -ItemType Directory -Path $e2eOutput -Force | Out-Null
+            $moveSmokeLog = Join-Path $e2eOutput 'window-move-smoke.log'
+            & ./windows-client/tools/Run-WindowsClientE2E.ps1 -ClientPath $exe -OutputDirectory $e2eOutput -Fixture -SourceSha $env:SOURCE_SHA
+            if (-not $?) { throw 'Windows UI Automation E2E failed.' }
+            "source-sha: $env:SOURCE_SHA" | Set-Content -LiteralPath $moveSmokeLog -Encoding utf8
+            $moveSmokeOutput = @(& ./scripts/windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput *>&1)
+            $moveSmokeOutput | Tee-Object -FilePath $moveSmokeLog -Append
+            if ($moveSmokeOutput.Count -eq 0 -or [string]$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS') {
+              throw 'Physical window move smoke did not report its terminal PASS contract.'
+            }
+          }
+          finally {
+            $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $uninstaller) {
+              $uninstallProcess = Start-Process -FilePath $uninstaller.FullName -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+              if ($uninstallProcess.ExitCode -ne 0) { throw "E2E cleanup uninstall failed with exit code $($uninstallProcess.ExitCode)" }
+            }
+          }
+      - name: Enforce release publication gate
+        if: always() && inputs.release_candidate
+        shell: pwsh
+        run: |
+          $publish = '${{ job.status }}' -eq 'success'
+          $requiredSteps = @{
+            windows_unit_tests = '${{ steps.windows_unit_tests.outcome }}'
+            install_inno_setup = '${{ steps.install_inno_setup.outcome }}'
+            build_installer = '${{ steps.build_installer.outcome }}'
+            verify_installer = '${{ steps.verify_installer.outcome }}'
+            manifest = '${{ steps.manifest.outcome }}'
+            prepublication_bootstrap_transition = '${{ steps.prepublication_bootstrap_transition.outcome }}'
+            clean_install_smoke = '${{ steps.clean_install_smoke.outcome }}'
+            installed_ui_e2e = '${{ steps.installed_ui_e2e.outcome }}'
+          }
+          foreach ($step in $requiredSteps.GetEnumerator()) {
+            if ($step.Value -ne 'success') {
+              $publish = $false
+              Write-Host "publish=false: $($step.Key) outcome=$($step.Value)"
+            }
+          }
+          if (-not $publish) {
+            throw 'publish=false: release candidate evidence is failed, inconclusive, unexecuted, or unavailable.'
+          }
+          Write-Host 'publish=true'
       - name: Upload release candidate
         if: inputs.release_candidate
         uses: actions/upload-artifact@v4

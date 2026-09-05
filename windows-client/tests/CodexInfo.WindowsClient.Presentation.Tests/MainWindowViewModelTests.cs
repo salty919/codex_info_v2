@@ -330,8 +330,8 @@ public sealed class MainWindowViewModelTests
             await EventuallyAsync(() =>
                 update.IsAuthenticated &&
                 update.IsUpdateNotificationVisible &&
-                update.IsUpdateActionVisible);
-            AssertCtaRow(update, CtaRow.UpdateAvailable);
+                !update.IsUpdateActionVisible);
+            AssertCtaRow(update, CtaRow.UpdateStarted);
         }
 
         using (var ready = new MainWindowViewModel(new SequenceClient(
@@ -355,9 +355,9 @@ public sealed class MainWindowViewModelTests
         await EventuallyAsync(() =>
             update.IsAuthenticated &&
             update.IsUpdateNotificationVisible &&
-            update.IsUpdateActionVisible);
+            !update.IsUpdateActionVisible);
 
-        AssertCtaRow(update, CtaRow.UpdateAvailable);
+        AssertCtaRow(update, CtaRow.UpdateStarted);
     }
 
     [Fact]
@@ -1158,6 +1158,11 @@ public sealed class MainWindowViewModelTests
             Assert.True(viewModel.UpdateCommand!.CanExecute(null));
             Assert.Equal(LocalizationService.Current.UpdateButtonText, viewModel.UpdateButtonText);
         }
+        else if (row == CtaRow.UpdateStarted)
+        {
+            Assert.True(viewModel.IsUpdateNotificationVisible);
+            Assert.False(viewModel.IsUpdateActionVisible);
+        }
         else
         {
             Assert.False(viewModel.IsUpdateNotificationVisible);
@@ -1334,6 +1339,7 @@ public sealed class MainWindowViewModelTests
         AuthRequiredAfterLaunch,
         AuthLaunchFailure,
         UpdateAvailable,
+        UpdateStarted,
         ReadyWithoutUpdate,
     }
 

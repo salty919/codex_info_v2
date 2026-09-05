@@ -209,8 +209,10 @@ SSH/WSL childはshell、cmd、PowerShellを介さず、実行ファイルと個�
 ### 3.2 日常監視
 
 Mainを既定の到達先とし、保存済みselectorで次回自動再接続する。接続確認・poll・同一generationの
-自動再構築ごとにSetup/app確認を再表示しない。更新は明示ボタンとbounded自動更新を同じ状態機械で扱い、
-更新中の再クリック、重複要求、値の一時消去を禁止する。
+自動再構築ごとにSetup/app確認を再表示しない。通常起動はbackend接続・認証・details状態と独立して
+bounded自動更新を開始する。Mainの明示retry、通常起動、Windowを持たないlogon/hourly `--update-only`は
+同じ状態機械、resolver、排他lease、pending ownerを共有し、更新中の再クリック、重複Setup、値の一時消去を
+禁止する。background経路はWindowを前面化せず、focus/cursorを奪わない。
 
 Main、Graph、Threadsは同じstrict validation済み`/v1/details`一応答を一つのatomic rootとして置換する。
 SQLite、別poll、認証control応答でfieldを補完せず、quota/history/threadの再収集、
@@ -347,6 +349,9 @@ Setupの製品名と導入見出しを一つの文字列へ結合しない。`ap
   選択を転嫁しない。Settings/Helpは共通navigationからsecondaryに到達できる。
 - background failureはWindowを前面化せず、focus/cursorを奪わない。利用者がCTAを押した場合だけ
   action先へfocusを移す。
+- update failureはbackend failureと別の補助状態として扱い、Mainのlast-good値、設定、Linux履歴を消さない。
+  installed target generationを次processがread-backするまで成功表示にせず、Setup生存中はbusy、旧版のまま
+  終了した場合はfailed、10分を超えて生存する場合は強制終了や重複起動をせずSAFE_BLOCKEDとする。
 - app-wide supervisorはbootstrap/tunnel childを1つだけ所有し、child終了時にreapとlistener消失を確認する。
   同時tunnel=1、orphan tunnel=0、same-generation auto retry infinite=0。recorderはMain/app/tunnel終了後も
   独立ownerとして継続する。
