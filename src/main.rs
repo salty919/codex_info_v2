@@ -147,7 +147,6 @@ struct LocalUsageCandidate {
     admission: AccountAdmission,
     collector_epoch: u128,
     cycle_seq: u64,
-    bounded_source_rescan_complete: bool,
     session_checkpoints: Vec<usage_store::SessionCheckpoint>,
     session_ranges: Vec<usage_store::SessionRange>,
     session_model_totals: Vec<usage_store::SessionModelTotal>,
@@ -6544,7 +6543,6 @@ struct LocalUsageCollection {
     session_model_totals: Vec<usage_store::SessionModelTotal>,
     history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
     cleanup_plan: Option<SessionCleanupPlan>,
-    bounded_source_rescan_complete: bool,
 }
 
 fn apply_regression_recovery(
@@ -6763,7 +6761,6 @@ fn collect_local_usage_snapshot(
         session_model_totals: Vec::new(),
         history_continuity_recovery: None,
         cleanup_plan: cleanup_plan_for_inventory(inventory),
-        bounded_source_rescan_complete: inventory.overflow_session_files.is_empty(),
     })
 }
 
@@ -7360,7 +7357,6 @@ struct SessionAppendResult {
     range: Option<usage_store::SessionRange>,
     marker: Option<usage_store::RecordedSessionSource>,
     appended_bytes: u64,
-    caught_up: bool,
 }
 
 fn same_session_checkpoint_state(
@@ -7672,13 +7668,11 @@ fn collect_session_append(
         && checkpoint.committed_offset == candidate.recorded_source.file_bytes)
         .then(|| candidate.recorded_source.clone());
     let appended_bytes = end_offset.saturating_sub(start_offset);
-    let caught_up = end_offset == candidate.fingerprint.length;
     Ok(Some(SessionAppendResult {
         checkpoint,
         range,
         marker,
         appended_bytes,
-        caught_up,
     }))
 }
 
@@ -7766,12 +7760,9 @@ fn collect_incremental_local_usage(
     let mut changed_checkpoints = Vec::new();
     let mut ranges = Vec::new();
     let mut markers = Vec::new();
-    let mut processed_files = 0usize;
     let mut append_budget = SESSION_APPEND_BYTES_PER_CYCLE;
-    let mut caught_up = true;
     for candidate in &inventory.selected_session_files {
         if append_budget == 0 {
-            caught_up = false;
             break;
         }
         let inventory_key = session_inventory_key(candidate);
@@ -7811,16 +7802,9 @@ fn collect_incremental_local_usage(
         );
         let result = match result {
             Ok(Some(result)) => result,
-            Ok(None) | Err(_) => {
-                caught_up = false;
-                continue;
-            }
+            Ok(None) | Err(_) => continue,
         };
-        processed_files = processed_files.checked_add(1).ok_or_else(|| {
-            security::SecurityError::new(security::SecurityErrorKind::LimitExceeded)
-        })?;
         append_budget = append_budget.saturating_sub(result.appended_bytes);
-        caught_up &= result.caught_up;
         let checkpoint_changed =
             prior.is_none_or(|prior| !same_session_checkpoint_state(prior, &result.checkpoint));
         let duplicate_checkpoint = checkpoint_identity_counts
@@ -7836,9 +7820,6 @@ fn collect_incremental_local_usage(
             ranges.push(range);
         }
     }
-    let bounded_source_rescan_complete = inventory.overflow_session_files.is_empty()
-        && processed_files == inventory.selected_session_files.len()
-        && caught_up;
     let (history_samples, history_model_totals) =
         model_usage_timeline_with_models_from_events_with_initial(events, reset_at, initial_totals);
     Ok(LocalUsageCollection {
@@ -7851,7 +7832,6 @@ fn collect_incremental_local_usage(
         session_model_totals: totals.to_session_totals(),
         history_continuity_recovery: None,
         cleanup_plan: cleanup_plan_for_inventory(inventory),
-        bounded_source_rescan_complete,
     })
 }
 
@@ -8791,7 +8771,7 @@ impl LocalUsageCache {
             },
         };
         let current_inventory = session_inventory_keys(&verified_inventory);
-        let mut collection = collect_incremental_local_usage(
+        let collection = collect_incremental_local_usage(
             &verified_inventory,
             &collection_state,
             &previous_inventory,
@@ -8803,12 +8783,6 @@ impl LocalUsageCache {
                 cycle_seq,
             },
         )?;
-        // A changed inventory or an omitted overflow prefix means this cycle
-        // did not cover the complete bounded source. Keep that evidence local
-        // to the collection result; the recorder uses it only to authorize a
-        // quota-only source closure, never for session backfill rows.
-        collection.bounded_source_rescan_complete &=
-            inventories_match && inventory.overflow_session_files.is_empty();
         self.partitioned_collector_epoch = Some(collector_epoch);
         self.verified_session_inventory = current_inventory;
         Ok(collection)
@@ -9009,8 +8983,6 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                             admission,
                             collector_epoch,
                             cycle_seq,
-                            bounded_source_rescan_complete: collection
-                                .bounded_source_rescan_complete,
                             session_checkpoints: collection.session_checkpoints,
                             session_ranges: collection.session_ranges,
                             session_model_totals: collection.session_model_totals,
@@ -9177,7 +9149,7 @@ struct PendingRecorderBatch {
     partition_id: Option<String>,
     collector_epoch: Option<u128>,
     cycle_seq: Option<u64>,
-    bounded_source_rescan_complete: bool,
+    quota_source_rescan_complete: bool,
     samples: Vec<usage_store::UsageHistorySample>,
     observations: Vec<usage_store::UsageHistoryObservation>,
     recorded_sessions: Vec<usage_store::RecordedSessionSource>,
@@ -9210,7 +9182,7 @@ impl PendingRecorderBatch {
             && self.session_model_totals.is_empty()
             && self.collector_epoch.is_none()
             && self.cycle_seq.is_none()
-            && !self.bounded_source_rescan_complete
+            && !self.quota_source_rescan_complete
             && self.cleanup_plans.is_empty()
     }
 }
@@ -9257,7 +9229,7 @@ struct CodexInfoState {
     pending_session_period: Option<(i64, i64)>,
     pending_recorder_admission: Option<(u64, AccountAdmission)>,
     pending_session_cleanup: Vec<SessionCleanupPlan>,
-    pending_bounded_source_rescan_complete: bool,
+    pending_quota_source_rescan_complete: bool,
     selected_reset_at: Option<i64>,
     selected_history_period: String,
     selected_metric: String,
@@ -9836,7 +9808,7 @@ impl CodexInfoState {
             pending_session_period: None,
             pending_recorder_admission: None,
             pending_session_cleanup: Vec::new(),
-            pending_bounded_source_rescan_complete: false,
+            pending_quota_source_rescan_complete: false,
             selected_reset_at: None,
             selected_history_period: "履歴なし".into(),
             selected_metric: "ドル".into(),
@@ -9908,7 +9880,7 @@ impl CodexInfoState {
             pending_session_period: None,
             pending_recorder_admission: None,
             pending_session_cleanup: Vec::new(),
-            pending_bounded_source_rescan_complete: false,
+            pending_quota_source_rescan_complete: false,
             selected_reset_at: None,
             selected_history_period: "履歴なし".into(),
             selected_metric: "ドル".into(),
@@ -9984,7 +9956,7 @@ impl CodexInfoState {
             pending_session_period: None,
             pending_recorder_admission: None,
             pending_session_cleanup: Vec::new(),
-            pending_bounded_source_rescan_complete: false,
+            pending_quota_source_rescan_complete: false,
             model_usage,
             active_threads: vec![ActiveThread {
                 id: "preview-thread".into(),
@@ -10959,15 +10931,15 @@ impl CodexInfoState {
         let period = self.pending_session_period.take();
         let collector = self.pending_collector_generation.take();
         let recorder_admission = self.pending_recorder_admission.take();
-        let bounded_source_rescan_complete =
-            std::mem::take(&mut self.pending_bounded_source_rescan_complete);
+        let quota_source_rescan_complete =
+            std::mem::take(&mut self.pending_quota_source_rescan_complete);
         PendingRecorderBatch {
             auth_epoch: recorder_admission.as_ref().map(|value| value.0),
             admission: recorder_admission.as_ref().map(|value| value.1.clone()),
             partition_id: recorder_admission.map(|value| value.1.partition_id),
             collector_epoch: collector.map(|value| value.0),
             cycle_seq: collector.map(|value| value.1),
-            bounded_source_rescan_complete,
+            quota_source_rescan_complete,
             samples: self.history.take_pending_store_samples(),
             observations: self.history.take_pending_store_observations(),
             recorded_sessions: std::mem::take(&mut self.pending_recorded_sessions),
@@ -10992,7 +10964,7 @@ impl CodexInfoState {
             || self.pending_collector_generation.is_some()
             || self.pending_session_period.is_some()
             || self.pending_recorder_admission.is_some()
-            || self.pending_bounded_source_rescan_complete
+            || self.pending_quota_source_rescan_complete
             || !self.pending_session_cleanup.is_empty()
     }
 
@@ -11030,7 +11002,7 @@ impl CodexInfoState {
             self.pending_history_continuity_recovery = batch.history_continuity_recovery;
         }
         self.pending_collector_generation = batch.collector_epoch.zip(batch.cycle_seq);
-        self.pending_bounded_source_rescan_complete = batch.bounded_source_rescan_complete;
+        self.pending_quota_source_rescan_complete = batch.quota_source_rescan_complete;
         self.pending_session_period = batch.reset_at.zip(batch.window_seconds);
         batch
             .cleanup_plans
@@ -11047,7 +11019,7 @@ impl CodexInfoState {
         self.pending_session_model_totals.clear();
         self.pending_history_continuity_recovery = None;
         self.pending_collector_generation = None;
-        self.pending_bounded_source_rescan_complete = false;
+        self.pending_quota_source_rescan_complete = false;
         self.pending_session_period = None;
         self.pending_recorder_admission = None;
         self.pending_session_cleanup.clear();
@@ -11601,7 +11573,9 @@ impl CodexInfoState {
         self.pending_session_checkpoints = candidate.session_checkpoints;
         self.pending_session_ranges = candidate.session_ranges;
         self.pending_session_model_totals = candidate.session_model_totals;
-        self.pending_bounded_source_rescan_complete = candidate.bounded_source_rescan_complete;
+        self.pending_quota_source_rescan_complete = self.account_error.is_none()
+            && self.remaining_percent.is_some()
+            && self.last_success_at.is_some();
         self.pending_collector_generation = Some((candidate.collector_epoch, candidate.cycle_seq));
         self.pending_session_period =
             Some((candidate.result.reset_at, candidate.result.window_seconds));
@@ -11708,7 +11682,7 @@ impl CodexInfoState {
         self.pending_collector_generation = Some((collector_epoch, cycle_seq));
         self.pending_session_period = Some((reset_at, window_seconds));
         self.pending_session_model_totals = durable_model_totals;
-        self.pending_bounded_source_rescan_complete = false;
+        self.pending_quota_source_rescan_complete = true;
         self.refresh_partial_failure_status();
     }
 
@@ -15743,7 +15717,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                 partition_id,
                                 collector_epoch,
                                 cycle_seq,
-                                bounded_source_rescan_complete,
+                                quota_source_rescan_complete,
                                 samples,
                                 observations,
                                 recorded_sessions,
@@ -15841,7 +15815,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                         session_ranges,
                                         session_model_totals,
                                         history_continuity_recovery,
-                                        bounded_source_rescan_complete,
+                                        quota_source_rescan_complete,
                                     },
                                 ) {
                                     Ok(ack) => ack,
@@ -18381,7 +18355,6 @@ mod tests {
             session_checkpoints: vec![checkpoint.clone()],
             session_ranges: vec![range.clone()],
             session_model_totals: normal.to_session_totals(),
-            bounded_source_rescan_complete: true,
             ..super::LocalUsageCollection::default()
         };
 
@@ -18392,7 +18365,6 @@ mod tests {
         assert_eq!(collection.model_usage, recovered);
         assert_eq!(collection.session_checkpoints, [checkpoint]);
         assert_eq!(collection.session_ranges, [range]);
-        assert!(collection.bounded_source_rescan_complete);
         let expected_costs = collection.model_usage.dollar_totals();
         let expected_tokens = collection.model_usage.token_totals();
         let sample = &collection.history_samples[0];
@@ -19145,7 +19117,6 @@ mod tests {
         state.pending_session_model_totals = totals.to_session_totals();
         state.pending_collector_generation = Some((0x138, 1));
         state.pending_session_period = Some((reset_at, WEEK_SECONDS));
-        state.pending_bounded_source_rescan_complete = true;
         state.pending_recorder_admission =
             Some((state.auth_epoch, state.current_account_admission().unwrap()));
         state.apply_local_usage_success(LocalUsageResult {
@@ -19430,7 +19401,6 @@ mod tests {
             admission: admission.clone(),
             collector_epoch: 0x129,
             cycle_seq: 1,
-            bounded_source_rescan_complete: false,
             session_checkpoints: vec![checkpoint],
             session_ranges: vec![range],
             session_model_totals: vec![super::usage_store::SessionModelTotal {
@@ -19608,7 +19578,7 @@ mod tests {
         assert_eq!(pending.reset_at, Some(reset_at));
         assert_eq!(pending.window_seconds, Some(WEEK_SECONDS));
         assert_eq!(pending.session_model_totals, durable_model_totals);
-        assert!(!pending.bounded_source_rescan_complete);
+        assert!(pending.quota_source_rescan_complete);
         assert!(pending.samples.is_empty());
         assert_eq!(pending.observations, vec![expected_observation]);
     }
@@ -19649,6 +19619,7 @@ mod tests {
             true,
             |_, pending| {
                 attempts.set(attempts.get() + 1);
+                assert!(pending.quota_source_rescan_complete);
                 assert!(pending.samples.is_empty());
                 assert_eq!(pending.observations, pending_before);
                 assert_eq!(pending.session_model_totals.len(), 1);
@@ -19674,6 +19645,7 @@ mod tests {
             true,
             |state, pending| {
                 attempts.set(attempts.get() + 1);
+                assert!(pending.quota_source_rescan_complete);
                 assert!(pending.samples.is_empty());
                 assert_eq!(pending.observations, pending_before);
                 assert_eq!(pending.session_model_totals.len(), 1);
