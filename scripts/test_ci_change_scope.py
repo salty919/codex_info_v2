@@ -163,6 +163,56 @@ class SelectionTests(unittest.TestCase):
                     quality_profile="history-graph",
                 )
 
+    def test_model_history_profile_maps_issue160_complete_diff_to_all_owners(self) -> None:
+        result = selection_for_paths(
+            [
+                "docs/DATA_PROTECTION_POLICY.md",
+                "docs/PRODUCT_REQUIREMENTS.md",
+                "docs/REQUIREMENTS_LEDGER.md",
+                "docs/REST_API_V1.md",
+                "docs/WINDOWS_CLIENT.md",
+                "docs/WINDOWS_CLIENT_REQUIREMENTS.md",
+                "docs/WINDOWS_UX_SPEC.md",
+                "src/daemon.rs",
+                "src/main.rs",
+                "src/server.rs",
+                "src/usage_store.rs",
+                "ui/app.slint",
+                "ui/components.slint",
+                "ui/theme.slint",
+                "windows-client/src/CodexInfo.WindowsClient.Core/DetailsContracts.cs",
+                "windows-client/src/CodexInfo.WindowsClient.Core/LoopbackStatusClient.cs",
+                "windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs",
+                "windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml",
+                "windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs",
+                "windows-client/src/CodexInfo.WindowsClient/Graphing/GraphScene.cs",
+                "windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml",
+                "windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs",
+                "windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs",
+                "windows-client/src/CodexInfo.WindowsClient/ViewModels/ModelUsageViewModel.cs",
+                "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackBoundaryCoverageTests.cs",
+                "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackStatusClientTests.cs",
+                "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs",
+            ],
+            quality_profile="model-history",
+        )
+        self.assertEqual(
+            result.owners, ("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS")
+        )
+        self.assertEqual(result.codeql_languages, ("csharp", "rust"))
+        self.assertTrue(result.binary_impact)
+        self.assertFalse(result.distribution_required)
+        self.assertEqual(result.quality_profile, "model-history")
+
+    def test_model_history_profile_has_finite_path_boundaries(self) -> None:
+        for paths in (
+            ["src/main.rs", "src/account_scope.rs"],
+            ["src/server.rs", "tests/fixtures/graph_delayed_quota.json"],
+            ["src/server.rs", ".github/workflows/rust.yml"],
+        ):
+            with self.subTest(paths=paths), self.assertRaises(ScopeError):
+                selection_for_paths(paths, quality_profile="model-history")
+
     def test_release_candidate_linux_selection_adds_windows_without_unchanged_csharp(self) -> None:
         result = selection_for_paths(
             ["src/server.rs"], release_candidate=True
@@ -252,6 +302,10 @@ class SelectionTests(unittest.TestCase):
                 "Quality-Profile: workflow-selection\n"
             ),
             "workflow-selection",
+        )
+        self.assertEqual(
+            quality_profile_from_document("Quality-Profile: model-history\n"),
+            "model-history",
         )
         for body in (
             "Quality-Profile: history-graph\nQuality-Profile: history-graph\n",
@@ -346,6 +400,69 @@ class CliTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["quality_profile"], "history-graph")
+
+    def test_profile_document_accepts_the_issue160_complete_diff(self) -> None:
+        classifier = Path(__file__).with_name("ci_change_scope.py")
+        paths = (
+            "docs/DATA_PROTECTION_POLICY.md",
+            "docs/PRODUCT_REQUIREMENTS.md",
+            "docs/REQUIREMENTS_LEDGER.md",
+            "docs/REST_API_V1.md",
+            "docs/WINDOWS_CLIENT.md",
+            "docs/WINDOWS_CLIENT_REQUIREMENTS.md",
+            "docs/WINDOWS_UX_SPEC.md",
+            "src/daemon.rs",
+            "src/main.rs",
+            "src/server.rs",
+            "src/usage_store.rs",
+            "ui/app.slint",
+            "ui/components.slint",
+            "ui/theme.slint",
+            "windows-client/src/CodexInfo.WindowsClient.Core/DetailsContracts.cs",
+            "windows-client/src/CodexInfo.WindowsClient.Core/LoopbackStatusClient.cs",
+            "windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs",
+            "windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml",
+            "windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs",
+            "windows-client/src/CodexInfo.WindowsClient/Graphing/GraphScene.cs",
+            "windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml",
+            "windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs",
+            "windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs",
+            "windows-client/src/CodexInfo.WindowsClient/ViewModels/ModelUsageViewModel.cs",
+            "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackBoundaryCoverageTests.cs",
+            "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackStatusClientTests.cs",
+            "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs",
+        )
+        with tempfile.TemporaryDirectory() as raw_root:
+            name_status = Path(raw_root) / "changed-paths.z"
+            profile = Path(raw_root) / "pr-body.txt"
+            name_status.write_bytes(
+                b"".join(b"M\0" + path.encode("utf-8") + b"\0" for path in paths)
+            )
+            profile.write_text("Quality-Profile: model-history\n", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(classifier),
+                    "--name-status",
+                    str(name_status),
+                    "--profile-document",
+                    str(profile),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "binary_impact": True,
+                "codeql_languages": ["csharp", "rust"],
+                "distribution_required": False,
+                "owners": ["DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"],
+                "quality_profile": "model-history",
+            },
+        )
 
 
 if __name__ == "__main__":

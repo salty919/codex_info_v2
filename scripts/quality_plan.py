@@ -30,6 +30,12 @@ HISTORY_GRAPH_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
     "LINUX_UI": ("requirements-authority", "linux-ui-history-graph"),
     "WINDOWS": ("requirements-authority", "windows-history-graph"),
 }
+MODEL_HISTORY_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
+    "DOCS": ("requirements-authority",),
+    "LINUX_BACKEND": ("requirements-authority", "rust-model-history"),
+    "LINUX_UI": ("requirements-authority", "linux-ui-model-history"),
+    "WINDOWS": ("requirements-authority", "windows-model-history"),
+}
 WORKFLOW_SELECTION_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
     "DOCS": ("requirements-authority",),
     "GOVERNANCE": ("requirements-authority", "governance-workflow-selection"),
@@ -39,6 +45,7 @@ ALL_CHECK_IDS = frozenset(
     for mapping in (
         OWNER_CHECKS,
         HISTORY_GRAPH_OWNER_CHECKS,
+        MODEL_HISTORY_OWNER_CHECKS,
         WORKFLOW_SELECTION_OWNER_CHECKS,
     )
     for checks in mapping.values()
@@ -119,6 +126,7 @@ def plan_for_paths(
     seen: set[str] = set()
     owner_checks = {
         "history-graph": HISTORY_GRAPH_OWNER_CHECKS,
+        "model-history": MODEL_HISTORY_OWNER_CHECKS,
         "workflow-selection": WORKFLOW_SELECTION_OWNER_CHECKS,
     }.get(selection.quality_profile, OWNER_CHECKS)
     for owner in selection.owners:

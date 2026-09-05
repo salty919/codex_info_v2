@@ -61,6 +61,7 @@ class SelectedQualityTests(unittest.TestCase):
             (("WINDOWS",), False, (), "history-graph"),
             (("WINDOWS",), True, ("csharp",), "history-graph"),
             (("DOCS", "LINUX_BACKEND", "WINDOWS"), True, ("csharp", "rust"), "history-graph"),
+            (("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"), True, ("csharp", "rust"), "model-history"),
         )
         for owners, binary_impact, languages, quality_profile in cases:
             with self.subTest(
@@ -78,6 +79,37 @@ class SelectedQualityTests(unittest.TestCase):
                             owners,
                             binary_impact=binary_impact,
                             languages=languages,
+                        )
+                    ),
+                )
+
+    def test_model_history_rejects_unrelated_jobs_and_distribution(self) -> None:
+        cases = (
+            (("LINUX_BACKEND", "LINUX_UI", "WINDOWS"), ("csharp", "rust"), False),
+            (("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"), ("actions", "csharp", "rust"), False),
+            (("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"), ("csharp", "rust"), True),
+            (("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"), (), False),
+        )
+        for owners, languages, distribution_required in cases:
+            with self.subTest(
+                owners=owners,
+                languages=languages,
+                distribution_required=distribution_required,
+            ), self.assertRaises(QualitySelectionError):
+                validate(
+                    selection(
+                        owners,
+                        binary_impact=True,
+                        languages=languages,
+                        distribution_required=distribution_required,
+                        quality_profile="model-history",
+                    ),
+                    json.dumps(
+                        successful_results(
+                            owners,
+                            binary_impact=True,
+                            languages=languages,
+                            distribution_required=distribution_required,
                         )
                     ),
                 )

@@ -83,6 +83,7 @@ LEGAL_SHARED_EXACT = frozenset(
 )
 PRODUCT_OWNERS = frozenset({"LINUX_BACKEND", "LINUX_UI", "WINDOWS"})
 HISTORY_GRAPH_PROFILE = "history-graph"
+MODEL_HISTORY_PROFILE = "model-history"
 WORKFLOW_SELECTION_PROFILE = "workflow-selection"
 HISTORY_GRAPH_PATHS = frozenset(
     {
@@ -124,6 +125,42 @@ WORKFLOW_SELECTION_PATHS = frozenset(
         "scripts/workflow_quality_gate.py",
     }
 )
+MODEL_HISTORY_PATHS = frozenset(
+    {
+        "docs/DATA_PROTECTION_POLICY.md",
+        "docs/PRODUCT_REQUIREMENTS.md",
+        "docs/REQUIREMENTS_LEDGER.md",
+        "docs/REST_API_V1.md",
+        "docs/WINDOWS_CLIENT.md",
+        "docs/WINDOWS_CLIENT_REQUIREMENTS.md",
+        "docs/WINDOWS_UX_SPEC.md",
+        "src/daemon.rs",
+        "src/main.rs",
+        "src/server.rs",
+        "src/usage_store.rs",
+        "ui/app.slint",
+        "ui/components.slint",
+        "ui/theme.slint",
+        "windows-client/src/CodexInfo.WindowsClient.Core/DetailsContracts.cs",
+        "windows-client/src/CodexInfo.WindowsClient.Core/LoopbackStatusClient.cs",
+        "windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs",
+        "windows-client/src/CodexInfo.WindowsClient/GraphWindow.axaml",
+        "windows-client/src/CodexInfo.WindowsClient/Graphing/GraphPlotProjection.cs",
+        "windows-client/src/CodexInfo.WindowsClient/Graphing/GraphScene.cs",
+        "windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml",
+        "windows-client/src/CodexInfo.WindowsClient/ViewModels/DetailsWindowViewModels.cs",
+        "windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs",
+        "windows-client/src/CodexInfo.WindowsClient/ViewModels/ModelUsageViewModel.cs",
+        "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackBoundaryCoverageTests.cs",
+        "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackStatusClientTests.cs",
+        "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs",
+    }
+)
+PROFILE_PATHS = {
+    HISTORY_GRAPH_PROFILE: HISTORY_GRAPH_PATHS,
+    MODEL_HISTORY_PROFILE: MODEL_HISTORY_PATHS,
+    WORKFLOW_SELECTION_PROFILE: WORKFLOW_SELECTION_PATHS,
+}
 PROFILE_LINE_RE = re.compile(r"^Quality-Profile:[ \t]*([a-z0-9]+(?:-[a-z0-9]+)*)[ \t]*$")
 
 
@@ -262,7 +299,7 @@ def quality_profile_from_document(text: str) -> str | None:
     if not declarations:
         return None
     profile = declarations[0]
-    if profile not in {HISTORY_GRAPH_PROFILE, WORKFLOW_SELECTION_PROFILE}:
+    if profile not in PROFILE_PATHS:
         raise ScopeError(f"Quality-Profile is unknown: {profile}")
     return profile
 
@@ -293,15 +330,22 @@ def _resolve_quality_profile(
         return "authority-only", False
     if quality_profile is None:
         raise ScopeError("feat product diff requires one finite Quality-Profile")
-    if quality_profile not in {HISTORY_GRAPH_PROFILE, WORKFLOW_SELECTION_PROFILE}:
+    if quality_profile not in PROFILE_PATHS:
         raise ScopeError(f"Quality-Profile is unknown: {quality_profile}")
-    expected_paths = (
-        HISTORY_GRAPH_PATHS
-        if quality_profile == HISTORY_GRAPH_PROFILE
-        else WORKFLOW_SELECTION_PATHS
-    )
+    expected_paths = PROFILE_PATHS[quality_profile]
     if quality_profile == HISTORY_GRAPH_PROFILE and not product_change:
         raise ScopeError("history-graph profile has no product path")
+    if quality_profile == MODEL_HISTORY_PROFILE and not product_change:
+        raise ScopeError("model-history profile has no product path")
+    if quality_profile == MODEL_HISTORY_PROFILE and owners != {
+        "DOCS",
+        "LINUX_BACKEND",
+        "LINUX_UI",
+        "WINDOWS",
+    }:
+        raise ScopeError(
+            "model-history profile requires DOCS, LINUX_BACKEND, LINUX_UI, and WINDOWS"
+        )
     if quality_profile == WORKFLOW_SELECTION_PROFILE and product_change:
         raise ScopeError("workflow-selection profile cannot own product code")
     outside = sorted(set(paths) - expected_paths)
