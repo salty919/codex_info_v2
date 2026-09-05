@@ -7735,7 +7735,8 @@ mod tests {
             UsageHistoryObservation::unavailable(old_timestamp, 1_700_604_800, Some(90.0));
         let new_observation =
             UsageHistoryObservation::unavailable(new_timestamp, 1_700_604_800, Some(80.0));
-        let mut store = UsageStore::open(&path).unwrap();
+        let identity = partition_identity('a', 1);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
         store.upsert_samples(&[old, retained.clone()]).unwrap();
         let durable = store
             .commit_durable_state(&[], "0".repeat(64), r#"{"kind":"row-one"}"#)
@@ -7790,7 +7791,8 @@ mod tests {
         let newer = sample(cutoff + 1, 1_701_814_400, Some(30.0), 3.0);
         let future = sample(now.timestamp() + 1, 1_701_814_400, Some(40.0), 4.0);
 
-        let mut store = UsageStore::open(&path).unwrap();
+        let identity = partition_identity('a', 1);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
         store
             .upsert_samples(&[
                 old,
@@ -7814,7 +7816,7 @@ mod tests {
 
         // Reopening must not perform another implicit destructive operation.
         drop(store);
-        let mut reopened = UsageStore::open(&path).unwrap();
+        let mut reopened = UsageStore::open_partitioned(&path, &identity).unwrap();
         assert_eq!(
             reopened.load_all().unwrap(),
             vec![boundary, boundary_other_period, newer, future]

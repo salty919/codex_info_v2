@@ -567,11 +567,12 @@ public sealed class GraphPlotControlTests
 
         var lines = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
 
-        Assert.Empty(lines.Flat.X);
+        Assert.Equal([1_060d, 3_600d], lines.Flat.X);
+        Assert.Equal([1d, 1d], lines.Flat.Y);
         Assert.Equal([1_000d, 1_060d, double.NaN, 3_600d, 3_660d], lines.Rising.X);
         Assert.Equal([0d, 1d, double.NaN, 1d, 2d], lines.Rising.Y);
-        Assert.Equal([1_060d, 3_600d], lines.Dashed.X);
-        Assert.Equal([1d, 1d], lines.Dashed.Y);
+        Assert.Empty(lines.Dashed.X);
+        Assert.Empty(lines.Dashed.Y);
     }
 
     [Fact]
@@ -1273,8 +1274,8 @@ public sealed class GraphPlotControlTests
         var terminalLines = GraphPlotProjection.BuildRemainingLines(terminalScene);
 
         Assert.Equal(90d, terminalEffective[^1]);
-        Assert.Equal([1_120d, 1_180d], terminalLines.Dashed.X);
-        Assert.Equal([90d, 90d], terminalLines.Dashed.Y);
+        Assert.Equal([1_000d, 1_060d, double.NaN, 1_120d, 1_180d], terminalLines.Dashed.X);
+        Assert.Equal([100d, 90d, double.NaN, 90d, 90d], terminalLines.Dashed.Y);
     }
 
     [Fact]
