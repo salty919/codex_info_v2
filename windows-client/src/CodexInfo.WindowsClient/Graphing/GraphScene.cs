@@ -34,6 +34,8 @@ public sealed class GraphScene
         double[] sol,
         double[] terra,
         double[] luna,
+        double[] astra,
+        IReadOnlyDictionary<string, IReadOnlyList<double>> modelSeries,
         bool[] modelVectorAvailable,
         bool[] remainingObserved,
         double[] observedRemainingValues,
@@ -50,6 +52,8 @@ public sealed class GraphScene
         Sol = sol;
         Terra = terra;
         Luna = luna;
+        Astra = astra;
+        ModelSeries = modelSeries;
         ModelVectorAvailable = modelVectorAvailable;
         RemainingObserved = remainingObserved;
         ObservedRemainingValues = observedRemainingValues;
@@ -74,6 +78,15 @@ public sealed class GraphScene
     public IReadOnlyList<double> Terra { get; }
 
     public IReadOnlyList<double> Luna { get; }
+
+    /// <summary>The explicit ASTRA series from the accepted v3 model rows.</summary>
+    public IReadOnlyList<double> Astra { get; }
+
+    /// <summary>
+    /// Generic model series keyed by the server-provided model identifier.
+    /// Missing values are represented by NaN and are never replaced with zero.
+    /// </summary>
+    public IReadOnlyDictionary<string, IReadOnlyList<double>> ModelSeries { get; }
 
     /// <summary>
     /// Indicates whether the complete cumulative model vector at each sample
@@ -100,7 +113,7 @@ public sealed class GraphScene
     public bool HasPoints => Timestamps.Count > 0;
 
     public static GraphScene Empty(GraphMetric metric = GraphMetric.Dollars) =>
-        new(0, 1, metric, [], [], [], [], [], [], [], [], [], [], [], 1);
+        new(0, 1, metric, [], [], [], [], [], [], new Dictionary<string, IReadOnlyList<double>>(StringComparer.Ordinal), [], [], [], [], [], [], 1);
 
     public static GraphScene Create(
         IReadOnlyList<ApiHistorySample> samples,
@@ -134,15 +147,19 @@ public sealed class GraphScene
                 .Where(gap => gap.EndAt > gap.StartAt)
                 .OrderBy(gap => gap.StartAt)
                 .ToArray();
+        var modelNames = samples
+            .SelectMany(sample => sample.Models.Select(model => model.Name))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var modelSeriesValues = modelNames.ToDictionary(
+            name => name,
+            _ => new List<double>(samples.Count),
+            StringComparer.Ordinal);
         var points = new ScenePoint[samples.Count];
-        var previousSol = 0d;
-        var previousTerra = 0d;
-        var previousLuna = 0d;
         var hasTrustedVector = false;
         var hasObservedVector = false;
-        var previousObservedSol = 0d;
-        var previousObservedTerra = 0d;
-        var previousObservedLuna = 0d;
+        var previousTrustedModels = new Dictionary<string, double>(StringComparer.Ordinal);
+        var previousObservedModels = new Dictionary<string, double>(StringComparer.Ordinal);
         var modelVectorAvailable = new bool[samples.Count];
         var remainingObserved = new bool[samples.Count];
         long? previousTimestamp = null;
@@ -155,67 +172,78 @@ public sealed class GraphScene
             }
 
             previousTimestamp = sample.Timestamp;
-            var rawSol = metric == GraphMetric.Dollars
-                ? sample.SolDollars
-                : sample.SolTokens is ulong solTokens ? solTokens : null;
-            var rawTerra = metric == GraphMetric.Dollars
-                ? sample.TerraDollars
-                : sample.TerraTokens is ulong terraTokens ? terraTokens : null;
-            var rawLuna = metric == GraphMetric.Dollars
-                ? sample.LunaDollars
-                : sample.LunaTokens is ulong lunaTokens ? lunaTokens : null;
-            var currentSol = FiniteNonNegative(rawSol);
-            var currentTerra = FiniteNonNegative(rawTerra);
-            var currentLuna = FiniteNonNegative(rawLuna);
-            var completeVector = double.IsFinite(currentSol) &&
-                double.IsFinite(currentTerra) &&
-                double.IsFinite(currentLuna);
-            var sourceConfirmed = sample.ModelSource == ApiHistorySample.ConfirmedModelSource;
+            var modelRows = sample.Models.ToDictionary(model => model.Name, StringComparer.Ordinal);
+            var currentModels = modelNames
+                .Select(name => modelRows.TryGetValue(name, out var model)
+                    ? ModelValue(model, metric)
+                    : double.NaN)
+                .ToArray();
+            var completeVector = currentModels.Length > 0 && currentModels.All(double.IsFinite);
+            var sourceConfirmed = sample.ModelSource == ApiHistorySample.ConfirmedModelSource &&
+                sample.ModelsComplete;
             var vectorRegressed = hasObservedVector && completeVector &&
-                (currentSol < previousObservedSol ||
-                 currentTerra < previousObservedTerra ||
-                 currentLuna < previousObservedLuna);
+                modelNames.Zip(currentModels, (name, value) =>
+                    previousObservedModels.TryGetValue(name, out var previous) && value < previous)
+                .Any(regressed => regressed);
             var vectorRecovered = sourceConfirmed && completeVector &&
-                (!hasTrustedVector ||
-                 (currentSol >= previousSol &&
-                  currentTerra >= previousTerra &&
-                  currentLuna >= previousLuna));
+                (!hasTrustedVector || modelNames.All(name =>
+                    !previousTrustedModels.TryGetValue(name, out var previous) ||
+                    currentModels[Array.IndexOf(modelNames, name)] >= previous));
             if (vectorRecovered)
             {
-                previousSol = currentSol;
-                previousTerra = currentTerra;
-                previousLuna = currentLuna;
+                previousTrustedModels.Clear();
+                for (var modelIndex = 0; modelIndex < modelNames.Length; modelIndex++)
+                {
+                    previousTrustedModels[modelNames[modelIndex]] = currentModels[modelIndex];
+                }
                 hasTrustedVector = true;
                 modelVectorAvailable[index] = true;
             }
             else if (!sourceConfirmed &&
                      sample.ModelSource != ApiHistorySample.UnavailableModelSource &&
-                     completeVector &&
+                     currentModels.Any(double.IsFinite) &&
                      !vectorRegressed)
             {
-                // Legacy rows have complete numeric values, but their origin
-                // is not recorder-confirmed. Retain them for a dashed
-                // reference path without allowing them to establish a
-                // trusted baseline or a solid quota attribution.
+                // The set is incomplete, but each present model row is still
+                // an exact observation. Missing models remain NaN rather than
+                // becoming synthetic zeroes. Set completeness is retained
+                // separately for quota attribution.
+            }
+            if (sample.ModelSource == ApiHistorySample.UnavailableModelSource)
+            {
+                Array.Fill(currentModels, double.NaN);
             }
             else
             {
-                // Keep the last trusted vector only as a recovery threshold;
-                // never synthesize a partially repaired row from its maxima.
-                currentSol = double.NaN;
-                currentTerra = double.NaN;
-                currentLuna = double.NaN;
+                for (var modelIndex = 0; modelIndex < modelNames.Length; modelIndex++)
+                {
+                    var value = currentModels[modelIndex];
+                    if (!double.IsFinite(value))
+                    {
+                        continue;
+                    }
+                    var name = modelNames[modelIndex];
+                    if (previousObservedModels.TryGetValue(name, out var priorValue) && value < priorValue)
+                    {
+                        // A cumulative model can never fall within one period.
+                        // Hide only the regressed model; a peer model's exact
+                        // row must not disappear with the whole vector.
+                        currentModels[modelIndex] = double.NaN;
+                        continue;
+                    }
+                    previousObservedModels[name] = value;
+                }
+                hasObservedVector = previousObservedModels.Count > 0;
             }
-            var modelDataAvailable = double.IsFinite(currentSol) &&
-                double.IsFinite(currentTerra) &&
-                double.IsFinite(currentLuna);
-            if (modelDataAvailable)
+            for (var modelIndex = 0; modelIndex < modelNames.Length; modelIndex++)
             {
-                previousObservedSol = currentSol;
-                previousObservedTerra = currentTerra;
-                previousObservedLuna = currentLuna;
-                hasObservedVector = true;
+                modelSeriesValues[modelNames[modelIndex]].Add(currentModels[modelIndex]);
             }
+            var currentSol = ModelValue(modelNames, currentModels, "SOL");
+            var currentTerra = ModelValue(modelNames, currentModels, "TERRA");
+            var currentLuna = ModelValue(modelNames, currentModels, "LUNA");
+            var currentAstra = ModelValue(modelNames, currentModels, "ASTRA");
+            var modelDataAvailable = currentModels.Length > 0 && currentModels.All(double.IsFinite);
             remainingObserved[index] = sample.RemainingPercent is { } observedQuota &&
                 double.IsFinite(observedQuota);
             points[index] = new ScenePoint(
@@ -224,6 +252,7 @@ public sealed class GraphScene
                 currentSol,
                 currentTerra,
                 currentLuna,
+                currentAstra,
                 modelVectorAvailable[index],
                 modelDataAvailable);
         }
@@ -251,12 +280,18 @@ public sealed class GraphScene
         var sol = points.Select(point => point.Sol).ToArray();
         var terra = points.Select(point => point.Terra).ToArray();
         var luna = points.Select(point => point.Luna).ToArray();
+        var astra = points.Select(point => point.Astra).ToArray();
         var maximum = Math.Max(
             1,
-            points.SelectMany(point => new[] { point.Sol, point.Terra, point.Luna })
+            modelSeriesValues.Values
+                .SelectMany(values => values)
                 .Where(double.IsFinite)
                 .DefaultIfEmpty(0)
                 .Max());
+        var modelSeries = modelSeriesValues.ToDictionary(
+            pair => pair.Key,
+            pair => (IReadOnlyList<double>)pair.Value.ToArray(),
+            StringComparer.Ordinal);
         return new GraphScene(
             start,
             end,
@@ -266,12 +301,14 @@ public sealed class GraphScene
             sol,
             terra,
             luna,
+            astra,
+            modelSeries,
             modelVectorAvailable,
             remainingObserved,
             observedRemainingValues,
             remainingInterpolated,
             normalizedGaps,
-            BuildIdleIntervals(points, start, end, normalizedGaps),
+            BuildIdleIntervals(points, start, end, modelSeriesValues.Values),
             maximum);
     }
 
@@ -470,7 +507,7 @@ public sealed class GraphScene
         IReadOnlyList<ScenePoint> points,
         long periodStart,
         long periodEnd,
-        IReadOnlyList<GraphConfirmedGap>? confirmedGaps = null)
+        IEnumerable<IReadOnlyList<double>> modelSeries)
     {
         var intervals = new List<GraphIdleInterval>();
         if (periodEnd <= periodStart)
@@ -494,21 +531,15 @@ public sealed class GraphScene
                 continue;
             }
 
-            var unobservedGap = after.Timestamp - before.Timestamp > 60;
-            var modelChanged = !ModelsEqual(before, after);
-            var unavailableGap = !before.DataAvailable || !after.DataAvailable;
-            if (modelChanged && !unobservedGap && !unavailableGap)
+            if (!ModelsEqualAt(modelSeries, index - 1, index))
             {
                 continue;
             }
 
-            // A long interval between observations is not evidence of a
-            // continuous spend rate.  The native graph marks that interval
-            // as unused/unobserved and draws any cumulative increase at the
-            // observed endpoint.  Preserve the boundary so the remaining
-            // line does not turn the unknown interval into a diagonal.
-            var preserveBoundary = unavailableGap ||
-                (unobservedGap && modelChanged);
+            // This background has one meaning: every measured cumulative
+            // model value stayed unchanged. Missing evidence and recorder
+            // gaps are rendered by thin dashed paths, never as idle bands.
+            const bool preserveBoundary = false;
 
             if (intervals.Count > 0)
             {
@@ -521,21 +552,6 @@ public sealed class GraphScene
             }
 
             intervals.Add(new GraphIdleInterval(intervalStart, intervalEnd, preserveBoundary));
-        }
-
-        if (confirmedGaps is null)
-        {
-            return intervals;
-        }
-
-        foreach (var gap in confirmedGaps)
-        {
-            var start = Math.Max(periodStart, gap.StartAt);
-            var end = Math.Min(periodEnd, gap.EndAt);
-            if (end > start)
-            {
-                intervals.Add(new GraphIdleInterval(start, end, true));
-            }
         }
 
         return intervals
@@ -599,13 +615,61 @@ public sealed class GraphScene
     private static double FiniteNonNegative(double? value) =>
         value is { } finite && double.IsFinite(finite) ? Math.Max(0, finite) : double.NaN;
 
+    private static double ModelValue(
+        ApiHistoryModelSample model,
+        GraphMetric metric)
+    {
+        if (metric == GraphMetric.Dollars)
+        {
+            return FiniteNonNegative(model.Dollars);
+        }
+
+        return model.TotalTokens is ulong tokens ? tokens : double.NaN;
+    }
+
+    private static double ModelValue(
+        IReadOnlyList<string> names,
+        IReadOnlyList<double> values,
+        string name)
+    {
+        var index = -1;
+        for (var candidate = 0; candidate < names.Count; candidate++)
+        {
+            if (names[candidate] == name)
+            {
+                index = candidate;
+                break;
+            }
+        }
+        return index >= 0 && index < values.Count ? values[index] : double.NaN;
+    }
+
     private static bool ModelAdvanced(ScenePoint before, ScenePoint after) =>
         before.DataAvailable && after.DataAvailable &&
-        (after.Sol > before.Sol || after.Terra > before.Terra || after.Luna > before.Luna);
+        (after.Sol > before.Sol || after.Terra > before.Terra || after.Luna > before.Luna ||
+         after.Astra > before.Astra);
 
-    private static bool ModelsEqual(ScenePoint before, ScenePoint after) =>
-        before.DataAvailable && after.DataAvailable &&
-        before.Sol == after.Sol && before.Terra == after.Terra && before.Luna == after.Luna;
+    private static bool ModelsEqualAt(
+        IEnumerable<IReadOnlyList<double>> modelSeries,
+        int beforeIndex,
+        int afterIndex)
+    {
+        var anyModel = false;
+        foreach (var values in modelSeries)
+        {
+            if (beforeIndex >= values.Count || afterIndex >= values.Count ||
+                !double.IsFinite(values[beforeIndex]) || !double.IsFinite(values[afterIndex]))
+            {
+                return false;
+            }
+            anyModel = true;
+            if (values[beforeIndex] != values[afterIndex])
+            {
+                return false;
+            }
+        }
+        return anyModel;
+    }
 
     internal readonly record struct ScenePoint(
         long Timestamp,
@@ -613,6 +677,7 @@ public sealed class GraphScene
         double Sol,
         double Terra,
         double Luna,
+        double Astra,
         bool ModelAvailable,
         bool DataAvailable);
 }

@@ -15,6 +15,7 @@ namespace CodexInfo.WindowsClient.Core;
 /// </remarks>
 public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetailsClient, IDisposable
 {
+    private const string DetailsV3Endpoint = "http://127.0.0.1:8787/v3/details";
     private const string DetailsV2Endpoint = "http://127.0.0.1:8787/v2/details";
     private const string DetailsEndpoint = "http://127.0.0.1:8787/v1/details";
     private const string HealthEndpoint = "http://127.0.0.1:8787/v1/health";
@@ -29,6 +30,7 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
     private const int MaxHistorySamples = 31 * 24 * 60;
     private const int MaxHistoryGaps = 4_096;
     private const int MaxThreads = 256;
+    private const int MaxDetailsModels = 1_024;
     private const long ResetAtToleranceSeconds = 60;
 
     private static readonly HashSet<string> HealthProperties = CreatePropertySet(
@@ -66,6 +68,37 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         "cached_input_dollars",
         "output_dollars");
 
+    private static readonly HashSet<string> DetailsV3TopLevelProperties = CreatePropertySet(
+        "api_version",
+        "state",
+        "observed_at",
+        "authenticated",
+        "plan_label",
+        "quota",
+        "models",
+        "active_thread_count",
+        "history_periods",
+        "history_samples",
+        "history_gaps",
+        "threads");
+
+    private static readonly HashSet<string> DetailsV3ModelProperties = CreatePropertySet(
+        "model",
+        "total_tokens",
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
+        "output_tokens",
+        "estimated_cost");
+
+    private static readonly HashSet<string> DetailsV3CostProperties = CreatePropertySet(
+        "price_version",
+        "ordinary_input_dollars",
+        "cached_input_dollars",
+        "cache_write_input_dollars",
+        "output_dollars",
+        "total_dollars");
+
     private static readonly HashSet<string> HistoryPeriodProperties = CreatePropertySet(
         "id",
         "start_at",
@@ -97,6 +130,23 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         "luna_tokens",
         "model_source");
 
+    private static readonly HashSet<string> HistorySampleV3Properties = CreatePropertySet(
+        "timestamp",
+        "reset_at",
+        "remaining_percent",
+        "models",
+        "models_complete",
+        "model_source");
+
+    private static readonly HashSet<string> HistoryModelV3Properties = CreatePropertySet(
+        "model",
+        "total_tokens",
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
+        "output_tokens",
+        "total_dollars");
+
     private static readonly HashSet<string> HistoryGapProperties = CreatePropertySet(
         "gap_id",
         "reset_at",
@@ -124,6 +174,9 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         "depth");
 
     private readonly HttpClient _httpClient;
+    private readonly object _v3CacheGate = new();
+    private ApiDetailsSnapshot? _lastV3Snapshot;
+    private PublishedPairIdentity? _lastV3PublishedPair;
 
     public LoopbackStatusClient()
         : this(CreateDefaultHandler())
@@ -238,6 +291,16 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
     public async Task<DetailsFetchResult> FetchDetailsAsync(
         CancellationToken cancellationToken = default)
     {
+        var v3Attempt = await FetchDetailsEndpointAsync(
+                DetailsV3Endpoint,
+                "v3",
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (!v3Attempt.NotFound)
+        {
+            return v3Attempt.Result;
+        }
+
         var v2Attempt = await FetchDetailsEndpointAsync(
                 DetailsV2Endpoint,
                 "v2",
@@ -267,6 +330,25 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
             request.Headers.Accept.Clear();
             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
+            PublishedPairIdentity? conditionalPair = null;
+            ApiDetailsSnapshot? conditionalSnapshot = null;
+            // Only v3 has the conditional request contract. Released v1/v2
+            // daemons may reject If-None-Match, so compatibility fallbacks
+            // must remain byte-for-byte legacy requests.
+            if (expectedApiVersion == "v3")
+            {
+                lock (_v3CacheGate)
+                {
+                    conditionalPair = _lastV3PublishedPair;
+                    conditionalSnapshot = _lastV3Snapshot;
+                }
+
+                if (conditionalPair is { } pair && conditionalSnapshot is not null)
+                {
+                    request.Headers.IfNoneMatch.Add(new EntityTagHeaderValue($"\"{pair}\""));
+                }
+            }
+
             using var response = await _httpClient.SendAsync(
                     request,
                     HttpCompletionOption.ResponseHeadersRead,
@@ -275,9 +357,40 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
 
             if (response.StatusCode == HttpStatusCode.NotFound)
             {
-                return expectedApiVersion == "v2"
+                return expectedApiVersion is "v3" or "v2"
                     ? DetailsAttemptResult.NotFoundResult()
                     : DetailsAttemptResult.Failure(DetailsFetchFailure.Transport);
+            }
+
+            if (response.StatusCode == HttpStatusCode.NotModified)
+            {
+                if (expectedApiVersion != "v3" ||
+                    conditionalPair is not { } expectedPair ||
+                    conditionalSnapshot is null ||
+                    !HasAcceptableHeaderSize(response) ||
+                    !HasRequiredResponseHeaders(response) ||
+                    !TryGetContentLength(response.Content, out var notModifiedLength) ||
+                    notModifiedLength != 0 ||
+                    !TryGetPublishedPairIdentity(response, out var actualPair) ||
+                    actualPair != expectedPair)
+                {
+                    return DetailsAttemptResult.Failure(DetailsFetchFailure.Response);
+                }
+
+                var notModifiedBody = await ReadBodyAsync(
+                        response.Content,
+                        notModifiedLength,
+                        cancellationToken,
+                        maximumBodyBytes: 0)
+                    .ConfigureAwait(false);
+                if (notModifiedBody.Kind is not BodyReadKind.Success ||
+                    notModifiedBody.Body is null ||
+                    notModifiedBody.Body.LongLength != 0)
+                {
+                    return DetailsAttemptResult.Failure(DetailsFetchFailure.Response);
+                }
+
+                return DetailsAttemptResult.NotModifiedResult(expectedSnapshot: conditionalSnapshot);
             }
 
             if (response.StatusCode != HttpStatusCode.OK)
@@ -324,8 +437,17 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
                 return DetailsAttemptResult.Failure(DetailsFetchFailure.Response);
             }
 
-            return DetailsAttemptResult.Success(
-                snapshot with { PublishedPair = publishedPair });
+            var accepted = snapshot with { PublishedPair = publishedPair };
+            if (expectedApiVersion == "v3")
+            {
+                lock (_v3CacheGate)
+                {
+                    _lastV3Snapshot = accepted;
+                    _lastV3PublishedPair = publishedPair;
+                }
+            }
+
+            return DetailsAttemptResult.Success(accepted);
         }
         catch (OperationCanceledException)
         {
@@ -590,6 +712,11 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         string expectedApiVersion,
         out ApiDetailsSnapshot? snapshot)
     {
+        if (expectedApiVersion == "v3")
+        {
+            return TryParseDetailsV3(body, out snapshot);
+        }
+
         snapshot = null;
 
         try
@@ -672,6 +799,340 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         {
             return false;
         }
+    }
+
+    private static bool TryParseDetailsV3(
+        byte[] body,
+        out ApiDetailsSnapshot? snapshot)
+    {
+        snapshot = null;
+
+        try
+        {
+            using var document = JsonDocument.Parse(
+                body,
+                new JsonDocumentOptions
+                {
+                    AllowTrailingCommas = false,
+                    CommentHandling = JsonCommentHandling.Disallow,
+                    MaxDepth = 24,
+                });
+
+            var root = document.RootElement;
+            if (!HasExactlyProperties(root, DetailsV3TopLevelProperties, 12) ||
+                !TryGetString(root, "api_version", out var apiVersion) ||
+                apiVersion != "v3" ||
+                !TryGetState(root, out var state) ||
+                !TryGetNullableUnixSeconds(root, "observed_at", out var observedAt) ||
+                !TryGetBoolean(root, "authenticated", out var authenticated) ||
+                !TryGetNullablePlanLabel(root, out var planLabel) ||
+                !TryGetQuota(root, out var quota) ||
+                !HasValidDetailsRootDomain(state, authenticated, planLabel, quota) ||
+                !TryGetDetailsModelsV3(root, out var models) ||
+                !TryGetUInt64(root, "active_thread_count", out var activeThreadCount) ||
+                !TryGetHistoryPeriods(root, observedAt, out var historyPeriods) ||
+                !TryGetHistorySamplesV3(root, historyPeriods, out var historySamples) ||
+                !TryGetHistoryGaps(root, historyPeriods, out var historyGaps) ||
+                !TryGetThreads(root, out var threads))
+            {
+                return false;
+            }
+
+            historyPeriods = historyPeriods
+                .Select(period => period with
+                {
+                    Samples = SamplesForCanonicalPeriod(period, historySamples),
+                })
+                .ToList();
+
+            snapshot = new ApiDetailsSnapshot(
+                state,
+                observedAt,
+                authenticated,
+                planLabel,
+                quota,
+                new System.Collections.ObjectModel.ReadOnlyCollection<ApiDetailsModelUsage>(models),
+                activeThreadCount,
+                new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistoryPeriod>(historyPeriods),
+                new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistorySample>(historySamples),
+                new System.Collections.ObjectModel.ReadOnlyCollection<ApiThreadDetails>(threads),
+                // v3 intentionally has no estimated_cost_label root field.
+                "概算 —")
+            {
+                ApiVersion = apiVersion,
+                HistoryGaps = new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistoryGap>(historyGaps),
+            };
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryGetDetailsModelsV3(
+        JsonElement parent,
+        out List<ApiDetailsModelUsage> models)
+    {
+        models = new List<ApiDetailsModelUsage>();
+        if (!parent.TryGetProperty("models", out var property) ||
+            property.ValueKind != JsonValueKind.Array ||
+            property.GetArrayLength() > MaxDetailsModels)
+        {
+            return false;
+        }
+
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var model in property.EnumerateArray())
+        {
+            if (!HasExactlyProperties(model, DetailsV3ModelProperties, 7) ||
+                !TryGetBoundedString(model, "model", 1, 128, out var name) ||
+                !names.Add(name) ||
+                !TryGetUInt64(model, "total_tokens", out var totalTokens) ||
+                !TryGetUInt64(model, "input_tokens", out var inputTokens) ||
+                !TryGetUInt64(model, "cached_input_tokens", out var cachedInputTokens) ||
+                !TryGetNullableUInt64(model, "cache_write_input_tokens", out var cacheWriteInputTokens) ||
+                !TryGetUInt64(model, "output_tokens", out var outputTokens) ||
+                cachedInputTokens > inputTokens ||
+                (cacheWriteInputTokens is ulong cacheWrite &&
+                 (cacheWrite > inputTokens || inputTokens - cacheWrite < cachedInputTokens)) ||
+                !TryGetV3ModelCost(model, out var cost))
+            {
+                return false;
+            }
+
+            models.Add(new ApiDetailsModelUsage(
+                name,
+                inputTokens,
+                cachedInputTokens,
+                outputTokens,
+                cost?.OrdinaryInputDollars ?? double.NaN,
+                cost?.CachedInputDollars ?? double.NaN,
+                cost?.OutputDollars ?? double.NaN)
+            {
+                TotalTokens = totalTokens,
+                CacheWriteInputTokens = cacheWriteInputTokens,
+                CacheWriteInputDollars = cost?.CacheWriteInputDollars ?? double.NaN,
+                PriceVersion = cost?.PriceVersion,
+                EstimatedTotalDollars = cost?.TotalDollars,
+            });
+        }
+
+        return true;
+    }
+
+    private static bool TryGetV3ModelCost(
+        JsonElement parent,
+        out V3ModelCost? cost)
+    {
+        cost = null;
+        if (!parent.TryGetProperty("estimated_cost", out var property))
+        {
+            return false;
+        }
+
+        if (property.ValueKind == JsonValueKind.Null)
+        {
+            return true;
+        }
+
+        if (!HasExactlyProperties(property, DetailsV3CostProperties, 6) ||
+            !TryGetBoundedString(property, "price_version", 1, 128, out var priceVersion) ||
+            !TryGetNonNegativeFiniteDouble(property, "ordinary_input_dollars", out var ordinaryInputDollars) ||
+            !TryGetNonNegativeFiniteDouble(property, "cached_input_dollars", out var cachedInputDollars) ||
+            !TryGetNonNegativeFiniteDouble(property, "cache_write_input_dollars", out var cacheWriteInputDollars) ||
+            !TryGetNonNegativeFiniteDouble(property, "output_dollars", out var outputDollars) ||
+            !TryGetNonNegativeFiniteDouble(property, "total_dollars", out var totalDollars))
+        {
+            return false;
+        }
+
+        var sum = ordinaryInputDollars + cachedInputDollars + cacheWriteInputDollars + outputDollars;
+        if (!double.IsFinite(sum) || Math.Abs(sum - totalDollars) > 0.000001)
+        {
+            return false;
+        }
+
+        cost = new V3ModelCost(
+            priceVersion,
+            ordinaryInputDollars,
+            cachedInputDollars,
+            cacheWriteInputDollars,
+            outputDollars,
+            totalDollars);
+        return true;
+    }
+
+    private static bool TryGetHistorySamplesV3(
+        JsonElement parent,
+        IReadOnlyList<ApiHistoryPeriod> periods,
+        out List<ApiHistorySample> samples)
+    {
+        samples = new List<ApiHistorySample>();
+        if (!parent.TryGetProperty("history_samples", out var property) ||
+            property.ValueKind != JsonValueKind.Array ||
+            property.GetArrayLength() > MaxHistorySamples)
+        {
+            return false;
+        }
+
+        long previousResetAt = 0;
+        long previousTimestamp = 0;
+        var identities = new HashSet<(long ResetAt, long Timestamp)>();
+        var canonicalIdentities = new HashSet<(string PeriodId, long Timestamp)>();
+        foreach (var sample in property.EnumerateArray())
+        {
+            if (!HasExactlyProperties(sample, HistorySampleV3Properties, 6) ||
+                !TryGetUnixSeconds(sample, "timestamp", out var timestamp) ||
+                !TryGetUnixSeconds(sample, "reset_at", out var resetAt) ||
+                timestamp % 60 != 0 ||
+                !TryGetNullableRemainingPercent(sample, out var remainingPercent) ||
+                !TryGetBoolean(sample, "models_complete", out var modelsComplete) ||
+                !TryGetString(sample, "model_source", out var modelSource) ||
+                modelSource is not ApiHistorySample.ConfirmedModelSource and
+                    not ApiHistorySample.UnavailableModelSource and
+                    not ApiHistorySample.LegacyUnknownModelSource ||
+                !TryGetHistoryModelsV3(sample, modelSource, modelsComplete, out var modelSamples))
+            {
+                return false;
+            }
+
+            if (!identities.Add((resetAt, timestamp)) ||
+                (samples.Count > 0 &&
+                 (resetAt < previousResetAt ||
+                  (resetAt == previousResetAt && timestamp <= previousTimestamp))))
+            {
+                return false;
+            }
+
+            var matchingPeriods = periods
+                .Where(period => resetAt >= period.ResetAt - ResetAtToleranceSeconds &&
+                                 resetAt <= period.ResetAt)
+                .ToArray();
+            if (matchingPeriods.Length != 1 ||
+                timestamp < matchingPeriods[0].StartAt ||
+                timestamp > matchingPeriods[0].EndAt ||
+                !canonicalIdentities.Add((matchingPeriods[0].Id, timestamp)))
+            {
+                return false;
+            }
+
+            samples.Add(new ApiHistorySample(
+                timestamp,
+                resetAt,
+                remainingPercent,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                modelSource)
+            {
+                ModelsComplete = modelsComplete,
+                ModelSamples = modelSamples,
+            });
+            previousResetAt = resetAt;
+            previousTimestamp = timestamp;
+        }
+
+        return true;
+    }
+
+    private static bool TryGetHistoryModelsV3(
+        JsonElement parent,
+        string modelSource,
+        bool modelsComplete,
+        out IReadOnlyList<ApiHistoryModelSample>? models)
+    {
+        models = null;
+        if (!parent.TryGetProperty("models", out var property))
+        {
+            return false;
+        }
+
+        if (modelSource == ApiHistorySample.UnavailableModelSource)
+        {
+            return property.ValueKind == JsonValueKind.Null && !modelsComplete;
+        }
+
+        if (property.ValueKind == JsonValueKind.Null)
+        {
+            return modelSource == ApiHistorySample.LegacyUnknownModelSource && !modelsComplete;
+        }
+
+        if (property.ValueKind != JsonValueKind.Array ||
+            property.GetArrayLength() > MaxDetailsModels ||
+            modelSource == ApiHistorySample.ConfirmedModelSource && !modelsComplete ||
+            modelSource == ApiHistorySample.LegacyUnknownModelSource && modelsComplete)
+        {
+            return false;
+        }
+
+        var parsed = new List<ApiHistoryModelSample>();
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var model in property.EnumerateArray())
+        {
+            if (!HasAllowedProperties(model, HistoryModelV3Properties, 2, 7) ||
+                !TryGetBoundedString(model, "model", 1, 128, out var name) ||
+                !names.Add(name) ||
+                !TryGetUInt64(model, "total_tokens", out var totalTokens) ||
+                !TryGetOptionalNullableUInt64(model, "input_tokens", out var inputTokens) ||
+                !TryGetOptionalNullableUInt64(model, "cached_input_tokens", out var cachedInputTokens) ||
+                !TryGetOptionalNullableUInt64(model, "cache_write_input_tokens", out var cacheWriteInputTokens) ||
+                !TryGetOptionalNullableUInt64(model, "output_tokens", out var outputTokens) ||
+                !TryGetOptionalNullableNonNegativeFiniteDouble(model, "total_dollars", out var totalDollars))
+            {
+                return false;
+            }
+
+            var anyComponents = inputTokens is not null || cachedInputTokens is not null || outputTokens is not null;
+            var allComponents = inputTokens is not null && cachedInputTokens is not null && outputTokens is not null;
+            if (anyComponents != allComponents ||
+                (!allComponents && cacheWriteInputTokens is not null) ||
+                (modelSource == ApiHistorySample.ConfirmedModelSource && !allComponents))
+            {
+                return false;
+            }
+
+            if (allComponents)
+            {
+                var input = inputTokens!.Value;
+                var cached = cachedInputTokens!.Value;
+                if (cached > input ||
+                    (cacheWriteInputTokens is ulong cacheWrite &&
+                     (cacheWrite > input || input - cacheWrite < cached)))
+                {
+                    return false;
+                }
+            }
+
+            parsed.Add(new ApiHistoryModelSample(
+                name,
+                inputTokens,
+                cachedInputTokens,
+                outputTokens,
+                totalDollars)
+            {
+                CacheWriteInputTokens = cacheWriteInputTokens,
+                TotalTokens = totalTokens,
+            });
+        }
+
+        models = new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistoryModelSample>(parsed);
+        return true;
     }
 
     private static IReadOnlyList<ApiHistorySample> SamplesForCanonicalPeriod(
@@ -929,7 +1390,10 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
                 solTokens,
                 terraTokens,
                 lunaTokens,
-                modelSource));
+                modelSource)
+            {
+                ModelsComplete = modelSource == ApiHistorySample.ConfirmedModelSource,
+            });
             previousResetAt = resetAt;
             previousTimestamp = timestamp;
         }
@@ -1108,6 +1572,31 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         return count == expectedCount;
     }
 
+    private static bool HasAllowedProperties(
+        JsonElement value,
+        HashSet<string> allowed,
+        int minimumCount,
+        int maximumCount)
+    {
+        if (value.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var count = 0;
+        foreach (var property in value.EnumerateObject())
+        {
+            count++;
+            if (!seen.Add(property.Name) || !allowed.Contains(property.Name))
+            {
+                return false;
+            }
+        }
+
+        return count >= minimumCount && count <= maximumCount;
+    }
+
     private static bool TryGetString(JsonElement parent, string name, out string value)
     {
         value = string.Empty;
@@ -1254,6 +1743,20 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         return true;
     }
 
+    private static bool TryGetOptionalNullableNonNegativeFiniteDouble(
+        JsonElement parent,
+        string name,
+        out double? value)
+    {
+        if (!parent.TryGetProperty(name, out _))
+        {
+            value = null;
+            return true;
+        }
+
+        return TryGetNullableNonNegativeFiniteDouble(parent, name, out value);
+    }
+
     private static bool TryGetNonNegativeFiniteDouble(
         JsonElement property,
         out double value)
@@ -1286,6 +1789,20 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
 
         value = candidate;
         return true;
+    }
+
+    private static bool TryGetOptionalNullableUInt64(
+        JsonElement parent,
+        string name,
+        out ulong? value)
+    {
+        if (!parent.TryGetProperty(name, out _))
+        {
+            value = null;
+            return true;
+        }
+
+        return TryGetNullableUInt64(parent, name, out value);
     }
 
     private static bool TryGetDepth(JsonElement parent, out int value)
@@ -1640,17 +2157,29 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
 
     private readonly record struct DetailsAttemptResult(
         DetailsFetchResult Result,
-        bool NotFound)
+        bool NotFound,
+        bool NotModified)
     {
         public static DetailsAttemptResult Success(ApiDetailsSnapshot snapshot) =>
-            new(DetailsFetchResult.Success(snapshot), false);
+            new(DetailsFetchResult.Success(snapshot), false, false);
 
         public static DetailsAttemptResult Failure(DetailsFetchFailure failure) =>
-            new(DetailsFetchResult.FromFailure(failure), false);
+            new(DetailsFetchResult.FromFailure(failure), false, false);
 
         public static DetailsAttemptResult NotFoundResult() =>
-            new(DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport), true);
+            new(DetailsFetchResult.FromFailure(DetailsFetchFailure.Transport), true, false);
+
+        public static DetailsAttemptResult NotModifiedResult(ApiDetailsSnapshot expectedSnapshot) =>
+            new(DetailsFetchResult.Success(expectedSnapshot), false, true);
     }
+
+    private sealed record V3ModelCost(
+        string PriceVersion,
+        double OrdinaryInputDollars,
+        double CachedInputDollars,
+        double CacheWriteInputDollars,
+        double OutputDollars,
+        double TotalDollars);
 
     private readonly record struct BodyReadResult(BodyReadKind Kind, byte[]? Body)
     {

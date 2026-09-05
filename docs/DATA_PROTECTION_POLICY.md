@@ -1,5 +1,6 @@
 <!-- codex-info-requirement-owner: DATA -->
 <!-- codex-info-master-ids:
+RECORDER-MODEL-01
 CUM-138-01
 CUM-138-02
 CUM-138-03
@@ -18,6 +19,18 @@ U128-19
 -->
 
 # Codex Info データ保護規約
+
+## RECORDER-MODEL-01 — モデル追加・source障害時の記録継続
+
+- Sessionが返す有効なmodel IDは固定allowlistで捨てず、正規化したIDごとに既存account DBへ記録する。既知の`gpt-6-astra` / `ASTRA`を含め、入力、cached入力、cache write入力、出力の各tokenを保持する。価格未登録モデルもtoken事実は保存し、価格だけを未確定とする。
+- `cache_write_input_tokens` の未提供と明示的な0を区別する。提供されない内訳を推測して確定値にしない。
+- model totalsとsource checkpointは同じtransactionで保存し、再起動・同一range再取得で重複加算しない。未対応モデルを未保存のままrecorded markerとして確定しない。
+- 既存cursorより前に読み飛ばされたASTRAは、保持sourceからモデル別に回収する。既存SOL/TERRA/LUNAの確定累計や履歴を再加算・削除しない。回収済みの範囲を永続化し、再実行で同じ補正を加えない。
+- 一部モデルだけを回収した履歴は不完全フラグを永続化し、未掲載モデルを0または確定値として公開しない。全モデル集合を同じ観測から再構成できない限り、確定履歴へ昇格させない。
+- 旧`usage_history`に保存済みのSOL/TERRA/LUNA別token・dollarは、全モデル集合やtoken内訳が不完全でも既知値まで捨てない。旧列にない入力・cached入力・cache write入力・出力はNULL、全モデル集合は不完全として公開し、0や推測内訳をDBへ書き込まない。
+- 既存account境界、DB履歴、quota欠測を保持する。旧REST consumerにASTRAを理解したふりをさせず、記録対応と表示対応の完了を分けて報告する。
+- 1つのSession sourceがsymlink、差替え、読取り失敗、不正recordまたは一時的なI/O障害になっても、そのsourceのcursorを進めず再試行可能な状態を保ち、他の独立した有効sourceの差分保存を続ける。外部quota/app-serverの停止およびREST clientの有無をSession記録の停止条件にしない。
+- 1か月の公開minute上限を、canonicalize前のraw reset alias行数へ適用しない。indexed raw readerの有界budget、canonical履歴上限、wire size上限を別の責務として管理し、いずれかの保護判定でDB writerを停止させない。
 
 この文書は、利用履歴・ローカルセッションログ・thread情報・SQLiteデータベースを変更する全実装の正本である。`DESIGN.md`の補足ではなく、変更を許可するための拘束条件として扱う。
 
@@ -70,11 +83,9 @@ Codex app-server / session JSONL / thread rollout
    local usage側の改行済み不正record隔離は、後続のvalidated cumulative snapshotで対象列の欠落を覆えるcaseだけを
    許可し、後続snapshotなし・usage eventか判定不能・EOF以外の部分行・I/O・file差替え・資源上限はfile/candidate
    単位でrollbackする。local readerがEOFで検出した未完了recordはvalid/invalid UTF-8・oversizeを問わずrollbackする。
-6. app-server停止中でも、Codex Infoプロセスが動作し、`history/usage_reset_hint.json`とcanonical sessions root配下のappend-onlyログが存在する場合だけ、
-   outage epochにつき1回のbounded one-shot backfillを許可する。hintはschema `reset-hint-v1`、UTF-8 JSON、最大4KiBとし、
-   `state`（`active`/`expired`/`tombstoned`）、`reset_at`、`window_seconds`、`observed_at`、file cursor、
-   個人識別値を含まないopaqueな`auth_epoch_nonce`を保持する。
-   現在の認証epoch・nonceに束縛されたauthenticated hintだけを受理し、未認証中の復旧値は公開しない。
+6. app-serverのtimeout・無応答・切断はlocal Session収集を停止する理由にしない。確認済みaccount partitionとsource cursorがある場合は通常周期で差分保存を継続する。
+   現在のaccountとの一致を確認できないsourceは他accountへ帰属させず原本を保持する。quotaは最終実測時刻と取得失敗を表示し、未観測の値を保存しない。
+   外部API復帰後は新しい実測値だけを採用する。旧reset hintを現在のaccount authorityや継続収集の必須条件にしない。
 7. 同一障害中にlocal JSONL全走査やapp-server再起動を無限反復しない。通常の全走査はquota cycle、明示更新、または一度だけの障害復旧に限定する。
    fingerprint不変ならscan/writeは0、変化時も1 cycleにつき1 scan・1 transactionだけとする。
 8. collector全停止中の未取得データは後から捏造しない。installed profileではuser-systemdの
@@ -85,8 +96,8 @@ Codex app-server / session JSONL / thread rollout
    hint、gap/recorder/control state、source JSONL、installed generationを保持する。
 9. canonical DB profileごとに`MaintenanceOwner`を1つだけ許可する。起動時pruneの前に、writer admissionを止めた同一排他境界で
    SQLite online backupを3世代作成・検証する。backup失敗時はpruneを実行しない。検証失敗・writer競合時もpruneを実行しない。バックアップは`0600`、DBディレクトリは`0700`とする。
-10. 現行版は旧schemaを暗黙migrationしない。schema mismatchは拒否する（read/writeを拒否する）。将来migrationは別名DB、全行validate、件数/hash/期間境界比較、
-   3世代backup保持、検証後のatomic switchの順序だけを許可する。candidate失敗時はDB、backup、memory、公開rootを旧世代のまま保持する。
+10. schema変更前にSQLiteの整合したbackupを保持し、複製で旧行・期間・checkpoint保持とrollbackを検証する。既存型・key・行を変えないnullable列追加は既存writerの単一transaction内で行い、旧readerは未提供をNULLとして読む。
+   互換的追加以外のmigrationは別名DB、全行validate、件数/hash/期間境界比較、3世代backup保持、検証後のatomic switchとする。失敗時に旧DBやsourceを初期化・削除しない。
 11. スレッドのライブ状態はDB履歴を根拠に再生しない。root/childとも、同一cycleで前後identityを検証した
     eligible Codex workloadの`canonical path -> nonempty ProcessIdentity set`にrolloutが存在し、最後のtask状態が
     runningである場合だけnative candidateにできる。`ProcessIdentity=(pid,starttime_ticks,exe_device,exe_inode)`とし、

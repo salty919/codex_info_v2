@@ -2503,6 +2503,7 @@ mod tests {
                     observations: Vec::new(),
                     recorded_sessions: vec![marker.clone()],
                     session_checkpoints: vec![crate::usage_store::SessionCheckpoint {
+                        previous_cache_write_input: None,
                         root_identity: marker.root_identity.clone(),
                         relative_path: marker.relative_path.clone(),
                         file_device: marker.file_device,
@@ -2524,6 +2525,7 @@ mod tests {
                     }],
                     session_ranges: Vec::new(),
                     session_model_totals: vec![crate::usage_store::SessionModelTotal {
+                        cache_write_input_tokens: None,
                         model: "SOL".into(),
                         total_tokens: 12_345,
                         input_tokens: 10_000,
@@ -2578,6 +2580,7 @@ mod tests {
             luna_tokens: 321,
         };
         let fallback_totals = vec![crate::usage_store::SessionModelTotal {
+            cache_write_input_tokens: None,
             model: "SOL".into(),
             total_tokens: 13_000,
             input_tokens: 10_500,
@@ -2601,6 +2604,7 @@ mod tests {
                     session_checkpoints: Vec::new(),
                     session_ranges: Vec::new(),
                     session_model_totals: vec![crate::usage_store::SessionModelTotal {
+                        cache_write_input_tokens: None,
                         model: "SOL".into(),
                         total_tokens: 14_000,
                         input_tokens: 11_300,
@@ -2622,6 +2626,7 @@ mod tests {
                                 luna_tokens: 0,
                             },
                             model_totals: vec![crate::usage_store::SessionModelTotal {
+                                cache_write_input_tokens: None,
                                 model: "SOL".into(),
                                 total_tokens: 1_000,
                                 input_tokens: 800,

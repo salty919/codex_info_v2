@@ -103,8 +103,8 @@
                     ToolTip.Tip="{Binding Texts.ModelUsage}" />
     </Grid>
 
-    <!-- One four-column control group: label length never changes geometry. -->
-    <Grid Grid.Row="2" ColumnDefinitions="*,*,*,*" ColumnSpacing="8">
+    <!-- One five-column control group: label length never changes geometry. -->
+    <Grid Grid.Row="2" ColumnDefinitions="*,*,*,*,*" ColumnSpacing="8">
       <ToggleButton Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowRemaining}" AutomationProperties.Name="{Binding Texts.RemainingQuota}" AutomationProperties.AutomationId="Graph.Toggle.Remaining" ToolTip.Tip="{Binding Texts.RemainingQuota}">
         <Grid ColumnDefinitions="18,*" ColumnSpacing="7"><Border Width="14" Height="4" CornerRadius="2" Background="#56B2F5" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Text="{Binding Texts.RemainingQuota}" /></Grid>
       </ToggleButton>
@@ -116,6 +116,9 @@
       </ToggleButton>
       <ToggleButton Grid.Column="3" Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowSol}" AutomationProperties.Name="SOL" AutomationProperties.AutomationId="Graph.Toggle.SOL" ToolTip.Tip="SOL">
         <Grid ColumnDefinitions="18,*" ColumnSpacing="7"><Border Width="14" Height="4" CornerRadius="2" Background="#A88CF5" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Text="SOL" /></Grid>
+      </ToggleButton>
+      <ToggleButton Grid.Column="4" Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowAstra}" AutomationProperties.Name="ASTRA" AutomationProperties.AutomationId="Graph.Toggle.ASTRA" ToolTip.Tip="ASTRA">
+        <Grid ColumnDefinitions="18,*" ColumnSpacing="7"><Border Width="14" Height="4" CornerRadius="2" Background="#E86E9F" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Text="ASTRA" /></Grid>
       </ToggleButton>
     </Grid>
 
@@ -139,6 +142,7 @@
         <plot:GraphPlotControl Grid.Row="1" Scene="{Binding Scene}"
                                ShowRemaining="{Binding ShowRemaining}" ShowSol="{Binding ShowSol}"
                                ShowTerra="{Binding ShowTerra}" ShowLuna="{Binding ShowLuna}"
+                               ShowAstra="{Binding ShowAstra}"
                                AutomationProperties.Name="{Binding Texts.Graph}"
                                AutomationProperties.AutomationId="Graph.Plot"
                                IsVisible="{Binding HasPoints}" />

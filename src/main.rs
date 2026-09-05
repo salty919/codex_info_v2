@@ -11,9 +11,11 @@ use codex_info::i18n::{CliTextKey, I18n, PeriodKind, TextKey};
 use codex_info::protocol_contract;
 use codex_info::security;
 use codex_info::server::{
-    validate_public_threads, ApiServer, ApiServerConfig, PublicDetailedModelUsage, PublicDetails,
-    PublicDetailsV2, PublicHistoryGap, PublicHistoryObservation, PublicHistoryPeriod,
-    PublicHistorySample, PublicQuota, PublicState, PublicThread,
+    legacy_history_models_v3, validate_public_threads, ApiServer, ApiServerConfig,
+    PublicDetailedModelUsage, PublicDetails, PublicDetailsV2, PublicDetailsV3, PublicHistoryGap,
+    PublicHistoryModelUsageV3, PublicHistoryObservation, PublicHistoryObservationV3,
+    PublicHistoryPeriod, PublicHistorySample, PublicModelCostV3, PublicModelUsageV3, PublicQuota,
+    PublicState, PublicThread,
 };
 use codex_info::thread_contract::{
     self, ThreadCycleAccumulator, ThreadCycleOutcome, ThreadTopologyNode,
@@ -135,6 +137,7 @@ struct LocalUsageResult {
     window_seconds: i64,
     model_usage: ModelUsageTotals,
     history_samples: Vec<UsageHistorySample>,
+    history_model_totals: Vec<(i64, Vec<usage_store::SessionModelTotal>)>,
     recorded_sessions: Vec<usage_store::RecordedSessionSource>,
     cleanup_plan: Option<SessionCleanupPlan>,
 }
@@ -170,6 +173,18 @@ struct TokenSnapshot {
     input: u64,
     cached_input: u64,
     output: u64,
+    cache_write_input: Option<u64>,
+}
+
+impl TokenSnapshot {
+    fn cache_write_delta_from(self, previous: Self) -> Option<u64> {
+        match (self.cache_write_input, previous.cache_write_input) {
+            (Some(current), Some(before)) => current.checked_sub(before),
+            (Some(current), None) if previous.total == 0 => Some(current),
+            (Some(0), None) => Some(0),
+            _ => None,
+        }
+    }
 }
 
 const LOCAL_ESTIMATE_PRICE_VERSION: &str = "LOCAL_ESTIMATE_V1_2026-08-14";
@@ -177,6 +192,8 @@ const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SOL_PRICE_PER_MILLION: (f64, f64, f64) = (5.0, 0.5, 30.0);
 const TERRA_PRICE_PER_MILLION: (f64, f64, f64) = (2.0, 0.2, 12.0);
 const LUNA_PRICE_PER_MILLION: (f64, f64, f64) = (0.2, 0.02, 1.2);
+const ASTRA_PRICE_PER_MILLION: (f64, f64, f64, f64) = (10.0, 1.0, 12.5, 50.0);
+const ASTRA_PRICE_VERSION: &str = "ASTRA_USER_2026-09-05";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ModelUsageRow {
@@ -185,17 +202,41 @@ struct ModelUsageRow {
     input_tokens: u64,
     cached_input_tokens: u64,
     output_tokens: u64,
+    cache_write_input_tokens: Option<u64>,
 }
 
 impl ModelUsageRow {
+    fn astra_dollar_costs(&self) -> Option<(f64, f64, f64, f64)> {
+        if self.name != "ASTRA" {
+            return None;
+        }
+        let writes = self.cache_write_input_tokens?;
+        let ordinary = self
+            .input_tokens
+            .checked_sub(self.cached_input_tokens)?
+            .checked_sub(writes)?;
+        let (input_rate, cached_rate, write_rate, output_rate) = ASTRA_PRICE_PER_MILLION;
+        Some((
+            ordinary as f64 * input_rate / 1_000_000.0,
+            self.cached_input_tokens as f64 * cached_rate / 1_000_000.0,
+            writes as f64 * write_rate / 1_000_000.0,
+            self.output_tokens as f64 * output_rate / 1_000_000.0,
+        ))
+    }
     fn new(name: &str) -> Self {
         Self {
             name: name.into(),
+            cache_write_input_tokens: Some(0),
             ..Self::default()
         }
     }
 
     fn add(&mut self, snapshot: TokenSnapshot) {
+        self.cache_write_input_tokens =
+            match (self.cache_write_input_tokens, snapshot.cache_write_input) {
+                (Some(left), Some(right)) => left.checked_add(right),
+                _ => None,
+            };
         self.tokens = self.tokens.saturating_add(snapshot.total);
         self.input_tokens = self.input_tokens.saturating_add(snapshot.input);
         self.cached_input_tokens = self
@@ -208,11 +249,17 @@ impl ModelUsageRow {
         // The version is intentionally fixed with the rates; changing either
         // requires updating the contract fixture rather than silent drift.
         let _ = LOCAL_ESTIMATE_PRICE_VERSION;
+        if self.name == "ASTRA" {
+            return self
+                .astra_dollar_costs()
+                .map(|(ordinary, cached, writes, output)| (ordinary + writes, cached, output))
+                .unwrap_or((f64::NAN, f64::NAN, f64::NAN));
+        }
         let (input_rate, cached_rate, output_rate) = match self.name.as_str() {
             "SOL" => SOL_PRICE_PER_MILLION,
             "TERRA" => TERRA_PRICE_PER_MILLION,
             "LUNA" => LUNA_PRICE_PER_MILLION,
-            _ => (0.0, 0.0, 0.0),
+            _ => (f64::NAN, f64::NAN, f64::NAN),
         };
         let input = self.input_tokens.saturating_sub(self.cached_input_tokens) as f64;
         (
@@ -221,6 +268,108 @@ impl ModelUsageRow {
             self.output_tokens as f64 * output_rate / 1_000_000.0,
         )
     }
+
+    fn public_v3(&self) -> PublicModelUsageV3 {
+        let estimated_cost = if self.name == "ASTRA" {
+            self.astra_dollar_costs().map(
+                |(ordinary_input, cached_input, cache_write_input, output)| PublicModelCostV3 {
+                    price_version: ASTRA_PRICE_VERSION.to_owned(),
+                    ordinary_input_dollars: ordinary_input,
+                    cached_input_dollars: cached_input,
+                    cache_write_input_dollars: cache_write_input,
+                    output_dollars: output,
+                    total_dollars: ordinary_input + cached_input + cache_write_input + output,
+                },
+            )
+        } else if matches!(self.name.as_str(), "SOL" | "TERRA" | "LUNA")
+            && self
+                .cache_write_input_tokens
+                .is_some_and(|writes| writes == 0)
+        {
+            let (ordinary_input, cached_input, output) = self.dollar_costs();
+            Some(PublicModelCostV3 {
+                price_version: LOCAL_ESTIMATE_PRICE_VERSION.to_owned(),
+                ordinary_input_dollars: ordinary_input,
+                cached_input_dollars: cached_input,
+                cache_write_input_dollars: 0.0,
+                output_dollars: output,
+                total_dollars: ordinary_input + cached_input + output,
+            })
+        } else {
+            None
+        };
+        PublicModelUsageV3 {
+            model: self.name.clone(),
+            total_tokens: self.tokens,
+            input_tokens: self.input_tokens,
+            cached_input_tokens: self.cached_input_tokens,
+            cache_write_input_tokens: self.cache_write_input_tokens,
+            output_tokens: self.output_tokens,
+            estimated_cost,
+        }
+    }
+}
+
+fn history_model_usage_v3(
+    total: &usage_store::SessionModelTotal,
+    legacy: &PublicHistoryObservation,
+) -> PublicHistoryModelUsageV3 {
+    let total_dollars = match total.model.as_str() {
+        "SOL" => legacy.sol_dollars,
+        "TERRA" => legacy.terra_dollars,
+        "LUNA" => legacy.luna_dollars,
+        _ => ModelUsageRow {
+            name: total.model.clone(),
+            tokens: total.total_tokens,
+            input_tokens: total.input_tokens,
+            cached_input_tokens: total.cached_input_tokens,
+            output_tokens: total.output_tokens,
+            cache_write_input_tokens: total.cache_write_input_tokens,
+        }
+        .public_v3()
+        .estimated_cost
+        .map(|cost| cost.total_dollars),
+    };
+    PublicHistoryModelUsageV3 {
+        model: total.model.clone(),
+        total_tokens: total.total_tokens,
+        input_tokens: Some(total.input_tokens),
+        cached_input_tokens: Some(total.cached_input_tokens),
+        cache_write_input_tokens: total.cache_write_input_tokens,
+        output_tokens: Some(total.output_tokens),
+        total_dollars,
+    }
+}
+
+fn history_models_v3(
+    source: Option<&usage_store::UsageHistoryObservation>,
+    sample: &PublicHistoryObservation,
+) -> Option<Vec<PublicHistoryModelUsageV3>> {
+    let mut models = source
+        .and_then(|observation| observation.model_totals.as_ref())
+        .map(|totals| {
+            totals
+                .iter()
+                .map(|total| history_model_usage_v3(total, sample))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    // An incomplete generic set can still contain exact rows recovered from
+    // the session log. It must not replace exact legacy SOL/TERRA/LUNA rows
+    // at the same observation. Completeness remains false because arbitrary
+    // peer models may still be unknown.
+    if source.is_none_or(|observation| !observation.model_totals_complete) {
+        if let Some(legacy_models) = legacy_history_models_v3(sample) {
+            for legacy in legacy_models {
+                if !models.iter().any(|model| model.model == legacy.model) {
+                    models.push(legacy);
+                }
+            }
+        }
+    }
+    models.sort_by(|left, right| left.model.cmp(&right.model));
+    (!models.is_empty()).then_some(models)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -228,6 +377,8 @@ struct ModelUsageTotals {
     sol: ModelUsageRow,
     terra: ModelUsageRow,
     luna: ModelUsageRow,
+    astra: ModelUsageRow,
+    additional: BTreeMap<String, ModelUsageRow>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -250,17 +401,27 @@ impl Default for ModelUsageTotals {
             sol: ModelUsageRow::new("SOL"),
             terra: ModelUsageRow::new("TERRA"),
             luna: ModelUsageRow::new("LUNA"),
+            astra: ModelUsageRow::new("ASTRA"),
+            additional: BTreeMap::new(),
         }
     }
 }
 
 impl ModelUsageTotals {
     fn add(&mut self, model: &str, snapshot: TokenSnapshot) {
-        match Self::recognized_model(model) {
-            Some("SOL") => self.sol.add(snapshot),
-            Some("TERRA") => self.terra.add(snapshot),
-            Some("LUNA") => self.luna.add(snapshot),
-            _ => {}
+        let Some(model) = Self::canonical_model(model) else {
+            return;
+        };
+        match model.as_str() {
+            "SOL" => self.sol.add(snapshot),
+            "TERRA" => self.terra.add(snapshot),
+            "LUNA" => self.luna.add(snapshot),
+            "ASTRA" => self.astra.add(snapshot),
+            _ => self
+                .additional
+                .entry(model.clone())
+                .or_insert_with(|| ModelUsageRow::new(&model))
+                .add(snapshot),
         }
     }
 
@@ -272,14 +433,28 @@ impl ModelUsageTotals {
             Some("TERRA")
         } else if model.contains("luna") {
             Some("LUNA")
+        } else if model.contains("astra") {
+            Some("ASTRA")
         } else {
             None
         }
     }
 
+    fn canonical_model(model: &str) -> Option<String> {
+        if let Some(known) = Self::recognized_model(model) {
+            return Some(known.to_owned());
+        }
+        let model = model.trim();
+        (!model.is_empty()
+            && model.len() <= usage_store::MAX_SESSION_MODEL_BYTES
+            && !model.chars().any(char::is_control))
+        .then(|| model.to_owned())
+    }
+
     fn rows(self) -> Vec<ModelUsageRow> {
-        [self.sol, self.terra, self.luna]
+        [self.sol, self.terra, self.luna, self.astra]
             .into_iter()
+            .chain(self.additional.into_values())
             .filter(|row| row.tokens > 0)
             .collect()
     }
@@ -287,7 +462,12 @@ impl ModelUsageTotals {
     fn dollar_totals(&self) -> ModelDollarTotals {
         fn total(row: &ModelUsageRow) -> f64 {
             let (input, cached_input, output) = row.dollar_costs();
-            input + cached_input + output
+            let total = input + cached_input + output;
+            if total.is_finite() {
+                total
+            } else {
+                0.0
+            }
         }
 
         ModelDollarTotals {
@@ -312,31 +492,47 @@ impl ModelUsageTotals {
                 "SOL" => &mut result.sol,
                 "TERRA" => &mut result.terra,
                 "LUNA" => &mut result.luna,
-                _ => continue,
+                "ASTRA" => &mut result.astra,
+                _ => result
+                    .additional
+                    .entry(total.model.clone())
+                    .or_insert_with(|| ModelUsageRow::new(&total.model)),
             };
             row.tokens = total.total_tokens;
             row.input_tokens = total.input_tokens;
             row.cached_input_tokens = total.cached_input_tokens;
             row.output_tokens = total.output_tokens;
+            row.cache_write_input_tokens = total.cache_write_input_tokens;
         }
         result
     }
 
     fn to_session_totals(&self) -> Vec<usage_store::SessionModelTotal> {
-        [&self.sol, &self.terra, &self.luna]
+        let mut totals = [&self.sol, &self.terra, &self.luna, &self.astra]
             .into_iter()
+            .chain(self.additional.values())
             .map(|row| usage_store::SessionModelTotal {
+                cache_write_input_tokens: row.cache_write_input_tokens,
                 model: row.name.clone(),
                 total_tokens: row.tokens,
                 input_tokens: row.input_tokens,
                 cached_input_tokens: row.cached_input_tokens,
                 output_tokens: row.output_tokens,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        totals.sort_by(|left, right| left.model.cmp(&right.model));
+        totals
     }
 
     fn checked_add_totals(&mut self, offset: &Self) -> Option<()> {
         fn add_row(target: &mut ModelUsageRow, offset: &ModelUsageRow) -> Option<()> {
+            target.cache_write_input_tokens = match (
+                target.cache_write_input_tokens,
+                offset.cache_write_input_tokens,
+            ) {
+                (Some(left), Some(right)) => Some(left.checked_add(right)?),
+                _ => None,
+            };
             target.tokens = target.tokens.checked_add(offset.tokens)?;
             target.input_tokens = target.input_tokens.checked_add(offset.input_tokens)?;
             target.cached_input_tokens = target
@@ -347,7 +543,17 @@ impl ModelUsageTotals {
         }
         add_row(&mut self.sol, &offset.sol)?;
         add_row(&mut self.terra, &offset.terra)?;
-        add_row(&mut self.luna, &offset.luna)
+        add_row(&mut self.luna, &offset.luna)?;
+        add_row(&mut self.astra, &offset.astra)?;
+        for (model, row) in &offset.additional {
+            add_row(
+                self.additional
+                    .entry(model.clone())
+                    .or_insert_with(|| ModelUsageRow::new(model)),
+                row,
+            )?;
+        }
+        Some(())
     }
 
     fn checked_difference(&self, baseline: &Self) -> Option<Self> {
@@ -357,6 +563,13 @@ impl ModelUsageTotals {
         ) -> Option<ModelUsageRow> {
             Some(ModelUsageRow {
                 name: current.name.clone(),
+                cache_write_input_tokens: match (
+                    current.cache_write_input_tokens,
+                    baseline.cache_write_input_tokens,
+                ) {
+                    (Some(current), Some(before)) => Some(current.checked_sub(before)?),
+                    _ => None,
+                },
                 tokens: current.tokens.checked_sub(baseline.tokens)?,
                 input_tokens: current.input_tokens.checked_sub(baseline.input_tokens)?,
                 cached_input_tokens: current
@@ -365,10 +578,32 @@ impl ModelUsageTotals {
                 output_tokens: current.output_tokens.checked_sub(baseline.output_tokens)?,
             })
         }
+        let model_names = self
+            .additional
+            .keys()
+            .chain(baseline.additional.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut additional = BTreeMap::new();
+        for model in model_names {
+            let current = self
+                .additional
+                .get(&model)
+                .cloned()
+                .unwrap_or_else(|| ModelUsageRow::new(&model));
+            let before = baseline
+                .additional
+                .get(&model)
+                .cloned()
+                .unwrap_or_else(|| ModelUsageRow::new(&model));
+            additional.insert(model, subtract_row(&current, &before)?);
+        }
         Some(Self {
             sol: subtract_row(&self.sol, &baseline.sol)?,
             terra: subtract_row(&self.terra, &baseline.terra)?,
             luna: subtract_row(&self.luna, &baseline.luna)?,
+            astra: subtract_row(&self.astra, &baseline.astra)?,
+            additional,
         })
     }
 
@@ -383,6 +618,16 @@ impl ModelUsageTotals {
             && self.luna.input_tokens == 0
             && self.luna.cached_input_tokens == 0
             && self.luna.output_tokens == 0
+            && self.astra.tokens == 0
+            && self.astra.input_tokens == 0
+            && self.astra.cached_input_tokens == 0
+            && self.astra.output_tokens == 0
+            && self.additional.values().all(|row| {
+                row.tokens == 0
+                    && row.input_tokens == 0
+                    && row.cached_input_tokens == 0
+                    && row.output_tokens == 0
+            })
     }
 }
 
@@ -421,8 +666,8 @@ const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
 // let row order manufacture a quota drop.
 // A minute bucket is the collector's contiguous observation unit. Beyond this
 // boundary the elapsed interval is not observed, so a cumulative model
-// increase must be shown as an idle horizontal segment followed by a point
-// change, never as an invented diagonal rate.
+// increase must be shown as a thin inferred bridge, never as a measured rate
+// or a confirmed idle interval.
 const MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS: i64 = 60;
 const MOVING_RESET_MIN_HORIZON_SECONDS: i64 = 86_400;
 
@@ -1569,9 +1814,7 @@ fn read_thread_rollout_snapshot(
     }
     let mut file = File::open(&canonical).map_err(|_| ())?;
     let before_file = file.metadata().map_err(|_| ())?;
-    if !same_rollout_identity(&before_path, &before_file)
-        || before_file.len() > security::MAX_SESSION_FILE_BYTES
-    {
+    if !same_rollout_identity(&before_path, &before_file) {
         return Err(());
     }
     let snapshot_len = before_file.len();
@@ -1624,7 +1867,7 @@ fn read_thread_rollout_snapshot(
         || !after_path.is_file()
         || !same_rollout_identity(&before_file, &after_file)
         || !same_rollout_identity(&after_file, &after_path)
-        || after_file.len() != snapshot_len
+        || after_file.len() < snapshot_len
     {
         return Err(());
     }
@@ -1661,9 +1904,7 @@ fn read_active_thread_rollout_cached_with_checkpoints(
     }
     let mut file = File::open(&canonical).map_err(|_| ())?;
     let before_file = file.metadata().map_err(|_| ())?;
-    if !same_rollout_identity(&before_path, &before_file)
-        || before_file.len() > security::MAX_SESSION_FILE_BYTES
-    {
+    if !same_rollout_identity(&before_path, &before_file) {
         return Err(());
     }
     let snapshot_len = before_file.len();
@@ -1808,7 +2049,7 @@ fn read_active_thread_rollout_cached_with_checkpoints(
         || !after_path.is_file()
         || !same_rollout_identity(&before_file, &after_file)
         || !same_rollout_identity(&after_file, &after_path)
-        || after_file.len() != snapshot_len
+        || after_file.len() < snapshot_len
     {
         return Err(());
     }
@@ -3070,6 +3311,93 @@ fn store_observation_from_public(
         terra_tokens: observation.terra_tokens,
         luna_tokens: observation.luna_tokens,
         model_source,
+        model_totals: None,
+        model_totals_complete: false,
+    }
+}
+
+fn v3_model_by_name<'a>(
+    models: Option<&'a [PublicHistoryModelUsageV3]>,
+    name: &str,
+) -> Option<&'a PublicHistoryModelUsageV3> {
+    models?.iter().find(|model| model.model == name)
+}
+
+fn main_sample_from_public_observation_v3(
+    observation: &PublicHistoryObservationV3,
+) -> Option<UsageHistorySample> {
+    let models = observation.models.as_deref();
+    let value = |name: &str| {
+        v3_model_by_name(models, name)
+            .and_then(|model| model.total_dollars)
+            .unwrap_or(if observation.models_complete {
+                0.0
+            } else {
+                -1.0
+            })
+    };
+    let tokens = |name: &str| {
+        v3_model_by_name(models, name)
+            .map(|model| model.total_tokens)
+            .unwrap_or(0)
+    };
+    Some(UsageHistorySample {
+        timestamp: observation.timestamp,
+        reset_at: observation.reset_at,
+        remaining_percent: observation.remaining_percent.unwrap_or(-1.0),
+        sol_dollars: value("SOL"),
+        terra_dollars: value("TERRA"),
+        luna_dollars: value("LUNA"),
+        sol_tokens: tokens("SOL"),
+        terra_tokens: tokens("TERRA"),
+        luna_tokens: tokens("LUNA"),
+    })
+}
+
+fn store_observation_from_public_v3(
+    observation: &PublicHistoryObservationV3,
+) -> usage_store::UsageHistoryObservation {
+    let model_source = match observation.model_source.as_str() {
+        "confirmed" => usage_store::ModelSource::Confirmed,
+        "unavailable" => usage_store::ModelSource::Unavailable,
+        _ => usage_store::ModelSource::LegacyUnknown,
+    };
+    let models = observation.models.as_ref();
+    let model_totals = models.map(|models| {
+        models
+            .iter()
+            .map(|model| usage_store::SessionModelTotal {
+                model: model.model.clone(),
+                total_tokens: model.total_tokens,
+                // v3 intentionally omits unknown components.  These fields
+                // are only a persistence carrier; graph/UI projections use
+                // total_tokens and total_dollars and retain source quality.
+                input_tokens: model.input_tokens.unwrap_or(0),
+                cached_input_tokens: model.cached_input_tokens.unwrap_or(0),
+                output_tokens: model.output_tokens.unwrap_or(0),
+                cache_write_input_tokens: model.cache_write_input_tokens,
+            })
+            .collect::<Vec<_>>()
+    });
+    usage_store::UsageHistoryObservation {
+        timestamp: observation.timestamp,
+        reset_at: observation.reset_at,
+        remaining_percent: observation.remaining_percent,
+        sol_dollars: v3_model_by_name(models.map(Vec::as_slice), "SOL")
+            .and_then(|model| model.total_dollars),
+        terra_dollars: v3_model_by_name(models.map(Vec::as_slice), "TERRA")
+            .and_then(|model| model.total_dollars),
+        luna_dollars: v3_model_by_name(models.map(Vec::as_slice), "LUNA")
+            .and_then(|model| model.total_dollars),
+        sol_tokens: v3_model_by_name(models.map(Vec::as_slice), "SOL")
+            .map(|model| model.total_tokens),
+        terra_tokens: v3_model_by_name(models.map(Vec::as_slice), "TERRA")
+            .map(|model| model.total_tokens),
+        luna_tokens: v3_model_by_name(models.map(Vec::as_slice), "LUNA")
+            .map(|model| model.total_tokens),
+        model_source,
+        model_totals,
+        model_totals_complete: observation.models_complete,
     }
 }
 
@@ -3498,12 +3826,24 @@ impl UsageHistory {
     }
 
     fn record(&mut self, sample: UsageHistorySample) {
+        self.record_with_models(sample, None);
+    }
+
+    fn record_with_models(
+        &mut self,
+        sample: UsageHistorySample,
+        model_totals: Option<Vec<usage_store::SessionModelTotal>>,
+    ) {
         if !sample.is_valid() {
             return;
         }
         let stored_sample = sample.to_store();
         self.pending_store_samples.push(stored_sample.clone());
-        let observation = usage_store::UsageHistoryObservation::confirmed(&stored_sample);
+        let observation = model_totals
+            .map(|totals| {
+                usage_store::UsageHistoryObservation::confirmed_with_models(&stored_sample, totals)
+            })
+            .unwrap_or_else(|| usage_store::UsageHistoryObservation::confirmed(&stored_sample));
         Self::merge_observation(&mut self.pending_store_observations, observation.clone());
         Self::merge_observation(&mut self.observations, observation);
         let acquisition_end = sample.timestamp;
@@ -3513,9 +3853,19 @@ impl UsageHistory {
     }
 
     fn apply_backfill_samples(&mut self, reset_at: i64, samples: Vec<UsageHistorySample>) {
+        self.apply_backfill_samples_with_models(reset_at, samples, Vec::new());
+    }
+
+    fn apply_backfill_samples_with_models(
+        &mut self,
+        reset_at: i64,
+        samples: Vec<UsageHistorySample>,
+        model_history: Vec<(i64, Vec<usage_store::SessionModelTotal>)>,
+    ) {
         if samples.is_empty() {
             return;
         }
+        let model_history = model_history.into_iter().collect::<BTreeMap<_, _>>();
         let acquisition_end = samples
             .iter()
             .filter(|sample| sample.is_valid())
@@ -3529,7 +3879,16 @@ impl UsageHistory {
             }
             let stored_sample = sample.to_store();
             self.pending_store_samples.push(stored_sample.clone());
-            let observation = usage_store::UsageHistoryObservation::confirmed(&stored_sample);
+            let observation = model_history
+                .get(&sample.timestamp)
+                .cloned()
+                .map(|totals| {
+                    usage_store::UsageHistoryObservation::confirmed_with_models(
+                        &stored_sample,
+                        totals,
+                    )
+                })
+                .unwrap_or_else(|| usage_store::UsageHistoryObservation::confirmed(&stored_sample));
             backfill_observations.push(observation);
             self.samples.push(sample);
         }
@@ -3849,6 +4208,8 @@ fn one_month_before_utc(now: DateTime<Utc>) -> i64 {
 #[derive(Default)]
 struct GraphPaths {
     remaining: String,
+    remaining_solid: String,
+    remaining_inferred: String,
     remaining_markers: Vec<RemainingMarkerPosition>,
     unused_intervals: Vec<UnusedIntervalPosition>,
     sol: String,
@@ -3856,24 +4217,42 @@ struct GraphPaths {
     luna: String,
     sol_flat: String,
     sol_rising: String,
+    sol_inferred: String,
     terra_flat: String,
     terra_rising: String,
+    terra_inferred: String,
     luna_flat: String,
     luna_rising: String,
+    luna_inferred: String,
+    astra_flat: String,
+    astra_rising: String,
+    astra_inferred: String,
     dollar_labels: [String; 5],
     current_remaining_label: String,
     current_sol_label: String,
     current_terra_label: String,
     current_luna_label: String,
+    current_astra_label: String,
     current_remaining_point_y: f32,
     current_sol_point_y: f32,
     current_terra_point_y: f32,
     current_luna_point_y: f32,
+    current_astra_point_y: f32,
     current_remaining_y: f32,
     current_sol_y: f32,
     current_terra_y: f32,
     current_luna_y: f32,
+    current_astra_y: f32,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct GraphModelPoint {
+    dollar: f64,
+    tokens: f64,
+    reliable: bool,
+}
+
+type GraphModelTimelines = BTreeMap<String, BTreeMap<i64, GraphModelPoint>>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RemainingMarkerPosition {
@@ -3983,16 +4362,25 @@ fn graph_paths_with_sources(
         period_start,
         period_end,
         confirmed_gaps,
+        None,
     );
+    let (remaining_solid, remaining_inferred) = remaining_paths_with_evidence(
+        &remaining_points,
+        samples,
+        &raw_minute,
+        period_start,
+        period_end,
+        confirmed_gaps,
+    );
+    let remaining_path = [remaining_solid.as_str(), remaining_inferred.as_str()]
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     GraphPaths {
-        remaining: remaining_path_with_evidence(
-            &remaining_points,
-            samples,
-            &raw_minute,
-            period_start,
-            period_end,
-            confirmed_gaps,
-        ),
+        remaining: remaining_path,
+        remaining_solid,
+        remaining_inferred,
         remaining_markers: remaining_marker_positions_on_points(
             &remaining_points,
             period_start,
@@ -4109,6 +4497,34 @@ fn graph_paths_for_selection_with_sources(
     untrusted_minutes: &BTreeSet<i64>,
     confirmed_gaps: &[GraphConfirmedGap],
 ) -> GraphPaths {
+    graph_paths_for_selection_with_sources_and_astra(
+        samples,
+        period_start,
+        period_end,
+        show_luna,
+        show_terra,
+        show_sol,
+        false,
+        show_tokens,
+        untrusted_minutes,
+        confirmed_gaps,
+        &BTreeMap::new(),
+    )
+}
+
+fn graph_paths_for_selection_with_sources_and_astra(
+    samples: &[&UsageHistorySample],
+    period_start: i64,
+    period_end: i64,
+    show_luna: bool,
+    show_terra: bool,
+    show_sol: bool,
+    show_astra: bool,
+    show_tokens: bool,
+    untrusted_minutes: &BTreeSet<i64>,
+    confirmed_gaps: &[GraphConfirmedGap],
+    model_timelines: &GraphModelTimelines,
+) -> GraphPaths {
     let mut paths = graph_paths_with_sources(
         samples,
         period_start,
@@ -4116,11 +4532,30 @@ fn graph_paths_for_selection_with_sources(
         untrusted_minutes,
         confirmed_gaps,
     );
-    let minute = graph_time_endpoints(
+    let mut minute = graph_time_endpoints(
         minute_model_spend_for_metric_with_untrusted(samples, show_tokens, untrusted_minutes),
         period_start,
         period_end,
     );
+    for point in &mut minute {
+        let value = |name: &str, fallback: f64| {
+            model_timelines
+                .get(name)
+                .and_then(|timeline| timeline.get(&point.timestamp))
+                .map(|model| {
+                    if show_tokens {
+                        model.tokens
+                    } else {
+                        model.dollar
+                    }
+                })
+                .unwrap_or(fallback)
+        };
+        point.sol = value("SOL", point.sol);
+        point.terra = value("TERRA", point.terra);
+        point.luna = value("LUNA", point.luna);
+        point.astra = value("ASTRA", -1.0);
+    }
     // Keep the remaining line on the same activity metric as the visible
     // model lines. A legacy row with dollars but no token counters must not
     // make the token graph slope while every visible model line is flat.
@@ -4136,7 +4571,7 @@ fn graph_paths_for_selection_with_sources(
         .any(|sample| sample.remaining_percent.is_finite() && sample.remaining_percent >= 0.0);
     if has_remaining_observation {
         if let Some(remaining) = remaining_points.last().map(|(_, value)| *value) {
-            paths.remaining = remaining_path_with_evidence(
+            let (solid, inferred) = remaining_paths_with_evidence(
                 &remaining_points,
                 samples,
                 &minute,
@@ -4144,6 +4579,13 @@ fn graph_paths_for_selection_with_sources(
                 period_end,
                 confirmed_gaps,
             );
+            paths.remaining = [solid.as_str(), inferred.as_str()]
+                .into_iter()
+                .filter(|path| !path.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            paths.remaining_solid = solid;
+            paths.remaining_inferred = inferred;
             paths.remaining_markers =
                 remaining_marker_positions_on_points(&remaining_points, period_start, period_end);
             paths.current_remaining_label = format_percent(remaining);
@@ -4157,6 +4599,7 @@ fn graph_paths_for_selection_with_sources(
         period_start,
         period_end,
         confirmed_gaps,
+        Some((model_timelines, show_tokens)),
     );
     let observed_maximum = samples
         .iter()
@@ -4181,17 +4624,36 @@ fn graph_paths_for_selection_with_sources(
                 .max_by(f64::total_cmp)
         })
         .max_by(f64::total_cmp)
-        .unwrap_or(0.0);
+        .unwrap_or(0.0)
+        .max(if show_astra {
+            minute
+                .iter()
+                .map(|point| point.astra)
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .max_by(f64::total_cmp)
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        });
     let maximum = minute
         .iter()
         .map(|point| {
             if show_tokens {
-                point.sol.max(point.terra).max(point.luna)
+                point
+                    .sol
+                    .max(point.terra)
+                    .max(point.luna)
+                    .max(if show_astra {
+                        point.astra.max(0.0)
+                    } else {
+                        0.0
+                    })
             } else {
                 [
                     show_luna.then_some(point.luna),
                     show_terra.then_some(point.terra),
                     show_sol.then_some(point.sol),
+                    show_astra.then_some(point.astra),
                 ]
                 .into_iter()
                 .flatten()
@@ -4200,15 +4662,25 @@ fn graph_paths_for_selection_with_sources(
         })
         .fold(0.0_f64, f64::max);
     let scale_maximum = maximum.max(observed_maximum).max(1.0);
-    let latest = minute.last().copied().unwrap_or_default();
-    let display_latest = if show_tokens {
+    let latest_value = |value: fn(&HourlyModelSpend) -> f64| {
         minute
-            .last()
-            .copied()
-            .filter(model_spend_is_reliable)
-            .unwrap_or(latest)
-    } else {
-        latest_reliable_model_spend(samples, false).unwrap_or(latest)
+            .iter()
+            .rev()
+            .map(value)
+            .find(|value| value.is_finite() && *value >= 0.0)
+    };
+    let model_untrusted = |name: &str| {
+        let timeline = model_timelines.get(name);
+        let mut minutes = BTreeSet::new();
+        if let Some(timeline) = timeline {
+            minutes.extend(
+                timeline
+                    .iter()
+                    .filter(|(_, point)| !point.reliable)
+                    .map(|(minute, _)| *minute),
+            );
+        }
+        minutes
     };
     paths.dollar_labels = if show_tokens {
         token_axis_labels(scale_maximum)
@@ -4220,116 +4692,147 @@ fn graph_paths_for_selection_with_sources(
     paths.luna.clear();
     paths.sol_flat.clear();
     paths.sol_rising.clear();
+    paths.sol_inferred.clear();
     paths.terra_flat.clear();
     paths.terra_rising.clear();
+    paths.terra_inferred.clear();
     paths.luna_flat.clear();
     paths.luna_rising.clear();
+    paths.luna_inferred.clear();
+    paths.astra_flat.clear();
+    paths.astra_rising.clear();
+    paths.astra_inferred.clear();
     paths.current_sol_label.clear();
     paths.current_terra_label.clear();
     paths.current_luna_label.clear();
+    paths.current_astra_label.clear();
     paths.current_sol_point_y = 0.99;
     paths.current_terra_point_y = 0.99;
     paths.current_luna_point_y = 0.99;
     paths.current_sol_y = 0.99;
     paths.current_terra_y = 0.99;
     paths.current_luna_y = 0.99;
+    paths.current_astra_point_y = 0.99;
+    paths.current_astra_y = 0.99;
     let graph_y =
         |value: f64| ((99.0 - value / scale_maximum * 98.0) / 100.0).clamp(0.01, 0.99) as f32;
     if show_luna {
-        let (flat, rising, inferred) = split_metric_line_paths_with_confirmed_gaps(
+        let (flat, rising, inferred) = split_metric_line_paths_with_evidence(
             &minute,
             period_start,
             period_end,
             scale_maximum,
             |point| point.luna,
             confirmed_gaps,
+            &model_untrusted("LUNA"),
+            false,
         );
-        paths.luna_flat = [flat, inferred]
-            .into_iter()
-            .filter(|path| !path.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        paths.luna_flat = flat;
         paths.luna_rising = rising;
-        paths.luna = metric_line_path_with_confirmed_gaps(
-            &minute,
-            period_start,
-            period_end,
-            scale_maximum,
-            |point| point.luna,
-            confirmed_gaps,
-        );
-        paths.current_luna_label =
-            if observed_maximum > 0.0 && model_spend_is_reliable(&display_latest) {
-                format_metric_value(display_latest.luna, show_tokens)
-            } else {
-                String::new()
-            };
-        paths.current_luna_y = graph_y(display_latest.luna);
-        paths.current_luna_point_y = paths.current_luna_y;
+        paths.luna_inferred = inferred;
+        paths.luna = [
+            paths.luna_flat.as_str(),
+            paths.luna_rising.as_str(),
+            paths.luna_inferred.as_str(),
+        ]
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+        if let Some(latest) = latest_value(|point| point.luna) {
+            if observed_maximum > 0.0 {
+                paths.current_luna_label = format_metric_value(latest, show_tokens);
+            }
+            paths.current_luna_y = graph_y(latest);
+            paths.current_luna_point_y = paths.current_luna_y;
+        }
     }
     if show_terra {
-        let (flat, rising, inferred) = split_metric_line_paths_with_confirmed_gaps(
+        let (flat, rising, inferred) = split_metric_line_paths_with_evidence(
             &minute,
             period_start,
             period_end,
             scale_maximum,
             |point| point.terra,
             confirmed_gaps,
+            &model_untrusted("TERRA"),
+            false,
         );
-        paths.terra_flat = [flat, inferred]
-            .into_iter()
-            .filter(|path| !path.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        paths.terra_flat = flat;
         paths.terra_rising = rising;
-        paths.terra = metric_line_path_with_confirmed_gaps(
-            &minute,
-            period_start,
-            period_end,
-            scale_maximum,
-            |point| point.terra,
-            confirmed_gaps,
-        );
-        paths.current_terra_label =
-            if observed_maximum > 0.0 && model_spend_is_reliable(&display_latest) {
-                format_metric_value(display_latest.terra, show_tokens)
-            } else {
-                String::new()
-            };
-        paths.current_terra_y = graph_y(display_latest.terra);
-        paths.current_terra_point_y = paths.current_terra_y;
+        paths.terra_inferred = inferred;
+        paths.terra = [
+            paths.terra_flat.as_str(),
+            paths.terra_rising.as_str(),
+            paths.terra_inferred.as_str(),
+        ]
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+        if let Some(latest) = latest_value(|point| point.terra) {
+            if observed_maximum > 0.0 {
+                paths.current_terra_label = format_metric_value(latest, show_tokens);
+            }
+            paths.current_terra_y = graph_y(latest);
+            paths.current_terra_point_y = paths.current_terra_y;
+        }
     }
     if show_sol {
-        let (flat, rising, inferred) = split_metric_line_paths_with_confirmed_gaps(
+        let (flat, rising, inferred) = split_metric_line_paths_with_evidence(
             &minute,
             period_start,
             period_end,
             scale_maximum,
             |point| point.sol,
             confirmed_gaps,
+            &model_untrusted("SOL"),
+            false,
         );
-        paths.sol_flat = [flat, inferred]
-            .into_iter()
-            .filter(|path| !path.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        paths.sol_flat = flat;
         paths.sol_rising = rising;
-        paths.sol = metric_line_path_with_confirmed_gaps(
+        paths.sol_inferred = inferred;
+        paths.sol = [
+            paths.sol_flat.as_str(),
+            paths.sol_rising.as_str(),
+            paths.sol_inferred.as_str(),
+        ]
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+        if let Some(latest) = latest_value(|point| point.sol) {
+            if observed_maximum > 0.0 {
+                paths.current_sol_label = format_metric_value(latest, show_tokens);
+            }
+            paths.current_sol_y = graph_y(latest);
+            paths.current_sol_point_y = paths.current_sol_y;
+        }
+    }
+    if show_astra {
+        let (flat, rising, inferred) = split_metric_line_paths_with_evidence(
             &minute,
             period_start,
             period_end,
             scale_maximum,
-            |point| point.sol,
+            |point| point.astra,
             confirmed_gaps,
+            &model_untrusted("ASTRA"),
+            false,
         );
-        paths.current_sol_label =
-            if observed_maximum > 0.0 && model_spend_is_reliable(&display_latest) {
-                format_metric_value(display_latest.sol, show_tokens)
-            } else {
-                String::new()
-            };
-        paths.current_sol_y = graph_y(display_latest.sol);
-        paths.current_sol_point_y = paths.current_sol_y;
+        paths.astra_flat = flat;
+        paths.astra_rising = rising;
+        paths.astra_inferred = inferred;
+        if let Some(latest_astra) = minute
+            .iter()
+            .rev()
+            .map(|point| point.astra)
+            .find(|value| value.is_finite() && *value >= 0.0)
+        {
+            paths.current_astra_label = format_metric_value(latest_astra, show_tokens);
+            paths.current_astra_y = graph_y(latest_astra);
+            paths.current_astra_point_y = paths.current_astra_y;
+        }
     }
     paths
 }
@@ -4469,6 +4972,7 @@ struct HourlyModelSpend {
     sol: f64,
     terra: f64,
     luna: f64,
+    astra: f64,
 }
 
 fn model_spend_is_reliable(point: &HourlyModelSpend) -> bool {
@@ -4499,6 +5003,7 @@ fn latest_reliable_model_spend(
             } else {
                 sample.luna_dollars
             },
+            astra: -1.0,
         };
         model_spend_is_reliable(&point).then_some(point)
     })
@@ -4510,6 +5015,7 @@ fn unreliable_model_spend(timestamp: i64) -> HourlyModelSpend {
         sol: -1.0,
         terra: -1.0,
         luna: -1.0,
+        astra: -1.0,
     }
 }
 
@@ -4528,7 +5034,7 @@ fn minute_model_spend_for_metric(
 fn minute_model_spend_for_metric_with_untrusted(
     samples: &[&UsageHistorySample],
     show_tokens: bool,
-    untrusted_minutes: &BTreeSet<i64>,
+    _untrusted_minutes: &BTreeSet<i64>,
 ) -> Vec<HourlyModelSpend> {
     let mut buckets: Vec<UsageHistorySample> = Vec::new();
     for sample in samples {
@@ -4544,38 +5050,34 @@ fn minute_model_spend_for_metric_with_untrusted(
         buckets.push(sample);
     }
     if show_tokens {
-        // A cumulative vector may never move backwards inside one period.
-        // Older rows can contain zero because token fields did not exist, and
-        // a damaged collection can temporarily lose an already-counted
-        // Session prefix. Neither is evidence of zero usage. Keep the whole
-        // observation unavailable until one later whole vector dominates the
-        // last reliable vector; component-wise maxima would fabricate a row
-        // that was never observed.
+        // Each model is an independent cumulative series. A damaged scan can
+        // temporarily lose one already-counted Session prefix, but that is no
+        // reason to discard another model that was observed and advanced in
+        // the same row. Mark only the regressed component unavailable; do not
+        // replace it with a component-wise maximum, which would fabricate a
+        // value that was never observed.
         let mut reliable = [0.0_f64; 3];
         return buckets
             .into_iter()
             .map(|sample| {
-                if untrusted_minutes.contains(&sample.timestamp) {
-                    return unreliable_model_spend(sample.timestamp);
-                }
                 let current = [
                     sample.sol_tokens as f64,
                     sample.terra_tokens as f64,
                     sample.luna_tokens as f64,
                 ];
-                if current
-                    .iter()
-                    .zip(reliable)
-                    .any(|(current, previous)| *current < previous)
-                {
-                    return unreliable_model_spend(sample.timestamp);
+                let mut visible = [-1.0_f64; 3];
+                for index in 0..current.len() {
+                    if current[index] >= reliable[index] {
+                        reliable[index] = current[index];
+                        visible[index] = current[index];
+                    }
                 }
-                reliable = current;
                 HourlyModelSpend {
                     timestamp: sample.timestamp,
-                    sol: current[0],
-                    terra: current[1],
-                    luna: current[2],
+                    sol: visible[0],
+                    terra: visible[1],
+                    luna: visible[2],
+                    astra: -1.0,
                 }
             })
             .collect();
@@ -4585,27 +5087,27 @@ fn minute_model_spend_for_metric_with_untrusted(
     buckets
         .into_iter()
         .map(|sample| {
-            if untrusted_minutes.contains(&sample.timestamp) {
-                return unreliable_model_spend(sample.timestamp);
-            }
             let current = [
                 sample.sol_dollars,
                 sample.terra_dollars,
                 sample.luna_dollars,
             ];
-            if current
-                .iter()
-                .zip(reliable)
-                .any(|(current, previous)| *current < previous)
-            {
-                return unreliable_model_spend(sample.timestamp);
+            let mut visible = [-1.0_f64; 3];
+            for index in 0..current.len() {
+                if current[index].is_finite()
+                    && current[index] >= 0.0
+                    && current[index] >= reliable[index]
+                {
+                    reliable[index] = current[index];
+                    visible[index] = current[index];
+                }
             }
-            reliable = current;
             HourlyModelSpend {
                 timestamp: sample.timestamp,
-                sol: current[0],
-                terra: current[1],
-                luna: current[2],
+                sol: visible[0],
+                terra: visible[1],
+                luna: visible[2],
+                astra: -1.0,
             }
         })
         .collect()
@@ -4646,8 +5148,11 @@ fn append_dashed_segment(commands: &mut String, start: (f64, f64), end: (f64, f6
     if !length.is_finite() || length <= f64::EPSILON {
         return;
     }
-    const DASH: f64 = 1.2;
-    const GAP: f64 = 0.9;
+    // Keep inferred intervals visually distinct from measured strokes even
+    // on a wide graph. Short, closely-spaced dashes make the transition point
+    // readable without increasing the 1px inferred stroke width.
+    const DASH: f64 = 0.45;
+    const GAP: f64 = 0.30;
     let mut offset = 0.0;
     while offset < length {
         let dash_end = (offset + DASH).min(length);
@@ -4700,6 +5205,28 @@ fn split_metric_line_paths_with_confirmed_gaps(
     value: impl Fn(&HourlyModelSpend) -> f64,
     confirmed_gaps: &[GraphConfirmedGap],
 ) -> (String, String, String) {
+    split_metric_line_paths_with_evidence(
+        points,
+        period_start,
+        period_end,
+        maximum,
+        value,
+        confirmed_gaps,
+        &BTreeSet::new(),
+        true,
+    )
+}
+
+fn split_metric_line_paths_with_evidence(
+    points: &[HourlyModelSpend],
+    period_start: i64,
+    period_end: i64,
+    maximum: f64,
+    value: impl Fn(&HourlyModelSpend) -> f64,
+    confirmed_gaps: &[GraphConfirmedGap],
+    untrusted_minutes: &BTreeSet<i64>,
+    require_legacy_vector: bool,
+) -> (String, String, String) {
     let span = (period_end - period_start).max(1) as f64;
     let scale = maximum.max(1.0);
     let coordinate = |point: &HourlyModelSpend| {
@@ -4718,19 +5245,28 @@ fn split_metric_line_paths_with_confirmed_gaps(
         ) {
             continue;
         }
-        if !model_spend_is_reliable(&pair[0]) || !model_spend_is_reliable(&pair[1]) {
+        let untrusted = untrusted_minutes.contains(&pair[0].timestamp)
+            || untrusted_minutes.contains(&pair[1].timestamp);
+        if require_legacy_vector
+            && (!model_spend_is_reliable(&pair[0]) || !model_spend_is_reliable(&pair[1]))
+        {
             continue;
         }
         let previous = value(&pair[0]);
         let current = value(&pair[1]);
-        if !previous.is_finite() || !current.is_finite() || current < previous {
+        if !previous.is_finite()
+            || !current.is_finite()
+            || previous < 0.0
+            || current < 0.0
+            || current < previous
+        {
             continue;
         }
         let (x1, y1) = coordinate(&pair[0]);
         let (x2, y2) = coordinate(&pair[1]);
         let unobserved_gap = pair[1].timestamp.saturating_sub(pair[0].timestamp)
             > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
-        if unobserved_gap {
+        if untrusted || (unobserved_gap && current != previous) {
             append_dashed_segment(&mut inferred, (x1, y1), (x2, y2));
             continue;
         }
@@ -4752,7 +5288,11 @@ fn split_metric_line_paths_with_confirmed_gaps(
     let mut last_reliable: Option<&HourlyModelSpend> = None;
     let mut crossed_unreliable = false;
     for point in points {
-        if !model_spend_is_reliable(point) {
+        let value_is_reliable = value(point).is_finite() && value(point) >= 0.0;
+        if (require_legacy_vector && !model_spend_is_reliable(point))
+            || !value_is_reliable
+            || untrusted_minutes.contains(&point.timestamp)
+        {
             crossed_unreliable |= last_reliable.is_some();
             continue;
         }
@@ -4764,7 +5304,16 @@ fn split_metric_line_paths_with_confirmed_gaps(
                     confirmed_gaps,
                 )
             {
-                append_dashed_segment(&mut inferred, coordinate(previous), coordinate(point));
+                if value(previous) == value(point) {
+                    let (x1, y1) = coordinate(previous);
+                    let (x2, y2) = coordinate(point);
+                    if !flat.is_empty() {
+                        flat.push(' ');
+                    }
+                    flat.push_str(&format!("M{x1:.2} {y1:.2} L{x2:.2} {y2:.2}"));
+                } else {
+                    append_dashed_segment(&mut inferred, coordinate(previous), coordinate(point));
+                }
             }
         }
         last_reliable = Some(point);
@@ -4773,22 +5322,23 @@ fn split_metric_line_paths_with_confirmed_gaps(
     (flat, rising, inferred)
 }
 
-/// Return horizontal bands where the model series is idle or unavailable.
-/// An unavailable interval also receives a dashed endpoint bridge; the band
-/// ensures it can never be mistaken for a confirmed flat cumulative value.
+/// Return horizontal bands only where every represented cumulative model
+/// series is confirmed unchanged. Missing and unavailable evidence belongs to
+/// the thin dashed paths and must never be labelled as idle.
 fn unused_interval_positions(
     points: &[HourlyModelSpend],
     period_start: i64,
     period_end: i64,
 ) -> Vec<UnusedIntervalPosition> {
-    unused_interval_positions_with_confirmed_gaps(points, period_start, period_end, &[])
+    unused_interval_positions_with_confirmed_gaps(points, period_start, period_end, &[], None)
 }
 
 fn unused_interval_positions_with_confirmed_gaps(
     points: &[HourlyModelSpend],
     period_start: i64,
     period_end: i64,
-    confirmed_gaps: &[GraphConfirmedGap],
+    _confirmed_gaps: &[GraphConfirmedGap],
+    model_timelines: Option<(&GraphModelTimelines, bool)>,
 ) -> Vec<UnusedIntervalPosition> {
     let span = (period_end - period_start).max(1) as f64;
     let to_x =
@@ -4807,28 +5357,40 @@ fn unused_interval_positions_with_confirmed_gaps(
             continue;
         }
         let unreliable = !model_spend_is_reliable(previous) || !model_spend_is_reliable(current);
-        let unchanged = [
+        let represented_unchanged = [
             (previous.sol, current.sol),
             (previous.terra, current.terra),
             (previous.luna, current.luna),
+            (previous.astra, current.astra),
         ]
         .into_iter()
-        .all(|(before, after)| before.is_finite() && after.is_finite() && before == after)
-            && !unreliable;
-        // A long observation gap ending at a later cumulative value contains
-        // no evidence of when usage occurred. Render the whole unobserved
-        // interval as idle, then let the model line make the vertical change
-        // at the observed endpoint; never leave daytime gaps unmarked.
-        let unobserved_active_gap = current.timestamp.saturating_sub(previous.timestamp)
-            > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS
-            && [
-                (previous.sol, current.sol),
-                (previous.terra, current.terra),
-                (previous.luna, current.luna),
-            ]
-            .into_iter()
-            .any(|(before, after)| after > before);
-        if !unchanged && !unobserved_active_gap && !unreliable {
+        .all(|(before, after)| {
+            (before.is_finite() && after.is_finite() && before == after)
+                || (before < 0.0 && after < 0.0)
+        }) && !unreliable;
+        let generic_unchanged = model_timelines.is_none_or(|(timelines, show_tokens)| {
+            !timelines.is_empty()
+                && timelines.values().all(|timeline| {
+                    let Some(before) = timeline.get(&previous.timestamp) else {
+                        return false;
+                    };
+                    let Some(after) = timeline.get(&current.timestamp) else {
+                        return false;
+                    };
+                    let before = if show_tokens {
+                        before.tokens
+                    } else {
+                        before.dollar
+                    };
+                    let after = if show_tokens {
+                        after.tokens
+                    } else {
+                        after.dollar
+                    };
+                    before.is_finite() && after.is_finite() && before >= 0.0 && before == after
+                })
+        });
+        if !represented_unchanged || !generic_unchanged {
             continue;
         }
         let start = to_x(interval_start);
@@ -4836,7 +5398,7 @@ fn unused_interval_positions_with_confirmed_gaps(
         if end <= start {
             continue;
         }
-        let preserve_boundary = unobserved_active_gap || unreliable;
+        let preserve_boundary = false;
         if let Some(last) = intervals.last_mut() {
             let last_end = last.start + last.width;
             if last.preserve_boundary == preserve_boundary
@@ -4850,18 +5412,6 @@ fn unused_interval_positions_with_confirmed_gaps(
             start,
             width: end - start,
             preserve_boundary,
-        });
-    }
-    for gap in confirmed_gaps {
-        let gap_start = gap.start_at.max(period_start);
-        let gap_end = gap.end_at.min(period_end);
-        if gap_end <= gap_start {
-            continue;
-        }
-        intervals.push(UnusedIntervalPosition {
-            start: to_x(gap_start),
-            width: to_x(gap_end) - to_x(gap_start),
-            preserve_boundary: true,
         });
     }
     intervals.sort_by(|left, right| {
@@ -4882,6 +5432,7 @@ fn separate_current_label_positions(
     show_luna: bool,
     show_terra: bool,
     show_sol: bool,
+    show_astra: bool,
 ) {
     const MIN_PATH_HEIGHT: f32 = 204.0;
     const HALF_LABEL: f32 = 8.0 / MIN_PATH_HEIGHT;
@@ -4889,7 +5440,7 @@ fn separate_current_label_positions(
     const LOWER: f32 = HALF_LABEL;
     const UPPER: f32 = 1.0 - HALF_LABEL;
 
-    let mut labels = Vec::with_capacity(4);
+    let mut labels = Vec::with_capacity(5);
     if show_remaining && !paths.current_remaining_label.is_empty() {
         labels.push((0_u8, paths.current_remaining_y));
     }
@@ -4901,6 +5452,9 @@ fn separate_current_label_positions(
     }
     if show_sol && !paths.current_sol_label.is_empty() {
         labels.push((3, paths.current_sol_y));
+    }
+    if show_astra && !paths.current_astra_label.is_empty() {
+        labels.push((4, paths.current_astra_y));
     }
     labels.sort_by(|left, right| {
         left.1
@@ -4932,6 +5486,7 @@ fn separate_current_label_positions(
             1 => paths.current_luna_y = position,
             2 => paths.current_terra_y = position,
             3 => paths.current_sol_y = position,
+            4 => paths.current_astra_y = position,
             _ => unreachable!("label kind is internal and bounded"),
         }
     }
@@ -5469,21 +6024,22 @@ fn model_interval_evidence(points: &[HourlyModelSpend], start: i64, end: i64) ->
 /// strokes. A normal open-ended remote gap holds the last measured remaining
 /// value horizontally as an explicitly dashed last-good projection; a
 /// confirmed irrecoverable gap still breaks the path entirely.
-fn remaining_path_with_evidence(
+fn remaining_paths_with_evidence(
     points: &[(i64, f64)],
     samples: &[&UsageHistorySample],
     model_points: &[HourlyModelSpend],
     period_start: i64,
     period_end: i64,
     confirmed_gaps: &[GraphConfirmedGap],
-) -> String {
+) -> (String, String) {
     let span = (period_end - period_start).max(1) as f64;
     let coordinate = |(timestamp, raw): (i64, f64)| {
         let x = ((timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
         let y = (99.0 - raw.clamp(0.0, 100.0) * 0.98).clamp(1.0, 99.0);
         (x, y)
     };
-    let mut commands = String::new();
+    let mut solid_commands = String::new();
+    let mut inferred_commands = String::new();
     for pair in points.windows(2) {
         let [before, after] = pair else {
             continue;
@@ -5504,18 +6060,18 @@ fn remaining_path_with_evidence(
         let start = coordinate(*before);
         let end = coordinate(*after);
         if solid {
-            if !commands.is_empty() {
-                commands.push(' ');
+            if !solid_commands.is_empty() {
+                solid_commands.push(' ');
             }
-            commands.push_str(&format!(
+            solid_commands.push_str(&format!(
                 "M{:.2} {:.2} L{:.2} {:.2}",
                 start.0, start.1, end.0, end.1
             ));
         } else {
-            append_dashed_segment(&mut commands, start, end);
+            append_dashed_segment(&mut inferred_commands, start, end);
         }
     }
-    commands
+    (solid_commands, inferred_commands)
 }
 
 fn remaining_graph_y(remaining: f64) -> f64 {
@@ -5552,6 +6108,11 @@ fn smooth_model_spend(points: &[HourlyModelSpend]) -> Vec<HourlyModelSpend> {
                 sol: current.sol.max(previous.sol),
                 terra: current.terra.max(previous.terra),
                 luna: current.luna.max(previous.luna),
+                astra: if current.astra >= 0.0 && previous.astra >= 0.0 {
+                    current.astra.max(previous.astra)
+                } else {
+                    current.astra
+                },
             });
             continue;
         }
@@ -5563,6 +6124,11 @@ fn smooth_model_spend(points: &[HourlyModelSpend]) -> Vec<HourlyModelSpend> {
             sol: smooth(previous.sol, current.sol, next.sol, previous.sol),
             terra: smooth(previous.terra, current.terra, next.terra, previous.terra),
             luna: smooth(previous.luna, current.luna, next.luna, previous.luna),
+            astra: if previous.astra >= 0.0 && current.astra >= 0.0 && next.astra >= 0.0 {
+                smooth(previous.astra, current.astra, next.astra, previous.astra)
+            } else {
+                current.astra
+            },
         });
     }
     let last = *points.last().expect("points has at least three items");
@@ -5576,6 +6142,11 @@ fn smooth_model_spend(points: &[HourlyModelSpend]) -> Vec<HourlyModelSpend> {
         sol: last.sol.max(previous.sol),
         terra: last.terra.max(previous.terra),
         luna: last.luna.max(previous.luna),
+        astra: if last.astra >= 0.0 && previous.astra >= 0.0 {
+            last.astra.max(previous.astra)
+        } else {
+            last.astra
+        },
     });
     smoothed
 }
@@ -5595,25 +6166,20 @@ fn codex_home_root() -> Option<PathBuf> {
 #[derive(Default)]
 struct SessionTraversalBudget {
     files: usize,
-    total_bytes: u64,
 }
 
 impl SessionTraversalBudget {
     fn admit_file(
         &mut self,
         relative_depth: usize,
-        bytes: u64,
+        _bytes: u64,
     ) -> Result<(), security::SecurityError> {
-        if relative_depth > security::MAX_SESSION_DEPTH || bytes > security::MAX_SESSION_FILE_BYTES
-        {
+        if relative_depth > security::MAX_SESSION_DEPTH {
             return Err(security::SecurityError::new(
                 security::SecurityErrorKind::LimitExceeded,
             ));
         }
         let files = self.files.checked_add(1).ok_or_else(|| {
-            security::SecurityError::new(security::SecurityErrorKind::LimitExceeded)
-        })?;
-        let total_bytes = self.total_bytes.checked_add(bytes).ok_or_else(|| {
             security::SecurityError::new(security::SecurityErrorKind::LimitExceeded)
         })?;
         if files > security::MAX_SESSION_FILES {
@@ -5622,7 +6188,6 @@ impl SessionTraversalBudget {
             ));
         }
         self.files = files;
-        self.total_bytes = total_bytes;
         Ok(())
     }
 }
@@ -5639,20 +6204,25 @@ fn session_jsonl_files(root: &Path) -> Result<Vec<PathBuf>, security::SecurityEr
                 security::SecurityErrorKind::LimitExceeded,
             ));
         }
-        let entries = fs::read_dir(directory)
-            .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
-        for entry in entries {
-            let entry = entry.map_err(|_| {
-                security::SecurityError::new(security::SecurityErrorKind::UnsafePath)
-            })?;
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path).map_err(|_| {
-                security::SecurityError::new(security::SecurityErrorKind::UnsafePath)
-            })?;
-            if metadata.file_type().is_symlink() {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(_) if depth > 0 => return Ok(()),
+            Err(_) => {
                 return Err(security::SecurityError::new(
                     security::SecurityErrorKind::UnsafePath,
                 ));
+            }
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() {
+                continue;
             }
             if metadata.is_dir() {
                 visit(&path, depth + 1, budget, files)?;
@@ -5737,9 +6307,7 @@ fn local_input_file_fingerprint(
     path: &Path,
     metadata: &fs::Metadata,
 ) -> Result<LocalInputFileFingerprint, security::SecurityError> {
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > security::MAX_SESSION_FILE_BYTES
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > i64::MAX as u64
     {
         return Err(security::SecurityError::new(
             security::SecurityErrorKind::UnsafePath,
@@ -5845,21 +6413,12 @@ fn select_latest_session_prefix(
     let mut selected_bytes = 0_u64;
     let mut overflow_started = false;
     for file in files {
-        if file.fingerprint.length > security::MAX_SESSION_FILE_BYTES {
-            return Err(security::SecurityError::new(
-                security::SecurityErrorKind::LimitExceeded,
-            ));
-        }
         if overflow_started {
             overflow.push(file);
             continue;
         }
-        let next_bytes = selected_bytes
-            .checked_add(file.fingerprint.length)
-            .ok_or_else(|| {
-                security::SecurityError::new(security::SecurityErrorKind::LimitExceeded)
-            })?;
-        if next_bytes <= selected_byte_limit {
+        let next_bytes = selected_bytes.saturating_add(file.fingerprint.length);
+        if selected.is_empty() || next_bytes <= selected_byte_limit {
             selected_bytes = next_bytes;
             selected.push(file);
         } else {
@@ -5914,12 +6473,19 @@ fn local_input_inventory_for_paths_with_limit(
             .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
         let root_identity = session_root_identity(root, &root_metadata)?;
         for path in &session_files {
-            let canonical = security::canonical_regular_file_under(root, path)?;
-            let metadata = fs::symlink_metadata(&canonical).map_err(|_| {
-                security::SecurityError::new(security::SecurityErrorKind::UnsafePath)
-            })?;
-            let fingerprint = local_input_file_fingerprint(&canonical, &metadata)?;
-            let recorded_source = recorded_session_source(root, &root_identity, &fingerprint)?;
+            let Ok(canonical) = security::canonical_regular_file_under(root, path) else {
+                continue;
+            };
+            let Ok(metadata) = fs::symlink_metadata(&canonical) else {
+                continue;
+            };
+            let Ok(fingerprint) = local_input_file_fingerprint(&canonical, &metadata) else {
+                continue;
+            };
+            let Ok(recorded_source) = recorded_session_source(root, &root_identity, &fingerprint)
+            else {
+                continue;
+            };
             candidates.push(SessionFileCandidate {
                 fingerprint,
                 recorded_source,
@@ -5971,6 +6537,7 @@ fn local_input_inventory() -> Result<LocalInputInventory, security::SecurityErro
 struct LocalUsageCollection {
     model_usage: ModelUsageTotals,
     history_samples: Vec<UsageHistorySample>,
+    history_model_totals: Vec<(i64, Vec<usage_store::SessionModelTotal>)>,
     recorded_sessions: Vec<usage_store::RecordedSessionSource>,
     session_checkpoints: Vec<usage_store::SessionCheckpoint>,
     session_ranges: Vec<usage_store::SessionRange>,
@@ -6020,7 +6587,16 @@ fn apply_regression_recovery(
         sample.terra_tokens = terra_tokens;
         sample.luna_tokens = luna_tokens;
     }
+    let mut adjusted_model_history = collection.history_model_totals.clone();
+    for (_, model_totals) in &mut adjusted_model_history {
+        let mut point = ModelUsageTotals::from_session_totals(model_totals);
+        if point.checked_add_totals(&offset).is_none() {
+            return false;
+        }
+        *model_totals = point.to_session_totals();
+    }
     collection.history_samples = adjusted_history;
+    collection.history_model_totals = adjusted_model_history;
     collection.session_model_totals = recovered.to_session_totals();
     collection.model_usage = recovered;
     debug_runtime(format!(
@@ -6171,9 +6747,16 @@ fn collect_local_usage_snapshot(
         &mut totals,
         &mut events,
     );
+    let (history_samples, history_model_totals) =
+        model_usage_timeline_with_models_from_events_with_initial(
+            events,
+            reset_at,
+            ModelUsageTotals::default(),
+        );
     Ok(LocalUsageCollection {
         model_usage: totals,
-        history_samples: model_usage_timeline_from_events(events, reset_at),
+        history_samples,
+        history_model_totals,
         recorded_sessions,
         session_checkpoints: Vec::new(),
         session_ranges: Vec::new(),
@@ -6203,6 +6786,7 @@ impl DelegationUsageRecoveryEntry {
         // usage display's total is intentionally input plus output only.
         let _ = self.reasoning_tokens;
         TokenSnapshot {
+            cache_write_input: None,
             total: self.input_tokens.saturating_add(self.output_tokens),
             input: self.input_tokens,
             cached_input: self.cached_input_tokens,
@@ -6317,6 +6901,7 @@ struct TimedModelUsage {
 /// record before returning the error, so skipping only `LimitExceeded` and
 /// `Parse` is both recoverable and bounded; I/O failures remain fatal.
 const SESSION_RECORD_INITIAL_CAPACITY: usize = 8 * 1024;
+const SESSION_APPEND_BYTES_PER_CYCLE: u64 = 64 * 1024 * 1024;
 
 fn read_recoverable_session_record_into<R: BufRead>(
     reader: &mut R,
@@ -6469,6 +7054,9 @@ fn session_token_snapshot(value: &Value) -> Option<TokenSnapshot> {
     let total = total_usage.get("total_tokens").and_then(Value::as_u64)?;
     Some(TokenSnapshot {
         total,
+        cache_write_input: total_usage
+            .get("cache_write_input_tokens")
+            .and_then(Value::as_u64),
         input: total_usage
             .get("input_tokens")
             .and_then(Value::as_u64)
@@ -6559,6 +7147,7 @@ fn collect_session_usage_records<R: BufRead>(
             continue;
         };
         let delta = TokenSnapshot {
+            cache_write_input: current.cache_write_delta_from(previous),
             total: current.total.saturating_sub(previous.total),
             input: current.input.saturating_sub(previous.input),
             cached_input: current.cached_input.saturating_sub(previous.cached_input),
@@ -6592,13 +7181,25 @@ fn model_usage_timeline_from_events(
 }
 
 fn model_usage_timeline_from_events_with_initial(
+    events: Vec<TimedModelUsage>,
+    reset_at: i64,
+    totals: ModelUsageTotals,
+) -> Vec<UsageHistorySample> {
+    model_usage_timeline_with_models_from_events_with_initial(events, reset_at, totals).0
+}
+
+fn model_usage_timeline_with_models_from_events_with_initial(
     mut events: Vec<TimedModelUsage>,
     reset_at: i64,
     mut totals: ModelUsageTotals,
-) -> Vec<UsageHistorySample> {
+) -> (
+    Vec<UsageHistorySample>,
+    Vec<(i64, Vec<usage_store::SessionModelTotal>)>,
+) {
     events.sort_by_key(|event| event.timestamp);
 
     let mut samples: Vec<UsageHistorySample> = Vec::new();
+    let mut model_history = Vec::new();
     for event in events {
         let minute = event.timestamp.div_euclid(60) * 60;
         totals.add(&event.model, event.delta);
@@ -6612,12 +7213,16 @@ fn model_usage_timeline_from_events_with_initial(
         if let Some(previous) = samples.last_mut() {
             if previous.timestamp == sample.timestamp {
                 *previous = sample;
+                if let Some((_, previous_models)) = model_history.last_mut() {
+                    *previous_models = totals.to_session_totals();
+                }
                 continue;
             }
         }
+        model_history.push((minute, totals.to_session_totals()));
         samples.push(sample);
     }
-    samples
+    (samples, model_history)
 }
 
 fn discard_session_partial_tail<R: BufRead>(
@@ -6747,12 +7352,15 @@ struct SessionAppendContext {
     cycle_seq: u64,
     window_start: i64,
     timeline_end: i64,
+    max_append_bytes: u64,
 }
 
 struct SessionAppendResult {
     checkpoint: usage_store::SessionCheckpoint,
     range: Option<usage_store::SessionRange>,
     marker: Option<usage_store::RecordedSessionSource>,
+    appended_bytes: u64,
+    caught_up: bool,
 }
 
 fn same_session_checkpoint_state(
@@ -6775,6 +7383,7 @@ fn same_session_checkpoint_state(
         && left.previous_input == right.previous_input
         && left.previous_cached_input == right.previous_cached_input
         && left.previous_output == right.previous_output
+        && left.previous_cache_write_input == right.previous_cache_write_input
 }
 
 fn collect_session_append(
@@ -6791,6 +7400,7 @@ fn collect_session_append(
         cycle_seq,
         window_start,
         timeline_end,
+        max_append_bytes,
     } = context;
     let path = &candidate.fingerprint.path;
     let before_path = fs::symlink_metadata(path)
@@ -6846,6 +7456,7 @@ fn collect_session_append(
             checkpoint.last_model.clone(),
             TokenSnapshot {
                 total: checkpoint.previous_total,
+                cache_write_input: checkpoint.previous_cache_write_input,
                 input: checkpoint.previous_input,
                 cached_input: checkpoint.previous_cached_input,
                 output: checkpoint.previous_output,
@@ -6903,10 +7514,13 @@ fn collect_session_append(
             .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
     }
     let mut line = Vec::with_capacity(SESSION_RECORD_INITIAL_CAPACITY);
+    let target_end = start_offset
+        .saturating_add(max_append_bytes)
+        .min(candidate.fingerprint.length);
     while reader
         .stream_position()
         .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?
-        < candidate.fingerprint.length
+        < target_end
     {
         let (present, skipped_invalid_record) =
             match read_recoverable_session_record_into(&mut reader, &mut line) {
@@ -6953,6 +7567,7 @@ fn collect_session_append(
         }
         let delta = TokenSnapshot {
             total: current.total - previous.total,
+            cache_write_input: current.cache_write_delta_from(previous),
             input: current.input - previous.input,
             cached_input: current.cached_input - previous.cached_input,
             output: current.output - previous.output,
@@ -7010,8 +7625,8 @@ fn collect_session_append(
         .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
     let after_fingerprint = local_input_file_fingerprint(path, &after_path)?;
     if !same_rollout_identity(&before_file, &after_file)
-        || after_fingerprint != candidate.fingerprint
-        || end_offset != candidate.fingerprint.length
+        || after_fingerprint.length < end_offset
+        || end_offset > candidate.fingerprint.length
     {
         return Ok(None);
     }
@@ -7020,6 +7635,7 @@ fn collect_session_append(
     events.extend(candidate_events);
 
     let checkpoint = usage_store::SessionCheckpoint {
+        previous_cache_write_input: previous.cache_write_input,
         root_identity: candidate.recorded_source.root_identity.clone(),
         relative_path: candidate.recorded_source.relative_path.clone(),
         file_device: candidate.recorded_source.file_device,
@@ -7033,14 +7649,7 @@ fn collect_session_append(
         fully_attributed_from_zero: fully_attributed,
         token_baseline_known: baseline_known,
         last_task_running,
-        // Session JSONL carries product model identifiers (for example,
-        // `gpt-5.6-luna`), while the durable checkpoint schema admits only the
-        // shared SOL/TERRA/LUNA keys. Keep that storage boundary canonical so
-        // a valid post-boundary append cannot be rejected by the recorder.
-        last_model: model
-            .as_deref()
-            .and_then(ModelUsageTotals::recognized_model)
-            .map(str::to_owned),
+        last_model: model.as_deref().and_then(ModelUsageTotals::canonical_model),
         previous_total: previous.total,
         previous_input: previous.input,
         previous_cached_input: previous.cached_input,
@@ -7062,10 +7671,14 @@ fn collect_session_append(
         && !checkpoint.discard_until_lf
         && checkpoint.committed_offset == candidate.recorded_source.file_bytes)
         .then(|| candidate.recorded_source.clone());
+    let appended_bytes = end_offset.saturating_sub(start_offset);
+    let caught_up = end_offset == candidate.fingerprint.length;
     Ok(Some(SessionAppendResult {
         checkpoint,
         range,
         marker,
+        appended_bytes,
+        caught_up,
     }))
 }
 
@@ -7154,7 +7767,13 @@ fn collect_incremental_local_usage(
     let mut ranges = Vec::new();
     let mut markers = Vec::new();
     let mut processed_files = 0usize;
+    let mut append_budget = SESSION_APPEND_BYTES_PER_CYCLE;
+    let mut caught_up = true;
     for candidate in &inventory.selected_session_files {
+        if append_budget == 0 {
+            caught_up = false;
+            break;
+        }
         let inventory_key = session_inventory_key(candidate);
         let seen_in_previous_inventory = previous_inventory.contains(&inventory_key);
         let key = (
@@ -7171,7 +7790,7 @@ fn collect_incremental_local_usage(
             .get(&identity_key)
             .or_else(|| checkpoints_by_path.get(&key))
             .copied();
-        let Some(result) = collect_session_append(
+        let result = collect_session_append(
             candidate,
             prior,
             SessionAppendContext {
@@ -7185,16 +7804,23 @@ fn collect_incremental_local_usage(
                 cycle_seq,
                 window_start,
                 timeline_end,
+                max_append_bytes: append_budget,
             },
             &mut totals,
             &mut events,
-        )?
-        else {
-            continue;
+        );
+        let result = match result {
+            Ok(Some(result)) => result,
+            Ok(None) | Err(_) => {
+                caught_up = false;
+                continue;
+            }
         };
         processed_files = processed_files.checked_add(1).ok_or_else(|| {
             security::SecurityError::new(security::SecurityErrorKind::LimitExceeded)
         })?;
+        append_budget = append_budget.saturating_sub(result.appended_bytes);
+        caught_up &= result.caught_up;
         let checkpoint_changed =
             prior.is_none_or(|prior| !same_session_checkpoint_state(prior, &result.checkpoint));
         let duplicate_checkpoint = checkpoint_identity_counts
@@ -7210,20 +7836,15 @@ fn collect_incremental_local_usage(
             ranges.push(range);
         }
     }
-    if baseline_existing && processed_files != inventory.selected_session_files.len() {
-        return Err(security::SecurityError::new(
-            security::SecurityErrorKind::UnsafePath,
-        ));
-    }
     let bounded_source_rescan_complete = inventory.overflow_session_files.is_empty()
-        && processed_files == inventory.selected_session_files.len();
+        && processed_files == inventory.selected_session_files.len()
+        && caught_up;
+    let (history_samples, history_model_totals) =
+        model_usage_timeline_with_models_from_events_with_initial(events, reset_at, initial_totals);
     Ok(LocalUsageCollection {
         model_usage: totals.clone(),
-        history_samples: model_usage_timeline_from_events_with_initial(
-            events,
-            reset_at,
-            initial_totals,
-        ),
+        history_samples,
+        history_model_totals,
         recorded_sessions: markers,
         session_checkpoints: changed_checkpoints,
         session_ranges: ranges,
@@ -8374,6 +8995,7 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                                 window_seconds,
                                 model_usage: collection.model_usage,
                                 history_samples: collection.history_samples,
+                                history_model_totals: collection.history_model_totals,
                                 recorded_sessions: collection.recorded_sessions,
                                 cleanup_plan: collection.cleanup_plan,
                             },
@@ -8665,6 +9287,10 @@ struct CodexInfoState {
     /// generation. The UI never assembles visible fields across two values of
     /// this header.
     service_published_pair: Option<String>,
+    /// The last valid v3 response generation.  Conditional requests are
+    /// deliberately scoped to v3; legacy fallback daemons must never receive
+    /// an If-None-Match header they do not understand.
+    service_v3_published_pair: Option<String>,
     acknowledged_recorder_commit: Option<AcknowledgedRecorderCommit>,
 }
 
@@ -8742,6 +9368,81 @@ impl CodexInfoState {
 
     fn public_details_v2_candidate(&self) -> Result<PublicDetailsV2, HistoryCanonicalizationError> {
         self.public_details_v2_candidate_at(Utc::now().timestamp())
+    }
+
+    fn public_details_v3_candidate(&self) -> Result<PublicDetailsV3, HistoryCanonicalizationError> {
+        self.public_details_v3_candidate_at(Utc::now().timestamp())
+    }
+
+    fn public_details_v3_candidate_at(
+        &self,
+        now: i64,
+    ) -> Result<PublicDetailsV3, HistoryCanonicalizationError> {
+        let v2 = self.public_details_v2_candidate_at(now)?;
+        let mut models = if self.authenticated && self.has_visible_usage() {
+            self.model_usage
+                .iter()
+                .map(ModelUsageRow::public_v3)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        models.sort_by(|left, right| left.model.cmp(&right.model));
+        let history_samples = v2
+            .history_samples
+            .iter()
+            .map(|sample| {
+                let source = self
+                    .history
+                    .observations
+                    .iter()
+                    .filter(|observation| {
+                        observation.timestamp == sample.timestamp
+                            && observation.reset_at.abs_diff(sample.reset_at) <= 60
+                    })
+                    .max_by_key(|observation| {
+                        (
+                            observation.model_totals.is_some(),
+                            observation.model_source == usage_store::ModelSource::Confirmed,
+                        )
+                    });
+                let model_totals = history_models_v3(source, sample);
+                let model_source = if sample.model_source == "unavailable" {
+                    "unavailable"
+                } else if model_totals.is_some()
+                    && source.is_some_and(|observation| {
+                        observation.model_source == usage_store::ModelSource::Confirmed
+                            && observation.model_totals_complete
+                    })
+                {
+                    "confirmed"
+                } else {
+                    "legacy-unknown"
+                };
+                PublicHistoryObservationV3 {
+                    timestamp: sample.timestamp,
+                    reset_at: sample.reset_at,
+                    remaining_percent: sample.remaining_percent,
+                    models: model_totals,
+                    models_complete: source
+                        .is_some_and(|observation| observation.model_totals_complete),
+                    model_source: model_source.to_owned(),
+                }
+            })
+            .collect();
+        Ok(PublicDetailsV3 {
+            state: v2.state,
+            observed_at: v2.observed_at,
+            authenticated: v2.authenticated,
+            plan_label: v2.plan_label,
+            quota: v2.quota,
+            models,
+            active_thread_count: v2.active_thread_count,
+            history_periods: v2.history_periods,
+            history_samples,
+            history_gaps: v2.history_gaps,
+            threads: v2.threads,
+        })
     }
 
     fn public_details_v2_candidate_at(
@@ -9140,6 +9841,7 @@ impl CodexInfoState {
                 .unwrap_or(resident_now),
             service_endpoint_error: None,
             service_published_pair: None,
+            service_v3_published_pair: None,
             acknowledged_recorder_commit: None,
         }
     }
@@ -9209,6 +9911,7 @@ impl CodexInfoState {
             last_local_poll: Instant::now(),
             service_endpoint_error: None,
             service_published_pair: None,
+            service_v3_published_pair: None,
             acknowledged_recorder_commit: None,
         }
     }
@@ -9304,6 +10007,7 @@ impl CodexInfoState {
             last_local_poll: Instant::now(),
             service_endpoint_error: None,
             service_published_pair: None,
+            service_v3_published_pair: None,
             acknowledged_recorder_commit: None,
         };
         match kind {
@@ -9518,42 +10222,51 @@ impl CodexInfoState {
                 // period's 88% observation. The rendered graph must keep the
                 // quota line monotone (88% -> 87%) and must not draw a
                 // fabricated vertical 14% drop.
-                let period_start = now.saturating_sub(4 * 86_400);
-                let selected_reset = now + 3 * 86_400;
+                let period_end = now.div_euclid(60).saturating_mul(60);
+                let period_start = period_end.saturating_sub(120 * 60);
+                let inferred_end = period_start + 10 * 60;
+                let selected_reset = period_start + WEEK_SECONDS;
                 let conflicting_reset = selected_reset + 80_000;
                 let cumulative = ModelDollarTotals {
                     sol: preview_costs.sol,
                     terra: preview_costs.terra,
                     luna: preview_costs.luna,
                 };
+                let mut samples = vec![
+                    UsageHistorySample::new_with_usage(
+                        period_start,
+                        selected_reset,
+                        88.0,
+                        ModelDollarTotals {
+                            sol: cumulative.sol * 0.35,
+                            terra: cumulative.terra,
+                            luna: cumulative.luna * 0.45,
+                        },
+                        ModelTokenTotals::default(),
+                    ),
+                    UsageHistorySample::new_with_usage(
+                        period_start,
+                        conflicting_reset,
+                        14.0,
+                        ModelDollarTotals::default(),
+                        ModelTokenTotals::default(),
+                    ),
+                ];
+                // Keep one source-proven unknown interval at the start, then
+                // provide contiguous observed rows across most of the plot.
+                // The same frame therefore exercises a thin inferred bridge
+                // and a long measured line without manufacturing either.
+                for timestamp in (inferred_end..=period_end).step_by(60) {
+                    samples.push(UsageHistorySample::new_with_usage(
+                        timestamp,
+                        selected_reset,
+                        87.0,
+                        cumulative,
+                        ModelTokenTotals::default(),
+                    ));
+                }
                 state.history = UsageHistory {
-                    samples: vec![
-                        UsageHistorySample::new_with_usage(
-                            period_start,
-                            selected_reset,
-                            88.0,
-                            ModelDollarTotals {
-                                sol: cumulative.sol * 0.35,
-                                terra: cumulative.terra,
-                                luna: cumulative.luna * 0.45,
-                            },
-                            ModelTokenTotals::default(),
-                        ),
-                        UsageHistorySample::new_with_usage(
-                            period_start,
-                            conflicting_reset,
-                            14.0,
-                            ModelDollarTotals::default(),
-                            ModelTokenTotals::default(),
-                        ),
-                        UsageHistorySample::new_with_usage(
-                            period_start + 2 * 86_400,
-                            selected_reset,
-                            87.0,
-                            cumulative,
-                            ModelTokenTotals::default(),
-                        ),
-                    ],
+                    samples,
                     ..UsageHistory::default()
                 };
                 state.remaining_percent = Some(87.0);
@@ -9566,7 +10279,37 @@ impl CodexInfoState {
                     .samples
                     .iter()
                     .map(|sample| {
-                        usage_store::UsageHistoryObservation::confirmed(&sample.to_store())
+                        let model_totals = ["SOL", "TERRA", "LUNA", "ASTRA"]
+                            .into_iter()
+                            .map(|model| {
+                                // Give ASTRA its own visible series. The first
+                                // opening increase is intentionally
+                                // unobserved and must be dashed; the later
+                                // equal endpoints are an observed flat line.
+                                let astra_tokens =
+                                    if model == "ASTRA" && sample.reset_at == selected_reset {
+                                        if sample.timestamp == period_start {
+                                            500_000
+                                        } else {
+                                            1_000_000
+                                        }
+                                    } else {
+                                        0
+                                    };
+                                usage_store::SessionModelTotal {
+                                    model: model.to_owned(),
+                                    total_tokens: astra_tokens,
+                                    input_tokens: astra_tokens,
+                                    cached_input_tokens: 0,
+                                    output_tokens: 0,
+                                    cache_write_input_tokens: Some(0),
+                                }
+                            })
+                            .collect();
+                        usage_store::UsageHistoryObservation::confirmed_with_models(
+                            &sample.to_store(),
+                            model_totals,
+                        )
                     })
                     .collect();
                 state.reset_at = Some(selected_reset);
@@ -9785,10 +10528,9 @@ impl CodexInfoState {
         let selected_reset_at = self.selected_reset_at;
         let selected_period = selected_reset_at
             .and_then(|selected| {
-                details
-                    .history_periods
-                    .iter()
-                    .find(|period| period.reset_at == selected)
+                details.history_periods.iter().find(|period| {
+                    period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
+                })
             })
             .or_else(|| details.history_periods.iter().find(|period| period.current))
             .or_else(|| details.history_periods.first());
@@ -9803,6 +10545,7 @@ impl CodexInfoState {
             .map(|model| {
                 let input_tokens = model.input_tokens.saturating_add(model.cached_input_tokens);
                 ModelUsageRow {
+                    cache_write_input_tokens: None,
                     name: model.name.clone(),
                     tokens: input_tokens.saturating_add(model.output_tokens),
                     input_tokens,
@@ -9898,6 +10641,133 @@ impl CodexInfoState {
         .into();
         self.service_endpoint_error = None;
         self.service_published_pair = Some(published_pair);
+        Ok(true)
+    }
+
+    fn apply_service_details_v3(
+        &mut self,
+        published_pair: String,
+        details: PublicDetailsV3,
+    ) -> Result<bool, String> {
+        if !published_pair_is_fresh(self.service_published_pair.as_deref(), &published_pair)? {
+            return Ok(false);
+        }
+        details.validate().map_err(|error| error.to_string())?;
+        if details.active_thread_count != details.threads.len() as u64 {
+            return Err("details thread count does not match rows".into());
+        }
+
+        let selected_period = self
+            .selected_reset_at
+            .and_then(|selected| {
+                details.history_periods.iter().find(|period| {
+                    period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
+                })
+            })
+            .or_else(|| details.history_periods.iter().find(|period| period.current))
+            .or_else(|| details.history_periods.first());
+        let next_selected_reset_at = selected_period.map(|period| period.reset_at);
+        let next_selected_label = selected_period
+            .map(|period| period.label.clone())
+            .unwrap_or_else(|| self.i18n.text(TextKey::NoHistory).into());
+        let observed_at = details.observed_at;
+        let next_models = details
+            .models
+            .iter()
+            .map(|model| ModelUsageRow {
+                name: model.model.clone(),
+                tokens: model.total_tokens,
+                input_tokens: model.input_tokens,
+                cached_input_tokens: model.cached_input_tokens,
+                output_tokens: model.output_tokens,
+                cache_write_input_tokens: model.cache_write_input_tokens,
+            })
+            .collect::<Vec<_>>();
+        let next_history = UsageHistory {
+            samples: details
+                .history_samples
+                .iter()
+                .filter_map(main_sample_from_public_observation_v3)
+                .collect(),
+            observations: details
+                .history_samples
+                .iter()
+                .map(store_observation_from_public_v3)
+                .collect(),
+            ..UsageHistory::default()
+        };
+        let next_threads = details
+            .threads
+            .iter()
+            .map(|thread| ActiveThread {
+                id: thread.id.clone(),
+                created_at: thread.created_at,
+                updated_at: thread
+                    .last_user_message_at
+                    .or(thread.created_at)
+                    .or(observed_at)
+                    .unwrap_or(1),
+                title: thread.title.clone(),
+                model: thread.model.clone(),
+                model_label: thread.model_label.clone(),
+                total_tokens: thread.total_tokens,
+                context_usage_tokens: thread.context_usage_tokens,
+                context_window_tokens: thread.context_window_tokens,
+                last_user_message_at: thread.last_user_message_at,
+                is_subagent: thread.is_subagent,
+                parent_thread_id: thread.parent_thread_id.clone(),
+                depth: thread.depth,
+            })
+            .collect::<Vec<_>>();
+
+        self.email = None;
+        self.authenticated = details.authenticated;
+        self.plan_label = details.plan_label.unwrap_or_default();
+        if self.authenticated {
+            self.auth_url = None;
+            self.auth_polling = false;
+        }
+        self.remaining_percent = details.quota.as_ref().map(|quota| quota.remaining_percent);
+        self.has_quota_percent = details.quota.is_some();
+        self.reset_at = details.quota.as_ref().map(|quota| quota.reset_at);
+        self.window_seconds = details
+            .quota
+            .as_ref()
+            .map_or(WEEK_SECONDS, |quota| quota.window_seconds);
+        self.monthly = details.quota.as_ref().is_some_and(|quota| quota.monthly);
+        self.limit_name = "Codex".into();
+        self.quota_title = if self.monthly {
+            "月間利用枠".into()
+        } else {
+            "残り利用枠".into()
+        };
+        self.has_usage = details.authenticated
+            && details.observed_at.is_some()
+            && matches!(details.state, PublicState::Ready | PublicState::Error);
+        self.local_usage_pending = false;
+        self.usage_snapshot_committed = self.has_usage;
+        self.last_success_at = observed_at;
+        self.model_usage = next_models;
+        self.history = next_history;
+        self.history_gaps = details.history_gaps;
+        self.active_threads = next_threads;
+        self.estimated_cost_label = estimated_cost_label_from_v3(&details.models);
+        self.selected_reset_at = next_selected_reset_at;
+        self.selected_history_period = next_selected_label;
+        self.checking = details.state == PublicState::Initializing;
+        self.account_error = (details.state == PublicState::Error)
+            .then(|| "常駐サービスが取得エラーを報告しました。".into());
+        self.error = self.account_error.clone();
+        self.status = match details.state {
+            PublicState::Initializing => "常駐サービスが利用状況を取得しています…",
+            PublicState::Ready => "利用状況を更新しました。",
+            PublicState::AuthRequired => "未認証です。認証を開始してください。",
+            PublicState::Error => "常駐サービスが利用状況を取得できませんでした。",
+        }
+        .into();
+        self.service_endpoint_error = None;
+        self.service_published_pair = Some(published_pair.clone());
+        self.service_v3_published_pair = Some(published_pair);
         Ok(true)
     }
 
@@ -10594,6 +11464,7 @@ impl CodexInfoState {
         }
         let model_costs = result.model_usage.dollar_totals();
         let model_tokens = result.model_usage.token_totals();
+        let current_model_totals = result.model_usage.to_session_totals();
         let history_sample_count = result.history_samples.len();
         self.local_usage_error = false;
         self.local_usage_pending = false;
@@ -10603,8 +11474,11 @@ impl CodexInfoState {
             self.usage_snapshot_committed = true;
         }
         if !self.preview {
-            self.history
-                .apply_backfill_samples(result.reset_at, result.history_samples);
+            self.history.apply_backfill_samples_with_models(
+                result.reset_at,
+                result.history_samples,
+                result.history_model_totals,
+            );
             self.pending_recorded_sessions
                 .extend(result.recorded_sessions);
             if let Some(cleanup_plan) = result.cleanup_plan {
@@ -10651,7 +11525,8 @@ impl CodexInfoState {
                         model_tokens,
                     )
                 });
-            self.history.record(sample);
+            self.history
+                .record_with_models(sample, Some(current_model_totals));
         }
         self.refresh_partial_failure_status();
         debug_runtime(format!(
@@ -11500,12 +12375,106 @@ impl CodexInfoState {
         (samples, untrusted_minutes)
     }
 
+    fn graph_model_points_for_selection(
+        &self,
+        selected_reset: i64,
+        period_start: i64,
+        period_end: i64,
+        model_name: &str,
+    ) -> BTreeMap<i64, GraphModelPoint> {
+        let (reset_aliases, canonical_resets) = canonical_reset_aliases(&self.history.samples);
+        let mut points = BTreeMap::new();
+        for observation in self.history.observations.iter().filter(|observation| {
+            observation_matches_period_bounds(
+                observation,
+                selected_reset,
+                period_start,
+                period_end,
+                &reset_aliases,
+                &canonical_resets,
+            )
+        }) {
+            let model = observation
+                .model_totals
+                .as_deref()
+                .and_then(|models| models.iter().find(|model| model.model == model_name));
+            let minute = observation.timestamp.div_euclid(60) * 60;
+            let complete = observation.model_source == usage_store::ModelSource::Confirmed
+                && observation.model_totals_complete;
+            let Some(model) = model else {
+                // A complete model set makes absence an observed zero. An
+                // incomplete set says nothing about an omitted model and must
+                // not manufacture a zero line.
+                if complete {
+                    points.insert(
+                        minute,
+                        GraphModelPoint {
+                            dollar: 0.0,
+                            tokens: 0.0,
+                            reliable: true,
+                        },
+                    );
+                }
+                continue;
+            };
+            // Completeness describes the model set, not the evidence quality
+            // of a row that is present. A row recovered from the session log
+            // is observed and stays solid; only an interval where this model
+            // itself is absent may be inferred.
+            let dollar = match model_name {
+                "SOL" => observation.sol_dollars,
+                "TERRA" => observation.terra_dollars,
+                "LUNA" => observation.luna_dollars,
+                _ => ModelUsageRow {
+                    name: model.model.clone(),
+                    tokens: model.total_tokens,
+                    input_tokens: model.input_tokens,
+                    cached_input_tokens: model.cached_input_tokens,
+                    output_tokens: model.output_tokens,
+                    cache_write_input_tokens: model.cache_write_input_tokens,
+                }
+                .public_v3()
+                .estimated_cost
+                .map(|cost| cost.total_dollars),
+            }
+            .unwrap_or(-1.0);
+            points.insert(
+                minute,
+                GraphModelPoint {
+                    dollar,
+                    tokens: model.total_tokens as f64,
+                    reliable: true,
+                },
+            );
+        }
+        points
+    }
+
     fn graph_paths_for_selection_at(
         &self,
         observed_at: i64,
         show_luna: bool,
         show_terra: bool,
         show_sol: bool,
+        show_tokens: bool,
+    ) -> GraphPaths {
+        self.graph_paths_for_selection_at_with_astra(
+            observed_at,
+            show_luna,
+            show_terra,
+            show_sol,
+            false,
+            show_tokens,
+        )
+    }
+
+    fn graph_paths_for_selection_at_with_astra(
+        &self,
+        observed_at: i64,
+        show_luna: bool,
+        show_terra: bool,
+        show_sol: bool,
+        show_astra: bool,
         show_tokens: bool,
     ) -> GraphPaths {
         let periods = self.history_periods_at(observed_at);
@@ -11536,19 +12505,50 @@ impl CodexInfoState {
                 end_at: gap.end_at,
             })
             .collect::<Vec<_>>();
-        let mut paths = graph_paths_for_selection_with_sources(
+        let mut model_names = ["SOL", "TERRA", "LUNA", "ASTRA"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        for observation in self.history.observations.iter().filter(|observation| {
+            same_reset_period(observation.reset_at, selected_reset)
+                && observation.timestamp >= period_start
+                && observation.timestamp <= period_end
+        }) {
+            if let Some(models) = observation.model_totals.as_ref() {
+                model_names.extend(models.iter().map(|model| model.model.clone()));
+            }
+        }
+        let model_timelines = model_names
+            .into_iter()
+            .map(|model| {
+                (
+                    model.clone(),
+                    self.graph_model_points_for_selection(
+                        selected_reset,
+                        period_start,
+                        period_end,
+                        &model,
+                    ),
+                )
+            })
+            .collect::<GraphModelTimelines>();
+        let mut paths = graph_paths_for_selection_with_sources_and_astra(
             &sample_references,
             period_start,
             period_end,
             show_luna,
             show_terra,
             show_sol,
+            show_astra,
             show_tokens,
             &untrusted_minutes,
             &confirmed_gaps,
+            &model_timelines,
         );
         if !self.has_quota_percent {
             paths.remaining.clear();
+            paths.remaining_solid.clear();
+            paths.remaining_inferred.clear();
             paths.remaining_markers.clear();
             paths.current_remaining_label.clear();
             paths.current_remaining_y = 0.99;
@@ -11572,11 +12572,12 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
         || state.selected_metric == state.i18n.text(TextKey::TokenMetric);
     graph.set_show_tokens(token_metric);
     let observed_at = Utc::now().timestamp();
-    let mut paths = state.graph_paths_for_selection_at(
+    let mut paths = state.graph_paths_for_selection_at_with_astra(
         observed_at,
         graph.get_show_luna(),
         graph.get_show_terra(),
         graph.get_show_sol(),
+        graph.get_show_astra(),
         graph.get_show_tokens(),
     );
     separate_current_label_positions(
@@ -11585,6 +12586,7 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
         graph.get_show_luna(),
         graph.get_show_terra(),
         graph.get_show_sol(),
+        graph.get_show_astra(),
     );
     let time_labels = state.graph_time_labels_at(observed_at);
     graph.set_graph_data(state.graph_data().into());
@@ -11625,7 +12627,8 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     graph.set_time_50_label(time_labels[2].clone().into());
     graph.set_time_75_label(time_labels[3].clone().into());
     graph.set_time_end_label(time_labels[4].clone().into());
-    graph.set_remaining_path(paths.remaining.into());
+    graph.set_remaining_path(paths.remaining_solid.into());
+    graph.set_remaining_inferred_path(paths.remaining_inferred.into());
     graph.set_remaining_markers(slint::ModelRc::new(slint::VecModel::from(
         paths
             .remaining_markers
@@ -11638,10 +12641,16 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     )));
     graph.set_sol_flat_path(paths.sol_flat.into());
     graph.set_sol_rising_path(paths.sol_rising.into());
+    graph.set_sol_inferred_path(paths.sol_inferred.into());
     graph.set_terra_flat_path(paths.terra_flat.into());
     graph.set_terra_rising_path(paths.terra_rising.into());
+    graph.set_terra_inferred_path(paths.terra_inferred.into());
     graph.set_luna_flat_path(paths.luna_flat.into());
     graph.set_luna_rising_path(paths.luna_rising.into());
+    graph.set_luna_inferred_path(paths.luna_inferred.into());
+    graph.set_astra_flat_path(paths.astra_flat.into());
+    graph.set_astra_rising_path(paths.astra_rising.into());
+    graph.set_astra_inferred_path(paths.astra_inferred.into());
     graph.set_dollar_top_label(paths.dollar_labels[0].clone().into());
     graph.set_dollar_75_label(paths.dollar_labels[1].clone().into());
     graph.set_dollar_50_label(paths.dollar_labels[2].clone().into());
@@ -11651,10 +12660,12 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     let has_current_sol_label = !paths.current_sol_label.is_empty();
     let has_current_terra_label = !paths.current_terra_label.is_empty();
     let has_current_luna_label = !paths.current_luna_label.is_empty();
+    let has_current_astra_label = !paths.current_astra_label.is_empty();
     graph.set_current_remaining_label(paths.current_remaining_label.into());
     graph.set_current_sol_label(paths.current_sol_label.into());
     graph.set_current_terra_label(paths.current_terra_label.into());
     graph.set_current_luna_label(paths.current_luna_label.into());
+    graph.set_current_astra_label(paths.current_astra_label.into());
     graph.set_current_remaining_connector_path(
         current_label_connector_path(
             paths.current_remaining_point_y,
@@ -11687,10 +12698,19 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
         )
         .into(),
     );
+    graph.set_current_astra_connector_path(
+        current_label_connector_path(
+            paths.current_astra_point_y,
+            paths.current_astra_y,
+            has_current_astra_label,
+        )
+        .into(),
+    );
     graph.set_current_remaining_y(paths.current_remaining_y);
     graph.set_current_sol_y(paths.current_sol_y);
     graph.set_current_terra_y(paths.current_terra_y);
     graph.set_current_luna_y(paths.current_luna_y);
+    graph.set_current_astra_y(paths.current_astra_y);
 }
 
 fn classify_active_thread_model(model_label: &str) -> &'static str {
@@ -11705,6 +12725,7 @@ fn classify_active_thread_model(model_label: &str) -> &'static str {
             "sol" => Some("SOL"),
             "terra" => Some("TERRA"),
             "luna" => Some("LUNA"),
+            "astra" => Some("ASTRA"),
             _ => None,
         };
         if let Some(candidate) = candidate {
@@ -11724,20 +12745,26 @@ fn active_thread_model_counts(threads: &[ActiveThread]) -> String {
     if threads.is_empty() {
         return String::new();
     }
-    let [sol, terra, luna, other] = active_thread_model_count_values(threads);
-    format!("SOL {sol}  TERRA {terra}  LUNA {luna}  その他 {other}")
+    let [sol, terra, luna, astra, other] = active_thread_model_count_values(threads);
+    if astra > 0 {
+        format!("SOL {sol}  TERRA {terra}  LUNA {luna}  ASTRA {astra}  その他 {other}")
+    } else {
+        format!("SOL {sol}  TERRA {terra}  LUNA {luna}  その他 {other}")
+    }
 }
 
-fn active_thread_model_count_values(threads: &[ActiveThread]) -> [i32; 4] {
+fn active_thread_model_count_values(threads: &[ActiveThread]) -> [i32; 5] {
     let mut sol = 0usize;
     let mut terra = 0usize;
     let mut luna = 0usize;
+    let mut astra = 0usize;
     let mut other = 0usize;
     for thread in threads {
         match classify_active_thread_model(&thread.model_label) {
             "SOL" => sol += 1,
             "TERRA" => terra += 1,
             "LUNA" => luna += 1,
+            "ASTRA" => astra += 1,
             _ => other += 1,
         }
     }
@@ -11745,6 +12772,7 @@ fn active_thread_model_count_values(threads: &[ActiveThread]) -> [i32; 4] {
         i32::try_from(sol).unwrap_or(i32::MAX),
         i32::try_from(terra).unwrap_or(i32::MAX),
         i32::try_from(luna).unwrap_or(i32::MAX),
+        i32::try_from(astra).unwrap_or(i32::MAX),
         i32::try_from(other).unwrap_or(i32::MAX),
     ]
 }
@@ -12488,7 +13516,8 @@ impl CodexInfoState {
                 .model_usage
                 .iter()
                 .map(ModelUsageRow::dollar_costs)
-                .map(|(sol, terra, luna)| sol + terra + luna)
+                .map(|(input, cached, output)| input + cached + output)
+                .filter(|value| value.is_finite() && *value >= 0.0)
                 .sum::<f64>();
             self.i18n.format_estimate(total)
         };
@@ -12511,10 +13540,12 @@ impl CodexInfoState {
                     .format_thread_count(self.active_threads.len())
                     .into(),
             );
-            let [sol, terra, luna, other] = active_thread_model_count_values(&self.active_threads);
+            let [sol, terra, luna, astra, other] =
+                active_thread_model_count_values(&self.active_threads);
             ui.set_active_thread_sol_count(sol);
             ui.set_active_thread_terra_count(terra);
             ui.set_active_thread_luna_count(luna);
+            ui.set_active_thread_astra_count(astra);
             ui.set_active_thread_other_count(other);
         } else {
             ui.set_has_active_thread(false);
@@ -12522,6 +13553,7 @@ impl CodexInfoState {
             ui.set_active_thread_sol_count(0);
             ui.set_active_thread_terra_count(0);
             ui.set_active_thread_luna_count(0);
+            ui.set_active_thread_astra_count(0);
             ui.set_active_thread_other_count(0);
             ui.set_active_thread_count_label(self.i18n.format_thread_count(0).into());
         }
@@ -12652,6 +13684,7 @@ fn preview_model_row(
     output_tokens: u64,
 ) -> ModelUsageRow {
     ModelUsageRow {
+        cache_write_input_tokens: None,
         name: name.into(),
         tokens,
         input_tokens,
@@ -12700,7 +13733,27 @@ fn format_model_usage_columns(
 }
 
 fn format_dollar_cost(value: f64) -> String {
-    format!("${}", value.max(0.0) as u64)
+    if !value.is_finite() || value < 0.0 {
+        return "—".into();
+    }
+    format!("${}", value as u64)
+}
+
+fn estimated_cost_label_from_v3(models: &[PublicModelUsageV3]) -> String {
+    let mut total = 0.0;
+    let mut known = false;
+    for model in models {
+        if let Some(cost) = model.estimated_cost.as_ref() {
+            if cost.total_dollars.is_finite() && cost.total_dollars >= 0.0 {
+                total += cost.total_dollars;
+                known = true;
+            }
+        }
+    }
+    if !known || !total.is_finite() || total < 0.0 {
+        return "概算 —".into();
+    }
+    format!("概算 ${}", total.min(u64::MAX as f64).round() as u64)
 }
 
 fn format_estimated_cost(costs: ModelDollarTotals) -> String {
@@ -13303,6 +14356,72 @@ fn parse_details_v2_document(bytes: &[u8]) -> Result<PublicDetailsV2, String> {
     Ok(details)
 }
 
+fn parse_details_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, String> {
+    let mut document = decode_unique_json(bytes)?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "details document is not an object".to_owned())?;
+    let expected = BTreeSet::from([
+        "active_thread_count",
+        "api_version",
+        "authenticated",
+        "history_gaps",
+        "history_periods",
+        "history_samples",
+        "models",
+        "observed_at",
+        "plan_label",
+        "quota",
+        "state",
+        "threads",
+    ]);
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err("details document fields differ from v3".into());
+    }
+    if object
+        .remove("api_version")
+        .as_ref()
+        .and_then(Value::as_str)
+        != Some("v3")
+    {
+        return Err("details document api_version is not v3".into());
+    }
+    let details: PublicDetailsV3 =
+        serde_json::from_value(document).map_err(|error| error.to_string())?;
+    details.validate().map_err(|error| error.to_string())?;
+    if details.active_thread_count != details.threads.len() as u64 {
+        return Err("details thread count does not match rows".into());
+    }
+    let topology = details
+        .threads
+        .iter()
+        .map(|thread| ThreadTopologyNode {
+            id: thread.id.as_str(),
+            parent_thread_id: thread.parent_thread_id.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    thread_contract::validate_selected_thread_topology(&topology)
+        .map_err(|_| "details thread topology is invalid".to_owned())?;
+    if !details.authenticated
+        && (details.quota.is_some()
+            || !details.models.is_empty()
+            || details.active_thread_count != 0
+            || !details.history_periods.is_empty()
+            || !details.history_samples.is_empty()
+            || !details.history_gaps.is_empty()
+            || !details.threads.is_empty())
+    {
+        return Err("unauthenticated details contain visible account data".into());
+    }
+    if details.state == PublicState::Ready
+        && (!details.authenticated || details.observed_at.is_none())
+    {
+        return Err("ready details are incomplete".into());
+    }
+    Ok(details)
+}
+
 struct ServiceDetailsHttpResponse {
     status: u16,
     pair: Option<String>,
@@ -13313,6 +14432,19 @@ fn request_service_details(
     address: SocketAddr,
     route: &str,
 ) -> Result<ServiceDetailsHttpResponse, String> {
+    request_service_details_with_etag(address, route, None)
+}
+
+fn request_service_details_with_etag(
+    address: SocketAddr,
+    route: &str,
+    if_none_match: Option<&str>,
+) -> Result<ServiceDetailsHttpResponse, String> {
+    if let Some(pair) = if_none_match {
+        if !valid_published_pair(pair) {
+            return Err("invalid details generation header".into());
+        }
+    }
     let timeout = Duration::from_millis(500);
     let mut stream = TcpStream::connect_timeout(&address, timeout).map_err(|_| "connect failed")?;
     stream
@@ -13321,7 +14453,12 @@ fn request_service_details(
     stream
         .set_write_timeout(Some(timeout))
         .map_err(|_| "write timeout setup failed")?;
-    let request = format!("GET {route} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    let conditional = if_none_match
+        .map(|pair| format!("If-None-Match: \"{pair}\"\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "GET {route} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n{conditional}\r\n"
+    );
     stream
         .write_all(request.as_bytes())
         .map_err(|_| "details request failed")?;
@@ -13387,7 +14524,7 @@ fn request_service_details(
             _ => return Err("unexpected or duplicate details response header".into()),
         }
     }
-    if status == 200 {
+    if status == 200 || status == 304 {
         let pair_value = pair
             .as_deref()
             .ok_or_else(|| "missing details generation header".to_owned())?;
@@ -13395,7 +14532,7 @@ fn request_service_details(
             return Err("details response generation header is invalid".into());
         }
     }
-    if status != 200 && pair.is_some() {
+    if status != 200 && status != 304 && pair.is_some() {
         return Err("non-success details response has a generation header".into());
     }
     if !content_type || !cache_control || !connection_close {
@@ -13404,6 +14541,9 @@ fn request_service_details(
     let body = &response[header_end + 4..];
     if body.len() > DETAILS_RESPONSE_MAX_BYTES || content_length != Some(body.len()) {
         return Err("details response body length mismatch".into());
+    }
+    if status == 304 && !body.is_empty() {
+        return Err("not-modified details response has a body".into());
     }
     Ok(ServiceDetailsHttpResponse {
         status,
@@ -13450,6 +14590,159 @@ where
         .pair
         .ok_or_else(|| "missing details generation header".to_owned())?;
     Ok((pair, parse_details_v2_document(&response.body)?))
+}
+
+#[derive(Debug, PartialEq)]
+enum ServiceDetailsV3Fetch {
+    Fresh {
+        pair: String,
+        details: PublicDetailsV3,
+        from_v3: bool,
+    },
+    NotModified {
+        pair: String,
+    },
+}
+
+fn response_published_pair(response: &ServiceDetailsHttpResponse) -> Result<String, String> {
+    response
+        .pair
+        .clone()
+        .ok_or_else(|| "missing details generation header".to_owned())
+}
+
+fn public_details_v3_from_v2(details: &PublicDetailsV2) -> PublicDetailsV3 {
+    PublicDetailsV3 {
+        state: details.state,
+        observed_at: details.observed_at,
+        authenticated: details.authenticated,
+        plan_label: details.plan_label.clone(),
+        quota: details.quota.clone(),
+        models: details
+            .models
+            .iter()
+            .map(|model| PublicModelUsageV3 {
+                model: model.name.clone(),
+                total_tokens: model
+                    .input_tokens
+                    .saturating_add(model.cached_input_tokens)
+                    .saturating_add(model.output_tokens),
+                input_tokens: model.input_tokens.saturating_add(model.cached_input_tokens),
+                cached_input_tokens: model.cached_input_tokens,
+                cache_write_input_tokens: None,
+                output_tokens: model.output_tokens,
+                estimated_cost: None,
+            })
+            .collect(),
+        active_thread_count: details.active_thread_count,
+        history_periods: details.history_periods.clone(),
+        history_samples: details
+            .history_samples
+            .iter()
+            .map(|sample| PublicHistoryObservationV3 {
+                timestamp: sample.timestamp,
+                reset_at: sample.reset_at,
+                remaining_percent: sample.remaining_percent,
+                models: legacy_history_models_v3(sample),
+                models_complete: false,
+                model_source: if sample.model_source == "unavailable" {
+                    "unavailable".into()
+                } else {
+                    "legacy-unknown".into()
+                },
+            })
+            .collect(),
+        history_gaps: details.history_gaps.clone(),
+        threads: details.threads.clone(),
+    }
+}
+
+fn fetch_service_details_v3(
+    address: SocketAddr,
+    prior_pair: Option<&str>,
+) -> Result<ServiceDetailsV3Fetch, String> {
+    fetch_service_details_v3_with_etag(
+        |route, if_none_match| {
+            debug_runtime(format!(
+                "requesting service details route={route} conditional={}",
+                if_none_match.is_some()
+            ));
+            request_service_details_with_etag(address, route, if_none_match)
+        },
+        prior_pair,
+    )
+}
+
+fn fetch_service_details_v3_with<F>(mut request: F) -> Result<(String, PublicDetailsV3), String>
+where
+    F: FnMut(&str) -> Result<ServiceDetailsHttpResponse, String>,
+{
+    let result = fetch_service_details_v3_with_etag(|route, _| request(route), None)?;
+    match result {
+        ServiceDetailsV3Fetch::Fresh { pair, details, .. } => Ok((pair, details)),
+        ServiceDetailsV3Fetch::NotModified { .. } => {
+            Err("unexpected not-modified details response".into())
+        }
+    }
+}
+
+fn fetch_service_details_v3_with_etag<F>(
+    mut request: F,
+    prior_pair: Option<&str>,
+) -> Result<ServiceDetailsV3Fetch, String>
+where
+    F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
+{
+    if let Some(pair) = prior_pair {
+        if !valid_published_pair(pair) {
+            return Err("invalid details generation header".into());
+        }
+    }
+    let response = request("/v3/details", prior_pair)?;
+    if response.status == 304 {
+        let pair = response_published_pair(&response)?;
+        if prior_pair != Some(pair.as_str()) || !response.body.is_empty() {
+            return Err("not-modified details response does not match last v3 root".into());
+        }
+        return Ok(ServiceDetailsV3Fetch::NotModified { pair });
+    }
+    if response.status == 404 {
+        let legacy_v2 = request("/v2/details", None)?;
+        if legacy_v2.status == 404 {
+            let legacy_v1 = request("/v1/details", None)?;
+            if legacy_v1.status != 200 {
+                return Err("v1 details fallback response is not HTTP 200".into());
+            }
+            let pair = response_published_pair(&legacy_v1)?;
+            let details = parse_details_document(&legacy_v1.body)?;
+            let details = public_details_v3_from_v2(&PublicDetailsV2::from(details));
+            return Ok(ServiceDetailsV3Fetch::Fresh {
+                pair,
+                details,
+                from_v3: false,
+            });
+        }
+        if legacy_v2.status != 200 {
+            return Err("v2 details fallback response is not HTTP 200".into());
+        }
+        let pair = response_published_pair(&legacy_v2)?;
+        let details = parse_details_v2_document(&legacy_v2.body)?;
+        return Ok(ServiceDetailsV3Fetch::Fresh {
+            pair,
+            details: public_details_v3_from_v2(&details),
+            from_v3: false,
+        });
+    }
+    if response.status != 200 {
+        return Err("v3 details response is not HTTP 200".into());
+    }
+    let pair = response_published_pair(&response)?;
+    let details = parse_details_v3_document(&response.body)?;
+    Ok(ServiceDetailsV3Fetch::Fresh {
+        pair,
+        details,
+        from_v3: true,
+    })
 }
 
 fn cli_error(key: CliTextKey) -> String {
@@ -14004,6 +15297,7 @@ fn poll_service_state_with_owner_check<F>(
     // document with two lock snapshots so a closing old listener cannot feed
     // stale data into the UI while a different service is taking ownership.
     if !owner_is_healthy(service_endpoint) {
+        debug_runtime("service owner validation failed");
         let error = state
             .service_endpoint_error
             .clone()
@@ -14011,9 +15305,38 @@ fn poll_service_state_with_owner_check<F>(
         state.hold_service_endpoint_error(error);
         return;
     }
-    match fetch_service_details_v2(service_endpoint)
-        .and_then(|(pair, details)| state.apply_service_details_v2(pair, details))
-    {
+    let previous_v3_pair = state.service_v3_published_pair.clone();
+    let fetched = fetch_service_details_v3_with_etag(
+        |route, if_none_match| {
+            if route == "/v3/details" {
+                request_service_details_with_etag(service_endpoint, route, if_none_match)
+            } else {
+                // Fallback requests intentionally omit If-None-Match so an
+                // older daemon receives the exact legacy request shape.
+                request_service_details(service_endpoint, route)
+            }
+        },
+        previous_v3_pair.as_deref(),
+    );
+    let result = fetched.and_then(|result| match result {
+        ServiceDetailsV3Fetch::Fresh {
+            pair,
+            details,
+            from_v3,
+        } => {
+            if !from_v3 {
+                state.service_v3_published_pair = None;
+            }
+            state.apply_service_details_v3(pair, details)
+        }
+        ServiceDetailsV3Fetch::NotModified { pair } => {
+            if state.service_v3_published_pair.as_deref() != Some(pair.as_str()) {
+                return Err("not-modified details response does not match last v3 root".into());
+            }
+            Ok(false)
+        }
+    });
+    match result {
         Ok(_) => {
             // A complete strict read proves that the selected endpoint has
             // recovered even when its immutable generation is unchanged.
@@ -14021,6 +15344,7 @@ fn poll_service_state_with_owner_check<F>(
             state.last_poll = Instant::now();
         }
         Err(error) => {
+            debug_runtime(format!("service details read failed: {error}"));
             state.hold_service_endpoint_error(error);
         }
     }
@@ -14141,6 +15465,7 @@ struct ResidentPublicationState {
     /// its state marker while every displayed data field remains identical.
     last_complete: Option<PublicDetails>,
     last_complete_v2: Option<PublicDetailsV2>,
+    last_complete_v3: Option<PublicDetailsV3>,
 }
 
 #[cfg(test)]
@@ -14194,6 +15519,30 @@ where
     W: FnOnce(&mut CodexInfoState, PendingRecorderBatch) -> Result<(), String>,
     P: FnOnce(PublicDetails, PublicDetailsV2) -> Result<(), codex_info::server::ApiSnapshotError>,
 {
+    resident_service_cycle_with_recorder_attempt_v3(
+        state,
+        publication,
+        recorder_attempt,
+        write_and_refresh,
+        |v1, v2, _v3| publish(v1, v2),
+    )
+}
+
+fn resident_service_cycle_with_recorder_attempt_v3<W, P>(
+    state: &mut CodexInfoState,
+    publication: &mut ResidentPublicationState,
+    recorder_attempt: bool,
+    write_and_refresh: W,
+    publish: P,
+) -> Result<ResidentServiceCycleOutcome, ResidentServiceCycleError>
+where
+    W: FnOnce(&mut CodexInfoState, PendingRecorderBatch) -> Result<(), String>,
+    P: FnOnce(
+        PublicDetails,
+        PublicDetailsV2,
+        PublicDetailsV3,
+    ) -> Result<(), codex_info::server::ApiSnapshotError>,
+{
     state.poll();
     // Logout/account replacement is the only event that invalidates the old
     // visible root. An incomplete first generation must never inherit a
@@ -14201,6 +15550,7 @@ where
     if !state.usage_snapshot_committed {
         publication.last_complete = None;
         publication.last_complete_v2 = None;
+        publication.last_complete_v3 = None;
     }
     state.schedule_resident_refresh(Instant::now());
     let store_error = if recorder_attempt {
@@ -14229,6 +15579,7 @@ where
     if !state.usage_snapshot_committed {
         publication.last_complete = None;
         publication.last_complete_v2 = None;
+        publication.last_complete_v3 = None;
     }
     // A quota response is only the first half of a public generation. Keep
     // the publisher's exact root and generation identity unchanged until the
@@ -14242,6 +15593,9 @@ where
     let mut candidate_v2 = state
         .public_details_v2_candidate()
         .map_err(|error| ResidentServiceCycleError::Candidate(error.to_string()))?;
+    let mut candidate_v3 = state
+        .public_details_v3_candidate()
+        .map_err(|error| ResidentServiceCycleError::Candidate(error.to_string()))?;
     if candidate.state == PublicState::Error {
         if let Some(last_complete) = publication.last_complete.as_ref() {
             candidate = last_complete.clone();
@@ -14249,6 +15603,10 @@ where
             if let Some(last_complete_v2) = publication.last_complete_v2.as_ref() {
                 candidate_v2 = last_complete_v2.clone();
                 candidate_v2.state = PublicState::Error;
+            }
+            if let Some(last_complete_v3) = publication.last_complete_v3.as_ref() {
+                candidate_v3 = last_complete_v3.clone();
+                candidate_v3.state = PublicState::Error;
             }
         } else if store_error.is_some() {
             // The collector result has not become durable and therefore is
@@ -14263,15 +15621,26 @@ where
             candidate.history_gaps.clear();
             candidate.threads.clear();
             candidate_v2 = PublicDetailsV2::from(candidate.clone());
+            candidate_v3 = PublicDetailsV3::default();
+            candidate_v3.state = PublicState::Error;
+            candidate_v3.authenticated = candidate.authenticated;
+            candidate_v3.plan_label = candidate.plan_label.clone();
         }
     }
-    publish(candidate.clone(), candidate_v2.clone()).map_err(ResidentServiceCycleError::Publish)?;
+    publish(
+        candidate.clone(),
+        candidate_v2.clone(),
+        candidate_v3.clone(),
+    )
+    .map_err(ResidentServiceCycleError::Publish)?;
     if candidate.state == PublicState::Ready {
         publication.last_complete = Some(candidate);
         publication.last_complete_v2 = Some(candidate_v2);
+        publication.last_complete_v3 = Some(candidate_v3);
     } else if !candidate.authenticated {
         publication.last_complete = None;
         publication.last_complete_v2 = None;
+        publication.last_complete_v3 = None;
     }
     if let Some(error) = store_error {
         Err(ResidentServiceCycleError::Store(error))
@@ -14294,9 +15663,10 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
         .map_err(|_| std::io::Error::other(cli_error(CliTextKey::ServiceStartFailed)))?;
     let publisher = api_server.publisher();
     let mut state = CodexInfoState::new();
-    publisher.publish_details_v2(
+    publisher.publish_details_v3(
         state.public_details_candidate()?,
         state.public_details_v2_candidate()?,
+        state.public_details_v3_candidate()?,
     )?;
     let mut publication = ResidentPublicationState::default();
     let mut last_recorder_error = None;
@@ -14334,7 +15704,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                     let recorder_attempt = recorder_attempt_due(now, recorder_retry_at)
                         && (recorder_work_pending
                             || desired_partition_id != active_recorder_partition.as_deref());
-                    let result = resident_service_cycle_with_recorder_attempt_v2(
+                    let result = resident_service_cycle_with_recorder_attempt_v3(
                         &mut state,
                         &mut publication,
                         recorder_attempt,
@@ -14530,7 +15900,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                             }
                             Ok(())
                         },
-                        |candidate, candidate_v2| {
+                        |candidate, candidate_v2, candidate_v3| {
                             if candidate.state == PublicState::Ready
                                 && !recorder.owner_is_live()
                             {
@@ -14538,7 +15908,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                     codex_info::server::ApiSnapshotError::Serialization,
                                 );
                             }
-                            publisher.publish_details_v2(candidate, candidate_v2)
+                            publisher.publish_details_v3(candidate, candidate_v2, candidate_v3)
                         },
                     );
                     match result {
@@ -14845,6 +16215,14 @@ fn run_ui(
                     graph.on_toggle_sol(move || {
                         if let Some(graph) = weak_graph.upgrade() {
                             graph.set_show_sol(!graph.get_show_sol());
+                            sync_graph_window(&state_for_toggle.borrow(), &graph);
+                        }
+                    });
+                    let weak_graph = graph.as_weak();
+                    let state_for_toggle = Rc::clone(&state);
+                    graph.on_toggle_astra(move || {
+                        if let Some(graph) = weak_graph.upgrade() {
+                            graph.set_show_astra(!graph.get_show_astra());
                             sync_graph_window(&state_for_toggle.borrow(), &graph);
                         }
                     });
@@ -15161,11 +16539,12 @@ mod tests {
         graph_paths, graph_paths_for_selection, graph_paths_for_selection_with_confirmed_gaps,
         graph_time_endpoints, is_service_health_response, local_input_inventory_for_paths,
         metric_line_path_with_confirmed_gaps, minute_model_spend, minute_model_spend_for_metric,
-        model_spend_is_reliable, model_usage_timeline_from_events, monthly_window_seconds,
-        native_account_window_title, native_legal_pages, native_startup_loading,
-        normal_status_text, one_month_before_utc, open_codex_session_paths, parse_details_document,
-        parse_launch_mode, parse_preview_size, parse_rate_limits, parse_resize_direction,
-        period_remaining_text, physical_size_for_logical, plan_type_label, poll_service_state,
+        minute_model_spend_for_metric_with_untrusted, model_spend_is_reliable,
+        model_usage_timeline_from_events, monthly_window_seconds, native_account_window_title,
+        native_legal_pages, native_startup_loading, normal_status_text, one_month_before_utc,
+        open_codex_session_paths, parse_details_document, parse_launch_mode, parse_preview_size,
+        parse_rate_limits, parse_resize_direction, period_remaining_text,
+        physical_size_for_logical, plan_type_label, poll_service_state,
         poll_service_state_with_owner_check, preview_model_row, published_pair_is_fresh,
         read_active_thread_rollout_cached, read_recovery_entries_for_ranges,
         read_thread_rollout_path, remaining_graph_points, remaining_graph_points_for_metric,
@@ -16035,6 +17414,7 @@ mod tests {
         let mut publication = super::ResidentPublicationState {
             last_complete: Some(last_complete.clone()),
             last_complete_v2: Some(PublicDetailsV2::from(last_complete.clone())),
+            last_complete_v3: Some(state.public_details_v3_candidate().unwrap()),
         };
 
         // Mutate every independently collected part to values that must not
@@ -16323,10 +17703,219 @@ mod tests {
     }
 
     #[test]
+    fn astra_session_delta_survives_database_restart_without_duplicate_tokens() {
+        use super::usage_store::{SessionCollectionCommit, StoragePartitionIdentity, UsageStore};
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-astra-durable-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let session = root.join("astra.jsonl");
+        let now = Utc::now();
+        let reset_at = now.timestamp() + 3600;
+        let event = |total, input, cached, writes, output| {
+            json!({
+                "timestamp":now.to_rfc3339(), "type":"event_msg", "payload":{
+                    "type":"token_count", "info":{"total_token_usage":{
+                        "total_tokens":total, "input_tokens":input, "cached_input_tokens":cached,
+                        "cache_write_input_tokens":writes, "output_tokens":output
+                    }}
+                }
+            })
+        };
+        fs::write(
+            &session,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"turn_context","payload":{"model":"gpt-6-astra"}}),
+                event(100, 80, 10, 5, 20)
+            ),
+        )
+        .unwrap();
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 1,
+            partition_id: "33".repeat(32),
+        };
+        let database = root.join("usage.sqlite3");
+        let mut store = UsageStore::create_partitioned(&database, &identity).unwrap();
+        let mut previous_inventory = BTreeSet::new();
+        for cycle in 1..=5 {
+            if cycle == 2 {
+                let mut file = fs::OpenOptions::new().append(true).open(&session).unwrap();
+                writeln!(file, "{}", event(150, 120, 20, 10, 30)).unwrap();
+            } else if cycle == 4 {
+                let mut file = fs::OpenOptions::new().append(true).open(&session).unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"type":"turn_context","payload":{"model":"gpt-7-nova"}})
+                )
+                .unwrap();
+                writeln!(file, "{}", event(200, 160, 25, 13, 40)).unwrap();
+            }
+            let inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+            let state = store.load_session_collection_state().unwrap();
+            let collected = super::collect_incremental_local_usage(
+                &inventory,
+                &state,
+                &previous_inventory,
+                super::IncrementalSessionContext {
+                    reset_at,
+                    window_seconds: WEEK_SECONDS,
+                    baseline_existing: false,
+                    collector_epoch: cycle,
+                    cycle_seq: 1,
+                },
+            )
+            .unwrap();
+            if matches!(cycle, 3 | 5) {
+                assert!(collected.session_ranges.is_empty());
+            }
+            let stored_samples = collected
+                .history_samples
+                .iter()
+                .map(UsageHistorySample::to_store)
+                .collect::<Vec<_>>();
+            let observations = stored_samples
+                .iter()
+                .filter_map(|sample| {
+                    collected
+                        .history_model_totals
+                        .iter()
+                        .find(|(timestamp, _)| *timestamp == sample.timestamp)
+                        .map(|(_, totals)| {
+                            super::usage_store::UsageHistoryObservation::confirmed_with_models(
+                                sample,
+                                totals.clone(),
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
+            store
+                .commit_session_collection_with_observations(
+                    SessionCollectionCommit {
+                        reset_at,
+                        window_seconds: WEEK_SECONDS,
+                        collector_epoch: cycle,
+                        cycle_seq: 1,
+                        samples: &stored_samples,
+                        checkpoints: &collected.session_checkpoints,
+                        ranges: &collected.session_ranges,
+                        model_totals: &collected.session_model_totals,
+                        recorded_sessions: &collected.recorded_sessions,
+                    },
+                    &observations,
+                )
+                .unwrap();
+            previous_inventory = super::session_inventory_keys(&inventory);
+            drop(store);
+            store = UsageStore::open_partitioned(&database, &identity).unwrap();
+            let persisted = store.load_session_collection_state().unwrap();
+            let astra = persisted
+                .model_totals
+                .iter()
+                .find(|row| row.model == "ASTRA")
+                .unwrap();
+            assert_eq!(astra.total_tokens, if cycle == 1 { 100 } else { 150 });
+            assert_eq!(
+                astra.cache_write_input_tokens,
+                Some(if cycle == 1 { 5 } else { 10 })
+            );
+            assert_eq!(
+                persisted.checkpoints[0].last_model.as_deref(),
+                Some(if cycle < 4 { "ASTRA" } else { "gpt-7-nova" })
+            );
+            assert_eq!(
+                persisted.checkpoints[0].previous_cache_write_input,
+                Some(if cycle < 4 {
+                    astra.cache_write_input_tokens.unwrap()
+                } else {
+                    13
+                })
+            );
+            if cycle >= 4 {
+                let future = persisted
+                    .model_totals
+                    .iter()
+                    .find(|row| row.model == "gpt-7-nova")
+                    .unwrap();
+                assert_eq!(future.total_tokens, 50);
+                assert_eq!(future.cache_write_input_tokens, Some(3));
+            }
+            if !observations.is_empty() {
+                let history = store
+                    .load_recent_observations(now + chrono::Duration::minutes(1))
+                    .unwrap();
+                let latest = history.last().unwrap();
+                let models = latest.model_totals.as_ref().unwrap();
+                assert!(models.iter().any(|row| row.model == "ASTRA"));
+                assert_eq!(
+                    models
+                        .iter()
+                        .find(|row| row.model == "gpt-7-nova")
+                        .is_some(),
+                    cycle >= 4
+                );
+            }
+        }
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn astra_usage_keeps_write_tokens_and_uses_four_component_prices() {
+        let event = json!({"type":"event_msg","payload":{"type":"token_count","info":{
+            "total_token_usage":{"total_tokens":1_100_000,"input_tokens":1_000_000,
+            "cached_input_tokens":200_000,"cache_write_input_tokens":100_000,"output_tokens":100_000}
+        }}});
+        let snapshot = super::session_token_snapshot(&event).unwrap();
+        assert_eq!(snapshot.cache_write_input, Some(100_000));
+        let mut totals = ModelUsageTotals::default();
+        totals.add("gpt-6-astra", snapshot);
+        assert_eq!(totals.astra.tokens, 1_100_000);
+        assert_eq!(
+            totals.astra.astra_dollar_costs(),
+            Some((7.0, 0.2, 1.25, 5.0))
+        );
+        let public = totals.astra.public_v3();
+        assert_eq!(public.model, "ASTRA");
+        assert_eq!(public.cache_write_input_tokens, Some(100_000));
+        let cost = public.estimated_cost.unwrap();
+        assert_eq!(cost.price_version, super::ASTRA_PRICE_VERSION);
+        assert!((cost.total_dollars - 13.45).abs() < 0.000_001);
+        let durable = totals.to_session_totals();
+        let reloaded = ModelUsageTotals::from_session_totals(&durable);
+        assert_eq!(reloaded, totals);
+        let mut absent = event.clone();
+        absent["payload"]["info"]["total_token_usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_write_input_tokens");
+        let unknown = super::session_token_snapshot(&absent).unwrap();
+        assert_eq!(unknown.cache_write_input, None);
+        let mut unknown_totals = ModelUsageTotals::default();
+        unknown_totals.add("gpt-6-astra", unknown);
+        assert_eq!(unknown_totals.astra.astra_dollar_costs(), None);
+        let mut zero = absent;
+        zero["payload"]["info"]["total_token_usage"]["cache_write_input_tokens"] = json!(0);
+        assert_eq!(
+            super::session_token_snapshot(&zero)
+                .unwrap()
+                .cache_write_input,
+            Some(0)
+        );
+    }
+
+    #[test]
     fn local_estimate_price_version_cost_rounding_and_large_tokens_are_fixed() {
         assert_eq!(LOCAL_ESTIMATE_PRICE_VERSION, "LOCAL_ESTIMATE_V1_2026-08-14");
         let rows = [
             ModelUsageRow {
+                cache_write_input_tokens: None,
                 name: "SOL".into(),
                 tokens: 3_000_000,
                 input_tokens: 2_000_000,
@@ -16334,6 +17923,7 @@ mod tests {
                 output_tokens: 1_000_000,
             },
             ModelUsageRow {
+                cache_write_input_tokens: None,
                 name: "TERRA".into(),
                 tokens: 3_000_000,
                 input_tokens: 2_000_000,
@@ -16341,6 +17931,7 @@ mod tests {
                 output_tokens: 1_000_000,
             },
             ModelUsageRow {
+                cache_write_input_tokens: None,
                 name: "LUNA".into(),
                 tokens: 3_000_000,
                 input_tokens: 2_000_000,
@@ -16367,6 +17958,7 @@ mod tests {
         );
 
         let maximum = ModelUsageRow {
+            cache_write_input_tokens: None,
             name: "SOL".into(),
             tokens: u64::MAX,
             input_tokens: u64::MAX,
@@ -16628,6 +18220,7 @@ mod tests {
         let now = 2_000_000_000;
         let two_days = 2 * 86_400;
         let durable_total = super::usage_store::SessionModelTotal {
+            cache_write_input_tokens: None,
             model: "SOL".into(),
             total_tokens: 1_000,
             input_tokens: 800,
@@ -16680,6 +18273,7 @@ mod tests {
         let reset_at = 1_800_604_800;
         let normal = ModelUsageTotals::from_session_totals(&[
             super::usage_store::SessionModelTotal {
+                cache_write_input_tokens: None,
                 model: "SOL".into(),
                 total_tokens: 100,
                 input_tokens: 80,
@@ -16687,6 +18281,7 @@ mod tests {
                 output_tokens: 20,
             },
             super::usage_store::SessionModelTotal {
+                cache_write_input_tokens: None,
                 model: "LUNA".into(),
                 total_tokens: 50,
                 input_tokens: 40,
@@ -16696,6 +18291,7 @@ mod tests {
         ]);
         let recovered = ModelUsageTotals::from_session_totals(&[
             super::usage_store::SessionModelTotal {
+                cache_write_input_tokens: None,
                 model: "SOL".into(),
                 total_tokens: 1_100,
                 input_tokens: 880,
@@ -16703,6 +18299,7 @@ mod tests {
                 output_tokens: 220,
             },
             super::usage_store::SessionModelTotal {
+                cache_write_input_tokens: None,
                 model: "LUNA".into(),
                 total_tokens: 50,
                 input_tokens: 40,
@@ -16711,6 +18308,7 @@ mod tests {
             },
         ]);
         let checkpoint = super::usage_store::SessionCheckpoint {
+            previous_cache_write_input: None,
             root_identity: "11".repeat(32),
             relative_path: "session.jsonl".into(),
             file_device: 1,
@@ -16857,6 +18455,7 @@ mod tests {
             .iter()
             .filter(|candidate| candidate.recorded_source.relative_path != "post-boundary.jsonl")
             .map(|candidate| super::usage_store::SessionCheckpoint {
+                previous_cache_write_input: None,
                 root_identity: candidate.recorded_source.root_identity.clone(),
                 relative_path: candidate.recorded_source.relative_path.clone(),
                 file_device: candidate.recorded_source.file_device,
@@ -16918,6 +18517,7 @@ mod tests {
             recovered,
             vec![
                 super::usage_store::SessionModelTotal {
+                    cache_write_input_tokens: None,
                     model: "SOL".into(),
                     total_tokens: 1_000_000,
                     input_tokens: 800_000,
@@ -16925,6 +18525,7 @@ mod tests {
                     output_tokens: 200_000,
                 },
                 super::usage_store::SessionModelTotal {
+                    cache_write_input_tokens: None,
                     model: "TERRA".into(),
                     total_tokens: 0,
                     input_tokens: 0,
@@ -16932,6 +18533,7 @@ mod tests {
                     output_tokens: 0,
                 },
                 super::usage_store::SessionModelTotal {
+                    cache_write_input_tokens: None,
                     model: "LUNA".into(),
                     total_tokens: 2_000_000,
                     input_tokens: 1_800_000,
@@ -17044,6 +18646,7 @@ mod tests {
             window_seconds: WEEK_SECONDS,
             model_usage: ModelUsageTotals::default(),
             history_samples: vec![sample],
+            history_model_totals: Vec::new(),
             recorded_sessions: Vec::new(),
             cleanup_plan: None,
         });
@@ -17124,6 +18727,7 @@ mod tests {
             window_seconds: WEEK_SECONDS,
             model_usage: ModelUsageTotals::default(),
             history_samples: vec![local_only.clone()],
+            history_model_totals: Vec::new(),
             recorded_sessions: Vec::new(),
             cleanup_plan: None,
         });
@@ -17488,6 +19092,7 @@ mod tests {
         totals.add(
             "gpt-5.6-sol",
             TokenSnapshot {
+                cache_write_input: None,
                 total: 2_000_000,
                 input: 1_000_000,
                 cached_input: 0,
@@ -17506,6 +19111,7 @@ mod tests {
             window_seconds: WEEK_SECONDS,
             model_usage: totals,
             history_samples: Vec::new(),
+            history_model_totals: Vec::new(),
             recorded_sessions: Vec::new(),
             cleanup_plan: None,
         });
@@ -17730,6 +19336,7 @@ mod tests {
             file_inode: 40,
         };
         let checkpoint = super::usage_store::SessionCheckpoint {
+            previous_cache_write_input: None,
             root_identity: source.root_identity.clone(),
             relative_path: source.relative_path.clone(),
             file_device: source.file_device,
@@ -17773,6 +19380,7 @@ mod tests {
                     12.9,
                     ModelDollarTotals::default(),
                 )],
+                history_model_totals: Vec::new(),
                 recorded_sessions: vec![source],
                 cleanup_plan: None,
             },
@@ -17783,6 +19391,7 @@ mod tests {
             session_checkpoints: vec![checkpoint],
             session_ranges: vec![range],
             session_model_totals: vec![super::usage_store::SessionModelTotal {
+                cache_write_input_tokens: None,
                 model: "SOL".into(),
                 total_tokens: 100,
                 input_tokens: 80,
@@ -17908,6 +19517,7 @@ mod tests {
         state.apply_usage_event(usage_event(Some(23.0), reset_at));
         state.preview = false;
         let durable_model_totals = vec![super::usage_store::SessionModelTotal {
+            cache_write_input_tokens: None,
             model: "SOL".into(),
             total_tokens: 120,
             input_tokens: 100,
@@ -17967,6 +19577,7 @@ mod tests {
         state.apply_usage_event(usage_event(Some(23.0), reset_at));
         state.preview = false;
         let durable_model_totals = vec![super::usage_store::SessionModelTotal {
+            cache_write_input_tokens: None,
             model: "LUNA".into(),
             total_tokens: 44,
             input_tokens: 40,
@@ -18125,6 +19736,7 @@ mod tests {
                 1.0,
                 ModelDollarTotals::default(),
             )],
+            history_model_totals: Vec::new(),
             recorded_sessions: Vec::new(),
             cleanup_plan: None,
         });
@@ -18158,6 +19770,7 @@ mod tests {
                 0.0,
                 ModelDollarTotals::default(),
             )],
+            history_model_totals: Vec::new(),
             recorded_sessions: Vec::new(),
             cleanup_plan: None,
         });
@@ -18180,6 +19793,7 @@ mod tests {
             window_seconds: WEEK_SECONDS,
             model_usage: ModelUsageTotals::default(),
             history_samples: Vec::new(),
+            history_model_totals: Vec::new(),
             recorded_sessions: Vec::new(),
             cleanup_plan: None,
         });
@@ -18199,6 +19813,7 @@ mod tests {
         totals.add(
             "gpt-5.6-sol",
             TokenSnapshot {
+                cache_write_input: None,
                 total: 12,
                 input: 8,
                 cached_input: 2,
@@ -18227,6 +19842,7 @@ mod tests {
                 ModelDollarTotals::default(),
                 ModelTokenTotals::default(),
             )],
+            history_model_totals: Vec::new(),
             recorded_sessions: Vec::new(),
             cleanup_plan: None,
         });
@@ -18266,6 +19882,7 @@ mod tests {
                 22.0,
                 ModelDollarTotals::default(),
             )],
+            history_model_totals: Vec::new(),
             recorded_sessions: Vec::new(),
             cleanup_plan: None,
         });
@@ -18332,7 +19949,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_candidate_reuses_v1_canonical_rows_for_drift_duplicates_and_unavailable() {
+    fn versioned_candidates_preserve_known_legacy_models_and_unavailable_rows() {
         let mut state = CodexInfoState::preview("normal");
         let observed_at = 1_800_000_000_i64;
         let reset_at = observed_at + WEEK_SECONDS;
@@ -18410,6 +20027,35 @@ mod tests {
                 && sample.sol_dollars.is_none()
         }));
 
+        let v3 = state.public_details_v3_candidate_at(observed_at).unwrap();
+        let legacy_v3 = v3
+            .history_samples
+            .iter()
+            .find(|sample| sample.timestamp == duplicate_at)
+            .unwrap();
+        assert_eq!(legacy_v3.model_source, "legacy-unknown");
+        assert!(!legacy_v3.models_complete);
+        let legacy_models = legacy_v3.models.as_ref().unwrap();
+        assert_eq!(
+            legacy_models
+                .iter()
+                .map(|model| model.model.as_str())
+                .collect::<Vec<_>>(),
+            ["LUNA", "SOL", "TERRA"]
+        );
+        let legacy_sol = legacy_models
+            .iter()
+            .find(|model| model.model == "SOL")
+            .unwrap();
+        assert_eq!(legacy_sol.total_tokens, dominant.sol_tokens);
+        assert_eq!(legacy_sol.total_dollars, Some(dominant.sol_dollars));
+        assert_eq!(legacy_sol.input_tokens, None);
+        assert!(v3.history_samples.iter().any(|sample| {
+            sample.timestamp == unavailable_at
+                && sample.model_source == "unavailable"
+                && sample.models.is_none()
+        }));
+
         let config = ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap();
         let mut api_server = ApiServer::start(config).unwrap();
         let publisher = api_server.publisher();
@@ -18430,10 +20076,10 @@ mod tests {
             remaining_percent: 90.0,
             sol_dollars: 1.0,
             terra_dollars: 0.0,
-            luna_dollars: 0.0,
+            luna_dollars: 0.1,
             sol_tokens: 10,
             terra_tokens: 0,
-            luna_tokens: 0,
+            luna_tokens: 1,
         };
         let legacy = UsageHistorySample {
             timestamp: observed_at - 120,
@@ -18441,10 +20087,10 @@ mod tests {
             remaining_percent: 89.0,
             sol_dollars: 2.0,
             terra_dollars: 0.0,
-            luna_dollars: 0.0,
+            luna_dollars: 0.5,
             sol_tokens: 20,
             terra_tokens: 0,
-            luna_tokens: 0,
+            luna_tokens: 5,
         };
         let confirmed_recovery = UsageHistorySample {
             timestamp: observed_at,
@@ -18452,10 +20098,10 @@ mod tests {
             remaining_percent: 88.0,
             sol_dollars: 3.0,
             terra_dollars: 0.0,
-            luna_dollars: 0.0,
+            luna_dollars: 0.8,
             sol_tokens: 30,
             terra_tokens: 0,
-            luna_tokens: 0,
+            luna_tokens: 8,
         };
         let start_store = confirmed_start.to_store();
         let legacy_store = legacy.to_store();
@@ -18485,10 +20131,42 @@ mod tests {
             ..UsageHistory::default()
         };
 
-        let paths = state.graph_paths_for_selection_at(observed_at, false, false, true, false);
-        assert!(paths.sol_rising.is_empty());
-        assert!(!paths.sol_flat.is_empty());
-        assert!(!paths.sol_flat.contains("L100.00"));
+        let periods = state.history_periods_at(observed_at);
+        let selected_reset = state
+            .selected_history_reset_for_periods(&periods)
+            .expect("selected period");
+        let period = periods
+            .iter()
+            .find(|period| period.canonical_reset_at == selected_reset)
+            .expect("selected period bounds");
+        let (graph_samples, untrusted) =
+            state.graph_samples_for_selection(selected_reset, period.start, period.end);
+        let graph_sample_refs = graph_samples.iter().collect::<Vec<_>>();
+        let model_points =
+            minute_model_spend_for_metric_with_untrusted(&graph_sample_refs, false, &untrusted);
+        let retained_legacy = model_points
+            .iter()
+            .find(|point| point.timestamp == legacy.timestamp)
+            .expect("known incomplete point must remain in the graph input");
+        assert_eq!((retained_legacy.sol, retained_legacy.luna), (2.0, 0.5));
+
+        let paths = state.graph_paths_for_selection_at(observed_at, true, false, true, false);
+        assert!(
+            !paths.sol_rising.is_empty(),
+            "known legacy SOL observations are measured values, not predictions"
+        );
+        assert!(
+            !paths.luna_rising.is_empty(),
+            "known legacy LUNA observations are measured values, not predictions"
+        );
+        assert!(
+            paths.sol_inferred.matches('M').count() > 1,
+            "only the unavailable interval is bridged as inferred"
+        );
+        assert!(paths.luna_inferred.matches('M').count() > 1);
+        assert!(!paths.sol_inferred.contains("L100.00"));
+        assert_eq!(paths.current_sol_label, "$3.00");
+        assert_eq!(paths.current_luna_label, "$0.80");
         assert!(paths.remaining.matches('M').count() > 3);
     }
 
@@ -18625,6 +20303,7 @@ mod tests {
                 0.0,
                 ModelDollarTotals::default(),
             )],
+            history_model_totals: Vec::new(),
             recorded_sessions: Vec::new(),
             cleanup_plan: None,
         });
@@ -19641,7 +21320,7 @@ mod tests {
     }
 
     #[test]
-    fn session_traversal_budgets_and_symlink_rejection_have_exact_boundaries() {
+    fn session_traversal_bounds_count_and_depth_not_lifetime_file_size() {
         assert_eq!(super::security::MAX_SESSION_FILE_BYTES, 256 * 1024 * 1024);
         assert_eq!(
             super::security::MAX_SESSION_TOTAL_BYTES,
@@ -19657,19 +21336,9 @@ mod tests {
         }
         assert!(files.admit_file(1, 0).is_err());
 
-        let mut total = SessionTraversalBudget::default();
-        for _ in 0..8 {
-            total
-                .admit_file(1, super::security::MAX_SESSION_FILE_BYTES)
-                .expect("total byte boundary");
-        }
-        assert_eq!(total.total_bytes, super::security::MAX_SESSION_TOTAL_BYTES);
-        total
-            .admit_file(1, 1)
-            .expect("inventory aggregate is not the selected-byte cap");
         assert!(SessionTraversalBudget::default()
             .admit_file(1, super::security::MAX_SESSION_FILE_BYTES + 1)
-            .is_err());
+            .is_ok());
         assert!(SessionTraversalBudget::default()
             .admit_file(super::security::MAX_SESSION_DEPTH + 1, 0)
             .is_err());
@@ -19682,12 +21351,12 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let safe = root.join("safe.jsonl");
         fs::write(&safe, "{}\n").unwrap();
-        assert_eq!(session_jsonl_files(&root).unwrap(), vec![safe]);
+        assert_eq!(session_jsonl_files(&root).unwrap(), vec![safe.clone()]);
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
             symlink("safe.jsonl", root.join("linked.jsonl")).unwrap();
-            assert!(session_jsonl_files(&root).is_err());
+            assert_eq!(session_jsonl_files(&root).unwrap(), vec![safe]);
         }
         let _ = fs::remove_dir_all(root);
     }
@@ -19762,7 +21431,7 @@ mod tests {
         assert_eq!(names(&selected), ["z", "a"]);
         assert!(overflow.is_empty());
 
-        assert!(super::select_latest_session_prefix(
+        let (selected, overflow) = super::select_latest_session_prefix(
             vec![candidate(
                 "oversized",
                 super::security::MAX_SESSION_FILE_BYTES + 1,
@@ -19771,7 +21440,9 @@ mod tests {
             )],
             u64::MAX,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(names(&selected), ["oversized"]);
+        assert!(overflow.is_empty());
     }
 
     #[test]
@@ -19925,6 +21596,12 @@ mod tests {
             "{\"type\":\"thread_context\",\"model\":\"wrong-prefix-model\"}\n"
         );
         fs::write(&path, prefix).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(security::MAX_SESSION_FILE_BYTES + 1)
+            .unwrap();
         let tail = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":123}}}}\n";
         let checkpoint_metadata = fs::metadata(&path).unwrap();
         #[cfg(unix)]
@@ -19936,11 +21613,12 @@ mod tests {
         let (file_device, file_inode) = (0, 0);
         let root_metadata = fs::symlink_metadata(&root).unwrap();
         let mut checkpoint = super::usage_store::SessionCheckpoint {
+            previous_cache_write_input: None,
             root_identity: super::session_root_identity(&root, &root_metadata).unwrap(),
             relative_path: "seeded.jsonl".into(),
             file_device,
             file_inode,
-            committed_offset: prefix.len() as u64,
+            committed_offset: security::MAX_SESSION_FILE_BYTES + 1,
             discard_until_lf: false,
             collector_epoch: 1,
             cycle_seq: 1,
@@ -21189,6 +22867,7 @@ mod tests {
         totals.add(
             "gpt-5.6-sol",
             TokenSnapshot {
+                cache_write_input: None,
                 total: 10,
                 input: 8,
                 cached_input: 2,
@@ -21198,6 +22877,7 @@ mod tests {
         totals.add(
             "some-other-model",
             TokenSnapshot {
+                cache_write_input: None,
                 total: 999,
                 input: 999,
                 cached_input: 0,
@@ -21961,6 +23641,7 @@ mod tests {
             let source = inventory.selected_session_files[0].recorded_source.clone();
             let checkpoint = |collector_epoch, cycle_seq, fully_attributed_from_zero| {
                 super::usage_store::SessionCheckpoint {
+                    previous_cache_write_input: None,
                     root_identity: source.root_identity.clone(),
                     relative_path: source.relative_path.clone(),
                     file_device: source.file_device,
@@ -22088,6 +23769,7 @@ mod tests {
                 inventory = local_input_inventory_for_paths(Some(&sessions), None).unwrap();
                 let appended_source = inventory.selected_session_files[0].recorded_source.clone();
                 let committed = super::usage_store::SessionCheckpoint {
+                    previous_cache_write_input: None,
                     root_identity: appended_source.root_identity.clone(),
                     relative_path: appended_source.relative_path.clone(),
                     file_device: appended_source.file_device,
@@ -22217,6 +23899,7 @@ mod tests {
                 window_seconds: WEEK_SECONDS,
                 model_usage: ModelUsageTotals::default(),
                 history_samples: Vec::new(),
+                history_model_totals: Vec::new(),
                 recorded_sessions: Vec::new(),
                 cleanup_plan: None,
             });
@@ -22242,6 +23925,7 @@ mod tests {
                     91.0,
                     ModelDollarTotals::default(),
                 )],
+                history_model_totals: Vec::new(),
                 recorded_sessions: Vec::new(),
                 cleanup_plan: None,
             });
@@ -22529,6 +24213,7 @@ mod tests {
         assert_eq!(inventory.overflow_session_files.len(), 1);
         assert_eq!(inventory.selected_session_files[0].fingerprint.path, newest);
         let durable_total = super::usage_store::SessionModelTotal {
+            cache_write_input_tokens: None,
             model: "SOL".into(),
             total_tokens: 1_000,
             input_tokens: 1_000,
@@ -22591,6 +24276,7 @@ mod tests {
             window_seconds: WEEK_SECONDS,
             model_usage: collection.model_usage,
             history_samples: collection.history_samples,
+            history_model_totals: collection.history_model_totals,
             recorded_sessions: collection.recorded_sessions,
             cleanup_plan: collection.cleanup_plan,
         });
@@ -24367,22 +26053,14 @@ mod tests {
             fixture.expected_graph_timestamps
         );
         let graph = state.graph_paths_for_selection_at(observed_at, true, true, true, false);
-        // The v1 fallback carries legacy-unknown model provenance. It may
-        // still expose the endpoint value, but no model increase is a
-        // confirmed solid segment in the native graph.
-        assert!(graph.sol_rising.is_empty());
+        // The v1 fallback has an incomplete model set, but every legacy row
+        // that is present remains an exact model observation. Keep its SOL
+        // increase solid and leave only omitted models unknown.
+        assert!(!graph.sol_rising.is_empty());
         assert_eq!(graph.current_sol_label, "$420.40");
-        let first_observation_x = (fixture.expected_raw_timestamps[0]
-            - fixture.expected_period_start) as f64
-            / (fixture.expected_period_end - fixture.expected_period_start) as f64
-            * 100.0;
-        assert!(graph.unused_intervals.iter().any(|interval| {
-            (interval.start - first_observation_x).abs() < 0.000_001 && interval.width > 0.0
-        }));
-        assert!(graph
-            .unused_intervals
-            .iter()
-            .all(|interval| interval.start + 0.000_001 >= first_observation_x));
+        // The legacy model set is incomplete, so even a flat published row
+        // cannot prove that every omitted model was idle.
+        assert!(graph.unused_intervals.is_empty());
 
         let labels = state.graph_time_labels_at(observed_at);
         let expected_labels = [0.0, 0.25, 0.5, 0.75, 1.0].map(|fraction| {
@@ -24718,6 +26396,69 @@ mod tests {
         .unwrap_err();
         assert_eq!(transport_routes, ["/v2/details"]);
         assert_eq!(error, "transport unavailable");
+    }
+
+    #[test]
+    fn linux_details_v3_uses_conditional_cache_and_legacy_fallback_only_on_404() {
+        let pair = format!("v1:{:032x}{:032x}", 1_u128, 1_u128);
+        let not_modified = super::fetch_service_details_v3_with_etag(
+            |route, conditional| {
+                assert_eq!(route, "/v3/details");
+                assert_eq!(conditional, Some(pair.as_str()));
+                Ok(super::ServiceDetailsHttpResponse {
+                    status: 304,
+                    pair: Some(pair.clone()),
+                    body: Vec::new(),
+                })
+            },
+            Some(pair.as_str()),
+        )
+        .unwrap();
+        assert_eq!(
+            not_modified,
+            super::ServiceDetailsV3Fetch::NotModified { pair: pair.clone() }
+        );
+
+        let mut v1_document =
+            serde_json::to_value(CodexInfoState::preview("normal").public_details()).unwrap();
+        v1_document
+            .as_object_mut()
+            .unwrap()
+            .insert("api_version".into(), Value::String("v1".into()));
+        let v1_body = serde_json::to_vec(&v1_document).unwrap();
+        let mut requests = Vec::new();
+        let fallback = super::fetch_service_details_v3_with_etag(
+            |route, conditional| {
+                requests.push((route.to_owned(), conditional.map(str::to_owned)));
+                Ok(match route {
+                    "/v3/details" | "/v2/details" => super::ServiceDetailsHttpResponse {
+                        status: 404,
+                        pair: None,
+                        body: b"{}".to_vec(),
+                    },
+                    "/v1/details" => super::ServiceDetailsHttpResponse {
+                        status: 200,
+                        pair: Some(pair.clone()),
+                        body: v1_body.clone(),
+                    },
+                    _ => unreachable!(),
+                })
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            requests,
+            [
+                ("/v3/details".into(), None),
+                ("/v2/details".into(), None),
+                ("/v1/details".into(), None),
+            ]
+        );
+        assert!(matches!(
+            fallback,
+            super::ServiceDetailsV3Fetch::Fresh { from_v3: false, .. }
+        ));
     }
 
     #[test]
@@ -25866,11 +27607,12 @@ mod tests {
         let points = minute_model_spend(&references);
         assert_eq!(points[0].sol, 50.0);
         assert!(!model_spend_is_reliable(&points[1]));
+        assert_eq!((points[1].terra, points[1].luna), (2.0, 1.0));
         assert_eq!(points[2].sol, 51.0);
 
         let graph = graph_paths_for_selection(&references, 0, 240, false, false, true, false);
         assert_eq!(graph.current_sol_label, "$51.00");
-        assert!(graph.sol_flat.matches('M').count() > 2);
+        assert!(graph.sol_inferred.matches('M').count() > 2);
         assert!(!graph.sol_rising.contains("M41.67"));
     }
 
@@ -25918,7 +27660,7 @@ mod tests {
         // Inferred model recovery and unattributed quota movement are drawn
         // as multiple separated strokes, never a solid flat-then-vertical
         // fiction at the recovery timestamp.
-        assert!(graph.sol_flat.matches('M').count() > 2);
+        assert!(graph.sol_inferred.matches('M').count() > 2);
         assert!(!graph.sol_rising.contains("M60.00"));
         assert!(graph.remaining.matches('M').count() > 5);
         assert!(!graph.remaining.contains("M80.00 4.92 L80.00 19.62"));
@@ -25978,11 +27720,7 @@ mod tests {
         assert!(graph.remaining.contains("M0.00 1.00 L33.33 10.80"));
         assert!(!graph.remaining.contains("M33.33 10.80 L66.67 20.60"));
         assert!(graph.remaining.contains("M66.67 20.60 L100.00 30.40"));
-        assert!(graph.unused_intervals.iter().any(|interval| {
-            interval.preserve_boundary
-                && (interval.start - 33.333_333).abs() < 0.001
-                && (interval.width - 33.333_333).abs() < 0.001
-        }));
+        assert!(graph.unused_intervals.is_empty());
     }
 
     #[test]
@@ -26026,6 +27764,7 @@ mod tests {
                 sol: 3.0,
                 terra: 2.0,
                 luna: 1.0,
+                astra: -1.0,
             }],
             100,
             300,
@@ -26050,6 +27789,7 @@ mod tests {
                 sol: 3.0,
                 terra: 2.0,
                 luna: 1.0,
+                astra: -1.0,
             }],
             0,
             3_600,
@@ -26070,6 +27810,7 @@ mod tests {
                 sol: 3.0,
                 terra: 2.0,
                 luna: 1.0,
+                astra: -1.0,
             }],
             100,
             100,
@@ -26928,7 +28669,7 @@ mod tests {
         assert!(graph.current_luna_label.is_empty());
         assert!(graph.current_terra_label.is_empty());
         assert!(graph.current_sol_label.is_empty());
-        assert!(graph.sol_flat.matches('M').count() > 2);
+        assert!(graph.sol_inferred.matches('M').count() > 2);
     }
 
     #[test]
@@ -27235,6 +28976,27 @@ mod tests {
         assert!(!flat.contains("M1.64 50.00 L98.36 50.00"));
         assert!(!rising.contains("M98.36 50.00 L98.36 1.00"));
         assert!(inferred.matches('M').count() > 2);
+
+        let equal_endpoints = [
+            HourlyModelSpend {
+                timestamp: 0,
+                luna: 2.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 3_600,
+                luna: 2.0,
+                ..HourlyModelSpend::default()
+            },
+        ];
+        let (flat, rising, inferred) =
+            split_metric_line_paths(&equal_endpoints, 0, 3_600, 2.0, |point| point.luna);
+        assert!(
+            !flat.is_empty(),
+            "equal cumulative endpoints prove a flat interval"
+        );
+        assert!(rising.is_empty());
+        assert!(inferred.is_empty());
     }
 
     #[test]
@@ -27265,12 +29027,12 @@ mod tests {
         let dollars = graph_paths_for_selection(&references, 0, 240, false, false, true, false);
         assert_eq!(dollars.current_sol_label, "$12.00");
         assert!(!dollars.sol_rising.contains("M50.00 99.00"));
-        assert!(dollars.sol_flat.matches('M').count() > 2);
+        assert!(dollars.sol_inferred.matches('M').count() > 2);
 
         let tokens = graph_paths_for_selection(&references, 0, 240, false, false, true, true);
         assert_eq!(tokens.current_sol_label, "120");
         assert!(!tokens.sol_rising.contains("M50.00 99.00"));
-        assert!(tokens.sol_flat.matches('M').count() > 2);
+        assert!(tokens.sol_inferred.matches('M').count() > 2);
     }
 
     #[test]
@@ -27295,7 +29057,7 @@ mod tests {
     }
 
     #[test]
-    fn unused_intervals_mark_idle_segments_and_preserve_first_use_boundary() {
+    fn unused_intervals_mark_only_confirmed_idle_segments() {
         let points = [
             HourlyModelSpend {
                 timestamp: 0,
@@ -27355,23 +29117,75 @@ mod tests {
         ];
         assert_eq!(
             unused_interval_positions(&first_use, 0, 240),
-            vec![
-                UnusedIntervalPosition {
-                    start: 0.0,
-                    width: 75.0,
-                    preserve_boundary: true,
-                },
-                UnusedIntervalPosition {
-                    start: 75.0,
-                    width: 25.0,
-                    preserve_boundary: false,
-                },
-            ]
+            vec![UnusedIntervalPosition {
+                start: 75.0,
+                width: 25.0,
+                preserve_boundary: false,
+            }]
         );
+
+        let astra_activity = [
+            HourlyModelSpend {
+                timestamp: 0,
+                astra: 10.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 60,
+                astra: 11.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 120,
+                astra: 12.0,
+                ..HourlyModelSpend::default()
+            },
+        ];
+        assert!(unused_interval_positions(&astra_activity, 0, 120).is_empty());
+
+        let fixed_models_flat = [
+            HourlyModelSpend {
+                timestamp: 0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 60,
+                ..HourlyModelSpend::default()
+            },
+        ];
+        let additional_model = BTreeMap::from([(
+            "future-model".to_owned(),
+            BTreeMap::from([
+                (
+                    0,
+                    super::GraphModelPoint {
+                        dollar: 1.0,
+                        tokens: 10.0,
+                        reliable: true,
+                    },
+                ),
+                (
+                    60,
+                    super::GraphModelPoint {
+                        dollar: 2.0,
+                        tokens: 20.0,
+                        reliable: true,
+                    },
+                ),
+            ]),
+        )]);
+        assert!(super::unused_interval_positions_with_confirmed_gaps(
+            &fixed_models_flat,
+            0,
+            60,
+            &[],
+            Some((&additional_model, false)),
+        )
+        .is_empty());
     }
 
     #[test]
-    fn unused_intervals_mark_long_gap_before_observed_spend() {
+    fn unused_intervals_do_not_call_unobserved_spend_idle() {
         let points = [
             HourlyModelSpend {
                 timestamp: 0,
@@ -27384,14 +29198,7 @@ mod tests {
                 ..HourlyModelSpend::default()
             },
         ];
-        assert_eq!(
-            unused_interval_positions(&points, 0, 3_600),
-            vec![UnusedIntervalPosition {
-                start: 0.0,
-                width: 100.0,
-                preserve_boundary: true,
-            }]
-        );
+        assert!(unused_interval_positions(&points, 0, 3_600).is_empty());
     }
 
     #[test]
@@ -27402,24 +29209,28 @@ mod tests {
                 sol: 2.0,
                 terra: 1.0,
                 luna: 3.0,
+                astra: -1.0,
             },
             HourlyModelSpend {
                 timestamp: 60,
                 sol: 2.0,
                 terra: 1.0,
                 luna: 3.0,
+                astra: -1.0,
             },
             HourlyModelSpend {
                 timestamp: 120,
                 sol: 2.0,
                 terra: 1.0,
                 luna: 3.0,
+                astra: -1.0,
             },
             HourlyModelSpend {
                 timestamp: 180,
                 sol: 2.0,
                 terra: 1.0,
                 luna: 3.0,
+                astra: -1.0,
             },
         ];
         assert_eq!(
@@ -27541,7 +29352,7 @@ mod tests {
             current_sol_y: 0.5,
             ..GraphPaths::default()
         };
-        separate_current_label_positions(&mut paths, true, true, true, true);
+        separate_current_label_positions(&mut paths, true, true, true, true, false);
         let mut positions = [
             paths.current_remaining_y,
             paths.current_luna_y,
@@ -27572,18 +29383,21 @@ mod tests {
                 sol: 0.0,
                 terra: 0.0,
                 luna: 0.0,
+                astra: 0.0,
             },
             HourlyModelSpend {
                 timestamp: 60,
                 sol: 1.0,
                 terra: 2.0,
                 luna: 3.0,
+                astra: 4.0,
             },
             HourlyModelSpend {
                 timestamp: 120,
                 sol: 4.0,
                 terra: 5.0,
                 luna: 6.0,
+                astra: 7.0,
             },
         ]);
         assert!(spend.windows(2).all(|pair| {
@@ -27626,8 +29440,321 @@ mod tests {
     }
 
     #[test]
+    fn service_refresh_preserves_a_bounded_historical_selection() {
+        let mut producer = CodexInfoState::preview("normal");
+        let current_reset = producer.reset_at.expect("preview reset");
+        let historical_reset = current_reset - WEEK_SECONDS;
+        let historical_timestamp = producer
+            .history
+            .samples
+            .iter()
+            .map(|sample| sample.timestamp)
+            .min()
+            .expect("preview history")
+            - WEEK_SECONDS;
+        producer
+            .history
+            .samples
+            .push(UsageHistorySample::new_with_usage(
+                historical_timestamp,
+                historical_reset,
+                64.0,
+                ModelDollarTotals {
+                    sol: 12.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 120,
+                    ..ModelTokenTotals::default()
+                },
+            ));
+        let details = PublicDetailsV2::from(producer.public_details());
+        let historical = details
+            .history_periods
+            .iter()
+            .find(|period| !period.current)
+            .expect("historical period")
+            .clone();
+
+        let mut client = CodexInfoState::service_client();
+        client.selected_reset_at = Some(historical.reset_at - 1);
+        client.selected_history_period = "stale client label".into();
+        assert!(client
+            .apply_service_details_v2(format!("v1:{:064x}", 1_u8), details)
+            .unwrap());
+
+        assert_eq!(client.selected_reset_at, Some(historical.reset_at));
+        assert_eq!(client.selected_history_period, historical.label);
+        let selected = client.history.samples_for_reset(client.selected_reset_at);
+        assert!(selected
+            .iter()
+            .all(|sample| sample.reset_at == historical.reset_at));
+        assert!(selected.iter().any(|sample| {
+            sample.timestamp == historical_timestamp && sample.sol_tokens == 120
+        }));
+    }
+
+    #[test]
+    fn v3_historical_selection_keeps_astra_without_requiring_legacy_models() {
+        let mut producer = CodexInfoState::preview("normal");
+        let observed_at = Utc::now().timestamp().div_euclid(60) * 60;
+        let current_reset = producer.reset_at.expect("preview reset");
+        let historical_reset = current_reset - WEEK_SECONDS;
+        let first = producer
+            .history
+            .samples
+            .iter()
+            .map(|sample| sample.timestamp)
+            .min()
+            .expect("preview history")
+            - WEEK_SECONDS;
+        for (timestamp, tokens, source, complete, sol, luna) in [
+            (
+                first,
+                1_000_000,
+                usage_store::ModelSource::LegacyUnknown,
+                false,
+                0_u64,
+                10_u64,
+            ),
+            (
+                first + 60,
+                2_000_000,
+                usage_store::ModelSource::LegacyUnknown,
+                false,
+                0,
+                20,
+            ),
+            (
+                first + 120,
+                3_000_000,
+                usage_store::ModelSource::Confirmed,
+                true,
+                30,
+                20,
+            ),
+            (
+                first + 180,
+                4_000_000,
+                usage_store::ModelSource::Confirmed,
+                true,
+                40,
+                30,
+            ),
+        ] {
+            producer
+                .history
+                .samples
+                .push(UsageHistorySample::new_with_usage(
+                    timestamp,
+                    historical_reset,
+                    64.0,
+                    ModelDollarTotals {
+                        sol: sol as f64,
+                        luna: luna as f64,
+                        ..ModelDollarTotals::default()
+                    },
+                    ModelTokenTotals {
+                        sol,
+                        luna,
+                        ..ModelTokenTotals::default()
+                    },
+                ));
+            let mut model_totals = vec![usage_store::SessionModelTotal {
+                model: "ASTRA".into(),
+                total_tokens: tokens,
+                input_tokens: tokens,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+            }];
+            if complete {
+                model_totals.extend([
+                    usage_store::SessionModelTotal {
+                        model: "SOL".into(),
+                        total_tokens: sol,
+                        input_tokens: sol,
+                        cached_input_tokens: 0,
+                        output_tokens: 0,
+                        cache_write_input_tokens: None,
+                    },
+                    usage_store::SessionModelTotal {
+                        model: "TERRA".into(),
+                        total_tokens: 0,
+                        input_tokens: 0,
+                        cached_input_tokens: 0,
+                        output_tokens: 0,
+                        cache_write_input_tokens: None,
+                    },
+                    usage_store::SessionModelTotal {
+                        model: "LUNA".into(),
+                        total_tokens: luna,
+                        input_tokens: luna,
+                        cached_input_tokens: 0,
+                        output_tokens: 0,
+                        cache_write_input_tokens: None,
+                    },
+                ]);
+            }
+            producer
+                .history
+                .observations
+                .push(usage_store::UsageHistoryObservation {
+                    timestamp,
+                    reset_at: historical_reset,
+                    remaining_percent: Some(64.0),
+                    sol_dollars: Some(sol as f64),
+                    terra_dollars: Some(0.0),
+                    luna_dollars: Some(luna as f64),
+                    sol_tokens: Some(sol),
+                    terra_tokens: Some(0),
+                    luna_tokens: Some(luna),
+                    model_source: source,
+                    model_totals: Some(model_totals),
+                    model_totals_complete: complete,
+                });
+        }
+        let details = producer
+            .public_details_v3_candidate_at(observed_at)
+            .unwrap();
+        let historical = details
+            .history_periods
+            .iter()
+            .find(|period| !period.current)
+            .expect("historical period")
+            .clone();
+        let first_details = details
+            .history_samples
+            .iter()
+            .find(|sample| sample.timestamp == first)
+            .expect("first historical v3 row");
+        let first_models = first_details.models.as_ref().expect("known model rows");
+        assert_eq!(
+            first_models
+                .iter()
+                .map(|model| model.model.as_str())
+                .collect::<Vec<_>>(),
+            ["ASTRA", "LUNA", "SOL", "TERRA"]
+        );
+        let first_luna = first_models
+            .iter()
+            .find(|model| model.model == "LUNA")
+            .expect("exact legacy LUNA row merged beside ASTRA");
+        assert_eq!(
+            (first_luna.total_tokens, first_luna.total_dollars),
+            (10, Some(10.0))
+        );
+
+        let mut client = CodexInfoState::service_client();
+        client.selected_reset_at = Some(historical.reset_at - 1);
+        client.selected_history_period = "stale client label".into();
+        assert!(client
+            .apply_service_details_v3(format!("v1:{:064x}", 2_u8), details)
+            .unwrap());
+
+        assert_eq!(client.selected_reset_at, Some(historical.reset_at));
+        assert_eq!(client.selected_history_period, historical.label);
+        let astra_observations = client
+            .history
+            .observations
+            .iter()
+            .filter(|observation| {
+                observation
+                    .model_totals
+                    .as_ref()
+                    .is_some_and(|models| models.iter().any(|model| model.model == "ASTRA"))
+            })
+            .count();
+        assert_eq!(astra_observations, 4);
+        let astra_points = client.graph_model_points_for_selection(
+            historical.reset_at,
+            historical.start_at,
+            historical.end_at,
+            "ASTRA",
+        );
+        assert_eq!(astra_points.len(), 4);
+        assert_eq!(
+            astra_points
+                .values()
+                .map(|point| (point.dollar, point.tokens, point.reliable))
+                .collect::<Vec<_>>(),
+            [
+                (10.0, 1_000_000.0, true),
+                (20.0, 2_000_000.0, true),
+                (30.0, 3_000_000.0, true),
+                (40.0, 4_000_000.0, true),
+            ]
+        );
+        let paths = client.graph_paths_for_selection_at_with_astra(
+            observed_at,
+            true,
+            true,
+            true,
+            true,
+            false,
+        );
+        assert!(paths.astra_flat.is_empty());
+        assert!(!paths.astra_rising.is_empty());
+        assert_eq!(paths.current_astra_label, "$40.00");
+        let luna_points = client.graph_model_points_for_selection(
+            historical.reset_at,
+            historical.start_at,
+            historical.end_at,
+            "LUNA",
+        );
+        let sol_points = client.graph_model_points_for_selection(
+            historical.reset_at,
+            historical.start_at,
+            historical.end_at,
+            "SOL",
+        );
+        assert_eq!(
+            luna_points.get(&first).map(|point| point.dollar),
+            Some(10.0)
+        );
+        assert_eq!(
+            luna_points.get(&(first + 60)).map(|point| point.dollar),
+            Some(20.0)
+        );
+        assert_eq!(sol_points.get(&first).map(|point| point.dollar), Some(0.0));
+        assert_eq!(
+            sol_points.get(&(first + 120)).map(|point| point.dollar),
+            Some(30.0)
+        );
+        assert!(!paths.luna_rising.is_empty());
+        assert!(!paths.sol_rising.is_empty());
+        assert_eq!(
+            paths.current_luna_label,
+            format!("${:.2}", luna_points.values().next_back().unwrap().dollar)
+        );
+        assert_eq!(
+            paths.current_sol_label,
+            format!("${:.2}", sol_points.values().next_back().unwrap().dollar)
+        );
+
+        let token_paths = client.graph_paths_for_selection_at_with_astra(
+            observed_at,
+            true,
+            true,
+            true,
+            true,
+            true,
+        );
+        assert!(token_paths.astra_flat.is_empty());
+        assert!(!token_paths.astra_rising.is_empty());
+        assert_eq!(token_paths.current_astra_label, "4,000,000");
+    }
+
+    #[test]
     fn graph_period_row_only_displays_period_label() {
         let source = include_str!("../ui/components.slint");
+        let graph_select = source
+            .split_once("export component GraphSelect inherits Rectangle {")
+            .and_then(|(_, source)| source.split_once("export component Header"))
+            .map(|(source, _)| source)
+            .expect("GraphSelect component");
+        assert!(graph_select.contains("in property <int> current-index: 0;"));
+        assert!(!graph_select.contains("root.current-index = index;"));
         let graph = source
             .split("export component GraphWindow inherits Window {")
             .nth(1)
@@ -27717,20 +29844,64 @@ mod tests {
     }
 
     #[test]
-    fn graph_idle_model_paths_use_quiet_strokes() {
+    fn graph_observed_model_paths_do_not_look_inferred() {
         let source = include_str!("../ui/components.slint");
         let graph = source
             .split("export component GraphWindow inherits Window {")
             .nth(1)
             .expect("GraphWindow");
-        for path_name in ["luna-flat-path", "terra-flat-path", "sol-flat-path"] {
+        for path_name in [
+            "luna-flat-path",
+            "terra-flat-path",
+            "sol-flat-path",
+            "astra-flat-path",
+        ] {
             let path = graph
                 .split("Path {")
                 .find(|body| body.contains(&format!("commands: root.{path_name};")))
                 .expect(path_name);
             assert!(path.contains("stroke-width: 1px;"), "{path_name}");
-            assert!(path.contains("opacity: 0.5;"), "{path_name}");
+            assert!(path.contains("opacity: 0.95;"), "{path_name}");
         }
+        for path_name in [
+            "luna-rising-path",
+            "terra-rising-path",
+            "sol-rising-path",
+            "astra-rising-path",
+        ] {
+            let path = graph
+                .split("Path {")
+                .find(|body| body.contains(&format!("commands: root.{path_name};")))
+                .expect(path_name);
+            assert!(path.contains("stroke-width: 3px;"), "{path_name}");
+            assert!(path.contains("opacity: 0.95;"), "{path_name}");
+        }
+        for path_name in [
+            "remaining-inferred-path",
+            "luna-inferred-path",
+            "terra-inferred-path",
+            "sol-inferred-path",
+            "astra-inferred-path",
+        ] {
+            let path = graph
+                .split("Path {")
+                .find(|body| body.contains(&format!("commands: root.{path_name};")))
+                .expect(path_name);
+            assert!(path.contains("stroke-width: 1px;"), "{path_name}");
+            assert!(path.contains("opacity: 0.72;"), "{path_name}");
+        }
+        let remaining_measured = graph
+            .split("Path {")
+            .find(|body| body.contains("commands: root.remaining-path;"))
+            .expect("remaining measured path");
+        assert!(remaining_measured.contains("stroke-width: 3px;"));
+
+        let mut inferred = String::new();
+        super::append_dashed_segment(&mut inferred, (0.0, 0.0), (10.0, 0.0));
+        assert!(
+            inferred.matches('M').count() >= 12,
+            "inferred cadence must remain short and dense: {inferred}"
+        );
     }
 
     #[test]
@@ -27792,15 +29963,37 @@ mod tests {
         assert!(payload.iter().all(|sample| sample.reset_at == reset));
         // Check the production source-aware projection as well as quota:
         // endpoint-label pixels alone do not prove any model line exists.
-        let paths = state.graph_paths_for_selection(true, true, true, false);
-        // The observations are two days apart: use dashed reference paths,
-        // not solid rising paths that would imply continuous recording.
+        let paths = state.graph_paths_for_selection_at_with_astra(
+            Utc::now().timestamp(),
+            true,
+            true,
+            true,
+            true,
+            false,
+        );
+        // The opening observations are ten minutes apart: use dashed
+        // reference paths, not solid rising paths that would imply
+        // continuous recording. The later minute-by-minute observations
+        // remain a visibly longer measured interval in the same frame.
         assert!(!paths.sol_flat.is_empty());
         assert!(!paths.terra_flat.is_empty());
         assert!(!paths.luna_flat.is_empty());
         assert!(paths.sol_rising.is_empty());
         assert!(paths.terra_rising.is_empty());
         assert!(paths.luna_rising.is_empty());
+        assert!(!paths.astra_flat.is_empty());
+        assert!(paths.astra_rising.is_empty());
+        assert!(!paths.astra_inferred.is_empty());
+        let measured_idle = paths
+            .unused_intervals
+            .iter()
+            .max_by(|left, right| left.width.total_cmp(&right.width))
+            .expect("preview contains a measured idle interval");
+        assert!(
+            measured_idle.width >= 60.0,
+            "idle width={}",
+            measured_idle.width
+        );
     }
 
     #[test]
@@ -28236,6 +30429,7 @@ mod tests {
         let reset_at = state.reset_at.expect("preview quota has reset");
         state.apply_usage_event(usage_event(Some(37.0), reset_at));
         state.model_usage = vec![ModelUsageRow {
+            cache_write_input_tokens: None,
             name: "SOL".into(),
             tokens: 1_750,
             input_tokens: 1_500,

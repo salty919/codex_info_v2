@@ -317,7 +317,70 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Scene_marks_a_regressed_model_component_as_a_whole_vector_gap_until_recovery()
+    public void V3AstraHistoryRendersWithoutLegacyModelRows()
+    {
+        var samples = new[]
+        {
+            new ApiHistorySample(
+                1_000, 2_000, 90, null, null, null, null, null, null,
+                ApiHistorySample.LegacyUnknownModelSource)
+            {
+                ModelsComplete = false,
+                ModelSamples =
+                [
+                    new ApiHistoryModelSample("ASTRA", 1, 0, 0, 10) { TotalTokens = 1 },
+                    new ApiHistoryModelSample("LUNA", null, null, null, 1) { TotalTokens = 1 },
+                ],
+            },
+            new ApiHistorySample(
+                1_060, 2_000, 89, null, null, null, null, null, null,
+                ApiHistorySample.LegacyUnknownModelSource)
+            {
+                ModelsComplete = false,
+                ModelSamples =
+                [
+                    new ApiHistoryModelSample("ASTRA", 2, 0, 0, 20) { TotalTokens = 2 },
+                    new ApiHistoryModelSample("LUNA", null, null, null, 2) { TotalTokens = 2 },
+                    new ApiHistoryModelSample("SOL", null, null, null, 3) { TotalTokens = 3 },
+                ],
+            },
+            new ApiHistorySample(
+                1_120, 2_000, 88, null, null, null, null, null, null,
+                ApiHistorySample.LegacyUnknownModelSource)
+            {
+                ModelsComplete = false,
+                ModelSamples =
+                [
+                    new ApiHistoryModelSample("ASTRA", 3, 0, 0, 30) { TotalTokens = 3 },
+                    new ApiHistoryModelSample("LUNA", null, null, null, 2) { TotalTokens = 2 },
+                    new ApiHistoryModelSample("SOL", null, null, null, 4) { TotalTokens = 4 },
+                ],
+            },
+        };
+
+        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_120);
+        var astra = GraphPlotProjection.BuildModelLines(scene, scene.Astra);
+        var luna = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
+        var sol = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+
+        Assert.Equal([10d, 20d, 30d], scene.Astra);
+        Assert.Equal([10d, 20d, 30d], scene.ModelSeries["ASTRA"]);
+        Assert.Equal([1d, 2d, 2d], scene.Luna);
+        Assert.True(double.IsNaN(scene.Sol[0]));
+        Assert.Equal([3d, 4d], scene.Sol.Skip(1));
+        Assert.Equal([1_000d, 1_060d, 1_120d], astra.Rising.X);
+        Assert.Equal([10d, 20d, 30d], astra.Rising.Y);
+        Assert.Empty(astra.Dashed.X);
+        Assert.Equal([1_000d, 1_060d], luna.Rising.X);
+        Assert.Equal([1_060d, 1_120d], luna.Flat.X);
+        Assert.Empty(luna.Dashed.X);
+        Assert.Equal([1_060d, 1_120d], sol.Rising.X);
+        Assert.Empty(sol.Dashed.X);
+        Assert.Empty(scene.IdleIntervals);
+    }
+
+    [Fact]
+    public void Scene_hides_only_the_regressed_model_component_until_recovery()
     {
         var scene = Scene(
             [
@@ -328,15 +391,15 @@ public sealed class GraphPlotControlTests
             ]);
 
         Assert.Equal([true, false, true, true], scene.ModelVectorAvailable);
-        Assert.Equal([1d, double.NaN, 2d, 75d], scene.Sol);
+        Assert.Equal([1d, 2d, 2d, 75d], scene.Sol);
         Assert.Equal([2d, double.NaN, 2d, 3d], scene.Terra);
-        Assert.Equal([3d, double.NaN, 4d, 5d], scene.Luna);
+        Assert.Equal([3d, 4d, 4d, 5d], scene.Luna);
 
         var lines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
-        Assert.Equal([1_120d, 1_180d], lines.Rising.X);
-        Assert.Equal([2d, 75d], lines.Rising.Y);
-        Assert.Equal([1_000d, 1_120d], lines.Dashed.X);
-        Assert.Equal([1d, 2d], lines.Dashed.Y);
+        Assert.Equal([1_000d, 1_060d, double.NaN, 1_120d, 1_180d], lines.Rising.X);
+        Assert.Equal([1d, 2d, double.NaN, 2d, 75d], lines.Rising.Y);
+        Assert.Equal([1_060d, 1_120d], lines.Flat.X);
+        Assert.Empty(lines.Dashed.X);
 
         var quotaLines = GraphPlotProjection.BuildRemainingLines(scene);
         Assert.Equal([1_120d, 1_180d], quotaLines.Solid.X);
@@ -377,13 +440,14 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Model_lines_dash_a_trusted_gap_longer_than_sixty_seconds()
+    public void Model_lines_dash_only_increasing_unobserved_gaps()
     {
         var scene = Scene(
             [
                 Point(1_000, 100, 0, 0, 0),
                 Point(1_060, 90, 1, 0, 0),
                 Point(1_121, 80, 2, 0, 0),
+                Point(1_242, 70, 2, 0, 0),
             ]);
 
         var lines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
@@ -392,6 +456,8 @@ public sealed class GraphPlotControlTests
         Assert.Equal([0d, 1d], lines.Rising.Y);
         Assert.Equal([1_060d, 1_121d], lines.Dashed.X);
         Assert.Equal([1d, 2d], lines.Dashed.Y);
+        Assert.Equal([1_121d, 1_242d], lines.Flat.X);
+        Assert.Equal([2d, 2d], lines.Flat.Y);
     }
 
     [Fact]
@@ -485,8 +551,7 @@ public sealed class GraphPlotControlTests
         Assert.Empty(model.Dashed.X);
         Assert.Equal([1_000d, 1_060d, double.NaN, 1_120d, 1_180d], remaining.Solid.X);
         Assert.Empty(remaining.Dashed.X);
-        Assert.Contains(scene.IdleIntervals, interval =>
-            interval.PreserveBoundary && interval.StartAt == 1_060 && interval.EndAt == 1_120);
+        Assert.Empty(scene.IdleIntervals);
     }
 
     [Fact]
@@ -531,10 +596,7 @@ public sealed class GraphPlotControlTests
         Assert.Equal([90d, 80d], remaining.Solid.Y);
         Assert.Equal([1_000d, 1_120d], remaining.Dashed.X);
         Assert.Equal([100d, 90d], remaining.Dashed.Y);
-        Assert.Equal((1_000L, 1_120L, true),
-            (Assert.Single(scene.IdleIntervals).StartAt,
-             scene.IdleIntervals[0].EndAt,
-             scene.IdleIntervals[0].PreserveBoundary));
+        Assert.Empty(scene.IdleIntervals);
         Assert.DoesNotContain(model.Rising.X, timestamp => timestamp < 1_120d);
     }
 
@@ -568,7 +630,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void PlotProjectionDropsSubpixelIdleBandsButKeepsMeaningfulAndBoundaryBands()
+    public void PlotProjectionKeepsOnlyMeasuredIdleBands()
     {
         var scene = Scene(
             [
@@ -582,10 +644,8 @@ public sealed class GraphPlotControlTests
 
         var visible = GraphPlotProjection.BuildVisibleIdleIntervals(scene);
 
-        Assert.Equal(2, visible.Count);
-        Assert.Equal((1_060L, 2_000L), (visible[0].StartAt, visible[0].EndAt));
-        Assert.True(visible[0].PreserveBoundary);
-        Assert.Equal((2_000L, 7_000L), (visible[1].StartAt, visible[1].EndAt));
+        var idle = Assert.Single(visible);
+        Assert.Equal((2_000L, 7_000L, false), (idle.StartAt, idle.EndAt, idle.PreserveBoundary));
 
         var boundaryScene = Scene(
             [
@@ -594,8 +654,7 @@ public sealed class GraphPlotControlTests
             ],
             1_000,
             87_400);
-        var boundary = Assert.Single(GraphPlotProjection.BuildVisibleIdleIntervals(boundaryScene));
-        Assert.Equal((1_000L, 1_120L, true), (boundary.StartAt, boundary.EndAt, boundary.PreserveBoundary));
+        Assert.Empty(GraphPlotProjection.BuildVisibleIdleIntervals(boundaryScene));
     }
 
     [Fact]
@@ -603,6 +662,36 @@ public sealed class GraphPlotControlTests
     {
         Assert.Equal("#3F5D7C", GraphPlotControl.IdleBandColorHex);
         Assert.Equal(0.22, GraphPlotControl.IdleBandOpacity);
+    }
+
+    [Fact]
+    public void InferredLinesAreThinnerThanMeasuredModelLines()
+    {
+        Assert.Equal(3f, GraphPlotControl.MeasuredModelLineWidth);
+        Assert.Equal(1f, GraphPlotControl.MeasuredFlatModelLineWidth);
+        Assert.Equal(3f, GraphPlotControl.MeasuredRemainingLineWidth);
+        Assert.Equal(1f, GraphPlotControl.InferredLineWidth);
+        Assert.True(GraphPlotControl.InferredLineWidth < GraphPlotControl.MeasuredModelLineWidth);
+        Assert.True(GraphPlotControl.InferredLineWidth < GraphPlotControl.MeasuredRemainingLineWidth);
+        Assert.Equal(ScottPlot.LinePattern.DenselyDashed, GraphPlotControl.InferredLinePattern);
+    }
+
+    [Fact]
+    public void GenericModelActivityIsNeverLabelledIdle()
+    {
+        var samples = new[]
+        {
+            Point(1_000, 100, 0, 0, 0) with
+            {
+                ModelSamples = [new ApiHistoryModelSample("future-model", null, null, null, 1)],
+            },
+            Point(1_060, 99, 0, 0, 0) with
+            {
+                ModelSamples = [new ApiHistoryModelSample("future-model", null, null, null, 2)],
+            },
+        };
+
+        Assert.Empty(GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_060).IdleIntervals);
     }
 
     [Fact]
@@ -799,10 +888,9 @@ public sealed class GraphPlotControlTests
         };
         var sparseIntervals = Scene(sparse, 1_000, 1_300).IdleIntervals;
 
-        Assert.Equal(2, sparseIntervals.Count);
-        Assert.True(sparseIntervals[0].PreserveBoundary);
-        Assert.Equal((1_000L, 1_120L), (sparseIntervals[0].StartAt, sparseIntervals[0].EndAt));
-        Assert.Equal((1_120L, 1_300L), (sparseIntervals[1].StartAt, sparseIntervals[1].EndAt));
+        var sparseIdle = Assert.Single(sparseIntervals);
+        Assert.False(sparseIdle.PreserveBoundary);
+        Assert.Equal((1_120L, 1_300L), (sparseIdle.StartAt, sparseIdle.EndAt));
     }
 
     [Fact]
@@ -841,7 +929,7 @@ public sealed class GraphPlotControlTests
         using var client = new LoopbackStatusClient(handler);
         var result = await client.FetchDetailsAsync(CancellationToken.None);
 
-        Assert.Equal(2, handler.RequestCount);
+        Assert.Equal(3, handler.RequestCount);
         Assert.Equal(HttpStatusCode.OK, handler.StatusCode);
         Assert.Equal(HttpMethod.Get, handler.LastRequest?.Method);
         Assert.Equal(
@@ -930,22 +1018,22 @@ public sealed class GraphPlotControlTests
         Assert.Equal(expectedPeriodEnd, scene.Timestamps[^1]);
 
         var firstObservation = expectedRawTimestamps[0];
-        Assert.Empty(terraLines.Flat.X);
+        Assert.NotEmpty(terraLines.Flat.X);
         Assert.Empty(terraLines.Rising.X);
-        Assert.NotEmpty(terraLines.Dashed.X);
-        Assert.DoesNotContain(expectedPeriodStart, terraLines.Dashed.X);
-        Assert.Contains(firstObservation, terraLines.Dashed.X);
+        Assert.Empty(terraLines.Dashed.X);
+        Assert.DoesNotContain(expectedPeriodStart, terraLines.Flat.X);
+        Assert.Contains(firstObservation, terraLines.Flat.X);
         Assert.NotEmpty(remainingLines.Dashed.X);
         Assert.Equal(firstObservation, remainingLines.Dashed.X[0]);
         Assert.Equal(87d, remainingLines.Dashed.Y[0]);
         Assert.DoesNotContain(remainingLines.Solid.X, timestamp => timestamp < firstObservation);
         Assert.DoesNotContain(remainingLines.Dashed.X, timestamp => timestamp < firstObservation);
-        Assert.Empty(solLines.Flat.X);
-        Assert.Empty(solLines.Rising.X);
-        Assert.NotEmpty(solLines.Dashed.X);
-        Assert.Empty(lunaLines.Flat.X);
+        Assert.NotEmpty(solLines.Flat.X);
+        Assert.NotEmpty(solLines.Rising.X);
+        Assert.Empty(solLines.Dashed.X);
+        Assert.NotEmpty(lunaLines.Flat.X);
         Assert.Empty(lunaLines.Rising.X);
-        Assert.NotEmpty(lunaLines.Dashed.X);
+        Assert.Empty(lunaLines.Dashed.X);
         Assert.Empty(remainingLines.Solid.X);
     }
 
@@ -982,7 +1070,7 @@ public sealed class GraphPlotControlTests
         var result = await client.FetchDetailsAsync(CancellationToken.None);
 
         Assert.True(result.IsSuccess);
-        Assert.Equal(1, handler.RequestCount);
+        Assert.Equal(2, handler.RequestCount);
         Assert.Equal("http://127.0.0.1:8787/v2/details", handler.LastRequest?.RequestUri?.AbsoluteUri);
         var snapshot = Assert.IsType<ApiDetailsSnapshot>(result.Snapshot);
         Assert.Equal("v2", snapshot.ApiVersion);
@@ -1101,10 +1189,10 @@ public sealed class GraphPlotControlTests
         Assert.Null(graph.Points[^1].RemainingPercent);
         Assert.Equal(41, graph.Scene.Remaining[^1]);
         Assert.Equal(323.674247, graph.Points[^1].SolValue, precision: 6);
-        // The refresh row regresses Terra/Luna while SOL advances. The
-        // whole-vector policy must keep that row unavailable instead of
-        // raising the maximum from a component-wise repair.
-        Assert.Equal(firstMaximum, graph.Scene.ModelMaximum);
+        // The refresh row regresses Terra/LUNA while SOL advances. Preserve
+        // the exact SOL observation and withhold only the regressed models.
+        Assert.NotEqual(firstMaximum, graph.Scene.ModelMaximum);
+        Assert.Equal(323.674247, graph.Scene.ModelMaximum, precision: 6);
         Assert.False(graph.Scene.ModelVectorAvailable[^1]);
         Assert.Equal("thread-b", Assert.Single(threads.Threads).Id);
         Assert.Equal(2, health.CallCount);
@@ -1190,7 +1278,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Idle_band_preserves_every_long_unobserved_spend_gap_not_just_the_first_one()
+    public void Idle_band_never_labels_a_long_unobserved_spend_gap_as_idle()
     {
         var points = new[]
         {
@@ -1202,9 +1290,8 @@ public sealed class GraphPlotControlTests
             Point(1_180, 90, 2, 0, 0),
         };
 
-        var interval = Assert.Single(Scene(points).IdleIntervals, candidate =>
+        Assert.DoesNotContain(Scene(points).IdleIntervals, candidate =>
             candidate.StartAt == 1_060 && candidate.EndAt == 1_180);
-        Assert.True(interval.PreserveBoundary);
     }
 
     private static ApiHistorySample Point(long timestamp, double? remaining, double sol, double terra, double luna) =>
@@ -1257,7 +1344,7 @@ public sealed class GraphPlotControlTests
         var result = await client.FetchDetailsAsync(CancellationToken.None);
         Assert.True(result.IsSuccess);
         Assert.Null(result.Failure);
-        Assert.Equal(2, handler.RequestCount);
+        Assert.Equal(3, handler.RequestCount);
         return Assert.IsType<ApiDetailsSnapshot>(result.Snapshot);
     }
 
@@ -1349,6 +1436,10 @@ public sealed class GraphPlotControlTests
         {
             RequestCount++;
             Assert.Equal(HttpMethod.Get, request.Method);
+            if (request.RequestUri?.AbsolutePath == "/v3/details")
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+            }
             if (request.RequestUri?.AbsolutePath == "/v2/details")
             {
                 if (!servesV2)

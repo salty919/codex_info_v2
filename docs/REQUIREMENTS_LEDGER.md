@@ -4,12 +4,17 @@
 
 | ID | owner | 実装範囲 | 直接オラクル | 状態 |
 | --- | --- | --- | --- | --- |
+| RECORDER-MODEL-01 | DATA | `src/main.rs`、`src/usage_store.rs` | 任意model差分/cache write保存、source単位隔離、旧DB保持、restart/range再適用、ASTRAのみbackfillと旧3モデル既知値を不完全履歴として保持する直接case | implemented |
+| ASTRA-COST-01 | PRODUCT | `src/main.rs`、REST/各UIの価格projection | 指定4単価、cache write二重計上なし、未提供/不整合の未確定表示 | implemented |
+| API-LIFECYCLE-01 | PRODUCT | `src/server.rs`、`docs/REST_API_V1.md`、各client contract adapter | domain snapshotとUI projectionの分離、任意model配列、旧v1/v2 exact互換、安定health、collector/DB非依存 | implemented |
+| API-V3-MODELS-01 | WIRE | `src/server.rs`、Linux/Windows v3 client・graph projection | v3 generic model、旧3モデル既知値、ASTRA履歴、同一pair 304をserver/Linux/Windowsの直接caseで検証 | implemented |
+| API-DEPRECATION-01 | WIRE | v1/v2 adapter、Linux/Windows fallback | v3→v2→v1をexact 404時だけ遷移し、fallbackへ条件headerを送らない直接case | implemented |
 | CUM-138-01 | DATA | `src/main.rs`、`src/usage_store.rs` | durable baseline＋2GiB overflow＋verified tail固定caseでbaseline保持とtail 1回加算 | implemented |
 | CUM-138-02 | DATA | `src/main.rs`、`src/usage_store.rs` | 同じrangeのrepeat/restart、変更prefix、stale generation固定caseで非重複・非mutation | implemented |
 | CUM-138-03 | DATA | `src/main.rs`、`src/usage_store.rs` | same-period drift＋checkpoint＋restartとconfirmed rolloverの固定case | implemented |
 | CUM-138-04 | PRODUCT | `src/main.rs`、`src/usage_store.rs` | 1 details root内のモデルtoken/価格合計とhistory latestのexact一致、失敗cycleのroot不変 | implemented |
 | CUM-138-05 | DATA | product data path、実Linux daemon/API、Linux/Windows UI | 修正前後sentinel digest、selected byte count、同一candidateの実API/UI read-back | implemented |
-| CUM-138-06 | UX | `src/main.rs` graph projection、Windows Graphing/ViewModel/Control | shared rollover、first observation、delayed/missing quota、whole-vector回帰/回復、confirmed gap、unattributed quota、current/historical右端、no-historyの9 causal caseを固定fixtureからX/Windowsで独立検証 | implemented |
+| CUM-138-06 | UX | `src/main.rs` graph projection、Windows Graphing/ViewModel/Control | UX正本の有限表示状態について開始・中間・終端値、利用増加の太い実線・未使用の細い実線・欠測予測の細く密な破線、idle判定、period ID、右端ラベルを直接検証し、ASTRA指定4単価、集合不完全でも個別model実測を保持し、全model実測不変だけidle、period選択後pollのbounded reset aliasを同じ到達経路へ統合 | implemented |
 | CUM-138-07 | DATA | resident scheduler、local collector、recorder、usage store | transport error→local-only pending row/quota NULL、local error→fresh quota＋durable model pending row、stale admission拒否、次周期single-flight、DB exact batch retry、live DB timestamp/generation進行 | implemented |
 | AUTH-129 | DATA | `src/account_scope.rs`、`src/protocol_contract.rs`、`src/main.rs` | `account_key_contract_rejects_missing_types_controls_limits_and_symlinks`、`account_authority_rejects_a_same_size_mid_read_replacement`、`account_update_generation_is_local_strict_and_permanently_invalidated`、`hmac_scopes_are_stable_and_account_separated`、`raw_identity_canaries_are_absent_from_partition_paths_metadata_and_candidate_db` | verified |
 | GEN-129 | DATA | `src/account_scope.rs`、`src/main.rs`、`src/daemon.rs` | `profile_registry_reuses_epoch_and_separates_physical_paths`、`registry_rejects_orphans_unknown_artifacts_and_missing_initialized_database`、`auth_epoch_overflow_requires_process_recovery_and_cannot_resurrect_usage`、`seven_account_switch_crash_images_restart_without_old_account_fallback` | verified |
