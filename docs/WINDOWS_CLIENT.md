@@ -98,7 +98,7 @@ Windows OpenSSH の設定ファイルは `%USERPROFILE%\.ssh\config` を参照�
 literal `Host` aliasだけとする。
 
 1. `connectionProfile`と`connectionSelector`を選択する。profileは`none|wsl|sshConfigAlias`、WSL selectorはinstalled distribution exact token、SSH selectorはliteral Host alias（`^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$`）。
-2. server/API prepare→listener→`GET /v1/health`でservice readinessを確認し、`GET /v2/details`から最初の完全な表示世代を取得する。旧serviceがexact 404を返す場合だけ`GET /v1/details`へfallbackする。
+2. server/API prepare→listener→`GET /v1/health`でservice readinessを確認し、`GET /v3/details`から最初の完全な表示世代を取得する。旧serviceがexact 404を返す場合だけ`GET /v2/details`、さらにexact 404の場合だけ`GET /v1/details`へfallbackする。
 3. 必要な場合だけauth-startを明示し、auth-start成功をreadyとしない。
 4. 別のauth-checkでlater details generationを取得し、wireの`ready` booleanは使わず、`state=ready AND authenticated=true`の導出条件だけでMainへ進む（ready wire boolean field=0）。
 5. `language/setupCompleted/connectionConfigured/timeZoneId/connectionProfile/connectionSelector`の6-key objectをflush・validate後atomic replaceする。
@@ -117,7 +117,7 @@ automatic recovery command count=0とする。保存selectorが有効なら次�
 
 クライアントがHTTPで読む接続先は編集不可の
 service readiness用`http://127.0.0.1:8787/v1/health`と、runtime data用
-`http://127.0.0.1:8787/v2/details`、旧serviceの404時だけ使う`http://127.0.0.1:8787/v1/details`である。
+`http://127.0.0.1:8787/v3/details`、旧serviceのexact 404時だけ使う`http://127.0.0.1:8787/v2/details`と`http://127.0.0.1:8787/v1/details`である。
 Linux の実アドレス、LAN アドレス、ホスト名、インターネット URL をHTTP endpointとして
 入力・保存しない。SSH転送開始に必要なraw Linux host/IPまたはraw userはone-session raw recoveryとして
 メモリ上だけで扱い、settings、shortcut、ログへ保存しない。durableに保存するのはprofileと、WSL installed
@@ -136,7 +136,7 @@ Linux / WSL -- 127.0.0.1:8787 --> Codex Info native UI + REST v1
 自動Remoteは`BatchMode=yes`、hidden prompt=0、shell/cmd/PowerShell=0とする。
 認証開始ボタンは、WSL profileではinstalled distribution tokenを含む`wsl.exe` ArgumentList、remote SSH
 profileではliteral Host aliasを含む`ssh.exe` ArgumentListを一回だけ起動する。どちらも認証情報を受け取らず、
-開始直後を認証完了とは扱わない。「認証を確認」で同じprofileのlater details generationをv2優先・404時だけv1 fallbackで取得し、
+開始直後を認証完了とは扱わない。「認証を確認」で同じprofileのlater details generationをv3優先・exact 404時だけv2、さらにexact 404時だけv1へfallbackして取得し、
 `state=ready`かつ`authenticated=true`になった場合だけ完了し、ready wire boolean field=0とする。未登録/変更host keyのautomatic routeは
 connectedにせず、明示CTAの一回のOpenSSH-owned interactiveだけを許可する。
 

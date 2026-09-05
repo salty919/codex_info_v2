@@ -15,7 +15,7 @@ API-DEPRECATION-01
 
 `API-V3-MODELS-01`: `/v3/details`はcommit済みdomain snapshotを、有界な`models`配列として返す。model ID、token内訳、価格計算可否を事実として分離し、UI固定列や表示文言をwire fieldにしない。`/health`はAPI世代から独立したread-only readiness endpointとし、collector、DB writer、外部quota取得の生存状態を混同しない。
 
-v3の各履歴rowは`models`と`models_complete`を持つ。`models_complete=true`は同じ観測で全モデル集合を確定できた場合だけ許可し、`model_source=confirmed`と非nullの`models`を必要とする。保持ログからASTRAだけを回収したような部分復旧は`models_complete=false`、`model_source=legacy-unknown`とし、配列にないモデルを0と解釈しない。clientはその区間を確定実線へ接続せず、破線または切断で未確定性を示す。
+v3の各履歴rowは`models`と`models_complete`を持つ。各model rowの`total_tokens`と`total_dollars`は個別に確認できた累計、入力・cached入力・cache write入力・出力は確認できたfieldだけを持ち、未確認fieldを反復`null`で送らない。旧`usage_history`のSOL/TERRA/LUNA列は既知の`total_tokens`と`total_dollars`として保持し、旧schemaにない内訳を0や推測値で補わない。`models_complete=true`は同じ観測で全モデル集合を確定できた場合だけ許可し、`model_source=confirmed`と非nullの`models`を必要とする。保持ログからASTRAだけを回収した場合や旧3モデルだけが既知の場合は`models_complete=false`、`model_source=legacy-unknown`とし、配列にないモデルを0と解釈しない。clientは既知のmodel値を表示しつつ、その区間を確定実線へ接続せず、破線または切断で未確定性を示す。
 
 `API-DEPRECATION-01`: `/v1/details`と`/v2/details`はdeprecated互換adapterである。互換期間中は同じatomic generationから生成し、既存field、値型、header allowlistを変更しない。新clientはv3を優先し、exact 404の場合だけv2、さらにexact 404の場合だけv1へfallbackし、世代をmergeしない。廃止日は未決定であり、決定前に`Sunset`を送らない。将来の削除対象は旧details route、adapter、client fallbackだけで、Session collector、SQLite writer、domain model、`/health`は対象外とする。
 
@@ -79,8 +79,8 @@ Windowsのcanonical `ArgumentList`はValue AuthoritiesおよびWIN-E-006..010の
 `[ssh.exe,-o,BatchMode=yes,-N,-L,8787:127.0.0.1:8787,<validated alias>]`に従う。
 
 このときLinux / Windows UIの表示rootは
-`http://127.0.0.1:8787/v2/details`の一応答であり、旧serviceがexact 404を返す場合だけ
-`http://127.0.0.1:8787/v1/details`の一応答へfallbackする。両応答をmergeしない。HTTPはLinux側のloopbackと
+`http://127.0.0.1:8787/v3/details`の一応答であり、旧serviceがexact 404を返す場合だけv2、
+さらにexact 404の場合だけv1の一応答へfallbackする。複数応答をmergeしない。HTTPはLinux側のloopbackと
 SSH トンネルの端点の間だけで使用し、端末間の暗号化・相手認証は SSH が担当する。
 そのため v1 では HTTPS 証明書を扱わない。
 
@@ -90,14 +90,20 @@ SSH トンネルの端点の間だけで使用し、端末間の暗号化・相�
 `Cache-Control: no-store` を返し、response header aggregateは8 KiB以下とする。既知の固定bodyでは
 `Content-Length`をUTF-8 body bytesと一致させ、未知長の受信側もstream中の上限超過で停止する。
 `Set-Cookie`、`Location`、`Content-Encoding`、`WWW-Authenticate`、proxy/authentication headerは
-返さない。response header allowlistはこの`Content-Type`/`Cache-Control`と固定body時の`Content-Length`だけで、
-その他のapplication/proxy headerを追加しない。許可する成功メソッドは `GET` だけである。自動解凍、redirect、cookie、proxyは使用しない。
+返さない。response header allowlistはこの`Content-Type`/`Cache-Control`、固定body時の`Content-Length`、
+detailsの`Codex-Info-Published-Pair`だけで、その他のapplication/proxy headerを追加しない。
+v3 clientは直前に受理したpublished pairをquoted `If-None-Match`として`/v3/details`へ一つだけ送信でき、同じ
+published generationならserverは同じpair headerとbody 0の`304`を返す。旧client向け200応答へ新headerを
+追加せず、v1/v2 fallbackへ条件headerを送らない。304を新しいsnapshotや失敗へ
+読み替えずlast-good rootを維持し、pairが異なる場合だけ200の完全rootをatomic置換する。
+許可する成功メソッドは `GET` だけである。自動解凍、redirect、cookie、proxyは使用しない。
 
 | Request | Result |
 | --- | --- |
 | `GET /v1/health` | resident serviceがread-only snapshot requestを受理できるreadinessを示す。 |
 | `GET /v1/details` | 旧client向けのschema-compatibleな単一atomic rootを返す。 |
 | `GET /v2/details` | Linux / Windows UIの単一atomic rootとして、状態・利用枠・モデル別ドル内訳・履歴・観測元provenance・Threadsを返す。 |
+| `GET /v3/details` | 新client向けの任意model配列と価格可否を持つ単一atomic rootを返す。 |
 
 未定義のパスは JSON の `404`、既知パスへの非 `GET` は JSON の `405` で返す。
 応答に email、認証 URL、認証トークン、raw error、ローカルパス、セッション内容を
@@ -115,6 +121,8 @@ SQLite transaction、WAL/SHM、migration、prune、backup、DB row/hash、publis
 | `/v1/health` | `GET` | `200` | JSON health object、required `Content-Type`/`Cache-Control` headers、DB write/transaction=0 |
 | `/v1/details` | `GET` | `200` | current immutable details generation、共通headerに加えて必須`Codex-Info-Published-Pair`、DB write/transaction=0 |
 | `/v2/details` | `GET` | `200` | 同じcurrent immutable generationのprovenance付きprojection、同じ必須published pair、DB write/transaction=0 |
+| `/v3/details` | `GET` | `200` | 同じcurrent immutable generationの任意model projection、同じ必須published pair、DB write/transaction=0 |
+| `/v3/details`＋current pairのquoted `If-None-Match` | `GET` | `304` | body 0、同じpublished pair、last-good維持、DB write/transaction=0 |
 | 上記known path | `HEAD/POST/PUT/PATCH/DELETE/OPTIONS`等全non-GET | `405` | 固定JSON error、同上header、DB/WAL/SHM/migration/prune/backup=0 |
 | unknown、case-altered、末尾slash、query付きpath（methodを問わない） | any | `404` | 固定JSON error、同上header、DB/WAL/SHM/migration/prune/backup=0 |
 
@@ -348,11 +356,11 @@ PID、listener、health 200、`product_version`のいずれか単独を成功へ
 - `Content-Type`は`application/json; charset=utf-8`。parameter追加、charset欠落、別charsetを生成しない。
 - `Cache-Control`は`no-store`。
 - fixed bodyでは`Content-Length`をUTF-8 bytesと一致させる。
-- `/v1/details`と`/v2/details`の200応答は`Codex-Info-Published-Pair`をexactly one持つ。値は
+- `/v1/details`、`/v2/details`、`/v3/details`の200応答とv3の304応答は`Codex-Info-Published-Pair`をexactly one持つ。値は
   ASCII `v1:`に128-bit server epochの32桁lowercase hex、続けて128-bit publish counterの
   32桁lowercase hexを置いた67 bytesだけとする。production UIはdetails headerのprefix/length/lowercase hexだけを検証し、
   epoch/counterを業務値としてparse、sort、永続化、表示せず、そのdetails応答のopaque generation identityとしてだけ扱う。
-  両details routeは同じpublished generationで同じpairを返す。`/v1/health`、error、unknown/method拒否応答はこのheaderを持たない。
+  全details routeは同じpublished generationで同じpairを返す。`/health`、error、unknown/method拒否応答はこのheaderを持たない。
 - response header aggregateは8 KiB以下。`Set-Cookie`、`Location`、`Content-Encoding`、
   `WWW-Authenticate`、authentication/proxy headerは0件。
 
@@ -416,7 +424,7 @@ details candidate全体をrejectし、UI consumerは直前のdetails rootを保�
 ### Request resource contract
 
 製品endpointはHTTP/1.1だけを受け、request targetはorigin-formのexact
-`/v1/health`、`/v1/details`、`/v2/details`である。percent decode、path normalization、query、fragment、
+`/health`、`/v1/health`、`/v1/details`、`/v2/details`、`/v3/details`である。percent decode、path normalization、query、fragment、
 absolute-form、authority-form、asterisk-formを許可しない。
 
 | resource | 採用上限・規則 |
@@ -431,7 +439,8 @@ absolute-form、authority-form、asterisk-formを許可しない。
 | deadline | acceptからheader完了3.000秒、header完了からrequest完了1.000秒、全体3.000秒 |
 | shutdown | 新規admissionを即時停止し、既存requestを最大3.000秒drain後cancel |
 
-request header allowlistは`Host,Accept,User-Agent,Connection,Content-Length`だけで、各fieldは最大1件、
+request header allowlistは`Host,Accept,User-Agent,Connection,Content-Length,If-None-Match`だけで、各fieldは最大1件、
+`If-None-Match`は`/v3/details`だけでquoted published pairを受け、他routeでは400とする。
 ただしContent-Lengthは欠落可とする。`Authorization,Cookie,Proxy-Authorization,Forwarded,X-Forwarded-For,
 X-Forwarded-Host,X-Forwarded-Proto,Upgrade,Expect,TE,Transfer-Encoding`は常に拒否する。obs-fold、NUL、CTL、
 bare LF、invalid UTF-8を値として解釈せず400またはparse前closeにする。拒否requestはbodyを無制限drainせず

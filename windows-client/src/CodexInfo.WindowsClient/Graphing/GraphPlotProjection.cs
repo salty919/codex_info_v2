@@ -60,6 +60,7 @@ internal enum GraphSeries
     Sol,
     Terra,
     Luna,
+    Astra,
 }
 
 /// <summary>
@@ -364,6 +365,21 @@ internal static class GraphPlotProjection
             new GraphLineProjection(dashedX, dashedY));
     }
 
+    /// <summary>Projects one server-provided generic model series.</summary>
+    public static GraphModelLineProjection BuildModelLines(
+        GraphScene scene,
+        string modelName)
+    {
+        ArgumentNullException.ThrowIfNull(scene);
+        ArgumentNullException.ThrowIfNull(modelName);
+        return scene.ModelSeries.TryGetValue(modelName, out var values)
+            ? BuildModelLines(scene, values)
+            : new GraphModelLineProjection(
+                new GraphLineProjection(Array.Empty<double>(), Array.Empty<double>()),
+                new GraphLineProjection(Array.Empty<double>(), Array.Empty<double>()),
+                new GraphLineProjection(Array.Empty<double>(), Array.Empty<double>()));
+    }
+
     /// <summary>
     /// Projects the paths used by the renderer. This keeps the compatibility
     /// output of <see cref="BuildModelLines"/> while ensuring gaps are never
@@ -475,6 +491,7 @@ internal static class GraphPlotProjection
             scene.Sol[index - 1] <= 0 &&
             scene.Terra[index - 1] <= 0 &&
             scene.Luna[index - 1] <= 0 &&
+            scene.Astra[index - 1] <= 0 &&
             values[index - 1] <= 0 &&
             values[index] > values[index - 1];
     }
@@ -516,6 +533,7 @@ internal static class GraphPlotProjection
         var candidates = new List<EndpointCandidate>();
         if (scene.PeriodEndAt - scene.Timestamps[last] <= ModelContiguousSampleMaxGapSeconds)
         {
+            AddModelCandidate("ASTRA", scene.Astra[last], scene.ModelMaximum, scene.Metric, GraphSeries.Astra, culture, candidates);
             AddModelCandidate("LUNA", scene.Luna[last], scene.ModelMaximum, scene.Metric, GraphSeries.Luna, culture, candidates);
             AddModelCandidate("TERRA", scene.Terra[last], scene.ModelMaximum, scene.Metric, GraphSeries.Terra, culture, candidates);
             AddModelCandidate("SOL", scene.Sol[last], scene.ModelMaximum, scene.Metric, GraphSeries.Sol, culture, candidates);
@@ -599,7 +617,8 @@ internal static class GraphPlotProjection
         scene.ModelVectorAvailable[before] && scene.ModelVectorAvailable[after] &&
         (scene.Sol[after] > scene.Sol[before] ||
          scene.Terra[after] > scene.Terra[before] ||
-         scene.Luna[after] > scene.Luna[before]);
+         scene.Luna[after] > scene.Luna[before] ||
+         scene.Astra[after] > scene.Astra[before]);
 
     private static double RemainingValue(GraphScene scene, int index)
     {

@@ -229,7 +229,7 @@ Mainを既定の到達先とし、保存済みselectorで次回自動再接続�
 自動再構築ごとにSetup/app確認を再表示しない。更新は明示ボタンとbounded自動更新を同じ状態機械で扱い、
 更新中の再クリック、重複要求、値の一時消去を禁止する。
 
-Main、Graph、Threadsは同じstrict validation済み`/v2/details`一応答を一つのatomic rootとして置換する。旧serviceがexact 404を返す場合だけ単一`/v1/details`へfallbackする。
+Main、Graph、Threadsは同じstrict validation済み`/v3/details`一応答を一つのatomic rootとして置換する。旧serviceがexact 404を返す場合だけ単一v2、さらにexact 404の場合だけ単一v1へfallbackする。
 SQLite、別poll、認証control応答でfieldを補完せず、quota/history/threadの再収集、
 値の再計算、同一minuteのmerge/max/last/null化をUIで行わない。候補拒否時は全surfaceが同じlast-good rootを保持する。
 
@@ -259,7 +259,8 @@ component順や表示所有者を変更しない。
 
 ### 4.2 Trends / Graph（master: `CUM-138-06`）
 
-- 期間、ドル/トークン、Remaining/LUNA/TERRA/SOLの操作を上部固定帯に置く。
+- 期間、ドル/トークン、Remaining/LUNA/TERRA/SOL/ASTRAの操作を上部固定帯に置く。
+  model名と累積値は同じaccepted v3 rootから取得し、ASTRAを「その他」へ集約しない。
 - 期間・metricのリストはpointer pressの1回で展開する。REST/DB/poll完了を待たず、物理入力から
   user-visible paintまで、系列ON/OFFはP90 75 ms以下・P95 100 ms以下、期間/metricリストは
   P90 100 ms以下・P95 150 ms以下、いずれもcold max 250 ms以下とする。10,080点と契約最大1暦月
@@ -282,13 +283,21 @@ component順や表示所有者を変更しない。
   空graphや部分graphへ変換せず、直前graphを保持してbounded errorを表示する。キャッシュ済みで次paint
   までに切替できる場合はprogressを点滅させない。クリック反応SLOと期間データ完成時間P90/P95を混同しない。
 - plotの横軸はX版の期間意味論を維持し、現在期間は観測時刻までを右端とする。
+- 期間欄、横軸、折れ線、右端値は同じselected reset IDだけから一括投影する。poll後の
+  bounded reset aliasは60秒以内だけ同一期間として選択を維持し、欄だけ旧期間・plotだけ現在期間の
+  混在を禁止する。
 - 右端現在値の表示域は、初期940×640 logical表示時に各metricで確保される幅をドル／トークン別に固定する。Graphを横へリサイズした差分はplotへ割り当て、現在値、系列色、leader、縦位置を変えない。
 - Remainingは独立0–100%意味、モデル系列は累積値として扱う。残量をドル軸へ誤って合わせない。
 - Remainingとモデル使用量は別の観測値であり、モデル使用後に遅れて届いた最初の低い残量観測はその観測時刻へ反映する。残量観測が存在しない区間を料金・tokenから逆算してはならず、未観測区間を正常な残量低下として表示しない。
+- `models_complete=false`でも公開されたmodelの既知累積token/金額は保持し、未掲載modelを0と扱わない。
+  既知だが不完全な区間は破線、`model_source=unavailable`は切断としてX/Windowsで同じ意味にし、
+  確認済みの急落や0へ置換しない。
 - X版とWindows版は同一の履歴fixtureと固定期待値（期間境界、累積SOL、遅延残量、未観測区間）を通過しなければならない。片方の描画ヘルパーが生成した値をもう片方の期待値には使用せず、fixtureの独立oracleを使う。
 - finite oracleは、shared rolloverのperiod A→B `100% / $1 → 41% / $323.674247`、
   `graph_delayed_quota`のfirst observation・遅延quota・missing quota、whole-vector回帰/回復、
   confirmed gap、unattributed quota、current/historical右端、no-historyの9 causal caseとする。
+  ASTRAのtoken/指定4単価、旧3モデルだけが既知のincomplete period、period選択後pollのbounded reset aliasは
+  今回観測した同じ到達経路へ統合し、別の全直積を作らない。
   X/Windowsは同じfixtureの固定期待値を独立に検査し、値形状による100%・7日・quota-only除外、
   platform helperから期待値を生成する循環oracle、新workflow gate、全test/all-suite/全直積を追加しない。
 - 操作帯を開閉してもplotの位置・高さを変えず、ラベルや右端値を隠さない。
@@ -320,7 +329,7 @@ component順や表示所有者を変更しない。
 - WSL/remote/one-session raw recovery、ArgumentList、API到達、認証開始、認証確認、app-wide single
   supervisor/tunnel/reapの境界は`UX-20260822-SSH-001`を正本とする。
 
-Setupの順序はserver/API prepare→listener→readiness `GET /v1/health`→strict `GET /v2/details`（旧serviceの404時だけstrict v1）→
+Setupの順序はserver/API prepare→listener→readiness `GET /health`→strict `GET /v3/details`（旧serviceのexact 404時だけv2、さらにexact 404時だけv1）→
 必要時だけauth-start→別auth-check→新しいstrict detailsで固定する。auth-start/auth-checkはcontrol-onlyであり、
 応答を表示rootへmergeしない。healthだけ、またはcontrol成功だけでdata readyとしない。
 

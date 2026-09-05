@@ -437,10 +437,47 @@ pub struct PublicModelCostV3 {
 pub struct PublicHistoryModelUsageV3 {
     pub model: String,
     pub total_tokens: u64,
-    pub input_tokens: u64,
-    pub cached_input_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write_input_tokens: Option<u64>,
-    pub output_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    /// Exact cumulative dollars retained by the legacy history row or
+    /// calculated from a known price. `None` means price is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_dollars: Option<f64>,
+}
+
+pub fn legacy_history_models_v3(
+    sample: &PublicHistoryObservation,
+) -> Option<Vec<PublicHistoryModelUsageV3>> {
+    if sample.model_source == "unavailable" {
+        return None;
+    }
+    let values = [
+        ("SOL", sample.sol_tokens?, sample.sol_dollars?),
+        ("TERRA", sample.terra_tokens?, sample.terra_dollars?),
+        ("LUNA", sample.luna_tokens?, sample.luna_dollars?),
+    ];
+    Some(
+        values
+            .into_iter()
+            .map(
+                |(model, total_tokens, total_dollars)| PublicHistoryModelUsageV3 {
+                    model: model.to_owned(),
+                    total_tokens,
+                    input_tokens: None,
+                    cached_input_tokens: None,
+                    cache_write_input_tokens: None,
+                    output_tokens: None,
+                    total_dollars: Some(total_dollars),
+                },
+            )
+            .collect(),
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -700,7 +737,7 @@ impl PublicDetailsV3 {
                     timestamp: sample.timestamp,
                     reset_at: sample.reset_at,
                     remaining_percent: sample.remaining_percent,
-                    models: None,
+                    models: legacy_history_models_v3(sample),
                     models_complete: false,
                     model_source: if sample.model_source == "unavailable" {
                         "unavailable".to_owned()
@@ -811,12 +848,34 @@ impl PublicDetailsV3 {
                 }
                 let mut names = HashSet::with_capacity(models.len());
                 for model in models {
-                    validate_v3_model_tokens(
-                        &model.model,
+                    let components = [
                         model.input_tokens,
                         model.cached_input_tokens,
-                        model.cache_write_input_tokens,
-                    )?;
+                        model.output_tokens,
+                    ];
+                    let all_components = components.iter().all(Option::is_some);
+                    let any_components = components.iter().any(Option::is_some);
+                    if any_components != all_components
+                        || !valid_text(&model.model, security::MAX_MODEL_SCALARS)
+                        || model
+                            .total_dollars
+                            .is_some_and(|value| !valid_non_negative_rate(value))
+                        || (sample.model_source == "confirmed" && !all_components)
+                    {
+                        return Err(ApiSnapshotError::InvalidHistoryObservation);
+                    }
+                    if let (Some(input), Some(cached), Some(_output)) = (
+                        model.input_tokens,
+                        model.cached_input_tokens,
+                        model.output_tokens,
+                    ) {
+                        validate_v3_model_tokens(
+                            &model.model,
+                            input,
+                            cached,
+                            model.cache_write_input_tokens,
+                        )?;
+                    }
                     if !names.insert(model.model.as_str()) {
                         return Err(ApiSnapshotError::InvalidHistoryObservation);
                     }
@@ -1448,6 +1507,7 @@ struct ParsedRequest {
     route: Option<ApiRoute>,
     is_get: bool,
     body_not_allowed: bool,
+    if_none_match: Option<String>,
 }
 
 fn authority_for(address: SocketAddr) -> String {
@@ -1549,7 +1609,11 @@ fn try_admit_connection(active: &AtomicUsize) -> bool {
 
 type HttpResponse = (u16, Vec<u8>, Option<PublishedPair>);
 
-fn snapshot_response(snapshot: &SharedSnapshot, route: ApiRoute) -> HttpResponse {
+fn snapshot_response(
+    snapshot: &SharedSnapshot,
+    route: ApiRoute,
+    if_none_match: Option<&str>,
+) -> HttpResponse {
     let current = snapshot
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1561,6 +1625,9 @@ fn snapshot_response(snapshot: &SharedSnapshot, route: ApiRoute) -> HttpResponse
         PublishedPairGenerationState::Active { .. }
     ) {
         return (503, error_body("snapshot_unavailable"), None);
+    }
+    if if_none_match == Some(pair.as_str()) {
+        return (304, Vec::new(), Some(pair));
     }
     let body = match route {
         ApiRoute::Details => current.details_body.clone(),
@@ -1599,9 +1666,21 @@ fn handle_connection(
                     (413, error_body("request_body_not_allowed"), None)
                 }
                 Some(ApiRoute::Health) => (200, health_body(), None),
-                Some(ApiRoute::Details) => snapshot_response(&snapshot, ApiRoute::Details),
-                Some(ApiRoute::DetailsV2) => snapshot_response(&snapshot, ApiRoute::DetailsV2),
-                Some(ApiRoute::DetailsV3) => snapshot_response(&snapshot, ApiRoute::DetailsV3),
+                Some(ApiRoute::Details) => snapshot_response(
+                    &snapshot,
+                    ApiRoute::Details,
+                    request.if_none_match.as_deref(),
+                ),
+                Some(ApiRoute::DetailsV2) => snapshot_response(
+                    &snapshot,
+                    ApiRoute::DetailsV2,
+                    request.if_none_match.as_deref(),
+                ),
+                Some(ApiRoute::DetailsV3) => snapshot_response(
+                    &snapshot,
+                    ApiRoute::DetailsV3,
+                    request.if_none_match.as_deref(),
+                ),
             },
             Err(ParseFailure::BadRequest) => (400, error_body("bad_request"), None),
             Err(ParseFailure::HeadersTooLarge) => {
@@ -1727,6 +1806,7 @@ fn parse_request(
     let mut content_length = None;
     let mut transfer_encoding = false;
     let mut disallowed_header = false;
+    let mut if_none_match = None;
     let header_section = &data[line_end + 2..terminator];
     let mut cursor = 0;
     let mut header_count = 0usize;
@@ -1777,6 +1857,9 @@ fn parse_request(
         match name.as_str() {
             "host" => host = Some(value.to_owned()),
             "accept" | "user-agent" => {}
+            "if-none-match" => {
+                if_none_match = Some(parse_details_etag(value).ok_or(ParseFailure::BadRequest)?);
+            }
             "connection" => {
                 if value
                     .split(',')
@@ -1800,7 +1883,7 @@ fn parse_request(
     if host.as_deref() != Some(authority) {
         return Err(ParseFailure::BadRequest);
     }
-    if disallowed_header {
+    if disallowed_header || (if_none_match.is_some() && route != Some(ApiRoute::DetailsV3)) {
         return Err(ParseFailure::BadRequest);
     }
 
@@ -1810,7 +1893,18 @@ fn parse_request(
         body_not_allowed: trailing_data
             || transfer_encoding
             || content_length.is_some_and(|length| length != 0),
+        if_none_match,
     })
+}
+
+fn parse_details_etag(value: &str) -> Option<String> {
+    let identity = value.strip_prefix('"')?.strip_suffix('"')?;
+    (identity.len() == 67
+        && identity.starts_with("v1:")
+        && identity[3..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| identity.to_owned())
 }
 
 fn classify_target(target: &[u8]) -> Result<Option<ApiRoute>, ParseFailure> {
@@ -1893,6 +1987,7 @@ fn write_json_response(
 ) {
     let reason = match status {
         200 => "OK",
+        304 => "Not Modified",
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -1904,7 +1999,7 @@ fn write_json_response(
         503 => "Service Unavailable",
         _ => "Error",
     };
-    let pair_header = if status == 200 {
+    let pair_header = if matches!(status, 200 | 304) {
         pair.map_or_else(String::new, |pair| {
             format!("Codex-Info-Published-Pair: {}\r\n", pair.as_str())
         })
@@ -2814,6 +2909,31 @@ mod tests {
         assert!(v3.starts_with("HTTP/1.1 200"));
         assert_eq!(published_pair_headers(&v1), published_pair_headers(&v2));
         assert_eq!(published_pair_headers(&v2), published_pair_headers(&v3));
+        let published_pair = published_pair_headers(&v3)
+            .into_iter()
+            .next()
+            .expect("v3 published pair");
+        let not_modified = wire_request(
+            server.local_addr(),
+            &format!(
+                "GET /v3/details HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"{published_pair}\"\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(not_modified.starts_with("HTTP/1.1 304 Not Modified"));
+        assert_eq!(
+            published_pair_headers(&not_modified),
+            vec![published_pair.clone()]
+        );
+        assert!(not_modified.contains("content-length: 0\r\n"));
+        assert!(not_modified.ends_with("\r\n\r\n"));
+        let legacy_conditional = wire_request(
+            server.local_addr(),
+            &format!(
+                "GET /v2/details HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"{published_pair}\"\r\nConnection: close\r\n\r\n"
+            ),
+        );
+        assert!(legacy_conditional.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(published_pair_headers(&legacy_conditional).is_empty());
         let v2_body = body(&v2);
         assert_eq!(v2_body["api_version"], "v2");
         assert_eq!(v2_body["history_samples"][0]["model_source"], "confirmed");
@@ -2823,7 +2943,25 @@ mod tests {
         assert_eq!(v3_body["api_version"], "v3");
         assert_eq!(v3_body["models"][0]["model"], "SOL");
         assert!(v3_body.get("estimated_cost_label").is_none());
-        assert!(v3_body["history_samples"][0]["models"].is_null());
+        assert_eq!(
+            v3_body["history_samples"][0]["model_source"],
+            "legacy-unknown"
+        );
+        assert!(!v3_body["history_samples"][0]["models_complete"]
+            .as_bool()
+            .unwrap());
+        assert_eq!(v3_body["history_samples"][0]["models"][0]["model"], "SOL");
+        assert_eq!(
+            v3_body["history_samples"][0]["models"][0]["total_tokens"],
+            v2_body["history_samples"][0]["sol_tokens"]
+        );
+        assert_eq!(
+            v3_body["history_samples"][0]["models"][0]["total_dollars"],
+            v2_body["history_samples"][0]["sol_dollars"]
+        );
+        assert!(v3_body["history_samples"][0]["models"][0]
+            .get("input_tokens")
+            .is_none());
 
         let health = wire_request(
             server.local_addr(),

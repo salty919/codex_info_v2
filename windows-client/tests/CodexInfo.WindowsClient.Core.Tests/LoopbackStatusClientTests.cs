@@ -26,31 +26,69 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
-    public async Task DetailsV2IsPreferredAndCarriesConfirmedHistorySource()
+    public async Task DetailsV3IsPreferredAndCarriesAstraHistory()
     {
         var paths = new List<string>();
         using var client = new LoopbackStatusClient(new StubHandler(request =>
         {
             paths.Add(request.RequestUri!.AbsolutePath);
-            return JsonResponse(ValidDetailsV2Json(), includePublishedPair: true);
+            return JsonResponse(ValidDetailsV3Json(), includePublishedPair: true);
         }));
 
         var result = await client.FetchDetailsAsync(CancellationToken.None);
 
         Assert.True(result.IsSuccess);
-        Assert.Equal(["/v2/details"], paths);
-        Assert.Equal("v2", result.Snapshot!.ApiVersion);
+        Assert.Equal(["/v3/details"], paths);
+        Assert.Equal("v3", result.Snapshot!.ApiVersion);
+        Assert.Equal("ASTRA", Assert.Single(result.Snapshot.Models).Name);
+        Assert.Equal("ASTRA", Assert.Single(result.Snapshot.HistorySamples[0].Models).Name);
         Assert.Equal(ApiHistorySample.ConfirmedModelSource, result.Snapshot.HistorySamples[0].ModelSource);
     }
 
     [Fact]
-    public async Task DetailsFallsBackToV1OnlyWhenV2ReturnsNotFound()
+    public async Task DetailsV3ReusesTheAcceptedGenerationWithAZeroBody304()
+    {
+        var requestCount = 0;
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            requestCount++;
+            Assert.Equal("/v3/details", request.RequestUri!.AbsolutePath);
+            if (requestCount == 1)
+            {
+                return JsonResponse(ValidDetailsV3Json(), includePublishedPair: true);
+            }
+
+            Assert.Equal($"\"{CanonicalPublishedPair}\"", Assert.Single(request.Headers.IfNoneMatch).Tag);
+            var response = new HttpResponseMessage(HttpStatusCode.NotModified)
+            {
+                Content = new ByteArrayContent([]),
+            };
+            response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json")
+            {
+                CharSet = "utf-8",
+            };
+            response.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
+            response.Headers.TryAddWithoutValidation(PublishedPairHeader, CanonicalPublishedPair);
+            return response;
+        }));
+
+        var first = await client.FetchDetailsAsync(CancellationToken.None);
+        var second = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.True(first.IsSuccess);
+        Assert.True(second.IsSuccess);
+        Assert.Same(first.Snapshot, second.Snapshot);
+        Assert.Equal(2, requestCount);
+    }
+
+    [Fact]
+    public async Task DetailsFallsBackToV1OnlyWhenV3AndV2ReturnNotFound()
     {
         var paths = new List<string>();
         using var client = new LoopbackStatusClient(new StubHandler(request =>
         {
             paths.Add(request.RequestUri!.AbsolutePath);
-            return request.RequestUri.AbsolutePath == "/v2/details"
+            return request.RequestUri.AbsolutePath is "/v3/details" or "/v2/details"
                 ? NotFoundResponse()
                 : JsonResponse(ValidDetailsJson(), includePublishedPair: true);
         }));
@@ -58,7 +96,7 @@ public sealed class LoopbackStatusClientTests
         var result = await client.FetchDetailsAsync(CancellationToken.None);
 
         Assert.True(result.IsSuccess);
-        Assert.Equal(["/v2/details", "/v1/details"], paths);
+        Assert.Equal(["/v3/details", "/v2/details", "/v1/details"], paths);
         Assert.Equal("v1", result.Snapshot!.ApiVersion);
         Assert.Equal(ApiHistorySample.LegacyUnknownModelSource, result.Snapshot.HistorySamples[0].ModelSource);
     }
@@ -73,6 +111,10 @@ public sealed class LoopbackStatusClientTests
         using var client = new LoopbackStatusClient(new StubHandler(request =>
         {
             paths.Add(request.RequestUri!.AbsolutePath);
+            if (request.RequestUri.AbsolutePath == "/v3/details")
+            {
+                return NotFoundResponse();
+            }
             return JsonResponse(json, includePublishedPair: true);
         }));
 
@@ -80,7 +122,7 @@ public sealed class LoopbackStatusClientTests
 
         Assert.Equal(DetailsFetchFailure.Response, result.Failure);
         Assert.Null(result.Snapshot);
-        Assert.Equal(["/v2/details"], paths);
+        Assert.Equal(["/v3/details", "/v2/details"], paths);
     }
 
     [Fact]
@@ -342,7 +384,7 @@ public sealed class LoopbackStatusClientTests
         var handler = new StubHandler(request =>
         {
             Assert.Equal(HttpMethod.Get, request.Method);
-            if (request.RequestUri!.AbsolutePath == "/v2/details")
+            if (request.RequestUri!.AbsolutePath is "/v3/details" or "/v2/details")
             {
                 return NotFoundResponse();
             }
@@ -784,7 +826,7 @@ public sealed class LoopbackStatusClientTests
     private static async Task<DetailsFetchResult> FetchDetails(string json)
     {
         using var client = new LoopbackStatusClient(new StubHandler(request =>
-            request.RequestUri?.AbsolutePath == "/v2/details"
+            request.RequestUri?.AbsolutePath is "/v3/details" or "/v2/details"
                 ? NotFoundResponse()
                 : JsonResponse(json, includePublishedPair: true)));
         return await client.FetchDetailsAsync(CancellationToken.None);
@@ -793,7 +835,7 @@ public sealed class LoopbackStatusClientTests
     private static async Task<DetailsFetchResult> FetchDetailsWithoutPublishedPair(string json)
     {
         using var client = new LoopbackStatusClient(new StubHandler(request =>
-            request.RequestUri?.AbsolutePath == "/v2/details"
+            request.RequestUri?.AbsolutePath is "/v3/details" or "/v2/details"
                 ? NotFoundResponse()
                 : JsonResponse(json)));
         return await client.FetchDetailsAsync(CancellationToken.None);
@@ -807,7 +849,7 @@ public sealed class LoopbackStatusClientTests
     {
         using var client = new LoopbackStatusClient(new StubHandler(request =>
         {
-            if (request.RequestUri?.AbsolutePath == "/v2/details")
+            if (request.RequestUri?.AbsolutePath is "/v3/details" or "/v2/details")
             {
                 return NotFoundResponse();
             }
@@ -861,6 +903,9 @@ public sealed class LoopbackStatusClientTests
                 "\"luna_tokens\":0}],\"history_gaps\"",
                 "\"luna_tokens\":0,\"model_source\":\"confirmed\"}],\"history_gaps\"",
                 StringComparison.Ordinal);
+
+    private static string ValidDetailsV3Json() =>
+        "{\"api_version\":\"v3\",\"state\":\"ready\",\"observed_at\":253402300740,\"authenticated\":true,\"plan_label\":\"Pro\",\"quota\":{\"remaining_percent\":98.5,\"reset_at\":253402300799,\"window_seconds\":604800,\"monthly\":false},\"models\":[{\"model\":\"ASTRA\",\"total_tokens\":13,\"input_tokens\":10,\"cached_input_tokens\":2,\"cache_write_input_tokens\":1,\"output_tokens\":3,\"estimated_cost\":{\"price_version\":\"ASTRA_USER_2026-09-05\",\"ordinary_input_dollars\":1.0,\"cached_input_dollars\":2.0,\"cache_write_input_dollars\":3.0,\"output_dollars\":4.0,\"total_dollars\":10.0}}],\"active_thread_count\":1,\"history_periods\":[{\"id\":\"253402300799\",\"start_at\":253341820740,\"end_at\":253402300740,\"reset_at\":253402300799,\"label\":\"2026/08/01 — 2026/08/08\",\"current\":true}],\"history_samples\":[{\"timestamp\":253402300680,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"models\":[{\"model\":\"ASTRA\",\"total_tokens\":6,\"input_tokens\":4,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":2,\"total_dollars\":0.25}],\"models_complete\":true,\"model_source\":\"confirmed\"}],\"history_gaps\":[],\"threads\":[{\"id\":\"thread-1\",\"title\":\"Task\",\"parent_thread_id\":null,\"model\":\"ASTRA\",\"model_label\":\"ASTRA\",\"total_tokens\":20,\"context_usage_tokens\":10,\"context_window_tokens\":80,\"created_at\":1,\"last_user_message_at\":1,\"is_subagent\":false,\"depth\":0}]}";
 
     private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> responder) : HttpMessageHandler
     {

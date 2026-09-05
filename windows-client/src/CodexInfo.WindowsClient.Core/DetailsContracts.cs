@@ -73,7 +73,42 @@ public sealed record ApiDetailsModelUsage(
     double CachedInputDollars,
     double OutputDollars)
 {
-    public double TotalDollars => InputDollars + CachedInputDollars + OutputDollars;
+    /// <summary>The server-provided cumulative token total when using v3.</summary>
+    public ulong TotalTokens { get; init; } = AddTokens(InputTokens, CachedInputTokens, OutputTokens);
+
+    /// <summary>v3 cache-write input tokens, which are absent from v1/v2.</summary>
+    public ulong? CacheWriteInputTokens { get; init; }
+
+    /// <summary>v3 cache-write input dollars, which are absent from v1/v2.</summary>
+    public double CacheWriteInputDollars { get; init; } = double.NaN;
+
+    /// <summary>Opaque price-table identity supplied by the v3 server.</summary>
+    public string? PriceVersion { get; init; }
+
+    /// <summary>
+    /// The v3 server-provided total dollar value. A null value means the
+    /// server had no validated price for this model; it is never inferred by
+    /// the Windows client.
+    /// </summary>
+    public double? EstimatedTotalDollars { get; init; }
+
+    public bool HasEstimatedCost => EstimatedTotalDollars is { } value && double.IsFinite(value);
+
+    /// <summary>
+    /// Keeps the compatibility behavior for v1/v2 while preferring the exact
+    /// v3 total when one was published.
+    /// </summary>
+    public double TotalDollars => EstimatedTotalDollars ??
+        (double.IsFinite(InputDollars + CachedInputDollars + OutputDollars)
+            ? InputDollars + CachedInputDollars + OutputDollars +
+              (double.IsFinite(CacheWriteInputDollars) ? CacheWriteInputDollars : 0)
+            : double.NaN);
+
+    private static ulong AddTokens(ulong input, ulong cached, ulong output) =>
+        SaturatingAdd(SaturatingAdd(input, cached), output);
+
+    private static ulong SaturatingAdd(ulong left, ulong right) =>
+        ulong.MaxValue - left < right ? ulong.MaxValue : left + right;
 }
 
 /// <summary>A persisted quota period shown by the history/graph view.</summary>
@@ -122,11 +157,25 @@ public sealed record ApiHistorySample(
     public const string UnavailableModelSource = "unavailable";
     public const string LegacyUnknownModelSource = "legacy-unknown";
 
-    public IReadOnlyList<ApiHistoryModelSample> Models =>
+    /// <summary>
+    /// True only when the v3 producer established the complete model set for
+    /// this observation. It is false for the legacy fixed-column projection.
+    /// </summary>
+    public bool ModelsComplete { get; init; } = true;
+
+    /// <summary>
+    /// Generic v3 model rows. Null is distinct from an empty, complete list:
+    /// null means that the producer did not publish model values at all.
+    /// </summary>
+    public IReadOnlyList<ApiHistoryModelSample>? ModelSamples { get; init; }
+
+    public IReadOnlyList<ApiHistoryModelSample> Models => ModelSamples ??
     [
-        new ApiHistoryModelSample("SOL", SolTokens, 0, 0, SolDollars),
-        new ApiHistoryModelSample("TERRA", TerraTokens, 0, 0, TerraDollars),
-        new ApiHistoryModelSample("LUNA", LunaTokens, 0, 0, LunaDollars),
+        // Legacy history columns only prove cumulative totals. Do not expose
+        // unknown input/cache/output components as zero-valued facts.
+        new ApiHistoryModelSample("SOL", null, null, null, SolDollars) { TotalTokens = SolTokens },
+        new ApiHistoryModelSample("TERRA", null, null, null, TerraDollars) { TotalTokens = TerraTokens },
+        new ApiHistoryModelSample("LUNA", null, null, null, LunaDollars) { TotalTokens = LunaTokens },
     ];
 }
 
@@ -136,7 +185,17 @@ public sealed record ApiHistoryModelSample(
     ulong? InputTokens,
     ulong? CachedInputTokens,
     ulong? OutputTokens,
-    double? Dollars);
+    double? Dollars)
+{
+    /// <summary>v3 cache-write input tokens, if the producer observed them.</summary>
+    public ulong? CacheWriteInputTokens { get; init; }
+
+    /// <summary>Exact cumulative token total from the history row.</summary>
+    public ulong? TotalTokens { get; init; }
+
+    /// <summary>Alias for the v3 total dollar field.</summary>
+    public double? TotalDollars => Dollars;
+}
 
 /// <summary>A currently running thread and its validated tree metadata.</summary>
 public sealed record ApiThreadDetails(

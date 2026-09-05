@@ -316,6 +316,32 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void V3AstraHistoryRendersWithoutLegacyModelRows()
+    {
+        var samples = new[]
+        {
+            new ApiHistorySample(1_000, 2_000, 90, null, null, null, null, null, null)
+            {
+                ModelsComplete = true,
+                ModelSamples = [new ApiHistoryModelSample("ASTRA", 1, 0, 0, 10) { TotalTokens = 1 }],
+            },
+            new ApiHistorySample(1_060, 2_000, 89, null, null, null, null, null, null)
+            {
+                ModelsComplete = true,
+                ModelSamples = [new ApiHistoryModelSample("ASTRA", 2, 0, 0, 20) { TotalTokens = 2 }],
+            },
+        };
+
+        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_060);
+        var lines = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Astra);
+
+        Assert.Equal([10d, 20d], scene.Astra);
+        Assert.Equal([10d, 20d], scene.ModelSeries["ASTRA"]);
+        Assert.Equal([1_000d, 1_060d], lines.Rising.X);
+        Assert.Equal([10d, 20d], lines.Rising.Y);
+    }
+
+    [Fact]
     public void PlotProjectionCoalescesAdjacentSegmentsWithTheSameLineStyle()
     {
         var scene = Scene(
@@ -1399,6 +1425,10 @@ public sealed class GraphPlotControlTests
         {
             RequestCount++;
             Assert.Equal(HttpMethod.Get, request.Method);
+            if (request.RequestUri?.AbsolutePath == "/v3/details")
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+            }
             if (request.RequestUri?.AbsolutePath == "/v2/details")
             {
                 if (!servesV2)

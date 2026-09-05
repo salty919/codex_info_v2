@@ -27,6 +27,7 @@ U128-19
 - model totalsとsource checkpointは同じtransactionで保存し、再起動・同一range再取得で重複加算しない。未対応モデルを未保存のままrecorded markerとして確定しない。
 - 既存cursorより前に読み飛ばされたASTRAは、保持sourceからモデル別に回収する。既存SOL/TERRA/LUNAの確定累計や履歴を再加算・削除しない。回収済みの範囲を永続化し、再実行で同じ補正を加えない。
 - 一部モデルだけを回収した履歴は不完全フラグを永続化し、未掲載モデルを0または確定値として公開しない。全モデル集合を同じ観測から再構成できない限り、確定履歴へ昇格させない。
+- 旧`usage_history`に保存済みのSOL/TERRA/LUNA別token・dollarは、全モデル集合やtoken内訳が不完全でも既知値まで捨てない。旧列にない入力・cached入力・cache write入力・出力はNULL、全モデル集合は不完全として公開し、0や推測内訳をDBへ書き込まない。
 - 既存account境界、DB履歴、quota欠測を保持する。旧REST consumerにASTRAを理解したふりをさせず、記録対応と表示対応の完了を分けて報告する。
 - 1つのSession sourceがsymlink、差替え、読取り失敗、不正recordまたは一時的なI/O障害になっても、そのsourceのcursorを進めず再試行可能な状態を保ち、他の独立した有効sourceの差分保存を続ける。外部quota/app-serverの停止およびREST clientの有無をSession記録の停止条件にしない。
 - 1か月の公開minute上限を、canonicalize前のraw reset alias行数へ適用しない。indexed raw readerの有界budget、canonical履歴上限、wire size上限を別の責務として管理し、いずれかの保護判定でDB writerを停止させない。
