@@ -86,6 +86,8 @@ LEGAL_SHARED_EXACT = frozenset(
 PRODUCT_OWNERS = frozenset({"LINUX_BACKEND", "LINUX_UI", "WINDOWS"})
 HISTORY_GRAPH_PROFILE = "history-graph"
 MODEL_HISTORY_PROFILE = "model-history"
+RECORDER_GAP_PROFILE = "recorder-gap"
+RESIDENT_PUBLICATION_PROFILE = "resident-publication"
 WORKFLOW_SELECTION_PROFILE = "workflow-selection"
 HISTORY_GRAPH_PATHS = frozenset(
     {
@@ -160,9 +162,27 @@ MODEL_HISTORY_PATHS = frozenset(
         "windows-client/tools/Run-WindowsClientE2E.ps1",
     }
 )
+RESIDENT_PUBLICATION_PATHS = frozenset(
+    {
+        "docs/PRODUCT_REQUIREMENTS.md",
+        "docs/REQUIREMENTS_LEDGER.md",
+        "src/main.rs",
+    }
+)
+RECORDER_GAP_PATHS = frozenset(
+    {
+        "docs/DATA_PROTECTION_POLICY.md",
+        "docs/PRODUCT_REQUIREMENTS.md",
+        "docs/REQUIREMENTS_LEDGER.md",
+        "src/daemon.rs",
+        "src/main.rs",
+    }
+)
 PROFILE_PATHS = {
     HISTORY_GRAPH_PROFILE: HISTORY_GRAPH_PATHS,
     MODEL_HISTORY_PROFILE: MODEL_HISTORY_PATHS,
+    RECORDER_GAP_PROFILE: RECORDER_GAP_PATHS,
+    RESIDENT_PUBLICATION_PROFILE: RESIDENT_PUBLICATION_PATHS,
     WORKFLOW_SELECTION_PROFILE: WORKFLOW_SELECTION_PATHS,
 }
 PROFILE_LINE_RE = re.compile(r"^Quality-Profile:[ \t]*([a-z0-9]+(?:-[a-z0-9]+)*)[ \t]*$")
@@ -340,6 +360,10 @@ def _resolve_quality_profile(
         raise ScopeError("history-graph profile has no product path")
     if quality_profile == MODEL_HISTORY_PROFILE and not product_change:
         raise ScopeError("model-history profile has no product path")
+    if quality_profile == RECORDER_GAP_PROFILE and not product_change:
+        raise ScopeError("recorder-gap profile has no product path")
+    if quality_profile == RESIDENT_PUBLICATION_PROFILE and not product_change:
+        raise ScopeError("resident-publication profile has no product path")
     if quality_profile == WORKFLOW_SELECTION_PROFILE and product_change:
         raise ScopeError("workflow-selection profile cannot own product code")
     outside = sorted(set(paths) - expected_paths)
@@ -372,6 +396,10 @@ def selection_for_paths(
         release_candidate=release_candidate,
         quality_profile=quality_profile,
     )
+    if resolved_profile in {RECORDER_GAP_PROFILE, RESIDENT_PUBLICATION_PROFILE}:
+        # These finite profiles own backend behavior in the shared binary
+        # entry point. They must not select unchanged X UI or Windows paths.
+        owners.intersection_update({"DOCS", "LINUX_BACKEND"})
     if release_candidate and binary_impact:
         owners.add("WINDOWS")
 

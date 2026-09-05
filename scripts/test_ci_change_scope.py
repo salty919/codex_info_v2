@@ -262,6 +262,61 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(paths=paths), self.assertRaises(ScopeError):
                 selection_for_paths(paths, quality_profile="model-history")
 
+    def test_resident_publication_profile_selects_backend_without_ui(self) -> None:
+        result = selection_for_paths(
+            [
+                "docs/PRODUCT_REQUIREMENTS.md",
+                "docs/REQUIREMENTS_LEDGER.md",
+                "src/main.rs",
+            ],
+            quality_profile="resident-publication",
+        )
+        self.assertEqual(result.owners, ("DOCS", "LINUX_BACKEND"))
+        self.assertEqual(result.codeql_languages, ("rust",))
+        self.assertTrue(result.binary_impact)
+        self.assertFalse(result.distribution_required)
+        self.assertEqual(result.quality_profile, "resident-publication")
+
+        backend_only = selection_for_paths(
+            ["src/main.rs"], quality_profile="resident-publication"
+        )
+        self.assertEqual(backend_only.owners, ("LINUX_BACKEND",))
+
+    def test_resident_publication_profile_has_finite_path_boundaries(self) -> None:
+        for paths in (
+            ["docs/PRODUCT_REQUIREMENTS.md"],
+            ["src/main.rs", "src/server.rs"],
+            ["src/main.rs", "ui/app.slint"],
+        ):
+            with self.subTest(paths=paths), self.assertRaises(ScopeError):
+                selection_for_paths(paths, quality_profile="resident-publication")
+
+    def test_recorder_gap_profile_selects_backend_without_ui(self) -> None:
+        result = selection_for_paths(
+            [
+                "docs/DATA_PROTECTION_POLICY.md",
+                "docs/PRODUCT_REQUIREMENTS.md",
+                "docs/REQUIREMENTS_LEDGER.md",
+                "src/daemon.rs",
+                "src/main.rs",
+            ],
+            quality_profile="recorder-gap",
+        )
+        self.assertEqual(result.owners, ("DOCS", "LINUX_BACKEND"))
+        self.assertEqual(result.codeql_languages, ("rust",))
+        self.assertTrue(result.binary_impact)
+        self.assertFalse(result.distribution_required)
+        self.assertEqual(result.quality_profile, "recorder-gap")
+
+    def test_recorder_gap_profile_has_finite_path_boundaries(self) -> None:
+        for paths in (
+            ["docs/DATA_PROTECTION_POLICY.md"],
+            ["src/main.rs", "src/server.rs"],
+            ["src/daemon.rs", "ui/app.slint"],
+        ):
+            with self.subTest(paths=paths), self.assertRaises(ScopeError):
+                selection_for_paths(paths, quality_profile="recorder-gap")
+
     def test_release_candidate_linux_selection_adds_windows_without_unchanged_csharp(self) -> None:
         result = selection_for_paths(
             ["src/server.rs"], release_candidate=True
@@ -355,6 +410,10 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(
             quality_profile_from_document("Quality-Profile: model-history\n"),
             "model-history",
+        )
+        self.assertEqual(
+            quality_profile_from_document("Quality-Profile: recorder-gap\n"),
+            "recorder-gap",
         )
         for body in (
             "Quality-Profile: history-graph\nQuality-Profile: history-graph\n",

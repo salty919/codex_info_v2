@@ -27,6 +27,8 @@ QUALITY_PROFILES = frozenset(
         "authority-only",
         "history-graph",
         "model-history",
+        "recorder-gap",
+        "resident-publication",
         "workflow-selection",
         "release",
     }
@@ -116,6 +118,21 @@ def validate(
         if not set(languages).issubset({"csharp", "rust"}):
             raise QualitySelectionError(
                 "model-history profile may select only Rust and C# CodeQL"
+            )
+    if quality_profile in {"recorder-gap", "resident-publication"}:
+        if not {"LINUX_BACKEND"}.issubset(selected) or not selected.issubset(
+            {"DOCS", "LINUX_BACKEND"}
+        ):
+            raise QualitySelectionError(
+                f"{quality_profile} profile must select backend and optional docs only"
+            )
+        if distribution_required:
+            raise QualitySelectionError(
+                f"{quality_profile} profile must not select distribution"
+            )
+        if set(languages) - {"rust"}:
+            raise QualitySelectionError(
+                f"{quality_profile} profile may select only Rust CodeQL"
             )
     if quality_profile == "workflow-selection":
         if "GOVERNANCE" not in selected or PRODUCT_OWNERS.intersection(selected):
