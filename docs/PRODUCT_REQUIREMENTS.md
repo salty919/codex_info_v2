@@ -187,7 +187,11 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   startup、CLI、recorder全体、installer、distributionを選択しない。product変更のない`history-graph`宣言は不要な品質要求として
   拒否する。workflow/selector変更は`workflow-selection`で、
   変更workflowの構文、profile selector、rename/copy、main Release非縮小だけを確認し、Release publisher、bundle、installer、
-  product E2Eを起動しない。単なる文書変更はprofileなしの`authority-only`とする。main向けRelease candidateはfeat profileを
+  product E2Eを起動しない。単なる文書変更はprofileなしの`authority-only`とする。今回のDB/API/model-history/Linux graph/Windows v3+ASTRA経路を含む
+  有限27 pathの差分は`model-history`で分類する。
+  同profileはDOCS、LINUX_BACKEND、LINUX_UI、WINDOWSだけを選び、v3 pair/304、v3 cacheとexact 404 fallback、履歴選択、
+  legacy known/incomplete、ASTRA pricing/restart、ASTRA-only graphの既存直接testだけを実行し、full suite、installer、distributionを選択しない。
+  profile外path、欠落・重複・未知profileは従来どおり拒否する。main向けRelease candidateはfeat profileを
   受け取らず、従来の
   full owner、distribution、installer、実OS/UI品質を維持する。feat向け`selected-quality`集約と`feat-acceptance`、Windows release
   candidateは生成しない。実jobの失敗は赤のまま表示するがmergeを禁止しない。live repository ruleの再監査、
@@ -317,5 +321,5 @@ component別max、last-row、null化、任意mergeを行わない。
 8. X版の初回起動でも、health readiness後に最初のstrict validation済み`/v3/details` generation（旧serviceのexact 404時だけv2、さらにexact 404時だけv1）が揃うまで主画面の内容領域を公開せず、ヘッダー（製品バージョンを含む）を固定したままスピナーを表示する。details取得が失敗した場合はスピナーを解除し、最後の完全表示または失敗状態を表示する。
 9. X版の起動ウィンドウは主モニターの可視デスクトップ内へ配置し、別モニターや負座標へ出して利用者から見えない状態にしてはならない。起動成功は、可視範囲内の実ウィンドウと内容の実画面で確認する。
 10. `--ui` のdaemon/REST起動に失敗しても、X版のGUIを消失・即時終了させず、接続失敗と再試行手段を表示する。
-11. 同一periodのモデル別累積vectorは全componentを一つの観測として扱う。1 componentでも直前の確定vectorより後退したrowは、前回値とのcomponent別maxで合成せず、全componentが直前の確定vector以上へ回復するまでwhole-vector欠測とする。
+11. 同一periodのモデル別累積はmodelごとに独立したログ観測として扱う。1 modelが直前の確定値より後退したrowは、そのmodelだけを回復点まで欠測とし、同じrowで確定している他modelの実測値を欠測や前回値へ置換しない。model集合が不完全でも、掲載modelの実測値は無効にしない。
 12. remote quotaとlocal Session/logは独立した取得元とする。remote transport障害中もresident local collectorとDB recorderを60秒以内の既存周期で継続し、local-only rowはquota `NULL`かつmodel source `confirmed`でcommitする。local取得失敗後も、そのcycleで取得済みのfresh remote quotaは元の観測時刻、実collector世代、model source `unavailable`として同じDB transactionへ保持し、直前のdurable model vectorを新しい確定rowとして複製しない。古いquotaを新しいtimestampへ複製しない。local取得失敗はsingle-flightを解放して次周期で再取得し、DB書込み失敗はprovenanceを含むexact pending batchを保持して同じdaemon内で再試行する。provenanceなしの旧rowは`legacy-unknown`であり、確定観測へ昇格しない。

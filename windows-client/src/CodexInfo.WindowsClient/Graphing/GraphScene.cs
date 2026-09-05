@@ -332,19 +332,18 @@ public sealed class GraphScene
         var interpolated = new bool[points.Count];
         values[0] = rawValues[0] is { } first && double.IsFinite(first)
             ? Math.Clamp(first, 0, 100)
-            : 100;
+            : null;
         var quotaAvailable = values[0] is not null;
         var quotaObservedSinceModelChange = true;
         for (var index = 1; index < points.Count; index++)
         {
-            var previous = values[index - 1] ?? 100;
+            var previous = values[index - 1].GetValueOrDefault();
             var modelAdvanced = ModelAdvanced(points[index - 1], points[index]);
-            var syntheticGap = IsSyntheticRemainingGap(points, index, points[0].Timestamp);
             var confirmedGap = HasConfirmedGapBetween(
                 confirmedGaps,
                 points[index - 1].Timestamp,
                 points[index].Timestamp);
-            activeSegments[index - 1] = modelAdvanced && !syntheticGap && !confirmedGap;
+            activeSegments[index - 1] = modelAdvanced && !confirmedGap;
             var observed = rawValues[index] is { } raw && double.IsFinite(raw)
                 ? Math.Clamp(raw, 0, 100)
                 : (double?)null;
@@ -488,8 +487,7 @@ public sealed class GraphScene
                 continue;
             }
             if (!activeSegments[index - 1] &&
-                points[index].Timestamp != points[index - 1].Timestamp &&
-                !IsSyntheticRemainingGap(points, index, points[0].Timestamp))
+                points[index].Timestamp != points[index - 1].Timestamp)
             {
                 values[index] = rawValues[index] is { } observed && double.IsFinite(observed) &&
                     values[index - 1] is { } before
@@ -560,24 +558,6 @@ public sealed class GraphScene
             .OrderBy(interval => interval.StartAt)
             .ThenBy(interval => interval.EndAt)
             .ToArray();
-    }
-
-    internal static bool IsSyntheticRemainingGap(
-        IReadOnlyList<ScenePoint> points,
-        int index,
-        long periodStart)
-    {
-        if (index <= 0 || index >= points.Count)
-        {
-            return false;
-        }
-
-        var before = points[index - 1];
-        var after = points[index];
-        return before.Timestamp == periodStart &&
-            after.Timestamp - before.Timestamp > 60 &&
-            before.Sol <= 0 && before.Terra <= 0 && before.Luna <= 0 && before.Astra <= 0 &&
-            ModelAdvanced(before, after);
     }
 
     internal bool HasConfirmedGapBetween(double startAt, double endAt) =>

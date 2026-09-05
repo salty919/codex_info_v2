@@ -315,7 +315,7 @@ component順や表示所有者を変更しない。
   検証し、一項目でも不一致ならその表示を受入れない。
 - X版とWindows版は同一の履歴fixtureと固定期待値（期間境界、累積SOL、遅延残量、未観測区間）を通過しなければならない。片方の描画ヘルパーが生成した値をもう片方の期待値には使用せず、fixtureの独立oracleを使う。
 - finite oracleは、shared rolloverのperiod A→B `100% / $1 → 41% / $323.674247`、
-  `graph_delayed_quota`のfirst observation・遅延quota・missing quota、whole-vector回帰/回復、
+  `graph_delayed_quota`のfirst observation・遅延quota・missing quota、model別回帰/回復、
   confirmed gap、unattributed quota、current/historical右端、no-historyの9 causal caseとする。
   ASTRAのtoken/指定4単価、旧3モデルだけが既知のincomplete period、period選択後pollのbounded reset aliasは
   今回観測した同じ到達経路へ統合し、別の全直積を作らない。

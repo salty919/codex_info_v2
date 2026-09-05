@@ -230,62 +230,11 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
         // Core admission supplies strictly increasing minute-start rows with
         // one canonical owner for each period/timestamp. Preserve every
-        // source vector as-is; graph code only adds documented quota/reset
-        // anchors and never repairs model components from older rows.
+        // source vector as-is; graph code must not invent a pre-observation
+        // baseline or repair model components from older rows.
         var normalized = observed.ToList();
 
-        var hasRemainingObservation = normalized.Any(sample => sample.RemainingPercent is { } value && double.IsFinite(value));
-        if (normalized[0].Timestamp == period.StartAt &&
-            normalized[0].RemainingPercent is null &&
-            hasRemainingObservation)
-        {
-            // raw_graph_points() always starts with a 100% reset anchor and
-            // only replaces it when a quota observation exists at the same
-            // timestamp.  Keep that distinction when the first model row is
-            // present but its quota field is missing.
-            normalized[0] = normalized[0] with { RemainingPercent = 100 };
-        }
-        var result = new List<ApiHistorySample>(normalized.Count + 2);
-        if (normalized[0].Timestamp > period.StartAt)
-        {
-            if (normalized[0].ModelSamples is { } genericModels)
-            {
-                // This is a presentation-only reset anchor. Keep the generic
-                // model identity (including ASTRA) while marking the value
-                // incomplete so the renderer uses its dashed path.
-                var anchorModels = genericModels
-                    .Select(model => new ApiHistoryModelSample(
-                        model.Name,
-                        null,
-                        null,
-                        null,
-                        0)
-                    {
-                        TotalTokens = 0,
-                    })
-                    .ToArray();
-                result.Add(new ApiHistorySample(
-                    period.StartAt,
-                    normalized[0].ResetAt,
-                    hasRemainingObservation ? 100 : null,
-                    null,
-                    null,
-                    null,
-                    null,
-                    null,
-                    null,
-                    ApiHistorySample.LegacyUnknownModelSource)
-                {
-                    ModelsComplete = false,
-                    ModelSamples = anchorModels,
-                });
-            }
-            else
-            {
-                result.Add(new ApiHistorySample(period.StartAt, normalized[0].ResetAt, hasRemainingObservation ? 100 : null, 0, 0, 0, 0, 0, 0));
-            }
-        }
-
+        var result = new List<ApiHistorySample>(normalized.Count + 1);
         result.AddRange(normalized);
         var last = result[^1];
         if (last.Timestamp < end &&

@@ -213,7 +213,7 @@ public sealed class GraphPlotControl : AvaPlot
         IReadOnlyList<double> values,
         ScottPlot.Color color)
     {
-        var lines = GraphPlotProjection.BuildRenderableModelLines(scene, values);
+        var lines = GraphPlotProjection.BuildModelLines(scene, values);
         return new ModelSeriesVisual(
             AddLine(lines.Flat, color.WithOpacity(0.95), Plot.Axes.Left, MeasuredModelLineWidth),
             AddLine(lines.Rising, color.WithOpacity(0.95), Plot.Axes.Left, MeasuredModelLineWidth),

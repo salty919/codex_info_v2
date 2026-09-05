@@ -159,34 +159,6 @@ internal static class GraphPlotProjection
     }
 
     /// <summary>
-    /// Builds the remaining-quota path, retaining the synthetic reset anchor
-    /// so an unknown interval stays horizontal until the first observation.
-    /// </summary>
-    public static GraphLineProjection BuildRemainingLine(GraphScene scene)
-    {
-        ArgumentNullException.ThrowIfNull(scene);
-        if (!scene.HasPoints)
-        {
-            return new GraphLineProjection([], []);
-        }
-
-        var x = new List<double>(scene.Timestamps.Count + 1) { scene.Timestamps[0] };
-        var y = new List<double>(scene.Remaining.Count + 1) { scene.Remaining[0] };
-        for (var index = 1; index < scene.Timestamps.Count; index++)
-        {
-            if (scene.IdleIntervals.Any(interval =>
-                    interval.PreserveBoundary && interval.EndAt == (long)scene.Timestamps[index]))
-            {
-                x.Add(scene.Timestamps[index]);
-                y.Add(scene.Remaining[index - 1]);
-            }
-            x.Add(scene.Timestamps[index]);
-            y.Add(scene.Remaining[index]);
-        }
-        return new GraphLineProjection(x, y);
-    }
-
-    /// <summary>
     /// Builds the quota path while keeping remote observations independent
     /// from model availability. Any missing or unattributed interval is
     /// emitted only into the dashed reference path.
@@ -288,98 +260,10 @@ internal static class GraphPlotProjection
     }
 
     /// <summary>
-    /// Splits cumulative model data into the thin/quiet flat path and the
-    /// thicker rising path used by the native X graph.
+    /// Projects the flat, rising, and inferred cumulative-model paths used by
+    /// the renderer. Confirmed gaps remain disconnected.
     /// </summary>
-    public static GraphModelLineProjection BuildModelLines(
-        GraphScene scene,
-        IReadOnlyList<double> values)
-    {
-        ArgumentNullException.ThrowIfNull(scene);
-        ArgumentNullException.ThrowIfNull(values);
-        if (values.Count != scene.Timestamps.Count)
-        {
-            throw new ArgumentException("A model series must match the graph timestamp count.", nameof(values));
-        }
-
-        var flatX = new List<double>();
-        var flatY = new List<double>();
-        var risingX = new List<double>();
-        var risingY = new List<double>();
-        var dashedX = new List<double>();
-        var dashedY = new List<double>();
-        for (var index = 1; index < values.Count; index++)
-        {
-            var before = values[index - 1];
-            var after = values[index];
-            if (!double.IsFinite(before) || !double.IsFinite(after) || after < before)
-            {
-                continue;
-            }
-
-            var startAt = scene.Timestamps[index - 1];
-            var endAt = scene.Timestamps[index];
-            if (scene.HasConfirmedGapBetween(startAt, endAt))
-            {
-                continue;
-            }
-            if (IsSyntheticFirstObservation(scene, values, index))
-            {
-                // The interval between the synthetic reset anchor and the
-                // first real observation is unknown. Keep the selected model
-                // flat at zero, then place its known cumulative increase at
-                // the actual observation timestamp.
-                AppendSegment(flatX, flatY, startAt, before, endAt, before);
-                AppendSegment(risingX, risingY, endAt, before, endAt, after);
-            }
-            else if (after == before)
-            {
-                AppendSegment(flatX, flatY, startAt, before, endAt, after);
-            }
-            else if (endAt - startAt > ModelContiguousSampleMaxGapSeconds)
-            {
-                // The elapsed interval is not observed. Keep the cumulative
-                // value horizontal during that gap, then show the increase at
-                // the actual next observation instead of inventing a spend
-                // rate across idle time.
-                AppendSegment(flatX, flatY, startAt, before, endAt, before);
-                AppendSegment(risingX, risingY, endAt, before, endAt, after);
-            }
-            else
-            {
-                AppendSegment(risingX, risingY, startAt, before, endAt, after);
-            }
-        }
-
-        AppendDashedModelGaps(scene, values, dashedX, dashedY);
-
-        return new GraphModelLineProjection(
-            new GraphLineProjection(flatX, flatY),
-            new GraphLineProjection(risingX, risingY),
-            new GraphLineProjection(dashedX, dashedY));
-    }
-
-    /// <summary>Projects one server-provided generic model series.</summary>
-    public static GraphModelLineProjection BuildModelLines(
-        GraphScene scene,
-        string modelName)
-    {
-        ArgumentNullException.ThrowIfNull(scene);
-        ArgumentNullException.ThrowIfNull(modelName);
-        return scene.ModelSeries.TryGetValue(modelName, out var values)
-            ? BuildModelLines(scene, values)
-            : new GraphModelLineProjection(
-                new GraphLineProjection(Array.Empty<double>(), Array.Empty<double>()),
-                new GraphLineProjection(Array.Empty<double>(), Array.Empty<double>()),
-                new GraphLineProjection(Array.Empty<double>(), Array.Empty<double>()));
-    }
-
-    /// <summary>
-    /// Projects the paths used by the renderer. This keeps the compatibility
-    /// output of <see cref="BuildModelLines"/> while ensuring gaps are never
-    /// painted as solid connections.
-    /// </summary>
-    internal static GraphModelLineProjection BuildRenderableModelLines(
+    internal static GraphModelLineProjection BuildModelLines(
         GraphScene scene,
         IReadOnlyList<double> values)
     {
@@ -429,11 +313,6 @@ internal static class GraphPlotProjection
             {
                 AppendSegment(dashedX, dashedY, startAt, before, endAt, value);
             }
-            else if (IsSyntheticFirstObservation(scene, values, index))
-            {
-                AppendSegment(flatX, flatY, startAt, before, endAt, before);
-                AppendSegment(risingX, risingY, endAt, before, endAt, value);
-            }
             else if (value == before)
             {
                 AppendSegment(flatX, flatY, startAt, before, endAt, value);
@@ -449,28 +328,6 @@ internal static class GraphPlotProjection
             new GraphLineProjection(flatX, flatY),
             new GraphLineProjection(risingX, risingY),
             new GraphLineProjection(dashedX, dashedY));
-    }
-
-    private static bool IsSyntheticFirstObservation(
-        GraphScene scene,
-        IReadOnlyList<double> values,
-        int index)
-    {
-        if (index <= 0 || index >= scene.Timestamps.Count)
-        {
-            return false;
-        }
-
-        var startAt = scene.Timestamps[index - 1];
-        var endAt = scene.Timestamps[index];
-        return startAt == scene.PeriodStartAt &&
-            endAt - startAt > 60 &&
-            scene.Sol[index - 1] <= 0 &&
-            scene.Terra[index - 1] <= 0 &&
-            scene.Luna[index - 1] <= 0 &&
-            scene.Astra[index - 1] <= 0 &&
-            values[index - 1] <= 0 &&
-            values[index] > values[index - 1];
     }
 
     /// <summary>
@@ -606,44 +463,6 @@ internal static class GraphPlotProjection
             return effective;
         }
         return double.IsFinite(effective) ? Math.Min(effective, observed) : observed;
-    }
-
-    private static void AppendDashedModelGaps(
-        GraphScene scene,
-        IReadOnlyList<double> values,
-        List<double> dashedX,
-        List<double> dashedY)
-    {
-        var previous = -1;
-        for (var index = 0; index < values.Count; index++)
-        {
-            if (!double.IsFinite(values[index]))
-            {
-                continue;
-            }
-            if (previous >= 0 && values[index] >= values[previous])
-            {
-                var elapsed = scene.Timestamps[index] - scene.Timestamps[previous];
-                if (scene.HasConfirmedGapBetween(
-                        scene.Timestamps[previous],
-                        scene.Timestamps[index]))
-                {
-                    previous = index;
-                    continue;
-                }
-                if (index != previous + 1 || elapsed > ModelContiguousSampleMaxGapSeconds)
-                {
-                    AppendSegment(
-                        dashedX,
-                        dashedY,
-                        scene.Timestamps[previous],
-                        values[previous],
-                        scene.Timestamps[index],
-                        values[index]);
-                }
-            }
-            previous = index;
-        }
     }
 
     private static void AddModelCandidate(
