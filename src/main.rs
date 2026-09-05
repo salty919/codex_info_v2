@@ -4215,6 +4215,8 @@ struct GraphModelPoint {
     reliable: bool,
 }
 
+type GraphModelTimelines = BTreeMap<String, BTreeMap<i64, GraphModelPoint>>;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RemainingMarkerPosition {
     x: f64,
@@ -4475,7 +4477,7 @@ fn graph_paths_for_selection_with_sources_and_astra(
     show_tokens: bool,
     untrusted_minutes: &BTreeSet<i64>,
     confirmed_gaps: &[GraphConfirmedGap],
-    astra_by_minute: &BTreeMap<i64, GraphModelPoint>,
+    model_timelines: &GraphModelTimelines,
 ) -> GraphPaths {
     let mut paths = graph_paths_with_sources(
         samples,
@@ -4490,16 +4492,30 @@ fn graph_paths_for_selection_with_sources_and_astra(
         period_end,
     );
     for point in &mut minute {
-        point.astra = astra_by_minute
-            .get(&point.timestamp)
-            .map(|model| {
-                if show_tokens {
-                    model.tokens
+        let has_model_observation = model_timelines
+            .values()
+            .any(|timeline| timeline.contains_key(&point.timestamp));
+        let value = |name: &str, fallback: f64| {
+            model_timelines
+                .get(name)
+                .and_then(|timeline| timeline.get(&point.timestamp))
+                .map(|model| {
+                    if show_tokens {
+                        model.tokens
+                    } else {
+                        model.dollar
+                    }
+                })
+                .unwrap_or(if has_model_observation {
+                    -1.0
                 } else {
-                    model.dollar
-                }
-            })
-            .unwrap_or(-1.0);
+                    fallback
+                })
+        };
+        point.sol = value("SOL", point.sol);
+        point.terra = value("TERRA", point.terra);
+        point.luna = value("LUNA", point.luna);
+        point.astra = value("ASTRA", -1.0);
     }
     // Keep the remaining line on the same activity metric as the visible
     // model lines. A legacy row with dollars but no token counters must not
@@ -4599,15 +4615,29 @@ fn graph_paths_for_selection_with_sources_and_astra(
         })
         .fold(0.0_f64, f64::max);
     let scale_maximum = maximum.max(observed_maximum).max(1.0);
-    let latest = minute.last().copied().unwrap_or_default();
-    let display_latest = if show_tokens {
+    let latest_value = |value: fn(&HourlyModelSpend) -> f64| {
         minute
-            .last()
+            .iter()
+            .rev()
+            .map(value)
+            .find(|value| value.is_finite() && *value >= 0.0)
+    };
+    let model_untrusted = |name: &str| {
+        let timeline = model_timelines.get(name);
+        let mut minutes = untrusted_minutes
+            .iter()
             .copied()
-            .filter(model_spend_is_reliable)
-            .unwrap_or(latest)
-    } else {
-        latest_reliable_model_spend(samples, false).unwrap_or(latest)
+            .filter(|minute| timeline.is_none_or(|timeline| !timeline.contains_key(minute)))
+            .collect::<BTreeSet<_>>();
+        if let Some(timeline) = timeline {
+            minutes.extend(
+                timeline
+                    .iter()
+                    .filter(|(_, point)| !point.reliable)
+                    .map(|(minute, _)| *minute),
+            );
+        }
+        minutes
     };
     paths.dollar_labels = if show_tokens {
         token_axis_labels(scale_maximum)
@@ -4640,13 +4670,15 @@ fn graph_paths_for_selection_with_sources_and_astra(
     let graph_y =
         |value: f64| ((99.0 - value / scale_maximum * 98.0) / 100.0).clamp(0.01, 0.99) as f32;
     if show_luna {
-        let (flat, rising, inferred) = split_metric_line_paths_with_confirmed_gaps(
+        let (flat, rising, inferred) = split_metric_line_paths_with_evidence(
             &minute,
             period_start,
             period_end,
             scale_maximum,
             |point| point.luna,
             confirmed_gaps,
+            &model_untrusted("LUNA"),
+            false,
         );
         paths.luna_flat = [flat, inferred]
             .into_iter()
@@ -4654,31 +4686,29 @@ fn graph_paths_for_selection_with_sources_and_astra(
             .collect::<Vec<_>>()
             .join(" ");
         paths.luna_rising = rising;
-        paths.luna = metric_line_path_with_confirmed_gaps(
-            &minute,
-            period_start,
-            period_end,
-            scale_maximum,
-            |point| point.luna,
-            confirmed_gaps,
-        );
-        paths.current_luna_label =
-            if observed_maximum > 0.0 && model_spend_is_reliable(&display_latest) {
-                format_metric_value(display_latest.luna, show_tokens)
-            } else {
-                String::new()
-            };
-        paths.current_luna_y = graph_y(display_latest.luna);
-        paths.current_luna_point_y = paths.current_luna_y;
+        paths.luna = [paths.luna_flat.as_str(), paths.luna_rising.as_str()]
+            .into_iter()
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Some(latest) = latest_value(|point| point.luna) {
+            if observed_maximum > 0.0 {
+                paths.current_luna_label = format_metric_value(latest, show_tokens);
+            }
+            paths.current_luna_y = graph_y(latest);
+            paths.current_luna_point_y = paths.current_luna_y;
+        }
     }
     if show_terra {
-        let (flat, rising, inferred) = split_metric_line_paths_with_confirmed_gaps(
+        let (flat, rising, inferred) = split_metric_line_paths_with_evidence(
             &minute,
             period_start,
             period_end,
             scale_maximum,
             |point| point.terra,
             confirmed_gaps,
+            &model_untrusted("TERRA"),
+            false,
         );
         paths.terra_flat = [flat, inferred]
             .into_iter()
@@ -4686,31 +4716,29 @@ fn graph_paths_for_selection_with_sources_and_astra(
             .collect::<Vec<_>>()
             .join(" ");
         paths.terra_rising = rising;
-        paths.terra = metric_line_path_with_confirmed_gaps(
-            &minute,
-            period_start,
-            period_end,
-            scale_maximum,
-            |point| point.terra,
-            confirmed_gaps,
-        );
-        paths.current_terra_label =
-            if observed_maximum > 0.0 && model_spend_is_reliable(&display_latest) {
-                format_metric_value(display_latest.terra, show_tokens)
-            } else {
-                String::new()
-            };
-        paths.current_terra_y = graph_y(display_latest.terra);
-        paths.current_terra_point_y = paths.current_terra_y;
+        paths.terra = [paths.terra_flat.as_str(), paths.terra_rising.as_str()]
+            .into_iter()
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Some(latest) = latest_value(|point| point.terra) {
+            if observed_maximum > 0.0 {
+                paths.current_terra_label = format_metric_value(latest, show_tokens);
+            }
+            paths.current_terra_y = graph_y(latest);
+            paths.current_terra_point_y = paths.current_terra_y;
+        }
     }
     if show_sol {
-        let (flat, rising, inferred) = split_metric_line_paths_with_confirmed_gaps(
+        let (flat, rising, inferred) = split_metric_line_paths_with_evidence(
             &minute,
             period_start,
             period_end,
             scale_maximum,
             |point| point.sol,
             confirmed_gaps,
+            &model_untrusted("SOL"),
+            false,
         );
         paths.sol_flat = [flat, inferred]
             .into_iter()
@@ -4718,29 +4746,20 @@ fn graph_paths_for_selection_with_sources_and_astra(
             .collect::<Vec<_>>()
             .join(" ");
         paths.sol_rising = rising;
-        paths.sol = metric_line_path_with_confirmed_gaps(
-            &minute,
-            period_start,
-            period_end,
-            scale_maximum,
-            |point| point.sol,
-            confirmed_gaps,
-        );
-        paths.current_sol_label =
-            if observed_maximum > 0.0 && model_spend_is_reliable(&display_latest) {
-                format_metric_value(display_latest.sol, show_tokens)
-            } else {
-                String::new()
-            };
-        paths.current_sol_y = graph_y(display_latest.sol);
-        paths.current_sol_point_y = paths.current_sol_y;
+        paths.sol = [paths.sol_flat.as_str(), paths.sol_rising.as_str()]
+            .into_iter()
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Some(latest) = latest_value(|point| point.sol) {
+            if observed_maximum > 0.0 {
+                paths.current_sol_label = format_metric_value(latest, show_tokens);
+            }
+            paths.current_sol_y = graph_y(latest);
+            paths.current_sol_point_y = paths.current_sol_y;
+        }
     }
     if show_astra {
-        let astra_untrusted = astra_by_minute
-            .iter()
-            .filter(|(_, model)| !model.reliable)
-            .map(|(minute, _)| *minute)
-            .collect::<BTreeSet<_>>();
         let (flat, rising, inferred) = split_metric_line_paths_with_evidence(
             &minute,
             period_start,
@@ -4748,7 +4767,7 @@ fn graph_paths_for_selection_with_sources_and_astra(
             scale_maximum,
             |point| point.astra,
             confirmed_gaps,
-            &astra_untrusted,
+            &model_untrusted("ASTRA"),
             false,
         );
         paths.astra_flat = [flat, inferred]
@@ -4973,7 +4992,7 @@ fn minute_model_spend_for_metric(
 fn minute_model_spend_for_metric_with_untrusted(
     samples: &[&UsageHistorySample],
     show_tokens: bool,
-    untrusted_minutes: &BTreeSet<i64>,
+    _untrusted_minutes: &BTreeSet<i64>,
 ) -> Vec<HourlyModelSpend> {
     let mut buckets: Vec<UsageHistorySample> = Vec::new();
     for sample in samples {
@@ -5000,9 +5019,6 @@ fn minute_model_spend_for_metric_with_untrusted(
         return buckets
             .into_iter()
             .map(|sample| {
-                if untrusted_minutes.contains(&sample.timestamp) {
-                    return unreliable_model_spend(sample.timestamp);
-                }
                 let current = [
                     sample.sol_tokens as f64,
                     sample.terra_tokens as f64,
@@ -5031,9 +5047,6 @@ fn minute_model_spend_for_metric_with_untrusted(
     buckets
         .into_iter()
         .map(|sample| {
-            if untrusted_minutes.contains(&sample.timestamp) {
-                return unreliable_model_spend(sample.timestamp);
-            }
             let current = [
                 sample.sol_dollars,
                 sample.terra_dollars,
@@ -12457,34 +12470,53 @@ impl CodexInfoState {
                 &canonical_resets,
             )
         }) {
-            let Some(model) = observation
+            let model = observation
                 .model_totals
                 .as_deref()
-                .and_then(|models| models.iter().find(|model| model.model == model_name))
-            else {
-                continue;
-            };
+                .and_then(|models| models.iter().find(|model| model.model == model_name));
+            let minute = observation.timestamp.div_euclid(60) * 60;
             let reliable = observation.model_source == usage_store::ModelSource::Confirmed
                 && observation.model_totals_complete;
+            let Some(model) = model else {
+                // A complete model set makes absence an observed zero. An
+                // incomplete set says nothing about an omitted model and must
+                // not manufacture a zero line.
+                if reliable {
+                    points.insert(
+                        minute,
+                        GraphModelPoint {
+                            dollar: 0.0,
+                            tokens: 0.0,
+                            reliable: true,
+                        },
+                    );
+                }
+                continue;
+            };
             // Completeness describes the model set, not the known model row.
             // Keep an exact row recovered from the session log and let
             // `reliable` render it as inferred/dashed when peer models are
             // unknown. Dropping the value makes the line appear later at the
             // first complete snapshot, which falsely implies a sudden spend.
-            let dollar = ModelUsageRow {
-                name: model.model.clone(),
-                tokens: model.total_tokens,
-                input_tokens: model.input_tokens,
-                cached_input_tokens: model.cached_input_tokens,
-                output_tokens: model.output_tokens,
-                cache_write_input_tokens: model.cache_write_input_tokens,
+            let dollar = match model_name {
+                "SOL" => observation.sol_dollars,
+                "TERRA" => observation.terra_dollars,
+                "LUNA" => observation.luna_dollars,
+                _ => ModelUsageRow {
+                    name: model.model.clone(),
+                    tokens: model.total_tokens,
+                    input_tokens: model.input_tokens,
+                    cached_input_tokens: model.cached_input_tokens,
+                    output_tokens: model.output_tokens,
+                    cache_write_input_tokens: model.cache_write_input_tokens,
+                }
+                .public_v3()
+                .estimated_cost
+                .map(|cost| cost.total_dollars),
             }
-            .public_v3()
-            .estimated_cost
-            .map(|cost| cost.total_dollars)
             .unwrap_or(-1.0);
             points.insert(
-                observation.timestamp.div_euclid(60) * 60,
+                minute,
                 GraphModelPoint {
                     dollar,
                     tokens: model.total_tokens as f64,
@@ -12550,12 +12582,20 @@ impl CodexInfoState {
                 end_at: gap.end_at,
             })
             .collect::<Vec<_>>();
-        let astra_by_minute = self.graph_model_points_for_selection(
-            selected_reset,
-            period_start,
-            period_end,
-            "ASTRA",
-        );
+        let model_timelines = ["SOL", "TERRA", "LUNA", "ASTRA"]
+            .into_iter()
+            .map(|model| {
+                (
+                    model.to_owned(),
+                    self.graph_model_points_for_selection(
+                        selected_reset,
+                        period_start,
+                        period_end,
+                        model,
+                    ),
+                )
+            })
+            .collect::<GraphModelTimelines>();
         let mut paths = graph_paths_for_selection_with_sources_and_astra(
             &sample_references,
             period_start,
@@ -12567,7 +12607,7 @@ impl CodexInfoState {
             show_tokens,
             &untrusted_minutes,
             &confirmed_gaps,
-            &astra_by_minute,
+            &model_timelines,
         );
         if !self.has_quota_percent {
             paths.remaining.clear();
@@ -16557,11 +16597,12 @@ mod tests {
         graph_paths, graph_paths_for_selection, graph_paths_for_selection_with_confirmed_gaps,
         graph_points, graph_time_endpoints, is_service_health_response,
         local_input_inventory_for_paths, minute_model_spend, minute_model_spend_for_metric,
-        model_spend_is_reliable, model_usage_timeline_from_events, monthly_window_seconds,
-        native_account_window_title, native_legal_pages, native_startup_loading,
-        normal_status_text, one_month_before_utc, open_codex_session_paths, parse_details_document,
-        parse_launch_mode, parse_preview_size, parse_rate_limits, parse_resize_direction,
-        period_remaining_text, physical_size_for_logical, plan_type_label, poll_service_state,
+        minute_model_spend_for_metric_with_untrusted, model_spend_is_reliable,
+        model_usage_timeline_from_events, monthly_window_seconds, native_account_window_title,
+        native_legal_pages, native_startup_loading, normal_status_text, one_month_before_utc,
+        open_codex_session_paths, parse_details_document, parse_launch_mode, parse_preview_size,
+        parse_rate_limits, parse_resize_direction, period_remaining_text,
+        physical_size_for_logical, plan_type_label, poll_service_state,
         poll_service_state_with_owner_check, preview_model_row, published_pair_is_fresh,
         read_active_thread_rollout_cached, read_recovery_entries_for_ranges,
         read_thread_rollout_path, remaining_graph_points, remaining_graph_points_for_metric,
@@ -19989,10 +20030,10 @@ mod tests {
             remaining_percent: 90.0,
             sol_dollars: 1.0,
             terra_dollars: 0.0,
-            luna_dollars: 0.0,
+            luna_dollars: 0.1,
             sol_tokens: 10,
             terra_tokens: 0,
-            luna_tokens: 0,
+            luna_tokens: 1,
         };
         let legacy = UsageHistorySample {
             timestamp: observed_at - 120,
@@ -20000,10 +20041,10 @@ mod tests {
             remaining_percent: 89.0,
             sol_dollars: 2.0,
             terra_dollars: 0.0,
-            luna_dollars: 0.0,
+            luna_dollars: 0.5,
             sol_tokens: 20,
             terra_tokens: 0,
-            luna_tokens: 0,
+            luna_tokens: 5,
         };
         let confirmed_recovery = UsageHistorySample {
             timestamp: observed_at,
@@ -20011,10 +20052,10 @@ mod tests {
             remaining_percent: 88.0,
             sol_dollars: 3.0,
             terra_dollars: 0.0,
-            luna_dollars: 0.0,
+            luna_dollars: 0.8,
             sol_tokens: 30,
             terra_tokens: 0,
-            luna_tokens: 0,
+            luna_tokens: 8,
         };
         let start_store = confirmed_start.to_store();
         let legacy_store = legacy.to_store();
@@ -20044,10 +20085,33 @@ mod tests {
             ..UsageHistory::default()
         };
 
-        let paths = state.graph_paths_for_selection_at(observed_at, false, false, true, false);
+        let periods = state.history_periods_at(observed_at);
+        let selected_reset = state
+            .selected_history_reset_for_periods(&periods)
+            .expect("selected period");
+        let period = periods
+            .iter()
+            .find(|period| period.canonical_reset_at == selected_reset)
+            .expect("selected period bounds");
+        let (graph_samples, untrusted) =
+            state.graph_samples_for_selection(selected_reset, period.start, period.end);
+        let graph_sample_refs = graph_samples.iter().collect::<Vec<_>>();
+        let model_points =
+            minute_model_spend_for_metric_with_untrusted(&graph_sample_refs, false, &untrusted);
+        let retained_legacy = model_points
+            .iter()
+            .find(|point| point.timestamp == legacy.timestamp)
+            .expect("known incomplete point must remain in the graph input");
+        assert_eq!((retained_legacy.sol, retained_legacy.luna), (2.0, 0.5));
+
+        let paths = state.graph_paths_for_selection_at(observed_at, true, false, true, false);
         assert!(paths.sol_rising.is_empty());
-        assert!(!paths.sol_flat.is_empty());
+        assert!(paths.luna_rising.is_empty());
+        assert!(paths.sol_flat.matches('M').count() > 1);
+        assert!(paths.luna_flat.matches('M').count() > 1);
         assert!(!paths.sol_flat.contains("L100.00"));
+        assert_eq!(paths.current_sol_label, "$3.00");
+        assert_eq!(paths.current_luna_label, "$0.80");
         assert!(paths.remaining.matches('M').count() > 3);
     }
 
