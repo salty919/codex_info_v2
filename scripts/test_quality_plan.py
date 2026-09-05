@@ -124,6 +124,40 @@ class QualityPlanFixtures(unittest.TestCase):
             ("requirements-authority", "windows-model-history"),
         )
 
+    def test_resident_publication_uses_only_authority_and_direct_rust_tests(self) -> None:
+        plan = plan_for_paths(
+            (
+                "docs/PRODUCT_REQUIREMENTS.md",
+                "docs/REQUIREMENTS_LEDGER.md",
+                "src/main.rs",
+            ),
+            quality_profile="resident-publication",
+        )
+        self.assertEqual(plan.affected_owners, ("DOCS", "LINUX_BACKEND"))
+        self.assertEqual(
+            plan.checks,
+            ("requirements-authority", "rust-resident-publication"),
+        )
+        self.assertEqual(plan.quality_profile, "resident-publication")
+
+    def test_recorder_gap_uses_only_authority_and_four_direct_rust_tests(self) -> None:
+        plan = plan_for_paths(
+            (
+                "docs/DATA_PROTECTION_POLICY.md",
+                "docs/PRODUCT_REQUIREMENTS.md",
+                "docs/REQUIREMENTS_LEDGER.md",
+                "src/daemon.rs",
+                "src/main.rs",
+            ),
+            quality_profile="recorder-gap",
+        )
+        self.assertEqual(plan.affected_owners, ("DOCS", "LINUX_BACKEND"))
+        self.assertEqual(
+            plan.checks,
+            ("requirements-authority", "rust-recorder-gap"),
+        )
+        self.assertEqual(plan.quality_profile, "recorder-gap")
+
     def test_windows_owner(self) -> None:
         plan = plan_for_paths(
             (

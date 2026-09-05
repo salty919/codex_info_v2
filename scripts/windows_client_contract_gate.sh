@@ -105,6 +105,11 @@ for index in "${!test_targets[@]}"; do
         --logger "trx;LogFilePrefix=${test_log_prefixes[$index]}"
 done
 
+if [[ "$profile" == model-history ]]; then
+    command -v pwsh >/dev/null 2>&1 || fail 'PowerShell is unavailable'
+    pwsh -NoProfile -File windows-client/tools/Run-WindowsClientE2E.ps1 -FixtureContractTest
+fi
+
 python3 - "$results_dir" "$profile" "${expected_methods[@]}" <<'PY'
 from pathlib import Path
 import sys
