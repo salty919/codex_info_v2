@@ -80,7 +80,7 @@
 | U128-16 | PRODUCT | daemon、service | worker fault、`RestartSec=5s`、`StartLimitIntervalSec=0` unit contract | implemented |
 | U128-17 | PRODUCT | installer、launcher | phase別rollback terminal oracle | verified |
 | U128-18 | DATA | daemon、usage store | outage/backfill/zero-new-row fixtures | verified |
-| U128-19 | DATA | usage store、server | gap transition/idempotence/projection tests | verified |
+| U128-19 | DATA | usage store、daemon、server | quota source完結性とSession inventory完結性の分離、gap transition/idempotence/projection tests | implemented |
 | U128-21 | PRODUCT | launcher、daemon/server | desired×actual state matrix | verified |
 | U128-25 | PRODUCT | installer | phaseごとのcrash image recovery | verified |
 | U128-26 | PRODUCT | installer、launcher、daemon | path/mode/symlink matrix | verified |
