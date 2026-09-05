@@ -61,6 +61,8 @@ class SelectedQualityTests(unittest.TestCase):
             (("WINDOWS",), False, (), "history-graph"),
             (("WINDOWS",), True, ("csharp",), "history-graph"),
             (("DOCS", "LINUX_BACKEND", "WINDOWS"), True, ("csharp", "rust"), "history-graph"),
+            (("LINUX_BACKEND",), True, ("rust",), "model-history"),
+            (("WINDOWS",), False, (), "model-history"),
             (("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"), True, ("csharp", "rust"), "model-history"),
         )
         for owners, binary_impact, languages, quality_profile in cases:
@@ -85,10 +87,10 @@ class SelectedQualityTests(unittest.TestCase):
 
     def test_model_history_rejects_unrelated_jobs_and_distribution(self) -> None:
         cases = (
-            (("LINUX_BACKEND", "LINUX_UI", "WINDOWS"), ("csharp", "rust"), False),
+            (("DOCS",), (), False),
+            (("DOCS", "GOVERNANCE", "WINDOWS"), (), False),
             (("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"), ("actions", "csharp", "rust"), False),
             (("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"), ("csharp", "rust"), True),
-            (("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"), (), False),
         )
         for owners, languages, distribution_required in cases:
             with self.subTest(

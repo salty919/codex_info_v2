@@ -103,13 +103,11 @@ def validate(
     if quality_profile == "history-graph" and distribution_required:
         raise QualitySelectionError("history-graph profile must not select distribution")
     if quality_profile == "model-history":
-        if selected != MODEL_HISTORY_OWNERS:
+        if not selected.issubset(MODEL_HISTORY_OWNERS) or not PRODUCT_OWNERS.intersection(
+            selected
+        ):
             raise QualitySelectionError(
-                "model-history profile must select DOCS, LINUX_BACKEND, LINUX_UI, and WINDOWS"
-            )
-        if not binary_impact or set(languages) != {"csharp", "rust"}:
-            raise QualitySelectionError(
-                "model-history profile must describe the Rust and C# binary changes"
+                "model-history profile must select at least one allowed product owner"
             )
         if distribution_required:
             raise QualitySelectionError(

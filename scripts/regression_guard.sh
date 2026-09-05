@@ -91,13 +91,20 @@ case "$1" in
         server_tests=(
             versioned_details_share_one_pair_and_v3_is_domain_shaped
         )
+        store_tests=(
+            three_month_prune_removes_old_sidecars_but_keeps_new_rows_and_row_one
+            pruning_removes_only_old_rows_and_preserves_boundary_across_reset_periods
+        )
         for test_name in "${main_tests[@]}"; do
             run_exact_test --bin=codex_info "tests::$test_name"
         done
         for test_name in "${server_tests[@]}"; do
             run_exact_test --lib "server::tests::$test_name"
         done
-        echo 'regression-guard: PASS check=rust-model-history cases=11'
+        for test_name in "${store_tests[@]}"; do
+            run_exact_test --lib "usage_store::tests::$test_name"
+        done
+        echo 'regression-guard: PASS check=rust-model-history cases=13'
         ;;
     *)
         fail "unknown check: $1"

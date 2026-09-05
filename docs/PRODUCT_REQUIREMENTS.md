@@ -187,9 +187,11 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   startup、CLI、recorder全体、installer、distributionを選択しない。product変更のない`history-graph`宣言は不要な品質要求として
   拒否する。workflow/selector変更は`workflow-selection`で、
   変更workflowの構文、profile selector、rename/copy、main Release非縮小だけを確認し、Release publisher、bundle、installer、
-  product E2Eを起動しない。単なる文書変更はprofileなしの`authority-only`とする。今回のDB/API/model-history/Linux graph/Windows v3+ASTRA経路を含む
-  有限27 pathの差分は`model-history`で分類する。
-  同profileはDOCS、LINUX_BACKEND、LINUX_UI、WINDOWSだけを選び、v3 pair/304、v3 cacheとexact 404 fallback、履歴選択、
+  product E2Eを起動しない。`AGENTS.md`を含む単なるauthority文書変更はprofileなしの`authority-only`とし、実行可能な
+  workflow・selector・検査scriptは同経路へ混在させない。今回のDB/API/model-history/Linux graph/Windows v3+ASTRA経路を含む
+  有限28 pathの実差分は`model-history`で分類する。
+  同profileは実差分に含まれるDOCS、LINUX_BACKEND、LINUX_UI、WINDOWSだけを選び、少なくとも1 product ownerを必須とする。
+  v3 pair/304、v3 cacheとexact 404 fallback、履歴選択、
   legacy known/incomplete、ASTRA pricing/restart、ASTRA-only graphの既存直接testだけを実行し、full suite、installer、distributionを選択しない。
   profile外path、欠落・重複・未知profileは従来どおり拒否する。main向けRelease candidateはfeat profileを
   受け取らず、従来の

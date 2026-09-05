@@ -118,6 +118,25 @@ class SelectionTests(unittest.TestCase):
         self.assertFalse(release_result.distribution_required)
         self.assertEqual(release_result.quality_profile, "release")
 
+    def test_agents_authority_change_needs_no_profile(self) -> None:
+        result = selection_for_paths(["AGENTS.md"])
+        self.assertEqual(result.owners, ("DOCS",))
+        self.assertEqual(result.codeql_languages, ())
+        self.assertFalse(result.binary_impact)
+        self.assertFalse(result.distribution_required)
+        self.assertEqual(result.quality_profile, "authority-only")
+
+    def test_executable_governance_still_requires_workflow_profile(self) -> None:
+        for path in (
+            ".github/workflows/selective-quality.yml",
+            "scripts/ci_change_scope.py",
+            "scripts/regression_guard.sh",
+        ):
+            with self.subTest(path=path), self.assertRaisesRegex(
+                ScopeError, "requires one finite Quality-Profile"
+            ):
+                selection_for_paths([path])
+
     def test_feat_product_change_without_finite_profile_stops(self) -> None:
         with self.assertRaisesRegex(ScopeError, "requires one finite Quality-Profile"):
             selection_for_paths(["src/server.rs"])
@@ -192,6 +211,7 @@ class SelectionTests(unittest.TestCase):
                 "windows-client/src/CodexInfo.WindowsClient/ViewModels/ModelUsageViewModel.cs",
                 "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackBoundaryCoverageTests.cs",
                 "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackStatusClientTests.cs",
+                "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/ContractsTests.cs",
                 "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs",
             ],
             quality_profile="model-history",
@@ -203,6 +223,25 @@ class SelectionTests(unittest.TestCase):
         self.assertTrue(result.binary_impact)
         self.assertFalse(result.distribution_required)
         self.assertEqual(result.quality_profile, "model-history")
+
+    def test_model_history_profile_selects_only_changed_product_owners(self) -> None:
+        rust = selection_for_paths(
+            ["src/usage_store.rs"], quality_profile="model-history"
+        )
+        self.assertEqual(rust.owners, ("LINUX_BACKEND",))
+        self.assertEqual(rust.codeql_languages, ("rust",))
+        self.assertTrue(rust.binary_impact)
+
+        windows_test = selection_for_paths(
+            [
+                "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/ContractsTests.cs"
+            ],
+            quality_profile="model-history",
+        )
+        self.assertEqual(windows_test.owners, ("WINDOWS",))
+        self.assertEqual(windows_test.codeql_languages, ())
+        self.assertFalse(windows_test.binary_impact)
+        self.assertFalse(windows_test.distribution_required)
 
     def test_model_history_profile_has_finite_path_boundaries(self) -> None:
         for paths in (
@@ -430,6 +469,7 @@ class CliTests(unittest.TestCase):
             "windows-client/src/CodexInfo.WindowsClient/ViewModels/ModelUsageViewModel.cs",
             "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackBoundaryCoverageTests.cs",
             "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackStatusClientTests.cs",
+            "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/ContractsTests.cs",
             "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs",
         )
         with tempfile.TemporaryDirectory() as raw_root:

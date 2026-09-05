@@ -49,11 +49,14 @@ if [[ "$profile" == history-graph ]]; then
     test_filters=("$filter")
 elif [[ "$profile" == model-history ]]; then
     core_methods=(
+        CodexInfo.WindowsClient.Core.Tests.ContractsTests.HistorySampleModelsExposeEachProviderValues
         CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsV3IsPreferredAndCarriesAstraHistory
         CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsV3ReusesTheAcceptedGenerationWithAZeroBody304
         CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsFallsBackToV1OnlyWhenV3AndV2ReturnNotFound
     )
     presentation_methods=(
+        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.PlotProjectionDoesNotInventSpendDuringAnUnobservedGap
+        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.PlotProjectionDashesTheLongFirstIntervalAndKeepsLaterEvidenceSolid
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.V3AstraHistoryRendersWithoutLegacyModelRows
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.InferredLinesAreThinnerThanMeasuredModelLines
     )
