@@ -28,7 +28,10 @@ public sealed class GraphPlotControl : AvaPlot
     internal const string IdleBandColorHex = "#3F5D7C";
     internal const double IdleBandOpacity = 0.22;
     internal const float MeasuredModelLineWidth = 3f;
+    internal const float MeasuredFlatModelLineWidth = 1f;
+    internal const float MeasuredRemainingLineWidth = 3f;
     internal const float InferredLineWidth = 1f;
+    internal static ScottPlot.LinePattern InferredLinePattern => ScottPlot.LinePattern.DenselyDashed;
     private static readonly ScottPlot.Color IdleBandColor = new(IdleBandColorHex);
     private static readonly ScottPlot.Color MutedColor = new("#A8B7CA");
     private static readonly ScottPlot.Color GridColor = new("#263548");
@@ -168,7 +171,7 @@ public sealed class GraphPlotControl : AvaPlot
             remainingLines.Solid,
             RemainingColor,
             Plot.Axes.Right,
-            2f);
+            MeasuredRemainingLineWidth);
         remainingDashedSeries = AddLine(
             remainingLines.Dashed,
             RemainingColor.WithOpacity(0.72),
@@ -215,7 +218,7 @@ public sealed class GraphPlotControl : AvaPlot
     {
         var lines = GraphPlotProjection.BuildModelLines(scene, values);
         return new ModelSeriesVisual(
-            AddLine(lines.Flat, color.WithOpacity(0.95), Plot.Axes.Left, MeasuredModelLineWidth),
+            AddLine(lines.Flat, color.WithOpacity(0.95), Plot.Axes.Left, MeasuredFlatModelLineWidth),
             AddLine(lines.Rising, color.WithOpacity(0.95), Plot.Axes.Left, MeasuredModelLineWidth),
             AddLine(lines.Dashed, color.WithOpacity(0.72), Plot.Axes.Left, InferredLineWidth, dashed: true));
     }
@@ -236,7 +239,7 @@ public sealed class GraphPlotControl : AvaPlot
         series.LineWidth = lineWidth;
         if (dashed)
         {
-            series.LinePattern = ScottPlot.LinePattern.Dashed;
+            series.LinePattern = InferredLinePattern;
         }
         series.MarkerSize = 0;
         return series;

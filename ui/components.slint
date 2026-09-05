@@ -1926,9 +1926,9 @@ export component GraphWindow inherits Window {
                 commands: root.luna-flat-path;
                 visible: root.show-luna;
                 stroke: DesignTokens.graph-luna;
-                // These are observed cumulative values, not predictions.
-                // Keep the same solid weight as increasing observations.
-                stroke-width: 3px;
+                // A flat measured total means confirmed non-use. Keep it
+                // thin and solid; only unknown intervals use thin dashes.
+                stroke-width: 1px;
                 fill: transparent;
                 opacity: 0.95;
                 stroke-line-cap: round;
@@ -1946,7 +1946,7 @@ export component GraphWindow inherits Window {
                 commands: root.astra-flat-path;
                 visible: root.show-astra;
                 stroke: DesignTokens.graph-astra;
-                stroke-width: 3px;
+                stroke-width: 1px;
                 fill: transparent;
                 opacity: 0.95;
                 stroke-line-cap: round;
@@ -2000,9 +2000,9 @@ export component GraphWindow inherits Window {
                 commands: root.terra-flat-path;
                 visible: root.show-terra;
                 stroke: DesignTokens.graph-terra;
-                // Exact flat observations use the same evidence style as
-                // exact increases. Only missing intervals are dashed.
-                stroke-width: 3px;
+                // Exact flat observations are confirmed non-use: thin solid.
+                // Only missing intervals are thin and dashed.
+                stroke-width: 1px;
                 fill: transparent;
                 opacity: 0.95;
                 stroke-line-cap: round;
@@ -2038,9 +2038,9 @@ export component GraphWindow inherits Window {
                 commands: root.sol-flat-path;
                 visible: root.show-sol;
                 stroke: DesignTokens.graph-sol;
-                // Exact flat observations use the same evidence style as
-                // exact increases. Only missing intervals are dashed.
-                stroke-width: 3px;
+                // Exact flat observations are confirmed non-use: thin solid.
+                // Only missing intervals are thin and dashed.
+                stroke-width: 1px;
                 fill: transparent;
                 opacity: 0.95;
                 stroke-line-cap: round;
@@ -2105,7 +2105,7 @@ export component GraphWindow inherits Window {
                 commands: root.remaining-path;
                 visible: root.show-remaining;
                 stroke: DesignTokens.graph-remaining;
-                stroke-width: 2px;
+                stroke-width: 3px;
                 fill: transparent;
                 stroke-line-cap: round;
                 stroke-line-join: round;

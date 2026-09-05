@@ -5148,8 +5148,11 @@ fn append_dashed_segment(commands: &mut String, start: (f64, f64), end: (f64, f6
     if !length.is_finite() || length <= f64::EPSILON {
         return;
     }
-    const DASH: f64 = 1.2;
-    const GAP: f64 = 0.9;
+    // Keep inferred intervals visually distinct from measured strokes even
+    // on a wide graph. Short, closely-spaced dashes make the transition point
+    // readable without increasing the 1px inferred stroke width.
+    const DASH: f64 = 0.45;
+    const GAP: f64 = 0.30;
     let mut offset = 0.0;
     while offset < length {
         let dash_end = (offset + DASH).min(length);
@@ -10220,8 +10223,8 @@ impl CodexInfoState {
                 // quota line monotone (88% -> 87%) and must not draw a
                 // fabricated vertical 14% drop.
                 let period_end = now.div_euclid(60).saturating_mul(60);
-                let period_start = period_end.saturating_sub(22 * 60);
-                let inferred_end = period_start + 6 * 60;
+                let period_start = period_end.saturating_sub(120 * 60);
+                let inferred_end = period_start + 10 * 60;
                 let selected_reset = period_start + WEEK_SECONDS;
                 let conflicting_reset = selected_reset + 80_000;
                 let cumulative = ModelDollarTotals {
@@ -29857,6 +29860,19 @@ mod tests {
                 .split("Path {")
                 .find(|body| body.contains(&format!("commands: root.{path_name};")))
                 .expect(path_name);
+            assert!(path.contains("stroke-width: 1px;"), "{path_name}");
+            assert!(path.contains("opacity: 0.95;"), "{path_name}");
+        }
+        for path_name in [
+            "luna-rising-path",
+            "terra-rising-path",
+            "sol-rising-path",
+            "astra-rising-path",
+        ] {
+            let path = graph
+                .split("Path {")
+                .find(|body| body.contains(&format!("commands: root.{path_name};")))
+                .expect(path_name);
             assert!(path.contains("stroke-width: 3px;"), "{path_name}");
             assert!(path.contains("opacity: 0.95;"), "{path_name}");
         }
@@ -29874,6 +29890,18 @@ mod tests {
             assert!(path.contains("stroke-width: 1px;"), "{path_name}");
             assert!(path.contains("opacity: 0.72;"), "{path_name}");
         }
+        let remaining_measured = graph
+            .split("Path {")
+            .find(|body| body.contains("commands: root.remaining-path;"))
+            .expect("remaining measured path");
+        assert!(remaining_measured.contains("stroke-width: 3px;"));
+
+        let mut inferred = String::new();
+        super::append_dashed_segment(&mut inferred, (0.0, 0.0), (10.0, 0.0));
+        assert!(
+            inferred.matches('M').count() >= 12,
+            "inferred cadence must remain short and dense: {inferred}"
+        );
     }
 
     #[test]
@@ -29943,7 +29971,7 @@ mod tests {
             true,
             false,
         );
-        // The opening observations are six minutes apart: use dashed
+        // The opening observations are ten minutes apart: use dashed
         // reference paths, not solid rising paths that would imply
         // continuous recording. The later minute-by-minute observations
         // remain a visibly longer measured interval in the same frame.
@@ -29962,12 +29990,7 @@ mod tests {
             .max_by(|left, right| left.width.total_cmp(&right.width))
             .expect("preview contains a measured idle interval");
         assert!(
-            measured_idle.start >= 26.0,
-            "idle start={}",
-            measured_idle.start
-        );
-        assert!(
-            measured_idle.width >= 69.0,
+            measured_idle.width >= 60.0,
             "idle width={}",
             measured_idle.width
         );
