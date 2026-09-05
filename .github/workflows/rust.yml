@@ -35,7 +35,7 @@ jobs:
         env:
           QUALITY_PROFILE: ${{ inputs.quality_profile }}
         run: |
-          [[ "$QUALITY_PROFILE" == release || "$QUALITY_PROFILE" == history-graph || "$QUALITY_PROFILE" == model-history ]]
+          [[ "$QUALITY_PROFILE" == release || "$QUALITY_PROFILE" == history-graph || "$QUALITY_PROFILE" == model-history || "$QUALITY_PROFILE" == resident-publication ]]
       - name: Install required native quality tools
         if: inputs.quality_profile == 'release'
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
@@ -49,6 +49,9 @@ jobs:
       - name: Run finite model history tests
         if: inputs.quality_profile == 'model-history'
         run: bash scripts/regression_guard.sh --model-history
+      - name: Run finite resident publication tests
+        if: inputs.quality_profile == 'resident-publication'
+        run: bash scripts/regression_guard.sh --resident-publication
       - name: Run native unit tests
         if: inputs.quality_profile == 'release'
         run: cargo test --locked --all-targets -- --nocapture

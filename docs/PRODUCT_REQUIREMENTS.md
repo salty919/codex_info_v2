@@ -193,6 +193,10 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   同profileは実差分に含まれるDOCS、LINUX_BACKEND、LINUX_UI、WINDOWSだけを選び、少なくとも1 product ownerを必須とする。
   v3 pair/304、v3 cacheとexact 404 fallback、履歴選択、
   legacy known/incomplete、ASTRA pricing/restart、ASTRA-only graphの既存直接testだけを実行し、full suite、installer、distributionを選択しない。
+  `REST-172`のresident service publication変更は`resident-publication`で分類し、`docs/PRODUCT_REQUIREMENTS.md`、
+  `docs/REQUIREMENTS_LEDGER.md`、`src/main.rs`だけを所有する。同profileは`src/main.rs`のdaemon/REST責務を
+  DOCSとLINUX_BACKENDへ限定し、不変tick、worker event、local/thread/recorder失敗間隔、incomplete root保持の直接6 caseだけを実行する。
+  Linux UI、Windows、full suite、installer、distribution、Releaseを選択しない。
   profile外path、欠落・重複・未知profileは従来どおり拒否する。main向けRelease candidateはfeat profileを
   受け取らず、従来の
   full owner、distribution、installer、実OS/UI品質を維持する。feat向け`selected-quality`集約と`feat-acceptance`、Windows release

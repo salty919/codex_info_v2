@@ -377,6 +377,11 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             _step(rust_job, name="Run finite history graph tests").get("if"),
             "inputs.quality_profile == 'history-graph'",
         )
+        expect(
+            "rust.resident-publication.if",
+            _step(rust_job, name="Run finite resident publication tests").get("if"),
+            "inputs.quality_profile == 'resident-publication'",
+        )
         for step_name in (
             "Run native unit tests",
             "Build native release",
@@ -685,13 +690,16 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "scripts/cli_contract_e2e.sh",
         "scripts/record_daemon_e2e.sh",
         "xvfb-run --auto-servernum",
+        '"$QUALITY_PROFILE" == resident-publication',
         "bash scripts/regression_guard.sh --history-graph",
+        "bash scripts/regression_guard.sh --resident-publication",
     ):
         if marker not in rust:
             errors.append(f"rust.yml: missing {marker}")
     if "upload-artifact" in rust:
         errors.append("rust.yml: evidence-only artifact remains")
     count("rust.yml", "scripts/regression_guard.sh --history-graph", 1)
+    count("rust.yml", "scripts/regression_guard.sh --resident-publication", 1)
     count("windows-client.yml", "scripts/windows_client_contract_gate.sh --history-graph", 1)
 
     codeql = workflows["codeql.yml"]
@@ -3142,7 +3150,36 @@ def _focused_rust_routing_tests() -> int:
             expected = f"--lib usage_store::tests::{name} count=1"
             if expected not in result.stdout:
                 raise AssertionError(f"Rust model caller omitted the DB test: {name}")
-    return 2
+        result = subprocess.run(
+            (
+                "bash",
+                str(ROOT / "scripts/regression_guard.sh"),
+                "--resident-publication",
+            ),
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                "Rust resident publication caller selected the wrong module: "
+                f"{result.stderr}"
+            )
+        for name in (
+            "unchanged_resident_tick_reuses_snapshot_and_worker_event_publishes_once",
+            "recorder_failure_keeps_interval_retry_when_snapshot_publication_also_fails",
+            "resident_publication_holds_incomplete_usage_and_errors_without_mixing_roots",
+            "resident_recorder_retries_after_interval_without_dropping_pending_batch",
+            "outage_recovery_uses_one_periodic_local_collector_lane",
+            "resident_scheduler_keeps_periodic_thread_reads_single_flight",
+        ):
+            expected = f"--bin=codex_info tests::{name} count=1"
+            if expected not in result.stdout:
+                raise AssertionError(
+                    f"Rust resident publication caller omitted test: {name}"
+                )
+    return 3
 
 
 def _focused_windows_model_routing_test() -> int:
@@ -3379,6 +3416,16 @@ def workflow_selection_self_test() -> int:
             "rust.yml",
             "bash scripts/regression_guard.sh --history-graph",
             "true",
+        ),
+        (
+            "rust.yml",
+            "bash scripts/regression_guard.sh --resident-publication",
+            "true",
+        ),
+        (
+            "rust.yml",
+            ' || "$QUALITY_PROFILE" == resident-publication',
+            "",
         ),
         (
             "windows-client.yml",
