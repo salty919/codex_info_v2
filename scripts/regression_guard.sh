@@ -84,6 +84,9 @@ case "$1" in
             linux_details_v3_uses_conditional_cache_and_legacy_fallback_only_on_404
             service_refresh_preserves_a_bounded_historical_selection
             v3_historical_selection_keeps_astra_without_requiring_legacy_models
+            graph_observed_model_paths_do_not_look_inferred
+            unused_intervals_do_not_call_unobserved_spend_idle
+            graph_collision_preview_matches_the_historical_singleton_oracle
         )
         server_tests=(
             versioned_details_share_one_pair_and_v3_is_domain_shaped
@@ -92,9 +95,9 @@ case "$1" in
             run_exact_test --bin=codex_info "tests::$test_name"
         done
         for test_name in "${server_tests[@]}"; do
-            run_exact_test --bin=codex_info "server::tests::$test_name"
+            run_exact_test --lib "server::tests::$test_name"
         done
-        echo 'regression-guard: PASS check=rust-model-history cases=8'
+        echo 'regression-guard: PASS check=rust-model-history cases=11'
         ;;
     *)
         fail "unknown check: $1"
