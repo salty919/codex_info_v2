@@ -1,5 +1,7 @@
 <!-- codex-info-requirement-owner: PRODUCT -->
 <!-- codex-info-master-ids:
+ASTRA-COST-01
+API-LIFECYCLE-01
 CUM-138-04
 WIN-PARITY-DATA
 WIN-PARITY-STATE
@@ -50,6 +52,9 @@ U128-36
 # Codex Info 製品要件
 
 この文書は製品要件の唯一の入口であり、各契約領域のownerを次表で一意に登録する。
+
+`ASTRA-COST-01`: ASTRAの概算はユーザー指定単価（100万token当たり通常入力$10、cached入力$1、cache write入力$12.50、出力$50）による。入力総数をI、cached入力をC、cache write入力をW、出力をOとして、通常入力はI-C-W、合計は `((I-C-W)*10+C*1+W*12.50+O*50)/1_000_000`。未提供のWや矛盾する内訳を0として確定表示しない。既存3モデルの単価は変更しない。
+`API-LIFECYCLE-01`: canonicalな収集・DB domainはUIの固定field、表示文言、画面構成および特定client versionへ依存させない。public APIは同じcommit済みdomain snapshotから作るversion別read-only adapterとし、client変更でcollectorまたはDB writerを変更しない。新APIはmodelを固定3列でなく有界な配列として公開し、未知モデルのtoken事実と価格未確定を区別する。旧v1/v2は互換期間中だけ同一snapshotのdeprecated projectionとして保持し、旧API削除はadapter・route・client fallbackだけで完結させ、記録、DB schema、常駐監視、安定health endpointを変更しない。Sunset日時は別途明示決定されるまで推測しない。
 一つの外部観測可能な契約IDを複数ownerへ置かず、下流文書、要求台帳、実装、testは登録済みownerの
 契約IDを参照する。監査履歴、作業経過、文書SHA一覧、test名やagent運用は製品要件ではない。
 

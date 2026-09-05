@@ -4,6 +4,9 @@
 
 | ID | owner | 実装範囲 | 直接オラクル | 状態 |
 | --- | --- | --- | --- | --- |
+| RECORDER-MODEL-01 | DATA | `src/main.rs`、`src/usage_store.rs` | 任意model差分/cache write保存、source単位隔離、旧DB保持、restart/range再適用、ASTRAのみbackfillを不完全履歴として保持する直接case | in-progress |
+| ASTRA-COST-01 | PRODUCT | `src/main.rs`、REST/各UIの価格projection | 指定4単価、cache write二重計上なし、未提供/不整合の未確定表示 | in-progress |
+| API-LIFECYCLE-01 | PRODUCT | `src/server.rs`、`docs/REST_API_V1.md`、各client contract adapter | domain snapshotとUI projectionの分離、任意model配列、旧v1/v2 exact互換、安定health、collector/DB非依存 | in-progress |
 | CUM-138-01 | DATA | `src/main.rs`、`src/usage_store.rs` | durable baseline＋2GiB overflow＋verified tail固定caseでbaseline保持とtail 1回加算 | implemented |
 | CUM-138-02 | DATA | `src/main.rs`、`src/usage_store.rs` | 同じrangeのrepeat/restart、変更prefix、stale generation固定caseで非重複・非mutation | implemented |
 | CUM-138-03 | DATA | `src/main.rs`、`src/usage_store.rs` | same-period drift＋checkpoint＋restartとconfirmed rolloverの固定case | implemented |

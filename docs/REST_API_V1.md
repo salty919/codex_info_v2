@@ -5,9 +5,19 @@
 REST-129
 WIN-PARITY-WIRE-01
 WIN-PARITY-PAIR-01
+API-V3-MODELS-01
+API-DEPRECATION-01
 -->
 
 # イントラネット REST API v1
+
+## API世代と廃止境界
+
+`API-V3-MODELS-01`: `/v3/details`はcommit済みdomain snapshotを、有界な`models`配列として返す。model ID、token内訳、価格計算可否を事実として分離し、UI固定列や表示文言をwire fieldにしない。`/health`はAPI世代から独立したread-only readiness endpointとし、collector、DB writer、外部quota取得の生存状態を混同しない。
+
+v3の各履歴rowは`models`と`models_complete`を持つ。`models_complete=true`は同じ観測で全モデル集合を確定できた場合だけ許可し、`model_source=confirmed`と非nullの`models`を必要とする。保持ログからASTRAだけを回収したような部分復旧は`models_complete=false`、`model_source=legacy-unknown`とし、配列にないモデルを0と解釈しない。clientはその区間を確定実線へ接続せず、破線または切断で未確定性を示す。
+
+`API-DEPRECATION-01`: `/v1/details`と`/v2/details`はdeprecated互換adapterである。互換期間中は同じatomic generationから生成し、既存field、値型、header allowlistを変更しない。新clientはv3を優先し、exact 404の場合だけv2、さらにexact 404の場合だけv1へfallbackし、世代をmergeしない。廃止日は未決定であり、決定前に`Sunset`を送らない。将来の削除対象は旧details route、adapter、client fallbackだけで、Session collector、SQLite writer、domain model、`/health`は対象外とする。
 
 ## 目的と境界
 

@@ -126,6 +126,7 @@ CREATE TABLE session_checkpoints (
     previous_cached_input TEXT NOT NULL,
     previous_output TEXT NOT NULL,
     last_task_running INTEGER CHECK (last_task_running IS NULL OR last_task_running IN (0, 1)),
+    previous_cache_write_input TEXT,
     PRIMARY KEY (
         root_identity,
         relative_path,
@@ -172,7 +173,21 @@ CREATE TABLE session_model_totals (
     total_tokens TEXT NOT NULL,
     input_tokens TEXT NOT NULL,
     cached_input_tokens TEXT NOT NULL,
-    output_tokens TEXT NOT NULL
+    output_tokens TEXT NOT NULL,
+    cache_write_input_tokens TEXT
+) WITHOUT ROWID;
+
+CREATE TABLE usage_model_history (
+    reset_at INTEGER NOT NULL CHECK (reset_at > 0),
+    timestamp INTEGER NOT NULL CHECK (timestamp > 0),
+    model TEXT NOT NULL CHECK (length(model) BETWEEN 1 AND 512),
+    total_tokens TEXT NOT NULL,
+    input_tokens TEXT NOT NULL,
+    cached_input_tokens TEXT NOT NULL,
+    output_tokens TEXT NOT NULL,
+    cache_write_input_tokens TEXT,
+    model_set_complete INTEGER NOT NULL CHECK (model_set_complete IN (0, 1)),
+    PRIMARY KEY (reset_at, timestamp, model)
 ) WITHOUT ROWID;
 
 CREATE TABLE history_continuity (
@@ -256,6 +271,8 @@ const HISTORY_TIMESTAMP_RESET_INDEX_COLUMNS: &[&str] = &[
 const DURABLE_STATE_OBSERVATION_MIN_SINGLETON: i64 = 2;
 const MAX_OBSERVATION_JSON_BYTES: usize = 16 * 1024;
 const OBSERVATION_JSON_KIND: &str = "codex-info-usage-observation-v1";
+pub const MAX_SESSION_MODEL_BYTES: usize = 512;
+const ACCOUNT_DB_SCHEMA_VERSION: i64 = 2;
 const OBSERVATION_JSON_KEYS: &[&str] = &[
     "kind",
     "timestamp",
@@ -275,6 +292,10 @@ const MAX_RECORDED_RELATIVE_PATH_BYTES: usize = 4_096;
 /// Persistent retention is independently three calendar months; callers must
 /// never materialize that whole retention window merely to serve one request.
 pub const MAX_RECENT_HISTORY_SAMPLES: usize = 31 * 24 * 60;
+/// Raw storage can legitimately contain bounded reset aliases for one minute.
+/// Public cardinality is still capped after canonicalization; applying that
+/// smaller limit before alias resolution made a valid 46k-row month vanish.
+const MAX_RECENT_HISTORY_SOURCE_ROWS: usize = MAX_RECENT_HISTORY_SAMPLES * 4;
 static BACKUP_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const UPSERT_SAMPLE: &str = r#"
@@ -382,6 +403,11 @@ pub struct UsageHistoryObservation {
     pub terra_tokens: Option<u64>,
     pub luna_tokens: Option<u64>,
     pub model_source: ModelSource,
+    /// Canonical per-model cumulative token facts for extensible consumers.
+    /// Legacy v1 sidecars legitimately deserialize as `None`.
+    pub model_totals: Option<Vec<SessionModelTotal>>,
+    /// False means absent models are unknown, never zero.
+    pub model_totals_complete: bool,
 }
 
 impl UsageHistoryObservation {
@@ -397,7 +423,19 @@ impl UsageHistoryObservation {
             terra_tokens: Some(sample.terra_tokens),
             luna_tokens: Some(sample.luna_tokens),
             model_source: ModelSource::Confirmed,
+            model_totals: None,
+            model_totals_complete: false,
         }
+    }
+
+    pub fn confirmed_with_models(
+        sample: &UsageHistorySample,
+        model_totals: Vec<SessionModelTotal>,
+    ) -> Self {
+        let mut observation = Self::confirmed(sample);
+        observation.model_totals = Some(model_totals);
+        observation.model_totals_complete = true;
+        observation
     }
 
     pub fn unavailable(timestamp: i64, reset_at: i64, remaining_percent: Option<f64>) -> Self {
@@ -412,6 +450,8 @@ impl UsageHistoryObservation {
             terra_tokens: None,
             luna_tokens: None,
             model_source: ModelSource::Unavailable,
+            model_totals: None,
+            model_totals_complete: false,
         }
     }
 
@@ -427,6 +467,8 @@ impl UsageHistoryObservation {
             terra_tokens: Some(sample.terra_tokens),
             luna_tokens: Some(sample.luna_tokens),
             model_source: ModelSource::LegacyUnknown,
+            model_totals: None,
+            model_totals_complete: false,
         }
     }
 
@@ -454,7 +496,7 @@ impl UsageHistoryObservation {
         let any_values = values.iter().any(Option::is_some);
         let any_tokens = tokens.iter().any(Option::is_some);
         match self.model_source {
-            ModelSource::Unavailable if any_values || any_tokens => {
+            ModelSource::Unavailable if any_values || any_tokens || self.model_totals.is_some() => {
                 return Err(UsageStoreError::InvalidImport(
                     "unavailable observation contains model values".into(),
                 ));
@@ -465,6 +507,19 @@ impl UsageHistoryObservation {
                 ));
             }
             _ => {}
+        }
+        if let Some(model_totals) = self.model_totals.as_ref() {
+            let canonical = canonicalize_model_totals(model_totals)?;
+            if canonical != *model_totals {
+                return Err(UsageStoreError::InvalidImport(
+                    "observation model totals are not canonical".into(),
+                ));
+            }
+        }
+        if self.model_totals_complete && self.model_totals.is_none() {
+            return Err(UsageStoreError::InvalidImport(
+                "complete observation model totals are missing".into(),
+            ));
         }
         for (field, value) in [
             ("sol_dollars", self.sol_dollars),
@@ -582,6 +637,7 @@ pub struct SessionCheckpoint {
     pub previous_input: u64,
     pub previous_cached_input: u64,
     pub previous_output: u64,
+    pub previous_cache_write_input: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -605,6 +661,7 @@ pub struct SessionModelTotal {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_write_input_tokens: Option<u64>,
 }
 
 /// Legacy history offset that still needs an exact component baseline.
@@ -1183,8 +1240,14 @@ fn validate_session_checkpoint(checkpoint: &SessionCheckpoint) -> Result<()> {
         || checkpoint
             .last_model
             .as_deref()
-            .is_some_and(|model| !matches!(model, "SOL" | "TERRA" | "LUNA"))
+            .is_some_and(|model| !valid_session_model(model))
         || checkpoint.previous_cached_input > checkpoint.previous_input
+        || checkpoint.previous_cache_write_input.is_some_and(|writes| {
+            checkpoint
+                .previous_cached_input
+                .checked_add(writes)
+                .is_none_or(|cached| cached > checkpoint.previous_input)
+        })
     {
         return Err(UsageStoreError::InvalidImport(
             "session checkpoint is invalid".into(),
@@ -1192,6 +1255,13 @@ fn validate_session_checkpoint(checkpoint: &SessionCheckpoint) -> Result<()> {
     }
     validate_sha256(&checkpoint.prefix_sha256, "session checkpoint prefix")?;
     Ok(())
+}
+
+fn valid_session_model(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= MAX_SESSION_MODEL_BYTES
+        && model.trim() == model
+        && !model.chars().any(char::is_control)
 }
 
 fn validate_session_range(range: &SessionRange) -> Result<()> {
@@ -1213,8 +1283,14 @@ fn validate_session_range(range: &SessionRange) -> Result<()> {
 fn canonicalize_model_totals(totals: &[SessionModelTotal]) -> Result<Vec<SessionModelTotal>> {
     let mut canonical = BTreeMap::new();
     for total in totals {
-        if !matches!(total.model.as_str(), "SOL" | "TERRA" | "LUNA")
+        if !valid_session_model(&total.model)
             || total.cached_input_tokens > total.input_tokens
+            || total.cache_write_input_tokens.is_some_and(|writes| {
+                total
+                    .cached_input_tokens
+                    .checked_add(writes)
+                    .is_none_or(|cached| cached > total.input_tokens)
+            })
         {
             return Err(UsageStoreError::InvalidImport(
                 "session model total is invalid".into(),
@@ -1597,6 +1673,44 @@ fn upsert_observations(
         persisted.insert((selected.reset_at, selected.timestamp), selected);
     }
     Ok(persisted.into_values().collect())
+}
+
+fn upsert_observation_model_totals(
+    transaction: &rusqlite::Transaction<'_>,
+    observations: &[UsageHistoryObservation],
+) -> Result<()> {
+    let mut delete = transaction
+        .prepare("DELETE FROM usage_model_history WHERE reset_at = ?1 AND timestamp = ?2")?;
+    let mut insert = transaction.prepare(
+        "INSERT INTO usage_model_history (
+            reset_at, timestamp, model, total_tokens, input_tokens,
+            cached_input_tokens, output_tokens, cache_write_input_tokens,
+            model_set_complete
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    for observation in observations {
+        let Some(model_totals) = observation.model_totals.as_ref() else {
+            continue;
+        };
+        let model_totals = canonicalize_model_totals(model_totals)?;
+        delete.execute(params![observation.reset_at, observation.timestamp])?;
+        for total in model_totals {
+            insert.execute(params![
+                observation.reset_at,
+                observation.timestamp,
+                &total.model,
+                total.total_tokens.to_string(),
+                total.input_tokens.to_string(),
+                total.cached_input_tokens.to_string(),
+                total.output_tokens.to_string(),
+                total
+                    .cache_write_input_tokens
+                    .map(|value| value.to_string()),
+                i64::from(observation.model_totals_complete),
+            ])?;
+        }
+    }
+    Ok(())
 }
 
 fn numeric_sqlite_value(value: Value) -> Option<f64> {
@@ -2047,6 +2161,8 @@ fn observation_from_sql(
         terra_tokens: optional_u64("terra_tokens")?,
         luna_tokens: optional_u64("luna_tokens")?,
         model_source,
+        model_totals: None,
+        model_totals_complete: false,
     };
     observation.validate()?;
     Ok(observation)
@@ -2173,7 +2289,23 @@ fn validate_partition_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_partition_schema(connection: &Connection) -> Result<()> {
+fn account_db_schema_version(connection: &Connection) -> Result<i64> {
+    let version = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if !(0..=ACCOUNT_DB_SCHEMA_VERSION).contains(&version) {
+        return Err(UsageStoreError::InvalidImport(
+            "account partition schema version is unsupported".into(),
+        ));
+    }
+    Ok(version)
+}
+
+fn stamp_current_account_db_schema(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    transaction.pragma_update(None, "user_version", ACCOUNT_DB_SCHEMA_VERSION)?;
+    Ok(())
+}
+
+fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Result<()> {
+    let allow_unversioned_legacy = schema_version == 0;
     type ColumnContract = (&'static str, &'static str, i64);
     type TableContract = (&'static str, &'static [ColumnContract]);
     const TABLES: &[TableContract] = &[
@@ -2254,6 +2386,7 @@ fn validate_partition_schema(connection: &Connection) -> Result<()> {
                 ("previous_cached_input", "TEXT", 0),
                 ("previous_output", "TEXT", 0),
                 ("last_task_running", "INTEGER", 0),
+                ("previous_cache_write_input", "TEXT", 0),
             ],
         ),
         (
@@ -2279,6 +2412,21 @@ fn validate_partition_schema(connection: &Connection) -> Result<()> {
                 ("input_tokens", "TEXT", 0),
                 ("cached_input_tokens", "TEXT", 0),
                 ("output_tokens", "TEXT", 0),
+                ("cache_write_input_tokens", "TEXT", 0),
+            ],
+        ),
+        (
+            "usage_model_history",
+            &[
+                ("reset_at", "INTEGER", 1),
+                ("timestamp", "INTEGER", 2),
+                ("model", "TEXT", 3),
+                ("total_tokens", "TEXT", 0),
+                ("input_tokens", "TEXT", 0),
+                ("cached_input_tokens", "TEXT", 0),
+                ("output_tokens", "TEXT", 0),
+                ("cache_write_input_tokens", "TEXT", 0),
+                ("model_set_complete", "INTEGER", 0),
             ],
         ),
         (
@@ -2334,14 +2482,22 @@ fn validate_partition_schema(connection: &Connection) -> Result<()> {
         .collect::<BTreeSet<_>>();
     let mut pre_continuity_tables = expected_tables.clone();
     pre_continuity_tables.remove("history_continuity");
-    if actual_tables != expected_tables && actual_tables != pre_continuity_tables {
+    pre_continuity_tables.remove("usage_model_history");
+    let mut pre_model_history_tables = expected_tables.clone();
+    pre_model_history_tables.remove("usage_model_history");
+    if actual_tables != expected_tables
+        && !(allow_unversioned_legacy && actual_tables == pre_continuity_tables)
+        && !(schema_version < 2 && actual_tables == pre_model_history_tables)
+    {
         return Err(UsageStoreError::InvalidImport(
             "account partition table set mismatch".into(),
         ));
     }
 
     for (table, expected) in TABLES {
-        if *table == "history_continuity" && !actual_tables.contains(*table) {
+        if (*table == "history_continuity" || *table == "usage_model_history")
+            && !actual_tables.contains(*table)
+        {
             continue;
         }
         let mut statement = connection.prepare(&format!(
@@ -2363,10 +2519,18 @@ fn validate_partition_schema(connection: &Connection) -> Result<()> {
         let legacy_history_continuity = *table == "history_continuity"
             && actual.len() + 1 == expected.len()
             && actual == expected[..actual.len()];
+        let legacy_cache_write_columns =
+            matches!(*table, "session_checkpoints" | "session_model_totals")
+                && actual.len() + 1 == expected.len()
+                && actual == expected[..actual.len()];
         if actual != expected
-            && !(*table == "recorder_gap_ledger" && actual == legacy_recorder_gap_ledger_columns())
-            && !(*table == "session_checkpoints" && actual == legacy_session_checkpoint_columns())
-            && !legacy_history_continuity
+            && !(allow_unversioned_legacy
+                && ((*table == "recorder_gap_ledger"
+                    && actual == legacy_recorder_gap_ledger_columns())
+                    || (*table == "session_checkpoints"
+                        && actual == legacy_session_checkpoint_columns())
+                    || legacy_history_continuity
+                    || legacy_cache_write_columns))
         {
             return Err(UsageStoreError::InvalidImport(format!(
                 "account partition {table} schema mismatch"
@@ -2459,6 +2623,26 @@ fn ensure_history_continuity_schema(transaction: &rusqlite::Transaction<'_>) -> 
     Ok(())
 }
 
+fn ensure_usage_model_history_schema(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS usage_model_history (
+            reset_at INTEGER NOT NULL CHECK (reset_at > 0),
+            timestamp INTEGER NOT NULL CHECK (timestamp > 0),
+            model TEXT NOT NULL CHECK (length(model) BETWEEN 1 AND 512),
+            total_tokens TEXT NOT NULL,
+            input_tokens TEXT NOT NULL,
+            cached_input_tokens TEXT NOT NULL,
+            output_tokens TEXT NOT NULL,
+            cache_write_input_tokens TEXT,
+            model_set_complete INTEGER NOT NULL CHECK (model_set_complete IN (0, 1)),
+            PRIMARY KEY (reset_at, timestamp, model)
+        ) WITHOUT ROWID;
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Adds the nullable task-state column to an existing account partition.
 /// NULL is intentional: older checkpoints do not carry task lifecycle state.
 fn session_checkpoint_running_column_present(connection: &Connection) -> Result<bool> {
@@ -2479,7 +2663,25 @@ fn ensure_session_checkpoint_schema(transaction: &rusqlite::Transaction<'_>) -> 
             [],
         )?;
     }
+    for (table, column) in [
+        ("session_checkpoints", "previous_cache_write_input"),
+        ("session_model_totals", "cache_write_input_tokens"),
+    ] {
+        if !cache_write_column_present(transaction, table, column)? {
+            transaction.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])?;
+        }
+    }
     Ok(())
+}
+
+fn cache_write_column_present(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+            params![table, column],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
 }
 
 fn legacy_recorder_gap_ledger_columns() -> Vec<(String, String, i64)> {
@@ -2683,7 +2885,8 @@ fn validate_storage_partition_metadata(
     expected: &StoragePartitionIdentity,
 ) -> Result<()> {
     expected.validate()?;
-    validate_partition_schema(connection)?;
+    let schema_version = account_db_schema_version(connection)?;
+    validate_partition_schema(connection, schema_version)?;
     let table_type: Option<String> = connection
         .query_row(
             "SELECT type FROM sqlite_master WHERE name = 'storage_partition'",
@@ -2746,6 +2949,7 @@ fn validate_storage_partition_identity(
     expected: &StoragePartitionIdentity,
 ) -> Result<()> {
     expected.validate()?;
+    account_db_schema_version(connection)?;
     let actual: (i64, String, String, String, String, String) = connection.query_row(
         "SELECT singleton, schema_version, profile_scope_id, account_scope_id,
                 storage_epoch, partition_id FROM storage_partition",
@@ -2893,6 +3097,8 @@ impl UsageStore {
         ensure_recorder_gap_ledger_schema(&transaction)?;
         ensure_session_checkpoint_schema(&transaction)?;
         ensure_history_continuity_schema(&transaction)?;
+        ensure_usage_model_history_schema(&transaction)?;
+        stamp_current_account_db_schema(&transaction)?;
         transaction.execute(
             "INSERT INTO storage_partition (
                 singleton, schema_version, profile_scope_id, account_scope_id,
@@ -2943,6 +3149,8 @@ impl UsageStore {
         ensure_recorder_gap_ledger_schema(&transaction)?;
         ensure_session_checkpoint_schema(&transaction)?;
         ensure_history_continuity_schema(&transaction)?;
+        ensure_usage_model_history_schema(&transaction)?;
+        stamp_current_account_db_schema(&transaction)?;
         validate_storage_partition(&transaction, identity)?;
         transaction.commit()?;
         Ok(store)
@@ -3492,17 +3700,17 @@ impl UsageStore {
         let mut rows = statement.query(params![
             cutoff,
             now_timestamp,
-            MAX_RECENT_HISTORY_SAMPLES as i64 + 1
+            MAX_RECENT_HISTORY_SOURCE_ROWS as i64 + 1
         ])?;
-        let mut samples = Vec::with_capacity(MAX_RECENT_HISTORY_SAMPLES);
+        let mut samples = Vec::with_capacity(MAX_RECENT_HISTORY_SOURCE_ROWS.min(65_536));
         while let Some(row) = rows.next()? {
             if let Some(sample) = valid_sample_from_row(row)? {
                 samples.push(sample);
             }
         }
-        if samples.len() > MAX_RECENT_HISTORY_SAMPLES {
+        if samples.len() > MAX_RECENT_HISTORY_SOURCE_ROWS {
             return Err(UsageStoreError::HistoryCapacityExceeded {
-                maximum: MAX_RECENT_HISTORY_SAMPLES,
+                maximum: MAX_RECENT_HISTORY_SOURCE_ROWS,
             });
         }
         samples.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
@@ -3548,7 +3756,7 @@ impl UsageStore {
             DURABLE_STATE_OBSERVATION_MIN_SINGLETON,
             cutoff,
             now_timestamp,
-            MAX_RECENT_HISTORY_SAMPLES as i64 + 1,
+            MAX_RECENT_HISTORY_SOURCE_ROWS as i64 + 1,
         ])?;
         let mut auxiliary_count = 0usize;
         while let Some(row) = rows.next()? {
@@ -3556,14 +3764,72 @@ impl UsageStore {
             let observation = observation_from_sql(row.get(0)?, row.get(1)?, row.get(2)?)?;
             observations.insert((observation.reset_at, observation.timestamp), observation);
         }
-        if auxiliary_count > MAX_RECENT_HISTORY_SAMPLES {
-            return Err(UsageStoreError::HistoryCapacityExceeded {
-                maximum: MAX_RECENT_HISTORY_SAMPLES,
+        drop(rows);
+        drop(statement);
+        let mut model_rows = BTreeMap::<(i64, i64), (Vec<SessionModelTotal>, bool)>::new();
+        let mut model_statement = self.connection.prepare(
+            "SELECT reset_at, timestamp, model, total_tokens, input_tokens,
+                    cached_input_tokens, output_tokens, cache_write_input_tokens,
+                    model_set_complete
+             FROM usage_model_history
+             WHERE timestamp > ?1 AND timestamp <= ?2
+             ORDER BY reset_at, timestamp, model",
+        )?;
+        let mut rows = model_statement.query(params![cutoff, now_timestamp])?;
+        while let Some(row) = rows.next()? {
+            let reset_at: i64 = row.get(0)?;
+            let timestamp: i64 = row.get(1)?;
+            if !observations.contains_key(&(reset_at, timestamp)) {
+                continue;
+            }
+            let cache_write: Option<String> = row.get(7)?;
+            let complete = match row.get::<_, i64>(8)? {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(UsageStoreError::InvalidImport(
+                        "history model completeness is invalid".into(),
+                    ));
+                }
+            };
+            let entry = model_rows
+                .entry((reset_at, timestamp))
+                .or_insert_with(|| (Vec::new(), complete));
+            if entry.1 != complete {
+                return Err(UsageStoreError::InvalidImport(
+                    "history model completeness is inconsistent".into(),
+                ));
+            }
+            entry.0.push(SessionModelTotal {
+                model: row.get(2)?,
+                total_tokens: canonical_u64_text(&row.get::<_, String>(3)?, "history total")?,
+                input_tokens: canonical_u64_text(&row.get::<_, String>(4)?, "history input")?,
+                cached_input_tokens: canonical_u64_text(
+                    &row.get::<_, String>(5)?,
+                    "history cached input",
+                )?,
+                output_tokens: canonical_u64_text(&row.get::<_, String>(6)?, "history output")?,
+                cache_write_input_tokens: cache_write
+                    .as_deref()
+                    .map(|value| canonical_u64_text(value, "history cache write"))
+                    .transpose()?,
             });
         }
-        if observations.len() > MAX_RECENT_HISTORY_SAMPLES {
+        for (key, (totals, complete)) in model_rows {
+            let canonical = canonicalize_model_totals(&totals)?;
+            if let Some(observation) = observations.get_mut(&key) {
+                observation.model_totals = Some(canonical);
+                observation.model_totals_complete = complete;
+            }
+        }
+        if auxiliary_count > MAX_RECENT_HISTORY_SOURCE_ROWS {
             return Err(UsageStoreError::HistoryCapacityExceeded {
-                maximum: MAX_RECENT_HISTORY_SAMPLES,
+                maximum: MAX_RECENT_HISTORY_SOURCE_ROWS,
+            });
+        }
+        if observations.len() > MAX_RECENT_HISTORY_SOURCE_ROWS {
+            return Err(UsageStoreError::HistoryCapacityExceeded {
+                maximum: MAX_RECENT_HISTORY_SOURCE_ROWS,
             });
         }
         Ok(observations.into_values().collect())
@@ -3904,10 +4170,12 @@ impl UsageStore {
                     committed_offset, discard_until_lf, collector_epoch, cycle_seq,
                     prefix_generation, prefix_sha256, fully_attributed_from_zero,
                     token_baseline_known, last_model, {task_running_column}, previous_total, previous_input,
-                    previous_cached_input, previous_output
+                    previous_cached_input, previous_output, {cache_write_column}
              FROM session_checkpoints
              ORDER BY root_identity, relative_path, file_device, file_inode, prefix_generation"
-        );
+        , cache_write_column = if cache_write_column_present(&transaction, "session_checkpoints", "previous_cache_write_input")? {
+            "previous_cache_write_input"
+        } else { "NULL" });
         let checkpoints = {
             let mut checkpoint_statement = transaction.prepare(&checkpoint_query)?;
             let rows = checkpoint_statement.query_map([], |row| {
@@ -3964,6 +4232,13 @@ impl UsageStore {
                         .get::<_, String>(17)?
                         .parse()
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    previous_cache_write_input: row
+                        .get::<_, Option<String>>(18)?
+                        .map(|text| {
+                            text.parse::<u64>()
+                                .map_err(|_| rusqlite::Error::InvalidQuery)
+                        })
+                        .transpose()?,
                 })
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -3973,13 +4248,29 @@ impl UsageStore {
         }
 
         let model_totals = {
-            let mut totals_statement = transaction.prepare(
-                "SELECT model, total_tokens, input_tokens, cached_input_tokens, output_tokens
-                 FROM session_model_totals ORDER BY model",
-            )?;
+            let write_column = if cache_write_column_present(
+                &transaction,
+                "session_model_totals",
+                "cache_write_input_tokens",
+            )? {
+                "cache_write_input_tokens"
+            } else {
+                "NULL"
+            };
+            let mut totals_statement = transaction.prepare(&format!(
+                "SELECT model, total_tokens, input_tokens, cached_input_tokens, output_tokens, {write_column}
+                 FROM session_model_totals ORDER BY model"
+            ))?;
             let rows = totals_statement.query_map([], |row| {
                 Ok(SessionModelTotal {
                     model: row.get(0)?,
+                    cache_write_input_tokens: row
+                        .get::<_, Option<String>>(5)?
+                        .map(|text| {
+                            text.parse::<u64>()
+                                .map_err(|_| rusqlite::Error::InvalidQuery)
+                        })
+                        .transpose()?,
                     total_tokens: row
                         .get::<_, String>(1)?
                         .parse()
@@ -4605,6 +4896,7 @@ impl UsageStore {
                 // incrementing durable state on an acknowledgement retry.
                 let replay_observations =
                     upsert_observations(&transaction, &canonical_observations)?;
+                upsert_observation_model_totals(&transaction, &replay_observations)?;
                 transaction.commit()?;
                 return Ok(SessionCollectionCommitResult {
                     data_generation: current_data_generation,
@@ -4699,6 +4991,7 @@ impl UsageStore {
 
         upsert_canonical_samples(&transaction, &canonical_samples)?;
         let persisted_observations = upsert_observations(&transaction, &canonical_observations)?;
+        upsert_observation_model_totals(&transaction, &persisted_observations)?;
         {
             let mut statement = transaction.prepare(
                 "INSERT INTO session_ranges (
@@ -4730,10 +5023,10 @@ impl UsageStore {
                     committed_offset, discard_until_lf, collector_epoch, cycle_seq,
                     prefix_generation, prefix_sha256, fully_attributed_from_zero,
                     token_baseline_known, last_model, last_task_running, previous_total, previous_input,
-                    previous_cached_input, previous_output
+                    previous_cached_input, previous_output, previous_cache_write_input
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                    ?14, ?15, ?16, ?17, ?18
+                    ?14, ?15, ?16, ?17, ?18, ?19
                  )
                  ON CONFLICT (
                     root_identity, relative_path, file_device, file_inode, prefix_generation
@@ -4750,7 +5043,8 @@ impl UsageStore {
                     previous_total = excluded.previous_total,
                     previous_input = excluded.previous_input,
                     previous_cached_input = excluded.previous_cached_input,
-                    previous_output = excluded.previous_output",
+                    previous_output = excluded.previous_output,
+                    previous_cache_write_input = excluded.previous_cache_write_input",
             )?;
             for checkpoint in canonical_checkpoints.values() {
                 statement.execute(params![
@@ -4772,6 +5066,9 @@ impl UsageStore {
                     checkpoint.previous_input.to_string(),
                     checkpoint.previous_cached_input.to_string(),
                     checkpoint.previous_output.to_string(),
+                    checkpoint
+                        .previous_cache_write_input
+                        .map(|value| value.to_string()),
                 ])?;
             }
         }
@@ -4779,8 +5076,8 @@ impl UsageStore {
         {
             let mut statement = transaction.prepare(
                 "INSERT INTO session_model_totals (
-                    model, total_tokens, input_tokens, cached_input_tokens, output_tokens
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    model, total_tokens, input_tokens, cached_input_tokens, output_tokens, cache_write_input_tokens
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             for total in &model_totals {
                 statement.execute(params![
@@ -4789,6 +5086,9 @@ impl UsageStore {
                     total.input_tokens.to_string(),
                     total.cached_input_tokens.to_string(),
                     total.output_tokens.to_string(),
+                    total
+                        .cache_write_input_tokens
+                        .map(|value| value.to_string()),
                 ])?;
             }
         }
@@ -4908,7 +5208,7 @@ impl UsageStore {
 
         let current = {
             let mut statement = transaction.prepare(
-                "SELECT model, total_tokens, input_tokens, cached_input_tokens, output_tokens
+                "SELECT model, total_tokens, input_tokens, cached_input_tokens, output_tokens, cache_write_input_tokens
                  FROM session_model_totals ORDER BY model",
             )?;
             let rows = statement.query_map([], |row| {
@@ -4918,6 +5218,13 @@ impl UsageStore {
                 let output_tokens = row.get::<_, String>(4)?;
                 Ok(SessionModelTotal {
                     model: row.get(0)?,
+                    cache_write_input_tokens: row
+                        .get::<_, Option<String>>(5)?
+                        .map(|text| {
+                            text.parse::<u64>()
+                                .map_err(|_| rusqlite::Error::InvalidQuery)
+                        })
+                        .transpose()?,
                     total_tokens: total_tokens
                         .parse::<u64>()
                         .ok()
@@ -4955,7 +5262,18 @@ impl UsageStore {
                     input_tokens: 0,
                     cached_input_tokens: 0,
                     output_tokens: 0,
+                    cache_write_input_tokens: Some(0),
                 });
+            total.cache_write_input_tokens = match (
+                total.cache_write_input_tokens,
+                offset.cache_write_input_tokens,
+            ) {
+                (Some(left), Some(right)) => Some(
+                    left.checked_add(right)
+                        .ok_or(UsageStoreError::GenerationOverflow)?,
+                ),
+                _ => None,
+            };
             total.total_tokens = total
                 .total_tokens
                 .checked_add(offset.total_tokens)
@@ -4978,8 +5296,8 @@ impl UsageStore {
         {
             let mut statement = transaction.prepare(
                 "INSERT INTO session_model_totals (
-                    model, total_tokens, input_tokens, cached_input_tokens, output_tokens
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    model, total_tokens, input_tokens, cached_input_tokens, output_tokens, cache_write_input_tokens
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
             for total in &combined {
                 statement.execute(params![
@@ -4988,6 +5306,9 @@ impl UsageStore {
                     total.input_tokens.to_string(),
                     total.cached_input_tokens.to_string(),
                     total.output_tokens.to_string(),
+                    total
+                        .cache_write_input_tokens
+                        .map(|value| value.to_string()),
                 ])?;
             }
         }
@@ -5202,6 +5523,10 @@ impl UsageStore {
              WHERE singleton >= ?1 AND data_generation < ?2",
             params![DURABLE_STATE_OBSERVATION_MIN_SINGLETON, cutoff],
         )?;
+        transaction.execute(
+            "DELETE FROM usage_model_history WHERE timestamp < ?1",
+            params![cutoff],
+        )?;
         transaction.commit()?;
         Ok(deleted)
     }
@@ -5304,6 +5629,7 @@ mod tests {
 
     fn checkpoint(source: &RecordedSessionSource, offset: u64) -> SessionCheckpoint {
         SessionCheckpoint {
+            previous_cache_write_input: None,
             root_identity: source.root_identity.clone(),
             relative_path: source.relative_path.clone(),
             file_device: source.file_device,
@@ -5326,12 +5652,21 @@ mod tests {
     }
 
     #[test]
-    fn session_checkpoint_schema_migrates_unknown_running_state_and_roundtrips_true() {
+    fn account_schema_v1_migrates_without_loss_and_roundtrips_unknown_models() {
         let path = database_path("partition-session-running-state");
         let identity = partition_identity('d', 18);
         let reset_at = 1_800_604_800;
         let source = recorded_source("2026/09/session-running.jsonl", 30);
         let checkpoint = checkpoint(&source, 10);
+        let legacy_total = SessionModelTotal {
+            cache_write_input_tokens: None,
+            model: "SOL".into(),
+            total_tokens: 20,
+            input_tokens: 12,
+            cached_input_tokens: 2,
+            output_tokens: 8,
+        };
+        let legacy_sample = sample(1_800_000_000, reset_at, Some(70.0), 3.0);
 
         let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
         store
@@ -5340,13 +5675,15 @@ mod tests {
                 window_seconds: 604_800,
                 collector_epoch: checkpoint.collector_epoch,
                 cycle_seq: checkpoint.cycle_seq,
-                samples: &[],
+                samples: std::slice::from_ref(&legacy_sample),
                 checkpoints: std::slice::from_ref(&checkpoint),
                 ranges: &[],
-                model_totals: &[],
+                model_totals: std::slice::from_ref(&legacy_total),
                 recorded_sessions: &[],
             })
             .unwrap();
+        let legacy_history = store.load_all().unwrap();
+        let legacy_state = store.load_session_collection_state().unwrap();
         store
             .connection
             .execute(
@@ -5354,12 +5691,41 @@ mod tests {
                 [],
             )
             .unwrap();
+        store
+            .connection
+            .execute(
+                "ALTER TABLE session_checkpoints DROP COLUMN previous_cache_write_input",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "ALTER TABLE session_model_totals DROP COLUMN cache_write_input_tokens",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute("DROP TABLE usage_model_history", [])
+            .unwrap();
+        store
+            .connection
+            .pragma_update(None, "user_version", 0)
+            .unwrap();
         drop(store);
 
         let legacy_reader = UsageStore::open_read_only_partitioned(&path, &identity).unwrap();
-        let legacy_state = legacy_reader.load_session_collection_state().unwrap();
-        assert_eq!(legacy_state.checkpoints.len(), 1);
-        assert_eq!(legacy_state.checkpoints[0].last_task_running, None);
+        assert_eq!(legacy_reader.load_all().unwrap(), legacy_history);
+        let legacy_read_state = legacy_reader.load_session_collection_state().unwrap();
+        assert_eq!(legacy_read_state, legacy_state);
+        assert_eq!(legacy_read_state.checkpoints.len(), 1);
+        assert_eq!(legacy_read_state.checkpoints[0].last_task_running, None);
+        assert_eq!(
+            legacy_read_state.checkpoints[0].previous_cache_write_input,
+            None
+        );
+        assert_eq!(legacy_read_state.model_totals, [legacy_total.clone()]);
         drop(legacy_reader);
 
         // Retained generations from the previous executable remain valid
@@ -5368,28 +5734,109 @@ mod tests {
 
         let mut migrated = UsageStore::open_partitioned(&path, &identity).unwrap();
         let migrated_state = migrated.load_session_collection_state().unwrap();
+        assert_eq!(migrated.load_all().unwrap(), legacy_history);
+        assert_eq!(migrated_state, legacy_state);
         assert_eq!(migrated_state.checkpoints.len(), 1);
         assert_eq!(migrated_state.checkpoints[0].committed_offset, 10);
         assert_eq!(migrated_state.checkpoints[0].last_task_running, None);
+        assert_eq!(
+            migrated_state.checkpoints[0].previous_cache_write_input,
+            None
+        );
+        assert_eq!(migrated_state.model_totals, [legacy_total]);
 
         let mut running = checkpoint.clone();
+        running.last_model = Some("gpt-7-nova".into());
         running.last_task_running = Some(true);
+        running.previous_cache_write_input = Some(0);
         running.cycle_seq = 2;
+        let astra_total = SessionModelTotal {
+            cache_write_input_tokens: Some(7),
+            model: "ASTRA".into(),
+            total_tokens: 20,
+            input_tokens: 12,
+            cached_input_tokens: 2,
+            output_tokens: 8,
+        };
+        let sol_total = SessionModelTotal {
+            cache_write_input_tokens: Some(0),
+            model: "SOL".into(),
+            total_tokens: 20,
+            input_tokens: 12,
+            cached_input_tokens: 2,
+            output_tokens: 8,
+        };
+        let terra_total = SessionModelTotal {
+            cache_write_input_tokens: None,
+            model: "TERRA".into(),
+            total_tokens: 30,
+            input_tokens: 20,
+            cached_input_tokens: 5,
+            output_tokens: 10,
+        };
+        let future_total = SessionModelTotal {
+            cache_write_input_tokens: Some(3),
+            model: "gpt-7-nova".into(),
+            total_tokens: 15,
+            input_tokens: 10,
+            cached_input_tokens: 2,
+            output_tokens: 5,
+        };
+        let current_totals = [
+            astra_total.clone(),
+            sol_total.clone(),
+            terra_total.clone(),
+            future_total.clone(),
+        ];
+        let model_observation =
+            UsageHistoryObservation::confirmed_with_models(&legacy_sample, current_totals.to_vec());
         migrated
-            .commit_session_collection(SessionCollectionCommit {
-                reset_at,
-                window_seconds: 604_800,
-                collector_epoch: running.collector_epoch,
-                cycle_seq: 2,
-                samples: &[],
-                checkpoints: std::slice::from_ref(&running),
-                ranges: &[],
-                model_totals: &[],
-                recorded_sessions: &[],
-            })
+            .commit_session_collection_with_observations(
+                SessionCollectionCommit {
+                    reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch: running.collector_epoch,
+                    cycle_seq: 2,
+                    samples: &[],
+                    checkpoints: std::slice::from_ref(&running),
+                    ranges: &[],
+                    model_totals: &current_totals,
+                    recorded_sessions: &[],
+                },
+                std::slice::from_ref(&model_observation),
+            )
             .unwrap();
         let roundtripped = migrated.load_session_collection_state().unwrap();
         assert_eq!(roundtripped.checkpoints[0].last_task_running, Some(true));
+        assert_eq!(
+            roundtripped.checkpoints[0].last_model,
+            Some("gpt-7-nova".into())
+        );
+        assert_eq!(
+            roundtripped.checkpoints[0].previous_cache_write_input,
+            Some(0)
+        );
+        assert_eq!(roundtripped.model_totals, current_totals);
+        let observations = migrated
+            .load_recent_observations(Utc.timestamp_opt(1_800_000_060, 0).unwrap())
+            .unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].model_totals.as_deref(),
+            Some(current_totals.as_slice())
+        );
+        let schema_version: i64 = migrated
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema_version, ACCOUNT_DB_SCHEMA_VERSION);
+
+        migrated
+            .connection
+            .pragma_update(None, "user_version", ACCOUNT_DB_SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(migrated);
+        assert!(UsageStore::open_read_only_partitioned(&path, &identity).is_err());
 
         remove_database(&path);
     }
@@ -5880,7 +6327,9 @@ mod tests {
         let reset_at = 1_800_604_800;
         let mut source = recorded_source("2026/09/session.jsonl", 30);
         source.file_bytes = 10;
-        let checkpoint = checkpoint(&source, 10);
+        let mut checkpoint = checkpoint(&source, 10);
+        checkpoint.last_model = Some("ASTRA".into());
+        checkpoint.previous_cache_write_input = Some(0);
         let range = SessionRange {
             root_identity: source.root_identity.clone(),
             relative_path: source.relative_path.clone(),
@@ -5894,6 +6343,24 @@ mod tests {
             record_sha256: "11".repeat(32),
         };
         let committed_sample = sample(1_800_000_000, reset_at, Some(50.0), 3.0);
+        let expected_model_totals = [
+            SessionModelTotal {
+                cache_write_input_tokens: Some(7),
+                model: "ASTRA".into(),
+                total_tokens: 20,
+                input_tokens: 12,
+                cached_input_tokens: 2,
+                output_tokens: 8,
+            },
+            SessionModelTotal {
+                cache_write_input_tokens: None,
+                model: "SOL".into(),
+                total_tokens: 20,
+                input_tokens: 12,
+                cached_input_tokens: 2,
+                output_tokens: 8,
+            },
+        ];
         let committed = store
             .commit_session_collection_with_samples(SessionCollectionCommit {
                 reset_at,
@@ -5903,13 +6370,7 @@ mod tests {
                 samples: std::slice::from_ref(&committed_sample),
                 checkpoints: std::slice::from_ref(&checkpoint),
                 ranges: std::slice::from_ref(&range),
-                model_totals: &[SessionModelTotal {
-                    model: "SOL".into(),
-                    total_tokens: 20,
-                    input_tokens: 12,
-                    cached_input_tokens: 2,
-                    output_tokens: 8,
-                }],
+                model_totals: &expected_model_totals,
                 recorded_sessions: std::slice::from_ref(&source),
             })
             .unwrap();
@@ -5924,13 +6385,7 @@ mod tests {
                 samples: std::slice::from_ref(&committed_sample),
                 checkpoints: std::slice::from_ref(&checkpoint),
                 ranges: std::slice::from_ref(&range),
-                model_totals: &[SessionModelTotal {
-                    model: "SOL".into(),
-                    total_tokens: 20,
-                    input_tokens: 12,
-                    cached_input_tokens: 2,
-                    output_tokens: 8,
-                }],
+                model_totals: &expected_model_totals,
                 recorded_sessions: std::slice::from_ref(&source),
             })
             .unwrap();
@@ -5980,17 +6435,8 @@ mod tests {
             })
         );
         assert_eq!(state.checkpoints, vec![checkpoint]);
-        assert_eq!(
-            state.model_totals,
-            [SessionModelTotal {
-                model: "SOL".into(),
-                total_tokens: 20,
-                input_tokens: 12,
-                cached_input_tokens: 2,
-                output_tokens: 8,
-            }]
-        );
-        assert_eq!(store.load_all().unwrap().len(), 1);
+        assert_eq!(state.model_totals, expected_model_totals);
+        assert_eq!(store.load_all().unwrap(), vec![committed_sample]);
         let range_count: i64 = store
             .connection
             .query_row("SELECT count(*) FROM session_ranges", [], |row| row.get(0))
@@ -6086,6 +6532,7 @@ mod tests {
                 checkpoints: &[checkpoint],
                 ranges: &[range],
                 model_totals: &[SessionModelTotal {
+                    cache_write_input_tokens: None,
                     model: "SOL".into(),
                     total_tokens: 20,
                     input_tokens: 12,
@@ -6396,9 +6843,8 @@ mod tests {
         assert!(p90 <= 100.0, "DB p90 {p90:.3}ms exceeds 100ms");
         assert!(p95 <= 150.0, "DB p95 {p95:.3}ms exceeds 150ms");
 
-        // More than 44,640 rows in the one-month candidate is malformed
-        // cardinality (for example overlapping reset windows), not permission
-        // to silently truncate the response. The retained database is intact.
+        // A second reset alias in one minute is legitimate raw evidence. It is
+        // resolved by the public canonicalizer, not rejected by this reader.
         let before_count: i64 = store
             .connection
             .query_row("SELECT COUNT(*) FROM usage_history", [], |row| row.get(0))
@@ -6422,12 +6868,10 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert!(matches!(
-            store.load_recent_one_month(now),
-            Err(UsageStoreError::HistoryCapacityExceeded {
-                maximum: MAX_RECENT_HISTORY_SAMPLES
-            })
-        ));
+        assert_eq!(
+            store.load_recent_one_month(now).unwrap().len(),
+            MAX_RECENT_HISTORY_SAMPLES + 1
+        );
         let after_count: i64 = store
             .connection
             .query_row("SELECT COUNT(*) FROM usage_history", [], |row| row.get(0))
@@ -8693,6 +9137,7 @@ mod wave_b_correction_tests {
         let reset_at = 1_800_604_800;
         let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
         let current = SessionModelTotal {
+            cache_write_input_tokens: None,
             model: "SOL".into(),
             total_tokens: 100,
             input_tokens: 80,
@@ -8733,6 +9178,7 @@ mod wave_b_correction_tests {
             .unwrap()
             .unwrap();
         let offset = SessionModelTotal {
+            cache_write_input_tokens: None,
             model: "SOL".into(),
             total_tokens: 1_000_000,
             input_tokens: 800_000,
@@ -8777,6 +9223,7 @@ mod wave_b_correction_tests {
         assert_eq!(
             store.load_session_collection_state().unwrap().model_totals,
             vec![SessionModelTotal {
+                cache_write_input_tokens: None,
                 model: "SOL".into(),
                 total_tokens: 1_000_100,
                 input_tokens: 800_080,
@@ -8817,6 +9264,7 @@ mod wave_b_correction_tests {
                     checkpoints: &[],
                     ranges: &[],
                     model_totals: &[SessionModelTotal {
+                        cache_write_input_tokens: None,
                         model: "SOL".into(),
                         total_tokens: 1_000_100,
                         input_tokens: 800_080,
