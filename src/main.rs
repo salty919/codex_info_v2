@@ -10219,7 +10219,10 @@ impl CodexInfoState {
                 // period's 88% observation. The rendered graph must keep the
                 // quota line monotone (88% -> 87%) and must not draw a
                 // fabricated vertical 14% drop.
-                let period_start = now.saturating_sub(4 * 86_400);
+                let period_start = now
+                    .saturating_sub(4 * 86_400)
+                    .div_euclid(60)
+                    .saturating_mul(60);
                 let selected_reset = now + 3 * 86_400;
                 let conflicting_reset = selected_reset + 80_000;
                 let cumulative = ModelDollarTotals {
@@ -10276,13 +10279,29 @@ impl CodexInfoState {
                     .map(|sample| {
                         let model_totals = ["SOL", "TERRA", "LUNA", "ASTRA"]
                             .into_iter()
-                            .map(|model| usage_store::SessionModelTotal {
-                                model: model.to_owned(),
-                                total_tokens: 0,
-                                input_tokens: 0,
-                                cached_input_tokens: 0,
-                                output_tokens: 0,
-                                cache_write_input_tokens: Some(0),
+                            .map(|model| {
+                                // Give ASTRA its own visible series. The first
+                                // half-period increase is intentionally
+                                // unobserved and must be dashed; the later
+                                // equal endpoints are an observed flat line.
+                                let astra_tokens =
+                                    if model == "ASTRA" && sample.reset_at == selected_reset {
+                                        if sample.timestamp == period_start {
+                                            500_000
+                                        } else {
+                                            1_000_000
+                                        }
+                                    } else {
+                                        0
+                                    };
+                                usage_store::SessionModelTotal {
+                                    model: model.to_owned(),
+                                    total_tokens: astra_tokens,
+                                    input_tokens: astra_tokens,
+                                    cached_input_tokens: 0,
+                                    output_tokens: 0,
+                                    cache_write_input_tokens: Some(0),
+                                }
                             })
                             .collect();
                         usage_store::UsageHistoryObservation::confirmed_with_models(
@@ -29917,7 +29936,14 @@ mod tests {
         assert!(payload.iter().all(|sample| sample.reset_at == reset));
         // Check the production source-aware projection as well as quota:
         // endpoint-label pixels alone do not prove any model line exists.
-        let paths = state.graph_paths_for_selection(true, true, true, false);
+        let paths = state.graph_paths_for_selection_at_with_astra(
+            Utc::now().timestamp(),
+            true,
+            true,
+            true,
+            true,
+            false,
+        );
         // The observations are two days apart: use dashed reference paths,
         // not solid rising paths that would imply continuous recording.
         assert!(!paths.sol_flat.is_empty());
@@ -29926,6 +29952,9 @@ mod tests {
         assert!(paths.sol_rising.is_empty());
         assert!(paths.terra_rising.is_empty());
         assert!(paths.luna_rising.is_empty());
+        assert!(!paths.astra_flat.is_empty());
+        assert!(paths.astra_rising.is_empty());
+        assert!(!paths.astra_inferred.is_empty());
         assert_eq!(paths.unused_intervals.len(), 1);
         assert!(paths.unused_intervals[0].start >= 49.0);
         assert!(paths.unused_intervals[0].width >= 49.0);
