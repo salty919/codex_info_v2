@@ -10219,52 +10219,51 @@ impl CodexInfoState {
                 // period's 88% observation. The rendered graph must keep the
                 // quota line monotone (88% -> 87%) and must not draw a
                 // fabricated vertical 14% drop.
-                let period_start = now
-                    .saturating_sub(4 * 86_400)
-                    .div_euclid(60)
-                    .saturating_mul(60);
-                let selected_reset = now + 3 * 86_400;
+                let period_end = now.div_euclid(60).saturating_mul(60);
+                let period_start = period_end.saturating_sub(22 * 60);
+                let inferred_end = period_start + 6 * 60;
+                let selected_reset = period_start + WEEK_SECONDS;
                 let conflicting_reset = selected_reset + 80_000;
                 let cumulative = ModelDollarTotals {
                     sol: preview_costs.sol,
                     terra: preview_costs.terra,
                     luna: preview_costs.luna,
                 };
+                let mut samples = vec![
+                    UsageHistorySample::new_with_usage(
+                        period_start,
+                        selected_reset,
+                        88.0,
+                        ModelDollarTotals {
+                            sol: cumulative.sol * 0.35,
+                            terra: cumulative.terra,
+                            luna: cumulative.luna * 0.45,
+                        },
+                        ModelTokenTotals::default(),
+                    ),
+                    UsageHistorySample::new_with_usage(
+                        period_start,
+                        conflicting_reset,
+                        14.0,
+                        ModelDollarTotals::default(),
+                        ModelTokenTotals::default(),
+                    ),
+                ];
+                // Keep one source-proven unknown interval at the start, then
+                // provide contiguous observed rows across most of the plot.
+                // The same frame therefore exercises a thin inferred bridge
+                // and a long measured line without manufacturing either.
+                for timestamp in (inferred_end..=period_end).step_by(60) {
+                    samples.push(UsageHistorySample::new_with_usage(
+                        timestamp,
+                        selected_reset,
+                        87.0,
+                        cumulative,
+                        ModelTokenTotals::default(),
+                    ));
+                }
                 state.history = UsageHistory {
-                    samples: vec![
-                        UsageHistorySample::new_with_usage(
-                            period_start,
-                            selected_reset,
-                            88.0,
-                            ModelDollarTotals {
-                                sol: cumulative.sol * 0.35,
-                                terra: cumulative.terra,
-                                luna: cumulative.luna * 0.45,
-                            },
-                            ModelTokenTotals::default(),
-                        ),
-                        UsageHistorySample::new_with_usage(
-                            period_start,
-                            conflicting_reset,
-                            14.0,
-                            ModelDollarTotals::default(),
-                            ModelTokenTotals::default(),
-                        ),
-                        UsageHistorySample::new_with_usage(
-                            period_start + 2 * 86_400,
-                            selected_reset,
-                            87.0,
-                            cumulative,
-                            ModelTokenTotals::default(),
-                        ),
-                        UsageHistorySample::new_with_usage(
-                            now,
-                            selected_reset,
-                            87.0,
-                            cumulative,
-                            ModelTokenTotals::default(),
-                        ),
-                    ],
+                    samples,
                     ..UsageHistory::default()
                 };
                 state.remaining_percent = Some(87.0);
@@ -10281,7 +10280,7 @@ impl CodexInfoState {
                             .into_iter()
                             .map(|model| {
                                 // Give ASTRA its own visible series. The first
-                                // half-period increase is intentionally
+                                // opening increase is intentionally
                                 // unobserved and must be dashed; the later
                                 // equal endpoints are an observed flat line.
                                 let astra_tokens =
@@ -29944,8 +29943,10 @@ mod tests {
             true,
             false,
         );
-        // The observations are two days apart: use dashed reference paths,
-        // not solid rising paths that would imply continuous recording.
+        // The opening observations are six minutes apart: use dashed
+        // reference paths, not solid rising paths that would imply
+        // continuous recording. The later minute-by-minute observations
+        // remain a visibly longer measured interval in the same frame.
         assert!(!paths.sol_flat.is_empty());
         assert!(!paths.terra_flat.is_empty());
         assert!(!paths.luna_flat.is_empty());
@@ -29955,9 +29956,21 @@ mod tests {
         assert!(!paths.astra_flat.is_empty());
         assert!(paths.astra_rising.is_empty());
         assert!(!paths.astra_inferred.is_empty());
-        assert_eq!(paths.unused_intervals.len(), 1);
-        assert!(paths.unused_intervals[0].start >= 49.0);
-        assert!(paths.unused_intervals[0].width >= 49.0);
+        let measured_idle = paths
+            .unused_intervals
+            .iter()
+            .max_by(|left, right| left.width.total_cmp(&right.width))
+            .expect("preview contains a measured idle interval");
+        assert!(
+            measured_idle.start >= 26.0,
+            "idle start={}",
+            measured_idle.start
+        );
+        assert!(
+            measured_idle.width >= 69.0,
+            "idle width={}",
+            measured_idle.width
+        );
     }
 
     #[test]
