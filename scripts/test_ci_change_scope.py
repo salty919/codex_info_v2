@@ -213,6 +213,7 @@ class SelectionTests(unittest.TestCase):
                 "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackStatusClientTests.cs",
                 "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/ContractsTests.cs",
                 "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs",
+                "windows-client/tools/Run-WindowsClientE2E.ps1",
             ],
             quality_profile="model-history",
         )
@@ -242,6 +243,15 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(windows_test.codeql_languages, ())
         self.assertFalse(windows_test.binary_impact)
         self.assertFalse(windows_test.distribution_required)
+
+        windows_e2e = selection_for_paths(
+            ["windows-client/tools/Run-WindowsClientE2E.ps1"],
+            quality_profile="model-history",
+        )
+        self.assertEqual(windows_e2e.owners, ("WINDOWS",))
+        self.assertEqual(windows_e2e.codeql_languages, ())
+        self.assertFalse(windows_e2e.binary_impact)
+        self.assertFalse(windows_e2e.distribution_required)
 
     def test_model_history_profile_has_finite_path_boundaries(self) -> None:
         for paths in (

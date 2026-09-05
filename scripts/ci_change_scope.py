@@ -157,6 +157,7 @@ MODEL_HISTORY_PATHS = frozenset(
         "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackStatusClientTests.cs",
         "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/ContractsTests.cs",
         "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs",
+        "windows-client/tools/Run-WindowsClientE2E.ps1",
     }
 )
 PROFILE_PATHS = {
