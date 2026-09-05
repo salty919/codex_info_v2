@@ -200,8 +200,9 @@
 
 グラフの値の意味、期間境界、欠測・未使用区間、残量とモデル使用量の
 独立性は `docs/WINDOWS_UX_SPEC.md` のグラフ意味論を正本とする。X版と
-Windows版の実装は同じ `tests/fixtures/graph_delayed_quota.json` を入力に
-し、fixture内の固定期待値（期間数、累積SOL、遅延して届く残量、未観測区間）
+Windows版の実装は同じ `tests/fixtures/graph_delayed_quota.json` と
+`tests/fixtures/graph_cumulative_correction.json` を入力にし、fixture内の固定期待値
+（期間数、累積SOL、遅延して届く残量、未観測区間、累積値の補正境界、最新endpoint）
 をそれぞれ独立に検証する。片方の描画結果や補間ヘルパーをもう片方の
 期待値生成に使うことは禁止する。仕様・fixture・実装のいずれかが不一致、
 または実機証跡が欠ける場合は合格ではなく保留とする。
@@ -210,6 +211,16 @@ Windows版の実装は同じ `tests/fixtures/graph_delayed_quota.json` を入力
   `graph_delayed_quota`、既存のhistory、rolling、delayed、gap、no-history、REST、Windows回帰を、
   同じproduct revisionに対して有限な既存testへ統合して確認する。別workflow gateや全直積を追加せず、
   どれか未実行・不一致ならそのrevisionを合格にしない。
+- 同一periodの連続するcanonical sampleで、選択metricの累積モデルcomponentが1つでも前sampleを
+  下回った位置は、値そのものから確認できる`observed cumulative correction boundary`とする。
+  これは回収不能欠測を証明する`confirmed gap`ではなく、timestamp間隔やcollector状態を推測して
+  gap ledgerへ昇格させない。X版とWindows版は補正前のsubpathをそこで終了し、補正後sampleから
+  新しいsubpathを開始する。境界を跨いでモデル値・Remainingを接続、補間、過去最大値carryしてはならない。
+  右端ラベルと値は最後のaccepted sampleを使い、期間終端への水平保持は最後のsubpath内だけで行う。
+- `graph_cumulative_correction`の固定oracleは、同一period内の複数補正を経た最新値
+  `SOL $127.284527 / 184314549 tokens / Remaining 62%`と補正開始timestampを検証する。
+  モデル系列の歴史最大値をcurrent endpointへ再利用したり、最大値へ固定した系列を
+  Remainingのactivity判定に使った場合は不合格とする。
 - 自動検査は実行されたtestが0件でないことを確認する。UI変更は実画面、Windows固有動作は実Windowsで確認する。
 - 未確認の外部authority値を創作してPASSにしない。値がない場合のfail-closed動作を検証する。
 
