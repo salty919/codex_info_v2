@@ -10443,7 +10443,8 @@ impl CodexInfoState {
     /// Own every periodic producer request in the resident service. Completed
     /// events are drained before this method runs, so `checking` and
     /// `thread_checking` are the single-flight completion boundaries.
-    fn schedule_resident_refresh(&mut self, now: Instant) {
+    fn schedule_resident_refresh(&mut self, now: Instant) -> bool {
+        let mut publication_changed = false;
         // When no current authenticated quota is available (auth-required or
         // app-server error), keep the persisted period current through the
         // same local collector used by authenticated refreshes. Local
@@ -10458,8 +10459,16 @@ impl CodexInfoState {
                 >= daemon::daemon_interval_from_environment()
         {
             if let Some((reset_at, window_seconds)) = self.recovery_period {
-                if self.request_local_usage(reset_at, window_seconds) {
-                    self.last_local_poll = now;
+                // The attempt itself owns this interval. A synchronous send
+                // or DB failure is published below, then retried on the next
+                // normal collection cycle rather than every one-second owner
+                // probe.
+                self.last_local_poll = now;
+                if !self.request_local_usage(reset_at, window_seconds) {
+                    // A failed DB/worker request can synchronously move the
+                    // public root into an error state without producing an
+                    // asynchronous event.
+                    publication_changed = true;
                 }
             }
         }
@@ -10485,13 +10494,19 @@ impl CodexInfoState {
             };
             self.request_account_refresh(status);
             self.last_poll = now;
+            // The request can synchronously expose initializing/error state.
+            // Successful authenticated refreshes are only scheduled once per
+            // collection interval, so this does not recreate a 1-second
+            // publication loop.
+            publication_changed = true;
         }
         if self.authenticated
             && !self.thread_checking
             && now.duration_since(self.last_thread_poll) >= Duration::from_secs(5)
         {
-            self.request_thread_update();
+            publication_changed |= self.request_thread_update();
         }
+        publication_changed
     }
 
     fn poll_auth_control(&mut self) {
@@ -10832,17 +10847,21 @@ impl CodexInfoState {
         }
     }
 
-    fn request_thread_update(&mut self) {
+    fn request_thread_update(&mut self) -> bool {
         if self.preview || !self.authenticated {
-            return;
+            return false;
         }
         let Some(admission) = self.current_account_admission() else {
-            return;
+            return false;
         };
         self.ensure_thread_bridge();
         let Some(account_partition) = self.account_partition.clone() else {
-            return;
+            return false;
         };
+        // A valid attempt owns the existing five-second thread interval even
+        // when both worker sends fail. The synchronous error is published
+        // once, then retried on that interval instead of every owner tick.
+        self.last_thread_poll = Instant::now();
         let command = ThreadCommand::Read {
             auth_epoch: self.auth_epoch,
             admission,
@@ -10861,12 +10880,13 @@ impl CodexInfoState {
             .is_some_and(|bridge| sent || bridge.send(command.clone()))
         {
             self.thread_checking = true;
-            self.last_thread_poll = Instant::now();
+            false
         } else {
             self.apply_thread_error(
                 self.auth_epoch,
                 "スレッド取得workerへ要求を送信できませんでした。".into(),
             );
+            true
         }
     }
 
@@ -11388,7 +11408,7 @@ impl CodexInfoState {
             || self.thread_bridge.is_none()
         {
             self.ensure_thread_bridge();
-            self.request_thread_update();
+            let _ = self.request_thread_update();
         }
     }
 
@@ -11433,7 +11453,7 @@ impl CodexInfoState {
         if authenticated {
             self.auth_url = None;
             self.ensure_thread_bridge();
-            self.request_thread_update();
+            let _ = self.request_thread_update();
         }
         self.status = if authenticated {
             "認証済みです。利用量を取得しています…"
@@ -11921,12 +11941,14 @@ impl CodexInfoState {
         false
     }
 
-    fn poll(&mut self) {
+    fn poll(&mut self) -> bool {
         if self.preview {
-            return;
+            return false;
         }
+        let mut observed_event = false;
         let mut account_events = Vec::new();
         while let Ok(event) = self.bridge.rx.try_recv() {
+            observed_event = true;
             account_events.push(event);
         }
         if self.apply_account_event_batch(account_events) {
@@ -11941,6 +11963,7 @@ impl CodexInfoState {
         let mut thread_events = Vec::new();
         if let Some(bridge) = self.thread_bridge.as_ref() {
             while let Ok(event) = bridge.rx.try_recv() {
+                observed_event = true;
                 thread_events.push(event);
             }
         }
@@ -11964,6 +11987,7 @@ impl CodexInfoState {
 
         let mut local_events = Vec::new();
         while let Ok(event) = self.local_bridge.rx.try_recv() {
+            observed_event = true;
             local_events.push(event);
         }
         for event in local_events {
@@ -11988,6 +12012,7 @@ impl CodexInfoState {
                 ),
             }
         }
+        observed_event
     }
 
     #[allow(clippy::needless_return)]
@@ -15418,10 +15443,27 @@ enum ResidentServiceCycleError {
 enum ResidentServiceCycleOutcome {
     Published,
     HeldIncomplete,
+    Unchanged,
 }
 
 fn recorder_attempt_due(now: Instant, retry_at: Option<Instant>) -> bool {
     retry_at.is_none_or(|retry_at| now >= retry_at)
+}
+
+fn recorder_retry_deadline_after_attempt(
+    now: Instant,
+    current: Option<Instant>,
+    recorder_attempt: bool,
+    store_failed: bool,
+    retry_interval: Duration,
+) -> Option<Instant> {
+    if !recorder_attempt {
+        current
+    } else if store_failed {
+        Some(now + retry_interval)
+    } else {
+        None
+    }
 }
 
 fn pending_gap_for_shutdown(
@@ -15570,7 +15612,33 @@ where
         PublicDetailsV3,
     ) -> Result<(), codex_info::server::ApiSnapshotError>,
 {
-    state.poll();
+    resident_service_cycle_with_publication_policy_v3(
+        state,
+        publication,
+        recorder_attempt,
+        true,
+        write_and_refresh,
+        publish,
+    )
+}
+
+fn resident_service_cycle_with_publication_policy_v3<W, P>(
+    state: &mut CodexInfoState,
+    publication: &mut ResidentPublicationState,
+    recorder_attempt: bool,
+    force_publication: bool,
+    write_and_refresh: W,
+    publish: P,
+) -> Result<ResidentServiceCycleOutcome, ResidentServiceCycleError>
+where
+    W: FnOnce(&mut CodexInfoState, PendingRecorderBatch) -> Result<(), String>,
+    P: FnOnce(
+        PublicDetails,
+        PublicDetailsV2,
+        PublicDetailsV3,
+    ) -> Result<(), codex_info::server::ApiSnapshotError>,
+{
+    let observed_event = state.poll();
     // Logout/account replacement is the only event that invalidates the old
     // visible root. An incomplete first generation must never inherit a
     // previous identity's data.
@@ -15579,7 +15647,7 @@ where
         publication.last_complete_v2 = None;
         publication.last_complete_v3 = None;
     }
-    state.schedule_resident_refresh(Instant::now());
+    let scheduled_change = state.schedule_resident_refresh(Instant::now());
     let store_error = if recorder_attempt {
         let pending = state.take_pending_recorder_batch();
         match write_and_refresh(state, pending.clone()) {
@@ -15613,6 +15681,14 @@ where
     // matching local usage/history result reaches a terminal state.
     if state.local_usage_pending && state.account_error.is_none() {
         return Ok(ResidentServiceCycleOutcome::HeldIncomplete);
+    }
+    // The one-second owner loop is a liveness probe, not a publication clock.
+    // Rebuilding all three multi-megabyte API generations on an unchanged tick
+    // consumes CPU in proportion to retained history without changing what a
+    // client can observe. Worker events and recorder attempts publish on their
+    // next cycle; a bounded periodic refresh still owns time-based freshness.
+    if !force_publication && !observed_event && !scheduled_change && !recorder_attempt {
+        return Ok(ResidentServiceCycleOutcome::Unchanged);
     }
     let mut candidate = state
         .public_details_candidate()
@@ -15712,6 +15788,8 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
     let runtime_result = runtime.block_on(async {
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let publication_interval = daemon::daemon_interval_from_environment();
+        let mut next_publication_refresh = Instant::now() + publication_interval;
         let shutdown = service_shutdown_signal();
         tokio::pin!(shutdown);
         let mut recorder_retry_at: Option<Instant> = None;
@@ -15731,10 +15809,12 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                     let recorder_attempt = recorder_attempt_due(now, recorder_retry_at)
                         && (recorder_work_pending
                             || desired_partition_id != active_recorder_partition.as_deref());
-                    let result = resident_service_cycle_with_recorder_attempt_v3(
+                    let force_publication = now >= next_publication_refresh;
+                    let result = resident_service_cycle_with_publication_policy_v3(
                         &mut state,
                         &mut publication,
                         recorder_attempt,
+                        force_publication,
                         |state, pending| {
                             let batch_is_empty = pending.is_empty();
                             let PendingRecorderBatch {
@@ -15938,13 +16018,23 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                             publisher.publish_details_v3(candidate, candidate_v2, candidate_v3)
                         },
                     );
+                    let store_failed = state.recorder_store_error;
+                    recorder_retry_at = recorder_retry_deadline_after_attempt(
+                        Instant::now(),
+                        recorder_retry_at,
+                        recorder_attempt,
+                        store_failed,
+                        publication_interval,
+                    );
+                    if recorder_attempt && !store_failed {
+                        if last_recorder_error.take().is_some() {
+                            eprintln!("codex-info: recorder state commit recovered");
+                        }
+                    }
                     match result {
                         Ok(outcome) => {
-                            if recorder_attempt {
-                                recorder_retry_at = None;
-                                if last_recorder_error.take().is_some() {
-                                    eprintln!("codex-info: recorder state commit recovered");
-                                }
+                            if outcome == ResidentServiceCycleOutcome::Published {
+                                next_publication_refresh = Instant::now() + publication_interval;
                             }
                             if outcome == ResidentServiceCycleOutcome::Published
                                 && last_publish_error.take().is_some()
@@ -15953,6 +16043,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                             }
                         }
                         Err(ResidentServiceCycleError::Store(error)) => {
+                            next_publication_refresh = Instant::now() + publication_interval;
                             if last_recorder_error.as_deref() != Some(error.as_str()) {
                                 eprintln!("codex-info: recorder state commit rejected: {error}");
                                 last_recorder_error = Some(error.clone());
@@ -15963,17 +16054,15 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                             // root, then retry once at the normal recorder
                             // interval. Actual thread death is detected by
                             // recorder.probe() on the one-second owner loop.
-                            recorder_retry_at = Some(
-                                Instant::now()
-                                    + daemon::daemon_interval_from_environment(),
-                            );
                         }
                         Err(ResidentServiceCycleError::Candidate(error)) => {
+                            next_publication_refresh = Instant::now() + publication_interval;
                             eprintln!(
                                 "codex-info: REST snapshot canonicalization rejected: {error}"
                             );
                         }
                         Err(ResidentServiceCycleError::Publish(error)) => {
+                            next_publication_refresh = Instant::now() + publication_interval;
                             if last_publish_error != Some(error) {
                                 eprintln!("codex-info: REST snapshot publication rejected: {error}");
                                 last_publish_error = Some(error);
@@ -17504,6 +17593,127 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_resident_tick_reuses_snapshot_and_worker_event_publishes_once() {
+        let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
+        state.service_published_pair = Some(format!("v1:{:032x}{:032x}", 9_u128, 1_u128));
+        let (command_tx, _command_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        state.bridge = super::AppServerBridge {
+            tx: command_tx,
+            rx: event_rx,
+        };
+
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        let publisher = server.publisher();
+        let mut publication = super::ResidentPublicationState::default();
+        let first = super::resident_service_cycle_with_publication_policy_v3(
+            &mut state,
+            &mut publication,
+            false,
+            true,
+            |_, pending| {
+                assert!(pending.is_empty());
+                Ok(())
+            },
+            |v1, v2, v3| publisher.publish_details_v3(v1, v2, v3),
+        )
+        .unwrap();
+        assert_eq!(first, super::ResidentServiceCycleOutcome::Published);
+        let stable_pair = publisher.published_pair();
+
+        let unchanged = super::resident_service_cycle_with_publication_policy_v3(
+            &mut state,
+            &mut publication,
+            false,
+            false,
+            |_, _| panic!("unchanged tick must not invoke the recorder"),
+            |_, _, _| panic!("unchanged tick must not rebuild the API snapshot"),
+        )
+        .unwrap();
+        assert_eq!(unchanged, super::ResidentServiceCycleOutcome::Unchanged);
+        assert_eq!(publisher.published_pair(), stable_pair);
+
+        state.last_poll = Instant::now() - Duration::from_secs(61);
+        state.checking = false;
+        let scheduled = super::resident_service_cycle_with_publication_policy_v3(
+            &mut state,
+            &mut publication,
+            false,
+            false,
+            |_, pending| {
+                assert!(pending.is_empty());
+                Ok(())
+            },
+            |v1, v2, v3| publisher.publish_details_v3(v1, v2, v3),
+        )
+        .unwrap();
+        assert_eq!(scheduled, super::ResidentServiceCycleOutcome::Published);
+        let scheduled_pair = publisher.published_pair();
+        assert_ne!(scheduled_pair, stable_pair);
+
+        event_tx
+            .send(super::Event::Error("external transport unavailable".into()))
+            .unwrap();
+        let changed = super::resident_service_cycle_with_publication_policy_v3(
+            &mut state,
+            &mut publication,
+            false,
+            false,
+            |_, pending| {
+                assert!(pending.is_empty());
+                Ok(())
+            },
+            |v1, v2, v3| publisher.publish_details_v3(v1, v2, v3),
+        )
+        .unwrap();
+        assert_eq!(changed, super::ResidentServiceCycleOutcome::Published);
+        assert_ne!(publisher.published_pair(), scheduled_pair);
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn recorder_failure_keeps_interval_retry_when_snapshot_publication_also_fails() {
+        let mut state = CodexInfoState::preview("normal");
+        state.history.pending_store_samples = vec![state.history.samples[0].to_store()];
+        state.pending_recorder_admission =
+            Some((state.auth_epoch, state.current_account_admission().unwrap()));
+        let mut publication = super::ResidentPublicationState::default();
+        let result = super::resident_service_cycle_with_publication_policy_v3(
+            &mut state,
+            &mut publication,
+            true,
+            false,
+            |_, _| Err("transient store failure".into()),
+            |_, _, _| Err(ApiSnapshotError::Serialization),
+        );
+        assert!(matches!(
+            result,
+            Err(super::ResidentServiceCycleError::Publish(
+                ApiSnapshotError::Serialization
+            ))
+        ));
+        assert!(state.recorder_store_error);
+        assert!(state.has_pending_recorder_batch());
+
+        let now = Instant::now();
+        let retry_interval = Duration::from_secs(60);
+        let retry_at = super::recorder_retry_deadline_after_attempt(
+            now,
+            None,
+            true,
+            state.recorder_store_error,
+            retry_interval,
+        )
+        .expect("failed store has a bounded retry deadline");
+        assert!(!super::recorder_attempt_due(now, Some(retry_at)));
+        assert!(super::recorder_attempt_due(retry_at, Some(retry_at)));
+    }
+
+    #[test]
     fn public_details_materializes_exactly_one_calendar_month() {
         let mut state = CodexInfoState::preview("normal");
         let now = Utc.with_ymd_and_hms(2026, 8, 31, 12, 0, 0).unwrap();
@@ -18204,13 +18414,14 @@ mod tests {
             rx: event_rx,
         };
 
-        state.schedule_resident_refresh(now);
+        let _ = state.schedule_resident_refresh(now);
         assert!(commands.try_recv().is_err());
 
         // Once the current local result reaches a terminal state, the same
         // overdue timer owns exactly one next account request.
         state.local_usage_pending = false;
-        state.schedule_resident_refresh(now);
+        let _ = state.schedule_resident_refresh(now);
+        assert_eq!(state.last_local_poll, now);
         assert!(matches!(
             commands.try_recv(),
             Ok(super::AccountCommand::Read)
@@ -18737,7 +18948,7 @@ mod tests {
             rx: local_rx,
         };
 
-        state.schedule_resident_refresh(now);
+        let _ = state.schedule_resident_refresh(now);
         assert!(matches!(
             local_commands.try_recv(),
             Ok(super::LocalCommand::Collect {
@@ -18748,7 +18959,7 @@ mod tests {
             }) if actual_reset == reset_at
         ));
         assert!(state.local_usage_pending);
-        state.schedule_resident_refresh(now + Duration::from_secs(3_601));
+        let _ = state.schedule_resident_refresh(now + Duration::from_secs(3_601));
         assert!(local_commands.try_recv().is_err());
 
         let recovery_epoch = state.auth_epoch;
@@ -18784,9 +18995,9 @@ mod tests {
         assert_eq!(state.history.pending_store_samples[0].sol_tokens, 12_500);
         assert_eq!(state.remaining_percent, Some(42.0));
 
-        state.schedule_resident_refresh(now + Duration::from_secs(4));
+        let _ = state.schedule_resident_refresh(now + Duration::from_secs(4));
         assert!(local_commands.try_recv().is_err());
-        state.schedule_resident_refresh(now + Duration::from_secs(3_601));
+        let _ = state.schedule_resident_refresh(now + Duration::from_secs(3_601));
         assert!(matches!(
             local_commands.try_recv(),
             Ok(super::LocalCommand::Collect { .. })
@@ -18863,7 +19074,7 @@ mod tests {
             rx: event_rx,
         };
 
-        state.schedule_resident_refresh(now);
+        let _ = state.schedule_resident_refresh(now);
         assert!(matches!(
             commands.try_recv(),
             Ok(super::AccountCommand::Read)
@@ -18871,13 +19082,13 @@ mod tests {
         assert!(state.checking);
 
         // Later ticks cannot enqueue a second read while the first is active.
-        state.schedule_resident_refresh(now + Duration::from_secs(61));
+        let _ = state.schedule_resident_refresh(now + Duration::from_secs(61));
         assert!(commands.try_recv().is_err());
 
         // A failed generation keeps last-good state but releases single-flight.
         // The scheduler retries only at the next established interval.
         state.apply_account_error("transient worker failure".into());
-        state.schedule_resident_refresh(now + Duration::from_secs(61));
+        let _ = state.schedule_resident_refresh(now + Duration::from_secs(61));
         assert!(matches!(
             commands.try_recv(),
             Ok(super::AccountCommand::Read)
@@ -18900,7 +19111,7 @@ mod tests {
             rx: account_rx,
         };
 
-        state.schedule_resident_refresh(now);
+        let _ = state.schedule_resident_refresh(now);
         assert!(matches!(
             account_commands.try_recv(),
             Ok(super::AccountCommand::Read)
@@ -18913,7 +19124,7 @@ mod tests {
             tx: thread_tx,
             rx: thread_rx,
         });
-        state.schedule_resident_refresh(now + Duration::from_secs(61));
+        let _ = state.schedule_resident_refresh(now + Duration::from_secs(61));
         assert!(matches!(
             account_commands.try_recv(),
             Ok(super::AccountCommand::Read)
@@ -18944,14 +19155,15 @@ mod tests {
             rx: thread_rx,
         });
 
-        state.schedule_resident_refresh(now);
+        let _ = state.schedule_resident_refresh(now);
         assert!(matches!(
             thread_commands.try_recv(),
             Ok(super::ThreadCommand::Read { auth_epoch: 0, .. })
         ));
         assert!(state.thread_checking);
+        assert!(state.last_thread_poll >= now);
 
-        state.schedule_resident_refresh(now + Duration::from_secs(6));
+        let _ = state.schedule_resident_refresh(now + Duration::from_secs(6));
         assert!(thread_commands.try_recv().is_err());
     }
 
