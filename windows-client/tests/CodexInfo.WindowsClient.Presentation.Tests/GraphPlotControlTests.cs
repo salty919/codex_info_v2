@@ -377,6 +377,25 @@ public sealed class GraphPlotControlTests
         Assert.Equal([1_060d, 1_120d], sol.Rising.X);
         Assert.Empty(sol.Dashed.X);
         Assert.Empty(scene.IdleIntervals);
+
+        var labels = GraphPlotProjection.BuildEndpointLabels(scene, CultureInfo.InvariantCulture);
+        foreach (var series in new[] { GraphSeries.Remaining, GraphSeries.Sol, GraphSeries.Luna, GraphSeries.Astra })
+            Assert.Contains(labels, label => label.Series == series);
+
+        var control = new GraphPlotControl { Scene = scene };
+        var rendered = control.Plot.GetImage(940, 480);
+        var pixels = rendered.GetArrayRGB();
+        var gutterStart = (int)Math.Ceiling(control.Plot.GetPixel(new ScottPlot.Coordinates(1_120, 0)).X);
+        foreach (var color in new[] { (86, 178, 245), (168, 140, 245), (230, 162, 60), (232, 110, 159) })
+        {
+            var found = false;
+            for (var x = gutterStart + 1; x < pixels.GetLength(1) && !found; x++)
+            for (var y = 0; y < pixels.GetLength(0) && !found; y++)
+                found = Math.Abs(pixels[y, x, 0] - color.Item1) <= 24 &&
+                        Math.Abs(pixels[y, x, 1] - color.Item2) <= 24 &&
+                        Math.Abs(pixels[y, x, 2] - color.Item3) <= 24;
+            Assert.True(found, $"Missing endpoint gutter pixels for {color}; start={gutterStart}, dimensions={pixels.GetLength(0)}x{pixels.GetLength(1)}");
+        }
     }
 
     [Fact]
