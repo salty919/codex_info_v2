@@ -65,6 +65,7 @@ class SelectedQualityTests(unittest.TestCase):
             (("WINDOWS",), False, (), "model-history"),
             (("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"), True, ("csharp", "rust"), "model-history"),
             (("DOCS", "LINUX_BACKEND"), True, ("rust",), "resident-publication"),
+            (("DOCS", "LINUX_BACKEND"), True, ("rust",), "recorder-gap"),
         )
         for owners, binary_impact, languages, quality_profile in cases:
             with self.subTest(
@@ -138,6 +139,38 @@ class SelectedQualityTests(unittest.TestCase):
                         languages=languages,
                         distribution_required=distribution_required,
                         quality_profile="resident-publication",
+                    ),
+                    json.dumps(
+                        successful_results(
+                            owners,
+                            binary_impact=True,
+                            languages=languages,
+                            distribution_required=distribution_required,
+                        )
+                    ),
+                )
+
+    def test_recorder_gap_rejects_unrelated_owners_and_distribution(self) -> None:
+        cases = (
+            (("DOCS",), ("rust",), False),
+            (("LINUX_BACKEND", "LINUX_UI"), ("rust",), False),
+            (("LINUX_BACKEND", "WINDOWS"), ("rust",), False),
+            (("DOCS", "LINUX_BACKEND"), ("actions", "rust"), False),
+            (("DOCS", "LINUX_BACKEND"), ("rust",), True),
+        )
+        for owners, languages, distribution_required in cases:
+            with self.subTest(
+                owners=owners,
+                languages=languages,
+                distribution_required=distribution_required,
+            ), self.assertRaises(QualitySelectionError):
+                validate(
+                    selection(
+                        owners,
+                        binary_impact=True,
+                        languages=languages,
+                        distribution_required=distribution_required,
+                        quality_profile="recorder-gap",
                     ),
                     json.dumps(
                         successful_results(

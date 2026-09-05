@@ -197,6 +197,10 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   `docs/REQUIREMENTS_LEDGER.md`、`src/main.rs`だけを所有する。同profileは`src/main.rs`のdaemon/REST責務を
   DOCSとLINUX_BACKENDへ限定し、不変tick、worker event、local/thread/recorder失敗間隔、incomplete root保持の直接6 caseだけを実行する。
   Linux UI、Windows、full suite、installer、distribution、Releaseを選択しない。
+  `U128-19`のquota gap source分離変更は`recorder-gap`で分類し、`docs/DATA_PROTECTION_POLICY.md`、
+  `docs/PRODUCT_REQUIREMENTS.md`、`docs/REQUIREMENTS_LEDGER.md`、`src/daemon.rs`、`src/main.rs`だけを所有する。
+  同profileはDOCSとLINUX_BACKENDへ限定し、fresh quota observation、outage/stale拒否、exact retry、daemon gap状態の
+  直接4 caseだけを実行する。Session model scan、Linux UI、Windows、full suite、installer、distribution、Releaseを選択しない。
   profile外path、欠落・重複・未知profileは従来どおり拒否する。main向けRelease candidateはfeat profileを
   受け取らず、従来の
   full owner、distribution、installer、実OS/UI品質を維持する。feat向け`selected-quality`集約と`feat-acceptance`、Windows release

@@ -9,7 +9,7 @@ fail() {
     exit 1
 }
 
-[[ $# -eq 1 ]] || fail 'expected exactly one check: --format, --test, --history-graph, --model-history, or --resident-publication'
+[[ $# -eq 1 ]] || fail 'expected exactly one check: --format, --test, --history-graph, --model-history, --recorder-gap, or --resident-publication'
 
 run_exact_test() {
     local target="$1" test_name="$2" output_file
@@ -119,6 +119,19 @@ case "$1" in
             run_exact_test --bin=codex_info "tests::$test_name"
         done
         echo 'regression-guard: PASS check=rust-resident-publication cases=6'
+        ;;
+    --recorder-gap)
+        run_exact_test --bin=codex_info \
+            daemon::tests::recorder_production_source_result_reaches_all_gap_states_without_session_quota_proof
+        main_tests=(
+            local_failure_queues_fresh_quota_as_unavailable_observation
+            local_failure_does_not_queue_quota_for_outage_or_stale_admission
+            local_failure_quota_batch_survives_recorder_retry_exactly_once
+        )
+        for test_name in "${main_tests[@]}"; do
+            run_exact_test --bin=codex_info "tests::$test_name"
+        done
+        echo 'regression-guard: PASS check=rust-recorder-gap cases=4'
         ;;
     *)
         fail "unknown check: $1"

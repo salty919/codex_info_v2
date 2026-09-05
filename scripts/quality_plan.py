@@ -40,6 +40,10 @@ RESIDENT_PUBLICATION_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
     "DOCS": ("requirements-authority",),
     "LINUX_BACKEND": ("requirements-authority", "rust-resident-publication"),
 }
+RECORDER_GAP_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
+    "DOCS": ("requirements-authority",),
+    "LINUX_BACKEND": ("requirements-authority", "rust-recorder-gap"),
+}
 WORKFLOW_SELECTION_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
     "DOCS": ("requirements-authority",),
     "GOVERNANCE": ("requirements-authority", "governance-workflow-selection"),
@@ -50,6 +54,7 @@ ALL_CHECK_IDS = frozenset(
         OWNER_CHECKS,
         HISTORY_GRAPH_OWNER_CHECKS,
         MODEL_HISTORY_OWNER_CHECKS,
+        RECORDER_GAP_OWNER_CHECKS,
         RESIDENT_PUBLICATION_OWNER_CHECKS,
         WORKFLOW_SELECTION_OWNER_CHECKS,
     )
@@ -132,6 +137,7 @@ def plan_for_paths(
     owner_checks = {
         "history-graph": HISTORY_GRAPH_OWNER_CHECKS,
         "model-history": MODEL_HISTORY_OWNER_CHECKS,
+        "recorder-gap": RECORDER_GAP_OWNER_CHECKS,
         "resident-publication": RESIDENT_PUBLICATION_OWNER_CHECKS,
         "workflow-selection": WORKFLOW_SELECTION_OWNER_CHECKS,
     }.get(selection.quality_profile, OWNER_CHECKS)

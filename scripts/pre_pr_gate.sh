@@ -139,6 +139,9 @@ for check in "${checks[@]}"; do
         rust-resident-publication)
             bash scripts/regression_guard.sh --resident-publication
             ;;
+        rust-recorder-gap)
+            bash scripts/regression_guard.sh --recorder-gap
+            ;;
         linux-ui-history-graph)
             cargo build --release --locked
             xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
