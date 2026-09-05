@@ -182,7 +182,11 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   startup、CLI、recorder全体、installer、distributionを選択しない。product変更のない`history-graph`宣言は不要な品質要求として
   拒否する。workflow/selector変更は`workflow-selection`で、
   変更workflowの構文、profile selector、rename/copy、main Release非縮小だけを確認し、Release publisher、bundle、installer、
-  product E2Eを起動しない。単なる文書変更はprofileなしの`authority-only`とする。main向けRelease candidateはfeat profileを
+  product E2Eを起動しない。単なる文書変更はprofileなしの`authority-only`とする。今回のDB/API/model-history/Linux graph/Windows v3+ASTRA経路を含む
+  有限27 pathの差分は`model-history`で分類する。
+  同profileはDOCS、LINUX_BACKEND、LINUX_UI、WINDOWSだけを選び、v3 pair/304、v3 cacheとexact 404 fallback、履歴選択、
+  legacy known/incomplete、ASTRA pricing/restart、ASTRA-only graphの既存直接testだけを実行し、full suite、installer、distributionを選択しない。
+  profile外path、欠落・重複・未知profileは従来どおり拒否する。main向けRelease candidateはfeat profileを
   受け取らず、従来の
   full owner、distribution、installer、実OS/UI品質を維持する。feat向け`selected-quality`集約と`feat-acceptance`、Windows release
   candidateは生成しない。実jobの失敗は赤のまま表示するがmergeを禁止しない。live repository ruleの再監査、

@@ -18,9 +18,18 @@ OWNER_JOBS = {
 }
 LINUX_DISTRIBUTION_JOB = "linux-distribution"
 PRODUCT_OWNERS = frozenset({"LINUX_BACKEND", "LINUX_UI", "WINDOWS"})
+MODEL_HISTORY_OWNERS = frozenset(
+    {"DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"}
+)
 CODEQL_LANGUAGES = frozenset({"actions", "csharp", "python", "rust"})
 QUALITY_PROFILES = frozenset(
-    {"authority-only", "history-graph", "workflow-selection", "release"}
+    {
+        "authority-only",
+        "history-graph",
+        "model-history",
+        "workflow-selection",
+        "release",
+    }
 )
 LANGUAGE_OWNERS = {
     "actions": frozenset({"GOVERNANCE"}),
@@ -93,6 +102,23 @@ def validate(
         raise QualitySelectionError("history-graph profile has no product owner")
     if quality_profile == "history-graph" and distribution_required:
         raise QualitySelectionError("history-graph profile must not select distribution")
+    if quality_profile == "model-history":
+        if selected != MODEL_HISTORY_OWNERS:
+            raise QualitySelectionError(
+                "model-history profile must select DOCS, LINUX_BACKEND, LINUX_UI, and WINDOWS"
+            )
+        if not binary_impact or set(languages) != {"csharp", "rust"}:
+            raise QualitySelectionError(
+                "model-history profile must describe the Rust and C# binary changes"
+            )
+        if distribution_required:
+            raise QualitySelectionError(
+                "model-history profile must not select distribution"
+            )
+        if not set(languages).issubset({"csharp", "rust"}):
+            raise QualitySelectionError(
+                "model-history profile may select only Rust and C# CodeQL"
+            )
     if quality_profile == "workflow-selection":
         if "GOVERNANCE" not in selected or PRODUCT_OWNERS.intersection(selected):
             raise QualitySelectionError(
