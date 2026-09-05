@@ -1572,15 +1572,20 @@ export component GraphWindow inherits Window {
     in-out property <bool> app-maximized: false;
     in-out property <bool> show-tokens: false;
     in-out property <string> remaining-path;
+    in-out property <string> remaining-inferred-path;
     in-out property <[RemainingMarker]> remaining-markers;
     in-out property <string> sol-flat-path;
     in-out property <string> sol-rising-path;
+    in-out property <string> sol-inferred-path;
     in-out property <string> terra-flat-path;
     in-out property <string> terra-rising-path;
+    in-out property <string> terra-inferred-path;
     in-out property <string> luna-flat-path;
     in-out property <string> luna-rising-path;
+    in-out property <string> luna-inferred-path;
     in-out property <string> astra-flat-path;
     in-out property <string> astra-rising-path;
+    in-out property <string> astra-inferred-path;
     in property <[string]> history-period-options;
     in property <bool> open-history-on-start: false;
     in property <int> selected-history-index: 0;
@@ -1879,6 +1884,36 @@ export component GraphWindow inherits Window {
             Text { x: root.current-label-x; y: 28px + root.current-sol-y * (parent.height - 52px) - 8px; width: root.current-label-width; height: 16px; text: root.current-sol-label; visible: root.current-sol-label != "" && root.show-sol; color: DesignTokens.graph-sol; font-size: 10px; font-weight: 700; horizontal-alignment: left; }
             Text { x: root.current-label-x; y: 28px + root.current-astra-y * (parent.height - 52px) - 8px; width: root.current-label-width; height: 16px; text: root.current-astra-label; visible: root.current-astra-label != "" && root.show-astra; color: DesignTokens.graph-astra; font-size: 10px; font-weight: 700; horizontal-alignment: left; }
 
+            // Missing-interval bridges are weaker evidence than measured
+            // samples. Keep them visibly thinner than every observed path.
+            Path {
+                x: root.plot-left; y: 28px; width: root.plot-width; height: parent.height - 52px;
+                viewbox-width: 100; viewbox-height: 100; fit: fill; clip: true;
+                commands: root.luna-inferred-path; visible: root.show-luna;
+                stroke: DesignTokens.graph-luna; stroke-width: 1px; fill: transparent; opacity: 0.72;
+                stroke-line-cap: round; stroke-line-join: round;
+            }
+            Path {
+                x: root.plot-left; y: 28px; width: root.plot-width; height: parent.height - 52px;
+                viewbox-width: 100; viewbox-height: 100; fit: fill; clip: true;
+                commands: root.terra-inferred-path; visible: root.show-terra;
+                stroke: DesignTokens.graph-terra; stroke-width: 1px; fill: transparent; opacity: 0.72;
+                stroke-line-cap: round; stroke-line-join: round;
+            }
+            Path {
+                x: root.plot-left; y: 28px; width: root.plot-width; height: parent.height - 52px;
+                viewbox-width: 100; viewbox-height: 100; fit: fill; clip: true;
+                commands: root.sol-inferred-path; visible: root.show-sol;
+                stroke: DesignTokens.graph-sol; stroke-width: 1px; fill: transparent; opacity: 0.72;
+                stroke-line-cap: round; stroke-line-join: round;
+            }
+            Path {
+                x: root.plot-left; y: 28px; width: root.plot-width; height: parent.height - 52px;
+                viewbox-width: 100; viewbox-height: 100; fit: fill; clip: true;
+                commands: root.astra-inferred-path; visible: root.show-astra;
+                stroke: DesignTokens.graph-astra; stroke-width: 1px; fill: transparent; opacity: 0.72;
+                stroke-line-cap: round; stroke-line-join: round;
+            }
             Path {
                 x: root.plot-left;
                 y: 28px;
@@ -1892,8 +1927,7 @@ export component GraphWindow inherits Window {
                 visible: root.show-luna;
                 stroke: DesignTokens.graph-luna;
                 // These are observed cumulative values, not predictions.
-                // Keep the same solid weight as increasing observations;
-                // inferred gaps are distinguished by path geometry.
+                // Keep the same solid weight as increasing observations.
                 stroke-width: 3px;
                 fill: transparent;
                 opacity: 0.95;
@@ -2027,6 +2061,24 @@ export component GraphWindow inherits Window {
                 stroke-width: 3px;
                 fill: transparent;
                 opacity: 0.95;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+            }
+            Path {
+                x: root.plot-left;
+                y: 28px;
+                width: root.plot-width;
+                height: parent.height - 52px;
+                viewbox-width: 100;
+                viewbox-height: 100;
+                fit: fill;
+                clip: true;
+                commands: root.remaining-inferred-path;
+                visible: root.show-remaining;
+                stroke: DesignTokens.graph-remaining;
+                stroke-width: 1px;
+                fill: transparent;
+                opacity: 0.72;
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }

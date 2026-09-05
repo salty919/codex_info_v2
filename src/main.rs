@@ -666,8 +666,8 @@ const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
 // let row order manufacture a quota drop.
 // A minute bucket is the collector's contiguous observation unit. Beyond this
 // boundary the elapsed interval is not observed, so a cumulative model
-// increase must be shown as an idle horizontal segment followed by a point
-// change, never as an invented diagonal rate.
+// increase must be shown as a thin inferred bridge, never as a measured rate
+// or a confirmed idle interval.
 const MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS: i64 = 60;
 const MOVING_RESET_MIN_HORIZON_SECONDS: i64 = 86_400;
 
@@ -4208,6 +4208,8 @@ fn one_month_before_utc(now: DateTime<Utc>) -> i64 {
 #[derive(Default)]
 struct GraphPaths {
     remaining: String,
+    remaining_solid: String,
+    remaining_inferred: String,
     remaining_markers: Vec<RemainingMarkerPosition>,
     unused_intervals: Vec<UnusedIntervalPosition>,
     sol: String,
@@ -4215,12 +4217,16 @@ struct GraphPaths {
     luna: String,
     sol_flat: String,
     sol_rising: String,
+    sol_inferred: String,
     terra_flat: String,
     terra_rising: String,
+    terra_inferred: String,
     luna_flat: String,
     luna_rising: String,
+    luna_inferred: String,
     astra_flat: String,
     astra_rising: String,
+    astra_inferred: String,
     dollar_labels: [String; 5],
     current_remaining_label: String,
     current_sol_label: String,
@@ -4356,16 +4362,25 @@ fn graph_paths_with_sources(
         period_start,
         period_end,
         confirmed_gaps,
+        None,
     );
+    let (remaining_solid, remaining_inferred) = remaining_paths_with_evidence(
+        &remaining_points,
+        samples,
+        &raw_minute,
+        period_start,
+        period_end,
+        confirmed_gaps,
+    );
+    let remaining_path = [remaining_solid.as_str(), remaining_inferred.as_str()]
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     GraphPaths {
-        remaining: remaining_path_with_evidence(
-            &remaining_points,
-            samples,
-            &raw_minute,
-            period_start,
-            period_end,
-            confirmed_gaps,
-        ),
+        remaining: remaining_path,
+        remaining_solid,
+        remaining_inferred,
         remaining_markers: remaining_marker_positions_on_points(
             &remaining_points,
             period_start,
@@ -4556,7 +4571,7 @@ fn graph_paths_for_selection_with_sources_and_astra(
         .any(|sample| sample.remaining_percent.is_finite() && sample.remaining_percent >= 0.0);
     if has_remaining_observation {
         if let Some(remaining) = remaining_points.last().map(|(_, value)| *value) {
-            paths.remaining = remaining_path_with_evidence(
+            let (solid, inferred) = remaining_paths_with_evidence(
                 &remaining_points,
                 samples,
                 &minute,
@@ -4564,6 +4579,13 @@ fn graph_paths_for_selection_with_sources_and_astra(
                 period_end,
                 confirmed_gaps,
             );
+            paths.remaining = [solid.as_str(), inferred.as_str()]
+                .into_iter()
+                .filter(|path| !path.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            paths.remaining_solid = solid;
+            paths.remaining_inferred = inferred;
             paths.remaining_markers =
                 remaining_marker_positions_on_points(&remaining_points, period_start, period_end);
             paths.current_remaining_label = format_percent(remaining);
@@ -4577,6 +4599,7 @@ fn graph_paths_for_selection_with_sources_and_astra(
         period_start,
         period_end,
         confirmed_gaps,
+        Some((model_timelines, show_tokens)),
     );
     let observed_maximum = samples
         .iter()
@@ -4669,12 +4692,16 @@ fn graph_paths_for_selection_with_sources_and_astra(
     paths.luna.clear();
     paths.sol_flat.clear();
     paths.sol_rising.clear();
+    paths.sol_inferred.clear();
     paths.terra_flat.clear();
     paths.terra_rising.clear();
+    paths.terra_inferred.clear();
     paths.luna_flat.clear();
     paths.luna_rising.clear();
+    paths.luna_inferred.clear();
     paths.astra_flat.clear();
     paths.astra_rising.clear();
+    paths.astra_inferred.clear();
     paths.current_sol_label.clear();
     paths.current_terra_label.clear();
     paths.current_luna_label.clear();
@@ -4700,17 +4727,18 @@ fn graph_paths_for_selection_with_sources_and_astra(
             &model_untrusted("LUNA"),
             false,
         );
-        paths.luna_flat = [flat, inferred]
-            .into_iter()
-            .filter(|path| !path.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        paths.luna_flat = flat;
         paths.luna_rising = rising;
-        paths.luna = [paths.luna_flat.as_str(), paths.luna_rising.as_str()]
-            .into_iter()
-            .filter(|path| !path.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        paths.luna_inferred = inferred;
+        paths.luna = [
+            paths.luna_flat.as_str(),
+            paths.luna_rising.as_str(),
+            paths.luna_inferred.as_str(),
+        ]
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
         if let Some(latest) = latest_value(|point| point.luna) {
             if observed_maximum > 0.0 {
                 paths.current_luna_label = format_metric_value(latest, show_tokens);
@@ -4730,17 +4758,18 @@ fn graph_paths_for_selection_with_sources_and_astra(
             &model_untrusted("TERRA"),
             false,
         );
-        paths.terra_flat = [flat, inferred]
-            .into_iter()
-            .filter(|path| !path.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        paths.terra_flat = flat;
         paths.terra_rising = rising;
-        paths.terra = [paths.terra_flat.as_str(), paths.terra_rising.as_str()]
-            .into_iter()
-            .filter(|path| !path.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        paths.terra_inferred = inferred;
+        paths.terra = [
+            paths.terra_flat.as_str(),
+            paths.terra_rising.as_str(),
+            paths.terra_inferred.as_str(),
+        ]
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
         if let Some(latest) = latest_value(|point| point.terra) {
             if observed_maximum > 0.0 {
                 paths.current_terra_label = format_metric_value(latest, show_tokens);
@@ -4760,17 +4789,18 @@ fn graph_paths_for_selection_with_sources_and_astra(
             &model_untrusted("SOL"),
             false,
         );
-        paths.sol_flat = [flat, inferred]
-            .into_iter()
-            .filter(|path| !path.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        paths.sol_flat = flat;
         paths.sol_rising = rising;
-        paths.sol = [paths.sol_flat.as_str(), paths.sol_rising.as_str()]
-            .into_iter()
-            .filter(|path| !path.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        paths.sol_inferred = inferred;
+        paths.sol = [
+            paths.sol_flat.as_str(),
+            paths.sol_rising.as_str(),
+            paths.sol_inferred.as_str(),
+        ]
+        .into_iter()
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
         if let Some(latest) = latest_value(|point| point.sol) {
             if observed_maximum > 0.0 {
                 paths.current_sol_label = format_metric_value(latest, show_tokens);
@@ -4790,12 +4820,9 @@ fn graph_paths_for_selection_with_sources_and_astra(
             &model_untrusted("ASTRA"),
             false,
         );
-        paths.astra_flat = [flat, inferred]
-            .into_iter()
-            .filter(|path| !path.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        paths.astra_flat = flat;
         paths.astra_rising = rising;
+        paths.astra_inferred = inferred;
         if let Some(latest_astra) = minute
             .iter()
             .rev()
@@ -5342,22 +5369,23 @@ fn split_metric_line_paths_with_evidence(
     (flat, rising, inferred)
 }
 
-/// Return horizontal bands where the model series is idle or unavailable.
-/// An unavailable interval also receives a dashed endpoint bridge; the band
-/// ensures it can never be mistaken for a confirmed flat cumulative value.
+/// Return horizontal bands only where every represented cumulative model
+/// series is confirmed unchanged. Missing and unavailable evidence belongs to
+/// the thin dashed paths and must never be labelled as idle.
 fn unused_interval_positions(
     points: &[HourlyModelSpend],
     period_start: i64,
     period_end: i64,
 ) -> Vec<UnusedIntervalPosition> {
-    unused_interval_positions_with_confirmed_gaps(points, period_start, period_end, &[])
+    unused_interval_positions_with_confirmed_gaps(points, period_start, period_end, &[], None)
 }
 
 fn unused_interval_positions_with_confirmed_gaps(
     points: &[HourlyModelSpend],
     period_start: i64,
     period_end: i64,
-    confirmed_gaps: &[GraphConfirmedGap],
+    _confirmed_gaps: &[GraphConfirmedGap],
+    model_timelines: Option<(&GraphModelTimelines, bool)>,
 ) -> Vec<UnusedIntervalPosition> {
     let span = (period_end - period_start).max(1) as f64;
     let to_x =
@@ -5376,36 +5404,40 @@ fn unused_interval_positions_with_confirmed_gaps(
             continue;
         }
         let unreliable = !model_spend_is_reliable(previous) || !model_spend_is_reliable(current);
-        let unchanged = [
+        let represented_unchanged = [
             (previous.sol, current.sol),
             (previous.terra, current.terra),
             (previous.luna, current.luna),
+            (previous.astra, current.astra),
         ]
         .into_iter()
-        .all(|(before, after)| before.is_finite() && after.is_finite() && before == after)
-            && !unreliable;
-        let synthetic_zero_gap = previous.timestamp == period_start
-            && current.timestamp.saturating_sub(previous.timestamp) > 60
-            && previous.sol == 0.0
-            && previous.terra == 0.0
-            && previous.luna == 0.0
-            && [current.sol, current.terra, current.luna]
-                .into_iter()
-                .any(|value| value.is_finite() && value > 0.0);
-        // A long observation gap ending at a later cumulative value contains
-        // no evidence of when usage occurred. Render the whole unobserved
-        // interval as idle, then let the model line make the vertical change
-        // at the observed endpoint; never leave daytime gaps unmarked.
-        let unobserved_active_gap = current.timestamp.saturating_sub(previous.timestamp)
-            > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS
-            && [
-                (previous.sol, current.sol),
-                (previous.terra, current.terra),
-                (previous.luna, current.luna),
-            ]
-            .into_iter()
-            .any(|(before, after)| after > before);
-        if !unchanged && !synthetic_zero_gap && !unobserved_active_gap && !unreliable {
+        .all(|(before, after)| {
+            (before.is_finite() && after.is_finite() && before == after)
+                || (before < 0.0 && after < 0.0)
+        }) && !unreliable;
+        let generic_unchanged = model_timelines.is_none_or(|(timelines, show_tokens)| {
+            !timelines.is_empty()
+                && timelines.values().all(|timeline| {
+                    let Some(before) = timeline.get(&previous.timestamp) else {
+                        return false;
+                    };
+                    let Some(after) = timeline.get(&current.timestamp) else {
+                        return false;
+                    };
+                    let before = if show_tokens {
+                        before.tokens
+                    } else {
+                        before.dollar
+                    };
+                    let after = if show_tokens {
+                        after.tokens
+                    } else {
+                        after.dollar
+                    };
+                    before.is_finite() && after.is_finite() && before >= 0.0 && before == after
+                })
+        });
+        if !represented_unchanged || !generic_unchanged {
             continue;
         }
         let start = to_x(interval_start);
@@ -5413,7 +5445,7 @@ fn unused_interval_positions_with_confirmed_gaps(
         if end <= start {
             continue;
         }
-        let preserve_boundary = synthetic_zero_gap || unobserved_active_gap || unreliable;
+        let preserve_boundary = false;
         if let Some(last) = intervals.last_mut() {
             let last_end = last.start + last.width;
             if last.preserve_boundary == preserve_boundary
@@ -5427,18 +5459,6 @@ fn unused_interval_positions_with_confirmed_gaps(
             start,
             width: end - start,
             preserve_boundary,
-        });
-    }
-    for gap in confirmed_gaps {
-        let gap_start = gap.start_at.max(period_start);
-        let gap_end = gap.end_at.min(period_end);
-        if gap_end <= gap_start {
-            continue;
-        }
-        intervals.push(UnusedIntervalPosition {
-            start: to_x(gap_start),
-            width: to_x(gap_end) - to_x(gap_start),
-            preserve_boundary: true,
         });
     }
     intervals.sort_by(|left, right| {
@@ -6151,21 +6171,22 @@ fn model_interval_evidence(points: &[HourlyModelSpend], start: i64, end: i64) ->
 /// strokes. A normal open-ended remote gap holds the last measured remaining
 /// value horizontally as an explicitly dashed last-good projection; a
 /// confirmed irrecoverable gap still breaks the path entirely.
-fn remaining_path_with_evidence(
+fn remaining_paths_with_evidence(
     points: &[(i64, f64)],
     samples: &[&UsageHistorySample],
     model_points: &[HourlyModelSpend],
     period_start: i64,
     period_end: i64,
     confirmed_gaps: &[GraphConfirmedGap],
-) -> String {
+) -> (String, String) {
     let span = (period_end - period_start).max(1) as f64;
     let coordinate = |(timestamp, raw): (i64, f64)| {
         let x = ((timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
         let y = (99.0 - raw.clamp(0.0, 100.0) * 0.98).clamp(1.0, 99.0);
         (x, y)
     };
-    let mut commands = String::new();
+    let mut solid_commands = String::new();
+    let mut inferred_commands = String::new();
     for pair in points.windows(2) {
         let [before, after] = pair else {
             continue;
@@ -6186,18 +6207,18 @@ fn remaining_path_with_evidence(
         let start = coordinate(*before);
         let end = coordinate(*after);
         if solid {
-            if !commands.is_empty() {
-                commands.push(' ');
+            if !solid_commands.is_empty() {
+                solid_commands.push(' ');
             }
-            commands.push_str(&format!(
+            solid_commands.push_str(&format!(
                 "M{:.2} {:.2} L{:.2} {:.2}",
                 start.0, start.1, end.0, end.1
             ));
         } else {
-            append_dashed_segment(&mut commands, start, end);
+            append_dashed_segment(&mut inferred_commands, start, end);
         }
     }
-    commands
+    (solid_commands, inferred_commands)
 }
 
 fn remaining_graph_y(remaining: f64) -> f64 {
@@ -12601,16 +12622,29 @@ impl CodexInfoState {
                 end_at: gap.end_at,
             })
             .collect::<Vec<_>>();
-        let model_timelines = ["SOL", "TERRA", "LUNA", "ASTRA"]
+        let mut model_names = ["SOL", "TERRA", "LUNA", "ASTRA"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        for observation in self.history.observations.iter().filter(|observation| {
+            same_reset_period(observation.reset_at, selected_reset)
+                && observation.timestamp >= period_start
+                && observation.timestamp <= period_end
+        }) {
+            if let Some(models) = observation.model_totals.as_ref() {
+                model_names.extend(models.iter().map(|model| model.model.clone()));
+            }
+        }
+        let model_timelines = model_names
             .into_iter()
             .map(|model| {
                 (
-                    model.to_owned(),
+                    model.clone(),
                     self.graph_model_points_for_selection(
                         selected_reset,
                         period_start,
                         period_end,
-                        model,
+                        &model,
                     ),
                 )
             })
@@ -12630,6 +12664,8 @@ impl CodexInfoState {
         );
         if !self.has_quota_percent {
             paths.remaining.clear();
+            paths.remaining_solid.clear();
+            paths.remaining_inferred.clear();
             paths.remaining_markers.clear();
             paths.current_remaining_label.clear();
             paths.current_remaining_y = 0.99;
@@ -12708,7 +12744,8 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     graph.set_time_50_label(time_labels[2].clone().into());
     graph.set_time_75_label(time_labels[3].clone().into());
     graph.set_time_end_label(time_labels[4].clone().into());
-    graph.set_remaining_path(paths.remaining.into());
+    graph.set_remaining_path(paths.remaining_solid.into());
+    graph.set_remaining_inferred_path(paths.remaining_inferred.into());
     graph.set_remaining_markers(slint::ModelRc::new(slint::VecModel::from(
         paths
             .remaining_markers
@@ -12721,12 +12758,16 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     )));
     graph.set_sol_flat_path(paths.sol_flat.into());
     graph.set_sol_rising_path(paths.sol_rising.into());
+    graph.set_sol_inferred_path(paths.sol_inferred.into());
     graph.set_terra_flat_path(paths.terra_flat.into());
     graph.set_terra_rising_path(paths.terra_rising.into());
+    graph.set_terra_inferred_path(paths.terra_inferred.into());
     graph.set_luna_flat_path(paths.luna_flat.into());
     graph.set_luna_rising_path(paths.luna_rising.into());
+    graph.set_luna_inferred_path(paths.luna_inferred.into());
     graph.set_astra_flat_path(paths.astra_flat.into());
     graph.set_astra_rising_path(paths.astra_rising.into());
+    graph.set_astra_inferred_path(paths.astra_inferred.into());
     graph.set_dollar_top_label(paths.dollar_labels[0].clone().into());
     graph.set_dollar_75_label(paths.dollar_labels[1].clone().into());
     graph.set_dollar_50_label(paths.dollar_labels[2].clone().into());
@@ -20133,11 +20174,11 @@ mod tests {
             "known legacy LUNA observations are measured values, not predictions"
         );
         assert!(
-            paths.sol_flat.matches('M').count() > 1,
+            paths.sol_inferred.matches('M').count() > 1,
             "only the unavailable interval is bridged as inferred"
         );
-        assert!(paths.luna_flat.matches('M').count() > 1);
-        assert!(!paths.sol_flat.contains("L100.00"));
+        assert!(paths.luna_inferred.matches('M').count() > 1);
+        assert!(!paths.sol_inferred.contains("L100.00"));
         assert_eq!(paths.current_sol_label, "$3.00");
         assert_eq!(paths.current_luna_label, "$0.80");
         assert!(paths.remaining.matches('M').count() > 3);
@@ -27590,7 +27631,7 @@ mod tests {
 
         let graph = graph_paths_for_selection(&references, 0, 240, false, false, true, false);
         assert_eq!(graph.current_sol_label, "$51.00");
-        assert!(graph.sol_flat.matches('M').count() > 2);
+        assert!(graph.sol_inferred.matches('M').count() > 2);
         assert!(!graph.sol_rising.contains("M41.67"));
     }
 
@@ -27638,7 +27679,7 @@ mod tests {
         // Inferred model recovery and unattributed quota movement are drawn
         // as multiple separated strokes, never a solid flat-then-vertical
         // fiction at the recovery timestamp.
-        assert!(graph.sol_flat.matches('M').count() > 2);
+        assert!(graph.sol_inferred.matches('M').count() > 2);
         assert!(!graph.sol_rising.contains("M60.00"));
         assert!(graph.remaining.matches('M').count() > 5);
         assert!(!graph.remaining.contains("M80.00 4.92 L80.00 19.62"));
@@ -27698,11 +27739,7 @@ mod tests {
         assert!(graph.remaining.contains("M0.00 1.00 L33.33 10.80"));
         assert!(!graph.remaining.contains("M33.33 10.80 L66.67 20.60"));
         assert!(graph.remaining.contains("M66.67 20.60 L100.00 30.40"));
-        assert!(graph.unused_intervals.iter().any(|interval| {
-            interval.preserve_boundary
-                && (interval.start - 33.333_333).abs() < 0.001
-                && (interval.width - 33.333_333).abs() < 0.001
-        }));
+        assert!(graph.unused_intervals.is_empty());
     }
 
     #[test]
@@ -28690,7 +28727,7 @@ mod tests {
         assert!(graph.current_luna_label.is_empty());
         assert!(graph.current_terra_label.is_empty());
         assert!(graph.current_sol_label.is_empty());
-        assert!(graph.sol_flat.matches('M').count() > 2);
+        assert!(graph.sol_inferred.matches('M').count() > 2);
     }
 
     #[test]
@@ -28945,6 +28982,7 @@ mod tests {
         assert!(!paths.sol.is_empty());
         assert!(paths.sol_flat.is_empty());
         assert!(paths.sol_rising.is_empty());
+        assert!(!paths.sol_inferred.is_empty());
     }
 
     #[test]
@@ -29068,12 +29106,12 @@ mod tests {
         let dollars = graph_paths_for_selection(&references, 0, 240, false, false, true, false);
         assert_eq!(dollars.current_sol_label, "$12.00");
         assert!(!dollars.sol_rising.contains("M50.00 99.00"));
-        assert!(dollars.sol_flat.matches('M').count() > 2);
+        assert!(dollars.sol_inferred.matches('M').count() > 2);
 
         let tokens = graph_paths_for_selection(&references, 0, 240, false, false, true, true);
         assert_eq!(tokens.current_sol_label, "120");
         assert!(!tokens.sol_rising.contains("M50.00 99.00"));
-        assert!(tokens.sol_flat.matches('M').count() > 2);
+        assert!(tokens.sol_inferred.matches('M').count() > 2);
     }
 
     #[test]
@@ -29098,7 +29136,7 @@ mod tests {
     }
 
     #[test]
-    fn unused_intervals_mark_idle_segments_and_preserve_first_use_boundary() {
+    fn unused_intervals_mark_only_confirmed_idle_segments() {
         let points = [
             HourlyModelSpend {
                 timestamp: 0,
@@ -29158,23 +29196,75 @@ mod tests {
         ];
         assert_eq!(
             unused_interval_positions(&first_use, 0, 240),
-            vec![
-                UnusedIntervalPosition {
-                    start: 0.0,
-                    width: 75.0,
-                    preserve_boundary: true,
-                },
-                UnusedIntervalPosition {
-                    start: 75.0,
-                    width: 25.0,
-                    preserve_boundary: false,
-                },
-            ]
+            vec![UnusedIntervalPosition {
+                start: 75.0,
+                width: 25.0,
+                preserve_boundary: false,
+            }]
         );
+
+        let astra_activity = [
+            HourlyModelSpend {
+                timestamp: 0,
+                astra: 10.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 60,
+                astra: 11.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 120,
+                astra: 12.0,
+                ..HourlyModelSpend::default()
+            },
+        ];
+        assert!(unused_interval_positions(&astra_activity, 0, 120).is_empty());
+
+        let fixed_models_flat = [
+            HourlyModelSpend {
+                timestamp: 0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 60,
+                ..HourlyModelSpend::default()
+            },
+        ];
+        let additional_model = BTreeMap::from([(
+            "future-model".to_owned(),
+            BTreeMap::from([
+                (
+                    0,
+                    super::GraphModelPoint {
+                        dollar: 1.0,
+                        tokens: 10.0,
+                        reliable: true,
+                    },
+                ),
+                (
+                    60,
+                    super::GraphModelPoint {
+                        dollar: 2.0,
+                        tokens: 20.0,
+                        reliable: true,
+                    },
+                ),
+            ]),
+        )]);
+        assert!(super::unused_interval_positions_with_confirmed_gaps(
+            &fixed_models_flat,
+            0,
+            60,
+            &[],
+            Some((&additional_model, false)),
+        )
+        .is_empty());
     }
 
     #[test]
-    fn unused_intervals_mark_long_gap_before_observed_spend() {
+    fn unused_intervals_do_not_call_unobserved_spend_idle() {
         let points = [
             HourlyModelSpend {
                 timestamp: 0,
@@ -29187,14 +29277,7 @@ mod tests {
                 ..HourlyModelSpend::default()
             },
         ];
-        assert_eq!(
-            unused_interval_positions(&points, 0, 3_600),
-            vec![UnusedIntervalPosition {
-                start: 0.0,
-                width: 100.0,
-                preserve_boundary: true,
-            }]
-        );
+        assert!(unused_interval_positions(&points, 0, 3_600).is_empty());
     }
 
     #[test]
@@ -29862,6 +29945,20 @@ mod tests {
                 .expect(path_name);
             assert!(path.contains("stroke-width: 3px;"), "{path_name}");
             assert!(path.contains("opacity: 0.95;"), "{path_name}");
+        }
+        for path_name in [
+            "remaining-inferred-path",
+            "luna-inferred-path",
+            "terra-inferred-path",
+            "sol-inferred-path",
+            "astra-inferred-path",
+        ] {
+            let path = graph
+                .split("Path {")
+                .find(|body| body.contains(&format!("commands: root.{path_name};")))
+                .expect(path_name);
+            assert!(path.contains("stroke-width: 1px;"), "{path_name}");
+            assert!(path.contains("opacity: 0.72;"), "{path_name}");
         }
     }
 

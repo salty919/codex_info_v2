@@ -308,7 +308,7 @@ public sealed class GraphScene
             observedRemainingValues,
             remainingInterpolated,
             normalizedGaps,
-            BuildIdleIntervals(points, start, end, normalizedGaps),
+            BuildIdleIntervals(points, start, end, modelSeriesValues.Values),
             maximum);
     }
 
@@ -509,7 +509,7 @@ public sealed class GraphScene
         IReadOnlyList<ScenePoint> points,
         long periodStart,
         long periodEnd,
-        IReadOnlyList<GraphConfirmedGap>? confirmedGaps = null)
+        IEnumerable<IReadOnlyList<double>> modelSeries)
     {
         var intervals = new List<GraphIdleInterval>();
         if (periodEnd <= periodStart)
@@ -533,23 +533,15 @@ public sealed class GraphScene
                 continue;
             }
 
-            var syntheticGap = IsSyntheticRemainingGap(points, index, periodStart);
-            var unobservedGap = after.Timestamp - before.Timestamp > 60;
-            var modelChanged = !ModelsEqual(before, after);
-            var unavailableGap = !before.DataAvailable || !after.DataAvailable;
-            if (modelChanged && !syntheticGap && !unobservedGap && !unavailableGap)
+            if (!ModelsEqualAt(modelSeries, index - 1, index))
             {
                 continue;
             }
 
-            // A long interval between observations is not evidence of a
-            // continuous spend rate.  The native graph marks that interval
-            // as unused/unobserved and draws any cumulative increase at the
-            // observed endpoint.  Preserve the boundary so the remaining
-            // line does not turn the unknown interval into a diagonal.
-            var preserveBoundary = syntheticGap ||
-                unavailableGap ||
-                (unobservedGap && modelChanged);
+            // This background has one meaning: every measured cumulative
+            // model value stayed unchanged. Missing evidence and recorder
+            // gaps are rendered by thin dashed paths, never as idle bands.
+            const bool preserveBoundary = false;
 
             if (intervals.Count > 0)
             {
@@ -562,21 +554,6 @@ public sealed class GraphScene
             }
 
             intervals.Add(new GraphIdleInterval(intervalStart, intervalEnd, preserveBoundary));
-        }
-
-        if (confirmedGaps is null)
-        {
-            return intervals;
-        }
-
-        foreach (var gap in confirmedGaps)
-        {
-            var start = Math.Max(periodStart, gap.StartAt);
-            var end = Math.Min(periodEnd, gap.EndAt);
-            if (end > start)
-            {
-                intervals.Add(new GraphIdleInterval(start, end, true));
-            }
         }
 
         return intervals
@@ -692,10 +669,27 @@ public sealed class GraphScene
         (after.Sol > before.Sol || after.Terra > before.Terra || after.Luna > before.Luna ||
          after.Astra > before.Astra);
 
-    private static bool ModelsEqual(ScenePoint before, ScenePoint after) =>
-        before.DataAvailable && after.DataAvailable &&
-        before.Sol == after.Sol && before.Terra == after.Terra && before.Luna == after.Luna &&
-        before.Astra == after.Astra;
+    private static bool ModelsEqualAt(
+        IEnumerable<IReadOnlyList<double>> modelSeries,
+        int beforeIndex,
+        int afterIndex)
+    {
+        var anyModel = false;
+        foreach (var values in modelSeries)
+        {
+            if (beforeIndex >= values.Count || afterIndex >= values.Count ||
+                !double.IsFinite(values[beforeIndex]) || !double.IsFinite(values[afterIndex]))
+            {
+                return false;
+            }
+            anyModel = true;
+            if (values[beforeIndex] != values[afterIndex])
+            {
+                return false;
+            }
+        }
+        return anyModel;
+    }
 
     internal readonly record struct ScenePoint(
         long Timestamp,

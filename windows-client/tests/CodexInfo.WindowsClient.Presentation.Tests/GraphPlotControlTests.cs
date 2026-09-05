@@ -566,8 +566,7 @@ public sealed class GraphPlotControlTests
         Assert.Empty(model.Dashed.X);
         Assert.Equal([1_000d, 1_060d], remaining.Solid.X);
         Assert.Empty(remaining.Dashed.X);
-        Assert.Contains(scene.IdleIntervals, interval =>
-            interval.PreserveBoundary && interval.StartAt == 1_060 && interval.EndAt == 1_120);
+        Assert.Empty(scene.IdleIntervals);
     }
 
     [Fact]
@@ -608,10 +607,7 @@ public sealed class GraphPlotControlTests
         Assert.Equal([0d, 1d, 2d], model.Rising.Y);
         Assert.Equal([1_000d, 1_120d, 1_120d, 1_180d], remaining.X);
         Assert.Equal([100d, 100d, 90d, 80d], remaining.Y);
-        Assert.Equal((1_000L, 1_120L, true),
-            (Assert.Single(scene.IdleIntervals).StartAt,
-             scene.IdleIntervals[0].EndAt,
-             scene.IdleIntervals[0].PreserveBoundary));
+        Assert.Empty(scene.IdleIntervals);
         Assert.DoesNotContain(
             model.Rising.X.Zip(model.Rising.X.Skip(1))
                 .Zip(model.Rising.Y.Zip(model.Rising.Y.Skip(1))),
@@ -651,7 +647,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void PlotProjectionDropsSubpixelIdleBandsButKeepsMeaningfulAndBoundaryBands()
+    public void PlotProjectionKeepsOnlyMeasuredIdleBands()
     {
         var scene = Scene(
             [
@@ -665,10 +661,8 @@ public sealed class GraphPlotControlTests
 
         var visible = GraphPlotProjection.BuildVisibleIdleIntervals(scene);
 
-        Assert.Equal(2, visible.Count);
-        Assert.Equal((1_060L, 2_000L), (visible[0].StartAt, visible[0].EndAt));
-        Assert.True(visible[0].PreserveBoundary);
-        Assert.Equal((2_000L, 7_000L), (visible[1].StartAt, visible[1].EndAt));
+        var idle = Assert.Single(visible);
+        Assert.Equal((2_000L, 7_000L, false), (idle.StartAt, idle.EndAt, idle.PreserveBoundary));
 
         var boundaryScene = Scene(
             [
@@ -677,8 +671,7 @@ public sealed class GraphPlotControlTests
             ],
             1_000,
             87_400);
-        var boundary = Assert.Single(GraphPlotProjection.BuildVisibleIdleIntervals(boundaryScene));
-        Assert.Equal((1_000L, 1_120L, true), (boundary.StartAt, boundary.EndAt, boundary.PreserveBoundary));
+        Assert.Empty(GraphPlotProjection.BuildVisibleIdleIntervals(boundaryScene));
     }
 
     [Fact]
@@ -686,6 +679,31 @@ public sealed class GraphPlotControlTests
     {
         Assert.Equal("#3F5D7C", GraphPlotControl.IdleBandColorHex);
         Assert.Equal(0.22, GraphPlotControl.IdleBandOpacity);
+    }
+
+    [Fact]
+    public void InferredLinesAreThinnerThanMeasuredModelLines()
+    {
+        Assert.Equal(1f, GraphPlotControl.InferredLineWidth);
+        Assert.True(GraphPlotControl.InferredLineWidth < 3f);
+    }
+
+    [Fact]
+    public void GenericModelActivityIsNeverLabelledIdle()
+    {
+        var samples = new[]
+        {
+            Point(1_000, 100, 0, 0, 0) with
+            {
+                ModelSamples = [new ApiHistoryModelSample("future-model", null, null, null, 1)],
+            },
+            Point(1_060, 99, 0, 0, 0) with
+            {
+                ModelSamples = [new ApiHistoryModelSample("future-model", null, null, null, 2)],
+            },
+        };
+
+        Assert.Empty(GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_060).IdleIntervals);
     }
 
     [Fact]
@@ -880,10 +898,9 @@ public sealed class GraphPlotControlTests
         };
         var sparseIntervals = Scene(sparse, 1_000, 1_300).IdleIntervals;
 
-        Assert.Equal(2, sparseIntervals.Count);
-        Assert.True(sparseIntervals[0].PreserveBoundary);
-        Assert.Equal((1_000L, 1_120L), (sparseIntervals[0].StartAt, sparseIntervals[0].EndAt));
-        Assert.Equal((1_120L, 1_300L), (sparseIntervals[1].StartAt, sparseIntervals[1].EndAt));
+        var sparseIdle = Assert.Single(sparseIntervals);
+        Assert.False(sparseIdle.PreserveBoundary);
+        Assert.Equal((1_120L, 1_300L), (sparseIdle.StartAt, sparseIdle.EndAt));
     }
 
     [Fact]
@@ -1295,7 +1312,7 @@ public sealed class GraphPlotControlTests
         Assert.Equal(100d, effective[0]);
         Assert.Equal(90d, effective[1]);
         Assert.Equal(90d, effective[2]);
-        Assert.Contains(scene.IdleIntervals, interval => interval.PreserveBoundary && interval.StartAt == 1_000 && interval.EndAt == 1_120);
+        Assert.DoesNotContain(scene.IdleIntervals, interval => interval.StartAt == 1_000 && interval.EndAt == 1_120);
 
         var shortGap = new[]
         {
@@ -1306,7 +1323,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Idle_band_preserves_every_long_unobserved_spend_gap_not_just_the_first_one()
+    public void Idle_band_never_labels_a_long_unobserved_spend_gap_as_idle()
     {
         var points = new[]
         {
@@ -1318,9 +1335,8 @@ public sealed class GraphPlotControlTests
             Point(1_180, 90, 2, 0, 0),
         };
 
-        var interval = Assert.Single(Scene(points).IdleIntervals, candidate =>
+        Assert.DoesNotContain(Scene(points).IdleIntervals, candidate =>
             candidate.StartAt == 1_060 && candidate.EndAt == 1_180);
-        Assert.True(interval.PreserveBoundary);
     }
 
     private static ApiHistorySample Point(long timestamp, double? remaining, double sol, double terra, double luna) =>
