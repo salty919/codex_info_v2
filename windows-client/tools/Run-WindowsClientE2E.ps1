@@ -96,6 +96,7 @@ function Wait-E2E {
     )
 
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastProbeError = $null
     while ([DateTime]::UtcNow -lt $deadline) {
         try {
             $value = & $Probe
@@ -104,13 +105,15 @@ function Wait-E2E {
             }
         }
         catch {
+            $lastProbeError = $_.Exception.Message
             # UIA elements can be replaced while Avalonia paints a new state.
             # Re-querying the same finite target is safe; a timeout is still a
             # hard failure and is never reported as a skip/pass.
         }
         Start-Sleep -Milliseconds 200
     }
-    throw "TIMEOUT: $Description (${TimeoutSeconds}s)"
+    $reason = if ($null -ne $lastProbeError) { "; last probe error: $lastProbeError" } else { '' }
+    throw "TIMEOUT: $Description (${TimeoutSeconds}s)$reason"
 }
 
 Add-Type -AssemblyName UIAutomationClient
@@ -174,6 +177,7 @@ public sealed class CodexInfoGraphPixelMeasurement {
 
 public static class CodexInfoGraphPixelScanner {
     private static readonly Color GridColor = ColorTranslator.FromHtml("#263548");
+    private static readonly Color PlotColor = ColorTranslator.FromHtml("#101925");
     private static readonly Color[] SeriesColors = new[] {
         ColorTranslator.FromHtml("#56B2F5"),
         ColorTranslator.FromHtml("#A88CF5"),
@@ -201,7 +205,12 @@ public static class CodexInfoGraphPixelScanner {
             for (int localX = 0; localX < plotWidth; localX++) {
                 int matches = 0;
                 for (int y = yStart; y < yEnd; y++) {
-                    if (Matches(bitmap.GetPixel(plotLeft + localX, y), GridColor, 8)) matches++;
+                    Color pixel = bitmap.GetPixel(plotLeft + localX, y);
+                    bool grid = Matches(pixel, GridColor, 8);
+                    if (!grid && localX + 1 < plotWidth) {
+                        grid = MatchesSplitGrid(pixel, bitmap.GetPixel(plotLeft + localX + 1, y));
+                    }
+                    if (grid) matches++;
                 }
                 gridColumns[localX] = matches >= requiredGridPixels;
             }
@@ -212,7 +221,9 @@ public static class CodexInfoGraphPixelScanner {
                 bool isGrid = x < plotWidth && gridColumns[x];
                 if (isGrid && runStart < 0) runStart = x;
                 if (!isGrid && runStart >= 0) {
-                    centers.Add((runStart + x - 1) / 2);
+                    // A one-pixel grid can cover adjacent pixels after
+                    // rasterization. A wide filled idle band is not a grid.
+                    if (x - runStart <= 2) centers.Add((runStart + x - 1) / 2);
                     runStart = -1;
                 }
             }
@@ -306,6 +317,20 @@ public static class CodexInfoGraphPixelScanner {
                 SeriesRightmost = rightmost,
             };
         }
+    }
+
+    private static bool MatchesSplitGrid(Color left, Color right) {
+        // Recover the coverage of a one-pixel line split across two pixels:
+        // left + right - background equals the original grid color.
+        return left.R > PlotColor.R && left.R <= GridColor.R &&
+            right.R > PlotColor.R && right.R <= GridColor.R &&
+            left.G > PlotColor.G && left.G <= GridColor.G &&
+            right.G > PlotColor.G && right.G <= GridColor.G &&
+            left.B > PlotColor.B && left.B <= GridColor.B &&
+            right.B > PlotColor.B && right.B <= GridColor.B &&
+            Math.Abs(left.R + right.R - PlotColor.R - GridColor.R) <= 3 &&
+            Math.Abs(left.G + right.G - PlotColor.G - GridColor.G) <= 3 &&
+            Math.Abs(left.B + right.B - PlotColor.B - GridColor.B) <= 3;
     }
 
     private static bool Matches(Color actual, Color expected, int tolerance) {
@@ -1207,13 +1232,8 @@ function Wait-E2EGraphPixelsReady {
         $candidatePlot = Find-E2EElementByAutomationId $Root 'Graph.Plot'
         if ($null -eq $candidatePlot) { return $false }
         $candidateCapture = Capture-E2EWindow $WindowHandle 'graph-ready-probe'
-        try {
-            return Get-E2EGraphMeasurement -Capture $candidateCapture -Plot $candidatePlot `
-                -WindowHandle $WindowHandle -Description $Description
-        }
-        catch {
-            return $false
-        }
+        return Get-E2EGraphMeasurement -Capture $candidateCapture -Plot $candidatePlot `
+            -WindowHandle $WindowHandle -Description $Description
     }
 }
 
@@ -1237,6 +1257,23 @@ function Invoke-E2EGraphPixelScannerSelfTest {
                 foreach ($x in $case.GridXs) { $graphics.DrawLine($gridPen, $x, 5, $x, 135) }
             }
             finally { $gridPen.Dispose() }
+            # Fixed raster values from the real 1px ScottPlot image; do not
+            # derive the expected pixels from the scanner under test.
+            foreach ($y in 5..135) {
+                foreach ($x in @(50, 130)) {
+                    $bitmap.SetPixel($x, $y, [System.Drawing.Color]::FromArgb(30, 43, 60))
+                    $bitmap.SetPixel($x + 1, $y, [System.Drawing.Color]::FromArgb(24, 35, 50))
+                }
+                foreach ($x in 65..75) {
+                    $bitmap.SetPixel($x, $y, [System.Drawing.Color]::FromArgb(27, 39, 55))
+                }
+                # Four physical columns reconstruct as three split-grid
+                # candidates. Keep this minimum wide-band boundary in the
+                # valid fixture so it must be ignored, not promoted to a grid.
+                foreach ($x in 145..148) {
+                    $bitmap.SetPixel($x, $y, [System.Drawing.Color]::FromArgb(27, 39, 55))
+                }
+            }
             for ($index = 0; $index -lt $seriesColors.Count; $index++) {
                 $seriesPen = New-Object System.Drawing.Pen($seriesColors[$index], 2)
                 try { $graphics.DrawLine($seriesPen, 175, 30 + ($index * 20), 215, 30 + ($index * 20)) }
