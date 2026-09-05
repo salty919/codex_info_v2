@@ -12466,22 +12466,23 @@ impl CodexInfoState {
             };
             let reliable = observation.model_source == usage_store::ModelSource::Confirmed
                 && observation.model_totals_complete;
-            let dollar = if reliable {
-                ModelUsageRow {
-                    name: model.model.clone(),
-                    tokens: model.total_tokens,
-                    input_tokens: model.input_tokens,
-                    cached_input_tokens: model.cached_input_tokens,
-                    output_tokens: model.output_tokens,
-                    cache_write_input_tokens: model.cache_write_input_tokens,
-                }
-                .public_v3()
-                .estimated_cost
-                .map(|cost| cost.total_dollars)
-                .unwrap_or(-1.0)
-            } else {
-                -1.0
-            };
+            // Completeness describes the model set, not the known model row.
+            // Keep an exact row recovered from the session log and let
+            // `reliable` render it as inferred/dashed when peer models are
+            // unknown. Dropping the value makes the line appear later at the
+            // first complete snapshot, which falsely implies a sudden spend.
+            let dollar = ModelUsageRow {
+                name: model.model.clone(),
+                tokens: model.total_tokens,
+                input_tokens: model.input_tokens,
+                cached_input_tokens: model.cached_input_tokens,
+                output_tokens: model.output_tokens,
+                cache_write_input_tokens: model.cache_write_input_tokens,
+            }
+            .public_v3()
+            .estimated_cost
+            .map(|cost| cost.total_dollars)
+            .unwrap_or(-1.0);
             points.insert(
                 observation.timestamp.div_euclid(60) * 60,
                 GraphModelPoint {
@@ -29418,7 +29419,7 @@ mod tests {
                     sol_tokens: Some(0),
                     terra_tokens: Some(0),
                     luna_tokens: Some(0),
-                    model_source: usage_store::ModelSource::Confirmed,
+                    model_source: usage_store::ModelSource::LegacyUnknown,
                     model_totals: Some(vec![usage_store::SessionModelTotal {
                         model: "ASTRA".into(),
                         total_tokens: tokens,
@@ -29427,7 +29428,7 @@ mod tests {
                         output_tokens: 0,
                         cache_write_input_tokens: Some(0),
                     }]),
-                    model_totals_complete: true,
+                    model_totals_complete: false,
                 });
         }
         let details = producer
@@ -29477,12 +29478,13 @@ mod tests {
             false,
         );
         assert!(
-            !paths.astra_rising.is_empty(),
-            "astra flat={:?} rising={:?} label={:?}",
+            !paths.astra_flat.is_empty(),
+            "incomplete known ASTRA values must remain as a dashed path: flat={:?} rising={:?} label={:?}",
             paths.astra_flat,
             paths.astra_rising,
             paths.current_astra_label
         );
+        assert!(paths.astra_rising.is_empty());
         assert_eq!(paths.current_astra_label, "$20.00");
     }
 
