@@ -199,6 +199,9 @@ Codex app-server / session JSONL / thread rollout
   確定した場合だけgapとする。既存REST v1のexact 13-key detailsにある`history_gaps`へconfirmed rowだけを
   projectionし、timestamp不連続だけではmarkerを作らない。確定gapは補間、quota/残量推測、旧値複製の対象外であり、
   backfillが成功した区間だけ実sampleで置換する。
+  quota gapのsource closureは同じaccount/periodのfresh authenticated quota結果だけで判定し、Session inventoryの
+  2GiB選択外file、model scanの完結性、REST clientの有無へ依存させない。反対にSession由来のrecordはquota gapを
+  `recovered`または`confirmed`へ進める証拠にしない。quota結果が未取得・不完全なら`pending`を保持する。
   ledger rowはexact key `gap_id,partition_id,source_identity_before,source_identity_after,cursor_before,cursor_after,
   stopped_at_monotonic_ns,resumed_at_monotonic_ns,start_at,end_at,reset_at,reason,state,owner_collector_epoch,
   confirmation_cycle_seq`を持つ。`state`は`pending|recovered|confirmed|rejected`、`reason`は
@@ -476,6 +479,8 @@ stop/restartを検出した時点では`pending`であり、bounded source resca
 公開せずlast-good Graph rootとbounded statusを保持する。全missing minuteがvalid source recordで回収できた場合だけ
 `recovered`としgap projection 0、回収不能な閉区間をsource cursorと前後identityで証明した場合だけ`confirmed`とする。
 invalid/foreign owner、時刻逆転、reset period外、overlap contradictionは`rejected`でcandidate rootを変更しない。
+quota sourceの完結性だけをrecorder generationへ明示して運び、Session inventory/model scanのoverflowや失敗を
+quota gapの`pending`継続条件にしてはならない。
 
 REST detailsへ公開するのはconfirmed rowだけで、raw path/cursor/process/ownerを除外した
 `history_gaps` projectionとする。projectionは`gap_id,reset_at,start_at,end_at,reason`の5 exact field、

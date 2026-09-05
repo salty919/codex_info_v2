@@ -1268,30 +1268,21 @@ pub(crate) struct RecorderGeneration {
     pub(crate) session_ranges: Vec<SessionRange>,
     pub(crate) session_model_totals: Vec<SessionModelTotal>,
     pub(crate) history_continuity_recovery: Option<HistoryContinuityModelRecovery>,
-    pub(crate) bounded_source_rescan_complete: bool,
+    pub(crate) quota_source_rescan_complete: bool,
 }
 
-/// A source closure is accepted only when the bounded collection result has at
-/// least one actual quota observation for the admitted reset period. Session
-/// backfill rows have a null quota and are excluded from this proof; an empty
-/// quota result never proves that the source was closed.
-fn quota_source_rescan_is_closed(
-    samples: &[UsageHistorySample],
-    reset_at: i64,
-    bounded_source_rescan_complete: bool,
+/// A source closure is accepted only when this generation follows a fresh
+/// authenticated quota result and carries at least one actual quota
+/// observation for the admitted reset period. Session inventory limits and
+/// model backfill rows are independent; an empty quota result never proves
+/// that the source was closed.
+fn quota_source_result_is_closed(
+    source_minutes: &[i64],
+    quota_source_rescan_complete: bool,
 ) -> bool {
-    let quota_samples = samples
-        .iter()
-        .filter(|sample| {
-            sample.reset_at == reset_at
-                && sample.remaining_percent.is_some()
-                && sample.timestamp > 0
-                && sample.timestamp.rem_euclid(60) == 0
-        })
-        .collect::<Vec<_>>();
-    bounded_source_rescan_complete
-        && !quota_samples.is_empty()
-        && quota_samples.len() <= MAX_SOURCE_RESCAN_SAMPLES
+    quota_source_rescan_complete
+        && !source_minutes.is_empty()
+        && source_minutes.len() <= MAX_SOURCE_RESCAN_SAMPLES
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1688,7 +1679,7 @@ impl RecorderWorker {
                                 session_ranges,
                                 session_model_totals,
                                 history_continuity_recovery,
-                                bounded_source_rescan_complete,
+                                quota_source_rescan_complete,
                             } = generation;
                             if std::env::var("CODEX_INFO_RECORDER_FAILURE")
                                 .ok()
@@ -1787,16 +1778,32 @@ impl RecorderWorker {
                                         // fabricate a quota gap repair.
                                         let mut source_minutes = samples
                                             .iter()
-                                            .filter(|sample| {
+                                            .map(|sample| {
+                                                (
+                                                    sample.timestamp,
+                                                    sample.reset_at,
+                                                    sample.remaining_percent,
+                                                )
+                                            })
+                                            .chain(observations.iter().map(|observation| {
+                                                (
+                                                    observation.timestamp,
+                                                    observation.reset_at,
+                                                    observation.remaining_percent,
+                                                )
+                                            }))
+                                            .filter(|(_, source_reset_at, remaining_percent)| {
                                                 // A quota value from a
                                                 // different reset period is
                                                 // not evidence for this
                                                 // gap, even when its minute
                                                 // happens to overlap.
-                                                sample.reset_at == reset_at
-                                                    && sample.remaining_percent.is_some()
+                                                *source_reset_at == reset_at
+                                                    && remaining_percent.is_some()
                                             })
-                                            .map(|sample| sample.timestamp.div_euclid(60) * 60)
+                                            .map(|(timestamp, _, _)| {
+                                                timestamp.div_euclid(60) * 60
+                                            })
                                             .collect::<Vec<_>>();
                                         source_minutes.sort_unstable();
                                         source_minutes.dedup();
@@ -1805,10 +1812,9 @@ impl RecorderWorker {
                                         let cursor_after = format!(
                                             "collector:{collector_epoch:032x}:cycle:{cycle_seq}"
                                         );
-                                        let source_closed = quota_source_rescan_is_closed(
-                                            &samples,
-                                            reset_at,
-                                            bounded_source_rescan_complete,
+                                        let source_closed = quota_source_result_is_closed(
+                                            &source_minutes,
+                                            quota_source_rescan_complete,
                                         );
                                         let resumed_at_monotonic_ns = monotonic_now_ns();
                                         if resumed_at_monotonic_ns == 0 {
@@ -2529,7 +2535,7 @@ mod tests {
                         output_tokens: 2_345,
                     }],
                     history_continuity_recovery: None,
-                    bounded_source_rescan_complete: true,
+                    quota_source_rescan_complete: false,
                 },
             )
             .unwrap();
@@ -2633,7 +2639,7 @@ mod tests {
                             fallback_model_totals: fallback_totals.clone(),
                         },
                     ),
-                    bounded_source_rescan_complete: false,
+                    quota_source_rescan_complete: false,
                 },
             )
             .unwrap();
@@ -2666,7 +2672,7 @@ mod tests {
                     session_ranges: Vec::new(),
                     session_model_totals: Vec::new(),
                     history_continuity_recovery: None,
-                    bounded_source_rescan_complete: false,
+                    quota_source_rescan_complete: false,
                 },
             )
             .is_err());
@@ -2748,7 +2754,7 @@ mod tests {
                 .unwrap();
         for gap in [
             pending_gap('a', 1_800_000_000, 1_800_000_180, reset_at),
-            pending_gap('b', 1_800_000_240, 1_800_000_300, reset_at),
+            pending_gap('b', 1_800_000_240, 1_800_000_248, reset_at),
             pending_gap('c', 1_800_000_360, 1_800_000_420, reset_at + 604_800),
         ] {
             store.begin_recorder_gap(&gap).unwrap();
@@ -2766,15 +2772,15 @@ mod tests {
             terra_tokens: 0,
             luna_tokens: 0,
         };
-        assert!(quota_source_rescan_is_closed(
-            &[
-                quota_sample(1_800_000_060),
-                quota_sample(1_800_000_120),
-                quota_sample(1_800_000_180),
-            ],
-            reset_at,
+        assert!(quota_source_result_is_closed(
+            &[1_800_000_060, 1_800_000_120, 1_800_000_180],
             true,
         ));
+        assert!(!quota_source_result_is_closed(
+            &[1_800_000_060, 1_800_000_120, 1_800_000_180],
+            false,
+        ));
+        assert!(!quota_source_result_is_closed(&[], true));
         writer
             .store_generation(
                 partition.partition_id.clone(),
@@ -2794,7 +2800,7 @@ mod tests {
                     session_ranges: Vec::new(),
                     session_model_totals: Vec::new(),
                     history_continuity_recovery: None,
-                    bounded_source_rescan_complete: true,
+                    quota_source_rescan_complete: true,
                 },
             )
             .unwrap();
@@ -2850,14 +2856,18 @@ mod tests {
                     window_seconds: 604_800,
                     collector_epoch: 3,
                     cycle_seq: 1,
-                    samples: vec![quota_sample(1_800_001_020), session_backfill],
-                    observations: Vec::new(),
+                    samples: vec![session_backfill],
+                    observations: vec![UsageHistoryObservation::unavailable(
+                        1_800_001_020,
+                        reset_at,
+                        Some(80.0),
+                    )],
                     recorded_sessions: Vec::new(),
                     session_checkpoints: Vec::new(),
                     session_ranges: Vec::new(),
                     session_model_totals: Vec::new(),
                     history_continuity_recovery: None,
-                    bounded_source_rescan_complete: true,
+                    quota_source_rescan_complete: true,
                 },
             )
             .unwrap();
@@ -2948,7 +2958,7 @@ mod tests {
             session_ranges: Vec::new(),
             session_model_totals: Vec::new(),
             history_continuity_recovery: None,
-            bounded_source_rescan_complete: false,
+            quota_source_rescan_complete: false,
         };
 
         std::thread::scope(|scope| {
@@ -2995,7 +3005,7 @@ mod tests {
                 session_ranges: Vec::new(),
                 session_model_totals: Vec::new(),
                 history_continuity_recovery: None,
-                bounded_source_rescan_complete: false,
+                quota_source_rescan_complete: false,
             };
             let mut writer = RecorderWorker::start().unwrap();
             if mode != "worker-death" {
