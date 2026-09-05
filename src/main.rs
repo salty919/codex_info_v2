@@ -3447,7 +3447,12 @@ fn graph_paths(samples: &[&UsageHistorySample], period_start: i64, period_end: i
     // Detect idle bands from raw cumulative snapshots, not smoothed lines.
     let unused_intervals = unused_interval_positions(&raw_minute, period_start, period_end);
     GraphPaths {
-        remaining: graph_path_from_points(&remaining_points, period_start, period_end, 100.0),
+        remaining: graph_path_from_points_with_correction_boundaries(
+            &remaining_points,
+            period_start,
+            period_end,
+            &raw_minute,
+        ),
         remaining_markers: remaining_marker_positions_on_points(
             &remaining_points,
             period_start,
@@ -3519,8 +3524,12 @@ fn graph_paths_for_selection(
         .any(|sample| sample.remaining_percent.is_finite() && sample.remaining_percent >= 0.0);
     if has_remaining_observation {
         if let Some(remaining) = remaining_points.last().map(|(_, value)| *value) {
-            paths.remaining =
-                graph_path_from_points(&remaining_points, period_start, period_end, 100.0);
+            paths.remaining = graph_path_from_points_with_correction_boundaries(
+                &remaining_points,
+                period_start,
+                period_end,
+                &minute,
+            );
             paths.remaining_markers =
                 remaining_marker_positions_on_points(&remaining_points, period_start, period_end);
             paths.current_remaining_label = format_percent(remaining);
@@ -3787,11 +3796,13 @@ fn minute_model_spend_for_metric(
         buckets.push(sample);
     }
     if show_tokens {
-        // The raw session counters are cumulative totals.  Older history
-        // rows can contain zero because the token fields did not exist (or a
+        // The raw session counters are cumulative totals. Older history rows
+        // can contain zero because the token fields did not exist (or a
         // provider did not report them), so a zero after a known value must be
-        // treated as an unknown sample and carried forward.  Taking the
-        // maximum also protects the graph from stale/out-of-order rows.
+        // treated as an unknown sample and carried forward. A non-zero lower
+        // value is a source-backed correction and must remain visible; using
+        // the historical maximum here would turn the correction into a
+        // misleading plateau.
         let mut cumulative = [0.0_f64; 3];
         return buckets
             .into_iter()
@@ -3802,7 +3813,7 @@ fn minute_model_spend_for_metric(
                     sample.luna_tokens as f64,
                 ];
                 for index in 0..3 {
-                    if current[index] > cumulative[index] {
+                    if current[index] != 0.0 || cumulative[index] == 0.0 {
                         cumulative[index] = current[index];
                     }
                 }
@@ -3816,34 +3827,30 @@ fn minute_model_spend_for_metric(
             .collect();
     }
 
-    let mut cumulative = [0.0_f64; 3];
     buckets
         .into_iter()
-        .map(|sample| {
-            let current = [
-                sample.sol_dollars,
-                sample.terra_dollars,
-                sample.luna_dollars,
-            ];
-            for index in 0..3 {
-                // Dollar history is also persisted as a cumulative snapshot.
-                // A later API scan can temporarily report a smaller snapshot
-                // (for example while a session file is still being indexed),
-                // so never add the positive difference twice after such a
-                // regression. Keep the greatest observed cumulative value,
-                // just as the token path does above.
-                if current[index] > cumulative[index] {
-                    cumulative[index] = current[index];
-                }
-            }
-            HourlyModelSpend {
-                timestamp: sample.timestamp,
-                sol: cumulative[0],
-                terra: cumulative[1],
-                luna: cumulative[2],
-            }
+        .map(|sample| HourlyModelSpend {
+            timestamp: sample.timestamp,
+            sol: sample.sol_dollars,
+            terra: sample.terra_dollars,
+            luna: sample.luna_dollars,
         })
         .collect()
+}
+
+/// A lower component in the next canonical cumulative snapshot marks an
+/// observed correction boundary. This is lineage evidence only: it is not a
+/// confirmed recorder gap, and timestamp distance must not promote it to one.
+/// All graph projections use this helper so model lines, idle bands, and the
+/// quota line agree on where a segment ends.
+fn observed_correction_boundary(previous: &HourlyModelSpend, current: &HourlyModelSpend) -> bool {
+    [
+        (previous.sol, current.sol),
+        (previous.terra, current.terra),
+        (previous.luna, current.luna),
+    ]
+    .into_iter()
+    .any(|(before, after)| before.is_finite() && after.is_finite() && after < before)
 }
 
 #[cfg(test)]
@@ -3916,6 +3923,14 @@ fn metric_line_path(
     let mut previous = first;
     for point in iter {
         let (x, y) = coordinate(point.timestamp, value(point));
+        if observed_correction_boundary(previous, point) {
+            // A lower cumulative snapshot is a source-backed correction, not
+            // a spend event. Start a new subpath at the corrected point so
+            // the old segment is neither connected nor interpolated into it.
+            commands.push_str(&format!(" M{x:.2} {y:.2}"));
+            previous = point;
+            continue;
+        }
         let unobserved_gap = point.timestamp.saturating_sub(previous.timestamp)
             > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
         if unobserved_gap && value(point) > value(previous) {
@@ -3948,7 +3963,10 @@ fn split_metric_line_paths(
     for pair in points.windows(2) {
         let previous = value(&pair[0]);
         let current = value(&pair[1]);
-        if !previous.is_finite() || !current.is_finite() || current < previous {
+        if !previous.is_finite()
+            || !current.is_finite()
+            || observed_correction_boundary(&pair[0], &pair[1])
+        {
             continue;
         }
         let (x1, y1) = coordinate(&pair[0]);
@@ -4037,6 +4055,11 @@ fn unused_interval_positions(
             && [current.sol, current.terra, current.luna]
                 .into_iter()
                 .any(|value| value.is_finite() && value > 0.0);
+        if observed_correction_boundary(previous, current) {
+            // A correction is an observed lineage boundary, not an idle or
+            // confirmed-gap interval inferred from its timestamp.
+            continue;
+        }
         // A long observation gap ending at a later cumulative value contains
         // no evidence of when usage occurred. Render the whole unobserved
         // interval as idle, then let the model line make the vertical change
@@ -4348,6 +4371,7 @@ fn remaining_graph_points_for_metric(
     // completed by interpolation in the smoothing pass below.
     let mut points = vec![(period_start, initial_remaining)];
     let mut active_segments = Vec::with_capacity(model_points.len() + 1);
+    let mut correction_segments = Vec::with_capacity(model_points.len() + 1);
     let mut previous_remaining = initial_remaining;
     let mut previous_model = model_points[0];
     let mut previous_timestamp = period_start;
@@ -4365,9 +4389,11 @@ fn remaining_graph_points_for_metric(
             previous_model = current_model;
             continue;
         }
-        let model_changed = current_model.sol > previous_model.sol
-            || current_model.terra > previous_model.terra
-            || current_model.luna > previous_model.luna;
+        let correction_boundary = observed_correction_boundary(&previous_model, &current_model);
+        let model_changed = !correction_boundary
+            && (current_model.sol > previous_model.sol
+                || current_model.terra > previous_model.terra
+                || current_model.luna > previous_model.luna);
         let synthetic_zero_gap = previous_timestamp == period_start
             && timestamp.saturating_sub(previous_timestamp) > 60
             && previous_model.sol == 0.0
@@ -4375,7 +4401,16 @@ fn remaining_graph_points_for_metric(
             && previous_model.luna == 0.0
             && model_changed;
         let active = model_changed && !synthetic_zero_gap;
-        let matched_remaining = if model_changed {
+        let matched_remaining = if correction_boundary {
+            // A correction starts a fresh lineage. Use only the quota sample
+            // in that source minute; never clamp it against the pre-correction
+            // value or treat elapsed time as a missing confirmed gap.
+            remaining_by_timestamp
+                .get(&timestamp)
+                .copied()
+                .filter(|value| value.is_finite())
+                .map(|value| value.clamp(0.0, 100.0))
+        } else if model_changed {
             latest_remaining_for_model_change(
                 &remaining_by_timestamp,
                 timestamp,
@@ -4398,11 +4433,17 @@ fn remaining_graph_points_for_metric(
         };
         let matched_quota = matched_remaining.is_some();
         let delayed_quota_applied = delayed_quota.is_some();
-        let next_remaining = matched_remaining
-            .or(delayed_quota)
-            .map(|value| previous_remaining.min(value))
-            .unwrap_or(previous_remaining);
-        if model_changed {
+        let next_remaining = if correction_boundary {
+            matched_remaining.unwrap_or(previous_remaining)
+        } else {
+            matched_remaining
+                .or(delayed_quota)
+                .map(|value| previous_remaining.min(value))
+                .unwrap_or(previous_remaining)
+        };
+        if correction_boundary {
+            quota_observed_since_model_change = matched_quota;
+        } else if model_changed {
             quota_observed_since_model_change = matched_quota;
         } else if delayed_quota_applied {
             quota_observed_since_model_change = true;
@@ -4413,13 +4454,16 @@ fn remaining_graph_points_for_metric(
             // the first observed quota value explicit at its real timestamp.
             points.push((timestamp, previous_remaining));
             active_segments.push(false);
+            correction_segments.push(false);
             if next_remaining != previous_remaining {
                 points.push((timestamp, next_remaining));
                 active_segments.push(false);
+                correction_segments.push(false);
             }
         } else {
             points.push((timestamp, next_remaining));
             active_segments.push(active);
+            correction_segments.push(correction_boundary);
         }
         previous_remaining = next_remaining;
         previous_model = current_model;
@@ -4429,15 +4473,21 @@ fn remaining_graph_points_for_metric(
     if previous_timestamp < period_end {
         points.push((period_end, previous_remaining));
         active_segments.push(false);
+        correction_segments.push(false);
     }
 
-    collapse_repeated_idle_remaining_points(&mut points, &mut active_segments);
-    smooth_remaining_points_with_activity(&points, &active_segments)
+    collapse_repeated_idle_remaining_points(
+        &mut points,
+        &mut active_segments,
+        &mut correction_segments,
+    );
+    smooth_remaining_points_with_activity(&points, &active_segments, &correction_segments)
 }
 
 fn collapse_repeated_idle_remaining_points(
     points: &mut Vec<(i64, f64)>,
     active_segments: &mut Vec<bool>,
+    correction_segments: &mut Vec<bool>,
 ) {
     let mut index = 1;
     while index + 1 < points.len() {
@@ -4446,9 +4496,12 @@ fn collapse_repeated_idle_remaining_points(
             points[index - 1].0 == points[index].0 || points[index].0 == points[index + 1].0;
         let joins_idle_segments = active_segments.get(index - 1) == Some(&false)
             && active_segments.get(index) == Some(&false);
-        if repeated && !is_vertical_boundary && joins_idle_segments {
+        let crosses_correction = correction_segments.get(index - 1) == Some(&true)
+            || correction_segments.get(index) == Some(&true);
+        if repeated && !is_vertical_boundary && joins_idle_segments && !crosses_correction {
             points.remove(index);
             active_segments.remove(index);
+            correction_segments.remove(index);
         } else {
             index += 1;
         }
@@ -4498,8 +4551,10 @@ fn latest_remaining_for_model_change(
 fn smooth_remaining_points_with_activity(
     points: &[(i64, f64)],
     active_segments: &[bool],
+    correction_segments: &[bool],
 ) -> Vec<(i64, f64)> {
     debug_assert_eq!(active_segments.len(), points.len().saturating_sub(1));
+    debug_assert_eq!(correction_segments.len(), points.len().saturating_sub(1));
     if points.len() < 3 {
         return points.to_vec();
     }
@@ -4552,6 +4607,16 @@ fn smooth_remaining_points_with_activity(
         if right_index <= left_index || points[right_index].0 <= points[left_index].0 {
             continue;
         }
+        if (left_index..right_index)
+            .any(|segment| correction_segments.get(segment).copied().unwrap_or(false))
+        {
+            // A correction boundary is not an idle interval that may be
+            // crossed while completing a missed quota sample. Keep the
+            // pre/post segments independent even when their quota values are
+            // equal or a later lower observation would otherwise invite
+            // interpolation.
+            continue;
+        }
 
         let active_duration = active_duration_between(left_index, right_index);
         if active_duration <= f64::EPSILON {
@@ -4587,8 +4652,11 @@ fn smooth_remaining_points_with_activity(
     for index in 1..points.len() - 1 {
         let before_active = active_segments.get(index - 1).copied().unwrap_or(false);
         let after_active = active_segments.get(index).copied().unwrap_or(false);
+        let crosses_correction = correction_segments.get(index - 1).copied().unwrap_or(false)
+            || correction_segments.get(index).copied().unwrap_or(false);
         if !before_active
             || !after_active
+            || crosses_correction
             || points[index - 1].0 == points[index].0
             || points[index].0 == points[index + 1].0
             // Keep the explicitly interpolated line intact. A second moving
@@ -4606,6 +4674,12 @@ fn smooth_remaining_points_with_activity(
 
     for index in 1..smoothed.len() {
         let active = active_segments.get(index - 1).copied().unwrap_or(false);
+        let correction = correction_segments.get(index - 1).copied().unwrap_or(false);
+        if correction {
+            // Preserve the source-backed post-correction quota without
+            // carrying the preceding value across the boundary.
+            continue;
+        }
         if !active && smoothed[index - 1].0 != smoothed[index].0 {
             smoothed[index].1 = smoothed[index - 1].1;
         } else if active {
@@ -4642,6 +4716,31 @@ fn graph_path_from_points(
     period_end: i64,
     maximum: f64,
 ) -> String {
+    graph_path_from_points_with_breaks(points, period_start, period_end, maximum, &BTreeSet::new())
+}
+
+fn graph_path_from_points_with_correction_boundaries(
+    points: &[(i64, f64)],
+    period_start: i64,
+    period_end: i64,
+    model_points: &[HourlyModelSpend],
+) -> String {
+    let correction_starts = model_points
+        .windows(2)
+        .filter_map(|pair| {
+            observed_correction_boundary(&pair[0], &pair[1]).then_some(pair[1].timestamp)
+        })
+        .collect::<BTreeSet<_>>();
+    graph_path_from_points_with_breaks(points, period_start, period_end, 100.0, &correction_starts)
+}
+
+fn graph_path_from_points_with_breaks(
+    points: &[(i64, f64)],
+    period_start: i64,
+    period_end: i64,
+    maximum: f64,
+    breaks: &BTreeSet<i64>,
+) -> String {
     let span = (period_end - period_start).max(1) as f64;
     points
         .iter()
@@ -4653,7 +4752,11 @@ fn graph_path_from_points(
             } else {
                 99.0
             };
-            let command = if index == 0 { "M" } else { "L" };
+            let command = if index == 0 || breaks.contains(timestamp) {
+                "M"
+            } else {
+                "L"
+            };
             format!("{command}{x:.2} {y:.2}")
         })
         .collect::<Vec<_>>()
@@ -4692,20 +4795,25 @@ fn smooth_model_spend(points: &[HourlyModelSpend]) -> Vec<HourlyModelSpend> {
     let mut smoothed = Vec::with_capacity(points.len());
     smoothed.push(points[0]);
     for index in 1..points.len() - 1 {
-        let previous = *smoothed.last().expect("zero anchor exists");
+        let previous_raw = points[index - 1];
         let current = points[index];
         let next = points[index + 1];
-        let previous_gap = current.timestamp.saturating_sub(previous.timestamp)
+        let correction_before = observed_correction_boundary(&previous_raw, &current);
+        let correction_after = observed_correction_boundary(&current, &next);
+        let previous_gap = current.timestamp.saturating_sub(previous_raw.timestamp)
             > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
         let next_gap = next.timestamp.saturating_sub(current.timestamp)
             > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
+        if correction_before || correction_after {
+            // Keep both sides of a correction raw. Smoothing either side with
+            // the other would carry the pre-correction value into the new
+            // segment (or manufacture a transition at the boundary).
+            smoothed.push(current);
+            continue;
+        }
+        let previous = *smoothed.last().expect("zero anchor exists");
         if previous_gap || next_gap {
-            smoothed.push(HourlyModelSpend {
-                timestamp: current.timestamp,
-                sol: current.sol.max(previous.sol),
-                terra: current.terra.max(previous.terra),
-                luna: current.luna.max(previous.luna),
-            });
+            smoothed.push(current);
             continue;
         }
         let smooth = |before: f64, value: f64, after: f64, floor: f64| {
@@ -4719,13 +4827,19 @@ fn smooth_model_spend(points: &[HourlyModelSpend]) -> Vec<HourlyModelSpend> {
         });
     }
     let last = *points.last().expect("points has at least three items");
-    let previous = *smoothed.last().expect("anchor exists");
-    smoothed.push(HourlyModelSpend {
-        timestamp: last.timestamp,
-        sol: last.sol.max(previous.sol),
-        terra: last.terra.max(previous.terra),
-        luna: last.luna.max(previous.luna),
-    });
+    if observed_correction_boundary(&points[points.len() - 2], &last) {
+        // The latest source-backed sample is the endpoint even when it is a
+        // correction of the preceding cumulative snapshot.
+        smoothed.push(last);
+    } else {
+        let previous = *smoothed.last().expect("anchor exists");
+        smoothed.push(HourlyModelSpend {
+            timestamp: last.timestamp,
+            sol: last.sol.max(previous.sol),
+            terra: last.terra.max(previous.terra),
+            luna: last.luna.max(previous.luna),
+        });
+    }
     smoothed
 }
 
@@ -13228,6 +13342,7 @@ mod tests {
         minute_model_spend_for_metric, model_usage_timeline_from_events, monthly_window_seconds,
         native_account_window_title, native_legal_pages, native_startup_loading,
         normal_status_text, one_month_before_utc, open_codex_session_paths, parse_details_document,
+        observed_correction_boundary,
         parse_launch_mode, parse_preview_size, parse_rate_limits, parse_resize_direction,
         period_remaining_text, physical_size_for_logical, plan_type_label, poll_service_state,
         poll_service_state_with_owner_check, preview_model_row, published_pair_is_fresh,
@@ -13265,6 +13380,21 @@ mod tests {
         expected_remaining: Vec<f64>,
         expected_sol_max: f64,
         expected_period_count: usize,
+        details_response: GraphFixtureDetailsResponse,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GraphCorrectionFixture {
+        expected_period_start: i64,
+        expected_period_end: i64,
+        expected_reset_at: i64,
+        expected_graph_timestamps: Vec<i64>,
+        expected_correction_starts: Vec<i64>,
+        expected_latest_sample_timestamp: i64,
+        expected_latest_remaining: f64,
+        expected_latest_sol_dollars: f64,
+        expected_latest_sol_tokens: u64,
         details_response: GraphFixtureDetailsResponse,
     }
 
@@ -13367,8 +13497,7 @@ mod tests {
         }
     }
 
-    fn state_from_graph_fixture(fixture: &GraphFixture) -> CodexInfoState {
-        let details = &fixture.details_response;
+    fn state_from_graph_details(details: &GraphFixtureDetailsResponse) -> CodexInfoState {
         let samples = details
             .history_samples
             .iter()
@@ -13394,6 +13523,16 @@ mod tests {
         state.selected_reset_at = Some(canonical_reset_at);
         state.selected_history_period.clear();
         state
+    }
+
+    fn state_from_graph_fixture(fixture: &GraphFixture) -> CodexInfoState {
+        state_from_graph_details(&fixture.details_response)
+    }
+
+    fn state_from_graph_correction_fixture(
+        fixture: &GraphCorrectionFixture,
+    ) -> CodexInfoState {
+        state_from_graph_details(&fixture.details_response)
     }
 
     fn acknowledge_recorder_commit_fixture(
@@ -21567,6 +21706,107 @@ mod tests {
     }
 
     #[test]
+    fn cumulative_correction_fixture_reaches_the_native_graph_endpoint() {
+        let fixture: GraphCorrectionFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/graph_cumulative_correction.json"
+        ))
+        .expect("valid cumulative correction fixture");
+        let details = &fixture.details_response;
+        assert_eq!(details.quota.reset_at, fixture.expected_reset_at);
+        assert_eq!(details.history_periods.len(), 1);
+        assert_eq!(
+            details.history_periods[0].start_at,
+            fixture.expected_period_start
+        );
+        assert_eq!(
+            details.history_periods[0].end_at,
+            fixture.expected_period_end
+        );
+
+        let state = state_from_graph_correction_fixture(&fixture);
+        let periods = state.history_periods_at(details.observed_at);
+        assert_eq!(periods.len(), 1);
+        assert_eq!(periods[0].start, fixture.expected_period_start);
+        assert_eq!(periods[0].end, fixture.expected_period_end);
+        assert_eq!(periods[0].canonical_reset_at, fixture.expected_reset_at);
+
+        let selected = state
+            .history
+            .samples_for_reset(Some(periods[0].canonical_reset_at));
+        let references = selected.iter().collect::<Vec<_>>();
+        let minute = graph_time_endpoints(
+            minute_model_spend_for_metric(&references, false),
+            fixture.expected_period_start,
+            fixture.expected_period_end,
+        );
+        assert_eq!(
+            minute
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>(),
+            fixture.expected_graph_timestamps
+        );
+        assert_eq!(
+            minute
+                .windows(2)
+                .filter_map(|pair| {
+                    observed_correction_boundary(&pair[0], &pair[1])
+                        .then_some(pair[1].timestamp)
+                })
+                .collect::<Vec<_>>(),
+            fixture.expected_correction_starts
+        );
+
+        let graph = state.graph_paths_for_selection_at(
+            details.observed_at,
+            true,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(
+            graph.current_sol_label,
+            format!("${:.2}", fixture.expected_latest_sol_dollars)
+        );
+        assert_eq!(graph.current_remaining_label, "62%");
+        assert_eq!(
+            selected.last().map(|sample| sample.timestamp),
+            Some(fixture.expected_latest_sample_timestamp)
+        );
+        assert_eq!(
+            selected.last().map(|sample| sample.remaining_percent),
+            Some(fixture.expected_latest_remaining)
+        );
+        assert_eq!(
+            selected.last().map(|sample| sample.sol_dollars),
+            Some(fixture.expected_latest_sol_dollars)
+        );
+        assert_eq!(
+            selected.last().map(|sample| sample.sol_tokens),
+            Some(fixture.expected_latest_sol_tokens)
+        );
+
+        // The corrected samples start independent subpaths. A correction is
+        // not rendered as a negative spend slope or as a confirmed gap band.
+        assert!(graph.sol.matches('M').count() >= 3);
+        assert!(graph.sol_flat.matches('M').count() >= 3);
+        assert!(graph
+            .unused_intervals
+            .iter()
+            .all(|interval| !interval.preserve_boundary));
+
+        let tokens = state.graph_paths_for_selection_at(
+            details.observed_at,
+            true,
+            true,
+            true,
+            true,
+        );
+        assert_eq!(tokens.current_sol_label, "184,314,549");
+        assert_eq!(tokens.current_remaining_label, "62%");
+    }
+
+    #[test]
     fn committed_history_ack_replaces_only_acknowledged_minutes() {
         let reset_at = 1_800_604_800;
         let stale = UsageHistorySample {
@@ -22907,7 +23147,7 @@ mod tests {
     }
 
     #[test]
-    fn dollar_graph_does_not_recount_a_regressed_snapshot() {
+    fn dollar_graph_keeps_a_source_backed_regressed_snapshot() {
         let reset_at = 1_700_100_000;
         let samples = [
             UsageHistorySample::new(
@@ -22920,8 +23160,8 @@ mod tests {
                     luna: 1.0,
                 },
             ),
-            // A transiently incomplete scan must not reset the cumulative
-            // total and make the next 51-dollar observation count as +51.
+            // The lower snapshot is a source-backed correction. It must stay
+            // visible as a new segment instead of being replaced by 50.
             UsageHistorySample::new(
                 160,
                 reset_at,
@@ -22946,11 +23186,113 @@ mod tests {
         let references = samples.iter().collect::<Vec<_>>();
         let points = minute_model_spend(&references);
         assert_eq!(points[0].sol, 50.0);
-        assert_eq!(points[1].sol, 50.0);
+        assert_eq!(points[1].sol, 49.0);
         assert_eq!(points[2].sol, 51.0);
 
         let graph = graph_paths_for_selection(&references, 0, 240, false, false, true, false);
         assert_eq!(graph.current_sol_label, "$51.00");
+        assert!(graph.sol.contains("M50.00"));
+        assert!(!graph.sol.contains("L50.00"));
+    }
+
+    #[test]
+    fn multiple_corrections_split_model_subpaths_and_use_latest_endpoint() {
+        let reset_at = 1_700_100_000;
+        let samples = [
+            UsageHistorySample::new_with_usage(
+                0,
+                reset_at,
+                80.0,
+                ModelDollarTotals {
+                    sol: 176.04182,
+                    terra: 4.0,
+                    luna: 7.33828848,
+                },
+                ModelTokenTotals {
+                    sol: 264_712_012,
+                    terra: 10_000,
+                    luna: 247_557_688,
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                60,
+                reset_at,
+                75.0,
+                ModelDollarTotals {
+                    sol: 87.483049,
+                    terra: 4.0,
+                    luna: 6.111394,
+                },
+                ModelTokenTotals {
+                    sol: 132_498_115,
+                    terra: 10_000,
+                    luna: 209_761_478,
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                120,
+                reset_at,
+                70.0,
+                ModelDollarTotals {
+                    sol: 103.320445,
+                    terra: 4.0,
+                    luna: 6.38715196,
+                },
+                ModelTokenTotals {
+                    sol: 156_116_016,
+                    terra: 10_000,
+                    luna: 217_177_530,
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                180,
+                reset_at,
+                68.0,
+                ModelDollarTotals {
+                    sol: 87.256537,
+                    terra: 4.0,
+                    luna: 6.12284928,
+                },
+                ModelTokenTotals {
+                    sol: 131_964_424,
+                    terra: 10_000,
+                    luna: 209_940_316,
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                240,
+                reset_at,
+                62.0,
+                ModelDollarTotals {
+                    sol: 127.284527,
+                    terra: 4.0,
+                    luna: 6.44192836,
+                },
+                ModelTokenTotals {
+                    sol: 184_314_549,
+                    terra: 10_000,
+                    luna: 218_090_071,
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let graph = graph_paths_for_selection(&references, 0, 300, true, true, true, false);
+        assert_eq!(graph.current_sol_label, "$127.28");
+        assert_eq!(graph.current_remaining_label, "62%");
+        assert_eq!(
+            minute_model_spend_for_metric(&references, false)
+                .last()
+                .map(|point| point.sol),
+            Some(127.284527)
+        );
+        assert!(graph.sol.matches('M').count() >= 3);
+        assert!(graph.sol_flat.matches('M').count() >= 2);
+        assert!(!graph.unused_intervals.iter().any(|interval| interval
+            .preserve_boundary));
+
+        let tokens = graph_paths_for_selection(&references, 0, 300, true, true, true, true);
+        assert_eq!(tokens.current_sol_label, "184,314,549");
+        assert!(tokens.sol.matches('M').count() >= 3);
     }
 
     #[test]
@@ -24223,12 +24565,14 @@ mod tests {
         let dollars = graph_paths_for_selection(&references, 0, 240, false, false, true, false);
         assert_eq!(dollars.current_sol_label, "$12.00");
         assert!(!dollars.sol_rising.contains("M50.00 99.00"));
-        assert!(dollars.sol_flat.contains("M25.00 17.33 L50.00 17.33"));
+        assert!(!dollars.sol_flat.contains("M25.00 17.33 L50.00 17.33"));
+        assert!(dollars.sol.contains("M50.00"));
 
         let tokens = graph_paths_for_selection(&references, 0, 240, false, false, true, true);
         assert_eq!(tokens.current_sol_label, "120");
         assert!(!tokens.sol_rising.contains("M50.00 99.00"));
-        assert!(tokens.sol_flat.contains("M25.00 17.33 L50.00 17.33"));
+        assert!(!tokens.sol_flat.contains("M25.00 17.33 L50.00 17.33"));
+        assert!(tokens.sol.contains("M50.00"));
     }
 
     #[test]

@@ -268,9 +268,13 @@ component順や表示所有者を変更しない。
 - 右端現在値の表示域は、初期940×640 logical表示時に各metricで確保される幅をドル／トークン別に固定する。Graphを横へリサイズした差分はplotへ割り当て、現在値、系列色、leader、縦位置を変えない。
 - Remainingは独立0–100%意味、モデル系列は累積値として扱う。残量をドル軸へ誤って合わせない。
 - Remainingとモデル使用量は別の観測値であり、モデル使用後に遅れて届いた最初の低い残量観測はその観測時刻へ反映する。残量観測が存在しない区間を料金・tokenから逆算してはならず、未観測区間を正常な残量低下として表示しない。
+- 同一periodの連続sampleで選択metricの累積モデルcomponentが低下した位置は、確認済み欠測ではなく
+  観測された累積補正境界として扱う。補正前後のモデル線とRemaining線を接続・補間せず、補正後sampleから
+  新しいsubpathを開始する。過去最大値を現在値へcarryせず、右端の点・leader・ラベルは最後のaccepted
+  sampleの値を表示する。期間終端への水平保持は最後のsubpath内だけに限定する。
 - X版とWindows版は同一の履歴fixtureと固定期待値（期間境界、累積SOL、遅延残量、未観測区間）を通過しなければならない。片方の描画ヘルパーが生成した値をもう片方の期待値には使用せず、fixtureの独立oracleを使う。
 - shared rollover fixtureのperiod A→Bで`100% / $1 → 41% / $323.674247`を保持し、
-  `graph_delayed_quota`と既存history/rolling/delayed/gap/no-history/REST/Windows回帰を同一revisionで確認する。
+  `graph_delayed_quota`、`graph_cumulative_correction`と既存history/rolling/delayed/gap/no-history/REST/Windows回帰を同一revisionで確認する。
   値形状による100%・7日・quota-only除外や、新workflow gate・全直積は追加しない。
 - 操作帯を開閉してもplotの位置・高さを変えず、ラベルや右端値を隠さない。
 - 記録なし、欠測、アイドル、活動、0/中間/100を明示的な設計状態として扱う。

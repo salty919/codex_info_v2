@@ -173,6 +173,14 @@ internal static class GraphPlotProjection
                 x.Add(scene.Timestamps[index]);
                 y.Add(scene.Remaining[index - 1]);
             }
+            if (IsCorrectionBoundary(scene, index))
+            {
+                // A correction is an observed source boundary, not a
+                // confirmed recorder gap. Keep both endpoint observations,
+                // but make the adapter start a new polyline at the latter.
+                x.Add(double.NaN);
+                y.Add(double.NaN);
+            }
             x.Add(scene.Timestamps[index]);
             y.Add(scene.Remaining[index]);
         }
@@ -202,7 +210,8 @@ internal static class GraphPlotProjection
         {
             var before = values[index - 1];
             var after = values[index];
-            if (!double.IsFinite(before) || !double.IsFinite(after) || after < before)
+            if (!double.IsFinite(before) || !double.IsFinite(after) ||
+                IsCorrectionBoundary(scene, index) || after < before)
             {
                 continue;
             }
@@ -241,6 +250,9 @@ internal static class GraphPlotProjection
             new GraphLineProjection(flatX, flatY),
             new GraphLineProjection(risingX, risingY));
     }
+
+    private static bool IsCorrectionBoundary(GraphScene scene, int pointIndex) =>
+        scene.CorrectionBoundaries.Any(boundary => boundary.PointIndex == pointIndex);
 
     private static bool IsSyntheticFirstObservation(
         GraphScene scene,

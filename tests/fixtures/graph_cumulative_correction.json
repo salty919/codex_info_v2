@@ -1,0 +1,135 @@
+{
+  "expected_period_start": 1788441660,
+  "expected_period_end": 1788476340,
+  "expected_reset_at": 1788993073,
+  "expected_graph_timestamps": [1788441660, 1788441720, 1788441780, 1788445260, 1788445320, 1788476280, 1788476340],
+  "expected_correction_starts": [1788441780, 1788445320],
+  "expected_latest_sample_timestamp": 1788476280,
+  "expected_latest_remaining": 62.0,
+  "expected_latest_sol_dollars": 127.284527,
+  "expected_latest_sol_tokens": 184314549,
+  "details_response": {
+    "api_version": "v1",
+    "state": "ready",
+    "observed_at": 1788476340,
+    "authenticated": true,
+    "plan_label": "Pro",
+    "quota": {
+      "remaining_percent": 62.0,
+      "reset_at": 1788993073,
+      "window_seconds": 604813,
+      "monthly": false
+    },
+    "models": [
+      {
+        "name": "SOL",
+        "input_tokens": 184314549,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "input_dollars": 127.284527,
+        "cached_input_dollars": 0.0,
+        "output_dollars": 0.0
+      },
+      {
+        "name": "TERRA",
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "input_dollars": 0.0,
+        "cached_input_dollars": 0.0,
+        "output_dollars": 0.0
+      },
+      {
+        "name": "LUNA",
+        "input_tokens": 218090071,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "input_dollars": 6.44192836,
+        "cached_input_dollars": 0.0,
+        "output_dollars": 0.0
+      }
+    ],
+    "active_thread_count": 0,
+    "history_periods": [
+      {
+        "id": "1788993073",
+        "start_at": 1788441660,
+        "end_at": 1788476340,
+        "reset_at": 1788993073,
+        "label": "2026/09/03 22:21:00 +09:00 ～ 2026/09/10 07:31:13 +09:00（現在）",
+        "current": true
+      }
+    ],
+    "history_samples": [
+      {
+        "timestamp": 1788441660,
+        "reset_at": 1788993073,
+        "remaining_percent": 73.0,
+        "sol_dollars": 176.04182,
+        "terra_dollars": 0.0,
+        "luna_dollars": 7.33828848,
+        "sol_tokens": 264712012,
+        "terra_tokens": 0,
+        "luna_tokens": 247557688
+      },
+      {
+        "timestamp": 1788441720,
+        "reset_at": 1788993073,
+        "remaining_percent": 73.0,
+        "sol_dollars": 176.04182,
+        "terra_dollars": 0.0,
+        "luna_dollars": 7.33828848,
+        "sol_tokens": 264712012,
+        "terra_tokens": 0,
+        "luna_tokens": 247557688
+      },
+      {
+        "timestamp": 1788441780,
+        "reset_at": 1788993073,
+        "remaining_percent": 73.0,
+        "sol_dollars": 87.483049,
+        "terra_dollars": 0.0,
+        "luna_dollars": 6.111394,
+        "sol_tokens": 132498115,
+        "terra_tokens": 0,
+        "luna_tokens": 209761478
+      },
+      {
+        "timestamp": 1788445260,
+        "reset_at": 1788993073,
+        "remaining_percent": 70.0,
+        "sol_dollars": 103.320445,
+        "terra_dollars": 0.0,
+        "luna_dollars": 6.38715196,
+        "sol_tokens": 156116016,
+        "terra_tokens": 0,
+        "luna_tokens": 217177530
+      },
+      {
+        "timestamp": 1788445320,
+        "reset_at": 1788993073,
+        "remaining_percent": 70.0,
+        "sol_dollars": 87.256537,
+        "terra_dollars": 0.0,
+        "luna_dollars": 6.12284928,
+        "sol_tokens": 131964424,
+        "terra_tokens": 0,
+        "luna_tokens": 209940316
+      },
+      {
+        "timestamp": 1788476280,
+        "reset_at": 1788993073,
+        "remaining_percent": 62.0,
+        "sol_dollars": 127.284527,
+        "terra_dollars": 0.0,
+        "luna_dollars": 6.44192836,
+        "sol_tokens": 184314549,
+        "terra_tokens": 0,
+        "luna_tokens": 218090071
+      }
+    ],
+    "history_gaps": [],
+    "threads": [],
+    "estimated_cost_label": "概算 $134"
+  }
+}

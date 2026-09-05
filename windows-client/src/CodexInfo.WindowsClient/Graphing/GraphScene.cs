@@ -16,6 +16,16 @@ public enum GraphMetric
 public readonly record struct GraphIdleInterval(long StartAt, long EndAt, bool PreserveBoundary);
 
 /// <summary>
+/// A source observation whose selected cumulative vector corrects a prior
+/// observation. The two observations are separate graph segments; this is
+/// not a recorder gap and must not be inferred as one by the adapter.
+/// </summary>
+public readonly record struct GraphCorrectionBoundary(
+    int PointIndex,
+    long BeforeAt,
+    long AfterAt);
+
+/// <summary>
 /// Framework-independent graph projection. It is the single owner of graph
 /// data semantics; XAML owns layout and the ScottPlot adapter only paints the
 /// arrays and fixed axes exposed here.
@@ -31,6 +41,7 @@ public sealed class GraphScene
         double[] sol,
         double[] terra,
         double[] luna,
+        IReadOnlyList<GraphCorrectionBoundary> correctionBoundaries,
         IReadOnlyList<GraphIdleInterval> idleIntervals,
         double modelMaximum)
     {
@@ -42,6 +53,7 @@ public sealed class GraphScene
         Sol = sol;
         Terra = terra;
         Luna = luna;
+        CorrectionBoundaries = correctionBoundaries;
         IdleIntervals = idleIntervals;
         ModelMaximum = modelMaximum;
     }
@@ -62,6 +74,12 @@ public sealed class GraphScene
 
     public IReadOnlyList<double> Luna { get; }
 
+    /// <summary>
+    /// Source-backed cumulative corrections. A boundary is a renderer
+    /// discontinuity, not a confirmed recorder gap.
+    /// </summary>
+    public IReadOnlyList<GraphCorrectionBoundary> CorrectionBoundaries { get; }
+
     public IReadOnlyList<GraphIdleInterval> IdleIntervals { get; }
 
     public double ModelMaximum { get; }
@@ -69,7 +87,18 @@ public sealed class GraphScene
     public bool HasPoints => Timestamps.Count > 0;
 
     public static GraphScene Empty(GraphMetric metric = GraphMetric.Dollars) =>
-        new(0, 1, metric, [], [], [], [], [], [], 1);
+        new(
+            0,
+            1,
+            metric,
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            1);
 
     public static GraphScene Create(
         IReadOnlyList<ApiHistorySample> samples,
@@ -86,9 +115,7 @@ public sealed class GraphScene
         var start = periodStartAt > 0 ? periodStartAt : samples[0].Timestamp;
         var end = periodEndAt > start ? periodEndAt : Math.Max(start + 1, samples[^1].Timestamp);
         var points = new ScenePoint[samples.Count];
-        var previousSol = 0d;
-        var previousTerra = 0d;
-        var previousLuna = 0d;
+        var correctionBoundaries = new List<GraphCorrectionBoundary>();
         long? previousTimestamp = null;
         for (var index = 0; index < samples.Count; index++)
         {
@@ -102,15 +129,18 @@ public sealed class GraphScene
             var rawSol = metric == GraphMetric.Dollars ? sample.SolDollars : sample.SolTokens;
             var rawTerra = metric == GraphMetric.Dollars ? sample.TerraDollars : sample.TerraTokens;
             var rawLuna = metric == GraphMetric.Dollars ? sample.LunaDollars : sample.LunaTokens;
-            previousSol = Math.Max(previousSol, FiniteNonNegative(rawSol));
-            previousTerra = Math.Max(previousTerra, FiniteNonNegative(rawTerra));
-            previousLuna = Math.Max(previousLuna, FiniteNonNegative(rawLuna));
-            points[index] = new ScenePoint(
+            var point = new ScenePoint(
                 Math.Clamp(sample.Timestamp, start, end),
                 sample.RemainingPercent,
-                previousSol,
-                previousTerra,
-                previousLuna);
+                FiniteNonNegative(rawSol),
+                FiniteNonNegative(rawTerra),
+                FiniteNonNegative(rawLuna));
+            if (index > 0 && IsCorrectionBoundary(points[index - 1], point))
+            {
+                correctionBoundaries.Add(new(index, points[index - 1].Timestamp, point.Timestamp));
+            }
+
+            points[index] = point;
         }
 
         var effectiveRemaining = BuildEffectiveRemaining(points);
@@ -131,6 +161,7 @@ public sealed class GraphScene
             sol,
             terra,
             luna,
+            correctionBoundaries,
             BuildIdleIntervals(points, start, end),
             maximum);
     }
@@ -150,6 +181,7 @@ public sealed class GraphScene
 
         var values = new double?[points.Count];
         var activeSegments = new bool[Math.Max(0, points.Count - 1)];
+        var correctionSegments = new bool[Math.Max(0, points.Count - 1)];
         var interpolated = new bool[points.Count];
         values[0] = rawValues[0] is { } first && double.IsFinite(first)
             ? Math.Clamp(first, 0, 100)
@@ -157,31 +189,43 @@ public sealed class GraphScene
         var quotaObservedSinceModelChange = true;
         for (var index = 1; index < points.Count; index++)
         {
-            var previous = values[index - 1] ?? 100;
+            var previousObserved = values[index - 1];
+            var previous = previousObserved ?? 100;
+            var correctionBoundary = IsCorrectionBoundary(points[index - 1], points[index]);
+            correctionSegments[index - 1] = correctionBoundary;
             var modelAdvanced = ModelAdvanced(points[index - 1], points[index]);
             var syntheticGap = IsSyntheticRemainingGap(points, index, points[0].Timestamp);
-            activeSegments[index - 1] = modelAdvanced && !syntheticGap;
+            activeSegments[index - 1] = modelAdvanced && !syntheticGap && !correctionBoundary;
             var observed = rawValues[index] is { } raw && double.IsFinite(raw)
                 ? Math.Clamp(raw, 0, 100)
                 : (double?)null;
-            if (modelAdvanced)
+            if (correctionBoundary)
             {
-                values[index] = observed is { } activeRaw
-                    ? Math.Min(previous, activeRaw)
-                    : previous;
+                // A correction starts a new source segment. Never carry the
+                // old quota into it; a missing new observation remains
+                // unknown until the source supplies one.
+                values[index] = observed;
                 quotaObservedSinceModelChange = observed is not null;
             }
-            else if (!quotaObservedSinceModelChange && observed is { } delayedRaw && delayedRaw < previous)
+            else if (modelAdvanced)
+            {
+                values[index] = observed is { } activeRaw
+                    ? previousObserved is { } prior ? Math.Min(prior, activeRaw) : activeRaw
+                    : previousObserved;
+                quotaObservedSinceModelChange = observed is not null;
+            }
+            else if (!quotaObservedSinceModelChange && previousObserved is { } prior &&
+                     observed is { } delayedRaw && delayedRaw < prior)
             {
                 // The quota poll can lag behind session usage. Accept the
                 // first lower endpoint after that unobserved active interval,
                 // but keep a genuinely idle period horizontal.
-                values[index] = Math.Min(previous, delayedRaw);
+                values[index] = Math.Min(prior, delayedRaw);
                 quotaObservedSinceModelChange = true;
             }
             else
             {
-                values[index] = previous;
+                values[index] = previousObserved;
             }
         }
 
@@ -207,6 +251,21 @@ public sealed class GraphScene
             }
 
             if (right >= points.Count || source[right] is not { } next || next >= previous)
+            {
+                continue;
+            }
+
+            var crossesCorrectionBoundary = false;
+            for (var segment = left; segment < right; segment++)
+            {
+                if (correctionSegments[segment])
+                {
+                    crossesCorrectionBoundary = true;
+                    break;
+                }
+            }
+
+            if (crossesCorrectionBoundary)
             {
                 continue;
             }
@@ -262,6 +321,11 @@ public sealed class GraphScene
 
         for (var index = 1; index < values.Length; index++)
         {
+            if (correctionSegments[index - 1])
+            {
+                continue;
+            }
+
             if (!activeSegments[index - 1] &&
                 points[index].Timestamp != points[index - 1].Timestamp &&
                 !IsSyntheticRemainingGap(points, index, points[0].Timestamp))
@@ -317,7 +381,9 @@ public sealed class GraphScene
             // as unused/unobserved and draws any cumulative increase at the
             // observed endpoint.  Preserve the boundary so the remaining
             // line does not turn the unknown interval into a diagonal.
-            var preserveBoundary = syntheticGap || (unobservedGap && modelChanged);
+            var correctionBoundary = IsCorrectionBoundary(before, after);
+            var preserveBoundary = !correctionBoundary &&
+                (syntheticGap || (unobservedGap && modelChanged));
 
             if (intervals.Count > 0)
             {
@@ -401,6 +467,9 @@ public sealed class GraphScene
 
     private static bool ModelAdvanced(ScenePoint before, ScenePoint after) =>
         after.Sol > before.Sol || after.Terra > before.Terra || after.Luna > before.Luna;
+
+    private static bool IsCorrectionBoundary(ScenePoint before, ScenePoint after) =>
+        after.Sol < before.Sol || after.Terra < before.Terra || after.Luna < before.Luna;
 
     private static bool ModelsEqual(ScenePoint before, ScenePoint after) =>
         before.Sol == after.Sol && before.Terra == after.Terra && before.Luna == after.Luna;

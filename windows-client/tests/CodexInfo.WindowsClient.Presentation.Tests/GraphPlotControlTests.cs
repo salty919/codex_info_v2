@@ -752,6 +752,100 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public async Task Shared_cumulative_correction_fixture_preserves_latest_values_and_splits_segments()
+    {
+        var fixturePath = Path.Combine(
+            AppContext.BaseDirectory,
+            "Fixtures",
+            "graph_cumulative_correction.json");
+        using var document = JsonDocument.Parse(File.ReadAllText(fixturePath));
+        var root = document.RootElement;
+        var snapshot = await ParseDetailsFixtureAsync(root.GetProperty("details_response"));
+        var period = Assert.Single(snapshot.HistoryPeriods);
+        var expectedPeriodStart = root.GetProperty("expected_period_start").GetInt64();
+        var expectedPeriodEnd = root.GetProperty("expected_period_end").GetInt64();
+        var expectedResetAt = root.GetProperty("expected_reset_at").GetInt64();
+        var expectedGraphTimestamps = root.GetProperty("expected_graph_timestamps")
+            .EnumerateArray()
+            .Select(value => value.GetInt64())
+            .ToArray();
+        var expectedCorrectionStarts = root.GetProperty("expected_correction_starts")
+            .EnumerateArray()
+            .Select(value => value.GetInt64())
+            .ToArray();
+        var expectedLatestRemaining = root.GetProperty("expected_latest_remaining").GetDouble();
+        var expectedLatestSolDollars = root.GetProperty("expected_latest_sol_dollars").GetDouble();
+        var expectedLatestSolTokens = root.GetProperty("expected_latest_sol_tokens").GetUInt64();
+
+        Assert.Equal(expectedPeriodStart, period.StartAt);
+        Assert.Equal(expectedPeriodEnd, period.EndAt);
+        Assert.Equal(expectedResetAt, period.ResetAt);
+
+        var graphSamples = GraphWindowViewModel.BuildGraphSamples(period, expectedPeriodEnd);
+        Assert.Equal(expectedGraphTimestamps, graphSamples.Select(sample => sample.Timestamp));
+        Assert.Equal(expectedLatestRemaining, graphSamples[^2].RemainingPercent);
+        Assert.Equal(expectedLatestSolDollars, graphSamples[^2].SolDollars, precision: 6);
+        Assert.Equal(expectedLatestSolTokens, graphSamples[^2].SolTokens);
+
+        var dollars = GraphScene.Create(
+            graphSamples,
+            GraphMetric.Dollars,
+            expectedPeriodStart,
+            expectedPeriodEnd);
+        var tokens = GraphScene.Create(
+            graphSamples,
+            GraphMetric.Tokens,
+            expectedPeriodStart,
+            expectedPeriodEnd);
+
+        Assert.Equal(expectedCorrectionStarts, dollars.CorrectionBoundaries.Select(boundary => boundary.AfterAt));
+        Assert.Equal(expectedCorrectionStarts, tokens.CorrectionBoundaries.Select(boundary => boundary.AfterAt));
+        Assert.Equal([2, 4], dollars.CorrectionBoundaries.Select(boundary => boundary.PointIndex));
+        Assert.Equal([2, 4], tokens.CorrectionBoundaries.Select(boundary => boundary.PointIndex));
+        Assert.Equal(
+            [73d, 73d, 73d, 70d, 70d, 62d, 62d],
+            dollars.Remaining);
+        Assert.Equal(dollars.Remaining, tokens.Remaining);
+
+        AssertSceneModelValues(
+            dollars,
+            [176.04182, 176.04182, 87.483049, 103.320445, 87.256537, 127.284527, 127.284527],
+            expectedLatestSolDollars);
+        AssertSceneModelValues(
+            tokens,
+            [264712012d, 264712012d, 132498115d, 156116016d, 131964424d, 184314549d, 184314549d],
+            expectedLatestSolTokens);
+
+        foreach (var scene in new[] { dollars, tokens })
+        {
+            var remainingLine = GraphPlotProjection.BuildRemainingLine(scene);
+            foreach (var boundary in scene.CorrectionBoundaries)
+            {
+                Assert.False(ContainsSegment(remainingLine, boundary.BeforeAt, boundary.AfterAt));
+                foreach (var values in new[] { scene.Sol, scene.Terra, scene.Luna })
+                {
+                    var modelLines = GraphPlotProjection.BuildModelLines(scene, values);
+                    Assert.False(ContainsSegment(modelLines.Flat, boundary.BeforeAt, boundary.AfterAt));
+                    Assert.False(ContainsSegment(modelLines.Rising, boundary.BeforeAt, boundary.AfterAt));
+                }
+            }
+
+            var labels = GraphPlotProjection.BuildEndpointLabels(scene, CultureInfo.InvariantCulture);
+            var solLabel = Assert.Single(labels, label => label.Series == GraphSeries.Sol);
+            var remainingLabel = Assert.Single(labels, label => label.Series == GraphSeries.Remaining);
+            Assert.Equal(expectedLatestRemaining, remainingLabel.PointAxisValue);
+            Assert.Equal(expectedLatestRemaining.ToString("0.#", CultureInfo.InvariantCulture) + "%", remainingLabel.Text);
+            Assert.Equal(
+                scene.Metric == GraphMetric.Dollars ? expectedLatestSolDollars : expectedLatestSolTokens,
+                solLabel.PointAxisValue,
+                precision: 6);
+            Assert.Equal(
+                scene.Metric == GraphMetric.Dollars ? "SOL $127.28" : "SOL 184.3M",
+                solLabel.Text);
+        }
+    }
+
+    [Fact]
     public async Task Shared_rollover_fixture_atomically_refreshes_open_main_graph_and_threads_from_details()
     {
         var fixturePath = Path.Combine(
@@ -950,6 +1044,23 @@ public sealed class GraphPlotControlTests
         Assert.Equal(expected.TerraTokens, actual.TerraTokens);
         Assert.Equal(expected.LunaTokens, actual.LunaTokens);
     }
+
+    private static void AssertSceneModelValues(
+        GraphScene scene,
+        IReadOnlyList<double> expectedSol,
+        double expectedLatest)
+    {
+        Assert.Equal(expectedSol.Count, scene.Sol.Count);
+        for (var index = 0; index < expectedSol.Count; index++)
+        {
+            Assert.Equal(expectedSol[index], scene.Sol[index], precision: 6);
+        }
+
+        Assert.Equal(expectedLatest, scene.Sol[^1], precision: 6);
+    }
+
+    private static bool ContainsSegment(GraphLineProjection line, long beforeAt, long afterAt) =>
+        line.X.Zip(line.X.Skip(1)).Any(pair => pair.First == beforeAt && pair.Second == afterAt);
 
     private static async Task<ApiDetailsSnapshot> ParseDetailsFixtureAsync(JsonElement response)
     {
