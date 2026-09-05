@@ -92,6 +92,61 @@ require_update_property_contract() {
     done
 }
 
+workflow_file=.github/workflows/windows-client.yml
+require_file "$workflow_file"
+require_text "$workflow_file" 'Run pre-publication first-fixed bootstrap/Inno previous-stable to candidate transition'
+require_text "$workflow_file" 'if: inputs.release_candidate'
+require_text "$workflow_file" 'timeout-minutes: 20'
+require_text "$workflow_file" 'GITHUB_TOKEN: ${{ github.token }}'
+require_text "$workflow_file" 'CANDIDATE_SOURCE_SHA: ${{ inputs.source_sha }}'
+require_text "$workflow_file" '$candidateManifest.installer.name'
+require_text "$workflow_file" '$candidateManifest.installer.url'
+require_text "$workflow_file" '$candidateManifest.installer.sha256'
+require_text "$workflow_file" '$candidateManifest.installer.size'
+require_text "$workflow_file" '$previousManifest.installer.name'
+require_text "$workflow_file" '$previousManifest.installer.url'
+require_text "$workflow_file" '$previousManifest.installer.sha256'
+require_text "$workflow_file" '$previousManifest.installer.size'
+require_text "$workflow_file" '$previousVersion+$previousSource'
+require_text "$workflow_file" '$candidateVersion+$candidateSource'
+require_text "$workflow_file" "Get-ScheduledTask -TaskPath '\\' -TaskName \$TaskName"
+require_text "$workflow_file" "CodexInfo.WindowsClient.Update.Logon"
+require_text "$workflow_file" "CodexInfo.WindowsClient.Update.Hourly"
+require_text "$workflow_file" "'--update-only'"
+require_text "$workflow_file" "'PT1H'"
+require_text "$workflow_file" 'top-level main Release acceptance must join same-source Linux distribution'
+require_text "$workflow_file" 'publish=false'
+
+bootstrap_block="$({
+    sed -n '/- name: Run pre-publication first-fixed bootstrap\/Inno previous-stable to candidate transition/,/- name: Smoke-test clean install and uninstall lifecycle/p' "$workflow_file"
+})"
+[[ -n "$bootstrap_block" ]] || fail 'pre-publication bootstrap transition step body is missing'
+candidate_install_count="$(awk 'index($0, "$candidateInstallProcess = Start-Process -FilePath $candidateSetup") { count++ } END { print count + 0 }' <<<"$bootstrap_block")"
+previous_install_count="$(awk 'index($0, "$previousInstallProcess = Start-Process -FilePath $previousSetupPath") { count++ } END { print count + 0 }' <<<"$bootstrap_block")"
+[[ "$candidate_install_count" -eq 1 ]] ||
+    fail "pre-publication E2E must invoke candidate Setup exactly once: count=$candidate_install_count"
+[[ "$previous_install_count" -eq 1 ]] ||
+    fail "pre-publication E2E must invoke previous stable Setup exactly once: count=$previous_install_count"
+if rg -q --fixed-strings 'continue-on-error:' <<<"$bootstrap_block"; then
+    fail 'pre-publication bootstrap transition must not continue on error'
+fi
+if rg -q --fixed-strings '$uiOutput = @(& ./windows-client/tools/Run-WindowsClientE2E.ps1' <<<"$bootstrap_block"; then
+    fail 'pre-publication bootstrap transition must use the UI command exit/readback contract, not log parsing'
+fi
+e2e_line="$(rg -n --fixed-strings -- '- name: Run pre-publication first-fixed bootstrap/Inno previous-stable to candidate transition' "$workflow_file" | cut -d: -f1)"
+smoke_line="$(rg -n --fixed-strings -- '- name: Smoke-test clean install and uninstall lifecycle' "$workflow_file" | cut -d: -f1)"
+upload_line="$(rg -n --fixed-strings -- '- name: Upload release candidate' "$workflow_file" | cut -d: -f1)"
+[[ "$e2e_line" =~ ^[0-9]+$ && "$smoke_line" =~ ^[0-9]+$ && "$upload_line" =~ ^[0-9]+$ &&
+    "$e2e_line" -lt "$smoke_line" && "$e2e_line" -lt "$upload_line" ]] ||
+    fail 'pre-publication update E2E must precede smoke and release-candidate upload'
+
+clean_install_block="$({
+    sed -n '/- name: Smoke-test clean install and uninstall lifecycle/,/- name: Run installed Windows UI Automation E2E/p' "$workflow_file"
+})"
+clean_install_count="$(awk 'index($0, "Start-Process -FilePath $setup") { count++ } END { print count + 0 }' <<<"$clean_install_block")"
+[[ "$clean_install_count" -eq 1 ]] ||
+    fail "clean-install smoke must not reinstall the same candidate Setup: count=$clean_install_count"
+
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenGraph"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenThreads"'
 require_text windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml 'Click="OnOpenLegal"'
