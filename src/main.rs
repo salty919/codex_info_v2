@@ -9388,17 +9388,27 @@ impl CodexInfoState {
             Vec::new()
         };
         models.sort_by(|left, right| left.model.cmp(&right.model));
+        // Preserve observation order within each timestamp so max_by_key
+        // retains the existing last-wins behavior for equal priorities.
+        // Each public row only needs observations at its own timestamp.
+        let mut observations_by_timestamp = BTreeMap::<_, Vec<_>>::new();
+        for observation in &self.history.observations {
+            observations_by_timestamp
+                .entry(observation.timestamp)
+                .or_default()
+                .push(observation);
+        }
         let history_samples = v2
             .history_samples
             .iter()
             .map(|sample| {
-                let source = self
-                    .history
-                    .observations
-                    .iter()
+                let source = observations_by_timestamp
+                    .get(&sample.timestamp)
+                    .into_iter()
+                    .flatten()
+                    .copied()
                     .filter(|observation| {
-                        observation.timestamp == sample.timestamp
-                            && observation.reset_at.abs_diff(sample.reset_at) <= 60
+                        observation.reset_at.abs_diff(sample.reset_at) <= 60
                     })
                     .max_by_key(|observation| {
                         (
