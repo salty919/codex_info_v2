@@ -3357,9 +3357,9 @@ impl UsageHistory {
         let (samples, observations) = db_path
             .as_ref()
             .and_then(|path| UsageStore::open_read_only(path).ok())
-            // Startup must never materialize an unbounded database. The
-            // bounded recent read uses the timestamp/reset index and the same
-            // cardinality ceiling as the public details contract.
+            // Startup reads only the recent calendar-month window through the
+            // timestamp/reset index. Raw reset aliases may exceed the public
+            // minute count; the public canonicalizer owns that logical bound.
             .and_then(|store| store.load_recent_observations(now).ok())
             .map(|observations| {
                 let samples = observations
@@ -4358,9 +4358,7 @@ fn remaining_marker_positions(
     period_start: i64,
     period_end: i64,
 ) -> Vec<RemainingMarkerPosition> {
-    let points = graph_points(samples, period_start, period_end, 100.0, |sample| {
-        sample.remaining_percent
-    });
+    let points = remaining_graph_points(samples, period_start, period_end);
     remaining_marker_positions_on_points(&points, period_start, period_end)
 }
 
@@ -4420,12 +4418,9 @@ fn graph_time_endpoints(
     if points.is_empty() {
         return points;
     }
-    let mut extended = Vec::with_capacity(points.len() + 2);
-    // セッション開始から最初の記録までは累積0を明示する。
-    extended.push(HourlyModelSpend {
-        timestamp: period_start,
-        ..HourlyModelSpend::default()
-    });
+    let mut extended: Vec<HourlyModelSpend> = Vec::with_capacity(points.len() + 1);
+    // The interval before the first observation is unknown. Start at the
+    // first source point instead of manufacturing a zero-valued baseline.
     for point in points
         .iter()
         .copied()
@@ -4616,48 +4611,6 @@ fn minute_model_spend_for_metric_with_untrusted(
         .collect()
 }
 
-#[cfg(test)]
-fn stacked_area_path(
-    points: &[HourlyModelSpend],
-    period_start: i64,
-    period_end: i64,
-    maximum: f64,
-    bounds: impl Fn(&HourlyModelSpend) -> (f64, f64),
-) -> String {
-    if points.is_empty() {
-        return String::new();
-    }
-    // すべて$0の期間も、下端に0基線を描いて「データなし」と区別する。
-    if maximum <= 0.0 {
-        return "M0.00 99.00 L100.00 99.00".into();
-    }
-    let span = (period_end - period_start).max(1) as f64;
-    let coordinate = |timestamp: i64, value: f64| {
-        let x = ((timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
-        // strokeがclip領域の外へ半分切れないよう、0/最大値を内側へ1%だけ寄せる。
-        let y = (99.0 - value / maximum * 98.0).clamp(1.0, 99.0);
-        (x, y)
-    };
-    let upper = points
-        .iter()
-        .map(|point| coordinate(point.timestamp, bounds(point).1))
-        .collect::<Vec<_>>();
-    let lower = points
-        .iter()
-        .rev()
-        .map(|point| coordinate(point.timestamp, bounds(point).0))
-        .collect::<Vec<_>>();
-    let mut commands = format!("M{:.2} {:.2}", upper[0].0, upper[0].1);
-    for (x, y) in upper.iter().skip(1) {
-        commands.push_str(&format!(" L{x:.2} {y:.2}"));
-    }
-    for (x, y) in lower {
-        commands.push_str(&format!(" L{x:.2} {y:.2}"));
-    }
-    commands.push_str(" Z");
-    commands
-}
-
 /// Draws one metric independently from the other model series. Token mode
 /// uses this path so enabling LUNA cannot turn SOL into a LUNA+SOL boundary.
 fn metric_line_path_with_confirmed_gaps(
@@ -4670,9 +4623,6 @@ fn metric_line_path_with_confirmed_gaps(
 ) -> String {
     if points.is_empty() {
         return String::new();
-    }
-    if maximum <= 0.0 {
-        return "M0.00 99.00 L100.00 99.00".into();
     }
     let (flat, rising, inferred) = split_metric_line_paths_with_confirmed_gaps(
         points,
@@ -4865,14 +4815,6 @@ fn unused_interval_positions_with_confirmed_gaps(
         .into_iter()
         .all(|(before, after)| before.is_finite() && after.is_finite() && before == after)
             && !unreliable;
-        let synthetic_zero_gap = previous.timestamp == period_start
-            && current.timestamp.saturating_sub(previous.timestamp) > 60
-            && previous.sol == 0.0
-            && previous.terra == 0.0
-            && previous.luna == 0.0
-            && [current.sol, current.terra, current.luna]
-                .into_iter()
-                .any(|value| value.is_finite() && value > 0.0);
         // A long observation gap ending at a later cumulative value contains
         // no evidence of when usage occurred. Render the whole unobserved
         // interval as idle, then let the model line make the vertical change
@@ -4886,7 +4828,7 @@ fn unused_interval_positions_with_confirmed_gaps(
             ]
             .into_iter()
             .any(|(before, after)| after > before);
-        if !unchanged && !synthetic_zero_gap && !unobserved_active_gap && !unreliable {
+        if !unchanged && !unobserved_active_gap && !unreliable {
             continue;
         }
         let start = to_x(interval_start);
@@ -4894,7 +4836,7 @@ fn unused_interval_positions_with_confirmed_gaps(
         if end <= start {
             continue;
         }
-        let preserve_boundary = synthetic_zero_gap || unobserved_active_gap || unreliable;
+        let preserve_boundary = unobserved_active_gap || unreliable;
         if let Some(last) = intervals.last_mut() {
             let last_end = last.start + last.width;
             if last.preserve_boundary == preserve_boundary
@@ -5037,68 +4979,6 @@ fn format_metric_value(value: f64, show_tokens: bool) -> String {
     }
 }
 
-#[cfg(test)]
-fn graph_points(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    maximum: f64,
-    value: impl Fn(&UsageHistorySample) -> f64,
-) -> Vec<(i64, f64)> {
-    smooth_remaining_points(&collapse_remaining_change_points(&raw_graph_points(
-        samples,
-        period_start,
-        period_end,
-        maximum,
-        value,
-    )))
-}
-
-#[cfg(test)]
-fn raw_graph_points(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    maximum: f64,
-    value: impl Fn(&UsageHistorySample) -> f64,
-) -> Vec<(i64, f64)> {
-    let mut observed = samples
-        .iter()
-        .filter_map(|sample| {
-            let raw = value(sample);
-            (raw.is_finite() && raw >= 0.0).then_some((sample.timestamp, raw))
-        })
-        .collect::<Vec<_>>();
-    observed.sort_by_key(|(timestamp, _)| *timestamp);
-    let has_observation = !observed.is_empty();
-
-    // リセット開始時点は仕様上、残り利用枠100%である。最初の実測値が
-    // 取得された時刻より後でも、グラフの左端を欠落させない。
-    let mut points = vec![(period_start, maximum)];
-    for (timestamp, raw) in observed {
-        let timestamp = timestamp.clamp(period_start, period_end);
-        if points
-            .last()
-            .is_some_and(|(last_timestamp, _)| *last_timestamp == timestamp)
-        {
-            points.last_mut().expect("points has an anchor").1 = raw;
-            continue;
-        }
-        points.push((timestamp, raw));
-    }
-
-    if has_observation {
-        if let Some((last_timestamp, last_raw)) = points.last().copied() {
-            if last_timestamp < period_end {
-                // 最新の実測値は現在時刻まで水平に保持する。未知の値を
-                // 現在時刻へ斜めに補間しない。
-                points.push((period_end, last_raw));
-            }
-        }
-    }
-    points
-}
-
 /// Builds the remaining-quota line from the same cumulative model snapshots
 /// used by the SOL/TERRA/LUNA lines. Model snapshots define active versus idle
 /// intervals: idle intervals stay horizontal, while remaining samples in
@@ -5174,13 +5054,12 @@ fn remaining_graph_points_for_metric_with_sources(
             (!conflicting).then_some((timestamp, first.clamp(0.0, 100.0)))
         })
         .collect::<BTreeMap<_, _>>();
-    let mut raw_remaining = vec![(period_start, 100.0)];
+    let mut raw_remaining = Vec::with_capacity(scoped_remaining.len() + 1);
     for (timestamp, value) in scoped_remaining.iter() {
-        if *timestamp == period_start {
-            raw_remaining[0].1 = *value;
-        } else {
-            raw_remaining.push((*timestamp, *value));
-        }
+        raw_remaining.push((*timestamp, *value));
+    }
+    if raw_remaining.is_empty() {
+        return raw_remaining;
     }
     if scoped_remaining
         .keys()
@@ -5190,7 +5069,7 @@ fn remaining_graph_points_for_metric_with_sources(
         let last_value = raw_remaining
             .last()
             .map(|(_, value)| *value)
-            .unwrap_or(100.0);
+            .expect("remaining observations are non-empty");
         raw_remaining.push((period_end, last_value));
     }
     if raw_remaining.len() < 2 {
@@ -5204,11 +5083,8 @@ fn remaining_graph_points_for_metric_with_sources(
     );
     let remaining_by_timestamp = raw_remaining.iter().copied().collect::<BTreeMap<_, _>>();
 
-    let initial_remaining = remaining_by_timestamp
-        .get(&period_start)
-        .copied()
-        .unwrap_or(100.0)
-        .clamp(0.0, 100.0);
+    let (initial_timestamp, initial_remaining) = raw_remaining[0];
+    let initial_remaining = initial_remaining.clamp(0.0, 100.0);
     if model_points.len() < 2 {
         // The remote quota source remains authoritative even when no local
         // Session/log observation is available. Preserve every known quota
@@ -5238,11 +5114,11 @@ fn remaining_graph_points_for_metric_with_sources(
     // model evidence is idle or unavailable; preserve it at its observed
     // time and let the evidence renderer mark the mismatch as inferred.
     // Repeated active quota samples are completed by interpolation below.
-    let mut points = vec![(period_start, initial_remaining)];
+    let mut points = vec![(initial_timestamp, initial_remaining)];
     let mut active_segments = Vec::with_capacity(model_points.len() + 1);
     let mut previous_remaining = initial_remaining;
     let mut previous_model = model_points[0];
-    let mut previous_timestamp = period_start;
+    let mut previous_timestamp = initial_timestamp;
     // A quota value can arrive after the last model snapshot (the recorder
     // and quota poll are independent). Keep track of whether a real quota
     // endpoint has already been observed since the latest model change; only
@@ -5262,13 +5138,7 @@ fn remaining_graph_points_for_metric_with_sources(
         let model_changed = current_model.sol > previous_model.sol
             || current_model.terra > previous_model.terra
             || current_model.luna > previous_model.luna;
-        let synthetic_zero_gap = previous_timestamp == period_start
-            && timestamp.saturating_sub(previous_timestamp) > 60
-            && previous_model.sol == 0.0
-            && previous_model.terra == 0.0
-            && previous_model.luna == 0.0
-            && model_changed;
-        let active = model_changed && !synthetic_zero_gap;
+        let active = model_changed;
         let matched_remaining = if model_changed && !unreliable_model {
             latest_remaining_for_model_change(
                 &remaining_by_timestamp,
@@ -5328,14 +5198,7 @@ fn remaining_graph_points_for_metric_with_sources(
             quota_observed_since_model_change = true;
         }
 
-        if synthetic_zero_gap {
-            // Reset=100% and the first remote observation are the only two
-            // known endpoints. Connect them as one inferred interval; a
-            // flat-then-vertical corner at the first observation would claim
-            // all earlier consumption happened instantaneously.
-            points.push((timestamp, next_remaining));
-            active_segments.push(true);
-        } else if unreliable_model {
+        if unreliable_model {
             // Model attribution is unavailable, but quota observations still
             // have their own authority. Keep them at their observed minute
             // and let the evidence path render any completion across missing
@@ -5544,27 +5407,6 @@ fn smooth_remaining_points_with_activity(
     smoothed
 }
 
-#[cfg(test)]
-fn collapse_remaining_change_points(points: &[(i64, f64)]) -> Vec<(i64, f64)> {
-    if points.len() < 2 {
-        return points.to_vec();
-    }
-
-    let mut collapsed = Vec::with_capacity(points.len());
-    collapsed.push(points[0]);
-    for (index, &(timestamp, raw)) in points.iter().enumerate().skip(1) {
-        let previous = collapsed.last().expect("first point is present").1;
-        // Remaining quota is monotonic between resets. Clamp a transient
-        // upward reread before deciding whether this is a visible change.
-        let value = raw.min(previous);
-        let is_period_end = index + 1 == points.len();
-        if value < previous || is_period_end {
-            collapsed.push((timestamp, value));
-        }
-    }
-    collapsed
-}
-
 fn quota_point_is_observed(samples: &[&UsageHistorySample], timestamp: i64, value: f64) -> bool {
     let minute = timestamp.div_euclid(60) * 60;
     samples.iter().any(|sample| {
@@ -5680,27 +5522,6 @@ fn remaining_graph_y(remaining: f64) -> f64 {
     (99.0 - remaining * 0.98).clamp(1.0, 99.0)
 }
 
-#[cfg(test)]
-fn smooth_remaining_points(points: &[(i64, f64)]) -> Vec<(i64, f64)> {
-    if points.len() < 3 {
-        return points.to_vec();
-    }
-    let mut smoothed = Vec::with_capacity(points.len());
-    smoothed.push(points[0]);
-    for index in 1..points.len() - 1 {
-        let average = (points[index - 1].1 + 2.0 * points[index].1 + points[index + 1].1) / 4.0;
-        // 利用枠はリセットまで増えないため、計測ノイズによる逆戻りを除く。
-        let value = average.min(smoothed.last().expect("anchor exists").1);
-        smoothed.push((points[index].0, value));
-    }
-    let last = points.last().expect("points has at least three items");
-    smoothed.push((
-        last.0,
-        last.1.min(smoothed.last().expect("anchor exists").1),
-    ));
-    smoothed
-}
-
 fn smooth_model_spend(points: &[HourlyModelSpend]) -> Vec<HourlyModelSpend> {
     if points.len() < 3 {
         return points.to_vec();
@@ -5708,7 +5529,7 @@ fn smooth_model_spend(points: &[HourlyModelSpend]) -> Vec<HourlyModelSpend> {
     let mut smoothed = Vec::with_capacity(points.len());
     smoothed.push(points[0]);
     for index in 1..points.len() - 1 {
-        let previous = *smoothed.last().expect("zero anchor exists");
+        let previous = *smoothed.last().expect("previous point exists");
         let current = points[index];
         let next = points[index + 1];
         if !model_spend_is_reliable(&previous)
@@ -15320,14 +15141,14 @@ mod tests {
     use super::{
         account_window_title, active_thread_model_counts, active_thread_rows_at,
         canonicalize_public_history_samples, clamp_graph_preview_size,
-        collapse_remaining_change_points, collect_recovery_usage, collect_session_usage_file,
+        collect_recovery_usage, collect_session_usage_file,
         complete_rollout_prefix_len, current_history_period_reset, current_label_connector_path,
         detail_window_title, fetch_active_thread_update_for_paths,
         fetch_active_thread_update_for_paths_and_state, fetch_service_details,
         fixed_resize_decision, fixed_resize_decision_for_scale, format_elapsed,
         format_estimated_cost, format_model_usage_columns, format_percent, format_period_label,
         graph_paths, graph_paths_for_selection, graph_paths_for_selection_with_confirmed_gaps,
-        graph_points, graph_time_endpoints, is_service_health_response,
+        graph_time_endpoints, is_service_health_response,
         local_input_inventory_for_paths, minute_model_spend, minute_model_spend_for_metric,
         model_spend_is_reliable, model_usage_timeline_from_events, monthly_window_seconds,
         native_account_window_title, native_legal_pages, native_startup_loading,
@@ -15341,8 +15162,8 @@ mod tests {
         request_with_timeout, reset_transition_is_boundary, same_rollout_identity,
         separate_current_label_positions, service_endpoint_state, service_health_response_version,
         service_is_healthy, session_event_model, session_event_type, session_jsonl_files,
-        session_token_snapshot, smooth_model_spend, smooth_remaining_points,
-        split_metric_line_paths, stacked_area_path, terminate_and_reap_owned_child,
+        session_token_snapshot, smooth_model_spend,
+        split_metric_line_paths, terminate_and_reap_owned_child,
         thread_presentation_rows, three_months_before_utc, unreliable_model_spend,
         unused_interval_positions, visible_window_position, week_remaining_text, ActiveThread,
         ActiveThreadUpdate, ApiServer, ApiServerConfig, CodexInfoState, Event, FixedResizeDecision,
@@ -16029,6 +15850,106 @@ mod tests {
     }
 
     #[test]
+    fn startup_load_keeps_dense_alias_history_and_publishes_each_period() {
+        let db_path = test_history_path("dense-alias-restart");
+        let now = Utc.with_ymd_and_hms(2026, 8, 31, 12, 0, 0).unwrap();
+        let current_start = now.timestamp() - 5 * 86_400;
+        let previous_reset = current_start;
+        let current_reset = current_start + WEEK_SECONDS;
+        drop(UsageStore::open(&db_path).unwrap());
+
+        let mut connection = rusqlite::Connection::open(&db_path).unwrap();
+        {
+            let transaction = connection.transaction().unwrap();
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "INSERT INTO usage_history (timestamp, reset_at, remaining_percent, \
+                         sol_dollars, terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens) \
+                         VALUES (?1, ?2, 48, ?3, 0, 0, ?4, 0, 0)",
+                    )
+                    .unwrap();
+                for index in 0..usage_store::MAX_RECENT_HISTORY_SAMPLES {
+                    let timestamp = now.timestamp()
+                        - (usage_store::MAX_RECENT_HISTORY_SAMPLES - 1 - index) as i64 * 60;
+                    let reset_at = if timestamp < current_start {
+                        previous_reset
+                    } else {
+                        current_reset
+                    };
+                    insert
+                        .execute(rusqlite::params![
+                            timestamp,
+                            reset_at,
+                            index as f64,
+                            index as i64,
+                        ])
+                        .unwrap();
+                }
+                insert
+                    .execute(rusqlite::params![
+                        now.timestamp(),
+                        current_reset + 30,
+                        usage_store::MAX_RECENT_HISTORY_SAMPLES as f64,
+                        usage_store::MAX_RECENT_HISTORY_SAMPLES as i64,
+                    ])
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        drop(connection);
+
+        let history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), now);
+        assert_eq!(
+            history.samples.len(),
+            usage_store::MAX_RECENT_HISTORY_SAMPLES + 1
+        );
+
+        let mut state = CodexInfoState::preview("normal");
+        state.history = history;
+        state.last_success_at = Some(now.timestamp());
+        state.reset_at = Some(current_reset);
+        state.window_seconds = WEEK_SECONDS;
+        let details = state.public_details_candidate_at(now.timestamp()).unwrap();
+
+        assert_eq!(details.history_periods.len(), 2);
+        assert_eq!(
+            details.history_samples.len(),
+            usage_store::MAX_RECENT_HISTORY_SAMPLES
+        );
+        let expected_timestamps = (0..usage_store::MAX_RECENT_HISTORY_SAMPLES)
+            .map(|index| {
+                now.timestamp() - (usage_store::MAX_RECENT_HISTORY_SAMPLES - 1 - index) as i64 * 60
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            details
+                .history_samples
+                .iter()
+                .map(|sample| sample.timestamp)
+                .collect::<Vec<_>>(),
+            expected_timestamps
+        );
+        assert_eq!(
+            details
+                .history_samples
+                .first()
+                .map(|sample| sample.timestamp),
+            Some(now.timestamp() - (usage_store::MAX_RECENT_HISTORY_SAMPLES - 1) as i64 * 60)
+        );
+        assert_eq!(
+            details
+                .history_samples
+                .last()
+                .map(|sample| sample.timestamp),
+            Some(now.timestamp())
+        );
+        details.validate().unwrap();
+
+        let _ = fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    #[test]
     fn public_details_preserves_256_thread_rows_and_all_fields_for_publication() {
         let mut state = CodexInfoState::preview("normal");
         state.active_threads = (0..MAX_PUBLIC_THREADS)
@@ -16167,7 +16088,7 @@ mod tests {
     #[test]
     fn public_details_materializes_exactly_one_calendar_month() {
         let mut state = CodexInfoState::preview("normal");
-        let now = Utc::now();
+        let now = Utc.with_ymd_and_hms(2026, 8, 31, 12, 0, 0).unwrap();
         let now_timestamp = now.timestamp();
         let cutoff = one_month_before_utc(now);
         let cutoff_minute = cutoff.div_euclid(60) * 60;
@@ -16692,7 +16613,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_model_totals_survive_restart_drift_and_clear_only_on_rollover() {
+    fn period_admission_preserves_durable_totals_during_drift_and_clears_on_rollover() {
         let now = 2_000_000_000;
         let two_days = 2 * 86_400;
         let durable_total = super::usage_store::SessionModelTotal {
@@ -18402,7 +18323,7 @@ mod tests {
     #[test]
     fn v2_candidate_reuses_v1_canonical_rows_for_drift_duplicates_and_unavailable() {
         let mut state = CodexInfoState::preview("normal");
-        let observed_at = Utc::now().timestamp().div_euclid(60) * 60;
+        let observed_at = 1_800_000_000_i64;
         let reset_at = observed_at + WEEK_SECONDS;
         let unavailable_at = observed_at - 180;
         let duplicate_at = observed_at - 120;
@@ -18490,7 +18411,7 @@ mod tests {
     #[test]
     fn graph_breaks_for_legacy_and_unavailable_until_confirmed_recovery() {
         let mut state = CodexInfoState::preview("normal");
-        let observed_at = Utc::now().timestamp().div_euclid(60) * 60;
+        let observed_at = 1_800_000_000_i64;
         let reset_at = observed_at + WEEK_SECONDS;
         let confirmed_start = UsageHistorySample {
             timestamp: observed_at - 180,
@@ -24309,7 +24230,7 @@ mod tests {
 
     #[test]
     fn shared_graph_fixture_is_the_x_history_oracle() {
-        const SPEC_REMAINING: [f64; 6] = [100.0, 87.0, 44.0, 1.0, 1.0, 1.0];
+        const SPEC_REMAINING: [f64; 5] = [87.0, 44.0, 1.0, 1.0, 1.0];
         const SPEC_SOL_MAX: f64 = 420.40;
         const SPEC_PERIOD_COUNT: usize = 1;
         let fixture: GraphFixture =
@@ -24321,7 +24242,7 @@ mod tests {
         assert_eq!(fixture.expected_sol_max, SPEC_SOL_MAX);
         assert_eq!(fixture.expected_period_count, SPEC_PERIOD_COUNT);
         assert_eq!(fixture.expected_raw_timestamps.len(), 5);
-        assert_eq!(fixture.expected_graph_timestamps.len(), 6);
+        assert_eq!(fixture.expected_graph_timestamps.len(), 5);
 
         let wire = &fixture.details_response;
         assert_eq!(wire.api_version, "v1");
@@ -24411,19 +24332,16 @@ mod tests {
         );
         assert_eq!(
             remaining.first(),
-            Some(&(fixture.expected_period_start, 100.0))
+            Some(&(fixture.expected_raw_timestamps[0], 87.0))
         );
-        assert_eq!(remaining.get(1).map(|point| point.1), Some(87.0));
-        assert_eq!(remaining.get(2).map(|point| point.1), Some(44.0));
+        assert_eq!(remaining.get(1).map(|point| point.1), Some(44.0));
         assert!(remaining.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert!(!remaining.windows(2).any(|pair| {
             pair[0].0 == pair[1].0 && (pair[0].1 - pair[1].1).abs() > f64::EPSILON
         }));
-        // The period boundary and first observation form a time-spanning
-        // inferred interval. Never fabricate a flat prefix followed by a
-        // same-timestamp vertical quota drop.
-        assert!(remaining[0].0 < selected[0].timestamp);
-        assert_eq!(remaining[1].0, selected[0].timestamp);
+        // No observation exists between the period boundary and the first
+        // source row, so the graph starts at that row without a prefix.
+        assert_eq!(remaining[0].0, selected[0].timestamp);
 
         let minute = graph_time_endpoints(
             minute_model_spend_for_metric(&references, false),
@@ -24443,10 +24361,17 @@ mod tests {
         // confirmed solid segment in the native graph.
         assert!(graph.sol_rising.is_empty());
         assert_eq!(graph.current_sol_label, "$420.40");
+        let first_observation_x = (fixture.expected_raw_timestamps[0]
+            - fixture.expected_period_start) as f64
+            / (fixture.expected_period_end - fixture.expected_period_start) as f64
+            * 100.0;
+        assert!(graph.unused_intervals.iter().any(|interval| {
+            (interval.start - first_observation_x).abs() < 0.000_001 && interval.width > 0.0
+        }));
         assert!(graph
             .unused_intervals
             .iter()
-            .any(|interval| { interval.start.abs() < 0.000_001 && interval.width > 0.0 }));
+            .all(|interval| interval.start + 0.000_001 >= first_observation_x));
 
         let labels = state.graph_time_labels_at(observed_at);
         let expected_labels = [0.0, 0.25, 0.5, 0.75, 1.0].map(|fraction| {
@@ -24940,7 +24865,7 @@ mod tests {
     }
 
     #[test]
-    fn current_period_bounds_stay_canonical_across_quota_reset_jitter() {
+    fn current_period_bounds_stay_canonical_across_selected_reset_drift() {
         const CANONICAL_RESET: i64 = 2_000_010_000;
         const WINDOW_SECONDS: i64 = 3_600;
         const OBSERVED_AT: i64 = CANONICAL_RESET - 30;
@@ -25071,7 +24996,7 @@ mod tests {
     #[test]
     fn fresh_startup_selects_current_minute_canonical_period_end_to_end() {
         const WINDOW_SECONDS: i64 = 3_600;
-        let observed_at = Utc::now().timestamp();
+        let observed_at = 1_800_003_017_i64;
         let raw_start = (observed_at - 3_000).div_euclid(60) * 60 + 34;
         let canonical_reset = raw_start + WINDOW_SECONDS;
         let current_alias = canonical_reset - 1;
@@ -25177,7 +25102,7 @@ mod tests {
     #[test]
     fn fresh_startup_rejects_current_period_with_one_minute_early_owned_row() {
         const WINDOW_SECONDS: i64 = 3_600;
-        let observed_at = Utc::now().timestamp();
+        let observed_at = 1_800_003_017_i64;
         let raw_start = (observed_at - 3_000).div_euclid(60) * 60 + 34;
         let canonical_reset = raw_start + WINDOW_SECONDS;
         let current_alias = canonical_reset - 1;
@@ -25308,9 +25233,8 @@ mod tests {
     #[test]
     fn long_rolling_reset_sequence_stays_in_one_period_after_a_real_boundary() {
         // The affected local history contains a genuine boundary followed by
-        // hundreds of quota observations whose reset_at advances every
-        // minute. The cumulative drift is hours, so a group-wide five-minute
-        // cap incorrectly turned the current graph into many tiny periods.
+        // twelve quota observations whose reset_at advances every minute.
+        // A group-wide five-minute cap incorrectly split this bounded chain.
         let base = 1_800_000_000;
         let stable_reset = base + WEEK_SECONDS;
         let rolling_start = base + 120;
@@ -25380,10 +25304,9 @@ mod tests {
     }
 
     #[test]
-    fn quota_only_reset_fragments_stay_with_the_adjacent_spend_period() {
-        // Historical guard name retained by the release gate. Independent
-        // reset cycles are no longer attached according to quota/model value
-        // shape; only reset grouping/tolerance determines their ownership.
+    fn reset_groups_are_value_shape_neutral() {
+        // Independent reset cycles are not attached according to quota/model
+        // value shape; only reset grouping/tolerance determines ownership.
         let base = 1_810_000_000;
         let stable_reset = base + WEEK_SECONDS;
         let samples = vec![
@@ -25607,7 +25530,7 @@ mod tests {
     }
 
     #[test]
-    fn period_list_is_value_shape_neutral_and_keeps_all_db_rows() {
+    fn raw_period_grouping_is_value_shape_neutral_and_keeps_all_db_rows() {
         let db_path = test_history_path("rolling-reset-artifacts");
         let base = 1_699_999_980;
         let stable_reset = base + 400_000;
@@ -26085,7 +26008,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_model_points_are_anchored_to_start_and_recent_now() {
+    fn graph_model_points_start_at_the_first_observation_and_recent_now() {
         let points = graph_time_endpoints(
             vec![HourlyModelSpend {
                 timestamp: 260,
@@ -26096,14 +26019,14 @@ mod tests {
             100,
             300,
         );
-        assert_eq!(points.first().map(|point| point.timestamp), Some(100));
+        assert_eq!(points.first().map(|point| point.timestamp), Some(260));
         assert_eq!(
             (points[0].sol, points[0].terra, points[0].luna),
-            (0.0, 0.0, 0.0)
+            (3.0, 2.0, 1.0)
         );
         assert_eq!(points.last().map(|point| point.timestamp), Some(300));
         assert_eq!(
-            (points[2].sol, points[2].terra, points[2].luna),
+            (points[1].sol, points[1].terra, points[1].luna),
             (3.0, 2.0, 1.0)
         );
     }
@@ -26124,9 +26047,8 @@ mod tests {
         assert_eq!(points.last().map(|point| point.timestamp), Some(60));
         let (_, rising, inferred) =
             split_metric_line_paths(&points, 0, 3_600, 3.0, |point| point.sol);
-        assert!(rising.contains("L1.67"));
-        assert!(!rising.contains("L100.00"));
-        assert!(!inferred.contains("L100.00"));
+        assert!(rising.is_empty());
+        assert!(inferred.is_empty());
     }
 
     #[test]
@@ -26150,7 +26072,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_paths_span_from_reset_start_to_current_time() {
+    fn graph_paths_start_at_first_observation_without_inventing_a_reset_value() {
         let reset_at = 7_200;
         let first = UsageHistorySample::new(
             600,
@@ -26175,16 +26097,14 @@ mod tests {
         let selected = [&first, &latest];
         let remaining_points = remaining_graph_points(&selected, 0, 3_900);
         let paths = graph_paths(&selected, 0, 3_900);
-        assert!(paths.remaining.starts_with("M0.00 1.00"));
-        assert_eq!(remaining_points[0], (0, 100.0));
-        // This internal point is an explicitly inferred smoothing point; the
-        // renderer therefore dashes it instead of claiming 82.5 was read.
-        assert_eq!(remaining_points[1], (600, 82.5));
+        assert!(paths.remaining.starts_with("M15.38 20.60"));
+        assert_eq!(remaining_points[0], (600, 80.0));
+        assert_eq!(remaining_points[1], (3_600, 70.0));
         assert!(remaining_points
             .windows(2)
             .all(|pair| pair[0].0 < pair[1].0));
         assert!(paths.remaining.matches('M').count() > 2);
-        assert!(paths.sol.starts_with("M0.00 99.00"));
+        assert!(paths.sol.starts_with("M15.38 74.50"));
         assert!(!paths.sol.contains("L100.00"));
         assert!(!paths.terra.contains("L100.00"));
         assert!(!paths.luna.contains("L100.00"));
@@ -26683,21 +26603,6 @@ mod tests {
     }
 
     #[test]
-    fn remaining_change_point_collapse_clamps_upward_rereads() {
-        let points = collapse_remaining_change_points(&[
-            (0, 100.0),
-            (60, 80.0),
-            (120, 85.0),
-            (180, 70.0),
-            (240, 70.0),
-        ]);
-        assert_eq!(
-            points,
-            vec![(0, 100.0), (60, 80.0), (180, 70.0), (240, 70.0)]
-        );
-    }
-
-    #[test]
     fn remaining_label_matches_smoothed_path_endpoint() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
@@ -26744,7 +26649,7 @@ mod tests {
         let second = UsageHistorySample::new(60, 1_000, 99.0, ModelDollarTotals::default());
         let third = UsageHistorySample::new(120, 1_000, 97.0, ModelDollarTotals::default());
         let samples = [&first, &second, &third];
-        let points = graph_points(&samples, 0, 120, 100.0, |sample| sample.remaining_percent);
+        let points = remaining_graph_points(&samples, 0, 120);
         let markers = remaining_marker_positions_on_points(&points, 0, 120);
 
         assert_eq!(points.first(), Some(&(0, 100.0)));
@@ -26764,21 +26669,6 @@ mod tests {
             let line_value = before.1 + (after.1 - before.1) * fraction;
             assert!((marker.y - remaining_graph_y(line_value)).abs() < 0.000_000_1);
         }
-    }
-
-    #[test]
-    fn remaining_markers_use_the_reset_anchor_for_the_first_observation() {
-        let sample = UsageHistorySample::new(60, 1_000, 97.0, ModelDollarTotals::default());
-
-        let markers = remaining_marker_positions(&[&sample], 0, 120);
-
-        assert_eq!(
-            markers
-                .iter()
-                .map(|marker| marker.boundary)
-                .collect::<Vec<_>>(),
-            [99, 98, 97]
-        );
     }
 
     #[test]
@@ -26823,7 +26713,7 @@ mod tests {
     }
 
     #[test]
-    fn remaining_markers_keep_reset_anchor_before_multiple_missing_values() {
+    fn remaining_markers_ignore_a_missing_prefix_and_terminal_hold() {
         let first_missing =
             UsageHistorySample::from_model_history(0, 1_000, ModelDollarTotals::default());
         let second_missing =
@@ -26832,16 +26722,9 @@ mod tests {
             UsageHistorySample::new(120, 1_000, 97.0, ModelDollarTotals::default());
 
         let markers =
-            remaining_marker_positions(&[&first_missing, &second_missing, &first_observed], 0, 120);
+            remaining_marker_positions(&[&first_missing, &second_missing, &first_observed], 0, 180);
 
-        assert_eq!(
-            markers
-                .iter()
-                .map(|marker| marker.boundary)
-                .collect::<Vec<_>>(),
-            [99, 98, 97]
-        );
-        assert_eq!(markers.last().map(|marker| marker.x), Some(100.0));
+        assert!(markers.is_empty());
     }
 
     #[test]
@@ -26857,7 +26740,7 @@ mod tests {
         assert!(empty.current_terra_label.is_empty());
         assert!(empty.current_luna_label.is_empty());
 
-        let zero = UsageHistorySample::new(120, 0, 70.0, ModelDollarTotals::default());
+        let zero = UsageHistorySample::new(120, 1_000, 70.0, ModelDollarTotals::default());
         let all_zero = graph_paths(&[&zero], 0, 300);
         assert_eq!(all_zero.current_remaining_label, "70%");
         assert!(all_zero.current_sol_label.is_empty());
@@ -26903,7 +26786,8 @@ mod tests {
         let paths = super::graph_paths_for_model(&references, 0, 200, "TERRA");
         assert!(paths.sol.is_empty());
         assert!(paths.luna.is_empty());
-        assert!(paths.terra.starts_with("M0.00"));
+        assert!(paths.terra_rising.starts_with("M30.00"));
+        assert!(!paths.terra.contains("M0.00"));
         assert_eq!(paths.current_terra_label, "$3.00");
         assert!(paths.current_sol_label.is_empty());
     }
@@ -27194,7 +27078,8 @@ mod tests {
         let terra_only = graph_paths_for_selection(&references, 0, 200, false, true, false, false);
         assert_eq!(all.dollar_labels[0], "$8.00");
         assert_eq!(terra_only.dollar_labels[0], "$3.00");
-        assert!(terra_only.terra.starts_with("M0.00"));
+        assert!(terra_only.terra_rising.starts_with("M30.00"));
+        assert!(!terra_only.terra.contains("M0.00"));
         assert!(!all.sol.contains('Z'));
         assert!(!all.terra.contains('Z'));
         assert!(!all.luna.contains('Z'));
@@ -27267,27 +27152,6 @@ mod tests {
                 && pair[0].terra <= pair[1].terra
                 && pair[0].luna <= pair[1].luna
         }));
-    }
-
-    #[test]
-    fn independent_lines_hold_zero_until_the_first_real_measurement() {
-        let sample = UsageHistorySample::new(
-            180,
-            1_000,
-            90.0,
-            ModelDollarTotals {
-                sol: 4.0,
-                terra: 0.0,
-                luna: 0.0,
-            },
-        );
-        let paths = graph_paths(&[&sample], 0, 240);
-        // x=75 is the first recorded point. The reset boundary is a reliable
-        // zero endpoint, so the unknown prefix is one time-spanning inferred
-        // interval; it is never a flat prefix plus a vertical jump.
-        assert!(!paths.sol.is_empty());
-        assert!(paths.sol_flat.is_empty());
-        assert!(paths.sol_rising.is_empty());
     }
 
     #[test]
@@ -27416,7 +27280,7 @@ mod tests {
         assert!(flat.contains("M75.00 1.00 L100.00 1.00"));
         assert!(!rising.contains("M75.00 99.00 L75.00 1.00"));
         assert!(!rising.contains("M0.00 99.00 L75.00 1.00"));
-        assert!(inferred.matches('M').count() > 2);
+        assert!(inferred.is_empty());
     }
 
     #[test]
@@ -27684,17 +27548,13 @@ mod tests {
     }
 
     #[test]
-    fn remaining_graph_keeps_the_reset_start_anchor_without_observations() {
+    fn remaining_graph_stays_empty_without_observations() {
         let paths = graph_paths(&[], 100, 300);
         assert!(paths.remaining.is_empty());
     }
 
     #[test]
-    fn smoothing_keeps_remaining_and_spend_cumulative() {
-        let remaining =
-            smooth_remaining_points(&[(0, 100.0), (60, 60.0), (120, 70.0), (180, 20.0)]);
-        assert!(remaining.windows(2).all(|pair| pair[0].1 >= pair[1].1));
-
+    fn smoothing_keeps_model_spend_cumulative() {
         let spend = smooth_model_spend(&[
             HourlyModelSpend {
                 timestamp: 0,
@@ -27723,20 +27583,20 @@ mod tests {
     }
 
     #[test]
-    fn zero_cost_period_draws_a_visible_baseline() {
+    fn zero_cost_period_starts_at_the_first_observation() {
         let points = [
             HourlyModelSpend {
-                timestamp: 0,
+                timestamp: 180,
                 ..HourlyModelSpend::default()
             },
             HourlyModelSpend {
-                timestamp: 60,
+                timestamp: 240,
                 ..HourlyModelSpend::default()
             },
         ];
         assert_eq!(
-            stacked_area_path(&points, 0, 60, 0.0, |_| (0.0, 0.0)),
-            "M0.00 99.00 L100.00 99.00"
+            metric_line_path_with_confirmed_gaps(&points, 0, 240, 0.0, |point| point.sol, &[]),
+            "M75.00 99.00 L100.00 99.00"
         );
     }
 

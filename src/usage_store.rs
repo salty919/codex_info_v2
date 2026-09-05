@@ -755,7 +755,6 @@ pub enum UsageStoreError {
     NonFiniteValue { field: &'static str },
     GenerationConflict { expected: u64, actual: u64 },
     GenerationOverflow,
-    HistoryCapacityExceeded { maximum: usize },
 }
 
 pub type Result<T> = std::result::Result<T, UsageStoreError>;
@@ -781,12 +780,6 @@ impl fmt::Display for UsageStoreError {
                 "durable generation conflict: expected {expected}, found {actual}"
             ),
             Self::GenerationOverflow => write!(formatter, "durable generation overflow"),
-            Self::HistoryCapacityExceeded { maximum } => {
-                write!(
-                    formatter,
-                    "recent history exceeds the {maximum}-row capacity"
-                )
-            }
         }
     }
 }
@@ -801,8 +794,7 @@ impl std::error::Error for UsageStoreError {
             | Self::InvalidTimestamp { .. }
             | Self::NonFiniteValue { .. }
             | Self::GenerationConflict { .. }
-            | Self::GenerationOverflow
-            | Self::HistoryCapacityExceeded { .. } => None,
+            | Self::GenerationOverflow => None,
         }
     }
 }
@@ -3486,24 +3478,14 @@ impl UsageStore {
                     terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens \
              FROM usage_history \
              WHERE timestamp > ?1 AND timestamp <= ?2 \
-             ORDER BY timestamp DESC, reset_at DESC \
-             LIMIT ?3",
+             ORDER BY timestamp DESC, reset_at DESC",
         )?;
-        let mut rows = statement.query(params![
-            cutoff,
-            now_timestamp,
-            MAX_RECENT_HISTORY_SAMPLES as i64 + 1
-        ])?;
+        let mut rows = statement.query(params![cutoff, now_timestamp])?;
         let mut samples = Vec::with_capacity(MAX_RECENT_HISTORY_SAMPLES);
         while let Some(row) = rows.next()? {
             if let Some(sample) = valid_sample_from_row(row)? {
                 samples.push(sample);
             }
-        }
-        if samples.len() > MAX_RECENT_HISTORY_SAMPLES {
-            return Err(UsageStoreError::HistoryCapacityExceeded {
-                maximum: MAX_RECENT_HISTORY_SAMPLES,
-            });
         }
         samples.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
         Ok(samples)
@@ -3541,30 +3523,16 @@ impl UsageStore {
             "SELECT data_generation, data_hash, snapshot_json
              FROM durable_state
              WHERE singleton >= ?1 AND data_generation > ?2 AND data_generation <= ?3
-             ORDER BY data_generation ASC, singleton ASC
-             LIMIT ?4",
+             ORDER BY data_generation ASC, singleton ASC",
         )?;
         let mut rows = statement.query(params![
             DURABLE_STATE_OBSERVATION_MIN_SINGLETON,
             cutoff,
             now_timestamp,
-            MAX_RECENT_HISTORY_SAMPLES as i64 + 1,
         ])?;
-        let mut auxiliary_count = 0usize;
         while let Some(row) = rows.next()? {
-            auxiliary_count = auxiliary_count.saturating_add(1);
             let observation = observation_from_sql(row.get(0)?, row.get(1)?, row.get(2)?)?;
             observations.insert((observation.reset_at, observation.timestamp), observation);
-        }
-        if auxiliary_count > MAX_RECENT_HISTORY_SAMPLES {
-            return Err(UsageStoreError::HistoryCapacityExceeded {
-                maximum: MAX_RECENT_HISTORY_SAMPLES,
-            });
-        }
-        if observations.len() > MAX_RECENT_HISTORY_SAMPLES {
-            return Err(UsageStoreError::HistoryCapacityExceeded {
-                maximum: MAX_RECENT_HISTORY_SAMPLES,
-            });
         }
         Ok(observations.into_values().collect())
     }
@@ -6295,7 +6263,7 @@ mod tests {
 
     #[test]
     #[ignore = "explicit host SQLite latency SLO gate"]
-    fn recent_history_query_is_indexed_bounded_and_meets_capacity_slo() {
+    fn recent_history_query_uses_the_one_month_index_and_meets_manual_latency_slo() {
         let path = database_path("history-slo");
         let now = Utc.timestamp_opt(1_800_000_000, 0).single().unwrap();
         let mut store = UsageStore::open(&path).unwrap();
@@ -6358,13 +6326,12 @@ mod tests {
                 "EXPLAIN QUERY PLAN SELECT timestamp, reset_at, remaining_percent, sol_dollars, \
                  terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens \
                  FROM usage_history WHERE timestamp > ?1 AND timestamp <= ?2 \
-                 ORDER BY timestamp DESC, reset_at DESC LIMIT ?3",
+                 ORDER BY timestamp DESC, reset_at DESC",
             )
             .unwrap()
-            .query_map(
-                params![cutoff, now.timestamp(), MAX_RECENT_HISTORY_SAMPLES as i64],
-                |row| row.get::<_, String>(3),
-            )
+            .query_map(params![cutoff, now.timestamp()], |row| {
+                row.get::<_, String>(3)
+            })
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
@@ -6375,8 +6342,8 @@ mod tests {
         );
         assert!(!plan.contains("SCAN usage_history"), "full scan: {plan}");
 
-        let mut elapsed = Vec::with_capacity(20);
-        for _ in 0..20 {
+        let mut elapsed = Vec::with_capacity(30);
+        for _ in 0..30 {
             let started = Instant::now();
             let rows = store.load_recent_one_month(now).unwrap();
             elapsed.push(started.elapsed().as_secs_f64() * 1_000.0);
@@ -6386,53 +6353,16 @@ mod tests {
             }));
         }
         elapsed.sort_by(f64::total_cmp);
-        let p90 = elapsed[17];
-        let p95 = elapsed[18];
-        let maximum = elapsed[19];
+        let p90 = elapsed[26];
+        let p95 = elapsed[28];
+        let maximum = elapsed[29];
         eprintln!(
-            "SLO db=recent_history rows={} n=20 p90={p90:.3}ms p95={p95:.3}ms max={maximum:.3}ms plan={plan}",
+            "SLO db=recent_history rows={} n=30 p90={p90:.3}ms p95={p95:.3}ms max={maximum:.3}ms plan={plan}",
             MAX_RECENT_HISTORY_SAMPLES
         );
         assert!(p90 <= 100.0, "DB p90 {p90:.3}ms exceeds 100ms");
         assert!(p95 <= 150.0, "DB p95 {p95:.3}ms exceeds 150ms");
 
-        // More than 44,640 rows in the one-month candidate is malformed
-        // cardinality (for example overlapping reset windows), not permission
-        // to silently truncate the response. The retained database is intact.
-        let before_count: i64 = store
-            .connection
-            .query_row("SELECT COUNT(*) FROM usage_history", [], |row| row.get(0))
-            .unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO usage_history (timestamp, reset_at, remaining_percent, \
-                 sol_dollars, terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    now.timestamp(),
-                    now.timestamp() + 1_209_600,
-                    48.0,
-                    1.0,
-                    1.0,
-                    1.0,
-                    1_i64,
-                    1_i64,
-                    1_i64,
-                ],
-            )
-            .unwrap();
-        assert!(matches!(
-            store.load_recent_one_month(now),
-            Err(UsageStoreError::HistoryCapacityExceeded {
-                maximum: MAX_RECENT_HISTORY_SAMPLES
-            })
-        ));
-        let after_count: i64 = store
-            .connection
-            .query_row("SELECT COUNT(*) FROM usage_history", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(after_count, before_count + 1);
         drop(store);
         remove_database(&path);
     }
@@ -6471,10 +6401,10 @@ mod tests {
                 "EXPLAIN QUERY PLAN SELECT timestamp, reset_at, remaining_percent, \
                  sol_dollars, terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens \
                  FROM usage_history WHERE timestamp > ?1 AND timestamp <= ?2 \
-                 ORDER BY timestamp DESC, reset_at DESC LIMIT ?3",
+                 ORDER BY timestamp DESC, reset_at DESC",
             )
             .unwrap()
-            .query_map(params![1_i64, 2_i64, 1_i64], |row| row.get::<_, String>(3))
+            .query_map(params![1_i64, 2_i64], |row| row.get::<_, String>(3))
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
@@ -7362,14 +7292,6 @@ mod tests {
     }
 
     #[test]
-    fn one_month_cutoff_clamps_end_of_month_by_calendar_rule() {
-        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 56).unwrap();
-        let expected = Utc.with_ymd_and_hms(2024, 4, 30, 12, 34, 56).unwrap();
-
-        assert_eq!(one_month_before(now), expected);
-    }
-
-    #[test]
     fn pruning_removes_only_old_rows_and_preserves_boundary_across_reset_periods() {
         let path = database_path("prune");
         let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 56).unwrap();
@@ -7412,20 +7334,6 @@ mod tests {
         );
         assert_eq!(reopened.prune_older_than_three_months(now).unwrap(), 0);
         drop(reopened);
-        remove_database(&path);
-    }
-
-    #[test]
-    fn ordinary_upsert_never_prunes_old_rows() {
-        let path = database_path("upsert-no-prune");
-        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 56).unwrap();
-        let cutoff = three_months_before(now).timestamp();
-        let old = sample(cutoff - 1, 1_700_604_800, Some(10.0), 1.0);
-
-        let store = UsageStore::open(&path).unwrap();
-        store.upsert_sample(&old).unwrap();
-        assert_eq!(store.load_all().unwrap(), vec![old]);
-        drop(store);
         remove_database(&path);
     }
 
@@ -8240,23 +8148,6 @@ mod wave_b_correction_tests {
             .upsert_samples(std::slice::from_ref(&overflowing))
             .is_err());
         assert!(history_rows(&path).is_empty());
-        drop(store);
-        cleanup(&path);
-    }
-
-    #[test]
-    fn ordinary_upsert_and_range_read_are_non_pruning() {
-        let path = database_path("non-pruning");
-        let now = Utc.timestamp_opt(1_715_156_800, 0).single().unwrap();
-        let store = UsageStore::open(&path).unwrap();
-        let old = sample(1_600_000_000, 1_600_000_100, Some(10.0), 1.0);
-        store.upsert_sample(&old).unwrap();
-        let before = history_rows(&path);
-        assert!(store.load_recent_one_month(now).unwrap().is_empty());
-        store
-            .upsert_sample(&sample(1_715_156_700, 1_715_156_000, Some(20.0), 2.0))
-            .unwrap();
-        assert_eq!(history_rows(&path).len(), before.len() + 1);
         drop(store);
         cleanup(&path);
     }

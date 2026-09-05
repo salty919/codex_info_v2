@@ -65,32 +65,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Legacy_history_reduction_keeps_the_one_month_bound_without_recovery_rescans()
-    {
-        const int endpointHistoryLimit = 44_640;
-        var samples = Enumerable.Range(0, endpointHistoryLimit)
-            .Select(index => new ApiHistorySample(
-                index + 1,
-                200_000,
-                null,
-                index,
-                index * 2,
-                index * 3,
-                (ulong)index,
-                (ulong)index * 2,
-                (ulong)index * 3,
-                ApiHistorySample.LegacyUnknownModelSource))
-            .ToArray();
-
-        var reduced = GraphWindowViewModel.ReduceGraphSamples(samples, 2_048);
-
-        Assert.Equal(GraphWindowViewModel.MaxRenderedGraphPoints, reduced.Count);
-        Assert.Equal(samples[0], reduced[0]);
-        Assert.Equal(samples[^1], reduced[^1]);
-    }
-
-    [Fact]
-    public void Reduction_preserves_confirmed_regression_and_recovery_boundaries()
+    public void Reduction_preserves_regression_quota_and_confirmed_gap_boundaries()
     {
         var samples = new[]
         {
@@ -104,6 +79,32 @@ public sealed class GraphPlotControlTests
 
         Assert.Equal(samples, reduced);
         Assert.Equal([1L, 2L, 3L, 4L], reduced.Select(sample => sample.Timestamp));
+
+        var monotonic = Enumerable.Range(0, 6)
+            .Select(index => ConfirmedCumulativeSample(index * 60, index))
+            .ToArray();
+        var acrossGap = GraphWindowViewModel.ReduceGraphSamples(
+            monotonic,
+            maximum: 2,
+            confirmedGaps: [new GraphConfirmedGap(120, 180)]);
+        Assert.Equal([0L, 120L, 180L, 300L], acrossGap.Select(sample => sample.Timestamp));
+
+        var unattributedQuotaDrop = monotonic
+            .Select((sample, index) => sample with
+            {
+                RemainingPercent = index < 2 ? 100 : 80,
+                SolDollars = 0,
+                TerraDollars = 0,
+                LunaDollars = 0,
+                SolTokens = 0,
+                TerraTokens = 0,
+                LunaTokens = 0,
+            })
+            .ToArray();
+        var acrossQuotaDrop = GraphWindowViewModel.ReduceGraphSamples(
+            unattributedQuotaDrop,
+            maximum: 2);
+        Assert.Equal([0L, 60L, 120L, 300L], acrossQuotaDrop.Select(sample => sample.Timestamp));
     }
 
     [Fact]
@@ -113,7 +114,7 @@ public sealed class GraphPlotControlTests
             .Select(index => new ApiHistorySample(
                 index,
                 100,
-                100 - index,
+                100,
                 index < 5 ? 0 : 10,
                 0,
                 0,
@@ -124,9 +125,9 @@ public sealed class GraphPlotControlTests
 
         var reduced = GraphWindowViewModel.ReduceGraphSamples(samples, 6);
 
-        Assert.Equal(Enumerable.Range(0, 12).Select(index => (long)index), reduced.Select(sample => sample.Timestamp));
-        Assert.Equal(0, reduced[4].SolDollars);
-        Assert.Equal(10, reduced[5].SolDollars);
+        Assert.Equal([0L, 3L, 4L, 7L, 8L, 11L], reduced.Select(sample => sample.Timestamp));
+        Assert.Equal(0, reduced[2].SolDollars);
+        Assert.Equal(10, reduced[3].SolDollars);
     }
 
     [Fact]
@@ -269,7 +270,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void PlotProjectionLegacyOverloadRetainsTheExistingEndpointCoordinates()
+    public void PlotProjectionFallbackWidthRetainsReferenceEndpointCoordinates()
     {
         foreach (var metric in new[] { GraphMetric.Dollars, GraphMetric.Tokens })
         {
@@ -316,24 +317,6 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void PlotProjectionCoalescesAdjacentSegmentsWithTheSameLineStyle()
-    {
-        var scene = Scene(
-            [
-                Point(1_000, 100, 0, 0, 0),
-                Point(1_060, 99, 0, 0, 1),
-                Point(1_120, 98, 0, 0, 2),
-                Point(1_180, 97, 0, 0, 3),
-            ]);
-
-        var lines = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
-
-        Assert.Empty(lines.Flat.X);
-        Assert.Equal([1_000d, 1_060d, 1_120d, 1_180d], lines.Rising.X);
-        Assert.Equal([0d, 1d, 2d, 3d], lines.Rising.Y);
-    }
-
-    [Fact]
     public void Scene_marks_a_regressed_model_component_as_a_whole_vector_gap_until_recovery()
     {
         var scene = Scene(
@@ -349,7 +332,7 @@ public sealed class GraphPlotControlTests
         Assert.Equal([2d, double.NaN, 2d, 3d], scene.Terra);
         Assert.Equal([3d, double.NaN, 4d, 5d], scene.Luna);
 
-        var lines = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Sol);
+        var lines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
         Assert.Equal([1_120d, 1_180d], lines.Rising.X);
         Assert.Equal([2d, 75d], lines.Rising.Y);
         Assert.Equal([1_000d, 1_120d], lines.Dashed.X);
@@ -363,7 +346,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Live_incident_shape_never_creates_a_flat_then_vertical_recovery_drop()
+    public void Live_incident_regression_recovery_is_never_connected_as_solid()
     {
         var scene = GraphScene.Create(
             [
@@ -378,7 +361,7 @@ public sealed class GraphPlotControlTests
             300);
 
         Assert.Equal([true, false, false, false, true], scene.ModelVectorAvailable);
-        var model = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Sol);
+        var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
         var remaining = GraphPlotProjection.BuildRemainingLines(scene);
 
         Assert.Empty(model.Flat.X);
@@ -394,7 +377,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Renderable_model_lines_use_dashes_for_long_trusted_gaps_only()
+    public void Model_lines_dash_a_trusted_gap_longer_than_sixty_seconds()
     {
         var scene = Scene(
             [
@@ -403,7 +386,7 @@ public sealed class GraphPlotControlTests
                 Point(1_121, 80, 2, 0, 0),
             ]);
 
-        var lines = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Sol);
+        var lines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
 
         Assert.Equal([1_000d, 1_060d], lines.Rising.X);
         Assert.Equal([0d, 1d], lines.Rising.Y);
@@ -448,7 +431,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Open_local_gap_stops_models_but_holds_last_remote_value_as_a_dashed_reference()
+    public void One_old_local_observation_is_not_extended_but_remote_quota_is_held_dashed()
     {
         var period = new ApiHistoryPeriod("current", 1_000, 2_000, true, "current")
         {
@@ -461,7 +444,7 @@ public sealed class GraphPlotControlTests
             1_000,
             1_600);
 
-        var model = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Sol);
+        var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
         var remaining = GraphPlotProjection.BuildRemainingLines(scene);
         var labels = GraphPlotProjection.BuildEndpointLabels(scene, CultureInfo.InvariantCulture);
 
@@ -485,21 +468,22 @@ public sealed class GraphPlotControlTests
                 Point(1_000, 100, 0, 0, 0),
                 Point(1_060, 90, 1, 0, 0),
                 Point(1_120, 80, 2, 0, 0),
+                Point(1_180, 70, 3, 0, 0),
             ],
             GraphMetric.Dollars,
             1_000,
-            1_120,
+            1_180,
             [new GraphConfirmedGap(1_060, 1_120)]);
 
-        var model = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Sol);
+        var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
         var remaining = GraphPlotProjection.BuildRemainingLines(scene);
 
         var gap = Assert.Single(scene.ConfirmedGaps);
         Assert.Equal(1_060L, gap.StartAt);
         Assert.Equal(1_120L, gap.EndAt);
-        Assert.Equal([1_000d, 1_060d], model.Rising.X);
+        Assert.Equal([1_000d, 1_060d, double.NaN, 1_120d, 1_180d], model.Rising.X);
         Assert.Empty(model.Dashed.X);
-        Assert.Equal([1_000d, 1_060d], remaining.Solid.X);
+        Assert.Equal([1_000d, 1_060d, double.NaN, 1_120d, 1_180d], remaining.Solid.X);
         Assert.Empty(remaining.Dashed.X);
         Assert.Contains(scene.IdleIntervals, interval =>
             interval.PreserveBoundary && interval.StartAt == 1_060 && interval.EndAt == 1_120);
@@ -512,20 +496,21 @@ public sealed class GraphPlotControlTests
             [
                 Point(1_000, 100, 0, 0, 0),
                 Point(1_060, 99, 0, 0, 1),
-                Point(3_600, 98, 0, 0, 2),
+                Point(3_600, 98, 0, 0, 1),
                 Point(3_660, 97, 0, 0, 2),
             ]);
 
         var lines = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
 
-        Assert.Equal([1_060d, 3_600d, double.NaN, 3_600d, 3_660d], lines.Flat.X);
-        Assert.Equal([1d, 1d, double.NaN, 2d, 2d], lines.Flat.Y);
-        Assert.Equal([1_000d, 1_060d, double.NaN, 3_600d, 3_600d], lines.Rising.X);
+        Assert.Empty(lines.Flat.X);
+        Assert.Equal([1_000d, 1_060d, double.NaN, 3_600d, 3_660d], lines.Rising.X);
         Assert.Equal([0d, 1d, double.NaN, 1d, 2d], lines.Rising.Y);
+        Assert.Equal([1_060d, 3_600d], lines.Dashed.X);
+        Assert.Equal([1d, 1d], lines.Dashed.Y);
     }
 
     [Fact]
-    public void PlotProjectionUsesFlatVerticalAndContiguousSegmentsForFirstObservation()
+    public void PlotProjectionDashesTheLongFirstIntervalAndKeepsLaterEvidenceSolid()
     {
         var scene = Scene(
             [
@@ -535,25 +520,22 @@ public sealed class GraphPlotControlTests
             ]);
 
         var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
-        var remaining = GraphPlotProjection.BuildRemainingLine(scene);
+        var remaining = GraphPlotProjection.BuildRemainingLines(scene);
 
-        Assert.Equal([1_000d, 1_120d], model.Flat.X);
-        Assert.Equal([0d, 0d], model.Flat.Y);
-        Assert.Equal([1_120d, 1_120d, 1_180d], model.Rising.X);
-        Assert.Equal([0d, 1d, 2d], model.Rising.Y);
-        Assert.Equal([1_000d, 1_120d, 1_120d, 1_180d], remaining.X);
-        Assert.Equal([100d, 100d, 90d, 80d], remaining.Y);
+        Assert.Empty(model.Flat.X);
+        Assert.Equal([1_120d, 1_180d], model.Rising.X);
+        Assert.Equal([1d, 2d], model.Rising.Y);
+        Assert.Equal([1_000d, 1_120d], model.Dashed.X);
+        Assert.Equal([0d, 1d], model.Dashed.Y);
+        Assert.Equal([1_120d, 1_180d], remaining.Solid.X);
+        Assert.Equal([90d, 80d], remaining.Solid.Y);
+        Assert.Equal([1_000d, 1_120d], remaining.Dashed.X);
+        Assert.Equal([100d, 90d], remaining.Dashed.Y);
         Assert.Equal((1_000L, 1_120L, true),
             (Assert.Single(scene.IdleIntervals).StartAt,
              scene.IdleIntervals[0].EndAt,
              scene.IdleIntervals[0].PreserveBoundary));
-        Assert.DoesNotContain(
-            model.Rising.X.Zip(model.Rising.X.Skip(1))
-                .Zip(model.Rising.Y.Zip(model.Rising.Y.Skip(1))),
-            pair => pair.First.First == 1_000d &&
-                pair.First.Second == 1_120d &&
-                pair.Second.First == 0d &&
-                pair.Second.Second == 1d);
+        Assert.DoesNotContain(model.Rising.X, timestamp => timestamp < 1_120d);
     }
 
     [Fact]
@@ -691,39 +673,18 @@ public sealed class GraphPlotControlTests
 
         var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_200);
 
-        Assert.Equal([1_020L, 1_080L, 1_140L, 1_200L], samples.Select(sample => sample.Timestamp));
-        Assert.Equal([0d, 2d, 3d, 4d], samples.Select(sample => sample.SolDollars));
-        Assert.Equal([0d, 1d, 3d, 2d], samples.Select(sample => sample.TerraDollars));
-        Assert.Equal([0d, 0d, 1d, 2d], samples.Select(sample => sample.LunaDollars));
-        Assert.Equal([0UL, 20UL, 30UL, 40UL], samples.Select(sample => sample.SolTokens));
-        Assert.Equal([0UL, 10UL, 30UL, 20UL], samples.Select(sample => sample.TerraTokens));
-        Assert.Equal([0UL, 0UL, 10UL, 20UL], samples.Select(sample => sample.LunaTokens));
-        Assert.Equal([100d, 90d, 80d, 70d], samples.Select(sample => sample.RemainingPercent!.Value));
+        Assert.Equal([1_080L, 1_140L, 1_200L], samples.Select(sample => sample.Timestamp));
+        Assert.Equal([2d, 3d, 4d], samples.Select(sample => sample.SolDollars));
+        Assert.Equal([1d, 3d, 2d], samples.Select(sample => sample.TerraDollars));
+        Assert.Equal([0d, 1d, 2d], samples.Select(sample => sample.LunaDollars));
+        Assert.Equal([20UL, 30UL, 40UL], samples.Select(sample => sample.SolTokens));
+        Assert.Equal([10UL, 30UL, 20UL], samples.Select(sample => sample.TerraTokens));
+        Assert.Equal([0UL, 10UL, 20UL], samples.Select(sample => sample.LunaTokens));
+        Assert.Equal([90d, 80d, 70d], samples.Select(sample => sample.RemainingPercent!.Value));
     }
 
     [Fact]
-    public void Graph_samples_admit_a_domain_valid_current_start_endpoint()
-    {
-        var period = new ApiHistoryPeriod("current", 1_020, 1_200, true, "current")
-        {
-            Samples =
-            [
-                // Domain-valid minute-start row at the exact degenerate
-                // current effective end.
-                new ApiHistorySample(1_020, 2_000, 100, 7, 0, 0, 70, 0, 0),
-            ],
-        };
-
-        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_020);
-
-        Assert.Equal([1_020L], samples.Select(sample => sample.Timestamp));
-        Assert.Equal(7, samples[0].SolDollars);
-        Assert.Equal(70UL, samples[0].SolTokens);
-        Assert.Equal(100, samples[0].RemainingPercent);
-    }
-
-    [Fact]
-    public void Graph_samples_restore_the_native_100_percent_anchor_for_a_missing_first_quota()
+    public void Graph_samples_preserve_a_missing_first_quota_observation()
     {
         var period = new ApiHistoryPeriod("2000", 1_020, 1_200, false, "history")
         {
@@ -736,20 +697,30 @@ public sealed class GraphPlotControlTests
 
         var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_200);
 
-        Assert.Equal(1_020, samples[0].Timestamp);
-        Assert.Equal(100, samples[0].RemainingPercent);
+        Assert.Equal([1_020L, 1_080L], samples.Select(sample => sample.Timestamp));
+        Assert.Null(samples[0].RemainingPercent);
+        Assert.Equal(1, samples[0].SolDollars);
+        Assert.Equal(10UL, samples[0].SolTokens);
         Assert.Equal(90, samples[1].RemainingPercent);
+        var scene = Scene(samples, period.StartAt, period.EndAt);
+        Assert.True(double.IsNaN(scene.Remaining[0]));
+        Assert.Equal(90, scene.Remaining[1]);
+        var lines = GraphPlotProjection.BuildRemainingLines(scene);
+        Assert.Empty(lines.Solid.X);
+        Assert.Equal([1_080d, 1_200d], lines.Dashed.X);
+        Assert.Equal([90d, 90d], lines.Dashed.Y);
+        Assert.DoesNotContain(lines.Dashed.X, timestamp => timestamp < 1_080d);
     }
 
     [Fact]
-    public void Graph_samples_include_current_effective_end_and_exclude_the_next_row()
+    public void Graph_samples_extend_only_recent_available_models_and_exclude_the_next_row()
     {
         var period = new ApiHistoryPeriod("current", 1_020, 1_200, true, "current")
         {
             Samples =
             [
                 new ApiHistorySample(1_020, 2_000, 100, 0, 0, 0, 0, 0, 0),
-                new ApiHistorySample(1_140, 2_000, 90, 7, 0, 0, 70, 0, 0),
+                new ApiHistorySample(1_080, 2_000, 90, 7, 0, 0, 70, 0, 0),
                 // Adapter-only invalid injection: not minute-start and not
                 // admitted by Core; this row tests defensive end filtering.
                 new ApiHistorySample(1_141, 2_000, 89, 99, 0, 0, 990, 0, 0),
@@ -758,39 +729,52 @@ public sealed class GraphPlotControlTests
 
         var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_140);
 
-        Assert.Equal(1_140, samples[^1].Timestamp);
+        Assert.Equal([1_020L, 1_080L, 1_140L], samples.Select(sample => sample.Timestamp));
         Assert.Equal(7, samples[^1].SolDollars);
         Assert.Equal(70UL, samples[^1].SolTokens);
+        Assert.Null(samples[^1].RemainingPercent);
         Assert.DoesNotContain(samples, sample => sample.SolDollars == 99);
         Assert.DoesNotContain(samples, sample => sample.SolTokens == 990);
-    }
 
-    [Fact]
-    public void Graph_samples_include_past_effective_end_and_exclude_the_next_row()
-    {
-        var period = new ApiHistoryPeriod("past", 1_020, 1_200, false, "past")
+        var unavailable = new ApiHistoryPeriod("unavailable", 1_020, 1_200, true, "current")
         {
             Samples =
             [
-                new ApiHistorySample(1_020, 2_000, 100, 0, 0, 0, 0, 0, 0),
-                new ApiHistorySample(1_200, 2_000, 80, 7, 0, 0, 70, 0, 0),
-                // Adapter-only invalid injection: not minute-start and not
-                // admitted by Core; this row tests defensive end filtering.
-                new ApiHistorySample(1_201, 2_000, 79, 99, 0, 0, 990, 0, 0),
+                new ApiHistorySample(
+                    1_080,
+                    2_000,
+                    90,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    ApiHistorySample.UnavailableModelSource),
             ],
         };
-
-        var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_200);
-
-        Assert.Equal(1_200, samples[^1].Timestamp);
-        Assert.Equal(7, samples[^1].SolDollars);
-        Assert.Equal(70UL, samples[^1].SolTokens);
-        Assert.DoesNotContain(samples, sample => sample.SolDollars == 99);
-        Assert.DoesNotContain(samples, sample => sample.SolTokens == 990);
+        var unavailableSamples = GraphWindowViewModel.BuildGraphSamples(unavailable, 1_140);
+        Assert.Equal(
+            [1_080L],
+            unavailableSamples.Select(sample => sample.Timestamp));
+        var unavailableScene = GraphScene.Create(
+            unavailableSamples,
+            GraphMetric.Dollars,
+            1_020,
+            1_140);
+        var unavailableModel = GraphPlotProjection.BuildModelLines(
+            unavailableScene,
+            unavailableScene.Sol);
+        var unavailableRemaining = GraphPlotProjection.BuildRemainingLines(unavailableScene);
+        Assert.Empty(unavailableModel.Flat.X);
+        Assert.Empty(unavailableModel.Rising.X);
+        Assert.Empty(unavailableModel.Dashed.X);
+        Assert.Equal([1_080d, 1_140d], unavailableRemaining.Dashed.X);
+        Assert.Equal([90d, 90d], unavailableRemaining.Dashed.Y);
     }
 
     [Fact]
-    public void Idle_intervals_merge_flat_segments_but_keep_the_synthetic_reset_boundary()
+    public void Idle_intervals_merge_flat_segments_but_keep_a_long_unobserved_boundary()
     {
         var points = new[]
         {
@@ -819,25 +803,6 @@ public sealed class GraphPlotControlTests
         Assert.True(sparseIntervals[0].PreserveBoundary);
         Assert.Equal((1_000L, 1_120L), (sparseIntervals[0].StartAt, sparseIntervals[0].EndAt));
         Assert.Equal((1_120L, 1_300L), (sparseIntervals[1].StartAt, sparseIntervals[1].EndAt));
-    }
-
-    [Fact]
-    public void Remaining_repeated_active_samples_are_interpolated_by_active_time()
-    {
-        var points = new[]
-        {
-            Point(1_000, 100, 0, 0, 0),
-            Point(1_060, 90, 1, 0, 0),
-            Point(1_120, 90, 2, 0, 0),
-            Point(1_180, 80, 3, 0, 0),
-        };
-
-        var effective = Scene(points).Remaining;
-
-        Assert.Equal(100d, effective[0]);
-        Assert.Equal(90d, effective[1]);
-        Assert.Equal(85d, effective[2]);
-        Assert.Equal(80d, effective[3]);
     }
 
     [Fact]
@@ -900,10 +865,6 @@ public sealed class GraphPlotControlTests
             .EnumerateArray()
             .Select(value => value.GetInt64())
             .ToArray();
-        var expectedGraphTimestamps = root.GetProperty("expected_graph_timestamps")
-            .EnumerateArray()
-            .Select(value => value.GetInt64())
-            .ToArray();
         var expectedRemaining = root.GetProperty("expected_remaining")
             .EnumerateArray()
             .Select(value => value.GetDouble())
@@ -932,6 +893,8 @@ public sealed class GraphPlotControlTests
         var ownedSamples = period.Samples;
         Assert.Equal(expectedRows.Length, flatSamples.Count);
         Assert.Equal(expectedRows.Length, ownedSamples.Count);
+        Assert.All(flatSamples, sample =>
+            Assert.Equal(ApiHistorySample.LegacyUnknownModelSource, sample.ModelSource));
         Assert.Equal(expectedRawTimestamps, flatSamples.Select(sample => sample.Timestamp));
         Assert.Equal(expectedRawTimestamps, ownedSamples.Select(sample => sample.Timestamp));
         for (var index = 0; index < expectedRows.Length; index++)
@@ -949,25 +912,19 @@ public sealed class GraphPlotControlTests
             GraphMetric.Dollars,
             expectedPeriodStart,
             expectedPeriodEnd);
-        var remainingLine = GraphPlotProjection.BuildRemainingLine(scene);
+        var remainingLines = GraphPlotProjection.BuildRemainingLines(scene);
         var solLines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
         var terraLines = GraphPlotProjection.BuildModelLines(scene, scene.Terra);
         var lunaLines = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
 
-        Assert.Equal(expectedGraphTimestamps.Select(timestamp => (double)timestamp), scene.Timestamps);
-        Assert.Equal(expectedGraphTimestamps, graphSamples.Select(sample => sample.Timestamp));
+        Assert.Equal(expectedRawTimestamps.Select(timestamp => (double)timestamp), scene.Timestamps);
+        Assert.Equal(expectedRawTimestamps, graphSamples.Select(sample => sample.Timestamp));
         Assert.Equal(expectedRemaining, scene.Remaining);
-        Assert.Equal([100d, 100d, 87d, 44d, 1d, 1d, 1d], remainingLine.Y);
         Assert.Equal(expectedPeriodStart, scene.PeriodStartAt);
         Assert.Equal(expectedPeriodEnd, scene.PeriodEndAt);
         Assert.Equal(expectedSolMax, scene.ModelMaximum, precision: 6);
-        Assert.Equal(expectedRows.Length + 1, graphSamples.Count);
-        Assert.Equal(expectedPeriodStart, graphSamples[0].Timestamp);
-        Assert.Equal(0d, graphSamples[0].SolDollars);
-        Assert.Equal(0d, graphSamples[0].TerraDollars);
-        Assert.Equal(0d, graphSamples[0].LunaDollars);
-        Assert.Equal(100d, graphSamples[0].RemainingPercent);
-        Assert.Equal(expectedRawTimestamps, graphSamples.Skip(1).Select(sample => sample.Timestamp));
+        Assert.Equal(expectedRows.Length, graphSamples.Count);
+        Assert.Equal(expectedRawTimestamps, graphSamples.Select(sample => sample.Timestamp));
         Assert.Equal(flatSamples[^1], graphSamples[^1]);
         Assert.Equal(expectedPeriodEnd, graphSamples[^1].Timestamp);
         Assert.Equal(expectedPeriodEnd, scene.Timestamps[^1]);
@@ -976,12 +933,20 @@ public sealed class GraphPlotControlTests
         Assert.Empty(terraLines.Flat.X);
         Assert.Empty(terraLines.Rising.X);
         Assert.NotEmpty(terraLines.Dashed.X);
-        Assert.Contains(expectedPeriodStart, terraLines.Dashed.X);
+        Assert.DoesNotContain(expectedPeriodStart, terraLines.Dashed.X);
         Assert.Contains(firstObservation, terraLines.Dashed.X);
-        Assert.Equal([expectedPeriodStart, firstObservation, firstObservation], remainingLine.X.Take(3));
-        Assert.Equal([100d, 100d, 87d], remainingLine.Y.Take(3));
+        Assert.NotEmpty(remainingLines.Dashed.X);
+        Assert.Equal(firstObservation, remainingLines.Dashed.X[0]);
+        Assert.Equal(87d, remainingLines.Dashed.Y[0]);
+        Assert.DoesNotContain(remainingLines.Solid.X, timestamp => timestamp < firstObservation);
+        Assert.DoesNotContain(remainingLines.Dashed.X, timestamp => timestamp < firstObservation);
+        Assert.Empty(solLines.Flat.X);
         Assert.Empty(solLines.Rising.X);
+        Assert.NotEmpty(solLines.Dashed.X);
+        Assert.Empty(lunaLines.Flat.X);
         Assert.Empty(lunaLines.Rising.X);
+        Assert.NotEmpty(lunaLines.Dashed.X);
+        Assert.Empty(remainingLines.Solid.X);
     }
 
     [Fact]
@@ -1050,8 +1015,10 @@ public sealed class GraphPlotControlTests
         Assert.Equal(expectedLatestRemaining, graphSamples[^2].RemainingPercent!.Value);
         Assert.Equal(expectedLatestSolDollars, graphSamples[^2].SolDollars!.Value, precision: 6);
         Assert.Equal(expectedLatestSolTokens, graphSamples[^2].SolTokens!.Value);
-        // The endpoint anchor repeats the last observation. It must not
-        // manufacture a recovery to the pre-correction cumulative value.
+        // A recent endpoint hold repeats only the local model vector. It must
+        // not manufacture quota or recover the pre-correction cumulative value.
+        Assert.InRange(expectedPeriodEnd - expectedLatestSampleTimestamp, 1, 60);
+        Assert.Null(graphSamples[^1].RemainingPercent);
         Assert.NotNull(graphSamples[^1].SolDollars);
         Assert.Equal(expectedLatestSolDollars, graphSamples[^1].SolDollars!.Value, precision: 6);
 
@@ -1068,7 +1035,7 @@ public sealed class GraphPlotControlTests
         Assert.Equal([73d, 73d, 73d, 70d, 70d, 62d, 62d], scene.Remaining);
         Assert.All(scene.Sol.Skip(2), value => Assert.True(double.IsNaN(value)));
 
-        var model = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Sol);
+        var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
         var remaining = GraphPlotProjection.BuildRemainingLines(scene);
 
         Assert.Empty(model.Rising.X);
@@ -1157,16 +1124,17 @@ public sealed class GraphPlotControlTests
         };
 
         var effective = Scene(points).Remaining;
-        var line = GraphPlotProjection.BuildRemainingLine(Scene(points));
+        var lines = GraphPlotProjection.BuildRemainingLines(Scene(points));
 
         Assert.Equal(100d, effective[0]);
         Assert.Equal(90d, effective[1]);
         Assert.Equal(86.66666666666667d, effective[2], precision: 12);
         Assert.Equal(83.33333333333333d, effective[3], precision: 12);
         Assert.Equal(80d, effective[4]);
-        Assert.Equal(points.Select(point => (double)point.Timestamp), line.X);
+        Assert.Equal(points.Select(point => (double)point.Timestamp), lines.Solid.X);
+        Assert.Empty(lines.Dashed.X);
         Assert.DoesNotContain(
-            line.X.Zip(line.X.Skip(1)),
+            lines.Solid.X.Zip(lines.Solid.X.Skip(1)),
             pair => pair.First == pair.Second);
     }
 
@@ -1209,35 +1177,13 @@ public sealed class GraphPlotControlTests
             Point(1_060, 90, 1, 0, 0),
             Point(1_120, 90, 2, 0, 0),
         };
-        var terminalEffective = Scene(terminal).Remaining;
+        var terminalScene = Scene(terminal, end: 1_180);
+        var terminalEffective = terminalScene.Remaining;
+        var terminalLines = GraphPlotProjection.BuildRemainingLines(terminalScene);
 
         Assert.Equal(90d, terminalEffective[^1]);
-    }
-
-    [Fact]
-    public void Remaining_keeps_the_reset_gap_flat_and_places_first_use_at_its_timestamp()
-    {
-        var points = new[]
-        {
-            Point(1_000, 100, 0, 0, 0),
-            Point(1_120, 90, 1, 0, 0),
-            Point(1_300, 90, 1, 0, 0),
-        };
-
-        var scene = Scene(points);
-        var effective = scene.Remaining;
-
-        Assert.Equal(100d, effective[0]);
-        Assert.Equal(90d, effective[1]);
-        Assert.Equal(90d, effective[2]);
-        Assert.Contains(scene.IdleIntervals, interval => interval.PreserveBoundary && interval.StartAt == 1_000 && interval.EndAt == 1_120);
-
-        var shortGap = new[]
-        {
-            Point(1_000, 100, 0, 0, 0),
-            Point(1_060, 90, 1, 0, 0),
-        };
-        Assert.DoesNotContain(Scene(shortGap).IdleIntervals, interval => interval.PreserveBoundary);
+        Assert.Equal([1_120d, 1_180d], terminalLines.Dashed.X);
+        Assert.Equal([90d, 90d], terminalLines.Dashed.Y);
     }
 
     [Fact]
@@ -1279,10 +1225,11 @@ public sealed class GraphPlotControlTests
         double firstObserved,
         double terminalObserved)
     {
-        Assert.Equal([1_000d, 1_120d], lines.Flat.X);
-        Assert.Equal([0d, 0d], lines.Flat.Y);
-        Assert.Equal([1_120d, 1_120d, 1_180d], lines.Rising.X);
-        Assert.Equal([0d, firstObserved, terminalObserved], lines.Rising.Y);
+        Assert.Empty(lines.Flat.X);
+        Assert.Equal([1_120d, 1_180d], lines.Rising.X);
+        Assert.Equal([firstObserved, terminalObserved], lines.Rising.Y);
+        Assert.Equal([1_000d, 1_120d], lines.Dashed.X);
+        Assert.Equal([0d, firstObserved], lines.Dashed.Y);
     }
 
     private static void AssertHistorySample(

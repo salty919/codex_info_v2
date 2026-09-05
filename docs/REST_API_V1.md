@@ -120,7 +120,7 @@ warm-up後、loopback、in-flight 1でrequest送信開始からresponse body全�
 7日相当10,080 samplesでP90 50 ms以下・P95 100 ms以下、契約最大1暦月44,640 samplesで
 P90 100 ms以下・P95 150 ms以下とする。各route/profileを30回以上測定し、client hard timeoutは
 1秒、timeout・欠測・上限超過はPASSへ丸めない。DB読出しはtimestamp/reset複合indexを使い、
-3暦月を保持したDBから1暦月窓かつ44,640行以下だけを一度materializeする。full table scan、無上限読出し、UI threadでの
+3暦月を保持したDBから1暦月窓のraw候補を一度materializeし、同一分のreset aliasをcanonicalizeした公開sampleだけを44,640点以下にする。raw alias行数を44,640で打ち切ったり取得失敗にしたりせず、full table scan、保持3暦月全体の読出し、UI threadでの
 行単位publishを禁止し、candidate失敗時はlast-good publicationを保持する。
 これらはinternal validated snapshot `1 MiB`とは別resourceであり、どの上限もdecode後の推測値へ
 置換しない。上限超過、malformed、unknown/case key、duplicate key、domain errorは該当resourceの
