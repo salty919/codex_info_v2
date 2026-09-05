@@ -52,6 +52,14 @@ cleanup条件と削除予定:
 - 許可後のfetchは、宣言した`origin/feat/next` refと完全SHAの取得に限定する。fetchが`FETCH_HEAD`と共有object database等を変更することを前提とし、作成直前にremote SHAが宣言値と同一であることを再確認する。
 - 一時branch名は一意な`codex/<task>`、canonical worktree pathは`/home/salty/code/codex_info_v2-wt-<task>`とする。既存local/remote branch、既存path、symlink、別worktreeと衝突する場合は作成せず停止する。
 
+### 認可状態の継続と自動GOAL継続
+
+- `同一申請`は、完全なbase SHA、一時branch名、canonical worktree path、owned files / paths、変更しない範囲、許可を求める操作、予定時間と完了予定時刻、統合方法とPR target、cleanup条件が同じ申請を指す。同一申請はchatで1回だけ提示し、重複して許可を求めない。
+- 申請提示後にユーザーが明示許可したら、認可状態はactive taskのcleanup、ユーザーによる取消し、または下記の失効条件まで継続する。宣言済みowned scopeと操作のedit、test、commit、push、PR作成の各段階で、ユーザーへの追加許可確認を挿入しない。継続自走を明示したactive GOALでは、この認可範囲を完了または真の外部blockerまで連続実行する。
+- `自動GOAL継続`は、ユーザーの新しい意思表示を含まず、永続するactive GOALの作業継続だけを求めるイベントを指す。これを許可、拒否、取消し、scope変更、再申請理由と解釈せず、認可状態を変更しない。認可状態は、新しいユーザーメッセージが明示的に許可、拒否、取消し、または申請内容の変更を示した場合だけ変更する。
+- 同一の未認可状態で自動GOAL継続が発生しても、同じ申請、説明、read-only監査を繰り返さず、それだけを理由にactive / blockedを往復しない。認可待ちの状態を保持し、無関係なtest、worktree、Issue、workflow実験を追加しない。
+- 認可は、base SHA、branch、canonical path、owned scope、操作、統合方法またはPR target、予定時間または完了予定時刻が変更された場合、期限を超過した場合、申請の事実誤認・要求の取違い・scope誤りが判明した場合、またはユーザーが取消した場合だけ失効する。再許可前に変更点を宣言する。既存のpreflight、remote SHA再確認、ownership、fail-closed停止、merge禁止は省略せず、この節をそれらの代替にしない。
+
 ### ownership、実装、検証、統合
 
 - 1 taskにつき一時branch 1本、一時worktree 1個とする。同じfile/pathにwriterを1人だけ割り当て、owned pathsと変更禁止範囲を宣言する。
