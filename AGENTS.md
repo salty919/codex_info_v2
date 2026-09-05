@@ -29,7 +29,7 @@
 
 - Codexはbranchまたはworktreeを作る前に、`git status`、`git worktree list --porcelain`、local/remote branch、Open PR、対象pathの所有・dirty状態を読取り確認する。
 - baseは`git ls-remote origin refs/heads/feat/next`が返す単一の40桁object IDとする。不存在、複数、取得不能、malformedの場合は停止し、localの`feat/next`、`main`、`FETCH_HEAD`、古いremote-tracking refで代替してはならない。
-- Codexは次の全項目をchatで宣言し、宣言後のユーザー本人による明示許可を待たなければならない。宣言自体や過去タスクの許可を、今回の許可と解釈してはならない。
+- Codexは次の全項目をchatで宣言する。先に会話とGOALの既存許可を読み、今回の目的と操作を含む継続自走許可があれば再確認せず進める。既存許可で扱えない新しい目的や操作だけをユーザーへ確認する。宣言自体を許可と解釈してはならない。
 
 ```text
 Worktree使用申請
@@ -48,7 +48,7 @@ owned files / paths:
 cleanup条件と削除予定:
 ```
 
-- 許可は宣言したbranch、path、base SHA、owned scope、操作、期限にだけ有効とする。base、scope、path、操作、統合方法、予定時間が変化または超過した場合、あるいはユーザーが取消した場合は直ちに停止し、変更点を宣言して再許可を待つ。
+- 許可の継続と再確認は下記「認可状態の継続と自動GOAL継続」を正本とする。branch、path、base SHA、予定時間は作業状態として報告し、その変更だけを許可失効と扱わない。
 - 許可後のfetchは、宣言した`origin/feat/next` refと完全SHAの取得に限定する。fetchが`FETCH_HEAD`と共有object database等を変更することを前提とし、作成直前にremote SHAが宣言値と同一であることを再確認する。
 - 一時branch名は一意な`codex/<task>`、canonical worktree pathは`/home/salty/code/codex_info_v2-wt-<task>`とする。既存local/remote branch、既存path、symlink、別worktreeと衝突する場合は作成せず停止する。
 
@@ -58,7 +58,9 @@ cleanup条件と削除予定:
 - 申請提示後にユーザーが明示許可したら、認可状態はactive taskのcleanup、ユーザーによる取消し、または下記の失効条件まで継続する。宣言済みowned scopeと操作のedit、test、commit、push、PR作成の各段階で、ユーザーへの追加許可確認を挿入しない。継続自走を明示したactive GOALでは、この認可範囲を完了または真の外部blockerまで連続実行する。
 - `自動GOAL継続`は、ユーザーの新しい意思表示を含まず、永続するactive GOALの作業継続だけを求めるイベントを指す。これを許可、拒否、取消し、scope変更、再申請理由と解釈せず、認可状態を変更しない。認可状態は、新しいユーザーメッセージが明示的に許可、拒否、取消し、または申請内容の変更を示した場合だけ変更する。
 - 同一の未認可状態で自動GOAL継続が発生しても、同じ申請、説明、read-only監査を繰り返さず、それだけを理由にactive / blockedを往復しない。認可待ちの状態を保持し、無関係なtest、worktree、Issue、workflow実験を追加しない。
-- 認可は、base SHA、branch、canonical path、owned scope、操作、統合方法またはPR target、予定時間または完了予定時刻が変更された場合、期限を超過した場合、申請の事実誤認・要求の取違い・scope誤りが判明した場合、またはユーザーが取消した場合だけ失効する。再許可前に変更点を宣言する。既存のpreflight、remote SHA再確認、ownership、fail-closed停止、merge禁止は省略せず、この節をそれらの代替にしない。
+- ユーザーがGOALや会話で本修正の連続自走を許可し、repository規約より優先すると指定した場合は、その目的に必要な調査・編集・直接検証・commit・push・feat向けPR更新・worktree作成とcleanupを継続する。個別申請の重複、予定時間超過、ターン終了、worktreeの再作成だけで停止しない。ユーザーが明示した作業終了期限は守る。未統合PRがあることだけで、他の許可済み作業を停止しない。
+- 再確認は、ユーザーの取消し、許可された目的を外れる変更、新たな破壊的操作、またはユーザー判断なしに解消できない所有権・要求の衝突がある場合に限る。事実誤認は訂正して影響を示し、訂正後も既存許可内なら続行する。明示的にユーザーだけが行うmerge・main・Release操作は代行しない。
+- 予定済み依存PRの統合でbase SHAが進んだ場合は、旧新SHAとowned pathsの差分を確認し、競合と目的変更がなければ既存許可を維持する。予期しない差分がある場合も、影響を調査してから判断し、SHAの変化だけで再許可待ちにしない。必要な検証は影響範囲だけ更新する。
 
 ### ownership、実装、検証、統合
 
@@ -70,7 +72,7 @@ cleanup条件と削除予定:
 - Codexは、ユーザーから依頼または許可を受けた場合も、いかなるPRもmergeせず、auto-mergeを設定または解除しない。この禁止に例外はなく、merge操作はユーザー本人だけが行う。Codexは`codex/<task> -> feat/next`のPR作成・更新と作業証拠のcommentを行える。PRのapprove、ready化、closeおよびworkflowのapproveまたはrerunは、exact targetと操作についてユーザーの明示許可がある場合だけ実施できる。
 - CodexはPRのURL、base/headの完全SHA、変更file、検証結果、未確認事項、`main`へ統合した場合の影響を提示し、ユーザーが変更と動作を確認できる状態でmerge前に停止する。Codex自身の実装・検証・review結果を、ユーザーによる統合判断の代替にしてはならない。
 - pushまたはPR作成が許可されていない作業を「統合済み」または「完了」と報告してはならない。実装済み、local検証済み、未統合を区別して報告する。
-- pushまたはPR作成直前に`origin/feat/next`の完全SHAを再確認する。宣言baseから進んでいる場合は、旧SHA、新SHA、競合し得るowned pathsを報告して停止し、rebase、merge、reset、cherry-pick、stash、force pushを行わず再許可を待つ。
+- pushまたはPR作成直前に`origin/feat/next`の完全SHAを再確認する。進んでいる場合は旧新SHAとowned pathsへの影響を報告し、「認可状態の継続と自動GOAL継続」に従って継続可否を判断する。履歴書換えを要しない既存branchの更新を、base SHAの変化だけで停止しない。
 - `codex/<task> -> feat/next`はtrusted `feat-integration.yml`が完全なPR差分を有限ownerへ分類し、関係するremote qualityだけをadvisoryに実行する。実owner job、CodeQL、distributionの失敗は赤のまま表示するが、`selected-quality`集約と`feat-acceptance`は実行せず、workflow結果でユーザーのmergeを禁止しない。この経路ではversion、candidate、Release、tag、branch refをmutationしない。`feat/next -> main`は同じ分類正本を使用するが、`selected-quality`・`acceptance`・`version-prepared`はRelease品質と公開可否を別のmain経路で所有し、merge判断はユーザーだけが行う。feat向けtriggerをmain向けtriggerの単純な拡張にしてはならない。
 - Git差分callerはrename/copy検出を明示し、両端を単一分類器へ渡す。mainのRelease向けselected/non-selected結果だけをtrusted base版gateで集約し、feat向けPRは選択された実job自身の結果を表示する。
 - workflowの`GITHUB_TOKEN`によるref更新が別のActions runを起動すると仮定しない。main向けversion生成H1は同じtrusted DAGでRelease品質を評価し、生成commitの固定trailerとproducer runでH0/H1を対応付ける。H1へcustom `version-prepared`・`acceptance` checkを登録せず、同じH1のeventは正規trailerを確認できた場合だけowner再実行を抑止する。この確認はbyte-identicalな手動commitとの区別だけを目的とし、poll、retry、mutation readback、表示URL照合、証拠専用artifactを追加しない。
