@@ -2,6 +2,7 @@
 <!-- codex-info-master-ids:
 ASTRA-COST-01
 API-LIFECYCLE-01
+REST-172
 CUM-138-04
 WIN-PARITY-DATA
 WIN-PARITY-STATE
@@ -95,7 +96,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 
 ## 3. 収集・API・live判定
 
-- 同一profileのresident serviceをquota、local usage、historyの唯一のauthority/writerとする。service内のrecorderとREST publisherは同じ有効owner、lease、epoch、cycleに従い、旧世代の結果を公開しない。
+- `REST-172`: 同一profileのresident serviceをquota、local usage、historyの唯一のauthority/writerとする。service内のrecorderとREST publisherは同じ有効owner、lease、epoch、cycleに従い、旧世代の結果を公開しない。1秒周期のrecorder死亡監視は常時維持する一方、REST snapshotの検証・3世代JSON生成・published pair更新は、新しいworker event、recorder試行結果、または60秒周期の鮮度確認があるcycleだけで行い、不変な1秒tickでは前回のimmutable snapshotを再利用する。
 - DBは履歴inventoryであり、実行中判定の単独根拠にしない。同一cycleで検証したprocess identityとrollout terminal stateの両方を用いる。
 - live rolloutではtask lifecycle、model、token stateを決めるrecordをstrict検証し、不正ならcycleを拒否して最後の完全snapshotを保持する。途中終了した`response_item`等の表示内容recordは状態値へ使わず隔離し、後続の完全な状態recordまで失敗させない。
 - 実行中threadの候補はCodex processが現在openしているcanonical Session pathの有限集合だけを正本とする。各pathの先頭`session_meta.id`に対して同一app-serverへ`thread/read(includeTurns=false)`を行い、返却ID/pathと完全Thread schemaを一致確認する。全Sessionを読む`thread/list`、state DBだけを候補正本にするfallback、Session総量に比例するRPCを本番取得経路に置かず、initializeを含む1cycleを共通15秒deadlineで打ち切る。
