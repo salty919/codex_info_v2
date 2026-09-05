@@ -3741,53 +3741,63 @@ impl UsageStore {
         drop(rows);
         drop(statement);
         let mut model_rows = BTreeMap::<(i64, i64), (Vec<SessionModelTotal>, bool)>::new();
-        let mut model_statement = self.connection.prepare(
-            "SELECT reset_at, timestamp, model, total_tokens, input_tokens,
+        let has_model_history: bool = self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'usage_model_history'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_model_history {
+            let mut model_statement = self.connection.prepare(
+                "SELECT reset_at, timestamp, model, total_tokens, input_tokens,
                     cached_input_tokens, output_tokens, cache_write_input_tokens,
                     model_set_complete
              FROM usage_model_history
              WHERE timestamp > ?1 AND timestamp <= ?2
              ORDER BY reset_at, timestamp, model",
-        )?;
-        let mut rows = model_statement.query(params![cutoff, now_timestamp])?;
-        while let Some(row) = rows.next()? {
-            let reset_at: i64 = row.get(0)?;
-            let timestamp: i64 = row.get(1)?;
-            if !observations.contains_key(&(reset_at, timestamp)) {
-                continue;
-            }
-            let cache_write: Option<String> = row.get(7)?;
-            let complete = match row.get::<_, i64>(8)? {
-                0 => false,
-                1 => true,
-                _ => {
+            )?;
+            let mut rows = model_statement.query(params![cutoff, now_timestamp])?;
+            while let Some(row) = rows.next()? {
+                let reset_at: i64 = row.get(0)?;
+                let timestamp: i64 = row.get(1)?;
+                if !observations.contains_key(&(reset_at, timestamp)) {
+                    continue;
+                }
+                let cache_write: Option<String> = row.get(7)?;
+                let complete = match row.get::<_, i64>(8)? {
+                    0 => false,
+                    1 => true,
+                    _ => {
+                        return Err(UsageStoreError::InvalidImport(
+                            "history model completeness is invalid".into(),
+                        ));
+                    }
+                };
+                let entry = model_rows
+                    .entry((reset_at, timestamp))
+                    .or_insert_with(|| (Vec::new(), complete));
+                if entry.1 != complete {
                     return Err(UsageStoreError::InvalidImport(
-                        "history model completeness is invalid".into(),
+                        "history model completeness is inconsistent".into(),
                     ));
                 }
-            };
-            let entry = model_rows
-                .entry((reset_at, timestamp))
-                .or_insert_with(|| (Vec::new(), complete));
-            if entry.1 != complete {
-                return Err(UsageStoreError::InvalidImport(
-                    "history model completeness is inconsistent".into(),
-                ));
+                entry.0.push(SessionModelTotal {
+                    model: row.get(2)?,
+                    total_tokens: canonical_u64_text(&row.get::<_, String>(3)?, "history total")?,
+                    input_tokens: canonical_u64_text(&row.get::<_, String>(4)?, "history input")?,
+                    cached_input_tokens: canonical_u64_text(
+                        &row.get::<_, String>(5)?,
+                        "history cached input",
+                    )?,
+                    output_tokens: canonical_u64_text(&row.get::<_, String>(6)?, "history output")?,
+                    cache_write_input_tokens: cache_write
+                        .as_deref()
+                        .map(|value| canonical_u64_text(value, "history cache write"))
+                        .transpose()?,
+                });
             }
-            entry.0.push(SessionModelTotal {
-                model: row.get(2)?,
-                total_tokens: canonical_u64_text(&row.get::<_, String>(3)?, "history total")?,
-                input_tokens: canonical_u64_text(&row.get::<_, String>(4)?, "history input")?,
-                cached_input_tokens: canonical_u64_text(
-                    &row.get::<_, String>(5)?,
-                    "history cached input",
-                )?,
-                output_tokens: canonical_u64_text(&row.get::<_, String>(6)?, "history output")?,
-                cache_write_input_tokens: cache_write
-                    .as_deref()
-                    .map(|value| canonical_u64_text(value, "history cache write"))
-                    .transpose()?,
-            });
         }
         for (key, (totals, complete)) in model_rows {
             let canonical = canonicalize_model_totals(&totals)?;

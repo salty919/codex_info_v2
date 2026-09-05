@@ -5050,13 +5050,12 @@ fn minute_model_spend_for_metric_with_untrusted(
         buckets.push(sample);
     }
     if show_tokens {
-        // A cumulative vector may never move backwards inside one period.
-        // Older rows can contain zero because token fields did not exist, and
-        // a damaged collection can temporarily lose an already-counted
-        // Session prefix. Neither is evidence of zero usage. Keep the whole
-        // observation unavailable until one later whole vector dominates the
-        // last reliable vector; component-wise maxima would fabricate a row
-        // that was never observed.
+        // Each model is an independent cumulative series. A damaged scan can
+        // temporarily lose one already-counted Session prefix, but that is no
+        // reason to discard another model that was observed and advanced in
+        // the same row. Mark only the regressed component unavailable; do not
+        // replace it with a component-wise maximum, which would fabricate a
+        // value that was never observed.
         let mut reliable = [0.0_f64; 3];
         return buckets
             .into_iter()
@@ -5066,19 +5065,18 @@ fn minute_model_spend_for_metric_with_untrusted(
                     sample.terra_tokens as f64,
                     sample.luna_tokens as f64,
                 ];
-                if current
-                    .iter()
-                    .zip(reliable)
-                    .any(|(current, previous)| *current < previous)
-                {
-                    return unreliable_model_spend(sample.timestamp);
+                let mut visible = [-1.0_f64; 3];
+                for index in 0..current.len() {
+                    if current[index] >= reliable[index] {
+                        reliable[index] = current[index];
+                        visible[index] = current[index];
+                    }
                 }
-                reliable = current;
                 HourlyModelSpend {
                     timestamp: sample.timestamp,
-                    sol: current[0],
-                    terra: current[1],
-                    luna: current[2],
+                    sol: visible[0],
+                    terra: visible[1],
+                    luna: visible[2],
                     astra: -1.0,
                 }
             })
@@ -5094,19 +5092,21 @@ fn minute_model_spend_for_metric_with_untrusted(
                 sample.terra_dollars,
                 sample.luna_dollars,
             ];
-            if current
-                .iter()
-                .zip(reliable)
-                .any(|(current, previous)| *current < previous)
-            {
-                return unreliable_model_spend(sample.timestamp);
+            let mut visible = [-1.0_f64; 3];
+            for index in 0..current.len() {
+                if current[index].is_finite()
+                    && current[index] >= 0.0
+                    && current[index] >= reliable[index]
+                {
+                    reliable[index] = current[index];
+                    visible[index] = current[index];
+                }
             }
-            reliable = current;
             HourlyModelSpend {
                 timestamp: sample.timestamp,
-                sol: current[0],
-                terra: current[1],
-                luna: current[2],
+                sol: visible[0],
+                terra: visible[1],
+                luna: visible[2],
                 astra: -1.0,
             }
         })
@@ -26032,22 +26032,14 @@ mod tests {
             fixture.expected_graph_timestamps
         );
         let graph = state.graph_paths_for_selection_at(observed_at, true, true, true, false);
-        // The v1 fallback carries legacy-unknown model provenance. It may
-        // still expose the endpoint value, but no model increase is a
-        // confirmed solid segment in the native graph.
-        assert!(graph.sol_rising.is_empty());
+        // The v1 fallback has an incomplete model set, but every legacy row
+        // that is present remains an exact model observation. Keep its SOL
+        // increase solid and leave only omitted models unknown.
+        assert!(!graph.sol_rising.is_empty());
         assert_eq!(graph.current_sol_label, "$420.40");
-        let first_observation_x = (fixture.expected_raw_timestamps[0]
-            - fixture.expected_period_start) as f64
-            / (fixture.expected_period_end - fixture.expected_period_start) as f64
-            * 100.0;
-        assert!(graph.unused_intervals.iter().any(|interval| {
-            (interval.start - first_observation_x).abs() < 0.000_001 && interval.width > 0.0
-        }));
-        assert!(graph
-            .unused_intervals
-            .iter()
-            .all(|interval| interval.start + 0.000_001 >= first_observation_x));
+        // The legacy model set is incomplete, so even a flat published row
+        // cannot prove that every omitted model was idle.
+        assert!(graph.unused_intervals.is_empty());
 
         let labels = state.graph_time_labels_at(observed_at);
         let expected_labels = [0.0, 0.25, 0.5, 0.75, 1.0].map(|fraction| {
@@ -27594,6 +27586,7 @@ mod tests {
         let points = minute_model_spend(&references);
         assert_eq!(points[0].sol, 50.0);
         assert!(!model_spend_is_reliable(&points[1]));
+        assert_eq!((points[1].terra, points[1].luna), (2.0, 1.0));
         assert_eq!(points[2].sol, 51.0);
 
         let graph = graph_paths_for_selection(&references, 0, 240, false, false, true, false);
