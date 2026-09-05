@@ -133,13 +133,24 @@ for check in "${checks[@]}"; do
         rust-history-graph)
             bash scripts/regression_guard.sh --history-graph
             ;;
+        rust-model-history)
+            bash scripts/regression_guard.sh --model-history
+            ;;
         linux-ui-history-graph)
+            cargo build --release --locked
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
+                bash scripts/x11_graph_visual_gate.sh
+            ;;
+        linux-ui-model-history)
             cargo build --release --locked
             xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
                 bash scripts/x11_graph_visual_gate.sh
             ;;
         windows-history-graph)
             bash scripts/windows_client_contract_gate.sh --history-graph
+            ;;
+        windows-model-history)
+            bash scripts/windows_client_contract_gate.sh --model-history
             ;;
         governance-workflow-selection)
             run_governance_contract

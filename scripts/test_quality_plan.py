@@ -72,6 +72,37 @@ class QualityPlanFixtures(unittest.TestCase):
         )
         self.assertEqual(plan.quality_profile, "history-graph")
 
+    def test_model_history_uses_only_authority_and_finite_platform_tests(self) -> None:
+        plan = plan_for_paths(
+            (
+                "docs/PRODUCT_REQUIREMENTS.md",
+                "src/daemon.rs",
+                "src/main.rs",
+                "src/server.rs",
+                "src/usage_store.rs",
+                "ui/components.slint",
+                "windows-client/src/CodexInfo.WindowsClient.Core/DetailsContracts.cs",
+                "windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs",
+                "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackStatusClientTests.cs",
+                "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs",
+            ),
+            quality_profile="model-history",
+        )
+        self.assertEqual(
+            plan.affected_owners,
+            ("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"),
+        )
+        self.assertEqual(
+            plan.checks,
+            (
+                "requirements-authority",
+                "rust-model-history",
+                "linux-ui-model-history",
+                "windows-model-history",
+            ),
+        )
+        self.assertEqual(plan.quality_profile, "model-history")
+
     def test_windows_owner(self) -> None:
         plan = plan_for_paths(
             (

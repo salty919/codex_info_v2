@@ -12,6 +12,8 @@ fail() {
 profile='full'
 if [[ $# -eq 1 && "$1" == --history-graph ]]; then
     profile='history-graph'
+elif [[ $# -eq 1 && "$1" == --model-history ]]; then
+    profile='model-history'
 elif [[ $# -ne 0 ]]; then
     fail "unexpected argument: $1"
 fi
@@ -21,9 +23,10 @@ solution='windows-client/CodexInfo.WindowsClient.sln'
 test_target="$solution"
 test_filter=()
 expected_methods=()
-if [[ "$profile" == history-graph ]]; then
+if [[ "$profile" == history-graph || "$profile" == model-history ]]; then
     test_target='windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/CodexInfo.WindowsClient.Presentation.Tests.csproj'
-    expected_methods=(
+    if [[ "$profile" == history-graph ]]; then
+        expected_methods=(
         CodexInfo.WindowsClient.Presentation.Tests.GraphWindowViewModelProjectionTests.Clips_current_graph_period_at_start_and_reset_boundaries
         CodexInfo.WindowsClient.Presentation.Tests.GraphWindowViewModelProjectionTests.Keeps_historical_graph_period_boundary_intact
         CodexInfo.WindowsClient.Presentation.Tests.GraphWindowViewModelProjectionTests.Graph_samples_start_at_first_observation_without_synthetic_anchor
@@ -37,7 +40,15 @@ if [[ "$profile" == history-graph ]]; then
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Remaining_quota_observations_survive_flat_model_rows_as_unattributed_dashes
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Missing_remote_quota_is_never_painted_as_a_solid_bridge
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Reduction_preserves_regression_quota_and_confirmed_gap_boundaries
-    )
+        )
+    else
+        expected_methods=(
+            CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsV3IsPreferredAndCarriesAstraHistory
+            CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsV3ReusesTheAcceptedGenerationWithAZeroBody304
+            CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsFallsBackToV1OnlyWhenV3AndV2ReturnNotFound
+            CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.V3AstraHistoryRendersWithoutLegacyModelRows
+        )
+    fi
     filter=''
     for method in "${expected_methods[@]}"; do
         filter+="${filter:+|}FullyQualifiedName=$method"
@@ -106,7 +117,7 @@ if totals["total"] <= 0 or totals["executed"] <= 0 or totals["passed"] <= 0:
     raise SystemExit("windows-client-contract-gate: FAIL: zero Windows tests executed")
 if totals["failed"] != 0:
     raise SystemExit("windows-client-contract-gate: FAIL: Windows test failure recorded")
-if profile == "history-graph":
+if profile in {"history-graph", "model-history"}:
     missing = sorted(expected_methods - observed_methods)
     unexpected = sorted(observed_methods - expected_methods)
     if missing or unexpected:
@@ -122,6 +133,8 @@ PY
 
 if [[ "$profile" == history-graph ]]; then
     echo "windows-client-contract-gate: PASS check=windows-history-graph methods=${#expected_methods[@]}"
+elif [[ "$profile" == model-history ]]; then
+    echo "windows-client-contract-gate: PASS check=windows-model-history methods=${#expected_methods[@]}"
 else
     echo 'windows-client-contract-gate: PASS check=windows-contract'
 fi

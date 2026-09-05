@@ -32,7 +32,7 @@ jobs:
         env:
           QUALITY_PROFILE: ${{ inputs.quality_profile }}
         run: |
-          [[ "$QUALITY_PROFILE" == release || "$QUALITY_PROFILE" == history-graph ]]
+          [[ "$QUALITY_PROFILE" == release || "$QUALITY_PROFILE" == history-graph || "$QUALITY_PROFILE" == model-history ]]
       - name: Install Linux UI quality tools
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
       - uses: dtolnay/rust-toolchain@stable

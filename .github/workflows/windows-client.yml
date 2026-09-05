@@ -39,13 +39,17 @@ jobs:
         env:
           QUALITY_PROFILE: ${{ inputs.quality_profile }}
         run: |
-          if ($env:QUALITY_PROFILE -cne 'release' -and $env:QUALITY_PROFILE -cne 'history-graph') {
+          if ($env:QUALITY_PROFILE -cne 'release' -and $env:QUALITY_PROFILE -cne 'history-graph' -and $env:QUALITY_PROFILE -cne 'model-history') {
             throw "Unsupported Windows quality profile: $env:QUALITY_PROFILE"
           }
       - name: Run finite history graph tests
         if: inputs.quality_profile == 'history-graph'
         shell: bash
         run: bash scripts/windows_client_contract_gate.sh --history-graph
+      - name: Run finite model history tests
+        if: inputs.quality_profile == 'model-history'
+        shell: bash
+        run: bash scripts/windows_client_contract_gate.sh --model-history
       - name: Run Windows unit tests
         if: inputs.quality_profile == 'release'
         shell: pwsh
