@@ -684,8 +684,9 @@ public sealed class GraphPlotControlTests
     [Fact]
     public void InferredLinesAreThinnerThanMeasuredModelLines()
     {
+        Assert.Equal(3f, GraphPlotControl.MeasuredModelLineWidth);
         Assert.Equal(1f, GraphPlotControl.InferredLineWidth);
-        Assert.True(GraphPlotControl.InferredLineWidth < 3f);
+        Assert.True(GraphPlotControl.InferredLineWidth < GraphPlotControl.MeasuredModelLineWidth);
     }
 
     [Fact]

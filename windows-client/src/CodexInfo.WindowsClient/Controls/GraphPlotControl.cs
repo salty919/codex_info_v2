@@ -27,6 +27,7 @@ public sealed class GraphPlotControl : AvaPlot
     private static readonly ScottPlot.Color AstraColor = new("#E86E9F");
     internal const string IdleBandColorHex = "#3F5D7C";
     internal const double IdleBandOpacity = 0.22;
+    internal const float MeasuredModelLineWidth = 3f;
     internal const float InferredLineWidth = 1f;
     private static readonly ScottPlot.Color IdleBandColor = new(IdleBandColorHex);
     private static readonly ScottPlot.Color MutedColor = new("#A8B7CA");
@@ -214,8 +215,8 @@ public sealed class GraphPlotControl : AvaPlot
     {
         var lines = GraphPlotProjection.BuildRenderableModelLines(scene, values);
         return new ModelSeriesVisual(
-            AddLine(lines.Flat, color.WithOpacity(0.50), Plot.Axes.Left, 1f),
-            AddLine(lines.Rising, color.WithOpacity(0.95), Plot.Axes.Left, 3f),
+            AddLine(lines.Flat, color.WithOpacity(0.95), Plot.Axes.Left, MeasuredModelLineWidth),
+            AddLine(lines.Rising, color.WithOpacity(0.95), Plot.Axes.Left, MeasuredModelLineWidth),
             AddLine(lines.Dashed, color.WithOpacity(0.72), Plot.Axes.Left, InferredLineWidth, dashed: true));
     }
 
