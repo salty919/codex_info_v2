@@ -3207,6 +3207,24 @@ def _focused_windows_model_routing_test() -> int:
             encoding="utf-8",
         )
         fake_dotnet.chmod(0o755)
+        fake_pwsh = fake_bin / "pwsh"
+        fake_pwsh.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import json
+                import os
+                from pathlib import Path
+                import sys
+
+                args = ["pwsh", *sys.argv[1:]]
+                with Path(os.environ["ROUTING_CALLS"]).open("a", encoding="utf-8") as output:
+                    output.write(json.dumps(args) + "\\n")
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake_pwsh.chmod(0o755)
         result = subprocess.run(
             ("bash", str(ROOT / "scripts/windows_client_contract_gate.sh"), "--model-history"),
             cwd=ROOT,
@@ -3220,6 +3238,18 @@ def _focused_windows_model_routing_test() -> int:
         test_calls = [args for args in calls if args[0] == "test"]
         if len(test_calls) != 2 or any(args[0] == "format" for args in calls):
             raise AssertionError(f"Windows model caller expanded its command set: {calls}")
+        pwsh_calls = [args for args in calls if args[0] == "pwsh"]
+        expected_pwsh = [[
+            "pwsh",
+            "-NoProfile",
+            "-File",
+            "windows-client/tools/Run-WindowsClientE2E.ps1",
+            "-FixtureContractTest",
+        ]]
+        if pwsh_calls != expected_pwsh:
+            raise AssertionError(
+                f"Windows model caller omitted its finite E2E fixture contract: {pwsh_calls}"
+            )
         observed: dict[str, frozenset[str]] = {}
         for args in test_calls:
             target = args[1]
