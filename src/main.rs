@@ -8076,7 +8076,14 @@ fn recover_checkpointed_history_model_totals(
         "legacy component recovery verified sources={} bytes={selected_bytes}",
         inventory.selected_session_files.len()
     ));
-    Ok(totals.to_session_totals())
+    // This offset reconstructs only the columns owned by the legacy
+    // authority. Other models already belong to normal checkpointed
+    // collection and must not be added a second time (or invented as zero).
+    Ok(totals
+        .to_session_totals()
+        .into_iter()
+        .filter(|total| matches!(total.model.as_str(), "SOL" | "TERRA" | "LUNA"))
+        .collect())
 }
 
 fn resolved_executable(override_name: &str, command_name: &str) -> Option<PathBuf> {
@@ -9388,18 +9395,26 @@ impl CodexInfoState {
             Vec::new()
         };
         models.sort_by(|left, right| left.model.cmp(&right.model));
+        // Preserve observation order within each timestamp so max_by_key
+        // retains the existing last-wins behavior for equal priorities.
+        // Each public row only needs observations at its own timestamp.
+        let mut observations_by_timestamp = BTreeMap::<_, Vec<_>>::new();
+        for observation in &self.history.observations {
+            observations_by_timestamp
+                .entry(observation.timestamp)
+                .or_default()
+                .push(observation);
+        }
         let history_samples = v2
             .history_samples
             .iter()
             .map(|sample| {
-                let source = self
-                    .history
-                    .observations
-                    .iter()
-                    .filter(|observation| {
-                        observation.timestamp == sample.timestamp
-                            && observation.reset_at.abs_diff(sample.reset_at) <= 60
-                    })
+                let source = observations_by_timestamp
+                    .get(&sample.timestamp)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|observation| observation.reset_at.abs_diff(sample.reset_at) <= 60)
                     .max_by_key(|observation| {
                         (
                             observation.model_totals.is_some(),
@@ -12135,14 +12150,22 @@ impl CodexInfoState {
     }
 
     fn graph_data(&self) -> String {
-        let Some(reset_at) = self.selected_history_reset() else {
+        self.graph_data_at(Utc::now().timestamp())
+    }
+
+    fn graph_data_at(&self, observed_at: i64) -> String {
+        let Some(reset_at) = self.selected_history_reset_at(observed_at) else {
             return "[]".into();
         };
         self.projected_history().graph_data_for_reset(reset_at)
     }
 
     fn selected_history_reset(&self) -> Option<i64> {
-        let periods = self.history_periods();
+        self.selected_history_reset_at(Utc::now().timestamp())
+    }
+
+    fn selected_history_reset_at(&self, observed_at: i64) -> Option<i64> {
+        let periods = self.history_periods_at(observed_at);
         periods
             .iter()
             .find(|period| period.label == self.selected_history_period)
@@ -12163,7 +12186,11 @@ impl CodexInfoState {
     }
 
     fn select_latest_history(&mut self) {
-        let periods = self.history_periods();
+        self.select_latest_history_at(Utc::now().timestamp());
+    }
+
+    fn select_latest_history_at(&mut self, observed_at: i64) {
+        let periods = self.history_periods_at(observed_at);
         let selected = self
             .reset_at
             .and_then(|reset| {
@@ -18449,6 +18476,15 @@ mod tests {
         )
         .unwrap();
 
+        // These models are owned by ordinary checkpointed collection, not
+        // the three-column legacy offset, even when present in the prefix.
+        for model in ["gpt-6-astra", "future-model"] {
+            fs::write(
+                root.join(format!("{model}.jsonl")),
+                session(model, boundary_timestamp, 100, 80, 20, 20),
+            )
+            .unwrap();
+        }
         let inventory = super::local_input_inventory_for_paths(Some(&root), None).unwrap();
         let checkpoints = inventory
             .selected_session_files
@@ -18513,6 +18549,10 @@ mod tests {
             WEEK_SECONDS,
         )
         .unwrap();
+        let recovered = recovered
+            .into_iter()
+            .map(|total| (total.model.clone(), total))
+            .collect::<BTreeMap<_, _>>();
         assert_eq!(
             recovered,
             vec![
@@ -18525,7 +18565,7 @@ mod tests {
                     output_tokens: 200_000,
                 },
                 super::usage_store::SessionModelTotal {
-                    cache_write_input_tokens: None,
+                    cache_write_input_tokens: Some(0),
                     model: "TERRA".into(),
                     total_tokens: 0,
                     input_tokens: 0,
@@ -18541,6 +18581,9 @@ mod tests {
                     output_tokens: 200_000,
                 },
             ]
+            .into_iter()
+            .map(|total| (total.model.clone(), total))
+            .collect::<BTreeMap<_, _>>()
         );
 
         let partial_path = root.join("post-boundary.jsonl");
@@ -20883,6 +20926,12 @@ mod tests {
         let inventory =
             super::local_input_inventory_for_paths_with_limit(Some(&sessions), None, 0).unwrap();
         let mut plan = super::cleanup_plan_for_inventory(&inventory).unwrap();
+        // Exercise cleanup authorization independently of the newest-file
+        // selection policy, which always retains at least one source.
+        plan.overflow_files
+            .extend(inventory.selected_session_files.iter().cloned());
+        plan.selected_paths.clear();
+        assert_eq!(plan.overflow_files.len(), 7);
         let candidate = |name: &str| {
             plan.overflow_files
                 .iter()
@@ -22818,6 +22867,7 @@ mod tests {
             "current-sol-connector-path",
             "current-terra-connector-path",
             "current-luna-connector-path",
+            "current-astra-connector-path",
             "current-label-gap: 10px;",
             "current-label-width: root.show-tokens ? 112px : 80px;",
             "current-label-right-padding: 4px;",
@@ -22830,15 +22880,23 @@ mod tests {
         // Connector coordinates are normalized to the 0..100 viewbox. They
         // must fill the narrow label gap; otherwise Slint treats the values as
         // raw pixels and paints stray lines near the plot center/top.
-        assert_eq!(
-            slint
-                .matches("fit: fill;\n                commands: root.current-")
-                .count(),
-            4
-        );
+        for model in ["remaining", "sol", "terra", "luna", "astra"] {
+            let command = format!("commands: root.current-{model}-connector-path;");
+            let before = slint.split_once(&command).expect("missing connector").0;
+            let properties = before.rsplit_once('{').unwrap().1;
+            assert!(properties.contains("fit: fill;"), "{model} connector fit");
+        }
         // An open SVG path must never be implicitly closed and painted to the
         // baseline; that was the visual source of the old stacked-area graph.
-        assert_eq!(slint.matches("fill: transparent;").count(), 11);
+        for block in slint.split("Path {").skip(1) {
+            let properties = block.split_once('}').unwrap().0;
+            if properties.contains("commands: root.") {
+                assert!(
+                    properties.contains("fill: transparent;"),
+                    "unfilled graph line"
+                );
+            }
+        }
     }
 
     #[test]
@@ -22862,7 +22920,7 @@ mod tests {
     }
 
     #[test]
-    fn model_rows_exclude_unknown_models() {
+    fn model_rows_preserve_unknown_model_tokens_without_inventing_prices() {
         let mut totals = ModelUsageTotals::default();
         totals.add(
             "gpt-5.6-sol",
@@ -22884,14 +22942,18 @@ mod tests {
                 output: 0,
             },
         );
+        let rows = totals.rows();
         assert_eq!(
-            totals
-                .rows()
-                .iter()
-                .map(|row| row.name.as_str())
-                .collect::<Vec<_>>(),
-            ["SOL"]
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            ["SOL", "some-other-model"]
         );
+        let unknown = &rows[1];
+        assert_eq!(unknown.tokens, 999);
+        assert_eq!(unknown.input_tokens, 999);
+        assert_eq!(unknown.cached_input_tokens, 0);
+        assert_eq!(unknown.output_tokens, 0);
+        let (input, cached, output) = unknown.dollar_costs();
+        assert!(input.is_nan() && cached.is_nan() && output.is_nan());
     }
 
     #[test]
@@ -24920,7 +24982,14 @@ mod tests {
                 luna_tokens: 0,
             },
         ];
-        let mut store = UsageStore::open(&db_path).unwrap();
+        let identity = usage_store::StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 1,
+            partition_id: "33".repeat(32),
+        };
+        let mut store = UsageStore::create_partitioned(&db_path, &identity).unwrap();
         store
             .upsert_samples(
                 &samples
@@ -24931,7 +25000,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        daemon::maintain_history_database_for_test(&db_path, now).unwrap();
+        daemon::maintain_history_database_for_test(&db_path, &identity, now).unwrap();
         let mut history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), now);
         history.startup_maintenance(now);
 
@@ -25203,7 +25272,14 @@ mod tests {
             record(now.timestamp(), now.timestamp() + 30_000, 70.0),
             record(now.timestamp() + 1, now.timestamp() + 40_000, 60.0),
         ];
-        let mut store = UsageStore::open(&db_path).unwrap();
+        let identity = usage_store::StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 1,
+            partition_id: "33".repeat(32),
+        };
+        let mut store = UsageStore::create_partitioned(&db_path, &identity).unwrap();
         store
             .upsert_samples(
                 &records
@@ -25214,7 +25290,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        daemon::maintain_history_database_for_test(&db_path, now).unwrap();
+        daemon::maintain_history_database_for_test(&db_path, &identity, now).unwrap();
         let mut history = UsageHistory::load_from_db_path_at(Some(db_path.clone()), now);
         history.startup_maintenance(now);
         assert_eq!(
@@ -26822,9 +26898,12 @@ mod tests {
         assert!(current.start <= current_samples[0].timestamp);
         assert!(!current.label.is_empty());
 
-        state.select_latest_history();
+        state.select_latest_history_at(observed_at);
         assert_eq!(state.selected_reset_at, Some(canonical_reset));
-        assert_eq!(state.selected_history_reset(), Some(canonical_reset));
+        assert_eq!(
+            state.selected_history_reset_at(observed_at),
+            Some(canonical_reset)
+        );
         assert_eq!(
             state.selected_history_period,
             state
@@ -26836,7 +26915,7 @@ mod tests {
         );
 
         let graph_samples: Vec<UsageHistorySample> =
-            serde_json::from_str(&state.graph_data()).expect("selected graph JSON");
+            serde_json::from_str(&state.graph_data_at(observed_at)).expect("selected graph JSON");
         assert_eq!(graph_samples.len(), current_samples.len());
         assert!(graph_samples
             .iter()
@@ -27733,8 +27812,8 @@ mod tests {
             .find(|period| period.current)
             .cloned()
             .expect("preview has a current period");
-        let gap_start = period.start_at + 60;
-        let gap_end = gap_start + 60;
+        let gap_start = period.start_at;
+        let gap_end = period.end_at;
         details.history_gaps = vec![PublicHistoryGap {
             gap_id: "11".repeat(16),
             reset_at: period.reset_at,
@@ -27749,11 +27828,12 @@ mod tests {
             .apply_service_details(format!("v1:{:064x}", 1_u8), details)
             .unwrap());
         assert_eq!(client.history_gaps.len(), 1);
+        assert_eq!(client.history_gaps[0].start_at, gap_start);
+        assert_eq!(client.history_gaps[0].end_at, gap_end);
         let graph = client.graph_paths_for_selection_at(observed_at, true, true, true, false);
-        assert!(graph
-            .unused_intervals
-            .iter()
-            .any(|interval| interval.preserve_boundary && interval.width > 0.0));
+        assert!(graph.unused_intervals.is_empty());
+        assert!(graph.remaining_solid.is_empty());
+        assert!(graph.remaining_inferred.is_empty());
     }
 
     #[test]
@@ -28191,11 +28271,14 @@ mod tests {
                 (240, 80.0)
             ]
         );
-        let path = graph_paths(&references, 0, 240).remaining;
-        assert!(path.starts_with("M0.00 1.00 L25.00 10.80"));
-        assert!(path.matches('M').count() > 5);
-        assert!(!path.contains("L50.00 10.80 L50.00 15.70"));
-        assert!(path.ends_with("L100.00 20.60"));
+        let paths = graph_paths(&references, 0, 240);
+        assert_eq!(
+            paths.remaining_solid,
+            "M0.00 1.00 L25.00 10.80 M75.00 20.60 L100.00 20.60"
+        );
+        assert!(!paths.remaining_inferred.is_empty());
+        assert!(!paths.remaining.contains("L50.00 10.80 L50.00 15.70"));
+        assert_eq!(paths.current_remaining_label, "80%");
     }
 
     #[test]
@@ -28666,9 +28749,9 @@ mod tests {
         assert!(!model_spend_is_reliable(&points[3]));
 
         let graph = graph_paths_for_selection(&references, 0, 300, true, true, true, true);
-        assert!(graph.current_luna_label.is_empty());
-        assert!(graph.current_terra_label.is_empty());
-        assert!(graph.current_sol_label.is_empty());
+        assert_eq!(graph.current_luna_label, "8,000");
+        assert_eq!(graph.current_terra_label, "4,000");
+        assert_eq!(graph.current_sol_label, "2,000");
         assert!(graph.sol_inferred.matches('M').count() > 2);
     }
 
@@ -29294,8 +29377,78 @@ mod tests {
             ),
         ];
         let references = samples.iter().collect::<Vec<_>>();
-        let dollars = graph_paths_for_selection(&references, 0, 180, true, true, true, false);
-        let tokens = graph_paths_for_selection(&references, 0, 180, true, true, true, true);
+        let without_models =
+            graph_paths_for_selection(&references, 0, 180, true, true, true, false);
+        assert!(without_models.unused_intervals.is_empty());
+        let timelines: super::GraphModelTimelines = [
+            (
+                "SOL".to_owned(),
+                samples
+                    .iter()
+                    .map(|sample| {
+                        (
+                            sample.timestamp,
+                            super::GraphModelPoint {
+                                dollar: sample.sol_dollars,
+                                tokens: sample.sol_tokens as f64,
+                                reliable: true,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            (
+                "LUNA".to_owned(),
+                samples
+                    .iter()
+                    .map(|sample| {
+                        (
+                            sample.timestamp,
+                            super::GraphModelPoint {
+                                dollar: 0.0,
+                                tokens: 0.0,
+                                reliable: true,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            (
+                "TERRA".to_owned(),
+                samples
+                    .iter()
+                    .map(|sample| {
+                        (
+                            sample.timestamp,
+                            super::GraphModelPoint {
+                                dollar: 0.0,
+                                tokens: 0.0,
+                                reliable: true,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let graph = |tokens| {
+            super::graph_paths_for_selection_with_sources_and_astra(
+                &references,
+                0,
+                180,
+                true,
+                true,
+                true,
+                false,
+                tokens,
+                &Default::default(),
+                &[],
+                &timelines,
+            )
+        };
+        let dollars = graph(false);
+        let tokens = graph(true);
 
         assert_eq!(dollars.unused_intervals.len(), 1);
         assert!((dollars.unused_intervals[0].start - 33.3333333333).abs() < 0.000_001);
@@ -29935,12 +30088,19 @@ mod tests {
     #[test]
     fn graph_collision_preview_matches_the_historical_singleton_oracle() {
         let state = CodexInfoState::preview("graph-collision");
+        let observed_at = state
+            .history
+            .samples
+            .iter()
+            .map(|sample| sample.timestamp)
+            .max()
+            .expect("preview contains observed history");
         let reset = state
-            .selected_history_reset()
+            .selected_history_reset_at(observed_at)
             .expect("selected preview period");
         let period = state
             .history
-            .period_for_id(reset, Utc::now().timestamp(), state.reset_at)
+            .period_for_id(reset, observed_at, state.reset_at)
             .expect("preview period");
         let selected = state.history.samples_for_reset(Some(reset));
         assert!(selected
@@ -29956,7 +30116,8 @@ mod tests {
         // publishes to Slint. The unrelated 14% singleton must not cross the
         // selected-period boundary into the rendered graph.
         let payload: Vec<UsageHistorySample> =
-            serde_json::from_str(&state.graph_data()).expect("graph payload serializes");
+            serde_json::from_str(&state.graph_data_at(observed_at))
+                .expect("graph payload serializes");
         assert!(!payload
             .iter()
             .any(|sample| (sample.remaining_percent - 14.0).abs() < f64::EPSILON));
@@ -29964,7 +30125,7 @@ mod tests {
         // Check the production source-aware projection as well as quota:
         // endpoint-label pixels alone do not prove any model line exists.
         let paths = state.graph_paths_for_selection_at_with_astra(
-            Utc::now().timestamp(),
+            observed_at,
             true,
             true,
             true,
@@ -29974,7 +30135,10 @@ mod tests {
         // The opening observations are ten minutes apart: use dashed
         // reference paths, not solid rising paths that would imply
         // continuous recording. The later minute-by-minute observations
-        // remain a visibly longer measured interval in the same frame.
+        // retain measured idle coverage across most of the same frame. The
+        // renderer may split that coverage into adjacent presentation bands,
+        // so the contract is their evidence-backed total, not one band's
+        // incidental width.
         assert!(!paths.sol_flat.is_empty());
         assert!(!paths.terra_flat.is_empty());
         assert!(!paths.luna_flat.is_empty());
@@ -29984,15 +30148,15 @@ mod tests {
         assert!(!paths.astra_flat.is_empty());
         assert!(paths.astra_rising.is_empty());
         assert!(!paths.astra_inferred.is_empty());
-        let measured_idle = paths
+        let measured_idle_width = paths
             .unused_intervals
             .iter()
-            .max_by(|left, right| left.width.total_cmp(&right.width))
-            .expect("preview contains a measured idle interval");
+            .map(|interval| interval.width)
+            .sum::<f64>();
         assert!(
-            measured_idle.width >= 60.0,
+            measured_idle_width >= 60.0,
             "idle width={}",
-            measured_idle.width
+            measured_idle_width
         );
     }
 

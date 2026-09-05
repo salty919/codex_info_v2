@@ -1351,14 +1351,10 @@ fn maintain_history_database(
 #[cfg(test)]
 pub(crate) fn maintain_history_database_for_test(
     database: &Path,
+    identity: &StoragePartitionIdentity,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), String> {
-    UsageStore::backup_generations(database, 3).map_err(|error| error.to_string())?;
-    let mut store = UsageStore::open(database).map_err(|error| error.to_string())?;
-    store
-        .prune_older_than_three_months(now)
-        .map_err(|error| error.to_string())?;
-    Ok(())
+    maintain_history_database(database, identity, now).map(|_| ())
 }
 
 pub(crate) struct ActiveRecorderPartition {
