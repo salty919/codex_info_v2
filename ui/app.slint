@@ -51,6 +51,7 @@ export component MainWindow inherits Window {
     in-out property <int> active-thread-sol-count: 0;
     in-out property <int> active-thread-terra-count: 0;
     in-out property <int> active-thread-luna-count: 0;
+    in-out property <int> active-thread-astra-count: 0;
     in-out property <int> active-thread-other-count: 0;
     in-out property <string> estimated-cost-label;
     in-out property <string> remaining-label: "—";
@@ -168,6 +169,7 @@ export component MainWindow inherits Window {
                 sol-count: root.active-thread-sol-count;
                 terra-count: root.active-thread-terra-count;
                 luna-count: root.active-thread-luna-count;
+                astra-count: root.active-thread-astra-count;
                 other-count: root.active-thread-other-count;
                 open-threads => { root.open-threads(); }
             }

@@ -16,6 +16,7 @@ namespace CodexInfo.WindowsClient.ViewModels;
 public sealed class GraphPointViewModel
 {
     private readonly GraphMetric metric;
+    private readonly IReadOnlyList<(string Name, double Value)> modelValues;
 
     public GraphPointViewModel(ApiHistorySample sample, GraphMetric metric)
     {
@@ -25,15 +26,15 @@ public sealed class GraphPointViewModel
             .ToString("g", CultureInfo.CurrentCulture);
         RemainingPercent = sample.RemainingPercent;
 
+        var values = new List<(string Name, double Value)>();
         foreach (var model in sample.Models)
         {
             var value = metric == GraphMetric.Dollars
                 ? model.Dollars ?? double.NaN
-                : model.InputTokens is ulong inputTokens &&
-                  model.CachedInputTokens is ulong cachedInputTokens &&
-                  model.OutputTokens is ulong outputTokens
-                    ? inputTokens + cachedInputTokens + outputTokens
+                : model.TotalTokens is ulong totalTokens
+                    ? (double)totalTokens
                     : double.NaN;
+            values.Add((model.Name, value));
             switch (model.Name)
             {
                 case "SOL":
@@ -45,8 +46,13 @@ public sealed class GraphPointViewModel
                 case "LUNA":
                     LunaValue = value;
                     break;
+                case "ASTRA":
+                    AstraValue = value;
+                    break;
             }
         }
+
+        modelValues = values;
     }
 
     public long Timestamp { get; }
@@ -61,17 +67,21 @@ public sealed class GraphPointViewModel
 
     public double LunaValue { get; }
 
+    public double AstraValue { get; }
+
+    public IReadOnlyDictionary<string, double> ModelValues =>
+        modelValues
+            .GroupBy(item => item.Name, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Last().Value, StringComparer.Ordinal);
+
     public string RemainingText => RemainingPercent is { } value
         ? string.Create(CultureInfo.CurrentCulture, $"{LocalizationService.Current.RemainingQuota} {value:0.#}%")
         : $"{LocalizationService.Current.RemainingQuota} —";
 
-    public string ModelsText => metric == GraphMetric.Dollars
-        ? string.Create(
-            CultureInfo.CurrentCulture,
-            $"SOL {FormatModelValue(SolValue, dollars: true)} / TERRA {FormatModelValue(TerraValue, dollars: true)} / LUNA {FormatModelValue(LunaValue, dollars: true)}")
-        : string.Create(
-            CultureInfo.CurrentCulture,
-            $"SOL {FormatModelValue(SolValue, dollars: false)} / TERRA {FormatModelValue(TerraValue, dollars: false)} / LUNA {FormatModelValue(LunaValue, dollars: false)}");
+    public string ModelsText => string.Join(
+        " / ",
+        modelValues.Select(item =>
+            $"{item.Name} {FormatModelValue(item.Value, dollars: metric == GraphMetric.Dollars)}"));
 
     private static string FormatModelValue(double value, bool dollars) =>
         double.IsFinite(value)
@@ -104,6 +114,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     private bool showSol = true;
     private bool showTerra = true;
     private bool showLuna = true;
+    private bool showAstra = true;
     private CancellationTokenSource pointBuildCancellation = new();
     private long pointBuildRevision;
     private bool isLoading;
@@ -219,27 +230,11 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
         // Core admission supplies strictly increasing minute-start rows with
         // one canonical owner for each period/timestamp. Preserve every
-        // source vector as-is; graph code only adds documented quota/reset
-        // anchors and never repairs model components from older rows.
+        // source vector as-is; graph code must not invent a pre-observation
+        // baseline or repair model components from older rows.
         var normalized = observed.ToList();
 
-        var hasRemainingObservation = normalized.Any(sample => sample.RemainingPercent is { } value && double.IsFinite(value));
-        if (normalized[0].Timestamp == period.StartAt &&
-            normalized[0].RemainingPercent is null &&
-            hasRemainingObservation)
-        {
-            // raw_graph_points() always starts with a 100% reset anchor and
-            // only replaces it when a quota observation exists at the same
-            // timestamp.  Keep that distinction when the first model row is
-            // present but its quota field is missing.
-            normalized[0] = normalized[0] with { RemainingPercent = 100 };
-        }
-        var result = new List<ApiHistorySample>(normalized.Count + 2);
-        if (normalized[0].Timestamp > period.StartAt)
-        {
-            result.Add(new ApiHistorySample(period.StartAt, normalized[0].ResetAt, hasRemainingObservation ? 100 : null, 0, 0, 0, 0, 0, 0));
-        }
-
+        var result = new List<ApiHistorySample>(normalized.Count + 1);
         result.AddRange(normalized);
         var last = result[^1];
         if (last.Timestamp < end &&
@@ -570,6 +565,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     public bool ShowSol { get => showSol; set { if (showSol == value) return; showSol = value; Notify(); } }
     public bool ShowTerra { get => showTerra; set { if (showTerra == value) return; showTerra = value; Notify(); } }
     public bool ShowLuna { get => showLuna; set { if (showLuna == value) return; showLuna = value; Notify(); } }
+    public bool ShowAstra { get => showAstra; set { if (showAstra == value) return; showAstra = value; Notify(); } }
 
     public void Dispose()
     {

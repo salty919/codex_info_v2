@@ -97,21 +97,24 @@ public sealed class ContractsTests
             sol =>
             {
                 Assert.Equal("SOL", sol.Name);
-                Assert.Equal((ulong)4, sol.InputTokens);
-                Assert.Equal((ulong)0, sol.CachedInputTokens);
-                Assert.Equal((ulong)0, sol.OutputTokens);
+                Assert.Null(sol.InputTokens);
+                Assert.Null(sol.CachedInputTokens);
+                Assert.Null(sol.OutputTokens);
+                Assert.Equal((ulong)4, sol.TotalTokens);
                 Assert.Equal(1.5, sol.Dollars);
             },
             terra =>
             {
                 Assert.Equal("TERRA", terra.Name);
-                Assert.Equal((ulong)5, terra.InputTokens);
+                Assert.Null(terra.InputTokens);
+                Assert.Equal((ulong)5, terra.TotalTokens);
                 Assert.Equal(2.5, terra.Dollars);
             },
             luna =>
             {
                 Assert.Equal("LUNA", luna.Name);
-                Assert.Equal((ulong)6, luna.InputTokens);
+                Assert.Null(luna.InputTokens);
+                Assert.Equal((ulong)6, luna.TotalTokens);
                 Assert.Equal(3.5, luna.Dollars);
             });
     }

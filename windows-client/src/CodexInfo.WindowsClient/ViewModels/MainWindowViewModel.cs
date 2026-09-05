@@ -291,7 +291,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public int ActiveLunaCount => CountThreads("LUNA");
 
-    public int ActiveOtherCount => Math.Max(0, (int)ActiveThreadCount - ActiveSolCount - ActiveTerraCount - ActiveLunaCount);
+    public int ActiveAstraCount => CountThreads("ASTRA");
+
+    public int ActiveOtherCount => Math.Max(0, (int)ActiveThreadCount - ActiveSolCount - ActiveTerraCount - ActiveLunaCount - ActiveAstraCount);
 
     /// <summary>Whether an authenticated details generation is visible.</summary>
     public bool HasDetails => detailsSnapshot is { Authenticated: true, State: not ApiState.AuthRequired };
@@ -1176,6 +1178,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(ActiveSolCount));
         Notify(nameof(ActiveTerraCount));
         Notify(nameof(ActiveLunaCount));
+        Notify(nameof(ActiveAstraCount));
         Notify(nameof(ActiveOtherCount));
     }
 
@@ -1248,7 +1251,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         var tokens = Regex.Split(model + " " + label, "[^\\p{L}\\p{N}]+")
             .Select(static token => token.ToUpperInvariant())
             .Where(static token => token.Length > 0)
-            .Where(static token => token is "SOL" or "TERRA" or "LUNA")
+            .Where(static token => token is "SOL" or "TERRA" or "LUNA" or "ASTRA")
             .Distinct(StringComparer.Ordinal)
             .ToArray();
         return tokens.Length == 1 ? tokens[0] : "その他";
@@ -1266,6 +1269,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             "SOL" => 0,
             "TERRA" => 1,
             "LUNA" => 2,
+            "ASTRA" => 3,
             _ => int.MaxValue,
         };
     }

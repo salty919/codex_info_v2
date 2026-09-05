@@ -20,13 +20,14 @@ fi
 command -v dotnet >/dev/null 2>&1 || fail 'dotnet is unavailable'
 
 solution='windows-client/CodexInfo.WindowsClient.sln'
-test_target="$solution"
-test_filter=()
+test_targets=("$solution")
+test_filters=('')
+test_log_prefixes=('windows-client')
 expected_methods=()
-if [[ "$profile" == history-graph || "$profile" == model-history ]]; then
-    test_target='windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/CodexInfo.WindowsClient.Presentation.Tests.csproj'
-    if [[ "$profile" == history-graph ]]; then
-        expected_methods=(
+if [[ "$profile" == history-graph ]]; then
+    test_targets=('windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/CodexInfo.WindowsClient.Presentation.Tests.csproj')
+    test_log_prefixes=('windows-history-graph')
+    expected_methods=(
         CodexInfo.WindowsClient.Presentation.Tests.GraphWindowViewModelProjectionTests.Clips_current_graph_period_at_start_and_reset_boundaries
         CodexInfo.WindowsClient.Presentation.Tests.GraphWindowViewModelProjectionTests.Keeps_historical_graph_period_boundary_intact
         CodexInfo.WindowsClient.Presentation.Tests.GraphWindowViewModelProjectionTests.Graph_samples_start_at_first_observation_without_synthetic_anchor
@@ -40,20 +41,40 @@ if [[ "$profile" == history-graph || "$profile" == model-history ]]; then
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Remaining_quota_observations_survive_flat_model_rows_as_unattributed_dashes
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Missing_remote_quota_is_never_painted_as_a_solid_bridge
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Reduction_preserves_regression_quota_and_confirmed_gap_boundaries
-        )
-    else
-        expected_methods=(
-            CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsV3IsPreferredAndCarriesAstraHistory
-            CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsV3ReusesTheAcceptedGenerationWithAZeroBody304
-            CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsFallsBackToV1OnlyWhenV3AndV2ReturnNotFound
-            CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.V3AstraHistoryRendersWithoutLegacyModelRows
-        )
-    fi
+    )
     filter=''
     for method in "${expected_methods[@]}"; do
         filter+="${filter:+|}FullyQualifiedName=$method"
     done
-    test_filter=(--filter "$filter")
+    test_filters=("$filter")
+elif [[ "$profile" == model-history ]]; then
+    core_methods=(
+        CodexInfo.WindowsClient.Core.Tests.ContractsTests.HistorySampleModelsExposeEachProviderValues
+        CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsV3IsPreferredAndCarriesAstraHistory
+        CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsV3ReusesTheAcceptedGenerationWithAZeroBody304
+        CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsFallsBackToV1OnlyWhenV3AndV2ReturnNotFound
+    )
+    presentation_methods=(
+        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.PlotProjectionDoesNotInventSpendDuringAnUnobservedGap
+        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.PlotProjectionDashesTheLongFirstIntervalAndKeepsLaterEvidenceSolid
+        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.V3AstraHistoryRendersWithoutLegacyModelRows
+        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.InferredLinesAreThinnerThanMeasuredModelLines
+    )
+    expected_methods=("${core_methods[@]}" "${presentation_methods[@]}")
+    core_filter=''
+    for method in "${core_methods[@]}"; do
+        core_filter+="${core_filter:+|}FullyQualifiedName=$method"
+    done
+    presentation_filter=''
+    for method in "${presentation_methods[@]}"; do
+        presentation_filter+="${presentation_filter:+|}FullyQualifiedName=$method"
+    done
+    test_targets=(
+        'windows-client/tests/CodexInfo.WindowsClient.Core.Tests/CodexInfo.WindowsClient.Core.Tests.csproj'
+        'windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/CodexInfo.WindowsClient.Presentation.Tests.csproj'
+    )
+    test_filters=("$core_filter" "$presentation_filter")
+    test_log_prefixes=('windows-model-history-core' 'windows-model-history-presentation')
 fi
 results_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex-info-windows-tests.XXXXXX")"
 case "$results_dir" in
@@ -65,16 +86,24 @@ trap 'rm -rf -- "$results_dir"' EXIT
 # Restore, formatting, and unit behavior form one Windows-source check.  The
 # gate owns each command once and deliberately does not mirror test names,
 # source strings, coverage percentages, installer, or real-OS E2E contracts.
-dotnet restore "$test_target" --locked-mode
+for test_target in "${test_targets[@]}"; do
+    dotnet restore "$test_target" --locked-mode
+done
 if [[ "$profile" == full ]]; then
     dotnet format "$solution" --no-restore --verify-no-changes
 fi
-dotnet test "$test_target" \
-    --no-restore \
-    --configuration Release \
-    "${test_filter[@]}" \
-    --results-directory "$results_dir" \
-    --logger 'trx;LogFilePrefix=windows-client'
+for index in "${!test_targets[@]}"; do
+    test_filter=()
+    if [[ -n "${test_filters[$index]}" ]]; then
+        test_filter=(--filter "${test_filters[$index]}")
+    fi
+    dotnet test "${test_targets[$index]}" \
+        --no-restore \
+        --configuration Release \
+        "${test_filter[@]}" \
+        --results-directory "$results_dir" \
+        --logger "trx;LogFilePrefix=${test_log_prefixes[$index]}"
+done
 
 python3 - "$results_dir" "$profile" "${expected_methods[@]}" <<'PY'
 from pathlib import Path

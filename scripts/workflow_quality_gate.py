@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 from typing import Mapping, Sequence
@@ -3091,7 +3092,7 @@ def release_self_test() -> int:
     return 0
 
 
-def _focused_rust_routing_test() -> int:
+def _focused_rust_routing_tests() -> int:
     """Execute the caller; a wrong Rust module selects zero tests, not success."""
     with tempfile.TemporaryDirectory(prefix="codex-info-rust-routing-") as raw_root:
         root = Path(raw_root)
@@ -3107,28 +3108,132 @@ def _focused_rust_routing_test() -> int:
             "#!/usr/bin/env python3\n"
             "import sys\n"
             "target, name = sys.argv[3:5]\n"
-            "module = {'--bin=codex_info': 'tests::', "
-            "'--test=usage_store': 'wave_b_correction_tests::'}\n"
-            "count = int(name.startswith(module[target]))\n"
+            "prefixes = {'--bin=codex_info': ('tests::',), "
+            "'--test=usage_store': ('wave_b_correction_tests::',), "
+            "'--lib': ('server::tests::', 'usage_store::tests::')}\n"
+            "count = int(any(name.startswith(prefix) for prefix in prefixes[target]))\n"
             "print(f'test result: ok. {count} passed; 0 failed; 0 ignored')\n",
             encoding="utf-8",
         )
         fake_cargo.chmod(0o755)
+        environment = {**os.environ, "PATH": str(root)}
         result = subprocess.run(
             ("bash", str(ROOT / "scripts/regression_guard.sh"), "--history-graph"),
-            cwd=ROOT,
-            env={**os.environ, "PATH": str(root)},
-            capture_output=True,
-            text=True,
+            cwd=ROOT, env=environment, capture_output=True, text=True,
         )
         if result.returncode != 0:
-            raise AssertionError(f"Rust caller selected the wrong module: {result.stderr}")
+            raise AssertionError(f"Rust history caller selected the wrong module: {result.stderr}")
         for name in (
             "recent_read_uses_one_month_half_open_interval_at_month_ends",
             "recent_read_filters_invalid_values_without_deleting_rows",
         ):
             if f"--test=usage_store wave_b_correction_tests::{name} count=1" not in result.stdout:
                 raise AssertionError(f"Rust caller did not execute the DB test: {name}")
+        result = subprocess.run(
+            ("bash", str(ROOT / "scripts/regression_guard.sh"), "--model-history"),
+            cwd=ROOT, env=environment, capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            raise AssertionError(f"Rust model caller selected the wrong module: {result.stderr}")
+        for name in (
+            "three_month_prune_removes_old_sidecars_but_keeps_new_rows_and_row_one",
+            "pruning_removes_only_old_rows_and_preserves_boundary_across_reset_periods",
+        ):
+            expected = f"--lib usage_store::tests::{name} count=1"
+            if expected not in result.stdout:
+                raise AssertionError(f"Rust model caller omitted the DB test: {name}")
+    return 2
+
+
+def _focused_windows_model_routing_test() -> int:
+    """Run the Windows caller with a deterministic dotnet protocol double."""
+    expected_core = frozenset(
+        {
+            "CodexInfo.WindowsClient.Core.Tests.ContractsTests.HistorySampleModelsExposeEachProviderValues",
+            "CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsV3IsPreferredAndCarriesAstraHistory",
+            "CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsV3ReusesTheAcceptedGenerationWithAZeroBody304",
+            "CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsFallsBackToV1OnlyWhenV3AndV2ReturnNotFound",
+        }
+    )
+    expected_presentation = frozenset(
+        {
+            "CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.PlotProjectionDoesNotInventSpendDuringAnUnobservedGap",
+            "CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.PlotProjectionDashesTheLongFirstIntervalAndKeepsLaterEvidenceSolid",
+            "CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.V3AstraHistoryRendersWithoutLegacyModelRows",
+            "CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.InferredLinesAreThinnerThanMeasuredModelLines",
+        }
+    )
+    with tempfile.TemporaryDirectory(prefix="codex-info-windows-routing-") as raw_root:
+        root = Path(raw_root)
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        calls_path = root / "calls.jsonl"
+        for command in ("bash", "dirname", "mktemp", "rm", "python3"):
+            executable = shutil.which(command)
+            if executable is None:
+                raise AssertionError(f"fixture standard tool is unavailable: {command}")
+            (fake_bin / command).symlink_to(executable)
+        fake_dotnet = fake_bin / "dotnet"
+        fake_dotnet.write_text(
+            textwrap.dedent(
+                f"""\
+                #!{sys.executable}
+                import json
+                import os
+                from pathlib import Path
+                import sys
+                import xml.etree.ElementTree as ET
+
+                args = sys.argv[1:]
+                with Path(os.environ["ROUTING_CALLS"]).open("a", encoding="utf-8") as output:
+                    output.write(json.dumps(args) + "\\n")
+                if args[0] == "restore":
+                    raise SystemExit(0)
+                if args[0] != "test":
+                    raise SystemExit(2)
+                raw_filter = args[args.index("--filter") + 1]
+                methods = [item.removeprefix("FullyQualifiedName=") for item in raw_filter.split("|")]
+                results = Path(args[args.index("--results-directory") + 1])
+                results.mkdir(parents=True, exist_ok=True)
+                root = ET.Element("TestRun")
+                ET.SubElement(root, "Counters", total=str(len(methods)), executed=str(len(methods)), passed=str(len(methods)), failed="0", notExecuted="0")
+                definitions = ET.SubElement(root, "TestDefinitions")
+                for method in methods:
+                    class_name, method_name = method.rsplit(".", 1)
+                    ET.SubElement(definitions, "TestMethod", className=class_name, name=method_name)
+                ET.ElementTree(root).write(results / (Path(args[1]).stem + ".trx"), encoding="utf-8")
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake_dotnet.chmod(0o755)
+        result = subprocess.run(
+            ("bash", str(ROOT / "scripts/windows_client_contract_gate.sh"), "--model-history"),
+            cwd=ROOT,
+            env={**os.environ, "PATH": str(fake_bin), "ROUTING_CALLS": str(calls_path)},
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise AssertionError(f"Windows model caller failed: {result.stderr}")
+        calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
+        test_calls = [args for args in calls if args[0] == "test"]
+        if len(test_calls) != 2 or any(args[0] == "format" for args in calls):
+            raise AssertionError(f"Windows model caller expanded its command set: {calls}")
+        observed: dict[str, frozenset[str]] = {}
+        for args in test_calls:
+            target = args[1]
+            raw_filter = args[args.index("--filter") + 1]
+            observed[target] = frozenset(
+                item.removeprefix("FullyQualifiedName=")
+                for item in raw_filter.split("|")
+            )
+        expected = {
+            "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/CodexInfo.WindowsClient.Core.Tests.csproj": expected_core,
+            "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/CodexInfo.WindowsClient.Presentation.Tests.csproj": expected_presentation,
+        }
+        if observed != expected:
+            raise AssertionError(f"Windows model caller selected the wrong methods: {observed}")
     return 1
 
 
@@ -3269,8 +3374,10 @@ def workflow_selection_self_test() -> int:
         baseline["selective-quality.yml"]
     )
     copy_cases = _git_copy_detection_test()
-    routing_cases = _focused_rust_routing_test() + _governance_path_selection_tests(
-        baseline["selective-quality.yml"]
+    routing_cases = (
+        _focused_rust_routing_tests()
+        + _focused_windows_model_routing_test()
+        + _governance_path_selection_tests(baseline["selective-quality.yml"])
     )
     total_cases = cases + release_candidate_cases + copy_cases + routing_cases
     print(

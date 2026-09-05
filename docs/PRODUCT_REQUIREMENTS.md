@@ -1,5 +1,7 @@
 <!-- codex-info-requirement-owner: PRODUCT -->
 <!-- codex-info-master-ids:
+ASTRA-COST-01
+API-LIFECYCLE-01
 CUM-138-04
 WIN-PARITY-DATA
 WIN-PARITY-STATE
@@ -50,6 +52,9 @@ U128-36
 # Codex Info 製品要件
 
 この文書は製品要件の唯一の入口であり、各契約領域のownerを次表で一意に登録する。
+
+`ASTRA-COST-01`: ASTRAの概算はユーザー指定単価（100万token当たり通常入力$10、cached入力$1、cache write入力$12.50、出力$50）による。入力総数をI、cached入力をC、cache write入力をW、出力をOとして、通常入力はI-C-W、合計は `((I-C-W)*10+C*1+W*12.50+O*50)/1_000_000`。未提供のWや矛盾する内訳を0として確定表示しない。既存3モデルの単価は変更しない。
+`API-LIFECYCLE-01`: canonicalな収集・DB domainはUIの固定field、表示文言、画面構成および特定client versionへ依存させない。public APIは同じcommit済みdomain snapshotから作るversion別read-only adapterとし、client変更でcollectorまたはDB writerを変更しない。新APIはmodelを固定3列でなく有界な配列として公開し、未知モデルのtoken事実と価格未確定を区別する。旧v1/v2は互換期間中だけ同一snapshotのdeprecated projectionとして保持し、旧API削除はadapter・route・client fallbackだけで完結させ、記録、DB schema、常駐監視、安定health endpointを変更しない。Sunset日時は別途明示決定されるまで推測しない。
 一つの外部観測可能な契約IDを複数ownerへ置かず、下流文書、要求台帳、実装、testは登録済みownerの
 契約IDを参照する。監査履歴、作業経過、文書SHA一覧、test名やagent運用は製品要件ではない。
 
@@ -96,8 +101,8 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 - 実行中threadの候補はCodex processが現在openしているcanonical Session pathの有限集合だけを正本とする。各pathの先頭`session_meta.id`に対して同一app-serverへ`thread/read(includeTurns=false)`を行い、返却ID/pathと完全Thread schemaを一致確認する。全Sessionを読む`thread/list`、state DBだけを候補正本にするfallback、Session総量に比例するRPCを本番取得経路に置かず、initializeを含む1cycleを共通15秒deadlineで打ち切る。
 - RESTはread-onlyである。未知route/method、不正header/schema、oversize requestからDB、settings、cursor、processを変更しない。
 - GUIなしserverはwindow、Slint component、display backendを生成せず、明示したservice lifecycleで起動・停止・復旧する。
-- resident serviceは一つの完全candidateからimmutable details generationを公開する。Linux / WindowsのMain、Graph、Threadsはmodel-source provenanceを持つstrict validation済みの単一`GET /v2/details` generationをatomic表示rootとして消費し、旧serviceが同routeへ404を返す場合だけ既存`GET /v1/details`一応答へfallbackする。SQLite/JSONL/app-serverの再収集、値の再計算、複数row/endpointのmergeを行わない。公開するread-only endpointはreadiness用`GET /v1/health`、互換表示用`GET /v1/details`、現行表示正本`GET /v2/details`だけとする。
-- `GET /v1/health`の200はresident serviceがread-only snapshot requestを受理できるreadinessと、Cargo/Windowsの単一authorityから導出したstable product versionを表す。Linux launcherはsystemd `MainPID`、process starttime、実行fileのdevice/inode/SHA-256、profile lock identity、port 8787のsocket inodeとそのPIDのFD対応をhealth取得の前後で同一と確認し、manifestのsource generationへ結合する。PID、listener、health body、versionのいずれか単独ではcurrent ownerと判定しない。既知の旧Codex Info ownerだけを一度交代し、unknown・foreign・malformed ownerはsignalせず30秒以内に`SAFE_BLOCKED`とする。Linux / Windows clientはschema-validな異なるproduct versionを表示・診断情報として保持したままdetails受理へ進み、API互換性はv2 strict validationと404時のv1 fallbackで判定する。version欠落・malformed healthでは進まない。認証済み、data `state=ready`、最新収集成功を意味しない。認証開始・確認はcontrol-onlyであり、control応答を表示dataとしてcommitせず、その後に受理した新しいdetails generationだけが画面を変えられる。
+- resident serviceは一つの完全candidateからimmutable details generationを公開する。Linux / WindowsのMain、Graph、Threadsは任意model配列とmodel-source provenanceを持つstrict validation済みの単一`GET /v3/details` generationをatomic表示rootとして消費し、旧serviceがexact 404を返す場合だけ`GET /v2/details`、さらにexact 404の場合だけ`GET /v1/details`一応答へfallbackする。SQLite/JSONL/app-serverの再収集、値の再計算、複数row/endpointのmergeを行わない。公開するread-only endpointはreadiness用`GET /health`（`/v1/health`互換）、現行表示正本`GET /v3/details`、deprecated互換用`GET /v1/details`と`GET /v2/details`だけとする。
+- `GET /health`（`/v1/health`互換）の200はresident serviceがread-only snapshot requestを受理できるreadinessと、Cargo/Windowsの単一authorityから導出したstable product versionを表す。Linux launcherはsystemd `MainPID`、process starttime、実行fileのdevice/inode/SHA-256、profile lock identity、port 8787のsocket inodeとそのPIDのFD対応をhealth取得の前後で同一と確認し、manifestのsource generationへ結合する。PID、listener、health body、versionのいずれか単独ではcurrent ownerと判定しない。既知の旧Codex Info ownerだけを一度交代し、unknown・foreign・malformed ownerはsignalせず30秒以内に`SAFE_BLOCKED`とする。Linux / Windows clientはschema-validな異なるproduct versionを表示・診断情報として保持したままdetails受理へ進み、API互換性はv3 strict validationとexact 404時のv2/v1 fallbackで判定する。version欠落・malformed healthでは進まない。認証済み、data `state=ready`、最新収集成功を意味しない。認証開始・確認はcontrol-onlyであり、control応答を表示dataとしてcommitせず、その後に受理した新しいdetails generationだけが画面を変えられる。
 
 ## 4. データ保護
 
@@ -182,9 +187,11 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   startup、CLI、recorder全体、installer、distributionを選択しない。product変更のない`history-graph`宣言は不要な品質要求として
   拒否する。workflow/selector変更は`workflow-selection`で、
   変更workflowの構文、profile selector、rename/copy、main Release非縮小だけを確認し、Release publisher、bundle、installer、
-  product E2Eを起動しない。単なる文書変更はprofileなしの`authority-only`とする。今回のDB/API/model-history/Linux graph/Windows v3+ASTRA経路を含む
-  有限27 pathの差分は`model-history`で分類する。
-  同profileはDOCS、LINUX_BACKEND、LINUX_UI、WINDOWSだけを選び、v3 pair/304、v3 cacheとexact 404 fallback、履歴選択、
+  product E2Eを起動しない。`AGENTS.md`を含む単なるauthority文書変更はprofileなしの`authority-only`とし、実行可能な
+  workflow・selector・検査scriptは同経路へ混在させない。今回のDB/API/model-history/Linux graph/Windows v3+ASTRA経路を含む
+  有限28 pathの実差分は`model-history`で分類する。
+  同profileは実差分に含まれるDOCS、LINUX_BACKEND、LINUX_UI、WINDOWSだけを選び、少なくとも1 product ownerを必須とする。
+  v3 pair/304、v3 cacheとexact 404 fallback、履歴選択、
   legacy known/incomplete、ASTRA pricing/restart、ASTRA-only graphの既存直接testだけを実行し、full suite、installer、distributionを選択しない。
   profile外path、欠落・重複・未知profileは従来どおり拒否する。main向けRelease candidateはfeat profileを
   受け取らず、従来の
@@ -312,9 +319,9 @@ component別max、last-row、null化、任意mergeを行わない。
 4. 同じprofile-owned DB read内で、既存`timestamp/reset_at`のbounded rolling規則から同一cycleと検証できた同じminuteのrowだけを`HistoryCanonicalizer`が1 logical sampleへ正規化する。quota観測を持たずquota確認済みcycleと重なるbackfill reset群と、継続cycleの内部だけにあるreset断片はperiod authorityにしない。実resetの秒をminute-startへ丸めて旧cycle末尾と新cycle先頭が同じ分になり、旧cycleがそこで終了して新cycleだけが後続分へ継続すると確認できる場合は、その境界分を新cycleへ一意に所属させる。distinct non-null quotaは最大1個、cumulative vectorは既存のcomponentwise-dominant値だけを採用し、同値duplicateは冪等に扱う。quota競合・非比較・dominant不存在はそのminuteだけを公開対象外とし、別cycle間の境界不明はcandidate全体をrejectする。100%・7日窓など数値の形では除外せず、UI/REST/Windowsでmerge/max/last/null化しない。
 5. 明示的なログアウトまたは認証主体変更だけが可視状態を消去する。通信失敗・quota更新中・local収集中は最後の完全表示を保持し、失敗状態は別途表示する。
 6. 製品バージョンはメイン画面に一度だけ表示し、子ウインドウのタイトルやボタンへ重複表示しない。値はX版・Windows版とも同じリリースversion authorityから導出する。
-7. Windows版の初回起動では、health readiness後に最初のstrict validation済み`/v2/details` generation（旧serviceの404時だけ`/v1/details`）が揃うまで内容領域を表示せず、固定レイアウト上にスピナーを表示する。control応答とのmerge、途中fieldの順番描画をせず、初回取得失敗時はスピナーを解除して失敗状態と再試行手段を表示する。
-8. X版の初回起動でも、health readiness後に最初のstrict validation済み`/v2/details` generation（旧serviceの404時だけ`/v1/details`）が揃うまで主画面の内容領域を公開せず、ヘッダー（製品バージョンを含む）を固定したままスピナーを表示する。details取得が失敗した場合はスピナーを解除し、最後の完全表示または失敗状態を表示する。
+7. Windows版の初回起動では、health readiness後に最初のstrict validation済み`/v3/details` generation（旧serviceのexact 404時だけv2、さらにexact 404時だけv1）が揃うまで内容領域を表示せず、固定レイアウト上にスピナーを表示する。control応答とのmerge、途中fieldの順番描画をせず、初回取得失敗時はスピナーを解除して失敗状態と再試行手段を表示する。
+8. X版の初回起動でも、health readiness後に最初のstrict validation済み`/v3/details` generation（旧serviceのexact 404時だけv2、さらにexact 404時だけv1）が揃うまで主画面の内容領域を公開せず、ヘッダー（製品バージョンを含む）を固定したままスピナーを表示する。details取得が失敗した場合はスピナーを解除し、最後の完全表示または失敗状態を表示する。
 9. X版の起動ウィンドウは主モニターの可視デスクトップ内へ配置し、別モニターや負座標へ出して利用者から見えない状態にしてはならない。起動成功は、可視範囲内の実ウィンドウと内容の実画面で確認する。
 10. `--ui` のdaemon/REST起動に失敗しても、X版のGUIを消失・即時終了させず、接続失敗と再試行手段を表示する。
-11. 同一periodのモデル別累積vectorは全componentを一つの観測として扱う。1 componentでも直前の確定vectorより後退したrowは、前回値とのcomponent別maxで合成せず、全componentが直前の確定vector以上へ回復するまでwhole-vector欠測とする。
+11. 同一periodのモデル別累積はmodelごとに独立したログ観測として扱う。1 modelが直前の確定値より後退したrowは、そのmodelだけを回復点まで欠測とし、同じrowで確定している他modelの実測値を欠測や前回値へ置換しない。model集合が不完全でも、掲載modelの実測値は無効にしない。
 12. remote quotaとlocal Session/logは独立した取得元とする。remote transport障害中もresident local collectorとDB recorderを60秒以内の既存周期で継続し、local-only rowはquota `NULL`かつmodel source `confirmed`でcommitする。local取得失敗後も、そのcycleで取得済みのfresh remote quotaは元の観測時刻、実collector世代、model source `unavailable`として同じDB transactionへ保持し、直前のdurable model vectorを新しい確定rowとして複製しない。古いquotaを新しいtimestampへ複製しない。local取得失敗はsingle-flightを解放して次周期で再取得し、DB書込み失敗はprovenanceを含むexact pending batchを保持して同じdaemon内で再試行する。provenanceなしの旧rowは`legacy-unknown`であり、確定観測へ昇格しない。

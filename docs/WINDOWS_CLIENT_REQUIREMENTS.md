@@ -87,7 +87,7 @@ binary. Its observable surfaces are:
 - Main unauthenticated surface: auth start, validated browser-open action, auth
   confirmation/check, error/retry, and legal notice.
 - Graph surface: one instance, current/older reset-period selection, dollar or
-  token metric, remaining/SOL/TERRA/LUNA visibility toggles, cumulative lines,
+  token metric, remaining/SOL/TERRA/LUNA/ASTRA visibility toggles, cumulative lines,
   current labels, unused intervals, and resident-service-backed history from the
   strict details root.
 - Threads surface: one instance, empty/single/multiple rows, parent-first
@@ -220,12 +220,14 @@ implementation or acceptance claim.
 
 ## API contract decisions
 
-`GET /v1/details` remains the exact read-only compatibility contract. `GET /v2/details` is
-versioned by the exact existing top-level field `api_version: "v2"`; it adds no second revision field.
-Together with readiness-only `GET /v1/health`, these routes are the complete public read surface. Their
+`GET /v1/details` and `GET /v2/details` remain deprecated read-only compatibility contracts.
+`GET /v3/details` is the current generic-model atomic root and is versioned by `api_version: "v3"`.
+Together with readiness-only `GET /health` (`/v1/health` compatibility), these routes are the complete public read surface. V1/v2
 top-level shape is the exact set `api_version`, `state`, `observed_at`,
 `authenticated`, `plan_label`, `quota`, `models`, `active_thread_count`,
 `history_periods`, `history_samples`, `history_gaps`, `threads`, and `estimated_cost_label`.
+V3 has the same top-level set without the UI-owned `estimated_cost_label`; current and history `models` are
+bounded generic-model arrays, and each history row separately carries `models_complete` and `model_source`.
 The exact details contract revision is `rest-v1-details-reset-at-20260823`; each history period carries
 its canonical `reset_at` independently from its potentially clipped graph `end_at`, and `history_gaps` contains only
 confirmed, redacted `recorder-gap-ledger-v1` projections. V2 adds exact per-history-row `model_source`
@@ -234,19 +236,21 @@ values to be null, while the other states require all six to be present. A detai
 whole candidate and retains the last complete root; a schema-valid health `product_version` mismatch is diagnostic
 only and does not block details retrieval.
 The server-side published-generation header contract revision is `rest-v1-published-pair-header-20260827`.
-Every successful v1 or v2 details response contains exactly one
+Every successful v1, v2, or v3 details response contains exactly one
 `Codex-Info-Published-Pair` header whose value is `v1:` followed by 64 lowercase
 hex characters: a 128-bit process server epoch followed by a 128-bit successful-publish
-counter. The resident service publishes both representations from one immutable details generation. Windows first
-requests one strict `/v2/details` response and falls back to one strict `/v1/details` response only for an exact 404.
-No second response completes, compares, or repairs an accepted root. A missing, duplicate, malformed, or case-altered details header rejects
+counter. The resident service publishes all representations from one immutable details generation. Windows first
+requests one strict `/v3/details` response and falls back to one strict v2, then one strict v1 response only for exact 404.
+No second response completes, compares, or repairs an accepted root. After a valid v3 root, its pair may be sent as one
+quoted `If-None-Match` on v3 only; matching 304/body zero retains last-good and is not a failure. V1/v2 fallback sends no
+conditional header. A missing, duplicate, malformed, or case-altered details header rejects
 the complete candidate and retains the last complete root. Health and error responses do not
 carry this header. The production UI treats the details header only as that response's opaque generation identity;
 it does not derive data meaning from either component.
 It contains bounded model cost rows, reset periods, minute history samples,
 bounded active-thread rows, and the aggregate cost label. Timestamps are
 positive Unix seconds; percentages and dollar values are finite and
-non-negative; model names are only `SOL`, `TERRA`, or `LUNA`; all user-visible
+non-negative; v3 model names are bounded generic IDs and ASTRA is not grouped as other; all user-visible
 labels are one-line bounded Unicode text. Unknown or duplicate keys, malformed
 JSON, oversized bodies, and values outside those limits are rejected without
 replacing the last valid details snapshot.

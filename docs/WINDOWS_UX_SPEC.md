@@ -229,7 +229,7 @@ Mainを既定の到達先とし、保存済みselectorで次回自動再接続�
 自動再構築ごとにSetup/app確認を再表示しない。更新は明示ボタンとbounded自動更新を同じ状態機械で扱い、
 更新中の再クリック、重複要求、値の一時消去を禁止する。
 
-Main、Graph、Threadsは同じstrict validation済み`/v2/details`一応答を一つのatomic rootとして置換する。旧serviceがexact 404を返す場合だけ単一`/v1/details`へfallbackする。
+Main、Graph、Threadsは同じstrict validation済み`/v3/details`一応答を一つのatomic rootとして置換する。旧serviceがexact 404を返す場合だけ単一v2、さらにexact 404の場合だけ単一v1へfallbackする。
 SQLite、別poll、認証control応答でfieldを補完せず、quota/history/threadの再収集、
 値の再計算、同一minuteのmerge/max/last/null化をUIで行わない。候補拒否時は全surfaceが同じlast-good rootを保持する。
 
@@ -259,7 +259,8 @@ component順や表示所有者を変更しない。
 
 ### 4.2 Trends / Graph（master: `CUM-138-06`）
 
-- 期間、ドル/トークン、Remaining/LUNA/TERRA/SOLの操作を上部固定帯に置く。
+- 期間、ドル/トークン、Remaining/LUNA/TERRA/SOL/ASTRAの操作を上部固定帯に置く。
+  model名と累積値は同じaccepted v3 rootから取得し、ASTRAを「その他」へ集約しない。
 - 期間・metricのリストはpointer pressの1回で展開する。REST/DB/poll完了を待たず、物理入力から
   user-visible paintまで、系列ON/OFFはP90 75 ms以下・P95 100 ms以下、期間/metricリストは
   P90 100 ms以下・P95 150 ms以下、いずれもcold max 250 ms以下とする。10,080点と契約最大1暦月
@@ -282,13 +283,43 @@ component順や表示所有者を変更しない。
   空graphや部分graphへ変換せず、直前graphを保持してbounded errorを表示する。キャッシュ済みで次paint
   までに切替できる場合はprogressを点滅させない。クリック反応SLOと期間データ完成時間P90/P95を混同しない。
 - plotの横軸はX版の期間意味論を維持し、現在期間は観測時刻までを右端とする。
+- 期間欄、横軸、折れ線、右端値は同じselected reset IDだけから一括投影する。poll後の
+  bounded reset aliasは60秒以内だけ同一期間として選択を維持し、欄だけ旧期間・plotだけ現在期間の
+  混在を禁止する。
 - 右端現在値の表示域は、初期940×640 logical表示時に各metricで確保される幅をドル／トークン別に固定する。Graphを横へリサイズした差分はplotへ割り当て、現在値、系列色、leader、縦位置を変えない。
 - Remainingは独立0–100%意味、モデル系列は累積値として扱う。残量をドル軸へ誤って合わせない。
 - Remainingとモデル使用量は別の観測値であり、モデル使用後に遅れて届いた最初の低い残量観測はその観測時刻へ反映する。残量観測が存在しない区間を料金・tokenから逆算してはならず、未観測区間を正常な残量低下として表示しない。
+- `models_complete=false`でも公開されたmodelの既知累積token/金額は保持し、未掲載modelを0と扱わない。
+  集合が不完全でも掲載modelのログ実測値は通常線、`model_source=unavailable`は切断としてX/Windowsで
+  同じ意味にする。model集合の完全性を個別modelの予測扱いへ流用せず、確認済みの急落や0へ置換しない。
+- model系列の有限表示状態は次を正本とし、model名ごとの全直積には展開しない。
+
+  | 入力状態 | 表示契約 |
+  | --- | --- |
+  | 同一periodの実測累積が増加／不変 | 増加は太い実線、不変は未使用を示す細い実線。同じ実測濃度を使い、最初と最後の値を同じ系列へ使う |
+  | 当該model値はログ実測、全model集合は不完全 | 既知の開始値・中間値・終端値を通常線で保持する。未掲載modelだけを未知とする |
+  | 前後の既知点間だけが未観測 | 累積が同値なら確定水平線、増加していれば実測線より細い破線。途中の消費時刻・速度を捏造しない |
+  | model値自体が未取得、または確認済みrecorder停止区間 | 値を0や直前値にせず切断または細い破線にする。別sourceのログ実測値は通常線のまま保持する |
+  | 累積が後退し、その後に回復 | 後退値と急降下を描かず、回復点まで破線または切断にする |
+  | period内の最初の既知点 | 0からの斜線を捏造せず、その値・時刻から開始する |
+  | 60秒以内のreset alias／正式reset境界 | 前者は同一periodへ正規化し、後者は別periodとして混ぜない |
+  | 確認済み0／model行なし | 前者だけ0として描き、後者は未知として数値・線を作らない |
+  | ドル／token切替 | 同じ観測時刻列を使い、単位と値だけを切り替える |
+
+  アイドル帯は、表示対象の全model累積値が利用可能で前後とも厳密に不変な区間だけに表示する。
+  model増加、model集合不完全、quota欠測、recorder gapをアイドル帯へ流用しない。欠測・予測の破線は
+  X版では1px、Windows版では1px相当とする。model利用増加の実測は3px、model未使用の実測は1px実線、Remaining実測は3pxとし、破線の有無で未使用実測と欠測・予測を区別する。
+  破線は幅の広いplotでも切替点が判別できる短く密な周期とし、長い線片・隙間で通常線に見せない。
+
+  既知の不完全ASTRAが途中まで増加した後に確定値へ移る場合、左側の増加を消して最初の確定値だけを
+  水平表示してはならない。開始・中間・終端値、線種、period ID、右端ラベルを一つの表示candidateとして
+  検証し、一項目でも不一致ならその表示を受入れない。
 - X版とWindows版は同一の履歴fixtureと固定期待値（期間境界、累積SOL、遅延残量、未観測区間）を通過しなければならない。片方の描画ヘルパーが生成した値をもう片方の期待値には使用せず、fixtureの独立oracleを使う。
 - finite oracleは、shared rolloverのperiod A→B `100% / $1 → 41% / $323.674247`、
-  `graph_delayed_quota`のfirst observation・遅延quota・missing quota、whole-vector回帰/回復、
+  `graph_delayed_quota`のfirst observation・遅延quota・missing quota、model別回帰/回復、
   confirmed gap、unattributed quota、current/historical右端、no-historyの9 causal caseとする。
+  ASTRAのtoken/指定4単価、旧3モデルだけが既知のincomplete period、period選択後pollのbounded reset aliasは
+  今回観測した同じ到達経路へ統合し、別の全直積を作らない。
   X/Windowsは同じfixtureの固定期待値を独立に検査し、値形状による100%・7日・quota-only除外、
   platform helperから期待値を生成する循環oracle、新workflow gate、全test/all-suite/全直積を追加しない。
 - 操作帯を開閉してもplotの位置・高さを変えず、ラベルや右端値を隠さない。
@@ -320,7 +351,7 @@ component順や表示所有者を変更しない。
 - WSL/remote/one-session raw recovery、ArgumentList、API到達、認証開始、認証確認、app-wide single
   supervisor/tunnel/reapの境界は`UX-20260822-SSH-001`を正本とする。
 
-Setupの順序はserver/API prepare→listener→readiness `GET /v1/health`→strict `GET /v2/details`（旧serviceの404時だけstrict v1）→
+Setupの順序はserver/API prepare→listener→readiness `GET /health`→strict `GET /v3/details`（旧serviceのexact 404時だけv2、さらにexact 404時だけv1）→
 必要時だけauth-start→別auth-check→新しいstrict detailsで固定する。auth-start/auth-checkはcontrol-onlyであり、
 応答を表示rootへmergeしない。healthだけ、またはcontrol成功だけでdata readyとしない。
 

@@ -15,7 +15,9 @@ from typing import Sequence
 OWNER_ORDER = ("DOCS", "GOVERNANCE", "LINUX_BACKEND", "LINUX_UI", "WINDOWS")
 GIT_STATUSES = frozenset({"A", "C", "D", "M", "R", "T"})
 
-DOC_EXACT = frozenset({"README.md", "README.en.md", "DESIGN.md", "SECURITY.md"})
+DOC_EXACT = frozenset(
+    {"README.md", "README.en.md", "DESIGN.md", "SECURITY.md", "AGENTS.md"}
+)
 WINDOWS_TEST_SCRIPT_EXACT = frozenset(
     {
         "scripts/capture_windows_window.ps1",
@@ -153,6 +155,7 @@ MODEL_HISTORY_PATHS = frozenset(
         "windows-client/src/CodexInfo.WindowsClient/ViewModels/ModelUsageViewModel.cs",
         "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackBoundaryCoverageTests.cs",
         "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackStatusClientTests.cs",
+        "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/ContractsTests.cs",
         "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs",
     }
 )
@@ -213,7 +216,6 @@ def _selection_for_path(path: str) -> PathSelection:
         return PathSelection(frozenset({"DOCS"}), False)
     if path.startswith((".github/", ".vscode/", ".codex-tasks/")) or path in {
         ".gitignore",
-        "AGENTS.md",
         "deny.toml",
     }:
         languages = (
@@ -337,15 +339,6 @@ def _resolve_quality_profile(
         raise ScopeError("history-graph profile has no product path")
     if quality_profile == MODEL_HISTORY_PROFILE and not product_change:
         raise ScopeError("model-history profile has no product path")
-    if quality_profile == MODEL_HISTORY_PROFILE and owners != {
-        "DOCS",
-        "LINUX_BACKEND",
-        "LINUX_UI",
-        "WINDOWS",
-    }:
-        raise ScopeError(
-            "model-history profile requires DOCS, LINUX_BACKEND, LINUX_UI, and WINDOWS"
-        )
     if quality_profile == WORKFLOW_SELECTION_PROFILE and product_change:
         raise ScopeError("workflow-selection profile cannot own product code")
     outside = sorted(set(paths) - expected_paths)

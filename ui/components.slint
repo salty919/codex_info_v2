@@ -201,7 +201,7 @@ export component GraphSelect inherits Rectangle {
     in property <[string]> model;
     in property <string> empty-label;
     in property <bool> selectable: true;
-    in-out property <int> current-index: 0;
+    in property <int> current-index: 0;
     // The placeholder row is informational only; it must not open a
     // selectable popup when there is no history.
     // enabled: root.model.length > 0 && !(root.model.length == 1 && root.model[0] == "履歴なし");
@@ -304,7 +304,6 @@ export component GraphSelect inherits Rectangle {
                     }
                     item-touch := TouchArea {
                         clicked => {
-                            root.current-index = index;
                             root.selected(value);
                             popup.close();
                         }
@@ -673,6 +672,7 @@ export component AccountActivity inherits Rectangle {
     in property <int> sol-count: 0;
     in property <int> terra-count: 0;
     in property <int> luna-count: 0;
+    in property <int> astra-count: 0;
     in property <int> other-count: 0;
     callback open-threads();
     height: 52px;
@@ -736,6 +736,14 @@ export component AccountActivity inherits Rectangle {
     }
     if root.has-active-thread : ThreadModelStat {
         x: 412px;
+        y: 24px;
+        width: 96px;
+        label: "ASTRA";
+        count: root.astra-count;
+        indicator-color: DesignTokens.graph-astra;
+    }
+    if root.has-active-thread : ThreadModelStat {
+        x: 508px;
         y: 24px;
         width: 104px;
         label: root.strings.other;
@@ -1557,19 +1565,27 @@ export component GraphWindow inherits Window {
     in-out property <bool> show-luna: true;
     in-out property <bool> show-terra: true;
     in-out property <bool> show-sol: true;
+    in-out property <bool> show-astra: true;
     // Graph uses app-side monitor geometry for maximize/restore. Keeping the
     // visual state separate from Window.maximized avoids asking X11 to size
     // the frameless surface to WSLg's virtual desktop root.
     in-out property <bool> app-maximized: false;
     in-out property <bool> show-tokens: false;
     in-out property <string> remaining-path;
+    in-out property <string> remaining-inferred-path;
     in-out property <[RemainingMarker]> remaining-markers;
     in-out property <string> sol-flat-path;
     in-out property <string> sol-rising-path;
+    in-out property <string> sol-inferred-path;
     in-out property <string> terra-flat-path;
     in-out property <string> terra-rising-path;
+    in-out property <string> terra-inferred-path;
     in-out property <string> luna-flat-path;
     in-out property <string> luna-rising-path;
+    in-out property <string> luna-inferred-path;
+    in-out property <string> astra-flat-path;
+    in-out property <string> astra-rising-path;
+    in-out property <string> astra-inferred-path;
     in property <[string]> history-period-options;
     in property <bool> open-history-on-start: false;
     in property <int> selected-history-index: 0;
@@ -1589,14 +1605,17 @@ export component GraphWindow inherits Window {
     in-out property <string> current-sol-label;
     in-out property <string> current-terra-label;
     in-out property <string> current-luna-label;
+    in-out property <string> current-astra-label;
     in-out property <string> current-remaining-connector-path;
     in-out property <string> current-sol-connector-path;
     in-out property <string> current-terra-connector-path;
     in-out property <string> current-luna-connector-path;
+    in-out property <string> current-astra-connector-path;
     in-out property <float> current-remaining-y;
     in-out property <float> current-sol-y;
     in-out property <float> current-terra-y;
     in-out property <float> current-luna-y;
+    in-out property <float> current-astra-y;
     callback close-graph();
     callback begin-window-drag();
     callback begin-window-resize(string);
@@ -1609,6 +1628,7 @@ export component GraphWindow inherits Window {
     callback toggle-luna();
     callback toggle-terra();
     callback toggle-sol();
+    callback toggle-astra();
     private property <bool> has-graph-data: root.graph-data != "" && root.graph-data != "[]";
     private property <length> content-x: min(30px, max(20px, 20px + (root.width - 700px) / 24));
     private property <length> content-width: root.width - 2 * root.content-x;
@@ -1727,6 +1747,7 @@ export component GraphWindow inherits Window {
         GraphToggle { x: 102px; y: root.history-toggle-y; width: 96px; label: "LUNA"; series-color: DesignTokens.graph-luna; checked: root.show-luna; toggled => { root.toggle-luna(); } }
         GraphToggle { x: 204px; y: root.history-toggle-y; width: 96px; label: "TERRA"; series-color: DesignTokens.graph-terra; checked: root.show-terra; toggled => { root.toggle-terra(); } }
         GraphToggle { x: 306px; y: root.history-toggle-y; width: 96px; label: "SOL"; series-color: DesignTokens.graph-sol; checked: root.show-sol; toggled => { root.toggle-sol(); } }
+        GraphToggle { x: 408px; y: root.history-toggle-y; width: 96px; label: "ASTRA"; series-color: DesignTokens.graph-astra; checked: root.show-astra; toggled => { root.toggle-astra(); } }
 
         Rectangle {
             x: 0px;
@@ -1800,6 +1821,22 @@ export component GraphWindow inherits Window {
                 viewbox-width: 100;
                 viewbox-height: 100;
                 fit: fill;
+                commands: root.current-astra-connector-path;
+                visible: root.current-astra-connector-path != "" && root.show-astra;
+                stroke: DesignTokens.graph-astra;
+                stroke-width: 1px;
+                fill: transparent;
+                opacity: 0.8;
+                stroke-line-cap: round;
+            }
+            Path {
+                x: root.plot-left + root.plot-width;
+                y: 28px;
+                width: root.current-label-gap;
+                height: parent.height - 52px;
+                viewbox-width: 100;
+                viewbox-height: 100;
+                fit: fill;
                 commands: root.current-sol-connector-path;
                 visible: root.current-sol-connector-path != "" && root.show-sol;
                 stroke: DesignTokens.graph-sol;
@@ -1845,7 +1882,38 @@ export component GraphWindow inherits Window {
             Text { x: root.current-label-x; y: 28px + root.current-luna-y * (parent.height - 52px) - 8px; width: root.current-label-width; height: 16px; text: root.current-luna-label; visible: root.current-luna-label != "" && root.show-luna; color: DesignTokens.graph-luna; font-size: 10px; font-weight: 700; horizontal-alignment: left; }
             Text { x: root.current-label-x; y: 28px + root.current-terra-y * (parent.height - 52px) - 8px; width: root.current-label-width; height: 16px; text: root.current-terra-label; visible: root.current-terra-label != "" && root.show-terra; color: DesignTokens.graph-terra; font-size: 10px; font-weight: 700; horizontal-alignment: left; }
             Text { x: root.current-label-x; y: 28px + root.current-sol-y * (parent.height - 52px) - 8px; width: root.current-label-width; height: 16px; text: root.current-sol-label; visible: root.current-sol-label != "" && root.show-sol; color: DesignTokens.graph-sol; font-size: 10px; font-weight: 700; horizontal-alignment: left; }
+            Text { x: root.current-label-x; y: 28px + root.current-astra-y * (parent.height - 52px) - 8px; width: root.current-label-width; height: 16px; text: root.current-astra-label; visible: root.current-astra-label != "" && root.show-astra; color: DesignTokens.graph-astra; font-size: 10px; font-weight: 700; horizontal-alignment: left; }
 
+            // Missing-interval bridges are weaker evidence than measured
+            // samples. Keep them visibly thinner than every observed path.
+            Path {
+                x: root.plot-left; y: 28px; width: root.plot-width; height: parent.height - 52px;
+                viewbox-width: 100; viewbox-height: 100; fit: fill; clip: true;
+                commands: root.luna-inferred-path; visible: root.show-luna;
+                stroke: DesignTokens.graph-luna; stroke-width: 1px; fill: transparent; opacity: 0.72;
+                stroke-line-cap: round; stroke-line-join: round;
+            }
+            Path {
+                x: root.plot-left; y: 28px; width: root.plot-width; height: parent.height - 52px;
+                viewbox-width: 100; viewbox-height: 100; fit: fill; clip: true;
+                commands: root.terra-inferred-path; visible: root.show-terra;
+                stroke: DesignTokens.graph-terra; stroke-width: 1px; fill: transparent; opacity: 0.72;
+                stroke-line-cap: round; stroke-line-join: round;
+            }
+            Path {
+                x: root.plot-left; y: 28px; width: root.plot-width; height: parent.height - 52px;
+                viewbox-width: 100; viewbox-height: 100; fit: fill; clip: true;
+                commands: root.sol-inferred-path; visible: root.show-sol;
+                stroke: DesignTokens.graph-sol; stroke-width: 1px; fill: transparent; opacity: 0.72;
+                stroke-line-cap: round; stroke-line-join: round;
+            }
+            Path {
+                x: root.plot-left; y: 28px; width: root.plot-width; height: parent.height - 52px;
+                viewbox-width: 100; viewbox-height: 100; fit: fill; clip: true;
+                commands: root.astra-inferred-path; visible: root.show-astra;
+                stroke: DesignTokens.graph-astra; stroke-width: 1px; fill: transparent; opacity: 0.72;
+                stroke-line-cap: round; stroke-line-join: round;
+            }
             Path {
                 x: root.plot-left;
                 y: 28px;
@@ -1858,11 +1926,47 @@ export component GraphWindow inherits Window {
                 commands: root.luna-flat-path;
                 visible: root.show-luna;
                 stroke: DesignTokens.graph-luna;
-                // Idle/no-change model intervals are deliberately quiet so
-                // the changing segments remain the visual focus.
+                // A flat measured total means confirmed non-use. Keep it
+                // thin and solid; only unknown intervals use thin dashes.
                 stroke-width: 1px;
                 fill: transparent;
-                opacity: 0.5;
+                opacity: 0.95;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+            }
+            Path {
+                x: root.plot-left;
+                y: 28px;
+                width: root.plot-width;
+                height: parent.height - 52px;
+                viewbox-width: 100;
+                viewbox-height: 100;
+                fit: fill;
+                clip: true;
+                commands: root.astra-flat-path;
+                visible: root.show-astra;
+                stroke: DesignTokens.graph-astra;
+                stroke-width: 1px;
+                fill: transparent;
+                opacity: 0.95;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+            }
+            Path {
+                x: root.plot-left;
+                y: 28px;
+                width: root.plot-width;
+                height: parent.height - 52px;
+                viewbox-width: 100;
+                viewbox-height: 100;
+                fit: fill;
+                clip: true;
+                commands: root.astra-rising-path;
+                visible: root.show-astra;
+                stroke: DesignTokens.graph-astra;
+                stroke-width: 3px;
+                fill: transparent;
+                opacity: 0.95;
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }
@@ -1896,11 +2000,11 @@ export component GraphWindow inherits Window {
                 commands: root.terra-flat-path;
                 visible: root.show-terra;
                 stroke: DesignTokens.graph-terra;
-                // Idle/no-change model intervals are deliberately quiet so
-                // the changing segments remain the visual focus.
+                // Exact flat observations are confirmed non-use: thin solid.
+                // Only missing intervals are thin and dashed.
                 stroke-width: 1px;
                 fill: transparent;
-                opacity: 0.5;
+                opacity: 0.95;
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }
@@ -1934,11 +2038,11 @@ export component GraphWindow inherits Window {
                 commands: root.sol-flat-path;
                 visible: root.show-sol;
                 stroke: DesignTokens.graph-sol;
-                // Idle/no-change model intervals are deliberately quiet so
-                // the changing segments remain the visual focus.
+                // Exact flat observations are confirmed non-use: thin solid.
+                // Only missing intervals are thin and dashed.
                 stroke-width: 1px;
                 fill: transparent;
-                opacity: 0.5;
+                opacity: 0.95;
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }
@@ -1957,6 +2061,24 @@ export component GraphWindow inherits Window {
                 stroke-width: 3px;
                 fill: transparent;
                 opacity: 0.95;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+            }
+            Path {
+                x: root.plot-left;
+                y: 28px;
+                width: root.plot-width;
+                height: parent.height - 52px;
+                viewbox-width: 100;
+                viewbox-height: 100;
+                fit: fill;
+                clip: true;
+                commands: root.remaining-inferred-path;
+                visible: root.show-remaining;
+                stroke: DesignTokens.graph-remaining;
+                stroke-width: 1px;
+                fill: transparent;
+                opacity: 0.72;
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }
@@ -1983,7 +2105,7 @@ export component GraphWindow inherits Window {
                 commands: root.remaining-path;
                 visible: root.show-remaining;
                 stroke: DesignTokens.graph-remaining;
-                stroke-width: 2px;
+                stroke-width: 3px;
                 fill: transparent;
                 stroke-line-cap: round;
                 stroke-line-join: round;

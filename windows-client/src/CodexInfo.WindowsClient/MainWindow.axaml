@@ -302,7 +302,7 @@
                      Text="{Binding Texts.NoRunningThreads}"
                      TextWrapping="NoWrap" />
         </StackPanel>
-        <UniformGrid Grid.Column="1" Columns="4" HorizontalAlignment="Stretch" VerticalAlignment="Center" IsVisible="{Binding HasActiveThreads}">
+        <UniformGrid Grid.Column="1" Columns="5" HorizontalAlignment="Stretch" VerticalAlignment="Center" IsVisible="{Binding HasActiveThreads}">
           <StackPanel Spacing="1" HorizontalAlignment="Center">
             <TextBlock Classes="metric-label" Foreground="#B79BFF" HorizontalAlignment="Center" Text="SOL" />
             <TextBlock Classes="metric-value" Foreground="#B79BFF" HorizontalAlignment="Center" Text="{Binding ActiveSolCount}" />
@@ -314,6 +314,10 @@
           <StackPanel Spacing="1" HorizontalAlignment="Center">
             <TextBlock Classes="metric-label" Foreground="#F1B35A" HorizontalAlignment="Center" Text="LUNA" />
             <TextBlock Classes="metric-value" Foreground="#F1B35A" HorizontalAlignment="Center" Text="{Binding ActiveLunaCount}" />
+          </StackPanel>
+          <StackPanel Spacing="1" HorizontalAlignment="Center">
+            <TextBlock Classes="metric-label" Foreground="#E86E9F" HorizontalAlignment="Center" Text="ASTRA" />
+            <TextBlock Classes="metric-value" Foreground="#E86E9F" HorizontalAlignment="Center" Text="{Binding ActiveAstraCount}" />
           </StackPanel>
           <StackPanel Spacing="1" HorizontalAlignment="Center">
             <TextBlock Classes="metric-label" HorizontalAlignment="Center" Text="{Binding Texts.Other}" />

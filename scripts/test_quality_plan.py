@@ -103,6 +103,27 @@ class QualityPlanFixtures(unittest.TestCase):
         )
         self.assertEqual(plan.quality_profile, "model-history")
 
+    def test_model_history_subset_does_not_expand_to_unchanged_owners(self) -> None:
+        rust = plan_for_paths(
+            ("src/usage_store.rs",), quality_profile="model-history"
+        )
+        self.assertEqual(rust.affected_owners, ("LINUX_BACKEND",))
+        self.assertEqual(
+            rust.checks, ("requirements-authority", "rust-model-history")
+        )
+
+        windows = plan_for_paths(
+            (
+                "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/ContractsTests.cs",
+            ),
+            quality_profile="model-history",
+        )
+        self.assertEqual(windows.affected_owners, ("WINDOWS",))
+        self.assertEqual(
+            windows.checks,
+            ("requirements-authority", "windows-model-history"),
+        )
+
     def test_windows_owner(self) -> None:
         plan = plan_for_paths(
             (
