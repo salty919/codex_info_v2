@@ -204,24 +204,36 @@ public sealed class GraphScene
                      currentModels.Any(double.IsFinite) &&
                      !vectorRegressed)
             {
-                // Legacy/incomplete rows retain each known model value for a
-                // dashed reference path. Missing models remain NaN rather
-                // than becoming synthetic zeroes.
+                // The set is incomplete, but each present model row is still
+                // an exact observation. Missing models remain NaN rather than
+                // becoming synthetic zeroes. Set completeness is retained
+                // separately for quota attribution.
+            }
+            if (sample.ModelSource == ApiHistorySample.UnavailableModelSource)
+            {
+                Array.Fill(currentModels, double.NaN);
             }
             else
             {
-                // Keep the last trusted vector only as a recovery threshold;
-                // never synthesize a partially repaired row from its maxima.
-                Array.Fill(currentModels, double.NaN);
-            }
-            var modelDataAvailable = currentModels.Length > 0 && currentModels.All(double.IsFinite);
-            if (modelDataAvailable)
-            {
                 for (var modelIndex = 0; modelIndex < modelNames.Length; modelIndex++)
                 {
-                    previousObservedModels[modelNames[modelIndex]] = currentModels[modelIndex];
+                    var value = currentModels[modelIndex];
+                    if (!double.IsFinite(value))
+                    {
+                        continue;
+                    }
+                    var name = modelNames[modelIndex];
+                    if (previousObservedModels.TryGetValue(name, out var priorValue) && value < priorValue)
+                    {
+                        // A cumulative model can never fall within one period.
+                        // Hide only the regressed model; a peer model's exact
+                        // row must not disappear with the whole vector.
+                        currentModels[modelIndex] = double.NaN;
+                        continue;
+                    }
+                    previousObservedModels[name] = value;
                 }
-                hasObservedVector = true;
+                hasObservedVector = previousObservedModels.Count > 0;
             }
             for (var modelIndex = 0; modelIndex < modelNames.Length; modelIndex++)
             {
@@ -231,6 +243,7 @@ public sealed class GraphScene
             var currentTerra = ModelValue(modelNames, currentModels, "TERRA");
             var currentLuna = ModelValue(modelNames, currentModels, "LUNA");
             var currentAstra = ModelValue(modelNames, currentModels, "ASTRA");
+            var modelDataAvailable = currentModels.Length > 0 && currentModels.All(double.IsFinite);
             remainingObserved[index] = sample.RemainingPercent is { } observedQuota &&
                 double.IsFinite(observedQuota);
             points[index] = new ScenePoint(

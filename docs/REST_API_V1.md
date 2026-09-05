@@ -15,7 +15,7 @@ API-DEPRECATION-01
 
 `API-V3-MODELS-01`: `/v3/details`はcommit済みdomain snapshotを、有界な`models`配列として返す。model ID、token内訳、価格計算可否を事実として分離し、UI固定列や表示文言をwire fieldにしない。`/health`はAPI世代から独立したread-only readiness endpointとし、collector、DB writer、外部quota取得の生存状態を混同しない。
 
-v3の各履歴rowは`models`と`models_complete`を持つ。各model rowの`total_tokens`と`total_dollars`は個別に確認できた累計、入力・cached入力・cache write入力・出力は確認できたfieldだけを持ち、未確認fieldを反復`null`で送らない。旧`usage_history`のSOL/TERRA/LUNA列は既知の`total_tokens`と`total_dollars`として保持し、旧schemaにない内訳を0や推測値で補わない。`models_complete=true`は同じ観測で全モデル集合を確定できた場合だけ許可し、`model_source=confirmed`と非nullの`models`を必要とする。保持ログからASTRAだけを回収した場合や旧3モデルだけが既知の場合は`models_complete=false`、`model_source=legacy-unknown`とし、配列にないモデルを0と解釈しない。clientは既知のmodel値を表示しつつ、その区間を確定実線へ接続せず、破線または切断で未確定性を示す。
+v3の各履歴rowは`models`と`models_complete`を持つ。各model rowの`total_tokens`と`total_dollars`は個別に確認できた累計、入力・cached入力・cache write入力・出力は確認できたfieldだけを持ち、未確認fieldを反復`null`で送らない。旧`usage_history`のSOL/TERRA/LUNA列は既知の`total_tokens`と`total_dollars`として保持し、同時刻の不完全なgeneric model集合へ名前単位でmergeする。旧schemaにない内訳を0や推測値で補わない。`models_complete=true`は同じ観測で全モデル集合を確定できた場合だけ許可し、`model_source=confirmed`と非nullの`models`を必要とする。保持ログからASTRAだけを回収した場合や旧3モデルだけが既知の場合は`models_complete=false`、`model_source=legacy-unknown`とし、配列にないモデルを0と解釈しない。clientは掲載modelの実測値を通常線で表示し、当該model自体の未観測区間だけを破線または切断で示す。集合の不完全性だけで掲載modelを予測値へ降格しない。
 
 `API-DEPRECATION-01`: `/v1/details`と`/v2/details`はdeprecated互換adapterである。互換期間中は同じatomic generationから生成し、既存field、値型、header allowlistを変更しない。新clientはv3を優先し、exact 404の場合だけv2、さらにexact 404の場合だけv1へfallbackし、世代をmergeしない。廃止日は未決定であり、決定前に`Sunset`を送らない。将来の削除対象は旧details route、adapter、client fallbackだけで、Session collector、SQLite writer、domain model、`/health`は対象外とする。
 
@@ -272,7 +272,7 @@ exact `v2`とする。`history_samples`の各rowはv1の9キーに`model_source`
 | --- | --- | --- |
 | `confirmed` | 全て非null | 同じlocal収集の証拠とatomic commitを持つ。ほかの連続条件も満たす隣接点だけ実線にできる |
 | `unavailable` | 全てnull | そのtimestampのlocal model値は未取得。freshな`remaining_percent`だけは同時刻へ保持できるが、model線は確定値として描かない |
-| `legacy-unknown` | 全て非null | provenance導入前またはv1 fallbackの値。確定観測へ昇格せず破線または切断として扱う |
+| `legacy-unknown` | 全て非null | provenance導入前またはv1 fallbackの実測累計。値は通常線にできるが、集合完全性やquota変化の帰属根拠には使わない |
 
 `confirmed`/`legacy-unknown`でmodel 6値の一部だけがnull、または`unavailable`で一つでも非nullのcandidateは
 全体rejectする。local取得失敗時に直前model vectorを新しいtimestampへ複製せず、quotaが取得できた場合だけ

@@ -341,6 +341,37 @@ fn history_model_usage_v3(
     }
 }
 
+fn history_models_v3(
+    source: Option<&usage_store::UsageHistoryObservation>,
+    sample: &PublicHistoryObservation,
+) -> Option<Vec<PublicHistoryModelUsageV3>> {
+    let mut models = source
+        .and_then(|observation| observation.model_totals.as_ref())
+        .map(|totals| {
+            totals
+                .iter()
+                .map(|total| history_model_usage_v3(total, sample))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    // An incomplete generic set can still contain exact rows recovered from
+    // the session log. It must not replace exact legacy SOL/TERRA/LUNA rows
+    // at the same observation. Completeness remains false because arbitrary
+    // peer models may still be unknown.
+    if source.is_none_or(|observation| !observation.model_totals_complete) {
+        if let Some(legacy_models) = legacy_history_models_v3(sample) {
+            for legacy in legacy_models {
+                if !models.iter().any(|model| model.model == legacy.model) {
+                    models.push(legacy);
+                }
+            }
+        }
+    }
+    models.sort_by(|left, right| left.model.cmp(&right.model));
+    (!models.is_empty()).then_some(models)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ModelUsageTotals {
     sol: ModelUsageRow,
@@ -4492,9 +4523,6 @@ fn graph_paths_for_selection_with_sources_and_astra(
         period_end,
     );
     for point in &mut minute {
-        let has_model_observation = model_timelines
-            .values()
-            .any(|timeline| timeline.contains_key(&point.timestamp));
         let value = |name: &str, fallback: f64| {
             model_timelines
                 .get(name)
@@ -4506,11 +4534,7 @@ fn graph_paths_for_selection_with_sources_and_astra(
                         model.dollar
                     }
                 })
-                .unwrap_or(if has_model_observation {
-                    -1.0
-                } else {
-                    fallback
-                })
+                .unwrap_or(fallback)
         };
         point.sol = value("SOL", point.sol);
         point.terra = value("TERRA", point.terra);
@@ -4624,11 +4648,7 @@ fn graph_paths_for_selection_with_sources_and_astra(
     };
     let model_untrusted = |name: &str| {
         let timeline = model_timelines.get(name);
-        let mut minutes = untrusted_minutes
-            .iter()
-            .copied()
-            .filter(|minute| timeline.is_none_or(|timeline| !timeline.contains_key(minute)))
-            .collect::<BTreeSet<_>>();
+        let mut minutes = BTreeSet::new();
         if let Some(timeline) = timeline {
             minutes.extend(
                 timeline
@@ -5266,7 +5286,7 @@ fn split_metric_line_paths_with_evidence(
         let (x2, y2) = coordinate(&pair[1]);
         let unobserved_gap = pair[1].timestamp.saturating_sub(pair[0].timestamp)
             > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
-        if unobserved_gap || untrusted {
+        if untrusted || (unobserved_gap && current != previous) {
             append_dashed_segment(&mut inferred, (x1, y1), (x2, y2));
             continue;
         }
@@ -5304,7 +5324,16 @@ fn split_metric_line_paths_with_evidence(
                     confirmed_gaps,
                 )
             {
-                append_dashed_segment(&mut inferred, coordinate(previous), coordinate(point));
+                if value(previous) == value(point) {
+                    let (x1, y1) = coordinate(previous);
+                    let (x2, y2) = coordinate(point);
+                    if !flat.is_empty() {
+                        flat.push(' ');
+                    }
+                    flat.push_str(&format!("M{x1:.2} {y1:.2} L{x2:.2} {y2:.2}"));
+                } else {
+                    append_dashed_segment(&mut inferred, coordinate(previous), coordinate(point));
+                }
             }
         }
         last_reliable = Some(point);
@@ -9524,16 +9553,7 @@ impl CodexInfoState {
                             observation.model_source == usage_store::ModelSource::Confirmed,
                         )
                     });
-                let model_totals = source
-                    .and_then(|observation| {
-                        observation.model_totals.as_ref().map(|totals| {
-                            totals
-                                .iter()
-                                .map(|total| history_model_usage_v3(total, sample))
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .or_else(|| legacy_history_models_v3(sample));
+                let model_totals = history_models_v3(source, sample);
                 let model_source = if sample.model_source == "unavailable" {
                     "unavailable"
                 } else if model_totals.is_some()
@@ -12475,13 +12495,13 @@ impl CodexInfoState {
                 .as_deref()
                 .and_then(|models| models.iter().find(|model| model.model == model_name));
             let minute = observation.timestamp.div_euclid(60) * 60;
-            let reliable = observation.model_source == usage_store::ModelSource::Confirmed
+            let complete = observation.model_source == usage_store::ModelSource::Confirmed
                 && observation.model_totals_complete;
             let Some(model) = model else {
                 // A complete model set makes absence an observed zero. An
                 // incomplete set says nothing about an omitted model and must
                 // not manufacture a zero line.
-                if reliable {
+                if complete {
                     points.insert(
                         minute,
                         GraphModelPoint {
@@ -12493,11 +12513,10 @@ impl CodexInfoState {
                 }
                 continue;
             };
-            // Completeness describes the model set, not the known model row.
-            // Keep an exact row recovered from the session log and let
-            // `reliable` render it as inferred/dashed when peer models are
-            // unknown. Dropping the value makes the line appear later at the
-            // first complete snapshot, which falsely implies a sudden spend.
+            // Completeness describes the model set, not the evidence quality
+            // of a row that is present. A row recovered from the session log
+            // is observed and stays solid; only an interval where this model
+            // itself is absent may be inferred.
             let dollar = match model_name {
                 "SOL" => observation.sol_dollars,
                 "TERRA" => observation.terra_dollars,
@@ -12520,7 +12539,7 @@ impl CodexInfoState {
                 GraphModelPoint {
                     dollar,
                     tokens: model.total_tokens as f64,
-                    reliable,
+                    reliable: true,
                 },
             );
         }
@@ -20105,9 +20124,18 @@ mod tests {
         assert_eq!((retained_legacy.sol, retained_legacy.luna), (2.0, 0.5));
 
         let paths = state.graph_paths_for_selection_at(observed_at, true, false, true, false);
-        assert!(paths.sol_rising.is_empty());
-        assert!(paths.luna_rising.is_empty());
-        assert!(paths.sol_flat.matches('M').count() > 1);
+        assert!(
+            !paths.sol_rising.is_empty(),
+            "known legacy SOL observations are measured values, not predictions"
+        );
+        assert!(
+            !paths.luna_rising.is_empty(),
+            "known legacy LUNA observations are measured values, not predictions"
+        );
+        assert!(
+            paths.sol_flat.matches('M').count() > 1,
+            "only the unavailable interval is bridged as inferred"
+        );
         assert!(paths.luna_flat.matches('M').count() > 1);
         assert!(!paths.sol_flat.contains("L100.00"));
         assert_eq!(paths.current_sol_label, "$3.00");
@@ -28989,6 +29017,27 @@ mod tests {
         assert!(!flat.contains("M1.64 50.00 L98.36 50.00"));
         assert!(!rising.contains("M98.36 50.00 L98.36 1.00"));
         assert!(inferred.matches('M').count() > 2);
+
+        let equal_endpoints = [
+            HourlyModelSpend {
+                timestamp: 0,
+                luna: 2.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 3_600,
+                luna: 2.0,
+                ..HourlyModelSpend::default()
+            },
+        ];
+        let (flat, rising, inferred) =
+            split_metric_line_paths(&equal_endpoints, 0, 3_600, 2.0, |point| point.luna);
+        assert!(
+            !flat.is_empty(),
+            "equal cumulative endpoints prove a flat interval"
+        );
+        assert!(rising.is_empty());
+        assert!(inferred.is_empty());
     }
 
     #[test]
@@ -29459,30 +29508,38 @@ mod tests {
             .min()
             .expect("preview history")
             - WEEK_SECONDS;
-        for (timestamp, tokens, source, complete) in [
+        for (timestamp, tokens, source, complete, sol, luna) in [
             (
                 first,
                 1_000_000,
                 usage_store::ModelSource::LegacyUnknown,
                 false,
+                0_u64,
+                10_u64,
             ),
             (
                 first + 60,
                 2_000_000,
                 usage_store::ModelSource::LegacyUnknown,
                 false,
+                0,
+                20,
             ),
             (
                 first + 120,
                 3_000_000,
                 usage_store::ModelSource::Confirmed,
                 true,
+                30,
+                20,
             ),
             (
                 first + 180,
                 4_000_000,
                 usage_store::ModelSource::Confirmed,
                 true,
+                40,
+                30,
             ),
         ] {
             producer
@@ -29492,9 +29549,53 @@ mod tests {
                     timestamp,
                     historical_reset,
                     64.0,
-                    ModelDollarTotals::default(),
-                    ModelTokenTotals::default(),
+                    ModelDollarTotals {
+                        sol: sol as f64,
+                        luna: luna as f64,
+                        ..ModelDollarTotals::default()
+                    },
+                    ModelTokenTotals {
+                        sol,
+                        luna,
+                        ..ModelTokenTotals::default()
+                    },
                 ));
+            let mut model_totals = vec![usage_store::SessionModelTotal {
+                model: "ASTRA".into(),
+                total_tokens: tokens,
+                input_tokens: tokens,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+            }];
+            if complete {
+                model_totals.extend([
+                    usage_store::SessionModelTotal {
+                        model: "SOL".into(),
+                        total_tokens: sol,
+                        input_tokens: sol,
+                        cached_input_tokens: 0,
+                        output_tokens: 0,
+                        cache_write_input_tokens: None,
+                    },
+                    usage_store::SessionModelTotal {
+                        model: "TERRA".into(),
+                        total_tokens: 0,
+                        input_tokens: 0,
+                        cached_input_tokens: 0,
+                        output_tokens: 0,
+                        cache_write_input_tokens: None,
+                    },
+                    usage_store::SessionModelTotal {
+                        model: "LUNA".into(),
+                        total_tokens: luna,
+                        input_tokens: luna,
+                        cached_input_tokens: 0,
+                        output_tokens: 0,
+                        cache_write_input_tokens: None,
+                    },
+                ]);
+            }
             producer
                 .history
                 .observations
@@ -29502,21 +29603,14 @@ mod tests {
                     timestamp,
                     reset_at: historical_reset,
                     remaining_percent: Some(64.0),
-                    sol_dollars: Some(0.0),
+                    sol_dollars: Some(sol as f64),
                     terra_dollars: Some(0.0),
-                    luna_dollars: Some(0.0),
-                    sol_tokens: Some(0),
+                    luna_dollars: Some(luna as f64),
+                    sol_tokens: Some(sol),
                     terra_tokens: Some(0),
-                    luna_tokens: Some(0),
+                    luna_tokens: Some(luna),
                     model_source: source,
-                    model_totals: Some(vec![usage_store::SessionModelTotal {
-                        model: "ASTRA".into(),
-                        total_tokens: tokens,
-                        input_tokens: tokens,
-                        cached_input_tokens: 0,
-                        output_tokens: 0,
-                        cache_write_input_tokens: Some(0),
-                    }]),
+                    model_totals: Some(model_totals),
                     model_totals_complete: complete,
                 });
         }
@@ -29529,6 +29623,27 @@ mod tests {
             .find(|period| !period.current)
             .expect("historical period")
             .clone();
+        let first_details = details
+            .history_samples
+            .iter()
+            .find(|sample| sample.timestamp == first)
+            .expect("first historical v3 row");
+        let first_models = first_details.models.as_ref().expect("known model rows");
+        assert_eq!(
+            first_models
+                .iter()
+                .map(|model| model.model.as_str())
+                .collect::<Vec<_>>(),
+            ["ASTRA", "LUNA", "SOL", "TERRA"]
+        );
+        let first_luna = first_models
+            .iter()
+            .find(|model| model.model == "LUNA")
+            .expect("exact legacy LUNA row merged beside ASTRA");
+        assert_eq!(
+            (first_luna.total_tokens, first_luna.total_dollars),
+            (10, Some(10.0))
+        );
 
         let mut client = CodexInfoState::service_client();
         client.selected_reset_at = Some(historical.reset_at - 1);
@@ -29564,8 +29679,8 @@ mod tests {
                 .map(|point| (point.dollar, point.tokens, point.reliable))
                 .collect::<Vec<_>>(),
             [
-                (10.0, 1_000_000.0, false),
-                (20.0, 2_000_000.0, false),
+                (10.0, 1_000_000.0, true),
+                (20.0, 2_000_000.0, true),
                 (30.0, 3_000_000.0, true),
                 (40.0, 4_000_000.0, true),
             ]
@@ -29578,19 +29693,44 @@ mod tests {
             true,
             false,
         );
-        assert!(
-            !paths.astra_flat.is_empty(),
-            "incomplete known ASTRA values must remain as a dashed path: flat={:?} rising={:?} label={:?}",
-            paths.astra_flat,
-            paths.astra_rising,
-            paths.current_astra_label
-        );
-        assert!(
-            paths.astra_flat.matches('M').count() > 1,
-            "incomplete ASTRA intervals must be geometrically dashed"
-        );
+        assert!(paths.astra_flat.is_empty());
         assert!(!paths.astra_rising.is_empty());
         assert_eq!(paths.current_astra_label, "$40.00");
+        let luna_points = client.graph_model_points_for_selection(
+            historical.reset_at,
+            historical.start_at,
+            historical.end_at,
+            "LUNA",
+        );
+        let sol_points = client.graph_model_points_for_selection(
+            historical.reset_at,
+            historical.start_at,
+            historical.end_at,
+            "SOL",
+        );
+        assert_eq!(
+            luna_points.get(&first).map(|point| point.dollar),
+            Some(10.0)
+        );
+        assert_eq!(
+            luna_points.get(&(first + 60)).map(|point| point.dollar),
+            Some(20.0)
+        );
+        assert_eq!(sol_points.get(&first).map(|point| point.dollar), Some(0.0));
+        assert_eq!(
+            sol_points.get(&(first + 120)).map(|point| point.dollar),
+            Some(30.0)
+        );
+        assert!(!paths.luna_rising.is_empty());
+        assert!(!paths.sol_rising.is_empty());
+        assert_eq!(
+            paths.current_luna_label,
+            format!("${:.2}", luna_points.values().next_back().unwrap().dollar)
+        );
+        assert_eq!(
+            paths.current_sol_label,
+            format!("${:.2}", sol_points.values().next_back().unwrap().dollar)
+        );
 
         let token_paths = client.graph_paths_for_selection_at_with_astra(
             observed_at,
@@ -29600,7 +29740,7 @@ mod tests {
             true,
             true,
         );
-        assert!(token_paths.astra_flat.matches('M').count() > 1);
+        assert!(token_paths.astra_flat.is_empty());
         assert!(!token_paths.astra_rising.is_empty());
         assert_eq!(token_paths.current_astra_label, "4,000,000");
     }
@@ -29704,19 +29844,24 @@ mod tests {
     }
 
     #[test]
-    fn graph_idle_model_paths_use_quiet_strokes() {
+    fn graph_observed_model_paths_do_not_look_inferred() {
         let source = include_str!("../ui/components.slint");
         let graph = source
             .split("export component GraphWindow inherits Window {")
             .nth(1)
             .expect("GraphWindow");
-        for path_name in ["luna-flat-path", "terra-flat-path", "sol-flat-path"] {
+        for path_name in [
+            "luna-flat-path",
+            "terra-flat-path",
+            "sol-flat-path",
+            "astra-flat-path",
+        ] {
             let path = graph
                 .split("Path {")
                 .find(|body| body.contains(&format!("commands: root.{path_name};")))
                 .expect(path_name);
-            assert!(path.contains("stroke-width: 1px;"), "{path_name}");
-            assert!(path.contains("opacity: 0.5;"), "{path_name}");
+            assert!(path.contains("stroke-width: 3px;"), "{path_name}");
+            assert!(path.contains("opacity: 0.95;"), "{path_name}");
         }
     }
 

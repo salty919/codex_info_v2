@@ -323,12 +323,6 @@ internal static class GraphPlotProjection
             {
                 continue;
             }
-            if (!scene.ModelVectorAvailable[index - 1] ||
-                !scene.ModelVectorAvailable[index])
-            {
-                AppendSegment(dashedX, dashedY, startAt, before, endAt, after);
-                continue;
-            }
             if (IsSyntheticFirstObservation(scene, values, index))
             {
                 // The interval between the synthetic reset anchor and the
@@ -412,17 +406,6 @@ internal static class GraphPlotProjection
             }
             if (previous >= 0 && value < values[previous])
             {
-                if (!scene.ModelVectorAvailable[previous] ||
-                    !scene.ModelVectorAvailable[index])
-                {
-                    AppendSegment(
-                        dashedX,
-                        dashedY,
-                        scene.Timestamps[previous],
-                        values[previous],
-                        scene.Timestamps[index],
-                        value);
-                }
                 previous = -1;
                 continue;
             }
@@ -441,14 +424,8 @@ internal static class GraphPlotProjection
                 previous = index;
                 continue;
             }
-            if (!scene.ModelVectorAvailable[previous] ||
-                !scene.ModelVectorAvailable[index])
-            {
-                AppendSegment(dashedX, dashedY, startAt, before, endAt, value);
-                previous = index;
-                continue;
-            }
-            if (index != previous + 1 || elapsed > ModelContiguousSampleMaxGapSeconds)
+            if ((index != previous + 1 || elapsed > ModelContiguousSampleMaxGapSeconds) &&
+                value != before)
             {
                 AppendSegment(dashedX, dashedY, startAt, before, endAt, value);
             }

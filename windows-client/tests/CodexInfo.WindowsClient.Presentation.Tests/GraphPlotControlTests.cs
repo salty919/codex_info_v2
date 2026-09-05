@@ -320,25 +320,61 @@ public sealed class GraphPlotControlTests
     {
         var samples = new[]
         {
-            new ApiHistorySample(1_000, 2_000, 90, null, null, null, null, null, null)
+            new ApiHistorySample(
+                1_000, 2_000, 90, null, null, null, null, null, null,
+                ApiHistorySample.LegacyUnknownModelSource)
             {
-                ModelsComplete = true,
-                ModelSamples = [new ApiHistoryModelSample("ASTRA", 1, 0, 0, 10) { TotalTokens = 1 }],
+                ModelsComplete = false,
+                ModelSamples =
+                [
+                    new ApiHistoryModelSample("ASTRA", 1, 0, 0, 10) { TotalTokens = 1 },
+                    new ApiHistoryModelSample("LUNA", null, null, null, 1) { TotalTokens = 1 },
+                ],
             },
-            new ApiHistorySample(1_060, 2_000, 89, null, null, null, null, null, null)
+            new ApiHistorySample(
+                1_060, 2_000, 89, null, null, null, null, null, null,
+                ApiHistorySample.LegacyUnknownModelSource)
             {
-                ModelsComplete = true,
-                ModelSamples = [new ApiHistoryModelSample("ASTRA", 2, 0, 0, 20) { TotalTokens = 2 }],
+                ModelsComplete = false,
+                ModelSamples =
+                [
+                    new ApiHistoryModelSample("ASTRA", 2, 0, 0, 20) { TotalTokens = 2 },
+                    new ApiHistoryModelSample("LUNA", null, null, null, 2) { TotalTokens = 2 },
+                    new ApiHistoryModelSample("SOL", null, null, null, 3) { TotalTokens = 3 },
+                ],
+            },
+            new ApiHistorySample(
+                1_120, 2_000, 88, null, null, null, null, null, null,
+                ApiHistorySample.LegacyUnknownModelSource)
+            {
+                ModelsComplete = false,
+                ModelSamples =
+                [
+                    new ApiHistoryModelSample("ASTRA", 3, 0, 0, 30) { TotalTokens = 3 },
+                    new ApiHistoryModelSample("LUNA", null, null, null, 2) { TotalTokens = 2 },
+                    new ApiHistoryModelSample("SOL", null, null, null, 4) { TotalTokens = 4 },
+                ],
             },
         };
 
-        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_060);
-        var lines = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Astra);
+        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_120);
+        var astra = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Astra);
+        var luna = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Luna);
+        var sol = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Sol);
 
-        Assert.Equal([10d, 20d], scene.Astra);
-        Assert.Equal([10d, 20d], scene.ModelSeries["ASTRA"]);
-        Assert.Equal([1_000d, 1_060d], lines.Rising.X);
-        Assert.Equal([10d, 20d], lines.Rising.Y);
+        Assert.Equal([10d, 20d, 30d], scene.Astra);
+        Assert.Equal([10d, 20d, 30d], scene.ModelSeries["ASTRA"]);
+        Assert.Equal([1d, 2d, 2d], scene.Luna);
+        Assert.True(double.IsNaN(scene.Sol[0]));
+        Assert.Equal([3d, 4d], scene.Sol.Skip(1));
+        Assert.Equal([1_000d, 1_060d, 1_120d], astra.Rising.X);
+        Assert.Equal([10d, 20d, 30d], astra.Rising.Y);
+        Assert.Empty(astra.Dashed.X);
+        Assert.Equal([1_000d, 1_060d], luna.Rising.X);
+        Assert.Equal([1_060d, 1_120d], luna.Flat.X);
+        Assert.Empty(luna.Dashed.X);
+        Assert.Equal([1_060d, 1_120d], sol.Rising.X);
+        Assert.Empty(sol.Dashed.X);
     }
 
     [Fact]
@@ -360,7 +396,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Scene_marks_a_regressed_model_component_as_a_whole_vector_gap_until_recovery()
+    public void Scene_hides_only_the_regressed_model_component_until_recovery()
     {
         var scene = Scene(
             [
@@ -371,15 +407,15 @@ public sealed class GraphPlotControlTests
             ]);
 
         Assert.Equal([true, false, true, true], scene.ModelVectorAvailable);
-        Assert.Equal([1d, double.NaN, 2d, 75d], scene.Sol);
+        Assert.Equal([1d, 2d, 2d, 75d], scene.Sol);
         Assert.Equal([2d, double.NaN, 2d, 3d], scene.Terra);
-        Assert.Equal([3d, double.NaN, 4d, 5d], scene.Luna);
+        Assert.Equal([3d, 4d, 4d, 5d], scene.Luna);
 
         var lines = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Sol);
-        Assert.Equal([1_120d, 1_180d], lines.Rising.X);
-        Assert.Equal([2d, 75d], lines.Rising.Y);
-        Assert.Equal([1_000d, 1_120d], lines.Dashed.X);
-        Assert.Equal([1d, 2d], lines.Dashed.Y);
+        Assert.Equal([1_000d, 1_060d, double.NaN, 1_120d, 1_180d], lines.Rising.X);
+        Assert.Equal([1d, 2d, double.NaN, 2d, 75d], lines.Rising.Y);
+        Assert.Equal([1_060d, 1_120d], lines.Flat.X);
+        Assert.Empty(lines.Dashed.X);
 
         var quotaLines = GraphPlotProjection.BuildRemainingLines(scene);
         Assert.Equal([1_120d, 1_180d], quotaLines.Solid.X);
@@ -420,13 +456,14 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Renderable_model_lines_use_dashes_for_long_trusted_gaps_only()
+    public void Renderable_model_lines_dash_only_increasing_unobserved_gaps()
     {
         var scene = Scene(
             [
                 Point(1_000, 100, 0, 0, 0),
                 Point(1_060, 90, 1, 0, 0),
                 Point(1_121, 80, 2, 0, 0),
+                Point(1_242, 70, 2, 0, 0),
             ]);
 
         var lines = GraphPlotProjection.BuildRenderableModelLines(scene, scene.Sol);
@@ -435,6 +472,8 @@ public sealed class GraphPlotControlTests
         Assert.Equal([0d, 1d], lines.Rising.Y);
         Assert.Equal([1_060d, 1_121d], lines.Dashed.X);
         Assert.Equal([1d, 2d], lines.Dashed.Y);
+        Assert.Equal([1_121d, 1_242d], lines.Flat.X);
+        Assert.Equal([2d, 2d], lines.Flat.Y);
     }
 
     [Fact]

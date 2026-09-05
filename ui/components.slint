@@ -1891,11 +1891,12 @@ export component GraphWindow inherits Window {
                 commands: root.luna-flat-path;
                 visible: root.show-luna;
                 stroke: DesignTokens.graph-luna;
-                // Idle/no-change model intervals are deliberately quiet so
-                // the changing segments remain the visual focus.
-                stroke-width: 1px;
+                // These are observed cumulative values, not predictions.
+                // Keep the same solid weight as increasing observations;
+                // inferred gaps are distinguished by path geometry.
+                stroke-width: 3px;
                 fill: transparent;
-                opacity: 0.5;
+                opacity: 0.95;
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }
@@ -1911,9 +1912,9 @@ export component GraphWindow inherits Window {
                 commands: root.astra-flat-path;
                 visible: root.show-astra;
                 stroke: DesignTokens.graph-astra;
-                stroke-width: 1px;
+                stroke-width: 3px;
                 fill: transparent;
-                opacity: 0.5;
+                opacity: 0.95;
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }
@@ -1965,11 +1966,11 @@ export component GraphWindow inherits Window {
                 commands: root.terra-flat-path;
                 visible: root.show-terra;
                 stroke: DesignTokens.graph-terra;
-                // Idle/no-change model intervals are deliberately quiet so
-                // the changing segments remain the visual focus.
-                stroke-width: 1px;
+                // Exact flat observations use the same evidence style as
+                // exact increases. Only missing intervals are dashed.
+                stroke-width: 3px;
                 fill: transparent;
-                opacity: 0.5;
+                opacity: 0.95;
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }
@@ -2003,11 +2004,11 @@ export component GraphWindow inherits Window {
                 commands: root.sol-flat-path;
                 visible: root.show-sol;
                 stroke: DesignTokens.graph-sol;
-                // Idle/no-change model intervals are deliberately quiet so
-                // the changing segments remain the visual focus.
-                stroke-width: 1px;
+                // Exact flat observations use the same evidence style as
+                // exact increases. Only missing intervals are dashed.
+                stroke-width: 3px;
                 fill: transparent;
-                opacity: 0.5;
+                opacity: 0.95;
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }
