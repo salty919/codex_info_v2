@@ -334,6 +334,26 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(paths=paths), self.assertRaises(ScopeError):
                 selection_for_paths(paths, quality_profile="recorder-gap")
 
+    def test_linux_update_handoff_profile_is_bounded_to_docs_classifier_and_bundle(self) -> None:
+        result = selection_for_paths(
+            [
+                "docs/PRODUCT_REQUIREMENTS.md",
+                "docs/REQUIREMENTS_LEDGER.md",
+                "scripts/ci_change_scope.py",
+                "scripts/quality_plan.py",
+                "scripts/pre_pr_gate.sh",
+                "scripts/test_ci_change_scope.py",
+                "scripts/test_quality_plan.py",
+                "packaging/install_linux_bundle.sh",
+                "scripts/test_linux_bundle.sh",
+            ],
+            quality_profile="linux-update-handoff",
+        )
+        self.assertEqual(result.owners, ("DOCS", "LINUX_BACKEND"))
+        self.assertTrue(result.binary_impact)
+        self.assertFalse(result.distribution_required)
+        self.assertEqual(result.quality_profile, "linux-update-handoff")
+
     def test_release_candidate_linux_selection_adds_windows_without_unchanged_csharp(self) -> None:
         result = selection_for_paths(
             ["src/server.rs"], release_candidate=True

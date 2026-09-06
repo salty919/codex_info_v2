@@ -89,6 +89,7 @@ MODEL_HISTORY_PROFILE = "model-history"
 APP_SERVER_ISOLATION_PROFILE = "app-server-isolation"
 RECORDER_GAP_PROFILE = "recorder-gap"
 RESIDENT_PUBLICATION_PROFILE = "resident-publication"
+LINUX_UPDATE_HANDOFF_PROFILE = "linux-update-handoff"
 WORKFLOW_SELECTION_PROFILE = "workflow-selection"
 HISTORY_GRAPH_PATHS = frozenset(
     {
@@ -189,12 +190,26 @@ RECORDER_GAP_PATHS = frozenset(
         "src/main.rs",
     }
 )
+LINUX_UPDATE_HANDOFF_PATHS = frozenset(
+    {
+        "docs/PRODUCT_REQUIREMENTS.md",
+        "docs/REQUIREMENTS_LEDGER.md",
+        "scripts/ci_change_scope.py",
+        "scripts/quality_plan.py",
+        "scripts/pre_pr_gate.sh",
+        "scripts/test_ci_change_scope.py",
+        "scripts/test_quality_plan.py",
+        "packaging/install_linux_bundle.sh",
+        "scripts/test_linux_bundle.sh",
+    }
+)
 PROFILE_PATHS = {
     HISTORY_GRAPH_PROFILE: HISTORY_GRAPH_PATHS,
     MODEL_HISTORY_PROFILE: MODEL_HISTORY_PATHS,
     APP_SERVER_ISOLATION_PROFILE: APP_SERVER_ISOLATION_PATHS,
     RECORDER_GAP_PROFILE: RECORDER_GAP_PATHS,
     RESIDENT_PUBLICATION_PROFILE: RESIDENT_PUBLICATION_PATHS,
+    LINUX_UPDATE_HANDOFF_PROFILE: LINUX_UPDATE_HANDOFF_PATHS,
     WORKFLOW_SELECTION_PROFILE: WORKFLOW_SELECTION_PATHS,
 }
 PROFILE_LINE_RE = re.compile(r"^Quality-Profile:[ \t]*([a-z0-9]+(?:-[a-z0-9]+)*)[ \t]*$")
@@ -378,6 +393,8 @@ def _resolve_quality_profile(
         raise ScopeError("recorder-gap profile has no product path")
     if quality_profile == RESIDENT_PUBLICATION_PROFILE and not product_change:
         raise ScopeError("resident-publication profile has no product path")
+    if quality_profile == LINUX_UPDATE_HANDOFF_PROFILE and not product_change:
+        raise ScopeError("linux-update-handoff profile has no product path")
     if quality_profile == WORKFLOW_SELECTION_PROFILE and product_change:
         raise ScopeError("workflow-selection profile cannot own product code")
     outside = sorted(set(paths) - expected_paths)
@@ -414,6 +431,7 @@ def selection_for_paths(
         APP_SERVER_ISOLATION_PROFILE,
         RECORDER_GAP_PROFILE,
         RESIDENT_PUBLICATION_PROFILE,
+        LINUX_UPDATE_HANDOFF_PROFILE,
     }:
         # These finite profiles own backend behavior in the shared binary
         # entry point. They must not select unchanged X UI or Windows paths.

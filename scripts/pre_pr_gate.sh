@@ -145,6 +145,9 @@ for check in "${checks[@]}"; do
         rust-recorder-gap)
             bash scripts/regression_guard.sh --recorder-gap
             ;;
+        linux-bundle-emergency-handoff)
+            bash scripts/test_linux_bundle.sh --emergency-handoff
+            ;;
         linux-ui-history-graph)
             cargo build --release --locked
             xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \

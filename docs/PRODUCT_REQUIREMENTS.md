@@ -48,6 +48,7 @@ U128-30
 U128-33
 U128-35
 U128-36
+U128-37
 -->
 
 # Codex Info 製品要件
@@ -250,6 +251,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 - Linux bundleの互換性は、bundle manifestに記録した実測`glibc_minimum`（glibc minimum）を満たすことだけを表明する。manifestのtargetまたは実測minimumが欠落・不一致なら候補を公開・導入せず、他のdistribution、architecture、署名済み、publisher検証済みの対応を表明しない。
 - Linux bundle archiveはbyte-identicalなruntime launcher `run.sh`、`codex_info`、`codex-info.service`、永続化する`install.sh`、`codex-info-update.service`、`codex-info-update.timer`、license/noticeを含み、version/target情報と対応するchecksum/manifestを同じcandidate identityへ結び付ける。導入時は`run.sh`を`$HOME/.local/bin/codex-info`、`install.sh`を`$HOME/.local/libexec/codex-info-install.sh`からcurrent generationへ参照させる。顧客の通常導線はRelease assetのdownload、checksum検証、extract、bundle内scriptによるinstall、installed launcher、自動更新、source-bound health、removeだけで完結し、repository clone、Cargo build、source treeの`run.sh`を要求しない。
 - Linux bundleのinstall、update、reinstall、removeまたはその失敗は、導入binary、永続installer、履歴DB、verified backup、`history/usage_reset_hint.json`、Codex session JSONL、設定を削除しない。removeはdaemon/updateのuser service/unitだけを解除し、部分導入を成功と表示しない。
+- `U128-37`: emergency runtimeはstable A/B成功terminalではなく、記録を継続しながら次回更新を受けられる明示的な非成功`recovery`状態とする。handoff authorityはexact owner、emergency executableのowner-only `0700`または配布互換`0755`、regularかつnon-symlinkのdrop-in bytes/hash、canonical `~/.local/share/codex-info/emergency/<binary-sha256>/codex_info` pathのsize/hash、effective systemd unitの`ExecStart`/`DropInPaths`/`MainPID`、listener/processのdevice+inode+starttime、profile lockとrecorderのnonce/identity/fresh heartbeat+commitを全て確認する。candidate切替前にdrop-in・binary・systemd/process identityの検証結果を`operation_id`へ結合したowner-only snapshotとして保持し、recorder identity/freshnessは切替前と起動後にliveで確認し、stable manifest/current/Release authorityにはしない。成功はold generationを起動せずcandidateのhealth/details/listener/recorderを確認した場合だけとし、失敗はbyte-identical emergencyを復元してfresh recorderを確認した後も非成功recoveryのまま次回更新を受理する。candidate/handoffの全失敗ではDB/log/sessionをmutationせず、復元不能時はsnapshotとjournalを保持して`SAFE_BLOCKED`とする。stop=20s、readiness=30s、rollback=60sの既存上限内に収め、recording停止は切替に必要な1回だけとし、同callback retry/worker/pollを追加せず、transaction v1は`schema`、`operation_id`、`owner_pid`、`owner_starttime`、`boot_id`、`phase`、`old_generation`、`new_generation`、`desired_state`、`updated_at_unix`のexact 10 keysを維持する。
 - release artifactはsource、lockfile、実payload、license/notice、署名、version、対象platformを一つのrelease identityで追跡する。
 - publisher名、certificate、対応OS build、RPO/RTO、accessibility適合、support窓口を根拠なしに推測しない。
 - authority inputがないclaimは「保証なし」「未対応」とし、認証済み、対応済み、測定済みと表示しない。

@@ -170,6 +170,28 @@ class QualityPlanFixtures(unittest.TestCase):
         )
         self.assertEqual(plan.quality_profile, "recorder-gap")
 
+    def test_linux_update_handoff_uses_exactly_authority_and_emergency_check(self) -> None:
+        plan = plan_for_paths(
+            (
+                "docs/PRODUCT_REQUIREMENTS.md",
+                "docs/REQUIREMENTS_LEDGER.md",
+                "scripts/ci_change_scope.py",
+                "scripts/quality_plan.py",
+                "scripts/pre_pr_gate.sh",
+                "scripts/test_ci_change_scope.py",
+                "scripts/test_quality_plan.py",
+                "packaging/install_linux_bundle.sh",
+                "scripts/test_linux_bundle.sh",
+            ),
+            quality_profile="linux-update-handoff",
+        )
+        self.assertEqual(plan.affected_owners, ("DOCS", "LINUX_BACKEND"))
+        self.assertEqual(
+            plan.checks,
+            ("requirements-authority", "linux-bundle-emergency-handoff"),
+        )
+        self.assertEqual(plan.quality_profile, "linux-update-handoff")
+
     def test_windows_owner(self) -> None:
         plan = plan_for_paths(
             (

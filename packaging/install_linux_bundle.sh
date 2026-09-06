@@ -56,10 +56,22 @@ manifest_destination="$share_dir/manifest.json"
 unit_destination="$unit_dir/codex-info.service"
 update_service_destination="$unit_dir/codex-info-update.service"
 update_timer_destination="$unit_dir/codex-info-update.timer"
+recovery_dropin_dir="$unit_dir/codex-info.service.d"
+recovery_dropin="$recovery_dropin_dir/90-issue-156-recovery.conf"
 current_link="$share_dir/current"
 transaction="$share_dir/install-transaction.json"
 control_state="$share_dir/control-state.json"
 install_lock="$share_dir/.install.lock"
+emergency_root="$share_dir/emergency"
+emergency_backup=
+emergency_pending=0
+emergency_binary=
+emergency_digest=
+emergency_size=
+emergency_pid=
+emergency_process_starttime=
+emergency_dropin_digest=
+emergency_dropin_size=
 proc_root="$(printenv CODEX_INFO_PROC_ROOT || printf '/proc')"
 
 usage() {
@@ -564,6 +576,15 @@ transaction_startup_authorized() {
     [[ "$current" == "$expected" ]] || return 1
     verify_generation_files "$generations_dir/$expected" >/dev/null 2>&1 || return 1
     verify_fixed_links_local || return 1
+}
+transaction_emergency_pending() {
+    case "$journal_phase" in
+        rollback_switched|current_switched|activation_requested|candidate_verified) ;;
+        *) return 1 ;;
+    esac
+    [[ -e "$recovery_dropin" || -L "$recovery_dropin" ||
+       -d "$backup_dir/$journal_operation_id-emergency-handoff" ]] || return 1
+    return 0
 }
 
 current_generation() {
@@ -1350,6 +1371,424 @@ if state["cycle_seq"] is not None and (isinstance(state["cycle_seq"], bool) or n
 if state["last_commit_unix"] is not None and (isinstance(state["last_commit_unix"], bool) or not isinstance(state["last_commit_unix"], int) or state["last_commit_unix"] <= 0): raise SystemExit("recorder commit is invalid")
 PY
 }
+systemd_show_value() {
+    local property="$1" value
+    value="$(systemctl_user show "--property=$property" --value codex-info.service 2>/dev/null)" || return 1
+    printf '%s\n' "$value"
+}
+parse_emergency_dropin() {
+    python3 - "$recovery_dropin" "$emergency_root" <<'PY'
+import pathlib, shlex, sys
+path, root = map(pathlib.Path, sys.argv[1:])
+try:
+    text = path.read_text(encoding="utf-8")
+except Exception as error:
+    raise SystemExit(str(error))
+directives = []
+for raw in text.splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#") or line == "[Service]":
+        continue
+    if line in {"ExecStartPre=", "ExecCondition=", "ExecStart="} or line.startswith("ExecStart="):
+        directives.append(line)
+        continue
+    if not line.startswith("ExecStart="):
+        raise SystemExit("recovery drop-in contains an unexpected directive")
+if len(directives) != 4 or directives[:3] != ["ExecStartPre=", "ExecCondition=", "ExecStart="] or not directives[3][len("ExecStart="):]:
+    raise SystemExit("recovery drop-in directives are not exact")
+commands = [directives[3][len("ExecStart="):]]
+try:
+    argv = shlex.split(commands[0], posix=True)
+except ValueError as error:
+    raise SystemExit(str(error))
+if len(argv) != 3 or argv[1:] != ["--port", "8787"]:
+    raise SystemExit("recovery ExecStart arguments are not exact")
+binary = pathlib.Path(argv[0])
+if binary.parent.parent != root or len(binary.parent.name) != 64 or any(c not in "0123456789abcdef" for c in binary.parent.name) or binary.name != "codex_info":
+    raise SystemExit("recovery executable path is not canonical")
+print(binary)
+PY
+}
+copy_regular_atomic() {
+    local source="$1" destination="$2" mode="$3"
+    python3 - "$source" "$destination" "$mode" <<'PY'
+import os, pathlib, sys, tempfile
+source, destination, mode = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+data = source.read_bytes()
+destination.parent.mkdir(parents=True, exist_ok=True)
+fd, temporary = tempfile.mkstemp(prefix=".codex-info.", dir=destination.parent)
+try:
+    with os.fdopen(fd, "wb") as output:
+        output.write(data); output.flush(); os.fsync(output.fileno())
+    os.chmod(temporary, int(mode, 8)); os.replace(temporary, destination)
+    fd = os.open(destination.parent, os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+finally:
+    try: os.unlink(temporary)
+    except FileNotFoundError: pass
+PY
+}
+verify_emergency_profile() {
+    local pid="$1"
+    recorder_identity_check "$pid" 0.0.0 0000000000000000000000000000000000000000 0000000000000000000000000000000000000000000000000000000000000000 ||
+        safe_blocked 'emergency recorder identity is invalid'
+}
+verify_emergency_runtime() {
+    local allow_snapshot="${1:-0}" dropin_paths effective_exec pid listener resolved actual_stat expected_stat actual_hash emergency_mode
+    if [[ -e "$recovery_dropin" || -L "$recovery_dropin" ]]; then
+        [[ -f "$recovery_dropin" && ! -L "$recovery_dropin" ]] || safe_blocked 'recovery drop-in is not regular'
+        [[ "$(stat -c '%u' -- "$recovery_dropin" 2>/dev/null || true)" == "$(id -u)" &&
+           "$(stat -c '%a' -- "$recovery_dropin" 2>/dev/null || true)" == 644 ]] ||
+            safe_blocked 'recovery drop-in owner or mode is invalid'
+        emergency_binary="$(parse_emergency_dropin)" || safe_blocked 'recovery drop-in identity is invalid'
+        dropin_paths="$(systemd_show_value DropInPaths)" || safe_blocked 'effective recovery drop-in paths are unavailable'
+        python3 - "$dropin_paths" "$recovery_dropin" <<'PY'
+import sys
+paths = sys.argv[1].split()
+if paths != [sys.argv[2]]:
+    raise SystemExit("effective recovery drop-in paths are not exact")
+PY
+        effective_exec="$(systemd_show_value ExecStart)" || safe_blocked 'effective recovery ExecStart is unavailable'
+        python3 - "$effective_exec" "$emergency_binary" <<'PY'
+import re, shlex, sys
+raw, binary = sys.argv[1:]
+commands = re.findall(r"argv\[\]=([^;}]+)", raw)
+if not commands: commands = [raw.strip(" {}")]
+try: parsed = [shlex.split(command.strip()) for command in commands]
+except ValueError as error: raise SystemExit(str(error))
+if parsed != [[binary, "--port", "8787"]]:
+    raise SystemExit("effective recovery ExecStart is not exact")
+PY
+    elif [[ "$allow_snapshot" == 1 ]]; then
+        load_emergency_snapshot
+    else
+        safe_blocked 'recovery drop-in is absent'
+    fi
+    [[ -f "$emergency_binary" && ! -L "$emergency_binary" ]] || safe_blocked 'emergency executable is not regular'
+    emergency_mode="$(stat -c '%a' -- "$emergency_binary" 2>/dev/null || true)"
+    [[ "$(stat -c '%u' -- "$emergency_binary" 2>/dev/null || true)" == "$(id -u)" &&
+       ( "$emergency_mode" == 700 || "$emergency_mode" == 755 ) ]] ||
+        safe_blocked 'emergency executable owner or mode is invalid'
+    [[ "$(readlink -f -- "$emergency_binary" 2>/dev/null || true)" == "$emergency_binary" ]] || safe_blocked 'emergency executable is not canonical'
+    [[ "$(basename -- "$(dirname -- "$emergency_binary")")" =~ ^[0-9a-f]{64}$ &&
+       "$(dirname -- "$(dirname -- "$emergency_binary")")" == "$emergency_root" ]] || safe_blocked 'emergency executable directory identity is invalid'
+    emergency_digest="$(sha256sum -- "$emergency_binary" 2>/dev/null | awk '{print $1}' || true)"
+    [[ "$emergency_digest" == "$(basename -- "$(dirname -- "$emergency_binary")")" ]] || safe_blocked 'emergency executable digest differs from directory'
+    emergency_size="$(stat -c '%s' -- "$emergency_binary" 2>/dev/null || true)"
+    [[ "$emergency_size" =~ ^[1-9][0-9]*$ ]] || safe_blocked 'emergency executable size is invalid'
+    probe_active codex-info.service || safe_blocked 'emergency service is inactive'
+    pid="$(systemd_pid)"; [[ "$pid" =~ ^[1-9][0-9]*$ ]] || safe_blocked 'emergency service MainPID is invalid'
+    listener="$(socket_pid)" || safe_blocked 'emergency listener ownership is ambiguous'
+    [[ "$listener" == "$pid" ]] || safe_blocked 'emergency listener is not owned by MainPID'
+    resolved="$(readlink -f -- "$proc_root/$pid/exe" 2>/dev/null || true)"
+    [[ "$resolved" == "$emergency_binary" ]] || safe_blocked 'emergency MainPID executable differs'
+    expected_stat="$(stat -Lc '%d:%i' -- "$emergency_binary" 2>/dev/null || true)"
+    actual_stat="$(stat -Lc '%d:%i' -- "$proc_root/$pid/exe" 2>/dev/null || true)"
+    [[ -n "$expected_stat" && "$actual_stat" == "$expected_stat" ]] || safe_blocked 'emergency MainPID executable identity differs'
+    actual_hash="$(sha256sum -- "$proc_root/$pid/exe" 2>/dev/null | awk '{print $1}' || true)"
+    [[ "$actual_hash" == "$emergency_digest" ]] || safe_blocked 'emergency MainPID executable digest differs'
+    [[ "$(stat -Lc '%s' -- "$proc_root/$pid/exe" 2>/dev/null || true)" == "$emergency_size" ]] || safe_blocked 'emergency MainPID executable size differs'
+    emergency_pid="$pid"
+    emergency_listener_pid="$listener"
+    emergency_process_stat="$actual_stat"
+    emergency_process_starttime="$(proc_starttime "$pid" 2>/dev/null || true)"
+    [[ "$emergency_process_starttime" =~ ^[1-9][0-9]*$ ]] || safe_blocked 'emergency MainPID starttime is invalid'
+    verify_emergency_profile "$pid"
+}
+load_emergency_snapshot() {
+    local identity
+    [[ -n "$emergency_backup" ]] || safe_blocked 'emergency snapshot path is unavailable'
+    [[ -d "$emergency_backup" && ! -L "$emergency_backup" ]] || safe_blocked 'emergency snapshot directory is unavailable'
+    [[ "$(stat -c '%u' -- "$emergency_backup" 2>/dev/null || true)" == "$(id -u)" &&
+       "$(stat -c '%a' -- "$emergency_backup" 2>/dev/null || true)" == 700 ]] ||
+        safe_blocked 'emergency snapshot owner or mode is invalid'
+    [[ -f "$emergency_backup/drop-in.conf" && ! -L "$emergency_backup/drop-in.conf" &&
+       -f "$emergency_backup/identity.json" && ! -L "$emergency_backup/identity.json" ]] ||
+        safe_blocked 'emergency snapshot members are unavailable'
+    [[ "$(stat -c '%u' -- "$emergency_backup/drop-in.conf" 2>/dev/null || true)" == "$(id -u)" &&
+       "$(stat -c '%a' -- "$emergency_backup/drop-in.conf" 2>/dev/null || true)" == 600 &&
+       "$(stat -c '%u' -- "$emergency_backup/identity.json" 2>/dev/null || true)" == "$(id -u)" &&
+       "$(stat -c '%a' -- "$emergency_backup/identity.json" 2>/dev/null || true)" == 600 ]] ||
+        safe_blocked 'emergency snapshot member owner or mode is invalid'
+    identity="$(python3 - "$emergency_backup/identity.json" "$operation_id" "$candidate_id" <<'PY'
+import json, pathlib, re, sys
+path, operation, candidate = sys.argv[1:]
+def pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result: raise ValueError("duplicate snapshot key")
+        result[key] = value
+    return result
+try:
+    value = json.loads(pathlib.Path(path).read_text(encoding="utf-8"), object_pairs_hook=pairs)
+except Exception as error:
+    raise SystemExit(str(error))
+required = {"schema","operation_id","candidate_id","dropin_sha256","dropin_size","dropin_mode","dropin_paths","exec_start","emergency_binary","emergency_sha256","emergency_size","main_pid","listener_pid","process_stat","process_starttime"}
+if not isinstance(value, dict) or set(value) != required or value["schema"] != "codex-info-emergency-handoff-v1":
+    raise SystemExit("snapshot identity schema is invalid")
+if value["operation_id"] != operation or value["candidate_id"] != candidate:
+    raise SystemExit("snapshot operation identity differs")
+if not isinstance(value["dropin_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["dropin_sha256"]):
+    raise SystemExit("snapshot drop-in digest is invalid")
+if type(value["dropin_size"]) is not int or value["dropin_size"] <= 0 or value["dropin_mode"] != 0o644:
+    raise SystemExit("snapshot drop-in identity is invalid")
+if not isinstance(value["dropin_paths"], str) or not isinstance(value["exec_start"], str):
+    raise SystemExit("snapshot systemd identity is invalid")
+if (not isinstance(value["emergency_binary"], str) or
+        not re.fullmatch(r".*/emergency/[0-9a-f]{64}/codex_info", value["emergency_binary"]) or
+        not isinstance(value["emergency_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["emergency_sha256"]) or
+        type(value["emergency_size"]) is not int or value["emergency_size"] <= 0 or
+        type(value["main_pid"]) is not int or value["main_pid"] <= 0 or
+        type(value["listener_pid"]) is not int or value["listener_pid"] <= 0 or
+        type(value["process_starttime"]) is not int or value["process_starttime"] <= 0 or
+        not isinstance(value["process_stat"], str) or not re.fullmatch(r"[0-9]+:[0-9]+", value["process_stat"])):
+    raise SystemExit("snapshot executable identity is invalid")
+print(value["emergency_binary"], value["emergency_sha256"], value["emergency_size"], value["main_pid"], value["listener_pid"], value["process_stat"], value["process_starttime"], value["dropin_sha256"], value["dropin_size"], sep="\x1f")
+PY
+    )" || safe_blocked 'emergency snapshot identity is invalid'
+    IFS=$'\x1f' read -r emergency_binary emergency_digest emergency_size emergency_pid emergency_listener_pid emergency_process_stat emergency_process_starttime emergency_dropin_digest emergency_dropin_size <<<"$identity"
+    [[ "$(sha256sum -- "$emergency_backup/drop-in.conf" 2>/dev/null | awk '{print $1}' || true)" == "$emergency_dropin_digest" &&
+       "$(stat -c '%s' -- "$emergency_backup/drop-in.conf" 2>/dev/null || true)" == "$emergency_dropin_size" ]] ||
+        safe_blocked 'emergency snapshot drop-in bytes differ from identity'
+}
+snapshot_emergency_handoff() {
+    local dropin_paths effective_exec dropin_size dropin_mode dropin_sha identity_path
+    [[ "$operation_id" =~ ^[A-Za-z0-9._-]+$ ]] || safe_blocked 'emergency operation_id is not path-safe'
+    emergency_backup="$backup_dir/$operation_id-emergency-handoff"
+    dropin_paths="$(systemd_show_value DropInPaths)" || safe_blocked 'effective recovery drop-in paths are unavailable for snapshot'
+    effective_exec="$(systemd_show_value ExecStart)" || safe_blocked 'effective recovery ExecStart is unavailable for snapshot'
+    dropin_size="$(stat -c '%s' -- "$recovery_dropin")"
+    dropin_mode="$(stat -c '%a' -- "$recovery_dropin")"
+    dropin_sha="$(sha256sum -- "$recovery_dropin" | awk '{print $1}')"
+    mkdir -p -- "$backup_dir"; chmod 700 -- "$backup_dir"
+    if [[ -e "$emergency_backup" || -L "$emergency_backup" ]]; then
+        load_emergency_snapshot
+        cmp -- "$recovery_dropin" "$emergency_backup/drop-in.conf" >/dev/null || safe_blocked 'emergency drop-in changed since snapshot'
+        return 0
+    fi
+    mkdir -- "$emergency_backup"; chmod 700 -- "$emergency_backup"
+    copy_regular_atomic "$recovery_dropin" "$emergency_backup/drop-in.conf" 600
+    identity_path="$emergency_backup/identity.json"
+    python3 - "$identity_path" "$operation_id" "$candidate_id" "$dropin_sha" "$dropin_size" "$dropin_mode" "$dropin_paths" "$effective_exec" "$emergency_binary" "$emergency_digest" "$emergency_size" "$emergency_pid" "$emergency_listener_pid" "$emergency_process_stat" "$emergency_process_starttime" <<'PY'
+import json, os, pathlib, sys
+(destination, operation, candidate, dropin_sha, dropin_size, dropin_mode, dropin_paths,
+ exec_start, binary, binary_sha, binary_size, pid, listener_pid, process_stat, process_starttime) = sys.argv[1:]
+document = {
+    "schema": "codex-info-emergency-handoff-v1", "operation_id": operation,
+    "candidate_id": candidate, "dropin_sha256": dropin_sha, "dropin_size": int(dropin_size),
+    "dropin_mode": int(dropin_mode, 8), "dropin_paths": dropin_paths, "exec_start": exec_start,
+    "emergency_binary": binary, "emergency_sha256": binary_sha, "emergency_size": int(binary_size),
+    "main_pid": int(pid), "listener_pid": int(listener_pid), "process_stat": process_stat,
+    "process_starttime": int(process_starttime),
+}
+path = pathlib.Path(destination)
+fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+try:
+    data = (json.dumps(document, separators=(",", ":")) + "\n").encode()
+    os.write(fd, data); os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+    chmod 600 -- "$identity_path"
+    python3 - "$emergency_backup" "$backup_dir" <<'PY'
+import os, sys
+for name in sys.argv[1:]:
+    fd = os.open(name, os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+PY
+    cmp -- "$recovery_dropin" "$emergency_backup/drop-in.conf" >/dev/null || safe_blocked 'emergency drop-in snapshot is not byte-identical'
+}
+restore_emergency_dropin() {
+    [[ -n "$emergency_backup" ]] || safe_blocked 'emergency snapshot is unavailable for restore'
+    load_emergency_snapshot
+    if [[ -e "$recovery_dropin" || -L "$recovery_dropin" ]]; then
+        [[ -f "$recovery_dropin" && ! -L "$recovery_dropin" ]] || safe_blocked 'cannot overwrite foreign recovery drop-in'
+        cmp -- "$recovery_dropin" "$emergency_backup/drop-in.conf" >/dev/null || safe_blocked 'recovery drop-in is not byte-identical before restore'
+    else
+        mkdir -p -- "$recovery_dropin_dir"
+    fi
+    copy_regular_atomic "$emergency_backup/drop-in.conf" "$recovery_dropin" 644
+    cmp -- "$recovery_dropin" "$emergency_backup/drop-in.conf" >/dev/null || safe_blocked 'recovery drop-in restore is not byte-identical'
+}
+remove_emergency_dropin() {
+    [[ -f "$recovery_dropin" && ! -L "$recovery_dropin" ]] || safe_blocked 'recovery drop-in changed before removal'
+    cmp -- "$recovery_dropin" "$emergency_backup/drop-in.conf" >/dev/null || safe_blocked 'recovery drop-in changed before removal'
+    atomic_unlink "$recovery_dropin"
+}
+wait_emergency_runtime_ready() {
+    local now deadline
+    now="$(now_unix)" || return 1
+    deadline=$((now + HEALTH_TIMEOUT))
+    if (( operation_deadline > 0 && operation_deadline < deadline )); then deadline=$operation_deadline; fi
+    while :; do
+        if (probe_active codex-info.service && verify_emergency_runtime >/dev/null 2>&1); then return 0; fi
+        now="$(now_unix)" || return 1
+        (( now < deadline )) || return 1
+        sleep_interval 1
+    done
+}
+remove_emergency_snapshot() {
+    [[ -n "$emergency_backup" ]] || return 0
+    [[ -d "$emergency_backup" && ! -L "$emergency_backup" ]] || safe_blocked 'emergency snapshot cleanup target is invalid'
+    rm -r -- "$emergency_backup"
+    python3 - "$backup_dir" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_DIRECTORY)
+try: os.fsync(fd)
+finally: os.close(fd)
+PY
+}
+
+emergency_handoff_rollback() {
+    local reason="$1" ok=1 saved_deadline="$operation_deadline" rollback_now rollback_deadline
+    local snapshot_pid snapshot_starttime restored_current restored_pid restored_starttime
+    rollback_now="$(now_unix)" || safe_blocked 'emergency rollback clock is unavailable'
+    rollback_deadline=$((rollback_now + ROLLBACK_TIMEOUT))
+    if (( saved_deadline > 0 && saved_deadline < rollback_deadline )); then rollback_deadline=$saved_deadline; fi
+    operation_deadline=$rollback_deadline
+    load_emergency_snapshot
+    snapshot_pid="$emergency_pid"
+    snapshot_starttime="$emergency_process_starttime"
+    if probe_active codex-info.service; then
+        handoff_runtime_known || safe_blocked 'emergency rollback found an unknown active runtime'
+        systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 || ok=0
+        wait_inactive codex-info.service || ok=0
+    fi
+    [[ -z "$(socket_pid 2>/dev/null || true)" ]] || ok=0
+    if [[ -n "$previous_id" ]]; then
+        atomic_symlink "generations/$previous_id" "$current_link" || ok=0
+    else
+        atomic_unlink "$current_link" || ok=0
+    fi
+    if (( ok )); then
+        write_journal rollback_switched "$reason" || ok=0
+        restore_emergency_dropin || ok=0
+        systemctl_user daemon-reload >/dev/null 2>&1 || ok=0
+        systemctl_user start --no-block codex-info.service >/dev/null 2>&1 || ok=0
+        wait_emergency_runtime_ready || ok=0
+        restored_current="$(current_generation 2>/dev/null || true)"
+        restored_pid="$(systemd_pid 2>/dev/null || true)"
+        restored_starttime="$(proc_starttime "$restored_pid" 2>/dev/null || true)"
+        [[ "$restored_current" == "$previous_id" ]] || ok=0
+        [[ "$restored_pid" =~ ^[1-9][0-9]*$ && "$restored_starttime" =~ ^[1-9][0-9]*$ ]] || ok=0
+        [[ "$restored_pid" != "$snapshot_pid" || "$restored_starttime" != "$snapshot_starttime" ]] || ok=0
+    fi
+    operation_deadline=$saved_deadline
+    (( ok )) || safe_blocked 'emergency rollback could not restore a verified recovery runtime'
+}
+handoff_runtime_known() {
+    local pid listener resolved
+    probe_active codex-info.service || return 1
+    pid="$(systemd_pid)"; [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    listener="$(socket_pid)" || return 1
+    [[ "$listener" == "$pid" ]] || return 1
+    resolved="$(readlink -f -- "$proc_root/$pid/exe" 2>/dev/null || true)"
+    [[ "$resolved" == "$emergency_binary" || "$resolved" == "$generations_dir/$candidate_id/codex_info" ||
+       ( -n "$previous_id" && "$resolved" == "$generations_dir/$previous_id/codex_info" ) ]]
+}
+activate_emergency_candidate() {
+    local reason="$1" current_id
+    current_id="$(current_generation 2>/dev/null || true)"
+    if [[ "$current_id" != "$candidate_id" ]]; then
+        emergency_handoff_rollback "$reason: candidate is not current"
+        die "$reason: candidate is not current; emergency recovery remains active"
+    fi
+    verify_generation_files "$generations_dir/$candidate_id" || {
+        emergency_handoff_rollback "$reason: candidate artifacts changed"
+        die "$reason: candidate artifacts changed; emergency recovery remains active"
+    }
+    if [[ -e "$recovery_dropin" || -L "$recovery_dropin" ]]; then
+        remove_emergency_dropin || { emergency_handoff_rollback "$reason: drop-in removal failed"; die "$reason: drop-in removal failed; emergency recovery remains active"; }
+    fi
+    write_journal activation_requested emergency-handoff
+    systemctl_user daemon-reload >/dev/null 2>&1 || { emergency_handoff_rollback "$reason: daemon-reload failed"; die "$reason: daemon-reload failed; emergency recovery remains active"; }
+    reset_failed_main || { emergency_handoff_rollback "$reason: reset-failed failed"; die "$reason: reset-failed failed; emergency recovery remains active"; }
+    systemctl_user enable codex-info.service >/dev/null 2>&1 || { emergency_handoff_rollback "$reason: enable failed"; die "$reason: enable failed; emergency recovery remains active"; }
+    rearm_update_timer || { emergency_handoff_rollback "$reason: timer rearm failed"; die "$reason: timer rearm failed; emergency recovery remains active"; }
+    systemctl_user start --no-block codex-info.service >/dev/null 2>&1 || { emergency_handoff_rollback "$reason: start failed"; die "$reason: start failed; emergency recovery remains active"; }
+    if ! wait_runtime_ready; then
+        emergency_handoff_rollback "$reason: readiness failed"
+        die "$reason: readiness failed; emergency recovery remains active"
+    fi
+    current_id="$(current_generation 2>/dev/null || true)"
+    if [[ "$current_id" != "$candidate_id" ]]; then
+        emergency_handoff_rollback "$reason: current changed during readiness"
+        die "$reason: current changed during readiness; emergency recovery remains active"
+    fi
+    write_journal candidate_verified emergency-handoff
+    write_journal committed emergency-handoff
+    remove_emergency_snapshot
+}
+
+emergency_handoff() {
+    local phase="$journal_phase" current_id
+    [[ "$phase" == rollback_switched || "$phase" == current_switched || "$phase" == activation_requested || "$phase" == candidate_verified ]] ||
+        safe_blocked 'emergency transaction phase is unsupported'
+    journal_owner_stale || safe_blocked 'emergency transaction owner is still live'
+    operation_id="$journal_operation_id"; candidate_id="$journal_candidate_id"; previous_id="$journal_previous_id"
+    journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""
+    emergency_backup="$backup_dir/$operation_id-emergency-handoff"
+    if [[ "$phase" == candidate_verified ]]; then
+        current_id="$(current_generation 2>/dev/null || true)"
+        if [[ "$current_id" == "$candidate_id" ]] && verify_local_generation >/dev/null 2>&1 &&
+            (verify_runtime >/dev/null 2>&1); then
+            write_journal committed resumed-verified-emergency-candidate
+            [[ ! -e "$emergency_backup" && ! -L "$emergency_backup" ]] || remove_emergency_snapshot
+            return 0
+        fi
+        [[ -d "$emergency_backup" && ! -L "$emergency_backup" ]] ||
+            safe_blocked 'verified candidate failed after its recovery snapshot was lost'
+        load_emergency_snapshot
+        emergency_handoff_rollback 'verified candidate was no longer healthy'
+        die 'verified candidate was no longer healthy; emergency recovery remains active'
+    fi
+    if [[ "$phase" == current_switched || "$phase" == activation_requested ]]; then
+        current_id="$(current_generation 2>/dev/null || true)"
+        if [[ "$current_id" == "$candidate_id" ]] && verify_local_generation >/dev/null 2>&1 &&
+            (verify_runtime >/dev/null 2>&1); then
+            write_journal candidate_verified resumed-emergency-candidate
+            write_journal committed resumed-emergency-candidate
+            [[ ! -e "$emergency_backup" && ! -L "$emergency_backup" ]] || remove_emergency_snapshot
+            return 0
+        fi
+        verify_generation_files "$generations_dir/$candidate_id" || safe_blocked 'existing candidate artifacts are incoherent'
+        [[ -d "$emergency_backup" && ! -L "$emergency_backup" ]] || safe_blocked 'emergency snapshot is required for interrupted handoff'
+        load_emergency_snapshot
+        if [[ "$current_id" == "$candidate_id" && "$phase" == current_switched && -f "$recovery_dropin" && ! -L "$recovery_dropin" ]] &&
+            ! probe_active codex-info.service; then
+            cmp -- "$recovery_dropin" "$emergency_backup/drop-in.conf" >/dev/null || safe_blocked 'interrupted recovery drop-in changed'
+            activate_emergency_candidate 'interrupted current switch'
+            return 0
+        fi
+        if [[ "$current_id" == "$candidate_id" && "$phase" == activation_requested && ! -e "$recovery_dropin" && ! -L "$recovery_dropin" ]] &&
+            ! probe_active codex-info.service; then
+            activate_emergency_candidate 'interrupted activation request'
+            return 0
+        fi
+        emergency_handoff_rollback "interrupted $phase state was not an exact resumable candidate"
+        die "interrupted $phase state was rolled back; emergency recovery remains active"
+    fi
+    if ! (verify_emergency_runtime >/dev/null 2>&1); then
+        if [[ ! -d "$emergency_backup" || -L "$emergency_backup" ]]; then
+            verify_emergency_runtime
+            safe_blocked 'emergency recovery identity changed before snapshot'
+        fi
+        load_emergency_snapshot
+        emergency_handoff_rollback 'interrupted rollback recovery'
+    fi
+    verify_emergency_runtime
+    verify_generation_files "$generations_dir/$candidate_id" || safe_blocked 'existing candidate artifacts are incoherent'
+    snapshot_emergency_handoff
+    systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 || safe_blocked 'could not stop emergency service'
+    wait_inactive codex-info.service || safe_blocked 'emergency service did not stop within bounded time'
+    [[ -z "$(socket_pid 2>/dev/null || true)" ]] || safe_blocked 'emergency listener survived stop'
+    atomic_symlink "generations/$candidate_id" "$current_link" || safe_blocked 'could not switch current to existing candidate'
+    write_journal current_switched emergency-handoff
+    activate_emergency_candidate 'candidate activation'
+}
+
 proc_identity_check() {
     local pid="$1" expected_hash="$2" expected_exe="$3" resolved actual owner expected_stat actual_stat
     resolved="$(readlink -f -- "$proc_root/$pid/exe" 2>/dev/null || true)"
@@ -1379,7 +1818,7 @@ health_readback() {
     [[ -n "$before" && "$after" == "$before" ]] || safe_blocked 'MainPID/starttime changed during health'
     after_pid="$(systemd_pid)"
     [[ "$after_pid" == "$pid" ]] || safe_blocked 'systemd MainPID changed during health'
-    python3 - "$response" "$version" "$source" "$manifest_hash" <<'PY'
+    python3 - "$response" "$version" "$source" "$manifest_hash" <<'PY' || safe_blocked 'health identity is invalid'
 import json,sys
 def pairs(items):
     result={}
@@ -1415,8 +1854,8 @@ if document.get("state") not in {"ready","auth_required"}:
 observed_at=document.get("observed_at")
 if isinstance(observed_at,bool) or not isinstance(observed_at,int) or observed_at <= 0:
     raise SystemExit("details observed_at is invalid")
-' <<< "$details"
-    recorder_identity_check "$pid" "$version" "$source" "$manifest_hash"
+' <<< "$details" || safe_blocked 'details readiness is invalid'
+    recorder_identity_check "$pid" "$version" "$source" "$manifest_hash" || safe_blocked 'recorder identity is invalid'
     proc_identity_check "$pid" "$binary_hash" "$expected_exe"
 }
 verify_runtime() {
@@ -1434,7 +1873,7 @@ verify_runtime() {
     probe_active codex-info.service || safe_blocked 'managed service is inactive'
     pid="$(systemd_pid)"; [[ "$pid" != 0 ]] || safe_blocked 'managed service has no MainPID'
     before="$(proc_starttime "$pid" 2>/dev/null || true)"; [[ -n "$before" ]] || safe_blocked 'MainPID starttime unavailable'
-    health_readback "$pid" "$before" "$version" "$source" "$manifest_hash" "$binary_hash"
+    health_readback "$pid" "$before" "$version" "$source" "$manifest_hash" "$binary_hash" || return 1
     printf 'ready version=%s source=%s generation=%s pid=%s\n' "$version" "$source" "$generation" "$pid"
 }
 verify_ui_source() {
@@ -1782,9 +2221,15 @@ update_failure_with_fallback() {
 }
 run_update() {
     local start update_deadline releases selection info local_coherent=0 discovery_limit
-    [[ ! -f "$transaction" ]] || resume_transaction
+    if [[ -f "$transaction" ]] && (( ! emergency_pending )); then
+        resume_transaction
+    fi
     start="$(now_unix)" || safe_blocked 'update clock is unavailable'; [[ "$TRIGGER" == timer ]] && update_deadline=$((start+TIMER_TIMEOUT)) || update_deadline=$((start+MANUAL_TIMEOUT))
     require_user_manager; load_control_state
+    if (( emergency_pending )); then
+        emergency_handoff
+        return 0
+    fi
     local current_id current_manifest_path
     current_id="$(current_generation)" || safe_blocked 'installed current generation is not coherent'
     if [[ -n "$current_id" ]]; then
@@ -1998,7 +2443,11 @@ initialize_mutating_action
 if (( ! lock_bypassed )) && [[ -f "$transaction" ]]; then
     read_journal
     if [[ "$journal_phase" != committed ]]; then
-        resume_transaction
+        if transaction_emergency_pending; then
+            emergency_pending=1
+        else
+            resume_transaction
+        fi
     fi
 fi
 

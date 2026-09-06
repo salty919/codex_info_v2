@@ -47,6 +47,13 @@ RECORDER_GAP_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
     "DOCS": ("requirements-authority",),
     "LINUX_BACKEND": ("requirements-authority", "rust-recorder-gap"),
 }
+LINUX_UPDATE_HANDOFF_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
+    "DOCS": ("requirements-authority",),
+    "LINUX_BACKEND": (
+        "requirements-authority",
+        "linux-bundle-emergency-handoff",
+    ),
+}
 WORKFLOW_SELECTION_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
     "DOCS": ("requirements-authority",),
     "GOVERNANCE": ("requirements-authority", "governance-workflow-selection"),
@@ -59,6 +66,7 @@ ALL_CHECK_IDS = frozenset(
         MODEL_HISTORY_OWNER_CHECKS,
         APP_SERVER_ISOLATION_OWNER_CHECKS,
         RECORDER_GAP_OWNER_CHECKS,
+        LINUX_UPDATE_HANDOFF_OWNER_CHECKS,
         RESIDENT_PUBLICATION_OWNER_CHECKS,
         WORKFLOW_SELECTION_OWNER_CHECKS,
     )
@@ -143,6 +151,7 @@ def plan_for_paths(
         "model-history": MODEL_HISTORY_OWNER_CHECKS,
         "app-server-isolation": APP_SERVER_ISOLATION_OWNER_CHECKS,
         "recorder-gap": RECORDER_GAP_OWNER_CHECKS,
+        "linux-update-handoff": LINUX_UPDATE_HANDOFF_OWNER_CHECKS,
         "resident-publication": RESIDENT_PUBLICATION_OWNER_CHECKS,
         "workflow-selection": WORKFLOW_SELECTION_OWNER_CHECKS,
     }.get(selection.quality_profile, OWNER_CHECKS)

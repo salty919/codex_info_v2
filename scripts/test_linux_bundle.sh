@@ -8,6 +8,7 @@ ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_SCRIPT="$ROOT_DIR/scripts/build_linux_bundle.sh"
 ORIGINAL_PATH="$PATH"
 BUNDLE_DIR=''
+EMERGENCY_HANDOFF=0
 while (($# > 0)); do
     case "$1" in
         --bundle-dir)
@@ -16,8 +17,13 @@ while (($# > 0)); do
             BUNDLE_DIR="$2"
             shift 2
             ;;
+        --emergency-handoff)
+            [[ "$EMERGENCY_HANDOFF" == 0 ]] || { echo 'linux-bundle-test: --emergency-handoff supplied twice' >&2; exit 2; }
+            EMERGENCY_HANDOFF=1
+            shift
+            ;;
         -h|--help)
-            printf 'usage: test_linux_bundle.sh [--bundle-dir DIR]\n'
+            printf 'usage: test_linux_bundle.sh [--bundle-dir DIR] [--emergency-handoff]\n'
             exit 0
             ;;
         *)
@@ -160,6 +166,18 @@ cat > "$fake_bin/systemctl" <<'FAKE_SYSTEMCTL'
 set -euo pipefail
 printf 'systemctl %s\n' "$*" >> "$FAKE_LOG"
 [[ "${1-}" == --user ]] && shift
+state_value() {
+    [[ -n "${FAKE_SYSTEMD_STATE:-}" && -f "$FAKE_SYSTEMD_STATE" ]] || return 0
+    awk -F= -v key="$1" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$FAKE_SYSTEMD_STATE"
+}
+state_set() {
+    [[ -n "${FAKE_SYSTEMD_STATE:-}" ]] || return 0
+    local key="$1" value="$2" temporary
+    temporary="$FAKE_SYSTEMD_STATE.tmp"
+    awk -F= -v key="$key" -v value="$value" '$1 == key {if (!seen++) print key "=" value; next} {print}' "$FAKE_SYSTEMD_STATE" 2>/dev/null > "$temporary" || true
+    if ! grep -Fq "$key=" "$temporary" 2>/dev/null; then printf '%s=%s\n' "$key" "$value" >> "$temporary"; fi
+    mv -- "$temporary" "$FAKE_SYSTEMD_STATE"
+}
 case "${1-}" in
     show-environment) exit 0 ;;
     is-enabled)
@@ -173,13 +191,24 @@ case "${1-}" in
     is-active)
         unit="${*: -1}"
         case "$unit" in
-            codex-info.service) [[ "${FAKE_MAIN_ACTIVE:-0}" == 1 ]] && exit 0 || exit 3 ;;
+            codex-info.service)
+                active="$(state_value main_active)"
+                [[ "${active:-${FAKE_MAIN_ACTIVE:-0}}" == 1 ]] && exit 0 || exit 3
+                ;;
             codex-info-update.timer) [[ "${FAKE_TIMER_ACTIVE:-0}" == 1 ]] && exit 0 || exit 3 ;;
             *) exit 3 ;;
         esac
         ;;
     show)
-        [[ "$*" == *MainPID* ]] && printf '%s\n' "${FAKE_MAIN_PID:-0}"
+        if [[ "$*" == *DropInPaths* ]]; then
+            value="$(state_value dropin_paths)"; printf '%s\n' "${value:-${FAKE_DROPIN_PATHS:-}}"
+        fi
+        if [[ "$*" == *ExecStart* ]]; then
+            value="$(state_value exec_start)"; printf '%s\n' "${value:-${FAKE_EXEC_START:-}}"
+        fi
+        if [[ "$*" == *MainPID* ]]; then
+            value="$(state_value main_pid)"; printf '%s\n' "${value:-${FAKE_MAIN_PID:-0}}"
+        fi
         exit 0
         ;;
     daemon-reload|enable|disable|start|stop|restart)
@@ -190,9 +219,20 @@ case "${1-}" in
             [[ -n "${FAKE_INSTALLER:-}" ]] || exit 1
             transaction="${FAKE_INSTALLER%/.local/libexec/codex-info-install.sh}/.local/share/codex-info/install-transaction.json"
             if [[ -f "$transaction" ]] && ! grep -Fq '"phase": "committed"' "$transaction"; then
-                env -u CODEX_INFO_PROC_ROOT bash "$FAKE_INSTALLER" --startup-reconcile >/dev/null
+                env -u CODEX_INFO_PROC_ROOT -u CODEX_INFO_INSTALL_LOCKED \
+                    bash "$FAKE_INSTALLER" --startup-reconcile 9<&- >/dev/null
             fi
-            env -u CODEX_INFO_PROC_ROOT bash "$FAKE_INSTALLER" --startup-condition >/dev/null
+            env -u CODEX_INFO_PROC_ROOT -u CODEX_INFO_INSTALL_LOCKED \
+                bash "$FAKE_INSTALLER" --startup-condition 9<&- >/dev/null
+        fi
+        if [[ "$unit" == codex-info.service && -n "${FAKE_SYSTEMD_STATE:-}" ]]; then
+            case "$1" in
+                stop) state_set main_active 0; [[ -n "${FAKE_SYSTEMD_HOOK:-}" ]] && "$FAKE_SYSTEMD_HOOK" stop ;;
+                start|restart)
+                    [[ -n "${FAKE_SYSTEMD_HOOK:-}" ]] && "$FAKE_SYSTEMD_HOOK" start
+                    state_set main_active 1
+                    ;;
+            esac
         fi
         exit 0
         ;;
@@ -393,17 +433,19 @@ run_update() {
 }
 
 boot_id_value="$(< /proc/sys/kernel/random/boot_id)"
-readonly_home="$TEST_ROOT/readonly-home"
-mkdir -p -- "$readonly_home"
-for readonly_action in --status --verify-runtime; do
-    HOME="$readonly_home" CODEX_HOME="$readonly_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
-        CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
-        bash "$ROOT_DIR/packaging/install_linux_bundle.sh" "$readonly_action" >/dev/null 2>&1 || true
-done
-[[ ! -e "$readonly_home/.local/share" && ! -e "$readonly_home/.local/bin" &&
-   ! -e "$readonly_home/.local/libexec" && ! -e "$readonly_home/.config" ]] ||
-    fail 'read-only status/verify created installation state'
-printf 'case read-only empty-home: PASS\n'
+if (( ! EMERGENCY_HANDOFF )); then
+    readonly_home="$TEST_ROOT/readonly-home"
+    mkdir -p -- "$readonly_home"
+    for readonly_action in --status --verify-runtime; do
+        HOME="$readonly_home" CODEX_HOME="$readonly_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+            CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+            bash "$ROOT_DIR/packaging/install_linux_bundle.sh" "$readonly_action" >/dev/null 2>&1 || true
+    done
+    [[ ! -e "$readonly_home/.local/share" && ! -e "$readonly_home/.local/bin" &&
+       ! -e "$readonly_home/.local/libexec" && ! -e "$readonly_home/.config" ]] ||
+        fail 'read-only status/verify created installation state'
+    printf 'case read-only empty-home: PASS\n'
+fi
 write_stopped_state() {
     local home="$1"
     mkdir -p -- "$home/.local/share/codex-info"
@@ -528,6 +570,278 @@ run_active_startup_condition_case() {
     exec {hold_fd}>&-
     rm -f -- "$ready_path" "$hold_pipe"
 }
+prepare_emergency_hook() {
+    local hook="$1"
+    cat > "$hook" <<'FAKE_EMERGENCY_HOOK'
+#!/usr/bin/env bash
+set -euo pipefail
+home="$FAKE_HOOK_HOME"
+proc_root="$FAKE_HOOK_PROC"
+state="$FAKE_SYSTEMD_STATE"
+dropin="$home/.config/systemd/user/codex-info.service.d/90-issue-156-recovery.conf"
+starts="$FAKE_HOOK_STARTS"
+count_file="$FAKE_HOOK_COUNT"
+state_value() {
+    [[ -f "$state" ]] || return 0
+    awk -F= -v key="$1" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$state"
+}
+state_set() {
+    local key="$1" value="$2" temporary="$state.tmp"
+    awk -F= -v key="$key" -v value="$value" '$1 == key {if (!seen++) print key "=" value; next} {print}' "$state" 2>/dev/null > "$temporary" || true
+    if ! grep -Fq "$key=" "$temporary" 2>/dev/null; then printf '%s=%s\n' "$key" "$value" >> "$temporary"; fi
+    mv -- "$temporary" "$state"
+}
+clear_proc() {
+    find "$proc_root" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -exec rm -r -- {} +
+    : > "$proc_root/net/tcp"
+}
+if [[ "$1" == stop ]]; then
+    clear_proc
+    state_set main_active 0
+    exit 0
+fi
+count=0
+[[ -f "$count_file" ]] && count="$(<"$count_file")"
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
+clear_proc
+if [[ -f "$dropin" ]]; then
+    mode=emergency
+    binary="$(awk -F= '$1 == "ExecStart" && $2 != "" {print $2; exit}' "$dropin" | awk '{print $1}')"
+    pid=$((7000 + count))
+    dropin_paths="$dropin"
+else
+    mode=candidate
+    binary="$(readlink -f -- "$home/.local/share/codex-info/current/codex_info")"
+    pid=$((8000 + count))
+    dropin_paths=
+    [[ "${FAKE_CANDIDATE_START_FAIL:-0}" != 1 ]] || exit 1
+fi
+starttime=$((10000 + pid))
+mkdir -p -- "$proc_root/$pid/fd"
+ln -s -- "$binary" "$proc_root/$pid/exe"
+ln -s -- "socket:[$((9000 + count))]" "$proc_root/$pid/fd/3"
+printf '%s (codex_info) %s\n' "$pid" "$(printf 'S 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 %s' "$starttime")" > "$proc_root/$pid/stat"
+printf '  sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n0: 0100007F:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 %s 1\n' "$((9000 + count))" > "$proc_root/net/tcp"
+mkdir -p -- "$home/.codex/history"
+python3 - "$home/.codex/history/usage_record_daemon.lock" "$home/.codex/history/recorder-state.json" "$binary" "$pid" "$starttime" <<'PY'
+import json, os, pathlib, stat, sys, time
+lock_name, state_name, executable, pid_text, start_text = sys.argv[1:]
+pid, start = int(pid_text), int(start_text)
+metadata = os.stat(executable)
+nonce = f"{pid:032x}"
+pathlib.Path(lock_name).write_text(json.dumps({
+    "pid": pid, "started_at": int(time.time()), "starttime_ticks": start,
+    "executable_device": metadata.st_dev, "executable_inode": metadata.st_ino,
+    "owner_nonce": nonce,
+}) + "\n", encoding="utf-8")
+pathlib.Path(lock_name).chmod(stat.S_IRUSR | stat.S_IWUSR)
+pathlib.Path(state_name).write_text(json.dumps({
+    "schema": "codex-info-recorder-state-v1", "pid": pid,
+    "process_starttime": start, "owner_nonce": nonce, "write_state": "ready",
+    "partition_id_hash": "ab" * 32, "data_generation": 1,
+    "collector_epoch": "cd" * 16, "cycle_seq": 1,
+    "last_commit_unix": int(time.time()), "updated_at_unix": int(time.time()),
+}) + "\n", encoding="utf-8")
+pathlib.Path(state_name).chmod(stat.S_IRUSR | stat.S_IWUSR)
+PY
+state_set main_pid "$pid"
+state_set main_active 1
+state_set dropin_paths "$dropin_paths"
+state_set exec_start "$binary --port 8787"
+printf '%s %s\n' "$mode" "$binary" >> "$starts"
+FAKE_EMERGENCY_HOOK
+    chmod 0755 "$hook"
+}
+prepare_emergency_fixture() {
+    local label="$1" old_home candidate_home old_id candidate_id emergency_source emergency_digest operation
+    find "$fake_proc" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -exec rm -r -- {} +
+    : > "$fake_proc/net/tcp"
+    EMERGENCY_HOME="$TEST_ROOT/emergency-$label"
+    candidate_home="$TEST_ROOT/emergency-candidate-$label"
+    mkdir -p -- "$EMERGENCY_HOME" "$candidate_home"
+    write_stopped_state "$EMERGENCY_HOME"
+    run_install "$EMERGENCY_OLD_ARCHIVE" "$EMERGENCY_HOME" >/dev/null
+    write_stopped_state "$candidate_home"
+    run_install "$EMERGENCY_CANDIDATE_ARCHIVE" "$candidate_home" >/dev/null
+    old_id="$(readlink -- "$EMERGENCY_HOME/.local/share/codex-info/current")"
+    candidate_id="$(readlink -- "$candidate_home/.local/share/codex-info/current")"
+    candidate_id="${candidate_id#generations/}"
+    cp -a -- "$candidate_home/.local/share/codex-info/generations/$candidate_id" \
+        "$EMERGENCY_HOME/.local/share/codex-info/generations/$candidate_id"
+    EMERGENCY_OLD_ID="${old_id#generations/}"
+    EMERGENCY_CANDIDATE_ID="${candidate_id#generations/}"
+    EMERGENCY_OPERATION_ID="emergency-$label"
+    emergency_source="$TEST_ROOT/emergency-source-$label"
+    printf 'emergency runtime %s\n' "$label" > "$emergency_source"
+    emergency_digest="$(sha256sum -- "$emergency_source" | awk '{print $1}')"
+    mkdir -p -- "$EMERGENCY_HOME/.local/share/codex-info/emergency/$emergency_digest"
+    cp -- "$emergency_source" "$EMERGENCY_HOME/.local/share/codex-info/emergency/$emergency_digest/codex_info"
+    chmod 0700 -- "$EMERGENCY_HOME/.local/share/codex-info/emergency/$emergency_digest/codex_info"
+    EMERGENCY_BINARY="$EMERGENCY_HOME/.local/share/codex-info/emergency/$emergency_digest/codex_info"
+    EMERGENCY_DROPIN="$EMERGENCY_HOME/.config/systemd/user/codex-info.service.d/90-issue-156-recovery.conf"
+    mkdir -p -- "$(dirname -- "$EMERGENCY_DROPIN")"
+    printf '[Service]\nExecStartPre=\nExecCondition=\nExecStart=\nExecStart=%s --port 8787\n' "$EMERGENCY_BINARY" > "$EMERGENCY_DROPIN"
+    chmod 0644 -- "$EMERGENCY_DROPIN"
+    EMERGENCY_STATE="$EMERGENCY_HOME/fake-systemd.state"
+    EMERGENCY_HOOK="$EMERGENCY_HOME/fake-emergency-hook"
+    EMERGENCY_STARTS="$EMERGENCY_HOME/start.log"
+    EMERGENCY_COUNT="$EMERGENCY_HOME/start.count"
+    : > "$EMERGENCY_STATE"
+    : > "$EMERGENCY_STARTS"
+    : > "$EMERGENCY_COUNT"
+    prepare_emergency_hook "$EMERGENCY_HOOK"
+    FAKE_HOOK_HOME="$EMERGENCY_HOME" FAKE_HOOK_PROC="$fake_proc" \
+        FAKE_SYSTEMD_STATE="$EMERGENCY_STATE" FAKE_HOOK_STARTS="$EMERGENCY_STARTS" \
+        FAKE_HOOK_COUNT="$EMERGENCY_COUNT" "$EMERGENCY_HOOK" start
+    operation="$EMERGENCY_OPERATION_ID"
+    python3 - "$EMERGENCY_HOME/.local/share/codex-info/install-transaction.json" \
+        "$EMERGENCY_OLD_ID" "$EMERGENCY_CANDIDATE_ID" "$operation" "$boot_id_value" <<'PY'
+import json, pathlib, sys
+path, old_id, candidate_id, operation, boot = sys.argv[1:]
+path = pathlib.Path(path)
+path.write_text(json.dumps({
+    "schema": "codex-info-install-transaction-v1", "operation_id": operation,
+    "owner_pid": 999999, "owner_starttime": 1, "boot_id": boot,
+    "phase": "rollback_switched", "old_generation": old_id,
+    "new_generation": candidate_id, "desired_state": "running",
+    "updated_at_unix": 1,
+}, indent=2) + "\n", encoding="utf-8")
+path.chmod(0o600)
+PY
+    write_running_state "$EMERGENCY_HOME"
+}
+run_emergency_update() {
+    local home="$1" shape="$2" interrupt="$3" start_fail="${4:-0}"
+    HOME="$home" CODEX_HOME="$home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        FAKE_STARTUP_CONDITION=1 FAKE_INSTALLER="$home/.local/libexec/codex-info-install.sh" \
+        FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" TMPDIR="$update_tmp" \
+        FAKE_SYSTEMD_STATE="$EMERGENCY_STATE" FAKE_SYSTEMD_HOOK="$EMERGENCY_HOOK" \
+        FAKE_HOOK_HOME="$home" FAKE_HOOK_PROC="$fake_proc" FAKE_HOOK_STARTS="$EMERGENCY_STARTS" \
+        FAKE_HOOK_COUNT="$EMERGENCY_COUNT" FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 \
+        FAKE_HEALTH_VERSION=1.0.33 FAKE_HEALTH_SHAPE="$shape" FAKE_CANDIDATE_START_FAIL="$start_fail" \
+        CODEX_INFO_INTERRUPT_PHASE="$interrupt" \
+        CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+        bash "$home/.local/libexec/codex-info-install.sh" --update
+}
+run_emergency_no_update() {
+    local home="$1"
+    HOME="$home" CODEX_HOME="$home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        FAKE_STARTUP_CONDITION=1 FAKE_INSTALLER="$home/.local/libexec/codex-info-install.sh" \
+        FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" TMPDIR="$update_tmp" \
+        FAKE_SYSTEMD_STATE="$EMERGENCY_STATE" FAKE_SYSTEMD_HOOK="$EMERGENCY_HOOK" \
+        FAKE_HOOK_HOME="$home" FAKE_HOOK_PROC="$fake_proc" FAKE_HOOK_STARTS="$EMERGENCY_STARTS" \
+        FAKE_HOOK_COUNT="$EMERGENCY_COUNT" FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 \
+        FAKE_HEALTH_VERSION=1.0.33 FAKE_HEALTH_SHAPE=exact CODEX_INFO_PROC_ROOT="$fake_proc" \
+        SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+        bash "$home/.local/libexec/codex-info-install.sh" --update
+}
+assert_emergency_phase() {
+    local expected="$1"
+    python3 - "$EMERGENCY_HOME/.local/share/codex-info/install-transaction.json" "$expected" <<'PY'
+import json, pathlib, sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert value["phase"] == sys.argv[2]
+assert set(value) == {"schema","operation_id","owner_pid","owner_starttime","boot_id","phase","old_generation","new_generation","desired_state","updated_at_unix"}
+PY
+}
+run_emergency_handoff_cases() {
+    EMERGENCY_OLD_ARCHIVE="$(build_bundle 3030303030303030303030303030303030303030 1.0.30)"
+    EMERGENCY_CANDIDATE_ARCHIVE="$(build_bundle 3333333333333333333333333333333333333333 1.0.33)"
+    prepare_emergency_fixture success
+    if ! run_emergency_update "$EMERGENCY_HOME" exact ''; then fail 'emergency success handoff failed'; fi
+    [[ "$(readlink -- "$EMERGENCY_HOME/.local/share/codex-info/current")" == "generations/$EMERGENCY_CANDIDATE_ID" ]] || fail 'success did not select candidate'
+    assert_emergency_phase committed
+    [[ ! -e "$EMERGENCY_DROPIN" && ! -e "$EMERGENCY_HOME/.local/share/codex-info/legacy-backups/$EMERGENCY_OPERATION_ID-emergency-handoff" ]] || fail 'success retained emergency override or snapshot'
+    ! grep -Fq "generations/$EMERGENCY_OLD_ID" "$EMERGENCY_STARTS" || fail 'success started old generation'
+    printf 'case emergency candidate success/old-never-started: PASS\n'
+
+    prepare_emergency_fixture readiness-fail
+    protected_db="$EMERGENCY_HOME/.codex/history/accounts/v1/test/epoch-1/usage_history.sqlite3"
+    protected_log="$EMERGENCY_HOME/.codex/log/codex-tui.log"
+    protected_session="$EMERGENCY_HOME/.codex/sessions/fixture.jsonl"
+    mkdir -p -- "$(dirname -- "$protected_db")" "$(dirname -- "$protected_log")" "$(dirname -- "$protected_session")"
+    printf 'protected db bytes\n' > "$protected_db"
+    printf 'protected log bytes\n' > "$protected_log"
+    printf '{"protected":"session"}\n' > "$protected_session"
+    protected_before="$(sha256sum -- "$protected_db" "$protected_log" "$protected_session")"
+    emergency_dropin_before="$TEST_ROOT/emergency-dropin-before"
+    cp -- "$EMERGENCY_DROPIN" "$emergency_dropin_before"
+    if run_emergency_update "$EMERGENCY_HOME" old ''; then fail 'candidate readiness failure unexpectedly succeeded'; fi
+    [[ "$(readlink -- "$EMERGENCY_HOME/.local/share/codex-info/current")" == "generations/$EMERGENCY_OLD_ID" ]] || fail 'failure did not restore old current'
+    assert_emergency_phase rollback_switched
+    cmp -- "$emergency_dropin_before" "$EMERGENCY_DROPIN" || fail 'failure did not restore byte-identical drop-in'
+    [[ -d "$EMERGENCY_HOME/.local/share/codex-info/legacy-backups/$EMERGENCY_OPERATION_ID-emergency-handoff" ]] || fail 'failure removed recovery snapshot'
+    grep -Fq 'emergency ' "$EMERGENCY_STARTS" || fail 'failure did not restart emergency'
+    ! grep -Fq "generations/$EMERGENCY_OLD_ID" "$EMERGENCY_STARTS" || fail 'failure started old generation'
+    [[ "$(sha256sum -- "$protected_db" "$protected_log" "$protected_session")" == "$protected_before" ]] || fail 'failure mutated protected DB/log/session bytes'
+    printf 'case emergency candidate readiness rollback/identity restore: PASS\n'
+
+    starts_before="$(wc -l < "$EMERGENCY_STARTS")"
+    printf 'tamper\n' >> "$EMERGENCY_HOME/.local/share/codex-info/legacy-backups/$EMERGENCY_OPERATION_ID-emergency-handoff/drop-in.conf"
+    if run_emergency_update "$EMERGENCY_HOME" exact ''; then fail 'tampered recovery snapshot unexpectedly succeeded'; fi
+    [[ "$(wc -l < "$EMERGENCY_STARTS")" == "$starts_before" ]] || fail 'tampered recovery snapshot stopped runtime'
+    printf 'case emergency snapshot bytes mismatch before stop: PASS\n'
+
+    for mismatch in dropin binary listener recorder; do
+        prepare_emergency_fixture "identity-$mismatch"
+        case "$mismatch" in
+            dropin) printf 'Environment=unexpected\n' >> "$EMERGENCY_DROPIN" ;;
+            binary) printf 'tamper\n' >> "$EMERGENCY_BINARY" ;;
+            listener) printf '  sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n0: 0100007F:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 9999 1\n' > "$fake_proc/net/tcp" ;;
+            recorder) python3 - "$EMERGENCY_HOME/.codex/history/recorder-state.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_text()); value["last_commit_unix"] = 1
+path.write_text(json.dumps(value) + "\n")
+PY
+            ;;
+        esac
+        starts_before="$(wc -l < "$EMERGENCY_STARTS")"
+        if run_emergency_update "$EMERGENCY_HOME" exact ''; then fail "identity mismatch unexpectedly succeeded: $mismatch"; fi
+        [[ "$(wc -l < "$EMERGENCY_STARTS")" == "$starts_before" ]] || fail "identity mismatch stopped runtime: $mismatch"
+        [[ "$(readlink -- "$EMERGENCY_HOME/.local/share/codex-info/current")" == "generations/$EMERGENCY_OLD_ID" ]] || fail "identity mismatch changed current: $mismatch"
+        assert_emergency_phase rollback_switched
+    done
+    printf 'case emergency identity mismatch matrix (4 subcases): PASS\n'
+
+    for interrupted in current_switched activation_requested candidate_verified; do
+        prepare_emergency_fixture "interrupted-$interrupted"
+        if run_emergency_update "$EMERGENCY_HOME" exact "$interrupted"; then
+            fail "interrupted $interrupted unexpectedly succeeded"
+        fi
+        assert_emergency_phase "$interrupted"
+        if ! run_emergency_update "$EMERGENCY_HOME" exact ''; then fail "interrupted $interrupted did not resume"; fi
+        assert_emergency_phase committed
+        [[ "$(readlink -- "$EMERGENCY_HOME/.local/share/codex-info/current")" == "generations/$EMERGENCY_CANDIDATE_ID" ]] || fail "interrupted $interrupted did not converge"
+    done
+    printf 'case current_switched/activation_requested/candidate_verified direct resume: PASS\n'
+
+    prepare_emergency_fixture interrupted-rollback
+    if run_emergency_update "$EMERGENCY_HOME" exact rollback_switched 1; then
+        fail 'interrupted rollback_switched unexpectedly succeeded'
+    fi
+    assert_emergency_phase rollback_switched
+    if ! run_emergency_update "$EMERGENCY_HOME" exact ''; then fail 'interrupted rollback_switched did not resume'; fi
+    assert_emergency_phase committed
+    [[ "$(readlink -- "$EMERGENCY_HOME/.local/share/codex-info/current")" == "generations/$EMERGENCY_CANDIDATE_ID" ]] || fail 'interrupted rollback_switched did not converge'
+    printf 'case rollback_switched emergency restart/resume: PASS\n'
+
+    prepare_emergency_fixture fallback-next-update
+    if run_emergency_update "$EMERGENCY_HOME" old ''; then fail 'fallback setup unexpectedly succeeded'; fi
+    assert_emergency_phase rollback_switched
+    if ! run_emergency_update "$EMERGENCY_HOME" exact ''; then fail 'fallback retry failed'; fi
+    write_release "$EMERGENCY_CANDIDATE_ARCHIVE"
+    if ! run_emergency_no_update "$EMERGENCY_HOME" >/dev/null; then fail 'post-fallback no-update was not possible'; fi
+    assert_emergency_phase committed
+    [[ ! -e "$EMERGENCY_DROPIN" ]] || fail 'post-fallback no-update restored emergency override'
+    printf 'case emergency fallback next update/no-update: PASS\n'
+    printf 'linux emergency handoff contract cases passed (5)\n'
+}
+
+if (( EMERGENCY_HANDOFF )); then
+    run_emergency_handoff_cases
+    exit 0
+fi
 
 archive_v1="$(build_bundle 1111111111111111111111111111111111111111 1.0.19)"
 archive_v2=''
