@@ -138,6 +138,7 @@ struct LocalUsageResult {
     reset_at: i64,
     window_seconds: i64,
     model_usage: ModelUsageTotals,
+    model_totals_complete: bool,
     history_samples: Vec<UsageHistorySample>,
     history_model_totals: Vec<(i64, Vec<usage_store::SessionModelTotal>)>,
     recorded_sessions: Vec<usage_store::RecordedSessionSource>,
@@ -525,6 +526,17 @@ impl ModelUsageTotals {
         totals
     }
 
+    fn history_session_totals(
+        &self,
+        model_totals_complete: bool,
+    ) -> Vec<usage_store::SessionModelTotal> {
+        let mut totals = self.to_session_totals();
+        if !model_totals_complete {
+            totals.retain(session_model_total_has_usage);
+        }
+        totals
+    }
+
     fn checked_add_totals(&mut self, offset: &Self) -> Option<()> {
         fn add_row(target: &mut ModelUsageRow, offset: &ModelUsageRow) -> Option<()> {
             target.cache_write_input_tokens = match (
@@ -630,6 +642,16 @@ impl ModelUsageTotals {
                     && row.output_tokens == 0
             })
     }
+}
+
+fn session_model_total_has_usage(total: &usage_store::SessionModelTotal) -> bool {
+    total.total_tokens > 0
+        || total.input_tokens > 0
+        || total.cached_input_tokens > 0
+        || total.output_tokens > 0
+        || total
+            .cache_write_input_tokens
+            .is_some_and(|tokens| tokens > 0)
 }
 
 impl ModelDollarTotals {
@@ -3832,13 +3854,14 @@ impl UsageHistory {
     }
 
     fn record(&mut self, sample: UsageHistorySample) {
-        self.record_with_models(sample, None);
+        self.record_with_models(sample, None, false);
     }
 
     fn record_with_models(
         &mut self,
         sample: UsageHistorySample,
         model_totals: Option<Vec<usage_store::SessionModelTotal>>,
+        model_totals_complete: bool,
     ) {
         if !sample.is_valid() {
             return;
@@ -3847,7 +3870,12 @@ impl UsageHistory {
         self.pending_store_samples.push(stored_sample.clone());
         let observation = model_totals
             .map(|totals| {
-                usage_store::UsageHistoryObservation::confirmed_with_models(&stored_sample, totals)
+                let mut observation = usage_store::UsageHistoryObservation::confirmed_with_models(
+                    &stored_sample,
+                    totals,
+                );
+                observation.model_totals_complete = model_totals_complete;
+                observation
             })
             .unwrap_or_else(|| usage_store::UsageHistoryObservation::confirmed(&stored_sample));
         Self::merge_observation(&mut self.pending_store_observations, observation.clone());
@@ -3859,7 +3887,7 @@ impl UsageHistory {
     }
 
     fn apply_backfill_samples(&mut self, reset_at: i64, samples: Vec<UsageHistorySample>) {
-        self.apply_backfill_samples_with_models(reset_at, samples, Vec::new());
+        self.apply_backfill_samples_with_models(reset_at, samples, Vec::new(), false);
     }
 
     fn apply_backfill_samples_with_models(
@@ -3867,6 +3895,7 @@ impl UsageHistory {
         reset_at: i64,
         samples: Vec<UsageHistorySample>,
         model_history: Vec<(i64, Vec<usage_store::SessionModelTotal>)>,
+        model_totals_complete: bool,
     ) {
         if samples.is_empty() {
             return;
@@ -3889,10 +3918,13 @@ impl UsageHistory {
                 .get(&sample.timestamp)
                 .cloned()
                 .map(|totals| {
-                    usage_store::UsageHistoryObservation::confirmed_with_models(
-                        &stored_sample,
-                        totals,
-                    )
+                    let mut observation =
+                        usage_store::UsageHistoryObservation::confirmed_with_models(
+                            &stored_sample,
+                            totals,
+                        );
+                    observation.model_totals_complete = model_totals_complete;
+                    observation
                 })
                 .unwrap_or_else(|| usage_store::UsageHistoryObservation::confirmed(&stored_sample));
             backfill_observations.push(observation);
@@ -6542,6 +6574,7 @@ fn local_input_inventory() -> Result<LocalInputInventory, security::SecurityErro
 #[derive(Clone, Debug, Default)]
 struct LocalUsageCollection {
     model_usage: ModelUsageTotals,
+    model_totals_complete: bool,
     history_samples: Vec<UsageHistorySample>,
     history_model_totals: Vec<(i64, Vec<usage_store::SessionModelTotal>)>,
     recorded_sessions: Vec<usage_store::RecordedSessionSource>,
@@ -6550,6 +6583,17 @@ struct LocalUsageCollection {
     session_model_totals: Vec<usage_store::SessionModelTotal>,
     history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
     cleanup_plan: Option<SessionCleanupPlan>,
+}
+
+impl LocalUsageCollection {
+    fn mark_model_totals_incomplete(&mut self) {
+        self.model_totals_complete = false;
+        for (_, totals) in &mut self.history_model_totals {
+            totals.retain(session_model_total_has_usage);
+        }
+        self.session_model_totals
+            .retain(session_model_total_has_usage);
+    }
 }
 
 fn apply_regression_recovery(
@@ -6598,11 +6642,12 @@ fn apply_regression_recovery(
         if point.checked_add_totals(&offset).is_none() {
             return false;
         }
-        *model_totals = point.to_session_totals();
+        *model_totals = point.history_session_totals(collection.model_totals_complete);
     }
     collection.history_samples = adjusted_history;
     collection.history_model_totals = adjusted_model_history;
-    collection.session_model_totals = recovered.to_session_totals();
+    collection.session_model_totals =
+        recovered.history_session_totals(collection.model_totals_complete);
     collection.model_usage = recovered;
     debug_runtime(format!(
         "durable cumulative recovery applied sol={} terra={} luna={}",
@@ -6708,6 +6753,7 @@ fn collect_local_usage_snapshot(
     let mut totals = ModelUsageTotals::default();
     let mut events = Vec::new();
     let mut recorded_sessions = Vec::new();
+    let mut model_totals_complete = inventory.overflow_session_files.is_empty();
     let window_start = reset_at.saturating_sub(window_seconds.max(0));
     let timeline_end = Utc::now().timestamp().min(reset_at);
     debug_runtime(format!(
@@ -6734,6 +6780,7 @@ fn collect_local_usage_snapshot(
             }
         };
         if !recordable {
+            model_totals_complete = false;
             continue;
         }
         let unchanged = fs::symlink_metadata(path)
@@ -6757,9 +6804,11 @@ fn collect_local_usage_snapshot(
             events,
             reset_at,
             ModelUsageTotals::default(),
+            model_totals_complete,
         );
     Ok(LocalUsageCollection {
         model_usage: totals,
+        model_totals_complete,
         history_samples,
         history_model_totals,
         recorded_sessions,
@@ -7189,13 +7238,14 @@ fn model_usage_timeline_from_events_with_initial(
     reset_at: i64,
     totals: ModelUsageTotals,
 ) -> Vec<UsageHistorySample> {
-    model_usage_timeline_with_models_from_events_with_initial(events, reset_at, totals).0
+    model_usage_timeline_with_models_from_events_with_initial(events, reset_at, totals, true).0
 }
 
 fn model_usage_timeline_with_models_from_events_with_initial(
     mut events: Vec<TimedModelUsage>,
     reset_at: i64,
     mut totals: ModelUsageTotals,
+    model_totals_complete: bool,
 ) -> (
     Vec<UsageHistorySample>,
     Vec<(i64, Vec<usage_store::SessionModelTotal>)>,
@@ -7218,12 +7268,12 @@ fn model_usage_timeline_with_models_from_events_with_initial(
             if previous.timestamp == sample.timestamp {
                 *previous = sample;
                 if let Some((_, previous_models)) = model_history.last_mut() {
-                    *previous_models = totals.to_session_totals();
+                    *previous_models = totals.history_session_totals(model_totals_complete);
                 }
                 continue;
             }
         }
-        model_history.push((minute, totals.to_session_totals()));
+        model_history.push((minute, totals.history_session_totals(model_totals_complete)));
         samples.push(sample);
     }
     (samples, model_history)
@@ -7364,6 +7414,7 @@ struct SessionAppendResult {
     range: Option<usage_store::SessionRange>,
     marker: Option<usage_store::RecordedSessionSource>,
     appended_bytes: u64,
+    source_complete: bool,
 }
 
 fn same_session_checkpoint_state(
@@ -7387,6 +7438,15 @@ fn same_session_checkpoint_state(
         && left.previous_cached_input == right.previous_cached_input
         && left.previous_output == right.previous_output
         && left.previous_cache_write_input == right.previous_cache_write_input
+}
+
+fn session_source_complete(
+    end_offset: u64,
+    candidate_length: u64,
+    observed_length: u64,
+    discard_until_lf: bool,
+) -> bool {
+    end_offset == candidate_length && observed_length == candidate_length && !discard_until_lf
 }
 
 fn collect_session_append(
@@ -7670,16 +7730,21 @@ fn collect_session_append(
         prefix_generation,
         record_sha256: record_sha256.expect("non-empty range has a digest"),
     });
-    let marker = (checkpoint.fully_attributed_from_zero
-        && !checkpoint.discard_until_lf
-        && checkpoint.committed_offset == candidate.recorded_source.file_bytes)
-        .then(|| candidate.recorded_source.clone());
     let appended_bytes = end_offset.saturating_sub(start_offset);
+    let source_complete = session_source_complete(
+        end_offset,
+        candidate.fingerprint.length,
+        after_fingerprint.length,
+        discard_until_lf,
+    );
+    let marker = (checkpoint.fully_attributed_from_zero && source_complete)
+        .then(|| candidate.recorded_source.clone());
     Ok(Some(SessionAppendResult {
         checkpoint,
         range,
         marker,
         appended_bytes,
+        source_complete,
     }))
 }
 
@@ -7697,6 +7762,22 @@ fn collect_incremental_local_usage(
     collection_state: &usage_store::SessionCollectionState,
     previous_inventory: &BTreeSet<SessionInventoryKey>,
     context: IncrementalSessionContext,
+) -> Result<LocalUsageCollection, security::SecurityError> {
+    collect_incremental_local_usage_with_budget(
+        inventory,
+        collection_state,
+        previous_inventory,
+        context,
+        SESSION_APPEND_BYTES_PER_CYCLE,
+    )
+}
+
+fn collect_incremental_local_usage_with_budget(
+    inventory: &LocalInputInventory,
+    collection_state: &usage_store::SessionCollectionState,
+    previous_inventory: &BTreeSet<SessionInventoryKey>,
+    context: IncrementalSessionContext,
+    mut append_budget: u64,
 ) -> Result<LocalUsageCollection, security::SecurityError> {
     let IncrementalSessionContext {
         reset_at,
@@ -7767,9 +7848,11 @@ fn collect_incremental_local_usage(
     let mut changed_checkpoints = Vec::new();
     let mut ranges = Vec::new();
     let mut markers = Vec::new();
-    let mut append_budget = SESSION_APPEND_BYTES_PER_CYCLE;
+    let mut processed_sources = 0_usize;
+    let mut model_totals_complete = inventory.overflow_session_files.is_empty();
     for candidate in &inventory.selected_session_files {
         if append_budget == 0 {
+            model_totals_complete = false;
             break;
         }
         let inventory_key = session_inventory_key(candidate);
@@ -7809,8 +7892,13 @@ fn collect_incremental_local_usage(
         );
         let result = match result {
             Ok(Some(result)) => result,
-            Ok(None) | Err(_) => continue,
+            Ok(None) | Err(_) => {
+                model_totals_complete = false;
+                continue;
+            }
         };
+        processed_sources += 1;
+        model_totals_complete &= result.source_complete;
         append_budget = append_budget.saturating_sub(result.appended_bytes);
         let checkpoint_changed =
             prior.is_none_or(|prior| !same_session_checkpoint_state(prior, &result.checkpoint));
@@ -7827,16 +7915,23 @@ fn collect_incremental_local_usage(
             ranges.push(range);
         }
     }
+    model_totals_complete &= processed_sources == inventory.selected_session_files.len();
     let (history_samples, history_model_totals) =
-        model_usage_timeline_with_models_from_events_with_initial(events, reset_at, initial_totals);
+        model_usage_timeline_with_models_from_events_with_initial(
+            events,
+            reset_at,
+            initial_totals,
+            model_totals_complete,
+        );
     Ok(LocalUsageCollection {
         model_usage: totals.clone(),
+        model_totals_complete,
         history_samples,
         history_model_totals,
         recorded_sessions: markers,
         session_checkpoints: changed_checkpoints,
         session_ranges: ranges,
-        session_model_totals: totals.to_session_totals(),
+        session_model_totals: totals.history_session_totals(model_totals_complete),
         history_continuity_recovery: None,
         cleanup_plan: cleanup_plan_for_inventory(inventory),
     })
@@ -8943,6 +9038,7 @@ impl LocalUsageCache {
         }
         let inventories_match = inventory.fingerprint == after.fingerprint
             && inventory.overflow_session_files == after.overflow_session_files;
+        let has_unprocessed_overflow = !after.overflow_session_files.is_empty();
         let verified_files = after.selected_session_files.clone();
         let verified_inventory = LocalInputInventory {
             selected_session_files: verified_files.clone(),
@@ -8962,7 +9058,7 @@ impl LocalUsageCache {
             },
         };
         let current_inventory = session_inventory_keys(&verified_inventory);
-        let collection = collect_incremental_local_usage(
+        let mut collection = collect_incremental_local_usage(
             &verified_inventory,
             &collection_state,
             &previous_inventory,
@@ -8974,6 +9070,9 @@ impl LocalUsageCache {
                 cycle_seq,
             },
         )?;
+        if has_unprocessed_overflow {
+            collection.mark_model_totals_incomplete();
+        }
         self.partitioned_collector_epoch = Some(collector_epoch);
         self.verified_session_inventory = current_inventory;
         Ok(collection)
@@ -9166,6 +9265,7 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                                 reset_at,
                                 window_seconds,
                                 model_usage: collection.model_usage,
+                                model_totals_complete: collection.model_totals_complete,
                                 history_samples: collection.history_samples,
                                 history_model_totals: collection.history_model_totals,
                                 recorded_sessions: collection.recorded_sessions,
@@ -11692,7 +11792,10 @@ impl CodexInfoState {
         }
         let model_costs = result.model_usage.dollar_totals();
         let model_tokens = result.model_usage.token_totals();
-        let current_model_totals = result.model_usage.to_session_totals();
+        let current_model_totals = result
+            .model_usage
+            .history_session_totals(result.model_totals_complete);
+        let has_current_model_totals = !result.model_usage.is_zero();
         let history_sample_count = result.history_samples.len();
         self.local_usage_error = false;
         self.local_usage_pending = false;
@@ -11706,6 +11809,7 @@ impl CodexInfoState {
                 result.reset_at,
                 result.history_samples,
                 result.history_model_totals,
+                result.model_totals_complete,
             );
             self.pending_recorded_sessions
                 .extend(result.recorded_sessions);
@@ -11722,12 +11826,6 @@ impl CodexInfoState {
             .is_none()
             .then_some(self.remaining_percent)
             .flatten();
-        let has_current_model_totals = model_costs.sol > 0.0
-            || model_costs.terra > 0.0
-            || model_costs.luna > 0.0
-            || model_tokens.sol > 0
-            || model_tokens.terra > 0
-            || model_tokens.luna > 0;
         let record_current_local_observation = fresh_remaining.is_some()
             || (!self.preview
                 && self.authenticated
@@ -11753,8 +11851,11 @@ impl CodexInfoState {
                         model_tokens,
                     )
                 });
-            self.history
-                .record_with_models(sample, Some(current_model_totals));
+            self.history.record_with_models(
+                sample,
+                Some(current_model_totals),
+                result.model_totals_complete,
+            );
         }
         self.refresh_partial_failure_status();
         debug_runtime(format!(
@@ -18141,6 +18242,104 @@ mod tests {
     }
 
     #[test]
+    fn bounded_session_append_does_not_publish_unread_astra_as_zero() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-partial-model-set-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("partial.jsonl");
+        let now = Utc::now();
+        let token_event = |total| {
+            json!({
+                "timestamp": now.to_rfc3339(),
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"total_token_usage": {
+                    "total_tokens": total, "input_tokens": total,
+                    "cached_input_tokens": 0, "output_tokens": 0
+                }}}
+            })
+        };
+        let admitted = format!(
+            "{}\n{}\n",
+            json!({"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}),
+            token_event(100)
+        );
+        let unread = format!(
+            "{}\n{}\n",
+            json!({"type":"turn_context","payload":{"model":"gpt-6-astra"}}),
+            token_event(200)
+        );
+        fs::write(&path, format!("{admitted}{unread}")).unwrap();
+
+        let inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let reset_at = now.timestamp() + 3_600;
+        let collection = super::collect_incremental_local_usage_with_budget(
+            &inventory,
+            &super::usage_store::SessionCollectionState::default(),
+            &BTreeSet::new(),
+            super::IncrementalSessionContext {
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: false,
+                collector_epoch: 1,
+                cycle_seq: 1,
+            },
+            admitted.len() as u64,
+        )
+        .unwrap();
+
+        assert!(!collection.model_totals_complete);
+        assert_eq!(collection.model_usage.sol.tokens, 100);
+        assert_eq!(collection.model_usage.astra.tokens, 0);
+        assert!(!collection.history_model_totals.is_empty());
+        assert!(collection.history_model_totals.iter().all(|(_, models)| {
+            models.iter().any(|model| model.model == "SOL")
+                && models.iter().all(|model| model.model != "ASTRA")
+        }));
+        assert!(collection
+            .session_model_totals
+            .iter()
+            .any(|model| model.model == "SOL" && model.total_tokens == 100));
+        assert!(collection
+            .session_model_totals
+            .iter()
+            .all(|model| model.model != "ASTRA"));
+        assert!(!super::session_source_complete(100, 100, 101, false));
+        assert!(super::session_source_complete(100, 100, 100, false));
+
+        let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
+        state.reset_at = Some(reset_at);
+        state.history = UsageHistory::default();
+        state.apply_local_usage_success(LocalUsageResult {
+            auth_epoch: state.auth_epoch,
+            reset_at,
+            window_seconds: WEEK_SECONDS,
+            model_usage: collection.model_usage,
+            model_totals_complete: collection.model_totals_complete,
+            history_samples: collection.history_samples,
+            history_model_totals: collection.history_model_totals,
+            recorded_sessions: collection.recorded_sessions,
+            cleanup_plan: collection.cleanup_plan,
+        });
+        assert!(!state.history.pending_store_observations.is_empty());
+        assert!(state
+            .history
+            .pending_store_observations
+            .iter()
+            .all(|observation| {
+                !observation.model_totals_complete
+                    && observation
+                        .model_totals
+                        .as_ref()
+                        .is_some_and(|models| models.iter().all(|model| model.model != "ASTRA"))
+            }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn astra_session_delta_survives_database_restart_without_duplicate_tokens() {
         use super::usage_store::{SessionCollectionCommit, StoragePartitionIdentity, UsageStore};
         let root = std::env::temp_dir().join(format!(
@@ -19097,6 +19296,7 @@ mod tests {
             reset_at,
             window_seconds: WEEK_SECONDS,
             model_usage: ModelUsageTotals::default(),
+            model_totals_complete: true,
             history_samples: vec![sample],
             history_model_totals: Vec::new(),
             recorded_sessions: Vec::new(),
@@ -19178,6 +19378,7 @@ mod tests {
             reset_at,
             window_seconds: WEEK_SECONDS,
             model_usage: ModelUsageTotals::default(),
+            model_totals_complete: true,
             history_samples: vec![local_only.clone()],
             history_model_totals: Vec::new(),
             recorded_sessions: Vec::new(),
@@ -19202,6 +19403,59 @@ mod tests {
         ));
         assert!(local_commands.try_recv().is_err());
         let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn quota_outage_records_astra_and_arbitrary_model_only_observations() {
+        for model in ["gpt-6-astra", "future-model"] {
+            let mut state = CodexInfoState::preview("normal");
+            let reset_at = state.reset_at.expect("preview quota has reset");
+            state.preview = false;
+            state.authenticated = true;
+            state.account_error = Some("quota unavailable".into());
+            state.history = UsageHistory::default();
+
+            let mut totals = ModelUsageTotals::default();
+            totals.add(
+                model,
+                TokenSnapshot {
+                    cache_write_input: Some(3),
+                    total: 20,
+                    input: 12,
+                    cached_input: 4,
+                    output: 5,
+                },
+            );
+            state.apply_local_usage_success(LocalUsageResult {
+                auth_epoch: state.auth_epoch,
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                model_usage: totals,
+                model_totals_complete: true,
+                history_samples: Vec::new(),
+                history_model_totals: Vec::new(),
+                recorded_sessions: Vec::new(),
+                cleanup_plan: None,
+            });
+
+            let [observation] = state.history.pending_store_observations.as_slice() else {
+                panic!("{model} local-only observation was not recorded");
+            };
+            assert_eq!(observation.remaining_percent, None, "{model}");
+            assert_eq!(
+                observation.model_source,
+                usage_store::ModelSource::Confirmed,
+                "{model}"
+            );
+            let expected = ModelUsageTotals::canonical_model(model).unwrap();
+            let recorded = observation
+                .model_totals
+                .as_ref()
+                .and_then(|models| models.iter().find(|row| row.model == expected))
+                .unwrap_or_else(|| panic!("{model} row was not persisted"));
+            assert_eq!(recorded.total_tokens, 20, "{model}");
+            assert_eq!(recorded.cache_write_input_tokens, Some(3), "{model}");
+        }
     }
 
     #[test]
@@ -19562,6 +19816,7 @@ mod tests {
             reset_at,
             window_seconds: WEEK_SECONDS,
             model_usage: totals,
+            model_totals_complete: true,
             history_samples: Vec::new(),
             history_model_totals: Vec::new(),
             recorded_sessions: Vec::new(),
@@ -19827,6 +20082,7 @@ mod tests {
                 reset_at,
                 window_seconds: WEEK_SECONDS,
                 model_usage: ModelUsageTotals::default(),
+                model_totals_complete: true,
                 history_samples: vec![UsageHistorySample::new(
                     Utc::now().timestamp(),
                     reset_at,
@@ -20184,6 +20440,7 @@ mod tests {
             reset_at,
             window_seconds: WEEK_SECONDS,
             model_usage: ModelUsageTotals::default(),
+            model_totals_complete: true,
             history_samples: vec![UsageHistorySample::new(
                 10,
                 reset_at,
@@ -20218,6 +20475,7 @@ mod tests {
             reset_at: reset_at + WEEK_SECONDS,
             window_seconds: WEEK_SECONDS,
             model_usage: ModelUsageTotals::default(),
+            model_totals_complete: true,
             history_samples: vec![UsageHistorySample::new(
                 10,
                 reset_at + WEEK_SECONDS,
@@ -20248,6 +20506,7 @@ mod tests {
             reset_at,
             window_seconds: WEEK_SECONDS,
             model_usage: ModelUsageTotals::default(),
+            model_totals_complete: true,
             history_samples: Vec::new(),
             history_model_totals: Vec::new(),
             recorded_sessions: Vec::new(),
@@ -20291,6 +20550,7 @@ mod tests {
             reset_at,
             window_seconds: WEEK_SECONDS,
             model_usage: totals,
+            model_totals_complete: true,
             history_samples: vec![UsageHistorySample::new_with_usage(
                 20,
                 reset_at,
@@ -20332,6 +20592,7 @@ mod tests {
             reset_at: next_reset,
             window_seconds: WEEK_SECONDS,
             model_usage: ModelUsageTotals::default(),
+            model_totals_complete: true,
             history_samples: vec![UsageHistorySample::new(
                 Utc::now().timestamp(),
                 next_reset,
@@ -20757,6 +21018,7 @@ mod tests {
             reset_at,
             window_seconds: WEEK_SECONDS,
             model_usage: continued_usage.clone(),
+            model_totals_complete: true,
             history_samples: Vec::new(),
             history_model_totals: Vec::new(),
             recorded_sessions: Vec::new(),
@@ -24422,6 +24684,7 @@ mod tests {
                 reset_at,
                 window_seconds: WEEK_SECONDS,
                 model_usage: ModelUsageTotals::default(),
+                model_totals_complete: true,
                 history_samples: Vec::new(),
                 history_model_totals: Vec::new(),
                 recorded_sessions: Vec::new(),
@@ -24443,6 +24706,7 @@ mod tests {
                 reset_at,
                 window_seconds: WEEK_SECONDS,
                 model_usage: ModelUsageTotals::default(),
+                model_totals_complete: true,
                 history_samples: vec![UsageHistorySample::new(
                     observed_at,
                     reset_at,
@@ -24799,6 +25063,7 @@ mod tests {
             reset_at,
             window_seconds: WEEK_SECONDS,
             model_usage: collection.model_usage,
+            model_totals_complete: collection.model_totals_complete,
             history_samples: collection.history_samples,
             history_model_totals: collection.history_model_totals,
             recorded_sessions: collection.recorded_sessions,
