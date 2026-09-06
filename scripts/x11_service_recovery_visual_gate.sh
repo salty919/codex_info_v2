@@ -82,6 +82,19 @@ cat >"$auth_fixture" <<'JSON'
 {"auth_mode":"chatgpt","tokens":{"account_id":"fixture-account-129"}}
 JSON
 chmod 600 "$auth_fixture"
+# The normal isolated app-server path snapshots Codex's existing state index.
+# Keep this fixture on that path instead of accidentally exercising the
+# one-cycle global fallback used only when isolation preparation fails.
+state_fixture="$temp_root/codex/state_5.sqlite"
+python3 - "$state_fixture" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("PRAGMA user_version = 1")
+connection.close()
+PY
+chmod 600 "$state_fixture"
 fake_codex="$root_dir/scripts/fake_codex_app_server.py"
 
 # Seed pre-boundary records that must be baselined without attribution. A
