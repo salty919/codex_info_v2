@@ -24,6 +24,13 @@ display for `--ui` (WSLg is supported), and a `codex` CLI that can run
 `codex app-server --stdio`. Authentication remains owned by the Codex CLI;
 this application does not save passwords, API keys, or tokens.
 
+Linux and Windows consume one strictly validated `GET /v3/details` generation.
+They fall back to v2 and then v1 only when each newer route returns an exact
+404. A valid product-version mismatch is diagnostic, not a connection failure;
+wire compatibility decides whether the snapshot is accepted. V3 preserves
+ASTRA and bounded future model IDs instead of collapsing them into a fixed
+three-model database contract.
+
 The installed launcher and the byte-identical bundle/repository `run.sh`
 never build locally or fall back to `target/`. With no arguments or
 `--start`, it reconciles the verified stable generation and starts one

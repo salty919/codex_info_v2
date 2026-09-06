@@ -9,7 +9,7 @@ API-V3-MODELS-01
 API-DEPRECATION-01
 -->
 
-# イントラネット REST API v1
+# Loopback REST API v1 / v2 / v3
 
 ## API世代と廃止境界
 
@@ -31,7 +31,7 @@ SQLiteへtransactionalに書く。`HistoryCanonicalizer`はcommit済みraw row�
 generationを構築し、native UIとREST workerへ同じgenerationをread-onlyで渡す。HTTP要求からCodex
 app-server、認証 URL、セッションファイル、SQLite、Slint / X11へ直接到達する経路は持たない。
 
-この v1 はインターネット公開、LAN への直接公開、ブラウザー向け CORS、書込み
+このAPIはインターネット公開、LANへの直接公開、ブラウザー向けCORS、書込み
 操作、ログイン操作を対象外とする。既存の Linux / X11 UI は引き続きローカルで
 動作する。
 
@@ -129,12 +129,12 @@ SQLite transaction、WAL/SHM、migration、prune、backup、DB row/hash、publis
 RESTのtransfer body上限はdetails `32 MiB`、response header `8 KiB`である。
 SQLiteの保持期間は過去3暦月である。一方、1回のDB取得と`details`応答が扱う履歴は観測時刻で終わる
 最長1暦月の半開区間 `(one_month_before(observed_at), observed_at]` に限定する。history samples上限は
-31日分の1分bucketに相当する`44,640`、history periods `128`、confirmed history gaps `4,096`、threads `256`、models `3`である。
+31日分の1分bucketに相当する`44,640`、history periods `128`、confirmed history gaps `4,096`、threads `256`である。v1/v2のmodels上限は固定3件、v3のtop-levelおよび各history rowのmodels上限は`1,024`件である。
 
 ### 応答時間SLOと容量条件
 
 warm-up後、loopback、in-flight 1でrequest送信開始からresponse body全受信までを測る。
-`/v1/health`と全4xxはP90 25 ms以下・P95 50 ms以下、v1/v2 detailsは
+`/v1/health`と全4xxはP90 25 ms以下・P95 50 ms以下、v1/v2/v3 detailsは
 7日相当10,080 samplesでP90 50 ms以下・P95 100 ms以下、契約最大1暦月44,640 samplesで
 P90 100 ms以下・P95 150 ms以下とする。各route/profileを30回以上測定し、client hard timeoutは
 1秒、timeout・欠測・上限超過はPASSへ丸めない。DB読出しはtimestamp/reset複合indexを使い、
@@ -277,8 +277,7 @@ exact `v2`とする。`history_samples`の各rowはv1の9キーに`model_source`
 `confirmed`/`legacy-unknown`でmodel 6値の一部だけがnull、または`unavailable`で一つでも非nullのcandidateは
 全体rejectする。local取得失敗時に直前model vectorを新しいtimestampへ複製せず、quotaが取得できた場合だけ
 その実測値を`unavailable` rowへ保存する。v1互換応答には`unavailable` rowも`model_source` fieldも含めない。
-clientは最初にv2を一回要求し、exact routeの404時だけv1を一回要求する。他のstatus、schema/size/header不正、
-timeoutではfallbackせずlast-good rootを保持する。二つのdetails応答を比較・mergeしてはならない。
+clientは最初にv3を一回要求し、exact routeの404時だけv2、さらにexact routeの404時だけv1を一回要求する。他のstatus、schema/size/header不正、timeoutではfallbackせずlast-good rootを保持する。複数versionのdetails応答を比較・mergeしてはならない。
 
 各history sample行は`timestamp`、`reset_at`、`remaining_percent`、`sol_dollars`、
 `terra_dollars`、`luna_dollars`、`sol_tokens`、`terra_tokens`、`luna_tokens`だけを持つ。
@@ -317,15 +316,11 @@ wireに存在しないserver内部値を推測・再計算せず、SQLite、別g
 取得失敗、更新競合、stale lease/epoch/cycleは架空の世代番号を補わず、DB、memory、REST、UIを変更せず
 last-good generation/rootを保持して次cycleで再取得する。
 
-## 段階的な移行
+## 互換移行
 
-v1 は Linux ネイティブ UI と別プロセスの、引数なしまたは`codex_info --port 8787`で起動する監視 API である。
-Windows 側には `windows-client/` の Avalonia / .NET 10 クライアントを用意し、Visual
-Studio Community から solution を開いて、この固定 JSON 契約を表示できる。詳細な
-接続・検証・表示仕様は[Windows クライアント](WINDOWS_CLIENT.md)を参照する。
+resident serviceはv1/v2/v3を同じloopback listenerで公開する。現行clientはv3を優先し、v1/v2は`API-DEPRECATION-01`のdeprecated adapterとしてだけ残す。旧adapterを将来削除してもcollector、DB、stable health、常駐監視は変更しない。詳細な接続・表示仕様は[Windowsクライアント](WINDOWS_CLIENT.md)とUX ownerを参照する。
 
-インターネット経由の利用を将来追加する場合は、v1 の bind 設定を緩めず、別の
-設定・認証・脅威モデルとして設計する。
+インターネット経由の利用を将来追加する場合はloopback bindを緩めず、別の設定・認証・脅威モデルとして設計する。
 
 
 ## DP-REST wire authority（RC-139..142の採用値）
