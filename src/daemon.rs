@@ -878,6 +878,7 @@ fn current_lock_owner_pid_at(path: &Path) -> Option<u32> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DaemonOwnerIdentity {
     pub(crate) pid: u32,
+    pub(crate) port: u16,
     pub(crate) starttime_ticks: u64,
     pub(crate) executable_device: u64,
     pub(crate) executable_inode: u64,
@@ -887,11 +888,13 @@ pub(crate) struct DaemonOwnerIdentity {
 pub(crate) fn current_daemon_owner_identity() -> Option<DaemonOwnerIdentity> {
     let snapshot = read_lock_snapshot(&daemon_lock_path()?).ok().flatten()?;
     let process = process_identity(snapshot.record.pid)?;
+    let port = process_is_known_codex(&process)?;
     snapshot
         .record
         .matches_process(&process)
         .then_some(DaemonOwnerIdentity {
             pid: snapshot.record.pid,
+            port,
             starttime_ticks: snapshot.record.starttime_ticks,
             executable_device: snapshot.record.executable_device,
             executable_inode: snapshot.record.executable_inode,
@@ -936,7 +939,7 @@ fn process_has_managed_marker(_pid: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn process_is_known_codex(identity: &ProcessIdentity) -> bool {
+fn process_is_known_codex(identity: &ProcessIdentity) -> Option<u16> {
     let process_root = Path::new("/proc").join(identity.pid.to_string());
     let executable = fs::read_link(process_root.join("exe"))
         .ok()
@@ -944,33 +947,33 @@ fn process_is_known_codex(identity: &ProcessIdentity) -> bool {
     let executable_name = executable.as_deref().and_then(|name| name.to_str());
     let executable_name = matches!(executable_name, Some("codex_info" | "codex-info"));
     if !executable_name {
-        return false;
+        return None;
     }
     let command_line = fs::read(process_root.join("cmdline")).ok();
     let Some(command_line) = command_line else {
-        return false;
+        return None;
     };
     let args = command_line
         .split(|byte| *byte == 0)
         .filter(|arg| !arg.is_empty())
         .collect::<Vec<_>>();
     if args.len() != 3 || args[1] != b"--port" {
-        return false;
+        return None;
     }
-    let valid_port = args[2].iter().all(u8::is_ascii_digit) && !args[2].is_empty() && {
-        let port = args[2].iter().fold(0_u32, |value, byte| {
-            value
-                .saturating_mul(10)
-                .saturating_add(u32::from(*byte - b'0'))
-        });
-        (1..=u32::from(u16::MAX)).contains(&port)
-    };
-    valid_port
+    if args[2].is_empty() || !args[2].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let port = args[2].iter().fold(0_u32, |value, byte| {
+        value
+            .saturating_mul(10)
+            .saturating_add(u32::from(*byte - b'0'))
+    });
+    u16::try_from(port).ok().filter(|port| *port != 0)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_is_known_codex(_identity: &ProcessIdentity) -> bool {
-    false
+fn process_is_known_codex(_identity: &ProcessIdentity) -> Option<u16> {
+    None
 }
 
 pub(crate) fn classify_profile_owner() -> OwnerClassification {
@@ -997,7 +1000,7 @@ pub(crate) fn classify_profile_owner() -> OwnerClassification {
     }
     if process_has_managed_marker(identity.pid) {
         OwnerClassification::ManagedActive
-    } else if process_is_known_codex(&identity) {
+    } else if process_is_known_codex(&identity).is_some() {
         OwnerClassification::KnownUnmanagedCodex
     } else {
         OwnerClassification::Foreign

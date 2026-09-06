@@ -15271,6 +15271,9 @@ fn healthy_combined_service_owner(address: SocketAddr) -> Option<u32> {
         return None;
     }
     let owner = daemon::current_daemon_owner_identity()?;
+    if owner.port != address.port() {
+        return None;
+    }
     if !recorder_owner_is_healthy(&owner) {
         return None;
     }
