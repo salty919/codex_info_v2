@@ -139,7 +139,7 @@ Codex app-server / session JSONL / thread rollout
 - すべてのcollectorは`UsageStore`を通してSQLiteへ書く。直接JSON、直接SQL、別形式の履歴DBは禁止する。
 - SQLite transaction lockとbounded busy timeoutを正本とする。ロックを無視した上書き、DB削除、DB再生成は禁止する。
 - `usage_history.sqlite3.bak.1`〜`.bak.3`は時系列の完全SQLite snapshotであり、同じ件数である必要はない。各世代は`PRAGMA quick_check`と再読込で検証する。
-- backup、prune、migrationの失敗は元DBを変更しない。pruneはbackup成功後だけ許可する。
+- backup、prune、migrationの失敗は元DBを変更しない。backup/migration候補の検証前は元DBをread-only接続だけで読み、schema・index・permissionを修復しない。pruneはbackup成功後だけ許可する。
 - migrationは`UsageStore::migrate_verified`を入口とし、候補DBを別名で作成して全行の型・値・一意キー、`quick_check`、row count、決定的fingerprint、reset-period境界を検証する。検証後だけ元DBを退避してcandidateをatomic switchし、旧DBと3世代backupを残す。candidate検証失敗・switch失敗・lock競合は元DBをそのまま保持する。
 - backup世代の復元は、対象プロセスを停止し、現在DBを別名退避してから、quick check・schema check・row/hash監査を通した世代だけで行う。通常起動が自動復元を試みてはならない。
 
