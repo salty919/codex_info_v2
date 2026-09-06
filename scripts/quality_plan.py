@@ -24,48 +24,9 @@ OWNER_CHECKS: dict[str, tuple[str, ...]] = {
     "LINUX_UI": ("requirements-authority", "rust-format", "rust-test"),
     "WINDOWS": ("requirements-authority", "windows-contract"),
 }
-HISTORY_GRAPH_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
-    "DOCS": ("requirements-authority",),
-    "LINUX_BACKEND": ("requirements-authority", "rust-history-graph"),
-    "LINUX_UI": ("requirements-authority", "linux-ui-history-graph"),
-    "WINDOWS": ("requirements-authority", "windows-history-graph"),
-}
-MODEL_HISTORY_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
-    "DOCS": ("requirements-authority",),
-    "LINUX_BACKEND": ("requirements-authority", "rust-model-history"),
-    "LINUX_UI": ("requirements-authority", "linux-ui-model-history"),
-    "WINDOWS": ("requirements-authority", "windows-model-history"),
-}
-APP_SERVER_ISOLATION_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
-    "LINUX_BACKEND": ("requirements-authority", "rust-app-server-isolation"),
-}
-RESIDENT_PUBLICATION_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
-    "DOCS": ("requirements-authority",),
-    "LINUX_BACKEND": ("requirements-authority", "rust-resident-publication"),
-}
-RECORDER_GAP_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
-    "DOCS": ("requirements-authority",),
-    "LINUX_BACKEND": ("requirements-authority", "rust-recorder-gap"),
-}
-WORKFLOW_SELECTION_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
-    "DOCS": ("requirements-authority",),
-    "GOVERNANCE": ("requirements-authority", "governance-workflow-selection"),
-}
 ALL_CHECK_IDS = frozenset(
-    check
-    for mapping in (
-        OWNER_CHECKS,
-        HISTORY_GRAPH_OWNER_CHECKS,
-        MODEL_HISTORY_OWNER_CHECKS,
-        APP_SERVER_ISOLATION_OWNER_CHECKS,
-        RECORDER_GAP_OWNER_CHECKS,
-        RESIDENT_PUBLICATION_OWNER_CHECKS,
-        WORKFLOW_SELECTION_OWNER_CHECKS,
-    )
-    for checks in mapping.values()
-    for check in checks
+    check for checks in OWNER_CHECKS.values() for check in checks
 )
-
 
 class QualityPlanError(ValueError):
     """The requested quality plan is malformed or not allowed."""
@@ -77,13 +38,11 @@ class QualityPlan:
 
     affected_owners: tuple[str, ...]
     checks: tuple[str, ...]
-    quality_profile: str
 
     def as_dict(self) -> dict[str, object]:
         return {
             "affected_owners": list(self.affected_owners),
             "checks": list(self.checks),
-            "quality_profile": self.quality_profile,
         }
 
     def as_json(self) -> str:
@@ -121,7 +80,6 @@ def _validate_requested_checks(
 def plan_for_paths(
     paths: Sequence[str],
     *,
-    quality_profile: str | None = None,
     requested_checks: Sequence[str] = (),
 ) -> QualityPlan:
     """Return the checks required by ``paths``.
@@ -132,22 +90,14 @@ def plan_for_paths(
     """
 
     try:
-        selection = selection_for_paths(paths, quality_profile=quality_profile)
+        selection = selection_for_paths(paths)
     except (ScopeError, TypeError) as exc:
         raise QualityPlanError(str(exc)) from exc
 
     checks: list[str] = []
     seen: set[str] = set()
-    owner_checks = {
-        "history-graph": HISTORY_GRAPH_OWNER_CHECKS,
-        "model-history": MODEL_HISTORY_OWNER_CHECKS,
-        "app-server-isolation": APP_SERVER_ISOLATION_OWNER_CHECKS,
-        "recorder-gap": RECORDER_GAP_OWNER_CHECKS,
-        "resident-publication": RESIDENT_PUBLICATION_OWNER_CHECKS,
-        "workflow-selection": WORKFLOW_SELECTION_OWNER_CHECKS,
-    }.get(selection.quality_profile, OWNER_CHECKS)
     for owner in selection.owners:
-        for check in owner_checks[owner]:
+        for check in OWNER_CHECKS[owner]:
             if check not in seen:
                 checks.append(check)
                 seen.add(check)
@@ -156,7 +106,6 @@ def plan_for_paths(
     return QualityPlan(
         affected_owners=selection.owners,
         checks=planned_checks,
-        quality_profile=selection.quality_profile,
     )
 
 
@@ -177,12 +126,6 @@ def _arguments() -> argparse.ArgumentParser:
         help="changed repository path; repeat for multiple paths",
     )
     parser.add_argument(
-        "--quality-profile",
-        default=None,
-        metavar="PROFILE",
-        help="registered finite product-risk profile",
-    )
-    parser.add_argument(
         "--requested-check",
         action="append",
         default=[],
@@ -198,7 +141,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         plan = plan_for_paths(
             paths,
-            quality_profile=args.quality_profile,
             requested_checks=tuple(args.requested_check),
         )
     except QualityPlanError as exc:

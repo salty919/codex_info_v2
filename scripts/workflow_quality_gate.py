@@ -244,17 +244,12 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             mapping(f"selective.{job_id}", child.get("with"), {
                 "source_sha": "${{ inputs.source_sha }}"
             })
-        for job_id in (
-            "linux-backend-quality",
-            "linux-ui-quality",
-            "windows-quality",
-        ):
+        for job_id in ("linux-backend-quality", "linux-ui-quality"):
             mapping(
                 f"selective.{job_id}",
                 _job(selective, job_id).get("with"),
                 {
-                    "quality_profile":
-                        "${{ fromJSON(inputs.selection_json).quality_profile }}"
+                    "release_candidate": "${{ inputs.release_candidate }}"
                 },
             )
         distribution = _job(selective, "linux-distribution")
@@ -281,7 +276,6 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         mapping("selective.windows", selective_windows.get("with"), {
             "pr_number": "${{ inputs.pr_number }}",
             "release_candidate": "${{ inputs.release_candidate }}",
-            "quality_profile": "${{ fromJSON(inputs.selection_json).quality_profile }}",
         })
         mapping("selective.codeql", selective_codeql.get("with"), {
             "head_ref": "${{ inputs.head_ref }}",
@@ -344,7 +338,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect("selective.windows-name", selective_windows.get("name"), "windows-quality")
         expect("windows.leaf-name", windows_job.get("name"), "windows-quality")
         e2e = _step(windows_job, name="Run installed Windows UI Automation E2E")
-        expect("windows.e2e.if", e2e.get("if"), "inputs.quality_profile == 'release'")
+        expect("windows.e2e.if", e2e.get("if"), "inputs.release_candidate")
         mapping("windows.e2e.env", e2e.get("env"), {
             "SOURCE_SHA": "${{ inputs.source_sha }}",
         })
@@ -354,7 +348,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect(
             "windows.manifest.if",
             manifest.get("if"),
-            "inputs.release_candidate && inputs.quality_profile == 'release'",
+            "inputs.release_candidate",
         )
         mapping("windows.manifest.env", manifest.get("env"), {
             "REPOSITORY": "${{ github.repository }}",
@@ -363,7 +357,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect(
             "windows.upload.if",
             upload.get("if"),
-            "inputs.release_candidate && inputs.quality_profile == 'release'",
+            "inputs.release_candidate",
         )
         mapping("windows.upload", upload.get("with"), {
             "name": "release-candidate-v1-pr-${{ inputs.pr_number }}-head-${{ inputs.source_sha }}-"
@@ -373,27 +367,11 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         })
 
         expect(
-            "rust.focused.if",
-            _step(rust_job, name="Run finite history graph tests").get("if"),
-            "inputs.quality_profile == 'history-graph'",
-        )
-        expect(
-            "rust.resident-publication.if",
-            _step(rust_job, name="Run finite resident publication tests").get("if"),
-            "inputs.quality_profile == 'resident-publication'",
-        )
-        expect(
-            "rust.app-server-isolation.if",
-            _step(rust_job, name="Run finite app-server isolation tests").get("if"),
-            "inputs.quality_profile == 'app-server-isolation'",
-        )
-        expect(
-            "rust.recorder-gap.if",
-            _step(rust_job, name="Run finite recorder gap tests").get("if"),
-            "inputs.quality_profile == 'recorder-gap'",
+            "rust.unit.if",
+            _step(rust_job, name="Run native unit tests").get("if"),
+            None,
         )
         for step_name in (
-            "Run native unit tests",
             "Build native release",
             "Run public CLI lifecycle acceptance",
             "Run recorder daemon live acceptance",
@@ -401,7 +379,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             expect(
                 f"rust.{step_name}.if",
                 _step(rust_job, name=step_name).get("if"),
-                "inputs.quality_profile == 'release'",
+                "inputs.release_candidate",
             )
         expect(
             "linux-ui.startup.if",
@@ -409,7 +387,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
                 linux_ui_job,
                 name="Run startup UI image and failure-state acceptance",
             ).get("if"),
-            "inputs.quality_profile == 'release'",
+            "inputs.release_candidate",
         )
         expect(
             "linux-ui.graph.if",
@@ -417,12 +395,11 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             None,
         )
         expect(
-            "windows.focused.if",
-            _step(windows_job, name="Run finite history graph tests").get("if"),
-            "inputs.quality_profile == 'history-graph'",
+            "windows.unit.if",
+            _step(windows_job, name="Run Windows unit tests").get("if"),
+            None,
         )
         for step_name in (
-            "Run Windows unit tests",
             "Install locked Inno Setup compiler",
             "Build standard Windows setup wizard",
             "Smoke-test install and uninstall lifecycle",
@@ -430,7 +407,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             expect(
                 f"windows.{step_name}.if",
                 _step(windows_job, name=step_name).get("if"),
-                "inputs.quality_profile == 'release'",
+                "inputs.release_candidate",
             )
 
         # Resolver outputs -> lock holder; revalidation controls both side effects.
@@ -591,7 +568,6 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         'branches: ["feat/next"]',
         "release_candidate: false",
         '--name-status -z "$BASE_SHA...$HEAD_SHA"',
-        '--profile-document "$profile_document"',
     ):
         if marker not in feat:
             errors.append(f"feat-integration.yml: missing {marker}")
@@ -654,9 +630,14 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     count("selective-quality.yml", "ref: ${{ github.workflow_sha }}", 1)
     count(
         "selective-quality.yml",
-        'bash scripts/pre_pr_gate.sh --base "$BASE_SHA" --quality-profile workflow-selection',
+        'bash scripts/pre_pr_gate.sh --base "$BASE_SHA"',
         1,
     )
+    for marker in (
+        "--requested-check requirements-authority",
+        "--requested-check governance-contract",
+    ):
+        count("selective-quality.yml", marker, 1)
 
     linux_distribution = workflows["linux-distribution.yml"]
     for marker in (
@@ -674,6 +655,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
 
     windows = workflows["windows-client.yml"]
     for marker in (
+        "dotnet format windows-client/CodexInfo.WindowsClient.sln",
         "dotnet test windows-client/CodexInfo.WindowsClient.sln",
         "Build-WindowsInstaller.ps1",
         "Run-WindowsClientE2E.ps1",
@@ -695,28 +677,23 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
 
     rust = workflows["rust.yml"]
     for marker in (
+        "cargo fmt --check",
         "cargo test --locked --all-targets -- --nocapture",
         "cargo build --release --locked",
         "scripts/cli_contract_e2e.sh",
         "scripts/record_daemon_e2e.sh",
         "xvfb-run --auto-servernum",
-        '"$QUALITY_PROFILE" == resident-publication',
-        '"$QUALITY_PROFILE" == app-server-isolation',
-        '"$QUALITY_PROFILE" == recorder-gap',
-        "bash scripts/regression_guard.sh --history-graph",
-        "bash scripts/regression_guard.sh --app-server-isolation",
-        "bash scripts/regression_guard.sh --recorder-gap",
-        "bash scripts/regression_guard.sh --resident-publication",
     ):
         if marker not in rust:
             errors.append(f"rust.yml: missing {marker}")
     if "upload-artifact" in rust:
         errors.append("rust.yml: evidence-only artifact remains")
-    count("rust.yml", "scripts/regression_guard.sh --history-graph", 1)
-    count("rust.yml", "scripts/regression_guard.sh --app-server-isolation", 1)
-    count("rust.yml", "scripts/regression_guard.sh --recorder-gap", 1)
-    count("rust.yml", "scripts/regression_guard.sh --resident-publication", 1)
-    count("windows-client.yml", "scripts/windows_client_contract_gate.sh --history-graph", 1)
+    count("rust.yml", "quality_profile", 0)
+    count("linux-ui-quality.yml", "quality_profile", 0)
+    count("windows-client.yml", "quality_profile", 0)
+    count("selective-quality.yml", "quality_profile", 0)
+    count("feat-integration.yml", "Quality-Profile", 0)
+    count("linux-ui-quality.yml", "bash scripts/x11_graph_visual_gate.sh", 1)
 
     codeql = workflows["codeql.yml"]
     if "  schedule:\n" in codeql:
@@ -887,7 +864,6 @@ def _selected_quality_release_candidate_tests(selective_workflow: str) -> int:
                 "codeql_languages": [],
                 "binary_impact": False,
                 "distribution_required": False,
-                "quality_profile": "release",
             },
             separators=(",", ":"),
         )
@@ -984,10 +960,6 @@ def _git_copy_detection_test() -> int:
             raise AssertionError(f"Git copy record is wrong: {result.stdout!r}")
         changes = root / "changes.z"
         changes.write_bytes(result.stdout)
-        profile_document = root / "pr-body.txt"
-        profile_document.write_text(
-            "Quality-Profile: workflow-selection\n", encoding="utf-8"
-        )
         selection = json.loads(
             _command(
                 (
@@ -995,8 +967,6 @@ def _git_copy_detection_test() -> int:
                     str(ROOT / "scripts/ci_change_scope.py"),
                     "--name-status",
                     str(changes),
-                    "--profile-document",
-                    str(profile_document),
                 ),
                 cwd=root,
             ).stdout
@@ -2913,7 +2883,7 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
                 "bash",
                 str(ROOT / "scripts" / "build_linux_bundle.sh"),
                 "--binary",
-                "/usr/bin/true",
+                str(Path("/usr/bin/true").resolve()),
                 "--version",
                 _VERSION,
                 "--source-sha",
@@ -3116,363 +3086,17 @@ def release_self_test() -> int:
     return 0
 
 
-def _focused_rust_routing_tests() -> int:
-    """Execute the caller; a wrong Rust module selects zero tests, not success."""
-    with tempfile.TemporaryDirectory(prefix="codex-info-rust-routing-") as raw_root:
-        root = Path(raw_root)
-        # Use the caller's standard tools only. The hosted governance runner
-        # does not provide developer conveniences such as ripgrep.
-        for command in ("bash", "dirname", "mktemp", "grep", "rm", "cat", "python3"):
-            executable = shutil.which(command)
-            if executable is None:
-                raise AssertionError(f"fixture standard tool is unavailable: {command}")
-            (root / command).symlink_to(executable)
-        fake_cargo = root / "cargo"
-        fake_cargo.write_text(
-            "#!/usr/bin/env python3\n"
-            "import sys\n"
-            "target, name = sys.argv[3:5]\n"
-            "prefixes = {'--bin=codex_info': ('tests::', 'daemon::tests::'), "
-            "'--test=usage_store': ('wave_b_correction_tests::',), "
-            "'--lib': ('server::tests::', 'usage_store::tests::', 'app_server_sqlite::tests::')}\n"
-            "count = int(any(name.startswith(prefix) for prefix in prefixes[target]))\n"
-            "print(f'test result: ok. {count} passed; 0 failed; 0 ignored')\n",
-            encoding="utf-8",
-        )
-        fake_cargo.chmod(0o755)
-        environment = {**os.environ, "PATH": str(root)}
-        result = subprocess.run(
-            ("bash", str(ROOT / "scripts/regression_guard.sh"), "--history-graph"),
-            cwd=ROOT, env=environment, capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            raise AssertionError(f"Rust history caller selected the wrong module: {result.stderr}")
-        for name in (
-            "recent_read_uses_one_month_half_open_interval_at_month_ends",
-            "recent_read_filters_invalid_values_without_deleting_rows",
-        ):
-            if f"--test=usage_store wave_b_correction_tests::{name} count=1" not in result.stdout:
-                raise AssertionError(f"Rust caller did not execute the DB test: {name}")
-        result = subprocess.run(
-            ("bash", str(ROOT / "scripts/regression_guard.sh"), "--model-history"),
-            cwd=ROOT, env=environment, capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            raise AssertionError(f"Rust model caller selected the wrong module: {result.stderr}")
-        for name in (
-            "three_month_prune_removes_old_sidecars_but_keeps_new_rows_and_row_one",
-            "pruning_removes_only_old_rows_and_preserves_boundary_across_reset_periods",
-        ):
-            expected = f"--lib usage_store::tests::{name} count=1"
-            if expected not in result.stdout:
-                raise AssertionError(f"Rust model caller omitted the DB test: {name}")
-        result = subprocess.run(
-            (
-                "bash",
-                str(ROOT / "scripts/regression_guard.sh"),
-                "--resident-publication",
-            ),
-            cwd=ROOT,
-            env=environment,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise AssertionError(
-                "Rust resident publication caller selected the wrong module: "
-                f"{result.stderr}"
-            )
-        for name in (
-            "unchanged_resident_tick_reuses_snapshot_and_worker_event_publishes_once",
-            "recorder_failure_keeps_interval_retry_when_snapshot_publication_also_fails",
-            "resident_publication_holds_incomplete_usage_and_errors_without_mixing_roots",
-            "resident_recorder_retries_after_interval_without_dropping_pending_batch",
-            "outage_recovery_uses_one_periodic_local_collector_lane",
-            "resident_scheduler_keeps_periodic_thread_reads_single_flight",
-            "periodic_quota_refresh_does_not_overlap_account_generations",
-        ):
-            expected = f"--bin=codex_info tests::{name} count=1"
-            if expected not in result.stdout:
-                raise AssertionError(
-                    f"Rust resident publication caller omitted test: {name}"
-                )
-        result = subprocess.run(
-            (
-                "bash",
-                str(ROOT / "scripts/regression_guard.sh"),
-                "--app-server-isolation",
-            ),
-            cwd=ROOT,
-            env=environment,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise AssertionError(
-                "Rust app-server isolation caller selected the wrong module: "
-                f"{result.stderr}"
-            )
-        for name in (
-            "cleanup_rejects_replaced_generation_without_touching_replacement",
-            "crash_before_marker_is_recovered_without_permanent_block",
-            "foreign_root_entry_blocks_prepare_without_removal",
-            "inherited_owner_lock_preserves_generation_until_child_exit",
-            "live_generation_is_kept_and_dropped_generation_is_recovered",
-            "online_backup_is_private_and_source_is_unchanged",
-            "source_symlink_is_rejected_without_cache_growth",
-            "stale_incomplete_generation_is_recovered_without_growth",
-        ):
-            expected = f"--lib app_server_sqlite::tests::{name} count=1"
-            if expected not in result.stdout:
-                raise AssertionError(
-                    f"Rust app-server isolation caller omitted module test: {name}"
-                )
-        for name in (
-            "app_server_isolation_uses_private_generation_for_account_and_thread_children",
-            "app_server_isolation_failure_keeps_confirmed_local_recorder_live",
-            "unconfirmed_isolation_failure_uses_one_global_account_child",
-            "app_server_child_reap_owns_generation_cleanup",
-        ):
-            expected = f"--bin=codex_info tests::{name} count=1"
-            if expected not in result.stdout:
-                raise AssertionError(
-                    f"Rust app-server isolation caller omitted integration test: {name}"
-                )
-        result = subprocess.run(
-            ("bash", str(ROOT / "scripts/regression_guard.sh"), "--recorder-gap"),
-            cwd=ROOT,
-            env=environment,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise AssertionError(
-                f"Rust recorder gap caller selected the wrong module: {result.stderr}"
-            )
-        expected_tests = (
-            "daemon::tests::recorder_production_source_result_reaches_all_gap_states_without_session_quota_proof",
-            "tests::local_failure_queues_fresh_quota_as_unavailable_observation",
-            "tests::local_failure_does_not_queue_quota_for_outage_or_stale_admission",
-            "tests::local_failure_quota_batch_survives_recorder_retry_exactly_once",
-        )
-        for name in expected_tests:
-            expected = f"--bin=codex_info {name} count=1"
-            if expected not in result.stdout:
-                raise AssertionError(f"Rust recorder gap caller omitted test: {name}")
-    return 5
 
 
-def _focused_windows_model_routing_test() -> int:
-    """Run the Windows caller with a deterministic dotnet protocol double."""
-    expected_core = frozenset(
-        {
-            "CodexInfo.WindowsClient.Core.Tests.ContractsTests.HistorySampleModelsExposeEachProviderValues",
-            "CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsV3IsPreferredAndCarriesAstraHistory",
-            "CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsV3ReusesTheAcceptedGenerationWithAZeroBody304",
-            "CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsFallsBackToV1OnlyWhenV3AndV2ReturnNotFound",
-        }
-    )
-    expected_presentation = frozenset(
-        {
-            "CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.PlotProjectionDoesNotInventSpendDuringAnUnobservedGap",
-            "CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.PlotProjectionDashesTheLongFirstIntervalAndKeepsLaterEvidenceSolid",
-            "CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.V3AstraHistoryRendersWithoutLegacyModelRows",
-            "CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.InferredLinesAreThinnerThanMeasuredModelLines",
-        }
-    )
-    with tempfile.TemporaryDirectory(prefix="codex-info-windows-routing-") as raw_root:
-        root = Path(raw_root)
-        fake_bin = root / "bin"
-        fake_bin.mkdir()
-        calls_path = root / "calls.jsonl"
-        for command in ("bash", "dirname", "mktemp", "rm", "python3"):
-            executable = shutil.which(command)
-            if executable is None:
-                raise AssertionError(f"fixture standard tool is unavailable: {command}")
-            (fake_bin / command).symlink_to(executable)
-        fake_dotnet = fake_bin / "dotnet"
-        fake_dotnet.write_text(
-            textwrap.dedent(
-                f"""\
-                #!{sys.executable}
-                import json
-                import os
-                from pathlib import Path
-                import sys
-                import xml.etree.ElementTree as ET
-
-                args = sys.argv[1:]
-                with Path(os.environ["ROUTING_CALLS"]).open("a", encoding="utf-8") as output:
-                    output.write(json.dumps(args) + "\\n")
-                if args[0] == "restore":
-                    raise SystemExit(0)
-                if args[0] != "test":
-                    raise SystemExit(2)
-                raw_filter = args[args.index("--filter") + 1]
-                methods = [item.removeprefix("FullyQualifiedName=") for item in raw_filter.split("|")]
-                results = Path(args[args.index("--results-directory") + 1])
-                results.mkdir(parents=True, exist_ok=True)
-                root = ET.Element("TestRun")
-                ET.SubElement(root, "Counters", total=str(len(methods)), executed=str(len(methods)), passed=str(len(methods)), failed="0", notExecuted="0")
-                definitions = ET.SubElement(root, "TestDefinitions")
-                for method in methods:
-                    class_name, method_name = method.rsplit(".", 1)
-                    ET.SubElement(definitions, "TestMethod", className=class_name, name=method_name)
-                ET.ElementTree(root).write(results / (Path(args[1]).stem + ".trx"), encoding="utf-8")
-                """
-            ),
-            encoding="utf-8",
-        )
-        fake_dotnet.chmod(0o755)
-        fake_pwsh = fake_bin / "pwsh"
-        fake_pwsh.write_text(
-            textwrap.dedent(
-                f"""\
-                #!{sys.executable}
-                import json
-                import os
-                from pathlib import Path
-                import sys
-
-                args = ["pwsh", *sys.argv[1:]]
-                with Path(os.environ["ROUTING_CALLS"]).open("a", encoding="utf-8") as output:
-                    output.write(json.dumps(args) + "\\n")
-                """
-            ),
-            encoding="utf-8",
-        )
-        fake_pwsh.chmod(0o755)
-        result = subprocess.run(
-            ("bash", str(ROOT / "scripts/windows_client_contract_gate.sh"), "--model-history"),
-            cwd=ROOT,
-            env={**os.environ, "PATH": str(fake_bin), "ROUTING_CALLS": str(calls_path)},
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise AssertionError(f"Windows model caller failed: {result.stderr}")
-        calls = [json.loads(line) for line in calls_path.read_text(encoding="utf-8").splitlines()]
-        test_calls = [args for args in calls if args[0] == "test"]
-        if len(test_calls) != 2 or any(args[0] == "format" for args in calls):
-            raise AssertionError(f"Windows model caller expanded its command set: {calls}")
-        pwsh_calls = [args for args in calls if args[0] == "pwsh"]
-        expected_pwsh = [[
-            "pwsh",
-            "-NoProfile",
-            "-File",
-            "windows-client/tools/Run-WindowsClientE2E.ps1",
-            "-FixtureContractTest",
-        ]]
-        if pwsh_calls != expected_pwsh:
-            raise AssertionError(
-                f"Windows model caller omitted its finite E2E fixture contract: {pwsh_calls}"
-            )
-        observed: dict[str, frozenset[str]] = {}
-        for args in test_calls:
-            target = args[1]
-            raw_filter = args[args.index("--filter") + 1]
-            observed[target] = frozenset(
-                item.removeprefix("FullyQualifiedName=")
-                for item in raw_filter.split("|")
-            )
-        expected = {
-            "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/CodexInfo.WindowsClient.Core.Tests.csproj": expected_core,
-            "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/CodexInfo.WindowsClient.Presentation.Tests.csproj": expected_presentation,
-        }
-        if observed != expected:
-            raise AssertionError(f"Windows model caller selected the wrong methods: {observed}")
-    return 1
 
 
-def _governance_path_selection_tests(workflow: str) -> int:
-    """Run the remote shell through the real local path selector, without suites."""
-    script = _step_script(workflow, "Validate workflow syntax and requirements")
-    with tempfile.TemporaryDirectory(prefix="codex-info-governance-routing-") as raw_root:
-        root = Path(raw_root)
-        repo = root / "repo"
-        scripts = repo / "scripts"
-        scripts.mkdir(parents=True)
-        calls = root / "calls"
-        fake_bin = root / "bin"
-        fake_bin.mkdir()
-        for name in ("pre_pr_gate.sh", "quality_plan.py", "ci_change_scope.py", "regression_guard.sh"):
-            shutil.copy2(ROOT / "scripts" / name, scripts / name)
-        (scripts / "requirements_ledger_gate.sh").write_text(
-            'printf "requirements-authority\\n" >> "$ROUTING_CALLS"\n', encoding="utf-8"
-        )
-        fixture_names = (
-            "test_requirements_authority.py", "test_quality_plan.py", "test_ci_change_scope.py",
-            "test_selected_quality_gate.py", "test_codeql_workflow.py", "workflow_quality_gate.py",
-            "workflow_inno_acquisition_gate.py",
-        )
-        for name in fixture_names:
-            (scripts / name).write_text(
-                "import os\nfrom pathlib import Path\n"
-                "with open(os.environ['ROUTING_CALLS'], 'a') as output:\n"
-                "    output.write(Path(__file__).name + '\\n')\n",
-                encoding="utf-8",
-            )
-        fake_go = fake_bin / "go"
-        fake_go.write_text(
-            '#!/usr/bin/env bash\nprintf "actionlint\\n" >> "$ROUTING_CALLS"\n', encoding="utf-8"
-        )
-        fake_go.chmod(0o755)
-        workflow_path = repo / ".github/workflows/selective-quality.yml"
-        workflow_path.parent.mkdir(parents=True)
-        workflow_path.write_text(workflow, encoding="utf-8")
-        _git(repo, "init", "--quiet")
-        _git(repo, "config", "user.name", "fixture")
-        _git(repo, "config", "user.email", "fixture@example.invalid")
-        _git(repo, "add", ".")
-        _git(repo, "commit", "--quiet", "-m", "base")
-        base = _git(repo, "rev-parse", "HEAD")
-        cases = (
-            ("scripts/regression_guard.sh", ["requirements-authority"]),
-            ("scripts/quality_plan.py", ["requirements-authority", "test_quality_plan.py",
-                                         "test_ci_change_scope.py", "test_selected_quality_gate.py"]),
-            (".github/workflows/selective-quality.yml", ["actionlint", "requirements-authority",
-                                                       "workflow_quality_gate.py", "test_codeql_workflow.py"]),
-        )
-        for path, expected in cases:
-            target = repo / path
-            original = target.read_text(encoding="utf-8")
-            target.write_text(original + "\n# routing fixture\n", encoding="utf-8")
-            _git(repo, "add", path)
-            _git(repo, "commit", "--quiet", "-m", "candidate")
-            head = _git(repo, "rev-parse", "HEAD")
-            calls.write_text("", encoding="utf-8")
-            result = subprocess.run(
-                ("bash", "-c", script), cwd=repo, capture_output=True, text=True,
-                env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}",
-                     "BASE_SHA": base, "SOURCE_SHA": head, "QUALITY_PROFILE": "workflow-selection",
-                     "ROUTING_CALLS": str(calls)},
-            )
-            actual = calls.read_text(encoding="utf-8").splitlines()
-            if result.returncode != 0 or actual != expected:
-                raise AssertionError(f"governance routing {path}: {actual}, {result.stderr}")
-            base = head
-        # Moving authority validation into the branches must not narrow the
-        # release branch or execute it twice.
-        calls.write_text("", encoding="utf-8")
-        result = subprocess.run(
-            ("bash", "-c", script), cwd=repo, capture_output=True, text=True,
-            env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}",
-                 "BASE_SHA": base, "SOURCE_SHA": base, "QUALITY_PROFILE": "release",
-                 "ROUTING_CALLS": str(calls)},
-        )
-        actual = calls.read_text(encoding="utf-8").splitlines()
-        expected = ["requirements-authority", "actionlint",
-                    "workflow_inno_acquisition_gate.py", "workflow_quality_gate.py"]
-        if result.returncode != 0 or actual != expected:
-            raise AssertionError(f"release governance routing: {actual}, {result.stderr}")
-    return len(cases) + 1
 
 
 def workflow_selection_self_test() -> int:
-    """Exercise only the changed feat selector/profile wiring.
+    """Exercise only the changed feat owner-selection wiring.
 
     Release publication, bundle construction, installer, and product E2E are
-    separate risk paths and intentionally do not run for this profile.
+    separate risk paths and intentionally do not run for a feat pull request.
     """
 
     baseline = sources()
@@ -3484,8 +3108,8 @@ def workflow_selection_self_test() -> int:
         ("feat-integration.yml", "--find-copies-harder", "--no-renames"),
         (
             "feat-integration.yml",
-            '--profile-document "$profile_document"',
-            '--name-status "$profile_document"',
+            'scripts/ci_change_scope.py --name-status "$changes"',
+            'scripts/ci_change_scope.py --release-candidate --name-status "$changes"',
         ),
         (
             "selective-quality.yml",
@@ -3494,48 +3118,18 @@ def workflow_selection_self_test() -> int:
         ),
         (
             "rust.yml",
-            "bash scripts/regression_guard.sh --history-graph",
+            "cargo test --locked --all-targets -- --nocapture",
             "true",
-        ),
-        (
-            "rust.yml",
-            "bash scripts/regression_guard.sh --resident-publication",
-            "true",
-        ),
-        (
-            "rust.yml",
-            "bash scripts/regression_guard.sh --app-server-isolation",
-            "true",
-        ),
-        (
-            "rust.yml",
-            "bash scripts/regression_guard.sh --recorder-gap",
-            "true",
-        ),
-        (
-            "rust.yml",
-            ' || "$QUALITY_PROFILE" == resident-publication',
-            "",
-        ),
-        (
-            "rust.yml",
-            ' || "$QUALITY_PROFILE" == app-server-isolation',
-            "",
-        ),
-        (
-            "rust.yml",
-            ' || "$QUALITY_PROFILE" == recorder-gap',
-            "",
         ),
         (
             "windows-client.yml",
-            "bash scripts/windows_client_contract_gate.sh --history-graph",
+            "dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release",
             "true",
         ),
         (
             "linux-ui-quality.yml",
-            "if: inputs.quality_profile == 'release'",
-            "if: always()",
+            "bash scripts/x11_graph_visual_gate.sh",
+            "true",
         ),
     )
     cases = 1
@@ -3551,17 +3145,12 @@ def workflow_selection_self_test() -> int:
         baseline["selective-quality.yml"]
     )
     copy_cases = _git_copy_detection_test()
-    routing_cases = (
-        _focused_rust_routing_tests()
-        + _focused_windows_model_routing_test()
-        + _governance_path_selection_tests(baseline["selective-quality.yml"])
-    )
-    total_cases = cases + release_candidate_cases + copy_cases + routing_cases
+    total_cases = cases + release_candidate_cases + copy_cases
     print(
-        "workflow-quality-gate: PASS profile=workflow-selection "
+        "workflow-quality-gate: PASS scope=owner-selection "
         f"total_cases={total_cases} static_cases={cases} "
         f"release_non_narrowing_cases={release_candidate_cases} "
-        f"copy_cases={copy_cases} routing_cases={routing_cases}"
+        f"copy_cases={copy_cases}"
     )
     return 0
 
@@ -3713,18 +3302,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--release-self-test", action="store_true")
-    parser.add_argument("--profile", choices=("workflow-selection",))
+    parser.add_argument("--owner-selection-self-test", action="store_true")
     args = parser.parse_args(argv)
-    if args.self_test and args.release_self_test:
-        parser.error("--self-test and --release-self-test are mutually exclusive")
+    selected_modes = sum(
+        (args.self_test, args.release_self_test, args.owner_selection_self_test)
+    )
+    if selected_modes > 1:
+        parser.error("self-test modes are mutually exclusive")
     if args.release_self_test:
         return release_self_test()
+    if args.owner_selection_self_test:
+        return workflow_selection_self_test()
     if args.self_test:
-        if args.profile == "workflow-selection":
-            return workflow_selection_self_test()
         return self_test()
-    if args.profile is not None:
-        parser.error("--profile requires --self-test")
     errors = validate(sources())
     if errors:
         for error in errors:

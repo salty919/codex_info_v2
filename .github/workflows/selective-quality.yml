@@ -65,27 +65,26 @@ jobs:
       - name: Validate workflow syntax and requirements
         env:
           BASE_SHA: ${{ inputs.base_sha }}
-          QUALITY_PROFILE: ${{ fromJSON(inputs.selection_json).quality_profile }}
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
           git diff --check "$BASE_SHA" "$SOURCE_SHA"
-          if [[ "$QUALITY_PROFILE" == workflow-selection ]]; then
+          if [[ "$RELEASE_CANDIDATE" == false ]]; then
             mapfile -t changed_workflows < <(
               git diff --name-only "$BASE_SHA" "$SOURCE_SHA" -- '.github/workflows/*.yml'
             )
             if ((${#changed_workflows[@]} > 0)); then
               go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 "${changed_workflows[@]}"
             fi
-            bash scripts/pre_pr_gate.sh --base "$BASE_SHA" --quality-profile workflow-selection
-          elif [[ "$QUALITY_PROFILE" == release ]]; then
+            bash scripts/pre_pr_gate.sh --base "$BASE_SHA" \
+              --requested-check requirements-authority \
+              --requested-check governance-contract
+          else
             bash scripts/requirements_ledger_gate.sh
             go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
             python3 scripts/workflow_inno_acquisition_gate.py --self-test
             python3 scripts/workflow_quality_gate.py --self-test
-          else
-            echo "unsupported governance quality profile: $QUALITY_PROFILE" >&2
-            exit 1
           fi
 
   linux-backend-quality:
@@ -94,7 +93,7 @@ jobs:
     uses: ./.github/workflows/rust.yml
     with:
       source_sha: ${{ inputs.source_sha }}
-      quality_profile: ${{ fromJSON(inputs.selection_json).quality_profile }}
+      release_candidate: ${{ inputs.release_candidate }}
     permissions:
       contents: read
 
@@ -104,7 +103,7 @@ jobs:
     uses: ./.github/workflows/linux-ui-quality.yml
     with:
       source_sha: ${{ inputs.source_sha }}
-      quality_profile: ${{ fromJSON(inputs.selection_json).quality_profile }}
+      release_candidate: ${{ inputs.release_candidate }}
     permissions:
       contents: read
 
@@ -116,7 +115,6 @@ jobs:
       source_sha: ${{ inputs.source_sha }}
       pr_number: ${{ inputs.pr_number }}
       release_candidate: ${{ inputs.release_candidate }}
-      quality_profile: ${{ fromJSON(inputs.selection_json).quality_profile }}
     permissions:
       contents: read
 
