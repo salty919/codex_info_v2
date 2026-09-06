@@ -10,8 +10,9 @@ fail() {
 }
 
 base_revision=''
-quality_profile=''
+deployed_caller_profile=''
 requested_args=()
+requested_checks=()
 while (($# > 0)); do
     case "$1" in
         --base)
@@ -20,20 +21,31 @@ while (($# > 0)); do
             base_revision="$2"
             shift 2
             ;;
+        --quality-profile)
+            [[ $# -ge 2 && -z "$deployed_caller_profile" ]] ||
+                fail '--quality-profile requires one value and may appear only once'
+            [[ "$2" == 'workflow-selection' ]] ||
+                fail "unsupported deployed caller profile: $2"
+            deployed_caller_profile="$2"
+            shift 2
+            ;;
         --requested-check)
             [[ $# -ge 2 ]] || fail '--requested-check requires one check ID'
             requested_args+=(--requested-check "$2")
-            shift 2
-            ;;
-        --quality-profile)
-            [[ $# -ge 2 && -z "$quality_profile" ]] ||
-                fail '--quality-profile requires one value and may appear only once'
-            quality_profile="$2"
+            requested_checks+=("$2")
             shift 2
             ;;
         *) fail "unknown argument: $1" ;;
     esac
 done
+
+# The deployed main workflow still invokes this exact interface while it is the
+# trusted caller. Validate its sole known value but let the owner plan select
+# every affected check. Remove this bridge after the new caller reaches main.
+if [[ -n "$deployed_caller_profile" ]]; then
+    ((${#requested_checks[@]} == 0)) ||
+        fail '--quality-profile cannot be combined with --requested-check'
+fi
 
 if [[ -n "$base_revision" ]]; then
     git rev-parse --verify "${base_revision}^{commit}" >/dev/null 2>&1 ||
@@ -59,20 +71,22 @@ plan_args=()
 for path in "${changed_paths[@]}"; do
     plan_args+=(--path "$path")
 done
-profile_args=()
-[[ -z "$quality_profile" ]] || profile_args+=(--quality-profile "$quality_profile")
 plan_json="$(python3 scripts/quality_plan.py \
-    "${plan_args[@]}" "${profile_args[@]}" "${requested_args[@]}")" || exit $?
+    "${plan_args[@]}" "${requested_args[@]}")" || exit $?
 printf 'pre-pr-gate: plan %s\n' "$plan_json"
 
-mapfile -t checks < <(
-    python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["checks"]))' \
-        <<<"$plan_json"
-)
+if ((${#requested_checks[@]} > 0)); then
+    checks=("${requested_checks[@]}")
+else
+    mapfile -t checks < <(
+        python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)["checks"]))' \
+            <<<"$plan_json"
+    )
+fi
 ((${#checks[@]} > 0)) || fail 'quality plan contains no checks'
 
 run_governance_contract() {
-    local path run_authority_fixtures=0 run_selector_fixtures=0 run_workflow_fixtures=0
+    local path run_authority_fixtures=0 run_selector_fixtures=0 run_workflow_fixtures=0 run_codeql_fixture=0
     for path in "${changed_paths[@]}"; do
         if [[ "$path" == *.sh && -f "$path" ]]; then
             bash -n "$path"
@@ -97,6 +111,9 @@ PY
                 run_workflow_fixtures=1
                 ;;
         esac
+        if [[ "$path" == .github/workflows/codeql.yml || "$path" == scripts/test_codeql_workflow.py ]]; then
+            run_codeql_fixture=1
+        fi
     done
 
     ((run_authority_fixtures == 0)) || python3 scripts/test_requirements_authority.py
@@ -107,7 +124,9 @@ PY
     fi
     if ((run_workflow_fixtures != 0)); then
         python3 scripts/workflow_quality_gate.py \
-            --self-test --profile workflow-selection
+            --owner-selection-self-test
+    fi
+    if ((run_codeql_fixture != 0)); then
         python3 scripts/test_codeql_workflow.py
     fi
 }
@@ -127,42 +146,14 @@ for check in "${checks[@]}"; do
         rust-test)
             bash scripts/regression_guard.sh --test
             ;;
+        linux-ui-contract)
+            command -v xvfb-run >/dev/null 2>&1 || fail 'xvfb-run is unavailable'
+            cargo build --release --locked
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
+                bash scripts/x11_graph_visual_gate.sh
+            ;;
         windows-contract)
             bash scripts/windows_client_contract_gate.sh
-            ;;
-        rust-history-graph)
-            bash scripts/regression_guard.sh --history-graph
-            ;;
-        rust-model-history)
-            bash scripts/regression_guard.sh --model-history
-            ;;
-        rust-app-server-isolation)
-            bash scripts/regression_guard.sh --app-server-isolation
-            ;;
-        rust-resident-publication)
-            bash scripts/regression_guard.sh --resident-publication
-            ;;
-        rust-recorder-gap)
-            bash scripts/regression_guard.sh --recorder-gap
-            ;;
-        linux-ui-history-graph)
-            cargo build --release --locked
-            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
-                bash scripts/x11_graph_visual_gate.sh
-            ;;
-        linux-ui-model-history)
-            cargo build --release --locked
-            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
-                bash scripts/x11_graph_visual_gate.sh
-            ;;
-        windows-history-graph)
-            bash scripts/windows_client_contract_gate.sh --history-graph
-            ;;
-        windows-model-history)
-            bash scripts/windows_client_contract_gate.sh --model-history
-            ;;
-        governance-workflow-selection)
-            run_governance_contract
             ;;
         *)
             fail "quality plan returned an unimplemented check: $check"
