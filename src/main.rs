@@ -8178,6 +8178,7 @@ fn app_server_arguments(sqlite_home: Option<&Path>) -> Vec<OsString> {
 }
 
 fn prepare_app_server_generation() -> Result<PreparedGeneration, String> {
+    retry_pending_app_server_reaps();
     let cache_root = usage_data_root()
         .ok_or_else(|| "Codex app-serverの専用保存先を準備できませんでした。".to_owned())?
         .join("app-server-sqlite");
@@ -8192,6 +8193,71 @@ struct RunningAppServer {
     generation: Option<PreparedGeneration>,
     input: std::process::ChildStdin,
     output: Receiver<RpcReadEvent>,
+}
+
+struct PendingAppServerReap {
+    child: security::ChildGuard,
+    generation: Option<PreparedGeneration>,
+}
+
+#[derive(Default)]
+struct AppServerReapQueue {
+    pending: Mutex<Vec<PendingAppServerReap>>,
+}
+
+impl AppServerReapQueue {
+    fn finish_with<F>(
+        &self,
+        mut child: security::ChildGuard,
+        generation: Option<PreparedGeneration>,
+        reap: F,
+    ) where
+        F: FnOnce(&mut security::ChildGuard) -> bool,
+    {
+        if reap(&mut child) {
+            if let Some(generation) = generation {
+                let _ = generation.cleanup();
+            }
+            return;
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(PendingAppServerReap { child, generation });
+    }
+
+    fn retry(&self) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.retain_mut(|server| {
+            if server.child.kill_and_reap().is_err() {
+                return true;
+            }
+            if let Some(generation) = server.generation.take() {
+                let _ = generation.cleanup();
+            }
+            false
+        });
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
+
+fn pending_app_server_reaps() -> &'static AppServerReapQueue {
+    static PENDING: OnceLock<AppServerReapQueue> = OnceLock::new();
+    PENDING.get_or_init(AppServerReapQueue::default)
+}
+
+fn retry_pending_app_server_reaps() {
+    pending_app_server_reaps().retry();
 }
 
 impl RunningAppServer {
@@ -8215,21 +8281,14 @@ impl RunningAppServer {
         };
         let mut child = security::ChildGuard::new(child);
         let Some(input) = child.child_mut().ok().and_then(|child| child.stdin.take()) else {
-            let reaped = child.kill_and_reap().is_ok();
-            if reaped {
-                if let Some(generation) = generation {
-                    let _ = generation.cleanup();
-                }
-            }
+            pending_app_server_reaps()
+                .finish_with(child, generation, |child| child.kill_and_reap().is_ok());
             return Err("Codex app-serverの入出力を初期化できませんでした。".into());
         };
         let Some(stdout) = child.child_mut().ok().and_then(|child| child.stdout.take()) else {
-            let reaped = child.kill_and_reap().is_ok();
-            if reaped {
-                if let Some(generation) = generation {
-                    let _ = generation.cleanup();
-                }
-            }
+            drop(input);
+            pending_app_server_reaps()
+                .finish_with(child, generation, |child| child.kill_and_reap().is_ok());
             return Err("Codex app-serverの入出力を初期化できませんでした。".into());
         };
         Ok(Self {
@@ -8240,12 +8299,25 @@ impl RunningAppServer {
         })
     }
 
-    fn shutdown(&mut self) {
-        if self.child.kill_and_reap().is_ok() {
-            if let Some(generation) = self.generation.take() {
-                let _ = generation.cleanup();
-            }
-        }
+    fn shutdown(self) {
+        self.shutdown_with(pending_app_server_reaps(), |child| {
+            child.kill_and_reap().is_ok()
+        });
+    }
+
+    fn shutdown_with<F>(self, queue: &AppServerReapQueue, reap: F)
+    where
+        F: FnOnce(&mut security::ChildGuard) -> bool,
+    {
+        let Self {
+            child,
+            generation,
+            input,
+            output,
+        } = self;
+        drop(input);
+        drop(output);
+        queue.finish_with(child, generation, reap);
     }
 }
 
@@ -8685,7 +8757,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
     while let Ok(command) = commands.recv() {
         match command {
             ThreadCommand::Stop => {
-                if let Some(mut server) = server.take() {
+                if let Some(server) = server.take() {
                     server.shutdown();
                 }
                 break;
@@ -8717,7 +8789,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                     }
                 };
                 if active_paths.is_empty() {
-                    if let Some(mut idle) = server.take() {
+                    if let Some(idle) = server.take() {
                         idle.shutdown();
                     }
                     server_active_paths.clear();
@@ -8739,7 +8811,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                 // the process-owned session-set boundary; steady-state polls
                 // keep the same child and do not create process churn.
                 if server.is_some() && server_active_paths != active_paths {
-                    if let Some(mut stale) = server.take() {
+                    if let Some(stale) = server.take() {
                         stale.shutdown();
                     }
                     server_active_paths.clear();
@@ -8793,7 +8865,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                     // A framing, timeout, EOF or protocol-budget failure can
                     // leave this connection unusable. Reap only this isolated
                     // thread server so the next scheduled read starts cleanly.
-                    if let Some(mut failed) = server.take() {
+                    if let Some(failed) = server.take() {
                         failed.shutdown();
                     }
                     server_active_paths.clear();
@@ -31121,7 +31193,7 @@ mod tests {
             .unwrap();
         let input = child.stdin.take().unwrap();
         let output = super::rpc_reader(child.stdout.take().unwrap());
-        let mut server = super::RunningAppServer {
+        let server = super::RunningAppServer {
             child: codex_info::security::ChildGuard::new(child),
             generation: Some(generation),
             input,
@@ -31130,6 +31202,46 @@ mod tests {
 
         server.shutdown();
 
+        assert!(!generation_path.exists());
+
+        let generation =
+            codex_info::app_server_sqlite::PreparedGeneration::prepare(&cache_root, &codex_root)
+                .unwrap();
+        let generation_path = generation.path().to_path_buf();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "cat"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = super::rpc_reader(child.stdout.take().unwrap());
+        let server = super::RunningAppServer {
+            child: codex_info::security::ChildGuard::new(child),
+            generation: Some(generation),
+            input,
+            output,
+        };
+        let queue = super::AppServerReapQueue::default();
+
+        server.shutdown_with(&queue, |_| false);
+
+        assert_eq!(queue.len(), 1);
+        assert!(generation_path.exists());
+        let competing_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(generation_path.join(".owner.lock"))
+            .unwrap();
+        assert!(rustix::fs::flock(
+            &competing_lock,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive
+        )
+        .is_err());
+
+        queue.retry();
+
+        assert_eq!(queue.len(), 0);
         assert!(!generation_path.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
