@@ -13,18 +13,18 @@ class QualityPlanTests(unittest.TestCase):
         cases = {
             "docs/PRODUCT_REQUIREMENTS.md": (("DOCS",), ("requirements-authority",)),
             ".github/workflows/feat-integration.yml": (
-                ("GOVERNANCE",), ("requirements-authority", "governance-contract")
+                ("GOVERNANCE",), ("governance-contract",)
             ),
             "src/lib.rs": (
                 ("LINUX_BACKEND",),
-                ("requirements-authority", "rust-format", "rust-test"),
+                ("rust-format", "rust-test"),
             ),
             "ui/app.slint": (
                 ("LINUX_UI",),
-                ("requirements-authority", "rust-format", "rust-test"),
+                ("linux-ui-contract",),
             ),
             "windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml.cs": (
-                ("WINDOWS",), ("requirements-authority", "windows-contract")
+                ("WINDOWS",), ("windows-contract",)
             ),
         }
         for path, expected in cases.items():
@@ -38,14 +38,18 @@ class QualityPlanTests(unittest.TestCase):
         )
         self.assertEqual(
             plan.checks,
-            ("requirements-authority", "rust-format", "rust-test", "windows-contract"),
+            (
+                "requirements-authority",
+                "rust-format",
+                "rust-test",
+                "linux-ui-contract",
+                "windows-contract",
+            ),
         )
 
     def test_requested_subset_is_allowed_without_changing_plan(self) -> None:
         plan = plan_for_paths(("src/lib.rs",), requested_checks=("rust-test",))
-        self.assertEqual(
-            plan.checks, ("requirements-authority", "rust-format", "rust-test")
-        )
+        self.assertEqual(plan.checks, ("rust-format", "rust-test"))
 
     def test_duplicate_unknown_and_unrelated_requests_fail(self) -> None:
         cases = (

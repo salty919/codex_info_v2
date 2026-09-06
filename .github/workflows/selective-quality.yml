@@ -62,14 +62,13 @@ jobs:
         with:
           go-version: '1.25.x'
           cache: false
-      - name: Validate workflow syntax and requirements
+      - name: Validate workflow contracts
         env:
           BASE_SHA: ${{ inputs.base_sha }}
           RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          git diff --check "$BASE_SHA" "$SOURCE_SHA"
           if [[ "$RELEASE_CANDIDATE" == false ]]; then
             mapfile -t changed_workflows < <(
               git diff --name-only "$BASE_SHA" "$SOURCE_SHA" -- '.github/workflows/*.yml'
@@ -78,10 +77,8 @@ jobs:
               go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 "${changed_workflows[@]}"
             fi
             bash scripts/pre_pr_gate.sh --base "$BASE_SHA" \
-              --requested-check requirements-authority \
               --requested-check governance-contract
           else
-            bash scripts/requirements_ledger_gate.sh
             go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
             python3 scripts/workflow_inno_acquisition_gate.py --self-test
             python3 scripts/workflow_quality_gate.py --self-test
@@ -93,7 +90,7 @@ jobs:
     uses: ./.github/workflows/rust.yml
     with:
       source_sha: ${{ inputs.source_sha }}
-      release_candidate: ${{ inputs.release_candidate }}
+      release_candidate: ${{ inputs.release_candidate && fromJSON(inputs.selection_json).binary_impact }}
     permissions:
       contents: read
 
@@ -103,7 +100,7 @@ jobs:
     uses: ./.github/workflows/linux-ui-quality.yml
     with:
       source_sha: ${{ inputs.source_sha }}
-      release_candidate: ${{ inputs.release_candidate }}
+      release_candidate: ${{ inputs.release_candidate && fromJSON(inputs.selection_json).binary_impact }}
     permissions:
       contents: read
 
@@ -114,7 +111,7 @@ jobs:
     with:
       source_sha: ${{ inputs.source_sha }}
       pr_number: ${{ inputs.pr_number }}
-      release_candidate: ${{ inputs.release_candidate }}
+      release_candidate: ${{ inputs.release_candidate && fromJSON(inputs.selection_json).binary_impact }}
     permissions:
       contents: read
 

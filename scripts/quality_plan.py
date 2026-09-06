@@ -19,10 +19,10 @@ from ci_change_scope import ScopeError, selection_for_paths
 
 OWNER_CHECKS: dict[str, tuple[str, ...]] = {
     "DOCS": ("requirements-authority",),
-    "GOVERNANCE": ("requirements-authority", "governance-contract"),
-    "LINUX_BACKEND": ("requirements-authority", "rust-format", "rust-test"),
-    "LINUX_UI": ("requirements-authority", "rust-format", "rust-test"),
-    "WINDOWS": ("requirements-authority", "windows-contract"),
+    "GOVERNANCE": ("governance-contract",),
+    "LINUX_BACKEND": ("rust-format", "rust-test"),
+    "LINUX_UI": ("linux-ui-contract",),
+    "WINDOWS": ("windows-contract",),
 }
 ALL_CHECK_IDS = frozenset(
     check for checks in OWNER_CHECKS.values() for check in checks

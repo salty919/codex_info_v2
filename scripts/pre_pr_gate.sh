@@ -10,6 +10,7 @@ fail() {
 }
 
 base_revision=''
+deployed_caller_profile=''
 requested_args=()
 requested_checks=()
 while (($# > 0)); do
@@ -18,6 +19,14 @@ while (($# > 0)); do
             [[ $# -ge 2 && -z "$base_revision" ]] ||
                 fail '--base requires one value and may appear only once'
             base_revision="$2"
+            shift 2
+            ;;
+        --quality-profile)
+            [[ $# -ge 2 && -z "$deployed_caller_profile" ]] ||
+                fail '--quality-profile requires one value and may appear only once'
+            [[ "$2" == 'workflow-selection' ]] ||
+                fail "unsupported deployed caller profile: $2"
+            deployed_caller_profile="$2"
             shift 2
             ;;
         --requested-check)
@@ -29,6 +38,14 @@ while (($# > 0)); do
         *) fail "unknown argument: $1" ;;
     esac
 done
+
+# The deployed main workflow still invokes this exact interface while it is the
+# trusted caller. Validate its sole known value but let the owner plan select
+# every affected check. Remove this bridge after the new caller reaches main.
+if [[ -n "$deployed_caller_profile" ]]; then
+    ((${#requested_checks[@]} == 0)) ||
+        fail '--quality-profile cannot be combined with --requested-check'
+fi
 
 if [[ -n "$base_revision" ]]; then
     git rev-parse --verify "${base_revision}^{commit}" >/dev/null 2>&1 ||
@@ -128,6 +145,12 @@ for check in "${checks[@]}"; do
             ;;
         rust-test)
             bash scripts/regression_guard.sh --test
+            ;;
+        linux-ui-contract)
+            command -v xvfb-run >/dev/null 2>&1 || fail 'xvfb-run is unavailable'
+            cargo build --release --locked
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
+                bash scripts/x11_graph_visual_gate.sh
             ;;
         windows-contract)
             bash scripts/windows_client_contract_gate.sh

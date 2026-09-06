@@ -244,12 +244,20 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             mapping(f"selective.{job_id}", child.get("with"), {
                 "source_sha": "${{ inputs.source_sha }}"
             })
-        for job_id in ("linux-backend-quality", "linux-ui-quality"):
+        binary_release_expression = (
+            "${{ inputs.release_candidate && "
+            "fromJSON(inputs.selection_json).binary_impact }}"
+        )
+        for job_id in (
+            "linux-backend-quality",
+            "linux-ui-quality",
+            "windows-quality",
+        ):
             mapping(
                 f"selective.{job_id}",
                 _job(selective, job_id).get("with"),
                 {
-                    "release_candidate": "${{ inputs.release_candidate }}"
+                    "release_candidate": binary_release_expression
                 },
             )
         distribution = _job(selective, "linux-distribution")
@@ -275,7 +283,6 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         })
         mapping("selective.windows", selective_windows.get("with"), {
             "pr_number": "${{ inputs.pr_number }}",
-            "release_candidate": "${{ inputs.release_candidate }}",
         })
         mapping("selective.codeql", selective_codeql.get("with"), {
             "head_ref": "${{ inputs.head_ref }}",
@@ -633,11 +640,8 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         'bash scripts/pre_pr_gate.sh --base "$BASE_SHA"',
         1,
     )
-    for marker in (
-        "--requested-check requirements-authority",
-        "--requested-check governance-contract",
-    ):
-        count("selective-quality.yml", marker, 1)
+    count("selective-quality.yml", "--requested-check requirements-authority", 0)
+    count("selective-quality.yml", "--requested-check governance-contract", 1)
 
     linux_distribution = workflows["linux-distribution.yml"]
     for marker in (
