@@ -118,7 +118,7 @@ Codex app-server / session JSONL / thread rollout
 | 障害 | 保持するもの | 破棄するもの | 再試行 |
 | --- | --- | --- | --- |
 | app-server/REST停止 | 既存のquota、履歴、thread、DB | 未取得の新規値 | 次の明示/周期要求。local backfillは障害期間1回 |
-| daemon/recorder unexpected exit / restart budget超過 | 直前の完全snapshot、DB、hint、source cursor、gap ledger、last committed recorder state | 停止区間の推測quota、未検証の再起動candidate | worker死亡は2秒以内に検知し次cycleまでに1回だけ再試行。process exitはsystemdが5秒後に1回だけ再起動し、2回目はFailed latch。明示launcher/update activationでreset |
+| daemon/recorder unexpected exit | 直前の完全snapshot、DB、hint、source cursor、gap ledger、last committed recorder state | 停止区間の推測quota、未検証の再起動candidate | worker死亡は2秒以内に検知し次cycleまでに1回だけ再試行。process exitはsystemdが5秒後に再起動し続け、start limitで永久inactiveにしない。明示stop/disable/removeだけが停止を持続 |
 | oversized/不正な1レコード | 同一ファイル内の前後の有効レコード | そのレコード | 次のcycleで再読込可能 |
 | ローカル履歴のEOF未完了レコード | 直前の完全snapshot、DB | 不完全レコードを含むローカル入力 | 次のcycle |
 | I/O、差替え、EOF以外の部分行、資源上限 | 直前の完全snapshot、DB | 失敗cycleの部分結果 | 次のcycle |
