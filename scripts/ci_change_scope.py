@@ -15,39 +15,18 @@ OWNER_ORDER = ("DOCS", "GOVERNANCE", "LINUX_BACKEND", "LINUX_UI", "WINDOWS")
 GIT_STATUSES = frozenset({"A", "C", "D", "M", "R", "T"})
 
 DOC_EXACT = frozenset(
-    {"README.md", "README.en.md", "DESIGN.md", "SECURITY.md", "AGENTS.md"}
+    {"README.md", "README.en.md", "DESIGN.md", "SECURITY.md"}
 )
-WINDOWS_TEST_SCRIPT_EXACT = frozenset(
-    {
-        "scripts/capture_windows_window.ps1",
-        "scripts/windows_window_move_message_smoke.ps1",
-        "scripts/windows_window_move_smoke.ps1",
-    }
-)
-LINUX_PRODUCT_EXACT = frozenset(
-    {
-        "run.sh",
-        "scripts/install_systemd_recorder.sh",
-        "scripts/build_linux_bundle.sh",
-    }
-)
-LINUX_TEST_EXACT = frozenset(
-    {
-        "scripts/cli_contract_e2e.sh",
-        "scripts/data_protection_gate.sh",
-        "scripts/db_protection_e2e.sh",
-        "scripts/record_daemon_e2e.sh",
-        "scripts/test_linux_bundle.sh",
-        "scripts/test_linux_update_convergence.sh",
-        "scripts/test_run_launcher_version_sync.sh",
-    }
-)
-LINUX_UI_EXACT = frozenset(
-    {
-        "scripts/x11_graph_visual_gate.sh",
-        "scripts/x11_service_recovery_visual_gate.sh",
-        "scripts/x11_startup_visual_gate.sh",
-    }
+LINUX_PRODUCT_SCRIPT_PREFIXES = ("build_linux_", "install_systemd_", "linux_")
+LINUX_TEST_SCRIPT_PREFIXES = (
+    "cli_",
+    "data_",
+    "db_",
+    "fake_codex_",
+    "record_daemon_",
+    "regression_guard",
+    "test_linux_",
+    "test_run_",
 )
 LINUX_SHARED_EXACT = frozenset(
     {"Cargo.toml", "Cargo.lock", "build.rs", "src/main.rs"}
@@ -57,26 +36,6 @@ WINDOWS_PRODUCT_ROOT_EXACT = frozenset(
         "windows-client/CodexInfo.WindowsClient.sln",
         "windows-client/Directory.Build.props",
         "windows-client/THIRD_PARTY_NOTICES.md",
-    }
-)
-WINDOWS_PRODUCT_TOOL_EXACT = frozenset(
-    {
-        "windows-client/tools/Build-WindowsInstaller.ps1",
-        "windows-client/tools/Collect-ThirdPartyNotices.ps1",
-        "windows-client/tools/New-WindowsUpdateManifest.ps1",
-    }
-)
-WINDOWS_TEST_TOOL_EXACT = frozenset(
-    {
-        "windows-client/tools/Measure-WindowsGraphLatency.ps1",
-        "windows-client/tools/Run-WindowsClientE2E.ps1",
-        "windows-client/tools/Test-WindowsClientFixtureContract.ps1",
-    }
-)
-WINDOWS_GOVERNANCE_TOOL_EXACT = frozenset(
-    {
-        "windows-client/tools/Get-WindowsReleaseDecision.ps1",
-        "windows-client/tools/Test-WindowsReleaseDecision.ps1",
     }
 )
 LEGAL_SHARED_EXACT = frozenset(
@@ -90,6 +49,7 @@ class ScopeError(ValueError):
 class Selection:
     owners: tuple[str, ...]
     codeql_languages: tuple[str, ...]
+    powershell_paths: tuple[str, ...]
     binary_impact: bool
     distribution_required: bool
 
@@ -100,6 +60,7 @@ class Selection:
                 "distribution_required": self.distribution_required,
                 "owners": list(self.owners),
                 "codeql_languages": list(self.codeql_languages),
+                "powershell_paths": list(self.powershell_paths),
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -116,7 +77,11 @@ class PathSelection:
 
 
 def _path(value: str) -> str:
-    if not value or "\x00" in value or value.startswith("/"):
+    if (
+        not value
+        or any(character in value for character in "\x00\r\n")
+        or value.startswith("/")
+    ):
         raise ScopeError("changed file path is malformed")
     if any(part in {"", ".", ".."} for part in value.split("/")):
         raise ScopeError("changed file path is not normalized")
@@ -129,6 +94,7 @@ def _selection_for_path(path: str) -> PathSelection:
         return PathSelection(frozenset({"DOCS"}), False)
     if path.startswith((".github/", ".vscode/", ".codex-tasks/")) or path in {
         ".gitignore",
+        "AGENTS.md",
         "deny.toml",
     }:
         languages = (
@@ -137,12 +103,24 @@ def _selection_for_path(path: str) -> PathSelection:
             else frozenset()
         )
         return PathSelection(frozenset({"GOVERNANCE"}), False, languages)
-    if path in WINDOWS_TEST_SCRIPT_EXACT:
-        return PathSelection(frozenset({"WINDOWS"}), False)
-    if path in LINUX_PRODUCT_EXACT or path.startswith("packaging/"):
+    if path.startswith("scripts/"):
+        name = path.rsplit("/", 1)[-1]
+        if path.endswith(".ps1") or name.startswith("windows_"):
+            return PathSelection(frozenset({"WINDOWS"}), False)
+        if name.startswith("x11_"):
+            return PathSelection(frozenset({"LINUX_UI"}), False)
+        if name.startswith(LINUX_PRODUCT_SCRIPT_PREFIXES):
+            return PathSelection(frozenset({"LINUX_BACKEND"}), True)
+        if name.startswith(LINUX_TEST_SCRIPT_PREFIXES):
+            return PathSelection(frozenset({"LINUX_BACKEND"}), False)
+        languages = (
+            frozenset({"python"})
+            if path.endswith(".py") and not name.startswith("test_")
+            else frozenset()
+        )
+        return PathSelection(frozenset({"GOVERNANCE"}), False, languages)
+    if path == "run.sh" or path.startswith("packaging/"):
         return PathSelection(frozenset({"LINUX_BACKEND"}), True)
-    if path in LINUX_TEST_EXACT:
-        return PathSelection(frozenset({"LINUX_BACKEND"}), False)
     if path.startswith("tests/fixtures/graph_"):
         return PathSelection(
             frozenset({"LINUX_BACKEND", "LINUX_UI", "WINDOWS"}), False
@@ -152,8 +130,6 @@ def _selection_for_path(path: str) -> PathSelection:
     if path.startswith("src/") and path != "src/main.rs":
         languages = frozenset({"rust"}) if path.endswith(".rs") else frozenset()
         return PathSelection(frozenset({"LINUX_BACKEND"}), True, languages)
-    if path in LINUX_UI_EXACT:
-        return PathSelection(frozenset({"LINUX_UI"}), False)
     if path.startswith(("ui/", "assets/")):
         return PathSelection(frozenset({"LINUX_UI"}), True)
     if path in LINUX_SHARED_EXACT or path.startswith(".cargo/"):
@@ -176,27 +152,17 @@ def _selection_for_path(path: str) -> PathSelection:
         or path == "windows-client/CodeCoverage.runsettings"
     ):
         return PathSelection(frozenset({"WINDOWS"}), False)
-    if path in WINDOWS_TEST_TOOL_EXACT:
-        return PathSelection(frozenset({"WINDOWS"}), False)
-    if path in WINDOWS_GOVERNANCE_TOOL_EXACT:
-        return PathSelection(frozenset({"GOVERNANCE"}), False)
+    if path.startswith("windows-client/tools/"):
+        name = path.rsplit("/", 1)[-1]
+        binary_impact = name.startswith(("Build-", "Collect-", "Install-", "New-"))
+        return PathSelection(frozenset({"WINDOWS"}), binary_impact)
     if (
         path in WINDOWS_PRODUCT_ROOT_EXACT
-        or path in WINDOWS_PRODUCT_TOOL_EXACT
         or path.startswith(("windows-client/src/", "windows-client/installer/"))
     ):
         languages = frozenset({"csharp"}) if path.endswith(".cs") else frozenset()
         return PathSelection(frozenset({"WINDOWS"}), True, languages)
-    if path.startswith("scripts/"):
-        languages = frozenset({"python"}) if path.endswith(".py") else frozenset()
-        return PathSelection(frozenset({"GOVERNANCE"}), False, languages)
     raise ScopeError(f"changed path has no CI owner: {path}")
-
-
-def owners_for_path(path: str) -> frozenset[str]:
-    """Return the quality owners for one repository path."""
-
-    return _selection_for_path(path).owners
 
 
 def selection_for_paths(
@@ -206,11 +172,14 @@ def selection_for_paths(
 ) -> Selection:
     owners: set[str] = set()
     languages: set[str] = set()
+    powershell_paths: set[str] = set()
     binary_impact = False
     for path in paths:
         path_selection = _selection_for_path(path)
         owners.update(path_selection.owners)
         languages.update(path_selection.codeql_languages)
+        if path.endswith(".ps1"):
+            powershell_paths.add(path)
         binary_impact = binary_impact or path_selection.binary_impact
     if not owners:
         raise ScopeError("pull request contains no changed paths")
@@ -224,13 +193,14 @@ def selection_for_paths(
             for language in ("actions", "csharp", "python", "rust")
             if language in languages
         ),
+        powershell_paths=tuple(sorted(powershell_paths)),
         binary_impact=binary_impact,
         distribution_required=release_candidate and binary_impact,
     )
 
 
 def paths_from_name_status(raw: bytes) -> tuple[str, ...]:
-    """Parse `git diff --name-status -z`, retaining both ends of renames/copies."""
+    """Parse name-status records; retain both rename ends and only a copy target."""
     if not raw or not raw.endswith(b"\0"):
         raise ScopeError("git name-status diff is empty or truncated")
     try:
@@ -249,7 +219,8 @@ def paths_from_name_status(raw: bytes) -> tuple[str, ...]:
         path_count = 2 if kind in {"C", "R"} else 1
         if index + path_count > len(fields):
             raise ScopeError("git name-status record is truncated")
-        paths.extend(_path(value) for value in fields[index : index + path_count])
+        record_paths = tuple(_path(value) for value in fields[index : index + path_count])
+        paths.extend(record_paths if kind == "R" else record_paths[-1:])
         index += path_count
     return tuple(paths)
 

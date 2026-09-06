@@ -39,15 +39,14 @@ class QualityPlan:
     affected_owners: tuple[str, ...]
     checks: tuple[str, ...]
 
-    def as_dict(self) -> dict[str, object]:
-        return {
-            "affected_owners": list(self.affected_owners),
-            "checks": list(self.checks),
-        }
-
     def as_json(self) -> str:
         return json.dumps(
-            self.as_dict(), separators=(",", ":"), sort_keys=True
+            {
+                "affected_owners": list(self.affected_owners),
+                "checks": list(self.checks),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
         )
 
 

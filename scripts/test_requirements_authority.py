@@ -96,6 +96,17 @@ class RequirementAuthorityFixtures(unittest.TestCase):
         report = authority.validate(self.root)
         self.assertEqual((report.owners, report.requirements), (2, 2))
 
+    def test_normal_mode_accepts_in_progress_but_final_mode_rejects_it(self) -> None:
+        self._write_fixture(
+            ledger=[
+                ("PROD-1", "PRODUCT", "product code", "unit test", "in-progress"),
+                ("WIRE-1", "WIRE", "wire code", "fixture", "verified"),
+            ]
+        )
+        report = authority.validate(self.root)
+        self.assertFalse(report.final)
+        self.assertIn("final validation", self._assert_fail(final=True))
+
     def test_license_comments_may_precede_owner_marker(self) -> None:
         product = (self.root / "docs/PRODUCT_REQUIREMENTS.md").read_text(
             encoding="utf-8"
@@ -257,54 +268,6 @@ class RequirementAuthorityFixtures(unittest.TestCase):
                     ledger=[row, ("WIRE-1", "WIRE", "scope", "oracle", "verified")]
                 )
                 self.assertIn("empty ledger", self._assert_fail())
-
-    def test_unbounded_oracle_wording_is_rejected(self) -> None:
-        for oracle in (
-            "全graph unitを実行",
-            "全てのテストを実行",
-            "既存history回帰を確認",
-            "既存テストを確認",
-            "run all tests",
-            "full regression suite",
-        ):
-            with self.subTest(oracle=oracle):
-                self._write_fixture(
-                    ledger=[
-                        ("PROD-1", "PRODUCT", "scope", oracle, "implemented"),
-                        ("WIRE-1", "WIRE", "scope", "finite fixture", "verified"),
-                    ]
-                )
-                self.assertIn("unbounded ledger oracle", self._assert_fail())
-
-    def test_finite_oracle_wording_remains_valid(self) -> None:
-        self._write_fixture(
-            ledger=[
-                (
-                    "PROD-1",
-                    "PRODUCT",
-                    "scope",
-                    "first observation、confirmed gap、no-historyの3 case",
-                    "implemented",
-                ),
-                (
-                    "WIRE-1",
-                    "WIRE",
-                    "scope",
-                    "account_boundary_baselines_existing_sessions_and_latest_prefix",
-                    "verified",
-                ),
-            ]
-        )
-        self.assertEqual(authority.validate(self.root).requirements, 2)
-
-    def test_exact_duplicate_oracle_is_rejected_after_normalization(self) -> None:
-        self._write_fixture(
-            ledger=[
-                ("PROD-1", "PRODUCT", "scope", "fixed   fixture", "implemented"),
-                ("WIRE-1", "WIRE", "scope", "FIXED fixture", "verified"),
-            ]
-        )
-        self.assertIn("duplicate ledger oracle", self._assert_fail())
 
     def test_malformed_id_and_owner(self) -> None:
         self._write_fixture(

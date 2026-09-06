@@ -1,0 +1,65 @@
+# Copyright (C) 2026 salty919
+# SPDX-License-Identifier: GPL-3.0-only
+
+name: Linux release quality (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Immutable source commit selected by the trusted caller
+        required: true
+        type: string
+permissions:
+  contents: read
+
+jobs:
+  linux-release-quality:
+    name: linux-release-quality
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux release quality tools
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes binutils ripgrep sqlite3 xvfb xauth x11-apps x11-utils libxkbcommon-x11-0
+      - name: Check native formatting
+        run: bash scripts/regression_guard.sh --format
+      - name: Run native unit tests
+        run: bash scripts/regression_guard.sh --test
+      - name: Build the release binary once
+        run: cargo build --release --locked
+      - name: Run resident and CLI acceptance
+        run: |
+          bash scripts/cli_contract_e2e.sh
+          xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/record_daemon_e2e.sh
+      - name: Run Linux UI acceptance
+        run: |
+          xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/x11_startup_visual_gate.sh
+          xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/x11_graph_visual_gate.sh
+      - name: Create and validate the Linux bundle
+        id: bundle
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          output_dir="artifacts/linux-bundle"
+          bash scripts/build_linux_bundle.sh \
+            --binary target/release/codex_info \
+            --output-dir "$output_dir" \
+            --source-sha "$SOURCE_SHA" \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT"
+          bash scripts/test_linux_bundle.sh --bundle-dir "$output_dir"
+          version="$(python3 -c 'import json,pathlib,sys; print(json.loads(next(pathlib.Path(sys.argv[1]).glob("*.manifest.json")).read_text())["version"])' "$output_dir")"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - name: Upload Linux release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-linux-v1-version-${{ steps.bundle.outputs.version }}
+          path: artifacts/linux-bundle/*
+          if-no-files-found: error

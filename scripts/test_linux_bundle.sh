@@ -272,7 +272,7 @@ chmod 0755 "$fake_bin/curl"
 
 cat > "$fake_bin/objdump" <<'FAKE_OBJDUMP'
 #!/usr/bin/env bash
-printf 'fake GLIBC_2.31\n'
+printf 'architecture: %s, flags 0x0:\nfake GLIBC_2.31\n' "${FAKE_OBJDUMP_ARCH:-i386:x86-64}"
 FAKE_OBJDUMP
 chmod 0755 "$fake_bin/objdump"
 
@@ -528,6 +528,14 @@ run_active_startup_condition_case() {
     exec {hold_fd}>&-
     rm -f -- "$ready_path" "$hold_pipe"
 }
+
+if FAKE_OBJDUMP_ARCH=i386 SOURCE_SHA=1111111111111111111111111111111111111111 \
+    RUN_ID=92001 RUN_ATTEMPT=1 OBJDUMP_BIN="$fake_bin/objdump" \
+    bash "$BUILD_SCRIPT" --binary "$fixture_root/codex_info" --version 1.0.19 \
+    --output-dir "$TEST_ROOT/wrong-architecture" >/dev/null 2>&1; then
+    fail 'non-x86_64 binary was mislabeled as x86_64'
+fi
+printf 'case non-x86_64 bundle rejection: PASS\n'
 
 archive_v1="$(build_bundle 1111111111111111111111111111111111111111 1.0.19)"
 archive_v2=''

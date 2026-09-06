@@ -28,11 +28,19 @@ class OwnerSelectionTests(unittest.TestCase):
                 ("GOVERNANCE",), False, ("actions",)
             ),
             "scripts/ci_change_scope.py": (("GOVERNANCE",), False, ("python",)),
+            "scripts/test_future_contract.py": (("GOVERNANCE",), False, ()),
+            "AGENTS.md": (("GOVERNANCE",), False, ()),
+            "scripts/fake_codex_app_server.py": (("LINUX_BACKEND",), False, ()),
+            "scripts/linux_future_probe.sh": (("LINUX_BACKEND",), True, ()),
+            "scripts/x11_future_visual_gate.sh": (("LINUX_UI",), False, ()),
+            "scripts/windows_future_smoke.ps1": (("WINDOWS",), False, ()),
             "src/usage_store.rs": (("LINUX_BACKEND",), True, ("rust",)),
             "ui/app.slint": (("LINUX_UI",), True, ()),
             "windows-client/src/CodexInfo.WindowsClient.Core/DetailsContracts.cs": (
                 ("WINDOWS",), True, ("csharp",)
             ),
+            "windows-client/tools/Install-InnoSetup.ps1": (("WINDOWS",), True, ()),
+            "windows-client/tools/Test-WindowsInstallerLifecycle.ps1": (("WINDOWS",), False, ()),
         }
         for path, expected in cases.items():
             with self.subTest(path=path):
@@ -40,6 +48,10 @@ class OwnerSelectionTests(unittest.TestCase):
                 self.assertEqual(
                     (value.owners, value.binary_impact, value.codeql_languages),
                     expected,
+                )
+                self.assertEqual(
+                    value.powershell_paths,
+                    (path,) if path.endswith(".ps1") else (),
                 )
                 self.assertFalse(value.distribution_required)
 
@@ -65,7 +77,7 @@ class OwnerSelectionTests(unittest.TestCase):
     def test_test_sources_do_not_trigger_binary_or_codeql(self) -> None:
         value = selection_for_paths(
             (
-                "tests/release_linux_rollout.rs",
+                "tests/db_protection_runtime.rs",
                 "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/ContractsTests.cs",
             )
         )
@@ -74,24 +86,30 @@ class OwnerSelectionTests(unittest.TestCase):
         self.assertEqual(value.codeql_languages, ())
 
     def test_empty_unknown_and_malformed_paths_fail(self) -> None:
-        for paths in ((), ("new-root/file.txt",), ("../src/main.rs",), ("/tmp/x",)):
+        for paths in (
+            (),
+            ("new-root/file.txt",),
+            ("../src/main.rs",),
+            ("/tmp/x",),
+            ("scripts/bad\nname.ps1",),
+        ):
             with self.subTest(paths=paths), self.assertRaises(ScopeError):
                 selection_for_paths(paths)
 
 
 class NameStatusTests(unittest.TestCase):
-    def test_rename_and_copy_keep_both_endpoints(self) -> None:
+    def test_rename_keeps_both_endpoints_and_copy_keeps_only_changed_target(self) -> None:
         raw = (
             b"R100\0docs/old.md\0src/new.rs\0"
             b"C090\0ui/source.slint\0windows-client/src/New.cs\0"
         )
         self.assertEqual(
             paths_from_name_status(raw),
-            ("docs/old.md", "src/new.rs", "ui/source.slint", "windows-client/src/New.cs"),
+            ("docs/old.md", "src/new.rs", "windows-client/src/New.cs"),
         )
         value = selection_from_name_status(raw)
         self.assertEqual(
-            value.owners, ("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS")
+            value.owners, ("DOCS", "LINUX_BACKEND", "WINDOWS")
         )
 
     def test_add_modify_delete_are_parsed(self) -> None:
@@ -117,6 +135,7 @@ class CliTests(unittest.TestCase):
             )
         payload = json.loads(result.stdout)
         self.assertEqual(payload["owners"], ["LINUX_BACKEND"])
+        self.assertEqual(payload["powershell_paths"], [])
         self.assertNotIn("quality_profile", payload)
 
     def test_removed_profile_argument_is_rejected(self) -> None:

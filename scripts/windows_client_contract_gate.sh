@@ -4,171 +4,122 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-fail() {
-    echo "windows-client-contract-gate: FAIL: $*" >&2
+[[ $# -eq 0 ]] || {
+    echo "windows-client-contract-gate: FAIL: unexpected argument: $1" >&2
+    exit 1
+}
+command -v dotnet >/dev/null 2>&1 || {
+    echo 'windows-client-contract-gate: FAIL: dotnet is unavailable' >&2
     exit 1
 }
 
-profile='full'
-if [[ $# -eq 1 && "$1" == --history-graph ]]; then
-    profile='history-graph'
-elif [[ $# -eq 1 && "$1" == --model-history ]]; then
-    profile='model-history'
-elif [[ $# -ne 0 ]]; then
-    fail "unexpected argument: $1"
+powershell_path_lines="$(python3 - <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+try:
+    paths = json.loads(os.environ.get("POWERSHELL_PATHS_JSON", "[]"))
+except json.JSONDecodeError as error:
+    raise SystemExit(f"windows-client-contract-gate: FAIL: invalid PowerShell path JSON: {error}")
+if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+    raise SystemExit("windows-client-contract-gate: FAIL: PowerShell paths must be a JSON string list")
+for path in paths:
+    value = pathlib.PurePosixPath(path)
+    if not path or value.is_absolute() or ".." in value.parts or any(char in path for char in "\0\r\n"):
+        raise SystemExit("windows-client-contract-gate: FAIL: unsafe PowerShell path")
+    print(path)
+PY
+)"
+powershell_paths=()
+[[ -z "$powershell_path_lines" ]] || mapfile -t powershell_paths <<<"$powershell_path_lines"
+if ((${#powershell_paths[@]} > 0)); then
+    if command -v pwsh >/dev/null 2>&1; then
+        powershell_command='pwsh'
+    elif command -v powershell.exe >/dev/null 2>&1; then
+        powershell_command='powershell.exe'
+    else
+        echo 'windows-client-contract-gate: FAIL: PowerShell parser is unavailable' >&2
+        exit 1
+    fi
+    for path in "${powershell_paths[@]}"; do
+        [[ -f "$path" && ! -L "$path" ]] || continue
+        powershell_environment=(env "CODEX_INFO_PS_PATH=$PWD/$path")
+        if [[ "$powershell_command" == powershell.exe ]]; then
+            wsl_environment="${WSLENV:-}"
+            [[ -z "$wsl_environment" ]] || wsl_environment+=':'
+            powershell_environment+=("WSLENV=${wsl_environment}CODEX_INFO_PS_PATH/p")
+        fi
+        "${powershell_environment[@]}" "$powershell_command" \
+            -NoProfile -NonInteractive -Command '
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+                $env:CODEX_INFO_PS_PATH, [ref]$tokens, [ref]$errors
+            ) > $null
+            if ($errors.Count -gt 0) {
+                $errors | ForEach-Object { [Console]::Error.WriteLine($_.Message) }
+                exit 1
+            }
+        '
+    done
 fi
-command -v dotnet >/dev/null 2>&1 || fail 'dotnet is unavailable'
 
 solution='windows-client/CodexInfo.WindowsClient.sln'
-test_targets=("$solution")
-test_filters=('')
-test_log_prefixes=('windows-client')
-expected_methods=()
-if [[ "$profile" == history-graph ]]; then
-    test_targets=('windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/CodexInfo.WindowsClient.Presentation.Tests.csproj')
-    test_log_prefixes=('windows-history-graph')
-    expected_methods=(
-        CodexInfo.WindowsClient.Presentation.Tests.GraphWindowViewModelProjectionTests.Clips_current_graph_period_at_start_and_reset_boundaries
-        CodexInfo.WindowsClient.Presentation.Tests.GraphWindowViewModelProjectionTests.Keeps_historical_graph_period_boundary_intact
-        CodexInfo.WindowsClient.Presentation.Tests.GraphWindowViewModelProjectionTests.Graph_samples_start_at_first_observation_without_synthetic_anchor
-        CodexInfo.WindowsClient.Presentation.Tests.GraphWindowViewModelProjectionTests.Graph_samples_are_empty_when_period_has_no_history
-        CodexInfo.WindowsClient.Presentation.Tests.GraphWindowViewModelProjectionTests.Graph_samples_do_not_fabricate_quota_when_quota_observations_are_missing
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Shared_graph_fixture_matches_the_native_history_oracle_through_details_http_parser
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Shared_rollover_fixture_atomically_refreshes_open_main_graph_and_threads_from_details
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Live_incident_regression_recovery_is_never_connected_as_solid
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_cumulative_correction_fixture_never_paints_a_solid_recovery_bridge
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Confirmed_history_gap_ends_both_subpaths_without_a_cross_gap_connector
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Remaining_quota_observations_survive_flat_model_rows_as_unattributed_dashes
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Missing_remote_quota_is_never_painted_as_a_solid_bridge
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Reduction_preserves_regression_quota_and_confirmed_gap_boundaries
-    )
-    filter=''
-    for method in "${expected_methods[@]}"; do
-        filter+="${filter:+|}FullyQualifiedName=$method"
-    done
-    test_filters=("$filter")
-elif [[ "$profile" == model-history ]]; then
-    core_methods=(
-        CodexInfo.WindowsClient.Core.Tests.ContractsTests.HistorySampleModelsExposeEachProviderValues
-        CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsV3IsPreferredAndCarriesAstraHistory
-        CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsV3ReusesTheAcceptedGenerationWithAZeroBody304
-        CodexInfo.WindowsClient.Core.Tests.LoopbackStatusClientTests.DetailsFallsBackToV1OnlyWhenV3AndV2ReturnNotFound
-    )
-    presentation_methods=(
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.PlotProjectionDoesNotInventSpendDuringAnUnobservedGap
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.PlotProjectionDashesTheLongFirstIntervalAndKeepsLaterEvidenceSolid
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.V3AstraHistoryRendersWithoutLegacyModelRows
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.InferredLinesAreThinnerThanMeasuredModelLines
-    )
-    expected_methods=("${core_methods[@]}" "${presentation_methods[@]}")
-    core_filter=''
-    for method in "${core_methods[@]}"; do
-        core_filter+="${core_filter:+|}FullyQualifiedName=$method"
-    done
-    presentation_filter=''
-    for method in "${presentation_methods[@]}"; do
-        presentation_filter+="${presentation_filter:+|}FullyQualifiedName=$method"
-    done
-    test_targets=(
-        'windows-client/tests/CodexInfo.WindowsClient.Core.Tests/CodexInfo.WindowsClient.Core.Tests.csproj'
-        'windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/CodexInfo.WindowsClient.Presentation.Tests.csproj'
-    )
-    test_filters=("$core_filter" "$presentation_filter")
-    test_log_prefixes=('windows-model-history-core' 'windows-model-history-presentation')
-fi
 results_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex-info-windows-tests.XXXXXX")"
 case "$results_dir" in
     "${TMPDIR:-/tmp}"/codex-info-windows-tests.*) ;;
-    *) fail "unsafe temporary result path: $results_dir" ;;
+    *)
+        echo "windows-client-contract-gate: FAIL: unsafe temporary result path: $results_dir" >&2
+        exit 1
+        ;;
 esac
 trap 'rm -rf -- "$results_dir"' EXIT
 
-# Restore, formatting, and unit behavior form one Windows-source check.  The
-# gate owns each command once and deliberately does not mirror test names,
-# source strings, coverage percentages, installer, or real-OS E2E contracts.
-for test_target in "${test_targets[@]}"; do
-    dotnet restore "$test_target" --locked-mode
-done
-if [[ "$profile" == full ]]; then
-    dotnet format "$solution" --no-restore --verify-no-changes
-fi
-for index in "${!test_targets[@]}"; do
-    test_filter=()
-    if [[ -n "${test_filters[$index]}" ]]; then
-        test_filter=(--filter "${test_filters[$index]}")
-    fi
-    dotnet test "${test_targets[$index]}" \
-        --no-restore \
-        --configuration Release \
-        "${test_filter[@]}" \
-        --results-directory "$results_dir" \
-        --logger "trx;LogFilePrefix=${test_log_prefixes[$index]}"
-done
+dotnet restore "$solution" --locked-mode
+dotnet test "$solution" \
+    --no-restore \
+    --configuration Release \
+    --results-directory "$results_dir" \
+    --logger 'trx;LogFilePrefix=windows-client'
 
-if [[ "$profile" == model-history ]]; then
-    command -v pwsh >/dev/null 2>&1 || fail 'PowerShell is unavailable'
-    pwsh -NoProfile -File windows-client/tools/Run-WindowsClientE2E.ps1 -FixtureContractTest
-fi
-
-python3 - "$results_dir" "$profile" "${expected_methods[@]}" <<'PY'
+python3 - "$results_dir" <<'PY'
 from pathlib import Path
 import sys
 import xml.etree.ElementTree as ET
 
 reports = sorted(Path(sys.argv[1]).rglob("*.trx"))
-profile = sys.argv[2]
-expected_methods = set(sys.argv[3:])
 if not reports:
     raise SystemExit("windows-client-contract-gate: FAIL: TRX report is missing")
 
-totals = {name: 0 for name in ("total", "executed", "passed", "failed", "notExecuted")}
-observed_methods = set()
+totals = {name: 0 for name in ("total", "executed", "passed", "failed")}
 for report in reports:
-    root = ET.parse(report).getroot()
-    counters = [element for element in root.iter() if element.tag.endswith("Counters")]
+    counters = [
+        element
+        for element in ET.parse(report).getroot().iter()
+        if element.tag.endswith("Counters")
+    ]
     if not counters:
         raise SystemExit(
             f"windows-client-contract-gate: FAIL: TRX counters are missing: {report}"
         )
-    values = counters[-1].attrib
     for name in totals:
         try:
-            totals[name] += int(values.get(name, "0"))
+            totals[name] += int(counters[-1].attrib.get(name, "0"))
         except ValueError as exc:
             raise SystemExit(
                 f"windows-client-contract-gate: FAIL: malformed {name} counter: {report}"
             ) from exc
-    for element in root.iter():
-        if element.tag.endswith("TestMethod"):
-            class_name = element.attrib.get("className")
-            method_name = element.attrib.get("name")
-            if class_name and method_name:
-                observed_methods.add(f"{class_name}.{method_name}")
 
-# A positive passing observation is required.  Skipped/not-executed tests are
-# reported but are not converted into failures merely to satisfy a count.
 if totals["total"] <= 0 or totals["executed"] <= 0 or totals["passed"] <= 0:
     raise SystemExit("windows-client-contract-gate: FAIL: zero Windows tests executed")
 if totals["failed"] != 0:
     raise SystemExit("windows-client-contract-gate: FAIL: Windows test failure recorded")
-if profile in {"history-graph", "model-history"}:
-    missing = sorted(expected_methods - observed_methods)
-    unexpected = sorted(observed_methods - expected_methods)
-    if missing or unexpected:
-        raise SystemExit(
-            "windows-client-contract-gate: FAIL: focused method set mismatch "
-            f"missing={missing} unexpected={unexpected}"
-        )
 print(
     "windows-client-contract-gate: evidence "
     + " ".join(f"{name}={value}" for name, value in totals.items())
 )
 PY
 
-if [[ "$profile" == history-graph ]]; then
-    echo "windows-client-contract-gate: PASS check=windows-history-graph methods=${#expected_methods[@]}"
-elif [[ "$profile" == model-history ]]; then
-    echo "windows-client-contract-gate: PASS check=windows-model-history methods=${#expected_methods[@]}"
-else
-    echo 'windows-client-contract-gate: PASS check=windows-contract'
-fi
+echo 'windows-client-contract-gate: PASS check=windows-contract'

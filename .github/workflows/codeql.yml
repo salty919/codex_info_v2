@@ -25,7 +25,6 @@ jobs:
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
         language: ${{ fromJSON(inputs.languages_json) }}
     steps:
@@ -42,3 +41,4 @@ jobs:
           category: "/language:${{ matrix.language }}"
           ref: refs/heads/${{ inputs.head_ref }}
           sha: ${{ inputs.source_sha }}
+          upload-database: false

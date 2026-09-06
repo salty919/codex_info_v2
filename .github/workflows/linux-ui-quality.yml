@@ -10,10 +10,6 @@ on:
         description: Immutable source commit selected by the trusted caller
         required: true
         type: string
-      release_candidate:
-        description: Whether this is the final main release-candidate path
-        required: true
-        type: boolean
 
 permissions:
   contents: read
@@ -25,16 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
       - name: Install Linux UI quality tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes xvfb xauth x11-apps x11-utils libxkbcommon-x11-0
       - uses: dtolnay/rust-toolchain@stable
       - name: Build native release for UI evaluation
         run: cargo build --release --locked
-      - name: Run startup UI image and failure-state acceptance
-        if: inputs.release_candidate
-        run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/x11_startup_visual_gate.sh
       - name: Run graph UI image acceptance
         run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/x11_graph_visual_gate.sh

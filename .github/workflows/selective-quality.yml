@@ -15,9 +15,6 @@ on:
       head_ref:
         required: true
         type: string
-      pr_number:
-        required: true
-        type: string
       selection_json:
         required: true
         type: string
@@ -36,17 +33,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
       - name: Validate documentation revision
-        env:
-          BASE_SHA: ${{ inputs.base_sha }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
-        run: |
-          set -euo pipefail
-          git diff --check "$BASE_SHA" "$SOURCE_SHA"
-          bash scripts/requirements_ledger_gate.sh
+        run: bash scripts/requirements_ledger_gate.sh
 
   governance-quality:
     name: governance-quality
@@ -55,73 +45,49 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
           ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.25.x'
+          go-version: stable
           cache: false
       - name: Validate workflow contracts
         env:
           BASE_SHA: ${{ inputs.base_sha }}
-          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
-          SELECTION_JSON: ${{ inputs.selection_json }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          if [[ "$RELEASE_CANDIDATE" == false ]]; then
-            mapfile -t changed_workflows < <(
-              git diff --name-only "$BASE_SHA" "$SOURCE_SHA" -- '.github/workflows/*.yml'
-            )
-            if ((${#changed_workflows[@]} > 0)); then
-              go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 "${changed_workflows[@]}"
-            fi
-            bash scripts/pre_pr_gate.sh --base "$BASE_SHA" \
-              --requested-check governance-contract
-          else
-            go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
-            python3 scripts/workflow_inno_acquisition_gate.py --self-test
-            python3 scripts/workflow_quality_gate.py --self-test
-            mapfile -t changed_requirement_authority < <(
-              git diff --name-only "$BASE_SHA" "$SOURCE_SHA" -- \
-                scripts/requirements_authority.py \
-                scripts/test_requirements_authority.py \
-                scripts/requirements_ledger_gate.sh
-            )
-            if ((${#changed_requirement_authority[@]} > 0)); then
-              for path in "${changed_requirement_authority[@]}"; do
-                if [[ "$path" == *.sh && -f "$path" ]]; then
-                  bash -n "$path"
-                fi
+          mapfile -t changed_workflows < <(
+            git diff --diff-filter=ACMRT --name-only "$BASE_SHA...$SOURCE_SHA" -- \
+              '.github/workflows/*.yml' '.github/workflows/*.yaml' |
+              while IFS= read -r path; do
+                [[ -f "$path" ]] && printf '%s\n' "$path"
               done
-              python3 scripts/test_requirements_authority.py
-              if ! jq -e '.owners | index("DOCS") != null' \
-                <<<"$SELECTION_JSON" >/dev/null; then
-                bash scripts/requirements_ledger_gate.sh
-              fi
-            fi
+          )
+          if ((${#changed_workflows[@]} > 0)); then
+            # actionlint 1.7.12 still models the pre-v3 input names for this action.
+            go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 \
+              -ignore 'missing input "app-id" which is required by action "actions/create-github-app-token@v3"' \
+              -ignore 'input "client-id" is not defined in action "actions/create-github-app-token@v3"' \
+              "${changed_workflows[@]}"
           fi
+          bash scripts/pre_pr_gate.sh --base "$BASE_SHA" \
+            --requested-check governance-contract
 
   linux-backend-quality:
     name: linux-backend-quality
-    if: contains(fromJSON(inputs.selection_json).owners, 'LINUX_BACKEND')
+    if: contains(fromJSON(inputs.selection_json).owners, 'LINUX_BACKEND') && !(inputs.release_candidate && fromJSON(inputs.selection_json).binary_impact)
     uses: ./.github/workflows/rust.yml
     with:
       source_sha: ${{ inputs.source_sha }}
-      release_candidate: ${{ inputs.release_candidate && fromJSON(inputs.selection_json).binary_impact }}
-    permissions:
-      contents: read
 
   linux-ui-quality:
     name: linux-ui-quality
-    if: contains(fromJSON(inputs.selection_json).owners, 'LINUX_UI')
+    if: contains(fromJSON(inputs.selection_json).owners, 'LINUX_UI') && !(inputs.release_candidate && fromJSON(inputs.selection_json).binary_impact)
     uses: ./.github/workflows/linux-ui-quality.yml
     with:
       source_sha: ${{ inputs.source_sha }}
-      release_candidate: ${{ inputs.release_candidate && fromJSON(inputs.selection_json).binary_impact }}
-    permissions:
-      contents: read
 
   windows-quality:
     name: windows-quality
@@ -129,10 +95,8 @@ jobs:
     uses: ./.github/workflows/windows-client.yml
     with:
       source_sha: ${{ inputs.source_sha }}
-      pr_number: ${{ inputs.pr_number }}
       release_candidate: ${{ inputs.release_candidate && fromJSON(inputs.selection_json).binary_impact }}
-    permissions:
-      contents: read
+      powershell_paths_json: ${{ toJSON(fromJSON(inputs.selection_json).powershell_paths) }}
 
   codeql-quality:
     name: codeql-quality
@@ -146,43 +110,9 @@ jobs:
       contents: read
       security-events: write
 
-  linux-distribution:
-    name: linux-distribution
+  linux-release-quality:
+    name: linux-release-quality
     if: fromJSON(inputs.selection_json).distribution_required == true
-    uses: ./.github/workflows/linux-distribution.yml
+    uses: ./.github/workflows/linux-release-quality.yml
     with:
       source_sha: ${{ inputs.source_sha }}
-      pr_number: ${{ inputs.pr_number }}
-      release_candidate: ${{ inputs.release_candidate }}
-    permissions:
-      contents: read
-
-  selected-quality:
-    name: selected-quality
-    if: always() && inputs.release_candidate
-    needs:
-      - docs-quality
-      - governance-quality
-      - linux-backend-quality
-      - linux-ui-quality
-      - windows-quality
-      - codeql-quality
-      - linux-distribution
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
-      - name: Require selected success and non-selected skip
-        env:
-          SELECTION: ${{ inputs.selection_json }}
-          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
-          RESULTS: ${{ toJSON(needs) }}
-        run: |
-          set -euo pipefail
-          results="$(jq -c 'with_entries(.value = .value.result)' <<<"$RESULTS")"
-          python3 scripts/selected_quality_gate.py \
-            --selection "$SELECTION" \
-            --results "$results" \
-            --release-candidate "$RELEASE_CANDIDATE"

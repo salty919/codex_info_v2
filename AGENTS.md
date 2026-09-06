@@ -73,9 +73,9 @@ cleanup条件と削除予定:
 - CodexはPRのURL、base/headの完全SHA、変更file、検証結果、未確認事項、`main`へ統合した場合の影響を提示し、ユーザーが変更と動作を確認できる状態でmerge前に停止する。Codex自身の実装・検証・review結果を、ユーザーによる統合判断の代替にしてはならない。
 - pushまたはPR作成が許可されていない作業を「統合済み」または「完了」と報告してはならない。実装済み、local検証済み、未統合を区別して報告する。
 - pushまたはPR作成直前に`origin/feat/next`の完全SHAを再確認する。進んでいる場合は旧新SHAとowned pathsへの影響を報告し、「認可状態の継続と自動GOAL継続」に従って継続可否を判断する。履歴書換えを要しない既存branchの更新を、base SHAの変化だけで停止しない。
-- `codex/<task> -> feat/next`はtrusted `feat-integration.yml`が完全なPR差分を有限ownerへ分類し、関係するremote qualityだけをadvisoryに実行する。実owner job、CodeQL、distributionの失敗は赤のまま表示するが、`selected-quality`集約と`feat-acceptance`は実行せず、workflow結果でユーザーのmergeを禁止しない。この経路ではversion、candidate、Release、tag、branch refをmutationしない。`feat/next -> main`は同じ分類正本を使用するが、`selected-quality`・`acceptance`・`version-prepared`はRelease品質と公開可否を別のmain経路で所有し、merge判断はユーザーだけが行う。feat向けtriggerをmain向けtriggerの単純な拡張にしてはならない。
-- Git差分callerはrename/copy検出を明示し、両端を単一分類器へ渡す。mainのRelease向けselected/non-selected結果だけをtrusted base版gateで集約し、feat向けPRは選択された実job自身の結果を表示する。
-- workflowの`GITHUB_TOKEN`によるref更新が別のActions runを起動すると仮定しない。main向けversion生成H1は同じtrusted DAGでRelease品質を評価し、生成commitの固定trailerとproducer runでH0/H1を対応付ける。H1へcustom `version-prepared`・`acceptance` checkを登録せず、同じH1のeventは正規trailerを確認できた場合だけowner再実行を抑止する。この確認はbyte-identicalな手動commitとの区別だけを目的とし、poll、retry、mutation readback、表示URL照合、証拠専用artifactを追加しない。
+- `codex/<task> -> feat/next`はtrusted `feat-integration.yml`が完全なPR差分を有限ownerへ分類し、関係するremote qualityだけをadvisoryに実行する。実owner jobとCodeQLの失敗は赤のまま表示するが、Release candidateは生成せず、workflow結果でユーザーのmergeを禁止しない。`feat/next -> main`は同じresolverをrelease modeで使用し、版数3ファイルの同期・stable形式・baseからの単調増加を判定する。binary impact時だけ選択品質と両platform candidateを要求し、non-binary時はcandidate 0件のまま公開しない。どちらの経路もbranch refをmutationせず、merge判断はユーザーだけが行う。
+- PR resolverのGit差分callerはrename/copy検出を明示し、renameの両端とcopyの追加先を単一分類器へ渡す。未変更copy元まで探索する`--find-copies-harder`はowner判定を変えず全repository走査を増やすため使用しない。feat/mainとも選択された実job自身の結果を表示し、Actions自身のworkflow結論を別runnerで再集約しない。
+- workflowはversion commit、branch push、custom check、poll、retry、証拠専用artifactを作らない。main向けbinary PRはPR作成前に版数3ファイルをbaseより大きい同一stable versionへ同期し、trusted callerはexact headを評価する。patch/minor/majorの選択はユーザー専用main PRの明示差分とし、WF改造やPR本文profileを要求しない。rerun attemptはRelease authorityにせず、同じheadの最新runが失敗した場合は過去の成功へfallbackせず新headまで公開をHOLDする。
 
 ### race、cleanup、復旧、報告
 

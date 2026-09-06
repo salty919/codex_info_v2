@@ -36,7 +36,7 @@
 | `governance-contract` | workflow、gate、selector、repository運用の変更 | 対象scriptの有限fixtureとsyntax |
 | `rust-format` | Rust sourceまたはRust build inputの変更 | Rust書式だけ |
 | `rust-test` | Linux backend/UIの観測可能な動作変更 | 影響master IDに登録したRust直接オラクル |
-| `windows-contract` | Windows sourceまたはbuild inputの変更 | locked restore、format、Windows unitを一つの共有呼出しで各1回 |
+| `windows-contract` | Windows sourceまたはbuild inputの変更 | 変更PowerShellの構文、locked restore、Windows unitを一つの共有呼出しで各1回 |
 
 check IDの追加は、既存checkでは観測できない独立した失敗境界と、そのmaster IDがある場合だけ許す。
 既存checkと同じ結果を判定する場合は追加せず、既存ownerへ統合する。

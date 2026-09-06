@@ -3,7 +3,8 @@
 param(
     [string]$Configuration = 'Release',
     [string]$Runtime = 'win-x64',
-    [string]$OutputDirectory = 'artifacts/windows-installer'
+    [string]$OutputDirectory = 'artifacts/windows-installer',
+    [switch]$InstallCompiler
 )
 
 $ErrorActionPreference = 'Stop'
@@ -54,11 +55,19 @@ $compilerCandidates = @(
     (Join-Path $env:ProgramFiles 'Inno Setup 7\ISCC.exe'),
     (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 7\ISCC.exe')
 ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-$compiler = $compilerCandidates |
-    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
-    Select-Object -First 1
+$compiler = if ($InstallCompiler) {
+    & (Join-Path $PSScriptRoot 'Install-InnoSetup.ps1')
+}
+else {
+    $compilerCandidates |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+}
 if ([string]::IsNullOrWhiteSpace($compiler)) {
     throw 'Inno Setup compiler was not found. Install JRSoftware.InnoSetup.7 or set INNO_SETUP_COMPILER.'
+}
+$temporaryCompilerDirectory = if ($InstallCompiler) {
+    Split-Path -Parent $compiler
 }
 
 try {
@@ -85,4 +94,8 @@ try {
 }
 finally {
     if (Test-Path $work) { Remove-Item -LiteralPath $work -Recurse -Force }
+    if (-not [string]::IsNullOrWhiteSpace($temporaryCompilerDirectory) -and
+        (Test-Path -LiteralPath $temporaryCompilerDirectory)) {
+        Remove-Item -LiteralPath $temporaryCompilerDirectory -Recurse -Force
+    }
 }

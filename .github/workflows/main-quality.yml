@@ -1,22 +1,22 @@
 # Copyright (C) 2026 salty919
 # SPDX-License-Identifier: GPL-3.0-only
 
-name: Feat integration
+name: Main PR quality
 
 on:
   pull_request_target:
-    branches: ["feat/next"]
+    branches: ["main"]
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
 
 permissions: {}
 
 concurrency:
-  group: feat-integration-${{ github.event.pull_request.number }}
+  group: main-pr-quality-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   classify:
-    name: Classify complete PR diff
+    name: Classify diff and validate version
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     permissions:
@@ -29,7 +29,7 @@ jobs:
           ref: ${{ github.workflow_sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Resolve affected quality owners
+      - name: Resolve release quality owners
         id: classify
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -40,11 +40,12 @@ jobs:
           set -euo pipefail
           selection="$(python3 scripts/resolve_pr_quality.py \
             --base "$BASE_SHA" --head "$HEAD_SHA" \
-            --repository "$REPOSITORY" --head-repository "$HEAD_REPOSITORY")"
+            --repository "$REPOSITORY" --head-repository "$HEAD_REPOSITORY" \
+            --release-candidate)"
           printf 'selection_json=%s\n' "$selection" >> "$GITHUB_OUTPUT"
 
   selective-quality:
-    name: Run selected advisory quality
+    name: Run selected release quality
     needs: [classify]
     uses: ./.github/workflows/selective-quality.yml
     with:
@@ -52,7 +53,7 @@ jobs:
       base_sha: ${{ github.event.pull_request.base.sha }}
       head_ref: ${{ github.event.pull_request.head.ref }}
       selection_json: ${{ needs.classify.outputs.selection_json }}
-      release_candidate: false
+      release_candidate: true
     permissions:
       contents: read
       security-events: write

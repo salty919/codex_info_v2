@@ -126,6 +126,10 @@ for required_file in \
         die "required bundle source is missing or not regular: $required_file"
 done
 command -v "$OBJDUMP_BIN" >/dev/null 2>&1 || die 'objdump is required to measure glibc minimum'
+ARCHITECTURE="$("$OBJDUMP_BIN" -f -- "$BINARY" 2>/dev/null |
+    awk '/^architecture:/{gsub(/,/, "", $2); print $2; exit}')"
+[[ "$ARCHITECTURE" == i386:x86-64 ]] ||
+    die "release binary architecture is not x86_64: ${ARCHITECTURE:-unknown}"
 GLIBC_MINIMUM="$("$OBJDUMP_BIN" -T -- "$BINARY" 2>/dev/null |
     grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' |
     sed 's/^GLIBC_//' | LC_ALL=C sort -V | tail -n 1 || true)"

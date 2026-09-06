@@ -10,7 +10,8 @@ param(
     [Parameter(Mandatory = $true)][string]$InstallerPath,
     [string]$Version,
     [string]$OutputPath = 'artifacts/windows-installer/CodexInfo.WindowsClient.update.json',
-    [Parameter(Mandatory = $true)][string]$Repository
+    [Parameter(Mandatory = $true)][string]$Repository,
+    [switch]$PassThruVersion
 )
 
 $ErrorActionPreference = 'Stop'
@@ -101,3 +102,6 @@ $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 [IO.File]::WriteAllText($manifestPath, $json + "`n", $utf8NoBom)
 
 Write-Host "Created $manifestPath"
+if ($PassThruVersion) {
+    Write-Output $Version
+}
