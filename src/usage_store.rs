@@ -3526,7 +3526,8 @@ impl UsageStore {
         Ok(())
     }
 
-    /// Migrate through a separately validated candidate database.
+    /// Migrate a legacy, unpartitioned history database through a separately
+    /// validated candidate database.
     ///
     /// The caller supplies an explicit transformation, so no schema or row
     /// value is guessed implicitly. The source remains untouched until the
@@ -3578,6 +3579,17 @@ impl UsageStore {
                 ));
             }
             let source_store = Self::open_read_only(path)?;
+            let is_account_partition: bool = source_store.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'storage_partition')",
+                [],
+                |row| row.get(0),
+            )?;
+            if is_account_partition {
+                return Err(UsageStoreError::InvalidImport(
+                    "account partitions use versioned in-place schema upgrades".into(),
+                ));
+            }
             let source_samples = source_store.load_all()?;
             let source_periods = build_reset_periods(&source_samples);
             let source_fingerprint = samples_fingerprint(&source_samples);
@@ -7448,6 +7460,35 @@ mod tests {
                 path.file_name().unwrap().to_string_lossy()
             ))
             .exists());
+        remove_database(&path);
+    }
+
+    #[test]
+    fn verified_migration_rejects_account_partition_before_transform() {
+        let path = database_path("verified-migration-account-partition");
+        let identity = partition_identity('a', 23);
+        let store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        drop(store);
+        let source_before = fs::read(&path).unwrap();
+        let transform_called = std::cell::Cell::new(false);
+
+        let result = UsageStore::migrate_verified(&path, |_| {
+            transform_called.set(true);
+            Ok(Vec::new())
+        });
+
+        assert!(matches!(result, Err(UsageStoreError::InvalidImport(_))));
+        assert!(!transform_called.get());
+        assert_eq!(fs::read(&path).unwrap(), source_before);
+        let parent = path.parent().unwrap();
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        assert!(!parent.join(format!(".{file_name}.migration.lock")).exists());
+        assert!(!parent
+            .read_dir()
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".migration-")));
+        UsageStore::open_read_only_partitioned(&path, &identity).unwrap();
         remove_database(&path);
     }
 
