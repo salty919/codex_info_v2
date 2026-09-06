@@ -11682,6 +11682,7 @@ impl CodexInfoState {
         let model_costs = result.model_usage.dollar_totals();
         let model_tokens = result.model_usage.token_totals();
         let current_model_totals = result.model_usage.to_session_totals();
+        let has_current_model_totals = !result.model_usage.is_zero();
         let history_sample_count = result.history_samples.len();
         self.local_usage_error = false;
         self.local_usage_pending = false;
@@ -11711,12 +11712,6 @@ impl CodexInfoState {
             .is_none()
             .then_some(self.remaining_percent)
             .flatten();
-        let has_current_model_totals = model_costs.sol > 0.0
-            || model_costs.terra > 0.0
-            || model_costs.luna > 0.0
-            || model_tokens.sol > 0
-            || model_tokens.terra > 0
-            || model_tokens.luna > 0;
         let record_current_local_observation = fresh_remaining.is_some()
             || (!self.preview
                 && self.authenticated
@@ -19187,6 +19182,58 @@ mod tests {
         ));
         assert!(local_commands.try_recv().is_err());
         let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn quota_outage_records_astra_and_arbitrary_model_only_observations() {
+        for model in ["gpt-6-astra", "future-model"] {
+            let mut state = CodexInfoState::preview("normal");
+            let reset_at = state.reset_at.expect("preview quota has reset");
+            state.preview = false;
+            state.authenticated = true;
+            state.account_error = Some("quota unavailable".into());
+            state.history = UsageHistory::default();
+
+            let mut totals = ModelUsageTotals::default();
+            totals.add(
+                model,
+                TokenSnapshot {
+                    cache_write_input: Some(3),
+                    total: 20,
+                    input: 12,
+                    cached_input: 4,
+                    output: 5,
+                },
+            );
+            state.apply_local_usage_success(LocalUsageResult {
+                auth_epoch: state.auth_epoch,
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                model_usage: totals,
+                history_samples: Vec::new(),
+                history_model_totals: Vec::new(),
+                recorded_sessions: Vec::new(),
+                cleanup_plan: None,
+            });
+
+            let [observation] = state.history.pending_store_observations.as_slice() else {
+                panic!("{model} local-only observation was not recorded");
+            };
+            assert_eq!(observation.remaining_percent, None, "{model}");
+            assert_eq!(
+                observation.model_source,
+                usage_store::ModelSource::Confirmed,
+                "{model}"
+            );
+            let expected = ModelUsageTotals::canonical_model(model).unwrap();
+            let recorded = observation
+                .model_totals
+                .as_ref()
+                .and_then(|models| models.iter().find(|row| row.model == expected))
+                .unwrap_or_else(|| panic!("{model} row was not persisted"));
+            assert_eq!(recorded.total_tokens, 20, "{model}");
+            assert_eq!(recorded.cache_write_input_tokens, Some(3), "{model}");
+        }
     }
 
     #[test]
