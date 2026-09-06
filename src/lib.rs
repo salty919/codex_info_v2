@@ -3,6 +3,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod app_server_sqlite;
 pub mod i18n;
 pub mod protocol_contract;
 pub mod security;
