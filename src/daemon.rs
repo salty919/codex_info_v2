@@ -878,7 +878,6 @@ fn current_lock_owner_pid_at(path: &Path) -> Option<u32> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DaemonOwnerIdentity {
     pub(crate) pid: u32,
-    pub(crate) port: u16,
     pub(crate) starttime_ticks: u64,
     pub(crate) executable_device: u64,
     pub(crate) executable_inode: u64,
@@ -888,18 +887,29 @@ pub(crate) struct DaemonOwnerIdentity {
 pub(crate) fn current_daemon_owner_identity() -> Option<DaemonOwnerIdentity> {
     let snapshot = read_lock_snapshot(&daemon_lock_path()?).ok().flatten()?;
     let process = process_identity(snapshot.record.pid)?;
-    let port = process_is_known_codex(&process)?;
     snapshot
         .record
         .matches_process(&process)
         .then_some(DaemonOwnerIdentity {
             pid: snapshot.record.pid,
-            port,
             starttime_ticks: snapshot.record.starttime_ticks,
             executable_device: snapshot.record.executable_device,
             executable_inode: snapshot.record.executable_inode,
             owner_nonce: snapshot.record.owner_nonce,
         })
+}
+
+/// Resolve the validated service port only when this exact owner process is
+/// still current. Recorder ownership itself does not depend on CLI arguments.
+pub(crate) fn daemon_owner_port(owner: &DaemonOwnerIdentity) -> Option<u16> {
+    let process = process_identity(owner.pid)?;
+    if process.starttime_ticks != owner.starttime_ticks
+        || process.executable_device != owner.executable_device
+        || process.executable_inode != owner.executable_inode
+    {
+        return None;
+    }
+    process_is_known_codex(&process)
 }
 
 /// Return only the PID from a complete, current recorder lock identity.
