@@ -3710,21 +3710,26 @@ impl UsageHistory {
         history
     }
 
-    fn load_from_partition(partition: &account_scope::AccountPartition) -> Self {
+    fn load_from_partition(partition: &account_scope::AccountPartition) -> Result<Self, String> {
         let now = Utc::now();
         let identity = partition.storage_identity();
-        let (samples, observations) =
-            UsageStore::open_read_only_partitioned(&partition.database_path, &identity)
-                .ok()
-                .and_then(|store| store.load_recent_observations(now).ok())
-                .map(|observations| {
-                    let samples = observations
-                        .iter()
-                        .filter_map(main_sample_from_observation)
-                        .collect::<Vec<_>>();
-                    (samples, observations)
-                })
-                .unwrap_or_default();
+        let observations = match fs::symlink_metadata(&partition.database_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(format!(
+                    "account partition database is not a regular file: {}",
+                    partition.database_path.display()
+                ));
+            }
+            Ok(_) => UsageStore::open_read_only_partitioned(&partition.database_path, &identity)
+                .and_then(|store| store.load_recent_observations(now))
+                .map_err(|error| error.to_string())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.to_string()),
+        };
+        let samples = observations
+            .iter()
+            .filter_map(main_sample_from_observation)
+            .collect::<Vec<_>>();
         let mut history = Self {
             db_path: Some(partition.database_path.clone()),
             partition_identity: Some(identity),
@@ -3735,7 +3740,7 @@ impl UsageHistory {
             startup_maintenance_done: false,
         };
         history.startup_maintenance(now);
-        history
+        Ok(history)
     }
 
     fn preview(now: i64, reset_at: i64, costs: ModelDollarTotals) -> Self {
@@ -11553,7 +11558,15 @@ impl CodexInfoState {
             if !self.clear_account_visible_state() {
                 return;
             }
-            self.history = UsageHistory::load_from_partition(&partition);
+            self.history = match UsageHistory::load_from_partition(&partition) {
+                Ok(history) => history,
+                Err(error) => {
+                    self.apply_identity_error(format!(
+                        "アカウント別の履歴DBを安全に読めませんでした: {error}"
+                    ));
+                    return;
+                }
+            };
             self.history_gaps = match UsageHistory::confirmed_gaps_from_partition(&partition) {
                 Ok(gaps) => gaps,
                 Err(error) => {
@@ -20793,6 +20806,55 @@ mod tests {
         assert_eq!(state.estimated_cost_label, "概算 —");
         assert!(state.history.samples.is_empty());
         assert_eq!(state.selected_history_period, "履歴なし");
+    }
+
+    #[test]
+    fn partition_history_read_failure_publishes_error_instead_of_ready_empty_history() {
+        let account_key =
+            super::account_scope::AccountKey::synthetic_preview("history-read-failure-account-129");
+        let partition = super::account_scope::AccountPartition::synthetic_preview(&account_key);
+        let directory = partition.database_path.parent().unwrap().to_path_buf();
+        let _ = fs::remove_dir_all(&directory);
+        drop(
+            UsageStore::create_partitioned(&partition.database_path, &partition.storage_identity())
+                .unwrap(),
+        );
+        let connection = rusqlite::Connection::open(&partition.database_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO durable_state
+                    (singleton, data_generation, data_hash, snapshot_json)
+                 VALUES (2, ?1, ?2, '{')",
+                rusqlite::params![Utc::now().timestamp(), "0".repeat(64)],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut state = CodexInfoState::preview("normal");
+        state.apply_resolved_confirmed_account_event(
+            Some("unpublished@example.test".into()),
+            Some("pro".into()),
+            account_key,
+            1,
+            partition,
+        );
+
+        assert!(!state.authenticated);
+        assert!(state.account_key.is_none());
+        assert!(state.account_partition.is_none());
+        assert!(state.current_account_admission().is_none());
+        assert!(!state.usage_snapshot_committed);
+        let details = state.public_details();
+        assert_eq!(details.state, PublicState::Error);
+        assert!(details.observed_at.is_none());
+        assert!(!details.authenticated);
+        assert!(details.quota.is_none());
+        assert!(details.models.is_empty());
+        assert!(details.history_periods.is_empty());
+        assert!(details.history_samples.is_empty());
+        assert!(details.history_gaps.is_empty());
+        assert!(details.threads.is_empty());
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
