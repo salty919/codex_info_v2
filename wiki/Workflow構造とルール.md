@@ -30,7 +30,7 @@ feat/next → main（ユーザーだけが操作）
 | `feat-integration.yml` | feat PRの完全diff分類とadvisory owner呼出し |
 | `version-prepare.yml` | main PRのtrusted version生成、Release品質呼出し、acceptance |
 | `selective-quality.yml` | DOCS/GOVERNANCE/Linux backend/Linux UI/Windows/CodeQL/distributionの選択 |
-| `rust.yml` | featではRust format/unit、Release候補ではunit/build/CLI/recorder確認 |
+| `rust.yml` | 選択profileのRust直接check |
 | `linux-ui-quality.yml` | 選択されたLinux UI check |
 | `windows-client.yml` | 選択されたWindows checkとRelease candidate |
 | `codeql.yml` | 選択言語だけのCodeQL |
