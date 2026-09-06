@@ -22,6 +22,8 @@
 - 影響するmaster IDごとに、その観測結果を直接判定できるオラクルを少なくとも1件持つ。
 - 同じ観測結果のcheck ownerは1件にし、他のgateからtest名、呼出し数、実装文字列を二重監視しない。
 - 変更のない製品ownerのtest、build、installer、実画面、実OS E2E、CodeQL言語は実行しない。
+- mainの自動生成H1だけは、既存Release品質runが同じheadの単一commit statusを`pending`から最終結果へ更新する。
+  feat、H2、binary impactなしheadへ重複statusを作らず、repository ruleでMergeを強制blockしない。
 - test件数、coverage率、「念のため」、「安心のため」、全直積、routineのAI再評価はcheck追加の理由にしない。
 - 実OS、installer、統合画面は、その境界を変更したとき、Release candidate、または記録済み障害経路の
   再現確認に限る。
@@ -46,5 +48,7 @@ check IDの追加は、既存checkでは観測できない独立した失敗境�
 - PASSは、実際に実行した直接オラクルの原始結果だけで示す。0件、SKIP、INCONCLUSIVEをPASSに変換しない。
 - 外部環境でしか得られない証拠は、local gateの成功に混ぜず未確認として残す。
 - Actionsの基盤・制御失敗はIssueへrevision、症状、原因、過剰checkの有無、再発防止を記録する。
+- feat向けPRを作る前に、完全name-statusと最終PR本文を同じ`ci_change_scope.py` callerへ一度渡し、
+  必須profileの欠落だけでなく、選択checkが変更責務外へ広がらないことを確認する。
 - 回帰検出後は過去のPASSを現行成果物の証拠に流用せず、影響経路だけを新しいrevisionで1回再検証する。
 - DB・Session・履歴を削除、再生成、推測補完して見かけ上回復させない。

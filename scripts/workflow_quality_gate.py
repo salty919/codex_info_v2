@@ -171,12 +171,24 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             mapping("version.outputs", prepared.get("outputs"), {key: f"${{{{ {source} }}}}"})
         acceptance_step = _step(acceptance, name="Resolve release quality result")
         acceptance_env = acceptance_step.get("env")
-        expect("acceptance.permissions", acceptance.get("permissions"), None)
+        expect("version.prepared.permissions", prepared.get("permissions"), {
+            "actions": "read",
+            "contents": "write",
+            "pull-requests": "read",
+            "statuses": "write",
+        })
+        expect("acceptance.permissions", acceptance.get("permissions"), {
+            "statuses": "write",
+        })
         expect("acceptance.env", acceptance_env, {
+            "GENERATED_HEAD": "${{ needs.version-prepared.outputs.generated_head }}",
             "GENERATED_OBSERVER": "${{ needs.version-prepared.outputs.generated_observer }}",
             "EVENT_OBSERVER": "${{ needs.version-prepared.outputs.event_observer }}",
+            "GH_TOKEN": "${{ github.token }}",
             "PREPARE_RESULT": "${{ needs.version-prepared.result }}",
+            "QUALITY_SHA": "${{ needs.version-prepared.outputs.quality_sha }}",
             "QUALITY_RESULT": "${{ needs.selective-quality.result }}",
+            "REPOSITORY": "${{ github.repository }}",
         })
 
         # Complete PR identity -> reusable owner calls -> each leaf checkout.
@@ -623,8 +635,13 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         if marker in version:
             errors.append(f"version-prepare.yml: write path overconstraint {marker}")
     count("version-prepare.yml", "checks: write", 0)
+    count("version-prepare.yml", "statuses: write", 2)
     count("version-prepare.yml", "cancel-in-progress: false", 1)
     count("version-prepare.yml", "repos/$REPOSITORY/check-runs", 0)
+    count("version-prepare.yml", "repos/$REPOSITORY/statuses/", 2)
+    count("version-prepare.yml", "main-pr-quality/current-head", 2)
+    count("feat-integration.yml", "statuses: write", 0)
+    count("feat-integration.yml", "repos/$REPOSITORY/statuses/", 0)
     count("version-prepare.yml", "--find-copies-harder", 2)
 
     selective = workflows["selective-quality.yml"]
@@ -1105,6 +1122,15 @@ def _write_readonly_gh(directory: Path) -> Path:
             endpoint = next((arg for arg in args if arg.startswith("repos/")), None)
             if endpoint is None:
                 raise SystemExit(4)
+            if (
+                os.environ.get("MOCK_GH_ALLOW_STATUS") == "1"
+                and "--method" in args
+                and args[args.index("--method") + 1] == "POST"
+                and endpoint.startswith("repos/example/project/statuses/")
+            ):
+                json.dump({"state": "recorded"}, sys.stdout, separators=(",", ":"))
+                sys.stdout.write("\\n")
+                raise SystemExit(0)
             with open(os.environ["MOCK_GH_DATABASE"], encoding="utf-8") as stream:
                 responses = json.load(stream)["responses"]
             if endpoint not in responses:
@@ -1221,6 +1247,7 @@ def _run_version_step(
     bin_dir.mkdir()
     _write_readonly_gh(bin_dir)
     database = runner_temp / "gh-database.json"
+    log = runner_temp / "gh-log.jsonl"
     responses: dict[str, object] = {}
     if producer_run is not None:
         producer_id = producer_run["id"]
@@ -1245,6 +1272,8 @@ def _run_version_step(
             "HEAD_REPOSITORY": "example/project",
             "HEAD_SHA": head,
             "MOCK_GH_DATABASE": str(database),
+            "MOCK_GH_ALLOW_STATUS": "1",
+            "MOCK_GH_LOG": str(log),
             "PATH": f"{bin_dir}:{environment['PATH']}",
             "PR_NUMBER": "44",
             "REPOSITORY": "example/project",
@@ -1254,7 +1283,27 @@ def _run_version_step(
     result = _command(
         ("bash", "-c", script), cwd=runner, env=environment, check=False
     )
+    fixture["last_gh_calls"] = (
+        [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        if log.exists()
+        else []
+    )
     return result, _output(output)
+
+
+def _status_calls(fixture: dict[str, Path | str | int]) -> list[list[str]]:
+    calls = fixture.get("last_gh_calls", [])
+    assert isinstance(calls, list)
+    return [
+        call
+        for call in calls
+        if isinstance(call, list)
+        and any(
+            isinstance(argument, str)
+            and argument.startswith("repos/example/project/statuses/")
+            for argument in call
+        )
+    ]
 
 
 def _version_state_tests(version_workflow: str) -> int:
@@ -1275,6 +1324,8 @@ def _version_state_tests(version_workflow: str) -> int:
             raise AssertionError("non-binary H0 changed the quality head")
         if json.loads(values["selection_json"])["owners"] != ["DOCS"]:
             raise AssertionError("non-binary H0 selected unrelated owners")
+        if _status_calls(fixture):
+            raise AssertionError("non-binary H0 published a duplicate commit status")
         cases += 1
 
         fixture = _new_version_fixture(root, "windows-causal-chain")
@@ -1302,6 +1353,13 @@ def _version_state_tests(version_workflow: str) -> int:
             or json.loads(first_values["selection_json"])["owners"] != ["WINDOWS"]
         ):
             raise AssertionError("Windows H0 did not continue on its generated H1")
+        if _status_calls(fixture) != [[
+            "api", "--method", "POST", "-H", "Accept: application/vnd.github+json",
+            f"repos/example/project/statuses/{h1}", "-f", "state=pending", "-f",
+            "context=main-pr-quality/current-head", "-f",
+            "description=Selected release quality is running",
+        ]]:
+            raise AssertionError("generated H1 did not receive exactly one pending status")
         next_version = _command(
             (
                 "python3",
@@ -1357,6 +1415,8 @@ def _version_state_tests(version_workflow: str) -> int:
             or json.loads(second_values["selection_json"])["owners"] != ["WINDOWS"]
         ):
             raise AssertionError("generated H1 was not a zero-owner observer")
+        if _status_calls(fixture):
+            raise AssertionError("generated H1 observer published a duplicate status")
         cases += 1
 
         _git(seed, "pull", "--quiet", "--ff-only", "origin", "case")
@@ -1375,6 +1435,8 @@ def _version_state_tests(version_workflow: str) -> int:
             or json.loads(third_values["selection_json"])["owners"] != ["WINDOWS"]
         ):
             raise AssertionError("H2 retained generated version files or became an observer")
+        if _status_calls(fixture):
+            raise AssertionError("H2 published a duplicate generated-head status")
         cases += 1
 
         fixture = _new_version_fixture(root, "linux")
@@ -1522,49 +1584,95 @@ def _acceptance_result_tests(version_workflow: str) -> int:
     script = _step_script(version_workflow, "Resolve release quality result")
     cases = 0
 
-    def execute(
-        *,
-        generated_observer: bool = False,
-        event_observer: bool = False,
-        prepare: str = "success",
-        quality: str = "success",
-    ) -> subprocess.CompletedProcess[str]:
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "EVENT_OBSERVER": str(event_observer).lower(),
-                "GENERATED_OBSERVER": str(generated_observer).lower(),
-                "PREPARE_RESULT": prepare,
-                "QUALITY_RESULT": quality,
-            }
-        )
-        return _command(
-            ("bash", "-c", script), cwd=ROOT, env=environment, check=False
-        )
+    with tempfile.TemporaryDirectory(prefix="codex-info-acceptance-") as raw_root:
+        root = Path(raw_root)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        _write_readonly_gh(bin_dir)
+        database = root / "gh-database.json"
+        database.write_text(json.dumps({"responses": {}}), encoding="utf-8")
 
-    if execute().returncode != 0:
-        raise AssertionError("successful Release quality was rejected")
-    cases += 1
+        def execute(
+            *,
+            generated_head: bool = False,
+            generated_observer: bool = False,
+            event_observer: bool = False,
+            prepare: str = "success",
+            quality: str = "success",
+        ) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+            log = root / "gh-log.jsonl"
+            log.unlink(missing_ok=True)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "EVENT_OBSERVER": str(event_observer).lower(),
+                    "GENERATED_HEAD": str(generated_head).lower(),
+                    "GENERATED_OBSERVER": str(generated_observer).lower(),
+                    "GH_TOKEN": "fixture",
+                    "MOCK_GH_ALLOW_STATUS": "1",
+                    "MOCK_GH_DATABASE": str(database),
+                    "MOCK_GH_LOG": str(log),
+                    "PATH": f"{bin_dir}:{environment['PATH']}",
+                    "PREPARE_RESULT": prepare,
+                    "QUALITY_RESULT": quality,
+                    "QUALITY_SHA": "a" * 40,
+                    "REPOSITORY": "example/project",
+                }
+            )
+            result = _command(
+                ("bash", "-c", script), cwd=ROOT, env=environment, check=False
+            )
+            calls = (
+                [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+                if log.exists()
+                else []
+            )
+            return result, calls
 
-    if execute(quality="failure").returncode == 0:
-        raise AssertionError("failed Release quality was accepted")
-    cases += 1
+        def expect_status(calls: list[list[str]], state: str) -> None:
+            if len(calls) != 1 or not all(
+                marker in calls[0]
+                for marker in (
+                    "repos/example/project/statuses/" + "a" * 40,
+                    f"state={state}",
+                    "context=main-pr-quality/current-head",
+                )
+            ):
+                raise AssertionError(f"generated H1 status is wrong: {calls}")
 
-    if execute(quality="cancelled").returncode == 0:
-        raise AssertionError("cancelled Release quality was accepted")
-    cases += 1
+        result, calls = execute(generated_head=True)
+        if result.returncode != 0:
+            raise AssertionError("successful Release quality was rejected")
+        expect_status(calls, "success")
+        cases += 1
 
-    if execute(generated_observer=True, quality="skipped").returncode != 0:
-        raise AssertionError("generated-H1 observer was rejected")
-    cases += 1
+        result, calls = execute(generated_head=True, quality="failure")
+        if result.returncode == 0:
+            raise AssertionError("failed Release quality was accepted")
+        expect_status(calls, "failure")
+        cases += 1
 
-    if execute(event_observer=True, quality="skipped").returncode != 0:
-        raise AssertionError("non-authoritative event observer was rejected")
-    cases += 1
+        result, calls = execute(generated_head=True, quality="cancelled")
+        if result.returncode == 0:
+            raise AssertionError("cancelled Release quality was accepted")
+        expect_status(calls, "failure")
+        cases += 1
 
-    if execute(prepare="failure", quality="skipped").returncode == 0:
-        raise AssertionError("failed version preparation was accepted")
-    cases += 1
+        result, calls = execute(generated_observer=True, quality="skipped")
+        if result.returncode != 0 or calls:
+            raise AssertionError("generated-H1 observer was rejected or published status")
+        cases += 1
+
+        result, calls = execute(event_observer=True, quality="skipped")
+        if result.returncode != 0 or calls:
+            raise AssertionError("non-authoritative event observer was rejected or published status")
+        cases += 1
+
+        result, calls = execute(generated_head=True, prepare="failure", quality="skipped")
+        if result.returncode == 0:
+            raise AssertionError("failed version preparation was accepted")
+        expect_status(calls, "failure")
+        cases += 1
 
     return cases
 
