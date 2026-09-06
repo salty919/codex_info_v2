@@ -7,6 +7,7 @@ mod account_scope;
 mod daemon;
 
 use chrono::{DateTime, Months, Utc};
+use codex_info::app_server_sqlite::PreparedGeneration;
 use codex_info::i18n::{CliTextKey, I18n, PeriodKind, TextKey};
 use codex_info::protocol_contract;
 use codex_info::security;
@@ -8123,10 +8124,10 @@ impl<C, E> AppServerBridge<C, E> {
 }
 
 impl AppServerBridge<AccountCommand, Event> {
-    fn start() -> Self {
+    fn start(allow_global_fallback: bool) -> Self {
         let (tx, commands) = mpsc::channel::<AccountCommand>();
         let (events, rx) = mpsc::channel::<Event>();
-        thread::spawn(move || account_server_worker(commands, events));
+        thread::spawn(move || account_server_worker(commands, events, allow_global_fallback));
         Self { tx, rx }
     }
 }
@@ -8164,7 +8165,176 @@ impl LocalUsageBridge {
     }
 }
 
-fn account_server_worker(commands: Receiver<AccountCommand>, events: Sender<Event>) {
+fn app_server_arguments(sqlite_home: Option<&Path>) -> Vec<OsString> {
+    let mut arguments = vec![OsString::from("app-server")];
+    if let Some(sqlite_home) = sqlite_home {
+        arguments.push(OsString::from("-c"));
+        let mut override_value = OsString::from("sqlite_home=");
+        override_value.push(sqlite_home);
+        arguments.push(override_value);
+    }
+    arguments.push(OsString::from("--stdio"));
+    arguments
+}
+
+fn prepare_app_server_generation() -> Result<PreparedGeneration, String> {
+    let cache_root = usage_data_root()
+        .ok_or_else(|| "Codex app-serverの専用保存先を準備できませんでした。".to_owned())?
+        .join("app-server-sqlite");
+    let codex_root = codex_home_root()
+        .ok_or_else(|| "Codex app-serverの保存元を確認できませんでした。".to_owned())?;
+    PreparedGeneration::prepare(&cache_root, &codex_root)
+        .map_err(|_| "Codex app-serverの専用データを準備できませんでした。".to_owned())
+}
+
+struct RunningAppServer {
+    child: security::ChildGuard,
+    generation: Option<PreparedGeneration>,
+    input: std::process::ChildStdin,
+    output: Receiver<RpcReadEvent>,
+}
+
+impl RunningAppServer {
+    fn spawn(codex: &Path, generation: Option<PreparedGeneration>) -> Result<Self, String> {
+        let child = match Command::new(codex)
+            .args(app_server_arguments(
+                generation.as_ref().map(PreparedGeneration::path),
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => {
+                if let Some(generation) = generation {
+                    let _ = generation.cleanup();
+                }
+                return Err("Codex app-serverを起動できませんでした。".to_owned());
+            }
+        };
+        let mut child = security::ChildGuard::new(child);
+        let Some(input) = child.child_mut().ok().and_then(|child| child.stdin.take()) else {
+            let reaped = child.kill_and_reap().is_ok();
+            if reaped {
+                if let Some(generation) = generation {
+                    let _ = generation.cleanup();
+                }
+            }
+            return Err("Codex app-serverの入出力を初期化できませんでした。".into());
+        };
+        let Some(stdout) = child.child_mut().ok().and_then(|child| child.stdout.take()) else {
+            let reaped = child.kill_and_reap().is_ok();
+            if reaped {
+                if let Some(generation) = generation {
+                    let _ = generation.cleanup();
+                }
+            }
+            return Err("Codex app-serverの入出力を初期化できませんでした。".into());
+        };
+        Ok(Self {
+            child,
+            generation,
+            input,
+            output: rpc_reader(stdout),
+        })
+    }
+
+    fn shutdown(&mut self) {
+        if self.child.kill_and_reap().is_ok() {
+            if let Some(generation) = self.generation.take() {
+                let _ = generation.cleanup();
+            }
+        }
+    }
+}
+
+fn initialize_account_app_server(
+    mut server: RunningAppServer,
+) -> Result<(RunningAppServer, AccountUpdateTracker), String> {
+    let mut account_updates = AccountUpdateTracker::default();
+    if let Err(error) = request_tracked(
+        &mut server.input,
+        &server.output,
+        &mut account_updates,
+        1,
+        "initialize",
+        json!({"clientInfo":{"name":"codex-info","version":"0.3.0"},"capabilities":{"experimentalApi":true}}),
+    ) {
+        server.shutdown();
+        return Err(error);
+    }
+    Ok((server, account_updates))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccountServerAttempt {
+    Isolated,
+    GlobalFallback,
+}
+
+fn account_server_attempts(allow_global_fallback: bool) -> &'static [AccountServerAttempt] {
+    const ISOLATED_ONLY: [AccountServerAttempt; 1] = [AccountServerAttempt::Isolated];
+    const WITH_FALLBACK: [AccountServerAttempt; 2] = [
+        AccountServerAttempt::Isolated,
+        AccountServerAttempt::GlobalFallback,
+    ];
+    if allow_global_fallback {
+        &WITH_FALLBACK
+    } else {
+        &ISOLATED_ONLY
+    }
+}
+
+fn start_account_app_server(
+    codex: &Path,
+    allow_global_fallback: bool,
+) -> Result<(RunningAppServer, AccountUpdateTracker, bool), String> {
+    let mut last_error = "Codex app-serverを起動できませんでした。".to_owned();
+    for attempt in account_server_attempts(allow_global_fallback) {
+        let started = match attempt {
+            AccountServerAttempt::Isolated => prepare_app_server_generation()
+                .and_then(|generation| RunningAppServer::spawn(codex, Some(generation)))
+                .and_then(initialize_account_app_server),
+            AccountServerAttempt::GlobalFallback => {
+                RunningAppServer::spawn(codex, None).and_then(initialize_account_app_server)
+            }
+        };
+        match started {
+            Ok((server, updates)) => {
+                return Ok((
+                    server,
+                    updates,
+                    *attempt == AccountServerAttempt::GlobalFallback,
+                ));
+            }
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+fn global_account_child_cycle_complete(global_fallback: bool, read_attempted: bool) -> bool {
+    global_fallback && read_attempted
+}
+
+fn receive_account_command(
+    commands: &Receiver<AccountCommand>,
+    global_fallback: bool,
+    fallback_read_attempted: bool,
+) -> Option<AccountCommand> {
+    if global_account_child_cycle_complete(global_fallback, fallback_read_attempted) {
+        None
+    } else {
+        commands.recv().ok()
+    }
+}
+
+fn account_server_worker(
+    commands: Receiver<AccountCommand>,
+    events: Sender<Event>,
+    allow_global_fallback: bool,
+) {
     debug_runtime("account worker starting");
     let Some(codex) = resolved_executable("CODEX_INFO_CODEX_BIN", "codex") else {
         let _ = events.send(Event::Error(
@@ -8172,65 +8342,32 @@ fn account_server_worker(commands: Receiver<AccountCommand>, events: Sender<Even
         ));
         return;
     };
-    let child_result = Command::new(codex)
-        .args(["app-server", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
-    let child = match child_result {
-        Ok(child) => child,
-        Err(_) => {
-            let _ = events.send(Event::Error(
-                "Codex app-serverを起動できませんでした。".into(),
-            ));
-            return;
-        }
-    };
-    let mut child = security::ChildGuard::new(child);
-    let Some(mut input) = child.child_mut().ok().and_then(|child| child.stdin.take()) else {
-        let _ = events.send(Event::Error(
-            "Codex app-serverの入出力を初期化できませんでした。".into(),
-        ));
-        return;
-    };
-    let Some(stdout) = child.child_mut().ok().and_then(|child| child.stdout.take()) else {
-        let _ = events.send(Event::Error(
-            "Codex app-serverの入出力を初期化できませんでした。".into(),
-        ));
-        return;
-    };
-    let output = rpc_reader(stdout);
-    let mut account_updates = AccountUpdateTracker::default();
-    if let Err(error) = request_tracked(
-        &mut input,
-        &output,
-        &mut account_updates,
-        1,
-        "initialize",
-        json!({"clientInfo":{"name":"codex-info","version":"0.3.0"},"capabilities":{"experimentalApi":true}}),
-    ) {
-        let event = if account_updates.valid {
-            Event::Error(error)
-        } else {
-            Event::IdentityError(error)
+    let (mut server, mut account_updates, global_fallback) =
+        match start_account_app_server(&codex, allow_global_fallback) {
+            Ok(server) => server,
+            Err(error) => {
+                let _ = events.send(Event::Error(error));
+                return;
+            }
         };
-        let _ = events.send(event);
-        return;
-    }
     let _ = events.send(Event::Ready);
     debug_runtime("account worker ready");
     let mut id = 2u64;
-    while let Ok(command) = commands.recv() {
+    let mut fallback_read_attempted = false;
+    while let Some(command) =
+        receive_account_command(&commands, global_fallback, fallback_read_attempted)
+    {
+        if global_fallback && matches!(&command, AccountCommand::Read) {
+            fallback_read_attempted = true;
+        }
         match command {
             AccountCommand::Stop => {
-                let _ = child.kill_and_reap();
                 break;
             }
             AccountCommand::Login => {
                 match request_tracked(
-                    &mut input,
-                    &output,
+                    &mut server.input,
+                    &server.output,
                     &mut account_updates,
                     id,
                     "account/login/start",
@@ -8276,8 +8413,8 @@ fn account_server_worker(commands: Receiver<AccountCommand>, events: Sender<Even
                 let generation_before = account_updates.generation;
                 let key_before = account_scope::read_account_key(&default_codex_root());
                 let account = request_tracked(
-                    &mut input,
-                    &output,
+                    &mut server.input,
+                    &server.output,
                     &mut account_updates,
                     id,
                     "account/read",
@@ -8329,8 +8466,8 @@ fn account_server_worker(commands: Receiver<AccountCommand>, events: Sender<Even
                                 };
                                 let plan_wire = plan_type.as_str().to_owned();
                                 let rate = request_tracked(
-                                    &mut input,
-                                    &output,
+                                    &mut server.input,
+                                    &server.output,
                                     &mut account_updates,
                                     id,
                                     "account/rateLimits/read",
@@ -8369,8 +8506,8 @@ fn account_server_worker(commands: Receiver<AccountCommand>, events: Sender<Even
                                     }
                                 };
                                 let recheck = request_tracked(
-                                    &mut input,
-                                    &output,
+                                    &mut server.input,
+                                    &server.output,
                                     &mut account_updates,
                                     id,
                                     "account/read",
@@ -8464,8 +8601,8 @@ fn account_server_worker(commands: Receiver<AccountCommand>, events: Sender<Even
                 let generation_before = account_updates.generation;
                 let key_before = account_scope::read_account_key(&default_codex_root());
                 let result = request_tracked(
-                    &mut input,
-                    &output,
+                    &mut server.input,
+                    &server.output,
                     &mut account_updates,
                     id,
                     "account/read",
@@ -8508,50 +8645,32 @@ fn account_server_worker(commands: Receiver<AccountCommand>, events: Sender<Even
             }
         }
     }
-}
-
-struct RunningAppServer {
-    child: security::ChildGuard,
-    input: std::process::ChildStdin,
-    output: Receiver<RpcReadEvent>,
+    server.shutdown();
 }
 
 fn start_app_server(deadline: Instant) -> Result<RunningAppServer, String> {
     let Some(codex) = resolved_executable("CODEX_INFO_CODEX_BIN", "codex") else {
         return Err("Codex app-serverの安全な実行ファイルを確認できません。".into());
     };
-    let child = Command::new(codex)
-        .args(["app-server", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| "Codex app-serverを起動できませんでした。".to_owned())?;
-    let mut child = security::ChildGuard::new(child);
-    let Some(mut input) = child.child_mut().ok().and_then(|child| child.stdin.take()) else {
-        return Err("Codex app-serverの入出力を初期化できませんでした。".into());
+    let generation = prepare_app_server_generation()?;
+    let mut server = RunningAppServer::spawn(&codex, Some(generation))?;
+    let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
+        server.shutdown();
+        return Err("Codex app-serverの応答がタイムアウトしました。".to_owned());
     };
-    let Some(stdout) = child.child_mut().ok().and_then(|child| child.stdout.take()) else {
-        return Err("Codex app-serverの入出力を初期化できませんでした。".into());
-    };
-    let output = rpc_reader(stdout);
-    let wait = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or_else(|| "Codex app-serverの応答がタイムアウトしました。".to_owned())?;
-    request_with_timeout_observed(
-        &mut input,
-        &output,
+    if let Err(error) = request_with_timeout_observed(
+        &mut server.input,
+        &server.output,
         1,
         "initialize",
         json!({"clientInfo":{"name":"codex-info","version":"0.3.0"},"capabilities":{"experimentalApi":true}}),
         wait,
         None,
-    )?;
-    Ok(RunningAppServer {
-        child,
-        input,
-        output,
-    })
+    ) {
+        server.shutdown();
+        return Err(error);
+    }
+    Ok(server)
 }
 
 fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<ThreadEvent>) {
@@ -8567,7 +8686,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
         match command {
             ThreadCommand::Stop => {
                 if let Some(mut server) = server.take() {
-                    let _ = server.child.kill_and_reap();
+                    server.shutdown();
                 }
                 break;
             }
@@ -8599,7 +8718,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                 };
                 if active_paths.is_empty() {
                     if let Some(mut idle) = server.take() {
-                        let _ = idle.child.kill_and_reap();
+                        idle.shutdown();
                     }
                     server_active_paths.clear();
                     rollout_cache.entries.clear();
@@ -8621,7 +8740,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                 // keep the same child and do not create process churn.
                 if server.is_some() && server_active_paths != active_paths {
                     if let Some(mut stale) = server.take() {
-                        let _ = stale.child.kill_and_reap();
+                        stale.shutdown();
                     }
                     server_active_paths.clear();
                     next_id = 2;
@@ -8675,7 +8794,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                     // leave this connection unusable. Reap only this isolated
                     // thread server so the next scheduled read starts cleanly.
                     if let Some(mut failed) = server.take() {
-                        let _ = failed.child.kill_and_reap();
+                        failed.shutdown();
                     }
                     server_active_paths.clear();
                     next_id = 2;
@@ -9197,6 +9316,7 @@ struct CodexInfoState {
     account_key: Option<account_scope::AccountKey>,
     account_update_generation: u64,
     account_partition: Option<account_scope::AccountPartition>,
+    global_account_fallback_available: bool,
     email: Option<String>,
     authenticated: bool,
     plan_label: String,
@@ -9764,7 +9884,7 @@ impl CodexInfoState {
     fn new() -> Self {
         let i18n = I18n::detect();
         let resident_now = Instant::now();
-        let bridge = AppServerBridge::<AccountCommand, Event>::start();
+        let bridge = AppServerBridge::<AccountCommand, Event>::start(true);
         bridge.send(AccountCommand::Read);
         Self {
             i18n,
@@ -9776,6 +9896,7 @@ impl CodexInfoState {
             account_key: None,
             account_update_generation: 0,
             account_partition: None,
+            global_account_fallback_available: true,
             email: None,
             authenticated: false,
             plan_label: String::new(),
@@ -9840,7 +9961,7 @@ impl CodexInfoState {
     fn service_client() -> Self {
         Self {
             i18n: I18n::detect(),
-            bridge: AppServerBridge::<AccountCommand, Event>::start(),
+            bridge: AppServerBridge::<AccountCommand, Event>::start(true),
             thread_bridge: None,
             local_bridge: LocalUsageBridge::inactive(),
             auth_epoch: 0,
@@ -9848,6 +9969,7 @@ impl CodexInfoState {
             account_key: None,
             account_update_generation: 0,
             account_partition: None,
+            global_account_fallback_available: true,
             email: None,
             authenticated: false,
             plan_label: String::new(),
@@ -9927,6 +10049,7 @@ impl CodexInfoState {
             account_key: Some(preview_account_key),
             account_update_generation: 1,
             account_partition: Some(preview_partition),
+            global_account_fallback_available: false,
             email: Some("preview@example.com".into()),
             authenticated: true,
             plan_label: "Pro".into(),
@@ -10400,7 +10523,9 @@ impl CodexInfoState {
             return;
         }
         if !self.bridge.send(AccountCommand::Read) {
-            self.bridge = AppServerBridge::<AccountCommand, Event>::start();
+            self.bridge = AppServerBridge::<AccountCommand, Event>::start(
+                self.global_account_fallback_available,
+            );
             if !self.bridge.send(AccountCommand::Read) {
                 self.apply_account_error(
                     "Codex app-serverへ更新要求を送信できませんでした。".into(),
@@ -11233,6 +11358,17 @@ impl CodexInfoState {
 
     fn apply_account_error(&mut self, error: String) {
         debug_runtime(format!("state account error: {error}"));
+        // Once this process has admitted an account partition, an external
+        // app-server/quota failure is presentation-only. Keep the independent
+        // local recorder generation, pending batch and cursor live.
+        if self.current_account_admission().is_some() {
+            self.checking = false;
+            self.account_error = Some(error.clone());
+            self.error = Some(error);
+            self.status =
+                "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
+            return;
+        }
         // The failed account connection is a publication boundary. Results
         // requested before this error may still be queued on the independent
         // thread/local channels, so invalidate their epoch without clearing
@@ -11365,6 +11501,7 @@ impl CodexInfoState {
         self.account_key = Some(account_key);
         self.account_update_generation = account_update_generation;
         self.account_partition = Some(partition);
+        self.global_account_fallback_available = false;
         self.email = email;
         self.authenticated = true;
         self.plan_label = next_plan_label;
@@ -11410,6 +11547,7 @@ impl CodexInfoState {
             self.account_partition = Some(account_scope::AccountPartition::synthetic_preview(&key));
             self.account_key = Some(key);
             self.account_update_generation = 1;
+            self.global_account_fallback_available = false;
         }
         self.email = email;
         self.authenticated = authenticated;
@@ -13431,7 +13569,9 @@ impl CodexInfoState {
             self.continue_auth_after_page_open(opened);
         } else {
             if !self.bridge.send(AccountCommand::Login) {
-                self.bridge = AppServerBridge::<AccountCommand, Event>::start();
+                self.bridge = AppServerBridge::<AccountCommand, Event>::start(
+                    self.global_account_fallback_available,
+                );
                 if !self.bridge.send(AccountCommand::Login) {
                     self.apply_account_error(
                         "Codex app-serverへ認証要求を送信できませんでした。".into(),
@@ -30871,5 +31011,127 @@ mod tests {
             }));
         server.shutdown();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn app_server_isolation_uses_private_generation_for_account_and_thread_children() {
+        let generation = std::path::Path::new("/tmp/codex-info-generation");
+        let expected = vec![
+            std::ffi::OsString::from("app-server"),
+            std::ffi::OsString::from("-c"),
+            std::ffi::OsString::from("sqlite_home=/tmp/codex-info-generation"),
+            std::ffi::OsString::from("--stdio"),
+        ];
+        assert_eq!(super::app_server_arguments(Some(generation)), expected);
+        assert_eq!(
+            super::app_server_arguments(None),
+            vec![
+                std::ffi::OsString::from("app-server"),
+                std::ffi::OsString::from("--stdio")
+            ]
+        );
+    }
+
+    #[test]
+    fn app_server_isolation_failure_keeps_confirmed_local_recorder_live() {
+        let mut state = CodexInfoState::preview("normal");
+        let admission = state.current_account_admission().unwrap();
+        let pending = state.history.samples[0].to_store();
+        state.history.pending_store_samples = vec![pending.clone()];
+        state.pending_recorder_admission = Some((state.auth_epoch, admission));
+        state.local_usage_pending = true;
+        let auth_epoch = state.auth_epoch;
+        let partition_id = state
+            .account_partition
+            .as_ref()
+            .unwrap()
+            .partition_id
+            .clone();
+
+        state.apply_account_error("isolated app-server unavailable".into());
+
+        assert_eq!(state.auth_epoch, auth_epoch);
+        assert_eq!(state.history.pending_store_samples, vec![pending]);
+        assert!(state.pending_recorder_admission.is_some());
+        assert!(state.local_usage_pending);
+        assert_eq!(
+            state.account_partition.as_ref().unwrap().partition_id,
+            partition_id
+        );
+        assert!(!state.global_account_fallback_available);
+    }
+
+    #[test]
+    fn unconfirmed_isolation_failure_uses_one_global_account_child() {
+        assert_eq!(
+            super::account_server_attempts(false),
+            [super::AccountServerAttempt::Isolated]
+        );
+        assert_eq!(
+            super::account_server_attempts(true),
+            [
+                super::AccountServerAttempt::Isolated,
+                super::AccountServerAttempt::GlobalFallback
+            ]
+        );
+        assert!(!super::global_account_child_cycle_complete(false, false));
+        assert!(!super::global_account_child_cycle_complete(false, true));
+        assert!(!super::global_account_child_cycle_complete(true, false));
+        assert!(super::global_account_child_cycle_complete(true, true));
+
+        let (sender, commands) = std::sync::mpsc::channel();
+        sender.send(super::AccountCommand::Read).unwrap();
+        assert_eq!(
+            super::receive_account_command(&commands, true, false),
+            Some(super::AccountCommand::Read)
+        );
+        // The sender intentionally remains live: completion must be checked
+        // before another blocking receive.
+        assert_eq!(super::receive_account_command(&commands, true, true), None);
+    }
+
+    #[test]
+    fn app_server_child_reap_owns_generation_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-app-server-reap-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let codex_root = root.join("codex");
+        let cache_root = root.join("cache");
+        std::fs::create_dir_all(&codex_root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&codex_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = rusqlite::Connection::open(codex_root.join("state_5.sqlite")).unwrap();
+        source
+            .execute_batch("CREATE TABLE state_fixture (value INTEGER);")
+            .unwrap();
+        drop(source);
+
+        let generation =
+            codex_info::app_server_sqlite::PreparedGeneration::prepare(&cache_root, &codex_root)
+                .unwrap();
+        let generation_path = generation.path().to_path_buf();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "cat"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let output = super::rpc_reader(child.stdout.take().unwrap());
+        let mut server = super::RunningAppServer {
+            child: codex_info::security::ChildGuard::new(child),
+            generation: Some(generation),
+            input,
+            output,
+        };
+
+        server.shutdown();
+
+        assert!(!generation_path.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
