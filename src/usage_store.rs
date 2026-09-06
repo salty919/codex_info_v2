@@ -966,6 +966,49 @@ fn canonicalize_recorded_sessions(
     Ok(canonical.into_iter().collect())
 }
 
+fn canonicalize_recorded_sessions_for_commit(
+    sources: &[RecordedSessionSource],
+) -> Result<Vec<RecordedSessionSource>> {
+    let canonical = canonicalize_recorded_sessions(sources)?;
+    let mut paths = BTreeSet::new();
+    for source in &canonical {
+        if !paths.insert((&source.root_identity, &source.relative_path)) {
+            return Err(UsageStoreError::InvalidImport(
+                "multiple recorded session fingerprints for one path".into(),
+            ));
+        }
+    }
+    Ok(canonical)
+}
+
+fn replace_recorded_session_markers(
+    transaction: &rusqlite::Transaction<'_>,
+    sources: &[RecordedSessionSource],
+) -> Result<()> {
+    let mut delete = transaction.prepare(
+        "DELETE FROM recorded_sessions
+         WHERE root_identity = ?1 AND relative_path = ?2",
+    )?;
+    let mut insert = transaction.prepare(
+        "INSERT INTO recorded_sessions (
+            root_identity, relative_path, file_bytes, modified_nanos,
+            file_device, file_inode
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for source in sources {
+        delete.execute(params![&source.root_identity, &source.relative_path])?;
+        insert.execute(params![
+            &source.root_identity,
+            &source.relative_path,
+            source.file_bytes as i64,
+            source.modified_nanos.to_string(),
+            source.file_device.to_string(),
+            source.file_inode.to_string(),
+        ])?;
+    }
+    Ok(())
+}
+
 fn canonical_u64_text(value: &str, field: &'static str) -> Result<u64> {
     let parsed = value.parse::<u64>().map_err(|_| {
         UsageStoreError::InvalidImport(format!("{field} is not a canonical unsigned integer"))
@@ -4049,36 +4092,14 @@ impl UsageStore {
         samples: &[UsageHistorySample],
         sources: &[RecordedSessionSource],
     ) -> Result<()> {
-        let sources = canonicalize_recorded_sessions(sources)?;
+        let sources = canonicalize_recorded_sessions_for_commit(sources)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let adjusted = apply_history_continuity(&transaction, samples)?;
         let canonical = canonicalize_samples(&transaction, &adjusted)?;
         upsert_canonical_samples(&transaction, &canonical)?;
-        {
-            let mut statement = transaction.prepare(
-                "INSERT INTO recorded_sessions (
-                    root_identity,
-                    relative_path,
-                    file_bytes,
-                    modified_nanos,
-                    file_device,
-                    file_inode
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                ON CONFLICT DO NOTHING",
-            )?;
-            for source in &sources {
-                statement.execute(params![
-                    &source.root_identity,
-                    &source.relative_path,
-                    source.file_bytes as i64,
-                    source.modified_nanos.to_string(),
-                    source.file_device.to_string(),
-                    source.file_inode.to_string(),
-                ])?;
-            }
-        }
+        replace_recorded_session_markers(&transaction, &sources)?;
         for source in &sources {
             if !recorded_session_matches_in(&transaction, source)? {
                 return Err(UsageStoreError::InvalidImport(
@@ -4797,7 +4818,7 @@ impl UsageStore {
             }
         }
         let model_totals = canonicalize_model_totals(model_totals)?;
-        let recorded_sessions = canonicalize_recorded_sessions(recorded_sessions)?;
+        let recorded_sessions = canonicalize_recorded_sessions_for_commit(recorded_sessions)?;
         for marker in &recorded_sessions {
             let checkpoint = canonical_checkpoints
                 .values()
@@ -5066,25 +5087,7 @@ impl UsageStore {
                 ])?;
             }
         }
-        {
-            let mut statement = transaction.prepare(
-                "INSERT INTO recorded_sessions (
-                    root_identity, relative_path, file_bytes, modified_nanos,
-                    file_device, file_inode
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT DO NOTHING",
-            )?;
-            for source in &recorded_sessions {
-                statement.execute(params![
-                    &source.root_identity,
-                    &source.relative_path,
-                    source.file_bytes as i64,
-                    source.modified_nanos.to_string(),
-                    source.file_device.to_string(),
-                    source.file_inode.to_string(),
-                ])?;
-            }
-        }
+        replace_recorded_session_markers(&transaction, &recorded_sessions)?;
         let next = current_data_generation
             .checked_add(1)
             .ok_or(UsageStoreError::GenerationOverflow)?;
@@ -6540,7 +6543,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_prunes_old_checkpoints_and_keeps_exact_cleanup_markers() {
+    fn replacement_prunes_old_checkpoints_and_replaces_stale_cleanup_marker() {
         let path = database_path("partition-session-replacement-retention");
         let identity = partition_identity('e', 5);
         let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
@@ -6609,15 +6612,22 @@ mod tests {
         let state = store.load_session_collection_state().unwrap();
         assert_eq!(state.data_generation, 3);
         assert_eq!(state.checkpoints, [new_checkpoint]);
-        assert!(store.recorded_session_matches(&old_source).unwrap());
+        assert!(!store.recorded_session_matches(&old_source).unwrap());
         assert!(store.recorded_session_matches(&new_source).unwrap());
+        let recorded_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM recorded_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(recorded_count, 1);
         assert_eq!(
             store
                 .forget_recorded_sessions(std::slice::from_ref(&new_source))
                 .unwrap(),
             1
         );
-        assert!(store.recorded_session_matches(&old_source).unwrap());
+        assert!(!store.recorded_session_matches(&old_source).unwrap());
         assert!(!store.recorded_session_matches(&new_source).unwrap());
 
         remove_database(&path);
@@ -6987,6 +6997,11 @@ mod tests {
                 std::slice::from_ref(&marker),
             )
             .unwrap();
+        let mut replacement = marker.clone();
+        replacement.modified_nanos += 1;
+        upgraded
+            .upsert_samples_and_recorded_sessions(&[], std::slice::from_ref(&replacement))
+            .unwrap();
         drop(upgraded);
 
         let reopened = UsageStore::open_read_only(&path).unwrap();
@@ -6998,7 +7013,15 @@ mod tests {
             reopened.load_durable_record().unwrap(),
             Some(durable.clone())
         );
-        assert!(reopened.recorded_session_matches(&marker).unwrap());
+        assert!(!reopened.recorded_session_matches(&marker).unwrap());
+        assert!(reopened.recorded_session_matches(&replacement).unwrap());
+        let recorded_count: i64 = reopened
+            .connection
+            .query_row("SELECT COUNT(*) FROM recorded_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(recorded_count, 1);
         drop(reopened);
 
         let mut writer = UsageStore::open(&path).unwrap();
