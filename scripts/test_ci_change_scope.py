@@ -262,6 +262,23 @@ class SelectionTests(unittest.TestCase):
             with self.subTest(paths=paths), self.assertRaises(ScopeError):
                 selection_for_paths(paths, quality_profile="model-history")
 
+    def test_app_server_isolation_selects_only_linux_backend(self) -> None:
+        result = selection_for_paths(
+            ["src/app_server_sqlite.rs", "src/lib.rs", "src/main.rs"],
+            quality_profile="app-server-isolation",
+        )
+        self.assertEqual(result.owners, ("LINUX_BACKEND",))
+        self.assertEqual(result.codeql_languages, ("rust",))
+        self.assertTrue(result.binary_impact)
+        self.assertFalse(result.distribution_required)
+
+    def test_app_server_isolation_rejects_outside_paths(self) -> None:
+        with self.assertRaises(ScopeError):
+            selection_for_paths(
+                ["src/app_server_sqlite.rs", "src/server.rs"],
+                quality_profile="app-server-isolation",
+            )
+
     def test_resident_publication_profile_selects_backend_without_ui(self) -> None:
         result = selection_for_paths(
             [
@@ -415,6 +432,12 @@ class SelectionTests(unittest.TestCase):
             quality_profile_from_document("Quality-Profile: recorder-gap\n"),
             "recorder-gap",
         )
+        self.assertEqual(
+            quality_profile_from_document(
+                "Quality-Profile: app-server-isolation\n"
+            ),
+            "app-server-isolation",
+        )
         for body in (
             "Quality-Profile: history-graph\nQuality-Profile: history-graph\n",
             "Quality-Profile: full\n",
@@ -426,7 +449,10 @@ class SelectionTests(unittest.TestCase):
     def test_workflow_profile_owns_only_the_finite_governance_change(self) -> None:
         result = selection_for_paths(
             [
+                "AGENTS.md",
+                ".github/workflows/version-prepare.yml",
                 ".github/workflows/selective-quality.yml",
+                "docs/REGRESSION_PREVENTION_POLICY.md",
                 "scripts/workflow_quality_gate.py",
                 "docs/REQUIREMENTS_LEDGER.md",
             ],

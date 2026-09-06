@@ -2,6 +2,7 @@
 <!-- codex-info-master-ids:
 ASTRA-COST-01
 API-LIFECYCLE-01
+REST-172
 CUM-138-04
 WIN-PARITY-DATA
 WIN-PARITY-STATE
@@ -95,7 +96,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 
 ## 3. 収集・API・live判定
 
-- 同一profileのresident serviceをquota、local usage、historyの唯一のauthority/writerとする。service内のrecorderとREST publisherは同じ有効owner、lease、epoch、cycleに従い、旧世代の結果を公開しない。
+- `REST-172`: 同一profileのresident serviceをquota、local usage、historyの唯一のauthority/writerとする。service内のrecorderとREST publisherは同じ有効owner、lease、epoch、cycleに従い、旧世代の結果を公開しない。1秒周期のrecorder死亡監視は常時維持する一方、REST snapshotの検証・3世代JSON生成・published pair更新は、新しいworker event、recorder試行結果、または60秒周期の鮮度確認があるcycleだけで行い、不変な1秒tickでは前回のimmutable snapshotを再利用する。
 - DBは履歴inventoryであり、実行中判定の単独根拠にしない。同一cycleで検証したprocess identityとrollout terminal stateの両方を用いる。
 - live rolloutではtask lifecycle、model、token stateを決めるrecordをstrict検証し、不正ならcycleを拒否して最後の完全snapshotを保持する。途中終了した`response_item`等の表示内容recordは状態値へ使わず隔離し、後続の完全な状態recordまで失敗させない。
 - 実行中threadの候補はCodex processが現在openしているcanonical Session pathの有限集合だけを正本とする。各pathの先頭`session_meta.id`に対して同一app-serverへ`thread/read(includeTurns=false)`を行い、返却ID/pathと完全Thread schemaを一致確認する。全Sessionを読む`thread/list`、state DBだけを候補正本にするfallback、Session総量に比例するRPCを本番取得経路に置かず、initializeを含む1cycleを共通15秒deadlineで打ち切る。
@@ -131,7 +132,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 - `desired_state=running`で完了したlauncher/startup/timer/update収束のterminal stateは、完全に検証した新世代がmanagedかつfunctionally readyなA、または完全に検証した旧世代がmanagedかつfunctionally readyなBのいずれかだけとする。`desired_state=stopped|disabled|removed`の操作は、対応するservice/timer/unit状態、listener不在、保持対象、local generation整合をread-backした場合だけ別の正常な非稼働terminalとする。unknown/foreign/malformed listenerまたはlockを安全に識別できない場合だけ、何も停止・上書きせず30秒以内に明示的`SAFE_BLOCKED`で終了できる。この安全例外を成功やA/Bへ読み替えず、次のmanual/startup/timer triggerを妨げない。manual/startupは20分30秒、control RPCは30秒、local validate/publishは60秒、stopは20秒、readinessは30秒、rollbackは60秒以内で必ずterminalになる。
 - installer/controlはL1 `.install.lock`だけ、resident runtimeはL2 profile recorder lockの後に必要な場合だけL3 account writer lockを取得する。installerはL2/L3を取得せず、serviceはL1を取得しない。systemd start/restartは`--no-block`で要求後にread-only pollする。これを唯一のlock順序として、launcher、startup、timer、removeのcycleを作らない。
 - `codex-info.service`はunexpected exitを`Restart=always`、`RestartSec=5s`、`StartLimitIntervalSec=0`で再起動し続け、start limitによる永久inactiveを作らない。反復失敗中は失敗のまま可視化し、成功扱いしない。recorder workerは1秒ごとに監視し、2秒以内に死亡を検知する。admitted accountでは新規rowが0件でも各scheduled generationをtransaction commitし、commit確認後だけowner-only `recorder-state.json`の`last_commit_unix`を更新する。全write stateのheartbeat `updated_at_unix`とadmitted accountの`last_commit_unix`はfuture skewを拒否しfreshness上限150秒とする。account未確定時は`idle_no_account`とし、架空のpartition/commitを作らない。
-- recorderのDB書込み障害は同callbackでretryせず`degraded`へ進み、daemonとexact pending batchを保持したまま次のscheduled cycle（60秒以内）で一度だけ再試行する。timeout、busy、full、readonly、corrupt等のDB応答をworker死亡と推測してdaemonを終了しない。writer threadの実終了だけは1秒owner loopの`JoinHandle`で確定して非0終了し、systemdへ復旧を委ねる。停止区間のSession usageだけは検証済みsource cursorからbounded backfillできるが、quota/残量を補間・複製しない。gapは`pending/recovered/confirmed/rejected`のledgerへ記録し、回収不能をsource identity/cursorで確定した`confirmed`だけを既存`history_gaps`へ公開する。
+- recorderのDB書込み障害は同callbackでretryせず`degraded`へ進み、daemonとexact pending batchを保持したまま次のscheduled cycle（60秒以内）で一度だけ再試行する。timeout、busy、full、readonly、corrupt等のDB応答をworker死亡と推測してdaemonを終了しない。writer threadの実終了だけは1秒owner loopの`JoinHandle`で確定して非0終了し、systemdへ復旧を委ねる。停止区間のSession usageだけは検証済みsource cursorからbounded backfillできるが、quota/残量を補間・複製しない。gapの状態・証拠境界・公開は`U128-19`へ従う。
 - 利用者操作は`codex-info --update`、`codex-info --status`、`codex-info --stop`、`codex-info --disable-autostart`、`codex-info --remove`を使用する。raw `systemctl`は診断用で、直接stopは永続的な製品停止意図ではなく次の更新でmanaged runningへ正規化され得る。`--remove`はmain/update unitだけを停止・無効化・解除し、installed generation、launcher、installer、manifest、履歴DB、verified backup、reset hint、gap/recorder/control state、Codex session JSONL、設定を削除しない。
 
 ## 6. Windows導入・更新・削除
@@ -187,20 +188,23 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   startup、CLI、recorder全体、installer、distributionを選択しない。product変更のない`history-graph`宣言は不要な品質要求として
   拒否する。workflow/selector変更は`workflow-selection`で、
   変更workflowの構文、profile selector、rename/copy、main Release非縮小だけを確認し、Release publisher、bundle、installer、
-  product E2Eを起動しない。`AGENTS.md`を含む単なるauthority文書変更はprofileなしの`authority-only`とし、実行可能な
-  workflow・selector・検査scriptは同経路へ混在させない。今回のDB/API/model-history/Linux graph/Windows v3+ASTRA経路を含む
+  product E2Eを起動しない。`AGENTS.md`を含む単なるauthority文書変更はprofileなしの`authority-only`とするが、workflow・selector・
+  検査scriptと同じ変更に含まれるauthority文書は`workflow-selection`が有限pathとして所有する。今回のDB/API/model-history/Linux graph/Windows v3+ASTRA経路を含む
   有限28 pathの実差分は`model-history`で分類する。
   同profileは実差分に含まれるDOCS、LINUX_BACKEND、LINUX_UI、WINDOWSだけを選び、少なくとも1 product ownerを必須とする。
   v3 pair/304、v3 cacheとexact 404 fallback、履歴選択、
   legacy known/incomplete、ASTRA pricing/restart、ASTRA-only graphの既存直接testだけを実行し、full suite、installer、distributionを選択しない。
   `REST-172`のresident service publication変更は`resident-publication`で分類し、`docs/PRODUCT_REQUIREMENTS.md`、
   `docs/REQUIREMENTS_LEDGER.md`、`src/main.rs`だけを所有する。同profileは`src/main.rs`のdaemon/REST責務を
-  DOCSとLINUX_BACKENDへ限定し、不変tick、worker event、local/thread/recorder失敗間隔、incomplete root保持の直接6 caseだけを実行する。
+  DOCSとLINUX_BACKENDへ限定し、不変tick、worker event、local/thread/recorder失敗間隔、incomplete root保持、account generation非重複の直接7 caseだけを実行する。
   Linux UI、Windows、full suite、installer、distribution、Releaseを選択しない。
   `U128-19`のquota gap source分離変更は`recorder-gap`で分類し、`docs/DATA_PROTECTION_POLICY.md`、
   `docs/PRODUCT_REQUIREMENTS.md`、`docs/REQUIREMENTS_LEDGER.md`、`src/daemon.rs`、`src/main.rs`だけを所有する。
   同profileはDOCSとLINUX_BACKENDへ限定し、fresh quota observation、outage/stale拒否、exact retry、daemon gap状態の
   直接4 caseだけを実行する。Session model scan、Linux UI、Windows、full suite、installer、distribution、Releaseを選択しない。
+  `app-server-isolation`は`src/app_server_sqlite.rs`、`src/lib.rs`、`src/main.rs`だけを所有し、LINUX_BACKENDへ限定する。
+  SQLite online backup、owner lock/stale cleanup、path差し替え、prepare crash、account/thread child隔離、failure縮退、reap cleanupの
+  直接12 caseだけを実行し、Linux UI、Windows、full suite、installer、distribution、Releaseを選択しない。
   profile外path、欠落・重複・未知profileは従来どおり拒否する。main向けRelease candidateはfeat profileを
   受け取らず、従来の
   full owner、distribution、installer、実OS/UI品質を維持する。feat向け`selected-quality`集約と`feat-acceptance`、Windows release

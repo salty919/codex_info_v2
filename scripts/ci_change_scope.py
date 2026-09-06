@@ -86,6 +86,7 @@ LEGAL_SHARED_EXACT = frozenset(
 PRODUCT_OWNERS = frozenset({"LINUX_BACKEND", "LINUX_UI", "WINDOWS"})
 HISTORY_GRAPH_PROFILE = "history-graph"
 MODEL_HISTORY_PROFILE = "model-history"
+APP_SERVER_ISOLATION_PROFILE = "app-server-isolation"
 RECORDER_GAP_PROFILE = "recorder-gap"
 RESIDENT_PUBLICATION_PROFILE = "resident-publication"
 WORKFLOW_SELECTION_PROFILE = "workflow-selection"
@@ -106,12 +107,15 @@ HISTORY_GRAPH_PATHS = frozenset(
 )
 WORKFLOW_SELECTION_PATHS = frozenset(
     {
+        "AGENTS.md",
         ".github/workflows/feat-integration.yml",
         ".github/workflows/linux-ui-quality.yml",
         ".github/workflows/rust.yml",
         ".github/workflows/selective-quality.yml",
+        ".github/workflows/version-prepare.yml",
         ".github/workflows/windows-client.yml",
         "docs/PRODUCT_REQUIREMENTS.md",
+        "docs/REGRESSION_PREVENTION_POLICY.md",
         "docs/REQUIREMENTS_LEDGER.md",
         "docs/WINDOWS_CLIENT_REQUIREMENTS.md",
         "docs/WINDOWS_UX_SPEC.md",
@@ -127,6 +131,13 @@ WORKFLOW_SELECTION_PATHS = frozenset(
         "scripts/test_selected_quality_gate.py",
         "scripts/windows_client_contract_gate.sh",
         "scripts/workflow_quality_gate.py",
+    }
+)
+APP_SERVER_ISOLATION_PATHS = frozenset(
+    {
+        "src/app_server_sqlite.rs",
+        "src/lib.rs",
+        "src/main.rs",
     }
 )
 MODEL_HISTORY_PATHS = frozenset(
@@ -181,6 +192,7 @@ RECORDER_GAP_PATHS = frozenset(
 PROFILE_PATHS = {
     HISTORY_GRAPH_PROFILE: HISTORY_GRAPH_PATHS,
     MODEL_HISTORY_PROFILE: MODEL_HISTORY_PATHS,
+    APP_SERVER_ISOLATION_PROFILE: APP_SERVER_ISOLATION_PATHS,
     RECORDER_GAP_PROFILE: RECORDER_GAP_PATHS,
     RESIDENT_PUBLICATION_PROFILE: RESIDENT_PUBLICATION_PATHS,
     WORKFLOW_SELECTION_PROFILE: WORKFLOW_SELECTION_PATHS,
@@ -360,6 +372,8 @@ def _resolve_quality_profile(
         raise ScopeError("history-graph profile has no product path")
     if quality_profile == MODEL_HISTORY_PROFILE and not product_change:
         raise ScopeError("model-history profile has no product path")
+    if quality_profile == APP_SERVER_ISOLATION_PROFILE and not product_change:
+        raise ScopeError("app-server-isolation profile has no product path")
     if quality_profile == RECORDER_GAP_PROFILE and not product_change:
         raise ScopeError("recorder-gap profile has no product path")
     if quality_profile == RESIDENT_PUBLICATION_PROFILE and not product_change:
@@ -396,7 +410,11 @@ def selection_for_paths(
         release_candidate=release_candidate,
         quality_profile=quality_profile,
     )
-    if resolved_profile in {RECORDER_GAP_PROFILE, RESIDENT_PUBLICATION_PROFILE}:
+    if resolved_profile in {
+        APP_SERVER_ISOLATION_PROFILE,
+        RECORDER_GAP_PROFILE,
+        RESIDENT_PUBLICATION_PROFILE,
+    }:
         # These finite profiles own backend behavior in the shared binary
         # entry point. They must not select unchanged X UI or Windows paths.
         owners.intersection_update({"DOCS", "LINUX_BACKEND"})
