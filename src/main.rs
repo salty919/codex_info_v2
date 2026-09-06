@@ -19750,7 +19750,7 @@ mod tests {
         state.restore_pending_recorder_batch(stale.clone());
 
         let old_epoch = state.auth_epoch;
-        state.apply_account_error("worker boundary".into());
+        state.apply_identity_error("confirmed identity changed".into());
         assert_eq!(state.auth_epoch, old_epoch + 1);
         assert!(state.take_pending_recorder_batch().is_empty());
 
@@ -20217,28 +20217,6 @@ mod tests {
         assert_eq!(state.model_usage, old_usage);
         assert_eq!(state.estimated_cost_label, old_cost);
         assert!(!state.local_usage_error);
-
-        // An account failure invalidates the in-flight generation but must
-        // keep its single physical lane occupied until the stale terminal
-        // event arrives. That event releases the lane without changing data.
-        state.local_usage_pending = true;
-        let stale_epoch = state.auth_epoch;
-        state.apply_account_error("account unavailable".into());
-        assert!(state.local_usage_pending);
-        state.apply_local_usage_success(LocalUsageResult {
-            auth_epoch: stale_epoch,
-            reset_at,
-            window_seconds: WEEK_SECONDS,
-            model_usage: ModelUsageTotals::default(),
-            history_samples: Vec::new(),
-            history_model_totals: Vec::new(),
-            recorded_sessions: Vec::new(),
-            cleanup_plan: None,
-        });
-        assert!(!state.local_usage_pending);
-        assert_eq!(state.history.samples, old_history);
-        assert_eq!(state.model_usage, old_usage);
-        assert_eq!(state.estimated_cost_label, old_cost);
     }
 
     #[test]
@@ -20619,16 +20597,18 @@ mod tests {
     }
 
     #[test]
-    fn account_error_does_not_clear_thread_failure_state() {
+    fn account_error_keeps_the_confirmed_thread_lane_live_until_its_result() {
         let mut state = CodexInfoState::preview("normal");
         state.thread_checking = true;
         state.thread_error = true;
         state.apply_account_error("account failure".into());
-        assert!(!state.thread_checking);
+        assert!(state.thread_checking);
         assert!(state.thread_error);
 
         let account_status = state.status.clone();
         state.apply_thread_result(state.auth_epoch, ActiveThreadUpdate::NoThread);
+        assert!(!state.thread_checking);
+        assert!(!state.thread_error);
         assert!(state.account_error.is_some());
         assert!(state.error.is_some());
         assert_eq!(state.status, account_status);
@@ -20698,43 +20678,51 @@ mod tests {
     }
 
     #[test]
-    fn account_error_fences_queued_thread_and_local_results_without_clearing_last_valid_values() {
+    fn account_error_accepts_queued_results_for_the_confirmed_generation() {
         let mut state = CodexInfoState::preview("normal");
-        let stale_epoch = state.auth_epoch;
+        let confirmed_epoch = state.auth_epoch;
         let reset_at = state.reset_at.expect("preview reset");
         let remaining = state.remaining_percent;
         let plan = state.plan_label.clone();
         let history = state.history.samples.clone();
-        let model_usage = state.model_usage.clone();
-        let cost = state.estimated_cost_label.clone();
-        let threads = state.active_threads.clone();
         state.thread_checking = true;
+        state.local_usage_pending = true;
+        let mut accepted_thread = state.active_threads[0].clone();
+        accepted_thread.id = "accepted-thread".into();
+
+        let mut accepted_usage = ModelUsageTotals::default();
+        accepted_usage.add(
+            "gpt-5.6-sol",
+            TokenSnapshot {
+                cache_write_input: None,
+                total: 12,
+                input: 8,
+                cached_input: 2,
+                output: 4,
+            },
+        );
+        let expected_usage = accepted_usage.clone().rows();
+        let expected_cost = format_estimated_cost(accepted_usage.dollar_totals());
 
         state.apply_account_error("failed account bridge".into());
         let error_status = state.status.clone();
 
-        assert_eq!(state.auth_epoch, stale_epoch + 1);
-        assert!(!state.thread_checking);
+        assert_eq!(state.auth_epoch, confirmed_epoch);
+        assert!(state.thread_checking);
+        assert!(state.local_usage_pending);
         assert_eq!(state.remaining_percent, remaining);
         assert_eq!(state.plan_label, plan);
         assert_eq!(state.history.samples, history);
-        assert_eq!(state.model_usage, model_usage);
-        assert_eq!(state.estimated_cost_label, cost);
-        assert_eq!(state.active_threads, threads);
 
         state.apply_thread_result(
-            stale_epoch,
-            ActiveThreadUpdate::Snapshot(vec![ActiveThread {
-                id: "stale-thread".into(),
-                ..ActiveThread::default()
-            }]),
+            confirmed_epoch,
+            ActiveThreadUpdate::Snapshot(vec![accepted_thread]),
         );
-        state.apply_thread_error(stale_epoch, "stale thread error".into());
         state.apply_local_usage_success(LocalUsageResult {
-            auth_epoch: stale_epoch,
+            auth_epoch: confirmed_epoch,
             reset_at,
             window_seconds: WEEK_SECONDS,
-            model_usage: ModelUsageTotals::default(),
+            model_usage: accepted_usage,
             history_samples: vec![UsageHistorySample::new(
                 10,
                 reset_at,
@@ -20745,18 +20733,19 @@ mod tests {
             recorded_sessions: Vec::new(),
             cleanup_plan: None,
         });
-        state.apply_local_usage_error(stale_epoch, reset_at, WEEK_SECONDS);
 
         assert_eq!(state.remaining_percent, remaining);
         assert_eq!(state.plan_label, plan);
         assert_eq!(state.history.samples, history);
-        assert_eq!(state.model_usage, model_usage);
-        assert_eq!(state.estimated_cost_label, cost);
-        assert_eq!(state.active_threads, threads);
+        assert_eq!(state.model_usage, expected_usage);
+        assert_eq!(state.estimated_cost_label, expected_cost);
+        assert_eq!(state.active_threads.len(), 1);
+        assert_eq!(state.active_threads[0].id, "accepted-thread");
         assert_eq!(state.status, error_status);
         assert!(state.account_error.is_some());
         assert!(!state.thread_error);
         assert!(!state.local_usage_error);
+        assert!(!state.local_usage_pending);
     }
 
     #[test]
@@ -20801,7 +20790,7 @@ mod tests {
         state.preview = false;
         state.auth_epoch = u64::MAX;
 
-        state.apply_account_error("worker boundary".into());
+        state.apply_identity_error("identity boundary".into());
 
         assert!(!state.auth_epoch_valid);
         assert_eq!(state.auth_epoch, u64::MAX);
