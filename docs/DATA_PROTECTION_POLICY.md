@@ -139,8 +139,8 @@ Codex app-server / session JSONL / thread rollout
 - すべてのcollectorは`UsageStore`を通してSQLiteへ書く。直接JSON、直接SQL、別形式の履歴DBは禁止する。
 - SQLite transaction lockとbounded busy timeoutを正本とする。ロックを無視した上書き、DB削除、DB再生成は禁止する。
 - `usage_history.sqlite3.bak.1`〜`.bak.3`は時系列の完全SQLite snapshotであり、同じ件数である必要はない。各世代は`PRAGMA quick_check`と再読込で検証する。
-- backup、prune、migrationの失敗は元DBを変更しない。pruneはbackup成功後だけ許可する。
-- migrationは`UsageStore::migrate_verified`を入口とし、候補DBを別名で作成して全行の型・値・一意キー、`quick_check`、row count、決定的fingerprint、reset-period境界を検証する。検証後だけ元DBを退避してcandidateをatomic switchし、旧DBと3世代backupを残す。candidate検証失敗・switch失敗・lock競合は元DBをそのまま保持する。
+- backup、prune、migrationの失敗は元DBを変更しない。backup/migration候補の検証前は元DBをread-only接続だけで読み、schema・index・permissionを修復しない。pruneはbackup成功後だけ許可する。
+- `UsageStore::migrate_verified`は旧形式の非partition履歴だけを対象とする。account partitionを渡した場合はtransform・candidate作成・切替を行わず拒否する。現行account DBのschema更新は`open_partitioned`の単一transaction内で、既存table/rowを保持する加算的変更だけを行い、成功時に`PRAGMA user_version`を更新する。非加算的なaccount DB移行は未実装であり、自動実行しない。
 - backup世代の復元は、対象プロセスを停止し、現在DBを別名退避してから、quick check・schema check・row/hash監査を通した世代だけで行う。通常起動が自動復元を試みてはならない。
 
 ### 4.1 RecorderSupervisor、lease、backfill、gap
@@ -225,21 +225,11 @@ Codex app-server / session JSONL / thread rollout
 - restoreは通常起動から自動実行しない。明示restoreでは全writer/API/UIを停止して確認し、現DBを削除せず別名退避し、最新の完全verified世代からquick_check/schema/row/hash/period監査を通したものだけを同一filesystemへatomic replaceする。
   reloadとREST/UIのpair検証まで成功する前に旧DB・全backup・old memoryを破棄せず、どの段階の失敗でも旧世代を復元可能なまま保持する。
 
-### 4.3 Migration 3経路とSQLite fault matrix
+### 4.3 Schema更新と旧履歴migration
 
-- **old-schema startup reject**: 現行schemaでないDBはread/writeを拒否し、旧DB、旧backup、old memory/rootをそのまま保持する。暗黙変換や空DB置換はしない。
-- **candidate migration success**: `UsageStore::migrate_verified`が同一account partitionの別名candidateをtransactionで作り、全rowの型・値・物理DB内`(reset_at,timestamp)`一意性、exact partition row、quick_check、row count、deterministic fingerprint、reset-period境界を比較する。writer/API/UI停止後、旧DB/candidateをflush/fsyncしparent directoryをfsyncする。owner-only `migration-switch-v1` journalへold/candidate/current path・inode・hash・phaseをflush/fsyncし、各renameとdirectory fsyncを記録する。再読込/pair検証後だけjournalを`committed`へ進め、DataGenerationを1回だけ増やす。terminal journalの削除は別のretention処理で行い、commit成立条件へ混ぜない。
-- **candidate validation/switch/crash failure**: candidate、lock競合、backup、rename、fsync、再読込、pair検証のいずれかが失敗した場合、または再起動時に未完了journalがある場合は、journalと実path/inode/hashから完全rollbackまたはroll-forwardを一意に選ぶ。current path不在、current DB二重、空DB自動作成を許さず、回復完了までwriter/publish=0、旧DB/backup/memory/rootを保持し、同callbackで再試行しない。
-
-`migration-switch-v1`はowner-only 0600、UTF-8 JSON、64 KiB以下とし、exact key集合を
-`schema_version,operation_id,operation_generation,owner_identity,phase,current_identity,current_sha256,
-candidate_identity,candidate_sha256,quarantine_identity,quarantine_sha256,parent_data_generation,
-result_data_generation_or_null,created_at_utc,updated_at_utc`に固定する。phaseは
-`admission_closed,backup_verified,candidate_validated,switch_intent,current_quarantined,candidate_published,
-pair_checked,committed,rollback_required,rolled_back`だけである。`pre_switch_crash,source_lock,candidate_lock,
-rename_failure,post_intent_pre_commit_crash,validation_failure`を独立interruptとして扱い、verified `committed`前は
-旧DBを唯一のcurrentとして保持する。同じoperation ID/generationの再入はresumeまたはno-opであり、新backup、rename、
-DataGeneration、pair publicationを二重化しない。foreign/第二operationはBusyかつmutation 0である。
+- **account DB startup**: `open_partitioned`はaccount identityと対応schemaをread-only probeで確認してから、単一transactionで不足table/column/indexだけを追加する。既存row・backup・account identityを置換せず、transaction失敗時はschema versionを進めない。
+- **unsupported account migration**: 非加算的なaccount DB変換の自動経路は持たない。`migrate_verified`へaccount partitionを渡しても旧9列履歴への縮退変換はせず、元DBを変更せずに拒否する。
+- **legacy history migration**: 明示操作で旧形式の非partition履歴を変換する場合だけ`migrate_verified`を使う。read-only sourceから別名candidateを作り、型・値・一意キー、`quick_check`、row count、fingerprint、reset-period境界を検証後に切り替え、旧DBとbackupを保持する。失敗時は元DBを保持し、同callbackで再試行しない。
 
 | fault | bounded action | retention / next state |
 | --- | --- | --- |
@@ -557,29 +547,3 @@ delete、publish、synthetic recovery は全て `0` とし、old DB・verified b
 restart後は old DBを open/read でき、検証済み世代は `quick_check=ok` でなければならない。faultの原因解消前に
 同じcallbackで再試行せず、復旧後の新generationだけを1回 publishする。fault結果の流用、corrupt DBの上書き、
 未検証backup採用、prune先行、空DB成功化は FAIL とする。
-
-### RC-169 — migration atomic switch / J015-J016 re-entry
-
-RC-169 は既存 `WIN-J-015` の「migration失敗時に旧DBを保持する」意味と、`WIN-J-016` の「clientはDBを
-破壊的再生成しない」意味を変更しない。専用case markerは
-`RC-169:<interrupt>:<operation_id>:<operation_generation>:migration-switch-v1` とする。
-required interrupt は `pre_switch_crash`、`source_lock`、`candidate_lock`、`rename_failure`、
-`post_intent_pre_commit_crash` の5値であり、既存J015の `validation_failure` は追加の候補検証失敗caseとして残す。
-
-各caseは `owner_identity`、migration lease、old/candidate/intent/backupの path・device/inode・SHA、
-exact journal key/phase、rename count、switch/delete/publish countを記録し、
-`admission_closed → backup_verified → candidate_validated → switch_intent → current_quarantined →
-candidate_published → pair_checked → committed` または rollback pathを一度だけ進める。割込み後のrestartは
-journalと再取得したfile identity/hash/phaseだけから rollback または roll-forward を一意に選ぶ。
-
-verified `committed` 前は old DBだけを logical current とし、lock・validation・rename・crashの全経路で
-`switch=0`、`delete=0`、`publication=0`、新DataGeneration発行=0とする。成功経路だけが candidate current=1、
-old DB retained=1、rename=1、publication=1、DataGeneration delta=1となる。missing/double/empty current、
-foreign owner、stale journal、未検証candidate、old DB削除、synthetic commitは FAIL とする。
-
-同一 `operation_id` と `operation_generation` の再入は journal の同じphaseから resume または no-op とし、
-追加 backup、rename、switch、delete、generation、pair publicationを各 `0` にする。foreign/second operationは
-Busyで mutation `0` とする。J016 client/REST consumerはこのmigration journalやLinux DB pathへopen/write/deleteせず、
-invalid/partial/foreign pairは直前のaccepted rootを保持する。RC-169 oracle は5 interrupt＋validation_failureの
-restart trace、old/candidate/current count、path identity/hash、journal phase、rename/publication、DB/backup/history SHAを
-独立再計算し、J015/J016の専用marker、oracle、re-entry結果を同じ artifact lineageへ結合する。
