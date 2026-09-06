@@ -1429,19 +1429,22 @@ function Assert-E2EGraphHasIdleBand {
         [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Plot,
         [Parameter(Mandatory = $true)][IntPtr]$Handle,
         [Parameter(Mandatory = $true)][psobject]$Capture,
+        [Parameter(Mandatory = $true)][psobject]$Measurement,
         [double]$ExpectedStartFraction = 0.01,
         [double]$ExpectedEndFraction = 0.35
     )
 
-    # UIA is responsible only for locating the plot rectangle.  The bounded
-    # pixel contract is shared with the finite bitmap self-test below.
+    # UIA locates the complete plot control, which also contains the endpoint
+    # label gutter. Restrict the time fractions to the scanner's period-grid
+    # span so the gutter cannot enlarge the expected idle interval.
     $window = Get-E2EWindowBounds $Handle
     $plotBounds = $Plot.Current.BoundingRectangle
     $bitmap = [System.Drawing.Bitmap]::FromFile($Capture.Path)
     try {
-        [int]$left = [Math]::Max(0, [int]($plotBounds.Left - $window.Left))
+        [int]$plotLeft = [Math]::Max(0, [int]($plotBounds.Left - $window.Left))
         [int]$top = [Math]::Max(0, [int]($plotBounds.Top - $window.Top))
-        [int]$right = [Math]::Min($bitmap.Width, [int]($plotBounds.Right - $window.Left))
+        [int]$left = $plotLeft + [int]$Measurement.Pixels.PeriodStartX
+        [int]$right = $plotLeft + [int]$Measurement.Pixels.PeriodEndX
         [int]$bottom = [Math]::Min($bitmap.Height, [int]($plotBounds.Bottom - $window.Top))
         $result = Assert-E2EGraphIdleBandBitmap -Bitmap $bitmap -Left $left -Top $top -Right $right -Bottom $bottom `
             -ExpectedStartFraction $ExpectedStartFraction -ExpectedEndFraction $ExpectedEndFraction
@@ -2239,11 +2242,11 @@ try {
     Select-E2EListItem $graphRoot $pastLabel
     Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastLabel
     Wait-E2EGraphLoadSettled $graphRoot
-    $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description 'past-period'
+    $pastMeasurement = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description 'past-period'
     $graphPast = Capture-E2EWindow $graph.Handle '03-graph-past'
     Assert-E2EImageChanged $graphCurrent $graphPast 'Current-to-past period selection'
     if ($Fixture) {
-        Assert-E2EGraphHasIdleBand $plot $graph.Handle $graphPast
+        Assert-E2EGraphHasIdleBand $plot $graph.Handle $graphPast $pastMeasurement
     }
 
     $periodSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
