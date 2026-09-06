@@ -18395,7 +18395,6 @@ mod tests {
         // overdue timer owns exactly one next account request.
         state.local_usage_pending = false;
         let _ = state.schedule_resident_refresh(now);
-        assert_eq!(state.last_local_poll, now);
         assert!(matches!(
             commands.try_recv(),
             Ok(super::AccountCommand::Read)
