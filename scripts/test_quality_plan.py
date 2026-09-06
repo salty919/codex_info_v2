@@ -140,6 +140,18 @@ class QualityPlanFixtures(unittest.TestCase):
         )
         self.assertEqual(plan.quality_profile, "resident-publication")
 
+    def test_app_server_isolation_uses_only_direct_rust_tests(self) -> None:
+        plan = plan_for_paths(
+            ("src/app_server_sqlite.rs", "src/lib.rs", "src/main.rs"),
+            quality_profile="app-server-isolation",
+        )
+        self.assertEqual(plan.affected_owners, ("LINUX_BACKEND",))
+        self.assertEqual(
+            plan.checks,
+            ("requirements-authority", "rust-app-server-isolation"),
+        )
+        self.assertEqual(plan.quality_profile, "app-server-isolation")
+
     def test_recorder_gap_uses_only_authority_and_four_direct_rust_tests(self) -> None:
         plan = plan_for_paths(
             (
