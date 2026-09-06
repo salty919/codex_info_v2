@@ -11,6 +11,14 @@ Codex Infoは、ChatGPT/Codexアカウントの利用枠、リセット時刻、
 - [導入と起動ガイド](https://github.com/salty919/codex_info_v2/wiki/導入と起動ガイド)
 - [画面情報](https://github.com/salty919/codex_info_v2/wiki/画面情報)
 - [開発・運用メモ](https://github.com/salty919/codex_info_v2/wiki/開発・運用メモ)
+- [仕様体系と全体構造](https://github.com/salty919/codex_info_v2/wiki/仕様体系と全体構造)
+- [データベース層](https://github.com/salty919/codex_info_v2/wiki/データベース層)
+- [REST API](https://github.com/salty919/codex_info_v2/wiki/REST-API)
+- [Linux UI](https://github.com/salty919/codex_info_v2/wiki/Linux-UI)
+- [Windows UI](https://github.com/salty919/codex_info_v2/wiki/Windows-UI)
+- [版数管理](https://github.com/salty919/codex_info_v2/wiki/版数管理)
+- [Workflow構造とルール](https://github.com/salty919/codex_info_v2/wiki/Workflow構造とルール)
+- [検証ハーネス](https://github.com/salty919/codex_info_v2/wiki/検証ハーネス)
 
 ## 現在の構成
 
@@ -30,8 +38,8 @@ Codex Infoは、ChatGPT/Codexアカウントの利用枠、リセット時刻、
 
 ### 表示データ
 
-- Codex App Serverから認証状態と利用枠を取得し、Codex session履歴からSOL / TERRA / LUNAのtokenと予想ドル額を集計します。
-- Linux / WindowsのMain、Graph、Threadsは、現行REST仕様に従って常駐serviceが公開する同一の`GET /v1/details`応答を表示データの取得元として使います。
+- Codex App Serverから認証状態と利用枠を取得し、Codex session履歴からASTRAを含む任意modelのtoken事実を集計します。価格が定義されないmodelを0ドルとは表示しません。
+- Linux / WindowsのMain、Graph、Threadsは、常駐serviceが公開する同一の`GET /v3/details`応答を表示rootとして使います。旧serviceがexact 404を返す場合だけv2、さらにexact 404の場合だけv1へfallbackします。
 - 定期更新の途中や取得失敗で確定済み表示を空や0に戻さず、最後の完全な表示を保持したまま失敗状態を示します。
 - 認証情報、password、token、private keyはCodex Infoへ保存しません。Windows側に保存できる接続情報も非秘密selectorだけです。
 
@@ -50,7 +58,7 @@ Codex Infoは、ChatGPT/Codexアカウントの利用枠、リセット時刻、
 - [README](https://github.com/salty919/codex_info_v2/blob/main/README.md) — 製品概要と通常導線
 - [製品要件](https://github.com/salty919/codex_info_v2/blob/main/docs/PRODUCT_REQUIREMENTS.md) — 製品境界と受入条件
 - [顧客運用手順](https://github.com/salty919/codex_info_v2/blob/main/docs/CUSTOMER_OPERATIONS_RUNBOOK.md) — install、service、更新、停止
-- [REST API v1](https://github.com/salty919/codex_info_v2/blob/main/docs/REST_API_V1.md) — loopback APIとSSH接続
+- [REST API](https://github.com/salty919/codex_info_v2/blob/main/docs/REST_API_V1.md) — v1/v2/v3のloopback APIとSSH接続
 - [データ保護規約](https://github.com/salty919/codex_info_v2/blob/main/docs/DATA_PROTECTION_POLICY.md) — 履歴と失敗時の保持
 - [Windowsクライアント](https://github.com/salty919/codex_info_v2/blob/main/docs/WINDOWS_CLIENT.md) — Windows配布・接続の設計と実装状態
 

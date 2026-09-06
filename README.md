@@ -70,7 +70,7 @@ journalctl --user -u codex-info-update.service --no-pager
 履歴DB、DB backup、reset hint、gap/recorder/control state、Codex session JSONL、設定は削除しません。
 launcherの公開操作は引数なし/`--start`、`--ui`、`--update`、`--status`、`--stop`、
 `--disable-autostart`、`--remove`、`--help`だけです。managed serviceのportは127.0.0.1:8787固定です。
-Linux / Windows UIは、現行の製品要件に従い、同じproduct versionのresident serviceが公開する単一generationの`GET /v1/details`を表示します。version整合とAPIの受理条件は、`docs/PRODUCT_REQUIREMENTS.md`から参照されるREST仕様に従います。
+Linux / Windows UIはresident serviceが公開する単一generationの`GET /v3/details`を表示します。旧serviceがexact 404を返した場合だけv2、さらにexact 404の場合だけv1へfallbackします。schema-validならproduct version差だけで停止せず、API互換性はREST正本に従います。
 
 初回起動時の画面内タイトルは`Codex Info`です。ネイティブタイトルバーは使わず、アプリ内では認証パネルが接続状態を案内します。
 
@@ -105,7 +105,7 @@ codex app-server --help
 - `account/read` — 認証状態とアカウント情報
 - `account/login/start` — 未認証時のChatGPTログイン開始
 - `account/rateLimits/read` — 使用率とリセット時刻
-- 内部の`thread/list`／`rollout`収集 — resident serviceが検証済みthread snapshotを構成する実装手段。UIは公開済み`GET /v1/details`の値だけを使う。
+- 内部の`thread/read`／`rollout`収集 — resident serviceが検証済みthread snapshotを構成する実装手段。UIは公開済みdetails rootの値だけを使う。
 
 取得したトークンやパスワードはアプリのファイルへ保存しません。Codex側の認証ストアが管理します。
 
@@ -130,10 +130,10 @@ Linux / WSL 側でネイティブ画面を維持したまま、Windows クライ
 - 定期再取得のquotaは中間イベントとして扱い、次のローカル集計が完了するまで前回確定済みのモデル・履歴・thread表示を保持します。rollingする`reset_at`の時刻差だけで画面を初期化しません。
 - ネイティブタイトルバーは使わず、各Windowの画面内タイトル領域に埋め込みフォントの見出しと自前の移動・最小化・閉じる操作を配置します。固定Windowには最大化操作を表示しません。
 - 認証済み画面の「グラフ」ボタンから1つのグラフウインドウを開きます。残り利用枠・LUNA/TERRA/SOLは凡例で個別に表示／非表示を切り替え、非表示系列は色とラベルのコントラストを下げて示します。初期状態は全系列表示です。各モデルの入力・キャッシュ・出力合計を独立した累積ラインで描き、表示中モデルの個別最大値をドル軸へ使います。全モデルの累積値が変化しない未使用区間は残量ラインを水平保持し、プロット下地の薄い帯で示します。モデルが進んでいるのに残量サンプルが同じ区間は、前後を実測された残量低下値で挟める場合だけ欠測サンプルとして線形補間し、`1→1→3` は `1→中点→3` として折返しや瞬間的な消費を描きません。次の実測値がない終端は最後の実測残量を保持します。右端の値は系列色のリーダー線で終端へ結びます。リセット直後（0）から現在時刻まで表示します
-- グラフの1分サンプルはSQLite（`history/usage_history.sqlite3`）へ過去3暦月分保存します。同一リセット期間・同一分は最大値を保持して再計測で減少しません。通常起動で削除されるのは3暦月より古い行だけです。1回の取得・REST応答・グラフ表示はその保持データ中の最長1暦月（最大44,640分点）に限定し、DB全体を読みません。グラフ上部の「ドル／トークン」で、ドルは累積額、トークンは各モデルの時間帯別使用量へ切り替えられます（初期値はドル）。モデル使用量と残量は別の観測値です。使用後に遅れて届いた残量観測は反映しますが、残量観測が無い区間を料金から推測しません。
+- グラフの1分サンプルはaccount/storage epoch別SQLite（`history/accounts/v1/<AccountScopeId>/epoch-<StorageEpoch>/usage_history.sqlite3`）へ過去3暦月分保存します。同一分の競合値はraw DBへ保持したままpublic viewから除外し、component別max、last-row、null化、推測mergeで一つの値を作りません。通常整理の対象は3暦月より古い正規rowだけです。1回の取得・REST応答・グラフ表示は保持データ中の最長1暦月（最大44,640分点）に限定し、DB全体を読みません。グラフ上部の「ドル／トークン」で、ドルは累積額、トークンは各モデルの時間帯別使用量へ切り替えられます（初期値はドル）。モデル使用量と残量は別の観測値です。使用後に遅れて届いた残量観測は反映しますが、残量観測が無い区間を料金から推測しません。
 - `CODEX_INFO_DATA_DIR`を指定すると、そのディレクトリ配下へ履歴を保存します
 - 週次または月間の対象期間の残り時間は、端数も含めた7セルのゲージで表示
-- `~/.codex/sessions`に履歴がある場合は、週次または月間の対象期間を表示し、その期間内のSOL/TERRA/LUNAの入力（非キャッシュ）・キャッシュ入力・出力トークン数と、[OpenAI Developer Docsのモデル料金表](https://developers.openai.com/api/docs/models)に基づく予想ドル額（整数部のみ）を各カテゴリの独立したドル列に表示します。見出しはモデル・入力・キャッシュ・出力だけです。クレジット換算は行いません。連続する同一累積スナップショットは差分0として二重計上しません。その他のモデルは表示しません。
+- `~/.codex/sessions`に履歴がある場合は、週次または月間の対象期間を表示し、その期間内のASTRAを含む受理済みmodelの入力（非キャッシュ）・キャッシュ入力・cache write入力・出力トークンを表示します。予想ドル額はversioned単価が定義されたmodelだけを各カテゴリの独立した列に表示し、未定義modelを0ドルへ確定しません。クレジット換算は行わず、連続する同一累積snapshotは差分0として二重計上しません。
 - 履歴は直近3カ月を保持し、グラフの期間履歴listから過去のリセット期間を選択できます。最新の実行中スレッドは全件を表示し、`last_token_usage.total_tokens`と`model_context_window`から算出した現在コンテキスト使用率と、累積tokenを`使用率% / 上限トークン`で併記します。Threads画面は親を先に置くdepth-first・subtree-contiguous順へ投影し、role/depth/orphanをtree guideで示します。
 - プランはschema検証済みアカウント情報から判定します。Enterpriseの`individualLimit`は月間枠として扱い、`unlimited`は固定上限なしとして表示します。認証状態や固定月間上限を、レスポンスにない情報から推測しません。
 - リセット前後24時間は状態バナーで明示
