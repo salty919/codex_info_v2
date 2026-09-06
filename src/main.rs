@@ -52,6 +52,7 @@ enum AccountCommand {
         admission: AccountAdmission,
         account_key: account_scope::AccountKey,
     },
+    FinishFallback,
     Stop,
 }
 
@@ -8386,20 +8387,12 @@ fn start_account_app_server(
     Err(last_error)
 }
 
-fn global_account_child_cycle_complete(global_fallback: bool, read_attempted: bool) -> bool {
-    global_fallback && read_attempted
-}
-
-fn receive_account_command(
-    commands: &Receiver<AccountCommand>,
-    global_fallback: bool,
-    fallback_read_attempted: bool,
-) -> Option<AccountCommand> {
-    if global_account_child_cycle_complete(global_fallback, fallback_read_attempted) {
-        None
-    } else {
-        commands.recv().ok()
-    }
+fn fallback_account_cycle_complete(global_fallback: bool, command: &AccountCommand) -> bool {
+    global_fallback
+        && matches!(
+            command,
+            AccountCommand::Verify { .. } | AccountCommand::FinishFallback
+        )
 }
 
 fn account_server_worker(
@@ -8425,16 +8418,15 @@ fn account_server_worker(
     let _ = events.send(Event::Ready);
     debug_runtime("account worker ready");
     let mut id = 2u64;
-    let mut fallback_read_attempted = false;
-    while let Some(command) =
-        receive_account_command(&commands, global_fallback, fallback_read_attempted)
-    {
-        if global_fallback && matches!(&command, AccountCommand::Read) {
-            fallback_read_attempted = true;
-        }
+    while let Ok(command) = commands.recv() {
+        let finish_fallback = fallback_account_cycle_complete(global_fallback, &command);
         match command {
             AccountCommand::Stop => {
                 break;
+            }
+            AccountCommand::FinishFallback => {
+                // Isolated workers persist across cycles; this command only
+                // closes the single unconfirmed global fallback cycle.
             }
             AccountCommand::Login => {
                 match request_tracked(
@@ -8715,6 +8707,9 @@ fn account_server_worker(
                         .is_ok_and(|current| current.same_account(&account_key));
                 let _ = events.send(Event::Verified { admission, valid });
             }
+        }
+        if finish_fallback {
+            break;
         }
     }
     server.shutdown();
@@ -11424,6 +11419,8 @@ impl CodexInfoState {
         // collect usage. The request carries the exact auth/period tuple.
         if self.request_local_usage(reset_at, window_seconds) {
             self.last_local_poll = Instant::now();
+        } else {
+            let _ = self.bridge.send(AccountCommand::FinishFallback);
         }
         self.refresh_partial_failure_status();
     }
@@ -11489,6 +11486,7 @@ impl CodexInfoState {
             return;
         }
         if !authenticated {
+            let _ = self.bridge.send(AccountCommand::FinishFallback);
             if !self.clear_account_visible_state() {
                 return;
             }
@@ -11873,6 +11871,7 @@ impl CodexInfoState {
             self.local_usage_pending = false;
             return;
         }
+        let _ = self.bridge.send(AccountCommand::FinishFallback);
         self.local_usage_error = true;
         self.local_usage_pending = false;
 
@@ -15272,6 +15271,9 @@ fn healthy_combined_service_owner(address: SocketAddr) -> Option<u32> {
         return None;
     }
     let owner = daemon::current_daemon_owner_identity()?;
+    if owner.port != address.port() {
+        return None;
+    }
     if !recorder_owner_is_healthy(&owner) {
         return None;
     }
@@ -19750,6 +19752,7 @@ mod tests {
         state.restore_pending_recorder_batch(stale.clone());
 
         let old_epoch = state.auth_epoch;
+        state.authenticated = false;
         state.apply_account_error("worker boundary".into());
         assert_eq!(state.auth_epoch, old_epoch + 1);
         assert!(state.take_pending_recorder_batch().is_empty());
@@ -20218,12 +20221,14 @@ mod tests {
         assert_eq!(state.estimated_cost_label, old_cost);
         assert!(!state.local_usage_error);
 
-        // An account failure invalidates the in-flight generation but must
-        // keep its single physical lane occupied until the stale terminal
-        // event arrives. That event releases the lane without changing data.
+        // Before an account partition is confirmed, an account failure is a
+        // real auth boundary. Keep the single physical lane occupied until
+        // its now-stale terminal event arrives, then release it unchanged.
         state.local_usage_pending = true;
         let stale_epoch = state.auth_epoch;
+        state.authenticated = false;
         state.apply_account_error("account unavailable".into());
+        assert_eq!(state.auth_epoch, stale_epoch + 1);
         assert!(state.local_usage_pending);
         state.apply_local_usage_success(LocalUsageResult {
             auth_epoch: stale_epoch,
@@ -20624,11 +20629,13 @@ mod tests {
         state.thread_checking = true;
         state.thread_error = true;
         state.apply_account_error("account failure".into());
-        assert!(!state.thread_checking);
+        assert!(state.thread_checking);
         assert!(state.thread_error);
 
         let account_status = state.status.clone();
         state.apply_thread_result(state.auth_epoch, ActiveThreadUpdate::NoThread);
+        assert!(!state.thread_checking);
+        assert!(!state.thread_error);
         assert!(state.account_error.is_some());
         assert!(state.error.is_some());
         assert_eq!(state.status, account_status);
@@ -20698,65 +20705,62 @@ mod tests {
     }
 
     #[test]
-    fn account_error_fences_queued_thread_and_local_results_without_clearing_last_valid_values() {
+    fn confirmed_account_error_keeps_queued_thread_and_local_results_admitted() {
         let mut state = CodexInfoState::preview("normal");
-        let stale_epoch = state.auth_epoch;
+        let admitted_epoch = state.auth_epoch;
         let reset_at = state.reset_at.expect("preview reset");
         let remaining = state.remaining_percent;
         let plan = state.plan_label.clone();
         let history = state.history.samples.clone();
-        let model_usage = state.model_usage.clone();
-        let cost = state.estimated_cost_label.clone();
-        let threads = state.active_threads.clone();
         state.thread_checking = true;
 
         state.apply_account_error("failed account bridge".into());
         let error_status = state.status.clone();
 
-        assert_eq!(state.auth_epoch, stale_epoch + 1);
-        assert!(!state.thread_checking);
+        assert_eq!(state.auth_epoch, admitted_epoch);
+        assert!(state.thread_checking);
         assert_eq!(state.remaining_percent, remaining);
         assert_eq!(state.plan_label, plan);
         assert_eq!(state.history.samples, history);
-        assert_eq!(state.model_usage, model_usage);
-        assert_eq!(state.estimated_cost_label, cost);
-        assert_eq!(state.active_threads, threads);
 
+        let continued_thread = active_thread_fixture(1, 120);
         state.apply_thread_result(
-            stale_epoch,
-            ActiveThreadUpdate::Snapshot(vec![ActiveThread {
-                id: "stale-thread".into(),
-                ..ActiveThread::default()
-            }]),
+            admitted_epoch,
+            ActiveThreadUpdate::Snapshot(vec![continued_thread.clone()]),
         );
-        state.apply_thread_error(stale_epoch, "stale thread error".into());
+        let mut continued_usage = ModelUsageTotals::default();
+        continued_usage.add(
+            "gpt-5.6-sol",
+            TokenSnapshot {
+                cache_write_input: None,
+                total: 12,
+                input: 8,
+                cached_input: 2,
+                output: 4,
+            },
+        );
         state.apply_local_usage_success(LocalUsageResult {
-            auth_epoch: stale_epoch,
+            auth_epoch: admitted_epoch,
             reset_at,
             window_seconds: WEEK_SECONDS,
-            model_usage: ModelUsageTotals::default(),
-            history_samples: vec![UsageHistorySample::new(
-                10,
-                reset_at,
-                0.0,
-                ModelDollarTotals::default(),
-            )],
+            model_usage: continued_usage.clone(),
+            history_samples: Vec::new(),
             history_model_totals: Vec::new(),
             recorded_sessions: Vec::new(),
             cleanup_plan: None,
         });
-        state.apply_local_usage_error(stale_epoch, reset_at, WEEK_SECONDS);
 
         assert_eq!(state.remaining_percent, remaining);
         assert_eq!(state.plan_label, plan);
         assert_eq!(state.history.samples, history);
-        assert_eq!(state.model_usage, model_usage);
-        assert_eq!(state.estimated_cost_label, cost);
-        assert_eq!(state.active_threads, threads);
+        assert_eq!(state.model_usage, continued_usage.rows());
+        assert_eq!(state.active_threads, [continued_thread]);
         assert_eq!(state.status, error_status);
         assert!(state.account_error.is_some());
         assert!(!state.thread_error);
         assert!(!state.local_usage_error);
+        assert!(!state.thread_checking);
+        assert!(!state.local_usage_pending);
     }
 
     #[test]
@@ -20799,6 +20803,7 @@ mod tests {
     fn auth_epoch_overflow_requires_process_recovery_and_cannot_resurrect_usage() {
         let mut state = CodexInfoState::preview("normal");
         state.preview = false;
+        state.authenticated = false;
         state.auth_epoch = u64::MAX;
 
         state.apply_account_error("worker boundary".into());
@@ -31145,20 +31150,27 @@ mod tests {
                 super::AccountServerAttempt::GlobalFallback
             ]
         );
-        assert!(!super::global_account_child_cycle_complete(false, false));
-        assert!(!super::global_account_child_cycle_complete(false, true));
-        assert!(!super::global_account_child_cycle_complete(true, false));
-        assert!(super::global_account_child_cycle_complete(true, true));
-
-        let (sender, commands) = std::sync::mpsc::channel();
-        sender.send(super::AccountCommand::Read).unwrap();
-        assert_eq!(
-            super::receive_account_command(&commands, true, false),
-            Some(super::AccountCommand::Read)
-        );
-        // The sender intentionally remains live: completion must be checked
-        // before another blocking receive.
-        assert_eq!(super::receive_account_command(&commands, true, true), None);
+        let admission = super::AccountAdmission {
+            account_update_generation: 0,
+            profile_scope_id: "profile".into(),
+            account_scope_id: "account".into(),
+            storage_epoch: 1,
+            partition_id: "partition".into(),
+        };
+        let verify = super::AccountCommand::Verify {
+            admission,
+            account_key: super::account_scope::AccountKey::synthetic_preview("account"),
+        };
+        assert!(!super::fallback_account_cycle_complete(
+            true,
+            &super::AccountCommand::Read
+        ));
+        assert!(super::fallback_account_cycle_complete(true, &verify));
+        assert!(super::fallback_account_cycle_complete(
+            true,
+            &super::AccountCommand::FinishFallback
+        ));
+        assert!(!super::fallback_account_cycle_complete(false, &verify));
     }
 
     #[test]

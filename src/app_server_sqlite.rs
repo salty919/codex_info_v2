@@ -865,6 +865,7 @@ mod tests {
         assert!(first_path.exists());
         assert_eq!(root_entry_names(&fixture.cache).unwrap().len(), 2);
         second.cleanup().unwrap();
+        rustix::fs::flock(first.lock_file(), rustix::fs::FlockOperation::Unlock).unwrap();
         drop(first);
         let third = PreparedGeneration::prepare(&fixture.cache, &fixture.codex).unwrap();
         assert!(!first_path.exists());
