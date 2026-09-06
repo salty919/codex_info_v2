@@ -148,13 +148,15 @@ Codex app-server / session JSONL / thread rollout
 - worker supervisorの状態は`Absent → Starting → Running → StopRequested → Stopped`または`Failed`だけを進む。
   worker死亡は1秒probeで2秒以内に検知する。最初の一時障害は同callbackでretryせず`degraded`へ進み、次の
   scheduled cycle（60秒以内）で1回だけ再試行する。2回目またはfatal errorはprocessを非0終了させる。
-  user-systemdは`Restart=always`、`RestartSec=5s`、`StartLimitIntervalSec=60s`、`StartLimitBurst=2`で
-  1回だけprocessを自動restartし、次の失敗でFailedへlatchする。明示launcher/update activationだけがlimitをresetする。
+  user-systemdは`Restart=always`、`RestartSec=5s`、`StartLimitIntervalSec=0`でunexpected exit後も再起動を継続し、
+  start limitによる永久inactiveを作らない。反復失敗は失敗のまま可視化し、記録停止を正常状態へ読み替えない。
 - `codex-info.service`がinstalledならsystemdがdaemon+RESTのsupervisorである。service processは
   verified current generationの`codex_info --port 8787`でrecorder leaseとREST listenerを同時に所有する。
   serviceの`ExecStartPre`はpersistent installerのstartup reconcileをbounded実行する。active transaction journalが
   switch後phaseならread-only検証して継続し、journalなしならL1 install lock下のshared resolverを使用するが、
-  startup modeは自分自身をrestartしない。launcher `--ui`はmanaged ownerへ収束後に別UI processを追加するだけである。
+  startup modeは自分自身をrestartしない。更新試行が失敗しても、完全なcurrent generation、committed以外のtransactionなし、
+  listenerなしを再検証できた場合だけ更新をdeferredとしてExecStartへ返し、既存世代の記録を開始する。local不整合、未解決transaction、
+  listenerの存在または曖昧性は成功へ変換しない。launcher `--ui`はmanaged ownerへ収束後に別UI processを追加するだけである。
 - singletonのscopeは正規化canonical DB pathとprofileの組である。lease schemaは最大4KiBのUTF-8 JSON
   `recorder-lease-v1`（`pid`、`process_start`、`owner_nonce`、`canonical_db_path`、`device_or_volume_serial`、`file_index_or_inode`）とし、
   writer processは同じ`UsageStore`のtransaction/upsert契約を使う。通常のrecorder二重起動はlease前にno-op、競合試験だけが別の許可済みwriter processを使い、

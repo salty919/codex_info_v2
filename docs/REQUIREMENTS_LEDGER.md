@@ -68,7 +68,7 @@
 | LINUX-BUNDLE-RETENTION-01 | DATA | `packaging/install_linux_bundle.sh`、`packaging/codex-info.service`、`packaging/codex-info-update.service`、`packaging/codex-info-update.timer`、`docs/CUSTOMER_OPERATIONS_RUNBOOK.md`、`README.md`、`wiki/導入と起動ガイド.md` | isolated HOMEのbinary/installer/manifest/profile sentinelとdaemon/update unit lifecycle、rollback retention fixture | implemented |
 | U128-01 | PRODUCT | launcher、installer、units | live/fixture stable convergenceとfull tuple read-back | verified |
 | U128-02 | PRODUCT | launcher、daemon identity | inactive-managed＋unmanaged/foreign listener matrix | verified |
-| U128-03 | PRODUCT | launcher、service ExecStartPre | 各入口のold/equal/new generation fixture | verified |
+| U128-03 | PRODUCT | launcher、service ExecStartPre | 各入口のold/equal/new generationと、更新失敗時に完全なlocal世代だけを起動許可するfixture | implemented |
 | U128-05 | PRODUCT | resolver、installer | phase別fault injection、details error rejection、sentinel byte/hash | implemented |
 | U128-06 | PRODUCT | bundle、installer、status/health resolver | 各identity要素の差替えとfunctional readiness rejection | implemented |
 | U128-07 | PRODUCT | installer、daemon/store | lock競合、wait-for graph、caller scan | verified |
