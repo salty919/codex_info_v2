@@ -112,6 +112,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         prepared = _job(version, "version-prepared")
         version_quality = _job(version, "selective-quality")
         acceptance = _job(version, "acceptance")
+        selective_governance = _job(selective, "governance-quality")
         selective_windows = _job(selective, "windows-quality")
         selective_codeql = _job(selective, "codeql-quality")
         selected = _job(selective, "selected-quality")
@@ -128,6 +129,31 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             uses="actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
         )
         publication = _step(publish, name="Publish or verify the exact release state")
+
+        governance_validation = _step(
+            selective_governance, name="Validate workflow contracts"
+        )
+        mapping(
+            "selective.governance.env",
+            governance_validation.get("env"),
+            {
+                "BASE_SHA": "${{ inputs.base_sha }}",
+                "RELEASE_CANDIDATE": "${{ inputs.release_candidate }}",
+                "SELECTION_JSON": "${{ inputs.selection_json }}",
+                "SOURCE_SHA": "${{ inputs.source_sha }}",
+            },
+        )
+        governance_script = governance_validation.get("run")
+        for marker in (
+            "changed_requirement_authority",
+            "python3 scripts/test_requirements_authority.py",
+            "'.owners | index(\"DOCS\") != null'",
+            "bash scripts/requirements_ledger_gate.sh",
+        ):
+            if not isinstance(governance_script, str) or marker not in governance_script:
+                errors.append(
+                    f"workflow wiring selective.governance: missing {marker}"
+                )
 
         # Observer output -> owner execution and the complete, push-capable checkout.
         condition = "steps.current.outputs.observer != 'true'"
@@ -2105,6 +2131,32 @@ def _release_resolution_tests(release_workflow: str) -> int:
     )
     if result.returncode != 0 or values.get("publish") != "false":
         raise AssertionError("skipped Windows authority with zero candidates was not a no-op")
+    cases += 1
+
+    candidate_free_windows_spec = [
+        {
+            "id": 121,
+            "number": 31,
+            "attempts": [
+                {
+                    "status": "completed",
+                    "conclusion": "success",
+                    "windows": "success",
+                    "candidate": "missing",
+                    "linux": "skipped",
+                    "linux_candidate": "missing",
+                }
+            ],
+        }
+    ]
+    responses, _ = _manual_release_responses(candidate_free_windows_spec)
+    result, values, _ = _execute_release_shell(
+        script, responses, event_name="pull_request_target", event=_closed_event()
+    )
+    if result.returncode != 0 or values.get("publish") != "false":
+        raise AssertionError(
+            "candidate-free Windows quality with skipped distribution was not a no-op"
+        )
     cases += 1
 
     linux_only_spec = [

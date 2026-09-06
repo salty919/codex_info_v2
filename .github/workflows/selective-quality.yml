@@ -66,6 +66,7 @@ jobs:
         env:
           BASE_SHA: ${{ inputs.base_sha }}
           RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
+          SELECTION_JSON: ${{ inputs.selection_json }}
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
@@ -82,6 +83,24 @@ jobs:
             go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/*.yml
             python3 scripts/workflow_inno_acquisition_gate.py --self-test
             python3 scripts/workflow_quality_gate.py --self-test
+            mapfile -t changed_requirement_authority < <(
+              git diff --name-only "$BASE_SHA" "$SOURCE_SHA" -- \
+                scripts/requirements_authority.py \
+                scripts/test_requirements_authority.py \
+                scripts/requirements_ledger_gate.sh
+            )
+            if ((${#changed_requirement_authority[@]} > 0)); then
+              for path in "${changed_requirement_authority[@]}"; do
+                if [[ "$path" == *.sh && -f "$path" ]]; then
+                  bash -n "$path"
+                fi
+              done
+              python3 scripts/test_requirements_authority.py
+              if ! jq -e '.owners | index("DOCS") != null' \
+                <<<"$SELECTION_JSON" >/dev/null; then
+                bash scripts/requirements_ledger_gate.sh
+              fi
+            fi
           fi
 
   linux-backend-quality:

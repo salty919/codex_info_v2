@@ -185,7 +185,9 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   main向けrelease candidateではWindows評価・candidateを追加で実行する。`feat/next`向けPRは、PR本文や機能名の申告を
   品質選択へ使用しない。完全差分の各pathを安定した責務境界でDOCS・GOVERNANCE・LINUX_BACKEND・LINUX_UI・WINDOWSへ分類し、
   実際に影響するownerの通常品質だけを実行する。backendはformatとunit、Linux UIはbuildとgraph実画面、Windowsは
-  restore・format・unit、文書は要求正本、workflowは変更workflowの構文とowner選択の直接契約を確認する。同一ownerの確認は
+  restore・format・unit、文書は要求正本、workflowは変更workflowの構文とowner選択の直接契約を確認する。要求authorityの
+  実装・fixture・launcherが変わる場合はauthority fixtureをGOVERNANCE ownerで1回だけ実行し、DOCS ownerの現行正本検証と
+  重複させない。同一ownerの確認は
   1回へ統合し、別owner、installer、配布物、Release E2Eを通常のfeat PRへ追加しない。機能別profile、PR本文宣言、
   機能ごとのexact path allowlistを設けず、新しいfileは既存の責務prefixで分類できる。責務不明のpath、空差分、malformedな
   rename/copyだけは、無関係な全suiteへ拡大せず分類前に停止する。main向けRelease candidateは同じowner分類を使い、
@@ -205,8 +207,10 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   Release側へ同じ赤を追加しない。final headを評価した生成producerとdirect runの全attemptを集合化し、draft・stale・generated observerを
   除外する。本来のattemptにmissing、failure、cancelその他の非成功が1件でもあれば、同じheadの後続rerunまたはreopen successで
   上書きせず、新headまで公開をHOLDする。旧成功runへfallbackしない。
-- 成功authorityの`windows-quality`が`skipped`ならcandidateは0件だけを許可し、`success`なら同じrun、attempt、PR、final head、versionに
-  結び付く既存candidateをexact 1件要求する。期限切れ・削除を含む0件、複数、malformed、別identityは失敗とする。candidateは増やさず、
+- 成功authorityの`windows-quality`が`skipped`ならcandidateは0件だけを許可する。非binary変更でWindows通常品質が`success`し、
+  同じrunのLinux distributionが`skipped`かつ両platformのcandidateが0件なら、正常なno-publicationとして扱う。Linux distributionが
+  `success`するbinary candidate runでは、Windows/Linuxそれぞれに同じrun、attempt、PR、final head、versionへ結び付く既存candidateを
+  exact 1件要求する。期限切れ・削除を含む0件、複数、malformed、別identity、片platformだけのcandidateは失敗とする。candidateは増やさず、
   既存のSetupとmanifestを持つ1件の名前へidentityを追加する。merge後にPRを再分類せず、quality test/build/CodeQLも再実行しない。
   公開jobだけをversion tag単位で直列化し、lock取得後にPR/final head、全attempt、candidate、tag、Release、assetsを1回再取得する。
   tagとReleaseがともに不存在の場合だけDraftを作って2資産をupload後に公開し、完全一致のpublished状態だけを成功済みno-opとする。

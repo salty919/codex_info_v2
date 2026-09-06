@@ -492,26 +492,34 @@ jobs:
             job_status="$(jq -r '.[0].status' <<<"$windows_jobs")"
             job_result="$(jq -r '.[0].conclusion // ""' <<<"$windows_jobs")"
             [[ "$job_status" == completed ]]
+            candidate_free_windows=false
             candidates="$(run_candidates "$run_id" | jq -c --argjson attempt "$attempt" \
               '[.[] | select(.attempt == $attempt and .platform == "windows")]')"
             if [[ "$job_name" == "$windows_wrapper" && "$job_result" == skipped ]]; then
               [[ "$(jq 'length' <<<"$candidates")" -eq 0 ]]
               skipped=$((skipped + 1))
             elif [[ "$job_name" == "$windows_leaf" && "$job_result" == success ]]; then
-              [[ "$(jq 'length' <<<"$candidates")" -eq 1 ]]
-              candidate="$(jq -c '.[0]' <<<"$candidates")"
-              jq -e '
-                .expired == false and (.digest | type) == "string" and
-                (.digest | test("^sha256:[0-9a-f]{64}$"))
-              ' <<<"$candidate" >/dev/null
-              if [[ "$generated" == true ]]; then
-                [[ "$(jq -r '.version' <<<"$candidate")" == "$generated_version" ]]
+              candidate_count="$(jq 'length' <<<"$candidates")"
+              if [[ "$candidate_count" -eq 0 ]]; then
+                candidate_free_windows=true
+              elif [[ "$candidate_count" -eq 1 ]]; then
+                candidate="$(jq -c '.[0]' <<<"$candidates")"
+                jq -e '
+                  .expired == false and (.digest | type) == "string" and
+                  (.digest | test("^sha256:[0-9a-f]{64}$"))
+                ' <<<"$candidate" >/dev/null
+                if [[ "$generated" == true ]]; then
+                  [[ "$(jq -r '.version' <<<"$candidate")" == "$generated_version" ]]
+                fi
+                jq -nc --argjson run_id "$run_id" --argjson run_number "$run_number" \
+                  --argjson attempt "$attempt" --argjson candidate "$candidate" \
+                  '$candidate + {run_id:$run_id,run_number:$run_number,attempt:$attempt}' \
+                  >>"$selected_candidates"
+                windows=$((windows + 1))
+              else
+                echo 'Windows authority owns multiple release candidates' >&2
+                exit 1
               fi
-              jq -nc --argjson run_id "$run_id" --argjson run_number "$run_number" \
-                --argjson attempt "$attempt" --argjson candidate "$candidate" \
-                '$candidate + {run_id:$run_id,run_number:$run_number,attempt:$attempt}' \
-                >>"$selected_candidates"
-              windows=$((windows + 1))
             else
               echo 'Windows authority has an unexpected name/result pair' >&2
               exit 1
@@ -525,13 +533,16 @@ jobs:
                 '[.[] | select(.attempt == $attempt and .platform == "linux")]')"
               if [[ "$linux_job_name" == "$linux_wrapper" && "$linux_job_result" == skipped ]]; then
                 [[ "$(jq 'length' <<<"$linux_candidates")" -eq 0 ]]
-                [[ "$job_name" == "$windows_wrapper" ]] || {
+                [[ "$job_name" == "$windows_wrapper" || "$candidate_free_windows" == true ]] || {
                   echo 'Windows success cannot publish without its Linux distribution candidate' >&2
                   exit 1
                 }
+                if [[ "$candidate_free_windows" == true ]]; then
+                  skipped=$((skipped + 1))
+                fi
               elif [[ "$linux_job_name" == "$linux_leaf" && "$linux_job_result" == success ]]; then
                 [[ "$(jq 'length' <<<"$linux_candidates")" -eq 1 ]]
-                [[ "$job_name" == "$windows_leaf" ]] || {
+                [[ "$job_name" == "$windows_leaf" && "$candidate_free_windows" == false ]] || {
                   echo 'Linux distribution candidate requires a Windows release candidate' >&2
                   exit 1
                 }
