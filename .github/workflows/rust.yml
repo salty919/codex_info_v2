@@ -10,10 +10,10 @@ on:
         description: Immutable source commit selected by the trusted caller
         required: true
         type: string
-      quality_profile:
-        description: Exact finite profile selected by the trusted caller
+      release_candidate:
+        description: Whether this is the final main release-candidate path
         required: true
-        type: string
+        type: boolean
 
 permissions:
   contents: read
@@ -31,42 +31,21 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
-      - name: Validate native quality profile
-        env:
-          QUALITY_PROFILE: ${{ inputs.quality_profile }}
-        run: |
-          [[ "$QUALITY_PROFILE" == release || "$QUALITY_PROFILE" == history-graph || "$QUALITY_PROFILE" == model-history || "$QUALITY_PROFILE" == app-server-isolation || "$QUALITY_PROFILE" == recorder-gap || "$QUALITY_PROFILE" == resident-publication ]]
       - name: Install required native quality tools
-        if: inputs.quality_profile == 'release'
+        if: inputs.release_candidate
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
-      - name: Install focused native quality tools
-        if: inputs.quality_profile == 'history-graph' || inputs.quality_profile == 'model-history'
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep
       - uses: dtolnay/rust-toolchain@stable
-      - name: Run finite history graph tests
-        if: inputs.quality_profile == 'history-graph'
-        run: bash scripts/regression_guard.sh --history-graph
-      - name: Run finite model history tests
-        if: inputs.quality_profile == 'model-history'
-        run: bash scripts/regression_guard.sh --model-history
-      - name: Run finite app-server isolation tests
-        if: inputs.quality_profile == 'app-server-isolation'
-        run: bash scripts/regression_guard.sh --app-server-isolation
-      - name: Run finite resident publication tests
-        if: inputs.quality_profile == 'resident-publication'
-        run: bash scripts/regression_guard.sh --resident-publication
-      - name: Run finite recorder gap tests
-        if: inputs.quality_profile == 'recorder-gap'
-        run: bash scripts/regression_guard.sh --recorder-gap
+      - name: Check native formatting
+        if: ${{ !inputs.release_candidate }}
+        run: cargo fmt --check
       - name: Run native unit tests
-        if: inputs.quality_profile == 'release'
         run: cargo test --locked --all-targets -- --nocapture
       - name: Build native release
-        if: inputs.quality_profile == 'release'
+        if: inputs.release_candidate
         run: cargo build --release --locked
       - name: Run public CLI lifecycle acceptance
-        if: inputs.quality_profile == 'release'
+        if: inputs.release_candidate
         run: bash scripts/cli_contract_e2e.sh
       - name: Run recorder daemon live acceptance
-        if: inputs.quality_profile == 'release'
+        if: inputs.release_candidate
         run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/record_daemon_e2e.sh

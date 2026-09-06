@@ -182,32 +182,14 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   `acceptance`はmain向けに選択jobの結果だけを集約し、失敗時はRelease公開をHOLDするがmergeを禁止しない。
   Windowsを含むmain向けrelease candidateでは、Windows job自身が実Windows評価後にrelease candidateを作る。
   Linux-only変更も、Linux archiveを既存`windows-vX.Y.Z` ReleaseへWindows Setup/manifestと同居させるため、
-  main向けrelease candidateではWindows評価・candidateを追加で実行する。`feat/next`向けproduct変更はPR本文のexact 1行
-  `Quality-Profile: <registered-profile>`を完全差分と一緒に分類する。profile欠落・重複・未知・所有外pathは、全suiteへ拡大せず
-  owner実行前に停止する。`history-graph`は`CUM-138-06`の有限なRust graph/history、X graph画像、Windows projectionだけを実行し、
-  startup、CLI、recorder全体、installer、distributionを選択しない。product変更のない`history-graph`宣言は不要な品質要求として
-  拒否する。workflow/selector変更は`workflow-selection`で、
-  変更workflowの構文、profile selector、rename/copy、main Release非縮小だけを確認し、Release publisher、bundle、installer、
-  product E2Eを起動しない。`AGENTS.md`を含む単なるauthority文書変更はprofileなしの`authority-only`とするが、workflow・selector・
-  検査scriptと同じ変更に含まれるauthority文書は`workflow-selection`が有限pathとして所有する。今回のDB/API/model-history/Linux graph/Windows v3+ASTRA経路を含む
-  有限28 pathの実差分は`model-history`で分類する。
-  同profileは実差分に含まれるDOCS、LINUX_BACKEND、LINUX_UI、WINDOWSだけを選び、少なくとも1 product ownerを必須とする。
-  v3 pair/304、v3 cacheとexact 404 fallback、履歴選択、
-  legacy known/incomplete、ASTRA pricing/restart、ASTRA-only graphの既存直接testだけを実行し、full suite、installer、distributionを選択しない。
-  `REST-172`のresident service publication変更は`resident-publication`で分類し、`docs/PRODUCT_REQUIREMENTS.md`、
-  `docs/REQUIREMENTS_LEDGER.md`、`src/main.rs`だけを所有する。同profileは`src/main.rs`のdaemon/REST責務を
-  DOCSとLINUX_BACKENDへ限定し、不変tick、worker event、local/thread/recorder失敗間隔、incomplete root保持、account generation非重複の直接7 caseだけを実行する。
-  Linux UI、Windows、full suite、installer、distribution、Releaseを選択しない。
-  `U128-19`のquota gap source分離変更は`recorder-gap`で分類し、`docs/DATA_PROTECTION_POLICY.md`、
-  `docs/PRODUCT_REQUIREMENTS.md`、`docs/REQUIREMENTS_LEDGER.md`、`src/daemon.rs`、`src/main.rs`だけを所有する。
-  同profileはDOCSとLINUX_BACKENDへ限定し、fresh quota observation、outage/stale拒否、exact retry、daemon gap状態の
-  直接4 caseだけを実行する。Session model scan、Linux UI、Windows、full suite、installer、distribution、Releaseを選択しない。
-  `app-server-isolation`は`src/app_server_sqlite.rs`、`src/lib.rs`、`src/main.rs`だけを所有し、LINUX_BACKENDへ限定する。
-  SQLite online backup、owner lock/stale cleanup、path差し替え、prepare crash、account/thread child隔離、failure縮退、reap cleanupの
-  直接12 caseだけを実行し、Linux UI、Windows、full suite、installer、distribution、Releaseを選択しない。
-  profile外path、欠落・重複・未知profileは従来どおり拒否する。main向けRelease candidateはfeat profileを
-  受け取らず、従来の
-  full owner、distribution、installer、実OS/UI品質を維持する。feat向け`selected-quality`集約と`feat-acceptance`、Windows release
+  main向けrelease candidateではWindows評価・candidateを追加で実行する。`feat/next`向けPRは、PR本文や機能名の申告を
+  品質選択へ使用しない。完全差分の各pathを安定した責務境界でDOCS・GOVERNANCE・LINUX_BACKEND・LINUX_UI・WINDOWSへ分類し、
+  実際に影響するownerの通常品質だけを実行する。backendはformatとunit、Linux UIはbuildとgraph実画面、Windowsは
+  restore・format・unit、文書は要求正本、workflowは変更workflowの構文とowner選択の直接契約を確認する。同一ownerの確認は
+  1回へ統合し、別owner、installer、配布物、Release E2Eを通常のfeat PRへ追加しない。機能別profile、PR本文宣言、
+  機能ごとのexact path allowlistを設けず、新しいfileは既存の責務prefixで分類できる。責務不明のpath、空差分、malformedな
+  rename/copyだけは、無関係な全suiteへ拡大せず分類前に停止する。main向けRelease candidateは同じowner分類を使い、
+  binary impactがある場合だけWindows、distribution、installer、実OS/UI品質を追加する。feat向け`selected-quality`集約と`feat-acceptance`、Windows release
   candidateは生成しない。実jobの失敗は赤のまま表示するがmergeを禁止しない。live repository ruleの再監査、
   選択済み製品testの再実行、branch名allowlist、custom check登録を追加しない。
 - バイナリ影響ありPRだけ、品質確認を開始する前にPR branch上のversion 3ファイルをexact next patchへ自動更新する。

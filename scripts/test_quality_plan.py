@@ -1,273 +1,70 @@
 #!/usr/bin/env python3
-"""Direct fixtures for the bounded quality-plan selector."""
+"""Direct tests for owner-based local quality planning."""
 
 from __future__ import annotations
 
-import contextlib
-import io
-import json
 import unittest
 
-from ci_change_scope import ScopeError
-from quality_plan import QualityPlanError, main, plan_for_paths
+from quality_plan import QualityPlanError, plan_for_paths
 
 
-class QualityPlanFixtures(unittest.TestCase):
-    def test_authority_validation_precedes_every_high_cost_owner(self) -> None:
-        for path in ("docs/spec.md",):
+class QualityPlanTests(unittest.TestCase):
+    def test_each_owner_maps_to_its_normal_checks(self) -> None:
+        cases = {
+            "docs/PRODUCT_REQUIREMENTS.md": (("DOCS",), ("requirements-authority",)),
+            ".github/workflows/feat-integration.yml": (
+                ("GOVERNANCE",), ("governance-contract",)
+            ),
+            "src/lib.rs": (
+                ("LINUX_BACKEND",),
+                ("rust-format", "rust-test"),
+            ),
+            "ui/app.slint": (
+                ("LINUX_UI",),
+                ("linux-ui-contract",),
+            ),
+            "windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml.cs": (
+                ("WINDOWS",), ("windows-contract",)
+            ),
+        }
+        for path, expected in cases.items():
             with self.subTest(path=path):
-                self.assertEqual(plan_for_paths((path,)).checks[0], "requirements-authority")
-        for path in (
-            "src/main.rs",
-            "tests/fixtures/graph_delayed_quota.json",
-            "windows-client/src/CodexInfo.WindowsClient/Graphing/GraphScene.cs",
-        ):
-            with self.subTest(path=path):
-                self.assertEqual(
-                    plan_for_paths(
-                        (path,), quality_profile="history-graph"
-                    ).checks[0],
-                    "requirements-authority",
-                )
-        self.assertEqual(
-            plan_for_paths(
-                (".github/workflows/selective-quality.yml",),
-                quality_profile="workflow-selection",
-            ).checks[0],
-            "requirements-authority",
-        )
+                plan = plan_for_paths((path,))
+                self.assertEqual((plan.affected_owners, plan.checks), expected)
 
-    def test_docs_only_has_no_product_check(self) -> None:
-        plan = plan_for_paths(("docs/PRODUCT_REQUIREMENTS.md",))
-        self.assertEqual(plan.affected_owners, ("DOCS",))
-        self.assertEqual(plan.checks, ("requirements-authority",))
-        self.assertEqual(plan.quality_profile, "authority-only")
-
-    def test_governance_and_docs_deduplicate_shared_check(self) -> None:
+    def test_shared_checks_are_deduplicated_in_stable_order(self) -> None:
         plan = plan_for_paths(
-            (
-                "docs/REQUIREMENTS_LEDGER.md",
-                ".github/workflows/selective-quality.yml",
-            ),
-            quality_profile="workflow-selection",
-        )
-        self.assertEqual(plan.affected_owners, ("DOCS", "GOVERNANCE"))
-        self.assertEqual(
-            plan.checks,
-            ("requirements-authority", "governance-workflow-selection"),
-        )
-
-    def test_history_graph_shared_linux_owners_use_only_direct_checks(self) -> None:
-        plan = plan_for_paths(
-            ("src/main.rs",), quality_profile="history-graph"
-        )
-        self.assertEqual(plan.affected_owners, ("LINUX_BACKEND", "LINUX_UI"))
-        self.assertEqual(
-            plan.checks,
-            (
-                "requirements-authority",
-                "rust-history-graph",
-                "linux-ui-history-graph",
-            ),
-        )
-        self.assertEqual(plan.quality_profile, "history-graph")
-
-    def test_model_history_uses_only_authority_and_finite_platform_tests(self) -> None:
-        plan = plan_for_paths(
-            (
-                "docs/PRODUCT_REQUIREMENTS.md",
-                "src/daemon.rs",
-                "src/main.rs",
-                "src/server.rs",
-                "src/usage_store.rs",
-                "ui/components.slint",
-                "windows-client/src/CodexInfo.WindowsClient.Core/DetailsContracts.cs",
-                "windows-client/src/CodexInfo.WindowsClient/Controls/GraphPlotControl.cs",
-                "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/LoopbackStatusClientTests.cs",
-                "windows-client/tests/CodexInfo.WindowsClient.Presentation.Tests/GraphPlotControlTests.cs",
-            ),
-            quality_profile="model-history",
-        )
-        self.assertEqual(
-            plan.affected_owners,
-            ("DOCS", "LINUX_BACKEND", "LINUX_UI", "WINDOWS"),
+            ("docs/PRODUCT_REQUIREMENTS.md", "src/main.rs", "windows-client/src/X.cs")
         )
         self.assertEqual(
             plan.checks,
             (
                 "requirements-authority",
-                "rust-model-history",
-                "linux-ui-model-history",
-                "windows-model-history",
-            ),
-        )
-        self.assertEqual(plan.quality_profile, "model-history")
-
-    def test_model_history_subset_does_not_expand_to_unchanged_owners(self) -> None:
-        rust = plan_for_paths(
-            ("src/usage_store.rs",), quality_profile="model-history"
-        )
-        self.assertEqual(rust.affected_owners, ("LINUX_BACKEND",))
-        self.assertEqual(
-            rust.checks, ("requirements-authority", "rust-model-history")
-        )
-
-        windows = plan_for_paths(
-            (
-                "windows-client/tests/CodexInfo.WindowsClient.Core.Tests/ContractsTests.cs",
-            ),
-            quality_profile="model-history",
-        )
-        self.assertEqual(windows.affected_owners, ("WINDOWS",))
-        self.assertEqual(
-            windows.checks,
-            ("requirements-authority", "windows-model-history"),
-        )
-
-    def test_resident_publication_uses_only_authority_and_direct_rust_tests(self) -> None:
-        plan = plan_for_paths(
-            (
-                "docs/PRODUCT_REQUIREMENTS.md",
-                "docs/REQUIREMENTS_LEDGER.md",
-                "src/main.rs",
-            ),
-            quality_profile="resident-publication",
-        )
-        self.assertEqual(plan.affected_owners, ("DOCS", "LINUX_BACKEND"))
-        self.assertEqual(
-            plan.checks,
-            ("requirements-authority", "rust-resident-publication"),
-        )
-        self.assertEqual(plan.quality_profile, "resident-publication")
-
-    def test_app_server_isolation_uses_only_direct_rust_tests(self) -> None:
-        plan = plan_for_paths(
-            ("src/app_server_sqlite.rs", "src/lib.rs", "src/main.rs"),
-            quality_profile="app-server-isolation",
-        )
-        self.assertEqual(plan.affected_owners, ("LINUX_BACKEND",))
-        self.assertEqual(
-            plan.checks,
-            ("requirements-authority", "rust-app-server-isolation"),
-        )
-        self.assertEqual(plan.quality_profile, "app-server-isolation")
-
-    def test_recorder_gap_uses_only_authority_and_four_direct_rust_tests(self) -> None:
-        plan = plan_for_paths(
-            (
-                "docs/DATA_PROTECTION_POLICY.md",
-                "docs/PRODUCT_REQUIREMENTS.md",
-                "docs/REQUIREMENTS_LEDGER.md",
-                "src/daemon.rs",
-                "src/main.rs",
-            ),
-            quality_profile="recorder-gap",
-        )
-        self.assertEqual(plan.affected_owners, ("DOCS", "LINUX_BACKEND"))
-        self.assertEqual(
-            plan.checks,
-            ("requirements-authority", "rust-recorder-gap"),
-        )
-        self.assertEqual(plan.quality_profile, "recorder-gap")
-
-    def test_windows_owner(self) -> None:
-        plan = plan_for_paths(
-            (
-                "windows-client/src/CodexInfo.WindowsClient/Graphing/GraphScene.cs",
-            ),
-            quality_profile="history-graph",
-        )
-        self.assertEqual(plan.affected_owners, ("WINDOWS",))
-        self.assertEqual(
-            plan.checks, ("requirements-authority", "windows-history-graph")
-        )
-
-    def test_unknown_path_fails_like_classifier(self) -> None:
-        with self.assertRaises(QualityPlanError) as raised:
-            plan_for_paths(("not-classified.txt",))
-        self.assertIn("no CI owner", str(raised.exception))
-
-    def test_empty_path_collection_fails(self) -> None:
-        with self.assertRaises(QualityPlanError):
-            plan_for_paths(())
-
-    def test_empty_path_fails(self) -> None:
-        with self.assertRaises(QualityPlanError):
-            plan_for_paths(("",))
-
-    def test_duplicate_requested_check_fails(self) -> None:
-        with self.assertRaises(QualityPlanError):
-            plan_for_paths(
-                ("src/main.rs",),
-                quality_profile="history-graph",
-                requested_checks=("rust-history-graph", "rust-history-graph"),
-            )
-
-    def test_known_but_unplanned_requested_check_fails(self) -> None:
-        with self.assertRaises(QualityPlanError):
-            plan_for_paths(
-                ("docs/spec.md",), requested_checks=("rust-test",)
-            )
-
-    def test_unknown_requested_check_fails(self) -> None:
-        with self.assertRaises(QualityPlanError):
-            plan_for_paths(
-                ("docs/spec.md",), requested_checks=("invented-check",)
-            )
-
-    def test_exact_requested_set_is_allowed(self) -> None:
-        plan = plan_for_paths(
-            ("src/main.rs",),
-            quality_profile="history-graph",
-            requested_checks=(
-                "requirements-authority",
-                "rust-history-graph",
-                "linux-ui-history-graph",
-            ),
-        )
-        self.assertEqual(
-            plan.checks,
-            (
-                "requirements-authority",
-                "rust-history-graph",
-                "linux-ui-history-graph",
+                "rust-format",
+                "rust-test",
+                "linux-ui-contract",
+                "windows-contract",
             ),
         )
 
-    def test_product_path_without_profile_fails_instead_of_expanding_suite(self) -> None:
-        with self.assertRaisesRegex(QualityPlanError, "finite Quality-Profile"):
-            plan_for_paths(("src/main.rs",))
+    def test_requested_subset_is_allowed_without_changing_plan(self) -> None:
+        plan = plan_for_paths(("src/lib.rs",), requested_checks=("rust-test",))
+        self.assertEqual(plan.checks, ("rust-format", "rust-test"))
 
-    def test_cli_emits_stable_json_without_running_commands(self) -> None:
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            result = main(("docs/spec.md",))
-        self.assertEqual(result, 0)
-        self.assertEqual(stderr.getvalue(), "")
-        self.assertEqual(
-            json.loads(stdout.getvalue()),
-            {
-                "affected_owners": ["DOCS"],
-                "checks": ["requirements-authority"],
-                "quality_profile": "authority-only",
-            },
+    def test_duplicate_unknown_and_unrelated_requests_fail(self) -> None:
+        cases = (
+            ("src/lib.rs", ("rust-test", "rust-test")),
+            ("src/lib.rs", ("not-a-check",)),
+            ("docs/PRODUCT_REQUIREMENTS.md", ("rust-test",)),
         )
+        for path, requested in cases:
+            with self.subTest(requested=requested), self.assertRaises(QualityPlanError):
+                plan_for_paths((path,), requested_checks=requested)
 
-    def test_cli_requested_failure_is_pre_execution_failure(self) -> None:
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            result = main(
-                (
-                    "docs/spec.md",
-                    "--requested-check",
-                    "rust-test",
-                )
-            )
-        self.assertEqual(result, 1)
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("quality-plan: FAIL", stderr.getvalue())
+    def test_empty_and_unknown_paths_fail(self) -> None:
+        for paths in ((), ("unknown/file.txt",)):
+            with self.subTest(paths=paths), self.assertRaises(QualityPlanError):
+                plan_for_paths(paths)
 
 
 if __name__ == "__main__":

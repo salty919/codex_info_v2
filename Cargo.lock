@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "codex_info"
-version = "1.0.33"
+version = "1.0.34"
 dependencies = [
  "axum",
  "chrono",
