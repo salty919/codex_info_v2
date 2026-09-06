@@ -188,20 +188,23 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   startup、CLI、recorder全体、installer、distributionを選択しない。product変更のない`history-graph`宣言は不要な品質要求として
   拒否する。workflow/selector変更は`workflow-selection`で、
   変更workflowの構文、profile selector、rename/copy、main Release非縮小だけを確認し、Release publisher、bundle、installer、
-  product E2Eを起動しない。`AGENTS.md`を含む単なるauthority文書変更はprofileなしの`authority-only`とし、実行可能な
-  workflow・selector・検査scriptは同経路へ混在させない。今回のDB/API/model-history/Linux graph/Windows v3+ASTRA経路を含む
+  product E2Eを起動しない。`AGENTS.md`を含む単なるauthority文書変更はprofileなしの`authority-only`とするが、workflow・selector・
+  検査scriptと同じ変更に含まれるauthority文書は`workflow-selection`が有限pathとして所有する。今回のDB/API/model-history/Linux graph/Windows v3+ASTRA経路を含む
   有限28 pathの実差分は`model-history`で分類する。
   同profileは実差分に含まれるDOCS、LINUX_BACKEND、LINUX_UI、WINDOWSだけを選び、少なくとも1 product ownerを必須とする。
   v3 pair/304、v3 cacheとexact 404 fallback、履歴選択、
   legacy known/incomplete、ASTRA pricing/restart、ASTRA-only graphの既存直接testだけを実行し、full suite、installer、distributionを選択しない。
   `REST-172`のresident service publication変更は`resident-publication`で分類し、`docs/PRODUCT_REQUIREMENTS.md`、
   `docs/REQUIREMENTS_LEDGER.md`、`src/main.rs`だけを所有する。同profileは`src/main.rs`のdaemon/REST責務を
-  DOCSとLINUX_BACKENDへ限定し、不変tick、worker event、local/thread/recorder失敗間隔、incomplete root保持の直接6 caseだけを実行する。
+  DOCSとLINUX_BACKENDへ限定し、不変tick、worker event、local/thread/recorder失敗間隔、incomplete root保持、account generation非重複の直接7 caseだけを実行する。
   Linux UI、Windows、full suite、installer、distribution、Releaseを選択しない。
   `U128-19`のquota gap source分離変更は`recorder-gap`で分類し、`docs/DATA_PROTECTION_POLICY.md`、
   `docs/PRODUCT_REQUIREMENTS.md`、`docs/REQUIREMENTS_LEDGER.md`、`src/daemon.rs`、`src/main.rs`だけを所有する。
   同profileはDOCSとLINUX_BACKENDへ限定し、fresh quota observation、outage/stale拒否、exact retry、daemon gap状態の
   直接4 caseだけを実行する。Session model scan、Linux UI、Windows、full suite、installer、distribution、Releaseを選択しない。
+  `app-server-isolation`は`src/app_server_sqlite.rs`、`src/lib.rs`、`src/main.rs`だけを所有し、LINUX_BACKENDへ限定する。
+  SQLite online backup、owner lock/stale cleanup、path差し替え、prepare crash、account/thread child隔離、failure縮退、reap cleanupの
+  直接12 caseだけを実行し、Linux UI、Windows、full suite、installer、distribution、Releaseを選択しない。
   profile外path、欠落・重複・未知profileは従来どおり拒否する。main向けRelease candidateはfeat profileを
   受け取らず、従来の
   full owner、distribution、installer、実OS/UI品質を維持する。feat向け`selected-quality`集約と`feat-acceptance`、Windows release

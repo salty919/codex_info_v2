@@ -176,5 +176,5 @@ account切替直後は、既存Sessionを現在EOFへbaselineしてから新し�
 
 WindowsクライアントはWSL/Ubuntu側のserviceへSSH local port forwarding経由で接続する。
 X UIを併用する場合もserviceを増やさず、`--ui`を起動する。
-保持期間、1回の取得上限、REST SLOは[REST API v1](REST_API_V1.md)と
+保持期間、1回の取得上限、REST SLOは[REST API（v1/v2/v3）](REST_API_V1.md)と
 [データ保護規約](DATA_PROTECTION_POLICY.md)を参照先とする。

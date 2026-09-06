@@ -36,6 +36,9 @@ MODEL_HISTORY_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
     "LINUX_UI": ("requirements-authority", "linux-ui-model-history"),
     "WINDOWS": ("requirements-authority", "windows-model-history"),
 }
+APP_SERVER_ISOLATION_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
+    "LINUX_BACKEND": ("requirements-authority", "rust-app-server-isolation"),
+}
 RESIDENT_PUBLICATION_OWNER_CHECKS: dict[str, tuple[str, ...]] = {
     "DOCS": ("requirements-authority",),
     "LINUX_BACKEND": ("requirements-authority", "rust-resident-publication"),
@@ -54,6 +57,7 @@ ALL_CHECK_IDS = frozenset(
         OWNER_CHECKS,
         HISTORY_GRAPH_OWNER_CHECKS,
         MODEL_HISTORY_OWNER_CHECKS,
+        APP_SERVER_ISOLATION_OWNER_CHECKS,
         RECORDER_GAP_OWNER_CHECKS,
         RESIDENT_PUBLICATION_OWNER_CHECKS,
         WORKFLOW_SELECTION_OWNER_CHECKS,
@@ -137,6 +141,7 @@ def plan_for_paths(
     owner_checks = {
         "history-graph": HISTORY_GRAPH_OWNER_CHECKS,
         "model-history": MODEL_HISTORY_OWNER_CHECKS,
+        "app-server-isolation": APP_SERVER_ISOLATION_OWNER_CHECKS,
         "recorder-gap": RECORDER_GAP_OWNER_CHECKS,
         "resident-publication": RESIDENT_PUBLICATION_OWNER_CHECKS,
         "workflow-selection": WORKFLOW_SELECTION_OWNER_CHECKS,
