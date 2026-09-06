@@ -136,6 +136,9 @@ for check in "${checks[@]}"; do
         rust-model-history)
             bash scripts/regression_guard.sh --model-history
             ;;
+        rust-app-server-isolation)
+            bash scripts/regression_guard.sh --app-server-isolation
+            ;;
         rust-resident-publication)
             bash scripts/regression_guard.sh --resident-publication
             ;;

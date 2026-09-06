@@ -383,6 +383,11 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "inputs.quality_profile == 'resident-publication'",
         )
         expect(
+            "rust.app-server-isolation.if",
+            _step(rust_job, name="Run finite app-server isolation tests").get("if"),
+            "inputs.quality_profile == 'app-server-isolation'",
+        )
+        expect(
             "rust.recorder-gap.if",
             _step(rust_job, name="Run finite recorder gap tests").get("if"),
             "inputs.quality_profile == 'recorder-gap'",
@@ -696,8 +701,10 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "scripts/record_daemon_e2e.sh",
         "xvfb-run --auto-servernum",
         '"$QUALITY_PROFILE" == resident-publication',
+        '"$QUALITY_PROFILE" == app-server-isolation',
         '"$QUALITY_PROFILE" == recorder-gap',
         "bash scripts/regression_guard.sh --history-graph",
+        "bash scripts/regression_guard.sh --app-server-isolation",
         "bash scripts/regression_guard.sh --recorder-gap",
         "bash scripts/regression_guard.sh --resident-publication",
     ):
@@ -706,6 +713,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     if "upload-artifact" in rust:
         errors.append("rust.yml: evidence-only artifact remains")
     count("rust.yml", "scripts/regression_guard.sh --history-graph", 1)
+    count("rust.yml", "scripts/regression_guard.sh --app-server-isolation", 1)
     count("rust.yml", "scripts/regression_guard.sh --recorder-gap", 1)
     count("rust.yml", "scripts/regression_guard.sh --resident-publication", 1)
     count("windows-client.yml", "scripts/windows_client_contract_gate.sh --history-graph", 1)
@@ -3126,7 +3134,7 @@ def _focused_rust_routing_tests() -> int:
             "target, name = sys.argv[3:5]\n"
             "prefixes = {'--bin=codex_info': ('tests::', 'daemon::tests::'), "
             "'--test=usage_store': ('wave_b_correction_tests::',), "
-            "'--lib': ('server::tests::', 'usage_store::tests::')}\n"
+            "'--lib': ('server::tests::', 'usage_store::tests::', 'app_server_sqlite::tests::')}\n"
             "count = int(any(name.startswith(prefix) for prefix in prefixes[target]))\n"
             "print(f'test result: ok. {count} passed; 0 failed; 0 ignored')\n",
             encoding="utf-8",
@@ -3181,11 +3189,54 @@ def _focused_rust_routing_tests() -> int:
             "resident_recorder_retries_after_interval_without_dropping_pending_batch",
             "outage_recovery_uses_one_periodic_local_collector_lane",
             "resident_scheduler_keeps_periodic_thread_reads_single_flight",
+            "periodic_quota_refresh_does_not_overlap_account_generations",
         ):
             expected = f"--bin=codex_info tests::{name} count=1"
             if expected not in result.stdout:
                 raise AssertionError(
                     f"Rust resident publication caller omitted test: {name}"
+                )
+        result = subprocess.run(
+            (
+                "bash",
+                str(ROOT / "scripts/regression_guard.sh"),
+                "--app-server-isolation",
+            ),
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                "Rust app-server isolation caller selected the wrong module: "
+                f"{result.stderr}"
+            )
+        for name in (
+            "cleanup_rejects_replaced_generation_without_touching_replacement",
+            "crash_before_marker_is_recovered_without_permanent_block",
+            "foreign_root_entry_blocks_prepare_without_removal",
+            "inherited_owner_lock_preserves_generation_until_child_exit",
+            "live_generation_is_kept_and_dropped_generation_is_recovered",
+            "online_backup_is_private_and_source_is_unchanged",
+            "source_symlink_is_rejected_without_cache_growth",
+            "stale_incomplete_generation_is_recovered_without_growth",
+        ):
+            expected = f"--lib app_server_sqlite::tests::{name} count=1"
+            if expected not in result.stdout:
+                raise AssertionError(
+                    f"Rust app-server isolation caller omitted module test: {name}"
+                )
+        for name in (
+            "app_server_isolation_uses_private_generation_for_account_and_thread_children",
+            "app_server_isolation_failure_keeps_confirmed_local_recorder_live",
+            "unconfirmed_isolation_failure_uses_one_global_account_child",
+            "app_server_child_reap_owns_generation_cleanup",
+        ):
+            expected = f"--bin=codex_info tests::{name} count=1"
+            if expected not in result.stdout:
+                raise AssertionError(
+                    f"Rust app-server isolation caller omitted integration test: {name}"
                 )
         result = subprocess.run(
             ("bash", str(ROOT / "scripts/regression_guard.sh"), "--recorder-gap"),
@@ -3208,7 +3259,7 @@ def _focused_rust_routing_tests() -> int:
             expected = f"--bin=codex_info {name} count=1"
             if expected not in result.stdout:
                 raise AssertionError(f"Rust recorder gap caller omitted test: {name}")
-    return 4
+    return 5
 
 
 def _focused_windows_model_routing_test() -> int:
@@ -3453,12 +3504,22 @@ def workflow_selection_self_test() -> int:
         ),
         (
             "rust.yml",
+            "bash scripts/regression_guard.sh --app-server-isolation",
+            "true",
+        ),
+        (
+            "rust.yml",
             "bash scripts/regression_guard.sh --recorder-gap",
             "true",
         ),
         (
             "rust.yml",
             ' || "$QUALITY_PROFILE" == resident-publication',
+            "",
+        ),
+        (
+            "rust.yml",
+            ' || "$QUALITY_PROFILE" == app-server-isolation',
             "",
         ),
         (

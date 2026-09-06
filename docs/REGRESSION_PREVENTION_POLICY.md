@@ -40,6 +40,8 @@
 
 check IDの追加は、既存checkでは観測できない独立した失敗境界と、そのmaster IDがある場合だけ許す。
 既存checkと同じ結果を判定する場合は追加せず、既存ownerへ統合する。
+登録profileは要求・owner変更時とIssue closure監査時に現行path/直接oracleへ照合し、役割を失ったprofile、重複check、
+終了Issueだけに依存する固定pathを削除または既存ownerへ統合する。古いprofileを通すためのdummy変更や無関係check追加は禁止する。
 
 ## 失敗と証拠
 

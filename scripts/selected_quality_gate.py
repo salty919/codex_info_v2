@@ -25,6 +25,7 @@ CODEQL_LANGUAGES = frozenset({"actions", "csharp", "python", "rust"})
 QUALITY_PROFILES = frozenset(
     {
         "authority-only",
+        "app-server-isolation",
         "history-graph",
         "model-history",
         "recorder-gap",
@@ -133,6 +134,19 @@ def validate(
         if set(languages) - {"rust"}:
             raise QualitySelectionError(
                 f"{quality_profile} profile may select only Rust CodeQL"
+            )
+    if quality_profile == "app-server-isolation":
+        if selected != {"LINUX_BACKEND"}:
+            raise QualitySelectionError(
+                "app-server-isolation profile must select only Linux backend"
+            )
+        if distribution_required:
+            raise QualitySelectionError(
+                "app-server-isolation profile must not select distribution"
+            )
+        if set(languages) - {"rust"}:
+            raise QualitySelectionError(
+                "app-server-isolation profile may select only Rust CodeQL"
             )
     if quality_profile == "workflow-selection":
         if "GOVERNANCE" not in selected or PRODUCT_OWNERS.intersection(selected):
