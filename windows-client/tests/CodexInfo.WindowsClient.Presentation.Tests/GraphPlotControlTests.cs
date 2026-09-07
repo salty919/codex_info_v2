@@ -715,6 +715,34 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void IncompleteModelSetIsNeverLabelledIdleOrForcedToPredictedRemaining()
+    {
+        var samples = new[]
+        {
+            new ApiHistorySample(
+                1_000, 2_000, 90, 10, 0, 2, 10, 0, 2,
+                ApiHistorySample.LegacyUnknownModelSource)
+            {
+                ModelsComplete = false,
+            },
+            new ApiHistorySample(
+                1_060, 2_000, 89, 11, 0, 2, 11, 0, 2,
+                ApiHistorySample.LegacyUnknownModelSource)
+            {
+                ModelsComplete = false,
+            },
+        };
+
+        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_060);
+        var remaining = GraphPlotProjection.BuildRemainingLines(scene);
+
+        Assert.Empty(scene.IdleIntervals);
+        Assert.Equal([1_000d, 1_060d], remaining.Solid.X);
+        Assert.Equal([90d, 89d], remaining.Solid.Y);
+        Assert.Empty(remaining.Dashed.X);
+    }
+
+    [Fact]
     public void PlotProjectionPreservesAxisValueFormattingBoundaries()
     {
         var culture = CultureInfo.InvariantCulture;

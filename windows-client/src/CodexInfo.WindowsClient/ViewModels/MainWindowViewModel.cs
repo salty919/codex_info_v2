@@ -381,7 +381,12 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public string ModelUsageUnavailableText => $"{Texts.ModelUsage}: {Texts.UnavailableValue}";
 
-    public string EstimatedCostText => detailsSnapshot?.EstimatedCostLabel ?? Texts.EstimatedUnavailable;
+    public string EstimatedCostText => detailsSnapshot switch
+    {
+        { ApiVersion: "v3" } snapshot => FormatV3EstimatedCost(snapshot.Models),
+        { } snapshot => snapshot.EstimatedCostLabel,
+        _ => Texts.EstimatedUnavailable,
+    };
 
     public ReadOnlyObservableCollection<ModelUsageViewModel> CurrentModels => Models;
 
@@ -1135,6 +1140,24 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             LegalNotices = Array.Empty<ApiLegalNotice>(),
         };
         ApplyDetailsGeneration(merged);
+    }
+
+    private string FormatV3EstimatedCost(IReadOnlyList<ApiDetailsModelUsage> currentModels)
+    {
+        var known = currentModels
+            .Where(model => model.HasEstimatedCost)
+            .Select(model => model.EstimatedTotalDollars!.Value)
+            .ToArray();
+        if (known.Length == 0 || known.Any(value => !double.IsFinite(value) || value < 0))
+        {
+            return Texts.EstimatedUnavailable;
+        }
+
+        var total = known.Sum();
+        var prefix = Texts.LanguageCode == "ja" ? "概算" : Texts.Dollars;
+        return double.IsFinite(total)
+            ? string.Create(CultureInfo.CurrentCulture, $"{prefix} ${total:N2}")
+            : Texts.EstimatedUnavailable;
     }
 
     private void ApplyFailure(DetailsFetchFailure failure)

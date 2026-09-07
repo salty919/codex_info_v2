@@ -116,6 +116,35 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public async Task V3CurrentShowsThePublishedModelCostTotal()
+    {
+        var current = new ApiCurrentSnapshot(
+            ApiState.Ready,
+            1,
+            true,
+            "Pro",
+            new ApiQuota(45, 2, 604800, false),
+            [
+                new ApiDetailsModelUsage("SOL", 1, 0, 0, 1, 0, 0)
+                {
+                    EstimatedTotalDollars = 302.946591,
+                },
+                new ApiDetailsModelUsage("LUNA", 1, 0, 0, 1, 0, 0)
+                {
+                    EstimatedTotalDollars = 10.62801708,
+                },
+            ],
+            0,
+            PublishedPair(CanonicalPublishedPair));
+        using var viewModel = new MainWindowViewModel(new SingleCurrentClient(current));
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.IsAuthenticated);
+
+        Assert.Equal("概算 $313.57", viewModel.EstimatedCostText);
+    }
+
+    [Fact]
     public async Task InitialFailureExposesOneRetryAndRecoversThroughOneExplicitGeneration()
     {
         var supervisor = new RecordingSupervisor();
@@ -1426,6 +1455,32 @@ public sealed class MainWindowViewModelTests
             index++;
             return Task.FromResult(result);
         }
+    }
+
+    private sealed class SingleCurrentClient(ApiCurrentSnapshot current)
+        : HealthyDetailsClientBase, ILoopbackResourceClient
+    {
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("The split client must not request combined details.");
+
+        public Task<CurrentFetchResult> FetchCurrentAsync(
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(CurrentFetchResult.Success(current));
+
+        public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Main must not request history periods.");
+
+        public Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+            string periodId,
+            string? cursor = null,
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Main must not request history pages.");
+
+        public Task<ThreadsFetchResult> FetchThreadsAsync(
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Main must not request threads.");
     }
 
     private sealed class CountingSequenceClient(params DetailsFetchResult[] results) : HealthyDetailsClientBase
