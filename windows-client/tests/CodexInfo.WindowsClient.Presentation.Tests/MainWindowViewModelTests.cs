@@ -744,7 +744,9 @@ public sealed class MainWindowViewModelTests
 
         Assert.Equal(initialRemaining, viewModel.RemainingPercentText);
         Assert.Contains("前回受信の値", viewModel.StatusDetail, StringComparison.Ordinal);
+        Assert.Contains("前回受信:", viewModel.StatusDetail, StringComparison.Ordinal);
         Assert.Contains("現在は更新できていません", viewModel.LastReceivedText, StringComparison.Ordinal);
+        Assert.False(viewModel.ShowLastReceived);
     }
 
     [Fact]
@@ -758,6 +760,8 @@ public sealed class MainWindowViewModelTests
 
         Assert.DoesNotContain("更新できていません", viewModel.StatusDetail, StringComparison.Ordinal);
         Assert.Contains("接続経路", viewModel.StatusDetail, StringComparison.Ordinal);
+        Assert.Contains("前回受信:", viewModel.StatusDetail, StringComparison.Ordinal);
+        Assert.False(viewModel.ShowLastReceived);
         Assert.Equal("98.5%", viewModel.RemainingPercentText);
     }
 

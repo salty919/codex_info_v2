@@ -1082,7 +1082,8 @@ public sealed class GraphPlotControlTests
         Assert.NotEmpty(lunaLines.Flat.X);
         Assert.Empty(lunaLines.Rising.X);
         Assert.Empty(lunaLines.Dashed.X);
-        Assert.Empty(remainingLines.Solid.X);
+        Assert.Equal([2_000_000_220d, 2_000_000_280d], remainingLines.Solid.X);
+        Assert.Equal([1d, 1d], remainingLines.Solid.Y);
     }
 
     [Fact]

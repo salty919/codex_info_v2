@@ -169,7 +169,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public string UpdateButtonText => update?.ActionText ?? Texts.UpdateButtonText;
 
-    public bool ShowLastReceived => IsAuthenticated && !IsUpdateNotificationVisible;
+    public bool ShowLastReceived => IsAuthenticated &&
+        !IsUpdateNotificationVisible &&
+        !IsRetryVisible &&
+        !IsRefreshingVisible;
 
     public ReadOnlyObservableCollection<ModelUsageViewModel> Models { get; }
 
@@ -430,7 +433,19 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         _ => Texts.Connecting,
     };
 
-    public string StatusDetail => Texts.StatusDetailFor(presentationState.ToString(), authLaunchFailed, detailsSnapshot is not null);
+    public string StatusDetail
+    {
+        get
+        {
+            var detail = Texts.StatusDetailFor(
+                presentationState.ToString(),
+                authLaunchFailed,
+                detailsSnapshot is not null);
+            return IsRetryVisible && lastReceivedAt is not null
+                ? $"{detail} {LastReceivedText}"
+                : detail;
+        }
+    }
 
     public IBrush StatusBackground => presentationState switch
     {
