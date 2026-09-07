@@ -11,8 +11,9 @@ fail() { echo "x11-service-recovery-visual-gate: FAIL: $*" >&2; exit 1; }
 for command in curl python3 xprop xwd xwininfo; do
     command -v "$command" >/dev/null 2>&1 || hold "$command is unavailable"
 done
-binary="$root_dir/target/release/codex_info"
-[[ -x "$binary" ]] || fail 'build target/release/codex_info first'
+binary="${CODEX_INFO_ACCEPTANCE_BINARY:-$root_dir/target/release/codex_info}"
+[[ "$binary" == /* ]] || binary="$root_dir/$binary"
+[[ -x "$binary" && ! -L "$binary" ]] || fail "acceptance binary is not an executable regular file: $binary"
 
 # The product rejects executables below world/group-writable ancestors.  Keep
 # the fixture below the checked-out repository (whose ancestors are trusted)
@@ -29,6 +30,7 @@ window_id=''
 port=''
 frame="$temp_root/frame.xwd"
 ready_frame="$temp_root/ready.xwd"
+ready_current="$temp_root/ready-current.json"
 service_starttime=''
 ui_starttime=''
 
@@ -158,6 +160,7 @@ common_env=(
     "CODEX_INFO_DATA_DIR=$temp_root/data"
     "CODEX_INFO_CODEX_BIN=$fake_codex"
     "CODEX_INFO_FAKE_RESET_AT=$fixture_reset_at"
+    "CODEX_INFO_FAKE_FAILURE_FILE=$temp_root/app-server-failure"
     "CODEX_INFO_DAEMON_INTERVAL_SECS=2"
 )
 run_with_common_env() {
@@ -257,10 +260,54 @@ wait_service_models_ready() {
     return 1
 }
 
+service_last_good_error() {
+    local current
+    current="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" 2>/dev/null)" || return 1
+    python3 - "$current" "$ready_current" <<'PY'
+import json
+import sys
+try:
+    current = json.loads(sys.argv[1])
+    ready = json.loads(open(sys.argv[2], encoding="utf-8").read())
+except (IndexError, json.JSONDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if (
+    current.get("state") == "error"
+    and current.get("authenticated") is True
+    and all(current.get(key) == ready.get(key) for key in (
+        "observed_at", "plan_label", "quota", "models"
+    ))
+) else 1)
+PY
+}
+
+wait_service_last_good_error() {
+    for _ in $(seq 1 80); do
+        service_last_good_error && return 0
+        sleep 0.25
+    done
+    sed -n '1,160p' "$temp_root"/service-*.log >&2 2>/dev/null || true
+    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" >&2 || true
+    return 1
+}
+
 launch_service
 wait_service_ready || fail 'fixture-backed resident service did not publish ready details'
 append_verified_usage
 wait_service_models_ready || fail 'post-baseline fixture usage did not publish model details'
+curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" >"$ready_current"
+python3 - "$ready_current" <<'PY'
+import json
+import sys
+ready = json.loads(open(sys.argv[1], encoding="utf-8").read())
+raise SystemExit(0 if (
+    ready.get("state") == "ready"
+    and ready.get("authenticated") is True
+    and ready.get("observed_at") is not None
+    and ready.get("quota") is not None
+    and len(ready.get("models", [])) == 3
+) else 1)
+PY
 env -u CODEX_INFO_PREVIEW -u CODEX_INFO_PREVIEW_SIZE "${common_env[@]}" "$binary" --ui --port "$port" \
     >"$temp_root/ui.log" 2>&1 &
 ui_pid="$!"
@@ -353,6 +400,26 @@ done
 ((ready_capture == 1)) || fail 'real-service UI did not render a ready details generation'
 cp -- "$frame" "$ready_frame"
 
+# A live daemon may publish a recoverable top-level error while retaining the
+# last complete authenticated generation. This is the field state that must
+# never be rendered as a fresh authentication prompt.
+touch "$temp_root/app-server-failure"
+wait_service_last_good_error || fail 'resident service did not publish authenticated last-good error state'
+error_frame=0
+for _ in $(seq 1 60); do
+    if capture_state error "$ready_frame" >/dev/null 2>/dev/null; then error_frame=1; break; fi
+    sleep 0.25
+done
+((error_frame == 1)) || fail 'UI replaced authenticated last-good data with the authentication surface'
+rm -- "$temp_root/app-server-failure"
+wait_service_models_ready || fail 'resident service did not recover after the bounded app-server failure'
+ready_capture=0
+for _ in $(seq 1 60); do
+    if capture_state ready "$ready_frame" >/dev/null 2>/dev/null; then ready_capture=1; break; fi
+    sleep 0.25
+done
+((ready_capture == 1)) || fail 'UI did not recover from authenticated last-good error state'
+
 terminate_owned "$service_pid" service "$service_starttime" || fail 'fixture service did not stop cleanly'
 service_pid=''
 service_starttime=''
@@ -371,4 +438,4 @@ for _ in $(seq 1 60); do
     sleep 0.25
 done
 ((ready_capture == 1)) || fail 'UI did not clear the failure after same-endpoint recovery'
-echo 'x11-service-recovery-visual-gate: PASS (real service ready -> stopped/error retained -> same endpoint ready/recovered)'
+echo 'x11-service-recovery-visual-gate: PASS (ready -> authenticated last-good error exact data -> ready -> transport error -> recovered)'

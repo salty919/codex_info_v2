@@ -31,12 +31,47 @@ WORKFLOW_NAMES = (
     "windows-client.yml",
 )
 
+RELEASE_ACCEPTANCE_SCRIPTS = {
+    "linux-last-good": "scripts/x11_service_recovery_visual_gate.sh",
+    "app-server-failure": "scripts/fake_codex_app_server.py",
+}
+
 
 def sources() -> dict[str, str]:
     return {
         name: (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
         for name in WORKFLOW_NAMES
     }
+
+
+def release_acceptance_sources() -> dict[str, str]:
+    return {
+        name: (ROOT / path).read_text(encoding="utf-8")
+        for name, path in RELEASE_ACCEPTANCE_SCRIPTS.items()
+    }
+
+
+def _release_acceptance_script_errors(scripts: Mapping[str, str]) -> list[str]:
+    required = {
+        "linux-last-good": (
+            'current.get("state") == "error"',
+            'current.get("authenticated") is True',
+            'all(current.get(key) == ready.get(key)',
+            '"observed_at", "plan_label", "quota", "models"',
+            "UI replaced authenticated last-good data with the authentication surface",
+        ),
+        "app-server-failure": (
+            'method == "account/rateLimits/read" and failure_file',
+            '"error": {"code": -32000',
+        ),
+    }
+    errors: list[str] = []
+    for name, markers in required.items():
+        source = scripts.get(name, "")
+        for marker in markers:
+            if marker not in source:
+                errors.append(f"release acceptance script {name} is missing {marker}")
+    return errors
 
 
 def _workflow_document(source: str) -> dict[str, object]:
@@ -421,13 +456,47 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         for step_name in (
             "Install locked Inno Setup compiler",
             "Build standard Windows setup wizard",
-            "Smoke-test install and uninstall lifecycle",
+            "Upgrade latest published Windows release to the exact candidate",
+            "Run installed Windows UI Automation E2E",
+            "Create release manifest",
+            "Upload release candidate",
         ):
             expect(
                 f"windows.{step_name}.if",
                 _step(windows_job, name=step_name).get("if"),
                 "inputs.release_candidate",
             )
+        upgrade_script = _step(
+            windows_job,
+            name="Upgrade latest published Windows release to the exact candidate",
+        ).get("run")
+        if not isinstance(upgrade_script, str):
+            errors.append("workflow wiring windows upgrade script is missing")
+        else:
+            for marker in (
+                "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf)) {",
+                "throw 'Candidate upgrade removed user settings.'",
+            ):
+                if marker not in upgrade_script:
+                    errors.append(
+                        f"workflow wiring windows upgrade script is missing {marker}"
+                    )
+        windows_step_names = [
+            step.get("name")
+            for step in windows_job.get("steps", [])
+            if isinstance(step, dict)
+        ]
+        required_order = (
+            "Build standard Windows setup wizard",
+            "Upgrade latest published Windows release to the exact candidate",
+            "Run installed Windows UI Automation E2E",
+            "Create release manifest",
+            "Upload release candidate",
+        )
+        if [windows_step_names.index(name) for name in required_order] != sorted(
+            windows_step_names.index(name) for name in required_order
+        ):
+            errors.append("workflow wiring windows release acceptance order is invalid")
 
         # Resolver outputs -> lock holder; revalidation controls both side effects.
         output_keys = (
@@ -667,6 +736,8 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "cargo build --release --locked --target",
         "scripts/build_linux_bundle.sh",
         "scripts/test_linux_bundle.sh",
+        'CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info"',
+        "scripts/x11_service_recovery_visual_gate.sh",
         "uses: actions/upload-artifact@v4",
         "release-candidate-linux-v1-pr-${{ inputs.pr_number }}",
     ):
@@ -679,7 +750,17 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "dotnet format windows-client/CodexInfo.WindowsClient.sln",
         "dotnet test windows-client/CodexInfo.WindowsClient.sln",
         "Build-WindowsInstaller.ps1",
+        "/releases/latest",
+        "Previous stable installer failed",
+        "if ($previousHash -cne [string]$manifest.installer.sha256)",
+        "Latest stable Windows Setup digest does not match its published manifest",
+        '$expectedProductVersion = "$candidateVersionText+$SourceSha"',
+        "Set-Content -LiteralPath $sentinel -Value 'preserve'",
+        "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf))",
+        "Candidate upgrade removed user settings",
+        "windows-installer-upgrade: PASS",
         "Run-WindowsClientE2E.ps1",
+        "E2E uninstall removed user settings.",
         "windows_window_move_smoke.ps1",
         "$moveSmokeOutput = @(& ./scripts/windows_window_move_smoke.ps1",
         "[string]$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS'",
@@ -690,6 +771,8 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
             errors.append(f"windows-client.yml: missing {marker}")
     for forbidden in (
         "Measure-WindowsGraphLatency.ps1",
+        "Smoke-test install and uninstall lifecycle",
+        "E2E fixture install failed",
         "if ($LASTEXITCODE -ne 0) { throw 'Physical window move smoke failed.' }",
     ):
         if forbidden in windows:
@@ -761,6 +844,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     count("release.yml", "--paginate --slurp", 3)
 
     errors.extend(_semantic_workflow_errors(workflows))
+    errors.extend(_release_acceptance_script_errors(release_acceptance_sources()))
 
     return errors
 
@@ -3272,6 +3356,7 @@ def workflow_selection_self_test() -> int:
 
 def self_test() -> int:
     baseline = sources()
+    acceptance_baseline = release_acceptance_sources()
     errors = validate(baseline)
     if errors:
         raise AssertionError("production workflow contract failed: " + "; ".join(errors))
@@ -3294,6 +3379,27 @@ def self_test() -> int:
         ),
         ("selective-quality.yml", "  windows-quality:\n", "  omitted-windows-quality:\n"),
         ("windows-client.yml", "New-WindowsUpdateManifest.ps1", "Omitted-Manifest.ps1"),
+        ("windows-client.yml", "/releases/latest", "/releases/omitted"),
+        (
+            "windows-client.yml",
+            '$expectedProductVersion = "$candidateVersionText+$SourceSha"',
+            '$expectedProductVersion = "$candidateVersionText"',
+        ),
+        (
+            "windows-client.yml",
+            "if ($previousHash -cne [string]$manifest.installer.sha256)",
+            "if ($previousHash -ceq [string]$manifest.installer.sha256)",
+        ),
+        (
+            "windows-client.yml",
+            "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf))",
+            "if (Test-Path -LiteralPath $sentinel -PathType Leaf)",
+        ),
+        (
+            "linux-distribution.yml",
+            'CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info"',
+            'CODEX_INFO_ACCEPTANCE_BINARY="$GITHUB_WORKSPACE/target/release/codex_info"',
+        ),
         ("rust.yml", "cargo test --locked --all-targets -- --nocapture", "true"),
         ("codeql.yml", "  workflow_call:\n", "  schedule:\n"),
         (
@@ -3375,6 +3481,26 @@ def self_test() -> int:
         candidate[name] = candidate[name].replace(old, new, 1)
         if not validate(candidate):
             raise AssertionError(f"workflow mutation was accepted: {name}: {old}")
+        cases += 1
+    acceptance_mutations = (
+        (
+            "linux-last-good",
+            'all(current.get(key) == ready.get(key)',
+            'all(current.get(key) is not None',
+        ),
+        (
+            "app-server-failure",
+            '"error": {"code": -32000',
+            '"result": {"code": -32000',
+        ),
+    )
+    for name, old, new in acceptance_mutations:
+        candidate = dict(acceptance_baseline)
+        if old not in candidate[name]:
+            raise AssertionError(f"acceptance mutation target is missing: {name}: {old}")
+        candidate[name] = candidate[name].replace(old, new, 1)
+        if not _release_acceptance_script_errors(candidate):
+            raise AssertionError(f"release acceptance mutation was accepted: {name}: {old}")
         cases += 1
     observer_cases = _current_observer_tests(baseline["version-prepare.yml"])
     version_cases = _version_state_tests(baseline["version-prepare.yml"])

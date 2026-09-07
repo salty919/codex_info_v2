@@ -40,7 +40,7 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
       - name: Install bundle validation tools
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes binutils jq
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes binutils jq xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
       - name: Build the exact Linux target
         run: cargo build --release --locked --target "$LINUX_BUNDLE_TARGET"
       - name: Create and validate the Linux bundle
@@ -61,6 +61,14 @@ jobs:
             --run-id "$RUN_ID" \
             --run-attempt "$RUN_ATTEMPT"
           bash scripts/test_linux_bundle.sh --bundle-dir "$output_dir"
+          archive="$(find "$output_dir" -mindepth 1 -maxdepth 1 -type f -name 'codex-info-*-x86_64-unknown-linux-gnu.tar.gz' -print -quit)"
+          candidate_root="$GITHUB_WORKSPACE/.release-candidate-linux"
+          mkdir "$candidate_root"
+          tar -xzf "$archive" -C "$candidate_root" --no-same-owner
+          CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info" \
+            xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
+            bash scripts/x11_service_recovery_visual_gate.sh
+          rm -r -- "$candidate_root"
           version="$(jq -er '.version | select(type == "string")' "$output_dir"/*.manifest.json)"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           mkdir -p artifacts/linux-bundle
