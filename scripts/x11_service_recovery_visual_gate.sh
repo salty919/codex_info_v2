@@ -8,7 +8,7 @@ cd "$root_dir"
 hold() { echo "x11-service-recovery-visual-gate: HOLD: $*" >&2; exit 2; }
 fail() { echo "x11-service-recovery-visual-gate: FAIL: $*" >&2; exit 1; }
 [[ -n "${DISPLAY:-}" ]] || hold 'DISPLAY is unavailable'
-for command in curl python3 xdotool xprop xwd xwininfo; do
+for command in curl python3 xprop xwd xwininfo; do
     command -v "$command" >/dev/null 2>&1 || hold "$command is unavailable"
 done
 binary="${CODEX_INFO_ACCEPTANCE_BINARY:-$root_dir/target/release/codex_info}"
@@ -39,6 +39,43 @@ ui_starttime=''
 proc_starttime() {
     local pid="$1"
     awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true
+}
+
+click_window() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import ctypes
+import sys
+import time
+
+window, x, y = (int(value, 0) for value in sys.argv[1:])
+x11 = ctypes.CDLL("libX11.so.6")
+xtst = ctypes.CDLL("libXtst.so.6")
+x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+x11.XOpenDisplay.restype = ctypes.c_void_p
+x11.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+x11.XWarpPointer.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+                             ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
+                             ctypes.c_int, ctypes.c_int]
+x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+xtst.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+
+display = x11.XOpenDisplay(None)
+if not display:
+    raise SystemExit("X display is unavailable")
+try:
+    x11.XRaiseWindow(display, window)
+    x11.XWarpPointer(display, 0, window, 0, 0, 0, 0, x, y)
+    x11.XSync(display, 0)
+    time.sleep(0.05)
+    if not xtst.XTestFakeButtonEvent(display, 1, 1, 0):
+        raise SystemExit("X button press failed")
+    if not xtst.XTestFakeButtonEvent(display, 1, 0, 0):
+        raise SystemExit("X button release failed")
+    x11.XSync(display, 0)
+finally:
+    x11.XCloseDisplay(display)
+PY
 }
 
 terminate_owned() {
@@ -267,12 +304,26 @@ service_last_good_error() {
     current="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" 2>/dev/null)" || return 1
     python3 - "$current" "$ready_current" <<'PY'
 import json
+import os
 import sys
 try:
     current = json.loads(sys.argv[1])
     ready = json.loads(open(sys.argv[2], encoding="utf-8").read())
 except (IndexError, json.JSONDecodeError):
     raise SystemExit(1)
+
+# A recorder cycle that started before failure injection may still commit one
+# valid generation afterwards.  That generation is the actual last-good root,
+# so retain it as the comparison baseline while waiting for the first error.
+if current.get("state") == "ready" and current.get("authenticated") is True:
+    temporary = f"{sys.argv[2]}.tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        stream.write(sys.argv[1])
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, sys.argv[2])
+    raise SystemExit(1)
+
 raise SystemExit(0 if (
     current.get("state") == "error"
     and current.get("authenticated") is True
@@ -405,7 +456,7 @@ cp -- "$frame" "$ready_frame"
 # Exercise the actual lazy boundary: the authenticated main window has already
 # rendered with period metadata, and only this user action may materialize the
 # selected history page and graph window.
-xdotool mousemove --window "$window_id" 750 30 click 1
+click_window "$window_id" 750 30
 for _ in $(seq 1 100); do
     while read -r candidate; do
         [[ "$candidate" != "$window_id" ]] || continue
