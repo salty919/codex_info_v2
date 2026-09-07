@@ -1276,7 +1276,7 @@ def _run_version_step(
 def _status_calls(fixture: dict[str, Path | str | int]) -> list[list[str]]:
     calls = fixture.get("last_gh_calls", [])
     if not isinstance(calls, list):
-        raise AssertionError("recorded GitHub calls must be a list")
+        raise TypeError("recorded GitHub calls must be a list")
     return [
         call
         for call in calls
