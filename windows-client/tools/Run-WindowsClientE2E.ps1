@@ -9,6 +9,7 @@ param(
     [string]$OutputDirectory = '',
     [switch]$Fixture,
     [switch]$FixtureContractTest,
+    [switch]$CompatibilitySmoke,
     [string]$SourceSha = ''
 )
 
@@ -2207,6 +2208,10 @@ try {
     }
     $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description 'initial-current'
     Write-E2E ("graph: plot bounds={0}x{1}" -f $plot.Current.BoundingRectangle.Width, $plot.Current.BoundingRectangle.Height)
+    if ($CompatibilitySmoke) {
+        Write-E2E 'windows-client-compatibility-smoke: PASS (installed client -> real current -> real selected history graph)'
+        return
+    }
     $initialGraphBounds = Get-E2EWindowBounds $graph.Handle
     $graphScaleX = $initialGraphBounds.Width / 940.0
     $graphScaleY = $initialGraphBounds.Height / 640.0

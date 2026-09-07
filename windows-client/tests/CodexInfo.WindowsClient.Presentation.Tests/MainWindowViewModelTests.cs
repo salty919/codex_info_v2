@@ -66,7 +66,7 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
-    public async Task ShowLastReceivedNotifiesWhenUpdateVisibilityChangesAcrossFailureAndRecovery()
+    public async Task AvailableUpdateRemainsThePrimaryActionAcrossFailureAndRecovery()
     {
         var supervisor = new RecordingSupervisor();
         var client = new SequenceClient(
@@ -83,37 +83,36 @@ public sealed class MainWindowViewModelTests
         await EventuallyAsync(() => viewModel.IsAuthenticated && viewModel.IsUpdateNotificationVisible);
         Assert.False(viewModel.ShowLastReceived);
 
-        var failureVisible = NewSignal<bool>();
-        var recoveryHidden = NewSignal<bool>();
-        PropertyChangedEventHandler handler = (_, args) =>
-        {
-            if (args.PropertyName != nameof(viewModel.ShowLastReceived)) return;
-            if (viewModel.ShowLastReceived)
-            {
-                failureVisible.TrySetResult(true);
-            }
-            else
-            {
-                recoveryHidden.TrySetResult(false);
-            }
-        };
-        viewModel.PropertyChanged += handler;
-        try
-        {
-            viewModel.RefreshCommand.Execute(null);
-            await failureVisible.Task.WaitAsync(TimeSpan.FromSeconds(2));
-            Assert.True(viewModel.ShowLastReceived);
-            Assert.True(viewModel.IsRetryVisible);
+        viewModel.RefreshCommand.Execute(null);
+        await EventuallyAsync(() =>
+            viewModel.IsUpdateNotificationVisible &&
+            viewModel.IsUpdateActionVisible &&
+            !viewModel.IsRetryVisible);
+        Assert.False(viewModel.ShowLastReceived);
 
-            viewModel.RefreshCommand.Execute(null);
-            await recoveryHidden.Task.WaitAsync(TimeSpan.FromSeconds(2));
-            Assert.False(viewModel.ShowLastReceived);
-            Assert.True(viewModel.IsUpdateNotificationVisible);
-        }
-        finally
-        {
-            viewModel.PropertyChanged -= handler;
-        }
+        viewModel.RefreshCommand.Execute(null);
+        await EventuallyAsync(() =>
+            viewModel.IsUpdateNotificationVisible &&
+            viewModel.IsUpdateActionVisible &&
+            !viewModel.IsRetryVisible);
+        Assert.False(viewModel.ShowLastReceived);
+    }
+
+    [Fact]
+    public async Task InitialConnectionFailureCannotHideAnAvailableUpdate()
+    {
+        using var updates = new TestUpdateCoordinator(new UpdateCheckResult("1.2.3", false));
+        using var viewModel = new MainWindowViewModel(
+            new SequenceClient(DetailsFetchResult.FromFailure(DetailsFetchFailure.Response)),
+            updateCoordinator: updates);
+
+        viewModel.Start();
+        await EventuallyAsync(() =>
+            viewModel.IsUpdateNotificationVisible && viewModel.IsUpdateActionVisible);
+
+        Assert.False(viewModel.IsRetryVisible);
+        Assert.NotNull(viewModel.UpdateCommand);
+        Assert.True(viewModel.UpdateCommand!.CanExecute(null));
     }
 
     [Fact]

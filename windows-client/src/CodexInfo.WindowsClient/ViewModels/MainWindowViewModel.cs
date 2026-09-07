@@ -144,7 +144,6 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             lock (stateGate)
             {
                 return !IsAuthRequired &&
-                    !hasConnectionFailure &&
                     !initialLoadPending &&
                     !refreshing &&
                     update?.IsNotificationVisible == true;
@@ -159,7 +158,6 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             lock (stateGate)
             {
                 return !IsAuthRequired &&
-                    !hasConnectionFailure &&
                     !initialLoadPending &&
                     !refreshing &&
                     update?.IsUpdateActionVisible == true;
@@ -201,7 +199,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                     !initialLoadPending &&
                     !refreshing &&
                     hasConnectionFailure &&
-                    !IsAuthRequired;
+                    !IsAuthRequired &&
+                    !IsUpdateActionVisible;
             }
         }
     }
@@ -1411,6 +1410,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             if (disposed) return;
             Notify(nameof(IsUpdateNotificationVisible));
             Notify(nameof(IsUpdateActionVisible));
+            Notify(nameof(IsRetryVisible));
             Notify(nameof(UpdateNotificationText));
             Notify(nameof(UpdateButtonText));
             Notify(nameof(ShowLastReceived));
