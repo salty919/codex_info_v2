@@ -10777,12 +10777,23 @@ impl CodexInfoState {
     /// `thread_checking` are the single-flight completion boundaries.
     fn schedule_resident_refresh(&mut self, now: Instant) -> bool {
         let mut publication_changed = false;
+        let account_due = !self.recorder_store_error
+            && !self.has_pending_recorder_batch()
+            && account_refresh_due(
+                now,
+                self.last_poll,
+                self.checking,
+                self.authenticated,
+                self.auth_polling,
+            );
         // When no current authenticated quota is available (auth-required or
         // app-server error), keep the persisted period current through the
         // same local collector used by authenticated refreshes. Local
-        // collection owns one lane, so it must finish before another account
-        // or local generation can be admitted.
+        // collection owns one lane. A due account read takes precedence:
+        // starting local recovery first would set `local_usage_pending` and
+        // starve every later quota retry while the error remains present.
         if (!self.authenticated || self.account_error.is_some())
+            && !account_due
             && !self.auth_polling
             && !self.checking
             && !self.local_usage_pending
@@ -10808,17 +10819,7 @@ impl CodexInfoState {
         // terminal local result. Periodic quota responses can share the same
         // reset tuple, so overlapping them would make an older local scan
         // indistinguishable from the newer generation.
-        if !self.local_usage_pending
-            && !self.recorder_store_error
-            && !self.has_pending_recorder_batch()
-            && account_refresh_due(
-                now,
-                self.last_poll,
-                self.checking,
-                self.authenticated,
-                self.auth_polling,
-            )
-        {
+        if !self.local_usage_pending && account_due {
             let status = if self.auth_polling && !self.authenticated {
                 "認証完了を確認しています…"
             } else {
@@ -11202,6 +11203,10 @@ impl CodexInfoState {
                 self.service_history_cursor = None;
             }
             self.active_threads.clear();
+            // Period metadata is a split resource. Fetch it immediately for
+            // the new pair instead of presenting the empty current root as
+            // "履歴なし" until the normal polling interval elapses.
+            self.service_history_force_poll = true;
             self.service_history_error = None;
             self.service_threads_pair = None;
             self.service_threads_error = None;
@@ -19311,6 +19316,7 @@ mod tests {
         client
             .apply_service_current_v3(pair.clone(), current)
             .expect("current root is valid");
+        assert!(client.service_history_force_poll);
 
         client
             .apply_service_history_periods_resource(pair.clone(), periods.clone())
@@ -20753,6 +20759,45 @@ mod tests {
         ));
         assert!(local_commands.try_recv().is_err());
         let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn due_account_retry_precedes_outage_local_recovery() {
+        let now = Instant::now();
+        let mut state = CodexInfoState::preview("normal");
+        let reset_at = state.reset_at.expect("preview quota has reset");
+        state.preview = false;
+        state.authenticated = true;
+        state.auth_polling = false;
+        state.checking = false;
+        state.account_error = Some("account bridge unavailable".into());
+        state.recovery_period = Some((reset_at, WEEK_SECONDS));
+        state.last_poll = now - Duration::from_secs(61);
+        state.last_local_poll = now - Duration::from_secs(61);
+        state.last_thread_poll = now;
+
+        let (account_tx, account_commands) = std::sync::mpsc::channel();
+        let (_account_events, account_rx) = std::sync::mpsc::channel();
+        state.bridge = super::AppServerBridge {
+            tx: account_tx,
+            rx: account_rx,
+        };
+        let (local_tx, local_commands) = std::sync::mpsc::channel();
+        let (_local_events, local_rx) = std::sync::mpsc::channel();
+        state.local_bridge = super::LocalUsageBridge {
+            tx: local_tx,
+            rx: local_rx,
+        };
+
+        let _ = state.schedule_resident_refresh(now);
+
+        assert!(matches!(
+            account_commands.try_recv(),
+            Ok(super::AccountCommand::Read)
+        ));
+        assert!(local_commands.try_recv().is_err());
+        assert!(state.checking);
+        assert!(!state.local_usage_pending);
     }
 
     #[test]
