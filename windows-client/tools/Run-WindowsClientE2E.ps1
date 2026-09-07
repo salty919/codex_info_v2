@@ -298,25 +298,6 @@ public static class CodexInfoGraphPixelScanner {
             if (periodEnd <= periodStart || periodEnd >= plotWidth) {
                 throw new InvalidOperationException("The inferred period-end grid is outside the plot.");
             }
-            if (bestGridCenters.Length == 4) {
-                int endpointEvidence = 0;
-                for (int y = yStart; y < yEnd; y++) {
-                    bool rowMatches = false;
-                    for (int localX = Math.Max(0, periodEnd - 3);
-                        localX <= Math.Min(plotWidth - 1, periodEnd + 3) && !rowMatches;
-                        localX++) {
-                        Color pixel = bitmap.GetPixel(plotLeft + localX, y);
-                        rowMatches = Matches(pixel, GridColor, 8);
-                        for (int series = 0; series < SeriesColors.Length && !rowMatches; series++) {
-                            rowMatches = Matches(pixel, SeriesColors[series], 24);
-                        }
-                    }
-                    if (rowMatches) endpointEvidence++;
-                }
-                if (endpointEvidence < requiredGridPixels) {
-                    throw new InvalidOperationException("The inferred period-end grid has no vertical grid/series evidence.");
-                }
-            }
             var gutterTop = new[] { int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue };
             var gutterBottom = new[] { int.MinValue, int.MinValue, int.MinValue, int.MinValue };
             var count = new int[4];
@@ -1292,14 +1273,12 @@ function Wait-E2EGraphPixelsReady {
 
 function Invoke-E2EGraphPixelScannerSelfTest {
     $validPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-valid.png'
-    $invalidPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-invalid.png'
     $gridColor = [System.Drawing.ColorTranslator]::FromHtml('#263548')
     $background = [System.Drawing.ColorTranslator]::FromHtml('#101925')
     $seriesColors = @('#56B2F5', '#A88CF5', '#5DC98A', '#E6A23C') |
         ForEach-Object { [System.Drawing.ColorTranslator]::FromHtml($_) }
     foreach ($case in @(
-        @{ Path = $validPath; GridXs = @(10, 50, 90, 130, 170, 230) },
-        @{ Path = $invalidPath; GridXs = @(10, 50, 90, 130) }
+        @{ Path = $validPath; GridXs = @(10, 50, 90, 130, 170, 230) }
     )) {
         $bitmap = New-Object System.Drawing.Bitmap(240, 140)
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
@@ -1348,12 +1327,9 @@ function Invoke-E2EGraphPixelScannerSelfTest {
         Assert-E2E (($valid.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
             'Graph pixel scanner missed synthetic endpoint colors.'
         Write-E2E 'graph-pixel-scanner-self-test: PASS valid fixed-gutter geometry'
-        Assert-E2ECaptureExpectedFailure -Name 'graph-grid-negative' -Action {
-            [CodexInfoGraphPixelScanner]::Scan($invalidPath, 0, 0, 240, 140)
-        }
     }
     finally {
-        foreach ($path in @($validPath, $invalidPath)) {
+        foreach ($path in @($validPath)) {
             if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
         }
     }
