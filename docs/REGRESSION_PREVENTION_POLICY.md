@@ -22,6 +22,8 @@
 - 影響するmaster IDごとに、その観測結果を直接判定できるオラクルを少なくとも1件持つ。
 - 同じ観測結果のcheck ownerは1件にし、他のgateからtest名、呼出し数、実装文字列を二重監視しない。
 - 変更のない製品ownerのtest、build、installer、実画面、実OS E2E、CodeQL言語は実行しない。
+- mainの自動生成H1だけは、既存Release品質runが同じheadの単一commit statusを`pending`から最終結果へ更新する。
+  feat、H2、binary impactなしheadへ重複statusを作らず、repository ruleでMergeを強制blockしない。
 - test件数、coverage率、「念のため」、「安心のため」、全直積、routineのAI再評価はcheck追加の理由にしない。
 - 実OS、installer、統合画面は、その境界を変更したとき、Release candidate、または記録済み障害経路の
   再現確認に限る。

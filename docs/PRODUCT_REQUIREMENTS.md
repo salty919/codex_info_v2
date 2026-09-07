@@ -178,7 +178,10 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
   version mutationを0件にする。open・non-draft・current headだけをownerとする。`version-prepared`と`acceptance`は同じrunの
   Release品質結果であり、branch mergeのrequired checkにはしない。workflowの`GITHUB_TOKEN`がversion commit H1をpushした経路は、
   同じH0 runが保存済み選択でH1を評価し、生成commitの固定trailerとproducer runからH0/H1を対応付ける。
-  H1へcustom `version-prepared`・`acceptance` checkを登録せず、poll、retry、URL・時刻・表示値の照合も行わない。
+  H1へ`version-prepared`・`acceptance`のcustom check runまたは別jobを登録しない。生成H1だけは、同じtrusted runが単一の
+  `main-pr-quality/current-head` commit statusをpush直後の`pending`から、選択job集約後の`success`または`failure`へ更新する。
+  statusはrequired checkにせず、失敗・取消・未完了を緑へ変えずに利用者のMerge操作を残す。H2、binary impactなしhead、feat headは
+  event自身の既存jobがexact headへ付くため、このstatusを重複作成しない。poll、retry、URL・時刻・表示値の照合も行わない。
   `acceptance`はmain向けに選択jobの結果だけを集約し、失敗時はRelease公開をHOLDするがmergeを禁止しない。
   Windowsを含むmain向けrelease candidateでは、Windows job自身が実Windows評価後にrelease candidateを作る。
   Linux-only変更も、Linux archiveを既存`windows-vX.Y.Z` ReleaseへWindows Setup/manifestと同居させるため、
@@ -216,7 +219,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 - PR由来のcheckout、script、workflow、artifactを、repository contents・checks・Releaseへのwrite権限を持つjobで実行しない。
   write権限を持つ採番jobはtrusted baseだけをcheckout・実行し、PR headはGit object dataとしてだけ読む。
   same-repository headへexact 1 commitをnon-force pushし、競合pushはGit自身のnon-fast-forward拒否に任せてreadbackやretryを行わない。
-  H1 custom check作成jobは置かない。Releaseのread-only解決jobはGitHub objectとrun状態だけを読み、
+  H1 custom check作成jobは置かず、生成H1のstatus更新は既存のversion-preparedとacceptanceだけが所有する。Releaseのread-only解決jobはGitHub objectとrun状態だけを読み、
   write jobはsourceをcheckout・実行せず、解決済みcandidateとlock取得後に再取得したremote状態だけを入力にする。
 - 完全path分類からCodeQL言語が導出されるPRではその言語だけを実行し、main向けRelease品質ではanalysis成功とcritical/high finding不在を
   公開条件とする。CodeQL失敗はworkflowへ表示するがbranch mergeを禁止しない。CodeQL言語が選択されないPRとmerge後pushでは

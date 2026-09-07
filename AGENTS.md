@@ -75,7 +75,7 @@ cleanup条件と削除予定:
 - pushまたはPR作成直前に`origin/feat/next`の完全SHAを再確認する。進んでいる場合は旧新SHAとowned pathsへの影響を報告し、「認可状態の継続と自動GOAL継続」に従って継続可否を判断する。履歴書換えを要しない既存branchの更新を、base SHAの変化だけで停止しない。
 - `codex/<task> -> feat/next`はtrusted `feat-integration.yml`が完全なPR差分を有限ownerへ分類し、関係するremote qualityだけをadvisoryに実行する。実owner job、CodeQL、distributionの失敗は赤のまま表示するが、`selected-quality`集約と`feat-acceptance`は実行せず、workflow結果でユーザーのmergeを禁止しない。この経路ではversion、candidate、Release、tag、branch refをmutationしない。`feat/next -> main`は同じ分類正本を使用するが、`selected-quality`・`acceptance`・`version-prepared`はRelease品質と公開可否を別のmain経路で所有し、merge判断はユーザーだけが行う。feat向けtriggerをmain向けtriggerの単純な拡張にしてはならない。
 - Git差分callerはrename/copy検出を明示し、両端を単一分類器へ渡す。mainのRelease向けselected/non-selected結果だけをtrusted base版gateで集約し、feat向けPRは選択された実job自身の結果を表示する。
-- workflowの`GITHUB_TOKEN`によるref更新が別のActions runを起動すると仮定しない。main向けversion生成H1は同じtrusted DAGでRelease品質を評価し、生成commitの固定trailerとproducer runでH0/H1を対応付ける。H1へcustom `version-prepared`・`acceptance` checkを登録せず、同じH1のeventは正規trailerを確認できた場合だけowner再実行を抑止する。この確認はbyte-identicalな手動commitとの区別だけを目的とし、poll、retry、mutation readback、表示URL照合、証拠専用artifactを追加しない。
+- workflowの`GITHUB_TOKEN`によるref更新が別のActions runを起動すると仮定しない。main向けversion生成H1は同じtrusted DAGでRelease品質を評価し、生成commitの固定trailerとproducer runでH0/H1を対応付ける。別jobやrequired checkを追加せず、生成H1だけに単一の`main-pr-quality/current-head` commit statusをpush直後の`pending`から同じrunの最終`success`または`failure`へ更新し、非成功でもMerge操作を強制blockしない。同じH1のeventは正規trailerを確認できた場合だけowner再実行を抑止する。この確認はbyte-identicalな手動commitとの区別だけを目的とし、poll、retry、mutation readback、表示URL照合、証拠専用artifactを追加しない。
 
 ### race、cleanup、復旧、報告
 
