@@ -218,13 +218,12 @@ internal static class GraphPlotProjection
             // reference-only. Do not taint the following segment once a
             // fresh remote observation and a trusted model increment arrive.
             var interpolated = scene.RemainingInterpolated[index];
-            var modelAvailable = scene.ModelVectorAvailable[previous] &&
-                scene.ModelVectorAvailable[index];
+            var modelAvailable = ModelDataAvailable(scene, previous, index);
             var modelAdvanced = ModelAdvanced(scene, previous, index);
             var quotaDropped = current < before;
             var unattributed = quotaDropped && (!modelAvailable || !modelAdvanced);
             var dashed = !contiguous || elapsed > ModelContiguousSampleMaxGapSeconds ||
-                !observed || interpolated || !modelAvailable || unattributed ||
+                !observed || interpolated || unattributed ||
                 scene.HasConfirmedGapBetween(scene.Timestamps[previous], scene.Timestamps[index]);
             if (dashed)
             {
@@ -447,12 +446,14 @@ internal static class GraphPlotProjection
     private static string FormatRemaining(double value, CultureInfo culture) =>
         value.ToString("0.#", culture) + "%";
 
+    private static bool ModelDataAvailable(GraphScene scene, int before, int after) =>
+        scene.ModelSeries.Count > 0 && scene.ModelSeries.Values.All(values =>
+            before < values.Count && after < values.Count &&
+            double.IsFinite(values[before]) && double.IsFinite(values[after]));
+
     private static bool ModelAdvanced(GraphScene scene, int before, int after) =>
-        scene.ModelVectorAvailable[before] && scene.ModelVectorAvailable[after] &&
-        (scene.Sol[after] > scene.Sol[before] ||
-         scene.Terra[after] > scene.Terra[before] ||
-         scene.Luna[after] > scene.Luna[before] ||
-         scene.Astra[after] > scene.Astra[before]);
+        ModelDataAvailable(scene, before, after) && scene.ModelSeries.Values.Any(values =>
+            values[after] > values[before]);
 
     private static double RemainingValue(GraphScene scene, int index)
     {

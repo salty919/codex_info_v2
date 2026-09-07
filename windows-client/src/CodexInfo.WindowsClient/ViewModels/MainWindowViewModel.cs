@@ -144,7 +144,6 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             lock (stateGate)
             {
                 return !IsAuthRequired &&
-                    !hasConnectionFailure &&
                     !initialLoadPending &&
                     !refreshing &&
                     update?.IsNotificationVisible == true;
@@ -159,7 +158,6 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             lock (stateGate)
             {
                 return !IsAuthRequired &&
-                    !hasConnectionFailure &&
                     !initialLoadPending &&
                     !refreshing &&
                     update?.IsUpdateActionVisible == true;
@@ -171,7 +169,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public string UpdateButtonText => update?.ActionText ?? Texts.UpdateButtonText;
 
-    public bool ShowLastReceived => IsAuthenticated && !IsUpdateNotificationVisible;
+    public bool ShowLastReceived => IsAuthenticated &&
+        !IsUpdateNotificationVisible &&
+        !IsRetryVisible &&
+        !IsRefreshingVisible;
 
     public ReadOnlyObservableCollection<ModelUsageViewModel> Models { get; }
 
@@ -201,7 +202,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                     !initialLoadPending &&
                     !refreshing &&
                     hasConnectionFailure &&
-                    !IsAuthRequired;
+                    !IsAuthRequired &&
+                    !IsUpdateActionVisible;
             }
         }
     }
@@ -382,7 +384,12 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public string ModelUsageUnavailableText => $"{Texts.ModelUsage}: {Texts.UnavailableValue}";
 
-    public string EstimatedCostText => detailsSnapshot?.EstimatedCostLabel ?? Texts.EstimatedUnavailable;
+    public string EstimatedCostText => detailsSnapshot switch
+    {
+        { ApiVersion: "v3" } snapshot => FormatV3EstimatedCost(snapshot.Models),
+        { } snapshot => snapshot.EstimatedCostLabel,
+        _ => Texts.EstimatedUnavailable,
+    };
 
     public ReadOnlyObservableCollection<ModelUsageViewModel> CurrentModels => Models;
 
@@ -426,7 +433,19 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         _ => Texts.Connecting,
     };
 
-    public string StatusDetail => Texts.StatusDetailFor(presentationState.ToString(), authLaunchFailed, detailsSnapshot is not null);
+    public string StatusDetail
+    {
+        get
+        {
+            var detail = Texts.StatusDetailFor(
+                presentationState.ToString(),
+                authLaunchFailed,
+                detailsSnapshot is not null);
+            return IsRetryVisible && lastReceivedAt is not null
+                ? $"{detail} {LastReceivedText}"
+                : detail;
+        }
+    }
 
     public IBrush StatusBackground => presentationState switch
     {
@@ -1138,6 +1157,24 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         ApplyDetailsGeneration(merged);
     }
 
+    private string FormatV3EstimatedCost(IReadOnlyList<ApiDetailsModelUsage> currentModels)
+    {
+        var known = currentModels
+            .Where(model => model.HasEstimatedCost)
+            .Select(model => model.EstimatedTotalDollars!.Value)
+            .ToArray();
+        if (known.Length == 0 || known.Any(value => !double.IsFinite(value) || value < 0))
+        {
+            return Texts.EstimatedUnavailable;
+        }
+
+        var total = known.Sum();
+        var prefix = Texts.LanguageCode == "ja" ? "概算" : Texts.Dollars;
+        return double.IsFinite(total)
+            ? string.Create(CultureInfo.CurrentCulture, $"{prefix} ${total:N2}")
+            : Texts.EstimatedUnavailable;
+    }
+
     private void ApplyFailure(DetailsFetchFailure failure)
     {
         hasConnectionFailure = true;
@@ -1411,6 +1448,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             if (disposed) return;
             Notify(nameof(IsUpdateNotificationVisible));
             Notify(nameof(IsUpdateActionVisible));
+            Notify(nameof(IsRetryVisible));
             Notify(nameof(UpdateNotificationText));
             Notify(nameof(UpdateButtonText));
             Notify(nameof(ShowLastReceived));

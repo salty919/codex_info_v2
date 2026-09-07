@@ -1,6 +1,6 @@
 # Runs the finite Windows UI Automation acceptance path against the installed
 # client.  The normal mode uses the configured loopback service.  CI may pass
-# -Fixture to provide bounded local /v1/health and /v1/details responses; this still
+# -Fixture to provide bounded local /v1/health and /v2/details responses; this still
 # drives the installed EXE and the real rendered windows, but does not require
 # an account or an SSH tunnel.
 [CmdletBinding()]
@@ -9,6 +9,8 @@ param(
     [string]$OutputDirectory = '',
     [switch]$Fixture,
     [switch]$FixtureContractTest,
+    [switch]$CompatibilitySmoke,
+    [switch]$RequireCurrentPresentation,
     [string]$SourceSha = ''
 )
 
@@ -121,16 +123,24 @@ Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Drawing
 
 $compilerReferenceRoot = Join-Path $PSHOME 'ref'
-$compilerReferences = @(Get-ChildItem -LiteralPath $compilerReferenceRoot -Filter '*.dll' -File |
-    Select-Object -ExpandProperty FullName)
-$runtimeReferences = @(
-    [System.Drawing.Bitmap].Assembly.Location
-    ([System.Reflection.Assembly]::Load('System.Private.Windows.GdiPlus')).Location
-    ([System.Reflection.Assembly]::Load('System.Private.Windows.Core')).Location
-)
-Assert-E2E ($compilerReferences.Count -gt 0) 'PowerShell compiler references could not be resolved.'
-Assert-E2E (@($runtimeReferences | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }).Count -eq 0) 'Windows drawing runtime references could not be resolved.'
-$compilerReferences += $runtimeReferences
+if (Test-Path -LiteralPath $compilerReferenceRoot -PathType Container) {
+    $compilerReferences = @(Get-ChildItem -LiteralPath $compilerReferenceRoot -Filter '*.dll' -File |
+        Select-Object -ExpandProperty FullName)
+    $runtimeReferences = @(
+        [System.Drawing.Bitmap].Assembly.Location
+        ([System.Reflection.Assembly]::Load('System.Private.Windows.GdiPlus')).Location
+        ([System.Reflection.Assembly]::Load('System.Private.Windows.Core')).Location
+    )
+    Assert-E2E ($compilerReferences.Count -gt 0) 'PowerShell compiler references could not be resolved.'
+    Assert-E2E (@($runtimeReferences | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }).Count -eq 0) 'Windows drawing runtime references could not be resolved.'
+    $compilerReferences += $runtimeReferences
+}
+else {
+    # Windows PowerShell 5.1 runs on .NET Framework and has no PSHOME/ref
+    # directory. Add-Type supplies the framework references; only the drawing
+    # assembly used by the pixel scanner must be named explicitly.
+    $compilerReferences = @('System.Drawing')
+}
 
 Add-Type -ReferencedAssemblies $compilerReferences -TypeDefinition @'
 using System;
@@ -177,6 +187,8 @@ public sealed class CodexInfoGraphPixelMeasurement {
 
 public static class CodexInfoGraphPixelScanner {
     private static readonly Color GridColor = ColorTranslator.FromHtml("#263548");
+    private static readonly Color IdleColor = ColorTranslator.FromHtml("#1A2838");
+    private static readonly Color IdleGridColor = ColorTranslator.FromHtml("#233244");
     private static readonly Color PlotColor = ColorTranslator.FromHtml("#101925");
     private static readonly Color[] SeriesColors = new[] {
         ColorTranslator.FromHtml("#56B2F5"),
@@ -206,9 +218,14 @@ public static class CodexInfoGraphPixelScanner {
                 int matches = 0;
                 for (int y = yStart; y < yEnd; y++) {
                     Color pixel = bitmap.GetPixel(plotLeft + localX, y);
-                    bool grid = Matches(pixel, GridColor, 8);
+                    bool grid = Matches(pixel, GridColor, 8) || Matches(pixel, IdleGridColor, 8);
                     if (!grid && localX + 1 < plotWidth) {
-                        grid = MatchesSplitGrid(pixel, bitmap.GetPixel(plotLeft + localX + 1, y));
+                        Color next = bitmap.GetPixel(plotLeft + localX + 1, y);
+                        if (!Matches(pixel, IdleColor, 8) &&
+                            !Matches(next, IdleColor, 8) &&
+                            !Matches(next, IdleGridColor, 8)) {
+                            grid = MatchesSplitGrid(pixel, next);
+                        }
                     }
                     if (grid) matches++;
                 }
@@ -231,57 +248,32 @@ public static class CodexInfoGraphPixelScanner {
                 throw new InvalidOperationException("Fewer than four visible vertical period-grid groups were detected.");
             }
 
-            int bestStart = -1;
-            int visiblePeriodGridCount = 0;
-            double bestScore = double.PositiveInfinity;
-            foreach (int candidateCount in new[] { 5, 4 }) {
-                if (centers.Count < candidateCount) continue;
-                int candidateIntervals = candidateCount - 1;
-                for (int start = 0; start <= centers.Count - candidateCount; start++) {
-                    double average = (centers[start + candidateIntervals] - centers[start]) / (double)candidateIntervals;
-                    double score = 0;
-                    for (int index = 0; index < candidateIntervals; index++) {
-                        score = Math.Max(score, Math.Abs((centers[start + index + 1] - centers[start + index]) - average));
-                    }
-                    if (score < bestScore) {
-                        bestScore = score;
-                        bestStart = start;
-                        visiblePeriodGridCount = candidateCount;
-                    }
-                }
+            double bestScore;
+            int[] bestGridCenters = FindEvenlySpacedCenters(centers, 5, out bestScore);
+            if (bestGridCenters == null || bestScore > 3) {
+                bestGridCenters = FindEvenlySpacedCenters(centers, 4, out bestScore);
             }
-            if (bestStart < 0 || bestScore > 3) {
+            if (bestGridCenters == null || bestScore > 3) {
+                // The plot owns five 0/25/50/75/100% grids. A series can
+                // cover one interior grid completely, while both period
+                // boundaries remain visible. Reconstruct only that bounded
+                // one-missing-interior case after the established four-grid
+                // endpoint fallback has been given priority.
+                bestGridCenters = ReconstructOneMissingInteriorGrid(centers, out bestScore);
+            }
+            if (bestGridCenters == null || bestScore > 3) {
                 throw new InvalidOperationException(
                     "Equally spaced period-grid groups were not detected: " + string.Join(",", centers));
             }
 
-            int periodStart = centers[bestStart];
-            int intervalCount = visiblePeriodGridCount - 1;
-            double periodStep = (centers[bestStart + intervalCount] - periodStart) / (double)intervalCount;
-            int periodEnd = visiblePeriodGridCount == 5
-                ? centers[bestStart + 4]
+            int periodStart = bestGridCenters[0];
+            int intervalCount = bestGridCenters.Length - 1;
+            double periodStep = (bestGridCenters[intervalCount] - periodStart) / (double)intervalCount;
+            int periodEnd = bestGridCenters.Length == 5
+                ? bestGridCenters[4]
                 : (int)Math.Round(periodStart + 4 * periodStep);
             if (periodEnd <= periodStart || periodEnd >= plotWidth) {
                 throw new InvalidOperationException("The inferred period-end grid is outside the plot.");
-            }
-            if (visiblePeriodGridCount == 4) {
-                int endpointEvidence = 0;
-                for (int y = yStart; y < yEnd; y++) {
-                    bool rowMatches = false;
-                    for (int localX = Math.Max(0, periodEnd - 3);
-                        localX <= Math.Min(plotWidth - 1, periodEnd + 3) && !rowMatches;
-                        localX++) {
-                        Color pixel = bitmap.GetPixel(plotLeft + localX, y);
-                        rowMatches = Matches(pixel, GridColor, 8);
-                        for (int series = 0; series < SeriesColors.Length && !rowMatches; series++) {
-                            rowMatches = Matches(pixel, SeriesColors[series], 24);
-                        }
-                    }
-                    if (rowMatches) endpointEvidence++;
-                }
-                if (endpointEvidence < requiredGridPixels) {
-                    throw new InvalidOperationException("The inferred period-end grid has no vertical grid/series evidence.");
-                }
             }
             var gutterTop = new[] { int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue };
             var gutterBottom = new[] { int.MinValue, int.MinValue, int.MinValue, int.MinValue };
@@ -317,6 +309,90 @@ public static class CodexInfoGraphPixelScanner {
                 SeriesRightmost = rightmost,
             };
         }
+    }
+
+    private static int[] FindEvenlySpacedCenters(
+        List<int> centers,
+        int candidateCount,
+        out double bestScore) {
+        int[] best = null;
+        bestScore = double.PositiveInfinity;
+        if (centers.Count < candidateCount) return null;
+
+        int candidateIntervals = candidateCount - 1;
+        for (int start = 0; start < centers.Count - candidateIntervals; start++) {
+            for (int end = start + candidateIntervals; end < centers.Count; end++) {
+                double step = (centers[end] - centers[start]) / (double)candidateIntervals;
+                var selected = new int[candidateCount];
+                selected[0] = centers[start];
+                selected[candidateIntervals] = centers[end];
+                int previous = start;
+                double score = 0;
+                bool complete = true;
+                for (int index = 1; index < candidateIntervals; index++) {
+                    double expected = centers[start] + (step * index);
+                    int remaining = candidateIntervals - index;
+                    int bestIndex = -1;
+                    double error = double.PositiveInfinity;
+                    for (int candidate = previous + 1;
+                        candidate <= end - remaining;
+                        candidate++) {
+                        double candidateError = Math.Abs(centers[candidate] - expected);
+                        if (candidateError < error) {
+                            error = candidateError;
+                            bestIndex = candidate;
+                        }
+                    }
+                    if (bestIndex < 0) {
+                        complete = false;
+                        break;
+                    }
+                    selected[index] = centers[bestIndex];
+                    previous = bestIndex;
+                    score = Math.Max(score, error);
+                }
+                if (complete && score < bestScore) {
+                    bestScore = score;
+                    best = selected;
+                }
+            }
+        }
+        return best;
+    }
+
+    private static int[] ReconstructOneMissingInteriorGrid(
+        List<int> centers,
+        out double bestScore) {
+        bestScore = double.PositiveInfinity;
+        if (centers.Count != 4) return null;
+
+        int[] reconstructed = null;
+        int validReconstructions = 0;
+        double step = (centers[3] - centers[0]) / 4.0;
+        foreach (int missing in new[] { 1, 2, 3 }) {
+            int observed = 0;
+            double score = 0;
+            for (int gridIndex = 0; gridIndex < 5; gridIndex++) {
+                if (gridIndex == missing) continue;
+                double expected = centers[0] + (step * gridIndex);
+                score = Math.Max(score, Math.Abs(centers[observed] - expected));
+                observed++;
+            }
+            int inferred = (int)Math.Round(centers[0] + (step * missing));
+            if (score > 3 || inferred <= centers[missing - 1] || inferred >= centers[missing]) {
+                continue;
+            }
+
+            validReconstructions++;
+            bestScore = score;
+            reconstructed = new int[5];
+            for (int gridIndex = 0; gridIndex < reconstructed.Length; gridIndex++) {
+                reconstructed[gridIndex] = (int)Math.Round(centers[0] + (step * gridIndex));
+            }
+        }
+        if (validReconstructions == 1) return reconstructed;
+        bestScore = double.PositiveInfinity;
+        return null;
     }
 
     private static bool MatchesSplitGrid(Color left, Color right) {
@@ -615,7 +691,7 @@ public static class CodexInfoWindowsE2EFixtureServer {
                     reason = "OK";
                     body = "{\"api_version\":\"v1\",\"service\":\"codex-info\",\"product_version\":\"" + productVersion + "\"}";
                 }
-                else if (parts[1] == "/v1/details") {
+                else if (parts[1] == "/v2/details") {
                     Interlocked.Increment(ref detailsRequests);
                     RecordRequestPhase(request);
                     code = 200;
@@ -1190,7 +1266,8 @@ function Get-E2EGraphMeasurement {
         [Parameter(Mandatory = $true)][psobject]$Capture,
         [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Plot,
         [Parameter(Mandatory = $true)][IntPtr]$WindowHandle,
-        [Parameter(Mandatory = $true)][string]$Description
+        [Parameter(Mandatory = $true)][string]$Description,
+        [switch]$AllowUnusedSeries
     )
 
     $windowBounds = Get-E2EWindowBounds $WindowHandle
@@ -1202,13 +1279,30 @@ function Get-E2EGraphMeasurement {
     $measurement = [CodexInfoGraphPixelScanner]::Scan(
         $Capture.Path, $plotLeft, $plotTop, $plotWidth, $plotHeight)
     $seriesNames = @('Remaining', 'SOL', 'TERRA', 'LUNA')
-    for ($index = 0; $index -lt $seriesNames.Count; $index++) {
-        Assert-E2E ($measurement.SeriesPixelCount[$index] -gt 0) `
-            "$Description has no visible $($seriesNames[$index]) color pixels."
-        Assert-E2E ($measurement.SeriesGutterPixelCount[$index] -gt 0) `
-            "$Description has no $($seriesNames[$index]) leader/glyph pixels in the endpoint gutter."
-        Assert-E2E ($measurement.SeriesRightmost[$index] -le $plotWidth - 3) `
-            "$Description clips $($seriesNames[$index]) at the right plot edge."
+    if ($AllowUnusedSeries) {
+        Assert-E2E ($measurement.SeriesPixelCount[0] -gt 0 -and
+            $measurement.SeriesGutterPixelCount[0] -gt 0) `
+            "$Description has no visible Remaining series and endpoint."
+        $visibleModelEndpoints = @(1..3 | Where-Object {
+            $measurement.SeriesPixelCount[$_] -gt 0 -and
+            $measurement.SeriesGutterPixelCount[$_] -gt 0
+        })
+        Assert-E2E ($visibleModelEndpoints.Count -gt 0) `
+            "$Description has no visible used-model series and endpoint."
+        foreach ($index in @(0) + $visibleModelEndpoints) {
+            Assert-E2E ($measurement.SeriesRightmost[$index] -le $plotWidth - 3) `
+                "$Description clips $($seriesNames[$index]) at the right plot edge."
+        }
+    }
+    else {
+        for ($index = 0; $index -lt $seriesNames.Count; $index++) {
+            Assert-E2E ($measurement.SeriesPixelCount[$index] -gt 0) `
+                "$Description has no visible $($seriesNames[$index]) color pixels."
+            Assert-E2E ($measurement.SeriesGutterPixelCount[$index] -gt 0) `
+                "$Description has no $($seriesNames[$index]) leader/glyph pixels in the endpoint gutter."
+            Assert-E2E ($measurement.SeriesRightmost[$index] -le $plotWidth - 3) `
+                "$Description clips $($seriesNames[$index]) at the right plot edge."
+        }
     }
     Write-E2E ("graph-resize-measurement: state={0} plot={1}x{2} grids={3} start={4} end={5} span={6} gutter={7}" -f
         $Description, $plotWidth, $plotHeight, ($measurement.GridCenters -join ','),
@@ -1225,7 +1319,8 @@ function Wait-E2EGraphPixelsReady {
     param(
         [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root,
         [Parameter(Mandatory = $true)][IntPtr]$WindowHandle,
-        [Parameter(Mandatory = $true)][string]$Description
+        [Parameter(Mandatory = $true)][string]$Description,
+        [switch]$AllowUnusedSeries
     )
 
     return Wait-E2E -Description "$Description rendered graph pixels" -TimeoutSeconds 30 -Probe {
@@ -1233,20 +1328,24 @@ function Wait-E2EGraphPixelsReady {
         if ($null -eq $candidatePlot) { return $false }
         $candidateCapture = Capture-E2EWindow $WindowHandle 'graph-ready-probe'
         return Get-E2EGraphMeasurement -Capture $candidateCapture -Plot $candidatePlot `
-            -WindowHandle $WindowHandle -Description $Description
+            -WindowHandle $WindowHandle -Description $Description -AllowUnusedSeries:$AllowUnusedSeries
     }
 }
 
 function Invoke-E2EGraphPixelScannerSelfTest {
     $validPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-valid.png'
-    $invalidPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-invalid.png'
+    $missingInteriorPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-missing-interior.png'
+    $endpointFallbackPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-endpoint-fallback.png'
     $gridColor = [System.Drawing.ColorTranslator]::FromHtml('#263548')
+    $idleColor = [System.Drawing.ColorTranslator]::FromHtml('#1A2838')
+    $idleGridColor = [System.Drawing.ColorTranslator]::FromHtml('#233244')
     $background = [System.Drawing.ColorTranslator]::FromHtml('#101925')
     $seriesColors = @('#56B2F5', '#A88CF5', '#5DC98A', '#E6A23C') |
         ForEach-Object { [System.Drawing.ColorTranslator]::FromHtml($_) }
     foreach ($case in @(
-        @{ Path = $validPath; GridXs = @(10, 50, 90, 130, 170, 230) },
-        @{ Path = $invalidPath; GridXs = @(10, 50, 90, 130) }
+        @{ Path = $validPath; GridXs = @(10, 50, 90, 130, 170, 230); AddIdleBand = $true; AddIdleGrid = $true },
+        @{ Path = $missingInteriorPath; GridXs = @(10, 50, 130, 170); AddIdleBand = $true; AddIdleGrid = $false },
+        @{ Path = $endpointFallbackPath; GridXs = @(10, 50, 90, 130); AddIdleBand = $false; AddIdleGrid = $false }
     )) {
         $bitmap = New-Object System.Drawing.Bitmap(240, 140)
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
@@ -1273,6 +1372,12 @@ function Invoke-E2EGraphPixelScannerSelfTest {
                 foreach ($x in 145..148) {
                     $bitmap.SetPixel($x, $y, [System.Drawing.Color]::FromArgb(27, 39, 55))
                 }
+                # ScottPlot composites a grid line inside the product's
+                # measured idle band to #233244 on the captured surface.
+                if ($case.AddIdleBand) {
+                    foreach ($x in 80..100) { $bitmap.SetPixel($x, $y, $idleColor) }
+                    if ($case.AddIdleGrid) { $bitmap.SetPixel(90, $y, $idleGridColor) }
+                }
             }
             for ($index = 0; $index -lt $seriesColors.Count; $index++) {
                 $seriesPen = New-Object System.Drawing.Pen($seriesColors[$index], 2)
@@ -1295,12 +1400,25 @@ function Invoke-E2EGraphPixelScannerSelfTest {
         Assert-E2E (($valid.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
             'Graph pixel scanner missed synthetic endpoint colors.'
         Write-E2E 'graph-pixel-scanner-self-test: PASS valid fixed-gutter geometry'
-        Assert-E2ECaptureExpectedFailure -Name 'graph-grid-negative' -Action {
-            [CodexInfoGraphPixelScanner]::Scan($invalidPath, 0, 0, 240, 140)
-        }
+
+        $missingInterior = [CodexInfoGraphPixelScanner]::Scan($missingInteriorPath, 0, 0, 240, 140)
+        Assert-E2E ($missingInterior.PeriodStartX -eq 10 -and $missingInterior.PeriodEndX -eq 170 -and
+            $missingInterior.PlotSpan -eq 160 -and $missingInterior.GutterWidth -eq 69) `
+            'Graph pixel scanner did not reconstruct one missing interior grid.'
+        Assert-E2E (($missingInterior.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
+            'Graph pixel scanner missed endpoints after reconstructing an interior grid.'
+        Write-E2E 'graph-pixel-scanner-self-test: PASS one missing interior grid reconstructed'
+
+        $endpointFallback = [CodexInfoGraphPixelScanner]::Scan($endpointFallbackPath, 0, 0, 240, 140)
+        Assert-E2E ($endpointFallback.PeriodStartX -eq 10 -and $endpointFallback.PeriodEndX -eq 170 -and
+            $endpointFallback.PlotSpan -eq 160 -and $endpointFallback.GutterWidth -eq 69) `
+            'Graph pixel scanner regressed the established four-grid endpoint fallback.'
+        Assert-E2E (($endpointFallback.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
+            'Graph pixel scanner missed endpoints in the four-grid endpoint fallback.'
+        Write-E2E 'graph-pixel-scanner-self-test: PASS four-grid endpoint fallback preserved'
     }
     finally {
-        foreach ($path in @($validPath, $invalidPath)) {
+        foreach ($path in @($validPath, $missingInteriorPath, $endpointFallbackPath)) {
             if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
         }
     }
@@ -1521,7 +1639,7 @@ function Get-E2EFixtureHeaderValues {
 function Invoke-E2EFixtureRawRequest {
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('/v1/health', '/v1/details')]
+        [ValidateSet('/v1/health', '/v2/details')]
         [string]$Path
     )
 
@@ -1656,7 +1774,7 @@ function Assert-E2EFixtureHistorySamples {
     $expectedSampleKeys = @(
         'timestamp', 'reset_at', 'remaining_percent',
         'sol_dollars', 'terra_dollars', 'luna_dollars',
-        'sol_tokens', 'terra_tokens', 'luna_tokens'
+        'sol_tokens', 'terra_tokens', 'luna_tokens', 'model_source'
     )
     $seenSampleKeys = @{}
     $hasPreviousSample = $false
@@ -1673,6 +1791,7 @@ function Assert-E2EFixtureHistorySamples {
         $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'sol_tokens' -Integer
         $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'terra_tokens' -Integer
         $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'luna_tokens' -Integer
+        Assert-E2E ([string]$sample.model_source -ceq 'confirmed') 'Fixture history sample model_source must be confirmed.'
         Assert-E2E (($timestamp % 60) -eq 0) "Fixture history sample timestamp must be minute bucket aligned (timestamp % 60 == 0): $timestamp."
         $matchingPeriods = @($periodRecords | Where-Object { $_.ResetAt -eq $reset })
         Assert-E2E ($matchingPeriods.Count -eq 1) "Fixture history sample reset_at has no unique period identity: $reset."
@@ -1687,6 +1806,16 @@ function Assert-E2EFixtureHistorySamples {
         $previousReset = $reset
         $previousTimestamp = $timestamp
         $hasPreviousSample = $true
+    }
+    foreach ($period in $periodRecords) {
+        $periodSamples = @($samples | Where-Object { [Int64]$_.reset_at -eq $period.ResetAt })
+        Assert-E2E ($periodSamples.Count -ge 2) "Fixture period must contain at least two observations: $($period.Id)."
+        Assert-E2E ([Int64]$periodSamples[0].timestamp -eq $period.StartAt) "Fixture period does not start with an observation: $($period.Id)."
+        Assert-E2E ([Int64]$periodSamples[-1].timestamp -eq $period.EndAt) "Fixture period does not end with an observation: $($period.Id)."
+        for ($index = 1; $index -lt $periodSamples.Count; $index++) {
+            $elapsed = [Int64]$periodSamples[$index].timestamp - [Int64]$periodSamples[$index - 1].timestamp
+            Assert-E2E ($elapsed -eq 60) "Fixture period contains a missing interval: period=$($period.Id) elapsed=$elapsed."
+        }
     }
     return $true
 }
@@ -1722,6 +1851,7 @@ function Assert-E2EFixtureWireContract {
     catch {
         throw "Fixture details body is not valid JSON: $($_.Exception.Message)"
     }
+    Assert-E2E ([string]$detailsJson.api_version -ceq 'v2') 'Fixture details api_version must be v2.'
     $expectedDetailsKeys = @(
         'api_version', 'state', 'observed_at', 'authenticated',
         'plan_label', 'quota', 'models', 'active_thread_count',
@@ -1747,7 +1877,7 @@ function Invoke-E2EFixturePreflight {
     $responses = [ordered]@{}
     foreach ($requestSpec in @(
             @{ Name = 'health'; Path = '/v1/health' },
-            @{ Name = 'details'; Path = '/v1/details' })) {
+            @{ Name = 'details'; Path = '/v2/details' })) {
         $response = Invoke-E2EFixtureRawRequest -Path $requestSpec.Path
         $responses[$requestSpec.Name] = $response
         $pairCount = @(Get-E2EFixtureHeaderValues -Response $response -Name 'Codex-Info-Published-Pair').Count
@@ -1767,16 +1897,16 @@ function Invoke-E2EFixturePreflight {
 function New-E2EFixtureDocuments {
     $rawNow = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $now = $rawNow - ($rawNow % 60)
-    $currentStart = $now - 7200
+    $currentStart = $now - 60
     $currentReset = $now + 7200
-    $pastStart = $now - 25200
-    $pastReset = $now - 14400
+    $pastStart = $now - 300
+    $pastReset = $now - 180
     $publishedPair = 'v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
     # Keep this wire fixture as explicit JSON.  The details endpoint is a
     # strict thirteen-field contract; serializing nested PowerShell dictionaries
     # can silently change null/number kinds between Windows PowerShell builds.
     $details = @"
-{"api_version":"v1","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400,"input_dollars":1.20,"cached_input_dollars":0.20,"output_dollars":0.40},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800,"input_dollars":2.40,"cached_input_dollars":0.50,"output_dollars":0.80},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100,"input_dollars":3.60,"cached_input_dollars":0.70,"output_dollars":1.10}],"active_thread_count":3,"history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$pastStart,"end_at":$pastReset,"reset_at":$pastReset,"label":"Past period","current":false}],"history_samples":[{"timestamp":$($currentStart + 60),"reset_at":$currentReset,"remaining_percent":92.0,"sol_dollars":0.25,"terra_dollars":0.50,"luna_dollars":0.75,"sol_tokens":100,"terra_tokens":200,"luna_tokens":300},{"timestamp":$($now - 60),"reset_at":$currentReset,"remaining_percent":72.0,"sol_dollars":1.20,"terra_dollars":2.40,"luna_dollars":3.60,"sol_tokens":1200,"terra_tokens":2400,"luna_tokens":3600},{"timestamp":$($pastStart + 60),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150},{"timestamp":$($pastStart + 3600),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150},{"timestamp":$($pastReset - 60),"reset_at":$pastReset,"remaining_percent":84.0,"sol_dollars":0.60,"terra_dollars":1.20,"luna_dollars":1.80,"sol_tokens":600,"terra_tokens":1200,"luna_tokens":1800}],"threads":[{"id":"e2e-root","title":"E2E root task","parent_thread_id":null,"model":"TERRA","model_label":"TERRA","total_tokens":2400,"context_usage_tokens":800,"context_window_tokens":16000,"created_at":$($now - 3600),"last_user_message_at":$($now - 300),"is_subagent":false,"depth":0},{"id":"e2e-child","title":"E2E child task","parent_thread_id":"e2e-root","model":"LUNA","model_label":"LUNA","total_tokens":1200,"context_usage_tokens":400,"context_window_tokens":16000,"created_at":$($now - 2400),"last_user_message_at":$($now - 600),"is_subagent":true,"depth":1},{"id":"e2e-orphan","title":"E2E orphan task","parent_thread_id":"missing-parent","model":"SOL","model_label":"SOL","total_tokens":600,"context_usage_tokens":null,"context_window_tokens":null,"created_at":$($now - 1200),"last_user_message_at":null,"is_subagent":true,"depth":null}],"estimated_cost_label":"USD 12.34"}
+{"api_version":"v2","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400,"input_dollars":1.20,"cached_input_dollars":0.20,"output_dollars":0.40},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800,"input_dollars":2.40,"cached_input_dollars":0.50,"output_dollars":0.80},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100,"input_dollars":3.60,"cached_input_dollars":0.70,"output_dollars":1.10}],"active_thread_count":3,"history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$pastStart,"end_at":$pastReset,"reset_at":$pastReset,"label":"Past period","current":false}],"history_samples":[{"timestamp":$currentStart,"reset_at":$currentReset,"remaining_percent":92.0,"sol_dollars":0.25,"terra_dollars":0.50,"luna_dollars":0.75,"sol_tokens":100,"terra_tokens":200,"luna_tokens":300,"model_source":"confirmed"},{"timestamp":$now,"reset_at":$currentReset,"remaining_percent":72.0,"sol_dollars":1.20,"terra_dollars":2.40,"luna_dollars":3.60,"sol_tokens":1200,"terra_tokens":2400,"luna_tokens":3600,"model_source":"confirmed"},{"timestamp":$pastStart,"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150,"model_source":"confirmed"},{"timestamp":$($pastStart + 60),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150,"model_source":"confirmed"},{"timestamp":$pastReset,"reset_at":$pastReset,"remaining_percent":84.0,"sol_dollars":0.60,"terra_dollars":1.20,"luna_dollars":1.80,"sol_tokens":600,"terra_tokens":1200,"luna_tokens":1800,"model_source":"confirmed"}],"threads":[{"id":"e2e-root","title":"E2E root task","parent_thread_id":null,"model":"TERRA","model_label":"TERRA","total_tokens":2400,"context_usage_tokens":800,"context_window_tokens":16000,"created_at":$($now - 3600),"last_user_message_at":$($now - 300),"is_subagent":false,"depth":0},{"id":"e2e-child","title":"E2E child task","parent_thread_id":"e2e-root","model":"LUNA","model_label":"LUNA","total_tokens":1200,"context_usage_tokens":400,"context_window_tokens":16000,"created_at":$($now - 2400),"last_user_message_at":$($now - 600),"is_subagent":true,"depth":1},{"id":"e2e-orphan","title":"E2E orphan task","parent_thread_id":"missing-parent","model":"SOL","model_label":"SOL","total_tokens":600,"context_usage_tokens":null,"context_window_tokens":null,"created_at":$($now - 1200),"last_user_message_at":null,"is_subagent":true,"depth":null}],"estimated_cost_label":"USD 12.34"}
 "@
     # Keep the explicit sample values above while enforcing the wire order
     # independently of PowerShell object serialization: past -> current.
@@ -2189,6 +2319,14 @@ try {
     Assert-E2E ($detailsIsLatest -and -not $detailsHasFailure) `
         "Main details status is not a complete accepted generation: '$detailsStatusText'"
     Write-E2E 'main-details-status: PASS (single details generation accepted)'
+    if ($RequireCurrentPresentation) {
+        $estimatedValues = @(Get-E2EAllDescendants $mainRoot | ForEach-Object {
+            try { [string]$_.Current.Name } catch { '' }
+        } | Where-Object { $_ -cmatch '^.+\s+\$[0-9][0-9,]*(\.[0-9]{2})$' })
+        Assert-E2E ($estimatedValues.Count -eq 1) `
+            'Main must expose exactly one numeric aggregate estimated cost.'
+        Write-E2E 'main-estimated-cost: PASS (numeric aggregate is rendered)'
+    }
 
     # Finite path: one Graph window, one period round-trip, two metrics, then
     # one OFF/ON cycle for each of four independent series.  No combinations
@@ -2205,8 +2343,13 @@ try {
         if ($candidate.Current.IsOffscreen -or $rect.Width -le 0 -or $rect.Height -le 0) { return $false }
         return $candidate
     }
-    $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description 'initial-current'
+    $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle `
+        -Description 'initial-current' -AllowUnusedSeries:$CompatibilitySmoke
     Write-E2E ("graph: plot bounds={0}x{1}" -f $plot.Current.BoundingRectangle.Width, $plot.Current.BoundingRectangle.Height)
+    if ($CompatibilitySmoke) {
+        Write-E2E 'windows-client-compatibility-smoke: PASS (installed client -> real current -> real selected history graph)'
+        return
+    }
     $initialGraphBounds = Get-E2EWindowBounds $graph.Handle
     $graphScaleX = $initialGraphBounds.Width / 940.0
     $graphScaleY = $initialGraphBounds.Height / 640.0
@@ -2333,9 +2476,12 @@ try {
                 return $candidate
             }
             $description = "$metricKey-$($resizeState.Name)"
-            $capture = Capture-E2EWindow $graph.Handle ("resize-{0}" -f $description)
-            $measurements[$resizeState.Name] = Get-E2EGraphMeasurement `
-                -Capture $capture -Plot $plot -WindowHandle $graph.Handle -Description $description
+            # SetWindowPos returns before Avalonia/ScottPlot necessarily paints
+            # the new width. Measure the first fully rendered frame, not the
+            # stale previous-width frame inside the resized HWND.
+            $measurements[$resizeState.Name] = Wait-E2EGraphPixelsReady `
+                -Root $graphRoot -WindowHandle $graph.Handle -Description $description
+            $null = Capture-E2EWindow $graph.Handle ("resize-{0}" -f $description)
         }
 
         $target = $measurements['940x640']

@@ -9518,9 +9518,10 @@ struct CodexInfoState {
     /// deliberately scoped to v3; legacy fallback daemons must never receive
     /// an If-None-Match header they do not understand.
     service_v3_published_pair: Option<String>,
-    /// Split v3 resources keep independent last-good generations. The main
-    /// current resource is the only one that is polled while the graph and
-    /// thread windows are closed.
+    /// Split v3 resources keep independent last-good generations. The small
+    /// current and history-period resources are polled while the graph is
+    /// closed; history samples remain lazy and are fetched only for an open
+    /// graph.
     service_current_snapshot: Option<PublicDetailsV3>,
     service_current_active_thread_count: Option<u64>,
     service_current_pair: Option<String>,
@@ -9528,6 +9529,7 @@ struct CodexInfoState {
     service_current_force_poll: bool,
     service_split_capable: bool,
     service_history_periods: Vec<PublicHistoryPeriod>,
+    service_history_periods_pair: Option<String>,
     service_history_samples: Vec<PublicHistoryObservationV3>,
     service_history_pair: Option<String>,
     service_history_period_id: Option<String>,
@@ -9923,15 +9925,25 @@ impl CodexInfoState {
             // is not part of this response window.
             self.history_gaps
                 .iter()
-                .filter(|gap| {
-                    history_periods.iter().any(|period| {
-                        gap.reset_at >= period.reset_at.saturating_sub(60)
-                            && gap.reset_at <= period.reset_at
-                            && gap.start_at >= period.start_at
-                            && gap.end_at <= period.end_at
-                    })
+                .filter_map(|gap| {
+                    history_periods
+                        .iter()
+                        .find(|period| {
+                            gap.reset_at >= period.reset_at.saturating_sub(60)
+                                && gap.reset_at <= period.reset_at
+                                && gap.start_at >= period.start_at
+                                && gap.end_at <= period.end_at
+                        })
+                        .map(|period| {
+                            let mut canonical = gap.clone();
+                            // Public period IDs use the canonical reset. Keep the
+                            // gap on that same wire identity so released clients
+                            // that predate reset-alias tolerance can still accept
+                            // the complete response.
+                            canonical.reset_at = period.reset_at;
+                            canonical
+                        })
                 })
-                .cloned()
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -10118,6 +10130,7 @@ impl CodexInfoState {
             service_current_force_poll: false,
             service_split_capable: false,
             service_history_periods: Vec::new(),
+            service_history_periods_pair: None,
             service_history_samples: Vec::new(),
             service_history_pair: None,
             service_history_period_id: None,
@@ -10210,6 +10223,7 @@ impl CodexInfoState {
             service_current_force_poll: true,
             service_split_capable: false,
             service_history_periods: Vec::new(),
+            service_history_periods_pair: None,
             service_history_samples: Vec::new(),
             service_history_pair: None,
             service_history_period_id: None,
@@ -10326,6 +10340,7 @@ impl CodexInfoState {
             service_current_force_poll: false,
             service_split_capable: false,
             service_history_periods: Vec::new(),
+            service_history_periods_pair: None,
             service_history_samples: Vec::new(),
             service_history_pair: None,
             service_history_period_id: None,
@@ -11122,6 +11137,7 @@ impl CodexInfoState {
         self.service_current_pair = self.service_published_pair.clone();
         self.service_split_capable = false;
         self.service_history_periods.clear();
+        self.service_history_periods_pair = None;
         self.service_history_samples.clear();
         self.service_history_pair = None;
         self.service_history_period_id = None;
@@ -11180,6 +11196,7 @@ impl CodexInfoState {
                 self.history_gaps.clear();
                 self.service_history_samples.clear();
                 self.service_history_periods.clear();
+                self.service_history_periods_pair = None;
                 self.service_history_pair = None;
                 self.service_history_period_id = None;
                 self.service_history_cursor = None;
@@ -11302,6 +11319,7 @@ impl CodexInfoState {
             .map(|period| period.label.clone())
             .unwrap_or_else(|| self.i18n.text(TextKey::NoHistory).into());
         self.service_history_periods = periods;
+        self.service_history_periods_pair = Some(published_pair.clone());
         self.service_history_samples = samples;
         self.service_history_pair = Some(published_pair);
         self.service_history_cursor = cursor;
@@ -11309,6 +11327,44 @@ impl CodexInfoState {
         self.history.observations = next_observations;
         self.history_gaps = gaps;
         self.service_history_error = None;
+        Ok(changed)
+    }
+
+    fn apply_service_history_periods_resource(
+        &mut self,
+        published_pair: String,
+        periods: Vec<PublicHistoryPeriod>,
+    ) -> Result<bool, String> {
+        if self.service_current_pair.as_deref() != Some(published_pair.as_str()) {
+            return Err("history periods generation differs from current".into());
+        }
+        let Some(mut validation) = self.service_current_snapshot.clone() else {
+            return Err("history periods have no current root".into());
+        };
+        validation.history_periods = periods.clone();
+        validation.history_samples.clear();
+        validation.history_gaps.clear();
+        validation.threads.clear();
+        validation.validate().map_err(|error| error.to_string())?;
+
+        let changed = self.service_history_periods_pair.as_deref() != Some(published_pair.as_str())
+            || self.service_history_periods != periods;
+        let selected_period = self
+            .selected_reset_at
+            .and_then(|selected| {
+                periods.iter().find(|period| {
+                    period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
+                })
+            })
+            .or_else(|| periods.iter().find(|period| period.current))
+            .or_else(|| periods.first());
+        self.service_history_period_id = selected_period.map(|period| period.id.clone());
+        self.selected_reset_at = selected_period.map(|period| period.reset_at);
+        self.selected_history_period = selected_period
+            .map(|period| period.label.clone())
+            .unwrap_or_else(|| self.i18n.text(TextKey::NoHistory).into());
+        self.service_history_periods = periods;
+        self.service_history_periods_pair = Some(published_pair);
         Ok(changed)
     }
 
@@ -11698,6 +11754,7 @@ impl CodexInfoState {
         self.service_current_force_poll = false;
         self.service_split_capable = false;
         self.service_history_periods.clear();
+        self.service_history_periods_pair = None;
         self.service_history_samples.clear();
         self.service_history_pair = None;
         self.service_history_period_id = None;
@@ -12684,8 +12741,8 @@ impl CodexInfoState {
     fn history_periods_at(&self, observed_at: i64) -> Vec<HistoryPeriod> {
         if !self.preview
             && self.service_split_capable
-            && self.service_history_pair.is_some()
-            && self.service_history_pair.as_deref() == self.service_current_pair.as_deref()
+            && self.service_history_periods_pair.is_some()
+            && self.service_history_periods_pair.as_deref() == self.service_current_pair.as_deref()
         {
             return self
                 .service_history_periods
@@ -16544,7 +16601,11 @@ fn poll_service_current_resources(state: &mut CodexInfoState, service_endpoint: 
     }
 }
 
-fn poll_service_graph_resources(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
+fn poll_service_graph_resources(
+    state: &mut CodexInfoState,
+    service_endpoint: SocketAddr,
+    graph_open: bool,
+) {
     let now = Instant::now();
     if !service_poll_due(
         state.service_history_last_poll,
@@ -16560,12 +16621,14 @@ fn poll_service_graph_resources(state: &mut CodexInfoState, service_endpoint: So
     };
     let force = state.service_history_force_poll;
     state.service_history_last_poll = now;
-    let previous_pair = state.service_history_pair.clone();
+    let previous_periods_pair = state.service_history_periods_pair.clone();
+    let previous_page_pair = state.service_history_pair.clone();
     let previous_period_id = state.service_history_period_id.clone();
     let previous_cursor = state.service_history_cursor.clone();
     let mut periods = state.service_history_periods.clone();
-    let refresh_periods =
-        force || periods.is_empty() || previous_pair.as_deref() != Some(current_pair.as_str());
+    let refresh_periods = force
+        || periods.is_empty()
+        || previous_periods_pair.as_deref() != Some(current_pair.as_str());
 
     let result = (|| {
         if refresh_periods {
@@ -16573,13 +16636,17 @@ fn poll_service_graph_resources(state: &mut CodexInfoState, service_endpoint: So
                 |route, if_none_match| {
                     request_service_details_with_etag(service_endpoint, route, if_none_match)
                 },
-                previous_pair.as_deref(),
+                previous_periods_pair.as_deref(),
             )? {
                 ServiceResourceFetch::Fresh { pair, value } => {
                     if pair != current_pair {
                         return Err("history periods generation differs from current".into());
                     }
                     periods = value;
+                    state.apply_service_history_periods_resource(
+                        current_pair.clone(),
+                        periods.clone(),
+                    )?;
                 }
                 ServiceResourceFetch::NotModified { pair } => {
                     if pair != current_pair {
@@ -16589,6 +16656,9 @@ fn poll_service_graph_resources(state: &mut CodexInfoState, service_endpoint: So
                     }
                 }
             }
+        }
+        if !graph_open {
+            return Ok::<(), String>(());
         }
         let selected_period = state
             .selected_reset_at
@@ -16612,11 +16682,11 @@ fn poll_service_graph_resources(state: &mut CodexInfoState, service_endpoint: So
         };
 
         let full_refresh = force
-            || previous_pair.is_none()
+            || previous_page_pair.is_none()
             || previous_period_id.as_deref() != Some(period_id.as_str())
-            || (previous_pair.as_deref() == Some(current_pair.as_str())
+            || (previous_page_pair.as_deref() == Some(current_pair.as_str())
                 && previous_cursor.is_none());
-        let append_prefix = !full_refresh && previous_pair.is_some();
+        let append_prefix = !full_refresh && previous_page_pair.is_some();
         let mut samples = if full_refresh {
             Vec::new()
         } else {
@@ -16642,7 +16712,7 @@ fn poll_service_graph_resources(state: &mut CodexInfoState, service_endpoint: So
                 }
             }
             let conditional_pair = if first_page && !full_refresh {
-                previous_pair.as_deref()
+                previous_page_pair.as_deref()
             } else {
                 None
             };
@@ -16793,9 +16863,7 @@ fn run_ui_service_timer_cycle_with_windows(
         return;
     }
     poll_service_current_resources(state, service_endpoint);
-    if graph_open {
-        poll_service_graph_resources(state, service_endpoint);
-    }
+    poll_service_graph_resources(state, service_endpoint, graph_open);
     if threads_open {
         poll_service_threads_resources(state, service_endpoint);
     }
@@ -19227,6 +19295,36 @@ mod tests {
             .expect("same-pair history root is valid");
         assert!(!client.service_history_periods.is_empty());
         assert!(!client.service_history_samples.is_empty());
+    }
+
+    #[test]
+    fn split_history_periods_update_main_without_materializing_history_samples() {
+        let source = CodexInfoState::preview("normal");
+        let mut current = source.public_details_v3_candidate().unwrap();
+        let periods = current.history_periods.clone();
+        current.history_periods.clear();
+        current.history_samples.clear();
+        current.history_gaps.clear();
+        current.threads.clear();
+        let pair = format!("v1:{:032x}{:032x}", 3_u128, 1_u128);
+        let mut client = CodexInfoState::service_client();
+        client
+            .apply_service_current_v3(pair.clone(), current)
+            .expect("current root is valid");
+
+        client
+            .apply_service_history_periods_resource(pair.clone(), periods.clone())
+            .expect("same-pair period metadata is valid");
+
+        assert_eq!(
+            client.service_history_periods_pair.as_deref(),
+            Some(pair.as_str())
+        );
+        assert_eq!(client.service_history_periods, periods);
+        assert_ne!(client.selected_history_period, "履歴なし");
+        assert!(client.service_history_pair.is_none());
+        assert!(client.service_history_samples.is_empty());
+        assert!(client.history.samples.is_empty());
     }
 
     #[test]
@@ -29908,6 +30006,30 @@ mod tests {
         assert!(graph.unused_intervals.is_empty());
         assert!(graph.remaining_solid.is_empty());
         assert!(graph.remaining_inferred.is_empty());
+    }
+
+    #[test]
+    fn public_history_gap_uses_the_periods_canonical_reset_on_the_wire() {
+        let mut state = CodexInfoState::preview("normal");
+        let initial = state.public_details_v3_candidate().unwrap();
+        let period = initial
+            .history_periods
+            .iter()
+            .find(|period| period.current)
+            .cloned()
+            .expect("preview has a current period");
+        state.history_gaps = vec![PublicHistoryGap {
+            gap_id: "22".repeat(16),
+            reset_at: period.reset_at - 2,
+            start_at: period.start_at,
+            end_at: period.start_at,
+            reason: "daemon_stop_unrecoverable".into(),
+        }];
+
+        let published = state.public_details_v3_candidate().unwrap();
+
+        assert_eq!(published.history_gaps.len(), 1);
+        assert_eq!(published.history_gaps[0].reset_at, period.reset_at);
     }
 
     #[test]

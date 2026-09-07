@@ -27,8 +27,10 @@ esac
 service_pid=''
 ui_pid=''
 window_id=''
+graph_window_id=''
 port=''
 frame="$temp_root/frame.xwd"
+graph_frame="$temp_root/graph.xwd"
 ready_frame="$temp_root/ready.xwd"
 ready_current="$temp_root/ready-current.json"
 service_starttime=''
@@ -37,6 +39,43 @@ ui_starttime=''
 proc_starttime() {
     local pid="$1"
     awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true
+}
+
+click_window() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import ctypes
+import sys
+import time
+
+window, x, y = (int(value, 0) for value in sys.argv[1:])
+x11 = ctypes.CDLL("libX11.so.6")
+xtst = ctypes.CDLL("libXtst.so.6")
+x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+x11.XOpenDisplay.restype = ctypes.c_void_p
+x11.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+x11.XWarpPointer.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+                             ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
+                             ctypes.c_int, ctypes.c_int]
+x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+xtst.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+
+display = x11.XOpenDisplay(None)
+if not display:
+    raise SystemExit("X display is unavailable")
+try:
+    x11.XRaiseWindow(display, window)
+    x11.XWarpPointer(display, 0, window, 0, 0, 0, 0, x, y)
+    x11.XSync(display, 0)
+    time.sleep(0.05)
+    if not xtst.XTestFakeButtonEvent(display, 1, 1, 0):
+        raise SystemExit("X button press failed")
+    if not xtst.XTestFakeButtonEvent(display, 1, 0, 0):
+        raise SystemExit("X button release failed")
+    x11.XSync(display, 0)
+finally:
+    x11.XCloseDisplay(display)
+PY
 }
 
 terminate_owned() {
@@ -265,12 +304,26 @@ service_last_good_error() {
     current="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" 2>/dev/null)" || return 1
     python3 - "$current" "$ready_current" <<'PY'
 import json
+import os
 import sys
 try:
     current = json.loads(sys.argv[1])
     ready = json.loads(open(sys.argv[2], encoding="utf-8").read())
 except (IndexError, json.JSONDecodeError):
     raise SystemExit(1)
+
+# A recorder cycle that started before failure injection may still commit one
+# valid generation afterwards.  That generation is the actual last-good root,
+# so retain it as the comparison baseline while waiting for the first error.
+if current.get("state") == "ready" and current.get("authenticated") is True:
+    temporary = f"{sys.argv[2]}.tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
+        stream.write(sys.argv[1])
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, sys.argv[2])
+    raise SystemExit(1)
+
 raise SystemExit(0 if (
     current.get("state") == "error"
     and current.get("authenticated") is True
@@ -400,9 +453,78 @@ done
 ((ready_capture == 1)) || fail 'real-service UI did not render a ready details generation'
 cp -- "$frame" "$ready_frame"
 
+# Exercise the actual lazy boundary: the authenticated main window has already
+# rendered with period metadata, and only this user action may materialize the
+# selected history page and graph window.
+click_window "$window_id" 750 30
+for _ in $(seq 1 100); do
+    while read -r candidate; do
+        [[ "$candidate" != "$window_id" ]] || continue
+        candidate_pid="$(xprop -id "$candidate" _NET_WM_PID 2>/dev/null | awk -F'= ' '{print $2}' | tr -d '[:space:]')"
+        if [[ "$candidate_pid" == "$ui_pid" ]]; then
+            graph_window_id="$candidate"
+            break
+        fi
+    done < <(xwininfo -root -tree 2>/dev/null | awk '/^ +0x[0-9a-f]+/ { print $1 }')
+    [[ -n "$graph_window_id" ]] && break
+    sleep 0.1
+done
+[[ -n "$graph_window_id" ]] || fail 'Graph action did not open the real graph window'
+
+graph_capture=0
+for _ in $(seq 1 80); do
+    if xwd -silent -id "$graph_window_id" -out "$graph_frame" 2>/dev/null &&
+        python3 - "$graph_frame" <<'PY' >/dev/null 2>&1
+import struct
+import sys
+from math import sqrt
+
+data = open(sys.argv[1], "rb").read()
+header = struct.unpack(">25I", data[:100])
+header_size, width, height, bytes_per_line, colors = header[0], header[4], header[5], header[12], header[19]
+if width < 700 or height < 480:
+    raise SystemExit(f"unexpected graph image size: {width}x{height}")
+offset = header_size + colors * 12
+stride = bytes_per_line // width
+def rgb(x, y):
+    index = offset + y * bytes_per_line + x * stride
+    return data[index + 2], data[index + 1], data[index]
+def near(value, target, tolerance=38):
+    return sqrt(sum((value[i] - target[i]) ** 2 for i in range(3))) <= tolerance
+
+# Exclude the header/toggle legend. These pixels must come from the plotted
+# history or its value labels, not from static controls.
+targets = {
+    "remaining": (86, 178, 245),
+    "sol": (168, 140, 245),
+    "terra": (93, 201, 138),
+    "luna": (230, 162, 60),
+}
+counts = {
+    name: sum(
+        near(rgb(x, y), color)
+        for y in range(180, height - 20)
+        for x in range(20, width - 20)
+    )
+    for name, color in targets.items()
+}
+if any(count < 8 for count in counts.values()):
+    raise SystemExit(f"real history plot is incomplete: {counts}")
+PY
+    then
+        graph_capture=1
+        break
+    fi
+    sleep 0.25
+done
+((graph_capture == 1)) || fail 'real graph did not render the selected history resource'
+
 # A live daemon may publish a recoverable top-level error while retaining the
 # last complete authenticated generation. This is the field state that must
 # never be rendered as a fresh authentication prompt.
+# Recorder cycles intentionally continue while the UI and graph are inspected,
+# so pin the actual last-good root immediately before injecting the failure.
+curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" >"$ready_current"
 touch "$temp_root/app-server-failure"
 wait_service_last_good_error || fail 'resident service did not publish authenticated last-good error state'
 error_frame=0
@@ -438,4 +560,4 @@ for _ in $(seq 1 60); do
     sleep 0.25
 done
 ((ready_capture == 1)) || fail 'UI did not clear the failure after same-endpoint recovery'
-echo 'x11-service-recovery-visual-gate: PASS (ready -> authenticated last-good error exact data -> ready -> transport error -> recovered)'
+echo 'x11-service-recovery-visual-gate: PASS (main period metadata -> selected history plot -> ready -> authenticated last-good error exact data -> ready -> transport error -> recovered)'

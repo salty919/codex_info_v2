@@ -155,14 +155,17 @@ public sealed class PreviewEnvironmentTests
             // details/models are cleared.
             Assert.Equal(48d, viewModel.RemainingPercentValue);
             Assert.Equal("48%", viewModel.RemainingPercentText);
-            Assert.False(viewModel.IsUpdateNotificationVisible);
             if (expectedState == ApiState.AuthRequired)
             {
+                Assert.False(viewModel.IsUpdateNotificationVisible);
+                Assert.False(viewModel.IsUpdateActionVisible);
                 Assert.True(viewModel.IsAuthRequired);
             }
             else
             {
-                Assert.True(viewModel.IsRetryVisible);
+                Assert.True(viewModel.IsUpdateNotificationVisible);
+                Assert.True(viewModel.IsUpdateActionVisible);
+                Assert.False(viewModel.IsRetryVisible);
             }
         });
     }
