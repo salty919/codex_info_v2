@@ -830,7 +830,54 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
                 if (currentResult.IsSuccess && currentResult.Snapshot is { } current)
                 {
-                    MutateIfCurrent(context, () => ApplyCurrentGeneration(current));
+                    IReadOnlyList<ApiThreadDetails> threads = Array.Empty<ApiThreadDetails>();
+                    if (current.ActiveThreadCount > 0)
+                    {
+                        ThreadsFetchResult threadsResult;
+                        try
+                        {
+                            threadsResult = await splitResources.FetchThreadsAsync(cancellationToken);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                        catch
+                        {
+                            threadsResult = ThreadsFetchResult.FromFailure(DetailsFetchFailure.Transport);
+                        }
+
+                        if (!threadsResult.IsSuccess || threadsResult.Snapshot is not { } threadSnapshot)
+                        {
+                            var failure = threadsResult.Failure == DetailsFetchFailure.Transport
+                                ? DetailsFetchFailure.Transport
+                                : DetailsFetchFailure.Response;
+                            MutateIfCurrent(context, () =>
+                            {
+                                detailsFailure = failure;
+                                Notify(nameof(DetailsStatusText));
+                                Notify(nameof(DetailsStatusAutomationText));
+                                ApplyFailure(failure);
+                            });
+                            return;
+                        }
+
+                        if (threadSnapshot.PublishedPair != current.PublishedPair ||
+                            (ulong)threadSnapshot.Threads.Count != current.ActiveThreadCount)
+                        {
+                            MutateIfCurrent(context, () =>
+                            {
+                                detailsFailure = DetailsFetchFailure.Response;
+                                Notify(nameof(DetailsStatusText));
+                                Notify(nameof(DetailsStatusAutomationText));
+                                ApplyFailure(DetailsFetchFailure.Response);
+                            });
+                            return;
+                        }
+                        threads = threadSnapshot.Threads;
+                    }
+
+                    MutateIfCurrent(context, () => ApplyCurrentGeneration(current, threads));
                 }
                 else
                 {
@@ -1134,7 +1181,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(IsUpdateActionVisible));
     }
 
-    private void ApplyCurrentGeneration(ApiCurrentSnapshot current)
+    private void ApplyCurrentGeneration(
+        ApiCurrentSnapshot current,
+        IReadOnlyList<ApiThreadDetails> threads)
     {
         var merged = new ApiDetailsSnapshot(
             current.State,
@@ -1146,7 +1195,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             current.ActiveThreadCount,
             Array.Empty<ApiHistoryPeriod>(),
             Array.Empty<ApiHistorySample>(),
-            Array.Empty<ApiThreadDetails>(),
+            threads,
             "概算 —")
         {
             ApiVersion = current.ApiVersion,
