@@ -702,12 +702,17 @@ for health_shape in extra duplicate old; do
         fail "health shape unexpectedly accepted: $health_shape"
     fi
 done
-if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
     FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
     FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_SHAPE=exact FAKE_DETAILS_STATE=error \
     CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+    bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null
+if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_SHAPE=exact FAKE_DETAILS_STATE=unknown \
+    CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
     bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null 2>&1; then
-    fail 'runtime with error details unexpectedly passed functional readiness'
+    fail 'runtime with unknown details state unexpectedly passed readiness'
 fi
 state_backup="$TEST_ROOT/recorder-state.good"
 cp -- "$fake_home/.codex/history/recorder-state.json" "$state_backup"
@@ -747,7 +752,7 @@ PY
     fi
     mv -- "$state_backup" "$fake_home/.codex/history/recorder-state.json"
 done
-printf 'case health schema/heartbeat rejection: PASS\n'
+printf 'case external-error tolerance/health schema/heartbeat rejection: PASS\n'
 
 write_running_state "$fake_home"
 if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \

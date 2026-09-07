@@ -1480,8 +1480,8 @@ def pairs(items):
 try: document=json.load(sys.stdin,object_pairs_hook=pairs)
 except Exception as error: raise SystemExit(str(error))
 if not isinstance(document,dict): raise SystemExit("details is not an object")
-if document.get("state") not in {"ready","auth_required"}:
-    raise SystemExit("details is not functionally ready")
+if document.get("state") not in {"ready","auth_required","error"}:
+    raise SystemExit("details state is unknown")
 observed_at=document.get("observed_at")
 if isinstance(observed_at,bool) or not isinstance(observed_at,int) or observed_at <= 0:
     raise SystemExit("details observed_at is invalid")
