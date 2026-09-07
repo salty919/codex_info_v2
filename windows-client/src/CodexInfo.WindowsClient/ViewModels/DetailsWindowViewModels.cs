@@ -98,9 +98,14 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     // Keep at least one sample per physical plot pixel at 200% DPI (and more
     // at standard DPI) so paint cost is bounded without changing endpoints.
     internal const int MaxRenderedGraphPoints = 2_048;
+    // This is a DoS guard derived from the existing one-month history admission
+    // envelope in Core. It is not a normal page-size or payload requirement.
+    private const int MaxSplitHistoryPageRequests = 31 * 24 * 60 + 1;
     private const int BackgroundBuildThreshold = 2_048;
     private readonly MainWindowViewModel main;
     private readonly Action<Action> postToUi;
+    private readonly ILoopbackResourceClient? resourceClient;
+    private readonly SemaphoreSlim resourceRefreshGate = new(1, 1);
     private readonly ObservableCollection<ApiHistoryPeriod> periods = [];
     private IReadOnlyList<GraphPointViewModel> points = Array.Empty<GraphPointViewModel>();
     private GraphScene scene = GraphScene.Empty();
@@ -120,6 +125,13 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     private bool isLoading;
     private bool hasLoadError;
     private bool disposed;
+    private bool resourceCursorResetRequired;
+    private CancellationTokenSource? resourcePollingCancellation;
+    private string? resourceNextCursor;
+    private PublishedPairIdentity? resourcePublishedPair;
+    private ApiHistoryPeriod? resourcePeriod;
+    private IReadOnlyList<ApiHistorySample> resourceSamples = Array.Empty<ApiHistorySample>();
+    private IReadOnlyList<ApiHistoryGap> resourceGaps = Array.Empty<ApiHistoryGap>();
 
     public GraphWindowViewModel(MainWindowViewModel main)
         : this(main, action => Dispatcher.UIThread.Post(action))
@@ -133,7 +145,16 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Periods = new ReadOnlyObservableCollection<ApiHistoryPeriod>(periods);
         RebuildMetricOptions();
         main.PropertyChanged += OnMainPropertyChanged;
-        Rebuild();
+        resourceClient = main.SplitResourceClient;
+        if (resourceClient is null)
+        {
+            Rebuild();
+        }
+        else
+        {
+            resourcePollingCancellation = new CancellationTokenSource();
+            _ = RunSplitResourcePollingAsync(resourcePollingCancellation.Token);
+        }
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -182,6 +203,13 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(SelectedPeriodText));
             Notify(nameof(SelectedPeriodStartAt));
             Notify(nameof(SelectedPeriodEndAt));
+            if (resourceClient is not null && value is not null && !disposed)
+            {
+                _ = RefreshSplitResourceAsync(
+                    initial: true,
+                    requestedPeriodId: value.Id,
+                    resourcePollingCancellation?.Token ?? main.LifetimeToken);
+            }
         }
     }
 
@@ -577,6 +605,11 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         disposed = true;
         pointBuildCancellation.Cancel();
         pointBuildCancellation.Dispose();
+        if (resourcePollingCancellation is not null)
+        {
+            resourcePollingCancellation.Cancel();
+            resourcePollingCancellation.Dispose();
+        }
         main.PropertyChanged -= OnMainPropertyChanged;
     }
 
@@ -584,7 +617,10 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         if (eventArgs.PropertyName == nameof(MainWindowViewModel.DetailsSnapshot))
         {
-            Rebuild();
+            if (resourceClient is null)
+            {
+                Rebuild();
+            }
             return;
         }
 
@@ -610,6 +646,321 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     private void RebuildMetricOptions()
     {
         metricOptions = [Texts.Dollars, Texts.Tokens];
+    }
+
+    private async Task RunSplitResourcePollingAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await RefreshSplitResourceAsync(
+                    initial: true,
+                    requestedPeriodId: null,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(60));
+            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+            {
+                await RefreshSplitResourceAsync(
+                        initial: false,
+                        requestedPeriodId: selectedPeriod?.Id,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Closing the graph owns cancellation.
+        }
+    }
+
+    private async Task RefreshSplitResourceAsync(
+        bool initial,
+        string? requestedPeriodId,
+        CancellationToken cancellationToken)
+    {
+        if (resourceClient is null || disposed || cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        try
+        {
+            await resourceRefreshGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
+        try
+        {
+            var periodsResult = await resourceClient.FetchHistoryPeriodsAsync(cancellationToken)
+                .ConfigureAwait(false);
+            if (!periodsResult.IsSuccess || periodsResult.Snapshot is not { } periodsSnapshot)
+            {
+                PublishSplitResourceFailure();
+                return;
+            }
+
+            var stagedPeriod = periodsSnapshot.Periods.FirstOrDefault(period =>
+                period.Id == requestedPeriodId);
+            stagedPeriod ??= periodsSnapshot.Periods.FirstOrDefault(period => period.Current)
+                ?? periodsSnapshot.Periods.FirstOrDefault();
+            if (stagedPeriod is null)
+            {
+                PublishSplitResourceState(
+                    periodsSnapshot.Periods,
+                    null,
+                    Array.Empty<ApiHistorySample>(),
+                    Array.Empty<ApiHistoryGap>(),
+                    periodsSnapshot.PublishedPair,
+                    nextCursor: null);
+                return;
+            }
+
+            var periodChanged = resourcePeriod?.Id != stagedPeriod.Id;
+            var canContinueFromPreviousCursor = !resourceCursorResetRequired &&
+                !periodChanged &&
+                resourceNextCursor is not null;
+            var fullRefresh = initial || periodChanged ||
+                resourceCursorResetRequired ||
+                !canContinueFromPreviousCursor;
+            var cursor = fullRefresh ? null : resourceNextCursor;
+            var appendingProvenPrefix = canContinueFromPreviousCursor;
+            var pageSamples = new List<ApiHistorySample>();
+            var pageGaps = new List<ApiHistoryGap>();
+            var requestedCursor = cursor;
+            var pageCount = 0;
+            string? resumeCursor = null;
+            while (true)
+            {
+                if (++pageCount > MaxSplitHistoryPageRequests)
+                {
+                    resourceCursorResetRequired = true;
+                    PublishSplitResourceFailure();
+                    return;
+                }
+
+                var firstPage = pageCount == 1;
+                var pageResult = await resourceClient.FetchHistoryPageAsync(
+                        stagedPeriod.Id,
+                        cursor,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (!pageResult.IsSuccess || pageResult.Page is not { } page ||
+                    page.PublishedPair != periodsSnapshot.PublishedPair ||
+                    page.PeriodId != stagedPeriod.Id ||
+                    !ValidateHistoryPage(stagedPeriod, page))
+                {
+                    // A stale opaque cursor is retried from the period head on
+                    // the next normal cycle. Other page failures use the same
+                    // isolation path; no partial page is ever published.
+                    resourceCursorResetRequired = cursor is not null;
+                    PublishSplitResourceFailure();
+                    return;
+                }
+
+                // A cursor continuation proves that the selected period's
+                // complete gap set is unchanged; delta pages therefore carry
+                // samples only. A head request publishes the complete gap set
+                // once, while later pages must not repeat or alter it.
+                if ((appendingProvenPrefix || !firstPage) && page.HistoryGaps.Count != 0)
+                {
+                    resourceCursorResetRequired = appendingProvenPrefix;
+                    PublishSplitResourceFailure();
+                    return;
+                }
+
+                pageSamples.AddRange(page.Samples);
+                if (firstPage)
+                {
+                    pageGaps.AddRange(page.HistoryGaps);
+                }
+                if (page.NextCursor is null)
+                {
+                    resumeCursor = page.IsLegacyFallback ? null : page.ResumeCursor;
+                    cursor = resumeCursor;
+                    break;
+                }
+
+                if (page.NextCursor == cursor ||
+                    page.NextCursor == requestedCursor && pageSamples.Count == 0)
+                {
+                    resourceCursorResetRequired = true;
+                    PublishSplitResourceFailure();
+                    return;
+                }
+
+                requestedCursor = cursor = page.NextCursor;
+            }
+
+            var mergedSamples = fullRefresh
+                ? MergeHistorySamples(Array.Empty<ApiHistorySample>(), pageSamples)
+                : MergeHistorySamples(resourceSamples, pageSamples);
+            var mergedGaps = fullRefresh
+                ? MergeHistoryGaps(Array.Empty<ApiHistoryGap>(), pageGaps)
+                : resourceGaps;
+            if (mergedSamples is null || mergedGaps is null)
+            {
+                resourceCursorResetRequired = appendingProvenPrefix;
+                PublishSplitResourceFailure();
+                return;
+            }
+
+            resourceCursorResetRequired = false;
+            PublishSplitResourceState(
+                periodsSnapshot.Periods,
+                stagedPeriod,
+                mergedSamples,
+                mergedGaps,
+                periodsSnapshot.PublishedPair,
+                cursor);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Closing the graph owns cancellation.
+        }
+        catch
+        {
+            PublishSplitResourceFailure();
+        }
+        finally
+        {
+            resourceRefreshGate.Release();
+        }
+    }
+
+    private void PublishSplitResourceState(
+        IReadOnlyList<ApiHistoryPeriod> nextPeriods,
+        ApiHistoryPeriod? nextSelectedPeriod,
+        IReadOnlyList<ApiHistorySample> nextSamples,
+        IReadOnlyList<ApiHistoryGap> nextGaps,
+        PublishedPairIdentity nextPair,
+        string? nextCursor)
+    {
+        postToUi(() =>
+        {
+            if (disposed)
+            {
+                return;
+            }
+
+            periods.Clear();
+            foreach (var period in nextPeriods)
+            {
+                periods.Add(period.Id == nextSelectedPeriod?.Id
+                    ? period with { Samples = nextSamples }
+                    : period);
+            }
+
+            selectedPeriod = nextSelectedPeriod is null
+                ? null
+                : nextSelectedPeriod with { Samples = nextSamples };
+            resourcePeriod = selectedPeriod;
+            resourceSamples = nextSamples;
+            resourceGaps = nextGaps;
+            resourcePublishedPair = nextPair;
+            resourceNextCursor = nextCursor;
+            SetLoadError(false);
+            SetLoading(false);
+            RebuildPoints();
+            Notify(nameof(HasPeriods));
+            Notify(nameof(SelectedPeriod));
+            Notify(nameof(SelectedPeriodText));
+            Notify(nameof(SelectedPeriodStartAt));
+            Notify(nameof(SelectedPeriodEndAt));
+        });
+    }
+
+    private void PublishSplitResourceFailure()
+    {
+        if (disposed)
+        {
+            return;
+        }
+
+        postToUi(() =>
+        {
+            if (disposed)
+            {
+                return;
+            }
+
+            SetLoading(false);
+            SetLoadError(true);
+        });
+    }
+
+    private static bool ValidateHistoryPage(ApiHistoryPeriod period, ApiHistoryPage page)
+    {
+        foreach (var sample in page.Samples)
+        {
+            if (sample.Timestamp < period.StartAt ||
+                sample.Timestamp > period.EndAt ||
+                sample.ResetAt < period.ResetAt - 60 ||
+                sample.ResetAt > period.ResetAt)
+            {
+                return false;
+            }
+        }
+
+        foreach (var gap in page.HistoryGaps)
+        {
+            if (gap.ResetAt != period.ResetAt ||
+                gap.StartAt < period.StartAt ||
+                gap.EndAt > period.EndAt)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static IReadOnlyList<ApiHistorySample>? MergeHistorySamples(
+        IReadOnlyList<ApiHistorySample> existing,
+        IReadOnlyList<ApiHistorySample> additions)
+    {
+        var merged = new Dictionary<(long ResetAt, long Timestamp), ApiHistorySample>();
+        foreach (var sample in existing.Concat(additions))
+        {
+            var key = (sample.ResetAt, sample.Timestamp);
+            if (merged.TryGetValue(key, out var prior) && prior != sample)
+            {
+                return null;
+            }
+
+            merged[key] = sample;
+        }
+
+        return merged.Values
+            .OrderBy(sample => sample.ResetAt)
+            .ThenBy(sample => sample.Timestamp)
+            .ToArray();
+    }
+
+    private static IReadOnlyList<ApiHistoryGap>? MergeHistoryGaps(
+        IReadOnlyList<ApiHistoryGap> existing,
+        IReadOnlyList<ApiHistoryGap> additions)
+    {
+        var merged = new Dictionary<string, ApiHistoryGap>(StringComparer.Ordinal);
+        foreach (var gap in existing.Concat(additions))
+        {
+            if (merged.TryGetValue(gap.GapId, out var prior) && prior != gap)
+            {
+                return null;
+            }
+
+            merged[gap.GapId] = gap;
+        }
+
+        return merged.Values
+            .OrderBy(gap => gap.ResetAt)
+            .ThenBy(gap => gap.StartAt)
+            .ThenBy(gap => gap.EndAt)
+            .ThenBy(gap => gap.GapId, StringComparer.Ordinal)
+            .ToArray();
     }
 
     private void Rebuild()
@@ -716,6 +1067,14 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     private IReadOnlyList<GraphConfirmedGap> BuildConfirmedGaps(ApiHistoryPeriod period)
     {
         var end = EffectiveGraphEnd(period, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        if (resourceClient is not null)
+        {
+            return resourceGaps
+                .Where(gap => gap.EndAt > period.StartAt && gap.StartAt < end)
+                .Select(gap => new GraphConfirmedGap(gap.StartAt, gap.EndAt))
+                .ToArray();
+        }
+
         return main.DetailsSnapshot?.HistoryGaps
                 .Where(gap => gap.EndAt > period.StartAt && gap.StartAt < end)
                 .Select(gap => new GraphConfirmedGap(gap.StartAt, gap.EndAt))
@@ -804,15 +1163,35 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 {
     private readonly MainWindowViewModel main;
+    private readonly Action<Action> postToUi;
+    private readonly ILoopbackResourceClient? resourceClient;
     private readonly ObservableCollection<ThreadItemViewModel> threads = [];
     private bool disposed;
+    private bool hasLoadError;
+    private CancellationTokenSource? resourcePollingCancellation;
+    private IReadOnlyList<ApiThreadDetails> resourceThreads = Array.Empty<ApiThreadDetails>();
 
     public ThreadsWindowViewModel(MainWindowViewModel main)
+        : this(main, action => Avalonia.Threading.Dispatcher.UIThread.Post(action))
+    {
+    }
+
+    internal ThreadsWindowViewModel(MainWindowViewModel main, Action<Action> postToUi)
     {
         this.main = main;
+        this.postToUi = postToUi;
+        resourceClient = main.SplitResourceClient;
         Threads = new ReadOnlyObservableCollection<ThreadItemViewModel>(threads);
         main.PropertyChanged += OnMainPropertyChanged;
-        Rebuild();
+        if (resourceClient is null)
+        {
+            Rebuild();
+        }
+        else
+        {
+            resourcePollingCancellation = new CancellationTokenSource();
+            _ = RunSplitResourcePollingAsync(resourcePollingCancellation.Token);
+        }
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -824,6 +1203,8 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
     public bool HasThreads => threads.Count > 0;
 
     public bool HasNoThreads => !HasThreads;
+
+    public bool HasLoadError => hasLoadError;
 
     public string EmptyText => Texts.NoRunningThreads;
 
@@ -875,6 +1256,11 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         disposed = true;
+        if (resourcePollingCancellation is not null)
+        {
+            resourcePollingCancellation.Cancel();
+            resourcePollingCancellation.Dispose();
+        }
         main.PropertyChanged -= OnMainPropertyChanged;
     }
 
@@ -883,19 +1269,84 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         if (eventArgs.PropertyName is nameof(MainWindowViewModel.DetailsSnapshot) or
             nameof(MainWindowViewModel.DetailsStatusText) or nameof(MainWindowViewModel.Texts))
         {
-            Rebuild();
+            if (resourceClient is null)
+            {
+                Rebuild();
+            }
             Notify(nameof(DetailsStatusText));
             Notify(nameof(Texts));
         }
     }
 
+    private async Task RunSplitResourcePollingAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await RefreshSplitResourceAsync(cancellationToken).ConfigureAwait(false);
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
+            {
+                await RefreshSplitResourceAsync(cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Closing the threads window owns cancellation.
+        }
+    }
+
+    private async Task RefreshSplitResourceAsync(CancellationToken cancellationToken)
+    {
+        if (resourceClient is null || disposed || cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        ThreadsFetchResult result;
+        try
+        {
+            result = await resourceClient.FetchThreadsAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+        catch
+        {
+            result = ThreadsFetchResult.FromFailure(DetailsFetchFailure.Transport);
+        }
+
+        postToUi(() =>
+        {
+            if (disposed)
+            {
+                return;
+            }
+
+            if (!result.IsSuccess || result.Snapshot is not { } snapshot)
+            {
+                hasLoadError = true;
+                Notify(nameof(HasLoadError));
+                return;
+            }
+
+            resourceThreads = snapshot.Threads;
+            hasLoadError = false;
+            Notify(nameof(HasLoadError));
+            Rebuild();
+        });
+    }
+
     private void Rebuild()
     {
         threads.Clear();
-        if (main.DetailsSnapshot is { } details)
+        var source = resourceClient is not null
+            ? resourceThreads
+            : main.DetailsSnapshot?.Threads ?? Array.Empty<ApiThreadDetails>();
+        if (source.Count > 0)
         {
-            var ordered = ParentFirst(details.Threads);
-            var byId = details.Threads.ToDictionary(thread => thread.Id, StringComparer.Ordinal);
+            var ordered = ParentFirst(source);
+            var byId = source.ToDictionary(thread => thread.Id, StringComparer.Ordinal);
             for (var index = 0; index < ordered.Count; index++)
             {
                 var thread = ordered[index];

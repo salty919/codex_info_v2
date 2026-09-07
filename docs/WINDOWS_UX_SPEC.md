@@ -229,9 +229,10 @@ Mainを既定の到達先とし、保存済みselectorで次回自動再接続�
 自動再構築ごとにSetup/app確認を再表示しない。更新は明示ボタンとbounded自動更新を同じ状態機械で扱い、
 更新中の再クリック、重複要求、値の一時消去を禁止する。
 
-Main、Graph、Threadsは同じstrict validation済み`/v3/details`一応答を一つのatomic rootとして置換する。旧serviceがexact 404を返す場合だけ単一v2、さらにexact 404の場合だけ単一v1へfallbackする。
-SQLite、別poll、認証control応答でfieldを補完せず、quota/history/threadの再収集、
-値の再計算、同一minuteのmerge/max/last/null化をUIで行わない。候補拒否時は全surfaceが同じlast-good rootを保持する。
+Mainはstrict validation済み`/v3/current`、Graphは`/v3/history/periods`と選択期間のhistory page、Threadsは`/v3/threads`を使う。各取得cycleは必要な応答が全て同じpublished pairの場合だけatomic置換する。Graph差分だけは直前cursorで既取得prefix不変が証明され、かつ新pairの全pageを受理した場合に限りatomic appendする。prefix補正時は先頭から再取得する。`/v3/current`がexact 404の旧serviceだけ単一`/v3/details`、さらにexact 404の場合だけ単一v2、v1へfallbackする。
+exact 404でlegacy details modeへ入った接続は、一つの受理済みdetails rootをMain、Graph、Threadsへ同時投影し、split routeを追加要求しない。再接続時に`/v3/current`から能力判定をやり直す。
+Mainは10秒、Graph差分はopen中60秒、Threadsはopen中5秒で確認し、Graph/Threadsを閉じている間は対応requestを送らない。SQLite、別pair、認証control応答でfieldを補完せず、quota/history/threadの再収集、
+値の再計算、同一minuteのmerge/max/last/null化をUIで行わない。候補拒否時は該当surfaceだけが同じlast-good rootを保持し、他surfaceやrecorderを変更しない。
 
 ### 3.3 詳細・設定・法的情報
 
@@ -261,12 +262,8 @@ component順や表示所有者を変更しない。
 
 - 期間、ドル/トークン、Remaining/LUNA/TERRA/SOL/ASTRAの操作を上部固定帯に置く。
   model名と累積値は同じaccepted v3 rootから取得し、ASTRAを「その他」へ集約しない。
-- 期間・metricのリストはpointer pressの1回で展開する。REST/DB/poll完了を待たず、物理入力から
-  user-visible paintまで、系列ON/OFFはP90 75 ms以下・P95 100 ms以下、期間/metricリストは
-  P90 100 ms以下・P95 150 ms以下、いずれもcold max 250 ms以下とする。10,080点と契約最大1暦月
-  44,640点の双方で30回以上測定し、一つでも未測定・超過ならUX FAILとする。
-- このP90/P95は固定Windows実機または専用self-hosted runnerで測る。負荷と画面capture速度が共有される
-  GitHub-hosted runnerは機能E2Eとハング検知にだけ使い、絶対性能の合否判定には使わない。
+- 期間・metricのリストはpointer pressの1回で展開し、REST/DB/poll完了を待たずにuser-visible acknowledgementを返す。物理入力からpaintまでのP90/P95は、CPU、memory、GPU、storage、OS/build、sample数を併記し、同じ環境・同じ入力規模の退行観測に使う。7日1分bucket由来の10,080点と契約最大1暦月由来の44,640点は観測profileであって、通常データを拒否する任意の上限ではない。最低動作環境と承認baselineが定義されるまでは、根拠のない絶対ms値やcold maxをUX合否条件にしない。
+- 承認済み最低Windows実機または同等の専用self-hosted runnerが定義された後だけ、その環境のbaselineから絶対P90/P95を導出できる。負荷と画面capture速度が共有されるGitHub-hosted runnerは機能E2Eとハング検知にだけ使い、絶対性能の合否判定には使わない。
 - 系列ON/OFFはpointer pressで状態とボタン面を先に更新する。P90/P95はこのuser-visible acknowledgementを
   測り、同じ入力でplot画像も必ず変化したことを別のbounded postconditionとして確認する。
 - 期間/metricの各測定sampleは閉状態から1回の物理クリックで展開する同一操作とし、次sample用の
@@ -274,7 +271,7 @@ component順や表示所有者を変更しない。
   高速連打や開閉の異なる操作を一つのP90/P95へ合成しない。pollやlocale通知による同値候補の
   再公開をユーザー選択へ読み替えず、開いているリストを自動で閉じない。
 - 期間変更は`idle → loading → ready|failed`の有限状態遷移とする。選択表示は入力直後に更新し、
-  accepted details rootのparseとpresentation projectionはUI thread外で行う。SQLite再読込やsampleの
+  accepted same-pair history page集合のparseとpresentation projectionはUI thread外で行う。SQLite再読込やsampleの
   canonicalization/merge/recalculationは行わない。既存の遅延残量補間と終端保持はpresentation-onlyで行い、
   導出点をdetailsやDBへ書き戻さない。処理が次paintまでに終わらない場合は操作を塞がない
   indeterminate progressと「期間データを読み込み中…」を表示する。loading中は直前に完成したgraph・
@@ -351,8 +348,8 @@ component順や表示所有者を変更しない。
 - WSL/remote/one-session raw recovery、ArgumentList、API到達、認証開始、認証確認、app-wide single
   supervisor/tunnel/reapの境界は`UX-20260822-SSH-001`を正本とする。
 
-Setupの順序はserver/API prepare→listener→readiness `GET /health`→strict `GET /v3/details`（旧serviceのexact 404時だけv2、さらにexact 404時だけv1）→
-必要時だけauth-start→別auth-check→新しいstrict detailsで固定する。auth-start/auth-checkはcontrol-onlyであり、
+Setupの順序はserver/API prepare→listener→readiness `GET /health`→strict `GET /v3/current`（新resourceがexact 404の旧serviceだけv3 details→v2→v1）→
+必要時だけauth-start→別auth-check→新しいstrict currentで固定する。auth-start/auth-checkはcontrol-onlyであり、
 応答を表示rootへmergeしない。healthだけ、またはcontrol成功だけでdata readyとしない。
 
 RC-121のprofile別action意味論も固定する。WSLのserver prepare/service start、Remoteのinstall/tunnel/raw

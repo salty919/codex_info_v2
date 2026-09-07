@@ -243,3 +243,180 @@ public interface ILoopbackDetailsClient
 {
     Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default);
 }
+
+/// <summary>
+/// The bounded v3 resources used by the current Windows client.  Each
+/// resource carries the server's opaque published-pair identity so callers
+/// can stage a view and commit it only when all of that view's pages agree.
+/// </summary>
+public interface ILoopbackResourceClient
+{
+    Task<CurrentFetchResult> FetchCurrentAsync(CancellationToken cancellationToken = default);
+
+    Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
+        CancellationToken cancellationToken = default);
+
+    Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+        string periodId,
+        string? cursor = null,
+        CancellationToken cancellationToken = default);
+
+    Task<ThreadsFetchResult> FetchThreadsAsync(CancellationToken cancellationToken = default);
+}
+
+/// <summary>The v3/current resource. History and thread rows are intentionally absent.</summary>
+public sealed record ApiCurrentSnapshot(
+    ApiState State,
+    long? ObservedAt,
+    bool Authenticated,
+    string? PlanLabel,
+    ApiQuota? Quota,
+    IReadOnlyList<ApiDetailsModelUsage> Models,
+    ulong ActiveThreadCount,
+    PublishedPairIdentity PublishedPair)
+{
+    public string ApiVersion { get; init; } = "v3";
+
+    internal static ApiCurrentSnapshot FromDetails(ApiDetailsSnapshot details)
+    {
+        ArgumentNullException.ThrowIfNull(details);
+        return new ApiCurrentSnapshot(
+            details.State,
+            details.ObservedAt,
+            details.Authenticated,
+            details.PlanLabel,
+            details.Quota,
+            details.Models,
+            details.ActiveThreadCount,
+            details.PublishedPair ?? default)
+        {
+            ApiVersion = details.ApiVersion,
+        };
+    }
+}
+
+/// <summary>Validated period metadata returned by v3/history/periods.</summary>
+public sealed record ApiHistoryPeriodsSnapshot(
+    IReadOnlyList<ApiHistoryPeriod> Periods,
+    PublishedPairIdentity PublishedPair)
+{
+    public string ApiVersion { get; init; } = "v3";
+
+    internal static ApiHistoryPeriodsSnapshot FromDetails(ApiDetailsSnapshot details) =>
+        new(details.HistoryPeriods, details.PublishedPair ?? default)
+        {
+            ApiVersion = details.ApiVersion,
+        };
+}
+
+/// <summary>One bounded history page and its opaque continuation cursor.</summary>
+public sealed record ApiHistoryPage(
+    string PeriodId,
+    IReadOnlyList<ApiHistorySample> Samples,
+    IReadOnlyList<ApiHistoryGap> HistoryGaps,
+    string? NextCursor,
+    string? ResumeCursor,
+    PublishedPairIdentity PublishedPair)
+{
+    public string ApiVersion { get; init; } = "v3";
+
+    public bool IsLegacyFallback { get; init; }
+
+    internal static ApiHistoryPage? FromDetails(ApiDetailsSnapshot details, string periodId)
+    {
+        var period = details.HistoryPeriods.FirstOrDefault(candidate => candidate.Id == periodId);
+        return period is null
+            ? null
+            : new ApiHistoryPage(
+                period.Id,
+                period.Samples,
+                details.HistoryGaps
+                    .Where(gap => gap.ResetAt == period.ResetAt)
+                    .ToArray(),
+                null,
+                "legacy",
+                details.PublishedPair ?? default)
+            {
+                ApiVersion = details.ApiVersion,
+                IsLegacyFallback = true,
+            };
+    }
+}
+
+/// <summary>Validated thread rows returned by v3/threads.</summary>
+public sealed record ApiThreadsSnapshot(
+    IReadOnlyList<ApiThreadDetails> Threads,
+    PublishedPairIdentity PublishedPair)
+{
+    public string ApiVersion { get; init; } = "v3";
+
+    internal static ApiThreadsSnapshot FromDetails(ApiDetailsSnapshot details) =>
+        new(details.Threads, details.PublishedPair ?? default)
+        {
+            ApiVersion = details.ApiVersion,
+        };
+}
+
+public sealed record CurrentFetchResult(
+    ApiCurrentSnapshot? Snapshot,
+    DetailsFetchFailure? Failure)
+{
+    public bool IsSuccess => Snapshot is not null && Failure is null;
+
+    public static CurrentFetchResult Success(ApiCurrentSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        return new CurrentFetchResult(snapshot, null);
+    }
+
+    public static CurrentFetchResult FromFailure(DetailsFetchFailure failure) =>
+        new(null, failure);
+}
+
+public sealed record HistoryPeriodsFetchResult(
+    ApiHistoryPeriodsSnapshot? Snapshot,
+    DetailsFetchFailure? Failure)
+{
+    public bool IsSuccess => Snapshot is not null && Failure is null;
+
+    public static HistoryPeriodsFetchResult Success(ApiHistoryPeriodsSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        return new HistoryPeriodsFetchResult(snapshot, null);
+    }
+
+    public static HistoryPeriodsFetchResult FromFailure(DetailsFetchFailure failure) =>
+        new(null, failure);
+}
+
+public sealed record HistoryPageFetchResult(
+    ApiHistoryPage? Page,
+    DetailsFetchFailure? Failure)
+{
+    public bool IsSuccess => Page is not null && Failure is null;
+
+    public static HistoryPageFetchResult Success(ApiHistoryPage page)
+    {
+        ArgumentNullException.ThrowIfNull(page);
+        return new HistoryPageFetchResult(page, null);
+    }
+
+    public static HistoryPageFetchResult FromFailure(DetailsFetchFailure failure) =>
+        new(null, failure);
+}
+
+public sealed record ThreadsFetchResult(
+    ApiThreadsSnapshot? Snapshot,
+    DetailsFetchFailure? Failure)
+{
+    public bool IsSuccess => Snapshot is not null && Failure is null;
+
+    public static ThreadsFetchResult Success(ApiThreadsSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        return new ThreadsFetchResult(snapshot, null);
+    }
+
+    public static ThreadsFetchResult FromFailure(DetailsFetchFailure failure) =>
+        new(null, failure);
+}

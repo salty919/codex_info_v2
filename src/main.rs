@@ -9518,6 +9518,27 @@ struct CodexInfoState {
     /// deliberately scoped to v3; legacy fallback daemons must never receive
     /// an If-None-Match header they do not understand.
     service_v3_published_pair: Option<String>,
+    /// Split v3 resources keep independent last-good generations. The main
+    /// current resource is the only one that is polled while the graph and
+    /// thread windows are closed.
+    service_current_snapshot: Option<PublicDetailsV3>,
+    service_current_active_thread_count: Option<u64>,
+    service_current_pair: Option<String>,
+    service_current_last_poll: Instant,
+    service_current_force_poll: bool,
+    service_split_capable: bool,
+    service_history_periods: Vec<PublicHistoryPeriod>,
+    service_history_samples: Vec<PublicHistoryObservationV3>,
+    service_history_pair: Option<String>,
+    service_history_period_id: Option<String>,
+    service_history_cursor: Option<String>,
+    service_history_last_poll: Instant,
+    service_history_force_poll: bool,
+    service_history_error: Option<String>,
+    service_threads_pair: Option<String>,
+    service_threads_last_poll: Instant,
+    service_threads_force_poll: bool,
+    service_threads_error: Option<String>,
     acknowledged_recorder_commit: Option<AcknowledgedRecorderCommit>,
 }
 
@@ -10090,6 +10111,24 @@ impl CodexInfoState {
             service_endpoint_error: None,
             service_published_pair: None,
             service_v3_published_pair: None,
+            service_current_snapshot: None,
+            service_current_active_thread_count: None,
+            service_current_pair: None,
+            service_current_last_poll: resident_now,
+            service_current_force_poll: false,
+            service_split_capable: false,
+            service_history_periods: Vec::new(),
+            service_history_samples: Vec::new(),
+            service_history_pair: None,
+            service_history_period_id: None,
+            service_history_cursor: None,
+            service_history_last_poll: resident_now,
+            service_history_force_poll: false,
+            service_history_error: None,
+            service_threads_pair: None,
+            service_threads_last_poll: resident_now,
+            service_threads_force_poll: false,
+            service_threads_error: None,
             acknowledged_recorder_commit: None,
         }
     }
@@ -10099,6 +10138,7 @@ impl CodexInfoState {
     /// generation replaces the root. The account bridge exists only for the
     /// explicit authentication-start control.
     fn service_client() -> Self {
+        let service_now = Instant::now();
         Self {
             i18n: I18n::detect(),
             bridge: AppServerBridge::<AccountCommand, Event>::start(true),
@@ -10161,6 +10201,26 @@ impl CodexInfoState {
             service_endpoint_error: None,
             service_published_pair: None,
             service_v3_published_pair: None,
+            service_current_snapshot: None,
+            service_current_active_thread_count: None,
+            service_current_pair: None,
+            service_current_last_poll: service_now
+                .checked_sub(Duration::from_secs(10))
+                .unwrap_or(service_now),
+            service_current_force_poll: true,
+            service_split_capable: false,
+            service_history_periods: Vec::new(),
+            service_history_samples: Vec::new(),
+            service_history_pair: None,
+            service_history_period_id: None,
+            service_history_cursor: None,
+            service_history_last_poll: service_now,
+            service_history_force_poll: false,
+            service_history_error: None,
+            service_threads_pair: None,
+            service_threads_last_poll: service_now,
+            service_threads_force_poll: false,
+            service_threads_error: None,
             acknowledged_recorder_commit: None,
         }
     }
@@ -10168,6 +10228,7 @@ impl CodexInfoState {
     fn preview(kind: &str) -> Self {
         let i18n = I18n::detect();
         let bridge = AppServerBridge::<AccountCommand, Event>::inactive();
+        let resident_now = Instant::now();
         let now = Utc::now().timestamp();
         let reset_at = now + 6 * 86_400 + 14 * 3_600;
         let model_usage = vec![
@@ -10258,6 +10319,24 @@ impl CodexInfoState {
             service_endpoint_error: None,
             service_published_pair: None,
             service_v3_published_pair: None,
+            service_current_snapshot: None,
+            service_current_active_thread_count: None,
+            service_current_pair: None,
+            service_current_last_poll: resident_now,
+            service_current_force_poll: false,
+            service_split_capable: false,
+            service_history_periods: Vec::new(),
+            service_history_samples: Vec::new(),
+            service_history_pair: None,
+            service_history_period_id: None,
+            service_history_cursor: None,
+            service_history_last_poll: resident_now,
+            service_history_force_poll: false,
+            service_history_error: None,
+            service_threads_pair: None,
+            service_threads_last_poll: resident_now,
+            service_threads_force_poll: false,
+            service_threads_error: None,
             acknowledged_recorder_commit: None,
         };
         match kind {
@@ -10654,6 +10733,7 @@ impl CodexInfoState {
         }
         self.checking = true;
         self.status = status.into();
+        self.service_current_force_poll = true;
     }
 
     /// Ask the resident producer for its next account/quota generation.
@@ -10924,6 +11004,7 @@ impl CodexInfoState {
         if details.active_thread_count != details.threads.len() as u64 {
             return Err("details thread count does not match rows".into());
         }
+        let full_snapshot = details.clone();
 
         let selected_period = self
             .selected_reset_at
@@ -11036,7 +11117,254 @@ impl CodexInfoState {
         self.service_endpoint_error = None;
         self.service_published_pair = Some(published_pair.clone());
         self.service_v3_published_pair = Some(published_pair);
+        self.service_current_snapshot = Some(full_snapshot);
+        self.service_current_active_thread_count = Some(self.active_threads.len() as u64);
+        self.service_current_pair = self.service_published_pair.clone();
+        self.service_split_capable = false;
+        self.service_history_periods.clear();
+        self.service_history_samples.clear();
+        self.service_history_pair = None;
+        self.service_history_period_id = None;
+        self.service_history_cursor = None;
+        self.service_history_error = None;
+        self.service_threads_pair = None;
+        self.service_threads_error = None;
         Ok(true)
+    }
+
+    fn apply_service_current_v3(
+        &mut self,
+        published_pair: String,
+        current: PublicDetailsV3,
+    ) -> Result<bool, String> {
+        let previous_pair = self
+            .service_current_pair
+            .as_deref()
+            .or(self.service_published_pair.as_deref());
+        if !published_pair_is_fresh(previous_pair, &published_pair)? {
+            return Ok(false);
+        }
+        current.validate().map_err(|error| error.to_string())?;
+        if !current.authenticated
+            && (current.quota.is_some()
+                || !current.models.is_empty()
+                || current.active_thread_count != 0)
+        {
+            return Err("unauthenticated current contains visible account data".into());
+        }
+        if current.state == PublicState::Ready
+            && (!current.authenticated || current.observed_at.is_none())
+        {
+            return Err("ready current is incomplete".into());
+        }
+        let pair_changed = previous_pair != Some(published_pair.as_str());
+        let previous_snapshot = self.service_current_snapshot.clone();
+        if pair_changed {
+            // The graph and thread resources are independent views, but a
+            // cursor from the preceding pair may be used for the next graph
+            // request. Keep the last-good graph as a presentation fallback;
+            // it is appended to a new pair only after that request returns a
+            // 200 page proving cursor-prefix continuity. Recorder state, DB
+            // rows, and pending local work stay untouched.
+            //
+            // An authentication transition is an identity boundary rather
+            // than a normal publication update, so do not retain another
+            // account's visible graph rows across it.
+            if !current.authenticated
+                || previous_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.authenticated != current.authenticated)
+            {
+                self.history.samples.clear();
+                self.history.observations.clear();
+                self.history_gaps.clear();
+                self.service_history_samples.clear();
+                self.service_history_periods.clear();
+                self.service_history_pair = None;
+                self.service_history_period_id = None;
+                self.service_history_cursor = None;
+            }
+            self.active_threads.clear();
+            self.service_history_error = None;
+            self.service_threads_pair = None;
+            self.service_threads_error = None;
+            self.thread_error = false;
+        }
+        self.email = None;
+        self.authenticated = current.authenticated;
+        self.plan_label = current.plan_label.clone().unwrap_or_default();
+        if self.authenticated {
+            self.auth_url = None;
+            self.auth_polling = false;
+        }
+        self.remaining_percent = current.quota.as_ref().map(|quota| quota.remaining_percent);
+        self.has_quota_percent = current.quota.is_some();
+        self.reset_at = current.quota.as_ref().map(|quota| quota.reset_at);
+        self.window_seconds = current
+            .quota
+            .as_ref()
+            .map_or(WEEK_SECONDS, |quota| quota.window_seconds);
+        self.monthly = current.quota.as_ref().is_some_and(|quota| quota.monthly);
+        self.limit_name = "Codex".into();
+        self.quota_title = if self.monthly {
+            "月間利用枠".into()
+        } else {
+            "残り利用枠".into()
+        };
+        self.has_usage = current.authenticated
+            && current.observed_at.is_some()
+            && matches!(current.state, PublicState::Ready | PublicState::Error);
+        self.local_usage_pending = false;
+        self.usage_snapshot_committed = self.has_usage;
+        self.last_success_at = current.observed_at;
+        self.model_usage = current
+            .models
+            .iter()
+            .map(|model| ModelUsageRow {
+                name: model.model.clone(),
+                tokens: model.total_tokens,
+                input_tokens: model.input_tokens,
+                cached_input_tokens: model.cached_input_tokens,
+                output_tokens: model.output_tokens,
+                cache_write_input_tokens: model.cache_write_input_tokens,
+            })
+            .collect();
+        self.estimated_cost_label = estimated_cost_label_from_v3(&current.models);
+        if self.selected_reset_at.is_none() {
+            self.selected_reset_at = self.reset_at;
+        }
+        self.checking = current.state == PublicState::Initializing;
+        self.account_error = (current.state == PublicState::Error)
+            .then(|| "常駐サービスが取得エラーを報告しました。".into());
+        self.error = self.account_error.clone();
+        self.status = match current.state {
+            PublicState::Initializing => "常駐サービスが利用状況を取得しています…",
+            PublicState::Ready => "利用状況を更新しました。",
+            PublicState::AuthRequired => "未認証です。認証を開始してください。",
+            PublicState::Error => "常駐サービスが利用状況を取得できませんでした。",
+        }
+        .into();
+        self.service_endpoint_error = None;
+        self.service_published_pair = Some(published_pair.clone());
+        self.service_v3_published_pair = Some(published_pair.clone());
+        self.service_current_snapshot = Some(current.clone());
+        self.service_current_active_thread_count = Some(current.active_thread_count);
+        self.service_current_pair = Some(published_pair);
+        self.service_split_capable = true;
+        Ok(pair_changed || previous_snapshot.as_ref() != Some(&current))
+    }
+
+    fn apply_service_history_resource(
+        &mut self,
+        published_pair: String,
+        periods: Vec<PublicHistoryPeriod>,
+        samples: Vec<PublicHistoryObservationV3>,
+        gaps: Vec<PublicHistoryGap>,
+        cursor: Option<String>,
+    ) -> Result<bool, String> {
+        if self.service_current_pair.as_deref() != Some(published_pair.as_str()) {
+            return Err("history resource generation differs from current".into());
+        }
+        let Some(mut validation) = self.service_current_snapshot.clone() else {
+            return Err("history resource has no current root".into());
+        };
+        validation.history_periods = periods.clone();
+        validation.history_samples = samples.clone();
+        validation.history_gaps = gaps.clone();
+        validation.threads.clear();
+        validation.validate().map_err(|error| error.to_string())?;
+        let next_samples = samples
+            .iter()
+            .filter_map(main_sample_from_public_observation_v3)
+            .collect::<Vec<_>>();
+        let next_observations = samples
+            .iter()
+            .map(store_observation_from_public_v3)
+            .collect::<Vec<_>>();
+        let changed = self.service_history_pair.as_deref() != Some(published_pair.as_str())
+            || self.service_history_periods != periods
+            || self.service_history_samples != samples
+            || self.history.samples != next_samples
+            || self.history.observations != next_observations
+            || self.history_gaps != gaps;
+        let selected_period = self
+            .selected_reset_at
+            .and_then(|selected| {
+                periods.iter().find(|period| {
+                    period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
+                })
+            })
+            .or_else(|| periods.iter().find(|period| period.current))
+            .or_else(|| periods.first());
+        self.service_history_period_id = selected_period.map(|period| period.id.clone());
+        self.selected_reset_at = selected_period.map(|period| period.reset_at);
+        self.selected_history_period = selected_period
+            .map(|period| period.label.clone())
+            .unwrap_or_else(|| self.i18n.text(TextKey::NoHistory).into());
+        self.service_history_periods = periods;
+        self.service_history_samples = samples;
+        self.service_history_pair = Some(published_pair);
+        self.service_history_cursor = cursor;
+        self.history.samples = next_samples;
+        self.history.observations = next_observations;
+        self.history_gaps = gaps;
+        self.service_history_error = None;
+        Ok(changed)
+    }
+
+    fn apply_service_threads_resource(
+        &mut self,
+        published_pair: String,
+        active_thread_count: Option<u64>,
+        threads: Vec<PublicThread>,
+    ) -> Result<bool, String> {
+        if self.service_current_pair.as_deref() != Some(published_pair.as_str()) {
+            return Err("threads resource generation differs from current".into());
+        }
+        let current_count = self
+            .service_current_active_thread_count
+            .ok_or_else(|| "threads resource has no current count".to_owned())?;
+        if active_thread_count.is_some_and(|count| count != threads.len() as u64)
+            || current_count != threads.len() as u64
+        {
+            return Err("threads count does not match current resource".into());
+        }
+        let Some(mut validation) = self.service_current_snapshot.clone() else {
+            return Err("threads resource has no current root".into());
+        };
+        validation.threads = threads.clone();
+        validation.validate().map_err(|error| error.to_string())?;
+        let next_threads = threads
+            .iter()
+            .map(|thread| ActiveThread {
+                id: thread.id.clone(),
+                created_at: thread.created_at,
+                updated_at: thread
+                    .last_user_message_at
+                    .or(thread.created_at)
+                    .or(validation.observed_at)
+                    .unwrap_or(1),
+                title: thread.title.clone(),
+                model: thread.model.clone(),
+                model_label: thread.model_label.clone(),
+                total_tokens: thread.total_tokens,
+                context_usage_tokens: thread.context_usage_tokens,
+                context_window_tokens: thread.context_window_tokens,
+                last_user_message_at: thread.last_user_message_at,
+                is_subagent: thread.is_subagent,
+                parent_thread_id: thread.parent_thread_id.clone(),
+                depth: thread.depth,
+            })
+            .collect::<Vec<_>>();
+        let changed = self.service_threads_pair.as_deref() != Some(published_pair.as_str())
+            || self.active_threads != next_threads
+            || self.thread_error;
+        self.active_threads = next_threads;
+        self.thread_error = false;
+        self.service_threads_pair = Some(published_pair);
+        self.service_threads_error = None;
+        self.refresh_partial_failure_status();
+        Ok(changed)
     }
 
     fn hold_service_endpoint_error(&mut self, error: String) {
@@ -11363,6 +11691,24 @@ impl CodexInfoState {
         self.pending_session_cleanup.clear();
         self.selected_reset_at = None;
         self.selected_history_period = "履歴なし".into();
+        self.service_current_snapshot = None;
+        self.service_current_active_thread_count = None;
+        self.service_current_pair = None;
+        self.service_current_last_poll = Instant::now();
+        self.service_current_force_poll = false;
+        self.service_split_capable = false;
+        self.service_history_periods.clear();
+        self.service_history_samples.clear();
+        self.service_history_pair = None;
+        self.service_history_period_id = None;
+        self.service_history_cursor = None;
+        self.service_history_last_poll = Instant::now();
+        self.service_history_force_poll = false;
+        self.service_history_error = None;
+        self.service_threads_pair = None;
+        self.service_threads_last_poll = Instant::now();
+        self.service_threads_force_poll = false;
+        self.service_threads_error = None;
     }
 
     fn current_account_admission(&self) -> Option<AccountAdmission> {
@@ -12074,17 +12420,19 @@ impl CodexInfoState {
         auth_epoch: u64,
         admission: AccountAdmission,
         update: ActiveThreadUpdate,
-    ) {
+    ) -> bool {
         if !self.authenticated
             || auth_epoch != self.auth_epoch
             || self.current_account_admission().as_ref() != Some(&admission)
         {
-            return;
+            return false;
         }
-        self.apply_admitted_thread_result(update);
+        self.apply_admitted_thread_result(update)
     }
 
-    fn apply_admitted_thread_result(&mut self, update: ActiveThreadUpdate) {
+    fn apply_admitted_thread_result(&mut self, update: ActiveThreadUpdate) -> bool {
+        let previous_threads = self.active_threads.clone();
+        let previous_thread_error = self.thread_error;
         let failed = self.apply_active_thread_update(update);
         self.thread_checking = false;
         self.thread_error = failed;
@@ -12094,6 +12442,7 @@ impl CodexInfoState {
             self.active_threads.len()
         ));
         self.refresh_partial_failure_status();
+        previous_threads != self.active_threads || previous_thread_error != self.thread_error
     }
 
     #[cfg(test)]
@@ -12101,7 +12450,7 @@ impl CodexInfoState {
         if !self.authenticated || auth_epoch != self.auth_epoch {
             return;
         }
-        self.apply_admitted_thread_result(update);
+        let _ = self.apply_admitted_thread_result(update);
     }
 
     fn apply_thread_error_for_admission(
@@ -12109,26 +12458,28 @@ impl CodexInfoState {
         auth_epoch: u64,
         admission: &AccountAdmission,
         message: String,
-    ) {
+    ) -> bool {
         if !self.authenticated
             || auth_epoch != self.auth_epoch
             || self.current_account_admission().as_ref() != Some(admission)
         {
-            return;
+            return false;
         }
+        let previous_thread_error = self.thread_error;
         self.thread_checking = false;
         // The worker could not establish a fresh live snapshot. Keep the
         // previous complete rows while exposing the existing error state.
         self.thread_error = true;
         let _ = message;
         self.refresh_partial_failure_status();
+        !previous_thread_error
     }
 
-    fn apply_thread_error(&mut self, auth_epoch: u64, message: String) {
+    fn apply_thread_error(&mut self, auth_epoch: u64, message: String) -> bool {
         let Some(admission) = self.current_account_admission() else {
-            return;
+            return false;
         };
-        self.apply_thread_error_for_admission(auth_epoch, &admission, message);
+        self.apply_thread_error_for_admission(auth_epoch, &admission, message)
     }
 
     fn refresh_partial_failure_status(&mut self) {
@@ -12239,7 +12590,6 @@ impl CodexInfoState {
         let mut thread_events = Vec::new();
         if let Some(bridge) = self.thread_bridge.as_ref() {
             while let Ok(event) = bridge.rx.try_recv() {
-                observed_event = true;
                 thread_events.push(event);
             }
         }
@@ -12251,13 +12601,17 @@ impl CodexInfoState {
                     admission,
                     update,
                 } => {
-                    self.apply_thread_result_for_admission(auth_epoch, admission, update);
+                    observed_event |=
+                        self.apply_thread_result_for_admission(auth_epoch, admission, update);
                 }
                 ThreadEvent::Error {
                     auth_epoch,
                     admission,
                     message,
-                } => self.apply_thread_error_for_admission(auth_epoch, &admission, message),
+                } => {
+                    observed_event |=
+                        self.apply_thread_error_for_admission(auth_epoch, &admission, message);
+                }
             }
         }
 
@@ -12328,6 +12682,22 @@ impl CodexInfoState {
     }
 
     fn history_periods_at(&self, observed_at: i64) -> Vec<HistoryPeriod> {
+        if !self.preview
+            && self.service_split_capable
+            && self.service_history_pair.is_some()
+            && self.service_history_pair.as_deref() == self.service_current_pair.as_deref()
+        {
+            return self
+                .service_history_periods
+                .iter()
+                .map(|period| HistoryPeriod {
+                    canonical_reset_at: period.reset_at,
+                    start: period.start_at,
+                    end: period.end_at,
+                    label: period.label.clone(),
+                })
+                .collect();
+        }
         let projected_history = self.projected_history();
         self.history_periods_for_history_at(&projected_history, observed_at)
     }
@@ -12439,6 +12809,9 @@ impl CodexInfoState {
         {
             self.selected_history_period = label.into();
             self.selected_reset_at = Some(period.canonical_reset_at);
+            if !self.preview {
+                self.service_history_force_poll = true;
+            }
         }
     }
 
@@ -12510,6 +12883,9 @@ impl CodexInfoState {
         } else {
             self.selected_history_period = "履歴なし".into();
             self.selected_reset_at = None;
+        }
+        if !self.preview {
+            self.service_history_force_poll = true;
         }
     }
 
@@ -12636,11 +13012,16 @@ impl CodexInfoState {
             .projected_history()
             .samples_for_reset(Some(selected_reset));
         let source_by_sample = canonical_model_sources(&self.history.observations, &samples);
+        // Legacy resources cannot name the acquisition source, but their
+        // complete numeric model vector is still an observed value, not an
+        // inferred one. Only an explicitly unavailable source marks a model
+        // minute as unobserved; confirmed gaps remain responsible for the
+        // dashed interval between observations.
         let mut untrusted_minutes = samples
             .iter()
             .filter(|sample| {
                 source_by_sample.get(&(sample.reset_at, sample.timestamp))
-                    != Some(&usage_store::ModelSource::Confirmed)
+                    == Some(&usage_store::ModelSource::Unavailable)
             })
             .map(|sample| sample.timestamp.div_euclid(60) * 60)
             .collect::<BTreeSet<_>>();
@@ -12648,7 +13029,7 @@ impl CodexInfoState {
             .iter()
             .filter(|sample| {
                 source_by_sample.get(&(sample.reset_at, sample.timestamp))
-                    == Some(&usage_store::ModelSource::Confirmed)
+                    != Some(&usage_store::ModelSource::Unavailable)
             })
             .map(|sample| sample.timestamp.div_euclid(60) * 60)
             .collect::<BTreeSet<_>>();
@@ -13838,14 +14219,15 @@ impl CodexInfoState {
         } else {
             0.0
         });
-        if !self.active_threads.is_empty() {
+        let active_thread_count = self
+            .service_current_active_thread_count
+            .unwrap_or(self.active_threads.len() as u64);
+        if active_thread_count > 0 {
             ui.set_has_active_thread(true);
-            ui.set_active_thread_count(
-                i32::try_from(self.active_threads.len()).unwrap_or(i32::MAX),
-            );
+            ui.set_active_thread_count(i32::try_from(active_thread_count).unwrap_or(i32::MAX));
             ui.set_active_thread_count_label(
                 self.i18n
-                    .format_thread_count(self.active_threads.len())
+                    .format_thread_count(usize::try_from(active_thread_count).unwrap_or(usize::MAX))
                     .into(),
             );
             let [sol, terra, luna, astra, other] =
@@ -14731,6 +15113,7 @@ struct ServiceDetailsHttpResponse {
     body: Vec<u8>,
 }
 
+#[cfg(test)]
 fn request_service_details(
     address: SocketAddr,
     route: &str,
@@ -15019,6 +15402,428 @@ where
         pair,
         details,
         from_v3: true,
+    })
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ServiceCurrentV3Document {
+    state: PublicState,
+    observed_at: Option<i64>,
+    authenticated: bool,
+    plan_label: Option<String>,
+    quota: Option<PublicQuota>,
+    models: Vec<PublicModelUsageV3>,
+    active_thread_count: u64,
+}
+
+fn parse_service_current_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, String> {
+    let mut document = decode_unique_json(bytes)?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "current document is not an object".to_owned())?;
+    let expected = BTreeSet::from([
+        "active_thread_count",
+        "api_version",
+        "authenticated",
+        "models",
+        "observed_at",
+        "plan_label",
+        "quota",
+        "state",
+    ]);
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err("current document fields differ from v3".into());
+    }
+    if object
+        .remove("api_version")
+        .as_ref()
+        .and_then(Value::as_str)
+        != Some("v3")
+    {
+        return Err("current document api_version is not v3".into());
+    }
+    let current: ServiceCurrentV3Document =
+        serde_json::from_value(document).map_err(|error| error.to_string())?;
+    let details = PublicDetailsV3 {
+        state: current.state,
+        observed_at: current.observed_at,
+        authenticated: current.authenticated,
+        plan_label: current.plan_label,
+        quota: current.quota,
+        models: current.models,
+        active_thread_count: current.active_thread_count,
+        history_periods: Vec::new(),
+        history_samples: Vec::new(),
+        history_gaps: Vec::new(),
+        threads: Vec::new(),
+    };
+    details.validate().map_err(|error| error.to_string())?;
+    if !details.authenticated
+        && (details.quota.is_some()
+            || !details.models.is_empty()
+            || details.active_thread_count != 0)
+    {
+        return Err("unauthenticated current contains visible account data".into());
+    }
+    if details.state == PublicState::Ready
+        && (!details.authenticated || details.observed_at.is_none())
+    {
+        return Err("ready current is incomplete".into());
+    }
+    Ok(details)
+}
+
+fn parse_service_history_periods_document(
+    bytes: &[u8],
+) -> Result<Vec<PublicHistoryPeriod>, String> {
+    let mut document = decode_unique_json(bytes)?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "history periods document is not an object".to_owned())?;
+    let expected = BTreeSet::from(["api_version", "history_periods"]);
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err("history periods document fields differ from v3".into());
+    }
+    if object
+        .remove("api_version")
+        .as_ref()
+        .and_then(Value::as_str)
+        != Some("v3")
+    {
+        return Err("history periods document api_version is not v3".into());
+    }
+    let periods: Vec<PublicHistoryPeriod> = serde_json::from_value(
+        object
+            .remove("history_periods")
+            .ok_or_else(|| "history periods document is missing periods".to_owned())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let observed_at = periods
+        .iter()
+        .map(|period| period.end_at)
+        .max()
+        .unwrap_or(1);
+    let validation = PublicDetails {
+        state: PublicState::Ready,
+        observed_at: Some(observed_at),
+        authenticated: true,
+        plan_label: None,
+        quota: None,
+        models: Vec::new(),
+        active_thread_count: 0,
+        history_periods: periods.clone(),
+        history_samples: Vec::new(),
+        history_gaps: Vec::new(),
+        threads: Vec::new(),
+        estimated_cost_label: "概算 —".into(),
+    };
+    validation.validate().map_err(|error| error.to_string())?;
+    Ok(periods)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ServiceHistoryPage {
+    next_cursor: Option<String>,
+    resume_cursor: Option<String>,
+    samples: Vec<PublicHistoryObservationV3>,
+    gaps: Vec<PublicHistoryGap>,
+}
+
+fn parse_service_history_page_document(bytes: &[u8]) -> Result<ServiceHistoryPage, String> {
+    let mut document = decode_unique_json(bytes)?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "history page document is not an object".to_owned())?;
+    if object
+        .remove("api_version")
+        .as_ref()
+        .and_then(Value::as_str)
+        != Some("v3")
+    {
+        return Err("history page document api_version is not v3".into());
+    }
+    let expected = BTreeSet::from([
+        "api_version",
+        "history_gaps",
+        "history_samples",
+        "next_cursor",
+        "resume_cursor",
+    ]);
+    // The route has one exact envelope. In particular, accepting a cursor or
+    // period alias here would make a response from another resource look like
+    // a valid selected-period page.
+    let actual = std::iter::once("api_version")
+        .chain(object.keys().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err("history page document fields differ from v3".into());
+    }
+    let next_cursor = object
+        .remove("next_cursor")
+        .and_then(|value| (!value.is_null()).then_some(value))
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| "history page next_cursor is invalid".to_owned())
+        })
+        .transpose()?;
+    let resume_cursor = object
+        .remove("resume_cursor")
+        .and_then(|value| (!value.is_null()).then_some(value))
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| "history page resume_cursor is invalid".to_owned())
+        })
+        .transpose()?;
+    let samples: Vec<PublicHistoryObservationV3> = serde_json::from_value(
+        object
+            .remove("history_samples")
+            .ok_or_else(|| "history page document is missing samples".to_owned())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let gaps: Vec<PublicHistoryGap> = serde_json::from_value(
+        object
+            .remove("history_gaps")
+            .ok_or_else(|| "history page document is missing gaps".to_owned())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if !samples.is_empty() && resume_cursor.is_none() {
+        return Err("history page samples are missing resume_cursor".into());
+    }
+    Ok(ServiceHistoryPage {
+        next_cursor,
+        resume_cursor,
+        samples,
+        gaps,
+    })
+}
+
+fn parse_service_threads_document(
+    bytes: &[u8],
+) -> Result<(Option<u64>, Vec<PublicThread>), String> {
+    let mut document = decode_unique_json(bytes)?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "threads document is not an object".to_owned())?;
+    let expected = BTreeSet::from(["api_version", "threads"]);
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err("threads document fields differ from v3".into());
+    }
+    if object
+        .remove("api_version")
+        .as_ref()
+        .and_then(Value::as_str)
+        != Some("v3")
+    {
+        return Err("threads document api_version is not v3".into());
+    }
+    let threads_value = object
+        .remove("threads")
+        .ok_or_else(|| "threads document is missing threads".to_owned())?;
+    let threads: Vec<PublicThread> =
+        serde_json::from_value(threads_value).map_err(|error| error.to_string())?;
+    validate_public_threads(&threads).map_err(|error| error.to_string())?;
+    let topology = threads
+        .iter()
+        .map(|thread| ThreadTopologyNode {
+            id: thread.id.as_str(),
+            parent_thread_id: thread.parent_thread_id.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    thread_contract::validate_selected_thread_topology(&topology)
+        .map_err(|_| "threads topology is invalid".to_owned())?;
+    Ok((None, threads))
+}
+
+#[derive(Debug, PartialEq)]
+enum ServiceCurrentV3Fetch {
+    Fresh {
+        pair: String,
+        current: PublicDetailsV3,
+    },
+    Legacy(ServiceDetailsV3Fetch),
+    NotModified {
+        pair: String,
+    },
+}
+
+fn fetch_service_current_v3_with_etag<F>(
+    mut request: F,
+    prior_pair: Option<&str>,
+) -> Result<ServiceCurrentV3Fetch, String>
+where
+    F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
+{
+    if let Some(pair) = prior_pair {
+        if !valid_published_pair(pair) {
+            return Err("invalid current generation header".into());
+        }
+    }
+    let response = request("/v3/current", prior_pair)?;
+    if response.status == 304 {
+        let pair = response_published_pair(&response)?;
+        if prior_pair != Some(pair.as_str()) || !response.body.is_empty() {
+            return Err("cacheless current 304 or generation mismatch".into());
+        }
+        return Ok(ServiceCurrentV3Fetch::NotModified { pair });
+    }
+    if response.status == 404 {
+        let legacy = fetch_service_details_v3_with_etag(
+            |route, conditional| request(route, conditional),
+            prior_pair,
+        )?;
+        return Ok(ServiceCurrentV3Fetch::Legacy(legacy));
+    }
+    if response.status != 200 {
+        return Err("current response is not HTTP 200".into());
+    }
+    let pair = response_published_pair(&response)?;
+    let current = parse_service_current_v3_document(&response.body)?;
+    Ok(ServiceCurrentV3Fetch::Fresh { pair, current })
+}
+
+#[derive(Debug, PartialEq)]
+enum ServiceResourceFetch<T> {
+    Fresh { pair: String, value: T },
+    NotModified { pair: String },
+}
+
+fn fetch_service_history_periods_with_etag<F>(
+    mut request: F,
+    prior_pair: Option<&str>,
+) -> Result<ServiceResourceFetch<Vec<PublicHistoryPeriod>>, String>
+where
+    F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
+{
+    if let Some(pair) = prior_pair {
+        if !valid_published_pair(pair) {
+            return Err("invalid history periods generation header".into());
+        }
+    }
+    let response = request("/v3/history/periods", prior_pair)?;
+    if response.status == 304 {
+        let pair = response_published_pair(&response)?;
+        if prior_pair != Some(pair.as_str()) || !response.body.is_empty() {
+            return Err("cacheless history periods 304 or generation mismatch".into());
+        }
+        return Ok(ServiceResourceFetch::NotModified { pair });
+    }
+    if response.status != 200 {
+        return Err("history periods response is not HTTP 200".into());
+    }
+    let pair = response_published_pair(&response)?;
+    let periods = parse_service_history_periods_document(&response.body)?;
+    Ok(ServiceResourceFetch::Fresh {
+        pair,
+        value: periods,
+    })
+}
+
+fn percent_encode_query_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(b"0123456789ABCDEF"[(byte >> 4) as usize]));
+            encoded.push(char::from(b"0123456789ABCDEF"[(byte & 0x0f) as usize]));
+        }
+    }
+    encoded
+}
+
+fn service_history_route(period_id: &str, cursor: Option<&str>) -> String {
+    let mut route = format!(
+        "/v3/history?period={}",
+        percent_encode_query_component(period_id)
+    );
+    if let Some(cursor) = cursor {
+        route.push_str("&cursor=");
+        route.push_str(&percent_encode_query_component(cursor));
+    }
+    route
+}
+
+fn fetch_service_history_page<F>(
+    mut request: F,
+    period_id: &str,
+    cursor: Option<&str>,
+    prior_pair: Option<&str>,
+) -> Result<ServiceResourceFetch<ServiceHistoryPage>, String>
+where
+    F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
+{
+    if let Some(pair) = prior_pair {
+        if !valid_published_pair(pair) {
+            return Err("invalid history page generation header".into());
+        }
+    }
+    let route = service_history_route(period_id, cursor);
+    let response = request(&route, prior_pair)?;
+    if response.status == 304 {
+        let pair = response_published_pair(&response)?;
+        if prior_pair != Some(pair.as_str()) || !response.body.is_empty() {
+            return Err("cacheless history page 304 or generation mismatch".into());
+        }
+        return Ok(ServiceResourceFetch::NotModified { pair });
+    }
+    if response.status != 200 {
+        let stale_cursor = decode_unique_json(&response.body)
+            .ok()
+            .and_then(|body| {
+                body.get("error")
+                    .and_then(Value::as_str)
+                    .map(|error| error == "stale_cursor")
+            })
+            .unwrap_or(false);
+        if response.status == 400 && stale_cursor {
+            return Err("stale_cursor".into());
+        }
+        return Err("history page response is not HTTP 200".into());
+    }
+    let pair = response_published_pair(&response)?;
+    let page = parse_service_history_page_document(&response.body)?;
+    Ok(ServiceResourceFetch::Fresh { pair, value: page })
+}
+
+fn fetch_service_threads_with_etag<F>(
+    mut request: F,
+    prior_pair: Option<&str>,
+) -> Result<ServiceResourceFetch<(Option<u64>, Vec<PublicThread>)>, String>
+where
+    F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
+{
+    if let Some(pair) = prior_pair {
+        if !valid_published_pair(pair) {
+            return Err("invalid threads generation header".into());
+        }
+    }
+    let response = request("/v3/threads", prior_pair)?;
+    if response.status == 304 {
+        let pair = response_published_pair(&response)?;
+        if prior_pair != Some(pair.as_str()) || !response.body.is_empty() {
+            return Err("cacheless threads 304 or generation mismatch".into());
+        }
+        return Ok(ServiceResourceFetch::NotModified { pair });
+    }
+    if response.status != 200 {
+        return Err("threads response is not HTTP 200".into());
+    }
+    let pair = response_published_pair(&response)?;
+    let threads = parse_service_threads_document(&response.body)?;
+    Ok(ServiceResourceFetch::Fresh {
+        pair,
+        value: threads,
     })
 }
 
@@ -15557,6 +16362,7 @@ where
     true
 }
 
+#[cfg(test)]
 fn poll_service_state_with_owner_check<F>(
     state: &mut CodexInfoState,
     service_endpoint: SocketAddr,
@@ -15622,14 +16428,377 @@ fn poll_service_state_with_owner_check<F>(
     }
 }
 
+#[cfg(test)]
 fn poll_service_state(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
     poll_service_state_with_owner_check(state, service_endpoint, |address| {
         healthy_combined_service_owner(address).is_some()
     });
 }
 
-fn run_ui_service_timer_cycle(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
-    poll_service_state(state, service_endpoint);
+const SERVICE_CURRENT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const SERVICE_HISTORY_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const SERVICE_THREADS_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+fn service_poll_due(last_poll: Instant, force: bool, interval: Duration, now: Instant) -> bool {
+    force || (now >= last_poll && now.duration_since(last_poll) >= interval)
+}
+
+fn merge_service_history_samples(
+    mut base: Vec<PublicHistoryObservationV3>,
+    incoming: Vec<PublicHistoryObservationV3>,
+    append_prefix: bool,
+) -> Result<Vec<PublicHistoryObservationV3>, String> {
+    let mut rows = BTreeMap::new();
+    for sample in base.drain(..) {
+        let key = (sample.reset_at, sample.timestamp);
+        if rows.insert(key, sample).is_some() {
+            return Err("duplicate last-good history sample".into());
+        }
+    }
+    let prefix_end = rows.keys().next_back().copied();
+    for sample in incoming {
+        let key = (sample.reset_at, sample.timestamp);
+        if let Some(previous) = rows.get(&key) {
+            if previous != &sample {
+                return Err("stale_cursor".into());
+            }
+            continue;
+        }
+        if append_prefix && prefix_end.is_some_and(|end| key <= end) {
+            return Err("stale_cursor".into());
+        }
+        if rows.len() >= codex_info::server::MAX_PUBLIC_HISTORY_SAMPLES {
+            return Err("history resource exceeds the public safety bound".into());
+        }
+        rows.insert(key, sample);
+    }
+    Ok(rows.into_values().collect())
+}
+
+fn poll_service_current_resources(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
+    let now = Instant::now();
+    if !service_poll_due(
+        state.service_current_last_poll,
+        state.service_current_force_poll,
+        SERVICE_CURRENT_POLL_INTERVAL,
+        now,
+    ) {
+        return;
+    }
+    state.service_current_last_poll = now;
+    state.service_current_force_poll = false;
+    let previous_pair = state
+        .service_current_pair
+        .as_deref()
+        .or(state.service_published_pair.as_deref());
+    let fetched = fetch_service_current_v3_with_etag(
+        |route, if_none_match| {
+            request_service_details_with_etag(service_endpoint, route, if_none_match)
+        },
+        previous_pair,
+    );
+    let result = fetched.and_then(|result| match result {
+        ServiceCurrentV3Fetch::Fresh { pair, current } => {
+            state.apply_service_current_v3(pair, current)
+        }
+        ServiceCurrentV3Fetch::Legacy(legacy) => match legacy {
+            ServiceDetailsV3Fetch::Fresh {
+                pair,
+                details,
+                from_v3,
+            } => {
+                if !from_v3 {
+                    state.service_v3_published_pair = None;
+                }
+                state.apply_service_details_v3(pair, details)
+            }
+            ServiceDetailsV3Fetch::NotModified { pair } => {
+                if state.service_v3_published_pair.as_deref() != Some(pair.as_str())
+                    || state.service_current_pair.as_deref() != Some(pair.as_str())
+                {
+                    return Err("not-modified legacy response does not match last root".into());
+                }
+                Ok(false)
+            }
+        },
+        ServiceCurrentV3Fetch::NotModified { pair } => {
+            if state.service_current_pair.as_deref() != Some(pair.as_str()) {
+                return Err("not-modified current response does not match last root".into());
+            }
+            state.checking = state
+                .service_current_snapshot
+                .as_ref()
+                .is_some_and(|current| current.state == PublicState::Initializing);
+            Ok(false)
+        }
+    });
+    match result {
+        Ok(_) => {
+            state.service_endpoint_error = None;
+            state.last_poll = now;
+        }
+        Err(error) => {
+            debug_runtime(format!("service current read failed: {error}"));
+            state.hold_service_endpoint_error(error);
+        }
+    }
+}
+
+fn poll_service_graph_resources(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
+    let now = Instant::now();
+    if !service_poll_due(
+        state.service_history_last_poll,
+        state.service_history_force_poll,
+        SERVICE_HISTORY_POLL_INTERVAL,
+        now,
+    ) || !state.service_split_capable
+    {
+        return;
+    }
+    let Some(current_pair) = state.service_current_pair.clone() else {
+        return;
+    };
+    let force = state.service_history_force_poll;
+    state.service_history_last_poll = now;
+    let previous_pair = state.service_history_pair.clone();
+    let previous_period_id = state.service_history_period_id.clone();
+    let previous_cursor = state.service_history_cursor.clone();
+    let mut periods = state.service_history_periods.clone();
+    let refresh_periods =
+        force || periods.is_empty() || previous_pair.as_deref() != Some(current_pair.as_str());
+
+    let result = (|| {
+        if refresh_periods {
+            match fetch_service_history_periods_with_etag(
+                |route, if_none_match| {
+                    request_service_details_with_etag(service_endpoint, route, if_none_match)
+                },
+                previous_pair.as_deref(),
+            )? {
+                ServiceResourceFetch::Fresh { pair, value } => {
+                    if pair != current_pair {
+                        return Err("history periods generation differs from current".into());
+                    }
+                    periods = value;
+                }
+                ServiceResourceFetch::NotModified { pair } => {
+                    if pair != current_pair {
+                        return Err(
+                            "not-modified history periods generation differs from current".into(),
+                        );
+                    }
+                }
+            }
+        }
+        let selected_period = state
+            .selected_reset_at
+            .and_then(|selected| {
+                periods.iter().find(|period| {
+                    period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
+                })
+            })
+            .or_else(|| periods.iter().find(|period| period.current))
+            .or_else(|| periods.first())
+            .map(|period| (period.id.clone(), period.reset_at));
+        let Some((period_id, _)) = selected_period else {
+            state.apply_service_history_resource(
+                current_pair.clone(),
+                periods,
+                Vec::new(),
+                Vec::new(),
+                None,
+            )?;
+            return Ok::<(), String>(());
+        };
+
+        let full_refresh = force
+            || previous_pair.is_none()
+            || previous_period_id.as_deref() != Some(period_id.as_str())
+            || (previous_pair.as_deref() == Some(current_pair.as_str())
+                && previous_cursor.is_none());
+        let append_prefix = !full_refresh && previous_pair.is_some();
+        let mut samples = if full_refresh {
+            Vec::new()
+        } else {
+            state.service_history_samples.clone()
+        };
+        let mut gaps = if full_refresh {
+            Vec::new()
+        } else {
+            state.history_gaps.clone()
+        };
+        let mut request_cursor = if full_refresh { None } else { previous_cursor };
+        let mut first_page = true;
+        let mut seen_cursors = BTreeSet::new();
+        let mut page_count = 0usize;
+        let terminal_cursor = loop {
+            page_count = page_count.saturating_add(1);
+            if page_count > codex_info::server::MAX_PUBLIC_HISTORY_SAMPLES.saturating_add(1) {
+                return Err("history resource exceeds the public safety bound".into());
+            }
+            if let Some(cursor) = request_cursor.as_deref() {
+                if !seen_cursors.insert(cursor.to_owned()) {
+                    return Err("history cursor repeated".into());
+                }
+            }
+            let conditional_pair = if first_page && !full_refresh {
+                previous_pair.as_deref()
+            } else {
+                None
+            };
+            let page = fetch_service_history_page(
+                |route, if_none_match| {
+                    request_service_details_with_etag(service_endpoint, route, if_none_match)
+                },
+                &period_id,
+                request_cursor.as_deref(),
+                conditional_pair,
+            )?;
+            match page {
+                ServiceResourceFetch::NotModified { pair } => {
+                    if full_refresh || pair != current_pair {
+                        return Err(
+                            "not-modified history page cannot replace current resource".into()
+                        );
+                    }
+                    break state.service_history_cursor.clone();
+                }
+                ServiceResourceFetch::Fresh { pair, value } => {
+                    if pair != current_pair {
+                        return Err("history page generation differs from current".into());
+                    }
+                    if !full_refresh && !value.gaps.is_empty() {
+                        // Cursor continuity is valid only while the selected
+                        // period's complete gap set is unchanged. A page that
+                        // carries gaps during a delta is therefore a stale
+                        // cursor signal; the next owner cycle will restart at
+                        // the period head.
+                        return Err("stale_cursor".into());
+                    }
+                    samples = merge_service_history_samples(samples, value.samples, append_prefix)?;
+                    if full_refresh {
+                        if first_page {
+                            gaps = value.gaps;
+                        } else if !value.gaps.is_empty() {
+                            return Err("history page repeated the period gap set".into());
+                        }
+                    }
+                    if let Some(next) = value.next_cursor {
+                        if request_cursor.as_deref() == Some(next.as_str()) {
+                            return Err("history page cursor did not advance".into());
+                        }
+                        request_cursor = Some(next);
+                        first_page = false;
+                        continue;
+                    }
+                    break value.resume_cursor.or_else(|| {
+                        if full_refresh {
+                            None
+                        } else {
+                            state.service_history_cursor.clone()
+                        }
+                    });
+                }
+            }
+        };
+        state.apply_service_history_resource(
+            current_pair,
+            periods,
+            samples,
+            gaps,
+            terminal_cursor,
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            state.service_history_force_poll = false;
+            state.service_history_error = None;
+        }
+        Err(error) => {
+            state.service_history_force_poll = false;
+            if error == "stale_cursor" && !force {
+                // The cursor is bound to the last-good prefix. Start from the
+                // selected period on the next owner tick, keeping the old
+                // graph visible until that complete replacement succeeds.
+                state.service_history_cursor = None;
+                state.service_history_force_poll = true;
+            }
+            state.service_history_error = Some(error);
+        }
+    }
+}
+
+fn poll_service_threads_resources(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
+    let now = Instant::now();
+    if !service_poll_due(
+        state.service_threads_last_poll,
+        state.service_threads_force_poll,
+        SERVICE_THREADS_POLL_INTERVAL,
+        now,
+    ) || !state.service_split_capable
+    {
+        return;
+    }
+    let Some(current_pair) = state.service_current_pair.clone() else {
+        return;
+    };
+    state.service_threads_last_poll = now;
+    state.service_threads_force_poll = false;
+    let previous_pair = state
+        .service_threads_pair
+        .clone()
+        .filter(|pair| pair == &current_pair);
+    let result = fetch_service_threads_with_etag(
+        |route, if_none_match| {
+            request_service_details_with_etag(service_endpoint, route, if_none_match)
+        },
+        previous_pair.as_deref(),
+    )
+    .and_then(|result| match result {
+        ServiceResourceFetch::Fresh { pair, value } => {
+            if pair != current_pair {
+                return Err("threads generation differs from current".into());
+            }
+            state.apply_service_threads_resource(pair, value.0, value.1)
+        }
+        ServiceResourceFetch::NotModified { pair } => {
+            if previous_pair.as_deref() != Some(pair.as_str()) {
+                return Err("not-modified threads response does not match last root".into());
+            }
+            Ok(false)
+        }
+    });
+    if let Err(error) = result {
+        state.service_threads_error = Some(error);
+        state.thread_error = true;
+        state.refresh_partial_failure_status();
+    }
+}
+
+fn run_ui_service_timer_cycle_with_windows(
+    state: &mut CodexInfoState,
+    service_endpoint: SocketAddr,
+    graph_open: bool,
+    threads_open: bool,
+) {
+    state.poll_auth_control();
+    if healthy_combined_service_owner(service_endpoint).is_none() {
+        debug_runtime("service owner validation failed");
+        let error = state
+            .service_endpoint_error
+            .clone()
+            .unwrap_or_else(|| cli_error(CliTextKey::ServiceStateUnavailable));
+        state.hold_service_endpoint_error(error);
+        return;
+    }
+    poll_service_current_resources(state, service_endpoint);
+    if graph_open {
+        poll_service_graph_resources(state, service_endpoint);
+    }
+    if threads_open {
+        poll_service_threads_resources(state, service_endpoint);
+    }
 }
 
 async fn service_shutdown_signal() {
@@ -15755,6 +16924,12 @@ struct ResidentPublicationState {
     last_complete: Option<PublicDetails>,
     last_complete_v2: Option<PublicDetailsV2>,
     last_complete_v3: Option<PublicDetailsV3>,
+    /// The exact last serialized candidate, including an error marker. This
+    /// prevents a periodic owner refresh from allocating and publishing an
+    /// identical v1/v2/v3 root after a no-op worker event.
+    last_published: Option<PublicDetails>,
+    last_published_v2: Option<PublicDetailsV2>,
+    last_published_v3: Option<PublicDetailsV3>,
 }
 
 #[cfg(test)]
@@ -15869,6 +17044,9 @@ where
         publication.last_complete = None;
         publication.last_complete_v2 = None;
         publication.last_complete_v3 = None;
+        publication.last_published = None;
+        publication.last_published_v2 = None;
+        publication.last_published_v3 = None;
     }
     let scheduled_change = state.schedule_resident_refresh(Instant::now());
     let store_error = if recorder_attempt {
@@ -15953,12 +17131,25 @@ where
             candidate_v3.plan_label = candidate.plan_label.clone();
         }
     }
+    if publication.last_published.as_ref() == Some(&candidate)
+        && publication.last_published_v2.as_ref() == Some(&candidate_v2)
+        && publication.last_published_v3.as_ref() == Some(&candidate_v3)
+    {
+        return if let Some(error) = store_error {
+            Err(ResidentServiceCycleError::Store(error))
+        } else {
+            Ok(ResidentServiceCycleOutcome::Unchanged)
+        };
+    }
     publish(
         candidate.clone(),
         candidate_v2.clone(),
         candidate_v3.clone(),
     )
     .map_err(ResidentServiceCycleError::Publish)?;
+    publication.last_published = Some(candidate.clone());
+    publication.last_published_v2 = Some(candidate_v2.clone());
+    publication.last_published_v3 = Some(candidate_v3.clone());
     if candidate.state == PublicState::Ready {
         publication.last_complete = Some(candidate);
         publication.last_complete_v2 = Some(candidate_v2);
@@ -15989,12 +17180,20 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
         .map_err(|_| std::io::Error::other(cli_error(CliTextKey::ServiceStartFailed)))?;
     let publisher = api_server.publisher();
     let mut state = CodexInfoState::new();
+    let initial_candidate = state.public_details_candidate()?;
+    let initial_candidate_v2 = state.public_details_v2_candidate()?;
+    let initial_candidate_v3 = state.public_details_v3_candidate()?;
     publisher.publish_details_v3(
-        state.public_details_candidate()?,
-        state.public_details_v2_candidate()?,
-        state.public_details_v3_candidate()?,
+        initial_candidate.clone(),
+        initial_candidate_v2.clone(),
+        initial_candidate_v3.clone(),
     )?;
-    let mut publication = ResidentPublicationState::default();
+    let mut publication = ResidentPublicationState {
+        last_published: Some(initial_candidate),
+        last_published_v2: Some(initial_candidate_v2),
+        last_published_v3: Some(initial_candidate_v3),
+        ..ResidentPublicationState::default()
+    };
     let mut last_recorder_error = None;
     let mut last_publish_error = None;
     let mut active_recorder_partition: Option<String> = None;
@@ -16012,7 +17211,6 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let publication_interval = daemon::daemon_interval_from_environment();
-        let mut next_publication_refresh = Instant::now() + publication_interval;
         let shutdown = service_shutdown_signal();
         tokio::pin!(shutdown);
         let mut recorder_retry_at: Option<Instant> = None;
@@ -16032,12 +17230,11 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                     let recorder_attempt = recorder_attempt_due(now, recorder_retry_at)
                         && (recorder_work_pending
                             || desired_partition_id != active_recorder_partition.as_deref());
-                    let force_publication = now >= next_publication_refresh;
                     let result = resident_service_cycle_with_publication_policy_v3(
                         &mut state,
                         &mut publication,
                         recorder_attempt,
-                        force_publication,
+                        false,
                         |state, pending| {
                             let batch_is_empty = pending.is_empty();
                             let PendingRecorderBatch {
@@ -16256,9 +17453,6 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                     }
                     match result {
                         Ok(outcome) => {
-                            if outcome == ResidentServiceCycleOutcome::Published {
-                                next_publication_refresh = Instant::now() + publication_interval;
-                            }
                             if outcome == ResidentServiceCycleOutcome::Published
                                 && last_publish_error.take().is_some()
                             {
@@ -16266,7 +17460,6 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                             }
                         }
                         Err(ResidentServiceCycleError::Store(error)) => {
-                            next_publication_refresh = Instant::now() + publication_interval;
                             if last_recorder_error.as_deref() != Some(error.as_str()) {
                                 eprintln!("codex-info: recorder state commit rejected: {error}");
                                 last_recorder_error = Some(error.clone());
@@ -16279,13 +17472,11 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                             // recorder.probe() on the one-second owner loop.
                         }
                         Err(ResidentServiceCycleError::Candidate(error)) => {
-                            next_publication_refresh = Instant::now() + publication_interval;
                             eprintln!(
                                 "codex-info: REST snapshot canonicalization rejected: {error}"
                             );
                         }
                         Err(ResidentServiceCycleError::Publish(error)) => {
-                            next_publication_refresh = Instant::now() + publication_interval;
                             if last_publish_error != Some(error) {
                                 eprintln!("codex-info: REST snapshot publication rejected: {error}");
                                 last_publish_error = Some(error);
@@ -16594,6 +17785,7 @@ fn run_ui(
         let threads_window = Rc::clone(&threads_window);
         let x11_monitor = Rc::clone(&x11_monitor);
         ui.on_open_threads(move || {
+            state.borrow_mut().service_threads_force_poll = true;
             let mut threads_window = threads_window.borrow_mut();
             if threads_window.is_none() {
                 if let Ok(window) = ThreadsWindow::new() {
@@ -16808,9 +18000,22 @@ fn run_ui(
     if !state.borrow().preview {
         timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
             if let Some(ui) = weak_ui.upgrade() {
+                let graph_open = graph_window_for_timer
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|graph| graph.window().is_visible());
+                let threads_open = threads_window_for_timer
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|window| window.window().is_visible());
                 let mut state = state.borrow_mut();
                 if !service_retry_for_timer.load(Ordering::Acquire) {
-                    run_ui_service_timer_cycle(&mut state, service_config.listen_addr());
+                    run_ui_service_timer_cycle_with_windows(
+                        &mut state,
+                        service_config.listen_addr(),
+                        graph_open,
+                        threads_open,
+                    );
                 }
                 state.sync_ui(&ui);
                 if let Some(graph) = graph_window_for_timer.borrow().as_ref() {
@@ -17427,11 +18632,16 @@ mod tests {
     fn service_endpoint_distinguishes_an_occupied_unknown_listener_from_an_absent_one() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request);
+        });
         assert_eq!(
             service_endpoint_state(address),
             ServiceEndpointState::Unrecognized
         );
-        drop(listener);
+        worker.join().unwrap();
         assert_eq!(
             service_endpoint_state(address),
             ServiceEndpointState::Absent
@@ -17754,6 +18964,7 @@ mod tests {
             last_complete: Some(last_complete.clone()),
             last_complete_v2: Some(PublicDetailsV2::from(last_complete.clone())),
             last_complete_v3: Some(state.public_details_v3_candidate().unwrap()),
+            ..super::ResidentPublicationState::default()
         };
 
         // Mutate every independently collected part to values that must not
@@ -17873,9 +19084,9 @@ mod tests {
             |v1, v2, v3| publisher.publish_details_v3(v1, v2, v3),
         )
         .unwrap();
-        assert_eq!(scheduled, super::ResidentServiceCycleOutcome::Published);
+        assert_eq!(scheduled, super::ResidentServiceCycleOutcome::Unchanged);
         let scheduled_pair = publisher.published_pair();
-        assert_ne!(scheduled_pair, stable_pair);
+        assert_eq!(scheduled_pair, stable_pair);
 
         event_tx
             .send(super::Event::Error("external transport unavailable".into()))
@@ -17896,6 +19107,126 @@ mod tests {
         assert_ne!(publisher.published_pair(), scheduled_pair);
 
         server.shutdown();
+    }
+
+    #[test]
+    fn identical_thread_result_does_not_publish_a_new_root() {
+        let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
+        state.last_poll = Instant::now();
+        state.last_local_poll = Instant::now();
+        state.last_thread_poll = Instant::now();
+        let (thread_command_tx, _thread_command_rx) = std::sync::mpsc::channel();
+        let (thread_event_tx, thread_event_rx) = std::sync::mpsc::channel();
+        state.thread_bridge = Some(super::AppServerBridge {
+            tx: thread_command_tx,
+            rx: thread_event_rx,
+        });
+        let admission = state
+            .current_account_admission()
+            .expect("preview thread result has an account admission");
+        thread_event_tx
+            .send(super::ThreadEvent::Update {
+                auth_epoch: state.auth_epoch,
+                admission,
+                update: ActiveThreadUpdate::Snapshot(state.active_threads.clone()),
+            })
+            .unwrap();
+
+        let mut publication = super::ResidentPublicationState {
+            last_published: Some(state.public_details_candidate().unwrap()),
+            last_published_v2: Some(state.public_details_v2_candidate().unwrap()),
+            last_published_v3: Some(state.public_details_v3_candidate().unwrap()),
+            ..super::ResidentPublicationState::default()
+        };
+        let before = (
+            publication.last_published.clone(),
+            publication.last_published_v2.clone(),
+            publication.last_published_v3.clone(),
+        );
+        let outcome = super::resident_service_cycle_with_publication_policy_v3(
+            &mut state,
+            &mut publication,
+            false,
+            false,
+            |_, _| Ok(()),
+            |_, _, _| panic!("an identical thread result must not publish"),
+        )
+        .unwrap();
+        assert_eq!(outcome, super::ResidentServiceCycleOutcome::Unchanged);
+        assert_eq!(
+            (
+                publication.last_published,
+                publication.last_published_v2,
+                publication.last_published_v3,
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn split_history_page_is_exact_and_requires_resume_cursor_for_rows() {
+        let valid = serde_json::json!({
+            "api_version": "v3",
+            "history_samples": [],
+            "history_gaps": [],
+            "next_cursor": null,
+            "resume_cursor": "opaque"
+        });
+        let page = super::parse_service_history_page_document(&serde_json::to_vec(&valid).unwrap())
+            .expect("exact empty history page");
+        assert_eq!(page.resume_cursor.as_deref(), Some("opaque"));
+
+        let invalid = serde_json::json!({
+            "api_version": "v3",
+            "history_samples": [],
+            "history_gaps": [],
+            "next_cursor": null,
+            "resume_cursor": null,
+            "period": "legacy-alias"
+        });
+        assert!(
+            super::parse_service_history_page_document(&serde_json::to_vec(&invalid).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn split_history_apply_is_atomic_at_the_current_pair_boundary() {
+        let source = CodexInfoState::preview("normal");
+        let mut current = source.public_details_v3_candidate().unwrap();
+        let periods = current.history_periods.clone();
+        let samples = current.history_samples.clone();
+        let gaps = current.history_gaps.clone();
+        current.history_periods.clear();
+        current.history_samples.clear();
+        current.history_gaps.clear();
+        current.threads.clear();
+        let pair = format!("v1:{:032x}{:032x}", 1_u128, 1_u128);
+        let wrong_pair = format!("v1:{:032x}{:032x}", 1_u128, 2_u128);
+        let mut client = CodexInfoState::service_client();
+        client
+            .apply_service_current_v3(pair.clone(), current)
+            .expect("current root is valid");
+
+        assert!(client
+            .apply_service_history_resource(
+                wrong_pair,
+                periods.clone(),
+                samples.clone(),
+                gaps.clone(),
+                None
+            )
+            .is_err());
+        assert!(client.service_history_periods.is_empty());
+        assert!(client.service_history_samples.is_empty());
+        assert!(client.history.samples.is_empty());
+
+        client
+            .apply_service_history_resource(pair, periods, samples, gaps, Some("resume".into()))
+            .expect("same-pair history root is valid");
+        assert!(!client.service_history_periods.is_empty());
+        assert!(!client.service_history_samples.is_empty());
     }
 
     #[test]
@@ -19897,13 +21228,10 @@ mod tests {
             &mut publication,
             false,
             |_, _| panic!("store retry must be interval-gated"),
-            |details| {
-                details.validate().unwrap();
-                Ok(())
-            },
+            |_| panic!("an interval-gated retry must not republish an identical root"),
         )
         .unwrap();
-        assert_eq!(skipped, super::ResidentServiceCycleOutcome::Published);
+        assert_eq!(skipped, super::ResidentServiceCycleOutcome::Unchanged);
         assert_eq!(attempts.get(), 1);
         assert!(state.has_pending_recorder_batch());
 
@@ -27186,6 +28514,104 @@ mod tests {
     }
 
     #[test]
+    fn linux_current_uses_exact_404_legacy_fallback_chain() {
+        let pair = format!("v1:{:032x}{:032x}", 1_u128, 2_u128);
+        let mut v1_document =
+            serde_json::to_value(CodexInfoState::preview("normal").public_details()).unwrap();
+        v1_document
+            .as_object_mut()
+            .unwrap()
+            .insert("api_version".into(), Value::String("v1".into()));
+        let v1_body = serde_json::to_vec(&v1_document).unwrap();
+        let mut requests = Vec::new();
+        let fallback = super::fetch_service_current_v3_with_etag(
+            |route, conditional| {
+                requests.push((route.to_owned(), conditional.map(str::to_owned)));
+                Ok(match route {
+                    "/v3/current" | "/v3/details" | "/v2/details" => {
+                        super::ServiceDetailsHttpResponse {
+                            status: 404,
+                            pair: None,
+                            body: b"{}".to_vec(),
+                        }
+                    }
+                    "/v1/details" => super::ServiceDetailsHttpResponse {
+                        status: 200,
+                        pair: Some(pair.clone()),
+                        body: v1_body.clone(),
+                    },
+                    _ => unreachable!(),
+                })
+            },
+            Some("v1:0000000000000000000000000000000100000000000000000000000000000001"),
+        )
+        .unwrap();
+        assert!(matches!(
+            fallback,
+            super::ServiceCurrentV3Fetch::Legacy(super::ServiceDetailsV3Fetch::Fresh {
+                from_v3: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            requests,
+            [
+                (
+                    "/v3/current".into(),
+                    Some(
+                        "v1:0000000000000000000000000000000100000000000000000000000000000001"
+                            .into()
+                    )
+                ),
+                (
+                    "/v3/details".into(),
+                    Some(
+                        "v1:0000000000000000000000000000000100000000000000000000000000000001"
+                            .into()
+                    )
+                ),
+                ("/v2/details".into(), None),
+                ("/v1/details".into(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn ui_resource_poll_windows_have_finite_due_states() {
+        let now = Instant::now();
+        assert!(super::service_poll_due(
+            now,
+            true,
+            super::SERVICE_CURRENT_POLL_INTERVAL,
+            now
+        ));
+        assert!(!super::service_poll_due(
+            now,
+            false,
+            super::SERVICE_CURRENT_POLL_INTERVAL,
+            now
+        ));
+        assert!(super::service_poll_due(
+            now,
+            false,
+            super::SERVICE_CURRENT_POLL_INTERVAL,
+            now + super::SERVICE_CURRENT_POLL_INTERVAL
+        ));
+        assert!(!super::service_poll_due(
+            now,
+            false,
+            super::SERVICE_HISTORY_POLL_INTERVAL,
+            now + Duration::from_secs(59)
+        ));
+        assert!(super::service_poll_due(
+            now,
+            false,
+            super::SERVICE_THREADS_POLL_INTERVAL,
+            now + Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
     fn weekly_reset_rollover_projects_one_current_cycle_without_mixing() {
         let fixture: WeeklyRolloverFixture = serde_json::from_str(include_str!(
             "../tests/fixtures/graph_weekly_reset_rollover.json"
@@ -27237,7 +28663,7 @@ mod tests {
         assert!(ui_root
             .apply_service_details(wire_pair_a.clone(), wire_a)
             .unwrap());
-        ui_root.select_latest_history();
+        ui_root.select_latest_history_at(oracle_a.observed_at.unwrap());
         assert_eq!(ui_root.remaining_percent, Some(100.0));
         assert_eq!(ui_root.estimated_cost_label, "概算 $1");
         assert_eq!(ui_root.active_threads[0].id, "thread-a");
@@ -27308,7 +28734,7 @@ mod tests {
         let (wire_pair_b, wire_b) = fetch_service_details(server.local_addr()).unwrap();
         assert_ne!(wire_pair_b, wire_pair_a);
         assert!(ui_root.apply_service_details(wire_pair_b, wire_b).unwrap());
-        ui_root.select_latest_history();
+        ui_root.select_latest_history_at(oracle_b.observed_at.unwrap());
         assert_eq!(ui_root.remaining_percent, Some(41.0));
         assert_eq!(ui_root.estimated_cost_label, "概算 $323.674247");
         assert_eq!(ui_root.active_threads[0].id, "thread-b");
