@@ -1013,8 +1013,16 @@ flock --exclusive --nonblock "$held_fd"
 if run_update "$fake_home" >/dev/null 2>&1; then
     fail 'concurrent L1 operation unexpectedly succeeded'
 fi
+timer_defer_output="$TEST_ROOT/timer-defer.out"
+if ! HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+    CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+    bash "$fake_home/.local/libexec/codex-info-install.sh" --timer-update >"$timer_defer_output"; then
+    fail 'concurrent timer update was not deferred successfully'
+fi
+grep -Fq 'update deferred: another install, update, or control operation is running' "$timer_defer_output" ||
+    fail 'concurrent timer update did not report its deferred state'
 exec {held_fd}>&-
-printf 'case concurrent-L1 rejection: PASS\n'
+printf 'case concurrent-L1 rejection/timer deferral: PASS\n'
 
 # Disabling autostart removes only the stable enable links. The published unit
 # entrypoints remain available so a later --start can recover without a

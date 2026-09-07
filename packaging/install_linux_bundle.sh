@@ -255,6 +255,12 @@ initialize_mutating_action() {
             # the live publication owner; it must never wait on or steal L1.
             lock_bypassed=1
             exec 9<&-
+        elif [[ "$ACTION" == timer-update ]]; then
+            # A persistent timer may become due while a manual publication owns
+            # L1. The publication is authoritative; defer this redundant tick
+            # without turning normal lock contention into a failed unit.
+            printf 'update deferred: another install, update, or control operation is running\n'
+            exit 0
         else
             die 'another install, update, or control operation is already running'
         fi
