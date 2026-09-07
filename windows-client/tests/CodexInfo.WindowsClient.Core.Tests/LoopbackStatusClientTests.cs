@@ -82,6 +82,230 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
+    public async Task CurrentUsesTheSplitRouteWithoutRequestingHistoryOrThreads()
+    {
+        var paths = new List<string>();
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            paths.Add(request.RequestUri!.AbsolutePath);
+            return JsonResponse(ValidCurrentJson(), includePublishedPair: true);
+        }));
+
+        var result = await client.FetchCurrentAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(["/v3/current"], paths);
+        Assert.Equal("ASTRA", result.Snapshot!.Models.Single().Name);
+        Assert.Equal(1UL, result.Snapshot.ActiveThreadCount);
+    }
+
+    [Fact]
+    public async Task CurrentFallsBackToLegacyDetailsOnlyAfterAnExact404()
+    {
+        var paths = new List<string>();
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            paths.Add(request.RequestUri!.AbsolutePath);
+            return request.RequestUri.AbsolutePath switch
+            {
+                "/v3/current" or "/v3/details" or "/v2/details" => NotFoundResponse(),
+                "/v1/details" => JsonResponse(ValidDetailsJson(), includePublishedPair: true),
+                _ => throw new InvalidOperationException("unexpected route"),
+            };
+        }));
+
+        var result = await client.FetchCurrentAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(["/v3/current", "/v3/details", "/v2/details", "/v1/details"], paths);
+        Assert.Equal("v1", result.Snapshot!.ApiVersion);
+    }
+
+    [Fact]
+    public async Task LegacyModeReusesTheLatestDetailsRootForGraphAndThreadsWithoutSplitRequests()
+    {
+        var paths = new List<string>();
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            paths.Add(request.RequestUri!.AbsolutePath);
+            return request.RequestUri.AbsolutePath switch
+            {
+                "/v3/current" or "/v3/details" or "/v2/details" => NotFoundResponse(),
+                "/v1/details" => JsonResponse(ValidDetailsJson(), includePublishedPair: true),
+                _ => throw new InvalidOperationException("split route requested in legacy mode"),
+            };
+        }));
+
+        var current = await client.FetchCurrentAsync(CancellationToken.None);
+        var periods = await client.FetchHistoryPeriodsAsync(CancellationToken.None);
+        var page = await client.FetchHistoryPageAsync(
+            "253402300799",
+            cancellationToken: CancellationToken.None);
+        var threads = await client.FetchThreadsAsync(CancellationToken.None);
+
+        Assert.True(current.IsSuccess);
+        Assert.True(periods.IsSuccess);
+        Assert.True(page.IsSuccess);
+        Assert.True(threads.IsSuccess);
+        Assert.Equal(["/v3/current", "/v3/details", "/v2/details", "/v1/details"], paths);
+    }
+
+    [Theory]
+    [InlineData("periods")]
+    [InlineData("page")]
+    [InlineData("threads")]
+    public async Task CurrentSuccessDoesNotDowngradeWhenASplitRouteReturns404(string surface)
+    {
+        var paths = new List<string>();
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            var path = request.RequestUri!.AbsolutePath;
+            paths.Add(path);
+            return path switch
+            {
+                "/v3/current" => JsonResponse(ValidCurrentJson(), includePublishedPair: true),
+                "/v3/history/periods" when surface == "periods" => NotFoundResponse(),
+                "/v3/history" when surface == "page" => NotFoundResponse(),
+                "/v3/threads" when surface == "threads" => NotFoundResponse(),
+                "/v3/details" or "/v2/details" or "/v1/details" =>
+                    throw new InvalidOperationException("split 404 must not enter legacy mode"),
+                _ => throw new InvalidOperationException("unexpected route"),
+            };
+        }));
+
+        var current = await client.FetchCurrentAsync(CancellationToken.None);
+        var failure = surface switch
+        {
+            "periods" => (await client.FetchHistoryPeriodsAsync(CancellationToken.None)).Failure,
+            "page" => (await client.FetchHistoryPageAsync("period", cancellationToken: CancellationToken.None)).Failure,
+            "threads" => (await client.FetchThreadsAsync(CancellationToken.None)).Failure,
+            _ => throw new InvalidOperationException("unexpected surface"),
+        };
+
+        Assert.True(current.IsSuccess);
+        Assert.Equal(DetailsFetchFailure.Response, failure);
+        Assert.Equal(
+            ["/v3/current", surface switch
+            {
+                "periods" => "/v3/history/periods",
+                "page" => "/v3/history",
+                "threads" => "/v3/threads",
+                _ => throw new InvalidOperationException("unexpected surface"),
+            }],
+            paths);
+    }
+
+    [Fact]
+    public async Task HistoryPageCacheRetainsOnlyTheNewestAcceptedCursorGeneration()
+    {
+        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(ValidHistoryPageJson(), includePublishedPair: true)));
+
+        var first = await client.FetchHistoryPageAsync(
+            "period",
+            "cursor-a",
+            CancellationToken.None);
+        var second = await client.FetchHistoryPageAsync(
+            "period",
+            "cursor-b",
+            CancellationToken.None);
+
+        Assert.True(first.IsSuccess);
+        Assert.True(second.IsSuccess);
+        var field = typeof(LoopbackStatusClient).GetField(
+            "_lastHistoryPages",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        Assert.NotNull(field);
+        var pages = Assert.IsType<Dictionary<string, ApiHistoryPage>>(field!.GetValue(client));
+        Assert.Single(pages);
+        Assert.Contains("cursor-b", pages.Keys.Single(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Current304ReusesOnlyTheAcceptedCurrentGeneration()
+    {
+        var requestCount = 0;
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            requestCount++;
+            Assert.Equal("/v3/current", request.RequestUri!.AbsolutePath);
+            if (requestCount == 1)
+            {
+                return JsonResponse(ValidCurrentJson(), includePublishedPair: true);
+            }
+
+            Assert.Equal($"\"{CanonicalPublishedPair}\"", Assert.Single(request.Headers.IfNoneMatch).Tag);
+            return NotModifiedResponse();
+        }));
+
+        var first = await client.FetchCurrentAsync(CancellationToken.None);
+        var second = await client.FetchCurrentAsync(CancellationToken.None);
+
+        Assert.True(first.IsSuccess);
+        Assert.True(second.IsSuccess);
+        Assert.Same(first.Snapshot, second.Snapshot);
+        Assert.Equal(2, requestCount);
+    }
+
+    [Fact]
+    public async Task HistoryPageUsesOpaquePeriodAndCursorAndAcceptsExplicitNullCompletionCursor()
+    {
+        var requests = new List<Uri>();
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            requests.Add(request.RequestUri!);
+            return JsonResponse(ValidHistoryPageJson(), includePublishedPair: true);
+        }));
+
+        var result = await client.FetchHistoryPageAsync(
+            "period/opaque",
+            "cursor+opaque",
+            CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("period/opaque", result.Page!.PeriodId);
+        Assert.Null(result.Page.NextCursor);
+        Assert.Equal("resume-opaque", result.Page.ResumeCursor);
+        Assert.Equal(
+            "http://127.0.0.1:8787/v3/history?period=period%2Fopaque&cursor=cursor%2Bopaque",
+            requests.Single().AbsoluteUri);
+    }
+
+    [Fact]
+    public async Task SplitResourceRequiresTheResumeCursorOnEveryHistoryPage()
+    {
+        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(
+                ValidHistoryPageJson().Replace(
+                    ",\"resume_cursor\":\"resume-opaque\"",
+                    String.Empty,
+                    StringComparison.Ordinal),
+                includePublishedPair: true)));
+
+        var result = await client.FetchHistoryPageAsync("period", cancellationToken: CancellationToken.None);
+
+        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
+        Assert.Null(result.Page);
+    }
+
+    [Fact]
+    public async Task EmptyInitialHistoryAcceptsAnExplicitNullResumeCursor()
+    {
+        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(
+                "{\"api_version\":\"v3\",\"history_samples\":[],\"history_gaps\":[],\"next_cursor\":null,\"resume_cursor\":null}",
+                includePublishedPair: true)));
+
+        var result = await client.FetchHistoryPageAsync(
+            "period",
+            cancellationToken: CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Null(result.Page!.NextCursor);
+        Assert.Null(result.Page.ResumeCursor);
+    }
+
+    [Fact]
     public async Task DetailsFallsBackToV1OnlyWhenV3AndV2ReturnNotFound()
     {
         var paths = new List<string>();
@@ -890,6 +1114,21 @@ public sealed class LoopbackStatusClientTests
     private static HttpResponseMessage NotFoundResponse() =>
         new(HttpStatusCode.NotFound);
 
+    private static HttpResponseMessage NotModifiedResponse()
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.NotModified)
+        {
+            Content = new ByteArrayContent([]),
+        };
+        response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json")
+        {
+            CharSet = "utf-8",
+        };
+        response.Headers.CacheControl = new CacheControlHeaderValue { NoStore = true };
+        response.Headers.TryAddWithoutValidation(PublishedPairHeader, CanonicalPublishedPair);
+        return response;
+    }
+
     private static string HealthJson(string? productVersion = null) =>
         $"{{\"api_version\":\"v1\",\"service\":\"codex-info\",\"product_version\":\"{productVersion ?? ProductInfo.Version}\"}}";
 
@@ -906,6 +1145,12 @@ public sealed class LoopbackStatusClientTests
 
     private static string ValidDetailsV3Json() =>
         "{\"api_version\":\"v3\",\"state\":\"ready\",\"observed_at\":253402300740,\"authenticated\":true,\"plan_label\":\"Pro\",\"quota\":{\"remaining_percent\":98.5,\"reset_at\":253402300799,\"window_seconds\":604800,\"monthly\":false},\"models\":[{\"model\":\"ASTRA\",\"total_tokens\":13,\"input_tokens\":10,\"cached_input_tokens\":2,\"cache_write_input_tokens\":1,\"output_tokens\":3,\"estimated_cost\":{\"price_version\":\"ASTRA_USER_2026-09-05\",\"ordinary_input_dollars\":1.0,\"cached_input_dollars\":2.0,\"cache_write_input_dollars\":3.0,\"output_dollars\":4.0,\"total_dollars\":10.0}}],\"active_thread_count\":1,\"history_periods\":[{\"id\":\"253402300799\",\"start_at\":253341820740,\"end_at\":253402300740,\"reset_at\":253402300799,\"label\":\"2026/08/01 — 2026/08/08\",\"current\":true}],\"history_samples\":[{\"timestamp\":253402300680,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"models\":[{\"model\":\"ASTRA\",\"total_tokens\":6,\"input_tokens\":4,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":2,\"total_dollars\":0.25}],\"models_complete\":true,\"model_source\":\"confirmed\"}],\"history_gaps\":[],\"threads\":[{\"id\":\"thread-1\",\"title\":\"Task\",\"parent_thread_id\":null,\"model\":\"ASTRA\",\"model_label\":\"ASTRA\",\"total_tokens\":20,\"context_usage_tokens\":10,\"context_window_tokens\":80,\"created_at\":1,\"last_user_message_at\":1,\"is_subagent\":false,\"depth\":0}]}";
+
+    private static string ValidCurrentJson() =>
+        "{\"api_version\":\"v3\",\"state\":\"ready\",\"observed_at\":253402300740,\"authenticated\":true,\"plan_label\":\"Pro\",\"quota\":{\"remaining_percent\":98.5,\"reset_at\":253402300799,\"window_seconds\":604800,\"monthly\":false},\"models\":[{\"model\":\"ASTRA\",\"total_tokens\":13,\"input_tokens\":10,\"cached_input_tokens\":2,\"cache_write_input_tokens\":1,\"output_tokens\":3,\"estimated_cost\":{\"price_version\":\"ASTRA_USER_2026-09-05\",\"ordinary_input_dollars\":1.0,\"cached_input_dollars\":2.0,\"cache_write_input_dollars\":3.0,\"output_dollars\":4.0,\"total_dollars\":10.0}}],\"active_thread_count\":1}";
+
+    private static string ValidHistoryPageJson() =>
+        $"{{\"api_version\":\"v3\",\"history_samples\":[{{\"timestamp\":253402300680,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"models\":[{{\"model\":\"ASTRA\",\"total_tokens\":6,\"input_tokens\":4,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":2,\"total_dollars\":0.25}}],\"models_complete\":true,\"model_source\":\"confirmed\"}}],\"history_gaps\":[],\"next_cursor\":null,\"resume_cursor\":\"resume-opaque\"}}";
 
     private sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> responder) : HttpMessageHandler
     {

@@ -115,6 +115,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             ? generation.PipelineCompletion.Task
             : Task.FromException(new ArgumentException("Unknown generation context.", nameof(context)));
 
+    /// <summary>The bounded resource transport, when the v3 split contract is available.</summary>
+    internal ILoopbackResourceClient? SplitResourceClient => detailsClient as ILoopbackResourceClient;
+
+    internal CancellationToken LifetimeToken => lifetime.Token;
+
     public UiText Texts => LocalizationService.Current;
 
     public string ProductVersionText => ProductInfo.DisplayVersion;
@@ -788,6 +793,42 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 return;
             }
 
+            if (detailsClient is ILoopbackResourceClient splitResources)
+            {
+                CurrentFetchResult currentResult;
+                try
+                {
+                    currentResult = await splitResources.FetchCurrentAsync(cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch
+                {
+                    currentResult = CurrentFetchResult.FromFailure(DetailsFetchFailure.Transport);
+                }
+
+                if (currentResult.IsSuccess && currentResult.Snapshot is { } current)
+                {
+                    MutateIfCurrent(context, () => ApplyCurrentGeneration(current));
+                }
+                else
+                {
+                    var failure = currentResult.Failure == DetailsFetchFailure.Transport
+                        ? DetailsFetchFailure.Transport
+                        : DetailsFetchFailure.Response;
+                    MutateIfCurrent(context, () =>
+                    {
+                        detailsFailure = failure;
+                        Notify(nameof(DetailsStatusText));
+                        Notify(nameof(DetailsStatusAutomationText));
+                        ApplyFailure(failure);
+                    });
+                }
+                return;
+            }
+
             // The one strictly validated details response is the complete
             // visible generation: core, history, models, and threads are never
             // assembled from separate response roots.
@@ -1072,6 +1113,29 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(IsRefreshingVisible));
         Notify(nameof(IsUpdateNotificationVisible));
         Notify(nameof(IsUpdateActionVisible));
+    }
+
+    private void ApplyCurrentGeneration(ApiCurrentSnapshot current)
+    {
+        var merged = new ApiDetailsSnapshot(
+            current.State,
+            current.ObservedAt,
+            current.Authenticated,
+            current.PlanLabel,
+            current.Quota,
+            current.Models,
+            current.ActiveThreadCount,
+            Array.Empty<ApiHistoryPeriod>(),
+            Array.Empty<ApiHistorySample>(),
+            Array.Empty<ApiThreadDetails>(),
+            "概算 —")
+        {
+            ApiVersion = current.ApiVersion,
+            PublishedPair = current.PublishedPair,
+            HistoryGaps = Array.Empty<ApiHistoryGap>(),
+            LegalNotices = Array.Empty<ApiLegalNotice>(),
+        };
+        ApplyDetailsGeneration(merged);
     }
 
     private void ApplyFailure(DetailsFetchFailure failure)

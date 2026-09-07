@@ -220,8 +220,9 @@ implementation or acceptance claim.
 
 ## API contract decisions
 
-`GET /v1/details` and `GET /v2/details` remain deprecated read-only compatibility contracts.
-`GET /v3/details` is the current generic-model atomic root and is versioned by `api_version: "v3"`.
+`GET /v1/details`, `GET /v2/details`, and the combined `GET /v3/details` remain read-only compatibility contracts.
+The current generic-model read surface is versioned by `api_version: "v3"` and split into `GET /v3/current`,
+`GET /v3/history/periods`, selected-period `GET /v3/history`, and `GET /v3/threads`.
 Together with readiness-only `GET /health` (`/v1/health` compatibility), these routes are the complete public read surface. V1/v2
 top-level shape is the exact set `api_version`, `state`, `observed_at`,
 `authenticated`, `plan_label`, `quota`, `models`, `active_thread_count`,
@@ -239,21 +240,25 @@ The server-side published-generation header contract revision is `rest-v1-publis
 Every successful v1, v2, or v3 details response contains exactly one
 `Codex-Info-Published-Pair` header whose value is `v1:` followed by 64 lowercase
 hex characters: a 128-bit process server epoch followed by a 128-bit successful-publish
-counter. The resident service publishes all representations from one immutable details generation. Windows first
-requests one strict `/v3/details` response and falls back to one strict v2, then one strict v1 response only for exact 404.
-No second response completes, compares, or repairs an accepted root. After a valid v3 root, its pair may be sent as one
-quoted `If-None-Match` on v3 only; matching 304/body zero retains last-good and is not a failure. V1/v2 fallback sends no
+counter. The resident service publishes all representations from one immutable domain generation. Windows Main first
+requests one strict `/v3/current` response. Graph requests periods and only its selected-period pages, while Threads requests
+thread rows only while its window is open. Each surface atomically accepts only the complete set carrying one pair.
+When `/v3/current` returns exact 404, Windows falls back to one strict `/v3/details`, then one strict v2 and v1 response on successive exact 404s.
+No second response repairs an accepted legacy root. After a valid v3 resource, its route-local pair may be sent as one
+quoted `If-None-Match`; matching 304/body zero retains last-good and is not a failure. V1/v2 fallback sends no
 conditional header. A missing, duplicate, malformed, or case-altered details header rejects
 the complete candidate and retains the last complete root. Health and error responses do not
 carry this header. The production UI treats the details header only as that response's opaque generation identity;
 it does not derive data meaning from either component.
-It contains bounded model cost rows, reset periods, minute history samples,
-bounded active-thread rows, and the aggregate cost label. Timestamps are
+The split resources contain only their current model cost rows, reset periods, selected-period minute history samples,
+or bounded active-thread rows. Timestamps are
 positive Unix seconds; percentages and dollar values are finite and
 non-negative; v3 model names are bounded generic IDs and ASTRA is not grouped as other; all user-visible
 labels are one-line bounded Unicode text. Unknown or duplicate keys, malformed
-JSON, oversized bodies, and values outside those limits are rejected without
-replacing the last valid details snapshot.
+JSON, bodies beyond the existing OOM/DoS boundary, and values outside domain limits are rejected without
+replacing the relevant last valid surface snapshot. Normal sample/model counts are not rejected by an arbitrary performance cap;
+history pages are divided only as needed to remain inside the existing memory-safety boundary and their opaque cursor must advance. A cursor binds the selected period, last canonical key, and the canonical sample/gap prefix fingerprint rather than expiring merely because the published pair advanced. Windows appends a delta only after the server proves that prefix unchanged and every returned page has one new pair; any corrected prefix forces one full refresh.
+When `/v3/current` returns an exact 404, the connection enters legacy-details mode: one accepted fallback details root supplies Main, Graph, and Threads, split routes are not requested, and capability detection restarts on the next connection.
 After reset-tolerance canonicalization, `(period.id, timestamp)` is also unique.
 A collision rejects the complete candidate; Windows must not merge, maximize,
 select the last row, null a conflicting remaining value, or render multiple

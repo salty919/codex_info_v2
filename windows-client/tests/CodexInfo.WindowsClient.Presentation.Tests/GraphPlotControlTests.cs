@@ -390,10 +390,10 @@ public sealed class GraphPlotControlTests
         {
             var found = false;
             for (var x = gutterStart + 1; x < pixels.GetLength(1) && !found; x++)
-            for (var y = 0; y < pixels.GetLength(0) && !found; y++)
-                found = Math.Abs(pixels[y, x, 0] - color.Item1) <= 24 &&
-                        Math.Abs(pixels[y, x, 1] - color.Item2) <= 24 &&
-                        Math.Abs(pixels[y, x, 2] - color.Item3) <= 24;
+                for (var y = 0; y < pixels.GetLength(0) && !found; y++)
+                    found = Math.Abs(pixels[y, x, 0] - color.Item1) <= 24 &&
+                            Math.Abs(pixels[y, x, 1] - color.Item2) <= 24 &&
+                            Math.Abs(pixels[y, x, 2] - color.Item3) <= 24;
             Assert.True(found, $"Missing endpoint gutter pixels for {color}; start={gutterStart}, dimensions={pixels.GetLength(0)}x{pixels.GetLength(1)}");
         }
     }

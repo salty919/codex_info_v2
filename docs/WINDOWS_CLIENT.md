@@ -25,17 +25,19 @@ Linux / WSL resident service -- 127.0.0.1:8787
 
 WSL installed distribution token、またはOpenSSH configのliteral `Host` aliasを非秘密selectorとして保存できる。password、token、private key、展開済みhost/user/pathは保存しない。SSHはWindows標準`ssh.exe`をshellなしのArgumentListで起動し、auto reconnectは`BatchMode=yes`を使う。RESTをLANへbindせず、端末間の暗号化とpeer authenticationはSSHが担当する。
 
-Setupはprofile準備、forward/listener、`GET /health`（`/v1/health`互換）、最初の完全なdetails、必要なCodex認証の順で進む。healthはservice readinessとproduct versionだけを示し、認証済み、data ready、最新収集成功を意味しない。
+Setupはprofile準備、forward/listener、`GET /health`（`/v1/health`互換）、最初の完全なcurrent、必要なCodex認証の順で進む。healthはservice readinessとproduct versionだけを示し、認証済み、data ready、最新収集成功を意味しない。
 
 ## REST受理とversion差
 
-現行表示rootは`GET /v3/details`一応答である。旧serviceがexact 404を返した場合だけ`GET /v2/details`、さらにexact 404の場合だけ`GET /v1/details`へfallbackする。timeout、別status、schema/header/body不正ではfallbackせず、直前の完全rootを保持する。応答同士、control結果、SQLite rowをmergeしない。
+現行Main rootは`GET /v3/current`一応答、Graphは`GET /v3/history/periods`と選択期間の`GET /v3/history`、Threadsは`GET /v3/threads`である。各取得cycleは同じpublished pairの完全集合だけをatomic commitする。Graph差分だけは、直前rootのopaque cursorが同periodの既取得sample/gap prefix不変をserverで証明した場合に限り、新pairの全pageを揃えて旧prefixへatomic appendする。過去補正時はcursor拒否後に先頭から再取得する。新resourceを持たない旧serviceが`/v3/current`へexact 404を返した場合だけ`GET /v3/details`、さらにexact 404の場合だけv2、v1へfallbackする。timeout、別status、schema/header/body不正ではfallbackせず、該当surfaceの直前完全rootを保持する。未証明の異なるpair、control結果、SQLite rowをmergeしない。
 
-Windows clientとLinux daemonのschema-validな異なるproduct versionは診断情報として保持し、それだけでdetails取得を停止しない。互換性はv3 strict validationと上記fallbackで決める。v1/v2はdeprecated固定3model projection、v3はASTRAと将来modelを含む有界な任意model配列である。正確なkey、型、上限、published pair、effectは`REST_API_V1.md`だけを参照する。
+`/v3/current`がexact 404の接続はlegacy details modeとし、受理した一つのdetails rootをMain、Graph、Threadsへ同時投影する。このmodeではsplit history/threadsを要求せず、Mainの10秒周期でdetailsだけを更新する。Graph/Threadsは開いた時点の最新legacy rootを使い、再接続時に`/v3/current`から能力判定をやり直す。
+
+Windows clientとLinux daemonのschema-validな異なるproduct versionは診断情報として保持し、それだけでsnapshot取得を停止しない。互換性はv3 strict validationと上記fallbackで決める。v1/v2と全体`/v3/details`は互換projection、v3 split resourceはASTRAと将来modelを含む有界な任意model配列である。正確なkey、型、OOM境界、cursor、published pair、effectは`REST_API_V1.md`だけを参照する。
 
 ## 表示と失敗
 
-Main、Graph、Threadsは同じaccepted details rootを使う。Setup、Main、Graph、Threads、Settings、Legalのsurface、状態優先順位、geometry、DPI、accessibility、Graphの実測/欠測/idle表現は`WINDOWS_UX_SPEC.md`を参照する。
+Main、Graph、Threadsは同じpublished domain generationから各surfaceに必要なresourceだけを使う。Mainは10秒、Graph差分はopen中60秒、Threadsはopen中5秒で確認し、閉じたsurfaceのresourceを取得しない。Setup、Main、Graph、Threads、Settings、Legalのsurface、状態優先順位、geometry、DPI、accessibility、Graphの実測/欠測/idle表現は`WINDOWS_UX_SPEC.md`を参照する。
 
 - `auth_required`は旧account表示を同じroot updateで消去し、認証導線だけを表示する。
 - transport、HTTP、schema、remote収集失敗は原因classを分け、last-goodがあればstaleとして保持する。

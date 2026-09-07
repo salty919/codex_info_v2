@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using System.Collections.Concurrent;
+using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
@@ -150,6 +151,35 @@ public sealed class DetailsPresentationCoverageTests
         graph.ShowTerra = true;
         graph.ShowLuna = true;
         Assert.True(graph.ShowRemaining && graph.ShowModels && graph.ShowSol && graph.ShowTerra && graph.ShowLuna);
+    }
+
+    [Fact]
+    public async Task GraphWindow_SplitResourcePublicationDoesNotRetriggerHistoryFetch()
+    {
+        var pair = PublishedPairIdentity.Create($"v1:{new string('a', 64)}");
+        var period = CreateSmallPeriod("current", 4_000_000, 4_000_120, current: true, remaining: 80, token: 100);
+        var details = CreateDetails([period], Array.Empty<ApiThreadDetails>());
+        var resourceClient = new CountingHistoryResourceClient(details, period, pair);
+        using var main = new MainWindowViewModel(
+            new StaticCombinedClient(DetailsFetchResult.Success(details)),
+            resourceClient);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+
+        ((INotifyCollectionChanged)graph.Periods).CollectionChanged += (_, _) =>
+        {
+            if (graph.Periods.Count > 0)
+            {
+                graph.SelectedPeriod = graph.Periods[0];
+            }
+        };
+
+        await PumpUiUntilAsync(pendingUi, () => graph.HasPoints);
+        await Task.Delay(50);
+
+        Assert.Equal(1, resourceClient.HistoryPeriodsCalls);
+        Assert.Equal(1, resourceClient.HistoryPageCalls);
+        Assert.Same(graph.Periods[0], graph.SelectedPeriod);
     }
 
     [Fact]
@@ -432,5 +462,50 @@ public sealed class DetailsPresentationCoverageTests
     {
         public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult(result);
+    }
+
+    private sealed class CountingHistoryResourceClient(
+        ApiDetailsSnapshot details,
+        ApiHistoryPeriod period,
+        PublishedPairIdentity pair) : ILoopbackDetailsClient, ILoopbackResourceClient
+    {
+        private int historyPeriodsCalls;
+        private int historyPageCalls;
+
+        public int HistoryPeriodsCalls => Volatile.Read(ref historyPeriodsCalls);
+
+        public int HistoryPageCalls => Volatile.Read(ref historyPageCalls);
+
+        public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(DetailsFetchResult.Success(details));
+
+        public Task<CurrentFetchResult> FetchCurrentAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Current is outside this graph regression test.");
+
+        public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
+            CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref historyPeriodsCalls);
+            return Task.FromResult(HistoryPeriodsFetchResult.Success(
+                new ApiHistoryPeriodsSnapshot([period with { Samples = Array.Empty<ApiHistorySample>() }], pair)));
+        }
+
+        public Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+            string periodId,
+            string? cursor = null,
+            CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref historyPageCalls);
+            return Task.FromResult(HistoryPageFetchResult.Success(new ApiHistoryPage(
+                periodId,
+                period.Samples,
+                Array.Empty<ApiHistoryGap>(),
+                NextCursor: null,
+                ResumeCursor: "resume",
+                pair)));
+        }
+
+        public Task<ThreadsFetchResult> FetchThreadsAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Threads are outside this graph regression test.");
     }
 }
