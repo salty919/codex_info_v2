@@ -125,6 +125,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     private bool isLoading;
     private bool hasLoadError;
     private bool disposed;
+    private bool applyingSplitResourceState;
     private bool resourceCursorResetRequired;
     private CancellationTokenSource? resourcePollingCancellation;
     private string? resourceNextCursor;
@@ -203,7 +204,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(SelectedPeriodText));
             Notify(nameof(SelectedPeriodStartAt));
             Notify(nameof(SelectedPeriodEndAt));
-            if (resourceClient is not null && value is not null && !disposed)
+            if (resourceClient is not null && value is not null && !disposed && !applyingSplitResourceState)
             {
                 _ = RefreshSplitResourceAsync(
                     initial: true,
@@ -846,30 +847,42 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 return;
             }
 
-            periods.Clear();
-            foreach (var period in nextPeriods)
+            applyingSplitResourceState = true;
+            try
             {
-                periods.Add(period.Id == nextSelectedPeriod?.Id
-                    ? period with { Samples = nextSamples }
-                    : period);
-            }
+                ApiHistoryPeriod? publishedSelectedPeriod = null;
+                periods.Clear();
+                foreach (var period in nextPeriods)
+                {
+                    var publishedPeriod = period.Id == nextSelectedPeriod?.Id
+                        ? period with { Samples = nextSamples }
+                        : period;
+                    periods.Add(publishedPeriod);
+                    if (publishedPeriod.Id == nextSelectedPeriod?.Id)
+                    {
+                        publishedSelectedPeriod = publishedPeriod;
+                    }
+                }
 
-            selectedPeriod = nextSelectedPeriod is null
-                ? null
-                : nextSelectedPeriod with { Samples = nextSamples };
-            resourcePeriod = selectedPeriod;
-            resourceSamples = nextSamples;
-            resourceGaps = nextGaps;
-            resourcePublishedPair = nextPair;
-            resourceNextCursor = nextCursor;
-            SetLoadError(false);
-            SetLoading(false);
-            RebuildPoints();
-            Notify(nameof(HasPeriods));
-            Notify(nameof(SelectedPeriod));
-            Notify(nameof(SelectedPeriodText));
-            Notify(nameof(SelectedPeriodStartAt));
-            Notify(nameof(SelectedPeriodEndAt));
+                selectedPeriod = publishedSelectedPeriod;
+                resourcePeriod = selectedPeriod;
+                resourceSamples = nextSamples;
+                resourceGaps = nextGaps;
+                resourcePublishedPair = nextPair;
+                resourceNextCursor = nextCursor;
+                SetLoadError(false);
+                SetLoading(false);
+                RebuildPoints();
+                Notify(nameof(HasPeriods));
+                Notify(nameof(SelectedPeriod));
+                Notify(nameof(SelectedPeriodText));
+                Notify(nameof(SelectedPeriodStartAt));
+                Notify(nameof(SelectedPeriodEndAt));
+            }
+            finally
+            {
+                applyingSplitResourceState = false;
+            }
         });
     }
 
