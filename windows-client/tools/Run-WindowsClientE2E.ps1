@@ -248,55 +248,18 @@ public static class CodexInfoGraphPixelScanner {
                 throw new InvalidOperationException("Fewer than four visible vertical period-grid groups were detected.");
             }
 
-            int[] bestGridCenters = null;
-            double bestScore = double.PositiveInfinity;
-            foreach (int candidateCount in new[] { 5, 4 }) {
-                if (centers.Count < candidateCount) continue;
-                int candidateIntervals = candidateCount - 1;
-                for (int start = 0; start < centers.Count - candidateIntervals; start++) {
-                    for (int end = start + candidateIntervals; end < centers.Count; end++) {
-                        double step = (centers[end] - centers[start]) / (double)candidateIntervals;
-                        var selected = new int[candidateCount];
-                        selected[0] = centers[start];
-                        selected[candidateIntervals] = centers[end];
-                        int previous = start;
-                        double score = 0;
-                        bool complete = true;
-                        for (int index = 1; index < candidateIntervals; index++) {
-                            double expected = centers[start] + (step * index);
-                            int remaining = candidateIntervals - index;
-                            int bestIndex = -1;
-                            double error = double.PositiveInfinity;
-                            for (int candidate = previous + 1;
-                                candidate <= end - remaining;
-                                candidate++) {
-                                double candidateError = Math.Abs(centers[candidate] - expected);
-                                if (candidateError < error) {
-                                    error = candidateError;
-                                    bestIndex = candidate;
-                                }
-                            }
-                            if (bestIndex < 0) {
-                                complete = false;
-                                break;
-                            }
-                            selected[index] = centers[bestIndex];
-                            previous = bestIndex;
-                            score = Math.Max(score, error);
-                        }
-                        if (complete && score < bestScore) {
-                            bestScore = score;
-                            bestGridCenters = selected;
-                        }
-                    }
-                }
-                if (bestGridCenters != null && bestScore <= 3) {
-                    // Five visible 0/25/50/75/100% grids are authoritative.
-                    // Use four-grid extrapolation only when a fifth grid is
-                    // genuinely unavailable, never because it scores a
-                    // fractionally smaller rasterization error.
-                    break;
-                }
+            double bestScore;
+            int[] bestGridCenters = FindEvenlySpacedCenters(centers, 5, out bestScore);
+            if (bestGridCenters == null || bestScore > 3) {
+                bestGridCenters = FindEvenlySpacedCenters(centers, 4, out bestScore);
+            }
+            if (bestGridCenters == null || bestScore > 3) {
+                // The plot owns five 0/25/50/75/100% grids. A series can
+                // cover one interior grid completely, while both period
+                // boundaries remain visible. Reconstruct only that bounded
+                // one-missing-interior case after the established four-grid
+                // endpoint fallback has been given priority.
+                bestGridCenters = ReconstructOneMissingInteriorGrid(centers, out bestScore);
             }
             if (bestGridCenters == null || bestScore > 3) {
                 throw new InvalidOperationException(
@@ -346,6 +309,90 @@ public static class CodexInfoGraphPixelScanner {
                 SeriesRightmost = rightmost,
             };
         }
+    }
+
+    private static int[] FindEvenlySpacedCenters(
+        List<int> centers,
+        int candidateCount,
+        out double bestScore) {
+        int[] best = null;
+        bestScore = double.PositiveInfinity;
+        if (centers.Count < candidateCount) return null;
+
+        int candidateIntervals = candidateCount - 1;
+        for (int start = 0; start < centers.Count - candidateIntervals; start++) {
+            for (int end = start + candidateIntervals; end < centers.Count; end++) {
+                double step = (centers[end] - centers[start]) / (double)candidateIntervals;
+                var selected = new int[candidateCount];
+                selected[0] = centers[start];
+                selected[candidateIntervals] = centers[end];
+                int previous = start;
+                double score = 0;
+                bool complete = true;
+                for (int index = 1; index < candidateIntervals; index++) {
+                    double expected = centers[start] + (step * index);
+                    int remaining = candidateIntervals - index;
+                    int bestIndex = -1;
+                    double error = double.PositiveInfinity;
+                    for (int candidate = previous + 1;
+                        candidate <= end - remaining;
+                        candidate++) {
+                        double candidateError = Math.Abs(centers[candidate] - expected);
+                        if (candidateError < error) {
+                            error = candidateError;
+                            bestIndex = candidate;
+                        }
+                    }
+                    if (bestIndex < 0) {
+                        complete = false;
+                        break;
+                    }
+                    selected[index] = centers[bestIndex];
+                    previous = bestIndex;
+                    score = Math.Max(score, error);
+                }
+                if (complete && score < bestScore) {
+                    bestScore = score;
+                    best = selected;
+                }
+            }
+        }
+        return best;
+    }
+
+    private static int[] ReconstructOneMissingInteriorGrid(
+        List<int> centers,
+        out double bestScore) {
+        bestScore = double.PositiveInfinity;
+        if (centers.Count != 4) return null;
+
+        int[] reconstructed = null;
+        int validReconstructions = 0;
+        double step = (centers[3] - centers[0]) / 4.0;
+        foreach (int missing in new[] { 1, 2, 3 }) {
+            int observed = 0;
+            double score = 0;
+            for (int gridIndex = 0; gridIndex < 5; gridIndex++) {
+                if (gridIndex == missing) continue;
+                double expected = centers[0] + (step * gridIndex);
+                score = Math.Max(score, Math.Abs(centers[observed] - expected));
+                observed++;
+            }
+            int inferred = (int)Math.Round(centers[0] + (step * missing));
+            if (score > 3 || inferred <= centers[missing - 1] || inferred >= centers[missing]) {
+                continue;
+            }
+
+            validReconstructions++;
+            bestScore = score;
+            reconstructed = new int[5];
+            for (int gridIndex = 0; gridIndex < reconstructed.Length; gridIndex++) {
+                reconstructed[gridIndex] = (int)Math.Round(centers[0] + (step * gridIndex));
+            }
+        }
+        if (validReconstructions == 1) return reconstructed;
+        bestScore = double.PositiveInfinity;
+        return null;
     }
 
     private static bool MatchesSplitGrid(Color left, Color right) {
@@ -1287,6 +1334,8 @@ function Wait-E2EGraphPixelsReady {
 
 function Invoke-E2EGraphPixelScannerSelfTest {
     $validPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-valid.png'
+    $missingInteriorPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-missing-interior.png'
+    $endpointFallbackPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-endpoint-fallback.png'
     $gridColor = [System.Drawing.ColorTranslator]::FromHtml('#263548')
     $idleColor = [System.Drawing.ColorTranslator]::FromHtml('#1A2838')
     $idleGridColor = [System.Drawing.ColorTranslator]::FromHtml('#233244')
@@ -1294,7 +1343,9 @@ function Invoke-E2EGraphPixelScannerSelfTest {
     $seriesColors = @('#56B2F5', '#A88CF5', '#5DC98A', '#E6A23C') |
         ForEach-Object { [System.Drawing.ColorTranslator]::FromHtml($_) }
     foreach ($case in @(
-        @{ Path = $validPath; GridXs = @(10, 50, 90, 130, 170, 230) }
+        @{ Path = $validPath; GridXs = @(10, 50, 90, 130, 170, 230); AddIdleBand = $true; AddIdleGrid = $true },
+        @{ Path = $missingInteriorPath; GridXs = @(10, 50, 130, 170); AddIdleBand = $true; AddIdleGrid = $false },
+        @{ Path = $endpointFallbackPath; GridXs = @(10, 50, 90, 130); AddIdleBand = $false; AddIdleGrid = $false }
     )) {
         $bitmap = New-Object System.Drawing.Bitmap(240, 140)
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
@@ -1323,8 +1374,10 @@ function Invoke-E2EGraphPixelScannerSelfTest {
                 }
                 # ScottPlot composites a grid line inside the product's
                 # measured idle band to #233244 on the captured surface.
-                foreach ($x in 80..100) { $bitmap.SetPixel($x, $y, $idleColor) }
-                $bitmap.SetPixel(90, $y, $idleGridColor)
+                if ($case.AddIdleBand) {
+                    foreach ($x in 80..100) { $bitmap.SetPixel($x, $y, $idleColor) }
+                    if ($case.AddIdleGrid) { $bitmap.SetPixel(90, $y, $idleGridColor) }
+                }
             }
             for ($index = 0; $index -lt $seriesColors.Count; $index++) {
                 $seriesPen = New-Object System.Drawing.Pen($seriesColors[$index], 2)
@@ -1347,9 +1400,25 @@ function Invoke-E2EGraphPixelScannerSelfTest {
         Assert-E2E (($valid.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
             'Graph pixel scanner missed synthetic endpoint colors.'
         Write-E2E 'graph-pixel-scanner-self-test: PASS valid fixed-gutter geometry'
+
+        $missingInterior = [CodexInfoGraphPixelScanner]::Scan($missingInteriorPath, 0, 0, 240, 140)
+        Assert-E2E ($missingInterior.PeriodStartX -eq 10 -and $missingInterior.PeriodEndX -eq 170 -and
+            $missingInterior.PlotSpan -eq 160 -and $missingInterior.GutterWidth -eq 69) `
+            'Graph pixel scanner did not reconstruct one missing interior grid.'
+        Assert-E2E (($missingInterior.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
+            'Graph pixel scanner missed endpoints after reconstructing an interior grid.'
+        Write-E2E 'graph-pixel-scanner-self-test: PASS one missing interior grid reconstructed'
+
+        $endpointFallback = [CodexInfoGraphPixelScanner]::Scan($endpointFallbackPath, 0, 0, 240, 140)
+        Assert-E2E ($endpointFallback.PeriodStartX -eq 10 -and $endpointFallback.PeriodEndX -eq 170 -and
+            $endpointFallback.PlotSpan -eq 160 -and $endpointFallback.GutterWidth -eq 69) `
+            'Graph pixel scanner regressed the established four-grid endpoint fallback.'
+        Assert-E2E (($endpointFallback.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
+            'Graph pixel scanner missed endpoints in the four-grid endpoint fallback.'
+        Write-E2E 'graph-pixel-scanner-self-test: PASS four-grid endpoint fallback preserved'
     }
     finally {
-        foreach ($path in @($validPath)) {
+        foreach ($path in @($validPath, $missingInteriorPath, $endpointFallbackPath)) {
             if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
         }
     }
