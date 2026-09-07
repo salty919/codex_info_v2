@@ -70,7 +70,6 @@ WINDOWS_TEST_TOOL_EXACT = frozenset(
     {
         "windows-client/tools/Measure-WindowsGraphLatency.ps1",
         "windows-client/tools/Run-WindowsClientE2E.ps1",
-        "windows-client/tools/Test-WindowsInstallerUpgrade.ps1",
         "windows-client/tools/Test-WindowsClientFixtureContract.ps1",
     }
 )

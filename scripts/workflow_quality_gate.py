@@ -32,7 +32,6 @@ WORKFLOW_NAMES = (
 )
 
 RELEASE_ACCEPTANCE_SCRIPTS = {
-    "windows-upgrade": "windows-client/tools/Test-WindowsInstallerUpgrade.ps1",
     "linux-last-good": "scripts/x11_service_recovery_visual_gate.sh",
     "app-server-failure": "scripts/fake_codex_app_server.py",
 }
@@ -54,17 +53,6 @@ def release_acceptance_sources() -> dict[str, str]:
 
 def _release_acceptance_script_errors(scripts: Mapping[str, str]) -> list[str]:
     required = {
-        "windows-upgrade": (
-            "/releases/latest",
-            "Previous stable installer failed",
-            "if ($previousHash -cne [string]$manifest.installer.sha256)",
-            "Latest stable Windows Setup digest does not match its published manifest",
-            "$expectedProductVersion = \"$candidateVersionText+$SourceSha\"",
-            "Set-Content -LiteralPath $sentinel -Value 'preserve'",
-            "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf))",
-            "Candidate upgrade removed user settings",
-            "windows-installer-upgrade: PASS",
-        ),
         "linux-last-good": (
             'current.get("state") == "error"',
             'current.get("authenticated") is True',
@@ -478,6 +466,21 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
                 _step(windows_job, name=step_name).get("if"),
                 "inputs.release_candidate",
             )
+        upgrade_script = _step(
+            windows_job,
+            name="Upgrade latest published Windows release to the exact candidate",
+        ).get("run")
+        if not isinstance(upgrade_script, str):
+            errors.append("workflow wiring windows upgrade script is missing")
+        else:
+            for marker in (
+                "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf)) {",
+                "throw 'Candidate upgrade removed user settings.'",
+            ):
+                if marker not in upgrade_script:
+                    errors.append(
+                        f"workflow wiring windows upgrade script is missing {marker}"
+                    )
         windows_step_names = [
             step.get("name")
             for step in windows_job.get("steps", [])
@@ -747,7 +750,15 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "dotnet format windows-client/CodexInfo.WindowsClient.sln",
         "dotnet test windows-client/CodexInfo.WindowsClient.sln",
         "Build-WindowsInstaller.ps1",
-        "Test-WindowsInstallerUpgrade.ps1",
+        "/releases/latest",
+        "Previous stable installer failed",
+        "if ($previousHash -cne [string]$manifest.installer.sha256)",
+        "Latest stable Windows Setup digest does not match its published manifest",
+        '$expectedProductVersion = "$candidateVersionText+$SourceSha"',
+        "Set-Content -LiteralPath $sentinel -Value 'preserve'",
+        "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf))",
+        "Candidate upgrade removed user settings",
+        "windows-installer-upgrade: PASS",
         "Run-WindowsClientE2E.ps1",
         "E2E uninstall removed user settings.",
         "windows_window_move_smoke.ps1",
@@ -3368,7 +3379,22 @@ def self_test() -> int:
         ),
         ("selective-quality.yml", "  windows-quality:\n", "  omitted-windows-quality:\n"),
         ("windows-client.yml", "New-WindowsUpdateManifest.ps1", "Omitted-Manifest.ps1"),
-        ("windows-client.yml", "Test-WindowsInstallerUpgrade.ps1", "Omitted-Upgrade.ps1"),
+        ("windows-client.yml", "/releases/latest", "/releases/omitted"),
+        (
+            "windows-client.yml",
+            '$expectedProductVersion = "$candidateVersionText+$SourceSha"',
+            '$expectedProductVersion = "$candidateVersionText"',
+        ),
+        (
+            "windows-client.yml",
+            "if ($previousHash -cne [string]$manifest.installer.sha256)",
+            "if ($previousHash -ceq [string]$manifest.installer.sha256)",
+        ),
+        (
+            "windows-client.yml",
+            "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf))",
+            "if (Test-Path -LiteralPath $sentinel -PathType Leaf)",
+        ),
         (
             "linux-distribution.yml",
             'CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info"',
@@ -3457,22 +3483,6 @@ def self_test() -> int:
             raise AssertionError(f"workflow mutation was accepted: {name}: {old}")
         cases += 1
     acceptance_mutations = (
-        ("windows-upgrade", "/releases/latest", "/releases/omitted"),
-        (
-            "windows-upgrade",
-            '$expectedProductVersion = "$candidateVersionText+$SourceSha"',
-            '$expectedProductVersion = "$candidateVersionText"',
-        ),
-        (
-            "windows-upgrade",
-            "if ($previousHash -cne [string]$manifest.installer.sha256)",
-            "if ($previousHash -ceq [string]$manifest.installer.sha256)",
-        ),
-        (
-            "windows-upgrade",
-            "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf))",
-            "if (Test-Path -LiteralPath $sentinel -PathType Leaf)",
-        ),
         (
             "linux-last-good",
             'all(current.get(key) == ready.get(key)',
