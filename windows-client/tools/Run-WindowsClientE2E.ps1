@@ -1,6 +1,6 @@
 # Runs the finite Windows UI Automation acceptance path against the installed
 # client.  The normal mode uses the configured loopback service.  CI may pass
-# -Fixture to provide bounded local /v1/health and /v1/details responses; this still
+# -Fixture to provide bounded local /v1/health and /v2/details responses; this still
 # drives the installed EXE and the real rendered windows, but does not require
 # an account or an SSH tunnel.
 [CmdletBinding()]
@@ -187,6 +187,8 @@ public sealed class CodexInfoGraphPixelMeasurement {
 
 public static class CodexInfoGraphPixelScanner {
     private static readonly Color GridColor = ColorTranslator.FromHtml("#263548");
+    private static readonly Color IdleColor = ColorTranslator.FromHtml("#1A2838");
+    private static readonly Color IdleGridColor = ColorTranslator.FromHtml("#233244");
     private static readonly Color PlotColor = ColorTranslator.FromHtml("#101925");
     private static readonly Color[] SeriesColors = new[] {
         ColorTranslator.FromHtml("#56B2F5"),
@@ -216,9 +218,14 @@ public static class CodexInfoGraphPixelScanner {
                 int matches = 0;
                 for (int y = yStart; y < yEnd; y++) {
                     Color pixel = bitmap.GetPixel(plotLeft + localX, y);
-                    bool grid = Matches(pixel, GridColor, 8);
+                    bool grid = Matches(pixel, GridColor, 8) || Matches(pixel, IdleGridColor, 8);
                     if (!grid && localX + 1 < plotWidth) {
-                        grid = MatchesSplitGrid(pixel, bitmap.GetPixel(plotLeft + localX + 1, y));
+                        Color next = bitmap.GetPixel(plotLeft + localX + 1, y);
+                        if (!Matches(pixel, IdleColor, 8) &&
+                            !Matches(next, IdleColor, 8) &&
+                            !Matches(next, IdleGridColor, 8)) {
+                            grid = MatchesSplitGrid(pixel, next);
+                        }
                     }
                     if (grid) matches++;
                 }
@@ -282,6 +289,13 @@ public static class CodexInfoGraphPixelScanner {
                             bestGridCenters = selected;
                         }
                     }
+                }
+                if (bestGridCenters != null && bestScore <= 3) {
+                    // Five visible 0/25/50/75/100% grids are authoritative.
+                    // Use four-grid extrapolation only when a fifth grid is
+                    // genuinely unavailable, never because it scores a
+                    // fractionally smaller rasterization error.
+                    break;
                 }
             }
             if (bestGridCenters == null || bestScore > 3) {
@@ -630,7 +644,7 @@ public static class CodexInfoWindowsE2EFixtureServer {
                     reason = "OK";
                     body = "{\"api_version\":\"v1\",\"service\":\"codex-info\",\"product_version\":\"" + productVersion + "\"}";
                 }
-                else if (parts[1] == "/v1/details") {
+                else if (parts[1] == "/v2/details") {
                     Interlocked.Increment(ref detailsRequests);
                     RecordRequestPhase(request);
                     code = 200;
@@ -1274,6 +1288,8 @@ function Wait-E2EGraphPixelsReady {
 function Invoke-E2EGraphPixelScannerSelfTest {
     $validPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-valid.png'
     $gridColor = [System.Drawing.ColorTranslator]::FromHtml('#263548')
+    $idleColor = [System.Drawing.ColorTranslator]::FromHtml('#1A2838')
+    $idleGridColor = [System.Drawing.ColorTranslator]::FromHtml('#233244')
     $background = [System.Drawing.ColorTranslator]::FromHtml('#101925')
     $seriesColors = @('#56B2F5', '#A88CF5', '#5DC98A', '#E6A23C') |
         ForEach-Object { [System.Drawing.ColorTranslator]::FromHtml($_) }
@@ -1305,6 +1321,10 @@ function Invoke-E2EGraphPixelScannerSelfTest {
                 foreach ($x in 145..148) {
                     $bitmap.SetPixel($x, $y, [System.Drawing.Color]::FromArgb(27, 39, 55))
                 }
+                # ScottPlot composites a grid line inside the product's
+                # measured idle band to #233244 on the captured surface.
+                foreach ($x in 80..100) { $bitmap.SetPixel($x, $y, $idleColor) }
+                $bitmap.SetPixel(90, $y, $idleGridColor)
             }
             for ($index = 0; $index -lt $seriesColors.Count; $index++) {
                 $seriesPen = New-Object System.Drawing.Pen($seriesColors[$index], 2)
@@ -1550,7 +1570,7 @@ function Get-E2EFixtureHeaderValues {
 function Invoke-E2EFixtureRawRequest {
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('/v1/health', '/v1/details')]
+        [ValidateSet('/v1/health', '/v2/details')]
         [string]$Path
     )
 
@@ -1685,7 +1705,7 @@ function Assert-E2EFixtureHistorySamples {
     $expectedSampleKeys = @(
         'timestamp', 'reset_at', 'remaining_percent',
         'sol_dollars', 'terra_dollars', 'luna_dollars',
-        'sol_tokens', 'terra_tokens', 'luna_tokens'
+        'sol_tokens', 'terra_tokens', 'luna_tokens', 'model_source'
     )
     $seenSampleKeys = @{}
     $hasPreviousSample = $false
@@ -1702,6 +1722,7 @@ function Assert-E2EFixtureHistorySamples {
         $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'sol_tokens' -Integer
         $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'terra_tokens' -Integer
         $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'luna_tokens' -Integer
+        Assert-E2E ([string]$sample.model_source -ceq 'confirmed') 'Fixture history sample model_source must be confirmed.'
         Assert-E2E (($timestamp % 60) -eq 0) "Fixture history sample timestamp must be minute bucket aligned (timestamp % 60 == 0): $timestamp."
         $matchingPeriods = @($periodRecords | Where-Object { $_.ResetAt -eq $reset })
         Assert-E2E ($matchingPeriods.Count -eq 1) "Fixture history sample reset_at has no unique period identity: $reset."
@@ -1716,6 +1737,16 @@ function Assert-E2EFixtureHistorySamples {
         $previousReset = $reset
         $previousTimestamp = $timestamp
         $hasPreviousSample = $true
+    }
+    foreach ($period in $periodRecords) {
+        $periodSamples = @($samples | Where-Object { [Int64]$_.reset_at -eq $period.ResetAt })
+        Assert-E2E ($periodSamples.Count -ge 2) "Fixture period must contain at least two observations: $($period.Id)."
+        Assert-E2E ([Int64]$periodSamples[0].timestamp -eq $period.StartAt) "Fixture period does not start with an observation: $($period.Id)."
+        Assert-E2E ([Int64]$periodSamples[-1].timestamp -eq $period.EndAt) "Fixture period does not end with an observation: $($period.Id)."
+        for ($index = 1; $index -lt $periodSamples.Count; $index++) {
+            $elapsed = [Int64]$periodSamples[$index].timestamp - [Int64]$periodSamples[$index - 1].timestamp
+            Assert-E2E ($elapsed -eq 60) "Fixture period contains a missing interval: period=$($period.Id) elapsed=$elapsed."
+        }
     }
     return $true
 }
@@ -1751,6 +1782,7 @@ function Assert-E2EFixtureWireContract {
     catch {
         throw "Fixture details body is not valid JSON: $($_.Exception.Message)"
     }
+    Assert-E2E ([string]$detailsJson.api_version -ceq 'v2') 'Fixture details api_version must be v2.'
     $expectedDetailsKeys = @(
         'api_version', 'state', 'observed_at', 'authenticated',
         'plan_label', 'quota', 'models', 'active_thread_count',
@@ -1776,7 +1808,7 @@ function Invoke-E2EFixturePreflight {
     $responses = [ordered]@{}
     foreach ($requestSpec in @(
             @{ Name = 'health'; Path = '/v1/health' },
-            @{ Name = 'details'; Path = '/v1/details' })) {
+            @{ Name = 'details'; Path = '/v2/details' })) {
         $response = Invoke-E2EFixtureRawRequest -Path $requestSpec.Path
         $responses[$requestSpec.Name] = $response
         $pairCount = @(Get-E2EFixtureHeaderValues -Response $response -Name 'Codex-Info-Published-Pair').Count
@@ -1796,16 +1828,16 @@ function Invoke-E2EFixturePreflight {
 function New-E2EFixtureDocuments {
     $rawNow = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $now = $rawNow - ($rawNow % 60)
-    $currentStart = $now - 7200
+    $currentStart = $now - 60
     $currentReset = $now + 7200
-    $pastStart = $now - 25200
-    $pastReset = $now - 14400
+    $pastStart = $now - 300
+    $pastReset = $now - 180
     $publishedPair = 'v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
     # Keep this wire fixture as explicit JSON.  The details endpoint is a
     # strict thirteen-field contract; serializing nested PowerShell dictionaries
     # can silently change null/number kinds between Windows PowerShell builds.
     $details = @"
-{"api_version":"v1","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400,"input_dollars":1.20,"cached_input_dollars":0.20,"output_dollars":0.40},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800,"input_dollars":2.40,"cached_input_dollars":0.50,"output_dollars":0.80},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100,"input_dollars":3.60,"cached_input_dollars":0.70,"output_dollars":1.10}],"active_thread_count":3,"history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$pastStart,"end_at":$pastReset,"reset_at":$pastReset,"label":"Past period","current":false}],"history_samples":[{"timestamp":$($currentStart + 60),"reset_at":$currentReset,"remaining_percent":92.0,"sol_dollars":0.25,"terra_dollars":0.50,"luna_dollars":0.75,"sol_tokens":100,"terra_tokens":200,"luna_tokens":300},{"timestamp":$($now - 60),"reset_at":$currentReset,"remaining_percent":72.0,"sol_dollars":1.20,"terra_dollars":2.40,"luna_dollars":3.60,"sol_tokens":1200,"terra_tokens":2400,"luna_tokens":3600},{"timestamp":$($pastStart + 60),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150},{"timestamp":$($pastStart + 3600),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150},{"timestamp":$($pastReset - 60),"reset_at":$pastReset,"remaining_percent":84.0,"sol_dollars":0.60,"terra_dollars":1.20,"luna_dollars":1.80,"sol_tokens":600,"terra_tokens":1200,"luna_tokens":1800}],"threads":[{"id":"e2e-root","title":"E2E root task","parent_thread_id":null,"model":"TERRA","model_label":"TERRA","total_tokens":2400,"context_usage_tokens":800,"context_window_tokens":16000,"created_at":$($now - 3600),"last_user_message_at":$($now - 300),"is_subagent":false,"depth":0},{"id":"e2e-child","title":"E2E child task","parent_thread_id":"e2e-root","model":"LUNA","model_label":"LUNA","total_tokens":1200,"context_usage_tokens":400,"context_window_tokens":16000,"created_at":$($now - 2400),"last_user_message_at":$($now - 600),"is_subagent":true,"depth":1},{"id":"e2e-orphan","title":"E2E orphan task","parent_thread_id":"missing-parent","model":"SOL","model_label":"SOL","total_tokens":600,"context_usage_tokens":null,"context_window_tokens":null,"created_at":$($now - 1200),"last_user_message_at":null,"is_subagent":true,"depth":null}],"estimated_cost_label":"USD 12.34"}
+{"api_version":"v2","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400,"input_dollars":1.20,"cached_input_dollars":0.20,"output_dollars":0.40},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800,"input_dollars":2.40,"cached_input_dollars":0.50,"output_dollars":0.80},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100,"input_dollars":3.60,"cached_input_dollars":0.70,"output_dollars":1.10}],"active_thread_count":3,"history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$pastStart,"end_at":$pastReset,"reset_at":$pastReset,"label":"Past period","current":false}],"history_samples":[{"timestamp":$currentStart,"reset_at":$currentReset,"remaining_percent":92.0,"sol_dollars":0.25,"terra_dollars":0.50,"luna_dollars":0.75,"sol_tokens":100,"terra_tokens":200,"luna_tokens":300,"model_source":"confirmed"},{"timestamp":$now,"reset_at":$currentReset,"remaining_percent":72.0,"sol_dollars":1.20,"terra_dollars":2.40,"luna_dollars":3.60,"sol_tokens":1200,"terra_tokens":2400,"luna_tokens":3600,"model_source":"confirmed"},{"timestamp":$pastStart,"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150,"model_source":"confirmed"},{"timestamp":$($pastStart + 60),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150,"model_source":"confirmed"},{"timestamp":$pastReset,"reset_at":$pastReset,"remaining_percent":84.0,"sol_dollars":0.60,"terra_dollars":1.20,"luna_dollars":1.80,"sol_tokens":600,"terra_tokens":1200,"luna_tokens":1800,"model_source":"confirmed"}],"threads":[{"id":"e2e-root","title":"E2E root task","parent_thread_id":null,"model":"TERRA","model_label":"TERRA","total_tokens":2400,"context_usage_tokens":800,"context_window_tokens":16000,"created_at":$($now - 3600),"last_user_message_at":$($now - 300),"is_subagent":false,"depth":0},{"id":"e2e-child","title":"E2E child task","parent_thread_id":"e2e-root","model":"LUNA","model_label":"LUNA","total_tokens":1200,"context_usage_tokens":400,"context_window_tokens":16000,"created_at":$($now - 2400),"last_user_message_at":$($now - 600),"is_subagent":true,"depth":1},{"id":"e2e-orphan","title":"E2E orphan task","parent_thread_id":"missing-parent","model":"SOL","model_label":"SOL","total_tokens":600,"context_usage_tokens":null,"context_window_tokens":null,"created_at":$($now - 1200),"last_user_message_at":null,"is_subagent":true,"depth":null}],"estimated_cost_label":"USD 12.34"}
 "@
     # Keep the explicit sample values above while enforcing the wire order
     # independently of PowerShell object serialization: past -> current.
@@ -2375,9 +2407,12 @@ try {
                 return $candidate
             }
             $description = "$metricKey-$($resizeState.Name)"
-            $capture = Capture-E2EWindow $graph.Handle ("resize-{0}" -f $description)
-            $measurements[$resizeState.Name] = Get-E2EGraphMeasurement `
-                -Capture $capture -Plot $plot -WindowHandle $graph.Handle -Description $description
+            # SetWindowPos returns before Avalonia/ScottPlot necessarily paints
+            # the new width. Measure the first fully rendered frame, not the
+            # stale previous-width frame inside the resized HWND.
+            $measurements[$resizeState.Name] = Wait-E2EGraphPixelsReady `
+                -Root $graphRoot -WindowHandle $graph.Handle -Description $description
+            $null = Capture-E2EWindow $graph.Handle ("resize-{0}" -f $description)
         }
 
         $target = $measurements['940x640']
