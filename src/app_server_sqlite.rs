@@ -515,7 +515,7 @@ fn validate_generation_shape_at(
         .map_err(|_| GenerationError::new(GenerationErrorKind::UnsafeGeneration))?;
         let opened = rustix::fs::fstat(&entry_fd)
             .map_err(|_| GenerationError::new(GenerationErrorKind::UnsafeGeneration))?;
-        validate_private_regular_stat(&opened)?;
+        validate_generation_entry_stat(&name, &opened)?;
         let current = rustix::fs::statat(directory, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|_| GenerationError::new(GenerationErrorKind::UnsafeGeneration))?;
         if !same_stat_identity(&opened, &current) {
@@ -648,7 +648,7 @@ fn remove_generation_files(
             .map_err(|_| GenerationError::new(GenerationErrorKind::UnsafeGeneration))?;
             let opened = rustix::fs::fstat(&entry_fd)
                 .map_err(|_| GenerationError::new(GenerationErrorKind::UnsafeGeneration))?;
-            validate_private_regular_stat(&opened)?;
+            validate_generation_entry_stat(&entry_name, &opened)?;
             let current = rustix::fs::statat(
                 directory,
                 &entry_name,
@@ -722,6 +722,25 @@ fn validate_private_regular_stat(stat: &rustix::fs::Stat) -> Result<(), Generati
         || stat.st_uid != rustix::process::geteuid().as_raw()
         || stat.st_nlink != 1
         || stat.st_mode & 0o777 != 0o600
+    {
+        return Err(GenerationError::new(GenerationErrorKind::UnsafeGeneration));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_generation_entry_stat(
+    name: &OsStr,
+    stat: &rustix::fs::Stat,
+) -> Result<(), GenerationError> {
+    if name == MARKER_FILE || name == LOCK_FILE {
+        return validate_private_regular_stat(stat);
+    }
+    if !is_allowed_sqlite_name(name)
+        || rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_nlink != 1
+        || stat.st_mode & 0o133 != 0
     {
         return Err(GenerationError::new(GenerationErrorKind::UnsafeGeneration));
     }
@@ -871,6 +890,25 @@ mod tests {
         assert!(!first_path.exists());
         assert_eq!(root_entry_names(&fixture.cache).unwrap().len(), 1);
         third.cleanup().unwrap();
+    }
+
+    #[test]
+    fn live_generation_accepts_private_root_sqlite_files_created_by_app_server() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        let first = PreparedGeneration::prepare(&fixture.cache, &fixture.codex).unwrap();
+        let app_server_database = first.path().join("logs_2.sqlite");
+        fs::write(&app_server_database, b"app-server").unwrap();
+        fs::set_permissions(&app_server_database, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let second = PreparedGeneration::prepare(&fixture.cache, &fixture.codex).unwrap();
+
+        assert!(first.path().exists());
+        assert!(second.path().exists());
+        second.cleanup().unwrap();
+        first.cleanup().unwrap();
+        assert!(root_entry_names(&fixture.cache).unwrap().is_empty());
     }
 
     #[test]
