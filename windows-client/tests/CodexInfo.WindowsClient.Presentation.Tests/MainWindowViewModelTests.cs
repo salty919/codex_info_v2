@@ -145,6 +145,60 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public async Task V3CurrentAndThreadsPublishOneSolThreadAtomically()
+    {
+        var current = CurrentSnapshot(activeThreadCount: 1);
+        var thread = ThreadDetails("gpt-5.6-sol");
+        var client = new SplitCurrentThreadsClient(
+            current,
+            ThreadsFetchResult.Success(new ApiThreadsSnapshot([thread], current.PublishedPair)));
+        using var viewModel = new MainWindowViewModel(client);
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.ActiveSolCount == 1);
+
+        Assert.Equal(1, client.ThreadsCallCount);
+        Assert.Equal(1UL, viewModel.ActiveThreadCount);
+        Assert.Equal(0, viewModel.ActiveOtherCount);
+        Assert.Same(thread, Assert.Single(viewModel.DetailsSnapshot!.Threads));
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task V3IncompleteThreadsGenerationRetainsLastCompleteDisplay(int failureMode)
+    {
+        var first = CurrentSnapshot(activeThreadCount: 1);
+        var sol = ThreadDetails("gpt-5.6-sol");
+        var second = CurrentSnapshot(activeThreadCount: 2, observedAt: 2);
+        var secondThreads = failureMode switch
+        {
+            0 => ThreadsFetchResult.FromFailure(DetailsFetchFailure.Transport),
+            1 => ThreadsFetchResult.Success(new ApiThreadsSnapshot(
+                [sol, ThreadDetails("gpt-5.6-luna", "thread-2")],
+                PublishedPair(OtherPublishedPair))),
+            _ => ThreadsFetchResult.Success(new ApiThreadsSnapshot([sol], second.PublishedPair)),
+        };
+        var client = new SequencedSplitClient(
+            [first, second],
+            [ThreadsFetchResult.Success(new ApiThreadsSnapshot([sol], first.PublishedPair)), secondThreads]);
+        using var viewModel = new MainWindowViewModel(client);
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.ActiveSolCount == 1);
+        var lastGood = viewModel.DetailsSnapshot;
+
+        viewModel.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => viewModel.DetailsStatusAutomationText == "error");
+
+        Assert.Same(lastGood, viewModel.DetailsSnapshot);
+        Assert.Equal(1UL, viewModel.ActiveThreadCount);
+        Assert.Equal(1, viewModel.ActiveSolCount);
+        Assert.Equal(0, viewModel.ActiveOtherCount);
+    }
+
+    [Fact]
     public async Task InitialFailureExposesOneRetryAndRecoversThroughOneExplicitGeneration()
     {
         var supervisor = new RecordingSupervisor();
@@ -1424,6 +1478,33 @@ public sealed class MainWindowViewModelTests
             PublishedPair = PublishedPair(CanonicalPublishedPair),
         };
 
+    private static ApiCurrentSnapshot CurrentSnapshot(
+        ulong activeThreadCount,
+        long observedAt = 1) => new(
+            ApiState.Ready,
+            observedAt,
+            true,
+            "Pro",
+            new ApiQuota(45, 2, 604800, false),
+            [new ApiDetailsModelUsage("SOL", 1, 0, 0, 1, 0, 0)],
+            activeThreadCount,
+            PublishedPair(CanonicalPublishedPair));
+
+    private static ApiThreadDetails ThreadDetails(string model, string id = "thread-1") => new(
+        id,
+        "Active thread",
+        null,
+        model,
+        model,
+        null,
+        null,
+        null,
+        1,
+        1,
+        false,
+        null,
+        false);
+
     private static PublishedPairIdentity PublishedPair(string value)
     {
         var method = typeof(PublishedPairIdentity).GetMethod(
@@ -1484,7 +1565,73 @@ public sealed class MainWindowViewModelTests
 
         public Task<ThreadsFetchResult> FetchThreadsAsync(
             CancellationToken cancellationToken = default) =>
-            throw new InvalidOperationException("Main must not request threads.");
+            current.ActiveThreadCount == 0
+                ? throw new InvalidOperationException("Main must not request threads for an empty summary.")
+                : Task.FromResult(ThreadsFetchResult.FromFailure(DetailsFetchFailure.Response));
+    }
+
+    private sealed class SplitCurrentThreadsClient(
+        ApiCurrentSnapshot current,
+        ThreadsFetchResult threads) : HealthyDetailsClientBase, ILoopbackResourceClient
+    {
+        private int threadsCallCount;
+
+        public int ThreadsCallCount => Volatile.Read(ref threadsCallCount);
+
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("The split client must not request combined details.");
+
+        public Task<CurrentFetchResult> FetchCurrentAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(CurrentFetchResult.Success(current));
+
+        public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Main must not request history periods.");
+
+        public Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+            string periodId,
+            string? cursor = null,
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Main must not request history pages.");
+
+        public Task<ThreadsFetchResult> FetchThreadsAsync(CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref threadsCallCount);
+            return Task.FromResult(threads);
+        }
+    }
+
+    private sealed class SequencedSplitClient(
+        ApiCurrentSnapshot[] current,
+        ThreadsFetchResult[] threads) : HealthyDetailsClientBase, ILoopbackResourceClient
+    {
+        private int currentIndex;
+        private int threadsIndex;
+
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("The split client must not request combined details.");
+
+        public Task<CurrentFetchResult> FetchCurrentAsync(CancellationToken cancellationToken = default)
+        {
+            var index = Math.Min(Interlocked.Increment(ref currentIndex) - 1, current.Length - 1);
+            return Task.FromResult(CurrentFetchResult.Success(current[index]));
+        }
+
+        public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Main must not request history periods.");
+
+        public Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+            string periodId,
+            string? cursor = null,
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Main must not request history pages.");
+
+        public Task<ThreadsFetchResult> FetchThreadsAsync(CancellationToken cancellationToken = default)
+        {
+            var index = Math.Min(Interlocked.Increment(ref threadsIndex) - 1, threads.Length - 1);
+            return Task.FromResult(threads[index]);
+        }
     }
 
     private sealed class CountingSequenceClient(params DetailsFetchResult[] results) : HealthyDetailsClientBase
