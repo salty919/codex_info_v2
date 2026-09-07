@@ -48,10 +48,6 @@ slint::include_modules!();
 enum AccountCommand {
     Read,
     Login,
-    Verify {
-        admission: AccountAdmission,
-        account_key: account_scope::AccountKey,
-    },
     FinishFallback,
     Stop,
 }
@@ -111,10 +107,6 @@ enum Event {
     },
     AuthUrl(String),
     Usage(Box<UsageEvent>),
-    Verified {
-        admission: AccountAdmission,
-        valid: bool,
-    },
     IdentityError(String),
     Error(String),
 }
@@ -8504,11 +8496,7 @@ fn start_account_app_server(
 }
 
 fn fallback_account_cycle_complete(global_fallback: bool, command: &AccountCommand) -> bool {
-    global_fallback
-        && matches!(
-            command,
-            AccountCommand::Verify { .. } | AccountCommand::FinishFallback
-        )
+    global_fallback && matches!(command, AccountCommand::FinishFallback)
 }
 
 fn account_server_worker(
@@ -8773,55 +8761,6 @@ fn account_server_worker(
                         let _ = events.send(event);
                     }
                 }
-            }
-            AccountCommand::Verify {
-                admission,
-                account_key,
-            } => {
-                let generation_before = account_updates.generation;
-                let key_before = account_scope::read_account_key(&default_codex_root());
-                let result = request_tracked(
-                    &mut server.input,
-                    &server.output,
-                    &mut account_updates,
-                    id,
-                    "account/read",
-                    json!({}),
-                );
-                let Some(next_id) = id.checked_add(1) else {
-                    let _ = events.send(Event::IdentityError(
-                        "Codex APIの要求IDが上限に達しました。".into(),
-                    ));
-                    break;
-                };
-                id = next_id;
-                let authenticated = match result {
-                    Ok(value) => matches!(
-                        protocol_contract::decode_account(&value),
-                        Ok(protocol_contract::AccountOutcome::Supported { .. })
-                    ),
-                    Err(error) => {
-                        let event = if account_updates.valid {
-                            Event::Error(error)
-                        } else {
-                            Event::IdentityError(error)
-                        };
-                        let _ = events.send(event);
-                        continue;
-                    }
-                };
-                let key_after = account_scope::read_account_key(&default_codex_root());
-                let valid = authenticated
-                    && account_updates.valid
-                    && generation_before == admission.account_update_generation
-                    && account_updates.generation == admission.account_update_generation
-                    && key_before
-                        .as_ref()
-                        .is_ok_and(|current| current.same_account(&account_key))
-                    && key_after
-                        .as_ref()
-                        .is_ok_and(|current| current.same_account(&account_key));
-                let _ = events.send(Event::Verified { admission, valid });
             }
         }
         if finish_fallback {
@@ -9580,6 +9519,18 @@ struct CodexInfoState {
     /// an If-None-Match header they do not understand.
     service_v3_published_pair: Option<String>,
     acknowledged_recorder_commit: Option<AcknowledgedRecorderCommit>,
+}
+
+fn local_account_authority_matches(
+    current_admission: Option<&AccountAdmission>,
+    expected_admission: &AccountAdmission,
+    state_account_key: Option<&account_scope::AccountKey>,
+    expected_account_key: &account_scope::AccountKey,
+    local_account_key: Option<&account_scope::AccountKey>,
+) -> bool {
+    current_admission == Some(expected_admission)
+        && state_account_key.is_some_and(|current| current.same_account(expected_account_key))
+        && local_account_key.is_some_and(|current| current.same_account(expected_account_key))
 }
 
 impl CodexInfoState {
@@ -10814,8 +10765,7 @@ impl CodexInfoState {
                 }
                 // Account/quota reads belong to the resident service. The UI
                 // control bridge must never mutate the visible root with them.
-                Event::Ready | Event::Account { .. } | Event::Usage(_) | Event::Verified { .. } => {
-                }
+                Event::Ready | Event::Account { .. } | Event::Usage(_) => {}
             }
         }
     }
@@ -11896,18 +11846,31 @@ impl CodexInfoState {
             self.apply_identity_error("Session確認時のアカウントidentityがありません。".into());
             return;
         };
-        let command = AccountCommand::Verify {
-            admission: candidate.admission.clone(),
-            account_key,
-        };
-        if !self.bridge.send(command) {
-            self.local_usage_pending = false;
-            self.apply_account_error(
-                "Session集計後のアカウント再確認を開始できませんでした。".into(),
+
+        // The local collector is independent from the app-server. Once the
+        // account admission is known, a remote account recheck here would
+        // make a transport outage discard an otherwise valid
+        // local candidate. Recheck the local account authority against the
+        // admission captured before the scan instead; any missing, switched,
+        // or corrupt authority remains fail-closed.
+        let current_admission = self.current_account_admission();
+        let local_account_key = account_scope::read_account_key(&default_codex_root()).ok();
+        if !local_account_authority_matches(
+            current_admission.as_ref(),
+            &candidate.admission,
+            self.account_key.as_ref(),
+            &account_key,
+            local_account_key.as_ref(),
+        ) {
+            self.apply_identity_error(
+                "Session集計後にアカウントidentityを安全に確認できませんでした。".into(),
             );
             return;
         }
+        let admission = candidate.admission.clone();
         self.pending_local_verification = Some(candidate);
+        self.apply_account_verification(admission, true);
+        let _ = self.bridge.send(AccountCommand::FinishFallback);
     }
 
     fn apply_account_verification(&mut self, admission: AccountAdmission, valid: bool) {
@@ -12241,9 +12204,6 @@ impl CodexInfoState {
                         "認証URLを発行しました。「認証ページを開く」を押してください。".into();
                 }
                 Event::Usage(event) => self.apply_usage_event(*event),
-                Event::Verified { admission, valid } => {
-                    self.apply_account_verification(admission, valid)
-                }
                 Event::IdentityError(error) => {
                     self.apply_identity_error(error);
                     return true;
@@ -31438,27 +31398,71 @@ mod tests {
                 super::AccountServerAttempt::GlobalFallback
             ]
         );
+        assert!(!super::fallback_account_cycle_complete(
+            true,
+            &super::AccountCommand::Read
+        ));
+        assert!(super::fallback_account_cycle_complete(
+            true,
+            &super::AccountCommand::FinishFallback
+        ));
+        assert!(!super::fallback_account_cycle_complete(
+            false,
+            &super::AccountCommand::FinishFallback
+        ));
+    }
+
+    #[test]
+    fn local_recorder_authority_requires_stable_admission_and_account() {
         let admission = super::AccountAdmission {
-            account_update_generation: 0,
+            account_update_generation: 1,
             profile_scope_id: "profile".into(),
             account_scope_id: "account".into(),
             storage_epoch: 1,
             partition_id: "partition".into(),
         };
-        let verify = super::AccountCommand::Verify {
-            admission,
-            account_key: super::account_scope::AccountKey::synthetic_preview("account"),
+        let account_key = super::account_scope::AccountKey::synthetic_preview("account");
+        assert!(super::local_account_authority_matches(
+            Some(&admission),
+            &admission,
+            Some(&account_key),
+            &account_key,
+            Some(&account_key),
+        ));
+
+        let switched_key = super::account_scope::AccountKey::synthetic_preview("other-account");
+        let switched_admission = super::AccountAdmission {
+            partition_id: "other-partition".into(),
+            ..admission.clone()
         };
-        assert!(!super::fallback_account_cycle_complete(
-            true,
-            &super::AccountCommand::Read
+        assert!(!super::local_account_authority_matches(
+            Some(&switched_admission),
+            &admission,
+            Some(&account_key),
+            &account_key,
+            Some(&account_key),
         ));
-        assert!(super::fallback_account_cycle_complete(true, &verify));
-        assert!(super::fallback_account_cycle_complete(
-            true,
-            &super::AccountCommand::FinishFallback
+        assert!(!super::local_account_authority_matches(
+            Some(&admission),
+            &admission,
+            Some(&switched_key),
+            &account_key,
+            Some(&account_key),
         ));
-        assert!(!super::fallback_account_cycle_complete(false, &verify));
+        assert!(!super::local_account_authority_matches(
+            Some(&admission),
+            &admission,
+            Some(&account_key),
+            &account_key,
+            Some(&switched_key),
+        ));
+        assert!(!super::local_account_authority_matches(
+            Some(&admission),
+            &admission,
+            Some(&account_key),
+            &account_key,
+            None,
+        ));
     }
 
     #[test]
