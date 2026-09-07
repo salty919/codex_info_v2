@@ -3315,6 +3315,7 @@ fn main_sample_from_public_observation(
     })
 }
 
+#[cfg(test)]
 fn store_observation_from_public(
     observation: &PublicHistoryObservation,
 ) -> usage_store::UsageHistoryObservation {
@@ -3853,6 +3854,7 @@ impl UsageHistory {
         self.normalize();
     }
 
+    #[cfg(test)]
     fn record(&mut self, sample: UsageHistorySample) {
         self.record_with_models(sample, None, false);
     }
@@ -3886,6 +3888,7 @@ impl UsageHistory {
         self.retain_acquisition_window(acquisition_end);
     }
 
+    #[cfg(test)]
     fn apply_backfill_samples(&mut self, reset_at: i64, samples: Vec<UsageHistorySample>) {
         self.apply_backfill_samples_with_models(reset_at, samples, Vec::new(), false);
     }
@@ -4312,10 +4315,12 @@ struct GraphConfirmedGap {
     end_at: i64,
 }
 
+#[cfg(test)]
 fn graph_paths(samples: &[&UsageHistorySample], period_start: i64, period_end: i64) -> GraphPaths {
     graph_paths_with_confirmed_gaps(samples, period_start, period_end, &[])
 }
 
+#[cfg(test)]
 fn graph_paths_with_confirmed_gaps(
     samples: &[&UsageHistorySample],
     period_start: i64,
@@ -4480,6 +4485,7 @@ fn graph_paths_with_sources(
 
 /// Builds a view from the monotonic cumulative snapshots. Flat and increasing
 /// segments are kept in separate paths so the UI can render distinct widths.
+#[cfg(test)]
 fn graph_paths_for_selection(
     samples: &[&UsageHistorySample],
     period_start: i64,
@@ -4501,6 +4507,7 @@ fn graph_paths_for_selection(
     )
 }
 
+#[cfg(test)]
 fn graph_paths_for_selection_with_confirmed_gaps(
     samples: &[&UsageHistorySample],
     period_start: i64,
@@ -4524,6 +4531,7 @@ fn graph_paths_for_selection_with_confirmed_gaps(
     )
 }
 
+#[cfg(test)]
 fn graph_paths_for_selection_with_sources(
     samples: &[&UsageHistorySample],
     period_start: i64,
@@ -5047,6 +5055,7 @@ fn latest_reliable_model_spend(
     })
 }
 
+#[cfg(test)]
 fn unreliable_model_spend(timestamp: i64) -> HourlyModelSpend {
     HourlyModelSpend {
         timestamp,
@@ -5062,6 +5071,7 @@ fn minute_model_spend(samples: &[&UsageHistorySample]) -> Vec<HourlyModelSpend> 
     minute_model_spend_for_metric(samples, false)
 }
 
+#[cfg(test)]
 fn minute_model_spend_for_metric(
     samples: &[&UsageHistorySample],
     show_tokens: bool,
@@ -5208,6 +5218,7 @@ fn append_dashed_segment(commands: &mut String, start: (f64, f64), end: (f64, f6
     }
 }
 
+#[cfg(test)]
 fn split_metric_line_paths(
     points: &[HourlyModelSpend],
     period_start: i64,
@@ -5363,6 +5374,7 @@ fn split_metric_line_paths_with_evidence(
 /// Return horizontal bands only where every represented cumulative model
 /// series is confirmed unchanged. Missing and unavailable evidence belongs to
 /// the thin dashed paths and must never be labelled as idle.
+#[cfg(test)]
 fn unused_interval_positions(
     points: &[HourlyModelSpend],
     period_start: i64,
@@ -5583,6 +5595,7 @@ fn format_metric_value(value: f64, show_tokens: bool) -> String {
 /// after an unobserved active interval closes that interval even when the
 /// model snapshot has already stopped changing; a genuinely idle period that
 /// never had model usage remains horizontal.
+#[cfg(test)]
 fn remaining_graph_points(
     samples: &[&UsageHistorySample],
     period_start: i64,
@@ -5597,6 +5610,7 @@ fn remaining_graph_points(
     )
 }
 
+#[cfg(test)]
 fn remaining_graph_points_for_metric(
     samples: &[&UsageHistorySample],
     period_start: i64,
@@ -6336,7 +6350,7 @@ struct LocalInputInventory {
     selected_session_files: Vec<SessionFileCandidate>,
     overflow_session_files: Vec<SessionFileCandidate>,
     sessions_root: Option<PathBuf>,
-    #[allow(dead_code)]
+    #[cfg(test)]
     recovery_path: Option<PathBuf>,
     fingerprint: LocalInputFingerprint,
 }
@@ -6555,6 +6569,7 @@ fn local_input_inventory_for_paths_with_limit(
         selected_session_files,
         overflow_session_files,
         sessions_root,
+        #[cfg(test)]
         recovery_path,
         fingerprint: LocalInputFingerprint {
             session_files: selected_fingerprints,
@@ -7233,6 +7248,7 @@ fn model_usage_timeline_from_events(
     model_usage_timeline_from_events_with_initial(events, reset_at, ModelUsageTotals::default())
 }
 
+#[cfg(test)]
 fn model_usage_timeline_from_events_with_initial(
     events: Vec<TimedModelUsage>,
     reset_at: i64,
@@ -9048,6 +9064,7 @@ impl LocalUsageCache {
                 Vec::new()
             },
             sessions_root: inventory.sessions_root.clone(),
+            #[cfg(test)]
             recovery_path: None,
             fingerprint: LocalInputFingerprint {
                 session_files: verified_files
@@ -10803,6 +10820,7 @@ impl CodexInfoState {
         }
     }
 
+    #[cfg(test)]
     fn apply_service_details(
         &mut self,
         published_pair: String,
@@ -10811,6 +10829,7 @@ impl CodexInfoState {
         self.apply_service_details_v2(published_pair, PublicDetailsV2::from(details))
     }
 
+    #[cfg(test)]
     fn apply_service_details_v2(
         &mut self,
         published_pair: String,
@@ -12614,23 +12633,6 @@ impl CodexInfoState {
         self.window_seconds.max(WEEK_SECONDS)
     }
 
-    #[allow(dead_code)]
-    fn graph_paths_for_selection(
-        &self,
-        show_luna: bool,
-        show_terra: bool,
-        show_sol: bool,
-        show_tokens: bool,
-    ) -> GraphPaths {
-        self.graph_paths_for_selection_at(
-            Utc::now().timestamp(),
-            show_luna,
-            show_terra,
-            show_sol,
-            show_tokens,
-        )
-    }
-
     fn selected_history_reset_for_periods(&self, periods: &[HistoryPeriod]) -> Option<i64> {
         if let Some(period) = periods
             .iter()
@@ -12799,6 +12801,7 @@ impl CodexInfoState {
         points
     }
 
+    #[cfg(test)]
     fn graph_paths_for_selection_at(
         &self,
         observed_at: i64,
@@ -13370,12 +13373,6 @@ fn active_thread_rows_at(threads: &[ActiveThread], now: i64) -> Vec<ActiveThread
     )
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-fn active_thread_rows(threads: &[ActiveThread]) -> Vec<ActiveThreadRow> {
-    active_thread_rows_at(threads, Utc::now().timestamp())
-}
-
 fn sync_threads_window(state: &CodexInfoState, threads_window: &ThreadsWindow) {
     threads_window.set_strings(ui_strings(&state.i18n));
     threads_window.set_thread_count_label(
@@ -13920,11 +13917,6 @@ impl CodexInfoState {
             })
             .map(|period| period.label)
             .unwrap_or_else(|| "履歴なし".into())
-    }
-
-    #[allow(dead_code)]
-    fn graph_time_labels(&self) -> [String; 5] {
-        self.graph_time_labels_at(Utc::now().timestamp())
     }
 
     fn graph_time_labels_at(&self, observed_at: i64) -> [String; 5] {
@@ -14903,6 +14895,7 @@ fn request_service_details_with_etag(
     })
 }
 
+#[cfg(test)]
 fn fetch_service_details(address: SocketAddr) -> Result<(String, PublicDetails), String> {
     let response = request_service_details(address, "/v1/details")?;
     if response.status != 200 {
@@ -14914,10 +14907,12 @@ fn fetch_service_details(address: SocketAddr) -> Result<(String, PublicDetails),
     Ok((pair, parse_details_document(&response.body)?))
 }
 
+#[cfg(test)]
 fn fetch_service_details_v2(address: SocketAddr) -> Result<(String, PublicDetailsV2), String> {
     fetch_service_details_v2_with(|route| request_service_details(address, route))
 }
 
+#[cfg(test)]
 fn fetch_service_details_v2_with<F>(mut request: F) -> Result<(String, PublicDetailsV2), String>
 where
     F: FnMut(&str) -> Result<ServiceDetailsHttpResponse, String>,
@@ -15005,35 +15000,6 @@ fn public_details_v3_from_v2(details: &PublicDetailsV2) -> PublicDetailsV3 {
             .collect(),
         history_gaps: details.history_gaps.clone(),
         threads: details.threads.clone(),
-    }
-}
-
-fn fetch_service_details_v3(
-    address: SocketAddr,
-    prior_pair: Option<&str>,
-) -> Result<ServiceDetailsV3Fetch, String> {
-    fetch_service_details_v3_with_etag(
-        |route, if_none_match| {
-            debug_runtime(format!(
-                "requesting service details route={route} conditional={}",
-                if_none_match.is_some()
-            ));
-            request_service_details_with_etag(address, route, if_none_match)
-        },
-        prior_pair,
-    )
-}
-
-fn fetch_service_details_v3_with<F>(mut request: F) -> Result<(String, PublicDetailsV3), String>
-where
-    F: FnMut(&str) -> Result<ServiceDetailsHttpResponse, String>,
-{
-    let result = fetch_service_details_v3_with_etag(|route, _| request(route), None)?;
-    match result {
-        ServiceDetailsV3Fetch::Fresh { pair, details, .. } => Ok((pair, details)),
-        ServiceDetailsV3Fetch::NotModified { .. } => {
-            Err("unexpected not-modified details response".into())
-        }
     }
 }
 
@@ -15287,14 +15253,6 @@ fn service_endpoint_state(address: SocketAddr) -> ServiceEndpointState {
         Some(ServiceHealthVersion::Current) => ServiceEndpointState::Current,
         Some(ServiceHealthVersion::Different) => ServiceEndpointState::Different,
         None => ServiceEndpointState::Unrecognized,
-    }
-}
-
-fn service_health_version(address: SocketAddr) -> Option<ServiceHealthVersion> {
-    match service_endpoint_state(address) {
-        ServiceEndpointState::Current => Some(ServiceHealthVersion::Current),
-        ServiceEndpointState::Different => Some(ServiceHealthVersion::Different),
-        ServiceEndpointState::Absent | ServiceEndpointState::Unrecognized => None,
     }
 }
 
@@ -15859,6 +15817,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn resident_service_cycle_with_recorder_attempt<W, P>(
     state: &mut CodexInfoState,
     publication: &mut ResidentPublicationState,
@@ -15879,6 +15838,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn resident_service_cycle_with_recorder_attempt_v2<W, P>(
     state: &mut CodexInfoState,
     publication: &mut ResidentPublicationState,
@@ -15899,6 +15859,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn resident_service_cycle_with_recorder_attempt_v3<W, P>(
     state: &mut CodexInfoState,
     publication: &mut ResidentPublicationState,
