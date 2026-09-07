@@ -13,11 +13,11 @@ API-DEPRECATION-01
 
 ## API世代と廃止境界
 
-`API-V3-MODELS-01`: `/v3/details`はcommit済みdomain snapshotを、有界な`models`配列として返す。model ID、token内訳、価格計算可否を事実として分離し、UI固定列や表示文言をwire fieldにしない。`/health`はAPI世代から独立したread-only readiness endpointとし、collector、DB writer、外部quota取得の生存状態を混同しない。
+`API-V3-MODELS-01`: v3の`current`と`history` resourceはcommit済みdomain snapshotを、有界な`models`配列として返す。model ID、token内訳、価格計算可否を事実として分離し、UI固定列や表示文言をwire fieldにしない。`/health`はAPI世代から独立したread-only readiness endpointとし、collector、DB writer、外部quota取得の生存状態を混同しない。
 
 v3の各履歴rowは`models`と`models_complete`を持つ。各model rowの`total_tokens`と`total_dollars`は個別に確認できた累計、入力・cached入力・cache write入力・出力は確認できたfieldだけを持ち、未確認fieldを反復`null`で送らない。旧`usage_history`のSOL/TERRA/LUNA列は既知の`total_tokens`と`total_dollars`として保持し、同時刻の不完全なgeneric model集合へ名前単位でmergeする。旧schemaにない内訳を0や推測値で補わない。`models_complete=true`は同じ観測で全モデル集合を確定できた場合だけ許可し、`model_source=confirmed`と非nullの`models`を必要とする。保持ログからASTRAだけを回収した場合や旧3モデルだけが既知の場合は`models_complete=false`、`model_source=legacy-unknown`とし、配列にないモデルを0と解釈しない。clientは掲載modelの実測値を通常線で表示し、当該model自体の未観測区間だけを破線または切断で示す。集合の不完全性だけで掲載modelを予測値へ降格しない。
 
-`API-DEPRECATION-01`: `/v1/details`と`/v2/details`はdeprecated互換adapterである。互換期間中は同じatomic generationから生成し、既存field、値型、header allowlistを変更しない。新clientはv3を優先し、exact 404の場合だけv2、さらにexact 404の場合だけv1へfallbackし、世代をmergeしない。廃止日は未決定であり、決定前に`Sunset`を送らない。将来の削除対象は旧details route、adapter、client fallbackだけで、Session collector、SQLite writer、domain model、`/health`は対象外とする。
+`API-DEPRECATION-01`: `/v1/details`、`/v2/details`、全表示情報を一体化した`/v3/details`は互換adapterである。互換期間中は同じatomic generationから生成し、既存field、値型、header allowlistを変更しない。新clientはv3 split resourceを優先し、`/v3/current`がexact 404の場合だけ`/v3/details`、さらにexact 404の場合だけv2、v1へfallbackし、世代をmergeしない。廃止日は未決定であり、決定前に`Sunset`を送らない。将来の削除対象は旧details route、adapter、client fallbackだけで、Session collector、SQLite writer、domain model、`/health`は対象外とする。
 
 ## 目的と境界
 
@@ -78,9 +78,10 @@ ssh -N -o BatchMode=yes -L 8787:127.0.0.1:8787 <connectionSelector>
 Windowsのcanonical `ArgumentList`はValue AuthoritiesおよびWIN-E-006..010の
 `[ssh.exe,-o,BatchMode=yes,-N,-L,8787:127.0.0.1:8787,<validated alias>]`に従う。
 
-このときLinux / Windows UIの表示rootは
-`http://127.0.0.1:8787/v3/details`の一応答であり、旧serviceがexact 404を返す場合だけv2、
-さらにexact 404の場合だけv1の一応答へfallbackする。複数応答をmergeしない。HTTPはLinux側のloopbackと
+このときLinux / Windows UIは`http://127.0.0.1:8787`のv3 split resourceから、可視surfaceに必要な
+current、period/history page、またはThreadsだけを取得する。各取得cycleは同じpublished pairの完全集合だけを
+atomic commitし、部分pageをmergeしない。履歴差分だけは、直前rootのcursorが既取得prefix不変を証明した場合に限り、新pairの完全集合を旧prefixへatomic appendできる。新resourceがない旧serviceへの互換fallbackだけは
+`/v3/details`、v2、v1をexact 404順で一応答ずつ受理する。HTTPはLinux側のloopbackと
 SSH トンネルの端点の間だけで使用し、端末間の暗号化・相手認証は SSH が担当する。
 そのため v1 では HTTPS 証明書を扱わない。
 
@@ -91,8 +92,8 @@ SSH トンネルの端点の間だけで使用し、端末間の暗号化・相�
 `Content-Length`をUTF-8 body bytesと一致させ、未知長の受信側もstream中の上限超過で停止する。
 `Set-Cookie`、`Location`、`Content-Encoding`、`WWW-Authenticate`、proxy/authentication headerは
 返さない。response header allowlistはこの`Content-Type`/`Cache-Control`、固定body時の`Content-Length`、
-detailsの`Codex-Info-Published-Pair`だけで、その他のapplication/proxy headerを追加しない。
-v3 clientは直前に受理したpublished pairをquoted `If-None-Match`として`/v3/details`へ一つだけ送信でき、同じ
+snapshot resourceの`Codex-Info-Published-Pair`だけで、その他のapplication/proxy headerを追加しない。
+v3 clientはrouteとqueryごとに直前に受理したpublished pairをquoted `If-None-Match`として一つだけ送信でき、同じ
 published generationならserverは同じpair headerとbody 0の`304`を返す。旧client向け200応答へ新headerを
 追加せず、v1/v2 fallbackへ条件headerを送らない。304を新しいsnapshotや失敗へ
 読み替えずlast-good rootを維持し、pairが異なる場合だけ200の完全rootをatomic置換する。
@@ -102,15 +103,22 @@ published generationならserverは同じpair headerとbody 0の`304`を返す�
 | --- | --- |
 | `GET /v1/health` | resident serviceがread-only snapshot requestを受理できるreadinessを示す。 |
 | `GET /v1/details` | 旧client向けのschema-compatibleな単一atomic rootを返す。 |
-| `GET /v2/details` | Linux / Windows UIの単一atomic rootとして、状態・利用枠・モデル別ドル内訳・履歴・観測元provenance・Threadsを返す。 |
-| `GET /v3/details` | 新client向けの任意model配列と価格可否を持つ単一atomic rootを返す。 |
+| `GET /v2/details` | 旧client向けのprovenance付き単一atomic rootを返す。 |
+| `GET /v3/details` | split resource非対応client向けの任意model単一atomic rootを返す。 |
+| `GET /v3/current` | Mainに必要な状態、利用枠、model累計、active thread countだけを返す。 |
+| `GET /v3/history/periods` | Graphの期間metadataだけを返す。 |
+| `GET /v3/history?period=<opaque>&cursor=<opaque>` | 選択期間の履歴または`cursor`より後の差分を返す。`cursor`は初回だけ省略できる。 |
+| `GET /v3/threads` | Threads surfaceを開いたときだけthread rowsを返す。 |
+
+history成功bodyはexact 5 keys `api_version`、`history_samples`、`history_gaps`、`next_cursor`、`resume_cursor`を持つ。`next_cursor`は同じ取得cycleに後続pageがある場合だけ非nullで、その値を次requestへ使う。`resume_cursor`は応答の最後のsampleまでを証明し、最終pageでも非nullである。cursor付き要求に新sampleがない場合は受理したcursorを`resume_cursor`へ返し、初回要求にsampleがない場合だけnullとする。clientは`next_cursor=null`まで同じpairを集めた後、最後の`resume_cursor`を次回差分用に保存する。
 
 未定義のパスは JSON の `404`、既知パスへの非 `GET` は JSON の `405` で返す。
 応答に email、認証 URL、認証トークン、raw error、ローカルパス、セッション内容を
 含めない。
 
 path照合はcase-sensitiveかつ完全一致であり、URL decode/normalizationを行わない。case-altered path、
-末尾slash追加、query付きknown path、未定義prefixはunknown pathとして扱う。拒否bodyは`api_version="v1"`と固定error codeだけを持つ
+末尾slash追加、`/v3/history`以外のquery付きknown path、未定義prefixはunknown pathとして扱う。history queryは
+`period`をexactly one必須、`cursor`を最大1件とし、未知・重複・空・percent encoding・fragmentを拒否する。拒否bodyは`api_version="v1"`と固定error codeだけを持つ
 JSON objectとし、未知キー・raw error・秘密値を含めない。404/405を含む全responseは
 SQLite transaction、WAL/SHM、migration、prune、backup、DB row/hash、published generationを変更しない。
 
@@ -122,26 +130,31 @@ SQLite transaction、WAL/SHM、migration、prune、backup、DB row/hash、publis
 | `/v1/details` | `GET` | `200` | current immutable details generation、共通headerに加えて必須`Codex-Info-Published-Pair`、DB write/transaction=0 |
 | `/v2/details` | `GET` | `200` | 同じcurrent immutable generationのprovenance付きprojection、同じ必須published pair、DB write/transaction=0 |
 | `/v3/details` | `GET` | `200` | 同じcurrent immutable generationの任意model projection、同じ必須published pair、DB write/transaction=0 |
-| `/v3/details`＋current pairのquoted `If-None-Match` | `GET` | `304` | body 0、同じpublished pair、last-good維持、DB write/transaction=0 |
+| `/v3/current` | `GET` | `200` | history/period/thread rowsを含まないcurrent projection、同じ必須published pair、DB write/transaction=0 |
+| `/v3/history/periods` | `GET` | `200` | period metadata projection、同じ必須published pair、DB write/transaction=0 |
+| `/v3/history?period=...&cursor=...` | `GET` | `200` | 同一pair・選択periodの有限page、DB write/transaction=0 |
+| `/v3/threads` | `GET` | `200` | thread projection、同じ必須published pair、DB write/transaction=0 |
+| v3 snapshot resource＋route/queryのcurrent pair | `GET` | `304` | body 0、同じpublished pair、route-local last-good維持、DB write/transaction=0 |
 | 上記known path | `HEAD/POST/PUT/PATCH/DELETE/OPTIONS`等全non-GET | `405` | 固定JSON error、同上header、DB/WAL/SHM/migration/prune/backup=0 |
 | unknown、case-altered、末尾slash、query付きpath（methodを問わない） | any | `404` | 固定JSON error、同上header、DB/WAL/SHM/migration/prune/backup=0 |
 
-RESTのtransfer body上限はdetails `32 MiB`、response header `8 KiB`である。
+RESTのtransfer body上限は既存のOOM/DoS安全境界であるdetails `32 MiB`、health/error `4 KiB`、response header `8 KiB`を全resourceで共有する。この値を通常データ件数の妥当性判定へ使わない。historyは次の正当なrowを加えると32 MiBへ達する場合だけ、そのrowの直前でpageを完了してopaque cursorを返し、次pageへ必ず前進する。単一row自体が安全境界を超える場合だけ`resource_too_large`とし、recorder、DB、公開generationを変更しない。
 SQLiteの保持期間は過去3暦月である。一方、1回のDB取得と`details`応答が扱う履歴は観測時刻で終わる
 最長1暦月の半開区間 `(one_month_before(observed_at), observed_at]` に限定する。history samples上限は
-31日分の1分bucketに相当する`44,640`、history periods `128`、confirmed history gaps `4,096`、threads `256`である。v1/v2のmodels上限は固定3件、v3のtop-levelおよび各history rowのmodels上限は`1,024`件である。
+31日分の1分bucketに相当する`44,640`、history periods `128`、confirmed history gaps `4,096`、threads `256`である。v3 history pageのrow数は固定せず、選択期間の残件数と上記OOM境界から決まる。v1/v2のmodels上限は固定3件、v3のtop-levelおよび各history rowのmodels上限はOOM/DoS境界として`1,024`件である。
 
 ### 応答時間SLOと容量条件
 
-warm-up後、loopback、in-flight 1でrequest送信開始からresponse body全受信までを測る。
-`/v1/health`と全4xxはP90 25 ms以下・P95 50 ms以下、v1/v2/v3 detailsは
-7日相当10,080 samplesでP90 50 ms以下・P95 100 ms以下、契約最大1暦月44,640 samplesで
-P90 100 ms以下・P95 150 ms以下とする。各route/profileを30回以上測定し、client hard timeoutは
-1秒、timeout・欠測・上限超過はPASSへ丸めない。DB読出しはtimestamp/reset複合indexを使い、
+Release buildを用い、warm loopback、in-flight 1で3回のwarm-up後、request送信開始からresponse body全受信までを各profile 30回測る。
+値を昇順に並べnearest-rankのP90を27番目、P95を29番目とする。profileはhealth、current、periods、選択期間history初回、同cursor差分、threads、固定4xxの到達経路に限定する。各結果にはCPU、memory、storage、OS、build、実際のwire bytes、sample数、model数、thread数を併記し、異なる環境または入力規模を同じprofileとして比較しない。
+
+応答時間はDBを置くmachine、storage、同時負荷、入力規模で変わる非固定値である。従って、最低動作環境と承認済みbaselineを定義するまでは、根拠のない絶対ms値、固定row数、任意の全直積をRelease拒否条件にしない。P90/P95は同じ環境・同じ入力規模に対する退行検出値として保存し、currentが履歴保持量に、history deltaが既取得prefixに比例して増大していないことを確認する。client hard timeoutは外部停止をUIへ閉じ込めるfailure-containment境界であり、serverの性能保証値ではない。timeout・欠測・安全境界超過を測定PASSへ丸めず、該当surfaceのlast-goodを保持してrecorderを継続する。
+
+固定できる値はschema、整合性、保持期間、取得範囲、処理量の次数、failure isolationおよびOOM/DoS安全境界である。CPU時間、I/O時間、1 pageのrow数、通常時payload bytesは固定しない。最低動作環境が製品authorityとして定義された後だけ、その環境と規定datasetから絶対P90/P95のRelease閾値を導出できる。DB読出しはtimestamp/reset複合indexを使い、
 3暦月を保持したDBから1暦月窓のraw候補を一度materializeし、同一分のreset aliasをcanonicalizeした公開sampleだけを44,640点以下にする。raw alias行数を44,640で打ち切ったり取得失敗にしたりせず、full table scan、保持3暦月全体の読出し、UI threadでの
 行単位publishを禁止し、candidate失敗時はlast-good publicationを保持する。
-これらはinternal validated snapshot `1 MiB`とは別resourceであり、どの上限もdecode後の推測値へ
-置換しない。上限超過、malformed、unknown/case key、duplicate key、domain errorは該当resourceの
+ここで扱うpublic REST resourceは、`DATA_PROTECTION_POLICY.md`が別の入力境界に定義するinternal validated snapshotのOOM/DoS安全境界とは別物であり、その`1 MiB`をpublic response cap、通常件数、性能gateへ流用しない。どの安全境界もdecode後の推測値へ
+置換しない。安全境界超過、malformed、unknown/case key、duplicate key、domain errorは該当resourceの
 直前完全generationを保持し、部分候補を公開しない。現行 admission tupleのいずれかがstale・欠落・不一致の
 candidateも同じ扱いとし、DB、memory、REST、UIを変更しない。
 
@@ -277,7 +290,7 @@ exact `v2`とする。`history_samples`の各rowはv1の9キーに`model_source`
 `confirmed`/`legacy-unknown`でmodel 6値の一部だけがnull、または`unavailable`で一つでも非nullのcandidateは
 全体rejectする。local取得失敗時に直前model vectorを新しいtimestampへ複製せず、quotaが取得できた場合だけ
 その実測値を`unavailable` rowへ保存する。v1互換応答には`unavailable` rowも`model_source` fieldも含めない。
-clientは最初にv3を一回要求し、exact routeの404時だけv2、さらにexact routeの404時だけv1を一回要求する。他のstatus、schema/size/header不正、timeoutではfallbackせずlast-good rootを保持する。複数versionのdetails応答を比較・mergeしてはならない。
+旧details clientは最初に`/v3/details`を一回要求し、exact routeの404時だけv2、さらにexact routeの404時だけv1を一回要求する。split対応clientは`/v3/current`を最初に要求し、そのexact 404時だけ同じdetails fallback列へ入る。他のstatus、schema/size/header不正、timeoutではfallbackせず該当surfaceのlast-good rootを保持する。複数versionまたはsplit resourceとdetailsの応答を比較・mergeしてはならない。
 
 各history sample行は`timestamp`、`reset_at`、`remaining_percent`、`sol_dollars`、
 `terra_dollars`、`luna_dollars`、`sol_tokens`、`terra_tokens`、`luna_tokens`だけを持つ。
@@ -310,15 +323,15 @@ rootとsiblingの相対rankを保ったまま親先行depth-first・subtree-cont
 配列上限超過が1件でもあればcandidate全体を拒否する。serverの`SnapshotPublisher`は現行
 `(ProfileScopeId, AccountScopeId, StorageEpoch, auth_epoch, AccountUpdateGeneration, CollectorEpoch, CycleSeq)`、profile publisherを所有する`SupervisorLeaseIdentity`、
 `DataGeneration`、`DataHash`、canonical fingerprint、`RootHash`が一致する内部candidateだけをpublishし、
-その成功publishへ一つの`Codex-Info-Published-Pair`を割り当てる。Linux / Windows UIはdetails一応答のstrict
-schema/domain、exactly oneの正規pair header、body/header sizeを満たす場合だけ、その全fieldを一つのrootとしてcommitする。
+その成功publishへ一つの`Codex-Info-Published-Pair`を割り当てる。Linux / Windows UIは各surfaceが必要とするresourceまたはpage集合のstrict
+schema/domain、同一の正規pair header、body/header sizeを全て満たす場合だけ、そのsurfaceを一つのrootとしてcommitする。
 wireに存在しないserver内部値を推測・再計算せず、SQLite、別generation、control応答で欠落値を補わない。
 取得失敗、更新競合、stale lease/epoch/cycleは架空の世代番号を補わず、DB、memory、REST、UIを変更せず
 last-good generation/rootを保持して次cycleで再取得する。
 
 ## 互換移行
 
-resident serviceはv1/v2/v3を同じloopback listenerで公開する。現行clientはv3を優先し、v1/v2は`API-DEPRECATION-01`のdeprecated adapterとしてだけ残す。旧adapterを将来削除してもcollector、DB、stable health、常駐監視は変更しない。詳細な接続・表示仕様は[Windowsクライアント](WINDOWS_CLIENT.md)とUX ownerを参照する。
+resident serviceはv1/v2/v3を同じloopback listenerで公開する。現行clientはv3 split resourceを優先し、全体detailsは`API-DEPRECATION-01`の互換adapterとしてだけ残す。旧adapterを将来削除してもcollector、DB、stable health、常駐監視は変更しない。詳細な接続・表示仕様は[Windowsクライアント](WINDOWS_CLIENT.md)とUX ownerを参照する。
 
 インターネット経由の利用を将来追加する場合はloopback bindを緩めず、別の設定・認証・脅威モデルとして設計する。
 
@@ -351,11 +364,11 @@ PID、listener、health 200、`product_version`のいずれか単独を成功へ
 - `Content-Type`は`application/json; charset=utf-8`。parameter追加、charset欠落、別charsetを生成しない。
 - `Cache-Control`は`no-store`。
 - fixed bodyでは`Content-Length`をUTF-8 bytesと一致させる。
-- `/v1/details`、`/v2/details`、`/v3/details`の200応答とv3の304応答は`Codex-Info-Published-Pair`をexactly one持つ。値は
+- `/v1/details`、`/v2/details`、全v3 snapshot resourceの200応答とv3の304応答は`Codex-Info-Published-Pair`をexactly one持つ。値は
   ASCII `v1:`に128-bit server epochの32桁lowercase hex、続けて128-bit publish counterの
   32桁lowercase hexを置いた67 bytesだけとする。production UIはdetails headerのprefix/length/lowercase hexだけを検証し、
   epoch/counterを業務値としてparse、sort、永続化、表示せず、そのdetails応答のopaque generation identityとしてだけ扱う。
-  全details routeは同じpublished generationで同じpairを返す。`/health`、error、unknown/method拒否応答はこのheaderを持たない。
+  全snapshot routeは同じpublished generationで同じpairを返す。`/health`、error、unknown/method拒否応答はこのheaderを持たない。
 - response header aggregateは8 KiB以下。`Set-Cookie`、`Location`、`Content-Encoding`、
   `WWW-Authenticate`、authentication/proxy headerは0件。
 
@@ -406,6 +419,7 @@ transfer-decoded bodyは1 KiB以下とする。
 | 405 | `method_not_allowed` | exact known pathに対するGET以外 |
 | 408 | `request_timeout` | request header/body deadline超過 |
 | 413 | `request_body_not_allowed` | GETにnon-zero bodyまたはTransfer-Encoding |
+| 413 | `resource_too_large` | split resourceの単一rowが既存32 MiBのOOM/DoS安全境界内へ収まらない |
 | 429 | `too_many_requests` | connection admission上限超過 |
 | 431 | `request_headers_too_large` | header count/field/aggregate上限超過 |
 | 500 | `internal_error` | response commit前のserialization/invariant failure |
@@ -414,13 +428,14 @@ transfer-decoded bodyは1 KiB以下とする。
 route/publisher faultを200や`state=error`へ丸めない。valid details generation自身の`state=error`だけはschema-valid
 200 snapshotであり、server transport faultと別物である。serialization failureがheader/body commit後に起きた場合は
 connectionをabortし、追加JSONやpartial-success markerを送らない。clientは全non-200、切断、長さ不一致で
-details candidate全体をrejectし、UI consumerは直前のdetails rootを保持する。
+該当resource candidate全体をrejectし、UI consumerはそのsurfaceの直前完全rootを保持する。
 
 ### Request resource contract
 
 製品endpointはHTTP/1.1だけを受け、request targetはorigin-formのexact
-`/health`、`/v1/health`、`/v1/details`、`/v2/details`、`/v3/details`である。percent decode、path normalization、query、fragment、
-absolute-form、authority-form、asterisk-formを許可しない。
+`/health`、`/v1/health`、`/v1/details`、`/v2/details`、`/v3/details`、`/v3/current`、
+`/v3/history/periods`、`/v3/history?period=<opaque>&cursor=<opaque>`、`/v3/threads`である。
+historyのstrict queryを除きpercent decode、path normalization、query、fragment、absolute-form、authority-form、asterisk-formを許可しない。
 
 | resource | 採用上限・規則 |
 | --- | --- |
@@ -435,7 +450,7 @@ absolute-form、authority-form、asterisk-formを許可しない。
 | shutdown | 新規admissionを即時停止し、既存requestを最大3.000秒drain後cancel |
 
 request header allowlistは`Host,Accept,User-Agent,Connection,Content-Length,If-None-Match`だけで、各fieldは最大1件、
-`If-None-Match`は`/v3/details`だけでquoted published pairを受け、他routeでは400とする。
+`If-None-Match`はv3 snapshot resourceだけでquoted published pairを受け、他routeでは400とする。
 ただしContent-Lengthは欠落可とする。`Authorization,Cookie,Proxy-Authorization,Forwarded,X-Forwarded-For,
 X-Forwarded-Host,X-Forwarded-Proto,Upgrade,Expect,TE,Transfer-Encoding`は常に拒否する。obs-fold、NUL、CTL、
 bare LF、invalid UTF-8を値として解釈せず400またはparse前closeにする。拒否requestはbodyを無制限drainせず
@@ -449,13 +464,21 @@ read/write、read-only open/statだけである。persistent log/Event Log/metri
 checkpoint、published generation mutationは禁止する。OS-managed atimeはproduct successの根拠にせず、content/inodeと
 product syscall traceを検査する。同一request再入で副作用countが増えた場合はFAIL/HOLDである。
 
-### Single details client admission
+### Surface-scoped client admission
 
-client cycleはhealth readiness受理後にdetailsを1回取得し、body全体のstrict schema/domain、size、
-exactly oneの`Codex-Info-Published-Pair` header形式を満たす場合だけ同じroot generationとして一括commitする。
+Main cycleはhealth readiness受理後にcurrentを1回取得する。Graphはopen/period選択時だけperiodsと選択periodの全page、
+Threadsはopen中だけthreadsを取得する。各surfaceはbody全体のstrict schema/domain、size、exactly oneかつ同一の
+`Codex-Info-Published-Pair` header形式を満たす場合だけ同じroot generationとして一括commitする。
 timeout/non-200/切断、header欠落・重複・大小文字差・prefix/長さ/hex不正、body欠落・未知・重複key、domain不整合では
-candidate全体をdiscardして直前の完全rootを保持する。wireにJSON generation fieldを追加せず、published-generation headerは
-details一応答のopaque generation identityとしてだけ使い、body SHAやcommon-core hashを別identityとして作らない。
+対象surfaceのcandidate全体をdiscardして直前の完全rootを保持する。route+queryのlast-goodがないclientは条件headerを送らず、
+cacheなし304はrejectして同一callback内でretryせず次の通常周期に一度だけ無条件取得する。wireにJSON generation fieldを追加せず、published-generation headerは
+snapshot応答のopaque generation identityとしてだけ使い、body SHAやcommon-core hashを別identityとして作らない。
+
+Linux / Windows Mainは10秒周期、Graphのcursor差分はopen中60秒周期、Threadsはopen中5秒周期とする。
+GraphまたはThreadsが閉じている間は対応requestを0件とする。同じpairではbody 0の304を使い、current更新時も
+history全体を取得しない。history cursorはperiod、最後の`(reset_at,timestamp)`、そこまでのsample canonical prefixと選択periodの完全gap集合のSHA-256 fingerprintへ結合したclient非解釈値である。serverはsnapshot構築時に累積fingerprintとkey indexを作り、requestではkeyの二分探索とfingerprint比較だけで旧cursorを検証する。現snapshotの同じsample prefixとgap集合が一致する場合だけ、旧pairで発行したcursorも受理し、cursor後のrowを現pairで返す。先頭からの完全取得では最初のpageだけが完全gap集合を持ち、後続pageは空のgap集合を持つ。delta pageもgap集合を反復せず、clientはその現pairの全pageを受理した後だけsampleを直前prefixへatomic appendして既存gap集合を保持する。過去row補正、gap追加・回復・補正、period変更、unknown、stale、malformedでは固定4xxとしてpage集合を破棄し、次の通常周期に先頭から一度取得する。これにより通常appendのrequest処理と通信はdelta量だけに比例し、prefixまたはgap変更時だけ完全再取得する。
+
+`/v3/current`のexact 404を受けたclientは、その接続中をlegacy details modeとし、fallback列で受理した一つの完全details rootをMain、Graph、Threadsへ同時投影する。legacy modeではsplit history/threads routeを追加要求せず、Mainの10秒周期で同じdetails列だけを更新し、Graph/Threadsは最新の受理済みrootを表示する。再接続時には`/v3/current`から能力判定をやり直す。これにより旧serviceでもsurfaceを欠落させず、splitとlegacy rootを混在させない。
 
 schema-validなdetailsの`state=auth_required|initializing|error,authenticated=false`が上記exact empty契約を満たす場合、
 その同じdetails rootで旧account可視値を空にする。認証開始・確認controlの成功・失敗だけではdata rootを変更しない。

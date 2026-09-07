@@ -13,8 +13,12 @@ namespace CodexInfo.WindowsClient.Core;
 /// turn the client into a general-purpose HTTP client.  A handler constructor is
 /// provided solely to make the transport boundary testable.
 /// </remarks>
-public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetailsClient, IDisposable
+public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetailsClient, ILoopbackResourceClient, IDisposable
 {
+    private const string CurrentEndpoint = "http://127.0.0.1:8787/v3/current";
+    private const string HistoryPeriodsEndpoint = "http://127.0.0.1:8787/v3/history/periods";
+    private const string HistoryEndpoint = "http://127.0.0.1:8787/v3/history";
+    private const string ThreadsEndpoint = "http://127.0.0.1:8787/v3/threads";
     private const string DetailsV3Endpoint = "http://127.0.0.1:8787/v3/details";
     private const string DetailsV2Endpoint = "http://127.0.0.1:8787/v2/details";
     private const string DetailsEndpoint = "http://127.0.0.1:8787/v1/details";
@@ -80,6 +84,31 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         "history_periods",
         "history_samples",
         "history_gaps",
+        "threads");
+
+    private static readonly HashSet<string> CurrentTopLevelProperties = CreatePropertySet(
+        "api_version",
+        "state",
+        "observed_at",
+        "authenticated",
+        "plan_label",
+        "quota",
+        "models",
+        "active_thread_count");
+
+    private static readonly HashSet<string> HistoryPeriodsTopLevelProperties = CreatePropertySet(
+        "api_version",
+        "history_periods");
+
+    private static readonly HashSet<string> HistoryPageTopLevelProperties = CreatePropertySet(
+        "api_version",
+        "history_samples",
+        "history_gaps",
+        "next_cursor",
+        "resume_cursor");
+
+    private static readonly HashSet<string> ThreadsTopLevelProperties = CreatePropertySet(
+        "api_version",
         "threads");
 
     private static readonly HashSet<string> DetailsV3ModelProperties = CreatePropertySet(
@@ -177,6 +206,12 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
     private readonly object _v3CacheGate = new();
     private ApiDetailsSnapshot? _lastV3Snapshot;
     private PublishedPairIdentity? _lastV3PublishedPair;
+    private ApiCurrentSnapshot? _lastCurrentSnapshot;
+    private ApiHistoryPeriodsSnapshot? _lastHistoryPeriodsSnapshot;
+    private ApiThreadsSnapshot? _lastThreadsSnapshot;
+    private bool _legacyDetailsMode;
+    private ApiDetailsSnapshot? _lastLegacyDetailsSnapshot;
+    private readonly Dictionary<string, ApiHistoryPage> _lastHistoryPages = new(StringComparer.Ordinal);
 
     public LoopbackStatusClient()
         : this(CreateDefaultHandler())
@@ -318,6 +353,384 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
             .ConfigureAwait(false);
         return v1Attempt.Result;
     }
+
+    /// <summary>
+    /// Reads the bounded v3 current resource.  A missing current route is the
+    /// sole compatibility signal: only then is the legacy details chain used.
+    /// Every other response failure remains a failure for this resource.
+    /// </summary>
+    public async Task<CurrentFetchResult> FetchCurrentAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (IsLegacyDetailsMode())
+        {
+            var refreshedLegacy = await FetchDetailsAsync(cancellationToken).ConfigureAwait(false);
+            if (!refreshedLegacy.IsSuccess || refreshedLegacy.Snapshot is not { } legacyDetails)
+            {
+                return CurrentFetchResult.FromFailure(
+                    refreshedLegacy.Failure ?? DetailsFetchFailure.Response);
+            }
+
+            StoreLegacyDetails(legacyDetails);
+            return CurrentFetchResult.Success(ApiCurrentSnapshot.FromDetails(legacyDetails));
+        }
+
+        var current = await FetchSplitResourceAsync(
+                CurrentEndpoint,
+                cacheKey: CurrentEndpoint,
+                cached: GetCurrentCache(),
+                ParseCurrent,
+                static value => value.PublishedPair,
+                StoreCurrentCache,
+                EvictCurrentCache,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        if (!current.NotFound)
+        {
+            return current.Value is not null
+                ? CurrentFetchResult.Success(current.Value)
+                : CurrentFetchResult.FromFailure(current.Failure ?? DetailsFetchFailure.Response);
+        }
+
+        var legacy = await FetchDetailsAsync(cancellationToken).ConfigureAwait(false);
+        if (!legacy.IsSuccess || legacy.Snapshot is not { } details)
+        {
+            return CurrentFetchResult.FromFailure(legacy.Failure ?? DetailsFetchFailure.Response);
+        }
+
+        EnterLegacyDetailsMode(details);
+        return CurrentFetchResult.Success(ApiCurrentSnapshot.FromDetails(details));
+    }
+
+    public async Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (GetLegacyDetails() is { } cachedLegacy)
+        {
+            return HistoryPeriodsFetchResult.Success(
+                ApiHistoryPeriodsSnapshot.FromDetails(cachedLegacy));
+        }
+
+        var result = await FetchSplitResourceAsync(
+                HistoryPeriodsEndpoint,
+                cacheKey: HistoryPeriodsEndpoint,
+                cached: GetHistoryPeriodsCache(),
+                ParseHistoryPeriods,
+                static value => value.PublishedPair,
+                StoreHistoryPeriodsCache,
+                EvictHistoryPeriodsCache,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return result.Value is not null
+            ? HistoryPeriodsFetchResult.Success(result.Value)
+            : HistoryPeriodsFetchResult.FromFailure(result.Failure ?? DetailsFetchFailure.Response);
+    }
+
+    public async Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+        string periodId,
+        string? cursor = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (!IsSafeOpaqueParameter(periodId) ||
+            (cursor is not null && !IsSafeOpaqueParameter(cursor)))
+        {
+            return HistoryPageFetchResult.FromFailure(DetailsFetchFailure.Response);
+        }
+
+        if (GetLegacyDetails() is { } cachedLegacy)
+        {
+            return ApiHistoryPage.FromDetails(cachedLegacy, periodId) is { } cachedPage
+                ? HistoryPageFetchResult.Success(cachedPage)
+                : HistoryPageFetchResult.FromFailure(DetailsFetchFailure.Response);
+        }
+
+        var cacheKey = CreateHistoryPageCacheKey(periodId, cursor);
+        var endpoint = CreateHistoryPageEndpoint(periodId, cursor);
+        var result = await FetchSplitResourceAsync(
+                endpoint,
+                cacheKey,
+                GetHistoryPageCache(cacheKey),
+                (body, pair) => ParseHistoryPage(body, pair, periodId),
+                static value => value.PublishedPair,
+                value => StoreHistoryPageCache(cacheKey, value),
+                () => EvictHistoryPageCache(cacheKey),
+                cancellationToken)
+            .ConfigureAwait(false);
+        return result.Value is not null
+            ? HistoryPageFetchResult.Success(result.Value)
+            : HistoryPageFetchResult.FromFailure(result.Failure ?? DetailsFetchFailure.Response);
+    }
+
+    public async Task<ThreadsFetchResult> FetchThreadsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        if (GetLegacyDetails() is { } cachedLegacy)
+        {
+            return ThreadsFetchResult.Success(ApiThreadsSnapshot.FromDetails(cachedLegacy));
+        }
+
+        var result = await FetchSplitResourceAsync(
+                ThreadsEndpoint,
+                cacheKey: ThreadsEndpoint,
+                cached: GetThreadsCache(),
+                ParseThreads,
+                static value => value.PublishedPair,
+                StoreThreadsCache,
+                EvictThreadsCache,
+                cancellationToken)
+            .ConfigureAwait(false);
+        return result.Value is not null
+            ? ThreadsFetchResult.Success(result.Value)
+            : ThreadsFetchResult.FromFailure(result.Failure ?? DetailsFetchFailure.Response);
+    }
+
+    private async Task<SplitFetchResult<T>> FetchSplitResourceAsync<T>(
+        string endpoint,
+        string cacheKey,
+        T? cached,
+        Func<byte[], PublishedPairIdentity, T?> parser,
+        Func<T, PublishedPairIdentity> pairSelector,
+        Action<T> store,
+        Action evict,
+        CancellationToken cancellationToken)
+        where T : class
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
+            request.Headers.Accept.Clear();
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            if (cached is not null)
+            {
+                request.Headers.IfNoneMatch.Add(
+                    new EntityTagHeaderValue($"\"{pairSelector(cached)}\""));
+            }
+
+            using var response = await _httpClient.SendAsync(
+                    request,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            if (response.StatusCode == HttpStatusCode.NotFound)
+            {
+                evict();
+                return SplitFetchResult<T>.NotFoundResult();
+            }
+
+            if (response.StatusCode == HttpStatusCode.NotModified)
+            {
+                if (cached is null ||
+                    !HasAcceptableHeaderSize(response) ||
+                    !HasRequiredResponseHeaders(response) ||
+                    !TryGetContentLength(response.Content, out var notModifiedLength) ||
+                    notModifiedLength != 0 ||
+                    !TryGetPublishedPairIdentity(response, out var actualPair) ||
+                    actualPair != pairSelector(cached))
+                {
+                    evict();
+                    return SplitFetchResult<T>.FromFailure(DetailsFetchFailure.Response);
+                }
+
+                var notModifiedBody = await ReadBodyAsync(
+                        response.Content,
+                        notModifiedLength,
+                        cancellationToken,
+                        maximumBodyBytes: 0)
+                    .ConfigureAwait(false);
+                if (notModifiedBody.Kind is not BodyReadKind.Success ||
+                    notModifiedBody.Body is null ||
+                    notModifiedBody.Body.LongLength != 0)
+                {
+                    evict();
+                    return SplitFetchResult<T>.FromFailure(DetailsFetchFailure.Response);
+                }
+
+                return SplitFetchResult<T>.Success(cached, notModified: true);
+            }
+
+            if (response.StatusCode != HttpStatusCode.OK)
+            {
+                evict();
+                return SplitFetchResult<T>.FromFailure(DetailsFetchFailure.Transport);
+            }
+
+            if (!HasAcceptableHeaderSize(response) ||
+                !HasRequiredResponseHeaders(response) ||
+                !TryGetContentLength(response.Content, out var contentLength) ||
+                !TryGetPublishedPairIdentity(response, out var publishedPair) ||
+                contentLength is > MaxDetailsBodyBytes)
+            {
+                evict();
+                return SplitFetchResult<T>.FromFailure(DetailsFetchFailure.Response);
+            }
+
+            var bodyStatus = await ReadBodyAsync(
+                    response.Content,
+                    contentLength,
+                    cancellationToken,
+                    MaxDetailsBodyBytes)
+                .ConfigureAwait(false);
+            if (bodyStatus.Kind is BodyReadKind.Oversize)
+            {
+                evict();
+                return SplitFetchResult<T>.FromFailure(DetailsFetchFailure.Response);
+            }
+
+            if (bodyStatus.Kind is BodyReadKind.Transport || bodyStatus.Body is null)
+            {
+                evict();
+                return SplitFetchResult<T>.FromFailure(DetailsFetchFailure.Transport);
+            }
+
+            if (contentLength is long declaredLength && bodyStatus.Body.LongLength != declaredLength ||
+                parser(bodyStatus.Body, publishedPair) is not { } parsed)
+            {
+                evict();
+                return SplitFetchResult<T>.FromFailure(DetailsFetchFailure.Response);
+            }
+
+            store(parsed);
+            return SplitFetchResult<T>.Success(parsed, notModified: false);
+        }
+        catch (OperationCanceledException)
+        {
+            return SplitFetchResult<T>.FromFailure(DetailsFetchFailure.Transport);
+        }
+        catch (HttpRequestException)
+        {
+            return SplitFetchResult<T>.FromFailure(DetailsFetchFailure.Transport);
+        }
+        catch (IOException)
+        {
+            return SplitFetchResult<T>.FromFailure(DetailsFetchFailure.Transport);
+        }
+        catch (Exception)
+        {
+            return SplitFetchResult<T>.FromFailure(DetailsFetchFailure.Transport);
+        }
+    }
+
+    private ApiCurrentSnapshot? GetCurrentCache()
+    {
+        lock (_v3CacheGate) return _lastCurrentSnapshot;
+    }
+
+    private void StoreCurrentCache(ApiCurrentSnapshot value)
+    {
+        lock (_v3CacheGate) _lastCurrentSnapshot = value;
+    }
+
+    private void EvictCurrentCache()
+    {
+        lock (_v3CacheGate) _lastCurrentSnapshot = null;
+    }
+
+    private bool IsLegacyDetailsMode()
+    {
+        lock (_v3CacheGate) return _legacyDetailsMode;
+    }
+
+    private ApiDetailsSnapshot? GetLegacyDetails()
+    {
+        lock (_v3CacheGate)
+        {
+            return _legacyDetailsMode ? _lastLegacyDetailsSnapshot : null;
+        }
+    }
+
+    private void EnterLegacyDetailsMode(ApiDetailsSnapshot snapshot)
+    {
+        lock (_v3CacheGate)
+        {
+            _legacyDetailsMode = true;
+            _lastLegacyDetailsSnapshot = snapshot;
+            _lastCurrentSnapshot = null;
+            _lastHistoryPeriodsSnapshot = null;
+            _lastThreadsSnapshot = null;
+            _lastHistoryPages.Clear();
+        }
+    }
+
+    private void StoreLegacyDetails(ApiDetailsSnapshot snapshot)
+    {
+        lock (_v3CacheGate)
+        {
+            if (_legacyDetailsMode)
+            {
+                _lastLegacyDetailsSnapshot = snapshot;
+            }
+        }
+    }
+
+    private ApiHistoryPeriodsSnapshot? GetHistoryPeriodsCache()
+    {
+        lock (_v3CacheGate) return _lastHistoryPeriodsSnapshot;
+    }
+
+    private void StoreHistoryPeriodsCache(ApiHistoryPeriodsSnapshot value)
+    {
+        lock (_v3CacheGate) _lastHistoryPeriodsSnapshot = value;
+    }
+
+    private void EvictHistoryPeriodsCache()
+    {
+        lock (_v3CacheGate) _lastHistoryPeriodsSnapshot = null;
+    }
+
+    private ApiHistoryPage? GetHistoryPageCache(string cacheKey)
+    {
+        lock (_v3CacheGate)
+        {
+            return _lastHistoryPages.TryGetValue(cacheKey, out var value) ? value : null;
+        }
+    }
+
+    private void StoreHistoryPageCache(string cacheKey, ApiHistoryPage value)
+    {
+        lock (_v3CacheGate)
+        {
+            // A page cursor is a continuation into one current surface. Keep
+            // only the newest accepted page so each polling cycle replaces the
+            // previous cursor generation instead of accumulating a dictionary
+            // entry for every page ever observed.
+            _lastHistoryPages.Clear();
+            _lastHistoryPages[cacheKey] = value;
+        }
+    }
+
+    private void EvictHistoryPageCache(string cacheKey)
+    {
+        lock (_v3CacheGate) _lastHistoryPages.Remove(cacheKey);
+    }
+
+    private ApiThreadsSnapshot? GetThreadsCache()
+    {
+        lock (_v3CacheGate) return _lastThreadsSnapshot;
+    }
+
+    private void StoreThreadsCache(ApiThreadsSnapshot value)
+    {
+        lock (_v3CacheGate) _lastThreadsSnapshot = value;
+    }
+
+    private void EvictThreadsCache()
+    {
+        lock (_v3CacheGate) _lastThreadsSnapshot = null;
+    }
+
+    private static string CreateHistoryPageCacheKey(string periodId, string? cursor) =>
+        $"{HistoryEndpoint}?period={periodId}&cursor={cursor ?? string.Empty}";
+
+    private static string CreateHistoryPageEndpoint(string periodId, string? cursor)
+    {
+        var endpoint = $"{HistoryEndpoint}?period={Uri.EscapeDataString(periodId)}";
+        return cursor is null ? endpoint : $"{endpoint}&cursor={Uri.EscapeDataString(cursor)}";
+    }
+
+    private static bool IsSafeOpaqueParameter(string value) =>
+        !string.IsNullOrWhiteSpace(value) && IsSafeText(value, 1, 512);
 
     private async Task<DetailsAttemptResult> FetchDetailsEndpointAsync(
         string endpoint,
@@ -801,6 +1214,172 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         }
     }
 
+    private static ApiCurrentSnapshot? ParseCurrent(
+        byte[] body,
+        PublishedPairIdentity publishedPair)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(
+                body,
+                new JsonDocumentOptions
+                {
+                    AllowTrailingCommas = false,
+                    CommentHandling = JsonCommentHandling.Disallow,
+                    MaxDepth = 24,
+                });
+            var root = document.RootElement;
+            if (!HasExactlyProperties(root, CurrentTopLevelProperties, 8) ||
+                !TryGetString(root, "api_version", out var apiVersion) ||
+                apiVersion != "v3" ||
+                !TryGetState(root, out var state) ||
+                !TryGetNullableUnixSeconds(root, "observed_at", out var observedAt) ||
+                !TryGetBoolean(root, "authenticated", out var authenticated) ||
+                !TryGetNullablePlanLabel(root, out var planLabel) ||
+                !TryGetQuota(root, out var quota) ||
+                !HasValidDetailsRootDomain(state, authenticated, planLabel, quota) ||
+                !TryGetDetailsModelsV3(root, out var models) ||
+                !TryGetUInt64(root, "active_thread_count", out var activeThreadCount))
+            {
+                return null;
+            }
+
+            return new ApiCurrentSnapshot(
+                state,
+                observedAt,
+                authenticated,
+                planLabel,
+                quota,
+                new System.Collections.ObjectModel.ReadOnlyCollection<ApiDetailsModelUsage>(models),
+                activeThreadCount,
+                publishedPair)
+            {
+                ApiVersion = apiVersion,
+            };
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private static ApiHistoryPeriodsSnapshot? ParseHistoryPeriods(
+        byte[] body,
+        PublishedPairIdentity publishedPair)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(
+                body,
+                new JsonDocumentOptions
+                {
+                    AllowTrailingCommas = false,
+                    CommentHandling = JsonCommentHandling.Disallow,
+                    MaxDepth = 24,
+                });
+            var root = document.RootElement;
+            if (!HasExactlyProperties(root, HistoryPeriodsTopLevelProperties, 2) ||
+                !TryGetString(root, "api_version", out var apiVersion) ||
+                apiVersion != "v3" ||
+                !TryGetHistoryPeriods(root, observedAt: null, out var periods, requireCurrentObserved: false))
+            {
+                return null;
+            }
+
+            return new ApiHistoryPeriodsSnapshot(
+                new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistoryPeriod>(periods),
+                publishedPair)
+            {
+                ApiVersion = apiVersion,
+            };
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private static ApiHistoryPage? ParseHistoryPage(
+        byte[] body,
+        PublishedPairIdentity publishedPair,
+        string expectedPeriodId)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(
+                body,
+                new JsonDocumentOptions
+                {
+                    AllowTrailingCommas = false,
+                    CommentHandling = JsonCommentHandling.Disallow,
+                    MaxDepth = 24,
+                });
+            var root = document.RootElement;
+            if (!HasExactlyProperties(root, HistoryPageTopLevelProperties, 5) ||
+                !TryGetString(root, "api_version", out var apiVersion) ||
+                apiVersion != "v3" ||
+                !TryGetHistorySamplesV3(root, periods: null, out var samples) ||
+                !TryGetHistoryGapsWithoutPeriods(root, out var gaps) ||
+                !TryGetOptionalBoundedString(root, "next_cursor", 1, 512, out var nextCursor) ||
+                !TryGetOptionalBoundedString(root, "resume_cursor", 1, 512, out var resumeCursor) ||
+                ((nextCursor is not null || samples.Count != 0) && resumeCursor is null))
+            {
+                return null;
+            }
+
+            return new ApiHistoryPage(
+                expectedPeriodId,
+                new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistorySample>(samples),
+                new System.Collections.ObjectModel.ReadOnlyCollection<ApiHistoryGap>(gaps),
+                nextCursor,
+                resumeCursor,
+                publishedPair)
+            {
+                ApiVersion = apiVersion,
+            };
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private static ApiThreadsSnapshot? ParseThreads(
+        byte[] body,
+        PublishedPairIdentity publishedPair)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(
+                body,
+                new JsonDocumentOptions
+                {
+                    AllowTrailingCommas = false,
+                    CommentHandling = JsonCommentHandling.Disallow,
+                    MaxDepth = 24,
+                });
+            var root = document.RootElement;
+            if (!HasExactlyProperties(root, ThreadsTopLevelProperties, 2) ||
+                !TryGetString(root, "api_version", out var apiVersion) ||
+                apiVersion != "v3" ||
+                !TryGetThreads(root, out var threads))
+            {
+                return null;
+            }
+
+            return new ApiThreadsSnapshot(
+                new System.Collections.ObjectModel.ReadOnlyCollection<ApiThreadDetails>(threads),
+                publishedPair)
+            {
+                ApiVersion = apiVersion,
+            };
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
     private static bool TryParseDetailsV3(
         byte[] body,
         out ApiDetailsSnapshot? snapshot)
@@ -977,7 +1556,7 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
 
     private static bool TryGetHistorySamplesV3(
         JsonElement parent,
-        IReadOnlyList<ApiHistoryPeriod> periods,
+        IReadOnlyList<ApiHistoryPeriod>? periods,
         out List<ApiHistorySample> samples)
     {
         samples = new List<ApiHistorySample>();
@@ -1017,16 +1596,19 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
                 return false;
             }
 
-            var matchingPeriods = periods
-                .Where(period => resetAt >= period.ResetAt - ResetAtToleranceSeconds &&
-                                 resetAt <= period.ResetAt)
-                .ToArray();
-            if (matchingPeriods.Length != 1 ||
-                timestamp < matchingPeriods[0].StartAt ||
-                timestamp > matchingPeriods[0].EndAt ||
-                !canonicalIdentities.Add((matchingPeriods[0].Id, timestamp)))
+            if (periods is not null)
             {
-                return false;
+                var matchingPeriods = periods
+                    .Where(period => resetAt >= period.ResetAt - ResetAtToleranceSeconds &&
+                                     resetAt <= period.ResetAt)
+                    .ToArray();
+                if (matchingPeriods.Length != 1 ||
+                    timestamp < matchingPeriods[0].StartAt ||
+                    timestamp > matchingPeriods[0].EndAt ||
+                    !canonicalIdentities.Add((matchingPeriods[0].Id, timestamp)))
+                {
+                    return false;
+                }
             }
 
             samples.Add(new ApiHistorySample(
@@ -1213,7 +1795,8 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
     private static bool TryGetHistoryPeriods(
         JsonElement parent,
         long? observedAt,
-        out List<ApiHistoryPeriod> periods)
+        out List<ApiHistoryPeriod> periods,
+        bool requireCurrentObserved = true)
     {
         periods = new List<ApiHistoryPeriod>();
         if (!parent.TryGetProperty("history_periods", out var property) ||
@@ -1265,7 +1848,8 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
             if (current)
             {
                 currentCount++;
-                if (observedAt is not long observed || candidate.EndAt != Math.Min(candidate.ResetAt, observed))
+                if (requireCurrentObserved &&
+                    (observedAt is not long observed || candidate.EndAt != Math.Min(candidate.ResetAt, observed)))
                 {
                     return false;
                 }
@@ -1448,6 +2032,51 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
 
             if (previous is not null && previous.ResetAt == candidate.ResetAt &&
                 candidate.StartAt <= previous.EndAt)
+            {
+                return false;
+            }
+
+            previous = candidate;
+            gaps.Add(candidate);
+        }
+
+        return true;
+    }
+
+    private static bool TryGetHistoryGapsWithoutPeriods(
+        JsonElement parent,
+        out List<ApiHistoryGap> gaps)
+    {
+        gaps = new List<ApiHistoryGap>();
+        if (!parent.TryGetProperty("history_gaps", out var property) ||
+            property.ValueKind != JsonValueKind.Array ||
+            property.GetArrayLength() > MaxHistoryGaps)
+        {
+            return false;
+        }
+
+        var gapIds = new HashSet<string>(StringComparer.Ordinal);
+        ApiHistoryGap? previous = null;
+        foreach (var gap in property.EnumerateArray())
+        {
+            if (!HasExactlyProperties(gap, HistoryGapProperties, 5) ||
+                !TryGetString(gap, "gap_id", out var gapId) ||
+                !IsLowercaseHexId(gapId) ||
+                !gapIds.Add(gapId) ||
+                !TryGetUnixSeconds(gap, "reset_at", out var resetAt) ||
+                !TryGetUnixSeconds(gap, "start_at", out var startAt) ||
+                !TryGetUnixSeconds(gap, "end_at", out var endAt) ||
+                startAt > endAt ||
+                !TryGetString(gap, "reason", out var reason) ||
+                !HistoryGapReasons.Contains(reason))
+            {
+                return false;
+            }
+
+            var candidate = new ApiHistoryGap(gapId, resetAt, startAt, endAt, reason);
+            if (previous is not null &&
+                (CompareHistoryGaps(previous, candidate) >= 0 ||
+                 (previous.ResetAt == candidate.ResetAt && candidate.StartAt <= previous.EndAt)))
             {
                 return false;
             }
@@ -1652,6 +2281,34 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
 
         var candidate = property.GetString();
         if (candidate is null || !IsSafeText(candidate, minimum, maximum))
+        {
+            return false;
+        }
+
+        value = candidate;
+        return true;
+    }
+
+    private static bool TryGetOptionalBoundedString(
+        JsonElement parent,
+        string name,
+        int minimum,
+        int maximum,
+        out string? value)
+    {
+        value = null;
+        if (!parent.TryGetProperty(name, out var property))
+        {
+            return true;
+        }
+
+        if (property.ValueKind == JsonValueKind.Null)
+        {
+            return true;
+        }
+
+        if (property.ValueKind != JsonValueKind.String ||
+            !TryGetBoundedString(parent, name, minimum, maximum, out var candidate))
         {
             return false;
         }
@@ -2171,6 +2828,23 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
 
         public static DetailsAttemptResult NotModifiedResult(ApiDetailsSnapshot expectedSnapshot) =>
             new(DetailsFetchResult.Success(expectedSnapshot), false, true);
+    }
+
+    private readonly record struct SplitFetchResult<T>(
+        T? Value,
+        DetailsFetchFailure? Failure,
+        bool NotFound,
+        bool NotModified)
+        where T : class
+    {
+        public static SplitFetchResult<T> Success(T value, bool notModified) =>
+            new(value, null, false, notModified);
+
+        public static SplitFetchResult<T> FromFailure(DetailsFetchFailure failure) =>
+            new(null, failure, false, false);
+
+        public static SplitFetchResult<T> NotFoundResult() =>
+            new(null, DetailsFetchFailure.Response, true, false);
     }
 
     private sealed record V3ModelCost(
