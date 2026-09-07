@@ -748,6 +748,43 @@ fi
 grep -Fq 'curl --fail --silent --show-error --proto =https' "$log" || fail 'release API failure fixture did not query discovery'
 grep -Fq '127.0.0.1:8787/v1/health' "$log" || fail 'release API failure did not read back coherent B'
 grep -Fq '127.0.0.1:8787/v1/details' "$log" || fail 'release API failure did not verify functional readiness'
+
+# ExecStartPre must not keep the recorder down when an update attempt fails
+# and the installed local generation is still complete and unambiguous.
+write_running_state "$fake_home"
+startup_current="$(readlink -- "$fake_home/.local/share/codex-info/current")"
+startup_state_hash="$(sha256sum "$fake_home/.local/share/codex-info/control-state.json" \
+    "$fake_home/.local/share/codex-info/install-transaction.json" \
+    "$fake_home/.codex/session.jsonl" "$fake_home/.config/codex-info/settings.json")"
+: > "$fake_proc/net/tcp"
+: > "$log"
+startup_output="$TEST_ROOT/startup-update-failure.out"
+if ! HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+    FAKE_RELEASE_FAILURE=1 FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" \
+    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=0 TMPDIR="$update_tmp" CODEX_INFO_PROC_ROOT="$fake_proc" \
+    SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+    bash "$fake_home/.local/libexec/codex-info-install.sh" --startup-reconcile >"$startup_output" 2>&1; then
+    fail 'startup update failure blocked a verified local generation'
+fi
+grep -Fq 'update deferred: public release discovery failed' "$startup_output" ||
+    fail 'startup update failure was not reported as deferred'
+[[ "$(readlink -- "$fake_home/.local/share/codex-info/current")" == "$startup_current" ]] ||
+    fail 'startup update failure changed current generation'
+[[ "$(sha256sum "$fake_home/.local/share/codex-info/control-state.json" \
+    "$fake_home/.local/share/codex-info/install-transaction.json" \
+    "$fake_home/.codex/session.jsonl" "$fake_home/.config/codex-info/settings.json")" == "$startup_state_hash" ]] ||
+    fail 'startup update failure changed durable state or profile data'
+[[ -z "$(find "$update_tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
+    fail 'startup update failure left temporary files'
+grep -Fq '/releases?per_page=100' "$log" || fail 'startup update failure did not query discovery'
+if grep -Fq '/releases/download/' "$log"; then fail 'startup update failure downloaded an asset'; fi
+if grep -Eq '^systemctl --user (start|restart) ' "$log"; then
+    fail 'startup reconcile started the service instead of returning to systemd ExecStart'
+fi
+run_startup_condition "$fake_home" >/dev/null || fail 'startup condition rejected the deferred verified generation'
+printf '  sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n0: 0100007F:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 9001 1\n' > "$fake_proc/net/tcp"
+printf 'case startup update failure defers to verified local generation: PASS\n'
+
 write_stopped_state "$fake_home"
 printf 'case release-failure coherent-B readback: PASS\n'
 
