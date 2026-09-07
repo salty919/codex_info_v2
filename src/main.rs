@@ -9510,6 +9510,10 @@ struct CodexInfoState {
     /// snapshot. Keep a failed selected endpoint latched until that same
     /// endpoint becomes healthy; never fall back to the default port.
     service_endpoint_error: Option<String>,
+    /// A failed owner probe is retried once through the authoritative current
+    /// resource as soon as the same owner is healthy again. This avoids
+    /// stretching a transient probe failure to the normal ten-second poll.
+    service_owner_probe_failed: bool,
     /// Last completely admitted v2 root (or exact-404 fallback v1 root)
     /// generation. The UI never assembles visible fields across two values of
     /// this header.
@@ -10121,6 +10125,7 @@ impl CodexInfoState {
                 .checked_sub(daemon::daemon_interval_from_environment())
                 .unwrap_or(resident_now),
             service_endpoint_error: None,
+            service_owner_probe_failed: false,
             service_published_pair: None,
             service_v3_published_pair: None,
             service_current_snapshot: None,
@@ -10212,6 +10217,7 @@ impl CodexInfoState {
             recovery_period: None,
             last_local_poll: Instant::now(),
             service_endpoint_error: None,
+            service_owner_probe_failed: false,
             service_published_pair: None,
             service_v3_published_pair: None,
             service_current_snapshot: None,
@@ -10331,6 +10337,7 @@ impl CodexInfoState {
             recovery_period: None,
             last_local_poll: Instant::now(),
             service_endpoint_error: None,
+            service_owner_probe_failed: false,
             service_published_pair: None,
             service_v3_published_pair: None,
             service_current_snapshot: None,
@@ -16857,15 +16864,36 @@ fn run_ui_service_timer_cycle_with_windows(
     graph_open: bool,
     threads_open: bool,
 ) {
+    run_ui_service_timer_cycle_with_owner_check(
+        state,
+        service_endpoint,
+        graph_open,
+        threads_open,
+        |address| healthy_combined_service_owner(address).is_some(),
+    );
+}
+
+fn run_ui_service_timer_cycle_with_owner_check(
+    state: &mut CodexInfoState,
+    service_endpoint: SocketAddr,
+    graph_open: bool,
+    threads_open: bool,
+    owner_is_healthy: impl FnOnce(SocketAddr) -> bool,
+) {
     state.poll_auth_control();
-    if healthy_combined_service_owner(service_endpoint).is_none() {
+    if !owner_is_healthy(service_endpoint) {
         debug_runtime("service owner validation failed");
+        state.service_owner_probe_failed = true;
         let error = state
             .service_endpoint_error
             .clone()
             .unwrap_or_else(|| cli_error(CliTextKey::ServiceStateUnavailable));
         state.hold_service_endpoint_error(error);
         return;
+    }
+    if state.service_owner_probe_failed {
+        state.service_owner_probe_failed = false;
+        state.service_current_force_poll = true;
     }
     poll_service_current_resources(state, service_endpoint);
     poll_service_graph_resources(state, service_endpoint, graph_open);
@@ -20902,6 +20930,50 @@ mod tests {
         );
         assert!(state.service_endpoint_error.is_none());
         assert!(commands.try_iter().next().is_none());
+        server.shutdown();
+    }
+
+    #[test]
+    fn recovered_owner_forces_one_immediate_current_read() {
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
+        state.service_current_last_poll = Instant::now();
+        state.service_current_force_poll = false;
+
+        super::run_ui_service_timer_cycle_with_owner_check(
+            &mut state,
+            server.local_addr(),
+            false,
+            false,
+            |_| false,
+        );
+        let before_recovery = state.service_current_last_poll;
+        assert!(state.service_endpoint_error.is_some());
+        assert!(state.service_owner_probe_failed);
+
+        super::run_ui_service_timer_cycle_with_owner_check(
+            &mut state,
+            server.local_addr(),
+            false,
+            false,
+            |_| true,
+        );
+        assert!(state.service_endpoint_error.is_none());
+        assert!(!state.service_owner_probe_failed);
+        assert!(state.service_current_last_poll > before_recovery);
+
+        let after_recovery = state.service_current_last_poll;
+        super::run_ui_service_timer_cycle_with_owner_check(
+            &mut state,
+            server.local_addr(),
+            false,
+            false,
+            |_| true,
+        );
+        assert_eq!(state.service_current_last_poll, after_recovery);
         server.shutdown();
     }
 
