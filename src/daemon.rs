@@ -899,6 +899,19 @@ pub(crate) fn current_daemon_owner_identity() -> Option<DaemonOwnerIdentity> {
         })
 }
 
+/// Resolve the validated service port only when this exact owner process is
+/// still current. Recorder ownership itself does not depend on CLI arguments.
+pub(crate) fn daemon_owner_port(owner: &DaemonOwnerIdentity) -> Option<u16> {
+    let process = process_identity(owner.pid)?;
+    if process.starttime_ticks != owner.starttime_ticks
+        || process.executable_device != owner.executable_device
+        || process.executable_inode != owner.executable_inode
+    {
+        return None;
+    }
+    process_is_known_codex(&process)
+}
+
 /// Return only the PID from a complete, current recorder lock identity.
 /// Callers use this to distinguish the service child they own from a
 /// concurrently-started winner; malformed, stale, or replaced locks are not
@@ -936,7 +949,7 @@ fn process_has_managed_marker(_pid: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn process_is_known_codex(identity: &ProcessIdentity) -> bool {
+fn process_is_known_codex(identity: &ProcessIdentity) -> Option<u16> {
     let process_root = Path::new("/proc").join(identity.pid.to_string());
     let executable = fs::read_link(process_root.join("exe"))
         .ok()
@@ -944,33 +957,33 @@ fn process_is_known_codex(identity: &ProcessIdentity) -> bool {
     let executable_name = executable.as_deref().and_then(|name| name.to_str());
     let executable_name = matches!(executable_name, Some("codex_info" | "codex-info"));
     if !executable_name {
-        return false;
+        return None;
     }
     let command_line = fs::read(process_root.join("cmdline")).ok();
     let Some(command_line) = command_line else {
-        return false;
+        return None;
     };
     let args = command_line
         .split(|byte| *byte == 0)
         .filter(|arg| !arg.is_empty())
         .collect::<Vec<_>>();
     if args.len() != 3 || args[1] != b"--port" {
-        return false;
+        return None;
     }
-    let valid_port = args[2].iter().all(u8::is_ascii_digit) && !args[2].is_empty() && {
-        let port = args[2].iter().fold(0_u32, |value, byte| {
-            value
-                .saturating_mul(10)
-                .saturating_add(u32::from(*byte - b'0'))
-        });
-        (1..=u32::from(u16::MAX)).contains(&port)
-    };
-    valid_port
+    if args[2].is_empty() || !args[2].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let port = args[2].iter().fold(0_u32, |value, byte| {
+        value
+            .saturating_mul(10)
+            .saturating_add(u32::from(*byte - b'0'))
+    });
+    u16::try_from(port).ok().filter(|port| *port != 0)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_is_known_codex(_identity: &ProcessIdentity) -> bool {
-    false
+fn process_is_known_codex(_identity: &ProcessIdentity) -> Option<u16> {
+    None
 }
 
 pub(crate) fn classify_profile_owner() -> OwnerClassification {
@@ -997,7 +1010,7 @@ pub(crate) fn classify_profile_owner() -> OwnerClassification {
     }
     if process_has_managed_marker(identity.pid) {
         OwnerClassification::ManagedActive
-    } else if process_is_known_codex(&identity) {
+    } else if process_is_known_codex(&identity).is_some() {
         OwnerClassification::KnownUnmanagedCodex
     } else {
         OwnerClassification::Foreign

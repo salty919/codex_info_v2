@@ -1760,11 +1760,15 @@ perform_install() {
     ((QUIET)) || printf 'installed generation=%s\n' "$candidate_id"
 }
 update_failure_with_fallback() {
-    local reason="$1" current_id fallback_ok=0
+    local reason="$1" current_id startup_id fallback_ok=0
     current_id="$(current_generation 2>/dev/null || true)"
     if [[ -n "$update_root" && -d "$update_root" && ! -L "$update_root" ]]; then
         rm -r -- "$update_root"
         update_root=
+    fi
+    if startup_id="$(startup_local_generation_can_run)"; then
+        ((QUIET)) || printf 'update deferred: %s; starting verified local generation=%s\n' "$reason" "$startup_id"
+        exit 0
     fi
     if [[ "$desired_state" == running ]]; then
         if [[ -n "$current_id" ]]; then
@@ -1779,6 +1783,21 @@ update_failure_with_fallback() {
         die "$reason; existing installation remains coherent"
     fi
     safe_blocked "$reason; existing installation could not be verified"
+}
+startup_local_generation_can_run() {
+    local current_id listener_pid
+    [[ "$TRIGGER" == startup && "$desired_state" == running ]] || return 1
+    current_id="$(current_generation 2>/dev/null || true)"
+    [[ -n "$current_id" ]] || return 1
+    verify_local_generation >/dev/null 2>&1 || return 1
+    if [[ -e "$transaction" || -L "$transaction" ]]; then
+        [[ -f "$transaction" && ! -L "$transaction" ]] || return 1
+        read_journal
+        [[ "$journal_phase" == committed ]] || return 1
+    fi
+    listener_pid="$(socket_pid)" || return 1
+    [[ -z "$listener_pid" ]] || return 1
+    printf '%s\n' "$current_id"
 }
 run_update() {
     local start update_deadline releases selection info local_coherent=0 discovery_limit

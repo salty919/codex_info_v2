@@ -966,6 +966,49 @@ fn canonicalize_recorded_sessions(
     Ok(canonical.into_iter().collect())
 }
 
+fn canonicalize_recorded_sessions_for_commit(
+    sources: &[RecordedSessionSource],
+) -> Result<Vec<RecordedSessionSource>> {
+    let canonical = canonicalize_recorded_sessions(sources)?;
+    let mut paths = BTreeSet::new();
+    for source in &canonical {
+        if !paths.insert((&source.root_identity, &source.relative_path)) {
+            return Err(UsageStoreError::InvalidImport(
+                "multiple recorded session fingerprints for one path".into(),
+            ));
+        }
+    }
+    Ok(canonical)
+}
+
+fn replace_recorded_session_markers(
+    transaction: &rusqlite::Transaction<'_>,
+    sources: &[RecordedSessionSource],
+) -> Result<()> {
+    let mut delete = transaction.prepare(
+        "DELETE FROM recorded_sessions
+         WHERE root_identity = ?1 AND relative_path = ?2",
+    )?;
+    let mut insert = transaction.prepare(
+        "INSERT INTO recorded_sessions (
+            root_identity, relative_path, file_bytes, modified_nanos,
+            file_device, file_inode
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for source in sources {
+        delete.execute(params![&source.root_identity, &source.relative_path])?;
+        insert.execute(params![
+            &source.root_identity,
+            &source.relative_path,
+            source.file_bytes as i64,
+            source.modified_nanos.to_string(),
+            source.file_device.to_string(),
+            source.file_inode.to_string(),
+        ])?;
+    }
+    Ok(())
+}
+
 fn canonical_u64_text(value: &str, field: &'static str) -> Result<u64> {
     let parsed = value.parse::<u64>().map_err(|_| {
         UsageStoreError::InvalidImport(format!("{field} is not a canonical unsigned integer"))
@@ -3383,11 +3426,14 @@ impl UsageStore {
             .ok_or_else(|| UsageStoreError::InvalidImport("database filename is invalid".into()))?;
 
         // Validate the source without changing it before creating any
-        // temporary or generation file. This rejects corrupt/old-schema input
-        // at the read boundary and leaves every existing generation intact.
-        let source_store = Self::open(path)?;
+        // temporary or generation file. Schema repair belongs to a separately
+        // verified candidate, never to the source being protected.
+        let source_store = Self::open_read_only(path)?;
         drop(source_store);
-        let source = Connection::open(path)?;
+        let source = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
         source.busy_timeout(Duration::from_secs(2))?;
         let source_check: String = source.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
         if source_check != "ok" {
@@ -3523,7 +3569,8 @@ impl UsageStore {
         Ok(())
     }
 
-    /// Migrate through a separately validated candidate database.
+    /// Migrate a legacy, unpartitioned history database through a separately
+    /// validated candidate database.
     ///
     /// The caller supplies an explicit transformation, so no schema or row
     /// value is guessed implicitly. The source remains untouched until the
@@ -3574,7 +3621,18 @@ impl UsageStore {
                     "stale migration candidate/original exists; inspect before retry".into(),
                 ));
             }
-            let source_store = Self::open(path)?;
+            let source_store = Self::open_read_only(path)?;
+            let is_account_partition: bool = source_store.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'storage_partition')",
+                [],
+                |row| row.get(0),
+            )?;
+            if is_account_partition {
+                return Err(UsageStoreError::InvalidImport(
+                    "account partitions use versioned in-place schema upgrades".into(),
+                ));
+            }
             let source_samples = source_store.load_all()?;
             let source_periods = build_reset_periods(&source_samples);
             let source_fingerprint = samples_fingerprint(&source_samples);
@@ -4049,36 +4107,14 @@ impl UsageStore {
         samples: &[UsageHistorySample],
         sources: &[RecordedSessionSource],
     ) -> Result<()> {
-        let sources = canonicalize_recorded_sessions(sources)?;
+        let sources = canonicalize_recorded_sessions_for_commit(sources)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let adjusted = apply_history_continuity(&transaction, samples)?;
         let canonical = canonicalize_samples(&transaction, &adjusted)?;
         upsert_canonical_samples(&transaction, &canonical)?;
-        {
-            let mut statement = transaction.prepare(
-                "INSERT INTO recorded_sessions (
-                    root_identity,
-                    relative_path,
-                    file_bytes,
-                    modified_nanos,
-                    file_device,
-                    file_inode
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                ON CONFLICT DO NOTHING",
-            )?;
-            for source in &sources {
-                statement.execute(params![
-                    &source.root_identity,
-                    &source.relative_path,
-                    source.file_bytes as i64,
-                    source.modified_nanos.to_string(),
-                    source.file_device.to_string(),
-                    source.file_inode.to_string(),
-                ])?;
-            }
-        }
+        replace_recorded_session_markers(&transaction, &sources)?;
         for source in &sources {
             if !recorded_session_matches_in(&transaction, source)? {
                 return Err(UsageStoreError::InvalidImport(
@@ -4797,7 +4833,7 @@ impl UsageStore {
             }
         }
         let model_totals = canonicalize_model_totals(model_totals)?;
-        let recorded_sessions = canonicalize_recorded_sessions(recorded_sessions)?;
+        let recorded_sessions = canonicalize_recorded_sessions_for_commit(recorded_sessions)?;
         for marker in &recorded_sessions {
             let checkpoint = canonical_checkpoints
                 .values()
@@ -5066,25 +5102,7 @@ impl UsageStore {
                 ])?;
             }
         }
-        {
-            let mut statement = transaction.prepare(
-                "INSERT INTO recorded_sessions (
-                    root_identity, relative_path, file_bytes, modified_nanos,
-                    file_device, file_inode
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT DO NOTHING",
-            )?;
-            for source in &recorded_sessions {
-                statement.execute(params![
-                    &source.root_identity,
-                    &source.relative_path,
-                    source.file_bytes as i64,
-                    source.modified_nanos.to_string(),
-                    source.file_device.to_string(),
-                    source.file_inode.to_string(),
-                ])?;
-            }
-        }
+        replace_recorded_session_markers(&transaction, &recorded_sessions)?;
         let next = current_data_generation
             .checked_add(1)
             .ok_or(UsageStoreError::GenerationOverflow)?;
@@ -6540,7 +6558,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_prunes_old_checkpoints_and_keeps_exact_cleanup_markers() {
+    fn replacement_prunes_old_checkpoints_and_replaces_stale_cleanup_marker() {
         let path = database_path("partition-session-replacement-retention");
         let identity = partition_identity('e', 5);
         let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
@@ -6609,15 +6627,22 @@ mod tests {
         let state = store.load_session_collection_state().unwrap();
         assert_eq!(state.data_generation, 3);
         assert_eq!(state.checkpoints, [new_checkpoint]);
-        assert!(store.recorded_session_matches(&old_source).unwrap());
+        assert!(!store.recorded_session_matches(&old_source).unwrap());
         assert!(store.recorded_session_matches(&new_source).unwrap());
+        let recorded_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM recorded_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(recorded_count, 1);
         assert_eq!(
             store
                 .forget_recorded_sessions(std::slice::from_ref(&new_source))
                 .unwrap(),
             1
         );
-        assert!(store.recorded_session_matches(&old_source).unwrap());
+        assert!(!store.recorded_session_matches(&old_source).unwrap());
         assert!(!store.recorded_session_matches(&new_source).unwrap());
 
         remove_database(&path);
@@ -6987,6 +7012,11 @@ mod tests {
                 std::slice::from_ref(&marker),
             )
             .unwrap();
+        let mut replacement = marker.clone();
+        replacement.modified_nanos += 1;
+        upgraded
+            .upsert_samples_and_recorded_sessions(&[], std::slice::from_ref(&replacement))
+            .unwrap();
         drop(upgraded);
 
         let reopened = UsageStore::open_read_only(&path).unwrap();
@@ -6998,7 +7028,15 @@ mod tests {
             reopened.load_durable_record().unwrap(),
             Some(durable.clone())
         );
-        assert!(reopened.recorded_session_matches(&marker).unwrap());
+        assert!(!reopened.recorded_session_matches(&marker).unwrap());
+        assert!(reopened.recorded_session_matches(&replacement).unwrap());
+        let recorded_count: i64 = reopened
+            .connection
+            .query_row("SELECT COUNT(*) FROM recorded_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(recorded_count, 1);
         drop(reopened);
 
         let mut writer = UsageStore::open(&path).unwrap();
@@ -7344,6 +7382,53 @@ mod tests {
     }
 
     #[test]
+    fn backup_and_migration_never_repair_the_protected_source() {
+        let path = database_path("backup-migration-read-only-source");
+        let original = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
+        let store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&original).unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute("DROP INDEX usage_history_timestamp_reset_idx", [])
+            .unwrap();
+        drop(connection);
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let source_before = fs::read(&path).unwrap();
+
+        let blocked = path.with_extension("sqlite3.bak.2");
+        fs::create_dir(&blocked).unwrap();
+        assert!(UsageStore::backup_generations(&path, 3).is_err());
+        assert_eq!(fs::read(&path).unwrap(), source_before);
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        fs::remove_dir(&blocked).unwrap();
+
+        let report = UsageStore::migrate_verified(&path, |samples| Ok(samples.to_vec())).unwrap();
+        assert_eq!(fs::read(&report.preserved_backup).unwrap(), source_before);
+        let migrated =
+            Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let index_present: bool = migrated
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_index_list('usage_history') WHERE name = ?1)",
+                [HISTORY_TIMESTAMP_RESET_INDEX],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            index_present,
+            "only the validated candidate may repair schema"
+        );
+        drop(migrated);
+        remove_database(&path);
+    }
+
+    #[test]
     fn verified_migration_switches_only_after_candidate_validation() {
         let path = database_path("verified-migration");
         let original = sample(1_700_000_060, 1_700_604_800, Some(75.0), 1.25);
@@ -7398,6 +7483,35 @@ mod tests {
                 path.file_name().unwrap().to_string_lossy()
             ))
             .exists());
+        remove_database(&path);
+    }
+
+    #[test]
+    fn verified_migration_rejects_account_partition_before_transform() {
+        let path = database_path("verified-migration-account-partition");
+        let identity = partition_identity('a', 23);
+        let store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        drop(store);
+        let source_before = fs::read(&path).unwrap();
+        let transform_called = std::cell::Cell::new(false);
+
+        let result = UsageStore::migrate_verified(&path, |_| {
+            transform_called.set(true);
+            Ok(Vec::new())
+        });
+
+        assert!(matches!(result, Err(UsageStoreError::InvalidImport(_))));
+        assert!(!transform_called.get());
+        assert_eq!(fs::read(&path).unwrap(), source_before);
+        let parent = path.parent().unwrap();
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        assert!(!parent.join(format!(".{file_name}.migration.lock")).exists());
+        assert!(!parent
+            .read_dir()
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".migration-")));
+        UsageStore::open_read_only_partitioned(&path, &identity).unwrap();
         remove_database(&path);
     }
 
