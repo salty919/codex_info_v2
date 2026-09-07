@@ -531,6 +531,11 @@ public sealed class GraphScene
                 continue;
             }
 
+            if (!before.ModelAvailable || !after.ModelAvailable)
+            {
+                continue;
+            }
+
             if (!ModelsEqualAt(modelSeries, index - 1, index))
             {
                 continue;

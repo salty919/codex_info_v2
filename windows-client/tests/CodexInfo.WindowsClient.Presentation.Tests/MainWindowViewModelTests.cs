@@ -66,7 +66,7 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
-    public async Task ShowLastReceivedNotifiesWhenUpdateVisibilityChangesAcrossFailureAndRecovery()
+    public async Task AvailableUpdateRemainsThePrimaryActionAcrossFailureAndRecovery()
     {
         var supervisor = new RecordingSupervisor();
         var client = new SequenceClient(
@@ -83,37 +83,65 @@ public sealed class MainWindowViewModelTests
         await EventuallyAsync(() => viewModel.IsAuthenticated && viewModel.IsUpdateNotificationVisible);
         Assert.False(viewModel.ShowLastReceived);
 
-        var failureVisible = NewSignal<bool>();
-        var recoveryHidden = NewSignal<bool>();
-        PropertyChangedEventHandler handler = (_, args) =>
-        {
-            if (args.PropertyName != nameof(viewModel.ShowLastReceived)) return;
-            if (viewModel.ShowLastReceived)
-            {
-                failureVisible.TrySetResult(true);
-            }
-            else
-            {
-                recoveryHidden.TrySetResult(false);
-            }
-        };
-        viewModel.PropertyChanged += handler;
-        try
-        {
-            viewModel.RefreshCommand.Execute(null);
-            await failureVisible.Task.WaitAsync(TimeSpan.FromSeconds(2));
-            Assert.True(viewModel.ShowLastReceived);
-            Assert.True(viewModel.IsRetryVisible);
+        viewModel.RefreshCommand.Execute(null);
+        await EventuallyAsync(() =>
+            viewModel.IsUpdateNotificationVisible &&
+            viewModel.IsUpdateActionVisible &&
+            !viewModel.IsRetryVisible);
+        Assert.False(viewModel.ShowLastReceived);
 
-            viewModel.RefreshCommand.Execute(null);
-            await recoveryHidden.Task.WaitAsync(TimeSpan.FromSeconds(2));
-            Assert.False(viewModel.ShowLastReceived);
-            Assert.True(viewModel.IsUpdateNotificationVisible);
-        }
-        finally
-        {
-            viewModel.PropertyChanged -= handler;
-        }
+        viewModel.RefreshCommand.Execute(null);
+        await EventuallyAsync(() =>
+            viewModel.IsUpdateNotificationVisible &&
+            viewModel.IsUpdateActionVisible &&
+            !viewModel.IsRetryVisible);
+        Assert.False(viewModel.ShowLastReceived);
+    }
+
+    [Fact]
+    public async Task InitialConnectionFailureCannotHideAnAvailableUpdate()
+    {
+        using var updates = new TestUpdateCoordinator(new UpdateCheckResult("1.2.3", false));
+        using var viewModel = new MainWindowViewModel(
+            new SequenceClient(DetailsFetchResult.FromFailure(DetailsFetchFailure.Response)),
+            updateCoordinator: updates);
+
+        viewModel.Start();
+        await EventuallyAsync(() =>
+            viewModel.IsUpdateNotificationVisible && viewModel.IsUpdateActionVisible);
+
+        Assert.False(viewModel.IsRetryVisible);
+        Assert.NotNull(viewModel.UpdateCommand);
+        Assert.True(viewModel.UpdateCommand!.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task V3CurrentShowsThePublishedModelCostTotal()
+    {
+        var current = new ApiCurrentSnapshot(
+            ApiState.Ready,
+            1,
+            true,
+            "Pro",
+            new ApiQuota(45, 2, 604800, false),
+            [
+                new ApiDetailsModelUsage("SOL", 1, 0, 0, 1, 0, 0)
+                {
+                    EstimatedTotalDollars = 302.946591,
+                },
+                new ApiDetailsModelUsage("LUNA", 1, 0, 0, 1, 0, 0)
+                {
+                    EstimatedTotalDollars = 10.62801708,
+                },
+            ],
+            0,
+            PublishedPair(CanonicalPublishedPair));
+        using var viewModel = new MainWindowViewModel(new SingleCurrentClient(current));
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.IsAuthenticated);
+
+        Assert.Equal("概算 $313.57", viewModel.EstimatedCostText);
     }
 
     [Fact]
@@ -716,7 +744,9 @@ public sealed class MainWindowViewModelTests
 
         Assert.Equal(initialRemaining, viewModel.RemainingPercentText);
         Assert.Contains("前回受信の値", viewModel.StatusDetail, StringComparison.Ordinal);
+        Assert.Contains("前回受信:", viewModel.StatusDetail, StringComparison.Ordinal);
         Assert.Contains("現在は更新できていません", viewModel.LastReceivedText, StringComparison.Ordinal);
+        Assert.False(viewModel.ShowLastReceived);
     }
 
     [Fact]
@@ -730,6 +760,8 @@ public sealed class MainWindowViewModelTests
 
         Assert.DoesNotContain("更新できていません", viewModel.StatusDetail, StringComparison.Ordinal);
         Assert.Contains("接続経路", viewModel.StatusDetail, StringComparison.Ordinal);
+        Assert.Contains("前回受信:", viewModel.StatusDetail, StringComparison.Ordinal);
+        Assert.False(viewModel.ShowLastReceived);
         Assert.Equal("98.5%", viewModel.RemainingPercentText);
     }
 
@@ -1427,6 +1459,32 @@ public sealed class MainWindowViewModelTests
             index++;
             return Task.FromResult(result);
         }
+    }
+
+    private sealed class SingleCurrentClient(ApiCurrentSnapshot current)
+        : HealthyDetailsClientBase, ILoopbackResourceClient
+    {
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("The split client must not request combined details.");
+
+        public Task<CurrentFetchResult> FetchCurrentAsync(
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(CurrentFetchResult.Success(current));
+
+        public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Main must not request history periods.");
+
+        public Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+            string periodId,
+            string? cursor = null,
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Main must not request history pages.");
+
+        public Task<ThreadsFetchResult> FetchThreadsAsync(
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Main must not request threads.");
     }
 
     private sealed class CountingSequenceClient(params DetailsFetchResult[] results) : HealthyDetailsClientBase

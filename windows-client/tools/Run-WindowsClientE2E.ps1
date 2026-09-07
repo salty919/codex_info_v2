@@ -9,6 +9,8 @@ param(
     [string]$OutputDirectory = '',
     [switch]$Fixture,
     [switch]$FixtureContractTest,
+    [switch]$CompatibilitySmoke,
+    [switch]$RequireCurrentPresentation,
     [string]$SourceSha = ''
 )
 
@@ -121,16 +123,24 @@ Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Drawing
 
 $compilerReferenceRoot = Join-Path $PSHOME 'ref'
-$compilerReferences = @(Get-ChildItem -LiteralPath $compilerReferenceRoot -Filter '*.dll' -File |
-    Select-Object -ExpandProperty FullName)
-$runtimeReferences = @(
-    [System.Drawing.Bitmap].Assembly.Location
-    ([System.Reflection.Assembly]::Load('System.Private.Windows.GdiPlus')).Location
-    ([System.Reflection.Assembly]::Load('System.Private.Windows.Core')).Location
-)
-Assert-E2E ($compilerReferences.Count -gt 0) 'PowerShell compiler references could not be resolved.'
-Assert-E2E (@($runtimeReferences | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }).Count -eq 0) 'Windows drawing runtime references could not be resolved.'
-$compilerReferences += $runtimeReferences
+if (Test-Path -LiteralPath $compilerReferenceRoot -PathType Container) {
+    $compilerReferences = @(Get-ChildItem -LiteralPath $compilerReferenceRoot -Filter '*.dll' -File |
+        Select-Object -ExpandProperty FullName)
+    $runtimeReferences = @(
+        [System.Drawing.Bitmap].Assembly.Location
+        ([System.Reflection.Assembly]::Load('System.Private.Windows.GdiPlus')).Location
+        ([System.Reflection.Assembly]::Load('System.Private.Windows.Core')).Location
+    )
+    Assert-E2E ($compilerReferences.Count -gt 0) 'PowerShell compiler references could not be resolved.'
+    Assert-E2E (@($runtimeReferences | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }).Count -eq 0) 'Windows drawing runtime references could not be resolved.'
+    $compilerReferences += $runtimeReferences
+}
+else {
+    # Windows PowerShell 5.1 runs on .NET Framework and has no PSHOME/ref
+    # directory. Add-Type supplies the framework references; only the drawing
+    # assembly used by the pixel scanner must be named explicitly.
+    $compilerReferences = @('System.Drawing')
+}
 
 Add-Type -ReferencedAssemblies $compilerReferences -TypeDefinition @'
 using System;
@@ -231,40 +241,64 @@ public static class CodexInfoGraphPixelScanner {
                 throw new InvalidOperationException("Fewer than four visible vertical period-grid groups were detected.");
             }
 
-            int bestStart = -1;
-            int visiblePeriodGridCount = 0;
+            int[] bestGridCenters = null;
             double bestScore = double.PositiveInfinity;
             foreach (int candidateCount in new[] { 5, 4 }) {
                 if (centers.Count < candidateCount) continue;
                 int candidateIntervals = candidateCount - 1;
-                for (int start = 0; start <= centers.Count - candidateCount; start++) {
-                    double average = (centers[start + candidateIntervals] - centers[start]) / (double)candidateIntervals;
-                    double score = 0;
-                    for (int index = 0; index < candidateIntervals; index++) {
-                        score = Math.Max(score, Math.Abs((centers[start + index + 1] - centers[start + index]) - average));
-                    }
-                    if (score < bestScore) {
-                        bestScore = score;
-                        bestStart = start;
-                        visiblePeriodGridCount = candidateCount;
+                for (int start = 0; start < centers.Count - candidateIntervals; start++) {
+                    for (int end = start + candidateIntervals; end < centers.Count; end++) {
+                        double step = (centers[end] - centers[start]) / (double)candidateIntervals;
+                        var selected = new int[candidateCount];
+                        selected[0] = centers[start];
+                        selected[candidateIntervals] = centers[end];
+                        int previous = start;
+                        double score = 0;
+                        bool complete = true;
+                        for (int index = 1; index < candidateIntervals; index++) {
+                            double expected = centers[start] + (step * index);
+                            int remaining = candidateIntervals - index;
+                            int bestIndex = -1;
+                            double error = double.PositiveInfinity;
+                            for (int candidate = previous + 1;
+                                candidate <= end - remaining;
+                                candidate++) {
+                                double candidateError = Math.Abs(centers[candidate] - expected);
+                                if (candidateError < error) {
+                                    error = candidateError;
+                                    bestIndex = candidate;
+                                }
+                            }
+                            if (bestIndex < 0) {
+                                complete = false;
+                                break;
+                            }
+                            selected[index] = centers[bestIndex];
+                            previous = bestIndex;
+                            score = Math.Max(score, error);
+                        }
+                        if (complete && score < bestScore) {
+                            bestScore = score;
+                            bestGridCenters = selected;
+                        }
                     }
                 }
             }
-            if (bestStart < 0 || bestScore > 3) {
+            if (bestGridCenters == null || bestScore > 3) {
                 throw new InvalidOperationException(
                     "Equally spaced period-grid groups were not detected: " + string.Join(",", centers));
             }
 
-            int periodStart = centers[bestStart];
-            int intervalCount = visiblePeriodGridCount - 1;
-            double periodStep = (centers[bestStart + intervalCount] - periodStart) / (double)intervalCount;
-            int periodEnd = visiblePeriodGridCount == 5
-                ? centers[bestStart + 4]
+            int periodStart = bestGridCenters[0];
+            int intervalCount = bestGridCenters.Length - 1;
+            double periodStep = (bestGridCenters[intervalCount] - periodStart) / (double)intervalCount;
+            int periodEnd = bestGridCenters.Length == 5
+                ? bestGridCenters[4]
                 : (int)Math.Round(periodStart + 4 * periodStep);
             if (periodEnd <= periodStart || periodEnd >= plotWidth) {
                 throw new InvalidOperationException("The inferred period-end grid is outside the plot.");
             }
-            if (visiblePeriodGridCount == 4) {
+            if (bestGridCenters.Length == 4) {
                 int endpointEvidence = 0;
                 for (int y = yStart; y < yEnd; y++) {
                     bool rowMatches = false;
@@ -1190,7 +1224,8 @@ function Get-E2EGraphMeasurement {
         [Parameter(Mandatory = $true)][psobject]$Capture,
         [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Plot,
         [Parameter(Mandatory = $true)][IntPtr]$WindowHandle,
-        [Parameter(Mandatory = $true)][string]$Description
+        [Parameter(Mandatory = $true)][string]$Description,
+        [switch]$AllowUnusedSeries
     )
 
     $windowBounds = Get-E2EWindowBounds $WindowHandle
@@ -1202,13 +1237,30 @@ function Get-E2EGraphMeasurement {
     $measurement = [CodexInfoGraphPixelScanner]::Scan(
         $Capture.Path, $plotLeft, $plotTop, $plotWidth, $plotHeight)
     $seriesNames = @('Remaining', 'SOL', 'TERRA', 'LUNA')
-    for ($index = 0; $index -lt $seriesNames.Count; $index++) {
-        Assert-E2E ($measurement.SeriesPixelCount[$index] -gt 0) `
-            "$Description has no visible $($seriesNames[$index]) color pixels."
-        Assert-E2E ($measurement.SeriesGutterPixelCount[$index] -gt 0) `
-            "$Description has no $($seriesNames[$index]) leader/glyph pixels in the endpoint gutter."
-        Assert-E2E ($measurement.SeriesRightmost[$index] -le $plotWidth - 3) `
-            "$Description clips $($seriesNames[$index]) at the right plot edge."
+    if ($AllowUnusedSeries) {
+        Assert-E2E ($measurement.SeriesPixelCount[0] -gt 0 -and
+            $measurement.SeriesGutterPixelCount[0] -gt 0) `
+            "$Description has no visible Remaining series and endpoint."
+        $visibleModelEndpoints = @(1..3 | Where-Object {
+            $measurement.SeriesPixelCount[$_] -gt 0 -and
+            $measurement.SeriesGutterPixelCount[$_] -gt 0
+        })
+        Assert-E2E ($visibleModelEndpoints.Count -gt 0) `
+            "$Description has no visible used-model series and endpoint."
+        foreach ($index in @(0) + $visibleModelEndpoints) {
+            Assert-E2E ($measurement.SeriesRightmost[$index] -le $plotWidth - 3) `
+                "$Description clips $($seriesNames[$index]) at the right plot edge."
+        }
+    }
+    else {
+        for ($index = 0; $index -lt $seriesNames.Count; $index++) {
+            Assert-E2E ($measurement.SeriesPixelCount[$index] -gt 0) `
+                "$Description has no visible $($seriesNames[$index]) color pixels."
+            Assert-E2E ($measurement.SeriesGutterPixelCount[$index] -gt 0) `
+                "$Description has no $($seriesNames[$index]) leader/glyph pixels in the endpoint gutter."
+            Assert-E2E ($measurement.SeriesRightmost[$index] -le $plotWidth - 3) `
+                "$Description clips $($seriesNames[$index]) at the right plot edge."
+        }
     }
     Write-E2E ("graph-resize-measurement: state={0} plot={1}x{2} grids={3} start={4} end={5} span={6} gutter={7}" -f
         $Description, $plotWidth, $plotHeight, ($measurement.GridCenters -join ','),
@@ -1225,7 +1277,8 @@ function Wait-E2EGraphPixelsReady {
     param(
         [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root,
         [Parameter(Mandatory = $true)][IntPtr]$WindowHandle,
-        [Parameter(Mandatory = $true)][string]$Description
+        [Parameter(Mandatory = $true)][string]$Description,
+        [switch]$AllowUnusedSeries
     )
 
     return Wait-E2E -Description "$Description rendered graph pixels" -TimeoutSeconds 30 -Probe {
@@ -1233,7 +1286,7 @@ function Wait-E2EGraphPixelsReady {
         if ($null -eq $candidatePlot) { return $false }
         $candidateCapture = Capture-E2EWindow $WindowHandle 'graph-ready-probe'
         return Get-E2EGraphMeasurement -Capture $candidateCapture -Plot $candidatePlot `
-            -WindowHandle $WindowHandle -Description $Description
+            -WindowHandle $WindowHandle -Description $Description -AllowUnusedSeries:$AllowUnusedSeries
     }
 }
 
@@ -2189,6 +2242,14 @@ try {
     Assert-E2E ($detailsIsLatest -and -not $detailsHasFailure) `
         "Main details status is not a complete accepted generation: '$detailsStatusText'"
     Write-E2E 'main-details-status: PASS (single details generation accepted)'
+    if ($RequireCurrentPresentation) {
+        $estimatedValues = @(Get-E2EAllDescendants $mainRoot | ForEach-Object {
+            try { [string]$_.Current.Name } catch { '' }
+        } | Where-Object { $_ -cmatch '^.+\s+\$[0-9][0-9,]*(\.[0-9]{2})$' })
+        Assert-E2E ($estimatedValues.Count -eq 1) `
+            'Main must expose exactly one numeric aggregate estimated cost.'
+        Write-E2E 'main-estimated-cost: PASS (numeric aggregate is rendered)'
+    }
 
     # Finite path: one Graph window, one period round-trip, two metrics, then
     # one OFF/ON cycle for each of four independent series.  No combinations
@@ -2205,8 +2266,13 @@ try {
         if ($candidate.Current.IsOffscreen -or $rect.Width -le 0 -or $rect.Height -le 0) { return $false }
         return $candidate
     }
-    $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description 'initial-current'
+    $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle `
+        -Description 'initial-current' -AllowUnusedSeries:$CompatibilitySmoke
     Write-E2E ("graph: plot bounds={0}x{1}" -f $plot.Current.BoundingRectangle.Width, $plot.Current.BoundingRectangle.Height)
+    if ($CompatibilitySmoke) {
+        Write-E2E 'windows-client-compatibility-smoke: PASS (installed client -> real current -> real selected history graph)'
+        return
+    }
     $initialGraphBounds = Get-E2EWindowBounds $graph.Handle
     $graphScaleX = $initialGraphBounds.Width / 940.0
     $graphScaleY = $initialGraphBounds.Height / 640.0

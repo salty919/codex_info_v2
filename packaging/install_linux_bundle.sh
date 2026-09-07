@@ -56,6 +56,8 @@ manifest_destination="$share_dir/manifest.json"
 unit_destination="$unit_dir/codex-info.service"
 update_service_destination="$unit_dir/codex-info-update.service"
 update_timer_destination="$unit_dir/codex-info-update.timer"
+main_enable_destination="$unit_dir/default.target.wants/codex-info.service"
+timer_enable_destination="$unit_dir/timers.target.wants/codex-info-update.timer"
 current_link="$share_dir/current"
 transaction="$share_dir/install-transaction.json"
 control_state="$share_dir/control-state.json"
@@ -253,6 +255,12 @@ initialize_mutating_action() {
             # the live publication owner; it must never wait on or steal L1.
             lock_bypassed=1
             exec 9<&-
+        elif [[ "$ACTION" == timer-update ]]; then
+            # A persistent timer may become due while a manual publication owns
+            # L1. The publication is authoritative; defer this redundant tick
+            # without turning normal lock contention into a failed unit.
+            printf 'update deferred: another install, update, or control operation is running\n'
+            exit 0
         else
             die 'another install, update, or control operation is already running'
         fi
@@ -301,10 +309,78 @@ systemctl_stop_user() {
 require_user_manager() {
     systemctl_user show-environment >/dev/null 2>&1 || die 'systemd user manager is unavailable'
 }
+enable_link_record() {
+    case "$1" in
+        codex-info.service)
+            printf '%s\t%s\n' "$main_enable_destination" '../codex-info.service'
+            ;;
+        codex-info-update.timer)
+            printf '%s\t%s\n' "$timer_enable_destination" '../codex-info-update.timer'
+            ;;
+        *) die "unsupported managed enable unit: $1" ;;
+    esac
+}
+known_enable_link() {
+    local unit="$1" destination="$2" expected="$3" link_target resolved generation_path
+    [[ -L "$destination" ]] || return 1
+    link_target="$(readlink -- "$destination" 2>/dev/null || true)"
+    [[ "$link_target" == "$expected" ]] && return 0
+    resolved="$(readlink -f -- "$destination" 2>/dev/null || true)"
+    [[ "$resolved" == "$generations_dir/"*"/$unit" ]] || return 1
+    generation_path="${resolved%/$unit}"
+    [[ "$(dirname -- "$generation_path")" == "$generations_dir" ]] || return 1
+    verify_generation_files "$generation_path" >/dev/null 2>&1
+}
 probe_enabled() {
-    local unit="$1" status=0
+    local unit="$1" destination expected status=0
+    IFS=$'\t' read -r destination expected <<<"$(enable_link_record "$unit")"
+    if [[ -e "$destination" || -L "$destination" ]]; then
+        known_enable_link "$unit" "$destination" "$expected" ||
+            safe_blocked "foreign enable link for $unit"
+        return 0
+    fi
     systemctl_user is-enabled --quiet "$unit" >/dev/null 2>&1 || status="$?"
-    case "$status" in 0) return 0 ;; 1) return 1 ;; *) die "could not inspect enabled state for $unit" ;; esac
+    case "$status" in
+        0) return 0 ;;
+        1|4) return 1 ;;
+        *) die "could not inspect enabled state for $unit" ;;
+    esac
+}
+enable_managed_unit() {
+    local unit="$1" destination expected
+    IFS=$'\t' read -r destination expected <<<"$(enable_link_record "$unit")"
+    if [[ -e "$destination" || -L "$destination" ]]; then
+        known_enable_link "$unit" "$destination" "$expected" ||
+            safe_blocked "foreign enable link for $unit"
+    fi
+    mkdir -p -- "$(dirname -- "$destination")"
+    atomic_symlink "$expected" "$destination"
+    systemctl_user daemon-reload >/dev/null 2>&1 || return 1
+    probe_enabled "$unit"
+}
+disable_managed_unit() {
+    local unit="$1" destination expected
+    IFS=$'\t' read -r destination expected <<<"$(enable_link_record "$unit")"
+    if [[ -e "$destination" || -L "$destination" ]]; then
+        known_enable_link "$unit" "$destination" "$expected" ||
+            safe_blocked "foreign enable link for $unit"
+        atomic_unlink "$destination"
+        systemctl_user daemon-reload >/dev/null 2>&1 || return 1
+    fi
+    ! probe_enabled "$unit"
+}
+converge_enable_links() {
+    case "$desired_state" in
+        running|stopped)
+            enable_managed_unit codex-info.service &&
+                enable_managed_unit codex-info-update.timer
+            ;;
+        disabled|removed)
+            disable_managed_unit codex-info.service &&
+                disable_managed_unit codex-info-update.timer
+            ;;
+        *) safe_blocked "unsupported desired state for enable links: $desired_state" ;;
+    esac
 }
 probe_active() {
     local unit="$1" status=0
@@ -1410,8 +1486,8 @@ def pairs(items):
 try: document=json.load(sys.stdin,object_pairs_hook=pairs)
 except Exception as error: raise SystemExit(str(error))
 if not isinstance(document,dict): raise SystemExit("details is not an object")
-if document.get("state") not in {"ready","auth_required"}:
-    raise SystemExit("details is not functionally ready")
+if document.get("state") not in {"ready","auth_required","error"}:
+    raise SystemExit("details state is unknown")
 observed_at=document.get("observed_at")
 if isinstance(observed_at,bool) or not isinstance(observed_at,int) or observed_at <= 0:
     raise SystemExit("details observed_at is invalid")
@@ -1509,7 +1585,7 @@ rearm_update_timer() {
         systemctl_stop_user stop --no-block codex-info-update.timer >/dev/null 2>&1 || return 1
         wait_inactive codex-info-update.timer || return 1
     fi
-    systemctl_user enable codex-info-update.timer >/dev/null 2>&1 || return 1
+    enable_managed_unit codex-info-update.timer || return 1
     systemctl_user start --no-block codex-info-update.timer >/dev/null 2>&1 || return 1
 }
 reset_failed_main() {
@@ -1609,15 +1685,15 @@ enforce_desired_state() {
             wait_inactive codex-info-update.timer || return 1
             timer_active=0
         fi
-        systemctl_user disable codex-info-update.timer >/dev/null 2>&1 || return 1
+        disable_managed_unit codex-info-update.timer || return 1
         timer_enabled=0
     fi
 }
 restore_runtime_state() {
     local failed=0
-    if ((timer_enabled)); then systemctl_user enable codex-info-update.timer >/dev/null 2>&1 || failed=1; else systemctl_user disable codex-info-update.timer >/dev/null 2>&1 || failed=1; fi
+    if ((timer_enabled)); then enable_managed_unit codex-info-update.timer || failed=1; else disable_managed_unit codex-info-update.timer || failed=1; fi
     if ((timer_active)); then systemctl_user start --no-block codex-info-update.timer >/dev/null 2>&1 || failed=1; else systemctl_stop_user stop --no-block codex-info-update.timer >/dev/null 2>&1 || failed=1; wait_inactive codex-info-update.timer || failed=1; fi
-    if ((main_enabled)); then systemctl_user enable codex-info.service >/dev/null 2>&1 || failed=1; else systemctl_user disable codex-info.service >/dev/null 2>&1 || failed=1; fi
+    if ((main_enabled)); then enable_managed_unit codex-info.service || failed=1; else disable_managed_unit codex-info.service || failed=1; fi
     if ((main_active)); then systemctl_user restart --no-block codex-info.service >/dev/null 2>&1 || failed=1; else systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 || failed=1; wait_inactive codex-info.service || failed=1; fi
     return "$failed"
 }
@@ -1643,7 +1719,7 @@ rollback_transaction() {
         if [[ -n "$previous" ]]; then
             if [[ "$desired_state" == running ]]; then
                 if ! ((main_active)); then
-                    systemctl_user enable codex-info.service >/dev/null 2>&1 || ok=0
+                    enable_managed_unit codex-info.service || ok=0
                     systemctl_user start --no-block codex-info.service >/dev/null 2>&1 || ok=0
                 fi
                 ((ok)) && wait_runtime_ready || ok=0
@@ -1675,7 +1751,8 @@ resume_transaction() {
     capture_runtime_state
     if [[ "$journal_phase" == current_switched || "$journal_phase" == activation_requested ]]; then
         if [[ "$(current_generation)" == "$candidate_id" ]] && verify_local_generation >/dev/null 2>&1 &&
-            { [[ "$desired_state" != running ]] || verify_runtime >/dev/null 2>&1; }; then
+            { [[ "$desired_state" != running ]] || (verify_runtime >/dev/null 2>&1); }; then
+            converge_enable_links || safe_blocked 'candidate enable links could not be recovered'
             write_journal candidate_verified resumed-live-owner
             write_journal committed resumed
             return 0
@@ -1683,7 +1760,8 @@ resume_transaction() {
     elif [[ "$journal_phase" == rollback_switched ]]; then
         if [[ -n "$previous_id" ]]; then
             if [[ "$(current_generation)" == "$previous_id" ]] && verify_local_generation >/dev/null 2>&1 &&
-                { [[ "$desired_state" != running ]] || verify_runtime >/dev/null 2>&1; }; then
+                { [[ "$desired_state" != running ]] || (verify_runtime >/dev/null 2>&1); }; then
+                converge_enable_links || safe_blocked 'rollback enable links could not be recovered'
                 write_journal rollback_verified resumed-rollback
                 write_journal committed resumed
                 return 0
@@ -1702,9 +1780,13 @@ resume_transaction() {
 }
 activate_candidate() {
     systemctl_user daemon-reload >/dev/null 2>&1 || return 1
+    converge_enable_links || return 1
+    if [[ "$desired_state" == stopped ]]; then
+        rearm_update_timer
+        return
+    fi
     [[ "$desired_state" == running ]] || return 0
     reset_failed_main || return 1
-    systemctl_user enable codex-info.service >/dev/null 2>&1 || return 1
     rearm_update_timer || return 1
     [[ "$TRIGGER" == startup ]] && return
     if ((main_active)); then systemctl_user restart --no-block codex-info.service >/dev/null 2>&1 || return 1
@@ -1772,7 +1854,7 @@ update_failure_with_fallback() {
     fi
     if [[ "$desired_state" == running ]]; then
         if [[ -n "$current_id" ]]; then
-            verify_runtime >/dev/null 2>&1 && fallback_ok=1 || true
+            (verify_runtime >/dev/null 2>&1) && fallback_ok=1 || true
         elif legacy_flat_present; then
             verify_legacy_runtime >/dev/null 2>&1 && fallback_ok=1 || true
         fi
@@ -1851,10 +1933,11 @@ run_update() {
             if ! probe_active codex-info.service; then
                 retire_known_unmanaged 0
                 if [[ "$TRIGGER" == startup ]]; then
+                    converge_enable_links || safe_blocked 'startup enable links could not be recovered'
                     rm -r -- "$update_root"; update_root=; ((QUIET)) || printf 'no update current=%s newest=%s\n' "$installed_version" "$newest"; return
                 fi
                 reset_failed_main || safe_blocked 'could not reset failed managed service'
-                systemctl_user enable codex-info.service >/dev/null 2>&1 || safe_blocked 'could not enable managed service'
+                enable_managed_unit codex-info.service || safe_blocked 'could not enable managed service'
                 systemctl_user start --no-block codex-info.service >/dev/null 2>&1 || safe_blocked 'could not start managed service'
             else
                 repair_known_managed_runtime
@@ -2028,7 +2111,7 @@ if [[ "$ACTION" == start ]]; then
     # the service running even when the resolver selects an equal generation.
     write_control_state running
     run_update
-    systemctl_user enable codex-info.service >/dev/null 2>&1 || safe_blocked 'could not enable managed service'
+    enable_managed_unit codex-info.service || safe_blocked 'could not enable managed service'
     rearm_update_timer || safe_blocked 'could not enable update timer'
     if ! probe_active codex-info.service; then
         systemctl_user start --no-block codex-info.service >/dev/null 2>&1 || safe_blocked 'could not start managed service'
@@ -2041,7 +2124,7 @@ if [[ "$ACTION" == stop ]]; then
     load_control_state; require_user_manager; guard_control_listener
     systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 || die 'could not stop service'
     wait_inactive codex-info.service || safe_blocked 'managed service did not stop within 20s'
-    systemctl_user enable codex-info.service >/dev/null 2>&1 || die 'could not keep service enabled'
+    enable_managed_unit codex-info.service || die 'could not keep service enabled'
     rearm_update_timer || safe_blocked 'update timer could not remain active after stop'
     desired_state=stopped
     verify_nonrunning_terminal stopped || safe_blocked 'stopped terminal could not be verified'
@@ -2053,9 +2136,10 @@ if [[ "$ACTION" == disable ]]; then
     load_control_state; require_user_manager; guard_control_listener
     systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 || die 'could not stop service'
     wait_inactive codex-info.service || safe_blocked 'managed service did not stop within 20s'
-    systemctl_user disable codex-info.service >/dev/null 2>&1 || die 'could not disable service'
-    systemctl_stop_user disable --now codex-info-update.timer >/dev/null 2>&1 || die 'could not disable timer'
+    disable_managed_unit codex-info.service || die 'could not disable service'
+    systemctl_stop_user stop --no-block codex-info-update.timer >/dev/null 2>&1 || die 'could not stop timer'
     wait_inactive codex-info-update.timer || safe_blocked 'update timer did not stop within 20s'
+    disable_managed_unit codex-info-update.timer || die 'could not disable timer'
     desired_state=disabled
     verify_nonrunning_terminal disabled || safe_blocked 'disabled terminal could not be verified'
     write_control_state disabled
@@ -2066,9 +2150,10 @@ if [[ "$ACTION" == remove ]]; then
     load_control_state; require_user_manager; guard_control_listener
     systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 || die 'could not stop service'
     wait_inactive codex-info.service || safe_blocked 'managed service did not stop within 20s'
-    systemctl_user disable codex-info.service >/dev/null 2>&1 || die 'could not disable service'
-    systemctl_stop_user disable --now codex-info-update.timer >/dev/null 2>&1 || die 'could not disable timer'
+    disable_managed_unit codex-info.service || die 'could not disable service'
+    systemctl_stop_user stop --no-block codex-info-update.timer >/dev/null 2>&1 || die 'could not stop timer'
     wait_inactive codex-info-update.timer || safe_blocked 'update timer did not stop within 20s'
+    disable_managed_unit codex-info-update.timer || die 'could not disable timer'
     systemctl_stop_user stop --no-block codex-info-update.service >/dev/null 2>&1 || die 'could not stop update service'
     wait_inactive codex-info-update.service || safe_blocked 'update service did not stop within 20s'
     for destination in "$unit_destination" "$update_service_destination" "$update_timer_destination"; do [[ -L "$destination" ]] || safe_blocked "refusing to remove non-symlink unit: $destination"; done
