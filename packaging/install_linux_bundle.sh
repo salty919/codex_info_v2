@@ -1745,7 +1745,7 @@ resume_transaction() {
     capture_runtime_state
     if [[ "$journal_phase" == current_switched || "$journal_phase" == activation_requested ]]; then
         if [[ "$(current_generation)" == "$candidate_id" ]] && verify_local_generation >/dev/null 2>&1 &&
-            { [[ "$desired_state" != running ]] || verify_runtime >/dev/null 2>&1; }; then
+            { [[ "$desired_state" != running ]] || (verify_runtime >/dev/null 2>&1); }; then
             converge_enable_links || safe_blocked 'candidate enable links could not be recovered'
             write_journal candidate_verified resumed-live-owner
             write_journal committed resumed
@@ -1754,7 +1754,7 @@ resume_transaction() {
     elif [[ "$journal_phase" == rollback_switched ]]; then
         if [[ -n "$previous_id" ]]; then
             if [[ "$(current_generation)" == "$previous_id" ]] && verify_local_generation >/dev/null 2>&1 &&
-                { [[ "$desired_state" != running ]] || verify_runtime >/dev/null 2>&1; }; then
+                { [[ "$desired_state" != running ]] || (verify_runtime >/dev/null 2>&1); }; then
                 converge_enable_links || safe_blocked 'rollback enable links could not be recovered'
                 write_journal rollback_verified resumed-rollback
                 write_journal committed resumed
@@ -1848,7 +1848,7 @@ update_failure_with_fallback() {
     fi
     if [[ "$desired_state" == running ]]; then
         if [[ -n "$current_id" ]]; then
-            verify_runtime >/dev/null 2>&1 && fallback_ok=1 || true
+            (verify_runtime >/dev/null 2>&1) && fallback_ok=1 || true
         elif legacy_flat_present; then
             verify_legacy_runtime >/dev/null 2>&1 && fallback_ok=1 || true
         fi

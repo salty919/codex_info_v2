@@ -184,7 +184,10 @@ case "${1-}" in
     is-active)
         unit="${*: -1}"
         case "$unit" in
-            codex-info.service) [[ "${FAKE_MAIN_ACTIVE:-0}" == 1 ]] && exit 0 || exit 3 ;;
+            codex-info.service)
+                if [[ -n "${FAKE_MAIN_ACTIVE_FILE:-}" && -f "$FAKE_MAIN_ACTIVE_FILE" ]]; then exit 0; fi
+                [[ "${FAKE_MAIN_ACTIVE:-0}" == 1 ]] && exit 0 || exit 3
+                ;;
             codex-info-update.timer) [[ "${FAKE_TIMER_ACTIVE:-0}" == 1 ]] && exit 0 || exit 3 ;;
             *) exit 3 ;;
         esac
@@ -195,6 +198,10 @@ case "${1-}" in
         ;;
     daemon-reload|enable|disable|start|stop|restart)
         unit="${*: -1}"
+        if [[ "$unit" == codex-info.service && -n "${FAKE_MAIN_ACTIVE_FILE:-}" ]]; then
+            if [[ "$1" == start || "$1" == restart ]]; then : > "$FAKE_MAIN_ACTIVE_FILE"; fi
+            if [[ "$1" == stop ]]; then rm -f -- "$FAKE_MAIN_ACTIVE_FILE"; fi
+        fi
         if [[ "${FAKE_STARTUP_CONDITION:-0}" == 1 &&
               "$unit" == codex-info.service &&
               ("$1" == start || "$1" == restart) ]]; then
@@ -813,6 +820,43 @@ printf '%s\n' '#!/usr/bin/env bash' 'cat -- "$READINESS_CLOCK_FILE"' > "$clock_b
 # shellcheck disable=SC2016
 printf '%s\n' '#!/usr/bin/env bash' 'value="$(<"$READINESS_CLOCK_FILE")"' 'printf "%s\\n" "$((value + ${1:-1}))" > "$READINESS_CLOCK_FILE"' > "$sleep_bin"
 chmod 0755 "$clock_bin" "$sleep_bin"
+
+# Runtime verification is fatal when used as a terminal gate, but recovery
+# must treat its pre-rollback failure as a boolean and continue to the known
+# predecessor. The fake service becomes active only after rollback starts it.
+resume_active_file="$TEST_ROOT/resume-main-active"
+rm -f -- "$resume_active_file"
+resume_generation="$(readlink -- "$fake_home/.local/share/codex-info/current")"
+resume_generation="${resume_generation#generations/}"
+python3 - "$fake_home/.local/share/codex-info/install-transaction.json" "$boot_id_value" "$resume_generation" <<'PY'
+import json, pathlib, sys
+path, boot_id, generation = sys.argv[1:]
+pathlib.Path(path).write_text(json.dumps({
+    "schema": "codex-info-install-transaction-v1",
+    "operation_id": "running-rollback-fixture",
+    "owner_pid": 2147483647,
+    "owner_starttime": 1,
+    "boot_id": boot_id,
+    "phase": "rollback_switched",
+    "old_generation": generation,
+    "new_generation": "",
+    "desired_state": "running",
+    "updated_at_unix": 1,
+}, indent=2) + "\n", encoding="utf-8")
+pathlib.Path(path).chmod(0o600)
+PY
+HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+    FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" TMPDIR="$update_tmp" \
+    FAKE_MAIN_ENABLED=1 FAKE_TIMER_ENABLED=1 FAKE_MAIN_ACTIVE_FILE="$resume_active_file" \
+    FAKE_MAIN_PID="$health_pid" FAKE_HEALTH_VERSION="$health_version" \
+    CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+    bash "$fake_home/.local/libexec/codex-info-install.sh" --update >/dev/null
+[[ -f "$resume_active_file" ]] || fail 'rollback resume did not start the known predecessor'
+grep -Fq '"phase": "committed"' "$fake_home/.local/share/codex-info/install-transaction.json" ||
+    fail 'running rollback resume did not commit'
+write_stopped_state "$fake_home"
+printf 'case running rollback continues after failed runtime probe: PASS\n'
+
 health_count="$TEST_ROOT/health-count"
 : > "$health_count"
 write_stopped_state "$fake_home"
@@ -928,9 +972,9 @@ run_active_startup_condition_case "$fake_home" current_switched '' "$condition_g
 if run_startup_condition "$fake_home" >/dev/null 2>&1; then
     fail 'stale transaction journal unexpectedly authorized startup condition'
 fi
-if run_startup_reconcile "$fake_home" >/dev/null 2>&1; then
-    fail 'stale transaction journal unexpectedly authorized startup reconcile'
-fi
+# A stale owner must remain unauthorized for the read-only condition. A
+# reconcile process that acquires L1 is instead the recovery authority; its
+# rollback behavior is covered by the running/stable-link resume cases above.
 run_active_startup_condition_case "$fake_home" rollback_switched "$condition_generation" '' pass rollback
 mismatch_generation="9.9.9-$(printf 'f%.0s' {1..40})-$(printf 'e%.0s' {1..64})"
 run_active_startup_condition_case "$fake_home" current_switched '' "$mismatch_generation" fail mismatch
