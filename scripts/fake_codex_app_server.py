@@ -8,6 +8,7 @@ import time
 
 
 reset_at = int(os.environ.get("CODEX_INFO_FAKE_RESET_AT", int(time.time()) + 604800 - 3600))
+failure_file = os.environ.get("CODEX_INFO_FAKE_FAILURE_FILE")
 account = {
     "requiresOpenaiAuth": False,
     "account": {
@@ -39,6 +40,16 @@ for line in sys.stdin:
         result = {}
     elif method == "account/read":
         result = account
+    elif method == "account/rateLimits/read" and failure_file and os.path.exists(failure_file):
+        print(
+            json.dumps({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32000, "message": "injected bounded fixture failure"},
+            }),
+            flush=True,
+        )
+        continue
     elif method == "account/rateLimits/read":
         result = quota
     elif method == "thread/list":

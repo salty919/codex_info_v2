@@ -79,62 +79,22 @@ jobs:
         if: inputs.release_candidate
         shell: pwsh
         run: ./windows-client/tools/Build-WindowsInstaller.ps1 -OutputDirectory artifacts/windows-installer
-      - name: Smoke-test install and uninstall lifecycle
+      - name: Upgrade latest published Windows release to the exact candidate
         if: inputs.release_candidate
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
-          $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
-          $installProcess = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/MERGETASKS=desktopicon') -Wait -PassThru
-          if ($installProcess.ExitCode -ne 0) { throw "Installer failed with exit code $($installProcess.ExitCode)" }
-          $install = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
-          $start = Join-Path ([Environment]::GetFolderPath('Programs')) 'Codex Info\Codex Info Monitor.lnk'
-          $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Codex Info Monitor.lnk'
-          $exe = Join-Path $install 'CodexInfo.WindowsClient.exe'
-          $nativeNotice = Join-Path $install 'THIRD-PARTY-LICENSES\skiasharp.nativeassets.win32-3.119.4-THIRD-PARTY-NOTICES.txt'
-          $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File | Select-Object -First 1
-          if (-not (Test-Path $exe -PathType Leaf)) { throw 'Installed client executable is missing.' }
-          if (-not (Test-Path $nativeNotice -PathType Leaf)) { throw 'Required SkiaSharp native notice is missing from the installed payload.' }
-          if ($null -eq $uninstaller) { throw 'Installed uninstaller is missing.' }
-          if (-not (Test-Path $start -PathType Leaf)) { throw 'Start-menu shortcut is missing.' }
-          if (-not (Test-Path $desktop -PathType Leaf)) { throw 'Desktop shortcut is missing.' }
-          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexInfo.WindowsClient_is1'
-          if (-not (Test-Path $key)) { throw 'Per-user Apps uninstall registration is missing.' }
-          if ((Get-ItemPropertyValue $key DisplayIcon) -ne $exe) { throw 'Apps entry icon does not target the product executable.' }
-          $shell = New-Object -ComObject WScript.Shell
-          $shortcut = $shell.CreateShortcut($start)
-          if ($shortcut.TargetPath -ne $exe) { throw 'Start-menu shortcut target is incorrect.' }
-          if ($shortcut.WorkingDirectory -ne $install) { throw 'Start-menu shortcut working directory is incorrect.' }
-          $settings = Join-Path $env:LOCALAPPDATA 'CodexInfo'
-          $sentinel = Join-Path $settings 'installer-preserve-sentinel.txt'
-          New-Item -ItemType Directory -Path $settings -Force | Out-Null
-          Set-Content -LiteralPath $sentinel -Value 'preserve'
-          $updateProcess = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
-          if ($updateProcess.ExitCode -ne 0) { throw "Installer update failed with exit code $($updateProcess.ExitCode)" }
-          if (-not (Test-Path $sentinel -PathType Leaf)) { throw 'Update removed user settings.' }
-          Start-Process -FilePath $start
-          Start-Sleep -Seconds 5
-          $clientProcesses = Get-Process -Name 'CodexInfo.WindowsClient' -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -eq $exe }
-          if (-not $clientProcesses) { throw 'Start-menu shortcut did not launch the installed client.' }
-          $clientProcesses | Stop-Process -Force
-          $uninstallProcess = Start-Process -FilePath $uninstaller.FullName -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
-          if ($uninstallProcess.ExitCode -ne 0) { throw "Uninstaller failed with exit code $($uninstallProcess.ExitCode)" }
-          Start-Sleep -Seconds 4
-          if (Test-Path $install) { throw 'Install directory still exists after uninstall.' }
-          if (Test-Path $start) { throw 'Start-menu shortcut still exists after uninstall.' }
-          if (Test-Path $desktop) { throw 'Desktop shortcut still exists after uninstall.' }
-          if (Test-Path $key) { throw 'Per-user uninstall registration still exists.' }
-          if (-not (Test-Path $sentinel -PathType Leaf)) { throw 'Uninstall removed user settings.' }
-          Remove-Item -LiteralPath $sentinel -Force
+          ./windows-client/tools/Test-WindowsInstallerUpgrade.ps1 `
+            -CandidateSetup ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe `
+            -SourceSha $env:SOURCE_SHA
       - name: Run installed Windows UI Automation E2E
         if: inputs.release_candidate
         shell: pwsh
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
-          $setup = (Resolve-Path ./artifacts/windows-installer/CodexInfo.WindowsClient.Setup.exe).Path
-          $installProcess = Start-Process -FilePath $setup -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
-          if ($installProcess.ExitCode -ne 0) { throw "E2E fixture install failed with exit code $($installProcess.ExitCode)" }
           $install = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
           $exe = Join-Path $install 'CodexInfo.WindowsClient.exe'
           $e2eOutput = Join-Path $env:RUNNER_TEMP 'codex-info-windows-e2e'
@@ -155,6 +115,17 @@ jobs:
               $uninstallProcess = Start-Process -FilePath $uninstaller.FullName -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
               if ($uninstallProcess.ExitCode -ne 0) { throw "E2E cleanup uninstall failed with exit code $($uninstallProcess.ExitCode)" }
             }
+            $sentinel = Join-Path $env:LOCALAPPDATA 'CodexInfo\installer-preserve-sentinel.txt'
+            $start = Join-Path ([Environment]::GetFolderPath('Programs')) 'Codex Info\Codex Info Monitor.lnk'
+            $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Codex Info Monitor.lnk'
+            $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexInfo.WindowsClient_is1'
+            Start-Sleep -Seconds 4
+            if (Test-Path -LiteralPath $install) { throw 'Install directory still exists after E2E uninstall.' }
+            if (Test-Path -LiteralPath $start) { throw 'Start-menu shortcut still exists after E2E uninstall.' }
+            if (Test-Path -LiteralPath $desktop) { throw 'Desktop shortcut still exists after E2E uninstall.' }
+            if (Test-Path -LiteralPath $key) { throw 'Apps registration still exists after E2E uninstall.' }
+            if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf)) { throw 'E2E uninstall removed user settings.' }
+            Remove-Item -LiteralPath $sentinel -Force
           }
       - name: Create release manifest
         id: manifest
