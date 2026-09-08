@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using CodexInfo.WindowsClient.Core;
+using System.Text;
 
 namespace CodexInfo.WindowsClient.Graphing;
 
@@ -17,6 +18,17 @@ public readonly record struct GraphIdleInterval(long StartAt, long EndAt, bool P
 
 /// <summary>A recorder-confirmed interval in which no complete observation exists.</summary>
 internal readonly record struct GraphConfirmedGap(long StartAt, long EndAt);
+
+/// <summary>The provenance of one displayed remaining-quota point.</summary>
+internal enum GraphRemainingOrigin
+{
+    Missing,
+    Raw,
+    Interpolated,
+    BoundedNullHold,
+    TerminalNullHold,
+    MonotonicHold,
+}
 
 /// <summary>
 /// Framework-independent graph projection. It is the single owner of graph
@@ -37,10 +49,13 @@ public sealed class GraphScene
         double[] astra,
         IReadOnlyDictionary<string, IReadOnlyList<double>> modelSeries,
         bool[] modelVectorAvailable,
+        bool[] modelSynthetic,
         bool[] remainingObserved,
         double[] observedRemainingValues,
         bool[] remainingInterpolated,
+        GraphRemainingOrigin[] remainingOrigins,
         IReadOnlyList<GraphConfirmedGap> confirmedGaps,
+        IReadOnlySet<long> correctionStarts,
         IReadOnlyList<GraphIdleInterval> idleIntervals,
         double modelMaximum)
     {
@@ -55,10 +70,13 @@ public sealed class GraphScene
         Astra = astra;
         ModelSeries = modelSeries;
         ModelVectorAvailable = modelVectorAvailable;
+        ModelSynthetic = modelSynthetic;
         RemainingObserved = remainingObserved;
         ObservedRemainingValues = observedRemainingValues;
         RemainingInterpolated = remainingInterpolated;
+        RemainingOrigins = remainingOrigins;
         ConfirmedGaps = confirmedGaps;
+        CorrectionStarts = correctionStarts;
         IdleIntervals = idleIntervals;
         ModelMaximum = modelMaximum;
     }
@@ -89,11 +107,13 @@ public sealed class GraphScene
     public IReadOnlyDictionary<string, IReadOnlyList<double>> ModelSeries { get; }
 
     /// <summary>
-    /// Indicates whether the complete cumulative model vector at each sample
-    /// is trusted. A false row is intentionally unavailable for every model,
-    /// even when one or two raw components were still monotonic.
+    /// Indicates whether every model in the selected period's published
+    /// universe has an accepted finite value at this sample. Set completeness
+    /// alone does not decide this value.
     /// </summary>
     internal IReadOnlyList<bool> ModelVectorAvailable { get; }
+
+    internal IReadOnlyList<bool> ModelSynthetic { get; }
 
     /// <summary>Indicates which remaining-quota values came from the remote observation.</summary>
     internal IReadOnlyList<bool> RemainingObserved { get; }
@@ -104,7 +124,11 @@ public sealed class GraphScene
     /// <summary>Indicates values filled or adjusted because an observation was unavailable.</summary>
     internal IReadOnlyList<bool> RemainingInterpolated { get; }
 
+    internal IReadOnlyList<GraphRemainingOrigin> RemainingOrigins { get; }
+
     internal IReadOnlyList<GraphConfirmedGap> ConfirmedGaps { get; }
+
+    internal IReadOnlySet<long> CorrectionStarts { get; }
 
     public IReadOnlyList<GraphIdleInterval> IdleIntervals { get; }
 
@@ -113,7 +137,7 @@ public sealed class GraphScene
     public bool HasPoints => Timestamps.Count > 0;
 
     public static GraphScene Empty(GraphMetric metric = GraphMetric.Dollars) =>
-        new(0, 1, metric, [], [], [], [], [], [], new Dictionary<string, IReadOnlyList<double>>(StringComparer.Ordinal), [], [], [], [], [], [], 1);
+        new(0, 1, metric, [], [], [], [], [], [], new Dictionary<string, IReadOnlyList<double>>(StringComparer.Ordinal), [], [], [], [], [], [], [], new HashSet<long>(), [], 1);
 
     public static GraphScene Create(
         IReadOnlyList<ApiHistorySample> samples,
@@ -148,73 +172,66 @@ public sealed class GraphScene
                 .OrderBy(gap => gap.StartAt)
                 .ToArray();
         var modelNames = samples
-            .SelectMany(sample => sample.Models.Select(model => model.Name))
+            .SelectMany(PublishedModels)
+            .Select(model => model.Name)
             .Distinct(StringComparer.Ordinal)
+            .OrderBy(name => name, Utf8ModelNameComparer.Instance)
             .ToArray();
         var modelSeriesValues = modelNames.ToDictionary(
             name => name,
             _ => new List<double>(samples.Count),
             StringComparer.Ordinal);
         var points = new ScenePoint[samples.Count];
-        var hasTrustedVector = false;
-        var hasObservedVector = false;
-        var previousTrustedModels = new Dictionary<string, double>(StringComparer.Ordinal);
-        var previousObservedModels = new Dictionary<string, double>(StringComparer.Ordinal);
+        var acceptedBaselines = new Dictionary<string, double>(StringComparer.Ordinal);
+        var correctionStarts = new HashSet<long>();
         var modelVectorAvailable = new bool[samples.Count];
+        var modelSynthetic = new bool[samples.Count];
         var remainingObserved = new bool[samples.Count];
         long? previousTimestamp = null;
         for (var index = 0; index < samples.Count; index++)
         {
             var sample = samples[index];
-            if (previousTimestamp is { } previous && sample.Timestamp <= previous)
+            modelSynthetic[index] = sample.IsSyntheticTail;
+            if (previousTimestamp is { } priorTimestamp && sample.Timestamp <= priorTimestamp)
             {
                 throw new ArgumentException("Graph samples must have strictly increasing timestamps.", nameof(samples));
             }
 
+            var crossedGap = previousTimestamp is { } previous &&
+                HasConfirmedGapBetween(normalizedGaps, previous, sample.Timestamp);
+            if (crossedGap)
+            {
+                acceptedBaselines.Clear();
+            }
+
             previousTimestamp = sample.Timestamp;
-            var modelRows = sample.Models.ToDictionary(model => model.Name, StringComparer.Ordinal);
+            var modelRows = PublishedModels(sample)
+                .ToDictionary(model => model.Name, StringComparer.Ordinal);
             var currentModels = modelNames
                 .Select(name => modelRows.TryGetValue(name, out var model)
                     ? ModelValue(model, metric)
-                    : double.NaN)
+                    : sample.ModelSource == ApiHistorySample.ConfirmedModelSource && sample.ModelsComplete
+                        ? 0d
+                        : double.NaN)
                 .ToArray();
-            var completeVector = currentModels.Length > 0 && currentModels.All(double.IsFinite);
-            var sourceConfirmed = sample.ModelSource == ApiHistorySample.ConfirmedModelSource &&
-                sample.ModelsComplete;
-            var vectorRegressed = hasObservedVector && completeVector &&
-                modelNames.Zip(currentModels, (name, value) =>
-                    previousObservedModels.TryGetValue(name, out var previous) && value < previous)
-                .Any(regressed => regressed);
-            var vectorRecovered = sourceConfirmed && completeVector &&
-                (!hasTrustedVector || modelNames.All(name =>
-                    !previousTrustedModels.TryGetValue(name, out var previous) ||
-                    currentModels[Array.IndexOf(modelNames, name)] >= previous));
-            if (vectorRecovered)
-            {
-                previousTrustedModels.Clear();
-                for (var modelIndex = 0; modelIndex < modelNames.Length; modelIndex++)
-                {
-                    previousTrustedModels[modelNames[modelIndex]] = currentModels[modelIndex];
-                }
-                hasTrustedVector = true;
-                modelVectorAvailable[index] = true;
-            }
-            else if (!sourceConfirmed &&
-                     sample.ModelSource != ApiHistorySample.UnavailableModelSource &&
-                     currentModels.Any(double.IsFinite) &&
-                     !vectorRegressed)
-            {
-                // The set is incomplete, but each present model row is still
-                // an exact observation. Missing models remain NaN rather than
-                // becoming synthetic zeroes. Set completeness is retained
-                // separately for quota attribution.
-            }
             if (sample.ModelSource == ApiHistorySample.UnavailableModelSource)
             {
                 Array.Fill(currentModels, double.NaN);
             }
             else
             {
+                var trustedCompleteVector = sample.ModelSource == ApiHistorySample.ConfirmedModelSource &&
+                    sample.ModelsComplete && currentModels.Length > 0 && currentModels.All(double.IsFinite);
+                var correction = !crossedGap && trustedCompleteVector &&
+                    modelNames.Select((name, modelIndex) =>
+                            acceptedBaselines.TryGetValue(name, out var prior) && currentModels[modelIndex] < prior)
+                        .Any(regressed => regressed);
+                if (correction)
+                {
+                    correctionStarts.Add(sample.Timestamp);
+                    acceptedBaselines.Clear();
+                }
+
                 for (var modelIndex = 0; modelIndex < modelNames.Length; modelIndex++)
                 {
                     var value = currentModels[modelIndex];
@@ -223,17 +240,16 @@ public sealed class GraphScene
                         continue;
                     }
                     var name = modelNames[modelIndex];
-                    if (previousObservedModels.TryGetValue(name, out var priorValue) && value < priorValue)
+                    if (!correction && acceptedBaselines.TryGetValue(name, out var priorValue) && value < priorValue)
                     {
-                        // A cumulative model can never fall within one period.
-                        // Hide only the regressed model; a peer model's exact
-                        // row must not disappear with the whole vector.
+                        // An incomplete or unconfirmed regression is not an
+                        // authoritative correction. Hide only this model until
+                        // it recovers to the last accepted baseline.
                         currentModels[modelIndex] = double.NaN;
                         continue;
                     }
-                    previousObservedModels[name] = value;
+                    acceptedBaselines[name] = value;
                 }
-                hasObservedVector = previousObservedModels.Count > 0;
             }
             for (var modelIndex = 0; modelIndex < modelNames.Length; modelIndex++)
             {
@@ -244,6 +260,7 @@ public sealed class GraphScene
             var currentLuna = ModelValue(modelNames, currentModels, "LUNA");
             var currentAstra = ModelValue(modelNames, currentModels, "ASTRA");
             var modelDataAvailable = currentModels.Length > 0 && currentModels.All(double.IsFinite);
+            modelVectorAvailable[index] = modelDataAvailable;
             remainingObserved[index] = sample.RemainingPercent is { } observedQuota &&
                 double.IsFinite(observedQuota);
             points[index] = new ScenePoint(
@@ -253,11 +270,20 @@ public sealed class GraphScene
                 currentTerra,
                 currentLuna,
                 currentAstra,
-                modelVectorAvailable[index],
-                modelDataAvailable);
+                modelDataAvailable,
+                modelDataAvailable,
+                sample.IsSyntheticTail);
         }
 
-        var effectiveRemaining = BuildEffectiveRemaining(points, normalizedGaps);
+        var evidenceSeries = modelSeriesValues.Values
+            .Select(values => (IReadOnlyList<double>)values)
+            .ToArray();
+        var remainingProjection = BuildEffectiveRemainingWithOrigins(
+            points,
+            evidenceSeries,
+            normalizedGaps,
+            correctionStarts);
+        var effectiveRemaining = remainingProjection.Values;
         var timestamps = points.Select(point => (double)point.Timestamp).ToArray();
         var observedRemainingValues = points
             .Select(point => point.Remaining is { } observed && double.IsFinite(observed)
@@ -267,16 +293,10 @@ public sealed class GraphScene
         var remaining = effectiveRemaining
             .Select(value => value is { } finite && double.IsFinite(finite) ? finite : double.NaN)
             .ToArray();
-        var remainingInterpolated = new bool[points.Length];
-        for (var index = 0; index < points.Length; index++)
-        {
-            var raw = points[index].Remaining;
-            var rawFinite = raw is { } observed && double.IsFinite(observed);
-            var rawValue = rawFinite ? Math.Clamp(raw!.Value, 0, 100) : double.NaN;
-            remainingInterpolated[index] = !rawFinite ||
-                !double.IsFinite(remaining[index]) ||
-                remaining[index] != rawValue;
-        }
+        var remainingOrigins = remainingProjection.Origins;
+        var remainingInterpolated = remainingOrigins
+            .Select(origin => origin is not GraphRemainingOrigin.Raw)
+            .ToArray();
         var sol = points.Select(point => point.Sol).ToArray();
         var terra = points.Select(point => point.Terra).ToArray();
         var luna = points.Select(point => point.Luna).ToArray();
@@ -304,11 +324,20 @@ public sealed class GraphScene
             astra,
             modelSeries,
             modelVectorAvailable,
+            modelSynthetic,
             remainingObserved,
             observedRemainingValues,
             remainingInterpolated,
+            remainingOrigins,
             normalizedGaps,
-            BuildIdleIntervals(points, start, end, modelSeriesValues.Values),
+            correctionStarts,
+            BuildIdleIntervals(
+                points,
+                start,
+                end,
+                evidenceSeries,
+                normalizedGaps,
+                correctionStarts),
             maximum);
     }
 
@@ -316,198 +345,149 @@ public sealed class GraphScene
         IReadOnlyList<ScenePoint> points,
         IReadOnlyList<GraphConfirmedGap>? confirmedGaps = null)
     {
-        if (points.Count == 0)
+        var legacySeries = new List<IReadOnlyList<double>>
         {
-            return Array.Empty<double?>();
-        }
-
-        var rawValues = points.Select(point => point.Remaining).ToArray();
-        if (!rawValues.Any(value => value is { } observed && double.IsFinite(observed)))
+            points.Select(point => point.Sol).ToArray(),
+            points.Select(point => point.Terra).ToArray(),
+            points.Select(point => point.Luna).ToArray(),
+        };
+        if (points.Any(point => double.IsFinite(point.Astra) && point.Astra >= 0))
         {
-            return rawValues;
+            legacySeries.Add(points.Select(point => point.Astra).ToArray());
         }
+        return BuildEffectiveRemainingWithOrigins(
+                points,
+                legacySeries,
+                confirmedGaps ?? Array.Empty<GraphConfirmedGap>(),
+                new HashSet<long>())
+            .Values;
+    }
 
+    private static RemainingProjection BuildEffectiveRemainingWithOrigins(
+        IReadOnlyList<ScenePoint> points,
+        IReadOnlyList<IReadOnlyList<double>> modelSeries,
+        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
+        IReadOnlySet<long> correctionStarts)
+    {
         var values = new double?[points.Count];
-        var activeSegments = new bool[Math.Max(0, points.Count - 1)];
-        var interpolated = new bool[points.Count];
-        values[0] = rawValues[0] is { } first && double.IsFinite(first)
-            ? Math.Clamp(first, 0, 100)
-            : null;
-        var quotaAvailable = values[0] is not null;
-        var quotaObservedSinceModelChange = true;
-        for (var index = 1; index < points.Count; index++)
+        var origins = Enumerable.Repeat(GraphRemainingOrigin.Missing, points.Count).ToArray();
+        var rawValues = points
+            .Select(point => point.Remaining is { } raw && double.IsFinite(raw) && raw is >= 0 and <= 100
+                ? raw
+                : (double?)null)
+            .ToArray();
+
+        double? minimum = null;
+        for (var index = 0; index < rawValues.Length; index++)
         {
-            var previous = values[index - 1].GetValueOrDefault();
-            var modelAdvanced = ModelAdvanced(points[index - 1], points[index]);
-            var confirmedGap = HasConfirmedGapBetween(
-                confirmedGaps,
-                points[index - 1].Timestamp,
-                points[index].Timestamp);
-            activeSegments[index - 1] = modelAdvanced && !confirmedGap;
-            var observed = rawValues[index] is { } raw && double.IsFinite(raw)
-                ? Math.Clamp(raw, 0, 100)
-                : (double?)null;
-            if (confirmedGap)
+            if (rawValues[index] is not { } raw)
             {
-                // A recorder-confirmed gap is not an inferred interval. Do
-                // not carry a previous quota into it or synthesize a value
-                // at its far edge; only a remote observation after the gap
-                // can restart the quota path.
-                values[index] = observed;
-                quotaAvailable = observed is not null;
-                quotaObservedSinceModelChange = observed is not null;
+                continue;
             }
-            else if (!quotaAvailable)
+            if (minimum is { } prior && raw > prior)
             {
-                // Once a confirmed gap has cut the quota path, no inferred
-                // value may restart it. Wait for a fresh remote endpoint.
-                values[index] = observed;
-                quotaAvailable = observed is not null;
-                quotaObservedSinceModelChange = observed is not null;
-            }
-            else if (!points[index].DataAvailable && observed is { } unavailableRaw)
-            {
-                // Preserve a remote quota reading even when the local model
-                // vector is unavailable. The renderer classifies this drop
-                // as unattributed and paints it dashed.
-                values[index] = Math.Min(previous, unavailableRaw);
-                quotaObservedSinceModelChange = true;
-            }
-            else if (modelAdvanced)
-            {
-                values[index] = observed is { } activeRaw
-                    ? Math.Min(previous, activeRaw)
-                    : previous;
-                quotaObservedSinceModelChange = observed is not null;
-            }
-            else if (!quotaObservedSinceModelChange && observed is { } delayedRaw && delayedRaw < previous)
-            {
-                // The quota poll can lag behind session usage. Accept the
-                // first lower endpoint after that unobserved active interval,
-                // but keep a genuinely idle period horizontal.
-                values[index] = Math.Min(previous, delayedRaw);
-                quotaObservedSinceModelChange = true;
-            }
-            else if (observed is { } independentRaw)
-            {
-                // A remote quota observation is evidence in its own right.
-                // Preserve its timestamp even when the local vector is flat;
-                // projection will mark an unattributed decrease as dashed.
-                values[index] = Math.Min(previous, independentRaw);
-                quotaObservedSinceModelChange = true;
+                values[index] = prior;
+                origins[index] = GraphRemainingOrigin.MonotonicHold;
             }
             else
             {
-                values[index] = previous;
+                values[index] = raw;
+                origins[index] = GraphRemainingOrigin.Raw;
+                minimum = raw;
             }
         }
 
-        var source = values.ToArray();
-        for (var index = 1; index < points.Count; index++)
+        var runStart = 0;
+        while (runStart < rawValues.Length)
         {
-            if (interpolated[index])
+            if (rawValues[runStart] is not null)
             {
+                runStart++;
                 continue;
             }
 
-            if (source[index - 1] is not { } previous || source[index] is not { } current ||
-                previous != current || points[index - 1].Timestamp == points[index].Timestamp)
+            var runEnd = runStart;
+            while (runEnd < rawValues.Length && rawValues[runEnd] is null)
             {
+                runEnd++;
+            }
+            var left = runStart - 1;
+            if (left < 0 || values[left] is null)
+            {
+                runStart = runEnd;
                 continue;
             }
 
-            var left = index - 1;
-            var right = index + 1;
-            while (right < points.Count && source[right] is { } candidate && candidate >= previous)
+            var bounded = runEnd < rawValues.Length && values[runEnd] is not null;
+            var interpolated = false;
+            if (bounded && values[left] is { } leftValue && values[runEnd] is { } rightValue && rightValue < leftValue)
             {
-                right++;
-            }
-
-            if (right >= points.Count || source[right] is not { } next || next >= previous)
-            {
-                continue;
-            }
-
-            var totalActive = 0d;
-            for (var segment = left; segment < right; segment++)
-            {
-                var duration = Math.Max(0, points[segment + 1].Timestamp - points[segment].Timestamp);
-                if (activeSegments[segment])
+                var fullEvidence = true;
+                var activeSeconds = 0d;
+                for (var segment = left; segment < runEnd; segment++)
                 {
-                    totalActive += duration;
+                    if (!HasFullModelEvidence(
+                            points,
+                            modelSeries,
+                            confirmedGaps,
+                            correctionStarts,
+                            segment,
+                            segment + 1))
+                    {
+                        fullEvidence = false;
+                        break;
+                    }
+                    if (ModelAdvanced(modelSeries, segment, segment + 1))
+                    {
+                        activeSeconds += points[segment + 1].Timestamp - points[segment].Timestamp;
+                    }
+                }
+
+                if (fullEvidence && activeSeconds > double.Epsilon)
+                {
+                    var elapsedActive = 0d;
+                    for (var index = runStart; index < runEnd; index++)
+                    {
+                        if (ModelAdvanced(modelSeries, index - 1, index))
+                        {
+                            elapsedActive += points[index].Timestamp - points[index - 1].Timestamp;
+                        }
+                        values[index] = leftValue + (rightValue - leftValue) * (elapsedActive / activeSeconds);
+                        origins[index] = GraphRemainingOrigin.Interpolated;
+                    }
+                    interpolated = true;
                 }
             }
 
-            if (totalActive <= double.Epsilon)
+            if (!interpolated)
             {
-                continue;
-            }
-
-            // Match the native graph's sampling-gap completion exactly: once
-            // a later lower quota observation bounds a run of repeated active
-            // samples, distribute that change across every active interval in
-            // the run.  Updating only the first repeated point leaves the
-            // remainder folded into an almost-vertical drop at the right edge.
-            var elapsedActive = 0d;
-            for (var pointIndex = index; pointIndex < right; pointIndex++)
-            {
-                if (pointIndex > left && activeSegments[pointIndex - 1])
+                var origin = bounded
+                    ? GraphRemainingOrigin.BoundedNullHold
+                    : GraphRemainingOrigin.TerminalNullHold;
+                for (var index = runStart; index < runEnd; index++)
                 {
-                    elapsedActive += Math.Max(
-                        0,
-                        points[pointIndex].Timestamp - points[pointIndex - 1].Timestamp);
+                    if (values[index - 1] is not { } prior ||
+                        !CanCarryQuota(points, confirmedGaps, correctionStarts, index - 1, index))
+                    {
+                        break;
+                    }
+                    values[index] = prior;
+                    origins[index] = origin;
                 }
-
-                var fraction = Math.Clamp(elapsedActive / totalActive, 0, 1);
-                values[pointIndex] = previous + (next - previous) * fraction;
-                interpolated[pointIndex] = true;
             }
+            runStart = runEnd;
         }
 
-        for (var index = 1; index + 1 < values.Length; index++)
-        {
-            if (!activeSegments[index - 1] || !activeSegments[index] ||
-                interpolated[index - 1] || interpolated[index] || interpolated[index + 1] ||
-                values[index - 1] is not { } before || values[index] is not { } current ||
-                values[index + 1] is not { } after)
-            {
-                continue;
-            }
-
-            values[index] = Math.Min(before, (before + 2 * current + after) / 4);
-        }
-
-        for (var index = 1; index < values.Length; index++)
-        {
-            if (HasConfirmedGapBetween(
-                    confirmedGaps,
-                    points[index - 1].Timestamp,
-                    points[index].Timestamp))
-            {
-                continue;
-            }
-            if (!activeSegments[index - 1] &&
-                points[index].Timestamp != points[index - 1].Timestamp)
-            {
-                values[index] = rawValues[index] is { } observed && double.IsFinite(observed) &&
-                    values[index - 1] is { } before
-                    ? Math.Min(before, Math.Clamp(observed, 0, 100))
-                    : values[index - 1];
-            }
-            else if (values[index] is { } current && values[index - 1] is { } before)
-            {
-                values[index] = Math.Min(current, before);
-            }
-        }
-
-        return values;
+        return new RemainingProjection(values, origins);
     }
 
     internal static IReadOnlyList<GraphIdleInterval> BuildIdleIntervals(
         IReadOnlyList<ScenePoint> points,
         long periodStart,
         long periodEnd,
-        IEnumerable<IReadOnlyList<double>> modelSeries)
+        IEnumerable<IReadOnlyList<double>> modelSeries,
+        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
+        IReadOnlySet<long> correctionStarts)
     {
         var intervals = new List<GraphIdleInterval>();
         if (periodEnd <= periodStart)
@@ -531,7 +511,11 @@ public sealed class GraphScene
                 continue;
             }
 
-            if (!before.ModelAvailable || !after.ModelAvailable)
+            if (after.Timestamp - before.Timestamp > 60 ||
+                HasConfirmedGapBetween(confirmedGaps, before.Timestamp, after.Timestamp) ||
+                HasCorrectionBetween(correctionStarts, before.Timestamp, after.Timestamp) ||
+                before.SyntheticTail || after.SyntheticTail ||
+                !before.ModelAvailable || !after.ModelAvailable)
             {
                 continue;
             }
@@ -568,11 +552,54 @@ public sealed class GraphScene
     internal bool HasConfirmedGapBetween(double startAt, double endAt) =>
         HasConfirmedGapBetween(ConfirmedGaps, startAt, endAt);
 
+    internal bool HasCorrectionBetween(double startAt, double endAt) =>
+        HasCorrectionBetween(CorrectionStarts, startAt, endAt);
+
+    internal bool HasHardBreakBetween(double startAt, double endAt) =>
+        HasConfirmedGapBetween(startAt, endAt) || HasCorrectionBetween(startAt, endAt);
+
     private static bool HasConfirmedGapBetween(
         IReadOnlyList<GraphConfirmedGap>? gaps,
         double startAt,
         double endAt) =>
         gaps is not null && gaps.Any(gap => gap.StartAt < endAt && gap.EndAt > startAt);
+
+    private static bool HasCorrectionBetween(
+        IReadOnlySet<long> correctionStarts,
+        double startAt,
+        double endAt) =>
+        correctionStarts.Any(timestamp => timestamp > startAt && timestamp <= endAt);
+
+    private static bool CanCarryQuota(
+        IReadOnlyList<ScenePoint> points,
+        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
+        IReadOnlySet<long> correctionStarts,
+        int before,
+        int after) =>
+        after == before + 1 &&
+        points[after].Timestamp > points[before].Timestamp &&
+        points[after].Timestamp - points[before].Timestamp <= 60 &&
+        !HasConfirmedGapBetween(confirmedGaps, points[before].Timestamp, points[after].Timestamp) &&
+        !HasCorrectionBetween(correctionStarts, points[before].Timestamp, points[after].Timestamp);
+
+    private static bool HasFullModelEvidence(
+        IReadOnlyList<ScenePoint> points,
+        IReadOnlyList<IReadOnlyList<double>> modelSeries,
+        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
+        IReadOnlySet<long> correctionStarts,
+        int before,
+        int after) =>
+        modelSeries.Count > 0 &&
+        CanCarryQuota(points, confirmedGaps, correctionStarts, before, after) &&
+        modelSeries.All(values =>
+            before < values.Count && after < values.Count &&
+            double.IsFinite(values[before]) && double.IsFinite(values[after]));
+
+    private static bool ModelAdvanced(
+        IReadOnlyList<IReadOnlyList<double>> modelSeries,
+        int before,
+        int after) =>
+        modelSeries.Any(values => values[after] > values[before]);
 
     internal static IReadOnlyList<double> ArrangeEndpointLabelTops(
         IReadOnlyList<double> idealTops,
@@ -649,10 +676,22 @@ public sealed class GraphScene
         return index >= 0 && index < values.Count ? values[index] : double.NaN;
     }
 
-    private static bool ModelAdvanced(ScenePoint before, ScenePoint after) =>
-        before.DataAvailable && after.DataAvailable &&
-        (after.Sol > before.Sol || after.Terra > before.Terra || after.Luna > before.Luna ||
-         after.Astra > before.Astra);
+    private static IEnumerable<ApiHistoryModelSample> PublishedModels(ApiHistorySample sample)
+    {
+        if (sample.ModelSource == ApiHistorySample.UnavailableModelSource)
+        {
+            return Array.Empty<ApiHistoryModelSample>();
+        }
+        if (sample.ModelSamples is not null)
+        {
+            return sample.ModelSamples;
+        }
+
+        var hasLegacyValues = sample.SolDollars is not null || sample.TerraDollars is not null ||
+            sample.LunaDollars is not null || sample.SolTokens is not null ||
+            sample.TerraTokens is not null || sample.LunaTokens is not null;
+        return hasLegacyValues ? sample.Models : Array.Empty<ApiHistoryModelSample>();
+    }
 
     private static bool ModelsEqualAt(
         IEnumerable<IReadOnlyList<double>> modelSeries,
@@ -676,6 +715,33 @@ public sealed class GraphScene
         return anyModel;
     }
 
+    private readonly record struct RemainingProjection(
+        double?[] Values,
+        GraphRemainingOrigin[] Origins);
+
+    private sealed class Utf8ModelNameComparer : IComparer<string>
+    {
+        internal static Utf8ModelNameComparer Instance { get; } = new();
+
+        public int Compare(string? left, string? right)
+        {
+            if (ReferenceEquals(left, right))
+            {
+                return 0;
+            }
+            if (left is null)
+            {
+                return -1;
+            }
+            if (right is null)
+            {
+                return 1;
+            }
+            return Encoding.UTF8.GetBytes(left).AsSpan()
+                .SequenceCompareTo(Encoding.UTF8.GetBytes(right));
+        }
+    }
+
     internal readonly record struct ScenePoint(
         long Timestamp,
         double? Remaining,
@@ -684,5 +750,6 @@ public sealed class GraphScene
         double Luna,
         double Astra,
         bool ModelAvailable,
-        bool DataAvailable);
+        bool DataAvailable,
+        bool SyntheticTail = false);
 }

@@ -277,7 +277,12 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             // copied: the renderer owns the explicitly dashed last-known
             // projection.  A longer local-log outage must leave the model
             // path at its actual observation time.
-            result.Add(last with { Timestamp = end, RemainingPercent = null });
+            result.Add(last with
+            {
+                Timestamp = end,
+                RemainingPercent = null,
+                IsSyntheticTail = true,
+            });
         }
 
         return result;
@@ -774,31 +779,55 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             var pageGaps = new List<ApiHistoryGap>();
             var requestedCursor = cursor;
             var pageCount = 0;
+            var totalPageRequests = 0;
+            var staleCursorRecoveryAttempted = false;
             string? resumeCursor = null;
             while (true)
             {
-                if (++pageCount > MaxSplitHistoryPageRequests)
+                if (++totalPageRequests > MaxSplitHistoryPageRequests)
                 {
-                    resourceCursorResetRequired = true;
                     PublishSplitResourceFailure();
                     return;
                 }
 
+                pageCount++;
                 var firstPage = pageCount == 1;
                 var pageResult = await resourceClient.FetchHistoryPageAsync(
                         stagedPeriod.Id,
                         cursor,
                         cancellationToken)
                     .ConfigureAwait(false);
+                if (pageResult.CursorRejected &&
+                    firstPage &&
+                    appendingProvenPrefix &&
+                    cursor is not null &&
+                    !staleCursorRecoveryAttempted)
+                {
+                    // The server proved that the saved prefix can no longer
+                    // be appended. Restart this candidate once from the head;
+                    // the published scene and saved cursor remain untouched
+                    // until the replacement page set is complete.
+                    staleCursorRecoveryAttempted = true;
+                    fullRefresh = true;
+                    appendingProvenPrefix = false;
+                    cursor = null;
+                    requestedCursor = null;
+                    pageCount = 0;
+                    pageSamples.Clear();
+                    pageGaps.Clear();
+                    resumeCursor = null;
+                    continue;
+                }
                 if (!pageResult.IsSuccess || pageResult.Page is not { } page ||
                     page.PublishedPair != periodsSnapshot.PublishedPair ||
                     page.PeriodId != stagedPeriod.Id ||
                     !ValidateHistoryPage(stagedPeriod, page))
                 {
-                    // A stale opaque cursor is retried from the period head on
-                    // the next normal cycle. Other page failures use the same
-                    // isolation path; no partial page is ever published.
-                    resourceCursorResetRequired = cursor is not null;
+                    // Only the exact stale-cursor response changes reset
+                    // state. Ordinary failures retry the same state next
+                    // cycle and never publish a partial candidate.
+                    resourceCursorResetRequired = staleCursorRecoveryAttempted ||
+                        resourceCursorResetRequired;
                     PublishSplitResourceFailure();
                     return;
                 }
@@ -809,7 +838,6 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 // once, while later pages must not repeat or alter it.
                 if ((appendingProvenPrefix || !firstPage) && page.HistoryGaps.Count != 0)
                 {
-                    resourceCursorResetRequired = appendingProvenPrefix;
                     PublishSplitResourceFailure();
                     return;
                 }
@@ -829,7 +857,6 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 if (page.NextCursor == cursor ||
                     page.NextCursor == requestedCursor && pageSamples.Count == 0)
                 {
-                    resourceCursorResetRequired = true;
                     PublishSplitResourceFailure();
                     return;
                 }
@@ -845,7 +872,6 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 : resourceGaps;
             if (mergedSamples is null || mergedGaps is null)
             {
-                resourceCursorResetRequired = appendingProvenPrefix;
                 PublishSplitResourceFailure();
                 return;
             }

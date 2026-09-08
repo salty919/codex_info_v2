@@ -6,6 +6,7 @@ using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
+using System.Reflection;
 using System.Xml.Linq;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Localization;
@@ -180,6 +181,58 @@ public sealed class DetailsPresentationCoverageTests
         Assert.Equal(1, resourceClient.HistoryPeriodsCalls);
         Assert.Equal(1, resourceClient.HistoryPageCalls);
         Assert.Same(graph.Periods[0], graph.SelectedPeriod);
+    }
+
+    [Fact]
+    public async Task GraphWindow_ExactStaleCursorRetriesHeadOnceAndPreservesResetStateAcrossFailures()
+    {
+        const long start = 6_000_000;
+        var pair = PublishedPairIdentity.Create($"v1:{new string('b', 64)}");
+        var samples = new[]
+        {
+            new ApiHistorySample(start, start + 120, 96, 1, 0, 0, 1, 0, 0),
+            new ApiHistorySample(start + 60, start + 120, 95, 2, 0, 0, 2, 0, 0),
+            new ApiHistorySample(start + 120, start + 120, 94, 3, 0, 0, 3, 0, 0),
+        };
+        var period = new ApiHistoryPeriod("cursor-period", start, start + 120, false, "cursor-period");
+        var details = CreateDetails([period], Array.Empty<ApiThreadDetails>());
+        var resourceClient = new CursorRecoveryHistoryResourceClient(details, period, samples, pair);
+        using var main = new MainWindowViewModel(
+            new StaticCombinedClient(DetailsFetchResult.Success(details)),
+            resourceClient);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+
+        await PumpUiUntilAsync(pendingUi, () => graph.HasPoints);
+        Assert.Equal([null], resourceClient.Cursors);
+        Assert.Equal(1, graph.Points[^1].SolValue);
+        var initialScene = graph.Scene;
+
+        // Saved C0 is rejected exactly, so the same cycle attempts one head
+        // request. That head fails and the complete last-good scene remains.
+        await RefreshGraphResourceAsync(graph, period.Id);
+        await PumpUiUntilAsync(pendingUi, () => graph.HasLoadError);
+        Assert.Equal([null, "C0", null], resourceClient.Cursors);
+        Assert.Same(initialScene, graph.Scene);
+        Assert.Equal(1, graph.Points[^1].SolValue);
+
+        // reset-required sends no C0 on the next cycle. A complete head root
+        // replaces the scene and clears reset-required with the new C1.
+        await RefreshGraphResourceAsync(graph, period.Id);
+        await PumpUiUntilAsync(pendingUi, () => !graph.HasLoadError && graph.Points[^1].SolValue == 2);
+        Assert.Equal([null, "C0", null, null], resourceClient.Cursors);
+        var recoveredScene = graph.Scene;
+
+        // An ordinary saved-cursor failure performs no head retry and does
+        // not set reset-required; the following cycle sends C1 again.
+        await RefreshGraphResourceAsync(graph, period.Id);
+        await PumpUiUntilAsync(pendingUi, () => graph.HasLoadError);
+        Assert.Equal([null, "C0", null, null, "C1"], resourceClient.Cursors);
+        Assert.Same(recoveredScene, graph.Scene);
+
+        await RefreshGraphResourceAsync(graph, period.Id);
+        await PumpUiUntilAsync(pendingUi, () => !graph.HasLoadError && graph.Points[^1].SolValue == 3);
+        Assert.Equal([null, "C0", null, null, "C1", "C1"], resourceClient.Cursors);
     }
 
     [Fact]
@@ -452,6 +505,18 @@ public sealed class DetailsPresentationCoverageTests
         }
     }
 
+    private static async Task RefreshGraphResourceAsync(GraphWindowViewModel graph, string periodId)
+    {
+        var method = typeof(GraphWindowViewModel).GetMethod(
+            "RefreshSplitResourceAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(method);
+        var task = Assert.IsAssignableFrom<Task>(method!.Invoke(
+            graph,
+            [false, periodId, CancellationToken.None]));
+        await task;
+    }
+
     private sealed class StaticCombinedClient(DetailsFetchResult result) : HealthyDetailsClientBase
     {
         protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default) =>
@@ -503,6 +568,74 @@ public sealed class DetailsPresentationCoverageTests
                 NextCursor: null,
                 ResumeCursor: "resume",
                 pair)));
+        }
+
+        public Task<ThreadsFetchResult> FetchThreadsAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Threads are outside this graph regression test.");
+    }
+
+    private sealed class CursorRecoveryHistoryResourceClient(
+        ApiDetailsSnapshot details,
+        ApiHistoryPeriod period,
+        ApiHistorySample[] samples,
+        PublishedPairIdentity pair) : ILoopbackDetailsClient, ILoopbackResourceClient
+    {
+        private readonly object gate = new();
+        private readonly List<string?> cursors = [];
+        private int historyPageCalls;
+
+        public IReadOnlyList<string?> Cursors
+        {
+            get
+            {
+                lock (gate)
+                {
+                    return cursors.ToArray();
+                }
+            }
+        }
+
+        public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(DetailsFetchResult.Success(details));
+
+        public Task<CurrentFetchResult> FetchCurrentAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Current is outside this graph regression test.");
+
+        public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(HistoryPeriodsFetchResult.Success(
+                new ApiHistoryPeriodsSnapshot([period], pair)));
+
+        public Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+            string periodId,
+            string? cursor = null,
+            CancellationToken cancellationToken = default)
+        {
+            lock (gate)
+            {
+                cursors.Add(cursor);
+            }
+            var call = Interlocked.Increment(ref historyPageCalls);
+            var result = call switch
+            {
+                1 => Page([samples[0]], "C0"),
+                2 => HistoryPageFetchResult.FromRejectedCursor(),
+                3 => HistoryPageFetchResult.FromFailure(DetailsFetchFailure.Transport),
+                4 => Page([samples[0], samples[1]], "C1"),
+                5 => HistoryPageFetchResult.FromFailure(DetailsFetchFailure.Transport),
+                6 => Page([samples[2]], "C2"),
+                _ => throw new InvalidOperationException($"Unexpected history page request {call}."),
+            };
+            return Task.FromResult(result);
+
+            HistoryPageFetchResult Page(IReadOnlyList<ApiHistorySample> pageSamples, string resumeCursor) =>
+                HistoryPageFetchResult.Success(new ApiHistoryPage(
+                    periodId,
+                    pageSamples,
+                    Array.Empty<ApiHistoryGap>(),
+                    NextCursor: null,
+                    ResumeCursor: resumeCursor,
+                    pair));
         }
 
         public Task<ThreadsFetchResult> FetchThreadsAsync(CancellationToken cancellationToken = default) =>
