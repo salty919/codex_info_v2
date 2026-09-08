@@ -1002,6 +1002,7 @@ def _command(
         env=None if env is None else dict(env),
         text=True,
         capture_output=True,
+        check=False,
     )
     if check and result.returncode != 0:
         raise AssertionError(
