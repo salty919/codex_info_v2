@@ -164,6 +164,12 @@ public sealed record ApiHistorySample(
     public bool ModelsComplete { get; init; } = true;
 
     /// <summary>
+    /// Presentation-only bounded hold added at a period edge. Wire parsers
+    /// never set this flag and the value is never persisted or republished.
+    /// </summary>
+    public bool IsSyntheticTail { get; init; }
+
+    /// <summary>
     /// Generic v3 model rows. Null is distinct from an empty, complete list:
     /// null means that the producer did not publish model values at all.
     /// </summary>
@@ -391,18 +397,22 @@ public sealed record HistoryPeriodsFetchResult(
 
 public sealed record HistoryPageFetchResult(
     ApiHistoryPage? Page,
-    DetailsFetchFailure? Failure)
+    DetailsFetchFailure? Failure,
+    bool CursorRejected)
 {
-    public bool IsSuccess => Page is not null && Failure is null;
+    public bool IsSuccess => Page is not null && Failure is null && !CursorRejected;
 
     public static HistoryPageFetchResult Success(ApiHistoryPage page)
     {
         ArgumentNullException.ThrowIfNull(page);
-        return new HistoryPageFetchResult(page, null);
+        return new HistoryPageFetchResult(page, null, false);
     }
 
     public static HistoryPageFetchResult FromFailure(DetailsFetchFailure failure) =>
-        new(null, failure);
+        new(null, failure, false);
+
+    public static HistoryPageFetchResult FromRejectedCursor() =>
+        new(null, DetailsFetchFailure.Response, true);
 }
 
 public sealed record ThreadsFetchResult(

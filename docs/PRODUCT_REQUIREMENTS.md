@@ -4,6 +4,7 @@ ASTRA-COST-01
 API-LIFECYCLE-01
 REST-172
 CUM-138-04
+G137-GRAPH-01
 WIN-PARITY-DATA
 WIN-PARITY-STATE
 WIN-PARITY-OPS
@@ -277,12 +278,68 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 
 - 上記要件と参照先仕様の間に、同じ入力へ異なる必須結果を要求する矛盾がない。
 
+## G137 Linux / Windows 履歴グラフ同値契約
+
+`G137-GRAPH-01` は、同じstrict validation済み履歴resourceからLinux版とWindows版が
+同じ値、同じ線種、同じ切断、同じ未使用区間を表示するためのcross-platform契約である。
+表示geometryと色はUX owner、wireのschemaとheaderはWIRE ownerが所有するが、次の
+入力状態から表示上の事実へ至る意味とfailure isolationは本契約だけが所有する。
+
+1. `G137-1`: 選択期間の全accepted pageに実際に掲載された`models[].model`の和集合を
+   model universe `U`とする。model名はexact wire stringをUTF-8 unsigned byte列の
+   case-sensitive lexicographic順（Unicode normalizationなし）に並べる。未掲載の
+   `ASTRA`その他を既知modelとして創作せず、`U`が空ならmodel activityと未使用区間を作らない。
+2. `G137-2`: `model_source != unavailable`の掲載modelについて、選択metricのfiniteかつ
+   non-negativeな値を実測として保持する。v3の`confirmed && models_complete=true`では
+   `U`内の未掲載modelだけを確定0とし、不完全rowの未掲載modelはunknownのまま0補完しない。
+   v1/v2のfixed-column rowは`confirmed`かつ全fieldがstrict parse済みの場合だけcomplete相当とする。
+3. `G137-3`: 同一lineageのbaselineはmodelごとの直前accepted finite値とし、抑止した後退値では
+   更新しない。confirmed complete rowがいずれかのmodelでbaselineを下回る場合は、その時刻を
+   trusted correction boundaryとして全modelとRemainingの直前lineageを切るが、現在rowのfinite値は
+   捨てず新lineageの開始値として表示する。不完全またはunconfirmed rowの後退は当該modelだけを
+   unknownにし、旧baseline以上となる最初の値で復帰させ、他modelの実測値は保持する。
+4. `G137-4`: 優先順位はconfirmed recorder gap、trusted correction、model unavailable/regression、
+   idleの順とする。gapとcorrectionを越えて線または未使用帯を接続しない。strictに増加する隣接時刻の
+   差が60秒以下だけをcontiguousとし、それより疎な既知点間、unknownを飛び越す復帰線、期間末の
+   bounded holdは細い破線とする。hard breakはsynthetic tailより優先する。
+5. `G137-5`: 未使用帯は、contiguousでgap/correctionがなく、`U`の全modelが両endpointで
+   accepted finiteかつexactly equalな区間だけに置く。`models_complete=false`自体は除外理由にせず、
+   `U`内modelの片endpoint欠落、model増加、unavailable、gap、correction、synthetic tailを未使用へ
+   読み替えない。この表示が証明する範囲は「公開済み全modelに利用増加がない」に限定する。
+6. `G137-6`: non-nullでfiniteな0..100のRemainingをraw観測として元時刻に保持し、繰返しrawを
+   補間またはmoving averageで変更しない。同一periodで増加したrawだけは表示用effective値を直前minimumへ
+   holdし、そのraw値自体は証拠として保持する。右raw anchorを持つ明示null runは、全隣接区間が60秒以下、
+   gap/correctionなし、`U`全値finiteで、少なくとも1 modelが増加したactive秒を持ち、右effectiveが左より
+   低い場合だけactive秒比でlinear interpolationする。条件不成立のbounded nullと右anchorなしのterminal
+   nullは直前effectiveをcarryし破線にする。period-end tailは最後のquota effective pointから60秒以内かつ
+   hard breakなしの場合だけ破線にし、model欠測をquota tailの欠測へ流用しない。
+7. `G137-7`: model線はcontiguous実測の増加を太い実線、不変を細い実線とする。疎な区間、途中に
+   当該modelのunknown rowがあるnearest-finite接続、derived quota pointの両側、unattributed quota drop、
+   monotonic hold、bounded/terminal hold、synthetic tailは破線とする。raw quota同値のcontiguous区間は
+   model availabilityと独立した実測実線であり、gap/correctionでは切断する。右端model labelは最後の
+   accepted raw model値、Remaining labelは最後のraw観測時刻におけるeffective値を表示する。
+8. `G137-8`: Graph candidateのpairはperiods応答のexact
+   `Codex-Info-Published-Pair`を`P`とし、全history success pageの同headerがASCII
+   case-sensitiveで`P`と一致した場合だけ全pageをatomic publishする。欠落、malformed、別値`Q`、
+   duplicate timestamp、repeating cursor、page上限超過はcandidate全体を破棄しlast-goodを保持する。
+9. `G137-9`: 保存cursor付きhistory requestが、pair headerなし、no-store、JSON content type、exact
+   Content-Lengthかつ1KiB以下、exact key集合`api_version,error`と値`v1,stale_cursor`を持つHTTP 400を
+   返した場合だけ、同cycleで同periodのcursorなしhead取得をexactly 1回行う。成功時だけ新pairの全pageを
+   atomic publishする。回復取得失敗時は旧cursorを保持してreset-requiredとし、次cycleは旧cursorを送らず
+   headから開始する。その他の400、malformed response、404/500/transportは同cycle retryしない。
+10. `G137-10`: Graphの成功・全失敗経路はMain details/quota/model totals、Threads、authと各々の
+    error/retry/suppression latch、cursor、timestampを変更しない。Graph失敗が変更できるのはGraph error、
+    loading終了状態と前項のreset-requiredだけで、scene、selected period、last-goodを部分更新しない。
+    X/Rust、Windows Core/GraphScene/ScottPlot、保存fixture E2Eは同じliteral inputと期待区間を独立に検証し、
+    一方のhelper出力を他方の期待値にしない。Release後の同値確認は同じsource SHAと単一accepted pair・period・
+    latest timestamp/model/quotaを照合し、platform固有binary SHA-256が異なることを不一致と扱わない。
+
 ## グラフ表示への参照
 
-グラフの表示意味、期間端、欠測線、補完線、系列独立性、X/Windows共通の
-受入caseは、UX ownerの唯一master `CUM-138-06` が
-`docs/WINDOWS_UX_SPEC.md`で所有する。本書は収集・公開する値と失敗時保持だけを
-所有し、graphの期待値、test一覧、platform別の派生契約を重複定義しない。
+一般のグラフgeometry、操作、色と線幅はUX ownerの`CUM-138-06`が
+`docs/WINDOWS_UX_SPEC.md`で所有する。Issue #137で確定したcross-platformの値・線種・切断・
+未使用・cursor回復・failure isolationは`G137-GRAPH-01`を正本とし、下流仕様とtestは
+`G137-1`..`G137-10`を参照して意味を重複定義しない。
 
 ### 履歴・snapshot validationを残す理由
 

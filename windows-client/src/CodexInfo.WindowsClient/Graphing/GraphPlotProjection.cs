@@ -204,7 +204,7 @@ internal static class GraphPlotProjection
             var current = RemainingValue(scene, index);
             var elapsed = scene.Timestamps[index] - scene.Timestamps[previous];
             var contiguous = index == previous + 1;
-            if (scene.HasConfirmedGapBetween(
+            if (scene.HasHardBreakBetween(
                     scene.Timestamps[previous],
                     scene.Timestamps[index]))
             {
@@ -214,17 +214,14 @@ internal static class GraphPlotProjection
                 continue;
             }
             var observed = scene.RemainingObserved[previous] && scene.RemainingObserved[index];
-            // A filled value makes only the interval ending at that point
-            // reference-only. Do not taint the following segment once a
-            // fresh remote observation and a trusted model increment arrive.
-            var interpolated = scene.RemainingInterpolated[index];
+            var derived = scene.RemainingOrigins[previous] is not GraphRemainingOrigin.Raw ||
+                scene.RemainingOrigins[index] is not GraphRemainingOrigin.Raw;
             var modelAvailable = ModelDataAvailable(scene, previous, index);
             var modelAdvanced = ModelAdvanced(scene, previous, index);
             var quotaDropped = current < before;
             var unattributed = quotaDropped && (!modelAvailable || !modelAdvanced);
             var dashed = !contiguous || elapsed > ModelContiguousSampleMaxGapSeconds ||
-                !observed || interpolated || unattributed ||
-                scene.HasConfirmedGapBetween(scene.Timestamps[previous], scene.Timestamps[index]);
+                !observed || derived || unattributed;
             if (dashed)
             {
                 AppendSegment(dashedX, dashedY, scene.Timestamps[previous], before, scene.Timestamps[index], current);
@@ -236,8 +233,10 @@ internal static class GraphPlotProjection
             previous = index;
         }
 
-        if (previous >= 0 && scene.PeriodEndAt > scene.Timestamps[previous] &&
-            !scene.HasConfirmedGapBetween(scene.Timestamps[previous], scene.PeriodEndAt))
+        if (previous == scene.Timestamps.Count - 1 &&
+            scene.PeriodEndAt > scene.Timestamps[previous] &&
+            scene.PeriodEndAt - scene.Timestamps[previous] <= ModelContiguousSampleMaxGapSeconds &&
+            !scene.HasHardBreakBetween(scene.Timestamps[previous], scene.PeriodEndAt))
         {
             // The remote source may stop while the current period continues.
             // Keep only the last measured value, horizontally and dashed;
@@ -287,11 +286,6 @@ internal static class GraphPlotProjection
             {
                 continue;
             }
-            if (previous >= 0 && value < values[previous])
-            {
-                previous = -1;
-                continue;
-            }
             if (previous < 0)
             {
                 previous = index;
@@ -302,13 +296,18 @@ internal static class GraphPlotProjection
             var startAt = scene.Timestamps[previous];
             var endAt = scene.Timestamps[index];
             var elapsed = endAt - startAt;
-            if (scene.HasConfirmedGapBetween(startAt, endAt))
+            if (scene.HasHardBreakBetween(startAt, endAt))
             {
                 previous = index;
                 continue;
             }
-            if ((index != previous + 1 || elapsed > ModelContiguousSampleMaxGapSeconds) &&
-                value != before)
+            if (value < before)
+            {
+                previous = index;
+                continue;
+            }
+            if (index != previous + 1 || elapsed > ModelContiguousSampleMaxGapSeconds ||
+                scene.ModelSynthetic[previous] || scene.ModelSynthetic[index])
             {
                 AppendSegment(dashedX, dashedY, startAt, before, endAt, value);
             }
@@ -321,6 +320,20 @@ internal static class GraphPlotProjection
                 AppendSegment(risingX, risingY, startAt, before, endAt, value);
             }
             previous = index;
+        }
+
+        if (previous == values.Count - 1 &&
+            scene.PeriodEndAt > scene.Timestamps[previous] &&
+            scene.PeriodEndAt - scene.Timestamps[previous] <= ModelContiguousSampleMaxGapSeconds &&
+            !scene.HasHardBreakBetween(scene.Timestamps[previous], scene.PeriodEndAt))
+        {
+            AppendSegment(
+                dashedX,
+                dashedY,
+                scene.Timestamps[previous],
+                values[previous],
+                scene.PeriodEndAt,
+                values[previous]);
         }
 
         return new GraphModelLineProjection(
@@ -362,22 +375,15 @@ internal static class GraphPlotProjection
             return Array.Empty<GraphEndpointLabel>();
         }
 
-        var last = scene.Timestamps.Count - 1;
         var candidates = new List<EndpointCandidate>();
-        if (scene.PeriodEndAt - scene.Timestamps[last] <= ModelContiguousSampleMaxGapSeconds)
-        {
-            AddModelCandidate("ASTRA", scene.Astra[last], scene.ModelMaximum, scene.Metric, GraphSeries.Astra, culture, candidates);
-            AddModelCandidate("LUNA", scene.Luna[last], scene.ModelMaximum, scene.Metric, GraphSeries.Luna, culture, candidates);
-            AddModelCandidate("TERRA", scene.Terra[last], scene.ModelMaximum, scene.Metric, GraphSeries.Terra, culture, candidates);
-            AddModelCandidate("SOL", scene.Sol[last], scene.ModelMaximum, scene.Metric, GraphSeries.Sol, culture, candidates);
-        }
+        AddLatestModelCandidate(scene, "ASTRA", scene.Astra, GraphSeries.Astra, culture, candidates);
+        AddLatestModelCandidate(scene, "LUNA", scene.Luna, GraphSeries.Luna, culture, candidates);
+        AddLatestModelCandidate(scene, "TERRA", scene.Terra, GraphSeries.Terra, culture, candidates);
+        AddLatestModelCandidate(scene, "SOL", scene.Sol, GraphSeries.Sol, culture, candidates);
         var lastRemainingObservation = scene.RemainingObserved
             .Select((observed, index) => observed ? index : -1)
             .LastOrDefault(index => index >= 0, -1);
-        if (lastRemainingObservation >= 0 &&
-            !scene.HasConfirmedGapBetween(
-                scene.Timestamps[lastRemainingObservation],
-                scene.PeriodEndAt))
+        if (lastRemainingObservation >= 0)
         {
             var remainingAtEndpoint = RemainingValue(scene, lastRemainingObservation);
             candidates.Add(new EndpointCandidate(
@@ -485,6 +491,24 @@ internal static class GraphPlotProjection
             $"{name} {FormatAxisValue(value, metric, culture)}",
             1 - Math.Clamp(value / maximum, 0, 1),
             value));
+    }
+
+    private static void AddLatestModelCandidate(
+        GraphScene scene,
+        string name,
+        IReadOnlyList<double> values,
+        GraphSeries series,
+        CultureInfo culture,
+        ICollection<EndpointCandidate> candidates)
+    {
+        var last = values
+            .Select((value, index) => double.IsFinite(value) ? index : -1)
+            .LastOrDefault(index => index >= 0, -1);
+        if (last < 0)
+        {
+            return;
+        }
+        AddModelCandidate(name, values[last], scene.ModelMaximum, scene.Metric, series, culture, candidates);
     }
 
     private static void AppendSegment(

@@ -1,0 +1,265 @@
+{
+  "requirement_ids": [
+    "G137-1",
+    "G137-2",
+    "G137-3",
+    "G137-4",
+    "G137-5",
+    "G137-6",
+    "G137-7",
+    "G137-8",
+    "G137-9",
+    "G137-10"
+  ],
+  "parity_v3": {
+    "published_pair": "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001",
+    "metric": "dollars",
+    "period": {
+      "id": "parity-current",
+      "start_at": 2100000000,
+      "end_at": 2100000660,
+      "reset_at": 2100604800,
+      "label": "Parity current period",
+      "current": true
+    },
+    "history_page": {
+      "api_version": "v3",
+      "history_samples": [
+        {"timestamp":2100000000,"reset_at":2100604800,"remaining_percent":96.0,"models":[{"model":"SOL","total_tokens":10,"total_dollars":10.0},{"model":"TERRA","total_tokens":2,"total_dollars":2.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
+        {"timestamp":2100000060,"reset_at":2100604800,"remaining_percent":96.0,"models":[{"model":"SOL","total_tokens":10,"total_dollars":10.0},{"model":"TERRA","total_tokens":2,"total_dollars":2.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
+        {"timestamp":2100000120,"reset_at":2100604800,"remaining_percent":96.0,"models":[{"model":"SOL","total_tokens":11,"total_dollars":11.0},{"model":"TERRA","total_tokens":2,"total_dollars":2.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
+        {"timestamp":2100000180,"reset_at":2100604800,"remaining_percent":null,"models":[{"model":"SOL","total_tokens":12,"total_dollars":12.0},{"model":"TERRA","total_tokens":2,"total_dollars":2.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
+        {"timestamp":2100000240,"reset_at":2100604800,"remaining_percent":null,"models":[{"model":"SOL","total_tokens":13,"total_dollars":13.0},{"model":"TERRA","total_tokens":2,"total_dollars":2.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
+        {"timestamp":2100000300,"reset_at":2100604800,"remaining_percent":94.0,"models":[{"model":"SOL","total_tokens":14,"total_dollars":14.0},{"model":"TERRA","total_tokens":2,"total_dollars":2.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
+        {"timestamp":2100000360,"reset_at":2100604800,"remaining_percent":94.0,"models":[{"model":"SOL","total_tokens":14,"total_dollars":14.0},{"model":"TERRA","total_tokens":2,"total_dollars":2.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
+        {"timestamp":2100000420,"reset_at":2100604800,"remaining_percent":93.0,"models":[{"model":"SOL","total_tokens":14,"total_dollars":14.0},{"model":"TERRA","total_tokens":2,"total_dollars":2.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
+        {"timestamp":2100000480,"reset_at":2100604800,"remaining_percent":92.0,"models":[{"model":"SOL","total_tokens":14,"total_dollars":14.0},{"model":"TERRA","total_tokens":2,"total_dollars":2.0}],"models_complete":false,"model_source":"legacy-unknown"},
+        {"timestamp":2100000540,"reset_at":2100604800,"remaining_percent":92.0,"models":null,"models_complete":false,"model_source":"unavailable"},
+        {"timestamp":2100000600,"reset_at":2100604800,"remaining_percent":92.0,"models":[{"model":"SOL","total_tokens":14,"total_dollars":14.0},{"model":"TERRA","total_tokens":2,"total_dollars":2.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"}
+      ],
+      "history_gaps": [
+        {"gap_id":"00112233445566778899aabbccddeeff","reset_at":2100604800,"start_at":2100000360,"end_at":2100000420,"reason":"daemon_stop_unrecoverable"}
+      ],
+      "next_cursor": null,
+      "resume_cursor": "resume-parity"
+    },
+    "expected": {
+      "model_universe": ["LUNA", "SOL", "TERRA"],
+      "latest_raw_timestamp": 2100000600,
+      "latest_models": {"SOL":14.0,"TERRA":2.0,"LUNA":1.0},
+      "latest_remaining_raw": 92.0,
+      "latest_remaining_effective": 92.0,
+      "latest_labels": {"SOL":"$14.00","remaining":"92%"},
+      "idle_intervals": [[2100000000,2100000060],[2100000300,2100000360]],
+      "idle_normalized_bounds": [[0.0,0.09090909090909091],[0.45454545454545453,0.5454545454545454]],
+      "accepted_models": {
+        "SOL": [10.0,10.0,11.0,12.0,13.0,14.0,14.0,14.0,14.0,null,14.0],
+        "TERRA": [2.0,2.0,2.0,2.0,2.0,2.0,2.0,2.0,2.0,null,2.0],
+        "LUNA": [1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,null,null,1.0]
+      },
+      "model_segments": {
+        "SOL": {"solid":[[2100000000,2100000060],[2100000060,2100000120],[2100000120,2100000180],[2100000180,2100000240],[2100000240,2100000300],[2100000300,2100000360],[2100000420,2100000480]],"dashed":[[2100000480,2100000600],[2100000600,2100000660]],"break":[[2100000360,2100000420]]},
+        "TERRA": {"solid":[[2100000000,2100000060],[2100000060,2100000120],[2100000120,2100000180],[2100000180,2100000240],[2100000240,2100000300],[2100000300,2100000360],[2100000420,2100000480]],"dashed":[[2100000480,2100000600],[2100000600,2100000660]],"break":[[2100000360,2100000420]]},
+        "LUNA": {"solid":[[2100000000,2100000060],[2100000060,2100000120],[2100000120,2100000180],[2100000180,2100000240],[2100000240,2100000300],[2100000300,2100000360]],"dashed":[[2100000420,2100000600],[2100000600,2100000660]],"break":[[2100000360,2100000420]]}
+      },
+      "remaining_points": [
+        {"timestamp":2100000000,"raw":96.0,"effective":96.0,"origin":"raw"},
+        {"timestamp":2100000060,"raw":96.0,"effective":96.0,"origin":"raw"},
+        {"timestamp":2100000120,"raw":96.0,"effective":96.0,"origin":"raw"},
+        {"timestamp":2100000180,"raw":null,"effective":95.33333333333333,"origin":"interpolated"},
+        {"timestamp":2100000240,"raw":null,"effective":94.66666666666667,"origin":"interpolated"},
+        {"timestamp":2100000300,"raw":94.0,"effective":94.0,"origin":"raw"},
+        {"timestamp":2100000360,"raw":94.0,"effective":94.0,"origin":"raw"},
+        {"timestamp":2100000420,"raw":93.0,"effective":93.0,"origin":"raw"},
+        {"timestamp":2100000480,"raw":92.0,"effective":92.0,"origin":"raw"},
+        {"timestamp":2100000540,"raw":92.0,"effective":92.0,"origin":"raw"},
+        {"timestamp":2100000600,"raw":92.0,"effective":92.0,"origin":"raw"},
+        {"timestamp":2100000660,"raw":null,"effective":92.0,"origin":"synthetic_tail_hold"}
+      ],
+      "remaining_segments": {"solid":[[2100000000,2100000060],[2100000060,2100000120],[2100000300,2100000360],[2100000480,2100000540],[2100000540,2100000600]],"dashed":[[2100000120,2100000180],[2100000180,2100000240],[2100000240,2100000300],[2100000420,2100000480],[2100000600,2100000660]],"break":[[2100000360,2100000420]]}
+    }
+  },
+  "correction_v2": {
+  "expected_period_start": 1788441660,
+  "expected_period_end": 1788476340,
+  "expected_reset_at": 1788993073,
+  "expected_graph_timestamps": [1788441660, 1788441720, 1788441780, 1788445260, 1788445320, 1788476280, 1788476340],
+  "expected_correction_starts": [1788441780, 1788445320],
+  "expected_latest_sample_timestamp": 1788476280,
+  "expected_latest_remaining": 62.0,
+  "expected_latest_sol_dollars": 127.284527,
+  "expected_latest_sol_tokens": 184314549,
+  "expected": {
+    "model_universe": ["LUNA", "SOL", "TERRA"],
+    "accepted_sol": [176.04182,176.04182,87.483049,103.320445,87.256537,127.284527,127.284527],
+    "corrections": [1788441780,1788445320],
+    "idle_intervals": [[1788441660,1788441720]],
+    "model_segments": {
+      "SOL": {"solid":[[1788441660,1788441720]],"dashed":[[1788441780,1788445260],[1788445320,1788476280],[1788476280,1788476340]],"break":[[1788441720,1788441780],[1788445260,1788445320]]},
+      "TERRA": {"solid":[[1788441660,1788441720]],"dashed":[[1788441780,1788445260],[1788445320,1788476280],[1788476280,1788476340]],"break":[[1788441720,1788441780],[1788445260,1788445320]]},
+      "LUNA": {"solid":[[1788441660,1788441720]],"dashed":[[1788441780,1788445260],[1788445320,1788476280],[1788476280,1788476340]],"break":[[1788441720,1788441780],[1788445260,1788445320]]}
+    },
+    "remaining_segments": {"solid":[[1788441660,1788441720]],"dashed":[[1788441780,1788445260],[1788445320,1788476280],[1788476280,1788476340]],"break":[[1788441720,1788441780],[1788445260,1788445320]]},
+    "latest_labels": {"SOL":"SOL $127.28","remaining":"62%"}
+  },
+  "details_response": {
+    "api_version": "v2",
+    "state": "ready",
+    "observed_at": 1788476340,
+    "authenticated": true,
+    "plan_label": "Pro",
+    "quota": {
+      "remaining_percent": 62.0,
+      "reset_at": 1788993073,
+      "window_seconds": 604813,
+      "monthly": false
+    },
+    "models": [
+      {
+        "name": "SOL",
+        "input_tokens": 184314549,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "input_dollars": 127.284527,
+        "cached_input_dollars": 0.0,
+        "output_dollars": 0.0
+      },
+      {
+        "name": "TERRA",
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "input_dollars": 0.0,
+        "cached_input_dollars": 0.0,
+        "output_dollars": 0.0
+      },
+      {
+        "name": "LUNA",
+        "input_tokens": 218090071,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "input_dollars": 6.44192836,
+        "cached_input_dollars": 0.0,
+        "output_dollars": 0.0
+      }
+    ],
+    "active_thread_count": 0,
+    "history_periods": [
+      {
+        "id": "1788993073",
+        "start_at": 1788441660,
+        "end_at": 1788476340,
+        "reset_at": 1788993073,
+        "label": "2026/09/03 22:21:00 +09:00 ～ 2026/09/10 07:31:13 +09:00（現在）",
+        "current": true
+      }
+    ],
+    "history_samples": [
+      {
+        "timestamp": 1788441660,
+        "reset_at": 1788993073,
+        "remaining_percent": 73.0,
+        "sol_dollars": 176.04182,
+        "terra_dollars": 0.0,
+        "luna_dollars": 7.33828848,
+        "sol_tokens": 264712012,
+        "terra_tokens": 0,
+        "luna_tokens": 247557688,
+        "model_source": "confirmed"
+      },
+      {
+        "timestamp": 1788441720,
+        "reset_at": 1788993073,
+        "remaining_percent": 73.0,
+        "sol_dollars": 176.04182,
+        "terra_dollars": 0.0,
+        "luna_dollars": 7.33828848,
+        "sol_tokens": 264712012,
+        "terra_tokens": 0,
+        "luna_tokens": 247557688,
+        "model_source": "confirmed"
+      },
+      {
+        "timestamp": 1788441780,
+        "reset_at": 1788993073,
+        "remaining_percent": 73.0,
+        "sol_dollars": 87.483049,
+        "terra_dollars": 0.0,
+        "luna_dollars": 6.111394,
+        "sol_tokens": 132498115,
+        "terra_tokens": 0,
+        "luna_tokens": 209761478,
+        "model_source": "confirmed"
+      },
+      {
+        "timestamp": 1788445260,
+        "reset_at": 1788993073,
+        "remaining_percent": 70.0,
+        "sol_dollars": 103.320445,
+        "terra_dollars": 0.0,
+        "luna_dollars": 6.38715196,
+        "sol_tokens": 156116016,
+        "terra_tokens": 0,
+        "luna_tokens": 217177530,
+        "model_source": "confirmed"
+      },
+      {
+        "timestamp": 1788445320,
+        "reset_at": 1788993073,
+        "remaining_percent": 70.0,
+        "sol_dollars": 87.256537,
+        "terra_dollars": 0.0,
+        "luna_dollars": 6.12284928,
+        "sol_tokens": 131964424,
+        "terra_tokens": 0,
+        "luna_tokens": 209940316,
+        "model_source": "confirmed"
+      },
+      {
+        "timestamp": 1788476280,
+        "reset_at": 1788993073,
+        "remaining_percent": 62.0,
+        "sol_dollars": 127.284527,
+        "terra_dollars": 0.0,
+        "luna_dollars": 6.44192836,
+        "sol_tokens": 184314549,
+        "terra_tokens": 0,
+        "luna_tokens": 218090071,
+        "model_source": "confirmed"
+      }
+    ],
+    "history_gaps": [],
+    "threads": [],
+    "estimated_cost_label": "概算 $134"
+  }
+  },
+  "mixed_unconfirmed_v3": {
+    "samples": [
+      {"timestamp":3000,"remaining_percent":100.0,"models":[{"model":"SOL","total_tokens":10,"total_dollars":10.0},{"model":"TERRA","total_tokens":5,"total_dollars":5.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
+      {"timestamp":3060,"remaining_percent":99.0,"models":[{"model":"SOL","total_tokens":12,"total_dollars":12.0},{"model":"TERRA","total_tokens":6,"total_dollars":6.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
+      {"timestamp":3120,"remaining_percent":98.0,"models":[{"model":"SOL","total_tokens":7,"total_dollars":7.0},{"model":"TERRA","total_tokens":7,"total_dollars":7.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
+      {"timestamp":3180,"remaining_percent":97.0,"models":[{"model":"SOL","total_tokens":11,"total_dollars":11.0},{"model":"TERRA","total_tokens":8,"total_dollars":8.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
+      {"timestamp":3240,"remaining_percent":96.0,"models":[{"model":"SOL","total_tokens":13,"total_dollars":13.0},{"model":"TERRA","total_tokens":9,"total_dollars":9.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"}
+    ],
+    "expected": {"accepted_sol":[10.0,12.0,null,null,13.0],"sol_solid":[[3000,3060]],"sol_dashed":[[3060,3240]],"corrections":[],"idle_intervals":[]}
+  },
+  "mixed_confirmed_v3": {
+    "samples": [
+      {"timestamp":3000,"remaining_percent":100.0,"models":[{"model":"SOL","total_tokens":10,"total_dollars":10.0},{"model":"TERRA","total_tokens":5,"total_dollars":5.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
+      {"timestamp":3060,"remaining_percent":99.0,"models":[{"model":"SOL","total_tokens":12,"total_dollars":12.0},{"model":"TERRA","total_tokens":6,"total_dollars":6.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
+      {"timestamp":3120,"remaining_percent":98.0,"models":[{"model":"SOL","total_tokens":7,"input_tokens":7,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":7.0},{"model":"TERRA","total_tokens":7,"input_tokens":7,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":7.0},{"model":"LUNA","total_tokens":1,"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":1.0}],"models_complete":true,"model_source":"confirmed"},
+      {"timestamp":3180,"remaining_percent":97.0,"models":[{"model":"SOL","total_tokens":11,"total_dollars":11.0},{"model":"TERRA","total_tokens":8,"total_dollars":8.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
+      {"timestamp":3240,"remaining_percent":96.0,"models":[{"model":"SOL","total_tokens":13,"total_dollars":13.0},{"model":"TERRA","total_tokens":9,"total_dollars":9.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"}
+    ],
+    "expected": {"accepted_sol":[10.0,12.0,7.0,11.0,13.0],"sol_solid":[[3000,3060],[3120,3180],[3180,3240]],"sol_dashed":[],"corrections":[3120],"idle_intervals":[]}
+  },
+  "quota_raw_increase": {
+    "period_start": 4000,
+    "period_end": 4120,
+    "samples": [
+      {"timestamp":4000,"remaining_percent":90.0,"models":[{"model":"SOL","total_tokens":1,"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":1.0},{"model":"TERRA","total_tokens":0,"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":0.0},{"model":"LUNA","total_tokens":0,"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":0.0}],"models_complete":true,"model_source":"confirmed"},
+      {"timestamp":4060,"remaining_percent":92.0,"models":[{"model":"SOL","total_tokens":2,"input_tokens":2,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":2.0},{"model":"TERRA","total_tokens":0,"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":0.0},{"model":"LUNA","total_tokens":0,"input_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_dollars":0.0}],"models_complete":true,"model_source":"confirmed"}
+    ],
+    "expected": {"raw":[90.0,92.0],"effective":[90.0,90.0],"origins":["raw","monotonic_hold"],"remaining_dashed":[[4000,4060],[4060,4120]],"latest_raw":92.0,"latest_effective":90.0,"latest_label":"90%","idle_intervals":[]}
+  }
+}

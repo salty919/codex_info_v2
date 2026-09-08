@@ -415,6 +415,7 @@ transfer-decoded bodyは1 KiB以下とする。
 | HTTP status | error | 適用条件 |
 | ---: | --- | --- |
 | 400 | `bad_request` | parse可能だがrequest line/target/header/body契約不正 |
+| 400 | `stale_cursor` | history cursorのperiod、prefixまたはgap fingerprintが現published generationと一致しない |
 | 404 | `not_found` | exact known pathでない |
 | 405 | `method_not_allowed` | exact known pathに対するGET以外 |
 | 408 | `request_timeout` | request header/body deadline超過 |
@@ -482,7 +483,7 @@ snapshot応答のopaque generation identityとしてだけ使い、body SHAやco
 
 Linux / Windows Mainは10秒周期、Graphのcursor差分はopen中60秒周期、Threads詳細はopen中5秒周期とする。
 Graphが閉じている間は対応requestを0件とし、Threads詳細が閉じている間は上記Linux / Windows Mainの条件付き1回を除きthreads requestを0件とする。同じpairではbody 0の304を使い、current更新時も
-history全体を取得しない。history cursorはperiod、最後の`(reset_at,timestamp)`、そこまでのsample canonical prefixと選択periodの完全gap集合のSHA-256 fingerprintへ結合したclient非解釈値である。serverはsnapshot構築時に累積fingerprintとkey indexを作り、requestではkeyの二分探索とfingerprint比較だけで旧cursorを検証する。現snapshotの同じsample prefixとgap集合が一致する場合だけ、旧pairで発行したcursorも受理し、cursor後のrowを現pairで返す。先頭からの完全取得では最初のpageだけが完全gap集合を持ち、後続pageは空のgap集合を持つ。delta pageもgap集合を反復せず、clientはその現pairの全pageを受理した後だけsampleを直前prefixへatomic appendして既存gap集合を保持する。過去row補正、gap追加・回復・補正、period変更、unknown、stale、malformedでは固定4xxとしてpage集合を破棄し、次の通常周期に先頭から一度取得する。これにより通常appendのrequest処理と通信はdelta量だけに比例し、prefixまたはgap変更時だけ完全再取得する。
+history全体を取得しない。history cursorはperiod、最後の`(reset_at,timestamp)`、そこまでのsample canonical prefixと選択periodの完全gap集合のSHA-256 fingerprintへ結合したclient非解釈値である。serverはsnapshot構築時に累積fingerprintとkey indexを作り、requestではkeyの二分探索とfingerprint比較だけで旧cursorを検証する。現snapshotの同じsample prefixとgap集合が一致する場合だけ、旧pairで発行したcursorも受理し、cursor後のrowを現pairで返す。先頭からの完全取得では最初のpageだけが完全gap集合を持ち、後続pageは空のgap集合を持つ。delta pageもgap集合を反復せず、clientはその現pairの全pageを受理した後だけsampleを直前prefixへatomic appendして既存gap集合を保持する。過去row補正、gap追加・回復・補正、period変更、unknown、stale、malformedでは`400 stale_cursor`としてpage集合を破棄する。clientは`G137-9`のexact responseを保存cursorへの応答として受理した場合だけ、同cycleで先頭から1回取得できる。それ以外の4xx、malformedまたは回復取得失敗は同cycleで反復せず、last-goodを保持する。これにより通常appendのrequest処理と通信はdelta量だけに比例し、prefixまたはgap変更時だけ完全再取得する。
 
 `/v3/current`のexact 404を受けたclientは、その接続中をlegacy details modeとし、fallback列で受理した一つの完全details rootをMain、Graph、Threadsへ同時投影する。legacy modeではsplit history/threads routeを追加要求せず、Mainの10秒周期で同じdetails列だけを更新し、Graph/Threadsは最新の受理済みrootを表示する。再接続時には`/v3/current`から能力判定をやり直す。これにより旧serviceでもsurfaceを欠落させず、splitとlegacy rootを混在させない。
 
