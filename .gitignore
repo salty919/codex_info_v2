@@ -39,6 +39,9 @@
 /.vscode/*
 !/.vscode/extensions.json
 
+# Local Codacy analysis materializations
+/.codacy/generated/
+
 # Local Codex task logs and raw evaluation evidence
 /.codex-tasks/
 /.delegation/
