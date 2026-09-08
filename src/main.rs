@@ -3011,28 +3011,58 @@ fn current_history_period_reset(
 }
 
 /// Build the shared presentation/publication view without mutating retained
-/// history.  A moving full-quota observation whose reset horizon advances
-/// with its acquisition minute is not a sample from the later authoritative
-/// cycle when it precedes that cycle's start.  Remove only that already-known
-/// acquisition shape from the current group; any lower/non-zero/ambiguous row
-/// remains so the existing authoritative-bounds and REST validation gates can
-/// fail closed.
+/// history. The caller supplies already-canonical samples, so the current
+/// quota reset identifies one structurally proven cycle without inspecting
+/// quota or model values. Samples from that cycle which precede its
+/// authoritative window are retained in SQLite but are not part of the public
+/// period.
 fn authoritative_history_projection_samples(
     samples: &[UsageHistorySample],
     current_reset_at: Option<i64>,
     window_seconds: i64,
 ) -> Vec<UsageHistorySample> {
-    let _ = (current_reset_at, window_seconds);
-    samples.to_vec()
+    let Some(current_reset_at) = current_reset_at else {
+        return samples.to_vec();
+    };
+    let Some(canonical_reset_at) = samples
+        .iter()
+        .map(|sample| sample.reset_at)
+        .filter(|reset_at| {
+            current_reset_at.abs_diff(*reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
+        })
+        .min_by(|left, right| {
+            current_reset_at
+                .abs_diff(*left)
+                .cmp(&current_reset_at.abs_diff(*right))
+                .then_with(|| right.cmp(left))
+        })
+    else {
+        return samples.to_vec();
+    };
+    let Some(authoritative_start) = (window_seconds > 0)
+        .then(|| canonical_reset_at.checked_sub(window_seconds))
+        .flatten()
+        .and_then(minute_start)
+    else {
+        return samples.to_vec();
+    };
+
+    samples
+        .iter()
+        .filter(|sample| {
+            sample.reset_at != canonical_reset_at || sample.timestamp >= authoritative_start
+        })
+        .cloned()
+        .collect()
 }
 
 /// Apply the authoritative quota bounds to the current raw period only.
 ///
 /// `UsageHistory` remains the owner of raw inventory and historical grouping.
 /// This bounded projection gives current consumers the quota reset/window
-/// boundary without deleting, clipping, or shape-filtering any stored sample.
-/// Rows outside the resulting public period remain in the complete candidate,
-/// where the shared REST validator rejects the generation atomically.
+/// boundary without deleting or shape-filtering any stored sample. The sample
+/// projection above and this period projection use the same boundary; every
+/// other mismatch remains subject to the strict REST validator.
 fn apply_authoritative_current_bounds(
     mut periods: Vec<HistoryPeriod>,
     _samples: &[UsageHistorySample],
@@ -9562,12 +9592,19 @@ fn local_account_authority_matches(
 
 impl CodexInfoState {
     fn projected_history(&self) -> UsageHistory {
+        let samples = canonicalize_public_history_samples(&self.history.samples)
+            .map(|samples| {
+                authoritative_history_projection_samples(
+                    &samples,
+                    self.reset_at,
+                    self.window_seconds,
+                )
+            })
+            // Keep an ambiguous source intact so downstream strict
+            // canonicalization rejects it rather than accepting a subset.
+            .unwrap_or_else(|_| self.history.samples.clone());
         UsageHistory {
-            samples: authoritative_history_projection_samples(
-                &self.history.samples,
-                self.reset_at,
-                self.window_seconds,
-            ),
+            samples,
             ..UsageHistory::default()
         }
     }
@@ -9845,8 +9882,11 @@ impl CodexInfoState {
             samples: admitted_history_samples,
             ..UsageHistory::default()
         };
-        let canonical_history_samples =
-            canonicalize_public_history_samples(&admitted_history.samples)?;
+        let canonical_history_samples = authoritative_history_projection_samples(
+            &canonicalize_public_history_samples(&admitted_history.samples)?,
+            self.reset_at,
+            self.window_seconds,
+        );
         // Period selectors and graph rows come from the same admitted view;
         // reset fragments and ambiguous minutes never survive only as empty
         // or misleading period options.
@@ -17033,6 +17073,63 @@ struct ResidentPublicationState {
     last_published_v3: Option<PublicDetailsV3>,
 }
 
+fn resident_publication_error_root(
+    publication: &ResidentPublicationState,
+) -> (PublicDetails, PublicDetailsV2, PublicDetailsV3) {
+    let (mut details, mut details_v2, mut details_v3) = match (
+        publication.last_published.as_ref(),
+        publication.last_published_v2.as_ref(),
+        publication.last_published_v3.as_ref(),
+    ) {
+        (Some(details), Some(details_v2), Some(details_v3)) => {
+            (details.clone(), details_v2.clone(), details_v3.clone())
+        }
+        _ => match (
+            publication.last_complete.as_ref(),
+            publication.last_complete_v2.as_ref(),
+            publication.last_complete_v3.as_ref(),
+        ) {
+            (Some(details), Some(details_v2), Some(details_v3)) => {
+                (details.clone(), details_v2.clone(), details_v3.clone())
+            }
+            _ => (
+                PublicDetails::default(),
+                PublicDetailsV2::default(),
+                PublicDetailsV3::default(),
+            ),
+        },
+    };
+    details.state = PublicState::Error;
+    details_v2.state = PublicState::Error;
+    details_v3.state = PublicState::Error;
+    (details, details_v2, details_v3)
+}
+
+fn publish_resident_error_root<P>(
+    publication: &mut ResidentPublicationState,
+    publish: &mut P,
+) -> Result<(), codex_info::server::ApiSnapshotError>
+where
+    P: FnMut(
+        PublicDetails,
+        PublicDetailsV2,
+        PublicDetailsV3,
+    ) -> Result<(), codex_info::server::ApiSnapshotError>,
+{
+    let (details, details_v2, details_v3) = resident_publication_error_root(publication);
+    if publication.last_published.as_ref() == Some(&details)
+        && publication.last_published_v2.as_ref() == Some(&details_v2)
+        && publication.last_published_v3.as_ref() == Some(&details_v3)
+    {
+        return Ok(());
+    }
+    publish(details.clone(), details_v2.clone(), details_v3.clone())?;
+    publication.last_published = Some(details);
+    publication.last_published_v2 = Some(details_v2);
+    publication.last_published_v3 = Some(details_v3);
+    Ok(())
+}
+
 #[cfg(test)]
 fn resident_service_cycle<W, P>(
     state: &mut CodexInfoState,
@@ -17042,7 +17139,7 @@ fn resident_service_cycle<W, P>(
 ) -> Result<ResidentServiceCycleOutcome, ResidentServiceCycleError>
 where
     W: FnOnce(&mut CodexInfoState, PendingRecorderBatch) -> Result<(), String>,
-    P: FnOnce(PublicDetails) -> Result<(), codex_info::server::ApiSnapshotError>,
+    P: FnMut(PublicDetails) -> Result<(), codex_info::server::ApiSnapshotError>,
 {
     resident_service_cycle_with_recorder_attempt(
         state,
@@ -17059,11 +17156,11 @@ fn resident_service_cycle_with_recorder_attempt<W, P>(
     publication: &mut ResidentPublicationState,
     recorder_attempt: bool,
     write_and_refresh: W,
-    publish: P,
+    mut publish: P,
 ) -> Result<ResidentServiceCycleOutcome, ResidentServiceCycleError>
 where
     W: FnOnce(&mut CodexInfoState, PendingRecorderBatch) -> Result<(), String>,
-    P: FnOnce(PublicDetails) -> Result<(), codex_info::server::ApiSnapshotError>,
+    P: FnMut(PublicDetails) -> Result<(), codex_info::server::ApiSnapshotError>,
 {
     resident_service_cycle_with_recorder_attempt_v2(
         state,
@@ -17080,11 +17177,11 @@ fn resident_service_cycle_with_recorder_attempt_v2<W, P>(
     publication: &mut ResidentPublicationState,
     recorder_attempt: bool,
     write_and_refresh: W,
-    publish: P,
+    mut publish: P,
 ) -> Result<ResidentServiceCycleOutcome, ResidentServiceCycleError>
 where
     W: FnOnce(&mut CodexInfoState, PendingRecorderBatch) -> Result<(), String>,
-    P: FnOnce(PublicDetails, PublicDetailsV2) -> Result<(), codex_info::server::ApiSnapshotError>,
+    P: FnMut(PublicDetails, PublicDetailsV2) -> Result<(), codex_info::server::ApiSnapshotError>,
 {
     resident_service_cycle_with_recorder_attempt_v3(
         state,
@@ -17105,7 +17202,7 @@ fn resident_service_cycle_with_recorder_attempt_v3<W, P>(
 ) -> Result<ResidentServiceCycleOutcome, ResidentServiceCycleError>
 where
     W: FnOnce(&mut CodexInfoState, PendingRecorderBatch) -> Result<(), String>,
-    P: FnOnce(
+    P: FnMut(
         PublicDetails,
         PublicDetailsV2,
         PublicDetailsV3,
@@ -17127,11 +17224,11 @@ fn resident_service_cycle_with_publication_policy_v3<W, P>(
     recorder_attempt: bool,
     force_publication: bool,
     write_and_refresh: W,
-    publish: P,
+    mut publish: P,
 ) -> Result<ResidentServiceCycleOutcome, ResidentServiceCycleError>
 where
     W: FnOnce(&mut CodexInfoState, PendingRecorderBatch) -> Result<(), String>,
-    P: FnOnce(
+    P: FnMut(
         PublicDetails,
         PublicDetailsV2,
         PublicDetailsV3,
@@ -17192,15 +17289,21 @@ where
     if !force_publication && !observed_event && !scheduled_change && !recorder_attempt {
         return Ok(ResidentServiceCycleOutcome::Unchanged);
     }
-    let mut candidate = state
-        .public_details_candidate()
-        .map_err(|error| ResidentServiceCycleError::Candidate(error.to_string()))?;
-    let mut candidate_v2 = state
-        .public_details_v2_candidate()
-        .map_err(|error| ResidentServiceCycleError::Candidate(error.to_string()))?;
-    let mut candidate_v3 = state
-        .public_details_v3_candidate()
-        .map_err(|error| ResidentServiceCycleError::Candidate(error.to_string()))?;
+    let candidates = (|| {
+        Ok::<_, HistoryCanonicalizationError>((
+            state.public_details_candidate()?,
+            state.public_details_v2_candidate()?,
+            state.public_details_v3_candidate()?,
+        ))
+    })();
+    let (mut candidate, mut candidate_v2, mut candidate_v3) = match candidates {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            publish_resident_error_root(publication, &mut publish)
+                .map_err(ResidentServiceCycleError::Publish)?;
+            return Err(ResidentServiceCycleError::Candidate(error.to_string()));
+        }
+    };
     if candidate.state == PublicState::Error {
         if let Some(last_complete) = publication.last_complete.as_ref() {
             candidate = last_complete.clone();
@@ -17242,12 +17345,15 @@ where
             Ok(ResidentServiceCycleOutcome::Unchanged)
         };
     }
-    publish(
+    if let Err(error) = publish(
         candidate.clone(),
         candidate_v2.clone(),
         candidate_v3.clone(),
-    )
-    .map_err(ResidentServiceCycleError::Publish)?;
+    ) {
+        publish_resident_error_root(publication, &mut publish)
+            .map_err(ResidentServiceCycleError::Publish)?;
+        return Err(ResidentServiceCycleError::Publish(error));
+    }
     publication.last_published = Some(candidate.clone());
     publication.last_published_v2 = Some(candidate_v2.clone());
     publication.last_published_v3 = Some(candidate_v3.clone());
@@ -18205,7 +18311,7 @@ mod tests {
         HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint, LocalUsageCache,
         LocalUsageCandidate, LocalUsageResult, ManualX11Geometry, ManualX11WindowAction,
         ModelDollarTotals, ModelTokenTotals, ModelUsageRow, ModelUsageTotals, PublicDetails,
-        PublicDetailsV2, PublicHistoryGap, RpcReadEvent, ServiceEndpointState,
+        PublicDetailsV2, PublicDetailsV3, PublicHistoryGap, RpcReadEvent, ServiceEndpointState,
         ServiceHealthVersion, SessionFileCandidate, SessionTraversalBudget, ThreadRolloutCache,
         TimedModelUsage, TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory,
         UsageHistorySample, UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT,
@@ -19125,6 +19231,94 @@ mod tests {
         assert_eq!(client.model_usage.len(), last_complete.models.len());
         assert_eq!(client.active_threads.len(), last_complete.threads.len());
         assert!(client.error.is_some());
+    }
+
+    #[test]
+    fn resident_publication_exposes_initial_rejection_and_recovers_to_ready() {
+        let mut state = CodexInfoState::preview("normal");
+        state.history = UsageHistory::default();
+        state.active_threads = (0..=MAX_PUBLIC_THREADS)
+            .map(|index| active_thread_fixture(index, 10_000 - index as i64))
+            .collect();
+
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        let publisher = server.publisher();
+        let initial_response = raw_loopback_get(server.local_addr(), "/v3/current");
+        let initial_pair = raw_loopback_pair(&initial_response);
+        assert_eq!(
+            raw_loopback_body(&initial_response)["state"],
+            "initializing"
+        );
+        let mut publication = super::ResidentPublicationState {
+            last_published: Some(PublicDetails::default()),
+            last_published_v2: Some(PublicDetailsV2::default()),
+            last_published_v3: Some(PublicDetailsV3::default()),
+            ..super::ResidentPublicationState::default()
+        };
+        let recorder_attempts = std::cell::Cell::new(0);
+
+        let rejected = super::resident_service_cycle_with_recorder_attempt_v3(
+            &mut state,
+            &mut publication,
+            true,
+            |_, pending| {
+                assert!(pending.is_empty());
+                recorder_attempts.set(recorder_attempts.get() + 1);
+                Ok(())
+            },
+            |v1, v2, v3| publisher.publish_details_v3(v1, v2, v3),
+        );
+        assert!(matches!(
+            rejected,
+            Err(super::ResidentServiceCycleError::Publish(
+                ApiSnapshotError::ListTooLong
+            ))
+        ));
+        assert_eq!(recorder_attempts.get(), 1);
+        let error_current = raw_loopback_get(server.local_addr(), "/v3/current");
+        let error_details = raw_loopback_get(server.local_addr(), "/v3/details");
+        let error_pair = raw_loopback_pair(&error_current);
+        assert_ne!(error_pair, initial_pair);
+        assert_eq!(raw_loopback_body(&error_current)["state"], "error");
+        assert_eq!(raw_loopback_body(&error_details)["state"], "error");
+        assert_eq!(
+            publication
+                .last_published
+                .as_ref()
+                .map(|details| details.state),
+            Some(PublicState::Error)
+        );
+        assert!(publication.last_complete.is_none());
+
+        state.active_threads.truncate(MAX_PUBLIC_THREADS);
+        let recovered = super::resident_service_cycle_with_recorder_attempt_v3(
+            &mut state,
+            &mut publication,
+            true,
+            |_, pending| {
+                assert!(pending.is_empty());
+                recorder_attempts.set(recorder_attempts.get() + 1);
+                Ok(())
+            },
+            |v1, v2, v3| publisher.publish_details_v3(v1, v2, v3),
+        )
+        .unwrap();
+        assert_eq!(recovered, super::ResidentServiceCycleOutcome::Published);
+        assert_eq!(recorder_attempts.get(), 2);
+        let ready_current = raw_loopback_get(server.local_addr(), "/v3/current");
+        let ready_pair = raw_loopback_pair(&ready_current);
+        assert_ne!(ready_pair, error_pair);
+        assert_eq!(raw_loopback_body(&ready_current)["state"], "ready");
+        assert_eq!(
+            publication
+                .last_complete
+                .as_ref()
+                .map(|details| details.state),
+            Some(PublicState::Ready)
+        );
+        server.shutdown();
     }
 
     #[test]
@@ -29220,7 +29414,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_startup_rejects_current_period_with_one_minute_early_owned_row() {
+    fn fresh_startup_projects_structurally_owned_pre_window_row_without_value_filter() {
         const WINDOW_SECONDS: i64 = 3_600;
         let observed_at = 1_800_003_017_i64;
         let raw_start = (observed_at - 3_000).div_euclid(60) * 60 + 34;
@@ -29272,81 +29466,43 @@ mod tests {
         state.selected_reset_at = None;
         state.selected_history_period.clear();
 
+        let retained_raw = state.history.samples.clone();
+        let authoritative_start = raw_start.div_euclid(60) * 60;
+        let early_timestamp = (raw_start - 60).div_euclid(60) * 60;
+
         let periods = state.history_periods_at(observed_at);
-        assert!(periods
+        let current = periods
             .iter()
-            .any(|period| period.canonical_reset_at == canonical_reset));
+            .find(|period| period.canonical_reset_at == canonical_reset)
+            .expect("authoritative current period");
+        assert_eq!(current.start, authoritative_start);
         assert!(periods
             .iter()
             .any(|period| period.canonical_reset_at == old_reset));
 
         let candidate = state.public_details_candidate_at(observed_at).unwrap();
-        assert!(candidate.validate().is_err());
-    }
-
-    #[test]
-    fn shared_graph_current_period_rejects_an_early_owned_row() {
-        let fixture: GraphFixture =
-            serde_json::from_str(include_str!("../tests/fixtures/graph_delayed_quota.json"))
-                .expect("valid shared graph fixture");
-        let mut state = state_from_graph_fixture(&fixture);
-        let quota = &fixture.details_response.quota;
-        let baseline = state
-            .public_details_candidate_at(fixture.details_response.observed_at)
-            .unwrap();
+        let candidate_v2 = state.public_details_v2_candidate_at(observed_at).unwrap();
+        let candidate_v3 = state.public_details_v3_candidate_at(observed_at).unwrap();
+        assert_eq!(candidate_v2.to_v1_projection(), candidate);
+        assert!(!candidate.history_samples.iter().any(|sample| {
+            sample.reset_at == canonical_reset && sample.timestamp == early_timestamp
+        }));
+        assert!(candidate.history_samples.iter().any(|sample| {
+            sample.reset_at == canonical_reset
+                && sample.timestamp == (raw_start + 60).div_euclid(60) * 60
+                && (sample.sol_dollars - 3.0).abs() < f64::EPSILON
+        }));
+        assert_eq!(state.history.samples, retained_raw);
+        candidate.validate().unwrap();
+        candidate_v2.validate().unwrap();
+        candidate_v3.validate().unwrap();
         let mut server =
             ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
                 .unwrap();
         server
             .publisher()
-            .publish_details(baseline.clone())
+            .publish_details_v3(candidate, candidate_v2, candidate_v3)
             .unwrap();
-        let (baseline_pair, baseline_wire) = fetch_service_details(server.local_addr()).unwrap();
-        let computed_start = quota
-            .reset_at
-            .checked_sub(quota.window_seconds)
-            .expect("fixture reset/window fit in i64");
-        state.history.samples.push(UsageHistorySample {
-            timestamp: computed_start - 60,
-            reset_at: quota.reset_at,
-            remaining_percent: 92.0,
-            sol_dollars: 0.0,
-            terra_dollars: 0.0,
-            luna_dollars: 0.0,
-            sol_tokens: 0,
-            terra_tokens: 0,
-            luna_tokens: 0,
-        });
-
-        let raw = state.history.samples_for_reset(Some(quota.reset_at));
-        assert_eq!(
-            raw.len(),
-            fixture.details_response.history_samples.len() + 1
-        );
-        assert_eq!(
-            raw.first().map(|sample| sample.timestamp),
-            Some(computed_start - 60)
-        );
-        let periods = state.history_periods_at(fixture.details_response.observed_at);
-        assert_eq!(periods.len(), 1);
-
-        let details = state
-            .public_details_candidate_at(fixture.details_response.observed_at)
-            .unwrap();
-        assert_eq!(details.history_samples.len(), raw.len());
-        assert!(details.validate().is_err());
-        assert!(server.publisher().publish_details(details).is_err());
-        let (retained_pair, retained_wire) = fetch_service_details(server.local_addr()).unwrap();
-        assert_eq!(retained_pair, baseline_pair);
-        assert_eq!(retained_wire, baseline_wire);
-        let raw_payload: Vec<UsageHistorySample> =
-            serde_json::from_str(&state.history.graph_data_for_reset(quota.reset_at))
-                .expect("raw graph payload remains serializable");
-        assert_eq!(raw_payload.len(), raw.len());
-        assert_eq!(
-            raw_payload.first().map(|sample| sample.timestamp),
-            Some(computed_start - 60)
-        );
         server.shutdown();
     }
 
