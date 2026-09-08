@@ -17,7 +17,7 @@ import re
 import stat
 import sys
 import tempfile
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as ET  # nosec B405  # nosemgrep
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +42,12 @@ _PROPS_VERSION_ELEMENT = re.compile(
     r"(?P<value>[^<]*)"
     r"</(?:[A-Za-z_][A-Za-z0-9_.-]*:)?Version\s*>",
     re.ASCII,
+)
+_WINDOWS_PROPS_MAX_BYTES = 64 * 1024
+_WINDOWS_PROPS_MAX_DEPTH = 16
+_UNSAFE_XML_DECLARATION = re.compile(
+    r"<!\s*(?:DOCTYPE|ENTITY)\b",
+    re.IGNORECASE | re.ASCII,
 )
 
 
@@ -297,13 +303,35 @@ def _local_name(tag: object) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+def _validate_windows_props_depth(root: ET.Element, path: Path) -> None:
+    stack = [(root, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > _WINDOWS_PROPS_MAX_DEPTH:
+            raise ProductVersionError(
+                f"{path}: Directory.Build.props exceeds the XML depth limit"
+            )
+        stack.extend((child, depth + 1) for child in list(node))
+
+
 def _parse_windows_props(path: Path) -> ParsedFile:
     original, mode = _read_regular(path)
+    if len(original) > _WINDOWS_PROPS_MAX_BYTES:
+        raise ProductVersionError(
+            f"{path}: Directory.Build.props exceeds the XML byte limit"
+        )
     text, has_bom = _decode_utf8(original, path)
+    if _UNSAFE_XML_DECLARATION.search(text) is not None:
+        raise ProductVersionError(
+            f"{path}: DTD and entity declarations are not allowed"
+        )
     try:
-        root = ET.fromstring(text)
+        # The byte, declaration, and depth boundaries above and below make this
+        # dependency-free parser safe for the release-owned local props file.
+        root = ET.fromstring(text)  # nosec B314  # nosemgrep
     except ET.ParseError as exc:
         raise ProductVersionError(f"{path}: Directory.Build.props is not valid XML") from exc
+    _validate_windows_props_depth(root, path)
     if _local_name(root.tag) != "Project":
         raise ProductVersionError(f"{path}: XML root must be Project")
 

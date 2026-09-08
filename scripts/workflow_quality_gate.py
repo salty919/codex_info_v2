@@ -10,7 +10,6 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 import tempfile
 import textwrap
 from typing import Mapping, Sequence
@@ -153,7 +152,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         windows_job = _job(windows, "windows-quality")
         rust_job = _job(docs["rust.yml"], "native-quality")
         linux_ui_job = _job(docs["linux-ui-quality.yml"], "linux-ui-quality")
-        linux_distribution_job = _job(linux_distribution, "linux-distribution")
+        _job(linux_distribution, "linux-distribution")
         resolve = _job(release, "resolve")
         publish = _job(release, "publish")
         revalidate = _step(publish, step_id="revalidate")
@@ -1089,7 +1088,7 @@ def _checked_version(cwd: Path) -> str:
     return versions[0]
 
 
-def _new_version_fixture(root: Path, name: str) -> dict[str, Path | str | int]:
+def _new_version_fixture(root: Path, name: str) -> dict[str, object]:
     case_root = root / name
     remote = case_root / "remote.git"
     seed = case_root / "seed"
@@ -1137,9 +1136,29 @@ def _new_version_fixture(root: Path, name: str) -> dict[str, Path | str | int]:
     }
 
 
-def _commit(fixture: dict[str, Path | str | int], message: str) -> str:
-    seed = fixture["seed"]
-    assert isinstance(seed, Path)
+def _fixture_path(fixture: Mapping[str, object], key: str) -> Path:
+    value = fixture.get(key)
+    if not isinstance(value, Path):
+        raise TypeError(f"version fixture {key} must be a Path")
+    return value
+
+
+def _fixture_text(fixture: Mapping[str, object], key: str) -> str:
+    value = fixture.get(key)
+    if not isinstance(value, str):
+        raise TypeError(f"version fixture {key} must be text")
+    return value
+
+
+def _fixture_integer(fixture: Mapping[str, object], key: str) -> int:
+    value = fixture.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"version fixture {key} must be an integer")
+    return value
+
+
+def _commit(fixture: dict[str, object], message: str) -> str:
+    seed = _fixture_path(fixture, "seed")
     _git(seed, "add", ".")
     _git(seed, "commit", "--quiet", "-m", message)
     head = _git(seed, "rev-parse", "HEAD")
@@ -1147,9 +1166,8 @@ def _commit(fixture: dict[str, Path | str | int], message: str) -> str:
     return head
 
 
-def _bump(fixture: dict[str, Path | str | int], expected: str) -> None:
-    seed = fixture["seed"]
-    assert isinstance(seed, Path)
+def _bump(fixture: dict[str, object], expected: str) -> None:
+    seed = _fixture_path(fixture, "seed")
     _command(
         (
             "python3",
@@ -1162,9 +1180,8 @@ def _bump(fixture: dict[str, Path | str | int], expected: str) -> None:
     )
 
 
-def _remote_head(fixture: dict[str, Path | str | int]) -> str:
-    remote = fixture["remote"]
-    assert isinstance(remote, Path)
+def _remote_head(fixture: Mapping[str, object]) -> str:
+    remote = _fixture_path(fixture, "remote")
     return _git(remote, "rev-parse", "refs/heads/case")
 
 
@@ -1287,7 +1304,7 @@ def _current_observer_tests(version_workflow: str) -> int:
 
 
 def _run_version_step(
-    fixture: dict[str, Path | str | int],
+    fixture: dict[str, object],
     script: str,
     head: str,
     *,
@@ -1296,10 +1313,9 @@ def _run_version_step(
     run_attempt: int = 7,
     run_id: int = 12345,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
-    remote = fixture["remote"]
-    base = fixture["base"]
-    counter = fixture["counter"]
-    assert isinstance(remote, Path) and isinstance(base, str) and isinstance(counter, int)
+    remote = _fixture_path(fixture, "remote")
+    base = _fixture_text(fixture, "base")
+    counter = _fixture_integer(fixture, "counter")
     counter += 1
     fixture["counter"] = counter
     runner = remote.parent / f"runner-{counter}"
@@ -1357,7 +1373,7 @@ def _run_version_step(
     return result, _output(output)
 
 
-def _status_calls(fixture: dict[str, Path | str | int]) -> list[list[str]]:
+def _status_calls(fixture: Mapping[str, object]) -> list[list[str]]:
     calls = fixture.get("last_gh_calls", [])
     if not isinstance(calls, list):
         raise TypeError("recorded GitHub calls must be a list")
@@ -1380,8 +1396,7 @@ def _version_state_tests(version_workflow: str) -> int:
         root = Path(raw_root)
 
         fixture = _new_version_fixture(root, "docs")
-        seed = fixture["seed"]
-        assert isinstance(seed, Path)
+        seed = _fixture_path(fixture, "seed")
         (seed / "README.md").write_text("docs\n", encoding="utf-8")
         head = _commit(fixture, "docs")
         result, values = _run_version_step(fixture, script, head)
@@ -1396,9 +1411,9 @@ def _version_state_tests(version_workflow: str) -> int:
         cases += 1
 
         fixture = _new_version_fixture(root, "windows-causal-chain")
-        seed = fixture["seed"]
-        base_version = fixture["version"]
-        assert isinstance(seed, Path) and isinstance(base_version, str)
+        seed = _fixture_path(fixture, "seed")
+        remote = _fixture_path(fixture, "remote")
+        base_version = _fixture_text(fixture, "version")
         (seed / "windows-client/src/App.cs").write_text(
             "windows H0\n", encoding="utf-8"
         )
@@ -1445,8 +1460,8 @@ def _version_state_tests(version_workflow: str) -> int:
             "Codex-Version-Prepare-Run-ID: 12345\n"
             "Codex-Version-Prepare-Run-Attempt: 7"
         )
-        message = _git(fixture["remote"], "show", "-s", "--format=%B", h1)
-        if message != expected_message or _git(fixture["remote"], "rev-parse", f"{h1}^") != h0:
+        message = _git(remote, "show", "-s", "--format=%B", h1)
+        if message != expected_message or _git(remote, "rev-parse", f"{h1}^") != h0:
             raise AssertionError("generated H1 did not atomically retain its H0 run/attempt identity")
         cases += 1
 
@@ -1507,8 +1522,7 @@ def _version_state_tests(version_workflow: str) -> int:
         cases += 1
 
         fixture = _new_version_fixture(root, "linux")
-        seed = fixture["seed"]
-        assert isinstance(seed, Path)
+        seed = _fixture_path(fixture, "seed")
         (seed / "src/lib.rs").write_text("pub fn changed() {}\n", encoding="utf-8")
         h0 = _commit(fixture, "linux")
         result, values = _run_version_step(fixture, script, h0)
@@ -1524,9 +1538,8 @@ def _version_state_tests(version_workflow: str) -> int:
         cases += 1
 
         fixture = _new_version_fixture(root, "manual-next")
-        seed = fixture["seed"]
-        version = fixture["version"]
-        assert isinstance(seed, Path) and isinstance(version, str)
+        seed = _fixture_path(fixture, "seed")
+        version = _fixture_text(fixture, "version")
         (seed / "windows-client/src/App.cs").write_text("manual next\n", encoding="utf-8")
         parent = _commit(fixture, "manual source")
         _bump(fixture, version)
@@ -1550,9 +1563,8 @@ def _version_state_tests(version_workflow: str) -> int:
         cases += 1
 
         fixture = _new_version_fixture(root, "schema-like-manual-next")
-        seed = fixture["seed"]
-        version = fixture["version"]
-        assert isinstance(seed, Path) and isinstance(version, str)
+        seed = _fixture_path(fixture, "seed")
+        version = _fixture_text(fixture, "version")
         (seed / "windows-client/src/App.cs").write_text(
             "schema-like manual next\n", encoding="utf-8"
         )
@@ -1582,9 +1594,8 @@ def _version_state_tests(version_workflow: str) -> int:
         cases += 1
 
         fixture = _new_version_fixture(root, "nonbinary-version")
-        seed = fixture["seed"]
-        version = fixture["version"]
-        assert isinstance(seed, Path) and isinstance(version, str)
+        seed = _fixture_path(fixture, "seed")
+        version = _fixture_text(fixture, "version")
         (seed / "README.md").write_text("docs then version\n", encoding="utf-8")
         _commit(fixture, "docs")
         _bump(fixture, version)
@@ -1595,9 +1606,8 @@ def _version_state_tests(version_workflow: str) -> int:
         cases += 1
 
         fixture = _new_version_fixture(root, "wrong-version")
-        seed = fixture["seed"]
-        version = fixture["version"]
-        assert isinstance(seed, Path) and isinstance(version, str)
+        seed = _fixture_path(fixture, "seed")
+        version = _fixture_text(fixture, "version")
         (seed / "windows-client/src/App.cs").write_text("wrong version\n", encoding="utf-8")
         _bump(fixture, version)
         next_version = _checked_version(seed)
@@ -1609,8 +1619,7 @@ def _version_state_tests(version_workflow: str) -> int:
         cases += 1
 
         fixture = _new_version_fixture(root, "unknown")
-        seed = fixture["seed"]
-        assert isinstance(seed, Path)
+        seed = _fixture_path(fixture, "seed")
         (seed / "future").mkdir()
         (seed / "future/unknown.bin").write_bytes(b"unknown")
         head = _commit(fixture, "unknown")
@@ -1620,10 +1629,9 @@ def _version_state_tests(version_workflow: str) -> int:
         cases += 1
 
         fixture = _new_version_fixture(root, "empty")
-        seed = fixture["seed"]
-        remote = fixture["remote"]
-        base = fixture["base"]
-        assert isinstance(seed, Path) and isinstance(remote, Path) and isinstance(base, str)
+        seed = _fixture_path(fixture, "seed")
+        remote = _fixture_path(fixture, "remote")
+        base = _fixture_text(fixture, "base")
         _git(seed, "push", "--quiet", "origin", "main:case")
         result, _ = _run_version_step(fixture, script, base)
         if result.returncode == 0:
@@ -1631,8 +1639,7 @@ def _version_state_tests(version_workflow: str) -> int:
         cases += 1
 
         fixture = _new_version_fixture(root, "head-race")
-        seed = fixture["seed"]
-        assert isinstance(seed, Path)
+        seed = _fixture_path(fixture, "seed")
         (seed / "windows-client/src/App.cs").write_text("event head\n", encoding="utf-8")
         event_head = _commit(fixture, "event head")
         (seed / "README.md").write_text("concurrent head\n", encoding="utf-8")

@@ -53,7 +53,17 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         new("local", Texts.LocalTimeZone),
         new("UTC", Texts.UtcTimeZone),
     ];
-    public string SelectedTimeZoneId { get => selectedTimeZoneId; set { if (selectedTimeZoneId == value) return; selectedTimeZoneId = value; Notify(); Notify(nameof(SelectedTimeZone)); } }
+    public string SelectedTimeZoneId
+    {
+        get => selectedTimeZoneId;
+        set
+        {
+            if (selectedTimeZoneId == value) return;
+            selectedTimeZoneId = value;
+            Notify();
+            Notify(nameof(SelectedTimeZone));
+        }
+    }
     public string SelectedTimeZone => selectedTimeZoneId == "UTC" ? Texts.UtcTimeZone : Texts.LocalTimeZone;
     public string CurrentEndpoint => Texts.ConnectionEndpoint;
     public string StatusTitle => main?.StatusTitle ?? Texts.Unavailable;
@@ -254,8 +264,35 @@ public sealed class SetupViewModel : INotifyPropertyChanged, IDisposable
             Notify();
         }
     }
-    public string SshUser { get => sshUser; set { if (sshUser == value) return; sshUser = value; sshLaunchFailed = false; Notify(); Notify(nameof(SshCommand)); Notify(nameof(CanStartSsh)); Notify(nameof(SshStatusText)); } }
-    public string SshHost { get => sshHost; set { if (sshHost == value) return; sshHost = value; sshLaunchFailed = false; Notify(); Notify(nameof(SshCommand)); Notify(nameof(CanStartSsh)); Notify(nameof(SshStatusText)); } }
+    public string SshUser
+    {
+        get => sshUser;
+        set
+        {
+            if (sshUser == value) return;
+            sshUser = value;
+            sshLaunchFailed = false;
+            Notify();
+            Notify(nameof(SshCommand));
+            Notify(nameof(CanStartSsh));
+            Notify(nameof(SshStatusText));
+        }
+    }
+
+    public string SshHost
+    {
+        get => sshHost;
+        set
+        {
+            if (sshHost == value) return;
+            sshHost = value;
+            sshLaunchFailed = false;
+            Notify();
+            Notify(nameof(SshCommand));
+            Notify(nameof(CanStartSsh));
+            Notify(nameof(SshStatusText));
+        }
+    }
     public bool SshRunning => sshProcess is { HasExited: false };
     public bool CanStartSsh => IsSafeSshHost(SshHost) && (string.IsNullOrWhiteSpace(SshUser) || IsSafeSshUser(SshUser));
     public string SshActionText => SshRunning ? Texts.SshStop : Texts.SshStart;
