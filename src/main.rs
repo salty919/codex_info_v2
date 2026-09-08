@@ -9464,6 +9464,13 @@ impl PendingRecorderBatch {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct StagedServiceCurrentBundle {
+    pair: String,
+    current: PublicDetailsV3,
+    active_threads: Vec<ActiveThread>,
+}
+
 struct CodexInfoState {
     i18n: I18n,
     bridge: AppServerBridge<AccountCommand, Event>,
@@ -9561,6 +9568,11 @@ struct CodexInfoState {
     service_current_pair: Option<String>,
     service_current_last_poll: Instant,
     service_current_force_poll: bool,
+    /// A positive current generation was read, but its same-generation
+    /// threads resource was not admitted. While set, force requests and
+    /// independent thread polls cannot bypass the ten-second unconditional
+    /// current retry.
+    service_current_bundle_retry_pending: bool,
     service_split_capable: bool,
     service_history_periods: Vec<PublicHistoryPeriod>,
     service_history_periods_pair: Option<String>,
@@ -9576,6 +9588,89 @@ struct CodexInfoState {
     service_threads_force_poll: bool,
     service_threads_error: Option<String>,
     acknowledged_recorder_commit: Option<AcknowledgedRecorderCommit>,
+}
+
+fn stage_service_current_bundle(
+    previous_pair: Option<&str>,
+    published_pair: String,
+    current: PublicDetailsV3,
+    threads_resource: Option<(Option<u64>, Vec<PublicThread>)>,
+) -> Result<Option<StagedServiceCurrentBundle>, String> {
+    if !published_pair_is_fresh(previous_pair, &published_pair)? {
+        return Ok(None);
+    }
+    current.validate().map_err(|error| error.to_string())?;
+    if !current.authenticated
+        && (current.quota.is_some()
+            || !current.models.is_empty()
+            || current.active_thread_count != 0)
+    {
+        return Err("unauthenticated current contains visible account data".into());
+    }
+    if current.state == PublicState::Ready
+        && (!current.authenticated || current.observed_at.is_none())
+    {
+        return Err("ready current is incomplete".into());
+    }
+
+    let public_threads = match (current.active_thread_count, threads_resource) {
+        (0, None) => Vec::new(),
+        (0, Some(_)) => {
+            return Err("zero-thread current must not materialize the threads resource".into());
+        }
+        (_, None) => {
+            return Err("positive current requires the same-generation threads resource".into());
+        }
+        (expected, Some((response_count, threads))) => {
+            if response_count.is_some_and(|count| count != threads.len() as u64)
+                || expected != threads.len() as u64
+            {
+                return Err("threads count does not match current resource".into());
+            }
+            threads
+        }
+    };
+
+    let mut validation = current.clone();
+    validation.threads = public_threads.clone();
+    validation.validate().map_err(|error| error.to_string())?;
+    let topology = public_threads
+        .iter()
+        .map(|thread| ThreadTopologyNode {
+            id: thread.id.as_str(),
+            parent_thread_id: thread.parent_thread_id.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    thread_contract::validate_selected_thread_topology(&topology)
+        .map_err(|_| "threads topology is invalid".to_owned())?;
+    let active_threads = public_threads
+        .iter()
+        .map(|thread| ActiveThread {
+            id: thread.id.clone(),
+            created_at: thread.created_at,
+            updated_at: thread
+                .last_user_message_at
+                .or(thread.created_at)
+                .or(current.observed_at)
+                .unwrap_or(1),
+            title: thread.title.clone(),
+            model: thread.model.clone(),
+            model_label: thread.model_label.clone(),
+            total_tokens: thread.total_tokens,
+            context_usage_tokens: thread.context_usage_tokens,
+            context_window_tokens: thread.context_window_tokens,
+            last_user_message_at: thread.last_user_message_at,
+            is_subagent: thread.is_subagent,
+            parent_thread_id: thread.parent_thread_id.clone(),
+            depth: thread.depth,
+        })
+        .collect();
+
+    Ok(Some(StagedServiceCurrentBundle {
+        pair: published_pair,
+        current,
+        active_threads,
+    }))
 }
 
 fn local_account_authority_matches(
@@ -10173,6 +10268,7 @@ impl CodexInfoState {
             service_current_pair: None,
             service_current_last_poll: resident_now,
             service_current_force_poll: false,
+            service_current_bundle_retry_pending: false,
             service_split_capable: false,
             service_history_periods: Vec::new(),
             service_history_periods_pair: None,
@@ -10267,6 +10363,7 @@ impl CodexInfoState {
                 .checked_sub(Duration::from_secs(10))
                 .unwrap_or(service_now),
             service_current_force_poll: true,
+            service_current_bundle_retry_pending: false,
             service_split_capable: false,
             service_history_periods: Vec::new(),
             service_history_periods_pair: None,
@@ -10385,6 +10482,7 @@ impl CodexInfoState {
             service_current_pair: None,
             service_current_last_poll: resident_now,
             service_current_force_poll: false,
+            service_current_bundle_retry_pending: false,
             service_split_capable: false,
             service_history_periods: Vec::new(),
             service_history_periods_pair: None,
@@ -11052,6 +11150,7 @@ impl CodexInfoState {
         .into();
         self.service_endpoint_error = None;
         self.service_published_pair = Some(published_pair);
+        self.service_current_bundle_retry_pending = false;
         Ok(true)
     }
 
@@ -11193,6 +11292,7 @@ impl CodexInfoState {
         self.service_history_error = None;
         self.service_threads_pair = None;
         self.service_threads_error = None;
+        self.service_current_bundle_retry_pending = false;
         Ok(true)
     }
 
@@ -11201,28 +11301,58 @@ impl CodexInfoState {
         published_pair: String,
         current: PublicDetailsV3,
     ) -> Result<bool, String> {
+        let Some(staged) = stage_service_current_bundle(
+            self.service_current_pair
+                .as_deref()
+                .or(self.service_published_pair.as_deref()),
+            published_pair,
+            current,
+            None,
+        )?
+        else {
+            return Ok(false);
+        };
+        Ok(self.commit_service_current_bundle(staged))
+    }
+
+    fn apply_service_current_bundle(
+        &mut self,
+        published_pair: String,
+        current: PublicDetailsV3,
+        active_thread_count: Option<u64>,
+        threads: Vec<PublicThread>,
+    ) -> Result<bool, String> {
+        let Some(staged) = stage_service_current_bundle(
+            self.service_current_pair
+                .as_deref()
+                .or(self.service_published_pair.as_deref()),
+            published_pair,
+            current,
+            Some((active_thread_count, threads)),
+        )?
+        else {
+            return Ok(false);
+        };
+        Ok(self.commit_service_current_bundle(staged))
+    }
+
+    /// Commit a bundle that has already passed every fallible generation,
+    /// count, public-document, and topology check. Keeping this body
+    /// infallible prevents Main from ever observing a new current count with
+    /// old or empty per-model rows.
+    fn commit_service_current_bundle(&mut self, staged: StagedServiceCurrentBundle) -> bool {
+        let StagedServiceCurrentBundle {
+            pair: published_pair,
+            current,
+            active_threads,
+        } = staged;
         let previous_pair = self
             .service_current_pair
             .as_deref()
             .or(self.service_published_pair.as_deref());
-        if !published_pair_is_fresh(previous_pair, &published_pair)? {
-            return Ok(false);
-        }
-        current.validate().map_err(|error| error.to_string())?;
-        if !current.authenticated
-            && (current.quota.is_some()
-                || !current.models.is_empty()
-                || current.active_thread_count != 0)
-        {
-            return Err("unauthenticated current contains visible account data".into());
-        }
-        if current.state == PublicState::Ready
-            && (!current.authenticated || current.observed_at.is_none())
-        {
-            return Err("ready current is incomplete".into());
-        }
         let pair_changed = previous_pair != Some(published_pair.as_str());
         let previous_snapshot = self.service_current_snapshot.clone();
+        let previous_threads = self.active_threads.clone();
         if pair_changed {
             // The graph and thread resources are independent views, but a
             // cursor from the preceding pair may be used for the next graph
@@ -11249,7 +11379,6 @@ impl CodexInfoState {
                 self.service_history_period_id = None;
                 self.service_history_cursor = None;
             }
-            self.active_threads.clear();
             // Period metadata is a split resource. Fetch it immediately for
             // the new pair instead of presenting the empty current root as
             // "履歴なし" until the normal polling interval elapses.
@@ -11318,9 +11447,19 @@ impl CodexInfoState {
         self.service_v3_published_pair = Some(published_pair.clone());
         self.service_current_snapshot = Some(current.clone());
         self.service_current_active_thread_count = Some(current.active_thread_count);
-        self.service_current_pair = Some(published_pair);
+        self.service_current_pair = Some(published_pair.clone());
         self.service_split_capable = true;
-        Ok(pair_changed || previous_snapshot.as_ref() != Some(&current))
+        self.active_threads = active_threads;
+        self.thread_error = false;
+        self.thread_checking = false;
+        self.service_threads_pair = Some(published_pair);
+        self.service_threads_force_poll = false;
+        self.service_threads_error = None;
+        self.service_current_bundle_retry_pending = false;
+        self.refresh_partial_failure_status();
+        pair_changed
+            || previous_snapshot.as_ref() != Some(&current)
+            || previous_threads != self.active_threads
     }
 
     fn apply_service_history_resource(
@@ -11804,6 +11943,7 @@ impl CodexInfoState {
         self.service_current_pair = None;
         self.service_current_last_poll = Instant::now();
         self.service_current_force_poll = false;
+        self.service_current_bundle_retry_pending = false;
         self.service_split_capable = false;
         self.service_history_periods.clear();
         self.service_history_periods_pair = None;
@@ -13547,7 +13687,14 @@ fn active_thread_model_counts(threads: &[ActiveThread]) -> String {
     if threads.is_empty() {
         return String::new();
     }
-    let [sol, terra, luna, astra, other] = active_thread_model_count_values(threads);
+    let ActiveThreadSummary {
+        sol,
+        terra,
+        luna,
+        astra,
+        other,
+        ..
+    } = active_thread_summary(threads);
     if astra > 0 {
         format!("SOL {sol}  TERRA {terra}  LUNA {luna}  ASTRA {astra}  その他 {other}")
     } else {
@@ -13555,28 +13702,35 @@ fn active_thread_model_counts(threads: &[ActiveThread]) -> String {
     }
 }
 
-fn active_thread_model_count_values(threads: &[ActiveThread]) -> [i32; 5] {
-    let mut sol = 0usize;
-    let mut terra = 0usize;
-    let mut luna = 0usize;
-    let mut astra = 0usize;
-    let mut other = 0usize;
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ActiveThreadSummary {
+    total: i32,
+    sol: i32,
+    terra: i32,
+    luna: i32,
+    astra: i32,
+    other: i32,
+}
+
+fn active_thread_summary(threads: &[ActiveThread]) -> ActiveThreadSummary {
+    let mut summary = ActiveThreadSummary::default();
     for thread in threads {
-        match classify_active_thread_model(&thread.model_label) {
-            "SOL" => sol += 1,
-            "TERRA" => terra += 1,
-            "LUNA" => luna += 1,
-            "ASTRA" => astra += 1,
-            _ => other += 1,
-        }
+        let bucket = match classify_active_thread_model(&thread.model_label) {
+            "SOL" => &mut summary.sol,
+            "TERRA" => &mut summary.terra,
+            "LUNA" => &mut summary.luna,
+            "ASTRA" => &mut summary.astra,
+            _ => &mut summary.other,
+        };
+        *bucket = bucket.saturating_add(1);
     }
-    [
-        i32::try_from(sol).unwrap_or(i32::MAX),
-        i32::try_from(terra).unwrap_or(i32::MAX),
-        i32::try_from(luna).unwrap_or(i32::MAX),
-        i32::try_from(astra).unwrap_or(i32::MAX),
-        i32::try_from(other).unwrap_or(i32::MAX),
-    ]
+    summary.total = summary
+        .sol
+        .saturating_add(summary.terra)
+        .saturating_add(summary.luna)
+        .saturating_add(summary.astra)
+        .saturating_add(summary.other);
+    summary
 }
 
 #[cfg(test)]
@@ -14328,24 +14482,24 @@ impl CodexInfoState {
         } else {
             0.0
         });
-        let active_thread_count = self
-            .service_current_active_thread_count
-            .unwrap_or(self.active_threads.len() as u64);
-        if active_thread_count > 0 {
+        // Main is one presentation projection over one admitted row set. The
+        // wire count remains an admission check, never a second UI authority.
+        let thread_summary = active_thread_summary(&self.active_threads);
+        if thread_summary.total > 0 {
             ui.set_has_active_thread(true);
-            ui.set_active_thread_count(i32::try_from(active_thread_count).unwrap_or(i32::MAX));
+            ui.set_active_thread_count(thread_summary.total);
             ui.set_active_thread_count_label(
                 self.i18n
-                    .format_thread_count(usize::try_from(active_thread_count).unwrap_or(usize::MAX))
+                    .format_thread_count(
+                        usize::try_from(thread_summary.total).unwrap_or(usize::MAX),
+                    )
                     .into(),
             );
-            let [sol, terra, luna, astra, other] =
-                active_thread_model_count_values(&self.active_threads);
-            ui.set_active_thread_sol_count(sol);
-            ui.set_active_thread_terra_count(terra);
-            ui.set_active_thread_luna_count(luna);
-            ui.set_active_thread_astra_count(astra);
-            ui.set_active_thread_other_count(other);
+            ui.set_active_thread_sol_count(thread_summary.sol);
+            ui.set_active_thread_terra_count(thread_summary.terra);
+            ui.set_active_thread_luna_count(thread_summary.luna);
+            ui.set_active_thread_astra_count(thread_summary.astra);
+            ui.set_active_thread_other_count(thread_summary.other);
         } else {
             ui.set_has_active_thread(false);
             ui.set_active_thread_count(0);
@@ -16584,31 +16738,90 @@ fn merge_service_history_samples(
     Ok(rows.into_values().collect())
 }
 
-fn poll_service_current_resources(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
-    let now = Instant::now();
-    if !service_poll_due(
-        state.service_current_last_poll,
-        state.service_current_force_poll,
-        SERVICE_CURRENT_POLL_INTERVAL,
-        now,
-    ) {
-        return;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceCurrentPollOutcome {
+    NotDue,
+    Success,
+    Failure,
+}
+
+fn poll_service_current_resources_with<F>(
+    state: &mut CodexInfoState,
+    now: Instant,
+    mut request: F,
+) -> ServiceCurrentPollOutcome
+where
+    F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
+{
+    let retry_pending = state.service_current_bundle_retry_pending;
+    let retry_due = now >= state.service_current_last_poll
+        && now.duration_since(state.service_current_last_poll) >= SERVICE_CURRENT_POLL_INTERVAL;
+    if (retry_pending && !retry_due)
+        || (!retry_pending
+            && !service_poll_due(
+                state.service_current_last_poll,
+                state.service_current_force_poll,
+                SERVICE_CURRENT_POLL_INTERVAL,
+                now,
+            ))
+    {
+        return ServiceCurrentPollOutcome::NotDue;
     }
     state.service_current_last_poll = now;
     state.service_current_force_poll = false;
-    let previous_pair = state
-        .service_current_pair
-        .as_deref()
-        .or(state.service_published_pair.as_deref());
+    let previous_pair = (!retry_pending)
+        .then(|| {
+            state
+                .service_current_pair
+                .as_deref()
+                .or(state.service_published_pair.as_deref())
+                .map(str::to_owned)
+        })
+        .flatten();
     let fetched = fetch_service_current_v3_with_etag(
-        |route, if_none_match| {
-            request_service_details_with_etag(service_endpoint, route, if_none_match)
-        },
-        previous_pair,
+        |route, if_none_match| request(route, if_none_match),
+        previous_pair.as_deref(),
     );
+    let mut positive_bundle_attempted = false;
     let result = fetched.and_then(|result| match result {
         ServiceCurrentV3Fetch::Fresh { pair, current } => {
-            state.apply_service_current_v3(pair, current)
+            let fresh = published_pair_is_fresh(
+                state
+                    .service_current_pair
+                    .as_deref()
+                    .or(state.service_published_pair.as_deref()),
+                &pair,
+            )?;
+            if !fresh {
+                if retry_pending {
+                    return Err("bundle retry current did not advance last-good generation".into());
+                }
+                return Ok(false);
+            }
+            let changed = if current.active_thread_count == 0 {
+                state.apply_service_current_v3(pair, current)?
+            } else {
+                positive_bundle_attempted = true;
+                let threads = fetch_service_threads_with_etag(
+                    |route, if_none_match| request(route, if_none_match),
+                    None,
+                )?;
+                let ServiceResourceFetch::Fresh {
+                    pair: threads_pair,
+                    value: (active_thread_count, threads),
+                } = threads
+                else {
+                    return Err(
+                        "not-modified threads cannot complete a fresh current bundle".into(),
+                    );
+                };
+                if threads_pair != pair {
+                    return Err("threads generation differs from current".into());
+                }
+                state.apply_service_current_bundle(pair, current, active_thread_count, threads)?
+            };
+            state.service_threads_last_poll = now;
+            Ok(changed)
         }
         ServiceCurrentV3Fetch::Legacy(legacy) => match legacy {
             ServiceDetailsV3Fetch::Fresh {
@@ -16619,9 +16832,17 @@ fn poll_service_current_resources(state: &mut CodexInfoState, service_endpoint: 
                 if !from_v3 {
                     state.service_v3_published_pair = None;
                 }
-                state.apply_service_details_v3(pair, details)
+                let changed = state.apply_service_details_v3(pair, details)?;
+                if retry_pending && !changed {
+                    return Err("bundle retry legacy root did not advance generation".into());
+                }
+                state.service_threads_last_poll = now;
+                Ok(changed)
             }
             ServiceDetailsV3Fetch::NotModified { pair } => {
+                if retry_pending {
+                    return Err("bundle retry received a cacheless legacy 304".into());
+                }
                 if state.service_v3_published_pair.as_deref() != Some(pair.as_str())
                     || state.service_current_pair.as_deref() != Some(pair.as_str())
                 {
@@ -16631,6 +16852,9 @@ fn poll_service_current_resources(state: &mut CodexInfoState, service_endpoint: 
             }
         },
         ServiceCurrentV3Fetch::NotModified { pair } => {
+            if retry_pending {
+                return Err("bundle retry received a cacheless current 304".into());
+            }
             if state.service_current_pair.as_deref() != Some(pair.as_str()) {
                 return Err("not-modified current response does not match last root".into());
             }
@@ -16645,12 +16869,37 @@ fn poll_service_current_resources(state: &mut CodexInfoState, service_endpoint: 
         Ok(_) => {
             state.service_endpoint_error = None;
             state.last_poll = now;
+            ServiceCurrentPollOutcome::Success
         }
         Err(error) => {
             debug_runtime(format!("service current read failed: {error}"));
-            state.hold_service_endpoint_error(error);
+            if retry_pending || positive_bundle_attempted {
+                state.service_current_bundle_retry_pending = true;
+                if state.service_threads_error.is_none() {
+                    state.service_threads_error = Some(error.clone());
+                }
+                state.thread_error = true;
+                state.refresh_partial_failure_status();
+                if state.service_endpoint_error.is_none() {
+                    state.hold_service_endpoint_error(error);
+                } else {
+                    state.checking = false;
+                }
+            } else {
+                state.hold_service_endpoint_error(error);
+            }
+            ServiceCurrentPollOutcome::Failure
         }
     }
+}
+
+fn poll_service_current_resources(
+    state: &mut CodexInfoState,
+    service_endpoint: SocketAddr,
+) -> ServiceCurrentPollOutcome {
+    poll_service_current_resources_with(state, Instant::now(), |route, if_none_match| {
+        request_service_details_with_etag(service_endpoint, route, if_none_match)
+    })
 }
 
 fn poll_service_graph_resources(
@@ -16851,8 +17100,13 @@ fn poll_service_graph_resources(
     }
 }
 
-fn poll_service_threads_resources(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
-    let now = Instant::now();
+fn poll_service_threads_resources_with<F>(state: &mut CodexInfoState, now: Instant, mut request: F)
+where
+    F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
+{
+    if state.service_current_bundle_retry_pending {
+        return;
+    }
     if !service_poll_due(
         state.service_threads_last_poll,
         state.service_threads_force_poll,
@@ -16872,9 +17126,7 @@ fn poll_service_threads_resources(state: &mut CodexInfoState, service_endpoint: 
         .clone()
         .filter(|pair| pair == &current_pair);
     let result = fetch_service_threads_with_etag(
-        |route, if_none_match| {
-            request_service_details_with_etag(service_endpoint, route, if_none_match)
-        },
+        |route, if_none_match| request(route, if_none_match),
         previous_pair.as_deref(),
     )
     .and_then(|result| match result {
@@ -16896,6 +17148,12 @@ fn poll_service_threads_resources(state: &mut CodexInfoState, service_endpoint: 
         state.thread_error = true;
         state.refresh_partial_failure_status();
     }
+}
+
+fn poll_service_threads_resources(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
+    poll_service_threads_resources_with(state, Instant::now(), |route, if_none_match| {
+        request_service_details_with_etag(service_endpoint, route, if_none_match)
+    });
 }
 
 fn run_ui_service_timer_cycle_with_windows(
@@ -16920,6 +17178,24 @@ fn run_ui_service_timer_cycle_with_owner_check(
     threads_open: bool,
     owner_is_healthy: impl FnOnce(SocketAddr) -> bool,
 ) {
+    run_ui_service_timer_cycle_with_owner_check_and_current_poll(
+        state,
+        service_endpoint,
+        graph_open,
+        threads_open,
+        owner_is_healthy,
+        poll_service_current_resources,
+    );
+}
+
+fn run_ui_service_timer_cycle_with_owner_check_and_current_poll(
+    state: &mut CodexInfoState,
+    service_endpoint: SocketAddr,
+    graph_open: bool,
+    threads_open: bool,
+    owner_is_healthy: impl FnOnce(SocketAddr) -> bool,
+    poll_current: impl FnOnce(&mut CodexInfoState, SocketAddr) -> ServiceCurrentPollOutcome,
+) {
     state.poll_auth_control();
     if !owner_is_healthy(service_endpoint) {
         debug_runtime("service owner validation failed");
@@ -16935,7 +17211,12 @@ fn run_ui_service_timer_cycle_with_owner_check(
         state.service_owner_probe_failed = false;
         state.service_current_force_poll = true;
     }
-    poll_service_current_resources(state, service_endpoint);
+    let current_outcome = poll_current(state, service_endpoint);
+    if current_outcome == ServiceCurrentPollOutcome::Failure
+        || state.service_current_bundle_retry_pending
+    {
+        return;
+    }
     poll_service_graph_resources(state, service_endpoint, graph_open);
     if threads_open {
         poll_service_threads_resources(state, service_endpoint);
@@ -18507,6 +18788,53 @@ mod tests {
         }
     }
 
+    fn split_current_fixture() -> (PublicDetailsV3, Vec<super::PublicThread>) {
+        let mut current = CodexInfoState::preview("normal")
+            .public_details_v3_candidate()
+            .expect("preview produces a public v3 fixture");
+        let threads = current.threads.clone();
+        current.history_periods.clear();
+        current.history_samples.clear();
+        current.history_gaps.clear();
+        current.threads.clear();
+        (current, threads)
+    }
+
+    fn split_current_body(current: &PublicDetailsV3) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "api_version": "v3",
+            "state": current.state,
+            "observed_at": current.observed_at,
+            "authenticated": current.authenticated,
+            "plan_label": current.plan_label,
+            "quota": current.quota,
+            "models": current.models,
+            "active_thread_count": current.active_thread_count,
+        }))
+        .expect("current fixture serializes")
+    }
+
+    fn split_threads_body(threads: &[super::PublicThread]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "api_version": "v3",
+            "threads": threads,
+        }))
+        .expect("threads fixture serializes")
+    }
+
+    fn published_pair(epoch: u128, counter: u128) -> String {
+        format!("v1:{epoch:032x}{counter:032x}")
+    }
+
+    fn seeded_split_service_client(pair: &str) -> CodexInfoState {
+        let (current, threads) = split_current_fixture();
+        let mut state = CodexInfoState::service_client();
+        state
+            .apply_service_current_bundle(pair.to_owned(), current, None, threads)
+            .expect("same-generation current and threads fixture is admitted");
+        state
+    }
+
     fn assert_public_thread_matches(active: &ActiveThread, public: &super::PublicThread) {
         assert_eq!(public.id, active.id);
         assert_eq!(public.title, active.title);
@@ -19497,6 +19825,7 @@ mod tests {
         current.history_samples.clear();
         current.history_gaps.clear();
         current.threads.clear();
+        current.active_thread_count = 0;
         let pair = format!("v1:{:032x}{:032x}", 1_u128, 1_u128);
         let wrong_pair = format!("v1:{:032x}{:032x}", 1_u128, 2_u128);
         let mut client = CodexInfoState::service_client();
@@ -19533,6 +19862,7 @@ mod tests {
         current.history_samples.clear();
         current.history_gaps.clear();
         current.threads.clear();
+        current.active_thread_count = 0;
         let pair = format!("v1:{:032x}{:032x}", 3_u128, 1_u128);
         let mut client = CodexInfoState::service_client();
         client
@@ -28982,6 +29312,479 @@ mod tests {
                 ("/v2/details".into(), None),
                 ("/v1/details".into(), None),
             ]
+        );
+    }
+
+    #[test]
+    fn linux_positive_current_commits_one_same_generation_thread_summary() {
+        let (current, threads) = split_current_fixture();
+        let pair = published_pair(7, 1);
+        let current_body = split_current_body(&current);
+        let threads_body = split_threads_body(&threads);
+        let now = Instant::now();
+        let mut state = CodexInfoState::service_client();
+        state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
+        let mut requests = Vec::new();
+
+        let outcome = super::poll_service_current_resources_with(&mut state, now, |route, etag| {
+            requests.push((route.to_owned(), etag.map(str::to_owned)));
+            Ok(match route {
+                "/v3/current" => super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: Some(pair.clone()),
+                    body: current_body.clone(),
+                },
+                "/v3/threads" => super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: Some(pair.clone()),
+                    body: threads_body.clone(),
+                },
+                _ => panic!("unexpected bundle route: {route}"),
+            })
+        });
+
+        assert_eq!(outcome, super::ServiceCurrentPollOutcome::Success);
+        assert_eq!(
+            requests,
+            [("/v3/current".into(), None), ("/v3/threads".into(), None)]
+        );
+        assert_eq!(state.service_current_pair.as_deref(), Some(pair.as_str()));
+        assert_eq!(state.service_threads_pair.as_deref(), Some(pair.as_str()));
+        assert_eq!(state.service_current_active_thread_count, Some(1));
+        assert_eq!(
+            super::active_thread_summary(&state.active_threads),
+            super::ActiveThreadSummary {
+                total: 1,
+                sol: 1,
+                terra: 0,
+                luna: 0,
+                astra: 0,
+                other: 0,
+            }
+        );
+        assert!(!state.service_current_bundle_retry_pending);
+        assert!(!state.thread_error);
+
+        let mut duplicate_threads_request_count = 0;
+        super::poll_service_threads_resources_with(&mut state, now, |_, _| {
+            duplicate_threads_request_count += 1;
+            panic!("a committed bundle owns this thread polling interval")
+        });
+        assert_eq!(duplicate_threads_request_count, 0);
+    }
+
+    #[test]
+    fn linux_zero_current_clears_old_rows_without_requesting_threads() {
+        let old_pair = published_pair(8, 1);
+        let new_pair = published_pair(8, 2);
+        let mut state = seeded_split_service_client(&old_pair);
+        assert_eq!(state.active_threads.len(), 1);
+        let (mut current, _) = split_current_fixture();
+        current.active_thread_count = 0;
+        let current_body = split_current_body(&current);
+        let now = Instant::now();
+        state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
+        let mut requests = Vec::new();
+
+        let outcome = super::poll_service_current_resources_with(&mut state, now, |route, etag| {
+            requests.push((route.to_owned(), etag.map(str::to_owned)));
+            assert_eq!(route, "/v3/current");
+            Ok(super::ServiceDetailsHttpResponse {
+                status: 200,
+                pair: Some(new_pair.clone()),
+                body: current_body.clone(),
+            })
+        });
+
+        assert_eq!(outcome, super::ServiceCurrentPollOutcome::Success);
+        assert_eq!(requests, [("/v3/current".into(), Some(old_pair))]);
+        assert!(state.active_threads.is_empty());
+        assert_eq!(state.service_current_active_thread_count, Some(0));
+        assert_eq!(
+            state.service_current_pair.as_deref(),
+            Some(new_pair.as_str())
+        );
+        assert_eq!(
+            state.service_threads_pair.as_deref(),
+            Some(new_pair.as_str())
+        );
+        assert_eq!(super::active_thread_summary(&state.active_threads).total, 0);
+    }
+
+    #[test]
+    fn linux_positive_bundle_failures_hold_every_last_good_projection() {
+        let old_pair = published_pair(9, 1);
+        let new_pair = published_pair(9, 2);
+        let wrong_pair = published_pair(9, 3);
+        let (current, threads) = split_current_fixture();
+        let current_body = split_current_body(&current);
+        let threads_body = split_threads_body(&threads);
+        let empty_threads_body = split_threads_body(&[]);
+
+        for failure in ["transport", "malformed", "wrong-pair", "count-mismatch"] {
+            let mut state = seeded_split_service_client(&old_pair);
+            let old_snapshot = state.service_current_snapshot.clone();
+            let old_count = state.service_current_active_thread_count;
+            let old_rows = state.active_threads.clone();
+            let old_current_pair = state.service_current_pair.clone();
+            let old_threads_pair = state.service_threads_pair.clone();
+            let old_history = (
+                state.history.samples.clone(),
+                state.history.observations.clone(),
+                state.history_gaps.clone(),
+                state.service_history_samples.clone(),
+                state.service_history_pair.clone(),
+            );
+            let now = Instant::now();
+            state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
+            state.service_history_last_poll = now - super::SERVICE_HISTORY_POLL_INTERVAL;
+            state.service_history_force_poll = true;
+            state.service_threads_last_poll = now - super::SERVICE_THREADS_POLL_INTERVAL;
+            state.service_threads_force_poll = true;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let endpoint = listener.local_addr().unwrap();
+            let mut requests = Vec::new();
+
+            super::run_ui_service_timer_cycle_with_owner_check_and_current_poll(
+                &mut state,
+                endpoint,
+                true,
+                true,
+                |_| true,
+                |state, _| {
+                    super::poll_service_current_resources_with(state, now, |route, etag| {
+                        requests.push((route.to_owned(), etag.map(str::to_owned)));
+                        if route == "/v3/current" {
+                            return Ok(super::ServiceDetailsHttpResponse {
+                                status: 200,
+                                pair: Some(new_pair.clone()),
+                                body: current_body.clone(),
+                            });
+                        }
+                        assert_eq!(route, "/v3/threads");
+                        match failure {
+                            "transport" => Err("fixture threads transport failure".into()),
+                            "malformed" => Ok(super::ServiceDetailsHttpResponse {
+                                status: 200,
+                                pair: Some(new_pair.clone()),
+                                body: b"{".to_vec(),
+                            }),
+                            "wrong-pair" => Ok(super::ServiceDetailsHttpResponse {
+                                status: 200,
+                                pair: Some(wrong_pair.clone()),
+                                body: threads_body.clone(),
+                            }),
+                            "count-mismatch" => Ok(super::ServiceDetailsHttpResponse {
+                                status: 200,
+                                pair: Some(new_pair.clone()),
+                                body: empty_threads_body.clone(),
+                            }),
+                            _ => unreachable!(),
+                        }
+                    })
+                },
+            );
+
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.0.as_str())
+                    .collect::<Vec<_>>(),
+                ["/v3/current", "/v3/threads"],
+                "{failure}"
+            );
+            assert_eq!(state.service_current_snapshot, old_snapshot, "{failure}");
+            assert_eq!(
+                state.service_current_active_thread_count, old_count,
+                "{failure}"
+            );
+            assert_eq!(state.active_threads, old_rows, "{failure}");
+            assert_eq!(state.service_current_pair, old_current_pair, "{failure}");
+            assert_eq!(state.service_threads_pair, old_threads_pair, "{failure}");
+            assert_eq!(
+                (
+                    state.history.samples.clone(),
+                    state.history.observations.clone(),
+                    state.history_gaps.clone(),
+                    state.service_history_samples.clone(),
+                    state.service_history_pair.clone(),
+                ),
+                old_history,
+                "{failure}"
+            );
+            assert!(state.service_current_bundle_retry_pending, "{failure}");
+            assert!(state.service_endpoint_error.is_some(), "{failure}");
+            assert!(state.service_threads_error.is_some(), "{failure}");
+            assert!(state.thread_error, "{failure}");
+            assert!(
+                matches!(
+                    listener.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ),
+                "dependent poll connected after {failure}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_bundle_retry_masks_force_and_threads_until_unconditional_success() {
+        let old_pair = published_pair(10, 1);
+        let new_pair = published_pair(10, 2);
+        let (current, threads) = split_current_fixture();
+        let current_body = split_current_body(&current);
+        let threads_body = split_threads_body(&threads);
+        let now = Instant::now();
+        let mut state = seeded_split_service_client(&old_pair);
+        state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
+        let failed = super::poll_service_current_resources_with(&mut state, now, |route, _| {
+            if route == "/v3/current" {
+                Ok(super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: Some(new_pair.clone()),
+                    body: current_body.clone(),
+                })
+            } else {
+                Err("fixture bundle transport failure".into())
+            }
+        });
+        assert_eq!(failed, super::ServiceCurrentPollOutcome::Failure);
+        let held_endpoint_error = state.service_endpoint_error.clone();
+        let held_threads_error = state.service_threads_error.clone();
+        let held_rows = state.active_threads.clone();
+        let held_history = (
+            state.history.samples.clone(),
+            state.history.observations.clone(),
+            state.history_gaps.clone(),
+            state.service_history_samples.clone(),
+            state.service_history_pair.clone(),
+        );
+
+        state.service_current_force_poll = true;
+        state.service_threads_force_poll = true;
+        state.service_history_force_poll = true;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let mut early_requests = 0;
+        super::run_ui_service_timer_cycle_with_owner_check_and_current_poll(
+            &mut state,
+            endpoint,
+            true,
+            true,
+            |_| true,
+            |state, _| {
+                super::poll_service_current_resources_with(
+                    state,
+                    now + Duration::from_secs(5),
+                    |_, _| {
+                        early_requests += 1;
+                        panic!("retry and force must both remain silent before ten seconds")
+                    },
+                )
+            },
+        );
+        assert_eq!(early_requests, 0);
+        assert_eq!(state.active_threads, held_rows);
+        assert_eq!(
+            (
+                state.history.samples.clone(),
+                state.history.observations.clone(),
+                state.history_gaps.clone(),
+                state.service_history_samples.clone(),
+                state.service_history_pair.clone(),
+            ),
+            held_history
+        );
+        assert_eq!(state.service_endpoint_error, held_endpoint_error);
+        assert_eq!(state.service_threads_error, held_threads_error);
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        let mut retry_requests = Vec::new();
+        let recovered = super::poll_service_current_resources_with(
+            &mut state,
+            now + super::SERVICE_CURRENT_POLL_INTERVAL,
+            |route, etag| {
+                retry_requests.push((route.to_owned(), etag.map(str::to_owned)));
+                assert!(
+                    etag.is_none(),
+                    "bundle retry must bypass conditional caches"
+                );
+                Ok(if route == "/v3/current" {
+                    super::ServiceDetailsHttpResponse {
+                        status: 200,
+                        pair: Some(new_pair.clone()),
+                        body: current_body.clone(),
+                    }
+                } else {
+                    assert_eq!(route, "/v3/threads");
+                    super::ServiceDetailsHttpResponse {
+                        status: 200,
+                        pair: Some(new_pair.clone()),
+                        body: threads_body.clone(),
+                    }
+                })
+            },
+        );
+        assert_eq!(recovered, super::ServiceCurrentPollOutcome::Success);
+        assert_eq!(retry_requests.len(), 2);
+        assert!(!state.service_current_bundle_retry_pending);
+        assert!(state.service_endpoint_error.is_none());
+        assert!(state.service_threads_error.is_none());
+        assert!(!state.thread_error);
+        assert_eq!(
+            state.service_current_pair.as_deref(),
+            Some(new_pair.as_str())
+        );
+        assert_eq!(
+            state.service_threads_pair.as_deref(),
+            Some(new_pair.as_str())
+        );
+    }
+
+    #[test]
+    fn linux_bundle_retry_rejects_cacheless_304_and_keeps_latched_errors() {
+        let old_pair = published_pair(13, 1);
+        let new_pair = published_pair(13, 2);
+        let (current, _) = split_current_fixture();
+        let current_body = split_current_body(&current);
+        let now = Instant::now();
+        let mut state = seeded_split_service_client(&old_pair);
+        state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
+        let failed = super::poll_service_current_resources_with(&mut state, now, |route, _| {
+            if route == "/v3/current" {
+                Ok(super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: Some(new_pair.clone()),
+                    body: current_body.clone(),
+                })
+            } else {
+                Err("fixture bundle transport failure".into())
+            }
+        });
+        assert_eq!(failed, super::ServiceCurrentPollOutcome::Failure);
+        let held_endpoint_error = state.service_endpoint_error.clone();
+        let held_threads_error = state.service_threads_error.clone();
+        let held_rows = state.active_threads.clone();
+
+        let retry = super::poll_service_current_resources_with(
+            &mut state,
+            now + super::SERVICE_CURRENT_POLL_INTERVAL,
+            |route, etag| {
+                assert_eq!(route, "/v3/current");
+                assert!(etag.is_none());
+                Ok(super::ServiceDetailsHttpResponse {
+                    status: 304,
+                    pair: Some(new_pair.clone()),
+                    body: Vec::new(),
+                })
+            },
+        );
+
+        assert_eq!(retry, super::ServiceCurrentPollOutcome::Failure);
+        assert!(state.service_current_bundle_retry_pending);
+        assert_eq!(state.active_threads, held_rows);
+        assert_eq!(
+            state.service_current_pair.as_deref(),
+            Some(old_pair.as_str())
+        );
+        assert_eq!(state.service_endpoint_error, held_endpoint_error);
+        assert_eq!(state.service_threads_error, held_threads_error);
+        assert!(state.thread_error);
+    }
+
+    #[test]
+    fn linux_current_poll_preserves_legacy_and_not_modified_thread_paths() {
+        let legacy_pair = published_pair(11, 1);
+        let mut v1_document =
+            serde_json::to_value(CodexInfoState::preview("normal").public_details()).unwrap();
+        v1_document
+            .as_object_mut()
+            .unwrap()
+            .insert("api_version".into(), Value::String("v1".into()));
+        let v1_body = serde_json::to_vec(&v1_document).unwrap();
+        let now = Instant::now();
+        let mut legacy_state = CodexInfoState::service_client();
+        legacy_state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
+        let mut legacy_routes = Vec::new();
+        let legacy_outcome =
+            super::poll_service_current_resources_with(&mut legacy_state, now, |route, _| {
+                legacy_routes.push(route.to_owned());
+                Ok(match route {
+                    "/v3/current" | "/v3/details" | "/v2/details" => {
+                        super::ServiceDetailsHttpResponse {
+                            status: 404,
+                            pair: None,
+                            body: b"{}".to_vec(),
+                        }
+                    }
+                    "/v1/details" => super::ServiceDetailsHttpResponse {
+                        status: 200,
+                        pair: Some(legacy_pair.clone()),
+                        body: v1_body.clone(),
+                    },
+                    _ => panic!("legacy current requested an unrelated route: {route}"),
+                })
+            });
+        assert_eq!(legacy_outcome, super::ServiceCurrentPollOutcome::Success);
+        assert_eq!(
+            legacy_routes,
+            ["/v3/current", "/v3/details", "/v2/details", "/v1/details"]
+        );
+        assert!(!legacy_routes.iter().any(|route| route == "/v3/threads"));
+
+        let pair = published_pair(12, 1);
+        let mut state = seeded_split_service_client(&pair);
+        state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
+        state.service_threads_last_poll = now - super::SERVICE_THREADS_POLL_INTERVAL;
+        state.service_threads_force_poll = true;
+        let current_outcome =
+            super::poll_service_current_resources_with(&mut state, now, |route, etag| {
+                assert_eq!(route, "/v3/current");
+                assert_eq!(etag, Some(pair.as_str()));
+                Ok(super::ServiceDetailsHttpResponse {
+                    status: 304,
+                    pair: Some(pair.clone()),
+                    body: Vec::new(),
+                })
+            });
+        assert_eq!(current_outcome, super::ServiceCurrentPollOutcome::Success);
+        let mut thread_requests = 0;
+        super::poll_service_threads_resources_with(&mut state, now, |route, etag| {
+            thread_requests += 1;
+            assert_eq!(route, "/v3/threads");
+            assert_eq!(etag, Some(pair.as_str()));
+            Ok(super::ServiceDetailsHttpResponse {
+                status: 304,
+                pair: Some(pair.clone()),
+                body: Vec::new(),
+            })
+        });
+        assert_eq!(thread_requests, 1);
+        assert!(!state.service_current_bundle_retry_pending);
+    }
+
+    #[test]
+    fn main_thread_summary_total_is_the_literal_sum_of_model_buckets() {
+        let state = CodexInfoState::preview("normal");
+        let summary = super::active_thread_summary(&state.active_threads);
+        assert_eq!(
+            [
+                summary.total,
+                summary.sol,
+                summary.terra,
+                summary.luna,
+                summary.astra,
+                summary.other,
+            ],
+            [1, 1, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            summary.total,
+            summary.sol + summary.terra + summary.luna + summary.astra + summary.other
         );
     }
 
