@@ -496,6 +496,10 @@ public sealed class GraphPlotControl : AvaPlot
                     lunaLabel = label; lunaConnector = connector; lunaConnectorX = connectorX; break;
                 case GraphSeries.Astra:
                     astraLabel = label; astraConnector = connector; astraConnectorX = connectorX; break;
+                default:
+                    connector.IsVisible = false;
+                    label.IsVisible = false;
+                    break;
             }
         }
     }

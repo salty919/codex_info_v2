@@ -1892,6 +1892,8 @@ public sealed class MainWindowViewModelTests
                         ? DetailsFetchResult.Success(DetailsSnapshot(2.5, observedAt: 2))
                         : DetailsFetchResult.FromFailure(DetailsFetchFailure.Response));
                     break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, null);
             }
         }
     }
@@ -2012,8 +2014,8 @@ public sealed class MainWindowViewModelTests
     {
         public event EventHandler? Exited
         {
-            add { }
-            remove { }
+            add { _ = value; }
+            remove { _ = value; }
         }
         public bool HasExited { get; private set; }
 

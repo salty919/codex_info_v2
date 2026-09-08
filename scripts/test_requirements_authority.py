@@ -125,7 +125,6 @@ class RequirementAuthorityFixtures(unittest.TestCase):
     def test_duplicate_registry_owner(self) -> None:
         self._write_fixture(
             owners={
-                "PRODUCT": ("docs/PRODUCT_REQUIREMENTS.md", ["PROD-1"]),
                 "PRODUCT": ("docs/OTHER.md", ["OTHER-1"]),
             }
         )

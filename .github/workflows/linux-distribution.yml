@@ -36,7 +36,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.source_sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: x86_64-unknown-linux-gnu
       - name: Install bundle validation tools
