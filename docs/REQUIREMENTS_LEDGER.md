@@ -6,7 +6,7 @@
 | --- | --- | --- | --- | --- |
 | RECORDER-MODEL-01 | DATA | `src/main.rs`、`src/usage_store.rs` | 任意model差分/cache write保存、source単位隔離、旧DB保持、restart/range再適用、ASTRAのみbackfillと旧3モデル既知値を不完全履歴として保持する直接case | implemented |
 | ASTRA-COST-01 | PRODUCT | `src/main.rs`、REST/各UIの価格projection | 指定4単価、cache write二重計上なし、未提供/不整合の未確定表示 | implemented |
-| API-LIFECYCLE-01 | PRODUCT | `src/server.rs`、`docs/REST_API_V1.md`、各client contract adapter | current/periods/selected-history/delta/threadsを同じdomain pairから分離し、prefix証明delta、閉surface request 0、DB/collector非依存、任意model、旧details互換を直接検証 | implemented |
+| API-LIFECYCLE-01 | PRODUCT | `src/server.rs`、`docs/REST_API_V1.md`、各client contract adapter | current/periods/selected-history/delta/threadsを同じdomain pairから分離し、Linux/Windows positive-current＋same-pair threadsのatomic commit、count 0のthreads request 0、合計＝bucket和、失敗後10秒無条件retry中の依存request 0、prefix証明delta、閉surface request 0、DB/collector非依存、任意model、旧details互換を直接検証 | implemented |
 | API-V3-MODELS-01 | WIRE | `src/server.rs`、Linux/Windows v3 current/history client・graph projection | v3 generic model、旧3モデル既知値、ASTRA履歴、route-local 304、same-pair page集合とprefix証明deltaのatomic applyをserver/Linux/Windowsの直接caseで検証 | implemented |
 | API-DEPRECATION-01 | WIRE | v1/v2/v3 details adapter、Linux/Windows fallback | v3 current exact 404時だけv3 details→v2→v1へ遷移し、legacy rootを全surfaceへ投影してsplit request 0、fallbackへ条件headerを送らない直接case | implemented |
 | CUM-138-01 | DATA | `src/main.rs`、`src/usage_store.rs` | durable baseline＋2GiB overflow＋verified tail固定caseでbaseline保持とtail 1回加算 | implemented |
@@ -39,7 +39,7 @@
 | X-START-03 | UX | Linux details client、`src/main.rs::native_startup_loading` | `native_startup_failure_releases_loading_surface`、失敗→回復details test | implemented |
 | X-START-04 | UX | `src/main.rs`、`run.sh`、`scripts/x11_startup_visual_gate.sh` | visible position test、X11可視範囲ゲート、実画面キャプチャ | verified |
 | X-START-05 | UX | `src/main.rs`、`run.sh` | verified-local＋失敗portでの実起動保持と、unsafe-generation/foreign-ownerでUI process 0の有限2-path test | implemented |
-| X-START-06 | UX | `scripts/x11_startup_visual_gate.sh`、`scripts/x11_service_recovery_visual_gate.sh` | 実resident service + isolated app-server fixtureのX11画像で、ready利用枠バー→停止/error保持→同一port復旧/readyを状態別にpixel判定 | implemented |
+| X-START-06 | UX | `scripts/x11_startup_visual_gate.sh`、`scripts/x11_service_recovery_visual_gate.sh` | 実resident service + isolated app-server fixtureのX11画像で、同一pairのcurrent count 1＋SOL thread 1件を`[1,1,0,0,0,0]`の6部品templateで判定し、ready利用枠バー→停止/error保持→同一port復旧/readyを状態別にpixel判定 | implemented |
 | X-THREAD-01 | UX | `src/thread_contract.rs`、`src/main.rs` | `active_thread_adapter_rejects_partial_rollout_fallback`、`multiple_running_threads_are_all_published_with_stable_order`、`recoverable_rollout_parser_skips_malformed_non_state_records_only`、実Codex active-path取得 | implemented |
 | WIN-VERSION-01 | UX | `Cargo.toml`、`Cargo.lock`、`windows-client/Directory.Build.props`、`windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml`、`windows-client/src/CodexInfo.WindowsClient/ViewModels/MainWindowViewModel.cs` | Windows contract gate、実Windows UI Automation | verified |
 | PROC-LAUNCH-01 | PRODUCT | `src/main.rs`、service、record/CLI E2E、REST/data docs | 全受理形・port境界unit test、direct payload mode別実行 | implemented |

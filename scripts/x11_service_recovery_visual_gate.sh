@@ -8,7 +8,7 @@ cd "$root_dir"
 hold() { echo "x11-service-recovery-visual-gate: HOLD: $*" >&2; exit 2; }
 fail() { echo "x11-service-recovery-visual-gate: FAIL: $*" >&2; exit 1; }
 [[ -n "${DISPLAY:-}" ]] || hold 'DISPLAY is unavailable'
-for command in curl python3 xprop xwd xwininfo; do
+for command in cp curl python3 readlink xprop xwd xwininfo; do
     command -v "$command" >/dev/null 2>&1 || hold "$command is unavailable"
 done
 binary="${CODEX_INFO_ACCEPTANCE_BINARY:-$root_dir/target/release/codex_info}"
@@ -26,15 +26,26 @@ case "$temp_root" in
 esac
 service_pid=''
 ui_pid=''
+reference_ui_pid=''
+holder_pid=''
 window_id=''
+reference_window_id=''
 graph_window_id=''
 port=''
 frame="$temp_root/frame.xwd"
 graph_frame="$temp_root/graph.xwd"
 ready_frame="$temp_root/ready.xwd"
 ready_current="$temp_root/ready-current.json"
+ready_threads="$temp_root/ready-threads.json"
+current_headers="$temp_root/ready-current.headers"
+threads_headers="$temp_root/ready-threads.headers"
+reference_frame="$temp_root/thread-summary-reference.xwd"
+thread_reference_dir="$temp_root/thread-summary-reference"
 service_starttime=''
 ui_starttime=''
+reference_ui_starttime=''
+holder_starttime=''
+holder_exe="$temp_root/holder/codex"
 
 proc_starttime() {
     local pid="$1"
@@ -78,6 +89,127 @@ finally:
 PY
 }
 
+write_thread_summary_reference() {
+    local frame_path="$1"
+    mkdir -p "$thread_reference_dir"
+    python3 - "$frame_path" "$thread_reference_dir" <<'PY'
+import pathlib
+import struct
+import sys
+
+data = pathlib.Path(sys.argv[1]).read_bytes()
+target = pathlib.Path(sys.argv[2])
+header = struct.unpack(">25I", data[:100])
+header_size, width, height, bytes_per_line, colors = (
+    header[0], header[4], header[5], header[12], header[19]
+)
+if (width, height) != (900, 480):
+    raise SystemExit(f"unexpected reference image size: {width}x{height}")
+offset = header_size + colors * 12
+stride = bytes_per_line // width
+if stride < 3:
+    raise SystemExit("reference image pixel stride is invalid")
+
+components = {
+    "total": ((50, 264, 126, 288), (86, 178, 245)),
+    "sol": ((182, 268, 258, 290), (245, 247, 251)),
+    "terra": ((270, 268, 354, 290), (245, 247, 251)),
+    "luna": ((366, 268, 442, 290), (245, 247, 251)),
+    "astra": ((454, 268, 538, 290), (245, 247, 251)),
+    "other": ((550, 268, 642, 290), (245, 247, 251)),
+}
+
+def rgb(x, y):
+    index = offset + y * bytes_per_line + x * stride
+    return data[index + 2], data[index + 1], data[index]
+
+for name, (rect, color) in components.items():
+    left, top, right, bottom = rect
+    mask = bytes(
+        int(sum((rgb(x, y)[index] - color[index]) ** 2 for index in range(3)) <= 70 ** 2)
+        for y in range(top, bottom)
+        for x in range(left, right)
+    )
+    foreground = sum(mask)
+    if foreground < 8:
+        raise SystemExit(f"reference {name} component is empty: {foreground}")
+    (target / f"{name}.mask").write_bytes(mask)
+PY
+}
+
+assert_thread_summary_components() {
+    local frame_path="$1"
+    python3 - "$frame_path" "$thread_reference_dir" <<'PY'
+import pathlib
+import struct
+import sys
+
+data = pathlib.Path(sys.argv[1]).read_bytes()
+reference = pathlib.Path(sys.argv[2])
+header = struct.unpack(">25I", data[:100])
+header_size, width, height, bytes_per_line, colors = (
+    header[0], header[4], header[5], header[12], header[19]
+)
+if (width, height) != (900, 480):
+    raise SystemExit(f"unexpected real-service image size: {width}x{height}")
+offset = header_size + colors * 12
+stride = bytes_per_line // width
+if stride < 3:
+    raise SystemExit("real-service image pixel stride is invalid")
+
+components = {
+    "total": ((50, 264, 126, 288), (86, 178, 245)),
+    "sol": ((182, 268, 258, 290), (245, 247, 251)),
+    "terra": ((270, 268, 354, 290), (245, 247, 251)),
+    "luna": ((366, 268, 442, 290), (245, 247, 251)),
+    "astra": ((454, 268, 538, 290), (245, 247, 251)),
+    "other": ((550, 268, 642, 290), (245, 247, 251)),
+}
+
+def rgb(x, y):
+    index = offset + y * bytes_per_line + x * stride
+    return data[index + 2], data[index + 1], data[index]
+
+for name, (rect, color) in components.items():
+    expected_path = reference / f"{name}.mask"
+    if not expected_path.is_file():
+        raise SystemExit(f"missing reference component: {name}")
+    left, top, right, bottom = rect
+    actual = bytes(
+        int(sum((rgb(x, y)[index] - color[index]) ** 2 for index in range(3)) <= 70 ** 2)
+        for y in range(top, bottom)
+        for x in range(left, right)
+    )
+    expected = expected_path.read_bytes()
+    if not expected or sum(expected) < 8 or len(expected) != len(actual):
+        raise SystemExit(f"invalid reference component: {name}")
+    if actual != expected:
+        changed = sum(left != right for left, right in zip(actual, expected))
+        raise SystemExit(f"thread summary component differs: {name}, changed={changed}")
+
+values = [1, 1, 0, 0, 0, 0]
+if sum(values[1:]) != values[0]:
+    raise SystemExit("thread summary fixture invariant is invalid")
+print(f"x11-service-recovery-visual-gate: thread summary PASS {values}")
+PY
+}
+
+assert_threads_window_closed() {
+    local owner_pid="$1" expected_main_window="$2"
+    local candidate candidate_pid candidate_title owned_window_count=0
+    while read -r candidate; do
+        candidate_pid="$(xprop -id "$candidate" _NET_WM_PID 2>/dev/null | awk -F'= ' '{print $2}' | tr -d '[:space:]')"
+        [[ "$candidate_pid" == "$owner_pid" ]] || continue
+        owned_window_count=$((owned_window_count + 1))
+        if [[ "$candidate" != "$expected_main_window" ]]; then
+            candidate_title="$(xprop -id "$candidate" _NET_WM_NAME WM_NAME 2>/dev/null || true)"
+            fail "Threads-closed fixture has another product window: id=$candidate title=$candidate_title"
+        fi
+    done < <(xwininfo -root -tree 2>/dev/null | awk '/^ +0x[0-9a-f]+/ { print $1 }')
+    ((owned_window_count == 1)) \
+        || fail "Threads-closed fixture expected one Main window, found $owned_window_count"
+}
+
 terminate_owned() {
     local pid="$1" label="$2" expected_starttime="$3"
     [[ "$pid" =~ ^[0-9]+$ ]] || return 0
@@ -106,18 +238,71 @@ terminate_owned() {
     wait "$pid" 2>/dev/null || true
 }
 
-cleanup() {
-    terminate_owned "$ui_pid" UI "$ui_starttime" || true
-    terminate_owned "$service_pid" service "$service_starttime" || true
+terminate_holder() {
+    local pid="$holder_pid" expected_starttime="$holder_starttime"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    if ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid" 2>/dev/null || true
+        return 0
+    fi
+    [[ "$(readlink "/proc/$pid/exe" 2>/dev/null || true)" == "$holder_exe" ]] || {
+        echo "x11-service-recovery-visual-gate: refusing to terminate unowned holder PID $pid" >&2
+        return 1
+    }
+    [[ "$expected_starttime" =~ ^[0-9]+$ && "$(proc_starttime "$pid")" == "$expected_starttime" ]] || {
+        echo "x11-service-recovery-visual-gate: refusing to terminate reused holder PID $pid" >&2
+        return 1
+    }
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        [[ "$(readlink "/proc/$pid/exe" 2>/dev/null || true)" == "$holder_exe" ]] || return 1
+        [[ "$(proc_starttime "$pid")" == "$expected_starttime" ]] || return 1
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+}
+
+cleanup_resources() {
+    local cleanup_failed=0
+    if ! terminate_owned "$reference_ui_pid" reference-UI "$reference_ui_starttime"; then
+        cleanup_failed=1
+    fi
+    if ! terminate_owned "$ui_pid" UI "$ui_starttime"; then
+        cleanup_failed=1
+    fi
+    if ! terminate_owned "$service_pid" service "$service_starttime"; then
+        cleanup_failed=1
+    fi
+    if ! terminate_holder; then
+        cleanup_failed=1
+    fi
+    ((cleanup_failed == 0)) || return 1
     case "$temp_root" in
-        "$temp_parent"/.codex-info-x11-recovery.*) rm -rf -- "$temp_root" ;;
-        *) echo 'x11-service-recovery-visual-gate: refusing unexpected cleanup' >&2 ;;
+        "$temp_parent"/.codex-info-x11-recovery.*) rm -rf -- "$temp_root" || return 1 ;;
+        *)
+            echo 'x11-service-recovery-visual-gate: refusing unexpected cleanup' >&2
+            return 1
+            ;;
     esac
 }
-trap cleanup EXIT
 
-mkdir -p "$temp_root"/{home,config,data,cache,state,runtime,codex/sessions}
-chmod 700 "$temp_root/runtime" "$temp_root/codex"
+cleanup_on_exit() {
+    local prior_status="$?"
+    trap - EXIT
+    if ! cleanup_resources; then
+        echo "x11-service-recovery-visual-gate: HOLD: cleanup ownership could not be proven; retained $temp_root" >&2
+        exit 2
+    fi
+    exit "$prior_status"
+}
+trap cleanup_on_exit EXIT
+
+mkdir -p "$temp_root"/{home,config,data,cache,state,runtime,codex/sessions,holder}
+chmod 700 "$temp_root/runtime" "$temp_root/codex" "$temp_root/holder"
 auth_fixture="$temp_root/codex/auth.json"
 cat >"$auth_fixture" <<'JSON'
 {"auth_mode":"chatgpt","tokens":{"account_id":"fixture-account-129"}}
@@ -157,6 +342,10 @@ events = [
     ("gpt-5.6-luna", 3_000, 2_100, 300, 600),
 ]
 with open(sys.argv[1], "w", encoding="utf-8") as stream:
+    stream.write(json.dumps({
+        "type": "session_meta",
+        "payload": {"id": "fixture-thread"},
+    }) + "\n")
     for model, total, input_tokens, cached, output in events:
         stream.write(json.dumps({"type": "thread_context", "model": model}) + "\n")
         stream.write(json.dumps({
@@ -174,8 +363,38 @@ with open(sys.argv[1], "w", encoding="utf-8") as stream:
                 },
             },
         }) + "\n")
+    # The last context is the active-thread model authority. Keep it SOL and
+    # leave the lifecycle open so the exact one-thread Main fixture is live.
+    stream.write(json.dumps({"type": "thread_context", "model": "gpt-5.6-sol"}) + "\n")
+    stream.write(json.dumps({"type": "task_started"}) + "\n")
 PY
 chmod 600 "$session_fixture"
+
+holder_source="$(readlink -f "$(command -v python3)")"
+[[ -x "$holder_source" && ! -L "$holder_source" ]] || fail 'could not resolve the holder executable'
+cp -- "$holder_source" "$holder_exe"
+chmod 700 "$holder_exe"
+"$holder_exe" -c 'import sys,time; stream=open(sys.argv[1], "rb"); time.sleep(3600)' \
+    "$session_fixture" >"$temp_root/holder.log" 2>&1 &
+holder_pid="$!"
+holder_starttime="$(proc_starttime "$holder_pid")"
+[[ "$holder_starttime" =~ ^[0-9]+$ ]] || fail 'holder starttime could not be recorded'
+holder_ready=0
+for _ in $(seq 1 30); do
+    if [[ "$(tr -d '\n' <"/proc/$holder_pid/comm" 2>/dev/null || true)" == "codex" \
+        && "$(readlink "/proc/$holder_pid/exe" 2>/dev/null || true)" == "$holder_exe" \
+        && "$(proc_starttime "$holder_pid")" == "$holder_starttime" ]]; then
+        for holder_fd in "/proc/$holder_pid/fd"/*; do
+            if [[ "$(readlink -f "$holder_fd" 2>/dev/null || true)" == "$session_fixture" ]]; then
+                holder_ready=1
+                break
+            fi
+        done
+    fi
+    ((holder_ready == 1)) && break
+    sleep 0.1
+done
+((holder_ready == 1)) || fail 'exact codex holder identity or session fd was not established'
 
 port="$(python3 - <<'PY'
 import socket
@@ -200,6 +419,9 @@ common_env=(
     "CODEX_INFO_CODEX_BIN=$fake_codex"
     "CODEX_INFO_FAKE_RESET_AT=$fixture_reset_at"
     "CODEX_INFO_FAKE_FAILURE_FILE=$temp_root/app-server-failure"
+    "CODEX_INFO_FAKE_THREAD_ID=fixture-thread"
+    "CODEX_INFO_FAKE_THREAD_PATH=$session_fixture"
+    "CODEX_INFO_FAKE_THREAD_TITLE=fixture active thread"
     "CODEX_INFO_DAEMON_INTERVAL_SECS=2"
 )
 run_with_common_env() {
@@ -270,6 +492,8 @@ with open(sys.argv[1], "a", encoding="utf-8") as stream:
                 },
             },
         }) + "\n")
+    stream.write(json.dumps({"type": "thread_context", "model": "gpt-5.6-sol"}) + "\n")
+    stream.write(json.dumps({"type": "task_started"}) + "\n")
 PY
 }
 service_models_ready() {
@@ -296,6 +520,43 @@ wait_service_models_ready() {
     done
     sed -n '1,160p' "$temp_root"/service-*.log >&2 2>/dev/null || true
     curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v1/details" >&2 || true
+    return 1
+}
+
+service_thread_bundle_ready() {
+    local current threads
+    current="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" 2>/dev/null)" || return 1
+    threads="$(curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/threads" 2>/dev/null)" || return 1
+    python3 - "$current" "$threads" <<'PY'
+import json
+import sys
+
+try:
+    current = json.loads(sys.argv[1])
+    threads = json.loads(sys.argv[2])
+except (IndexError, json.JSONDecodeError):
+    raise SystemExit(1)
+rows = threads.get("threads", [])
+raise SystemExit(0 if (
+    current.get("state") == "ready"
+    and current.get("authenticated") is True
+    and current.get("active_thread_count") == 1
+    and len(rows) == 1
+    and rows[0].get("id") == "fixture-thread"
+    and rows[0].get("model") == "gpt-5.6-sol"
+    and rows[0].get("model_label") == "gpt-5.6-sol"
+) else 1)
+PY
+}
+
+wait_service_thread_bundle_ready() {
+    for _ in $(seq 1 80); do
+        service_thread_bundle_ready && return 0
+        sleep 0.25
+    done
+    sed -n '1,160p' "$temp_root"/service-*.log >&2 2>/dev/null || true
+    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" >&2 || true
+    curl --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/threads" >&2 || true
     return 1
 }
 
@@ -348,19 +609,76 @@ launch_service
 wait_service_ready || fail 'fixture-backed resident service did not publish ready details'
 append_verified_usage
 wait_service_models_ready || fail 'post-baseline fixture usage did not publish model details'
-curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" >"$ready_current"
-python3 - "$ready_current" <<'PY'
+wait_service_thread_bundle_ready || fail 'resident service did not publish the exact one-SOL thread bundle'
+curl --fail --silent --show-error --max-time 1 --dump-header "$current_headers" \
+    --output "$ready_current" "http://127.0.0.1:$port/v3/current"
+curl --fail --silent --show-error --max-time 1 --dump-header "$threads_headers" \
+    --output "$ready_threads" "http://127.0.0.1:$port/v3/threads"
+python3 - "$ready_current" "$current_headers" "$ready_threads" "$threads_headers" <<'PY'
 import json
 import sys
+
+def published_pair(path):
+    for raw in open(path, "rb").read().splitlines():
+        name, separator, value = raw.partition(b":")
+        if separator and name.lower() == b"codex-info-published-pair":
+            return value.strip().decode("ascii")
+    return None
+
 ready = json.loads(open(sys.argv[1], encoding="utf-8").read())
+threads = json.loads(open(sys.argv[3], encoding="utf-8").read())
+rows = threads.get("threads", [])
 raise SystemExit(0 if (
     ready.get("state") == "ready"
     and ready.get("authenticated") is True
     and ready.get("observed_at") is not None
     and ready.get("quota") is not None
     and len(ready.get("models", [])) == 3
+    and ready.get("active_thread_count") == 1
+    and len(rows) == 1
+    and rows[0].get("id") == "fixture-thread"
+    and rows[0].get("model") == "gpt-5.6-sol"
+    and published_pair(sys.argv[2]) is not None
+    and published_pair(sys.argv[2]) == published_pair(sys.argv[4])
 ) else 1)
 PY
+
+# Build six fixed AccountActivity templates from the same candidate binary,
+# display, dimensions, locale, and font stack. The direct Rust oracle fixes
+# this preview to [total, SOL, TERRA, LUNA, ASTRA, other] = [1,1,0,0,0,0].
+env "${common_env[@]}" CODEX_INFO_UI_CLIENT_ONLY=1 CODEX_INFO_PREVIEW=normal \
+    CODEX_INFO_PREVIEW_SIZE=900x480 "$binary" --ui --port "$port" \
+    >"$temp_root/reference-ui.log" 2>&1 &
+reference_ui_pid="$!"
+reference_ui_starttime="$(proc_starttime "$reference_ui_pid")"
+[[ "$reference_ui_starttime" =~ ^[0-9]+$ ]] || fail 'reference UI starttime could not be recorded'
+for _ in $(seq 1 100); do
+    kill -0 "$reference_ui_pid" 2>/dev/null || {
+        sed -n '1,160p' "$temp_root/reference-ui.log" >&2 || true
+        fail 'reference UI exited before rendering'
+    }
+    while read -r candidate; do
+        candidate_pid="$(xprop -id "$candidate" _NET_WM_PID 2>/dev/null | awk -F'= ' '{print $2}' | tr -d '[:space:]')"
+        if [[ "$candidate_pid" == "$reference_ui_pid" ]]; then
+            reference_window_id="$candidate"
+            break
+        fi
+    done < <(xwininfo -root -tree 2>/dev/null | awk '/^ +0x[0-9a-f]+/ { print $1 }')
+    [[ -n "$reference_window_id" ]] && break
+    sleep 0.1
+done
+[[ -n "$reference_window_id" ]] || fail 'reference UI window did not render'
+xwd -silent -id "$reference_window_id" -out "$reference_frame" 2>/dev/null \
+    || fail 'reference UI capture failed'
+write_thread_summary_reference "$reference_frame" \
+    || fail 'reference thread-summary components were not exact'
+rm -- "$reference_frame"
+terminate_owned "$reference_ui_pid" reference-UI "$reference_ui_starttime" \
+    || fail 'reference UI did not stop cleanly'
+reference_ui_pid=''
+reference_ui_starttime=''
+reference_window_id=''
+
 env -u CODEX_INFO_PREVIEW -u CODEX_INFO_PREVIEW_SIZE "${common_env[@]}" "$binary" --ui --port "$port" \
     >"$temp_root/ui.log" 2>&1 &
 ui_pid="$!"
@@ -382,6 +700,7 @@ for _ in $(seq 1 100); do
     sleep 0.1
 done
 [[ -n "$window_id" ]] || fail 'real-service UI window did not render'
+assert_threads_window_closed "$ui_pid" "$window_id"
 
 capture_state() {
     local expected="$1" baseline="${2:-}"
@@ -452,6 +771,8 @@ for _ in $(seq 1 60); do
 done
 ((ready_capture == 1)) || fail 'real-service UI did not render a ready details generation'
 cp -- "$frame" "$ready_frame"
+assert_thread_summary_components "$ready_frame" \
+    || fail 'Main thread total and per-model components differ from the one-SOL wire bundle'
 
 # Exercise the actual lazy boundary: the authenticated main window has already
 # rendered with period metadata, and only this user action may materialize the
@@ -522,17 +843,30 @@ done
 # A live daemon may publish a recoverable top-level error while retaining the
 # last complete authenticated generation. This is the field state that must
 # never be rendered as a fresh authentication prompt.
-# Recorder cycles intentionally continue while the UI and graph are inspected,
-# so pin the actual last-good root immediately before injecting the failure.
+# Recorder cycles and the software renderer intentionally continue while the
+# graph is inspected. Pin both the current Main frame and the service root
+# immediately before injecting the failure, instead of comparing with the
+# pre-graph frame.
+capture_state ready >/dev/null \
+    || fail 'Main did not remain ready after the graph acceptance step'
+cp -- "$frame" "$ready_frame"
+assert_thread_summary_components "$ready_frame" \
+    || fail 'Main thread summary changed before failure injection'
 curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" >"$ready_current"
 touch "$temp_root/app-server-failure"
 wait_service_last_good_error || fail 'resident service did not publish authenticated last-good error state'
 error_frame=0
-for _ in $(seq 1 60); do
+# A rejected current/threads pair retries unconditionally every ten seconds.
+# Keep a finite three-attempt window so one publication race cannot make the
+# acceptance gate flaky while still bounding the failure path.
+for _ in $(seq 1 120); do
     if capture_state error "$ready_frame" >/dev/null 2>/dev/null; then error_frame=1; break; fi
     sleep 0.25
 done
-((error_frame == 1)) || fail 'UI replaced authenticated last-good data with the authentication surface'
+if ((error_frame != 1)); then
+    capture_state error "$ready_frame" || true
+    fail 'UI replaced authenticated last-good data with the authentication surface'
+fi
 rm -- "$temp_root/app-server-failure"
 wait_service_models_ready || fail 'resident service did not recover after the bounded app-server failure'
 ready_capture=0
@@ -560,4 +894,7 @@ for _ in $(seq 1 60); do
     sleep 0.25
 done
 ((ready_capture == 1)) || fail 'UI did not clear the failure after same-endpoint recovery'
-echo 'x11-service-recovery-visual-gate: PASS (main period metadata -> selected history plot -> ready -> authenticated last-good error exact data -> ready -> transport error -> recovered)'
+trap - EXIT
+cleanup_resources \
+    || hold "cleanup ownership could not be proven; retained $temp_root"
+echo 'x11-service-recovery-visual-gate: PASS (exact one-SOL Main summary -> main period metadata -> selected history plot -> ready -> authenticated last-good error exact data -> ready -> transport error -> recovered)'
