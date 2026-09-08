@@ -127,7 +127,9 @@ def _selection_for_path(path: str) -> PathSelection:
     path = _path(path)
     if path in DOC_EXACT or path.startswith(("docs/", "wiki/")):
         return PathSelection(frozenset({"DOCS"}), False)
-    if path.startswith((".github/", ".vscode/", ".codex-tasks/")) or path in {
+    if path.startswith(
+        (".github/", ".vscode/", ".codacy/generated/", ".codex-tasks/")
+    ) or path in {
         ".gitignore",
         "deny.toml",
     }:

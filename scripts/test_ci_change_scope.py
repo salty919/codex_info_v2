@@ -48,6 +48,16 @@ class OwnerSelectionTests(unittest.TestCase):
         self.assertEqual(value.owners, ("LINUX_BACKEND", "LINUX_UI"))
         self.assertEqual(value.codeql_languages, ("rust",))
 
+    def test_generated_codacy_configs_are_governance_only(self) -> None:
+        value = selection_from_name_status(
+            b"A\0.codacy/generated/Ruff/ruff.toml\0"
+            b"D\0.codacy/generated/Semgrep/opengrep-rules.yaml\0"
+        )
+        self.assertEqual(value.owners, ("GOVERNANCE",))
+        self.assertFalse(value.binary_impact)
+        self.assertFalse(value.distribution_required)
+        self.assertEqual(value.codeql_languages, ())
+
     def test_release_candidate_adds_windows_and_distribution_for_binary(self) -> None:
         value = selection_for_paths(("src/usage_store.rs",), release_candidate=True)
         self.assertEqual(value.owners, ("LINUX_BACKEND", "WINDOWS"))
