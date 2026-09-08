@@ -236,6 +236,91 @@ public sealed class DetailsPresentationCoverageTests
     }
 
     [Fact]
+    public async Task GraphWindow_PublishedPairChangeUsesProvenCursorAndAtomicallyAppends()
+    {
+        const long start = 6_100_000;
+        var firstPair = PublishedPairIdentity.Create($"v1:{new string('c', 64)}");
+        var secondPair = PublishedPairIdentity.Create($"v1:{new string('d', 64)}");
+        var period = new ApiHistoryPeriod("pair-period", start, start + 120, false, "pair-period");
+        var firstSample = new ApiHistorySample(start, start + 120, 96, 1, 0, 0, 1, 0, 0);
+        var secondSample = new ApiHistorySample(start + 60, start + 120, 95, 20, 0, 0, 20, 0, 0);
+        var details = CreateDetails([period], Array.Empty<ApiThreadDetails>());
+        var resourceClient = new PairTransitionHistoryResourceClient(
+            details,
+            period,
+            firstSample,
+            secondSample,
+            firstPair,
+            secondPair);
+        using var main = new MainWindowViewModel(
+            new StaticCombinedClient(DetailsFetchResult.Success(details)),
+            resourceClient);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+
+        await PumpUiUntilAsync(pendingUi, () => graph.HasPoints);
+        Assert.Equal([null], resourceClient.Cursors);
+        Assert.Single(graph.Points);
+        Assert.Equal(firstSample.Timestamp, graph.Points[0].Timestamp);
+
+        await RefreshGraphResourceAsync(graph, period.Id);
+        await PumpUiUntilAsync(
+            pendingUi,
+            () => !graph.HasLoadError &&
+                graph.Points.Any(point => point.Timestamp == secondSample.Timestamp));
+
+        Assert.Equal([null, "A0"], resourceClient.Cursors);
+        Assert.Contains(graph.Points, point => point.Timestamp == firstSample.Timestamp && point.SolValue == 1);
+        Assert.Contains(graph.Points, point => point.Timestamp == secondSample.Timestamp && point.SolValue == 20);
+    }
+
+    [Fact]
+    public async Task GraphWindow_DuplicateTimestampsRejectWholeCandidateAndPreserveLastGood()
+    {
+        const long start = 6_200_000;
+        var pair = PublishedPairIdentity.Create($"v1:{new string('e', 64)}");
+        var period = new ApiHistoryPeriod("duplicate-period", start, start + 180, false, "duplicate-period");
+        var samples = new[]
+        {
+            new ApiHistorySample(start, start + 180, 96, 1, 0, 0, 1, 0, 0),
+            new ApiHistorySample(start + 60, start + 180, 95, 2, 0, 0, 2, 0, 0),
+        };
+        var details = CreateDetails([period], Array.Empty<ApiThreadDetails>());
+        var resourceClient = new DuplicateTimestampHistoryResourceClient(details, period, samples, pair);
+        using var main = new MainWindowViewModel(
+            new StaticCombinedClient(DetailsFetchResult.Success(details)),
+            resourceClient);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+
+        await PumpUiUntilAsync(pendingUi, () => graph.HasPoints);
+        var lastGoodScene = graph.Scene;
+        Assert.Equal([null], resourceClient.Cursors);
+
+        // A continuation that repeats an already accepted timestamp is not
+        // an append, even when the repeated row is byte-equivalent.
+        await RefreshGraphResourceAsync(graph, period.Id);
+        await PumpUiUntilAsync(pendingUi, () => graph.HasLoadError);
+        Assert.Equal([null, "C0"], resourceClient.Cursors);
+        Assert.Same(lastGoodScene, graph.Scene);
+
+        // Two equivalent rows in one page are also a duplicate candidate.
+        await RefreshGraphResourceAsync(graph, period.Id);
+        await PumpUiUntilAsync(pendingUi, () => graph.HasLoadError);
+        Assert.Equal([null, "C0", "C0"], resourceClient.Cursors);
+        Assert.Same(lastGoodScene, graph.Scene);
+
+        // Repeating the timestamp across two pages rejects the complete page
+        // set atomically and leaves the prior scene and cursor untouched.
+        await RefreshGraphResourceAsync(graph, period.Id);
+        await PumpUiUntilAsync(pendingUi, () => graph.HasLoadError);
+        Assert.Equal([null, "C0", "C0", "C0", "P1"], resourceClient.Cursors);
+        Assert.Same(lastGoodScene, graph.Scene);
+        Assert.Single(graph.Points);
+        Assert.Equal(samples[0].Timestamp, graph.Points[0].Timestamp);
+    }
+
+    [Fact]
     public async Task ThreadsWindow_EmptyStateTracksLocalizedText()
     {
         using var main = await StartMainAsync(CreateDetails(Array.Empty<ApiHistoryPeriod>(), Array.Empty<ApiThreadDetails>()));
@@ -635,6 +720,141 @@ public sealed class DetailsPresentationCoverageTests
                     Array.Empty<ApiHistoryGap>(),
                     NextCursor: null,
                     ResumeCursor: resumeCursor,
+                    pair));
+        }
+
+        public Task<ThreadsFetchResult> FetchThreadsAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Threads are outside this graph regression test.");
+    }
+
+    private sealed class PairTransitionHistoryResourceClient(
+        ApiDetailsSnapshot details,
+        ApiHistoryPeriod period,
+        ApiHistorySample firstSample,
+        ApiHistorySample secondSample,
+        PublishedPairIdentity firstPair,
+        PublishedPairIdentity secondPair) : ILoopbackDetailsClient, ILoopbackResourceClient
+    {
+        private readonly object gate = new();
+        private readonly List<string?> cursors = [];
+        private int periodsCalls;
+        private int pageCalls;
+
+        public IReadOnlyList<string?> Cursors
+        {
+            get
+            {
+                lock (gate)
+                {
+                    return cursors.ToArray();
+                }
+            }
+        }
+
+        public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(DetailsFetchResult.Success(details));
+
+        public Task<CurrentFetchResult> FetchCurrentAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Current is outside this graph regression test.");
+
+        public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
+            CancellationToken cancellationToken = default)
+        {
+            var pair = Interlocked.Increment(ref periodsCalls) == 1 ? firstPair : secondPair;
+            return Task.FromResult(HistoryPeriodsFetchResult.Success(
+                new ApiHistoryPeriodsSnapshot([period], pair)));
+        }
+
+        public Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+            string periodId,
+            string? cursor = null,
+            CancellationToken cancellationToken = default)
+        {
+            lock (gate)
+            {
+                cursors.Add(cursor);
+            }
+
+            var call = Interlocked.Increment(ref pageCalls);
+            var sample = call == 1 ? firstSample : secondSample;
+            var pair = call == 1 ? firstPair : secondPair;
+            return Task.FromResult(HistoryPageFetchResult.Success(new ApiHistoryPage(
+                periodId,
+                [sample],
+                Array.Empty<ApiHistoryGap>(),
+                NextCursor: null,
+                ResumeCursor: call == 1 ? "A0" : "B0",
+                pair)));
+        }
+
+        public Task<ThreadsFetchResult> FetchThreadsAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Threads are outside this graph regression test.");
+    }
+
+    private sealed class DuplicateTimestampHistoryResourceClient(
+        ApiDetailsSnapshot details,
+        ApiHistoryPeriod period,
+        ApiHistorySample[] samples,
+        PublishedPairIdentity pair) : ILoopbackDetailsClient, ILoopbackResourceClient
+    {
+        private readonly object gate = new();
+        private readonly List<string?> cursors = [];
+        private int pageCalls;
+
+        public IReadOnlyList<string?> Cursors
+        {
+            get
+            {
+                lock (gate)
+                {
+                    return cursors.ToArray();
+                }
+            }
+        }
+
+        public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(DetailsFetchResult.Success(details));
+
+        public Task<CurrentFetchResult> FetchCurrentAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Current is outside this graph regression test.");
+
+        public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(HistoryPeriodsFetchResult.Success(
+                new ApiHistoryPeriodsSnapshot([period], pair)));
+
+        public Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+            string periodId,
+            string? cursor = null,
+            CancellationToken cancellationToken = default)
+        {
+            lock (gate)
+            {
+                cursors.Add(cursor);
+            }
+
+            var call = Interlocked.Increment(ref pageCalls);
+            var result = call switch
+            {
+                1 => Page([samples[0]], nextCursor: null, resumeCursor: "C0"),
+                2 => Page([samples[0]], nextCursor: null, resumeCursor: "C0"),
+                3 => Page([samples[1], samples[1]], nextCursor: null, resumeCursor: "C0"),
+                4 => Page([samples[1]], nextCursor: "P1", resumeCursor: null),
+                5 => Page([samples[1]], nextCursor: null, resumeCursor: "C0"),
+                _ => throw new InvalidOperationException($"Unexpected history page request {call}."),
+            };
+            return Task.FromResult(result);
+
+            HistoryPageFetchResult Page(
+                IReadOnlyList<ApiHistorySample> pageSamples,
+                string? nextCursor,
+                string? resumeCursor) =>
+                HistoryPageFetchResult.Success(new ApiHistoryPage(
+                    periodId,
+                    pageSamples,
+                    Array.Empty<ApiHistoryGap>(),
+                    nextCursor,
+                    resumeCursor,
                     pair));
         }
 

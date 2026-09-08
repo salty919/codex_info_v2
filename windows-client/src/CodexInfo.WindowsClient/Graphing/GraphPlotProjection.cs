@@ -208,16 +208,23 @@ internal static class GraphPlotProjection
                     scene.Timestamps[previous],
                     scene.Timestamps[index]))
             {
-                // Confirmed recorder gaps terminate the old subpath. The
-                // marker is the only visual evidence for the interval.
+                AppendSegment(
+                    dashedX,
+                    dashedY,
+                    scene.Timestamps[previous],
+                    before,
+                    scene.Timestamps[index],
+                    current);
                 previous = index;
                 continue;
             }
             var observed = scene.RemainingObserved[previous] && scene.RemainingObserved[index];
             var derived = scene.RemainingOrigins[previous] is not GraphRemainingOrigin.Raw ||
                 scene.RemainingOrigins[index] is not GraphRemainingOrigin.Raw;
-            var modelAvailable = ModelDataAvailable(scene, previous, index);
-            var modelAdvanced = ModelAdvanced(scene, previous, index);
+            var modelAvailable = scene.TryGetTokenIntervalEvidence(
+                previous,
+                index,
+                out var modelAdvanced);
             var quotaDropped = current < before;
             var unattributed = quotaDropped && (!modelAvailable || !modelAdvanced);
             var dashed = !contiguous || elapsed > ModelContiguousSampleMaxGapSeconds ||
@@ -233,10 +240,7 @@ internal static class GraphPlotProjection
             previous = index;
         }
 
-        if (previous == scene.Timestamps.Count - 1 &&
-            scene.PeriodEndAt > scene.Timestamps[previous] &&
-            scene.PeriodEndAt - scene.Timestamps[previous] <= ModelContiguousSampleMaxGapSeconds &&
-            !scene.HasHardBreakBetween(scene.Timestamps[previous], scene.PeriodEndAt))
+        if (previous >= 0 && scene.PeriodEndAt > scene.Timestamps[previous])
         {
             // The remote source may stop while the current period continues.
             // Keep only the last measured value, horizontally and dashed;
@@ -298,16 +302,19 @@ internal static class GraphPlotProjection
             var elapsed = endAt - startAt;
             if (scene.HasHardBreakBetween(startAt, endAt))
             {
+                AppendSegment(dashedX, dashedY, startAt, before, endAt, value);
                 previous = index;
                 continue;
             }
             if (value < before)
             {
+                AppendSegment(dashedX, dashedY, startAt, before, endAt, before);
                 previous = index;
                 continue;
             }
             if (index != previous + 1 || elapsed > ModelContiguousSampleMaxGapSeconds ||
-                scene.ModelSynthetic[previous] || scene.ModelSynthetic[index])
+                scene.ModelSynthetic[previous] || scene.ModelSynthetic[index] ||
+                !scene.IsModelIntervalReliable(values, previous, index))
             {
                 AppendSegment(dashedX, dashedY, startAt, before, endAt, value);
             }
@@ -322,10 +329,7 @@ internal static class GraphPlotProjection
             previous = index;
         }
 
-        if (previous == values.Count - 1 &&
-            scene.PeriodEndAt > scene.Timestamps[previous] &&
-            scene.PeriodEndAt - scene.Timestamps[previous] <= ModelContiguousSampleMaxGapSeconds &&
-            !scene.HasHardBreakBetween(scene.Timestamps[previous], scene.PeriodEndAt))
+        if (previous >= 0 && scene.PeriodEndAt > scene.Timestamps[previous])
         {
             AppendSegment(
                 dashedX,
@@ -342,26 +346,11 @@ internal static class GraphPlotProjection
             new GraphLineProjection(dashedX, dashedY));
     }
 
-    /// <summary>
-    /// Sub-pixel rectangles produce the barcode artefact seen in ScottPlot.
-    /// X effectively drops those rectangles during rasterization, so apply
-    /// the same finite minimum at the smallest supported plot width.
-    /// </summary>
-    public static IReadOnlyList<GraphIdleInterval> BuildVisibleIdleIntervals(
-        GraphScene scene,
-        double minimumNormalizedWidth = 1d / 480d)
+    /// <summary>Returns every evidence interval without a pixel-width filter.</summary>
+    public static IReadOnlyList<GraphIdleInterval> BuildVisibleIdleIntervals(GraphScene scene)
     {
         ArgumentNullException.ThrowIfNull(scene);
-        if (!double.IsFinite(minimumNormalizedWidth) || minimumNormalizedWidth < 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(minimumNormalizedWidth));
-        }
-
-        var span = Math.Max(1d, scene.PeriodEndAt - scene.PeriodStartAt);
-        return scene.IdleIntervals
-            .Where(interval => interval.PreserveBoundary ||
-                (interval.EndAt - interval.StartAt) / span >= minimumNormalizedWidth)
-            .ToArray();
+        return scene.IdleIntervals.ToArray();
     }
 
     public static IReadOnlyList<GraphEndpointLabel> BuildEndpointLabels(
@@ -452,15 +441,6 @@ internal static class GraphPlotProjection
     private static string FormatRemaining(double value, CultureInfo culture) =>
         value.ToString("0.#", culture) + "%";
 
-    private static bool ModelDataAvailable(GraphScene scene, int before, int after) =>
-        scene.ModelSeries.Count > 0 && scene.ModelSeries.Values.All(values =>
-            before < values.Count && after < values.Count &&
-            double.IsFinite(values[before]) && double.IsFinite(values[after]));
-
-    private static bool ModelAdvanced(GraphScene scene, int before, int after) =>
-        ModelDataAvailable(scene, before, after) && scene.ModelSeries.Values.Any(values =>
-            values[after] > values[before]);
-
     private static double RemainingValue(GraphScene scene, int index)
     {
         var effective = scene.Remaining[index];
@@ -469,7 +449,10 @@ internal static class GraphPlotProjection
         {
             return effective;
         }
-        return double.IsFinite(effective) ? Math.Min(effective, observed) : observed;
+        // GraphScene has already rejected quota pulses and applied bounded
+        // smoothing. Reintroducing a lower raw pulse here would draw the exact
+        // false valley that the evidence projection rejected.
+        return double.IsFinite(effective) ? effective : observed;
     }
 
     private static void AddModelCandidate(
@@ -481,7 +464,7 @@ internal static class GraphPlotProjection
         CultureInfo culture,
         ICollection<EndpointCandidate> candidates)
     {
-        if (!double.IsFinite(value) || value <= 0)
+        if (!double.IsFinite(value) || value < 0)
         {
             return;
         }

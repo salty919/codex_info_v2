@@ -23,10 +23,9 @@ export global DesignTokens {
     out property <color> graph-control-border: #405779;
     out property <color> graph-plot-surface: #121c2c;
     out property <color> graph-plot-border: #3b506f;
-    // A dedicated, visible-but-neutral fill for intervals with no model use.
-    // Keep this separate from text-muted so idle bands cannot disappear when
-    // text contrast is tuned independently.
-    out property <color> graph-idle-band: #3f5d7c;
+    // Final opaque composite shared with the Windows plot. Drawing this over
+    // the grid prevents grid columns from periodically splitting one idle run.
+    out property <color> graph-idle-band: #1a2838;
     out property <color> graph-remaining: #56b2f5;
     out property <color> graph-sol: #a88cf5;
     out property <color> graph-terra: #5dc98a;
