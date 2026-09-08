@@ -6,6 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
   </PropertyGroup>
 
   <ItemGroup>
@@ -25,8 +26,8 @@
     <None Include="../../../tests/fixtures/graph_weekly_reset_rollover.json"
           Link="Fixtures/graph_weekly_reset_rollover.json"
           CopyToOutputDirectory="PreserveNewest" />
-    <None Include="../../../tests/fixtures/graph_cumulative_correction.json"
-          Link="Fixtures/graph_cumulative_correction.json"
+    <None Include="../../../tests/fixtures/graph_evidence_oracle.json"
+          Link="Fixtures/graph_evidence_oracle.json"
           CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

@@ -62,6 +62,10 @@ case "$1" in
             remaining_graph_stays_empty_without_observations
             zero_cost_period_starts_at_the_first_observation
             graph_breaks_for_legacy_and_unavailable_until_confirmed_recovery
+            graph_parity_v3_fixture_drives_linux_production_projection
+            graph_correction_fixture_resets_linux_lineage_without_a_solid_bridge
+            graph_oracle_distinguishes_unconfirmed_regression_from_confirmed_correction
+            graph_oracle_preserves_raw_quota_increase_but_displays_monotonic_hold
         )
         store_tests=(
             recent_read_uses_one_month_half_open_interval_at_month_ends
@@ -73,7 +77,7 @@ case "$1" in
         for test_name in "${store_tests[@]}"; do
             run_exact_test --test=usage_store "wave_b_correction_tests::$test_name"
         done
-        echo 'regression-guard: PASS check=rust-history-graph cases=15'
+        echo 'regression-guard: PASS check=rust-history-graph cases=19'
         ;;
     --model-history)
         main_tests=(

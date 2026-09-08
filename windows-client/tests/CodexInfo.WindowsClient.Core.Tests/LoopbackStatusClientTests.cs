@@ -272,6 +272,64 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
+    public async Task HistoryPageRecognizesOnlyTheExactBoundedStaleCursorResponseForASavedCursor()
+    {
+        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+            StaleCursorResponse("{\"api_version\":\"v1\",\"error\":\"stale_cursor\"}")));
+
+        var result = await client.FetchHistoryPageAsync(
+            "period",
+            "saved-cursor",
+            CancellationToken.None);
+
+        Assert.False(result.IsSuccess);
+        Assert.Null(result.Page);
+        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
+        Assert.True(result.CursorRejected);
+    }
+
+    [Fact]
+    public async Task HistoryPageDoesNotTreatMalformedOrCursorlessBadRequestsAsStaleCursor()
+    {
+        var cases = new Func<HttpResponseMessage>[]
+        {
+            () => StaleCursorResponse("{\"api_version\":\"v1\",\"error\":\"stale_cursor\",\"extra\":true}"),
+            () => StaleCursorResponse("{\"api_version\":\"v1\",\"error\":\"other\"}"),
+            () =>
+            {
+                var response = StaleCursorResponse("{\"api_version\":\"v1\",\"error\":\"stale_cursor\"}");
+                response.Headers.TryAddWithoutValidation(PublishedPairHeader, CanonicalPublishedPair);
+                return response;
+            },
+            () =>
+            {
+                var response = StaleCursorResponse("{\"api_version\":\"v1\",\"error\":\"stale_cursor\"}");
+                response.Headers.CacheControl = null;
+                return response;
+            },
+        };
+
+        foreach (var responseFactory in cases)
+        {
+            using var client = new LoopbackStatusClient(new StubHandler(_ => responseFactory()));
+            var malformed = await client.FetchHistoryPageAsync(
+                "period",
+                "saved-cursor",
+                CancellationToken.None);
+            Assert.False(malformed.CursorRejected);
+            Assert.Equal(DetailsFetchFailure.Transport, malformed.Failure);
+        }
+
+        using var cursorlessClient = new LoopbackStatusClient(new StubHandler(_ =>
+            StaleCursorResponse("{\"api_version\":\"v1\",\"error\":\"stale_cursor\"}")));
+        var cursorless = await cursorlessClient.FetchHistoryPageAsync(
+            "period",
+            cancellationToken: CancellationToken.None);
+        Assert.False(cursorless.CursorRejected);
+        Assert.Equal(DetailsFetchFailure.Transport, cursorless.Failure);
+    }
+
+    [Fact]
     public async Task SplitResourceRequiresTheResumeCursorOnEveryHistoryPage()
     {
         using var client = new LoopbackStatusClient(new StubHandler(_ =>
@@ -1113,6 +1171,13 @@ public sealed class LoopbackStatusClientTests
 
     private static HttpResponseMessage NotFoundResponse() =>
         new(HttpStatusCode.NotFound);
+
+    private static HttpResponseMessage StaleCursorResponse(string json)
+    {
+        var response = JsonResponse(json);
+        response.StatusCode = HttpStatusCode.BadRequest;
+        return response;
+    }
 
     private static HttpResponseMessage NotModifiedResponse()
     {

@@ -111,6 +111,10 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         "api_version",
         "threads");
 
+    private static readonly HashSet<string> StaleCursorProperties = CreatePropertySet(
+        "api_version",
+        "error");
+
     private static readonly HashSet<string> DetailsV3ModelProperties = CreatePropertySet(
         "model",
         "total_tokens",
@@ -455,10 +459,13 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
                 static value => value.PublishedPair,
                 value => StoreHistoryPageCache(cacheKey, value),
                 () => EvictHistoryPageCache(cacheKey),
-                cancellationToken)
+                cancellationToken,
+                recognizeStaleCursor: cursor is not null)
             .ConfigureAwait(false);
         return result.Value is not null
             ? HistoryPageFetchResult.Success(result.Value)
+            : result.CursorRejected
+                ? HistoryPageFetchResult.FromRejectedCursor()
             : HistoryPageFetchResult.FromFailure(result.Failure ?? DetailsFetchFailure.Response);
     }
 
@@ -493,7 +500,8 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         Func<T, PublishedPairIdentity> pairSelector,
         Action<T> store,
         Action evict,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool recognizeStaleCursor = false)
         where T : class
     {
         try
@@ -548,6 +556,15 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
                 }
 
                 return SplitFetchResult<T>.Success(cached, notModified: true);
+            }
+
+            if (response.StatusCode == HttpStatusCode.BadRequest &&
+                recognizeStaleCursor &&
+                await IsExactStaleCursorResponseAsync(response, cancellationToken).ConfigureAwait(false))
+            {
+                // Keep the route-local last-good page. The graph owner alone
+                // may perform the single same-cycle cursorless recovery.
+                return SplitFetchResult<T>.RejectedCursor();
             }
 
             if (response.StatusCode != HttpStatusCode.OK)
@@ -609,6 +626,57 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         catch (Exception)
         {
             return SplitFetchResult<T>.FromFailure(DetailsFetchFailure.Transport);
+        }
+    }
+
+    private static async Task<bool> IsExactStaleCursorResponseAsync(
+        HttpResponseMessage response,
+        CancellationToken cancellationToken)
+    {
+        if (!HasAcceptableHeaderSize(response) ||
+            !HasRequiredResponseHeaders(response) ||
+            response.Headers.Contains(PublishedPairHeader) ||
+            response.Content.Headers.Contains(PublishedPairHeader) ||
+            !TryGetContentLength(response.Content, out var contentLength) ||
+            contentLength is not long exactLength ||
+            exactLength is < 0 or > 1024)
+        {
+            return false;
+        }
+
+        var bodyStatus = await ReadBodyAsync(
+                response.Content,
+                exactLength,
+                cancellationToken,
+                maximumBodyBytes: 1024)
+            .ConfigureAwait(false);
+        if (bodyStatus.Kind is not BodyReadKind.Success ||
+            bodyStatus.Body is null ||
+            bodyStatus.Body.LongLength != exactLength)
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(
+                bodyStatus.Body,
+                new JsonDocumentOptions
+                {
+                    AllowTrailingCommas = false,
+                    CommentHandling = JsonCommentHandling.Disallow,
+                    MaxDepth = 2,
+                });
+            var root = document.RootElement;
+            return HasExactlyProperties(root, StaleCursorProperties, 2) &&
+                TryGetString(root, "api_version", out var apiVersion) &&
+                apiVersion == "v1" &&
+                TryGetString(root, "error", out var error) &&
+                error == "stale_cursor";
+        }
+        catch (Exception)
+        {
+            return false;
         }
     }
 
@@ -2834,17 +2902,21 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         T? Value,
         DetailsFetchFailure? Failure,
         bool NotFound,
-        bool NotModified)
+        bool NotModified,
+        bool CursorRejected)
         where T : class
     {
         public static SplitFetchResult<T> Success(T value, bool notModified) =>
-            new(value, null, false, notModified);
+            new(value, null, false, notModified, false);
 
         public static SplitFetchResult<T> FromFailure(DetailsFetchFailure failure) =>
-            new(null, failure, false, false);
+            new(null, failure, false, false, false);
 
         public static SplitFetchResult<T> NotFoundResult() =>
-            new(null, DetailsFetchFailure.Response, true, false);
+            new(null, DetailsFetchFailure.Response, true, false, false);
+
+        public static SplitFetchResult<T> RejectedCursor() =>
+            new(null, DetailsFetchFailure.Response, false, false, true);
     }
 
     private sealed record V3ModelCost(

@@ -35,8 +35,11 @@ if [[ "$profile" == history-graph ]]; then
         CodexInfo.WindowsClient.Presentation.Tests.GraphWindowViewModelProjectionTests.Graph_samples_do_not_fabricate_quota_when_quota_observations_are_missing
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Shared_graph_fixture_matches_the_native_history_oracle_through_details_http_parser
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Shared_rollover_fixture_atomically_refreshes_open_main_graph_and_threads_from_details
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Live_incident_regression_recovery_is_never_connected_as_solid
+        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Live_incident_confirmed_correction_starts_a_new_lineage_without_a_bridge
+        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_shared_v3_oracle_matches_values_roles_idle_and_pair_through_http_parser
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_cumulative_correction_fixture_never_paints_a_solid_recovery_bridge
+        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_shared_oracle_matches_regression_and_quota_anomaly_rules
+        CodexInfo.WindowsClient.Presentation.Tests.DetailsPresentationCoverageTests.GraphWindow_ExactStaleCursorRetriesHeadOnceAndPreservesResetStateAcrossFailures
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Confirmed_history_gap_ends_both_subpaths_without_a_cross_gap_connector
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Remaining_quota_observations_survive_flat_model_rows_as_unattributed_dashes
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Missing_remote_quota_is_never_painted_as_a_solid_bridge
