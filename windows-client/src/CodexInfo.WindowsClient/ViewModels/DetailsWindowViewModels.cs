@@ -49,6 +49,8 @@ public sealed class GraphPointViewModel
                 case "ASTRA":
                     AstraValue = value;
                     break;
+                default:
+                    break;
             }
         }
 
@@ -591,10 +593,49 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
-    public bool ShowSol { get => showSol; set { if (showSol == value) return; showSol = value; Notify(); } }
-    public bool ShowTerra { get => showTerra; set { if (showTerra == value) return; showTerra = value; Notify(); } }
-    public bool ShowLuna { get => showLuna; set { if (showLuna == value) return; showLuna = value; Notify(); } }
-    public bool ShowAstra { get => showAstra; set { if (showAstra == value) return; showAstra = value; Notify(); } }
+    public bool ShowSol
+    {
+        get => showSol;
+        set
+        {
+            if (showSol == value) return;
+            showSol = value;
+            Notify();
+        }
+    }
+
+    public bool ShowTerra
+    {
+        get => showTerra;
+        set
+        {
+            if (showTerra == value) return;
+            showTerra = value;
+            Notify();
+        }
+    }
+
+    public bool ShowLuna
+    {
+        get => showLuna;
+        set
+        {
+            if (showLuna == value) return;
+            showLuna = value;
+            Notify();
+        }
+    }
+
+    public bool ShowAstra
+    {
+        get => showAstra;
+        set
+        {
+            if (showAstra == value) return;
+            showAstra = value;
+            Notify();
+        }
+    }
 
     public void Dispose()
     {

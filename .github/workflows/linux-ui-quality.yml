@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false
       - name: Install Linux UI quality tools
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: Build native release for UI evaluation
         run: cargo build --release --locked
       - name: Run startup UI image and failure-state acceptance

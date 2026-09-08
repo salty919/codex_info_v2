@@ -49,6 +49,7 @@ WINDOWS_PROPS = """<Project>
   </PropertyGroup>
 </Project>
 """
+WINDOWS_PROPS_MAX_BYTES = 64 * 1024
 
 
 class VersionFixture:
@@ -214,6 +215,44 @@ class ProductVersionFixtures(unittest.TestCase):
     def test_malformed_props_xml_is_rejected_without_writes(self) -> None:
         fixture = self.use_fixture()
         fixture.paths.windows_props.write_bytes(b"<Project><PropertyGroup><Version>1.0.8")
+        self.assert_rejected_without_writes(fixture)
+
+    def test_props_internal_entity_is_rejected_without_writes(self) -> None:
+        fixture = self.use_fixture()
+        fixture.paths.windows_props.write_text(
+            "<!DOCTYPE Project [<!ENTITY version '1.0.8'>]>"
+            "<Project><PropertyGroup><Version>&version;</Version>"
+            "</PropertyGroup></Project>",
+            encoding="utf-8",
+        )
+        self.assert_rejected_without_writes(fixture)
+
+    def test_props_external_entity_is_rejected_without_writes(self) -> None:
+        fixture = self.use_fixture()
+        fixture.paths.windows_props.write_text(
+            "<!DOCTYPE Project [<!ENTITY external SYSTEM 'file:///etc/passwd'>]>"
+            "<Project><PropertyGroup><Version>1.0.8</Version>"
+            "<Value>&external;</Value></PropertyGroup></Project>",
+            encoding="utf-8",
+        )
+        self.assert_rejected_without_writes(fixture)
+
+    def test_oversized_props_xml_is_rejected_without_writes(self) -> None:
+        fixture = self.use_fixture()
+        payload = WINDOWS_PROPS.replace("{version}", "1.0.8")
+        fixture.paths.windows_props.write_text(
+            payload + " " * WINDOWS_PROPS_MAX_BYTES,
+            encoding="utf-8",
+        )
+        self.assert_rejected_without_writes(fixture)
+
+    def test_deep_props_xml_is_rejected_without_writes(self) -> None:
+        fixture = self.use_fixture()
+        nested = "<Node>" * 16 + "</Node>" * 16
+        payload = WINDOWS_PROPS.replace("{version}", "1.0.8").replace(
+            "</Project>", f"{nested}</Project>"
+        )
+        fixture.paths.windows_props.write_text(payload, encoding="utf-8")
         self.assert_rejected_without_writes(fixture)
 
     def test_atomic_commit_failure_rolls_back_every_target(self) -> None:

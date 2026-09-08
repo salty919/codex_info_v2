@@ -34,7 +34,7 @@ jobs:
       - name: Install required native quality tools
         if: inputs.release_candidate
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: Check native formatting
         if: ${{ !inputs.release_candidate }}
         run: cargo fmt --check
