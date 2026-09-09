@@ -196,8 +196,17 @@ public sealed class GraphPlotControlTests
             CultureInfo.InvariantCulture);
 
         Assert.Equal([0d, 0.25d, 0.5d, 0.75d, 1d], projection.BottomValues);
-        Assert.Equal([0d, 0.25d, 0.5d, 0.75d, 1d], projection.ModelValues);
-        Assert.Equal([0d, 25d, 50d, 75d, 100d], projection.RemainingValues);
+        var expectedModelValues = new[]
+            { -1d / 98d, 24d / 98d, 49d / 98d, 74d / 98d, 99d / 98d };
+        var expectedRemainingValues = new[]
+            { -100d / 98d, 2_400d / 98d, 4_900d / 98d, 7_400d / 98d, 9_900d / 98d };
+        Assert.Equal(expectedModelValues.Length, projection.ModelValues.Count);
+        Assert.Equal(expectedRemainingValues.Length, projection.RemainingValues.Count);
+        for (var index = 0; index < expectedModelValues.Length; index++)
+        {
+            Assert.Equal(expectedModelValues[index], projection.ModelValues[index], precision: 12);
+            Assert.Equal(expectedRemainingValues[index], projection.RemainingValues[index], precision: 12);
+        }
         Assert.Equal(["0%", "25%", "50%", "75%", "100%"], projection.RemainingLabels);
         Assert.Equal(5, projection.BottomLabels.Count);
         Assert.Equal(5, projection.ModelLabels.Count);
@@ -229,7 +238,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void PlotProjectionKeepsMetricSpecificEndpointGutterFixedAcrossUnboundedWidths()
+    public void PlotProjectionKeepsNativePixelEndpointGutterFixedAcrossUnboundedWidths()
     {
         const double referenceWidth = 800;
         double[] currentWidths = [320, 800, 1_200, 10_000];
@@ -239,15 +248,13 @@ public sealed class GraphPlotControlTests
             Point(2_000, 75, 2, 4, 6),
         };
 
-        foreach (var (metric, legacyGutterRatio) in new[]
+        foreach (var (metric, expectedGutter) in new[]
         {
-            (GraphMetric.Dollars, 0.20),
-            (GraphMetric.Tokens, 0.27),
+            (GraphMetric.Dollars, 94d),
+            (GraphMetric.Tokens, 126d),
         })
         {
             var scene = GraphScene.Create(points, metric, points[0].Timestamp, points[^1].Timestamp);
-            var expectedGutter = referenceWidth * legacyGutterRatio / (1 + legacyGutterRatio);
-            var expectedLabelGap = referenceWidth * 0.018 / (1 + legacyGutterRatio);
 
             foreach (var currentWidth in currentWidths)
             {
@@ -264,13 +271,13 @@ public sealed class GraphPlotControlTests
                     (projection.EndpointLabelAt - scene.PeriodEndAt) / displaySpan;
 
                 Assert.Equal(expectedGutter, currentWidth - plotWidth, precision: 9);
-                Assert.Equal(expectedLabelGap, labelGap, precision: 9);
+                Assert.Equal(10d, labelGap, precision: 9);
             }
         }
     }
 
     [Fact]
-    public void PlotProjectionFallbackWidthRetainsReferenceEndpointCoordinates()
+    public void PlotProjectionFallbackUsesTheNativeCanonicalDataAreaWidth()
     {
         foreach (var metric in new[] { GraphMetric.Dollars, GraphMetric.Tokens })
         {
@@ -289,8 +296,8 @@ public sealed class GraphPlotControlTests
                 scene,
                 TimeZoneInfo.Utc,
                 CultureInfo.InvariantCulture,
-                800,
-                800);
+                788,
+                788);
 
             Assert.Equal(legacy.DisplayEndAt, sameWidth.DisplayEndAt);
             Assert.Equal(legacy.EndpointLabelAt, sameWidth.EndpointLabelAt);
@@ -386,7 +393,7 @@ public sealed class GraphPlotControlTests
         var rendered = control.Plot.GetImage(940, 480);
         var pixels = rendered.GetArrayRGB();
         var gutterStart = (int)Math.Ceiling(control.Plot.GetPixel(new ScottPlot.Coordinates(1_120, 0)).X);
-        foreach (var color in new[] { (86, 178, 245), (168, 140, 245), (230, 162, 60), (232, 110, 159) })
+        foreach (var color in new[] { (86, 178, 245), (168, 140, 245), (230, 162, 60), (239, 106, 106) })
         {
             var found = false;
             for (var x = gutterStart + 1; x < pixels.GetLength(1) && !found; x++)
@@ -540,7 +547,7 @@ public sealed class GraphPlotControlTests
         Assert.Empty(remaining.Solid.X);
         Assert.Equal([1_000d, 1_600d], remaining.Dashed.X);
         Assert.Equal([80d, 80d], remaining.Dashed.Y);
-        Assert.Contains(labels, label => label.Series == GraphSeries.Sol && label.Text == "SOL $5.00");
+        Assert.Contains(labels, label => label.Series == GraphSeries.Sol && label.Text == "$5.00");
         Assert.Contains(labels, label => label.Series == GraphSeries.Remaining && label.Text == "80%");
     }
 
@@ -725,7 +732,96 @@ public sealed class GraphPlotControlTests
         Assert.Equal(1f, GraphPlotControl.InferredLineWidth);
         Assert.True(GraphPlotControl.InferredLineWidth < GraphPlotControl.MeasuredModelLineWidth);
         Assert.True(GraphPlotControl.InferredLineWidth < GraphPlotControl.MeasuredRemainingLineWidth);
-        Assert.Equal(ScottPlot.LinePattern.DenselyDashed, GraphPlotControl.InferredLinePattern);
+    }
+
+    [Fact]
+    public void CanonicalRenderProjectionUsesTheNativeNormalizedDashCadence()
+    {
+        var scene = Scene(
+            [
+                Point(1_000, 100, 10, 0, 0),
+                Point(1_600, 90, 10, 0, 0),
+            ],
+            1_000,
+            1_600);
+
+        var model = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol);
+        var remaining = GraphPlotProjection.BuildCanonicalRemainingLines(scene);
+
+        Assert.StartsWith("M0.00 1.00 L0.45 1.00 M0.75 1.00", model.Dashed.Path);
+        Assert.StartsWith("M0.00 1.00 L0.45 1.04 M0.75 1.07", remaining.Dashed.Path);
+        Assert.True(model.Dashed.Line.X.Count > 100);
+        Assert.True(remaining.Dashed.Line.X.Count > 100);
+        Assert.All(
+            model.Dashed.Line.X.Where(double.IsFinite),
+            value => Assert.InRange(value, scene.PeriodStartAt, scene.PeriodEndAt));
+    }
+
+    [Fact]
+    public void CanonicalRenderProjectionUsesNativeBinaryFixedTwoRounding()
+    {
+        var lowScene = Scene(
+            [
+                Point(1_000, 97.30, 0, 0, 0),
+                Point(1_060, 97.25, 1, 0, 0),
+            ],
+            1_000,
+            1_060);
+        var highScene = Scene(
+            [
+                Point(1_000, 82.30, 0, 0, 0),
+                Point(1_060, 82.25, 1, 0, 0),
+            ],
+            1_000,
+            1_060);
+
+        var lowRemaining = GraphPlotProjection.BuildCanonicalRemainingLines(lowScene);
+        var highRemaining = GraphPlotProjection.BuildCanonicalRemainingLines(highScene);
+
+        Assert.Equal("M0.00 3.65 L100.00 3.69", lowRemaining.Solid.Path);
+        Assert.Equal("M0.00 18.35 L100.00 18.39", highRemaining.Solid.Path);
+    }
+
+    [Fact]
+    public void AxisQuarterTimestampsUseTheNativeTruncationRule()
+    {
+        var scene = Scene(
+            [
+                Point(1_000, 100, 0, 0, 0),
+                Point(1_103, 99, 1, 0, 0),
+            ],
+            1_000,
+            1_103);
+
+        var axes = GraphPlotProjection.BuildAxes(
+            scene,
+            TimeZoneInfo.Utc,
+            CultureInfo.InvariantCulture);
+
+        Assert.Equal(
+            [1_000L, 1_025L, 1_051L, 1_077L, 1_103L],
+            axes.BottomTimestampValues);
+    }
+
+    [Fact]
+    public void RemainingMarkersUseTheSameNormalizedIntegerBoundariesAsNative()
+    {
+        var scene = Scene(
+            [
+                Point(1_000, 100, 0, 0, 0),
+                Point(1_060, 97.5, 10, 0, 0),
+            ],
+            1_000,
+            1_060);
+
+        var markers = GraphPlotProjection.BuildCanonicalRemainingMarkers(scene);
+
+        Assert.Equal([99, 98], markers.Select(marker => marker.Boundary));
+        Assert.Equal([40d, 80d], markers.Select(marker => marker.X));
+        Assert.Collection(
+            markers,
+            marker => Assert.Equal(1.98d, marker.YTop, precision: 12),
+            marker => Assert.Equal(2.96d, marker.YTop, precision: 12));
     }
 
     [Fact]
@@ -800,16 +896,17 @@ public sealed class GraphPlotControlTests
         Assert.Equal(
             [GraphSeries.Luna, GraphSeries.Remaining, GraphSeries.Terra, GraphSeries.Sol],
             labels.Select(label => label.Series));
-        Assert.Equal(["LUNA $6.00", "75%", "TERRA $4.00", "SOL $2.00"], labels.Select(label => label.Text));
-        Assert.Equal(0d, labels[0].NormalizedTop);
-        Assert.Equal(0.25d, labels[1].NormalizedTop);
-        Assert.Equal(1d - 4d / 6d, labels[2].NormalizedTop, precision: 12);
-        Assert.Equal(1d - 2d / 6d, labels[3].NormalizedTop, precision: 12);
-        Assert.Equal(5.85d, labels[0].AxisValue, precision: 12);
-        Assert.Equal(75d, labels[1].AxisValue, precision: 12);
-        Assert.Equal(4d, labels[2].AxisValue, precision: 12);
-        Assert.Equal(2d, labels[3].AxisValue, precision: 12);
-        Assert.True(labels.Zip(labels.Skip(1)).All(pair => pair.Second.ArrangedTop - pair.First.ArrangedTop >= 0.062));
+        Assert.Equal(["$6.00", "75%", "$4.00", "$2.00"], labels.Select(label => label.Text));
+        Assert.Equal(0.01d, labels[0].NormalizedTop, precision: 7);
+        Assert.Equal(0.255d, labels[1].NormalizedTop, precision: 7);
+        Assert.Equal((double)(float)(0.99d - 0.98d * 4d / 6d), labels[2].NormalizedTop);
+        Assert.Equal((double)(float)(0.99d - 0.98d * 2d / 6d), labels[3].NormalizedTop);
+        Assert.Equal((0.99d - labels[0].ArrangedTop) / 0.98d * 6d, labels[0].AxisValue, precision: 7);
+        Assert.Equal((0.99d - labels[1].ArrangedTop) / 0.98d * 100d, labels[1].AxisValue, precision: 7);
+        Assert.Equal((0.99d - labels[2].ArrangedTop) / 0.98d * 6d, labels[2].AxisValue, precision: 7);
+        Assert.Equal((0.99d - labels[3].ArrangedTop) / 0.98d * 6d, labels[3].AxisValue, precision: 7);
+        Assert.True(labels.Zip(labels.Skip(1)).All(pair =>
+            pair.Second.ArrangedTop - pair.First.ArrangedTop >= 16d / 204d - 1e-7));
     }
 
     [Fact]
@@ -1212,9 +1309,7 @@ public sealed class GraphPlotControlTests
         var labels = GraphPlotProjection.BuildEndpointLabels(scene, CultureInfo.InvariantCulture);
         Assert.Contains(labels, label =>
             label.Series == GraphSeries.Sol &&
-            label.Text.EndsWith(
-                expected.GetProperty("latest_labels").GetProperty("SOL").GetString()!,
-                StringComparison.Ordinal));
+            label.Text == expected.GetProperty("latest_labels").GetProperty("SOL").GetString());
         Assert.Contains(labels, label =>
             label.Series == GraphSeries.Remaining &&
             label.Text == expected.GetProperty("latest_labels").GetProperty("remaining").GetString());
@@ -1225,9 +1320,10 @@ public sealed class GraphPlotControlTests
     {
         var evidencePath = Environment.GetEnvironmentVariable("CODEX_INFO_GRAPH_LIVE_EVIDENCE");
         var outputPath = Environment.GetEnvironmentVariable("CODEX_INFO_GRAPH_ACTUAL_OUTPUT");
+        var imagePath = Environment.GetEnvironmentVariable("CODEX_INFO_GRAPH_IMAGE_OUTPUT");
         var sourceSha = Environment.GetEnvironmentVariable("CODEX_INFO_GRAPH_SOURCE_SHA");
         var repositoryRoot = Environment.GetEnvironmentVariable("CODEX_INFO_GRAPH_REPOSITORY_ROOT");
-        if (evidencePath is null && outputPath is null && sourceSha is null && repositoryRoot is null)
+        if (evidencePath is null && outputPath is null && imagePath is null && sourceSha is null && repositoryRoot is null)
         {
             return;
         }
@@ -1238,15 +1334,20 @@ public sealed class GraphPlotControlTests
         Assert.False(string.IsNullOrWhiteSpace(repositoryRoot));
         var fullEvidencePath = Path.GetFullPath(evidencePath!);
         var fullOutputPath = Path.GetFullPath(outputPath!);
+        var fullImagePath = imagePath is null ? null : Path.GetFullPath(imagePath);
         var fullRepositoryRoot = Path.GetFullPath(repositoryRoot!);
         Assert.True(Path.IsPathFullyQualified(evidencePath));
         Assert.True(Path.IsPathFullyQualified(outputPath));
+        Assert.True(imagePath is null || Path.IsPathFullyQualified(imagePath));
         Assert.True(Path.IsPathFullyQualified(repositoryRoot));
         Assert.True(File.Exists(fullEvidencePath));
         Assert.False(File.Exists(fullOutputPath));
+        Assert.True(fullImagePath is null || !File.Exists(fullImagePath));
         Assert.True(Directory.Exists(Path.GetDirectoryName(fullOutputPath)));
+        Assert.True(fullImagePath is null || Directory.Exists(Path.GetDirectoryName(fullImagePath)));
         Assert.False(PathIsInside(fullEvidencePath, fullRepositoryRoot));
         Assert.False(PathIsInside(fullOutputPath, fullRepositoryRoot));
+        Assert.True(fullImagePath is null || !PathIsInside(fullImagePath, fullRepositoryRoot));
 
         using var artifact = JsonDocument.Parse(File.ReadAllText(fullEvidencePath));
         var root = artifact.RootElement;
@@ -1273,7 +1374,7 @@ public sealed class GraphPlotControlTests
         var page = Assert.IsType<ApiHistoryPage>(pageResult.Page);
         Assert.Equal(periods.PublishedPair, page.PublishedPair);
         Assert.Equal(pair, periods.PublishedPair.ToString());
-        var parsedPeriod = Assert.Single(periods.Periods, candidate => candidate.Current);
+        var parsedPeriod = Assert.Single(periods.Periods, candidate => candidate.Id == periodId);
         var period = parsedPeriod with { Samples = page.Samples };
         var samples = GraphWindowViewModel.BuildGraphSamples(period, period.EndAt);
         var gaps = page.HistoryGaps
@@ -1348,12 +1449,22 @@ public sealed class GraphPlotControlTests
             pair,
             "windows",
             orderedActual,
-            actualIdle);
+            actualIdle,
+            new Dictionary<string, LiveRenderContract>(StringComparer.Ordinal)
+            {
+                ["dollars"] = BuildLiveRenderContract(dollarScene),
+                ["tokens"] = BuildLiveRenderContract(tokenScene),
+            });
         using var output = new FileStream(fullOutputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
         JsonSerializer.Serialize(output, actual, new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
         });
+        if (fullImagePath is not null)
+        {
+            var imageControl = new GraphPlotControl { Scene = dollarScene };
+            imageControl.Plot.SavePng(fullImagePath, 940, 480);
+        }
     }
 
     [Fact]
@@ -1503,7 +1614,7 @@ public sealed class GraphPlotControlTests
             {
                 Assert.Contains(labels, label =>
                     label.Series == series &&
-                    label.Text == $"{name} {expected.GetProperty(labelProperty).GetProperty(name).GetString()}");
+                    label.Text == expected.GetProperty(labelProperty).GetProperty(name).GetString());
             }
         }
     }
@@ -2146,6 +2257,117 @@ public sealed class GraphPlotControlTests
             candidate.StartsWith(normalizedRoot + Path.DirectorySeparatorChar, comparison);
     }
 
+    private static LiveRenderContract BuildLiveRenderContract(GraphScene scene)
+    {
+        var span = Math.Max(1d, scene.PeriodEndAt - scene.PeriodStartAt);
+        var models = scene.ModelSeries
+            .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+            .Select(pair =>
+            {
+                var lines = GraphPlotProjection.BuildCanonicalModelLines(scene, pair.Value);
+                return new LiveModelRenderPaths(
+                    pair.Key,
+                    lines.Flat.Path,
+                    lines.Rising.Path,
+                    lines.Dashed.Path);
+            })
+            .ToArray();
+        var remaining = GraphPlotProjection.BuildCanonicalRemainingLines(scene);
+        var markers = GraphPlotProjection.BuildCanonicalRemainingMarkers(scene)
+            .Select(marker => new LiveRemainingMarker(
+                marker.X.ToString("F12", CultureInfo.InvariantCulture),
+                marker.YTop.ToString("F12", CultureInfo.InvariantCulture),
+                marker.Boundary))
+            .ToArray();
+        var idle = scene.IdleIntervals
+            .Select(interval => new LiveIdleGeometry(
+                ((interval.StartAt - scene.PeriodStartAt) / span * 100)
+                    .ToString("F12", CultureInfo.InvariantCulture),
+                ((interval.EndAt - interval.StartAt) / span * 100)
+                    .ToString("F12", CultureInfo.InvariantCulture)))
+            .ToArray();
+        var axes = GraphPlotProjection.BuildAxes(
+            scene,
+            TimeZoneInfo.Utc,
+            CultureInfo.InvariantCulture);
+        var endpointLabels = GraphPlotProjection.BuildEndpointLabels(
+                scene,
+                CultureInfo.InvariantCulture)
+            .Select(label => new LiveEndpointLabel(
+                label.Series == GraphSeries.Remaining ? "remaining" : label.Series.ToString().ToUpperInvariant(),
+                label.Text,
+                label.NormalizedTop.ToString("F9", CultureInfo.InvariantCulture),
+                label.ArrangedTop.ToString("F9", CultureInfo.InvariantCulture)))
+            .ToArray();
+        var axisGridY = axes.ModelValues
+            .Reverse()
+            .Select(value =>
+                ((axes.ModelDisplayMaximum - value) /
+                 (axes.ModelDisplayMaximum - axes.ModelDisplayMinimum))
+                .ToString("F12", CultureInfo.InvariantCulture))
+            .ToArray();
+        var gutterWidth = scene.Metric == GraphMetric.Tokens
+            ? GraphPlotProjection.TokenLabelGutterWidth
+            : GraphPlotProjection.DollarLabelGutterWidth;
+        var remainingPoints = scene.Timestamps
+            .Select((timestamp, index) => new LiveRemainingPoint(
+                (long)timestamp,
+                scene.Remaining[index].ToString("F12", CultureInfo.InvariantCulture),
+                RemainingOriginName(scene, scene.RemainingOrigins[index], index)))
+            .Where(point => point.Value != "NaN")
+            .ToList();
+        if (remainingPoints.Count > 0 &&
+            scene.RemainingObserved.Any(observed => observed) &&
+            scene.PeriodEndAt > remainingPoints[^1].Timestamp)
+        {
+            // BuildRemainingLines renders this same horizontal dashed hold.
+            // Include it in the renderer contract without inventing a source
+            // history observation in BuildGraphSamples.
+            remainingPoints.Add(new LiveRemainingPoint(
+                scene.PeriodEndAt,
+                remainingPoints[^1].Value,
+                "synthetic_tail_hold"));
+        }
+        return new LiveRenderContract(
+            [100, 100],
+            scene.ModelMaximum.ToString("F12", CultureInfo.InvariantCulture),
+            axes.BottomTimestampValues,
+            axes.ModelLabels.Reverse().ToArray(),
+            axisGridY,
+            endpointLabels,
+            new LiveGraphLayout(
+                788,
+                788 - gutterWidth,
+                gutterWidth,
+                GraphPlotProjection.EndpointLabelGapWidth,
+                gutterWidth - GraphPlotProjection.EndpointLabelGapWidth - 4,
+                4,
+                GraphPlotProjection.MinimumPlotHeight),
+            new LiveGraphStyles(
+                GraphPlotControl.PlotColorHex,
+                GraphPlotControl.GridColorHex,
+                GraphPlotControl.AxisTextColorHex,
+                GraphPlotControl.IdleBandColorHex.ToLowerInvariant(),
+                GraphPlotControl.RemainingColorHex,
+                GraphPlotControl.SolColorHex,
+                GraphPlotControl.TerraColorHex,
+                GraphPlotControl.LunaColorHex,
+                GraphPlotControl.AstraColorHex,
+                GraphPlotControl.MeasuredFlatModelLineWidth,
+                GraphPlotControl.MeasuredModelLineWidth,
+                GraphPlotControl.InferredLineWidth,
+                GraphPlotControl.MeasuredRemainingLineWidth,
+                2,
+                "0.95",
+                "0.95",
+                "0.72"),
+            idle,
+            models,
+            new LiveRemainingRenderPaths(remaining.Solid.Path, remaining.Dashed.Path),
+            markers,
+            remainingPoints);
+    }
+
     private sealed record LiveGraphSegment(
         string Metric,
         string Series,
@@ -2155,6 +2377,69 @@ public sealed class GraphPlotControlTests
 
     private sealed record LiveIdleInterval(long StartAt, long EndAt);
 
+    private sealed record LiveIdleGeometry(string Start, string Width);
+
+    private sealed record LiveModelRenderPaths(
+        string Series,
+        string Flat,
+        string Rising,
+        string Dashed);
+
+    private sealed record LiveRemainingRenderPaths(string Solid, string Dashed);
+
+    private sealed record LiveRemainingMarker(string X, string YTop, int Boundary);
+
+    private sealed record LiveRemainingPoint(long Timestamp, string Value, string Origin);
+
+    private sealed record LiveEndpointLabel(
+        string Series,
+        string Text,
+        string PointY,
+        string LabelY);
+
+    private sealed record LiveGraphLayout(
+        double ReferenceDataWidth,
+        double PlotWidth,
+        double GutterWidth,
+        double LabelGap,
+        double LabelWidth,
+        double RightPadding,
+        double MinimumPlotHeight);
+
+    private sealed record LiveGraphStyles(
+        string PlotSurface,
+        string Grid,
+        string AxisText,
+        string IdleBand,
+        string Remaining,
+        string Sol,
+        string Terra,
+        string Luna,
+        string Astra,
+        float FlatWidth,
+        float RisingWidth,
+        float InferredWidth,
+        float RemainingWidth,
+        int MarkerSize,
+        string FlatOpacity,
+        string RisingOpacity,
+        string InferredOpacity);
+
+    private sealed record LiveRenderContract(
+        IReadOnlyList<int> Viewbox,
+        string ModelMaximum,
+        IReadOnlyList<long> TimeTicks,
+        IReadOnlyList<string> AxisLabels,
+        IReadOnlyList<string> AxisGridY,
+        IReadOnlyList<LiveEndpointLabel> EndpointLabels,
+        LiveGraphLayout Layout,
+        LiveGraphStyles Styles,
+        IReadOnlyList<LiveIdleGeometry> IdleGeometry,
+        IReadOnlyList<LiveModelRenderPaths> Models,
+        LiveRemainingRenderPaths Remaining,
+        IReadOnlyList<LiveRemainingMarker> RemainingMarkers,
+        IReadOnlyList<LiveRemainingPoint> RemainingPoints);
+
     private sealed record LiveActualDocument(
         string SchemaVersion,
         string SourceSha,
@@ -2162,7 +2447,8 @@ public sealed class GraphPlotControlTests
         string PublishedPair,
         string Platform,
         IReadOnlyList<LiveGraphSegment> Segments,
-        IReadOnlyList<LiveIdleInterval> IdleIntervals);
+        IReadOnlyList<LiveIdleInterval> IdleIntervals,
+        IReadOnlyDictionary<string, LiveRenderContract> RenderContracts);
 
     private static string RemainingOriginName(
         GraphScene scene,

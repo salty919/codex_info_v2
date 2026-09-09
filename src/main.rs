@@ -5415,6 +5415,10 @@ fn append_dashed_segment(commands: &mut String, start: (f64, f64), end: (f64, f6
     }
 }
 
+fn canonical_graph_viewbox_value(value: f64) -> f64 {
+    (value * 1_000_000_000_000.0).round() / 1_000_000_000_000.0
+}
+
 #[cfg(test)]
 fn split_metric_line_paths(
     points: &[HourlyModelSpend],
@@ -5632,7 +5636,10 @@ fn split_metric_line_paths_with_boundaries(
     let coordinate = |point: &HourlyModelSpend| {
         let x = ((point.timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
         let y = (99.0 - value(point).max(0.0) / scale * 98.0).clamp(1.0, 99.0);
-        (x, y)
+        (
+            canonical_graph_viewbox_value(x),
+            canonical_graph_viewbox_value(y),
+        )
     };
     let mut flat = String::new();
     let mut rising = String::new();
@@ -7089,7 +7096,10 @@ fn remaining_paths_with_boundaries(
     let coordinate = |(timestamp, raw): (i64, f64)| {
         let x = ((timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
         let y = (99.0 - raw.clamp(0.0, 100.0) * 0.98).clamp(1.0, 99.0);
-        (x, y)
+        (
+            canonical_graph_viewbox_value(x),
+            canonical_graph_viewbox_value(y),
+        )
     };
     let mut solid_commands = String::new();
     let mut inferred_commands = String::new();
@@ -21925,15 +21935,14 @@ mod tests {
         .expect("period fixture bytes");
         let periods = super::parse_service_history_periods_document(&periods_body)
             .expect("strict live period fixture");
+        let selected_period_id = fixture["period"]["id"]
+            .as_str()
+            .expect("selected live period id");
         let period = periods
             .iter()
-            .find(|candidate| candidate.current)
-            .expect("one current live period")
+            .find(|candidate| candidate.id == selected_period_id)
+            .expect("selected live period")
             .clone();
-        assert_eq!(
-            periods.iter().filter(|candidate| candidate.current).count(),
-            1
-        );
         let page = super::parse_service_history_page_document(
             &serde_json::to_vec(&fixture["history_page"]).expect("history fixture bytes"),
         )
@@ -21993,7 +22002,13 @@ mod tests {
                 end_at: gap.end_at,
             })
             .collect::<Vec<_>>();
+        let raw_model_timelines = state.graph_raw_model_timelines_for_selection(
+            period.reset_at,
+            period.start_at,
+            period.end_at,
+        );
         let mut actual_segments = Vec::<Value>::new();
+        let mut render_contracts = serde_json::Map::new();
         let mut token_timelines = None;
         let mut token_correction_starts = BTreeSet::new();
         for (show_tokens, metric) in [(false, "dollars"), (true, "tokens")] {
@@ -22011,6 +22026,207 @@ mod tests {
                 show_tokens,
                 &untrusted_minutes,
                 &timelines,
+            );
+            let mut render_paths =
+                super::graph_paths_for_selection_with_sources_and_astra_with_lineage(
+                    &references,
+                    period.start_at,
+                    period.end_at,
+                    true,
+                    true,
+                    true,
+                    true,
+                    show_tokens,
+                    &untrusted_minutes,
+                    &confirmed_gaps,
+                    &raw_model_timelines,
+                );
+            super::separate_current_label_positions(
+                &mut render_paths,
+                true,
+                true,
+                true,
+                true,
+                true,
+            );
+            let maximum = minute
+                .iter()
+                .map(|point| point.sol.max(point.terra).max(point.luna).max(point.astra))
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            let span = (period.end_at - period.start_at).max(1) as f64;
+            let idle_geometry = render_paths
+                .unused_intervals
+                .iter()
+                .map(|interval| {
+                    serde_json::json!({
+                        "start": format!("{:.12}", interval.start),
+                        "width": format!("{:.12}", interval.width),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let remaining_markers = render_paths
+                .remaining_markers
+                .iter()
+                .map(|marker| {
+                    serde_json::json!({
+                        "x": format!("{:.12}", marker.x),
+                        "y_top": format!("{:.12}", marker.y),
+                        "boundary": marker.boundary,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let model_paths = [
+                (
+                    "ASTRA",
+                    &render_paths.astra_flat,
+                    &render_paths.astra_rising,
+                    &render_paths.astra_inferred,
+                ),
+                (
+                    "LUNA",
+                    &render_paths.luna_flat,
+                    &render_paths.luna_rising,
+                    &render_paths.luna_inferred,
+                ),
+                (
+                    "SOL",
+                    &render_paths.sol_flat,
+                    &render_paths.sol_rising,
+                    &render_paths.sol_inferred,
+                ),
+                (
+                    "TERRA",
+                    &render_paths.terra_flat,
+                    &render_paths.terra_rising,
+                    &render_paths.terra_inferred,
+                ),
+            ]
+            .into_iter()
+            .filter(|(name, _, _, _)| timelines.contains_key(*name))
+            .map(|(name, flat, rising, dashed)| {
+                serde_json::json!({
+                    "series": name,
+                    "flat": flat,
+                    "rising": rising,
+                    "dashed": dashed,
+                })
+            })
+            .collect::<Vec<_>>();
+            let time_ticks = [0.0, 0.25, 0.5, 0.75, 1.0]
+                .map(|fraction| period.start_at + (span * fraction) as i64);
+            let mut endpoint_labels = [
+                (
+                    0_u8,
+                    "remaining",
+                    &render_paths.current_remaining_label,
+                    render_paths.current_remaining_point_y,
+                    render_paths.current_remaining_y,
+                ),
+                (
+                    1,
+                    "LUNA",
+                    &render_paths.current_luna_label,
+                    render_paths.current_luna_point_y,
+                    render_paths.current_luna_y,
+                ),
+                (
+                    2,
+                    "TERRA",
+                    &render_paths.current_terra_label,
+                    render_paths.current_terra_point_y,
+                    render_paths.current_terra_y,
+                ),
+                (
+                    3,
+                    "SOL",
+                    &render_paths.current_sol_label,
+                    render_paths.current_sol_point_y,
+                    render_paths.current_sol_y,
+                ),
+                (
+                    4,
+                    "ASTRA",
+                    &render_paths.current_astra_label,
+                    render_paths.current_astra_point_y,
+                    render_paths.current_astra_y,
+                ),
+            ]
+            .into_iter()
+            .filter(|(_, _, label, _, _)| !label.is_empty())
+            .collect::<Vec<_>>();
+            endpoint_labels.sort_by(|left, right| {
+                left.4
+                    .total_cmp(&right.4)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            let endpoint_labels = endpoint_labels
+                .into_iter()
+                .map(|(_, series, label, point_y, label_y)| {
+                    serde_json::json!({
+                        "series": series,
+                        "text": label,
+                        "point_y": format!("{point_y:.9}"),
+                        "label_y": format!("{label_y:.9}"),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let (plot_width, gutter_width, label_width) = if show_tokens {
+                (662, 126, 112)
+            } else {
+                (694, 94, 80)
+            };
+            render_contracts.insert(
+                metric.to_owned(),
+                serde_json::json!({
+                    "viewbox": [100, 100],
+                    "model_maximum": format!("{maximum:.12}"),
+                    "time_ticks": time_ticks,
+                    "axis_labels": render_paths.dollar_labels,
+                    "axis_grid_y": [
+                        "0.000000000000",
+                        "0.250000000000",
+                        "0.500000000000",
+                        "0.750000000000",
+                        "1.000000000000",
+                    ],
+                    "endpoint_labels": endpoint_labels,
+                    "layout": {
+                        "reference_data_width": 788,
+                        "plot_width": plot_width,
+                        "gutter_width": gutter_width,
+                        "label_gap": 10,
+                        "label_width": label_width,
+                        "right_padding": 4,
+                        "minimum_plot_height": 204,
+                    },
+                    "styles": {
+                        "plot_surface": "#121c2c",
+                        "grid": "#263850",
+                        "axis_text": "#78879c",
+                        "idle_band": "#1a2838",
+                        "remaining": "#56b2f5",
+                        "sol": "#a88cf5",
+                        "terra": "#5dc98a",
+                        "luna": "#e6a23c",
+                        "astra": "#ef6a6a",
+                        "flat_width": 1,
+                        "rising_width": 3,
+                        "inferred_width": 1,
+                        "remaining_width": 3,
+                        "marker_size": 2,
+                        "flat_opacity": "0.95",
+                        "rising_opacity": "0.95",
+                        "inferred_opacity": "0.72",
+                    },
+                    "idle_geometry": idle_geometry,
+                    "models": model_paths,
+                    "remaining": {
+                        "solid": render_paths.remaining_solid,
+                        "dashed": render_paths.remaining_inferred,
+                    },
+                    "remaining_markers": remaining_markers,
+                }),
             );
             for model in timelines.keys() {
                 let untrusted = super::graph_model_untrusted_minutes(
@@ -22063,6 +22279,34 @@ mod tests {
             &confirmed_gaps,
             &token_correction_starts,
         );
+        let remaining_contract_points = remaining_evidence
+            .iter()
+            .map(|point| {
+                let origin = match point.origin {
+                    super::GraphRemainingOrigin::Raw => "raw",
+                    super::GraphRemainingOrigin::ActivitySmoothed => "activity_smoothed",
+                    super::GraphRemainingOrigin::Interpolated => "interpolated",
+                    super::GraphRemainingOrigin::BoundedNullHold => "bounded_null_hold",
+                    super::GraphRemainingOrigin::TerminalNullHold => "terminal_null_hold",
+                    super::GraphRemainingOrigin::SyntheticTailHold => "synthetic_tail_hold",
+                    super::GraphRemainingOrigin::MonotonicHold => "monotonic_hold",
+                };
+                serde_json::json!({
+                    "timestamp": point.timestamp,
+                    "value": format!("{:.12}", point.effective),
+                    "origin": origin,
+                })
+            })
+            .collect::<Vec<_>>();
+        for contract in render_contracts.values_mut() {
+            contract
+                .as_object_mut()
+                .expect("render contract object")
+                .insert(
+                    "remaining_points".to_owned(),
+                    Value::Array(remaining_contract_points.clone()),
+                );
+        }
         let remaining_points = remaining_evidence
             .iter()
             .map(|point| (point.timestamp, point.effective))
@@ -22144,6 +22388,7 @@ mod tests {
             "platform": "linux",
             "segments": actual_segments,
             "idle_intervals": actual_idle,
+            "render_contracts": render_contracts,
         });
         let output = std::fs::OpenOptions::new()
             .write(true)

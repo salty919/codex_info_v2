@@ -20,25 +20,33 @@ namespace CodexInfo.WindowsClient.Controls;
 /// </summary>
 public sealed class GraphPlotControl : AvaPlot
 {
-    private static readonly ScottPlot.Color RemainingColor = new("#56B2F5");
-    private static readonly ScottPlot.Color SolColor = new("#A88CF5");
-    private static readonly ScottPlot.Color TerraColor = new("#5DC98A");
-    private static readonly ScottPlot.Color LunaColor = new("#E6A23C");
-    private static readonly ScottPlot.Color AstraColor = new("#E86E9F");
+    internal const string RemainingColorHex = "#56b2f5";
+    internal const string SolColorHex = "#a88cf5";
+    internal const string TerraColorHex = "#5dc98a";
+    internal const string LunaColorHex = "#e6a23c";
+    internal const string AstraColorHex = "#ef6a6a";
+    internal const string AxisTextColorHex = "#78879c";
+    internal const string GridColorHex = "#263850";
+    internal const string PlotColorHex = "#121c2c";
+    private static readonly ScottPlot.Color RemainingColor = new(RemainingColorHex);
+    private static readonly ScottPlot.Color SolColor = new(SolColorHex);
+    private static readonly ScottPlot.Color TerraColor = new(TerraColorHex);
+    private static readonly ScottPlot.Color LunaColor = new(LunaColorHex);
+    private static readonly ScottPlot.Color AstraColor = new(AstraColorHex);
     internal const string IdleBandColorHex = "#1A2838";
     internal const double IdleBandOpacity = 1.0;
     internal const float MeasuredModelLineWidth = 3f;
     internal const float MeasuredFlatModelLineWidth = 1f;
     internal const float MeasuredRemainingLineWidth = 3f;
     internal const float InferredLineWidth = 1f;
-    internal static ScottPlot.LinePattern InferredLinePattern => ScottPlot.LinePattern.DenselyDashed;
     private static readonly ScottPlot.Color IdleBandColor = new(IdleBandColorHex);
-    private static readonly ScottPlot.Color MutedColor = new("#A8B7CA");
-    private static readonly ScottPlot.Color GridColor = new("#263548");
-    private static readonly ScottPlot.Color PlotColor = new("#101925");
+    private static readonly ScottPlot.Color MutedColor = new(AxisTextColorHex);
+    private static readonly ScottPlot.Color GridColor = new(GridColorHex);
+    private static readonly ScottPlot.Color PlotColor = new(PlotColorHex);
 
     private ScottPlot.Plottables.Scatter? remainingSeries;
     private ScottPlot.Plottables.Scatter? remainingDashedSeries;
+    private ScottPlot.Plottables.Scatter? remainingMarkers;
     private ModelSeriesVisual? solSeries;
     private ModelSeriesVisual? terraSeries;
     private ModelSeriesVisual? lunaSeries;
@@ -121,6 +129,7 @@ public sealed class GraphPlotControl : AvaPlot
         Plot.Clear();
         remainingSeries = null;
         remainingDashedSeries = null;
+        remainingMarkers = null;
         solSeries = null;
         terraSeries = null;
         lunaSeries = null;
@@ -162,23 +171,42 @@ public sealed class GraphPlotControl : AvaPlot
             band.LineWidth = 0;
         }
 
-        lunaSeries = AddModelSeries(scene, scene.Luna, LunaColor);
-        terraSeries = AddModelSeries(scene, scene.Terra, TerraColor);
-        solSeries = AddModelSeries(scene, scene.Sol, SolColor);
-        astraSeries = AddModelSeries(scene, scene.Astra, AstraColor);
-        var remainingLines = GraphPlotProjection.BuildRemainingLines(scene);
+        // Match the native graph's painter order: endpoint leaders sit below
+        // the data strokes, inferred model paths precede measured paths, and
+        // Remaining is painted last over its boundary markers.
+        AddEndpointLabels(scene, axes);
+        var lunaLines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Luna);
+        var terraLines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Terra);
+        var solLines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol);
+        var astraLines = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Astra);
+        var lunaDashed = AddLine(lunaLines.Dashed.Line, LunaColor.WithOpacity(0.72), Plot.Axes.Left, InferredLineWidth);
+        var terraDashed = AddLine(terraLines.Dashed.Line, TerraColor.WithOpacity(0.72), Plot.Axes.Left, InferredLineWidth);
+        var solDashed = AddLine(solLines.Dashed.Line, SolColor.WithOpacity(0.72), Plot.Axes.Left, InferredLineWidth);
+        var astraDashed = AddLine(astraLines.Dashed.Line, AstraColor.WithOpacity(0.72), Plot.Axes.Left, InferredLineWidth);
+        var lunaFlat = AddLine(lunaLines.Flat.Line, LunaColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredFlatModelLineWidth);
+        var astraFlat = AddLine(astraLines.Flat.Line, AstraColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredFlatModelLineWidth);
+        var astraRising = AddLine(astraLines.Rising.Line, AstraColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredModelLineWidth);
+        var lunaRising = AddLine(lunaLines.Rising.Line, LunaColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredModelLineWidth);
+        var terraFlat = AddLine(terraLines.Flat.Line, TerraColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredFlatModelLineWidth);
+        var terraRising = AddLine(terraLines.Rising.Line, TerraColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredModelLineWidth);
+        var solFlat = AddLine(solLines.Flat.Line, SolColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredFlatModelLineWidth);
+        var solRising = AddLine(solLines.Rising.Line, SolColor.WithOpacity(0.95), Plot.Axes.Left, MeasuredModelLineWidth);
+        lunaSeries = new ModelSeriesVisual(lunaFlat, lunaRising, lunaDashed);
+        terraSeries = new ModelSeriesVisual(terraFlat, terraRising, terraDashed);
+        solSeries = new ModelSeriesVisual(solFlat, solRising, solDashed);
+        astraSeries = new ModelSeriesVisual(astraFlat, astraRising, astraDashed);
+        var remainingLines = GraphPlotProjection.BuildCanonicalRemainingLines(scene);
+        remainingDashedSeries = AddLine(
+            remainingLines.Dashed.Line,
+            RemainingColor.WithOpacity(0.72),
+            Plot.Axes.Right,
+            InferredLineWidth);
+        remainingMarkers = AddRemainingMarkers(scene);
         remainingSeries = AddLine(
-            remainingLines.Solid,
+            remainingLines.Solid.Line,
             RemainingColor,
             Plot.Axes.Right,
             MeasuredRemainingLineWidth);
-        remainingDashedSeries = AddLine(
-            remainingLines.Dashed,
-            RemainingColor.WithOpacity(0.72),
-            Plot.Axes.Right,
-            InferredLineWidth,
-            dashed: true);
-        AddEndpointLabels(scene, axes);
         ApplyAxes(scene, axes);
         ApplyVisibility();
         ScheduleReferenceCapture(
@@ -211,24 +239,11 @@ public sealed class GraphPlotControl : AvaPlot
             CultureInfo.CurrentCulture);
     }
 
-    private ModelSeriesVisual AddModelSeries(
-        GraphScene scene,
-        IReadOnlyList<double> values,
-        ScottPlot.Color color)
-    {
-        var lines = GraphPlotProjection.BuildModelLines(scene, values);
-        return new ModelSeriesVisual(
-            AddLine(lines.Flat, color.WithOpacity(0.95), Plot.Axes.Left, MeasuredFlatModelLineWidth),
-            AddLine(lines.Rising, color.WithOpacity(0.95), Plot.Axes.Left, MeasuredModelLineWidth),
-            AddLine(lines.Dashed, color.WithOpacity(0.72), Plot.Axes.Left, InferredLineWidth, dashed: true));
-    }
-
     private ScottPlot.Plottables.Scatter? AddLine(
         GraphLineProjection line,
         ScottPlot.Color color,
         ScottPlot.IYAxis axis,
-        float lineWidth,
-        bool dashed = false)
+        float lineWidth)
     {
         if (line.X.Count < 2)
         {
@@ -237,11 +252,28 @@ public sealed class GraphPlotControl : AvaPlot
         var series = Plot.Add.Scatter(line.X.ToArray(), line.Y.ToArray(), color);
         series.Axes.YAxis = axis;
         series.LineWidth = lineWidth;
-        if (dashed)
-        {
-            series.LinePattern = InferredLinePattern;
-        }
         series.MarkerSize = 0;
+        return series;
+    }
+
+    private ScottPlot.Plottables.Scatter? AddRemainingMarkers(GraphScene scene)
+    {
+        var markers = GraphPlotProjection.BuildCanonicalRemainingMarkers(scene);
+        if (markers.Count == 0)
+        {
+            return null;
+        }
+        var span = scene.PeriodEndAt - scene.PeriodStartAt;
+        var x = markers
+            .Select(marker => scene.PeriodStartAt + marker.X / 100 * span)
+            .ToArray();
+        var y = markers
+            .Select(marker => Math.Clamp((99 - marker.YTop) / 0.98, 0, 100))
+            .ToArray();
+        var series = Plot.Add.Scatter(x, y, RemainingColor);
+        series.Axes.YAxis = Plot.Axes.Right;
+        series.LineWidth = 0;
+        series.MarkerSize = 2;
         return series;
     }
 
@@ -470,7 +502,7 @@ public sealed class GraphPlotControl : AvaPlot
             var connector = Plot.Add.Scatter(
                 connectorX,
                 new double[] { endpoint.PointAxisValue, endpoint.AxisValue },
-                color.WithOpacity(0.75));
+                color.WithOpacity(0.8));
             connector.Axes.YAxis = axis;
             connector.LineWidth = 1;
             connector.MarkerSize = 0;
@@ -478,12 +510,12 @@ public sealed class GraphPlotControl : AvaPlot
             var label = Plot.Add.Text(endpoint.Text, axes.EndpointLabelAt, endpoint.AxisValue);
             label.Axes.YAxis = axis;
             label.Alignment = ScottPlot.Alignment.MiddleLeft;
-            label.OffsetX = 4;
+            label.OffsetX = 0;
             label.LabelFontColor = color;
             label.LabelFontName = "Noto Sans JP Medium";
-            label.LabelFontSize = 11;
-            label.LabelBackgroundColor = PlotColor.WithOpacity(0.82);
-            label.LabelPadding = 2;
+            label.LabelFontSize = 10;
+            label.LabelBackgroundColor = PlotColor.WithOpacity(0);
+            label.LabelPadding = 0;
             switch (endpoint.Series)
             {
                 case GraphSeries.Remaining:
@@ -506,7 +538,13 @@ public sealed class GraphPlotControl : AvaPlot
 
     private void ApplyVisibility()
     {
-        SetVisible(remainingSeries, remainingDashedSeries, remainingConnector, remainingLabel, ShowRemaining);
+        SetVisible(
+            remainingSeries,
+            remainingDashedSeries,
+            remainingMarkers,
+            remainingConnector,
+            remainingLabel,
+            ShowRemaining);
         SetVisible(solSeries, solConnector, solLabel, ShowModels && ShowSol);
         SetVisible(terraSeries, terraConnector, terraLabel, ShowModels && ShowTerra);
         SetVisible(lunaSeries, lunaConnector, lunaLabel, ShowModels && ShowLuna);
@@ -521,12 +559,14 @@ public sealed class GraphPlotControl : AvaPlot
     private static void SetVisible(
         ScottPlot.Plottables.Scatter? series,
         ScottPlot.Plottables.Scatter? dashedSeries,
+        ScottPlot.Plottables.Scatter? markers,
         ScottPlot.Plottables.Scatter? connector,
         ScottPlot.Plottables.Text? label,
         bool visible)
     {
         if (series is not null) series.IsVisible = visible;
         if (dashedSeries is not null) dashedSeries.IsVisible = visible;
+        if (markers is not null) markers.IsVisible = visible;
         if (connector is not null) connector.IsVisible = visible;
         if (label is not null) label.IsVisible = visible;
     }
