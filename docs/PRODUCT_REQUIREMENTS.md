@@ -281,7 +281,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 ## G137 Linux / Windows 履歴グラフ同値契約
 
 `G137-GRAPH-01` は、同じstrict validation済み履歴resourceからLinux版とWindows版が
-同じ値、同じ線種、同じ切断、同じ未使用区間を表示するためのcross-platform契約である。
+同じ値、同じ線種、同じ連続区間、同じ未使用区間を表示するためのcross-platform契約である。
 表示geometryと色はUX owner、wireのschemaとheaderはWIRE ownerが所有するが、次の
 入力状態から表示上の事実へ至る意味とfailure isolationは本契約だけが所有する。
 
@@ -289,35 +289,79 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
    model universe `U`とする。model名はexact wire stringをUTF-8 unsigned byte列の
    case-sensitive lexicographic順（Unicode normalizationなし）に並べる。未掲載の
    `ASTRA`その他を既知modelとして創作せず、`U`が空ならmodel activityと未使用区間を作らない。
-2. `G137-2`: `model_source != unavailable`の掲載modelについて、選択metricのfiniteかつ
-   non-negativeな値を実測として保持する。v3の`confirmed && models_complete=true`では
+2. `G137-2`: `model_source != unavailable`の掲載modelについて、`total_tokens`と選択metricのfiniteかつ
+   non-negativeな値を実測候補として保持する。未使用判定はドル表示中も丸め前の`total_tokens`を使用し、
+   単価、ドル丸めまたは表示metricの同値をtoken不変へ読み替えない。v3の`confirmed && models_complete=true`では
    `U`内の未掲載modelだけを確定0とし、不完全rowの未掲載modelはunknownのまま0補完しない。
    v1/v2のfixed-column rowは`confirmed`かつ全fieldがstrict parse済みの場合だけcomplete相当とする。
-3. `G137-3`: 同一lineageのbaselineはmodelごとの直前accepted finite値とし、抑止した後退値では
-   更新しない。confirmed complete rowがいずれかのmodelでbaselineを下回る場合は、その時刻を
-   trusted correction boundaryとして全modelとRemainingの直前lineageを切るが、現在rowのfinite値は
-   捨てず新lineageの開始値として表示する。不完全またはunconfirmed rowの後退は当該modelだけを
-   unknownにし、旧baseline以上となる最初の値で復帰させ、他modelの実測値は保持する。
-4. `G137-4`: 優先順位はconfirmed recorder gap、trusted correction、model unavailable/regression、
-   idleの順とする。gapとcorrectionを越えて線または未使用帯を接続しない。strictに増加する隣接時刻の
-   差が60秒以下だけをcontiguousとし、それより疎な既知点間、unknownを飛び越す復帰線、期間末の
-   bounded holdは細い破線とする。hard breakはsynthetic tailより優先する。
-5. `G137-5`: 未使用帯は、contiguousでgap/correctionがなく、`U`の全modelが両endpointで
-   accepted finiteかつexactly equalな区間だけに置く。`models_complete=false`自体は除外理由にせず、
-   `U`内modelの片endpoint欠落、model増加、unavailable、gap、correction、synthetic tailを未使用へ
-   読み替えない。この表示が証明する範囲は「公開済み全modelに利用増加がない」に限定する。
+3. `G137-3`: 同一periodの累積model値は減少しない。baselineはmodelごとの直前accepted finite値とし、
+   source completenessを問わずbaseline未満のraw値は計測異常として表示値へ採用せずbaselineを更新しない。
+   60秒cadenceの3実測点`left,middle,right`で`left <= right`かつ`middle < left || middle > right`となる
+   isolated pulseも計測異常として`middle`を採用しない。残る候補を時刻順に走査し、最初のfinite non-negative値を
+   baselineとする。以後、候補がbaseline以上ならその値をacceptedとしてbaselineを更新し、baseline未満なら当該
+   metricだけrecovery stateへ入り値を採用しない。recovery中もbaselineを固定し、最初のfinite non-negativeかつ
+   `candidate >= baseline`の値だけをaccepted recoveryとしてstateを抜ける。それまでの候補は全て異常である。
+   rejected値の期間は直前baselineを細い破線holdし、accepted recoveryへ細い破線で接続する。period endまで復帰が
+   なければ同じbaselineを終端まで破線holdする。これをraw tokenとraw dollarへ独立に適用し、tokenだけ異常なら
+   token線だけ、dollarだけ異常ならdollar線だけを破線にする。他metricと他modelのaccepted実測は保持する。
+   idle判定の優先順位はconfirmed gap／unavailable、tokenまたはRemaining異常、基本未使用、限定1 cadence bridgeの
+   順とし、token異常とそのrecovery bridgeはidle不可、dollarだけの異常はtoken正本のidleを無効にしない。
+   period境界だけが新しい0起点を許し、period内補正を垂直落下または低い新lineageとして表示しない。
+4. `G137-4`: strictに増加する隣接時刻の差が60秒以下で、同じmodelが両endpointに実測され、当該表示metricの
+   異常または
+   recorder gapを跨がない区間だけをcontiguous measuredとする。それ以外の疎な既知点間、model欠測、
+   source集合変更、後退／回復、confirmed recorder gap、bounded／terminal holdは既知endpoint間を細い
+   破線で連続補完する。period endはaccepted periods resourceの同じpairにあるexact `end_at`とし、currentか
+   completedか、local clockがどこかによって置換しない。accepted値が1点以上ある系列はperiod内の最初の
+   accepted pointからperiod endまで空白区間を作らず、同一X座標のsegmentを作らない。最初のaccepted point
+   より前は創作せず、accepted値が0点のmodelは線・右端labelを、全modelが0点なら未使用帯も作らない。
+   最終accepted point後は長さを問わずperiod endまで細い破線holdとする。破線は予測であり、それ単独では
+   未使用の証拠にしない。
+5. `G137-5`: 未使用判定の正本は表示metricではなくraw `total_tokens`である。基本未使用区間は、時刻差が
+   strictに1..60秒のcontiguous measuredで、両endpointに実際に掲載された非空のmodel名集合がexactに同一、
+   その全modelのaccepted finite raw `total_tokens`がexactly equal、さらに両endpointのaccepted raw Remainingが
+   finiteかつexactly equalな区間だけとする。periodの和集合`U`に存在しても両endpointで未掲載のmodelはその
+   区間へ創作しない。ドルが同値でもtokenが増加した区間、tokenが同値でもRemainingが変化した区間、片endpoint
+   だけの欠落、model集合変更、unavailable、confirmed gap、tokenまたはRemainingの異常、synthetic holdは
+   未使用へ読み替えない。dollarだけの異常はdollar線の線種だけに影響し、token正本の未使用を消さない。
+
+   例外はexact 60秒cadenceで1 sampleだけ欠落したbridgeに限定する。`t0<t1<t2<t3`について
+   `t1-t0=60`、`t2-t1=120`、`t3-t2=60`で、`[t0,t1]`と`[t2,t3]`が基本未使用、4点の掲載model集合・
+   全raw `total_tokens`・raw Remainingがexactに同一、かつ`[t1,t2]`にconfirmed gap、token anomalyまたは
+   Remaining anomalyがない場合だけ、
+   `[t1,t2]`も未使用帯へ含める。このbridge上のmodel／Remaining線は欠測を示す破線のままとする。期間端、
+   片側に基本未使用がない孤立した120秒、121秒以上、2 sample以上の欠落、既知の内部変化、null、gap、anomalyは
+   bridgeしない。隣接する基本未使用とこの限定bridgeは単一bandへ結合し、画面幅、pixel丸め、gridまたはsegment
+   境界を理由に削除・分断しない。
 6. `G137-6`: non-nullでfiniteな0..100のRemainingをraw観測として元時刻に保持し、繰返しrawを
-   補間またはmoving averageで変更しない。同一periodで増加したrawだけは表示用effective値を直前minimumへ
-   holdし、そのraw値自体は証拠として保持する。右raw anchorを持つ明示null runは、全隣接区間が60秒以下、
-   gap/correctionなし、`U`全値finiteで、少なくとも1 modelが増加したactive秒を持ち、右effectiveが左より
-   低い場合だけactive秒比でlinear interpolationする。条件不成立のbounded nullと右anchorなしのterminal
-   nullは直前effectiveをcarryし破線にする。period-end tailは最後のquota effective pointから60秒以内かつ
-   hard breakなしの場合だけ破線にし、model欠測をquota tailの欠測へ流用しない。
+   証拠として変更しない。60秒cadenceの3 finite実測点`left,middle,right`で`left >= right`かつ
+   `middle > left || middle < right`となるisolated pulseはAPI異常としてeffective anchorへ採用しない。
+   残る候補を時刻順に走査し、最初のfinite 0..100値をbaselineとする。以後、候補がbaseline以下ならaccepted
+   anchorとしてbaselineを更新し、baselineより大きければAPI anomalyとして採用しない。anomaly中もbaselineを
+   固定し、最初のfinite 0..100かつ`candidate <= baseline`だけをaccepted recoveryとして復帰する。それまでの
+   raw証拠は保持するが、表示は直前baselineを破線holdする。period endまで復帰しなければ同じbaselineを終端まで
+   破線holdする。このRemaining anomalyとrecovery bridgeは未使用の証拠にしない。
+
+   Remaining表示は生の階段をそのまま正規線にしない。前回のaccepted raw変化anchorから次の低いaccepted raw
+   anchorまでのdropを、区間内でaccepted raw `total_tokens`が1 model以上増えたcontiguous measured intervalの
+   elapsed秒だけへlinear配分し、token不変の基本未使用intervalではexactに水平とする。途中の同値raw観測は
+   未使用判定の証拠として保持するが、新しい変化anchorにはしない。利用可能なmodel集合は各intervalに実際に
+   掲載された同一の非空集合とし、period-wide `U`の未掲載値を補完しない。token anomaly区間はactive秒へ
+   採用しない。導出した傾斜segmentは破線とし、
+   raw Remaining labelは変更しない。active intervalが0、model集合変更、null、gap、token anomalyまたは
+   Remaining anomalyを跨ぐdropは配分せず、既知endpoint間を破線bridgeして未使用帯を作らない。ただし
+   bounded null runは、左右に正常な変化anchorがあり、その間の全intervalに同一model集合のtoken証拠が揃う場合だけ、
+   null点を未使用証拠にせずactive秒へ破線補間できる。右anchorなしのterminal nullは直前effectiveを
+   carryする。accepted raw Remainingが1点以上あれば、最後のeffective pointからexact period endまでを長さに
+   関係なく時間幅のある破線holdとし、空白や同一X座標の垂直落下を作らない。
 7. `G137-7`: model線はcontiguous実測の増加を太い実線、不変を細い実線とする。疎な区間、途中に
    当該modelのunknown rowがあるnearest-finite接続、derived quota pointの両側、unattributed quota drop、
    monotonic hold、bounded/terminal hold、synthetic tailは破線とする。raw quota同値のcontiguous区間は
-   model availabilityと独立した実測実線であり、gap/correctionでは切断する。右端model labelは最後の
-   accepted raw model値、Remaining labelは最後のraw観測時刻におけるeffective値を表示する。
+   model availabilityと独立した実測実線である。ただし、後続の正常な低下anchorにより`G137-6`の平滑化対象に
+   なった区間は導出破線へ置換する。model線は当該modelの当該表示metric anomaly、Remaining線はRemaining
+   anomaly、全線はgapを跨ぐ区間だけを破線bridgeとし、別metricのanomalyを正常線へ波及させない。右端model
+   labelは最後のaccepted raw model値を表示し、実測0を未掲載と同一視して隠さない。Remaining labelは最後の
+   raw観測時刻におけるeffective値を表示する。
 8. `G137-8`: Graph candidateのpairはperiods応答のexact
    `Codex-Info-Published-Pair`を`P`とし、全history success pageの同headerがASCII
    case-sensitiveで`P`と一致した場合だけ全pageをatomic publishする。欠落、malformed、別値`Q`、
@@ -334,10 +378,43 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
     一方のhelper出力を他方の期待値にしない。Release後の同値確認は同じsource SHAと単一accepted pair・period・
     latest timestamp/model/quotaを照合し、platform固有binary SHA-256が異なることを不一致と扱わない。
 
+`G137-1`..`G137-10`の最小literal oracleは、accepted periods/historyのpair headerが全てASCII exact `P`、
+有効な基準時刻`T`を持つcompleted period `id=T+600,start_at=T,end_at=T+600,current=false`、全rowがstrict
+parse済みでtimestamp重複なしとして次の相対offsetを固定する。保存fixtureでは`T=2200000020`を使用し、表と期待segmentの
+`0..600`はwire timestampそのものではなく`timestamp - T`である。model値は
+`name:(raw total_tokens,raw total_dollars)`で表し、全記載値をliteral期待値とする。
+`V4`は`{ASTRA:(0,0),LUNA:(0,0),SOL:(20,0.000020),TERRA:(0,0)}`、`V3`は
+`{LUNA:(0,0),SOL:(20,0.000020),TERRA:(0,0)}`を表す。
+
+| offset | model evidence | `models_complete`,`model_source` | raw Remaining | 固定期待 |
+| ---: | --- | --- | ---: | --- |
+| 0 | `V4`の`SOL:(10,0.000010)`版 | `true,confirmed` | 90 | 最初のaccepted point。0から線を創作しない |
+| 60 | 同上 | `true,confirmed` | 90 | 基本未使用`[0,60]` |
+| 120 | `V4` | `true,confirmed` | 89 | token増加かつquota低下。`[60,120]`はactive |
+| 180 | `V3` | `false,legacy-unknown` | 89 | model集合変更のため`[120,180]`は未使用でない |
+| 240 | `V3` | `false,legacy-unknown` | 89 | 基本未使用`[180,240]` |
+| 300 | sampleなし | — | — | 1 cadence欠測 |
+| 360 | `V3` | `false,legacy-unknown` | 89 | 欠測endpoint |
+| 420 | `V3` | `false,legacy-unknown` | 89 | 基本未使用`[360,420]` |
+| 480 | `V3`の`SOL:(5,0.000005)`版 | `false,legacy-unknown` | 89 | token/dollar回帰異常。表示は20を破線holdし未使用でない |
+| 540 | `V3`の`SOL:(21,0.000021)`版 | `false,legacy-unknown` | 88 | token/dollar recovery。破線bridgeで未使用でない |
+| 600 | sampleなし | — | — | 全系列をexact period endまで破線hold |
+
+期待する未使用帯は`[0,60]`と`[180,420]`で、後者の`[240,360]`は線種を破線のまま
+1 cadenceだけgray bridgeする。空白区間と`x1 == x2`のsegmentは0件とする。追加反例として、同じドル値でも
+tokenが`100→101`かつdollarが`1.00→1.00`、同じtokenでもRemainingが`90→89`、tokenまたはRemainingの
+isolated pulse、confirmed gapを跨ぐ同値endpointはいずれも未使用0件とする。tokenとRemainingが同値でdollarだけ
+`1.00→0.99→1.00`のisolated pulseなら、dollar線だけを破線hold／recovery、token線を細い実線、未使用帯を
+表示する。逆にtokenだけ`100→90→100`ならdollarが同値でもtoken線だけを破線にして未使用帯を表示しない。
+quota smoothing oracleは、60秒ごとのtokenが
+`10,20,30,40`、raw Remainingが`100,100,100,99`なら表示Remainingを`100,99.666…,99.333…,99`とし、
+3 active intervalを破線で結ぶ。途中に基本未使用intervalがある場合はそのintervalだけexactな水平線とする。
+同じdrop区間にtoken増加が0件なら配分せず、rawの水平区間と低下anchorを保持する。
+
 ## グラフ表示への参照
 
 一般のグラフgeometry、操作、色と線幅はUX ownerの`CUM-138-06`が
-`docs/WINDOWS_UX_SPEC.md`で所有する。Issue #137で確定したcross-platformの値・線種・切断・
+`docs/WINDOWS_UX_SPEC.md`で所有する。Issue #137で確定したcross-platformの値・線種・連続区間・
 未使用・cursor回復・failure isolationは`G137-GRAPH-01`を正本とし、下流仕様とtestは
 `G137-1`..`G137-10`を参照して意味を重複定義しない。
 

@@ -1769,19 +1769,6 @@ export component GraphWindow inherits Window {
             Text { x: 0px; y: parent.height - 32px; width: 84px; height: 16px; text: root.dollar-bottom-label; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption; horizontal-alignment: right; }
             Text { x: root.plot-left; y: 6px; width: root.plot-width; height: 16px; text: root.show-tokens ? root.strings.graph-token-description : root.strings.graph-dollar-description; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption; overflow: elide; }
 
-            // Neutral bands expose intervals where no model changed its
-            // cumulative usage. They sit below the grid and series paths so
-            // the idle state remains visible without hiding data lines.
-            for interval in root.unused-intervals: Rectangle {
-                x: root.plot-left + root.plot-width * interval.start / 100;
-                y: 28px;
-                width: root.plot-width * interval.width / 100;
-                height: parent.height - 52px;
-                background: DesignTokens.graph-idle-band;
-                opacity: 0.22;
-                visible: root.has-graph-data && interval.width > 0.0;
-            }
-
             Rectangle { x: root.plot-left; y: 28px; width: root.plot-width; height: 1px; background: DesignTokens.chart-grid; }
             Rectangle { x: root.plot-left; y: parent.height * 0.25 + 24px; width: root.plot-width; height: 1px; background: DesignTokens.chart-grid; }
             Rectangle { x: root.plot-left; y: parent.height * 0.50 + 12px; width: root.plot-width; height: 1px; background: DesignTokens.chart-grid; }
@@ -1792,6 +1779,17 @@ export component GraphWindow inherits Window {
             Rectangle { x: root.plot-left + root.plot-width * 0.50; y: 28px; width: 1px; height: parent.height - 52px; background: DesignTokens.chart-grid; }
             Rectangle { x: root.plot-left + root.plot-width * 0.75; y: 28px; width: 1px; height: parent.height - 52px; background: DesignTokens.chart-grid; }
             Rectangle { x: root.plot-left + root.plot-width; y: 28px; width: 1px; height: parent.height - 52px; background: DesignTokens.chart-grid; }
+
+            // Idle evidence is an opaque final surface above the grid and
+            // below every data path. Its geometry is never pixel-filtered.
+            for interval in root.unused-intervals: Rectangle {
+                x: root.plot-left + root.plot-width * interval.start / 100;
+                y: 28px;
+                width: root.plot-width * interval.width / 100;
+                height: parent.height - 52px;
+                background: DesignTokens.graph-idle-band;
+                visible: root.has-graph-data && interval.width > 0.0;
+            }
 
             // Rust emits leader coordinates in the same 0..100 viewbox as the
             // series. Fit each short path to the label gap and plot height;

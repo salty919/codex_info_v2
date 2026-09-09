@@ -143,7 +143,10 @@ def near(actual, expected, tolerance=15):
     return sqrt(sum((actual[i] - expected[i]) ** 2 for i in range(3))) <= tolerance
 
 plot = [(x, y) for y in range(230, 590) for x in range(90, 830)]
-idle_band = [(x, y) for x, y in plot if near(rgb(x, y), (27, 41, 61), 4)]
+# The band is the final opaque cross-platform color #1A2838.  The former
+# (27, 41, 61) literal was the approximate result of alpha-compositing the old
+# fill over the plot and rejected the new exact surface even when it rendered.
+idle_band = [(x, y) for x, y in plot if near(rgb(x, y), (26, 40, 56), 4)]
 if len(idle_band) < 1000:
     raise SystemExit(f'dedicated idle-band pixels are missing: {len(idle_band)}')
 if max(x for x, _ in idle_band) - min(x for x, _ in idle_band) < 200:

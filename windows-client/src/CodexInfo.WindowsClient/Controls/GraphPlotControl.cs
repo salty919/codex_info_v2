@@ -25,8 +25,8 @@ public sealed class GraphPlotControl : AvaPlot
     private static readonly ScottPlot.Color TerraColor = new("#5DC98A");
     private static readonly ScottPlot.Color LunaColor = new("#E6A23C");
     private static readonly ScottPlot.Color AstraColor = new("#E86E9F");
-    internal const string IdleBandColorHex = "#3F5D7C";
-    internal const double IdleBandOpacity = 0.22;
+    internal const string IdleBandColorHex = "#1A2838";
+    internal const double IdleBandOpacity = 1.0;
     internal const float MeasuredModelLineWidth = 3f;
     internal const float MeasuredFlatModelLineWidth = 1f;
     internal const float MeasuredRemainingLineWidth = 3f;
@@ -150,6 +150,7 @@ public sealed class GraphPlotControl : AvaPlot
         }
 
         var axes = BuildAxesForCurrentWidth(scene);
+        AddPlotGrid(scene, axes);
         foreach (var interval in GraphPlotProjection.BuildVisibleIdleIntervals(scene))
         {
             var band = Plot.Add.Rectangle(
@@ -160,7 +161,6 @@ public sealed class GraphPlotControl : AvaPlot
             band.FillColor = IdleBandColor.WithOpacity(IdleBandOpacity);
             band.LineWidth = 0;
         }
-        AddPlotGrid(scene, axes);
 
         lunaSeries = AddModelSeries(scene, scene.Luna, LunaColor);
         terraSeries = AddModelSeries(scene, scene.Terra, TerraColor);
