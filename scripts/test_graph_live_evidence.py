@@ -8,7 +8,6 @@ from unittest import mock
 
 from scripts import graph_live_evidence as oracle
 
-
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_PATH = ROOT / "tests" / "fixtures" / "graph_evidence_oracle.json"
 

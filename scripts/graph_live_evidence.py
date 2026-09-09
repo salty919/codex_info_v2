@@ -10,7 +10,6 @@ Evidence is written only to an explicitly supplied directory outside the repo.
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 import hashlib
 import http.client
 import json
@@ -19,10 +18,12 @@ import os
 import struct
 import sys
 import urllib.parse
+from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
-from typing import Any, Iterable
-
+from typing import Any
 
 PAIR_HEADER = "Codex-Info-Published-Pair"
 CAUSE_ORDER = (
@@ -397,7 +398,7 @@ def _remaining_projection(
             continue
         if not anchors or raw[anchors[-1]] != value:
             anchors.append(index)
-    for left, right in zip(anchors, anchors[1:]):
+    for left, right in pairwise(anchors):
         if right - left < 2 or values[right] >= values[left]:
             continue
         if any(raw[index] is not None and not raw_reliable[index] for index in range(left + 1, right)):
@@ -497,7 +498,7 @@ def _remaining_segments(
         sample["timestamp"] for sample in samples if sample["remaining_percent"] is not None
     }
     result: list[dict[str, Any]] = []
-    for before, after in zip(evidence, evidence[1:]):
+    for before, after in pairwise(evidence):
         left, right = row_index[before.timestamp], row_index[after.timestamp]
         causes: list[str] = []
         if _hard_break(before.timestamp, after.timestamp, gaps):
