@@ -506,7 +506,11 @@ public static class CodexInfoGraphPixelScanner {
                 return null;
             }
         }
-        if (visible < 2 || obscured < 1) return null;
+        // Expected geometry comes from a completed render of the same plot.
+        // Five visible grids are stronger evidence than an idle-obscured
+        // reconstruction and must not require an idle band. The unanchored
+        // path above still requires opaque idle evidence for reconstruction.
+        if (visible < 2) return null;
 
         foreach (int center in centers) {
             if (center < candidate[0] - 3 || center > candidate[4] + 3) continue;
@@ -1685,6 +1689,15 @@ function Invoke-E2EGraphPixelScannerSelfTest {
             'Graph pixel scanner promoted an exact two-pixel opaque idle band to a grid.'
         Write-E2E 'graph-pixel-scanner-self-test: PASS valid fixed-gutter geometry'
 
+        [int[]]$fullyVisiblePeriodGridCenters = @(10, 50, 90, 130, 170)
+        $fullyVisibleExpected = [CodexInfoGraphPixelScanner]::Scan(
+            $validPath, 0, 0, 240, 140, $fullyVisiblePeriodGridCenters)
+        Assert-E2E ($fullyVisibleExpected.PeriodStartX -eq 10 -and
+            $fullyVisibleExpected.PeriodEndX -eq 170 -and
+            $fullyVisibleExpected.PlotSpan -eq 160) `
+            'Graph pixel scanner required idle evidence despite five visible expected grids.'
+        Write-E2E 'graph-pixel-scanner-self-test: PASS five visible expected grids need no idle evidence'
+
         $opaqueIdlePrefix = [CodexInfoGraphPixelScanner]::Scan($opaqueIdlePrefixPath, 0, 0, 240, 140)
         Assert-E2E ($opaqueIdlePrefix.PeriodStartX -eq 10 -and $opaqueIdlePrefix.PeriodEndX -eq 170 -and
             $opaqueIdlePrefix.PlotSpan -eq 160 -and $opaqueIdlePrefix.GutterWidth -eq 69) `
@@ -2110,7 +2123,6 @@ function Assert-E2EFixtureHistorySamples {
     $samplesProperty = @($DetailsJson.PSObject.Properties | Where-Object { $_.Name -eq 'history_samples' })
     Assert-E2E ($samplesProperty.Count -eq 1 -and $samplesProperty[0].Value -is [System.Array]) 'Fixture details history_samples must be an array.'
     $samples = @($DetailsJson.history_samples)
-    Assert-E2E ($samples.Count -eq 5) "Fixture details history_samples count changed: $($samples.Count)."
     $expectedSampleKeys = @(
         'timestamp', 'reset_at', 'remaining_percent',
         'sol_dollars', 'terra_dollars', 'luna_dollars',
@@ -2239,14 +2251,14 @@ function New-E2EFixtureDocuments {
     $now = $rawNow - ($rawNow % 60)
     $currentStart = $now - 60
     $currentReset = $now + 7200
-    $pastStart = $now - 300
+    $pastStart = $now - 360
     $pastReset = $now - 180
     $publishedPair = 'v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
     # Keep this wire fixture as explicit JSON.  The details endpoint is a
     # strict thirteen-field contract; serializing nested PowerShell dictionaries
     # can silently change null/number kinds between Windows PowerShell builds.
     $details = @"
-{"api_version":"v2","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400,"input_dollars":1.20,"cached_input_dollars":0.20,"output_dollars":0.40},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800,"input_dollars":2.40,"cached_input_dollars":0.50,"output_dollars":0.80},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100,"input_dollars":3.60,"cached_input_dollars":0.70,"output_dollars":1.10}],"active_thread_count":3,"history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$pastStart,"end_at":$pastReset,"reset_at":$pastReset,"label":"Past period","current":false}],"history_samples":[{"timestamp":$currentStart,"reset_at":$currentReset,"remaining_percent":92.0,"sol_dollars":0.25,"terra_dollars":0.50,"luna_dollars":0.75,"sol_tokens":100,"terra_tokens":200,"luna_tokens":300,"model_source":"confirmed"},{"timestamp":$now,"reset_at":$currentReset,"remaining_percent":72.0,"sol_dollars":1.20,"terra_dollars":2.40,"luna_dollars":3.60,"sol_tokens":1200,"terra_tokens":2400,"luna_tokens":3600,"model_source":"confirmed"},{"timestamp":$pastStart,"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150,"model_source":"confirmed"},{"timestamp":$($pastStart + 60),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150,"model_source":"confirmed"},{"timestamp":$pastReset,"reset_at":$pastReset,"remaining_percent":84.0,"sol_dollars":0.60,"terra_dollars":1.20,"luna_dollars":1.80,"sol_tokens":600,"terra_tokens":1200,"luna_tokens":1800,"model_source":"confirmed"}],"threads":[{"id":"e2e-root","title":"E2E root task","parent_thread_id":null,"model":"TERRA","model_label":"TERRA","total_tokens":2400,"context_usage_tokens":800,"context_window_tokens":16000,"created_at":$($now - 3600),"last_user_message_at":$($now - 300),"is_subagent":false,"depth":0},{"id":"e2e-child","title":"E2E child task","parent_thread_id":"e2e-root","model":"LUNA","model_label":"LUNA","total_tokens":1200,"context_usage_tokens":400,"context_window_tokens":16000,"created_at":$($now - 2400),"last_user_message_at":$($now - 600),"is_subagent":true,"depth":1},{"id":"e2e-orphan","title":"E2E orphan task","parent_thread_id":"missing-parent","model":"SOL","model_label":"SOL","total_tokens":600,"context_usage_tokens":null,"context_window_tokens":null,"created_at":$($now - 1200),"last_user_message_at":null,"is_subagent":true,"depth":null}],"estimated_cost_label":"USD 12.34"}
+{"api_version":"v2","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400,"input_dollars":1.20,"cached_input_dollars":0.20,"output_dollars":0.40},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800,"input_dollars":2.40,"cached_input_dollars":0.50,"output_dollars":0.80},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100,"input_dollars":3.60,"cached_input_dollars":0.70,"output_dollars":1.10}],"active_thread_count":3,"history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$pastStart,"end_at":$pastReset,"reset_at":$pastReset,"label":"Past period","current":false}],"history_samples":[{"timestamp":$currentStart,"reset_at":$currentReset,"remaining_percent":92.0,"sol_dollars":0.25,"terra_dollars":0.50,"luna_dollars":0.75,"sol_tokens":100,"terra_tokens":200,"luna_tokens":300,"model_source":"confirmed"},{"timestamp":$now,"reset_at":$currentReset,"remaining_percent":72.0,"sol_dollars":1.20,"terra_dollars":2.40,"luna_dollars":3.60,"sol_tokens":1200,"terra_tokens":2400,"luna_tokens":3600,"model_source":"confirmed"},{"timestamp":$pastStart,"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150,"model_source":"confirmed"},{"timestamp":$($pastStart + 60),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150,"model_source":"confirmed"},{"timestamp":$($pastStart + 120),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150,"model_source":"confirmed"},{"timestamp":$pastReset,"reset_at":$pastReset,"remaining_percent":84.0,"sol_dollars":0.60,"terra_dollars":1.20,"luna_dollars":1.80,"sol_tokens":600,"terra_tokens":1200,"luna_tokens":1800,"model_source":"confirmed"}],"threads":[{"id":"e2e-root","title":"E2E root task","parent_thread_id":null,"model":"TERRA","model_label":"TERRA","total_tokens":2400,"context_usage_tokens":800,"context_window_tokens":16000,"created_at":$($now - 3600),"last_user_message_at":$($now - 300),"is_subagent":false,"depth":0},{"id":"e2e-child","title":"E2E child task","parent_thread_id":"e2e-root","model":"LUNA","model_label":"LUNA","total_tokens":1200,"context_usage_tokens":400,"context_window_tokens":16000,"created_at":$($now - 2400),"last_user_message_at":$($now - 600),"is_subagent":true,"depth":1},{"id":"e2e-orphan","title":"E2E orphan task","parent_thread_id":"missing-parent","model":"SOL","model_label":"SOL","total_tokens":600,"context_usage_tokens":null,"context_window_tokens":null,"created_at":$($now - 1200),"last_user_message_at":null,"is_subagent":true,"depth":null}],"estimated_cost_label":"USD 12.34"}
 "@
     # Keep the explicit sample values above while enforcing the wire order
     # independently of PowerShell object serialization: past -> current.
@@ -2260,11 +2272,11 @@ function New-E2EFixtureDocuments {
     $historySamplesBodyStart = $historySamplesStart + $historySamplesMarker.Length
     $historySamplesBody = $details.Substring($historySamplesBodyStart, $historySamplesEnd - $historySamplesBodyStart)
     $sampleObjects = @([regex]::Matches($historySamplesBody, '\{[^{}]+\}') | ForEach-Object { $_.Value })
-    if ($sampleObjects.Count -ne 5) {
-        throw "Fixture details history_samples expected five objects, found $($sampleObjects.Count)."
+    if ($sampleObjects.Count -ne 6) {
+        throw "Fixture details history_samples expected six objects, found $($sampleObjects.Count)."
     }
     $orderedSampleObjects = @(
-        $sampleObjects[2], $sampleObjects[3], $sampleObjects[4],
+        $sampleObjects[2], $sampleObjects[3], $sampleObjects[4], $sampleObjects[5],
         $sampleObjects[0], $sampleObjects[1]
     )
     $details = $details.Substring(0, $historySamplesBodyStart) +
@@ -2478,6 +2490,30 @@ function Invoke-E2EFixtureContractTests {
     Assert-E2EExpectedContractFailure -Name 'history-gaps-missing' -Health $health -Details $detailsWithoutGaps
 
     $detailsJson = ConvertFrom-Json -InputObject $documents.Details
+    $pastPeriod = @($detailsJson.history_periods | Where-Object { $_.id -eq 'e2e-past' })
+    Assert-E2E ($pastPeriod.Count -eq 1) 'Fixture must contain exactly one e2e-past period.'
+    $pastSamples = @($detailsJson.history_samples |
+        Where-Object { [Int64]$_.reset_at -eq [Int64]$pastPeriod[0].reset_at } |
+        Sort-Object timestamp)
+    Assert-E2E ($pastSamples.Count -eq 4) `
+        'Past fixture must contain three idle observations followed by one active observation.'
+    foreach ($index in 0..1) {
+        Assert-E2E (([Int64]$pastSamples[$index + 1].timestamp -
+            [Int64]$pastSamples[$index].timestamp) -eq 60) `
+            'Past fixture idle observations must use exact one-minute cadence.'
+        foreach ($model in @('sol', 'terra', 'luna')) {
+            $tokenProperty = "${model}_tokens"
+            $beforeTokens = [Int64]$pastSamples[$index].PSObject.Properties[$tokenProperty].Value
+            $afterTokens = [Int64]$pastSamples[$index + 1].PSObject.Properties[$tokenProperty].Value
+            Assert-E2E ($beforeTokens -eq $afterTokens) `
+                "Past fixture $model tokens changed inside the sustained idle evidence."
+        }
+    }
+    Assert-E2E (([Int64]$pastSamples[3].sol_tokens -gt [Int64]$pastSamples[2].sol_tokens) -and
+        ([Int64]$pastSamples[3].terra_tokens -gt [Int64]$pastSamples[2].terra_tokens) -and
+        ([Int64]$pastSamples[3].luna_tokens -gt [Int64]$pastSamples[2].luna_tokens)) `
+        'Past fixture final observation must end the idle run with token activity.'
+    Write-E2E 'fixture-graph-idle-evidence: PASS two measured flat-token intervals then activity'
     $unorderedSamples = @($detailsJson.history_samples)
     $firstSample = $unorderedSamples[0]
     $unorderedSamples[0] = $unorderedSamples[2]
