@@ -322,7 +322,10 @@ component順や表示所有者を変更しない。
   opacity 1でplot全高へ置き、gridを透過させない。既知idle band内のseriesとedgeを避けた同一Yで、major gridの
   X pixelと左右のnon-grid X pixelがいずれもexact `#1A2838`となり、background色またはgrid色の縦columnがbandを
   分断しないことをX screenshotとWindows rasterで検査する。band geometryは時間intervalだけから決め、画面幅や
-  pixel幅を理由にintervalを除外しない。
+  pixel幅を理由にintervalを除外しない。Releaseのperiod geometry oracleは、不透明bandに隠れたgridを可視gridとして
+  要求してはならない。2点以上の可視gridと、隠れた全grid位置で上下20pxを除く走査高の90%以上を占めるidle色
+  （後描画seriesの交差だけを許容）から5点の等間隔gridが一意に定まる場合だけperiod境界を復元し、部分高のidle色、
+  idle色のない疎grid、または複数のgrid解はfail-closedで拒否する。
 
   既知の不完全ASTRAが途中まで増加した後に確定値へ移る場合、左側の増加を消して最初の確定値だけを
   水平表示してはならない。開始・中間・終端値、線種、period ID、右端ラベルを一つの表示candidateとして
