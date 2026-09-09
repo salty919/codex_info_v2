@@ -46,21 +46,29 @@
         "SOL": [10.0,10.0,20.0,20.0,20.0,20.0,20.0,20.0,21.0,21.0],
         "TERRA": [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]
       },
-      "idle_intervals": [[0,60],[180,420]],
+      "idle_intervals": [[180,420]],
       "model_segments": {
         "ASTRA": {"flat":[[0,60],[60,120]],"rising":[],"dashed":[[120,600]]},
         "LUNA": {"flat":[[0,60],[60,120],[120,180],[180,240],[360,420],[420,480],[480,540]],"rising":[],"dashed":[[240,360],[540,600]]},
         "SOL": {"flat":[[0,60],[120,180],[180,240],[360,420]],"rising":[[60,120]],"dashed":[[240,360],[420,480],[480,540],[540,600]]},
         "TERRA": {"flat":[[0,60],[60,120],[120,180],[180,240],[360,420],[420,480],[480,540]],"rising":[],"dashed":[[240,360],[540,600]]}
       },
-      "remaining_values": [90.0,90.0,89.0,89.0,89.0,89.0,89.0,89.0,88.0,88.0],
-      "remaining_origins": ["raw","raw","raw","raw","raw","raw","raw","raw","raw","synthetic_tail_hold"],
-      "remaining_segments": {"solid":[[0,60],[60,120],[120,180],[180,240],[360,420],[420,480]],"dashed":[[240,360],[480,540],[540,600]]},
+      "remaining_values": [90.0,90.0,89.0,88.8,88.8,88.4,88.4,88.2,88.0,88.0],
+      "remaining_origins": ["raw","raw","raw","interpolated","activity_smoothed","interpolated","activity_smoothed","interpolated","raw","synthetic_tail_hold"],
+      "remaining_segments": {"solid":[[0,60],[60,120]],"dashed":[[120,180],[180,240],[240,360],[360,420],[420,480],[480,540],[540,600]]},
       "latest_labels": {"ASTRA":"$0.00","LUNA":"$0.00","SOL":"$0.00","TERRA":"$0.00","remaining":"88%"},
       "latest_token_labels": {"ASTRA":"0","LUNA":"0","SOL":"21","TERRA":"0","remaining":"88%"}
     }
   },
   "idle_counterexamples_v4": {
+    "one_quiet_minute_inside_activity": {
+      "samples": [
+        {"timestamp":0,"remaining_percent":90.0,"tokens":100,"dollars":1.0},
+        {"timestamp":60,"remaining_percent":90.0,"tokens":100,"dollars":1.0},
+        {"timestamp":120,"remaining_percent":90.0,"tokens":101,"dollars":2.0}
+      ],
+      "idle_intervals": []
+    },
     "dollar_equal_token_increase": {
       "samples": [
         {"timestamp":0,"remaining_percent":90.0,"tokens":100,"dollars":1.0},
@@ -74,6 +82,17 @@
         {"timestamp":60,"remaining_percent":89.0,"tokens":100,"dollars":1.0}
       ],
       "idle_intervals": []
+    },
+    "reliable_remaining_step_splits_idle_locally": {
+      "samples": [
+        {"timestamp":0,"remaining_percent":90.0,"tokens":100,"dollars":1.0},
+        {"timestamp":60,"remaining_percent":90.0,"tokens":100,"dollars":1.0},
+        {"timestamp":120,"remaining_percent":90.0,"tokens":100,"dollars":1.0},
+        {"timestamp":180,"remaining_percent":89.0,"tokens":100,"dollars":1.0},
+        {"timestamp":240,"remaining_percent":89.0,"tokens":100,"dollars":1.0},
+        {"timestamp":300,"remaining_percent":89.0,"tokens":100,"dollars":1.0}
+      ],
+      "idle_intervals": [[0,120],[180,300]]
     },
     "dollar_only_isolated_pulse": {
       "samples": [
@@ -123,7 +142,7 @@
         {"timestamp":60,"remaining_percent":95.0,"tokens":100,"dollars":1.0},
         {"timestamp":120,"remaining_percent":90.0,"tokens":100,"dollars":1.0}
       ],
-      "idle_intervals": [],
+      "idle_intervals": [[0,120]],
       "remaining_values": [90.0,90.0,90.0],
       "remaining_dashed": [[0,60],[60,120]]
     },
@@ -133,7 +152,7 @@
         {"timestamp":60,"remaining_percent":80.0,"tokens":100,"dollars":1.0},
         {"timestamp":120,"remaining_percent":90.0,"tokens":100,"dollars":1.0}
       ],
-      "idle_intervals": [],
+      "idle_intervals": [[0,120]],
       "remaining_values": [90.0,90.0,90.0],
       "remaining_dashed": [[0,60],[60,120]]
     },
@@ -172,7 +191,7 @@
         {"timestamp":240,"remaining_percent":90.0,"tokens":100,"dollars":1.0},
         {"timestamp":300,"remaining_percent":90.0,"tokens":100,"dollars":1.0}
       ],
-      "idle_intervals": [[0,60],[240,300]]
+      "idle_intervals": []
     },
     "one_missing_at_period_edge": {
       "samples": [
@@ -180,7 +199,7 @@
         {"timestamp":120,"remaining_percent":90.0,"tokens":100,"dollars":1.0},
         {"timestamp":180,"remaining_percent":90.0,"tokens":100,"dollars":1.0}
       ],
-      "idle_intervals": [[120,180]]
+      "idle_intervals": []
     },
     "missing_remaining_sample_is_not_a_missing_cadence": {
       "samples": [
@@ -190,13 +209,27 @@
         {"timestamp":180,"remaining_percent":90.0,"tokens":100,"dollars":1.0},
         {"timestamp":240,"remaining_percent":90.0,"tokens":100,"dollars":1.0}
       ],
-      "idle_intervals": [[0,60],[180,240]],
+      "idle_intervals": [[0,240]],
       "dollar_flat": [[0,60],[60,120],[120,180],[180,240]],
       "token_flat": [[0,60],[60,120],[120,180],[180,240]],
       "remaining_dashed": [[60,120],[120,180]]
     }
   },
   "remaining_smoothing_v4": {
+    "bounded_null_with_one_confirmed_gap": {
+      "samples": [
+        {"timestamp":0,"remaining_percent":100.0,"tokens":10,"dollars":1.0},
+        {"timestamp":60,"remaining_percent":null,"tokens":20,"dollars":2.0},
+        {"timestamp":120,"remaining_percent":null,"tokens":30,"dollars":3.0},
+        {"timestamp":180,"remaining_percent":99.0,"tokens":40,"dollars":4.0}
+      ],
+      "confirmed_gaps": [[60,120]],
+      "effective": [100.0,99.66666666666667,99.33333333333333,99.0],
+      "remaining_origins": ["raw","interpolated","interpolated","raw"],
+      "idle_intervals": [],
+      "remaining_solid": [],
+      "remaining_dashed": [[0,60],[60,120],[120,180]]
+    },
     "all_active": {
       "samples": [
         {"timestamp":0,"remaining_percent":100.0,"tokens":10,"dollars":1.0},
@@ -219,7 +252,7 @@
       ],
       "effective": [100.0,99.5,99.5,99.0],
       "remaining_origins": ["raw","activity_smoothed","activity_smoothed","raw"],
-      "idle_intervals": [[60,120]],
+      "idle_intervals": [],
       "remaining_solid": [[0,60],[60,120],[120,180]],
       "remaining_dashed": []
     },
@@ -231,7 +264,7 @@
       ],
       "effective": [100.0,100.0,99.0],
       "remaining_origins": ["raw","raw","raw"],
-      "idle_intervals": [[0,60]],
+      "idle_intervals": [],
       "remaining_solid": [[0,60]],
       "remaining_dashed": [[60,120]]
     }
@@ -275,8 +308,8 @@
       "latest_remaining_raw": 92.0,
       "latest_remaining_effective": 92.0,
       "latest_labels": {"SOL":"$14.00","remaining":"92%"},
-      "idle_intervals": [[2100000000,2100000060],[2100000300,2100000360]],
-      "idle_normalized_bounds": [[0.0,0.09090909090909091],[0.45454545454545453,0.5454545454545454]],
+      "idle_intervals": [],
+      "idle_normalized_bounds": [],
       "accepted_models": {
         "SOL": [10.0,10.0,11.0,12.0,13.0,14.0,14.0,14.0,14.0,null,14.0],
         "TERRA": [2.0,2.0,2.0,2.0,2.0,2.0,2.0,2.0,2.0,null,2.0],
@@ -317,14 +350,15 @@
   "expected": {
     "model_universe": ["LUNA", "SOL", "TERRA"],
     "accepted_sol": [176.04182,176.04182,176.04182,176.04182,176.04182,176.04182,176.04182],
+    "remaining_values": [73.0,73.0,72.94915254237289,70.0,69.98452611218569,62.0,62.0],
     "corrections": [],
-    "idle_intervals": [[1788441660,1788441720]],
+    "idle_intervals": [],
     "model_segments": {
       "SOL": {"solid":[[1788441660,1788441720]],"dashed":[[1788441720,1788441780],[1788441780,1788445260],[1788445260,1788445320],[1788445320,1788476280],[1788476280,1788476340]],"break":[]},
       "TERRA": {"solid":[[1788441660,1788441720],[1788441720,1788441780],[1788445260,1788445320]],"dashed":[[1788441780,1788445260],[1788445320,1788476280],[1788476280,1788476340]],"break":[]},
       "LUNA": {"solid":[[1788441660,1788441720]],"dashed":[[1788441720,1788441780],[1788441780,1788445260],[1788445260,1788445320],[1788445320,1788476280],[1788476280,1788476340]],"break":[]}
     },
-    "remaining_segments": {"solid":[[1788441660,1788441720],[1788441720,1788441780],[1788445260,1788445320]],"dashed":[[1788441780,1788445260],[1788445320,1788476280],[1788476280,1788476340]],"break":[]},
+    "remaining_segments": {"solid":[[1788441660,1788441720]],"dashed":[[1788441720,1788441780],[1788441780,1788445260],[1788445260,1788445320],[1788445320,1788476280],[1788476280,1788476340]],"break":[]},
     "latest_labels": {"SOL":"SOL $176.04","remaining":"62%"}
   },
   "details_response": {

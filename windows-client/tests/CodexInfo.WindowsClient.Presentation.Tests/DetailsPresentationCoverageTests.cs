@@ -167,6 +167,9 @@ public sealed class DetailsPresentationCoverageTests
         var pendingUi = new ConcurrentQueue<Action>();
         using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
 
+        Assert.True(graph.IsLoading);
+        Assert.False(graph.HasNoPoints);
+
         ((INotifyCollectionChanged)graph.Periods).CollectionChanged += (_, _) =>
         {
             if (graph.Periods.Count > 0)
@@ -178,9 +181,43 @@ public sealed class DetailsPresentationCoverageTests
         await PumpUiUntilAsync(pendingUi, () => graph.HasPoints);
         await Task.Delay(50);
 
+        Assert.False(graph.IsLoading);
+        Assert.False(graph.HasNoPoints);
         Assert.Equal(1, resourceClient.HistoryPeriodsCalls);
         Assert.Equal(1, resourceClient.HistoryPageCalls);
         Assert.Same(graph.Periods[0], graph.SelectedPeriod);
+    }
+
+    [Fact]
+    public async Task GraphWindow_PeriodSwitchKeepsLoadingDistinctFromConfirmedEmpty()
+    {
+        var pair = PublishedPairIdentity.Create($"v1:{new string('9', 64)}");
+        var current = CreateSmallPeriod("current", 4_100_000, 4_100_120, current: true, remaining: 80, token: 100);
+        var empty = new ApiHistoryPeriod("empty", 4_200_000, 4_200_120, false, "empty");
+        var details = CreateDetails([current, empty], Array.Empty<ApiThreadDetails>());
+        var resourceClient = new DeferredEmptyHistoryResourceClient(details, current, empty, pair);
+        using var main = new MainWindowViewModel(
+            new StaticCombinedClient(DetailsFetchResult.Success(details)),
+            resourceClient);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+
+        await PumpUiUntilAsync(pendingUi, () => graph.HasPoints && !graph.IsLoading);
+        graph.SelectedPeriod = Assert.Single(graph.Periods, period => period.Id == empty.Id);
+
+        Assert.True(graph.IsLoading);
+        Assert.False(graph.HasNoPoints);
+        Assert.True(graph.HasPoints);
+        Assert.False(graph.HasLoadError);
+        await EventuallyAsync(() => resourceClient.EmptyRequestStarted);
+
+        resourceClient.CompleteEmptyRequest();
+        await PumpUiUntilAsync(pendingUi, () => !graph.IsLoading && graph.HasNoPoints);
+
+        Assert.False(graph.HasLoadError);
+        Assert.False(graph.HasPoints);
+        Assert.False(graph.Scene.HasPoints);
+        Assert.Equal(empty.Id, graph.SelectedPeriod?.Id);
     }
 
     [Fact]
@@ -653,6 +690,70 @@ public sealed class DetailsPresentationCoverageTests
                 NextCursor: null,
                 ResumeCursor: "resume",
                 pair)));
+        }
+
+        public Task<ThreadsFetchResult> FetchThreadsAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Threads are outside this graph regression test.");
+    }
+
+    private sealed class DeferredEmptyHistoryResourceClient(
+        ApiDetailsSnapshot details,
+        ApiHistoryPeriod current,
+        ApiHistoryPeriod empty,
+        PublishedPairIdentity pair) : ILoopbackDetailsClient, ILoopbackResourceClient
+    {
+        private readonly TaskCompletionSource emptyRequestStarted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource releaseEmptyRequest =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public bool EmptyRequestStarted => emptyRequestStarted.Task.IsCompleted;
+
+        public void CompleteEmptyRequest() => releaseEmptyRequest.TrySetResult();
+
+        public Task<DetailsFetchResult> FetchDetailsAsync(CancellationToken cancellationToken = default) =>
+            Task.FromResult(DetailsFetchResult.Success(details));
+
+        public Task<CurrentFetchResult> FetchCurrentAsync(CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Current is outside this graph regression test.");
+
+        public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(HistoryPeriodsFetchResult.Success(new ApiHistoryPeriodsSnapshot(
+                [
+                    current with { Samples = Array.Empty<ApiHistorySample>() },
+                    empty with { Samples = Array.Empty<ApiHistorySample>() },
+                ],
+                pair)));
+
+        public async Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+            string periodId,
+            string? cursor = null,
+            CancellationToken cancellationToken = default)
+        {
+            IReadOnlyList<ApiHistorySample> samples;
+            if (periodId == current.Id)
+            {
+                samples = current.Samples;
+            }
+            else if (periodId == empty.Id)
+            {
+                emptyRequestStarted.TrySetResult();
+                await releaseEmptyRequest.Task.WaitAsync(cancellationToken);
+                samples = Array.Empty<ApiHistorySample>();
+            }
+            else
+            {
+                throw new InvalidOperationException($"Unexpected period {periodId}.");
+            }
+
+            return HistoryPageFetchResult.Success(new ApiHistoryPage(
+                periodId,
+                samples,
+                Array.Empty<ApiHistoryGap>(),
+                NextCursor: null,
+                ResumeCursor: $"resume-{periodId}",
+                pair));
         }
 
         public Task<ThreadsFetchResult> FetchThreadsAsync(CancellationToken cancellationToken = default) =>

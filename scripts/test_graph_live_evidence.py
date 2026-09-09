@@ -141,7 +141,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             ),
         )
 
-    def test_persistent_rejected_remaining_increase_is_not_idle(self):
+    def test_rejected_remaining_increase_does_not_erase_token_idle(self):
         rows = [(0, 90.0, 100), (60, 95.0, 100), (120, 95.0, 100), (180, 89.0, 101)]
         fixture = {
             "period": {"id": "remaining-anomaly", "start_at": 0, "end_at": 180, "reset_at": 180},
@@ -170,7 +170,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             },
         }
         segments, idle = oracle.build_expected(fixture)
-        self.assertEqual([], idle)
+        self.assertEqual([{"start_at": 0, "end_at": 120}], idle)
         self.assertIn([60, 120], pairs(segments, "dashed"))
 
     def test_json_loader_rejects_duplicate_object_keys(self):

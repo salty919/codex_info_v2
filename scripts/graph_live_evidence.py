@@ -356,28 +356,24 @@ def _remaining_projection(
         bounded = run_end < len(rows) and values[run_end] is not None
         interpolated = False
         if bounded and values[run_end] < values[left]:
-            activity: list[tuple[bool, int]] = []
-            active_seconds = 0
+            activity: list[tuple[int, bool]] = []
+            weighted_seconds = 0
             for segment in range(left, run_end):
                 available, advanced, _ = token_interval(segment, segment + 1)
                 elapsed = rows[segment + 1]["timestamp"] - rows[segment]["timestamp"]
-                if not available:
-                    break
-                activity.append((advanced, elapsed))
-                if advanced:
-                    active_seconds += elapsed
-            else:
-                if active_seconds > 0:
-                    active_elapsed = 0
-                    for index in range(run_start, run_end):
-                        advanced, elapsed = activity[index - left - 1]
-                        if advanced:
-                            active_elapsed += elapsed
-                        values[index] = values[left] + (values[run_end] - values[left]) * (
-                            active_elapsed / active_seconds
-                        )
-                        origins[index] = "interpolated"
-                    interpolated = True
+                weight = 0 if available and not advanced else elapsed
+                weighted_seconds += weight
+                activity.append((weight, not available))
+            if weighted_seconds > 0:
+                weighted_elapsed = 0
+                for index in range(run_start, run_end):
+                    weight, _ = activity[index - left - 1]
+                    weighted_elapsed += weight
+                    values[index] = values[left] + (values[run_end] - values[left]) * (
+                        weighted_elapsed / weighted_seconds
+                    )
+                    origins[index] = "interpolated"
+                interpolated = True
         if not interpolated:
             for index in range(run_start, run_end):
                 if values[index - 1] is None:
@@ -403,30 +399,30 @@ def _remaining_projection(
             continue
         if any(raw[index] is not None and not raw_reliable[index] for index in range(left + 1, right)):
             continue
-        activity: list[tuple[bool, int]] = []
-        active_seconds = 0
+        activity: list[tuple[int, bool]] = []
+        weighted_seconds = 0
         for segment in range(left, right):
             available, advanced, _ = token_interval(segment, segment + 1)
             elapsed = rows[segment + 1]["timestamp"] - rows[segment]["timestamp"]
-            if not available:
-                break
-            activity.append((advanced, elapsed))
-            if advanced:
-                active_seconds += elapsed
-        else:
-            if active_seconds <= 0:
-                continue
-            active_elapsed = 0
-            for offset, index in enumerate(range(left + 1, right)):
-                advanced, elapsed = activity[offset]
-                if advanced:
-                    active_elapsed += elapsed
-                smoothed = values[left] + (values[right] - values[left]) * (
-                    active_elapsed / active_seconds
+            weight = 0 if available and not advanced else elapsed
+            weighted_seconds += weight
+            activity.append((weight, not available))
+        if weighted_seconds <= 0:
+            continue
+        weighted_elapsed = 0
+        for offset, index in enumerate(range(left + 1, right)):
+            weight, inferred = activity[offset]
+            weighted_elapsed += weight
+            smoothed = values[left] + (values[right] - values[left]) * (
+                weighted_elapsed / weighted_seconds
+            )
+            values[index] = smoothed
+            if not (raw_reliable[index] and raw[index] == smoothed):
+                origins[index] = (
+                    "activity_smoothed"
+                    if not inferred and raw_reliable[index]
+                    else "interpolated"
                 )
-                values[index] = smoothed
-                if not (raw_reliable[index] and raw[index] == smoothed):
-                    origins[index] = "activity_smoothed" if raw_reliable[index] else "interpolated"
 
     return [
         RemainingEvidence(row["timestamp"], raw[index], values[index], origins[index])
@@ -547,19 +543,10 @@ def _idle_intervals(
         for point in _remaining_projection(period, rows, token_models, gaps)
     }
 
-    def equal(before: int, after: int) -> bool:
+    def token_equal(before: int, after: int) -> bool:
         left_row, right_row = rows[before], rows[after]
-        left_remaining = remaining.get(left_row["timestamp"])
-        right_remaining = remaining.get(right_row["timestamp"])
         if (
-            left_remaining is None
-            or right_remaining is None
-            or left_remaining.origin not in {"raw", "activity_smoothed"}
-            or right_remaining.origin not in {"raw", "activity_smoothed"}
-            or left_remaining.raw is None
-            or right_remaining.raw is None
-            or left_remaining.raw != right_remaining.raw
-            or _hard_break(left_row["timestamp"], right_row["timestamp"], gaps)
+            _hard_break(left_row["timestamp"], right_row["timestamp"], gaps)
         ):
             return False
         names = _published_names(left_row)
@@ -572,32 +559,52 @@ def _idle_intervals(
             for name in names
         )
 
-    intervals: list[tuple[int, int]] = []
+    def remaining_contradicts(start: int, end: int) -> bool:
+        values = [
+            point.raw
+            for timestamp, point in remaining.items()
+            if start <= timestamp <= end
+            and point.origin in {"raw", "activity_smoothed"}
+            and point.raw is not None
+        ]
+        return len(values) > 1 and any(value != values[0] for value in values[1:])
+
+    intervals: list[tuple[int, int, int]] = []
+    basic: set[tuple[int, int]] = set()
     for index in range(len(rows) - 1):
         elapsed = timestamps[index + 1] - timestamps[index]
-        if 0 < elapsed <= 60 and equal(index, index + 1):
-            intervals.append((timestamps[index], timestamps[index + 1]))
+        start, end = timestamps[index], timestamps[index + 1]
+        if (
+            0 < elapsed <= 60
+            and token_equal(index, index + 1)
+            and not remaining_contradicts(start, end)
+        ):
+            intervals.append((start, end, 1))
+            basic.add((start, end))
     for index in range(len(rows) - 3):
         t0, t1, t2, t3 = timestamps[index : index + 4]
         if (
             t1 - t0 == 60
             and t2 - t1 == 120
             and t3 - t2 == 60
-            and equal(index, index + 1)
-            and equal(index + 1, index + 2)
-            and equal(index + 2, index + 3)
+            and (t0, t1) in basic
+            and (t2, t3) in basic
+            and token_equal(index + 1, index + 2)
+            and not remaining_contradicts(t1, t2)
         ):
-            intervals.append((t1, t2))
+            intervals.append((t1, t2, 0))
     merged: list[list[int]] = []
-    for start, end in sorted(intervals):
+    for start, end, observed_count in sorted(intervals):
         if merged and start <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], end)
+            merged[-1][2] += observed_count
         else:
-            merged.append([start, end])
+            merged.append([start, end, observed_count])
     return [
         {"start_at": max(start, period["start_at"]), "end_at": min(end, period["end_at"])}
-        for start, end in merged
-        if min(end, period["end_at"]) > max(start, period["start_at"])
+        for start, end, observed_count in merged
+        if observed_count >= 2
+        and min(end, period["end_at"]) > max(start, period["start_at"])
     ]
 
 

@@ -155,6 +155,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
         else
         {
+            SetLoading(true);
             resourcePollingCancellation = new CancellationTokenSource();
             _ = RunSplitResourcePollingAsync(resourcePollingCancellation.Token);
         }
@@ -199,18 +200,28 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 return;
             }
 
+            var requiresResourceFetch = resourceClient is not null && value is not null &&
+                !disposed && !applyingSplitResourceState;
             selectedPeriod = value;
-            RebuildPoints();
+            if (requiresResourceFetch)
+            {
+                SetLoadError(false);
+                SetLoading(true);
+            }
+            else
+            {
+                RebuildPoints();
+            }
             Notify();
             Notify(nameof(HasPoints));
             Notify(nameof(SelectedPeriodText));
             Notify(nameof(SelectedPeriodStartAt));
             Notify(nameof(SelectedPeriodEndAt));
-            if (resourceClient is not null && value is not null && !disposed && !applyingSplitResourceState)
+            if (requiresResourceFetch)
             {
                 _ = RefreshSplitResourceAsync(
                     initial: true,
-                    requestedPeriodId: value.Id,
+                    requestedPeriodId: value!.Id,
                     resourcePollingCancellation?.Token ?? main.LifetimeToken);
             }
         }
@@ -218,7 +229,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public bool HasPoints => points.Count > 0;
 
-    public bool HasNoPoints => !HasPoints;
+    public bool HasNoPoints => !IsLoading && !HasLoadError && !HasPoints;
 
     public bool HasPeriods => periods.Count > 0;
 
@@ -931,7 +942,6 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 resourcePublishedPair = nextPair;
                 resourceNextCursor = nextCursor;
                 SetLoadError(false);
-                SetLoading(false);
                 RebuildPoints();
                 Notify(nameof(HasPeriods));
                 Notify(nameof(SelectedPeriod));
@@ -960,8 +970,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 return;
             }
 
-            SetLoading(false);
             SetLoadError(true);
+            SetLoading(false);
         });
     }
 
@@ -1205,8 +1215,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             return;
         }
-        SetLoading(false);
         SetLoadError(true);
+        SetLoading(false);
     }
 
     private void SetLoading(bool value)
@@ -1217,6 +1227,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
         isLoading = value;
         Notify(nameof(IsLoading));
+        Notify(nameof(HasNoPoints));
     }
 
     private void SetLoadError(bool value)
@@ -1227,6 +1238,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
         hasLoadError = value;
         Notify(nameof(HasLoadError));
+        Notify(nameof(HasNoPoints));
     }
 
     private void Notify([CallerMemberName] string? propertyName = null)

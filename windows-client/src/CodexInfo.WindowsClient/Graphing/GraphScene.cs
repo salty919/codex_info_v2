@@ -39,6 +39,8 @@ internal enum GraphRemainingOrigin
 /// </summary>
 public sealed class GraphScene
 {
+    private const int ConfirmedIdleMinimumObservedIntervals = 2;
+
     private GraphScene(
         long periodStartAt,
         long periodEndAt,
@@ -588,46 +590,36 @@ public sealed class GraphScene
             {
                 continue;
             }
-            var activity = new List<(bool Active, double Elapsed)>();
-            var activeSeconds = 0d;
-            var fullEvidence = true;
+            var activity = new List<(double Weight, bool Inferred)>();
+            var weightedSeconds = 0d;
             for (var segment = left; segment < right; segment++)
             {
-                if (!HasTokenIntervalEvidence(
-                        points,
-                        tokenSeries,
-                        tokenReliability,
-                        publishedModelNames,
-                        confirmedGaps,
-                        correctionStarts,
-                        segment,
-                        segment + 1,
-                        out var advanced))
-                {
-                    fullEvidence = false;
-                    break;
-                }
+                var observed = HasTokenIntervalEvidence(
+                    points,
+                    tokenSeries,
+                    tokenReliability,
+                    publishedModelNames,
+                    confirmedGaps,
+                    correctionStarts,
+                    segment,
+                    segment + 1,
+                    out var advanced);
                 var elapsed = points[segment + 1].Timestamp - points[segment].Timestamp;
-                if (advanced)
-                {
-                    activeSeconds += elapsed;
-                }
-                activity.Add((advanced, elapsed));
+                var weight = observed && !advanced ? 0d : elapsed;
+                weightedSeconds += weight;
+                activity.Add((weight, !observed));
             }
-            if (!fullEvidence || activeSeconds <= double.Epsilon)
+            if (weightedSeconds <= double.Epsilon)
             {
                 continue;
             }
-            var activeElapsed = 0d;
+            var weightedElapsed = 0d;
             for (var index = left + 1; index < right; index++)
             {
                 var interval = activity[index - left - 1];
-                if (interval.Active)
-                {
-                    activeElapsed += interval.Elapsed;
-                }
+                weightedElapsed += interval.Weight;
                 var smoothed = leftValue +
-                    (rightValue - leftValue) * (activeElapsed / activeSeconds);
+                    (rightValue - leftValue) * (weightedElapsed / weightedSeconds);
                 values[index] = smoothed;
                 if (!(rawReliable[index] && rawValues[index] == smoothed))
                 {
@@ -635,7 +627,7 @@ public sealed class GraphScene
                     // evidence.  Normal staircase smoothing retains the raw
                     // quota observation at this timestamp and is a measured,
                     // solid line.  Only a raw-null point is interpolation.
-                    origins[index] = rawReliable[index] && rawValues[index] is not null
+                    origins[index] = !interval.Inferred && rawReliable[index] && rawValues[index] is not null
                         ? GraphRemainingOrigin.ActivitySmoothed
                         : GraphRemainingOrigin.Interpolated;
                 }
@@ -692,11 +684,11 @@ public sealed class GraphScene
         IReadOnlyList<GraphConfirmedGap> confirmedGaps,
         IReadOnlySet<long> correctionStarts)
     {
-        var candidates = new List<GraphIdleInterval>();
+        var candidates = new List<(GraphIdleInterval Interval, int ObservedCount)>();
         if (periodEnd <= periodStart || points.Count < 2 ||
             publishedModelNames.Count != points.Count || remainingRawReliable.Count != points.Count)
         {
-            return candidates;
+            return Array.Empty<GraphIdleInterval>();
         }
 
         var basic = new bool[points.Count - 1];
@@ -722,7 +714,6 @@ public sealed class GraphScene
                     tokenSeries,
                     tokenReliability,
                     publishedModelNames,
-                    remainingRawReliable,
                     confirmedGaps,
                     correctionStarts,
                     index - 1,
@@ -730,8 +721,13 @@ public sealed class GraphScene
             {
                 continue;
             }
+            var interval = new GraphIdleInterval(intervalStart, intervalEnd, false);
+            if (ReliableRemainingChangesWithin(points, remainingRawReliable, interval))
+            {
+                continue;
+            }
             basic[index - 1] = true;
-            candidates.Add(new GraphIdleInterval(intervalStart, intervalEnd, false));
+            candidates.Add((interval, 1));
         }
 
         for (var index = 0; index + 3 < points.Count; index++)
@@ -745,36 +741,51 @@ public sealed class GraphScene
                     tokenSeries,
                     tokenReliability,
                     publishedModelNames,
-                    remainingRawReliable,
                     confirmedGaps,
                     correctionStarts,
                     index + 1,
-                    index + 2))
+                    index + 2) &&
+                !ReliableRemainingChangesWithin(
+                    points,
+                    remainingRawReliable,
+                    new GraphIdleInterval(
+                        points[index + 1].Timestamp,
+                        points[index + 2].Timestamp,
+                        false)))
             {
-                candidates.Add(new GraphIdleInterval(
+                candidates.Add((new GraphIdleInterval(
                     points[index + 1].Timestamp,
                     points[index + 2].Timestamp,
-                    false));
+                    false), 0));
             }
         }
 
         var ordered = candidates
-            .OrderBy(interval => interval.StartAt)
-            .ThenBy(interval => interval.EndAt)
+            .OrderBy(candidate => candidate.Interval.StartAt)
+            .ThenBy(candidate => candidate.Interval.EndAt)
             .ToArray();
-        var merged = new List<GraphIdleInterval>();
-        foreach (var interval in ordered)
+        var merged = new List<(GraphIdleInterval Interval, int ObservedCount)>();
+        foreach (var candidate in ordered)
         {
-            if (merged.Count > 0 && interval.StartAt <= merged[^1].EndAt)
+            if (merged.Count > 0 && candidate.Interval.StartAt <= merged[^1].Interval.EndAt)
             {
-                merged[^1] = merged[^1] with { EndAt = Math.Max(merged[^1].EndAt, interval.EndAt) };
+                var previous = merged[^1];
+                merged[^1] = (
+                    previous.Interval with
+                    {
+                        EndAt = Math.Max(previous.Interval.EndAt, candidate.Interval.EndAt),
+                    },
+                    previous.ObservedCount + candidate.ObservedCount);
             }
             else
             {
-                merged.Add(interval);
+                merged.Add(candidate);
             }
         }
-        return merged;
+        return merged
+            .Where(candidate => candidate.ObservedCount >= ConfirmedIdleMinimumObservedIntervals)
+            .Select(candidate => candidate.Interval)
+            .ToArray();
     }
 
     private static bool IdleEvidenceEqual(
@@ -782,7 +793,6 @@ public sealed class GraphScene
         IReadOnlyDictionary<string, IReadOnlyList<double>> tokenSeries,
         IReadOnlyDictionary<string, IReadOnlyList<bool>> tokenReliability,
         IReadOnlyList<IReadOnlySet<string>> publishedModelNames,
-        IReadOnlyList<bool> remainingRawReliable,
         IReadOnlyList<GraphConfirmedGap> confirmedGaps,
         IReadOnlySet<long> correctionStarts,
         int before,
@@ -790,10 +800,6 @@ public sealed class GraphScene
     {
         if (before < 0 || after <= before || after >= points.Count ||
             points[before].SyntheticTail || points[after].SyntheticTail ||
-            !remainingRawReliable[before] || !remainingRawReliable[after] ||
-            points[before].Remaining is not { } beforeRemaining ||
-            points[after].Remaining is not { } afterRemaining ||
-            beforeRemaining != afterRemaining ||
             HasConfirmedGapBetween(confirmedGaps, points[before].Timestamp, points[after].Timestamp) ||
             HasCorrectionBetween(correctionStarts, points[before].Timestamp, points[after].Timestamp))
         {
@@ -812,6 +818,32 @@ public sealed class GraphScene
             reliable[before] && reliable[after] &&
             double.IsFinite(values[before]) && values[before] >= 0 &&
             values[before] == values[after]);
+    }
+
+    private static bool ReliableRemainingChangesWithin(
+        IReadOnlyList<ScenePoint> points,
+        IReadOnlyList<bool> remainingRawReliable,
+        GraphIdleInterval interval)
+    {
+        double? firstRemaining = null;
+        for (var index = 0; index < points.Count; index++)
+        {
+            if (points[index].Timestamp < interval.StartAt || points[index].Timestamp > interval.EndAt ||
+                index >= remainingRawReliable.Count || !remainingRawReliable[index] ||
+                points[index].Remaining is not { } remaining)
+            {
+                continue;
+            }
+            if (firstRemaining is null)
+            {
+                firstRemaining = remaining;
+            }
+            else if (remaining != firstRemaining.Value)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static bool HasTokenIntervalEvidence(
