@@ -95,10 +95,10 @@ public sealed class GraphPointViewModel
 
 public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 {
-    // The transport keeps the complete one-month (44,640 minute) history, but
-    // a 940 logical-pixel graph cannot expose that many distinct x positions.
-    // Keep at least one sample per physical plot pixel at 200% DPI (and more
-    // at standard DPI) so paint cost is bounded without changing endpoints.
+    // Bound the legacy diagnostic point view-model collection. GraphScene and
+    // the rendered evidence retain every admitted minute: reducing before
+    // semantic projection would turn ordinary 60-second idle observations
+    // into periodic gaps on long histories.
     internal const int MaxRenderedGraphPoints = 2_048;
     // This is a DoS guard derived from the existing one-month history admission
     // envelope in Core. It is not a normal page-size or payload requirement.
@@ -226,30 +226,23 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public long SelectedPeriodStartAt => scene.HasPoints ? scene.PeriodStartAt : displayedPeriod?.StartAt ?? 0;
 
-    // The API keeps the canonical reset boundary in end_at so clients can
-    // label the period consistently.  For the active period the X client
-    // clips the plot's right edge to the observation time; using the future
-    // reset boundary here leaves an empty tail and changes the graph meaning.
     public long SelectedPeriodEndAt => scene.HasPoints ? scene.PeriodEndAt : 0;
 
+    // The accepted periods resource owns the graph boundary. Local clock skew
+    // must not make Windows project a different X range than the X client.
     internal static long EffectiveGraphEnd(ApiHistoryPeriod period, long now)
     {
-        if (!period.Current)
-        {
-            return period.EndAt;
-        }
-
-        return Math.Max(period.StartAt, Math.Min(period.EndAt, now));
+        _ = now;
+        return period.EndAt;
     }
 
     internal static IReadOnlyList<ApiHistorySample> BuildGraphSamples(ApiHistoryPeriod period, long now)
     {
         var end = EffectiveGraphEnd(period, now);
         var observed = period.Samples
-            // Both current and historical periods own their effective-end
-            // sample.  The active period is clipped to the observation time,
-            // so rows after that endpoint remain excluded without dropping
-            // the exact endpoint itself.
+            // Both current and historical periods own their exact published
+            // end. A 60-second cadence may start at any Unix-time phase, so
+            // validity is bounded by the accepted period rather than modulo.
             .Where(sample => sample.Timestamp >= period.StartAt &&
                              sample.Timestamp <= end)
             .OrderBy(sample => sample.Timestamp)
@@ -1006,12 +999,13 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         foreach (var sample in existing.Concat(additions))
         {
             var key = (sample.ResetAt, sample.Timestamp);
-            if (merged.TryGetValue(key, out var prior) && prior != sample)
+            // A timestamp may occur exactly once in the complete candidate.
+            // Even byte-equivalent repeats are ambiguous wire evidence and
+            // must not be silently normalized by the presentation layer.
+            if (!merged.TryAdd(key, sample))
             {
                 return null;
             }
-
-            merged[key] = sample;
         }
 
         return merged.Values
@@ -1099,10 +1093,10 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             return;
         }
 
-        // Large history normalization/reduction never runs on the UI thread.
+        // Large history projection never runs on the UI thread.
         // The previously painted graph and its axis remain intact while the
-        // selected period is prepared. Only the final bounded immutable array
-        // crosses back in one atomic publish.
+        // selected period is prepared. Only the final transport-bounded,
+        // immutable projection crosses back in one atomic publish.
         SetLoadError(false);
         SetLoading(true);
         var previewDelay = PreviewEnvironment.Enabled
@@ -1168,9 +1162,10 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         IReadOnlyList<GraphConfirmedGap> confirmedGaps)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        var samples = ReduceGraphSamples(BuildGraphSamples(period, now), MaxRenderedGraphPoints, confirmedGaps);
+        var samples = BuildGraphSamples(period, now);
+        var diagnosticSamples = ReduceGraphSamples(samples, MaxRenderedGraphPoints, confirmedGaps);
         return new GraphProjection(
-            samples.Select(sample => new GraphPointViewModel(sample, metric)).ToArray(),
+            diagnosticSamples.Select(sample => new GraphPointViewModel(sample, metric)).ToArray(),
             GraphScene.Create(
                 samples,
                 metric,

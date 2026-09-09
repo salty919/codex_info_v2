@@ -255,7 +255,7 @@ public sealed class DetailsWindowViewModelTests
     }
 
     [Fact]
-    public async Task SlowPeriodChangeShowsLoadingAndAtomicallyKeepsThePreviousGraphUntilReady()
+    public async Task SlowPeriodChangeKeepsPreviousGraphUntilFullSemanticHistoryIsReady()
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var current = new ApiHistoryPeriod("current", now - 3_600, now + 3_600, true, "current")
@@ -273,13 +273,13 @@ public sealed class DetailsWindowViewModelTests
                 .Select(index => new ApiHistorySample(
                     oldStart + index * 60L,
                     oldStart + 5_000L * 60,
-                    100 - index / 100d,
-                    index,
-                    index * 2,
-                    index * 3,
-                    (ulong)index,
-                    (ulong)index * 2,
-                    (ulong)index * 3))
+                    90,
+                    1,
+                    2,
+                    3,
+                    10,
+                    20,
+                    30))
                 .ToArray(),
         };
         var details = new ApiDetailsSnapshot(
@@ -314,6 +314,10 @@ public sealed class DetailsWindowViewModelTests
         Assert.False(graph.IsLoading);
         Assert.Equal(oldStart, graph.SelectedPeriodStartAt);
         Assert.Equal(GraphWindowViewModel.MaxRenderedGraphPoints, graph.Points.Count);
+        Assert.Equal(5_001, graph.Scene.Timestamps.Count);
+        var idle = Assert.Single(graph.Scene.IdleIntervals);
+        Assert.Equal(oldStart, idle.StartAt);
+        Assert.Equal(oldStart + 4_999L * 60, idle.EndAt);
         Assert.NotSame(previousPoints, graph.Points);
         Assert.False(graph.HasLoadError);
     }

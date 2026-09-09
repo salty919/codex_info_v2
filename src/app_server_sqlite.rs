@@ -836,6 +836,11 @@ mod tests {
         }
     }
 
+    fn initialize_root_lock_file(root: &Path) {
+        let lock = acquire_root_lock(root).unwrap();
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::Unlock).unwrap();
+    }
+
     #[test]
     fn online_backup_is_private_and_source_is_unchanged() {
         use std::os::unix::fs::PermissionsExt;
@@ -915,7 +920,7 @@ mod tests {
     fn foreign_root_entry_blocks_prepare_without_removal() {
         let fixture = Fixture::new();
         create_private_directory(&fixture.cache).unwrap();
-        drop(acquire_root_lock(&fixture.cache).unwrap());
+        initialize_root_lock_file(&fixture.cache);
         let foreign = fixture.cache.join("not-managed");
         fs::write(&foreign, b"keep").unwrap();
         let error = PreparedGeneration::prepare(&fixture.cache, &fixture.codex).unwrap_err();
@@ -927,7 +932,7 @@ mod tests {
     fn stale_incomplete_generation_is_recovered_without_growth() {
         let fixture = Fixture::new();
         create_private_directory(&fixture.cache).unwrap();
-        drop(acquire_root_lock(&fixture.cache).unwrap());
+        initialize_root_lock_file(&fixture.cache);
         let generation = fixture.cache.join(next_generation_name());
         create_private_directory(&generation).unwrap();
         create_private_file(&generation.join(LOCK_FILE)).unwrap();
@@ -953,7 +958,7 @@ mod tests {
         for with_lock in [false, true] {
             let fixture = Fixture::new();
             create_private_directory(&fixture.cache).unwrap();
-            drop(acquire_root_lock(&fixture.cache).unwrap());
+            initialize_root_lock_file(&fixture.cache);
             let generation = fixture.cache.join(next_generation_name());
             create_private_directory(&generation).unwrap();
             if with_lock {

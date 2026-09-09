@@ -279,7 +279,9 @@ component順や表示所有者を変更しない。
 - 期間を連続選択した場合は旧候補をcancelし、最新revisionだけをpublishする。失敗・timeout・cancelを
   空graphや部分graphへ変換せず、直前graphを保持してbounded errorを表示する。キャッシュ済みで次paint
   までに切替できる場合はprogressを点滅させない。クリック反応SLOと期間データ完成時間P90/P95を混同しない。
-- plotの横軸はX版の期間意味論を維持し、現在期間は観測時刻までを右端とする。
+- plotの横軸はaccepted periods resourceの同じpairにあるexact `start_at..end_at`を使う。current periodの
+  `end_at`は同じatomic published rootのaccepted観測終端であり、UI取得後のlocal現在時刻へ延ばさない。
+  completed periodは保存された固定`end_at`までを右端とする。
 - 期間欄、横軸、折れ線、右端値は同じselected reset IDだけから一括投影する。poll後の
   bounded reset aliasは60秒以内だけ同一期間として選択を維持し、欄だけ旧期間・plotだけ現在期間の
   混在を禁止する。
@@ -287,34 +289,52 @@ component順や表示所有者を変更しない。
 - Remainingは独立0–100%意味、モデル系列は累積値として扱う。残量をドル軸へ誤って合わせない。
 - Remainingとモデル使用量は別の観測値であり、モデル使用後に遅れて届いた最初の低い残量観測はその観測時刻へ反映する。残量観測が存在しない区間を料金・tokenから逆算してはならず、未観測区間を正常な残量低下として表示しない。
 - `models_complete=false`でも公開されたmodelの既知累積token/金額は保持し、未掲載modelを0と扱わない。
-  集合が不完全でも掲載modelのログ実測値は通常線、`model_source=unavailable`は切断としてX/Windowsで
+  集合が不完全でも掲載modelのログ実測値は通常線、`model_source=unavailable`は既知endpoint間を破線bridgeとしてX/Windowsで
   同じ意味にする。model集合の完全性を個別modelの予測扱いへ流用せず、確認済みの急落や0へ置換しない。
 - model系列の有限表示状態は次を正本とし、model名ごとの全直積には展開しない。
 
   | 入力状態 | 表示契約 |
   | --- | --- |
-  | 同一periodの実測累積が増加／不変 | 増加は太い実線、不変は未使用を示す細い実線。同じ実測濃度を使い、最初と最後の値を同じ系列へ使う |
+  | 同一periodの実測累積が増加／不変 | 増加は太い実線、当該modelの不変は細い実線。同じ実測濃度を使い、最初と最後の値を同じ系列へ使う。未使用帯は全modelとRemainingを別途判定する |
   | 当該model値はログ実測、全model集合は不完全 | 既知の開始値・中間値・終端値を通常線で保持する。未掲載modelだけを未知とする |
+  | 他modelの出現／消失、または`confirmed`と`legacy-unknown`の切替 | 両endpointに掲載された共通modelのaccepted値は通常線を維持する。新規modelは最初のaccepted時刻から開始し、消失modelだけを最後のaccepted時刻から破線holdする。集合変更はRemaining低下のtoken帰属と未使用判定には使用しない |
   | 前後の既知点間だけが未観測 | 同値・増加を問わず実測線より細い破線。途中の消費時刻・速度や未使用を捏造しない（`G137-4`,`G137-7`） |
-  | model値自体が未取得、または確認済みrecorder停止区間 | 値を0や直前値にせず切断または細い破線にする。別sourceのログ実測値は通常線のまま保持する |
-  | 累積が後退し、その後に回復 | confirmed complete rowは補正境界で旧線を切り、低い現在値を新lineageとして保持する。不完全／unconfirmed rowは当該modelだけ回復点まで未知とする（`G137-3`） |
+  | model値自体が未取得、または確認済みrecorder停止区間 | 既知endpoint間と終端を細い破線の予測bridge／holdで連続させる。0補完、空白、垂直segmentを作らず、別sourceのログ実測値は通常線のまま保持する |
+  | 累積が後退し、その後に回復 | source completenessを問わず最後のaccepted値を下回るrawを表示値へ採用せず、当該modelだけを回復点まで細い破線hold／bridgeとする（`G137-3`） |
   | period内の最初の既知点 | 0からの斜線を捏造せず、その値・時刻から開始する |
   | 60秒以内のreset alias／正式reset境界 | 前者は同一periodへ正規化し、後者は別periodとして混ぜない |
   | 確認済み0／model行なし | 前者だけ0として描き、後者は未知として数値・線を作らない |
   | ドル／token切替 | 同じ観測時刻列を使い、単位と値だけを切り替える |
 
-  アイドル帯は、選択期間に実際に公開された全model累積値が利用可能で、60秒以内の隣接する前後で
-  厳密に不変な区間だけに表示する。集合不完全だけを理由に除外せず、未掲載modelを0や固定modelとして
-  創作しない。model増加、既知model欠落、recorder gap、補正境界、期間末holdをアイドル帯へ流用しない。
-  Remainingのraw同値区間はmodelとは独立して実線にできる。欠測・予測の破線は
+  アイドル帯は表示metricから独立し、ドル表示中もraw `total_tokens`を正本にする。60秒以内の隣接する実測前後で、
+  実際に掲載された非空のmodel集合が同一、全model tokenが厳密に不変、かつaccepted raw Remainingも厳密に
+  不変な区間だけに表示する。集合不完全だけを理由に除外せず、両endpointで未掲載のmodelを0や固定modelとして
+  創作しない。ドル丸めが同値でもtoken増加、model集合変更、modelまたはRemaining増減、既知model欠落、
+  recorder gap、tokenまたはRemainingの異常、期間末holdをアイドル帯へ流用しない。dollarだけの異常は
+  dollar線だけを破線にし、token正本の未使用帯を消さない。前後を基本未使用で挟まれたexact 120秒の1 cadence
+  欠測だけは`G137-5`の条件でgray bridgeし、線自体は破線にする。隣接idleは単一bandへ結合し、pixel幅filter、
+  最小表示幅、gridまたはsegment境界によって削除・周期分断しない。
+  Remainingは`G137-6`に従って連続するtoken active秒へ低下を配分し、未使用帯の中ではexactな水平線とする。
+  各timestampにaccepted raw Remainingがあるtoken-backed通常平滑化は`ActivitySmoothed`の実線とし、
+  計測停止・欠測を意味する破線へ降格しない。Remainingのraw同値区間はmodelとは独立して実線にできる。
+  raw-null補間、gap、異常、終端hold等の欠測・予測の破線は
   X版では1px、Windows版では1px相当とする。model利用増加の実測は3px、model未使用の実測は1px実線、Remaining実測は3pxとし、破線の有無で未使用実測と欠測・予測を区別する。
   破線は幅の広いplotでも切替点が判別できる短く密な周期とし、長い線片・隙間で通常線に見せない。
+
+  plotの描画layerは`background/grid → idle band → series/labels`とする。idle bandは最終合成色`#1A2838`を
+  opacity 1でplot全高へ置き、gridを透過させない。既知idle band内のseriesとedgeを避けた同一Yで、major gridの
+  X pixelと左右のnon-grid X pixelがいずれもexact `#1A2838`となり、background色またはgrid色の縦columnがbandを
+  分断しないことをX screenshotとWindows rasterで検査する。band geometryは時間intervalだけから決め、画面幅や
+  pixel幅を理由にintervalを除外しない。Releaseのperiod geometry oracleは、不透明bandに隠れたgridを可視gridとして
+  要求してはならない。2点以上の可視gridと、隠れた全grid位置で上下20pxを除く走査高の90%以上を占めるidle色
+  （後描画seriesの交差だけを許容）から5点の等間隔gridが一意に定まる場合だけperiod境界を復元し、部分高のidle色、
+  idle色のない疎grid、または複数のgrid解はfail-closedで拒否する。
 
   既知の不完全ASTRAが途中まで増加した後に確定値へ移る場合、左側の増加を消して最初の確定値だけを
   水平表示してはならない。開始・中間・終端値、線種、period ID、右端ラベルを一つの表示candidateとして
   検証し、一項目でも不一致ならその表示を受入れない。
 - X版とWindows版は`G137-1`..`G137-10`を参照する同一の履歴fixtureと固定期待値（period/pair、
-  累積model、raw/effective Remaining、gap、補正、partial/unavailable、未使用区間、期間末）を通過しなければならない。
+  累積model、raw/effective Remaining、gap、metric別anomaly、partial/unavailable、未使用区間、期間末）を通過しなければならない。
   片方の描画ヘルパーが生成した値をもう片方の期待値には使用せず、fixtureのliteral oracleを独立に使う。
 - finite oracleは、shared rolloverのperiod A→B `100% / $1 → 41% / $323.674247`、
   `graph_delayed_quota`のfirst observation・遅延quota・missing quota、model別回帰/回復、

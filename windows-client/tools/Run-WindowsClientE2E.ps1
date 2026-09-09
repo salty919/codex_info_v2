@@ -178,6 +178,7 @@ public sealed class CodexInfoGraphPixelMeasurement {
     public int PlotSpan { get; set; }
     public int GutterWidth { get; set; }
     public int[] GridCenters { get; set; }
+    public int[] PeriodGridCenters { get; set; }
     public int[] SeriesGutterTop { get; set; }
     public int[] SeriesGutterBottom { get; set; }
     public int[] SeriesPixelCount { get; set; }
@@ -188,7 +189,6 @@ public sealed class CodexInfoGraphPixelMeasurement {
 public static class CodexInfoGraphPixelScanner {
     private static readonly Color GridColor = ColorTranslator.FromHtml("#263548");
     private static readonly Color IdleColor = ColorTranslator.FromHtml("#1A2838");
-    private static readonly Color IdleGridColor = ColorTranslator.FromHtml("#233244");
     private static readonly Color PlotColor = ColorTranslator.FromHtml("#101925");
     private static readonly Color[] SeriesColors = new[] {
         ColorTranslator.FromHtml("#56B2F5"),
@@ -203,6 +203,16 @@ public static class CodexInfoGraphPixelScanner {
         int plotTop,
         int plotWidth,
         int plotHeight) {
+        return Scan(path, plotLeft, plotTop, plotWidth, plotHeight, null);
+    }
+
+    public static CodexInfoGraphPixelMeasurement Scan(
+        string path,
+        int plotLeft,
+        int plotTop,
+        int plotWidth,
+        int plotHeight,
+        int[] expectedPeriodGridCenters) {
         using (var bitmap = new Bitmap(path)) {
             if (plotLeft < 0 || plotTop < 0 || plotWidth <= 0 || plotHeight <= 40 ||
                 plotLeft + plotWidth > bitmap.Width || plotTop + plotHeight > bitmap.Height) {
@@ -213,23 +223,24 @@ public static class CodexInfoGraphPixelScanner {
             int yEnd = plotTop + plotHeight - 20;
             int sampledHeight = yEnd - yStart;
             int requiredGridPixels = (int)Math.Ceiling(sampledHeight * 0.40);
+            int requiredIdlePixels = (int)Math.Ceiling(sampledHeight * 0.90);
             var gridColumns = new bool[plotWidth];
+            var idleColumns = new bool[plotWidth];
             for (int localX = 0; localX < plotWidth; localX++) {
                 int matches = 0;
+                int idleMatches = 0;
                 for (int y = yStart; y < yEnd; y++) {
                     Color pixel = bitmap.GetPixel(plotLeft + localX, y);
-                    bool grid = Matches(pixel, GridColor, 8) || Matches(pixel, IdleGridColor, 8);
+                    if (Matches(pixel, IdleColor, 8)) idleMatches++;
+                    bool grid = Matches(pixel, GridColor, 8);
                     if (!grid && localX + 1 < plotWidth) {
                         Color next = bitmap.GetPixel(plotLeft + localX + 1, y);
-                        if (!Matches(pixel, IdleColor, 8) &&
-                            !Matches(next, IdleColor, 8) &&
-                            !Matches(next, IdleGridColor, 8)) {
-                            grid = MatchesSplitGrid(pixel, next);
-                        }
+                        grid = MatchesSplitGrid(pixel, next);
                     }
                     if (grid) matches++;
                 }
                 gridColumns[localX] = matches >= requiredGridPixels;
+                idleColumns[localX] = idleMatches >= requiredIdlePixels;
             }
 
             var centers = new List<int>();
@@ -244,16 +255,21 @@ public static class CodexInfoGraphPixelScanner {
                     runStart = -1;
                 }
             }
-            if (centers.Count < 4) {
-                throw new InvalidOperationException("Fewer than four visible vertical period-grid groups were detected.");
+            double bestScore = double.PositiveInfinity;
+            int[] bestGridCenters = null;
+            if (expectedPeriodGridCenters != null) {
+                bestGridCenters = ValidateExpectedPeriodGrid(
+                    centers, idleColumns, plotWidth, expectedPeriodGridCenters, out bestScore);
             }
-
-            double bestScore;
-            int[] bestGridCenters = FindEvenlySpacedCenters(centers, 5, out bestScore);
-            if (bestGridCenters == null || bestScore > 3) {
+            else if (centers.Count >= 4) {
+                bestGridCenters = FindEvenlySpacedCenters(centers, 5, out bestScore);
+            }
+            if (expectedPeriodGridCenters == null &&
+                (bestGridCenters == null || bestScore > 3) && centers.Count >= 4) {
                 bestGridCenters = FindEvenlySpacedCenters(centers, 4, out bestScore);
             }
-            if (bestGridCenters == null || bestScore > 3) {
+            if (expectedPeriodGridCenters == null &&
+                (bestGridCenters == null || bestScore > 3) && centers.Count >= 4) {
                 // The plot owns five 0/25/50/75/100% grids. A series can
                 // cover one interior grid completely, while both period
                 // boundaries remain visible. Reconstruct only that bounded
@@ -261,9 +277,19 @@ public static class CodexInfoGraphPixelScanner {
                 // endpoint fallback has been given priority.
                 bestGridCenters = ReconstructOneMissingInteriorGrid(centers, out bestScore);
             }
+            if (expectedPeriodGridCenters == null &&
+                (bestGridCenters == null || bestScore > 3)) {
+                // An opaque measured-idle band deliberately paints over the
+                // grid below it. Recover only a unique five-grid lattice for
+                // which at least two positions remain visibly measured and
+                // every other position has full-height idle-color evidence.
+                bestGridCenters = ReconstructOpaqueIdleObscuredGrid(
+                    centers, idleColumns, plotWidth, out bestScore);
+            }
             if (bestGridCenters == null || bestScore > 3) {
                 throw new InvalidOperationException(
-                    "Equally spaced period-grid groups were not detected: " + string.Join(",", centers));
+                    "Period grids were not uniquely proven by visible grid and opaque idle evidence: " +
+                    string.Join(",", centers));
             }
 
             int periodStart = bestGridCenters[0];
@@ -302,6 +328,7 @@ public static class CodexInfoGraphPixelScanner {
                 PlotSpan = periodEnd - periodStart,
                 GutterWidth = plotWidth - 1 - periodEnd,
                 GridCenters = centers.ToArray(),
+                PeriodGridCenters = bestGridCenters,
                 SeriesGutterTop = gutterTop,
                 SeriesGutterBottom = gutterBottom,
                 SeriesPixelCount = count,
@@ -360,6 +387,179 @@ public static class CodexInfoGraphPixelScanner {
         return best;
     }
 
+    private static int[] ReconstructOpaqueIdleObscuredGrid(
+        List<int> centers,
+        bool[] idleColumns,
+        int plotWidth,
+        out double bestScore) {
+        bestScore = double.PositiveInfinity;
+        var candidates = new List<int[]>();
+        var scores = new List<double>();
+        if (centers.Count < 2) return null;
+
+        for (int first = 0; first < centers.Count - 1; first++) {
+            for (int second = first + 1; second < centers.Count; second++) {
+                for (int firstGrid = 0; firstGrid < 4; firstGrid++) {
+                    for (int secondGrid = firstGrid + 1; secondGrid < 5; secondGrid++) {
+                        double step = (centers[second] - centers[first]) /
+                            (double)(secondGrid - firstGrid);
+                        if (step < 4) continue;
+                        double start = centers[first] - (firstGrid * step);
+                        double end = start + (4 * step);
+                        if (start < 0 || end >= plotWidth - 4) continue;
+
+                        var candidate = new int[5];
+                        bool increasing = true;
+                        for (int grid = 0; grid < candidate.Length; grid++) {
+                            candidate[grid] = (int)Math.Round(start + (grid * step));
+                            if (grid > 0 && candidate[grid] <= candidate[grid - 1]) increasing = false;
+                        }
+                        if (!increasing) continue;
+
+                        int visible = 0;
+                        int obscured = 0;
+                        double score = 0;
+                        bool valid = true;
+                        for (int grid = 0; grid < candidate.Length; grid++) {
+                            double distance = NearestCenterDistance(centers, candidate[grid]);
+                            if (distance <= 3) {
+                                visible++;
+                                score = Math.Max(score, distance);
+                            }
+                            else if (HasOpaqueIdleRunNear(idleColumns, candidate[grid], 3)) {
+                                obscured++;
+                            }
+                            else {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        if (!valid || visible < 2 || obscured < 1) continue;
+
+                        // A full-height grid-like column inside the candidate
+                        // period must belong to the recovered lattice. This
+                        // prevents an arbitrary sparse set from selecting one
+                        // of several possible periods.
+                        foreach (int center in centers) {
+                            if (center < candidate[0] - 3 || center > candidate[4] + 3) continue;
+                            if (NearestExpectedDistance(candidate, center) > 3) {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        if (!valid) continue;
+
+                        int existing = -1;
+                        for (int index = 0; index < candidates.Count; index++) {
+                            if (SameGrid(candidates[index], candidate, 2)) {
+                                existing = index;
+                                break;
+                            }
+                        }
+                        if (existing >= 0) {
+                            scores[existing] = Math.Min(scores[existing], score);
+                        }
+                        else {
+                            candidates.Add(candidate);
+                            scores.Add(score);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (candidates.Count != 1) return null;
+        bestScore = scores[0];
+        return candidates[0];
+    }
+
+    private static int[] ValidateExpectedPeriodGrid(
+        List<int> centers,
+        bool[] idleColumns,
+        int plotWidth,
+        int[] expected,
+        out double bestScore) {
+        bestScore = double.PositiveInfinity;
+        if (expected.Length != 5) return null;
+
+        var candidate = (int[])expected.Clone();
+        for (int index = 0; index < candidate.Length; index++) {
+            if (candidate[index] < 0 || candidate[index] >= plotWidth - 4 ||
+                (index > 0 && candidate[index] <= candidate[index - 1])) {
+                return null;
+            }
+        }
+
+        int visible = 0;
+        int obscured = 0;
+        double score = 0;
+        foreach (int expectedCenter in candidate) {
+            double distance = NearestCenterDistance(centers, expectedCenter);
+            if (distance <= 3) {
+                visible++;
+                score = Math.Max(score, distance);
+            }
+            else if (HasOpaqueIdleRunNear(idleColumns, expectedCenter, 3)) {
+                obscured++;
+            }
+            else {
+                return null;
+            }
+        }
+        if (visible < 2 || obscured < 1) return null;
+
+        foreach (int center in centers) {
+            if (center < candidate[0] - 3 || center > candidate[4] + 3) continue;
+            if (NearestExpectedDistance(candidate, center) > 3) return null;
+        }
+
+        bestScore = score;
+        return candidate;
+    }
+
+    private static double NearestCenterDistance(List<int> centers, int expected) {
+        double distance = double.PositiveInfinity;
+        foreach (int center in centers) {
+            distance = Math.Min(distance, Math.Abs(center - expected));
+        }
+        return distance;
+    }
+
+    private static double NearestExpectedDistance(int[] expected, int center) {
+        double distance = double.PositiveInfinity;
+        foreach (int value in expected) {
+            distance = Math.Min(distance, Math.Abs(value - center));
+        }
+        return distance;
+    }
+
+    private static bool HasOpaqueIdleRunNear(bool[] idleColumns, int expected, int radius) {
+        int expectedStart = Math.Max(0, expected - radius);
+        int expectedEnd = Math.Min(idleColumns.Length - 1, expected + radius);
+        int runStart = -1;
+        for (int column = 0; column <= idleColumns.Length; column++) {
+            bool isIdle = column < idleColumns.Length && idleColumns[column];
+            if (isIdle && runStart < 0) runStart = column;
+            if (!isIdle && runStart >= 0) {
+                int runEnd = column - 1;
+                int runWidth = runEnd - runStart + 1;
+                if (runWidth >= 4 && runEnd >= expectedStart && runStart <= expectedEnd) {
+                    return true;
+                }
+                runStart = -1;
+            }
+        }
+        return false;
+    }
+
+    private static bool SameGrid(int[] left, int[] right, int tolerance) {
+        if (left.Length != right.Length) return false;
+        for (int index = 0; index < left.Length; index++) {
+            if (Math.Abs(left[index] - right[index]) > tolerance) return false;
+        }
+        return true;
+    }
+
     private static int[] ReconstructOneMissingInteriorGrid(
         List<int> centers,
         out double bestScore) {
@@ -396,6 +596,12 @@ public static class CodexInfoGraphPixelScanner {
     }
 
     private static bool MatchesSplitGrid(Color left, Color right) {
+        // Two adjacent pixels from an opaque idle band satisfy the split-line
+        // color equation by coincidence. Exact idle pixels are authoritative
+        // band evidence and must never be promoted to visible grid centers.
+        // Keep the tolerance at zero: the real split-grid raster halves are
+        // intentionally close to IdleColor and remain valid candidates.
+        if (Matches(left, IdleColor, 0) || Matches(right, IdleColor, 0)) return false;
         // Recover the coverage of a one-pixel line split across two pixels:
         // left + right - background equals the original grid color.
         return left.R > PlotColor.R && left.R <= GridColor.R &&
@@ -1267,6 +1473,7 @@ function Get-E2EGraphMeasurement {
         [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Plot,
         [Parameter(Mandatory = $true)][IntPtr]$WindowHandle,
         [Parameter(Mandatory = $true)][string]$Description,
+        [psobject]$ExpectedGeometry,
         [switch]$AllowUnusedSeries
     )
 
@@ -1276,8 +1483,21 @@ function Get-E2EGraphMeasurement {
     $plotTop = [int][Math]::Floor(($plotRect.Top - $windowBounds.Top) + 0.5)
     $plotWidth = [int][Math]::Floor($plotRect.Width + 0.5)
     $plotHeight = [int][Math]::Floor($plotRect.Height + 0.5)
-    $measurement = [CodexInfoGraphPixelScanner]::Scan(
-        $Capture.Path, $plotLeft, $plotTop, $plotWidth, $plotHeight)
+    if ($null -eq $ExpectedGeometry) {
+        $measurement = [CodexInfoGraphPixelScanner]::Scan(
+            $Capture.Path, $plotLeft, $plotTop, $plotWidth, $plotHeight)
+    }
+    else {
+        Assert-E2E ($plotWidth -eq [int]$ExpectedGeometry.PlotBoundsWidth -and
+            $plotHeight -eq [int]$ExpectedGeometry.PlotBoundsHeight) `
+            "$Description changed plot bounds before applying the measured period geometry."
+        [int[]]$expectedPeriodGridCenters = @($ExpectedGeometry.Pixels.PeriodGridCenters)
+        Assert-E2E ($expectedPeriodGridCenters.Count -eq 5) `
+            "$Description did not receive five measured period-grid centers."
+        $measurement = [CodexInfoGraphPixelScanner]::Scan(
+            $Capture.Path, $plotLeft, $plotTop, $plotWidth, $plotHeight,
+            $expectedPeriodGridCenters)
+    }
     $seriesNames = @('Remaining', 'SOL', 'TERRA', 'LUNA')
     if ($AllowUnusedSeries) {
         Assert-E2E ($measurement.SeriesPixelCount[0] -gt 0 -and
@@ -1320,6 +1540,7 @@ function Wait-E2EGraphPixelsReady {
         [Parameter(Mandatory = $true)][System.Windows.Automation.AutomationElement]$Root,
         [Parameter(Mandatory = $true)][IntPtr]$WindowHandle,
         [Parameter(Mandatory = $true)][string]$Description,
+        [psobject]$ExpectedGeometry,
         [switch]$AllowUnusedSeries
     )
 
@@ -1328,24 +1549,33 @@ function Wait-E2EGraphPixelsReady {
         if ($null -eq $candidatePlot) { return $false }
         $candidateCapture = Capture-E2EWindow $WindowHandle 'graph-ready-probe'
         return Get-E2EGraphMeasurement -Capture $candidateCapture -Plot $candidatePlot `
-            -WindowHandle $WindowHandle -Description $Description -AllowUnusedSeries:$AllowUnusedSeries
+            -WindowHandle $WindowHandle -Description $Description `
+            -ExpectedGeometry $ExpectedGeometry -AllowUnusedSeries:$AllowUnusedSeries
     }
 }
 
 function Invoke-E2EGraphPixelScannerSelfTest {
     $validPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-valid.png'
+    $opaqueIdlePrefixPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-opaque-idle-prefix.png'
+    $shiftedOpaqueIdlePrefixPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-shifted-opaque-idle-prefix.png'
     $missingInteriorPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-missing-interior.png'
     $endpointFallbackPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-endpoint-fallback.png'
+    $unprovenSparsePath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-unproven-sparse.png'
+    $ambiguousIdlePath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-ambiguous-idle.png'
+    $partialHeightIdlePath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-partial-height-idle.png'
     $gridColor = [System.Drawing.ColorTranslator]::FromHtml('#263548')
     $idleColor = [System.Drawing.ColorTranslator]::FromHtml('#1A2838')
-    $idleGridColor = [System.Drawing.ColorTranslator]::FromHtml('#233244')
     $background = [System.Drawing.ColorTranslator]::FromHtml('#101925')
     $seriesColors = @('#56B2F5', '#A88CF5', '#5DC98A', '#E6A23C') |
         ForEach-Object { [System.Drawing.ColorTranslator]::FromHtml($_) }
     foreach ($case in @(
-        @{ Path = $validPath; GridXs = @(10, 50, 90, 130, 170, 230); AddIdleBand = $true; AddIdleGrid = $true },
-        @{ Path = $missingInteriorPath; GridXs = @(10, 50, 130, 170); AddIdleBand = $true; AddIdleGrid = $false },
-        @{ Path = $endpointFallbackPath; GridXs = @(10, 50, 90, 130); AddIdleBand = $false; AddIdleGrid = $false }
+        @{ Path = $validPath; GridXs = @(10, 50, 90, 130, 170, 230); IdleStart = 65; IdleEnd = 75; NarrowIdleStart = 25; NarrowIdleEnd = 26; IdleColumns = @(); IdleYStart = 5; IdleYEnd = 135 },
+        @{ Path = $opaqueIdlePrefixPath; GridXs = @(10, 50, 90, 130, 170, 230); IdleStart = 10; IdleEnd = 90; NarrowIdleStart = -1; NarrowIdleEnd = -1; IdleColumns = @(); IdleYStart = 5; IdleYEnd = 135 },
+        @{ Path = $missingInteriorPath; GridXs = @(10, 50, 130, 170); IdleStart = -1; IdleEnd = -1; NarrowIdleStart = -1; NarrowIdleEnd = -1; IdleColumns = @(); IdleYStart = 5; IdleYEnd = 135 },
+        @{ Path = $endpointFallbackPath; GridXs = @(10, 50, 90, 130); IdleStart = -1; IdleEnd = -1; NarrowIdleStart = -1; NarrowIdleEnd = -1; IdleColumns = @(); IdleYStart = 5; IdleYEnd = 135 },
+        @{ Path = $unprovenSparsePath; GridXs = @(130, 170, 230); IdleStart = -1; IdleEnd = -1; NarrowIdleStart = -1; NarrowIdleEnd = -1; IdleColumns = @(); IdleYStart = 5; IdleYEnd = 135 },
+        @{ Path = $ambiguousIdlePath; GridXs = @(90, 170, 230); IdleStart = -1; IdleEnd = -1; NarrowIdleStart = -1; NarrowIdleEnd = -1; IdleColumns = @(10, 50, 130, 210); IdleYStart = 5; IdleYEnd = 135 },
+        @{ Path = $partialHeightIdlePath; GridXs = @(130, 170, 230); IdleStart = -1; IdleEnd = -1; NarrowIdleStart = -1; NarrowIdleEnd = -1; IdleColumns = @(10, 50, 90); IdleYStart = 20; IdleYEnd = 59 }
     )) {
         $bitmap = New-Object System.Drawing.Bitmap(240, 140)
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
@@ -1359,9 +1589,12 @@ function Invoke-E2EGraphPixelScannerSelfTest {
             # Fixed raster values from the real 1px ScottPlot image; do not
             # derive the expected pixels from the scanner under test.
             foreach ($y in 5..135) {
+                $paintIdle = $y -ge $case.IdleYStart -and $y -le $case.IdleYEnd
                 foreach ($x in @(50, 130)) {
-                    $bitmap.SetPixel($x, $y, [System.Drawing.Color]::FromArgb(30, 43, 60))
-                    $bitmap.SetPixel($x + 1, $y, [System.Drawing.Color]::FromArgb(24, 35, 50))
+                    if ($case.GridXs -contains $x) {
+                        $bitmap.SetPixel($x, $y, [System.Drawing.Color]::FromArgb(30, 43, 60))
+                        $bitmap.SetPixel($x + 1, $y, [System.Drawing.Color]::FromArgb(24, 35, 50))
+                    }
                 }
                 foreach ($x in 65..75) {
                     $bitmap.SetPixel($x, $y, [System.Drawing.Color]::FromArgb(27, 39, 55))
@@ -1372,11 +1605,25 @@ function Invoke-E2EGraphPixelScannerSelfTest {
                 foreach ($x in 145..148) {
                     $bitmap.SetPixel($x, $y, [System.Drawing.Color]::FromArgb(27, 39, 55))
                 }
-                # ScottPlot composites a grid line inside the product's
-                # measured idle band to #233244 on the captured surface.
-                if ($case.AddIdleBand) {
-                    foreach ($x in 80..100) { $bitmap.SetPixel($x, $y, $idleColor) }
-                    if ($case.AddIdleGrid) { $bitmap.SetPixel(90, $y, $idleGridColor) }
+                # The measured idle band is opaque and intentionally erases
+                # every grid pixel below it. The release regression covers a
+                # prefix spanning three of the five period-grid positions.
+                if ($paintIdle -and $case.IdleStart -ge 0) {
+                    foreach ($x in $case.IdleStart..$case.IdleEnd) {
+                        $bitmap.SetPixel($x, $y, $idleColor)
+                    }
+                }
+                if ($paintIdle -and $case.NarrowIdleStart -ge 0) {
+                    foreach ($x in $case.NarrowIdleStart..$case.NarrowIdleEnd) {
+                        $bitmap.SetPixel($x, $y, $idleColor)
+                    }
+                }
+                if ($paintIdle) {
+                    foreach ($idleCenter in $case.IdleColumns) {
+                        foreach ($x in ($idleCenter - 3)..($idleCenter + 3)) {
+                            $bitmap.SetPixel($x, $y, $idleColor)
+                        }
+                    }
                 }
             }
             for ($index = 0; $index -lt $seriesColors.Count; $index++) {
@@ -1392,6 +1639,39 @@ function Invoke-E2EGraphPixelScannerSelfTest {
         }
     }
 
+    $bitmap = New-Object System.Drawing.Bitmap(866, 331)
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $graphics.Clear($background)
+        $gridPen = New-Object System.Drawing.Pen($gridColor, 1)
+        try {
+            foreach ($x in @(48, 218, 388, 558, 729)) {
+                $graphics.DrawLine($gridPen, $x, 5, $x, 326)
+            }
+        }
+        finally { $gridPen.Dispose() }
+        $idleBrush = New-Object System.Drawing.SolidBrush($idleColor)
+        try {
+            # Two visible end grids extrapolate a false x=45 start. A one-pixel
+            # opaque-edge raster drift then lies outside that inferred window,
+            # while the immediately preceding measured grid remains x=48.
+            $graphics.FillRectangle($idleBrush, 49, 5, 340, 322)
+        }
+        finally { $idleBrush.Dispose() }
+        for ($index = 0; $index -lt $seriesColors.Count; $index++) {
+            $seriesPen = New-Object System.Drawing.Pen($seriesColors[$index], 2)
+            try {
+                $graphics.DrawLine($seriesPen, 735, 60 + ($index * 35), 850, 60 + ($index * 35))
+            }
+            finally { $seriesPen.Dispose() }
+        }
+        $bitmap.Save($shiftedOpaqueIdlePrefixPath, [System.Drawing.Imaging.ImageFormat]::Png)
+    }
+    finally {
+        $graphics.Dispose()
+        $bitmap.Dispose()
+    }
+
     try {
         $valid = [CodexInfoGraphPixelScanner]::Scan($validPath, 0, 0, 240, 140)
         Assert-E2E ($valid.PeriodStartX -eq 10 -and $valid.PeriodEndX -eq 170 -and
@@ -1399,7 +1679,41 @@ function Invoke-E2EGraphPixelScannerSelfTest {
             'Graph pixel scanner rejected the valid synthetic geometry.'
         Assert-E2E (($valid.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
             'Graph pixel scanner missed synthetic endpoint colors.'
+        Assert-E2E ($valid.GridCenters -contains 50 -and $valid.GridCenters -contains 130) `
+            'Graph pixel scanner rejected a real two-pixel split-grid raster.'
+        Assert-E2E ($valid.GridCenters -notcontains 25) `
+            'Graph pixel scanner promoted an exact two-pixel opaque idle band to a grid.'
         Write-E2E 'graph-pixel-scanner-self-test: PASS valid fixed-gutter geometry'
+
+        $opaqueIdlePrefix = [CodexInfoGraphPixelScanner]::Scan($opaqueIdlePrefixPath, 0, 0, 240, 140)
+        Assert-E2E ($opaqueIdlePrefix.PeriodStartX -eq 10 -and $opaqueIdlePrefix.PeriodEndX -eq 170 -and
+            $opaqueIdlePrefix.PlotSpan -eq 160 -and $opaqueIdlePrefix.GutterWidth -eq 69) `
+            'Graph pixel scanner did not recover the unique grid lattice below an opaque idle prefix.'
+        Assert-E2E (($opaqueIdlePrefix.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
+            'Graph pixel scanner missed endpoints after recovering an opaque idle prefix.'
+        Write-E2E 'graph-pixel-scanner-self-test: PASS opaque idle prefix recovered from two visible grids'
+
+        $unanchoredShiftedRejected = $false
+        try {
+            $null = [CodexInfoGraphPixelScanner]::Scan(
+                $shiftedOpaqueIdlePrefixPath, 0, 0, 866, 331)
+        }
+        catch {
+            $unanchoredShiftedRejected = $true
+        }
+        Assert-E2E $unanchoredShiftedRejected `
+            'Graph pixel scanner did not reproduce the unanchored release geometry failure.'
+        [int[]]$measuredPeriodGridCenters = @(48, 218, 388, 558, 729)
+        $shiftedOpaqueIdlePrefix = [CodexInfoGraphPixelScanner]::Scan(
+            $shiftedOpaqueIdlePrefixPath, 0, 0, 866, 331, $measuredPeriodGridCenters)
+        Assert-E2E ($shiftedOpaqueIdlePrefix.PeriodStartX -eq 48 -and
+            $shiftedOpaqueIdlePrefix.PeriodEndX -eq 729 -and
+            $shiftedOpaqueIdlePrefix.PlotSpan -eq 681 -and
+            $shiftedOpaqueIdlePrefix.GutterWidth -eq 136) `
+            'Graph pixel scanner rejected the release-failure idle/grid boundary geometry.'
+        Assert-E2E (($shiftedOpaqueIdlePrefix.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
+            'Graph pixel scanner missed endpoints after recovering the release-failure geometry.'
+        Write-E2E 'graph-pixel-scanner-self-test: PASS release-failure geometry uses the measured current-period grid'
 
         $missingInterior = [CodexInfoGraphPixelScanner]::Scan($missingInteriorPath, 0, 0, 240, 140)
         Assert-E2E ($missingInterior.PeriodStartX -eq 10 -and $missingInterior.PeriodEndX -eq 170 -and
@@ -1416,9 +1730,42 @@ function Invoke-E2EGraphPixelScannerSelfTest {
         Assert-E2E (($endpointFallback.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
             'Graph pixel scanner missed endpoints in the four-grid endpoint fallback.'
         Write-E2E 'graph-pixel-scanner-self-test: PASS four-grid endpoint fallback preserved'
+
+        $unprovenSparseRejected = $false
+        try {
+            $null = [CodexInfoGraphPixelScanner]::Scan($unprovenSparsePath, 0, 0, 240, 140)
+        }
+        catch {
+            $unprovenSparseRejected = $true
+            Write-E2E ("graph-pixel-scanner-self-test: PASS unproven sparse geometry rejected={0}" -f $_.Exception.Message)
+        }
+        Assert-E2E $unprovenSparseRejected `
+            'Graph pixel scanner accepted sparse grids without opaque idle evidence.'
+
+        $ambiguousIdleRejected = $false
+        try {
+            $null = [CodexInfoGraphPixelScanner]::Scan($ambiguousIdlePath, 0, 0, 240, 140)
+        }
+        catch {
+            $ambiguousIdleRejected = $true
+            Write-E2E ("graph-pixel-scanner-self-test: PASS ambiguous idle geometry rejected={0}" -f $_.Exception.Message)
+        }
+        Assert-E2E $ambiguousIdleRejected `
+            'Graph pixel scanner accepted multiple idle-supported grid solutions.'
+
+        $partialHeightIdleRejected = $false
+        try {
+            $null = [CodexInfoGraphPixelScanner]::Scan($partialHeightIdlePath, 0, 0, 240, 140)
+        }
+        catch {
+            $partialHeightIdleRejected = $true
+            Write-E2E ("graph-pixel-scanner-self-test: PASS partial-height idle evidence rejected={0}" -f $_.Exception.Message)
+        }
+        Assert-E2E $partialHeightIdleRejected `
+            'Graph pixel scanner accepted partial-height idle pixels as an opaque full-height band.'
     }
     finally {
-        foreach ($path in @($validPath, $missingInteriorPath, $endpointFallbackPath)) {
+        foreach ($path in @($validPath, $opaqueIdlePrefixPath, $shiftedOpaqueIdlePrefixPath, $missingInteriorPath, $endpointFallbackPath, $unprovenSparsePath, $ambiguousIdlePath, $partialHeightIdlePath)) {
             if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
         }
     }
@@ -1434,14 +1781,7 @@ function Assert-E2EImageChanged {
 }
 
 function Get-E2EGraphIdleBackgroundColor {
-    $plotBackground = [System.Drawing.ColorTranslator]::FromHtml('#101925')
-    $idleBand = [System.Drawing.ColorTranslator]::FromHtml('#3F5D7C')
-    $opacity = 0.22
-    return [System.Drawing.Color]::FromArgb(
-        255,
-        [int][Math]::Round($plotBackground.R + (($idleBand.R - $plotBackground.R) * $opacity)),
-        [int][Math]::Round($plotBackground.G + (($idleBand.G - $plotBackground.G) * $opacity)),
-        [int][Math]::Round($plotBackground.B + (($idleBand.B - $plotBackground.B) * $opacity)))
+    return [System.Drawing.ColorTranslator]::FromHtml('#1A2838')
 }
 
 function Test-E2EGraphIdleBandPixel {
@@ -1449,8 +1789,8 @@ function Test-E2EGraphIdleBandPixel {
         [Parameter(Mandatory = $true)][System.Drawing.Color]$Pixel
     )
 
-    # #3F5D7C at opacity .22 over #101925 composites to #1A2838.  Compare
-    # each channel against that computed composite so the plot surface
+    # The renderer owns the final opaque #1A2838 composite. Compare each
+    # channel against that literal product color so the plot surface
     # (#101925) and grid/axis (#263548) cannot satisfy the idle-band oracle.
     $expected = Get-E2EGraphIdleBackgroundColor
     $tolerance = 8
@@ -1570,7 +1910,7 @@ function Assert-E2EGraphHasIdleBand {
     finally {
         $bitmap.Dispose()
     }
-    Write-E2E ("graph-past-idle-band: PASS pixels={0} columns={1}/{2} range={3}-{4} color=#3F5D7C opacity=0.22" -f
+    Write-E2E ("graph-past-idle-band: PASS pixels={0} columns={1}/{2} range={3}-{4} color=#1A2838 opacity=1" -f
         $result.Hits, $result.CoveredColumns, $result.ExpectedColumns, $ExpectedStartFraction, $ExpectedEndFraction)
 }
 
@@ -2343,7 +2683,7 @@ try {
         if ($candidate.Current.IsOffscreen -or $rect.Width -le 0 -or $rect.Height -le 0) { return $false }
         return $candidate
     }
-    $null = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle `
+    $initialCurrentMeasurement = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle `
         -Description 'initial-current' -AllowUnusedSeries:$CompatibilitySmoke
     Write-E2E ("graph: plot bounds={0}x{1}" -f $plot.Current.BoundingRectangle.Width, $plot.Current.BoundingRectangle.Height)
     if ($CompatibilitySmoke) {
@@ -2385,7 +2725,8 @@ try {
     Select-E2EListItem $graphRoot $pastLabel
     Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastLabel
     Wait-E2EGraphLoadSettled $graphRoot
-    $pastMeasurement = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle -Description 'past-period'
+    $pastMeasurement = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle `
+        -Description 'past-period' -ExpectedGeometry $initialCurrentMeasurement
     $graphPast = Capture-E2EWindow $graph.Handle '03-graph-past'
     Assert-E2EImageChanged $graphCurrent $graphPast 'Current-to-past period selection'
     if ($Fixture) {

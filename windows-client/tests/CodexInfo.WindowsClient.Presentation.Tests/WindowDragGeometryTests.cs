@@ -13,13 +13,13 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class GraphWindowViewModelProjectionTests
 {
     [Theory]
-    [InlineData(999L, 1_000L)]
-    [InlineData(1_000L, 1_000L)]
-    [InlineData(1_500L, 1_500L)]
+    [InlineData(999L, 2_000L)]
+    [InlineData(1_000L, 2_000L)]
+    [InlineData(1_500L, 2_000L)]
     [InlineData(2_000L, 2_000L)]
     [InlineData(2_001L, 2_000L)]
     [InlineData(2_500L, 2_000L)]
-    public void Clips_current_graph_period_at_start_and_reset_boundaries(long now, long expectedEnd)
+    public void Uses_the_published_period_end_independently_of_the_local_clock(long now, long expectedEnd)
     {
         var period = new ApiHistoryPeriod("2000", 1_000, 2_000, true, "current");
 
@@ -47,8 +47,8 @@ public sealed class GraphWindowViewModelProjectionTests
 
         var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_620);
 
-        // The admitted row is already a UTC minute-start. A 240-second open
-        // local-log gap must not be turned into a current model observation.
+        // The admitted row is already a UTC minute-start. The line projector,
+        // rather than a fabricated observation, owns the dashed terminal hold.
         Assert.Equal([1_380L], samples.Select(sample => sample.Timestamp));
         Assert.Equal(80, samples[0].RemainingPercent);
         Assert.Equal(10UL, samples[0].SolTokens);
@@ -58,7 +58,7 @@ public sealed class GraphWindowViewModelProjectionTests
     [Theory]
     [InlineData(1_019L)]
     [InlineData(1_020L)]
-    public void Graph_samples_preserve_literal_start_sample_at_clamped_current_end(long now)
+    public void Graph_samples_preserve_literal_start_sample_at_published_end(long now)
     {
         var period = new ApiHistoryPeriod("2040", 1_020, 2_040, true, "current")
         {
