@@ -821,10 +821,6 @@ internal static class GraphPlotProjection
         {
             throw new ArgumentOutOfRangeException(nameof(value));
         }
-        if (value == 0)
-        {
-            return 0;
-        }
         if (decimalPlaces is < 0 or > 9)
         {
             throw new ArgumentOutOfRangeException(nameof(decimalPlaces));

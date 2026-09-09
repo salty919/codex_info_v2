@@ -781,7 +781,7 @@ def _format_percent(value: float) -> str:
 
 
 def _endpoint_labels(
-    projections: dict[str, list[ProjectionPoint]],
+    projections: dict[str, list[ModelEvidence]],
     maximum: float,
     metric: str,
     remaining: list[RemainingEvidence],
