@@ -320,21 +320,24 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
    model集合変更は、未掲載または新規model自身の線と、その区間のRemaining低下のtoken帰属および未使用判定にだけ
    反映する。集合変更区間でも共通modelのaccepted値は実線を維持し、raw Remainingの両endpointがacceptedかつ同値なら
    Remainingも実線を維持する。`source_mismatch`は欠測または利用不能という主原因があるbridgeの補助理由に限定する。
-5. `G137-5`: 未使用判定の正本は表示metricではなくraw `total_tokens`である。基本未使用区間は、時刻差が
+5. `G137-5`: 未使用判定の正本は表示metricではなくraw `total_tokens`である。基本候補は、時刻差が
    strictに1..60秒のcontiguous measuredで、両endpointに実際に掲載された非空のmodel名集合がexactに同一、
-   その全modelのaccepted finite raw `total_tokens`がexactly equal、さらに両endpointのaccepted raw Remainingが
-   finiteかつexactly equalな区間だけとする。periodの和集合`U`に存在しても両endpointで未掲載のmodelはその
-   区間へ創作しない。ドルが同値でもtokenが増加した区間、tokenが同値でもRemainingが変化した区間、片endpoint
-   だけの欠落、model集合変更、unavailable、confirmed gap、tokenまたはRemainingの異常、synthetic holdは
-   未使用へ読み替えない。dollarだけの異常はdollar線の線種だけに影響し、token正本の未使用を消さない。
+   その全modelのaccepted finite raw `total_tokens`がexactly equalな区間とする。単発1区間はcollectorの更新粒度に
+   よる同値と区別できないため帯にせず細い実線だけとし、隣接する基本候補が2区間以上（accepted 3観測以上）
+   連続した最大区間だけを未使用帯にする。絶対時間の任意閾値は追加しない。periodの和集合`U`に存在しても
+   両endpointで未掲載のmodelはその区間へ創作しない。ドルが同値でもtokenが増加した区間、片endpointだけの
+   model欠落、model集合変更、unavailable、confirmed gap、token異常、synthetic holdは未使用へ読み替えない。
+   dollarだけの異常と、欠落または異常として棄却したraw Remainingはtoken正本の未使用を消さない。acceptedで
+   信頼できるraw Remainingが局所的に変化した区間だけはtoken計測との矛盾として帯から除外し、前後のtoken不変
+   run全体を棄却しない。raw Remaining欠落だけでrunを分断しない。
 
    例外はexact 60秒cadenceで1 sampleだけ欠落したbridgeに限定する。`t0<t1<t2<t3`について
-   `t1-t0=60`、`t2-t1=120`、`t3-t2=60`で、`[t0,t1]`と`[t2,t3]`が基本未使用、4点の掲載model集合・
-   全raw `total_tokens`・raw Remainingがexactに同一、かつ`[t1,t2]`にconfirmed gap、token anomalyまたは
-   Remaining anomalyがない場合だけ、
+   `t1-t0=60`、`t2-t1=120`、`t3-t2=60`で、`[t0,t1]`と`[t2,t3]`が基本候補、4点の掲載model集合・
+   全raw `total_tokens`がexactに同一、かつ`[t1,t2]`にconfirmed gap、token anomalyまたはacceptedで信頼できる
+   Remaining変化がない場合だけ、
    `[t1,t2]`も未使用帯へ含める。このbridge上のmodel／Remaining線は欠測を示す破線のままとする。期間端、
-   片側に基本未使用がない孤立した120秒、121秒以上、2 sample以上の欠落、既知の内部変化、null、gap、anomalyは
-   bridgeしない。隣接する基本未使用とこの限定bridgeは単一bandへ結合し、画面幅、pixel丸め、gridまたはsegment
+   片側に基本候補がない孤立した120秒、121秒以上、2 sample以上の欠落、既知のtoken内部変化、token欠落、gap、
+   token anomalyまたはaccepted Remaining変化はbridgeしない。隣接する基本候補とこの限定bridgeは単一bandへ結合し、画面幅、pixel丸め、gridまたはsegment
    境界を理由に削除・分断しない。
 6. `G137-6`: non-nullでfiniteな0..100のRemainingをraw観測として元時刻に保持し、繰返しrawを
    証拠として変更しない。60秒cadenceの3 finite実測点`left,middle,right`で`left >= right`かつ
@@ -351,11 +354,13 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
    未使用判定の証拠として保持するが、新しい変化anchorにはしない。利用可能なmodel集合は各intervalに実際に
    掲載された同一の非空集合とし、period-wide `U`の未掲載値を補完しない。token anomaly区間はactive秒へ
    採用しない。各timestampにaccepted raw Remainingが存在し、全intervalのtoken証拠が揃う通常平滑化点は
-   `ActivitySmoothed`としてraw証拠を保持し、その傾斜・水平segmentを実線とする。これは欠測補間ではなく、
-   破線や計測停止の根拠にしない。raw Remaining labelは変更しない。active intervalが0、model集合変更、null、gap、token anomalyまたは
-   Remaining anomalyを跨ぐdropは配分せず、既知endpoint間を破線bridgeして未使用帯を作らない。ただし
-   bounded null runは、左右に正常な変化anchorがあり、その間の全intervalに同一model集合のtoken証拠が揃う場合だけ、
-   null点を未使用証拠にせずactive秒へ破線補間できる。右anchorなしのterminal nullは直前effectiveを
+   `ActivitySmoothed`としてraw証拠を保持し、その傾斜・水平segmentを実線とする。単発のtoken不変intervalは
+   Remainingを水平に保ち、前後のtoken active秒へdropを配分する。これは欠測補間ではなく、
+   破線や計測停止の根拠にしない。raw Remaining labelは変更しない。token active intervalとtoken欠測intervalが
+   ともに0、またはRemaining anomalyを跨ぐdropは配分せず、既知endpoint間を破線bridgeして未使用帯を作らない。ただし
+   bounded null runは、左右に正常な変化anchorがある場合、token active intervalへ配分し、token証拠が欠ける
+   intervalにはelapsed比で配分して破線補間する。観測済みtoken不変intervalへは配分せず、null点を未使用証拠に
+   しない。右anchorなしのterminal nullは直前effectiveを
    carryする。accepted raw Remainingが1点以上あれば、最後のeffective pointからexact period endまでを長さに
    関係なく時間幅のある破線holdとし、空白や同一X座標の垂直落下を作らない。
 7. `G137-7`: model線はcontiguous実測の増加を太い実線、不変を細い実線とする。疎な区間、途中に
@@ -378,6 +383,9 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 10. `G137-10`: Graphの成功・全失敗経路はMain details/quota/model totals、Threads、authと各々の
     error/retry/suppression latch、cursor、timestampを変更しない。Graph失敗が変更できるのはGraph error、
     loading終了状態と前項のreset-requiredだけで、scene、selected period、last-goodを部分更新しない。
+    期間選択は`idle -> loading -> ready | confirmed-empty | failed`とし、選択先periodのsame-pair全history pageと
+    projectionがatomic publishされるまでloadingを維持する。loading中はspinnerを表示し、`記録なし`または
+    `利用不可`を表示しない。0件を確認した完全pageだけをconfirmed-emptyとし、失敗をemptyへ変換しない。
     X/Rust、Windows Core/GraphScene/ScottPlot、保存fixture E2Eは同じliteral inputと期待区間を独立に検証し、
     一方のhelper出力を他方の期待値にしない。Release後の同値確認は同じsource SHAと単一accepted pair・period・
     latest timestamp/model/quotaを照合し、platform固有binary SHA-256が異なることを不一致と扱わない。
@@ -393,7 +401,7 @@ parse済みでtimestamp重複なしとして次の相対offsetを固定する。
 | offset | model evidence | `models_complete`,`model_source` | raw Remaining | 固定期待 |
 | ---: | --- | --- | ---: | --- |
 | 0 | `V4`の`SOL:(10,0.000010)`版 | `true,confirmed` | 90 | 最初のaccepted point。0から線を創作しない |
-| 60 | 同上 | `true,confirmed` | 90 | 基本未使用`[0,60]` |
+| 60 | 同上 | `true,confirmed` | 90 | 単発token不変の細い実線。未使用帯にはしない |
 | 120 | `V4` | `true,confirmed` | 89 | token増加かつquota低下。`[60,120]`はactive |
 | 180 | `V3` | `false,legacy-unknown` | 89 | model集合変更のため`[120,180]`は未使用でない |
 | 240 | `V3` | `false,legacy-unknown` | 89 | 基本未使用`[180,240]` |
@@ -404,10 +412,11 @@ parse済みでtimestamp重複なしとして次の相対offsetを固定する。
 | 540 | `V3`の`SOL:(21,0.000021)`版 | `false,legacy-unknown` | 88 | token/dollar recovery。破線bridgeで未使用でない |
 | 600 | sampleなし | — | — | 全系列をexact period endまで破線hold |
 
-期待する未使用帯は`[0,60]`と`[180,420]`で、後者の`[240,360]`は線種を破線のまま
+期待する未使用帯は`[180,420]`で、`[0,60]`は単発1区間なので除外し、その`[240,360]`は線種を破線のまま
 1 cadenceだけgray bridgeする。空白区間と`x1 == x2`のsegmentは0件とする。追加反例として、同じドル値でも
-tokenが`100→101`かつdollarが`1.00→1.00`、同じtokenでもRemainingが`90→89`、tokenまたはRemainingの
-isolated pulse、confirmed gapを跨ぐ同値endpointはいずれも未使用0件とする。tokenとRemainingが同値でdollarだけ
+tokenが`100→101`かつdollarが`1.00→1.00`、accepted Remainingが局所的に`90→89`、tokenの
+isolated pulse、confirmed gapを跨ぐ同値endpointはいずれも未使用0件とする。棄却されるRemaining isolated pulseは
+token不変runを消さない。tokenとRemainingが同値でdollarだけ
 `1.00→0.99→1.00`のisolated pulseなら、dollar線だけを破線hold／recovery、token線を細い実線、未使用帯を
 表示する。逆にtokenだけ`100→90→100`ならdollarが同値でもtoken線だけを破線にして未使用帯を表示しない。
 quota smoothing oracleは、60秒ごとのtokenが

@@ -270,11 +270,12 @@ component順や表示所有者を変更しない。
   Escape閉鎖は測定区間へ混ぜない。物理入力、UI状態、実描画を別経路で確認し、同一点の機械的な
   高速連打や開閉の異なる操作を一つのP90/P95へ合成しない。pollやlocale通知による同値候補の
   再公開をユーザー選択へ読み替えず、開いているリストを自動で閉じない。
-- 期間変更は`idle → loading → ready|failed`の有限状態遷移とする。選択表示は入力直後に更新し、
+- 期間変更は`idle → loading → ready|confirmed-empty|failed`の有限状態遷移とする。選択表示は入力直後に更新し、
   accepted same-pair history page集合のparseとpresentation projectionはUI thread外で行う。SQLite再読込やsampleの
   canonicalization/merge/recalculationは行わない。既存の遅延残量補間と終端保持はpresentation-onlyで行い、
   導出点をdetailsやDBへ書き戻さない。処理が次paintまでに終わらない場合は操作を塞がない
-  indeterminate progressと「期間データを読み込み中…」を表示する。loading中は直前に完成したgraph・
+  indeterminate progressと「期間データを読み込み中…」を表示し、`記録なし`や`利用不可`を先に表示しない。
+  same-pairの全pageが0件と確定した場合だけ`confirmed-empty`へ進む。loading中は直前に完成したgraph・
   metric・軸を保持し、候補完成時だけ1回のUI publishで全てを同時に差し替える。
 - 期間を連続選択した場合は旧候補をcancelし、最新revisionだけをpublishする。失敗・timeout・cancelを
   空graphや部分graphへ変換せず、直前graphを保持してbounded errorを表示する。キャッシュ済みで次paint
@@ -307,14 +308,16 @@ component順や表示所有者を変更しない。
   | ドル／token切替 | 同じ観測時刻列を使い、単位と値だけを切り替える |
 
   アイドル帯は表示metricから独立し、ドル表示中もraw `total_tokens`を正本にする。60秒以内の隣接する実測前後で、
-  実際に掲載された非空のmodel集合が同一、全model tokenが厳密に不変、かつaccepted raw Remainingも厳密に
-  不変な区間だけに表示する。集合不完全だけを理由に除外せず、両endpointで未掲載のmodelを0や固定modelとして
-  創作しない。ドル丸めが同値でもtoken増加、model集合変更、modelまたはRemaining増減、既知model欠落、
-  recorder gap、tokenまたはRemainingの異常、期間末holdをアイドル帯へ流用しない。dollarだけの異常は
-  dollar線だけを破線にし、token正本の未使用帯を消さない。前後を基本未使用で挟まれたexact 120秒の1 cadence
+  実際に掲載された非空のmodel集合が同一かつ全model tokenが厳密に不変な候補を結合し、2候補区間以上
+  （accepted 3観測以上）続いた最大runだけに表示する。単発候補は細い実線に留め、任意の絶対時間閾値は追加しない。
+  集合不完全だけを理由に除外せず、両endpointで未掲載のmodelを0や固定modelとして創作しない。ドル丸めが同値でも
+  token増加、model集合変更、既知model欠落、recorder gap、token異常、期間末holdをアイドル帯へ流用しない。
+  missing／棄却済みRemainingとdollarだけの異常はtoken正本の帯を消さず、信頼できるraw Remaining変化を含む
+  局所区間だけを矛盾として除外する。前後のtoken不変run全体は除外しない。前後を基本候補で挟まれたexact 120秒の1 cadence
   欠測だけは`G137-5`の条件でgray bridgeし、線自体は破線にする。隣接idleは単一bandへ結合し、pixel幅filter、
   最小表示幅、gridまたはsegment境界によって削除・周期分断しない。
-  Remainingは`G137-6`に従って連続するtoken active秒へ低下を配分し、未使用帯の中ではexactな水平線とする。
+  Remainingは`G137-6`に従って連続するtoken active秒へ低下を配分し、観測済みtoken不変intervalと
+  未使用帯の中ではexactな水平線とする。token証拠が欠けたbounded区間はelapsed比で補間し、破線にする。
   各timestampにaccepted raw Remainingがあるtoken-backed通常平滑化は`ActivitySmoothed`の実線とし、
   計測停止・欠測を意味する破線へ降格しない。Remainingのraw同値区間はmodelとは独立して実線にできる。
   raw-null補間、gap、異常、終端hold等の欠測・予測の破線は

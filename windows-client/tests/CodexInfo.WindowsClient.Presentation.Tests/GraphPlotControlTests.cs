@@ -650,7 +650,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void PlotProjectionKeepsShortMeasuredIdleButRejectsSparseEndpoints()
+    public void PlotProjectionKeepsSingleMeasuredFlatLineButRequiresSustainedIdle()
     {
         var scene = Scene(
             [
@@ -664,9 +664,9 @@ public sealed class GraphPlotControlTests
 
         var visible = GraphPlotProjection.BuildVisibleIdleIntervals(scene);
 
-        Assert.Equal(
-            [new GraphIdleInterval(1_000, 1_060, PreserveBoundary: false)],
-            visible);
+        Assert.Empty(visible);
+        var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+        Assert.Equal([1_000d, 1_060d], model.Flat.X);
 
         var boundaryScene = Scene(
             [
@@ -949,16 +949,17 @@ public sealed class GraphPlotControlTests
         {
             Point(1_000, 100, 0, 0, 0),
             Point(1_060, 100, 0, 0, 0),
-            Point(1_120, 90, 1, 0, 0),
-            Point(1_180, 90, 1, 0, 0),
-            Point(1_300, 90, 1, 0, 0),
+            Point(1_120, 100, 0, 0, 0),
+            Point(1_300, 100, 0, 0, 0),
+            Point(1_360, 100, 0, 0, 0),
+            Point(1_420, 100, 0, 0, 0),
         };
 
-        var intervals = Scene(points, 1_000, 1_300).IdleIntervals;
+        var intervals = Scene(points, 1_000, 1_420).IdleIntervals;
 
         Assert.Equal(2, intervals.Count);
-        Assert.Equal((1_000L, 1_060L, false), (intervals[0].StartAt, intervals[0].EndAt, intervals[0].PreserveBoundary));
-        Assert.Equal((1_120L, 1_180L, false), (intervals[1].StartAt, intervals[1].EndAt, intervals[1].PreserveBoundary));
+        Assert.Equal((1_000L, 1_120L, false), (intervals[0].StartAt, intervals[0].EndAt, intervals[0].PreserveBoundary));
+        Assert.Equal((1_300L, 1_420L, false), (intervals[1].StartAt, intervals[1].EndAt, intervals[1].PreserveBoundary));
 
         var sparse = new[]
         {
@@ -972,7 +973,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Remaining_does_not_interpolate_across_a_sparse_delayed_quota_interval()
+    public void Remaining_interpolates_a_sparse_delayed_quota_interval_as_prediction()
     {
         var points = new[]
         {
@@ -984,7 +985,7 @@ public sealed class GraphPlotControlTests
 
         var effective = Scene(points).Remaining;
 
-        Assert.Equal([87d, 87d, 87d, 1d], effective);
+        Assert.Equal([87d, 65.5d, 44d, 1d], effective);
     }
 
     [Fact]
@@ -1587,11 +1588,19 @@ public sealed class GraphPlotControlTests
         {
             var fixture = property.Value;
             var samples = SimpleOracleSamples(fixture);
+            var gaps = fixture.TryGetProperty("confirmed_gaps", out var gapElement)
+                ? gapElement.EnumerateArray()
+                    .Select(interval => new GraphConfirmedGap(
+                        interval[0].GetInt64(),
+                        interval[1].GetInt64()))
+                    .ToArray()
+                : Array.Empty<GraphConfirmedGap>();
             var scene = GraphScene.Create(
                 samples,
                 GraphMetric.Dollars,
                 samples[0].Timestamp,
-                samples[^1].Timestamp);
+                samples[^1].Timestamp,
+                gaps);
             var expectedValues = fixture.GetProperty("effective")
                 .EnumerateArray()
                 .Select(value => value.GetDouble())
@@ -1718,7 +1727,9 @@ public sealed class GraphPlotControlTests
         using var graph = new GraphWindowViewModel(main, static action => action());
         var scene = graph.Scene;
         Assert.Contains(false, scene.ModelVectorAvailable);
-        Assert.Equal([73d, 73d, 73d, 70d, 70d, 62d, 62d], scene.Remaining);
+        Assert.Equal(
+            expected.GetProperty("remaining_values").EnumerateArray().Select(value => value.GetDouble()),
+            scene.Remaining);
         Assert.Equal(
             expected.GetProperty("accepted_sol").EnumerateArray().Select(value => value.GetDouble()),
             scene.Sol);

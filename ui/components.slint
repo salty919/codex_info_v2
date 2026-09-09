@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 import { DesignTokens } from "theme.slint";
-import { ListView } from "std-widgets.slint";
+import { ListView, Spinner } from "std-widgets.slint";
 
 export struct UiStrings {
     font-family: string,
@@ -45,6 +45,8 @@ export struct UiStrings {
     graph-token-description: string,
     graph-dollar-description: string,
     no-records: string,
+    graph-loading: string,
+    graph-load-error: string,
     connect-account: string,
     auth-browser-instructions: string,
     auth-managed: string,
@@ -1549,6 +1551,8 @@ export component GraphWindow inherits Window {
     in-out property <string> window-title;
     in property <UiStrings> strings;
     in property <bool> has-history-options: true;
+    in property <bool> history-loading: false;
+    in property <bool> history-load-error: false;
     in-out property <bool> reset-close-buttons: false;
     no-frame: true;
     // Slint supplies edge resize hit-testing for frameless winit windows.
@@ -2118,7 +2122,7 @@ export component GraphWindow inherits Window {
                 y: 28px;
                 width: root.plot-width;
                 height: parent.height - 52px;
-                visible: !root.has-graph-data;
+                visible: !root.has-graph-data && !root.history-loading && !root.history-load-error;
                 background: DesignTokens.raised;
                 Text {
                     x: 0px;
@@ -2126,6 +2130,52 @@ export component GraphWindow inherits Window {
                     width: parent.width;
                     height: parent.height;
                     text: root.strings.no-records;
+                    color: DesignTokens.text-secondary;
+                    font-size: DesignTokens.text-reset;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+            if root.history-loading : Rectangle {
+                x: root.plot-left;
+                y: 28px;
+                width: root.plot-width;
+                height: parent.height - 52px;
+                background: DesignTokens.raised;
+                Spinner {
+                    x: parent.width / 2 - 12px;
+                    y: parent.height / 2 - 30px;
+                    width: 24px;
+                    height: 24px;
+                    indeterminate: true;
+                }
+                Text {
+                    x: 0px;
+                    y: parent.height / 2 + 2px;
+                    width: parent.width;
+                    height: 24px;
+                    text: root.strings.graph-loading;
+                    color: DesignTokens.text-secondary;
+                    font-size: DesignTokens.text-reset;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+            Rectangle {
+                x: root.plot-left;
+                y: 28px;
+                width: root.plot-width;
+                height: parent.height - 52px;
+                visible: !root.has-graph-data && !root.history-loading && root.history-load-error;
+                background: DesignTokens.raised;
+                Text {
+                    x: 0px;
+                    y: 0px;
+                    width: parent.width;
+                    height: parent.height;
+                    text: root.strings.graph-load-error;
                     color: DesignTokens.text-secondary;
                     font-size: DesignTokens.text-reset;
                     font-weight: 700;
