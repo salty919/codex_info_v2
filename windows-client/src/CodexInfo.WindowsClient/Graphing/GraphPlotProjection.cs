@@ -218,9 +218,8 @@ internal static class GraphPlotProjection
                 previous = index;
                 continue;
             }
-            var observed = scene.RemainingObserved[previous] && scene.RemainingObserved[index];
-            var derived = scene.RemainingOrigins[previous] is not GraphRemainingOrigin.Raw ||
-                scene.RemainingOrigins[index] is not GraphRemainingOrigin.Raw;
+            var observed = RemainingOriginHasMeasuredQuota(scene.RemainingOrigins[previous]) &&
+                RemainingOriginHasMeasuredQuota(scene.RemainingOrigins[index]);
             var modelAvailable = scene.TryGetTokenIntervalEvidence(
                 previous,
                 index,
@@ -228,7 +227,7 @@ internal static class GraphPlotProjection
             var quotaDropped = current < before;
             var unattributed = quotaDropped && (!modelAvailable || !modelAdvanced);
             var dashed = !contiguous || elapsed > ModelContiguousSampleMaxGapSeconds ||
-                !observed || derived || unattributed;
+                !observed || unattributed;
             if (dashed)
             {
                 AppendSegment(dashedX, dashedY, scene.Timestamps[previous], before, scene.Timestamps[index], current);
@@ -260,6 +259,9 @@ internal static class GraphPlotProjection
             new GraphLineProjection(solidX, solidY),
             new GraphLineProjection(dashedX, dashedY));
     }
+
+    private static bool RemainingOriginHasMeasuredQuota(GraphRemainingOrigin origin) =>
+        origin is GraphRemainingOrigin.Raw or GraphRemainingOrigin.ActivitySmoothed;
 
     /// <summary>
     /// Projects the flat, rising, and inferred cumulative-model paths used by

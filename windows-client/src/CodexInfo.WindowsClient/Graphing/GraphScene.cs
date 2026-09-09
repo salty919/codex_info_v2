@@ -24,9 +24,11 @@ internal enum GraphRemainingOrigin
 {
     Missing,
     Raw,
+    ActivitySmoothed,
     Interpolated,
     BoundedNullHold,
     TerminalNullHold,
+    SyntheticTailHold,
     MonotonicHold,
 }
 
@@ -543,9 +545,6 @@ public sealed class GraphScene
             }
 
             var bounded = runEnd < rawValues.Length && values[runEnd] is not null;
-            var origin = bounded
-                ? GraphRemainingOrigin.BoundedNullHold
-                : GraphRemainingOrigin.TerminalNullHold;
             for (var index = runStart; index < runEnd; index++)
             {
                 if (values[index - 1] is not { } prior)
@@ -553,7 +552,11 @@ public sealed class GraphScene
                     break;
                 }
                 values[index] = prior;
-                origins[index] = origin;
+                origins[index] = points[index].SyntheticTail
+                    ? GraphRemainingOrigin.SyntheticTailHold
+                    : bounded
+                        ? GraphRemainingOrigin.BoundedNullHold
+                        : GraphRemainingOrigin.TerminalNullHold;
             }
             runStart = runEnd;
         }
@@ -628,7 +631,13 @@ public sealed class GraphScene
                 values[index] = smoothed;
                 if (!(rawReliable[index] && rawValues[index] == smoothed))
                 {
-                    origins[index] = GraphRemainingOrigin.Interpolated;
+                    // A changed presentation value is not by itself missing
+                    // evidence.  Normal staircase smoothing retains the raw
+                    // quota observation at this timestamp and is a measured,
+                    // solid line.  Only a raw-null point is interpolation.
+                    origins[index] = rawReliable[index] && rawValues[index] is not null
+                        ? GraphRemainingOrigin.ActivitySmoothed
+                        : GraphRemainingOrigin.Interpolated;
                 }
             }
         }

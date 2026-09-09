@@ -297,6 +297,7 @@ component順や表示所有者を変更しない。
   | --- | --- |
   | 同一periodの実測累積が増加／不変 | 増加は太い実線、当該modelの不変は細い実線。同じ実測濃度を使い、最初と最後の値を同じ系列へ使う。未使用帯は全modelとRemainingを別途判定する |
   | 当該model値はログ実測、全model集合は不完全 | 既知の開始値・中間値・終端値を通常線で保持する。未掲載modelだけを未知とする |
+  | 他modelの出現／消失、または`confirmed`と`legacy-unknown`の切替 | 両endpointに掲載された共通modelのaccepted値は通常線を維持する。新規modelは最初のaccepted時刻から開始し、消失modelだけを最後のaccepted時刻から破線holdする。集合変更はRemaining低下のtoken帰属と未使用判定には使用しない |
   | 前後の既知点間だけが未観測 | 同値・増加を問わず実測線より細い破線。途中の消費時刻・速度や未使用を捏造しない（`G137-4`,`G137-7`） |
   | model値自体が未取得、または確認済みrecorder停止区間 | 既知endpoint間と終端を細い破線の予測bridge／holdで連続させる。0補完、空白、垂直segmentを作らず、別sourceのログ実測値は通常線のまま保持する |
   | 累積が後退し、その後に回復 | source completenessを問わず最後のaccepted値を下回るrawを表示値へ採用せず、当該modelだけを回復点まで細い破線hold／bridgeとする（`G137-3`） |
@@ -314,7 +315,9 @@ component順や表示所有者を変更しない。
   欠測だけは`G137-5`の条件でgray bridgeし、線自体は破線にする。隣接idleは単一bandへ結合し、pixel幅filter、
   最小表示幅、gridまたはsegment境界によって削除・周期分断しない。
   Remainingは`G137-6`に従って連続するtoken active秒へ低下を配分し、未使用帯の中ではexactな水平線とする。
-  Remainingのraw同値区間はmodelとは独立して実線にできる。欠測・予測の破線は
+  各timestampにaccepted raw Remainingがあるtoken-backed通常平滑化は`ActivitySmoothed`の実線とし、
+  計測停止・欠測を意味する破線へ降格しない。Remainingのraw同値区間はmodelとは独立して実線にできる。
+  raw-null補間、gap、異常、終端hold等の欠測・予測の破線は
   X版では1px、Windows版では1px相当とする。model利用増加の実測は3px、model未使用の実測は1px実線、Remaining実測は3pxとし、破線の有無で未使用実測と欠測・予測を区別する。
   破線は幅の広いplotでも切替点が判別できる短く密な周期とし、長い線片・隙間で通常線に見せない。
 

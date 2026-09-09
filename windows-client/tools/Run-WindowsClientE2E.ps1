@@ -596,6 +596,12 @@ public static class CodexInfoGraphPixelScanner {
     }
 
     private static bool MatchesSplitGrid(Color left, Color right) {
+        // Two adjacent pixels from an opaque idle band satisfy the split-line
+        // color equation by coincidence. Exact idle pixels are authoritative
+        // band evidence and must never be promoted to visible grid centers.
+        // Keep the tolerance at zero: the real split-grid raster halves are
+        // intentionally close to IdleColor and remain valid candidates.
+        if (Matches(left, IdleColor, 0) || Matches(right, IdleColor, 0)) return false;
         // Recover the coverage of a one-pixel line split across two pixels:
         // left + right - background equals the original grid color.
         return left.R > PlotColor.R && left.R <= GridColor.R &&
@@ -1563,13 +1569,13 @@ function Invoke-E2EGraphPixelScannerSelfTest {
     $seriesColors = @('#56B2F5', '#A88CF5', '#5DC98A', '#E6A23C') |
         ForEach-Object { [System.Drawing.ColorTranslator]::FromHtml($_) }
     foreach ($case in @(
-        @{ Path = $validPath; GridXs = @(10, 50, 90, 130, 170, 230); IdleStart = 65; IdleEnd = 75; IdleColumns = @(); IdleYStart = 5; IdleYEnd = 135 },
-        @{ Path = $opaqueIdlePrefixPath; GridXs = @(10, 50, 90, 130, 170, 230); IdleStart = 10; IdleEnd = 90; IdleColumns = @(); IdleYStart = 5; IdleYEnd = 135 },
-        @{ Path = $missingInteriorPath; GridXs = @(10, 50, 130, 170); IdleStart = -1; IdleEnd = -1; IdleColumns = @(); IdleYStart = 5; IdleYEnd = 135 },
-        @{ Path = $endpointFallbackPath; GridXs = @(10, 50, 90, 130); IdleStart = -1; IdleEnd = -1; IdleColumns = @(); IdleYStart = 5; IdleYEnd = 135 },
-        @{ Path = $unprovenSparsePath; GridXs = @(130, 170, 230); IdleStart = -1; IdleEnd = -1; IdleColumns = @(); IdleYStart = 5; IdleYEnd = 135 },
-        @{ Path = $ambiguousIdlePath; GridXs = @(90, 170, 230); IdleStart = -1; IdleEnd = -1; IdleColumns = @(10, 50, 130, 210); IdleYStart = 5; IdleYEnd = 135 },
-        @{ Path = $partialHeightIdlePath; GridXs = @(130, 170, 230); IdleStart = -1; IdleEnd = -1; IdleColumns = @(10, 50, 90); IdleYStart = 20; IdleYEnd = 59 }
+        @{ Path = $validPath; GridXs = @(10, 50, 90, 130, 170, 230); IdleStart = 65; IdleEnd = 75; NarrowIdleStart = 25; NarrowIdleEnd = 26; IdleColumns = @(); IdleYStart = 5; IdleYEnd = 135 },
+        @{ Path = $opaqueIdlePrefixPath; GridXs = @(10, 50, 90, 130, 170, 230); IdleStart = 10; IdleEnd = 90; NarrowIdleStart = -1; NarrowIdleEnd = -1; IdleColumns = @(); IdleYStart = 5; IdleYEnd = 135 },
+        @{ Path = $missingInteriorPath; GridXs = @(10, 50, 130, 170); IdleStart = -1; IdleEnd = -1; NarrowIdleStart = -1; NarrowIdleEnd = -1; IdleColumns = @(); IdleYStart = 5; IdleYEnd = 135 },
+        @{ Path = $endpointFallbackPath; GridXs = @(10, 50, 90, 130); IdleStart = -1; IdleEnd = -1; NarrowIdleStart = -1; NarrowIdleEnd = -1; IdleColumns = @(); IdleYStart = 5; IdleYEnd = 135 },
+        @{ Path = $unprovenSparsePath; GridXs = @(130, 170, 230); IdleStart = -1; IdleEnd = -1; NarrowIdleStart = -1; NarrowIdleEnd = -1; IdleColumns = @(); IdleYStart = 5; IdleYEnd = 135 },
+        @{ Path = $ambiguousIdlePath; GridXs = @(90, 170, 230); IdleStart = -1; IdleEnd = -1; NarrowIdleStart = -1; NarrowIdleEnd = -1; IdleColumns = @(10, 50, 130, 210); IdleYStart = 5; IdleYEnd = 135 },
+        @{ Path = $partialHeightIdlePath; GridXs = @(130, 170, 230); IdleStart = -1; IdleEnd = -1; NarrowIdleStart = -1; NarrowIdleEnd = -1; IdleColumns = @(10, 50, 90); IdleYStart = 20; IdleYEnd = 59 }
     )) {
         $bitmap = New-Object System.Drawing.Bitmap(240, 140)
         $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
@@ -1604,6 +1610,11 @@ function Invoke-E2EGraphPixelScannerSelfTest {
                 # prefix spanning three of the five period-grid positions.
                 if ($paintIdle -and $case.IdleStart -ge 0) {
                     foreach ($x in $case.IdleStart..$case.IdleEnd) {
+                        $bitmap.SetPixel($x, $y, $idleColor)
+                    }
+                }
+                if ($paintIdle -and $case.NarrowIdleStart -ge 0) {
+                    foreach ($x in $case.NarrowIdleStart..$case.NarrowIdleEnd) {
                         $bitmap.SetPixel($x, $y, $idleColor)
                     }
                 }
@@ -1668,6 +1679,10 @@ function Invoke-E2EGraphPixelScannerSelfTest {
             'Graph pixel scanner rejected the valid synthetic geometry.'
         Assert-E2E (($valid.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
             'Graph pixel scanner missed synthetic endpoint colors.'
+        Assert-E2E ($valid.GridCenters -contains 50 -and $valid.GridCenters -contains 130) `
+            'Graph pixel scanner rejected a real two-pixel split-grid raster.'
+        Assert-E2E ($valid.GridCenters -notcontains 25) `
+            'Graph pixel scanner promoted an exact two-pixel opaque idle band to a grid.'
         Write-E2E 'graph-pixel-scanner-self-test: PASS valid fixed-gutter geometry'
 
         $opaqueIdlePrefix = [CodexInfoGraphPixelScanner]::Scan($opaqueIdlePrefixPath, 0, 0, 240, 140)

@@ -1220,6 +1220,142 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public async Task Issue137_live_evidence_exports_windows_production_projection()
+    {
+        var evidencePath = Environment.GetEnvironmentVariable("CODEX_INFO_GRAPH_LIVE_EVIDENCE");
+        var outputPath = Environment.GetEnvironmentVariable("CODEX_INFO_GRAPH_ACTUAL_OUTPUT");
+        var sourceSha = Environment.GetEnvironmentVariable("CODEX_INFO_GRAPH_SOURCE_SHA");
+        var repositoryRoot = Environment.GetEnvironmentVariable("CODEX_INFO_GRAPH_REPOSITORY_ROOT");
+        if (evidencePath is null && outputPath is null && sourceSha is null && repositoryRoot is null)
+        {
+            return;
+        }
+
+        Assert.False(string.IsNullOrWhiteSpace(evidencePath));
+        Assert.False(string.IsNullOrWhiteSpace(outputPath));
+        Assert.False(string.IsNullOrWhiteSpace(sourceSha));
+        Assert.False(string.IsNullOrWhiteSpace(repositoryRoot));
+        var fullEvidencePath = Path.GetFullPath(evidencePath!);
+        var fullOutputPath = Path.GetFullPath(outputPath!);
+        var fullRepositoryRoot = Path.GetFullPath(repositoryRoot!);
+        Assert.True(Path.IsPathFullyQualified(evidencePath));
+        Assert.True(Path.IsPathFullyQualified(outputPath));
+        Assert.True(Path.IsPathFullyQualified(repositoryRoot));
+        Assert.True(File.Exists(fullEvidencePath));
+        Assert.False(File.Exists(fullOutputPath));
+        Assert.True(Directory.Exists(Path.GetDirectoryName(fullOutputPath)));
+        Assert.False(PathIsInside(fullEvidencePath, fullRepositoryRoot));
+        Assert.False(PathIsInside(fullOutputPath, fullRepositoryRoot));
+
+        using var artifact = JsonDocument.Parse(File.ReadAllText(fullEvidencePath));
+        var root = artifact.RootElement;
+        Assert.Equal("graph-evidence-v1", root.GetProperty("schema_version").GetString());
+        Assert.Equal(sourceSha, root.GetProperty("source_sha").GetString());
+        var fixture = root.GetProperty("fixture");
+        var pair = root.GetProperty("published_pair").GetString()!;
+        Assert.Equal(pair, fixture.GetProperty("published_pair").GetString());
+        var periodElement = fixture.GetProperty("period");
+        var periodBody = Encoding.UTF8.GetBytes(
+            "{\"api_version\":\"v3\",\"history_periods\":[" +
+            periodElement.GetRawText() +
+            "]}");
+        var historyBody = Encoding.UTF8.GetBytes(fixture.GetProperty("history_page").GetRawText());
+        var periodId = periodElement.GetProperty("id").GetString()!;
+        var handler = new SplitHistoryFixtureHandler(periodBody, historyBody, pair, periodId);
+        using var client = new LoopbackStatusClient(handler);
+        var periodsResult = await client.FetchHistoryPeriodsAsync(CancellationToken.None);
+        var pageResult = await client.FetchHistoryPageAsync(periodId, cancellationToken: CancellationToken.None);
+        Assert.True(periodsResult.IsSuccess);
+        Assert.True(pageResult.IsSuccess);
+        Assert.Equal(2, handler.RequestCount);
+        var periods = Assert.IsType<ApiHistoryPeriodsSnapshot>(periodsResult.Snapshot);
+        var page = Assert.IsType<ApiHistoryPage>(pageResult.Page);
+        Assert.Equal(periods.PublishedPair, page.PublishedPair);
+        Assert.Equal(pair, periods.PublishedPair.ToString());
+        var parsedPeriod = Assert.Single(periods.Periods, candidate => candidate.Current);
+        var period = parsedPeriod with { Samples = page.Samples };
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, period.EndAt);
+        var gaps = page.HistoryGaps
+            .Select(gap => new GraphConfirmedGap(gap.StartAt, gap.EndAt))
+            .ToArray();
+
+        var actualSegments = new List<LiveGraphSegment>();
+        GraphScene? dollarScene = null;
+        GraphScene? tokenScene = null;
+        foreach (var (metric, name) in new[]
+        {
+            (GraphMetric.Dollars, "dollars"),
+            (GraphMetric.Tokens, "tokens"),
+        })
+        {
+            var scene = GraphScene.Create(samples, metric, period.StartAt, period.EndAt, gaps);
+            if (metric == GraphMetric.Dollars)
+            {
+                dollarScene = scene;
+            }
+            else
+            {
+                tokenScene = scene;
+            }
+
+            foreach (var model in scene.ModelSeries)
+            {
+                var lines = GraphPlotProjection.BuildModelLines(scene, model.Value);
+                AddLiveSegments(actualSegments, name, model.Key, "flat", lines.Flat);
+                AddLiveSegments(actualSegments, name, model.Key, "rising", lines.Rising);
+                AddLiveSegments(actualSegments, name, model.Key, "dashed", lines.Dashed);
+            }
+        }
+
+        Assert.NotNull(dollarScene);
+        Assert.NotNull(tokenScene);
+        Assert.Equal(dollarScene.IdleIntervals, tokenScene.IdleIntervals);
+        var remaining = GraphPlotProjection.BuildRemainingLines(tokenScene);
+        AddLiveSegments(actualSegments, "remaining", "remaining", "solid", remaining.Solid);
+        AddLiveSegments(actualSegments, "remaining", "remaining", "dashed", remaining.Dashed);
+        var orderedActual = OrderLiveSegments(actualSegments);
+        var expectedSegments = OrderLiveSegments(
+            root.GetProperty("expected_segments")
+                .EnumerateArray()
+                .Select(segment => new LiveGraphSegment(
+                    segment.GetProperty("metric").GetString()!,
+                    segment.GetProperty("series").GetString()!,
+                    segment.GetProperty("start_at").GetInt64(),
+                    segment.GetProperty("end_at").GetInt64(),
+                    segment.GetProperty("style").GetString()!)));
+        Assert.Equal(expectedSegments, orderedActual);
+
+        var actualIdle = tokenScene.IdleIntervals
+            .Select(interval => new LiveIdleInterval(interval.StartAt, interval.EndAt))
+            .OrderBy(interval => interval.StartAt)
+            .ThenBy(interval => interval.EndAt)
+            .ToArray();
+        var expectedIdle = root.GetProperty("expected_idle_intervals")
+            .EnumerateArray()
+            .Select(interval => new LiveIdleInterval(
+                interval.GetProperty("start_at").GetInt64(),
+                interval.GetProperty("end_at").GetInt64()))
+            .OrderBy(interval => interval.StartAt)
+            .ThenBy(interval => interval.EndAt)
+            .ToArray();
+        Assert.Equal(expectedIdle, actualIdle);
+
+        var actual = new LiveActualDocument(
+            "graph-actual-v1",
+            sourceSha!,
+            root.GetProperty("input_sha256").GetString()!,
+            pair,
+            "windows",
+            orderedActual,
+            actualIdle);
+        using var output = new FileStream(fullOutputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        JsonSerializer.Serialize(output, actual, new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+        });
+    }
+
+    [Fact]
     public async Task Issue137_continuity_v4_oracle_is_identical_for_dollars_tokens_and_exact_period_end()
     {
         using var document = JsonDocument.Parse(File.ReadAllText(Path.Combine(
@@ -1466,15 +1602,28 @@ public sealed class GraphPlotControlTests
                 Assert.Equal(expectedValues[index], scene.Remaining[index], precision: 12);
             }
             Assert.Equal(
+                fixture.GetProperty("remaining_origins")
+                    .EnumerateArray()
+                    .Select(value => value.GetString()),
+                scene.RemainingOrigins.Select((origin, index) =>
+                    RemainingOriginName(scene, origin, index)));
+            Assert.Equal(
                 fixture.GetProperty("idle_intervals").EnumerateArray().Select(interval =>
                     new GraphIdleInterval(
                         interval[0].GetInt64(),
                         interval[1].GetInt64(),
                         PreserveBoundary: false)),
                 scene.IdleIntervals);
+            var remainingLines = GraphPlotProjection.BuildRemainingLines(scene);
+            Assert.Equal(
+                SegmentPairs(fixture.GetProperty("remaining_solid")),
+                SegmentPairs(remainingLines.Solid));
             Assert.Equal(
                 SegmentPairs(fixture.GetProperty("remaining_dashed")),
-                SegmentPairs(GraphPlotProjection.BuildRemainingLines(scene).Dashed));
+                SegmentPairs(remainingLines.Dashed));
+            Assert.All(
+                SegmentPairs(remainingLines.Solid, remainingLines.Dashed),
+                segment => Assert.True(segment.StartAt < segment.EndAt));
             foreach (var interval in scene.IdleIntervals)
             {
                 var startIndex = Array.IndexOf(scene.Timestamps.ToArray(), (double)interval.StartAt);
@@ -1811,10 +1960,12 @@ public sealed class GraphPlotControlTests
         Assert.Equal(86.66666666666667d, effective[2], precision: 12);
         Assert.Equal(83.33333333333333d, effective[3], precision: 12);
         Assert.Equal(80d, effective[4]);
-        Assert.Equal([1_000d, 1_060d], lines.Solid.X);
-        Assert.Equal([100d, 90d], lines.Solid.Y);
-        Assert.Equal([1_060d, 1_120d, 1_180d, 1_240d], lines.Dashed.X);
-        Assert.Equal([90d, 86.66666666666667d, 83.33333333333333d, 80d], lines.Dashed.Y);
+        Assert.Equal([1_000d, 1_060d, 1_120d, 1_180d, 1_240d], lines.Solid.X);
+        Assert.Equal(
+            [100d, 90d, 86.66666666666667d, 83.33333333333333d, 80d],
+            lines.Solid.Y);
+        Assert.Empty(lines.Dashed.X);
+        Assert.Empty(lines.Dashed.Y);
         Assert.DoesNotContain(
             lines.Solid.X.Zip(lines.Solid.X.Skip(1)),
             pair => pair.First == pair.Second);
@@ -1946,21 +2097,76 @@ public sealed class GraphPlotControlTests
             .ToArray();
     }
 
+    private static void AddLiveSegments(
+        ICollection<LiveGraphSegment> target,
+        string metric,
+        string series,
+        string style,
+        GraphLineProjection projection)
+    {
+        foreach (var (startAt, endAt) in SegmentPairs(projection))
+        {
+            target.Add(new LiveGraphSegment(metric, series, startAt, endAt, style));
+        }
+    }
+
+    private static LiveGraphSegment[] OrderLiveSegments(IEnumerable<LiveGraphSegment> segments) =>
+        segments
+            .OrderBy(segment => segment.Metric switch
+            {
+                "remaining" => 0,
+                "tokens" => 1,
+                "dollars" => 2,
+                _ => throw new InvalidOperationException($"Unknown live graph metric: {segment.Metric}"),
+            })
+            .ThenBy(segment => segment.Series, StringComparer.Ordinal)
+            .ThenBy(segment => segment.StartAt)
+            .ThenBy(segment => segment.EndAt)
+            .ThenBy(segment => segment.Style, StringComparer.Ordinal)
+            .ToArray();
+
+    private static bool PathIsInside(string candidate, string root)
+    {
+        var comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        var normalizedRoot = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return candidate.Equals(normalizedRoot, comparison) ||
+            candidate.StartsWith(normalizedRoot + Path.DirectorySeparatorChar, comparison);
+    }
+
+    private sealed record LiveGraphSegment(
+        string Metric,
+        string Series,
+        long StartAt,
+        long EndAt,
+        string Style);
+
+    private sealed record LiveIdleInterval(long StartAt, long EndAt);
+
+    private sealed record LiveActualDocument(
+        string SchemaVersion,
+        string SourceSha,
+        string InputSha256,
+        string PublishedPair,
+        string Platform,
+        IReadOnlyList<LiveGraphSegment> Segments,
+        IReadOnlyList<LiveIdleInterval> IdleIntervals);
+
     private static string RemainingOriginName(
         GraphScene scene,
         GraphRemainingOrigin origin,
-        int index) =>
-        scene.ModelSynthetic[index] && origin == GraphRemainingOrigin.TerminalNullHold
-            ? "synthetic_tail_hold"
-            : origin switch
-            {
-                GraphRemainingOrigin.Raw => "raw",
-                GraphRemainingOrigin.Interpolated => "interpolated",
-                GraphRemainingOrigin.BoundedNullHold => "bounded_null_hold",
-                GraphRemainingOrigin.TerminalNullHold => "terminal_null_hold",
-                GraphRemainingOrigin.MonotonicHold => "monotonic_hold",
-                _ => "missing",
-            };
+        int index) => origin switch
+        {
+            GraphRemainingOrigin.Raw => "raw",
+            GraphRemainingOrigin.ActivitySmoothed => "activity_smoothed",
+            GraphRemainingOrigin.Interpolated => "interpolated",
+            GraphRemainingOrigin.BoundedNullHold => "bounded_null_hold",
+            GraphRemainingOrigin.TerminalNullHold => "terminal_null_hold",
+            GraphRemainingOrigin.SyntheticTailHold => "synthetic_tail_hold",
+            GraphRemainingOrigin.MonotonicHold => "monotonic_hold",
+            _ => "missing",
+        };
 
     private static ApiHistorySample ConfirmedCumulativeSample(long timestamp, double value) =>
         new(
