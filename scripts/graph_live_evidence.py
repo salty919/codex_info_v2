@@ -630,6 +630,378 @@ def build_expected(fixture: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
     return segments, _idle_intervals(period, samples, token_models, gaps)
 
 
+def _canonical_coordinate(
+    timestamp: int,
+    value: float,
+    period_start: int,
+    period_end: int,
+    maximum: float,
+    remaining: bool,
+) -> tuple[float, float]:
+    span = max(1, period_end - period_start)
+    x = min(100.0, max(0.0, (timestamp - period_start) / span * 100.0))
+    if remaining:
+        y = min(99.0, max(1.0, 99.0 - min(100.0, max(0.0, value)) * 0.98))
+    else:
+        y = min(99.0, max(1.0, 99.0 - max(0.0, value) / max(1.0, maximum) * 98.0))
+    return round(x, 12), round(y, 12)
+
+
+def _canonical_segment(start: tuple[float, float], end: tuple[float, float]) -> str:
+    return f"M{start[0]:.2f} {start[1]:.2f} L{end[0]:.2f} {end[1]:.2f}"
+
+
+def _canonical_dashes(start: tuple[float, float], end: tuple[float, float]) -> list[str]:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if not math.isfinite(length) or length <= sys.float_info.epsilon:
+        return []
+    result: list[str] = []
+    offset = 0.0
+    while offset < length:
+        dash_end = min(offset + 0.45, length)
+        start_fraction = offset / length
+        end_fraction = dash_end / length
+        result.append(
+            _canonical_segment(
+                (
+                    start[0] + dx * start_fraction,
+                    start[1] + dy * start_fraction,
+                ),
+                (
+                    start[0] + dx * end_fraction,
+                    start[1] + dy * end_fraction,
+                ),
+            )
+        )
+        offset += 0.75
+    return result
+
+
+def _canonical_path(
+    segments: list[dict[str, Any]],
+    style: str,
+    values: dict[int, float],
+    period: dict[str, Any],
+    maximum: float,
+    remaining: bool,
+) -> str:
+    commands: list[str] = []
+    for segment in segments:
+        if segment["style"] != style:
+            continue
+        start = _canonical_coordinate(
+            segment["start_at"],
+            values[segment["start_at"]],
+            period["start_at"],
+            period["end_at"],
+            maximum,
+            remaining,
+        )
+        end = _canonical_coordinate(
+            segment["end_at"],
+            values[segment["end_at"]],
+            period["start_at"],
+            period["end_at"],
+            maximum,
+            remaining,
+        )
+        if style == "dashed":
+            commands.extend(_canonical_dashes(start, end))
+        else:
+            commands.append(_canonical_segment(start, end))
+    return " ".join(commands)
+
+
+def _remaining_markers(
+    evidence: list[RemainingEvidence],
+    period: dict[str, Any],
+) -> list[dict[str, Any]]:
+    span = max(1, period["end_at"] - period["start_at"])
+    seen: set[int] = set()
+    markers: list[dict[str, Any]] = []
+    for before, after in pairwise(evidence):
+        if after.timestamp < before.timestamp or after.effective >= before.effective:
+            continue
+        boundary = math.floor(before.effective)
+        if abs(before.effective - boundary) <= sys.float_info.epsilon:
+            boundary -= 1
+        lowest = math.ceil(after.effective)
+        while boundary >= lowest:
+            if boundary < before.effective and boundary >= after.effective and boundary not in seen:
+                seen.add(boundary)
+                fraction = min(
+                    1.0,
+                    max(
+                        0.0,
+                        (boundary - before.effective)
+                        / (after.effective - before.effective),
+                    ),
+                )
+                timestamp = before.timestamp + (after.timestamp - before.timestamp) * fraction
+                markers.append(
+                    {
+                        "x": f"{(timestamp - period['start_at']) / span * 100.0:.12f}",
+                        "y_top": f"{99.0 - boundary * 0.98:.12f}",
+                        "boundary": boundary,
+                    }
+                )
+            boundary -= 1
+    return markers
+
+
+def _f32(value: float) -> float:
+    return struct.unpack("!f", struct.pack("!f", value))[0]
+
+
+def _native_graph_y(value: float, maximum: float) -> float:
+    return _f32(
+        min(0.99, max(0.01, (99.0 - value / max(1.0, maximum) * 98.0) / 100.0))
+    )
+
+
+def _format_token_count(value: float) -> str:
+    return f"{math.floor(max(0.0, value) + 0.5):,}"
+
+
+def _format_token_axis_value(value: float) -> str:
+    value = max(0.0, value)
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.1f}B"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return _format_token_count(value)
+
+
+def _format_percent(value: float) -> str:
+    return f"{value:.0f}%" if abs(value % 1.0) < 0.0001 else f"{value:.1f}%"
+
+
+def _endpoint_labels(
+    projections: dict[str, list[ProjectionPoint]],
+    maximum: float,
+    metric: str,
+    remaining: list[RemainingEvidence],
+) -> list[dict[str, str]]:
+    rank = {"remaining": 0, "LUNA": 1, "TERRA": 2, "SOL": 3, "ASTRA": 4}
+    candidates: list[dict[str, Any]] = []
+    for model in ("ASTRA", "LUNA", "TERRA", "SOL"):
+        values = projections.get(model)
+        if values is None:
+            continue
+        latest = next(
+            (
+                point.value
+                for point in reversed(values)
+                if point.value is not None and math.isfinite(point.value) and point.value >= 0
+            ),
+            None,
+        )
+        if latest is None:
+            continue
+        candidates.append(
+            {
+                "series": model,
+                "text": f"${latest:.2f}" if metric == "dollars" else _format_token_count(latest),
+                "point_y": _native_graph_y(latest, maximum),
+            }
+        )
+    if remaining:
+        latest_remaining = remaining[-1].effective
+        candidates.append(
+            {
+                "series": "remaining",
+                "text": _format_percent(latest_remaining),
+                "point_y": _native_graph_y(latest_remaining, 100.0),
+            }
+        )
+    candidates.sort(key=lambda item: (item["point_y"], rank[item["series"]]))
+    if not candidates:
+        return []
+
+    half = _f32(8.0 / 204.0)
+    separation = _f32(16.0 / 204.0)
+    lower = half
+    upper = _f32(1.0 - half)
+    label_y = [min(upper, max(lower, item["point_y"])) for item in candidates]
+    for index in range(1, len(label_y)):
+        label_y[index] = max(
+            min(upper, max(lower, label_y[index])),
+            _f32(label_y[index - 1] + separation),
+        )
+    if label_y[-1] > upper:
+        label_y[-1] = upper
+        for index in range(len(label_y) - 2, -1, -1):
+            label_y[index] = min(
+                label_y[index],
+                _f32(label_y[index + 1] - separation),
+            )
+
+    return [
+        {
+            "series": item["series"],
+            "text": item["text"],
+            "point_y": f"{item['point_y']:.9f}",
+            "label_y": f"{label_y[index]:.9f}",
+        }
+        for index, item in enumerate(candidates)
+    ]
+
+
+def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
+    period, samples, gaps = _validate_fixture(fixture)
+    rows = _rows_with_tail(period, samples)
+    universe = sorted(
+        {model["model"] for sample in samples for model in sample.get("models") or []},
+        key=lambda value: value.encode("utf-8"),
+    )
+    token_models = {
+        model: _model_projection(rows, model, "tokens") for model in universe
+    }
+    remaining_evidence = _remaining_projection(period, rows, token_models, gaps)
+    remaining_values = {
+        point.timestamp: point.effective for point in remaining_evidence
+    }
+    remaining_segments = _remaining_segments(
+        samples,
+        rows,
+        remaining_evidence,
+        token_models,
+        gaps,
+    )
+    idle = _idle_intervals(period, samples, token_models, gaps)
+    idle_geometry = [
+        {
+            "start": f"{(interval['start_at'] - period['start_at']) / max(1, period['end_at'] - period['start_at']) * 100.0:.12f}",
+            "width": f"{(interval['end_at'] - interval['start_at']) / max(1, period['end_at'] - period['start_at']) * 100.0:.12f}",
+        }
+        for interval in idle
+    ]
+    markers = _remaining_markers(remaining_evidence, period)
+    remaining_points = [
+        {
+            "timestamp": point.timestamp,
+            "value": f"{point.effective:.12f}",
+            "origin": point.origin,
+        }
+        for point in remaining_evidence
+    ]
+    time_ticks = [
+        period["start_at"]
+        + int((period["end_at"] - period["start_at"]) * fraction)
+        for fraction in (0.0, 0.25, 0.5, 0.75, 1.0)
+    ]
+    contracts: dict[str, Any] = {}
+    for metric in ("dollars", "tokens"):
+        projections = {
+            model: _model_projection(rows, model, metric) for model in universe
+        }
+        finite_values = [
+            point.value
+            for projection in projections.values()
+            for point in projection
+            if point.value is not None and math.isfinite(point.value) and point.value >= 0
+        ]
+        maximum = max([1.0, *finite_values])
+        axis_labels = [
+            (
+                f"${maximum * fraction:.2f}"
+                if metric == "dollars"
+                else _format_token_axis_value(maximum * fraction)
+            )
+            for fraction in (1.0, 0.75, 0.5, 0.25, 0.0)
+        ]
+        models = []
+        for model in universe:
+            segments = _model_segments(rows, model, metric, projections[model], gaps)
+            values = {
+                row["timestamp"]: point.value
+                for row, point in zip(rows, projections[model], strict=True)
+                if point.value is not None
+            }
+            models.append(
+                {
+                    "series": model,
+                    "flat": _canonical_path(
+                        segments, "flat", values, period, maximum, False
+                    ),
+                    "rising": _canonical_path(
+                        segments, "rising", values, period, maximum, False
+                    ),
+                    "dashed": _canonical_path(
+                        segments, "dashed", values, period, maximum, False
+                    ),
+                }
+            )
+        contracts[metric] = {
+            "viewbox": [100, 100],
+            "model_maximum": f"{maximum:.12f}",
+            "time_ticks": time_ticks,
+            "axis_labels": axis_labels,
+            "axis_grid_y": [f"{fraction:.12f}" for fraction in (0.0, 0.25, 0.5, 0.75, 1.0)],
+            "endpoint_labels": _endpoint_labels(
+                projections,
+                maximum,
+                metric,
+                remaining_evidence,
+            ),
+            "layout": {
+                "reference_data_width": 788,
+                "plot_width": 694 if metric == "dollars" else 662,
+                "gutter_width": 94 if metric == "dollars" else 126,
+                "label_gap": 10,
+                "label_width": 80 if metric == "dollars" else 112,
+                "right_padding": 4,
+                "minimum_plot_height": 204,
+            },
+            "styles": {
+                "plot_surface": "#121c2c",
+                "grid": "#263850",
+                "axis_text": "#78879c",
+                "idle_band": "#1a2838",
+                "remaining": "#56b2f5",
+                "sol": "#a88cf5",
+                "terra": "#5dc98a",
+                "luna": "#e6a23c",
+                "astra": "#ef6a6a",
+                "flat_width": 1,
+                "rising_width": 3,
+                "inferred_width": 1,
+                "remaining_width": 3,
+                "marker_size": 2,
+                "flat_opacity": "0.95",
+                "rising_opacity": "0.95",
+                "inferred_opacity": "0.72",
+            },
+            "idle_geometry": idle_geometry,
+            "models": models,
+            "remaining": {
+                "solid": _canonical_path(
+                    remaining_segments,
+                    "solid",
+                    remaining_values,
+                    period,
+                    100,
+                    True,
+                ),
+                "dashed": _canonical_path(
+                    remaining_segments,
+                    "dashed",
+                    remaining_values,
+                    period,
+                    100,
+                    True,
+                ),
+            },
+            "remaining_markers": markers,
+            "remaining_points": remaining_points,
+        }
+    return contracts
+
+
 def _fetch(url: str) -> tuple[bytes, str]:
     parsed = urllib.parse.urlsplit(url)
     if (
@@ -668,7 +1040,26 @@ def _fetch(url: str) -> tuple[bytes, str]:
         connection.close()
 
 
-def capture(base_url: str, output_directory: Path, source_sha: str) -> Path:
+def _select_period(periods: list[dict[str, Any]], period_id: str | None) -> dict[str, Any]:
+    if period_id is not None:
+        matches = [period for period in periods if period.get("id") == period_id]
+        if len(matches) != 1:
+            raise EvidenceError(
+                f"expected one period with id {period_id!r}, found {len(matches)}"
+            )
+        return matches[0]
+    current = [period for period in periods if period.get("current") is True]
+    if len(current) != 1:
+        raise EvidenceError(f"expected one current period, found {len(current)}")
+    return current[0]
+
+
+def capture(
+    base_url: str,
+    output_directory: Path,
+    source_sha: str,
+    period_id: str | None = None,
+) -> Path:
     if not source_sha.isascii() or len(source_sha) != 40 or any(character not in "0123456789abcdef" for character in source_sha):
         raise EvidenceError("source SHA must be 40 lowercase hexadecimal characters")
     resolved_output = output_directory.resolve(strict=False)
@@ -683,10 +1074,10 @@ def capture(base_url: str, output_directory: Path, source_sha: str) -> Path:
     periods_document = _json_loads(periods_raw)
     if set(periods_document) != {"api_version", "history_periods"} or periods_document["api_version"] != "v3":
         raise EvidenceError("periods response has an unexpected schema")
-    current = [period for period in periods_document["history_periods"] if period.get("current") is True]
-    if len(current) != 1:
-        raise EvidenceError(f"expected one current period, found {len(current)}")
-    period = current[0]
+    periods = periods_document["history_periods"]
+    if not isinstance(periods, list):
+        raise EvidenceError("periods response history_periods is not an array")
+    period = _select_period(periods, period_id)
     encoded_period = urllib.parse.quote(period["id"], safe="")
     samples: list[dict[str, Any]] = []
     gaps: list[dict[str, Any]] = []
@@ -748,6 +1139,7 @@ def capture(base_url: str, output_directory: Path, source_sha: str) -> Path:
         "input_sha256": aggregate.hexdigest(),
         "fixture": fixture,
         "expected_segments": expected_segments,
+        "expected_render_contracts": build_expected_render_contracts(fixture),
         "actual_projection_segments": [],
         "expected_idle_intervals": expected_idle,
         "actual_idle_intervals": {"linux": [], "windows": []},
@@ -771,7 +1163,16 @@ def _actual_document(path: Path, platform: str, artifact: dict[str, Any]) -> dic
     if len(raw) > MAX_EVIDENCE_BYTES:
         raise EvidenceError(f"{platform} actual document exceeded the size bound")
     document = _json_loads(raw)
-    required = {"schema_version", "source_sha", "input_sha256", "published_pair", "platform", "segments", "idle_intervals"}
+    required = {
+        "schema_version",
+        "source_sha",
+        "input_sha256",
+        "published_pair",
+        "platform",
+        "segments",
+        "idle_intervals",
+        "render_contracts",
+    }
     if set(document) != required or document["schema_version"] != "graph-actual-v1":
         raise EvidenceError(f"{platform} actual document has an unexpected schema")
     for key in ("source_sha", "input_sha256", "published_pair"):
@@ -781,6 +1182,8 @@ def _actual_document(path: Path, platform: str, artifact: dict[str, Any]) -> dic
         raise EvidenceError(f"actual platform is not {platform}")
     if not isinstance(document["segments"], list) or not isinstance(document["idle_intervals"], list):
         raise EvidenceError(f"{platform} actual projection arrays are invalid")
+    if not isinstance(document["render_contracts"], dict):
+        raise EvidenceError(f"{platform} actual render contracts are invalid")
     prior_key: tuple[Any, ...] | None = None
     seen_segments: set[tuple[Any, ...]] = set()
     for segment in document["segments"]:
@@ -832,8 +1235,11 @@ def verify(evidence_path: Path, linux_path: Path, windows_path: Path) -> None:
     if artifact.get("schema_version") != "graph-evidence-v1":
         raise EvidenceError("evidence document schema_version is invalid")
     recomputed_segments, recomputed_idle = build_expected(artifact["fixture"])
+    recomputed_render = build_expected_render_contracts(artifact["fixture"])
     if artifact["expected_segments"] != recomputed_segments or artifact["expected_idle_intervals"] != recomputed_idle:
         raise EvidenceError("captured expectations do not match the independent oracle")
+    if artifact.get("expected_render_contracts") != recomputed_render:
+        raise EvidenceError("captured render contract does not match the independent oracle")
     if artifact["fixture"].get("published_pair") != artifact.get("published_pair"):
         raise EvidenceError("captured fixture published pair does not match its envelope")
     expected = [
@@ -895,6 +1301,11 @@ def verify(evidence_path: Path, linux_path: Path, windows_path: Path) -> None:
         or any(artifact["unmatched_actual"].values())
         or artifact["cross_platform_mismatches"]
         or any(
+            actual_by_platform[platform]["render_contracts"]
+            != artifact["expected_render_contracts"]
+            for platform in ("linux", "windows")
+        )
+        or any(
             actual_by_platform[platform]["idle_intervals"] != artifact["expected_idle_intervals"]
             for platform in ("linux", "windows")
         )
@@ -913,6 +1324,7 @@ def main() -> int:
     capture_parser.add_argument("--base-url", default="http://127.0.0.1:8787")
     capture_parser.add_argument("--output-directory", type=Path, required=True)
     capture_parser.add_argument("--source-sha", required=True)
+    capture_parser.add_argument("--period-id")
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("--evidence", type=Path, required=True)
     verify_parser.add_argument("--linux-actual", type=Path, required=True)
@@ -920,7 +1332,14 @@ def main() -> int:
     arguments = parser.parse_args()
     try:
         if arguments.command == "capture":
-            print(capture(arguments.base_url, arguments.output_directory, arguments.source_sha))
+            print(
+                capture(
+                    arguments.base_url,
+                    arguments.output_directory,
+                    arguments.source_sha,
+                    arguments.period_id,
+                )
+            )
         else:
             verify(arguments.evidence, arguments.linux_actual, arguments.windows_actual)
             print(arguments.evidence)
