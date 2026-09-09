@@ -471,16 +471,19 @@ public static class CodexInfoGraphPixelScanner {
     }
 
     private static bool HasOpaqueIdleRunNear(bool[] idleColumns, int expected, int radius) {
-        int start = Math.Max(0, expected - radius);
-        int end = Math.Min(idleColumns.Length - 1, expected + radius);
-        int run = 0;
-        for (int column = start; column <= end; column++) {
-            if (idleColumns[column]) {
-                run++;
-                if (run >= 4) return true;
-            }
-            else {
-                run = 0;
+        int expectedStart = Math.Max(0, expected - radius);
+        int expectedEnd = Math.Min(idleColumns.Length - 1, expected + radius);
+        int runStart = -1;
+        for (int column = 0; column <= idleColumns.Length; column++) {
+            bool isIdle = column < idleColumns.Length && idleColumns[column];
+            if (isIdle && runStart < 0) runStart = column;
+            if (!isIdle && runStart >= 0) {
+                int runEnd = column - 1;
+                int runWidth = runEnd - runStart + 1;
+                if (runWidth >= 4 && runEnd >= expectedStart && runStart <= expectedEnd) {
+                    return true;
+                }
+                runStart = -1;
             }
         }
         return false;
@@ -1469,6 +1472,7 @@ function Wait-E2EGraphPixelsReady {
 function Invoke-E2EGraphPixelScannerSelfTest {
     $validPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-valid.png'
     $opaqueIdlePrefixPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-opaque-idle-prefix.png'
+    $shiftedOpaqueIdlePrefixPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-shifted-opaque-idle-prefix.png'
     $missingInteriorPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-missing-interior.png'
     $endpointFallbackPath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-endpoint-fallback.png'
     $unprovenSparsePath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-unproven-sparse.png'
@@ -1545,6 +1549,39 @@ function Invoke-E2EGraphPixelScannerSelfTest {
         }
     }
 
+    $bitmap = New-Object System.Drawing.Bitmap(866, 331)
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $graphics.Clear($background)
+        $gridPen = New-Object System.Drawing.Pen($gridColor, 1)
+        try {
+            foreach ($x in @(48, 218, 388, 558, 729)) {
+                $graphics.DrawLine($gridPen, $x, 5, $x, 326)
+            }
+        }
+        finally { $gridPen.Dispose() }
+        $idleBrush = New-Object System.Drawing.SolidBrush($idleColor)
+        try {
+            # The release failure inferred the first grid at x=45 from the
+            # visible x=558/729 pair. The real opaque band starts at x=48,
+            # exactly on the inclusive +3px tolerance boundary.
+            $graphics.FillRectangle($idleBrush, 48, 5, 341, 322)
+        }
+        finally { $idleBrush.Dispose() }
+        for ($index = 0; $index -lt $seriesColors.Count; $index++) {
+            $seriesPen = New-Object System.Drawing.Pen($seriesColors[$index], 2)
+            try {
+                $graphics.DrawLine($seriesPen, 735, 60 + ($index * 35), 850, 60 + ($index * 35))
+            }
+            finally { $seriesPen.Dispose() }
+        }
+        $bitmap.Save($shiftedOpaqueIdlePrefixPath, [System.Drawing.Imaging.ImageFormat]::Png)
+    }
+    finally {
+        $graphics.Dispose()
+        $bitmap.Dispose()
+    }
+
     try {
         $valid = [CodexInfoGraphPixelScanner]::Scan($validPath, 0, 0, 240, 140)
         Assert-E2E ($valid.PeriodStartX -eq 10 -and $valid.PeriodEndX -eq 170 -and
@@ -1561,6 +1598,17 @@ function Invoke-E2EGraphPixelScannerSelfTest {
         Assert-E2E (($opaqueIdlePrefix.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
             'Graph pixel scanner missed endpoints after recovering an opaque idle prefix.'
         Write-E2E 'graph-pixel-scanner-self-test: PASS opaque idle prefix recovered from two visible grids'
+
+        $shiftedOpaqueIdlePrefix = [CodexInfoGraphPixelScanner]::Scan(
+            $shiftedOpaqueIdlePrefixPath, 0, 0, 866, 331)
+        Assert-E2E ($shiftedOpaqueIdlePrefix.PeriodStartX -eq 45 -and
+            $shiftedOpaqueIdlePrefix.PeriodEndX -eq 729 -and
+            $shiftedOpaqueIdlePrefix.PlotSpan -eq 684 -and
+            $shiftedOpaqueIdlePrefix.GutterWidth -eq 136) `
+            'Graph pixel scanner rejected the release-failure idle/grid boundary geometry.'
+        Assert-E2E (($shiftedOpaqueIdlePrefix.SeriesGutterPixelCount | Where-Object { $_ -le 0 }).Count -eq 0) `
+            'Graph pixel scanner missed endpoints after recovering the release-failure geometry.'
+        Write-E2E 'graph-pixel-scanner-self-test: PASS release-failure +3px idle boundary recovered'
 
         $missingInterior = [CodexInfoGraphPixelScanner]::Scan($missingInteriorPath, 0, 0, 240, 140)
         Assert-E2E ($missingInterior.PeriodStartX -eq 10 -and $missingInterior.PeriodEndX -eq 170 -and
@@ -1612,7 +1660,7 @@ function Invoke-E2EGraphPixelScannerSelfTest {
             'Graph pixel scanner accepted partial-height idle pixels as an opaque full-height band.'
     }
     finally {
-        foreach ($path in @($validPath, $opaqueIdlePrefixPath, $missingInteriorPath, $endpointFallbackPath, $unprovenSparsePath, $ambiguousIdlePath, $partialHeightIdlePath)) {
+        foreach ($path in @($validPath, $opaqueIdlePrefixPath, $shiftedOpaqueIdlePrefixPath, $missingInteriorPath, $endpointFallbackPath, $unprovenSparsePath, $ambiguousIdlePath, $partialHeightIdlePath)) {
             if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
         }
     }

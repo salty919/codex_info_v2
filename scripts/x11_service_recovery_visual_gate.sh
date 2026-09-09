@@ -91,7 +91,6 @@ PY
 
 write_thread_summary_reference() {
     local frame_path="$1"
-    mkdir -p "$thread_reference_dir"
     python3 - "$frame_path" "$thread_reference_dir" <<'PY'
 import pathlib
 import struct
@@ -123,6 +122,7 @@ def rgb(x, y):
     index = offset + y * bytes_per_line + x * stride
     return data[index + 2], data[index + 1], data[index]
 
+masks = {}
 for name, (rect, color) in components.items():
     left, top, right, bottom = rect
     mask = bytes(
@@ -133,6 +133,10 @@ for name, (rect, color) in components.items():
     foreground = sum(mask)
     if foreground < 8:
         raise SystemExit(f"reference {name} component is empty: {foreground}")
+    masks[name] = mask
+
+target.mkdir()
+for name, mask in masks.items():
     (target / f"{name}.mask").write_bytes(mask)
 PY
 }
@@ -652,11 +656,14 @@ env "${common_env[@]}" CODEX_INFO_UI_CLIENT_ONLY=1 CODEX_INFO_PREVIEW=normal \
 reference_ui_pid="$!"
 reference_ui_starttime="$(proc_starttime "$reference_ui_pid")"
 [[ "$reference_ui_starttime" =~ ^[0-9]+$ ]] || fail 'reference UI starttime could not be recorded'
-for _ in $(seq 1 100); do
+reference_ready=0
+reference_error=''
+for reference_attempt in $(seq 1 100); do
     kill -0 "$reference_ui_pid" 2>/dev/null || {
         sed -n '1,160p' "$temp_root/reference-ui.log" >&2 || true
         fail 'reference UI exited before rendering'
     }
+    reference_window_id=''
     while read -r candidate; do
         candidate_pid="$(xprop -id "$candidate" _NET_WM_PID 2>/dev/null | awk -F'= ' '{print $2}' | tr -d '[:space:]')"
         if [[ "$candidate_pid" == "$reference_ui_pid" ]]; then
@@ -664,14 +671,24 @@ for _ in $(seq 1 100); do
             break
         fi
     done < <(xwininfo -root -tree 2>/dev/null | awk '/^ +0x[0-9a-f]+/ { print $1 }')
-    [[ -n "$reference_window_id" ]] && break
-    sleep 0.1
+    if [[ -z "$reference_window_id" ]]; then
+        reference_error='reference UI window is not available yet'
+    elif reference_error="$(xwd -silent -id "$reference_window_id" -out "$reference_frame" 2>&1)"; then
+        if reference_error="$(write_thread_summary_reference "$reference_frame" 2>&1)"; then
+            reference_ready=1
+            break
+        fi
+    fi
+    rm -f -- "$reference_frame"
+    if ((reference_attempt < 100)); then
+        sleep 0.1
+    fi
 done
-[[ -n "$reference_window_id" ]] || fail 'reference UI window did not render'
-xwd -silent -id "$reference_window_id" -out "$reference_frame" 2>/dev/null \
-    || fail 'reference UI capture failed'
-write_thread_summary_reference "$reference_frame" \
-    || fail 'reference thread-summary components were not exact'
+if ((reference_ready != 1)); then
+    sed -n '1,160p' "$temp_root/reference-ui.log" >&2 || true
+    [[ -n "$reference_error" ]] && printf '%s\n' "$reference_error" >&2
+    fail 'reference thread-summary components did not render exactly'
+fi
 rm -- "$reference_frame"
 terminate_owned "$reference_ui_pid" reference-UI "$reference_ui_starttime" \
     || fail 'reference UI did not stop cleanly'
@@ -723,7 +740,9 @@ def rgb(x, y):
     return data[index + 2], data[index + 1], data[index]
 def near(value, target, tolerance=24):
     return sqrt(sum((value[i] - target[i]) ** 2 for i in range(3))) <= tolerance
-red = sum(near(rgb(x, y), (239, 106, 106)) for y in range(height) for x in range(width))
+# Restrict danger-color detection to the fixed StatusBanner region. ASTRA uses
+# the same color in the normal model summary and must not make a ready frame fail.
+red = sum(near(rgb(x, y), (239, 106, 106)) for y in range(400, 460) for x in range(20, 880))
 # The quota fill is at a fixed y on the authenticated main surface. The
 # auth panel's primary button is lower, so this rejects a false-ready
 # frame.
