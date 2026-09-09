@@ -187,9 +187,9 @@ public sealed class CodexInfoGraphPixelMeasurement {
 }
 
 public static class CodexInfoGraphPixelScanner {
-    private static readonly Color GridColor = ColorTranslator.FromHtml("#263548");
+    private static readonly Color GridColor = ColorTranslator.FromHtml("#263850");
     private static readonly Color IdleColor = ColorTranslator.FromHtml("#1A2838");
-    private static readonly Color PlotColor = ColorTranslator.FromHtml("#101925");
+    private static readonly Color PlotColor = ColorTranslator.FromHtml("#121C2C");
     private static readonly Color[] SeriesColors = new[] {
         ColorTranslator.FromHtml("#56B2F5"),
         ColorTranslator.FromHtml("#A88CF5"),
@@ -1567,9 +1567,9 @@ function Invoke-E2EGraphPixelScannerSelfTest {
     $unprovenSparsePath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-unproven-sparse.png'
     $ambiguousIdlePath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-ambiguous-idle.png'
     $partialHeightIdlePath = Join-Path $script:e2eOutput 'graph-pixel-scanner-self-test-partial-height-idle.png'
-    $gridColor = [System.Drawing.ColorTranslator]::FromHtml('#263548')
+    $gridColor = [System.Drawing.ColorTranslator]::FromHtml('#263850')
     $idleColor = [System.Drawing.ColorTranslator]::FromHtml('#1A2838')
-    $background = [System.Drawing.ColorTranslator]::FromHtml('#101925')
+    $background = [System.Drawing.ColorTranslator]::FromHtml('#121C2C')
     $seriesColors = @('#56B2F5', '#A88CF5', '#5DC98A', '#E6A23C') |
         ForEach-Object { [System.Drawing.ColorTranslator]::FromHtml($_) }
     foreach ($case in @(
@@ -1596,8 +1596,8 @@ function Invoke-E2EGraphPixelScannerSelfTest {
                 $paintIdle = $y -ge $case.IdleYStart -and $y -le $case.IdleYEnd
                 foreach ($x in @(50, 130)) {
                     if ($case.GridXs -contains $x) {
-                        $bitmap.SetPixel($x, $y, [System.Drawing.Color]::FromArgb(30, 43, 60))
-                        $bitmap.SetPixel($x + 1, $y, [System.Drawing.Color]::FromArgb(24, 35, 50))
+                        $bitmap.SetPixel($x, $y, [System.Drawing.Color]::FromArgb(25, 37, 56))
+                        $bitmap.SetPixel($x + 1, $y, [System.Drawing.Color]::FromArgb(32, 47, 69))
                     }
                 }
                 foreach ($x in 65..75) {
@@ -1804,7 +1804,7 @@ function Test-E2EGraphIdleBandPixel {
 
     # The renderer owns the final opaque #1A2838 composite. Compare each
     # channel against that literal product color so the plot surface
-    # (#101925) and grid/axis (#263548) cannot satisfy the idle-band oracle.
+    # (#121C2C) and grid/axis (#263850) cannot satisfy the idle-band oracle.
     $expected = Get-E2EGraphIdleBackgroundColor
     $tolerance = 8
     $redDelta = [Math]::Abs([int]$Pixel.R - [int]$expected.R)
@@ -2366,9 +2366,9 @@ function New-E2EGraphIdleBandSyntheticBitmap {
     [int]$width = 120
     [int]$height = 100
     $bitmap = [System.Drawing.Bitmap]::new($width, $height)
-    $plotBackground = [System.Drawing.ColorTranslator]::FromHtml('#101925')
+    $plotBackground = [System.Drawing.ColorTranslator]::FromHtml('#121C2C')
     $idleComposite = Get-E2EGraphIdleBackgroundColor
-    $wrongColor = [System.Drawing.ColorTranslator]::FromHtml('#263548')
+    $wrongColor = [System.Drawing.ColorTranslator]::FromHtml('#263850')
     for ($x = 0; $x -lt $width; $x++) {
         for ($y = 0; $y -lt $height; $y++) {
             $bitmap.SetPixel($x, $y, $plotBackground)

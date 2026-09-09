@@ -23,7 +23,7 @@
   <Window.Styles>
     <Style Selector="TextBlock.label">
       <Setter Property="FontSize" Value="13" />
-      <Setter Property="Foreground" Value="#A8B7CA" />
+      <Setter Property="Foreground" Value="#78879C" />
     </Style>
     <Style Selector="ToggleButton.selector">
       <Setter Property="Height" Value="34" />
@@ -118,7 +118,7 @@
         <Grid ColumnDefinitions="18,*" ColumnSpacing="7"><Border Width="14" Height="4" CornerRadius="2" Background="#A88CF5" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Text="SOL" /></Grid>
       </ToggleButton>
       <ToggleButton Grid.Column="4" Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowAstra}" AutomationProperties.Name="ASTRA" AutomationProperties.AutomationId="Graph.Toggle.ASTRA" ToolTip.Tip="ASTRA">
-        <Grid ColumnDefinitions="18,*" ColumnSpacing="7"><Border Width="14" Height="4" CornerRadius="2" Background="#E86E9F" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Text="ASTRA" /></Grid>
+        <Grid ColumnDefinitions="18,*" ColumnSpacing="7"><Border Width="14" Height="4" CornerRadius="2" Background="#EF6A6A" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Text="ASTRA" /></Grid>
       </ToggleButton>
     </Grid>
 
@@ -133,7 +133,7 @@
       </StackPanel>
     </Grid>
 
-    <Border Grid.Row="4" Background="#101925" BorderBrush="#263548" BorderThickness="1" CornerRadius="10" Padding="14">
+    <Border Grid.Row="4" Background="#121C2C" BorderBrush="#3B506F" BorderThickness="1" CornerRadius="10" Padding="14">
       <Grid RowDefinitions="Auto,*" RowSpacing="8">
         <StackPanel Spacing="2">
           <TextBlock Classes="label" FontWeight="SemiBold" Text="{Binding MetricAxisText}" />
