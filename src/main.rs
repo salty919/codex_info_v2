@@ -4320,6 +4320,7 @@ type GraphModelTimelines = BTreeMap<String, BTreeMap<i64, GraphModelPoint>>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GraphRemainingOrigin {
     Raw,
+    ActivitySmoothed,
     Interpolated,
     BoundedNullHold,
     TerminalNullHold,
@@ -4862,6 +4863,7 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
                 confirmed_gaps,
                 &token_anomaly_starts,
                 model_timeline_evidence,
+                Some(&remaining_evidence),
             );
             paths.remaining = [solid.as_str(), inferred.as_str()]
                 .into_iter()
@@ -6348,7 +6350,21 @@ fn remaining_evidence_from_model_timelines(
                     .get(&rows[index].timestamp)
                     .is_some_and(|sample| sample.reliable);
             if !remains_exact_raw {
-                origins[index] = Some(GraphRemainingOrigin::Interpolated);
+                // A raw observation still exists at a normally smoothed
+                // staircase point. Keep that measured provenance distinct
+                // from a raw-null interpolation so presentation smoothing
+                // cannot be misreported as a recorder/API incident.
+                origins[index] = Some(
+                    if rows[index].raw.is_some()
+                        && accepted_remaining
+                            .get(&rows[index].timestamp)
+                            .is_some_and(|sample| sample.reliable)
+                    {
+                        GraphRemainingOrigin::ActivitySmoothed
+                    } else {
+                        GraphRemainingOrigin::Interpolated
+                    },
+                );
             }
         }
     }
@@ -6925,6 +6941,7 @@ fn remaining_paths_with_evidence(
         confirmed_gaps,
         &BTreeSet::new(),
         None,
+        None,
     )
 }
 
@@ -6941,6 +6958,7 @@ struct GraphRemainingSegment {
     kind: GraphRemainingSegmentKind,
 }
 
+#[cfg(test)]
 fn remaining_segments_with_boundaries(
     points: &[(i64, f64)],
     samples: &[&UsageHistorySample],
@@ -6948,6 +6966,26 @@ fn remaining_segments_with_boundaries(
     confirmed_gaps: &[GraphConfirmedGap],
     correction_starts: &BTreeSet<i64>,
     model_timelines: Option<(&GraphModelTimelines, bool)>,
+) -> Vec<GraphRemainingSegment> {
+    remaining_segments_with_boundaries_and_evidence(
+        points,
+        samples,
+        model_points,
+        confirmed_gaps,
+        correction_starts,
+        model_timelines,
+        None,
+    )
+}
+
+fn remaining_segments_with_boundaries_and_evidence(
+    points: &[(i64, f64)],
+    samples: &[&UsageHistorySample],
+    model_points: &[HourlyModelSpend],
+    confirmed_gaps: &[GraphConfirmedGap],
+    correction_starts: &BTreeSet<i64>,
+    model_timelines: Option<(&GraphModelTimelines, bool)>,
+    remaining_evidence: Option<&[GraphRemainingEvidence]>,
 ) -> Vec<GraphRemainingSegment> {
     points
         .windows(2)
@@ -6963,9 +7001,18 @@ fn remaining_segments_with_boundaries(
             ) {
                 GraphRemainingSegmentKind::Inferred
             } else {
-                let quota_evidence = quota_point_is_observed(samples, before.0, before.1)
-                    && quota_point_is_observed(samples, after.0, after.1)
-                    && quota_interval_is_contiguously_observed(samples, before.0, after.0);
+                let quota_evidence =
+                    remaining_point_has_measured_quota(
+                        remaining_evidence,
+                        start_index,
+                        samples,
+                        before,
+                    ) && remaining_point_has_measured_quota(
+                        remaining_evidence,
+                        start_index + 1,
+                        samples,
+                        after,
+                    ) && quota_interval_is_contiguously_observed(samples, before.0, after.0);
                 let (model_evidence, model_advanced) = model_timelines.map_or_else(
                     || model_interval_evidence(model_points, before.0, after.0),
                     |(timelines, show_tokens)| {
@@ -6988,6 +7035,33 @@ fn remaining_segments_with_boundaries(
         .collect()
 }
 
+fn remaining_point_has_measured_quota(
+    evidence: Option<&[GraphRemainingEvidence]>,
+    index: usize,
+    samples: &[&UsageHistorySample],
+    point: (i64, f64),
+) -> bool {
+    let Some(evidence) = evidence else {
+        return quota_point_is_observed(samples, point.0, point.1);
+    };
+    let Some(item) = evidence.get(index) else {
+        return false;
+    };
+    if item.timestamp != point.0 || item.effective != point.1 {
+        return false;
+    }
+    match item.origin {
+        GraphRemainingOrigin::Raw | GraphRemainingOrigin::ActivitySmoothed => item
+            .raw
+            .is_some_and(|raw| quota_point_is_observed(samples, point.0, raw)),
+        GraphRemainingOrigin::Interpolated
+        | GraphRemainingOrigin::BoundedNullHold
+        | GraphRemainingOrigin::TerminalNullHold
+        | GraphRemainingOrigin::SyntheticTailHold
+        | GraphRemainingOrigin::MonotonicHold => false,
+    }
+}
+
 fn remaining_paths_with_boundaries(
     points: &[(i64, f64)],
     samples: &[&UsageHistorySample],
@@ -6997,6 +7071,7 @@ fn remaining_paths_with_boundaries(
     confirmed_gaps: &[GraphConfirmedGap],
     correction_starts: &BTreeSet<i64>,
     model_timelines: Option<(&GraphModelTimelines, bool)>,
+    remaining_evidence: Option<&[GraphRemainingEvidence]>,
 ) -> (String, String) {
     let span = (period_end - period_start).max(1) as f64;
     let coordinate = |(timestamp, raw): (i64, f64)| {
@@ -7006,13 +7081,14 @@ fn remaining_paths_with_boundaries(
     };
     let mut solid_commands = String::new();
     let mut inferred_commands = String::new();
-    for segment in remaining_segments_with_boundaries(
+    for segment in remaining_segments_with_boundaries_and_evidence(
         points,
         samples,
         model_points,
         confirmed_gaps,
         correction_starts,
         model_timelines,
+        remaining_evidence,
     ) {
         let start = coordinate(points[segment.start_index]);
         let end = coordinate(points[segment.end_index]);
@@ -21433,6 +21509,7 @@ mod tests {
         fn origin_name(origin: super::GraphRemainingOrigin) -> &'static str {
             match origin {
                 super::GraphRemainingOrigin::Raw => "raw",
+                super::GraphRemainingOrigin::ActivitySmoothed => "activity_smoothed",
                 super::GraphRemainingOrigin::Interpolated => "interpolated",
                 super::GraphRemainingOrigin::BoundedNullHold => "bounded_null_hold",
                 super::GraphRemainingOrigin::TerminalNullHold => "terminal_null_hold",
@@ -21631,13 +21708,14 @@ mod tests {
             .iter()
             .map(|point| (point.timestamp, point.effective))
             .collect::<Vec<_>>();
-        let remaining_segments = super::remaining_segments_with_boundaries(
+        let remaining_segments = super::remaining_segments_with_boundaries_and_evidence(
             &remaining_points,
             &sample_references,
             &minute,
             &confirmed_gaps,
             &correction_starts,
             Some((&model_timelines, false)),
+            Some(&remaining_evidence),
         );
         let actual_remaining = |kind| {
             remaining_segments
@@ -21692,6 +21770,338 @@ mod tests {
     }
 
     #[test]
+    fn issue137_live_evidence_exports_linux_production_projection() {
+        fn configured_path(name: &str, value: Option<std::ffi::OsString>) -> std::path::PathBuf {
+            std::path::PathBuf::from(value.unwrap_or_else(|| panic!("{name} is required")))
+        }
+
+        fn model_value(point: &HourlyModelSpend, model: &str) -> f64 {
+            match model {
+                "ASTRA" => point.astra,
+                "LUNA" => point.luna,
+                "SOL" => point.sol,
+                "TERRA" => point.terra,
+                _ => panic!("Linux graph has no renderable slot for live model {model}"),
+            }
+        }
+
+        fn segment_key(value: &Value) -> (u8, Vec<u8>, i64, i64, Vec<u8>) {
+            let metric = value["metric"].as_str().expect("segment metric");
+            let metric_rank = match metric {
+                "remaining" => 0,
+                "tokens" => 1,
+                "dollars" => 2,
+                _ => panic!("unknown graph metric {metric}"),
+            };
+            (
+                metric_rank,
+                value["series"]
+                    .as_str()
+                    .expect("segment series")
+                    .as_bytes()
+                    .to_vec(),
+                value["start_at"].as_i64().expect("segment start"),
+                value["end_at"].as_i64().expect("segment end"),
+                value["style"]
+                    .as_str()
+                    .expect("segment style")
+                    .as_bytes()
+                    .to_vec(),
+            )
+        }
+
+        let evidence_os = std::env::var_os("CODEX_INFO_GRAPH_LIVE_EVIDENCE");
+        let output_os = std::env::var_os("CODEX_INFO_GRAPH_ACTUAL_OUTPUT");
+        let source_sha_os = std::env::var_os("CODEX_INFO_GRAPH_SOURCE_SHA");
+        let repository_os = std::env::var_os("CODEX_INFO_GRAPH_REPOSITORY_ROOT");
+        if evidence_os.is_none()
+            && output_os.is_none()
+            && source_sha_os.is_none()
+            && repository_os.is_none()
+        {
+            return;
+        }
+        let evidence_path = configured_path("CODEX_INFO_GRAPH_LIVE_EVIDENCE", evidence_os);
+        let output_path = configured_path("CODEX_INFO_GRAPH_ACTUAL_OUTPUT", output_os);
+        let repository_path = configured_path("CODEX_INFO_GRAPH_REPOSITORY_ROOT", repository_os)
+            .canonicalize()
+            .expect("canonical repository root");
+        let source_sha = source_sha_os
+            .expect("CODEX_INFO_GRAPH_SOURCE_SHA is required")
+            .into_string()
+            .expect("source SHA must be UTF-8");
+        assert!(
+            evidence_path.is_absolute(),
+            "evidence path must be absolute"
+        );
+        assert!(
+            output_path.is_absolute(),
+            "actual output path must be absolute"
+        );
+        let canonical_evidence = evidence_path
+            .canonicalize()
+            .expect("canonical live evidence path");
+        assert!(
+            !canonical_evidence.starts_with(&repository_path),
+            "live evidence must remain outside the repository"
+        );
+        let output_parent = output_path
+            .parent()
+            .expect("actual output parent")
+            .canonicalize()
+            .expect("canonical actual output parent");
+        assert!(
+            !output_parent.starts_with(&repository_path),
+            "actual projection must remain outside the repository"
+        );
+        assert!(!output_path.exists(), "actual output already exists");
+
+        let artifact: Value = serde_json::from_slice(
+            &std::fs::read(&canonical_evidence).expect("read live evidence artifact"),
+        )
+        .expect("parse live evidence artifact");
+        assert_eq!(
+            artifact["schema_version"].as_str(),
+            Some("graph-evidence-v1")
+        );
+        assert_eq!(artifact["source_sha"].as_str(), Some(source_sha.as_str()));
+        let fixture = &artifact["fixture"];
+        let periods_body = serde_json::to_vec(&serde_json::json!({
+            "api_version": "v3",
+            "history_periods": [fixture["period"].clone()],
+        }))
+        .expect("period fixture bytes");
+        let periods = super::parse_service_history_periods_document(&periods_body)
+            .expect("strict live period fixture");
+        let period = periods
+            .iter()
+            .find(|candidate| candidate.current)
+            .expect("one current live period")
+            .clone();
+        assert_eq!(
+            periods.iter().filter(|candidate| candidate.current).count(),
+            1
+        );
+        let page = super::parse_service_history_page_document(
+            &serde_json::to_vec(&fixture["history_page"]).expect("history fixture bytes"),
+        )
+        .expect("strict live history fixture");
+        let latest_remaining = fixture["history_page"]["history_samples"]
+            .as_array()
+            .expect("history samples")
+            .iter()
+            .rev()
+            .find_map(|sample| sample["remaining_percent"].as_f64())
+            .unwrap_or(0.0);
+        let current = PublicDetailsV3 {
+            state: super::PublicState::Ready,
+            observed_at: Some(period.end_at),
+            authenticated: true,
+            plan_label: Some("live-evidence".into()),
+            quota: Some(super::PublicQuota {
+                remaining_percent: latest_remaining,
+                reset_at: period.reset_at,
+                window_seconds: period.reset_at.saturating_sub(period.start_at),
+                monthly: false,
+            }),
+            models: Vec::new(),
+            active_thread_count: 0,
+            history_periods: Vec::new(),
+            history_samples: Vec::new(),
+            history_gaps: Vec::new(),
+            threads: Vec::new(),
+        };
+        let pair = artifact["published_pair"]
+            .as_str()
+            .expect("published pair")
+            .to_owned();
+        assert_eq!(fixture["published_pair"].as_str(), Some(pair.as_str()));
+        let mut state = CodexInfoState::service_client();
+        state
+            .apply_service_current_v3(pair.clone(), current)
+            .expect("same-pair live current root");
+        state
+            .apply_service_history_resource(
+                pair.clone(),
+                periods,
+                page.samples,
+                page.gaps,
+                page.resume_cursor,
+            )
+            .expect("same-pair live history root");
+
+        let (samples, untrusted_minutes) =
+            state.graph_samples_for_selection(period.reset_at, period.start_at, period.end_at);
+        let references = samples.iter().collect::<Vec<_>>();
+        let confirmed_gaps = state
+            .history_gaps
+            .iter()
+            .map(|gap| GraphConfirmedGap {
+                start_at: gap.start_at,
+                end_at: gap.end_at,
+            })
+            .collect::<Vec<_>>();
+        let mut actual_segments = Vec::<Value>::new();
+        let mut token_timelines = None;
+        let mut token_correction_starts = BTreeSet::new();
+        for (show_tokens, metric) in [(false, "dollars"), (true, "tokens")] {
+            let (timelines, correction_starts) = state.graph_model_lineage_for_selection(
+                period.reset_at,
+                period.start_at,
+                period.end_at,
+                show_tokens,
+                &confirmed_gaps,
+            );
+            let minute = super::graph_minute_points_with_model_timelines(
+                &references,
+                period.start_at,
+                period.end_at,
+                show_tokens,
+                &untrusted_minutes,
+                &timelines,
+            );
+            for model in timelines.keys() {
+                let untrusted = super::graph_model_untrusted_minutes(
+                    timelines.get(model),
+                    &minute,
+                    period.end_at,
+                );
+                for segment in super::metric_line_segments_with_boundaries(
+                    &minute,
+                    |point| model_value(point, model),
+                    &confirmed_gaps,
+                    &untrusted,
+                    false,
+                    &correction_starts,
+                ) {
+                    let style = match segment.kind {
+                        super::GraphMetricSegmentKind::Flat => "flat",
+                        super::GraphMetricSegmentKind::Rising => "rising",
+                        super::GraphMetricSegmentKind::Inferred => "dashed",
+                    };
+                    actual_segments.push(serde_json::json!({
+                        "metric": metric,
+                        "series": model,
+                        "start_at": minute[segment.start_index].timestamp,
+                        "end_at": minute[segment.end_index].timestamp,
+                        "style": style,
+                    }));
+                }
+            }
+            if show_tokens {
+                token_correction_starts = correction_starts;
+                token_timelines = Some(timelines);
+            }
+        }
+        let token_timelines = token_timelines.expect("token projection");
+        let token_minute = super::graph_minute_points_with_model_timelines(
+            &references,
+            period.start_at,
+            period.end_at,
+            true,
+            &untrusted_minutes,
+            &token_timelines,
+        );
+        let remaining_evidence = super::remaining_evidence_from_model_timelines(
+            &references,
+            period.start_at,
+            period.end_at,
+            &token_timelines,
+            true,
+            &confirmed_gaps,
+            &token_correction_starts,
+        );
+        let remaining_points = remaining_evidence
+            .iter()
+            .map(|point| (point.timestamp, point.effective))
+            .collect::<Vec<_>>();
+        for segment in super::remaining_segments_with_boundaries_and_evidence(
+            &remaining_points,
+            &references,
+            &token_minute,
+            &confirmed_gaps,
+            &token_correction_starts,
+            Some((&token_timelines, true)),
+            Some(&remaining_evidence),
+        ) {
+            actual_segments.push(serde_json::json!({
+                "metric": "remaining",
+                "series": "remaining",
+                "start_at": remaining_points[segment.start_index].0,
+                "end_at": remaining_points[segment.end_index].0,
+                "style": match segment.kind {
+                    super::GraphRemainingSegmentKind::Solid => "solid",
+                    super::GraphRemainingSegmentKind::Inferred => "dashed",
+                },
+            }));
+        }
+        actual_segments.sort_by_key(segment_key);
+        let mut expected_segments = artifact["expected_segments"]
+            .as_array()
+            .expect("expected segments")
+            .iter()
+            .map(|segment| {
+                serde_json::json!({
+                    "metric": segment["metric"].clone(),
+                    "series": segment["series"].clone(),
+                    "start_at": segment["start_at"].clone(),
+                    "end_at": segment["end_at"].clone(),
+                    "style": segment["style"].clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        expected_segments.sort_by_key(segment_key);
+        assert_eq!(
+            actual_segments, expected_segments,
+            "Linux live graph segments"
+        );
+
+        let span = (period.end_at - period.start_at).max(1) as f64;
+        let mut actual_idle = super::token_idle_interval_positions(
+            &references,
+            period.start_at,
+            period.end_at,
+            &token_timelines,
+            &confirmed_gaps,
+        )
+        .into_iter()
+        .map(|interval| {
+            let start_at = period.start_at + (interval.start / 100.0 * span).round() as i64;
+            let end_at =
+                period.start_at + ((interval.start + interval.width) / 100.0 * span).round() as i64;
+            serde_json::json!({"start_at": start_at, "end_at": end_at})
+        })
+        .collect::<Vec<_>>();
+        actual_idle.sort_by_key(|interval| {
+            (
+                interval["start_at"].as_i64().expect("idle start"),
+                interval["end_at"].as_i64().expect("idle end"),
+            )
+        });
+        let expected_idle = artifact["expected_idle_intervals"]
+            .as_array()
+            .expect("expected idle intervals")
+            .to_vec();
+        assert_eq!(actual_idle, expected_idle, "Linux live idle intervals");
+
+        let document = serde_json::json!({
+            "schema_version": "graph-actual-v1",
+            "source_sha": source_sha,
+            "input_sha256": artifact["input_sha256"].clone(),
+            "published_pair": pair,
+            "platform": "linux",
+            "segments": actual_segments,
+            "idle_intervals": actual_idle,
+        });
+        let output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&output_path)
+            .expect("create Linux actual projection without overwrite");
+        serde_json::to_writer(output, &document).expect("write Linux actual projection");
+    }
+
+    #[test]
     fn graph_continuity_v4_fixture_matches_values_roles_idle_and_period_end() {
         fn intervals(value: &Value) -> Vec<(i64, i64)> {
             value
@@ -21710,6 +22120,7 @@ mod tests {
         fn origin_name(origin: super::GraphRemainingOrigin) -> &'static str {
             match origin {
                 super::GraphRemainingOrigin::Raw => "raw",
+                super::GraphRemainingOrigin::ActivitySmoothed => "activity_smoothed",
                 super::GraphRemainingOrigin::Interpolated => "interpolated",
                 super::GraphRemainingOrigin::BoundedNullHold => "bounded_null_hold",
                 super::GraphRemainingOrigin::TerminalNullHold => "terminal_null_hold",
@@ -22315,6 +22726,18 @@ mod tests {
                 .collect()
         }
 
+        fn origin_name(origin: super::GraphRemainingOrigin) -> &'static str {
+            match origin {
+                super::GraphRemainingOrigin::Raw => "raw",
+                super::GraphRemainingOrigin::ActivitySmoothed => "activity_smoothed",
+                super::GraphRemainingOrigin::Interpolated => "interpolated",
+                super::GraphRemainingOrigin::BoundedNullHold => "bounded_null_hold",
+                super::GraphRemainingOrigin::TerminalNullHold => "terminal_null_hold",
+                super::GraphRemainingOrigin::SyntheticTailHold => "synthetic_tail_hold",
+                super::GraphRemainingOrigin::MonotonicHold => "monotonic_hold",
+            }
+        }
+
         let document: Value =
             serde_json::from_str(include_str!("../tests/fixtures/graph_evidence_oracle.json"))
                 .expect("shared graph evidence fixture");
@@ -22381,6 +22804,14 @@ mod tests {
                     actual.effective
                 );
             }
+            assert_eq!(
+                evidence
+                    .iter()
+                    .map(|point| origin_name(point.origin))
+                    .collect::<Vec<_>>(),
+                serde_json::from_value::<Vec<String>>(case["remaining_origins"].clone()).unwrap(),
+                "origin {name}"
+            );
             let graph = super::graph_paths_for_selection_with_sources_and_astra(
                 &references,
                 start,
@@ -22423,19 +22854,30 @@ mod tests {
                 &BTreeSet::new(),
                 &tokens,
             );
-            let segments = super::remaining_segments_with_boundaries(
+            let segments = super::remaining_segments_with_boundaries_and_evidence(
                 &points,
                 &references,
                 &minute,
                 &[],
                 &corrections,
                 Some((&tokens, true)),
+                Some(&evidence),
             );
+            let solid = segments
+                .iter()
+                .filter(|segment| segment.kind == super::GraphRemainingSegmentKind::Solid)
+                .map(|segment| (points[segment.start_index].0, points[segment.end_index].0))
+                .collect::<Vec<_>>();
             let dashed = segments
                 .iter()
                 .filter(|segment| segment.kind == super::GraphRemainingSegmentKind::Inferred)
                 .map(|segment| (points[segment.start_index].0, points[segment.end_index].0))
                 .collect::<Vec<_>>();
+            assert_eq!(
+                solid,
+                intervals(&case["remaining_solid"]),
+                "solid line role {name}"
+            );
             assert_eq!(
                 dashed,
                 intervals(&case["remaining_dashed"]),
@@ -34659,8 +35101,14 @@ mod tests {
     #[test]
     fn remaining_graph_interpolates_repeated_active_quota_samples() {
         let samples = [
-            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
-            UsageHistorySample::new(
+            UsageHistorySample::new_with_usage(
+                0,
+                1_000,
+                100.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals::default(),
+            ),
+            UsageHistorySample::new_with_usage(
                 60,
                 1_000,
                 90.0,
@@ -34668,11 +35116,15 @@ mod tests {
                     sol: 1.0,
                     ..ModelDollarTotals::default()
                 },
+                ModelTokenTotals {
+                    sol: 1,
+                    ..ModelTokenTotals::default()
+                },
             ),
-            // Model usage continues, but the quota reread is unchanged. Treat
-            // the repeated value as a missed sample and interpolate it from
-            // the surrounding endpoints instead of drawing a false fold.
-            UsageHistorySample::new(
+            // Model usage continues while the measured quota reread is
+            // unchanged. Smooth the staircase for presentation, but keep the
+            // raw observation as measured provenance and render it solid.
+            UsageHistorySample::new_with_usage(
                 120,
                 1_000,
                 90.0,
@@ -34680,8 +35132,12 @@ mod tests {
                     sol: 2.0,
                     ..ModelDollarTotals::default()
                 },
+                ModelTokenTotals {
+                    sol: 2,
+                    ..ModelTokenTotals::default()
+                },
             ),
-            UsageHistorySample::new(
+            UsageHistorySample::new_with_usage(
                 180,
                 1_000,
                 80.0,
@@ -34689,14 +35145,22 @@ mod tests {
                     sol: 3.0,
                     ..ModelDollarTotals::default()
                 },
+                ModelTokenTotals {
+                    sol: 3,
+                    ..ModelTokenTotals::default()
+                },
             ),
-            UsageHistorySample::new(
+            UsageHistorySample::new_with_usage(
                 240,
                 1_000,
                 80.0,
                 ModelDollarTotals {
                     sol: 4.0,
                     ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 4,
+                    ..ModelTokenTotals::default()
                 },
             ),
         ];
@@ -34712,12 +35176,41 @@ mod tests {
                 (240, 80.0)
             ]
         );
-        let paths = graph_paths(&references, 0, 240);
+        let raw_timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            samples
+                .iter()
+                .map(|sample| {
+                    (
+                        sample.timestamp,
+                        super::GraphModelPoint {
+                            dollar: sample.sol_dollars,
+                            tokens: sample.sol_tokens as f64,
+                            reliable: true,
+                            published: true,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+        )]);
+        let paths = super::graph_paths_for_selection_with_sources_and_astra(
+            &references,
+            0,
+            240,
+            false,
+            false,
+            true,
+            false,
+            false,
+            &BTreeSet::new(),
+            &[],
+            &raw_timelines,
+        );
         assert_eq!(
             paths.remaining_solid,
-            "M0.00 1.00 L25.00 10.80 M75.00 20.60 L100.00 20.60"
+            "M0.00 1.00 L25.00 10.80 M25.00 10.80 L50.00 15.70 M50.00 15.70 L75.00 20.60 M75.00 20.60 L100.00 20.60"
         );
-        assert!(!paths.remaining_inferred.is_empty());
+        assert!(paths.remaining_inferred.is_empty());
         assert!(!paths.remaining.contains("L50.00 10.80 L50.00 15.70"));
         assert_eq!(paths.current_remaining_label, "80%");
     }

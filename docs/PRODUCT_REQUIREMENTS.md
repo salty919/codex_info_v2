@@ -308,15 +308,18 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
    順とし、token異常とそのrecovery bridgeはidle不可、dollarだけの異常はtoken正本のidleを無効にしない。
    period境界だけが新しい0起点を許し、period内補正を垂直落下または低い新lineageとして表示しない。
 4. `G137-4`: strictに増加する隣接時刻の差が60秒以下で、同じmodelが両endpointに実測され、当該表示metricの
-   異常または
-   recorder gapを跨がない区間だけをcontiguous measuredとする。それ以外の疎な既知点間、model欠測、
-   source集合変更、後退／回復、confirmed recorder gap、bounded／terminal holdは既知endpoint間を細い
+   異常またはrecorder gapを跨がない区間だけを、そのmodelのcontiguous measuredとする。他modelの出現／消失、
+   `confirmed`と`legacy-unknown`の切替、model集合の完全性だけを理由に、この区間を破線化しない。それ以外の
+   疎な既知点間、当該modelの欠測、後退／回復、confirmed recorder gap、bounded／terminal holdは既知endpoint間を細い
    破線で連続補完する。period endはaccepted periods resourceの同じpairにあるexact `end_at`とし、currentか
    completedか、local clockがどこかによって置換しない。accepted値が1点以上ある系列はperiod内の最初の
    accepted pointからperiod endまで空白区間を作らず、同一X座標のsegmentを作らない。最初のaccepted point
    より前は創作せず、accepted値が0点のmodelは線・右端labelを、全modelが0点なら未使用帯も作らない。
    最終accepted point後は長さを問わずperiod endまで細い破線holdとする。破線は予測であり、それ単独では
    未使用の証拠にしない。
+   model集合変更は、未掲載または新規model自身の線と、その区間のRemaining低下のtoken帰属および未使用判定にだけ
+   反映する。集合変更区間でも共通modelのaccepted値は実線を維持し、raw Remainingの両endpointがacceptedかつ同値なら
+   Remainingも実線を維持する。`source_mismatch`は欠測または利用不能という主原因があるbridgeの補助理由に限定する。
 5. `G137-5`: 未使用判定の正本は表示metricではなくraw `total_tokens`である。基本未使用区間は、時刻差が
    strictに1..60秒のcontiguous measuredで、両endpointに実際に掲載された非空のmodel名集合がexactに同一、
    その全modelのaccepted finite raw `total_tokens`がexactly equal、さらに両endpointのaccepted raw Remainingが
@@ -347,18 +350,19 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
    elapsed秒だけへlinear配分し、token不変の基本未使用intervalではexactに水平とする。途中の同値raw観測は
    未使用判定の証拠として保持するが、新しい変化anchorにはしない。利用可能なmodel集合は各intervalに実際に
    掲載された同一の非空集合とし、period-wide `U`の未掲載値を補完しない。token anomaly区間はactive秒へ
-   採用しない。導出した傾斜segmentは破線とし、
-   raw Remaining labelは変更しない。active intervalが0、model集合変更、null、gap、token anomalyまたは
+   採用しない。各timestampにaccepted raw Remainingが存在し、全intervalのtoken証拠が揃う通常平滑化点は
+   `ActivitySmoothed`としてraw証拠を保持し、その傾斜・水平segmentを実線とする。これは欠測補間ではなく、
+   破線や計測停止の根拠にしない。raw Remaining labelは変更しない。active intervalが0、model集合変更、null、gap、token anomalyまたは
    Remaining anomalyを跨ぐdropは配分せず、既知endpoint間を破線bridgeして未使用帯を作らない。ただし
    bounded null runは、左右に正常な変化anchorがあり、その間の全intervalに同一model集合のtoken証拠が揃う場合だけ、
    null点を未使用証拠にせずactive秒へ破線補間できる。右anchorなしのterminal nullは直前effectiveを
    carryする。accepted raw Remainingが1点以上あれば、最後のeffective pointからexact period endまでを長さに
    関係なく時間幅のある破線holdとし、空白や同一X座標の垂直落下を作らない。
 7. `G137-7`: model線はcontiguous実測の増加を太い実線、不変を細い実線とする。疎な区間、途中に
-   当該modelのunknown rowがあるnearest-finite接続、derived quota pointの両側、unattributed quota drop、
+   当該modelのunknown rowがあるnearest-finite接続、raw-null補間点の両側、unattributed quota drop、
    monotonic hold、bounded/terminal hold、synthetic tailは破線とする。raw quota同値のcontiguous区間は
-   model availabilityと独立した実測実線である。ただし、後続の正常な低下anchorにより`G137-6`の平滑化対象に
-   なった区間は導出破線へ置換する。model線は当該modelの当該表示metric anomaly、Remaining線はRemaining
+   model availabilityと独立した実測実線である。`G137-6`の`ActivitySmoothed`はraw観測とtoken証拠を持つ
+   実測実線であり、raw-nullの`Interpolated`だけを欠測破線とする。model線は当該modelの当該表示metric anomaly、Remaining線はRemaining
    anomaly、全線はgapを跨ぐ区間だけを破線bridgeとし、別metricのanomalyを正常線へ波及させない。右端model
    labelは最後のaccepted raw model値を表示し、実測0を未掲載と同一視して隠さない。Remaining labelは最後の
    raw観測時刻におけるeffective値を表示する。
