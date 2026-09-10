@@ -19,6 +19,8 @@ v3の各履歴rowは`models`と`models_complete`を持つ。各model rowの`tota
 
 `API-DEPRECATION-01`: `/v1/details`、`/v2/details`、全表示情報を一体化した`/v3/details`は互換adapterである。互換期間中は同じatomic generationから生成し、既存field、値型、header allowlistを変更しない。新clientはv3 split resourceを優先し、`/v3/current`がexact 404の場合だけ`/v3/details`、さらにexact 404の場合だけv2、v1へfallbackし、世代をmergeしない。廃止日は未決定であり、決定前に`Sunset`を送らない。将来の削除対象は旧details route、adapter、client fallbackだけで、Session collector、SQLite writer、domain model、`/health`は対象外とする。
 
+RESTの`api_version`はwire互換性だけのauthorityであり、製品Release版およびdaemonのrecorder-state/DB schema版から独立させる。daemon内部形式だけの変更でREST版を進めず、wireの意味またはschemaを非互換に変更するときだけ新しいREST版を追加する。同一binaryで稼働するdaemonとRESTに、独立deployを装う重複SemVerを設けない。
+
 ## 目的と境界
 
 Linux / WSL 上で起動する Codex Info のresident serviceと、Linux / Windows UI向け読み取り専用 APIを、
@@ -484,6 +486,8 @@ snapshot応答のopaque generation identityとしてだけ使い、body SHAやco
 Linux / Windows Mainは10秒周期、Graphのcursor差分はopen中60秒周期、Threads詳細はopen中5秒周期とする。
 Graphが閉じている間は対応requestを0件とし、Threads詳細が閉じている間は上記Linux / Windows Mainの条件付き1回を除きthreads requestを0件とする。同じpairではbody 0の304を使い、current更新時も
 history全体を取得しない。history cursorはperiod、最後の`(reset_at,timestamp)`、そこまでのsample canonical prefixと選択periodの完全gap集合のSHA-256 fingerprintへ結合したclient非解釈値である。serverはsnapshot構築時に累積fingerprintとkey indexを作り、requestではkeyの二分探索とfingerprint比較だけで旧cursorを検証する。現snapshotの同じsample prefixとgap集合が一致する場合だけ、旧pairで発行したcursorも受理し、cursor後のrowを現pairで返す。先頭からの完全取得では最初のpageだけが完全gap集合を持ち、後続pageは空のgap集合を持つ。delta pageもgap集合を反復せず、clientはその現pairの全pageを受理した後だけsampleを直前prefixへatomic appendして既存gap集合を保持する。過去row補正、gap追加・回復・補正、period変更、unknown、stale、malformedでは`400 stale_cursor`としてpage集合を破棄する。clientは`G137-9`のexact responseを保存cursorへの応答として受理した場合だけ、同cycleで先頭から1回取得できる。それ以外の4xx、malformedまたは回復取得失敗は同cycleで反復せず、last-goodを保持する。これにより通常appendのrequest処理と通信はdelta量だけに比例し、prefixまたはgap変更時だけ完全再取得する。
+
+選択periodの先頭pageはGraphが実際に要求した時点でだけ同じimmutable published pair内へ遅延生成し、そのpairを読む全loopback接続で再利用する。未選択periodを先行serializeせず、新しいpairへのatomic switchで旧page cacheも同時に破棄する。cursor付きpageは同pairなら304、更新pairでは検証済みcursor後のsuffixだけをserializeし、request処理からDB、Session、履歴canonicalizationへ戻らない。
 
 `/v3/current`のexact 404を受けたclientは、その接続中をlegacy details modeとし、fallback列で受理した一つの完全details rootをMain、Graph、Threadsへ同時投影する。legacy modeではsplit history/threads routeを追加要求せず、Mainの10秒周期で同じdetails列だけを更新し、Graph/Threadsは最新の受理済みrootを表示する。再接続時には`/v3/current`から能力判定をやり直す。これにより旧serviceでもsurfaceを欠落させず、splitとlegacy rootを混在させない。
 
