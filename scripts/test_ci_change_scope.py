@@ -28,7 +28,13 @@ class OwnerSelectionTests(unittest.TestCase):
                 ("GOVERNANCE",), False, ("actions",)
             ),
             "scripts/ci_change_scope.py": (("GOVERNANCE",), False, ("python",)),
+            "scripts/check_recorder_rest_boundary.sh": (
+                ("LINUX_BACKEND",), False, ()
+            ),
             "src/usage_store.rs": (("LINUX_BACKEND",), True, ("rust",)),
+            "crates/codex-info-rest/src/lib.rs": (
+                ("LINUX_BACKEND",), True, ("rust",)
+            ),
             "ui/app.slint": (("LINUX_UI",), True, ()),
             "windows-client/src/CodexInfo.WindowsClient.Core/DetailsContracts.cs": (
                 ("WINDOWS",), True, ("csharp",)
