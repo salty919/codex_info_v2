@@ -35,11 +35,35 @@ jobs:
         if: inputs.release_candidate
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes ripgrep sqlite3 xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: llvm-tools-preview
+      - name: Install locked Rust coverage tool
+        uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2.87.10
+        with:
+          tool: cargo-llvm-cov@0.9.0
+          fallback: none
       - name: Check native formatting
         if: ${{ !inputs.release_candidate }}
         run: cargo fmt --check
-      - name: Run native unit tests
-        run: cargo test --workspace --locked --all-targets -- --nocapture
+      - name: Run native unit tests with coverage
+        run: |
+          mkdir -p artifacts/codacy-coverage-rust
+          cargo llvm-cov --workspace --locked --all-targets --cobertura \
+            --output-path artifacts/codacy-coverage-rust/rust.cobertura.xml \
+            -- --nocapture
+          report=artifacts/codacy-coverage-rust/rust.cobertura.xml
+          test -s "$report"
+          grep -Eq 'lines-valid="[1-9][0-9]*"' "$report"
+          if grep -Eq 'filename="(/|[A-Za-z]:[\\/])' "$report"; then
+            echo 'Rust Cobertura contains a runner-specific path.' >&2
+            exit 1
+          fi
+      - name: Preserve native coverage for isolated upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: codacy-coverage-rust-v1-head-${{ inputs.source_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifacts/codacy-coverage-rust/rust.cobertura.xml
+          if-no-files-found: error
       - name: Reject native compiler and Clippy warnings
         run: cargo clippy --workspace --locked --all-targets -- -D warnings
       - name: Build native release

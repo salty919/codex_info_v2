@@ -86,7 +86,7 @@ fi
 ((${#checks[@]} > 0)) || fail 'quality plan contains no checks'
 
 run_governance_contract() {
-    local path run_authority_fixtures=0 run_selector_fixtures=0 run_workflow_fixtures=0 run_codeql_fixture=0
+    local path run_authority_fixtures=0 run_selector_fixtures=0 run_workflow_fixtures=0 run_codeql_fixture=0 run_codacy_coverage_fixture=0
     for path in "${changed_paths[@]}"; do
         if [[ "$path" == *.sh && -f "$path" ]]; then
             bash -n "$path"
@@ -114,6 +114,11 @@ PY
         if [[ "$path" == .github/workflows/codeql.yml || "$path" == scripts/test_codeql_workflow.py ]]; then
             run_codeql_fixture=1
         fi
+        case "$path" in
+            .github/workflows/rust.yml|.github/workflows/windows-client.yml|.github/workflows/codacy-coverage.yml|windows-client/CodeCoverage.runsettings|scripts/codacy_coverage_artifacts.py|scripts/test_codacy_coverage_artifacts.py|scripts/test_codacy_coverage_workflow.py)
+                run_codacy_coverage_fixture=1
+                ;;
+        esac
     done
 
     ((run_authority_fixtures == 0)) || python3 scripts/test_requirements_authority.py
@@ -128,6 +133,10 @@ PY
     fi
     if ((run_codeql_fixture != 0)); then
         python3 scripts/test_codeql_workflow.py
+    fi
+    if ((run_codacy_coverage_fixture != 0)); then
+        python3 scripts/test_codacy_coverage_artifacts.py
+        python3 scripts/test_codacy_coverage_workflow.py
     fi
 }
 

@@ -5,6 +5,7 @@
       <DataCollector friendlyName="Code Coverage">
         <Configuration>
           <Format>Cobertura</Format>
+          <DeterministicReport>True</DeterministicReport>
           <IncludeTestAssembly>False</IncludeTestAssembly>
           <CodeCoverage>
             <ModulePaths>
