@@ -21,7 +21,10 @@ use codex_info::server::{
 use codex_info::thread_contract::{
     self, ThreadCycleAccumulator, ThreadCycleOutcome, ThreadTopologyNode,
 };
-use codex_info::usage_store::{self, StoragePartitionIdentity, UsageStore};
+use codex_info::usage_store::{
+    self, classify_quota_transition, select_predeadline_quota_authority, QuotaTransition,
+    StoragePartitionIdentity, UsageStore,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -2674,60 +2677,6 @@ impl UsageHistorySample {
 
 fn same_reset_period(left: i64, right: i64) -> bool {
     left.abs_diff(right) <= RESET_AT_TOLERANCE_SECONDS as u64
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum QuotaTransition {
-    Initial,
-    SamePeriod,
-    Boundary,
-    Rejected,
-}
-
-/// Classify a quota observation using only durable time authority. Percentage
-/// changes and a replacement reset timestamp before the accepted deadline are
-/// observations, not proof of a new period.
-fn classify_quota_transition(
-    previous_reset_at: Option<i64>,
-    previous_window_seconds: i64,
-    previous_observed_at: Option<i64>,
-    next_reset_at: i64,
-    next_window_seconds: i64,
-    next_remaining_percent: Option<f64>,
-    observed_at: i64,
-) -> QuotaTransition {
-    let candidate_is_valid = observed_at > 0
-        && next_reset_at > observed_at
-        && next_window_seconds > 0
-        && next_reset_at.checked_sub(next_window_seconds).is_some()
-        && next_remaining_percent
-            .is_some_and(|value| value.is_finite() && (0.0..=100.0).contains(&value));
-    if !candidate_is_valid {
-        return QuotaTransition::Rejected;
-    }
-    let Some(previous_reset_at) = previous_reset_at else {
-        return QuotaTransition::Initial;
-    };
-    let Some(previous_observed_at) = previous_observed_at else {
-        return QuotaTransition::Rejected;
-    };
-    if previous_reset_at <= 0
-        || previous_window_seconds <= 0
-        || previous_observed_at <= 0
-        || observed_at < previous_observed_at
-    {
-        return QuotaTransition::Rejected;
-    }
-    if next_reset_at == previous_reset_at
-        && next_window_seconds == previous_window_seconds
-        && previous_reset_at > observed_at
-    {
-        return QuotaTransition::SamePeriod;
-    }
-    if previous_reset_at <= observed_at && next_reset_at > previous_reset_at {
-        return QuotaTransition::Boundary;
-    }
-    QuotaTransition::Rejected
 }
 
 /// Decide whether a newly reported reset timestamp is a real period boundary
@@ -8084,6 +8033,89 @@ fn apply_cumulative_recovery_to_current(
     true
 }
 
+#[derive(Clone, Debug)]
+struct QuotaGenerationRecoveryPlan {
+    source_state: usage_store::SessionCollectionState,
+    collection_state: usage_store::SessionCollectionState,
+    canonical_observation: usage_store::SessionQuotaObservation,
+    cumulative_recovery: usage_store::SessionCumulativeRecovery,
+}
+
+fn load_quota_generation_recovery_plan(
+    partition: &account_scope::AccountPartition,
+    current: &usage_store::SessionCollectionState,
+    observed_at: i64,
+) -> Option<QuotaGenerationRecoveryPlan> {
+    let identity = partition.storage_identity();
+    let mut retained = Vec::new();
+    for generation in 1..=3 {
+        let path = partition
+            .database_path
+            .with_extension(format!("sqlite3.bak.{generation}"));
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return None;
+            }
+            Ok(_) => {}
+        }
+        let store = UsageStore::open_read_only_partitioned(&path, &identity).ok()?;
+        store.verify_integrity().ok()?;
+        retained.push(store.load_session_collection_state().ok()?);
+    }
+    let canonical = select_predeadline_quota_authority(current, &retained)?;
+    let store = UsageStore::open_read_only_partitioned(&partition.database_path, &identity).ok()?;
+    let current_models = store
+        .latest_raw_session_model_totals_for_period(canonical.reset_at, observed_at)
+        .ok()??;
+    let recovery = store
+        .pending_session_cumulative_recovery(
+            canonical.reset_at,
+            canonical.window_seconds,
+            observed_at,
+            &current_models,
+        )
+        .ok()??;
+    let canonical_observation = store
+        .latest_raw_quota_observation_for_period(canonical.reset_at)
+        .ok()??;
+    if canonical_observation.observed_at > observed_at {
+        return None;
+    }
+    let source = recovery.source_generation.as_ref()?;
+    let current_observation = current.last_quota_observation.as_ref()?;
+    if source.data_generation != current.data_generation
+        || source.reset_at != current.reset_at
+        || source.window_seconds != current.window_seconds
+        || source.observed_at != current_observation.observed_at
+        || source.remaining_percent != current_observation.remaining_percent
+        || source.model_totals != current.model_totals
+    {
+        return None;
+    }
+    let reconciled = usage_store::reconcile_rejected_generation_model_totals(
+        &current_models,
+        &current.model_totals,
+    )
+    .ok()??;
+    let mut collection_state = current.clone();
+    collection_state.reset_at = canonical.reset_at;
+    collection_state.window_seconds = canonical.window_seconds;
+    collection_state.last_quota_observation = Some(canonical_observation.clone());
+    collection_state.model_totals = reconciled;
+    debug_runtime(format!(
+        "predeadline quota generation recovery selected source={} canonical_reset_at={}",
+        current.data_generation, canonical.reset_at
+    ));
+    Some(QuotaGenerationRecoveryPlan {
+        source_state: current.clone(),
+        collection_state,
+        canonical_observation,
+        cumulative_recovery: recovery,
+    })
+}
+
 fn load_regression_recovery_state(
     partition: &account_scope::AccountPartition,
     current: &usage_store::SessionCollectionState,
@@ -10598,10 +10630,23 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                     if let Some(recovered) = recovered_totals {
                         apply_regression_recovery(&mut collection, recovered);
                     }
-                    let cumulative_recovery = cumulative_recovery.and_then(|recovery| {
-                        apply_cumulative_recovery_to_current(&mut collection, &recovery)
-                            .then_some(recovery)
-                    });
+                    let cumulative_recovery = match cumulative_recovery {
+                        Some(recovery) => {
+                            if apply_cumulative_recovery_to_current(&mut collection, &recovery) {
+                                Some(recovery)
+                            } else if recovery.source_generation.as_ref().is_some_and(|source| {
+                                source.reset_at != recovery.canonical_reset_at
+                                    || source.window_seconds != recovery.window_seconds
+                            }) {
+                                return Err(security::SecurityError::new(
+                                    security::SecurityErrorKind::Parse,
+                                ));
+                            } else {
+                                None
+                            }
+                        }
+                        None => None,
+                    };
                     let verified_recovery =
                         verified_recovery.and_then(|(authority, model_totals)| {
                             let fallback_samples = collection.history_samples.clone();
@@ -10929,6 +10974,9 @@ struct CodexInfoState {
     /// commits; after that, the last committed snapshot remains visible while
     /// a periodic refresh is pending.
     local_usage_pending: bool,
+    /// Whether the in-flight local scan follows an accepted quota sample.
+    /// Rejected remote candidates may not be stamped onto durable history.
+    pending_quota_observation_confirmed: bool,
     pending_local_verification: Option<LocalUsageCandidate>,
     /// A completed snapshot remains visible while a later quota-only refresh
     /// collects the next local payload. This is cleared only with account
@@ -11650,6 +11698,7 @@ impl CodexInfoState {
             local_usage_error: false,
             recorder_store_error: false,
             local_usage_pending: false,
+            pending_quota_observation_confirmed: false,
             pending_local_verification: None,
             usage_snapshot_committed: false,
             last_thread_poll: resident_now,
@@ -11747,6 +11796,7 @@ impl CodexInfoState {
             local_usage_error: false,
             recorder_store_error: false,
             local_usage_pending: false,
+            pending_quota_observation_confirmed: false,
             pending_local_verification: None,
             usage_snapshot_committed: false,
             last_thread_poll: Instant::now(),
@@ -11867,6 +11917,7 @@ impl CodexInfoState {
             local_usage_error: false,
             recorder_store_error: false,
             local_usage_pending: false,
+            pending_quota_observation_confirmed: false,
             pending_local_verification: None,
             // Preview is one complete in-memory generation. Individual
             // startup fixtures clear this bit when they intentionally model
@@ -12532,6 +12583,7 @@ impl CodexInfoState {
             && details.observed_at.is_some()
             && matches!(details.state, PublicState::Ready | PublicState::Error);
         self.local_usage_pending = false;
+        self.pending_quota_observation_confirmed = false;
         self.usage_snapshot_committed = self.has_usage;
         self.last_success_at = observed_at;
         self.model_usage = next_models;
@@ -12677,6 +12729,7 @@ impl CodexInfoState {
             && details.observed_at.is_some()
             && matches!(details.state, PublicState::Ready | PublicState::Error);
         self.local_usage_pending = false;
+        self.pending_quota_observation_confirmed = false;
         self.usage_snapshot_committed = self.has_usage;
         self.last_success_at = observed_at;
         self.model_usage = next_models;
@@ -12837,6 +12890,7 @@ impl CodexInfoState {
             && current.observed_at.is_some()
             && matches!(current.state, PublicState::Ready | PublicState::Error);
         self.local_usage_pending = false;
+        self.pending_quota_observation_confirmed = false;
         self.usage_snapshot_committed = self.has_usage;
         self.last_success_at = current.observed_at;
         self.model_usage = current
@@ -13129,6 +13183,15 @@ impl CodexInfoState {
     }
 
     fn request_local_usage(&mut self, reset_at: i64, window_seconds: i64) -> bool {
+        self.request_local_usage_with_recovery(reset_at, window_seconds, None)
+    }
+
+    fn request_local_usage_with_recovery(
+        &mut self,
+        reset_at: i64,
+        window_seconds: i64,
+        supplied_recovery: Option<QuotaGenerationRecoveryPlan>,
+    ) -> bool {
         if self.preview || reset_at <= 0 || self.local_usage_pending {
             return false;
         }
@@ -13185,34 +13248,61 @@ impl CodexInfoState {
                     return false;
                 }
             };
-        let regression_recovery_state =
-            history_continuity_recovery.as_ref().and_then(|continuity| {
-                load_regression_recovery_state(partition, &collection_state, continuity)
-            });
-        let period_transition = admit_session_collection_period(
-            &mut collection_state,
-            reset_at,
-            window_seconds,
-            self.remaining_percent,
-            observed_at,
-        );
-        if period_transition == QuotaTransition::Rejected {
-            debug_runtime("local collection rejected ambiguous quota period candidate");
-            return false;
-        }
-        let period_boundary = period_transition == QuotaTransition::Boundary;
-        let (canonical_reset_at, canonical_window_seconds) =
-            if period_transition == QuotaTransition::SamePeriod {
-                (collection_state.reset_at, collection_state.window_seconds)
+        let recovery_plan = supplied_recovery.or_else(|| {
+            load_quota_generation_recovery_plan(partition, &collection_state, observed_at)
+        });
+        let (period_transition, period_boundary, canonical_reset_at, canonical_window_seconds) =
+            if let Some(plan) = recovery_plan.as_ref() {
+                if plan.source_state != collection_state
+                    || plan.cumulative_recovery.canonical_reset_at != reset_at
+                    || plan.cumulative_recovery.window_seconds != window_seconds
+                {
+                    debug_runtime("quota generation recovery source changed before collection");
+                    return false;
+                }
+                collection_state = plan.collection_state.clone();
+                (QuotaTransition::Rejected, false, reset_at, window_seconds)
             } else {
-                (reset_at, window_seconds)
+                let transition = admit_session_collection_period(
+                    &mut collection_state,
+                    reset_at,
+                    window_seconds,
+                    self.remaining_percent,
+                    observed_at,
+                );
+                if transition == QuotaTransition::Rejected {
+                    debug_runtime("local collection rejected ambiguous quota period candidate");
+                    return false;
+                }
+                let period = if transition == QuotaTransition::SamePeriod {
+                    (collection_state.reset_at, collection_state.window_seconds)
+                } else {
+                    (reset_at, window_seconds)
+                };
+                (
+                    transition,
+                    transition == QuotaTransition::Boundary,
+                    period.0,
+                    period.1,
+                )
             };
+        let regression_recovery_state = recovery_plan
+            .is_none()
+            .then(|| {
+                history_continuity_recovery.as_ref().and_then(|continuity| {
+                    load_regression_recovery_state(partition, &collection_state, continuity)
+                })
+            })
+            .flatten();
         debug_runtime(format!(
             "local collection period admitted transition={period_transition:?} durable_generation={}",
             collection_state.data_generation,
         ));
         let history_continuity_recovery = history_continuity_recovery
-            .filter(|recovery| recovery.matches_reset_at(collection_state.reset_at));
+            .filter(|recovery| recovery.matches_reset_at(canonical_reset_at));
+        let cumulative_recovery = recovery_plan
+            .map(|plan| plan.cumulative_recovery)
+            .or(cumulative_recovery);
         let command = LocalCommand::Collect {
             auth_epoch: self.auth_epoch,
             admission,
@@ -13379,6 +13469,7 @@ impl CodexInfoState {
         self.local_usage_error = false;
         self.recorder_store_error = false;
         self.local_usage_pending = false;
+        self.pending_quota_observation_confirmed = false;
         self.pending_local_verification = None;
         self.usage_snapshot_committed = false;
         self.history = UsageHistory::default();
@@ -13499,6 +13590,8 @@ impl CodexInfoState {
         let mut previous_reset_at = self.reset_at;
         let mut previous_window_seconds = self.window_seconds;
         let mut previous_observed_at = self.last_success_at;
+        let mut durable_authority = None;
+        let mut quota_generation_recovery = None;
         if let Some(partition) = self.account_partition.as_ref() {
             let identity = partition.storage_identity();
             if let Ok(durable) =
@@ -13506,7 +13599,17 @@ impl CodexInfoState {
                     .and_then(|store| store.load_session_collection_state())
             {
                 if durable.data_generation > 0 {
-                    if let Some(observation) = durable.last_quota_observation.as_ref() {
+                    let recovery = load_quota_generation_recovery_plan(partition, &durable, now);
+                    if let Some(plan) = recovery.as_ref() {
+                        previous_reset_at = Some(plan.cumulative_recovery.canonical_reset_at);
+                        previous_window_seconds = plan.cumulative_recovery.window_seconds;
+                        previous_observed_at = Some(plan.canonical_observation.observed_at);
+                        durable_authority = Some((
+                            plan.cumulative_recovery.canonical_reset_at,
+                            plan.cumulative_recovery.window_seconds,
+                            plan.canonical_observation.clone(),
+                        ));
+                    } else if let Some(observation) = durable.last_quota_observation.as_ref() {
                         if previous_observed_at
                             .is_none_or(|current| observation.observed_at > current)
                         {
@@ -13514,7 +13617,13 @@ impl CodexInfoState {
                             previous_window_seconds = durable.window_seconds;
                             previous_observed_at = Some(observation.observed_at);
                         }
+                        durable_authority = Some((
+                            durable.reset_at,
+                            durable.window_seconds,
+                            observation.clone(),
+                        ));
                     }
+                    quota_generation_recovery = recovery;
                 }
             }
         }
@@ -13527,10 +13636,39 @@ impl CodexInfoState {
             remaining_percent,
             now,
         );
-        if transition == QuotaTransition::Rejected {
+        let recover_before_period_change =
+            quota_generation_recovery.is_some() && transition != QuotaTransition::SamePeriod;
+        if transition == QuotaTransition::Rejected || recover_before_period_change {
             debug_runtime(format!(
                 "quota candidate rejected previous_reset_at={previous_reset_at:?} next_reset_at={reset_at} observed_at={now}"
             ));
+            if let Some((canonical_reset_at, canonical_window_seconds, observation)) =
+                durable_authority
+            {
+                let state_did_not_hold_authority = self.reset_at != Some(canonical_reset_at)
+                    || self.window_seconds != canonical_window_seconds;
+                if state_did_not_hold_authority {
+                    self.has_quota_percent = true;
+                    self.has_usage = true;
+                    self.remaining_percent = Some(observation.remaining_percent);
+                    self.reset_at = Some(canonical_reset_at);
+                    self.window_seconds = canonical_window_seconds;
+                    self.last_success_at = Some(observation.observed_at);
+                    self.recovery_period = Some((canonical_reset_at, canonical_window_seconds));
+                    self.selected_reset_at = Some(canonical_reset_at);
+                    self.selected_history_period.clear();
+                }
+                self.pending_quota_observation_confirmed = false;
+                if self.request_local_usage_with_recovery(
+                    canonical_reset_at,
+                    canonical_window_seconds,
+                    quota_generation_recovery,
+                ) {
+                    self.last_local_poll = Instant::now();
+                } else {
+                    let _ = self.bridge.send(AccountCommand::FinishFallback);
+                }
+            }
             self.checking = false;
             let _ = self.bridge.send(AccountCommand::FinishFallback);
             self.refresh_partial_failure_status();
@@ -13557,6 +13695,7 @@ impl CodexInfoState {
         self.monthly = monthly;
         self.account_error = None;
         self.local_usage_error = false;
+        self.pending_quota_observation_confirmed = true;
         if reset_changed {
             // A graph that was following the previously current period must
             // follow the newly announced period as soon as its local payload
@@ -13585,7 +13724,11 @@ impl CodexInfoState {
         ));
         // Quota is committed before the single local worker is asked to
         // collect usage. The request carries the exact auth/period tuple.
-        if self.request_local_usage(canonical_reset_at, canonical_window_seconds) {
+        if self.request_local_usage_with_recovery(
+            canonical_reset_at,
+            canonical_window_seconds,
+            quota_generation_recovery,
+        ) {
             self.last_local_poll = Instant::now();
         } else {
             let _ = self.bridge.send(AccountCommand::FinishFallback);
@@ -13846,6 +13989,7 @@ impl CodexInfoState {
             // command is pending, so its stale terminal event releases the
             // physical lane without admitting stale data.
             self.local_usage_pending = false;
+            self.pending_quota_observation_confirmed = false;
             return;
         }
         if self.pending_recorder_admission.is_none() {
@@ -13884,16 +14028,13 @@ impl CodexInfoState {
         // the remote quota request failed, keep the confirmed local model
         // values but leave remaining_percent null; never stamp a stale quota
         // value onto that timestamp.
-        let fresh_remaining = self
-            .account_error
-            .is_none()
-            .then_some(self.remaining_percent)
-            .flatten();
+        let fresh_remaining = (self.pending_quota_observation_confirmed
+            && self.account_error.is_none())
+        .then_some(self.remaining_percent)
+        .flatten();
+        self.pending_quota_observation_confirmed = false;
         let record_current_local_observation = fresh_remaining.is_some()
-            || (!self.preview
-                && self.authenticated
-                && self.account_error.is_some()
-                && has_current_model_totals);
+            || (!self.preview && self.authenticated && has_current_model_totals);
         if record_current_local_observation {
             let observed_at = Utc::now().timestamp();
             let sample = fresh_remaining
@@ -13934,6 +14075,7 @@ impl CodexInfoState {
             self.current_account_admission().as_ref() == Some(&candidate.admission);
         if candidate.result.auth_epoch != self.auth_epoch || !admission_matches {
             self.local_usage_pending = false;
+            self.pending_quota_observation_confirmed = false;
             return;
         }
         let Some(account_key) = self.account_key.clone() else {
@@ -13980,6 +14122,7 @@ impl CodexInfoState {
             )
         {
             self.local_usage_pending = false;
+            self.pending_quota_observation_confirmed = false;
             return;
         }
         if !valid {
@@ -13992,7 +14135,8 @@ impl CodexInfoState {
         self.pending_session_checkpoints = candidate.session_checkpoints;
         self.pending_session_ranges = candidate.session_ranges;
         self.pending_session_model_totals = candidate.session_model_totals;
-        self.pending_quota_source_rescan_complete = self.account_error.is_none()
+        self.pending_quota_source_rescan_complete = self.pending_quota_observation_confirmed
+            && self.account_error.is_none()
             && self.remaining_percent.is_some()
             && self.last_success_at.is_some();
         self.pending_collector_generation = Some((candidate.collector_epoch, candidate.cycle_seq));
@@ -14060,8 +14204,11 @@ impl CodexInfoState {
             })
         {
             self.local_usage_pending = false;
+            self.pending_quota_observation_confirmed = false;
             return;
         }
+        let quota_observation_confirmed =
+            std::mem::take(&mut self.pending_quota_observation_confirmed);
         let _ = self.bridge.send(AccountCommand::FinishFallback);
         self.local_usage_error = true;
         self.local_usage_pending = false;
@@ -14080,7 +14227,8 @@ impl CodexInfoState {
             self.refresh_partial_failure_status();
             return;
         };
-        if self.account_error.is_some()
+        if !quota_observation_confirmed
+            || self.account_error.is_some()
             || reset_at <= 0
             || self.remaining_percent.is_none()
             || self.has_pending_recorder_batch()
@@ -14109,6 +14257,7 @@ impl CodexInfoState {
     fn apply_recorder_store_error(&mut self) {
         self.recorder_store_error = true;
         self.local_usage_pending = false;
+        self.pending_quota_observation_confirmed = false;
         self.refresh_partial_failure_status();
     }
 
@@ -25265,6 +25414,50 @@ mod tests {
     }
 
     #[test]
+    fn retained_authority_is_selected_only_for_one_unambiguous_predeadline_period() {
+        let observed_a = 1_789_004_280;
+        let observed_c = 1_789_018_800;
+        let reset_a = 1_789_437_490;
+        let reset_b = 1_789_300_251;
+        let reset_c = 1_789_623_591;
+        let state = |generation, reset_at, observed_at, remaining_percent| {
+            super::usage_store::SessionCollectionState {
+                data_generation: generation,
+                reset_at,
+                window_seconds: WEEK_SECONDS,
+                last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
+                    observed_at,
+                    remaining_percent,
+                }),
+                ..super::usage_store::SessionCollectionState::default()
+            }
+        };
+        let corrupted = state(100, reset_c, observed_c, 100.0);
+        let newest_a = state(90, reset_a, observed_a, 9.0);
+        let older_a = state(80, reset_a, observed_a - 60, 10.0);
+        let expired = state(70, observed_a - 1, observed_a - 60, 1.0);
+
+        assert_eq!(
+            super::select_predeadline_quota_authority(
+                &corrupted,
+                &[older_a.clone(), expired, newest_a.clone()],
+            )
+            .map(|selected| selected.data_generation),
+            Some(newest_a.data_generation)
+        );
+
+        let conflicting = state(95, reset_b, observed_a + 60, 17.0);
+        assert!(super::select_predeadline_quota_authority(
+            &corrupted,
+            &[newest_a.clone(), conflicting],
+        )
+        .is_none());
+
+        let true_boundary = state(101, reset_c, reset_a, 100.0);
+        assert!(super::select_predeadline_quota_authority(&true_boundary, &[newest_a]).is_none());
+    }
+
+    #[test]
     fn rejected_quota_candidate_keeps_the_last_complete_http_generation() {
         let observed = Utc::now().timestamp();
         let canonical_reset = observed + WEEK_SECONDS;
@@ -26763,6 +26956,122 @@ mod tests {
         assert_eq!(graph.current_sol_label, "$370.81");
         assert_eq!(graph.current_luna_label, "$1.61");
         server.shutdown();
+    }
+
+    #[test]
+    #[ignore = "requires the explicit current account database and retained backups"]
+    fn real_database_has_one_source_proven_predeadline_recovery_plan() {
+        let database = std::env::var_os("CODEX_INFO_REAL_DB_GATE")
+            .map(PathBuf::from)
+            .expect("CODEX_INFO_REAL_DB_GATE must name the account database");
+        let connection = rusqlite::Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .unwrap();
+        connection.pragma_update(None, "query_only", true).unwrap();
+        let identity = connection
+            .query_row(
+                "SELECT schema_version, profile_scope_id, account_scope_id,
+                        storage_epoch, partition_id
+                 FROM storage_partition WHERE singleton=1",
+                [],
+                |row| {
+                    Ok(usage_store::StoragePartitionIdentity {
+                        schema_version: row.get(0)?,
+                        profile_scope_id: row.get(1)?,
+                        account_scope_id: row.get(2)?,
+                        storage_epoch: row
+                            .get::<_, String>(3)?
+                            .parse()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        partition_id: row.get(4)?,
+                    })
+                },
+            )
+            .unwrap();
+        drop(connection);
+        let key = super::account_scope::AccountKey::synthetic_preview("issue-258-real-gate");
+        let mut partition = super::account_scope::AccountPartition::synthetic_preview(&key);
+        partition.profile_scope_id = identity.profile_scope_id;
+        partition.account_scope_id = identity.account_scope_id;
+        partition.storage_epoch = identity.storage_epoch;
+        partition.partition_id = identity.partition_id;
+        partition.database_path = database;
+
+        let store = UsageStore::open_read_only_partitioned(
+            &partition.database_path,
+            &partition.storage_identity(),
+        )
+        .unwrap();
+        let current = store.load_session_collection_state().unwrap();
+        let observed_at = current
+            .last_quota_observation
+            .as_ref()
+            .unwrap()
+            .observed_at
+            .checked_add(1)
+            .unwrap();
+        let plan = super::load_quota_generation_recovery_plan(&partition, &current, observed_at)
+            .expect("the retained current incident has one finite recovery plan");
+        assert_eq!(plan.cumulative_recovery.canonical_reset_at, 1_789_437_490);
+        assert_eq!(plan.source_state, current);
+        assert_eq!(
+            plan.collection_state.data_generation,
+            plan.source_state.data_generation
+        );
+        assert_eq!(plan.collection_state.reset_at, 1_789_437_490);
+        assert_eq!(
+            plan.collection_state.checkpoints, plan.source_state.checkpoints,
+            "recovery retains the current append cursors instead of rescanning Session files"
+        );
+        assert_eq!(
+            plan.cumulative_recovery
+                .offset_model_totals
+                .iter()
+                .find(|total| total.model == "SOL")
+                .unwrap()
+                .total_tokens,
+            555_312_427
+        );
+        assert_eq!(
+            plan.cumulative_recovery
+                .offset_model_totals
+                .iter()
+                .find(|total| total.model == "LUNA")
+                .unwrap()
+                .total_tokens,
+            22_816_483
+        );
+        let planned_totals = plan.collection_state.model_totals.clone();
+        let mut collection = super::LocalUsageCollection {
+            model_usage: ModelUsageTotals::from_session_totals(&planned_totals),
+            model_totals_complete: false,
+            session_model_totals: planned_totals,
+            ..super::LocalUsageCollection::default()
+        };
+        assert!(super::apply_cumulative_recovery_to_current(
+            &mut collection,
+            &plan.cumulative_recovery,
+        ));
+        let sol = collection
+            .session_model_totals
+            .iter()
+            .find(|total| total.model == "SOL")
+            .unwrap();
+        let luna = collection
+            .session_model_totals
+            .iter()
+            .find(|total| total.model == "LUNA")
+            .unwrap();
+        assert_eq!(sol.total_tokens, 555_312_427);
+        assert!(luna.total_tokens >= 25_262_756);
+        assert_ne!(
+            super::format_estimated_cost(collection.model_usage.dollar_totals()),
+            "概算 $0.19"
+        );
     }
 
     #[test]
