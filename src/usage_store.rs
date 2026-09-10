@@ -188,6 +188,17 @@ CREATE TABLE session_cumulative_recoveries (
     applied_generation TEXT NOT NULL
 ) WITHOUT ROWID;
 
+CREATE TABLE session_timeline_recoveries (
+    recovery_id TEXT PRIMARY KEY CHECK (
+        length(recovery_id) = 64
+        AND recovery_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    payload_json TEXT NOT NULL CHECK (
+        length(payload_json) BETWEEN 2 AND 67108864
+    ),
+    applied_generation TEXT NOT NULL
+) WITHOUT ROWID;
+
 CREATE TABLE usage_model_history (
     reset_at INTEGER NOT NULL CHECK (reset_at > 0),
     timestamp INTEGER NOT NULL CHECK (timestamp > 0),
@@ -283,7 +294,7 @@ const DURABLE_STATE_OBSERVATION_MIN_SINGLETON: i64 = 2;
 const MAX_OBSERVATION_JSON_BYTES: usize = 16 * 1024;
 const OBSERVATION_JSON_KIND: &str = "codex-info-usage-observation-v1";
 pub const MAX_SESSION_MODEL_BYTES: usize = 512;
-const ACCOUNT_DB_SCHEMA_VERSION: i64 = 3;
+const ACCOUNT_DB_SCHEMA_VERSION: i64 = 4;
 const OBSERVATION_JSON_KEYS: &[&str] = &[
     "kind",
     "timestamp",
@@ -326,6 +337,22 @@ ON CONFLICT (reset_at, timestamp) DO UPDATE SET
     sol_tokens = excluded.sol_tokens,
     terra_tokens = excluded.terra_tokens,
     luna_tokens = excluded.luna_tokens
+"#;
+
+const INSERT_SAMPLE_IF_ABSENT: &str = r#"
+INSERT INTO usage_history (
+    timestamp,
+    reset_at,
+    remaining_percent,
+    sol_dollars,
+    terra_dollars,
+    luna_dollars,
+    sol_tokens,
+    terra_tokens,
+    luna_tokens
+)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+ON CONFLICT (reset_at, timestamp) DO NOTHING
 "#;
 
 /// Returns the UTC instant three calendar months before `now`.
@@ -372,6 +399,7 @@ pub struct UsageHistorySample {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelSource {
     Confirmed,
+    ReconstructedFromSession,
     Unavailable,
     LegacyUnknown,
 }
@@ -380,6 +408,7 @@ impl ModelSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Confirmed => "confirmed",
+            Self::ReconstructedFromSession => "reconstructed-from-session",
             Self::Unavailable => "unavailable",
             Self::LegacyUnknown => "legacy-unknown",
         }
@@ -388,6 +417,7 @@ impl ModelSource {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "confirmed" => Some(Self::Confirmed),
+            "reconstructed-from-session" => Some(Self::ReconstructedFromSession),
             "unavailable" => Some(Self::Unavailable),
             "legacy-unknown" => Some(Self::LegacyUnknown),
             _ => None,
@@ -396,8 +426,10 @@ impl ModelSource {
 }
 
 /// One bounded model/quota observation, including local-source provenance.
-/// Model fields are all present for `confirmed` and `legacy-unknown`, and all
-/// absent for `unavailable`; mixed vectors are rejected at the storage edge.
+/// Model fields are all present for `confirmed`, `reconstructed-from-session`,
+/// and `legacy-unknown`, and all absent for `unavailable`; mixed vectors are
+/// rejected at the storage edge. Model-set completeness is independent from
+/// provenance: a reconstructed vector can still enumerate every model.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageHistoryObservation {
     pub timestamp: i64,
@@ -508,7 +540,11 @@ impl UsageHistoryObservation {
                     "unavailable observation contains model values".into(),
                 ));
             }
-            ModelSource::Confirmed | ModelSource::LegacyUnknown if !all_values || !all_tokens => {
+            ModelSource::Confirmed
+            | ModelSource::ReconstructedFromSession
+            | ModelSource::LegacyUnknown
+                if !all_values || !all_tokens =>
+            {
                 return Err(UsageStoreError::InvalidImport(
                     "confirmed observation has a partial model vector".into(),
                 ));
@@ -647,7 +683,7 @@ pub struct SessionCheckpoint {
     pub previous_cache_write_input: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct SessionRange {
     pub root_identity: String,
     pub relative_path: String,
@@ -669,6 +705,37 @@ pub struct SessionModelTotal {
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
     pub cache_write_input_tokens: Option<u64>,
+}
+
+/// Cumulative Session-derived delta at one canonical minute. These values are
+/// reconstructed from an exact, committed JSONL byte range; they are not a
+/// point-in-time measurement and never replace an existing DB value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionTimelineRecoveryPoint {
+    pub timestamp: i64,
+    pub offset_model_totals: Vec<SessionModelTotal>,
+    pub offset_sol_dollars: f64,
+    pub offset_terra_dollars: f64,
+    pub offset_luna_dollars: f64,
+}
+
+/// One atomic catch-up repair for source bytes that were not reflected in the
+/// minute history. Raw history stays unchanged; readers add the cumulative
+/// offset only before the first corrected current anchor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionTimelineRecovery {
+    pub recovery_id: String,
+    pub canonical_reset_at: i64,
+    pub window_seconds: i64,
+    pub source_data_generation: u64,
+    pub projection_end_exclusive: i64,
+    pub source_model_totals: Vec<SessionModelTotal>,
+    pub ranges: Vec<SessionRange>,
+    pub points: Vec<SessionTimelineRecoveryPoint>,
+    pub final_offset_model_totals: Vec<SessionModelTotal>,
+    pub final_offset_sol_dollars: f64,
+    pub final_offset_terra_dollars: f64,
+    pub final_offset_luna_dollars: f64,
 }
 
 /// One source-proven correction for a cumulative Session counter that was
@@ -1457,8 +1524,57 @@ fn model_totals_dominate(left: &[SessionModelTotal], right: &[SessionModelTotal]
     })
 }
 
+/// Timeline offsets may lose knowledge of the optional cache-write component
+/// when a newer Session producer omits it. Unknown is not a numeric rollback:
+/// all required counters must still be monotonic, and optional knowledge may
+/// only move from a measured value to unknown, never the reverse.
+fn timeline_model_totals_dominate(left: &[SessionModelTotal], right: &[SessionModelTotal]) -> bool {
+    let left = left
+        .iter()
+        .map(|total| (total.model.as_str(), total))
+        .collect::<BTreeMap<_, _>>();
+    right.iter().all(|required| {
+        left.get(required.model.as_str()).is_some_and(|candidate| {
+            candidate.total_tokens >= required.total_tokens
+                && candidate.input_tokens >= required.input_tokens
+                && candidate.cached_input_tokens >= required.cached_input_tokens
+                && candidate.output_tokens >= required.output_tokens
+                && match (
+                    candidate.cache_write_input_tokens,
+                    required.cache_write_input_tokens,
+                ) {
+                    (Some(candidate), Some(required)) => candidate >= required,
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                }
+        })
+    })
+}
+
 fn same_reset_group(left: i64, right: i64) -> bool {
     left > 0 && right > 0 && left.abs_diff(right) <= RESET_GROUP_TOLERANCE_SECONDS as u64
+}
+
+fn reset_window_started_between_observations(
+    previous_reset_at: i64,
+    previous_observed_at: i64,
+    next_reset_at: i64,
+    next_window_seconds: i64,
+    observed_at: i64,
+) -> bool {
+    if next_reset_at <= previous_reset_at || observed_at <= previous_observed_at {
+        return false;
+    }
+    let Some(next_start_at) = next_reset_at.checked_sub(next_window_seconds) else {
+        return false;
+    };
+    let reset_advance = next_reset_at.saturating_sub(previous_reset_at);
+    let observation_advance = observed_at.saturating_sub(previous_observed_at);
+    let tracks_observation_clock =
+        reset_advance.abs_diff(observation_advance) <= RESET_GROUP_TOLERANCE_SECONDS as u64;
+    next_start_at > previous_observed_at
+        && next_start_at <= observed_at
+        && !tracks_observation_clock
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1481,10 +1597,11 @@ pub fn classify_quota_transition(
     next_remaining_percent: Option<f64>,
     observed_at: i64,
 ) -> QuotaTransition {
+    let next_start_at = next_reset_at.checked_sub(next_window_seconds);
     let candidate_is_valid = observed_at > 0
         && next_reset_at > observed_at
         && next_window_seconds > 0
-        && next_reset_at.checked_sub(next_window_seconds).is_some()
+        && next_start_at.is_some()
         && next_remaining_percent
             .is_some_and(|value| value.is_finite() && (0.0..=100.0).contains(&value));
     if !candidate_is_valid {
@@ -1509,7 +1626,16 @@ pub fn classify_quota_transition(
     {
         return QuotaTransition::SamePeriod;
     }
-    if previous_reset_at <= observed_at && next_reset_at > previous_reset_at {
+    let newly_started_window = reset_window_started_between_observations(
+        previous_reset_at,
+        previous_observed_at,
+        next_reset_at,
+        next_window_seconds,
+        observed_at,
+    );
+    if next_reset_at > previous_reset_at
+        && (previous_reset_at <= observed_at || newly_started_window)
+    {
         return QuotaTransition::Boundary;
     }
     QuotaTransition::Rejected
@@ -1675,6 +1801,31 @@ pub fn reconcile_rejected_generation_model_totals(
 
 type CumulativeModelPayload = (String, u64, u64, u64, u64, Option<u64>);
 type CumulativeDollarPayload = (f64, f64, f64);
+type TimelineRangePayload = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+type TimelinePointPayload = (i64, Vec<CumulativeModelPayload>, CumulativeDollarPayload);
+type TimelineRecoveryPayload = (
+    String,
+    i64,
+    i64,
+    u64,
+    i64,
+    Vec<CumulativeModelPayload>,
+    Vec<TimelineRangePayload>,
+    Vec<TimelinePointPayload>,
+    Vec<CumulativeModelPayload>,
+    CumulativeDollarPayload,
+);
 type CumulativeRecoveryPayload = (
     String,
     i64,
@@ -1692,6 +1843,312 @@ type CumulativeRecoveryPayload = (
     CumulativeDollarPayload,
     CumulativeDollarPayload,
 );
+
+const MAX_SESSION_TIMELINE_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
+
+fn model_payload_rows(totals: &[SessionModelTotal]) -> Vec<CumulativeModelPayload> {
+    totals
+        .iter()
+        .map(|total| {
+            (
+                total.model.clone(),
+                total.total_tokens,
+                total.input_tokens,
+                total.cached_input_tokens,
+                total.output_tokens,
+                total.cache_write_input_tokens,
+            )
+        })
+        .collect()
+}
+
+fn model_totals_from_payload(values: Vec<CumulativeModelPayload>) -> Vec<SessionModelTotal> {
+    values
+        .into_iter()
+        .map(
+            |(
+                model,
+                total_tokens,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                cache_write_input_tokens,
+            )| SessionModelTotal {
+                model,
+                total_tokens,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                cache_write_input_tokens,
+            },
+        )
+        .collect()
+}
+
+fn timeline_recovery_payload(
+    partition_id: &str,
+    recovery: &SessionTimelineRecovery,
+) -> Result<String> {
+    let ranges = recovery
+        .ranges
+        .iter()
+        .map(|range| {
+            (
+                range.root_identity.clone(),
+                range.relative_path.clone(),
+                range.file_device.to_string(),
+                range.file_inode.to_string(),
+                range.start_offset.to_string(),
+                range.end_offset.to_string(),
+                format!("{:032x}", range.collector_epoch),
+                range.cycle_seq.to_string(),
+                format!("{:032x}", range.prefix_generation),
+                range.record_sha256.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let points = recovery
+        .points
+        .iter()
+        .map(|point| {
+            (
+                point.timestamp,
+                model_payload_rows(&point.offset_model_totals),
+                (
+                    point.offset_sol_dollars,
+                    point.offset_terra_dollars,
+                    point.offset_luna_dollars,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&(
+        partition_id,
+        recovery.canonical_reset_at,
+        recovery.window_seconds,
+        recovery.source_data_generation,
+        recovery.projection_end_exclusive,
+        model_payload_rows(&recovery.source_model_totals),
+        ranges,
+        points,
+        model_payload_rows(&recovery.final_offset_model_totals),
+        (
+            recovery.final_offset_sol_dollars,
+            recovery.final_offset_terra_dollars,
+            recovery.final_offset_luna_dollars,
+        ),
+    ))
+    .map_err(|_| UsageStoreError::InvalidImport("timeline recovery is not serializable".into()))
+}
+
+fn validate_timeline_recovery_content(
+    partition_id: &str,
+    recovery: &SessionTimelineRecovery,
+) -> Result<String> {
+    if partition_id.len() != 64
+        || !partition_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || recovery.canonical_reset_at <= 0
+        || recovery.window_seconds <= 0
+        || recovery.source_data_generation == 0
+        || recovery.projection_end_exclusive <= 0
+        || recovery.projection_end_exclusive > recovery.canonical_reset_at
+        || recovery.ranges.is_empty()
+        || recovery.points.is_empty()
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "timeline recovery authority is invalid".into(),
+        ));
+    }
+    let period_start = recovery
+        .canonical_reset_at
+        .checked_sub(recovery.window_seconds)
+        .ok_or_else(|| UsageStoreError::InvalidImport("timeline period underflow".into()))?;
+    let source_model_totals = canonicalize_model_totals(&recovery.source_model_totals)?;
+    let final_offset_model_totals = canonicalize_model_totals(&recovery.final_offset_model_totals)?;
+    if source_model_totals != recovery.source_model_totals {
+        return Err(UsageStoreError::InvalidImport(
+            "timeline source totals are not canonical".into(),
+        ));
+    }
+    if final_offset_model_totals != recovery.final_offset_model_totals
+        || final_offset_model_totals.is_empty()
+        || !final_offset_model_totals.iter().any(|total| {
+            total.total_tokens > 0
+                || total.input_tokens > 0
+                || total.cached_input_tokens > 0
+                || total.output_tokens > 0
+                || total
+                    .cache_write_input_tokens
+                    .is_some_and(|value| value > 0)
+        })
+        || [
+            recovery.final_offset_sol_dollars,
+            recovery.final_offset_terra_dollars,
+            recovery.final_offset_luna_dollars,
+        ]
+        .into_iter()
+        .any(|value| !value.is_finite() || value < 0.0)
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "timeline final offset is invalid".into(),
+        ));
+    }
+    let mut canonical_ranges = recovery.ranges.clone();
+    canonical_ranges.sort();
+    canonical_ranges.dedup();
+    if canonical_ranges != recovery.ranges {
+        return Err(UsageStoreError::InvalidImport(
+            "timeline source ranges are not canonical".into(),
+        ));
+    }
+    let owner = (
+        recovery.ranges[0].collector_epoch,
+        recovery.ranges[0].cycle_seq,
+    );
+    for (index, range) in recovery.ranges.iter().enumerate() {
+        validate_session_range(range)?;
+        if (range.collector_epoch, range.cycle_seq) != owner {
+            return Err(UsageStoreError::InvalidImport(
+                "timeline source ranges span collector generations".into(),
+            ));
+        }
+        if recovery.ranges[..index].iter().any(|previous| {
+            previous.root_identity == range.root_identity
+                && previous.relative_path == range.relative_path
+                && previous.file_device == range.file_device
+                && previous.file_inode == range.file_inode
+                && previous.prefix_generation == range.prefix_generation
+                && previous.start_offset < range.end_offset
+                && previous.end_offset > range.start_offset
+        }) {
+            return Err(UsageStoreError::InvalidImport(
+                "timeline source ranges overlap".into(),
+            ));
+        }
+    }
+    let maximum_points = recovery
+        .window_seconds
+        .div_euclid(60)
+        .checked_add(2)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(UsageStoreError::GenerationOverflow)?;
+    if recovery.points.len() > maximum_points {
+        return Err(UsageStoreError::InvalidImport(
+            "timeline recovery has more than one point per minute".into(),
+        ));
+    }
+    let mut previous_timestamp = None;
+    let mut previous_totals: Option<Vec<SessionModelTotal>> = None;
+    let mut previous_dollars = (0.0, 0.0, 0.0);
+    for point in &recovery.points {
+        let totals = canonicalize_model_totals(&point.offset_model_totals)?;
+        let dollars = (
+            point.offset_sol_dollars,
+            point.offset_terra_dollars,
+            point.offset_luna_dollars,
+        );
+        if point.timestamp.rem_euclid(60) != 0
+            || point.timestamp < period_start.div_euclid(60) * 60
+            || point.timestamp >= recovery.projection_end_exclusive
+            || previous_timestamp.is_some_and(|previous| point.timestamp <= previous)
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "timeline recovery point timestamp is invalid".into(),
+            ));
+        }
+        if totals.is_empty()
+            || totals != point.offset_model_totals
+            || !totals.iter().any(|total| {
+                total.total_tokens > 0
+                    || total.input_tokens > 0
+                    || total.cached_input_tokens > 0
+                    || total.output_tokens > 0
+                    || total
+                        .cache_write_input_tokens
+                        .is_some_and(|value| value > 0)
+            })
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "timeline recovery point totals are invalid".into(),
+            ));
+        }
+        if previous_totals
+            .as_ref()
+            .is_some_and(|previous| !timeline_model_totals_dominate(&totals, previous))
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "timeline recovery point totals moved backwards".into(),
+            ));
+        }
+        if [dollars.0, dollars.1, dollars.2]
+            .into_iter()
+            .any(|value| !value.is_finite() || value < 0.0)
+            || dollars.0 < previous_dollars.0
+            || dollars.1 < previous_dollars.1
+            || dollars.2 < previous_dollars.2
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "timeline recovery point dollars are invalid".into(),
+            ));
+        }
+        previous_timestamp = Some(point.timestamp);
+        previous_totals = Some(totals);
+        previous_dollars = dollars;
+    }
+    if checked_add_model_totals(&source_model_totals, &final_offset_model_totals).is_none()
+        || !timeline_model_totals_dominate(
+            &final_offset_model_totals,
+            &recovery
+                .points
+                .last()
+                .expect("non-empty timeline recovery")
+                .offset_model_totals,
+        )
+        || recovery.final_offset_sol_dollars < previous_dollars.0
+        || recovery.final_offset_terra_dollars < previous_dollars.1
+        || recovery.final_offset_luna_dollars < previous_dollars.2
+    {
+        return Err(UsageStoreError::GenerationOverflow);
+    }
+    let payload = timeline_recovery_payload(partition_id, recovery)?;
+    if payload.len() > MAX_SESSION_TIMELINE_RECOVERY_BYTES {
+        return Err(UsageStoreError::InvalidImport(
+            "timeline recovery payload exceeds one collector cycle".into(),
+        ));
+    }
+    Ok(payload)
+}
+
+fn validate_timeline_recovery(
+    partition_id: &str,
+    recovery: &SessionTimelineRecovery,
+) -> Result<String> {
+    let payload = validate_timeline_recovery_content(partition_id, recovery)?;
+    let expected = format!("{:x}", Sha256::digest(payload.as_bytes()));
+    if recovery.recovery_id != expected {
+        return Err(UsageStoreError::InvalidImport(
+            "timeline recovery identity mismatch".into(),
+        ));
+    }
+    Ok(payload)
+}
+
+pub fn finalize_session_timeline_recovery(
+    partition_id: &str,
+    mut recovery: SessionTimelineRecovery,
+) -> Result<SessionTimelineRecovery> {
+    if !recovery.recovery_id.is_empty() {
+        return Err(UsageStoreError::InvalidImport(
+            "unfinalized timeline recovery already has an identity".into(),
+        ));
+    }
+    let payload = timeline_recovery_payload(partition_id, &recovery)?;
+    recovery.recovery_id = format!("{:x}", Sha256::digest(payload.as_bytes()));
+    validate_timeline_recovery(partition_id, &recovery)?;
+    Ok(recovery)
+}
 
 fn cumulative_recovery_payload(
     partition_id: &str,
@@ -2227,6 +2684,235 @@ fn cumulative_recovery_from_payload(
     Ok((partition_id, recovery))
 }
 
+fn timeline_recovery_from_payload(
+    recovery_id: &str,
+    payload_json: &str,
+) -> Result<(String, SessionTimelineRecovery)> {
+    if payload_json.is_empty() || payload_json.len() > MAX_SESSION_TIMELINE_RECOVERY_BYTES {
+        return Err(UsageStoreError::InvalidImport(
+            "timeline recovery payload length is invalid".into(),
+        ));
+    }
+    let stored_identity = format!("{:x}", Sha256::digest(payload_json.as_bytes()));
+    if recovery_id != stored_identity {
+        return Err(UsageStoreError::InvalidImport(
+            "timeline recovery stored identity mismatch".into(),
+        ));
+    }
+    let (
+        partition_id,
+        canonical_reset_at,
+        window_seconds,
+        source_data_generation,
+        projection_end_exclusive,
+        source_rows,
+        range_rows,
+        point_rows,
+        final_offset_rows,
+        final_offset_dollars,
+    ): TimelineRecoveryPayload = serde_json::from_str(payload_json).map_err(|_| {
+        UsageStoreError::InvalidImport("timeline recovery payload is invalid".into())
+    })?;
+    let ranges = range_rows
+        .into_iter()
+        .map(
+            |(
+                root_identity,
+                relative_path,
+                file_device,
+                file_inode,
+                start_offset,
+                end_offset,
+                collector_epoch,
+                cycle_seq,
+                prefix_generation,
+                record_sha256,
+            )| {
+                Ok(SessionRange {
+                    root_identity,
+                    relative_path,
+                    file_device: canonical_u64_text(&file_device, "timeline file device")?,
+                    file_inode: canonical_u64_text(&file_inode, "timeline file inode")?,
+                    start_offset: canonical_u64_text(&start_offset, "timeline start offset")?,
+                    end_offset: canonical_u64_text(&end_offset, "timeline end offset")?,
+                    collector_epoch: canonical_u128_hex(
+                        &collector_epoch,
+                        "timeline collector epoch",
+                    )?,
+                    cycle_seq: canonical_u64_text(&cycle_seq, "timeline cycle sequence")?,
+                    prefix_generation: canonical_u128_hex(
+                        &prefix_generation,
+                        "timeline prefix generation",
+                    )?,
+                    record_sha256,
+                })
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    let points = point_rows
+        .into_iter()
+        .map(|(timestamp, rows, dollars)| {
+            let (offset_sol_dollars, offset_terra_dollars, offset_luna_dollars) = dollars;
+            SessionTimelineRecoveryPoint {
+                timestamp,
+                offset_model_totals: model_totals_from_payload(rows),
+                offset_sol_dollars,
+                offset_terra_dollars,
+                offset_luna_dollars,
+            }
+        })
+        .collect();
+    let recovery = SessionTimelineRecovery {
+        recovery_id: recovery_id.to_owned(),
+        canonical_reset_at,
+        window_seconds,
+        source_data_generation,
+        projection_end_exclusive,
+        source_model_totals: model_totals_from_payload(source_rows),
+        ranges,
+        points,
+        final_offset_model_totals: model_totals_from_payload(final_offset_rows),
+        final_offset_sol_dollars: final_offset_dollars.0,
+        final_offset_terra_dollars: final_offset_dollars.1,
+        final_offset_luna_dollars: final_offset_dollars.2,
+    };
+    // The durable identity authenticates the exact stored bytes above.
+    // Re-serializing parsed finite f64 values is not a stable byte-level
+    // canonicalization contract across serde_json versions, so readback
+    // validates the complete logical structure without replacing that exact
+    // byte authority.
+    validate_timeline_recovery_content(&partition_id, &recovery)?;
+    Ok((partition_id, recovery))
+}
+
+fn timeline_recovery_point_for(
+    recovery: &SessionTimelineRecovery,
+    reset_at: i64,
+    timestamp: i64,
+) -> Option<&SessionTimelineRecoveryPoint> {
+    if !same_reset_group(reset_at, recovery.canonical_reset_at)
+        || timestamp >= recovery.projection_end_exclusive
+    {
+        return None;
+    }
+    let index = recovery
+        .points
+        .partition_point(|point| point.timestamp <= timestamp);
+    index
+        .checked_sub(1)
+        .and_then(|index| recovery.points.get(index))
+}
+
+fn apply_timeline_recoveries_to_sample<'a>(
+    sample: &mut UsageHistorySample,
+    recoveries: impl Iterator<Item = &'a SessionTimelineRecovery>,
+) -> Result<()> {
+    for recovery in recoveries {
+        let Some(point) = timeline_recovery_point_for(recovery, sample.reset_at, sample.timestamp)
+        else {
+            continue;
+        };
+        sample.sol_dollars += point.offset_sol_dollars;
+        sample.terra_dollars += point.offset_terra_dollars;
+        sample.luna_dollars += point.offset_luna_dollars;
+        for (value, model) in [
+            (&mut sample.sol_tokens, "SOL"),
+            (&mut sample.terra_tokens, "TERRA"),
+            (&mut sample.luna_tokens, "LUNA"),
+        ] {
+            *value = value
+                .checked_add(
+                    point
+                        .offset_model_totals
+                        .iter()
+                        .find(|total| total.model == model)
+                        .map(|total| total.total_tokens)
+                        .unwrap_or(0),
+                )
+                .ok_or(UsageStoreError::GenerationOverflow)?;
+            if *value > i64::MAX as u64 {
+                return Err(UsageStoreError::GenerationOverflow);
+            }
+        }
+        if [
+            sample.sol_dollars,
+            sample.terra_dollars,
+            sample.luna_dollars,
+        ]
+        .into_iter()
+        .any(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "timeline recovery dollar projection overflowed".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn add_timeline_offsets_to_models(
+    totals: &[SessionModelTotal],
+    offsets: &[SessionModelTotal],
+) -> Result<Vec<SessionModelTotal>> {
+    checked_add_model_totals(totals, offsets).ok_or(UsageStoreError::GenerationOverflow)
+}
+
+fn apply_timeline_recoveries_to_observation<'a>(
+    observation: &mut UsageHistoryObservation,
+    recoveries: impl Iterator<Item = &'a SessionTimelineRecovery>,
+) -> Result<()> {
+    for recovery in recoveries {
+        let Some(point) =
+            timeline_recovery_point_for(recovery, observation.reset_at, observation.timestamp)
+        else {
+            continue;
+        };
+        for (value, offset) in [
+            (&mut observation.sol_dollars, point.offset_sol_dollars),
+            (&mut observation.terra_dollars, point.offset_terra_dollars),
+            (&mut observation.luna_dollars, point.offset_luna_dollars),
+        ] {
+            if let Some(value) = value.as_mut() {
+                *value += offset;
+                if !value.is_finite() || *value < 0.0 {
+                    return Err(UsageStoreError::InvalidImport(
+                        "timeline recovery observation dollars overflowed".into(),
+                    ));
+                }
+            }
+        }
+        for (value, model) in [
+            (&mut observation.sol_tokens, "SOL"),
+            (&mut observation.terra_tokens, "TERRA"),
+            (&mut observation.luna_tokens, "LUNA"),
+        ] {
+            if let Some(value) = value.as_mut() {
+                *value = value
+                    .checked_add(
+                        point
+                            .offset_model_totals
+                            .iter()
+                            .find(|total| total.model == model)
+                            .map(|total| total.total_tokens)
+                            .unwrap_or(0),
+                    )
+                    .ok_or(UsageStoreError::GenerationOverflow)?;
+                if *value > i64::MAX as u64 {
+                    return Err(UsageStoreError::GenerationOverflow);
+                }
+            }
+        }
+        if let Some(totals) = observation.model_totals.as_ref() {
+            observation.model_totals = Some(add_timeline_offsets_to_models(
+                totals,
+                &point.offset_model_totals,
+            )?);
+        }
+        observation.model_source = ModelSource::ReconstructedFromSession;
+    }
+    observation.validate()
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct CumulativeRecoveryPoint {
     timestamp: i64,
@@ -2259,11 +2945,24 @@ pub fn derive_session_cumulative_recovery(
     {
         return Ok(None);
     }
-    let period_start = canonical_reset_at
+    let period_started_at = canonical_reset_at
         .checked_sub(window_seconds)
-        .ok_or_else(|| UsageStoreError::InvalidImport("cumulative period underflow".into()))?
-        .div_euclid(60)
-        * 60;
+        .ok_or_else(|| UsageStoreError::InvalidImport("cumulative period underflow".into()))?;
+    let period_start = period_started_at.div_euclid(60) * 60;
+    let first_period_minute = if period_started_at.rem_euclid(60) == 0 {
+        period_started_at
+    } else {
+        period_start.checked_add(60).ok_or_else(|| {
+            UsageStoreError::InvalidImport("cumulative period minute overflow".into())
+        })?
+    };
+    let canonical_period_start_was_observed = observations.iter().any(|observation| {
+        observation.timestamp == first_period_minute
+            && same_reset_group(observation.reset_at, canonical_reset_at)
+            && observation
+                .remaining_percent
+                .is_some_and(|value| value.is_finite() && (0.0..=100.0).contains(&value))
+    });
     let mut grouped = BTreeMap::<i64, Vec<CumulativeRecoveryPoint>>::new();
     for observation in observations {
         if observation.timestamp < period_start || observation.timestamp > now {
@@ -2328,6 +3027,22 @@ pub fn derive_session_cumulative_recovery(
     };
     let before = &points[candidate_index - 1];
     let first = &points[candidate_index];
+    if canonical_period_start_was_observed {
+        // The canonical cumulative stream was observed at its first
+        // representable minute. A later stale reset followed by a return to
+        // that stream is not a same-period counter regression and must never
+        // inherit the stale period's totals.
+        return Ok(None);
+    }
+    if reset_window_started_between_observations(
+        before.reset_at,
+        before.timestamp,
+        first.reset_at,
+        window_seconds,
+        first.timestamp,
+    ) {
+        return Ok(None);
+    }
 
     let mut known = BTreeMap::<String, SessionModelTotal>::new();
     for point in &points[candidate_index..=endpoint_index] {
@@ -2701,6 +3416,7 @@ fn reconcile_existing_sample(
 fn canonicalize_samples(
     transaction: &rusqlite::Transaction<'_>,
     samples: &[UsageHistorySample],
+    preserve_existing: bool,
 ) -> Result<Vec<UsageHistorySample>> {
     let mut grouped = std::collections::BTreeMap::<(i64, i64), Vec<UsageHistorySample>>::new();
     for sample in samples {
@@ -2731,6 +3447,7 @@ fn canonicalize_samples(
             })
             .optional()?;
         canonical.push(match existing {
+            Some(existing) if preserve_existing => existing,
             Some(existing) => reconcile_existing_sample(existing, incoming)?,
             None => incoming,
         });
@@ -2742,8 +3459,13 @@ fn canonicalize_samples(
 fn upsert_canonical_samples(
     transaction: &rusqlite::Transaction<'_>,
     samples: &[UsageHistorySample],
+    preserve_existing: bool,
 ) -> Result<()> {
-    let mut statement = transaction.prepare(UPSERT_SAMPLE)?;
+    let mut statement = transaction.prepare(if preserve_existing {
+        INSERT_SAMPLE_IF_ABSENT
+    } else {
+        UPSERT_SAMPLE
+    })?;
     for sample in samples {
         statement.execute(params![
             sample.timestamp,
@@ -2781,7 +3503,9 @@ fn canonicalize_observations(
     }
     for (key, observation) in canonical.iter_mut() {
         match observation.model_source {
-            ModelSource::Confirmed | ModelSource::LegacyUnknown => {
+            ModelSource::Confirmed
+            | ModelSource::ReconstructedFromSession
+            | ModelSource::LegacyUnknown => {
                 let sample = if let Some(sample) = canonical_samples.get(key) {
                     Some((*sample).clone())
                 } else {
@@ -2892,19 +3616,18 @@ fn upsert_observations(
             continue;
         };
         let existing = observation_from_sql(data_generation, data_hash.clone(), existing_json)?;
-        let selected = match (existing.model_source, observation.model_source) {
-            (ModelSource::Unavailable, ModelSource::Confirmed | ModelSource::LegacyUnknown) => {
-                observation.clone()
-            }
-            (ModelSource::Confirmed | ModelSource::LegacyUnknown, ModelSource::Unavailable) => {
-                existing.clone()
-            }
-            (ModelSource::Confirmed, ModelSource::Confirmed)
-            | (ModelSource::LegacyUnknown, ModelSource::Confirmed)
-            | (ModelSource::LegacyUnknown, ModelSource::LegacyUnknown) => observation.clone(),
-            (ModelSource::Confirmed, ModelSource::LegacyUnknown) => existing.clone(),
-            (ModelSource::Unavailable, ModelSource::Unavailable) => observation.clone(),
+        let source_rank = |source: ModelSource| match source {
+            ModelSource::Unavailable => 0,
+            ModelSource::LegacyUnknown => 1,
+            ModelSource::ReconstructedFromSession => 2,
+            ModelSource::Confirmed => 3,
         };
+        let selected =
+            if source_rank(observation.model_source) >= source_rank(existing.model_source) {
+                observation.clone()
+            } else {
+                existing.clone()
+            };
         if selected != existing {
             let selected_json = observation_json(&selected)?;
             transaction.execute(
@@ -2921,6 +3644,7 @@ fn upsert_observations(
 fn upsert_observation_model_totals(
     transaction: &rusqlite::Transaction<'_>,
     observations: &[UsageHistoryObservation],
+    preserve_existing: bool,
 ) -> Result<()> {
     let mut delete = transaction
         .prepare("DELETE FROM usage_model_history WHERE reset_at = ?1 AND timestamp = ?2")?;
@@ -2936,6 +3660,19 @@ fn upsert_observation_model_totals(
             continue;
         };
         let model_totals = canonicalize_model_totals(model_totals)?;
+        if preserve_existing {
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM usage_model_history
+                    WHERE reset_at = ?1 AND timestamp = ?2
+                )",
+                params![observation.reset_at, observation.timestamp],
+                |row| row.get(0),
+            )?;
+            if exists {
+                continue;
+            }
+        }
         delete.execute(params![observation.reset_at, observation.timestamp])?;
         for total in model_totals {
             insert.execute(params![
@@ -3667,6 +4404,14 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
             ],
         ),
         (
+            "session_timeline_recoveries",
+            &[
+                ("recovery_id", "TEXT", 1),
+                ("payload_json", "TEXT", 0),
+                ("applied_generation", "TEXT", 0),
+            ],
+        ),
+        (
             "usage_model_history",
             &[
                 ("reset_at", "INTEGER", 1),
@@ -3735,15 +4480,21 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
     pre_continuity_tables.remove("history_continuity");
     pre_continuity_tables.remove("usage_model_history");
     pre_continuity_tables.remove("session_cumulative_recoveries");
+    pre_continuity_tables.remove("session_timeline_recoveries");
     let mut pre_model_history_tables = expected_tables.clone();
     pre_model_history_tables.remove("usage_model_history");
     pre_model_history_tables.remove("session_cumulative_recoveries");
+    pre_model_history_tables.remove("session_timeline_recoveries");
     let mut pre_cumulative_recovery_tables = expected_tables.clone();
     pre_cumulative_recovery_tables.remove("session_cumulative_recoveries");
+    pre_cumulative_recovery_tables.remove("session_timeline_recoveries");
+    let mut pre_timeline_recovery_tables = expected_tables.clone();
+    pre_timeline_recovery_tables.remove("session_timeline_recoveries");
     if actual_tables != expected_tables
         && !(allow_unversioned_legacy && actual_tables == pre_continuity_tables)
         && !(schema_version < 2 && actual_tables == pre_model_history_tables)
         && !(schema_version < 3 && actual_tables == pre_cumulative_recovery_tables)
+        && !(schema_version < 4 && actual_tables == pre_timeline_recovery_tables)
     {
         return Err(UsageStoreError::InvalidImport(
             "account partition table set mismatch".into(),
@@ -3753,7 +4504,8 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
     for (table, expected) in TABLES {
         if (*table == "history_continuity"
             || *table == "usage_model_history"
-            || *table == "session_cumulative_recoveries")
+            || *table == "session_cumulative_recoveries"
+            || *table == "session_timeline_recoveries")
             && !actual_tables.contains(*table)
         {
             continue;
@@ -3913,6 +4665,24 @@ fn ensure_session_cumulative_recovery_schema(
             ),
             payload_json TEXT NOT NULL CHECK (
                 length(payload_json) BETWEEN 2 AND 1048576
+            ),
+            applied_generation TEXT NOT NULL
+        ) WITHOUT ROWID;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn ensure_session_timeline_recovery_schema(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS session_timeline_recoveries (
+            recovery_id TEXT PRIMARY KEY CHECK (
+                length(recovery_id) = 64
+                AND recovery_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            payload_json TEXT NOT NULL CHECK (
+                length(payload_json) BETWEEN 2 AND 67108864
             ),
             applied_generation TEXT NOT NULL
         ) WITHOUT ROWID;
@@ -4377,6 +5147,7 @@ impl UsageStore {
         ensure_history_continuity_schema(&transaction)?;
         ensure_usage_model_history_schema(&transaction)?;
         ensure_session_cumulative_recovery_schema(&transaction)?;
+        ensure_session_timeline_recovery_schema(&transaction)?;
         stamp_current_account_db_schema(&transaction)?;
         transaction.execute(
             "INSERT INTO storage_partition (
@@ -4430,6 +5201,7 @@ impl UsageStore {
         ensure_history_continuity_schema(&transaction)?;
         ensure_usage_model_history_schema(&transaction)?;
         ensure_session_cumulative_recovery_schema(&transaction)?;
+        ensure_session_timeline_recovery_schema(&transaction)?;
         stamp_current_account_db_schema(&transaction)?;
         validate_storage_partition(&transaction, identity)?;
         transaction.commit()?;
@@ -4965,10 +5737,15 @@ impl UsageStore {
     pub fn load_all(&self) -> Result<Vec<UsageHistorySample>> {
         let mut samples = self.load_all_raw()?;
         let recoveries = self.load_session_cumulative_recoveries()?;
+        let timeline_recoveries = self.load_session_timeline_recoveries()?;
         for sample in &mut samples {
             apply_cumulative_recoveries_to_sample(
                 sample,
                 recoveries.iter().map(|(recovery, _, _)| recovery),
+            )?;
+            apply_timeline_recoveries_to_sample(
+                sample,
+                timeline_recoveries.iter().map(|(recovery, _, _)| recovery),
             )?;
         }
         Ok(samples)
@@ -5025,10 +5802,15 @@ impl UsageStore {
     pub fn load_recent_history(&self, now: DateTime<Utc>) -> Result<Vec<UsageHistorySample>> {
         let mut samples = self.load_recent_history_raw(now)?;
         let recoveries = self.load_session_cumulative_recoveries()?;
+        let timeline_recoveries = self.load_session_timeline_recoveries()?;
         for sample in &mut samples {
             apply_cumulative_recoveries_to_sample(
                 sample,
                 recoveries.iter().map(|(recovery, _, _)| recovery),
+            )?;
+            apply_timeline_recoveries_to_sample(
+                sample,
+                timeline_recoveries.iter().map(|(recovery, _, _)| recovery),
             )?;
         }
         Ok(samples)
@@ -5142,13 +5924,74 @@ impl UsageStore {
     ) -> Result<Vec<UsageHistoryObservation>> {
         let mut observations = self.load_recent_observations_raw(now)?;
         let recoveries = self.load_session_cumulative_recoveries()?;
+        let timeline_recoveries = self.load_session_timeline_recoveries()?;
         for observation in &mut observations {
             apply_cumulative_recoveries_to_observation(
                 observation,
                 recoveries.iter().map(|(recovery, _, _)| recovery),
             )?;
+            apply_timeline_recoveries_to_observation(
+                observation,
+                timeline_recoveries.iter().map(|(recovery, _, _)| recovery),
+            )?;
         }
         Ok(observations)
+    }
+
+    fn load_session_timeline_recoveries(
+        &self,
+    ) -> Result<Vec<(SessionTimelineRecovery, String, u64)>> {
+        let present: bool = self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'session_timeline_recoveries'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !present {
+            return Ok(Vec::new());
+        }
+        let partition_id: String = self.connection.query_row(
+            "SELECT partition_id FROM storage_partition WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let generation: String = self.connection.query_row(
+            "SELECT data_generation FROM collection_generation WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let generation = canonical_u64_text(&generation, "collection generation")?;
+        let mut statement = self.connection.prepare(
+            "SELECT recovery_id, payload_json, applied_generation
+             FROM session_timeline_recoveries ORDER BY applied_generation, recovery_id",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut recoveries = Vec::new();
+        while let Some(row) = rows.next()? {
+            let recovery_id: String = row.get(0)?;
+            let payload_json: String = row.get(1)?;
+            let applied_generation: String = row.get(2)?;
+            let applied_generation =
+                canonical_u64_text(&applied_generation, "timeline recovery generation")?;
+            if applied_generation == 0 || applied_generation > generation {
+                return Err(UsageStoreError::InvalidImport(
+                    "timeline recovery generation is invalid".into(),
+                ));
+            }
+            let (payload_partition, recovery) =
+                timeline_recovery_from_payload(&recovery_id, &payload_json)?;
+            if payload_partition != partition_id
+                || recovery.source_data_generation.checked_add(1) != Some(applied_generation)
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "timeline recovery partition or generation changed".into(),
+                ));
+            }
+            recoveries.push((recovery, payload_json, applied_generation));
+        }
+        Ok(recoveries)
     }
 
     fn load_session_cumulative_recoveries(
@@ -5226,10 +6069,15 @@ impl UsageStore {
         let source_state = self.load_session_collection_state()?;
         let mut observations = self.load_recent_observations_raw(now)?;
         let stored_recoveries = self.load_session_cumulative_recoveries()?;
+        let timeline_recoveries = self.load_session_timeline_recoveries()?;
         for observation in &mut observations {
             apply_cumulative_recoveries_to_observation(
                 observation,
                 stored_recoveries.iter().map(|(recovery, _, _)| recovery),
+            )?;
+            apply_timeline_recoveries_to_observation(
+                observation,
+                timeline_recoveries.iter().map(|(recovery, _, _)| recovery),
             )?;
         }
         if source_state.reset_at != canonical_reset_at
@@ -5566,11 +6414,11 @@ impl UsageStore {
             .filter(|sample| sample.timestamp < continuity.boundary_timestamp)
             .cloned()
             .collect::<Vec<_>>();
-        let historical = canonicalize_samples(&transaction, &historical)?;
-        upsert_canonical_samples(&transaction, &historical)?;
+        let historical = canonicalize_samples(&transaction, &historical, false)?;
+        upsert_canonical_samples(&transaction, &historical, false)?;
         let adjusted_current = apply_history_continuity(&transaction, &current_samples)?;
-        let adjusted_current = canonicalize_samples(&transaction, &adjusted_current)?;
-        upsert_canonical_samples(&transaction, &adjusted_current)?;
+        let adjusted_current = canonicalize_samples(&transaction, &adjusted_current, false)?;
+        upsert_canonical_samples(&transaction, &adjusted_current, false)?;
         let generation: String = transaction.query_row(
             "SELECT data_generation FROM collection_generation WHERE singleton=1",
             [],
@@ -5596,8 +6444,8 @@ impl UsageStore {
         let transaction =
             rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let adjusted = apply_history_continuity(&transaction, std::slice::from_ref(sample))?;
-        let canonical = canonicalize_samples(&transaction, &adjusted)?;
-        upsert_canonical_samples(&transaction, &canonical)?;
+        let canonical = canonicalize_samples(&transaction, &adjusted, false)?;
+        upsert_canonical_samples(&transaction, &canonical, false)?;
         transaction.commit()?;
         Ok(())
     }
@@ -5623,8 +6471,8 @@ impl UsageStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let adjusted = apply_history_continuity(&transaction, samples)?;
-        let canonical = canonicalize_samples(&transaction, &adjusted)?;
-        upsert_canonical_samples(&transaction, &canonical)?;
+        let canonical = canonicalize_samples(&transaction, &adjusted, false)?;
+        upsert_canonical_samples(&transaction, &canonical, false)?;
         replace_recorded_session_markers(&transaction, &sources)?;
         for source in &sources {
             if !recorded_session_matches_in(&transaction, source)? {
@@ -6239,7 +7087,7 @@ impl UsageStore {
             .iter()
             .map(UsageHistoryObservation::confirmed)
             .collect::<Vec<_>>();
-        self.commit_session_collection_with_observations_inner(commit, &observations, None)
+        self.commit_session_collection_with_observations_inner(commit, &observations, None, None)
     }
 
     /// Atomically commits ordinary session samples and provenance observations
@@ -6251,7 +7099,7 @@ impl UsageStore {
         commit: SessionCollectionCommit<'_>,
         observations: &[UsageHistoryObservation],
     ) -> Result<SessionCollectionCommitResult> {
-        self.commit_session_collection_with_observations_inner(commit, observations, None)
+        self.commit_session_collection_with_observations_inner(commit, observations, None, None)
     }
 
     /// Commits an ordinary recorder generation and one source-proven
@@ -6264,7 +7112,29 @@ impl UsageStore {
         observations: &[UsageHistoryObservation],
         recovery: &SessionCumulativeRecovery,
     ) -> Result<SessionCollectionCommitResult> {
-        self.commit_session_collection_with_observations_inner(commit, observations, Some(recovery))
+        self.commit_session_collection_with_observations_inner(
+            commit,
+            observations,
+            Some(recovery),
+            None,
+        )
+    }
+
+    /// Commits exact Session byte ranges together with their reconstructed
+    /// minute deltas. The marker, ranges, checkpoint, corrected current total,
+    /// and generation share one transaction.
+    pub fn commit_session_collection_with_timeline_recovery(
+        &mut self,
+        commit: SessionCollectionCommit<'_>,
+        observations: &[UsageHistoryObservation],
+        recovery: &SessionTimelineRecovery,
+    ) -> Result<SessionCollectionCommitResult> {
+        self.commit_session_collection_with_observations_inner(
+            commit,
+            observations,
+            None,
+            Some(recovery),
+        )
     }
 
     fn commit_session_collection_with_observations_inner(
@@ -6272,6 +7142,7 @@ impl UsageStore {
         commit: SessionCollectionCommit<'_>,
         observations: &[UsageHistoryObservation],
         cumulative_recovery: Option<&SessionCumulativeRecovery>,
+        timeline_recovery: Option<&SessionTimelineRecovery>,
     ) -> Result<SessionCollectionCommitResult> {
         let SessionCollectionCommit {
             reset_at,
@@ -6370,7 +7241,10 @@ impl UsageStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let adjusted_samples = apply_history_continuity(&transaction, samples)?;
-        let canonical_samples = canonicalize_samples(&transaction, &adjusted_samples)?;
+        let preserve_existing_history =
+            cumulative_recovery.is_some() || timeline_recovery.is_some();
+        let canonical_samples =
+            canonicalize_samples(&transaction, &adjusted_samples, preserve_existing_history)?;
         let canonical_observations =
             canonicalize_observations(&transaction, observations, &canonical_samples)?;
         let current_generation: (String, i64, i64, Option<String>, String) = transaction
@@ -6399,6 +7273,11 @@ impl UsageStore {
         let next = current_data_generation
             .checked_add(1)
             .ok_or(UsageStoreError::GenerationOverflow)?;
+        if cumulative_recovery.is_some() && timeline_recovery.is_some() {
+            return Err(UsageStoreError::InvalidImport(
+                "independent recovery classes must commit in separate generations".into(),
+            ));
+        }
         let cumulative_payload = if let Some(recovery) = cumulative_recovery {
             if recovery.canonical_reset_at != reset_at || recovery.window_seconds != window_seconds
             {
@@ -6471,6 +7350,112 @@ impl UsageStore {
         } else {
             None
         };
+        let timeline_payload = if let Some(recovery) = timeline_recovery {
+            if recovery.canonical_reset_at != reset_at || recovery.window_seconds != window_seconds
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "timeline recovery source generation changed".into(),
+                ));
+            }
+            let partition_id: String = transaction.query_row(
+                "SELECT partition_id FROM storage_partition WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?;
+            let payload = validate_timeline_recovery(&partition_id, recovery)?;
+            let mut committed_ranges = canonical_ranges.values().cloned().collect::<Vec<_>>();
+            committed_ranges.sort();
+            if recovery.ranges != committed_ranges
+                || recovery.ranges.iter().any(|range| {
+                    range.collector_epoch != collector_epoch || range.cycle_seq != cycle_seq
+                })
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "timeline recovery ranges differ from the committed source".into(),
+                ));
+            }
+            let expected_totals = checked_add_model_totals(
+                &recovery.source_model_totals,
+                &recovery.final_offset_model_totals,
+            )
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+            if expected_totals != model_totals {
+                return Err(UsageStoreError::InvalidImport(
+                    "timeline recovery does not equal the committed model totals".into(),
+                ));
+            }
+            let existing: Option<(String, String)> = transaction
+                .query_row(
+                    "SELECT payload_json, applied_generation
+                     FROM session_timeline_recoveries WHERE recovery_id=?1",
+                    [&recovery.recovery_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((stored_payload, applied_generation)) = existing {
+                let applied_generation =
+                    canonical_u64_text(&applied_generation, "timeline recovery generation")?;
+                if stored_payload != payload {
+                    return Err(UsageStoreError::InvalidImport(
+                        "timeline recovery replay conflicts with its marker".into(),
+                    ));
+                }
+                if current_epoch != Some(collector_epoch)
+                    || current_cycle_seq != cycle_seq
+                    || applied_generation != current_data_generation
+                    || recovery.source_data_generation.checked_add(1)
+                        != Some(current_data_generation)
+                {
+                    return Err(UsageStoreError::InvalidImport(
+                        "timeline recovery was already applied".into(),
+                    ));
+                }
+                Some((payload, true))
+            } else {
+                if recovery.source_data_generation != current_data_generation {
+                    return Err(UsageStoreError::InvalidImport(
+                        "timeline recovery source generation changed".into(),
+                    ));
+                }
+                if session_model_totals_from_transaction(&transaction)?
+                    != recovery.source_model_totals
+                {
+                    return Err(UsageStoreError::InvalidImport(
+                        "timeline recovery source totals changed".into(),
+                    ));
+                }
+                for range in &recovery.ranges {
+                    let exists: i64 = transaction.query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM session_ranges
+                            WHERE root_identity=?1 AND relative_path=?2
+                              AND file_device=?3 AND file_inode=?4
+                              AND prefix_generation=?5 AND start_offset=?6
+                              AND end_offset=?7 AND record_sha256=?8
+                        )",
+                        params![
+                            &range.root_identity,
+                            &range.relative_path,
+                            range.file_device.to_string(),
+                            range.file_inode.to_string(),
+                            format!("{:032x}", range.prefix_generation),
+                            range.start_offset as i64,
+                            range.end_offset as i64,
+                            &range.record_sha256,
+                        ],
+                        |row| row.get(0),
+                    )?;
+                    if exists != 0 {
+                        return Err(UsageStoreError::InvalidImport(
+                            "timeline recovery source range was already committed".into(),
+                        ));
+                    }
+                }
+                Some((payload, false))
+            }
+        } else {
+            None
+        };
         if current_epoch == Some(collector_epoch) {
             if current_cycle_seq == cycle_seq {
                 if current_generation.1 != reset_at || current_generation.2 != window_seconds {
@@ -6486,12 +7471,24 @@ impl UsageStore {
                         "replayed collection generation has no cumulative recovery marker".into(),
                     ));
                 }
+                if timeline_payload
+                    .as_ref()
+                    .is_some_and(|(_, marker_exists)| !marker_exists)
+                {
+                    return Err(UsageStoreError::InvalidImport(
+                        "replayed collection generation has no timeline recovery marker".into(),
+                    ));
+                }
                 // The complete transaction for this epoch/cycle already
                 // committed. Return its exact generation rather than
                 // incrementing durable state on an acknowledgement retry.
                 let replay_observations =
                     upsert_observations(&transaction, &canonical_observations)?;
-                upsert_observation_model_totals(&transaction, &replay_observations)?;
+                upsert_observation_model_totals(
+                    &transaction,
+                    &replay_observations,
+                    preserve_existing_history,
+                )?;
                 transaction.commit()?;
                 return Ok(SessionCollectionCommitResult {
                     data_generation: current_data_generation,
@@ -6584,9 +7581,13 @@ impl UsageStore {
             }
         }
 
-        upsert_canonical_samples(&transaction, &canonical_samples)?;
+        upsert_canonical_samples(&transaction, &canonical_samples, preserve_existing_history)?;
         let persisted_observations = upsert_observations(&transaction, &canonical_observations)?;
-        upsert_observation_model_totals(&transaction, &persisted_observations)?;
+        upsert_observation_model_totals(
+            &transaction,
+            &persisted_observations,
+            preserve_existing_history,
+        )?;
         {
             let mut statement = transaction.prepare(
                 "INSERT INTO session_ranges (
@@ -6672,6 +7673,16 @@ impl UsageStore {
         {
             transaction.execute(
                 "INSERT INTO session_cumulative_recoveries (
+                    recovery_id, payload_json, applied_generation
+                 ) VALUES (?1, ?2, ?3)",
+                params![&recovery.recovery_id, payload, next.to_string()],
+            )?;
+        }
+        if let (Some(recovery), Some((payload, false))) =
+            (timeline_recovery, timeline_payload.as_ref())
+        {
+            transaction.execute(
+                "INSERT INTO session_timeline_recoveries (
                     recovery_id, payload_json, applied_generation
                  ) VALUES (?1, ?2, ?3)",
                 params![&recovery.recovery_id, payload, next.to_string()],
@@ -6969,7 +7980,7 @@ impl UsageStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let canonical = canonicalize_samples(&transaction, samples)?;
+        let canonical = canonicalize_samples(&transaction, samples, false)?;
         validate_data_hash(data_hash)?;
         validate_snapshot_json(snapshot_json)?;
         let current_raw: Option<(i64, String, String)> = transaction
@@ -7003,7 +8014,7 @@ impl UsageStore {
         let sqlite_generation =
             i64::try_from(next_generation).map_err(|_| UsageStoreError::GenerationOverflow)?;
 
-        upsert_canonical_samples(&transaction, &canonical)?;
+        upsert_canonical_samples(&transaction, &canonical, false)?;
         transaction.execute(
             "INSERT INTO durable_state (singleton, data_generation, data_hash, snapshot_json) \
              VALUES (1, ?1, ?2, ?3) \
@@ -7296,6 +8307,10 @@ mod tests {
         store
             .connection
             .execute("DROP TABLE session_cumulative_recoveries", [])
+            .unwrap();
+        store
+            .connection
+            .execute("DROP TABLE session_timeline_recoveries", [])
             .unwrap();
         store
             .connection
@@ -9171,7 +10186,7 @@ mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
         let canonical_samples =
-            canonicalize_samples(&transaction, std::slice::from_ref(&smaller)).unwrap();
+            canonicalize_samples(&transaction, std::slice::from_ref(&smaller), false).unwrap();
         let canonical_observations = canonicalize_observations(
             &transaction,
             std::slice::from_ref(&UsageHistoryObservation::confirmed(&smaller)),
@@ -9612,6 +10627,368 @@ mod tests {
             .unwrap();
         assert!(!index_exists);
         drop(connection);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn session_timeline_recovery_is_atomic_projected_and_exactly_once() {
+        let path = database_path("session-timeline-recovery");
+        let identity = partition_identity('a', 1);
+        let reset_at = 1_800_000_600;
+        let window_seconds = 600;
+        let first_at = 1_800_000_120;
+        let second_at = 1_800_000_180;
+        let anchor_at = 1_800_000_240;
+        let luna = SessionModelTotal {
+            model: "LUNA".into(),
+            total_tokens: 50,
+            input_tokens: 40,
+            cached_input_tokens: 10,
+            output_tokens: 10,
+            cache_write_input_tokens: Some(0),
+        };
+        let sol = SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 100,
+            input_tokens: 90,
+            cached_input_tokens: 50,
+            output_tokens: 10,
+            cache_write_input_tokens: Some(0),
+        };
+        let source_models = vec![luna.clone(), sol.clone()];
+        let base = |timestamp, remaining_percent| UsageHistorySample {
+            timestamp,
+            reset_at,
+            remaining_percent: Some(remaining_percent),
+            sol_dollars: 1.0,
+            terra_dollars: 0.0,
+            luna_dollars: 0.5,
+            sol_tokens: 100,
+            terra_tokens: 0,
+            luna_tokens: 50,
+        };
+        let base_samples = vec![base(first_at, 90.0), base(second_at, 89.0)];
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let base_observations = base_samples
+            .iter()
+            .map(|sample| {
+                UsageHistoryObservation::confirmed_with_models(sample, source_models.clone())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            store
+                .commit_session_collection_with_observations(
+                    SessionCollectionCommit {
+                        reset_at,
+                        window_seconds,
+                        collector_epoch: 0x111,
+                        cycle_seq: 1,
+                        samples: &base_samples,
+                        checkpoints: &[],
+                        ranges: &[],
+                        model_totals: &source_models,
+                        recorded_sessions: &[],
+                    },
+                    &base_observations,
+                )
+                .unwrap()
+                .data_generation,
+            1
+        );
+
+        let range = SessionRange {
+            root_identity: "unix:10:20".into(),
+            relative_path: "2026/recovery.jsonl".into(),
+            file_device: 10,
+            file_inode: 20,
+            start_offset: 100,
+            end_offset: 200,
+            collector_epoch: 0x222,
+            cycle_seq: 1,
+            prefix_generation: 0x333,
+            record_sha256: "ab".repeat(32),
+        };
+        let offset =
+            |timestamp, total, input, cached, output, dollars| SessionTimelineRecoveryPoint {
+                timestamp,
+                offset_model_totals: vec![SessionModelTotal {
+                    model: "SOL".into(),
+                    total_tokens: total,
+                    input_tokens: input,
+                    cached_input_tokens: cached,
+                    output_tokens: output,
+                    cache_write_input_tokens: Some(0),
+                }],
+                offset_sol_dollars: dollars,
+                offset_terra_dollars: 0.0,
+                offset_luna_dollars: 0.0,
+            };
+        let recovery = finalize_session_timeline_recovery(
+            &identity.partition_id,
+            SessionTimelineRecovery {
+                recovery_id: String::new(),
+                canonical_reset_at: reset_at,
+                window_seconds,
+                source_data_generation: 1,
+                projection_end_exclusive: anchor_at,
+                source_model_totals: source_models.clone(),
+                ranges: vec![range.clone()],
+                points: vec![
+                    offset(first_at, 10, 9, 5, 1, 0.1),
+                    offset(second_at, 20, 18, 10, 2, 0.2),
+                ],
+                final_offset_model_totals: vec![SessionModelTotal {
+                    model: "SOL".into(),
+                    total_tokens: 25,
+                    input_tokens: 23,
+                    cached_input_tokens: 12,
+                    output_tokens: 2,
+                    cache_write_input_tokens: None,
+                }],
+                final_offset_sol_dollars: 0.25,
+                final_offset_terra_dollars: 0.0,
+                final_offset_luna_dollars: 0.0,
+            },
+        )
+        .unwrap();
+        let corrected_sol = SessionModelTotal {
+            total_tokens: 125,
+            input_tokens: 113,
+            cached_input_tokens: 62,
+            output_tokens: 12,
+            cache_write_input_tokens: None,
+            ..sol.clone()
+        };
+        let corrected_models = vec![luna.clone(), corrected_sol.clone()];
+        let anchor = UsageHistorySample {
+            timestamp: anchor_at,
+            reset_at,
+            remaining_percent: Some(88.0),
+            sol_dollars: 1.25,
+            terra_dollars: 0.0,
+            luna_dollars: 0.5,
+            sol_tokens: 125,
+            terra_tokens: 0,
+            luna_tokens: 50,
+        };
+        let commit_samples = vec![base_samples[0].clone(), anchor.clone()];
+        let commit_observations = vec![
+            base_observations[0].clone(),
+            UsageHistoryObservation::confirmed_with_models(&anchor, corrected_models.clone()),
+        ];
+        let commit = || SessionCollectionCommit {
+            reset_at,
+            window_seconds,
+            collector_epoch: 0x222,
+            cycle_seq: 1,
+            samples: &commit_samples,
+            checkpoints: &[],
+            ranges: std::slice::from_ref(&range),
+            model_totals: &corrected_models,
+            recorded_sessions: &[],
+        };
+        store
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER timeline_keep_usage_update
+                 BEFORE UPDATE ON usage_history
+                 BEGIN
+                     SELECT RAISE(ABORT, 'timeline rewrote measured usage');
+                 END;
+                 CREATE TEMP TRIGGER timeline_keep_usage_delete
+                 BEFORE DELETE ON usage_history
+                 BEGIN
+                     SELECT RAISE(ABORT, 'timeline deleted measured usage');
+                 END;
+                 CREATE TEMP TRIGGER timeline_keep_models_update
+                 BEFORE UPDATE ON usage_model_history
+                 BEGIN
+                     SELECT RAISE(ABORT, 'timeline rewrote measured models');
+                 END;
+                 CREATE TEMP TRIGGER timeline_keep_models_delete
+                 BEFORE DELETE ON usage_model_history
+                 BEGIN
+                     SELECT RAISE(ABORT, 'timeline deleted measured models');
+                 END;
+                 CREATE TEMP TRIGGER timeline_recovery_commit_failure
+                 BEFORE UPDATE ON collection_generation
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected timeline recovery failure');
+                 END;",
+            )
+            .unwrap();
+        assert!(store
+            .commit_session_collection_with_timeline_recovery(
+                commit(),
+                &commit_observations,
+                &recovery,
+            )
+            .is_err());
+        assert_eq!(store.load_all_raw().unwrap(), base_samples);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM session_ranges", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_timeline_recoveries",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .load_session_collection_state()
+                .unwrap()
+                .data_generation,
+            1
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER timeline_recovery_commit_failure;")
+            .unwrap();
+        let committed = store
+            .commit_session_collection_with_timeline_recovery(
+                commit(),
+                &commit_observations,
+                &recovery,
+            )
+            .unwrap();
+        assert_eq!(committed.data_generation, 2);
+
+        assert_eq!(
+            store.load_all_raw().unwrap(),
+            [base_samples.clone(), vec![anchor.clone()]].concat()
+        );
+        let logical = store.load_all().unwrap();
+        assert_eq!(logical[0].sol_tokens, 110);
+        assert_eq!(logical[0].sol_dollars, 1.1);
+        assert_eq!(logical[0].luna_tokens, 50);
+        assert_eq!(logical[0].remaining_percent, Some(90.0));
+        assert_eq!(logical[1].sol_tokens, 120);
+        assert_eq!(logical[1].sol_dollars, 1.2);
+        assert_eq!(logical[1].remaining_percent, Some(89.0));
+        assert_eq!(logical[2], anchor);
+        let observations = store
+            .load_recent_observations(Utc.timestamp_opt(anchor_at + 1, 0).unwrap())
+            .unwrap();
+        assert_eq!(
+            observations[0].model_source,
+            ModelSource::ReconstructedFromSession
+        );
+        assert_eq!(
+            observations[1].model_source,
+            ModelSource::ReconstructedFromSession
+        );
+        assert_eq!(observations[2].model_source, ModelSource::Confirmed);
+        assert_eq!(
+            observations[1]
+                .model_totals
+                .as_ref()
+                .and_then(|totals| totals.iter().find(|total| total.model == "SOL")),
+            Some(&SessionModelTotal {
+                model: "SOL".into(),
+                total_tokens: 120,
+                input_tokens: 108,
+                cached_input_tokens: 60,
+                output_tokens: 12,
+                cache_write_input_tokens: Some(0),
+            })
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_timeline_recoveries",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+
+        let replay = store
+            .commit_session_collection_with_timeline_recovery(
+                commit(),
+                &commit_observations,
+                &recovery,
+            )
+            .unwrap();
+        assert_eq!(replay.data_generation, 2);
+        assert_eq!(store.load_all().unwrap(), logical);
+
+        let conflicting_range = SessionRange {
+            collector_epoch: 0x222,
+            cycle_seq: 2,
+            ..range
+        };
+        let conflict = finalize_session_timeline_recovery(
+            &identity.partition_id,
+            SessionTimelineRecovery {
+                recovery_id: String::new(),
+                canonical_reset_at: reset_at,
+                window_seconds,
+                source_data_generation: 2,
+                projection_end_exclusive: anchor_at + 60,
+                source_model_totals: corrected_models.clone(),
+                ranges: vec![conflicting_range.clone()],
+                points: vec![offset(anchor_at, 5, 5, 0, 0, 0.05)],
+                final_offset_model_totals: vec![SessionModelTotal {
+                    model: "SOL".into(),
+                    total_tokens: 5,
+                    input_tokens: 5,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    cache_write_input_tokens: Some(0),
+                }],
+                final_offset_sol_dollars: 0.05,
+                final_offset_terra_dollars: 0.0,
+                final_offset_luna_dollars: 0.0,
+            },
+        )
+        .unwrap();
+        let conflicting_models = vec![
+            luna,
+            SessionModelTotal {
+                total_tokens: 130,
+                input_tokens: 118,
+                ..corrected_sol
+            },
+        ];
+        assert!(store
+            .commit_session_collection_with_timeline_recovery(
+                SessionCollectionCommit {
+                    reset_at,
+                    window_seconds,
+                    collector_epoch: 0x222,
+                    cycle_seq: 2,
+                    samples: &[],
+                    checkpoints: &[],
+                    ranges: std::slice::from_ref(&conflicting_range),
+                    model_totals: &conflicting_models,
+                    recorded_sessions: &[],
+                },
+                &[],
+                &conflict,
+            )
+            .is_err());
+        assert_eq!(
+            store
+                .load_session_collection_state()
+                .unwrap()
+                .data_generation,
+            2
+        );
+        assert_eq!(store.load_all().unwrap(), logical);
+        drop(store);
         remove_database(&path);
     }
 }
@@ -11242,6 +12619,70 @@ mod wave_b_correction_tests {
     }
 
     #[test]
+    fn cumulative_recovery_does_not_cross_a_time_proven_new_window() {
+        let reset_a = 1_789_437_490;
+        let reset_c = 1_789_623_591;
+        let old = vec![SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 555_312_427,
+            input_tokens: 553_537_987,
+            cached_input_tokens: 544_468_480,
+            output_tokens: 1_774_440,
+            cache_write_input_tokens: Some(0),
+        }];
+        let current = vec![SessionModelTotal {
+            model: "LUNA".into(),
+            total_tokens: 686_397,
+            input_tokens: 674_095,
+            cached_input_tokens: 546_560,
+            output_tokens: 12_302,
+            cache_write_input_tokens: Some(0),
+        }];
+        let first = vec![SessionModelTotal {
+            model: "LUNA".into(),
+            total_tokens: 0,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            cache_write_input_tokens: Some(0),
+        }];
+        let observations = vec![
+            cumulative_observation(1_789_018_740, reset_a, 0.0, 1.0, 0.3, old.clone()),
+            cumulative_observation(1_789_018_800, reset_c, 100.0, 0.0, 0.0, first),
+            cumulative_observation(
+                1_789_027_320,
+                reset_c,
+                93.0,
+                0.0,
+                0.051_200_6,
+                current.clone(),
+            ),
+            // A stale daemon generation can publish the old period again
+            // after the new period was already observed and persisted.
+            cumulative_observation(1_789_030_680, reset_a, 0.0, 1.0, 0.3, old),
+            cumulative_observation(
+                1_789_030_800,
+                reset_c,
+                91.0,
+                0.0,
+                0.051_200_6,
+                current.clone(),
+            ),
+        ];
+
+        assert!(derive_session_cumulative_recovery(
+            &"44".repeat(32),
+            reset_c,
+            604_800,
+            1_789_030_801,
+            &current,
+            &observations,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
     fn cumulative_recovery_offsets_only_models_proven_to_have_regressed() {
         let partition_id = "43".repeat(32);
         let reset_a = 1_789_437_490;
@@ -11909,7 +13350,9 @@ mod wave_b_correction_tests {
         };
         let reset_a = 1_789_437_490;
         let reset_b = 1_789_300_251;
-        let reset_c = 1_789_623_591;
+        // This replacement has no newly started window between the adjacent
+        // observations, so it remains a genuine pre-deadline corruption.
+        let reset_c = reset_a + 60_000;
         let collector_epoch = 0x258;
         let baseline = vec![SessionModelTotal {
             model: "LUNA".into(),

@@ -623,7 +623,7 @@ impl PublicDetailsV2 {
                     .is_some_and(|previous| previous > (sample.reset_at, sample.timestamp))
                 || !matches!(
                     sample.model_source.as_str(),
-                    "confirmed" | "unavailable" | "legacy-unknown"
+                    "confirmed" | "reconstructed-from-session" | "unavailable" | "legacy-unknown"
                 )
                 || sample
                     .remaining_percent
@@ -744,10 +744,10 @@ impl PublicDetailsV3 {
                     remaining_percent: sample.remaining_percent,
                     models: legacy_history_models_v3(sample),
                     models_complete: false,
-                    model_source: if sample.model_source == "unavailable" {
-                        "unavailable".to_owned()
-                    } else {
-                        "legacy-unknown".to_owned()
+                    model_source: match sample.model_source.as_str() {
+                        "unavailable" => "unavailable".to_owned(),
+                        "reconstructed-from-session" => "reconstructed-from-session".to_owned(),
+                        _ => "legacy-unknown".to_owned(),
                     },
                 })
                 .collect(),
@@ -821,7 +821,7 @@ impl PublicDetailsV3 {
                 || previous.is_some_and(|previous| previous > key)
                 || !matches!(
                     sample.model_source.as_str(),
-                    "confirmed" | "unavailable" | "legacy-unknown"
+                    "confirmed" | "reconstructed-from-session" | "unavailable" | "legacy-unknown"
                 )
                 || sample
                     .remaining_percent
@@ -4103,6 +4103,38 @@ mod tests {
         no_observed_at.history_periods[0].current = false;
         assert_eq!(
             no_observed_at.validate(),
+            Err(ApiSnapshotError::InvalidHistoryObservation)
+        );
+    }
+
+    #[test]
+    fn reconstructed_session_source_is_preserved_and_remains_non_confirmed() {
+        let mut details_v2 = PublicDetailsV2::from(detailed_fixture());
+        details_v2.history_samples[0].model_source = "reconstructed-from-session".into();
+        details_v2.validate().unwrap();
+
+        let details_v3 = PublicDetailsV3::from_v2_compat(&details_v2);
+        assert_eq!(
+            details_v3.history_samples[0].model_source,
+            "reconstructed-from-session"
+        );
+        assert!(!details_v3.history_samples[0].models_complete);
+        details_v3.validate().unwrap();
+        let wire: Value =
+            serde_json::from_slice(&serialize_details_v3(&details_v3).unwrap()).unwrap();
+        assert_eq!(
+            wire["history_samples"][0]["model_source"],
+            "reconstructed-from-session"
+        );
+
+        let mut complete = details_v3.clone();
+        complete.history_samples[0].models_complete = true;
+        complete.validate().unwrap();
+
+        let mut invalid = complete;
+        invalid.history_samples[0].models = None;
+        assert_eq!(
+            invalid.validate(),
             Err(ApiSnapshotError::InvalidHistoryObservation)
         );
     }

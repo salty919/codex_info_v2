@@ -46,6 +46,88 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
+    public async Task DetailsV3PreservesReconstructedSessionSourceAsNonConfirmed()
+    {
+        var json = ValidDetailsV3Json()
+            .Replace(
+                "\"models_complete\":true,\"model_source\":\"confirmed\"",
+                "\"models_complete\":false,\"model_source\":\"reconstructed-from-session\"",
+                StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(json, includePublishedPair: true)));
+
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        var sample = Assert.Single(result.Snapshot!.HistorySamples);
+        Assert.Equal(ApiHistorySample.ReconstructedFromSessionModelSource, sample.ModelSource);
+        Assert.False(sample.ModelsComplete);
+        Assert.Equal(6UL, Assert.Single(sample.Models).TotalTokens);
+    }
+
+    [Fact]
+    public async Task DetailsV3PreservesReconstructedSessionSourceMarkedComplete()
+    {
+        var json = ValidDetailsV3Json()
+            .Replace(
+                "\"model_source\":\"confirmed\"",
+                "\"model_source\":\"reconstructed-from-session\"",
+                StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(json, includePublishedPair: true)));
+
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        var sample = Assert.Single(result.Snapshot!.HistorySamples);
+        Assert.Equal(ApiHistorySample.ReconstructedFromSessionModelSource, sample.ModelSource);
+        Assert.True(sample.ModelsComplete);
+    }
+
+    [Fact]
+    public async Task DetailsV3RejectsReconstructedSessionSourceWithoutModelsWhenMarkedComplete()
+    {
+        var json = ValidDetailsV3Json()
+            .Replace(
+                "\"models\":[{\"model\":\"ASTRA\",\"total_tokens\":6,\"input_tokens\":4,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":2,\"total_dollars\":0.25}]",
+                "\"models\":null",
+                StringComparison.Ordinal)
+            .Replace(
+                "\"model_source\":\"confirmed\"",
+                "\"model_source\":\"reconstructed-from-session\"",
+                StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(json, includePublishedPair: true)));
+
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
+        Assert.Null(result.Snapshot);
+    }
+
+    [Fact]
+    public async Task DetailsV2PreservesReconstructedSessionSourceAsNonConfirmed()
+    {
+        var json = ValidDetailsV2Json()
+            .Replace(
+                "\"model_source\":\"confirmed\"",
+                "\"model_source\":\"reconstructed-from-session\"",
+                StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+            request.RequestUri!.AbsolutePath == "/v3/details"
+                ? NotFoundResponse()
+                : JsonResponse(json, includePublishedPair: true)));
+
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        var sample = Assert.Single(result.Snapshot!.HistorySamples);
+        Assert.Equal(ApiHistorySample.ReconstructedFromSessionModelSource, sample.ModelSource);
+        Assert.False(sample.ModelsComplete);
+        Assert.Equal(6UL, sample.SolTokens);
+    }
+
+    [Fact]
     public async Task DetailsV3ReusesTheAcceptedGenerationWithAZeroBody304()
     {
         var requestCount = 0;
