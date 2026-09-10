@@ -12,8 +12,8 @@ use crate::account_scope::{self, AccountPartition};
 use crate::security;
 use crate::usage_store::{
     HistoryContinuityModelRecovery, RecordedSessionSource, RecorderGap, SessionCheckpoint,
-    SessionCollectionCommit, SessionModelTotal, SessionRange, StoragePartitionIdentity,
-    UsageHistoryObservation, UsageHistorySample, UsageStore,
+    SessionCollectionCommit, SessionCumulativeRecovery, SessionModelTotal, SessionRange,
+    StoragePartitionIdentity, UsageHistoryObservation, UsageHistorySample, UsageStore,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1281,6 +1281,7 @@ pub(crate) struct RecorderGeneration {
     pub(crate) session_ranges: Vec<SessionRange>,
     pub(crate) session_model_totals: Vec<SessionModelTotal>,
     pub(crate) history_continuity_recovery: Option<HistoryContinuityModelRecovery>,
+    pub(crate) cumulative_recovery: Option<SessionCumulativeRecovery>,
     pub(crate) quota_source_rescan_complete: bool,
 }
 
@@ -1308,6 +1309,7 @@ pub(crate) struct RecorderCommitAck {
     pub(crate) canonical_observations: Vec<UsageHistoryObservation>,
     pub(crate) fallback_model_totals: Option<Vec<SessionModelTotal>>,
     pub(crate) legacy_history_bridged: bool,
+    pub(crate) cumulative_history_recovered: bool,
 }
 
 enum RecorderCommand {
@@ -1692,6 +1694,7 @@ impl RecorderWorker {
                                 session_ranges,
                                 session_model_totals,
                                 history_continuity_recovery,
+                                cumulative_recovery,
                                 quota_source_rescan_complete,
                             } = generation;
                             if std::env::var("CODEX_INFO_RECORDER_FAILURE")
@@ -1750,8 +1753,7 @@ impl RecorderWorker {
                                                 fallback_was_used = true;
                                             }
                                         }
-                                        let commit_result = store
-                                            .commit_session_collection_with_observations(SessionCollectionCommit {
+                                        let commit = SessionCollectionCommit {
                                                 reset_at,
                                                 window_seconds,
                                                 collector_epoch,
@@ -1761,7 +1763,21 @@ impl RecorderWorker {
                                                 ranges: &session_ranges,
                                                 model_totals: commit_model_totals,
                                                 recorded_sessions: &recorded_sessions,
-                                            }, &observations)
+                                            };
+                                        let commit_result = if let Some(recovery) =
+                                            cumulative_recovery.as_ref()
+                                        {
+                                            store.commit_session_collection_with_cumulative_recovery(
+                                                commit,
+                                                &observations,
+                                                recovery,
+                                            )
+                                        } else {
+                                            store.commit_session_collection_with_observations(
+                                                commit,
+                                                &observations,
+                                            )
+                                        }
                                             .map_err(|error| error.to_string())?;
                                         let mut data_generation = commit_result.data_generation;
                                         let canonical_samples = commit_result.canonical_samples;
@@ -1875,6 +1891,8 @@ impl RecorderWorker {
                                             fallback_model_totals: fallback_was_used
                                                 .then(|| commit_model_totals.to_vec()),
                                             legacy_history_bridged,
+                                            cumulative_history_recovered: cumulative_recovery
+                                                .is_some(),
                                         })
                                     })
                             };
@@ -2548,6 +2566,7 @@ mod tests {
                         output_tokens: 2_345,
                     }],
                     history_continuity_recovery: None,
+                    cumulative_recovery: None,
                     quota_source_rescan_complete: false,
                 },
             )
@@ -2652,6 +2671,7 @@ mod tests {
                             fallback_model_totals: fallback_totals.clone(),
                         },
                     ),
+                    cumulative_recovery: None,
                     quota_source_rescan_complete: false,
                 },
             )
@@ -2685,6 +2705,7 @@ mod tests {
                     session_ranges: Vec::new(),
                     session_model_totals: Vec::new(),
                     history_continuity_recovery: None,
+                    cumulative_recovery: None,
                     quota_source_rescan_complete: false,
                 },
             )
@@ -2813,6 +2834,7 @@ mod tests {
                     session_ranges: Vec::new(),
                     session_model_totals: Vec::new(),
                     history_continuity_recovery: None,
+                    cumulative_recovery: None,
                     quota_source_rescan_complete: true,
                 },
             )
@@ -2880,6 +2902,7 @@ mod tests {
                     session_ranges: Vec::new(),
                     session_model_totals: Vec::new(),
                     history_continuity_recovery: None,
+                    cumulative_recovery: None,
                     quota_source_rescan_complete: true,
                 },
             )
@@ -2971,6 +2994,7 @@ mod tests {
             session_ranges: Vec::new(),
             session_model_totals: Vec::new(),
             history_continuity_recovery: None,
+            cumulative_recovery: None,
             quota_source_rescan_complete: false,
         };
 
@@ -3018,6 +3042,7 @@ mod tests {
                 session_ranges: Vec::new(),
                 session_model_totals: Vec::new(),
                 history_continuity_recovery: None,
+                cumulative_recovery: None,
                 quota_source_rescan_complete: false,
             };
             let mut writer = RecorderWorker::start().unwrap();

@@ -1316,6 +1316,80 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public async Task Issue258_recovered_v3_history_keeps_exact_components_and_graph_endpoints()
+    {
+        const string periodId = "issue-258-current";
+        var periodsBody = Encoding.UTF8.GetBytes(
+            """
+            {"api_version":"v3","history_periods":[{"id":"issue-258-current","start_at":1788832680,"end_at":1788996000,"reset_at":1789437490,"label":"Current period","current":true}]}
+            """);
+        var historyBody = Encoding.UTF8.GetBytes(
+            """
+            {"api_version":"v3","history_samples":[{"timestamp":1788975600,"reset_at":1789437490,"remaining_percent":29.0,"models":[{"model":"LUNA","total_tokens":22907995,"input_tokens":22428188,"cached_input_tokens":20141824,"cache_write_input_tokens":0,"output_tokens":479807,"total_dollars":1.43587768},{"model":"SOL","total_tokens":555312427,"input_tokens":553537987,"cached_input_tokens":544468480,"cache_write_input_tokens":0,"output_tokens":1774440,"total_dollars":370.814975}],"models_complete":false,"model_source":"legacy-unknown"},{"timestamp":1788996000,"reset_at":1789437490,"remaining_percent":9.0,"models":[{"model":"LUNA","total_tokens":25262756,"input_tokens":24726033,"cached_input_tokens":22103552,"cache_write_input_tokens":0,"output_tokens":536723,"total_dollars":1.61063484},{"model":"SOL","total_tokens":555312427,"input_tokens":553537987,"cached_input_tokens":544468480,"cache_write_input_tokens":0,"output_tokens":1774440,"total_dollars":370.814975}],"models_complete":false,"model_source":"legacy-unknown"}],"history_gaps":[],"next_cursor":null,"resume_cursor":"issue-258-end"}
+            """);
+        var handler = new SplitHistoryFixtureHandler(
+            periodsBody,
+            historyBody,
+            CanonicalPublishedPair,
+            periodId);
+        using var client = new LoopbackStatusClient(handler);
+
+        var periodsResult = await client.FetchHistoryPeriodsAsync(CancellationToken.None);
+        var pageResult = await client.FetchHistoryPageAsync(
+            periodId,
+            cancellationToken: CancellationToken.None);
+
+        Assert.True(periodsResult.IsSuccess);
+        Assert.True(pageResult.IsSuccess);
+        var periods = Assert.IsType<ApiHistoryPeriodsSnapshot>(periodsResult.Snapshot);
+        var page = Assert.IsType<ApiHistoryPage>(pageResult.Page);
+        Assert.Equal(periods.PublishedPair, page.PublishedPair);
+        var period = Assert.Single(periods.Periods) with { Samples = page.Samples };
+        var endpoint = period.Samples[^1];
+        var sol = endpoint.Models.Single(model => model.Name == "SOL");
+        var luna = endpoint.Models.Single(model => model.Name == "LUNA");
+        Assert.Equal(555_312_427UL, sol.TotalTokens);
+        Assert.Equal(553_537_987UL, sol.InputTokens);
+        Assert.Equal(544_468_480UL, sol.CachedInputTokens);
+        Assert.Equal(1_774_440UL, sol.OutputTokens);
+        Assert.Equal(370.814975, sol.TotalDollars!.Value);
+        Assert.Equal(25_262_756UL, luna.TotalTokens);
+        Assert.Equal(24_726_033UL, luna.InputTokens);
+        Assert.Equal(22_103_552UL, luna.CachedInputTokens);
+        Assert.Equal(536_723UL, luna.OutputTokens);
+        Assert.Equal(1.61063484, luna.TotalDollars!.Value);
+        Assert.Equal(
+            372.42560984,
+            sol.TotalDollars.Value + luna.TotalDollars.Value,
+            precision: 8);
+
+        var graphSamples = GraphWindowViewModel.BuildGraphSamples(period, period.EndAt);
+        var dollars = GraphScene.Create(
+            graphSamples,
+            GraphMetric.Dollars,
+            period.StartAt,
+            period.EndAt);
+        var dollarLabels = GraphPlotProjection.BuildEndpointLabels(
+            dollars,
+            CultureInfo.InvariantCulture);
+        Assert.Contains(dollarLabels, label =>
+            label.Series == GraphSeries.Sol && label.Text == "$370.81");
+        Assert.Contains(dollarLabels, label =>
+            label.Series == GraphSeries.Luna && label.Text == "$1.61");
+        Assert.Equal(370.814975, dollars.ModelSeries["SOL"][^1], precision: 8);
+        Assert.Equal(1.61063484, dollars.ModelSeries["LUNA"][^1], precision: 8);
+
+        var tokens = GraphScene.Create(
+            graphSamples,
+            GraphMetric.Tokens,
+            period.StartAt,
+            period.EndAt);
+        Assert.Equal(555_312_427d, tokens.ModelSeries["SOL"][^1]);
+        Assert.Equal(25_262_756d, tokens.ModelSeries["LUNA"][^1]);
+        Assert.NotEqual(0d, tokens.ModelSeries["SOL"][^1]);
+    }
+
+    [Fact]
     public async Task Issue137_live_evidence_exports_windows_production_projection()
     {
         var evidencePath = Environment.GetEnvironmentVariable("CODEX_INFO_GRAPH_LIVE_EVIDENCE");
