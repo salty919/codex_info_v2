@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Behavior tests for exact Codacy coverage artifact pairing."""
 
 from __future__ import annotations
@@ -6,7 +5,6 @@ from __future__ import annotations
 import unittest
 
 from codacy_coverage_artifacts import CoverageArtifactError, resolve_pair
-
 
 RUN = "123"
 ATTEMPT = "2"

@@ -1,8 +1,6 @@
-#!/usr/bin/env python3
 """Focused contract for complete, isolated Codacy coverage upload."""
 
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 RUST = (ROOT / ".github/workflows/rust.yml").read_text(encoding="utf-8")

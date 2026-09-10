@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Select one complete Rust/.NET coverage pair from one Actions run attempt."""
 
 from __future__ import annotations
