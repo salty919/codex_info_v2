@@ -1649,6 +1649,7 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
                 !TryGetBoolean(sample, "models_complete", out var modelsComplete) ||
                 !TryGetString(sample, "model_source", out var modelSource) ||
                 modelSource is not ApiHistorySample.ConfirmedModelSource and
+                    not ApiHistorySample.ReconstructedFromSessionModelSource and
                     not ApiHistorySample.UnavailableModelSource and
                     not ApiHistorySample.LegacyUnknownModelSource ||
                 !TryGetHistoryModelsV3(sample, modelSource, modelsComplete, out var modelSamples))
@@ -1720,7 +1721,9 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
 
         if (property.ValueKind == JsonValueKind.Null)
         {
-            return modelSource == ApiHistorySample.LegacyUnknownModelSource && !modelsComplete;
+            return (modelSource == ApiHistorySample.LegacyUnknownModelSource ||
+                    modelSource == ApiHistorySample.ReconstructedFromSessionModelSource) &&
+                !modelsComplete;
         }
 
         if (property.ValueKind != JsonValueKind.Array ||
@@ -1808,6 +1811,7 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
         }
 
         if (candidate is not ApiHistorySample.ConfirmedModelSource and
+            not ApiHistorySample.ReconstructedFromSessionModelSource and
             not ApiHistorySample.UnavailableModelSource and
             not ApiHistorySample.LegacyUnknownModelSource)
         {
