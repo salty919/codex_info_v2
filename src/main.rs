@@ -152,6 +152,7 @@ struct LocalUsageCandidate {
     session_model_totals: Vec<usage_store::SessionModelTotal>,
     history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
     cumulative_recovery: Option<usage_store::SessionCumulativeRecovery>,
+    timeline_recovery: Option<usage_store::SessionTimelineRecovery>,
 }
 
 enum LocalEvent {
@@ -194,6 +195,7 @@ const TERRA_PRICE_PER_MILLION: (f64, f64, f64) = (2.0, 0.2, 12.0);
 const LUNA_PRICE_PER_MILLION: (f64, f64, f64) = (0.2, 0.02, 1.2);
 const ASTRA_PRICE_PER_MILLION: (f64, f64, f64, f64) = (10.0, 1.0, 12.5, 50.0);
 const ASTRA_PRICE_VERSION: &str = "ASTRA_USER_2026-09-05";
+const UNATTRIBUTED_SESSION_MODEL: &str = "UNATTRIBUTED";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ModelUsageRow {
@@ -2744,6 +2746,48 @@ fn admit_session_collection_period(
     transition
 }
 
+fn select_started_boundary_collection_state(
+    current_generation: u64,
+    reset_at: i64,
+    window_seconds: i64,
+    observed_at: i64,
+    retained: &[usage_store::SessionCollectionState],
+) -> Option<usage_store::SessionCollectionState> {
+    let period_started_at = reset_at.checked_sub(window_seconds)?;
+    if current_generation == 0
+        || window_seconds <= 0
+        || period_started_at > observed_at
+        || reset_at <= observed_at
+    {
+        return None;
+    }
+    retained
+        .iter()
+        .filter(|candidate| {
+            let Some(observation) = candidate.last_quota_observation.as_ref() else {
+                return false;
+            };
+            candidate.data_generation > 0
+                && candidate.data_generation < current_generation
+                && candidate.reset_at == reset_at
+                && candidate.window_seconds == window_seconds
+                && observation.observed_at >= period_started_at
+                && observation.observed_at <= observed_at
+                && observation.remaining_percent.is_finite()
+                && (0.0..=100.0).contains(&observation.remaining_percent)
+        })
+        .max_by_key(|candidate| {
+            (
+                candidate
+                    .last_quota_observation
+                    .as_ref()
+                    .map_or(0, |observation| observation.observed_at),
+                candidate.data_generation,
+            )
+        })
+        .cloned()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HistoryPeriod {
     canonical_reset_at: i64,
@@ -3685,6 +3729,7 @@ fn store_observation_from_public(
 ) -> usage_store::UsageHistoryObservation {
     let model_source = match observation.model_source.as_str() {
         "confirmed" => usage_store::ModelSource::Confirmed,
+        "reconstructed-from-session" => usage_store::ModelSource::ReconstructedFromSession,
         "unavailable" => usage_store::ModelSource::Unavailable,
         _ => usage_store::ModelSource::LegacyUnknown,
     };
@@ -3747,6 +3792,7 @@ fn store_observation_from_public_v3(
 ) -> usage_store::UsageHistoryObservation {
     let model_source = match observation.model_source.as_str() {
         "confirmed" => usage_store::ModelSource::Confirmed,
+        "reconstructed-from-session" => usage_store::ModelSource::ReconstructedFromSession,
         "unavailable" => usage_store::ModelSource::Unavailable,
         _ => usage_store::ModelSource::LegacyUnknown,
     };
@@ -3796,9 +3842,22 @@ fn prefer_model_source(
     match (current, candidate) {
         (usage_store::ModelSource::Confirmed, _) => usage_store::ModelSource::Confirmed,
         (_, usage_store::ModelSource::Confirmed) => usage_store::ModelSource::Confirmed,
+        (usage_store::ModelSource::ReconstructedFromSession, _)
+        | (_, usage_store::ModelSource::ReconstructedFromSession) => {
+            usage_store::ModelSource::ReconstructedFromSession
+        }
         (usage_store::ModelSource::LegacyUnknown, _)
         | (_, usage_store::ModelSource::LegacyUnknown) => usage_store::ModelSource::LegacyUnknown,
         _ => usage_store::ModelSource::Unavailable,
+    }
+}
+
+fn model_source_rank(source: usage_store::ModelSource) -> u8 {
+    match source {
+        usage_store::ModelSource::Unavailable => 0,
+        usage_store::ModelSource::LegacyUnknown => 1,
+        usage_store::ModelSource::ReconstructedFromSession => 2,
+        usage_store::ModelSource::Confirmed => 3,
     }
 }
 
@@ -3944,7 +4003,9 @@ impl UsageHistory {
         let preserve_existing = matches!(
             (existing.model_source, incoming.model_source,),
             (
-                usage_store::ModelSource::Confirmed | usage_store::ModelSource::LegacyUnknown,
+                usage_store::ModelSource::Confirmed
+                    | usage_store::ModelSource::ReconstructedFromSession
+                    | usage_store::ModelSource::LegacyUnknown,
                 usage_store::ModelSource::Unavailable,
             )
         );
@@ -4220,14 +4281,20 @@ impl UsageHistory {
 
     #[cfg(test)]
     fn record(&mut self, sample: UsageHistorySample) {
-        self.record_with_models(sample, None, false);
+        self.record_with_models_from_source(
+            sample,
+            None,
+            false,
+            usage_store::ModelSource::Confirmed,
+        );
     }
 
-    fn record_with_models(
+    fn record_with_models_from_source(
         &mut self,
         sample: UsageHistorySample,
         model_totals: Option<Vec<usage_store::SessionModelTotal>>,
         model_totals_complete: bool,
+        model_source: usage_store::ModelSource,
     ) {
         if !sample.is_valid() {
             return;
@@ -4241,9 +4308,15 @@ impl UsageHistory {
                     totals,
                 );
                 observation.model_totals_complete = model_totals_complete;
+                observation.model_source = model_source;
                 observation
             })
-            .unwrap_or_else(|| usage_store::UsageHistoryObservation::confirmed(&stored_sample));
+            .unwrap_or_else(|| {
+                let mut observation =
+                    usage_store::UsageHistoryObservation::confirmed(&stored_sample);
+                observation.model_source = model_source;
+                observation
+            });
         Self::merge_observation(&mut self.pending_store_observations, observation.clone());
         Self::merge_observation(&mut self.observations, observation);
         let acquisition_end = sample.timestamp;
@@ -7940,6 +8013,7 @@ struct LocalUsageCollection {
     session_ranges: Vec<usage_store::SessionRange>,
     session_model_totals: Vec<usage_store::SessionModelTotal>,
     history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
+    timeline_recovery: Option<usage_store::SessionTimelineRecovery>,
     cleanup_plan: Option<SessionCleanupPlan>,
 }
 
@@ -7949,8 +8023,10 @@ impl LocalUsageCollection {
         for (_, totals) in &mut self.history_model_totals {
             totals.retain(session_model_total_has_usage);
         }
-        self.session_model_totals
-            .retain(session_model_total_has_usage);
+        if self.timeline_recovery.is_none() {
+            self.session_model_totals
+                .retain(session_model_total_has_usage);
+        }
     }
 }
 
@@ -8116,6 +8192,45 @@ fn load_quota_generation_recovery_plan(
     })
 }
 
+fn load_started_boundary_collection_state(
+    partition: &account_scope::AccountPartition,
+    current_generation: u64,
+    reset_at: i64,
+    window_seconds: i64,
+    observed_at: i64,
+) -> Option<usage_store::SessionCollectionState> {
+    let identity = partition.storage_identity();
+    let mut retained = Vec::new();
+    for generation in 1..=3 {
+        let path = partition
+            .database_path
+            .with_extension(format!("sqlite3.bak.{generation}"));
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return None;
+            }
+            Ok(_) => {}
+        }
+        let store = UsageStore::open_read_only_partitioned(&path, &identity).ok()?;
+        store.verify_integrity().ok()?;
+        retained.push(store.load_session_collection_state().ok()?);
+    }
+    let selected = select_started_boundary_collection_state(
+        current_generation,
+        reset_at,
+        window_seconds,
+        observed_at,
+        &retained,
+    )?;
+    debug_runtime(format!(
+        "started boundary state restored source_generation={} reset_at={reset_at}",
+        selected.data_generation
+    ));
+    Some(selected)
+}
+
 fn load_regression_recovery_state(
     partition: &account_scope::AccountPartition,
     current: &usage_store::SessionCollectionState,
@@ -8276,6 +8391,7 @@ fn collect_local_usage_snapshot(
         session_ranges: Vec::new(),
         session_model_totals: Vec::new(),
         history_continuity_recovery: None,
+        timeline_recovery: None,
         cleanup_plan: cleanup_plan_for_inventory(inventory),
     })
 }
@@ -8400,27 +8516,191 @@ fn collect_recovery_usage(
     }
 }
 
+#[derive(Clone)]
 struct TimedModelUsage {
     timestamp: i64,
     model: String,
     delta: TokenSnapshot,
 }
 
-/// Read one session record while isolating a malformed/oversized line.
+fn canonical_session_minute(timestamp: i64) -> i64 {
+    timestamp.div_euclid(60) * 60
+}
+
+fn timeline_model_totals_with_usage(
+    mut totals: Vec<usage_store::SessionModelTotal>,
+) -> Option<Vec<usage_store::SessionModelTotal>> {
+    totals.retain(session_model_total_has_usage);
+    totals.sort_by(|left, right| left.model.cmp(&right.model));
+    (!totals.is_empty()).then_some(totals)
+}
+
+fn timeline_current_model_totals(
+    totals: &ModelUsageTotals,
+    source_totals: &[usage_store::SessionModelTotal],
+) -> Vec<usage_store::SessionModelTotal> {
+    let source_models = source_totals
+        .iter()
+        .map(|total| total.model.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut current = totals
+        .to_session_totals()
+        .into_iter()
+        .filter(|total| {
+            source_models.contains(total.model.as_str()) || session_model_total_has_usage(total)
+        })
+        .collect::<Vec<_>>();
+    current.sort_by(|left, right| left.model.cmp(&right.model));
+    current
+}
+
+fn build_session_timeline_recovery(
+    events: &[TimedModelUsage],
+    reset_at: i64,
+    window_seconds: i64,
+    timeline_end: i64,
+    collection_state: &usage_store::SessionCollectionState,
+    ranges: &[usage_store::SessionRange],
+    collector_epoch: u128,
+    cycle_seq: u64,
+    collected_totals: &ModelUsageTotals,
+) -> Result<Option<usage_store::SessionTimelineRecovery>, security::SecurityError> {
+    if collection_state.data_generation == 0 || ranges.is_empty() {
+        return Ok(None);
+    }
+    let projection_end_exclusive = canonical_session_minute(timeline_end);
+    if projection_end_exclusive <= 0
+        || projection_end_exclusive > reset_at
+        || !events.iter().any(|event| {
+            (event.delta.total > 0
+                || event.delta.input > 0
+                || event.delta.cached_input > 0
+                || event.delta.output > 0
+                || event.delta.cache_write_input.is_some_and(|value| value > 0))
+                && canonical_session_minute(event.timestamp) < projection_end_exclusive
+        })
+    {
+        return Ok(None);
+    }
+
+    let source_model_totals = collection_state.model_totals.clone();
+    let source_totals = ModelUsageTotals::from_session_totals(&source_model_totals);
+    let mut ordered_events = events.to_vec();
+    ordered_events.sort_by_key(|event| event.timestamp);
+    let mut offsets = ModelUsageTotals::default();
+    let mut points: Vec<usage_store::SessionTimelineRecoveryPoint> = Vec::new();
+    for event in ordered_events {
+        offsets.add(&event.model, event.delta);
+        let minute = canonical_session_minute(event.timestamp);
+        if minute >= projection_end_exclusive {
+            continue;
+        }
+        let Some(offset_model_totals) =
+            timeline_model_totals_with_usage(offsets.to_session_totals())
+        else {
+            // A valid cumulative sample with no positive delta is the same
+            // horizontal state, not a missing or malformed recovery point.
+            continue;
+        };
+        if let Some(previous) = points.last_mut() {
+            if previous.timestamp == minute {
+                previous.offset_model_totals = offset_model_totals;
+                continue;
+            }
+        }
+        points.push(usage_store::SessionTimelineRecoveryPoint {
+            timestamp: minute,
+            offset_model_totals,
+            offset_sol_dollars: 0.0,
+            offset_terra_dollars: 0.0,
+            offset_luna_dollars: 0.0,
+        });
+    }
+    if points.is_empty() {
+        return Err(security::SecurityError::new(
+            security::SecurityErrorKind::Parse,
+        ));
+    }
+    let final_offset_model_totals =
+        timeline_model_totals_with_usage(offsets.to_session_totals())
+            .ok_or_else(|| security::SecurityError::new(security::SecurityErrorKind::Parse))?;
+    let mut expected_totals = source_totals.clone();
+    if expected_totals.checked_add_totals(&offsets).is_none()
+        || timeline_current_model_totals(&expected_totals, &source_model_totals)
+            != timeline_current_model_totals(collected_totals, &source_model_totals)
+    {
+        return Err(security::SecurityError::new(
+            security::SecurityErrorKind::Parse,
+        ));
+    }
+    let dollars = offsets.dollar_totals();
+    let final_tokens = offsets.token_totals();
+    let weighted_dollars = |value: u64, final_value: u64, final_dollars: f64| {
+        if final_value == 0 {
+            0.0
+        } else {
+            final_dollars * value as f64 / final_value as f64
+        }
+    };
+    for point in &mut points {
+        // Component counters can be revised between cumulative Session
+        // snapshots even while total tokens remain monotonic. Deriving each
+        // intermediate dollar point from that changing mix can therefore make
+        // cumulative spend move backwards. The exact final component vector
+        // remains the dollar authority; model-token progress supplies the
+        // monotonic per-minute reconstruction weight.
+        let point_tokens =
+            ModelUsageTotals::from_session_totals(&point.offset_model_totals).token_totals();
+        point.offset_sol_dollars =
+            weighted_dollars(point_tokens.sol, final_tokens.sol, dollars.sol);
+        point.offset_terra_dollars =
+            weighted_dollars(point_tokens.terra, final_tokens.terra, dollars.terra);
+        point.offset_luna_dollars =
+            weighted_dollars(point_tokens.luna, final_tokens.luna, dollars.luna);
+    }
+    let mut canonical_ranges = ranges.to_vec();
+    canonical_ranges.sort();
+    canonical_ranges.dedup();
+    if canonical_ranges.len() != ranges.len()
+        || canonical_ranges
+            .iter()
+            .any(|range| range.collector_epoch != collector_epoch || range.cycle_seq != cycle_seq)
+    {
+        return Err(security::SecurityError::new(
+            security::SecurityErrorKind::Parse,
+        ));
+    }
+    Ok(Some(usage_store::SessionTimelineRecovery {
+        recovery_id: String::new(),
+        canonical_reset_at: reset_at,
+        window_seconds,
+        source_data_generation: collection_state.data_generation,
+        projection_end_exclusive,
+        source_model_totals,
+        ranges: canonical_ranges,
+        points,
+        final_offset_model_totals,
+        final_offset_sol_dollars: dollars.sol,
+        final_offset_terra_dollars: dollars.terra,
+        final_offset_luna_dollars: dollars.luna,
+    }))
+}
+
+/// Read one bounded legacy recovery record for test fixtures.
 ///
-/// Codex rollout files are append-only and may contain a very large tool
-/// payload.  One such payload must not make every valid token snapshot in the
-/// same file disappear from the graph.  The bounded reader consumes the bad
-/// record before returning the error, so skipping only `LimitExceeded` and
-/// `Parse` is both recoverable and bounded; I/O failures remain fatal.
+/// This helper is not used by the production Session collector. Production
+/// JSONL uses `read_streaming_session_record`, which validates one complete
+/// record without buffering the payload. The legacy recovery fixture has its
+/// own bounded contract and consumes malformed lines before continuing.
+#[cfg(test)]
 const SESSION_RECORD_INITIAL_CAPACITY: usize = 8 * 1024;
 const SESSION_APPEND_BYTES_PER_CYCLE: u64 = 64 * 1024 * 1024;
 
+#[cfg(test)]
 fn read_recoverable_session_record_into<R: BufRead>(
     reader: &mut R,
     line: &mut Vec<u8>,
-) -> Result<(bool, bool), security::SecurityError> {
-    let mut skipped_invalid_record = false;
+) -> Result<bool, security::SecurityError> {
     loop {
         line.clear();
         let mut invalid_record = false;
@@ -8430,7 +8710,7 @@ fn read_recoverable_session_record_into<R: BufRead>(
                 .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::Io))?;
             if buffer.is_empty() {
                 if line.is_empty() {
-                    return Ok((false, skipped_invalid_record));
+                    return Ok(false);
                 }
                 return Err(security::SecurityError::new(
                     security::SecurityErrorKind::Unterminated,
@@ -8463,7 +8743,6 @@ fn read_recoverable_session_record_into<R: BufRead>(
         }
         if invalid_record {
             debug_runtime("skipped malformed session record kind=LimitExceeded");
-            skipped_invalid_record = true;
             continue;
         }
         if line.last() == Some(&b'\r') {
@@ -8471,47 +8750,959 @@ fn read_recoverable_session_record_into<R: BufRead>(
         }
         if std::str::from_utf8(line).is_err() {
             debug_runtime("skipped malformed session record kind=Parse");
-            skipped_invalid_record = true;
             continue;
         }
-        return Ok((true, skipped_invalid_record));
+        return Ok(true);
     }
 }
 
-fn session_record_may_affect_usage(line: &[u8]) -> bool {
-    const USAGE_RECORD_MARKERS: [&[u8]; 4] = [
-        b"token_count",
-        b"turn_context",
-        b"thread_context",
-        b"thread_settings_applied",
-    ];
-    USAGE_RECORD_MARKERS.iter().any(|marker| {
-        line.windows(marker.len())
-            .any(|candidate| candidate == *marker)
-    })
+/// The session collector cannot use the RPC line limit as a JSONL record
+/// limit.  Rollouts legitimately contain large `compacted`/tool payloads, so
+/// framing and JSON validation are performed a byte at a time from the
+/// `BufRead` source while only the fields needed for usage attribution are
+/// retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionRecordParseError {
+    Syntax,
+    Io,
+}
+
+#[derive(Debug)]
+enum SessionRecordStatus {
+    End,
+    Present(Box<SessionRecordSummary>),
+    Invalid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionJsonKey {
+    Type,
+    Timestamp,
+    Model,
+    Payload,
+    ThreadSettings,
+    Info,
+    TotalTokenUsage,
+    TotalTokens,
+    CacheWriteInputTokens,
+    InputTokens,
+    CachedInputTokens,
+    OutputTokens,
+    Other,
+}
+
+const SESSION_JSON_KEYS: [(&[u8], SessionJsonKey); 12] = [
+    (b"type", SessionJsonKey::Type),
+    (b"timestamp", SessionJsonKey::Timestamp),
+    (b"model", SessionJsonKey::Model),
+    (b"payload", SessionJsonKey::Payload),
+    (b"thread_settings", SessionJsonKey::ThreadSettings),
+    (b"info", SessionJsonKey::Info),
+    (b"total_token_usage", SessionJsonKey::TotalTokenUsage),
+    (b"total_tokens", SessionJsonKey::TotalTokens),
+    (
+        b"cache_write_input_tokens",
+        SessionJsonKey::CacheWriteInputTokens,
+    ),
+    (b"input_tokens", SessionJsonKey::InputTokens),
+    (b"cached_input_tokens", SessionJsonKey::CachedInputTokens),
+    (b"output_tokens", SessionJsonKey::OutputTokens),
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionJsonObject {
+    Root,
+    Payload,
+    ThreadSettings,
+    Info,
+    TokenUsage,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SessionTokenUsageSummary {
+    total: Option<u64>,
+    cache_write_input: Option<u64>,
+    input: Option<u64>,
+    cached_input: Option<u64>,
+    output: Option<u64>,
+    total_seen: bool,
+    malformed: bool,
+}
+
+impl SessionTokenUsageSummary {
+    fn snapshot(&self) -> Option<TokenSnapshot> {
+        Some(TokenSnapshot {
+            total: self.total?,
+            cache_write_input: self.cache_write_input,
+            input: self.input.unwrap_or(0),
+            cached_input: self.cached_input.unwrap_or(0),
+            output: self.output.unwrap_or(0),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SessionPayloadSummary {
+    event_type: Option<String>,
+    model: Option<String>,
+    model_seen: bool,
+    model_malformed: bool,
+    thread_settings_seen: bool,
+    thread_settings_object: bool,
+    thread_settings_model: Option<String>,
+    thread_settings_model_seen: bool,
+    thread_settings_model_malformed: bool,
+    info_seen: bool,
+    info_null: bool,
+    info_object: bool,
+    token_usage_seen: bool,
+    token_usage_object: bool,
+    token_usage: SessionTokenUsageSummary,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SessionRecordSummary {
+    outer_type: Option<String>,
+    timestamp: Option<String>,
+    timestamp_seen: bool,
+    timestamp_malformed: bool,
+    root_model: Option<String>,
+    root_model_seen: bool,
+    root_model_malformed: bool,
+    payload_seen: bool,
+    payload_object: bool,
+    payload: SessionPayloadSummary,
+}
+
+impl SessionRecordSummary {
+    fn event_type(&self) -> Option<&str> {
+        match self.outer_type.as_deref() {
+            Some(
+                "task_started"
+                | "task_complete"
+                | "task_completed"
+                | "turn_aborted"
+                | "token_count"
+                | "turn_context"
+                | "thread_context"
+                | "thread_settings_applied",
+            ) => self.outer_type.as_deref(),
+            _ => self.payload.event_type.as_deref(),
+        }
+    }
+
+    fn event_model(&self) -> Option<&str> {
+        let (model, malformed) = match self.event_type() {
+            Some("turn_context" | "thread_context") => {
+                if self.payload.model.is_some() {
+                    (self.payload.model.as_deref(), self.payload.model_malformed)
+                } else {
+                    (self.root_model.as_deref(), self.root_model_malformed)
+                }
+            }
+            Some("thread_settings_applied") => {
+                if self.payload.thread_settings_model.is_some() {
+                    (
+                        self.payload.thread_settings_model.as_deref(),
+                        self.payload.thread_settings_model_malformed,
+                    )
+                } else if self.payload.model.is_some() {
+                    (self.payload.model.as_deref(), self.payload.model_malformed)
+                } else {
+                    (self.root_model.as_deref(), self.root_model_malformed)
+                }
+            }
+            _ => (None, false),
+        };
+        if malformed || model.is_some_and(|model| model.chars().any(char::is_control)) {
+            return None;
+        }
+        let model = model?;
+        (!model.trim().is_empty()).then_some(model)
+    }
+
+    fn token_snapshot(&self) -> Option<TokenSnapshot> {
+        (self.event_type() == Some("token_count") && self.payload_object)
+            .then(|| self.payload.token_usage.snapshot())
+            .flatten()
+    }
+
+    fn event_timestamp(&self) -> i64 {
+        self.timestamp
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.timestamp())
+            .unwrap_or(0)
+    }
+
+    /// A known event with a field shape that cannot be attributed safely must
+    /// not become the end of an incremental checkpoint.  `info: null` is the
+    /// producer's valid no-sample token-count envelope and remains a no-op.
+    fn usage_unparsed(&self) -> bool {
+        match self.event_type() {
+            Some("token_count") => {
+                if !self.payload_object || !self.payload.info_seen {
+                    return true;
+                }
+                if self.payload.info_null {
+                    return false;
+                }
+                let timestamp_valid = self
+                    .timestamp
+                    .as_deref()
+                    .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                    .is_some();
+                !self.payload.info_object
+                    || !self.payload.token_usage_seen
+                    || !self.payload.token_usage_object
+                    || !self.payload.token_usage.total_seen
+                    || self.payload.token_usage.malformed
+                    || self.timestamp_malformed
+                    || !self.timestamp_seen
+                    || !timestamp_valid
+            }
+            Some("turn_context" | "thread_context") => self.event_model().is_none(),
+            Some("thread_settings_applied") => self.event_model().is_none(),
+            _ => false,
+        }
+    }
+}
+
+struct SessionRecordInput<'a, R: BufRead> {
+    reader: &'a mut R,
+    saw_bytes: bool,
+    terminated: bool,
+    eof: bool,
+    depth: usize,
+}
+
+impl<'a, R: BufRead> SessionRecordInput<'a, R> {
+    fn new(reader: &'a mut R) -> Self {
+        Self {
+            reader,
+            saw_bytes: false,
+            terminated: false,
+            eof: false,
+            depth: 0,
+        }
+    }
+
+    fn peek_byte(&mut self) -> Result<Option<u8>, SessionRecordParseError> {
+        let buffer = self
+            .reader
+            .fill_buf()
+            .map_err(|_| SessionRecordParseError::Io)?;
+        if buffer.is_empty() {
+            self.eof = true;
+            return Ok(None);
+        }
+        if buffer[0] == b'\n' {
+            return Ok(None);
+        }
+        Ok(Some(buffer[0]))
+    }
+
+    fn next_byte(&mut self) -> Result<Option<u8>, SessionRecordParseError> {
+        let buffer = self
+            .reader
+            .fill_buf()
+            .map_err(|_| SessionRecordParseError::Io)?;
+        if buffer.is_empty() {
+            self.eof = true;
+            return Ok(None);
+        }
+        if buffer[0] == b'\n' {
+            self.reader.consume(1);
+            self.terminated = true;
+            return Ok(None);
+        }
+        let byte = buffer[0];
+        self.reader.consume(1);
+        self.saw_bytes = true;
+        Ok(Some(byte))
+    }
+
+    fn next_required(&mut self) -> Result<u8, SessionRecordParseError> {
+        self.next_byte()?.ok_or(SessionRecordParseError::Syntax)
+    }
+
+    fn consume_if(&mut self, expected: u8) -> Result<bool, SessionRecordParseError> {
+        if self.peek_byte()? == Some(expected) {
+            let _ = self.next_byte()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn skip_whitespace(&mut self) -> Result<(), SessionRecordParseError> {
+        while matches!(self.peek_byte()?, Some(b' ' | b'\t' | b'\r')) {
+            let _ = self.next_byte()?;
+        }
+        Ok(())
+    }
+
+    fn enter_container(&mut self) -> Result<(), SessionRecordParseError> {
+        // serde_json's default recursion limit is 128. Keep the same
+        // structural guard while allowing record size itself to remain
+        // unbounded for streamed payloads.
+        if self.depth >= 128 {
+            return Err(SessionRecordParseError::Syntax);
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave_container(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    fn parse_record(&mut self) -> Result<SessionRecordSummary, SessionRecordParseError> {
+        self.skip_whitespace()?;
+        let mut summary = SessionRecordSummary::default();
+        match self.peek_byte()? {
+            Some(b'{') => self.parse_object(SessionJsonObject::Root, &mut summary)?,
+            Some(b'[') => self.skip_array()?,
+            Some(_) => self.skip_value()?,
+            None => return Err(SessionRecordParseError::Syntax),
+        }
+        self.skip_whitespace()?;
+        if self.peek_byte()?.is_some() {
+            return Err(SessionRecordParseError::Syntax);
+        }
+        Ok(summary)
+    }
+
+    fn parse_object(
+        &mut self,
+        object: SessionJsonObject,
+        summary: &mut SessionRecordSummary,
+    ) -> Result<(), SessionRecordParseError> {
+        self.enter_container()?;
+        let result = (|| {
+            if self.next_required()? != b'{' {
+                return Err(SessionRecordParseError::Syntax);
+            }
+            self.skip_whitespace()?;
+            if self.consume_if(b'}')? {
+                return Ok(());
+            }
+            loop {
+                let key = self.parse_key()?;
+                self.skip_whitespace()?;
+                if self.next_required()? != b':' {
+                    return Err(SessionRecordParseError::Syntax);
+                }
+                self.skip_whitespace()?;
+                self.parse_object_value(object, key, summary)?;
+                self.skip_whitespace()?;
+                if self.consume_if(b'}')? {
+                    return Ok(());
+                }
+                if !self.consume_if(b',')? {
+                    return Err(SessionRecordParseError::Syntax);
+                }
+                self.skip_whitespace()?;
+                if self.peek_byte()? == Some(b'}') {
+                    return Err(SessionRecordParseError::Syntax);
+                }
+            }
+        })();
+        self.leave_container();
+        result
+    }
+
+    fn parse_object_value(
+        &mut self,
+        object: SessionJsonObject,
+        key: SessionJsonKey,
+        summary: &mut SessionRecordSummary,
+    ) -> Result<(), SessionRecordParseError> {
+        match object {
+            SessionJsonObject::Root => match key {
+                SessionJsonKey::Type => {
+                    summary.outer_type = self.parse_text_value()?.0;
+                }
+                SessionJsonKey::Timestamp => {
+                    summary.timestamp_seen = true;
+                    let (value, malformed) = self.parse_text_value()?;
+                    summary.timestamp = value;
+                    summary.timestamp_malformed = malformed;
+                }
+                SessionJsonKey::Model => {
+                    summary.root_model_seen = true;
+                    let (value, malformed) = self.parse_text_value()?;
+                    summary.root_model = value;
+                    summary.root_model_malformed = malformed;
+                }
+                SessionJsonKey::Payload => {
+                    summary.payload_seen = true;
+                    summary.payload = SessionPayloadSummary::default();
+                    if self.peek_byte()? == Some(b'{') {
+                        summary.payload_object = true;
+                        self.parse_object(SessionJsonObject::Payload, summary)?;
+                    } else {
+                        summary.payload_object = false;
+                        self.skip_value()?;
+                    }
+                }
+                _ => self.skip_value()?,
+            },
+            SessionJsonObject::Payload => match key {
+                SessionJsonKey::Type => {
+                    summary.payload.event_type = self.parse_text_value()?.0;
+                }
+                SessionJsonKey::Model => {
+                    summary.payload.model_seen = true;
+                    let (value, malformed) = self.parse_text_value()?;
+                    summary.payload.model = value;
+                    summary.payload.model_malformed = malformed;
+                }
+                SessionJsonKey::ThreadSettings => {
+                    summary.payload.thread_settings_seen = true;
+                    summary.payload.thread_settings_model = None;
+                    summary.payload.thread_settings_model_seen = false;
+                    summary.payload.thread_settings_model_malformed = false;
+                    if self.peek_byte()? == Some(b'{') {
+                        summary.payload.thread_settings_object = true;
+                        self.parse_object(SessionJsonObject::ThreadSettings, summary)?;
+                    } else {
+                        summary.payload.thread_settings_object = false;
+                        self.skip_value()?;
+                    }
+                }
+                SessionJsonKey::Info => {
+                    summary.payload.info_seen = true;
+                    summary.payload.info_null = self.peek_byte()? == Some(b'n');
+                    summary.payload.info_object = false;
+                    summary.payload.token_usage_seen = false;
+                    summary.payload.token_usage_object = false;
+                    summary.payload.token_usage = SessionTokenUsageSummary::default();
+                    if self.peek_byte()? == Some(b'{') {
+                        summary.payload.info_object = true;
+                        self.parse_object(SessionJsonObject::Info, summary)?;
+                    } else {
+                        self.skip_value()?;
+                    }
+                }
+                _ => self.skip_value()?,
+            },
+            SessionJsonObject::ThreadSettings => {
+                if key == SessionJsonKey::Model {
+                    summary.payload.thread_settings_model_seen = true;
+                    let (value, malformed) = self.parse_text_value()?;
+                    summary.payload.thread_settings_model = value;
+                    summary.payload.thread_settings_model_malformed = malformed;
+                } else {
+                    self.skip_value()?;
+                }
+            }
+            SessionJsonObject::Info => {
+                if key == SessionJsonKey::TotalTokenUsage {
+                    summary.payload.token_usage_seen = true;
+                    summary.payload.token_usage_object = false;
+                    summary.payload.token_usage = SessionTokenUsageSummary::default();
+                    if self.peek_byte()? == Some(b'{') {
+                        summary.payload.token_usage_object = true;
+                        self.parse_object(SessionJsonObject::TokenUsage, summary)?;
+                        if !summary.payload.token_usage.total_seen {
+                            summary.payload.token_usage.malformed = true;
+                        }
+                    } else {
+                        self.skip_value()?;
+                        summary.payload.token_usage.malformed = true;
+                    }
+                } else {
+                    self.skip_value()?;
+                }
+            }
+            SessionJsonObject::TokenUsage => match key {
+                SessionJsonKey::TotalTokens => {
+                    summary.payload.token_usage.total_seen = true;
+                    let (value, malformed) = self.parse_u64_value()?;
+                    summary.payload.token_usage.total = value;
+                    summary.payload.token_usage.malformed |= malformed || value.is_none();
+                }
+                SessionJsonKey::CacheWriteInputTokens => {
+                    let (value, malformed) = self.parse_u64_value()?;
+                    summary.payload.token_usage.cache_write_input = value;
+                    summary.payload.token_usage.malformed |= malformed;
+                }
+                SessionJsonKey::InputTokens => {
+                    let (value, malformed) = self.parse_u64_value()?;
+                    summary.payload.token_usage.input = value;
+                    summary.payload.token_usage.malformed |= malformed;
+                }
+                SessionJsonKey::CachedInputTokens => {
+                    let (value, malformed) = self.parse_u64_value()?;
+                    summary.payload.token_usage.cached_input = value;
+                    summary.payload.token_usage.malformed |= malformed;
+                }
+                SessionJsonKey::OutputTokens => {
+                    let (value, malformed) = self.parse_u64_value()?;
+                    summary.payload.token_usage.output = value;
+                    summary.payload.token_usage.malformed |= malformed;
+                }
+                _ => self.skip_value()?,
+            },
+        }
+        Ok(())
+    }
+
+    fn parse_key(&mut self) -> Result<SessionJsonKey, SessionRecordParseError> {
+        if self.next_required()? != b'"' {
+            return Err(SessionRecordParseError::Syntax);
+        }
+        let mut matches = [true; SESSION_JSON_KEYS.len()];
+        let mut length = 0usize;
+        loop {
+            let byte = self.next_required()?;
+            match byte {
+                b'"' => break,
+                b'\\' => {
+                    let character = self.parse_escape_character()?;
+                    if character.is_ascii() {
+                        let byte = character as u8;
+                        for (index, (candidate, _)) in SESSION_JSON_KEYS.iter().enumerate() {
+                            if matches[index] && candidate.get(length).copied() != Some(byte) {
+                                matches[index] = false;
+                            }
+                        }
+                    } else {
+                        matches.fill(false);
+                    }
+                    length = length.saturating_add(1);
+                }
+                byte if byte < 0x20 => return Err(SessionRecordParseError::Syntax),
+                byte if byte < 0x80 => {
+                    for (index, (candidate, _)) in SESSION_JSON_KEYS.iter().enumerate() {
+                        if matches[index] && candidate.get(length).copied() != Some(byte) {
+                            matches[index] = false;
+                        }
+                    }
+                    length = length.saturating_add(1);
+                }
+                byte => {
+                    self.consume_utf8_character(byte)?;
+                    matches.fill(false);
+                    length = length.saturating_add(1);
+                }
+            }
+        }
+        Ok(SESSION_JSON_KEYS
+            .iter()
+            .enumerate()
+            .find_map(|(index, (candidate, key))| {
+                (matches[index] && candidate.len() == length).then_some(*key)
+            })
+            .unwrap_or(SessionJsonKey::Other))
+    }
+
+    fn parse_text_value(&mut self) -> Result<(Option<String>, bool), SessionRecordParseError> {
+        if self.peek_byte()? == Some(b'"') {
+            let (value, truncated) = self.parse_text()?;
+            return Ok((Some(value), truncated));
+        }
+        let is_null = self.peek_byte()? == Some(b'n');
+        self.skip_value()?;
+        Ok((None, !is_null))
+    }
+
+    fn parse_text(&mut self) -> Result<(String, bool), SessionRecordParseError> {
+        if self.next_required()? != b'"' {
+            return Err(SessionRecordParseError::Syntax);
+        }
+        let mut text = String::with_capacity(usage_store::MAX_SESSION_MODEL_BYTES);
+        let mut truncated = false;
+        loop {
+            let byte = self.next_required()?;
+            match byte {
+                b'"' => return Ok((text, truncated)),
+                b'\\' => {
+                    let character = self.parse_escape_character()?;
+                    if text.len().saturating_add(character.len_utf8())
+                        <= usage_store::MAX_SESSION_MODEL_BYTES
+                    {
+                        text.push(character);
+                    } else {
+                        truncated = true;
+                    }
+                }
+                byte if byte < 0x20 => return Err(SessionRecordParseError::Syntax),
+                byte if byte < 0x80 => {
+                    if text.len() < usage_store::MAX_SESSION_MODEL_BYTES {
+                        text.push(byte as char);
+                    } else {
+                        truncated = true;
+                    }
+                }
+                byte => {
+                    let (bytes, length) = self.read_utf8_character(byte)?;
+                    let value = std::str::from_utf8(&bytes[..length])
+                        .map_err(|_| SessionRecordParseError::Syntax)?;
+                    if text.len().saturating_add(value.len())
+                        <= usage_store::MAX_SESSION_MODEL_BYTES
+                    {
+                        text.push_str(value);
+                    } else {
+                        truncated = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn skip_string(&mut self) -> Result<(), SessionRecordParseError> {
+        if self.next_required()? != b'"' {
+            return Err(SessionRecordParseError::Syntax);
+        }
+        loop {
+            let byte = self.next_required()?;
+            match byte {
+                b'"' => return Ok(()),
+                b'\\' => {
+                    self.parse_escape_character()?;
+                }
+                byte if byte < 0x20 => return Err(SessionRecordParseError::Syntax),
+                byte if byte < 0x80 => {}
+                byte => {
+                    self.consume_utf8_character(byte)?;
+                }
+            }
+        }
+    }
+
+    fn parse_escape_character(&mut self) -> Result<char, SessionRecordParseError> {
+        match self.next_required()? {
+            b'"' => Ok('"'),
+            b'\\' => Ok('\\'),
+            b'/' => Ok('/'),
+            b'b' => Ok('\u{0008}'),
+            b'f' => Ok('\u{000c}'),
+            b'n' => Ok('\n'),
+            b'r' => Ok('\r'),
+            b't' => Ok('\t'),
+            b'u' => {
+                let first = self.parse_hex_quad()?;
+                if (0xD800..=0xDBFF).contains(&first) {
+                    if self.next_required()? != b'\\' || self.next_required()? != b'u' {
+                        return Err(SessionRecordParseError::Syntax);
+                    }
+                    let second = self.parse_hex_quad()?;
+                    if !(0xDC00..=0xDFFF).contains(&second) {
+                        return Err(SessionRecordParseError::Syntax);
+                    }
+                    let codepoint = 0x1_0000
+                        + ((u32::from(first) - 0xD800) << 10)
+                        + (u32::from(second) - 0xDC00);
+                    char::from_u32(codepoint).ok_or(SessionRecordParseError::Syntax)
+                } else if (0xDC00..=0xDFFF).contains(&first) {
+                    Err(SessionRecordParseError::Syntax)
+                } else {
+                    char::from_u32(u32::from(first)).ok_or(SessionRecordParseError::Syntax)
+                }
+            }
+            _ => Err(SessionRecordParseError::Syntax),
+        }
+    }
+
+    fn parse_hex_quad(&mut self) -> Result<u16, SessionRecordParseError> {
+        let mut value = 0u16;
+        for _ in 0..4 {
+            value = (value << 4)
+                | u16::from(
+                    char::from(self.next_required()?)
+                        .to_digit(16)
+                        .ok_or(SessionRecordParseError::Syntax)? as u8,
+                );
+        }
+        Ok(value)
+    }
+
+    fn read_utf8_character(
+        &mut self,
+        first: u8,
+    ) -> Result<([u8; 4], usize), SessionRecordParseError> {
+        let length = match first {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => return Err(SessionRecordParseError::Syntax),
+        };
+        let mut bytes = [0u8; 4];
+        bytes[0] = first;
+        for byte in &mut bytes[1..length] {
+            *byte = self.next_required()?;
+            if !(*byte >= 0x80 && *byte <= 0xBF) {
+                return Err(SessionRecordParseError::Syntax);
+            }
+        }
+        std::str::from_utf8(&bytes[..length]).map_err(|_| SessionRecordParseError::Syntax)?;
+        Ok((bytes, length))
+    }
+
+    fn consume_utf8_character(&mut self, first: u8) -> Result<(), SessionRecordParseError> {
+        let _ = self.read_utf8_character(first)?;
+        Ok(())
+    }
+
+    fn parse_u64_value(&mut self) -> Result<(Option<u64>, bool), SessionRecordParseError> {
+        match self.peek_byte()? {
+            Some(b'-' | b'0'..=b'9') => {
+                let value = self.parse_number()?;
+                Ok((value, value.is_none()))
+            }
+            Some(b'n') => {
+                self.skip_value()?;
+                Ok((None, false))
+            }
+            Some(_) => {
+                self.skip_value()?;
+                Ok((None, true))
+            }
+            None => Err(SessionRecordParseError::Syntax),
+        }
+    }
+
+    fn parse_number(&mut self) -> Result<Option<u64>, SessionRecordParseError> {
+        let negative = self.consume_if(b'-')?;
+        let mut integer = true;
+        let mut overflow = false;
+        let mut value = 0u64;
+        match self.next_byte()? {
+            Some(b'0') => {
+                if matches!(self.peek_byte()?, Some(b'0'..=b'9')) {
+                    return Err(SessionRecordParseError::Syntax);
+                }
+            }
+            Some(byte @ b'1'..=b'9') => {
+                value = u64::from(byte - b'0');
+                while let Some(byte @ b'0'..=b'9') = self.peek_byte()? {
+                    let _ = self.next_byte()?;
+                    if let Some(next) = value
+                        .checked_mul(10)
+                        .and_then(|value| value.checked_add(u64::from(byte - b'0')))
+                    {
+                        value = next;
+                    } else {
+                        overflow = true;
+                    }
+                }
+            }
+            _ => return Err(SessionRecordParseError::Syntax),
+        }
+        if self.consume_if(b'.')? {
+            integer = false;
+            if !matches!(self.peek_byte()?, Some(b'0'..=b'9')) {
+                return Err(SessionRecordParseError::Syntax);
+            }
+            while matches!(self.peek_byte()?, Some(b'0'..=b'9')) {
+                let _ = self.next_byte()?;
+            }
+        }
+        if matches!(self.peek_byte()?, Some(b'e' | b'E')) {
+            integer = false;
+            let _ = self.next_byte()?;
+            if !self.consume_if(b'+')? {
+                let _ = self.consume_if(b'-')?;
+            }
+            if !matches!(self.peek_byte()?, Some(b'0'..=b'9')) {
+                return Err(SessionRecordParseError::Syntax);
+            }
+            while matches!(self.peek_byte()?, Some(b'0'..=b'9')) {
+                let _ = self.next_byte()?;
+            }
+        }
+        Ok((!negative && integer && !overflow).then_some(value))
+    }
+
+    fn parse_literal(&mut self, literal: &[u8]) -> Result<(), SessionRecordParseError> {
+        for expected in literal {
+            if self.next_required()? != *expected {
+                return Err(SessionRecordParseError::Syntax);
+            }
+        }
+        Ok(())
+    }
+
+    fn skip_value(&mut self) -> Result<(), SessionRecordParseError> {
+        self.skip_whitespace()?;
+        match self.peek_byte()? {
+            Some(b'"') => self.skip_string(),
+            Some(b'{') => self.skip_object(),
+            Some(b'[') => self.skip_array(),
+            Some(b'n') => self.parse_literal(b"null"),
+            Some(b't') => self.parse_literal(b"true"),
+            Some(b'f') => self.parse_literal(b"false"),
+            Some(b'-' | b'0'..=b'9') => self.parse_number().map(|_| ()),
+            Some(_) | None => Err(SessionRecordParseError::Syntax),
+        }
+    }
+
+    fn skip_object(&mut self) -> Result<(), SessionRecordParseError> {
+        self.enter_container()?;
+        let result = (|| {
+            if self.next_required()? != b'{' {
+                return Err(SessionRecordParseError::Syntax);
+            }
+            self.skip_whitespace()?;
+            if self.consume_if(b'}')? {
+                return Ok(());
+            }
+            loop {
+                self.skip_string()?;
+                self.skip_whitespace()?;
+                if self.next_required()? != b':' {
+                    return Err(SessionRecordParseError::Syntax);
+                }
+                self.skip_value()?;
+                self.skip_whitespace()?;
+                if self.consume_if(b'}')? {
+                    return Ok(());
+                }
+                if !self.consume_if(b',')? {
+                    return Err(SessionRecordParseError::Syntax);
+                }
+                self.skip_whitespace()?;
+                if self.peek_byte()? == Some(b'}') {
+                    return Err(SessionRecordParseError::Syntax);
+                }
+            }
+        })();
+        self.leave_container();
+        result
+    }
+
+    fn skip_array(&mut self) -> Result<(), SessionRecordParseError> {
+        self.enter_container()?;
+        let result = (|| {
+            if self.next_required()? != b'[' {
+                return Err(SessionRecordParseError::Syntax);
+            }
+            self.skip_whitespace()?;
+            if self.consume_if(b']')? {
+                return Ok(());
+            }
+            loop {
+                self.skip_value()?;
+                self.skip_whitespace()?;
+                if self.consume_if(b']')? {
+                    return Ok(());
+                }
+                if !self.consume_if(b',')? {
+                    return Err(SessionRecordParseError::Syntax);
+                }
+                self.skip_whitespace()?;
+                if self.peek_byte()? == Some(b']') {
+                    return Err(SessionRecordParseError::Syntax);
+                }
+            }
+        })();
+        self.leave_container();
+        result
+    }
+
+    fn finish_record(&mut self) -> Result<bool, SessionRecordParseError> {
+        if self.terminated {
+            return Ok(true);
+        }
+        let buffer = self
+            .reader
+            .fill_buf()
+            .map_err(|_| SessionRecordParseError::Io)?;
+        if buffer.is_empty() {
+            self.eof = true;
+            return Ok(false);
+        }
+        if buffer[0] == b'\n' {
+            self.reader.consume(1);
+            self.terminated = true;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn drain_record(&mut self) -> Result<bool, SessionRecordParseError> {
+        if self.terminated {
+            return Ok(true);
+        }
+        loop {
+            let buffer = self
+                .reader
+                .fill_buf()
+                .map_err(|_| SessionRecordParseError::Io)?;
+            if buffer.is_empty() {
+                self.eof = true;
+                return Ok(false);
+            }
+            if let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                self.saw_bytes |= position > 0;
+                self.reader.consume(position + 1);
+                self.terminated = true;
+                return Ok(true);
+            }
+            self.saw_bytes = true;
+            let length = buffer.len();
+            self.reader.consume(length);
+        }
+    }
+}
+
+fn read_streaming_session_record<R: BufRead>(
+    reader: &mut R,
+) -> Result<SessionRecordStatus, security::SecurityError> {
+    let mut input = SessionRecordInput::new(reader);
+    let parsed = input.parse_record();
+    if matches!(parsed.as_ref(), Err(SessionRecordParseError::Io)) {
+        return Err(security::SecurityError::new(
+            security::SecurityErrorKind::Io,
+        ));
+    }
+    if parsed.is_err() {
+        if !input.saw_bytes && input.eof && !input.terminated {
+            return Ok(SessionRecordStatus::End);
+        }
+        let terminated = if input.terminated {
+            true
+        } else {
+            input
+                .drain_record()
+                .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::Io))?
+        };
+        if terminated {
+            debug_runtime("skipped malformed session record kind=Parse");
+            return Ok(SessionRecordStatus::Invalid);
+        }
+        return Err(security::SecurityError::new(
+            security::SecurityErrorKind::Unterminated,
+        ));
+    }
+    if input
+        .finish_record()
+        .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::Io))?
+    {
+        return Ok(SessionRecordStatus::Present(Box::new(
+            parsed.expect("parsed record"),
+        )));
+    }
+    Err(security::SecurityError::new(
+        security::SecurityErrorKind::Unterminated,
+    ))
 }
 
 #[cfg(test)]
 fn read_recoverable_session_line<R: BufRead>(
     reader: &mut R,
 ) -> Result<Option<String>, security::SecurityError> {
-    read_recoverable_session_line_with_status(reader).map(|(line, _)| line)
-}
-
-#[cfg(test)]
-fn read_recoverable_session_line_with_status<R: BufRead>(
-    reader: &mut R,
-) -> Result<(Option<String>, bool), security::SecurityError> {
     let mut line = Vec::with_capacity(SESSION_RECORD_INITIAL_CAPACITY);
-    let (present, skipped_invalid_record) =
-        read_recoverable_session_record_into(reader, &mut line)?;
+    let present = read_recoverable_session_record_into(reader, &mut line)?;
     let line = present
         .then(|| String::from_utf8(line))
         .transpose()
         .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::Parse))?;
-    Ok((line, skipped_invalid_record))
+    Ok(line)
 }
 
+#[cfg(test)]
 fn session_event_type(value: &Value) -> Option<&str> {
     let outer_type = value.get("type").and_then(Value::as_str);
     match outer_type {
@@ -8533,6 +9724,7 @@ fn session_event_type(value: &Value) -> Option<&str> {
     }
 }
 
+#[cfg(test)]
 fn session_event_model(value: &Value) -> Option<String> {
     let payload = value.get("payload").and_then(Value::as_object);
     let root_model = value.get("model").and_then(Value::as_str);
@@ -8555,6 +9747,7 @@ fn session_event_model(value: &Value) -> Option<String> {
     (!model.trim().is_empty()).then(|| model.to_owned())
 }
 
+#[cfg(test)]
 fn session_token_snapshot(value: &Value) -> Option<TokenSnapshot> {
     if session_event_type(value) != Some("token_count") {
         return None;
@@ -8585,15 +9778,6 @@ fn session_token_snapshot(value: &Value) -> Option<TokenSnapshot> {
     })
 }
 
-fn session_event_timestamp(value: &Value) -> i64 {
-    value
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-        .map(|value| value.timestamp())
-        .unwrap_or(0)
-}
-
 fn collect_session_usage_records<R: BufRead>(
     reader: &mut R,
     window_start: i64,
@@ -8607,56 +9791,31 @@ fn collect_session_usage_records<R: BufRead>(
     let mut fully_recordable = true;
     let mut model: Option<String> = None;
     let mut previous = TokenSnapshot::default();
-    let mut line = Vec::with_capacity(SESSION_RECORD_INITIAL_CAPACITY);
     loop {
-        let present = match read_recoverable_session_record_into(reader, &mut line) {
-            Ok((present, skipped_invalid_record)) => {
-                fully_recordable &= !skipped_invalid_record;
-                present
+        let record = match read_streaming_session_record(reader) {
+            Ok(SessionRecordStatus::End) => break,
+            Ok(SessionRecordStatus::Invalid) => {
+                fully_recordable = false;
+                continue;
             }
+            Ok(SessionRecordStatus::Present(record)) => record,
             Err(error) => {
                 *totals = original;
                 events.truncate(initial_events_len);
                 return Err(error);
             }
         };
-        if !present {
-            break;
-        }
-        // Session files contain large tool payloads and assistant/user
-        // messages that cannot change model attribution or token counters.
-        // Their framing is still bounded and consumed above, but building a
-        // serde tree for each one makes a 2 GiB recovery retain memory in
-        // proportion to unrelated payloads. A missed escaped marker only
-        // makes the immutable aggregate oracle reject recovery; it can never
-        // admit an incomplete total.
-        if !session_record_may_affect_usage(&line) {
-            // Skipping allocation-heavy payload decoding must not turn a
-            // malformed complete record into cleanup authority. Validate the
-            // JSON grammar without materializing its payload so following
-            // usage records remain readable while the source stays retained.
-            if serde_json::from_slice::<serde::de::IgnoredAny>(&line).is_err() {
-                fully_recordable = false;
-            }
-            continue;
-        }
-        let value = match serde_json::from_slice::<Value>(&line) {
-            Ok(value) => value,
-            Err(_) => {
-                fully_recordable = false;
-                continue;
-            }
-        };
+        fully_recordable &= !record.usage_unparsed();
         // thread_settings_applied can precede the actual turn context. Keep
         // the previous model until turn_context confirms the model for the
         // token-count event; otherwise setup metadata is charged to the next
         // model (ccusage-compatible attribution).
-        if session_event_type(&value) != Some("thread_settings_applied") || model.is_none() {
-            if let Some(next_model) = session_event_model(&value) {
-                model = Some(next_model);
+        if record.event_type() != Some("thread_settings_applied") || model.is_none() {
+            if let Some(next_model) = record.event_model() {
+                model = Some(next_model.to_owned());
             }
         }
-        let Some(current) = session_token_snapshot(&value) else {
+        let Some(current) = record.token_snapshot() else {
             continue;
         };
         let delta = TokenSnapshot {
@@ -8667,19 +9826,18 @@ fn collect_session_usage_records<R: BufRead>(
             output: current.output.saturating_sub(previous.output),
         };
         previous = current;
-        let timestamp = session_event_timestamp(&value);
+        let timestamp = record.event_timestamp();
         if timestamp < window_start || timestamp > totals_window_end {
             continue;
         }
-        if let Some(model) = model.as_deref() {
-            totals.add(model, delta);
-            if timestamp <= timeline_window_end {
-                events.push(TimedModelUsage {
-                    timestamp,
-                    model: model.to_owned(),
-                    delta,
-                });
-            }
+        let model = model.as_deref().unwrap_or(UNATTRIBUTED_SESSION_MODEL);
+        totals.add(model, delta);
+        if timestamp <= timeline_window_end {
+            events.push(TimedModelUsage {
+                timestamp,
+                model: model.to_owned(),
+                delta,
+            });
         }
     }
     Ok(fully_recordable)
@@ -9037,7 +10195,6 @@ fn collect_session_append(
             .stream_position()
             .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?;
     }
-    let mut line = Vec::with_capacity(SESSION_RECORD_INITIAL_CAPACITY);
     let target_end = start_offset
         .saturating_add(max_append_bytes)
         .min(candidate.fingerprint.length);
@@ -9046,41 +10203,39 @@ fn collect_session_append(
         .map_err(|_| security::SecurityError::new(security::SecurityErrorKind::UnsafePath))?
         < target_end
     {
-        let (present, skipped_invalid_record) =
-            match read_recoverable_session_record_into(&mut reader, &mut line) {
-                Ok(result) => result,
-                Err(error) if error.kind() == security::SecurityErrorKind::Unterminated => {
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
-            };
-        if skipped_invalid_record {
-            return Ok(None);
-        }
-        if !present {
-            break;
-        };
-        let value = match serde_json::from_slice::<Value>(&line) {
-            Ok(value) => value,
-            Err(_) => {
+        let record = match read_streaming_session_record(&mut reader) {
+            Ok(SessionRecordStatus::End) => break,
+            Ok(SessionRecordStatus::Invalid) => return Ok(None),
+            Ok(SessionRecordStatus::Present(record)) => record,
+            Err(error) if error.kind() == security::SecurityErrorKind::Unterminated => {
                 return Ok(None);
             }
+            Err(error) => return Err(error),
         };
-        if let Some(running) =
-            session_event_type(&value).and_then(thread_contract::task_running_for_event_type)
+        if record.usage_unparsed() {
+            return Ok(None);
+        }
+        if let Some(running) = record
+            .event_type()
+            .and_then(thread_contract::task_running_for_event_type)
         {
             last_task_running = Some(running);
         }
-        if session_event_type(&value) != Some("thread_settings_applied") || model.is_none() {
-            if let Some(next_model) = session_event_model(&value) {
-                model = Some(next_model);
+        if record.event_type() != Some("thread_settings_applied") || model.is_none() {
+            if let Some(next_model) = record.event_model() {
+                model = Some(next_model.to_owned());
             }
         }
-        let Some(current) = session_token_snapshot(&value) else {
+        let Some(current) = record.token_snapshot() else {
             continue;
         };
-        if !baseline_known
-            || current.total < previous.total
+        let timestamp = record.event_timestamp();
+        if !baseline_known {
+            previous = current;
+            baseline_known = true;
+            continue;
+        }
+        if current.total < previous.total
             || current.input < previous.input
             || current.cached_input < previous.cached_input
             || current.output < previous.output
@@ -9097,19 +10252,17 @@ fn collect_session_append(
             output: current.output - previous.output,
         };
         previous = current;
-        let timestamp = session_event_timestamp(&value);
         if timestamp < window_start {
             continue;
         }
-        if let Some(model) = model.as_deref() {
-            candidate_totals.add(model, delta);
-            if timestamp <= timeline_end {
-                candidate_events.push(TimedModelUsage {
-                    timestamp,
-                    model: model.to_owned(),
-                    delta,
-                });
-            }
+        let model = model.as_deref().unwrap_or(UNATTRIBUTED_SESSION_MODEL);
+        candidate_totals.add(model, delta);
+        if timestamp <= timeline_end {
+            candidate_events.push(TimedModelUsage {
+                timestamp,
+                model: model.to_owned(),
+                delta,
+            });
         }
     }
     let end_offset = reader
@@ -9377,13 +10530,38 @@ fn collect_incremental_local_usage_with_budget(
         }
     }
     model_totals_complete &= processed_sources == inventory.selected_session_files.len();
-    let (history_samples, history_model_totals) =
+    let timeline_recovery = build_session_timeline_recovery(
+        &events,
+        reset_at,
+        window_seconds,
+        timeline_end,
+        collection_state,
+        &ranges,
+        collector_epoch,
+        cycle_seq,
+        &totals,
+    )?;
+    let (history_samples, history_model_totals) = if timeline_recovery.is_some() {
+        // The timeline marker projects the exact accepted ranges over the
+        // entire catch-up window. Keeping ordinary samples from those same
+        // events would stamp the current global total onto old timestamps.
+        (Vec::new(), Vec::new())
+    } else {
         model_usage_timeline_with_models_from_events_with_initial(
             events,
             reset_at,
             initial_totals,
             model_totals_complete,
-        );
+        )
+    };
+    let session_model_totals = if timeline_recovery.is_some() {
+        // The timeline commit validates source + exact range delta against
+        // the current vector, retaining durable zero rows while adding only
+        // models with positive accepted range usage.
+        timeline_current_model_totals(&totals, &collection_state.model_totals)
+    } else {
+        totals.history_session_totals(model_totals_complete)
+    };
     Ok(LocalUsageCollection {
         model_usage: totals.clone(),
         model_totals_complete,
@@ -9392,8 +10570,9 @@ fn collect_incremental_local_usage_with_budget(
         recorded_sessions: markers,
         session_checkpoints: changed_checkpoints,
         session_ranges: ranges,
-        session_model_totals: totals.history_session_totals(model_totals_complete),
+        session_model_totals,
         history_continuity_recovery: None,
+        timeline_recovery,
         cleanup_plan: cleanup_plan_for_inventory(inventory),
     })
 }
@@ -10627,11 +11806,48 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                         collector_epoch,
                         cycle_seq,
                     })?;
-                    if let Some(recovered) = recovered_totals {
+                    if collection.timeline_recovery.is_some() {
+                        if recovered_totals.is_some() || verified_recovery.is_some() {
+                            // Exact unread Session ranges are the only input
+                            // that can otherwise grow while this generation is
+                            // pending. Commit them first; the independent
+                            // baseline/continuity authority remains unapplied
+                            // and is derived again from durable state next
+                            // cycle.
+                            debug_runtime(
+                                "independent baseline recovery deferred: timeline recovery owns this generation",
+                            );
+                            verified_recovery = None;
+                            verified_fingerprint = None;
+                        }
+                    } else if let Some(recovered) = recovered_totals {
                         apply_regression_recovery(&mut collection, recovered);
                     }
-                    let cumulative_recovery = match cumulative_recovery {
-                        Some(recovery) => {
+                    let timeline_recovery = match collection.timeline_recovery.take() {
+                        Some(recovery) => Some(
+                            usage_store::finalize_session_timeline_recovery(
+                                &admission.partition_id,
+                                recovery,
+                            )
+                            .map_err(|_| {
+                                security::SecurityError::new(security::SecurityErrorKind::Parse)
+                            })?,
+                        ),
+                        None => None,
+                    };
+                    let cumulative_recovery = match (timeline_recovery.is_some(), cumulative_recovery) {
+                        (true, Some(_)) => {
+                            // The recorder rejects two independent recovery
+                            // classes in one generation. The cumulative
+                            // marker stays durable-unapplied and is derived
+                            // again on the next cycle after this timeline
+                            // commit.
+                            debug_runtime(
+                                "cumulative recovery deferred: timeline recovery owns this generation",
+                            );
+                            None
+                        }
+                        (false, Some(recovery)) => {
                             if apply_cumulative_recovery_to_current(&mut collection, &recovery) {
                                 Some(recovery)
                             } else if recovery.source_generation.as_ref().is_some_and(|source| {
@@ -10645,7 +11861,7 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                                 None
                             }
                         }
-                        None => None,
+                        (true, None) | (false, None) => None,
                     };
                     let verified_recovery =
                         verified_recovery.and_then(|(authority, model_totals)| {
@@ -10677,10 +11893,10 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                         cache.rejected_history_recovery = Some(fingerprint);
                     }
                     collection.history_continuity_recovery = verified_recovery;
-                    Ok((collection, cumulative_recovery))
+                    Ok((collection, cumulative_recovery, timeline_recovery))
                 });
                 match result {
-                    Ok((collection, cumulative_recovery)) => {
+                    Ok((collection, cumulative_recovery, timeline_recovery)) => {
                         debug_runtime(format!(
                             "local collect succeeded rows={} samples={}",
                             collection.model_usage.clone().rows().len(),
@@ -10706,6 +11922,7 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                             session_model_totals: collection.session_model_totals,
                             history_continuity_recovery: collection.history_continuity_recovery,
                             cumulative_recovery,
+                            timeline_recovery,
                         })));
                     }
                     Err(_) => {
@@ -10877,6 +12094,7 @@ struct PendingRecorderBatch {
     session_model_totals: Vec<usage_store::SessionModelTotal>,
     history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
     cumulative_recovery: Option<usage_store::SessionCumulativeRecovery>,
+    timeline_recovery: Option<usage_store::SessionTimelineRecovery>,
     reset_at: Option<i64>,
     window_seconds: Option<i64>,
     cleanup_plans: Vec<SessionCleanupPlan>,
@@ -10901,6 +12119,7 @@ impl PendingRecorderBatch {
             && self.session_ranges.is_empty()
             && self.session_model_totals.is_empty()
             && self.cumulative_recovery.is_none()
+            && self.timeline_recovery.is_none()
             && self.collector_epoch.is_none()
             && self.cycle_seq.is_none()
             && !self.quota_source_rescan_complete
@@ -10955,6 +12174,7 @@ struct CodexInfoState {
     pending_session_model_totals: Vec<usage_store::SessionModelTotal>,
     pending_history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
     pending_cumulative_recovery: Option<usage_store::SessionCumulativeRecovery>,
+    pending_timeline_recovery: Option<usage_store::SessionTimelineRecovery>,
     pending_collector_generation: Option<(u128, u64)>,
     pending_session_period: Option<(i64, i64)>,
     pending_recorder_admission: Option<(u64, AccountAdmission)>,
@@ -11260,12 +12480,16 @@ impl CodexInfoState {
                     .max_by_key(|observation| {
                         (
                             observation.model_totals.is_some(),
-                            observation.model_source == usage_store::ModelSource::Confirmed,
+                            model_source_rank(observation.model_source),
                         )
                     });
                 let model_totals = history_models_v3(source, sample);
                 let model_source = if sample.model_source == "unavailable" {
                     "unavailable"
+                } else if source.is_some_and(|observation| {
+                    observation.model_source == usage_store::ModelSource::ReconstructedFromSession
+                }) {
+                    "reconstructed-from-session"
                 } else if model_totals.is_some()
                     && source.is_some_and(|observation| {
                         observation.model_source == usage_store::ModelSource::Confirmed
@@ -11683,6 +12907,7 @@ impl CodexInfoState {
             pending_session_model_totals: Vec::new(),
             pending_history_continuity_recovery: None,
             pending_cumulative_recovery: None,
+            pending_timeline_recovery: None,
             pending_collector_generation: None,
             pending_session_period: None,
             pending_recorder_admission: None,
@@ -11781,6 +13006,7 @@ impl CodexInfoState {
             pending_session_model_totals: Vec::new(),
             pending_history_continuity_recovery: None,
             pending_cumulative_recovery: None,
+            pending_timeline_recovery: None,
             pending_collector_generation: None,
             pending_session_period: None,
             pending_recorder_admission: None,
@@ -11885,6 +13111,7 @@ impl CodexInfoState {
             pending_session_model_totals: Vec::new(),
             pending_history_continuity_recovery: None,
             pending_cumulative_recovery: None,
+            pending_timeline_recovery: None,
             pending_collector_generation: None,
             pending_session_period: None,
             pending_recorder_admission: None,
@@ -13294,6 +14521,20 @@ impl CodexInfoState {
                 })
             })
             .flatten();
+        if period_boundary {
+            if let Some(retained) = load_started_boundary_collection_state(
+                partition,
+                collection_state.data_generation,
+                canonical_reset_at,
+                canonical_window_seconds,
+                observed_at,
+            ) {
+                // Totals and checkpoints are one atomic collection state. A
+                // partial restore would make the next incremental scan apply
+                // an old checkpoint to a new-period total.
+                collection_state = retained;
+            }
+        }
         debug_runtime(format!(
             "local collection period admitted transition={period_transition:?} durable_generation={}",
             collection_state.data_generation,
@@ -13350,6 +14591,7 @@ impl CodexInfoState {
             session_model_totals: std::mem::take(&mut self.pending_session_model_totals),
             history_continuity_recovery: self.pending_history_continuity_recovery.take(),
             cumulative_recovery: self.pending_cumulative_recovery.take(),
+            timeline_recovery: self.pending_timeline_recovery.take(),
             reset_at: period.map(|value| value.0),
             window_seconds: period.map(|value| value.1),
             cleanup_plans: std::mem::take(&mut self.pending_session_cleanup),
@@ -13365,6 +14607,7 @@ impl CodexInfoState {
             || !self.pending_session_model_totals.is_empty()
             || self.pending_history_continuity_recovery.is_some()
             || self.pending_cumulative_recovery.is_some()
+            || self.pending_timeline_recovery.is_some()
             || self.pending_collector_generation.is_some()
             || self.pending_session_period.is_some()
             || self.pending_recorder_admission.is_some()
@@ -13408,6 +14651,9 @@ impl CodexInfoState {
         if batch.cumulative_recovery.is_some() {
             self.pending_cumulative_recovery = batch.cumulative_recovery;
         }
+        if batch.timeline_recovery.is_some() {
+            self.pending_timeline_recovery = batch.timeline_recovery;
+        }
         self.pending_collector_generation = batch.collector_epoch.zip(batch.cycle_seq);
         self.pending_quota_source_rescan_complete = batch.quota_source_rescan_complete;
         self.pending_session_period = batch.reset_at.zip(batch.window_seconds);
@@ -13426,6 +14672,7 @@ impl CodexInfoState {
         self.pending_session_model_totals.clear();
         self.pending_history_continuity_recovery = None;
         self.pending_cumulative_recovery = None;
+        self.pending_timeline_recovery = None;
         self.pending_collector_generation = None;
         self.pending_quota_source_rescan_complete = false;
         self.pending_session_period = None;
@@ -13481,6 +14728,7 @@ impl CodexInfoState {
         self.pending_session_model_totals.clear();
         self.pending_history_continuity_recovery = None;
         self.pending_cumulative_recovery = None;
+        self.pending_timeline_recovery = None;
         self.pending_collector_generation = None;
         self.pending_session_period = None;
         self.pending_recorder_admission = None;
@@ -14055,10 +15303,16 @@ impl CodexInfoState {
                         model_tokens,
                     )
                 });
-            self.history.record_with_models(
+            let model_source = if self.pending_timeline_recovery.is_some() {
+                usage_store::ModelSource::ReconstructedFromSession
+            } else {
+                usage_store::ModelSource::Confirmed
+            };
+            self.history.record_with_models_from_source(
                 sample,
                 Some(current_model_totals),
                 result.model_totals_complete,
+                model_source,
             );
         }
         self.refresh_partial_failure_status();
@@ -14132,6 +15386,7 @@ impl CodexInfoState {
         let fallback_start = self.history.pending_store_samples.len();
         let mut history_continuity_recovery = candidate.history_continuity_recovery;
         self.pending_cumulative_recovery = candidate.cumulative_recovery;
+        self.pending_timeline_recovery = candidate.timeline_recovery;
         self.pending_session_checkpoints = candidate.session_checkpoints;
         self.pending_session_ranges = candidate.session_ranges;
         self.pending_session_model_totals = candidate.session_model_totals;
@@ -14948,9 +16203,9 @@ impl CodexInfoState {
     /// Build graph input from the same canonical rows as the public details
     /// projection, while retaining source quality that the legacy nine-field
     /// sample cannot carry. Untrusted complete rows become unreliable points;
-    /// unavailable quota-only observations become bounded unreliable points
-    /// in their canonical period. Neither case is extended through an
-    /// open-ended local gap.
+    /// Reconstructed session rows and unavailable quota-only observations
+    /// become bounded unreliable points in their canonical period. Neither
+    /// case is extended through an open-ended local gap.
     fn graph_samples_for_selection(
         &self,
         selected_reset: i64,
@@ -14963,22 +16218,32 @@ impl CodexInfoState {
         let source_by_sample = canonical_model_sources(&self.history.observations, &samples);
         // Legacy resources cannot name the acquisition source, but their
         // complete numeric model vector is still an observed value, not an
-        // inferred one. Only an explicitly unavailable source marks a model
-        // minute as unobserved; confirmed gaps remain responsible for the
-        // dashed interval between observations.
+        // inferred one. Reconstructed rows are source-backed but remain
+        // untrusted for graph reliability; confirmed gaps remain responsible
+        // for the dashed interval between observations.
         let mut untrusted_minutes = samples
             .iter()
             .filter(|sample| {
-                source_by_sample.get(&(sample.reset_at, sample.timestamp))
-                    == Some(&usage_store::ModelSource::Unavailable)
+                matches!(
+                    source_by_sample.get(&(sample.reset_at, sample.timestamp)),
+                    Some(
+                        &usage_store::ModelSource::Unavailable
+                            | &usage_store::ModelSource::ReconstructedFromSession
+                    )
+                )
             })
             .map(|sample| sample.timestamp.div_euclid(60) * 60)
             .collect::<BTreeSet<_>>();
         let confirmed_minutes = samples
             .iter()
             .filter(|sample| {
-                source_by_sample.get(&(sample.reset_at, sample.timestamp))
-                    != Some(&usage_store::ModelSource::Unavailable)
+                !matches!(
+                    source_by_sample.get(&(sample.reset_at, sample.timestamp)),
+                    Some(
+                        &usage_store::ModelSource::Unavailable
+                            | &usage_store::ModelSource::ReconstructedFromSession
+                    )
+                )
             })
             .map(|sample| sample.timestamp.div_euclid(60) * 60)
             .collect::<BTreeSet<_>>();
@@ -15040,8 +16305,9 @@ impl CodexInfoState {
                 .as_deref()
                 .and_then(|models| models.iter().find(|model| model.model == model_name));
             let minute = observation.timestamp.div_euclid(60) * 60;
-            let complete = observation.model_source == usage_store::ModelSource::Confirmed
-                && observation.model_totals_complete;
+            let reconstructed =
+                observation.model_source == usage_store::ModelSource::ReconstructedFromSession;
+            let complete = observation.model_totals_complete;
             let Some(model) = model else {
                 let legacy = if observation.model_source != usage_store::ModelSource::Unavailable {
                     match model_name {
@@ -15068,7 +16334,7 @@ impl CodexInfoState {
                         GraphModelPoint {
                             dollar,
                             tokens,
-                            reliable: true,
+                            reliable: !reconstructed,
                             published: true,
                         },
                     );
@@ -15083,7 +16349,7 @@ impl CodexInfoState {
                         GraphModelPoint {
                             dollar: 0.0,
                             tokens: 0.0,
-                            reliable: true,
+                            reliable: !reconstructed,
                             published: false,
                         },
                     );
@@ -15092,8 +16358,7 @@ impl CodexInfoState {
             };
             // Completeness describes the model set, not the evidence quality
             // of a row that is present. A row recovered from the session log
-            // is observed and stays solid; only an interval where this model
-            // itself is absent may be inferred.
+            // is source-backed but remains unreliable for graph rendering.
             let dollar = match model_name {
                 "SOL" => observation.sol_dollars,
                 "TERRA" => observation.terra_dollars,
@@ -15116,7 +16381,7 @@ impl CodexInfoState {
                 GraphModelPoint {
                     dollar,
                     tokens: model.total_tokens as f64,
-                    reliable: true,
+                    reliable: !reconstructed,
                     published: true,
                 },
             );
@@ -19593,6 +20858,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                 session_model_totals,
                                 history_continuity_recovery,
                                 cumulative_recovery,
+                                timeline_recovery,
                                 reset_at,
                                 window_seconds,
                                 cleanup_plans,
@@ -19643,6 +20909,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                 || !session_model_totals.is_empty()
                                 || history_continuity_recovery.is_some()
                                 || cumulative_recovery.is_some()
+                                || timeline_recovery.is_some()
                             {
                                 let Some(batch_partition_id) = partition_id.as_ref() else {
                                     state.apply_identity_error(
@@ -19662,6 +20929,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                     active_recorder_partition = None;
                                     return Err("recorder batch account partition mismatch".into());
                                 }
+                                let timeline_history_recovered = timeline_recovery.is_some();
                                 let commit_ack = match recorder.store_generation(
                                     batch_partition_id.clone(),
                                     daemon::RecorderGeneration {
@@ -19685,6 +20953,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                         session_model_totals,
                                         history_continuity_recovery,
                                         cumulative_recovery,
+                                        timeline_recovery,
                                         quota_source_rescan_complete,
                                     },
                                 ) {
@@ -19713,6 +20982,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                 state.acknowledge_recorder_commit(batch_admission, commit_ack);
                                 let refreshed = if legacy_history_bridged
                                     || cumulative_history_recovered
+                                    || timeline_history_recovered
                                 {
                                     state.history.refresh_from_store(Utc::now())
                                 } else {
@@ -24752,6 +26022,128 @@ mod tests {
     }
 
     #[test]
+    fn incremental_collection_streams_large_compacted_record() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-incremental-oversized-record-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("active.jsonl");
+        let now = Utc::now();
+        let token_event = |total| {
+            json!({
+                "timestamp": now.to_rfc3339(),
+                "type": "event_msg",
+                "payload": {"type": "token_count", "info": {"total_token_usage": {
+                    "total_tokens": total, "input_tokens": total,
+                    "cached_input_tokens": 0, "output_tokens": 0
+                }}}
+            })
+        };
+        let compacted = format!(
+            "{{\"type\":\"compacted\",\"payload\":{{\"message\":\"{}\"}}}}",
+            "x".repeat(security::MAX_JSONL_LINE_BYTES + 128)
+        );
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                json!({"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}),
+                token_event(100),
+                compacted,
+                token_event(250)
+            ),
+        )
+        .unwrap();
+
+        let inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let collection = super::collect_incremental_local_usage_with_budget(
+            &inventory,
+            &super::usage_store::SessionCollectionState::default(),
+            &BTreeSet::new(),
+            super::IncrementalSessionContext {
+                reset_at: now.timestamp() + 3_600,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: false,
+                collector_epoch: 1,
+                cycle_seq: 1,
+            },
+            super::SESSION_APPEND_BYTES_PER_CYCLE,
+        )
+        .unwrap();
+
+        assert!(collection.model_totals_complete);
+        assert_eq!(collection.model_usage.sol.tokens, 250);
+        assert_eq!(collection.session_checkpoints.len(), 1);
+        assert_eq!(
+            collection.session_checkpoints[0].committed_offset,
+            fs::metadata(&path).unwrap().len()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incremental_collection_does_not_checkpoint_after_large_malformed_record() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-incremental-malformed-record-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("active.jsonl");
+        let now = Utc::now();
+        let context = json!({
+            "timestamp": now.to_rfc3339(),
+            "type": "turn_context",
+            "payload": {"model": "gpt-5.6-sol"}
+        });
+        let token_event = json!({
+            "timestamp": now.to_rfc3339(),
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": {
+                "total_tokens": 250, "input_tokens": 250,
+                "cached_input_tokens": 0, "output_tokens": 0
+            }}}
+        });
+        let malformed = format!(
+            "{{\"type\":\"compacted\",\"payload\":{{\"message\":\"{}\"}}",
+            "x".repeat(security::MAX_JSONL_LINE_BYTES + 128)
+        );
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::to_string(&context).unwrap(),
+                malformed,
+                serde_json::to_string(&token_event).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let inventory = local_input_inventory_for_paths(Some(&root), None).unwrap();
+        let collection = super::collect_incremental_local_usage_with_budget(
+            &inventory,
+            &super::usage_store::SessionCollectionState::default(),
+            &BTreeSet::new(),
+            super::IncrementalSessionContext {
+                reset_at: now.timestamp() + 3_600,
+                window_seconds: WEEK_SECONDS,
+                baseline_existing: false,
+                collector_epoch: 1,
+                cycle_seq: 1,
+            },
+            super::SESSION_APPEND_BYTES_PER_CYCLE,
+        )
+        .unwrap();
+
+        assert!(!collection.model_totals_complete);
+        assert!(collection.session_checkpoints.is_empty());
+        assert_eq!(collection.model_usage.sol.tokens, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn astra_session_delta_survives_database_restart_without_duplicate_tokens() {
         use super::usage_store::{SessionCollectionCommit, StoragePartitionIdentity, UsageStore};
         let root = std::env::temp_dir().join(format!(
@@ -25269,6 +26661,24 @@ mod tests {
             now + 60,
             window,
         ));
+
+        // A replacement weekly window can legitimately start before the
+        // previously advertised deadline (for example after an account-side
+        // quota rollover). Its own start boundary is durable time evidence:
+        // it follows the last accepted observation and has already begun.
+        let previous_observed = 1_789_018_740;
+        let previous_reset = 1_789_437_490;
+        let next_observed = 1_789_018_800;
+        let next_reset = 1_789_623_591;
+        assert!(reset_transition_is_boundary(
+            Some(previous_reset),
+            Some(0.0),
+            next_reset,
+            Some(100.0),
+            Some(previous_observed),
+            next_observed,
+            window,
+        ));
     }
 
     #[test]
@@ -25414,7 +26824,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_authority_is_selected_only_for_one_unambiguous_predeadline_period() {
+    fn retained_authority_never_overrides_a_new_window_that_has_already_started() {
         let observed_a = 1_789_004_280;
         let observed_c = 1_789_018_800;
         let reset_a = 1_789_437_490;
@@ -25432,26 +26842,26 @@ mod tests {
                 ..super::usage_store::SessionCollectionState::default()
             }
         };
-        let corrupted = state(100, reset_c, observed_c, 100.0);
+        let started_new_window = state(100, reset_c, observed_c, 100.0);
         let newest_a = state(90, reset_a, observed_a, 9.0);
         let older_a = state(80, reset_a, observed_a - 60, 10.0);
         let expired = state(70, observed_a - 1, observed_a - 60, 1.0);
 
+        assert!(super::select_predeadline_quota_authority(
+            &started_new_window,
+            &[older_a.clone(), expired, newest_a.clone()],
+        )
+        .is_none());
+
+        let premature_alias = state(100, reset_b, observed_c, 17.0);
         assert_eq!(
             super::select_predeadline_quota_authority(
-                &corrupted,
-                &[older_a.clone(), expired, newest_a.clone()],
+                &premature_alias,
+                &[older_a.clone(), newest_a.clone()],
             )
             .map(|selected| selected.data_generation),
             Some(newest_a.data_generation)
         );
-
-        let conflicting = state(95, reset_b, observed_a + 60, 17.0);
-        assert!(super::select_predeadline_quota_authority(
-            &corrupted,
-            &[newest_a.clone(), conflicting],
-        )
-        .is_none());
 
         let true_boundary = state(101, reset_c, reset_a, 100.0);
         assert!(super::select_predeadline_quota_authority(&true_boundary, &[newest_a]).is_none());
@@ -25553,6 +26963,74 @@ mod tests {
             super::QuotaTransition::Boundary
         );
         assert!(rollover.model_totals.is_empty());
+    }
+
+    #[test]
+    fn started_boundary_restores_one_atomic_retained_collection_state() {
+        let observed_at = 1_789_027_320;
+        let reset_at = 1_789_623_591;
+        let checkpoint = super::usage_store::SessionCheckpoint {
+            previous_cache_write_input: Some(0),
+            root_identity: "11".repeat(32),
+            relative_path: "session.jsonl".into(),
+            file_device: 1,
+            file_inode: 2,
+            committed_offset: 100,
+            discard_until_lf: false,
+            collector_epoch: 3,
+            cycle_seq: 4,
+            prefix_generation: 5,
+            prefix_sha256: "22".repeat(32),
+            fully_attributed_from_zero: true,
+            token_baseline_known: true,
+            last_model: Some("LUNA".into()),
+            last_task_running: Some(false),
+            previous_total: 686_397,
+            previous_input: 674_095,
+            previous_cached_input: 546_560,
+            previous_output: 12_302,
+        };
+        let retained = super::usage_store::SessionCollectionState {
+            data_generation: 9_800,
+            reset_at,
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(3),
+            cycle_seq: 4,
+            last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
+                observed_at,
+                remaining_percent: 93.0,
+            }),
+            checkpoints: vec![checkpoint],
+            model_totals: vec![super::usage_store::SessionModelTotal {
+                model: "LUNA".into(),
+                total_tokens: 686_397,
+                input_tokens: 674_095,
+                cached_input_tokens: 546_560,
+                output_tokens: 12_302,
+                cache_write_input_tokens: Some(0),
+            }],
+        };
+        let old_period = super::usage_store::SessionCollectionState {
+            data_generation: 9_799,
+            reset_at: 1_789_437_490,
+            window_seconds: WEEK_SECONDS,
+            last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
+                observed_at: 1_789_018_740,
+                remaining_percent: 0.0,
+            }),
+            ..super::usage_store::SessionCollectionState::default()
+        };
+
+        assert_eq!(
+            super::select_started_boundary_collection_state(
+                9_822,
+                reset_at,
+                WEEK_SECONDS,
+                observed_at + 1,
+                &[old_period, retained.clone()],
+            ),
+            Some(retained)
+        );
     }
 
     #[test]
@@ -27242,6 +28720,7 @@ mod tests {
             }],
             history_continuity_recovery: None,
             cumulative_recovery: None,
+            timeline_recovery: None,
         });
         state.local_usage_pending = true;
 
@@ -30860,9 +32339,554 @@ mod tests {
     }
 
     #[test]
-    fn oversized_tool_records_do_not_hide_following_usage_samples() {
+    fn session_timeline_recovery_uses_current_anchor_without_quota_observation() {
+        let reset_at = 2_400;
+        let window_seconds = 1_800;
+        let collector_epoch = 9_u128;
+        let cycle_seq = 2_u64;
+        let collection_state = usage_store::SessionCollectionState {
+            data_generation: 7,
+            reset_at,
+            window_seconds,
+            last_quota_observation: None,
+            model_totals: vec![usage_store::SessionModelTotal {
+                model: "SOL".into(),
+                total_tokens: 0,
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+            }],
+            ..usage_store::SessionCollectionState::default()
+        };
+        let ranges = vec![usage_store::SessionRange {
+            root_identity: "root".into(),
+            relative_path: "sessions.jsonl".into(),
+            file_device: 1,
+            file_inode: 2,
+            start_offset: 0,
+            end_offset: 3,
+            collector_epoch,
+            cycle_seq,
+            prefix_generation: 4,
+            record_sha256: "a".repeat(64),
+        }];
+        let event = |timestamp, total| TimedModelUsage {
+            timestamp,
+            model: "SOL".into(),
+            delta: TokenSnapshot {
+                total,
+                input: total,
+                cached_input: 0,
+                output: 0,
+                cache_write_input: Some(0),
+            },
+        };
+        let events = vec![event(1_140, 10), event(1_320, 20), event(1_830, 5)];
+        let mut collected_totals =
+            ModelUsageTotals::from_session_totals(&collection_state.model_totals);
+        for event in &events {
+            collected_totals.add(&event.model, event.delta);
+        }
+        let recovery = super::build_session_timeline_recovery(
+            &events,
+            reset_at,
+            window_seconds,
+            1_859,
+            &collection_state,
+            &ranges,
+            collector_epoch,
+            cycle_seq,
+            &collected_totals,
+        )
+        .unwrap()
+        .expect("durable quota lag requires timeline catch-up");
+
+        assert_eq!(recovery.projection_end_exclusive, 1_800);
+        assert_eq!(
+            recovery
+                .points
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>(),
+            vec![1_140, 1_320]
+        );
+        assert_eq!(recovery.source_data_generation, 7);
+        assert_eq!(
+            recovery
+                .source_model_totals
+                .iter()
+                .map(|total| total.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SOL"]
+        );
+        assert_eq!(
+            recovery
+                .final_offset_model_totals
+                .iter()
+                .find(|total| total.model == "SOL")
+                .map(|total| total.total_tokens),
+            Some(35)
+        );
+        assert!(recovery
+            .final_offset_model_totals
+            .iter()
+            .all(super::session_model_total_has_usage));
+        let mut expected = ModelUsageTotals::from_session_totals(&recovery.source_model_totals);
+        let final_offset =
+            ModelUsageTotals::from_session_totals(&recovery.final_offset_model_totals);
+        expected.checked_add_totals(&final_offset).unwrap();
+        assert_eq!(expected, collected_totals);
+        assert_eq!(
+            super::timeline_current_model_totals(&expected, &recovery.source_model_totals)
+                .iter()
+                .map(|total| total.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SOL"]
+        );
+        assert_ne!(expected, {
+            let mut double_applied = expected.clone();
+            double_applied.checked_add_totals(&final_offset).unwrap();
+            double_applied
+        });
+    }
+
+    #[test]
+    #[ignore = "requires the fixed Issue #134 database and Session snapshot"]
+    fn issue134_fixed_snapshot_recovers_exact_session_suffix_on_an_isolated_clone() {
+        const EXPECTED_DB_SHA256: &str =
+            "a79587970dd013e7341b974d10721058dd4627c47c49c77a74e64dd066c1b0f4";
+        const EXPECTED_SESSION_SHA256: &str =
+            "9066a53be90620ee26a7b1d2ba93df30c7e342864d472800516404b0625b8860";
+        const EXPECTED_RANGE_SHA256: &str =
+            "755fb7ba24cfd0fcdb2b82e4f19f90fbb375451e973dfc367d5b425d11f65119";
+        const START_OFFSET: u64 = 161_507_293;
+        const END_OFFSET: u64 = 345_979_457;
+        const EXPECTED_SOL: (u64, u64, u64, u64) =
+            (1_019_439_069, 1_016_478_969, 1_001_867_136, 2_960_100);
+
+        let database = std::env::var_os("CODEX_INFO_ISSUE134_DB_GATE")
+            .map(PathBuf::from)
+            .expect("CODEX_INFO_ISSUE134_DB_GATE must name the fixed database snapshot");
+        let session = std::env::var_os("CODEX_INFO_ISSUE134_SESSION_GATE")
+            .map(PathBuf::from)
+            .expect("CODEX_INFO_ISSUE134_SESSION_GATE must name the fixed Session snapshot");
+        let hash_file = |path: &std::path::Path| {
+            let length = fs::metadata(path).unwrap().len();
+            super::sha256_file_range(&mut File::open(path).unwrap(), 0, length).unwrap()
+        };
+        assert_eq!(hash_file(&database), EXPECTED_DB_SHA256);
+        assert_eq!(hash_file(&session), EXPECTED_SESSION_SHA256);
+        assert_eq!(fs::metadata(&session).unwrap().len(), END_OFFSET);
+        assert_eq!(
+            super::sha256_file_range(&mut File::open(&session).unwrap(), START_OFFSET, END_OFFSET,)
+                .unwrap(),
+            EXPECTED_RANGE_SHA256
+        );
+
+        let source = rusqlite::Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .unwrap();
+        source.pragma_update(None, "query_only", true).unwrap();
+        let identity = source
+            .query_row(
+                "SELECT schema_version, profile_scope_id, account_scope_id,
+                        storage_epoch, partition_id
+                 FROM storage_partition WHERE singleton=1",
+                [],
+                |row| {
+                    Ok(usage_store::StoragePartitionIdentity {
+                        schema_version: row.get(0)?,
+                        profile_scope_id: row.get(1)?,
+                        account_scope_id: row.get(2)?,
+                        storage_epoch: row
+                            .get::<_, String>(3)?
+                            .parse()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        partition_id: row.get(4)?,
+                    })
+                },
+            )
+            .unwrap();
+        let original_generation = source
+            .query_row(
+                "SELECT data_generation FROM collection_generation WHERE singleton=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!(original_generation, 9_959);
+        let original_history_count = source
+            .query_row("SELECT COUNT(*) FROM usage_history", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let original_model_history_count = source
+            .query_row("SELECT COUNT(*) FROM usage_model_history", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let original_max_timestamp = source
+            .query_row("SELECT MAX(timestamp) FROM usage_history", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let clone_root = std::env::temp_dir().join(format!(
+            "codex-info-issue134-fixed-clone-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&clone_root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&clone_root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let clone_path = clone_root.join("usage_history.sqlite3");
+        let mut destination = rusqlite::Connection::open(&clone_path).unwrap();
+        {
+            let backup = rusqlite::backup::Backup::new(&source, &mut destination).unwrap();
+            assert!(matches!(
+                backup.step(-1).unwrap(),
+                rusqlite::backup::StepResult::Done
+            ));
+        }
+        drop(destination);
+        drop(source);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&clone_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // Migrate only the isolated clone, then make any mutation of an
+        // already-existing history row abort the recovery transaction.
+        drop(UsageStore::open_partitioned(&clone_path, &identity).unwrap());
+        let guard = rusqlite::Connection::open(&clone_path).unwrap();
+        guard
+            .execute_batch(&format!(
+                "CREATE TRIGGER issue134_keep_history_update
+                   BEFORE UPDATE ON usage_history
+                   WHEN OLD.timestamp <= {original_max_timestamp}
+                   BEGIN SELECT RAISE(ABORT, 'existing usage_history update'); END;
+                 CREATE TRIGGER issue134_keep_history_delete
+                   BEFORE DELETE ON usage_history
+                   WHEN OLD.timestamp <= {original_max_timestamp}
+                   BEGIN SELECT RAISE(ABORT, 'existing usage_history delete'); END;
+                 CREATE TRIGGER issue134_keep_models_update
+                   BEFORE UPDATE ON usage_model_history
+                   WHEN OLD.timestamp <= {original_max_timestamp}
+                   BEGIN SELECT RAISE(ABORT, 'existing usage_model_history update'); END;
+                 CREATE TRIGGER issue134_keep_models_delete
+                   BEFORE DELETE ON usage_model_history
+                   WHEN OLD.timestamp <= {original_max_timestamp}
+                   BEGIN SELECT RAISE(ABORT, 'existing usage_model_history delete'); END;"
+            ))
+            .unwrap();
+        drop(guard);
+
+        let metadata = fs::symlink_metadata(&session).unwrap();
+        let fingerprint = super::local_input_file_fingerprint(&session, &metadata).unwrap();
+        let mut store = UsageStore::open_partitioned(&clone_path, &identity).unwrap();
+        let initial_state = store.load_session_collection_state().unwrap();
+        assert_eq!(initial_state.data_generation, original_generation);
+        let prior = initial_state
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.committed_offset == START_OFFSET)
+            .expect("fixed durable checkpoint");
+        assert_eq!(prior.last_model.as_deref(), Some("SOL"));
+        assert_eq!(prior.previous_total, 77_858_168);
+        let candidate = SessionFileCandidate {
+            fingerprint: fingerprint.clone(),
+            recorded_source: usage_store::RecordedSessionSource {
+                root_identity: prior.root_identity.clone(),
+                relative_path: prior.relative_path.clone(),
+                file_bytes: fingerprint.length,
+                modified_nanos: fingerprint.modified_nanos,
+                file_device: prior.file_device,
+                file_inode: prior.file_inode,
+            },
+        };
+        let inventory = super::LocalInputInventory {
+            selected_session_files: vec![candidate],
+            overflow_session_files: Vec::new(),
+            sessions_root: None,
+            recovery_path: None,
+            fingerprint: super::LocalInputFingerprint {
+                session_files: vec![fingerprint],
+                recovery_file: None,
+            },
+        };
+
+        let collector_epoch = 0x134_u128;
+        let mut committed_ranges = Vec::new();
+        let mut timeline_commits = 0_u64;
+        let mut final_anchor = None;
+        for cycle_seq in 1..=8_u64 {
+            let state = store.load_session_collection_state().unwrap();
+            let mut collection = super::collect_incremental_local_usage_with_budget(
+                &inventory,
+                &state,
+                &std::collections::BTreeSet::new(),
+                super::IncrementalSessionContext {
+                    reset_at: state.reset_at,
+                    window_seconds: state.window_seconds,
+                    baseline_existing: false,
+                    collector_epoch,
+                    cycle_seq,
+                },
+                super::SESSION_APPEND_BYTES_PER_CYCLE,
+            )
+            .unwrap();
+            assert_eq!(collection.session_ranges.len(), 1, "cycle made no progress");
+            committed_ranges.extend(collection.session_ranges.iter().cloned());
+            let finished = collection
+                .session_checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.committed_offset == END_OFFSET);
+            let recovery = collection.timeline_recovery.take().map(|recovery| {
+                usage_store::finalize_session_timeline_recovery(&identity.partition_id, recovery)
+                    .unwrap()
+            });
+            timeline_commits += u64::from(recovery.is_some());
+            let anchor_at = recovery
+                .as_ref()
+                .map(|recovery| recovery.projection_end_exclusive)
+                .unwrap_or_else(|| {
+                    super::canonical_session_minute(
+                        chrono::Utc::now().timestamp().min(state.reset_at),
+                    )
+                })
+                .max(original_max_timestamp + 60);
+            let (samples, observations) = if finished {
+                let costs = collection.model_usage.dollar_totals();
+                let tokens = collection.model_usage.token_totals();
+                let sample = usage_store::UsageHistorySample {
+                    timestamp: anchor_at,
+                    reset_at: state.reset_at,
+                    remaining_percent: None,
+                    sol_dollars: costs.sol,
+                    terra_dollars: costs.terra,
+                    luna_dollars: costs.luna,
+                    sol_tokens: tokens.sol,
+                    terra_tokens: tokens.terra,
+                    luna_tokens: tokens.luna,
+                };
+                let mut observation = usage_store::UsageHistoryObservation::confirmed_with_models(
+                    &sample,
+                    collection.session_model_totals.clone(),
+                );
+                observation.model_source = usage_store::ModelSource::ReconstructedFromSession;
+                observation.model_totals_complete = collection.model_totals_complete;
+                final_anchor = Some(anchor_at);
+                (vec![sample], vec![observation])
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            let commit = || usage_store::SessionCollectionCommit {
+                reset_at: state.reset_at,
+                window_seconds: state.window_seconds,
+                collector_epoch,
+                cycle_seq,
+                samples: &samples,
+                checkpoints: &collection.session_checkpoints,
+                ranges: &collection.session_ranges,
+                model_totals: &collection.session_model_totals,
+                recorded_sessions: &collection.recorded_sessions,
+            };
+            let committed = match recovery.as_ref() {
+                Some(recovery) => store
+                    .commit_session_collection_with_timeline_recovery(
+                        commit(),
+                        &observations,
+                        recovery,
+                    )
+                    .unwrap(),
+                None => store
+                    .commit_session_collection_with_observations(commit(), &observations)
+                    .unwrap(),
+            };
+            assert_eq!(committed.data_generation, state.data_generation + 1);
+            if let Some(recovery) = recovery.as_ref() {
+                let replay = store
+                    .commit_session_collection_with_timeline_recovery(
+                        commit(),
+                        &observations,
+                        recovery,
+                    )
+                    .unwrap();
+                assert_eq!(replay.data_generation, committed.data_generation);
+            }
+            if finished {
+                break;
+            }
+        }
+
+        committed_ranges.sort_by_key(|range| range.start_offset);
+        let mut next_offset = START_OFFSET;
+        for range in &committed_ranges {
+            assert_eq!(range.start_offset, next_offset);
+            assert!(range.end_offset > range.start_offset);
+            next_offset = range.end_offset;
+        }
+        assert_eq!(next_offset, END_OFFSET);
+        assert!(timeline_commits > 0);
+        let state = store.load_session_collection_state().unwrap();
+        let sol = state
+            .model_totals
+            .iter()
+            .find(|total| total.model == "SOL")
+            .unwrap();
+        assert_eq!(
+            (
+                sol.total_tokens,
+                sol.input_tokens,
+                sol.cached_input_tokens,
+                sol.output_tokens,
+            ),
+            EXPECTED_SOL
+        );
+        assert_eq!(
+            state
+                .model_totals
+                .iter()
+                .find(|total| total.model == "LUNA")
+                .map(|total| total.total_tokens),
+            Some(84_981_552)
+        );
+        assert_eq!(
+            state
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.root_identity == prior.root_identity
+                    && checkpoint.relative_path == prior.relative_path
+                    && checkpoint.file_device == prior.file_device
+                    && checkpoint.file_inode == prior.file_inode)
+                .map(|checkpoint| checkpoint.committed_offset),
+            Some(END_OFFSET)
+        );
+        let anchor_at = final_anchor.expect("fixed suffix must reach one final anchor");
+        let anchor = store
+            .load_all()
+            .unwrap()
+            .into_iter()
+            .find(|sample| sample.timestamp == anchor_at && sample.reset_at == state.reset_at)
+            .expect("corrected current anchor");
+        assert_eq!(anchor.remaining_percent, None);
+        assert_eq!(anchor.sol_tokens, EXPECTED_SOL.0);
+        assert!((anchor.sol_dollars - 662.795_733).abs() < 0.000_000_5);
+        let anchor_observation = store
+            .load_recent_observations(chrono::Utc::now())
+            .unwrap()
+            .into_iter()
+            .find(|observation| {
+                observation.timestamp == anchor_at && observation.reset_at == state.reset_at
+            })
+            .expect("corrected anchor provenance");
+        assert_eq!(
+            anchor_observation.model_source,
+            usage_store::ModelSource::ReconstructedFromSession
+        );
+        drop(store);
+
+        let readback = rusqlite::Connection::open_with_flags(
+            &clone_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .unwrap();
+        let (history_count, model_history_count, recovery_count): (i64, i64, i64) = readback
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM usage_history),
+                    (SELECT COUNT(*) FROM usage_model_history),
+                    (SELECT COUNT(*) FROM session_timeline_recoveries)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(history_count, original_history_count + 1);
+        assert!(model_history_count > original_model_history_count);
+        assert_eq!(recovery_count as u64, timeline_commits);
+        let quick_check = readback
+            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+        drop(readback);
+
+        assert_eq!(hash_file(&database), EXPECTED_DB_SHA256);
+        assert_eq!(hash_file(&session), EXPECTED_SESSION_SHA256);
+        fs::remove_file(&clone_path).unwrap();
+        fs::remove_dir(&clone_root).unwrap();
+    }
+
+    #[test]
+    fn unknown_initial_session_cumulative_is_retained_before_model_context() {
         let path = std::env::temp_dir().join(format!(
-            "codex-info-oversized-session-{}.jsonl",
+            "codex-info-unknown-session-model-{}.jsonl",
+            std::process::id()
+        ));
+        let unknown_initial = json!({
+            "timestamp": "2026-08-11T10:00:00Z",
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": {
+                "total_tokens": 100, "input_tokens": 100,
+                "cached_input_tokens": 0, "output_tokens": 0
+            }}}
+        });
+        let context = json!({
+            "timestamp": "2026-08-11T10:00:01Z",
+            "type": "turn_context",
+            "model": "gpt-5.6-sol"
+        });
+        let known_delta = json!({
+            "timestamp": "2026-08-11T10:00:02Z",
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {"total_token_usage": {
+                "total_tokens": 130, "input_tokens": 130,
+                "cached_input_tokens": 0, "output_tokens": 0
+            }}}
+        });
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::to_string(&unknown_initial).unwrap(),
+                serde_json::to_string(&context).unwrap(),
+                serde_json::to_string(&known_delta).unwrap()
+            ),
+        )
+        .unwrap();
+        let mut totals = ModelUsageTotals::default();
+        let mut events = Vec::new();
+        collect_session_usage_file(&path, 0, i64::MAX, &mut totals, &mut events).unwrap();
+        assert_eq!(
+            totals.additional.get("UNATTRIBUTED").map(|row| row.tokens),
+            Some(100)
+        );
+        assert_eq!(totals.sol.tokens, 30);
+        assert_eq!(
+            totals.additional.get("UNATTRIBUTED").unwrap().tokens + totals.sol.tokens,
+            130
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn large_compacted_records_do_not_hide_following_usage_samples() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-info-compacted-session-{}.jsonl",
             std::process::id()
         ));
         let context = json!({
@@ -30878,8 +32902,8 @@ mod tests {
                 "cached_input_tokens": 80, "output_tokens": 20
             }}}
         });
-        let oversized = format!(
-            "{{\"type\":\"response_item\",\"payload\":\"{}\"}}",
+        let compacted = format!(
+            "{{\"type\":\"compacted\",\"payload\":{{\"message\":\"{}\"}}}}",
             "x".repeat(security::MAX_JSONL_LINE_BYTES + 128)
         );
         fs::write(
@@ -30887,7 +32911,7 @@ mod tests {
             format!(
                 "{}\n{}\n{}\n",
                 serde_json::to_string(&context).unwrap(),
-                oversized,
+                compacted,
                 serde_json::to_string(&token_count).unwrap()
             ),
         )
@@ -30904,12 +32928,12 @@ mod tests {
         .unwrap();
         assert_eq!(totals.luna.tokens, 120);
         assert_eq!(totals.luna.output_tokens, 20);
-        assert!(!recordable);
+        assert!(recordable);
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn malformed_tool_records_do_not_hide_following_usage_samples() {
+    fn malformed_large_records_do_not_hide_following_usage_samples() {
         let path = std::env::temp_dir().join(format!(
             "codex-info-malformed-session-{}.jsonl",
             std::process::id()
@@ -30927,11 +32951,16 @@ mod tests {
                 "cached_input_tokens": 80, "output_tokens": 20
             }}}
         });
+        let malformed = format!(
+            "{{\"type\":\"compacted\",\"payload\":{{\"message\":\"{}\"}}",
+            "x".repeat(security::MAX_JSONL_LINE_BYTES + 128)
+        );
         fs::write(
             &path,
             format!(
-                "{}\n{{\"type\":\"response_item\",\"payload\":\n{}\n",
+                "{}\n{}\n{}\n",
                 serde_json::to_string(&context).unwrap(),
+                malformed,
                 serde_json::to_string(&token_count).unwrap()
             ),
         )

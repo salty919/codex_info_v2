@@ -154,12 +154,14 @@ public sealed record ApiHistorySample(
     string ModelSource = "confirmed")
 {
     public const string ConfirmedModelSource = "confirmed";
+    public const string ReconstructedFromSessionModelSource = "reconstructed-from-session";
     public const string UnavailableModelSource = "unavailable";
     public const string LegacyUnknownModelSource = "legacy-unknown";
 
     /// <summary>
     /// True only when the v3 producer established the complete model set for
-    /// this observation. It is false for the legacy fixed-column projection.
+    /// this observation. It is false for the legacy fixed-column projection;
+    /// session reconstruction can carry either complete or partial model sets.
     /// </summary>
     public bool ModelsComplete { get; init; } = true;
 

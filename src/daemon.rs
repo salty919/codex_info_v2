@@ -13,7 +13,8 @@ use crate::security;
 use crate::usage_store::{
     HistoryContinuityModelRecovery, RecordedSessionSource, RecorderGap, SessionCheckpoint,
     SessionCollectionCommit, SessionCumulativeRecovery, SessionModelTotal, SessionRange,
-    StoragePartitionIdentity, UsageHistoryObservation, UsageHistorySample, UsageStore,
+    SessionTimelineRecovery, StoragePartitionIdentity, UsageHistoryObservation, UsageHistorySample,
+    UsageStore,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1282,6 +1283,7 @@ pub(crate) struct RecorderGeneration {
     pub(crate) session_model_totals: Vec<SessionModelTotal>,
     pub(crate) history_continuity_recovery: Option<HistoryContinuityModelRecovery>,
     pub(crate) cumulative_recovery: Option<SessionCumulativeRecovery>,
+    pub(crate) timeline_recovery: Option<SessionTimelineRecovery>,
     pub(crate) quota_source_rescan_complete: bool,
 }
 
@@ -1695,17 +1697,22 @@ impl RecorderWorker {
                                 session_model_totals,
                                 history_continuity_recovery,
                                 cumulative_recovery,
+                                timeline_recovery,
                                 quota_source_rescan_complete,
                             } = generation;
-                            if std::env::var("CODEX_INFO_RECORDER_FAILURE")
+                            let mut result = if cumulative_recovery.is_some()
+                                && timeline_recovery.is_some()
+                            {
+                                Err("recorder generation contains both cumulative and timeline recovery"
+                                    .to_owned())
+                            } else if std::env::var("CODEX_INFO_RECORDER_FAILURE")
                                 .ok()
                                 .is_some_and(|mode| {
                                     !injected_failure_consumed && mode == "worker-death"
                                 })
                             {
                                 break;
-                            }
-                            let mut result = if std::env::var("CODEX_INFO_RECORDER_FAILURE")
+                            } else if std::env::var("CODEX_INFO_RECORDER_FAILURE")
                                 .ok()
                                 .is_some_and(|mode| {
                                     !injected_failure_consumed && mode == "busy"
@@ -1765,6 +1772,14 @@ impl RecorderWorker {
                                                 recorded_sessions: &recorded_sessions,
                                             };
                                         let commit_result = if let Some(recovery) =
+                                            timeline_recovery.as_ref()
+                                        {
+                                            store.commit_session_collection_with_timeline_recovery(
+                                                commit,
+                                                &observations,
+                                                recovery,
+                                            )
+                                        } else if let Some(recovery) =
                                             cumulative_recovery.as_ref()
                                         {
                                             store.commit_session_collection_with_cumulative_recovery(
@@ -2199,6 +2214,571 @@ mod tests {
         root
     }
 
+    struct TimelineFixture {
+        reset_at: i64,
+        window_seconds: i64,
+        base_sample: UsageHistorySample,
+        anchor_sample: UsageHistorySample,
+        source_model_totals: Vec<SessionModelTotal>,
+        corrected_model_totals: Vec<SessionModelTotal>,
+        recovery: SessionTimelineRecovery,
+        marker: RecordedSessionSource,
+        checkpoint: SessionCheckpoint,
+        range: SessionRange,
+    }
+
+    impl TimelineFixture {
+        fn new(partition_id: &str) -> Self {
+            let reset_at = 1_800_000_600;
+            let window_seconds = 600;
+            let source_model_totals = vec![SessionModelTotal {
+                model: "SOL".into(),
+                total_tokens: 100,
+                input_tokens: 90,
+                cached_input_tokens: 50,
+                output_tokens: 10,
+                cache_write_input_tokens: Some(0),
+            }];
+            let offset_model_totals = vec![SessionModelTotal {
+                model: "SOL".into(),
+                total_tokens: 25,
+                input_tokens: 23,
+                cached_input_tokens: 12,
+                output_tokens: 2,
+                cache_write_input_tokens: Some(0),
+            }];
+            let corrected_model_totals = vec![SessionModelTotal {
+                model: "SOL".into(),
+                total_tokens: 125,
+                input_tokens: 113,
+                cached_input_tokens: 62,
+                output_tokens: 12,
+                cache_write_input_tokens: Some(0),
+            }];
+            let base_sample = UsageHistorySample {
+                timestamp: 1_800_000_120,
+                reset_at,
+                remaining_percent: Some(90.0),
+                sol_dollars: 1.0,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: 100,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            };
+            let anchor_sample = UsageHistorySample {
+                timestamp: 1_800_000_240,
+                reset_at,
+                remaining_percent: Some(88.0),
+                sol_dollars: 1.25,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: 125,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            };
+            let range = SessionRange {
+                root_identity: "unix:10:20".into(),
+                relative_path: "2026/recovery.jsonl".into(),
+                file_device: 10,
+                file_inode: 20,
+                start_offset: 100,
+                end_offset: 200,
+                collector_epoch: 0x222,
+                cycle_seq: 2,
+                prefix_generation: 0x333,
+                record_sha256: "ab".repeat(32),
+            };
+            let marker = RecordedSessionSource {
+                root_identity: range.root_identity.clone(),
+                relative_path: range.relative_path.clone(),
+                file_bytes: range.end_offset,
+                modified_nanos: 1_700_000_000_000_000_000,
+                file_device: range.file_device,
+                file_inode: range.file_inode,
+            };
+            let checkpoint = SessionCheckpoint {
+                previous_cache_write_input: Some(0),
+                root_identity: range.root_identity.clone(),
+                relative_path: range.relative_path.clone(),
+                file_device: range.file_device,
+                file_inode: range.file_inode,
+                committed_offset: range.end_offset,
+                discard_until_lf: false,
+                collector_epoch: range.collector_epoch,
+                cycle_seq: range.cycle_seq,
+                prefix_generation: range.prefix_generation,
+                prefix_sha256: "cd".repeat(32),
+                fully_attributed_from_zero: true,
+                token_baseline_known: true,
+                last_task_running: Some(true),
+                last_model: Some("SOL".into()),
+                previous_total: 125,
+                previous_input: 113,
+                previous_cached_input: 62,
+                previous_output: 12,
+            };
+            let point = |timestamp, total, input, cached_input, output, dollars| {
+                crate::usage_store::SessionTimelineRecoveryPoint {
+                    timestamp,
+                    offset_model_totals: vec![SessionModelTotal {
+                        model: "SOL".into(),
+                        total_tokens: total,
+                        input_tokens: input,
+                        cached_input_tokens: cached_input,
+                        output_tokens: output,
+                        cache_write_input_tokens: Some(0),
+                    }],
+                    offset_sol_dollars: dollars,
+                    offset_terra_dollars: 0.0,
+                    offset_luna_dollars: 0.0,
+                }
+            };
+            let recovery = crate::usage_store::finalize_session_timeline_recovery(
+                partition_id,
+                SessionTimelineRecovery {
+                    recovery_id: String::new(),
+                    canonical_reset_at: reset_at,
+                    window_seconds,
+                    source_data_generation: 1,
+                    projection_end_exclusive: anchor_sample.timestamp,
+                    source_model_totals: source_model_totals.clone(),
+                    ranges: vec![range.clone()],
+                    points: vec![
+                        point(1_800_000_120, 10, 9, 5, 1, 0.1),
+                        point(1_800_000_180, 20, 18, 10, 2, 0.2),
+                    ],
+                    final_offset_model_totals: offset_model_totals,
+                    final_offset_sol_dollars: 0.25,
+                    final_offset_terra_dollars: 0.0,
+                    final_offset_luna_dollars: 0.0,
+                },
+            )
+            .unwrap();
+            Self {
+                reset_at,
+                window_seconds,
+                base_sample,
+                anchor_sample,
+                source_model_totals,
+                corrected_model_totals,
+                recovery,
+                marker,
+                checkpoint,
+                range,
+            }
+        }
+
+        fn base_generation(&self) -> RecorderGeneration {
+            RecorderGeneration {
+                reset_at: self.reset_at,
+                window_seconds: self.window_seconds,
+                collector_epoch: 0x111,
+                cycle_seq: 1,
+                samples: vec![self.base_sample.clone()],
+                observations: vec![UsageHistoryObservation::confirmed_with_models(
+                    &self.base_sample,
+                    self.source_model_totals.clone(),
+                )],
+                recorded_sessions: Vec::new(),
+                session_checkpoints: Vec::new(),
+                session_ranges: Vec::new(),
+                session_model_totals: self.source_model_totals.clone(),
+                history_continuity_recovery: None,
+                cumulative_recovery: None,
+                timeline_recovery: None,
+                quota_source_rescan_complete: false,
+            }
+        }
+
+        fn timeline_generation(&self) -> RecorderGeneration {
+            RecorderGeneration {
+                reset_at: self.reset_at,
+                window_seconds: self.window_seconds,
+                collector_epoch: self.range.collector_epoch,
+                cycle_seq: self.range.cycle_seq,
+                samples: vec![self.anchor_sample.clone()],
+                observations: vec![UsageHistoryObservation::confirmed_with_models(
+                    &self.anchor_sample,
+                    self.corrected_model_totals.clone(),
+                )],
+                recorded_sessions: vec![self.marker.clone()],
+                session_checkpoints: vec![self.checkpoint.clone()],
+                session_ranges: vec![self.range.clone()],
+                session_model_totals: self.corrected_model_totals.clone(),
+                history_continuity_recovery: None,
+                cumulative_recovery: None,
+                timeline_recovery: Some(self.recovery.clone()),
+                quota_source_rescan_complete: false,
+            }
+        }
+    }
+
+    #[test]
+    fn recorder_timeline_recovery_commits_marker_range_checkpoint_models_and_generation_atomically()
+    {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("timeline-atomic");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let old_data = std::env::var_os("CODEX_INFO_DATA_DIR");
+        std::env::set_var("CODEX_INFO_DATA_DIR", &data_dir);
+
+        let account = crate::account_scope::AccountKey::synthetic_preview("timeline-atomic");
+        let partition = crate::account_scope::resolve_partition(&data_dir, &account).unwrap();
+        let mut writer = RecorderWorker::start().unwrap();
+        writer
+            .activate_partition(partition.clone(), chrono::Utc::now())
+            .unwrap();
+        let fixture = TimelineFixture::new(&partition.partition_id);
+        assert_eq!(
+            writer
+                .store_generation(partition.partition_id.clone(), fixture.base_generation())
+                .unwrap()
+                .data_generation,
+            1
+        );
+
+        let committed = writer
+            .store_generation(
+                partition.partition_id.clone(),
+                fixture.timeline_generation(),
+            )
+            .unwrap();
+        assert_eq!(committed.data_generation, 2);
+
+        let store = UsageStore::open_read_only_partitioned(
+            &partition.database_path,
+            &partition.storage_identity(),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .load_session_collection_state()
+                .unwrap()
+                .data_generation,
+            2
+        );
+        let logical = store.load_all().unwrap();
+        assert_eq!(logical.len(), 2);
+        assert_eq!(logical[0].sol_tokens, 110);
+        assert_eq!(logical[0].sol_dollars, 1.1);
+        assert_eq!(logical[1], fixture.anchor_sample);
+        assert!(store.recorded_session_matches(&fixture.marker).unwrap());
+        drop(store);
+
+        let connection = rusqlite::Connection::open(&partition.database_path).unwrap();
+        let (markers, ranges, checkpoints, model_totals, recoveries, generation): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            String,
+        ) = connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM recorded_sessions),
+                    (SELECT COUNT(*) FROM session_ranges),
+                    (SELECT COUNT(*) FROM session_checkpoints),
+                    (SELECT COUNT(*) FROM session_model_totals),
+                    (SELECT COUNT(*) FROM session_timeline_recoveries),
+                    (SELECT data_generation FROM collection_generation)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (markers, ranges, checkpoints, model_totals, recoveries),
+            (1, 1, 1, 1, 1)
+        );
+        assert_eq!(generation, "2");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT total_tokens FROM session_model_totals WHERE model='SOL'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "125"
+        );
+        drop(connection);
+
+        let replay = writer
+            .store_generation(
+                partition.partition_id.clone(),
+                fixture.timeline_generation(),
+            )
+            .unwrap();
+        assert_eq!(replay.data_generation, 2);
+        let store = UsageStore::open_read_only_partitioned(
+            &partition.database_path,
+            &partition.storage_identity(),
+        )
+        .unwrap();
+        assert!(store.recorded_session_matches(&fixture.marker).unwrap());
+        drop(store);
+        let connection = rusqlite::Connection::open(&partition.database_path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_timeline_recoveries",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT data_generation FROM collection_generation",
+                    [],
+                    |row| { row.get::<_, String>(0) }
+                )
+                .unwrap(),
+            "2"
+        );
+        drop(connection);
+
+        writer.shutdown();
+        match old_data {
+            Some(value) => std::env::set_var("CODEX_INFO_DATA_DIR", value),
+            None => std::env::remove_var("CODEX_INFO_DATA_DIR"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recorder_timeline_recovery_storage_failure_does_not_ack_and_retry_is_exactly_once() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("timeline-retry");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let old_data = std::env::var_os("CODEX_INFO_DATA_DIR");
+        std::env::set_var("CODEX_INFO_DATA_DIR", &data_dir);
+
+        let account = crate::account_scope::AccountKey::synthetic_preview("timeline-retry");
+        let partition = crate::account_scope::resolve_partition(&data_dir, &account).unwrap();
+        let mut writer = RecorderWorker::start().unwrap();
+        writer
+            .activate_partition(partition.clone(), chrono::Utc::now())
+            .unwrap();
+        let fixture = TimelineFixture::new(&partition.partition_id);
+        writer
+            .store_generation(partition.partition_id.clone(), fixture.base_generation())
+            .unwrap();
+
+        let trigger = rusqlite::Connection::open(&partition.database_path).unwrap();
+        trigger
+            .execute_batch(
+                "CREATE TRIGGER timeline_daemon_commit_failure
+                 BEFORE UPDATE ON collection_generation
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected daemon timeline failure');
+                 END;",
+            )
+            .unwrap();
+        let failed = writer.store_generation(
+            partition.partition_id.clone(),
+            fixture.timeline_generation(),
+        );
+        assert!(failed.is_err(), "failed timeline commit was acknowledged");
+        let store = UsageStore::open_read_only_partitioned(
+            &partition.database_path,
+            &partition.storage_identity(),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .load_session_collection_state()
+                .unwrap()
+                .data_generation,
+            1
+        );
+        assert_eq!(store.load_all().unwrap(), vec![fixture.base_sample.clone()]);
+        assert!(!store.recorded_session_matches(&fixture.marker).unwrap());
+        drop(store);
+        let (ranges, checkpoints, recoveries): (i64, i64, i64) = trigger
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM session_ranges),
+                    (SELECT COUNT(*) FROM session_checkpoints),
+                    (SELECT COUNT(*) FROM session_timeline_recoveries)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((ranges, checkpoints, recoveries), (0, 0, 0));
+        trigger
+            .execute_batch("DROP TRIGGER timeline_daemon_commit_failure;")
+            .unwrap();
+
+        let committed = writer
+            .store_generation(
+                partition.partition_id.clone(),
+                fixture.timeline_generation(),
+            )
+            .unwrap();
+        assert_eq!(committed.data_generation, 2);
+        let replay = writer
+            .store_generation(
+                partition.partition_id.clone(),
+                fixture.timeline_generation(),
+            )
+            .unwrap();
+        assert_eq!(replay.data_generation, 2);
+        let store = UsageStore::open_read_only_partitioned(
+            &partition.database_path,
+            &partition.storage_identity(),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .load_session_collection_state()
+                .unwrap()
+                .data_generation,
+            2
+        );
+        assert!(store.recorded_session_matches(&fixture.marker).unwrap());
+        drop(store);
+        let (ranges, checkpoints, recoveries, generation): (i64, i64, i64, String) = trigger
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM session_ranges),
+                    (SELECT COUNT(*) FROM session_checkpoints),
+                    (SELECT COUNT(*) FROM session_timeline_recoveries),
+                    (SELECT data_generation FROM collection_generation)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (ranges, checkpoints, recoveries, generation),
+            (1, 1, 1, "2".into())
+        );
+
+        drop(trigger);
+        writer.shutdown();
+        match old_data {
+            Some(value) => std::env::set_var("CODEX_INFO_DATA_DIR", value),
+            None => std::env::remove_var("CODEX_INFO_DATA_DIR"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recorder_rejects_cumulative_and_timeline_recovery_together_without_storage_write() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = temp_root("timeline-both-recovery");
+        let data_dir = root.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+        let old_data = std::env::var_os("CODEX_INFO_DATA_DIR");
+        std::env::set_var("CODEX_INFO_DATA_DIR", &data_dir);
+
+        let account = crate::account_scope::AccountKey::synthetic_preview("timeline-both-recovery");
+        let partition = crate::account_scope::resolve_partition(&data_dir, &account).unwrap();
+        let mut writer = RecorderWorker::start().unwrap();
+        writer
+            .activate_partition(partition.clone(), chrono::Utc::now())
+            .unwrap();
+        let fixture = TimelineFixture::new(&partition.partition_id);
+        let mut generation = fixture.timeline_generation();
+        generation.cumulative_recovery = Some(SessionCumulativeRecovery {
+            recovery_id: String::new(),
+            canonical_reset_at: fixture.reset_at,
+            window_seconds: fixture.window_seconds,
+            before_reset_at: 0,
+            before_timestamp: 0,
+            first_reset_at: 0,
+            first_timestamp: 0,
+            through_reset_at: 0,
+            through_timestamp: 0,
+            before_model_totals: Vec::new(),
+            offset_model_totals: Vec::new(),
+            first_model_totals: Vec::new(),
+            source_current_model_totals: Vec::new(),
+            before_sol_dollars: 0.0,
+            before_terra_dollars: 0.0,
+            before_luna_dollars: 0.0,
+            offset_sol_dollars: 0.0,
+            offset_terra_dollars: 0.0,
+            offset_luna_dollars: 0.0,
+            source_generation: None,
+        });
+        let error = writer
+            .store_generation(partition.partition_id.clone(), generation)
+            .unwrap_err();
+        assert!(error.contains("both cumulative and timeline recovery"));
+
+        let store = UsageStore::open_read_only_partitioned(
+            &partition.database_path,
+            &partition.storage_identity(),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .load_session_collection_state()
+                .unwrap()
+                .data_generation,
+            0
+        );
+        assert!(store.load_all().unwrap().is_empty());
+        drop(store);
+        let connection = rusqlite::Connection::open(&partition.database_path).unwrap();
+        let (markers, ranges, checkpoints, models, timeline, cumulative): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = connection
+            .query_row(
+                "SELECT
+                        (SELECT COUNT(*) FROM recorded_sessions),
+                        (SELECT COUNT(*) FROM session_ranges),
+                        (SELECT COUNT(*) FROM session_checkpoints),
+                        (SELECT COUNT(*) FROM session_model_totals),
+                        (SELECT COUNT(*) FROM session_timeline_recoveries),
+                        (SELECT COUNT(*) FROM session_cumulative_recoveries)",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (markers, ranges, checkpoints, models, timeline, cumulative),
+            (0, 0, 0, 0, 0, 0)
+        );
+        drop(connection);
+
+        writer.shutdown();
+        match old_data {
+            Some(value) => std::env::set_var("CODEX_INFO_DATA_DIR", value),
+            None => std::env::remove_var("CODEX_INFO_DATA_DIR"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn boot_wide_monotonic_source_is_bounded_and_restart_ordered() {
@@ -2567,6 +3147,7 @@ mod tests {
                     }],
                     history_continuity_recovery: None,
                     cumulative_recovery: None,
+                    timeline_recovery: None,
                     quota_source_rescan_complete: false,
                 },
             )
@@ -2672,6 +3253,7 @@ mod tests {
                         },
                     ),
                     cumulative_recovery: None,
+                    timeline_recovery: None,
                     quota_source_rescan_complete: false,
                 },
             )
@@ -2706,6 +3288,7 @@ mod tests {
                     session_model_totals: Vec::new(),
                     history_continuity_recovery: None,
                     cumulative_recovery: None,
+                    timeline_recovery: None,
                     quota_source_rescan_complete: false,
                 },
             )
@@ -2835,6 +3418,7 @@ mod tests {
                     session_model_totals: Vec::new(),
                     history_continuity_recovery: None,
                     cumulative_recovery: None,
+                    timeline_recovery: None,
                     quota_source_rescan_complete: true,
                 },
             )
@@ -2903,6 +3487,7 @@ mod tests {
                     session_model_totals: Vec::new(),
                     history_continuity_recovery: None,
                     cumulative_recovery: None,
+                    timeline_recovery: None,
                     quota_source_rescan_complete: true,
                 },
             )
@@ -2995,6 +3580,7 @@ mod tests {
             session_model_totals: Vec::new(),
             history_continuity_recovery: None,
             cumulative_recovery: None,
+            timeline_recovery: None,
             quota_source_rescan_complete: false,
         };
 
@@ -3043,6 +3629,7 @@ mod tests {
                 session_model_totals: Vec::new(),
                 history_continuity_recovery: None,
                 cumulative_recovery: None,
+                timeline_recovery: None,
                 quota_source_rescan_complete: false,
             };
             let mut writer = RecorderWorker::start().unwrap();
