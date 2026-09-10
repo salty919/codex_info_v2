@@ -54,7 +54,7 @@ const MAX_SOURCE_RESCAN_SAMPLES: usize = 31 * 24 * 60;
 pub(crate) fn monotonic_now_ns() -> u64 {
     #[cfg(target_os = "linux")]
     {
-        return read_proc_uptime_ns().unwrap_or(0);
+        read_proc_uptime_ns().unwrap_or(0)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -948,9 +948,7 @@ fn process_is_known_codex(identity: &ProcessIdentity) -> Option<u16> {
         return None;
     }
     let command_line = fs::read(process_root.join("cmdline")).ok();
-    let Some(command_line) = command_line else {
-        return None;
-    };
+    let command_line = command_line?;
     let args = command_line
         .split(|byte| *byte == 0)
         .filter(|arg| !arg.is_empty())
@@ -1309,7 +1307,7 @@ enum RecorderCommand {
     },
     Store {
         partition_id: String,
-        generation: RecorderGeneration,
+        generation: Box<RecorderGeneration>,
         committed: mpsc::SyncSender<Result<RecorderCommitAck, String>>,
     },
     ForgetRecordedSessions {
@@ -1662,7 +1660,7 @@ impl RecorderWorker {
                                 cumulative_recovery,
                                 timeline_recovery,
                                 quota_source_rescan_complete,
-                            } = generation;
+                            } = *generation;
                             let mut result = if cumulative_recovery.is_some()
                                 && timeline_recovery.is_some()
                             {
@@ -2026,7 +2024,7 @@ impl RecorderWorker {
         commands
             .send(RecorderCommand::Store {
                 partition_id,
-                generation,
+                generation: Box::new(generation),
                 committed,
             })
             .map_err(|_| DaemonError::Runtime.to_string())?;
@@ -2693,7 +2691,7 @@ mod tests {
         assert_eq!(parse_proc_uptime_ns(b"42 7.0\n"), Some(42_000_000_000));
         assert!(parse_proc_uptime_ns(b"42.0000000001 7.0\n").is_none());
         assert!(parse_proc_uptime_ns(b"not-uptime 7.0\n").is_none());
-        assert!(parse_proc_uptime_ns(&vec![b'1'; MAX_PROC_UPTIME_BYTES + 1]).is_none());
+        assert!(parse_proc_uptime_ns(&[b'1'; MAX_PROC_UPTIME_BYTES + 1]).is_none());
 
         // These fixtures model two different processes reading the same
         // boot-wide clock. A persisted stop value remains ordered after the

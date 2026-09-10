@@ -3090,8 +3090,12 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
             [
                 "bash",
                 str(ROOT / "scripts" / "build_linux_bundle.sh"),
-                "--binary",
+                "--ui-binary",
                 str(Path("/usr/bin/true").resolve()),
+                "--recorder-binary",
+                str(Path("/usr/bin/bash").resolve()),
+                "--rest-binary",
+                str(Path("/usr/bin/dash").resolve()),
                 "--version",
                 _VERSION,
                 "--source-sha",

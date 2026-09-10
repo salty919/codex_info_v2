@@ -1401,6 +1401,16 @@ impl Default for PublishedSnapshot {
     }
 }
 
+struct PublishedSnapshotInput {
+    details: PublicDetails,
+    details_v2: PublicDetailsV2,
+    details_v3: PublicDetailsV3,
+    current_v3_body: Vec<u8>,
+    history_periods_v3_body: Vec<u8>,
+    threads_v3_body: Vec<u8>,
+    history_period_indexes: Vec<HistoryPeriodIndex>,
+}
+
 type SharedSnapshot = Arc<RwLock<PublishedSnapshot>>;
 
 /// Cloneable one-way publication handle held by the UI thread.
@@ -1467,7 +1477,7 @@ impl ApiSnapshotPublisher {
         let history_periods_v3_body = serialize_history_periods_v3(&details_v3)?;
         let threads_v3_body = serialize_threads_v3(&details_v3)?;
         let history_period_indexes = history_period_indexes(&details_v3)?;
-        self.publish_serialized(
+        self.publish_serialized(PublishedSnapshotInput {
             details,
             details_v2,
             details_v3,
@@ -1475,7 +1485,7 @@ impl ApiSnapshotPublisher {
             history_periods_v3_body,
             threads_v3_body,
             history_period_indexes,
-        )
+        })
         .map(|_| ())
     }
 
@@ -1488,7 +1498,7 @@ impl ApiSnapshotPublisher {
         let history_periods_v3_body = serialize_history_periods_v3(&details_v3)?;
         let threads_v3_body = serialize_threads_v3(&details_v3)?;
         let history_period_indexes = history_period_indexes(&details_v3)?;
-        self.publish_serialized(
+        self.publish_serialized(PublishedSnapshotInput {
             details,
             details_v2,
             details_v3,
@@ -1496,19 +1506,22 @@ impl ApiSnapshotPublisher {
             history_periods_v3_body,
             threads_v3_body,
             history_period_indexes,
-        )
+        })
     }
 
     fn publish_serialized(
         &self,
-        details: PublicDetails,
-        details_v2: PublicDetailsV2,
-        details_v3: PublicDetailsV3,
-        current_v3_body: Vec<u8>,
-        history_periods_v3_body: Vec<u8>,
-        threads_v3_body: Vec<u8>,
-        history_period_indexes: Vec<HistoryPeriodIndex>,
+        input: PublishedSnapshotInput,
     ) -> Result<PublishedPair, ApiSnapshotError> {
+        let PublishedSnapshotInput {
+            details,
+            details_v2,
+            details_v3,
+            current_v3_body,
+            history_periods_v3_body,
+            threads_v3_body,
+            history_period_indexes,
+        } = input;
         let mut current = self
             .snapshot
             .write()
@@ -1789,6 +1802,13 @@ enum ParseFailure {
 }
 
 #[derive(Debug)]
+struct ParsedTarget {
+    route: Option<ApiRoute>,
+    period: Option<String>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug)]
 enum HeaderRead {
     Complete {
         data: Vec<u8>,
@@ -1922,7 +1942,7 @@ fn hex_encode(value: &[u8]) -> String {
 }
 
 fn hex_decode(value: &str) -> Option<Vec<u8>> {
-    if value.is_empty() || value.len() % 2 != 0 {
+    if value.is_empty() || !value.len().is_multiple_of(2) {
         return None;
     }
     let mut decoded = Vec::with_capacity(value.len() / 2);
@@ -2062,37 +2082,41 @@ fn serialize_history_page_v3(
     Ok(body.bytes)
 }
 
-fn history_page_candidate(
-    current: &PublishedSnapshot,
+struct HistoryPageContext<'a> {
+    current: &'a PublishedSnapshot,
     period_index: usize,
+    sample_end: usize,
+    gaps: &'a [PublicHistoryGap],
+    incoming_cursor: Option<&'a str>,
+    body_limit: usize,
+}
+
+fn history_page_candidate(
+    context: &HistoryPageContext<'_>,
     start: usize,
     end: usize,
-    sample_end: usize,
-    gaps: &[PublicHistoryGap],
-    incoming_cursor: Option<&str>,
-    body_limit: usize,
 ) -> Result<Vec<u8>, HistoryPageSerializeError> {
-    let period = &current.details_v3.history_periods[period_index];
-    let period_indexed = &current.history_period_indexes[period_index];
+    let period = &context.current.details_v3.history_periods[context.period_index];
+    let period_indexed = &context.current.history_period_indexes[context.period_index];
     let resume_cursor = if end > start {
         let prefix_index = end - period_indexed.sample_start - 1;
         Some(encode_history_cursor(
             period,
-            &current.details_v3.history_samples[end - 1],
+            &context.current.details_v3.history_samples[end - 1],
             &period_indexed.sample_prefix_fingerprints[prefix_index],
         ))
     } else {
-        incoming_cursor.map(str::to_owned)
+        context.incoming_cursor.map(str::to_owned)
     };
-    let next_cursor = (end < sample_end)
-        .then(|| resume_cursor.as_deref())
+    let next_cursor = (end < context.sample_end)
+        .then_some(resume_cursor.as_deref())
         .flatten();
     serialize_history_page_v3(
-        &current.details_v3.history_samples[start..end],
-        gaps,
+        &context.current.details_v3.history_samples[start..end],
+        context.gaps,
         next_cursor,
         resume_cursor.as_deref(),
-        body_limit,
+        context.body_limit,
     )
 }
 
@@ -2106,16 +2130,15 @@ fn history_page_response_body(
     body_limit: usize,
 ) -> (u16, Vec<u8>) {
     let total = sample_end.saturating_sub(start);
-    let (mut body, initial_too_large) = match history_page_candidate(
+    let context = HistoryPageContext {
         current,
         period_index,
-        start,
-        sample_end,
         sample_end,
         gaps,
-        cursor,
+        incoming_cursor: cursor,
         body_limit,
-    ) {
+    };
+    let (mut body, initial_too_large) = match history_page_candidate(&context, start, sample_end) {
         Ok(body) => (body, false),
         Err(HistoryPageSerializeError::ResourceTooLarge) => (Vec::new(), true),
         Err(HistoryPageSerializeError::Serialization) => {
@@ -2129,16 +2152,7 @@ fn history_page_response_body(
         while low <= high {
             let count = low + (high - low) / 2;
             let end = start + count;
-            let candidate = match history_page_candidate(
-                current,
-                period_index,
-                start,
-                end,
-                sample_end,
-                gaps,
-                cursor,
-                body_limit,
-            ) {
+            let candidate = match history_page_candidate(&context, start, end) {
                 Ok(candidate) => candidate,
                 Err(HistoryPageSerializeError::ResourceTooLarge) => {
                     high = count.saturating_sub(1);
@@ -2496,7 +2510,11 @@ fn parse_request(
         return Err(ParseFailure::BadRequest);
     }
 
-    let (route, period, cursor) = parse_target(target)?;
+    let ParsedTarget {
+        route,
+        period,
+        cursor,
+    } = parse_target(target)?;
     let mut seen = HashSet::new();
     let mut host = None;
     let mut content_length = None;
@@ -2685,9 +2703,7 @@ fn parse_history_query(query: Option<&[u8]>) -> Result<(String, Option<String>),
     Ok((period, cursor))
 }
 
-fn parse_target(
-    target: &[u8],
-) -> Result<(Option<ApiRoute>, Option<String>, Option<String>), ParseFailure> {
+fn parse_target(target: &[u8]) -> Result<ParsedTarget, ParseFailure> {
     if !target.starts_with(b"/") || target.starts_with(b"//") {
         return Err(ParseFailure::BadRequest);
     }
@@ -2710,7 +2726,11 @@ fn parse_target(
     match route {
         Some(ApiRoute::HistoryV3) => {
             let (period, cursor) = parse_history_query(query)?;
-            Ok((route, Some(period), cursor))
+            Ok(ParsedTarget {
+                route,
+                period: Some(period),
+                cursor,
+            })
         }
         Some(ApiRoute::CurrentV3 | ApiRoute::HistoryPeriodsV3 | ApiRoute::ThreadsV3)
             if query.is_some() =>
@@ -2720,15 +2740,23 @@ fn parse_target(
         Some(ApiRoute::Health | ApiRoute::Details | ApiRoute::DetailsV2 | ApiRoute::DetailsV3)
             if query.is_some() =>
         {
-            Ok((None, None, None))
+            Ok(ParsedTarget {
+                route: None,
+                period: None,
+                cursor: None,
+            })
         }
-        _ => Ok((route, None, None)),
+        _ => Ok(ParsedTarget {
+            route,
+            period: None,
+            cursor: None,
+        }),
     }
 }
 
 #[allow(dead_code)]
 fn classify_target(target: &[u8]) -> Result<Option<ApiRoute>, ParseFailure> {
-    parse_target(target).map(|(route, _, _)| route)
+    parse_target(target).map(|parsed| parsed.route)
 }
 
 fn is_http_token(value: &[u8]) -> bool {

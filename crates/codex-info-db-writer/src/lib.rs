@@ -2278,20 +2278,30 @@ fn validate_timeline_recovery_content(
         previous_totals = Some(totals);
         previous_dollars = dollars;
     }
-    if checked_add_model_totals(&source_model_totals, &final_offset_model_totals).is_none()
-        || !timeline_model_totals_dominate(
-            &final_offset_model_totals,
-            &recovery
-                .points
-                .last()
-                .expect("non-empty timeline recovery")
-                .offset_model_totals,
-        )
-        || recovery.final_offset_sol_dollars < previous_dollars.0
+    if checked_add_model_totals(&source_model_totals, &final_offset_model_totals).is_none() {
+        return Err(UsageStoreError::InvalidImport(
+            "timeline recovery source and offset totals are inconsistent".into(),
+        ));
+    }
+    if !timeline_model_totals_dominate(
+        &final_offset_model_totals,
+        &recovery
+            .points
+            .last()
+            .expect("non-empty timeline recovery")
+            .offset_model_totals,
+    ) {
+        return Err(UsageStoreError::InvalidImport(
+            "timeline recovery final offset moved backwards".into(),
+        ));
+    }
+    if recovery.final_offset_sol_dollars < previous_dollars.0
         || recovery.final_offset_terra_dollars < previous_dollars.1
         || recovery.final_offset_luna_dollars < previous_dollars.2
     {
-        return Err(UsageStoreError::GenerationOverflow);
+        return Err(UsageStoreError::InvalidImport(
+            "timeline recovery final dollars moved backwards".into(),
+        ));
     }
     let payload = timeline_recovery_payload(partition_id, recovery)?;
     if payload.len() > MAX_SESSION_TIMELINE_RECOVERY_BYTES {
@@ -3668,7 +3678,17 @@ fn replace_session_pending_ranges(
     transaction: &rusqlite::Transaction<'_>,
     pending_ranges: &BTreeMap<(String, String, u64, u64, u128, u64), SessionPendingRange>,
     accepted_ranges: &BTreeMap<(String, String, u64, u64, u128, u64, u64, String), SessionRange>,
+    replace_incomplete: bool,
 ) -> Result<()> {
+    if replace_incomplete {
+        // Incomplete rows describe only the latest full source inventory
+        // (budget backlog, an open tail, or a transient read failure). A new
+        // recorder cycle supplies that complete set, so retaining an omitted
+        // prior-cycle row would manufacture a permanent degraded state.
+        // Complete malformed-byte evidence remains until an accepted range
+        // explicitly supersedes the same source offset below.
+        transaction.execute("DELETE FROM session_pending_ranges WHERE complete=0", [])?;
+    }
     for range in accepted_ranges.values() {
         let pending_same_start = pending_ranges.values().any(|pending| {
             pending.root_identity == range.root_identity
@@ -8180,6 +8200,7 @@ impl UsageStore {
                 ));
             }
         }
+        let replace_incomplete_pending_ranges = pending_ranges.is_some();
         let mut canonical_pending_ranges = BTreeMap::new();
         for pending in pending_ranges.unwrap_or(&[]) {
             validate_session_pending_range(pending)?;
@@ -8525,6 +8546,7 @@ impl UsageStore {
                     &transaction,
                     &canonical_pending_ranges,
                     &canonical_ranges,
+                    replace_incomplete_pending_ranges,
                 )?;
                 upsert_session_events(&transaction, &canonical_events)?;
                 transaction.commit()?;
@@ -8650,7 +8672,12 @@ impl UsageStore {
                 ])?;
             }
         }
-        replace_session_pending_ranges(&transaction, &canonical_pending_ranges, &canonical_ranges)?;
+        replace_session_pending_ranges(
+            &transaction,
+            &canonical_pending_ranges,
+            &canonical_ranges,
+            replace_incomplete_pending_ranges,
+        )?;
         upsert_session_events(&transaction, &canonical_events)?;
         {
             let mut statement = transaction.prepare(
@@ -9287,6 +9314,92 @@ mod tests {
     }
 
     #[test]
+    fn current_incomplete_pending_inventory_replaces_the_previous_cycle() {
+        let path = database_path("pending-inventory-replacement");
+        let identity = partition_identity('d', 19);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let key = (
+            "unix:10:20".to_owned(),
+            "2026/09/recovered.jsonl".to_owned(),
+            10_u64,
+            30_u64,
+            0x5678_u128,
+            0_u64,
+        );
+        let backlog = SessionPendingRange {
+            root_identity: key.0.clone(),
+            relative_path: key.1.clone(),
+            file_device: key.2,
+            file_inode: key.3,
+            start_offset: key.5,
+            end_offset: key.5,
+            collector_epoch: 0x1234,
+            cycle_seq: 1,
+            prefix_generation: key.4,
+            record_sha256: "00".repeat(32),
+            parser_version: "v1".into(),
+            reason: "cycle-budget-backlog".into(),
+            complete: false,
+        };
+        {
+            let transaction = store.connection.transaction().unwrap();
+            replace_session_pending_ranges(
+                &transaction,
+                &BTreeMap::from([(key.clone(), backlog)]),
+                &BTreeMap::new(),
+                true,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        let malformed = SessionPendingRange {
+            end_offset: 10,
+            record_sha256: "11".repeat(32),
+            reason: "malformed-json-record".into(),
+            complete: true,
+            ..SessionPendingRange {
+                root_identity: key.0.clone(),
+                relative_path: key.1.clone(),
+                file_device: key.2,
+                file_inode: key.3,
+                start_offset: key.5,
+                end_offset: key.5,
+                collector_epoch: 0x1234,
+                cycle_seq: 2,
+                prefix_generation: key.4,
+                record_sha256: "00".repeat(32),
+                parser_version: "v1".into(),
+                reason: "cycle-budget-backlog".into(),
+                complete: false,
+            }
+        };
+        {
+            let transaction = store.connection.transaction().unwrap();
+            replace_session_pending_ranges(
+                &transaction,
+                &BTreeMap::from([(key, malformed)]),
+                &BTreeMap::new(),
+                true,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT reason, complete FROM session_pending_ranges",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            ("malformed-json-record".to_owned(), 1)
+        );
+        remove_database(&path);
+    }
+
+    #[test]
     fn account_schema_v1_migrates_without_loss_and_roundtrips_unknown_models() {
         let path = database_path("partition-session-running-state");
         let identity = partition_identity('d', 18);
@@ -9376,7 +9489,10 @@ mod tests {
             legacy_read_state.checkpoints[0].previous_cache_write_input,
             None
         );
-        assert_eq!(legacy_read_state.model_totals, [legacy_total.clone()]);
+        assert_eq!(
+            legacy_read_state.model_totals,
+            std::slice::from_ref(&legacy_total)
+        );
         drop(legacy_reader);
 
         // Retained generations from the previous executable remain valid
@@ -10026,7 +10142,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(committed.data_generation, 1);
-        assert_eq!(committed.canonical_samples, [committed_sample.clone()]);
+        assert_eq!(
+            committed.canonical_samples,
+            std::slice::from_ref(&committed_sample)
+        );
         let replayed = store
             .commit_session_collection_with_samples(SessionCollectionCommit {
                 reset_at,
@@ -13806,7 +13925,10 @@ mod wave_b_correction_tests {
         )
         .unwrap()
         .expect("the LUNA regression is independently recoverable");
-        assert_eq!(recovery.offset_model_totals, [luna_baseline.clone()]);
+        assert_eq!(
+            recovery.offset_model_totals,
+            std::slice::from_ref(&luna_baseline)
+        );
         assert_eq!(recovery.before_sol_dollars, 10.0);
         assert_eq!(recovery.before_luna_dollars, 1.0);
         assert_eq!(recovery.offset_sol_dollars, 0.0);

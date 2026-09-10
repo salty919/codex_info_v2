@@ -56,6 +56,14 @@ pub struct DbSnapshot {
     pub history_samples_v2: Vec<PublicHistoryObservation>,
 }
 
+/// Cheap, transactionally consistent publication marker used by REST to
+/// decide whether its immutable in-memory snapshot needs rebuilding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DbChangeMarker {
+    pub generation: u64,
+    pub has_pending_ranges: bool,
+}
+
 #[derive(Debug)]
 pub enum ReaderError {
     Io(std::io::Error),
@@ -170,16 +178,35 @@ impl DbReader {
         Ok(connection.query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))? == 1)
     }
 
+    /// Read only the recorder's commit marker and unresolved-work state.
+    /// Legacy databases without an explicit generation return `None`, which
+    /// directs REST to rebuild and validate the complete snapshot.
+    pub fn read_change_marker(&self) -> Result<Option<DbChangeMarker>, ReaderError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let Some(generation) = read_explicit_generation(&transaction)? else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let has_pending_ranges = read_pending_ranges(&transaction)?;
+        transaction.commit()?;
+        Ok(Some(DbChangeMarker {
+            generation,
+            has_pending_ranges,
+        }))
+    }
+
     /// Build a completely new snapshot.  Domain-invalid rows are omitted from
     /// the projection; schema and transient SQLite errors still reject the
     /// candidate so the REST layer can retain the preceding generation.
     pub fn read_snapshot(&self) -> Result<DbSnapshot, ReaderError> {
-        let connection = self.connection()?;
-        let has_pending_ranges = read_pending_ranges(&connection)?;
-        let raw = read_history(&connection)?;
-        let generation = read_generation(&connection, raw.iter().map(|row| row.timestamp))?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let has_pending_ranges = read_pending_ranges(&transaction)?;
+        let raw = read_history(&transaction)?;
+        let generation = read_generation(&transaction, raw.iter().map(|row| row.timestamp))?;
         let (details, models_v3, history_samples_v2, history_samples_v3) =
-            build_details(&connection, &raw)?;
+            build_details(&transaction, &raw)?;
         details.validate()?;
         let mut hasher = Sha256::new();
         hasher.update(generation.to_be_bytes());
@@ -195,6 +222,7 @@ impl DbReader {
             })?,
         );
         let data_hash = hex_lower(&hasher.finalize());
+        transaction.commit()?;
         Ok(DbSnapshot {
             generation,
             data_hash,
@@ -308,11 +336,14 @@ fn read_pending_ranges(connection: &Connection) -> Result<bool, ReaderError> {
     if !table_exists(connection, "session_pending_ranges")? {
         return Ok(false);
     }
-    Ok(connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_pending_ranges)",
-        [],
-        |row| row.get(0),
-    )?)
+    let query = if table_has_column(connection, "session_pending_ranges", "complete")? {
+        "SELECT EXISTS(SELECT 1 FROM session_pending_ranges WHERE complete=0)"
+    } else {
+        // A legacy table has no durable completion proof, so its rows remain
+        // conservatively pending while the complete snapshot is still read.
+        "SELECT EXISTS(SELECT 1 FROM session_pending_ranges)"
+    };
+    Ok(connection.query_row(query, [], |row| row.get(0))?)
 }
 
 fn table_has_column(
@@ -323,6 +354,7 @@ fn table_has_column(
     let query = match table {
         "session_model_totals" => "PRAGMA table_info(session_model_totals)",
         "usage_model_history" => "PRAGMA table_info(usage_model_history)",
+        "session_pending_ranges" => "PRAGMA table_info(session_pending_ranges)",
         _ => return Ok(false),
     };
     let mut statement = connection.prepare(query)?;
@@ -339,6 +371,17 @@ fn read_generation<I>(connection: &Connection, fallback_timestamps: I) -> Result
 where
     I: Iterator<Item = i64>,
 {
+    if let Some(generation) = read_explicit_generation(connection)? {
+        return Ok(generation);
+    }
+    Ok(fallback_timestamps
+        .max()
+        .unwrap_or(0)
+        .try_into()
+        .unwrap_or(0))
+}
+
+fn read_explicit_generation(connection: &Connection) -> Result<Option<u64>, ReaderError> {
     if table_exists(connection, "collection_generation")? {
         let value: Option<String> = connection
             .query_row(
@@ -348,7 +391,7 @@ where
             )
             .optional()?;
         if let Some(value) = value {
-            return parse_u64(&value, "collection_generation.data_generation");
+            return parse_u64(&value, "collection_generation.data_generation").map(Some);
         }
     }
     if table_exists(connection, "durable_state")? {
@@ -360,16 +403,12 @@ where
             )
             .optional()?;
         if let Some(value) = value {
-            return u64::try_from(value).map_err(|_| {
+            return u64::try_from(value).map(Some).map_err(|_| {
                 ReaderError::InvalidValue("durable_state generation is negative".to_owned())
             });
         }
     }
-    Ok(fallback_timestamps
-        .max()
-        .unwrap_or(0)
-        .try_into()
-        .unwrap_or(0))
+    Ok(None)
 }
 
 fn parse_u64(value: &str, field: &str) -> Result<u64, ReaderError> {
@@ -1735,7 +1774,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_reports_pending_ranges_without_rejecting_durable_values() {
+    fn snapshot_reports_only_incomplete_ranges_as_pending() {
         let path = temp_db("pending-ranges");
         make_db(&path);
         let reader = DbReader::open(&path).expect("reader");
@@ -1750,11 +1789,22 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE session_pending_ranges(
-                    source_id TEXT NOT NULL, range_start INTEGER NOT NULL
+                    source_id TEXT NOT NULL, range_start INTEGER NOT NULL,
+                    complete INTEGER NOT NULL
                 );
-                INSERT INTO session_pending_ranges VALUES('fixture', 0);",
+                INSERT INTO session_pending_ranges VALUES('complete', 0, 1);",
             )
             .expect("pending fixture");
+        let complete = reader
+            .read_snapshot()
+            .expect("complete diagnostic snapshot");
+        assert!(!complete.has_pending_ranges);
+        connection
+            .execute(
+                "INSERT INTO session_pending_ranges VALUES('incomplete', 1, 0)",
+                [],
+            )
+            .expect("incomplete fixture");
         let pending = reader.read_snapshot().expect("pending snapshot");
         assert!(pending.has_pending_ranges);
         assert_eq!(pending.details.history_samples.len(), 1);
@@ -1767,6 +1817,66 @@ mod tests {
                 .read_snapshot()
                 .expect("recovered snapshot")
                 .has_pending_ranges
+        );
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn change_marker_tracks_committed_generation_and_incomplete_work() {
+        let path = temp_db("change-marker");
+        make_db(&path);
+        let reader = DbReader::open(&path).expect("reader");
+        assert_eq!(
+            reader.read_change_marker().expect("initial marker"),
+            Some(DbChangeMarker {
+                generation: 7,
+                has_pending_ranges: false,
+            })
+        );
+
+        let connection = Connection::open(&path).expect("fixture db");
+        connection
+            .execute_batch(
+                "CREATE TABLE session_pending_ranges(
+                    source_id TEXT NOT NULL, range_start INTEGER NOT NULL,
+                    complete INTEGER NOT NULL
+                );
+                INSERT INTO session_pending_ranges VALUES('complete', 0, 1);",
+            )
+            .expect("complete diagnostic");
+        assert_eq!(
+            reader.read_change_marker().expect("complete marker"),
+            Some(DbChangeMarker {
+                generation: 7,
+                has_pending_ranges: false,
+            })
+        );
+
+        connection
+            .execute(
+                "INSERT INTO session_pending_ranges VALUES('incomplete', 1, 0)",
+                [],
+            )
+            .expect("incomplete work");
+        assert_eq!(
+            reader.read_change_marker().expect("pending marker"),
+            Some(DbChangeMarker {
+                generation: 7,
+                has_pending_ranges: true,
+            })
+        );
+        connection
+            .execute(
+                "UPDATE collection_generation SET data_generation='8' WHERE singleton=1",
+                [],
+            )
+            .expect("advance generation");
+        assert_eq!(
+            reader.read_change_marker().expect("advanced marker"),
+            Some(DbChangeMarker {
+                generation: 8,
+                has_pending_ranges: true,
+            })
         );
         fs::remove_file(path).expect("cleanup");
     }

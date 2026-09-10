@@ -15,7 +15,7 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -71,7 +71,7 @@ pub struct StoreStatus {
 
 #[derive(Debug)]
 struct StoreInner {
-    current: Option<PublishedSnapshot>,
+    current: Option<Arc<PublishedSnapshot>>,
     degraded: bool,
 }
 
@@ -79,6 +79,7 @@ struct StoreInner {
 /// a second persistence authority and is never written to disk.
 pub struct SnapshotStore {
     reader: DbReader,
+    refresh_lock: Mutex<()>,
     inner: RwLock<StoreInner>,
 }
 
@@ -86,6 +87,7 @@ impl SnapshotStore {
     pub fn new(reader: DbReader) -> Self {
         Self {
             reader,
+            refresh_lock: Mutex::new(()),
             inner: RwLock::new(StoreInner {
                 current: None,
                 degraded: false,
@@ -100,6 +102,53 @@ impl SnapshotStore {
     /// Read one candidate and atomically replace the current generation only
     /// after the reader has completed all schema/value/domain checks.
     pub fn refresh(&self) -> RefreshStatus {
+        let _refresh_guard = self
+            .refresh_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .current
+            .as_ref()
+            .map(|snapshot| (snapshot.generation, snapshot.has_pending_ranges));
+        if let Some((current_generation, current_pending)) = current {
+            match self.reader.read_change_marker() {
+                Ok(Some(marker))
+                    if marker.generation == current_generation
+                        && marker.has_pending_ranges == current_pending =>
+                {
+                    self.inner
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .degraded = marker.has_pending_ranges;
+                    return RefreshStatus::Unchanged {
+                        generation: current_generation,
+                    };
+                }
+                Ok(Some(marker)) if marker.generation < current_generation => {
+                    self.inner
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .degraded = true;
+                    return RefreshStatus::RetainedLastGood {
+                        generation: current_generation,
+                    };
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("codex-info-rest: snapshot marker read failed: {error}");
+                    self.inner
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .degraded = true;
+                    return RefreshStatus::RetainedLastGood {
+                        generation: current_generation,
+                    };
+                }
+            }
+        }
         let candidate = self.reader.read_snapshot().map(PublishedSnapshot::from_db);
         let mut inner = self
             .inner
@@ -115,7 +164,7 @@ impl SnapshotStore {
                     None => {
                         let generation = candidate.generation;
                         let degraded = candidate.has_pending_ranges;
-                        inner.current = Some(candidate);
+                        inner.current = Some(Arc::new(candidate));
                         inner.degraded = degraded;
                         RefreshStatus::Updated { generation }
                     }
@@ -146,7 +195,7 @@ impl SnapshotStore {
                     Some(_) => {
                         let generation = candidate.generation;
                         let degraded = candidate.has_pending_ranges;
-                        inner.current = Some(candidate);
+                        inner.current = Some(Arc::new(candidate));
                         inner.degraded = degraded;
                         RefreshStatus::Updated { generation }
                     }
@@ -180,7 +229,7 @@ impl SnapshotStore {
         }
     }
 
-    pub fn snapshot(&self) -> Option<PublishedSnapshot> {
+    pub fn snapshot(&self) -> Option<Arc<PublishedSnapshot>> {
         self.inner
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -191,7 +240,7 @@ impl SnapshotStore {
     /// Return the last-good snapshot and its publication health atomically.
     /// Keeping these values under one read lock prevents a concurrent refresh
     /// from pairing a new generation with the previous degraded flag.
-    pub fn snapshot_with_status(&self) -> (Option<PublishedSnapshot>, bool) {
+    pub fn snapshot_with_status(&self) -> (Option<Arc<PublishedSnapshot>>, bool) {
         let inner = self
             .inner
             .read()
@@ -626,15 +675,19 @@ fn serialize_route(
             flatten_with_version(API_VERSION_V3, &details)
         }
         Route::CurrentV3 => {
-            let details = details_v3(snapshot, degraded);
+            let state = if degraded {
+                PublicState::Error
+            } else {
+                details.state
+            };
             serialize_json(&json!({
                 "api_version": API_VERSION_V3,
-                "state": details.state,
+                "state": state,
                 "observed_at": details.observed_at,
                 "authenticated": details.authenticated,
                 "plan_label": details.plan_label,
                 "quota": details.quota,
-                "models": details.models,
+                "models": snapshot.models_v3,
                 "active_thread_count": details.active_thread_count,
             }))
         }
@@ -716,9 +769,8 @@ fn serialize_history(
     };
     // The paged history wire shape has no state field; its exact contract is
     // preserved while the v3 details/current resources expose degradation.
-    let v3 = details_v3(snapshot, false);
-    let samples = v3
-        .history_samples
+    let samples = snapshot
+        .history_samples_v3
         .iter()
         .filter(|sample| {
             sample.reset_at >= period_meta.reset_at.saturating_sub(60)
@@ -1063,6 +1115,48 @@ mod tests {
     }
 
     #[test]
+    fn committed_generation_is_the_cache_invalidation_boundary() {
+        let path = temp_db("generation-cache");
+        fixture(&path, 10);
+        let reader = DbReader::open(&path).expect("reader");
+        let store = SnapshotStore::new(reader);
+        assert!(matches!(
+            store.refresh(),
+            RefreshStatus::Updated { generation: 1 }
+        ));
+        let initial = store.snapshot().expect("initial snapshot");
+
+        let connection = Connection::open(&path).expect("fixture db");
+        connection
+            .execute("UPDATE usage_history SET sol_tokens=99", [])
+            .expect("uncommitted generation mutation");
+        assert!(matches!(
+            store.refresh(),
+            RefreshStatus::Unchanged { generation: 1 }
+        ));
+        assert_eq!(
+            store.snapshot().expect("cached snapshot").data_hash,
+            initial.data_hash,
+            "rows outside a committed generation must not replace the publication cache"
+        );
+
+        connection
+            .execute(
+                "UPDATE collection_generation SET data_generation='2' WHERE singleton=1",
+                [],
+            )
+            .expect("commit generation");
+        assert!(matches!(
+            store.refresh(),
+            RefreshStatus::Updated { generation: 2 }
+        ));
+        let updated = store.snapshot().expect("updated snapshot");
+        assert_ne!(updated.data_hash, initial.data_hash);
+        assert_eq!(updated.details.history_samples[0].sol_tokens, 99);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
     fn v1_and_v2_wire_mark_last_good_snapshot_degraded_without_clearing_data() {
         let path = temp_db("last-good-legacy-wire");
         fixture(&path, 10);
@@ -1162,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_ranges_mark_all_details_versions_degraded_without_clearing_data() {
+    fn only_incomplete_ranges_mark_details_degraded_without_clearing_data() {
         let path = temp_db("pending-ranges-wire");
         fixture(&path, 10);
         let reader = DbReader::open(&path).expect("reader");
@@ -1182,11 +1276,25 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE session_pending_ranges(
-                    source_id TEXT NOT NULL, range_start INTEGER NOT NULL
+                    source_id TEXT NOT NULL, range_start INTEGER NOT NULL,
+                    complete INTEGER NOT NULL
                 );
-                INSERT INTO session_pending_ranges VALUES('fixture', 0);",
+                INSERT INTO session_pending_ranges VALUES('complete', 0, 1);",
             )
             .expect("pending fixture");
+        for version in ["v1", "v2", "v3"] {
+            let wire_request = format!("GET /{version}/details HTTP/1.1\r\nHost:x\r\n\r\n");
+            let response = request(server.local_addr(), &wire_request);
+            let value: serde_json::Value =
+                serde_json::from_str(body(&response)).expect("complete diagnostic JSON");
+            assert_eq!(value["state"], "ready");
+        }
+        connection
+            .execute(
+                "INSERT INTO session_pending_ranges VALUES('incomplete', 1, 0)",
+                [],
+            )
+            .expect("incomplete fixture");
         for (version, previous) in ["v1", "v2", "v3"].into_iter().zip(initial.iter()) {
             let wire_request = format!("GET /{version}/details HTTP/1.1\r\nHost:x\r\n\r\n");
             let response = request(server.local_addr(), &wire_request);

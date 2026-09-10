@@ -501,6 +501,21 @@ pub struct TokenSnapshot {
 }
 
 impl TokenSnapshot {
+    fn checked_delta_from(self, previous: Self) -> Option<Self> {
+        let cache_write_input = match (self.cache_write_input, previous.cache_write_input) {
+            (Some(current), Some(before)) => Some(current.checked_sub(before)?),
+            (None, None) => None,
+            _ => return None,
+        };
+        Some(Self {
+            total: self.total.checked_sub(previous.total)?,
+            input: self.input.checked_sub(previous.input)?,
+            cached_input: self.cached_input.checked_sub(previous.cached_input)?,
+            output: self.output.checked_sub(previous.output)?,
+            cache_write_input,
+        })
+    }
+
     fn cache_write_delta_from(self, previous: Self) -> Option<u64> {
         match (self.cache_write_input, previous.cache_write_input) {
             (Some(current), Some(before)) => current.checked_sub(before),
@@ -528,13 +543,27 @@ impl TokenSnapshot {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct ModelCounter {
     total: u64,
     input: u64,
     cached_input: u64,
     output: u64,
     cache_write_input: Option<u64>,
+}
+
+impl Default for ModelCounter {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            input: 0,
+            cached_input: 0,
+            output: 0,
+            // `Some(0)` is the additive identity for a known counter. Any
+            // unknown delta still changes the accumulated value to `None`.
+            cache_write_input: Some(0),
+        }
+    }
 }
 
 impl ModelCounter {
@@ -673,6 +702,9 @@ impl ModelTotals {
     }
 
     fn add(&mut self, model: &str, delta: TokenSnapshot) -> Result<(), RecorderError> {
+        if !delta.has_usage() {
+            return Ok(());
+        }
         let model = Self::canonical_model(model).unwrap_or_else(|| UNATTRIBUTED_MODEL.to_owned());
         self.values.entry(model).or_default().add(delta)
     }
@@ -1303,6 +1335,9 @@ impl Recorder {
             let source = &sources[(first_source + logical_index) % source_count];
             let prior = prior_checkpoint(&state.checkpoints, source);
             if consumed_budget >= self.config.chunk_bytes {
+                if checkpoint_covers_observed_end(prior, source) {
+                    continue;
+                }
                 pending_ranges = pending_ranges.saturating_add(1);
                 pending_evidence.push(pending_source_issue(
                     source,
@@ -1321,7 +1356,6 @@ impl Recorder {
                 cycle_seq,
                 reset_at,
                 window_start,
-                timeline_end,
                 self.config.chunk_bytes.saturating_sub(consumed_budget),
                 &mut totals,
                 &mut events,
@@ -1392,7 +1426,12 @@ impl Recorder {
             None
         };
         let mut history_events = replayed_events;
-        history_events.extend(events.iter().cloned());
+        history_events.extend(
+            events
+                .iter()
+                .filter(|event| event.timestamp <= timeline_end)
+                .cloned(),
+        );
         let history_initial_totals = if period_restarted {
             ModelTotals::default()
         } else {
@@ -1642,8 +1681,9 @@ fn pending_source_issue(
     cycle_seq: u64,
     reason: &'static str,
 ) -> SessionPendingRange {
-    let start_offset = prior.map_or(0, |checkpoint| checkpoint.committed_offset);
-    let prefix_generation = prior.map_or_else(
+    let resumable = prior.filter(|checkpoint| checkpoint_can_resume_offset(checkpoint, source));
+    let start_offset = resumable.map_or(0, |checkpoint| checkpoint.committed_offset);
+    let prefix_generation = resumable.map_or_else(
         || prefix_generation(collector_epoch, &source.recorded, EMPTY_SHA256),
         |checkpoint| checkpoint.prefix_generation,
     );
@@ -1807,19 +1847,21 @@ fn collect_jsonl(
     Ok(())
 }
 
-fn root_identity(_root: &Path, metadata: &Metadata) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"codex-info-session-root-v1\0");
+fn root_identity(root: &Path, metadata: &Metadata) -> String {
     #[cfg(unix)]
     {
-        hasher.update(metadata.dev().to_be_bytes());
-        hasher.update(metadata.ino().to_be_bytes());
+        let _ = root;
+        format!("unix:{}:{}", metadata.dev(), metadata.ino())
     }
     #[cfg(not(unix))]
     {
-        hasher.update(_root.to_string_lossy().as_bytes());
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in root.to_string_lossy().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("path-fnv1a64:{hash:016x}")
     }
-    hex_digest(hasher.finalize().as_slice())
 }
 
 fn recorded_source(root: String, relative: String, metadata: Metadata) -> RecordedSessionSource {
@@ -1866,6 +1908,21 @@ fn prior_checkpoint<'a>(
     })
 }
 
+fn checkpoint_covers_observed_end(prior: Option<&SessionCheckpoint>, source: &Source) -> bool {
+    prior.is_some_and(|checkpoint| {
+        checkpoint_can_resume_offset(checkpoint, source)
+            && checkpoint.committed_offset == source.recorded.file_bytes
+    })
+}
+
+fn checkpoint_can_resume_offset(checkpoint: &SessionCheckpoint, source: &Source) -> bool {
+    checkpoint.root_identity == source.recorded.root_identity
+        && checkpoint.relative_path == source.recorded.relative_path
+        && checkpoint.file_device == source.recorded.file_device
+        && checkpoint.file_inode == source.recorded.file_inode
+        && checkpoint.committed_offset <= source.recorded.file_bytes
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_source(
     source: &Source,
@@ -1875,7 +1932,6 @@ fn scan_source(
     cycle_seq: u64,
     reset_at: i64,
     window_start: i64,
-    timeline_end: i64,
     max_bytes: u64,
     totals: &mut ModelTotals,
     events: &mut Vec<TimedModelUsage>,
@@ -1890,11 +1946,26 @@ fn scan_source(
     {
         return Ok(None);
     }
+    // A byte offset is valid only for the same physical file. If a restore
+    // changes inode, scan from zero and re-synchronize on the durable token
+    // vector below instead of guessing that the old byte boundary survived.
     let continuous = prior.filter(|checkpoint| {
-        checkpoint.file_device == source.recorded.file_device
+        checkpoint.root_identity == source.recorded.root_identity
+            && checkpoint.relative_path == source.recorded.relative_path
+            && checkpoint.file_device == source.recorded.file_device
             && checkpoint.file_inode == source.recorded.file_inode
             && checkpoint.committed_offset <= before_file.len()
     });
+    let recovery_anchor = prior
+        .filter(|_| continuous.is_none())
+        .map(|checkpoint| TokenSnapshot {
+            total: checkpoint.previous_total,
+            input: checkpoint.previous_input,
+            cached_input: checkpoint.previous_cached_input,
+            output: checkpoint.previous_output,
+            cache_write_input: checkpoint.previous_cache_write_input,
+        });
+    let mut recovery_anchor_found = recovery_anchor.is_none();
     let (
         start_offset,
         mut discard_until_lf,
@@ -1957,6 +2028,10 @@ fn scan_source(
     // vector is what lets a later reset boundary reconstruct outage-spanning
     // usage without rereading or double-adding checkpoints.
     let mut all_candidate_events = Vec::new();
+    let mut recovery_stream_previous = None;
+    let mut recovery_stream_events = Vec::new();
+    let mut recovery_stream_proven = true;
+    let mut recovery_last = None;
     let mut read_any = false;
     loop {
         if consumed_bytes >= max_bytes && read_any {
@@ -2046,6 +2121,43 @@ fn scan_source(
             ));
             continue;
         }
+        if let Some(anchor) = recovery_anchor.filter(|_| !recovery_anchor_found) {
+            baseline_known = true;
+            previous = current;
+            let timestamp = summary.event_timestamp();
+            let model = last_model
+                .as_deref()
+                .unwrap_or(UNATTRIBUTED_MODEL)
+                .to_owned();
+            recovery_last = Some((current, timestamp));
+            if current != anchor {
+                if let Some(before) = recovery_stream_previous {
+                    match current.checked_delta_from(before) {
+                        Some(delta) if timestamp > 0 && delta.has_usage() => {
+                            recovery_stream_events.push(TimedModelUsage {
+                                timestamp,
+                                model,
+                                delta,
+                            });
+                        }
+                        Some(_) => {}
+                        None => {
+                            recovery_stream_proven = false;
+                            // Values before a reset or an incomparable token
+                            // shape may overlap the old physical file. Only
+                            // the new, internally monotonic segment after this
+                            // boundary is safe to reconstruct.
+                            recovery_stream_events.clear();
+                        }
+                    }
+                }
+                recovery_stream_previous = Some(current);
+                continue;
+            }
+            recovery_anchor_found = true;
+            recovery_stream_events.clear();
+            continue;
+        }
         if !baseline_known {
             previous = current;
             baseline_known = true;
@@ -2097,10 +2209,11 @@ fn scan_source(
             continue;
         }
         candidate_totals.add(&model, delta)?;
-        if timestamp <= timeline_end {
-            if let Some(event) = timed_event {
-                candidate_events.push(event);
-            }
+        // Session timestamps can be slightly ahead of the local cycle clock.
+        // Keep every source-authoritative delta paired with the total applied
+        // by this transaction; display projection excludes future points.
+        if let Some(event) = timed_event {
+            candidate_events.push(event);
         }
     }
 
@@ -2113,6 +2226,44 @@ fn scan_source(
         || after_file.len() < end_offset
     {
         return Ok(None);
+    }
+    if let Some(anchor) = recovery_anchor.filter(|_| !recovery_anchor_found) {
+        unresolved = true;
+        pending_evidence.push((
+            admitted_start,
+            end_offset,
+            "checkpoint-token-anchor-missing",
+            true,
+        ));
+        let recovered_events = if recovery_stream_proven {
+            recovery_last
+                .and_then(|(last, timestamp)| {
+                    last.checked_delta_from(anchor).and_then(|delta| {
+                        (timestamp > 0 && delta.has_usage()).then(|| {
+                            vec![TimedModelUsage {
+                                timestamp,
+                                model: UNATTRIBUTED_MODEL.to_owned(),
+                                delta,
+                            }]
+                        })
+                    })
+                })
+                // If the replacement starts after a proven counter reset,
+                // its endpoint cannot be joined to the old anchor. Preserve
+                // only deltas proven inside the new monotonic stream.
+                .unwrap_or(recovery_stream_events)
+        } else {
+            recovery_stream_events
+        };
+        for event in recovered_events {
+            all_candidate_events.push(event.clone());
+            if reset_at == 0 {
+                candidate_events.push(event);
+            } else if event.timestamp >= window_start && event.timestamp <= reset_at {
+                candidate_totals.add(&event.model, event.delta)?;
+                candidate_events.push(event);
+            }
+        }
     }
     let accepted_digest = (end_offset > admitted_start)
         .then(|| sha256_file_range(&source.path, admitted_start, end_offset))
@@ -2444,22 +2595,15 @@ fn build_timeline_recovery(
     }
     let dollars = offsets.dollar_totals();
     let final_tokens = offsets.token_totals();
-    let weighted = |value: u64, final_value: u64, final_dollars: f64| {
-        if final_value == 0 {
-            0.0
-        } else {
-            final_dollars * value as f64 / final_value as f64
-        }
-    };
     let mut recovery_points = Vec::with_capacity(points.len());
     for (timestamp, model_totals) in points {
         let point_totals = ModelTotals::from_state(&model_totals).token_totals();
         recovery_points.push(SessionTimelineRecoveryPoint {
             timestamp,
             offset_model_totals: model_totals,
-            offset_sol_dollars: weighted(point_totals.0, final_tokens.0, dollars.0),
-            offset_terra_dollars: weighted(point_totals.1, final_tokens.1, dollars.1),
-            offset_luna_dollars: weighted(point_totals.2, final_tokens.2, dollars.2),
+            offset_sol_dollars: weighted_dollars(point_totals.0, final_tokens.0, dollars.0),
+            offset_terra_dollars: weighted_dollars(point_totals.1, final_tokens.1, dollars.1),
+            offset_luna_dollars: weighted_dollars(point_totals.2, final_tokens.2, dollars.2),
         });
     }
     let mut canonical_ranges = ranges.to_vec();
@@ -2492,6 +2636,18 @@ fn build_timeline_recovery(
         &identity.partition_id,
         recovery,
     )?))
+}
+
+fn weighted_dollars(value: u64, final_value: u64, final_dollars: f64) -> f64 {
+    if final_value == 0 {
+        0.0
+    } else if value == final_value {
+        // Preserve the authoritative endpoint bit-for-bit. Multiplying by
+        // the token count before dividing can round one ULP above it.
+        final_dollars
+    } else {
+        final_dollars * (value as f64 / final_value as f64)
+    }
 }
 
 enum RecordRead {
@@ -3545,6 +3701,20 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn session_root_identity_remains_legacy_checkpoint_compatible() {
+        let root = temp_root("legacy-root-identity");
+        let metadata = fs::metadata(&root).unwrap();
+
+        assert_eq!(
+            root_identity(&root, &metadata),
+            format!("unix:{}:{}", metadata.dev(), metadata.ino())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn two_fresh_durable_acks_reflect_tokens() {
         let (root, database) = prepare("two-acks");
@@ -3566,6 +3736,150 @@ mod tests {
             5
         );
         assert_eq!(recorder.run_cycle().unwrap().unwrap().generation, 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn source_timestamp_ahead_of_cycle_clock_does_not_block_durable_ack() {
+        let (root, database) = prepare("future-source-timestamp");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE collection_generation SET window_seconds=?1",
+                [7_200_i64],
+            )
+            .unwrap();
+        fs::write(&source, token(10, now - 180)).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{}{}", token(15, now - 120), token(20, now + 120)).as_bytes())
+            .unwrap();
+
+        let report = recorder.run_cycle().unwrap().unwrap();
+
+        assert_eq!(report.generation, 2);
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            10
+        );
+        let future_samples: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM usage_history WHERE timestamp > ?1",
+                [now],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(future_samples, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unchanged_counter_does_not_create_a_phantom_model_total() {
+        let mut totals = ModelTotals::default();
+
+        totals.add("ASTRA", TokenSnapshot::default()).unwrap();
+
+        assert!(totals.to_totals().is_empty());
+    }
+
+    #[test]
+    fn known_cache_write_delta_is_preserved_from_zero() {
+        let mut totals = ModelTotals::default();
+
+        totals
+            .add(
+                "ASTRA",
+                TokenSnapshot {
+                    total: 10,
+                    input: 8,
+                    cached_input: 2,
+                    output: 2,
+                    cache_write_input: Some(3),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(totals.to_totals()[0].cache_write_input_tokens, Some(3));
+    }
+
+    #[test]
+    fn recovery_delta_requires_matching_cache_write_lineage() {
+        let anchor = TokenSnapshot {
+            total: 10,
+            input: 8,
+            cached_input: 2,
+            output: 2,
+            cache_write_input: Some(3),
+        };
+        let current = TokenSnapshot {
+            total: 15,
+            input: 12,
+            cached_input: 3,
+            output: 3,
+            cache_write_input: Some(5),
+        };
+
+        assert_eq!(
+            current.checked_delta_from(anchor),
+            Some(TokenSnapshot {
+                total: 5,
+                input: 4,
+                cached_input: 1,
+                output: 1,
+                cache_write_input: Some(2),
+            })
+        );
+        assert_eq!(
+            TokenSnapshot {
+                cache_write_input: None,
+                ..current
+            }
+            .checked_delta_from(anchor),
+            None
+        );
+    }
+
+    #[test]
+    fn timeline_weighting_preserves_the_exact_final_dollar_endpoint() {
+        let dollars = 54.696256_f64;
+
+        assert_eq!(weighted_dollars(87_009_506, 87_009_506, dollars), dollars);
+        assert!(weighted_dollars(87_009_505, 87_009_506, dollars) <= dollars);
+    }
+
+    #[test]
+    fn exhausted_cycle_budget_does_not_mark_sources_already_at_eof_as_backlog() {
+        let (root, database) = prepare("budget-eof");
+        let first_source = root.join("sessions/a.jsonl");
+        let second_source = root.join("sessions/b.jsonl");
+        let now = Utc::now().timestamp();
+        fs::write(&first_source, token(10, now)).unwrap();
+        fs::write(&second_source, token(20, now)).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        assert_eq!(recorder.run_cycle().unwrap().unwrap().pending_ranges, 0);
+        drop(recorder);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&first_source)
+            .unwrap()
+            .write_all(token(15, now + 1).as_bytes())
+            .unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1), &database, &identity()).unwrap();
+
+        let report = recorder.run_cycle().unwrap().unwrap();
+
+        assert_eq!(report.accepted_ranges, 1);
+        assert_eq!(report.pending_ranges, 0);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3773,23 +4087,119 @@ mod tests {
     }
 
     #[test]
-    fn replaced_source_is_rebased_without_double_counting() {
+    fn replaced_source_without_anchor_is_reconciled_once_and_reported() {
         let (root, database) = prepare("source-replacement");
         let source = root.join("sessions/one.jsonl");
         let now = Utc::now().timestamp();
-        fs::write(&source, format!("{}{}", token(10, now), token(15, now + 1))).unwrap();
+        let original = (1..=8)
+            .map(|index| token(index * 10, now + index as i64))
+            .collect::<String>();
+        fs::write(&source, original).unwrap();
         let mut recorder =
-            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            70
+        );
+        fs::write(
+            &source,
+            format!("{}{}", token(100, now + 20), token(105, now + 21)),
+        )
+        .unwrap();
+        let replacement_report = recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            95
+        );
+        assert_eq!(replacement_report.pending_ranges, 1);
+        let diagnostic: (String, i64) = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT reason, complete FROM session_pending_ranges",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            diagnostic,
+            ("checkpoint-token-anchor-missing".to_owned(), 1)
+        );
+
+        recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            95
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replaced_source_recovers_only_the_segment_after_a_counter_reset() {
+        for (name, replacement_values, recovered_total) in [
+            ("reset-above-anchor", [90, 100, 20, 105], 155),
+            ("reset-below-anchor", [90, 100, 20, 30], 80),
+            ("reset-before-first-record", [20, 20, 20, 30], 80),
+        ] {
+            let (root, database) = prepare(name);
+            let source = root.join("sessions/one.jsonl");
+            let now = Utc::now().timestamp();
+            let original = (1..=8)
+                .map(|index| token(index * 10, now + index as i64))
+                .collect::<String>();
+            fs::write(&source, original).unwrap();
+            let mut recorder =
+                Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+            recorder.run_cycle().unwrap().unwrap();
+
+            let replacement = replacement_values
+                .into_iter()
+                .enumerate()
+                .map(|(index, total)| token(total, now + 20 + index as i64))
+                .collect::<String>();
+            fs::write(&source, replacement).unwrap();
+            let report = recorder.run_cycle().unwrap().unwrap();
+
+            assert_eq!(
+                recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+                recovered_total
+            );
+            assert_eq!(report.pending_ranges, 1);
+            recorder.run_cycle().unwrap().unwrap();
+            assert_eq!(
+                recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+                recovered_total
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_source_inode_reuses_the_logical_path_checkpoint() {
+        let (root, database) = prepare("source-inode-replacement");
+        let source = root.join("sessions/one.jsonl");
+        let replacement = root.join("sessions/replacement.tmp");
+        let now = Utc::now().timestamp();
+        let committed = format!("{}{}", token(10, now), token(15, now + 1));
+        fs::write(&source, &committed).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         recorder.run_cycle().unwrap().unwrap();
         assert_eq!(
             recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
             5
         );
-        fs::write(&source, token(100, now + 2)).unwrap();
+        let original_inode = fs::metadata(&source).unwrap().ino();
+        fs::write(&replacement, format!("{committed}{}", token(20, now + 2))).unwrap();
+        fs::rename(&replacement, &source).unwrap();
+        assert_ne!(fs::metadata(&source).unwrap().ino(), original_inode);
+
         recorder.run_cycle().unwrap().unwrap();
+
         assert_eq!(
             recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
-            5
+            10
         );
         let _ = fs::remove_dir_all(root);
     }

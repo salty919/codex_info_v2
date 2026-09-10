@@ -182,6 +182,24 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
+    public async Task CurrentKeepsReadyUsageWhenTheOptionalPlanLabelIsUnavailable()
+    {
+        var json = ValidCurrentJson().Replace(
+            "\"plan_label\":\"Pro\"",
+            "\"plan_label\":null",
+            StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(json, includePublishedPair: true)));
+
+        var result = await client.FetchCurrentAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Null(result.Snapshot!.PlanLabel);
+        Assert.NotNull(result.Snapshot.Quota);
+        Assert.NotEmpty(result.Snapshot.Models);
+    }
+
+    [Fact]
     public async Task CurrentFallsBackToLegacyDetailsOnlyAfterAnExact404()
     {
         var paths = new List<string>();
@@ -814,12 +832,27 @@ public sealed class LoopbackStatusClientTests
         Assert.Equal(monthly, result.Snapshot.Quota!.Monthly);
     }
 
+    [Fact]
+    public async Task DetailsAcceptsUnavailableOptionalPlanWithAuthenticatedUsage()
+    {
+        var json = ValidDetailsJson().Replace(
+            "\"plan_label\":\"Pro\"",
+            "\"plan_label\":null",
+            StringComparison.Ordinal);
+
+        var result = await FetchDetails(json);
+
+        Assert.True(result.IsSuccess);
+        Assert.Null(result.Snapshot!.PlanLabel);
+        Assert.NotNull(result.Snapshot.Quota);
+        Assert.NotEmpty(result.Snapshot.Models);
+    }
+
     [Theory]
     [InlineData("\"pro\"", false)]
     [InlineData("\"Enterprise\"", true)]
     [InlineData("\"エンタープライズ\"", false)]
     [InlineData("\"Pro\"", true)]
-    [InlineData("null", false)]
     public async Task DetailsRejectsNonCanonicalPlanOrMonthlyDomain(
         string planLabelJson,
         bool monthly)
@@ -1166,14 +1199,14 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
-    public void ClientTimeoutIsFixedAtOneSecond()
+    public void ClientTimeoutMatchesTheRestRequestBudget()
     {
         using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(ValidDetailsJson())));
         var field = typeof(LoopbackStatusClient).GetField("_httpClient", BindingFlags.NonPublic | BindingFlags.Instance);
         Assert.NotNull(field);
         var httpClient = Assert.IsType<HttpClient>(field!.GetValue(client));
 
-        Assert.Equal(TimeSpan.FromSeconds(1), httpClient.Timeout);
+        Assert.Equal(TimeSpan.FromSeconds(3), httpClient.Timeout);
     }
 
     [Fact]

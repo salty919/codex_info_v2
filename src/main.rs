@@ -87,7 +87,7 @@ enum ThreadCommand {
     Read {
         auth_epoch: u64,
         admission: AccountAdmission,
-        account_partition: account_scope::AccountPartition,
+        account_partition: Box<account_scope::AccountPartition>,
     },
     Stop,
 }
@@ -100,8 +100,8 @@ enum LocalCommand {
         admission: AccountAdmission,
         collection_state: Box<usage_store::SessionCollectionState>,
         regression_recovery_state: Option<Box<usage_store::SessionCollectionState>>,
-        history_continuity_recovery: Option<usage_store::HistoryContinuityRecovery>,
-        cumulative_recovery: Option<usage_store::SessionCumulativeRecovery>,
+        history_continuity_recovery: Box<Option<usage_store::HistoryContinuityRecovery>>,
+        cumulative_recovery: Box<Option<usage_store::SessionCumulativeRecovery>>,
         reset_at: i64,
         window_seconds: i64,
     },
@@ -2111,7 +2111,7 @@ fn read_active_thread_rollout_cached_with_checkpoints(
                         .or_else(|| (complete_len > parse_start).then_some(true)),
                 )
             })
-            .unwrap_or_else(thread_contract::RolloutAccumulator::new);
+            .unwrap_or_default();
         let thread_id = read_thread_session_meta_id(&mut file)?;
         if complete_len > parse_start {
             let appended_len = complete_len.checked_sub(parse_start).ok_or(())?;
@@ -2402,26 +2402,22 @@ fn cleanup_recorded_session_overflow(
 }
 
 #[cfg(test)]
-fn fetch_active_thread_update(
-    input: &mut impl Write,
-    output: &Receiver<RpcReadEvent>,
-    next_id: &mut u64,
-    sessions_root: &Path,
-    active_paths: &BTreeSet<PathBuf>,
+struct ActiveThreadUpdateContext<'a, W: Write> {
+    input: &'a mut W,
+    output: &'a Receiver<RpcReadEvent>,
+    next_id: &'a mut u64,
+    sessions_root: &'a Path,
+    active_paths: &'a BTreeSet<PathBuf>,
     deadline: Instant,
-    rollout_cache: &mut ThreadRolloutCache,
-    checkpoints: &[usage_store::SessionCheckpoint],
+    rollout_cache: &'a mut ThreadRolloutCache,
+    checkpoints: &'a [usage_store::SessionCheckpoint],
+}
+
+#[cfg(test)]
+fn fetch_active_thread_update<W: Write>(
+    context: &mut ActiveThreadUpdateContext<'_, W>,
 ) -> ActiveThreadUpdate {
-    fetch_active_thread_update_before_deadline_with_cache(
-        input,
-        output,
-        next_id,
-        sessions_root,
-        active_paths,
-        deadline,
-        rollout_cache,
-        checkpoints,
-    )
+    fetch_active_thread_update_before_deadline_with_cache(context)
 }
 
 #[cfg(test)]
@@ -2452,30 +2448,28 @@ fn fetch_active_thread_update_for_paths_and_state(
     _codex_root: Option<&Path>,
 ) -> ActiveThreadUpdate {
     let mut rollout_cache = ThreadRolloutCache::default();
-    fetch_active_thread_update_before_deadline_with_cache(
+    let mut context = ActiveThreadUpdateContext {
         input,
         output,
         next_id,
         sessions_root,
         active_paths,
-        Instant::now() + security::RPC_RESPONSE_TIMEOUT,
-        &mut rollout_cache,
-        &[],
-    )
+        deadline: Instant::now() + security::RPC_RESPONSE_TIMEOUT,
+        rollout_cache: &mut rollout_cache,
+        checkpoints: &[],
+    };
+    fetch_active_thread_update_before_deadline_with_cache(&mut context)
 }
 
 #[cfg(test)]
-fn fetch_active_thread_update_before_deadline_with_cache(
-    input: &mut impl Write,
-    output: &Receiver<RpcReadEvent>,
-    next_id: &mut u64,
-    sessions_root: &Path,
-    active_paths: &BTreeSet<PathBuf>,
-    deadline: Instant,
-    rollout_cache: &mut ThreadRolloutCache,
-    checkpoints: &[usage_store::SessionCheckpoint],
+fn fetch_active_thread_update_before_deadline_with_cache<W: Write>(
+    context: &mut ActiveThreadUpdateContext<'_, W>,
 ) -> ActiveThreadUpdate {
-    rollout_cache
+    let sessions_root = context.sessions_root;
+    let active_paths = context.active_paths;
+    let checkpoints = context.checkpoints;
+    context
+        .rollout_cache
         .entries
         .retain(|path, _| active_paths.contains(path));
     let mut rollouts = BTreeMap::new();
@@ -2484,7 +2478,7 @@ fn fetch_active_thread_update_before_deadline_with_cache(
         let (thread_id, rollout) = match read_active_thread_rollout_cached_with_checkpoints(
             sessions_root,
             active_path,
-            rollout_cache,
+            context.rollout_cache,
             checkpoints,
         ) {
             Ok(value) => value,
@@ -2493,18 +2487,18 @@ fn fetch_active_thread_update_before_deadline_with_cache(
                 return ActiveThreadUpdate::Failed;
             }
         };
-        let request_id = *next_id;
-        let Some(following_id) = next_id.checked_add(1) else {
+        let request_id = *context.next_id;
+        let Some(following_id) = context.next_id.checked_add(1) else {
             return ActiveThreadUpdate::Failed;
         };
-        *next_id = following_id;
-        let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
+        *context.next_id = following_id;
+        let Some(wait) = context.deadline.checked_duration_since(Instant::now()) else {
             debug_runtime("thread read cycle timed out");
             return ActiveThreadUpdate::Failed;
         };
         let result = match request_with_timeout_observed(
-            input,
-            output,
+            context.input,
+            context.output,
             request_id,
             "thread/read",
             json!({"threadId": thread_id, "includeTurns": false}),
@@ -2533,7 +2527,7 @@ fn fetch_active_thread_update_before_deadline_with_cache(
             }
         };
         let response_path = candidate.path().and_then(|path| {
-            security::canonical_regular_file_under(sessions_root, Path::new(path)).ok()
+            security::canonical_regular_file_under(context.sessions_root, Path::new(path)).ok()
         });
         if candidate.id() != thread_id || response_path.as_ref() != Some(active_path) {
             debug_runtime("thread read identity mismatch");
@@ -2979,10 +2973,9 @@ fn reset_sample_groups(samples: &[UsageHistorySample]) -> Vec<ResetSampleGroup> 
             if !moving_started
                 && candidate.timestamp == anchor.timestamp
                 && candidate.reset_at.abs_diff(anchor.reset_at) > RESET_AT_TOLERANCE_SECONDS as u64
+                && !has_forward_observation[index]
             {
-                if !has_forward_observation[index] {
-                    break;
-                }
+                break;
             }
             if !moving_started
                 && candidate.reset_at < anchor.reset_at
@@ -4779,6 +4772,20 @@ struct GraphModelPoint {
 
 type GraphModelTimelines = BTreeMap<String, BTreeMap<i64, GraphModelPoint>>;
 
+struct GraphSelectionInput<'a> {
+    samples: &'a [&'a UsageHistorySample],
+    period_start: i64,
+    period_end: i64,
+    show_luna: bool,
+    show_terra: bool,
+    show_sol: bool,
+    show_astra: bool,
+    show_tokens: bool,
+    untrusted_minutes: &'a BTreeSet<i64>,
+    confirmed_gaps: &'a [GraphConfirmedGap],
+    model_timelines: &'a GraphModelTimelines,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GraphRemainingOrigin {
     Raw,
@@ -5103,96 +5110,37 @@ fn graph_paths_for_selection(
     show_sol: bool,
     show_tokens: bool,
 ) -> GraphPaths {
-    graph_paths_for_selection_with_confirmed_gaps(
+    let untrusted_minutes = BTreeSet::new();
+    let confirmed_gaps = [];
+    let model_timelines = BTreeMap::new();
+    graph_paths_for_selection_with_confirmed_gaps(GraphSelectionInput {
         samples,
         period_start,
         period_end,
         show_luna,
         show_terra,
         show_sol,
+        show_astra: false,
         show_tokens,
-        &[],
-    )
+        untrusted_minutes: &untrusted_minutes,
+        confirmed_gaps: &confirmed_gaps,
+        model_timelines: &model_timelines,
+    })
 }
 
 #[cfg(test)]
-fn graph_paths_for_selection_with_confirmed_gaps(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    show_luna: bool,
-    show_terra: bool,
-    show_sol: bool,
-    show_tokens: bool,
-    confirmed_gaps: &[GraphConfirmedGap],
-) -> GraphPaths {
-    graph_paths_for_selection_with_sources(
-        samples,
-        period_start,
-        period_end,
-        show_luna,
-        show_terra,
-        show_sol,
-        show_tokens,
-        &BTreeSet::new(),
-        confirmed_gaps,
-    )
+fn graph_paths_for_selection_with_confirmed_gaps(input: GraphSelectionInput<'_>) -> GraphPaths {
+    graph_paths_for_selection_with_sources(input)
 }
 
 #[cfg(test)]
-fn graph_paths_for_selection_with_sources(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    show_luna: bool,
-    show_terra: bool,
-    show_sol: bool,
-    show_tokens: bool,
-    untrusted_minutes: &BTreeSet<i64>,
-    confirmed_gaps: &[GraphConfirmedGap],
-) -> GraphPaths {
-    graph_paths_for_selection_with_sources_and_astra(
-        samples,
-        period_start,
-        period_end,
-        show_luna,
-        show_terra,
-        show_sol,
-        false,
-        show_tokens,
-        untrusted_minutes,
-        confirmed_gaps,
-        &BTreeMap::new(),
-    )
+fn graph_paths_for_selection_with_sources(input: GraphSelectionInput<'_>) -> GraphPaths {
+    graph_paths_for_selection_with_sources_and_astra(input)
 }
 
 #[cfg(test)]
-fn graph_paths_for_selection_with_sources_and_astra(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    show_luna: bool,
-    show_terra: bool,
-    show_sol: bool,
-    show_astra: bool,
-    show_tokens: bool,
-    untrusted_minutes: &BTreeSet<i64>,
-    confirmed_gaps: &[GraphConfirmedGap],
-    model_timelines: &GraphModelTimelines,
-) -> GraphPaths {
-    graph_paths_for_selection_with_sources_and_astra_with_lineage(
-        samples,
-        period_start,
-        period_end,
-        show_luna,
-        show_terra,
-        show_sol,
-        show_astra,
-        show_tokens,
-        untrusted_minutes,
-        confirmed_gaps,
-        model_timelines,
-    )
+fn graph_paths_for_selection_with_sources_and_astra(input: GraphSelectionInput<'_>) -> GraphPaths {
+    graph_paths_for_selection_with_sources_and_astra_with_lineage(input)
 }
 
 fn graph_minute_points_with_model_timelines(
@@ -5255,18 +5203,21 @@ fn graph_model_untrusted_minutes(
 }
 
 fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    show_luna: bool,
-    show_terra: bool,
-    show_sol: bool,
-    show_astra: bool,
-    show_tokens: bool,
-    untrusted_minutes: &BTreeSet<i64>,
-    confirmed_gaps: &[GraphConfirmedGap],
-    raw_model_timelines: &GraphModelTimelines,
+    input: GraphSelectionInput<'_>,
 ) -> GraphPaths {
+    let GraphSelectionInput {
+        samples,
+        period_start,
+        period_end,
+        show_luna,
+        show_terra,
+        show_sol,
+        show_astra,
+        show_tokens,
+        untrusted_minutes,
+        confirmed_gaps,
+        model_timelines,
+    } = input;
     let mut paths = graph_paths_with_sources(
         samples,
         period_start,
@@ -5280,13 +5231,13 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
     // Display metric and idle/activity evidence therefore have independent
     // anomaly state, while idle and quota smoothing always use raw tokens.
     let (display_timelines, display_anomaly_starts) = accepted_graph_model_timelines(
-        raw_model_timelines,
+        model_timelines,
         &BTreeSet::new(),
         show_tokens,
         confirmed_gaps,
     );
     let (token_timelines, token_anomaly_starts) =
-        accepted_graph_model_timelines(raw_model_timelines, &BTreeSet::new(), true, confirmed_gaps);
+        accepted_graph_model_timelines(model_timelines, &BTreeSet::new(), true, confirmed_gaps);
     let minute = graph_minute_points_with_model_timelines(
         samples,
         period_start,
@@ -5316,17 +5267,17 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
     let model_timeline_evidence = (!token_timelines.is_empty()).then_some((&token_timelines, true));
     if has_remaining_observation {
         if let Some(remaining) = remaining_points.last().map(|(_, value)| *value) {
-            let (solid, inferred) = remaining_paths_with_boundaries(
-                &remaining_points,
+            let (solid, inferred) = remaining_paths_with_boundaries(RemainingPathContext {
+                points: &remaining_points,
                 samples,
-                &minute,
+                model_points: &minute,
                 period_start,
                 period_end,
                 confirmed_gaps,
-                &token_anomaly_starts,
-                model_timeline_evidence,
-                Some(&remaining_evidence),
-            );
+                correction_starts: &token_anomaly_starts,
+                model_timelines: model_timeline_evidence,
+                remaining_evidence: Some(&remaining_evidence),
+            });
             paths.remaining = [solid.as_str(), inferred.as_str()]
                 .into_iter()
                 .filter(|path| !path.is_empty())
@@ -5423,17 +5374,19 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
     let graph_y =
         |value: f64| ((99.0 - value / scale_maximum * 98.0) / 100.0).clamp(0.01, 0.99) as f32;
     if show_luna {
-        let (flat, rising, inferred) = split_metric_line_paths_with_boundaries(
-            &minute,
+        let untrusted_minutes = model_untrusted("LUNA");
+        let context = MetricLinePathContext {
+            points: &minute,
             period_start,
             period_end,
-            scale_maximum,
-            |point| point.luna,
+            maximum: scale_maximum,
             confirmed_gaps,
-            &model_untrusted("LUNA"),
-            false,
-            &display_anomaly_starts,
-        );
+            untrusted_minutes: &untrusted_minutes,
+            require_legacy_vector: false,
+            correction_starts: &display_anomaly_starts,
+        };
+        let (flat, rising, inferred) =
+            split_metric_line_paths_with_boundaries(&context, |point| point.luna);
         paths.luna_flat = flat;
         paths.luna_rising = rising;
         paths.luna_inferred = inferred;
@@ -5453,17 +5406,19 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
         }
     }
     if show_terra {
-        let (flat, rising, inferred) = split_metric_line_paths_with_boundaries(
-            &minute,
+        let untrusted_minutes = model_untrusted("TERRA");
+        let context = MetricLinePathContext {
+            points: &minute,
             period_start,
             period_end,
-            scale_maximum,
-            |point| point.terra,
+            maximum: scale_maximum,
             confirmed_gaps,
-            &model_untrusted("TERRA"),
-            false,
-            &display_anomaly_starts,
-        );
+            untrusted_minutes: &untrusted_minutes,
+            require_legacy_vector: false,
+            correction_starts: &display_anomaly_starts,
+        };
+        let (flat, rising, inferred) =
+            split_metric_line_paths_with_boundaries(&context, |point| point.terra);
         paths.terra_flat = flat;
         paths.terra_rising = rising;
         paths.terra_inferred = inferred;
@@ -5483,17 +5438,19 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
         }
     }
     if show_sol {
-        let (flat, rising, inferred) = split_metric_line_paths_with_boundaries(
-            &minute,
+        let untrusted_minutes = model_untrusted("SOL");
+        let context = MetricLinePathContext {
+            points: &minute,
             period_start,
             period_end,
-            scale_maximum,
-            |point| point.sol,
+            maximum: scale_maximum,
             confirmed_gaps,
-            &model_untrusted("SOL"),
-            false,
-            &display_anomaly_starts,
-        );
+            untrusted_minutes: &untrusted_minutes,
+            require_legacy_vector: false,
+            correction_starts: &display_anomaly_starts,
+        };
+        let (flat, rising, inferred) =
+            split_metric_line_paths_with_boundaries(&context, |point| point.sol);
         paths.sol_flat = flat;
         paths.sol_rising = rising;
         paths.sol_inferred = inferred;
@@ -5513,17 +5470,19 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
         }
     }
     if show_astra {
-        let (flat, rising, inferred) = split_metric_line_paths_with_boundaries(
-            &minute,
+        let untrusted_minutes = model_untrusted("ASTRA");
+        let context = MetricLinePathContext {
+            points: &minute,
             period_start,
             period_end,
-            scale_maximum,
-            |point| point.astra,
+            maximum: scale_maximum,
             confirmed_gaps,
-            &model_untrusted("ASTRA"),
-            false,
-            &display_anomaly_starts,
-        );
+            untrusted_minutes: &untrusted_minutes,
+            require_legacy_vector: false,
+            correction_starts: &display_anomaly_starts,
+        };
+        let (flat, rising, inferred) =
+            split_metric_line_paths_with_boundaries(&context, |point| point.astra);
         paths.astra_flat = flat;
         paths.astra_rising = rising;
         paths.astra_inferred = inferred;
@@ -5928,6 +5887,17 @@ fn graph_interval_has_hard_break(
         || graph_interval_crosses_correction(start_at, end_at, correction_starts)
 }
 
+struct MetricLinePathContext<'a> {
+    points: &'a [HourlyModelSpend],
+    period_start: i64,
+    period_end: i64,
+    maximum: f64,
+    confirmed_gaps: &'a [GraphConfirmedGap],
+    untrusted_minutes: &'a BTreeSet<i64>,
+    require_legacy_vector: bool,
+    correction_starts: &'a BTreeSet<i64>,
+}
+
 fn split_metric_line_paths_with_confirmed_gaps(
     points: &[HourlyModelSpend],
     period_start: i64,
@@ -5936,39 +5906,26 @@ fn split_metric_line_paths_with_confirmed_gaps(
     value: impl Fn(&HourlyModelSpend) -> f64,
     confirmed_gaps: &[GraphConfirmedGap],
 ) -> (String, String, String) {
-    split_metric_line_paths_with_evidence(
+    let untrusted_minutes = BTreeSet::new();
+    let correction_starts = BTreeSet::new();
+    let context = MetricLinePathContext {
         points,
         period_start,
         period_end,
         maximum,
-        value,
         confirmed_gaps,
-        &BTreeSet::new(),
-        true,
-    )
+        untrusted_minutes: &untrusted_minutes,
+        require_legacy_vector: true,
+        correction_starts: &correction_starts,
+    };
+    split_metric_line_paths_with_evidence(&context, value)
 }
 
 fn split_metric_line_paths_with_evidence(
-    points: &[HourlyModelSpend],
-    period_start: i64,
-    period_end: i64,
-    maximum: f64,
+    context: &MetricLinePathContext<'_>,
     value: impl Fn(&HourlyModelSpend) -> f64,
-    confirmed_gaps: &[GraphConfirmedGap],
-    untrusted_minutes: &BTreeSet<i64>,
-    require_legacy_vector: bool,
 ) -> (String, String, String) {
-    split_metric_line_paths_with_boundaries(
-        points,
-        period_start,
-        period_end,
-        maximum,
-        value,
-        confirmed_gaps,
-        untrusted_minutes,
-        require_legacy_vector,
-        &BTreeSet::new(),
-    )
+    split_metric_line_paths_with_boundaries(context, value)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6078,20 +6035,13 @@ fn metric_line_segments_with_boundaries(
 }
 
 fn split_metric_line_paths_with_boundaries(
-    points: &[HourlyModelSpend],
-    period_start: i64,
-    period_end: i64,
-    maximum: f64,
+    context: &MetricLinePathContext<'_>,
     value: impl Fn(&HourlyModelSpend) -> f64,
-    confirmed_gaps: &[GraphConfirmedGap],
-    untrusted_minutes: &BTreeSet<i64>,
-    require_legacy_vector: bool,
-    correction_starts: &BTreeSet<i64>,
 ) -> (String, String, String) {
-    let span = (period_end - period_start).max(1) as f64;
-    let scale = maximum.max(1.0);
+    let span = (context.period_end - context.period_start).max(1) as f64;
+    let scale = context.maximum.max(1.0);
     let coordinate = |point: &HourlyModelSpend| {
-        let x = ((point.timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
+        let x = ((point.timestamp - context.period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
         let y = (99.0 - value(point).max(0.0) / scale * 98.0).clamp(1.0, 99.0);
         (
             canonical_graph_viewbox_value(x),
@@ -6102,15 +6052,15 @@ fn split_metric_line_paths_with_boundaries(
     let mut rising = String::new();
     let mut inferred = String::new();
     for segment in metric_line_segments_with_boundaries(
-        points,
+        context.points,
         &value,
-        confirmed_gaps,
-        untrusted_minutes,
-        require_legacy_vector,
-        correction_starts,
+        context.confirmed_gaps,
+        context.untrusted_minutes,
+        context.require_legacy_vector,
+        context.correction_starts,
     ) {
-        let start = coordinate(&points[segment.start_index]);
-        let end = coordinate(&points[segment.end_index]);
+        let start = coordinate(&context.points[segment.start_index]);
+        let end = coordinate(&context.points[segment.end_index]);
         let target = match segment.kind {
             GraphMetricSegmentKind::Flat => &mut flat,
             GraphMetricSegmentKind::Rising => &mut rising,
@@ -7408,17 +7358,18 @@ fn remaining_paths_with_evidence(
     period_end: i64,
     confirmed_gaps: &[GraphConfirmedGap],
 ) -> (String, String) {
-    remaining_paths_with_boundaries(
+    let correction_starts = BTreeSet::new();
+    remaining_paths_with_boundaries(RemainingPathContext {
         points,
         samples,
         model_points,
         period_start,
         period_end,
         confirmed_gaps,
-        &BTreeSet::new(),
-        None,
-        None,
-    )
+        correction_starts: &correction_starts,
+        model_timelines: None,
+        remaining_evidence: None,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7538,17 +7489,30 @@ fn remaining_point_has_measured_quota(
     }
 }
 
-fn remaining_paths_with_boundaries(
-    points: &[(i64, f64)],
-    samples: &[&UsageHistorySample],
-    model_points: &[HourlyModelSpend],
+struct RemainingPathContext<'a> {
+    points: &'a [(i64, f64)],
+    samples: &'a [&'a UsageHistorySample],
+    model_points: &'a [HourlyModelSpend],
     period_start: i64,
     period_end: i64,
-    confirmed_gaps: &[GraphConfirmedGap],
-    correction_starts: &BTreeSet<i64>,
-    model_timelines: Option<(&GraphModelTimelines, bool)>,
-    remaining_evidence: Option<&[GraphRemainingEvidence]>,
-) -> (String, String) {
+    confirmed_gaps: &'a [GraphConfirmedGap],
+    correction_starts: &'a BTreeSet<i64>,
+    model_timelines: Option<(&'a GraphModelTimelines, bool)>,
+    remaining_evidence: Option<&'a [GraphRemainingEvidence]>,
+}
+
+fn remaining_paths_with_boundaries(context: RemainingPathContext<'_>) -> (String, String) {
+    let RemainingPathContext {
+        points,
+        samples,
+        model_points,
+        period_start,
+        period_end,
+        confirmed_gaps,
+        correction_starts,
+        model_timelines,
+        remaining_evidence,
+    } = context;
     let span = (period_end - period_start).max(1) as f64;
     let coordinate = |(timestamp, raw): (i64, f64)| {
         let x = ((timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
@@ -8636,17 +8600,33 @@ fn timeline_current_model_totals(
 }
 
 #[cfg(test)]
-fn build_session_timeline_recovery(
-    events: &[TimedModelUsage],
+struct SessionTimelineRecoveryContext<'a> {
+    events: &'a [TimedModelUsage],
     reset_at: i64,
     window_seconds: i64,
     timeline_end: i64,
-    collection_state: &usage_store::SessionCollectionState,
-    ranges: &[usage_store::SessionRange],
+    collection_state: &'a usage_store::SessionCollectionState,
+    ranges: &'a [usage_store::SessionRange],
     collector_epoch: u128,
     cycle_seq: u64,
-    collected_totals: &ModelUsageTotals,
+    collected_totals: &'a ModelUsageTotals,
+}
+
+#[cfg(test)]
+fn build_session_timeline_recovery(
+    context: SessionTimelineRecoveryContext<'_>,
 ) -> Result<Option<usage_store::SessionTimelineRecovery>, security::SecurityError> {
+    let SessionTimelineRecoveryContext {
+        events,
+        reset_at,
+        window_seconds,
+        timeline_end,
+        collection_state,
+        ranges,
+        collector_epoch,
+        cycle_seq,
+        collected_totals,
+    } = context;
     if collection_state.data_generation == 0 || ranges.is_empty() {
         return Ok(None);
     }
@@ -10644,17 +10624,17 @@ fn collect_incremental_local_usage_with_budget(
         }
     }
     model_totals_complete &= processed_sources == inventory.selected_session_files.len();
-    let timeline_recovery = build_session_timeline_recovery(
-        &events,
+    let timeline_recovery = build_session_timeline_recovery(SessionTimelineRecoveryContext {
+        events: &events,
         reset_at,
         window_seconds,
         timeline_end,
         collection_state,
-        &ranges,
+        ranges: &ranges,
         collector_epoch,
         cycle_seq,
-        &totals,
-    )?;
+        collected_totals: &totals,
+    })?;
     let (history_samples, history_model_totals) = if timeline_recovery.is_some() {
         // The timeline marker projects the exact accepted ranges over the
         // entire catch-up window. Keeping ordinary samples from those same
@@ -11658,16 +11638,17 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                 let Some(server_ref) = server.as_mut() else {
                     continue;
                 };
-                let update = fetch_active_thread_update(
-                    &mut server_ref.input,
-                    &server_ref.output,
-                    &mut next_id,
-                    &sessions_root,
-                    &active_paths,
+                let mut context = ActiveThreadUpdateContext {
+                    input: &mut server_ref.input,
+                    output: &server_ref.output,
+                    next_id: &mut next_id,
+                    sessions_root: &sessions_root,
+                    active_paths: &active_paths,
                     deadline,
-                    &mut rollout_cache,
-                    &durable_checkpoints,
-                );
+                    rollout_cache: &mut rollout_cache,
+                    checkpoints: &durable_checkpoints,
+                };
+                let update = fetch_active_thread_update(&mut context);
                 if update == ActiveThreadUpdate::Failed {
                     debug_runtime("thread read failed");
                     let _ = events.send(ThreadEvent::Error {
@@ -11845,6 +11826,8 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                 reset_at,
                 window_seconds,
             } => {
+                let history_continuity_recovery = *history_continuity_recovery;
+                let cumulative_recovery = *cumulative_recovery;
                 debug_runtime(format!(
                     "local collect requested epoch={auth_epoch} reset_at={reset_at} window_seconds={window_seconds}"
                 ));
@@ -12520,6 +12503,17 @@ fn local_account_authority_matches(
         && local_account_key.is_some_and(|current| current.same_account(expected_account_key))
 }
 
+#[cfg(test)]
+struct LocalUsageErrorContext {
+    auth_epoch: u64,
+    admission: Option<AccountAdmission>,
+    reset_at: i64,
+    window_seconds: i64,
+    collector_epoch: Option<u128>,
+    cycle_seq: Option<u64>,
+    durable_model_totals: Vec<usage_store::SessionModelTotal>,
+}
+
 impl CodexInfoState {
     fn projected_history(&self) -> UsageHistory {
         let canonical = canonicalize_public_history_samples(&self.history.samples);
@@ -12556,8 +12550,7 @@ impl CodexInfoState {
         {
             // The retired resident producer could publish local usage only
             // after its own account-partition transaction was acknowledged.
-            return self
-                .acknowledged_recorder_commit
+            self.acknowledged_recorder_commit
                 .as_ref()
                 .is_some_and(|commit| {
                     let now = Utc::now().timestamp();
@@ -12573,7 +12566,7 @@ impl CodexInfoState {
                         && commit.last_commit_unix <= now
                         && now.saturating_sub(commit.last_commit_unix)
                             <= daemon::RECORDER_LAST_COMMIT_MAX_AGE_SECS
-                });
+                })
         }
         #[cfg(not(test))]
         false
@@ -13882,7 +13875,12 @@ impl CodexInfoState {
                 .iter()
                 .map(store_observation_from_public)
                 .collect(),
-            ..UsageHistory::default()
+            #[cfg(test)]
+            pending_store_samples: Vec::new(),
+            #[cfg(test)]
+            pending_store_observations: Vec::new(),
+            #[cfg(test)]
+            startup_maintenance_done: false,
         };
         let next_threads = details
             .threads
@@ -14031,7 +14029,12 @@ impl CodexInfoState {
                 .iter()
                 .map(store_observation_from_public_v3)
                 .collect(),
-            ..UsageHistory::default()
+            #[cfg(test)]
+            pending_store_samples: Vec::new(),
+            #[cfg(test)]
+            pending_store_observations: Vec::new(),
+            #[cfg(test)]
+            startup_maintenance_done: false,
         };
         let next_threads = details
             .threads
@@ -14516,7 +14519,7 @@ impl CodexInfoState {
         let command = ThreadCommand::Read {
             auth_epoch: self.auth_epoch,
             admission,
-            account_partition,
+            account_partition: Box::new(account_partition),
         };
         let sent = self
             .thread_bridge
@@ -14686,10 +14689,14 @@ impl CodexInfoState {
                 .then_some(regression_recovery_state)
                 .flatten()
                 .map(Box::new),
-            history_continuity_recovery: (!period_boundary)
-                .then_some(history_continuity_recovery)
-                .flatten(),
-            cumulative_recovery: (!period_boundary).then_some(cumulative_recovery).flatten(),
+            history_continuity_recovery: Box::new(
+                (!period_boundary)
+                    .then_some(history_continuity_recovery)
+                    .flatten(),
+            ),
+            cumulative_recovery: Box::new(
+                (!period_boundary).then_some(cumulative_recovery).flatten(),
+            ),
             reset_at: canonical_reset_at,
             window_seconds: canonical_window_seconds,
         };
@@ -15595,28 +15602,28 @@ impl CodexInfoState {
 
     #[cfg(test)]
     fn apply_local_usage_error(&mut self, auth_epoch: u64, reset_at: i64, window_seconds: i64) {
-        self.apply_local_usage_error_with_generation(
+        self.apply_local_usage_error_with_generation(LocalUsageErrorContext {
             auth_epoch,
-            None,
+            admission: None,
             reset_at,
             window_seconds,
-            None,
-            None,
-            Vec::new(),
-        );
+            collector_epoch: None,
+            cycle_seq: None,
+            durable_model_totals: Vec::new(),
+        });
     }
 
     #[cfg(test)]
-    fn apply_local_usage_error_with_generation(
-        &mut self,
-        auth_epoch: u64,
-        admission: Option<AccountAdmission>,
-        reset_at: i64,
-        window_seconds: i64,
-        collector_epoch: Option<u128>,
-        cycle_seq: Option<u64>,
-        durable_model_totals: Vec<usage_store::SessionModelTotal>,
-    ) {
+    fn apply_local_usage_error_with_generation(&mut self, context: LocalUsageErrorContext) {
+        let LocalUsageErrorContext {
+            auth_epoch,
+            admission,
+            reset_at,
+            window_seconds,
+            collector_epoch,
+            cycle_seq,
+            durable_model_totals,
+        } = context;
         if !self.auth_epoch_valid
             || auth_epoch != self.auth_epoch
             || !self.current_local_period_matches(reset_at, window_seconds)
@@ -15940,15 +15947,15 @@ impl CodexInfoState {
                     collector_epoch,
                     cycle_seq,
                     durable_model_totals,
-                } => self.apply_local_usage_error_with_generation(
+                } => self.apply_local_usage_error_with_generation(LocalUsageErrorContext {
                     auth_epoch,
-                    Some(admission),
+                    admission: Some(admission),
                     reset_at,
                     window_seconds,
                     collector_epoch,
                     cycle_seq,
                     durable_model_totals,
-                ),
+                }),
             }
         }
         observed_event
@@ -16728,19 +16735,20 @@ impl CodexInfoState {
             .collect::<Vec<_>>();
         let raw_model_timelines =
             self.graph_raw_model_timelines_for_selection(selected_reset, period_start, period_end);
-        let mut paths = graph_paths_for_selection_with_sources_and_astra_with_lineage(
-            &sample_references,
-            period_start,
-            period_end,
-            show_luna,
-            show_terra,
-            show_sol,
-            show_astra,
-            show_tokens,
-            &untrusted_minutes,
-            &confirmed_gaps,
-            &raw_model_timelines,
-        );
+        let mut paths =
+            graph_paths_for_selection_with_sources_and_astra_with_lineage(GraphSelectionInput {
+                samples: &sample_references,
+                period_start,
+                period_end,
+                show_luna,
+                show_terra,
+                show_sol,
+                show_astra,
+                show_tokens,
+                untrusted_minutes: &untrusted_minutes,
+                confirmed_gaps: &confirmed_gaps,
+                model_timelines: &raw_model_timelines,
+            });
         if !self.has_quota_percent {
             paths.remaining.clear();
             paths.remaining_solid.clear();
@@ -18308,6 +18316,10 @@ fn clamp_graph_preview_size((width, height): (u32, u32)) -> (u32, u32) {
 }
 
 const DEFAULT_SERVICE_ADDRESS: &str = "127.0.0.1:8787";
+// Transport completion must fit the standalone REST server's own three-second
+// request budget. Performance-derived polling values are intentionally left
+// to the separately planned post-optimization measurement work.
+const SERVICE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
 const BACKGROUND_CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const DETAILS_RESPONSE_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -18667,34 +18679,75 @@ fn request_service_details_with_etag(
     route: &str,
     if_none_match: Option<&str>,
 ) -> Result<ServiceDetailsHttpResponse, String> {
+    request_service_details_with_etag_and_timeout(
+        address,
+        route,
+        if_none_match,
+        SERVICE_RESPONSE_TIMEOUT,
+    )
+}
+
+fn service_response_remaining(deadline: Instant) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "details response deadline exceeded".to_owned())
+}
+
+fn request_service_details_with_etag_and_timeout(
+    address: SocketAddr,
+    route: &str,
+    if_none_match: Option<&str>,
+    timeout: Duration,
+) -> Result<ServiceDetailsHttpResponse, String> {
     if let Some(pair) = if_none_match {
         if !valid_published_pair(pair) {
             return Err("invalid details generation header".into());
         }
     }
-    let timeout = Duration::from_millis(500);
-    let mut stream = TcpStream::connect_timeout(&address, timeout).map_err(|_| "connect failed")?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|_| "read timeout setup failed")?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|_| "write timeout setup failed")?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "details response deadline is invalid".to_owned())?;
+    let mut stream = TcpStream::connect_timeout(&address, service_response_remaining(deadline)?)
+        .map_err(|_| "connect failed")?;
     let conditional = if_none_match
         .map(|pair| format!("If-None-Match: \"{pair}\"\r\n"))
         .unwrap_or_default();
     let request = format!(
         "GET {route} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n{conditional}\r\n"
     );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|_| "details request failed")?;
+    let mut request_offset = 0;
+    while request_offset < request.len() {
+        stream
+            .set_write_timeout(Some(service_response_remaining(deadline)?))
+            .map_err(|_| "write timeout setup failed")?;
+        let written = stream
+            .write(&request.as_bytes()[request_offset..])
+            .map_err(|_| "details request failed")?;
+        if written == 0 {
+            return Err("details request failed".into());
+        }
+        request_offset += written;
+    }
     let maximum = DETAILS_RESPONSE_MAX_BYTES + DETAILS_RESPONSE_HEADER_MAX_BYTES + 1;
-    let mut response = Vec::new();
-    stream
-        .take(maximum as u64)
-        .read_to_end(&mut response)
-        .map_err(|_| "details response read failed")?;
+    let mut response = Vec::with_capacity(maximum.min(8 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        stream
+            .set_read_timeout(Some(service_response_remaining(deadline)?))
+            .map_err(|_| "read timeout setup failed")?;
+        let available = (maximum - response.len()).min(buffer.len());
+        let read = stream
+            .read(&mut buffer[..available])
+            .map_err(|_| "details response read failed")?;
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&buffer[..read]);
+        if response.len() >= maximum {
+            break;
+        }
+    }
     if response.len() >= maximum {
         return Err("details response exceeds bounded size".into());
     }
@@ -18732,12 +18785,16 @@ fn request_service_details_with_etag(
         let (name, value) = line
             .split_once(": ")
             .ok_or_else(|| "details response header is malformed".to_owned())?;
-        match name {
-            "Codex-Info-Published-Pair" if pair.is_none() => pair = Some(value.to_owned()),
-            "content-type" if !content_type && value == "application/json; charset=utf-8" => {
+        let name = name.to_ascii_lowercase();
+        match name.as_str() {
+            "codex-info-published-pair" if pair.is_none() => pair = Some(value.to_owned()),
+            "content-type"
+                if !content_type
+                    && value.eq_ignore_ascii_case("application/json; charset=utf-8") =>
+            {
                 content_type = true;
             }
-            "cache-control" if !cache_control && value == "no-store" => {
+            "cache-control" if !cache_control && value.eq_ignore_ascii_case("no-store") => {
                 cache_control = true;
             }
             "content-length" if content_length.is_none() => {
@@ -18747,7 +18804,9 @@ fn request_service_details_with_etag(
                         .map_err(|_| "invalid details content length")?,
                 );
             }
-            "connection" if !connection_close && value == "close" => connection_close = true,
+            "connection" if !connection_close && value.eq_ignore_ascii_case("close") => {
+                connection_close = true;
+            }
             _ => return Err("unexpected or duplicate details response header".into()),
         }
     }
@@ -19182,6 +19241,8 @@ enum ServiceResourceFetch<T> {
     NotModified { pair: String },
 }
 
+type ServiceThreadsResource = (Option<u64>, Vec<PublicThread>);
+
 fn fetch_service_history_periods_with_etag<F>(
     mut request: F,
     prior_pair: Option<&str>,
@@ -19297,7 +19358,7 @@ where
 fn fetch_service_threads_with_etag<F>(
     mut request: F,
     prior_pair: Option<&str>,
-) -> Result<ServiceResourceFetch<(Option<u64>, Vec<PublicThread>)>, String>
+) -> Result<ServiceResourceFetch<ServiceThreadsResource>, String>
 where
     F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
 {
@@ -21582,7 +21643,7 @@ mod tests {
             parse_launch_mode(launch_args(&["-h"])).unwrap(),
             LaunchMode::Help
         );
-        assert_eq!(parse_launch_mode(launch_args(&["--stop"])).is_err(), true);
+        assert!(parse_launch_mode(launch_args(&["--stop"])).is_err());
         assert!(parse_launch_mode(launch_args(&["--port", "9876"])).is_err());
         let LaunchMode::Ui(config) =
             parse_launch_mode(launch_args(&["--ui", "--port", "4321"])).unwrap()
@@ -21756,6 +21817,70 @@ mod tests {
         });
 
         assert!(service_is_healthy(address));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn service_client_accepts_standard_case_insensitive_http_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let pair = format!("v1:{}", "1".repeat(64));
+        let body = br#"{"api_version":"v3","state":"ready","observed_at":1800000000,"authenticated":true,"plan_label":null,"quota":null,"models":[],"active_thread_count":0}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nCodex-Info-Published-Pair: {pair}\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request);
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let fetched = super::request_service_details_with_etag(address, "/v3/current", None)
+            .expect("HTTP field names are case-insensitive");
+        assert_eq!(fetched.status, 200);
+        assert_eq!(fetched.pair.as_deref(), Some(pair.as_str()));
+        assert_eq!(fetched.body, body);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn service_client_response_budget_matches_the_rest_request_budget() {
+        assert_eq!(super::SERVICE_RESPONSE_TIMEOUT, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn service_client_response_budget_is_an_absolute_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request);
+            for chunk in std::iter::once(b"HTTP/1.1 200 OK\r\n".as_slice())
+                .chain(std::iter::repeat_n(b"X-Pad: x\r\n".as_slice(), 10))
+            {
+                std::thread::sleep(Duration::from_millis(60));
+                if stream.write_all(chunk).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let result = super::request_service_details_with_etag_and_timeout(
+            address,
+            "/v3/current",
+            None,
+            Duration::from_millis(100),
+        );
+        assert!(
+            result.is_err(),
+            "a slow-drip response exceeded its deadline"
+        );
+        assert!(started.elapsed() < Duration::from_millis(350));
         worker.join().unwrap();
     }
 
@@ -23315,17 +23440,19 @@ mod tests {
             );
             let mut render_paths =
                 super::graph_paths_for_selection_with_sources_and_astra_with_lineage(
-                    &references,
-                    period.start_at,
-                    period.end_at,
-                    true,
-                    true,
-                    true,
-                    true,
-                    show_tokens,
-                    &untrusted_minutes,
-                    &confirmed_gaps,
-                    &raw_model_timelines,
+                    super::GraphSelectionInput {
+                        samples: &references,
+                        period_start: period.start_at,
+                        period_end: period.end_at,
+                        show_luna: true,
+                        show_terra: true,
+                        show_sol: true,
+                        show_astra: true,
+                        show_tokens,
+                        untrusted_minutes: &untrusted_minutes,
+                        confirmed_gaps: &confirmed_gaps,
+                        model_timelines: &raw_model_timelines,
+                    },
                 );
             super::separate_current_label_positions(
                 &mut render_paths,
@@ -23990,19 +24117,19 @@ mod tests {
 
         let expected_idle = intervals(&expected["idle_intervals"]);
         let graph = |show_tokens| {
-            super::graph_paths_for_selection_with_sources_and_astra(
-                &references,
-                period.start_at,
-                period.end_at,
-                true,
-                true,
-                true,
-                true,
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: period.start_at,
+                period_end: period.end_at,
+                show_luna: true,
+                show_terra: true,
+                show_sol: true,
+                show_astra: true,
                 show_tokens,
-                &untrusted_minutes,
-                &[],
-                &raw_timelines,
-            )
+                untrusted_minutes: &untrusted_minutes,
+                confirmed_gaps: &[],
+                model_timelines: &raw_timelines,
+            })
         };
         let dollars = graph(false);
         let tokens = graph(true);
@@ -24154,17 +24281,19 @@ mod tests {
             );
             let graph = |show_tokens| {
                 super::graph_paths_for_selection_with_sources_and_astra(
-                    &references,
-                    start,
-                    end,
-                    false,
-                    false,
-                    true,
-                    false,
-                    show_tokens,
-                    &BTreeSet::new(),
-                    &confirmed_gaps,
-                    &raw,
+                    super::GraphSelectionInput {
+                        samples: &references,
+                        period_start: start,
+                        period_end: end,
+                        show_luna: false,
+                        show_terra: false,
+                        show_sol: true,
+                        show_astra: false,
+                        show_tokens,
+                        untrusted_minutes: &BTreeSet::new(),
+                        confirmed_gaps: &confirmed_gaps,
+                        model_timelines: &raw,
+                    },
                 )
             };
             let dollars = graph(false);
@@ -24410,17 +24539,19 @@ mod tests {
                 "origin {name}"
             );
             let graph = super::graph_paths_for_selection_with_sources_and_astra(
-                &references,
-                start,
-                end,
-                false,
-                false,
-                true,
-                false,
-                false,
-                &BTreeSet::new(),
-                &confirmed_gaps,
-                &raw,
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: start,
+                    period_end: end,
+                    show_luna: false,
+                    show_terra: false,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: false,
+                    untrusted_minutes: &BTreeSet::new(),
+                    confirmed_gaps: &confirmed_gaps,
+                    model_timelines: &raw,
+                },
             );
             let span = (end - start) as f64;
             let actual_idle = graph
@@ -24541,19 +24672,20 @@ mod tests {
         )]);
         let period_end = 5_000 * 60;
 
-        let graph = super::graph_paths_for_selection_with_sources_and_astra(
-            &references,
-            0,
-            period_end,
-            false,
-            false,
-            true,
-            false,
-            false,
-            &BTreeSet::new(),
-            &[],
-            &raw,
-        );
+        let graph =
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end,
+                show_luna: false,
+                show_terra: false,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: false,
+                untrusted_minutes: &BTreeSet::new(),
+                confirmed_gaps: &[],
+                model_timelines: &raw,
+            });
 
         let idle = graph.unused_intervals.as_slice();
         assert_eq!(idle.len(), 1);
@@ -26317,7 +26449,10 @@ mod tests {
             ),
             super::QuotaTransition::Rejected
         );
-        assert_eq!(restarted.model_totals, [durable_total.clone()]);
+        assert_eq!(
+            restarted.model_totals.as_slice(),
+            std::slice::from_ref(&durable_total)
+        );
 
         let mut rollover = super::usage_store::SessionCollectionState {
             data_generation: 8,
@@ -28227,15 +28362,15 @@ mod tests {
             .current_account_admission()
             .expect("preview admission");
 
-        state.apply_local_usage_error_with_generation(
-            state.auth_epoch,
-            Some(admission),
+        state.apply_local_usage_error_with_generation(super::LocalUsageErrorContext {
+            auth_epoch: state.auth_epoch,
+            admission: Some(admission),
             reset_at,
-            WEEK_SECONDS,
-            Some(0x138),
-            Some(2),
-            durable_model_totals.clone(),
-        );
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(0x138),
+            cycle_seq: Some(2),
+            durable_model_totals: durable_model_totals.clone(),
+        });
 
         assert!(!state.local_usage_pending);
         assert!(state.local_usage_error);
@@ -28285,15 +28420,15 @@ mod tests {
         let admission = state
             .current_account_admission()
             .expect("preview admission");
-        state.apply_local_usage_error_with_generation(
-            state.auth_epoch,
-            Some(admission),
+        state.apply_local_usage_error_with_generation(super::LocalUsageErrorContext {
+            auth_epoch: state.auth_epoch,
+            admission: Some(admission),
             reset_at,
-            WEEK_SECONDS,
-            Some(0x139),
-            Some(3),
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(0x139),
+            cycle_seq: Some(3),
             durable_model_totals,
-        );
+        });
         let pending_before = state.history.pending_store_observations.clone();
         let mut publication = super::ResidentPublicationState::default();
         let attempts = std::cell::Cell::new(0_u8);
@@ -28373,30 +28508,30 @@ mod tests {
         let mut stale_admission = admission.clone();
         stale_admission.partition_id.push_str("-stale");
 
-        state.apply_local_usage_error_with_generation(
-            state.auth_epoch,
-            Some(stale_admission),
+        state.apply_local_usage_error_with_generation(super::LocalUsageErrorContext {
+            auth_epoch: state.auth_epoch,
+            admission: Some(stale_admission),
             reset_at,
-            WEEK_SECONDS,
-            Some(0x13a),
-            Some(4),
-            Vec::new(),
-        );
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(0x13a),
+            cycle_seq: Some(4),
+            durable_model_totals: Vec::new(),
+        });
         assert!(!state.local_usage_error);
         assert!(state.history.pending_store_samples.is_empty());
         assert!(!state.has_pending_recorder_batch());
 
         state.account_error = Some("remote outage".into());
         state.local_usage_pending = true;
-        state.apply_local_usage_error_with_generation(
-            state.auth_epoch,
-            Some(admission),
+        state.apply_local_usage_error_with_generation(super::LocalUsageErrorContext {
+            auth_epoch: state.auth_epoch,
+            admission: Some(admission),
             reset_at,
-            WEEK_SECONDS,
-            Some(0x13a),
-            Some(5),
-            Vec::new(),
-        );
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(0x13a),
+            cycle_seq: Some(5),
+            durable_model_totals: Vec::new(),
+        });
         assert!(!state.local_usage_pending);
         assert!(state.history.pending_store_samples.is_empty());
         assert!(!state.has_pending_recorder_batch());
@@ -31764,19 +31899,20 @@ mod tests {
         for event in &events {
             collected_totals.add(&event.model, event.delta);
         }
-        let recovery = super::build_session_timeline_recovery(
-            &events,
-            reset_at,
-            window_seconds,
-            1_859,
-            &collection_state,
-            &ranges,
-            collector_epoch,
-            cycle_seq,
-            &collected_totals,
-        )
-        .unwrap()
-        .expect("durable quota lag requires timeline catch-up");
+        let recovery =
+            super::build_session_timeline_recovery(super::SessionTimelineRecoveryContext {
+                events: &events,
+                reset_at,
+                window_seconds,
+                timeline_end: 1_859,
+                collection_state: &collection_state,
+                ranges: &ranges,
+                collector_epoch,
+                cycle_seq,
+                collected_totals: &collected_totals,
+            })
+            .unwrap()
+            .expect("durable quota lag requires timeline catch-up");
 
         assert_eq!(recovery.projection_end_exclusive, 1_800);
         assert_eq!(
@@ -37983,19 +38119,23 @@ mod tests {
             ),
         ];
         let references = samples.iter().collect::<Vec<_>>();
-        let graph = graph_paths_for_selection_with_confirmed_gaps(
-            &references,
-            0,
-            180,
-            false,
-            false,
-            true,
-            false,
-            &[GraphConfirmedGap {
-                start_at: 60,
-                end_at: 120,
-            }],
-        );
+        let confirmed_gaps = [GraphConfirmedGap {
+            start_at: 60,
+            end_at: 120,
+        }];
+        let graph = graph_paths_for_selection_with_confirmed_gaps(super::GraphSelectionInput {
+            samples: &references,
+            period_start: 0,
+            period_end: 180,
+            show_luna: false,
+            show_terra: false,
+            show_sol: true,
+            show_astra: false,
+            show_tokens: false,
+            untrusted_minutes: &BTreeSet::new(),
+            confirmed_gaps: &confirmed_gaps,
+            model_timelines: &BTreeMap::new(),
+        });
 
         assert!(graph.sol_rising.contains("M0.00 99.00 L33.33 66.33"));
         assert!(!graph.sol_rising.contains("M33.33 66.33 L66.67 33.67"));
@@ -38558,19 +38698,20 @@ mod tests {
                 })
                 .collect::<BTreeMap<_, _>>(),
         )]);
-        let paths = super::graph_paths_for_selection_with_sources_and_astra(
-            &references,
-            0,
-            240,
-            false,
-            false,
-            true,
-            false,
-            false,
-            &BTreeSet::new(),
-            &[],
-            &raw_timelines,
-        );
+        let paths =
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end: 240,
+                show_luna: false,
+                show_terra: false,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: false,
+                untrusted_minutes: &BTreeSet::new(),
+                confirmed_gaps: &[],
+                model_timelines: &raw_timelines,
+            });
         assert_eq!(
             paths.remaining_solid,
             "M0.00 1.00 L25.00 10.80 M25.00 10.80 L50.00 15.70 M50.00 15.70 L75.00 20.60 M75.00 20.60 L100.00 20.60"
@@ -39209,19 +39350,20 @@ mod tests {
                 ]),
             ),
         ]);
-        let tokens = super::graph_paths_for_selection_with_sources_and_astra(
-            &references,
-            0,
-            240,
-            true,
-            true,
-            true,
-            false,
-            true,
-            &BTreeSet::new(),
-            &[],
-            &model_timelines,
-        );
+        let tokens =
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end: 240,
+                show_luna: true,
+                show_terra: true,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: true,
+                untrusted_minutes: &BTreeSet::new(),
+                confirmed_gaps: &[],
+                model_timelines: &model_timelines,
+            });
 
         assert_eq!(
             tokens.remaining_solid, "M50.00 10.80 L75.00 20.60",
@@ -39859,19 +40001,19 @@ mod tests {
         .into_iter()
         .collect();
         let graph = |tokens| {
-            super::graph_paths_for_selection_with_sources_and_astra(
-                &references,
-                0,
-                240,
-                true,
-                true,
-                true,
-                false,
-                tokens,
-                &Default::default(),
-                &[],
-                &timelines,
-            )
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end: 240,
+                show_luna: true,
+                show_terra: true,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: tokens,
+                untrusted_minutes: &Default::default(),
+                confirmed_gaps: &[],
+                model_timelines: &timelines,
+            })
         };
         let dollars = graph(false);
         let tokens = graph(true);

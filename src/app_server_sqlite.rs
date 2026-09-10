@@ -344,7 +344,19 @@ fn validate_private_regular_file(_path: &Path) -> Result<(), GenerationError> {
     Err(GenerationError::new(GenerationErrorKind::UnsafeGeneration))
 }
 
-fn source_identity(path: &Path) -> Result<(u64, u64), GenerationError> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SidecarIdentity {
+    path: PathBuf,
+    identity: FileIdentity,
+}
+
+fn source_identity(path: &Path) -> Result<FileIdentity, GenerationError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -358,7 +370,10 @@ fn source_identity(path: &Path) -> Result<(u64, u64), GenerationError> {
         {
             return Err(GenerationError::new(GenerationErrorKind::UnsafeSource));
         }
-        return Ok((metadata.dev(), metadata.ino()));
+        Ok(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
     }
     #[cfg(not(unix))]
     {
@@ -367,16 +382,17 @@ fn source_identity(path: &Path) -> Result<(u64, u64), GenerationError> {
     }
 }
 
-fn optional_sidecar_identities(
-    database: &Path,
-) -> Result<Vec<(PathBuf, (u64, u64))>, GenerationError> {
+fn optional_sidecar_identities(database: &Path) -> Result<Vec<SidecarIdentity>, GenerationError> {
     let mut sidecars = Vec::new();
     for suffix in ["-wal", "-shm"] {
         let mut name = database.as_os_str().to_os_string();
         name.push(suffix);
         let path = PathBuf::from(name);
         match fs::symlink_metadata(&path) {
-            Ok(_) => sidecars.push((path.clone(), source_identity(&path)?)),
+            Ok(_) => sidecars.push(SidecarIdentity {
+                path: path.clone(),
+                identity: source_identity(&path)?,
+            }),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(GenerationError::new(GenerationErrorKind::UnsafeSource)),
         }
