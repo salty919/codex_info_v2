@@ -10,7 +10,7 @@
 use crate::security;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -1147,6 +1147,41 @@ impl PartialEq for LegacyBodyCache {
     }
 }
 
+#[derive(Debug, Default)]
+struct HistoryHeadBodyCache {
+    response: OnceLock<(u16, Vec<u8>)>,
+    #[cfg(test)]
+    serialization_count: AtomicUsize,
+}
+
+impl HistoryHeadBodyCache {
+    fn get_or_init<F>(&self, serializer: F) -> (u16, Vec<u8>)
+    where
+        F: FnOnce() -> (u16, Vec<u8>),
+    {
+        self.response
+            .get_or_init(|| {
+                #[cfg(test)]
+                self.serialization_count.fetch_add(1, Ordering::Relaxed);
+                serializer()
+            })
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn serialization_count(&self) -> usize {
+        self.serialization_count.load(Ordering::Relaxed)
+    }
+}
+
+impl PartialEq for HistoryHeadBodyCache {
+    fn eq(&self, other: &Self) -> bool {
+        self.response.get() == other.response.get()
+    }
+}
+
+impl Eq for HistoryHeadBodyCache {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublishedPair {
     identity: String,
@@ -1191,6 +1226,7 @@ struct HistoryPeriodIndex {
     gap_start: usize,
     gap_end: usize,
     sample_prefix_fingerprints: Vec<[u8; 32]>,
+    head_body: Arc<HistoryHeadBodyCache>,
 }
 
 fn history_period_matches(period: &PublicHistoryPeriod, reset_at: i64, timestamp: i64) -> bool {
@@ -1224,11 +1260,24 @@ fn history_period_indexes(
     details: &PublicDetailsV3,
 ) -> Result<Vec<HistoryPeriodIndex>, ApiSnapshotError> {
     let mut indexes = vec![HistoryPeriodIndex::default(); details.history_periods.len()];
+    let periods_by_reset = details
+        .history_periods
+        .iter()
+        .enumerate()
+        .map(|(index, period)| (period.reset_at, index))
+        .collect::<BTreeMap<_, _>>();
     for (sample_index, sample) in details.history_samples.iter().enumerate() {
-        let Some(period_index) = details
-            .history_periods
-            .iter()
-            .position(|period| history_period_matches(period, sample.reset_at, sample.timestamp))
+        let Some(period_index) = periods_by_reset
+            .range(sample.reset_at..=sample.reset_at.saturating_add(60))
+            .filter_map(|(_, index)| {
+                history_period_matches(
+                    &details.history_periods[*index],
+                    sample.reset_at,
+                    sample.timestamp,
+                )
+                .then_some(*index)
+            })
+            .min()
         else {
             continue;
         };
@@ -1242,10 +1291,13 @@ fn history_period_indexes(
         }
     }
     for (gap_index, gap) in details.history_gaps.iter().enumerate() {
-        let Some(period_index) = details
-            .history_periods
-            .iter()
-            .position(|period| history_period_matches(period, gap.reset_at, gap.start_at))
+        let Some(period_index) = periods_by_reset
+            .range(gap.reset_at..=gap.reset_at.saturating_add(60))
+            .filter_map(|(_, index)| {
+                history_period_matches(&details.history_periods[*index], gap.reset_at, gap.start_at)
+                    .then_some(*index)
+            })
+            .min()
         else {
             continue;
         };
@@ -2044,6 +2096,69 @@ fn history_page_candidate(
     )
 }
 
+fn history_page_response_body(
+    current: &PublishedSnapshot,
+    period_index: usize,
+    start: usize,
+    sample_end: usize,
+    gaps: &[PublicHistoryGap],
+    cursor: Option<&str>,
+    body_limit: usize,
+) -> (u16, Vec<u8>) {
+    let total = sample_end.saturating_sub(start);
+    let (mut body, initial_too_large) = match history_page_candidate(
+        current,
+        period_index,
+        start,
+        sample_end,
+        sample_end,
+        gaps,
+        cursor,
+        body_limit,
+    ) {
+        Ok(body) => (body, false),
+        Err(HistoryPageSerializeError::ResourceTooLarge) => (Vec::new(), true),
+        Err(HistoryPageSerializeError::Serialization) => {
+            return (500, error_body("serialization_failed"))
+        }
+    };
+    if initial_too_large {
+        let mut best = None;
+        let mut low = 1usize;
+        let mut high = total.saturating_sub(1);
+        while low <= high {
+            let count = low + (high - low) / 2;
+            let end = start + count;
+            let candidate = match history_page_candidate(
+                current,
+                period_index,
+                start,
+                end,
+                sample_end,
+                gaps,
+                cursor,
+                body_limit,
+            ) {
+                Ok(candidate) => candidate,
+                Err(HistoryPageSerializeError::ResourceTooLarge) => {
+                    high = count.saturating_sub(1);
+                    continue;
+                }
+                Err(HistoryPageSerializeError::Serialization) => {
+                    return (500, error_body("serialization_failed"))
+                }
+            };
+            best = Some(candidate);
+            low = count + 1;
+        }
+        let Some(smaller) = best else {
+            return (413, error_body("resource_too_large"));
+        };
+        body = smaller;
+    }
+    (200, body)
+}
+
 fn history_snapshot_response(
     current: &PublishedSnapshot,
     pair: PublishedPair,
@@ -2110,58 +2225,31 @@ fn history_snapshot_response_with_limit(
     } else {
         &[]
     };
-    let total = sample_end.saturating_sub(start);
-    let (mut body, initial_too_large) = match history_page_candidate(
-        current,
-        period_index,
-        start,
-        sample_end,
-        sample_end,
-        gaps,
-        cursor,
-        body_limit,
-    ) {
-        Ok(body) => (body, false),
-        Err(HistoryPageSerializeError::ResourceTooLarge) => (Vec::new(), true),
-        Err(HistoryPageSerializeError::Serialization) => {
-            return (500, error_body("serialization_failed"), None)
-        }
-    };
-    if initial_too_large {
-        let mut best = None;
-        let mut low = 1usize;
-        let mut high = total.saturating_sub(1);
-        while low <= high {
-            let count = low + (high - low) / 2;
-            let end = start + count;
-            let candidate = match history_page_candidate(
+    let (status, body) = if cursor.is_none() && body_limit == MAX_SPLIT_RESOURCE_BODY_BYTES {
+        period_indexed.head_body.get_or_init(|| {
+            history_page_response_body(
                 current,
                 period_index,
                 start,
-                end,
                 sample_end,
                 gaps,
                 cursor,
                 body_limit,
-            ) {
-                Ok(candidate) => candidate,
-                Err(HistoryPageSerializeError::ResourceTooLarge) => {
-                    high = count.saturating_sub(1);
-                    continue;
-                }
-                Err(HistoryPageSerializeError::Serialization) => {
-                    return (500, error_body("serialization_failed"), None)
-                }
-            };
-            best = Some(candidate);
-            low = count + 1;
-        }
-        let Some(smaller) = best else {
-            return (413, error_body("resource_too_large"), None);
-        };
-        body = smaller;
-    }
-    (200, body, Some(pair))
+            )
+        })
+    } else {
+        history_page_response_body(
+            current,
+            period_index,
+            start,
+            sample_end,
+            gaps,
+            cursor,
+            body_limit,
+        )
+    };
+    let response_pair = (status == 200).then_some(pair);
+    (status, body, response_pair)
 }
 
 fn snapshot_response(
@@ -4244,16 +4332,32 @@ mod tests {
             assert_eq!(snapshot.details_body.serialization_count(), 0);
             assert_eq!(snapshot.details_v2_body.serialization_count(), 0);
             assert_eq!(snapshot.details_v3_body.serialization_count(), 0);
+            assert_eq!(
+                snapshot.history_period_indexes[0]
+                    .head_body
+                    .serialization_count(),
+                0
+            );
         }
 
         for route in [
             ApiRoute::CurrentV3,
             ApiRoute::HistoryPeriodsV3,
-            ApiRoute::HistoryV3,
             ApiRoute::ThreadsV3,
         ] {
             let response =
                 snapshot_response(&publisher.snapshot, route, None, Some("slo-period"), None);
+            assert_eq!(response.0, 200);
+            assert_eq!(response.2, Some(pair.clone()));
+        }
+        for _ in 0..2 {
+            let response = snapshot_response(
+                &publisher.snapshot,
+                ApiRoute::HistoryV3,
+                None,
+                Some("slo-period"),
+                None,
+            );
             assert_eq!(response.0, 200);
             assert_eq!(response.2, Some(pair.clone()));
         }
@@ -4265,6 +4369,12 @@ mod tests {
             assert_eq!(snapshot.details_body.serialization_count(), 0);
             assert_eq!(snapshot.details_v2_body.serialization_count(), 0);
             assert_eq!(snapshot.details_v3_body.serialization_count(), 0);
+            assert_eq!(
+                snapshot.history_period_indexes[0]
+                    .head_body
+                    .serialization_count(),
+                1
+            );
         }
 
         for route in [ApiRoute::Details, ApiRoute::DetailsV2, ApiRoute::DetailsV3] {
@@ -4284,6 +4394,69 @@ mod tests {
         assert_eq!(snapshot.details_body.serialization_count(), 1);
         assert_eq!(snapshot.details_v2_body.serialization_count(), 1);
         assert_eq!(snapshot.details_v3_body.serialization_count(), 1);
+    }
+
+    #[test]
+    fn v3_history_head_cache_is_scoped_to_one_published_pair() {
+        let publisher = ApiSnapshotPublisher::with_unpublished_epoch_for_test([0x54; 16]);
+        let first_pair = publisher.publish_for_test(history_fixture(8)).unwrap();
+        let first = snapshot_response(
+            &publisher.snapshot,
+            ApiRoute::HistoryV3,
+            None,
+            Some("slo-period"),
+            None,
+        );
+        assert_eq!(first.2, Some(first_pair.clone()));
+        assert_eq!(
+            direct_body(&first)["history_samples"]
+                .as_array()
+                .unwrap()
+                .len(),
+            8
+        );
+        {
+            let snapshot = publisher
+                .snapshot
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(
+                snapshot.history_period_indexes[0]
+                    .head_body
+                    .serialization_count(),
+                1
+            );
+        }
+
+        let second_pair = publisher.publish_for_test(history_fixture(9)).unwrap();
+        assert_ne!(second_pair, first_pair);
+        {
+            let snapshot = publisher
+                .snapshot
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(
+                snapshot.history_period_indexes[0]
+                    .head_body
+                    .serialization_count(),
+                0
+            );
+        }
+        let second = snapshot_response(
+            &publisher.snapshot,
+            ApiRoute::HistoryV3,
+            None,
+            Some("slo-period"),
+            None,
+        );
+        assert_eq!(second.2, Some(second_pair));
+        assert_eq!(
+            direct_body(&second)["history_samples"]
+                .as_array()
+                .unwrap()
+                .len(),
+            9
+        );
     }
 
     #[test]
