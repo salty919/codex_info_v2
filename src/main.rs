@@ -80,6 +80,7 @@ enum LocalCommand {
         collection_state: Box<usage_store::SessionCollectionState>,
         regression_recovery_state: Option<Box<usage_store::SessionCollectionState>>,
         history_continuity_recovery: Option<usage_store::HistoryContinuityRecovery>,
+        cumulative_recovery: Option<usage_store::SessionCumulativeRecovery>,
         reset_at: i64,
         window_seconds: i64,
     },
@@ -147,6 +148,7 @@ struct LocalUsageCandidate {
     session_ranges: Vec<usage_store::SessionRange>,
     session_model_totals: Vec<usage_store::SessionModelTotal>,
     history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
+    cumulative_recovery: Option<usage_store::SessionCumulativeRecovery>,
 }
 
 enum LocalEvent {
@@ -2674,46 +2676,83 @@ fn same_reset_period(left: i64, right: i64) -> bool {
     left.abs_diff(right) <= RESET_AT_TOLERANCE_SECONDS as u64
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuotaTransition {
+    Initial,
+    SamePeriod,
+    Boundary,
+    Rejected,
+}
+
+/// Classify a quota observation using only durable time authority. Percentage
+/// changes and a replacement reset timestamp before the accepted deadline are
+/// observations, not proof of a new period.
+fn classify_quota_transition(
+    previous_reset_at: Option<i64>,
+    previous_window_seconds: i64,
+    previous_observed_at: Option<i64>,
+    next_reset_at: i64,
+    next_window_seconds: i64,
+    next_remaining_percent: Option<f64>,
+    observed_at: i64,
+) -> QuotaTransition {
+    let candidate_is_valid = observed_at > 0
+        && next_reset_at > observed_at
+        && next_window_seconds > 0
+        && next_reset_at.checked_sub(next_window_seconds).is_some()
+        && next_remaining_percent
+            .is_some_and(|value| value.is_finite() && (0.0..=100.0).contains(&value));
+    if !candidate_is_valid {
+        return QuotaTransition::Rejected;
+    }
+    let Some(previous_reset_at) = previous_reset_at else {
+        return QuotaTransition::Initial;
+    };
+    let Some(previous_observed_at) = previous_observed_at else {
+        return QuotaTransition::Rejected;
+    };
+    if previous_reset_at <= 0
+        || previous_window_seconds <= 0
+        || previous_observed_at <= 0
+        || observed_at < previous_observed_at
+    {
+        return QuotaTransition::Rejected;
+    }
+    if next_reset_at == previous_reset_at
+        && next_window_seconds == previous_window_seconds
+        && previous_reset_at > observed_at
+    {
+        return QuotaTransition::SamePeriod;
+    }
+    if previous_reset_at <= observed_at && next_reset_at > previous_reset_at {
+        return QuotaTransition::Boundary;
+    }
+    QuotaTransition::Rejected
+}
+
 /// Decide whether a newly reported reset timestamp is a real period boundary
 /// or merely the service's rolling `now + window` value moving between polls.
 /// The latter is common in the live response and must never make the main
 /// screen throw away a complete model/history snapshot.
+#[cfg(test)]
 fn reset_transition_is_boundary(
     previous_reset: Option<i64>,
-    previous_remaining: Option<f64>,
+    _previous_remaining: Option<f64>,
     next_reset: i64,
     next_remaining: Option<f64>,
     previous_observed_at: Option<i64>,
     now: i64,
     window_seconds: i64,
 ) -> bool {
-    let Some(previous_reset) = previous_reset else {
-        return next_reset > 0;
-    };
-    if next_reset <= 0 || same_reset_period(previous_reset, next_reset) {
-        return false;
-    }
-
-    // A real reset is accompanied by a material quota refill.  A one-point
-    // rounding fluctuation is not enough to change period identity.
-    if let (Some(previous), Some(next)) = (previous_remaining, next_remaining) {
-        if next.is_finite() && previous.is_finite() && next >= previous + 5.0 {
-            return true;
-        }
-    }
-
-    // If the prior observation was close to its boundary and the new one is
-    // a full window ahead, this is a genuine rollover even when the quota
-    // percentage is unavailable. Otherwise, two full-window horizons are the
-    // same rolling period regardless of their absolute reset timestamps.
-    let previous_at = previous_observed_at.unwrap_or(now);
-    let previous_horizon = previous_reset.saturating_sub(previous_at);
-    let next_horizon = next_reset.saturating_sub(now);
-    let boundary_proximity = window_seconds.clamp(60, 3_600);
-    if previous_horizon <= boundary_proximity && next_horizon >= window_seconds / 2 {
-        return true;
-    }
-    false
+    classify_quota_transition(
+        previous_reset,
+        window_seconds,
+        previous_observed_at,
+        next_reset,
+        window_seconds,
+        next_remaining,
+        now,
+    ) == QuotaTransition::Boundary
 }
 
 /// Admit the durable absolute model totals for the next collector cycle.
@@ -2728,25 +2767,32 @@ fn admit_session_collection_period(
     next_window_seconds: i64,
     next_remaining_percent: Option<f64>,
     now: i64,
-) -> bool {
+) -> QuotaTransition {
     if state.data_generation == 0 {
-        return false;
+        return classify_quota_transition(
+            None,
+            0,
+            None,
+            next_reset_at,
+            next_window_seconds,
+            next_remaining_percent,
+            now,
+        );
     }
     let observation = state.last_quota_observation.as_ref();
-    let boundary = state.window_seconds != next_window_seconds
-        || reset_transition_is_boundary(
-            (state.reset_at > 0).then_some(state.reset_at),
-            observation.map(|value| value.remaining_percent),
-            next_reset_at,
-            next_remaining_percent,
-            observation.map(|value| value.observed_at),
-            now,
-            state.window_seconds,
-        );
-    if boundary {
+    let transition = classify_quota_transition(
+        (state.reset_at > 0).then_some(state.reset_at),
+        state.window_seconds,
+        observation.map(|value| value.observed_at),
+        next_reset_at,
+        next_window_seconds,
+        next_remaining_percent,
+        now,
+    );
+    if transition == QuotaTransition::Boundary {
         state.model_totals.clear();
     }
-    boundary
+    transition
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8019,6 +8065,25 @@ fn apply_regression_recovery(
     true
 }
 
+/// Apply a source-proven cumulative baseline to the newly collected current
+/// vector. Historical rows deliberately stay raw: the durable recovery marker
+/// owns their bounded read projection after the recorder commits atomically.
+fn apply_cumulative_recovery_to_current(
+    collection: &mut LocalUsageCollection,
+    recovery: &usage_store::SessionCumulativeRecovery,
+) -> bool {
+    let offset = ModelUsageTotals::from_session_totals(&recovery.offset_model_totals);
+    let mut recovered = collection.model_usage.clone();
+    if recovered.checked_add_totals(&offset).is_none() {
+        debug_runtime("cumulative recovery total overflow rejected");
+        return false;
+    }
+    collection.session_model_totals =
+        recovered.history_session_totals(collection.model_totals_complete);
+    collection.model_usage = recovered;
+    true
+}
+
 fn load_regression_recovery_state(
     partition: &account_scope::AccountPartition,
     current: &usage_store::SessionCollectionState,
@@ -10430,6 +10495,7 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                 collection_state,
                 regression_recovery_state,
                 history_continuity_recovery,
+                cumulative_recovery,
                 reset_at,
                 window_seconds,
             } => {
@@ -10532,6 +10598,10 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                     if let Some(recovered) = recovered_totals {
                         apply_regression_recovery(&mut collection, recovered);
                     }
+                    let cumulative_recovery = cumulative_recovery.and_then(|recovery| {
+                        apply_cumulative_recovery_to_current(&mut collection, &recovery)
+                            .then_some(recovery)
+                    });
                     let verified_recovery =
                         verified_recovery.and_then(|(authority, model_totals)| {
                             let fallback_samples = collection.history_samples.clone();
@@ -10562,10 +10632,10 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                         cache.rejected_history_recovery = Some(fingerprint);
                     }
                     collection.history_continuity_recovery = verified_recovery;
-                    Ok(collection)
+                    Ok((collection, cumulative_recovery))
                 });
                 match result {
-                    Ok(collection) => {
+                    Ok((collection, cumulative_recovery)) => {
                         debug_runtime(format!(
                             "local collect succeeded rows={} samples={}",
                             collection.model_usage.clone().rows().len(),
@@ -10590,6 +10660,7 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                             session_ranges: collection.session_ranges,
                             session_model_totals: collection.session_model_totals,
                             history_continuity_recovery: collection.history_continuity_recovery,
+                            cumulative_recovery,
                         })));
                     }
                     Err(_) => {
@@ -10760,6 +10831,7 @@ struct PendingRecorderBatch {
     session_ranges: Vec<usage_store::SessionRange>,
     session_model_totals: Vec<usage_store::SessionModelTotal>,
     history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
+    cumulative_recovery: Option<usage_store::SessionCumulativeRecovery>,
     reset_at: Option<i64>,
     window_seconds: Option<i64>,
     cleanup_plans: Vec<SessionCleanupPlan>,
@@ -10783,6 +10855,7 @@ impl PendingRecorderBatch {
             && self.session_checkpoints.is_empty()
             && self.session_ranges.is_empty()
             && self.session_model_totals.is_empty()
+            && self.cumulative_recovery.is_none()
             && self.collector_epoch.is_none()
             && self.cycle_seq.is_none()
             && !self.quota_source_rescan_complete
@@ -10836,6 +10909,7 @@ struct CodexInfoState {
     pending_session_ranges: Vec<usage_store::SessionRange>,
     pending_session_model_totals: Vec<usage_store::SessionModelTotal>,
     pending_history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
+    pending_cumulative_recovery: Option<usage_store::SessionCumulativeRecovery>,
     pending_collector_generation: Option<(u128, u64)>,
     pending_session_period: Option<(i64, i64)>,
     pending_recorder_admission: Option<(u64, AccountAdmission)>,
@@ -11560,6 +11634,7 @@ impl CodexInfoState {
             pending_session_ranges: Vec::new(),
             pending_session_model_totals: Vec::new(),
             pending_history_continuity_recovery: None,
+            pending_cumulative_recovery: None,
             pending_collector_generation: None,
             pending_session_period: None,
             pending_recorder_admission: None,
@@ -11656,6 +11731,7 @@ impl CodexInfoState {
             pending_session_ranges: Vec::new(),
             pending_session_model_totals: Vec::new(),
             pending_history_continuity_recovery: None,
+            pending_cumulative_recovery: None,
             pending_collector_generation: None,
             pending_session_period: None,
             pending_recorder_admission: None,
@@ -11758,6 +11834,7 @@ impl CodexInfoState {
             pending_session_ranges: Vec::new(),
             pending_session_model_totals: Vec::new(),
             pending_history_continuity_recovery: None,
+            pending_cumulative_recovery: None,
             pending_collector_generation: None,
             pending_session_period: None,
             pending_recorder_admission: None,
@@ -13061,19 +13138,33 @@ impl CodexInfoState {
         let Some(partition) = self.account_partition.as_ref() else {
             return false;
         };
-        let (mut collection_state, history_continuity_recovery) =
+        let observed_at = Utc::now().timestamp();
+        let (mut collection_state, history_continuity_recovery, cumulative_recovery) =
             match fs::symlink_metadata(&partition.database_path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    (usage_store::SessionCollectionState::default(), None)
+                    (usage_store::SessionCollectionState::default(), None, None)
                 }
                 Ok(_) => {
                     let identity = partition.storage_identity();
                     let state =
                         UsageStore::open_read_only_partitioned(&partition.database_path, &identity)
                             .and_then(|store| {
+                                let state = store.load_session_collection_state()?;
+                                let cumulative_recovery = (state.data_generation > 0)
+                                    .then(|| {
+                                        store.pending_session_cumulative_recovery(
+                                            state.reset_at,
+                                            state.window_seconds,
+                                            observed_at,
+                                            &state.model_totals,
+                                        )
+                                    })
+                                    .transpose()?
+                                    .flatten();
                                 Ok((
-                                    store.load_session_collection_state()?,
+                                    state,
                                     store.pending_history_continuity_recovery()?,
+                                    cumulative_recovery,
                                 ))
                             });
                     match state {
@@ -13098,16 +13189,27 @@ impl CodexInfoState {
             history_continuity_recovery.as_ref().and_then(|continuity| {
                 load_regression_recovery_state(partition, &collection_state, continuity)
             });
-        let period_boundary = admit_session_collection_period(
+        let period_transition = admit_session_collection_period(
             &mut collection_state,
             reset_at,
             window_seconds,
             self.remaining_percent,
-            Utc::now().timestamp(),
+            observed_at,
         );
+        if period_transition == QuotaTransition::Rejected {
+            debug_runtime("local collection rejected ambiguous quota period candidate");
+            return false;
+        }
+        let period_boundary = period_transition == QuotaTransition::Boundary;
+        let (canonical_reset_at, canonical_window_seconds) =
+            if period_transition == QuotaTransition::SamePeriod {
+                (collection_state.reset_at, collection_state.window_seconds)
+            } else {
+                (reset_at, window_seconds)
+            };
         debug_runtime(format!(
-            "local collection period admitted boundary={period_boundary} durable_generation={}",
-            collection_state.data_generation
+            "local collection period admitted transition={period_transition:?} durable_generation={}",
+            collection_state.data_generation,
         ));
         let history_continuity_recovery = history_continuity_recovery
             .filter(|recovery| recovery.matches_reset_at(collection_state.reset_at));
@@ -13122,8 +13224,9 @@ impl CodexInfoState {
             history_continuity_recovery: (!period_boundary)
                 .then_some(history_continuity_recovery)
                 .flatten(),
-            reset_at,
-            window_seconds,
+            cumulative_recovery: (!period_boundary).then_some(cumulative_recovery).flatten(),
+            reset_at: canonical_reset_at,
+            window_seconds: canonical_window_seconds,
         };
         if !self.local_bridge.send(command.clone()) {
             self.local_bridge = LocalUsageBridge::start();
@@ -13156,6 +13259,7 @@ impl CodexInfoState {
             session_ranges: std::mem::take(&mut self.pending_session_ranges),
             session_model_totals: std::mem::take(&mut self.pending_session_model_totals),
             history_continuity_recovery: self.pending_history_continuity_recovery.take(),
+            cumulative_recovery: self.pending_cumulative_recovery.take(),
             reset_at: period.map(|value| value.0),
             window_seconds: period.map(|value| value.1),
             cleanup_plans: std::mem::take(&mut self.pending_session_cleanup),
@@ -13170,6 +13274,7 @@ impl CodexInfoState {
             || !self.pending_session_ranges.is_empty()
             || !self.pending_session_model_totals.is_empty()
             || self.pending_history_continuity_recovery.is_some()
+            || self.pending_cumulative_recovery.is_some()
             || self.pending_collector_generation.is_some()
             || self.pending_session_period.is_some()
             || self.pending_recorder_admission.is_some()
@@ -13210,6 +13315,9 @@ impl CodexInfoState {
         if batch.history_continuity_recovery.is_some() {
             self.pending_history_continuity_recovery = batch.history_continuity_recovery;
         }
+        if batch.cumulative_recovery.is_some() {
+            self.pending_cumulative_recovery = batch.cumulative_recovery;
+        }
         self.pending_collector_generation = batch.collector_epoch.zip(batch.cycle_seq);
         self.pending_quota_source_rescan_complete = batch.quota_source_rescan_complete;
         self.pending_session_period = batch.reset_at.zip(batch.window_seconds);
@@ -13227,6 +13335,7 @@ impl CodexInfoState {
         self.pending_session_ranges.clear();
         self.pending_session_model_totals.clear();
         self.pending_history_continuity_recovery = None;
+        self.pending_cumulative_recovery = None;
         self.pending_collector_generation = None;
         self.pending_quota_source_rescan_complete = false;
         self.pending_session_period = None;
@@ -13280,6 +13389,7 @@ impl CodexInfoState {
         self.pending_session_ranges.clear();
         self.pending_session_model_totals.clear();
         self.pending_history_continuity_recovery = None;
+        self.pending_cumulative_recovery = None;
         self.pending_collector_generation = None;
         self.pending_session_period = None;
         self.pending_recorder_admission = None;
@@ -13385,23 +13495,63 @@ impl CodexInfoState {
             self.apply_identity_error("利用枠取得中にアカウントidentityが変更されました。".into());
             return;
         }
-        let previous_reset_at = self.reset_at;
         let now = Utc::now().timestamp();
-        let reset_changed = reset_transition_is_boundary(
+        let mut previous_reset_at = self.reset_at;
+        let mut previous_window_seconds = self.window_seconds;
+        let mut previous_observed_at = self.last_success_at;
+        if let Some(partition) = self.account_partition.as_ref() {
+            let identity = partition.storage_identity();
+            if let Ok(durable) =
+                UsageStore::open_read_only_partitioned(&partition.database_path, &identity)
+                    .and_then(|store| store.load_session_collection_state())
+            {
+                if durable.data_generation > 0 {
+                    if let Some(observation) = durable.last_quota_observation.as_ref() {
+                        if previous_observed_at
+                            .is_none_or(|current| observation.observed_at > current)
+                        {
+                            previous_reset_at = (durable.reset_at > 0).then_some(durable.reset_at);
+                            previous_window_seconds = durable.window_seconds;
+                            previous_observed_at = Some(observation.observed_at);
+                        }
+                    }
+                }
+            }
+        }
+        let transition = classify_quota_transition(
             previous_reset_at,
-            self.remaining_percent,
+            previous_window_seconds,
+            previous_observed_at,
             reset_at,
+            window_seconds,
             remaining_percent,
-            self.last_success_at,
             now,
-            self.window_seconds,
         );
+        if transition == QuotaTransition::Rejected {
+            debug_runtime(format!(
+                "quota candidate rejected previous_reset_at={previous_reset_at:?} next_reset_at={reset_at} observed_at={now}"
+            ));
+            self.checking = false;
+            let _ = self.bridge.send(AccountCommand::FinishFallback);
+            self.refresh_partial_failure_status();
+            return;
+        }
+        let reset_changed = transition == QuotaTransition::Boundary;
+        let (canonical_reset_at, canonical_window_seconds) =
+            if transition == QuotaTransition::SamePeriod {
+                (
+                    previous_reset_at.expect("same-period authority has a reset"),
+                    previous_window_seconds,
+                )
+            } else {
+                (reset_at, window_seconds)
+            };
         self.has_quota_percent = remaining_percent.is_some();
         self.has_usage = true;
-        self.remaining_percent = remaining_percent.map(|value| value.clamp(0.0, 100.0));
-        self.reset_at = (reset_at > 0).then_some(reset_at);
-        self.window_seconds = window_seconds;
-        self.recovery_period = (reset_at > 0).then_some((reset_at, window_seconds));
+        self.remaining_percent = remaining_percent;
+        self.reset_at = Some(canonical_reset_at);
+        self.window_seconds = canonical_window_seconds;
+        self.recovery_period = Some((canonical_reset_at, canonical_window_seconds));
         self.limit_name = limit_name;
         self.quota_title = quota_title;
         self.monthly = monthly;
@@ -13430,12 +13580,12 @@ impl CodexInfoState {
         self.checking = false;
         self.last_success_at = Some(now);
         debug_runtime(format!(
-            "state usage applied authenticated={} reset_at={} window_seconds={} auth_epoch={}",
-            self.authenticated, reset_at, window_seconds, self.auth_epoch
+            "state usage applied authenticated={} reset_at={} window_seconds={} transition={transition:?} auth_epoch={}",
+            self.authenticated, canonical_reset_at, canonical_window_seconds, self.auth_epoch
         ));
         // Quota is committed before the single local worker is asked to
         // collect usage. The request carries the exact auth/period tuple.
-        if self.request_local_usage(reset_at, window_seconds) {
+        if self.request_local_usage(canonical_reset_at, canonical_window_seconds) {
             self.last_local_poll = Instant::now();
         } else {
             let _ = self.bridge.send(AccountCommand::FinishFallback);
@@ -13838,6 +13988,7 @@ impl CodexInfoState {
         }
         let fallback_start = self.history.pending_store_samples.len();
         let mut history_continuity_recovery = candidate.history_continuity_recovery;
+        self.pending_cumulative_recovery = candidate.cumulative_recovery;
         self.pending_session_checkpoints = candidate.session_checkpoints;
         self.pending_session_ranges = candidate.session_ranges;
         self.pending_session_model_totals = candidate.session_model_totals;
@@ -16240,7 +16391,7 @@ fn estimated_cost_label_from_v3(models: &[PublicModelUsageV3]) -> String {
     if !known || !total.is_finite() || total < 0.0 {
         return "概算 —".into();
     }
-    format!("概算 ${}", total.min(u64::MAX as f64).round() as u64)
+    format_estimated_total(total)
 }
 
 fn format_estimated_cost(costs: ModelDollarTotals) -> String {
@@ -16248,12 +16399,23 @@ fn format_estimated_cost(costs: ModelDollarTotals) -> String {
         .into_iter()
         .filter(|value| value.is_finite() && *value >= 0.0)
         .sum::<f64>();
-    let total = if total.is_finite() && total >= 0.0 {
-        total.min(u64::MAX as f64).round() as u64
-    } else {
-        0
-    };
-    format!("概算 ${}", format_token_count(total))
+    format_estimated_total(total)
+}
+
+fn format_estimated_total(total: f64) -> String {
+    if !total.is_finite() || total < 0.0 {
+        return "概算 —".into();
+    }
+    let cents = (total * 100.0).round();
+    if !cents.is_finite() || cents > u128::MAX as f64 {
+        return "概算 —".into();
+    }
+    let cents = cents as u128;
+    format!(
+        "概算 ${}.{:02}",
+        format_unsigned_count(cents / 100),
+        cents % 100
+    )
 }
 
 fn format_token_count(value: u64) -> String {
@@ -19281,6 +19443,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                 session_ranges,
                                 session_model_totals,
                                 history_continuity_recovery,
+                                cumulative_recovery,
                                 reset_at,
                                 window_seconds,
                                 cleanup_plans,
@@ -19330,6 +19493,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                 || !session_ranges.is_empty()
                                 || !session_model_totals.is_empty()
                                 || history_continuity_recovery.is_some()
+                                || cumulative_recovery.is_some()
                             {
                                 let Some(batch_partition_id) = partition_id.as_ref() else {
                                     state.apply_identity_error(
@@ -19371,6 +19535,7 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                         session_ranges,
                                         session_model_totals,
                                         history_continuity_recovery,
+                                        cumulative_recovery,
                                         quota_source_rescan_complete,
                                     },
                                 ) {
@@ -19394,8 +19559,12 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                                 let canonical_observations =
                                     commit_ack.canonical_observations.clone();
                                 let legacy_history_bridged = commit_ack.legacy_history_bridged;
+                                let cumulative_history_recovered =
+                                    commit_ack.cumulative_history_recovered;
                                 state.acknowledge_recorder_commit(batch_admission, commit_ack);
-                                let refreshed = if legacy_history_bridged {
+                                let refreshed = if legacy_history_bridged
+                                    || cumulative_history_recovered
+                                {
                                     state.history.refresh_from_store(Utc::now())
                                 } else {
                                     state.history.apply_committed_samples(
@@ -20308,6 +20477,7 @@ mod tests {
                 canonical_observations: Vec::new(),
                 fallback_model_totals: None,
                 legacy_history_bridged: false,
+                cumulative_history_recovered: false,
             },
         );
     }
@@ -20497,14 +20667,18 @@ mod tests {
     }
 
     fn raw_loopback_pair(response: &str) -> String {
+        raw_loopback_header(response, "Codex-Info-Published-Pair")
+    }
+
+    fn raw_loopback_header(response: &str, expected_name: &str) -> String {
         response
             .lines()
             .find_map(|line| {
                 let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("Codex-Info-Published-Pair")
+                name.eq_ignore_ascii_case(expected_name)
                     .then(|| value.trim().to_owned())
             })
-            .expect("published pair header")
+            .unwrap_or_else(|| panic!("{expected_name} header"))
     }
 
     use super::{
@@ -24669,19 +24843,26 @@ mod tests {
         assert_eq!(totals.sol, 35.5);
         assert_eq!(totals.terra, 14.2);
         assert!((totals.luna - 1.42).abs() < f64::EPSILON);
-        assert_eq!(format_estimated_cost(totals), "概算 $51");
+        assert_eq!(format_estimated_cost(totals), "概算 $51.12");
         assert_eq!(
             format_estimated_cost(ModelDollarTotals {
                 sol: 1_234.5,
                 terra: 0.0,
                 luna: 0.0,
             }),
-            "概算 $1,235"
+            "概算 $1,234.50"
         );
         assert_eq!(
             format_estimated_cost(ModelDollarTotals::default()),
-            "概算 $0"
+            "概算 $0.00"
         );
+        let recovered = ModelDollarTotals {
+            sol: 370.814_975,
+            terra: 0.0,
+            luna: 1.423_482_24 + 0.187_152_6,
+        };
+        assert!((recovered.sol + recovered.luna - 372.425_609_84).abs() < f64::EPSILON);
+        assert_eq!(format_estimated_cost(recovered), "概算 $372.43");
 
         let maximum = ModelUsageRow {
             cache_write_input_tokens: None,
@@ -24942,6 +25123,187 @@ mod tests {
     }
 
     #[test]
+    fn future_reset_alias_round_trip_is_not_a_period_boundary() {
+        // Production regression (2026-09-09 16:56--17:40 UTC): the
+        // authoritative weekly deadline A was still in the future when the
+        // quota source temporarily reported an earlier deadline B. Returning
+        // to A raised the reported remaining percentage, but time had crossed
+        // neither deadline. No cumulative Session value may be cleared.
+        let observed_a = 1_788_972_900;
+        let observed_b = 1_788_975_540;
+        let observed_a_again = 1_788_975_600;
+        let reset_a = 1_789_437_490;
+        let reset_b = 1_789_300_251;
+        assert!(!reset_transition_is_boundary(
+            Some(reset_a),
+            Some(29.0),
+            reset_b,
+            Some(17.0),
+            Some(observed_a),
+            observed_b,
+            WEEK_SECONDS,
+        ));
+        assert!(!reset_transition_is_boundary(
+            Some(reset_b),
+            Some(17.0),
+            reset_a,
+            Some(29.0),
+            Some(observed_b),
+            observed_a_again,
+            WEEK_SECONDS,
+        ));
+
+        let durable = super::usage_store::SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 555_312_427,
+            input_tokens: 553_537_987,
+            cached_input_tokens: 544_468_480,
+            output_tokens: 1_774_440,
+            cache_write_input_tokens: Some(0),
+        };
+        let mut state = super::usage_store::SessionCollectionState {
+            data_generation: 9_000,
+            reset_at: reset_b,
+            window_seconds: WEEK_SECONDS,
+            last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
+                observed_at: observed_b,
+                remaining_percent: 17.0,
+            }),
+            model_totals: vec![durable.clone()],
+            ..super::usage_store::SessionCollectionState::default()
+        };
+        assert_eq!(
+            super::admit_session_collection_period(
+                &mut state,
+                reset_a,
+                WEEK_SECONDS,
+                Some(29.0),
+                observed_a_again,
+            ),
+            super::QuotaTransition::Rejected
+        );
+        assert_eq!(state.model_totals, [durable]);
+    }
+
+    #[test]
+    fn quota_boundary_rejects_a_reversed_observation_clock() {
+        let previous_observed_at = 2_000_000_100;
+        let previous_reset_at = 2_000_000_050;
+        assert!(!reset_transition_is_boundary(
+            Some(previous_reset_at),
+            Some(1.0),
+            previous_reset_at + WEEK_SECONDS,
+            Some(100.0),
+            Some(previous_observed_at),
+            previous_observed_at - 1,
+            WEEK_SECONDS,
+        ));
+    }
+
+    #[test]
+    fn quota_transition_follows_only_the_durable_time_authority() {
+        let observed = 2_000_000_000;
+        let reset = observed + WEEK_SECONDS;
+        assert_eq!(
+            super::classify_quota_transition(
+                None,
+                0,
+                None,
+                reset,
+                WEEK_SECONDS,
+                Some(50.0),
+                observed,
+            ),
+            super::QuotaTransition::Initial
+        );
+        assert_eq!(
+            super::classify_quota_transition(
+                Some(reset),
+                WEEK_SECONDS,
+                Some(observed),
+                reset,
+                WEEK_SECONDS,
+                Some(49.0),
+                observed + 60,
+            ),
+            super::QuotaTransition::SamePeriod
+        );
+        for (next_reset, next_window, remaining, next_observed) in [
+            (reset - 137_239, WEEK_SECONDS, Some(17.0), observed + 60),
+            (reset + 1, WEEK_SECONDS, Some(29.0), observed + 60),
+            (reset, WEEK_SECONDS + 1, Some(29.0), observed + 60),
+            (reset, WEEK_SECONDS, None, observed + 60),
+            (reset, WEEK_SECONDS, Some(f64::NAN), observed + 60),
+            (observed + 59, WEEK_SECONDS, Some(29.0), observed + 60),
+            (reset, WEEK_SECONDS, Some(29.0), observed - 1),
+        ] {
+            assert_eq!(
+                super::classify_quota_transition(
+                    Some(reset),
+                    WEEK_SECONDS,
+                    Some(observed),
+                    next_reset,
+                    next_window,
+                    remaining,
+                    next_observed,
+                ),
+                super::QuotaTransition::Rejected
+            );
+        }
+        assert_eq!(
+            super::classify_quota_transition(
+                Some(reset),
+                WEEK_SECONDS,
+                Some(observed),
+                reset + WEEK_SECONDS,
+                WEEK_SECONDS,
+                Some(100.0),
+                reset,
+            ),
+            super::QuotaTransition::Boundary
+        );
+    }
+
+    #[test]
+    fn rejected_quota_candidate_keeps_the_last_complete_http_generation() {
+        let observed = Utc::now().timestamp();
+        let canonical_reset = observed + WEEK_SECONDS;
+        let mut state = CodexInfoState::preview("normal");
+        state.reset_at = Some(canonical_reset);
+        state.window_seconds = WEEK_SECONDS;
+        state.remaining_percent = Some(29.0);
+        state.last_success_at = Some(observed);
+        state.checking = false;
+        let before = state.public_details_candidates_at(observed);
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        server
+            .publisher()
+            .publish_details_v3(before.0.clone(), before.1.clone(), before.2.clone())
+            .unwrap();
+        let first = raw_loopback_get(server.local_addr(), "/v3/current");
+
+        state.apply_usage_event(usage_event(Some(17.0), canonical_reset - 137_239));
+        assert_eq!(state.reset_at, Some(canonical_reset));
+        assert_eq!(state.window_seconds, WEEK_SECONDS);
+        assert_eq!(state.remaining_percent, Some(29.0));
+        assert_eq!(state.public_details_candidates_at(observed), before);
+        // A rejected candidate is not a publication event. The active server
+        // pair remains the last complete generation rather than minting a
+        // new identity for the same body.
+        let rejected = raw_loopback_get(server.local_addr(), "/v3/current");
+        assert!(rejected.starts_with("HTTP/1.1 200"));
+        assert_eq!(raw_loopback_body(&rejected), raw_loopback_body(&first));
+        assert_eq!(raw_loopback_pair(&rejected), raw_loopback_pair(&first));
+
+        state.apply_usage_event(usage_event(Some(28.0), canonical_reset));
+        assert_eq!(state.reset_at, Some(canonical_reset));
+        assert_eq!(state.remaining_percent, Some(28.0));
+        server.shutdown();
+    }
+
+    #[test]
     fn period_admission_preserves_durable_totals_during_drift_and_clears_on_rollover() {
         let now = 2_000_000_000;
         let two_days = 2 * 86_400;
@@ -24964,13 +25326,16 @@ mod tests {
             model_totals: vec![durable_total.clone()],
             ..super::usage_store::SessionCollectionState::default()
         };
-        assert!(!super::admit_session_collection_period(
-            &mut restarted,
-            now + WEEK_SECONDS,
-            WEEK_SECONDS,
-            Some(69.0),
-            now,
-        ));
+        assert_eq!(
+            super::admit_session_collection_period(
+                &mut restarted,
+                now + WEEK_SECONDS,
+                WEEK_SECONDS,
+                Some(69.0),
+                now,
+            ),
+            super::QuotaTransition::Rejected
+        );
         assert_eq!(restarted.model_totals, [durable_total.clone()]);
 
         let mut rollover = super::usage_store::SessionCollectionState {
@@ -24984,13 +25349,16 @@ mod tests {
             model_totals: vec![durable_total],
             ..super::usage_store::SessionCollectionState::default()
         };
-        assert!(super::admit_session_collection_period(
-            &mut rollover,
-            now + WEEK_SECONDS,
-            WEEK_SECONDS,
-            Some(100.0),
-            now,
-        ));
+        assert_eq!(
+            super::admit_session_collection_period(
+                &mut rollover,
+                now + WEEK_SECONDS + 30,
+                WEEK_SECONDS,
+                Some(100.0),
+                now + 30,
+            ),
+            super::QuotaTransition::Boundary
+        );
         assert!(rollover.model_totals.is_empty());
     }
 
@@ -26048,6 +26416,7 @@ mod tests {
                         canonical_observations: canonical_observations.clone(),
                         fallback_model_totals: None,
                         legacy_history_bridged: false,
+                        cumulative_history_recovered: false,
                     },
                 );
                 assert!(state
@@ -26073,7 +26442,7 @@ mod tests {
         assert_eq!(model.input_dollars, 5.0);
         assert_eq!(model.cached_input_dollars, 0.0);
         assert_eq!(model.output_dollars, 30.0);
-        assert_eq!(wire.estimated_cost_label, "概算 $35");
+        assert_eq!(wire.estimated_cost_label, "概算 $35.00");
         let current_reset = wire
             .history_periods
             .iter()
@@ -26094,7 +26463,7 @@ mod tests {
         assert!(linux_ui.apply_service_details_v2(pair, wire).unwrap());
         assert_eq!(linux_ui.model_usage.len(), 1);
         assert_eq!(linux_ui.model_usage[0].tokens, 2_000_000);
-        assert_eq!(linux_ui.estimated_cost_label, "概算 $35");
+        assert_eq!(linux_ui.estimated_cost_label, "概算 $35.00");
         assert_eq!(
             linux_ui
                 .history
@@ -26107,6 +26476,293 @@ mod tests {
 
         server.shutdown();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovered_generation_publishes_the_exact_cost_to_rest_and_linux_ui() {
+        let canonical_reset = 1_789_437_490;
+        let transient_reset = 1_789_300_251;
+        let baseline = vec![
+            usage_store::SessionModelTotal {
+                model: "LUNA".into(),
+                total_tokens: 22_816_483,
+                input_tokens: 22_343_994,
+                cached_input_tokens: 20_068_352,
+                output_tokens: 472_489,
+                cache_write_input_tokens: Some(0),
+            },
+            usage_store::SessionModelTotal {
+                model: "SOL".into(),
+                total_tokens: 555_312_427,
+                input_tokens: 553_537_987,
+                cached_input_tokens: 544_468_480,
+                output_tokens: 1_774_440,
+                cache_write_input_tokens: Some(0),
+            },
+        ];
+        let first_suffix = vec![usage_store::SessionModelTotal {
+            model: "LUNA".into(),
+            total_tokens: 91_512,
+            input_tokens: 84_194,
+            cached_input_tokens: 73_472,
+            output_tokens: 7_318,
+            cache_write_input_tokens: Some(0),
+        }];
+        let current_suffix = vec![usage_store::SessionModelTotal {
+            model: "LUNA".into(),
+            total_tokens: 2_446_273,
+            input_tokens: 2_382_039,
+            cached_input_tokens: 2_035_200,
+            output_tokens: 64_234,
+            cache_write_input_tokens: Some(0),
+        }];
+        let observation = |timestamp: i64,
+                           reset_at: i64,
+                           sol_dollars: f64,
+                           luna_dollars: f64,
+                           totals: Vec<usage_store::SessionModelTotal>| {
+            let tokens = |model: &str| {
+                totals
+                    .iter()
+                    .find(|total| total.model == model)
+                    .map(|total| total.total_tokens)
+                    .unwrap_or(0)
+            };
+            usage_store::UsageHistoryObservation {
+                timestamp,
+                reset_at,
+                remaining_percent: Some(if reset_at == transient_reset {
+                    17.0
+                } else {
+                    29.0
+                }),
+                sol_dollars: Some(sol_dollars),
+                terra_dollars: Some(0.0),
+                luna_dollars: Some(luna_dollars),
+                sol_tokens: Some(tokens("SOL")),
+                terra_tokens: Some(0),
+                luna_tokens: Some(tokens("LUNA")),
+                model_source: usage_store::ModelSource::Confirmed,
+                model_totals: Some(totals),
+                model_totals_complete: false,
+            }
+        };
+        let observations = vec![
+            observation(
+                1_788_975_540,
+                transient_reset,
+                370.814_975,
+                1.423_482_24,
+                baseline,
+            ),
+            observation(
+                1_788_975_600,
+                canonical_reset,
+                0.0,
+                0.012_395_44,
+                first_suffix,
+            ),
+            observation(
+                1_788_996_000,
+                canonical_reset,
+                0.0,
+                0.187_152_6,
+                current_suffix.clone(),
+            ),
+        ];
+        let recovery = usage_store::derive_session_cumulative_recovery(
+            &"33".repeat(32),
+            canonical_reset,
+            WEEK_SECONDS,
+            1_788_996_001,
+            &current_suffix,
+            &observations,
+        )
+        .unwrap()
+        .expect("production reset regression is recoverable");
+        let mut collection = super::LocalUsageCollection {
+            model_usage: ModelUsageTotals::from_session_totals(&current_suffix),
+            model_totals_complete: false,
+            session_model_totals: current_suffix,
+            ..super::LocalUsageCollection::default()
+        };
+        assert!(super::apply_cumulative_recovery_to_current(
+            &mut collection,
+            &recovery
+        ));
+        let corrected = &collection.session_model_totals;
+        let corrected_sol = corrected.iter().find(|total| total.model == "SOL").unwrap();
+        let corrected_luna = corrected
+            .iter()
+            .find(|total| total.model == "LUNA")
+            .unwrap();
+        assert_eq!(corrected_sol.total_tokens, 555_312_427);
+        assert_eq!(corrected_luna.total_tokens, 25_262_756);
+        assert_eq!(corrected_luna.input_tokens, 24_726_033);
+        assert_eq!(corrected_luna.cached_input_tokens, 22_103_552);
+        assert_eq!(corrected_luna.output_tokens, 536_723);
+
+        let mut producer = CodexInfoState::preview("normal");
+        producer.preview = false;
+        producer.history = UsageHistory::default();
+        producer.active_threads.clear();
+        producer.reset_at = Some(canonical_reset);
+        producer.window_seconds = WEEK_SECONDS;
+        producer.remaining_percent = Some(9.0);
+        producer.has_quota_percent = true;
+        producer.last_success_at = Some(Utc::now().timestamp());
+        producer.local_usage_pending = true;
+        producer.apply_local_usage_success(LocalUsageResult {
+            auth_epoch: producer.auth_epoch,
+            reset_at: canonical_reset,
+            window_seconds: WEEK_SECONDS,
+            model_usage: collection.model_usage,
+            model_totals_complete: false,
+            history_samples: Vec::new(),
+            history_model_totals: Vec::new(),
+            recorded_sessions: Vec::new(),
+            cleanup_plan: None,
+        });
+        acknowledge_recorder_commit_fixture(&mut producer, 258, 0x258, 1);
+        let observed_at = producer
+            .history
+            .samples
+            .iter()
+            .map(|sample| sample.timestamp)
+            .max()
+            .unwrap();
+        producer.last_success_at = Some(observed_at);
+        assert_eq!(producer.estimated_cost_label, "概算 $372.43");
+
+        let (v1, v2, v3) = producer.public_details_candidates_at(observed_at);
+        assert_eq!(v1.estimated_cost_label, "概算 $372.43");
+        assert_eq!(v2.estimated_cost_label, "概算 $372.43");
+        let current_sol = v3.models.iter().find(|model| model.model == "SOL").unwrap();
+        let current_luna = v3
+            .models
+            .iter()
+            .find(|model| model.model == "LUNA")
+            .unwrap();
+        assert_eq!(current_sol.total_tokens, 555_312_427);
+        assert_eq!(current_luna.total_tokens, 25_262_756);
+        assert_eq!(current_luna.input_tokens, 24_726_033);
+        assert_eq!(current_luna.cached_input_tokens, 22_103_552);
+        assert_eq!(current_luna.output_tokens, 536_723);
+        assert!(
+            (current_sol.estimated_cost.as_ref().unwrap().total_dollars - 370.814_975).abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (current_luna.estimated_cost.as_ref().unwrap().total_dollars - 1.610_634_84).abs()
+                < f64::EPSILON
+        );
+        let exact_total = v3
+            .models
+            .iter()
+            .map(|model| model.estimated_cost.as_ref().unwrap().total_dollars)
+            .sum::<f64>();
+        assert!((exact_total - 372.425_609_84).abs() < f64::EPSILON);
+        assert!(v3.models.iter().any(|model| model.model == "SOL"));
+        assert_ne!(
+            v3.models.len(),
+            1,
+            "the old LUNA-only generation is forbidden"
+        );
+
+        let mut server =
+            ApiServer::start(ApiServerConfig::new("127.0.0.1:0".parse().unwrap()).unwrap())
+                .unwrap();
+        server
+            .publisher()
+            .publish_details_v3(v1, v2, v3.clone())
+            .unwrap();
+        let current_response = raw_loopback_get(server.local_addr(), "/v3/current");
+        let periods_response = raw_loopback_get(server.local_addr(), "/v3/history/periods");
+        let current_body = raw_loopback_body(&current_response);
+        let periods_body = raw_loopback_body(&periods_response);
+        let current_period_id = periods_body["history_periods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|period| period["current"] == true)
+            .and_then(|period| period["id"].as_str())
+            .unwrap();
+        let history_response = raw_loopback_get(
+            server.local_addr(),
+            &super::service_history_route(current_period_id, None),
+        );
+        let history_body = raw_loopback_body(&history_response);
+        let published_pair = raw_loopback_pair(&current_response);
+        assert_eq!(raw_loopback_pair(&periods_response), published_pair);
+        assert_eq!(raw_loopback_pair(&history_response), published_pair);
+        let endpoint = history_body["history_samples"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        for model_name in ["SOL", "LUNA"] {
+            let current_model = current_body["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["model"] == model_name)
+                .unwrap();
+            let history_model = endpoint["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["model"] == model_name)
+                .unwrap();
+            for component in [
+                "total_tokens",
+                "input_tokens",
+                "cached_input_tokens",
+                "cache_write_input_tokens",
+                "output_tokens",
+            ] {
+                assert_eq!(history_model[component], current_model[component]);
+            }
+            assert_eq!(
+                history_model["total_dollars"],
+                current_model["estimated_cost"]["total_dollars"]
+            );
+        }
+        let wire_total = current_body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["estimated_cost"]["total_dollars"].as_f64().unwrap())
+            .sum::<f64>();
+        assert!((wire_total - 372.425_609_84).abs() < f64::EPSILON);
+        assert!((wire_total - 0.187_152_6).abs() > 300.0);
+
+        let mut linux = CodexInfoState::service_client();
+        assert_eq!(
+            super::poll_service_current_resources(&mut linux, server.local_addr()),
+            super::ServiceCurrentPollOutcome::Success
+        );
+        super::poll_service_graph_resources(&mut linux, server.local_addr(), true);
+        assert_eq!(linux.estimated_cost_label, "概算 $372.43");
+        assert_eq!(
+            linux
+                .model_usage
+                .iter()
+                .find(|model| model.name == "SOL")
+                .map(|model| model.tokens),
+            Some(555_312_427)
+        );
+        assert_eq!(
+            linux
+                .model_usage
+                .iter()
+                .find(|model| model.name == "LUNA")
+                .map(|model| model.tokens),
+            Some(25_262_756)
+        );
+        let graph = linux.graph_paths_for_selection_at(observed_at, true, true, true, false);
+        assert_eq!(graph.current_sol_label, "$370.81");
+        assert_eq!(graph.current_luna_label, "$1.61");
+        server.shutdown();
     }
 
     #[test]
@@ -26276,6 +26932,7 @@ mod tests {
                 output_tokens: 20,
             }],
             history_continuity_recovery: None,
+            cumulative_recovery: None,
         });
         state.local_usage_pending = true;
 
@@ -26747,8 +27404,11 @@ mod tests {
     #[test]
     fn quota_reset_moves_an_auto_selected_graph_to_the_new_period() {
         let mut state = CodexInfoState::preview("normal");
-        let previous_reset = state.reset_at.expect("preview reset");
-        state.select_latest_history();
+        let previous_reset = Utc::now().timestamp();
+        state.reset_at = Some(previous_reset);
+        state.last_success_at = Some(previous_reset - 60);
+        state.selected_reset_at = Some(previous_reset);
+        state.selected_history_period.clear();
         assert_eq!(state.selected_reset_at, Some(previous_reset));
 
         let next_reset = previous_reset + WEEK_SECONDS;
@@ -26782,7 +27442,9 @@ mod tests {
 
         for offset in offsets {
             let mut state = CodexInfoState::preview("normal");
-            let previous_reset = state.reset_at.expect("preview reset");
+            let previous_reset = Utc::now().timestamp();
+            state.reset_at = Some(previous_reset);
+            state.last_success_at = Some(previous_reset - 60);
             let next_reset = previous_reset + WEEK_SECONDS;
             state.selected_reset_at = Some(previous_reset + offset);
             state.selected_history_period = "stale selected period".into();
@@ -31193,13 +31855,16 @@ mod tests {
             model_totals: vec![durable_total],
             ..super::usage_store::SessionCollectionState::default()
         };
-        assert!(!super::admit_session_collection_period(
-            &mut durable_state,
-            reset_at,
-            WEEK_SECONDS,
-            Some(79.0),
-            now.timestamp(),
-        ));
+        assert_eq!(
+            super::admit_session_collection_period(
+                &mut durable_state,
+                reset_at,
+                WEEK_SECONDS,
+                Some(79.0),
+                now.timestamp(),
+            ),
+            super::QuotaTransition::Rejected
+        );
         let cumulative = super::collect_incremental_local_usage(
             &inventory,
             &durable_state,

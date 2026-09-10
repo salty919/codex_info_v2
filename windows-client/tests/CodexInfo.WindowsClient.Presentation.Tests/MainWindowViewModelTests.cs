@@ -116,7 +116,7 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
-    public async Task V3CurrentShowsThePublishedModelCostTotal()
+    public async Task RecoveredV3CurrentShowsTheExactCrossPlatformCostTotal()
     {
         var current = new ApiCurrentSnapshot(
             ApiState.Ready,
@@ -125,13 +125,17 @@ public sealed class MainWindowViewModelTests
             "Pro",
             new ApiQuota(45, 2, 604800, false),
             [
-                new ApiDetailsModelUsage("SOL", 1, 0, 0, 1, 0, 0)
+                new ApiDetailsModelUsage("SOL", 553_537_987, 544_468_480, 1_774_440, 0, 0, 0)
                 {
-                    EstimatedTotalDollars = 302.946591,
+                    TotalTokens = 555_312_427,
+                    CacheWriteInputTokens = 0,
+                    EstimatedTotalDollars = 370.814975,
                 },
-                new ApiDetailsModelUsage("LUNA", 1, 0, 0, 1, 0, 0)
+                new ApiDetailsModelUsage("LUNA", 24_726_033, 22_103_552, 536_723, 0, 0, 0)
                 {
-                    EstimatedTotalDollars = 10.62801708,
+                    TotalTokens = 25_262_756,
+                    CacheWriteInputTokens = 0,
+                    EstimatedTotalDollars = 1.61063484,
                 },
             ],
             0,
@@ -141,7 +145,10 @@ public sealed class MainWindowViewModelTests
         viewModel.Start();
         await EventuallyAsync(() => viewModel.IsAuthenticated);
 
-        Assert.Equal("概算 $313.57", viewModel.EstimatedCostText);
+        Assert.Equal("概算 $372.43", viewModel.EstimatedCostText);
+        Assert.NotEqual("概算 $0.19", viewModel.EstimatedCostText);
+        Assert.Equal(555_312_427UL, viewModel.DetailsSnapshot!.Models.Single(model => model.Name == "SOL").TotalTokens);
+        Assert.Equal(25_262_756UL, viewModel.DetailsSnapshot.Models.Single(model => model.Name == "LUNA").TotalTokens);
     }
 
     [Fact]

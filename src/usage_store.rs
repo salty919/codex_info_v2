@@ -177,6 +177,17 @@ CREATE TABLE session_model_totals (
     cache_write_input_tokens TEXT
 ) WITHOUT ROWID;
 
+CREATE TABLE session_cumulative_recoveries (
+    recovery_id TEXT PRIMARY KEY CHECK (
+        length(recovery_id) = 64
+        AND recovery_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    payload_json TEXT NOT NULL CHECK (
+        length(payload_json) BETWEEN 2 AND 1048576
+    ),
+    applied_generation TEXT NOT NULL
+) WITHOUT ROWID;
+
 CREATE TABLE usage_model_history (
     reset_at INTEGER NOT NULL CHECK (reset_at > 0),
     timestamp INTEGER NOT NULL CHECK (timestamp > 0),
@@ -272,7 +283,7 @@ const DURABLE_STATE_OBSERVATION_MIN_SINGLETON: i64 = 2;
 const MAX_OBSERVATION_JSON_BYTES: usize = 16 * 1024;
 const OBSERVATION_JSON_KIND: &str = "codex-info-usage-observation-v1";
 pub const MAX_SESSION_MODEL_BYTES: usize = 512;
-const ACCOUNT_DB_SCHEMA_VERSION: i64 = 2;
+const ACCOUNT_DB_SCHEMA_VERSION: i64 = 3;
 const OBSERVATION_JSON_KEYS: &[&str] = &[
     "kind",
     "timestamp",
@@ -658,6 +669,36 @@ pub struct SessionModelTotal {
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
     pub cache_write_input_tokens: Option<u64>,
+}
+
+/// One source-proven correction for a cumulative Session counter that was
+/// reset while the authoritative quota period was still active.
+///
+/// The raw history rows remain immutable. `before_model_totals` retains the
+/// complete boundary evidence, while `offset_model_totals` contains only the
+/// models whose own counters prove a regression (or disappear as unknown).
+/// Those offsets and the legacy SOL/TERRA/LUNA dollar offsets are projected
+/// only over the bounded raw suffix identified by the two exact keys. The
+/// recorder stores the payload and corrected durable totals atomically under
+/// `recovery_id`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionCumulativeRecovery {
+    pub recovery_id: String,
+    pub canonical_reset_at: i64,
+    pub window_seconds: i64,
+    pub before_reset_at: i64,
+    pub before_timestamp: i64,
+    pub first_reset_at: i64,
+    pub first_timestamp: i64,
+    pub through_reset_at: i64,
+    pub through_timestamp: i64,
+    pub before_model_totals: Vec<SessionModelTotal>,
+    pub offset_model_totals: Vec<SessionModelTotal>,
+    pub first_model_totals: Vec<SessionModelTotal>,
+    pub source_current_model_totals: Vec<SessionModelTotal>,
+    pub offset_sol_dollars: f64,
+    pub offset_terra_dollars: f64,
+    pub offset_luna_dollars: f64,
 }
 
 /// Legacy history offset that still needs an exact component baseline.
@@ -1337,6 +1378,787 @@ fn canonicalize_model_totals(totals: &[SessionModelTotal]) -> Result<Vec<Session
         }
     }
     Ok(canonical.into_values().collect())
+}
+
+fn model_total_dominates(left: &SessionModelTotal, right: &SessionModelTotal) -> bool {
+    left.model == right.model
+        && left.total_tokens >= right.total_tokens
+        && left.input_tokens >= right.input_tokens
+        && left.cached_input_tokens >= right.cached_input_tokens
+        && left.output_tokens >= right.output_tokens
+        && match (
+            left.cache_write_input_tokens,
+            right.cache_write_input_tokens,
+        ) {
+            (Some(left), Some(right)) => left >= right,
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+fn model_total_reset_is_proven(baseline: &SessionModelTotal, observed: &SessionModelTotal) -> bool {
+    if baseline.model != observed.model {
+        return false;
+    }
+    let known_components = [
+        (baseline.total_tokens, observed.total_tokens),
+        (baseline.input_tokens, observed.input_tokens),
+        (baseline.cached_input_tokens, observed.cached_input_tokens),
+        (baseline.output_tokens, observed.output_tokens),
+    ];
+    if known_components
+        .into_iter()
+        .any(|(before, after)| before > 0 && after >= before)
+    {
+        return false;
+    }
+    match (
+        baseline.cache_write_input_tokens,
+        observed.cache_write_input_tokens,
+    ) {
+        (Some(before), Some(after)) if before > 0 && after >= before => false,
+        (Some(_), Some(_)) | (None, None) => true,
+        _ => false,
+    }
+}
+
+fn model_totals_dominate(left: &[SessionModelTotal], right: &[SessionModelTotal]) -> bool {
+    let left = left
+        .iter()
+        .map(|total| (total.model.as_str(), total))
+        .collect::<BTreeMap<_, _>>();
+    right.iter().all(|required| {
+        left.get(required.model.as_str())
+            .is_some_and(|candidate| model_total_dominates(candidate, required))
+    })
+}
+
+fn same_reset_group(left: i64, right: i64) -> bool {
+    left > 0 && right > 0 && left.abs_diff(right) <= RESET_GROUP_TOLERANCE_SECONDS as u64
+}
+
+fn checked_add_model_totals(
+    left: &[SessionModelTotal],
+    right: &[SessionModelTotal],
+) -> Option<Vec<SessionModelTotal>> {
+    let mut combined = left
+        .iter()
+        .cloned()
+        .map(|total| (total.model.clone(), total))
+        .collect::<BTreeMap<_, _>>();
+    for offset in right {
+        let total = combined
+            .entry(offset.model.clone())
+            .or_insert_with(|| SessionModelTotal {
+                model: offset.model.clone(),
+                total_tokens: 0,
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+            });
+        total.total_tokens = total.total_tokens.checked_add(offset.total_tokens)?;
+        total.input_tokens = total.input_tokens.checked_add(offset.input_tokens)?;
+        total.cached_input_tokens = total
+            .cached_input_tokens
+            .checked_add(offset.cached_input_tokens)?;
+        total.output_tokens = total.output_tokens.checked_add(offset.output_tokens)?;
+        total.cache_write_input_tokens = match (
+            total.cache_write_input_tokens,
+            offset.cache_write_input_tokens,
+        ) {
+            (Some(left), Some(right)) => Some(left.checked_add(right)?),
+            _ => None,
+        };
+    }
+    canonicalize_model_totals(&combined.into_values().collect::<Vec<_>>()).ok()
+}
+
+type CumulativeModelPayload = (String, u64, u64, u64, u64, Option<u64>);
+type CumulativeRecoveryPayload = (
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    i64,
+    Vec<CumulativeModelPayload>,
+    Vec<CumulativeModelPayload>,
+    Vec<CumulativeModelPayload>,
+    Vec<CumulativeModelPayload>,
+    f64,
+    f64,
+    f64,
+);
+
+fn cumulative_recovery_payload(
+    partition_id: &str,
+    recovery: &SessionCumulativeRecovery,
+) -> Result<String> {
+    let rows = |totals: &[SessionModelTotal]| -> Vec<CumulativeModelPayload> {
+        totals
+            .iter()
+            .map(|total| {
+                (
+                    total.model.clone(),
+                    total.total_tokens,
+                    total.input_tokens,
+                    total.cached_input_tokens,
+                    total.output_tokens,
+                    total.cache_write_input_tokens,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    serde_json::to_string(&(
+        partition_id,
+        recovery.canonical_reset_at,
+        recovery.window_seconds,
+        recovery.before_reset_at,
+        recovery.before_timestamp,
+        recovery.first_reset_at,
+        recovery.first_timestamp,
+        recovery.through_reset_at,
+        recovery.through_timestamp,
+        rows(&recovery.before_model_totals),
+        rows(&recovery.offset_model_totals),
+        rows(&recovery.first_model_totals),
+        rows(&recovery.source_current_model_totals),
+        recovery.offset_sol_dollars,
+        recovery.offset_terra_dollars,
+        recovery.offset_luna_dollars,
+    ))
+    .map_err(|_| UsageStoreError::InvalidImport("cumulative recovery is not serializable".into()))
+}
+
+fn validate_cumulative_recovery(
+    partition_id: &str,
+    recovery: &SessionCumulativeRecovery,
+) -> Result<String> {
+    if partition_id.len() != 64
+        || !partition_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || recovery.canonical_reset_at <= 0
+        || recovery.window_seconds <= 0
+        || recovery.before_reset_at <= 0
+        || recovery.before_timestamp <= 0
+        || recovery.first_reset_at <= 0
+        || recovery.first_timestamp <= recovery.before_timestamp
+        || recovery.through_reset_at <= 0
+        || recovery.through_timestamp < recovery.first_timestamp
+        || same_reset_group(recovery.before_reset_at, recovery.first_reset_at)
+        || !same_reset_group(recovery.through_reset_at, recovery.canonical_reset_at)
+        || !same_reset_group(recovery.first_reset_at, recovery.canonical_reset_at)
+        || [
+            recovery.offset_sol_dollars,
+            recovery.offset_terra_dollars,
+            recovery.offset_luna_dollars,
+        ]
+        .into_iter()
+        .any(|value| !value.is_finite() || value < 0.0)
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "cumulative recovery authority is invalid".into(),
+        ));
+    }
+    let before = canonicalize_model_totals(&recovery.before_model_totals)?;
+    let offset = canonicalize_model_totals(&recovery.offset_model_totals)?;
+    let first = canonicalize_model_totals(&recovery.first_model_totals)?;
+    let current = canonicalize_model_totals(&recovery.source_current_model_totals)?;
+    let before_by_model = before
+        .iter()
+        .map(|total| (total.model.as_str(), total))
+        .collect::<BTreeMap<_, _>>();
+    if before != recovery.before_model_totals
+        || offset != recovery.offset_model_totals
+        || first != recovery.first_model_totals
+        || current != recovery.source_current_model_totals
+        || before.is_empty()
+        || offset.is_empty()
+        || first.is_empty()
+        || current.is_empty()
+        || !offset.iter().any(|total| {
+            total.total_tokens > 0
+                || total.input_tokens > 0
+                || total.cached_input_tokens > 0
+                || total.output_tokens > 0
+                || total
+                    .cache_write_input_tokens
+                    .is_some_and(|value| value > 0)
+        })
+        || offset
+            .iter()
+            .any(|total| before_by_model.get(total.model.as_str()).copied() != Some(total))
+        || model_totals_dominate(&first, &offset)
+        || !model_totals_dominate(&current, &first)
+        || checked_add_model_totals(&current, &offset).is_none()
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "cumulative recovery model vector is invalid".into(),
+        ));
+    }
+    let payload = cumulative_recovery_payload(partition_id, recovery)?;
+    if payload.len() > MAX_SNAPSHOT_JSON_BYTES {
+        return Err(UsageStoreError::InvalidImport(
+            "cumulative recovery payload is too large".into(),
+        ));
+    }
+    let expected = format!("{:x}", Sha256::digest(payload.as_bytes()));
+    if recovery.recovery_id != expected {
+        return Err(UsageStoreError::InvalidImport(
+            "cumulative recovery identity mismatch".into(),
+        ));
+    }
+    Ok(payload)
+}
+
+fn cumulative_recovery_point_from_storage(
+    transaction: &rusqlite::Transaction<'_>,
+    reset_at: i64,
+    timestamp: i64,
+) -> Result<Option<CumulativeRecoveryPoint>> {
+    let dollars: Option<(f64, f64, f64)> = transaction
+        .query_row(
+            "SELECT sol_dollars, terra_dollars, luna_dollars
+             FROM usage_history WHERE reset_at=?1 AND timestamp=?2",
+            params![reset_at, timestamp],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((sol_dollars, terra_dollars, luna_dollars)) = dollars else {
+        return Ok(None);
+    };
+    let mut statement = transaction.prepare(
+        "SELECT model, total_tokens, input_tokens, cached_input_tokens,
+                output_tokens, cache_write_input_tokens
+         FROM usage_model_history
+         WHERE reset_at=?1 AND timestamp=?2 ORDER BY model",
+    )?;
+    let rows = statement.query_map(params![reset_at, timestamp], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+        ))
+    })?;
+    let mut model_totals = Vec::new();
+    for row in rows {
+        let (model, total, input, cached, output, cache_write) = row?;
+        model_totals.push(SessionModelTotal {
+            model,
+            total_tokens: canonical_u64_text(&total, "recovery evidence total")?,
+            input_tokens: canonical_u64_text(&input, "recovery evidence input")?,
+            cached_input_tokens: canonical_u64_text(&cached, "recovery evidence cached input")?,
+            output_tokens: canonical_u64_text(&output, "recovery evidence output")?,
+            cache_write_input_tokens: cache_write
+                .as_deref()
+                .map(|value| canonical_u64_text(value, "recovery evidence cache write"))
+                .transpose()?,
+        });
+    }
+    let model_totals = canonicalize_model_totals(&model_totals)?;
+    if model_totals.is_empty()
+        || [sol_dollars, terra_dollars, luna_dollars]
+            .into_iter()
+            .any(|value| !value.is_finite() || value < 0.0)
+    {
+        return Ok(None);
+    }
+    Ok(Some(CumulativeRecoveryPoint {
+        timestamp,
+        reset_at,
+        sol_dollars,
+        terra_dollars,
+        luna_dollars,
+        model_totals,
+    }))
+}
+
+fn validate_cumulative_recovery_storage_evidence(
+    transaction: &rusqlite::Transaction<'_>,
+    recovery: &SessionCumulativeRecovery,
+) -> Result<()> {
+    let before = cumulative_recovery_point_from_storage(
+        transaction,
+        recovery.before_reset_at,
+        recovery.before_timestamp,
+    )?;
+    let first = cumulative_recovery_point_from_storage(
+        transaction,
+        recovery.first_reset_at,
+        recovery.first_timestamp,
+    )?;
+    let through = cumulative_recovery_point_from_storage(
+        transaction,
+        recovery.through_reset_at,
+        recovery.through_timestamp,
+    )?;
+    let evidence_matches = before.as_ref().is_some_and(|point| {
+        point.model_totals == recovery.before_model_totals
+            && point.sol_dollars == recovery.offset_sol_dollars
+            && point.terra_dollars == recovery.offset_terra_dollars
+            && point.luna_dollars == recovery.offset_luna_dollars
+    }) && first
+        .as_ref()
+        .is_some_and(|point| point.model_totals == recovery.first_model_totals)
+        && through
+            .as_ref()
+            .is_some_and(|point| point.model_totals == recovery.source_current_model_totals);
+    if !evidence_matches {
+        return Err(UsageStoreError::InvalidImport(
+            "cumulative recovery raw evidence changed".into(),
+        ));
+    }
+    for timestamp in [recovery.before_timestamp, recovery.first_timestamp] {
+        let count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM usage_history WHERE timestamp=?1",
+            [timestamp],
+            |row| row.get(0),
+        )?;
+        if count != 1 {
+            return Err(UsageStoreError::InvalidImport(
+                "cumulative recovery boundary timestamp is ambiguous".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn session_model_totals_from_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<Vec<SessionModelTotal>> {
+    let mut statement = transaction.prepare(
+        "SELECT model, total_tokens, input_tokens, cached_input_tokens,
+                output_tokens, cache_write_input_tokens
+         FROM session_model_totals ORDER BY model",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<String>>(5)?,
+        ))
+    })?;
+    let mut totals = Vec::new();
+    for row in rows {
+        let (model, total, input, cached, output, cache_write) = row?;
+        totals.push(SessionModelTotal {
+            model,
+            total_tokens: canonical_u64_text(&total, "current recovery total")?,
+            input_tokens: canonical_u64_text(&input, "current recovery input")?,
+            cached_input_tokens: canonical_u64_text(&cached, "current recovery cached input")?,
+            output_tokens: canonical_u64_text(&output, "current recovery output")?,
+            cache_write_input_tokens: cache_write
+                .as_deref()
+                .map(|value| canonical_u64_text(value, "current recovery cache write"))
+                .transpose()?,
+        });
+    }
+    canonicalize_model_totals(&totals)
+}
+
+fn cumulative_recovery_from_payload(
+    recovery_id: &str,
+    payload_json: &str,
+) -> Result<(String, SessionCumulativeRecovery)> {
+    if payload_json.is_empty() || payload_json.len() > MAX_SNAPSHOT_JSON_BYTES {
+        return Err(UsageStoreError::InvalidImport(
+            "cumulative recovery payload length is invalid".into(),
+        ));
+    }
+    let (
+        partition_id,
+        canonical_reset_at,
+        window_seconds,
+        before_reset_at,
+        before_timestamp,
+        first_reset_at,
+        first_timestamp,
+        through_reset_at,
+        through_timestamp,
+        before_rows,
+        offset_rows,
+        first_rows,
+        current_rows,
+        offset_sol_dollars,
+        offset_terra_dollars,
+        offset_luna_dollars,
+    ): CumulativeRecoveryPayload = serde_json::from_str(payload_json).map_err(|_| {
+        UsageStoreError::InvalidImport("cumulative recovery payload is invalid".into())
+    })?;
+    let rows = |values: Vec<CumulativeModelPayload>| {
+        values
+            .into_iter()
+            .map(
+                |(
+                    model,
+                    total_tokens,
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    cache_write_input_tokens,
+                )| SessionModelTotal {
+                    model,
+                    total_tokens,
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    cache_write_input_tokens,
+                },
+            )
+            .collect::<Vec<_>>()
+    };
+    let recovery = SessionCumulativeRecovery {
+        recovery_id: recovery_id.to_owned(),
+        canonical_reset_at,
+        window_seconds,
+        before_reset_at,
+        before_timestamp,
+        first_reset_at,
+        first_timestamp,
+        through_reset_at,
+        through_timestamp,
+        before_model_totals: rows(before_rows),
+        offset_model_totals: rows(offset_rows),
+        first_model_totals: rows(first_rows),
+        source_current_model_totals: rows(current_rows),
+        offset_sol_dollars,
+        offset_terra_dollars,
+        offset_luna_dollars,
+    };
+    validate_cumulative_recovery(&partition_id, &recovery)?;
+    if cumulative_recovery_payload(&partition_id, &recovery)? != payload_json {
+        return Err(UsageStoreError::InvalidImport(
+            "cumulative recovery payload is not canonical".into(),
+        ));
+    }
+    Ok((partition_id, recovery))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CumulativeRecoveryPoint {
+    timestamp: i64,
+    reset_at: i64,
+    sol_dollars: f64,
+    terra_dollars: f64,
+    luna_dollars: f64,
+    model_totals: Vec<SessionModelTotal>,
+}
+
+/// Derives one bounded correction from immutable observations. The function
+/// is deliberately total over ordinary ambiguity: conflicting timestamps,
+/// malformed vectors, a non-monotonic suffix, or a current vector which does
+/// not equal the latest raw endpoint produce no candidate rather than making
+/// history or the recorder unavailable.
+pub fn derive_session_cumulative_recovery(
+    partition_id: &str,
+    canonical_reset_at: i64,
+    window_seconds: i64,
+    now: i64,
+    current_model_totals: &[SessionModelTotal],
+    observations: &[UsageHistoryObservation],
+) -> Result<Option<SessionCumulativeRecovery>> {
+    if canonical_reset_at <= 0 || window_seconds <= 0 || now <= 0 || canonical_reset_at <= now {
+        return Ok(None);
+    }
+    let current_model_totals = canonicalize_model_totals(current_model_totals)?;
+    if current_model_totals.is_empty() {
+        return Ok(None);
+    }
+    let period_start = canonical_reset_at
+        .checked_sub(window_seconds)
+        .ok_or_else(|| UsageStoreError::InvalidImport("cumulative period underflow".into()))?
+        .div_euclid(60)
+        * 60;
+    let mut grouped = BTreeMap::<i64, Vec<CumulativeRecoveryPoint>>::new();
+    for observation in observations {
+        if observation.timestamp < period_start || observation.timestamp > now {
+            continue;
+        }
+        let (Some(sol_dollars), Some(terra_dollars), Some(luna_dollars), Some(totals)) = (
+            observation.sol_dollars,
+            observation.terra_dollars,
+            observation.luna_dollars,
+            observation.model_totals.as_ref(),
+        ) else {
+            continue;
+        };
+        let totals = canonicalize_model_totals(totals)?;
+        if totals.is_empty()
+            || [sol_dollars, terra_dollars, luna_dollars]
+                .into_iter()
+                .any(|value| !value.is_finite() || value < 0.0)
+        {
+            continue;
+        }
+        grouped
+            .entry(observation.timestamp)
+            .or_default()
+            .push(CumulativeRecoveryPoint {
+                timestamp: observation.timestamp,
+                reset_at: observation.reset_at,
+                sol_dollars,
+                terra_dollars,
+                luna_dollars,
+                model_totals: totals,
+            });
+    }
+    let mut points = Vec::new();
+    for candidates in grouped.into_values() {
+        let first = &candidates[0];
+        if candidates.iter().all(|candidate| candidate == first) {
+            points.push(first.clone());
+        }
+    }
+    let Some(endpoint_index) = points.iter().rposition(|point| {
+        same_reset_group(point.reset_at, canonical_reset_at)
+            && point.model_totals == current_model_totals
+    }) else {
+        return Ok(None);
+    };
+    if endpoint_index + 1 != points.len() {
+        return Ok(None);
+    }
+
+    let candidate_index = (1..=endpoint_index).rev().find(|index| {
+        let before = &points[index - 1];
+        let after = &points[*index];
+        !same_reset_group(before.reset_at, after.reset_at)
+            && same_reset_group(after.reset_at, canonical_reset_at)
+            && !model_totals_dominate(&after.model_totals, &before.model_totals)
+    });
+    let Some(candidate_index) = candidate_index else {
+        return Ok(None);
+    };
+    let before = &points[candidate_index - 1];
+    let first = &points[candidate_index];
+
+    let mut known = BTreeMap::<String, SessionModelTotal>::new();
+    for point in &points[candidate_index..=endpoint_index] {
+        if !same_reset_group(point.reset_at, canonical_reset_at) {
+            return Ok(None);
+        }
+        for total in &point.model_totals {
+            if known
+                .get(&total.model)
+                .is_some_and(|previous| !model_total_dominates(total, previous))
+            {
+                return Ok(None);
+            }
+            known.insert(total.model.clone(), total.clone());
+        }
+    }
+    let suffix_endpoint = canonicalize_model_totals(&known.into_values().collect::<Vec<_>>())?;
+    if suffix_endpoint != current_model_totals {
+        return Ok(None);
+    }
+
+    // A reset alias is only the boundary candidate. Recovery authority is
+    // established independently for every model: a model which continues
+    // monotonically across the alias is already an exact absolute fact and
+    // must not receive the baseline a second time. A missing model remains
+    // unknown, so its last known baseline is carried. Mixed component motion
+    // is ambiguous and rejects this recovery instead of guessing.
+    let mut offset_model_totals = Vec::new();
+    for baseline in &before.model_totals {
+        let first_after_boundary =
+            points[candidate_index..=endpoint_index]
+                .iter()
+                .find_map(|point| {
+                    point
+                        .model_totals
+                        .iter()
+                        .find(|total| total.model == baseline.model)
+                });
+        match first_after_boundary {
+            None => offset_model_totals.push(baseline.clone()),
+            Some(observed) if model_total_dominates(observed, baseline) => {}
+            Some(observed) if model_total_reset_is_proven(baseline, observed) => {
+                offset_model_totals.push(baseline.clone());
+            }
+            Some(_) => return Ok(None),
+        }
+    }
+    let offset_model_totals = canonicalize_model_totals(&offset_model_totals)?;
+    if offset_model_totals.is_empty()
+        || checked_add_model_totals(&current_model_totals, &offset_model_totals).is_none()
+    {
+        return Ok(None);
+    }
+
+    let offsets_model = |model: &str| offset_model_totals.iter().any(|total| total.model == model);
+    let offset_sol_dollars = if offsets_model("SOL") {
+        before.sol_dollars
+    } else {
+        0.0
+    };
+    let offset_terra_dollars = if offsets_model("TERRA") {
+        before.terra_dollars
+    } else {
+        0.0
+    };
+    let offset_luna_dollars = if offsets_model("LUNA") {
+        before.luna_dollars
+    } else {
+        0.0
+    };
+
+    let through = &points[endpoint_index];
+    let mut recovery = SessionCumulativeRecovery {
+        recovery_id: String::new(),
+        canonical_reset_at,
+        window_seconds,
+        before_reset_at: before.reset_at,
+        before_timestamp: before.timestamp,
+        first_reset_at: first.reset_at,
+        first_timestamp: first.timestamp,
+        through_reset_at: through.reset_at,
+        through_timestamp: through.timestamp,
+        before_model_totals: before.model_totals.clone(),
+        offset_model_totals,
+        first_model_totals: first.model_totals.clone(),
+        source_current_model_totals: current_model_totals,
+        offset_sol_dollars,
+        offset_terra_dollars,
+        offset_luna_dollars,
+    };
+    let payload = cumulative_recovery_payload(partition_id, &recovery)?;
+    recovery.recovery_id = format!("{:x}", Sha256::digest(payload.as_bytes()));
+    validate_cumulative_recovery(partition_id, &recovery)?;
+    Ok(Some(recovery))
+}
+
+fn recovery_contains_raw_key(
+    recovery: &SessionCumulativeRecovery,
+    reset_at: i64,
+    timestamp: i64,
+) -> bool {
+    same_reset_group(reset_at, recovery.canonical_reset_at)
+        && timestamp >= recovery.first_timestamp
+        && timestamp <= recovery.through_timestamp
+}
+
+fn apply_cumulative_recoveries_to_sample<'a>(
+    sample: &mut UsageHistorySample,
+    recoveries: impl Iterator<Item = &'a SessionCumulativeRecovery>,
+) -> Result<()> {
+    for recovery in recoveries {
+        if !recovery_contains_raw_key(recovery, sample.reset_at, sample.timestamp) {
+            continue;
+        }
+        sample.sol_dollars += recovery.offset_sol_dollars;
+        sample.terra_dollars += recovery.offset_terra_dollars;
+        sample.luna_dollars += recovery.offset_luna_dollars;
+        sample.sol_tokens = sample
+            .sol_tokens
+            .checked_add(
+                recovery
+                    .offset_model_totals
+                    .iter()
+                    .find(|total| total.model == "SOL")
+                    .map(|total| total.total_tokens)
+                    .unwrap_or(0),
+            )
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+        sample.terra_tokens = sample
+            .terra_tokens
+            .checked_add(
+                recovery
+                    .offset_model_totals
+                    .iter()
+                    .find(|total| total.model == "TERRA")
+                    .map(|total| total.total_tokens)
+                    .unwrap_or(0),
+            )
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+        sample.luna_tokens = sample
+            .luna_tokens
+            .checked_add(
+                recovery
+                    .offset_model_totals
+                    .iter()
+                    .find(|total| total.model == "LUNA")
+                    .map(|total| total.total_tokens)
+                    .unwrap_or(0),
+            )
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+        if [
+            sample.sol_dollars,
+            sample.terra_dollars,
+            sample.luna_dollars,
+        ]
+        .into_iter()
+        .any(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "cumulative recovery dollar projection overflowed".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_cumulative_recoveries_to_observation<'a>(
+    observation: &mut UsageHistoryObservation,
+    recoveries: impl Iterator<Item = &'a SessionCumulativeRecovery>,
+) -> Result<()> {
+    for recovery in recoveries {
+        if !recovery_contains_raw_key(recovery, observation.reset_at, observation.timestamp) {
+            continue;
+        }
+        let Some(model_totals) = observation.model_totals.as_ref() else {
+            continue;
+        };
+        let combined = checked_add_model_totals(model_totals, &recovery.offset_model_totals)
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+        observation.model_totals = Some(combined);
+        for (value, offset) in [
+            (&mut observation.sol_dollars, recovery.offset_sol_dollars),
+            (
+                &mut observation.terra_dollars,
+                recovery.offset_terra_dollars,
+            ),
+            (&mut observation.luna_dollars, recovery.offset_luna_dollars),
+        ] {
+            if let Some(value) = value.as_mut() {
+                *value += offset;
+                if !value.is_finite() || *value < 0.0 {
+                    return Err(UsageStoreError::InvalidImport(
+                        "cumulative recovery observation dollars overflowed".into(),
+                    ));
+                }
+            }
+        }
+        for (value, model) in [
+            (&mut observation.sol_tokens, "SOL"),
+            (&mut observation.terra_tokens, "TERRA"),
+            (&mut observation.luna_tokens, "LUNA"),
+        ] {
+            if let Some(value) = value.as_mut() {
+                *value = value
+                    .checked_add(
+                        recovery
+                            .offset_model_totals
+                            .iter()
+                            .find(|total| total.model == model)
+                            .map(|total| total.total_tokens)
+                            .unwrap_or(0),
+                    )
+                    .ok_or(UsageStoreError::GenerationOverflow)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn recorded_session_matches_in(
@@ -2447,6 +3269,14 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
             ],
         ),
         (
+            "session_cumulative_recoveries",
+            &[
+                ("recovery_id", "TEXT", 1),
+                ("payload_json", "TEXT", 0),
+                ("applied_generation", "TEXT", 0),
+            ],
+        ),
+        (
             "usage_model_history",
             &[
                 ("reset_at", "INTEGER", 1),
@@ -2514,11 +3344,16 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
     let mut pre_continuity_tables = expected_tables.clone();
     pre_continuity_tables.remove("history_continuity");
     pre_continuity_tables.remove("usage_model_history");
+    pre_continuity_tables.remove("session_cumulative_recoveries");
     let mut pre_model_history_tables = expected_tables.clone();
     pre_model_history_tables.remove("usage_model_history");
+    pre_model_history_tables.remove("session_cumulative_recoveries");
+    let mut pre_cumulative_recovery_tables = expected_tables.clone();
+    pre_cumulative_recovery_tables.remove("session_cumulative_recoveries");
     if actual_tables != expected_tables
         && !(allow_unversioned_legacy && actual_tables == pre_continuity_tables)
         && !(schema_version < 2 && actual_tables == pre_model_history_tables)
+        && !(schema_version < 3 && actual_tables == pre_cumulative_recovery_tables)
     {
         return Err(UsageStoreError::InvalidImport(
             "account partition table set mismatch".into(),
@@ -2526,7 +3361,9 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
     }
 
     for (table, expected) in TABLES {
-        if (*table == "history_continuity" || *table == "usage_model_history")
+        if (*table == "history_continuity"
+            || *table == "usage_model_history"
+            || *table == "session_cumulative_recoveries")
             && !actual_tables.contains(*table)
         {
             continue;
@@ -2668,6 +3505,26 @@ fn ensure_usage_model_history_schema(transaction: &rusqlite::Transaction<'_>) ->
             cache_write_input_tokens TEXT,
             model_set_complete INTEGER NOT NULL CHECK (model_set_complete IN (0, 1)),
             PRIMARY KEY (reset_at, timestamp, model)
+        ) WITHOUT ROWID;
+        "#,
+    )?;
+    Ok(())
+}
+
+fn ensure_session_cumulative_recovery_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS session_cumulative_recoveries (
+            recovery_id TEXT PRIMARY KEY CHECK (
+                length(recovery_id) = 64
+                AND recovery_id NOT GLOB '*[^0-9a-f]*'
+            ),
+            payload_json TEXT NOT NULL CHECK (
+                length(payload_json) BETWEEN 2 AND 1048576
+            ),
+            applied_generation TEXT NOT NULL
         ) WITHOUT ROWID;
         "#,
     )?;
@@ -3129,6 +3986,7 @@ impl UsageStore {
         ensure_session_checkpoint_schema(&transaction)?;
         ensure_history_continuity_schema(&transaction)?;
         ensure_usage_model_history_schema(&transaction)?;
+        ensure_session_cumulative_recovery_schema(&transaction)?;
         stamp_current_account_db_schema(&transaction)?;
         transaction.execute(
             "INSERT INTO storage_partition (
@@ -3181,6 +4039,7 @@ impl UsageStore {
         ensure_session_checkpoint_schema(&transaction)?;
         ensure_history_continuity_schema(&transaction)?;
         ensure_usage_model_history_schema(&transaction)?;
+        ensure_session_cumulative_recovery_schema(&transaction)?;
         stamp_current_account_db_schema(&transaction)?;
         validate_storage_partition(&transaction, identity)?;
         transaction.commit()?;
@@ -3714,6 +4573,18 @@ impl UsageStore {
 
     /// Loads all samples in reset-window and timestamp order.
     pub fn load_all(&self) -> Result<Vec<UsageHistorySample>> {
+        let mut samples = self.load_all_raw()?;
+        let recoveries = self.load_session_cumulative_recoveries()?;
+        for sample in &mut samples {
+            apply_cumulative_recoveries_to_sample(
+                sample,
+                recoveries.iter().map(|(recovery, _, _)| recovery),
+            )?;
+        }
+        Ok(samples)
+    }
+
+    fn load_all_raw(&self) -> Result<Vec<UsageHistorySample>> {
         let mut statement = self.connection.prepare(
             "SELECT timestamp, reset_at, remaining_percent, sol_dollars, \
                     terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens \
@@ -3732,7 +4603,7 @@ impl UsageStore {
         Ok(samples)
     }
 
-    fn load_recent_history_impl(&self, now: DateTime<Utc>) -> Result<Vec<UsageHistorySample>> {
+    fn load_recent_history_raw(&self, now: DateTime<Utc>) -> Result<Vec<UsageHistorySample>> {
         let cutoff = one_month_before(now).timestamp();
         let now_timestamp = now.timestamp();
         let mut statement = self.connection.prepare(
@@ -3757,26 +4628,34 @@ impl UsageStore {
     ///
     /// The database retains three months independently of this bounded read.
     pub fn load_recent_one_month(&self, now: DateTime<Utc>) -> Result<Vec<UsageHistorySample>> {
-        self.load_recent_history_impl(now)
+        self.load_recent_history(now)
     }
 
     /// Alias for the same bounded read, retaining the history terminology.
     pub fn load_recent_history(&self, now: DateTime<Utc>) -> Result<Vec<UsageHistorySample>> {
-        self.load_recent_history_impl(now)
+        let mut samples = self.load_recent_history_raw(now)?;
+        let recoveries = self.load_session_cumulative_recoveries()?;
+        for sample in &mut samples {
+            apply_cumulative_recoveries_to_sample(
+                sample,
+                recoveries.iter().map(|(recovery, _, _)| recovery),
+            )?;
+        }
+        Ok(samples)
     }
 
     /// Loads the bounded recent observation timeline. Existing rows without a
     /// sidecar provenance record are intentionally labelled `legacy-unknown`;
     /// auxiliary unavailable rows remain visible here while staying absent from
     /// the v1 `usage_history` projection.
-    pub fn load_recent_observations(
+    fn load_recent_observations_raw(
         &self,
         now: DateTime<Utc>,
     ) -> Result<Vec<UsageHistoryObservation>> {
         let cutoff = one_month_before(now).timestamp();
         let now_timestamp = now.timestamp();
         let mut observations = BTreeMap::<(i64, i64), UsageHistoryObservation>::new();
-        for sample in self.load_recent_history_impl(now)? {
+        for sample in self.load_recent_history_raw(now)? {
             let observation = UsageHistoryObservation::legacy_unknown(&sample);
             observations.insert((sample.reset_at, sample.timestamp), observation);
         }
@@ -3865,6 +4744,127 @@ impl UsageStore {
             }
         }
         Ok(observations.into_values().collect())
+    }
+
+    pub fn load_recent_observations(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<UsageHistoryObservation>> {
+        let mut observations = self.load_recent_observations_raw(now)?;
+        let recoveries = self.load_session_cumulative_recoveries()?;
+        for observation in &mut observations {
+            apply_cumulative_recoveries_to_observation(
+                observation,
+                recoveries.iter().map(|(recovery, _, _)| recovery),
+            )?;
+        }
+        Ok(observations)
+    }
+
+    fn load_session_cumulative_recoveries(
+        &self,
+    ) -> Result<Vec<(SessionCumulativeRecovery, String, u64)>> {
+        let present: bool = self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'session_cumulative_recoveries'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !present {
+            return Ok(Vec::new());
+        }
+        let partition_id: String = self.connection.query_row(
+            "SELECT partition_id FROM storage_partition WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let generation: String = self.connection.query_row(
+            "SELECT data_generation FROM collection_generation WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let generation = canonical_u64_text(&generation, "collection generation")?;
+        let mut statement = self.connection.prepare(
+            "SELECT recovery_id, payload_json, applied_generation
+             FROM session_cumulative_recoveries ORDER BY recovery_id",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut recoveries = Vec::new();
+        while let Some(row) = rows.next()? {
+            let recovery_id: String = row.get(0)?;
+            let payload_json: String = row.get(1)?;
+            let applied_generation: String = row.get(2)?;
+            let applied_generation =
+                canonical_u64_text(&applied_generation, "cumulative recovery generation")?;
+            if applied_generation == 0 || applied_generation > generation {
+                return Err(UsageStoreError::InvalidImport(
+                    "cumulative recovery generation is invalid".into(),
+                ));
+            }
+            let (payload_partition, recovery) =
+                cumulative_recovery_from_payload(&recovery_id, &payload_json)?;
+            if payload_partition != partition_id {
+                return Err(UsageStoreError::InvalidImport(
+                    "cumulative recovery partition changed".into(),
+                ));
+            }
+            recoveries.push((recovery, payload_json, applied_generation));
+        }
+        Ok(recoveries)
+    }
+
+    /// Returns a correction only when the latest durable vector exactly
+    /// matches a monotonic raw suffix after a reset-alias regression. Applied
+    /// recovery IDs are filtered before any Session scan is requested.
+    pub fn pending_session_cumulative_recovery(
+        &self,
+        canonical_reset_at: i64,
+        window_seconds: i64,
+        now: i64,
+        current_model_totals: &[SessionModelTotal],
+    ) -> Result<Option<SessionCumulativeRecovery>> {
+        let partition_id: String = self.connection.query_row(
+            "SELECT partition_id FROM storage_partition WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let Some(now) = DateTime::<Utc>::from_timestamp(now, 0) else {
+            return Ok(None);
+        };
+        let mut observations = self.load_recent_observations_raw(now)?;
+        let stored_recoveries = self.load_session_cumulative_recoveries()?;
+        for observation in &mut observations {
+            apply_cumulative_recoveries_to_observation(
+                observation,
+                stored_recoveries.iter().map(|(recovery, _, _)| recovery),
+            )?;
+        }
+        let candidate = derive_session_cumulative_recovery(
+            &partition_id,
+            canonical_reset_at,
+            window_seconds,
+            now.timestamp(),
+            current_model_totals,
+            &observations,
+        )?;
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let payload = cumulative_recovery_payload(&partition_id, &candidate)?;
+        if let Some((_, stored_payload, _)) = stored_recoveries
+            .into_iter()
+            .find(|(stored, _, _)| stored.recovery_id == candidate.recovery_id)
+        {
+            if stored_payload != payload {
+                return Err(UsageStoreError::InvalidImport(
+                    "cumulative recovery replay conflicts with its marker".into(),
+                ));
+            }
+            return Ok(None);
+        }
+        Ok(Some(candidate))
     }
 
     /// Pure grouping helper exposed beside the store API for callers that
@@ -4748,7 +5748,7 @@ impl UsageStore {
             .iter()
             .map(UsageHistoryObservation::confirmed)
             .collect::<Vec<_>>();
-        self.commit_session_collection_with_observations_inner(commit, &observations)
+        self.commit_session_collection_with_observations_inner(commit, &observations, None)
     }
 
     /// Atomically commits ordinary session samples and provenance observations
@@ -4760,13 +5760,27 @@ impl UsageStore {
         commit: SessionCollectionCommit<'_>,
         observations: &[UsageHistoryObservation],
     ) -> Result<SessionCollectionCommitResult> {
-        self.commit_session_collection_with_observations_inner(commit, observations)
+        self.commit_session_collection_with_observations_inner(commit, observations, None)
+    }
+
+    /// Commits an ordinary recorder generation and one source-proven
+    /// cumulative correction under the same SQLite transaction. Existing
+    /// history rows are not rewritten; the recovery marker controls their
+    /// bounded read projection.
+    pub fn commit_session_collection_with_cumulative_recovery(
+        &mut self,
+        commit: SessionCollectionCommit<'_>,
+        observations: &[UsageHistoryObservation],
+        recovery: &SessionCumulativeRecovery,
+    ) -> Result<SessionCollectionCommitResult> {
+        self.commit_session_collection_with_observations_inner(commit, observations, Some(recovery))
     }
 
     fn commit_session_collection_with_observations_inner(
         &mut self,
         commit: SessionCollectionCommit<'_>,
         observations: &[UsageHistoryObservation],
+        cumulative_recovery: Option<&SessionCumulativeRecovery>,
     ) -> Result<SessionCollectionCommitResult> {
         let SessionCollectionCommit {
             reset_at,
@@ -4891,6 +5905,71 @@ impl UsageStore {
             .as_deref()
             .map(|value| canonical_u128_hex(value, "collector epoch"))
             .transpose()?;
+        let next = current_data_generation
+            .checked_add(1)
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+        let cumulative_payload = if let Some(recovery) = cumulative_recovery {
+            if recovery.canonical_reset_at != reset_at || recovery.window_seconds != window_seconds
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "cumulative recovery period changed".into(),
+                ));
+            }
+            let partition_id: String = transaction.query_row(
+                "SELECT partition_id FROM storage_partition WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?;
+            let payload = validate_cumulative_recovery(&partition_id, recovery)?;
+            let corrected_source = checked_add_model_totals(
+                &recovery.source_current_model_totals,
+                &recovery.offset_model_totals,
+            )
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+            if !model_totals_dominate(&model_totals, &corrected_source) {
+                return Err(UsageStoreError::InvalidImport(
+                    "cumulative recovery is not present in the committed totals".into(),
+                ));
+            }
+            let existing: Option<(String, String)> = transaction
+                .query_row(
+                    "SELECT payload_json, applied_generation
+                     FROM session_cumulative_recoveries WHERE recovery_id=?1",
+                    [&recovery.recovery_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((stored_payload, applied_generation)) = existing {
+                let applied_generation =
+                    canonical_u64_text(&applied_generation, "cumulative recovery generation")?;
+                if stored_payload != payload {
+                    return Err(UsageStoreError::InvalidImport(
+                        "cumulative recovery replay conflicts with its marker".into(),
+                    ));
+                }
+                if current_epoch != Some(collector_epoch)
+                    || current_cycle_seq != cycle_seq
+                    || applied_generation != current_data_generation
+                {
+                    return Err(UsageStoreError::InvalidImport(
+                        "cumulative recovery was already applied".into(),
+                    ));
+                }
+                Some((payload, true))
+            } else {
+                validate_cumulative_recovery_storage_evidence(&transaction, recovery)?;
+                if session_model_totals_from_transaction(&transaction)?
+                    != recovery.source_current_model_totals
+                {
+                    return Err(UsageStoreError::InvalidImport(
+                        "cumulative recovery source generation changed".into(),
+                    ));
+                }
+                Some((payload, false))
+            }
+        } else {
+            None
+        };
         if current_epoch == Some(collector_epoch) {
             if current_cycle_seq == cycle_seq {
                 if current_generation.1 != reset_at || current_generation.2 != window_seconds {
@@ -4898,8 +5977,13 @@ impl UsageStore {
                         "replayed collection generation has a different period".into(),
                     ));
                 }
-                if current_data_generation == u64::MAX {
-                    return Err(UsageStoreError::GenerationOverflow);
+                if cumulative_payload
+                    .as_ref()
+                    .is_some_and(|(_, marker_exists)| !marker_exists)
+                {
+                    return Err(UsageStoreError::InvalidImport(
+                        "replayed collection generation has no cumulative recovery marker".into(),
+                    ));
                 }
                 // The complete transaction for this epoch/cycle already
                 // committed. Return its exact generation rather than
@@ -5082,6 +6166,16 @@ impl UsageStore {
                 ])?;
             }
         }
+        if let (Some(recovery), Some((payload, false))) =
+            (cumulative_recovery, cumulative_payload.as_ref())
+        {
+            transaction.execute(
+                "INSERT INTO session_cumulative_recoveries (
+                    recovery_id, payload_json, applied_generation
+                 ) VALUES (?1, ?2, ?3)",
+                params![&recovery.recovery_id, payload, next.to_string()],
+            )?;
+        }
         transaction.execute("DELETE FROM session_model_totals", [])?;
         {
             let mut statement = transaction.prepare(
@@ -5103,9 +6197,6 @@ impl UsageStore {
             }
         }
         replace_recorded_session_markers(&transaction, &recorded_sessions)?;
-        let next = current_data_generation
-            .checked_add(1)
-            .ok_or(UsageStoreError::GenerationOverflow)?;
         transaction.execute(
             "UPDATE collection_generation
              SET data_generation = ?1, reset_at = ?2, window_seconds = ?3,
@@ -5700,6 +6791,10 @@ mod tests {
         store
             .connection
             .execute("DROP TABLE usage_model_history", [])
+            .unwrap();
+        store
+            .connection
+            .execute("DROP TABLE session_cumulative_recoveries", [])
             .unwrap();
         store
             .connection
@@ -8063,6 +9158,139 @@ mod wave_b_correction_tests {
         }
     }
 
+    fn cumulative_observation(
+        timestamp: i64,
+        reset_at: i64,
+        remaining_percent: f64,
+        sol_dollars: f64,
+        luna_dollars: f64,
+        model_totals: Vec<SessionModelTotal>,
+    ) -> UsageHistoryObservation {
+        let model_tokens = |model: &str| {
+            model_totals
+                .iter()
+                .find(|total| total.model == model)
+                .map(|total| total.total_tokens)
+                .unwrap_or(0)
+        };
+        UsageHistoryObservation {
+            timestamp,
+            reset_at,
+            remaining_percent: Some(remaining_percent),
+            sol_dollars: Some(sol_dollars),
+            terra_dollars: Some(0.0),
+            luna_dollars: Some(luna_dollars),
+            sol_tokens: Some(model_tokens("SOL")),
+            terra_tokens: Some(0),
+            luna_tokens: Some(model_tokens("LUNA")),
+            model_source: ModelSource::Confirmed,
+            model_totals: Some(model_totals),
+            model_totals_complete: false,
+        }
+    }
+
+    fn commit_cumulative_point(
+        store: &mut UsageStore,
+        collector_epoch: u128,
+        cycle_seq: u64,
+        observation: &UsageHistoryObservation,
+    ) -> SessionCollectionCommitResult {
+        let sample = UsageHistorySample {
+            timestamp: observation.timestamp,
+            reset_at: observation.reset_at,
+            remaining_percent: observation.remaining_percent,
+            sol_dollars: observation.sol_dollars.unwrap(),
+            terra_dollars: observation.terra_dollars.unwrap(),
+            luna_dollars: observation.luna_dollars.unwrap(),
+            sol_tokens: observation.sol_tokens.unwrap(),
+            terra_tokens: observation.terra_tokens.unwrap(),
+            luna_tokens: observation.luna_tokens.unwrap(),
+        };
+        store
+            .commit_session_collection_with_observations(
+                SessionCollectionCommit {
+                    reset_at: observation.reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch,
+                    cycle_seq,
+                    samples: std::slice::from_ref(&sample),
+                    checkpoints: &[],
+                    ranges: &[],
+                    model_totals: observation.model_totals.as_deref().unwrap(),
+                    recorded_sessions: &[],
+                },
+                std::slice::from_ref(observation),
+            )
+            .unwrap()
+    }
+
+    fn raw_cumulative_history_fingerprint(store: &UsageStore) -> String {
+        let mut source = String::new();
+        let mut history = store
+            .connection
+            .prepare(
+                "SELECT timestamp, reset_at, remaining_percent, sol_dollars,
+                        terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+                 FROM usage_history ORDER BY reset_at, timestamp",
+            )
+            .unwrap();
+        let rows = history
+            .query_map([], |row| {
+                Ok(format!(
+                    "{:?}",
+                    (
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<f64>>(2)?,
+                        row.get::<_, f64>(3)?,
+                        row.get::<_, f64>(4)?,
+                        row.get::<_, f64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    )
+                ))
+            })
+            .unwrap();
+        for row in rows {
+            source.push_str(&row.unwrap());
+            source.push('\n');
+        }
+        drop(history);
+        let mut models = store
+            .connection
+            .prepare(
+                "SELECT reset_at, timestamp, model, total_tokens, input_tokens,
+                        cached_input_tokens, output_tokens, cache_write_input_tokens,
+                        model_set_complete
+                 FROM usage_model_history ORDER BY reset_at, timestamp, model",
+            )
+            .unwrap();
+        let rows = models
+            .query_map([], |row| {
+                Ok(format!(
+                    "{:?}",
+                    (
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, i64>(8)?,
+                    )
+                ))
+            })
+            .unwrap();
+        for row in rows {
+            source.push_str(&row.unwrap());
+            source.push('\n');
+        }
+        format!("{:x}", Sha256::digest(source.as_bytes()))
+    }
+
     fn sample(
         timestamp: i64,
         reset_at: i64,
@@ -9330,5 +10558,841 @@ mod wave_b_correction_tests {
         assert_eq!(store.load_all().unwrap(), vec![combined_sample]);
         drop(store);
         cleanup(&path);
+    }
+
+    #[test]
+    fn cumulative_recovery_uses_the_real_future_reset_round_trip_oracle() {
+        let partition_id = "42".repeat(32);
+        let reset_a = 1_789_437_490;
+        let reset_b = 1_789_300_251;
+        let baseline = vec![
+            SessionModelTotal {
+                model: "LUNA".into(),
+                total_tokens: 22_816_483,
+                input_tokens: 22_343_994,
+                cached_input_tokens: 20_068_352,
+                output_tokens: 472_489,
+                cache_write_input_tokens: Some(0),
+            },
+            SessionModelTotal {
+                model: "SOL".into(),
+                total_tokens: 555_312_427,
+                input_tokens: 553_537_987,
+                cached_input_tokens: 544_468_480,
+                output_tokens: 1_774_440,
+                cache_write_input_tokens: Some(0),
+            },
+        ];
+        let first_suffix = vec![SessionModelTotal {
+            model: "LUNA".into(),
+            total_tokens: 91_512,
+            input_tokens: 84_194,
+            cached_input_tokens: 73_472,
+            output_tokens: 7_318,
+            cache_write_input_tokens: Some(0),
+        }];
+        let current = vec![SessionModelTotal {
+            model: "LUNA".into(),
+            total_tokens: 2_446_273,
+            input_tokens: 2_382_039,
+            cached_input_tokens: 2_035_200,
+            output_tokens: 64_234,
+            cache_write_input_tokens: Some(0),
+        }];
+        let observation = |timestamp, reset_at, sol, luna, totals: Vec<SessionModelTotal>| {
+            UsageHistoryObservation {
+                timestamp,
+                reset_at,
+                remaining_percent: Some(if reset_at == reset_a { 29.0 } else { 17.0 }),
+                sol_dollars: Some(sol),
+                terra_dollars: Some(0.0),
+                luna_dollars: Some(luna),
+                sol_tokens: Some(
+                    totals
+                        .iter()
+                        .find(|total| total.model == "SOL")
+                        .map(|total| total.total_tokens)
+                        .unwrap_or(0),
+                ),
+                terra_tokens: Some(0),
+                luna_tokens: Some(
+                    totals
+                        .iter()
+                        .find(|total| total.model == "LUNA")
+                        .map(|total| total.total_tokens)
+                        .unwrap_or(0),
+                ),
+                model_source: ModelSource::Confirmed,
+                model_totals: Some(totals),
+                // Missing models are unknown. The exact rows which are
+                // present remain valid recovery facts.
+                model_totals_complete: false,
+            }
+        };
+        let observations = vec![
+            observation(
+                1_788_972_900,
+                reset_a,
+                370.814_975,
+                1.402_420_84,
+                vec![
+                    baseline[1].clone(),
+                    SessionModelTotal {
+                        total_tokens: 22_488_065,
+                        input_tokens: 22_017_725,
+                        cached_input_tokens: 19_808_512,
+                        output_tokens: 470_340,
+                        ..baseline[0].clone()
+                    },
+                ],
+            ),
+            observation(
+                1_788_975_480,
+                reset_b,
+                370.814_975,
+                1.423_482_24,
+                baseline.clone(),
+            ),
+            observation(
+                1_788_975_540,
+                reset_b,
+                370.814_975,
+                1.423_482_24,
+                baseline.clone(),
+            ),
+            observation(1_788_975_600, reset_a, 0.0, 0.012_395_44, first_suffix),
+            // The retained production rows also contain three one-second
+            // reset aliases. They belong to the same canonical quota period
+            // under the existing reset-group contract and must not make an
+            // otherwise source-proven suffix unrecoverable.
+            observation(
+                1_788_985_140,
+                reset_a + 1,
+                0.0,
+                0.092_958_24,
+                vec![SessionModelTotal {
+                    model: "LUNA".into(),
+                    total_tokens: 1_523_427,
+                    input_tokens: 1_480_000,
+                    cached_input_tokens: 1_280_000,
+                    output_tokens: 43_427,
+                    cache_write_input_tokens: Some(0),
+                }],
+            ),
+            observation(1_788_996_000, reset_a, 0.0, 0.187_152_6, current.clone()),
+        ];
+
+        let recovery = derive_session_cumulative_recovery(
+            &partition_id,
+            reset_a,
+            604_800,
+            1_788_996_001,
+            &current,
+            &observations,
+        )
+        .unwrap()
+        .expect("the source-proven reset regression is recoverable");
+        assert_eq!(recovery.offset_model_totals, baseline);
+        assert_eq!(recovery.first_timestamp, 1_788_975_600);
+        assert_eq!(recovery.through_timestamp, 1_788_996_000);
+        assert_eq!(recovery.offset_sol_dollars, 370.814_975);
+        assert_eq!(recovery.offset_luna_dollars, 1.423_482_24);
+        let corrected = checked_add_model_totals(
+            &recovery.source_current_model_totals,
+            &recovery.offset_model_totals,
+        )
+        .unwrap();
+        assert_eq!(
+            corrected
+                .iter()
+                .find(|total| total.model == "SOL")
+                .unwrap()
+                .total_tokens,
+            555_312_427
+        );
+        assert_eq!(
+            corrected
+                .iter()
+                .find(|total| total.model == "LUNA")
+                .unwrap()
+                .total_tokens,
+            25_262_756
+        );
+        let exact_dollars =
+            recovery.offset_sol_dollars + recovery.offset_luna_dollars + 0.187_152_6;
+        assert!((exact_dollars - 372.425_609_84).abs() < f64::EPSILON);
+
+        let mut conflicting = observations;
+        let mut conflict = conflicting.last().unwrap().clone();
+        conflict.reset_at = reset_b;
+        conflict.model_totals.as_mut().unwrap()[0].total_tokens += 1;
+        conflict.luna_tokens = Some(2_446_274);
+        conflicting.push(conflict);
+        assert!(derive_session_cumulative_recovery(
+            &partition_id,
+            reset_a,
+            604_800,
+            1_788_996_001,
+            &current,
+            &conflicting,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn cumulative_recovery_offsets_only_models_proven_to_have_regressed() {
+        let partition_id = "43".repeat(32);
+        let reset_a = 1_789_437_490;
+        let reset_b = 1_789_300_251;
+        let luna_baseline = SessionModelTotal {
+            model: "LUNA".into(),
+            total_tokens: 50,
+            input_tokens: 40,
+            cached_input_tokens: 30,
+            output_tokens: 10,
+            cache_write_input_tokens: Some(0),
+        };
+        let sol_baseline = SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 100,
+            input_tokens: 80,
+            cached_input_tokens: 60,
+            output_tokens: 20,
+            cache_write_input_tokens: Some(0),
+        };
+        let first = vec![
+            SessionModelTotal {
+                total_tokens: 2,
+                input_tokens: 2,
+                cached_input_tokens: 1,
+                output_tokens: 0,
+                ..luna_baseline.clone()
+            },
+            SessionModelTotal {
+                total_tokens: 101,
+                input_tokens: 81,
+                cached_input_tokens: 61,
+                output_tokens: 20,
+                ..sol_baseline.clone()
+            },
+        ];
+        let current = vec![
+            SessionModelTotal {
+                total_tokens: 5,
+                input_tokens: 4,
+                cached_input_tokens: 2,
+                output_tokens: 1,
+                ..luna_baseline.clone()
+            },
+            SessionModelTotal {
+                total_tokens: 105,
+                input_tokens: 84,
+                cached_input_tokens: 63,
+                output_tokens: 21,
+                ..sol_baseline.clone()
+            },
+        ];
+        let observations = vec![
+            cumulative_observation(
+                1_788_975_540,
+                reset_b,
+                17.0,
+                10.0,
+                1.0,
+                vec![luna_baseline.clone(), sol_baseline],
+            ),
+            cumulative_observation(1_788_975_600, reset_a, 29.0, 10.1, 0.02, first),
+            cumulative_observation(1_788_996_000, reset_a, 28.0, 10.5, 0.10, current.clone()),
+        ];
+
+        let recovery = derive_session_cumulative_recovery(
+            &partition_id,
+            reset_a,
+            604_800,
+            1_788_996_001,
+            &current,
+            &observations,
+        )
+        .unwrap()
+        .expect("the LUNA regression is independently recoverable");
+        assert_eq!(recovery.offset_model_totals, [luna_baseline]);
+        assert_eq!(recovery.offset_sol_dollars, 0.0);
+        assert_eq!(recovery.offset_luna_dollars, 1.0);
+        let corrected = checked_add_model_totals(
+            &recovery.source_current_model_totals,
+            &recovery.offset_model_totals,
+        )
+        .unwrap();
+        assert_eq!(
+            corrected
+                .iter()
+                .find(|total| total.model == "SOL")
+                .unwrap()
+                .total_tokens,
+            105,
+            "the independently monotonic SOL counter must not be doubled"
+        );
+        assert_eq!(
+            corrected
+                .iter()
+                .find(|total| total.model == "LUNA")
+                .unwrap()
+                .total_tokens,
+            55
+        );
+    }
+
+    #[test]
+    fn cumulative_recovery_rejects_mixed_component_regression() {
+        let partition_id = "44".repeat(32);
+        let reset_a = 1_789_437_490;
+        let reset_b = 1_789_300_251;
+        let baseline = SessionModelTotal {
+            model: "LUNA".into(),
+            total_tokens: 50,
+            input_tokens: 40,
+            cached_input_tokens: 30,
+            output_tokens: 10,
+            cache_write_input_tokens: Some(0),
+        };
+        let first = SessionModelTotal {
+            total_tokens: 2,
+            input_tokens: 2,
+            cached_input_tokens: 1,
+            // This component did not regress, so adding its baseline would
+            // be a guess rather than a source-proven recovery.
+            output_tokens: 10,
+            ..baseline.clone()
+        };
+        let current = SessionModelTotal {
+            total_tokens: 5,
+            input_tokens: 4,
+            cached_input_tokens: 2,
+            output_tokens: 11,
+            ..baseline.clone()
+        };
+        let observations = vec![
+            cumulative_observation(1_788_975_540, reset_b, 17.0, 0.0, 1.0, vec![baseline]),
+            cumulative_observation(1_788_975_600, reset_a, 29.0, 0.0, 0.02, vec![first]),
+            cumulative_observation(
+                1_788_996_000,
+                reset_a,
+                28.0,
+                0.0,
+                0.10,
+                vec![current.clone()],
+            ),
+        ];
+
+        assert!(derive_session_cumulative_recovery(
+            &partition_id,
+            reset_a,
+            604_800,
+            1_788_996_001,
+            &[current],
+            &observations,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn cumulative_recovery_commit_is_atomic_bounded_and_restart_idempotent() {
+        let path = database_path("cumulative-recovery-atomic");
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".into(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "4".repeat(64),
+            storage_epoch: 1,
+            partition_id: "4".repeat(64),
+        };
+        let reset_a = 1_789_437_490;
+        let reset_b = 1_789_300_251;
+        let collector_epoch = 0x258;
+        let baseline = vec![
+            SessionModelTotal {
+                model: "LUNA".into(),
+                total_tokens: 50,
+                input_tokens: 40,
+                cached_input_tokens: 30,
+                output_tokens: 10,
+                cache_write_input_tokens: Some(0),
+            },
+            SessionModelTotal {
+                model: "SOL".into(),
+                total_tokens: 100,
+                input_tokens: 80,
+                cached_input_tokens: 60,
+                output_tokens: 20,
+                cache_write_input_tokens: Some(0),
+            },
+        ];
+        let first = vec![SessionModelTotal {
+            model: "LUNA".into(),
+            total_tokens: 2,
+            input_tokens: 2,
+            cached_input_tokens: 1,
+            output_tokens: 0,
+            cache_write_input_tokens: Some(0),
+        }];
+        let current = vec![SessionModelTotal {
+            model: "LUNA".into(),
+            total_tokens: 5,
+            input_tokens: 4,
+            cached_input_tokens: 2,
+            output_tokens: 1,
+            cache_write_input_tokens: Some(0),
+        }];
+        let before =
+            cumulative_observation(1_788_975_540, reset_b, 17.0, 10.0, 1.0, baseline.clone());
+        let after =
+            cumulative_observation(1_788_975_600, reset_a + 1, 29.0, 0.0, 0.02, first.clone());
+        let endpoint =
+            cumulative_observation(1_788_996_000, reset_a, 28.0, 0.0, 0.10, current.clone());
+
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        assert_eq!(
+            commit_cumulative_point(&mut store, collector_epoch, 1, &before).data_generation,
+            1
+        );
+        assert_eq!(
+            commit_cumulative_point(&mut store, collector_epoch, 2, &after).data_generation,
+            2
+        );
+        assert_eq!(
+            commit_cumulative_point(&mut store, collector_epoch, 3, &endpoint).data_generation,
+            3
+        );
+        let recovery = store
+            .pending_session_cumulative_recovery(reset_a, 604_800, 1_788_996_001, &current)
+            .unwrap()
+            .expect("reset-alias regression must have one finite recovery");
+        assert_eq!(recovery.offset_model_totals, baseline);
+        assert_eq!(recovery.first_model_totals, first);
+        let corrected = checked_add_model_totals(
+            &recovery.source_current_model_totals,
+            &recovery.offset_model_totals,
+        )
+        .unwrap();
+        let raw_before = raw_cumulative_history_fingerprint(&store);
+
+        let mut invalid = recovery.clone();
+        invalid.first_timestamp += 1;
+        let invalid_commit = store.commit_session_collection_with_cumulative_recovery(
+            SessionCollectionCommit {
+                reset_at: reset_a,
+                window_seconds: 604_800,
+                collector_epoch,
+                cycle_seq: 4,
+                samples: &[],
+                checkpoints: &[],
+                ranges: &[],
+                model_totals: &corrected,
+                recorded_sessions: &[],
+            },
+            &[],
+            &invalid,
+        );
+        assert!(invalid_commit.is_err());
+        assert_eq!(
+            store
+                .load_session_collection_state()
+                .unwrap()
+                .data_generation,
+            3
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM session_cumulative_recoveries",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(raw_cumulative_history_fingerprint(&store), raw_before);
+
+        let committed = store
+            .commit_session_collection_with_cumulative_recovery(
+                SessionCollectionCommit {
+                    reset_at: reset_a,
+                    window_seconds: 604_800,
+                    collector_epoch,
+                    cycle_seq: 4,
+                    samples: &[],
+                    checkpoints: &[],
+                    ranges: &[],
+                    model_totals: &corrected,
+                    recorded_sessions: &[],
+                },
+                &[],
+                &recovery,
+            )
+            .unwrap();
+        assert_eq!(committed.data_generation, 4);
+        assert_eq!(raw_cumulative_history_fingerprint(&store), raw_before);
+        assert_eq!(
+            store.load_session_collection_state().unwrap().model_totals,
+            corrected
+        );
+        let projected = store.load_all().unwrap();
+        let projected_endpoint = projected
+            .iter()
+            .find(|sample| sample.reset_at == reset_a && sample.timestamp == endpoint.timestamp)
+            .unwrap();
+        assert_eq!(projected_endpoint.sol_tokens, 100);
+        assert_eq!(projected_endpoint.luna_tokens, 55);
+        assert_eq!(projected_endpoint.sol_dollars, 10.0);
+        assert_eq!(projected_endpoint.luna_dollars, 1.10);
+        let projected_before = projected
+            .iter()
+            .find(|sample| sample.reset_at == reset_b && sample.timestamp == before.timestamp)
+            .unwrap();
+        assert_eq!(projected_before.sol_tokens, 100);
+        assert_eq!(projected_before.luna_tokens, 50);
+        let projected_observations = store
+            .load_recent_observations(Utc.timestamp_opt(1_788_996_001, 0).single().unwrap())
+            .unwrap();
+        let projected_models = projected_observations
+            .iter()
+            .find(|observation| observation.timestamp == endpoint.timestamp)
+            .and_then(|observation| observation.model_totals.as_ref())
+            .unwrap();
+        assert_eq!(projected_models, &corrected);
+
+        let replay = store
+            .commit_session_collection_with_cumulative_recovery(
+                SessionCollectionCommit {
+                    reset_at: reset_a,
+                    window_seconds: 604_800,
+                    collector_epoch,
+                    cycle_seq: 4,
+                    samples: &[],
+                    checkpoints: &[],
+                    ranges: &[],
+                    model_totals: &corrected,
+                    recorded_sessions: &[],
+                },
+                &[],
+                &recovery,
+            )
+            .unwrap();
+        assert_eq!(replay.data_generation, 4);
+        drop(store);
+
+        let mut restarted = UsageStore::open_partitioned(&path, &identity).unwrap();
+        assert_eq!(restarted.load_all().unwrap(), projected);
+        assert_eq!(
+            restarted
+                .load_session_collection_state()
+                .unwrap()
+                .model_totals,
+            corrected
+        );
+        assert!(restarted
+            .pending_session_cumulative_recovery(reset_a, 604_800, 1_788_996_001, &corrected,)
+            .unwrap()
+            .is_none());
+
+        let next_raw = vec![SessionModelTotal {
+            total_tokens: 7,
+            input_tokens: 6,
+            cached_input_tokens: 3,
+            output_tokens: 1,
+            ..current[0].clone()
+        }];
+        let next_corrected = checked_add_model_totals(&next_raw, &baseline).unwrap();
+        let next = cumulative_observation(
+            1_788_996_060,
+            reset_a,
+            28.0,
+            10.0,
+            1.14,
+            next_corrected.clone(),
+        );
+        assert_eq!(
+            commit_cumulative_point(&mut restarted, collector_epoch, 5, &next).data_generation,
+            5
+        );
+        let logical = restarted.load_all().unwrap();
+        let logical_next = logical
+            .iter()
+            .find(|sample| sample.timestamp == next.timestamp)
+            .unwrap();
+        assert_eq!(logical_next.sol_tokens, 100);
+        assert_eq!(logical_next.luna_tokens, 57);
+        assert_eq!(
+            restarted
+                .load_session_collection_state()
+                .unwrap()
+                .model_totals,
+            next_corrected
+        );
+        drop(restarted);
+        cleanup(&path);
+    }
+
+    /// PR gate for the retained production incident. The source connection is
+    /// read-only and SQLite Backup creates a transactionally consistent,
+    /// private copy; every migration and recovery write targets only that
+    /// copy. Run with CODEX_INFO_REAL_DB_GATE set to the account database.
+    #[test]
+    #[ignore = "requires an explicit read-only production database source"]
+    fn real_database_recovery_changes_only_the_proven_current_suffix() {
+        let source_path = std::env::var_os("CODEX_INFO_REAL_DB_GATE")
+            .map(PathBuf::from)
+            .expect("CODEX_INFO_REAL_DB_GATE must name the source database");
+        let copied_path = database_path("real-cumulative-recovery-gate");
+        let source = Connection::open_with_flags(
+            &source_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .expect("open source database read-only");
+        source
+            .pragma_update(None, "query_only", true)
+            .expect("source remains query-only");
+        let mut destination = Connection::open(&copied_path).expect("open isolated destination");
+        {
+            let backup = rusqlite::backup::Backup::new(&source, &mut destination)
+                .expect("create consistent SQLite backup");
+            assert!(matches!(
+                backup.step(-1).expect("copy complete source snapshot"),
+                rusqlite::backup::StepResult::Done
+            ));
+        }
+        drop(destination);
+        drop(source);
+        #[cfg(unix)]
+        fs::set_permissions(&copied_path, fs::Permissions::from_mode(0o600))
+            .expect("make isolated database owner-private");
+
+        let identity_connection = Connection::open(&copied_path).unwrap();
+        let identity = identity_connection
+            .query_row(
+                "SELECT schema_version, profile_scope_id, account_scope_id,
+                        storage_epoch, partition_id
+                 FROM storage_partition WHERE singleton=1",
+                [],
+                |row| {
+                    Ok(StoragePartitionIdentity {
+                        schema_version: row.get(0)?,
+                        profile_scope_id: row.get(1)?,
+                        account_scope_id: row.get(2)?,
+                        storage_epoch: row
+                            .get::<_, String>(3)?
+                            .parse()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        partition_id: row.get(4)?,
+                    })
+                },
+            )
+            .expect("read copied partition identity");
+        drop(identity_connection);
+
+        let mut store = UsageStore::open_partitioned(&copied_path, &identity)
+            .expect("migrate only the isolated copy");
+        let raw_fingerprint_before = raw_cumulative_history_fingerprint(&store);
+        let raw_counts_before = (
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM usage_history", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM usage_model_history", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+        );
+        let raw_samples_before = store.load_all_raw().unwrap();
+        let periods_before = group_reset_periods(&raw_samples_before);
+        let latest_timestamp = raw_samples_before
+            .iter()
+            .map(|sample| sample.timestamp)
+            .max()
+            .expect("production copy has history");
+        let now = latest_timestamp
+            .checked_add(1)
+            .expect("fixture time is finite");
+        let raw_observations_before = store
+            .load_recent_observations_raw(Utc.timestamp_opt(now, 0).single().unwrap())
+            .unwrap();
+        let state_before = store.load_session_collection_state().unwrap();
+        assert!(
+            state_before.reset_at > now,
+            "gate must target the live period"
+        );
+
+        let recovery = store
+            .pending_session_cumulative_recovery(
+                state_before.reset_at,
+                state_before.window_seconds,
+                now,
+                &state_before.model_totals,
+            )
+            .unwrap()
+            .expect("retained A→B→A regression has one source-proven recovery");
+        let baseline_sol = recovery
+            .offset_model_totals
+            .iter()
+            .find(|total| total.model == "SOL")
+            .unwrap();
+        let baseline_luna = recovery
+            .offset_model_totals
+            .iter()
+            .find(|total| total.model == "LUNA")
+            .unwrap();
+        assert_eq!(baseline_sol.total_tokens, 555_312_427);
+        assert_eq!(baseline_luna.total_tokens, 22_816_483);
+        assert_eq!(recovery.offset_sol_dollars, 370.814_975);
+        assert_eq!(recovery.offset_luna_dollars, 1.423_482_24);
+
+        let corrected = checked_add_model_totals(
+            &recovery.source_current_model_totals,
+            &recovery.offset_model_totals,
+        )
+        .expect("all current components add without overflow");
+        let collector_epoch = state_before
+            .collector_epoch
+            .expect("committed collector epoch");
+        let next_cycle = state_before
+            .cycle_seq
+            .checked_add(1)
+            .expect("finite cycle sequence");
+        let committed = store
+            .commit_session_collection_with_cumulative_recovery(
+                SessionCollectionCommit {
+                    reset_at: state_before.reset_at,
+                    window_seconds: state_before.window_seconds,
+                    collector_epoch,
+                    cycle_seq: next_cycle,
+                    samples: &[],
+                    checkpoints: &[],
+                    ranges: &[],
+                    model_totals: &corrected,
+                    recorded_sessions: &[],
+                },
+                &[],
+                &recovery,
+            )
+            .expect("atomic recovery commit succeeds in the isolated copy");
+        assert_eq!(committed.data_generation, state_before.data_generation + 1);
+
+        let raw_fingerprint_after = raw_cumulative_history_fingerprint(&store);
+        let raw_counts_after = (
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM usage_history", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM usage_model_history", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+        );
+        assert_eq!(raw_counts_after, raw_counts_before);
+        assert_eq!(raw_fingerprint_after, raw_fingerprint_before);
+        assert_eq!(
+            store.load_session_collection_state().unwrap().model_totals,
+            corrected
+        );
+
+        let logical_samples = store.load_all().unwrap();
+        assert_eq!(group_reset_periods(&logical_samples), periods_before);
+        assert_eq!(logical_samples.len(), raw_samples_before.len());
+        for (raw, logical) in raw_samples_before.iter().zip(&logical_samples) {
+            let in_recovered_suffix = same_reset_group(raw.reset_at, recovery.canonical_reset_at)
+                && raw.timestamp >= recovery.first_timestamp
+                && raw.timestamp <= recovery.through_timestamp;
+            if !in_recovered_suffix {
+                assert_eq!(logical, raw, "unrelated period or row changed: {raw:?}");
+                continue;
+            }
+            assert_eq!(logical.timestamp, raw.timestamp);
+            assert_eq!(logical.reset_at, raw.reset_at);
+            assert_eq!(logical.remaining_percent, raw.remaining_percent);
+            assert_eq!(
+                logical.sol_dollars,
+                raw.sol_dollars + recovery.offset_sol_dollars
+            );
+            assert_eq!(
+                logical.terra_dollars,
+                raw.terra_dollars + recovery.offset_terra_dollars
+            );
+            assert_eq!(
+                logical.luna_dollars,
+                raw.luna_dollars + recovery.offset_luna_dollars
+            );
+        }
+
+        let logical_observations = store
+            .load_recent_observations(Utc.timestamp_opt(now, 0).single().unwrap())
+            .unwrap();
+        assert_eq!(logical_observations.len(), raw_observations_before.len());
+        for raw in &raw_observations_before {
+            let logical = logical_observations
+                .iter()
+                .find(|candidate| {
+                    candidate.reset_at == raw.reset_at && candidate.timestamp == raw.timestamp
+                })
+                .expect("raw observation remains addressable");
+            let in_recovered_suffix = same_reset_group(raw.reset_at, recovery.canonical_reset_at)
+                && raw.timestamp >= recovery.first_timestamp
+                && raw.timestamp <= recovery.through_timestamp;
+            if !in_recovered_suffix || raw.model_totals.is_none() {
+                assert_eq!(logical, raw, "unrelated observation changed");
+            }
+        }
+        let endpoint = logical_observations
+            .iter()
+            .find(|observation| {
+                observation.reset_at == recovery.through_reset_at
+                    && observation.timestamp == recovery.through_timestamp
+            })
+            .expect("corrected current history endpoint exists");
+        assert_eq!(endpoint.model_totals.as_deref(), Some(corrected.as_slice()));
+        assert_eq!(endpoint.sol_dollars, Some(recovery.offset_sol_dollars));
+        assert_eq!(
+            endpoint.luna_dollars,
+            raw_observations_before
+                .iter()
+                .find(|observation| {
+                    observation.reset_at == recovery.through_reset_at
+                        && observation.timestamp == recovery.through_timestamp
+                })
+                .and_then(|observation| observation.luna_dollars)
+                .map(|value| value + recovery.offset_luna_dollars)
+        );
+        assert!(store
+            .pending_session_cumulative_recovery(
+                state_before.reset_at,
+                state_before.window_seconds,
+                now,
+                &corrected,
+            )
+            .unwrap()
+            .is_none());
+
+        println!(
+            "real-db-gate periods={} raw_rows={}/{} generation={}→{} current_models={:?}",
+            periods_before.len(),
+            raw_counts_before.0,
+            raw_counts_before.1,
+            state_before.data_generation,
+            committed.data_generation,
+            corrected
+        );
+        drop(store);
+        cleanup(&copied_path);
     }
 }
