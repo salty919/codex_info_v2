@@ -33,10 +33,44 @@ jobs:
           dotnet-version: "10.0.x"
       - name: Run Windows unit tests
         shell: pwsh
+        env:
+          COVERAGE_ROOT: ${{ runner.temp }}\codacy-coverage-dotnet
         run: |
           dotnet restore windows-client/CodexInfo.WindowsClient.sln --locked-mode
           dotnet format windows-client/CodexInfo.WindowsClient.sln --no-restore --verify-no-changes
-          dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release
+          dotnet test windows-client/CodexInfo.WindowsClient.sln `
+            --no-restore `
+            --configuration Release `
+            -p:DeterministicSourcePaths=true `
+            --collect:"Code Coverage" `
+            --settings windows-client/CodeCoverage.runsettings `
+            --results-directory $env:COVERAGE_ROOT
+
+          $reports = @(Get-ChildItem -LiteralPath $env:COVERAGE_ROOT -Recurse -File -Filter '*.cobertura.xml')
+          if ($reports.Count -eq 0) {
+            throw 'Windows tests produced no Cobertura report.'
+          }
+          $staging = Join-Path $env:GITHUB_WORKSPACE 'artifacts\codacy-coverage-windows'
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
+          for ($index = 0; $index -lt $reports.Count; $index++) {
+            $content = [System.IO.File]::ReadAllText($reports[$index].FullName)
+            $content = $content.Replace('filename="/_/', 'filename="')
+            if ($content -cnotmatch 'lines-valid="[1-9][0-9]*"') {
+              throw "Cobertura report has no valid lines: $($reports[$index].Name)"
+            }
+            if ($content -cmatch 'filename="(?:/|[A-Za-z]:[\\/])') {
+              throw "Cobertura report contains a runner-specific path: $($reports[$index].Name)"
+            }
+            $output = Join-Path $staging ("windows-{0}.cobertura.xml" -f ($index + 1))
+            [System.IO.File]::WriteAllText($output, $content, $utf8)
+          }
+      - name: Preserve Windows coverage for isolated upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: codacy-coverage-windows-v1-head-${{ inputs.source_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: artifacts/codacy-coverage-windows/*.cobertura.xml
+          if-no-files-found: error
       - name: Install locked Inno Setup compiler
         if: inputs.release_candidate
         shell: pwsh
