@@ -34,6 +34,7 @@ LINUX_PRODUCT_EXACT = frozenset(
 LINUX_TEST_EXACT = frozenset(
     {
         "scripts/cli_contract_e2e.sh",
+        "scripts/check_recorder_rest_boundary.sh",
         "scripts/data_protection_gate.sh",
         "scripts/db_protection_e2e.sh",
         "scripts/record_daemon_e2e.sh",
@@ -152,6 +153,9 @@ def _selection_for_path(path: str) -> PathSelection:
     if path.startswith("tests/"):
         return PathSelection(frozenset({"LINUX_BACKEND"}), False)
     if path.startswith("src/") and path != "src/main.rs":
+        languages = frozenset({"rust"}) if path.endswith(".rs") else frozenset()
+        return PathSelection(frozenset({"LINUX_BACKEND"}), True, languages)
+    if path.startswith("crates/"):
         languages = frozenset({"rust"}) if path.endswith(".rs") else frozenset()
         return PathSelection(frozenset({"LINUX_BACKEND"}), True, languages)
     if path in LINUX_UI_EXACT:
