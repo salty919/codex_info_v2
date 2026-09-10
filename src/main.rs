@@ -28,7 +28,8 @@ use sha2::{Digest, Sha256};
 use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
 use slint::{CloseRequestResponse, ComponentHandle, Model, Timer, TimerMode};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -2800,10 +2801,28 @@ fn moving_reset_observation_belongs_to_anchor(
     if timestamp_delta == 0 && reset_delta <= MOVING_RESET_GROUP_MAX_DRIFT_SECONDS {
         return true;
     }
-    let anchor_horizon = anchor.reset_at.saturating_sub(anchor.timestamp);
-    let candidate_horizon = candidate.reset_at.saturating_sub(candidate.timestamp);
+    moving_reset_coordinates_form_step(
+        anchor.timestamp,
+        anchor.reset_at,
+        candidate.timestamp,
+        candidate.reset_at,
+    )
+}
+
+fn moving_reset_coordinates_form_step(
+    anchor_timestamp: i64,
+    anchor_reset_at: i64,
+    candidate_timestamp: i64,
+    candidate_reset_at: i64,
+) -> bool {
+    if candidate_timestamp <= anchor_timestamp || candidate_reset_at <= anchor_reset_at {
+        return false;
+    }
+    let timestamp_delta = candidate_timestamp - anchor_timestamp;
+    let reset_delta = candidate_reset_at - anchor_reset_at;
+    let anchor_horizon = anchor_reset_at.saturating_sub(anchor_timestamp);
+    let candidate_horizon = candidate_reset_at.saturating_sub(candidate_timestamp);
     reset_delta <= MOVING_RESET_GROUP_MAX_DRIFT_SECONDS
-        && timestamp_delta > 0
         && anchor_horizon >= MOVING_RESET_MIN_HORIZON_SECONDS
         && candidate_horizon >= MOVING_RESET_MIN_HORIZON_SECONDS
         && anchor_horizon.abs_diff(candidate_horizon) <= MOVING_RESET_STEP_TOLERANCE_SECONDS as u64
@@ -2823,6 +2842,36 @@ fn reset_sample_groups(samples: &[UsageHistorySample]) -> Vec<ResetSampleGroup> 
     // quota rows cannot split a spend period.
     sorted.sort_by_key(|sample| (sample.timestamp, sample.reset_at));
 
+    // A far reset observed in the same acquisition timestamp may join a
+    // moving sequence only when a strictly later observation continues from
+    // that reset. Build that existence proof once by sweeping timestamp
+    // batches backwards; repeatedly scanning the remaining history here made
+    // one malformed burst quadratic in the retained row count.
+    let mut has_forward_observation = vec![false; sorted.len()];
+    let mut later_resets = BTreeSet::<i64>::new();
+    let mut batch_end = sorted.len();
+    while batch_end > 0 {
+        let timestamp = sorted[batch_end - 1].timestamp;
+        let mut batch_start = batch_end - 1;
+        while batch_start > 0 && sorted[batch_start - 1].timestamp == timestamp {
+            batch_start -= 1;
+        }
+        for candidate_index in batch_start..batch_end {
+            let candidate_reset = sorted[candidate_index].reset_at;
+            has_forward_observation[candidate_index] = later_resets
+                .range(
+                    candidate_reset
+                        ..=candidate_reset.saturating_add(MOVING_RESET_GROUP_MAX_DRIFT_SECONDS),
+                )
+                .next()
+                .is_some();
+        }
+        for sample in &sorted[batch_start..batch_end] {
+            later_resets.insert(sample.reset_at);
+        }
+        batch_end = batch_start;
+    }
+
     let mut groups = Vec::new();
     let mut index = 0;
     while let Some(anchor) = sorted.get(index).cloned() {
@@ -2839,15 +2888,7 @@ fn reset_sample_groups(samples: &[UsageHistorySample]) -> Vec<ResetSampleGroup> 
                 && candidate.timestamp == anchor.timestamp
                 && candidate.reset_at.abs_diff(anchor.reset_at) > RESET_AT_TOLERANCE_SECONDS as u64
             {
-                let has_forward_observation = sorted.get(index + 1..).is_some_and(|remaining| {
-                    remaining.iter().any(|future| {
-                        future.timestamp > anchor.timestamp
-                            && future.reset_at >= candidate.reset_at
-                            && future.reset_at - candidate.reset_at
-                                <= MOVING_RESET_GROUP_MAX_DRIFT_SECONDS
-                    })
-                });
-                if !has_forward_observation {
+                if !has_forward_observation[index] {
                     break;
                 }
             }
@@ -2880,19 +2921,29 @@ fn reset_sample_groups(samples: &[UsageHistorySample]) -> Vec<ResetSampleGroup> 
             samples: members,
         });
     }
-    let mut same_reset_merged: Vec<ResetSampleGroup> = Vec::with_capacity(groups.len());
-    let mut merged_indexes: BTreeMap<i64, usize> = BTreeMap::new();
+    // Exact reset IDs remain one candidate cycle even when a transient reset
+    // observation is interleaved at the same minute. Nearby reset IDs are not
+    // merged here: only the externally authoritative current reset may join
+    // aliases, in `authoritative_history_projection_samples`.
+    let mut exact_merged: Vec<ResetSampleGroup> = Vec::with_capacity(groups.len());
+    let mut exact_indexes = BTreeMap::<i64, usize>::new();
     for mut group in groups {
-        if let Some(&index) = merged_indexes.get(&group.canonical_reset_at) {
-            let existing = &mut same_reset_merged[index];
+        if let Some(&index) = exact_indexes.get(&group.canonical_reset_at) {
+            let existing = &mut exact_merged[index];
             existing.start = existing.start.min(group.start);
             existing.samples.append(&mut group.samples);
         } else {
-            merged_indexes.insert(group.canonical_reset_at, same_reset_merged.len());
-            same_reset_merged.push(group);
+            exact_indexes.insert(group.canonical_reset_at, exact_merged.len());
+            exact_merged.push(group);
         }
     }
-    same_reset_merged
+    for group in &mut exact_merged {
+        group
+            .samples
+            .sort_by_key(|sample| (sample.timestamp, sample.reset_at));
+    }
+    exact_merged.sort_by_key(|group| (group.start, group.canonical_reset_at));
+    exact_merged
 }
 
 /// Groups reset observations by an anchored sixty-second window, with a
@@ -2906,6 +2957,28 @@ fn history_periods_for_samples(
     current_reset_at: Option<i64>,
 ) -> Vec<HistoryPeriod> {
     let groups = reset_sample_groups(samples);
+    let current_group_reset = nearest_current_reset(
+        groups.iter().map(|group| group.canonical_reset_at),
+        current_reset_at,
+        now,
+    );
+
+    // Groups are ordered by start. Every member of one equal-start batch has
+    // the same next strictly later start, so resolve it once per batch rather
+    // than scanning the suffix once per period.
+    let mut next_starts = vec![None; groups.len()];
+    let mut next_distinct_start = None;
+    let mut batch_end = groups.len();
+    while batch_end > 0 {
+        let start = groups[batch_end - 1].start;
+        let mut batch_start = batch_end - 1;
+        while batch_start > 0 && groups[batch_start - 1].start == start {
+            batch_start -= 1;
+        }
+        next_starts[batch_start..batch_end].fill(next_distinct_start);
+        next_distinct_start = Some(start);
+        batch_end = batch_start;
+    }
 
     let mut periods = groups
         .iter()
@@ -2916,18 +2989,11 @@ fn history_periods_for_samples(
             // not a boundary for the selected spend period; use the next
             // strictly later observation as the visual end instead of
             // collapsing the graph to a zero-width interval.
-            let next_start = groups
-                .iter()
-                .skip(index + 1)
-                .map(|next| next.start)
-                .find(|start| *start > group.start);
+            let next_start = next_starts[index];
             let period_end = next_start.map_or(group.canonical_reset_at, |next| {
                 group.canonical_reset_at.min(next)
             });
-            let is_current = current_reset_at.is_some_and(|current| {
-                current.abs_diff(group.canonical_reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
-                    && now < group.canonical_reset_at
-            });
+            let is_current = current_group_reset == Some(group.canonical_reset_at);
             let end = if is_current {
                 now.max(group.start).min(group.canonical_reset_at)
             } else {
@@ -2964,17 +3030,19 @@ fn history_periods_for_samples(
             .iter()
             .map(|period| period.label.clone())
             .collect::<Vec<_>>();
+        let mut label_counts = BTreeMap::<String, usize>::new();
+        let mut start_counts = BTreeMap::<i64, usize>::new();
+        for period in &periods {
+            *label_counts.entry(period.label.clone()).or_default() += 1;
+            *start_counts.entry(period.start).or_default() += 1;
+        }
         for index in 0..periods.len() {
-            let same_start_count = periods
-                .iter()
-                .filter(|candidate| candidate.start == periods[index].start)
-                .count();
-            if base_labels
-                .iter()
-                .filter(|label| **label == base_labels[index])
-                .count()
-                > 1
-                || same_start_count > 1
+            if label_counts
+                .get(&base_labels[index])
+                .is_some_and(|count| *count > 1)
+                || start_counts
+                    .get(&periods[index].start)
+                    .is_some_and(|count| *count > 1)
             {
                 let canonical_reset_at = periods[index].canonical_reset_at;
                 let reset_label = format_period_timestamp(canonical_reset_at)
@@ -2994,25 +3062,33 @@ fn history_periods_for_samples(
     periods
 }
 
+fn nearest_current_reset<I>(resets: I, current_reset_at: Option<i64>, now: i64) -> Option<i64>
+where
+    I: IntoIterator<Item = i64>,
+{
+    let current = current_reset_at?;
+    resets
+        .into_iter()
+        .filter(|reset_at| now < *reset_at)
+        .filter(|reset_at| current.abs_diff(*reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64)
+        .min_by(|left, right| {
+            current
+                .abs_diff(*left)
+                .cmp(&current.abs_diff(*right))
+                .then_with(|| right.cmp(left))
+        })
+}
+
 fn current_history_period_reset(
     periods: &[HistoryPeriod],
     current_reset_at: Option<i64>,
     now: i64,
 ) -> Option<i64> {
-    let current = current_reset_at?;
-    periods
-        .iter()
-        .filter(|period| now < period.canonical_reset_at)
-        .filter(|period| {
-            current.abs_diff(period.canonical_reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
-        })
-        .min_by(|left, right| {
-            current
-                .abs_diff(left.canonical_reset_at)
-                .cmp(&current.abs_diff(right.canonical_reset_at))
-                .then_with(|| right.canonical_reset_at.cmp(&left.canonical_reset_at))
-        })
-        .map(|period| period.canonical_reset_at)
+    nearest_current_reset(
+        periods.iter().map(|period| period.canonical_reset_at),
+        current_reset_at,
+        now,
+    )
 }
 
 /// Build the shared presentation/publication view without mutating retained
@@ -3025,23 +3101,13 @@ fn authoritative_history_projection_samples(
     samples: &[UsageHistorySample],
     current_reset_at: Option<i64>,
     window_seconds: i64,
+    observed_at: i64,
 ) -> Vec<UsageHistorySample> {
-    let Some(current_reset_at) = current_reset_at else {
-        return samples.to_vec();
-    };
-    let Some(canonical_reset_at) = samples
-        .iter()
-        .map(|sample| sample.reset_at)
-        .filter(|reset_at| {
-            current_reset_at.abs_diff(*reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
-        })
-        .min_by(|left, right| {
-            current_reset_at
-                .abs_diff(*left)
-                .cmp(&current_reset_at.abs_diff(*right))
-                .then_with(|| right.cmp(left))
-        })
-    else {
+    let Some(canonical_reset_at) = nearest_current_reset(
+        samples.iter().map(|sample| sample.reset_at),
+        current_reset_at,
+        observed_at,
+    ) else {
         return samples.to_vec();
     };
     let Some(authoritative_start) = (window_seconds > 0)
@@ -3054,10 +3120,18 @@ fn authoritative_history_projection_samples(
 
     samples
         .iter()
-        .filter(|sample| {
-            sample.reset_at != canonical_reset_at || sample.timestamp >= authoritative_start
+        .filter_map(|sample| {
+            let current_alias =
+                canonical_reset_at.abs_diff(sample.reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64;
+            if current_alias && sample.timestamp < authoritative_start {
+                return None;
+            }
+            let mut projected = sample.clone();
+            if current_alias {
+                projected.reset_at = canonical_reset_at;
+            }
+            Some(projected)
         })
-        .cloned()
         .collect()
 }
 
@@ -3075,15 +3149,20 @@ fn apply_authoritative_current_bounds(
     window_seconds: i64,
     observed_at: i64,
 ) -> Vec<HistoryPeriod> {
-    let Some(current_reset_at) = current_reset_at else {
+    // Use the same deterministic nearest-alias decision as the current-period
+    // marker. Picking the first tolerant match can widen a different reset
+    // fragment and make one sample belong to two public periods.
+    let Some(canonical_reset_at) =
+        current_history_period_reset(&periods, current_reset_at, observed_at)
+    else {
         return periods;
     };
-    let Some(current_index) = periods.iter().position(|period| {
-        current_reset_at.abs_diff(period.canonical_reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
-    }) else {
+    let Some(current_index) = periods
+        .iter()
+        .position(|period| period.canonical_reset_at == canonical_reset_at)
+    else {
         return periods;
     };
-    let canonical_reset_at = periods[current_index].canonical_reset_at;
     let Some(authoritative_start) = (window_seconds > 0)
         .then(|| canonical_reset_at.checked_sub(window_seconds))
         .flatten()
@@ -3106,91 +3185,325 @@ fn apply_authoritative_current_bounds(
     periods
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HistoryCanonicalizationError {
-    MultipleCyclesInMinute,
+#[derive(Clone, Copy, Debug)]
+struct ResetGroupFacts {
+    end: i64,
+    has_quota: bool,
+    observes_multiple_minutes: bool,
 }
 
-impl std::fmt::Display for HistoryCanonicalizationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::MultipleCyclesInMinute => {
-                "history minute belongs to multiple reset cycles or partitions"
+fn reset_group_facts(groups: &[ResetSampleGroup]) -> Vec<ResetGroupFacts> {
+    groups
+        .iter()
+        .map(|group| {
+            let first_minute = group
+                .samples
+                .first()
+                .map(|sample| sample.timestamp.div_euclid(60));
+            let mut facts = ResetGroupFacts {
+                end: group.start,
+                has_quota: false,
+                observes_multiple_minutes: false,
+            };
+            for sample in &group.samples {
+                facts.end = facts.end.max(sample.timestamp);
+                facts.has_quota |= sample.remaining_percent >= 0.0;
+                facts.observes_multiple_minutes |=
+                    first_minute.is_some_and(|minute| sample.timestamp.div_euclid(60) != minute);
             }
+            facts
         })
+        .collect()
+}
+
+fn structurally_moving_reset_groups(groups: &[ResetSampleGroup]) -> Vec<bool> {
+    let mut moving = groups
+        .iter()
+        .map(|group| {
+            group.samples.windows(2).any(|pair| {
+                moving_reset_coordinates_form_step(
+                    pair[0].timestamp,
+                    pair[0].reset_at,
+                    pair[1].timestamp,
+                    pair[1].reset_at,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    // Concurrent stable observations can split a rolling reset response into
+    // singleton groups. Join only its structural trajectory: observation and
+    // reset advance together within the same bounded acquisition interval.
+    // Exact-reset groups are unique and ordered by start, so an active reset
+    // index limits comparisons to the existing bounded reset/time window.
+    let mut active_by_reset = BTreeMap::<i64, usize>::new();
+    let mut oldest_active = 0;
+    for right in 0..groups.len() {
+        let minimum_start = groups[right]
+            .start
+            .saturating_sub(MOVING_RESET_GROUP_MAX_DRIFT_SECONDS);
+        while oldest_active < right && groups[oldest_active].start < minimum_start {
+            let reset_at = groups[oldest_active].canonical_reset_at;
+            if active_by_reset.get(&reset_at) == Some(&oldest_active) {
+                active_by_reset.remove(&reset_at);
+            }
+            oldest_active += 1;
+        }
+        let minimum_reset = groups[right]
+            .canonical_reset_at
+            .saturating_sub(MOVING_RESET_GROUP_MAX_DRIFT_SECONDS);
+        for &left in active_by_reset
+            .range(minimum_reset..groups[right].canonical_reset_at)
+            .map(|(_, index)| index)
+        {
+            if moving_reset_coordinates_form_step(
+                groups[left].start,
+                groups[left].canonical_reset_at,
+                groups[right].start,
+                groups[right].canonical_reset_at,
+            ) {
+                moving[left] = true;
+                moving[right] = true;
+            }
+        }
+        active_by_reset.insert(groups[right].canonical_reset_at, right);
+    }
+    moving
+}
+
+fn reset_group_confirms_fixed_transition(facts: ResetGroupFacts, moving: bool) -> bool {
+    !moving && facts.has_quota && facts.observes_multiple_minutes
+}
+
+#[derive(Debug)]
+struct ActiveResetEnds {
+    leaf_count: usize,
+    minima: Vec<Option<(i64, usize)>>,
+}
+
+impl ActiveResetEnds {
+    fn new(reset_count: usize) -> Self {
+        let leaf_count = reset_count.next_power_of_two().max(1);
+        Self {
+            leaf_count,
+            minima: vec![None; leaf_count * 2],
+        }
+    }
+
+    fn earlier(left: Option<(i64, usize)>, right: Option<(i64, usize)>) -> Option<(i64, usize)> {
+        match (left, right) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        }
+    }
+
+    fn update(&mut self, position: usize, value: Option<(i64, usize)>) {
+        let mut node = self.leaf_count + position;
+        self.minima[node] = value;
+        while node > 1 {
+            node /= 2;
+            self.minima[node] = Self::earlier(self.minima[node * 2], self.minima[node * 2 + 1]);
+        }
+    }
+
+    fn minimum_before(&self, end: usize) -> Option<(i64, usize)> {
+        let mut left = self.leaf_count;
+        let mut right = self.leaf_count + end;
+        let mut minimum = None;
+        while left < right {
+            if left % 2 == 1 {
+                minimum = Self::earlier(minimum, self.minima[left]);
+                left += 1;
+            }
+            if right % 2 == 1 {
+                right -= 1;
+                minimum = Self::earlier(minimum, self.minima[right]);
+            }
+            left /= 2;
+            right /= 2;
+        }
+        minimum
     }
 }
 
-impl std::error::Error for HistoryCanonicalizationError {}
-
-fn usage_vector_dominates(left: &UsageHistorySample, right: &UsageHistorySample) -> bool {
-    left.sol_dollars >= right.sol_dollars
-        && left.terra_dollars >= right.terra_dollars
-        && left.luna_dollars >= right.luna_dollars
-        && left.sol_tokens >= right.sol_tokens
-        && left.terra_tokens >= right.terra_tokens
-        && left.luna_tokens >= right.luna_tokens
-}
-
-fn reset_group_has_quota(group: &ResetSampleGroup) -> bool {
-    group
-        .samples
+fn reset_group_transition_starts(
+    groups: &[ResetSampleGroup],
+    moving_groups: &[bool],
+) -> Vec<Option<i64>> {
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let facts = reset_group_facts(groups);
+    let reset_ends = groups
         .iter()
-        .any(|sample| sample.remaining_percent >= 0.0)
-}
-
-fn reset_group_end(group: &ResetSampleGroup) -> i64 {
-    group
-        .samples
+        .zip(&facts)
+        .map(|(group, facts)| (group.canonical_reset_at, facts.end))
+        .collect::<BTreeMap<_, _>>();
+    let family_ends = groups
         .iter()
-        .map(|sample| sample.timestamp)
-        .max()
-        .unwrap_or(group.start)
-}
-
-fn reset_group_is_shadowed(index: usize, groups: &[ResetSampleGroup]) -> bool {
-    let group = &groups[index];
-    let group_end = reset_group_end(group);
-    let has_quota = reset_group_has_quota(group);
-
-    groups.iter().enumerate().any(|(other_index, other)| {
-        if other_index == index || !reset_group_has_quota(other) {
-            return false;
-        }
-        let other_end = reset_group_end(other);
-        let overlaps = group.start <= other_end && other.start <= group_end;
-        (!has_quota && overlaps) || (other.start < group.start && other_end > group_end)
-    })
-}
-
-/// Canonicalize a storage-admitted public candidate without changing raw
-/// SQLite rows. Reset aliases may contribute one quota value and one existing
-/// dominant cumulative row only when the aliases are already validated as the
-/// same cycle and collector minute. No model component is assembled from
-/// different rows.
-fn canonicalize_public_history_samples(
-    samples: &[UsageHistorySample],
-) -> Result<Vec<UsageHistorySample>, HistoryCanonicalizationError> {
-    let raw_groups = reset_sample_groups(samples);
-    // A reset value carried only by local backfill is not cycle authority when
-    // it overlaps an observed quota cycle. Likewise, a reset fragment wholly
-    // enclosed by a continuing quota cycle never establishes a transition.
-    // Keep the raw rows in SQLite, but do not expose either as a graph period.
-    let shadowed = (0..raw_groups.len())
-        .map(|index| reset_group_is_shadowed(index, &raw_groups))
+        .zip(&facts)
+        .map(|(group, facts)| {
+            reset_ends
+                .range(
+                    group
+                        .canonical_reset_at
+                        .saturating_sub(RESET_AT_TOLERANCE_SECONDS)
+                        ..=group
+                            .canonical_reset_at
+                            .saturating_add(RESET_AT_TOLERANCE_SECONDS),
+                )
+                .map(|(_, end)| *end)
+                .max()
+                .unwrap_or(facts.end)
+        })
         .collect::<Vec<_>>();
-    let groups = raw_groups
+    let mut reset_values = groups
+        .iter()
+        .map(|group| group.canonical_reset_at)
+        .collect::<Vec<_>>();
+    reset_values.sort_unstable();
+    reset_values.dedup();
+    let reset_positions = groups
+        .iter()
+        .map(|group| {
+            reset_values
+                .binary_search(&group.canonical_reset_at)
+                .expect("group reset must exist in its reset index")
+        })
+        .collect::<Vec<_>>();
+
+    // Sweep later candidate cycles in observation order. The segment tree
+    // owns only earlier groups which still overlap this start. A confirmed
+    // fixed transition removes every eligible lower-reset group; otherwise
+    // only groups ending before the candidate's reset-family tail qualify.
+    // Each old group is removed at most once, at its earliest proven boundary.
+    let mut transition_starts = vec![None; groups.len()];
+    let mut active = vec![false; groups.len()];
+    let mut active_ends = ActiveResetEnds::new(reset_values.len());
+    let mut expirations = BinaryHeap::<Reverse<(i64, usize)>>::new();
+    let mut batch_start = 0;
+    while batch_start < groups.len() {
+        let candidate_start = groups[batch_start].start;
+        while let Some(Reverse((end, index))) = expirations.peek().copied() {
+            if end >= candidate_start {
+                break;
+            }
+            expirations.pop();
+            if active[index] {
+                active[index] = false;
+                active_ends.update(reset_positions[index], None);
+            }
+        }
+        let mut batch_end = batch_start + 1;
+        while batch_end < groups.len() && groups[batch_end].start == candidate_start {
+            batch_end += 1;
+        }
+        for candidate in batch_start..batch_end {
+            let lower_reset_count = reset_values.partition_point(|reset_at| {
+                reset_at.saturating_add(RESET_AT_TOLERANCE_SECONDS)
+                    < groups[candidate].canonical_reset_at
+            });
+            let confirmed =
+                reset_group_confirms_fixed_transition(facts[candidate], moving_groups[candidate]);
+            while let Some((prior_end, prior)) = active_ends.minimum_before(lower_reset_count) {
+                if !confirmed && prior_end >= family_ends[candidate] {
+                    break;
+                }
+                transition_starts[prior] = Some(candidate_start);
+                active[prior] = false;
+                active_ends.update(reset_positions[prior], None);
+            }
+        }
+        for index in batch_start..batch_end {
+            active[index] = true;
+            active_ends.update(reset_positions[index], Some((facts[index].end, index)));
+            expirations.push(Reverse((facts[index].end, index)));
+        }
+        batch_start = batch_end;
+    }
+    transition_starts
+}
+
+fn shadowed_moving_reset_groups(
+    groups: &[ResetSampleGroup],
+    moving_groups: &[bool],
+    facts: &[ResetGroupFacts],
+) -> Vec<bool> {
+    let mut shadowed = vec![false; groups.len()];
+    let mut prior_quota_max_end = None::<i64>;
+    let mut batch_start = 0;
+    while batch_start < groups.len() {
+        let start = groups[batch_start].start;
+        let mut batch_end = batch_start + 1;
+        while batch_end < groups.len() && groups[batch_end].start == start {
+            batch_end += 1;
+        }
+        for index in batch_start..batch_end {
+            shadowed[index] = moving_groups[index]
+                && prior_quota_max_end.is_some_and(|end| end > facts[index].end);
+        }
+        for facts in &facts[batch_start..batch_end] {
+            if facts.has_quota {
+                prior_quota_max_end =
+                    Some(prior_quota_max_end.map_or(facts.end, |end| end.max(facts.end)));
+            }
+        }
+        batch_start = batch_end;
+    }
+    shadowed
+}
+
+/// Derive the readable history view without changing raw SQLite rows.
+///
+/// This is a total projection: source anomalies never reject otherwise valid
+/// usage. Cycle decisions use only observation time, reset time and quota
+/// presence. Within one proven cycle/minute, aliases may contribute one quota
+/// value and one already-observed dominant cumulative row; values are never
+/// fabricated or assembled component-by-component. If the source cannot prove
+/// one owner or one value for a minute, only that minute is omitted so the UI
+/// can render it as missing while all other periods remain readable.
+fn canonicalize_public_history_samples(samples: &[UsageHistorySample]) -> Vec<UsageHistorySample> {
+    let mut groups = reset_sample_groups(samples);
+    let moving_groups = structurally_moving_reset_groups(&groups);
+    // A later reset which starts inside an older candidate and continues past
+    // it is a confirmed forward transition. Remove only the stale tail of the
+    // older candidate from that boundary onward. Conversely, a short later
+    // reset wholly enclosed by the older cycle is shadowed below and therefore
+    // cannot cut the continuing cycle. This uses reset/timestamp structure,
+    // never quota percentages or model values.
+    let transition_starts = reset_group_transition_starts(&groups, &moving_groups);
+    for (group, transition_start) in groups.iter_mut().zip(transition_starts) {
+        if let Some(transition_start) = transition_start {
+            group
+                .samples
+                .retain(|sample| sample.timestamp < transition_start);
+        }
+    }
+    groups.retain(|group| !group.samples.is_empty());
+    // A reset trajectory which advances with observation time but is wholly
+    // enclosed by one stable quota cycle is a transient source outage, not a
+    // period. Fixed reset groups are never removed here: their shared minutes
+    // are resolved below and their non-conflicting minutes remain readable.
+    // Transition tails were resolved first so an older reset cannot hide a
+    // fixed newer cycle which has repeated quota observations.
+    let moving_groups = structurally_moving_reset_groups(&groups);
+    let facts = reset_group_facts(&groups);
+    let shadowed = shadowed_moving_reset_groups(&groups, &moving_groups, &facts);
+    groups = groups
         .into_iter()
         .enumerate()
         .filter_map(|(index, group)| (!shadowed[index]).then_some(group))
-        .collect::<Vec<_>>();
-    let mut minute_groups = BTreeMap::<i64, BTreeSet<usize>>::new();
+        .collect();
+    let facts = reset_group_facts(&groups);
+    let mut minute_groups = BTreeMap::<i64, Vec<usize>>::new();
     for (group_index, group) in groups.iter().enumerate() {
         for sample in &group.samples {
-            minute_groups
+            let owners = minute_groups
                 .entry(sample.timestamp.div_euclid(60) * 60)
-                .or_default()
-                .insert(group_index);
+                .or_default();
+            if owners.last() != Some(&group_index) {
+                owners.push(group_index);
+            }
         }
     }
 
@@ -3200,33 +3513,42 @@ fn canonicalize_public_history_samples(
     // afterward, while every earlier cycle ends there. Any other overlap is
     // still ambiguous and must not be published.
     let mut boundary_minute_owners = BTreeMap::<i64, usize>::new();
+    let mut ambiguous_minutes = BTreeSet::<i64>::new();
     for (minute, group_indexes) in minute_groups
         .iter()
         .filter(|(_, group_indexes)| group_indexes.len() > 1)
     {
+        // A quota observation is direct evidence for the reset cycle that
+        // owned this minute. Model-history-only rows can enrich a proven
+        // cycle, but cannot displace that authority or make the whole minute
+        // unreadable. This decision depends on source capability, never on
+        // dollar/token magnitude.
+        let quota_owners = group_indexes
+            .iter()
+            .copied()
+            .filter(|group_index| facts[*group_index].has_quota)
+            .collect::<Vec<_>>();
+        if let [owner] = quota_owners.as_slice() {
+            boundary_minute_owners.insert(*minute, *owner);
+            continue;
+        }
         let continuing = group_indexes
             .iter()
             .copied()
             .filter(|group_index| {
                 let group = &groups[*group_index];
-                group.start == *minute
-                    && group
-                        .samples
-                        .iter()
-                        .any(|sample| sample.timestamp.div_euclid(60) * 60 > *minute)
+                group.start == *minute && facts[*group_index].end.div_euclid(60) * 60 > *minute
             })
             .collect::<Vec<_>>();
         let [owner] = continuing.as_slice() else {
-            return Err(HistoryCanonicalizationError::MultipleCyclesInMinute);
+            ambiguous_minutes.insert(*minute);
+            continue;
         };
         if group_indexes.iter().copied().any(|group_index| {
-            group_index != *owner
-                && groups[group_index]
-                    .samples
-                    .iter()
-                    .any(|sample| sample.timestamp.div_euclid(60) * 60 > *minute)
+            group_index != *owner && facts[group_index].end.div_euclid(60) * 60 > *minute
         }) {
-            return Err(HistoryCanonicalizationError::MultipleCyclesInMinute);
+            ambiguous_minutes.insert(*minute);
+            continue;
         }
         boundary_minute_owners.insert(*minute, *owner);
     }
@@ -3238,9 +3560,10 @@ fn canonicalize_public_history_samples(
             .into_iter()
             .filter(|sample| {
                 let minute = sample.timestamp.div_euclid(60) * 60;
-                boundary_minute_owners
-                    .get(&minute)
-                    .is_none_or(|owner| *owner == group_index)
+                !ambiguous_minutes.contains(&minute)
+                    && boundary_minute_owners
+                        .get(&minute)
+                        .is_none_or(|owner| *owner == group_index)
             })
             .collect::<Vec<_>>();
         if rows.is_empty() {
@@ -3276,13 +3599,33 @@ fn canonicalize_public_history_samples(
             if quota_conflict {
                 continue;
             }
+            let first = &minute_rows[0];
+            let mut maximums = (
+                first.sol_dollars,
+                first.terra_dollars,
+                first.luna_dollars,
+                first.sol_tokens,
+                first.terra_tokens,
+                first.luna_tokens,
+            );
+            for row in &minute_rows[1..] {
+                maximums.0 = maximums.0.max(row.sol_dollars);
+                maximums.1 = maximums.1.max(row.terra_dollars);
+                maximums.2 = maximums.2.max(row.luna_dollars);
+                maximums.3 = maximums.3.max(row.sol_tokens);
+                maximums.4 = maximums.4.max(row.terra_tokens);
+                maximums.5 = maximums.5.max(row.luna_tokens);
+            }
             let dominant = minute_rows
                 .iter()
                 .rev()
                 .find(|candidate| {
-                    minute_rows
-                        .iter()
-                        .all(|row| usage_vector_dominates(candidate, row))
+                    candidate.sol_dollars >= maximums.0
+                        && candidate.terra_dollars >= maximums.1
+                        && candidate.luna_dollars >= maximums.2
+                        && candidate.sol_tokens >= maximums.3
+                        && candidate.terra_tokens >= maximums.4
+                        && candidate.luna_tokens >= maximums.5
                 })
                 .cloned();
             let Some(dominant) = dominant else {
@@ -3296,7 +3639,7 @@ fn canonicalize_public_history_samples(
         }
     }
     canonical.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
-    Ok(canonical)
+    canonical
 }
 
 #[derive(Debug, Default)]
@@ -4176,11 +4519,10 @@ impl UsageHistory {
             .find(|group| group.canonical_reset_at == canonical_reset_at)
             .map(|group| group.samples)
             .unwrap_or_default();
-        // Presentation consumes the same canonical rows as `/v1/details`.
-        // Invalid raw observations fail closed to no new graph candidate;
-        // callers only commit strict service generations, so the prior graph
-        // remains visible instead of receiving a synthetic vector.
-        canonicalize_public_history_samples(&selected).unwrap_or_default()
+        // Presentation consumes the same localized, non-synthetic projection
+        // as `/v1/details`; an ambiguous minute cannot suppress the rest of
+        // the selected period.
+        canonicalize_public_history_samples(&selected)
     }
 
     #[cfg(test)]
@@ -10675,17 +11017,16 @@ fn local_account_authority_matches(
 
 impl CodexInfoState {
     fn projected_history(&self) -> UsageHistory {
-        let samples = canonicalize_public_history_samples(&self.history.samples)
-            .map(|samples| {
-                authoritative_history_projection_samples(
-                    &samples,
-                    self.reset_at,
-                    self.window_seconds,
-                )
-            })
-            // Keep an ambiguous source intact so downstream strict
-            // canonicalization rejects it rather than accepting a subset.
-            .unwrap_or_else(|_| self.history.samples.clone());
+        let canonical = canonicalize_public_history_samples(&self.history.samples);
+        let observed_at = self
+            .last_success_at
+            .unwrap_or_else(|| Utc::now().timestamp());
+        let samples = authoritative_history_projection_samples(
+            &canonical,
+            self.reset_at,
+            self.window_seconds,
+            observed_at,
+        );
         UsageHistory {
             samples,
             ..UsageHistory::default()
@@ -10738,33 +11079,33 @@ impl CodexInfoState {
     /// Build the sole read-only document consumed by public clients in tests.
     #[cfg(test)]
     fn public_details(&self) -> PublicDetails {
-        self.public_details_candidate()
-            .expect("in-process details candidate must be canonical")
+        self.public_details_candidate_at(Utc::now().timestamp())
     }
 
     #[cfg(test)]
     fn public_details_at(&self, now: i64) -> PublicDetails {
         self.public_details_candidate_at(now)
-            .expect("in-process details candidate must be canonical")
     }
 
-    fn public_details_candidate(&self) -> Result<PublicDetails, HistoryCanonicalizationError> {
-        self.public_details_candidate_at(Utc::now().timestamp())
+    fn public_details_candidates(&self) -> (PublicDetails, PublicDetailsV2, PublicDetailsV3) {
+        self.public_details_candidates_at(Utc::now().timestamp())
     }
 
-    fn public_details_v2_candidate(&self) -> Result<PublicDetailsV2, HistoryCanonicalizationError> {
-        self.public_details_v2_candidate_at(Utc::now().timestamp())
-    }
-
-    fn public_details_v3_candidate(&self) -> Result<PublicDetailsV3, HistoryCanonicalizationError> {
-        self.public_details_v3_candidate_at(Utc::now().timestamp())
-    }
-
-    fn public_details_v3_candidate_at(
+    fn public_details_candidates_at(
         &self,
         now: i64,
-    ) -> Result<PublicDetailsV3, HistoryCanonicalizationError> {
-        let v2 = self.public_details_v2_candidate_at(now)?;
+    ) -> (PublicDetails, PublicDetailsV2, PublicDetailsV3) {
+        // One publication cycle owns one canonical v1 projection. Newer wire
+        // generations are adapters over that exact root; rebuilding each
+        // generation from State would repeat the complete retained-history
+        // scan and could observe a different wall-clock second.
+        let v1 = self.public_details_candidate_at(now);
+        let v2 = self.public_details_v2_from_v1_at(v1.clone(), now);
+        let v3 = self.public_details_v3_from_v2(v2.clone());
+        (v1, v2, v3)
+    }
+
+    fn public_details_v3_from_v2(&self, v2: PublicDetailsV2) -> PublicDetailsV3 {
         let mut models = if self.authenticated && self.has_visible_usage() {
             self.model_usage
                 .iter()
@@ -10824,7 +11165,7 @@ impl CodexInfoState {
                 }
             })
             .collect();
-        Ok(PublicDetailsV3 {
+        PublicDetailsV3 {
             state: v2.state,
             observed_at: v2.observed_at,
             authenticated: v2.authenticated,
@@ -10836,14 +11177,10 @@ impl CodexInfoState {
             history_samples,
             history_gaps: v2.history_gaps,
             threads: v2.threads,
-        })
+        }
     }
 
-    fn public_details_v2_candidate_at(
-        &self,
-        now: i64,
-    ) -> Result<PublicDetailsV2, HistoryCanonicalizationError> {
-        let v1 = self.public_details_candidate_at(now)?;
+    fn public_details_v2_from_v1_at(&self, v1: PublicDetails, now: i64) -> PublicDetailsV2 {
         let effective_observed_at = v1.observed_at.unwrap_or(now);
         let history_cutoff = DateTime::<Utc>::from_timestamp(effective_observed_at, 0)
             .map(one_month_before_utc)
@@ -10915,13 +11252,10 @@ impl CodexInfoState {
             v2.history_samples
                 .sort_by_key(|sample| (sample.reset_at, sample.timestamp));
         }
-        Ok(v2)
+        v2
     }
 
-    fn public_details_candidate_at(
-        &self,
-        now: i64,
-    ) -> Result<PublicDetails, HistoryCanonicalizationError> {
+    fn public_details_candidate_at(&self, now: i64) -> PublicDetails {
         // A same-identity transport or refresh failure retains the last
         // complete values even while the state reports that error. Identity
         // authority failures clear authenticated state before projection.
@@ -10966,9 +11300,10 @@ impl CodexInfoState {
             ..UsageHistory::default()
         };
         let canonical_history_samples = authoritative_history_projection_samples(
-            &canonicalize_public_history_samples(&admitted_history.samples)?,
+            &canonicalize_public_history_samples(&admitted_history.samples),
             self.reset_at,
             self.window_seconds,
+            effective_observed_at,
         );
         // Period selectors and graph rows come from the same admitted view;
         // reset fragments and ambiguous minutes never survive only as empty
@@ -11132,7 +11467,7 @@ impl CodexInfoState {
                 window_seconds: self.window_seconds.max(1),
                 monthly: self.monthly,
             });
-        Ok(PublicDetails {
+        PublicDetails {
             state,
             observed_at,
             authenticated: visible_usage,
@@ -11159,7 +11494,7 @@ impl CodexInfoState {
             } else {
                 "概算 —".into()
             },
-        })
+        }
     }
 
     #[allow(clippy::needless_return)]
@@ -18469,7 +18804,6 @@ async fn service_shutdown_signal() {
 #[derive(Debug)]
 enum ResidentServiceCycleError {
     Store(String),
-    Candidate(String),
     Publish(codex_info::server::ApiSnapshotError),
 }
 
@@ -18793,21 +19127,7 @@ where
     if !force_publication && !observed_event && !scheduled_change && !recorder_attempt {
         return Ok(ResidentServiceCycleOutcome::Unchanged);
     }
-    let candidates = (|| {
-        Ok::<_, HistoryCanonicalizationError>((
-            state.public_details_candidate()?,
-            state.public_details_v2_candidate()?,
-            state.public_details_v3_candidate()?,
-        ))
-    })();
-    let (mut candidate, mut candidate_v2, mut candidate_v3) = match candidates {
-        Ok(candidates) => candidates,
-        Err(error) => {
-            publish_resident_error_root(publication, &mut publish)
-                .map_err(ResidentServiceCycleError::Publish)?;
-            return Err(ResidentServiceCycleError::Candidate(error.to_string()));
-        }
-    };
+    let (mut candidate, mut candidate_v2, mut candidate_v3) = state.public_details_candidates();
     if candidate.state == PublicState::Error {
         if let Some(last_complete) = publication.last_complete.as_ref() {
             candidate = last_complete.clone();
@@ -18891,9 +19211,8 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
         .map_err(|_| std::io::Error::other(cli_error(CliTextKey::ServiceStartFailed)))?;
     let publisher = api_server.publisher();
     let mut state = CodexInfoState::new();
-    let initial_candidate = state.public_details_candidate()?;
-    let initial_candidate_v2 = state.public_details_v2_candidate()?;
-    let initial_candidate_v3 = state.public_details_v3_candidate()?;
+    let (initial_candidate, initial_candidate_v2, initial_candidate_v3) =
+        state.public_details_candidates();
     publisher.publish_details_v3(
         initial_candidate.clone(),
         initial_candidate_v2.clone(),
@@ -19181,11 +19500,6 @@ fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::erro
                             // root, then retry once at the normal recorder
                             // interval. Actual thread death is detected by
                             // recorder.probe() on the one-second owner loop.
-                        }
-                        Err(ResidentServiceCycleError::Candidate(error)) => {
-                            eprintln!(
-                                "codex-info: REST snapshot canonicalization rejected: {error}"
-                            );
                         }
                         Err(ResidentServiceCycleError::Publish(error)) => {
                             if last_publish_error != Some(error) {
@@ -19785,6 +20099,7 @@ mod tests {
     use super::winit;
     use super::{
         account_window_title, active_thread_model_counts, active_thread_rows_at,
+        apply_authoritative_current_bounds, authoritative_history_projection_samples,
         canonicalize_public_history_samples, clamp_graph_preview_size, collect_recovery_usage,
         collect_session_usage_file, complete_rollout_prefix_len, current_history_period_reset,
         current_label_connector_path, detail_window_title, fetch_active_thread_update_for_paths,
@@ -19812,16 +20127,16 @@ mod tests {
         unreliable_model_spend, unused_interval_positions, visible_window_position,
         week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer, ApiServerConfig,
         CodexInfoState, Event, FixedResizeDecision, GraphConfirmedGap, GraphPaths, GraphWindow,
-        HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint, LocalUsageCache,
-        LocalUsageCandidate, LocalUsageResult, ManualX11Geometry, ManualX11WindowAction,
-        ModelDollarTotals, ModelTokenTotals, ModelUsageRow, ModelUsageTotals, PublicDetails,
-        PublicDetailsV2, PublicDetailsV3, PublicHistoryGap, RpcReadEvent, ServiceEndpointState,
-        ServiceHealthVersion, SessionFileCandidate, SessionTraversalBudget, ThreadRolloutCache,
-        TimedModelUsage, TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory,
-        UsageHistorySample, UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT,
-        FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE,
-        LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION, THREADS_WINDOW_PURPOSE,
-        UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
+        HistoryPeriod, HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint,
+        LocalUsageCache, LocalUsageCandidate, LocalUsageResult, ManualX11Geometry,
+        ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
+        ModelUsageTotals, PublicDetails, PublicDetailsV2, PublicDetailsV3, PublicHistoryGap,
+        RpcReadEvent, ServiceEndpointState, ServiceHealthVersion, SessionFileCandidate,
+        SessionTraversalBudget, ThreadRolloutCache, TimedModelUsage, TokenSnapshot,
+        UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
+        DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS,
+        GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION,
+        THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
     use codex_info::usage_store;
     use serde::Deserialize;
@@ -20018,8 +20333,8 @@ mod tests {
 
     fn split_current_fixture() -> (PublicDetailsV3, Vec<super::PublicThread>) {
         let mut current = CodexInfoState::preview("normal")
-            .public_details_v3_candidate()
-            .expect("preview produces a public v3 fixture");
+            .public_details_candidates()
+            .2;
         let threads = current.threads.clone();
         current.history_periods.clear();
         current.history_samples.clear();
@@ -20612,9 +20927,7 @@ mod tests {
             ..UsageHistory::default()
         };
 
-        let details = state
-            .public_details_candidate_at(OBSERVED_AT + 600)
-            .unwrap();
+        let details = state.public_details_candidate_at(OBSERVED_AT + 600);
 
         assert_eq!(details.observed_at, Some(OBSERVED_AT));
         assert_eq!(
@@ -20694,7 +21007,7 @@ mod tests {
         state.last_success_at = Some(now.timestamp());
         state.reset_at = Some(current_reset);
         state.window_seconds = WEEK_SECONDS;
-        let details = state.public_details_candidate_at(now.timestamp()).unwrap();
+        let details = state.public_details_candidate_at(now.timestamp());
 
         assert_eq!(details.history_periods.len(), 2);
         assert_eq!(
@@ -20808,7 +21121,7 @@ mod tests {
         let mut publication = super::ResidentPublicationState {
             last_complete: Some(last_complete.clone()),
             last_complete_v2: Some(PublicDetailsV2::from(last_complete.clone())),
-            last_complete_v3: Some(state.public_details_v3_candidate().unwrap()),
+            last_complete_v3: Some(state.public_details_candidates().2),
             ..super::ResidentPublicationState::default()
         };
 
@@ -21066,10 +21379,12 @@ mod tests {
             })
             .unwrap();
 
+        let (last_published, last_published_v2, last_published_v3) =
+            state.public_details_candidates();
         let mut publication = super::ResidentPublicationState {
-            last_published: Some(state.public_details_candidate().unwrap()),
-            last_published_v2: Some(state.public_details_v2_candidate().unwrap()),
-            last_published_v3: Some(state.public_details_v3_candidate().unwrap()),
+            last_published: Some(last_published),
+            last_published_v2: Some(last_published_v2),
+            last_published_v3: Some(last_published_v3),
             ..super::ResidentPublicationState::default()
         };
         let before = (
@@ -21127,7 +21442,7 @@ mod tests {
     #[test]
     fn split_history_apply_is_atomic_at_the_current_pair_boundary() {
         let source = CodexInfoState::preview("normal");
-        let mut current = source.public_details_v3_candidate().unwrap();
+        let mut current = source.public_details_candidates().2;
         let periods = current.history_periods.clone();
         let samples = current.history_samples.clone();
         let gaps = current.history_gaps.clone();
@@ -23715,7 +24030,7 @@ mod tests {
     #[test]
     fn split_history_periods_update_main_without_materializing_history_samples() {
         let source = CodexInfoState::preview("normal");
-        let mut current = source.public_details_v3_candidate().unwrap();
+        let mut current = source.public_details_candidates().2;
         let periods = current.history_periods.clone();
         current.history_periods.clear();
         current.history_samples.clear();
@@ -23822,7 +24137,6 @@ mod tests {
 
         let timestamps = state
             .public_details_candidate_at(now_timestamp)
-            .unwrap()
             .history_samples
             .into_iter()
             .map(|sample| sample.timestamp)
@@ -26583,8 +26897,7 @@ mod tests {
             ..UsageHistory::default()
         };
 
-        let v1 = state.public_details_at(observed_at);
-        let v2 = state.public_details_v2_candidate_at(observed_at).unwrap();
+        let (v1, v2, v3) = state.public_details_candidates_at(observed_at);
         assert_eq!(v2.to_v1_projection(), v1);
         assert_eq!(
             v2.history_samples
@@ -26599,7 +26912,6 @@ mod tests {
                 && sample.sol_dollars.is_none()
         }));
 
-        let v3 = state.public_details_v3_candidate_at(observed_at).unwrap();
         let legacy_v3 = v3
             .history_samples
             .iter()
@@ -31303,7 +31615,7 @@ mod tests {
         history.record(jittered);
 
         assert_eq!(history.samples.len(), 2);
-        let canonical = canonicalize_public_history_samples(&history.samples).unwrap();
+        let canonical = canonicalize_public_history_samples(&history.samples);
         assert_eq!(canonical.len(), 1);
         assert_eq!(canonical[0].reset_at, 1_700_100_003);
         assert_eq!(canonical[0].remaining_percent, 75.0);
@@ -31331,7 +31643,7 @@ mod tests {
                 },
             ),
         ];
-        let displayed = canonicalize_public_history_samples(&history.samples).unwrap();
+        let displayed = canonicalize_public_history_samples(&history.samples);
         assert_eq!(displayed.len(), 1);
         assert_eq!(displayed[0].reset_at, 1_700_100_003);
         assert_eq!(displayed[0].remaining_percent, 75.0);
@@ -31366,7 +31678,7 @@ mod tests {
         history.apply_backfill_samples(1_003, vec![backfill]);
 
         assert_eq!(history.samples.len(), 2);
-        let canonical = canonicalize_public_history_samples(&history.samples).unwrap();
+        let canonical = canonicalize_public_history_samples(&history.samples);
         assert_eq!(canonical.len(), 1);
         assert_eq!(canonical[0].remaining_percent, 42.0);
         assert_eq!(canonical[0].sol_dollars, 9.0);
@@ -31398,7 +31710,7 @@ mod tests {
         let selected = history.samples_for_reset(Some(base_reset));
         assert!(selected.is_empty());
         assert_eq!(
-            canonicalize_public_history_samples(&history.samples).unwrap(),
+            canonicalize_public_history_samples(&history.samples),
             Vec::<UsageHistorySample>::new()
         );
     }
@@ -31436,7 +31748,7 @@ mod tests {
         let selected = history.samples_for_reset(Some(reset_at));
         assert!(selected.is_empty());
         assert_eq!(
-            canonicalize_public_history_samples(&history.samples).unwrap(),
+            canonicalize_public_history_samples(&history.samples),
             Vec::<UsageHistorySample>::new()
         );
     }
@@ -31470,7 +31782,7 @@ mod tests {
 
         assert_eq!(history.samples, [first, second]);
         assert_eq!(
-            canonicalize_public_history_samples(&history.samples).unwrap(),
+            canonicalize_public_history_samples(&history.samples),
             Vec::<UsageHistorySample>::new()
         );
         assert!(history.samples_for_reset(Some(reset_at)).is_empty());
@@ -31536,7 +31848,7 @@ mod tests {
             .filter(|sample| sample.timestamp == timestamp)
             .any(|sample| (sample.remaining_percent - 14.0).abs() < f64::EPSILON));
         assert_eq!(
-            canonicalize_public_history_samples(&history.samples).unwrap(),
+            canonicalize_public_history_samples(&history.samples),
             Vec::<UsageHistorySample>::new()
         );
         let _ = fs::remove_dir_all(db_path.parent().unwrap());
@@ -32293,7 +32605,7 @@ mod tests {
 
         assert_eq!(history.samples.len(), 2);
         assert_eq!(history.periods(timestamp + 60, None).len(), 2);
-        let canonical = canonicalize_public_history_samples(&history.samples).unwrap();
+        let canonical = canonicalize_public_history_samples(&history.samples);
         assert_eq!(canonical.len(), 1);
         assert_eq!(canonical[0].timestamp, timestamp);
         assert_eq!(canonical[0].reset_at, spend_reset);
@@ -32362,7 +32674,7 @@ mod tests {
             ),
         ];
 
-        let canonical = canonicalize_public_history_samples(&rows).unwrap();
+        let canonical = canonicalize_public_history_samples(&rows);
 
         assert_eq!(canonical.len(), 3);
         assert!(canonical.iter().any(|sample| {
@@ -32426,7 +32738,7 @@ mod tests {
             )
         }));
 
-        let canonical = canonicalize_public_history_samples(&rows).unwrap();
+        let canonical = canonicalize_public_history_samples(&rows);
 
         assert!(canonical.iter().all(
             |sample| matches!(sample.reset_at, value if value == old_reset || value == new_reset)
@@ -32890,7 +33202,7 @@ mod tests {
                 luna_tokens: 70,
             },
         ];
-        let canonical = canonicalize_public_history_samples(&rows).unwrap();
+        let canonical = canonicalize_public_history_samples(&rows);
         assert_eq!(canonical.len(), 1);
         assert_eq!(canonical[0].reset_at, reset);
         assert_eq!(canonical[0].remaining_percent, 41.0);
@@ -32899,14 +33211,11 @@ mod tests {
         assert_eq!(canonical[0].luna_dollars, 7.0);
 
         let duplicated = [rows.clone(), rows.clone()].concat();
-        assert_eq!(
-            canonicalize_public_history_samples(&duplicated).unwrap(),
-            canonical
-        );
+        assert_eq!(canonicalize_public_history_samples(&duplicated), canonical);
     }
 
     #[test]
-    fn history_canonicalizer_omits_ambiguous_values_and_rejects_cross_partition_minutes() {
+    fn history_canonicalizer_omits_ambiguous_values_and_cross_cycle_minutes() {
         let base = UsageHistorySample {
             timestamp: 1_788_040_140,
             reset_at: 1_788_644_929,
@@ -32922,7 +33231,7 @@ mod tests {
         quota_conflict.reset_at += 20;
         quota_conflict.remaining_percent = 40.0;
         assert_eq!(
-            canonicalize_public_history_samples(&[base.clone(), quota_conflict]).unwrap(),
+            canonicalize_public_history_samples(&[base.clone(), quota_conflict]),
             Vec::<UsageHistorySample>::new()
         );
 
@@ -32933,7 +33242,7 @@ mod tests {
         noncomparable.sol_tokens = 100;
         noncomparable.terra_tokens = 0;
         assert_eq!(
-            canonicalize_public_history_samples(&[base.clone(), noncomparable]).unwrap(),
+            canonicalize_public_history_samples(&[base.clone(), noncomparable]),
             Vec::<UsageHistorySample>::new()
         );
 
@@ -32942,16 +33251,164 @@ mod tests {
         other_partition.reset_at += 10_000;
         assert_eq!(
             canonicalize_public_history_samples(&[base.clone(), other_partition]),
-            Err(super::HistoryCanonicalizationError::MultipleCyclesInMinute)
+            Vec::<UsageHistorySample>::new(),
+            "one ambiguous historical minute must not reject the current snapshot"
         );
 
         let mut true_reset = base.clone();
         true_reset.timestamp += 60;
         true_reset.reset_at += WEEK_SECONDS;
         true_reset.remaining_percent = 100.0;
-        let distinct_cycles = canonicalize_public_history_samples(&[base, true_reset]).unwrap();
+        let distinct_cycles = canonicalize_public_history_samples(&[base, true_reset]);
         assert_eq!(distinct_cycles.len(), 2);
         assert_ne!(distinct_cycles[0].reset_at, distinct_cycles[1].reset_at);
+    }
+
+    #[test]
+    fn ambiguous_historical_minute_does_not_hide_valid_current_usage() {
+        let mut state = CodexInfoState::preview("normal");
+        let now = state.last_success_at.expect("preview observation");
+        let ambiguous_minute = (now - 600).div_euclid(60) * 60;
+        state.history.samples.extend([
+            UsageHistorySample::new(
+                ambiguous_minute,
+                now + 20_000,
+                40.0,
+                ModelDollarTotals::default(),
+            ),
+            UsageHistorySample::new(
+                ambiguous_minute + 19,
+                now + 30_000,
+                90.0,
+                ModelDollarTotals::default(),
+            ),
+        ]);
+
+        let details = state.public_details_candidate_at(now);
+
+        assert_eq!(details.state, super::PublicState::Ready);
+        assert!(details.authenticated);
+        assert!(details.quota.is_some());
+        assert!(!details.history_samples.is_empty());
+        assert!(details
+            .history_samples
+            .iter()
+            .all(|sample| sample.timestamp != ambiguous_minute));
+    }
+
+    #[test]
+    fn current_projection_does_not_trim_a_nearer_expired_alias() {
+        const CURRENT_RESET: i64 = 1_800_010_000;
+        const OBSERVED_AT: i64 = CURRENT_RESET - 10;
+        const EXPIRED_ALIAS: i64 = CURRENT_RESET - 20;
+        const FUTURE_ALIAS: i64 = CURRENT_RESET + 50;
+        const OLD_TIMESTAMP: i64 = 1_800_009_600;
+        let mut state = CodexInfoState::preview("normal");
+        state.last_success_at = Some(OBSERVED_AT);
+        state.reset_at = Some(CURRENT_RESET);
+        state.window_seconds = 300;
+        state.history.samples = vec![
+            UsageHistorySample::new(
+                OLD_TIMESTAMP,
+                EXPIRED_ALIAS,
+                60.0,
+                ModelDollarTotals::default(),
+            ),
+            UsageHistorySample::new(
+                OBSERVED_AT - 60,
+                FUTURE_ALIAS,
+                59.0,
+                ModelDollarTotals::default(),
+            ),
+        ];
+
+        let details = state.public_details_candidate_at(OBSERVED_AT);
+
+        assert!(details.history_samples.iter().any(|sample| {
+            sample.timestamp == OLD_TIMESTAMP && sample.reset_at == EXPIRED_ALIAS
+        }));
+        assert_eq!(
+            details
+                .history_periods
+                .iter()
+                .filter(|period| period.current)
+                .map(|period| period.reset_at)
+                .collect::<Vec<_>>(),
+            vec![FUTURE_ALIAS]
+        );
+    }
+
+    #[test]
+    fn confirmed_forward_cycle_is_not_shadowed_by_a_stale_reset_tail() {
+        const BASE: i64 = 1_800_000_000;
+        const OLD_RESET: i64 = BASE + 10_000;
+        const NEW_RESET: i64 = BASE + 20_000;
+        let row = |offset, reset_at, percent| {
+            UsageHistorySample::new(
+                BASE + offset,
+                reset_at,
+                percent,
+                ModelDollarTotals::default(),
+            )
+        };
+        let rows = vec![
+            row(0, OLD_RESET, 70.0),
+            row(60, NEW_RESET, 100.0),
+            row(120, NEW_RESET, 99.0),
+            row(180, OLD_RESET, 69.0),
+            row(240, OLD_RESET, 68.0),
+        ];
+
+        let canonical = canonicalize_public_history_samples(&rows);
+
+        assert!(canonical.iter().any(|sample| sample.reset_at == NEW_RESET));
+        assert!(canonical
+            .iter()
+            .all(|sample| { sample.reset_at != OLD_RESET || sample.timestamp < BASE + 60 }));
+    }
+
+    #[test]
+    fn overlapping_quota_authority_does_not_delete_an_earlier_model_only_minute() {
+        const BASE: i64 = 1_800_000_000;
+        const MODEL_RESET: i64 = BASE + 20_000;
+        const QUOTA_RESET: i64 = BASE + 10_000;
+        let rows = vec![
+            UsageHistorySample::from_model_history_with_usage(
+                BASE,
+                MODEL_RESET,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 10,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::from_model_history_with_usage(
+                BASE + 60,
+                MODEL_RESET,
+                ModelDollarTotals {
+                    sol: 2.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 20,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new(BASE + 60, QUOTA_RESET, 80.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(BASE + 120, QUOTA_RESET, 79.0, ModelDollarTotals::default()),
+        ];
+
+        let canonical = canonicalize_public_history_samples(&rows);
+
+        assert!(canonical
+            .iter()
+            .any(|sample| { sample.timestamp == BASE && sample.reset_at == MODEL_RESET }));
+        assert!(canonical
+            .iter()
+            .any(|sample| { sample.timestamp == BASE + 120 && sample.reset_at == QUOTA_RESET }));
     }
 
     #[test]
@@ -32984,7 +33441,7 @@ mod tests {
         let before = store.load_all().unwrap();
         drop(store);
 
-        let canonical = canonicalize_public_history_samples(&rows).unwrap();
+        let canonical = canonicalize_public_history_samples(&rows);
         assert_eq!(canonical.len(), 3);
         assert!(canonical
             .iter()
@@ -33744,9 +34201,7 @@ mod tests {
                 .collect(),
             ..UsageHistory::default()
         };
-        let candidate_a = producer
-            .public_details_candidate_at(oracle_a.observed_at.unwrap())
-            .expect("A aliases canonicalize");
+        let candidate_a = producer.public_details_candidate_at(oracle_a.observed_at.unwrap());
         let alias_sample = candidate_a
             .history_samples
             .iter()
@@ -33797,9 +34252,7 @@ mod tests {
         let conflict_timestamp = conflict.timestamp;
         invalid.push(conflict);
         producer.history.samples = invalid;
-        let isolated = producer
-            .public_details_candidate_at(oracle_a.observed_at.unwrap())
-            .expect("one ambiguous history minute does not block the complete root");
+        let isolated = producer.public_details_candidate_at(oracle_a.observed_at.unwrap());
         assert!(isolated
             .history_samples
             .iter()
@@ -33826,9 +34279,7 @@ mod tests {
                 .collect(),
             ..UsageHistory::default()
         };
-        let candidate_b = producer
-            .public_details_candidate_at(oracle_b.observed_at.unwrap())
-            .expect("B candidate recovers");
+        let candidate_b = producer.public_details_candidate_at(oracle_b.observed_at.unwrap());
         assert_eq!(
             candidate_b
                 .history_samples
@@ -34003,6 +34454,239 @@ mod tests {
             );
         }
         server.shutdown();
+    }
+
+    #[test]
+    fn authoritative_bounds_use_same_nearest_alias_as_current_period() {
+        const PERIOD_START: i64 = 1_800_000_000;
+        const CURRENT_RESET: i64 = PERIOD_START + 3_600;
+        const OBSERVED_AT: i64 = PERIOD_START + 300;
+
+        // A bad reset observation can split one real cycle into fragments.
+        // Both aliases remain within the same-cycle tolerance, but only the
+        // closest alias is the current period selected by the UI/public wire.
+        let periods = vec![
+            HistoryPeriod {
+                canonical_reset_at: CURRENT_RESET + 2,
+                start: PERIOD_START,
+                end: PERIOD_START + 60,
+                label: "older fragment".into(),
+            },
+            HistoryPeriod {
+                canonical_reset_at: CURRENT_RESET + 1,
+                start: PERIOD_START + 240,
+                end: OBSERVED_AT,
+                label: "nearest fragment".into(),
+            },
+        ];
+        let selected = current_history_period_reset(&periods, Some(CURRENT_RESET), OBSERVED_AT)
+            .expect("one nearest current period");
+        assert_eq!(selected, CURRENT_RESET + 1);
+
+        let bounded = apply_authoritative_current_bounds(
+            periods,
+            &[],
+            Some(CURRENT_RESET),
+            3_600,
+            OBSERVED_AT,
+        );
+        let older = bounded
+            .iter()
+            .find(|period| period.canonical_reset_at == CURRENT_RESET + 2)
+            .expect("older same-cycle fragment");
+        let current = bounded
+            .iter()
+            .find(|period| period.canonical_reset_at == selected)
+            .expect("selected current period");
+
+        assert_eq!(older.end, PERIOD_START + 60);
+        assert_eq!(current.start, PERIOD_START);
+        assert_eq!(current.end, OBSERVED_AT);
+
+        // The later sample must belong to exactly the selected period. Giving
+        // the older alias current bounds as well would violate the one-owner
+        // wire invariant.
+        let sample_timestamp = PERIOD_START + 240;
+        let matching_periods = bounded
+            .iter()
+            .filter(|period| {
+                selected >= period.canonical_reset_at.saturating_sub(60)
+                    && selected <= period.canonical_reset_at
+                    && sample_timestamp >= period.start
+                    && sample_timestamp <= period.end
+            })
+            .count();
+        assert_eq!(matching_periods, 1);
+    }
+
+    #[test]
+    fn fragmented_current_aliases_collapse_to_one_current_period() {
+        const PERIOD_START: i64 = 1_800_000_000;
+        const CURRENT_RESET: i64 = PERIOD_START + 3_600;
+        const OBSERVED_AT: i64 = PERIOD_START + 300;
+        let row = |timestamp, reset_at| {
+            UsageHistorySample::new_with_usage(
+                timestamp,
+                reset_at,
+                50.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals::default(),
+            )
+        };
+        let samples = vec![
+            row(PERIOD_START, CURRENT_RESET + 2),
+            row(PERIOD_START + 60, CURRENT_RESET + 2),
+            // A transient bad reset separates two fragments of the actual
+            // current cycle without making either alias authoritative.
+            row(PERIOD_START + 120, CURRENT_RESET - 1_200),
+            row(PERIOD_START + 180, CURRENT_RESET - 1_200),
+            row(PERIOD_START + 240, CURRENT_RESET + 1),
+            row(PERIOD_START + 300, CURRENT_RESET + 1),
+        ];
+
+        let canonical = canonicalize_public_history_samples(&samples);
+        let projected = authoritative_history_projection_samples(
+            &canonical,
+            Some(CURRENT_RESET),
+            CURRENT_RESET - PERIOD_START,
+            OBSERVED_AT,
+        );
+        let periods =
+            super::history_periods_for_samples(&projected, OBSERVED_AT, Some(CURRENT_RESET));
+        assert_eq!(
+            periods
+                .iter()
+                .filter(|period| {
+                    period.canonical_reset_at.abs_diff(CURRENT_RESET)
+                        <= super::RESET_AT_TOLERANCE_SECONDS as u64
+                })
+                .count(),
+            1,
+            "same-cycle aliases split by a bad reset must not become separate periods"
+        );
+        assert_eq!(
+            periods
+                .iter()
+                .filter(|period| period.end == OBSERVED_AT)
+                .count(),
+            1,
+            "only the nearest reset alias may receive current-period bounds"
+        );
+        assert_eq!(
+            current_history_period_reset(&periods, Some(CURRENT_RESET), OBSERVED_AT),
+            Some(CURRENT_RESET + 1)
+        );
+    }
+
+    #[test]
+    fn stale_reset_reappearance_does_not_join_across_multiple_periods() {
+        const BASE: i64 = 1_800_000_000;
+        const OLD_RESET: i64 = BASE + 10_000;
+        const MIDDLE_RESET: i64 = BASE + 20_000;
+        const CURRENT_RESET: i64 = BASE + 30_000;
+        let row = |timestamp, reset_at| {
+            UsageHistorySample::new_with_usage(
+                timestamp,
+                reset_at,
+                50.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals::default(),
+            )
+        };
+        let stale_start = BASE + 360;
+        let samples = vec![
+            row(BASE, OLD_RESET),
+            row(BASE + 60, OLD_RESET),
+            row(BASE + 120, MIDDLE_RESET),
+            row(BASE + 180, MIDDLE_RESET),
+            row(BASE + 240, CURRENT_RESET + 2),
+            row(BASE + 300, CURRENT_RESET + 2),
+            // A stale old reset briefly reappears inside the current cycle.
+            row(stale_start, OLD_RESET),
+            row(BASE + 420, OLD_RESET),
+            row(BASE + 480, CURRENT_RESET + 1),
+            row(BASE + 540, CURRENT_RESET + 1),
+        ];
+
+        let canonical = canonicalize_public_history_samples(&samples);
+        assert!(canonical
+            .iter()
+            .any(|sample| sample.timestamp == BASE && sample.reset_at == OLD_RESET));
+        assert!(canonical.iter().all(|sample| !(stale_start..=BASE + 420)
+            .contains(&sample.timestamp)
+            || sample.reset_at != OLD_RESET));
+
+        let periods = super::history_periods_for_samples(&canonical, BASE + 600, None);
+        for sample in &canonical {
+            assert_eq!(
+                periods
+                    .iter()
+                    .filter(|period| {
+                        sample.reset_at >= period.canonical_reset_at.saturating_sub(60)
+                            && sample.reset_at <= period.canonical_reset_at
+                            && sample.timestamp >= period.start
+                            && sample.timestamp <= period.end
+                    })
+                    .count(),
+                1,
+                "every projected sample must have exactly one period"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_moving_reset_outage_does_not_split_continuing_fixed_cycle() {
+        const BASE: i64 = 1_786_684_680;
+        const STABLE_RESET: i64 = 1_787_196_898;
+        const MOVING_RESET: i64 = 1_787_289_647;
+        let stable = |offset, percent, tokens| {
+            UsageHistorySample::new_with_usage(
+                BASE + offset,
+                STABLE_RESET,
+                percent,
+                ModelDollarTotals {
+                    sol: tokens as f64 / 1_000_000.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: tokens,
+                    ..ModelTokenTotals::default()
+                },
+            )
+        };
+        let moving = |offset, reset_offset| {
+            UsageHistorySample::new_with_usage(
+                BASE + offset,
+                MOVING_RESET + reset_offset,
+                100.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals::default(),
+            )
+        };
+        let rows = vec![
+            stable(0, 70.0, 250_673_322),
+            stable(60, 70.0, 250_831_654),
+            stable(120, -1.0, 251_162_025),
+            moving(120, 0),
+            stable(180, -1.0, 251_387_986),
+            moving(180, 61),
+            stable(240, -1.0, 251_489_043),
+            moving(240, 121),
+            moving(300, 181),
+            stable(360, 69.0, 252_176_217),
+            stable(420, 69.0, 252_392_369),
+        ];
+
+        let canonical = canonicalize_public_history_samples(&rows);
+
+        assert!(canonical
+            .iter()
+            .all(|sample| sample.reset_at == STABLE_RESET));
+        assert_eq!(canonical.first().map(|sample| sample.timestamp), Some(BASE));
+        assert_eq!(
+            canonical.last().map(|sample| sample.timestamp),
+            Some(BASE + 420)
+        );
     }
 
     #[test]
@@ -34181,9 +34865,8 @@ mod tests {
             .iter()
             .any(|period| period.canonical_reset_at == old_reset));
 
-        let candidate = state.public_details_candidate_at(observed_at).unwrap();
-        let candidate_v2 = state.public_details_v2_candidate_at(observed_at).unwrap();
-        let candidate_v3 = state.public_details_v3_candidate_at(observed_at).unwrap();
+        let (candidate, candidate_v2, candidate_v3) =
+            state.public_details_candidates_at(observed_at);
         assert_eq!(candidate_v2.to_v1_projection(), candidate);
         assert!(!candidate.history_samples.iter().any(|sample| {
             sample.reset_at == canonical_reset && sample.timestamp == early_timestamp
@@ -34373,9 +35056,7 @@ mod tests {
             assert_eq!(history.samples_for_reset(Some(reset_at)).len(), 1);
         }
         assert_eq!(
-            canonicalize_public_history_samples(&history.samples)
-                .unwrap()
-                .len(),
+            canonicalize_public_history_samples(&history.samples).len(),
             history.samples.len()
         );
     }
@@ -35004,7 +35685,7 @@ mod tests {
     #[test]
     fn public_history_gap_uses_the_periods_canonical_reset_on_the_wire() {
         let mut state = CodexInfoState::preview("normal");
-        let initial = state.public_details_v3_candidate().unwrap();
+        let initial = state.public_details_candidates().2;
         let period = initial
             .history_periods
             .iter()
@@ -35019,7 +35700,7 @@ mod tests {
             reason: "daemon_stop_unrecoverable".into(),
         }];
 
-        let published = state.public_details_v3_candidate().unwrap();
+        let published = state.public_details_candidates().2;
 
         assert_eq!(published.history_gaps.len(), 1);
         assert_eq!(published.history_gaps[0].reset_at, period.reset_at);
@@ -35303,7 +35984,7 @@ mod tests {
                 "drift={drift}"
             );
             assert_eq!(
-                canonicalize_public_history_samples(&history.samples).unwrap(),
+                canonicalize_public_history_samples(&history.samples),
                 expected,
                 "drift={drift}"
             );
@@ -37134,9 +37815,7 @@ mod tests {
                     model_totals_complete: complete,
                 });
         }
-        let details = producer
-            .public_details_v3_candidate_at(observed_at)
-            .unwrap();
+        let details = producer.public_details_candidates_at(observed_at).2;
         let historical = details
             .history_periods
             .iter()
