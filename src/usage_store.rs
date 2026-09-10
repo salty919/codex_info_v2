@@ -1440,6 +1440,12 @@ fn model_total_reset_is_proven(baseline: &SessionModelTotal, observed: &SessionM
     }
 }
 
+fn cumulative_model_totals_are_complete(totals: &[SessionModelTotal]) -> bool {
+    totals
+        .iter()
+        .all(|total| total.cache_write_input_tokens.is_some())
+}
+
 fn model_totals_dominate(left: &[SessionModelTotal], right: &[SessionModelTotal]) -> bool {
     let left = left
         .iter()
@@ -1622,6 +1628,11 @@ pub fn reconcile_rejected_generation_model_totals(
 ) -> Result<Option<Vec<SessionModelTotal>>> {
     let canonical = canonicalize_model_totals(canonical)?;
     let rejected = canonicalize_model_totals(rejected)?;
+    if !cumulative_model_totals_are_complete(&canonical)
+        || !cumulative_model_totals_are_complete(&rejected)
+    {
+        return Ok(None);
+    }
     let canonical_by_model = canonical
         .iter()
         .map(|total| (total.model.as_str(), total))
@@ -1800,6 +1811,10 @@ fn validate_cumulative_recovery(
         || offset.is_empty()
         || first.is_empty()
         || current.is_empty()
+        || !cumulative_model_totals_are_complete(&before)
+        || !cumulative_model_totals_are_complete(&offset)
+        || !cumulative_model_totals_are_complete(&first)
+        || !cumulative_model_totals_are_complete(&current)
         || !offset.iter().any(|total| {
             total.total_tokens > 0
                 || total.input_tokens > 0
@@ -1894,6 +1909,7 @@ fn cumulative_recovery_point_from_storage(
     }
     let model_totals = canonicalize_model_totals(&model_totals)?;
     if model_totals.is_empty()
+        || !cumulative_model_totals_are_complete(&model_totals)
         || [sol_dollars, terra_dollars, luna_dollars]
             .into_iter()
             .any(|value| !value.is_finite() || value < 0.0)
@@ -1945,7 +1961,11 @@ fn validate_cumulative_recovery_storage_evidence(
             "cumulative recovery raw evidence changed".into(),
         ));
     }
-    for timestamp in [recovery.before_timestamp, recovery.first_timestamp] {
+    for timestamp in [
+        recovery.before_timestamp,
+        recovery.first_timestamp,
+        recovery.through_timestamp,
+    ] {
         let count: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM usage_history WHERE timestamp=?1",
             [timestamp],
@@ -1974,6 +1994,7 @@ fn validate_cumulative_recovery_source_generation(
         || !source.remaining_percent.is_finite()
         || !(0.0..=100.0).contains(&source.remaining_percent)
         || source_models != source.model_totals
+        || !cumulative_model_totals_are_complete(&source_models)
     {
         return Err(UsageStoreError::InvalidImport(
             "cumulative recovery source generation is invalid".into(),
@@ -2233,7 +2254,9 @@ pub fn derive_session_cumulative_recovery(
         return Ok(None);
     }
     let current_model_totals = canonicalize_model_totals(current_model_totals)?;
-    if current_model_totals.is_empty() {
+    if current_model_totals.is_empty()
+        || !cumulative_model_totals_are_complete(&current_model_totals)
+    {
         return Ok(None);
     }
     let period_start = canonical_reset_at
@@ -2255,10 +2278,12 @@ pub fn derive_session_cumulative_recovery(
             continue;
         };
         let totals = canonicalize_model_totals(totals)?;
-        if totals.is_empty()
-            || [sol_dollars, terra_dollars, luna_dollars]
-                .into_iter()
-                .any(|value| !value.is_finite() || value < 0.0)
+        if totals.is_empty() || !cumulative_model_totals_are_complete(&totals) {
+            return Ok(None);
+        }
+        if [sol_dollars, terra_dollars, luna_dollars]
+            .into_iter()
+            .any(|value| !value.is_finite() || value < 0.0)
         {
             continue;
         }
@@ -11320,6 +11345,29 @@ mod wave_b_correction_tests {
             55
         );
 
+        for partial_index in 0..observations.len() {
+            let mut partial = observations.clone();
+            partial[partial_index].model_totals.as_mut().unwrap()[0].cache_write_input_tokens =
+                None;
+            let partial_current = partial
+                .last()
+                .and_then(|observation| observation.model_totals.clone())
+                .unwrap();
+            assert!(
+                derive_session_cumulative_recovery(
+                    &partition_id,
+                    reset_a,
+                    604_800,
+                    1_788_996_001,
+                    &partial_current,
+                    &partial,
+                )
+                .unwrap()
+                .is_none(),
+                "a missing component at recovery point {partial_index} is not exact evidence"
+            );
+        }
+
         let path = database_path("cumulative-recovery-selective-model");
         let identity = StoragePartitionIdentity {
             schema_version: "codex-info-account-db-v1".into(),
@@ -11624,6 +11672,25 @@ mod wave_b_correction_tests {
         .unwrap();
         let raw_before = raw_cumulative_history_fingerprint(&store);
 
+        let mut incomplete = recovery.clone();
+        for totals in [
+            &mut incomplete.before_model_totals,
+            &mut incomplete.offset_model_totals,
+            &mut incomplete.first_model_totals,
+            &mut incomplete.source_current_model_totals,
+        ] {
+            for total in totals {
+                total.cache_write_input_tokens = None;
+            }
+        }
+        let incomplete_payload =
+            cumulative_recovery_payload(&identity.partition_id, &incomplete).unwrap();
+        incomplete.recovery_id = format!("{:x}", Sha256::digest(incomplete_payload.as_bytes()));
+        assert!(
+            validate_cumulative_recovery(&identity.partition_id, &incomplete).is_err(),
+            "a recovery payload with a missing component must fail validation"
+        );
+
         let mut invalid = recovery.clone();
         invalid.first_timestamp += 1;
         let invalid_commit = store.commit_session_collection_with_cumulative_recovery(
@@ -11660,6 +11727,54 @@ mod wave_b_correction_tests {
                 .unwrap(),
             0
         );
+        assert_eq!(raw_cumulative_history_fingerprint(&store), raw_before);
+
+        store
+            .connection
+            .execute(
+                "INSERT INTO usage_history (
+                    timestamp, reset_at, remaining_percent, sol_dollars,
+                    terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+                 )
+                 SELECT timestamp, ?1, remaining_percent, sol_dollars,
+                        terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+                 FROM usage_history WHERE reset_at=?2 AND timestamp=?3",
+                params![reset_a + 120, reset_a, endpoint.timestamp],
+            )
+            .unwrap();
+        let through_conflict = store.commit_session_collection_with_cumulative_recovery(
+            SessionCollectionCommit {
+                reset_at: reset_a,
+                window_seconds: 604_800,
+                collector_epoch,
+                cycle_seq: 4,
+                samples: &[],
+                checkpoints: &[],
+                ranges: &[],
+                model_totals: &corrected,
+                recorded_sessions: &[],
+            },
+            &[],
+            &recovery,
+        );
+        assert!(
+            through_conflict.is_err(),
+            "a conflicting reset alias at the recovery endpoint must reject only the recovery"
+        );
+        assert_eq!(
+            store
+                .load_session_collection_state()
+                .unwrap()
+                .data_generation,
+            3
+        );
+        store
+            .connection
+            .execute(
+                "DELETE FROM usage_history WHERE reset_at=?1 AND timestamp=?2",
+                params![reset_a + 120, endpoint.timestamp],
+            )
+            .unwrap();
         assert_eq!(raw_cumulative_history_fingerprint(&store), raw_before);
 
         let committed = store
@@ -12003,42 +12118,30 @@ mod wave_b_correction_tests {
             "gate must target the live period"
         );
 
-        let direct_recovery = store
-            .pending_session_cumulative_recovery(
-                state_before.reset_at,
-                state_before.window_seconds,
-                now,
-                &state_before.model_totals,
-            )
-            .unwrap();
-        let (canonical_state, recovery) = if let Some(recovery) = direct_recovery {
-            (state_before.clone(), recovery)
-        } else {
-            let mut retained = Vec::new();
-            for generation in 1..=3 {
-                let retained_path = source_path.with_extension(format!("sqlite3.bak.{generation}"));
-                match fs::symlink_metadata(&retained_path) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => panic!("inspect retained generation: {error}"),
-                    Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-                        panic!("retained generation is not a regular file")
-                    }
-                    Ok(_) => {}
+        let mut retained = Vec::new();
+        for generation in 1..=3 {
+            let retained_path = source_path.with_extension(format!("sqlite3.bak.{generation}"));
+            match fs::symlink_metadata(&retained_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("inspect retained generation: {error}"),
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    panic!("retained generation is not a regular file")
                 }
-                let retained_store =
-                    UsageStore::open_read_only_partitioned(&retained_path, &identity)
-                        .expect("open retained generation read-only");
-                retained_store
-                    .verify_integrity()
-                    .expect("retained generation passes SQLite integrity check");
-                retained.push(
-                    retained_store
-                        .load_session_collection_state()
-                        .expect("load retained collection state"),
-                );
+                Ok(_) => {}
             }
-            let canonical = select_predeadline_quota_authority(&state_before, &retained)
-                .expect("one retained live period rejects the premature current generation");
+            let retained_store = UsageStore::open_read_only_partitioned(&retained_path, &identity)
+                .expect("open retained generation read-only");
+            retained_store
+                .verify_integrity()
+                .expect("retained generation passes SQLite integrity check");
+            retained.push(
+                retained_store
+                    .load_session_collection_state()
+                    .expect("load retained collection state"),
+            );
+        }
+        let retained_authority = select_predeadline_quota_authority(&state_before, &retained);
+        let (canonical_state, recovery) = if let Some(canonical) = retained_authority {
             let canonical_models = store
                 .latest_raw_session_model_totals_for_period(canonical.reset_at, now)
                 .unwrap()
@@ -12053,6 +12156,17 @@ mod wave_b_correction_tests {
                 .unwrap()
                 .expect("retained A→B→A regression has one source-proven recovery");
             (canonical, recovery)
+        } else {
+            let recovery = store
+                .pending_session_cumulative_recovery(
+                    state_before.reset_at,
+                    state_before.window_seconds,
+                    now,
+                    &state_before.model_totals,
+                )
+                .unwrap()
+                .expect("current period has one source-proven recovery");
+            (state_before.clone(), recovery)
         };
         let baseline_sol = recovery
             .offset_model_totals
