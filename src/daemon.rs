@@ -900,19 +900,6 @@ pub(crate) fn current_daemon_owner_identity() -> Option<DaemonOwnerIdentity> {
         })
 }
 
-/// Resolve the validated service port only when this exact owner process is
-/// still current. Recorder ownership itself does not depend on CLI arguments.
-pub(crate) fn daemon_owner_port(owner: &DaemonOwnerIdentity) -> Option<u16> {
-    let process = process_identity(owner.pid)?;
-    if process.starttime_ticks != owner.starttime_ticks
-        || process.executable_device != owner.executable_device
-        || process.executable_inode != owner.executable_inode
-    {
-        return None;
-    }
-    process_is_known_codex(&process)
-}
-
 /// Return only the PID from a complete, current recorder lock identity.
 /// Callers use this to distinguish the service child they own from a
 /// concurrently-started winner; malformed, stale, or replaced locks are not
@@ -1320,9 +1307,6 @@ enum RecorderCommand {
         now: chrono::DateTime<chrono::Utc>,
         completed: mpsc::SyncSender<Result<(), String>>,
     },
-    Deactivate {
-        completed: mpsc::SyncSender<Result<(), String>>,
-    },
     Store {
         partition_id: String,
         generation: RecorderGeneration,
@@ -1332,11 +1316,6 @@ enum RecorderCommand {
         partition_id: String,
         recorded_sessions: Vec<RecordedSessionSource>,
         committed: mpsc::SyncSender<Result<(), String>>,
-    },
-    BeginGap {
-        partition_id: String,
-        gap: RecorderGap,
-        completed: mpsc::SyncSender<Result<(), String>>,
     },
     Shutdown,
 }
@@ -1663,22 +1642,6 @@ impl RecorderWorker {
                                 }
                             }
                         }
-                        RecorderCommand::Deactivate { completed } => {
-                            active = None;
-                            let result = persist_recorder_state(
-                                &_lock,
-                                &recorder_state_for_lock(
-                                    &_lock,
-                                    RecorderWriteState::IdleNoAccount,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                ),
-                            );
-                            let _ = completed.send(result);
-                        }
                         RecorderCommand::Store {
                             partition_id,
                             generation,
@@ -1972,30 +1935,6 @@ impl RecorderWorker {
                                 });
                             let _ = committed.send(result);
                         }
-                        RecorderCommand::BeginGap {
-                            partition_id,
-                            gap,
-                            completed,
-                        } => {
-                            let result = active
-                                .as_mut()
-                                .filter(|current| current.partition.partition_id == partition_id)
-                                .ok_or_else(|| {
-                                    "recorder account partition is not active".to_owned()
-                                })
-                                .and_then(|current| {
-                                    if gap.partition_id != current.partition.partition_id {
-                                        return Err(
-                                            "recorder gap account partition mismatch".to_owned(),
-                                        );
-                                    }
-                                    current
-                                        .store
-                                        .begin_recorder_gap(&gap)
-                                        .map_err(|error| error.to_string())
-                                });
-                            let _ = completed.send(result);
-                        }
                     }
                 }
             })
@@ -2072,20 +2011,6 @@ impl RecorderWorker {
             .map_err(|_| DaemonError::Runtime.to_string())?
     }
 
-    pub(crate) fn deactivate_partition(&self) -> Result<(), String> {
-        let commands = self
-            .commands
-            .as_ref()
-            .ok_or_else(|| DaemonError::Runtime.to_string())?;
-        let (completed, receiver) = mpsc::sync_channel(1);
-        commands
-            .send(RecorderCommand::Deactivate { completed })
-            .map_err(|_| DaemonError::Runtime.to_string())?;
-        receiver
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| DaemonError::Runtime.to_string())?
-    }
-
     /// Commit usage rows and the exact source markers that authorize later
     /// cleanup in one SQLite transaction.
     pub(crate) fn store_generation(
@@ -2153,27 +2078,6 @@ impl RecorderWorker {
                 partition_id,
                 recorded_sessions,
                 committed,
-            })
-            .map_err(|_| DaemonError::Runtime.to_string())?;
-        receiver
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| DaemonError::Runtime.to_string())?
-    }
-
-    /// Persist a pending interval before releasing the resident owner.  The
-    /// interval remains non-public until a later source-rescan caller proves
-    /// recovery or an explicit source authority confirms it unrecoverable.
-    pub(crate) fn begin_gap(&self, partition_id: String, gap: RecorderGap) -> Result<(), String> {
-        let commands = self
-            .commands
-            .as_ref()
-            .ok_or_else(|| DaemonError::Runtime.to_string())?;
-        let (completed, receiver) = mpsc::sync_channel(1);
-        commands
-            .send(RecorderCommand::BeginGap {
-                partition_id,
-                gap,
-                completed,
             })
             .map_err(|_| DaemonError::Runtime.to_string())?;
         receiver

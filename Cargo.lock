@@ -734,12 +734,82 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-info-account-locator"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "hex",
+ "hmac",
+ "rustix 0.38.44",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "codex-info-db-reader"
+version = "1.0.48"
+dependencies = [
+ "codex-info-rest-contract",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "codex-info-db-writer"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "rustix 0.38.44",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "codex-info-recorder"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "codex-info-account-locator",
+ "codex-info-db-writer",
+ "getrandom 0.3.4",
+ "rusqlite",
+ "rustix 0.38.44",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "codex-info-rest"
+version = "0.1.0"
+dependencies = [
+ "codex-info-account-locator",
+ "codex-info-db-reader",
+ "codex-info-rest-contract",
+ "rusqlite",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "codex-info-rest-contract"
+version = "1.0.48"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "codex_info"
 version = "1.0.49"
 dependencies = [
  "axum",
  "chrono",
  "chrono-tz",
+ "codex-info-db-writer",
  "fontique",
  "getrandom 0.3.4",
  "hex",

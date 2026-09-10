@@ -2,38 +2,67 @@
 set -euo pipefail
 shopt -s nullglob
 
-# Finite daemon/REST/UI mode acceptance checks. Every case owns a temporary
-# HOME, XDG directories, CODEX_HOME, history database, and loopback ports.
-# No PID outside the case's binary/data scope is ever terminated.
-ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# Finite split-process acceptance.  The recorder is the only process that
+# reads Session files or writes SQLite; REST reads that same database and the
+# UI is an HTTP client.  Every process and mutable input is owned by one
+# temporary case, so cleanup can be identity-checked before sending a signal.
+ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT_DIR"
-
-fail() {
-    echo "record-daemon-e2e: $*" >&2
+ROOT_VERSION="$(awk '
+    /^\[package\]$/ { in_package=1; next }
+    /^\[/ { in_package=0 }
+    in_package && $1 == "version" && $2 == "=" { gsub(/"/, "", $3); print $3; exit }
+' Cargo.toml)"
+[[ "$ROOT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    echo 'record-daemon-e2e: root Cargo.toml package version is unavailable' >&2
     exit 1
 }
 
-for command in awk curl date getconf python3 rg sed sqlite3 ss stat tr; do
+fail() {
+    echo "record-daemon-e2e: $*" >&2
+    if [[ -n "${case_root:-}" && -d "${case_root:-}" ]]; then
+        sed -n '1,120p' "$case_root"/*.log >&2 2>/dev/null || true
+    fi
+    exit 1
+}
+
+for command in awk curl date python3 rg sed sqlite3 ss stat tail tr xwininfo xdpyinfo; do
     command -v "$command" >/dev/null || fail "$command is required"
 done
-BINARY="$ROOT_DIR/target/release/codex_info"
-[[ -x "$BINARY" ]] || fail "build target/release/codex_info first"
 
+RECORDER_BINARY="$ROOT_DIR/target/release/codex_info_recorder"
+REST_BINARY="$ROOT_DIR/target/release/codex_info_rest"
+UI_BINARY="$ROOT_DIR/target/release/codex_info"
+for binary in "$RECORDER_BINARY" "$REST_BINARY" "$UI_BINARY"; do
+    [[ -f "$binary" && -x "$binary" ]] || fail "build executable first: $binary"
+done
+
+[[ -n "${DISPLAY:-}" ]] || fail 'DISPLAY is required for the client-only UI case'
+xdpyinfo >/dev/null 2>&1 || fail 'X11 display is unavailable for the client-only UI case'
+
+RECORDER_UNIT="$ROOT_DIR/packaging/codex-info-recorder.service"
+REST_UNIT="$ROOT_DIR/packaging/codex-info-rest.service"
+[[ -f "$RECORDER_UNIT" ]] || fail "missing unit: $RECORDER_UNIT"
+[[ -f "$REST_UNIT" ]] || fail "missing unit: $REST_UNIT"
 for contract in \
-    'ExecStart=%h/.local/bin/codex_info --port 8787' \
+    'ExecStart=%h/.local/bin/codex_info_recorder' \
     'Restart=always' \
     'RestartSec=5s' \
     'StartLimitIntervalSec=0' \
     'NoNewPrivileges=true'; do
-    rg -q --fixed-strings -- "$contract" packaging/codex-info.service \
-        || fail "service contract missing: $contract"
+    rg -q --fixed-strings -- "$contract" "$RECORDER_UNIT" \
+        || fail "recorder unit contract missing: $contract"
 done
-if rg -q '^StartLimitBurst=' packaging/codex-info.service; then
-    fail 'StartLimitBurst can permanently suppress recorder recovery'
-fi
-if rg -q '^PrivateTmp=true$' packaging/codex-info.service; then
-    fail 'PrivateTmp=true hides live Codex /proc state from the Threads snapshot'
-fi
+for contract in \
+    'ExecStart=%h/.local/bin/codex_info_rest --port 8787' \
+    'Restart=always' \
+    'RestartSec=5s' \
+    'NoNewPrivileges=true'; do
+    rg -q --fixed-strings -- "$contract" "$REST_UNIT" \
+        || fail "REST unit contract missing: $contract"
+done
+rg -q --fixed-strings -- 'After=default.target codex-info-recorder.service' "$REST_UNIT" \
+    || fail 'REST unit does not follow the recorder unit'
 
 temp_parent="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
 temp_parent="$(cd -- "$temp_parent" 2>/dev/null && pwd -P)" \
@@ -41,20 +70,20 @@ temp_parent="$(cd -- "$temp_parent" 2>/dev/null && pwd -P)" \
 case "$temp_parent/" in
     "$ROOT_DIR/"*) fail 'temporary acceptance data must stay outside the repository' ;;
 esac
-tmp_root="$(mktemp -d "$temp_parent/codex-info-daemon-e2e.XXXXXX")"
+tmp_root="$(mktemp -d "$temp_parent/codex-info-recorder-rest-e2e.XXXXXX")"
 case_root=""
-case_data=""
 case_home=""
-case_port=""
-case_alt_port=""
-case_lock=""
+case_data=""
 case_db=""
-case_label=""
+sessions_root=""
+session_file=""
+case_port=""
 common_env=()
-service_pid=""
+recorder_pid=""
+rest_pid=""
 ui_pid=""
-hold_count=0
-port_seed=$((30000 + ($$ % 10000)))
+sentinel_pid=""
+port_seed=$((35000 + (BASHPID % 10000)))
 
 listener_count() {
     local port="$1"
@@ -62,19 +91,15 @@ listener_count() {
         | awk '$1 == "LISTEN" { count += 1 } END { print count + 0 }'
 }
 
-reserve_ports() {
-    local candidate
+reserve_port() {
     while ((port_seed < 60000)); do
-        candidate="$port_seed"
-        port_seed=$((port_seed + 3))
-        if [[ "$(listener_count "$candidate")" == 0 \
-            && "$(listener_count "$((candidate + 1))")" == 0 ]]; then
-            case_port="$candidate"
-            case_alt_port="$((candidate + 1))"
-            return
+        case_port="$port_seed"
+        port_seed=$((port_seed + 1))
+        if [[ "$(listener_count "$case_port")" == 0 ]]; then
+            return 0
         fi
     done
-    fail 'could not find two unused loopback ports'
+    fail 'could not find an unused loopback port'
 }
 
 process_env_contains() {
@@ -90,20 +115,27 @@ process_cmdline() {
 }
 
 process_matches_scope() {
-    local pid="$1" kind="$2" cmdline
+    local pid="$1" kind="$2" cmdline exe
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     [[ -e "/proc/$pid" ]] || return 1
-    [[ "$(readlink "/proc/$pid/exe" 2>/dev/null || true)" == "$BINARY" ]] \
-        || return 1
+    exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
     process_env_contains "$pid" "CODEX_INFO_DATA_DIR=$case_data" || return 1
     cmdline="$(process_cmdline "$pid")"
     case "$kind" in
-        service)
-            [[ "$cmdline" == *"--port $case_port"* \
-                && "$cmdline" != *"--ui"* ]]
+        recorder)
+            [[ "$exe" == "$RECORDER_BINARY" ]] \
+                && [[ "$cmdline" == *"--sessions-root $sessions_root"* ]] \
+                && [[ "$cmdline" == *"--interval-secs 1"* ]]
+            ;;
+        rest)
+            [[ "$exe" == "$REST_BINARY" ]] \
+                && [[ "$cmdline" == *"--port $case_port"* ]]
             ;;
         ui)
-            [[ "$cmdline" == *"--ui"* ]]
+            [[ "$exe" == "$UI_BINARY" ]] \
+                && [[ "$cmdline" == *"--ui"* ]] \
+                && [[ "$cmdline" == *"--port $case_port"* ]] \
+                && process_env_contains "$pid" 'CODEX_INFO_UI_CLIENT_ONLY=1'
             ;;
         *)
             return 1
@@ -111,40 +143,46 @@ process_matches_scope() {
     esac
 }
 
-find_ui_pids() {
-    local proc pid
+find_scoped_pids() {
+    local kind="$1" proc pid
     for proc in /proc/[0-9]*; do
         [[ -d "$proc" ]] || continue
         pid="${proc##*/}"
-        if process_matches_scope "$pid" ui; then
+        if process_matches_scope "$pid" "$kind"; then
             printf '%s\n' "$pid"
         fi
     done
 }
 
-find_service_pids() {
-    local proc pid
-    for proc in /proc/[0-9]*; do
-        [[ -d "$proc" ]] || continue
-        pid="${proc##*/}"
-        if process_matches_scope "$pid" service; then
-            printf '%s\n' "$pid"
-        fi
-    done
+assert_one_scoped_process() {
+    local kind="$1" expected="$2" label="$3" pids=()
+    mapfile -t pids < <(find_scoped_pids "$kind")
+    [[ "${#pids[@]}" -eq 1 && "${pids[0]}" == "$expected" ]] \
+        || fail "$label: expected only PID $expected, found ${pids[*]:-none}"
+    process_matches_scope "$expected" "$kind" \
+        || fail "$label: PID $expected no longer has its scoped identity"
+}
+
+assert_no_scoped_process() {
+    local kind="$1" label="$2" pids=()
+    mapfile -t pids < <(find_scoped_pids "$kind")
+    [[ "${#pids[@]}" -eq 0 ]] \
+        || fail "$label: scoped process remains (${pids[*]})"
 }
 
 terminate_scoped_pid() {
-    local pid="$1" kind="$2" label="$3" waited
+    local pid="$1" kind="$2" label="$3" waited=0
     [[ -n "$pid" ]] || return 0
     if ! kill -0 "$pid" 2>/dev/null; then
         wait "$pid" 2>/dev/null || true
         return 0
     fi
-    if ! process_matches_scope "$pid" "$kind"; then
-        echo "record-daemon-e2e: refusing to terminate unverified $label PID $pid" >&2
-        return 1
-    fi
+    process_matches_scope "$pid" "$kind" \
+        || fail "refusing to terminate unverified $label PID $pid"
     kill -TERM "$pid" 2>/dev/null || true
+    # These bounded waits are the existing daemon E2E lifecycle budget.  A
+    # forceful signal is sent only while the exact executable/data identity is
+    # still present; a recycled PID is never escalated.
     for _ in $(seq 1 40); do
         if ! kill -0 "$pid" 2>/dev/null; then
             break
@@ -152,8 +190,6 @@ terminate_scoped_pid() {
         sleep 0.1
     done
     if kill -0 "$pid" 2>/dev/null; then
-        # The identity/data/executable checks above constrain this to a child
-        # created by this case. Never escalate a PID that no longer matches.
         if process_matches_scope "$pid" "$kind"; then
             kill -KILL "$pid" 2>/dev/null || true
         fi
@@ -164,85 +200,97 @@ terminate_scoped_pid() {
         fi
         sleep 0.1
     done
-    waited=0
     wait "$pid" 2>/dev/null || waited=$?
     if kill -0 "$pid" 2>/dev/null; then
-        echo "record-daemon-e2e: $label PID $pid did not terminate (status=$waited)" >&2
-        return 1
+        fail "$label PID $pid did not terminate (status=$waited)"
     fi
+    return 0
 }
 
-stop_ui() {
-    local pid pids=()
-    mapfile -t pids < <(find_ui_pids)
-    if [[ "${#pids[@]}" -eq 0 && -n "${ui_pid:-}" ]]; then
-        pids=("$ui_pid")
-    fi
+stop_kind() {
+    local kind="$1" label="$2" pid pids=()
+    mapfile -t pids < <(find_scoped_pids "$kind")
     for pid in "${pids[@]}"; do
-        terminate_scoped_pid "$pid" ui 'UI' || true
+        terminate_scoped_pid "$pid" "$kind" "$label"
     done
-    ui_pid=""
-}
-
-stop_services() {
-    local pids=() pid
-    mapfile -t pids < <(find_service_pids)
-    for pid in "${pids[@]}"; do
-        terminate_scoped_pid "$pid" service 'service' || true
-    done
-    service_pid=""
 }
 
 cleanup() {
-    stop_ui || true
-    stop_services || true
+    set +e
+    if [[ -n "${case_data:-}" ]]; then
+        stop_kind ui UI >/dev/null 2>&1 || true
+        stop_kind rest REST >/dev/null 2>&1 || true
+        stop_kind recorder recorder >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${sentinel_pid:-}" ]] && kill -0 "$sentinel_pid" 2>/dev/null; then
+        kill -TERM "$sentinel_pid" 2>/dev/null || true
+        wait "$sentinel_pid" 2>/dev/null || true
+    fi
     case "$tmp_root" in
-        "$temp_parent"/codex-info-daemon-e2e.*)
-            rm -rf -- "$tmp_root"
-            ;;
-        *)
-            echo "record-daemon-e2e: refusing to clean unexpected path $tmp_root" >&2
-            ;;
+        "$temp_parent"/codex-info-recorder-rest-e2e.*) rm -rf -- "$tmp_root" ;;
+        *) echo "record-daemon-e2e: refusing to clean unexpected path $tmp_root" >&2 ;;
     esac
 }
 trap cleanup EXIT
 
+read_sql() {
+    local query="$1"
+    [[ -f "$case_db" ]] || return 1
+    sqlite3 -batch -readonly -bail -cmd '.timeout 2000' "$case_db" "$query" \
+        2>/dev/null
+}
+
+is_uint() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
 write_fixture() {
-    local auth_file now initial_time reset_at session_dir session
-    session_dir="$case_home/sessions/$(date -u +%Y/%m/%d)"
-    mkdir -p "$session_dir" "$case_data/history"
-    chmod 700 "$case_home"
+    local now minute baseline_time first_time second_time auth_file
+    now="$(date -u +%s)"
+    minute=$((now - now % 60))
+    baseline_time=$((minute - 120))
+    first_time=$((minute - 60))
+    second_time="$minute"
+    mkdir -p "$sessions_root" "$case_data/history"
+    chmod 700 "$case_home" "$case_data"
     auth_file="$case_home/auth.json"
     printf '%s\n' '{"auth_mode":"chatgpt","tokens":{"account_id":"fixture-account-129"}}' \
         >"$auth_file"
     chmod 600 "$auth_file"
-    now="$(date +%s)"
-    reset_at=$((now + 604200))
-    initial_time=$((now - 600))
-    common_env+=("CODEX_INFO_FAKE_RESET_AT=$reset_at")
-    session="$session_dir/daemon-e2e.jsonl"
-    cat >"$session" <<EOF
-{"timestamp":"$(date -u -d "@$initial_time" +%Y-%m-%dT%H:%M:%SZ)","type":"turn_context","model":"gpt-5.6-luna"}
-{"timestamp":"$(date -u -d "@$initial_time" +%Y-%m-%dT%H:%M:%SZ)","type":"token_count","payload":{"info":{"total_token_usage":{"total_tokens":120,"input_tokens":100,"cached_input_tokens":80,"output_tokens":20}}}}
-EOF
-    chmod 600 "$session"
-    printf '{"reset_at":%s,"window_seconds":604800}\n' "$reset_at" \
-        >"$case_data/history/usage_reset_hint.json"
+    session_file="$sessions_root/recorder-rest.jsonl"
+    printf '%s\n' \
+        "{\"type\":\"event_msg\",\"timestamp\":\"$(date -u -d "@$baseline_time" +%Y-%m-%dT%H:%M:%SZ)\",\"payload\":{\"type\":\"turn_context\",\"model\":\"gpt-5.6-luna\"}}" \
+        "{\"type\":\"event_msg\",\"timestamp\":\"$(date -u -d "@$baseline_time" +%Y-%m-%dT%H:%M:%SZ)\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":120,\"input_tokens\":100,\"cached_input_tokens\":80,\"output_tokens\":20}}}}" \
+        >"$session_file"
+    chmod 600 "$session_file"
+    fixture_first_time="$first_time"
+    fixture_second_time="$second_time"
+}
+
+append_session_usage() {
+    local event_time="$1" total="$2" input="$3" cached="$4" output="$5"
+    local timestamp
+    timestamp="$(date -u -d "@$event_time" +%Y-%m-%dT%H:%M:%SZ)"
+    printf '%s\n' \
+        "{\"type\":\"event_msg\",\"timestamp\":\"$timestamp\",\"payload\":{\"type\":\"turn_context\",\"model\":\"gpt-5.6-luna\"}}" \
+        "{\"type\":\"event_msg\",\"timestamp\":\"$timestamp\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":$total,\"input_tokens\":$input,\"cached_input_tokens\":$cached,\"output_tokens\":$output}}}}" \
+        >>"$session_file"
 }
 
 setup_case() {
-    case_label="$1"
-    case_root="$tmp_root/$case_label"
+    case_root="$tmp_root/split-process"
     case_home="$case_root/codex"
     case_data="$case_root/data"
-    case_lock="$case_data/history/usage_record_daemon.lock"
     case_db=""
-    service_pid=""
+    sessions_root="$case_home/sessions"
+    recorder_pid=""
+    rest_pid=""
     ui_pid=""
     mkdir -p "$case_root/home" "$case_root/xdg-config" "$case_root/xdg-data" \
-        "$case_root/xdg-cache" "$case_root/xdg-state" "$case_root/xdg-runtime"
-    chmod 700 "$case_root/xdg-runtime"
-    reserve_ports
+        "$case_root/xdg-cache" "$case_root/xdg-state" "$case_root/xdg-runtime" \
+        "$case_home" "$case_data"
+    chmod 700 "$case_root" "$case_home" "$case_data" "$case_root/xdg-runtime"
+    reserve_port
     common_env=(
         "HOME=$case_root/home"
         "XDG_CONFIG_HOME=$case_root/xdg-config"
@@ -253,222 +301,311 @@ setup_case() {
         "CODEX_HOME=$case_home"
         "CODEX_INFO_DATA_DIR=$case_data"
         "CODEX_INFO_CODEX_BIN=$ROOT_DIR/scripts/fake_codex_app_server.py"
-        "CODEX_INFO_DAEMON_INTERVAL_SECS=5"
+        "CODEX_INFO_DAEMON_INTERVAL_SECS=1"
         "CODEX_INFO_DEBUG=1"
+        "LC_ALL=C"
     )
 }
 
-launch_service() {
+launch_recorder() {
     local log_name="$1"
-    env "${common_env[@]}" "$BINARY" --port "$case_port" \
+    env "${common_env[@]}" "$RECORDER_BINARY" \
+        --sessions-root "$sessions_root" \
+        --interval-secs 1 \
         >"$case_root/$log_name.log" 2>&1 &
-    service_pid="$!"
+    recorder_pid="$!"
 }
 
-launch_managed_service() {
+launch_rest() {
     local log_name="$1"
-    env "${common_env[@]}" CODEX_INFO_SYSTEMD_MANAGED=1 "$BINARY" --port "$case_port" \
+    env "${common_env[@]}" "$REST_BINARY" \
+        --port "$case_port" \
         >"$case_root/$log_name.log" 2>&1 &
-    service_pid="$!"
+    rest_pid="$!"
 }
 
 launch_ui() {
     local log_name="$1"
-    env "${common_env[@]}" \
-        CODEX_INFO_PREVIEW=normal "$BINARY" --ui --port "$case_port" \
+    env "${common_env[@]}" CODEX_INFO_UI_CLIENT_ONLY=1 \
+        "$UI_BINARY" --ui --port "$case_port" \
         >"$case_root/$log_name.log" 2>&1 &
     ui_pid="$!"
 }
 
-launch_client_only_ui() {
-    local log_name="$1"
-    env "${common_env[@]}" \
-        CODEX_INFO_UI_CLIENT_ONLY=1 CODEX_INFO_PREVIEW=normal \
-        "$BINARY" --ui --port "$case_port" \
-        >"$case_root/$log_name.log" 2>&1 &
-    ui_pid="$!"
-}
-
-lock_owner() {
-    [[ -f "$case_lock" ]] || return 1
-    sed -nE 's/.*"pid"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$case_lock"
-}
-
-service_health() {
-    curl --fail --silent --show-error --max-time 1 \
-        "http://127.0.0.1:$case_port/v1/health" >/dev/null 2>&1
-}
-
-wait_for_ready() {
-    for _ in $(seq 1 60); do
-        if [[ -f "$case_lock" ]] && service_health; then
-            return 0
-        fi
-        sleep 0.25
-    done
-    return 1
-}
-
-wait_for_history_value() {
-    local query="$1" minimum="$2" observed="" read_ok=0
-    for _ in $(seq 1 30); do
-        read_ok=0
-        if [[ -f "$case_db" ]]; then
-            if observed="$(sqlite3 "$case_db" "$query" 2>/dev/null)"; then
-                read_ok=1
-            else
-                observed=""
-            fi
-        else
-            observed=""
-        fi
-        if ((read_ok == 1)) && [[ "$observed" =~ ^[0-9]+$ ]] \
-            && ((10#$observed >= minimum)); then
-            printf '%s\n' "$observed"
-            return 0
-        fi
-        sleep 0.5
-    done
-    if [[ "$observed" =~ ^[0-9]+$ ]]; then
-        printf '%s\n' "$observed"
-    else
-        printf '0\n'
-    fi
-    return 1
-}
-
-wait_for_account_baseline() {
+locate_account_partition() {
     local checkpoint_count databases=()
-    for _ in $(seq 1 80); do
+    for _ in $(seq 1 200); do
         databases=("$case_data"/history/accounts/v1/*/epoch-*/usage_history.sqlite3)
         if [[ "${#databases[@]}" -eq 1 ]]; then
             checkpoint_count="$(sqlite3 -batch -bail -cmd '.timeout 2000' \
                 "${databases[0]}" 'SELECT COUNT(*) FROM session_checkpoints;' 2>/dev/null || true)"
             if [[ "$checkpoint_count" =~ ^[0-9]+$ ]] && ((10#$checkpoint_count >= 1)); then
                 case_db="${databases[0]}"
-                return 0
+                break
             fi
+        fi
+        sleep 0.1
+    done
+    [[ -n "$case_db" ]] || {
+        tail -n 80 "$case_root/recorder.log" >&2 || true
+        fail 'recorder did not create a locator-selected account partition'
+    }
+}
+
+valid_collection_snapshot() {
+    local generation="$1" epoch="$2" cycle="$3"
+    is_uint "$generation" && is_uint "$cycle" \
+        && ((10#$generation > 0 && 10#$cycle > 0)) \
+        && [[ "$epoch" =~ ^[0-9a-f]{32}$ ]]
+}
+
+collection_generation_state() {
+    read_sql 'SELECT data_generation || "|" || COALESCE(collector_epoch, "") || "|" || cycle_seq FROM collection_generation WHERE singleton = 1'
+}
+
+matching_range_count() {
+    local epoch="$1" cycle="$2"
+    [[ "$epoch" =~ ^[0-9a-f]{32}$ && "$cycle" =~ ^[0-9]+$ ]] || return 1
+    read_sql "SELECT COUNT(*) FROM session_ranges WHERE collector_epoch='$epoch' AND cycle_seq='$cycle'"
+}
+
+matching_checkpoint_offset() {
+    local epoch="$1" cycle="$2"
+    [[ "$epoch" =~ ^[0-9a-f]{32}$ && "$cycle" =~ ^[0-9]+$ ]] || return 1
+    read_sql "SELECT COALESCE(MAX(committed_offset),0) FROM session_checkpoints WHERE collector_epoch='$epoch' AND cycle_seq='$cycle'"
+}
+
+canonical_model_total() {
+    read_sql 'SELECT COALESCE(SUM(CAST(total_tokens AS INTEGER)),0) FROM session_model_totals'
+}
+
+recorder_projection_snapshot() {
+    local state generation epoch cycle matching_ranges checkpoint total_ranges models
+    state="$(collection_generation_state)" || return 1
+    IFS='|' read -r generation epoch cycle <<<"$state"
+    matching_ranges="$(matching_range_count "$epoch" "$cycle")" || return 1
+    checkpoint="$(matching_checkpoint_offset "$epoch" "$cycle")" || return 1
+    total_ranges="$(read_sql 'SELECT COUNT(*) FROM session_ranges')" || return 1
+    models="$(canonical_model_total)" || return 1
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$generation" "$epoch" "$cycle" "$matching_ranges" "$checkpoint" "$total_ranges" "$models"
+}
+
+wait_for_recorder_generation() {
+    local minimum="$1" require_range="${2:-1}" snapshot="" generation="" epoch="" cycle="" matching_ranges="" checkpoint="" total_ranges="" models=""
+    for _ in $(seq 1 80); do
+        snapshot="$(recorder_projection_snapshot 2>/dev/null || true)"
+        IFS=$'\t' read -r generation epoch cycle matching_ranges checkpoint total_ranges models <<<"$snapshot"
+        if valid_collection_snapshot "$generation" "$epoch" "$cycle" \
+            && is_uint "$matching_ranges" && is_uint "$checkpoint" \
+            && is_uint "$total_ranges" && is_uint "$models" \
+            && ((10#$generation >= minimum && 10#$checkpoint > 0)) \
+            && (( ! require_range || (10#$matching_ranges > 0 && 10#$total_ranges > 0) )); then
+            printf '%s\n' "$snapshot"
+            return 0
+        fi
+        sleep 0.25
+    done
+    printf '%s\n' "${snapshot:-0}"
+    return 1
+}
+
+health_body() {
+    curl --fail --silent --show-error --max-time 1 \
+        "http://127.0.0.1:$case_port/v1/health"
+}
+
+wait_for_rest() {
+    for _ in $(seq 1 60); do
+        if process_matches_scope "$rest_pid" rest \
+            && [[ "$(listener_count "$case_port")" == 1 ]] \
+            && health_body >/dev/null 2>&1; then
+            return 0
         fi
         sleep 0.25
     done
     return 1
 }
 
-require_ready() {
-    if ! wait_for_ready; then
-        sed -n '1,160p' "$case_root"/*.log >&2 2>/dev/null || true
-        fail "$case_label: service did not become ready"
-    fi
-}
-
-require_one_service() {
-    local expected_owner="${1:-}" owner="" pids=() pid
-    for _ in $(seq 1 20); do
-        mapfile -t pids < <(find_service_pids)
-        owner="$(lock_owner 2>/dev/null || true)"
-        if [[ "${#pids[@]}" -eq 1 && -n "$owner" \
-            && "${pids[0]}" == "$owner" \
-            && "$(listener_count "$case_port")" == 1 ]]; then
-            break
-        fi
-        sleep 0.1
-    done
-    [[ "${#pids[@]}" -eq 1 ]] \
-        || fail "$case_label: expected one scoped service process, found ${#pids[@]}"
-    [[ -n "$owner" && "$owner" == "${pids[0]}" ]] \
-        || fail "$case_label: lock owner does not match the sole service process"
-    [[ "$(listener_count "$case_port")" == 1 ]] \
-        || fail "$case_label: expected one listener on $case_port"
-    if [[ -n "$expected_owner" ]]; then
-        [[ "$owner" == "$expected_owner" ]] \
-            || fail "$case_label: service owner changed ($expected_owner -> $owner)"
-    fi
-    service_pid="$owner"
-}
-
-assert_recorder_state() {
-    local expected_state="$1" expected_pid="$2"
-    python3 - "$case_data/history/recorder-state.json" "$expected_state" "$expected_pid" <<'PY'
+assert_health() {
+    local body="$1"
+    python3 - "$body" "$ROOT_VERSION" <<'PY'
 import json
-import os
-import stat
 import sys
 
-path, expected_state, expected_pid = sys.argv[1:]
-with open(path, encoding="utf-8") as handle:
-    value = json.load(handle)
-expected_keys = {
-    "schema", "pid", "process_starttime", "owner_nonce", "write_state",
-    "partition_id_hash", "data_generation", "collector_epoch", "cycle_seq",
-    "last_commit_unix", "updated_at_unix",
-}
-if set(value) != expected_keys:
-    raise SystemExit("recorder-state key set changed")
-if value["schema"] != "codex-info-recorder-state-v1":
-    raise SystemExit("recorder-state schema changed")
-if value["pid"] != int(expected_pid) or value["write_state"] != expected_state:
-    raise SystemExit("recorder-state owner/state mismatch")
-if not isinstance(value["process_starttime"], int) or value["process_starttime"] <= 0:
-    raise SystemExit("recorder-state process identity is invalid")
-if not isinstance(value["owner_nonce"], str) or len(value["owner_nonce"]) != 32 \
-        or any(char not in "0123456789abcdef" for char in value["owner_nonce"]):
-    raise SystemExit("recorder-state owner nonce is invalid")
-if not isinstance(value["updated_at_unix"], int) or value["updated_at_unix"] <= 0:
-    raise SystemExit("recorder-state updated_at_unix is invalid")
-if expected_state == "ready":
-    if not isinstance(value["partition_id_hash"], str) or len(value["partition_id_hash"]) != 64:
-        raise SystemExit("ready recorder-state partition hash is invalid")
-    if not isinstance(value["data_generation"], int) or value["data_generation"] <= 0:
-        raise SystemExit("ready recorder-state generation is invalid")
-    if not isinstance(value["collector_epoch"], str) or len(value["collector_epoch"]) != 32:
-        raise SystemExit("ready recorder-state collector epoch is invalid")
-    if not isinstance(value["cycle_seq"], int) or value["cycle_seq"] <= 0:
-        raise SystemExit("ready recorder-state cycle is invalid")
-    if not isinstance(value["last_commit_unix"], int) or value["last_commit_unix"] <= 0:
-        raise SystemExit("ready recorder-state commit time is invalid")
-elif expected_state == "idle_no_account":
-    if any(value[key] is not None for key in (
-        "partition_id_hash", "data_generation", "collector_epoch",
-        "cycle_seq", "last_commit_unix",
-    )):
-        raise SystemExit("idle recorder-state carries commit fields")
-else:
-    raise SystemExit("unexpected recorder-state test state")
-if (stat.S_IMODE(os.stat(path).st_mode) != 0o600):
-    raise SystemExit("recorder-state is not owner-private")
+document = json.loads(sys.argv[1])
+root_version = sys.argv[2]
+if set(document) != {"api_version", "service", "product_version"}:
+    raise SystemExit("REST health key set changed")
+if (document["api_version"] != "v1" or document["service"] != "codex-info"
+        or document["product_version"] != root_version):
+    raise SystemExit("REST health identity changed")
+if not isinstance(document["product_version"], str) or not document["product_version"]:
+    raise SystemExit("REST health product version is empty")
 PY
 }
 
-require_no_service() {
-    local pids=()
-    [[ ! -e "$case_lock" ]] \
-        || fail "$case_label: recorder lock remains unexpectedly"
-    mapfile -t pids < <(find_service_pids)
-    [[ "${#pids[@]}" -eq 0 ]] \
-        || fail "$case_label: scoped service process remains (${pids[*]})"
-    [[ "$(listener_count "$case_port")" == 0 \
-        && "$(listener_count "$case_alt_port")" == 0 ]] \
-        || fail "$case_label: REST listener remains unexpectedly"
+assert_details_file() {
+    local path="$1"
+    python3 - "$path" <<'PY'
+import json
+import sys
+
+document = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = {
+    "api_version", "state", "observed_at", "authenticated", "plan_label", "quota",
+    "models", "active_thread_count", "history_periods", "history_samples",
+    "history_gaps", "threads", "estimated_cost_label",
+}
+if set(document) != expected or document["api_version"] != "v1":
+    raise SystemExit("REST details wire contract changed")
+if document["state"] != "ready" or document["authenticated"] is not True:
+    raise SystemExit("REST details are not an authenticated ready snapshot")
+if not isinstance(document["observed_at"], int) or document["observed_at"] <= 0:
+    raise SystemExit("REST details observed_at is empty")
+
+quota = document["quota"]
+if not isinstance(quota, dict) or set(quota) != {
+    "remaining_percent", "reset_at", "window_seconds", "monthly",
+}:
+    raise SystemExit("REST details quota is missing")
+if not isinstance(quota["remaining_percent"], (int, float)) \
+        or not 0 <= quota["remaining_percent"] <= 100 \
+        or not isinstance(quota["reset_at"], int) or quota["reset_at"] <= 0 \
+        or not isinstance(quota["window_seconds"], int) or quota["window_seconds"] <= 0:
+    raise SystemExit("REST details quota is invalid")
+
+history = document["history_samples"]
+if not isinstance(history, list) or not history:
+    raise SystemExit("REST details history_samples is empty")
+if not any(sample.get("remaining_percent") is not None for sample in history):
+    raise SystemExit("REST details has no quota-backed history sample")
+
+models = document["models"]
+if not isinstance(models, list) or not models:
+    raise SystemExit("REST details models is empty")
+if not any(
+    isinstance(model.get("name"), str) and model["name"]
+    and (model.get("input_tokens", 0) + model.get("output_tokens", 0)) > 0
+    for model in models
+):
+    raise SystemExit("REST details contains no non-zero model usage")
+PY
 }
 
-stop_current_service() {
-    local owner=""
-    owner="$(lock_owner 2>/dev/null || true)"
-    if [[ -n "$owner" ]]; then
-        terminate_scoped_pid "$owner" service 'service' || true
-    fi
-    stop_services
+fetch_details() {
+    local path="$1"
+    curl --fail --silent --show-error --max-time 1 \
+        "http://127.0.0.1:$case_port/v1/details" >"$path"
+    assert_details_file "$path"
+}
+
+assert_details_matches_sqlite() {
+    local path="$1" quota_row="" max_luna_tokens="" model_total=""
+    quota_row="$(read_sql 'SELECT timestamp || "|" || reset_at || "|" || remaining_percent FROM usage_history WHERE remaining_percent IS NOT NULL ORDER BY timestamp DESC, reset_at DESC LIMIT 1' 2>/dev/null || true)"
+    max_luna_tokens="$(read_sql 'SELECT COALESCE(MAX(luna_tokens),0) FROM usage_history' 2>/dev/null || true)"
+    model_total="$(canonical_model_total 2>/dev/null || true)"
+    is_uint "$max_luna_tokens" || fail 'luna token total is not readable from the same SQLite database'
+    is_uint "$model_total" || fail 'recorder model total is not readable from the same SQLite database'
+    [[ -n "$quota_row" ]] || fail 'usage_history has no SQLite quota row for REST read-back'
+    python3 - "$path" "$quota_row" "$max_luna_tokens" "$model_total" <<'PY'
+import json
+import sys
+
+details = json.load(open(sys.argv[1], encoding="utf-8"))
+raw = sys.argv[2].split("|", 2)
+if len(raw) != 3:
+    raise SystemExit("SQLite usage_history quota row is malformed")
+timestamp, reset_at, remaining = raw
+timestamp = int(timestamp)
+reset_at = int(reset_at)
+remaining = float(remaining)
+quota = details["quota"]
+if abs(float(quota["remaining_percent"]) - remaining) >= 1e-9:
+    raise SystemExit("REST quota lost the SQLite quota observation")
+if abs(int(quota["reset_at"]) - reset_at) > 60:
+    raise SystemExit("REST quota lost the SQLite reset boundary")
+max_luna_tokens = int(sys.argv[3])
+if max_luna_tokens > 0 and max(
+    int(row["luna_tokens"]) for row in details["history_samples"]
+) < max_luna_tokens:
+    raise SystemExit("REST history lost SQLite token usage")
+
+expected_model_total = int(sys.argv[4])
+observed_model_total = sum(
+    int(model["input_tokens"]) + int(model.get("cached_input_tokens", 0))
+    + int(model["output_tokens"])
+    for model in details["models"]
+)
+if observed_model_total < expected_model_total:
+    raise SystemExit("REST models lost recorder SQLite token usage")
+PY
+}
+
+assert_model_growth() {
+    local before="$1" after="$2"
+    python3 - "$before" "$after" <<'PY'
+import json
+import sys
+
+before = json.load(open(sys.argv[1], encoding="utf-8"))
+after = json.load(open(sys.argv[2], encoding="utf-8"))
+old = {
+    model["name"]: int(model["input_tokens"]) + int(model["output_tokens"])
+    for model in before["models"]
+}
+new = {
+    model["name"]: int(model["input_tokens"]) + int(model["output_tokens"])
+    for model in after["models"]
+}
+if not any(name in old and total > old[name] for name, total in new.items()):
+    raise SystemExit("REST model details did not advance after Session append")
+PY
+}
+
+wait_for_recorder_advance() {
+    local before="$1" model_before="$2" ranges_before="$3" checkpoint_before="$4" require_quota="${5:-0}"
+    local before_generation="" before_epoch="" before_cycle="" generation="" epoch="" cycle=""
+    local matching_ranges="" checkpoint="" total_ranges="" models="" history="" quota="" snapshot=""
+    IFS='|' read -r before_generation before_epoch before_cycle <<<"$before"
+    valid_collection_snapshot "$before_generation" "$before_epoch" "$before_cycle" || return 1
+    for _ in $(seq 1 80); do
+        process_matches_scope "$recorder_pid" recorder || return 1
+        snapshot="$(recorder_projection_snapshot 2>/dev/null || true)"
+        IFS=$'\t' read -r generation epoch cycle matching_ranges checkpoint total_ranges models <<<"$snapshot"
+        if valid_collection_snapshot "$generation" "$epoch" "$cycle" \
+            && is_uint "$matching_ranges" && is_uint "$checkpoint" \
+            && is_uint "$total_ranges" && is_uint "$models" \
+            && ((10#$generation > 10#$before_generation \
+                && 10#$total_ranges > 10#$ranges_before \
+                && 10#$checkpoint > 10#$checkpoint_before \
+                && 10#$models > 10#$model_before \
+                && 10#$matching_ranges > 0)); then
+            if ((require_quota)); then
+                history="$(read_sql 'SELECT COUNT(*) FROM usage_history' 2>/dev/null || true)"
+                quota="$(read_sql 'SELECT COUNT(*) FROM usage_history WHERE remaining_percent IS NOT NULL' 2>/dev/null || true)"
+                is_uint "$history" && is_uint "$quota" \
+                    && ((10#$history > 0 && 10#$quota > 0)) || {
+                        sleep 0.25
+                        continue
+                    }
+            fi
+            printf '%s\n' "$snapshot"
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
 }
 
 wait_for_ui_window() {
     local pid="$1" tree
-    command -v xwininfo >/dev/null 2>&1 || return 1
     for _ in $(seq 1 60); do
-        if ! kill -0 "$pid" 2>/dev/null; then
+        if ! process_matches_scope "$pid" ui; then
             return 1
         fi
         tree="$(xwininfo -root -tree 2>/dev/null || true)"
-        if rg -q --fixed-strings -- 'preview@example.com' <<<"$tree"; then
+        if rg -q -- '(Codex Info|Codex -)' <<<"$tree"; then
             return 0
         fi
         sleep 0.25
@@ -476,19 +613,17 @@ wait_for_ui_window() {
     return 1
 }
 
-wait_for_two_ui_windows() {
-    local first_pid="$1" second_pid="$2" tree window_count
-    command -v xwininfo >/dev/null 2>&1 || return 1
+wait_for_ui_rest_connection() {
+    local pid="$1"
     for _ in $(seq 1 60); do
-        if ! kill -0 "$first_pid" 2>/dev/null \
-            || ! kill -0 "$second_pid" 2>/dev/null \
-            || ! process_matches_scope "$first_pid" ui \
-            || ! process_matches_scope "$second_pid" ui; then
+        if ! process_matches_scope "$pid" ui; then
             return 1
         fi
-        tree="$(xwininfo -root -tree 2>/dev/null || true)"
-        window_count="$(awk '{ count += gsub(/preview@example[.]com/, "&") } END { print count + 0 }' <<<"$tree")"
-        if ((window_count >= 2)); then
+        # The client opens short-lived loopback HTTP connections. Observe the
+        # UI PID itself in the socket table while its one-second poll runs;
+        # the REST process and a matching window alone are not a connection
+        # proof.
+        if ss -tnpH 2>/dev/null | rg -q "pid=${pid}[,)]"; then
             return 0
         fi
         sleep 0.25
@@ -496,479 +631,151 @@ wait_for_two_ui_windows() {
     return 1
 }
 
-is_descendant_of() {
-    local pid="$1" ancestor="$2" ppid
-    [[ "$pid" != "$ancestor" ]] || return 1
-    for _ in $(seq 1 32); do
-        ppid="$(awk '/^PPid:/ { print $2; exit }' "/proc/$pid/status" 2>/dev/null || true)"
-        [[ "$ppid" =~ ^[0-9]+$ && "$ppid" != "$pid" ]] || return 1
-        [[ "$ppid" == "$ancestor" ]] && return 0
-        [[ "$ppid" != 1 ]] || return 1
-        pid="$ppid"
-    done
-    return 1
-}
+setup_case
+write_fixture
 
-find_service_zombies() {
-    local first_pid="$1" second_pid="$2" proc pid state name
-    for proc in /proc/[0-9]*; do
-        [[ -r "$proc/status" ]] || continue
-        pid="${proc##*/}"
-        state="$(awk '/^State:/ { print $2; exit }' "$proc/status" 2>/dev/null || true)"
-        [[ "$state" == Z ]] || continue
-        name="$(awk '/^Name:/ { print $2; exit }' "$proc/status" 2>/dev/null || true)"
-        [[ "$name" == "${BINARY##*/}" ]] || continue
-        if is_descendant_of "$pid" "$first_pid" \
-            || is_descendant_of "$pid" "$second_pid"; then
-            printf '%s\n' "$pid"
-        fi
-    done
-}
+# The sentinel is deliberately outside the product scope.  It must survive
+# every product termination below, proving that PID cleanup is not a broad
+# process-group or name-based kill.
+tail -f /dev/null &
+sentinel_pid="$!"
+kill -0 "$sentinel_pid" 2>/dev/null || fail 'scope sentinel did not start'
 
-ui_display_available=0
-if [[ -n "${DISPLAY:-}" ]] && command -v xdpyinfo >/dev/null 2>&1 \
-    && xdpyinfo >/dev/null 2>&1; then
-    ui_display_available=1
-fi
+launch_recorder recorder
+locate_account_partition
+for _ in $(seq 1 20); do
+    process_matches_scope "$recorder_pid" recorder && break
+    sleep 0.1
+done
+assert_one_scoped_process recorder "$recorder_pid" 'recorder startup'
+baseline_snapshot="$(wait_for_recorder_generation 1 0 2>/dev/null || true)"
+[[ "$baseline_snapshot" != 0 ]] \
+    || fail 'recorder did not produce the first durable generation/ack'
+IFS=$'\t' read -r baseline_generation baseline_epoch baseline_cycle baseline_matching_ranges baseline_checkpoint baseline_ranges baseline_model <<<"$baseline_snapshot"
+valid_collection_snapshot "$baseline_generation" "$baseline_epoch" "$baseline_cycle" \
+    || fail 'first recorder acknowledgement has invalid collection_generation identity'
+is_uint "$baseline_matching_ranges" && is_uint "$baseline_checkpoint" \
+    && is_uint "$baseline_ranges" && is_uint "$baseline_model" \
+    || fail 'first recorder acknowledgement has invalid range/checkpoint/model readback'
 
-mark_ui_hold() {
-    local label="$1" reason="$2"
-    hold_count=$((hold_count + 1))
-    printf 'CASE %s: HOLD (%s)\n' "$label" "$reason"
-}
+# First append establishes the non-empty, recorder-produced quota/history/model
+# snapshot used by REST. No SQLite schema or row is created by this fixture;
+# quota/history must come from the recorder or a real existing UsageStore state.
+append_session_usage "$fixture_first_time" 240 200 160 40
+first_snapshot="$(wait_for_recorder_advance \
+    "$baseline_generation|$baseline_epoch|$baseline_cycle" "$baseline_model" \
+    "$baseline_ranges" "$baseline_checkpoint" 1 2>/dev/null || true)"
+[[ -n "$first_snapshot" && "$first_snapshot" != 0 ]] \
+    || fail 'recorder did not produce non-empty quota/history/models from Session input'
+IFS=$'\t' read -r first_generation first_epoch first_cycle _ first_checkpoint first_ranges first_model <<<"$first_snapshot"
+valid_collection_snapshot "$first_generation" "$first_epoch" "$first_cycle" \
+    || fail 'first append acknowledgement has invalid collection_generation identity'
+assert_one_scoped_process recorder "$recorder_pid" 'recorder projection'
 
-run_service_cold_start() {
-    local append_time before after clk_tck cpu_before cpu_after idle_cpu_ticks session now2
-    setup_case service-cold-start
-    write_fixture
-    launch_service service-cold
-    require_ready
-    require_one_service "$service_pid"
-    if ! wait_for_account_baseline; then
-        sed -n '1,160p' "$case_root/service-cold.log" >&2 || true
-        fail "$case_label: daemon did not persist the account Session baseline"
-    fi
-    assert_recorder_state ready "$service_pid" \
-        || fail "$case_label: recorder-state.json is not an acknowledged ready state"
-    before="$(sqlite3 "$case_db" 'SELECT COUNT(*) FROM usage_history;')"
-    [[ "$(sqlite3 "$case_db" 'SELECT COUNT(*) FROM usage_history WHERE sol_tokens <> 0 OR terra_tokens <> 0 OR luna_tokens <> 0 OR ABS(sol_dollars) > 0.0000001 OR ABS(terra_dollars) > 0.0000001 OR ABS(luna_dollars) > 0.0000001;')" == 0 ]] \
-        || fail "$case_label: pre-boundary Session bytes were attributed"
-    [[ "$(sqlite3 "$case_db" 'SELECT COUNT(*) FROM session_ranges;')" == 0 ]] \
-        || fail "$case_label: pre-boundary Session bytes produced a committed range"
-    [[ "$(sqlite3 "$case_db" 'SELECT COUNT(*) FROM storage_partition;')" == 1 ]] \
-        || fail "$case_label: account database partition authority is missing"
-    [[ ! -e "$case_data/history/usage_history.sqlite3" ]] \
-        || fail "$case_label: legacy unpartitioned history database was created"
+launch_rest rest-initial
+assert_one_scoped_process rest "$rest_pid" 'REST startup'
+[[ "$rest_pid" != "$recorder_pid" ]] || fail 'recorder and REST share a PID'
+wait_for_rest || fail 'REST did not become healthy over the recorder SQLite database'
+assert_health "$(health_body)" || fail 'REST health contract failed'
+details_before="$case_root/details-before.json"
+fetch_details "$details_before" \
+    || fail 'REST did not publish non-empty details after recorder append'
+assert_details_matches_sqlite "$details_before" \
+    || fail 'REST details did not read the recorder SQLite database'
 
-    clk_tck="$(getconf CLK_TCK)"
-    cpu_before="$(awk '{print $14+$15}' "/proc/$service_pid/stat")"
-    sleep 5
-    cpu_after="$(awk '{print $14+$15}' "/proc/$service_pid/stat")"
-    idle_cpu_ticks=$((cpu_after - cpu_before))
-    [[ "$idle_cpu_ticks" -lt $((clk_tck * 5 / 2)) ]] \
-        || fail "$case_label: unchanged-input daemon CPU exceeded 50%"
+generation_before="$first_generation"
+epoch_before="$first_epoch"
+cycle_before="$first_cycle"
+model_before="$first_model"
+ranges_before="$first_ranges"
+checkpoint_before="$first_checkpoint"
+is_uint "$generation_before" && is_uint "$model_before" \
+    && is_uint "$ranges_before" && is_uint "$checkpoint_before" \
+    || fail 'recorder canonical state is not numeric before REST outage'
+process_matches_scope "$recorder_pid" recorder \
+    || fail 'recorder identity changed before REST outage'
+recorder_pid_before="$recorder_pid"
 
-    now2="$(date +%s)"
-    session="$case_home/sessions/$(date -u +%Y/%m/%d)/daemon-e2e.jsonl"
-    append_time="$(date -u -d "@$now2" +%Y-%m-%dT%H:%M:%SZ)"
-    printf '%s\n' \
-        "{\"timestamp\":\"$append_time\",\"type\":\"turn_context\",\"model\":\"gpt-5.6-luna\"}" \
-        "{\"timestamp\":\"$append_time\",\"type\":\"token_count\",\"payload\":{\"info\":{\"total_token_usage\":{\"total_tokens\":240,\"input_tokens\":200,\"cached_input_tokens\":160,\"output_tokens\":40}}}}" \
-        "{\"timestamp\":\"$append_time\",\"type\":\"token_count\",\"payload\":{\"info\":{\"total_token_usage\":{\"total_tokens\":360,\"input_tokens\":300,\"cached_input_tokens\":240,\"output_tokens\":60}}}}" \
-        >>"$session"
-    after=0
-    if ! after="$(wait_for_history_value \
-        'SELECT COALESCE(MAX(luna_tokens),0) FROM usage_history;' 120)"; then
-        sed -n '1,160p' "$case_root/service-cold.log" >&2 || true
-        fail "$case_label: daemon did not record changed session input (observed luna_tokens=$after)"
-    fi
-    if [[ "$(listener_count "$case_port")" != 1 ]] || ! service_health; then
-        fail "$case_label: REST became unavailable during recording"
-    fi
+# REST is stopped first. The next Session append must still be committed by
+# the same recorder PID, with both a fresh durable acknowledgement and a
+# strictly larger model total.
+rest_pid_before="$rest_pid"
+terminate_scoped_pid "$rest_pid" rest REST
+rest_pid=""
+assert_no_scoped_process rest 'REST shutdown'
+[[ "$(listener_count "$case_port")" == 0 ]] \
+    || fail 'REST listener remained after its scoped shutdown'
+[[ "$recorder_pid" == "$recorder_pid_before" ]] \
+    || fail 'recorder PID changed when REST stopped'
+process_matches_scope "$recorder_pid" recorder \
+    || fail 'recorder stopped or changed executable during REST outage'
 
-    stop_current_service
-    for _ in $(seq 1 20); do
-        [[ ! -e "$case_lock" ]] && break
-        sleep 0.25
-    done
-    [[ ! -e "$case_lock" ]] || fail "$case_label: daemon lock was not released"
-    [[ "$(listener_count "$case_port")" == 0 ]] \
-        || fail "$case_label: service REST listener remained after shutdown"
-    [[ "$(sqlite3 "$case_db" "SELECT COUNT(*) FROM recorder_gap_ledger WHERE state = 'pending';")" -ge 1 ]] \
-        || fail "$case_label: clean stop did not leave an explicit pending recorder gap"
-    [[ "$(sqlite3 "$case_db" 'PRAGMA quick_check;')" == ok ]] \
-        || fail "$case_label: history database quick_check failed"
-    printf 'CASE %s: PASS (rows_before=%s, luna_tokens_after=%s, idle_cpu_ticks=%s/%s, one owner/listener and clean stop)\n' \
-        "$case_label" "$before" "$after" "$idle_cpu_ticks" "$clk_tck"
-}
+append_session_usage "$fixture_second_time" 360 300 240 60
+outage_snapshot=""
+outage_snapshot="$(wait_for_recorder_advance \
+    "$generation_before|$epoch_before|$cycle_before" "$model_before" \
+    "$ranges_before" "$checkpoint_before" 0 2>/dev/null || true)"
+[[ -n "$outage_snapshot" && "$outage_snapshot" != 0 ]] \
+    || fail 'recorder did not advance a durable generation while REST was stopped'
+IFS=$'\t' read -r outage_generation outage_epoch outage_cycle _ _ _ _ <<<"$outage_snapshot"
+valid_collection_snapshot "$outage_generation" "$outage_epoch" "$outage_cycle" \
+    || fail 'REST-outage acknowledgement has invalid collection_generation identity'
+[[ "$recorder_pid" == "$recorder_pid_before" ]] \
+    || fail 'recorder PID changed after Session append during REST outage'
+assert_one_scoped_process recorder "$recorder_pid" 'recorder during REST outage'
 
-run_ui_without_service() {
-    local owner launcher_pid
-    setup_case ui-without-service
-    write_fixture
-    if [[ "$ui_display_available" != 1 ]]; then
-        mark_ui_hold "$case_label" 'X11 display is unavailable; UI was not rendered'
-        return
-    fi
-    launch_ui ui-new-service
-    launcher_pid="$ui_pid"
-    require_ready
-    owner="$(lock_owner)"
-    [[ "$owner" != "$launcher_pid" ]] \
-        || fail "$case_label: --ui became the resident service instead of adding UI"
-    require_one_service
-    if ! wait_for_ui_window "$launcher_pid"; then
-        if ! xdpyinfo >/dev/null 2>&1; then
-            stop_ui
-            stop_current_service
-            mark_ui_hold "$case_label" 'X11 display became unavailable; UI was not rendered'
-            return
-        fi
-        sed -n '1,120p' "$case_root/ui-new-service.log" >&2 || true
-        fail "$case_label: --ui process did not render a preview window"
-    fi
-    require_one_service "$owner"
-    service_health || fail "$case_label: --ui-created service became unavailable"
-    stop_ui
-    require_one_service "$owner"
-    stop_current_service
-    require_no_service
-    printf 'CASE %s: PASS (rendered --ui, one newly-created service owner/listener)\n' "$case_label"
-}
+# Restart REST against the exact same database path and require the changed
+# model/history details to be read back, rather than accepting an empty root.
+launch_rest rest-restart
+assert_one_scoped_process rest "$rest_pid" 'REST restart'
+[[ "$rest_pid" != "$recorder_pid" ]] || fail 'recorder and restarted REST share a PID'
+[[ "$rest_pid" != "$rest_pid_before" ]] || fail 'REST restart reused the stopped process instance'
+wait_for_rest || fail 'REST did not recover after restart'
+details_after="$case_root/details-after.json"
+fetch_details "$details_after" \
+    || fail 'REST restart did not recover non-empty details'
+assert_details_matches_sqlite "$details_after" \
+    || fail 'REST restart details did not read the same SQLite database'
+assert_model_growth "$details_before" "$details_after" \
+    || fail 'REST restart did not expose the recorder model/token generation'
 
-run_ui_with_service() {
-    local owner launcher_pid
-    setup_case ui-with-service
-    write_fixture
-    launch_service ui-existing-service
-    require_ready
-    require_one_service "$service_pid"
-    owner="$service_pid"
-    if [[ "$ui_display_available" != 1 ]]; then
-        stop_current_service
-        mark_ui_hold "$case_label" 'X11 display is unavailable; UI was not rendered'
-        return
-    fi
-    launch_ui ui-existing-service-window
-    launcher_pid="$ui_pid"
-    if ! wait_for_ui_window "$launcher_pid"; then
-        if ! xdpyinfo >/dev/null 2>&1; then
-            stop_ui
-            stop_current_service
-            mark_ui_hold "$case_label" 'X11 display became unavailable; UI was not rendered'
-            return
-        fi
-        sed -n '1,120p' "$case_root/ui-existing-service-window.log" >&2 || true
-        fail "$case_label: --ui process did not render a preview window"
-    fi
-    require_one_service "$owner"
-    [[ "$launcher_pid" != "$owner" ]] \
-        || fail "$case_label: --ui replaced the existing service with its UI process"
-    stop_ui
-    require_one_service "$owner"
-    stop_current_service
-    require_no_service
-    printf 'CASE %s: PASS (rendered --ui reusing service PID %s, no additional resident)\n' \
-        "$case_label" "$owner"
-}
+# The UI receives only the REST endpoint in this invocation. Its executable,
+# marker, and port are checked independently, while recorder and REST PIDs
+# remain untouched and no UI-owned recorder process may appear.
+launch_ui ui-client-only
+assert_one_scoped_process ui "$ui_pid" 'client-only UI startup'
+[[ "$ui_pid" != "$recorder_pid" && "$ui_pid" != "$rest_pid" ]] \
+    || fail 'UI shares a product process PID'
+wait_for_ui_window "$ui_pid" \
+    || fail 'client-only UI did not render a window connected to the REST case'
+wait_for_ui_rest_connection "$ui_pid" \
+    || fail 'client-only UI did not open a loopback connection to REST'
+assert_one_scoped_process recorder "$recorder_pid" 'client-only UI recorder isolation'
+assert_one_scoped_process rest "$rest_pid" 'client-only UI REST isolation'
+assert_one_scoped_process ui "$ui_pid" 'client-only UI identity'
 
-run_verified_ui_failure_without_service() {
-    local launcher_pid pids=()
-    setup_case verified-ui-failure-no-owner
-    write_fixture
-    if [[ "$ui_display_available" != 1 ]]; then
-        mark_ui_hold "$case_label" 'X11 display is unavailable; UI was not rendered'
-        return
-    fi
-    # This is the installed-launcher fallback contract: the verified payload
-    # receives only a strict client marker after service startup failed. It
-    # must retain the localized connection/retry surface without creating a
-    # raw resident owner, recorder, writer, or listener.
-    launch_client_only_ui ui-client-only
-    launcher_pid="$ui_pid"
-    if ! wait_for_ui_window "$launcher_pid"; then
-        if ! xdpyinfo >/dev/null 2>&1; then
-            stop_ui
-            mark_ui_hold "$case_label" 'X11 display became unavailable; UI was not rendered'
-            return
-        fi
-        sed -n '1,120p' "$case_root/ui-client-only.log" >&2 || true
-        fail "$case_label: verified client-only UI did not render a failure surface"
-    fi
-    process_env_contains "$launcher_pid" 'CODEX_INFO_UI_CLIENT_ONLY=1' \
-        || fail "$case_label: client-only marker was not preserved"
-    sleep 2
-    [[ ! -e "$case_lock" ]] \
-        || fail "$case_label: client-only UI created a recorder owner after service failure"
-    mapfile -t pids < <(find_service_pids)
-    [[ "${#pids[@]}" -eq 0 ]] \
-        || fail "$case_label: client-only UI created resident service process(es) ${pids[*]}"
-    [[ "$(listener_count "$case_port")" == 0 ]] \
-        || fail "$case_label: client-only UI created an unmanaged listener"
-    terminate_scoped_pid "$launcher_pid" ui 'client-only UI' || true
-    ui_pid=""
-    require_no_service
-    printf 'CASE %s: PASS (verified UI failure surface remained client-only with zero owner/listener)\n' \
-        "$case_label"
-}
+# Stop exactly the three scoped product instances and verify the unrelated
+# sentinel remains alive until the harness deliberately cleans up its own
+# fixture. This is the end-of-case process-scope acceptance.
+terminate_scoped_pid "$ui_pid" ui 'client-only UI'
+ui_pid=""
+terminate_scoped_pid "$rest_pid" rest REST
+rest_pid=""
+terminate_scoped_pid "$recorder_pid" recorder recorder
+recorder_pid=""
+assert_no_scoped_process ui 'final UI cleanup'
+assert_no_scoped_process rest 'final REST cleanup'
+assert_no_scoped_process recorder 'final recorder cleanup'
+kill -0 "$sentinel_pid" 2>/dev/null \
+    || fail 'scoped product termination killed the unrelated sentinel'
+sentinel_exe="$(readlink "/proc/$sentinel_pid/exe" 2>/dev/null || true)"
+[[ "$sentinel_exe" != "$RECORDER_BINARY" \
+    && "$sentinel_exe" != "$REST_BINARY" \
+    && "$sentinel_exe" != "$UI_BINARY" ]] \
+    || fail 'scope sentinel unexpectedly has a product executable'
+kill -TERM "$sentinel_pid" 2>/dev/null || true
+wait "$sentinel_pid" 2>/dev/null || true
+sentinel_pid=""
 
-run_simultaneous_ui_without_service() {
-    local first_ui second_ui owner pids=() zombies=()
-    setup_case simultaneous-ui-without-service
-    write_fixture
-    if [[ "$ui_display_available" != 1 ]]; then
-        mark_ui_hold "$case_label" 'X11 display is unavailable; UI was not rendered'
-        return
-    fi
-    launch_ui ui-concurrent-first
-    first_ui="$ui_pid"
-    launch_ui ui-concurrent-second
-    second_ui="$ui_pid"
-    require_ready
-    require_one_service
-    owner="$service_pid"
-    [[ "$owner" != "$first_ui" && "$owner" != "$second_ui" ]] \
-        || fail "$case_label: --ui process became the service owner"
-    process_matches_scope "$first_ui" ui \
-        || fail "$case_label: first --ui launcher is not a scoped UI"
-    process_matches_scope "$second_ui" ui \
-        || fail "$case_label: second --ui launcher is not a scoped UI"
-    if ! wait_for_two_ui_windows "$first_ui" "$second_ui"; then
-        if ! xdpyinfo >/dev/null 2>&1; then
-            stop_ui
-            stop_current_service
-            mark_ui_hold "$case_label" 'X11 display became unavailable; UI was not rendered'
-            return
-        fi
-        sed -n '1,120p' "$case_root"/ui-concurrent-*.log >&2 2>/dev/null || true
-        fail "$case_label: concurrent --ui launchers did not render two preview windows"
-    fi
-    require_one_service "$owner"
-    mapfile -t pids < <(find_service_pids)
-    [[ "${#pids[@]}" -eq 1 && "${pids[0]}" == "$owner" ]] \
-        || fail "$case_label: concurrent --ui launchers left extra service processes"
-    mapfile -t zombies < <(find_service_zombies "$first_ui" "$second_ui")
-    [[ "${#zombies[@]}" -eq 0 ]] \
-        || fail "$case_label: losing --ui service zombie remains (${zombies[*]})"
-    service_health || fail "$case_label: concurrent --ui service became unavailable"
-
-    terminate_scoped_pid "$first_ui" ui 'first concurrent --ui process'
-    terminate_scoped_pid "$second_ui" ui 'second concurrent --ui process'
-    ui_pid=""
-    [[ ! -e "/proc/$first_ui" && ! -e "/proc/$second_ui" ]] \
-        || fail "$case_label: one of the concurrent --ui processes remained resident"
-    require_one_service "$owner"
-    service_health || fail "$case_label: sole service did not survive both UI exits"
-    stop_current_service
-    require_no_service
-    printf 'CASE %s: PASS (simultaneous --ui processes=%s,%s, sole service owner/listener=%s, clean stop)\n' \
-        "$case_label" "$first_ui" "$second_ui" "$owner"
-}
-
-run_simultaneous_service_launches() {
-    local first second owner loser pids=()
-    setup_case simultaneous-service-launches
-    write_fixture
-    env "${common_env[@]}" "$BINARY" --port "$case_port" \
-        >"$case_root/simultaneous-first.log" 2>&1 &
-    first="$!"
-    env "${common_env[@]}" "$BINARY" --port "$case_port" \
-        >"$case_root/simultaneous-second.log" 2>&1 &
-    second="$!"
-    require_ready
-    owner="$(lock_owner)"
-    [[ "$owner" == "$first" || "$owner" == "$second" ]] \
-        || fail "$case_label: lock owner is not one of the simultaneous launchers"
-    require_one_service "$owner"
-    mapfile -t pids < <(find_service_pids)
-    [[ "${#pids[@]}" -eq 1 ]] \
-        || fail "$case_label: concurrent launch created multiple service owners"
-    if [[ "$owner" == "$first" ]]; then
-        loser="$second"
-    else
-        loser="$first"
-    fi
-    for _ in $(seq 1 20); do
-        if ! kill -0 "$loser" 2>/dev/null; then
-            break
-        fi
-        sleep 0.1
-    done
-    if [[ -e "/proc/$loser" ]] && ! process_matches_scope "$loser" service; then
-        # A failed launcher can be a zombie until its shell parent reaps it.
-        wait "$loser" 2>/dev/null || true
-    fi
-    [[ ! -e "/proc/$loser" ]] \
-        || fail "$case_label: losing service launcher remained resident"
-    if [[ "$(listener_count "$case_port")" != 1 ]] || ! service_health; then
-        fail "$case_label: concurrent launch did not leave one healthy listener"
-    fi
-    terminate_scoped_pid "$owner" service 'concurrent service' || true
-    stop_services
-    require_no_service
-    printf 'CASE %s: PASS (simultaneous launchers=%s,%s, sole owner/listener=%s)\n' \
-        "$case_label" "$first" "$second" "$owner"
-}
-
-launch_failure_service() {
-    local mode="$1" log_name="$2"
-    env "${common_env[@]}" CODEX_INFO_RECORDER_FAILURE="$mode" "$BINARY" --port "$case_port" \
-        >"$case_root/$log_name.log" 2>&1 &
-    service_pid="$!"
-}
-
-wait_for_expected_failure() {
-    local pid="$1" label="$2" status
-    for _ in $(seq 1 120); do
-        if ! kill -0 "$pid" 2>/dev/null; then
-            break
-        fi
-        sleep 0.25
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-        terminate_scoped_pid "$pid" service "$label" || true
-        fail "$case_label: $label did not exit within the finite failure budget"
-    fi
-    if wait "$pid"; then
-        fail "$case_label: $label exited cleanly after an injected failure"
-    else
-        status="$?"
-    fi
-    [[ "$status" != 0 ]] || fail "$case_label: $label returned status zero"
-    service_pid=""
-}
-
-run_managed_activation_retires_unmanaged_owner() {
-    local unmanaged managed
-    setup_case managed-activation-retires-unmanaged
-    write_fixture
-    launch_service managed-unmanaged-owner
-    require_ready
-    unmanaged="$service_pid"
-    require_one_service "$unmanaged"
-    launch_managed_service managed-retire
-    managed="$service_pid"
-    for _ in $(seq 1 80); do
-        if [[ "$(lock_owner 2>/dev/null || true)" == "$managed" ]] \
-            && service_health; then
-            break
-        fi
-        sleep 0.25
-    done
-    require_one_service "$managed"
-    process_env_contains "$managed" 'CODEX_INFO_SYSTEMD_MANAGED=1' \
-        || fail "$case_label: managed activation owner lacks its marker"
-    if [[ -e "/proc/$unmanaged" ]]; then
-        wait "$unmanaged" 2>/dev/null || true
-    fi
-    [[ ! -e "/proc/$unmanaged" ]] \
-        || fail "$case_label: managed activation left the old unmanaged owner alive"
-    stop_current_service
-    require_no_service
-    printf 'CASE %s: PASS (managed activation retired exact unmanaged owner %s and adopted %s)\n' \
-        "$case_label" "$unmanaged" "$managed"
-}
-
-run_managed_activation_reuses_managed_owner() {
-    local owner second
-    setup_case managed-activation-reuses-managed
-    write_fixture
-    launch_managed_service managed-owner
-    require_ready
-    owner="$service_pid"
-    require_one_service "$owner"
-    launch_managed_service managed-reuse
-    second="$service_pid"
-    if ! wait "$second"; then
-        fail "$case_label: managed activation failed while reusing a healthy managed owner"
-    fi
-    require_one_service "$owner"
-    [[ "$(listener_count "$case_port")" == 1 ]] \
-        || fail "$case_label: managed owner listener count changed during reuse"
-    stop_current_service
-    require_no_service
-    printf 'CASE %s: PASS (healthy managed owner %s was reused; contender %s exited cleanly)\n' \
-        "$case_label" "$owner" "$second"
-}
-
-run_managed_activation_rejects_malformed_owner() {
-    local payload='{"pid":1}'
-    setup_case managed-malformed-owner
-    write_fixture
-    printf '%s\n' "$payload" >"$case_lock"
-    chmod 600 "$case_lock"
-    launch_managed_service managed-malformed
-    wait_for_expected_failure "$service_pid" 'malformed-owner activation'
-    [[ -f "$case_lock" ]] || fail "$case_label: malformed owner lock was removed"
-    rg -q --fixed-strings -- "$payload" "$case_lock" \
-        || fail "$case_label: malformed owner lock was rewritten"
-    [[ "$(listener_count "$case_port")" == 0 ]] \
-        || fail "$case_label: malformed owner activation bound an unknown listener"
-    printf 'CASE %s: PASS (malformed owner stayed untouched and activation failed closed)\n' \
-        "$case_label"
-}
-
-run_recorder_failure_budget() {
-    local mode
-    setup_case recorder-busy-retry
-    write_fixture
-    launch_failure_service busy recorder-busy
-    require_ready
-    if ! wait_for_account_baseline; then
-        sed -n '1,160p' "$case_root/recorder-busy.log" >&2 || true
-        fail "$case_label: busy injection did not reach the next-cycle commit"
-    fi
-    assert_recorder_state ready "$service_pid" \
-        || fail "$case_label: busy retry did not return to ready state"
-    process_matches_scope "$service_pid" service \
-        || fail "$case_label: busy retry service exited unexpectedly"
-    stop_current_service
-    require_no_service
-    printf 'CASE %s: PASS (one 2s busy failure, one next-cycle retry, ready state restored)\n' \
-        "$case_label"
-
-    for mode in fatal full readonly; do
-        setup_case "recorder-failure-$mode"
-        write_fixture
-        launch_failure_service "$mode" "recorder-$mode"
-        require_ready
-        if ! wait_for_account_baseline; then
-            sed -n '1,160p' "$case_root/recorder-$mode.log" >&2 || true
-            fail "$case_label: $mode injection did not reach the next-cycle commit"
-        fi
-        assert_recorder_state ready "$service_pid" \
-            || fail "$case_label: $mode retry did not return to ready state"
-        process_matches_scope "$service_pid" service \
-            || fail "$case_label: $mode retry service exited unexpectedly"
-        stop_current_service
-        require_no_service
-        printf 'CASE %s: PASS (injected %s failure kept service alive and recovered next cycle)\n' \
-            "$case_label" "$mode"
-    done
-
-    setup_case recorder-failure-worker-death
-    write_fixture
-    launch_failure_service worker-death recorder-worker-death
-    wait_for_expected_failure "$service_pid" 'worker-death failure'
-    require_no_service
-    printf 'CASE %s: PASS (actual writer death exited nonzero and released owner/listener)\n' \
-        "$case_label"
-}
-
-run_service_cold_start
-run_ui_without_service
-run_ui_with_service
-run_verified_ui_failure_without_service
-run_simultaneous_ui_without_service
-run_simultaneous_service_launches
-run_managed_activation_retires_unmanaged_owner
-run_managed_activation_reuses_managed_owner
-run_managed_activation_rejects_malformed_owner
-run_recorder_failure_budget
-
-if ((hold_count > 0)); then
-    printf 'record-daemon-e2e: HOLD (%s UI case(s) could not be rendered; no HOLD was reported as PASS)\n' \
-        "$hold_count"
-    exit 2
-fi
-printf 'record-daemon-e2e: PASS (finite service/ui/concurrent cases verified with isolated HOME/XDG/data/ports)\n'
+printf 'CASE split-process: PASS (recorder/rest separate PID+exe, REST outage recovery, same SQLite read, client-only UI, scoped termination)\n'
+printf 'record-daemon-e2e: PASS (tests=1, recorder acknowledgements and non-empty quota/history/models verified)\n'

@@ -111,4 +111,8 @@ require_payload
 unset WAYLAND_DISPLAY WAYLAND_SOCKET WINIT_X11_SCALE_FACTOR
 export LIBGL_ALWAYS_SOFTWARE='1'
 export MESA_LOADER_DRIVER_OVERRIDE='llvmpipe'
+# The installed UI is always a REST client.  It must never recreate the
+# retired combined recorder/REST owner if the REST process restarts between
+# installer readiness and UI launch.
+export CODEX_INFO_UI_CLIENT_ONLY=1
 exec "$payload" --ui

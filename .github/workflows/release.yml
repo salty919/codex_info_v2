@@ -1134,7 +1134,8 @@ jobs:
                     (endswith("/..") | not) and . != "..")) and
                   (.size | type == "number" and floor == . and . >= 0) and
                   (.sha256 | type == "string" and test("^[0-9a-fA-F]{64}$"))) and
-                (["codex_info", "codex-info.service", "install.sh", "LICENSE",
+                (["codex_info", "codex_info_recorder", "codex_info_rest",
+                  "codex-info-recorder.service", "codex-info-rest.service", "install.sh", "LICENSE",
                   "COPYRIGHT", "THIRD_PARTY_NOTICES.md"] - [.[].path] | length == 0))
             ' "$linux_manifest" >/dev/null
             archive_check_dir="$RUNNER_TEMP/linux-release-archive-check"
@@ -1146,7 +1147,11 @@ jobs:
               [[ -n "$archive_path" && "$archive_path" != /* && "$archive_path" != *'..'* ]]
             done < "$archive_check_dir/paths"
             tar -xzf "$linux_archive" -C "$archive_check_dir"
-            [[ -x "$archive_check_dir/codex_info" && -f "$archive_check_dir/codex-info.service" &&
+            [[ -x "$archive_check_dir/codex_info" &&
+               -x "$archive_check_dir/codex_info_recorder" &&
+               -x "$archive_check_dir/codex_info_rest" &&
+               -f "$archive_check_dir/codex-info-recorder.service" &&
+               -f "$archive_check_dir/codex-info-rest.service" &&
                -x "$archive_check_dir/install.sh" && -f "$archive_check_dir/LICENSE" &&
                -f "$archive_check_dir/COPYRIGHT" && -f "$archive_check_dir/THIRD_PARTY_NOTICES.md" &&
                -f "$archive_check_dir/manifest.json" && -f "$archive_check_dir/SHA256SUMS" ]]

@@ -1,13 +1,11 @@
 [Unit]
-Description=Codex Info daemon and loopback REST service
+Description=Codex Info recorder
 After=default.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStartPre=%h/.local/libexec/codex-info-install.sh --startup-reconcile
-ExecCondition=%h/.local/libexec/codex-info-install.sh --startup-condition
-ExecStart=%h/.local/bin/codex_info --port 8787
+ExecStart=%h/.local/bin/codex_info_recorder
 Restart=always
 RestartSec=5s
 KillSignal=SIGTERM

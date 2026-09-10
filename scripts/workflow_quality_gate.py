@@ -781,8 +781,9 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     rust = workflows["rust.yml"]
     for marker in (
         "cargo fmt --check",
-        "cargo test --locked --all-targets -- --nocapture",
-        "cargo build --release --locked",
+        "cargo test --workspace --locked --all-targets -- --nocapture",
+        "cargo clippy --workspace --locked --all-targets -- -D warnings",
+        "cargo build --workspace --release --locked",
         "scripts/cli_contract_e2e.sh",
         "scripts/record_daemon_e2e.sh",
         "xvfb-run --auto-servernum",
@@ -3325,7 +3326,12 @@ def workflow_selection_self_test() -> int:
         ),
         (
             "rust.yml",
-            "cargo test --locked --all-targets -- --nocapture",
+            "cargo test --workspace --locked --all-targets -- --nocapture",
+            "true",
+        ),
+        (
+            "rust.yml",
+            "cargo clippy --workspace --locked --all-targets -- -D warnings",
             "true",
         ),
         (
@@ -3408,7 +3414,8 @@ def self_test() -> int:
             'CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info"',
             'CODEX_INFO_ACCEPTANCE_BINARY="$GITHUB_WORKSPACE/target/release/codex_info"',
         ),
-        ("rust.yml", "cargo test --locked --all-targets -- --nocapture", "true"),
+        ("rust.yml", "cargo test --workspace --locked --all-targets -- --nocapture", "true"),
+        ("rust.yml", "cargo clippy --workspace --locked --all-targets -- -D warnings", "true"),
         ("codeql.yml", "  workflow_call:\n", "  schedule:\n"),
         (
             "release.yml",

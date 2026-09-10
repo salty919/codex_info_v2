@@ -1,0 +1,12 @@
+[package]
+name = "codex-info-rest-contract"
+version = "1.0.48"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

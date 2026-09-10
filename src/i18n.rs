@@ -60,16 +60,16 @@ impl Language {
     /// silently diverging in language or launch semantics.
     pub const fn launch_help(self) -> &'static str {
         match self {
-            Self::Japanese => "使用法: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (引数なし)       daemon+REST（127.0.0.1:8787）\n  --port PORT      daemon+RESTのポート（アドレスは127.0.0.1に固定）\n  --ui             daemon+REST + X UI\n  --ui --port PORT 指定ポートでdaemon+REST + X UI\n  --stop           常駐daemonを停止\n  --help, --h, -h  このヘルプを表示",
-            Self::English => "Usage: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (no arguments)   daemon+REST (127.0.0.1:8787)\n  --port PORT      daemon+REST port (address fixed to 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI on the selected port\n  --stop           stop the resident daemon\n  --help, --h, -h  show this help",
-            Self::SimplifiedChinese => "用法: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (无参数)         daemon+REST（127.0.0.1:8787）\n  --port PORT      daemon+REST端口（地址固定为127.0.0.1）\n  --ui             daemon+REST + X UI\n  --ui --port PORT 在指定端口启动daemon+REST + X UI\n  --stop           停止常驻daemon\n  --help, --h, -h  显示此帮助",
-            Self::Korean => "사용법: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (인수 없음)      daemon+REST (127.0.0.1:8787)\n  --port PORT      daemon+REST 포트 (주소는 127.0.0.1로 고정)\n  --ui             daemon+REST + X UI\n  --ui --port PORT 지정 포트에서 daemon+REST + X UI\n  --stop           상주 daemon 중지\n  --help, --h, -h  이 도움말 표시",
-            Self::Spanish => "Uso: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (sin argumentos) daemon+REST (127.0.0.1:8787)\n  --port PORT      puerto daemon+REST (dirección fija a 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI en el puerto indicado\n  --stop           detener el daemon residente\n  --help, --h, -h  mostrar esta ayuda",
-            Self::French => "Usage : codex_info [--ui] [--port PORT] | --stop | --help\n\n  (aucun argument) daemon+REST (127.0.0.1:8787)\n  --port PORT      port daemon+REST (adresse fixée à 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI sur le port choisi\n  --stop           arrêter le daemon résident\n  --help, --h, -h  afficher cette aide",
-            Self::German => "Aufruf: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (keine Argumente) daemon+REST (127.0.0.1:8787)\n  --port PORT      daemon+REST-Port (Adresse fest auf 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI am gewählten Port\n  --stop           residenten Daemon stoppen\n  --help, --h, -h  diese Hilfe anzeigen",
-            Self::Portuguese => "Uso: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (sem argumentos) daemon+REST (127.0.0.1:8787)\n  --port PORT      porta daemon+REST (endereço fixado em 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI na porta escolhida\n  --stop           parar o daemon residente\n  --help, --h, -h  mostrar esta ajuda",
-            Self::Italian => "Uso: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (nessun argomento) daemon+REST (127.0.0.1:8787)\n  --port PORT      porta daemon+REST (indirizzo fissato a 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI sulla porta scelta\n  --stop           arresta il daemon residente\n  --help, --h, -h  mostra questo aiuto",
-            Self::Russian => "Использование: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (без аргументов) daemon+REST (127.0.0.1:8787)\n  --port PORT      порт daemon+REST (адрес фиксирован: 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI на выбранном порту\n  --stop           остановить daemon\n  --help, --h, -h  показать эту справку",
+            Self::Japanese => "使用法: codex_info [--ui [--port PORT]] | --help\n\n  (引数なし), --ui UIクライアントを起動\n  --ui --port PORT 指定ポートのRESTへ接続してUIを起動\n  --help, --h, -h  このヘルプを表示",
+            Self::English => "Usage: codex_info [--ui [--port PORT]] | --help\n\n  (no arguments), --ui start the UI client\n  --ui --port PORT connect the UI to REST on the selected port\n  --help, --h, -h  show this help",
+            Self::SimplifiedChinese => "用法: codex_info [--ui [--port PORT]] | --help\n\n  （无参数）, --ui 启动UI客户端\n  --ui --port PORT 连接指定端口的REST并启动UI\n  --help, --h, -h  显示此帮助",
+            Self::Korean => "사용법: codex_info [--ui [--port PORT]] | --help\n\n  (인수 없음), --ui UI 클라이언트 시작\n  --ui --port PORT 지정 포트의 REST에 연결하여 UI 시작\n  --help, --h, -h  이 도움말 표시",
+            Self::Spanish => "Uso: codex_info [--ui [--port PORT]] | --help\n\n  (sin argumentos), --ui iniciar el cliente UI\n  --ui --port PORT conectar la UI al REST del puerto indicado\n  --help, --h, -h  mostrar esta ayuda",
+            Self::French => "Usage : codex_info [--ui [--port PORT]] | --help\n\n  (aucun argument), --ui démarrer le client UI\n  --ui --port PORT connecter l’UI au REST sur le port choisi\n  --help, --h, -h  afficher cette aide",
+            Self::German => "Aufruf: codex_info [--ui [--port PORT]] | --help\n\n  (keine Argumente), --ui UI-Client starten\n  --ui --port PORT UI mit REST am gewählten Port verbinden\n  --help, --h, -h  diese Hilfe anzeigen",
+            Self::Portuguese => "Uso: codex_info [--ui [--port PORT]] | --help\n\n  (sem argumentos), --ui iniciar o cliente UI\n  --ui --port PORT ligar a UI ao REST na porta escolhida\n  --help, --h, -h  mostrar esta ajuda",
+            Self::Italian => "Uso: codex_info [--ui [--port PORT]] | --help\n\n  (nessun argomento), --ui avvia il client UI\n  --ui --port PORT collega la UI al REST sulla porta scelta\n  --help, --h, -h  mostra questo aiuto",
+            Self::Russian => "Использование: codex_info [--ui [--port PORT]] | --help\n\n  (без аргументов), --ui запустить UI-клиент\n  --ui --port PORT подключить UI к REST на выбранном порту\n  --help, --h, -h  показать эту справку",
         }
     }
 
@@ -1988,7 +1988,7 @@ mod tests {
             let help = language.launch_help();
             assert!(help.contains("--ui"), "{}", language.code());
             assert!(help.contains("--port"), "{}", language.code());
-            assert!(help.contains("--stop"), "{}", language.code());
+            assert!(!help.contains("--stop"), "{}", language.code());
             assert!(help.contains("--help, --h, -h"), "{}", language.code());
             for legacy in [
                 "--service",
