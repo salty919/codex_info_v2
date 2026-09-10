@@ -11,7 +11,9 @@ PRODUCT="codex_info"
 ARCHIVE_PREFIX="codex-info"
 COMPATIBILITY="${COMPATIBILITY:-glibc}"
 OBJDUMP_BIN="${OBJDUMP_BIN:-objdump}"
-BINARY=""
+UI_BINARY=""
+RECORDER_BINARY=""
+REST_BINARY=""
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/dist}"
 VERSION="${VERSION:-}"
 SOURCE_SHA="${SOURCE_SHA:-${GITHUB_SHA:-}}"
@@ -23,7 +25,9 @@ usage() {
 usage: build_linux_bundle.sh [options]
 
 Options:
-  --binary PATH              pre-built codex_info binary
+  --ui-binary PATH           pre-built codex_info UI binary
+  --recorder-binary PATH     pre-built codex_info_recorder binary
+  --rest-binary PATH         pre-built codex_info_rest binary
   --output-dir PATH          directory for the three release assets
   --version VERSION          product version (defaults to Cargo.toml)
   --source-sha VALUE         source revision recorded in the manifest
@@ -42,9 +46,19 @@ die() {
 
 while (($# > 0)); do
     case "$1" in
-        --binary)
-            (($# >= 2)) || die '--binary requires a path'
-            BINARY="$2"
+        --ui-binary)
+            (($# >= 2)) || die '--ui-binary requires a path'
+            UI_BINARY="$2"
+            shift 2
+            ;;
+        --recorder-binary)
+            (($# >= 2)) || die '--recorder-binary requires a path'
+            RECORDER_BINARY="$2"
+            shift 2
+            ;;
+        --rest-binary)
+            (($# >= 2)) || die '--rest-binary requires a path'
+            REST_BINARY="$2"
             shift 2
             ;;
         --output-dir|--out-dir|--output)
@@ -106,17 +120,26 @@ fi
 [[ "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] ||
     die 'run attempt must be a positive integer'
 
-if [[ -z "$BINARY" ]]; then
-    command -v cargo >/dev/null 2>&1 || die 'cargo is required when --binary is not supplied'
-    (cd -- "$ROOT_DIR" && cargo build --release --locked --target "$TARGET")
-    BINARY="$ROOT_DIR/target/$TARGET/release/codex_info"
+if [[ -z "$UI_BINARY" || -z "$RECORDER_BINARY" || -z "$REST_BINARY" ]]; then
+    command -v cargo >/dev/null 2>&1 || die 'cargo is required when binaries are not supplied'
+    (cd -- "$ROOT_DIR" && cargo build --release --locked --target "$TARGET" \
+        -p codex_info -p codex-info-recorder -p codex-info-rest)
+    [[ -n "$UI_BINARY" ]] || UI_BINARY="$ROOT_DIR/target/$TARGET/release/codex_info"
+    [[ -n "$RECORDER_BINARY" ]] || RECORDER_BINARY="$ROOT_DIR/target/$TARGET/release/codex_info_recorder"
+    [[ -n "$REST_BINARY" ]] || REST_BINARY="$ROOT_DIR/target/$TARGET/release/codex_info_rest"
 fi
-[[ -f "$BINARY" && -x "$BINARY" && ! -L "$BINARY" ]] ||
-    die "release binary is not an executable regular file: $BINARY"
+for binary in "$UI_BINARY" "$RECORDER_BINARY" "$REST_BINARY"; do
+    [[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] ||
+        die "release binary is not an executable regular file: $binary"
+done
+[[ "$(sha256sum -- "$RECORDER_BINARY" | awk '{print $1}')" != \
+   "$(sha256sum -- "$REST_BINARY" | awk '{print $1}')" ]] ||
+    die 'recorder and REST artifacts must have different identities'
 
 for required_file in \
     "$ROOT_DIR/run.sh" \
-    "$ROOT_DIR/packaging/codex-info.service" \
+    "$ROOT_DIR/packaging/codex-info-recorder.service" \
+    "$ROOT_DIR/packaging/codex-info-rest.service" \
     "$ROOT_DIR/packaging/codex-info-update.service" \
     "$ROOT_DIR/packaging/codex-info-update.timer" \
     "$ROOT_DIR/packaging/install_linux_bundle.sh" \
@@ -126,7 +149,9 @@ for required_file in \
         die "required bundle source is missing or not regular: $required_file"
 done
 command -v "$OBJDUMP_BIN" >/dev/null 2>&1 || die 'objdump is required to measure glibc minimum'
-GLIBC_MINIMUM="$("$OBJDUMP_BIN" -T -- "$BINARY" 2>/dev/null |
+GLIBC_MINIMUM="$({ "$OBJDUMP_BIN" -T -- "$UI_BINARY" 2>/dev/null; \
+                    "$OBJDUMP_BIN" -T -- "$RECORDER_BINARY" 2>/dev/null; \
+                    "$OBJDUMP_BIN" -T -- "$REST_BINARY" 2>/dev/null; } |
     grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' |
     sed 's/^GLIBC_//' | LC_ALL=C sort -V | tail -n 1 || true)"
 [[ "$GLIBC_MINIMUM" =~ ^[0-9]+(\.[0-9]+)+$ ]] ||
@@ -140,12 +165,15 @@ trap cleanup EXIT
 payload="$work_dir/payload"
 mkdir -- "$payload" "$payload/LICENSES"
 
-# The exact executable contract is three 0755 files.  Everything else in the
+# The exact executable contract is five 0755 files.  Everything else in the
 # archive is a regular 0644 file, including every legal notice.
-install -m 0755 -- "$BINARY" "$payload/codex_info"
+install -m 0755 -- "$UI_BINARY" "$payload/codex_info"
+install -m 0755 -- "$RECORDER_BINARY" "$payload/codex_info_recorder"
+install -m 0755 -- "$REST_BINARY" "$payload/codex_info_rest"
 install -m 0755 -- "$ROOT_DIR/run.sh" "$payload/run.sh"
 install -m 0755 -- "$ROOT_DIR/packaging/install_linux_bundle.sh" "$payload/install.sh"
-install -m 0644 -- "$ROOT_DIR/packaging/codex-info.service" "$payload/codex-info.service"
+install -m 0644 -- "$ROOT_DIR/packaging/codex-info-recorder.service" "$payload/codex-info-recorder.service"
+install -m 0644 -- "$ROOT_DIR/packaging/codex-info-rest.service" "$payload/codex-info-rest.service"
 install -m 0644 -- "$ROOT_DIR/packaging/codex-info-update.service" "$payload/codex-info-update.service"
 install -m 0644 -- "$ROOT_DIR/packaging/codex-info-update.timer" "$payload/codex-info-update.timer"
 install -m 0644 -- "$ROOT_DIR/LICENSE" "$payload/LICENSE"

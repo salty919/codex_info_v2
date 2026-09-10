@@ -38,6 +38,11 @@ journal_owner_pid=
 journal_owner_starttime=
 journal_boot_id=
 previous_flat=0
+previous_combined=0
+legacy_combined_enabled=0
+legacy_combined_active=0
+legacy_combined_generation=0
+recorder_reused=0
 operation_deadline=0
 readiness_deadline=0
 requested_deadline="${CODEX_INFO_DEADLINE:-}"
@@ -50,13 +55,19 @@ share_dir="$home_dir/.local/share/codex-info"
 generations_dir="$share_dir/generations"
 backup_dir="$share_dir/legacy-backups"
 binary_destination="$local_bin/codex_info"
+recorder_binary_destination="$local_bin/codex_info_recorder"
+rest_binary_destination="$local_bin/codex_info_rest"
 launcher_destination="$local_bin/codex-info"
 installer_destination="$local_libexec/codex-info-install.sh"
 manifest_destination="$share_dir/manifest.json"
-unit_destination="$unit_dir/codex-info.service"
+unit_destination="$unit_dir/codex-info-recorder.service"
+rest_unit_destination="$unit_dir/codex-info-rest.service"
+legacy_combined_unit_destination="$unit_dir/codex-info.service"
+legacy_combined_enable_destination="$unit_dir/default.target.wants/codex-info.service"
 update_service_destination="$unit_dir/codex-info-update.service"
 update_timer_destination="$unit_dir/codex-info-update.timer"
-main_enable_destination="$unit_dir/default.target.wants/codex-info.service"
+main_enable_destination="$unit_dir/default.target.wants/codex-info-recorder.service"
+rest_enable_destination="$unit_dir/default.target.wants/codex-info-rest.service"
 timer_enable_destination="$unit_dir/timers.target.wants/codex-info-update.timer"
 current_link="$share_dir/current"
 transaction="$share_dir/install-transaction.json"
@@ -311,8 +322,11 @@ require_user_manager() {
 }
 enable_link_record() {
     case "$1" in
-        codex-info.service)
-            printf '%s\t%s\n' "$main_enable_destination" '../codex-info.service'
+        codex-info-recorder.service)
+            printf '%s\t%s\n' "$main_enable_destination" '../codex-info-recorder.service'
+            ;;
+        codex-info-rest.service)
+            printf '%s\t%s\n' "$rest_enable_destination" '../codex-info-rest.service'
             ;;
         codex-info-update.timer)
             printf '%s\t%s\n' "$timer_enable_destination" '../codex-info-update.timer'
@@ -372,11 +386,13 @@ disable_managed_unit() {
 converge_enable_links() {
     case "$desired_state" in
         running|stopped)
-            enable_managed_unit codex-info.service &&
+            enable_managed_unit codex-info-recorder.service &&
+                enable_managed_unit codex-info-rest.service &&
                 enable_managed_unit codex-info-update.timer
             ;;
         disabled|removed)
-            disable_managed_unit codex-info.service &&
+            disable_managed_unit codex-info-recorder.service &&
+                disable_managed_unit codex-info-rest.service &&
                 disable_managed_unit codex-info-update.timer
             ;;
         *) safe_blocked "unsupported desired state for enable links: $desired_state" ;;
@@ -430,7 +446,7 @@ wait_runtime_ready() {
     previous_readiness_deadline=$readiness_deadline
     readiness_deadline=$deadline
     while :; do
-        if (probe_active codex-info.service); then
+        if (probe_active codex-info-rest.service); then
             if (verify_runtime >/dev/null 2>&1); then
                 readiness_deadline=$previous_readiness_deadline
                 return 0
@@ -446,7 +462,13 @@ wait_runtime_ready() {
 }
 systemd_pid() {
     local pid
-    pid="$(systemctl_user show --property=MainPID --value codex-info.service 2>/dev/null)" || die 'could not read MainPID'
+    pid="$(systemctl_user show --property=MainPID --value codex-info-rest.service 2>/dev/null)" || die 'could not read REST MainPID'
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { printf '0\n'; return; }
+    printf '%s\n' "$pid"
+}
+recorder_systemd_pid() {
+    local pid
+    pid="$(systemctl_user show --property=MainPID --value codex-info-recorder.service 2>/dev/null)" || die 'could not read recorder MainPID'
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { printf '0\n'; return; }
     printf '%s\n' "$pid"
 }
@@ -673,7 +695,7 @@ version,source,entries=document.get("version"),document.get("source_sha"),docume
 if (not isinstance(version,str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)",version)
     or not isinstance(source,str) or not re.fullmatch(r"[0-9a-f]{40}",source) or not isinstance(entries,list)):
     raise SystemExit("manifest fields are invalid")
-paths=[]; binary=None
+paths=[]; binaries={}
 for entry in entries:
     if not isinstance(entry,dict) or set(entry)!={"path","size","sha256","mode"}:
         raise SystemExit("manifest file entry is invalid")
@@ -686,19 +708,35 @@ for entry in entries:
             isinstance(entry["mode"],bool) or not isinstance(entry["mode"],int) or entry["mode"] not in {0o644,0o755}):
         raise SystemExit("manifest file identity is invalid")
     paths.append(path_name)
-    if path_name == "codex_info": binary=entry
-if paths != sorted(paths) or binary is None:
+    if path_name in {"codex_info", "codex_info_recorder", "codex_info_rest"}: binaries[path_name]=entry
+if paths != sorted(paths) or set(binaries) != {"codex_info", "codex_info_recorder", "codex_info_rest"}:
     raise SystemExit("manifest file entries are invalid")
-print(version,source,hashlib.sha256(raw).hexdigest(),binary["sha256"],sep="\t")
+if "codex-info" + ".service" in set(paths):
+    raise SystemExit("combined recorder/REST unit is forbidden")
+print(version,source,hashlib.sha256(raw).hexdigest(),binaries["codex_info_recorder"]["sha256"],sep="\t")
+PY
+}
+manifest_rest_hash() {
+    local path="${1:-$manifest_destination}"
+    [[ -f "$path" ]] || safe_blocked 'REST manifest is absent'
+    python3 - "$path" <<'PY'
+import json,pathlib,re,sys
+path=pathlib.Path(sys.argv[1])
+document=json.loads(path.read_text(encoding="utf-8"))
+entries=document.get("files") if isinstance(document,dict) else None
+matches=[entry for entry in entries or [] if isinstance(entry,dict) and entry.get("path")=="codex_info_rest"]
+if len(matches)!=1 or not re.fullmatch(r"[0-9a-f]{64}", str(matches[0].get("sha256"))):
+    raise SystemExit("REST binary manifest entry is invalid")
+print(matches[0]["sha256"])
 PY
 }
 legacy_flat_record() {
     [[ -f "$manifest_destination" && ! -L "$manifest_destination" ]] || return 1
-    python3 - "$manifest_destination" "$binary_destination" "$installer_destination" \
-        "$unit_destination" "$update_service_destination" "$update_timer_destination" \
+    python3 - "$manifest_destination" "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$installer_destination" \
+        "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination" \
         "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" <<'PY'
 import hashlib,json,os,pathlib,re,stat,sys
-(manifest_name,binary_name,installer_name,unit_name,update_service_name,update_timer_name,
+(manifest_name,ui_binary_name,recorder_binary_name,rest_binary_name,installer_name,unit_name,rest_unit_name,update_service_name,update_timer_name,
  schema,product,target,compatibility)=sys.argv[1:]
 manifest_path=pathlib.Path(manifest_name)
 def pairs(items):
@@ -743,21 +781,138 @@ for entry in entries:
         raise SystemExit("legacy manifest file identity is invalid")
     by_path[name]=entry; ordered.append(name)
 if ordered != sorted(ordered): raise SystemExit("legacy manifest files are not sorted")
-paths={"codex_info":(binary_name,0o755),"install.sh":(installer_name,0o755),
-       "codex-info.service":(unit_name,0o644),"codex-info-update.service":(update_service_name,0o644),
+paths={"codex_info":(ui_binary_name,0o755),"codex_info_recorder":(recorder_binary_name,0o755),"codex_info_rest":(rest_binary_name,0o755),"install.sh":(installer_name,0o755),
+       "codex-info-recorder.service":(unit_name,0o644),"codex-info-rest.service":(rest_unit_name,0o644),
+       "codex-info-update.service":(update_service_name,0o644),
        "codex-info-update.timer":(update_timer_name,0o644)}
 if set(paths)-set(by_path): raise SystemExit("legacy manifest omits required flat member")
 for name,(actual_name,mode) in paths.items():
     actual=regular(actual_name,mode); entry=by_path[name]
     if actual.stat().st_size != entry["size"] or hashlib.sha256(actual.read_bytes()).hexdigest()!=entry["sha256"]:
         raise SystemExit("legacy flat member does not match manifest")
+print(version,source,hashlib.sha256(raw).hexdigest(),by_path["codex_info_recorder"]["sha256"],manifest_path.stat().st_size,sep="\t")
+PY
+}
+legacy_combined_record_at() {
+    python3 - "$@" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" <<'PY'
+import hashlib,json,os,pathlib,re,stat,sys
+(manifest_name,binary_name,installer_name,unit_name,update_service_name,update_timer_name,
+ schema,product,target,compatibility)=sys.argv[1:]
+manifest_path=pathlib.Path(manifest_name)
+def pairs(items):
+    result={}
+    for key,value in items:
+        if key in result: raise SystemExit("legacy combined manifest has duplicate keys")
+        result[key]=value
+    return result
+def regular(path,mode):
+    path=pathlib.Path(path)
+    if not path.is_file() or path.is_symlink(): raise SystemExit("legacy combined member is not regular")
+    metadata=path.stat()
+    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != mode:
+        raise SystemExit("legacy combined member owner or mode is not trusted")
+    return path
+try:
+    raw=manifest_path.read_bytes()
+    document=json.loads(raw.decode("utf-8"),object_pairs_hook=pairs)
+except Exception as error: raise SystemExit(str(error))
+regular(manifest_path,0o644)
+required={"schema","product","version","source_sha","run_id","run_attempt","target","compatibility","glibc_minimum","files"}
+if not isinstance(document,dict) or set(document)!=required: raise SystemExit("legacy combined manifest keys are invalid")
+if document["schema"]!=schema or document["product"]!=product or document["target"]!=target or document["compatibility"]!=compatibility:
+    raise SystemExit("legacy combined manifest identity is invalid")
+version,source=document["version"],document["source_sha"]
+if (not isinstance(version,str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*)",version) or
+    not isinstance(source,str) or not re.fullmatch(r"[0-9a-f]{40}",source) or
+    not isinstance(document["run_id"],str) or not re.fullmatch(r"[1-9][0-9]*",document["run_id"]) or
+    isinstance(document["run_attempt"],bool) or not isinstance(document["run_attempt"],int) or document["run_attempt"]<1 or
+    not isinstance(document["glibc_minimum"],str) or not re.fullmatch(r"[0-9]+(?:[.][0-9]+)+",document["glibc_minimum"])):
+    raise SystemExit("legacy combined manifest identity fields are invalid")
+entries=document["files"]
+if not isinstance(entries,list) or not entries: raise SystemExit("legacy combined manifest files are invalid")
+by_path={}; ordered=[]; modes_present=None
+for entry in entries:
+    if not isinstance(entry,dict) or set(entry) not in ({"path","size","sha256"},{"path","size","sha256","mode"}):
+        raise SystemExit("legacy combined manifest entry schema is invalid")
+    has_mode="mode" in entry
+    if modes_present is None: modes_present=has_mode
+    if modes_present != has_mode: raise SystemExit("legacy combined manifest mixes entry schemas")
+    name=entry["path"]
+    if (not isinstance(name,str) or not name or name.startswith("/") or "\\" in name or
+        any(part in {"",".",".."} for part in name.split("/") ) or name in by_path):
+        raise SystemExit("legacy combined manifest path is invalid")
+    if (isinstance(entry["size"],bool) or not isinstance(entry["size"],int) or entry["size"]<0 or
+        not isinstance(entry["sha256"],str) or not re.fullmatch(r"[0-9a-f]{64}",entry["sha256"])):
+        raise SystemExit("legacy combined manifest file identity is invalid")
+    if has_mode and (isinstance(entry["mode"],bool) or not isinstance(entry["mode"],int) or entry["mode"] not in {0o644,0o755}):
+        raise SystemExit("legacy combined manifest mode is invalid")
+    by_path[name]=entry; ordered.append(name)
+if ordered != sorted(ordered): raise SystemExit("legacy combined manifest files are not sorted")
+paths={"codex_info":(binary_name,0o755),"install.sh":(installer_name,0o755),
+       "codex-info.service":(unit_name,0o644),"codex-info-update.service":(update_service_name,0o644),
+       "codex-info-update.timer":(update_timer_name,0o644)}
+if set(paths)-set(by_path): raise SystemExit("legacy combined manifest omits required member")
+for name,(actual_name,mode) in paths.items():
+    actual=regular(actual_name,mode); entry=by_path[name]
+    if modes_present and entry["mode"] != mode: raise SystemExit("legacy combined member mode differs")
+    if actual.stat().st_size != entry["size"] or hashlib.sha256(actual.read_bytes()).hexdigest()!=entry["sha256"]:
+        raise SystemExit("legacy combined member does not match manifest")
 print(version,source,hashlib.sha256(raw).hexdigest(),by_path["codex_info"]["sha256"],manifest_path.stat().st_size,sep="\t")
 PY
 }
+legacy_combined_record() {
+    local resolved generation_path
+    [[ -e "$legacy_combined_unit_destination" || -L "$legacy_combined_unit_destination" ]] || return 1
+    if [[ -L "$legacy_combined_unit_destination" ]]; then
+        resolved="$(readlink -f -- "$legacy_combined_unit_destination" 2>/dev/null || true)"
+        [[ "$resolved" == "$generations_dir/"*"/codex-info.service" ]] || return 1
+        generation_path="${resolved%/codex-info.service}"
+        [[ "$(dirname -- "$generation_path")" == "$generations_dir" ]] || return 1
+        legacy_combined_record_at "$generation_path/manifest.json" "$generation_path/codex_info" \
+            "$generation_path/install.sh" "$generation_path/codex-info.service" \
+            "$generation_path/codex-info-update.service" "$generation_path/codex-info-update.timer"
+    else
+        legacy_combined_record_at "$manifest_destination" "$binary_destination" "$installer_destination" \
+            "$legacy_combined_unit_destination" "$update_service_destination" "$update_timer_destination"
+    fi
+}
+legacy_combined_present() {
+    [[ -e "$legacy_combined_unit_destination" || -L "$legacy_combined_unit_destination" ||
+        -e "$legacy_combined_enable_destination" || -L "$legacy_combined_enable_destination" ]]
+}
+legacy_combined_retired() {
+    [[ ! -e "$legacy_combined_unit_destination" && ! -L "$legacy_combined_unit_destination" &&
+        ! -e "$legacy_combined_enable_destination" && ! -L "$legacy_combined_enable_destination" ]]
+}
+probe_legacy_combined_enabled() {
+    local status=0
+    systemctl_user is-enabled --quiet codex-info.service >/dev/null 2>&1 || status="$?"
+    case "$status" in 0) return 0 ;; 1|4) return 1 ;; *) die 'could not inspect legacy combined enabled state' ;; esac
+}
+validate_legacy_combined_enable_link() {
+    if [[ -e "$legacy_combined_enable_destination" || -L "$legacy_combined_enable_destination" ]]; then
+        [[ -L "$legacy_combined_enable_destination" &&
+           "$(readlink -- "$legacy_combined_enable_destination" 2>/dev/null || true)" == '../codex-info.service' ]] ||
+            safe_blocked 'foreign legacy combined enable link'
+    fi
+}
+legacy_combined_owner_record() {
+    local resolved="$1" generation_path
+    if [[ "$resolved" == "$binary_destination" ]]; then
+        legacy_combined_record
+        return
+    fi
+    [[ "$resolved" == "$generations_dir/"*"/codex_info" ]] || return 1
+    generation_path="${resolved%/codex_info}"
+    [[ "$(dirname -- "$generation_path")" == "$generations_dir" ]] || return 1
+    legacy_combined_record_at "$generation_path/manifest.json" "$generation_path/codex_info" \
+        "$generation_path/install.sh" "$generation_path/codex-info.service" \
+        "$generation_path/codex-info-update.service" "$generation_path/codex-info-update.timer"
+}
 legacy_flat_present() {
     local path
-    for path in "$manifest_destination" "$binary_destination" "$installer_destination" \
-        "$unit_destination" "$update_service_destination" "$update_timer_destination"; do
+    for path in "$manifest_destination" "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$installer_destination" \
+        "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
         [[ -e "$path" || -L "$path" ]] && return 0
     done
     return 1
@@ -856,28 +1011,32 @@ PY
 }
 verify_fixed_links() {
     local destination expected
-    for destination in "$binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$update_service_destination" "$update_timer_destination"; do
+    for destination in "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
         [[ -L "$destination" ]] || safe_blocked "fixed link missing: $destination"
     done
-    [[ "$(readlink -- "$binary_destination")" == '../share/codex-info/current/codex_info' ]] || safe_blocked 'binary link is not canonical'
+    [[ "$(readlink -- "$binary_destination")" == '../share/codex-info/current/codex_info' ]] || safe_blocked 'UI binary link is not canonical'
+    [[ "$(readlink -- "$recorder_binary_destination")" == '../share/codex-info/current/codex_info_recorder' ]] || safe_blocked 'recorder binary link is not canonical'
+    [[ "$(readlink -- "$rest_binary_destination")" == '../share/codex-info/current/codex_info_rest' ]] || safe_blocked 'REST binary link is not canonical'
     [[ "$(readlink -- "$launcher_destination")" == '../share/codex-info/current/run.sh' ]] || safe_blocked 'launcher link is not canonical'
     [[ "$(readlink -- "$installer_destination")" == '../share/codex-info/current/install.sh' ]] || safe_blocked 'installer link is not canonical'
     [[ "$(readlink -- "$manifest_destination")" == 'current/manifest.json' ]] || safe_blocked 'manifest link is not canonical'
-    for destination in "$unit_destination" "$update_service_destination" "$update_timer_destination"; do
+    for destination in "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
         expected="../../../.local/share/codex-info/current/$(basename -- "$destination")"
         [[ "$(readlink -- "$destination")" == "$expected" ]] || safe_blocked "unit link is not canonical"
     done
 }
 verify_fixed_links_local() {
     local destination expected
-    for destination in "$binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$update_service_destination" "$update_timer_destination"; do
+    for destination in "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
         [[ -L "$destination" ]] || return 1
     done
     [[ "$(readlink -- "$binary_destination")" == '../share/codex-info/current/codex_info' ]] || return 1
+    [[ "$(readlink -- "$recorder_binary_destination")" == '../share/codex-info/current/codex_info_recorder' ]] || return 1
+    [[ "$(readlink -- "$rest_binary_destination")" == '../share/codex-info/current/codex_info_rest' ]] || return 1
     [[ "$(readlink -- "$launcher_destination")" == '../share/codex-info/current/run.sh' ]] || return 1
     [[ "$(readlink -- "$installer_destination")" == '../share/codex-info/current/install.sh' ]] || return 1
     [[ "$(readlink -- "$manifest_destination")" == 'current/manifest.json' ]] || return 1
-    for destination in "$unit_destination" "$update_service_destination" "$update_timer_destination"; do
+    for destination in "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
         expected="../../../.local/share/codex-info/current/$(basename -- "$destination")"
         [[ "$(readlink -- "$destination")" == "$expected" ]] || return 1
     done
@@ -892,10 +1051,13 @@ verify_local_generation() {
     verify_generation_files "$generations_dir/$generation" || return 1
     if [[ "$desired_state" == removed ]]; then
         [[ -L "$binary_destination" && "$(readlink -- "$binary_destination")" == '../share/codex-info/current/codex_info' ]] || return 1
+        [[ -L "$recorder_binary_destination" && "$(readlink -- "$recorder_binary_destination")" == '../share/codex-info/current/codex_info_recorder' ]] || return 1
+        [[ -L "$rest_binary_destination" && "$(readlink -- "$rest_binary_destination")" == '../share/codex-info/current/codex_info_rest' ]] || return 1
         [[ -L "$launcher_destination" && "$(readlink -- "$launcher_destination")" == '../share/codex-info/current/run.sh' ]] || return 1
         [[ -L "$installer_destination" && "$(readlink -- "$installer_destination")" == '../share/codex-info/current/install.sh' ]] || return 1
         [[ -L "$manifest_destination" && "$(readlink -- "$manifest_destination")" == 'current/manifest.json' ]] || return 1
         [[ ! -e "$unit_destination" && ! -L "$unit_destination" ]] || return 1
+        [[ ! -e "$rest_unit_destination" && ! -L "$rest_unit_destination" ]] || return 1
         [[ ! -e "$update_service_destination" && ! -L "$update_service_destination" ]] || return 1
         [[ ! -e "$update_timer_destination" && ! -L "$update_timer_destination" ]] || return 1
     else
@@ -985,7 +1147,8 @@ for entry in entries:
             isinstance(entry["mode"],bool) or not isinstance(entry["mode"],int) or entry["mode"] not in {0o644,0o755}): reject("file identity")
     paths.append(path); by_path[path]=entry
 if paths!=sorted(paths): reject("files not sorted")
-required_files={"codex_info","run.sh","install.sh","codex-info.service","codex-info-update.service","codex-info-update.timer","LICENSE","COPYRIGHT"}
+if "codex-info" + ".service" in set(paths): reject("combined recorder/REST unit is forbidden")
+required_files={"codex_info","codex_info_recorder","codex_info_rest","run.sh","install.sh","codex-info-recorder.service","codex-info-rest.service","codex-info-update.service","codex-info-update.timer","LICENSE","COPYRIGHT"}
 if not required_files.issubset(by_path) or not ({"THIRD_PARTY_NOTICES.md","NOTICE.txt"} & set(by_path)): reject("required member missing")
 try:
     with tarfile.open(archive_name,"r:gz") as archive:
@@ -1015,7 +1178,7 @@ try:
             if digest.hexdigest()!=expected: reject("SHA256SUMS digest")
         for path,entry in by_path.items():
             member=archive.getmember(path); mode=member.mode&0o7777
-            expected_mode=0o755 if path in {"codex_info","run.sh","install.sh"} else 0o644
+            expected_mode=0o755 if path in {"codex_info","codex_info_recorder","codex_info_rest","run.sh","install.sh"} else 0o644
             if mode!=expected_mode or mode!=entry["mode"] or member.size!=entry["size"]: reject("mode/size mismatch")
             digest=hashlib.sha256(); stream=archive.extractfile(member)
             while chunk:=stream.read(1024*1024): digest.update(chunk)
@@ -1024,7 +1187,7 @@ try:
             if archive.getmember(path).mode&0o7777 != 0o644: reject("metadata mode mismatch")
 except (OSError,tarfile.TarError,UnicodeError) as error: reject(str(error))
 signal.alarm(0)
-print(manifest["version"],manifest["source_sha"],hashlib.sha256(raw).hexdigest(),by_path["codex_info"]["sha256"],sep="\t")
+print(manifest["version"],manifest["source_sha"],hashlib.sha256(raw).hexdigest(),by_path["codex_info_recorder"]["sha256"],sep="\t")
 PY
 }
 extract_candidate() {
@@ -1112,7 +1275,7 @@ backup_legacy_path() {
         safe_blocked "legacy path owner is not trusted: $destination"
     local expected_mode
     case "$destination" in
-        "$binary_destination"|"$installer_destination") expected_mode=755 ;;
+        "$binary_destination"|"$recorder_binary_destination"|"$rest_binary_destination"|"$installer_destination") expected_mode=755 ;;
         *) expected_mode=644 ;;
     esac
     [[ "$(stat -c '%a' -- "$destination")" == "$expected_mode" ]] ||
@@ -1139,15 +1302,44 @@ try: os.fsync(fd)
 finally: os.close(fd)
 PY
 }
+backup_legacy_combined_unit() {
+    local destination="$legacy_combined_unit_destination" resolved generation_path backup
+    [[ -e "$destination" || -L "$destination" ]] || return 0
+    if [[ ! -L "$destination" ]]; then
+        backup_legacy_path "$destination"
+        return
+    fi
+    resolved="$(readlink -f -- "$destination" 2>/dev/null || true)"
+    [[ "$resolved" == "$generations_dir/"*"/codex-info.service" ]] ||
+        safe_blocked 'foreign legacy combined unit symlink'
+    generation_path="${resolved%/codex-info.service}"
+    [[ "$(dirname -- "$generation_path")" == "$generations_dir" ]] ||
+        safe_blocked 'legacy combined unit generation path is invalid'
+    backup="$backup_dir/$operation_id-codex-info.service"
+    [[ ! -e "$backup" && ! -L "$backup" ]] || safe_blocked 'legacy combined unit backup collision'
+    mkdir -p -- "$backup_dir"; chmod 700 -- "$backup_dir"
+    python3 - "$destination" "$backup" <<'PY'
+import os,sys
+from pathlib import Path
+source,destination=map(Path,sys.argv[1:])
+os.replace(source,destination)
+for parent in {source.parent,destination.parent}:
+    fd=os.open(parent,os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+PY
+}
 link_entrypoints() {
     mkdir -p -- "$local_bin" "$local_libexec" "$unit_dir"
     atomic_symlink '../share/codex-info/current/codex_info' "$binary_destination"
+    atomic_symlink '../share/codex-info/current/codex_info_recorder' "$recorder_binary_destination"
+    atomic_symlink '../share/codex-info/current/codex_info_rest' "$rest_binary_destination"
     atomic_symlink '../share/codex-info/current/run.sh' "$launcher_destination"
     atomic_symlink '../share/codex-info/current/install.sh' "$installer_destination"
     atomic_symlink 'current/manifest.json' "$manifest_destination"
     if [[ "${desired_state-}" == removed ]]; then
         local destination expected
-        for destination in "$unit_destination" "$update_service_destination" "$update_timer_destination"; do
+        for destination in "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
             [[ -e "$destination" || -L "$destination" ]] || continue
             expected="../../../.local/share/codex-info/current/$(basename -- "$destination")"
             [[ -L "$destination" && "$(readlink -- "$destination")" == "$expected" ]] ||
@@ -1156,12 +1348,13 @@ link_entrypoints() {
         done
         return 0
     fi
-    atomic_symlink '../../../.local/share/codex-info/current/codex-info.service' "$unit_destination"
+    atomic_symlink '../../../.local/share/codex-info/current/codex-info-recorder.service' "$unit_destination"
+    atomic_symlink '../../../.local/share/codex-info/current/codex-info-rest.service' "$rest_unit_destination"
     atomic_symlink '../../../.local/share/codex-info/current/codex-info-update.service' "$update_service_destination"
     atomic_symlink '../../../.local/share/codex-info/current/codex-info-update.timer' "$update_timer_destination"
 }
 restore_backups() {
-    python3 - "$operation_id" "$backup_dir" "$current_link" "$binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$update_service_destination" "$update_timer_destination" <<'PY'
+    python3 - "$operation_id" "$backup_dir" "$current_link" "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$legacy_combined_unit_destination" "$update_service_destination" "$update_timer_destination" <<'PY'
 import os,sys
 from pathlib import Path
 operation,backup_root,*destinations=sys.argv[1:]
@@ -1171,7 +1364,7 @@ for destination_name in reversed(destinations):
     backup=backup_root / (operation + "-" + destination.name)
     if backup.exists() or backup.is_symlink():
         if destination.exists() or destination.is_symlink(): destination.unlink()
-        expected=0o755 if destination.name in {"codex_info","codex-info-install.sh"} else 0o644
+        expected=0o755 if destination.name in {"codex_info","codex_info_recorder","codex_info_rest","codex-info-install.sh"} else 0o644
         if not backup.is_symlink() and (backup.stat().st_mode & 0o7777) != expected:
             raise SystemExit("legacy backup mode changed before restore")
         os.replace(backup,destination)
@@ -1186,11 +1379,13 @@ PY
 }
 remove_published_entrypoints() {
     local destination link_target expected
-    for destination in "$binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$update_service_destination" "$update_timer_destination"; do
+    for destination in "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
         [[ -L "$destination" ]] || continue
         link_target="$(readlink -- "$destination" 2>/dev/null || true)"
         case "$destination" in
             "$binary_destination") expected='../share/codex-info/current/codex_info' ;;
+            "$recorder_binary_destination") expected='../share/codex-info/current/codex_info_recorder' ;;
+            "$rest_binary_destination") expected='../share/codex-info/current/codex_info_rest' ;;
             "$launcher_destination") expected='../share/codex-info/current/run.sh' ;;
             "$installer_destination") expected='../share/codex-info/current/install.sh' ;;
             "$manifest_destination") expected='current/manifest.json' ;;
@@ -1202,13 +1397,16 @@ remove_published_entrypoints() {
 }
 ensure_entrypoints_for_generation() {
     [[ -n "${previous_id-}" ]] || return 0
+    (( previous_combined == 0 )) || return 0
     local destination expected
     mkdir -p -- "$local_bin" "$local_libexec" "$unit_dir"
-    for destination in "$binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$update_service_destination" "$update_timer_destination"; do
-        [[ "${desired_state-}" == removed && "$destination" == "$unit_destination" || "${desired_state-}" == removed && "$destination" == "$update_service_destination" || "${desired_state-}" == removed && "$destination" == "$update_timer_destination" ]] && continue
+    for destination in "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
+        [[ "${desired_state-}" == removed && ("$destination" == "$unit_destination" || "$destination" == "$rest_unit_destination" || "$destination" == "$update_service_destination" || "$destination" == "$update_timer_destination") ]] && continue
         [[ -e "$destination" || -L "$destination" ]] && continue
         case "$destination" in
             "$binary_destination") expected='../share/codex-info/current/codex_info' ;;
+            "$recorder_binary_destination") expected='../share/codex-info/current/codex_info_recorder' ;;
+            "$rest_binary_destination") expected='../share/codex-info/current/codex_info_rest' ;;
             "$launcher_destination") expected='../share/codex-info/current/run.sh' ;;
             "$installer_destination") expected='../share/codex-info/current/install.sh' ;;
             "$manifest_destination") expected='current/manifest.json' ;;
@@ -1255,13 +1453,14 @@ retire_known_unmanaged() {
     local managed_pid="$1" listener_pid
     listener_pid="$(socket_pid)" || safe_blocked 'listener ownership is ambiguous'
     if [[ -z "$listener_pid" || "$listener_pid" == "$managed_pid" ]]; then return 0; fi
-    local resolved actual expected generation_path
+    local resolved actual expected generation_path legacy_info
     resolved="$(readlink -f -- "$proc_root/$listener_pid/exe" 2>/dev/null || true)"
-    if [[ "$resolved" == "$binary_destination" ]]; then
+    if [[ "$resolved" == "$rest_binary_destination" ]]; then
         local legacy_info legacy_binary
-        legacy_info="$(legacy_flat_record)" || safe_blocked 'legacy listener state is not trusted'
+        legacy_info="$(legacy_flat_record)" || safe_blocked 'legacy REST listener state is not trusted'
         IFS=$'\t' read -r _ _ _ legacy_binary _ <<<"$legacy_info"
-        [[ "$(stat -Lc '%d:%i' -- "$resolved" 2>/dev/null || true)" == "$(stat -Lc '%d:%i' -- "$binary_destination" 2>/dev/null || true)" ]] ||
+        legacy_binary="$(manifest_rest_hash "$manifest_destination")" || safe_blocked 'legacy REST listener hash is unavailable'
+        [[ "$(stat -Lc '%d:%i' -- "$resolved" 2>/dev/null || true)" == "$(stat -Lc '%d:%i' -- "$rest_binary_destination" 2>/dev/null || true)" ]] ||
             safe_blocked 'legacy listener executable identity differs'
         actual="$(sha256sum -- "$resolved" 2>/dev/null | awk '{print $1}' || true)"
         [[ "$actual" == "$legacy_binary" ]] || safe_blocked 'legacy listener digest differs'
@@ -1273,8 +1472,20 @@ retire_known_unmanaged() {
         done
         return 0
     fi
-    [[ "$resolved" == "$generations_dir/"*"/codex_info" ]] || safe_blocked 'foreign listener owner is present'
-    generation_path="${resolved%/codex_info}"
+    if legacy_info="$(legacy_combined_owner_record "$resolved" 2>/dev/null)"; then
+        IFS=$'\t' read -r _ _ _ expected _ <<<"$legacy_info"
+        actual="$(sha256sum -- "$proc_root/$listener_pid/exe" 2>/dev/null | awk '{print $1}' || true)"
+        [[ -n "$actual" && "$actual" == "$expected" ]] || safe_blocked 'legacy combined listener digest differs'
+        kill -TERM "$listener_pid" 2>/dev/null || safe_blocked 'legacy combined listener could not be retired'
+        local legacy_deadline; legacy_deadline=$(( $(now_unix) + HEALTH_TIMEOUT ))
+        while kill -0 "$listener_pid" 2>/dev/null; do
+            (( $(now_unix) < legacy_deadline )) || safe_blocked 'legacy combined listener did not stop in 30s'
+            sleep_interval 1
+        done
+        return 0
+    fi
+    [[ "$resolved" == "$generations_dir/"*"/codex_info_rest" ]] || safe_blocked 'foreign listener owner is present'
+    generation_path="${resolved%/codex_info_rest}"
     [[ "$(dirname -- "$generation_path")" == "$generations_dir" ]] || safe_blocked 'listener generation path is invalid'
     verify_generation_files "$generation_path" || safe_blocked 'known listener generation is incoherent'
     expected="$(python3 - "$resolved" "$SCHEMA" "$PRODUCT" "$TARGET" "$COMPATIBILITY" <<'PY'
@@ -1282,7 +1493,7 @@ import hashlib, json, pathlib, re, stat, sys
 
 path = pathlib.Path(sys.argv[1])
 schema, product, target, compatibility = sys.argv[2:]
-if path.name != "codex_info" or not path.is_file() or path.is_symlink():
+if path.name != "codex_info_rest" or not path.is_file() or path.is_symlink():
     raise SystemExit("listener executable is not a regular generation member")
 manifest_path = path.parent / "manifest.json"
 try:
@@ -1316,7 +1527,7 @@ if path.parent.name != version + "-" + source + "-" + manifest_hash:
 entries = document["files"]
 if not isinstance(entries, list):
     raise SystemExit("listener generation entries are invalid")
-binary = [entry for entry in entries if isinstance(entry, dict) and entry.get("path") == "codex_info"]
+binary = [entry for entry in entries if isinstance(entry, dict) and entry.get("path") == "codex_info_rest"]
 if len(binary) != 1 or set(binary[0]) != {"path", "size", "sha256", "mode"}:
     raise SystemExit("listener binary manifest entry is invalid")
 entry = binary[0]
@@ -1337,22 +1548,25 @@ PY
     done
 }
 preflight_listener_owner() {
-    local listener_pid managed_pid=0 resolved generation_path info expected actual
+    local listener_pid managed_pid=0 resolved generation_path info expected actual legacy_info
     listener_pid="$(socket_pid)" || safe_blocked 'listener ownership is ambiguous'
     [[ -z "$listener_pid" ]] && return 0
-    if probe_active codex-info.service; then managed_pid="$(systemd_pid)"; fi
+    if probe_active codex-info-rest.service; then managed_pid="$(systemd_pid)"; fi
     [[ "$listener_pid" == "$managed_pid" ]] && return 0
     resolved="$(readlink -f -- "$proc_root/$listener_pid/exe" 2>/dev/null || true)"
-    if [[ "$resolved" == "$binary_destination" ]]; then
-        info="$(legacy_flat_record)" || safe_blocked 'legacy listener state is not trusted'
-        IFS=$'\t' read -r _ _ _ expected _ <<<"$info"
-        [[ "$(stat -Lc '%d:%i' -- "$resolved" 2>/dev/null || true)" == "$(stat -Lc '%d:%i' -- "$binary_destination" 2>/dev/null || true)" ]] || safe_blocked 'legacy listener executable identity differs'
-    elif [[ "$resolved" == "$generations_dir/"*"/codex_info" ]]; then
-        generation_path="${resolved%/codex_info}"
+    if [[ "$resolved" == "$rest_binary_destination" ]]; then
+        info="$(legacy_flat_record)" || safe_blocked 'legacy REST listener state is not trusted'
+        expected="$(manifest_rest_hash "$manifest_destination")" || safe_blocked 'legacy REST listener hash is unavailable'
+        [[ "$(stat -Lc '%d:%i' -- "$resolved" 2>/dev/null || true)" == "$(stat -Lc '%d:%i' -- "$rest_binary_destination" 2>/dev/null || true)" ]] || safe_blocked 'legacy REST listener executable identity differs'
+    elif [[ "$resolved" == "$generations_dir/"*"/codex_info_rest" ]]; then
+        generation_path="${resolved%/codex_info_rest}"
         [[ "$(dirname -- "$generation_path")" == "$generations_dir" ]] || safe_blocked 'listener generation path is invalid'
         verify_generation_files "$generation_path" || safe_blocked 'known listener generation is incoherent'
-        info="$(manifest_record "$generation_path/manifest.json")" || safe_blocked 'known listener manifest is invalid'
-        IFS=$'\t' read -r _ _ _ expected <<<"$info"
+        expected="$(manifest_rest_hash "$generation_path/manifest.json")" || safe_blocked 'known listener REST hash is unavailable'
+    elif legacy_info="$(legacy_combined_owner_record "$resolved" 2>/dev/null)"; then
+        IFS=$'\t' read -r _ _ _ expected _ <<<"$legacy_info"
+        [[ "$(stat -Lc '%d:%i' -- "$proc_root/$listener_pid/exe" 2>/dev/null || true)" == "$(stat -Lc '%d:%i' -- "$resolved" 2>/dev/null || true)" ]] ||
+            safe_blocked 'legacy combined listener executable identity differs'
     else
         safe_blocked 'foreign listener owner is present'
     fi
@@ -1363,7 +1577,7 @@ guard_control_listener() {
     local listener_pid managed_pid=0
     listener_pid="$(socket_pid)" || safe_blocked 'listener ownership is ambiguous'
     [[ -z "$listener_pid" ]] && return 0
-    if probe_active codex-info.service; then managed_pid="$(systemd_pid)"; fi
+    if probe_active codex-info-rest.service; then managed_pid="$(systemd_pid)"; fi
     [[ "$listener_pid" == "$managed_pid" ]] || safe_blocked 'foreign listener blocks control mutation'
 }
 recorder_identity_check() {
@@ -1416,10 +1630,9 @@ partition = state["partition_id_hash"]
 if partition is not None and (not isinstance(partition, str) or not re.fullmatch(r"[0-9a-f]{64}", partition)): raise SystemExit("recorder partition identity is invalid")
 if write_state == "idle_no_account" and any(state[key] is not None for key in ("partition_id_hash","data_generation","collector_epoch","cycle_seq","last_commit_unix")):
     raise SystemExit("idle recorder state is inconsistent")
-if write_state == "ready":
-    if partition is None or any(state[key] is None for key in ("data_generation","collector_epoch","cycle_seq","last_commit_unix")): raise SystemExit("ready recorder state is incomplete")
+if write_state in {"ready", "degraded"}:
+    if partition is None or any(state[key] is None for key in ("data_generation","collector_epoch","cycle_seq","last_commit_unix")): raise SystemExit("recorder state is incomplete")
     if state["last_commit_unix"] > now + 5 or now - state["last_commit_unix"] > 150: raise SystemExit("recorder commit is stale")
-if write_state == "degraded": raise SystemExit("recorder is degraded")
 if state["data_generation"] is not None and (isinstance(state["data_generation"], bool) or not isinstance(state["data_generation"], int) or state["data_generation"] <= 0): raise SystemExit("recorder data generation is invalid")
 if state["collector_epoch"] is not None and (not isinstance(state["collector_epoch"], str) or not re.fullmatch(r"[0-9a-f]{32}", state["collector_epoch"]) or set(state["collector_epoch"]) == {"0"}): raise SystemExit("recorder collector epoch is invalid")
 if state["cycle_seq"] is not None and (isinstance(state["cycle_seq"], bool) or not isinstance(state["cycle_seq"], int) or state["cycle_seq"] <= 0): raise SystemExit("recorder cycle is invalid")
@@ -1440,7 +1653,7 @@ proc_identity_check() {
 }
 health_readback() {
     local pid="$1" before="$2" version="$3" source="$4" manifest_hash="$5" binary_hash="$6" response details after after_pid expected_exe health_limit health_now health_remaining readback_deadline
-    expected_exe="$generations_dir/$version-$source-$manifest_hash/codex_info"
+    expected_exe="$generations_dir/$version-$source-$manifest_hash/codex_info_rest"
     proc_identity_check "$pid" "$binary_hash" "$expected_exe"
     health_now="$(now_unix)" || safe_blocked 'health clock is unavailable'
     readback_deadline=$((health_now + HEALTH_TIMEOUT))
@@ -1492,29 +1705,35 @@ observed_at=document.get("observed_at")
 if isinstance(observed_at,bool) or not isinstance(observed_at,int) or observed_at <= 0:
     raise SystemExit("details observed_at is invalid")
 ' <<< "$details"
-    recorder_identity_check "$pid" "$version" "$source" "$manifest_hash"
+    local recorder_pid
+    recorder_pid="$(recorder_systemd_pid)"; [[ "$recorder_pid" != 0 ]] || safe_blocked 'recorder service has no MainPID'
+    recorder_identity_check "$recorder_pid" "$version" "$source" "$manifest_hash"
     proc_identity_check "$pid" "$binary_hash" "$expected_exe"
 }
 verify_runtime() {
     verify_fixed_links
+    legacy_combined_retired || safe_blocked 'legacy combined unit was not retired'
     [[ -L "$current_link" ]] || safe_blocked 'current generation is absent'
-    local target generation info version source manifest_hash binary_hash pid before
+    local target generation info version source manifest_hash binary_hash rest_hash pid before
     target="$(readlink -- "$current_link")"
     [[ "$target" == generations/* && "$target" != */*/* ]] || safe_blocked 'current generation link is invalid'
     generation="${target#generations/}"
     [[ -d "$generations_dir/$generation" && ! -L "$generations_dir/$generation" ]] || safe_blocked 'current generation directory is invalid'
     info="$(manifest_record)"; IFS=$'\t' read -r version source manifest_hash binary_hash <<<"$info"
+    rest_hash="$(manifest_rest_hash)" || safe_blocked 'REST binary digest is unavailable'
     [[ "$generation" == "$version-$source-$manifest_hash" ]] || safe_blocked 'generation identity mismatch'
     verify_generation_files "$generations_dir/$generation" || safe_blocked 'generation artifact set is incoherent'
-    [[ "$(sha256sum -- "$binary_destination" | awk '{print $1}')" == "$binary_hash" ]] || safe_blocked 'installed binary digest mismatch'
-    probe_active codex-info.service || safe_blocked 'managed service is inactive'
-    pid="$(systemd_pid)"; [[ "$pid" != 0 ]] || safe_blocked 'managed service has no MainPID'
+    [[ "$(sha256sum -- "$recorder_binary_destination" | awk '{print $1}')" == "$binary_hash" ]] || safe_blocked 'installed recorder binary digest mismatch'
+    [[ "$(sha256sum -- "$rest_binary_destination" | awk '{print $1}')" == "$rest_hash" ]] || safe_blocked 'installed REST binary digest mismatch'
+    probe_active codex-info-recorder.service || safe_blocked 'recorder service is inactive'
+    probe_active codex-info-rest.service || safe_blocked 'REST service is inactive'
+    pid="$(systemd_pid)"; [[ "$pid" != 0 ]] || safe_blocked 'REST service has no MainPID'
     before="$(proc_starttime "$pid" 2>/dev/null || true)"; [[ -n "$before" ]] || safe_blocked 'MainPID starttime unavailable'
-    health_readback "$pid" "$before" "$version" "$source" "$manifest_hash" "$binary_hash"
+    health_readback "$pid" "$before" "$version" "$source" "$manifest_hash" "$rest_hash"
     printf 'ready version=%s source=%s generation=%s pid=%s\n' "$version" "$source" "$generation" "$pid"
 }
 verify_ui_source() {
-    local target generation info version source manifest_hash binary_hash pid expected_exe resolved listener_pid
+    local target generation info version source manifest_hash binary_hash rest_hash pid expected_exe resolved listener_pid
     verify_fixed_links_local || return 1
     [[ -L "$current_link" ]] || return 1
     target="$(readlink -- "$current_link")"
@@ -1523,31 +1742,33 @@ verify_ui_source() {
     [[ -d "$generations_dir/$generation" && ! -L "$generations_dir/$generation" ]] || return 1
     info="$(manifest_record)" || return 1
     IFS=$'\t' read -r version source manifest_hash binary_hash <<<"$info"
+    rest_hash="$(manifest_rest_hash)" || return 1
     [[ "$generation" == "$version-$source-$manifest_hash" ]] || return 1
     verify_generation_files "$generations_dir/$generation" || return 1
-    if ! probe_active codex-info.service; then
+    if ! probe_active codex-info-rest.service; then
         listener_pid="$(socket_pid 2>/dev/null || true)"
         [[ -z "$listener_pid" ]]
         return
     fi
     pid="$(systemd_pid)"; [[ "$pid" != 0 ]] || return 1
-    expected_exe="$generations_dir/$generation/codex_info"
+    expected_exe="$generations_dir/$generation/codex_info_rest"
     resolved="$(readlink -f -- "$proc_root/$pid/exe" 2>/dev/null || true)"
     [[ "$resolved" == "$expected_exe" ]] || return 1
     [[ "$(stat -Lc '%d:%i' -- "$resolved" 2>/dev/null || true)" == "$(stat -Lc '%d:%i' -- "$expected_exe" 2>/dev/null || true)" ]] || return 1
-    [[ "$(sha256sum -- "$resolved" 2>/dev/null | awk '{print $1}')" == "$binary_hash" ]] || return 1
+    [[ "$(sha256sum -- "$resolved" 2>/dev/null | awk '{print $1}')" == "$rest_hash" ]] || return 1
     listener_pid="$(socket_pid 2>/dev/null || true)"
     [[ -z "$listener_pid" || "$listener_pid" == "$pid" ]]
 }
 verify_legacy_runtime() {
-    local info version source manifest_hash binary_hash pid before after listener_pid
+    local info version source manifest_hash binary_hash pid recorder_pid before after listener_pid
     info="$(legacy_flat_record)" || return 1
     IFS=$'\t' read -r version source manifest_hash binary_hash _ <<<"$info"
-    probe_active codex-info.service || return 1
+    probe_active codex-info-recorder.service || return 1
+    probe_active codex-info-rest.service || return 1
     pid="$(systemd_pid)"; [[ "$pid" != 0 ]] || return 1
-    [[ "$(readlink -f -- "$proc_root/$pid/exe" 2>/dev/null || true)" == "$binary_destination" ]] || return 1
-    [[ "$(stat -Lc '%d:%i' -- "$proc_root/$pid/exe" 2>/dev/null || true)" == "$(stat -Lc '%d:%i' -- "$binary_destination" 2>/dev/null || true)" ]] || return 1
-    [[ "$(sha256sum -- "$proc_root/$pid/exe" 2>/dev/null | awk '{print $1}')" == "$binary_hash" ]] || return 1
+    [[ "$(readlink -f -- "$proc_root/$pid/exe" 2>/dev/null || true)" == "$rest_binary_destination" ]] || return 1
+    [[ "$(stat -Lc '%d:%i' -- "$proc_root/$pid/exe" 2>/dev/null || true)" == "$(stat -Lc '%d:%i' -- "$rest_binary_destination" 2>/dev/null || true)" ]] || return 1
+    [[ "$(sha256sum -- "$proc_root/$pid/exe" 2>/dev/null | awk '{print $1}')" == "$(manifest_rest_hash "$manifest_destination")" ]] || return 1
     listener_pid="$(socket_pid 2>/dev/null || true)"; [[ "$listener_pid" == "$pid" ]] || return 1
     before="$(proc_starttime "$pid" 2>/dev/null || true)"; [[ -n "$before" ]] || return 1
     python3 - "$CURL_BIN" "$HEALTH_URL" "$HEALTH_TIMEOUT" "$version" <<'PY'
@@ -1568,7 +1789,8 @@ if document!={"api_version":"v1","service":"codex-info","product_version":versio
 PY
     after="$(proc_starttime "$pid" 2>/dev/null || true)"; [[ "$after" == "$before" ]] || return 1
     [[ "$(systemd_pid)" == "$pid" ]] || return 1
-    recorder_identity_check "$pid" "$version" "$source" "$manifest_hash"
+    recorder_pid="$(recorder_systemd_pid)"; [[ "$recorder_pid" != 0 ]] || return 1
+    recorder_identity_check "$recorder_pid" "$version" "$source" "$manifest_hash"
 }
 verify_legacy_terminal() {
     legacy_flat_record >/dev/null || return 1
@@ -1576,7 +1798,8 @@ verify_legacy_terminal() {
     if [[ "$desired_state" == running ]]; then
         verify_legacy_runtime
     else
-        ! probe_active codex-info.service || return 1
+        ! probe_active codex-info-recorder.service || return 1
+        ! probe_active codex-info-rest.service || return 1
         [[ -z "$(socket_pid 2>/dev/null || true)" ]]
     fi
 }
@@ -1589,16 +1812,17 @@ rearm_update_timer() {
     systemctl_user start --no-block codex-info-update.timer >/dev/null 2>&1 || return 1
 }
 reset_failed_main() {
-    systemctl_user reset-failed codex-info.service >/dev/null 2>&1
+    systemctl_user reset-failed codex-info-recorder.service >/dev/null 2>&1
+    systemctl_user reset-failed codex-info-rest.service >/dev/null 2>&1
 }
 repair_known_managed_runtime() {
     local pid resolved expected generation_path current_path current_info expected_hash actual_hash
-    probe_active codex-info.service || return 0
+    probe_active codex-info-recorder.service || return 0
     [[ "$TRIGGER" != startup ]] || return 0
-    pid="$(systemd_pid)"; [[ "$pid" != 0 ]] || safe_blocked 'managed service has no MainPID'
+    pid="$(recorder_systemd_pid)"; [[ "$pid" != 0 ]] || safe_blocked 'managed recorder service has no MainPID'
     current_path="$(readlink -f -- "$current_link" 2>/dev/null || true)"
     [[ "$current_path" == "$generations_dir/"* ]] || safe_blocked 'current generation path is unavailable for runtime repair'
-    expected="$current_path/codex_info"
+    expected="$current_path/codex_info_recorder"
     resolved="$(readlink -f -- "$proc_root/$pid/exe" 2>/dev/null || true)"
     if [[ "$resolved" == "$expected" ]]; then
         current_info="$(manifest_record "$current_path/manifest.json")" || safe_blocked 'current generation manifest is unavailable for runtime repair'
@@ -1607,43 +1831,49 @@ repair_known_managed_runtime() {
         [[ "$actual_hash" == "$expected_hash" ]] || safe_blocked 'managed current executable digest differs'
         return 0
     fi
-    if [[ "$resolved" == "$generations_dir/"*"/codex_info" ]]; then
-        generation_path="${resolved%/codex_info}"
+    if [[ "$resolved" == "$generations_dir/"*"/codex_info_recorder" ]]; then
+        generation_path="${resolved%/codex_info_recorder}"
         [[ "$(dirname -- "$generation_path")" == "$generations_dir" ]] || safe_blocked 'managed runtime generation path is invalid'
         verify_generation_files "$generation_path" || safe_blocked 'known managed runtime generation is incoherent'
         actual_hash="$(sha256sum -- "$proc_root/$pid/exe" 2>/dev/null | awk '{print $1}' || true)"
         current_info="$(manifest_record "$generation_path/manifest.json")" || safe_blocked 'known managed runtime manifest is unavailable'
         IFS=$'\t' read -r _ _ _ expected_hash <<<"$current_info"
         [[ "$actual_hash" == "$expected_hash" ]] || safe_blocked 'known managed runtime digest differs'
-    elif [[ "$resolved" == "$binary_destination" ]]; then
+    elif [[ "$resolved" == "$recorder_binary_destination" ]]; then
         legacy_flat_record >/dev/null || safe_blocked 'legacy managed runtime is not trusted'
         actual_hash="$(sha256sum -- "$proc_root/$pid/exe" 2>/dev/null | awk '{print $1}' || true)"
-        expected_hash="$(sha256sum -- "$binary_destination" 2>/dev/null | awk '{print $1}' || true)"
+        expected_hash="$(sha256sum -- "$recorder_binary_destination" 2>/dev/null | awk '{print $1}' || true)"
         [[ -n "$actual_hash" && "$actual_hash" == "$expected_hash" ]] || safe_blocked 'legacy managed runtime digest differs'
     else
         safe_blocked 'foreign managed service executable blocks runtime repair'
     fi
     reset_failed_main || safe_blocked 'could not reset failed managed service for runtime repair'
-    systemctl_user restart --no-block codex-info.service >/dev/null 2>&1 || safe_blocked 'could not restart managed service for runtime repair'
+    systemctl_user restart --no-block codex-info-recorder.service >/dev/null 2>&1 || safe_blocked 'could not restart recorder service for runtime repair'
+    systemctl_user restart --no-block codex-info-rest.service >/dev/null 2>&1 || safe_blocked 'could not restart REST service for runtime repair'
 }
 verify_nonrunning_terminal() {
     local desired="$1" listener_pid
+    legacy_combined_retired || return 1
     if [[ "$desired" == removed ]]; then
-        unit_inactive_or_absent codex-info.service || return 1
+        unit_inactive_or_absent codex-info-recorder.service || return 1
+        unit_inactive_or_absent codex-info-rest.service || return 1
     else
-        probe_active codex-info.service && return 1
+        probe_active codex-info-recorder.service && return 1
+        probe_active codex-info-rest.service && return 1
     fi
     listener_pid="$(socket_pid 2>/dev/null || true)"
     [[ -z "$listener_pid" ]] || return 1
     verify_local_generation || return 1
     case "$desired" in
         stopped)
-            probe_enabled codex-info.service || return 1
+            probe_enabled codex-info-recorder.service || return 1
+            probe_enabled codex-info-rest.service || return 1
             probe_enabled codex-info-update.timer || return 1
             probe_active codex-info-update.timer || return 1
             ;;
         disabled)
-            probe_enabled codex-info.service && return 1
+            probe_enabled codex-info-recorder.service && return 1
+            probe_enabled codex-info-rest.service && return 1
             probe_enabled codex-info-update.timer && return 1
             probe_active codex-info-update.timer && return 1
             verify_fixed_links_local || return 1
@@ -1654,7 +1884,7 @@ verify_nonrunning_terminal() {
             [[ ! -e "$unit_destination" && ! -L "$unit_destination" ]] || return 1
             [[ ! -e "$update_service_destination" && ! -L "$update_service_destination" ]] || return 1
             [[ ! -e "$update_timer_destination" && ! -L "$update_timer_destination" ]] || return 1
-            [[ -L "$binary_destination" && -L "$launcher_destination" && -L "$installer_destination" && -L "$manifest_destination" ]] || return 1
+            [[ -L "$binary_destination" && -L "$recorder_binary_destination" && -L "$rest_binary_destination" && -L "$launcher_destination" && -L "$installer_destination" && -L "$manifest_destination" ]] || return 1
             ;;
         *) return 1 ;;
     esac
@@ -1670,14 +1900,173 @@ unit_inactive_or_absent() {
 }
 capture_runtime_state() {
     main_enabled=0; main_active=0; timer_enabled=0; timer_active=0
-    probe_enabled codex-info.service && main_enabled=1 || true; probe_active codex-info.service && main_active=1 || true
+    probe_enabled codex-info-recorder.service && main_enabled=1 || true; probe_active codex-info-recorder.service && main_active=1 || true
+    rest_enabled=0; rest_active=0
+    probe_enabled codex-info-rest.service && rest_enabled=1 || true; probe_active codex-info-rest.service && rest_active=1 || true
     probe_enabled codex-info-update.timer && timer_enabled=1 || true; probe_active codex-info-update.timer && timer_active=1 || true
+}
+capture_legacy_combined_state() {
+    legacy_combined_enabled=0; legacy_combined_active=0; legacy_combined_generation=0
+    legacy_combined_record >/dev/null || safe_blocked 'legacy combined predecessor is not trusted'
+    validate_legacy_combined_enable_link
+    probe_legacy_combined_enabled && legacy_combined_enabled=1 || true
+    probe_active codex-info.service && legacy_combined_active=1 || true
+    [[ -L "$legacy_combined_unit_destination" ]] && legacy_combined_generation=1
+}
+legacy_combined_mixed_split_present() {
+    local path
+    for path in "$recorder_binary_destination" "$rest_binary_destination" "$unit_destination" "$rest_unit_destination"; do
+        [[ -e "$path" || -L "$path" ]] && return 0
+    done
+    return 1
+}
+legacy_combined_listener_matches() {
+    local listener_pid resolved info expected actual
+    listener_pid="$(socket_pid 2>/dev/null || true)"
+    [[ -n "$listener_pid" ]] || return 1
+    resolved="$(readlink -f -- "$proc_root/$listener_pid/exe" 2>/dev/null || true)"
+    info="$(legacy_combined_owner_record "$resolved" 2>/dev/null || true)"
+    [[ -n "$info" ]] || return 1
+    IFS=$'\t' read -r _ _ _ expected _ <<<"$info"
+    [[ "$(stat -Lc '%d:%i' -- "$proc_root/$listener_pid/exe" 2>/dev/null || true)" == "$(stat -Lc '%d:%i' -- "$resolved" 2>/dev/null || true)" ]] || return 1
+    actual="$(sha256sum -- "$proc_root/$listener_pid/exe" 2>/dev/null | awk '{print $1}' || true)"
+    [[ -n "$actual" && "$actual" == "$expected" ]]
+}
+retire_legacy_combined() {
+    local managed_pid="$1" listener_pid
+    legacy_combined_present || return 0
+    (( previous_combined )) && return 0
+    capture_legacy_combined_state
+    previous_combined=1
+    if (( legacy_combined_active )); then
+        systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 ||
+            safe_blocked 'legacy combined service could not be stopped'
+        wait_inactive codex-info.service || safe_blocked 'legacy combined service did not stop'
+    fi
+    if (( legacy_combined_enabled )); then
+        systemctl_user disable --no-block codex-info.service >/dev/null 2>&1 ||
+            safe_blocked 'legacy combined service could not be disabled'
+        probe_legacy_combined_enabled && safe_blocked 'legacy combined service remained enabled'
+    fi
+    if [[ -e "$legacy_combined_enable_destination" || -L "$legacy_combined_enable_destination" ]]; then
+        validate_legacy_combined_enable_link
+        atomic_unlink "$legacy_combined_enable_destination"
+    fi
+    if probe_active codex-info.service; then
+        systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 ||
+            safe_blocked 'legacy combined service restarted during retirement'
+        wait_inactive codex-info.service || safe_blocked 'legacy combined service restarted during retirement'
+    fi
+    listener_pid="$(socket_pid 2>/dev/null || true)"
+    if [[ -n "$listener_pid" ]]; then
+        legacy_combined_listener_matches || safe_blocked 'legacy combined listener remained after stop'
+        retire_known_unmanaged "$managed_pid"
+    fi
+    [[ -z "$(socket_pid 2>/dev/null || true)" ]] || safe_blocked 'legacy combined listener could not be retired'
+    backup_legacy_combined_unit
+}
+restore_legacy_combined_entrypoints() {
+    (( previous_combined && legacy_combined_generation )) || return 0
+    atomic_symlink '../share/codex-info/current/codex_info' "$binary_destination"
+    atomic_symlink '../share/codex-info/current/run.sh' "$launcher_destination"
+    atomic_symlink '../share/codex-info/current/install.sh' "$installer_destination"
+    atomic_symlink 'current/manifest.json' "$manifest_destination"
+    atomic_symlink '../../../.local/share/codex-info/current/codex-info.service' "$legacy_combined_unit_destination"
+    atomic_symlink '../../../.local/share/codex-info/current/codex-info-update.service' "$update_service_destination"
+    atomic_symlink '../../../.local/share/codex-info/current/codex-info-update.timer' "$update_timer_destination"
+}
+restore_legacy_combined_runtime() {
+    local split_unit
+    for split_unit in codex-info-recorder.service codex-info-rest.service codex-info-update.timer; do
+        if probe_active "$split_unit"; then
+            systemctl_stop_user stop --no-block "$split_unit" >/dev/null 2>&1 || return 1
+            wait_inactive "$split_unit" || return 1
+        fi
+        disable_managed_unit "$split_unit" || return 1
+    done
+    if (( legacy_combined_enabled )); then
+        if [[ -e "$legacy_combined_enable_destination" || -L "$legacy_combined_enable_destination" ]]; then
+            validate_legacy_combined_enable_link
+        fi
+        atomic_symlink '../codex-info.service' "$legacy_combined_enable_destination"
+        systemctl_user daemon-reload >/dev/null 2>&1 || return 1
+        probe_legacy_combined_enabled || return 1
+    else
+        if [[ -e "$legacy_combined_enable_destination" || -L "$legacy_combined_enable_destination" ]]; then
+            validate_legacy_combined_enable_link
+            atomic_unlink "$legacy_combined_enable_destination"
+        fi
+        ! probe_legacy_combined_enabled || return 1
+    fi
+    if (( legacy_combined_active )); then
+        systemctl_user start --no-block codex-info.service >/dev/null 2>&1 || return 1
+        probe_active codex-info.service || return 1
+    elif probe_active codex-info.service; then
+        systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 || return 1
+        wait_inactive codex-info.service || return 1
+    fi
+    return 0
+}
+verify_legacy_combined_terminal() {
+    legacy_combined_record >/dev/null || return 1
+    if (( legacy_combined_generation )); then
+        [[ -n "$previous_id" && "$(current_generation)" == "$previous_id" ]] || return 1
+    else
+        [[ ! -L "$current_link" ]] || return 1
+    fi
+    if (( legacy_combined_enabled )); then
+        probe_legacy_combined_enabled || return 1
+    else
+        ! probe_legacy_combined_enabled || return 1
+    fi
+    if (( legacy_combined_active )); then
+        probe_active codex-info.service || return 1
+        legacy_combined_listener_matches
+    else
+        ! probe_active codex-info.service || return 1
+        [[ -z "$(socket_pid 2>/dev/null || true)" ]]
+    fi
+}
+recover_legacy_combined_state() {
+    previous_combined=0; legacy_combined_generation=0
+    if [[ -e "$legacy_combined_unit_destination" || -L "$legacy_combined_unit_destination" ]]; then
+        capture_legacy_combined_state
+        previous_combined=1
+        return
+    fi
+    local backup="$backup_dir/$operation_id-codex-info.service"
+    if [[ -e "$backup" || -L "$backup" ]]; then
+        previous_combined=1
+        [[ -n "$previous_id" ]] && legacy_combined_generation=1
+        if [[ -e "$legacy_combined_enable_destination" || -L "$legacy_combined_enable_destination" ]]; then
+            validate_legacy_combined_enable_link
+            legacy_combined_enabled=1
+        else
+            legacy_combined_enabled=0
+        fi
+        probe_active codex-info.service && legacy_combined_active=1 || true
+    fi
+}
+recorder_artifact_matches_previous() {
+    local candidate_hash="$1" previous_path previous_hash
+    [[ -n "$previous_id" && -n "$candidate_hash" ]] || return 1
+    previous_path="$generations_dir/$previous_id"
+    verify_generation_files "$previous_path" >/dev/null 2>&1 || return 1
+    previous_path="$previous_path/codex_info_recorder"
+    [[ -f "$previous_path" && ! -L "$previous_path" ]] || return 1
+    previous_hash="$(sha256sum -- "$previous_path" | awk '{print $1}')" || return 1
+    [[ "$previous_hash" == "$candidate_hash" ]]
 }
 enforce_desired_state() {
     if [[ "$desired_state" != running && "$main_active" == 1 ]]; then
-        systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 || return 1
-        wait_inactive codex-info.service || return 1
+        systemctl_stop_user stop --no-block codex-info-recorder.service >/dev/null 2>&1 || return 1
+        wait_inactive codex-info-recorder.service || return 1
         main_active=0
+    fi
+    if [[ "$desired_state" != running && "$rest_active" == 1 ]]; then
+        systemctl_stop_user stop --no-block codex-info-rest.service >/dev/null 2>&1 || return 1
+        wait_inactive codex-info-rest.service || return 1
+        rest_active=0
     fi
     if [[ "$desired_state" == disabled ]]; then
         if [[ "$timer_active" == 1 ]]; then
@@ -1693,8 +2082,19 @@ restore_runtime_state() {
     local failed=0
     if ((timer_enabled)); then enable_managed_unit codex-info-update.timer || failed=1; else disable_managed_unit codex-info-update.timer || failed=1; fi
     if ((timer_active)); then systemctl_user start --no-block codex-info-update.timer >/dev/null 2>&1 || failed=1; else systemctl_stop_user stop --no-block codex-info-update.timer >/dev/null 2>&1 || failed=1; wait_inactive codex-info-update.timer || failed=1; fi
-    if ((main_enabled)); then enable_managed_unit codex-info.service || failed=1; else disable_managed_unit codex-info.service || failed=1; fi
-    if ((main_active)); then systemctl_user restart --no-block codex-info.service >/dev/null 2>&1 || failed=1; else systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 || failed=1; wait_inactive codex-info.service || failed=1; fi
+    if ((main_enabled)); then enable_managed_unit codex-info-recorder.service || failed=1; else disable_managed_unit codex-info-recorder.service || failed=1; fi
+    if ((main_active)); then
+        if ((recorder_reused)); then
+            probe_active codex-info-recorder.service || failed=1
+        else
+            systemctl_user restart --no-block codex-info-recorder.service >/dev/null 2>&1 || failed=1
+        fi
+    else
+        systemctl_stop_user stop --no-block codex-info-recorder.service >/dev/null 2>&1 || failed=1
+        wait_inactive codex-info-recorder.service || failed=1
+    fi
+    if ((rest_enabled)); then enable_managed_unit codex-info-rest.service || failed=1; else disable_managed_unit codex-info-rest.service || failed=1; fi
+    if ((rest_active)); then systemctl_user restart --no-block codex-info-rest.service >/dev/null 2>&1 || failed=1; else systemctl_stop_user stop --no-block codex-info-rest.service >/dev/null 2>&1 || failed=1; wait_inactive codex-info-rest.service || failed=1; fi
     return "$failed"
 }
 rollback_transaction() {
@@ -1707,20 +2107,38 @@ rollback_transaction() {
     remove_published_entrypoints || ok=0
     restore_backups || ok=0
     previous_id="$previous"
-    ensure_entrypoints_for_generation || ok=0
+    if (( previous_combined )); then
+        restore_legacy_combined_entrypoints || ok=0
+    else
+        ensure_entrypoints_for_generation || ok=0
+    fi
     write_journal rollback_switched "$reason" || ok=0
-    systemctl_user daemon-reload >/dev/null 2>&1 || ok=0; restore_runtime_state || ok=0
+    systemctl_user daemon-reload >/dev/null 2>&1 || ok=0
+    if (( previous_combined )); then
+        restore_legacy_combined_runtime || ok=0
+    else
+        restore_runtime_state || ok=0
+    fi
     if ((ok)) && [[ "$desired_state" != running && "$main_active" == 1 ]]; then
-        systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 || ok=0
-        wait_inactive codex-info.service || ok=0
+        systemctl_stop_user stop --no-block codex-info-recorder.service >/dev/null 2>&1 || ok=0
+        wait_inactive codex-info-recorder.service || ok=0
         main_active=0
     fi
+    if ((ok)) && [[ "$desired_state" != running && "$rest_active" == 1 ]]; then
+        systemctl_stop_user stop --no-block codex-info-rest.service >/dev/null 2>&1 || ok=0
+        wait_inactive codex-info-rest.service || ok=0
+        rest_active=0
+    fi
     if ((ok)); then
-        if [[ -n "$previous" ]]; then
+        if (( previous_combined )); then
+            verify_legacy_combined_terminal || ok=0
+        elif [[ -n "$previous" ]]; then
             if [[ "$desired_state" == running ]]; then
                 if ! ((main_active)); then
-                    enable_managed_unit codex-info.service || ok=0
-                    systemctl_user start --no-block codex-info.service >/dev/null 2>&1 || ok=0
+                    enable_managed_unit codex-info-recorder.service || ok=0
+                    enable_managed_unit codex-info-rest.service || ok=0
+                    systemctl_user start --no-block codex-info-recorder.service >/dev/null 2>&1 || ok=0
+                    systemctl_user start --no-block codex-info-rest.service >/dev/null 2>&1 || ok=0
                 fi
                 ((ok)) && wait_runtime_ready || ok=0
             elif ((main_active)); then
@@ -1749,6 +2167,7 @@ resume_transaction() {
     journal_owner_pid="$$"; journal_owner_starttime="$(owner_starttime)" || safe_blocked 'journal resume owner starttime is unavailable'; journal_boot_id="$(boot_id)"
     require_user_manager
     capture_runtime_state
+    recover_legacy_combined_state
     if [[ "$journal_phase" == current_switched || "$journal_phase" == activation_requested ]]; then
         if [[ "$(current_generation)" == "$candidate_id" ]] && verify_local_generation >/dev/null 2>&1 &&
             { [[ "$desired_state" != running ]] || (verify_runtime >/dev/null 2>&1); }; then
@@ -1766,6 +2185,10 @@ resume_transaction() {
                 write_journal committed resumed
                 return 0
             fi
+        elif (( previous_combined )) && verify_legacy_combined_terminal >/dev/null 2>&1; then
+            write_journal rollback_verified resumed-legacy-combined-rollback
+            write_journal committed resumed
+            return 0
         elif legacy_flat_present && verify_legacy_terminal >/dev/null 2>&1; then
             write_journal rollback_verified resumed-legacy-rollback
             write_journal committed resumed
@@ -1779,6 +2202,10 @@ resume_transaction() {
     rollback_transaction "$previous_id" 'resumed rollback'
 }
 activate_candidate() {
+    local candidate_recorder_hash
+    recorder_reused=0
+    candidate_recorder_hash="$(manifest_record "$generations_dir/$candidate_id/manifest.json" | awk -F $'\t' '{print $4}')" || return 1
+    [[ "$candidate_recorder_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
     systemctl_user daemon-reload >/dev/null 2>&1 || return 1
     converge_enable_links || return 1
     if [[ "$desired_state" == stopped ]]; then
@@ -1789,8 +2216,17 @@ activate_candidate() {
     reset_failed_main || return 1
     rearm_update_timer || return 1
     [[ "$TRIGGER" == startup ]] && return
-    if ((main_active)); then systemctl_user restart --no-block codex-info.service >/dev/null 2>&1 || return 1
-    else systemctl_user start --no-block codex-info.service >/dev/null 2>&1 || return 1; fi
+    if ((main_active)); then
+        if recorder_artifact_matches_previous "$candidate_recorder_hash"; then
+            recorder_reused=1
+        else
+            systemctl_user restart --no-block codex-info-recorder.service >/dev/null 2>&1 || return 1
+        fi
+    else
+        systemctl_user start --no-block codex-info-recorder.service >/dev/null 2>&1 || return 1
+    fi
+    if ((rest_active)); then systemctl_user restart --no-block codex-info-rest.service >/dev/null 2>&1 || return 1
+    else systemctl_user start --no-block codex-info-rest.service >/dev/null 2>&1 || return 1; fi
 }
 verify_candidate() {
     verify_local_generation; [[ "$(current_generation)" == "$candidate_id" ]] || safe_blocked 'candidate is not current'
@@ -1802,22 +2238,27 @@ perform_install() {
     check_glibc_compatibility "$MANIFEST" || die 'candidate glibc compatibility check failed'
     IFS=$'\t' read -r bundle_version source_hash manifest_hash binary_hash <<<"$validation"
     candidate_id="$bundle_version-$source_hash-$manifest_hash"; previous_id="$(current_generation)"; operation_id="$(new_operation_id)"
-    previous_flat=0
-    if [[ -z "$previous_id" ]] && legacy_flat_present; then
+    previous_flat=0; previous_combined=0; legacy_combined_generation=0; recorder_reused=0
+    journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""
+    load_control_state; require_user_manager
+    if legacy_combined_present; then
+        legacy_combined_mixed_split_present && safe_blocked 'legacy combined and split installation states are mixed'
+        capture_legacy_combined_state
+    elif [[ -z "$previous_id" ]] && legacy_flat_present; then
         local legacy_info
         legacy_info="$(legacy_flat_record)" || safe_blocked 'flat predecessor is not trusted'
         previous_flat=1
     fi
-    journal_owner_pid=""; journal_owner_starttime=""; journal_boot_id=""
-    load_control_state; require_user_manager; capture_runtime_state
-    local managed_pid=0; probe_active codex-info.service && managed_pid="$(systemd_pid)" || true
+    capture_runtime_state
+    local managed_pid=0; probe_active codex-info-rest.service && managed_pid="$(systemd_pid)" || true
     # The durable pre-state marker must exist before the first stop or TERM.
     # This makes a crash after owner retirement resumable instead of leaving a
     # listener-less flat installation with no recovery authority.
     write_journal prepared
+    retire_legacy_combined "$managed_pid"
     enforce_desired_state || safe_blocked 'could not enforce desired runtime state'
     retire_known_unmanaged "$managed_pid"
-    for destination in "$current_link" "$binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$update_service_destination" "$update_timer_destination"; do
+    for destination in "$current_link" "$binary_destination" "$recorder_binary_destination" "$rest_binary_destination" "$launcher_destination" "$installer_destination" "$manifest_destination" "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do
         backup_legacy_path "$destination"
         # Persist each legacy move, so a crash between two moves can always
         # replay the same operation without guessing from mtimes.
@@ -1930,15 +2371,17 @@ run_update() {
     if [[ "$state" == no-update ]]; then
         verify_local_generation || safe_blocked 'no-update local generation is incoherent'
         if [[ "$desired_state" == running ]]; then
-            if ! probe_active codex-info.service; then
+            if ! probe_active codex-info-recorder.service || ! probe_active codex-info-rest.service; then
                 retire_known_unmanaged 0
                 if [[ "$TRIGGER" == startup ]]; then
                     converge_enable_links || safe_blocked 'startup enable links could not be recovered'
                     rm -r -- "$update_root"; update_root=; ((QUIET)) || printf 'no update current=%s newest=%s\n' "$installed_version" "$newest"; return
                 fi
                 reset_failed_main || safe_blocked 'could not reset failed managed service'
-                enable_managed_unit codex-info.service || safe_blocked 'could not enable managed service'
-                systemctl_user start --no-block codex-info.service >/dev/null 2>&1 || safe_blocked 'could not start managed service'
+                enable_managed_unit codex-info-recorder.service || safe_blocked 'could not enable recorder service'
+                enable_managed_unit codex-info-rest.service || safe_blocked 'could not enable REST service'
+                systemctl_user start --no-block codex-info-recorder.service >/dev/null 2>&1 || safe_blocked 'could not start recorder service'
+                systemctl_user start --no-block codex-info-rest.service >/dev/null 2>&1 || safe_blocked 'could not start REST service'
             else
                 repair_known_managed_runtime
             fi
@@ -2111,32 +2554,42 @@ if [[ "$ACTION" == start ]]; then
     # the service running even when the resolver selects an equal generation.
     write_control_state running
     run_update
-    enable_managed_unit codex-info.service || safe_blocked 'could not enable managed service'
+    enable_managed_unit codex-info-recorder.service || safe_blocked 'could not enable recorder service'
+    enable_managed_unit codex-info-rest.service || safe_blocked 'could not enable REST service'
     rearm_update_timer || safe_blocked 'could not enable update timer'
-    if ! probe_active codex-info.service; then
-        systemctl_user start --no-block codex-info.service >/dev/null 2>&1 || safe_blocked 'could not start managed service'
+    if ! probe_active codex-info-recorder.service; then
+        systemctl_user start --no-block codex-info-recorder.service >/dev/null 2>&1 || safe_blocked 'could not start recorder service'
+    fi
+    if ! probe_active codex-info-rest.service; then
+        systemctl_user start --no-block codex-info-rest.service >/dev/null 2>&1 || safe_blocked 'could not start REST service'
     fi
     wait_runtime_ready || safe_blocked 'managed runtime is not healthy after start'
-    printf 'started codex-info.service\n'
+    printf 'started codex-info-recorder.service and codex-info-rest.service\n'
     exit
 fi
 if [[ "$ACTION" == stop ]]; then
     load_control_state; require_user_manager; guard_control_listener
-    systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 || die 'could not stop service'
-    wait_inactive codex-info.service || safe_blocked 'managed service did not stop within 20s'
-    enable_managed_unit codex-info.service || die 'could not keep service enabled'
+    systemctl_stop_user stop --no-block codex-info-recorder.service >/dev/null 2>&1 || die 'could not stop recorder service'
+    wait_inactive codex-info-recorder.service || safe_blocked 'recorder service did not stop within 20s'
+    systemctl_stop_user stop --no-block codex-info-rest.service >/dev/null 2>&1 || die 'could not stop REST service'
+    wait_inactive codex-info-rest.service || safe_blocked 'REST service did not stop within 20s'
+    enable_managed_unit codex-info-recorder.service || die 'could not keep recorder service enabled'
+    enable_managed_unit codex-info-rest.service || die 'could not keep REST service enabled'
     rearm_update_timer || safe_blocked 'update timer could not remain active after stop'
     desired_state=stopped
     verify_nonrunning_terminal stopped || safe_blocked 'stopped terminal could not be verified'
     write_control_state stopped
     load_control_state; verify_nonrunning_terminal stopped || safe_blocked 'stopped control state readback failed'
-    printf 'stopped codex-info.service (timer remains enabled)\n'; exit
+    printf 'stopped recorder and REST services (timer remains enabled)\n'; exit
 fi
 if [[ "$ACTION" == disable ]]; then
     load_control_state; require_user_manager; guard_control_listener
-    systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 || die 'could not stop service'
-    wait_inactive codex-info.service || safe_blocked 'managed service did not stop within 20s'
-    disable_managed_unit codex-info.service || die 'could not disable service'
+    systemctl_stop_user stop --no-block codex-info-recorder.service >/dev/null 2>&1 || die 'could not stop recorder service'
+    wait_inactive codex-info-recorder.service || safe_blocked 'recorder service did not stop within 20s'
+    disable_managed_unit codex-info-recorder.service || die 'could not disable recorder service'
+    systemctl_stop_user stop --no-block codex-info-rest.service >/dev/null 2>&1 || die 'could not stop REST service'
+    wait_inactive codex-info-rest.service || safe_blocked 'REST service did not stop within 20s'
+    disable_managed_unit codex-info-rest.service || die 'could not disable REST service'
     systemctl_stop_user stop --no-block codex-info-update.timer >/dev/null 2>&1 || die 'could not stop timer'
     wait_inactive codex-info-update.timer || safe_blocked 'update timer did not stop within 20s'
     disable_managed_unit codex-info-update.timer || die 'could not disable timer'
@@ -2148,16 +2601,19 @@ if [[ "$ACTION" == disable ]]; then
 fi
 if [[ "$ACTION" == remove ]]; then
     load_control_state; require_user_manager; guard_control_listener
-    systemctl_stop_user stop --no-block codex-info.service >/dev/null 2>&1 || die 'could not stop service'
-    wait_inactive codex-info.service || safe_blocked 'managed service did not stop within 20s'
-    disable_managed_unit codex-info.service || die 'could not disable service'
+    systemctl_stop_user stop --no-block codex-info-recorder.service >/dev/null 2>&1 || die 'could not stop recorder service'
+    wait_inactive codex-info-recorder.service || safe_blocked 'recorder service did not stop within 20s'
+    disable_managed_unit codex-info-recorder.service || die 'could not disable recorder service'
+    systemctl_stop_user stop --no-block codex-info-rest.service >/dev/null 2>&1 || die 'could not stop REST service'
+    wait_inactive codex-info-rest.service || safe_blocked 'REST service did not stop within 20s'
+    disable_managed_unit codex-info-rest.service || die 'could not disable REST service'
     systemctl_stop_user stop --no-block codex-info-update.timer >/dev/null 2>&1 || die 'could not stop timer'
     wait_inactive codex-info-update.timer || safe_blocked 'update timer did not stop within 20s'
     disable_managed_unit codex-info-update.timer || die 'could not disable timer'
     systemctl_stop_user stop --no-block codex-info-update.service >/dev/null 2>&1 || die 'could not stop update service'
     wait_inactive codex-info-update.service || safe_blocked 'update service did not stop within 20s'
-    for destination in "$unit_destination" "$update_service_destination" "$update_timer_destination"; do [[ -L "$destination" ]] || safe_blocked "refusing to remove non-symlink unit: $destination"; done
-    atomic_unlink "$unit_destination"; atomic_unlink "$update_service_destination"; atomic_unlink "$update_timer_destination"; systemctl_user daemon-reload >/dev/null 2>&1 || die 'daemon-reload failed during remove'
+    for destination in "$unit_destination" "$rest_unit_destination" "$update_service_destination" "$update_timer_destination"; do [[ -L "$destination" ]] || safe_blocked "refusing to remove non-symlink unit: $destination"; done
+    atomic_unlink "$unit_destination"; atomic_unlink "$rest_unit_destination"; atomic_unlink "$update_service_destination"; atomic_unlink "$update_timer_destination"; systemctl_user daemon-reload >/dev/null 2>&1 || die 'daemon-reload failed during remove'
     desired_state=removed
     verify_nonrunning_terminal removed || safe_blocked 'removed terminal could not be verified'
     write_control_state removed
@@ -2181,7 +2637,7 @@ if [[ "$ACTION" == startup ]]; then
     [[ "$desired_state" == running ]] || { ((QUIET)) || printf 'startup reconcile preserved desired_state=%s\n' "$desired_state"; exit; }
     [[ -L "$current_link" ]] || safe_blocked 'startup reconcile has no installed generation'
     run_update
-    if probe_active codex-info.service; then verify_runtime; else ((QUIET)) || printf 'startup reconcile complete; service activation is pending\n'; fi
+    if probe_active codex-info-recorder.service && probe_active codex-info-rest.service; then verify_runtime; else ((QUIET)) || printf 'startup reconcile complete; service activation is pending\n'; fi
     exit
 fi
 if [[ "$ACTION" == update || "$ACTION" == timer-update ]]; then run_update; exit; fi

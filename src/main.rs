@@ -3,7 +3,9 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(test)]
 mod account_scope;
+#[cfg(test)]
 mod daemon;
 
 use chrono::{DateTime, Months, Utc};
@@ -11,22 +13,28 @@ use codex_info::app_server_sqlite::PreparedGeneration;
 use codex_info::i18n::{CliTextKey, I18n, PeriodKind, TextKey};
 use codex_info::protocol_contract;
 use codex_info::security;
+#[cfg(test)]
 use codex_info::server::{
-    legacy_history_models_v3, validate_public_threads, ApiServer, ApiServerConfig,
-    PublicDetailedModelUsage, PublicDetails, PublicDetailsV2, PublicDetailsV3, PublicHistoryGap,
-    PublicHistoryModelUsageV3, PublicHistoryObservation, PublicHistoryObservationV3,
-    PublicHistoryPeriod, PublicHistorySample, PublicModelCostV3, PublicModelUsageV3, PublicQuota,
-    PublicState, PublicThread,
+    legacy_history_models_v3, ApiServer, PublicDetailedModelUsage, PublicHistorySample,
 };
-use codex_info::thread_contract::{
-    self, ThreadCycleAccumulator, ThreadCycleOutcome, ThreadTopologyNode,
+use codex_info::server::{
+    validate_public_threads, ApiServerConfig, PublicDetails, PublicDetailsV2, PublicDetailsV3,
+    PublicHistoryGap, PublicHistoryModelUsageV3, PublicHistoryObservation,
+    PublicHistoryObservationV3, PublicHistoryPeriod, PublicModelCostV3, PublicModelUsageV3,
+    PublicQuota, PublicState, PublicThread,
 };
+use codex_info::thread_contract::{self, ThreadTopologyNode};
+#[cfg(test)]
+use codex_info::thread_contract::{ThreadCycleAccumulator, ThreadCycleOutcome};
+use codex_info::usage_store;
+#[cfg(test)]
 use codex_info::usage_store::{
-    self, classify_quota_transition, select_predeadline_quota_authority, QuotaTransition,
+    classify_quota_transition, select_predeadline_quota_authority, QuotaTransition,
     StoragePartitionIdentity, UsageStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
 use slint::{CloseRequestResponse, ComponentHandle, Model, Timer, TimerMode};
@@ -34,15 +42,20 @@ use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::fs;
+#[cfg(test)]
+use std::fs::File;
+#[cfg(test)]
+use std::io::{BufRead, Seek, SeekFrom};
+use std::io::{BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+#[cfg(test)]
+use std::process::Child;
+use std::process::{Command, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,13 +63,16 @@ slint::include_modules!();
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AccountCommand {
+    #[cfg(test)]
     Read,
     Login,
+    #[cfg(test)]
     FinishFallback,
     Stop,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct AccountAdmission {
     account_update_generation: u64,
     profile_scope_id: String,
@@ -66,30 +82,33 @@ struct AccountAdmission {
 }
 
 #[derive(Clone)]
+#[cfg(test)]
 enum ThreadCommand {
     Read {
         auth_epoch: u64,
         admission: AccountAdmission,
-        account_partition: account_scope::AccountPartition,
+        account_partition: Box<account_scope::AccountPartition>,
     },
     Stop,
 }
 
 #[derive(Clone)]
+#[cfg(test)]
 enum LocalCommand {
     Collect {
         auth_epoch: u64,
         admission: AccountAdmission,
         collection_state: Box<usage_store::SessionCollectionState>,
         regression_recovery_state: Option<Box<usage_store::SessionCollectionState>>,
-        history_continuity_recovery: Option<usage_store::HistoryContinuityRecovery>,
-        cumulative_recovery: Option<usage_store::SessionCumulativeRecovery>,
+        history_continuity_recovery: Box<Option<usage_store::HistoryContinuityRecovery>>,
+        cumulative_recovery: Box<Option<usage_store::SessionCumulativeRecovery>>,
         reset_at: i64,
         window_seconds: i64,
     },
     Stop,
 }
 
+#[cfg(test)]
 struct UsageEvent {
     account_key: account_scope::AccountKey,
     account_update_generation: u64,
@@ -103,6 +122,7 @@ struct UsageEvent {
 
 enum Event {
     Ready,
+    #[cfg(test)]
     Account {
         email: Option<String>,
         authenticated: bool,
@@ -111,11 +131,13 @@ enum Event {
         account_update_generation: u64,
     },
     AuthUrl(String),
+    #[cfg(test)]
     Usage(Box<UsageEvent>),
     IdentityError(String),
     Error(String),
 }
 
+#[cfg(test)]
 enum ThreadEvent {
     Ready,
     Update {
@@ -130,6 +152,7 @@ enum ThreadEvent {
     },
 }
 
+#[cfg(test)]
 struct LocalUsageResult {
     auth_epoch: u64,
     reset_at: i64,
@@ -142,6 +165,7 @@ struct LocalUsageResult {
     cleanup_plan: Option<SessionCleanupPlan>,
 }
 
+#[cfg(test)]
 struct LocalUsageCandidate {
     result: LocalUsageResult,
     admission: AccountAdmission,
@@ -155,6 +179,7 @@ struct LocalUsageCandidate {
     timeline_recovery: Option<usage_store::SessionTimelineRecovery>,
 }
 
+#[cfg(test)]
 enum LocalEvent {
     Usage(Box<LocalUsageCandidate>),
     Error {
@@ -169,6 +194,7 @@ enum LocalEvent {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(test)]
 struct TokenSnapshot {
     total: u64,
     input: u64,
@@ -177,6 +203,7 @@ struct TokenSnapshot {
     cache_write_input: Option<u64>,
 }
 
+#[cfg(test)]
 impl TokenSnapshot {
     fn cache_write_delta_from(self, previous: Self) -> Option<u64> {
         match (self.cache_write_input, previous.cache_write_input) {
@@ -195,6 +222,7 @@ const TERRA_PRICE_PER_MILLION: (f64, f64, f64) = (2.0, 0.2, 12.0);
 const LUNA_PRICE_PER_MILLION: (f64, f64, f64) = (0.2, 0.02, 1.2);
 const ASTRA_PRICE_PER_MILLION: (f64, f64, f64, f64) = (10.0, 1.0, 12.5, 50.0);
 const ASTRA_PRICE_VERSION: &str = "ASTRA_USER_2026-09-05";
+#[cfg(test)]
 const UNATTRIBUTED_SESSION_MODEL: &str = "UNATTRIBUTED";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -225,6 +253,7 @@ impl ModelUsageRow {
             self.output_tokens as f64 * output_rate / 1_000_000.0,
         ))
     }
+    #[cfg(test)]
     fn new(name: &str) -> Self {
         Self {
             name: name.into(),
@@ -233,6 +262,7 @@ impl ModelUsageRow {
         }
     }
 
+    #[cfg(test)]
     fn add(&mut self, snapshot: TokenSnapshot) {
         self.cache_write_input_tokens =
             match (self.cache_write_input_tokens, snapshot.cache_write_input) {
@@ -312,6 +342,7 @@ impl ModelUsageRow {
     }
 }
 
+#[cfg(test)]
 fn history_model_usage_v3(
     total: &usage_store::SessionModelTotal,
     legacy: &PublicHistoryObservation,
@@ -343,6 +374,7 @@ fn history_model_usage_v3(
     }
 }
 
+#[cfg(test)]
 fn history_models_v3(
     source: Option<&usage_store::UsageHistoryObservation>,
     sample: &PublicHistoryObservation,
@@ -375,6 +407,7 @@ fn history_models_v3(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct ModelUsageTotals {
     sol: ModelUsageRow,
     terra: ModelUsageRow,
@@ -397,6 +430,7 @@ struct ModelTokenTotals {
     luna: u64,
 }
 
+#[cfg(test)]
 impl Default for ModelUsageTotals {
     fn default() -> Self {
         Self {
@@ -409,6 +443,7 @@ impl Default for ModelUsageTotals {
     }
 }
 
+#[cfg(test)]
 impl ModelUsageTotals {
     fn add(&mut self, model: &str, snapshot: TokenSnapshot) {
         let Some(model) = Self::canonical_model(model) else {
@@ -644,6 +679,7 @@ impl ModelUsageTotals {
     }
 }
 
+#[cfg(test)]
 fn session_model_total_has_usage(total: &usage_store::SessionModelTotal) -> bool {
     total.total_tokens > 0
         || total.input_tokens > 0
@@ -1456,6 +1492,7 @@ fn ascii_title_part(value: &str, fallback: &str) -> String {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+#[cfg(test)]
 struct RateLimitSnapshot {
     remaining_percent: Option<f64>,
     reset_at: i64,
@@ -1483,6 +1520,7 @@ struct ActiveThread {
 }
 
 impl ActiveThread {
+    #[cfg(test)]
     fn to_public_thread(&self) -> PublicThread {
         PublicThread {
             id: self.id.clone(),
@@ -1512,6 +1550,7 @@ struct ThreadPresentationRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 enum ActiveThreadUpdate {
     Snapshot(Vec<ActiveThread>),
     NoThread,
@@ -1519,6 +1558,7 @@ enum ActiveThreadUpdate {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct RolloutFileIdentity {
     #[cfg(unix)]
     device: u64,
@@ -1528,6 +1568,7 @@ struct RolloutFileIdentity {
     is_file: bool,
 }
 
+#[cfg(test)]
 fn rollout_file_identity(metadata: &fs::Metadata) -> RolloutFileIdentity {
     #[cfg(unix)]
     {
@@ -1545,6 +1586,7 @@ fn rollout_file_identity(metadata: &fs::Metadata) -> RolloutFileIdentity {
     }
 }
 
+#[cfg(test)]
 struct ThreadRolloutCacheEntry {
     identity: RolloutFileIdentity,
     observed_len: u64,
@@ -1556,6 +1598,7 @@ struct ThreadRolloutCacheEntry {
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct ThreadRolloutCache {
     entries: BTreeMap<PathBuf, ThreadRolloutCacheEntry>,
 }
@@ -1572,6 +1615,7 @@ fn debug_runtime(message: impl AsRef<str>) {
     }
 }
 
+#[cfg(test)]
 fn plan_type_label(plan_type: Option<&str>) -> String {
     protocol_contract::plan_label(plan_type)
 }
@@ -1585,6 +1629,7 @@ fn monthly_window_seconds(reset_at: i64) -> i64 {
         .unwrap_or(31 * 86_400)
 }
 
+#[cfg(test)]
 fn parse_rate_limits(
     rate: &Value,
     plan_type: Option<&str>,
@@ -1608,6 +1653,7 @@ fn parse_rate_limits(
             monthly: quota.monthly,
         })
 }
+#[cfg(test)]
 fn same_rollout_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
 
@@ -1619,6 +1665,7 @@ fn same_rollout_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.is_file() && right.is_file()
 }
 
+#[cfg(test)]
 fn complete_rollout_prefix_len(file: &mut File, snapshot_len: u64) -> Result<u64, ()> {
     if snapshot_len == 0 {
         return Ok(0);
@@ -1647,6 +1694,7 @@ fn complete_rollout_prefix_len(file: &mut File, snapshot_len: u64) -> Result<u64
     Ok(0)
 }
 
+#[cfg(test)]
 fn complete_rollout_range_end(
     file: &mut File,
     start_offset: u64,
@@ -1688,6 +1736,7 @@ fn complete_rollout_range_end(
     Ok(start_offset)
 }
 
+#[cfg(test)]
 fn first_rollout_newline_end(
     file: &mut File,
     start_offset: u64,
@@ -1730,6 +1779,7 @@ fn first_rollout_newline_end(
     Ok(None)
 }
 
+#[cfg(test)]
 fn rollout_checkpoint_key(
     sessions_root: &Path,
     canonical: &Path,
@@ -1760,6 +1810,7 @@ fn rollout_checkpoint_key(
     Ok((root_identity, relative_path, device, inode))
 }
 
+#[cfg(test)]
 fn matching_rollout_checkpoint<'a>(
     sessions_root: &Path,
     canonical: &Path,
@@ -1776,6 +1827,7 @@ fn matching_rollout_checkpoint<'a>(
     })
 }
 
+#[cfg(test)]
 fn load_thread_rollout_checkpoints(
     partition: &account_scope::AccountPartition,
 ) -> Vec<usage_store::SessionCheckpoint> {
@@ -1794,6 +1846,7 @@ fn load_thread_rollout_checkpoints(
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn read_thread_session_meta_id(file: &mut File) -> Result<String, ()> {
     file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
     let max_record_bytes = security::MAX_JSONL_LINE_BYTES.checked_add(1).ok_or(())?;
@@ -1918,6 +1971,7 @@ fn read_active_thread_rollout_cached(
     read_active_thread_rollout_cached_with_checkpoints(sessions_root, candidate_path, cache, &[])
 }
 
+#[cfg(test)]
 fn read_active_thread_rollout_cached_with_checkpoints(
     sessions_root: &Path,
     candidate_path: &Path,
@@ -2057,7 +2111,7 @@ fn read_active_thread_rollout_cached_with_checkpoints(
                         .or_else(|| (complete_len > parse_start).then_some(true)),
                 )
             })
-            .unwrap_or_else(thread_contract::RolloutAccumulator::new);
+            .unwrap_or_default();
         let thread_id = read_thread_session_meta_id(&mut file)?;
         if complete_len > parse_start {
             let appended_len = complete_len.checked_sub(parse_start).ok_or(())?;
@@ -2097,10 +2151,14 @@ fn read_active_thread_rollout_cached_with_checkpoints(
     Ok((thread_id, snapshot))
 }
 
+#[cfg(test)]
 const MAX_PROC_PROCESS_ENTRIES: usize = 65_536;
+#[cfg(test)]
 const MAX_CODEX_PROCESS_FDS: usize = 16_384;
+#[cfg(test)]
 const MAX_OPEN_SESSION_FILES: usize = 1_024;
 
+#[cfg(test)]
 fn proc_value_or_disappeared<T>(result: std::io::Result<T>) -> Result<Option<T>, ()> {
     match result {
         Ok(value) => Ok(Some(value)),
@@ -2112,6 +2170,7 @@ fn proc_value_or_disappeared<T>(result: std::io::Result<T>) -> Result<Option<T>,
     }
 }
 
+#[cfg(test)]
 fn open_codex_session_paths(
     proc_root: &Path,
     sessions_root: &Path,
@@ -2185,6 +2244,7 @@ fn open_codex_session_paths(
     Ok(open_files)
 }
 
+#[cfg(test)]
 fn active_thread_paths(codex_root: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>), ()> {
     let sessions_root = codex_root.join("sessions");
     let active_paths = open_codex_session_paths(Path::new("/proc"), &sessions_root)?;
@@ -2193,6 +2253,7 @@ fn active_thread_paths(codex_root: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>)
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
+#[cfg(test)]
 struct SessionCleanupReport {
     deleted: Vec<usage_store::RecordedSessionSource>,
     retained: usize,
@@ -2200,6 +2261,7 @@ struct SessionCleanupReport {
     process_scan_failed: bool,
 }
 
+#[cfg(test)]
 fn current_session_candidate(
     sessions_root: &Path,
     expected_path: &Path,
@@ -2221,6 +2283,7 @@ fn current_session_candidate(
     Ok((canonical, source))
 }
 
+#[cfg(test)]
 fn cleanup_recorded_session_overflow_partitioned_with<F>(
     database: &Path,
     partition_identity: Option<&StoragePartitionIdentity>,
@@ -2326,22 +2389,6 @@ where
     )
 }
 
-fn cleanup_recorded_session_overflow_partitioned(
-    database: &Path,
-    partition_identity: &StoragePartitionIdentity,
-    plan: &SessionCleanupPlan,
-    proc_root: &Path,
-) -> SessionCleanupReport {
-    let active_paths = open_codex_session_paths(proc_root, &plan.sessions_root);
-    cleanup_recorded_session_overflow_partitioned_with(
-        database,
-        Some(partition_identity),
-        plan,
-        active_paths,
-        |path| fs::remove_file(path),
-    )
-}
-
 #[cfg(test)]
 fn cleanup_recorded_session_overflow(
     database: &Path,
@@ -2354,26 +2401,23 @@ fn cleanup_recorded_session_overflow(
     })
 }
 
-fn fetch_active_thread_update(
-    input: &mut impl Write,
-    output: &Receiver<RpcReadEvent>,
-    next_id: &mut u64,
-    sessions_root: &Path,
-    active_paths: &BTreeSet<PathBuf>,
+#[cfg(test)]
+struct ActiveThreadUpdateContext<'a, W: Write> {
+    input: &'a mut W,
+    output: &'a Receiver<RpcReadEvent>,
+    next_id: &'a mut u64,
+    sessions_root: &'a Path,
+    active_paths: &'a BTreeSet<PathBuf>,
     deadline: Instant,
-    rollout_cache: &mut ThreadRolloutCache,
-    checkpoints: &[usage_store::SessionCheckpoint],
+    rollout_cache: &'a mut ThreadRolloutCache,
+    checkpoints: &'a [usage_store::SessionCheckpoint],
+}
+
+#[cfg(test)]
+fn fetch_active_thread_update<W: Write>(
+    context: &mut ActiveThreadUpdateContext<'_, W>,
 ) -> ActiveThreadUpdate {
-    fetch_active_thread_update_before_deadline_with_cache(
-        input,
-        output,
-        next_id,
-        sessions_root,
-        active_paths,
-        deadline,
-        rollout_cache,
-        checkpoints,
-    )
+    fetch_active_thread_update_before_deadline_with_cache(context)
 }
 
 #[cfg(test)]
@@ -2404,29 +2448,28 @@ fn fetch_active_thread_update_for_paths_and_state(
     _codex_root: Option<&Path>,
 ) -> ActiveThreadUpdate {
     let mut rollout_cache = ThreadRolloutCache::default();
-    fetch_active_thread_update_before_deadline_with_cache(
+    let mut context = ActiveThreadUpdateContext {
         input,
         output,
         next_id,
         sessions_root,
         active_paths,
-        Instant::now() + security::RPC_RESPONSE_TIMEOUT,
-        &mut rollout_cache,
-        &[],
-    )
+        deadline: Instant::now() + security::RPC_RESPONSE_TIMEOUT,
+        rollout_cache: &mut rollout_cache,
+        checkpoints: &[],
+    };
+    fetch_active_thread_update_before_deadline_with_cache(&mut context)
 }
 
-fn fetch_active_thread_update_before_deadline_with_cache(
-    input: &mut impl Write,
-    output: &Receiver<RpcReadEvent>,
-    next_id: &mut u64,
-    sessions_root: &Path,
-    active_paths: &BTreeSet<PathBuf>,
-    deadline: Instant,
-    rollout_cache: &mut ThreadRolloutCache,
-    checkpoints: &[usage_store::SessionCheckpoint],
+#[cfg(test)]
+fn fetch_active_thread_update_before_deadline_with_cache<W: Write>(
+    context: &mut ActiveThreadUpdateContext<'_, W>,
 ) -> ActiveThreadUpdate {
-    rollout_cache
+    let sessions_root = context.sessions_root;
+    let active_paths = context.active_paths;
+    let checkpoints = context.checkpoints;
+    context
+        .rollout_cache
         .entries
         .retain(|path, _| active_paths.contains(path));
     let mut rollouts = BTreeMap::new();
@@ -2435,7 +2478,7 @@ fn fetch_active_thread_update_before_deadline_with_cache(
         let (thread_id, rollout) = match read_active_thread_rollout_cached_with_checkpoints(
             sessions_root,
             active_path,
-            rollout_cache,
+            context.rollout_cache,
             checkpoints,
         ) {
             Ok(value) => value,
@@ -2444,18 +2487,18 @@ fn fetch_active_thread_update_before_deadline_with_cache(
                 return ActiveThreadUpdate::Failed;
             }
         };
-        let request_id = *next_id;
-        let Some(following_id) = next_id.checked_add(1) else {
+        let request_id = *context.next_id;
+        let Some(following_id) = context.next_id.checked_add(1) else {
             return ActiveThreadUpdate::Failed;
         };
-        *next_id = following_id;
-        let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
+        *context.next_id = following_id;
+        let Some(wait) = context.deadline.checked_duration_since(Instant::now()) else {
             debug_runtime("thread read cycle timed out");
             return ActiveThreadUpdate::Failed;
         };
         let result = match request_with_timeout_observed(
-            input,
-            output,
+            context.input,
+            context.output,
             request_id,
             "thread/read",
             json!({"threadId": thread_id, "includeTurns": false}),
@@ -2484,7 +2527,7 @@ fn fetch_active_thread_update_before_deadline_with_cache(
             }
         };
         let response_path = candidate.path().and_then(|path| {
-            security::canonical_regular_file_under(sessions_root, Path::new(path)).ok()
+            security::canonical_regular_file_under(context.sessions_root, Path::new(path)).ok()
         });
         if candidate.id() != thread_id || response_path.as_ref() != Some(active_path) {
             debug_runtime("thread read identity mismatch");
@@ -2577,6 +2620,7 @@ struct UsageHistorySample {
 }
 
 impl UsageHistorySample {
+    #[cfg(test)]
     fn from_store(sample: usage_store::UsageHistorySample) -> Self {
         Self {
             timestamp: sample.timestamp,
@@ -2647,6 +2691,7 @@ impl UsageHistorySample {
         Self::from_model_history_with_usage(timestamp, reset_at, costs, ModelTokenTotals::default())
     }
 
+    #[cfg(test)]
     fn from_model_history_with_usage(
         timestamp: i64,
         reset_at: i64,
@@ -2712,6 +2757,7 @@ fn reset_transition_is_boundary(
 /// changed quota window starts the next cumulative period at zero. Session
 /// checkpoints deliberately survive both paths because token records remain
 /// append-only across quota periods.
+#[cfg(test)]
 fn admit_session_collection_period(
     state: &mut usage_store::SessionCollectionState,
     next_reset_at: i64,
@@ -2746,6 +2792,7 @@ fn admit_session_collection_period(
     transition
 }
 
+#[cfg(test)]
 fn select_started_boundary_collection_state(
     current_generation: u64,
     reset_at: i64,
@@ -2926,10 +2973,9 @@ fn reset_sample_groups(samples: &[UsageHistorySample]) -> Vec<ResetSampleGroup> 
             if !moving_started
                 && candidate.timestamp == anchor.timestamp
                 && candidate.reset_at.abs_diff(anchor.reset_at) > RESET_AT_TOLERANCE_SECONDS as u64
+                && !has_forward_observation[index]
             {
-                if !has_forward_observation[index] {
-                    break;
-                }
+                break;
             }
             if !moving_started
                 && candidate.reset_at < anchor.reset_at
@@ -3683,12 +3729,13 @@ fn canonicalize_public_history_samples(samples: &[UsageHistorySample]) -> Vec<Us
 
 #[derive(Debug, Default)]
 struct UsageHistory {
-    db_path: Option<PathBuf>,
-    partition_identity: Option<StoragePartitionIdentity>,
     samples: Vec<UsageHistorySample>,
     observations: Vec<usage_store::UsageHistoryObservation>,
+    #[cfg(test)]
     pending_store_samples: Vec<usage_store::UsageHistorySample>,
+    #[cfg(test)]
     pending_store_observations: Vec<usage_store::UsageHistoryObservation>,
+    #[cfg(test)]
     startup_maintenance_done: bool,
 }
 
@@ -3852,6 +3899,7 @@ fn prefer_model_source(
     }
 }
 
+#[cfg(test)]
 fn model_source_rank(source: usage_store::ModelSource) -> u8 {
     match source {
         usage_store::ModelSource::Unavailable => 0,
@@ -3945,6 +3993,7 @@ fn canonical_reset_aliases(samples: &[UsageHistorySample]) -> (BTreeMap<i64, i64
     (aliases, canonical_resets)
 }
 
+#[cfg(test)]
 fn observation_matches_history_period(
     observation: &usage_store::UsageHistoryObservation,
     period: &PublicHistoryPeriod,
@@ -3996,6 +4045,7 @@ fn observation_reset_matches_period(
 }
 
 impl UsageHistory {
+    #[cfg(test)]
     fn resolve_observation(
         existing: usage_store::UsageHistoryObservation,
         incoming: usage_store::UsageHistoryObservation,
@@ -4016,6 +4066,7 @@ impl UsageHistory {
         }
     }
 
+    #[cfg(test)]
     fn merge_observation(
         observations: &mut Vec<usage_store::UsageHistoryObservation>,
         incoming: usage_store::UsageHistoryObservation,
@@ -4038,6 +4089,7 @@ impl UsageHistory {
     /// Merge an acquired batch in key order so backfill/replay does not pay a
     /// full vector shift for every observation. Equal keys use the same source
     /// monotonicity as `merge_observation`.
+    #[cfg(test)]
     fn merge_observations(
         observations: &mut Vec<usage_store::UsageHistoryObservation>,
         mut incoming: Vec<usage_store::UsageHistoryObservation>,
@@ -4091,6 +4143,7 @@ impl UsageHistory {
         *observations = merged;
     }
 
+    #[cfg(test)]
     fn confirmed_gaps_from_partition(
         partition: &account_scope::AccountPartition,
     ) -> Result<Vec<PublicHistoryGap>, String> {
@@ -4147,8 +4200,6 @@ impl UsageHistory {
             })
             .unwrap_or_default();
         let mut history = Self {
-            db_path,
-            partition_identity: None,
             samples,
             observations,
             pending_store_samples: Vec::new(),
@@ -4159,6 +4210,7 @@ impl UsageHistory {
         history
     }
 
+    #[cfg(test)]
     fn load_from_partition(partition: &account_scope::AccountPartition) -> Result<Self, String> {
         let now = Utc::now();
         let identity = partition.storage_identity();
@@ -4180,8 +4232,6 @@ impl UsageHistory {
             .filter_map(main_sample_from_observation)
             .collect::<Vec<_>>();
         let mut history = Self {
-            db_path: Some(partition.database_path.clone()),
-            partition_identity: Some(identity),
             samples,
             observations,
             pending_store_samples: Vec::new(),
@@ -4250,12 +4300,13 @@ impl UsageHistory {
         );
         let samples = previous.chain(current).collect();
         Self {
-            db_path: None,
-            partition_identity: None,
             samples,
             observations: Vec::new(),
+            #[cfg(test)]
             pending_store_samples: Vec::new(),
+            #[cfg(test)]
             pending_store_observations: Vec::new(),
+            #[cfg(test)]
             startup_maintenance_done: true,
         }
     }
@@ -4264,6 +4315,7 @@ impl UsageHistory {
     ///
     /// The visible in-memory set is always bounded, even if persistent pruning
     /// is unavailable. A storage failure must never expose an old or future row.
+    #[cfg(test)]
     fn startup_maintenance(&mut self, now: DateTime<Utc>) {
         if self.startup_maintenance_done {
             return;
@@ -4289,6 +4341,7 @@ impl UsageHistory {
         );
     }
 
+    #[cfg(test)]
     fn record_with_models_from_source(
         &mut self,
         sample: UsageHistorySample,
@@ -4330,6 +4383,7 @@ impl UsageHistory {
         self.apply_backfill_samples_with_models(reset_at, samples, Vec::new(), false);
     }
 
+    #[cfg(test)]
     fn apply_backfill_samples_with_models(
         &mut self,
         reset_at: i64,
@@ -4381,19 +4435,23 @@ impl UsageHistory {
         }
     }
 
+    #[cfg(test)]
     fn take_pending_store_samples(&mut self) -> Vec<usage_store::UsageHistorySample> {
         std::mem::take(&mut self.pending_store_samples)
     }
 
+    #[cfg(test)]
     fn take_pending_store_observations(&mut self) -> Vec<usage_store::UsageHistoryObservation> {
         std::mem::take(&mut self.pending_store_observations)
     }
 
+    #[cfg(test)]
     fn restore_pending_store_samples(&mut self, mut samples: Vec<usage_store::UsageHistorySample>) {
         samples.append(&mut self.pending_store_samples);
         self.pending_store_samples = samples;
     }
 
+    #[cfg(test)]
     fn restore_pending_store_observations(
         &mut self,
         mut observations: Vec<usage_store::UsageHistoryObservation>,
@@ -4404,6 +4462,7 @@ impl UsageHistory {
         Self::merge_observations(pending, observations);
     }
 
+    #[cfg(test)]
     fn record_unavailable(
         &mut self,
         timestamp: i64,
@@ -4424,31 +4483,7 @@ impl UsageHistory {
         self.retain_acquisition_window(timestamp.div_euclid(60) * 60);
     }
 
-    fn refresh_from_store(&mut self, now: DateTime<Utc>) -> bool {
-        let Some(path) = self.db_path.as_ref() else {
-            return false;
-        };
-        let store = match self.partition_identity.as_ref() {
-            Some(identity) => UsageStore::open_read_only_partitioned(path, identity),
-            None => UsageStore::open_read_only(path),
-        };
-        let Ok(store) = store else {
-            return false;
-        };
-        let Ok(observations) = store.load_recent_observations(now) else {
-            return false;
-        };
-        self.observations = observations;
-        self.samples = self
-            .observations
-            .iter()
-            .filter_map(main_sample_from_observation)
-            .into_iter()
-            .collect();
-        self.normalize();
-        true
-    }
-
+    #[cfg(test)]
     fn apply_committed_samples(
         &mut self,
         samples: Vec<usage_store::UsageHistorySample>,
@@ -4475,6 +4510,7 @@ impl UsageHistory {
         true
     }
 
+    #[cfg(test)]
     fn apply_committed_observations(
         &mut self,
         observations: Vec<usage_store::UsageHistoryObservation>,
@@ -4606,6 +4642,7 @@ impl UsageHistory {
             .collect()
     }
 
+    #[cfg(test)]
     fn normalize(&mut self) {
         // Keep every raw observation distinguishable until the sole public
         // HistoryCanonicalizer validates its cycle/minute group. Sorting is
@@ -4622,6 +4659,7 @@ impl UsageHistory {
     /// Bounds the in-memory/API/graph working set without deleting SQLite
     /// retention rows. Persistent deletion remains exclusively the three-month
     /// startup prune.
+    #[cfg(test)]
     fn retain_acquisition_window(&mut self, end_timestamp: i64) {
         let Some(end) = DateTime::<Utc>::from_timestamp(end_timestamp, 0) else {
             return;
@@ -4670,12 +4708,14 @@ fn usage_data_root() -> Option<PathBuf> {
     prepared_data_root(path)
 }
 
+#[cfg(test)]
 fn three_months_before_utc(now: DateTime<Utc>) -> i64 {
     now.checked_sub_months(Months::new(3))
         .expect("subtracting three calendar months from UTC now must be representable")
         .timestamp()
 }
 
+#[cfg(test)]
 fn one_month_before_utc(now: DateTime<Utc>) -> i64 {
     now.checked_sub_months(Months::new(1))
         .expect("subtracting one calendar month from UTC now must be representable")
@@ -4731,6 +4771,20 @@ struct GraphModelPoint {
 }
 
 type GraphModelTimelines = BTreeMap<String, BTreeMap<i64, GraphModelPoint>>;
+
+struct GraphSelectionInput<'a> {
+    samples: &'a [&'a UsageHistorySample],
+    period_start: i64,
+    period_end: i64,
+    show_luna: bool,
+    show_terra: bool,
+    show_sol: bool,
+    show_astra: bool,
+    show_tokens: bool,
+    untrusted_minutes: &'a BTreeSet<i64>,
+    confirmed_gaps: &'a [GraphConfirmedGap],
+    model_timelines: &'a GraphModelTimelines,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GraphRemainingOrigin {
@@ -5056,96 +5110,37 @@ fn graph_paths_for_selection(
     show_sol: bool,
     show_tokens: bool,
 ) -> GraphPaths {
-    graph_paths_for_selection_with_confirmed_gaps(
+    let untrusted_minutes = BTreeSet::new();
+    let confirmed_gaps = [];
+    let model_timelines = BTreeMap::new();
+    graph_paths_for_selection_with_confirmed_gaps(GraphSelectionInput {
         samples,
         period_start,
         period_end,
         show_luna,
         show_terra,
         show_sol,
+        show_astra: false,
         show_tokens,
-        &[],
-    )
+        untrusted_minutes: &untrusted_minutes,
+        confirmed_gaps: &confirmed_gaps,
+        model_timelines: &model_timelines,
+    })
 }
 
 #[cfg(test)]
-fn graph_paths_for_selection_with_confirmed_gaps(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    show_luna: bool,
-    show_terra: bool,
-    show_sol: bool,
-    show_tokens: bool,
-    confirmed_gaps: &[GraphConfirmedGap],
-) -> GraphPaths {
-    graph_paths_for_selection_with_sources(
-        samples,
-        period_start,
-        period_end,
-        show_luna,
-        show_terra,
-        show_sol,
-        show_tokens,
-        &BTreeSet::new(),
-        confirmed_gaps,
-    )
+fn graph_paths_for_selection_with_confirmed_gaps(input: GraphSelectionInput<'_>) -> GraphPaths {
+    graph_paths_for_selection_with_sources(input)
 }
 
 #[cfg(test)]
-fn graph_paths_for_selection_with_sources(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    show_luna: bool,
-    show_terra: bool,
-    show_sol: bool,
-    show_tokens: bool,
-    untrusted_minutes: &BTreeSet<i64>,
-    confirmed_gaps: &[GraphConfirmedGap],
-) -> GraphPaths {
-    graph_paths_for_selection_with_sources_and_astra(
-        samples,
-        period_start,
-        period_end,
-        show_luna,
-        show_terra,
-        show_sol,
-        false,
-        show_tokens,
-        untrusted_minutes,
-        confirmed_gaps,
-        &BTreeMap::new(),
-    )
+fn graph_paths_for_selection_with_sources(input: GraphSelectionInput<'_>) -> GraphPaths {
+    graph_paths_for_selection_with_sources_and_astra(input)
 }
 
 #[cfg(test)]
-fn graph_paths_for_selection_with_sources_and_astra(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    show_luna: bool,
-    show_terra: bool,
-    show_sol: bool,
-    show_astra: bool,
-    show_tokens: bool,
-    untrusted_minutes: &BTreeSet<i64>,
-    confirmed_gaps: &[GraphConfirmedGap],
-    model_timelines: &GraphModelTimelines,
-) -> GraphPaths {
-    graph_paths_for_selection_with_sources_and_astra_with_lineage(
-        samples,
-        period_start,
-        period_end,
-        show_luna,
-        show_terra,
-        show_sol,
-        show_astra,
-        show_tokens,
-        untrusted_minutes,
-        confirmed_gaps,
-        model_timelines,
-    )
+fn graph_paths_for_selection_with_sources_and_astra(input: GraphSelectionInput<'_>) -> GraphPaths {
+    graph_paths_for_selection_with_sources_and_astra_with_lineage(input)
 }
 
 fn graph_minute_points_with_model_timelines(
@@ -5208,18 +5203,21 @@ fn graph_model_untrusted_minutes(
 }
 
 fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    show_luna: bool,
-    show_terra: bool,
-    show_sol: bool,
-    show_astra: bool,
-    show_tokens: bool,
-    untrusted_minutes: &BTreeSet<i64>,
-    confirmed_gaps: &[GraphConfirmedGap],
-    raw_model_timelines: &GraphModelTimelines,
+    input: GraphSelectionInput<'_>,
 ) -> GraphPaths {
+    let GraphSelectionInput {
+        samples,
+        period_start,
+        period_end,
+        show_luna,
+        show_terra,
+        show_sol,
+        show_astra,
+        show_tokens,
+        untrusted_minutes,
+        confirmed_gaps,
+        model_timelines,
+    } = input;
     let mut paths = graph_paths_with_sources(
         samples,
         period_start,
@@ -5233,13 +5231,13 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
     // Display metric and idle/activity evidence therefore have independent
     // anomaly state, while idle and quota smoothing always use raw tokens.
     let (display_timelines, display_anomaly_starts) = accepted_graph_model_timelines(
-        raw_model_timelines,
+        model_timelines,
         &BTreeSet::new(),
         show_tokens,
         confirmed_gaps,
     );
     let (token_timelines, token_anomaly_starts) =
-        accepted_graph_model_timelines(raw_model_timelines, &BTreeSet::new(), true, confirmed_gaps);
+        accepted_graph_model_timelines(model_timelines, &BTreeSet::new(), true, confirmed_gaps);
     let minute = graph_minute_points_with_model_timelines(
         samples,
         period_start,
@@ -5269,17 +5267,17 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
     let model_timeline_evidence = (!token_timelines.is_empty()).then_some((&token_timelines, true));
     if has_remaining_observation {
         if let Some(remaining) = remaining_points.last().map(|(_, value)| *value) {
-            let (solid, inferred) = remaining_paths_with_boundaries(
-                &remaining_points,
+            let (solid, inferred) = remaining_paths_with_boundaries(RemainingPathContext {
+                points: &remaining_points,
                 samples,
-                &minute,
+                model_points: &minute,
                 period_start,
                 period_end,
                 confirmed_gaps,
-                &token_anomaly_starts,
-                model_timeline_evidence,
-                Some(&remaining_evidence),
-            );
+                correction_starts: &token_anomaly_starts,
+                model_timelines: model_timeline_evidence,
+                remaining_evidence: Some(&remaining_evidence),
+            });
             paths.remaining = [solid.as_str(), inferred.as_str()]
                 .into_iter()
                 .filter(|path| !path.is_empty())
@@ -5376,17 +5374,19 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
     let graph_y =
         |value: f64| ((99.0 - value / scale_maximum * 98.0) / 100.0).clamp(0.01, 0.99) as f32;
     if show_luna {
-        let (flat, rising, inferred) = split_metric_line_paths_with_boundaries(
-            &minute,
+        let untrusted_minutes = model_untrusted("LUNA");
+        let context = MetricLinePathContext {
+            points: &minute,
             period_start,
             period_end,
-            scale_maximum,
-            |point| point.luna,
+            maximum: scale_maximum,
             confirmed_gaps,
-            &model_untrusted("LUNA"),
-            false,
-            &display_anomaly_starts,
-        );
+            untrusted_minutes: &untrusted_minutes,
+            require_legacy_vector: false,
+            correction_starts: &display_anomaly_starts,
+        };
+        let (flat, rising, inferred) =
+            split_metric_line_paths_with_boundaries(&context, |point| point.luna);
         paths.luna_flat = flat;
         paths.luna_rising = rising;
         paths.luna_inferred = inferred;
@@ -5406,17 +5406,19 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
         }
     }
     if show_terra {
-        let (flat, rising, inferred) = split_metric_line_paths_with_boundaries(
-            &minute,
+        let untrusted_minutes = model_untrusted("TERRA");
+        let context = MetricLinePathContext {
+            points: &minute,
             period_start,
             period_end,
-            scale_maximum,
-            |point| point.terra,
+            maximum: scale_maximum,
             confirmed_gaps,
-            &model_untrusted("TERRA"),
-            false,
-            &display_anomaly_starts,
-        );
+            untrusted_minutes: &untrusted_minutes,
+            require_legacy_vector: false,
+            correction_starts: &display_anomaly_starts,
+        };
+        let (flat, rising, inferred) =
+            split_metric_line_paths_with_boundaries(&context, |point| point.terra);
         paths.terra_flat = flat;
         paths.terra_rising = rising;
         paths.terra_inferred = inferred;
@@ -5436,17 +5438,19 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
         }
     }
     if show_sol {
-        let (flat, rising, inferred) = split_metric_line_paths_with_boundaries(
-            &minute,
+        let untrusted_minutes = model_untrusted("SOL");
+        let context = MetricLinePathContext {
+            points: &minute,
             period_start,
             period_end,
-            scale_maximum,
-            |point| point.sol,
+            maximum: scale_maximum,
             confirmed_gaps,
-            &model_untrusted("SOL"),
-            false,
-            &display_anomaly_starts,
-        );
+            untrusted_minutes: &untrusted_minutes,
+            require_legacy_vector: false,
+            correction_starts: &display_anomaly_starts,
+        };
+        let (flat, rising, inferred) =
+            split_metric_line_paths_with_boundaries(&context, |point| point.sol);
         paths.sol_flat = flat;
         paths.sol_rising = rising;
         paths.sol_inferred = inferred;
@@ -5466,17 +5470,19 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
         }
     }
     if show_astra {
-        let (flat, rising, inferred) = split_metric_line_paths_with_boundaries(
-            &minute,
+        let untrusted_minutes = model_untrusted("ASTRA");
+        let context = MetricLinePathContext {
+            points: &minute,
             period_start,
             period_end,
-            scale_maximum,
-            |point| point.astra,
+            maximum: scale_maximum,
             confirmed_gaps,
-            &model_untrusted("ASTRA"),
-            false,
-            &display_anomaly_starts,
-        );
+            untrusted_minutes: &untrusted_minutes,
+            require_legacy_vector: false,
+            correction_starts: &display_anomaly_starts,
+        };
+        let (flat, rising, inferred) =
+            split_metric_line_paths_with_boundaries(&context, |point| point.astra);
         paths.astra_flat = flat;
         paths.astra_rising = rising;
         paths.astra_inferred = inferred;
@@ -5881,6 +5887,17 @@ fn graph_interval_has_hard_break(
         || graph_interval_crosses_correction(start_at, end_at, correction_starts)
 }
 
+struct MetricLinePathContext<'a> {
+    points: &'a [HourlyModelSpend],
+    period_start: i64,
+    period_end: i64,
+    maximum: f64,
+    confirmed_gaps: &'a [GraphConfirmedGap],
+    untrusted_minutes: &'a BTreeSet<i64>,
+    require_legacy_vector: bool,
+    correction_starts: &'a BTreeSet<i64>,
+}
+
 fn split_metric_line_paths_with_confirmed_gaps(
     points: &[HourlyModelSpend],
     period_start: i64,
@@ -5889,39 +5906,26 @@ fn split_metric_line_paths_with_confirmed_gaps(
     value: impl Fn(&HourlyModelSpend) -> f64,
     confirmed_gaps: &[GraphConfirmedGap],
 ) -> (String, String, String) {
-    split_metric_line_paths_with_evidence(
+    let untrusted_minutes = BTreeSet::new();
+    let correction_starts = BTreeSet::new();
+    let context = MetricLinePathContext {
         points,
         period_start,
         period_end,
         maximum,
-        value,
         confirmed_gaps,
-        &BTreeSet::new(),
-        true,
-    )
+        untrusted_minutes: &untrusted_minutes,
+        require_legacy_vector: true,
+        correction_starts: &correction_starts,
+    };
+    split_metric_line_paths_with_evidence(&context, value)
 }
 
 fn split_metric_line_paths_with_evidence(
-    points: &[HourlyModelSpend],
-    period_start: i64,
-    period_end: i64,
-    maximum: f64,
+    context: &MetricLinePathContext<'_>,
     value: impl Fn(&HourlyModelSpend) -> f64,
-    confirmed_gaps: &[GraphConfirmedGap],
-    untrusted_minutes: &BTreeSet<i64>,
-    require_legacy_vector: bool,
 ) -> (String, String, String) {
-    split_metric_line_paths_with_boundaries(
-        points,
-        period_start,
-        period_end,
-        maximum,
-        value,
-        confirmed_gaps,
-        untrusted_minutes,
-        require_legacy_vector,
-        &BTreeSet::new(),
-    )
+    split_metric_line_paths_with_boundaries(context, value)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6031,20 +6035,13 @@ fn metric_line_segments_with_boundaries(
 }
 
 fn split_metric_line_paths_with_boundaries(
-    points: &[HourlyModelSpend],
-    period_start: i64,
-    period_end: i64,
-    maximum: f64,
+    context: &MetricLinePathContext<'_>,
     value: impl Fn(&HourlyModelSpend) -> f64,
-    confirmed_gaps: &[GraphConfirmedGap],
-    untrusted_minutes: &BTreeSet<i64>,
-    require_legacy_vector: bool,
-    correction_starts: &BTreeSet<i64>,
 ) -> (String, String, String) {
-    let span = (period_end - period_start).max(1) as f64;
-    let scale = maximum.max(1.0);
+    let span = (context.period_end - context.period_start).max(1) as f64;
+    let scale = context.maximum.max(1.0);
     let coordinate = |point: &HourlyModelSpend| {
-        let x = ((point.timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
+        let x = ((point.timestamp - context.period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
         let y = (99.0 - value(point).max(0.0) / scale * 98.0).clamp(1.0, 99.0);
         (
             canonical_graph_viewbox_value(x),
@@ -6055,15 +6052,15 @@ fn split_metric_line_paths_with_boundaries(
     let mut rising = String::new();
     let mut inferred = String::new();
     for segment in metric_line_segments_with_boundaries(
-        points,
+        context.points,
         &value,
-        confirmed_gaps,
-        untrusted_minutes,
-        require_legacy_vector,
-        correction_starts,
+        context.confirmed_gaps,
+        context.untrusted_minutes,
+        context.require_legacy_vector,
+        context.correction_starts,
     ) {
-        let start = coordinate(&points[segment.start_index]);
-        let end = coordinate(&points[segment.end_index]);
+        let start = coordinate(&context.points[segment.start_index]);
+        let end = coordinate(&context.points[segment.end_index]);
         let target = match segment.kind {
             GraphMetricSegmentKind::Flat => &mut flat,
             GraphMetricSegmentKind::Rising => &mut rising,
@@ -7361,17 +7358,18 @@ fn remaining_paths_with_evidence(
     period_end: i64,
     confirmed_gaps: &[GraphConfirmedGap],
 ) -> (String, String) {
-    remaining_paths_with_boundaries(
+    let correction_starts = BTreeSet::new();
+    remaining_paths_with_boundaries(RemainingPathContext {
         points,
         samples,
         model_points,
         period_start,
         period_end,
         confirmed_gaps,
-        &BTreeSet::new(),
-        None,
-        None,
-    )
+        correction_starts: &correction_starts,
+        model_timelines: None,
+        remaining_evidence: None,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7491,17 +7489,30 @@ fn remaining_point_has_measured_quota(
     }
 }
 
-fn remaining_paths_with_boundaries(
-    points: &[(i64, f64)],
-    samples: &[&UsageHistorySample],
-    model_points: &[HourlyModelSpend],
+struct RemainingPathContext<'a> {
+    points: &'a [(i64, f64)],
+    samples: &'a [&'a UsageHistorySample],
+    model_points: &'a [HourlyModelSpend],
     period_start: i64,
     period_end: i64,
-    confirmed_gaps: &[GraphConfirmedGap],
-    correction_starts: &BTreeSet<i64>,
-    model_timelines: Option<(&GraphModelTimelines, bool)>,
-    remaining_evidence: Option<&[GraphRemainingEvidence]>,
-) -> (String, String) {
+    confirmed_gaps: &'a [GraphConfirmedGap],
+    correction_starts: &'a BTreeSet<i64>,
+    model_timelines: Option<(&'a GraphModelTimelines, bool)>,
+    remaining_evidence: Option<&'a [GraphRemainingEvidence]>,
+}
+
+fn remaining_paths_with_boundaries(context: RemainingPathContext<'_>) -> (String, String) {
+    let RemainingPathContext {
+        points,
+        samples,
+        model_points,
+        period_start,
+        period_end,
+        confirmed_gaps,
+        correction_starts,
+        model_timelines,
+        remaining_evidence,
+    } = context;
     let span = (period_end - period_start).max(1) as f64;
     let coordinate = |(timestamp, raw): (i64, f64)| {
         let x = ((timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
@@ -7619,6 +7630,7 @@ fn smooth_model_spend(points: &[HourlyModelSpend]) -> Vec<HourlyModelSpend> {
     smoothed
 }
 
+#[cfg(test)]
 fn local_sessions_root() -> Option<PathBuf> {
     codex_home_root().map(|root| root.join("sessions"))
 }
@@ -7632,10 +7644,12 @@ fn codex_home_root() -> Option<PathBuf> {
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct SessionTraversalBudget {
     files: usize,
 }
 
+#[cfg(test)]
 impl SessionTraversalBudget {
     fn admit_file(
         &mut self,
@@ -7660,6 +7674,7 @@ impl SessionTraversalBudget {
     }
 }
 
+#[cfg(test)]
 fn session_jsonl_files(root: &Path) -> Result<Vec<PathBuf>, security::SecurityError> {
     fn visit(
         directory: &Path,
@@ -7714,6 +7729,7 @@ fn session_jsonl_files(root: &Path) -> Result<Vec<PathBuf>, security::SecurityEr
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct LocalInputFileFingerprint {
     path: PathBuf,
     length: u64,
@@ -7725,19 +7741,23 @@ struct LocalInputFileFingerprint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct LocalInputFingerprint {
     session_files: Vec<LocalInputFileFingerprint>,
     recovery_file: Option<LocalInputFileFingerprint>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct SessionFileCandidate {
     fingerprint: LocalInputFileFingerprint,
     recorded_source: usage_store::RecordedSessionSource,
 }
 
+#[cfg(test)]
 type SessionInventoryKey = (String, String);
 
+#[cfg(test)]
 fn session_inventory_key(candidate: &SessionFileCandidate) -> SessionInventoryKey {
     (
         candidate.recorded_source.root_identity.clone(),
@@ -7745,6 +7765,7 @@ fn session_inventory_key(candidate: &SessionFileCandidate) -> SessionInventoryKe
     )
 }
 
+#[cfg(test)]
 fn session_inventory_keys(inventory: &LocalInputInventory) -> BTreeSet<SessionInventoryKey> {
     inventory
         .selected_session_files
@@ -7755,6 +7776,7 @@ fn session_inventory_keys(inventory: &LocalInputInventory) -> BTreeSet<SessionIn
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct SessionCleanupPlan {
     sessions_root: PathBuf,
     selected_paths: BTreeSet<PathBuf>,
@@ -7762,6 +7784,7 @@ struct SessionCleanupPlan {
 }
 
 #[derive(Clone)]
+#[cfg(test)]
 struct LocalInputInventory {
     selected_session_files: Vec<SessionFileCandidate>,
     overflow_session_files: Vec<SessionFileCandidate>,
@@ -7771,6 +7794,7 @@ struct LocalInputInventory {
     fingerprint: LocalInputFingerprint,
 }
 
+#[cfg(test)]
 fn local_input_file_fingerprint(
     path: &Path,
     metadata: &fs::Metadata,
@@ -7803,6 +7827,7 @@ fn local_input_file_fingerprint(
     })
 }
 
+#[cfg(test)]
 fn session_root_identity(
     root: &Path,
     metadata: &fs::Metadata,
@@ -7827,6 +7852,7 @@ fn session_root_identity(
     }
 }
 
+#[cfg(test)]
 fn recorded_session_source(
     sessions_root: &Path,
     root_identity: &str,
@@ -7865,6 +7891,7 @@ fn recorded_session_source(
     })
 }
 
+#[cfg(test)]
 fn select_latest_session_prefix(
     mut files: Vec<SessionFileCandidate>,
     selected_byte_limit: u64,
@@ -7897,6 +7924,7 @@ fn select_latest_session_prefix(
     Ok((selected, overflow))
 }
 
+#[cfg(test)]
 fn local_input_inventory_for_paths(
     sessions_root: Option<&Path>,
     recovery_path: Option<PathBuf>,
@@ -7908,6 +7936,7 @@ fn local_input_inventory_for_paths(
     )
 }
 
+#[cfg(test)]
 fn local_input_inventory_for_paths_with_limit(
     sessions_root: Option<&Path>,
     recovery_path: Option<PathBuf>,
@@ -7994,6 +8023,7 @@ fn local_input_inventory_for_paths_with_limit(
     })
 }
 
+#[cfg(test)]
 fn local_input_inventory() -> Result<LocalInputInventory, security::SecurityError> {
     let sessions_root = local_sessions_root();
     // The profile-wide delegation recovery log has no durable account
@@ -8003,6 +8033,7 @@ fn local_input_inventory() -> Result<LocalInputInventory, security::SecurityErro
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 struct LocalUsageCollection {
     model_usage: ModelUsageTotals,
     model_totals_complete: bool,
@@ -8017,6 +8048,7 @@ struct LocalUsageCollection {
     cleanup_plan: Option<SessionCleanupPlan>,
 }
 
+#[cfg(test)]
 impl LocalUsageCollection {
     fn mark_model_totals_incomplete(&mut self) {
         self.model_totals_complete = false;
@@ -8030,6 +8062,7 @@ impl LocalUsageCollection {
     }
 }
 
+#[cfg(test)]
 fn apply_regression_recovery(
     collection: &mut LocalUsageCollection,
     recovered: ModelUsageTotals,
@@ -8093,6 +8126,7 @@ fn apply_regression_recovery(
 /// Apply a source-proven cumulative baseline to the newly collected current
 /// vector. Historical rows deliberately stay raw: the durable recovery marker
 /// owns their bounded read projection after the recorder commits atomically.
+#[cfg(test)]
 fn apply_cumulative_recovery_to_current(
     collection: &mut LocalUsageCollection,
     recovery: &usage_store::SessionCumulativeRecovery,
@@ -8110,6 +8144,7 @@ fn apply_cumulative_recovery_to_current(
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 struct QuotaGenerationRecoveryPlan {
     source_state: usage_store::SessionCollectionState,
     collection_state: usage_store::SessionCollectionState,
@@ -8117,6 +8152,7 @@ struct QuotaGenerationRecoveryPlan {
     cumulative_recovery: usage_store::SessionCumulativeRecovery,
 }
 
+#[cfg(test)]
 fn load_quota_generation_recovery_plan(
     partition: &account_scope::AccountPartition,
     current: &usage_store::SessionCollectionState,
@@ -8192,6 +8228,7 @@ fn load_quota_generation_recovery_plan(
     })
 }
 
+#[cfg(test)]
 fn load_started_boundary_collection_state(
     partition: &account_scope::AccountPartition,
     current_generation: u64,
@@ -8231,6 +8268,7 @@ fn load_started_boundary_collection_state(
     Some(selected)
 }
 
+#[cfg(test)]
 fn load_regression_recovery_state(
     partition: &account_scope::AccountPartition,
     current: &usage_store::SessionCollectionState,
@@ -8297,6 +8335,7 @@ fn load_regression_recovery_state(
     selected
 }
 
+#[cfg(test)]
 fn cleanup_plan_for_inventory(inventory: &LocalInputInventory) -> Option<SessionCleanupPlan> {
     let sessions_root = inventory.sessions_root.clone()?;
     if inventory.overflow_session_files.is_empty() {
@@ -8425,6 +8464,7 @@ impl DelegationUsageRecoveryEntry {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 fn read_recovery_entries_for_ranges(
     path: &Path,
     window_start: i64,
@@ -8486,6 +8526,7 @@ fn read_recovery_entries_for_ranges(
 }
 
 #[cfg(test)]
+#[cfg(test)]
 fn collect_recovery_usage(
     path: Option<&Path>,
     window_start: i64,
@@ -8517,16 +8558,19 @@ fn collect_recovery_usage(
 }
 
 #[derive(Clone)]
+#[cfg(test)]
 struct TimedModelUsage {
     timestamp: i64,
     model: String,
     delta: TokenSnapshot,
 }
 
+#[cfg(test)]
 fn canonical_session_minute(timestamp: i64) -> i64 {
     timestamp.div_euclid(60) * 60
 }
 
+#[cfg(test)]
 fn timeline_model_totals_with_usage(
     mut totals: Vec<usage_store::SessionModelTotal>,
 ) -> Option<Vec<usage_store::SessionModelTotal>> {
@@ -8535,6 +8579,7 @@ fn timeline_model_totals_with_usage(
     (!totals.is_empty()).then_some(totals)
 }
 
+#[cfg(test)]
 fn timeline_current_model_totals(
     totals: &ModelUsageTotals,
     source_totals: &[usage_store::SessionModelTotal],
@@ -8554,17 +8599,34 @@ fn timeline_current_model_totals(
     current
 }
 
-fn build_session_timeline_recovery(
-    events: &[TimedModelUsage],
+#[cfg(test)]
+struct SessionTimelineRecoveryContext<'a> {
+    events: &'a [TimedModelUsage],
     reset_at: i64,
     window_seconds: i64,
     timeline_end: i64,
-    collection_state: &usage_store::SessionCollectionState,
-    ranges: &[usage_store::SessionRange],
+    collection_state: &'a usage_store::SessionCollectionState,
+    ranges: &'a [usage_store::SessionRange],
     collector_epoch: u128,
     cycle_seq: u64,
-    collected_totals: &ModelUsageTotals,
+    collected_totals: &'a ModelUsageTotals,
+}
+
+#[cfg(test)]
+fn build_session_timeline_recovery(
+    context: SessionTimelineRecoveryContext<'_>,
 ) -> Result<Option<usage_store::SessionTimelineRecovery>, security::SecurityError> {
+    let SessionTimelineRecoveryContext {
+        events,
+        reset_at,
+        window_seconds,
+        timeline_end,
+        collection_state,
+        ranges,
+        collector_epoch,
+        cycle_seq,
+        collected_totals,
+    } = context;
     if collection_state.data_generation == 0 || ranges.is_empty() {
         return Ok(None);
     }
@@ -8694,6 +8756,7 @@ fn build_session_timeline_recovery(
 /// own bounded contract and consumes malformed lines before continuing.
 #[cfg(test)]
 const SESSION_RECORD_INITIAL_CAPACITY: usize = 8 * 1024;
+#[cfg(test)]
 const SESSION_APPEND_BYTES_PER_CYCLE: u64 = 64 * 1024 * 1024;
 
 #[cfg(test)]
@@ -8762,12 +8825,14 @@ fn read_recoverable_session_record_into<R: BufRead>(
 /// `BufRead` source while only the fields needed for usage attribution are
 /// retained.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum SessionRecordParseError {
     Syntax,
     Io,
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 enum SessionRecordStatus {
     End,
     Present(Box<SessionRecordSummary>),
@@ -8775,6 +8840,7 @@ enum SessionRecordStatus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum SessionJsonKey {
     Type,
     Timestamp,
@@ -8791,6 +8857,7 @@ enum SessionJsonKey {
     Other,
 }
 
+#[cfg(test)]
 const SESSION_JSON_KEYS: [(&[u8], SessionJsonKey); 12] = [
     (b"type", SessionJsonKey::Type),
     (b"timestamp", SessionJsonKey::Timestamp),
@@ -8810,6 +8877,7 @@ const SESSION_JSON_KEYS: [(&[u8], SessionJsonKey); 12] = [
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum SessionJsonObject {
     Root,
     Payload,
@@ -8819,6 +8887,7 @@ enum SessionJsonObject {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 struct SessionTokenUsageSummary {
     total: Option<u64>,
     cache_write_input: Option<u64>,
@@ -8829,6 +8898,7 @@ struct SessionTokenUsageSummary {
     malformed: bool,
 }
 
+#[cfg(test)]
 impl SessionTokenUsageSummary {
     fn snapshot(&self) -> Option<TokenSnapshot> {
         Some(TokenSnapshot {
@@ -8842,6 +8912,7 @@ impl SessionTokenUsageSummary {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 struct SessionPayloadSummary {
     event_type: Option<String>,
     model: Option<String>,
@@ -8861,6 +8932,7 @@ struct SessionPayloadSummary {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 struct SessionRecordSummary {
     outer_type: Option<String>,
     timestamp: Option<String>,
@@ -8874,6 +8946,7 @@ struct SessionRecordSummary {
     payload: SessionPayloadSummary,
 }
 
+#[cfg(test)]
 impl SessionRecordSummary {
     fn event_type(&self) -> Option<&str> {
         match self.outer_type.as_deref() {
@@ -8968,6 +9041,7 @@ impl SessionRecordSummary {
     }
 }
 
+#[cfg(test)]
 struct SessionRecordInput<'a, R: BufRead> {
     reader: &'a mut R,
     saw_bytes: bool,
@@ -8976,6 +9050,7 @@ struct SessionRecordInput<'a, R: BufRead> {
     depth: usize,
 }
 
+#[cfg(test)]
 impl<'a, R: BufRead> SessionRecordInput<'a, R> {
     fn new(reader: &'a mut R) -> Self {
         Self {
@@ -9647,6 +9722,7 @@ impl<'a, R: BufRead> SessionRecordInput<'a, R> {
     }
 }
 
+#[cfg(test)]
 fn read_streaming_session_record<R: BufRead>(
     reader: &mut R,
 ) -> Result<SessionRecordStatus, security::SecurityError> {
@@ -9689,6 +9765,7 @@ fn read_streaming_session_record<R: BufRead>(
     ))
 }
 
+#[cfg(test)]
 #[cfg(test)]
 fn read_recoverable_session_line<R: BufRead>(
     reader: &mut R,
@@ -9778,6 +9855,7 @@ fn session_token_snapshot(value: &Value) -> Option<TokenSnapshot> {
     })
 }
 
+#[cfg(test)]
 fn collect_session_usage_records<R: BufRead>(
     reader: &mut R,
     window_start: i64,
@@ -9844,6 +9922,7 @@ fn collect_session_usage_records<R: BufRead>(
 }
 
 #[cfg(test)]
+#[cfg(test)]
 fn model_usage_timeline_from_events(
     events: Vec<TimedModelUsage>,
     reset_at: i64,
@@ -9851,6 +9930,7 @@ fn model_usage_timeline_from_events(
     model_usage_timeline_from_events_with_initial(events, reset_at, ModelUsageTotals::default())
 }
 
+#[cfg(test)]
 #[cfg(test)]
 fn model_usage_timeline_from_events_with_initial(
     events: Vec<TimedModelUsage>,
@@ -9860,6 +9940,7 @@ fn model_usage_timeline_from_events_with_initial(
     model_usage_timeline_with_models_from_events_with_initial(events, reset_at, totals, true).0
 }
 
+#[cfg(test)]
 fn model_usage_timeline_with_models_from_events_with_initial(
     mut events: Vec<TimedModelUsage>,
     reset_at: i64,
@@ -9898,6 +9979,7 @@ fn model_usage_timeline_with_models_from_events_with_initial(
     (samples, model_history)
 }
 
+#[cfg(test)]
 fn discard_session_partial_tail<R: BufRead>(
     reader: &mut R,
 ) -> Result<bool, security::SecurityError> {
@@ -9917,6 +9999,7 @@ fn discard_session_partial_tail<R: BufRead>(
     }
 }
 
+#[cfg(test)]
 fn sha256_file_range(
     file: &mut File,
     start_offset: u64,
@@ -9949,6 +10032,7 @@ fn sha256_file_range(
     Ok(hex::encode(hasher.finalize()))
 }
 
+#[cfg(test)]
 fn session_file_has_partial_tail(
     file: &mut File,
     file_bytes: u64,
@@ -9964,6 +10048,7 @@ fn session_file_has_partial_tail(
     Ok(last[0] != b'\n')
 }
 
+#[cfg(test)]
 fn session_prefix_generation(
     collector_epoch: u128,
     source: &usage_store::RecordedSessionSource,
@@ -9984,6 +10069,7 @@ fn session_prefix_generation(
     u128::from_be_bytes(generation).max(1)
 }
 
+#[cfg(test)]
 fn session_boundary_lineage(
     collector_epoch: u128,
     source: &usage_store::RecordedSessionSource,
@@ -10018,6 +10104,7 @@ fn session_boundary_lineage(
 }
 
 #[derive(Clone, Copy)]
+#[cfg(test)]
 struct SessionAppendContext {
     baseline_existing: bool,
     allow_prior_continuity: bool,
@@ -10028,6 +10115,7 @@ struct SessionAppendContext {
     max_append_bytes: u64,
 }
 
+#[cfg(test)]
 struct SessionAppendResult {
     checkpoint: usage_store::SessionCheckpoint,
     range: Option<usage_store::SessionRange>,
@@ -10036,6 +10124,7 @@ struct SessionAppendResult {
     source_complete: bool,
 }
 
+#[cfg(test)]
 fn same_session_checkpoint_state(
     left: &usage_store::SessionCheckpoint,
     right: &usage_store::SessionCheckpoint,
@@ -10059,6 +10148,7 @@ fn same_session_checkpoint_state(
         && left.previous_cache_write_input == right.previous_cache_write_input
 }
 
+#[cfg(test)]
 fn session_source_complete(
     end_offset: u64,
     candidate_length: u64,
@@ -10068,6 +10158,7 @@ fn session_source_complete(
     end_offset == candidate_length && observed_length == candidate_length && !discard_until_lf
 }
 
+#[cfg(test)]
 fn collect_session_append(
     candidate: &SessionFileCandidate,
     prior: Option<&usage_store::SessionCheckpoint>,
@@ -10363,6 +10454,7 @@ fn collect_session_append(
 }
 
 #[derive(Clone, Copy)]
+#[cfg(test)]
 struct IncrementalSessionContext {
     reset_at: i64,
     window_seconds: i64,
@@ -10371,6 +10463,7 @@ struct IncrementalSessionContext {
     cycle_seq: u64,
 }
 
+#[cfg(test)]
 fn collect_incremental_local_usage(
     inventory: &LocalInputInventory,
     collection_state: &usage_store::SessionCollectionState,
@@ -10386,6 +10479,7 @@ fn collect_incremental_local_usage(
     )
 }
 
+#[cfg(test)]
 fn collect_incremental_local_usage_with_budget(
     inventory: &LocalInputInventory,
     collection_state: &usage_store::SessionCollectionState,
@@ -10530,17 +10624,17 @@ fn collect_incremental_local_usage_with_budget(
         }
     }
     model_totals_complete &= processed_sources == inventory.selected_session_files.len();
-    let timeline_recovery = build_session_timeline_recovery(
-        &events,
+    let timeline_recovery = build_session_timeline_recovery(SessionTimelineRecoveryContext {
+        events: &events,
         reset_at,
         window_seconds,
         timeline_end,
         collection_state,
-        &ranges,
+        ranges: &ranges,
         collector_epoch,
         cycle_seq,
-        &totals,
-    )?;
+        collected_totals: &totals,
+    })?;
     let (history_samples, history_model_totals) = if timeline_recovery.is_some() {
         // The timeline marker projects the exact accepted ranges over the
         // entire catch-up window. Keeping ordinary samples from those same
@@ -10578,6 +10672,7 @@ fn collect_incremental_local_usage_with_budget(
 }
 
 #[cfg(test)]
+#[cfg(test)]
 fn collect_session_usage_file(
     path: &Path,
     window_start: i64,
@@ -10595,6 +10690,7 @@ fn collect_session_usage_file(
     .map(|_| ())
 }
 
+#[cfg(test)]
 #[cfg(test)]
 fn collect_session_usage_file_with_recordability(
     path: &Path,
@@ -10650,6 +10746,7 @@ fn collect_session_usage_file_with_recordability(
     Ok(fully_recordable)
 }
 
+#[cfg(test)]
 fn recover_checkpointed_history_model_totals(
     inventory: &LocalInputInventory,
     recovery: &usage_store::HistoryContinuityRecovery,
@@ -10873,6 +10970,7 @@ impl AppServerBridge<AccountCommand, Event> {
     }
 }
 
+#[cfg(test)]
 impl AppServerBridge<ThreadCommand, ThreadEvent> {
     fn start() -> Self {
         let (tx, commands) = mpsc::channel::<ThreadCommand>();
@@ -10882,12 +10980,15 @@ impl AppServerBridge<ThreadCommand, ThreadEvent> {
     }
 }
 
+#[cfg(test)]
 struct LocalUsageBridge {
     tx: Sender<LocalCommand>,
     rx: Receiver<LocalEvent>,
 }
 
+#[cfg(test)]
 impl LocalUsageBridge {
+    #[cfg(test)]
     fn start() -> Self {
         let (tx, commands) = mpsc::channel::<LocalCommand>();
         let (events, rx) = mpsc::channel::<LocalEvent>();
@@ -10901,6 +11002,7 @@ impl LocalUsageBridge {
         Self { tx, rx }
     }
 
+    #[cfg(test)]
     fn send(&self, command: LocalCommand) -> bool {
         self.tx.send(command).is_ok()
     }
@@ -11127,6 +11229,7 @@ fn start_account_app_server(
     Err(last_error)
 }
 
+#[cfg(test)]
 fn fallback_account_cycle_complete(global_fallback: bool, command: &AccountCommand) -> bool {
     global_fallback && matches!(command, AccountCommand::FinishFallback)
 }
@@ -11155,11 +11258,15 @@ fn account_server_worker(
     debug_runtime("account worker ready");
     let mut id = 2u64;
     while let Ok(command) = commands.recv() {
+        #[cfg(test)]
         let finish_fallback = fallback_account_cycle_complete(global_fallback, &command);
+        #[cfg(not(test))]
+        let _ = global_fallback;
         match command {
             AccountCommand::Stop => {
                 break;
             }
+            #[cfg(test)]
             AccountCommand::FinishFallback => {
                 // Isolated workers persist across cycles; this command only
                 // closes the single unconfirmed global fallback cycle.
@@ -11208,6 +11315,7 @@ fn account_server_worker(
                 };
                 id = next_id;
             }
+            #[cfg(test)]
             AccountCommand::Read => {
                 debug_runtime("account read requested");
                 let generation_before = account_updates.generation;
@@ -11395,6 +11503,7 @@ fn account_server_worker(
                 }
             }
         }
+        #[cfg(test)]
         if finish_fallback {
             break;
         }
@@ -11402,6 +11511,7 @@ fn account_server_worker(
     server.shutdown();
 }
 
+#[cfg(test)]
 fn start_app_server(deadline: Instant) -> Result<RunningAppServer, String> {
     let Some(codex) = resolved_executable("CODEX_INFO_CODEX_BIN", "codex") else {
         return Err("Codex app-serverの安全な実行ファイルを確認できません。".into());
@@ -11427,6 +11537,7 @@ fn start_app_server(deadline: Instant) -> Result<RunningAppServer, String> {
     Ok(server)
 }
 
+#[cfg(test)]
 fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<ThreadEvent>) {
     debug_runtime("thread worker starting");
     // The thread bridge is lazy: construction of CodexInfoState does not issue
@@ -11527,16 +11638,17 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                 let Some(server_ref) = server.as_mut() else {
                     continue;
                 };
-                let update = fetch_active_thread_update(
-                    &mut server_ref.input,
-                    &server_ref.output,
-                    &mut next_id,
-                    &sessions_root,
-                    &active_paths,
+                let mut context = ActiveThreadUpdateContext {
+                    input: &mut server_ref.input,
+                    output: &server_ref.output,
+                    next_id: &mut next_id,
+                    sessions_root: &sessions_root,
+                    active_paths: &active_paths,
                     deadline,
-                    &mut rollout_cache,
-                    &durable_checkpoints,
-                );
+                    rollout_cache: &mut rollout_cache,
+                    checkpoints: &durable_checkpoints,
+                };
+                let update = fetch_active_thread_update(&mut context);
                 if update == ActiveThreadUpdate::Failed {
                     debug_runtime("thread read failed");
                     let _ = events.send(ThreadEvent::Error {
@@ -11572,6 +11684,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct LocalUsageCache {
     partitioned_collector_epoch: Option<u128>,
     verified_session_inventory: BTreeSet<SessionInventoryKey>,
@@ -11584,6 +11697,7 @@ struct LocalUsageCache {
     legacy_model_usage: ModelUsageTotals,
 }
 
+#[cfg(test)]
 struct PartitionedLocalCollection {
     reset_at: i64,
     window_seconds: i64,
@@ -11593,6 +11707,7 @@ struct PartitionedLocalCollection {
     cycle_seq: u64,
 }
 
+#[cfg(test)]
 impl LocalUsageCache {
     fn collect_partitioned(
         &mut self,
@@ -11691,6 +11806,7 @@ impl LocalUsageCache {
     }
 }
 
+#[cfg(test)]
 fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEvent>) {
     debug_runtime("local usage worker starting");
     let mut cache = LocalUsageCache::default();
@@ -11710,6 +11826,8 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                 reset_at,
                 window_seconds,
             } => {
+                let history_continuity_recovery = *history_continuity_recovery;
+                let cumulative_recovery = *cumulative_recovery;
                 debug_runtime(format!(
                     "local collect requested epoch={auth_epoch} reset_at={reset_at} window_seconds={window_seconds}"
                 ));
@@ -12079,6 +12197,7 @@ fn request_with_timeout_observed(
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 struct PendingRecorderBatch {
     auth_epoch: Option<u64>,
     admission: Option<AccountAdmission>,
@@ -12101,6 +12220,7 @@ struct PendingRecorderBatch {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct AcknowledgedRecorderCommit {
     auth_epoch: u64,
     partition_id: String,
@@ -12110,6 +12230,7 @@ struct AcknowledgedRecorderCommit {
     last_commit_unix: i64,
 }
 
+#[cfg(test)]
 impl PendingRecorderBatch {
     fn is_empty(&self) -> bool {
         self.samples.is_empty()
@@ -12137,12 +12258,19 @@ struct StagedServiceCurrentBundle {
 struct CodexInfoState {
     i18n: I18n,
     bridge: AppServerBridge<AccountCommand, Event>,
+    #[cfg(test)]
     thread_bridge: Option<AppServerBridge<ThreadCommand, ThreadEvent>>,
+    #[cfg(test)]
     local_bridge: LocalUsageBridge,
+    #[cfg(test)]
     auth_epoch: u64,
+    #[cfg(test)]
     auth_epoch_valid: bool,
+    #[cfg(test)]
     account_key: Option<account_scope::AccountKey>,
+    #[cfg(test)]
     account_update_generation: u64,
+    #[cfg(test)]
     account_partition: Option<account_scope::AccountPartition>,
     global_account_fallback_available: bool,
     email: Option<String>,
@@ -12168,17 +12296,29 @@ struct CodexInfoState {
     estimated_cost_label: String,
     history: UsageHistory,
     history_gaps: Vec<PublicHistoryGap>,
+    #[cfg(test)]
     pending_recorded_sessions: Vec<usage_store::RecordedSessionSource>,
+    #[cfg(test)]
     pending_session_checkpoints: Vec<usage_store::SessionCheckpoint>,
+    #[cfg(test)]
     pending_session_ranges: Vec<usage_store::SessionRange>,
+    #[cfg(test)]
     pending_session_model_totals: Vec<usage_store::SessionModelTotal>,
+    #[cfg(test)]
     pending_history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
+    #[cfg(test)]
     pending_cumulative_recovery: Option<usage_store::SessionCumulativeRecovery>,
+    #[cfg(test)]
     pending_timeline_recovery: Option<usage_store::SessionTimelineRecovery>,
+    #[cfg(test)]
     pending_collector_generation: Option<(u128, u64)>,
+    #[cfg(test)]
     pending_session_period: Option<(i64, i64)>,
+    #[cfg(test)]
     pending_recorder_admission: Option<(u64, AccountAdmission)>,
+    #[cfg(test)]
     pending_session_cleanup: Vec<SessionCleanupPlan>,
+    #[cfg(test)]
     pending_quota_source_rescan_complete: bool,
     selected_reset_at: Option<i64>,
     selected_history_period: String,
@@ -12197,19 +12337,23 @@ struct CodexInfoState {
     /// Whether the in-flight local scan follows an accepted quota sample.
     /// Rejected remote candidates may not be stamped onto durable history.
     pending_quota_observation_confirmed: bool,
+    #[cfg(test)]
     pending_local_verification: Option<LocalUsageCandidate>,
     /// A completed snapshot remains visible while a later quota-only refresh
     /// collects the next local payload. This is cleared only with account
     /// identity, never at each periodic refresh or reset timestamp update.
     usage_snapshot_committed: bool,
+    #[cfg(test)]
     last_thread_poll: Instant,
     /// The last persisted reset period is enough to backfill local session
     /// usage while app-server/REST is unavailable. It is never exposed until
     /// a fresh authenticated quota snapshot is committed.
+    #[cfg(test)]
     recovery_period: Option<(i64, i64)>,
     /// The single local collector lane is scheduled independently of account
     /// availability. This timestamp throttles that same lane during an
     /// app-server outage; it does not introduce a second scanner.
+    #[cfg(test)]
     last_local_poll: Instant,
     /// In UI mode, the service listener is the single owner of the visible
     /// snapshot. Keep a failed selected endpoint latched until that same
@@ -12259,6 +12403,7 @@ struct CodexInfoState {
     service_threads_last_poll: Instant,
     service_threads_force_poll: bool,
     service_threads_error: Option<String>,
+    #[cfg(test)]
     acknowledged_recorder_commit: Option<AcknowledgedRecorderCommit>,
 }
 
@@ -12345,6 +12490,7 @@ fn stage_service_current_bundle(
     }))
 }
 
+#[cfg(test)]
 fn local_account_authority_matches(
     current_admission: Option<&AccountAdmission>,
     expected_admission: &AccountAdmission,
@@ -12355,6 +12501,17 @@ fn local_account_authority_matches(
     current_admission == Some(expected_admission)
         && state_account_key.is_some_and(|current| current.same_account(expected_account_key))
         && local_account_key.is_some_and(|current| current.same_account(expected_account_key))
+}
+
+#[cfg(test)]
+struct LocalUsageErrorContext {
+    auth_epoch: u64,
+    admission: Option<AccountAdmission>,
+    reset_at: i64,
+    window_seconds: i64,
+    collector_epoch: Option<u128>,
+    cycle_seq: Option<u64>,
+    durable_model_totals: Vec<usage_store::SessionModelTotal>,
 }
 
 impl CodexInfoState {
@@ -12389,11 +12546,10 @@ impl CodexInfoState {
             return true;
         }
 
-        // The resident producer may publish local usage only after its own
-        // account-partition transaction has been acknowledged. This private
-        // proof never crosses the REST boundary; clients trust the complete
-        // published root above rather than inventing a second wire identity.
-        let recorder_commit_current =
+        #[cfg(test)]
+        {
+            // The retired resident producer could publish local usage only
+            // after its own account-partition transaction was acknowledged.
             self.acknowledged_recorder_commit
                 .as_ref()
                 .is_some_and(|commit| {
@@ -12410,8 +12566,10 @@ impl CodexInfoState {
                         && commit.last_commit_unix <= now
                         && now.saturating_sub(commit.last_commit_unix)
                             <= daemon::RECORDER_LAST_COMMIT_MAX_AGE_SECS
-                });
-        recorder_commit_current
+                })
+        }
+        #[cfg(not(test))]
+        false
     }
 
     fn has_visible_usage(&self) -> bool {
@@ -12429,10 +12587,12 @@ impl CodexInfoState {
         self.public_details_candidate_at(now)
     }
 
+    #[cfg(test)]
     fn public_details_candidates(&self) -> (PublicDetails, PublicDetailsV2, PublicDetailsV3) {
         self.public_details_candidates_at(Utc::now().timestamp())
     }
 
+    #[cfg(test)]
     fn public_details_candidates_at(
         &self,
         now: i64,
@@ -12447,6 +12607,7 @@ impl CodexInfoState {
         (v1, v2, v3)
     }
 
+    #[cfg(test)]
     fn public_details_v3_from_v2(&self, v2: PublicDetailsV2) -> PublicDetailsV3 {
         let mut models = if self.authenticated && self.has_visible_usage() {
             self.model_usage
@@ -12526,6 +12687,7 @@ impl CodexInfoState {
         }
     }
 
+    #[cfg(test)]
     fn public_details_v2_from_v1_at(&self, v1: PublicDetails, now: i64) -> PublicDetailsV2 {
         let effective_observed_at = v1.observed_at.unwrap_or(now);
         let history_cutoff = DateTime::<Utc>::from_timestamp(effective_observed_at, 0)
@@ -12601,6 +12763,7 @@ impl CodexInfoState {
         v2
     }
 
+    #[cfg(test)]
     fn public_details_candidate_at(&self, now: i64) -> PublicDetails {
         // A same-identity transport or refresh failure retains the last
         // complete values even while the state reports that error. Identity
@@ -12862,104 +13025,6 @@ impl CodexInfoState {
         )
     }
 
-    fn new() -> Self {
-        let i18n = I18n::detect();
-        let resident_now = Instant::now();
-        let bridge = AppServerBridge::<AccountCommand, Event>::start(true);
-        bridge.send(AccountCommand::Read);
-        Self {
-            i18n,
-            bridge,
-            thread_bridge: None,
-            local_bridge: LocalUsageBridge::start(),
-            auth_epoch: 0,
-            auth_epoch_valid: true,
-            account_key: None,
-            account_update_generation: 0,
-            account_partition: None,
-            global_account_fallback_available: true,
-            email: None,
-            authenticated: false,
-            plan_label: String::new(),
-            auth_url: None,
-            remaining_percent: None,
-            has_quota_percent: false,
-            has_usage: false,
-            reset_at: None,
-            window_seconds: WEEK_SECONDS,
-            limit_name: "Codex".into(),
-            quota_title: "残り利用枠".into(),
-            monthly: false,
-            account_error: None,
-            error: None,
-            status: "Codex app-serverへ接続しています…".into(),
-            checking: true,
-            last_poll: resident_now,
-            last_success_at: None,
-            model_usage: Vec::new(),
-            active_threads: Vec::new(),
-            estimated_cost_label: "概算 —".into(),
-            history: UsageHistory::default(),
-            history_gaps: Vec::new(),
-            pending_recorded_sessions: Vec::new(),
-            pending_session_checkpoints: Vec::new(),
-            pending_session_ranges: Vec::new(),
-            pending_session_model_totals: Vec::new(),
-            pending_history_continuity_recovery: None,
-            pending_cumulative_recovery: None,
-            pending_timeline_recovery: None,
-            pending_collector_generation: None,
-            pending_session_period: None,
-            pending_recorder_admission: None,
-            pending_session_cleanup: Vec::new(),
-            pending_quota_source_rescan_complete: false,
-            selected_reset_at: None,
-            selected_history_period: "履歴なし".into(),
-            selected_metric: "ドル".into(),
-            preview: false,
-            auth_polling: false,
-            thread_checking: false,
-            thread_error: false,
-            local_usage_error: false,
-            recorder_store_error: false,
-            local_usage_pending: false,
-            pending_quota_observation_confirmed: false,
-            pending_local_verification: None,
-            usage_snapshot_committed: false,
-            last_thread_poll: resident_now,
-            recovery_period: None,
-            last_local_poll: resident_now
-                .checked_sub(daemon::daemon_interval_from_environment())
-                .unwrap_or(resident_now),
-            service_endpoint_error: None,
-            service_owner_probe_failed: false,
-            service_published_pair: None,
-            service_v3_published_pair: None,
-            service_current_snapshot: None,
-            service_current_active_thread_count: None,
-            service_current_pair: None,
-            service_current_last_poll: resident_now,
-            service_current_force_poll: false,
-            service_current_bundle_retry_pending: false,
-            service_split_capable: false,
-            service_history_periods: Vec::new(),
-            service_history_periods_pair: None,
-            service_history_samples: Vec::new(),
-            service_history_pair: None,
-            service_history_period_id: None,
-            service_history_cursor: None,
-            service_history_cursor_reset_required: false,
-            service_history_last_poll: resident_now,
-            service_history_force_poll: false,
-            service_history_error: None,
-            service_threads_pair: None,
-            service_threads_last_poll: resident_now,
-            service_threads_force_poll: false,
-            service_threads_error: None,
-            acknowledged_recorder_commit: None,
-        }
-    }
-
     /// Construct the Linux UI adapter. Visible account, quota, local usage,
     /// history, and thread fields remain empty until one strict REST details
     /// generation replaces the root. The account bridge exists only for the
@@ -12969,12 +13034,19 @@ impl CodexInfoState {
         Self {
             i18n: I18n::detect(),
             bridge: AppServerBridge::<AccountCommand, Event>::start(true),
+            #[cfg(test)]
             thread_bridge: None,
+            #[cfg(test)]
             local_bridge: LocalUsageBridge::inactive(),
+            #[cfg(test)]
             auth_epoch: 0,
+            #[cfg(test)]
             auth_epoch_valid: true,
+            #[cfg(test)]
             account_key: None,
+            #[cfg(test)]
             account_update_generation: 0,
+            #[cfg(test)]
             account_partition: None,
             global_account_fallback_available: true,
             email: None,
@@ -13000,17 +13072,29 @@ impl CodexInfoState {
             estimated_cost_label: "概算 —".into(),
             history: UsageHistory::default(),
             history_gaps: Vec::new(),
+            #[cfg(test)]
             pending_recorded_sessions: Vec::new(),
+            #[cfg(test)]
             pending_session_checkpoints: Vec::new(),
+            #[cfg(test)]
             pending_session_ranges: Vec::new(),
+            #[cfg(test)]
             pending_session_model_totals: Vec::new(),
+            #[cfg(test)]
             pending_history_continuity_recovery: None,
+            #[cfg(test)]
             pending_cumulative_recovery: None,
+            #[cfg(test)]
             pending_timeline_recovery: None,
+            #[cfg(test)]
             pending_collector_generation: None,
+            #[cfg(test)]
             pending_session_period: None,
+            #[cfg(test)]
             pending_recorder_admission: None,
+            #[cfg(test)]
             pending_session_cleanup: Vec::new(),
+            #[cfg(test)]
             pending_quota_source_rescan_complete: false,
             selected_reset_at: None,
             selected_history_period: "履歴なし".into(),
@@ -13023,10 +13107,14 @@ impl CodexInfoState {
             recorder_store_error: false,
             local_usage_pending: false,
             pending_quota_observation_confirmed: false,
+            #[cfg(test)]
             pending_local_verification: None,
             usage_snapshot_committed: false,
+            #[cfg(test)]
             last_thread_poll: Instant::now(),
+            #[cfg(test)]
             recovery_period: None,
+            #[cfg(test)]
             last_local_poll: Instant::now(),
             service_endpoint_error: None,
             service_owner_probe_failed: false,
@@ -13055,6 +13143,7 @@ impl CodexInfoState {
             service_threads_last_poll: service_now,
             service_threads_force_poll: false,
             service_threads_error: None,
+            #[cfg(test)]
             acknowledged_recorder_commit: None,
         }
     }
@@ -13071,18 +13160,27 @@ impl CodexInfoState {
             preview_model_row("LUNA", 155_294_770, 100_000_000, 40_000_000, 15_294_770),
         ];
         let preview_costs = ModelDollarTotals::from_rows(&model_usage);
+        #[cfg(test)]
         let preview_account_key = account_scope::AccountKey::synthetic_preview("preview-account");
+        #[cfg(test)]
         let preview_partition =
             account_scope::AccountPartition::synthetic_preview(&preview_account_key);
         let mut state = Self {
             i18n,
             bridge,
+            #[cfg(test)]
             thread_bridge: None,
+            #[cfg(test)]
             local_bridge: LocalUsageBridge::inactive(),
+            #[cfg(test)]
             auth_epoch: 0,
+            #[cfg(test)]
             auth_epoch_valid: true,
+            #[cfg(test)]
             account_key: Some(preview_account_key),
+            #[cfg(test)]
             account_update_generation: 1,
+            #[cfg(test)]
             account_partition: Some(preview_partition),
             global_account_fallback_available: false,
             email: Some("preview@example.com".into()),
@@ -13105,17 +13203,29 @@ impl CodexInfoState {
             window_seconds: WEEK_SECONDS,
             history: UsageHistory::preview(now, reset_at, preview_costs),
             history_gaps: Vec::new(),
+            #[cfg(test)]
             pending_recorded_sessions: Vec::new(),
+            #[cfg(test)]
             pending_session_checkpoints: Vec::new(),
+            #[cfg(test)]
             pending_session_ranges: Vec::new(),
+            #[cfg(test)]
             pending_session_model_totals: Vec::new(),
+            #[cfg(test)]
             pending_history_continuity_recovery: None,
+            #[cfg(test)]
             pending_cumulative_recovery: None,
+            #[cfg(test)]
             pending_timeline_recovery: None,
+            #[cfg(test)]
             pending_collector_generation: None,
+            #[cfg(test)]
             pending_session_period: None,
+            #[cfg(test)]
             pending_recorder_admission: None,
+            #[cfg(test)]
             pending_session_cleanup: Vec::new(),
+            #[cfg(test)]
             pending_quota_source_rescan_complete: false,
             model_usage,
             active_threads: vec![ActiveThread {
@@ -13145,13 +13255,17 @@ impl CodexInfoState {
             recorder_store_error: false,
             local_usage_pending: false,
             pending_quota_observation_confirmed: false,
+            #[cfg(test)]
             pending_local_verification: None,
             // Preview is one complete in-memory generation. Individual
             // startup fixtures clear this bit when they intentionally model
             // an incomplete first collection.
             usage_snapshot_committed: true,
+            #[cfg(test)]
             last_thread_poll: Instant::now(),
+            #[cfg(test)]
             recovery_period: None,
+            #[cfg(test)]
             last_local_poll: Instant::now(),
             service_endpoint_error: None,
             service_owner_probe_failed: false,
@@ -13178,6 +13292,7 @@ impl CodexInfoState {
             service_threads_last_poll: resident_now,
             service_threads_force_poll: false,
             service_threads_error: None,
+            #[cfg(test)]
             acknowledged_recorder_commit: None,
         };
         match kind {
@@ -13579,6 +13694,7 @@ impl CodexInfoState {
 
     /// Ask the resident producer for its next account/quota generation.
     /// The UI never calls this path: it consumes the immutable details root.
+    #[cfg(test)]
     fn request_account_refresh(&mut self, status: &str) {
         if self.preview {
             return;
@@ -13601,6 +13717,7 @@ impl CodexInfoState {
     /// Own every periodic producer request in the resident service. Completed
     /// events are drained before this method runs, so `checking` and
     /// `thread_checking` are the single-flight completion boundaries.
+    #[cfg(test)]
     fn schedule_resident_refresh(&mut self, now: Instant) -> bool {
         let mut publication_changed = false;
         let account_due = !self.recorder_store_error
@@ -13687,7 +13804,9 @@ impl CodexInfoState {
                 }
                 // Account/quota reads belong to the resident service. The UI
                 // control bridge must never mutate the visible root with them.
-                Event::Ready | Event::Account { .. } | Event::Usage(_) => {}
+                Event::Ready => {}
+                #[cfg(test)]
+                Event::Account { .. } | Event::Usage(_) => {}
             }
         }
     }
@@ -13756,7 +13875,12 @@ impl CodexInfoState {
                 .iter()
                 .map(store_observation_from_public)
                 .collect(),
-            ..UsageHistory::default()
+            #[cfg(test)]
+            pending_store_samples: Vec::new(),
+            #[cfg(test)]
+            pending_store_observations: Vec::new(),
+            #[cfg(test)]
+            startup_maintenance_done: false,
         };
         let next_threads = details
             .threads
@@ -13905,7 +14029,12 @@ impl CodexInfoState {
                 .iter()
                 .map(store_observation_from_public_v3)
                 .collect(),
-            ..UsageHistory::default()
+            #[cfg(test)]
+            pending_store_samples: Vec::new(),
+            #[cfg(test)]
+            pending_store_observations: Vec::new(),
+            #[cfg(test)]
+            startup_maintenance_done: false,
         };
         let next_threads = details
             .threads
@@ -14322,6 +14451,7 @@ impl CodexInfoState {
 
     fn hold_service_endpoint_error(&mut self, error: String) {
         if self.service_endpoint_error.is_none() {
+            #[cfg(test)]
             if !self.advance_auth_epoch() {
                 return;
             }
@@ -14331,6 +14461,7 @@ impl CodexInfoState {
         self.checking = false;
     }
 
+    #[cfg(test)]
     fn advance_auth_epoch(&mut self) -> bool {
         if !self.auth_epoch_valid {
             return false;
@@ -14343,6 +14474,7 @@ impl CodexInfoState {
         true
     }
 
+    #[cfg(test)]
     fn enter_auth_epoch_recovery(&mut self) {
         self.auth_epoch_valid = false;
         self.stop_thread_bridge();
@@ -14354,18 +14486,21 @@ impl CodexInfoState {
         self.status = error.into();
     }
 
+    #[cfg(test)]
     fn stop_thread_bridge(&mut self) {
         if let Some(bridge) = self.thread_bridge.take() {
             let _ = bridge.send(ThreadCommand::Stop);
         }
     }
 
+    #[cfg(test)]
     fn ensure_thread_bridge(&mut self) {
         if !self.preview && self.thread_bridge.is_none() {
             self.thread_bridge = Some(AppServerBridge::<ThreadCommand, ThreadEvent>::start());
         }
     }
 
+    #[cfg(test)]
     fn request_thread_update(&mut self) -> bool {
         if self.preview || !self.authenticated {
             return false;
@@ -14384,7 +14519,7 @@ impl CodexInfoState {
         let command = ThreadCommand::Read {
             auth_epoch: self.auth_epoch,
             admission,
-            account_partition,
+            account_partition: Box::new(account_partition),
         };
         let sent = self
             .thread_bridge
@@ -14409,10 +14544,12 @@ impl CodexInfoState {
         }
     }
 
+    #[cfg(test)]
     fn request_local_usage(&mut self, reset_at: i64, window_seconds: i64) -> bool {
         self.request_local_usage_with_recovery(reset_at, window_seconds, None)
     }
 
+    #[cfg(test)]
     fn request_local_usage_with_recovery(
         &mut self,
         reset_at: i64,
@@ -14552,10 +14689,14 @@ impl CodexInfoState {
                 .then_some(regression_recovery_state)
                 .flatten()
                 .map(Box::new),
-            history_continuity_recovery: (!period_boundary)
-                .then_some(history_continuity_recovery)
-                .flatten(),
-            cumulative_recovery: (!period_boundary).then_some(cumulative_recovery).flatten(),
+            history_continuity_recovery: Box::new(
+                (!period_boundary)
+                    .then_some(history_continuity_recovery)
+                    .flatten(),
+            ),
+            cumulative_recovery: Box::new(
+                (!period_boundary).then_some(cumulative_recovery).flatten(),
+            ),
             reset_at: canonical_reset_at,
             window_seconds: canonical_window_seconds,
         };
@@ -14570,6 +14711,7 @@ impl CodexInfoState {
         true
     }
 
+    #[cfg(test)]
     fn take_pending_recorder_batch(&mut self) -> PendingRecorderBatch {
         let period = self.pending_session_period.take();
         let collector = self.pending_collector_generation.take();
@@ -14598,6 +14740,7 @@ impl CodexInfoState {
         }
     }
 
+    #[cfg(test)]
     fn has_pending_recorder_batch(&self) -> bool {
         !self.history.pending_store_samples.is_empty()
             || !self.history.pending_store_observations.is_empty()
@@ -14615,6 +14758,7 @@ impl CodexInfoState {
             || !self.pending_session_cleanup.is_empty()
     }
 
+    #[cfg(test)]
     fn restore_pending_recorder_batch(&mut self, mut batch: PendingRecorderBatch) {
         let current_admission = self.current_account_admission();
         if batch.auth_epoch != Some(self.auth_epoch)
@@ -14663,6 +14807,7 @@ impl CodexInfoState {
         self.pending_session_cleanup = batch.cleanup_plans;
     }
 
+    #[cfg(test)]
     fn discard_pending_recorder_batch(&mut self) {
         let _ = self.history.take_pending_store_samples();
         let _ = self.history.take_pending_store_observations();
@@ -14680,6 +14825,7 @@ impl CodexInfoState {
         self.pending_session_cleanup.clear();
     }
 
+    #[cfg(test)]
     fn clear_account_visible_state(&mut self) -> bool {
         if !self.advance_auth_epoch() {
             return false;
@@ -14688,6 +14834,7 @@ impl CodexInfoState {
         true
     }
 
+    #[cfg(test)]
     fn clear_account_visible_fields(&mut self) {
         self.stop_thread_bridge();
         self.account_key = None;
@@ -14758,6 +14905,7 @@ impl CodexInfoState {
         self.service_threads_error = None;
     }
 
+    #[cfg(test)]
     fn current_account_admission(&self) -> Option<AccountAdmission> {
         let partition = self.account_partition.as_ref()?;
         (self.auth_epoch_valid && self.authenticated).then(|| AccountAdmission {
@@ -14769,6 +14917,7 @@ impl CodexInfoState {
         })
     }
 
+    #[cfg(test)]
     fn admit_active_thread_update(&mut self, update: ActiveThreadUpdate) -> bool {
         match update {
             ActiveThreadUpdate::Snapshot(threads) => {
@@ -14807,10 +14956,12 @@ impl CodexInfoState {
         }
     }
 
+    #[cfg(test)]
     fn apply_active_thread_update(&mut self, update: ActiveThreadUpdate) -> bool {
         self.admit_active_thread_update(update)
     }
 
+    #[cfg(test)]
     fn apply_usage_event(&mut self, event: UsageEvent) {
         if !self.auth_epoch_valid {
             return;
@@ -14985,43 +15136,57 @@ impl CodexInfoState {
     }
 
     fn apply_account_error(&mut self, error: String) {
-        debug_runtime(format!("state account error: {error}"));
-        // Once this process has admitted an account partition, an external
-        // app-server/quota failure is presentation-only. Keep the independent
-        // local recorder generation, pending batch and cursor live.
-        if self.current_account_admission().is_some() {
+        #[cfg(test)]
+        {
+            debug_runtime(format!("state account error: {error}"));
+            // Once this process has admitted an account partition, an external
+            // app-server/quota failure is presentation-only. Keep the independent
+            // local recorder generation, pending batch and cursor live.
+            if self.current_account_admission().is_some() {
+                self.checking = false;
+                self.account_error = Some(error.clone());
+                self.error = Some(error);
+                self.status =
+                    "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
+                return;
+            }
+            // The failed account connection is a publication boundary. Results
+            // requested before this error may still be queued on the independent
+            // thread/local channels, so invalidate their epoch without clearing
+            // the last valid visible values. Let the thread scheduler issue a
+            // fresh request instead of remaining stuck behind the stale one.
+            if !self.advance_auth_epoch() {
+                return;
+            }
+            self.discard_pending_recorder_batch();
+            self.thread_checking = false;
+            self.checking = false;
+            if self.pending_local_verification.take().is_some() {
+                self.local_usage_pending = false;
+            }
+            // If the local lane is already running, the epoch change makes that
+            // exact result stale. Keep the lane occupied until its terminal event
+            // arrives; otherwise a second full session scan could be queued.
+            self.account_error = Some(error.clone());
+            self.error = Some(error);
+            self.status =
+                "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
+            // The resident scheduler owns outage recovery at the established
+            // interval. Error handling only records the failed account boundary.
+        }
+        #[cfg(not(test))]
+        {
+            debug_runtime(format!("UI auth control error: {error}"));
+            self.auth_polling = false;
             self.checking = false;
             self.account_error = Some(error.clone());
             self.error = Some(error);
             self.status =
                 "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
-            return;
         }
-        // The failed account connection is a publication boundary. Results
-        // requested before this error may still be queued on the independent
-        // thread/local channels, so invalidate their epoch without clearing
-        // the last valid visible values. Let the thread scheduler issue a
-        // fresh request instead of remaining stuck behind the stale one.
-        if !self.advance_auth_epoch() {
-            return;
-        }
-        self.discard_pending_recorder_batch();
-        self.thread_checking = false;
-        self.checking = false;
-        if self.pending_local_verification.take().is_some() {
-            self.local_usage_pending = false;
-        }
-        // If the local lane is already running, the epoch change makes that
-        // exact result stale. Keep the lane occupied until its terminal event
-        // arrives; otherwise a second full session scan could be queued.
-        self.account_error = Some(error.clone());
-        self.error = Some(error);
-        self.status =
-            "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
-        // The resident scheduler owns outage recovery at the established
-        // interval. Error handling only records the failed account boundary.
     }
 
+    #[cfg(test)]
     fn apply_identity_error(&mut self, error: String) {
         debug_runtime(format!("state identity error: {error}"));
         if !self.clear_account_visible_state() {
@@ -15033,6 +15198,7 @@ impl CodexInfoState {
         self.status = "アカウントidentityまたは保存先を安全に確認できませんでした。".into();
     }
 
+    #[cfg(test)]
     fn apply_confirmed_account_event(
         &mut self,
         email: Option<String>,
@@ -15081,6 +15247,7 @@ impl CodexInfoState {
         );
     }
 
+    #[cfg(test)]
     fn apply_resolved_confirmed_account_event(
         &mut self,
         email: Option<String>,
@@ -15210,6 +15377,7 @@ impl CodexInfoState {
         .into();
     }
 
+    #[cfg(test)]
     fn current_local_period_matches(&self, reset_at: i64, window_seconds: i64) -> bool {
         if self.authenticated {
             return self.window_seconds == window_seconds
@@ -15222,6 +15390,7 @@ impl CodexInfoState {
         self.recovery_period == Some((reset_at, window_seconds))
     }
 
+    #[cfg(test)]
     fn apply_local_usage_success(&mut self, result: LocalUsageResult) {
         if !self.auth_epoch_valid
             || result.auth_epoch != self.auth_epoch
@@ -15324,6 +15493,7 @@ impl CodexInfoState {
         ));
     }
 
+    #[cfg(test)]
     fn request_local_usage_verification(&mut self, candidate: LocalUsageCandidate) {
         let admission_matches =
             self.current_account_admission().as_ref() == Some(&candidate.admission);
@@ -15363,6 +15533,7 @@ impl CodexInfoState {
         let _ = self.bridge.send(AccountCommand::FinishFallback);
     }
 
+    #[cfg(test)]
     fn apply_account_verification(&mut self, admission: AccountAdmission, valid: bool) {
         let Some(candidate) = self.pending_local_verification.take() else {
             return;
@@ -15429,28 +15600,30 @@ impl CodexInfoState {
         }
     }
 
+    #[cfg(test)]
     fn apply_local_usage_error(&mut self, auth_epoch: u64, reset_at: i64, window_seconds: i64) {
-        self.apply_local_usage_error_with_generation(
+        self.apply_local_usage_error_with_generation(LocalUsageErrorContext {
             auth_epoch,
-            None,
+            admission: None,
             reset_at,
             window_seconds,
-            None,
-            None,
-            Vec::new(),
-        );
+            collector_epoch: None,
+            cycle_seq: None,
+            durable_model_totals: Vec::new(),
+        });
     }
 
-    fn apply_local_usage_error_with_generation(
-        &mut self,
-        auth_epoch: u64,
-        admission: Option<AccountAdmission>,
-        reset_at: i64,
-        window_seconds: i64,
-        collector_epoch: Option<u128>,
-        cycle_seq: Option<u64>,
-        durable_model_totals: Vec<usage_store::SessionModelTotal>,
-    ) {
+    #[cfg(test)]
+    fn apply_local_usage_error_with_generation(&mut self, context: LocalUsageErrorContext) {
+        let LocalUsageErrorContext {
+            auth_epoch,
+            admission,
+            reset_at,
+            window_seconds,
+            collector_epoch,
+            cycle_seq,
+            durable_model_totals,
+        } = context;
         if !self.auth_epoch_valid
             || auth_epoch != self.auth_epoch
             || !self.current_local_period_matches(reset_at, window_seconds)
@@ -15509,6 +15682,7 @@ impl CodexInfoState {
         self.refresh_partial_failure_status();
     }
 
+    #[cfg(test)]
     fn apply_recorder_store_error(&mut self) {
         self.recorder_store_error = true;
         self.local_usage_pending = false;
@@ -15516,6 +15690,7 @@ impl CodexInfoState {
         self.refresh_partial_failure_status();
     }
 
+    #[cfg(test)]
     fn clear_recorder_store_error(&mut self) {
         if self.recorder_store_error {
             self.recorder_store_error = false;
@@ -15523,25 +15698,7 @@ impl CodexInfoState {
         }
     }
 
-    fn refresh_history_gaps(&mut self) -> bool {
-        let Some(partition) = self.account_partition.clone() else {
-            self.history_gaps.clear();
-            return true;
-        };
-        match UsageHistory::confirmed_gaps_from_partition(&partition) {
-            Ok(gaps) => {
-                self.history_gaps = gaps;
-                true
-            }
-            Err(error) => {
-                self.apply_identity_error(format!(
-                    "アカウント別の履歴gap ledgerを安全に確認できませんでした: {error}"
-                ));
-                false
-            }
-        }
-    }
-
+    #[cfg(test)]
     fn acknowledge_recorder_commit(
         &mut self,
         admission: &AccountAdmission,
@@ -15568,6 +15725,7 @@ impl CodexInfoState {
         });
     }
 
+    #[cfg(test)]
     fn apply_thread_result_for_admission(
         &mut self,
         auth_epoch: u64,
@@ -15583,6 +15741,7 @@ impl CodexInfoState {
         self.apply_admitted_thread_result(update)
     }
 
+    #[cfg(test)]
     fn apply_admitted_thread_result(&mut self, update: ActiveThreadUpdate) -> bool {
         let previous_threads = self.active_threads.clone();
         let previous_thread_error = self.thread_error;
@@ -15606,6 +15765,7 @@ impl CodexInfoState {
         let _ = self.apply_admitted_thread_result(update);
     }
 
+    #[cfg(test)]
     fn apply_thread_error_for_admission(
         &mut self,
         auth_epoch: u64,
@@ -15628,6 +15788,7 @@ impl CodexInfoState {
         !previous_thread_error
     }
 
+    #[cfg(test)]
     fn apply_thread_error(&mut self, auth_epoch: u64, message: String) -> bool {
         let Some(admission) = self.current_account_admission() else {
             return false;
@@ -15677,6 +15838,7 @@ impl CodexInfoState {
     /// Apply one FIFO batch from the current account bridge. An account error
     /// invalidates the connection, so later events already drained from that
     /// same receiver must not cross the replacement boundary.
+    #[cfg(test)]
     fn apply_account_event_batch(&mut self, events: Vec<Event>) -> bool {
         for event in events {
             match event {
@@ -15721,6 +15883,7 @@ impl CodexInfoState {
         false
     }
 
+    #[cfg(test)]
     fn poll(&mut self) -> bool {
         if self.preview {
             return false;
@@ -15784,15 +15947,15 @@ impl CodexInfoState {
                     collector_epoch,
                     cycle_seq,
                     durable_model_totals,
-                } => self.apply_local_usage_error_with_generation(
+                } => self.apply_local_usage_error_with_generation(LocalUsageErrorContext {
                     auth_epoch,
-                    Some(admission),
+                    admission: Some(admission),
                     reset_at,
                     window_seconds,
                     collector_epoch,
                     cycle_seq,
                     durable_model_totals,
-                ),
+                }),
             }
         }
         observed_event
@@ -16572,19 +16735,20 @@ impl CodexInfoState {
             .collect::<Vec<_>>();
         let raw_model_timelines =
             self.graph_raw_model_timelines_for_selection(selected_reset, period_start, period_end);
-        let mut paths = graph_paths_for_selection_with_sources_and_astra_with_lineage(
-            &sample_references,
-            period_start,
-            period_end,
-            show_luna,
-            show_terra,
-            show_sol,
-            show_astra,
-            show_tokens,
-            &untrusted_minutes,
-            &confirmed_gaps,
-            &raw_model_timelines,
-        );
+        let mut paths =
+            graph_paths_for_selection_with_sources_and_astra_with_lineage(GraphSelectionInput {
+                samples: &sample_references,
+                period_start,
+                period_end,
+                show_luna,
+                show_terra,
+                show_sol,
+                show_astra,
+                show_tokens,
+                untrusted_minutes: &untrusted_minutes,
+                confirmed_gaps: &confirmed_gaps,
+                model_timelines: &raw_model_timelines,
+            });
         if !self.has_quota_percent {
             paths.remaining.clear();
             paths.remaining_solid.clear();
@@ -17296,6 +17460,7 @@ fn normal_status_text(remaining: f64, seconds: i64, last_success_at: Option<&str
     }
 }
 
+#[cfg(test)]
 fn automatic_refresh_interval(authenticated: bool, auth_polling: bool) -> Duration {
     if !authenticated && auth_polling {
         Duration::from_secs(2)
@@ -17304,6 +17469,7 @@ fn automatic_refresh_interval(authenticated: bool, auth_polling: bool) -> Durati
     }
 }
 
+#[cfg(test)]
 fn account_refresh_due(
     now: Instant,
     last_poll: Instant,
@@ -17674,7 +17840,9 @@ fn format_period_label(start: i64, end: i64) -> String {
 impl Drop for CodexInfoState {
     fn drop(&mut self) {
         let _ = self.bridge.send(AccountCommand::Stop);
+        #[cfg(test)]
         self.stop_thread_bridge();
+        #[cfg(test)]
         let _ = self.local_bridge.send(LocalCommand::Stop);
     }
 }
@@ -18148,7 +18316,11 @@ fn clamp_graph_preview_size((width, height): (u32, u32)) -> (u32, u32) {
 }
 
 const DEFAULT_SERVICE_ADDRESS: &str = "127.0.0.1:8787";
-const BACKGROUND_SERVICE_START_TIMEOUT: Duration = Duration::from_secs(5);
+// Transport completion must fit the standalone REST server's own three-second
+// request budget. Performance-derived polling values are intentionally left
+// to the separately planned post-optimization measurement work.
+const SERVICE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
 const BACKGROUND_CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const DETAILS_RESPONSE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const DETAILS_RESPONSE_HEADER_MAX_BYTES: usize = 8 * 1024;
@@ -18507,34 +18679,75 @@ fn request_service_details_with_etag(
     route: &str,
     if_none_match: Option<&str>,
 ) -> Result<ServiceDetailsHttpResponse, String> {
+    request_service_details_with_etag_and_timeout(
+        address,
+        route,
+        if_none_match,
+        SERVICE_RESPONSE_TIMEOUT,
+    )
+}
+
+fn service_response_remaining(deadline: Instant) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "details response deadline exceeded".to_owned())
+}
+
+fn request_service_details_with_etag_and_timeout(
+    address: SocketAddr,
+    route: &str,
+    if_none_match: Option<&str>,
+    timeout: Duration,
+) -> Result<ServiceDetailsHttpResponse, String> {
     if let Some(pair) = if_none_match {
         if !valid_published_pair(pair) {
             return Err("invalid details generation header".into());
         }
     }
-    let timeout = Duration::from_millis(500);
-    let mut stream = TcpStream::connect_timeout(&address, timeout).map_err(|_| "connect failed")?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|_| "read timeout setup failed")?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|_| "write timeout setup failed")?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "details response deadline is invalid".to_owned())?;
+    let mut stream = TcpStream::connect_timeout(&address, service_response_remaining(deadline)?)
+        .map_err(|_| "connect failed")?;
     let conditional = if_none_match
         .map(|pair| format!("If-None-Match: \"{pair}\"\r\n"))
         .unwrap_or_default();
     let request = format!(
         "GET {route} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n{conditional}\r\n"
     );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|_| "details request failed")?;
+    let mut request_offset = 0;
+    while request_offset < request.len() {
+        stream
+            .set_write_timeout(Some(service_response_remaining(deadline)?))
+            .map_err(|_| "write timeout setup failed")?;
+        let written = stream
+            .write(&request.as_bytes()[request_offset..])
+            .map_err(|_| "details request failed")?;
+        if written == 0 {
+            return Err("details request failed".into());
+        }
+        request_offset += written;
+    }
     let maximum = DETAILS_RESPONSE_MAX_BYTES + DETAILS_RESPONSE_HEADER_MAX_BYTES + 1;
-    let mut response = Vec::new();
-    stream
-        .take(maximum as u64)
-        .read_to_end(&mut response)
-        .map_err(|_| "details response read failed")?;
+    let mut response = Vec::with_capacity(maximum.min(8 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        stream
+            .set_read_timeout(Some(service_response_remaining(deadline)?))
+            .map_err(|_| "read timeout setup failed")?;
+        let available = (maximum - response.len()).min(buffer.len());
+        let read = stream
+            .read(&mut buffer[..available])
+            .map_err(|_| "details response read failed")?;
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&buffer[..read]);
+        if response.len() >= maximum {
+            break;
+        }
+    }
     if response.len() >= maximum {
         return Err("details response exceeds bounded size".into());
     }
@@ -18572,12 +18785,16 @@ fn request_service_details_with_etag(
         let (name, value) = line
             .split_once(": ")
             .ok_or_else(|| "details response header is malformed".to_owned())?;
-        match name {
-            "Codex-Info-Published-Pair" if pair.is_none() => pair = Some(value.to_owned()),
-            "content-type" if !content_type && value == "application/json; charset=utf-8" => {
+        let name = name.to_ascii_lowercase();
+        match name.as_str() {
+            "codex-info-published-pair" if pair.is_none() => pair = Some(value.to_owned()),
+            "content-type"
+                if !content_type
+                    && value.eq_ignore_ascii_case("application/json; charset=utf-8") =>
+            {
                 content_type = true;
             }
-            "cache-control" if !cache_control && value == "no-store" => {
+            "cache-control" if !cache_control && value.eq_ignore_ascii_case("no-store") => {
                 cache_control = true;
             }
             "content-length" if content_length.is_none() => {
@@ -18587,7 +18804,9 @@ fn request_service_details_with_etag(
                         .map_err(|_| "invalid details content length")?,
                 );
             }
-            "connection" if !connection_close && value == "close" => connection_close = true,
+            "connection" if !connection_close && value.eq_ignore_ascii_case("close") => {
+                connection_close = true;
+            }
             _ => return Err("unexpected or duplicate details response header".into()),
         }
     }
@@ -19022,6 +19241,8 @@ enum ServiceResourceFetch<T> {
     NotModified { pair: String },
 }
 
+type ServiceThreadsResource = (Option<u64>, Vec<PublicThread>);
+
 fn fetch_service_history_periods_with_etag<F>(
     mut request: F,
     prior_pair: Option<&str>,
@@ -19137,7 +19358,7 @@ where
 fn fetch_service_threads_with_etag<F>(
     mut request: F,
     prior_pair: Option<&str>,
-) -> Result<ServiceResourceFetch<(Option<u64>, Vec<PublicThread>)>, String>
+) -> Result<ServiceResourceFetch<ServiceThreadsResource>, String>
 where
     F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
 {
@@ -19171,12 +19392,9 @@ fn cli_error(key: CliTextKey) -> String {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LaunchMode {
-    /// Mode 1: one resident owner containing recorder + REST.
-    Service(ApiServerConfig),
-    /// Mode 2: ensure a resident service exists at this address, then add X UI.
-    All(ApiServerConfig),
-    /// Stop this profile's verified resident service and wait for its lock to disappear.
-    Stop,
+    /// The public binary is a REST client. Recorder and REST are separate
+    /// packaged executables and are never started by this process.
+    Ui(ApiServerConfig),
     /// Print CLI usage without starting a daemon or UI.
     Help,
 }
@@ -19209,27 +19427,31 @@ where
 {
     let arguments = arguments.into_iter().collect::<Vec<_>>();
     match arguments.as_slice() {
-        [] => default_service_config().map(LaunchMode::Service),
+        [] => default_service_config().map(LaunchMode::Ui),
         [value] if value == "--help" || value == "--h" || value == "-h" => Ok(LaunchMode::Help),
-        [value] if value == "--ui" => default_service_config().map(LaunchMode::All),
-        [stop] if stop == "--stop" => Ok(LaunchMode::Stop),
-        [port, value] if port == "--port" => {
-            service_config_for_port(value).map(LaunchMode::Service)
+        [value] if value == "--ui" => default_service_config().map(LaunchMode::Ui),
+        // These were legacy combined-service controls. Reject them before
+        // probing, stopping, binding, or spawning anything.
+        [stop] if stop == "--stop" => Err(I18n::detect().language().launch_help().to_owned()),
+        [port, _value] if port == "--port" => {
+            Err(I18n::detect().language().launch_help().to_owned())
         }
         [ui, port, value] if ui == "--ui" && port == "--port" => {
-            service_config_for_port(value).map(LaunchMode::All)
+            service_config_for_port(value).map(LaunchMode::Ui)
         }
         _ => Err(I18n::detect().language().launch_help().to_owned()),
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum ServiceHealthVersion {
     Current,
     Different,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum ServiceEndpointState {
     Absent,
     Current,
@@ -19247,6 +19469,7 @@ struct VersionedServiceHealth {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(test)]
 struct LegacyServiceHealth {
     api_version: String,
     service: String,
@@ -19254,6 +19477,7 @@ struct LegacyServiceHealth {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
+#[cfg(test)]
 enum ServiceHealthDocument {
     Versioned(VersionedServiceHealth),
     Legacy(LegacyServiceHealth),
@@ -19272,6 +19496,7 @@ fn is_stable_product_version(value: &str) -> bool {
         && components.next().is_none()
 }
 
+#[cfg(test)]
 fn service_health_response_version(response: &[u8]) -> Option<ServiceHealthVersion> {
     if !response.starts_with(b"HTTP/1.1 200 ") {
         return None;
@@ -19309,6 +19534,7 @@ fn is_service_health_response(response: &[u8]) -> bool {
     service_health_response_version(response) == Some(ServiceHealthVersion::Current)
 }
 
+#[cfg(test)]
 fn service_endpoint_state(address: SocketAddr) -> ServiceEndpointState {
     let timeout = Duration::from_millis(150);
     let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
@@ -19408,66 +19634,10 @@ fn service_is_healthy(address: SocketAddr) -> bool {
         && is_stable_product_version(&document.product_version)
 }
 
-fn recorder_owner_is_healthy(owner: &daemon::DaemonOwnerIdentity) -> bool {
-    let Ok(Some(state)) = daemon::read_recorder_state() else {
-        return false;
-    };
-    let now = Utc::now().timestamp().max(1);
-    if state.pid != owner.pid
-        || state.process_starttime != owner.starttime_ticks
-        || state.owner_nonce != owner.owner_nonce
-        || state.updated_at_unix > now
-        || now.saturating_sub(state.updated_at_unix) > daemon::RECORDER_LAST_COMMIT_MAX_AGE_SECS
-    {
-        return false;
-    }
-    match state.write_state {
-        daemon::RecorderWriteState::IdleNoAccount => true,
-        daemon::RecorderWriteState::Ready => state.last_commit_unix.is_some_and(|last_commit| {
-            now.saturating_sub(last_commit) <= daemon::RECORDER_LAST_COMMIT_MAX_AGE_SECS
-        }),
-        daemon::RecorderWriteState::Degraded => false,
-    }
-}
-
-fn healthy_combined_service_owner(address: SocketAddr) -> Option<u32> {
-    if !service_is_healthy(address) {
-        return None;
-    }
-    // A healthy HTTP document is not an owner credential.  Only a current
-    // lock whose process is an explicitly managed service or an exact known
-    // Codex invocation may be paired with the endpoint; a foreign/malformed
-    // owner must never be adopted by UI attachment or startup races.
-    if !matches!(
-        daemon::classify_profile_owner(),
-        daemon::OwnerClassification::ManagedActive
-            | daemon::OwnerClassification::KnownUnmanagedCodex
-    ) {
-        return None;
-    }
-    let owner = daemon::current_daemon_owner_identity()?;
-    if daemon::daemon_owner_port(&owner) != Some(address.port()) {
-        return None;
-    }
-    if !recorder_owner_is_healthy(&owner) {
-        return None;
-    }
-    // Re-read the endpoint after the lock snapshot.  A stale HTTP 200 from a
-    // listener that is closing must never be paired with a newer/different
-    // profile owner during UI attachment or concurrent startup.
-    (service_is_healthy(address)
-        && daemon::current_daemon_owner_identity().is_some_and(|current| current == owner))
-    .then_some(owner.pid)
-}
-
-fn systemd_managed_activation() -> bool {
-    std::env::var_os("CODEX_INFO_SYSTEMD_MANAGED").is_some_and(|value| value == "1")
-}
-
-/// The installed launcher sets this marker only for its verified fallback
-/// path after a service-start failure.  That path is a UI client, never a
-/// second resident owner: malformed marker values fail closed instead of
-/// silently falling back to the direct-development `--ui` contract.
+/// The installed launcher sets this marker for every packaged UI start.  The
+/// UI is a REST client and never a second resident owner; malformed marker
+/// values fail closed instead of silently enabling the development-only
+/// combined-service path.
 fn ui_client_only_marker_value(value: Option<&std::ffi::OsStr>) -> Result<bool, String> {
     match value {
         None => Ok(false),
@@ -19478,226 +19648,6 @@ fn ui_client_only_marker_value(value: Option<&std::ffi::OsStr>) -> Result<bool, 
 
 fn ui_client_only_mode() -> Result<bool, String> {
     ui_client_only_marker_value(std::env::var_os("CODEX_INFO_UI_CLIENT_ONLY").as_deref())
-}
-
-/// Reconcile the profile owner before a systemd-managed service binds its
-/// listener.  A managed activation may retire only an exact, known Codex
-/// owner validated by the existing lock/PID/starttime/executable identity
-/// contract.  An owner with an unknown executable, malformed lock, or no lock
-/// is never guessed at or killed, even when the port happens to look healthy.
-fn reconcile_managed_service_owner(address: SocketAddr) -> Result<bool, String> {
-    let deadline = Instant::now() + BACKGROUND_SERVICE_START_TIMEOUT;
-    loop {
-        let endpoint = service_endpoint_state(address);
-        match daemon::classify_profile_owner() {
-            daemon::OwnerClassification::ManagedActive
-                if endpoint == ServiceEndpointState::Current =>
-            {
-                if let Some(owner) = daemon::current_daemon_owner_identity() {
-                    if recorder_owner_is_healthy(&owner) {
-                        return Ok(true);
-                    }
-                }
-                // The marker identifies a managed process, but stale/missing
-                // recorder state is not health. Retire only this exact owner
-                // and establish a fresh state/listener below.
-                daemon::stop_daemon().map_err(|error| {
-                    format!("managed service could not retire unhealthy owner: {error:?}")
-                })?;
-            }
-            daemon::OwnerClassification::ManagedActive
-            | daemon::OwnerClassification::KnownUnmanagedCodex => {
-                daemon::stop_daemon().map_err(|error| {
-                    format!("managed service could not retire verified owner: {error:?}")
-                })?;
-            }
-            daemon::OwnerClassification::Stale => {
-                // The lock acquisition path will reclaim a dead/stale lock
-                // using the same inode race check.  A listener that survives
-                // without a valid owner remains an unknown occupant.
-                if endpoint == ServiceEndpointState::Absent {
-                    return Ok(false);
-                }
-                // A dead owner can leave its socket in the process of closing;
-                // wait for that listener instead of adopting an old HTTP 200.
-            }
-            daemon::OwnerClassification::NoOwner => {
-                if endpoint == ServiceEndpointState::Absent {
-                    return Ok(false);
-                }
-                // The verified owner has just released its lock.  Its socket
-                // may close slightly later, so keep waiting without assigning
-                // authority to the lockless listener.
-            }
-            daemon::OwnerClassification::Malformed | daemon::OwnerClassification::Foreign => {
-                return Err(cli_error(CliTextKey::ServiceStateUnavailable));
-            }
-        }
-
-        // stop_daemon waits for lock release, but the old listener may close
-        // a few milliseconds later.  Keep the decision bounded and do not
-        // treat an old HTTP 200 as permission to attach to an unknown owner.
-        if Instant::now() >= deadline {
-            return Err(cli_error(CliTextKey::ServiceCleanupFailed));
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-fn retire_different_version_service(address: SocketAddr) -> Result<(), String> {
-    if service_endpoint_state(address) != ServiceEndpointState::Different {
-        return Ok(());
-    }
-    if !matches!(
-        daemon::classify_profile_owner(),
-        daemon::OwnerClassification::ManagedActive
-            | daemon::OwnerClassification::KnownUnmanagedCodex
-    ) {
-        // A different-version response without an exact known Codex owner is
-        // still an unknown occupant. Never send the public stop signal based
-        // on HTTP health or a bare PID.
-        return Err(cli_error(CliTextKey::ServiceStateUnavailable));
-    }
-    daemon::stop_daemon().map_err(|error| format!("verified service stop failed: {error:?}"))?;
-    // The legacy process releases its recorder lock immediately before closing
-    // the REST listener. A malformed/incomplete response still means that the
-    // port is occupied, so wait for an actually absent listener or a concurrent
-    // current-version winner before the one-shot start decision below.
-    let deadline = Instant::now() + BACKGROUND_SERVICE_START_TIMEOUT;
-    loop {
-        match service_endpoint_state(address) {
-            ServiceEndpointState::Absent | ServiceEndpointState::Current => return Ok(()),
-            ServiceEndpointState::Different | ServiceEndpointState::Unrecognized => {}
-        }
-        if Instant::now() >= deadline {
-            return Err(cli_error(CliTextKey::ServiceCleanupFailed));
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-fn terminate_and_reap_owned_child(child: &mut Child) -> bool {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return true;
-    }
-    // The child is ours, but still pin its process instance before requesting
-    // termination. A forceful Child::kill would bypass the pidfd contract used
-    // by the public --stop path.
-    if !daemon::send_term_to_owned_process(child.id()) {
-        return false;
-    }
-    let deadline = Instant::now() + BACKGROUND_CHILD_CLEANUP_TIMEOUT;
-    loop {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn ensure_background_service(config: ApiServerConfig) -> Result<(), String> {
-    let address = config.listen_addr();
-    if healthy_combined_service_owner(address).is_some() {
-        return Ok(());
-    }
-    retire_different_version_service(address)?;
-    let executable =
-        std::env::current_exe().map_err(|_| cli_error(CliTextKey::ServiceExecutableUnavailable))?;
-    let port_text = address.port().to_string();
-    let child = Command::new(executable)
-        .args(["--port", port_text.as_str()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| cli_error(CliTextKey::ServiceStartFailed))?;
-    let child_pid = child.id();
-    let mut owned_child = Some(child);
-    let deadline = Instant::now() + BACKGROUND_SERVICE_START_TIMEOUT;
-    loop {
-        let healthy_owner = healthy_combined_service_owner(address);
-        if healthy_owner == Some(child_pid) {
-            // This is the resident child this UI+service invocation intentionally
-            // created. Dropping the process handle detaches it; it must remain
-            // alive after the X UI closes.
-            return Ok(());
-        }
-        if healthy_owner.is_some() {
-            // A concurrent UI/service launcher won recorder ownership and became
-            // healthy. This invocation must reap only the child it spawned
-            // before attaching its UI to that winner.
-            if let Some(child) = owned_child.as_mut() {
-                if !terminate_and_reap_owned_child(child) {
-                    return Err(cli_error(CliTextKey::ServiceCleanupFailed));
-                }
-            }
-            return Ok(());
-        }
-
-        if let Some(child) = owned_child.as_mut() {
-            match child.try_wait() {
-                Ok(Some(_)) => owned_child = None,
-                Ok(None) => {}
-                Err(_) => {
-                    let reaped = terminate_and_reap_owned_child(child);
-                    return Err(if reaped {
-                        cli_error(CliTextKey::ServiceStateUnavailable)
-                    } else {
-                        cli_error(CliTextKey::ServiceCleanupFailed)
-                    });
-                }
-            }
-        }
-        if owned_child.is_none() && daemon::current_daemon_owner_pid().is_none() {
-            return Err(cli_error(CliTextKey::ServiceExitedBeforeHealthy));
-        }
-        if Instant::now() >= deadline {
-            let reaped = owned_child
-                .as_mut()
-                .is_none_or(terminate_and_reap_owned_child);
-            return Err(if reaped {
-                cli_error(CliTextKey::ServiceNotHealthy)
-            } else {
-                cli_error(CliTextKey::ServiceCleanupFailed)
-            });
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn start_background_service_retry<F>(
-    state: &mut CodexInfoState,
-    config: ApiServerConfig,
-    in_flight: &Arc<AtomicBool>,
-    start_service: F,
-) -> bool
-where
-    F: FnOnce(ApiServerConfig) -> Result<(), String> + Send + 'static,
-{
-    if state.service_endpoint_error.is_none()
-        || in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
-        return false;
-    }
-    state.request_service_read("利用状況を更新しています…");
-    let worker_in_flight = Arc::clone(in_flight);
-    if thread::Builder::new()
-        .spawn(move || {
-            let _ = start_service(config);
-            worker_in_flight.store(false, Ordering::Release);
-        })
-        .is_err()
-    {
-        in_flight.store(false, Ordering::Release);
-        state.hold_service_endpoint_error(cli_error(CliTextKey::ServiceStartFailed));
-        return false;
-    }
-    true
 }
 
 #[cfg(test)]
@@ -19765,9 +19715,7 @@ fn poll_service_state_with_owner_check<F>(
 
 #[cfg(test)]
 fn poll_service_state(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
-    poll_service_state_with_owner_check(state, service_endpoint, |address| {
-        healthy_combined_service_owner(address).is_some()
-    });
+    poll_service_state_with_owner_check(state, service_endpoint, service_is_healthy);
 }
 
 const SERVICE_CURRENT_POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -20301,7 +20249,9 @@ fn run_ui_service_timer_cycle_with_windows(
         service_endpoint,
         graph_open,
         threads_open,
-        |address| healthy_combined_service_owner(address).is_some(),
+        // The UI trusts only the REST health contract. Recorder ownership is
+        // deliberately outside this process and must not gate client reads.
+        service_is_healthy,
     );
 }
 
@@ -20357,43 +20307,27 @@ fn run_ui_service_timer_cycle_with_owner_check_and_current_poll(
     }
 }
 
-async fn service_shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let ctrl_c = tokio::signal::ctrl_c();
-        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
-            tokio::select! {
-                _ = ctrl_c => {}
-                _ = terminate.recv() => {}
-            }
-        } else {
-            let _ = ctrl_c.await;
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
 #[derive(Debug)]
+#[cfg(test)]
 enum ResidentServiceCycleError {
-    Store(String),
+    Store,
     Publish(codex_info::server::ApiSnapshotError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum ResidentServiceCycleOutcome {
     Published,
     HeldIncomplete,
     Unchanged,
 }
 
+#[cfg(test)]
 fn recorder_attempt_due(now: Instant, retry_at: Option<Instant>) -> bool {
     retry_at.is_none_or(|retry_at| now >= retry_at)
 }
 
+#[cfg(test)]
 fn recorder_retry_deadline_after_attempt(
     now: Instant,
     current: Option<Instant>,
@@ -20410,68 +20344,8 @@ fn recorder_retry_deadline_after_attempt(
     }
 }
 
-fn pending_gap_for_shutdown(
-    state: &CodexInfoState,
-    active_partition: Option<&str>,
-) -> Option<usage_store::RecorderGap> {
-    let active_partition = active_partition?;
-    let partition = state.account_partition.as_ref()?;
-    if partition.partition_id != active_partition {
-        return None;
-    }
-    let now = Utc::now().timestamp().max(1);
-    let acknowledged = state
-        .acknowledged_recorder_commit
-        .as_ref()
-        .filter(|commit| commit.partition_id == active_partition);
-    let start_at = acknowledged
-        .map(|commit| commit.last_commit_unix)
-        .filter(|timestamp| *timestamp > 0 && *timestamp <= now)
-        .unwrap_or(now);
-    let owner_collector_epoch = acknowledged
-        .map(|commit| commit.collector_epoch)
-        .filter(|epoch| *epoch > 0)
-        .unwrap_or(1);
-    let confirmation_cycle_seq = acknowledged
-        .map(|commit| commit.cycle_seq)
-        .filter(|cycle| *cycle > 0)
-        .unwrap_or(1);
-    let cursor = acknowledged
-        .map(|commit| format!("generation-{}", commit.data_generation))
-        .unwrap_or_else(|| "generation-0".into());
-    let stopped_at_monotonic_ns = daemon::monotonic_now_ns();
-    if stopped_at_monotonic_ns == 0 {
-        return None;
-    }
-    let mut digest = Sha256::new();
-    digest.update(active_partition.as_bytes());
-    digest.update(stopped_at_monotonic_ns.to_be_bytes());
-    digest.update(std::process::id().to_be_bytes());
-    let digest = digest.finalize();
-    let gap_id = digest[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Some(usage_store::RecorderGap {
-        gap_id,
-        partition_id: active_partition.to_owned(),
-        source_identity_before: format!("resident:{active_partition}"),
-        source_identity_after: "unresolved".into(),
-        cursor_before: cursor,
-        cursor_after: "unresolved".into(),
-        stopped_at_monotonic_ns,
-        resumed_at_monotonic_ns: None,
-        start_at,
-        end_at: now,
-        reset_at: state.reset_at.filter(|reset| *reset > 0),
-        reason: "daemon_stop_unrecoverable".into(),
-        state: "pending".into(),
-        owner_collector_epoch,
-        confirmation_cycle_seq,
-    })
-}
-
 #[derive(Default)]
+#[cfg(test)]
 struct ResidentPublicationState {
     /// Exact last complete root accepted by the REST publisher. This is the
     /// publication buffer, not another collector: failures may change only
@@ -20487,6 +20361,7 @@ struct ResidentPublicationState {
     last_published_v3: Option<PublicDetailsV3>,
 }
 
+#[cfg(test)]
 fn resident_publication_error_root(
     publication: &ResidentPublicationState,
 ) -> (PublicDetails, PublicDetailsV2, PublicDetailsV3) {
@@ -20519,6 +20394,7 @@ fn resident_publication_error_root(
     (details, details_v2, details_v3)
 }
 
+#[cfg(test)]
 fn publish_resident_error_root<P>(
     publication: &mut ResidentPublicationState,
     publish: &mut P,
@@ -20632,6 +20508,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn resident_service_cycle_with_publication_policy_v3<W, P>(
     state: &mut CodexInfoState,
     publication: &mut ResidentPublicationState,
@@ -20739,8 +20616,8 @@ where
         && publication.last_published_v2.as_ref() == Some(&candidate_v2)
         && publication.last_published_v3.as_ref() == Some(&candidate_v3)
     {
-        return if let Some(error) = store_error {
-            Err(ResidentServiceCycleError::Store(error))
+        return if store_error.is_some() {
+            Err(ResidentServiceCycleError::Store)
         } else {
             Ok(ResidentServiceCycleOutcome::Unchanged)
         };
@@ -20766,392 +20643,39 @@ where
         publication.last_complete_v2 = None;
         publication.last_complete_v3 = None;
     }
-    if let Some(error) = store_error {
-        Err(ResidentServiceCycleError::Store(error))
+    if store_error.is_some() {
+        Err(ResidentServiceCycleError::Store)
     } else {
         Ok(ResidentServiceCycleOutcome::Published)
     }
 }
 
-fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let mut recorder = daemon::RecorderWorker::start()
-        .map_err(|_| std::io::Error::other(cli_error(CliTextKey::ServiceStartFailed)))?;
-    if !recorder.is_active() {
-        recorder.shutdown();
-        return Err(std::io::Error::other(cli_error(CliTextKey::ServiceAlreadyOwned)).into());
+#[cfg(test)]
+fn terminate_and_reap_owned_child(child: &mut Child) -> bool {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return true;
     }
-    // Bind REST only after this process owns the recorder. Concurrent service
-    // children therefore exit before publishing a listener, and an API bind
-    // failure drops the worker and releases its exact lock identity.
-    let mut api_server = ApiServer::start(config)
-        .map_err(|_| std::io::Error::other(cli_error(CliTextKey::ServiceStartFailed)))?;
-    let publisher = api_server.publisher();
-    let mut state = CodexInfoState::new();
-    let (initial_candidate, initial_candidate_v2, initial_candidate_v3) =
-        state.public_details_candidates();
-    publisher.publish_details_v3(
-        initial_candidate.clone(),
-        initial_candidate_v2.clone(),
-        initial_candidate_v3.clone(),
-    )?;
-    let mut publication = ResidentPublicationState {
-        last_published: Some(initial_candidate),
-        last_published_v2: Some(initial_candidate_v2),
-        last_published_v3: Some(initial_candidate_v3),
-        ..ResidentPublicationState::default()
-    };
-    let mut last_recorder_error = None;
-    let mut last_publish_error = None;
-    let mut active_recorder_partition: Option<String> = None;
-    eprintln!(
-        "codex-info: daemon+REST listening on {} recorder_owner={}",
-        api_server.local_addr(),
-        recorder.is_active()
-    );
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()?;
-    let runtime_result = runtime.block_on(async {
-        let mut ticker = tokio::time::interval(Duration::from_secs(1));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let publication_interval = daemon::daemon_interval_from_environment();
-        let shutdown = service_shutdown_signal();
-        tokio::pin!(shutdown);
-        let mut recorder_retry_at: Option<Instant> = None;
-        loop {
-            tokio::select! {
-                _ = &mut shutdown => return Ok::<(), String>(()),
-                _ = ticker.tick() => {
-                    if let Err(error) = recorder.probe() {
-                        return Err(format!("recorder worker stopped: {error}"));
-                    }
-                    let now = Instant::now();
-                    let desired_partition_id = state
-                        .account_partition
-                        .as_ref()
-                        .map(|partition| partition.partition_id.as_str());
-                    let recorder_work_pending = state.has_pending_recorder_batch();
-                    let recorder_attempt = recorder_attempt_due(now, recorder_retry_at)
-                        && (recorder_work_pending
-                            || desired_partition_id != active_recorder_partition.as_deref());
-                    let result = resident_service_cycle_with_publication_policy_v3(
-                        &mut state,
-                        &mut publication,
-                        recorder_attempt,
-                        false,
-                        |state, pending| {
-                            let batch_is_empty = pending.is_empty();
-                            let PendingRecorderBatch {
-                                auth_epoch,
-                                admission,
-                                partition_id,
-                                collector_epoch,
-                                cycle_seq,
-                                quota_source_rescan_complete,
-                                samples,
-                                observations,
-                                recorded_sessions,
-                                session_checkpoints,
-                                session_ranges,
-                                session_model_totals,
-                                history_continuity_recovery,
-                                cumulative_recovery,
-                                timeline_recovery,
-                                reset_at,
-                                window_seconds,
-                                cleanup_plans,
-                            } = pending;
-                            let current_admission = state.current_account_admission();
-                            if !batch_is_empty
-                                && (auth_epoch != Some(state.auth_epoch)
-                                    || admission.as_ref() != current_admission.as_ref()
-                                    || partition_id.as_deref()
-                                        != current_admission.as_ref().map(|current| {
-                                            current.partition_id.as_str()
-                                        }))
-                            {
-                                state.apply_identity_error(
-                                    "保存batchのアカウント世代が失効しました。".into(),
-                                );
-                                let _ = recorder.deactivate_partition();
-                                active_recorder_partition = None;
-                                return Err("recorder batch admission mismatch".into());
-                            }
-                            let desired_partition = state.account_partition.clone();
-                            let desired_id = desired_partition
-                                .as_ref()
-                                .map(|partition| partition.partition_id.clone());
-                            if desired_id != active_recorder_partition {
-                                let activation = match desired_partition {
-                                    Some(partition) => recorder
-                                        .activate_partition(partition, Utc::now()),
-                                    None => recorder.deactivate_partition(),
-                                };
-                                if let Err(error) = activation {
-                                    let _ = recorder.deactivate_partition();
-                                    active_recorder_partition = None;
-                                    state.apply_identity_error(
-                                        "アカウント別DBを安全に有効化できませんでした。".into(),
-                                    );
-                                    return Err(error);
-                                }
-                                active_recorder_partition = desired_id;
-                            }
-                            if collector_epoch.is_some()
-                                || cycle_seq.is_some()
-                                || !samples.is_empty()
-                                || !observations.is_empty()
-                                || !recorded_sessions.is_empty()
-                                || !session_checkpoints.is_empty()
-                                || !session_ranges.is_empty()
-                                || !session_model_totals.is_empty()
-                                || history_continuity_recovery.is_some()
-                                || cumulative_recovery.is_some()
-                                || timeline_recovery.is_some()
-                            {
-                                let Some(batch_partition_id) = partition_id.as_ref() else {
-                                    state.apply_identity_error(
-                                        "保存batchにアカウントpartitionがありません。".into(),
-                                    );
-                                    let _ = recorder.deactivate_partition();
-                                    active_recorder_partition = None;
-                                    return Err("recorder batch has no account partition".into());
-                                };
-                                if active_recorder_partition.as_deref()
-                                    != Some(batch_partition_id.as_str())
-                                {
-                                    state.apply_identity_error(
-                                        "保存batchと有効なアカウントpartitionが一致しません。".into(),
-                                    );
-                                    let _ = recorder.deactivate_partition();
-                                    active_recorder_partition = None;
-                                    return Err("recorder batch account partition mismatch".into());
-                                }
-                                let timeline_history_recovered = timeline_recovery.is_some();
-                                let commit_ack = match recorder.store_generation(
-                                    batch_partition_id.clone(),
-                                    daemon::RecorderGeneration {
-                                        reset_at: reset_at.ok_or_else(|| {
-                                            "recorder batch reset period is missing".to_owned()
-                                        })?,
-                                        window_seconds: window_seconds.ok_or_else(|| {
-                                            "recorder batch window is missing".to_owned()
-                                        })?,
-                                        collector_epoch: collector_epoch.ok_or_else(|| {
-                                            "recorder batch collector epoch is missing".to_owned()
-                                        })?,
-                                        cycle_seq: cycle_seq.ok_or_else(|| {
-                                            "recorder batch cycle sequence is missing".to_owned()
-                                        })?,
-                                        samples,
-                                        observations,
-                                        recorded_sessions,
-                                        session_checkpoints,
-                                        session_ranges,
-                                        session_model_totals,
-                                        history_continuity_recovery,
-                                        cumulative_recovery,
-                                        timeline_recovery,
-                                        quota_source_rescan_complete,
-                                    },
-                                ) {
-                                    Ok(ack) => ack,
-                                    Err(error) => {
-                                        // Keep the admitted account and active
-                                        // writer lane intact. The outer cycle
-                                        // restores this exact batch and gates
-                                        // the next database attempt by the
-                                        // normal recorder interval. Storage
-                                        // failure degrades publication; it
-                                        // does not terminate the resident
-                                        // recorder.
-                                        return Err(error);
-                                    }
-                                };
-                                let Some(batch_admission) = admission.as_ref() else {
-                                    return Err("recorder batch admission disappeared after commit".into());
-                                };
-                                let canonical_samples = commit_ack.canonical_samples.clone();
-                                let canonical_observations =
-                                    commit_ack.canonical_observations.clone();
-                                let legacy_history_bridged = commit_ack.legacy_history_bridged;
-                                let cumulative_history_recovered =
-                                    commit_ack.cumulative_history_recovered;
-                                state.acknowledge_recorder_commit(batch_admission, commit_ack);
-                                let refreshed = if legacy_history_bridged
-                                    || cumulative_history_recovered
-                                    || timeline_history_recovered
-                                {
-                                    state.history.refresh_from_store(Utc::now())
-                                } else {
-                                    state.history.apply_committed_samples(
-                                        canonical_samples,
-                                        Utc::now(),
-                                    ) && state.history.apply_committed_observations(
-                                        canonical_observations,
-                                        Utc::now(),
-                                    )
-                                };
-                                if !refreshed {
-                                    return Err("history refresh after recorder commit failed".into());
-                                }
-                            }
-                            if !batch_is_empty && !state.refresh_history_gaps() {
-                                return Err("history gap refresh after recorder commit failed".into());
-                            }
-                            for plan in cleanup_plans {
-                                let Some(database) = state.history.db_path.as_deref() else {
-                                    debug_runtime("session cleanup retained all files: database unavailable");
-                                    continue;
-                                };
-                                let Some(partition_identity) =
-                                    state.history.partition_identity.as_ref()
-                                else {
-                                    state.apply_identity_error(
-                                        "Session cleanupの保存partitionを確認できませんでした。"
-                                            .into(),
-                                    );
-                                    return Err("cleanup partition identity is missing".into());
-                                };
-                                let report = cleanup_recorded_session_overflow_partitioned(
-                                    database,
-                                    partition_identity,
-                                    &plan,
-                                    Path::new("/proc"),
-                                );
-                                let deleted_count = report.deleted.len();
-                                if deleted_count > 0
-                                    && recorder
-                                        .forget_recorded_sessions(
-                                            partition_id.clone().ok_or_else(|| {
-                                                "cleanup partition is missing".to_owned()
-                                            })?,
-                                            report.deleted,
-                                        )
-                                        .is_err()
-                                {
-                                    debug_runtime(format!(
-                                        "session cleanup marker retirement failed deleted={deleted_count}"
-                                    ));
-                                }
-                                debug_runtime(format!(
-                                    "session cleanup deleted={deleted_count} retained={} database_failed={} process_scan_failed={}",
-                                    report.retained,
-                                    report.database_failed,
-                                    report.process_scan_failed
-                                ));
-                            }
-                            Ok(())
-                        },
-                        |candidate, candidate_v2, candidate_v3| {
-                            if candidate.state == PublicState::Ready
-                                && !recorder.owner_is_live()
-                            {
-                                return Err(
-                                    codex_info::server::ApiSnapshotError::Serialization,
-                                );
-                            }
-                            publisher.publish_details_v3(candidate, candidate_v2, candidate_v3)
-                        },
-                    );
-                    let store_failed = state.recorder_store_error;
-                    recorder_retry_at = recorder_retry_deadline_after_attempt(
-                        Instant::now(),
-                        recorder_retry_at,
-                        recorder_attempt,
-                        store_failed,
-                        publication_interval,
-                    );
-                    if recorder_attempt && !store_failed {
-                        if last_recorder_error.take().is_some() {
-                            eprintln!("codex-info: recorder state commit recovered");
-                        }
-                    }
-                    match result {
-                        Ok(outcome) => {
-                            if outcome == ResidentServiceCycleOutcome::Published
-                                && last_publish_error.take().is_some()
-                            {
-                                eprintln!("codex-info: REST snapshot publication recovered");
-                            }
-                        }
-                        Err(ResidentServiceCycleError::Store(error)) => {
-                            if last_recorder_error.as_deref() != Some(error.as_str()) {
-                                eprintln!("codex-info: recorder state commit rejected: {error}");
-                                last_recorder_error = Some(error.clone());
-                            }
-                            // A response timeout cannot distinguish a busy
-                            // serialized writer from a dead one. Keep the
-                            // exact pending batch and the last-good public
-                            // root, then retry once at the normal recorder
-                            // interval. Actual thread death is detected by
-                            // recorder.probe() on the one-second owner loop.
-                        }
-                        Err(ResidentServiceCycleError::Publish(error)) => {
-                            if last_publish_error != Some(error) {
-                                eprintln!("codex-info: REST snapshot publication rejected: {error}");
-                                last_publish_error = Some(error);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-    if let Some(gap) = pending_gap_for_shutdown(&state, active_recorder_partition.as_deref()) {
-        if let Err(error) = recorder.begin_gap(gap.partition_id.clone(), gap) {
-            eprintln!("codex-info: recorder stop gap was not persisted: {error}");
-        }
+    // The child is ours, but still pin its process instance before requesting
+    // termination. A forceful Child::kill would bypass the pidfd contract used
+    // by the legacy test-only stop path.
+    if !daemon::send_term_to_owned_process(child.id()) {
+        return false;
     }
-    api_server.shutdown();
-    recorder.shutdown();
-    runtime_result.map_err(std::io::Error::other)?;
-    Ok(())
-}
-
-fn run_service_mode(config: ApiServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let address = config.listen_addr();
-    if systemd_managed_activation() {
-        if reconcile_managed_service_owner(address).map_err(std::io::Error::other)? {
-            eprintln!(
-                "codex-info: {}",
-                I18n::detect().cli_text(CliTextKey::ServiceReused)
-            );
-            return Ok(());
+    let deadline = Instant::now() + BACKGROUND_CHILD_CLEANUP_TIMEOUT;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
         }
-    } else {
-        retire_different_version_service(address).map_err(std::io::Error::other)?;
-        if healthy_combined_service_owner(address).is_some() {
-            eprintln!(
-                "codex-info: {}",
-                I18n::detect().cli_text(CliTextKey::ServiceReused)
-            );
-            return Ok(());
+        if Instant::now() >= deadline {
+            return false;
         }
+        thread::sleep(Duration::from_millis(10));
     }
-    run_combined_service(config)
-}
-
-fn stop_service_mode() -> Result<(), Box<dyn std::error::Error>> {
-    daemon::stop_daemon().map_err(|error| {
-        let key = match error {
-            daemon::StopError::LockUnavailable => CliTextKey::StopLockUnavailable,
-            daemon::StopError::LockInvalid => CliTextKey::StopLockInvalid,
-            daemon::StopError::OwnerChanged => CliTextKey::StopOwnerChanged,
-            daemon::StopError::SignalFailed => CliTextKey::StopSignalFailed,
-            daemon::StopError::Timeout => CliTextKey::StopTimeout,
-            daemon::StopError::Unsupported => CliTextKey::StopUnsupported,
-        };
-        std::io::Error::other(cli_error(key)).into()
-    })
 }
 
 fn run_ui(
     initial_service_error: Option<String>,
     service_config: ApiServerConfig,
-    client_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ui = MainWindow::new()?;
     install_fixed_window_guard(ui.window());
@@ -21179,8 +20703,6 @@ fn run_ui(
     let threads_window = Rc::new(RefCell::new(None::<ThreadsWindow>));
     let legal_notice_window = Rc::new(RefCell::new(None::<LegalNoticeWindow>));
     let x11_monitor = Rc::new(X11WindowStateMonitor::connect());
-    let service_retry_in_flight = Arc::new(AtomicBool::new(false));
-
     {
         let weak_ui = ui.as_weak();
         ui.on_begin_window_drag(move || {
@@ -21221,24 +20743,12 @@ fn run_ui(
     }
     {
         let state = Rc::clone(&state);
-        let service_retry_in_flight = Arc::clone(&service_retry_in_flight);
         ui.on_retry(move || {
             let mut state = state.borrow_mut();
             if state.service_endpoint_error.is_some() {
-                if client_only {
-                    // The verified launcher fallback is explicitly a UI
-                    // client. Retry only the selected endpoint; allowing this
-                    // callback to spawn a raw `--port` child would recreate
-                    // the resident owner after the launcher reported failure.
-                    state.request_service_read("利用状況を更新しています…");
-                } else {
-                    start_background_service_retry(
-                        &mut state,
-                        service_config,
-                        &service_retry_in_flight,
-                        ensure_background_service,
-                    );
-                }
+                // Retry only the selected REST endpoint. The UI binary never
+                // spawns a recorder or a combined resident service.
+                state.request_service_read("利用状況を更新しています…");
             } else {
                 state.request_service_read("利用状況を更新しています…");
             }
@@ -21608,7 +21118,6 @@ fn run_ui(
     let weak_ui = ui.as_weak();
     let graph_window_for_timer = Rc::clone(&graph_window);
     let threads_window_for_timer = Rc::clone(&threads_window);
-    let service_retry_for_timer = Arc::clone(&service_retry_in_flight);
     let timer = Timer::default();
     if !state.borrow().preview {
         timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
@@ -21622,14 +21131,12 @@ fn run_ui(
                     .as_ref()
                     .is_some_and(|window| window.window().is_visible());
                 let mut state = state.borrow_mut();
-                if !service_retry_for_timer.load(Ordering::Acquire) {
-                    run_ui_service_timer_cycle_with_windows(
-                        &mut state,
-                        service_config.listen_addr(),
-                        graph_open,
-                        threads_open,
-                    );
-                }
+                run_ui_service_timer_cycle_with_windows(
+                    &mut state,
+                    service_config.listen_addr(),
+                    graph_open,
+                    threads_open,
+                );
                 state.sync_ui(&ui);
                 if let Some(graph) = graph_window_for_timer.borrow().as_ref() {
                     if graph.window().is_visible() {
@@ -21652,20 +21159,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let mode = parse_launch_mode(arguments).map_err(std::io::Error::other)?;
     match mode {
-        LaunchMode::Service(config) => run_service_mode(config),
-        LaunchMode::Stop => stop_service_mode(),
-        LaunchMode::All(config) => {
-            let client_only = ui_client_only_mode().map_err(std::io::Error::other)?;
-            let startup_error = if client_only {
-                // The installed launcher has already performed generation,
-                // payload, and owner verification.  Preserve the existing
-                // localized failure/retry surface while this process only
-                // polls the selected endpoint and never starts a resident.
-                Some(cli_error(CliTextKey::ServiceStartFailed))
-            } else {
-                ensure_background_service(config).err()
-            };
-            run_ui(startup_error, config, client_only)
+        LaunchMode::Ui(config) => {
+            // Preserve the launcher's exact-marker validation, but service
+            // recovery remains outside this binary in all environments.
+            ui_client_only_mode().map_err(std::io::Error::other)?;
+            run_ui(None, config)
         }
         LaunchMode::Help => {
             let language = I18n::detect().language();
@@ -22114,9 +21612,8 @@ mod tests {
     use std::io::{BufReader, Read, Seek, SeekFrom, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     fn launch_args(values: &[&str]) -> Vec<std::ffi::OsString> {
@@ -22126,13 +21623,12 @@ mod tests {
     #[test]
     fn launch_options_follow_the_public_contract() {
         let default_address = DEFAULT_SERVICE_ADDRESS.parse().unwrap();
-        let LaunchMode::Service(default_config) = parse_launch_mode(launch_args(&[])).unwrap()
-        else {
-            panic!("default mode was not service-only");
+        let LaunchMode::Ui(default_config) = parse_launch_mode(launch_args(&[])).unwrap() else {
+            panic!("default mode was not UI client");
         };
         assert_eq!(default_config.listen_addr(), default_address);
-        let LaunchMode::All(ui_config) = parse_launch_mode(launch_args(&["--ui"])).unwrap() else {
-            panic!("--ui mode was not all");
+        let LaunchMode::Ui(ui_config) = parse_launch_mode(launch_args(&["--ui"])).unwrap() else {
+            panic!("--ui mode was not UI client");
         };
         assert_eq!(ui_config.listen_addr(), default_address);
         assert_eq!(
@@ -22147,30 +21643,19 @@ mod tests {
             parse_launch_mode(launch_args(&["-h"])).unwrap(),
             LaunchMode::Help
         );
-        assert_eq!(
-            parse_launch_mode(launch_args(&["--stop"])).unwrap(),
-            LaunchMode::Stop
-        );
-        let LaunchMode::Service(config) =
-            parse_launch_mode(launch_args(&["--port", "9876"])).unwrap()
-        else {
-            panic!("service mode was not selected");
-        };
-        assert_eq!(config.listen_addr(), "127.0.0.1:9876".parse().unwrap());
-        let LaunchMode::All(config) =
+        assert!(parse_launch_mode(launch_args(&["--stop"])).is_err());
+        assert!(parse_launch_mode(launch_args(&["--port", "9876"])).is_err());
+        let LaunchMode::Ui(config) =
             parse_launch_mode(launch_args(&["--ui", "--port", "4321"])).unwrap()
         else {
-            panic!("UI mode with explicit port was not selected");
+            panic!("UI client mode with explicit port was not selected");
         };
         assert_eq!(config.listen_addr(), "127.0.0.1:4321".parse().unwrap());
 
-        for port in ["1", "65535"] {
-            assert!(parse_launch_mode(launch_args(&["--port", port])).is_ok());
-        }
-        for invalid in ["0", "65536", "-1", "abc", "127.0.0.1:9876", ""] {
+        for port in ["1", "65535", "0", "65536", "-1", "abc", ""] {
             assert!(
-                parse_launch_mode(launch_args(&["--port", invalid])).is_err(),
-                "invalid port accepted: {invalid:?}"
+                parse_launch_mode(launch_args(&["--port", port])).is_err(),
+                "legacy service option accepted: {port:?}"
             );
         }
         for legacy in [
@@ -22235,11 +21720,9 @@ mod tests {
         poll_service_state(&mut state, endpoint);
         assert_eq!(
             state.service_endpoint_error.as_deref(),
-            Some("selected endpoint unavailable"),
-            "HTTP health without a verified resident owner must remain rejected"
+            None,
+            "a healthy REST endpoint is sufficient for the client"
         );
-        poll_service_state_with_owner_check(&mut state, endpoint, service_is_healthy);
-        assert!(state.service_endpoint_error.is_none());
         let admitted_pair = state.service_published_pair.clone();
         let admitted_details = state.public_details();
         let admitted_status = state.display_status();
@@ -22258,50 +21741,6 @@ mod tests {
         assert_eq!(state.service_published_pair, admitted_pair);
         assert_eq!(state.public_details(), admitted_details);
         server.shutdown();
-    }
-
-    #[test]
-    fn explicit_service_retry_starts_once_without_replacing_last_good_data() {
-        let mut state = CodexInfoState::preview("normal");
-        state.preview = false;
-        state.service_published_pair = Some("pair:7".into());
-        state.hold_service_endpoint_error("selected endpoint unavailable".into());
-        let admitted_details = state.public_details();
-        let in_flight = Arc::new(AtomicBool::new(false));
-        let (started_tx, started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let config = ApiServerConfig::new("127.0.0.1:18787".parse().unwrap()).unwrap();
-
-        assert!(super::start_background_service_retry(
-            &mut state,
-            config,
-            &in_flight,
-            move |started_config| {
-                started_tx.send(started_config.listen_addr()).unwrap();
-                release_rx.recv().unwrap();
-                Ok(())
-            },
-        ));
-        assert_eq!(
-            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            config.listen_addr()
-        );
-        assert!(!super::start_background_service_retry(
-            &mut state,
-            config,
-            &in_flight,
-            |_| Ok(()),
-        ));
-        assert!(state.checking);
-        assert!(state.has_display_error());
-        assert_eq!(state.public_details(), admitted_details);
-
-        release_tx.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while in_flight.load(Ordering::Acquire) && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(!in_flight.load(Ordering::Acquire));
     }
 
     #[test]
@@ -22378,6 +21817,70 @@ mod tests {
         });
 
         assert!(service_is_healthy(address));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn service_client_accepts_standard_case_insensitive_http_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let pair = format!("v1:{}", "1".repeat(64));
+        let body = br#"{"api_version":"v3","state":"ready","observed_at":1800000000,"authenticated":true,"plan_label":null,"quota":null,"models":[],"active_thread_count":0}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nCodex-Info-Published-Pair: {pair}\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request);
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let fetched = super::request_service_details_with_etag(address, "/v3/current", None)
+            .expect("HTTP field names are case-insensitive");
+        assert_eq!(fetched.status, 200);
+        assert_eq!(fetched.pair.as_deref(), Some(pair.as_str()));
+        assert_eq!(fetched.body, body);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn service_client_response_budget_matches_the_rest_request_budget() {
+        assert_eq!(super::SERVICE_RESPONSE_TIMEOUT, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn service_client_response_budget_is_an_absolute_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request);
+            for chunk in std::iter::once(b"HTTP/1.1 200 OK\r\n".as_slice())
+                .chain(std::iter::repeat_n(b"X-Pad: x\r\n".as_slice(), 10))
+            {
+                std::thread::sleep(Duration::from_millis(60));
+                if stream.write_all(chunk).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let result = super::request_service_details_with_etag_and_timeout(
+            address,
+            "/v3/current",
+            None,
+            Duration::from_millis(100),
+        );
+        assert!(
+            result.is_err(),
+            "a slow-drip response exceeded its deadline"
+        );
+        assert!(started.elapsed() < Duration::from_millis(350));
         worker.join().unwrap();
     }
 
@@ -23937,17 +23440,19 @@ mod tests {
             );
             let mut render_paths =
                 super::graph_paths_for_selection_with_sources_and_astra_with_lineage(
-                    &references,
-                    period.start_at,
-                    period.end_at,
-                    true,
-                    true,
-                    true,
-                    true,
-                    show_tokens,
-                    &untrusted_minutes,
-                    &confirmed_gaps,
-                    &raw_model_timelines,
+                    super::GraphSelectionInput {
+                        samples: &references,
+                        period_start: period.start_at,
+                        period_end: period.end_at,
+                        show_luna: true,
+                        show_terra: true,
+                        show_sol: true,
+                        show_astra: true,
+                        show_tokens,
+                        untrusted_minutes: &untrusted_minutes,
+                        confirmed_gaps: &confirmed_gaps,
+                        model_timelines: &raw_model_timelines,
+                    },
                 );
             super::separate_current_label_positions(
                 &mut render_paths,
@@ -24612,19 +24117,19 @@ mod tests {
 
         let expected_idle = intervals(&expected["idle_intervals"]);
         let graph = |show_tokens| {
-            super::graph_paths_for_selection_with_sources_and_astra(
-                &references,
-                period.start_at,
-                period.end_at,
-                true,
-                true,
-                true,
-                true,
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: period.start_at,
+                period_end: period.end_at,
+                show_luna: true,
+                show_terra: true,
+                show_sol: true,
+                show_astra: true,
                 show_tokens,
-                &untrusted_minutes,
-                &[],
-                &raw_timelines,
-            )
+                untrusted_minutes: &untrusted_minutes,
+                confirmed_gaps: &[],
+                model_timelines: &raw_timelines,
+            })
         };
         let dollars = graph(false);
         let tokens = graph(true);
@@ -24776,17 +24281,19 @@ mod tests {
             );
             let graph = |show_tokens| {
                 super::graph_paths_for_selection_with_sources_and_astra(
-                    &references,
-                    start,
-                    end,
-                    false,
-                    false,
-                    true,
-                    false,
-                    show_tokens,
-                    &BTreeSet::new(),
-                    &confirmed_gaps,
-                    &raw,
+                    super::GraphSelectionInput {
+                        samples: &references,
+                        period_start: start,
+                        period_end: end,
+                        show_luna: false,
+                        show_terra: false,
+                        show_sol: true,
+                        show_astra: false,
+                        show_tokens,
+                        untrusted_minutes: &BTreeSet::new(),
+                        confirmed_gaps: &confirmed_gaps,
+                        model_timelines: &raw,
+                    },
                 )
             };
             let dollars = graph(false);
@@ -25032,17 +24539,19 @@ mod tests {
                 "origin {name}"
             );
             let graph = super::graph_paths_for_selection_with_sources_and_astra(
-                &references,
-                start,
-                end,
-                false,
-                false,
-                true,
-                false,
-                false,
-                &BTreeSet::new(),
-                &confirmed_gaps,
-                &raw,
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: start,
+                    period_end: end,
+                    show_luna: false,
+                    show_terra: false,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: false,
+                    untrusted_minutes: &BTreeSet::new(),
+                    confirmed_gaps: &confirmed_gaps,
+                    model_timelines: &raw,
+                },
             );
             let span = (end - start) as f64;
             let actual_idle = graph
@@ -25163,19 +24672,20 @@ mod tests {
         )]);
         let period_end = 5_000 * 60;
 
-        let graph = super::graph_paths_for_selection_with_sources_and_astra(
-            &references,
-            0,
-            period_end,
-            false,
-            false,
-            true,
-            false,
-            false,
-            &BTreeSet::new(),
-            &[],
-            &raw,
-        );
+        let graph =
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end,
+                show_luna: false,
+                show_terra: false,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: false,
+                untrusted_minutes: &BTreeSet::new(),
+                confirmed_gaps: &[],
+                model_timelines: &raw,
+            });
 
         let idle = graph.unused_intervals.as_slice();
         assert_eq!(idle.len(), 1);
@@ -26939,7 +26449,10 @@ mod tests {
             ),
             super::QuotaTransition::Rejected
         );
-        assert_eq!(restarted.model_totals, [durable_total.clone()]);
+        assert_eq!(
+            restarted.model_totals.as_slice(),
+            std::slice::from_ref(&durable_total)
+        );
 
         let mut rollover = super::usage_store::SessionCollectionState {
             data_generation: 8,
@@ -27459,8 +26972,6 @@ mod tests {
         ));
         let _ = fs::remove_file(&db_path);
         state.history = UsageHistory {
-            db_path: Some(db_path.clone()),
-            partition_identity: None,
             samples: Vec::new(),
             observations: Vec::new(),
             pending_store_samples: Vec::new(),
@@ -27896,7 +27407,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(super::ResidentServiceCycleError::Store(_))
+            Err(super::ResidentServiceCycleError::Store)
         ));
         let mut expected_error = last_complete.clone();
         expected_error.state = PublicState::Error;
@@ -27961,7 +27472,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(super::ResidentServiceCycleError::Store(_))
+            Err(super::ResidentServiceCycleError::Store)
         ));
         let initial_error = emitted_initial_error
             .into_inner()
@@ -28577,7 +28088,7 @@ mod tests {
         );
         assert!(matches!(
             first,
-            Err(super::ResidentServiceCycleError::Store(_))
+            Err(super::ResidentServiceCycleError::Store)
         ));
         assert_eq!(attempts.get(), 1);
         assert!(state.recorder_store_error);
@@ -28851,15 +28362,15 @@ mod tests {
             .current_account_admission()
             .expect("preview admission");
 
-        state.apply_local_usage_error_with_generation(
-            state.auth_epoch,
-            Some(admission),
+        state.apply_local_usage_error_with_generation(super::LocalUsageErrorContext {
+            auth_epoch: state.auth_epoch,
+            admission: Some(admission),
             reset_at,
-            WEEK_SECONDS,
-            Some(0x138),
-            Some(2),
-            durable_model_totals.clone(),
-        );
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(0x138),
+            cycle_seq: Some(2),
+            durable_model_totals: durable_model_totals.clone(),
+        });
 
         assert!(!state.local_usage_pending);
         assert!(state.local_usage_error);
@@ -28909,15 +28420,15 @@ mod tests {
         let admission = state
             .current_account_admission()
             .expect("preview admission");
-        state.apply_local_usage_error_with_generation(
-            state.auth_epoch,
-            Some(admission),
+        state.apply_local_usage_error_with_generation(super::LocalUsageErrorContext {
+            auth_epoch: state.auth_epoch,
+            admission: Some(admission),
             reset_at,
-            WEEK_SECONDS,
-            Some(0x139),
-            Some(3),
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(0x139),
+            cycle_seq: Some(3),
             durable_model_totals,
-        );
+        });
         let pending_before = state.history.pending_store_observations.clone();
         let mut publication = super::ResidentPublicationState::default();
         let attempts = std::cell::Cell::new(0_u8);
@@ -28941,7 +28452,7 @@ mod tests {
         );
         assert!(matches!(
             first,
-            Err(super::ResidentServiceCycleError::Store(_))
+            Err(super::ResidentServiceCycleError::Store)
         ));
         assert_eq!(attempts.get(), 1);
         assert_eq!(state.history.pending_store_observations, pending_before);
@@ -28997,30 +28508,30 @@ mod tests {
         let mut stale_admission = admission.clone();
         stale_admission.partition_id.push_str("-stale");
 
-        state.apply_local_usage_error_with_generation(
-            state.auth_epoch,
-            Some(stale_admission),
+        state.apply_local_usage_error_with_generation(super::LocalUsageErrorContext {
+            auth_epoch: state.auth_epoch,
+            admission: Some(stale_admission),
             reset_at,
-            WEEK_SECONDS,
-            Some(0x13a),
-            Some(4),
-            Vec::new(),
-        );
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(0x13a),
+            cycle_seq: Some(4),
+            durable_model_totals: Vec::new(),
+        });
         assert!(!state.local_usage_error);
         assert!(state.history.pending_store_samples.is_empty());
         assert!(!state.has_pending_recorder_batch());
 
         state.account_error = Some("remote outage".into());
         state.local_usage_pending = true;
-        state.apply_local_usage_error_with_generation(
-            state.auth_epoch,
-            Some(admission),
+        state.apply_local_usage_error_with_generation(super::LocalUsageErrorContext {
+            auth_epoch: state.auth_epoch,
+            admission: Some(admission),
             reset_at,
-            WEEK_SECONDS,
-            Some(0x13a),
-            Some(5),
-            Vec::new(),
-        );
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(0x13a),
+            cycle_seq: Some(5),
+            durable_model_totals: Vec::new(),
+        });
         assert!(!state.local_usage_pending);
         assert!(state.history.pending_store_samples.is_empty());
         assert!(!state.has_pending_recorder_batch());
@@ -32388,19 +31899,20 @@ mod tests {
         for event in &events {
             collected_totals.add(&event.model, event.delta);
         }
-        let recovery = super::build_session_timeline_recovery(
-            &events,
-            reset_at,
-            window_seconds,
-            1_859,
-            &collection_state,
-            &ranges,
-            collector_epoch,
-            cycle_seq,
-            &collected_totals,
-        )
-        .unwrap()
-        .expect("durable quota lag requires timeline catch-up");
+        let recovery =
+            super::build_session_timeline_recovery(super::SessionTimelineRecoveryContext {
+                events: &events,
+                reset_at,
+                window_seconds,
+                timeline_end: 1_859,
+                collection_state: &collection_state,
+                ranges: &ranges,
+                collector_epoch,
+                cycle_seq,
+                collected_totals: &collected_totals,
+            })
+            .unwrap()
+            .expect("durable quota lag requires timeline catch-up");
 
         assert_eq!(recovery.projection_end_exclusive, 1_800);
         assert_eq!(
@@ -34947,8 +34459,6 @@ mod tests {
             luna_tokens: 0,
         };
         let mut history = UsageHistory {
-            db_path: Some(db_path.clone()),
-            partition_identity: None,
             samples: vec![
                 sample(1),
                 sample(now.timestamp()),
@@ -38609,19 +38119,23 @@ mod tests {
             ),
         ];
         let references = samples.iter().collect::<Vec<_>>();
-        let graph = graph_paths_for_selection_with_confirmed_gaps(
-            &references,
-            0,
-            180,
-            false,
-            false,
-            true,
-            false,
-            &[GraphConfirmedGap {
-                start_at: 60,
-                end_at: 120,
-            }],
-        );
+        let confirmed_gaps = [GraphConfirmedGap {
+            start_at: 60,
+            end_at: 120,
+        }];
+        let graph = graph_paths_for_selection_with_confirmed_gaps(super::GraphSelectionInput {
+            samples: &references,
+            period_start: 0,
+            period_end: 180,
+            show_luna: false,
+            show_terra: false,
+            show_sol: true,
+            show_astra: false,
+            show_tokens: false,
+            untrusted_minutes: &BTreeSet::new(),
+            confirmed_gaps: &confirmed_gaps,
+            model_timelines: &BTreeMap::new(),
+        });
 
         assert!(graph.sol_rising.contains("M0.00 99.00 L33.33 66.33"));
         assert!(!graph.sol_rising.contains("M33.33 66.33 L66.67 33.67"));
@@ -39184,19 +38698,20 @@ mod tests {
                 })
                 .collect::<BTreeMap<_, _>>(),
         )]);
-        let paths = super::graph_paths_for_selection_with_sources_and_astra(
-            &references,
-            0,
-            240,
-            false,
-            false,
-            true,
-            false,
-            false,
-            &BTreeSet::new(),
-            &[],
-            &raw_timelines,
-        );
+        let paths =
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end: 240,
+                show_luna: false,
+                show_terra: false,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: false,
+                untrusted_minutes: &BTreeSet::new(),
+                confirmed_gaps: &[],
+                model_timelines: &raw_timelines,
+            });
         assert_eq!(
             paths.remaining_solid,
             "M0.00 1.00 L25.00 10.80 M25.00 10.80 L50.00 15.70 M50.00 15.70 L75.00 20.60 M75.00 20.60 L100.00 20.60"
@@ -39835,19 +39350,20 @@ mod tests {
                 ]),
             ),
         ]);
-        let tokens = super::graph_paths_for_selection_with_sources_and_astra(
-            &references,
-            0,
-            240,
-            true,
-            true,
-            true,
-            false,
-            true,
-            &BTreeSet::new(),
-            &[],
-            &model_timelines,
-        );
+        let tokens =
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end: 240,
+                show_luna: true,
+                show_terra: true,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: true,
+                untrusted_minutes: &BTreeSet::new(),
+                confirmed_gaps: &[],
+                model_timelines: &model_timelines,
+            });
 
         assert_eq!(
             tokens.remaining_solid, "M50.00 10.80 L75.00 20.60",
@@ -40485,19 +40001,19 @@ mod tests {
         .into_iter()
         .collect();
         let graph = |tokens| {
-            super::graph_paths_for_selection_with_sources_and_astra(
-                &references,
-                0,
-                240,
-                true,
-                true,
-                true,
-                false,
-                tokens,
-                &Default::default(),
-                &[],
-                &timelines,
-            )
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end: 240,
+                show_luna: true,
+                show_terra: true,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: tokens,
+                untrusted_minutes: &Default::default(),
+                confirmed_gaps: &[],
+                model_timelines: &timelines,
+            })
         };
         let dollars = graph(false);
         let tokens = graph(true);

@@ -39,10 +39,14 @@ jobs:
         if: ${{ !inputs.release_candidate }}
         run: cargo fmt --check
       - name: Run native unit tests
-        run: cargo test --locked --all-targets -- --nocapture
+        run: cargo test --workspace --locked --all-targets -- --nocapture
+      - name: Reject native compiler and Clippy warnings
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings
       - name: Build native release
         if: inputs.release_candidate
-        run: cargo build --release --locked
+        run: cargo build --workspace --release --locked
+      - name: Verify recorder and REST compile-time boundary
+        run: bash scripts/check_recorder_rest_boundary.sh --static-only
       - name: Run public CLI lifecycle acceptance
         if: inputs.release_candidate
         run: bash scripts/cli_contract_e2e.sh

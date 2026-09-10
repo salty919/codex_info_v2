@@ -36,6 +36,9 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
     private const int MaxThreads = 256;
     private const int MaxDetailsModels = 1_024;
     private const long ResetAtToleranceSeconds = 60;
+    // This is the standalone REST server's transport request budget, not a
+    // latency percentile. Performance calibration remains separate.
+    private static readonly TimeSpan ServiceResponseTimeout = TimeSpan.FromSeconds(3);
 
     private static readonly HashSet<string> HealthProperties = CreatePropertySet(
         "api_version",
@@ -238,7 +241,7 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
 
         _httpClient = new HttpClient(handler, disposeHandler: true)
         {
-            Timeout = TimeSpan.FromSeconds(1),
+            Timeout = ServiceResponseTimeout,
         };
     }
 
@@ -2721,7 +2724,10 @@ public sealed class LoopbackStatusClient : ILoopbackHealthClient, ILoopbackDetai
 
         if (planLabel is null)
         {
-            return state != ApiState.Ready && quota is null;
+            // Plan metadata is optional and may lag an otherwise complete
+            // authenticated usage snapshot. Keep quota/model visibility; an
+            // unauthenticated response must still not expose quota data.
+            return authenticated || quota is null;
         }
 
         if (!TryGetCanonicalMonthly(planLabel, out var expectedMonthly))

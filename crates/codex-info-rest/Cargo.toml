@@ -1,0 +1,21 @@
+[package]
+name = "codex-info-rest"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+license = "GPL-3.0-only"
+publish = false
+
+[[bin]]
+name = "codex_info_rest"
+path = "src/main.rs"
+
+[dependencies]
+codex-info-account-locator = { path = "../codex-info-account-locator" }
+codex-info-db-reader = { path = "../codex-info-db-reader" }
+codex-info-rest-contract = { path = "../codex-info-rest-contract" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
