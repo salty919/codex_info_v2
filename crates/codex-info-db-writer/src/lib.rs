@@ -3810,13 +3810,18 @@ fn upsert_canonical_samples(
     transaction: &rusqlite::Transaction<'_>,
     samples: &[UsageHistorySample],
     preserve_existing: bool,
+    preserve_existing_before: Option<i64>,
 ) -> Result<()> {
-    let mut statement = transaction.prepare(if preserve_existing {
-        INSERT_SAMPLE_IF_ABSENT
-    } else {
-        UPSERT_SAMPLE
-    })?;
+    let mut insert_if_absent = transaction.prepare(INSERT_SAMPLE_IF_ABSENT)?;
+    let mut upsert = transaction.prepare(UPSERT_SAMPLE)?;
     for sample in samples {
+        let statement = if preserve_existing
+            || preserve_existing_before.is_some_and(|cutoff| sample.timestamp < cutoff)
+        {
+            &mut insert_if_absent
+        } else {
+            &mut upsert
+        };
         statement.execute(params![
             sample.timestamp,
             sample.reset_at,
@@ -4229,6 +4234,7 @@ fn upsert_observation_model_totals(
     transaction: &rusqlite::Transaction<'_>,
     observations: &[UsageHistoryObservation],
     preserve_existing: bool,
+    preserve_existing_before: Option<i64>,
 ) -> Result<()> {
     let mut delete = transaction
         .prepare("DELETE FROM usage_model_history WHERE reset_at = ?1 AND timestamp = ?2")?;
@@ -4244,7 +4250,9 @@ fn upsert_observation_model_totals(
             continue;
         };
         let model_totals = canonicalize_model_totals(model_totals)?;
-        if preserve_existing {
+        if preserve_existing
+            || preserve_existing_before.is_some_and(|cutoff| observation.timestamp < cutoff)
+        {
             let exists: bool = transaction.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM usage_model_history
@@ -7392,10 +7400,10 @@ impl UsageStore {
             .cloned()
             .collect::<Vec<_>>();
         let historical = canonicalize_samples(&transaction, &historical, false, None)?;
-        upsert_canonical_samples(&transaction, &historical, false)?;
+        upsert_canonical_samples(&transaction, &historical, false, None)?;
         let adjusted_current = apply_history_continuity(&transaction, &current_samples)?;
         let adjusted_current = canonicalize_samples(&transaction, &adjusted_current, false, None)?;
-        upsert_canonical_samples(&transaction, &adjusted_current, false)?;
+        upsert_canonical_samples(&transaction, &adjusted_current, false, None)?;
         let generation: String = transaction.query_row(
             "SELECT data_generation FROM collection_generation WHERE singleton=1",
             [],
@@ -7422,7 +7430,7 @@ impl UsageStore {
             rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let adjusted = apply_history_continuity(&transaction, std::slice::from_ref(sample))?;
         let canonical = canonicalize_samples(&transaction, &adjusted, false, None)?;
-        upsert_canonical_samples(&transaction, &canonical, false)?;
+        upsert_canonical_samples(&transaction, &canonical, false, None)?;
         transaction.commit()?;
         Ok(())
     }
@@ -7449,7 +7457,7 @@ impl UsageStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let adjusted = apply_history_continuity(&transaction, samples)?;
         let canonical = canonicalize_samples(&transaction, &adjusted, false, None)?;
-        upsert_canonical_samples(&transaction, &canonical, false)?;
+        upsert_canonical_samples(&transaction, &canonical, false, None)?;
         replace_recorded_session_markers(&transaction, &sources)?;
         for source in &sources {
             if !recorded_session_matches_in(&transaction, source)? {
@@ -8720,8 +8728,7 @@ impl UsageStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let adjusted_samples = apply_history_continuity(&transaction, samples)?;
-        let preserve_existing_history =
-            cumulative_recovery.is_some() || timeline_recovery.is_some();
+        let preserve_all_existing_history = cumulative_recovery.is_some();
         let canonical_samples = canonicalize_samples(
             &transaction,
             &adjusted_samples,
@@ -8967,11 +8974,7 @@ impl UsageStore {
                 // incrementing durable state on an acknowledgement retry.
                 let replay_observations =
                     upsert_observations(&transaction, &canonical_observations)?;
-                upsert_observation_model_totals(
-                    &transaction,
-                    &replay_observations,
-                    preserve_existing_history,
-                )?;
+                upsert_observation_model_totals(&transaction, &replay_observations, true, None)?;
                 replace_session_pending_ranges(
                     &transaction,
                     &canonical_pending_ranges,
@@ -9071,12 +9074,18 @@ impl UsageStore {
             }
         }
 
-        upsert_canonical_samples(&transaction, &canonical_samples, preserve_existing_history)?;
+        upsert_canonical_samples(
+            &transaction,
+            &canonical_samples,
+            preserve_all_existing_history,
+            preserve_existing_before,
+        )?;
         let persisted_observations = upsert_observations(&transaction, &canonical_observations)?;
         upsert_observation_model_totals(
             &transaction,
             &persisted_observations,
-            preserve_existing_history,
+            preserve_all_existing_history,
+            preserve_existing_before,
         )?;
         {
             let mut statement = transaction.prepare(
@@ -9511,7 +9520,7 @@ impl UsageStore {
         let sqlite_generation =
             i64::try_from(next_generation).map_err(|_| UsageStoreError::GenerationOverflow)?;
 
-        upsert_canonical_samples(&transaction, &canonical, false)?;
+        upsert_canonical_samples(&transaction, &canonical, false, None)?;
         transaction.execute(
             "INSERT INTO durable_state (singleton, data_generation, data_hash, snapshot_json) \
              VALUES (1, ?1, ?2, ?3) \
@@ -12518,7 +12527,8 @@ mod tests {
             terra_tokens: 0,
             luna_tokens: 50,
         };
-        let base_samples = vec![base(first_at, 90.0), base(second_at, 89.0)];
+        let stale_anchor = base(anchor_at, 88.0);
+        let base_samples = vec![base(first_at, 90.0), base(second_at, 89.0), stale_anchor];
         let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
         let base_observations = base_samples
             .iter()
@@ -12640,24 +12650,24 @@ mod tests {
         };
         store
             .connection
-            .execute_batch(
+            .execute_batch(&format!(
                 "CREATE TEMP TRIGGER timeline_keep_usage_update
-                 BEFORE UPDATE ON usage_history
+                 BEFORE UPDATE ON usage_history WHEN OLD.timestamp < {anchor_at}
                  BEGIN
                      SELECT RAISE(ABORT, 'timeline rewrote measured usage');
                  END;
                  CREATE TEMP TRIGGER timeline_keep_usage_delete
-                 BEFORE DELETE ON usage_history
+                 BEFORE DELETE ON usage_history WHEN OLD.timestamp < {anchor_at}
                  BEGIN
                      SELECT RAISE(ABORT, 'timeline deleted measured usage');
                  END;
                  CREATE TEMP TRIGGER timeline_keep_models_update
-                 BEFORE UPDATE ON usage_model_history
+                 BEFORE UPDATE ON usage_model_history WHEN OLD.timestamp < {anchor_at}
                  BEGIN
                      SELECT RAISE(ABORT, 'timeline rewrote measured models');
                  END;
                  CREATE TEMP TRIGGER timeline_keep_models_delete
-                 BEFORE DELETE ON usage_model_history
+                 BEFORE DELETE ON usage_model_history WHEN OLD.timestamp < {anchor_at}
                  BEGIN
                      SELECT RAISE(ABORT, 'timeline deleted measured models');
                  END;
@@ -12665,8 +12675,8 @@ mod tests {
                  BEFORE UPDATE ON collection_generation
                  BEGIN
                      SELECT RAISE(ABORT, 'injected timeline recovery failure');
-                 END;",
-            )
+                 END;"
+            ))
             .unwrap();
         assert!(store
             .commit_session_collection_with_timeline_recovery(
@@ -12717,7 +12727,11 @@ mod tests {
 
         assert_eq!(
             store.load_all_raw().unwrap(),
-            [base_samples.clone(), vec![anchor.clone()]].concat()
+            vec![
+                base_samples[0].clone(),
+                base_samples[1].clone(),
+                anchor.clone()
+            ]
         );
         let logical = store.load_all().unwrap();
         assert_eq!(logical[0].sol_tokens, 110);
@@ -12740,6 +12754,14 @@ mod tests {
             ModelSource::ReconstructedFromSession
         );
         assert_eq!(observations[2].model_source, ModelSource::Confirmed);
+        assert_eq!(
+            observations[2]
+                .model_totals
+                .as_ref()
+                .and_then(|totals| totals.iter().find(|total| total.model == "SOL"))
+                .map(|total| total.total_tokens),
+            Some(125)
+        );
         assert_eq!(
             observations[1]
                 .model_totals
