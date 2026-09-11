@@ -148,11 +148,13 @@ fake_home="$TEST_ROOT/home"
 fake_proc="$TEST_ROOT/proc"
 fixture_root="$TEST_ROOT/fixture"
 output_root="$TEST_ROOT/output"
+legacy_output_root="$TEST_ROOT/legacy-output"
 release_json="$TEST_ROOT/release.json"
 release_assets="$TEST_ROOT/release-assets"
 update_tmp="$TEST_ROOT/update-tmp"
 log="$TEST_ROOT/commands.log"
-mkdir -p -- "$fake_bin" "$fake_home" "$fake_proc/net" "$fixture_root" "$output_root" "$release_assets" "$update_tmp"
+mkdir -p -- "$fake_bin" "$fake_home" "$fake_proc/net" "$fixture_root" "$output_root" \
+    "$legacy_output_root" "$release_assets" "$update_tmp"
 : > "$fake_proc/net/tcp"
 
 cat > "$fake_bin/systemctl" <<'FAKE_SYSTEMCTL'
@@ -425,6 +427,13 @@ build_bundle() {
         --version "$version" \
         --output-dir "$output_root" >/dev/null
     printf '%s/codex-info-%s-x86_64-unknown-linux-gnu.tar.gz\n' "$output_root" "$version"
+}
+
+build_legacy_caller_bundle() {
+    local source="$1" version="$2"
+    SOURCE_SHA="$source" RUN_ID=92000 RUN_ATTEMPT=1 OBJDUMP_BIN="$fake_bin/objdump" \
+        bash "$BUILD_SCRIPT" --binary "$fixture_root/codex_info" \
+        --version "$version" --output-dir "$legacy_output_root" >/dev/null
 }
 
 archive_version() {
@@ -782,6 +791,21 @@ run_active_startup_condition_case() {
     exec {hold_fd}>&-
     rm -f -- "$ready_path" "$hold_pipe"
 }
+
+build_legacy_caller_bundle 0000000000000000000000000000000000000001 1.0.18
+validate_workflow_candidate "$legacy_output_root"
+mixed_contract_error="$TEST_ROOT/mixed-binary-contract.err"
+if SOURCE_SHA=0000000000000000000000000000000000000002 RUN_ID=92000 RUN_ATTEMPT=1 \
+    OBJDUMP_BIN="$fake_bin/objdump" bash "$BUILD_SCRIPT" \
+    --binary "$fixture_root/codex_info" --ui-binary "$fixture_root/codex_info" \
+    --recorder-binary "$fixture_root/codex_info_recorder" \
+    --rest-binary "$fixture_root/codex_info_rest" --version 1.0.18 \
+    --output-dir "$TEST_ROOT/mixed-output" > /dev/null 2>"$mixed_contract_error"; then
+    fail 'mixed legacy/new bundle binary contract unexpectedly succeeded'
+fi
+grep -Fq 'cannot combine --binary with the split binary options' "$mixed_contract_error" \
+    || fail 'mixed legacy/new bundle binary contract did not fail explicitly'
+printf 'case trusted-main legacy bundle caller compatibility: PASS\n'
 
 archive_v1="$(build_bundle 1111111111111111111111111111111111111111 1.0.19)"
 archive_v2=''

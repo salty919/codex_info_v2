@@ -14,6 +14,8 @@ OBJDUMP_BIN="${OBJDUMP_BIN:-objdump}"
 UI_BINARY=""
 RECORDER_BINARY=""
 REST_BINARY=""
+LEGACY_UI_BINARY=""
+ALLOW_SOURCE_BUILD=0
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/dist}"
 VERSION="${VERSION:-}"
 SOURCE_SHA="${SOURCE_SHA:-${GITHUB_SHA:-}}"
@@ -25,6 +27,7 @@ usage() {
 usage: build_linux_bundle.sh [options]
 
 Options:
+  --binary PATH              trusted-main bootstrap alias for the UI binary
   --ui-binary PATH           pre-built codex_info UI binary
   --recorder-binary PATH     pre-built codex_info_recorder binary
   --rest-binary PATH         pre-built codex_info_rest binary
@@ -46,6 +49,12 @@ die() {
 
 while (($# > 0)); do
     case "$1" in
+        --binary)
+            (($# >= 2)) || die '--binary requires a path'
+            [[ -z "$LEGACY_UI_BINARY" ]] || die '--binary supplied more than once'
+            LEGACY_UI_BINARY="$2"
+            shift 2
+            ;;
         --ui-binary)
             (($# >= 2)) || die '--ui-binary requires a path'
             UI_BINARY="$2"
@@ -104,6 +113,43 @@ while (($# > 0)); do
     esac
 done
 
+if [[ -n "$LEGACY_UI_BINARY" ]]; then
+    if [[ -n "$UI_BINARY" || -n "$RECORDER_BINARY" || -n "$REST_BINARY" ]]; then
+        die 'cannot combine --binary with the split binary options'
+    fi
+    [[ "$(basename -- "$LEGACY_UI_BINARY")" == codex_info ]] ||
+        die '--binary must name the codex_info UI binary'
+    legacy_dir="$(cd -- "$(dirname -- "$LEGACY_UI_BINARY")" 2>/dev/null && pwd -P)" ||
+        die 'the --binary parent directory is unavailable'
+    UI_BINARY="$legacy_dir/codex_info"
+    if [[ "$UI_BINARY" == "$ROOT_DIR/target/$TARGET/release/codex_info" ]]; then
+        RECORDER_BINARY="$legacy_dir/codex_info_recorder"
+        REST_BINARY="$legacy_dir/codex_info_rest"
+        ALLOW_SOURCE_BUILD=1
+    else
+        RECORDER_BINARY="$legacy_dir/codex_info_recorder"
+        REST_BINARY="$legacy_dir/codex_info_rest"
+        if [[ ( ! -e "$RECORDER_BINARY" && ! -L "$RECORDER_BINARY" ) ||
+              ( ! -e "$REST_BINARY" && ! -L "$REST_BINARY" ) ]]; then
+            die 'external --binary requires sibling codex_info_recorder and codex_info_rest artifacts'
+        fi
+    fi
+else
+    supplied_split=0
+    [[ -n "$UI_BINARY" ]] && supplied_split=$((supplied_split + 1))
+    [[ -n "$RECORDER_BINARY" ]] && supplied_split=$((supplied_split + 1))
+    [[ -n "$REST_BINARY" ]] && supplied_split=$((supplied_split + 1))
+    if ((supplied_split != 0 && supplied_split != 3)); then
+        die 'the split binary options must be supplied together'
+    fi
+    if ((supplied_split == 0)); then
+        UI_BINARY="$ROOT_DIR/target/$TARGET/release/codex_info"
+        RECORDER_BINARY="$ROOT_DIR/target/$TARGET/release/codex_info_recorder"
+        REST_BINARY="$ROOT_DIR/target/$TARGET/release/codex_info_rest"
+        ALLOW_SOURCE_BUILD=1
+    fi
+fi
+
 [[ "$TARGET" == x86_64-unknown-linux-gnu ]] ||
     die "unsupported target: $TARGET (only x86_64-unknown-linux-gnu is supported)"
 [[ "$COMPATIBILITY" == glibc ]] ||
@@ -120,13 +166,13 @@ fi
 [[ "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] ||
     die 'run attempt must be a positive integer'
 
-if [[ -z "$UI_BINARY" || -z "$RECORDER_BINARY" || -z "$REST_BINARY" ]]; then
+if ((ALLOW_SOURCE_BUILD == 1)) &&
+   [[ ! -f "$UI_BINARY" || ! -x "$UI_BINARY" || -L "$UI_BINARY" ||
+      ! -f "$RECORDER_BINARY" || ! -x "$RECORDER_BINARY" || -L "$RECORDER_BINARY" ||
+      ! -f "$REST_BINARY" || ! -x "$REST_BINARY" || -L "$REST_BINARY" ]]; then
     command -v cargo >/dev/null 2>&1 || die 'cargo is required when binaries are not supplied'
     (cd -- "$ROOT_DIR" && cargo build --release --locked --target "$TARGET" \
         -p codex_info -p codex-info-recorder -p codex-info-rest)
-    [[ -n "$UI_BINARY" ]] || UI_BINARY="$ROOT_DIR/target/$TARGET/release/codex_info"
-    [[ -n "$RECORDER_BINARY" ]] || RECORDER_BINARY="$ROOT_DIR/target/$TARGET/release/codex_info_recorder"
-    [[ -n "$REST_BINARY" ]] || REST_BINARY="$ROOT_DIR/target/$TARGET/release/codex_info_rest"
 fi
 for binary in "$UI_BINARY" "$RECORDER_BINARY" "$REST_BINARY"; do
     [[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] ||

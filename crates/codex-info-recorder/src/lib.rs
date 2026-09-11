@@ -8,22 +8,24 @@
 #![deny(unsafe_code)]
 
 use chrono::{DateTime, Months, Utc};
+use codex_info::{security, thread_contract};
 use codex_info_db_writer::{
     canonical_reset_period, classify_quota_transition, finalize_session_timeline_recovery,
-    QuotaTransition, RecordedSessionSource, SessionCheckpoint, SessionCollectionCommit,
-    SessionCollectionState, SessionEvent, SessionModelTotal, SessionPendingRange, SessionRange,
-    SessionTimelineRecovery, SessionTimelineRecoveryPoint, StoragePartitionIdentity,
-    UsageHistoryObservation, UsageHistorySample, UsageStore, UsageStoreError,
+    ActiveThreadRecord, ActiveThreadSnapshot, QuotaTransition, RecordedSessionSource,
+    SessionCheckpoint, SessionCollectionCommit, SessionCollectionState, SessionEvent,
+    SessionModelTotal, SessionPendingRange, SessionRange, SessionTimelineRecovery,
+    SessionTimelineRecoveryPoint, StoragePartitionIdentity, UsageHistoryObservation,
+    UsageHistorySample, UsageStore, UsageStoreError,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -41,6 +43,12 @@ const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495
 const APP_SERVER_MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 const APP_SERVER_MAX_IGNORED_MESSAGES: usize = 1_024;
 const APP_SERVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_PROC_PROCESS_ENTRIES: usize = 65_536;
+const MAX_CODEX_PROCESS_FDS: usize = 16_384;
+const MAX_OPEN_SESSION_FILES: usize = 1_024;
+const MAX_ACTIVE_THREAD_ROWS: usize = 256;
+const MAX_THREAD_CHECKPOINTS: usize = 65_536;
+const MAX_THREAD_ID_SCALARS: usize = 128;
 
 #[derive(Debug)]
 pub enum RecorderError {
@@ -116,6 +124,15 @@ pub struct QuotaSnapshot {
 
 type QuotaPollResult = Result<QuotaSnapshot, String>;
 
+/// Health transitions from the isolated quota lane. The payload is retained
+/// only for a successful observation; failures are intentionally categorical
+/// so a malformed app-server response cannot leak into recorder diagnostics.
+#[derive(Clone, Debug, PartialEq)]
+pub enum QuotaPollEvent {
+    Ready(QuotaSnapshot),
+    Failed,
+}
+
 /// Polls the Codex app-server in a lane independent of Session collection.
 /// A failed poll is reported as degraded while the last good quota remains
 /// available to the next recorder cycle.
@@ -123,33 +140,115 @@ pub struct QuotaPoller {
     receiver: Receiver<QuotaPollResult>,
     _worker: JoinHandle<()>,
     latest: Option<QuotaSnapshot>,
+    events: Vec<QuotaPollEvent>,
 }
 
 impl QuotaPoller {
     pub fn start() -> Self {
+        Self::start_with_interval(DEFAULT_INTERVAL_SECS)
+    }
+
+    /// Start the quota lane with the caller's polling cadence. The worker
+    /// never waits on the Session recorder; a full result queue only drops a
+    /// stale observation and does not stop the lane.
+    pub fn start_with_interval(interval_secs: u64) -> Self {
         let (sender, receiver) = mpsc::sync_channel(2);
+        let interval_secs = interval_secs.max(1);
         let worker = thread::spawn(move || loop {
             let result = fetch_quota_snapshot();
-            if sender.send(result).is_err() {
-                break;
+            match sender.try_send(result) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => break,
             }
-            thread::sleep(Duration::from_secs(DEFAULT_INTERVAL_SECS));
+            thread::sleep(Duration::from_secs(interval_secs));
         });
         Self {
             receiver,
             _worker: worker,
             latest: None,
+            events: Vec::new(),
         }
     }
 
     pub fn latest(&mut self) -> Option<QuotaSnapshot> {
         while let Ok(result) = self.receiver.try_recv() {
             match result {
-                Ok(snapshot) => self.latest = Some(snapshot),
-                Err(error) => eprintln!("recorder degraded: quota poll failed: {error}"),
+                Ok(snapshot) => {
+                    self.latest = Some(snapshot.clone());
+                    self.events.push(QuotaPollEvent::Ready(snapshot));
+                }
+                Err(error) => {
+                    eprintln!("recorder degraded: quota poll failed: {error}");
+                    self.events.push(QuotaPollEvent::Failed);
+                }
             }
         }
         self.latest.clone()
+    }
+
+    /// Drain health transitions without waiting for a poll result. The main
+    /// loop can forward these to the DB health API while continuing Session
+    /// collection when the app-server lane is degraded.
+    pub fn take_events(&mut self) -> Vec<QuotaPollEvent> {
+        std::mem::take(&mut self.events)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActiveThreadPollResult {
+    Snapshot(ActiveThreadSnapshot),
+    Empty,
+    Failed(String),
+}
+
+enum ActiveThreadPollCommand {
+    Probe { checkpoints: Vec<SessionCheckpoint> },
+}
+
+/// Non-blocking bridge between the recorder cycle and live active-thread
+/// discovery. The worker owns the short-lived app-server process and all
+/// `/proc`/Session reads; the token recorder only submits checkpoints and
+/// drains completed results with `try_*` operations.
+pub struct ThreadPoller {
+    sender: SyncSender<ActiveThreadPollCommand>,
+    receiver: Receiver<ActiveThreadPollResult>,
+    _worker: JoinHandle<()>,
+}
+
+impl ThreadPoller {
+    pub fn start(sessions_root: PathBuf) -> Self {
+        let (sender, commands) = mpsc::sync_channel(1);
+        let (results, receiver) = mpsc::sync_channel(2);
+        let worker = thread::spawn(move || {
+            while let Ok(ActiveThreadPollCommand::Probe { checkpoints }) = commands.recv() {
+                let result = collect_active_thread_snapshot(&sessions_root, &checkpoints);
+                // Never let an app-server result block or back up the Session
+                // loop. A later cycle will request a fresh snapshot.
+                let _ = results.try_send(result);
+            }
+        });
+        Self {
+            sender,
+            receiver,
+            _worker: worker,
+        }
+    }
+
+    /// Queue a probe only when the worker is idle. `false` means the caller
+    /// should continue its Session cycle and retry on the next cycle.
+    pub fn submit(&self, checkpoints: &[SessionCheckpoint]) -> bool {
+        if checkpoints.len() > MAX_THREAD_CHECKPOINTS {
+            return false;
+        }
+        self.sender
+            .try_send(ActiveThreadPollCommand::Probe {
+                checkpoints: checkpoints.to_vec(),
+            })
+            .is_ok()
+    }
+
+    pub fn drain(&self) -> Vec<ActiveThreadPollResult> {
+        self.receiver.try_iter().collect()
     }
 }
 
@@ -321,13 +420,30 @@ fn request_app_server(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
+    request_app_server_before_deadline(
+        input,
+        output,
+        id,
+        method,
+        params,
+        Instant::now() + APP_SERVER_RESPONSE_TIMEOUT,
+    )
+}
+
+fn request_app_server_before_deadline(
+    input: &mut impl Write,
+    output: &Receiver<Result<String, String>>,
+    id: u64,
+    method: &str,
+    params: Value,
+    deadline: Instant,
+) -> Result<Value, String> {
     let message = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
     writeln!(input, "{message}")
         .map_err(|_| "Codex app-server request could not be sent".to_owned())?;
     input
         .flush()
         .map_err(|_| "Codex app-server request could not be sent".to_owned())?;
-    let deadline = Instant::now() + APP_SERVER_RESPONSE_TIMEOUT;
     let mut ignored = 0usize;
     loop {
         let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
@@ -363,6 +479,561 @@ fn request_app_server(
         }
         return Ok(value.get("result").cloned().unwrap_or(Value::Null));
     }
+}
+
+fn collect_active_thread_snapshot(
+    sessions_root: &Path,
+    checkpoints: &[SessionCheckpoint],
+) -> ActiveThreadPollResult {
+    let (sessions_root, active_paths) = match active_thread_paths(sessions_root) {
+        Ok(value) => value,
+        Err(error) => return ActiveThreadPollResult::Failed(error),
+    };
+    if active_paths.is_empty() {
+        return ActiveThreadPollResult::Empty;
+    }
+
+    let root_metadata = match fs::metadata(&sessions_root) {
+        Ok(metadata) => metadata,
+        Err(_) => return ActiveThreadPollResult::Failed("session root stat failed".to_owned()),
+    };
+    let root_identity = root_identity(&sessions_root, &root_metadata);
+    let mut candidates = Vec::with_capacity(active_paths.len());
+    for path in active_paths {
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                return ActiveThreadPollResult::Failed("active session disappeared".to_owned())
+            }
+        };
+        let relative_path = match path.strip_prefix(&sessions_root) {
+            Ok(relative) if !relative.as_os_str().is_empty() => {
+                relative.to_string_lossy().replace('\\', "/")
+            }
+            _ => {
+                return ActiveThreadPollResult::Failed(
+                    "active session path escaped root".to_owned(),
+                )
+            }
+        };
+        let Some(checkpoint) = checkpoints.iter().find(|checkpoint| {
+            checkpoint.root_identity == root_identity
+                && checkpoint.relative_path == relative_path
+                && checkpoint.file_device == file_device(&metadata)
+                && checkpoint.file_inode == file_inode(&metadata)
+        }) else {
+            // A live Session without a read-back checkpoint is not a trusted
+            // rollout state. Treat it as degraded rather than publishing a
+            // false empty snapshot.
+            return ActiveThreadPollResult::Failed("active session checkpoint mismatch".to_owned());
+        };
+        let thread_id = match read_session_meta_id(&sessions_root, &path, &metadata) {
+            Ok(id) => id,
+            Err(error) => return ActiveThreadPollResult::Failed(error),
+        };
+        candidates.push((path, metadata, thread_id, checkpoint.clone()));
+    }
+
+    let deadline = Instant::now() + APP_SERVER_RESPONSE_TIMEOUT;
+    let executable = match resolve_codex_executable() {
+        Ok(path) => path,
+        Err(_) => {
+            return ActiveThreadPollResult::Failed(
+                "Codex app-server executable unavailable".to_owned(),
+            )
+        }
+    };
+    let mut child = match Command::new(executable)
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => {
+            return ActiveThreadPollResult::Failed("Codex app-server start failed".to_owned())
+        }
+    };
+    let Some(mut input) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return ActiveThreadPollResult::Failed("Codex app-server stdin unavailable".to_owned());
+    };
+    let Some(stdout) = child.stdout.take() else {
+        drop(input);
+        let _ = child.kill();
+        let _ = child.wait();
+        return ActiveThreadPollResult::Failed("Codex app-server stdout unavailable".to_owned());
+    };
+    let output = app_server_reader(stdout);
+    let result = (|| {
+        request_app_server_before_deadline(
+            &mut input,
+            &output,
+            1,
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "codex-info-recorder-thread-poller",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {"experimentalApi": true}
+            }),
+            deadline,
+        )?;
+        let mut next_request_id = 2_u64;
+        let mut seen_ids = BTreeSet::new();
+        let mut rollouts = BTreeMap::new();
+        let mut thread_items = Vec::with_capacity(candidates.len());
+        for (path, metadata, thread_id, checkpoint) in &candidates {
+            let rollout = read_active_rollout(&sessions_root, path, metadata, checkpoint)?;
+            let request_id = next_request_id;
+            next_request_id = next_request_id
+                .checked_add(1)
+                .ok_or_else(|| "thread request id exhausted".to_owned())?;
+            let result = request_app_server_before_deadline(
+                &mut input,
+                &output,
+                request_id,
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": false}),
+                deadline,
+            )?;
+            let result_object = result
+                .as_object()
+                .filter(|object| object.len() == 1)
+                .ok_or_else(|| "thread/read response envelope rejected".to_owned())?;
+            let thread_item = result_object
+                .get("thread")
+                .ok_or_else(|| "thread/read response missing thread".to_owned())?;
+            let candidate = thread_contract::validate_thread_item(thread_item)
+                .map_err(|_| "thread/read response rejected".to_owned())?;
+            let response_path = candidate.path().and_then(|value| {
+                security::canonical_regular_file_under(&sessions_root, Path::new(value)).ok()
+            });
+            if candidate.id() != thread_id || response_path.as_ref() != Some(path) {
+                return Err("thread/read identity mismatch".to_owned());
+            }
+            if !seen_ids.insert(thread_id.clone()) {
+                return Err("duplicate active thread identity".to_owned());
+            }
+            if thread_items.len() >= MAX_ACTIVE_THREAD_ROWS {
+                return Err("active thread row limit exceeded".to_owned());
+            }
+            rollouts.insert(thread_id.clone(), rollout);
+            thread_items.push(thread_item.clone());
+        }
+        let mut accumulator = thread_contract::ThreadCycleAccumulator::new();
+        accumulator
+            .accept_page(&json!({"data": thread_items}))
+            .map_err(|_| "thread/read cycle rejected".to_owned())?;
+        let outcome = thread_contract::select_active_threads_parsed_where(
+            accumulator,
+            |candidate| {
+                candidate
+                    .path()
+                    .and_then(|value| {
+                        security::canonical_regular_file_under(&sessions_root, Path::new(value))
+                            .ok()
+                    })
+                    .is_some_and(|path| {
+                        candidates
+                            .iter()
+                            .any(|(candidate_path, _, _, _)| candidate_path == &path)
+                    })
+            },
+            |candidate| rollouts.get(candidate.id()).cloned().ok_or(()),
+        );
+        let snapshots = match outcome {
+            thread_contract::ThreadCycleOutcome::Snapshots(snapshots) => snapshots,
+            thread_contract::ThreadCycleOutcome::NoThread => Vec::new(),
+            thread_contract::ThreadCycleOutcome::CycleError => {
+                return Err("active thread cycle rejected".to_owned())
+            }
+        };
+        Ok(snapshots
+            .into_iter()
+            .map(|snapshot| ActiveThreadRecord {
+                id: snapshot.thread_id,
+                title: snapshot.title,
+                model: snapshot.model,
+                model_label: snapshot.model_label,
+                created_at: Some(snapshot.created_at),
+                updated_at: snapshot.updated_at,
+                last_user_message_at: snapshot.last_user_message_at,
+                total_tokens: snapshot.total_tokens,
+                context_usage_tokens: snapshot.context_usage_tokens,
+                context_window_tokens: snapshot.context_window_tokens,
+                is_subagent: snapshot.is_subagent,
+                parent_thread_id: snapshot.parent_thread_id,
+                depth: snapshot.depth,
+            })
+            .collect::<Vec<_>>())
+    })();
+    drop(input);
+    let _ = child.kill();
+    let _ = child.wait();
+    match result {
+        Ok(threads) if threads.is_empty() => ActiveThreadPollResult::Empty,
+        Ok(threads) => ActiveThreadPollResult::Snapshot(ActiveThreadSnapshot {
+            observed_at: Utc::now().timestamp(),
+            threads,
+        }),
+        Err(error) => ActiveThreadPollResult::Failed(error),
+    }
+}
+
+fn read_active_rollout(
+    sessions_root: &Path,
+    expected_path: &Path,
+    expected_metadata: &Metadata,
+    checkpoint: &SessionCheckpoint,
+) -> Result<thread_contract::ValidatedRollout, String> {
+    let canonical = security::canonical_regular_file_under(sessions_root, expected_path)
+        .map_err(|_| "active rollout path rejected".to_owned())?;
+    if canonical != expected_path {
+        return Err("active rollout path changed".to_owned());
+    }
+    let before_path = fs::symlink_metadata(&canonical)
+        .map_err(|_| "active rollout path disappeared".to_owned())?;
+    if before_path.file_type().is_symlink() || !before_path.is_file() {
+        return Err("active rollout is not a regular file".to_owned());
+    }
+    let mut file = File::open(&canonical).map_err(|_| "active rollout open failed".to_owned())?;
+    let before_file = file
+        .metadata()
+        .map_err(|_| "active rollout stat failed".to_owned())?;
+    if !same_file_identity(&before_path, &before_file)
+        || !same_file_identity(&before_file, expected_metadata)
+        || before_file.len() > security::MAX_SESSION_FILE_BYTES
+    {
+        return Err("active rollout identity rejected".to_owned());
+    }
+    let snapshot_len = before_file.len();
+    let checkpoint_offset = checkpoint.committed_offset;
+    if checkpoint_offset > snapshot_len {
+        return Err("active rollout checkpoint is ahead of file".to_owned());
+    }
+    let parse_start = if checkpoint.discard_until_lf {
+        match first_rollout_newline_end(&mut file, checkpoint_offset, snapshot_len)? {
+            Some(offset) => offset,
+            None => checkpoint_offset,
+        }
+    } else {
+        checkpoint_offset
+    };
+    let complete_len = if parse_start == checkpoint_offset && checkpoint.discard_until_lf {
+        parse_start
+    } else {
+        complete_rollout_range_end(&mut file, parse_start, snapshot_len)?
+    };
+    let mut parser = thread_contract::RolloutAccumulator::seeded(
+        checkpoint.last_model.clone(),
+        checkpoint.previous_total,
+        checkpoint
+            .last_task_running
+            .or_else(|| (complete_len > parse_start).then_some(true)),
+    );
+    if complete_len > parse_start {
+        file.seek(SeekFrom::Start(parse_start))
+            .map_err(|_| "active rollout seek failed".to_owned())?;
+        let appended_len = complete_len
+            .checked_sub(parse_start)
+            .ok_or_else(|| "active rollout offset underflow".to_owned())?;
+        let mut reader = BufReader::new((&mut file).take(appended_len));
+        parser
+            .apply_reader(&mut reader, appended_len)
+            .map_err(|_| "active rollout parse rejected".to_owned())?;
+    }
+    let snapshot = parser
+        .snapshot()
+        .map_err(|_| "active rollout state rejected".to_owned())?;
+    let after_file = file
+        .metadata()
+        .map_err(|_| "active rollout post-stat failed".to_owned())?;
+    let after_path = fs::symlink_metadata(&canonical)
+        .map_err(|_| "active rollout path post-stat failed".to_owned())?;
+    if !same_file_identity(&before_file, &after_file)
+        || !same_file_identity(&after_file, &after_path)
+        || after_file.len() < before_file.len()
+    {
+        return Err("active rollout changed during read".to_owned());
+    }
+    Ok(snapshot)
+}
+
+fn first_rollout_newline_end(
+    file: &mut File,
+    start_offset: u64,
+    snapshot_len: u64,
+) -> Result<Option<u64>, String> {
+    file.seek(SeekFrom::Start(start_offset))
+        .map_err(|_| "active rollout seek failed".to_owned())?;
+    let mut reader = BufReader::new(&mut *file);
+    let mut observed = start_offset;
+    loop {
+        let buffer = reader
+            .fill_buf()
+            .map_err(|_| "active rollout read failed".to_owned())?;
+        if buffer.is_empty() {
+            break;
+        }
+        if let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+            let consumed = u64::try_from(position)
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| "active rollout offset overflow".to_owned())?;
+            observed = observed
+                .checked_add(consumed)
+                .ok_or_else(|| "active rollout offset overflow".to_owned())?;
+            reader.consume(position + 1);
+            return Ok((observed <= snapshot_len).then_some(observed));
+        } else {
+            let consumed = u64::try_from(buffer.len())
+                .map_err(|_| "active rollout offset overflow".to_owned())?;
+            let buffer_len = buffer.len();
+            observed = observed
+                .checked_add(consumed)
+                .ok_or_else(|| "active rollout offset overflow".to_owned())?;
+            reader.consume(buffer_len);
+        }
+        if observed >= snapshot_len {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+fn complete_rollout_range_end(
+    file: &mut File,
+    start_offset: u64,
+    snapshot_len: u64,
+) -> Result<u64, String> {
+    file.seek(SeekFrom::Start(start_offset))
+        .map_err(|_| "active rollout seek failed".to_owned())?;
+    let mut reader = BufReader::new(&mut *file);
+    let mut observed = start_offset;
+    let mut complete = start_offset;
+    loop {
+        let buffer = reader
+            .fill_buf()
+            .map_err(|_| "active rollout read failed".to_owned())?;
+        if buffer.is_empty() {
+            break;
+        }
+        if let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+            let consumed = u64::try_from(position)
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| "active rollout offset overflow".to_owned())?;
+            observed = observed
+                .checked_add(consumed)
+                .ok_or_else(|| "active rollout offset overflow".to_owned())?;
+            reader.consume(position + 1);
+            complete = observed;
+        } else {
+            let consumed = u64::try_from(buffer.len())
+                .map_err(|_| "active rollout offset overflow".to_owned())?;
+            let buffer_len = buffer.len();
+            observed = observed
+                .checked_add(consumed)
+                .ok_or_else(|| "active rollout offset overflow".to_owned())?;
+            reader.consume(buffer_len);
+        }
+        if observed >= snapshot_len {
+            break;
+        }
+    }
+    Ok(complete.min(snapshot_len))
+}
+
+fn read_session_meta_id(
+    sessions_root: &Path,
+    path: &Path,
+    expected_metadata: &Metadata,
+) -> Result<String, String> {
+    let canonical = canonical_session_file(sessions_root, path)
+        .ok_or_else(|| "session_meta path rejected".to_owned())?;
+    let before_path =
+        fs::symlink_metadata(&canonical).map_err(|_| "session_meta path disappeared".to_owned())?;
+    let mut file = File::open(&canonical).map_err(|_| "session_meta open failed".to_owned())?;
+    let before_file = file
+        .metadata()
+        .map_err(|_| "session_meta stat failed".to_owned())?;
+    if !same_file_identity(&before_path, &before_file)
+        || file_device(&before_file) != file_device(expected_metadata)
+        || file_inode(&before_file) != file_inode(expected_metadata)
+    {
+        return Err("session_meta identity mismatch".to_owned());
+    }
+    let line = read_bounded_rpc_line(&mut BufReader::new(
+        (&mut file).take(APP_SERVER_MAX_LINE_BYTES as u64 + 1),
+    ))?
+    .ok_or_else(|| "session_meta is empty".to_owned())?;
+    let value: Value =
+        serde_json::from_str(&line).map_err(|_| "session_meta JSON rejected".to_owned())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "session_meta envelope rejected".to_owned())?;
+    if object.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return Err("session_meta record rejected".to_owned());
+    }
+    let id = object
+        .get("payload")
+        .and_then(Value::as_object)
+        .and_then(|payload| payload.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| {
+            (1..=MAX_THREAD_ID_SCALARS).contains(&id.chars().count())
+                && !id.chars().any(char::is_control)
+        })
+        .ok_or_else(|| "session_meta id rejected".to_owned())?
+        .to_owned();
+    let after_file = file
+        .metadata()
+        .map_err(|_| "session_meta post-stat failed".to_owned())?;
+    let after_path = fs::symlink_metadata(&canonical)
+        .map_err(|_| "session_meta path post-stat failed".to_owned())?;
+    if !same_file_identity(&before_file, &after_file)
+        || !same_file_identity(&after_file, &after_path)
+        || after_file.len() < before_file.len()
+    {
+        return Err("session_meta changed during read".to_owned());
+    }
+    Ok(id)
+}
+
+fn active_thread_paths(sessions_root: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>), String> {
+    #[cfg(not(unix))]
+    {
+        let _ = sessions_root;
+        return Err("active session process inventory unavailable".to_owned());
+    }
+    #[cfg(unix)]
+    {
+        let metadata = fs::symlink_metadata(sessions_root)
+            .map_err(|_| "sessions root unavailable".to_owned())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("sessions root is not a regular directory".to_owned());
+        }
+        let canonical_root = sessions_root
+            .canonicalize()
+            .map_err(|_| "sessions root could not be canonicalized".to_owned())?;
+        let paths = open_codex_session_paths(Path::new("/proc"), &canonical_root)?;
+        Ok((canonical_root, paths))
+    }
+}
+
+#[cfg(unix)]
+fn open_codex_session_paths(
+    proc_root: &Path,
+    sessions_root: &Path,
+) -> Result<BTreeSet<PathBuf>, String> {
+    let mut process_entries = 0usize;
+    let mut open_files = BTreeSet::new();
+    let processes = fs::read_dir(proc_root).map_err(|_| "process inventory failed".to_owned())?;
+    for process in processes {
+        process_entries = process_entries
+            .checked_add(1)
+            .ok_or_else(|| "process inventory limit exceeded".to_owned())?;
+        if process_entries > MAX_PROC_PROCESS_ENTRIES {
+            return Err("process inventory limit exceeded".to_owned());
+        }
+        let process = match process {
+            Ok(process) => process,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("process inventory entry failed".to_owned()),
+        };
+        let name = process.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let process_path = process.path();
+        let mut comm = Vec::new();
+        match File::open(process_path.join("comm")) {
+            Ok(file) => {
+                if file.take(64).read_to_end(&mut comm).is_err() {
+                    return Err("process name read failed".to_owned());
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("process name open failed".to_owned()),
+        }
+        if comm.strip_suffix(b"\n") != Some(b"codex") && comm.as_slice() != b"codex" {
+            continue;
+        }
+        let executable = match fs::read_link(process_path.join("exe")) {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("process executable read failed".to_owned()),
+        };
+        if executable.file_name().and_then(|value| value.to_str()) != Some("codex") {
+            continue;
+        }
+        let descriptors = match fs::read_dir(process_path.join("fd")) {
+            Ok(descriptors) => descriptors,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Err("process descriptor inventory failed".to_owned()),
+        };
+        let mut descriptor_count = 0usize;
+        for descriptor in descriptors {
+            descriptor_count = descriptor_count
+                .checked_add(1)
+                .ok_or_else(|| "process descriptor limit exceeded".to_owned())?;
+            if descriptor_count > MAX_CODEX_PROCESS_FDS {
+                return Err("process descriptor limit exceeded".to_owned());
+            }
+            let descriptor = match descriptor {
+                Ok(descriptor) => descriptor,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return Err("process descriptor entry failed".to_owned()),
+            };
+            let target = match fs::read_link(descriptor.path()) {
+                Ok(path) => path,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return Err("process descriptor read failed".to_owned()),
+            };
+            let Some(canonical) = canonical_session_file(sessions_root, &target) else {
+                continue;
+            };
+            open_files.insert(canonical);
+            if open_files.len() > MAX_OPEN_SESSION_FILES {
+                return Err("active session file limit exceeded".to_owned());
+            }
+        }
+    }
+    Ok(open_files)
+}
+
+fn canonical_session_file(root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let canonical = security::canonical_regular_file_under(root, candidate).ok()?;
+    (canonical.extension().and_then(|value| value.to_str()) == Some("jsonl")).then_some(canonical)
+}
+
+fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
+    file_device(left) == file_device(right) && file_inode(left) == file_inode(right)
+}
+
+#[cfg(unix)]
+fn file_device(metadata: &Metadata) -> u64 {
+    metadata.dev()
+}
+
+#[cfg(not(unix))]
+fn file_device(_metadata: &Metadata) -> u64 {
+    0
+}
+
+#[cfg(unix)]
+fn file_inode(metadata: &Metadata) -> u64 {
+    metadata.ino()
+}
+
+#[cfg(not(unix))]
+fn file_inode(_metadata: &Metadata) -> u64 {
+    0
 }
 
 fn decode_app_server_account(value: &Value) -> Result<AppServerAccount, String> {
@@ -699,6 +1370,24 @@ impl ModelTotals {
             return Some(trimmed.to_owned());
         };
         Some(canonical.to_owned())
+    }
+
+    fn checkpoint_model(model: &str) -> Option<String> {
+        let trimmed = model.trim();
+        if !trimmed.is_empty()
+            && trimmed.len() <= codex_info_db_writer::MAX_SESSION_MODEL_BYTES
+            && !trimmed.chars().any(char::is_control)
+        {
+            Some(trimmed.to_owned())
+        } else {
+            Self::canonical_model(model)
+        }
+    }
+
+    fn usage_model(model: Option<&str>) -> String {
+        model
+            .and_then(Self::canonical_model)
+            .unwrap_or_else(|| UNATTRIBUTED_MODEL.to_owned())
     }
 
     fn add(&mut self, model: &str, delta: TokenSnapshot) -> Result<(), RecorderError> {
@@ -1179,6 +1868,28 @@ impl Recorder {
 
     pub fn state(&self) -> Result<SessionCollectionState, RecorderError> {
         Ok(self.writer.load_session_collection_state()?)
+    }
+
+    /// Publish a complete active-thread candidate through the writer's
+    /// atomic snapshot boundary. The caller owns the independent poll lane;
+    /// this method only performs the bounded DB operation after a result has
+    /// been drained and never runs on the Session RPC worker.
+    pub fn commit_active_thread_snapshot(
+        &mut self,
+        snapshot: &ActiveThreadSnapshot,
+        acquisition_degraded: bool,
+    ) -> Result<u64, RecorderError> {
+        Ok(self
+            .writer
+            .commit_active_thread_snapshot_with_health(snapshot, acquisition_degraded)?)
+    }
+
+    pub fn mark_active_thread_snapshot_degraded(&mut self) -> Result<u64, RecorderError> {
+        Ok(self.writer.mark_active_thread_snapshot_degraded()?)
+    }
+
+    pub fn clear_active_thread_snapshot_degraded(&mut self) -> Result<u64, RecorderError> {
+        Ok(self.writer.clear_active_thread_snapshot_degraded()?)
     }
 
     pub fn model_totals(&self) -> Result<BTreeMap<String, TokenSnapshot>, RecorderError> {
@@ -2103,7 +2814,7 @@ fn scan_source(
         }
         if summary.event_type() != Some("thread_settings_applied") || last_model.is_none() {
             if let Some(model) = summary.event_model() {
-                last_model = ModelTotals::canonical_model(model);
+                last_model = ModelTotals::checkpoint_model(model);
             }
         }
         let Some(current) = summary.token_snapshot() else {
@@ -2125,10 +2836,7 @@ fn scan_source(
             baseline_known = true;
             previous = current;
             let timestamp = summary.event_timestamp();
-            let model = last_model
-                .as_deref()
-                .unwrap_or(UNATTRIBUTED_MODEL)
-                .to_owned();
+            let model = ModelTotals::usage_model(last_model.as_deref());
             recovery_last = Some((current, timestamp));
             if current != anchor {
                 if let Some(before) = recovery_stream_previous {
@@ -2184,10 +2892,7 @@ fn scan_source(
         };
         previous = current;
         let timestamp = summary.event_timestamp();
-        let model = last_model
-            .as_deref()
-            .unwrap_or(UNATTRIBUTED_MODEL)
-            .to_owned();
+        let model = ModelTotals::usage_model(last_model.as_deref());
         let timed_event = (timestamp > 0 && delta.has_usage()).then(|| TimedModelUsage {
             timestamp,
             model: model.clone(),
@@ -4329,5 +5034,51 @@ mod tests {
         assert_eq!(snapshot.window_seconds, 120 * 60);
         assert_eq!(snapshot.remaining_percent, Some(80.0));
         assert!(snapshot.observed_at > 0);
+    }
+
+    #[test]
+    fn active_rollout_uses_checkpoint_offset_and_preserves_display_model() {
+        let root = temp_root("active-thread-record");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("one.jsonl");
+        let session_meta = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-1\"}}\n";
+        fs::write(&path, session_meta).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let root_metadata = fs::metadata(&sessions).unwrap();
+        let checkpoint = SessionCheckpoint {
+            root_identity: root_identity(&sessions, &root_metadata),
+            relative_path: "one.jsonl".to_owned(),
+            file_device: file_device(&metadata),
+            file_inode: file_inode(&metadata),
+            committed_offset: session_meta.len() as u64,
+            discard_until_lf: false,
+            collector_epoch: 7,
+            cycle_seq: 3,
+            prefix_generation: 9,
+            prefix_sha256: EMPTY_SHA256.to_owned(),
+            fully_attributed_from_zero: true,
+            token_baseline_known: true,
+            last_model: Some("gpt-5.6-sol".to_owned()),
+            last_task_running: Some(true),
+            previous_total: 42,
+            previous_input: 40,
+            previous_cached_input: 0,
+            previous_output: 2,
+            previous_cache_write_input: Some(0),
+        };
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(token(43, Utc::now().timestamp()).as_bytes())
+            .unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let snapshot = read_active_rollout(&sessions, &path, &metadata, &checkpoint).unwrap();
+        assert!(snapshot.is_running());
+        assert_eq!(snapshot.model(), "gpt-5.6-sol");
+        assert_eq!(snapshot.model_label(), "gpt-5.6-sol");
+        assert_eq!(snapshot.total_tokens(), Some(43));
+        let _ = fs::remove_dir_all(root);
     }
 }

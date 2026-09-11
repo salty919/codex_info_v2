@@ -9,12 +9,14 @@ use codex_info_rest_contract::{
     is_valid_public_model_name, ContractError, PublicDetailedModelUsage, PublicDetails,
     PublicHistoryGap, PublicHistoryModelUsageV3, PublicHistoryObservation,
     PublicHistoryObservationV3, PublicHistoryPeriod, PublicHistorySample, PublicModelCostV3,
-    PublicModelUsageV3, PublicQuota, PublicState, MAX_PUBLIC_MODELS_V3,
+    PublicModelUsageV3, PublicQuota, PublicState, PublicThread, MAX_PUBLIC_MODELS_V3,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
+use serde::de::{self, Deserializer, MapAccess, Visitor};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,6 +27,9 @@ const RESET_AT_TOLERANCE_SECONDS: i64 = 60;
 const MOVING_RESET_GROUP_MAX_DRIFT_SECONDS: i64 = 5 * 60;
 const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
 const MOVING_RESET_MIN_HORIZON_SECONDS: i64 = 86_400;
+const MAX_ACTIVE_THREADS: usize = 256;
+const MAX_ACTIVE_THREAD_JSON_BYTES: usize = 1024 * 1024;
+const MAX_PUBLIC_UNIX_SECONDS: i64 = 253_402_300_799;
 // These are the distribution's established local estimate rates.  Keep the
 // REST projection numerically identical to the root UI: durable history
 // dollars are cumulative totals, while the public model fields are split into
@@ -188,7 +193,8 @@ impl DbReader {
             transaction.commit()?;
             return Ok(None);
         };
-        let has_pending_ranges = read_pending_ranges(&transaction)?;
+        let (_, acquisition_degraded) = read_active_thread_snapshot_or_degraded(&transaction);
+        let has_pending_ranges = read_pending_ranges(&transaction)? || acquisition_degraded;
         transaction.commit()?;
         Ok(Some(DbChangeMarker {
             generation,
@@ -202,11 +208,12 @@ impl DbReader {
     pub fn read_snapshot(&self) -> Result<DbSnapshot, ReaderError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        let has_pending_ranges = read_pending_ranges(&transaction)?;
+        let (threads, acquisition_degraded) = read_active_thread_snapshot_or_degraded(&transaction);
+        let has_pending_ranges = read_pending_ranges(&transaction)? || acquisition_degraded;
         let raw = read_history(&transaction)?;
         let generation = read_generation(&transaction, raw.iter().map(|row| row.timestamp))?;
         let (details, models_v3, history_samples_v2, history_samples_v3) =
-            build_details(&transaction, &raw)?;
+            build_details(&transaction, &raw, &threads)?;
         details.validate()?;
         let mut hasher = Sha256::new();
         hasher.update(generation.to_be_bytes());
@@ -246,6 +253,329 @@ struct RawSample {
     sol_tokens: u64,
     terra_tokens: u64,
     luna_tokens: u64,
+}
+
+#[derive(Clone, Debug)]
+struct StoredActiveThread {
+    id: String,
+    updated_at: i64,
+    title: String,
+    parent_thread_id: Option<String>,
+    model: String,
+    model_label: String,
+    total_tokens: Option<u64>,
+    context_usage_tokens: Option<u64>,
+    context_window_tokens: Option<u64>,
+    created_at: Option<i64>,
+    last_user_message_at: Option<i64>,
+    is_subagent: bool,
+    depth: Option<i32>,
+}
+
+fn read_active_thread_snapshot_or_degraded(connection: &Connection) -> (Vec<PublicThread>, bool) {
+    // Active-thread presence is auxiliary to the durable usage history. A
+    // malformed or unreadable thread row must not make quota, model totals,
+    // or history disappear; publish those values as degraded and retry the
+    // complete thread snapshot on the next recorder generation.
+    read_active_thread_snapshot(connection).unwrap_or_else(|_| (Vec::new(), true))
+}
+
+impl<'de> Deserialize<'de> for StoredActiveThread {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "id",
+            "updated_at",
+            "title",
+            "parent_thread_id",
+            "model",
+            "model_label",
+            "total_tokens",
+            "context_usage_tokens",
+            "context_window_tokens",
+            "created_at",
+            "last_user_message_at",
+            "is_subagent",
+            "depth",
+        ];
+        struct StoredActiveThreadVisitor;
+        impl<'de> Visitor<'de> for StoredActiveThreadVisitor {
+            type Value = StoredActiveThread;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("one active thread object")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut id = None;
+                let mut updated_at = None;
+                let mut title = None;
+                let mut parent_thread_id = None;
+                let mut model = None;
+                let mut model_label = None;
+                let mut total_tokens = None;
+                let mut context_usage_tokens = None;
+                let mut context_window_tokens = None;
+                let mut created_at = None;
+                let mut last_user_message_at = None;
+                let mut is_subagent = None;
+                let mut depth = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => {
+                            if id.is_some() {
+                                return Err(de::Error::duplicate_field("id"));
+                            }
+                            id = Some(map.next_value()?);
+                        }
+                        "updated_at" => {
+                            if updated_at.is_some() {
+                                return Err(de::Error::duplicate_field("updated_at"));
+                            }
+                            updated_at = Some(map.next_value()?);
+                        }
+                        "title" => {
+                            if title.is_some() {
+                                return Err(de::Error::duplicate_field("title"));
+                            }
+                            title = Some(map.next_value()?);
+                        }
+                        "parent_thread_id" => {
+                            if parent_thread_id.is_some() {
+                                return Err(de::Error::duplicate_field("parent_thread_id"));
+                            }
+                            parent_thread_id = Some(map.next_value()?);
+                        }
+                        "model" => {
+                            if model.is_some() {
+                                return Err(de::Error::duplicate_field("model"));
+                            }
+                            model = Some(map.next_value()?);
+                        }
+                        "model_label" => {
+                            if model_label.is_some() {
+                                return Err(de::Error::duplicate_field("model_label"));
+                            }
+                            model_label = Some(map.next_value()?);
+                        }
+                        "total_tokens" => {
+                            if total_tokens.is_some() {
+                                return Err(de::Error::duplicate_field("total_tokens"));
+                            }
+                            total_tokens = Some(map.next_value()?);
+                        }
+                        "context_usage_tokens" => {
+                            if context_usage_tokens.is_some() {
+                                return Err(de::Error::duplicate_field("context_usage_tokens"));
+                            }
+                            context_usage_tokens = Some(map.next_value()?);
+                        }
+                        "context_window_tokens" => {
+                            if context_window_tokens.is_some() {
+                                return Err(de::Error::duplicate_field("context_window_tokens"));
+                            }
+                            context_window_tokens = Some(map.next_value()?);
+                        }
+                        "created_at" => {
+                            if created_at.is_some() {
+                                return Err(de::Error::duplicate_field("created_at"));
+                            }
+                            created_at = Some(map.next_value()?);
+                        }
+                        "last_user_message_at" => {
+                            if last_user_message_at.is_some() {
+                                return Err(de::Error::duplicate_field("last_user_message_at"));
+                            }
+                            last_user_message_at = Some(map.next_value()?);
+                        }
+                        "is_subagent" => {
+                            if is_subagent.is_some() {
+                                return Err(de::Error::duplicate_field("is_subagent"));
+                            }
+                            is_subagent = Some(map.next_value()?);
+                        }
+                        "depth" => {
+                            if depth.is_some() {
+                                return Err(de::Error::duplicate_field("depth"));
+                            }
+                            depth = Some(map.next_value()?);
+                        }
+                        _ => return Err(de::Error::unknown_field(&key, FIELDS)),
+                    }
+                }
+                Ok(StoredActiveThread {
+                    id: id.ok_or_else(|| de::Error::missing_field("id"))?,
+                    updated_at: updated_at.ok_or_else(|| de::Error::missing_field("updated_at"))?,
+                    title: title.ok_or_else(|| de::Error::missing_field("title"))?,
+                    parent_thread_id: parent_thread_id
+                        .ok_or_else(|| de::Error::missing_field("parent_thread_id"))?,
+                    model: model.ok_or_else(|| de::Error::missing_field("model"))?,
+                    model_label: model_label
+                        .ok_or_else(|| de::Error::missing_field("model_label"))?,
+                    total_tokens: total_tokens
+                        .ok_or_else(|| de::Error::missing_field("total_tokens"))?,
+                    context_usage_tokens: context_usage_tokens
+                        .ok_or_else(|| de::Error::missing_field("context_usage_tokens"))?,
+                    context_window_tokens: context_window_tokens
+                        .ok_or_else(|| de::Error::missing_field("context_window_tokens"))?,
+                    created_at: created_at.ok_or_else(|| de::Error::missing_field("created_at"))?,
+                    last_user_message_at: last_user_message_at
+                        .ok_or_else(|| de::Error::missing_field("last_user_message_at"))?,
+                    is_subagent: is_subagent
+                        .ok_or_else(|| de::Error::missing_field("is_subagent"))?,
+                    depth: depth.ok_or_else(|| de::Error::missing_field("depth"))?,
+                })
+            }
+        }
+        deserializer.deserialize_map(StoredActiveThreadVisitor)
+    }
+}
+
+fn active_thread_table_shape(connection: &Connection) -> Result<bool, ReaderError> {
+    let mut statement = connection.prepare(
+        "SELECT name, type, pk FROM pragma_table_info('active_thread_snapshot') ORDER BY cid",
+    )?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let current = vec![
+        ("singleton".to_owned(), "INTEGER".to_owned(), 1),
+        ("observed_at".to_owned(), "INTEGER".to_owned(), 0),
+        ("threads_json".to_owned(), "TEXT".to_owned(), 0),
+        ("acquisition_degraded".to_owned(), "INTEGER".to_owned(), 0),
+    ];
+    let legacy = current[..3].to_vec();
+    if actual == current {
+        Ok(true)
+    } else if actual == legacy {
+        Ok(false)
+    } else {
+        Err(ReaderError::Schema(
+            "active_thread_snapshot table schema is invalid".to_owned(),
+        ))
+    }
+}
+
+/// Reads the optional singleton publication row.  Missing tables and rows are
+/// the legacy empty state; a present but malformed candidate rejects the
+/// whole read so REST can retain its last-good pair.
+fn read_active_thread_snapshot(
+    connection: &Connection,
+) -> Result<(Vec<PublicThread>, bool), ReaderError> {
+    if !table_exists(connection, "active_thread_snapshot")? {
+        return Ok((Vec::new(), false));
+    }
+    let has_degraded = active_thread_table_shape(connection)?;
+    let count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM active_thread_snapshot", [], |row| {
+            row.get(0)
+        })?;
+    if count > 1 {
+        return Err(ReaderError::Schema(
+            "active_thread_snapshot singleton cardinality is invalid".to_owned(),
+        ));
+    }
+    let query = if has_degraded {
+        "SELECT singleton, observed_at, threads_json, acquisition_degraded
+         FROM active_thread_snapshot WHERE singleton = 1"
+    } else {
+        "SELECT singleton, observed_at, threads_json, 0
+         FROM active_thread_snapshot WHERE singleton = 1"
+    };
+    let Some((singleton, observed_at, threads_json, acquisition_degraded)) = connection
+        .query_row(query, [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .optional()?
+    else {
+        return Ok((Vec::new(), false));
+    };
+    if singleton != 1 {
+        return Err(ReaderError::Schema(
+            "active_thread_snapshot singleton key is invalid".to_owned(),
+        ));
+    }
+    if !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&observed_at) {
+        return Err(ReaderError::InvalidValue(
+            "active thread snapshot observed_at is invalid".to_owned(),
+        ));
+    }
+    if !matches!(acquisition_degraded, 0 | 1) {
+        return Err(ReaderError::InvalidValue(
+            "active thread snapshot acquisition state is invalid".to_owned(),
+        ));
+    }
+    if threads_json.len() > MAX_ACTIVE_THREAD_JSON_BYTES || threads_json.len() < 2 {
+        return Err(ReaderError::InvalidValue(
+            "active thread snapshot JSON is outside its size bound".to_owned(),
+        ));
+    }
+    let mut stored: Vec<StoredActiveThread> =
+        serde_json::from_str(&threads_json).map_err(|error| {
+            ReaderError::InvalidValue(format!("active thread JSON is invalid: {error}"))
+        })?;
+    if stored.len() > MAX_ACTIVE_THREADS {
+        return Err(ReaderError::TooManyRows(stored.len()));
+    }
+    let mut ids = HashSet::with_capacity(stored.len());
+    for thread in &stored {
+        if !ids.insert(thread.id.as_str()) {
+            return Err(ReaderError::InvalidValue(
+                "active thread snapshot contains duplicate ids".to_owned(),
+            ));
+        }
+        if !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&thread.updated_at) {
+            return Err(ReaderError::InvalidValue(
+                "active thread updated_at is invalid".to_owned(),
+            ));
+        }
+    }
+    stored.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let threads = stored
+        .into_iter()
+        .map(|thread| PublicThread {
+            id: thread.id,
+            title: thread.title,
+            parent_thread_id: thread.parent_thread_id,
+            model: thread.model,
+            model_label: thread.model_label,
+            total_tokens: thread.total_tokens,
+            context_usage_tokens: thread.context_usage_tokens,
+            context_window_tokens: thread.context_window_tokens,
+            created_at: thread.created_at,
+            last_user_message_at: thread.last_user_message_at,
+            is_subagent: thread.is_subagent,
+            depth: thread.depth,
+        })
+        .collect::<Vec<_>>();
+    let validation = PublicDetails {
+        active_thread_count: threads.len() as u64,
+        threads: threads.clone(),
+        ..PublicDetails::default()
+    };
+    validation.validate()?;
+    Ok((threads, acquisition_degraded == 1))
 }
 
 #[derive(Clone, Debug)]
@@ -424,9 +754,18 @@ type DetailsBuild = (
     Vec<PublicHistoryObservationV3>,
 );
 
-fn build_details(connection: &Connection, raw: &[RawSample]) -> Result<DetailsBuild, ReaderError> {
+fn build_details(
+    connection: &Connection,
+    raw: &[RawSample],
+    threads: &[PublicThread],
+) -> Result<DetailsBuild, ReaderError> {
     if raw.is_empty() {
-        return Ok((PublicDetails::default(), Vec::new(), Vec::new(), Vec::new()));
+        let details = PublicDetails {
+            active_thread_count: threads.len() as u64,
+            threads: threads.to_vec(),
+            ..PublicDetails::default()
+        };
+        return Ok((details, Vec::new(), Vec::new(), Vec::new()));
     }
     let observed_at = raw.iter().map(|row| row.timestamp).max().unwrap_or(0);
     let (current_reset_at, window_seconds) = read_collection_config(connection)?;
@@ -504,11 +843,11 @@ fn build_details(connection: &Connection, raw: &[RawSample]) -> Result<DetailsBu
             plan_label: None,
             quota,
             models,
-            active_thread_count: 0,
+            active_thread_count: threads.len() as u64,
             history_periods: periods,
             history_samples: samples,
             history_gaps: gaps,
-            threads: Vec::new(),
+            threads: threads.to_vec(),
             estimated_cost_label,
         },
         model_projection.v3,
@@ -1734,6 +2073,149 @@ mod tests {
                 ],
             )
             .expect("fixture row");
+    }
+
+    fn active_thread_json(id: &str, updated_at: i64) -> String {
+        serde_json::json!([{
+            "id": id,
+            "updated_at": updated_at,
+            "title": "one SOL thread",
+            "parent_thread_id": null,
+            "model": "gpt-5",
+            "model_label": "SOL",
+            "total_tokens": 12,
+            "context_usage_tokens": 8,
+            "context_window_tokens": 128,
+            "created_at": updated_at - 60,
+            "last_user_message_at": updated_at,
+            "is_subagent": false,
+            "depth": 0
+        }])
+        .to_string()
+    }
+
+    fn add_active_thread_table(path: &Path, json: &str, degraded: i64) {
+        let connection = Connection::open(path).expect("active thread fixture db");
+        connection
+            .execute_batch(
+                "CREATE TABLE active_thread_snapshot(
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    observed_at INTEGER NOT NULL CHECK(observed_at>0),
+                    threads_json TEXT NOT NULL,
+                    acquisition_degraded INTEGER NOT NULL DEFAULT 0
+                        CHECK(acquisition_degraded IN (0,1))
+                );",
+            )
+            .expect("active thread schema");
+        connection
+            .execute(
+                "INSERT INTO active_thread_snapshot(
+                    singleton, observed_at, threads_json, acquisition_degraded
+                 ) VALUES(1,?1,?2,?3)",
+                params![1_800_000_060_i64, json, degraded],
+            )
+            .expect("active thread row");
+    }
+
+    #[test]
+    fn one_sol_active_thread_is_projected_from_the_singleton_row() {
+        let path = temp_db("active-thread-one-sol");
+        make_db(&path);
+        let json = active_thread_json("thread-sol", 1_800_000_000);
+        add_active_thread_table(&path, &json, 0);
+        let snapshot = DbReader::open(&path)
+            .expect("reader")
+            .read_snapshot()
+            .expect("active thread snapshot");
+        assert!(!snapshot.has_pending_ranges);
+        assert_eq!(snapshot.details.active_thread_count, 1);
+        assert_eq!(snapshot.details.threads.len(), 1);
+        assert_eq!(snapshot.details.threads[0].id, "thread-sol");
+        assert_eq!(snapshot.details.threads[0].model_label, "SOL");
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn legacy_database_without_active_thread_table_is_empty() {
+        let path = temp_db("active-thread-legacy-empty");
+        make_db(&path);
+        let snapshot = DbReader::open(&path)
+            .expect("reader")
+            .read_snapshot()
+            .expect("legacy snapshot");
+        assert_eq!(snapshot.details.active_thread_count, 0);
+        assert!(snapshot.details.threads.is_empty());
+        assert!(!snapshot.has_pending_ranges);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn malformed_active_thread_row_is_local_to_threads() {
+        let path = temp_db("active-thread-malformed");
+        make_db(&path);
+        let malformed = serde_json::json!([{
+            "id": "duplicate",
+            "updated_at": 1_800_000_000,
+            "title": "valid",
+            "parent_thread_id": null,
+            "model": "gpt-5",
+            "model_label": "SOL",
+            "total_tokens": 1,
+            "context_usage_tokens": 1,
+            "context_window_tokens": 1,
+            "created_at": 1_800_000_000,
+            "last_user_message_at": 1_800_000_000,
+            "is_subagent": false,
+            "depth": 1025
+        }])
+        .to_string();
+        add_active_thread_table(&path, &malformed, 0);
+        let snapshot = DbReader::open(&path)
+            .expect("reader")
+            .read_snapshot()
+            .expect("usage history remains readable");
+        assert!(snapshot.has_pending_ranges);
+        assert_eq!(snapshot.details.history_samples.len(), 1);
+        assert_eq!(snapshot.details.active_thread_count, 0);
+        assert!(snapshot.details.threads.is_empty());
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn duplicate_active_thread_json_key_is_local_to_threads() {
+        let path = temp_db("active-thread-duplicate-key");
+        make_db(&path);
+        let duplicate = r#"[{"id":"one","id":"two","updated_at":1800000000,"title":"valid","parent_thread_id":null,"model":"gpt-5","model_label":"SOL","total_tokens":1,"context_usage_tokens":1,"context_window_tokens":1,"created_at":1800000000,"last_user_message_at":1800000000,"is_subagent":false,"depth":0}]"#;
+        add_active_thread_table(&path, duplicate, 0);
+        let snapshot = DbReader::open(&path)
+            .expect("reader")
+            .read_snapshot()
+            .expect("usage history remains readable");
+        assert!(snapshot.has_pending_ranges);
+        assert_eq!(snapshot.details.history_samples.len(), 1);
+        assert!(snapshot.details.threads.is_empty());
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn acquisition_degraded_retains_threads_and_marks_the_change_marker() {
+        let path = temp_db("active-thread-degraded");
+        make_db(&path);
+        let json = active_thread_json("thread-sol", 1_800_000_000);
+        add_active_thread_table(&path, &json, 1);
+        let reader = DbReader::open(&path).expect("reader");
+        let snapshot = reader.read_snapshot().expect("degraded snapshot");
+        assert!(snapshot.has_pending_ranges);
+        assert_eq!(snapshot.details.active_thread_count, 1);
+        assert_eq!(snapshot.details.threads[0].id, "thread-sol");
+        assert_eq!(
+            reader.read_change_marker().expect("change marker"),
+            Some(DbChangeMarker {
+                generation: 7,
+                has_pending_ranges: true,
+            })
+        );
+        fs::remove_file(path).expect("cleanup");
     }
 
     #[test]

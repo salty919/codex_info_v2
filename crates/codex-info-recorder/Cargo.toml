@@ -10,6 +10,7 @@ name = "codex_info_recorder"
 path = "src/main.rs"
 
 [dependencies]
+codex_info = { path = "../.." }
 codex-info-account-locator = { path = "../codex-info-account-locator" }
 codex-info-db-writer = { path = "../codex-info-db-writer" }
 chrono = { version = "0.4", features = ["serde"] }

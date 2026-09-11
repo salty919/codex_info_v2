@@ -1,10 +1,11 @@
+use chrono::Utc;
 use codex_info_account_locator::{
     ensure_partition, mark_partition_initialized, prepare_recorder_data_root, AccountPartition,
 };
-use codex_info_db_writer::StoragePartitionIdentity;
+use codex_info_db_writer::{ActiveThreadSnapshot, StoragePartitionIdentity};
 use codex_info_recorder::{
-    ProfileLease, QuotaPoller, Recorder, RecorderConfig, RecorderStateWriter, DEFAULT_CHUNK_BYTES,
-    DEFAULT_INTERVAL_SECS,
+    ActiveThreadPollResult, ProfileLease, QuotaPollEvent, QuotaPoller, Recorder, RecorderConfig,
+    RecorderStateWriter, ThreadPoller, DEFAULT_CHUNK_BYTES, DEFAULT_INTERVAL_SECS,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -22,6 +23,34 @@ struct Options {
     chunk_bytes: u64,
     interval_secs: u64,
     once: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaneHealth {
+    Unknown,
+    Ready,
+    Failed,
+}
+
+fn desired_acquisition_degraded(quota: LaneHealth, threads: LaneHealth) -> Option<bool> {
+    if quota == LaneHealth::Failed || threads == LaneHealth::Failed {
+        Some(true)
+    } else if quota == LaneHealth::Ready && threads == LaneHealth::Ready {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn sync_acquisition_health(recorder: &mut Recorder, quota: LaneHealth, threads: LaneHealth) {
+    let result = match desired_acquisition_degraded(quota, threads) {
+        Some(true) => recorder.mark_active_thread_snapshot_degraded(),
+        Some(false) => recorder.clear_active_thread_snapshot_degraded(),
+        None => return,
+    };
+    if let Err(error) = result {
+        eprintln!("codex-info-recorder acquisition health commit failed: {error}");
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     options.partition = partition;
     let mut recorder = Recorder::open_partitioned(
         RecorderConfig {
-            sessions_root: options.sessions_root,
+            sessions_root: options.sessions_root.clone(),
             chunk_bytes: options.chunk_bytes,
         },
         &options.database,
@@ -61,7 +90,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("mark account partition initialized: {error}"))?;
     let mut state_writer =
         RecorderStateWriter::new(&options.data_root, &options.identity, &_profile_lease)?;
-    let mut quota_poller = QuotaPoller::start();
+    let mut quota_poller = QuotaPoller::start_with_interval(options.interval_secs);
+    let thread_poller = ThreadPoller::start(options.sessions_root.clone());
+    let mut quota_health = LaneHealth::Unknown;
+    let mut thread_health = LaneHealth::Unknown;
     loop {
         match recorder.run_cycle_with_quota(quota_poller.latest()) {
             Ok(Some(report)) => {
@@ -93,6 +125,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let state = recorder.state().ok();
                 if let Err(state_error) = state_writer.write_degraded(state.as_ref()) {
                     eprintln!("codex-info-recorder degraded state write failed: {state_error}");
+                }
+            }
+        }
+        // Both lanes are deliberately submitted and drained with nonblocking
+        // operations. The DB integration consumes these typed outcomes; an
+        // app-server timeout or malformed response must not delay the next
+        // Session token cycle.
+        if let Some(event) = quota_poller.take_events().into_iter().last() {
+            match event {
+                QuotaPollEvent::Ready(_) => {
+                    quota_health = LaneHealth::Ready;
+                    eprintln!("codex-info-recorder quota lane ready");
+                }
+                QuotaPollEvent::Failed => {
+                    quota_health = LaneHealth::Failed;
+                    eprintln!("codex-info-recorder quota lane degraded");
+                }
+            }
+            sync_acquisition_health(&mut recorder, quota_health, thread_health);
+        }
+        if let Ok(state) = recorder.state() {
+            let _ = thread_poller.submit(&state.checkpoints);
+        }
+        if let Some(result) = thread_poller.drain().into_iter().last() {
+            let snapshot = match result {
+                ActiveThreadPollResult::Snapshot(snapshot) => Some(snapshot),
+                ActiveThreadPollResult::Empty => Some(ActiveThreadSnapshot {
+                    observed_at: Utc::now().timestamp(),
+                    threads: Vec::new(),
+                }),
+                ActiveThreadPollResult::Failed(reason) => {
+                    thread_health = LaneHealth::Failed;
+                    eprintln!("codex-info-recorder active-thread lane degraded: {reason}");
+                    sync_acquisition_health(&mut recorder, quota_health, thread_health);
+                    None
+                }
+            };
+            if let Some(snapshot) = snapshot {
+                // Unknown quota health must not clear a degraded marker left by
+                // a previous process. The snapshot remains readable while the
+                // marker records that both acquisition lanes are not yet ready.
+                let acquisition_degraded = quota_health != LaneHealth::Ready;
+                match recorder.commit_active_thread_snapshot(&snapshot, acquisition_degraded) {
+                    Ok(generation) => {
+                        thread_health = LaneHealth::Ready;
+                        eprintln!(
+                            "codex-info-recorder active-thread snapshot rows={} observed_at={} generation={generation}",
+                            snapshot.threads.len(),
+                            snapshot.observed_at
+                        );
+                    }
+                    Err(error) => {
+                        thread_health = LaneHealth::Failed;
+                        eprintln!(
+                            "codex-info-recorder active-thread snapshot commit failed: {error}"
+                        );
+                        sync_acquisition_health(&mut recorder, quota_health, thread_health);
+                    }
                 }
             }
         }
@@ -206,11 +296,45 @@ fn default_codex_home() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use super::{desired_acquisition_degraded, LaneHealth};
+
     #[test]
     fn version_is_the_recorder_package_version() {
         assert!(!super::RECORDER_VERSION.is_empty());
         assert!(super::RECORDER_VERSION
             .split('.')
             .all(|component| !component.is_empty()));
+    }
+
+    #[test]
+    fn acquisition_health_only_recovers_after_both_lanes_are_ready() {
+        assert_eq!(
+            desired_acquisition_degraded(LaneHealth::Ready, LaneHealth::Ready),
+            Some(false)
+        );
+        assert_eq!(
+            desired_acquisition_degraded(LaneHealth::Failed, LaneHealth::Ready),
+            Some(true)
+        );
+        assert_eq!(
+            desired_acquisition_degraded(LaneHealth::Ready, LaneHealth::Failed),
+            Some(true)
+        );
+        assert_eq!(
+            desired_acquisition_degraded(LaneHealth::Failed, LaneHealth::Failed),
+            Some(true)
+        );
+        assert_eq!(
+            desired_acquisition_degraded(LaneHealth::Unknown, LaneHealth::Ready),
+            None
+        );
+        assert_eq!(
+            desired_acquisition_degraded(LaneHealth::Ready, LaneHealth::Unknown),
+            None
+        );
+        assert_eq!(
+            desired_acquisition_degraded(LaneHealth::Unknown, LaneHealth::Unknown),
+            None
+        );
     }
 }

@@ -334,6 +334,13 @@ CREATE TABLE recorder_gap_ledger (
         AND confirmation_cycle_seq NOT GLOB '*[^0-9]*'
     )
 );
+
+CREATE TABLE active_thread_snapshot (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    observed_at INTEGER NOT NULL CHECK (observed_at > 0),
+    threads_json TEXT NOT NULL CHECK (length(threads_json) BETWEEN 2 AND 1048576),
+    acquisition_degraded INTEGER NOT NULL DEFAULT 0 CHECK (acquisition_degraded IN (0, 1))
+);
 "#;
 
 const GAP_LEDGER_REASONS: [&str; 3] = [
@@ -363,7 +370,14 @@ const DURABLE_STATE_OBSERVATION_MIN_SINGLETON: i64 = 2;
 const MAX_OBSERVATION_JSON_BYTES: usize = 16 * 1024;
 const OBSERVATION_JSON_KIND: &str = "codex-info-usage-observation-v1";
 pub const MAX_SESSION_MODEL_BYTES: usize = 512;
-const ACCOUNT_DB_SCHEMA_VERSION: i64 = 6;
+const ACCOUNT_DB_SCHEMA_VERSION: i64 = 7;
+const MAX_ACTIVE_THREADS: usize = 256;
+const MAX_ACTIVE_THREAD_ID_SCALARS: usize = 512;
+const MAX_ACTIVE_THREAD_TITLE_SCALARS: usize = 512;
+const MAX_ACTIVE_THREAD_MODEL_SCALARS: usize = 128;
+const MAX_ACTIVE_THREAD_MODEL_LABEL_SCALARS: usize = 24;
+const MAX_ACTIVE_THREAD_JSON_BYTES: usize = 1024 * 1024;
+const MAX_PUBLIC_UNIX_SECONDS: i64 = 253_402_300_799;
 const OBSERVATION_JSON_KEYS: &[&str] = &[
     "kind",
     "timestamp",
@@ -458,6 +472,144 @@ pub struct UsageHistorySample {
     pub sol_tokens: u64,
     pub terra_tokens: u64,
     pub luna_tokens: u64,
+}
+
+/// One active Session thread accepted for publication.  This is intentionally
+/// a writer-owned DTO: the recorder validates the native candidate before it
+/// crosses into the account partition, while the read-only reader projects
+/// the same JSON shape into its public REST DTO.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveThreadRecord {
+    pub id: String,
+    pub updated_at: i64,
+    pub title: String,
+    pub parent_thread_id: Option<String>,
+    pub model: String,
+    pub model_label: String,
+    pub total_tokens: Option<u64>,
+    pub context_usage_tokens: Option<u64>,
+    pub context_window_tokens: Option<u64>,
+    pub created_at: Option<i64>,
+    pub last_user_message_at: Option<i64>,
+    pub is_subagent: bool,
+    pub depth: Option<i32>,
+}
+
+/// A complete active-thread publication candidate.  An empty `threads` value
+/// is meaningful and commits as a verified empty set; callers must not use a
+/// failed/partial candidate as an empty replacement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveThreadSnapshot {
+    pub observed_at: i64,
+    pub threads: Vec<ActiveThreadRecord>,
+}
+
+fn active_thread_text_valid(value: &str, max_scalars: usize) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= max_scalars
+        && !value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+        })
+}
+
+fn validate_active_thread_record(record: &ActiveThreadRecord) -> Result<()> {
+    if record.updated_at <= 0
+        || record.updated_at > MAX_PUBLIC_UNIX_SECONDS
+        || !active_thread_text_valid(&record.id, MAX_ACTIVE_THREAD_ID_SCALARS)
+        || !active_thread_text_valid(&record.title, MAX_ACTIVE_THREAD_TITLE_SCALARS)
+        || !active_thread_text_valid(&record.model, MAX_ACTIVE_THREAD_MODEL_SCALARS)
+        || !active_thread_text_valid(&record.model_label, MAX_ACTIVE_THREAD_MODEL_LABEL_SCALARS)
+        || record
+            .parent_thread_id
+            .as_deref()
+            .is_some_and(|value| !active_thread_text_valid(value, MAX_ACTIVE_THREAD_ID_SCALARS))
+        || record
+            .created_at
+            .is_some_and(|value| !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&value))
+        || record
+            .last_user_message_at
+            .is_some_and(|value| !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&value))
+        || record
+            .depth
+            .is_some_and(|value| !(0..=1024).contains(&value))
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "active thread contains an invalid scalar".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_active_thread_snapshot(snapshot: &ActiveThreadSnapshot) -> Result<(i64, String)> {
+    if !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&snapshot.observed_at) {
+        return Err(UsageStoreError::InvalidTimestamp {
+            field: "active thread snapshot",
+            value: snapshot.observed_at,
+        });
+    }
+    if snapshot.threads.len() > MAX_ACTIVE_THREADS {
+        return Err(UsageStoreError::InvalidImport(
+            "active thread snapshot contains too many threads".into(),
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    let mut threads = snapshot.threads.clone();
+    for thread in &threads {
+        validate_active_thread_record(thread)?;
+        if !ids.insert(thread.id.as_str()) {
+            return Err(UsageStoreError::InvalidImport(
+                "active thread snapshot contains duplicate ids".into(),
+            ));
+        }
+    }
+    // The public contract's canonical order is newest activity first, then
+    // descending id.  Sorting at the storage edge makes equivalent recorder
+    // candidates serialize to one byte representation.
+    threads.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let rows = threads
+        .iter()
+        .map(|thread| {
+            serde_json::json!({
+                "id": &thread.id,
+                "updated_at": thread.updated_at,
+                "title": &thread.title,
+                "parent_thread_id": &thread.parent_thread_id,
+                "model": &thread.model,
+                "model_label": &thread.model_label,
+                "total_tokens": thread.total_tokens,
+                "context_usage_tokens": thread.context_usage_tokens,
+                "context_window_tokens": thread.context_window_tokens,
+                "created_at": thread.created_at,
+                "last_user_message_at": thread.last_user_message_at,
+                "is_subagent": thread.is_subagent,
+                "depth": thread.depth,
+            })
+        })
+        .collect::<Vec<_>>();
+    let encoded = serde_json::to_string(&rows).map_err(|error| {
+        UsageStoreError::InvalidImport(format!(
+            "active thread snapshot is not serializable: {error}"
+        ))
+    })?;
+    if encoded.len() > MAX_ACTIVE_THREAD_JSON_BYTES {
+        return Err(UsageStoreError::InvalidImport(
+            "active thread snapshot JSON is too large".into(),
+        ));
+    }
+    Ok((snapshot.observed_at, encoded))
 }
 
 /// Provenance of the local model vector for one history observation.
@@ -4927,6 +5079,15 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
                 ("confirmation_cycle_seq", "TEXT", 0),
             ],
         ),
+        (
+            "active_thread_snapshot",
+            &[
+                ("singleton", "INTEGER", 1),
+                ("observed_at", "INTEGER", 0),
+                ("threads_json", "TEXT", 0),
+                ("acquisition_degraded", "INTEGER", 0),
+            ],
+        ),
     ];
 
     let mut table_statement = connection.prepare(
@@ -4947,33 +5108,53 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
     pre_continuity_tables.remove("session_timeline_recoveries");
     pre_continuity_tables.remove("session_pending_ranges");
     pre_continuity_tables.remove("session_events");
+    pre_continuity_tables.remove("active_thread_snapshot");
     let mut pre_model_history_tables = expected_tables.clone();
     pre_model_history_tables.remove("usage_model_history");
     pre_model_history_tables.remove("session_cumulative_recoveries");
     pre_model_history_tables.remove("session_timeline_recoveries");
     pre_model_history_tables.remove("session_pending_ranges");
     pre_model_history_tables.remove("session_events");
+    pre_model_history_tables.remove("active_thread_snapshot");
     let mut pre_cumulative_recovery_tables = expected_tables.clone();
     pre_cumulative_recovery_tables.remove("session_cumulative_recoveries");
     pre_cumulative_recovery_tables.remove("session_timeline_recoveries");
     pre_cumulative_recovery_tables.remove("session_pending_ranges");
     pre_cumulative_recovery_tables.remove("session_events");
+    pre_cumulative_recovery_tables.remove("active_thread_snapshot");
     let mut pre_timeline_recovery_tables = expected_tables.clone();
     pre_timeline_recovery_tables.remove("session_timeline_recoveries");
     pre_timeline_recovery_tables.remove("session_pending_ranges");
     pre_timeline_recovery_tables.remove("session_events");
+    pre_timeline_recovery_tables.remove("active_thread_snapshot");
     let mut pre_pending_range_tables = expected_tables.clone();
     pre_pending_range_tables.remove("session_pending_ranges");
     pre_pending_range_tables.remove("session_events");
+    pre_pending_range_tables.remove("active_thread_snapshot");
     let mut pre_session_event_tables = expected_tables.clone();
     pre_session_event_tables.remove("session_events");
+    pre_session_event_tables.remove("active_thread_snapshot");
+    let mut actual_tables_without_active = actual_tables.clone();
+    actual_tables_without_active.remove("active_thread_snapshot");
     if actual_tables != expected_tables
-        && !(allow_unversioned_legacy && actual_tables == pre_continuity_tables)
-        && !(schema_version < 2 && actual_tables == pre_model_history_tables)
-        && !(schema_version < 3 && actual_tables == pre_cumulative_recovery_tables)
-        && !(schema_version < 4 && actual_tables == pre_timeline_recovery_tables)
-        && !(schema_version < 5 && actual_tables == pre_pending_range_tables)
-        && !(schema_version < 6 && actual_tables == pre_session_event_tables)
+        && !(allow_unversioned_legacy
+            && (actual_tables == pre_continuity_tables
+                || actual_tables_without_active == pre_continuity_tables))
+        && !(schema_version < 2
+            && (actual_tables == pre_model_history_tables
+                || actual_tables_without_active == pre_model_history_tables))
+        && !(schema_version < 3
+            && (actual_tables == pre_cumulative_recovery_tables
+                || actual_tables_without_active == pre_cumulative_recovery_tables))
+        && !(schema_version < 4
+            && (actual_tables == pre_timeline_recovery_tables
+                || actual_tables_without_active == pre_timeline_recovery_tables))
+        && !(schema_version < 5
+            && (actual_tables == pre_pending_range_tables
+                || actual_tables_without_active == pre_pending_range_tables))
+        && !(schema_version < 6
+            && (actual_tables == pre_session_event_tables
+                || actual_tables_without_active == pre_session_event_tables))
     {
         return Err(UsageStoreError::InvalidImport(
             "account partition table set mismatch".into(),
@@ -4986,7 +5167,8 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
             || *table == "session_cumulative_recoveries"
             || *table == "session_timeline_recoveries"
             || *table == "session_pending_ranges"
-            || *table == "session_events")
+            || *table == "session_events"
+            || *table == "active_thread_snapshot")
             && !actual_tables.contains(*table)
         {
             continue;
@@ -5014,6 +5196,9 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
             matches!(*table, "session_checkpoints" | "session_model_totals")
                 && actual.len() + 1 == expected.len()
                 && actual == expected[..actual.len()];
+        let legacy_active_thread_snapshot_columns = *table == "active_thread_snapshot"
+            && schema_version < 7
+            && actual == legacy_active_thread_snapshot_columns();
         if actual != expected
             && !(allow_unversioned_legacy
                 && ((*table == "recorder_gap_ledger"
@@ -5022,6 +5207,7 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
                         && actual == legacy_session_checkpoint_columns())
                     || legacy_history_continuity
                     || legacy_cache_write_columns))
+            && !legacy_active_thread_snapshot_columns
         {
             return Err(UsageStoreError::InvalidImport(format!(
                 "account partition {table} schema mismatch"
@@ -5054,6 +5240,14 @@ fn legacy_session_checkpoint_columns() -> Vec<(String, String, i64)> {
         ("previous_input".to_owned(), "TEXT".to_owned(), 0),
         ("previous_cached_input".to_owned(), "TEXT".to_owned(), 0),
         ("previous_output".to_owned(), "TEXT".to_owned(), 0),
+    ]
+}
+
+fn legacy_active_thread_snapshot_columns() -> Vec<(String, String, i64)> {
+    vec![
+        ("singleton".to_owned(), "INTEGER".to_owned(), 1),
+        ("observed_at".to_owned(), "INTEGER".to_owned(), 0),
+        ("threads_json".to_owned(), "TEXT".to_owned(), 0),
     ]
 }
 
@@ -5252,6 +5446,40 @@ fn ensure_session_event_schema(transaction: &rusqlite::Transaction<'_>) -> Resul
         ) WITHOUT ROWID;
         "#,
     )?;
+    Ok(())
+}
+
+/// Add the active-thread publication row without rewriting any existing
+/// candidate.  Older partitions either have no table or the original
+/// three-column table; the nullable-looking state is represented by a
+/// non-null default so an old complete row remains a healthy snapshot.
+fn ensure_active_thread_snapshot_schema(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS active_thread_snapshot (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            observed_at INTEGER NOT NULL CHECK (observed_at > 0),
+            threads_json TEXT NOT NULL CHECK (length(threads_json) BETWEEN 2 AND 1048576),
+            acquisition_degraded INTEGER NOT NULL DEFAULT 0 CHECK (acquisition_degraded IN (0, 1))
+        );
+        "#,
+    )?;
+    let degraded_present: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('active_thread_snapshot')
+            WHERE name = 'acquisition_degraded'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !degraded_present {
+        transaction.execute(
+            "ALTER TABLE active_thread_snapshot
+             ADD COLUMN acquisition_degraded INTEGER NOT NULL DEFAULT 0
+             CHECK (acquisition_degraded IN (0, 1))",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -5715,6 +5943,7 @@ impl UsageStore {
         ensure_session_timeline_recovery_schema(&transaction)?;
         ensure_session_pending_range_schema(&transaction)?;
         ensure_session_event_schema(&transaction)?;
+        ensure_active_thread_snapshot_schema(&transaction)?;
         stamp_current_account_db_schema(&transaction)?;
         transaction.execute(
             "INSERT INTO storage_partition (
@@ -5771,6 +6000,7 @@ impl UsageStore {
         ensure_session_timeline_recovery_schema(&transaction)?;
         ensure_session_pending_range_schema(&transaction)?;
         ensure_session_event_schema(&transaction)?;
+        ensure_active_thread_snapshot_schema(&transaction)?;
         stamp_current_account_db_schema(&transaction)?;
         validate_storage_partition(&transaction, identity)?;
         transaction.commit()?;
@@ -5791,6 +6021,177 @@ impl UsageStore {
         // integrity scan on every minute poll is not an access check.
         validate_storage_partition_metadata(&store.connection, identity)?;
         Ok(store)
+    }
+
+    /// Atomically publishes one complete active-thread candidate.  The
+    /// payload and collection generation share one transaction so a failed
+    /// candidate leaves the preceding complete row untouched.  Replaying the
+    /// exact canonical thread payload is idempotent even when only the
+    /// producer's observation time advances; that private timestamp is not a
+    /// publication change.  A degraded row is cleared only by a successful
+    /// complete publication.
+    pub fn commit_active_thread_snapshot(
+        &mut self,
+        snapshot: &ActiveThreadSnapshot,
+    ) -> Result<u64> {
+        self.commit_active_thread_snapshot_with_health(snapshot, false)
+    }
+
+    /// Atomically publishes a complete candidate and the acquisition health
+    /// that applies to it. This prevents a successful thread refresh from
+    /// exposing a transient healthy generation while another acquisition
+    /// lane is still failed or has not completed its first probe.
+    pub fn commit_active_thread_snapshot_with_health(
+        &mut self,
+        snapshot: &ActiveThreadSnapshot,
+        acquisition_degraded: bool,
+    ) -> Result<u64> {
+        let (observed_at, threads_json) = canonical_active_thread_snapshot(snapshot)?;
+        let acquisition_degraded = i64::from(acquisition_degraded);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let generation_text: String = transaction.query_row(
+            "SELECT data_generation FROM collection_generation WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let generation = canonical_u64_text(&generation_text, "collection generation")?;
+        let existing: Option<(i64, String, i64)> = transaction
+            .query_row(
+                "SELECT observed_at, threads_json, acquisition_degraded
+                 FROM active_thread_snapshot WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((_existing_observed_at, existing_json, existing_degraded)) = &existing {
+            if !matches!(*existing_degraded, 0 | 1) {
+                return Err(UsageStoreError::InvalidImport(
+                    "active thread acquisition state is invalid".into(),
+                ));
+            }
+            if existing_json == &threads_json && *existing_degraded == acquisition_degraded {
+                transaction.commit()?;
+                return Ok(generation);
+            }
+        }
+        let next = generation
+            .checked_add(1)
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+        transaction.execute(
+            "INSERT INTO active_thread_snapshot (
+                 singleton, observed_at, threads_json, acquisition_degraded
+             ) VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT (singleton) DO UPDATE SET
+                 observed_at = excluded.observed_at,
+                 threads_json = excluded.threads_json,
+                 acquisition_degraded = excluded.acquisition_degraded",
+            params![observed_at, &threads_json, acquisition_degraded],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE collection_generation SET data_generation = ?1 WHERE singleton = 1",
+            [next.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(UsageStoreError::InvalidImport(
+                "collection generation singleton is missing".into(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// Marks acquisition failure while retaining the last complete thread
+    /// payload.  A missing row is a no-op: it must never manufacture an empty
+    /// snapshot or a synthetic generation.
+    pub fn mark_acquisition_degraded(&mut self) -> Result<u64> {
+        self.set_acquisition_degraded(true)
+    }
+
+    /// Clears the acquisition failure after all recorder lanes have succeeded.
+    /// The retained payload is unchanged; only the degraded marker and
+    /// publication generation move together.
+    pub fn clear_acquisition_degraded(&mut self) -> Result<u64> {
+        self.set_acquisition_degraded(false)
+    }
+
+    /// Compatibility alias for the explicit active-thread wording used by
+    /// older recorder call sites.
+    pub fn clear_active_thread_snapshot_degraded(&mut self) -> Result<u64> {
+        self.clear_acquisition_degraded()
+    }
+
+    /// Compatibility alias for callers that name the failure after the
+    /// active-thread lane.  The persisted state is shared with quota and
+    /// other acquisition failures.
+    pub fn mark_active_thread_snapshot_degraded(&mut self) -> Result<u64> {
+        self.mark_acquisition_degraded()
+    }
+
+    fn set_acquisition_degraded(&mut self, degraded: bool) -> Result<u64> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let generation_text: String = transaction.query_row(
+            "SELECT data_generation FROM collection_generation WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let generation = canonical_u64_text(&generation_text, "collection generation")?;
+        let table_exists: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_schema
+                WHERE type = 'table' AND name = 'active_thread_snapshot'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !table_exists {
+            transaction.commit()?;
+            return Ok(generation);
+        }
+        let existing: Option<i64> = transaction
+            .query_row(
+                "SELECT acquisition_degraded FROM active_thread_snapshot
+                 WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(existing) = existing else {
+            transaction.commit()?;
+            return Ok(generation);
+        };
+        if !matches!(existing, 0 | 1) {
+            return Err(UsageStoreError::InvalidImport(
+                "active thread acquisition state is invalid".into(),
+            ));
+        }
+        let requested = i64::from(degraded);
+        if existing == requested {
+            transaction.commit()?;
+            return Ok(generation);
+        }
+        let next = generation
+            .checked_add(1)
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+        transaction.execute(
+            "UPDATE active_thread_snapshot SET acquisition_degraded = ?1
+             WHERE singleton = 1",
+            [requested],
+        )?;
+        let changed = transaction.execute(
+            "UPDATE collection_generation SET data_generation = ?1 WHERE singleton = 1",
+            [next.to_string()],
+        )?;
+        if changed != 1 {
+            return Err(UsageStoreError::InvalidImport(
+                "collection generation singleton is missing".into(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(next)
     }
 
     /// Performs the full SQLite integrity proof only when a retained backup
@@ -9240,6 +9641,222 @@ mod tests {
             terra_tokens: 22,
             luna_tokens: 33,
         }
+    }
+
+    fn active_thread(id: &str, updated_at: i64) -> ActiveThreadRecord {
+        ActiveThreadRecord {
+            id: id.into(),
+            updated_at,
+            title: format!("thread {id}"),
+            parent_thread_id: None,
+            model: "gpt-5".into(),
+            model_label: "SOL".into(),
+            total_tokens: Some(12),
+            context_usage_tokens: Some(8),
+            context_window_tokens: Some(128),
+            created_at: Some(updated_at - 60),
+            last_user_message_at: Some(updated_at),
+            is_subagent: false,
+            depth: Some(0),
+        }
+    }
+
+    #[test]
+    fn active_thread_snapshot_roundtrips_and_empty_is_real() {
+        let path = database_path("active-thread-roundtrip");
+        let identity = partition_identity('a', 1);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let snapshot = ActiveThreadSnapshot {
+            observed_at: 1_800_000_060,
+            threads: vec![active_thread("thread-a", 1_800_000_000)],
+        };
+        assert_eq!(store.commit_active_thread_snapshot(&snapshot).unwrap(), 1);
+        let row: (i64, String, i64) = store
+            .connection
+            .query_row(
+                "SELECT observed_at, threads_json, acquisition_degraded
+                 FROM active_thread_snapshot WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, snapshot.observed_at);
+        assert_eq!(row.2, 0);
+        let json: serde_json::Value = serde_json::from_str(&row.1).unwrap();
+        assert_eq!(json[0]["id"], "thread-a");
+        assert_eq!(json[0]["updated_at"], 1_800_000_000_i64);
+
+        // Exact canonical replay is a no-op, including generation.
+        assert_eq!(store.commit_active_thread_snapshot(&snapshot).unwrap(), 1);
+        let observed_later = ActiveThreadSnapshot {
+            observed_at: 1_800_000_120,
+            threads: snapshot.threads.clone(),
+        };
+        assert_eq!(
+            store
+                .commit_active_thread_snapshot(&observed_later)
+                .unwrap(),
+            1
+        );
+        let empty = ActiveThreadSnapshot {
+            observed_at: 1_800_000_120,
+            threads: Vec::new(),
+        };
+        assert_eq!(store.commit_active_thread_snapshot(&empty).unwrap(), 2);
+        let empty_json: String = store
+            .connection
+            .query_row(
+                "SELECT threads_json FROM active_thread_snapshot WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(empty_json, "[]");
+        remove_database(&path);
+    }
+
+    #[test]
+    fn active_thread_snapshot_failure_retains_row_and_generation() {
+        let path = database_path("active-thread-atomic");
+        let identity = partition_identity('b', 1);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let before = ActiveThreadSnapshot {
+            observed_at: 1_800_000_060,
+            threads: vec![active_thread("thread-before", 1_800_000_000)],
+        };
+        store.commit_active_thread_snapshot(&before).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_active_thread_update
+                 BEFORE UPDATE ON active_thread_snapshot
+                 BEGIN SELECT RAISE(ABORT, 'reject active thread update'); END;",
+            )
+            .unwrap();
+        let after = ActiveThreadSnapshot {
+            observed_at: 1_800_000_120,
+            threads: vec![active_thread("thread-after", 1_800_000_060)],
+        };
+        assert!(store.commit_active_thread_snapshot(&after).is_err());
+        let row: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT threads_json, data_generation FROM active_thread_snapshot
+                 JOIN collection_generation USING (singleton)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(row.0.contains("thread-before"));
+        assert!(!row.0.contains("thread-after"));
+        assert_eq!(row.1, "1");
+        remove_database(&path);
+    }
+
+    #[test]
+    fn acquisition_degraded_marks_and_clears_without_changing_payload() {
+        let path = database_path("active-thread-degraded-transition");
+        let identity = partition_identity('e', 1);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let snapshot = ActiveThreadSnapshot {
+            observed_at: 1_800_000_060,
+            threads: vec![active_thread("retained", 1_800_000_000)],
+        };
+        store.commit_active_thread_snapshot(&snapshot).unwrap();
+        let before: String = store
+            .connection
+            .query_row(
+                "SELECT threads_json FROM active_thread_snapshot WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .commit_active_thread_snapshot_with_health(&snapshot, true)
+                .unwrap(),
+            2
+        );
+        assert_eq!(store.mark_acquisition_degraded().unwrap(), 2);
+        let degraded: (String, i64) = store
+            .connection
+            .query_row(
+                "SELECT threads_json, acquisition_degraded
+                 FROM active_thread_snapshot WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(degraded.0, before);
+        assert_eq!(degraded.1, 1);
+        assert_eq!(store.clear_acquisition_degraded().unwrap(), 3);
+        assert_eq!(store.clear_acquisition_degraded().unwrap(), 3);
+        let recovered: (String, i64) = store
+            .connection
+            .query_row(
+                "SELECT threads_json, acquisition_degraded
+                 FROM active_thread_snapshot WHERE singleton=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(recovered.0, before);
+        assert_eq!(recovered.1, 0);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn active_thread_snapshot_invalid_migration_preserves_existing_table_and_row() {
+        let path = database_path("active-thread-migration-invalid");
+        let identity = partition_identity('c', 1);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let snapshot = ActiveThreadSnapshot {
+            observed_at: 1_800_000_060,
+            threads: vec![active_thread("migration-row", 1_800_000_000)],
+        };
+        store.commit_active_thread_snapshot(&snapshot).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE active_thread_snapshot RENAME TO active_thread_snapshot_old;
+                 CREATE TABLE active_thread_snapshot(
+                     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                     observed_at INTEGER NOT NULL CHECK(observed_at>0),
+                     threads_json TEXT NOT NULL,
+                     acquisition_degraded INTEGER NOT NULL DEFAULT 0
+                         CHECK(acquisition_degraded IN (0,1)),
+                     unexpected TEXT NOT NULL
+                 );
+                 INSERT INTO active_thread_snapshot(
+                     singleton, observed_at, threads_json, acquisition_degraded, unexpected
+                 ) SELECT singleton, observed_at, threads_json, acquisition_degraded, 'keep-me'
+                   FROM active_thread_snapshot_old;
+                 DROP TABLE active_thread_snapshot_old;
+                 PRAGMA user_version = 6;",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(UsageStore::open_partitioned(&path, &identity).is_err());
+        let retained = Connection::open(&path).unwrap();
+        let unexpected: String = retained
+            .query_row(
+                "SELECT unexpected FROM active_thread_snapshot WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let json: String = retained
+            .query_row(
+                "SELECT threads_json FROM active_thread_snapshot WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unexpected, "keep-me");
+        assert!(json.contains("migration-row"));
+        remove_database(&path);
     }
 
     fn recorded_source(relative_path: &str, inode: u64) -> RecordedSessionSource {
