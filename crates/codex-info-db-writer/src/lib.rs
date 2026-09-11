@@ -3760,6 +3760,7 @@ fn canonicalize_samples(
     transaction: &rusqlite::Transaction<'_>,
     samples: &[UsageHistorySample],
     preserve_existing: bool,
+    preserve_existing_before: Option<i64>,
 ) -> Result<Vec<UsageHistorySample>> {
     let mut grouped = std::collections::BTreeMap::<(i64, i64), Vec<UsageHistorySample>>::new();
     for sample in samples {
@@ -3790,7 +3791,13 @@ fn canonicalize_samples(
             })
             .optional()?;
         canonical.push(match existing {
-            Some(existing) if preserve_existing => existing,
+            Some(existing)
+                if preserve_existing
+                    || preserve_existing_before
+                        .is_some_and(|cutoff| incoming.timestamp < cutoff) =>
+            {
+                existing
+            }
             Some(existing) => reconcile_existing_sample(existing, incoming)?,
             None => incoming,
         });
@@ -7384,10 +7391,10 @@ impl UsageStore {
             .filter(|sample| sample.timestamp < continuity.boundary_timestamp)
             .cloned()
             .collect::<Vec<_>>();
-        let historical = canonicalize_samples(&transaction, &historical, false)?;
+        let historical = canonicalize_samples(&transaction, &historical, false, None)?;
         upsert_canonical_samples(&transaction, &historical, false)?;
         let adjusted_current = apply_history_continuity(&transaction, &current_samples)?;
-        let adjusted_current = canonicalize_samples(&transaction, &adjusted_current, false)?;
+        let adjusted_current = canonicalize_samples(&transaction, &adjusted_current, false, None)?;
         upsert_canonical_samples(&transaction, &adjusted_current, false)?;
         let generation: String = transaction.query_row(
             "SELECT data_generation FROM collection_generation WHERE singleton=1",
@@ -7414,7 +7421,7 @@ impl UsageStore {
         let transaction =
             rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let adjusted = apply_history_continuity(&transaction, std::slice::from_ref(sample))?;
-        let canonical = canonicalize_samples(&transaction, &adjusted, false)?;
+        let canonical = canonicalize_samples(&transaction, &adjusted, false, None)?;
         upsert_canonical_samples(&transaction, &canonical, false)?;
         transaction.commit()?;
         Ok(())
@@ -7441,7 +7448,7 @@ impl UsageStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let adjusted = apply_history_continuity(&transaction, samples)?;
-        let canonical = canonicalize_samples(&transaction, &adjusted, false)?;
+        let canonical = canonicalize_samples(&transaction, &adjusted, false, None)?;
         upsert_canonical_samples(&transaction, &canonical, false)?;
         replace_recorded_session_markers(&transaction, &sources)?;
         for source in &sources {
@@ -8691,14 +8698,36 @@ impl UsageStore {
             }
         }
 
+        // A timeline recovery is an immutable correction for the historical
+        // prefix ending at `projection_end_exclusive`. Later recorder cycles
+        // may replay the same Session events while materializing minutes that
+        // were absent during the outage. Existing raw rows in that proven
+        // prefix remain the original evidence; only previously absent minutes
+        // may be inserted. Current and future minutes still use the ordinary
+        // reconciliation path.
+        let preserve_existing_before = self
+            .load_session_timeline_recoveries()?
+            .into_iter()
+            .map(|(recovery, _, _)| recovery.projection_end_exclusive)
+            .chain(
+                timeline_recovery
+                    .iter()
+                    .map(|recovery| recovery.projection_end_exclusive),
+            )
+            .max();
+
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let adjusted_samples = apply_history_continuity(&transaction, samples)?;
         let preserve_existing_history =
             cumulative_recovery.is_some() || timeline_recovery.is_some();
-        let canonical_samples =
-            canonicalize_samples(&transaction, &adjusted_samples, preserve_existing_history)?;
+        let canonical_samples = canonicalize_samples(
+            &transaction,
+            &adjusted_samples,
+            cumulative_recovery.is_some(),
+            preserve_existing_before,
+        )?;
         let canonical_observations =
             canonicalize_observations(&transaction, observations, &canonical_samples)?;
         let current_generation: (String, i64, i64, Option<String>, String) = transaction
@@ -9448,7 +9477,7 @@ impl UsageStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let canonical = canonicalize_samples(&transaction, samples, false)?;
+        let canonical = canonicalize_samples(&transaction, samples, false, None)?;
         validate_data_hash(data_hash)?;
         validate_snapshot_json(snapshot_json)?;
         let current_raw: Option<(i64, String, String)> = transaction
@@ -11970,7 +11999,8 @@ mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
         let canonical_samples =
-            canonicalize_samples(&transaction, std::slice::from_ref(&smaller), false).unwrap();
+            canonicalize_samples(&transaction, std::slice::from_ref(&smaller), false, None)
+                .unwrap();
         let canonical_observations = canonicalize_observations(
             &transaction,
             std::slice::from_ref(&UsageHistoryObservation::confirmed(&smaller)),
@@ -11983,6 +12013,43 @@ mod tests {
             ModelSource::LegacyUnknown
         );
         assert_eq!(canonical_observations[0].sol_dollars, Some(9.5));
+        drop(transaction);
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn recovered_prefix_keeps_existing_non_comparable_row_without_blocking_append() {
+        let path = database_path("recovered-prefix-preserves-existing");
+        let timestamp = 1_700_000_060;
+        let reset_at = 1_700_604_800;
+        let existing = sample(timestamp, reset_at, Some(75.0), 10.0);
+        let mut replayed = sample(timestamp, reset_at, None, 1.0);
+        replayed.luna_dollars = 4.0;
+
+        let mut store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&existing).unwrap();
+        let transaction = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        let preserved = canonicalize_samples(
+            &transaction,
+            std::slice::from_ref(&replayed),
+            false,
+            Some(timestamp + 60),
+        )
+        .unwrap();
+        assert_eq!(preserved, vec![existing]);
+        assert!(canonicalize_samples(
+            &transaction,
+            std::slice::from_ref(&replayed),
+            false,
+            Some(timestamp),
+        )
+        .is_err());
+
         drop(transaction);
         drop(store);
         remove_database(&path);

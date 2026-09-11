@@ -706,7 +706,6 @@ fn read_active_rollout(
         .map_err(|_| "active rollout stat failed".to_owned())?;
     if !same_file_identity(&before_path, &before_file)
         || !same_file_identity(&before_file, expected_metadata)
-        || before_file.len() > security::MAX_SESSION_FILE_BYTES
     {
         return Err("active rollout identity rejected".to_owned());
     }
@@ -5078,6 +5077,52 @@ mod tests {
         assert!(snapshot.is_running());
         assert_eq!(snapshot.model(), "gpt-5.6-sol");
         assert_eq!(snapshot.model_label(), "gpt-5.6-sol");
+        assert_eq!(snapshot.total_tokens(), Some(43));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_rollout_reads_bounded_append_after_large_committed_prefix() {
+        let root = temp_root("active-thread-large-prefix");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("large.jsonl");
+        let committed_offset = security::MAX_SESSION_FILE_BYTES + 1;
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(committed_offset).unwrap();
+        drop(file);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(token(43, Utc::now().timestamp()).as_bytes())
+            .unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let root_metadata = fs::metadata(&sessions).unwrap();
+        let checkpoint = SessionCheckpoint {
+            root_identity: root_identity(&sessions, &root_metadata),
+            relative_path: "large.jsonl".to_owned(),
+            file_device: file_device(&metadata),
+            file_inode: file_inode(&metadata),
+            committed_offset,
+            discard_until_lf: false,
+            collector_epoch: 7,
+            cycle_seq: 3,
+            prefix_generation: 9,
+            prefix_sha256: EMPTY_SHA256.to_owned(),
+            fully_attributed_from_zero: true,
+            token_baseline_known: true,
+            last_model: Some("gpt-5.6-sol".to_owned()),
+            last_task_running: Some(true),
+            previous_total: 42,
+            previous_input: 40,
+            previous_cached_input: 0,
+            previous_output: 2,
+            previous_cache_write_input: Some(0),
+        };
+
+        let snapshot = read_active_rollout(&sessions, &path, &metadata, &checkpoint).unwrap();
+        assert!(snapshot.is_running());
         assert_eq!(snapshot.total_tokens(), Some(43));
         let _ = fs::remove_dir_all(root);
     }

@@ -16,7 +16,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,7 @@ const MOVING_RESET_MIN_HORIZON_SECONDS: i64 = 86_400;
 const MAX_ACTIVE_THREADS: usize = 256;
 const MAX_ACTIVE_THREAD_JSON_BYTES: usize = 1024 * 1024;
 const MAX_PUBLIC_UNIX_SECONDS: i64 = 253_402_300_799;
+const MAX_SESSION_TIMELINE_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
 // These are the distribution's established local estimate rates.  Keep the
 // REST projection numerically identical to the root UI: durable history
 // dollars are cumulative totals, while the public model fields are split into
@@ -212,8 +213,9 @@ impl DbReader {
         let has_pending_ranges = read_pending_ranges(&transaction)? || acquisition_degraded;
         let raw = read_history(&transaction)?;
         let generation = read_generation(&transaction, raw.iter().map(|row| row.timestamp))?;
+        let timeline_recoveries = read_session_timeline_recoveries(&transaction, generation)?;
         let (details, models_v3, history_samples_v2, history_samples_v3) =
-            build_details(&transaction, &raw, &threads)?;
+            build_details(&transaction, &raw, &threads, &timeline_recoveries)?;
         details.validate()?;
         let mut hasher = Sha256::new();
         hasher.update(generation.to_be_bytes());
@@ -758,6 +760,7 @@ fn build_details(
     connection: &Connection,
     raw: &[RawSample],
     threads: &[PublicThread],
+    timeline_recoveries: &[StoredTimelineRecovery],
 ) -> Result<DetailsBuild, ReaderError> {
     if raw.is_empty() {
         let details = PublicDetails {
@@ -798,8 +801,14 @@ fn build_details(
         .filter(|quota| quota.window_seconds > 0);
     let model_projection = read_model_projection(connection)?;
     let models = model_projection.v1;
-    let history_samples_v3 =
-        read_history_projection(connection, &samples, &mut periods, observed_at, cutoff)?;
+    let history_samples_v3 = read_history_projection(
+        connection,
+        &samples,
+        &mut periods,
+        observed_at,
+        cutoff,
+        timeline_recoveries,
+    )?;
     let history_samples_v2 = history_observations_v2(&samples, &history_samples_v3);
     let estimated_cost_label = format_estimated_cost(&models);
     let mut gaps = read_confirmed_gaps(connection)?
@@ -883,6 +892,62 @@ struct StoredHistoryObservation {
     model_source: HistoryModelSource,
 }
 
+type TimelineModelPayload = (String, u64, u64, u64, u64, Option<u64>);
+type TimelineDollarPayload = (f64, f64, f64);
+type TimelineRangePayload = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+type TimelinePointPayload = (i64, Vec<TimelineModelPayload>, TimelineDollarPayload);
+type TimelineRecoveryPayload = (
+    String,
+    i64,
+    i64,
+    u64,
+    i64,
+    Vec<TimelineModelPayload>,
+    Vec<TimelineRangePayload>,
+    Vec<TimelinePointPayload>,
+    Vec<TimelineModelPayload>,
+    TimelineDollarPayload,
+);
+
+#[derive(Clone, Debug)]
+struct StoredTimelinePoint {
+    timestamp: i64,
+    offset_model_totals: Vec<RawModelTotal>,
+}
+
+#[derive(Clone, Debug)]
+struct StoredTimelineRecovery {
+    recovery_id: String,
+    applied_generation: u64,
+    canonical_reset_at: i64,
+    window_seconds: i64,
+    projection_end_exclusive: i64,
+    source_model_totals: Vec<RawModelTotal>,
+    points: Vec<StoredTimelinePoint>,
+}
+
+#[derive(Clone, Debug)]
+struct TimelineProjectionPoint {
+    recovery_id: String,
+    applied_generation: u64,
+    canonical_reset_at: i64,
+    window_seconds: i64,
+    source_model_totals: Vec<RawModelTotal>,
+    timestamp: i64,
+    offset_model_totals: Vec<RawModelTotal>,
+}
+
 #[derive(Clone, Debug)]
 struct HistoryModelGroup {
     totals: BTreeMap<String, RawModelTotal>,
@@ -908,6 +973,440 @@ impl HistoryModelGroup {
     }
 }
 
+/// Read the writer's immutable Session timeline-recovery payload without
+/// depending on any writer crate type.  A malformed recovery is local to its
+/// row: the legacy history remains the durable source of truth and can still
+/// be published while the next generation repairs or replaces the payload.
+fn read_session_timeline_recoveries(
+    connection: &Connection,
+    generation: u64,
+) -> Result<Vec<StoredTimelineRecovery>, ReaderError> {
+    if !table_exists(connection, "session_timeline_recoveries")? {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection.prepare(
+        "SELECT recovery_id, payload_json, applied_generation
+         FROM session_timeline_recoveries ORDER BY applied_generation, recovery_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut recoveries = Vec::new();
+    while let Some(row) = rows.next()? {
+        let Some(recovery_id) = sql_text(row, 0) else {
+            continue;
+        };
+        let Some(payload_json) = sql_text(row, 1) else {
+            continue;
+        };
+        let Some(applied_generation) = sql_text(row, 2).and_then(|value| value.parse().ok()) else {
+            continue;
+        };
+        if applied_generation == 0 || applied_generation > generation {
+            continue;
+        }
+        if let Some(recovery) =
+            parse_session_timeline_recovery(&recovery_id, &payload_json, applied_generation)
+        {
+            recoveries.push(recovery);
+        }
+    }
+    recoveries.sort_by(|left, right| {
+        left.applied_generation
+            .cmp(&right.applied_generation)
+            .then_with(|| left.recovery_id.cmp(&right.recovery_id))
+    });
+    Ok(recoveries)
+}
+
+fn parse_session_timeline_recovery(
+    recovery_id: &str,
+    payload_json: &str,
+    applied_generation: u64,
+) -> Option<StoredTimelineRecovery> {
+    if payload_json.is_empty()
+        || payload_json.len() > MAX_SESSION_TIMELINE_RECOVERY_BYTES
+        || !valid_lower_hex(recovery_id, 64)
+        || hex_lower(Sha256::digest(payload_json.as_bytes()).as_ref()) != recovery_id
+    {
+        return None;
+    }
+    let (
+        partition_id,
+        canonical_reset_at,
+        window_seconds,
+        source_data_generation,
+        projection_end_exclusive,
+        source_rows,
+        range_rows,
+        point_rows,
+        final_offset_rows,
+        final_offset_dollars,
+    ): TimelineRecoveryPayload = serde_json::from_str(payload_json).ok()?;
+    if !valid_lower_hex(&partition_id, 64)
+        || canonical_reset_at <= 0
+        || window_seconds <= 0
+        || source_data_generation == 0
+        || source_data_generation.checked_add(1) != Some(applied_generation)
+        || projection_end_exclusive <= 0
+        || projection_end_exclusive > canonical_reset_at
+        || range_rows.is_empty()
+        || range_rows.iter().any(|range| !valid_timeline_range(range))
+    {
+        return None;
+    }
+    let period_start = canonical_reset_at.checked_sub(window_seconds)?;
+    let minimum_point_timestamp = period_start.checked_div_euclid(60)?.checked_mul(60)?;
+    let source_model_totals = parse_timeline_model_totals(source_rows)?;
+    let final_offset_model_totals = parse_timeline_model_totals(final_offset_rows)?;
+    if final_offset_model_totals.is_empty()
+        || !timeline_model_totals_have_usage(&final_offset_model_totals)
+        || checked_add_timeline_model_totals(&source_model_totals, &final_offset_model_totals)
+            .is_none()
+        || [
+            final_offset_dollars.0,
+            final_offset_dollars.1,
+            final_offset_dollars.2,
+        ]
+        .into_iter()
+        .any(|value| !value.is_finite() || value < 0.0)
+    {
+        return None;
+    }
+    let maximum_points = window_seconds
+        .div_euclid(60)
+        .checked_add(2)
+        .and_then(|value| usize::try_from(value).ok())?;
+    if point_rows.is_empty() || point_rows.len() > maximum_points {
+        return None;
+    }
+    let mut points = Vec::with_capacity(point_rows.len());
+    let mut previous_timestamp = None;
+    let mut previous_totals: Option<Vec<RawModelTotal>> = None;
+    let mut previous_dollars = (0.0, 0.0, 0.0);
+    for (timestamp, rows, dollars) in point_rows {
+        let offset_model_totals = parse_timeline_model_totals(rows)?;
+        if !valid_public_timestamp(timestamp)
+            || timestamp.rem_euclid(60) != 0
+            || timestamp < minimum_point_timestamp
+            || timestamp >= projection_end_exclusive
+            || previous_timestamp.is_some_and(|previous| timestamp <= previous)
+            || offset_model_totals.is_empty()
+            || !timeline_model_totals_have_usage(&offset_model_totals)
+            || previous_totals.as_ref().is_some_and(|previous| {
+                !timeline_model_totals_dominate(&offset_model_totals, previous)
+            })
+            || [dollars.0, dollars.1, dollars.2]
+                .into_iter()
+                .any(|value| !value.is_finite() || value < 0.0)
+            || dollars.0 < previous_dollars.0
+            || dollars.1 < previous_dollars.1
+            || dollars.2 < previous_dollars.2
+        {
+            return None;
+        }
+        previous_timestamp = Some(timestamp);
+        previous_totals = Some(offset_model_totals.clone());
+        previous_dollars = dollars;
+        points.push(StoredTimelinePoint {
+            timestamp,
+            offset_model_totals,
+        });
+    }
+    let last_totals = &points.last()?.offset_model_totals;
+    if !timeline_model_totals_dominate(&final_offset_model_totals, last_totals) {
+        return None;
+    }
+    Some(StoredTimelineRecovery {
+        recovery_id: recovery_id.to_owned(),
+        applied_generation,
+        canonical_reset_at,
+        window_seconds,
+        projection_end_exclusive,
+        source_model_totals,
+        points,
+    })
+}
+
+fn valid_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn canonical_timeline_u64(value: &str) -> Option<u64> {
+    let parsed = value.parse::<u64>().ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
+
+fn canonical_timeline_u128_hex(value: &str) -> Option<u128> {
+    if !valid_lower_hex(value, 32) {
+        return None;
+    }
+    let parsed = u128::from_str_radix(value, 16).ok()?;
+    (parsed != 0 && format!("{parsed:032x}") == value).then_some(parsed)
+}
+
+fn valid_timeline_range(range: &TimelineRangePayload) -> bool {
+    let (
+        root_identity,
+        relative_path,
+        file_device,
+        file_inode,
+        start_offset,
+        end_offset,
+        collector_epoch,
+        cycle_seq,
+        prefix_generation,
+        record_sha256,
+    ) = range;
+    if root_identity.is_empty()
+        || root_identity.len() > 1024
+        || !root_identity.is_ascii()
+        || relative_path.is_empty()
+        || relative_path.len() > 4096
+        || Path::new(relative_path).is_absolute()
+        || Path::new(relative_path)
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        || !valid_lower_hex(record_sha256, 64)
+    {
+        return false;
+    }
+    let Some(file_device) = canonical_timeline_u64(file_device) else {
+        return false;
+    };
+    let Some(file_inode) = canonical_timeline_u64(file_inode) else {
+        return false;
+    };
+    let Some(start_offset) = canonical_timeline_u64(start_offset) else {
+        return false;
+    };
+    let Some(end_offset) = canonical_timeline_u64(end_offset) else {
+        return false;
+    };
+    let Some(collector_epoch) = canonical_timeline_u128_hex(collector_epoch) else {
+        return false;
+    };
+    let Some(cycle_seq) = canonical_timeline_u64(cycle_seq) else {
+        return false;
+    };
+    let Some(prefix_generation) = canonical_timeline_u128_hex(prefix_generation) else {
+        return false;
+    };
+    let _ = (file_device, file_inode, collector_epoch, prefix_generation);
+    start_offset < end_offset && cycle_seq != 0
+}
+
+fn parse_timeline_model_totals(values: Vec<TimelineModelPayload>) -> Option<Vec<RawModelTotal>> {
+    if values.len() > MAX_PUBLIC_MODELS_V3 {
+        return None;
+    }
+    let mut totals = BTreeMap::new();
+    for (
+        model,
+        total_tokens,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        cache_write_input_tokens,
+    ) in values
+    {
+        if !is_valid_public_model_name(&model)
+            || cached_input_tokens > input_tokens
+            || cache_write_input_tokens.is_some_and(|writes| {
+                cached_input_tokens
+                    .checked_add(writes)
+                    .is_none_or(|discounted| discounted > input_tokens)
+            })
+            || totals.contains_key(&model)
+        {
+            return None;
+        }
+        totals.insert(
+            model.clone(),
+            RawModelTotal {
+                model,
+                total_tokens,
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                cache_write_input_tokens,
+            },
+        );
+    }
+    Some(totals.into_values().collect())
+}
+
+fn timeline_model_totals_have_usage(totals: &[RawModelTotal]) -> bool {
+    totals.iter().any(|total| {
+        total.total_tokens > 0
+            || total.input_tokens > 0
+            || total.cached_input_tokens > 0
+            || total.output_tokens > 0
+            || total
+                .cache_write_input_tokens
+                .is_some_and(|value| value > 0)
+    })
+}
+
+fn timeline_model_totals_dominate(left: &[RawModelTotal], right: &[RawModelTotal]) -> bool {
+    let left = left
+        .iter()
+        .map(|total| (total.model.as_str(), total))
+        .collect::<BTreeMap<_, _>>();
+    right.iter().all(|required| {
+        left.get(required.model.as_str()).is_some_and(|candidate| {
+            candidate.total_tokens >= required.total_tokens
+                && candidate.input_tokens >= required.input_tokens
+                && candidate.cached_input_tokens >= required.cached_input_tokens
+                && candidate.output_tokens >= required.output_tokens
+                && match (
+                    candidate.cache_write_input_tokens,
+                    required.cache_write_input_tokens,
+                ) {
+                    (Some(candidate), Some(required)) => candidate >= required,
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                }
+        })
+    })
+}
+
+fn checked_add_timeline_model_totals(
+    left: &[RawModelTotal],
+    right: &[RawModelTotal],
+) -> Option<Vec<RawModelTotal>> {
+    let mut combined = left
+        .iter()
+        .cloned()
+        .map(|total| (total.model.clone(), total))
+        .collect::<BTreeMap<_, _>>();
+    for offset in right {
+        let total = combined
+            .entry(offset.model.clone())
+            .or_insert_with(|| RawModelTotal {
+                model: offset.model.clone(),
+                total_tokens: 0,
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+            });
+        total.total_tokens = total.total_tokens.checked_add(offset.total_tokens)?;
+        total.input_tokens = total.input_tokens.checked_add(offset.input_tokens)?;
+        total.cached_input_tokens = total
+            .cached_input_tokens
+            .checked_add(offset.cached_input_tokens)?;
+        total.output_tokens = total.output_tokens.checked_add(offset.output_tokens)?;
+        total.cache_write_input_tokens = match (
+            total.cache_write_input_tokens,
+            offset.cache_write_input_tokens,
+        ) {
+            (Some(left), Some(right)) => Some(left.checked_add(right)?),
+            _ => None,
+        };
+    }
+    let values = combined.into_values().collect::<Vec<_>>();
+    values
+        .iter()
+        .all(|total| {
+            total.cached_input_tokens <= total.input_tokens
+                && total.cache_write_input_tokens.is_none_or(|writes| {
+                    total
+                        .cached_input_tokens
+                        .checked_add(writes)
+                        .is_some_and(|discounted| discounted <= total.input_tokens)
+                })
+        })
+        .then_some(values)
+}
+
+fn flatten_timeline_points(
+    recoveries: &[StoredTimelineRecovery],
+) -> BTreeMap<(i64, i64), TimelineProjectionPoint> {
+    let mut points = BTreeMap::<(i64, i64), TimelineProjectionPoint>::new();
+    for recovery in recoveries {
+        for point in &recovery.points {
+            let key = (recovery.canonical_reset_at, point.timestamp);
+            let candidate = TimelineProjectionPoint {
+                recovery_id: recovery.recovery_id.clone(),
+                applied_generation: recovery.applied_generation,
+                canonical_reset_at: recovery.canonical_reset_at,
+                window_seconds: recovery.window_seconds,
+                source_model_totals: recovery.source_model_totals.clone(),
+                timestamp: point.timestamp,
+                offset_model_totals: point.offset_model_totals.clone(),
+            };
+            let replace = points.get(&key).is_none_or(|existing| {
+                (candidate.applied_generation, candidate.recovery_id.as_str())
+                    > (existing.applied_generation, existing.recovery_id.as_str())
+            });
+            if replace {
+                points.insert(key, candidate);
+            }
+        }
+    }
+    points
+}
+
+fn timeline_period_index(
+    periods: &[PublicHistoryPeriod],
+    reset_at: i64,
+    timestamp: i64,
+) -> Option<usize> {
+    periods
+        .iter()
+        .enumerate()
+        .filter(|(_, period)| {
+            reset_at.abs_diff(period.reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
+                && timestamp >= period.start_at
+                && timestamp <= period.end_at
+        })
+        .min_by_key(|(_, period)| reset_at.abs_diff(period.reset_at))
+        .map(|(index, _)| index)
+}
+
+fn timeline_recovery_covers_timestamp(
+    recovery: &StoredTimelineRecovery,
+    reset_at: i64,
+    timestamp: i64,
+) -> bool {
+    let Some(first) = recovery.points.first() else {
+        return false;
+    };
+    if reset_at.abs_diff(recovery.canonical_reset_at) > RESET_AT_TOLERANCE_SECONDS as u64
+        || timestamp < first.timestamp
+    {
+        return false;
+    }
+    timestamp < recovery.projection_end_exclusive
+        || timestamp.div_euclid(60) * 60 == recovery.projection_end_exclusive.div_euclid(60) * 60
+}
+
+fn timeline_history_models_v3(
+    source_model_totals: &[RawModelTotal],
+    offset_model_totals: &[RawModelTotal],
+) -> Option<Vec<PublicHistoryModelUsageV3>> {
+    let totals = checked_add_timeline_model_totals(source_model_totals, offset_model_totals)?;
+    (!totals.is_empty()).then(|| {
+        totals
+            .into_iter()
+            .map(|total| PublicHistoryModelUsageV3 {
+                model: total.model,
+                total_tokens: total.total_tokens,
+                input_tokens: Some(total.input_tokens),
+                cached_input_tokens: Some(total.cached_input_tokens),
+                cache_write_input_tokens: total.cache_write_input_tokens,
+                output_tokens: Some(total.output_tokens),
+                // Timeline payloads carry cumulative dollar offsets, but not
+                // the source dollar baseline.  Keep this nullable rather than
+                // exposing a delta as a measured cumulative total.
+                total_dollars: None,
+            })
+            .collect()
+    })
+}
+
 /// Build the v3 graph rows from the durable observation JSON and model-history
 /// sidecar.  The legacy `usage_history` row remains the v1 source of truth for
 /// period ownership and the three displayed dollar columns; sidecar faults
@@ -918,9 +1417,11 @@ fn read_history_projection(
     periods: &mut [PublicHistoryPeriod],
     observed_at: i64,
     cutoff: i64,
+    timeline_recoveries: &[StoredTimelineRecovery],
 ) -> Result<Vec<PublicHistoryObservationV3>, ReaderError> {
     let observations = read_stored_history_observations(connection, cutoff, observed_at)?;
     let model_groups = read_history_model_groups(connection, cutoff, observed_at)?;
+    let timeline_points = flatten_timeline_points(timeline_recoveries);
     let mut observations_by_timestamp = BTreeMap::<i64, Vec<&StoredHistoryObservation>>::new();
     for observation in &observations {
         observations_by_timestamp
@@ -951,6 +1452,48 @@ fn read_history_projection(
         }) {
             period.start_at = period.start_at.min(observation.timestamp);
         }
+    }
+
+    // Timeline points are valid Session-derived minutes even when no
+    // usage_history row was materialized for that minute. Extend only the
+    // already known reset period and never cross the next proven period
+    // boundary; an older recovery can outlive its quota cycle in raw storage.
+    let maximum_period_ends = periods
+        .iter()
+        .map(|period| {
+            let next_start = periods
+                .iter()
+                .filter(|candidate| candidate.start_at > period.start_at)
+                .map(|candidate| candidate.start_at)
+                .min();
+            next_start
+                .map(|start| start.saturating_sub(60))
+                .unwrap_or(period.end_at)
+                .min(period.reset_at)
+                .min(observed_at)
+        })
+        .collect::<Vec<_>>();
+    for point in timeline_points.values() {
+        let Some(period_start) = point.canonical_reset_at.checked_sub(point.window_seconds) else {
+            continue;
+        };
+        let Some((period_index, period)) = periods
+            .iter_mut()
+            .enumerate()
+            .filter(|(index, period)| {
+                point.canonical_reset_at.abs_diff(period.reset_at)
+                    <= RESET_AT_TOLERANCE_SECONDS as u64
+                    && point.timestamp >= period_start
+                    && point.timestamp <= maximum_period_ends[*index]
+            })
+            .min_by_key(|(_, period)| point.canonical_reset_at.abs_diff(period.reset_at))
+        else {
+            continue;
+        };
+        period.start_at = period.start_at.min(point.timestamp);
+        period.end_at = period
+            .end_at
+            .max(point.timestamp.min(maximum_period_ends[period_index]));
     }
 
     let mut history = BTreeMap::<(i64, i64), PublicHistoryObservationV3>::new();
@@ -994,7 +1537,12 @@ fn read_history_projection(
             .unwrap_or(HistoryModelSource::LegacyUnknown);
         let models_complete = group.is_some_and(HistoryModelGroup::model_set_complete);
         let models = history_models_v3(group, sample, models_complete);
-        let source = if model_source == HistoryModelSource::Unavailable {
+        let timeline_reconstructed = timeline_recoveries.iter().any(|recovery| {
+            timeline_recovery_covers_timestamp(recovery, sample.reset_at, sample.timestamp)
+        });
+        let source = if timeline_reconstructed {
+            HistoryModelSource::ReconstructedFromSession
+        } else if model_source == HistoryModelSource::Unavailable {
             HistoryModelSource::Unavailable
         } else if model_source == HistoryModelSource::ReconstructedFromSession {
             HistoryModelSource::ReconstructedFromSession
@@ -1015,6 +1563,39 @@ fn read_history_projection(
                 models,
                 models_complete,
                 model_source: source.as_str().to_owned(),
+            },
+        );
+    }
+
+    // A recovery point is a reconstructed cumulative Session total.  Use the
+    // source model vector plus the point offset, never a raw quota or an
+    // estimated remaining percentage.  Existing raw rows win on timestamp so
+    // their measured values remain byte-for-byte represented in the v1 view.
+    for point in timeline_points.values() {
+        let Some(period_index) =
+            timeline_period_index(periods, point.canonical_reset_at, point.timestamp)
+        else {
+            continue;
+        };
+        let period = &periods[period_index];
+        let key = (period.reset_at, point.timestamp);
+        if history.contains_key(&key) {
+            continue;
+        }
+        let Some(models) =
+            timeline_history_models_v3(&point.source_model_totals, &point.offset_model_totals)
+        else {
+            continue;
+        };
+        history.insert(
+            key,
+            PublicHistoryObservationV3 {
+                timestamp: point.timestamp,
+                reset_at: period.reset_at,
+                remaining_percent: None,
+                models: Some(models),
+                models_complete: false,
+                model_source: "reconstructed-from-session".to_owned(),
             },
         );
     }
@@ -1046,7 +1627,99 @@ fn read_history_projection(
                 model_source: "unavailable".to_owned(),
             });
     }
+    suppress_regressing_history_models(&mut history);
+    assign_history_period_labels(periods);
     Ok(history.into_values().collect())
+}
+
+fn suppress_regressing_history_models(
+    history: &mut BTreeMap<(i64, i64), PublicHistoryObservationV3>,
+) {
+    let mut watermarks = BTreeMap::<(i64, String), PublicHistoryModelUsageV3>::new();
+    for ((reset_at, _), observation) in history.iter_mut() {
+        let Some(models) = observation.models.as_mut() else {
+            continue;
+        };
+        let mut suppressed = false;
+        models.retain(|candidate| {
+            let key = (*reset_at, candidate.model.clone());
+            if watermarks
+                .get(&key)
+                .is_some_and(|watermark| !history_model_dominates(candidate, watermark))
+            {
+                suppressed = true;
+                return false;
+            }
+            watermarks
+                .entry(key)
+                .and_modify(|watermark| advance_history_model_watermark(watermark, candidate))
+                .or_insert_with(|| candidate.clone());
+            true
+        });
+        if suppressed {
+            observation.models_complete = false;
+            if observation.model_source == "confirmed" {
+                observation.model_source = "legacy-unknown".to_owned();
+            }
+        }
+        if models.is_empty() {
+            observation.models = None;
+        }
+    }
+}
+
+fn history_model_dominates(
+    candidate: &PublicHistoryModelUsageV3,
+    watermark: &PublicHistoryModelUsageV3,
+) -> bool {
+    candidate.total_tokens >= watermark.total_tokens
+        && optional_u64_does_not_regress(candidate.input_tokens, watermark.input_tokens)
+        && optional_u64_does_not_regress(
+            candidate.cached_input_tokens,
+            watermark.cached_input_tokens,
+        )
+        && optional_u64_does_not_regress(
+            candidate.cache_write_input_tokens,
+            watermark.cache_write_input_tokens,
+        )
+        && optional_u64_does_not_regress(candidate.output_tokens, watermark.output_tokens)
+        && optional_f64_does_not_regress(candidate.total_dollars, watermark.total_dollars)
+}
+
+fn optional_u64_does_not_regress(candidate: Option<u64>, watermark: Option<u64>) -> bool {
+    match (candidate, watermark) {
+        (Some(candidate), Some(watermark)) => candidate >= watermark,
+        _ => true,
+    }
+}
+
+fn optional_f64_does_not_regress(candidate: Option<f64>, watermark: Option<f64>) -> bool {
+    match (candidate, watermark) {
+        (Some(candidate), Some(watermark)) => candidate >= watermark,
+        _ => true,
+    }
+}
+
+fn advance_history_model_watermark(
+    watermark: &mut PublicHistoryModelUsageV3,
+    candidate: &PublicHistoryModelUsageV3,
+) {
+    watermark.total_tokens = candidate.total_tokens;
+    if candidate.input_tokens.is_some() {
+        watermark.input_tokens = candidate.input_tokens;
+    }
+    if candidate.cached_input_tokens.is_some() {
+        watermark.cached_input_tokens = candidate.cached_input_tokens;
+    }
+    if candidate.cache_write_input_tokens.is_some() {
+        watermark.cache_write_input_tokens = candidate.cache_write_input_tokens;
+    }
+    if candidate.output_tokens.is_some() {
+        watermark.output_tokens = candidate.output_tokens;
+    }
+    if candidate.total_dollars.is_some() {
+        watermark.total_dollars = candidate.total_dollars;
+    }
 }
 
 fn history_observations_v2(
@@ -1446,11 +2119,12 @@ fn history_periods(
                 start_at,
                 end_at: end_at.max(start_at),
                 reset_at,
-                label: format!("reset-{reset_at}"),
+                label: String::new(),
                 current: is_current || Some(reset_at) == fallback_current,
             }
         })
         .collect::<Vec<_>>();
+    assign_history_period_labels(&mut periods);
     // The Windows client treats period order as part of the wire contract:
     // newest starts must precede older starts.  Keep reset/id as deterministic
     // tie-breakers for clipped or same-minute periods.
@@ -1462,6 +2136,80 @@ fn history_periods(
             .then_with(|| right.id.cmp(&left.id))
     });
     periods
+}
+
+fn assign_history_period_labels(periods: &mut [PublicHistoryPeriod]) {
+    for period in periods.iter_mut() {
+        period.label = format_jst_period_label(
+            period.start_at,
+            if period.current {
+                period.reset_at
+            } else {
+                period.end_at
+            },
+            period.current,
+        );
+    }
+    let base_labels = periods
+        .iter()
+        .map(|period| period.label.clone())
+        .collect::<Vec<_>>();
+    let mut label_counts = BTreeMap::<String, usize>::new();
+    for label in &base_labels {
+        *label_counts.entry(label.clone()).or_default() += 1;
+    }
+    for (index, period) in periods.iter_mut().enumerate() {
+        if label_counts
+            .get(&base_labels[index])
+            .is_some_and(|count| *count > 1)
+        {
+            let reset_label =
+                format_jst_timestamp(period.reset_at).unwrap_or_else(|| "時刻不明".to_owned());
+            period.label.push_str(&format!("（期限 {reset_label}）"));
+        }
+    }
+}
+
+fn format_jst_period_label(start_at: i64, end_at: i64, current: bool) -> String {
+    let Some(start) = format_jst_timestamp(start_at) else {
+        return "期間不明".to_owned();
+    };
+    let Some(end) = format_jst_timestamp(end_at) else {
+        return "期間不明".to_owned();
+    };
+    let current_suffix = if current { "（現在）" } else { "" };
+    format!("{start} ～ {end}{current_suffix}")
+}
+
+fn format_jst_timestamp(timestamp: i64) -> Option<String> {
+    let shifted = timestamp.checked_add(9 * 60 * 60)?;
+    let days = shifted.div_euclid(86_400);
+    let seconds = shifted.rem_euclid(86_400);
+    let (year, month, day) = civil_date_from_days(days);
+    let hour = seconds / 3_600;
+    let minute = seconds.rem_euclid(3_600) / 60;
+    let second = seconds.rem_euclid(60);
+    Some(format!(
+        "{year:04}/{month:02}/{day:02} {hour:02}:{minute:02}:{second:02} +09:00"
+    ))
+}
+
+// Proleptic Gregorian conversion for valid public Unix timestamps. JST is a
+// fixed +09:00 reference label shared by the split REST clients.
+fn civil_date_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
+    let z = days_since_unix_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524
+        - day_of_era / 146_096)
+        .div_euclid(365);
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_part = (5 * day_of_year + 2).div_euclid(153);
+    let day = day_of_year - (153 * month_part + 2).div_euclid(5) + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    let year = year + if month <= 2 { 1 } else { 0 };
+    (year, month, day)
 }
 
 fn latest_quota_row(rows: &[RawSample], current_reset_at: Option<i64>) -> Option<&RawSample> {
@@ -1529,7 +2277,8 @@ fn canonicalize_history(
                 belongs = Some(index);
                 break;
             }
-            if row.timestamp.saturating_sub(group.start) > MOVING_RESET_GROUP_MAX_DRIFT_SECONDS {
+            if row.timestamp.saturating_sub(anchor.timestamp) > MOVING_RESET_GROUP_MAX_DRIFT_SECONDS
+            {
                 break;
             }
         }
@@ -1545,6 +2294,48 @@ fn canonicalize_history(
             });
         }
     }
+
+    let mut exact_merged = Vec::<ResetGroup>::with_capacity(groups.len());
+    let mut exact_indexes = BTreeMap::<i64, usize>::new();
+    for mut group in groups {
+        if let Some(&index) = exact_indexes.get(&group.canonical_reset_at) {
+            let existing = &mut exact_merged[index];
+            existing.start = existing.start.min(group.start);
+            existing.rows.append(&mut group.rows);
+        } else {
+            exact_indexes.insert(group.canonical_reset_at, exact_merged.len());
+            exact_merged.push(group);
+        }
+    }
+    for group in &mut exact_merged {
+        group.rows.sort_by_key(|row| (row.timestamp, row.reset_at));
+    }
+    exact_merged.sort_by_key(|group| (group.start, group.canonical_reset_at));
+    let mut family_merged = Vec::<ResetGroup>::with_capacity(exact_merged.len());
+    for mut group in exact_merged {
+        let family_index = family_merged.iter().position(|existing| {
+            existing
+                .canonical_reset_at
+                .abs_diff(group.canonical_reset_at)
+                <= RESET_AT_TOLERANCE_SECONDS as u64
+        });
+        if let Some(index) = family_index {
+            let existing = &mut family_merged[index];
+            existing.canonical_reset_at = existing.canonical_reset_at.max(group.canonical_reset_at);
+            existing.start = existing.start.min(group.start);
+            existing.rows.append(&mut group.rows);
+            existing
+                .rows
+                .sort_by_key(|row| (row.timestamp, row.reset_at));
+        } else {
+            family_merged.push(group);
+        }
+    }
+    family_merged.sort_by_key(|group| (group.start, group.canonical_reset_at));
+    let mut groups = family_merged;
+    clip_stale_reset_group_tails(&mut groups);
+    groups.retain(|group| !group.rows.is_empty());
+    remove_shadowed_moving_reset_groups(&mut groups);
 
     // An authoritative reset aliases one group.  Retain only the observed
     // current window for that group; all older groups remain readable.
@@ -1576,6 +2367,55 @@ fn canonicalize_history(
         owners.sort_unstable();
         owners.dedup();
     }
+    let group_facts = groups
+        .iter()
+        .map(|group| {
+            (
+                group.rows.iter().any(|row| row.remaining_percent.is_some()),
+                group
+                    .rows
+                    .iter()
+                    .map(|row| row.timestamp)
+                    .max()
+                    .unwrap_or(group.start),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut boundary_minute_owners = BTreeMap::<i64, usize>::new();
+    let mut ambiguous_minutes = BTreeSet::<i64>::new();
+    for (minute, group_indexes) in minute_owners
+        .iter()
+        .filter(|(_, group_indexes)| group_indexes.len() > 1)
+    {
+        let quota_owners = group_indexes
+            .iter()
+            .copied()
+            .filter(|group_index| group_facts[*group_index].0)
+            .collect::<Vec<_>>();
+        if let [owner] = quota_owners.as_slice() {
+            boundary_minute_owners.insert(*minute, *owner);
+            continue;
+        }
+        let continuing = group_indexes
+            .iter()
+            .copied()
+            .filter(|group_index| {
+                let group = &groups[*group_index];
+                group.start == *minute && group_facts[*group_index].1.div_euclid(60) * 60 > *minute
+            })
+            .collect::<Vec<_>>();
+        let [owner] = continuing.as_slice() else {
+            ambiguous_minutes.insert(*minute);
+            continue;
+        };
+        if group_indexes.iter().copied().any(|group_index| {
+            group_index != *owner && group_facts[group_index].1.div_euclid(60) * 60 > *minute
+        }) {
+            ambiguous_minutes.insert(*minute);
+            continue;
+        }
+        boundary_minute_owners.insert(*minute, *owner);
+    }
 
     let mut canonical = Vec::new();
     for (group_index, group) in groups.into_iter().enumerate() {
@@ -1587,23 +2427,24 @@ fn canonicalize_history(
             {
                 continue;
             }
+            if ambiguous_minutes.contains(&minute)
+                || boundary_minute_owners
+                    .get(&minute)
+                    .is_some_and(|owner| *owner != group_index)
+            {
+                continue;
+            }
             by_minute.entry(minute).or_default().push(row);
         }
         for (minute, mut minute_rows) in by_minute {
-            let owners = minute_owners.get(&minute).map_or(0, Vec::len);
-            if owners > 1 {
-                // A quota value is the authority when reset aliases overlap.
-                // More than one distinct quota owner is ambiguous for only
-                // this minute; unrelated periods stay publishable.
-                let mut quota_values = Vec::new();
-                for value in minute_rows.iter().filter_map(|row| row.remaining_percent) {
-                    if !quota_values.contains(&value) {
-                        quota_values.push(value);
-                    }
+            let mut quota_values = Vec::new();
+            for value in minute_rows.iter().filter_map(|row| row.remaining_percent) {
+                if !quota_values.contains(&value) {
+                    quota_values.push(value);
                 }
-                if quota_values.len() > 1 {
-                    continue;
-                }
+            }
+            if quota_values.len() > 1 {
+                continue;
             }
             minute_rows.sort_by_key(|row| (row.timestamp, row.reset_at));
             let maximums = minute_rows.iter().fold(
@@ -1649,9 +2490,157 @@ fn canonicalize_history(
     Ok(canonical)
 }
 
+fn clip_stale_reset_group_tails(groups: &mut [ResetGroup]) {
+    let fixed_suffix_starts = groups
+        .iter()
+        .map(fixed_reset_transition_start)
+        .collect::<Vec<_>>();
+    let shadowed_moving = shadowed_moving_reset_groups(groups);
+    for candidate_index in 0..groups.len() {
+        if shadowed_moving[candidate_index] {
+            continue;
+        }
+        let Some(_fixed_suffix_start) = fixed_suffix_starts[candidate_index] else {
+            continue;
+        };
+        let candidate_reset = groups[candidate_index].canonical_reset_at;
+        // A rolling deadline followed by a stable reset confirms one quota
+        // cycle. Keep its complete observed prelude: the quota recovery at
+        // the first row is the public boundary, while the fixed suffix is
+        // confirmation rather than a later artificial boundary.
+        let transition_start = groups[candidate_index].start;
+        for prior in groups.iter_mut().take(candidate_index) {
+            if prior
+                .canonical_reset_at
+                .saturating_add(RESET_AT_TOLERANCE_SECONDS)
+                >= candidate_reset
+            {
+                continue;
+            }
+            prior.rows.retain(|row| row.timestamp < transition_start);
+        }
+    }
+    for group in groups {
+        if let Some(start) = group.rows.iter().map(|row| row.timestamp).min() {
+            group.start = start;
+        }
+    }
+}
+
+fn fixed_reset_transition_start(group: &ResetGroup) -> Option<i64> {
+    let mut previous = None::<&RawSample>;
+    for row in group.rows.iter().filter(|row| {
+        row.reset_at.abs_diff(group.canonical_reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64
+    }) {
+        if let Some(anchor) = previous {
+            let different_minute = anchor.timestamp.div_euclid(60) != row.timestamp.div_euclid(60);
+            let same_reset_family =
+                anchor.reset_at.abs_diff(row.reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64;
+            if different_minute
+                && same_reset_family
+                && (anchor.remaining_percent.is_some() || row.remaining_percent.is_some())
+                && !reset_coordinates_form_moving_step(
+                    anchor.timestamp,
+                    anchor.reset_at,
+                    row.timestamp,
+                    row.reset_at,
+                )
+            {
+                return Some(anchor.timestamp);
+            }
+        }
+        previous = Some(row);
+    }
+    None
+}
+
+fn remove_shadowed_moving_reset_groups(groups: &mut Vec<ResetGroup>) {
+    let shadowed = shadowed_moving_reset_groups(groups);
+    let mut index = 0;
+    groups.retain(|_| {
+        let keep = !shadowed[index];
+        index += 1;
+        keep
+    });
+}
+
+fn shadowed_moving_reset_groups(groups: &[ResetGroup]) -> Vec<bool> {
+    let mut shadowed = vec![false; groups.len()];
+    let mut prior_quota_max_end = None::<i64>;
+    let mut batch_start = 0;
+    while batch_start < groups.len() {
+        let start = groups[batch_start].start;
+        let mut batch_end = batch_start + 1;
+        while batch_end < groups.len() && groups[batch_end].start == start {
+            batch_end += 1;
+        }
+        for index in batch_start..batch_end {
+            let end = groups[index]
+                .rows
+                .iter()
+                .map(|row| row.timestamp)
+                .max()
+                .unwrap_or(groups[index].start);
+            let moving = groups[index].rows.windows(2).any(|pair| {
+                reset_coordinates_form_moving_step(
+                    pair[0].timestamp,
+                    pair[0].reset_at,
+                    pair[1].timestamp,
+                    pair[1].reset_at,
+                )
+            });
+            shadowed[index] = moving && prior_quota_max_end.is_some_and(|prior| prior > end);
+        }
+        for group in &groups[batch_start..batch_end] {
+            if group.rows.iter().any(|row| row.remaining_percent.is_some()) {
+                let end = group
+                    .rows
+                    .iter()
+                    .map(|row| row.timestamp)
+                    .max()
+                    .unwrap_or(group.start);
+                prior_quota_max_end = Some(prior_quota_max_end.map_or(end, |prior| prior.max(end)));
+            }
+        }
+        batch_start = batch_end;
+    }
+    shadowed
+}
+
+fn reset_coordinates_form_moving_step(
+    anchor_timestamp: i64,
+    anchor_reset_at: i64,
+    candidate_timestamp: i64,
+    candidate_reset_at: i64,
+) -> bool {
+    if candidate_timestamp <= anchor_timestamp || candidate_reset_at <= anchor_reset_at {
+        return false;
+    }
+    let timestamp_delta = candidate_timestamp - anchor_timestamp;
+    let reset_delta = candidate_reset_at - anchor_reset_at;
+    let anchor_horizon = anchor_reset_at.saturating_sub(anchor_timestamp);
+    let candidate_horizon = candidate_reset_at.saturating_sub(candidate_timestamp);
+    reset_delta <= MOVING_RESET_GROUP_MAX_DRIFT_SECONDS
+        && anchor_horizon >= MOVING_RESET_MIN_HORIZON_SECONDS
+        && candidate_horizon >= MOVING_RESET_MIN_HORIZON_SECONDS
+        && anchor_horizon.abs_diff(candidate_horizon) <= MOVING_RESET_STEP_TOLERANCE_SECONDS as u64
+        && reset_delta.abs_diff(timestamp_delta) <= MOVING_RESET_STEP_TOLERANCE_SECONDS as u64
+}
+
 fn reset_belongs_to_group(anchor: &RawSample, candidate: &RawSample) -> bool {
     if candidate.reset_at.abs_diff(anchor.reset_at) <= RESET_AT_TOLERANCE_SECONDS as u64 {
         return true;
+    }
+    if candidate.timestamp == anchor.timestamp {
+        return candidate.reset_at > anchor.reset_at
+            && candidate.reset_at - anchor.reset_at <= MOVING_RESET_GROUP_MAX_DRIFT_SECONDS
+            && quota_observations_agree(anchor, candidate)
+            && candidate.sol_dollars >= anchor.sol_dollars
+            && candidate.terra_dollars >= anchor.terra_dollars
+            && candidate.luna_dollars >= anchor.luna_dollars
+            && candidate.sol_tokens >= anchor.sol_tokens
+            && candidate.terra_tokens >= anchor.terra_tokens
+            && candidate.luna_tokens >= anchor.luna_tokens;
     }
     if candidate.timestamp <= anchor.timestamp || candidate.reset_at <= anchor.reset_at {
         return false;
@@ -1665,6 +2654,13 @@ fn reset_belongs_to_group(anchor: &RawSample, candidate: &RawSample) -> bool {
         && candidate_horizon >= MOVING_RESET_MIN_HORIZON_SECONDS
         && anchor_horizon.abs_diff(candidate_horizon) <= MOVING_RESET_STEP_TOLERANCE_SECONDS as u64
         && reset_delta.abs_diff(timestamp_delta) <= MOVING_RESET_STEP_TOLERANCE_SECONDS as u64
+}
+
+fn quota_observations_agree(anchor: &RawSample, candidate: &RawSample) -> bool {
+    match (anchor.remaining_percent, candidate.remaining_percent) {
+        (Some(anchor), Some(candidate)) => anchor == candidate,
+        _ => true,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2686,5 +3682,423 @@ mod tests {
             .iter()
             .all(|sample| { sample.reset_at == 1_800_000_604 }));
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn timeline_recovery_stays_in_its_reset_period_and_period_labels_are_jst() {
+        let current_reset = 1_789_623_591;
+        let past_reset = 1_789_300_253;
+        let recovery_reset = 1_789_437_492;
+        let current_samples = [1_789_018_800_i64, 1_789_018_860_i64]
+            .into_iter()
+            .map(|timestamp| PublicHistorySample {
+                timestamp,
+                reset_at: current_reset,
+                remaining_percent: Some(27.0),
+                sol_dollars: 1.0,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens: 10,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            });
+        let past_samples = [1_788_695_460_i64, 1_788_832_620_i64]
+            .into_iter()
+            .map(|timestamp| PublicHistorySample {
+                timestamp,
+                reset_at: past_reset,
+                remaining_percent: Some(20.0),
+                sol_dollars: 370.814975,
+                terra_dollars: 0.0,
+                luna_dollars: 1.40242084,
+                sol_tokens: 555_312_427,
+                terra_tokens: 0,
+                luna_tokens: 22_488_065,
+            });
+        let recovery_anchor = PublicHistorySample {
+            timestamp: 1_788_832_680,
+            reset_at: recovery_reset,
+            remaining_percent: None,
+            sol_dollars: 2.0,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 100,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        let samples = current_samples
+            .chain(past_samples)
+            .chain(std::iter::once(recovery_anchor))
+            .collect::<Vec<_>>();
+        let observed_at = 1_789_018_860;
+        let mut periods = history_periods(&samples, observed_at, Some(current_reset), 604_800);
+        let recovery = StoredTimelineRecovery {
+            recovery_id: "recovery".to_owned(),
+            applied_generation: 8,
+            canonical_reset_at: recovery_reset,
+            window_seconds: 604_800,
+            projection_end_exclusive: 1_789_018_860,
+            source_model_totals: vec![RawModelTotal {
+                model: "SOL".to_owned(),
+                total_tokens: 100,
+                input_tokens: 100,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                cache_write_input_tokens: Some(0),
+            }],
+            points: vec![
+                StoredTimelinePoint {
+                    timestamp: 1_788_832_740,
+                    offset_model_totals: vec![RawModelTotal {
+                        model: "SOL".to_owned(),
+                        total_tokens: 10,
+                        input_tokens: 10,
+                        cached_input_tokens: 0,
+                        output_tokens: 0,
+                        cache_write_input_tokens: Some(0),
+                    }],
+                },
+                StoredTimelinePoint {
+                    timestamp: 1_788_832_800,
+                    offset_model_totals: vec![RawModelTotal {
+                        model: "SOL".to_owned(),
+                        total_tokens: 20,
+                        input_tokens: 20,
+                        cached_input_tokens: 0,
+                        output_tokens: 0,
+                        cache_write_input_tokens: Some(0),
+                    }],
+                },
+                // This raw recovery outlived its quota cycle. It must not
+                // extend the old public period across the proven 14:40 reset.
+                StoredTimelinePoint {
+                    timestamp: 1_789_018_800,
+                    offset_model_totals: vec![RawModelTotal {
+                        model: "SOL".to_owned(),
+                        total_tokens: 30,
+                        input_tokens: 30,
+                        cached_input_tokens: 0,
+                        output_tokens: 0,
+                        cache_write_input_tokens: Some(0),
+                    }],
+                },
+            ],
+        };
+        let connection = Connection::open_in_memory().expect("reader fixture");
+        let history = read_history_projection(
+            &connection,
+            &samples,
+            &mut periods,
+            observed_at,
+            observed_at - HISTORY_WINDOW_SECONDS,
+            std::slice::from_ref(&recovery),
+        )
+        .expect("timeline projection");
+
+        assert!(history
+            .iter()
+            .filter(|sample| sample.reset_at == current_reset || sample.reset_at == past_reset)
+            .all(|sample| sample.model_source != "reconstructed-from-session"));
+        let recovered = history
+            .iter()
+            .filter(|sample| sample.reset_at == recovery_reset)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|sample| sample.timestamp)
+                .collect::<Vec<_>>(),
+            vec![1_788_832_680, 1_788_832_740, 1_788_832_800]
+        );
+        assert!(recovered[1..].iter().all(|sample| {
+            sample.model_source == "reconstructed-from-session"
+                && sample.remaining_percent.is_none()
+        }));
+        assert_eq!(
+            periods
+                .iter()
+                .find(|period| period.reset_at == recovery_reset)
+                .expect("recovery period")
+                .end_at,
+            1_788_832_800
+        );
+        assert_eq!(
+            periods
+                .iter()
+                .find(|period| period.reset_at == past_reset)
+                .expect("past period")
+                .label,
+            "2026/09/06 20:51:00 +09:00 ～ 2026/09/08 10:57:00 +09:00"
+        );
+    }
+
+    #[test]
+    fn retained_reset_tail_is_clipped_before_real_boundary_and_current_label_uses_reset() {
+        let stale_reset = 1_789_300_251;
+        let next_period_reset = 1_789_437_490;
+        let real_reset = 1_789_623_591;
+        let next_period_fixed_start = 1_788_832_680;
+        let next_period_start = next_period_fixed_start - 2_100;
+        let transition_timestamp = 1_789_018_800;
+        let observed_at = transition_timestamp + 120;
+        let row = |timestamp: i64,
+                   reset_at: i64,
+                   remaining_percent: f64,
+                   sol_dollars: f64,
+                   luna_dollars: f64| {
+            let stale_family = reset_at.abs_diff(stale_reset) <= 2;
+            let next_period_family = reset_at.abs_diff(next_period_reset) <= 2;
+            RawSample {
+                timestamp,
+                reset_at,
+                remaining_percent: Some(remaining_percent),
+                sol_dollars,
+                terra_dollars: 0.0,
+                luna_dollars,
+                sol_tokens: if stale_family { 555_312_427 } else { 0 },
+                terra_tokens: 0,
+                luna_tokens: if stale_family {
+                    22_816_483
+                } else if next_period_family {
+                    91_512
+                } else {
+                    0
+                },
+            }
+        };
+        let mut samples = vec![
+            row(1_788_695_460, stale_reset, 100.0, 0.0, 0.0),
+            row(
+                next_period_start - 60,
+                stale_reset,
+                17.0,
+                370.814_975,
+                1.423_482_24,
+            ),
+        ];
+        // The API reports a deadline that moves with each observation before
+        // settling on the next fixed reset. The simultaneous quota recovery
+        // makes this complete prelude part of the new quota period.
+        samples.extend((0..35).map(|minute| {
+            let timestamp = next_period_start + minute * 60;
+            row(
+                timestamp,
+                next_period_reset - (next_period_fixed_start - timestamp),
+                100.0,
+                0.0,
+                0.0,
+            )
+        }));
+        let alias_timestamp = next_period_start + 60;
+        samples.push(row(
+            alias_timestamp,
+            next_period_reset - (next_period_fixed_start - alias_timestamp) + 61,
+            100.0,
+            0.0,
+            0.0,
+        ));
+        samples.extend([
+            row(
+                1_788_975_540,
+                stale_reset + 1,
+                17.0,
+                370.814_975,
+                1.423_482_24,
+            ),
+            // These are retained stale-tail aliases at the false 02:40 boundary.
+            row(
+                1_788_975_480,
+                stale_reset + 2,
+                17.0,
+                370.814_975,
+                1.423_482_24,
+            ),
+            row(1_788_975_540, stale_reset, 17.0, 370.814_975, 1.423_482_24),
+            row(next_period_fixed_start, next_period_reset, 100.0, 0.0, 0.0),
+            row(
+                1_788_975_600,
+                next_period_reset + 1,
+                29.0,
+                0.0,
+                0.012_395_44,
+            ),
+            row(
+                transition_timestamp - 60,
+                next_period_reset + 2,
+                29.0,
+                0.0,
+                0.187_152_6,
+            ),
+            // The only real reset boundary is retained exactly once.
+            row(transition_timestamp, real_reset, 100.0, 0.0, 0.0),
+            row(transition_timestamp + 60, real_reset + 1, 100.0, 0.0, 0.0),
+            row(transition_timestamp + 120, real_reset + 2, 100.0, 0.0, 0.0),
+        ]);
+
+        let canonical = canonicalize_history(&samples, None, 0, observed_at)
+            .expect("literal retained history is structurally valid");
+        assert!(canonical.iter().any(|sample| {
+            sample.reset_at.abs_diff(stale_reset) <= 60 && sample.timestamp < next_period_start
+        }));
+        assert!(canonical.iter().all(|sample| {
+            sample.reset_at.abs_diff(stale_reset) > 60 || sample.timestamp < next_period_start
+        }));
+        assert!(canonical.iter().any(|sample| {
+            sample.reset_at.abs_diff(next_period_reset) <= 60
+                && sample.timestamp >= next_period_start
+        }));
+
+        let periods = history_periods(&canonical, observed_at, None, 0);
+        assert_eq!(periods.len(), 3, "{periods:#?}");
+        assert!(periods
+            .iter()
+            .all(|period| period.start_at != 1_788_975_600));
+        let next_period = periods
+            .iter()
+            .find(|period| period.reset_at.abs_diff(next_period_reset) <= 60)
+            .expect("next fixed period");
+        assert_eq!(next_period.start_at, next_period_start);
+        assert_eq!(
+            periods
+                .iter()
+                .filter(|period| period.reset_at.abs_diff(stale_reset) <= 60)
+                .count(),
+            1
+        );
+        let stale_period = periods
+            .iter()
+            .find(|period| period.reset_at.abs_diff(stale_reset) <= 60)
+            .expect("stale prefix remains diagnostic history");
+        assert_eq!(stale_period.end_at, next_period_start - 60);
+        assert_eq!(
+            periods
+                .iter()
+                .filter(|period| period.reset_at.abs_diff(real_reset) <= 60)
+                .count(),
+            1,
+            "the explicit reset must remain one public boundary"
+        );
+
+        let current_samples = canonicalize_history(
+            &[row(real_reset - 120, real_reset, 100.0, 0.0, 0.0)],
+            None,
+            0,
+            real_reset - 30,
+        )
+        .expect("current label fixture");
+        let current_periods =
+            history_periods(&current_samples, real_reset - 30, Some(real_reset), 3_600);
+        assert_eq!(current_periods.len(), 1);
+        assert_eq!(current_periods[0].end_at, real_reset - 30);
+        assert!(current_periods[0]
+            .label
+            .contains(&format_jst_timestamp(real_reset).expect("reset label")));
+        assert!(!current_periods[0]
+            .label
+            .contains(&format_jst_timestamp(real_reset - 30).expect("observed label")));
+    }
+
+    #[test]
+    fn conflicting_cross_period_minute_is_not_published() {
+        let timestamp = 1_800_000_000;
+        let row = |reset_at, remaining_percent, sol_tokens| RawSample {
+            timestamp,
+            reset_at,
+            remaining_percent: Some(remaining_percent),
+            sol_dollars: sol_tokens as f64,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        let rows = vec![row(1_800_000_600, 17.0, 17), row(1_800_001_200, 29.0, 29)];
+        let canonical = canonicalize_history(&rows, None, 0, timestamp)
+            .expect("cross-period fixture is structurally valid");
+        assert!(
+            canonical.is_empty(),
+            "conflicting owners must not cross the wire"
+        );
+    }
+
+    #[test]
+    fn regressing_model_is_missing_until_recovery_without_hiding_other_models() {
+        let model = |name: &str, total_tokens: u64, total_dollars: f64| PublicHistoryModelUsageV3 {
+            model: name.to_owned(),
+            total_tokens,
+            input_tokens: None,
+            cached_input_tokens: None,
+            cache_write_input_tokens: None,
+            output_tokens: None,
+            total_dollars: Some(total_dollars),
+        };
+        let observation =
+            |timestamp: i64, reset_at: i64, sol_tokens: u64, sol_dollars: f64, luna_tokens: u64| {
+                PublicHistoryObservationV3 {
+                    timestamp,
+                    reset_at,
+                    remaining_percent: Some(50.0),
+                    models: Some(vec![
+                        model("LUNA", luna_tokens, luna_tokens as f64),
+                        model("SOL", sol_tokens, sol_dollars),
+                    ]),
+                    models_complete: true,
+                    model_source: "confirmed".to_owned(),
+                }
+            };
+        let first_reset = 1_800_000_600;
+        let second_reset = 1_800_001_200;
+        let mut history = BTreeMap::from([
+            (
+                (first_reset, 1_800_000_000),
+                observation(1_800_000_000, first_reset, 100, 10.0, 50),
+            ),
+            (
+                (first_reset, 1_800_000_060),
+                observation(1_800_000_060, first_reset, 90, 11.0, 60),
+            ),
+            (
+                (first_reset, 1_800_000_120),
+                observation(1_800_000_120, first_reset, 100, 9.0, 70),
+            ),
+            (
+                (first_reset, 1_800_000_180),
+                observation(1_800_000_180, first_reset, 101, 11.0, 80),
+            ),
+            (
+                (second_reset, 1_800_000_240),
+                observation(1_800_000_240, second_reset, 1, 0.1, 1),
+            ),
+        ]);
+
+        suppress_regressing_history_models(&mut history);
+
+        let names = |timestamp| {
+            history
+                .values()
+                .find(|sample| sample.timestamp == timestamp)
+                .and_then(|sample| sample.models.as_ref())
+                .map(|models| {
+                    models
+                        .iter()
+                        .map(|model| model.model.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(names(1_800_000_060), vec!["LUNA"]);
+        assert_eq!(names(1_800_000_120), vec!["LUNA"]);
+        assert_eq!(names(1_800_000_180), vec!["LUNA", "SOL"]);
+        assert_eq!(names(1_800_000_240), vec!["LUNA", "SOL"]);
+        assert!(!history[&(first_reset, 1_800_000_060)].models_complete);
+        assert!(!history[&(first_reset, 1_800_000_120)].models_complete);
+        assert_eq!(
+            history[&(first_reset, 1_800_000_060)].model_source,
+            "legacy-unknown"
+        );
+        assert_eq!(
+            history[&(first_reset, 1_800_000_120)].model_source,
+            "legacy-unknown"
+        );
     }
 }
