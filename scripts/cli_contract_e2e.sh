@@ -30,8 +30,14 @@ fail() {
 for command in curl python3 rg sha256sum sqlite3 ss stat; do
     command -v "$command" >/dev/null || fail "$command is required"
 done
+if [[ ! -x "$UI_BINARY" || ! -x "$RECORDER_BINARY" || ! -x "$REST_BINARY" ]]; then
+    command -v cargo >/dev/null || fail 'cargo is required to build missing release binaries'
+    (cd -- "$ROOT_DIR" && cargo build --release --locked \
+        -p codex_info -p codex-info-recorder -p codex-info-rest)
+fi
 for binary in "$UI_BINARY" "$RECORDER_BINARY" "$REST_BINARY"; do
-    [[ -x "$binary" ]] || fail "build release binaries first: $binary"
+    [[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] \
+        || fail "release binary is not an executable regular file: $binary"
 done
 
 temp_parent="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"

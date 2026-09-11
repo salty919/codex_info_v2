@@ -775,6 +775,7 @@ dependencies = [
  "chrono",
  "codex-info-account-locator",
  "codex-info-db-writer",
+ "codex_info",
  "getrandom 0.3.4",
  "rusqlite",
  "rustix 0.38.44",

@@ -26,7 +26,7 @@ fail() {
     exit 1
 }
 
-for command in awk curl date python3 rg sed sqlite3 ss stat tail tr xwininfo xdpyinfo; do
+for command in awk curl date python3 rg sed sqlite3 ss stat tail tr xprop xwininfo xdpyinfo; do
     command -v "$command" >/dev/null || fail "$command is required"
 done
 
@@ -83,6 +83,7 @@ recorder_pid=""
 rest_pid=""
 ui_pid=""
 sentinel_pid=""
+ui_rest_connection_baseline=""
 port_seed=$((35000 + (BASHPID % 10000)))
 
 listener_count() {
@@ -105,7 +106,7 @@ reserve_port() {
 process_env_contains() {
     local pid="$1" needle="$2" env_text
     [[ -r "/proc/$pid/environ" ]] || return 1
-    env_text="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null || true)"
+    env_text="$(tr '\0' '\n' 2>/dev/null <"/proc/$pid/environ" || true)"
     rg -Fqx -- "$needle" <<<"$env_text" >/dev/null
 }
 
@@ -599,36 +600,49 @@ wait_for_recorder_advance() {
 }
 
 wait_for_ui_window() {
-    local pid="$1" tree
+    local pid="$1" candidate window_pid
     for _ in $(seq 1 60); do
         if ! process_matches_scope "$pid" ui; then
             return 1
         fi
-        tree="$(xwininfo -root -tree 2>/dev/null || true)"
-        if rg -q -- '(Codex Info|Codex -)' <<<"$tree"; then
-            return 0
-        fi
+        while read -r candidate; do
+            window_pid="$(xprop -id "$candidate" _NET_WM_PID 2>/dev/null \
+                | awk -F'= ' '{print $2}' | tr -d '[:space:]')"
+            [[ "$window_pid" == "$pid" ]] && return 0
+        done < <(xwininfo -root -tree 2>/dev/null \
+            | awk '/^ +0x[0-9a-f]+/ {print $1}')
         sleep 0.25
     done
     return 1
 }
 
 wait_for_ui_rest_connection() {
-    local pid="$1"
+    local pid="$1" tuple
     for _ in $(seq 1 60); do
         if ! process_matches_scope "$pid" ui; then
             return 1
         fi
-        # The client opens short-lived loopback HTTP connections. Observe the
-        # UI PID itself in the socket table while its one-second poll runs;
-        # the REST process and a matching window alone are not a connection
-        # proof.
-        if ss -tnpH 2>/dev/null | rg -q "pid=${pid}[,)]"; then
-            return 0
-        fi
+        # The client uses short-lived HTTP connections that normally reach
+        # TIME_WAIT before a 250 ms process-table sample. Compare client tuples
+        # with the pre-launch baseline so the completed connection remains a
+        # durable proof instead of relying on a chance ESTABLISHED observation.
+        while IFS= read -r tuple; do
+            [[ -n "$tuple" ]] || continue
+            if ! rg -Fqx -- "$tuple" <<<"$ui_rest_connection_baseline"; then
+                return 0
+            fi
+        done < <(rest_client_tuples)
         sleep 0.25
     done
     return 1
+}
+
+rest_client_tuples() {
+    local remote
+    printf -v remote '0100007F:%04X' "$case_port"
+    awk -v remote="$remote" '
+        NR > 1 && toupper($3) == remote { print toupper($2 "|" $3) }
+    ' /proc/net/tcp 2>/dev/null
 }
 
 setup_case
@@ -742,6 +756,7 @@ assert_model_growth "$details_before" "$details_after" \
 # The UI receives only the REST endpoint in this invocation. Its executable,
 # marker, and port are checked independently, while recorder and REST PIDs
 # remain untouched and no UI-owned recorder process may appear.
+ui_rest_connection_baseline="$(rest_client_tuples)"
 launch_ui ui-client-only
 assert_one_scoped_process ui "$ui_pid" 'client-only UI startup'
 [[ "$ui_pid" != "$recorder_pid" && "$ui_pid" != "$rest_pid" ]] \
