@@ -42,6 +42,9 @@ class OwnerSelectionTests(unittest.TestCase):
             "windows-client/tools/Reproduce-WindowsInstalledE2E.ps1": (
                 ("WINDOWS",), False, ()
             ),
+            "windows-client/tools/Ensure-DotNetSdk.ps1": (
+                ("WINDOWS",), False, ()
+            ),
             "windows-client/tools/Ensure-InnoSetupCompiler.ps1": (
                 ("WINDOWS",), False, ()
             ),

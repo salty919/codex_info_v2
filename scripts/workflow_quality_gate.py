@@ -36,6 +36,7 @@ RELEASE_ACCEPTANCE_SCRIPTS = {
 }
 
 WINDOWS_GATE_SCRIPTS = {
+    "sdk": "windows-client/tools/Ensure-DotNetSdk.ps1",
     "compiler": "windows-client/tools/Ensure-InnoSetupCompiler.ps1",
     "build": "windows-client/tools/Build-WindowsInstaller.ps1",
     "upgrade": "windows-client/tools/Install-WindowsCandidateForE2E.ps1",
@@ -66,6 +67,14 @@ def windows_gate_sources() -> dict[str, str]:
 
 def _windows_gate_script_errors(scripts: Mapping[str, str]) -> list[str]:
     required = {
+        "sdk": (
+            "https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json",
+            "'latest-sdk'",
+            "dotnet-sdk-win-x64.zip",
+            "Get-FileHash -LiteralPath $archive -Algorithm SHA512",
+            "$env:DOTNET_ROOT = $sdkRoot",
+            "& $dotnet --list-sdks",
+        ),
         "compiler": (
             "innosetup-7.1.0-x64.exe",
             "0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f",
@@ -89,6 +98,7 @@ def _windows_gate_script_errors(scripts: Mapping[str, str]) -> list[str]:
         ),
         "e2e": (
             "[switch]$PrepareCandidate",
+            "Ensure-DotNetSdk.ps1",
             "Ensure-InnoSetupCompiler.ps1",
             "Build-WindowsInstaller.ps1",
             "Install-WindowsCandidateForE2E.ps1",
@@ -3578,6 +3588,11 @@ def self_test() -> int:
         cases += 1
     windows_gate_baseline = windows_gate_sources()
     windows_gate_mutations = (
+        (
+            "sdk",
+            "Get-FileHash -LiteralPath $archive -Algorithm SHA512",
+            "Get-FileHash -LiteralPath $archive -Algorithm SHA256",
+        ),
         ("compiler", "Get-AuthenticodeSignature", "Get-Item"),
         (
             "build",

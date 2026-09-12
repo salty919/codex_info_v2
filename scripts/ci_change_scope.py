@@ -69,6 +69,7 @@ WINDOWS_PRODUCT_TOOL_EXACT = frozenset(
 )
 WINDOWS_TEST_TOOL_EXACT = frozenset(
     {
+        "windows-client/tools/Ensure-DotNetSdk.ps1",
         "windows-client/tools/Ensure-InnoSetupCompiler.ps1",
         "windows-client/tools/Install-WindowsCandidateForE2E.ps1",
         "windows-client/tools/Measure-WindowsGraphLatency.ps1",

@@ -27,6 +27,7 @@ if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
 
 $runner = Join-Path $PSScriptRoot 'Run-WindowsClientE2E.ps1'
 $moveSmoke = Join-Path $repositoryRoot 'scripts/windows_window_move_smoke.ps1'
+$ensureDotNetSdk = Join-Path $PSScriptRoot 'Ensure-DotNetSdk.ps1'
 $ensureCompiler = Join-Path $PSScriptRoot 'Ensure-InnoSetupCompiler.ps1'
 $buildInstaller = Join-Path $PSScriptRoot 'Build-WindowsInstaller.ps1'
 $installCandidate = Join-Path $PSScriptRoot 'Install-WindowsCandidateForE2E.ps1'
@@ -47,7 +48,7 @@ $expectedProductVersion = "$($versionNodes[0].InnerText.Trim())+$SourceSha"
 $installedMatches = (Test-Path -LiteralPath $ClientPath -PathType Leaf) -and
     ((Get-Item -LiteralPath $ClientPath).VersionInfo.ProductVersion -ceq $expectedProductVersion)
 if ($PrepareCandidate -and -not $installedMatches) {
-    foreach ($requiredScript in ($ensureCompiler, $buildInstaller, $installCandidate)) {
+    foreach ($requiredScript in ($ensureDotNetSdk, $ensureCompiler, $buildInstaller, $installCandidate)) {
         if (-not (Test-Path -LiteralPath $requiredScript -PathType Leaf)) {
             throw "Windows candidate preparation script is missing: $requiredScript"
         }
@@ -55,6 +56,7 @@ if ($PrepareCandidate -and -not $installedMatches) {
     if ([IO.Path]::IsPathRooted($CandidateOutputDirectory)) {
         throw 'CandidateOutputDirectory must be relative to the repository root.'
     }
+    & $ensureDotNetSdk
     & $ensureCompiler
     & $buildInstaller -OutputDirectory $CandidateOutputDirectory -SourceSha $SourceSha
     $candidateSetup = Join-Path $repositoryRoot `
