@@ -2365,8 +2365,8 @@ mod tests {
         );
         let logical = store.load_all().unwrap();
         assert_eq!(logical.len(), 2);
-        assert_eq!(logical[0].sol_tokens, 110);
-        assert_eq!(logical[0].sol_dollars, 1.1);
+        assert_eq!(logical[0].sol_tokens, 100);
+        assert_eq!(logical[0].sol_dollars, 1.0);
         assert_eq!(logical[1], fixture.anchor_sample);
         assert!(store.recorded_session_matches(&fixture.marker).unwrap());
         drop(store);

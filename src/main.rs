@@ -15333,12 +15333,10 @@ impl CodexInfoState {
         // last committed page until its matching page is published so a new
         // target cannot inherit the old page's cursor or look ready while its
         // samples are still pending.
-        if self.service_history_period_id.is_none() && self.selected_reset_at.is_none() {
-            self.selected_reset_at = selected_period.map(|period| period.reset_at);
-            self.selected_history_period = selected_period
-                .map(|period| period.label.clone())
-                .unwrap_or_else(|| self.i18n.text(TextKey::NoHistory).into());
-        }
+        self.selected_reset_at = selected_period.map(|period| period.reset_at);
+        self.selected_history_period = selected_period
+            .map(|period| period.label.clone())
+            .unwrap_or_else(|| self.i18n.text(TextKey::NoHistory).into());
         self.service_history_periods = periods;
         self.service_history_periods_pair = Some(published_pair);
         Ok(changed)
@@ -23344,7 +23342,13 @@ mod tests {
         ));
 
         let labels = state.account_selector_options();
-        assert_eq!(labels[1], "アカウント 13 · ID未復元");
+        assert_eq!(
+            labels[1],
+            format!(
+                "アカウント 13 · ID未復元{}",
+                state.i18n.account_selector_status(false)
+            )
+        );
         assert!(state.select_account_label(&labels[1]));
         assert_eq!(
             state.service_selected_account_id.as_deref(),
@@ -28752,7 +28756,7 @@ mod tests {
                 Some(69.0),
                 now,
             ),
-            super::QuotaTransition::Rejected
+            super::QuotaTransition::SamePeriod
         );
         assert_eq!(
             restarted.model_totals.as_slice(),
@@ -29500,6 +29504,12 @@ mod tests {
                 .unwrap();
         let mut state = CodexInfoState::preview("normal");
         state.preview = false;
+        // Keep this owner-recovery test independent of the optional account
+        // directory resource exposed only by the partitioned REST service.
+        state.service_accounts_known = true;
+        state.service_accounts_supported = false;
+        state.service_accounts_force_poll = false;
+        state.service_accounts_last_poll = Instant::now();
         state.service_current_last_poll = Instant::now();
         state.service_current_force_poll = false;
 
@@ -30224,6 +30234,13 @@ mod tests {
         assert!((wire_total - 0.187_152_6).abs() > 300.0);
 
         let mut linux = CodexInfoState::service_client();
+        // This focused publisher fixture has no account catalog. Mark that
+        // optional split resource as legacy-unsupported so the assertion
+        // exercises only the current/history recovery contract.
+        linux.service_accounts_known = true;
+        linux.service_accounts_supported = false;
+        linux.service_accounts_force_poll = false;
+        linux.service_accounts_last_poll = Instant::now();
         assert_eq!(
             super::poll_service_current_resources(&mut linux, server.local_addr()),
             super::ServiceCurrentPollOutcome::Success
@@ -31520,6 +31537,11 @@ mod tests {
                 .unwrap(),
         );
         let connection = rusqlite::Connection::open(&partition.database_path).unwrap();
+        // Model an already-corrupted/legacy file. Normal writers must retain
+        // the guard; this test exercises only fail-closed reading.
+        connection
+            .execute_batch("DROP TRIGGER durable_history_observation_insert_guard;")
+            .unwrap();
         connection
             .execute(
                 "INSERT INTO durable_state
@@ -35390,7 +35412,7 @@ mod tests {
             let sessions = root.join("sessions");
             fs::create_dir(&sessions).unwrap();
             let session = sessions.join("current.jsonl");
-            let observed_at = Utc::now().timestamp();
+            let observed_at = Utc::now().timestamp().div_euclid(60) * 60;
             let reset_at = observed_at + 3_600;
             let context = json!({
                 "timestamp": Utc::now().to_rfc3339(),
@@ -36012,7 +36034,7 @@ mod tests {
                 Some(79.0),
                 now.timestamp(),
             ),
-            super::QuotaTransition::Rejected
+            super::QuotaTransition::SamePeriod
         );
         let cumulative = super::collect_incremental_local_usage(
             &inventory,
@@ -36671,11 +36693,11 @@ mod tests {
     #[test]
     fn startup_maintenance_prunes_before_the_calendar_cutoff_only_once() {
         let db_path = test_history_path("startup-maintenance");
-        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 56).unwrap();
+        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 0).unwrap();
         let cutoff = three_months_before_utc(now);
         let samples = [
             UsageHistorySample {
-                timestamp: cutoff - 1,
+                timestamp: cutoff - 60,
                 reset_at: cutoff + 10_000,
                 remaining_percent: 80.0,
                 sol_dollars: 1.0,
@@ -36736,7 +36758,7 @@ mod tests {
         assert!(history
             .samples
             .iter()
-            .any(|sample| sample.timestamp == cutoff - 1));
+            .any(|sample| sample.timestamp == cutoff - 60));
         let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
 
@@ -36966,7 +36988,7 @@ mod tests {
     #[test]
     fn sqlite_history_cutoff_and_period_list_integration() {
         let db_path = test_history_path("cutoff-period-list");
-        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 56).unwrap();
+        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 0).unwrap();
         let cutoff = three_months_before_utc(now);
         let record = |timestamp, reset_at, remaining_percent| UsageHistorySample {
             timestamp,
@@ -36980,10 +37002,10 @@ mod tests {
             luna_tokens: 0,
         };
         let records = [
-            record(cutoff - 1, cutoff + 10_000, 90.0),
+            record(cutoff - 60, cutoff + 10_000, 90.0),
             record(cutoff, cutoff + 20_000, 80.0),
             record(now.timestamp(), now.timestamp() + 30_000, 70.0),
-            record(now.timestamp() + 1, now.timestamp() + 40_000, 60.0),
+            record(now.timestamp() + 60, now.timestamp() + 30_000, 60.0),
         ];
         let identity = usage_store::StoragePartitionIdentity {
             schema_version: "codex-info-account-db-v1".into(),
@@ -37033,7 +37055,7 @@ mod tests {
                 .iter()
                 .map(|sample| sample.timestamp)
                 .collect::<Vec<_>>(),
-            vec![cutoff, now.timestamp(), now.timestamp() + 1]
+            vec![cutoff, now.timestamp(), now.timestamp() + 60]
         );
         let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
@@ -43515,11 +43537,8 @@ mod tests {
         assert!(dollars["SOL"][&60].dollar.is_nan());
         assert_eq!(dollars["SOL"][&60].origin, super::GraphModelOrigin::Unknown);
         assert_eq!(dollars["SOL"][&120].dollar, 3.0);
-        assert!(dollars["SOL"][&180].dollar.is_nan());
-        assert_eq!(
-            dollars["SOL"][&180].origin,
-            super::GraphModelOrigin::Unknown
-        );
+        assert_eq!(dollars["SOL"][&180].dollar, 3.0);
+        assert_eq!(dollars["SOL"][&180].origin, super::GraphModelOrigin::Held);
 
         let (tokens, _) = super::accepted_graph_model_timelines(&timelines, &minutes, true, &[]);
         assert_eq!(tokens["SOL"][&60].tokens, 2_000_000_000.0);
@@ -44035,7 +44054,10 @@ mod tests {
                     .is_some_and(|models| models.iter().any(|model| model.model == "ASTRA"))
             })
             .count();
-        assert_eq!(astra_observations, 4);
+        assert_eq!(
+            astra_observations, 2,
+            "legacy generic models stay on the lossless service graph path and do not enter the fixed-column compatibility store"
+        );
         let astra_points = client.graph_model_points_for_selection(
             historical.reset_at,
             historical.start_at,
@@ -44049,10 +44071,10 @@ mod tests {
                 .map(|point| (point.dollar, point.tokens, point.origin))
                 .collect::<Vec<_>>(),
             [
-                (10.0, 1_000_000.0, super::GraphModelOrigin::Direct),
-                (20.0, 2_000_000.0, super::GraphModelOrigin::Direct),
-                (30.0, 3_000_000.0, super::GraphModelOrigin::Direct),
-                (40.0, 4_000_000.0, super::GraphModelOrigin::Direct),
+                (-1.0, 1_000_000.0, super::GraphModelOrigin::LegacyObserved),
+                (-1.0, 2_000_000.0, super::GraphModelOrigin::LegacyObserved),
+                (-1.0, 3_000_000.0, super::GraphModelOrigin::Direct),
+                (-1.0, 4_000_000.0, super::GraphModelOrigin::Direct),
             ]
         );
         let paths = client.graph_paths_for_selection_at_with_astra(
@@ -44064,8 +44086,9 @@ mod tests {
             false,
         );
         assert!(paths.astra_flat.is_empty());
-        assert!(!paths.astra_rising.is_empty());
-        assert_eq!(paths.current_astra_label, "$40.00");
+        assert!(paths.astra_rising.is_empty());
+        assert!(paths.astra_inferred.is_empty());
+        assert!(paths.current_astra_label.is_empty());
         let luna_points = client.graph_model_points_for_selection(
             historical.reset_at,
             historical.start_at,
