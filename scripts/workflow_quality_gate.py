@@ -84,6 +84,7 @@ def _windows_gate_script_errors(scripts: Mapping[str, str]) -> list[str]:
         "build": (
             "[string]$SourceSha = ''",
             "-p:SourceRevisionId=$SourceSha",
+            "--artifacts-path $buildArtifacts",
         ),
         "upgrade": (
             "/releases/latest",
