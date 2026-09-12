@@ -3,6 +3,7 @@
 <!-- codex-info-requirement-owner: WIRE -->
 <!-- codex-info-master-ids:
 REST-129
+ACCOUNT-SELECT-134
 WIN-PARITY-WIRE-01
 WIN-PARITY-PAIR-01
 API-V3-MODELS-01
@@ -13,9 +14,31 @@ API-DEPRECATION-01
 
 ## API世代と廃止境界
 
-`API-V3-MODELS-01`: v3の`current`と`history` resourceはcommit済みdomain snapshotを、有界な`models`配列として返す。model ID、token内訳、価格計算可否を事実として分離し、UI固定列や表示文言をwire fieldにしない。`/health`はAPI世代から独立したread-only readiness endpointとし、collector、DB writer、外部quota取得の生存状態を混同しない。
+`ACCOUNT-SELECT-134`: `GET /v3/accounts`は初期化済みaccount partitionの有限catalogを返す。各要素は
+`id`（`account-<StorageEpoch>`形式の非秘密selector）、`is_current`、nullableな`activation_at`、
+`deactivation_at`、`login_id`だけを持ち、rootは`default_account_id`を一つ持つ。`login_id`は前後の同一
+`account/read`で確認し、owner-onlyな当該account DBへ保存した1..254 Unicode scalar、trim済み・control文字なしの
+表示専用値であり、欠落時はnullとする。AccountScopeId、partition ID、raw AccountKey、token、pathをwireへ出さない。
+`/v3/details`、`/v3/current`、`/v3/history/periods`、`/v3/history`、`/v3/threads`は
+任意の`account=<id>`を一つだけ受理し、省略時は現accountを選ぶ。未知・重複・不正selectorは別accountへfallbackせず
+400とする。published pairとcursorはaccount IDへnamespace bindし、別accountのETag、cursor、last-goodを受理しない。
 
-v3の各履歴rowは`models`と`models_complete`を持つ。各model rowの`total_tokens`と`total_dollars`は個別に確認できた累計、入力・cached入力・cache write入力・出力は確認できたfieldだけを持ち、未確認fieldを反復`null`で送らない。旧`usage_history`のSOL/TERRA/LUNA列は既知の`total_tokens`と`total_dollars`として保持し、同時刻の不完全なgeneric model集合へ名前単位でmergeする。旧schemaにない内訳を0や推測値で補わない。`models_complete=true`は同じ観測で全モデル集合を確定できた場合だけ許可し、`model_source=confirmed`と非nullの`models`を必要とする。保持ログからASTRAだけを回収した場合や旧3モデルだけが既知の場合は`models_complete=false`、`model_source=legacy-unknown`とし、配列にないモデルを0と解釈しない。clientは掲載modelの実測値を通常線で表示し、当該model自体の未観測区間だけを破線または切断で示す。集合の不完全性だけで掲載modelを予測値へ降格しない。
+`API-V3-MODELS-01`: v3の`current`と`history` resourceはcommit済みdomain snapshotを、有界な`models`配列として返す。model ID、token内訳、価格計算可否を事実として分離し、UI固定列や表示文言をwire fieldにしない。モデルの数値は同じmodel keyを持つ直接観測(`model_source=confirmed`)のraw値だけを公開する。`reconstructed-from-session`、`unknown`、`unavailable`はmodel key/sourceと欠損metadataだけを返し、モデル数値を返さない。`legacy-unknown`は保存済みの同じmodel keyの数値を表示投影に限って返せるが、集計・予測・idle判定のauthorityにはしない。補間、hold、smoothing、予測および派生値はUI presentation-onlyで、API/DBへ書き戻さない。`/health`はAPI世代から独立したread-only readiness endpointとし、collector、DB writer、外部quota取得の生存状態を混同しない。
+
+v3の各履歴rowは`models`、`models_complete`、nullable boolean `task_active_since_previous`を持つ。
+`task_active_since_previous`は同じcanonical periodの直前rowより後から当該row時刻までにtaskが実行中だったかを表し、
+graphのinterval判定ではafter rowの値として扱う。
+完全に索引済みのtask lifecycleで1件以上のoverlapを確認した場合だけ`true`、完全coverageで0件の場合だけ`false`、
+period先頭、未索引範囲、矛盾または旧schemaは`null`とする。欠落fieldを受理する互換clientも`null`として扱い、
+`false`や履歴の見た目へ推測変換しない。各model rowの`total_tokens`と`total_dollars`は個別に確認できた累計、
+入力・cached入力・cache write入力・出力は確認できたfieldだけを持ち、未確認fieldを反復`null`で送らない。
+旧`usage_history`のSOL/TERRA/LUNA列は、同じmodel keyの保存済み値である場合だけ`legacy-unknown`として表示投影へ渡す。異なるkeyの値をgeneric modelへmergeせず、旧schemaにない内訳や未掲載modelを0・推測値で補わない。`models_complete=true`は同じ直接観測で全モデル集合を確定できた場合だけ許可し、`model_source=confirmed`と非nullの`models`を必要とする。保持ログから一部modelだけを回収した場合は欠損metadataを返し、数値を生成しない。clientは直接観測の掲載modelだけを通常線で表示し、その他の補完線はpresentation-onlyとする。
+
+Graphでgray idleを表示するclientはsame `reset_at`のperiod内で、両endpointが`confirmed`かつ`models_complete=true`、同じmodel key集合、
+全raw `total_tokens`のexact equal、finite raw Remainingのbitwise equal、active/gap/直接観測値の矛盾なしを同時に要求する。
+`legacy-unknown`、`unknown`、`unavailable`、補間・hold・smoothing・予測値はendpointまたは矛盾なしのidle authorityにしない。
+ただし完全directな同値endpoint間の数値なしmetadata rowは境界済み不変区間を否定しない。上記条件を満たす連続30分以上のrunだけを
+gray表示する。詳しい表示判定は`G137-GRAPH-01`に従う。
 
 `API-DEPRECATION-01`: `/v1/details`、`/v2/details`、全表示情報を一体化した`/v3/details`は互換adapterである。互換期間中は同じatomic generationから生成し、既存field、値型、header allowlistを変更しない。新clientはv3 split resourceを優先し、`/v3/current`がexact 404の場合だけ`/v3/details`、さらにexact 404の場合だけv2、v1へfallbackし、世代をmergeしない。廃止日は未決定であり、決定前に`Sunset`を送らない。将来の削除対象は旧details route、adapter、client fallbackだけで、Session collector、SQLite writer、domain model、`/health`は対象外とする。
 
@@ -205,8 +228,11 @@ atomic commitする。wire上に`version`、
 | `estimated_cost_label` | control/bidi formattingなしの1..160 Unicode scalar。表示所有権は別途DESIGNで決め、schemaに存在するだけで重複表示を許可しない |
 
 各model行は`name`、`input_tokens`、`cached_input_tokens`、`output_tokens`、
-`input_dollars`、`cached_input_dollars`、`output_dollars`だけを持つ。tokenはJSON非負整数、
-dollarは有限かつ0以上のJSON numberである。ドルはcreditや為替へ変換しない。
+`input_dollars`、`cached_input_dollars`、`output_dollars`だけを持つ。これらの数値は同じ`name` keyの
+直接観測で確認できた値だけを設定し、その他のsourceではmodel key/sourceと欠損metadataだけを保持する。
+tokenはJSON非負整数、dollarは有限かつ0以上のJSON numberである。ドルはcreditや為替へ変換しない。
+固定schemaのv1ではsource metadataを表現できないため、直接観測でないmodel行を数値付きで出さず、欠損metadataを表現できる
+v2/v3 projectionを使用する。互換性のためのv1固定列へ保存済み値を複製しない。
 
 各history period行は`id`、`start_at`、`end_at`、`reset_at`、`label`、`current`だけを持つ。`id`は
 1..512 Unicode scalarで集合内一意、時刻はUnix秒整数`1..253402300799`、
@@ -231,10 +257,9 @@ public candidateを構築する前に、resident serviceの`HistoryCanonicalizer
 chainだけを同cycleとし、group内最大`reset_at`をcanonical resetとする。新しいpartition列や永続CycleSeqを
 legacy回復の前提にしない。quota観測を持たずquota確認済みcycleと時間範囲が重なるbackfill reset群と、
 継続するquota確認済みcycleの時間範囲内だけに存在するreset断片はperiod authorityにせず、raw SQLiteへ残したまま
-public viewから除外する。distinct non-null quotaが0または1個で、
-既存のcumulative vector `(sol_dollars, terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens)`のうち
-全rowをcomponentwiseに支配する既存vector値が存在する場合だけ、そのquota（0個なら`null`）とdominant vectorを
-1 logical sampleとして採用する。quota競合またはdominant vector不存在・非比較となったminuteは値を選択・合成せず
+public viewから除外する。distinct non-null quotaが0または1個で、同じmodel keyの直接観測vectorが一つだけ存在する場合だけ、
+そのquota（0個なら`null`）とその直接観測vectorを1 logical sampleとして採用する。quota競合、同一keyの複数vector、または
+直接観測vector不存在となったminuteは値を選択・合成せず
 そのminuteだけpublic viewへ含めない。別cycle間の所属を時系列から一意にできない場合はcandidate全体をrejectして
 last-good details generationを保持する。
 同値duplicateは同じvector値として冪等に扱う。
@@ -285,13 +310,15 @@ exact `v2`とする。`history_samples`の各rowはv1の9キーに`model_source`
 
 | `model_source` | model dollar/token 6値 | 意味と表示 |
 | --- | --- | --- |
-| `confirmed` | 全て非null | 同じlocal収集の証拠とatomic commitを持つ。ほかの連続条件も満たす隣接点だけ実線にできる |
-| `unavailable` | 全てnull | そのtimestampのlocal model値は未取得。freshな`remaining_percent`だけは同時刻へ保持できるが、model線は確定値として描かない |
-| `legacy-unknown` | 全て非null | provenance導入前またはv1 fallbackの実測累計。値は通常線にできるが、集合完全性やquota変化の帰属根拠には使わない |
+| `confirmed` | 全て非null | 同じmodel keyの直接観測とatomic commitを持つ。集計・idle判定の根拠になれる |
+| `reconstructed-from-session` | 全てnull | sessionからの復元であり、model key/sourceと欠損metadataだけを返す。モデル線・集計・idle判定には使わない |
+| `unknown` | 全てnull | 観測不明。model key/sourceと欠損metadataだけを返し、数値を推測しない |
+| `unavailable` | 全てnull | そのtimestampのlocal model値は未取得。freshな`remaining_percent`だけを保持でき、model数値は返さない |
+| `legacy-unknown` | 全て非null | provenance導入前またはv1 fallbackの保存済み同じmodel keyの値。表示投影だけに使い、集計・予測・idle判定には使わない |
 
-`confirmed`/`legacy-unknown`でmodel 6値の一部だけがnull、または`unavailable`で一つでも非nullのcandidateは
-全体rejectする。local取得失敗時に直前model vectorを新しいtimestampへ複製せず、quotaが取得できた場合だけ
-その実測値を`unavailable` rowへ保存する。v1互換応答には`unavailable` rowも`model_source` fieldも含めない。
+`confirmed`/`legacy-unknown`でmodel 6値の一部だけがnull、または`reconstructed-from-session`/`unknown`/`unavailable`で
+一つでも非nullのcandidateは全体rejectする。local取得失敗時に直前model vectorを新しいtimestampへ複製せず、quotaが取得できた場合だけ
+その実測値を`unavailable` rowへ保存する。v1互換応答には欠損modelの数値を含めず、`model_source`を持たない場合も欠損metadataだけを維持する。
 旧details clientは最初に`/v3/details`を一回要求し、exact routeの404時だけv2、さらにexact routeの404時だけv1を一回要求する。split対応clientは`/v3/current`を最初に要求し、そのexact 404時だけ同じdetails fallback列へ入る。他のstatus、schema/size/header不正、timeoutではfallbackせず該当surfaceのlast-good rootを保持する。複数versionまたはsplit resourceとdetailsの応答を比較・mergeしてはならない。
 
 各history sample行は`timestamp`、`reset_at`、`remaining_percent`、`sol_dollars`、

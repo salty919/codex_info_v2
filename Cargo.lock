@@ -762,6 +762,7 @@ name = "codex-info-db-writer"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "codex-info-db-reader",
  "rusqlite",
  "rustix 0.38.44",
  "serde_json",

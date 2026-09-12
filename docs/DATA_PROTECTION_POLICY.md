@@ -8,6 +8,8 @@ CUM-138-05
 CUM-138-07
 AUTH-129
 GEN-129
+ACCOUNT-PARTITION-134
+HISTORY-CANONICAL-134
 DB-129
 SESSION-129
 LEGACY-129
@@ -31,6 +33,16 @@ U128-19
 - 既存account境界、DB履歴、quota欠測を保持する。旧REST consumerにASTRAを理解したふりをさせず、記録対応と表示対応の完了を分けて報告する。
 - 1つのSession sourceがsymlink、差替え、読取り失敗、不正recordまたは一時的なI/O障害になっても、そのsourceのcursorを進めず再試行可能な状態を保ち、他の独立した有効sourceの差分保存を続ける。外部quota/app-serverの停止およびREST clientの有無をSession記録の停止条件にしない。
 - 1か月の公開minute上限を、canonicalize前のraw reset alias行数へ適用しない。indexed raw readerの有界budget、canonical履歴上限、wire size上限を別の責務として管理し、いずれかの保護判定でDB writerを停止させない。
+
+## HISTORY-CANONICAL-134 — account履歴の永続的な正規化
+
+- account registryが宣言し、`storage_partition`のidentityと`quick_check`を検証できる全初期化済みpartitionを対象とする。現在ログイン中か、過去accountか、表示用login IDがあるかを対象判定に使わない。registry外、orphan、symlink、unreadable、schema不正、identity不一致のfileは変更せずdegradedとして列挙し、空DBへの置換、別accountへのfallback、推測修復を行わない。全対象partitionが同じalgorithm versionへ到達するまでmigration完了としない。
+- この変換の目的は、旧writerが作った重複`reset_at` aliasと範囲外quota sentinelを稼働DBから完全に排除し、将来のreader・graph・修復処理がそれらを再解釈する余地をなくすことである。移行前の原形は検証済みSQLite backupだけに保存し、稼働DB内へraw互換表、canonical別表、revision同期表、例外補償用stateを追加してはならない。稼働中の履歴正本は`usage_history`一表だけとする。
+- `HistoryCanonicalizer`はPRODUCTの既存bounded rolling・quota・componentwise-dominance・境界規則を実装する唯一のauthorityとする。migrationは保持対象の全`usage_history` rowへ同じ純粋関数を一度適用し、同一timestampを一つのcanonical periodへだけ所属させる。既知の旧sentinelであるexact numeric `-1`はmigration入力でだけ「quota未観測」と解釈して`NULL`へ置換する。通常reader/writerでは`-1`を含む範囲外値を許容しない。同一period内のquota競合・非比較・dominant不存在は値を選択・合成せず、その局所minuteと対応sidecarだけをlive canonical集合から除外して原形をverified backupへ保持する。period ownerまたはcycle境界を一意に決められない場合だけ、そのpartition全体を無変更で失敗させる。
+- 初回migrationはpartition writer lock取得後、現行SQLite connectionからonline backupを作成し、`.bak.1`〜`.bak.3`の既存検証・保持規則を通した後だけ`BEGIN IMMEDIATE`する。DB/WAL/SHMを個別file copyせず、backupはcommit済みsnapshotを含む。backupのraw row countとordered deterministic raw-row fingerprintが移行直前のsourceと一致することを確認し、transaction内で`usage_history`をcanonical row集合へ置換する。`HistoryCanonicalizer`は各canonical rowと同時に、実際に採用したraw usage rowのexact旧`timestamp/reset_at`を返す。対応する`usage_model_history`はそのexact旧キーに結び付いた一群だけを同じcanonical keyへ移し、捨てたreset aliasにだけ結び付いたmodel群を混合・補間・比較選択しない。既存`durable_state`内のhistory observationもexact旧キーが採用rowと一致し、かつ全usage vectorがcanonical rowと一致するものだけを同transactionで再所属する。所属不明、canonical vector不一致、または捨てたaliasのsidecarは正しい観測へ作り替えずlive sidecarから除去し、原形はbackupだけに残す。旧alias row、`-1`、orphan sidecar、並列履歴表を稼働DBへ残さない。
+- 移行後の`usage_history`は`timestamp`を全表で一意、`remaining_percent`を`NULL`または有限な`0..100`、cost/tokenを有限な非負値としてDB制約でも強制する。`usage_model_history`も同一timestamp/modelを一意とし、canonical `usage_history`に対応しないrowを禁止する。通常writeは既存rowとincoming batchを同じperiod判定で一つへreconcileしてから一transactionで保存し、別`reset_at` alias、不正quota、orphan sidecarを生成できない。readerはこの一表を直接読み、raw互換分岐、読出し時merge、UI/RESTでの補償を行わない。
+- backup、lock、identity、schema、raw fingerprint、period/cycle境界、sidecar対応、DB制約、commitのどれかが失敗した場合は全rollbackし、source DB、verified backup、last-good publicationを保持する。同一period内の局所quota/vector不成立は上記canonical除外規則で処理し、partition失敗へ読み替えない。crashがcommit前なら旧schema、commit後ならcanonical単一表とschema versionが一括で可視になる。commit後のfresh read-only readbackに失敗した場合はpublicationを進めない。完成済みschemaの再実行は履歴rowとbackup generationを変更しないno-opとする。
+- 再発防止の合格条件は、製品schema/codeに`canonical_usage_history`、`usage_history_observations`、`history_canonical_state`およびそれらの互換分岐が0件、移行後DBに範囲外quota・同一timestamp重複・旧resetのhistory observation・orphan model sidecarが0件であることを直接確認することである。新しい永続表・revision・例外補償を必要とする案は本目的のscope外として実装せず、先に要件変更の明示確認を必要とする。
 
 この文書は、利用履歴・ローカルセッションログ・thread情報・SQLiteデータベースを変更する全実装の正本である。`DESIGN.md`の補足ではなく、変更を許可するための拘束条件として扱う。
 
@@ -64,12 +76,14 @@ Codex app-server / session JSONL / thread rollout
 
 以下を満たせない変更は不合格とし、fallback値・ゼロ値・空DBで通過させない。
 
-1. 既存の有効なDB行を、収集失敗・認証失敗・通信切断・UI終了・migration失敗で削除、上書き、推測変換しない。
-2. canonical DBは`(ProfileScopeId, AccountScopeId, StorageEpoch)`ごとに物理fileを分け、DB内のusage rowは`(reset_at, timestamp)`で一意である。必須`storage_partition` singletonの`partition_id`は
+1. 既存の有効なDB行を、収集失敗・認証失敗・通信切断・UI終了・migration失敗で削除、上書き、推測変換しない。`HISTORY-CANONICAL-134`の成功済み移行だけは、検証済みbackupへ原形を保持したうえで、旧aliasと既知sentinelをcanonical rowへ置換する。
+2. canonical DBは`(ProfileScopeId, AccountScopeId, StorageEpoch)`ごとに物理fileを分け、DB内のcanonical usage rowは`timestamp`で全表一意である。必須`storage_partition` singletonの`partition_id`は
    その3値に結合し、`timestamp`は有効なUTC event秒を
-   `floor(event_epoch / 60) * 60`へ変換したminute-startであり、同一キーの再計測は行を増やさず、
-   残量はcanonical順序の最後の有効値、累積cost/tokenは列ごとの最大既知値を保持する。元event秒は
-   同一minuteのcanonical順序を決めるためだけに使い、REST/DBのtimestampへ書き戻さない。
+   `floor(event_epoch / 60) * 60`へ変換したminute-startである。同一canonical minuteのdistinct non-null quotaは
+   最大1個、累積cost/tokenは列ごとの最大値を合成せず、同minuteに実在して他の全raw vectorを
+   componentwiseに支配する一つの観測vectorだけを保持する。支配vectorがないminuteはprojection外、cycle境界が
+   一意でないcandidateは全rejectとする。元event秒は同一minuteの順序を検証するためだけに使い、canonical
+   timestampへ書き戻さない。backup保持と単一表置換の詳細は`HISTORY-CANONICAL-134`を正本とする。
 3. DB書き込みはtransaction内だけで行う。busy、I/O、full、corrupt、schema不一致、migration中断はrollbackし、旧DBと旧メモリ世代を保持する。
 4. 有効な完全snapshotだけを公開する。account usageのcommit/publish admissionは現行の
    `(ProfileScopeId, AccountScopeId, StorageEpoch, auth_epoch, AccountUpdateGeneration, CollectorEpoch, CycleSeq)` tupleだけを正本とし、candidateの7要素が全て現行値と一致する場合だけDB、memory、REST、UIへ進める。`SupervisorLeaseIdentity`は同一profile serviceの単一publisher所有権を別に固定し、account generationの代用にしない。
@@ -140,7 +154,7 @@ Codex app-server / session JSONL / thread rollout
 - SQLite transaction lockとbounded busy timeoutを正本とする。ロックを無視した上書き、DB削除、DB再生成は禁止する。
 - `usage_history.sqlite3.bak.1`〜`.bak.3`は時系列の完全SQLite snapshotであり、同じ件数である必要はない。各世代は`PRAGMA quick_check`と再読込で検証する。
 - backup、prune、migrationの失敗は元DBを変更しない。backup/migration候補の検証前は元DBをread-only接続だけで読み、schema・index・permissionを修復しない。pruneはbackup成功後だけ許可する。
-- `UsageStore::migrate_verified`は旧形式の非partition履歴だけを対象とする。account partitionを渡した場合はtransform・candidate作成・切替を行わず拒否する。現行account DBのschema更新は`open_partitioned`の単一transaction内で、既存table/rowを保持する加算的変更だけを行い、成功時に`PRAGMA user_version`を更新する。非加算的なaccount DB移行は未実装であり、自動実行しない。
+- `UsageStore::migrate_verified`は旧形式の非partition履歴だけを対象とする。account partitionを渡した場合はtransform・candidate作成・切替を行わず拒否する。account DBの履歴変換は`HISTORY-CANONICAL-134`の検証済みbackup後の専用経路だけが所有し、成功時にcanonical単一表と`PRAGMA user_version`を同時commitする。
 - backup世代の復元は、対象プロセスを停止し、現在DBを別名退避してから、quick check・schema check・row/hash監査を通した世代だけで行う。通常起動が自動復元を試みてはならない。
 
 ### 4.1 RecorderSupervisor、lease、backfill、gap
@@ -196,7 +210,8 @@ Codex app-server / session JSONL / thread rollout
   fresh authenticated hint（`reset_at > now`、同じcurrent source identity、旧hintでない）が受理された後だけ、新期間へ帰属する
   bounded one-shot backfillを開始する。hint、cursor、source identity、AuthEpoch/nonceが不一致ならcandidate全体を破棄し、gapを埋めず旧rootを保持する。
   logout、token失効、AccountKey変更ではAuthEpochを先に増やし、persisted hintを`state=tombstoned`へatomicに更新してcursorと公開候補を無効化する。
-  hint/DBへemail、account ID、その他の個人識別値を保存せず、opaque nonceとprocess内AuthEpochだけでepoch境界を検証する。
+  hintへlogin ID、raw AccountKeyその他の個人識別値を保存せず、DBの表示専用`storage_partition.login_id`も
+  epoch境界の判定には使わない。opaque nonceとprocess内AuthEpochだけでepoch境界を検証する。
 - daemon停止区間は`RecorderGapLedger`がsource identity/cursorと停止・再開monotonic時刻から回収不能を
   確定した場合だけgapとする。既存REST v1のexact 13-key detailsにある`history_gaps`へconfirmed rowだけを
   projectionし、timestamp不連続だけではmarkerを作らない。確定gapは補間、quota/残量推測、旧値複製の対象外であり、
@@ -227,8 +242,8 @@ Codex app-server / session JSONL / thread rollout
 
 ### 4.3 Schema更新と旧履歴migration
 
-- **account DB startup**: `open_partitioned`はaccount identityと対応schemaをread-only probeで確認してから、単一transactionで不足table/column/indexだけを追加する。既存row・backup・account identityを置換せず、transaction失敗時はschema versionを進めない。
-- **unsupported account migration**: 非加算的なaccount DB変換の自動経路は持たない。`migrate_verified`へaccount partitionを渡しても旧9列履歴への縮退変換はせず、元DBを変更せずに拒否する。
+- **account DB startup**: `open_partitioned`はaccount identityと対応schemaをread-only probeで確認する。旧schemaの場合は、全初期化済みpartitionを列挙するrecorder startupだけが`HISTORY-CANONICAL-134`のverified backupを確定し、専用の単一transactionで`usage_history`と対応model sidecarをcanonical単一正本へ置換する。transaction失敗時はschema versionを進めない。
+- **unsupported account migration**: account DBへ並列raw/canonical表やreader補償を追加する自動経路は持たない。`migrate_verified`へaccount partitionを渡しても旧9列履歴への縮退変換はせず、元DBを変更せずに拒否する。
 - **legacy history migration**: 明示操作で旧形式の非partition履歴を変換する場合だけ`migrate_verified`を使う。read-only sourceから別名candidateを作り、型・値・一意キー、`quick_check`、row count、fingerprint、reset-period境界を検証後に切り替え、旧DBとbackupを保持する。失敗時は元DBを保持し、同callbackで再試行しない。
 
 | fault | bounded action | retention / next state |
@@ -359,19 +374,24 @@ usage rowの一意keyは各物理DB内の`(reset_at,timestamp)`である。DBに
 - `ProfileScopeId`: 保存profileを作成した時に生成する128-bit random opaque ID。raw WSL distro、SSH alias、pathを
   DBへ保存しない。
 - `AccountScopeId`: authenticated app-server ownerがcanonical AccountKeyから、owner-only 256-bit install keyを使い
-  `HMAC-SHA-256("codex-info-account-scope-v1" + NUL + AccountKey)`で生成する32-byte値。raw AccountKey、email、tokenを
-  DB・hint・logへ保存しない。
+  `HMAC-SHA-256("codex-info-account-scope-v1" + NUL + AccountKey)`で生成する32-byte値。raw AccountKeyとtokenを
+  DB・hint・logへ保存しない。stableな`account/read`で確認したlogin IDだけは表示専用値としてowner-only registryと
+  当該account DBへ保存できるが、scope、path、hint、journal、logまたは認証判定へ使用しない。
 - `StorageEpoch`: partition作成時のmonotonic unsigned 64-bit値。account/profile不一致やHMAC key欠落時は新規writeと
   publishを0件にし、自動的な空partitionや推測mergeを作らない。
 
-同一account/profileの再認証は同じpartitionを再利用し、別account/profileは別partitionにする。画面は現在認証済み
-partitionだけを公開し、旧partitionを削除・混合しない。HMAC install keyは0600 owner-only fileへatomic保存し、
+同一account/profileの再認証は同じpartitionを再利用し、別account/profileは別partitionにする。同時書込みauthorityは
+現在認証済みpartition一つだけとし、非認証accountを推測更新しない。初期化済みpartitionは旧accountを含めて
+read-only catalogへ公開し、画面は利用者が明示選択した一つだけを読む。旧partitionを削除・混合せず、account切替時は
+別partitionのpair、cursor、last-goodを再利用しない。HMAC install keyは0600 owner-only fileへatomic保存し、
 欠損時は既存AccountScopeIdを再生成せずrecovery-requiredとする。
 
 canonical AccountKeyはowner-only・regular・0600・1..65536 bytesで前後identityが安定した
 `CODEX_HOME/auth.json`のexact `tokens.account_id` bytesである。前後`account/read`とprocess-local
 `AccountUpdateGeneration`を含むconfirmed windowが不一致なら、DB/WAL/SHM、checkpoint、publishを0件にする。
-raw AccountKey、email、tokenはpath、profile metadata、DB、journal、log、RESTへ保存しない。
+raw AccountKeyとtokenはpath、profile metadata、DB、journal、log、RESTへ保存しない。login IDは1..254 Unicode scalar、
+trim済み・control文字なしを再検証し、owner-only account registryと当該account DBの表示label、およびloopback限定
+`GET /v3/accounts`のnullable `login_id`にだけ使用する。login IDの取得・保存失敗はusage記録を停止させない。
 
 ### 8.7 DP-REST-006 / RC-144 — cursorとDB transaction
 

@@ -243,15 +243,39 @@ public sealed class DetailsWindowViewModelTests
 
         using var graph = new GraphWindowViewModel(main);
         Assert.Single(graph.Periods);
-        Assert.Equal(2, graph.Points.Count);
+        Assert.Equal(3, graph.Points.Count);
         Assert.Equal(3.75, graph.Points[0].LunaValue);
         Assert.Equal(4.5, graph.Points[1].LunaValue);
+        Assert.Equal(period.EndAt, graph.Points[^1].Timestamp);
 
         graph.SelectedMetric = graph.Texts.Tokens;
         Assert.Equal(300, graph.Points[0].LunaValue);
         Assert.Equal(360, graph.Points[1].LunaValue);
         graph.ShowLuna = false;
         Assert.False(graph.ShowLuna);
+        Assert.DoesNotContain("LUNA", graph.Scene.ModelSeries.Keys);
+        graph.ShowLuna = true;
+        Assert.Contains("LUNA", graph.Scene.ModelSeries.Keys);
+    }
+
+    [Fact]
+    public void PeriodStartFormatting_follows_selected_language_date_order_without_end_time()
+    {
+        const long startAt = 1_709_900_000;
+        var local = TimeZoneInfo.ConvertTime(
+            DateTimeOffset.FromUnixTimeSeconds(startAt),
+            LocalizationService.DisplayTimeZone);
+        var monthFirst = local.ToString("MM/dd HH:mm", CultureInfo.InvariantCulture);
+        var dayFirst = local.ToString("dd/MM HH:mm", CultureInfo.InvariantCulture);
+
+        foreach (var language in new[] { "ja", "en", "zh-Hans", "ko" })
+        {
+            Assert.Equal(monthFirst, GraphWindowViewModel.FormatPeriodStart(startAt, language));
+        }
+        foreach (var language in new[] { "es", "fr", "de", "pt", "it", "ru" })
+        {
+            Assert.Equal(dayFirst, GraphWindowViewModel.FormatPeriodStart(startAt, language));
+        }
     }
 
     [Fact]
@@ -315,9 +339,12 @@ public sealed class DetailsWindowViewModelTests
         Assert.Equal(oldStart, graph.SelectedPeriodStartAt);
         Assert.Equal(GraphWindowViewModel.MaxRenderedGraphPoints, graph.Points.Count);
         Assert.Equal(5_001, graph.Scene.Timestamps.Count);
+        // Missing lifecycle metadata does not erase exact cumulative token and
+        // Remaining evidence. The synthetic period-end hold is not part of idle.
         var idle = Assert.Single(graph.Scene.IdleIntervals);
         Assert.Equal(oldStart, idle.StartAt);
         Assert.Equal(oldStart + 4_999L * 60, idle.EndAt);
+        Assert.False(idle.PreserveBoundary);
         Assert.NotSame(previousPoints, graph.Points);
         Assert.False(graph.HasLoadError);
     }

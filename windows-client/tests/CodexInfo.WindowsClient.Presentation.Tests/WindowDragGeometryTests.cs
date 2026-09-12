@@ -47,12 +47,14 @@ public sealed class GraphWindowViewModelProjectionTests
 
         var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_620);
 
-        // The admitted row is already a UTC minute-start. The line projector,
-        // rather than a fabricated observation, owns the dashed terminal hold.
-        Assert.Equal([1_380L], samples.Select(sample => sample.Timestamp));
+        // The period endpoint is explicit presentation evidence. It carries
+        // no quota observation and is rendered as an inferred terminal hold.
+        Assert.Equal([1_380L, 2_040L], samples.Select(sample => sample.Timestamp));
         Assert.Equal(80, samples[0].RemainingPercent);
         Assert.Equal(10UL, samples[0].SolTokens);
         Assert.Equal(1, samples[^1].SolDollars);
+        Assert.Null(samples[^1].RemainingPercent);
+        Assert.True(samples[^1].IsSyntheticTail);
     }
 
     [Theory]
@@ -70,9 +72,10 @@ public sealed class GraphWindowViewModelProjectionTests
 
         var samples = GraphWindowViewModel.BuildGraphSamples(period, now);
 
-        Assert.Equal([1_020L], samples.Select(sample => sample.Timestamp));
+        Assert.Equal([1_020L, 2_040L], samples.Select(sample => sample.Timestamp));
         Assert.Equal(1, samples[0].SolDollars);
         Assert.Equal(80, samples[0].RemainingPercent);
+        Assert.True(samples[^1].IsSyntheticTail);
     }
 
     [Fact]
@@ -163,6 +166,8 @@ public sealed class GraphWindowViewModelProjectionTests
         var samples = GraphWindowViewModel.BuildGraphSamples(period, 1_500);
 
         Assert.All(samples, sample => Assert.Null(sample.RemainingPercent));
+        Assert.Equal([1_200L, 2_000L], samples.Select(sample => sample.Timestamp));
+        Assert.True(samples[^1].IsSyntheticTail);
     }
 }
 

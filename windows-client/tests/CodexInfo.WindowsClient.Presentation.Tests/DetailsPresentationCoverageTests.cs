@@ -29,7 +29,7 @@ public sealed class DetailsPresentationCoverageTests
         Assert.Empty(graph.Points);
         Assert.False(graph.Scene.HasPoints);
         Assert.Null(graph.SelectedPeriod);
-        Assert.Equal(graph.Texts.UnavailableValue, graph.SelectedPeriodText);
+        Assert.Equal($"{graph.Texts.PeriodSelectorHeading}｜{graph.Texts.UnavailableValue}", graph.SelectedPeriodText);
 
         var changed = new HashSet<string>();
         graph.PropertyChanged += (_, args) => changed.Add(args.PropertyName ?? string.Empty);
@@ -43,9 +43,9 @@ public sealed class DetailsPresentationCoverageTests
             Assert.Contains(nameof(GraphWindowViewModel.Texts), changed);
             Assert.Contains(nameof(GraphWindowViewModel.MetricOptions), changed);
             Assert.Contains(nameof(GraphWindowViewModel.MetricAxisText), changed);
-            Assert.Equal(graph.Texts.Dollars, graph.MetricOptions[0]);
+            Assert.Equal(graph.Texts.GraphDollarMetric, graph.MetricOptions[0]);
             Assert.Equal(graph.Texts.Tokens, graph.MetricOptions[1]);
-            Assert.Equal(graph.Texts.UnavailableValue, graph.SelectedPeriodText);
+            Assert.Equal($"{graph.Texts.PeriodSelectorHeading}｜{graph.Texts.UnavailableValue}", graph.SelectedPeriodText);
         }
         finally
         {
@@ -108,7 +108,7 @@ public sealed class DetailsPresentationCoverageTests
         Assert.Equal(second.StartAt, graph.SelectedPeriodStartAt);
         Assert.Equal(second.EndAt, graph.SelectedPeriodEndAt);
         Assert.NotEmpty(graph.Points);
-        Assert.Equal(second.Samples[^1].Timestamp, graph.Points[^1].Timestamp);
+        Assert.Equal(second.EndAt, graph.Points[^1].Timestamp);
     }
 
     [Fact]
@@ -127,7 +127,7 @@ public sealed class DetailsPresentationCoverageTests
         graph.SelectedPeriod = second;
         Assert.True(graph.HasPoints);
         Assert.Equal(second.Id, graph.SelectedPeriod?.Id);
-        Assert.Equal(second.Label, graph.SelectedPeriodText);
+        Assert.Equal($"{graph.Texts.PeriodSelectorHeading}｜{second.Label}", graph.SelectedPeriodText);
 
         graph.SelectedMetric = graph.Texts.Tokens;
         Assert.False(graph.IsDollars);
@@ -221,6 +221,66 @@ public sealed class DetailsPresentationCoverageTests
     }
 
     [Fact]
+    public async Task GraphWindow_FailedPeriodSwitchKeepsAcceptedSelectorAndSceneTogether()
+    {
+        var pair = PublishedPairIdentity.Create($"v1:{new string('8', 64)}");
+        var current = CreateSmallPeriod("current", 4_300_000, 4_300_120, current: true, remaining: 80, token: 100);
+        var rejected = new ApiHistoryPeriod("rejected", 4_400_000, 4_400_120, false, "rejected");
+        var details = CreateDetails([current, rejected], Array.Empty<ApiThreadDetails>());
+        var resourceClient = new DeferredEmptyHistoryResourceClient(
+            details,
+            current,
+            rejected,
+            pair,
+            failEmpty: true);
+        using var main = new MainWindowViewModel(
+            new StaticCombinedClient(DetailsFetchResult.Success(details)),
+            resourceClient);
+        var pendingUi = new ConcurrentQueue<Action>();
+        using var graph = new GraphWindowViewModel(main, action => pendingUi.Enqueue(action));
+
+        await PumpUiUntilAsync(pendingUi, () => graph.HasPoints && !graph.IsLoading);
+        var acceptedPeriod = graph.SelectedPeriod;
+        var acceptedText = graph.SelectedPeriodText;
+        var acceptedScene = graph.Scene;
+
+        graph.SelectedPeriod = Assert.Single(graph.Periods, period => period.Id == rejected.Id);
+
+        Assert.True(graph.IsLoading);
+        Assert.Same(acceptedPeriod, graph.SelectedPeriod);
+        Assert.Equal(acceptedText, graph.SelectedPeriodText);
+        Assert.Same(acceptedScene, graph.Scene);
+        await EventuallyAsync(() => resourceClient.EmptyRequestStarted);
+
+        resourceClient.CompleteEmptyRequest();
+        await PumpUiUntilAsync(pendingUi, () => graph.HasLoadError);
+
+        Assert.False(graph.IsLoading);
+        Assert.Same(acceptedPeriod, graph.SelectedPeriod);
+        Assert.Equal(acceptedText, graph.SelectedPeriodText);
+        Assert.Same(acceptedScene, graph.Scene);
+    }
+
+    [Fact]
+    public async Task GraphWindow_NonResourceGapsAreScopedToTheSelectedReset()
+    {
+        var selected = CreateSmallPeriod("selected", 4_500_000, 4_500_120, current: true, remaining: 80, token: 100);
+        var other = CreateSmallPeriod("other", 4_500_000, 4_600_120, current: false, remaining: 60, token: 200);
+        var selectedGap = new ApiHistoryGap("selected-gap", selected.ResetAt, 4_500_030, 4_500_050, "collector");
+        var otherGap = new ApiHistoryGap("other-gap", other.ResetAt, 4_500_040, 4_500_060, "collector");
+        var details = CreateDetails([selected, other], Array.Empty<ApiThreadDetails>()) with
+        {
+            HistoryGaps = [selectedGap, otherGap],
+        };
+        using var main = await StartMainAsync(details);
+        using var graph = new GraphWindowViewModel(main);
+
+        var gap = Assert.Single(graph.Scene.ConfirmedGaps);
+        Assert.Equal(selectedGap.StartAt, gap.StartAt);
+        Assert.Equal(selectedGap.EndAt, gap.EndAt);
+    }
+
+    [Fact]
     public async Task GraphWindow_ExactStaleCursorRetriesHeadOnceAndPreservesResetStateAcrossFailures()
     {
         const long start = 6_000_000;
@@ -273,7 +333,7 @@ public sealed class DetailsPresentationCoverageTests
     }
 
     [Fact]
-    public async Task GraphWindow_PublishedPairChangeUsesProvenCursorAndAtomicallyAppends()
+    public async Task GraphWindow_PublishedPairAdvanceRealignsOnceWithoutFalseFailure()
     {
         const long start = 6_100_000;
         var firstPair = PublishedPairIdentity.Create($"v1:{new string('c', 64)}");
@@ -297,8 +357,10 @@ public sealed class DetailsPresentationCoverageTests
 
         await PumpUiUntilAsync(pendingUi, () => graph.HasPoints);
         Assert.Equal([null], resourceClient.Cursors);
-        Assert.Single(graph.Points);
+        Assert.Equal(2, graph.Points.Count);
         Assert.Equal(firstSample.Timestamp, graph.Points[0].Timestamp);
+        Assert.Equal(period.EndAt, graph.Points[^1].Timestamp);
+        Assert.Null(graph.Points[^1].RemainingPercent);
 
         await RefreshGraphResourceAsync(graph, period.Id);
         await PumpUiUntilAsync(
@@ -306,7 +368,8 @@ public sealed class DetailsPresentationCoverageTests
             () => !graph.HasLoadError &&
                 graph.Points.Any(point => point.Timestamp == secondSample.Timestamp));
 
-        Assert.Equal([null, "A0"], resourceClient.Cursors);
+        Assert.Equal([null, "A0", null], resourceClient.Cursors);
+        Assert.False(graph.HasLoadError);
         Assert.Contains(graph.Points, point => point.Timestamp == firstSample.Timestamp && point.SolValue == 1);
         Assert.Contains(graph.Points, point => point.Timestamp == secondSample.Timestamp && point.SolValue == 20);
     }
@@ -353,8 +416,10 @@ public sealed class DetailsPresentationCoverageTests
         await PumpUiUntilAsync(pendingUi, () => graph.HasLoadError);
         Assert.Equal([null, "C0", "C0", "C0", "P1"], resourceClient.Cursors);
         Assert.Same(lastGoodScene, graph.Scene);
-        Assert.Single(graph.Points);
+        Assert.Equal(2, graph.Points.Count);
         Assert.Equal(samples[0].Timestamp, graph.Points[0].Timestamp);
+        Assert.Equal(period.EndAt, graph.Points[^1].Timestamp);
+        Assert.Null(graph.Points[^1].RemainingPercent);
     }
 
     [Fact]
@@ -700,7 +765,8 @@ public sealed class DetailsPresentationCoverageTests
         ApiDetailsSnapshot details,
         ApiHistoryPeriod current,
         ApiHistoryPeriod empty,
-        PublishedPairIdentity pair) : ILoopbackDetailsClient, ILoopbackResourceClient
+        PublishedPairIdentity pair,
+        bool failEmpty = false) : ILoopbackDetailsClient, ILoopbackResourceClient
     {
         private readonly TaskCompletionSource emptyRequestStarted =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -740,6 +806,10 @@ public sealed class DetailsPresentationCoverageTests
             {
                 emptyRequestStarted.TrySetResult();
                 await releaseEmptyRequest.Task.WaitAsync(cancellationToken);
+                if (failEmpty)
+                {
+                    return HistoryPageFetchResult.FromFailure(DetailsFetchFailure.Transport);
+                }
                 samples = Array.Empty<ApiHistorySample>();
             }
             else
@@ -861,7 +931,10 @@ public sealed class DetailsPresentationCoverageTests
         public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
             CancellationToken cancellationToken = default)
         {
-            var pair = Interlocked.Increment(ref periodsCalls) == 1 ? firstPair : secondPair;
+            // The second periods read deliberately races with a page from the
+            // next root. The view-model must retry the complete transaction,
+            // whose third periods read then aligns with that page generation.
+            var pair = Interlocked.Increment(ref periodsCalls) <= 2 ? firstPair : secondPair;
             return Task.FromResult(HistoryPeriodsFetchResult.Success(
                 new ApiHistoryPeriodsSnapshot([period], pair)));
         }
@@ -877,11 +950,16 @@ public sealed class DetailsPresentationCoverageTests
             }
 
             var call = Interlocked.Increment(ref pageCalls);
-            var sample = call == 1 ? firstSample : secondSample;
             var pair = call == 1 ? firstPair : secondPair;
+            IReadOnlyList<ApiHistorySample> pageSamples = call switch
+            {
+                1 => [firstSample],
+                2 => [secondSample],
+                _ => [firstSample, secondSample],
+            };
             return Task.FromResult(HistoryPageFetchResult.Success(new ApiHistoryPage(
                 periodId,
-                [sample],
+                pageSamples,
                 Array.Empty<ApiHistoryGap>(),
                 NextCursor: null,
                 ResumeCursor: call == 1 ? "A0" : "B0",

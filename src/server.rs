@@ -450,8 +450,9 @@ pub struct PublicHistoryModelUsageV3 {
     pub cache_write_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
-    /// Exact cumulative dollars retained by the legacy history row or
-    /// calculated from a known price. `None` means price is unknown.
+    /// Exact cumulative dollars stored for this same observation key.
+    /// `None` means the historical value was not observed; the REST layer
+    /// never reprices cumulative tokens to manufacture it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_dollars: Option<f64>,
 }
@@ -459,7 +460,7 @@ pub struct PublicHistoryModelUsageV3 {
 pub fn legacy_history_models_v3(
     sample: &PublicHistoryObservation,
 ) -> Option<Vec<PublicHistoryModelUsageV3>> {
-    if sample.model_source == "unavailable" {
+    if !matches!(sample.model_source.as_str(), "confirmed" | "legacy-unknown") {
         return None;
     }
     let values = [
@@ -491,6 +492,10 @@ pub struct PublicHistoryObservationV3 {
     pub timestamp: i64,
     pub reset_at: i64,
     pub remaining_percent: Option<f64>,
+    /// Whether a task was active at any point since the preceding sample in
+    /// this period. Missing lifecycle coverage is represented by `None`.
+    #[serde(default)]
+    pub task_active_since_previous: Option<bool>,
     pub models: Option<Vec<PublicHistoryModelUsageV3>>,
     /// False means omitted models are unknown rather than zero.
     pub models_complete: bool,
@@ -585,6 +590,9 @@ impl PublicDetailsV2 {
                 .history_samples
                 .iter()
                 .filter_map(|sample| {
+                    if !matches!(sample.model_source.as_str(), "confirmed" | "legacy-unknown") {
+                        return None;
+                    }
                     Some(PublicHistorySample {
                         timestamp: sample.timestamp,
                         reset_at: sample.reset_at,
@@ -639,8 +647,12 @@ impl PublicDetailsV2 {
             let tokens = [sample.sol_tokens, sample.terra_tokens, sample.luna_tokens];
             let complete = values.iter().all(Option::is_some) && tokens.iter().all(Option::is_some);
             let empty = values.iter().all(Option::is_none) && tokens.iter().all(Option::is_none);
-            if (sample.model_source == "unavailable" && !empty)
-                || (sample.model_source != "unavailable" && !complete)
+            if (matches!(
+                sample.model_source.as_str(),
+                "unavailable" | "reconstructed-from-session"
+            ) && !empty)
+                || (matches!(sample.model_source.as_str(), "confirmed" | "legacy-unknown")
+                    && !complete)
                 || values
                     .iter()
                     .flatten()
@@ -738,17 +750,22 @@ impl PublicDetailsV3 {
             history_samples: details
                 .history_samples
                 .iter()
-                .map(|sample| PublicHistoryObservationV3 {
-                    timestamp: sample.timestamp,
-                    reset_at: sample.reset_at,
-                    remaining_percent: sample.remaining_percent,
-                    models: legacy_history_models_v3(sample),
-                    models_complete: false,
-                    model_source: match sample.model_source.as_str() {
-                        "unavailable" => "unavailable".to_owned(),
-                        "reconstructed-from-session" => "reconstructed-from-session".to_owned(),
-                        _ => "legacy-unknown".to_owned(),
-                    },
+                .map(|sample| {
+                    let models = legacy_history_models_v3(sample);
+                    let model_source = match sample.model_source.as_str() {
+                        "confirmed" | "legacy-unknown" if models.is_some() => "legacy-unknown",
+                        "reconstructed-from-session" => "reconstructed-from-session",
+                        _ => "unavailable",
+                    };
+                    PublicHistoryObservationV3 {
+                        timestamp: sample.timestamp,
+                        reset_at: sample.reset_at,
+                        remaining_percent: sample.remaining_percent,
+                        task_active_since_previous: None,
+                        models,
+                        models_complete: false,
+                        model_source: model_source.to_owned(),
+                    }
                 })
                 .collect(),
             history_gaps: details.history_gaps.clone(),
@@ -826,10 +843,17 @@ impl PublicDetailsV3 {
                 || sample
                     .remaining_percent
                     .is_some_and(|value| !value.is_finite() || !(0.0..=100.0).contains(&value))
-                || (sample.model_source == "unavailable" && sample.models.is_some())
-                || (sample.model_source == "unavailable" && sample.models_complete)
+                || (matches!(
+                    sample.model_source.as_str(),
+                    "unavailable" | "reconstructed-from-session"
+                ) && sample.models.is_some())
+                || (matches!(
+                    sample.model_source.as_str(),
+                    "unavailable" | "reconstructed-from-session"
+                ) && sample.models_complete)
                 || (sample.model_source == "confirmed"
                     && (sample.models.is_none() || !sample.models_complete))
+                || (sample.model_source == "legacy-unknown" && sample.models_complete)
                 || (sample.models_complete && sample.models.is_none())
             {
                 return Err(ApiSnapshotError::InvalidHistoryObservation);
@@ -4136,10 +4160,21 @@ mod tests {
     }
 
     #[test]
-    fn reconstructed_session_source_is_preserved_and_remains_non_confirmed() {
+    fn reconstructed_session_source_never_publishes_model_values() {
         let mut details_v2 = PublicDetailsV2::from(detailed_fixture());
         details_v2.history_samples[0].model_source = "reconstructed-from-session".into();
+        assert_eq!(
+            details_v2.validate(),
+            Err(ApiSnapshotError::InvalidHistoryObservation)
+        );
+        details_v2.history_samples[0].sol_dollars = None;
+        details_v2.history_samples[0].terra_dollars = None;
+        details_v2.history_samples[0].luna_dollars = None;
+        details_v2.history_samples[0].sol_tokens = None;
+        details_v2.history_samples[0].terra_tokens = None;
+        details_v2.history_samples[0].luna_tokens = None;
         details_v2.validate().unwrap();
+        assert!(details_v2.to_v1_projection().history_samples.is_empty());
 
         let details_v3 = PublicDetailsV3::from_v2_compat(&details_v2);
         assert_eq!(
@@ -4147,6 +4182,7 @@ mod tests {
             "reconstructed-from-session"
         );
         assert!(!details_v3.history_samples[0].models_complete);
+        assert!(details_v3.history_samples[0].models.is_none());
         details_v3.validate().unwrap();
         let wire: Value =
             serde_json::from_slice(&serialize_details_v3(&details_v3).unwrap()).unwrap();
@@ -4154,13 +4190,10 @@ mod tests {
             wire["history_samples"][0]["model_source"],
             "reconstructed-from-session"
         );
+        assert!(wire["history_samples"][0]["models"].is_null());
 
-        let mut complete = details_v3.clone();
-        complete.history_samples[0].models_complete = true;
-        complete.validate().unwrap();
-
-        let mut invalid = complete;
-        invalid.history_samples[0].models = None;
+        let mut invalid = details_v3;
+        invalid.history_samples[0].models = Some(Vec::new());
         assert_eq!(
             invalid.validate(),
             Err(ApiSnapshotError::InvalidHistoryObservation)

@@ -4,6 +4,7 @@
 using System.Diagnostics;
 using System.Collections.Specialized;
 using System.ComponentModel;
+using System.Globalization;
 using System.Reflection;
 using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.Localization;
@@ -168,6 +169,202 @@ public sealed class MainWindowViewModelTests
         Assert.Equal(1UL, viewModel.ActiveThreadCount);
         Assert.Equal(0, viewModel.ActiveOtherCount);
         Assert.Same(thread, Assert.Single(viewModel.DetailsSnapshot!.Threads));
+    }
+
+    [Fact]
+    public async Task AccountSelectionDefaultsToCurrentAndClearsThePreviousGeneration()
+    {
+        var client = new AccountScopedClient();
+        using var viewModel = new MainWindowViewModel(client);
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.IsAuthenticated &&
+            viewModel.SelectedAccount?.Id == "account-7");
+
+        Assert.Equal("アカウント 7 · ID未復元［ログイン中］", viewModel.SelectedAccountText);
+        Assert.True(viewModel.SelectAccount("account-13"));
+        Assert.NotEqual("account-7", viewModel.DetailsSnapshot?.AccountId);
+        Assert.Equal("アカウント 13 · ID未復元［履歴］", viewModel.SelectedAccountText);
+
+        await EventuallyAsync(() => viewModel.IsAuthenticated &&
+            viewModel.DetailsSnapshot?.AccountId == "account-13");
+        Assert.Contains("account-7", client.CurrentAccountIds);
+        Assert.Contains("account-13", client.CurrentAccountIds);
+        Assert.All(client.CurrentAccountIds, accountId =>
+            Assert.True(accountId is "account-7" or "account-13"));
+    }
+
+    [Fact]
+    public async Task PeriodicRefreshDoesNotResetStableMainCollectionsOrItemsSources()
+    {
+        var client = new AccountScopedClient();
+        using var viewModel = new MainWindowViewModel(client);
+
+        viewModel.Start();
+        await WaitForPipelineCompletion(viewModel, CurrentContext(viewModel));
+        var selectedAccount = viewModel.SelectedAccount;
+        var accountRows = viewModel.Accounts.ToArray();
+        var quotaRows = viewModel.QuotaSegments.ToArray();
+        var accountCollectionChanges = 0;
+        var quotaCollectionChanges = 0;
+        var itemSourceNotifications = new List<string?>();
+        NotifyCollectionChangedEventHandler accountHandler = (_, _) => accountCollectionChanges++;
+        NotifyCollectionChangedEventHandler quotaHandler = (_, _) => quotaCollectionChanges++;
+        PropertyChangedEventHandler propertyHandler = (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName is nameof(MainWindowViewModel.Accounts) or
+                nameof(MainWindowViewModel.QuotaSegments))
+            {
+                itemSourceNotifications.Add(eventArgs.PropertyName);
+            }
+        };
+        ((INotifyCollectionChanged)viewModel.Accounts).CollectionChanged += accountHandler;
+        ((INotifyCollectionChanged)viewModel.QuotaSegments).CollectionChanged += quotaHandler;
+        viewModel.PropertyChanged += propertyHandler;
+
+        await InvokePrivateTask(viewModel, "RunPeriodicRefreshAsync");
+
+        ((INotifyCollectionChanged)viewModel.Accounts).CollectionChanged -= accountHandler;
+        ((INotifyCollectionChanged)viewModel.QuotaSegments).CollectionChanged -= quotaHandler;
+        viewModel.PropertyChanged -= propertyHandler;
+        Assert.Equal(0, accountCollectionChanges);
+        Assert.Equal(0, quotaCollectionChanges);
+        Assert.Empty(itemSourceNotifications);
+        Assert.Same(selectedAccount, viewModel.SelectedAccount);
+        Assert.Equal(accountRows.Length, viewModel.Accounts.Count);
+        Assert.Equal(quotaRows.Length, viewModel.QuotaSegments.Count);
+        Assert.All(accountRows.Select((row, index) => (row, index)), item =>
+            Assert.Same(item.row, viewModel.Accounts[item.index]));
+        Assert.All(quotaRows.Select((row, index) => (row, index)), item =>
+            Assert.Same(item.row, viewModel.QuotaSegments[item.index]));
+    }
+
+    [Fact]
+    public async Task InactiveAccountShowsItsRecordedPointWithoutLiveCountdownOrThreads()
+    {
+        var client = new AccountScopedClient();
+        using var viewModel = new MainWindowViewModel(client);
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.IsAuthenticated &&
+            viewModel.SelectedAccount?.Id == "account-7");
+        Assert.True(viewModel.SelectAccount("account-13"));
+        await EventuallyAsync(() => viewModel.IsAuthenticated &&
+            viewModel.DetailsSnapshot?.AccountId == "account-13");
+
+        const long historicalObservedAt = 1_700_000_000;
+        var observedLocal = TimeZoneInfo.ConvertTime(
+            DateTimeOffset.FromUnixTimeSeconds(historicalObservedAt),
+            LocalizationService.DisplayTimeZone)
+            .ToString("M/d HH:mm", CultureInfo.CurrentCulture);
+
+        Assert.True(viewModel.IsSelectedAccountHistorical);
+        Assert.Equal(viewModel.SelectedAccountText, viewModel.StatusTitle);
+        Assert.Equal("過去の記録を表示しています", viewModel.StatusDetail);
+        Assert.Equal($"最終記録 {observedLocal}", viewModel.LastReceivedText);
+        Assert.Equal("記録終了時の期間", viewModel.QuotaWindowText);
+        Assert.Equal("$42.00", viewModel.Models.Single().InputDollarsText);
+        Assert.Equal(2UL, viewModel.DetailsSnapshot!.ActiveThreadCount);
+        var resetLocal = TimeZoneInfo.ConvertTime(
+            DateTimeOffset.FromUnixTimeSeconds(1_700_000_600),
+            LocalizationService.DisplayTimeZone)
+            .ToString("g", CultureInfo.CurrentCulture);
+        Assert.Equal(resetLocal, viewModel.ResetAtText);
+        Assert.Equal(viewModel.ResetAtText, viewModel.QuotaRemainingText);
+        Assert.Equal(0, viewModel.QuotaRemainingPeriodValue);
+        Assert.False(viewModel.HasActiveThreads);
+        Assert.False(viewModel.HasNoActiveThreads);
+        Assert.True(viewModel.HasHistoricalThreadNotice);
+        Assert.Equal(LocalizationService.Current.UnavailableValue, viewModel.ActiveThreadCountText);
+        Assert.DoesNotContain("account-7", viewModel.DetailsSnapshot!.PlanLabel ?? string.Empty, StringComparison.Ordinal);
+        Assert.DoesNotContain("account-13", client.ThreadAccountIds);
+
+        using var threads = new ThreadsWindowViewModel(viewModel, action => action());
+        await Task.Delay(20);
+        Assert.Empty(threads.Threads);
+        Assert.Equal(LocalizationService.Current.HistoricalThreadsUnavailable, threads.EmptyText);
+        Assert.DoesNotContain("account-13", client.ThreadAccountIds);
+    }
+
+    [Fact]
+    public async Task AccountSelectionSchedulesARefreshAfterAnInFlightGenerationCompletes()
+    {
+        var client = new AccountScopedClient(blockFirstCurrent: true);
+        using var viewModel = new MainWindowViewModel(client);
+
+        viewModel.Start();
+        await client.FirstCurrentStarted.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("account-7", viewModel.SelectedAccount?.Id);
+        Assert.True(viewModel.SelectAccount("account-13"));
+        Assert.Null(viewModel.DetailsSnapshot);
+
+        client.CompleteFirstCurrent();
+        await EventuallyAsync(() => viewModel.IsAuthenticated &&
+            viewModel.DetailsSnapshot?.AccountId == "account-13");
+
+        Assert.Equal(["account-7", "account-13"], client.CurrentAccountIds);
+    }
+
+    [Fact]
+    public async Task GraphAndThreadsUseTheSelectedAccountBoundary()
+    {
+        var client = new AccountScopedClient();
+        using var viewModel = new MainWindowViewModel(client);
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.IsAuthenticated &&
+            viewModel.SelectedAccount?.Id == "account-7");
+
+        using var graph = new GraphWindowViewModel(viewModel, action => action());
+        using var threads = new ThreadsWindowViewModel(viewModel, action => action());
+        await EventuallyAsync(() => client.HistoryPeriodAccountIds.Contains("account-7") &&
+            client.HistoryPageAccountIds.Contains("account-7") &&
+            client.ThreadAccountIds.Contains("account-7"));
+
+        Assert.True(viewModel.SelectAccount("account-13"));
+        await EventuallyAsync(() => client.HistoryPeriodAccountIds.Contains("account-13") &&
+            client.HistoryPageAccountIds.Contains("account-13"));
+        Assert.DoesNotContain("account-13", client.ThreadAccountIds);
+        Assert.Empty(threads.Threads);
+        Assert.Empty(graph.Points);
+    }
+
+    [Fact]
+    public async Task SplitGenerationAdvanceRetriesOnceWithoutPublishingFalseFailure()
+    {
+        var first = CurrentSnapshot(activeThreadCount: 1);
+        var sol = ThreadDetails("gpt-5.6-sol");
+        var second = CurrentSnapshot(activeThreadCount: 1, observedAt: 2) with
+        {
+            PublishedPair = PublishedPair(OtherPublishedPair),
+        };
+        var client = new SequencedSplitClient(
+            [first, second, second],
+            [
+                ThreadsFetchResult.Success(new ApiThreadsSnapshot([sol], first.PublishedPair)),
+                ThreadsFetchResult.Success(new ApiThreadsSnapshot([sol], first.PublishedPair)),
+                ThreadsFetchResult.Success(new ApiThreadsSnapshot([sol], second.PublishedPair)),
+            ]);
+        using var viewModel = new MainWindowViewModel(client);
+        var publishedFalseFailure = false;
+        viewModel.PropertyChanged += (_, eventArgs) =>
+        {
+            if (eventArgs.PropertyName == nameof(MainWindowViewModel.DetailsStatusAutomationText) &&
+                viewModel.DetailsStatusAutomationText == "error")
+            {
+                publishedFalseFailure = true;
+            }
+        };
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.ActiveSolCount == 1);
+
+        viewModel.RefreshCommand.Execute(null);
+        await EventuallyAsync(() => viewModel.DetailsSnapshot?.ObservedAt == 2);
+
+        Assert.False(publishedFalseFailure);
+        Assert.Equal(3, client.CurrentCallCount);
+        Assert.Equal(3, client.ThreadsCallCount);
+        Assert.Equal(OtherPublishedPair, viewModel.DetailsSnapshot!.PublishedPair?.ToString());
     }
 
     [Theory]
@@ -963,7 +1160,7 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
-    public async Task RefreshPublishesModelAndQuotaCollectionsAsOneAtomicReset()
+    public async Task RefreshUpdatesStableModelAndQuotaRowsWithoutCollectionReset()
     {
         var firstDetails = DetailsSnapshot(1.25);
         var secondDetails = DetailsSnapshot(2.5);
@@ -977,6 +1174,8 @@ public sealed class MainWindowViewModelTests
 
         viewModel.Start();
         await EventuallyAsync(() => viewModel.HasDetails && !viewModel.IsStartupLoading);
+        var modelRow = viewModel.Models[0];
+        var quotaRows = viewModel.QuotaSegments.ToArray();
 
         var modelChanges = 0;
         var quotaChanges = 0;
@@ -990,8 +1189,12 @@ public sealed class MainWindowViewModelTests
 
         ((INotifyCollectionChanged)viewModel.Models).CollectionChanged -= modelHandler;
         ((INotifyCollectionChanged)viewModel.QuotaSegments).CollectionChanged -= quotaHandler;
-        Assert.Equal(1, modelChanges);
-        Assert.Equal(1, quotaChanges);
+        Assert.Equal(0, modelChanges);
+        Assert.Equal(0, quotaChanges);
+        Assert.Same(modelRow, viewModel.Models[0]);
+        Assert.Equal(quotaRows.Length, viewModel.QuotaSegments.Count);
+        Assert.All(quotaRows.Select((row, index) => (row, index)), item =>
+            Assert.Same(item.row, viewModel.QuotaSegments[item.index]));
     }
 
     [Fact]
@@ -1615,6 +1818,10 @@ public sealed class MainWindowViewModelTests
         private int currentIndex;
         private int threadsIndex;
 
+        public int CurrentCallCount => Volatile.Read(ref currentIndex);
+
+        public int ThreadsCallCount => Volatile.Read(ref threadsIndex);
+
         protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(
             CancellationToken cancellationToken = default) =>
             throw new InvalidOperationException("The split client must not request combined details.");
@@ -2003,6 +2210,231 @@ public sealed class MainWindowViewModelTests
     {
         protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(CancellationToken cancellationToken = default) =>
             throw new InvalidOperationException("The connection start test must not depend on HTTP.");
+    }
+
+    private sealed class AccountScopedClient : HealthyDetailsClientBase,
+        ILoopbackResourceClient,
+        ILoopbackAccountsClient,
+        ILoopbackAccountResourceClient
+    {
+        private readonly bool blockFirstCurrent;
+        private readonly object gate = new();
+        private readonly List<string> currentAccountIds = [];
+        private readonly List<string> threadAccountIds = [];
+        private readonly List<string> historyPeriodAccountIds = [];
+        private readonly List<string> historyPageAccountIds = [];
+        private readonly TaskCompletionSource<object?> firstCurrentStarted = NewSignal<object?>();
+        private readonly TaskCompletionSource<CurrentFetchResult> firstCurrentCompletion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private CurrentFetchResult? blockedFirstResult;
+        private int scopedCurrentCalls;
+        private readonly ApiHistoryPeriod period = new(
+            "period-1",
+            1_800_000_000,
+            1_800_000_600,
+            true,
+            "2026/09/12 — 2026/09/12");
+
+        public AccountScopedClient(bool blockFirstCurrent = false)
+        {
+            this.blockFirstCurrent = blockFirstCurrent;
+        }
+
+        public Task FirstCurrentStarted => firstCurrentStarted.Task;
+
+        public void CompleteFirstCurrent()
+        {
+            CurrentFetchResult result;
+            lock (gate)
+            {
+                result = blockedFirstResult
+                    ?? throw new InvalidOperationException("The first current request was not blocked.");
+            }
+            firstCurrentCompletion.TrySetResult(result);
+        }
+
+        public IReadOnlyList<string> CurrentAccountIds
+        {
+            get
+            {
+                lock (gate)
+                {
+                    return currentAccountIds.ToArray();
+                }
+            }
+        }
+
+        public IReadOnlyList<string> ThreadAccountIds
+        {
+            get
+            {
+                lock (gate)
+                {
+                    return threadAccountIds.ToArray();
+                }
+            }
+        }
+
+        public IReadOnlyList<string> HistoryPeriodAccountIds
+        {
+            get
+            {
+                lock (gate)
+                {
+                    return historyPeriodAccountIds.ToArray();
+                }
+            }
+        }
+
+        public IReadOnlyList<string> HistoryPageAccountIds
+        {
+            get
+            {
+                lock (gate)
+                {
+                    return historyPageAccountIds.ToArray();
+                }
+            }
+        }
+
+        protected override Task<DetailsFetchResult> FetchDetailsFixtureAsync(
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("Account-scoped tests must not request combined details.");
+
+        public Task<AccountsFetchResult> FetchAccountsAsync(
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(AccountsFetchResult.Success(new ApiAccountsSnapshot(
+                "account-7",
+                [
+                    new ApiAccount("account-7", true, 1_789_167_600, null),
+                    new ApiAccount("account-13", false, null, null),
+                ])));
+
+        public Task<CurrentFetchResult> FetchCurrentAsync(
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("The unscoped current route must not be used.");
+
+        public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("The unscoped history route must not be used.");
+
+        public Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+            string periodId,
+            string? cursor = null,
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("The unscoped history route must not be used.");
+
+        public Task<ThreadsFetchResult> FetchThreadsAsync(
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("The unscoped threads route must not be used.");
+
+        public Task<CurrentFetchResult> FetchCurrentAsync(
+            string accountId,
+            CancellationToken cancellationToken = default)
+        {
+            var historical = accountId == "account-13";
+            lock (gate)
+            {
+                currentAccountIds.Add(accountId);
+            }
+
+            var result = CurrentFetchResult.Success(
+                new ApiCurrentSnapshot(
+                    ApiState.Ready,
+                    historical ? 1_700_000_000 : 1_800_000_600,
+                    true,
+                    "Pro",
+                    new ApiQuota(
+                        historical ? 73 : 80,
+                        historical ? 1_700_000_600 : 1_800_001_200,
+                        604_800,
+                        false),
+                    [new ApiDetailsModelUsage("SOL", 1, 0, 0, historical ? 42 : 1, 0, 0)],
+                    historical ? 2UL : 1UL,
+                    PublishedPair(CanonicalPublishedPair))
+                {
+                    AccountId = accountId,
+                });
+            if (blockFirstCurrent && Interlocked.Increment(ref scopedCurrentCalls) == 1)
+            {
+                lock (gate)
+                {
+                    blockedFirstResult = result;
+                }
+                firstCurrentStarted.TrySetResult(null);
+                return firstCurrentCompletion.Task;
+            }
+
+            Interlocked.Increment(ref scopedCurrentCalls);
+            return Task.FromResult(result);
+        }
+
+        public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
+            string accountId,
+            CancellationToken cancellationToken = default) =>
+            FetchHistoryPeriodsForAccount(accountId);
+
+        private Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsForAccount(string accountId)
+        {
+            lock (gate)
+            {
+                historyPeriodAccountIds.Add(accountId);
+            }
+            return Task.FromResult(HistoryPeriodsFetchResult.Success(
+                new ApiHistoryPeriodsSnapshot([period], PublishedPair(CanonicalPublishedPair))
+                {
+                    AccountId = accountId,
+                }));
+        }
+
+        public Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+            string accountId,
+            string periodId,
+            string? cursor = null,
+            CancellationToken cancellationToken = default) =>
+            FetchHistoryPageForAccount(accountId, periodId);
+
+        private Task<HistoryPageFetchResult> FetchHistoryPageForAccount(
+            string accountId,
+            string periodId)
+        {
+            lock (gate)
+            {
+                historyPageAccountIds.Add(accountId);
+            }
+            return Task.FromResult(HistoryPageFetchResult.Success(
+                new ApiHistoryPage(
+                    periodId,
+                    [],
+                    [],
+                    null,
+                    "resume",
+                    PublishedPair(CanonicalPublishedPair))
+                {
+                    AccountId = accountId,
+                }));
+        }
+
+        public Task<ThreadsFetchResult> FetchThreadsAsync(
+            string accountId,
+            CancellationToken cancellationToken = default) =>
+            FetchThreadsForAccount(accountId);
+
+        private Task<ThreadsFetchResult> FetchThreadsForAccount(string accountId)
+        {
+            lock (gate)
+            {
+                threadAccountIds.Add(accountId);
+            }
+            IReadOnlyList<ApiThreadDetails> rows = accountId == "account-7"
+                ? [ThreadDetails("gpt-5.6-sol")]
+                : [];
+            return Task.FromResult(ThreadsFetchResult.Success(
+                new ApiThreadsSnapshot(rows, PublishedPair(CanonicalPublishedPair))
+                {
+                    AccountId = accountId,
+                }));
+        }
     }
 
     private sealed class TestConnectionChildProcessFactory(TestConnectionChildProcess child)

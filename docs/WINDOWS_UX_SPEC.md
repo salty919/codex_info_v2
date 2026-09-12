@@ -1,6 +1,7 @@
 <!-- codex-info-requirement-owner: UX -->
 <!-- codex-info-master-ids:
 CUM-138-06
+ACCOUNT-UX-134
 WIN-PARITY-RETRY-01
 WIN-PARITY-UX
 WIN-PARITY-CTA-01
@@ -229,7 +230,7 @@ Mainを既定の到達先とし、保存済みselectorで次回自動再接続�
 自動再構築ごとにSetup/app確認を再表示しない。更新は明示ボタンとbounded自動更新を同じ状態機械で扱い、
 更新中の再クリック、重複要求、値の一時消去を禁止する。
 
-Mainはstrict validation済み`/v3/current`、Graphは`/v3/history/periods`と選択期間のhistory page、Threadsは`/v3/threads`を使う。各取得cycleは必要な応答が全て同じpublished pairの場合だけatomic置換する。Graph差分だけは直前cursorで既取得prefix不変が証明され、かつ新pairの全pageを受理した場合に限りatomic appendする。prefix補正時は先頭から再取得する。`/v3/current`がexact 404の旧serviceだけ単一`/v3/details`、さらにexact 404の場合だけ単一v2、v1へfallbackする。
+Mainはstrict validation済み`/v3/current`、Graphは`/v3/history/periods`と選択期間のhistory page、Threadsは`/v3/threads`を使う。account selectorは`/v3/accounts`の非秘密IDを使い、既定を現accountとし、過去accountを一つずつ選択できる。選択変更時はMain、Graph、Threadsの旧account値、pair、cursor、pending、errorを一括破棄し、選択accountのresourceだけを再取得する。各取得cycleは必要な応答が全て同じaccountかつ同じpublished pairの場合だけatomic置換する。Graph差分だけは直前cursorで既取得prefix不変が証明され、かつ新pairの全pageを受理した場合に限りatomic appendする。prefix補正時は先頭から再取得する。`/v3/current`がexact 404の旧serviceだけ単一`/v3/details`、さらにexact 404の場合だけ単一v2、v1へfallbackする。
 exact 404でlegacy details modeへ入った接続は、一つの受理済みdetails rootをMain、Graph、Threadsへ同時投影し、split routeを追加要求しない。再接続時に`/v3/current`から能力判定をやり直す。
 Mainは10秒、Graph差分はopen中60秒、Threadsはopen中5秒で確認し、Graph/Threadsを閉じている間は対応requestを送らない。SQLite、別pair、認証control応答でfieldを補完せず、quota/history/threadの再収集、
 値の再計算、同一minuteのmerge/max/last/null化をUIで行わない。候補拒否時は該当surfaceだけが同じlast-good rootを保持し、他surfaceやrecorderを変更しない。
@@ -289,37 +290,36 @@ component順や表示所有者を変更しない。
 - 右端現在値の表示域は、初期940×640 logical表示時に各metricで確保される幅をドル／トークン別に固定する。Graphを横へリサイズした差分はplotへ割り当て、現在値、系列色、leader、縦位置を変えない。
 - Remainingは独立0–100%意味、モデル系列は累積値として扱う。残量をドル軸へ誤って合わせない。
 - Remainingとモデル使用量は別の観測値であり、モデル使用後に遅れて届いた最初の低い残量観測はその観測時刻へ反映する。残量観測が存在しない区間を料金・tokenから逆算してはならず、未観測区間を正常な残量低下として表示しない。
-- `models_complete=false`でも公開されたmodelの既知累積token/金額は保持し、未掲載modelを0と扱わない。
-  集合が不完全でも掲載modelのログ実測値は通常線、`model_source=unavailable`は既知endpoint間を破線bridgeとしてX/Windowsで
-  同じ意味にする。model集合の完全性を個別modelの予測扱いへ流用せず、確認済みの急落や0へ置換しない。
+- `reconstructed-from-session`、`unknown`、`unavailable`および（`legacy-unknown`を除く）`models_complete=false`ではモデル数値を表示せず、
+  model key/sourceと欠損metadataだけを表示する。`legacy-unknown`は保存済みの同じmodel keyの値だけ表示できるが、集計・予測・idle判定には使わない。
+  直接観測(`confirmed`)の値だけを通常線とし、補間・hold・smoothing・予測はUI presentation-onlyでAPI/DBへ書き戻さない。
 - model系列の有限表示状態は次を正本とし、model名ごとの全直積には展開しない。
 
   | 入力状態 | 表示契約 |
   | --- | --- |
   | 同一periodの実測累積が増加／不変 | 増加は太い実線、当該modelの不変は細い実線。同じ実測濃度を使い、最初と最後の値を同じ系列へ使う。未使用帯は全modelとRemainingを別途判定する |
-  | 当該model値はログ実測、全model集合は不完全 | 既知の開始値・中間値・終端値を通常線で保持する。未掲載modelだけを未知とする |
-  | 他modelの出現／消失、または`confirmed`と`legacy-unknown`の切替 | 両endpointに掲載された共通modelのaccepted値は通常線を維持する。新規modelは最初のaccepted時刻から開始し、消失modelだけを最後のaccepted時刻から破線holdする。集合変更はRemaining低下のtoken帰属と未使用判定には使用しない |
+  | 当該model値はログ実測、全model集合は不完全 | 直接観測(`confirmed`)の値だけを保持する。未掲載modelは欠損metadataだけとし、数値を作らない |
+  | 他modelの出現／消失、または`confirmed`と`legacy-unknown`の切替 | `confirmed`の同じmodel keyは通常線を維持する。`legacy-unknown`は保存済み同じkeyの値だけを表示し、集計・予測・idle判定には使わない。新規modelは最初の直接観測時刻から開始し、消失modelのholdは表示専用とする |
   | 前後の既知点間だけが未観測 | 同値・増加を問わず実測線より細い破線。途中の消費時刻・速度や未使用を捏造しない（`G137-4`,`G137-7`） |
-  | model値自体が未取得、または確認済みrecorder停止区間 | 既知endpoint間と終端を細い破線の予測bridge／holdで連続させる。0補完、空白、垂直segmentを作らず、別sourceのログ実測値は通常線のまま保持する |
+  | model値自体が未取得、または確認済みrecorder停止区間 | model key/sourceと欠損metadataだけを表示し、数値を0補完しない。必要な破線bridge／holdは表示専用で、API/DB、集計、idle判定へ反映しない。`Remaining`からmodel値やtailを外挿しない |
   | 累積が後退し、その後に回復 | source completenessを問わず最後のaccepted値を下回るrawを表示値へ採用せず、当該modelだけを回復点まで細い破線hold／bridgeとする（`G137-3`） |
   | period内の最初の既知点 | 0からの斜線を捏造せず、その値・時刻から開始する |
   | 60秒以内のreset alias／正式reset境界 | 前者は同一periodへ正規化し、後者は別periodとして混ぜない |
   | 確認済み0／model行なし | 前者だけ0として描き、後者は未知として数値・線を作らない |
   | ドル／token切替 | 同じ観測時刻列を使い、単位と値だけを切り替える |
 
-  アイドル帯は表示metricから独立し、ドル表示中もraw `total_tokens`を正本にする。60秒以内の隣接する実測前後で、
-  実際に掲載された非空のmodel集合が同一かつ全model tokenが厳密に不変な候補を結合し、2候補区間以上
-  （accepted 3観測以上）続いた最大runだけに表示する。単発候補は細い実線に留め、任意の絶対時間閾値は追加しない。
-  集合不完全だけを理由に除外せず、両endpointで未掲載のmodelを0や固定modelとして創作しない。ドル丸めが同値でも
-  token増加、model集合変更、既知model欠落、recorder gap、token異常、期間末holdをアイドル帯へ流用しない。
-  missing／棄却済みRemainingとdollarだけの異常はtoken正本の帯を消さず、信頼できるraw Remaining変化を含む
-  局所区間だけを矛盾として除外する。前後のtoken不変run全体は除外しない。前後を基本候補で挟まれたexact 120秒の1 cadence
-  欠測だけは`G137-5`の条件でgray bridgeし、線自体は破線にする。隣接idleは単一bandへ結合し、pixel幅filter、
-  最小表示幅、gridまたはsegment境界によって削除・周期分断しない。
-  Remainingは`G137-6`に従って連続するtoken active秒へ低下を配分し、観測済みtoken不変intervalと
-  未使用帯の中ではexactな水平線とする。token証拠が欠けたbounded区間はelapsed比で補間し、破線にする。
-  各timestampにaccepted raw Remainingがあるtoken-backed通常平滑化は`ActivitySmoothed`の実線とし、
-  計測停止・欠測を意味する破線へ降格しない。Remainingのraw同値区間はmodelとは独立して実線にできる。
+  アイドル帯はsame `reset_at`のperiod内で、両endpointが`confirmed`かつ`models_complete=true`、同じmodel key集合、全raw
+  `total_tokens`がexact equal、raw Remainingがfiniteかつbitwise equalであり、active、confirmed gap、直接観測値の矛盾が
+  ない区間だけを候補にする。`legacy-unknown`、`unknown`、`unavailable`、欠損・補間・hold・smoothing・予測値はendpointまたは
+  矛盾なしのauthorityにしない。ただし完全directな同値endpoint間の数値なしmetadata rowは、両endpointが境界づけた不変区間を
+  否定しない。上記条件を満たす連続30分以上のrunだけをgray表示し、観測点数・cadence・direct endpointを欠く欠測時間だけで確定しない。
+  30分は画面幅に依存しない意味閾値とし、pixel幅filter、最小表示幅、gridまたはsegment境界によって削除・周期分断しない。
+  Remainingは`G137-6`に従い、完全な全modelの`Direct` token証拠があるspanでは各隣接intervalのtoken増分合計に比例して
+  低下を配分し、token増分0のintervalと未使用帯ではexactな水平線とする。実利用が偏ったspanを一定速度の直線へ
+  捏造しない。1 intervalでもtoken証拠が欠けるか矛盾する場合はspan全体をelapsed比の参考bridgeへfallbackし、
+  全中間点を破線にする。token量と秒数を同一spanで混在させない。平滑化・補間は`ActivitySmoothed`などの表示専用線に限り、
+  raw-null点はtoken比で位置を決めても破線にする。導出値をAPI/DBへ書き戻さない。
+  `Remaining`のeffective値からmodel系列の値またはそのperiod tailを外挿しない。
   raw-null補間、gap、異常、終端hold等の欠測・予測の破線は
   X版では1px、Windows版では1px相当とする。model利用増加の実測は3px、model未使用の実測は1px実線、Remaining実測は3pxとし、破線の有無で未使用実測と欠測・予測を区別する。
   破線は幅の広いplotでも切替点が判別できる短く密な周期とし、長い線片・隙間で通常線に見せない。

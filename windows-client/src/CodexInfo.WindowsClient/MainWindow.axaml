@@ -3,6 +3,7 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:CodexInfo.WindowsClient.ViewModels"
+        xmlns:core="using:CodexInfo.WindowsClient.Core"
         x:Class="CodexInfo.WindowsClient.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Width="900"
@@ -120,7 +121,7 @@
         RowSpacing="8">
     <!-- Header owns the application heading, endpoint, and navigation. -->
     <Grid Grid.Row="0"
-          ColumnDefinitions="210,*"
+          ColumnDefinitions="210,250,*"
           ColumnSpacing="10"
           Panel.ZIndex="10"
           Background="Transparent"
@@ -143,7 +144,38 @@
                      Text="{Binding ProductVersionText}" />
         </StackPanel>
       </StackPanel>
-      <StackPanel Grid.Column="1"
+      <ToggleButton Grid.Column="1"
+                    x:Name="AccountSelector"
+                    Width="250"
+                    Height="44"
+                    HorizontalAlignment="Stretch"
+                    HorizontalContentAlignment="Left"
+                    Padding="10,3"
+                    ClickMode="Press"
+                    IsCheckedChanged="OnAccountSelectorCheckedChanged"
+                    IsVisible="{Binding HasAccounts}"
+                    AutomationProperties.Name="{Binding Texts.Account}"
+                    AutomationProperties.AutomationId="Main.AccountSelector"
+                    AutomationProperties.HelpText="{Binding SelectedAccountText}"
+                    ToolTip.Tip="{Binding SelectedAccountText}">
+        <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
+          <StackPanel Spacing="0" VerticalAlignment="Center">
+            <TextBlock FontSize="9"
+                       Foreground="#56B2F5"
+                       Text="{Binding Texts.Account}" />
+            <TextBlock FontSize="11"
+                       FontWeight="SemiBold"
+                       Text="{Binding SelectedAccountText}"
+                       TextTrimming="CharacterEllipsis"
+                       TextWrapping="NoWrap" />
+          </StackPanel>
+          <TextBlock Grid.Column="1"
+                     VerticalAlignment="Center"
+                     Foreground="#9FB0C5"
+                     Text="⌄" />
+        </Grid>
+      </ToggleButton>
+      <StackPanel Grid.Column="2"
                   Orientation="Horizontal"
                   Spacing="4"
                   HorizontalAlignment="Right"
@@ -289,7 +321,7 @@
     <!-- AccountActivity owns only live activity: total count, model
          classification counts, and the one Details entry point. -->
     <Border Grid.Row="3" Classes="section" Padding="12,5" IsVisible="{Binding ShowAuthenticatedContent}">
-      <Grid ColumnDefinitions="180,*,68" ColumnSpacing="8">
+      <Grid ColumnDefinitions="240,*,68" ColumnSpacing="8">
         <StackPanel Spacing="1" VerticalAlignment="Center">
           <TextBlock Classes="metric-label" Text="{Binding Texts.RunningThreads}" />
           <TextBlock FontSize="22"
@@ -300,6 +332,10 @@
           <TextBlock Classes="label"
                      IsVisible="{Binding HasNoActiveThreads}"
                      Text="{Binding Texts.NoRunningThreads}"
+                     TextWrapping="NoWrap" />
+          <TextBlock Classes="label"
+                     IsVisible="{Binding HasHistoricalThreadNotice}"
+                     Text="{Binding Texts.HistoricalThreadsUnavailable}"
                      TextWrapping="NoWrap" />
         </StackPanel>
         <UniformGrid Grid.Column="1" Columns="5" HorizontalAlignment="Stretch" VerticalAlignment="Center" IsVisible="{Binding HasActiveThreads}">
@@ -366,7 +402,7 @@
         <Grid Grid.Row="1"
               ColumnDefinitions="2.4*,*,*,*,*,*,*"
               ColumnSpacing="6">
-          <TextBlock Classes="metric-label" VerticalAlignment="Center" Text="Model" />
+          <TextBlock Classes="metric-label" VerticalAlignment="Center" Text="{Binding Texts.ModelLabel}" />
           <TextBlock Grid.Column="1" Grid.ColumnSpan="2" Classes="metric-label" HorizontalAlignment="Center" Text="{Binding Texts.Input}" />
           <TextBlock Grid.Column="3" Grid.ColumnSpan="2" Classes="metric-label" HorizontalAlignment="Center" Text="{Binding Texts.CachedInput}" />
           <TextBlock Grid.Column="5" Grid.ColumnSpan="2" Classes="metric-label" HorizontalAlignment="Center" Text="{Binding Texts.Output}" />
@@ -496,6 +532,41 @@
                    Text="{Binding Texts.Connecting}"
                    AutomationProperties.AutomationId="Main.StartupLoadingText" />
       </StackPanel>
+    </Border>
+
+    <!-- The account list is measured at its final width before it is opened,
+         so selecting an account does not resize the 900x480 monitor surface. -->
+    <Border x:Name="AccountMenu"
+            Grid.RowSpan="6"
+            ZIndex="100"
+            HorizontalAlignment="Left"
+            VerticalAlignment="Top"
+            Margin="220,52,0,0"
+            Opacity="0"
+            IsEnabled="False"
+            IsHitTestVisible="False"
+            Width="560"
+            MaxWidth="560"
+            MaxHeight="320"
+            Padding="4"
+            Background="#1B2838"
+            BorderBrush="#47769F"
+            BorderThickness="1"
+            CornerRadius="6">
+      <ListBox ItemsSource="{Binding Accounts}"
+               SelectedItem="{Binding SelectedAccount, Mode=TwoWay}"
+               SelectionChanged="OnAccountSelectionChanged"
+               AutomationProperties.AutomationId="Main.AccountMenu">
+        <ListBox.ItemTemplate>
+          <DataTemplate x:DataType="core:ApiAccount">
+            <TextBlock Text="{Binding DisplayLabel}"
+                       TextWrapping="Wrap"
+                       ToolTip.Tip="{Binding DisplayLabel}"
+                       AutomationProperties.Name="{Binding DisplayLabel}"
+                       AutomationProperties.HelpText="{Binding DisplayLabel}" />
+          </DataTemplate>
+        </ListBox.ItemTemplate>
+      </ListBox>
     </Border>
   </Grid>
 </Window>

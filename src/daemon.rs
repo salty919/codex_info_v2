@@ -1323,7 +1323,9 @@ fn maintain_history_database(
     identity: &StoragePartitionIdentity,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<UsageStore, String> {
-    UsageStore::backup_generations_partitioned(database, identity, 3)
+    let backup = UsageStore::backup_generations_partitioned_verified(database, identity, 3)
+        .map_err(|error| error.to_string())?;
+    UsageStore::migrate_partition_history_after_verified_backup(database, identity, &backup)
         .map_err(|error| error.to_string())?;
     let mut store =
         UsageStore::open_partitioned(database, identity).map_err(|error| error.to_string())?;

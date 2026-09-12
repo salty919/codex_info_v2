@@ -23,6 +23,7 @@ namespace CodexInfo.WindowsClient.ViewModels;
 /// </summary>
 public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 {
+    private const int MaxSplitGenerationAlignmentAttempts = 2;
     private static readonly IBrush NormalBackground = new SolidColorBrush(Color.Parse("#143426"));
     private static readonly IBrush NormalBorder = new SolidColorBrush(Color.Parse("#276C49"));
     private static readonly IBrush NormalAccent = new SolidColorBrush(Color.Parse("#4FB878"));
@@ -48,7 +49,12 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private readonly AsyncCommand checkAuthCommand;
     private readonly SnapshotCollection<ModelUsageViewModel> models = [];
     private readonly SnapshotCollection<QuotaSegmentViewModel> quotaSegments = [];
+    private readonly SnapshotCollection<ApiAccount> accounts = [];
+    private readonly ILoopbackAccountsClient? accountsClient;
+    private readonly ILoopbackAccountResourceClient? accountResourceClient;
     private ApiDetailsSnapshot? detailsSnapshot;
+    private ApiAccount? selectedAccount;
+    private long accountSelectionGeneration;
     private DetailsFetchFailure? detailsFailure;
     private DateTimeOffset? lastReceivedAt;
     private ClientPresentationState presentationState = ClientPresentationState.Connecting;
@@ -56,9 +62,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private bool authLaunchFailed;
     private bool authLaunchSucceeded;
     private bool hasConnectionFailure;
+    private bool historicalActivitySuppressed;
     private bool disposed;
     private bool initialLoadPending = true;
     private bool explicitOperationActive;
+    private bool accountRefreshPending;
     private GenerationContext? currentContext;
     private ClientSettings settingsSnapshot;
     private int started;
@@ -91,6 +99,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         ArgumentNullException.ThrowIfNull(detailsClient);
         this.healthClient = healthClient;
         this.detailsClient = detailsClient;
+        accountsClient = detailsClient as ILoopbackAccountsClient;
+        accountResourceClient = detailsClient as ILoopbackAccountResourceClient;
         this.connectionSupervisor = connectionSupervisor;
         this.authenticationLauncher = authenticationLauncher ?? StartLinuxAuthenticationProcess;
         settingsSnapshot = App.CurrentSettings;
@@ -105,6 +115,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             () => IsAuthRequired && authLaunchSucceeded && CanRefresh);
         Models = new ReadOnlyObservableCollection<ModelUsageViewModel>(models);
         QuotaSegments = new ReadOnlyObservableCollection<QuotaSegmentViewModel>(quotaSegments);
+        Accounts = new ReadOnlyObservableCollection<ApiAccount>(accounts);
         LocalizationService.LanguageChanged += OnLanguageChanged;
     }
 
@@ -118,9 +129,84 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     /// <summary>The bounded resource transport, when the v3 split contract is available.</summary>
     internal ILoopbackResourceClient? SplitResourceClient => detailsClient as ILoopbackResourceClient;
 
+    internal ILoopbackAccountResourceClient? AccountResourceClient => accountResourceClient;
+
+    internal long AccountSelectionGeneration
+    {
+        get
+        {
+            lock (stateGate)
+            {
+                return accountSelectionGeneration;
+            }
+        }
+    }
+
     internal CancellationToken LifetimeToken => lifetime.Token;
 
     public UiText Texts => LocalizationService.Current;
+
+    public ReadOnlyObservableCollection<ApiAccount> Accounts { get; }
+
+    public bool HasAccounts => accounts.Count > 0;
+
+    public ApiAccount? SelectedAccount
+    {
+        get
+        {
+            lock (stateGate)
+            {
+                return selectedAccount;
+            }
+        }
+        set => SelectAccount(value?.Id);
+    }
+
+    public string SelectedAccountText
+    {
+        get
+        {
+            lock (stateGate)
+            {
+                return selectedAccount?.DisplayLabel ?? Texts.UnavailableValue;
+            }
+        }
+    }
+
+    internal string? SelectedAccountId
+    {
+        get
+        {
+            lock (stateGate)
+            {
+                return selectedAccount?.Id;
+            }
+        }
+    }
+
+    internal bool IsAccountSelectionCurrent(string accountId, long generation)
+    {
+        lock (stateGate)
+        {
+            return generation == accountSelectionGeneration &&
+                string.Equals(selectedAccount?.Id, accountId, StringComparison.Ordinal);
+        }
+    }
+
+    /// <summary>
+    /// An inactive account is a recorded partition, not a second live
+    /// session. Child views use this fence before presenting any thread rows.
+    /// </summary>
+    internal bool IsSelectedAccountHistorical
+    {
+        get
+        {
+            lock (stateGate)
+            {
+                return selectedAccount is { IsCurrent: false };
+            }
+        }
+    }
 
     public string ProductVersionText => ProductInfo.DisplayVersion;
 
@@ -279,9 +365,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public bool ShowAuthenticatedContent => IsAuthenticated && !IsStartupLoading;
 
-    public bool HasActiveThreads => ActiveThreadCount > 0;
+    public bool HasActiveThreads => !historicalActivitySuppressed && ActiveThreadCount > 0;
 
-    public bool HasNoActiveThreads => !HasActiveThreads;
+    public bool HasNoActiveThreads => !historicalActivitySuppressed && !HasActiveThreads;
+
+    public bool HasHistoricalThreadNotice => historicalActivitySuppressed;
 
     /// <summary>
     /// The scalar generation count is authoritative even when the details
@@ -290,7 +378,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     /// </summary>
     public ulong ActiveThreadCount => detailsSnapshot?.ActiveThreadCount ?? 0;
 
-    public string ActiveThreadCountLabel => string.Create(CultureInfo.CurrentCulture, $"{ActiveThreadCount:N0}{(string.IsNullOrEmpty(Texts.CountUnit) ? "" : " " + Texts.CountUnit)}");
+    public string ActiveThreadCountLabel => historicalActivitySuppressed
+        ? Texts.UnavailableValue
+        : string.Create(CultureInfo.CurrentCulture, $"{ActiveThreadCount:N0}{(string.IsNullOrEmpty(Texts.CountUnit) ? "" : " " + Texts.CountUnit)}");
 
     public int ActiveSolCount => CountThreads("SOL");
 
@@ -305,6 +395,16 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     /// <summary>Whether an authenticated details generation is visible.</summary>
     public bool HasDetails => detailsSnapshot is { Authenticated: true, State: not ApiState.AuthRequired };
 
+    /// <summary>
+    /// True only when the visible details document belongs to the selected
+    /// inactive account. A missing or unscoped document is never treated as a
+    /// historical record by inference.
+    /// </summary>
+    private bool IsHistoricalDetails =>
+        selectedAccount is { IsCurrent: false, Id: var accountId } &&
+        detailsSnapshot is { State: ApiState.Ready, Authenticated: true, AccountId: var snapshotAccountId } &&
+        snapshotAccountId == accountId;
+
     public ApiDetailsSnapshot? DetailsSnapshot => HasDetails ? detailsSnapshot : null;
 
     public string DetailsStatusText
@@ -315,6 +415,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             {
                 return detailsFailure switch
                 {
+                    null when IsHistoricalDetails => "詳細データ: 過去記録",
                     null when HasDetails => "詳細データ: 最新",
                     DetailsFetchFailure.Transport when HasDetails => "詳細データ: 前回値を表示（接続エラー）",
                     DetailsFetchFailure.Response when HasDetails => "詳細データ: 前回値を表示（応答エラー）",
@@ -325,6 +426,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             }
             return detailsFailure switch
             {
+                null when IsHistoricalDetails => $"{Texts.Details}: recorded",
                 null when HasDetails => $"{Texts.Details}: {Texts.Latest}",
                 DetailsFetchFailure.Transport when HasDetails => $"{Texts.Details}: {Texts.Unavailable} ({Texts.TransportError})",
                 DetailsFetchFailure.Response when HasDetails => $"{Texts.Details}: {Texts.Unavailable} ({Texts.ApiError})",
@@ -361,26 +463,38 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     public string QuotaWindowText => (detailsSnapshot?.Quota) switch
     {
         null => Texts.QuotaWaiting,
+        _ when IsHistoricalDetails => Texts.HistoricalQuotaPeriod,
         { Monthly: true } => Texts.MonthlyQuota,
         _ => Texts.WeeklyQuota,
     };
 
     public string QuotaRemainingText => detailsSnapshot?.Quota is { } quota
-        ? FormatRemainingDuration(quota.ResetAt)
+        ? IsHistoricalDetails
+            ? FormatUnixTime(quota.ResetAt)
+            : FormatRemainingDuration(quota.ResetAt)
         : Texts.UnavailableValue;
 
     public double QuotaRemainingPeriodValue => detailsSnapshot?.Quota is { } quota
-        ? Math.Clamp(
-            (quota.ResetAt - DateTimeOffset.UtcNow.ToUnixTimeSeconds()) * 100.0 /
-            Math.Max(1, quota.WindowSeconds),
-            0,
-            100)
+        ? IsHistoricalDetails
+            ? 0
+            : Math.Clamp(
+                (quota.ResetAt - DateTimeOffset.UtcNow.ToUnixTimeSeconds()) * 100.0 /
+                Math.Max(1, quota.WindowSeconds),
+                0,
+                100)
         : 0;
 
-    public string ModelUsagePeriodText =>
-        detailsSnapshot?.History.FirstOrDefault(period => period.Current)?.Label
-        ?? detailsSnapshot?.History.FirstOrDefault()?.Label
-        ?? QuotaWindowText;
+    public string ModelUsagePeriodText
+    {
+        get
+        {
+            var period = detailsSnapshot?.History.FirstOrDefault(candidate => candidate.Current)
+                ?? detailsSnapshot?.History.FirstOrDefault();
+            return period is null
+                ? QuotaWindowText
+                : $"{FormatShortUnixTime(period.StartAt)}{(period.Current ? Texts.CurrentPeriodSuffix : string.Empty)}";
+        }
+    }
 
     public string ModelUsageUnavailableText => $"{Texts.ModelUsage}: {Texts.UnavailableValue}";
 
@@ -402,7 +516,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public string PlanText => detailsSnapshot?.PlanLabel ?? Texts.UnavailableValue;
 
-    public string ActiveThreadCountText => detailsSnapshot is null
+    public string ActiveThreadCountText => detailsSnapshot is null || historicalActivitySuppressed
         ? Texts.UnavailableValue
         : string.Create(CultureInfo.CurrentCulture, $"{ActiveThreadCount:N0}{(string.IsNullOrEmpty(Texts.CountUnit) ? "" : " " + Texts.CountUnit)}");
 
@@ -414,11 +528,26 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         ? FormatUnixTime(observedAt)
         : Texts.UnavailableValue;
 
-    public string LastReceivedText => lastReceivedAt is { } receivedAt
-        ? $"{Texts.LastReceivedPrefix}: {TimeZoneInfo.ConvertTime(receivedAt, LocalizationService.DisplayTimeZone).ToString("g", CultureInfo.CurrentCulture)}{StaleSuffix}"
-        : Texts.LastReceivedUnavailable;
+    public string LastReceivedText
+    {
+        get
+        {
+            if (IsHistoricalDetails)
+            {
+                return detailsSnapshot?.ObservedAt is { } observedAt
+                    ? $"{Texts.HistoricalLastRecordedPrefix} {FormatShortUnixTime(observedAt)}"
+                    : Texts.LastReceivedUnavailable;
+            }
 
-    public string StatusTitle => presentationState switch
+            return lastReceivedAt is { } receivedAt
+                ? $"{Texts.LastReceivedPrefix}: {TimeZoneInfo.ConvertTime(receivedAt, LocalizationService.DisplayTimeZone).ToString("g", CultureInfo.CurrentCulture)}{StaleSuffix}"
+                : Texts.LastReceivedUnavailable;
+        }
+    }
+
+    public string StatusTitle => selectedAccount is { IsCurrent: false }
+        ? selectedAccount.DisplayLabel
+        : presentationState switch
     {
         ClientPresentationState.Connecting => Texts.Connecting,
         ClientPresentationState.Ready => Texts.Ready,
@@ -437,6 +566,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         get
         {
+            if (IsHistoricalDetails && detailsFailure is null)
+            {
+                return Texts.HistoricalAccountDetail;
+            }
+
             var detail = Texts.StatusDetailFor(
                 presentationState.ToString(),
                 authLaunchFailed,
@@ -497,6 +631,141 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             _ = RunStartupAsync(startupContext);
         }
         _ = RunPollingAsync(lifetime.Token);
+    }
+
+    /// <summary>
+    /// Changes the one account selection shared by Main, Graph, and Threads.
+    /// The old visible generation is cleared synchronously so an account
+    /// switch can never show the previous account while the new root loads.
+    /// </summary>
+    public bool SelectAccount(string? accountId)
+    {
+        GenerationContext? context;
+        lock (stateGate)
+        {
+            if (disposed || accountId is null)
+            {
+                return false;
+            }
+
+            var next = accounts.FirstOrDefault(account =>
+                string.Equals(account.Id, accountId, StringComparison.Ordinal));
+            if (next is null)
+            {
+                return false;
+            }
+
+            if (selectedAccount?.Id == next.Id)
+            {
+                var labelChanged = selectedAccount?.DisplayLabel != next.DisplayLabel;
+                selectedAccount = next;
+                if (labelChanged)
+                {
+                    Notify(nameof(SelectedAccountText));
+                }
+                return true;
+            }
+
+            selectedAccount = next;
+            accountSelectionGeneration++;
+            ClearAccountPresentationLocked();
+            context = currentContext;
+            Notify(nameof(SelectedAccount));
+            Notify(nameof(SelectedAccountText));
+            Notify(nameof(HasDetails));
+            Notify(nameof(DetailsSnapshot));
+            Notify(nameof(DetailsStatusText));
+            Notify(nameof(DetailsStatusAutomationText));
+            NotifyGenerationProperties(quotaAlreadyRebuilt: true);
+            accountRefreshPending = context is not null;
+        }
+
+        // Kick the same current-generation pipeline used by periodic refresh;
+        // if another lease is active, the next scheduled cycle observes the
+        // new account and the generation fence rejects its old result.
+        if (context is not null)
+        {
+            _ = RunPeriodicRefreshAsync();
+        }
+        return true;
+    }
+
+    private bool ApplyAccountsSnapshot(ApiAccountsSnapshot snapshot)
+    {
+        var previousId = selectedAccount?.Id;
+        var normalizedAccounts = ApiAccount.EnsureUniqueDisplayLabels(snapshot.Accounts
+            .Select(account => account with
+            {
+                DisplayStatusSuffix = account.IsCurrent
+                    ? Texts.SignedInAccountSuffix
+                    : Texts.HistoricalAccountSuffix,
+            }))
+            .ToArray();
+        var accountsChanged = !accounts.SequenceEqual(normalizedAccounts);
+        if (accountsChanged)
+        {
+            accounts.ReplaceAll(normalizedAccounts, notify: false);
+            accounts.NotifyReset();
+        }
+
+        var next = previousId is not null
+            ? accounts.FirstOrDefault(account => account.Id == previousId)
+            : null;
+        next ??= accounts.FirstOrDefault(account => account.Id == snapshot.DefaultAccountId);
+        next ??= accounts.FirstOrDefault(account => account.IsCurrent);
+        if (next is null)
+        {
+            return false;
+        }
+
+        var previousSelected = selectedAccount;
+        var changed = previousSelected?.Id != next.Id;
+        var accountKindChanged = previousSelected?.IsCurrent != next.IsCurrent;
+        var labelChanged = previousSelected?.DisplayLabel != next.DisplayLabel;
+        selectedAccount = next;
+        if (changed || accountKindChanged)
+        {
+            accountSelectionGeneration++;
+            ClearAccountPresentationLocked();
+        }
+
+        if (accountsChanged)
+        {
+            Notify(nameof(Accounts));
+            Notify(nameof(HasAccounts));
+        }
+        if (changed || accountKindChanged)
+        {
+            Notify(nameof(SelectedAccount));
+        }
+        if (changed || accountKindChanged || labelChanged)
+        {
+            Notify(nameof(SelectedAccountText));
+        }
+        if (changed || accountKindChanged)
+        {
+            Notify(nameof(HasDetails));
+            Notify(nameof(DetailsSnapshot));
+            Notify(nameof(DetailsStatusText));
+            Notify(nameof(DetailsStatusAutomationText));
+            NotifyGenerationProperties(quotaAlreadyRebuilt: true);
+        }
+
+        return true;
+    }
+
+    private void ClearAccountPresentationLocked()
+    {
+        detailsSnapshot = null;
+        detailsFailure = null;
+        lastReceivedAt = null;
+        hasConnectionFailure = false;
+        historicalActivitySuppressed = selectedAccount is { IsCurrent: false };
+        authLaunchFailed = false;
+        authLaunchSucceeded = false;
+        presentationState = ClientPresentationState.Initializing;
+        ClearModels();
+        RebuildQuotaSegments();
     }
 
     /// <summary>
@@ -676,6 +945,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(ActiveThreadCountText));
             Notify(nameof(EstimatedCostText));
             Notify(nameof(ModelUsageUnavailableText));
+            Notify(nameof(ModelUsagePeriodText));
         }
     }
 
@@ -736,14 +1006,24 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private async Task RunPeriodicRefreshAsync()
     {
         GenerationContext? context;
+        long requestedAccountGeneration;
         lock (stateGate)
         {
             context = currentContext;
+            requestedAccountGeneration = accountSelectionGeneration;
         }
 
         if (context is null) return;
         var lease = TryLease(context);
         if (lease is null) return;
+        lock (stateGate)
+        {
+            if (ReferenceEquals(currentContext, context) &&
+                requestedAccountGeneration == accountSelectionGeneration)
+            {
+                accountRefreshPending = false;
+            }
+        }
         try
         {
             await FetchCycleAsync(context, lease.Token);
@@ -812,12 +1092,14 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 return;
             }
 
-            if (detailsClient is ILoopbackResourceClient splitResources)
+            string? selectedAccountId = null;
+            long selectedAccountGeneration = 0;
+            if (accountsClient is not null)
             {
-                CurrentFetchResult currentResult;
+                AccountsFetchResult accountsResult;
                 try
                 {
-                    currentResult = await splitResources.FetchCurrentAsync(cancellationToken);
+                    accountsResult = await accountsClient.FetchAccountsAsync(cancellationToken);
                 }
                 catch (OperationCanceledException)
                 {
@@ -825,18 +1107,103 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 }
                 catch
                 {
-                    currentResult = CurrentFetchResult.FromFailure(DetailsFetchFailure.Transport);
+                    accountsResult = AccountsFetchResult.FromFailure(DetailsFetchFailure.Transport);
                 }
 
-                if (currentResult.IsSuccess && currentResult.Snapshot is { } current)
+                if (!accountsResult.IsSuccess || accountsResult.Snapshot is not { } accountsSnapshot)
                 {
+                    var failure = accountsResult.Failure == DetailsFetchFailure.Transport
+                        ? DetailsFetchFailure.Transport
+                        : DetailsFetchFailure.Response;
+                    MutateIfCurrent(context, () =>
+                    {
+                        detailsFailure = failure;
+                        Notify(nameof(DetailsStatusText));
+                        Notify(nameof(DetailsStatusAutomationText));
+                        ApplyFailure(failure);
+                    });
+                    return;
+                }
+
+                if (!MutateIfCurrent(context, () =>
+                    {
+                        if (!ApplyAccountsSnapshot(accountsSnapshot))
+                        {
+                            return;
+                        }
+
+                        selectedAccountId = selectedAccount?.Id;
+                        selectedAccountGeneration = accountSelectionGeneration;
+                    }))
+                {
+                    return;
+                }
+
+                if (selectedAccountId is null || accountResourceClient is null)
+                {
+                    MutateIfCurrent(context, () =>
+                    {
+                        detailsFailure = DetailsFetchFailure.Response;
+                        Notify(nameof(DetailsStatusText));
+                        Notify(nameof(DetailsStatusAutomationText));
+                        ApplyFailure(DetailsFetchFailure.Response);
+                    });
+                    return;
+                }
+            }
+
+            if (detailsClient is ILoopbackResourceClient splitResources)
+            {
+                for (var alignmentAttempt = 0;
+                     alignmentAttempt < MaxSplitGenerationAlignmentAttempts;
+                     alignmentAttempt++)
+                {
+                    CurrentFetchResult currentResult;
+                    try
+                    {
+                        currentResult = selectedAccountId is not null && accountResourceClient is not null
+                            ? await accountResourceClient.FetchCurrentAsync(selectedAccountId, cancellationToken)
+                            : await splitResources.FetchCurrentAsync(cancellationToken);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch
+                    {
+                        currentResult = CurrentFetchResult.FromFailure(DetailsFetchFailure.Transport);
+                    }
+
+                    if (selectedAccountId is not null &&
+                        !IsAccountSelectionCurrent(selectedAccountId, selectedAccountGeneration))
+                    {
+                        return;
+                    }
+
+                    if (!currentResult.IsSuccess || currentResult.Snapshot is not { } current)
+                    {
+                        var failure = currentResult.Failure == DetailsFetchFailure.Transport
+                            ? DetailsFetchFailure.Transport
+                            : DetailsFetchFailure.Response;
+                        MutateIfCurrent(context, () =>
+                        {
+                            detailsFailure = failure;
+                            Notify(nameof(DetailsStatusText));
+                            Notify(nameof(DetailsStatusAutomationText));
+                            ApplyFailure(failure);
+                        });
+                        return;
+                    }
+
                     IReadOnlyList<ApiThreadDetails> threads = Array.Empty<ApiThreadDetails>();
-                    if (current.ActiveThreadCount > 0)
+                    if (current.ActiveThreadCount > 0 && !IsSelectedAccountHistorical)
                     {
                         ThreadsFetchResult threadsResult;
                         try
                         {
-                            threadsResult = await splitResources.FetchThreadsAsync(cancellationToken);
+                            threadsResult = selectedAccountId is not null && accountResourceClient is not null
+                                ? await accountResourceClient.FetchThreadsAsync(selectedAccountId, cancellationToken)
+                                : await splitResources.FetchThreadsAsync(cancellationToken);
                         }
                         catch (OperationCanceledException)
                         {
@@ -845,6 +1212,12 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                         catch
                         {
                             threadsResult = ThreadsFetchResult.FromFailure(DetailsFetchFailure.Transport);
+                        }
+
+                        if (selectedAccountId is not null &&
+                            !IsAccountSelectionCurrent(selectedAccountId, selectedAccountGeneration))
+                        {
+                            return;
                         }
 
                         if (!threadsResult.IsSuccess || threadsResult.Snapshot is not { } threadSnapshot)
@@ -862,8 +1235,36 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                             return;
                         }
 
-                        if (threadSnapshot.PublishedPair != current.PublishedPair ||
-                            (ulong)threadSnapshot.Threads.Count != current.ActiveThreadCount)
+                        if (selectedAccountId is not null &&
+                            (current.AccountId != selectedAccountId ||
+                             threadSnapshot.AccountId != selectedAccountId ||
+                             !IsAccountSelectionCurrent(selectedAccountId, selectedAccountGeneration)))
+                        {
+                            return;
+                        }
+
+                        if (threadSnapshot.PublishedPair != current.PublishedPair)
+                        {
+                            // A recorder publication can advance between the two
+                            // split reads. Keep the last-good generation visible
+                            // and align both resources once to the new root before
+                            // treating the cycle as a real response failure.
+                            if (alignmentAttempt + 1 < MaxSplitGenerationAlignmentAttempts)
+                            {
+                                continue;
+                            }
+
+                            MutateIfCurrent(context, () =>
+                            {
+                                detailsFailure = DetailsFetchFailure.Response;
+                                Notify(nameof(DetailsStatusText));
+                                Notify(nameof(DetailsStatusAutomationText));
+                                ApplyFailure(DetailsFetchFailure.Response);
+                            });
+                            return;
+                        }
+
+                        if ((ulong)threadSnapshot.Threads.Count != current.ActiveThreadCount)
                         {
                             MutateIfCurrent(context, () =>
                             {
@@ -877,20 +1278,15 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                         threads = threadSnapshot.Threads;
                     }
 
-                    MutateIfCurrent(context, () => ApplyCurrentGeneration(current, threads));
-                }
-                else
-                {
-                    var failure = currentResult.Failure == DetailsFetchFailure.Transport
-                        ? DetailsFetchFailure.Transport
-                        : DetailsFetchFailure.Response;
-                    MutateIfCurrent(context, () =>
+                    if (selectedAccountId is not null &&
+                        (current.AccountId != selectedAccountId ||
+                         !IsAccountSelectionCurrent(selectedAccountId, selectedAccountGeneration)))
                     {
-                        detailsFailure = failure;
-                        Notify(nameof(DetailsStatusText));
-                        Notify(nameof(DetailsStatusAutomationText));
-                        ApplyFailure(failure);
-                    });
+                        return;
+                    }
+
+                    MutateIfCurrent(context, () => ApplyCurrentGeneration(current, threads));
+                    return;
                 }
                 return;
             }
@@ -1025,6 +1421,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         lease.Dispose();
         RetiredContext? retirement = null;
+        var scheduleAccountRefresh = false;
         lock (stateGate)
         {
             context.RefreshInFlight = false;
@@ -1053,12 +1450,21 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 Notify(nameof(IsRefreshingVisible));
                 Notify(nameof(IsUpdateNotificationVisible));
                 Notify(nameof(IsUpdateActionVisible));
+                if (accountRefreshPending)
+                {
+                    accountRefreshPending = false;
+                    scheduleAccountRefresh = true;
+                }
             }
 
             retirement = ReleaseRetirementLocked(context);
         }
         CancelRetirement(retirement);
         context.PipelineCompletion.TrySetResult(context);
+        if (scheduleAccountRefresh)
+        {
+            _ = RunPeriodicRefreshAsync();
+        }
     }
 
     private RetiredContext? RetireContextLocked(GenerationContext? context)
@@ -1137,34 +1543,42 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         // or property notification.  The commit itself is synchronous so an
         // observer can never see core from one details generation with history,
         // models, or threads from another.
+        var historical = selectedAccount is { IsCurrent: false, Id: var accountId } &&
+            validatedDetails is { State: ApiState.Ready, Authenticated: true } &&
+            validatedDetails.AccountId == accountId;
         detailsSnapshot = validatedDetails;
         detailsFailure = null;
-        lastReceivedAt = DateTimeOffset.Now;
+        historicalActivitySuppressed = historical;
+        lastReceivedAt = historical
+            ? validatedDetails.ObservedAt is { } observedAt
+                ? DateTimeOffset.FromUnixTimeSeconds(observedAt)
+                : null
+            : DateTimeOffset.Now;
         hasConnectionFailure = validatedDetails.State == ApiState.Error;
         authLaunchFailed = false;
         authLaunchSucceeded = false;
-        presentationState = validatedDetails.State switch
-        {
-            ApiState.Ready => GetReadyPresentationState(validatedDetails),
-            ApiState.Initializing => ClientPresentationState.Initializing,
-            ApiState.AuthRequired => ClientPresentationState.AuthRequired,
-            ApiState.Error => ClientPresentationState.ApiError,
-            _ => ClientPresentationState.ResponseError,
-        };
+        presentationState = historical
+            ? ClientPresentationState.Ready
+            : validatedDetails.State switch
+            {
+                ApiState.Ready => GetReadyPresentationState(validatedDetails),
+                ApiState.Initializing => ClientPresentationState.Initializing,
+                ApiState.AuthRequired => ClientPresentationState.AuthRequired,
+                ApiState.Error => ClientPresentationState.ApiError,
+                _ => ClientPresentationState.ResponseError,
+            };
 
         if (validatedDetails.State == ApiState.AuthRequired || !validatedDetails.Authenticated)
         {
             // The validated generation remains the core authority, while its
             // account-scoped presentation is cleared for authentication.
-            ClearModels(notify: false);
+            ClearModels();
         }
         else
         {
-            ReplaceModels(validatedDetails.Models.OrderBy(ModelOrder), notify: false);
+            ReplaceModels(validatedDetails.Models.OrderBy(ModelOrder));
         }
-        RebuildQuotaSegments(notify: false);
-        models.NotifyReset();
-        quotaSegments.NotifyReset();
+        RebuildQuotaSegments();
 
         Notify(nameof(HasDetails));
         Notify(nameof(DetailsSnapshot));
@@ -1185,6 +1599,15 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         ApiCurrentSnapshot current,
         IReadOnlyList<ApiThreadDetails> threads)
     {
+        var historical = selectedAccount is { IsCurrent: false, Id: var accountId } &&
+            current is { State: ApiState.Ready, Authenticated: true } &&
+            current.AccountId == accountId;
+        // The v3 current resource for an inactive account is a point-in-time
+        // record.  It must never be surfaced as currently running threads;
+        // quota, models, and observed_at remain the account's own snapshot.
+        var visibleThreads = historical
+            ? Array.Empty<ApiThreadDetails>()
+            : threads;
         var merged = new ApiDetailsSnapshot(
             current.State,
             current.ObservedAt,
@@ -1195,11 +1618,12 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             current.ActiveThreadCount,
             Array.Empty<ApiHistoryPeriod>(),
             Array.Empty<ApiHistorySample>(),
-            threads,
+            visibleThreads,
             "概算 —")
         {
             ApiVersion = current.ApiVersion,
             PublishedPair = current.PublishedPair,
+            AccountId = current.AccountId,
             HistoryGaps = Array.Empty<ApiHistoryGap>(),
             LegalNotices = Array.Empty<ApiLegalNotice>(),
         };
@@ -1259,11 +1683,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void NotifyGenerationProperties(bool quotaAlreadyRebuilt = false)
     {
-        if (quotaAlreadyRebuilt)
-        {
-            Notify(nameof(QuotaSegments));
-        }
-        else
+        if (!quotaAlreadyRebuilt)
         {
             RebuildQuotaSegments();
         }
@@ -1292,21 +1712,28 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         NotifyActiveThreadProperties();
     }
 
-    private void RebuildQuotaSegments(bool notify = true)
+    private void RebuildQuotaSegments()
     {
         var fraction = detailsSnapshot?.Quota is { } quota
-            ? Math.Clamp((quota.ResetAt - DateTimeOffset.UtcNow.ToUnixTimeSeconds()) /
-                         (double)Math.Max(1, quota.WindowSeconds), 0, 1)
+            ? IsHistoricalDetails
+                ? Math.Clamp(quota.RemainingPercent / 100.0, 0, 1)
+                : Math.Clamp((quota.ResetAt - DateTimeOffset.UtcNow.ToUnixTimeSeconds()) /
+                             (double)Math.Max(1, quota.WindowSeconds), 0, 1)
             : 0;
-        quotaSegments.ReplaceAll(Enumerable.Range(0, 7)
-            .Select(index => new QuotaSegmentViewModel(Math.Clamp(fraction * 7 - index, 0, 1))),
-            notify: false);
-
-        if (notify)
+        var fills = Enumerable.Range(0, 7)
+            .Select(index => Math.Clamp(fraction * 7 - index, 0, 1))
+            .ToArray();
+        if (quotaSegments.Count == fills.Length)
         {
-            quotaSegments.NotifyReset();
-            Notify(nameof(QuotaSegments));
+            for (var index = 0; index < fills.Length; index++)
+            {
+                quotaSegments[index].UpdateFill(fills[index]);
+            }
+            return;
         }
+
+        quotaSegments.ReplaceAll(fills.Select(fill => new QuotaSegmentViewModel(fill)));
+        Notify(nameof(QuotaSegments));
     }
 
     private void NotifyStatusProperties()
@@ -1322,6 +1749,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         Notify(nameof(HasActiveThreads));
         Notify(nameof(HasNoActiveThreads));
+        Notify(nameof(HasHistoricalThreadNotice));
         Notify(nameof(ActiveThreadCount));
         Notify(nameof(ActiveThreadCountLabel));
         Notify(nameof(ActiveThreadCountText));
@@ -1332,21 +1760,35 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(ActiveOtherCount));
     }
 
-    private void ClearModels(bool notify = true)
+    private void ClearModels()
     {
         var previous = models.ToArray();
-        models.ReplaceAll([], notify);
+        if (previous.Length != 0)
+        {
+            models.ReplaceAll([]);
+        }
         foreach (var model in previous)
         {
             model.Dispose();
         }
     }
 
-    private void ReplaceModels(IEnumerable<ApiDetailsModelUsage> source, bool notify = true)
+    private void ReplaceModels(IEnumerable<ApiDetailsModelUsage> source)
     {
-        var next = source.Select(static model => new ModelUsageViewModel(model)).ToArray();
+        var usages = source.ToArray();
+        if (usages.Length == models.Count &&
+            usages.Select(usage => usage.Name).SequenceEqual(models.Select(model => model.Name), StringComparer.Ordinal))
+        {
+            for (var index = 0; index < usages.Length; index++)
+            {
+                models[index].Update(usages[index]);
+            }
+            return;
+        }
+
+        var next = usages.Select(static model => new ModelUsageViewModel(model)).ToArray();
         var previous = models.ToArray();
-        models.ReplaceAll(next, notify);
+        models.ReplaceAll(next);
         foreach (var model in previous)
         {
             model.Dispose();
@@ -1388,7 +1830,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private int CountThreads(string model)
     {
-        if (detailsSnapshot is null)
+        if (detailsSnapshot is null || historicalActivitySuppressed)
         {
             return 0;
         }
@@ -1455,6 +1897,13 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         var utc = DateTimeOffset.FromUnixTimeSeconds(unixSeconds);
         return TimeZoneInfo.ConvertTime(utc, LocalizationService.DisplayTimeZone)
             .ToString("g", CultureInfo.CurrentCulture);
+    }
+
+    private static string FormatShortUnixTime(long unixSeconds)
+    {
+        var utc = DateTimeOffset.FromUnixTimeSeconds(unixSeconds);
+        return TimeZoneInfo.ConvertTime(utc, LocalizationService.DisplayTimeZone)
+            .ToString("M/d HH:mm", CultureInfo.CurrentCulture);
     }
 
     private string FormatRemainingDuration(long resetAt)
@@ -1561,12 +2010,25 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     }
 }
 
-public sealed class QuotaSegmentViewModel
+public sealed class QuotaSegmentViewModel : INotifyPropertyChanged
 {
     public QuotaSegmentViewModel(double fill)
     {
         Fill = fill;
     }
 
-    public double Fill { get; }
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    public double Fill { get; private set; }
+
+    public void UpdateFill(double fill)
+    {
+        if (Fill.Equals(fill))
+        {
+            return;
+        }
+
+        Fill = fill;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Fill)));
+    }
 }

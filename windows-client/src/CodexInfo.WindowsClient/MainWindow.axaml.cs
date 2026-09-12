@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia;
 using Avalonia.Input;
 using Avalonia.Threading;
+using Avalonia.VisualTree;
+using CodexInfo.WindowsClient.Core;
 using CodexInfo.WindowsClient.ViewModels;
 
 namespace CodexInfo.WindowsClient;
@@ -16,6 +19,7 @@ public partial class MainWindow : Window
     private LegalNoticesWindow? legalNoticesWindow;
     private SettingsWindow? settingsWindow;
     private SetupWindow? setupWindow;
+    private string? accountSelectionAtOpen;
 
     public MainWindow()
     {
@@ -106,10 +110,38 @@ public partial class MainWindow : Window
         ApplyPreviewSize(window);
         graphWindow = window;
         window.Closed += (_, _) => graphWindow = null;
-        window.Show(this);
+        ShowIndependentWindow(window);
     }
 
     private void OnOpenThreads(object? sender, Avalonia.Interactivity.RoutedEventArgs eventArgs) => OpenThreads();
+
+    private void OnAccountSelectorCheckedChanged(object? sender, Avalonia.Interactivity.RoutedEventArgs eventArgs)
+    {
+        var open = AccountSelector.IsChecked == true;
+        accountSelectionAtOpen = open
+            ? (DataContext as MainWindowViewModel)?.SelectedAccount?.Id
+            : null;
+        SetAccountMenuOpen(open);
+    }
+
+    private void OnAccountSelectionChanged(object? sender, SelectionChangedEventArgs eventArgs)
+    {
+        if (!AccountMenu.IsEnabled || sender is not ListBox { SelectedItem: ApiAccount selected } ||
+            string.Equals(selected.Id, accountSelectionAtOpen, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        SetAccountMenuOpen(false);
+        AccountSelector.IsChecked = false;
+    }
+
+    private void SetAccountMenuOpen(bool open)
+    {
+        AccountMenu.Opacity = open ? 1 : 0;
+        AccountMenu.IsEnabled = open;
+        AccountMenu.IsHitTestVisible = open;
+    }
 
     private void OpenThreads()
     {
@@ -128,7 +160,7 @@ public partial class MainWindow : Window
         ApplyPreviewSize(window);
         threadsWindow = window;
         window.Closed += (_, _) => threadsWindow = null;
-        window.Show(this);
+        ShowIndependentWindow(window);
     }
 
     private void OnOpenLegal(object? sender, Avalonia.Interactivity.RoutedEventArgs eventArgs) => OpenLegal();
@@ -150,7 +182,7 @@ public partial class MainWindow : Window
         ApplyPreviewSize(window);
         legalNoticesWindow = window;
         window.Closed += (_, _) => legalNoticesWindow = null;
-        window.Show(this);
+        ShowIndependentWindow(window);
     }
 
     private void OnOpenSettings(object? sender, Avalonia.Interactivity.RoutedEventArgs eventArgs)
@@ -161,11 +193,11 @@ public partial class MainWindow : Window
             return;
         }
 
-        var window = new SettingsWindow(new SettingsViewModel(App.SettingsStore, DataContext as MainWindowViewModel));
+        var window = new SettingsWindow(new SettingsViewModel(App.SettingsStore, DataContext as MainWindowViewModel), this);
         ApplyPreviewSize(window);
         settingsWindow = window;
         window.Closed += (_, _) => settingsWindow = null;
-        window.Show(this);
+        ShowIndependentWindow(window);
     }
 
     public void OpenSetupFromChild() => OpenSetup();
@@ -189,7 +221,24 @@ public partial class MainWindow : Window
         ApplyPreviewSize(window);
         setupWindow = window;
         window.Closed += (_, _) => setupWindow = null;
-        window.Show(this);
+        ShowIndependentWindow(window);
+    }
+
+    private void ShowIndependentWindow(Window window)
+    {
+        window.WindowStartupLocation = WindowStartupLocation.Manual;
+        if (Screens.ScreenFromWindow(this) is { } screen)
+        {
+            var scale = screen.Scaling;
+            var width = (int)Math.Round(window.Width * scale);
+            var height = (int)Math.Round(window.Height * scale);
+            var area = screen.WorkingArea;
+            window.Position = new PixelPoint(
+                area.X + Math.Max(0, (area.Width - width) / 2),
+                area.Y + Math.Max(0, (area.Height - height) / 2));
+        }
+
+        window.Show();
     }
 
     private static void ApplyPreviewSize(Window window)
@@ -205,10 +254,26 @@ public partial class MainWindow : Window
 
     private void OnTitlePointerPressed(object? sender, PointerPressedEventArgs eventArgs)
     {
-        if (eventArgs.Source is not Button && eventArgs.GetCurrentPoint(this).Properties.PointerUpdateKind == PointerUpdateKind.LeftButtonPressed)
+        if (!IsInteractiveSource(eventArgs.Source) &&
+            eventArgs.GetCurrentPoint(this).Properties.PointerUpdateKind == PointerUpdateKind.LeftButtonPressed)
         {
             WindowDragBehavior.Begin(this, eventArgs);
         }
+    }
+
+    private bool IsInteractiveSource(object? source)
+    {
+        for (var current = source as Visual;
+             current is not null && !ReferenceEquals(current, this);
+             current = current.GetVisualParent())
+        {
+            if (current is Button or ListBox or ListBoxItem or ScrollBar or TextBox or ComboBox)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private void OnMinimizeWindow(object? sender, Avalonia.Interactivity.RoutedEventArgs eventArgs)
