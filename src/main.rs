@@ -14326,15 +14326,41 @@ impl CodexInfoState {
                     .samples
                     .iter()
                     .filter(|sample| sample.reset_at == selected_reset)
-                    .map(|sample| PublicHistoryObservationV3 {
-                        timestamp: sample.timestamp,
-                        reset_at: sample.reset_at,
-                        remaining_percent: Some(sample.remaining_percent),
-                        task_active_since_previous: (sample.timestamp > inferred_end)
-                            .then_some(false),
-                        models: None,
-                        models_complete: false,
-                        model_source: "unavailable".to_owned(),
+                    .map(|sample| {
+                        let astra_tokens = if sample.timestamp == period_start {
+                            500_000
+                        } else {
+                            1_000_000
+                        };
+                        let models = [
+                            ("SOL", sample.sol_tokens, Some(sample.sol_dollars)),
+                            ("TERRA", sample.terra_tokens, Some(sample.terra_dollars)),
+                            ("LUNA", sample.luna_tokens, Some(sample.luna_dollars)),
+                            ("ASTRA", astra_tokens, None),
+                        ]
+                        .into_iter()
+                        .map(
+                            |(model, total_tokens, total_dollars)| PublicHistoryModelUsageV3 {
+                                model: model.to_owned(),
+                                total_tokens,
+                                input_tokens: Some(total_tokens),
+                                cached_input_tokens: Some(0),
+                                cache_write_input_tokens: Some(0),
+                                output_tokens: Some(0),
+                                total_dollars,
+                            },
+                        )
+                        .collect();
+                        PublicHistoryObservationV3 {
+                            timestamp: sample.timestamp,
+                            reset_at: sample.reset_at,
+                            remaining_percent: Some(sample.remaining_percent),
+                            task_active_since_previous: (sample.timestamp > inferred_end)
+                                .then_some(false),
+                            models: Some(models),
+                            models_complete: true,
+                            model_source: "confirmed".to_owned(),
+                        }
                     })
                     .collect();
                 state.reset_at = Some(selected_reset);
@@ -44428,7 +44454,10 @@ mod tests {
         assert!(paths.astra_rising.is_empty());
         assert!(paths.astra_inferred.is_empty());
         assert!(paths.current_astra_label.is_empty());
-        assert!(paths.unused_intervals.is_empty());
+        assert_eq!(paths.unused_intervals.len(), 1);
+        let idle = &paths.unused_intervals[0];
+        assert!((idle.start - 100.0 / 12.0).abs() < 0.001);
+        assert!((idle.width - 100.0 * 11.0 / 12.0).abs() < 0.001);
     }
 
     #[test]

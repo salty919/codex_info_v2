@@ -46,7 +46,7 @@ if [[ "$profile" == history-graph ]]; then
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Remaining_stair_step_is_smoothed_across_coherent_token_deltas
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.IdleBandRasterIsOpaqueAboveTheMajorGridAndBelowDataSeries
         CodexInfo.WindowsClient.Presentation.Tests.DetailsPresentationCoverageTests.GraphWindow_ExactStaleCursorRetriesHeadOnceAndPreservesResetStateAcrossFailures
-        CodexInfo.WindowsClient.Presentation.Tests.DetailsPresentationCoverageTests.GraphWindow_PublishedPairChangeUsesProvenCursorAndAtomicallyAppends
+        CodexInfo.WindowsClient.Presentation.Tests.DetailsPresentationCoverageTests.GraphWindow_PublishedPairAdvanceRealignsOnceWithoutFalseFailure
         CodexInfo.WindowsClient.Presentation.Tests.DetailsPresentationCoverageTests.GraphWindow_DuplicateTimestampsRejectWholeCandidateAndPreserveLastGood
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Confirmed_history_gap_is_continuous_and_dashed_across_the_gap
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Remaining_quota_observations_survive_flat_model_rows_as_unattributed_dashes
