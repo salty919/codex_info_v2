@@ -8,7 +8,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).ProviderPath
 $clientProject = Join-Path $root 'windows-client\src\CodexInfo.WindowsClient\CodexInfo.WindowsClient.csproj'
 $versionProps = Join-Path $root 'windows-client\Directory.Build.props'
 $installerScript = Join-Path $root 'windows-client\installer\CodexInfo.WindowsClient.iss'
