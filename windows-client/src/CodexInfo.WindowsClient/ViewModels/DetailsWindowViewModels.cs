@@ -103,10 +103,12 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     // This is a DoS guard derived from the existing one-month history admission
     // envelope in Core. It is not a normal page-size or payload requirement.
     private const int MaxSplitHistoryPageRequests = 31 * 24 * 60 + 1;
+    private const int MaxSplitGenerationAlignmentAttempts = 2;
     private const int BackgroundBuildThreshold = 2_048;
     private readonly MainWindowViewModel main;
     private readonly Action<Action> postToUi;
     private readonly ILoopbackResourceClient? resourceClient;
+    private readonly ILoopbackAccountResourceClient? accountResourceClient;
     private readonly SemaphoreSlim resourceRefreshGate = new(1, 1);
     private readonly ObservableCollection<ApiHistoryPeriod> periods = [];
     private IReadOnlyList<GraphPointViewModel> points = Array.Empty<GraphPointViewModel>();
@@ -124,6 +126,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     private bool showAstra = true;
     private CancellationTokenSource pointBuildCancellation = new();
     private long pointBuildRevision;
+    private long periodSelectionRevision;
     private bool isLoading;
     private bool hasLoadError;
     private bool disposed;
@@ -149,6 +152,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         RebuildMetricOptions();
         main.PropertyChanged += OnMainPropertyChanged;
         resourceClient = main.SplitResourceClient;
+        accountResourceClient = main.AccountResourceClient;
         if (resourceClient is null)
         {
             Rebuild();
@@ -171,14 +175,32 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public UiText Texts => LocalizationService.Current;
 
+    public ReadOnlyObservableCollection<ApiAccount> Accounts => main.Accounts;
+
+    public bool HasAccounts => main.HasAccounts;
+
+    public ApiAccount? SelectedAccount
+    {
+        get => main.SelectedAccount;
+        set
+        {
+            if (value is not null)
+            {
+                main.SelectAccount(value.Id);
+            }
+        }
+    }
+
+    public string SelectedAccountText => $"{Texts.Account}｜{main.SelectedAccountText}";
+
     public IReadOnlyList<string> MetricOptions => metricOptions;
 
     public string SelectedMetric
     {
-        get => selectedMetric == GraphMetric.Dollars ? Texts.Dollars : Texts.Tokens;
+        get => selectedMetric == GraphMetric.Dollars ? Texts.GraphDollarMetric : Texts.GraphTokenMetric;
         set
         {
-            var metric = value == Texts.Tokens ? GraphMetric.Tokens : GraphMetric.Dollars;
+            var metric = value == Texts.GraphTokenMetric ? GraphMetric.Tokens : GraphMetric.Dollars;
             if (selectedMetric == metric)
             {
                 return;
@@ -202,28 +224,31 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
             var requiresResourceFetch = resourceClient is not null && value is not null &&
                 !disposed && !applyingSplitResourceState;
-            selectedPeriod = value;
             if (requiresResourceFetch)
             {
+                var selectionRevision = Interlocked.Increment(ref periodSelectionRevision);
                 SetLoadError(false);
                 SetLoading(true);
+                // Keep the accepted selector, scene, and axis as one visible
+                // generation until the requested period has been fetched and
+                // validated completely. Re-notify the accepted value so the
+                // ComboBox cannot label the old scene as the requested period.
+                Notify();
+                _ = RefreshSplitResourceCoreAsync(
+                    initial: true,
+                    requestedPeriodId: value!.Id,
+                    selectionRevision,
+                    resourcePollingCancellation?.Token ?? main.LifetimeToken);
+                return;
             }
-            else
-            {
-                RebuildPoints();
-            }
+
+            selectedPeriod = value;
+            RebuildPoints();
             Notify();
             Notify(nameof(HasPoints));
             Notify(nameof(SelectedPeriodText));
             Notify(nameof(SelectedPeriodStartAt));
             Notify(nameof(SelectedPeriodEndAt));
-            if (requiresResourceFetch)
-            {
-                _ = RefreshSplitResourceAsync(
-                    initial: true,
-                    requestedPeriodId: value!.Id,
-                    resourcePollingCancellation?.Token ?? main.LifetimeToken);
-            }
         }
     }
 
@@ -231,9 +256,13 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public bool HasNoPoints => !IsLoading && !HasLoadError && !HasPoints;
 
+    public bool HasBlockingLoadError => !IsLoading && HasLoadError && !HasPoints;
+
     public bool HasPeriods => periods.Count > 0;
 
-    public string SelectedPeriodText => selectedPeriod?.Label ?? Texts.UnavailableValue;
+    public string SelectedPeriodText => selectedPeriod is { } period
+        ? $"{Texts.PeriodSelectorHeading}｜{period.Label}"
+        : $"{Texts.PeriodSelectorHeading}｜{Texts.UnavailableValue}";
 
     public long SelectedPeriodStartAt => scene.HasPoints ? scene.PeriodStartAt : displayedPeriod?.StartAt ?? 0;
 
@@ -272,15 +301,12 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         var result = new List<ApiHistorySample>(normalized.Count + 1);
         result.AddRange(normalized);
         var last = result[^1];
-        if (last.Timestamp < end &&
-            end - last.Timestamp <= 60 &&
-            last.ModelSource != ApiHistorySample.UnavailableModelSource)
+        if (last.Timestamp < end)
         {
-            // A recent local cumulative observation may be held only until
-            // the next normal collection boundary.  The quota field is not
-            // copied: the renderer owns the explicitly dashed last-known
-            // projection.  A longer local-log outage must leave the model
-            // path at its actual observation time.
+            // Match the native graph's explicit selected-period endpoint.
+            // This is presentation evidence, never a measured sample: model
+            // and quota projectors therefore render the full hold as inferred
+            // regardless of its duration or the last row's source quality.
             result.Add(last with
             {
                 Timestamp = end,
@@ -567,8 +593,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     public string LoadErrorText => Texts.GraphLoadFailed;
 
     public string MetricAxisText => displayedMetric == GraphMetric.Dollars
-        ? $"{Texts.Dollars} ({Texts.ModelUsage})"
-        : $"{Texts.Tokens} ({Texts.ModelUsage})";
+        ? Texts.GraphDollarDescription
+        : Texts.GraphTokenDescription;
 
     public string GraphGapHintText => Texts.LanguageCode switch
     {
@@ -598,6 +624,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             if (showModels == value) return;
             showModels = value;
+            RebuildPoints();
             Notify();
         }
     }
@@ -609,6 +636,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             if (showSol == value) return;
             showSol = value;
+            RebuildPoints();
             Notify();
         }
     }
@@ -620,6 +648,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             if (showTerra == value) return;
             showTerra = value;
+            RebuildPoints();
             Notify();
         }
     }
@@ -631,6 +660,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             if (showLuna == value) return;
             showLuna = value;
+            RebuildPoints();
             Notify();
         }
     }
@@ -642,6 +672,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             if (showAstra == value) return;
             showAstra = value;
+            RebuildPoints();
             Notify();
         }
     }
@@ -666,6 +697,33 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void OnMainPropertyChanged(object? sender, PropertyChangedEventArgs eventArgs)
     {
+        if (eventArgs.PropertyName is nameof(MainWindowViewModel.Accounts) or
+            nameof(MainWindowViewModel.HasAccounts) or
+            nameof(MainWindowViewModel.SelectedAccount) or
+            nameof(MainWindowViewModel.SelectedAccountText))
+        {
+            Notify(nameof(Accounts));
+            Notify(nameof(HasAccounts));
+            Notify(nameof(SelectedAccount));
+            Notify(nameof(SelectedAccountText));
+            if (eventArgs.PropertyName == nameof(MainWindowViewModel.SelectedAccount))
+            {
+                ClearAccountResourceState();
+                if (resourceClient is null)
+                {
+                    Rebuild();
+                }
+                else if (!disposed)
+                {
+                    _ = RefreshSplitResourceAsync(
+                        initial: true,
+                        requestedPeriodId: null,
+                        resourcePollingCancellation?.Token ?? main.LifetimeToken);
+                }
+            }
+            return;
+        }
+
         if (eventArgs.PropertyName == nameof(MainWindowViewModel.DetailsSnapshot))
         {
             if (resourceClient is null)
@@ -684,6 +742,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         if (eventArgs.PropertyName == nameof(MainWindowViewModel.Texts))
         {
             RebuildMetricOptions();
+            ReformatPeriodLabels();
             RebuildPoints();
             Notify(nameof(Texts));
             Notify(nameof(MetricOptions));
@@ -694,9 +753,46 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
+    private void ClearAccountResourceState()
+    {
+        if (disposed)
+        {
+            return;
+        }
+
+        Interlocked.Increment(ref periodSelectionRevision);
+        pointBuildCancellation.Cancel();
+        pointBuildCancellation.Dispose();
+        pointBuildCancellation = new CancellationTokenSource();
+        pointBuildRevision++;
+        periods.Clear();
+        selectedPeriod = null;
+        displayedPeriod = null;
+        resourceCursorResetRequired = false;
+        resourceNextCursor = null;
+        resourcePublishedPair = null;
+        resourcePeriod = null;
+        resourceSamples = Array.Empty<ApiHistorySample>();
+        resourceGaps = Array.Empty<ApiHistoryGap>();
+        points = Array.Empty<GraphPointViewModel>();
+        scene = GraphScene.Empty(selectedMetric);
+        SetLoadError(false);
+        SetLoading(main.HasAccounts);
+        Notify(nameof(Periods));
+        Notify(nameof(SelectedPeriod));
+        Notify(nameof(SelectedPeriodText));
+        Notify(nameof(SelectedPeriodStartAt));
+        Notify(nameof(SelectedPeriodEndAt));
+        Notify(nameof(Points));
+        Notify(nameof(Scene));
+        Notify(nameof(HasPoints));
+        Notify(nameof(HasNoPoints));
+        Notify(nameof(HasBlockingLoadError));
+    }
+
     private void RebuildMetricOptions()
     {
-        metricOptions = [Texts.Dollars, Texts.Tokens];
+        metricOptions = [Texts.GraphDollarMetric, Texts.GraphTokenMetric];
     }
 
     private async Task RunSplitResourcePollingAsync(CancellationToken cancellationToken)
@@ -728,6 +824,17 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     private async Task RefreshSplitResourceAsync(
         bool initial,
         string? requestedPeriodId,
+        CancellationToken cancellationToken) =>
+        await RefreshSplitResourceCoreAsync(
+            initial,
+            requestedPeriodId,
+            Interlocked.Read(ref periodSelectionRevision),
+            cancellationToken).ConfigureAwait(false);
+
+    private async Task RefreshSplitResourceCoreAsync(
+        bool initial,
+        string? requestedPeriodId,
+        long selectionRevision,
         CancellationToken cancellationToken)
     {
         if (resourceClient is null || disposed || cancellationToken.IsCancellationRequested)
@@ -744,13 +851,50 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             return;
         }
 
+        string? operationAccountId = null;
+        long operationAccountGeneration = 0;
+        bool operationCursorResetRequired = false;
         try
         {
-            var periodsResult = await resourceClient.FetchHistoryPeriodsAsync(cancellationToken)
+            var accountId = main.SelectedAccountId;
+            var accountGeneration = main.AccountSelectionGeneration;
+            operationAccountId = accountId;
+            operationAccountGeneration = accountGeneration;
+            if (accountResourceClient is not null && accountId is null)
+            {
+                return;
+            }
+
+            if (accountResourceClient is null && main.HasAccounts)
+            {
+                PublishSplitResourceFailure(accountId, accountGeneration, selectionRevision);
+                return;
+            }
+
+            var candidateResourcePeriod = resourcePeriod;
+            var candidateResourceNextCursor = resourceNextCursor;
+            var candidateCursorResetRequired = resourceCursorResetRequired;
+            operationCursorResetRequired = candidateCursorResetRequired;
+            var candidateResourceSamples = resourceSamples;
+            var candidateResourceGaps = resourceGaps;
+            var periodsResult = accountId is not null && accountResourceClient is not null
+                ? await accountResourceClient.FetchHistoryPeriodsAsync(accountId, cancellationToken)
+                : await resourceClient.FetchHistoryPeriodsAsync(cancellationToken)
                 .ConfigureAwait(false);
             if (!periodsResult.IsSuccess || periodsResult.Snapshot is not { } periodsSnapshot)
             {
-                PublishSplitResourceFailure();
+                PublishSplitResourceFailure(
+                    accountId,
+                    accountGeneration,
+                    selectionRevision,
+                    candidateCursorResetRequired);
+                return;
+            }
+
+            if (accountId is not null &&
+                (periodsSnapshot.AccountId != accountId ||
+                 !main.IsAccountSelectionCurrent(accountId, accountGeneration)))
+            {
                 return;
             }
 
@@ -766,18 +910,22 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                     Array.Empty<ApiHistorySample>(),
                     Array.Empty<ApiHistoryGap>(),
                     periodsSnapshot.PublishedPair,
-                    nextCursor: null);
+                    nextCursor: null,
+                    accountId,
+                    accountGeneration,
+                    selectionRevision,
+                    nextCursorResetRequired: false);
                 return;
             }
 
-            var periodChanged = resourcePeriod?.Id != stagedPeriod.Id;
-            var canContinueFromPreviousCursor = !resourceCursorResetRequired &&
+            var periodChanged = candidateResourcePeriod?.Id != stagedPeriod.Id;
+            var canContinueFromPreviousCursor = !candidateCursorResetRequired &&
                 !periodChanged &&
-                resourceNextCursor is not null;
+                candidateResourceNextCursor is not null;
             var fullRefresh = initial || periodChanged ||
-                resourceCursorResetRequired ||
+                candidateCursorResetRequired ||
                 !canContinueFromPreviousCursor;
-            var cursor = fullRefresh ? null : resourceNextCursor;
+            var cursor = fullRefresh ? null : candidateResourceNextCursor;
             var appendingProvenPrefix = canContinueFromPreviousCursor;
             var pageSamples = new List<ApiHistorySample>();
             var pageGaps = new List<ApiHistoryGap>();
@@ -785,22 +933,37 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             var pageCount = 0;
             var totalPageRequests = 0;
             var staleCursorRecoveryAttempted = false;
+            var generationAlignmentAttempts = 1;
             string? resumeCursor = null;
             while (true)
             {
                 if (++totalPageRequests > MaxSplitHistoryPageRequests)
                 {
-                    PublishSplitResourceFailure();
+                    PublishSplitResourceFailure(
+                        accountId,
+                        accountGeneration,
+                        selectionRevision,
+                        candidateCursorResetRequired);
                     return;
                 }
 
                 pageCount++;
                 var firstPage = pageCount == 1;
-                var pageResult = await resourceClient.FetchHistoryPageAsync(
-                        stagedPeriod.Id,
-                        cursor,
-                        cancellationToken)
+                var pageResult = accountId is not null && accountResourceClient is not null
+                    ? await accountResourceClient.FetchHistoryPageAsync(
+                            accountId,
+                            stagedPeriod.Id,
+                            cursor,
+                            cancellationToken)
+                    : await resourceClient.FetchHistoryPageAsync(
+                            stagedPeriod.Id,
+                            cursor,
+                            cancellationToken)
                     .ConfigureAwait(false);
+                if (accountId is not null && !main.IsAccountSelectionCurrent(accountId, accountGeneration))
+                {
+                    return;
+                }
                 if (pageResult.CursorRejected &&
                     firstPage &&
                     appendingProvenPrefix &&
@@ -823,16 +986,103 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                     continue;
                 }
                 if (!pageResult.IsSuccess || pageResult.Page is not { } page ||
-                    page.PublishedPair != periodsSnapshot.PublishedPair ||
-                    page.PeriodId != stagedPeriod.Id ||
-                    !ValidateHistoryPage(stagedPeriod, page))
+                    (accountId is not null && page.AccountId != accountId) ||
+                    page.PeriodId != stagedPeriod.Id)
                 {
                     // Only the exact stale-cursor response changes reset
                     // state. Ordinary failures retry the same state next
                     // cycle and never publish a partial candidate.
-                    resourceCursorResetRequired = staleCursorRecoveryAttempted ||
-                        resourceCursorResetRequired;
-                    PublishSplitResourceFailure();
+                    candidateCursorResetRequired = staleCursorRecoveryAttempted ||
+                        candidateCursorResetRequired;
+                    operationCursorResetRequired = candidateCursorResetRequired;
+                    PublishSplitResourceFailure(
+                        accountId,
+                        accountGeneration,
+                        selectionRevision,
+                        candidateCursorResetRequired);
+                    return;
+                }
+
+                if (page.PublishedPair != periodsSnapshot.PublishedPair)
+                {
+                    if (generationAlignmentAttempts >= MaxSplitGenerationAlignmentAttempts)
+                    {
+                        candidateCursorResetRequired = staleCursorRecoveryAttempted ||
+                            candidateCursorResetRequired;
+                        operationCursorResetRequired = candidateCursorResetRequired;
+                        PublishSplitResourceFailure(
+                            accountId,
+                            accountGeneration,
+                            selectionRevision,
+                            candidateCursorResetRequired);
+                        return;
+                    }
+
+                    generationAlignmentAttempts++;
+                    var alignedPeriodsResult = accountId is not null && accountResourceClient is not null
+                        ? await accountResourceClient.FetchHistoryPeriodsAsync(accountId, cancellationToken)
+                        : await resourceClient.FetchHistoryPeriodsAsync(cancellationToken)
+                        .ConfigureAwait(false);
+                    if (!alignedPeriodsResult.IsSuccess ||
+                        alignedPeriodsResult.Snapshot is not { } alignedPeriodsSnapshot ||
+                        (accountId is not null &&
+                            (alignedPeriodsSnapshot.AccountId != accountId ||
+                             !main.IsAccountSelectionCurrent(accountId, accountGeneration))))
+                    {
+                        candidateCursorResetRequired = staleCursorRecoveryAttempted ||
+                            candidateCursorResetRequired;
+                        operationCursorResetRequired = candidateCursorResetRequired;
+                        PublishSplitResourceFailure(
+                            accountId,
+                            accountGeneration,
+                            selectionRevision,
+                            candidateCursorResetRequired);
+                        return;
+                    }
+
+                    var alignedPeriod = alignedPeriodsSnapshot.Periods.FirstOrDefault(period =>
+                        period.Id == requestedPeriodId);
+                    alignedPeriod ??= alignedPeriodsSnapshot.Periods.FirstOrDefault(period => period.Current)
+                        ?? alignedPeriodsSnapshot.Periods.FirstOrDefault();
+                    if (alignedPeriod is null)
+                    {
+                        PublishSplitResourceState(
+                            alignedPeriodsSnapshot.Periods,
+                            null,
+                            Array.Empty<ApiHistorySample>(),
+                            Array.Empty<ApiHistoryGap>(),
+                            alignedPeriodsSnapshot.PublishedPair,
+                            nextCursor: null,
+                            accountId,
+                            accountGeneration,
+                            selectionRevision,
+                            nextCursorResetRequired: false);
+                        return;
+                    }
+
+                    // The global REST root advanced between periods and page.
+                    // Keep the published scene untouched and rebuild one complete
+                    // candidate from the new root instead of flashing an error.
+                    periodsSnapshot = alignedPeriodsSnapshot;
+                    stagedPeriod = alignedPeriod;
+                    fullRefresh = true;
+                    appendingProvenPrefix = false;
+                    cursor = null;
+                    requestedCursor = null;
+                    pageCount = 0;
+                    pageSamples.Clear();
+                    pageGaps.Clear();
+                    resumeCursor = null;
+                    continue;
+                }
+
+                if (!ValidateHistoryPage(stagedPeriod, page))
+                {
+                    PublishSplitResourceFailure(
+                        accountId,
+                        accountGeneration,
+                        selectionRevision,
+                        candidateCursorResetRequired);
                     return;
                 }
 
@@ -842,7 +1092,11 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 // once, while later pages must not repeat or alter it.
                 if ((appendingProvenPrefix || !firstPage) && page.HistoryGaps.Count != 0)
                 {
-                    PublishSplitResourceFailure();
+                    PublishSplitResourceFailure(
+                        accountId,
+                        accountGeneration,
+                        selectionRevision,
+                        candidateCursorResetRequired);
                     return;
                 }
 
@@ -861,7 +1115,11 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 if (page.NextCursor == cursor ||
                     page.NextCursor == requestedCursor && pageSamples.Count == 0)
                 {
-                    PublishSplitResourceFailure();
+                    PublishSplitResourceFailure(
+                        accountId,
+                        accountGeneration,
+                        selectionRevision,
+                        candidateCursorResetRequired);
                     return;
                 }
 
@@ -870,24 +1128,36 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
             var mergedSamples = fullRefresh
                 ? MergeHistorySamples(Array.Empty<ApiHistorySample>(), pageSamples)
-                : MergeHistorySamples(resourceSamples, pageSamples);
+                : MergeHistorySamples(candidateResourceSamples, pageSamples);
             var mergedGaps = fullRefresh
                 ? MergeHistoryGaps(Array.Empty<ApiHistoryGap>(), pageGaps)
-                : resourceGaps;
+                : candidateResourceGaps;
             if (mergedSamples is null || mergedGaps is null)
             {
-                PublishSplitResourceFailure();
+                PublishSplitResourceFailure(
+                    accountId,
+                    accountGeneration,
+                    selectionRevision,
+                    candidateCursorResetRequired);
                 return;
             }
 
-            resourceCursorResetRequired = false;
+            if (accountId is not null && !main.IsAccountSelectionCurrent(accountId, accountGeneration))
+            {
+                return;
+            }
+
             PublishSplitResourceState(
                 periodsSnapshot.Periods,
                 stagedPeriod,
                 mergedSamples,
                 mergedGaps,
                 periodsSnapshot.PublishedPair,
-                cursor);
+                cursor,
+                accountId,
+                accountGeneration,
+                selectionRevision,
+                nextCursorResetRequired: false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -895,7 +1165,11 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
         catch
         {
-            PublishSplitResourceFailure();
+            PublishSplitResourceFailure(
+                operationAccountId,
+                operationAccountGeneration,
+                selectionRevision,
+                operationCursorResetRequired);
         }
         finally
         {
@@ -909,11 +1183,17 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         IReadOnlyList<ApiHistorySample> nextSamples,
         IReadOnlyList<ApiHistoryGap> nextGaps,
         PublishedPairIdentity nextPair,
-        string? nextCursor)
+        string? nextCursor,
+        string? accountId,
+        long accountGeneration,
+        long selectionRevision,
+        bool nextCursorResetRequired)
     {
         postToUi(() =>
         {
-            if (disposed)
+            if (disposed ||
+                selectionRevision != Interlocked.Read(ref periodSelectionRevision) ||
+                accountId is not null && !main.IsAccountSelectionCurrent(accountId, accountGeneration))
             {
                 return;
             }
@@ -923,11 +1203,11 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             {
                 ApiHistoryPeriod? publishedSelectedPeriod = null;
                 periods.Clear();
-                foreach (var period in nextPeriods)
+                foreach (var displayPeriod in FormatPeriodsForDisplay(nextPeriods))
                 {
-                    var publishedPeriod = period.Id == nextSelectedPeriod?.Id
-                        ? period with { Samples = nextSamples }
-                        : period;
+                    var publishedPeriod = displayPeriod.Id == nextSelectedPeriod?.Id
+                        ? displayPeriod with { Samples = nextSamples }
+                        : displayPeriod;
                     periods.Add(publishedPeriod);
                     if (publishedPeriod.Id == nextSelectedPeriod?.Id)
                     {
@@ -941,6 +1221,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 resourceGaps = nextGaps;
                 resourcePublishedPair = nextPair;
                 resourceNextCursor = nextCursor;
+                resourceCursorResetRequired = nextCursorResetRequired;
                 SetLoadError(false);
                 RebuildPoints();
                 Notify(nameof(HasPeriods));
@@ -956,7 +1237,11 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         });
     }
 
-    private void PublishSplitResourceFailure()
+    private void PublishSplitResourceFailure(
+        string? accountId,
+        long accountGeneration,
+        long selectionRevision,
+        bool nextCursorResetRequired = false)
     {
         if (disposed)
         {
@@ -965,11 +1250,14 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
         postToUi(() =>
         {
-            if (disposed)
+            if (disposed ||
+                selectionRevision != Interlocked.Read(ref periodSelectionRevision) ||
+                accountId is not null && !main.IsAccountSelectionCurrent(accountId, accountGeneration))
             {
                 return;
             }
 
+            resourceCursorResetRequired = nextCursorResetRequired;
             SetLoadError(true);
             SetLoading(false);
         });
@@ -1053,7 +1341,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         periods.Clear();
         if (main.DetailsSnapshot is { } details)
         {
-            foreach (var period in details.History)
+            foreach (var period in FormatPeriodsForDisplay(details.History))
             {
                 periods.Add(period);
             }
@@ -1069,6 +1357,73 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(SelectedPeriodText));
         Notify(nameof(SelectedPeriodStartAt));
         Notify(nameof(SelectedPeriodEndAt));
+    }
+
+    private void ReformatPeriodLabels()
+    {
+        var selectedId = selectedPeriod?.Id;
+        var resourceId = resourcePeriod?.Id;
+        var displayedId = displayedPeriod?.Id;
+        var formatted = FormatPeriodsForDisplay(periods);
+        for (var index = 0; index < formatted.Count; index++)
+        {
+            periods[index] = formatted[index];
+        }
+
+        selectedPeriod = periods.FirstOrDefault(period => period.Id == selectedId);
+        resourcePeriod = periods.FirstOrDefault(period => period.Id == resourceId);
+        displayedPeriod = periods.FirstOrDefault(period => period.Id == displayedId);
+    }
+
+    private static IReadOnlyList<ApiHistoryPeriod> FormatPeriodsForDisplay(
+        IEnumerable<ApiHistoryPeriod> source)
+    {
+        var formatted = source.Select(FormatPeriodForDisplay).ToArray();
+        var totals = formatted
+            .GroupBy(period => period.Label, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
+        var occurrences = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (var index = 0; index < formatted.Length; index++)
+        {
+            var label = formatted[index].Label;
+            if (totals[label] <= 1)
+            {
+                continue;
+            }
+
+            occurrences.TryGetValue(label, out var occurrence);
+            occurrence++;
+            occurrences[label] = occurrence;
+            formatted[index] = formatted[index] with
+            {
+                Label = $"{label} · {occurrence}/{totals[label]}",
+            };
+        }
+        return formatted;
+    }
+
+    private static ApiHistoryPeriod FormatPeriodForDisplay(ApiHistoryPeriod period)
+    {
+        var label = LocalizationService.Current.FormatPeriodSelectorLabel(
+            FormatPeriodStart(period.StartAt),
+            period.Current);
+        return period with { Label = label };
+    }
+
+    private static string FormatPeriodStart(long startAt) =>
+        FormatPeriodStart(startAt, LocalizationService.Current.LanguageCode);
+
+    internal static string FormatPeriodStart(long startAt, string languageCode)
+    {
+        var format = languageCode switch
+        {
+            "es" or "fr" or "de" or "pt" or "it" or "ru" => "dd/MM HH:mm",
+            _ => "MM/dd HH:mm",
+        };
+        return TimeZoneInfo.ConvertTime(
+                DateTimeOffset.FromUnixTimeSeconds(startAt),
+                LocalizationService.DisplayTimeZone)
+            .ToString(format, CultureInfo.InvariantCulture);
     }
 
     private void RebuildPoints()
@@ -1090,11 +1445,15 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
         var sourceCount = period.Samples.Count;
         var confirmedGaps = BuildConfirmedGaps(period);
+        var hiddenModelNames = BuildHiddenModelNames(period.Samples);
         if (sourceCount <= BackgroundBuildThreshold)
         {
             try
             {
-                PublishPoints(BuildProjection(period, metric, confirmedGaps), period, metric);
+                PublishPoints(
+                    BuildProjection(period, metric, confirmedGaps, hiddenModelNames),
+                    period,
+                    metric);
             }
             catch
             {
@@ -1118,7 +1477,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 {
                     Task.Delay(previewDelay, cancellationToken).GetAwaiter().GetResult();
                 }
-                return BuildProjection(period, metric, confirmedGaps);
+                return BuildProjection(period, metric, confirmedGaps, hiddenModelNames);
             }, cancellationToken)
             .ContinueWith(
                 task =>
@@ -1154,22 +1513,58 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         if (resourceClient is not null)
         {
             return resourceGaps
-                .Where(gap => gap.EndAt > period.StartAt && gap.StartAt < end)
+                .Where(gap => GapBelongsToPeriod(gap, period) &&
+                    gap.EndAt > period.StartAt && gap.StartAt < end)
                 .Select(gap => new GraphConfirmedGap(gap.StartAt, gap.EndAt))
                 .ToArray();
         }
 
         return main.DetailsSnapshot?.HistoryGaps
-                .Where(gap => gap.EndAt > period.StartAt && gap.StartAt < end)
+                .Where(gap => GapBelongsToPeriod(gap, period) &&
+                    gap.EndAt > period.StartAt && gap.StartAt < end)
                 .Select(gap => new GraphConfirmedGap(gap.StartAt, gap.EndAt))
                 .ToArray()
             ?? Array.Empty<GraphConfirmedGap>();
     }
 
+    private static bool GapBelongsToPeriod(ApiHistoryGap gap, ApiHistoryPeriod period) =>
+        gap.ResetAt >= period.ResetAt - 60 && gap.ResetAt <= period.ResetAt;
+
+    private IReadOnlySet<string> BuildHiddenModelNames(
+        IReadOnlyList<ApiHistorySample> samples)
+    {
+        var hidden = new HashSet<string>(StringComparer.Ordinal);
+        if (!showModels)
+        {
+            foreach (var model in samples.SelectMany(sample => sample.Models))
+            {
+                hidden.Add(model.Name);
+            }
+        }
+        if (!showSol)
+        {
+            hidden.Add("SOL");
+        }
+        if (!showTerra)
+        {
+            hidden.Add("TERRA");
+        }
+        if (!showLuna)
+        {
+            hidden.Add("LUNA");
+        }
+        if (!showAstra)
+        {
+            hidden.Add("ASTRA");
+        }
+        return hidden;
+    }
+
     private static GraphProjection BuildProjection(
         ApiHistoryPeriod period,
         GraphMetric metric,
-        IReadOnlyList<GraphConfirmedGap> confirmedGaps)
+        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
+        IReadOnlySet<string> hiddenModelNames)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var samples = BuildGraphSamples(period, now);
@@ -1181,7 +1576,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 metric,
                 period.StartAt,
                 EffectiveGraphEnd(period, now),
-                confirmedGaps));
+                confirmedGaps,
+                hiddenModelNames));
     }
 
     private void PublishPoints(
@@ -1199,6 +1595,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(Scene));
         Notify(nameof(HasPoints));
         Notify(nameof(HasNoPoints));
+        Notify(nameof(HasBlockingLoadError));
         Notify(nameof(MetricAxisText));
         Notify(nameof(IsDollars));
         Notify(nameof(SelectedPeriodStartAt));
@@ -1228,6 +1625,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         isLoading = value;
         Notify(nameof(IsLoading));
         Notify(nameof(HasNoPoints));
+        Notify(nameof(HasBlockingLoadError));
     }
 
     private void SetLoadError(bool value)
@@ -1239,6 +1637,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         hasLoadError = value;
         Notify(nameof(HasLoadError));
         Notify(nameof(HasNoPoints));
+        Notify(nameof(HasBlockingLoadError));
     }
 
     private void Notify([CallerMemberName] string? propertyName = null)
@@ -1252,6 +1651,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
     private readonly MainWindowViewModel main;
     private readonly Action<Action> postToUi;
     private readonly ILoopbackResourceClient? resourceClient;
+    private readonly ILoopbackAccountResourceClient? accountResourceClient;
     private readonly ObservableCollection<ThreadItemViewModel> threads = [];
     private bool disposed;
     private bool hasLoadError;
@@ -1268,6 +1668,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         this.main = main;
         this.postToUi = postToUi;
         resourceClient = main.SplitResourceClient;
+        accountResourceClient = main.AccountResourceClient;
         Threads = new ReadOnlyObservableCollection<ThreadItemViewModel>(threads);
         main.PropertyChanged += OnMainPropertyChanged;
         if (resourceClient is null)
@@ -1287,13 +1688,33 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public UiText Texts => LocalizationService.Current;
 
-    public bool HasThreads => threads.Count > 0;
+    public ReadOnlyObservableCollection<ApiAccount> Accounts => main.Accounts;
+
+    public bool HasAccounts => main.HasAccounts;
+
+    public ApiAccount? SelectedAccount
+    {
+        get => main.SelectedAccount;
+        set
+        {
+            if (value is not null)
+            {
+                main.SelectAccount(value.Id);
+            }
+        }
+    }
+
+    public string SelectedAccountText => main.SelectedAccountText;
+
+    public bool HasThreads => !main.IsSelectedAccountHistorical && threads.Count > 0;
 
     public bool HasNoThreads => !HasThreads;
 
     public bool HasLoadError => hasLoadError;
 
-    public string EmptyText => Texts.NoRunningThreads;
+    public string EmptyText => main.IsSelectedAccountHistorical
+        ? Texts.HistoricalThreadsUnavailable
+        : Texts.NoRunningThreads;
 
     public string DetailsStatusText => main.DetailsStatusText;
 
@@ -1353,6 +1774,38 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private void OnMainPropertyChanged(object? sender, PropertyChangedEventArgs eventArgs)
     {
+        if (eventArgs.PropertyName is nameof(MainWindowViewModel.Accounts) or
+            nameof(MainWindowViewModel.HasAccounts) or
+            nameof(MainWindowViewModel.SelectedAccount) or
+            nameof(MainWindowViewModel.SelectedAccountText))
+        {
+            Notify(nameof(Accounts));
+            Notify(nameof(HasAccounts));
+            Notify(nameof(SelectedAccount));
+            Notify(nameof(SelectedAccountText));
+            Notify(nameof(HasThreads));
+            Notify(nameof(HasNoThreads));
+            Notify(nameof(EmptyText));
+            if (eventArgs.PropertyName == nameof(MainWindowViewModel.SelectedAccount))
+            {
+                resourceThreads = Array.Empty<ApiThreadDetails>();
+                threads.Clear();
+                hasLoadError = false;
+                Notify(nameof(HasThreads));
+                Notify(nameof(HasNoThreads));
+                Notify(nameof(HasLoadError));
+                if (resourceClient is null)
+                {
+                    Rebuild();
+                }
+                else if (!disposed)
+                {
+                    _ = RefreshSplitResourceAsync(resourcePollingCancellation?.Token ?? main.LifetimeToken);
+                }
+            }
+            return;
+        }
+
         if (eventArgs.PropertyName is nameof(MainWindowViewModel.DetailsSnapshot) or
             nameof(MainWindowViewModel.DetailsStatusText) or nameof(MainWindowViewModel.Texts))
         {
@@ -1389,28 +1842,64 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             return;
         }
 
-        ThreadsFetchResult result;
-        try
+        var accountId = main.SelectedAccountId;
+        var accountGeneration = main.AccountSelectionGeneration;
+        if (main.IsSelectedAccountHistorical)
         {
-            result = await resourceClient.FetchThreadsAsync(cancellationToken).ConfigureAwait(false);
+            // Inactive accounts expose only a point-in-time current snapshot;
+            // thread rows are intentionally not presented as live activity.
+            return;
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        if (accountResourceClient is not null && accountId is null)
         {
             return;
         }
-        catch
+
+        ThreadsFetchResult result;
+        if (accountResourceClient is null && main.HasAccounts)
         {
-            result = ThreadsFetchResult.FromFailure(DetailsFetchFailure.Transport);
+            result = ThreadsFetchResult.FromFailure(DetailsFetchFailure.Response);
+        }
+        else
+        {
+            try
+            {
+                result = accountId is not null && accountResourceClient is not null
+                    ? await accountResourceClient.FetchThreadsAsync(accountId, cancellationToken)
+                    : await resourceClient.FetchThreadsAsync(cancellationToken)
+                        .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+            catch
+            {
+                result = ThreadsFetchResult.FromFailure(DetailsFetchFailure.Transport);
+            }
+        }
+
+        if (accountId is not null && !main.IsAccountSelectionCurrent(accountId, accountGeneration))
+        {
+            return;
         }
 
         postToUi(() =>
         {
-            if (disposed)
+            if (disposed ||
+                accountId is not null && !main.IsAccountSelectionCurrent(accountId, accountGeneration))
             {
                 return;
             }
 
             if (!result.IsSuccess || result.Snapshot is not { } snapshot)
+            {
+                hasLoadError = true;
+                Notify(nameof(HasLoadError));
+                return;
+            }
+
+            if (accountId is not null && snapshot.AccountId != accountId)
             {
                 hasLoadError = true;
                 Notify(nameof(HasLoadError));
@@ -1427,7 +1916,9 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
     private void Rebuild()
     {
         threads.Clear();
-        var source = resourceClient is not null
+        var source = main.IsSelectedAccountHistorical
+            ? Array.Empty<ApiThreadDetails>()
+            : resourceClient is not null
             ? resourceThreads
             : main.DetailsSnapshot?.Threads ?? Array.Empty<ApiThreadDetails>();
         if (source.Count > 0)

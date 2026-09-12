@@ -56,6 +56,8 @@ export struct UiStrings {
     check-auth: string,
     auth-cli: string,
     no-history: string,
+    account-selector-heading: string,
+    period-selector-heading: string,
 }
 
 // Frameless windows keep their system-independent controls in the application
@@ -211,10 +213,13 @@ export component GraphSelect inherits Rectangle {
     in property <bool> open-on-start: false;
     in property <bool> popup-above: false;
     in property <length> popup-x: 0px;
+    in property <length> popup-width: root.width;
+    in property <int> max-visible-items: 4;
+    in property <string> field-label: "";
     out property <bool> popup-open: popup.is-open;
-    // Keep the two-pixel border outside the row viewport so four 32px rows
-    // remain fully visible. The content is capped at four rows (128px).
-    out property <length> popup-height: min(130px, max(root.item-height + 2px, root.model.length * root.item-height + 2px));
+    // Keep the two-pixel border outside the row viewport. Callers choose how
+    // many complete rows fit their surface; a long list scrolls inside it.
+    out property <length> popup-height: min(root.max-visible-items * root.item-height + 2px, max(root.item-height + 2px, root.model.length * root.item-height + 2px));
     callback selected(string);
     private property <bool> startup-popup-shown: false;
     property <length> item-height: 32px;
@@ -227,7 +232,28 @@ export component GraphSelect inherits Rectangle {
     Text {
         x: 12px;
         y: 0px;
-        width: parent.width - 38px;
+        width: root.field-label == "" ? 0px : 82px;
+        height: parent.height;
+        visible: root.field-label != "";
+        text: root.field-label;
+        color: DesignTokens.accent-primary;
+        font-size: DesignTokens.text-caption;
+        font-weight: 700;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Rectangle {
+        x: 101px;
+        y: 8px;
+        width: 1px;
+        height: parent.height - 16px;
+        visible: root.field-label != "";
+        background: DesignTokens.graph-control-border;
+    }
+    Text {
+        x: root.field-label == "" ? 12px : 112px;
+        y: 0px;
+        width: parent.width - self.x - 26px;
         height: parent.height;
         text: root.enabled && root.current-index >= 0 && root.current-index < root.model.length ? root.model[root.current-index] : root.empty-label;
         color: root.enabled ? DesignTokens.text-primary : DesignTokens.text-muted;
@@ -273,9 +299,12 @@ export component GraphSelect inherits Rectangle {
         // A short history list is fully visible. Longer histories keep a
         // bounded panel and scroll inside ListView instead of hiding entries.
         y: root.popup-above ? 0px : root.height;
-        width: root.width;
+        width: root.popup-width;
         height: root.popup-height;
-        close-policy: close-on-click-outside;
+        // Keep list navigation under explicit user control. Selecting a row
+        // or clicking the selector again closes it; delayed/synthetic outside
+        // events must not destroy an in-progress scroll.
+        close-policy: no-auto-close;
         Rectangle {
             width: parent.width;
             height: parent.height;
@@ -290,8 +319,15 @@ export component GraphSelect inherits Rectangle {
                 width: parent.width - 2px;
                 height: parent.height - 2px;
                 viewport-width: self.width;
+                // A persistent rail makes the scroll affordance visible.
+                // Drag-panning also avoids forcing the user to acquire the
+                // narrow rail at the far edge of a long selector.
+                vertical-scrollbar-policy: root.model.length > root.max-visible-items ? ScrollBarPolicy.always-on : ScrollBarPolicy.always-off;
+                mouse-drag-pan-enabled: true;
                 for value[index] in root.model : Rectangle {
-                    width: popup-list.visible-width;
+                    // Reserve space beside a visible scroll bar. Missing the
+                    // rail must not activate a row and close the popup.
+                    width: popup-list.visible-width - (root.model.length > root.max-visible-items ? 22px : 0px);
                     height: root.item-height;
                     background: item-touch.has-hover ? DesignTokens.graph-control-hover : (index == root.current-index ? DesignTokens.graph-control-selected : DesignTokens.graph-control-surface);
                     Text {
@@ -320,19 +356,24 @@ export component Header inherits Rectangle {
     in property <UiStrings> strings;
     in property <string> period-label;
     in property <bool> show-graph: false;
+    in property <[string]> account-options;
+    in property <int> selected-account-index: 0;
     callback open-graph();
+    callback select-account(string);
     callback open-legal-notice();
     callback begin-window-drag();
     callback minimize-window();
     callback close-window();
-    property <length> legal-button-width: 208px;
+    property <length> legal-button-width: 120px;
     property <length> graph-button-width: 100px;
+    property <length> account-select-width: 340px;
     property <length> window-control-width: 72px;
-    private property <length> action-reserve: root.window-control-width + 8px;
+    private property <bool> show-account-selector: root.account-options.length > 1;
     // Keep the move target before all legal/graph/window controls so a
     // frameless button click is never interpreted as a window move.
     private property <length> action-start: root.width - root.window-control-width - 8px
-        - (root.show-graph ? root.graph-button-width + 8px + root.legal-button-width : root.legal-button-width);
+        - (root.show-graph ? root.graph-button-width + 8px + root.legal-button-width : root.legal-button-width)
+        - (root.show-account-selector ? root.account-select-width + 8px : 0px);
     height: 48px;
 
     WindowDragArea {
@@ -346,7 +387,7 @@ export component Header inherits Rectangle {
     Text {
         x: 0px;
         y: 0px;
-        width: parent.width - (root.show-graph ? 260px : 152px) - root.action-reserve;
+        width: max(120px, root.action-start - 8px);
         height: 24px;
         text: root.strings.usage-status + " · " + root.strings.product-version;
         color: DesignTokens.text-primary;
@@ -358,7 +399,7 @@ export component Header inherits Rectangle {
     Text {
         x: 0px;
         y: 25px;
-        width: parent.width - (root.show-graph ? 260px : 152px) - root.action-reserve;
+        width: max(120px, root.action-start - 8px);
         height: 19px;
         text: root.period-label;
         color: DesignTokens.text-secondary;
@@ -391,6 +432,21 @@ export component Header inherits Rectangle {
         TouchArea {
             clicked => { root.open-graph(); }
         }
+    }
+    GraphSelect {
+        x: parent.width - root.window-control-width - 8px
+            - (root.show-graph ? root.graph-button-width + 8px : 0px)
+            - root.legal-button-width - 8px - root.account-select-width;
+        y: 6px;
+        width: root.account-select-width;
+        height: 36px;
+        visible: root.show-account-selector;
+        model: root.account-options;
+        empty-label: "アカウントなし";
+        field-label: root.strings.account-selector-heading;
+        current-index: root.selected-account-index;
+        popup-width: 560px;
+        selected(value) => { root.select-account(value); }
     }
     Rectangle {
         x: parent.width - root.window-control-width - 8px
@@ -1541,8 +1597,8 @@ export struct GraphUnusedInterval {
     width: float,
 }
 
-// Pathの座標は0〜100のviewboxで受け取る。Rust側はgraph-dataのJSONを正本にして
-// 各系列のSVG path commandsへ変換するため、Slint側でJSONを解釈する必要がない。
+// Pathの座標は0〜100のviewboxで受け取る。Rust側が各系列の
+// SVG path commandsと、同じ受理済み表示証拠からhas-graph-dataを生成する。
 export component GraphWindow inherits Window {
     preferred-width: 940px;
     preferred-height: 640px;
@@ -1563,7 +1619,7 @@ export component GraphWindow inherits Window {
     background: DesignTokens.canvas;
     default-font-family: root.strings.font-family;
 
-    in-out property <string> graph-data;
+    in property <bool> has-graph-data: false;
     in-out property <[GraphUnusedInterval]> unused-intervals;
     in-out property <bool> show-remaining: true;
     in-out property <bool> show-luna: true;
@@ -1593,8 +1649,11 @@ export component GraphWindow inherits Window {
     in property <[string]> history-period-options;
     in property <bool> open-history-on-start: false;
     in property <int> selected-history-index: 0;
+    in property <[string]> account-options;
+    in property <int> selected-account-index: 0;
     in property <[string]> metric-options;
     in property <int> selected-metric-index: 0;
+    out property <bool> history-popup-open: history-select.popup-open;
     in-out property <string> time-start-label;
     in-out property <string> time-25-label;
     in-out property <string> time-50-label;
@@ -1627,13 +1686,13 @@ export component GraphWindow inherits Window {
     callback toggle-maximize-window();
     callback close-window();
     callback select-history(string);
+    callback select-account(string);
     callback select-metric(string);
     callback toggle-remaining();
     callback toggle-luna();
     callback toggle-terra();
     callback toggle-sol();
     callback toggle-astra();
-    private property <bool> has-graph-data: root.graph-data != "" && root.graph-data != "[]";
     private property <length> content-x: min(30px, max(20px, 20px + (root.width - 700px) / 24));
     private property <length> content-width: root.width - 2 * root.content-x;
     private property <length> plot-left: 92px;
@@ -1685,7 +1744,7 @@ export component GraphWindow inherits Window {
         WindowDragArea {
             x: 0px;
             y: 0px;
-            width: parent.width - 244px;
+            width: parent.width - 252px;
             height: 36px;
             begin-drag => { root.begin-window-drag(); }
         }
@@ -1710,6 +1769,19 @@ export component GraphWindow inherits Window {
             close => { root.close-window(); }
         }
         GraphSelect {
+            x: 0px;
+            y: 42px;
+            width: parent.width;
+            height: 36px;
+            model: root.account-options;
+            empty-label: "アカウントなし";
+            field-label: root.strings.account-selector-heading;
+            current-index: root.selected-account-index;
+            popup-width: 560px;
+            z: 2;
+            selected(value) => { root.select-account(value); }
+        }
+        GraphSelect {
             x: parent.width - 244px;
             y: 0px;
             width: 128px;
@@ -1732,17 +1804,23 @@ export component GraphWindow inherits Window {
         }
         history-select := GraphSelect {
             x: 0px;
-            y: 72px;
+            y: 84px;
             width: parent.width;
             height: 36px;
             model: root.history-period-options;
-            empty-label: root.strings.no-history;
+            empty-label: root.history-loading ? root.strings.graph-loading : root.strings.no-history;
+            field-label: root.strings.period-selector-heading;
             selectable: root.has-history-options;
             current-index: root.selected-history-index;
             open-on-start: root.open-history-on-start;
             // Open below the selector so the bounded popup overlays the
             // controls and plot instead of changing their geometry.
             popup-above: false;
+            // Period labels are short. Keeping the popup compact puts its
+            // scroll controls beside the text instead of at the far edge of
+            // a maximized graph, while ten rows avoid needless paging.
+            popup-width: min(620px, parent.width);
+            max-visible-items: 10;
             z: 2;
             selected(value) => { root.select-history(value); }
         }

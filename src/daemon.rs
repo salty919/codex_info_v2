@@ -1323,7 +1323,9 @@ fn maintain_history_database(
     identity: &StoragePartitionIdentity,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<UsageStore, String> {
-    UsageStore::backup_generations_partitioned(database, identity, 3)
+    let backup = UsageStore::backup_generations_partitioned_verified(database, identity, 3)
+        .map_err(|error| error.to_string())?;
+    UsageStore::migrate_partition_history_after_verified_backup(database, identity, &backup)
         .map_err(|error| error.to_string())?;
     let mut store =
         UsageStore::open_partitioned(database, identity).map_err(|error| error.to_string())?;
@@ -2363,8 +2365,8 @@ mod tests {
         );
         let logical = store.load_all().unwrap();
         assert_eq!(logical.len(), 2);
-        assert_eq!(logical[0].sol_tokens, 110);
-        assert_eq!(logical[0].sol_dollars, 1.1);
+        assert_eq!(logical[0].sol_tokens, 100);
+        assert_eq!(logical[0].sol_dollars, 1.0);
         assert_eq!(logical[1], fixture.anchor_sample);
         assert!(store.recorded_session_matches(&fixture.marker).unwrap());
         drop(store);
@@ -2915,7 +2917,7 @@ mod tests {
             .join("08")
             .join("22");
         fs::create_dir_all(&sessions).unwrap();
-        let now = unix_now().max(1);
+        let now = unix_now().max(1).div_euclid(60) * 60;
         let reset_at = now + 3_600;
         let session = sessions.join("must-not-be-collected.jsonl");
         let context = serde_json::json!({

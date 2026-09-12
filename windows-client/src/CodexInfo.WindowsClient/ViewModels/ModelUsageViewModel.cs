@@ -54,16 +54,16 @@ public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
         LocalizationService.LanguageChanged += OnLanguageChanged;
     }
 
-    private readonly ulong inputTokens;
-    private readonly ulong cachedInputTokens;
-    private readonly ulong outputTokens;
-    private readonly ulong totalTokens;
-    private readonly ulong? cacheWriteInputTokens;
-    private readonly double? inputDollars;
-    private readonly double? cachedInputDollars;
-    private readonly double? outputDollars;
-    private readonly double cacheWriteInputDollars;
-    private readonly double? totalDollars;
+    private ulong inputTokens;
+    private ulong cachedInputTokens;
+    private ulong outputTokens;
+    private ulong totalTokens;
+    private ulong? cacheWriteInputTokens;
+    private double? inputDollars;
+    private double? cachedInputDollars;
+    private double? outputDollars;
+    private double cacheWriteInputDollars;
+    private double? totalDollars;
     private bool disposed;
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -95,6 +95,59 @@ public sealed class ModelUsageViewModel : INotifyPropertyChanged, IDisposable
     public string OutputLabel => LocalizationService.Current.Output;
     public string CacheWriteInputLabel => "Cache write";
     public string TotalLabel => "Total";
+
+    /// <summary>
+    /// Updates one stable table row in place. Periodic snapshots normally
+    /// retain the same model set, so replacing the ItemsControl children on
+    /// every poll would cause a visible remove/recreate flash.
+    /// </summary>
+    public void Update(ApiDetailsModelUsage usage)
+    {
+        ArgumentNullException.ThrowIfNull(usage);
+        if (!string.Equals(Name, usage.Name, StringComparison.Ordinal))
+        {
+            throw new ArgumentException("A model row cannot change identity.", nameof(usage));
+        }
+
+        var nextTotalDollars = usage.HasEstimatedCost
+            ? usage.EstimatedTotalDollars
+            : usage.TotalDollars;
+        if (inputTokens == usage.InputTokens &&
+            cachedInputTokens == usage.CachedInputTokens &&
+            outputTokens == usage.OutputTokens &&
+            totalTokens == usage.TotalTokens &&
+            cacheWriteInputTokens == usage.CacheWriteInputTokens &&
+            Nullable.Equals(inputDollars, usage.InputDollars) &&
+            Nullable.Equals(cachedInputDollars, usage.CachedInputDollars) &&
+            Nullable.Equals(outputDollars, usage.OutputDollars) &&
+            cacheWriteInputDollars.Equals(usage.CacheWriteInputDollars) &&
+            Nullable.Equals(totalDollars, nextTotalDollars))
+        {
+            return;
+        }
+
+        inputTokens = usage.InputTokens;
+        cachedInputTokens = usage.CachedInputTokens;
+        outputTokens = usage.OutputTokens;
+        totalTokens = usage.TotalTokens;
+        cacheWriteInputTokens = usage.CacheWriteInputTokens;
+        inputDollars = usage.InputDollars;
+        cachedInputDollars = usage.CachedInputDollars;
+        outputDollars = usage.OutputDollars;
+        cacheWriteInputDollars = usage.CacheWriteInputDollars;
+        totalDollars = nextTotalDollars;
+
+        Notify(nameof(InputTokensText));
+        Notify(nameof(CachedInputTokensText));
+        Notify(nameof(OutputTokensText));
+        Notify(nameof(TotalTokensText));
+        Notify(nameof(CacheWriteInputTokensText));
+        Notify(nameof(InputDollarsText));
+        Notify(nameof(CachedInputDollarsText));
+        Notify(nameof(OutputDollarsText));
+        Notify(nameof(CacheWriteInputDollarsText));
+        Notify(nameof(TotalDollarsText));
+    }
 
     private void OnLanguageChanged(object? sender, EventArgs eventArgs)
     {

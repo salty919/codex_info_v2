@@ -9,11 +9,14 @@ namespace CodexInfo.WindowsClient;
 
 public partial class SettingsWindow : Window
 {
-    public SettingsWindow() : this(new SettingsViewModel(App.SettingsStore)) { }
+    private readonly MainWindow? mainWindow;
 
-    public SettingsWindow(SettingsViewModel viewModel)
+    public SettingsWindow() : this(new SettingsViewModel(App.SettingsStore), null) { }
+
+    public SettingsWindow(SettingsViewModel viewModel, MainWindow? mainWindow = null)
     {
         InitializeComponent();
+        this.mainWindow = mainWindow;
         DataContext = viewModel;
         Closed += (_, _) => viewModel.Dispose();
     }
@@ -38,10 +41,10 @@ public partial class SettingsWindow : Window
 
     private void OnOpenSetup(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
     {
-        if (Owner is MainWindow main) main.OpenSetupFromChild();
+        mainWindow?.OpenSetupFromChild();
     }
 
     private void OnRefresh(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => (DataContext as SettingsViewModel)?.Refresh();
     private void OnAuth(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => (DataContext as SettingsViewModel)?.StartAuthentication();
-    private void OnOpenLegal(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => (Owner as MainWindow)?.OpenLegalFromChild();
+    private void OnOpenLegal(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => mainWindow?.OpenLegalFromChild();
 }

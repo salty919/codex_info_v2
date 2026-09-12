@@ -21,6 +21,9 @@ fail() {
         echo "cli-contract-e2e: bounded service diagnostics follow" >&2
         tail -n 40 "$tmp_root/recorder.log" >&2
     fi
+    if [[ -n "${tmp_root:-}" && -s "$tmp_root/rest.log" ]]; then
+        tail -n 40 "$tmp_root/rest.log" >&2
+    fi
     exit 1
 }
 
@@ -263,7 +266,22 @@ done
 curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/health" >/dev/null \
     || fail 'REST health did not become ready'
 health_body="$(curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/health")"
-details_body="$(curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/details")"
+details_body=''
+for _ in $(seq 1 40); do
+    details_body="$(curl --fail --silent --max-time 1 \
+        "http://127.0.0.1:$port/v1/details" 2>/dev/null || true)"
+    if python3 - "$details_body" <<'PY' >/dev/null 2>&1
+import json
+import sys
+
+details = json.loads(sys.argv[1])
+raise SystemExit(0 if details.get("state") == "ready" and details.get("authenticated") is True else 1)
+PY
+    then
+        break
+    fi
+    sleep 0.1
+done
 python3 - "$health_body" "$details_body" "$ROOT_VERSION" <<'PY'
 import json
 import sys
@@ -331,8 +349,8 @@ PY
 [[ "$(sqlite3 "$database" 'SELECT COUNT(*) FROM usage_history WHERE sol_tokens <> 0 OR terra_tokens <> 0 OR luna_tokens <> 0 OR ABS(sol_dollars) > 0.0000001 OR ABS(terra_dollars) > 0.0000001 OR ABS(luna_dollars) > 0.0000001;')" == 0 ]] \
     || fail 'pre-boundary Session bytes were attributed'
 pre_append_ranges="$(sqlite3 "$database" 'SELECT COUNT(*) FROM session_ranges;')"
-[[ "$pre_append_ranges" =~ ^[0-9]+$ ]] && ((10#$pre_append_ranges >= 1)) \
-    || fail 'baseline Session bytes did not produce an accepted range'
+[[ "$pre_append_ranges" == 0 ]] \
+    || fail 'new account EOF baseline unexpectedly accepted a pre-boundary range'
 [[ ! -e "$data_root/history/usage_history.sqlite3" ]] \
     || fail 'legacy unpartitioned history database was created'
 
@@ -370,6 +388,16 @@ collection_state() {
     sqlite3 -batch -bail -cmd '.timeout 2000' "$database" \
         'SELECT data_generation || "|" || COALESCE(collector_epoch, "") || "|" || cycle_seq FROM collection_generation WHERE singleton = 1'
 }
+recorder_state() {
+    python3 - "$state_path" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    state = json.load(handle)
+print(f'{state["data_generation"]}|{state["collector_epoch"]}|{state["cycle_seq"]}')
+PY
+}
 range_count() {
     sqlite3 -batch -bail -cmd '.timeout 2000' "$database" \
         'SELECT COUNT(*) FROM session_ranges'
@@ -393,6 +421,22 @@ baseline_state="$(collection_state 2>/dev/null || true)"
 IFS='|' read -r baseline_generation baseline_epoch baseline_cycle <<<"$baseline_state"
 valid_collection_state "$baseline_generation" "$baseline_epoch" "$baseline_cycle" \
     || fail 'recorder did not publish a valid collection_generation acknowledgement'
+for _ in $(seq 1 20); do
+    rg -q --fixed-strings 'codex-info-recorder acknowledged generation=' \
+        "$tmp_root/recorder.log" && break
+    sleep 0.1
+done
+rg -q --fixed-strings 'codex-info-recorder acknowledged generation=' \
+    "$tmp_root/recorder.log" \
+    || fail 'recorder did not publish a final cycle acknowledgement'
+for _ in $(seq 1 20); do
+    db_ack="$(collection_state 2>/dev/null || true)"
+    file_ack="$(recorder_state 2>/dev/null || true)"
+    [[ -n "$db_ack" && "$file_ack" == "$db_ack" ]] && break
+    sleep 0.1
+done
+[[ "$file_ack" == "$db_ack" ]] \
+    || fail 'recorder-state does not match the final SQLite generation'
 baseline_ranges="$(range_count)"
 baseline_checkpoint="$(checkpoint_offset)"
 baseline_models="$(model_total)"
@@ -401,8 +445,33 @@ baseline_models="$(model_total)"
     || fail 'recorder acknowledgement readback is not numeric'
 
 details_before="$tmp_root/details-before.json"
-details_body="$(curl --fail --silent --max-time 1 "http://127.0.0.1:$port/v1/details")"
+details_body=''
+for _ in $(seq 1 40); do
+    details_body="$(curl --fail --silent --max-time 1 \
+        "http://127.0.0.1:$port/v1/details" 2>/dev/null || true)"
+    if python3 - "$details_body" <<'PY' >/dev/null 2>&1
+import json
+import sys
+
+details = json.loads(sys.argv[1])
+raise SystemExit(0 if details.get("state") == "ready" and details.get("authenticated") is True else 1)
+PY
+    then
+        break
+    fi
+    sleep 0.1
+done
 printf '%s\n' "$details_body" >"$details_before"
+details_state="$(python3 - "$details_body" <<'PY'
+import json
+import sys
+
+details = json.loads(sys.argv[1])
+print(f'{details.get("state")}|{details.get("authenticated")}')
+PY
+)"
+[[ "$details_state" == 'ready|True' ]] \
+    || fail "REST details remained non-ready ($details_state)"
 
 # REST details must be backed by recorder-produced UsageStore values. Empty
 # quota/history/models are a failure, never a successful fixture shortcut.

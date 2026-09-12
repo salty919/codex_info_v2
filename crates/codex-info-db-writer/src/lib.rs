@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use chrono::{DateTime, Months, Utc};
+use codex_info_db_reader::{
+    canonicalize_history_for_storage_with_sources, RawSample as CanonicalRawSample,
+    HISTORY_CANONICAL_SCHEMA_VERSION,
+};
 use rusqlite::types::Value;
 use rusqlite::{
     params, Connection, DatabaseName, OpenFlags, OptionalExtension, TransactionBehavior,
@@ -11,9 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -77,7 +79,8 @@ CREATE TABLE storage_partition (
     profile_scope_id TEXT NOT NULL,
     account_scope_id TEXT NOT NULL,
     storage_epoch TEXT NOT NULL,
-    partition_id TEXT NOT NULL
+    partition_id TEXT NOT NULL,
+    login_id TEXT
 );
 
 CREATE TABLE collection_generation (
@@ -237,6 +240,69 @@ CREATE TABLE session_events (
     )
 ) WITHOUT ROWID;
 
+CREATE TABLE session_task_events (
+    root_identity TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    file_device TEXT NOT NULL,
+    file_inode TEXT NOT NULL,
+    prefix_generation TEXT NOT NULL CHECK (
+        length(prefix_generation) = 32
+        AND prefix_generation NOT GLOB '*[^0-9a-f]*'
+    ),
+    start_offset INTEGER NOT NULL CHECK (start_offset >= 0),
+    end_offset INTEGER NOT NULL CHECK (end_offset > start_offset),
+    record_sha256 TEXT NOT NULL CHECK (
+        length(record_sha256) = 64
+        AND record_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    event_index INTEGER NOT NULL CHECK (event_index >= 0),
+    timestamp INTEGER NOT NULL CHECK (timestamp > 0),
+    running INTEGER NOT NULL CHECK (running IN (0, 1)),
+    PRIMARY KEY (
+        root_identity,
+        relative_path,
+        file_device,
+        file_inode,
+        prefix_generation,
+        start_offset,
+        end_offset,
+        record_sha256,
+        event_index
+    )
+) WITHOUT ROWID;
+
+CREATE TABLE session_task_indexed_ranges (
+    root_identity TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    file_device TEXT NOT NULL,
+    file_inode TEXT NOT NULL,
+    start_offset INTEGER NOT NULL CHECK (start_offset >= 0),
+    end_offset INTEGER NOT NULL CHECK (end_offset > start_offset),
+    collector_epoch TEXT NOT NULL CHECK (
+        length(collector_epoch) = 32
+        AND collector_epoch NOT GLOB '*[^0-9a-f]*'
+    ),
+    cycle_seq TEXT NOT NULL,
+    prefix_generation TEXT NOT NULL CHECK (
+        length(prefix_generation) = 32
+        AND prefix_generation NOT GLOB '*[^0-9a-f]*'
+    ),
+    record_sha256 TEXT NOT NULL CHECK (
+        length(record_sha256) = 64
+        AND record_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    PRIMARY KEY (
+        root_identity,
+        relative_path,
+        file_device,
+        file_inode,
+        prefix_generation,
+        start_offset,
+        end_offset,
+        record_sha256
+    )
+) WITHOUT ROWID;
+
 CREATE TABLE session_model_totals (
     model TEXT PRIMARY KEY,
     total_tokens TEXT NOT NULL,
@@ -343,6 +409,213 @@ CREATE TABLE active_thread_snapshot (
 );
 "#;
 
+const HISTORY_CANONICAL_CONSTRAINTS: &str = r#"
+CREATE UNIQUE INDEX usage_history_canonical_timestamp_idx
+    ON usage_history (timestamp);
+CREATE UNIQUE INDEX usage_model_history_canonical_timestamp_model_idx
+    ON usage_model_history (timestamp, model);
+
+CREATE TRIGGER usage_history_canonical_insert_guard
+BEFORE INSERT ON usage_history
+WHEN typeof(NEW.timestamp) <> 'integer'
+  OR typeof(NEW.reset_at) <> 'integer'
+  OR NEW.timestamp <= 0 OR NEW.reset_at <= 0 OR NEW.timestamp > NEW.reset_at
+  OR (NEW.remaining_percent IS NOT NULL AND (
+      typeof(NEW.remaining_percent) NOT IN ('integer', 'real')
+      OR NEW.remaining_percent < 0.0 OR NEW.remaining_percent > 100.0
+  ))
+  OR typeof(NEW.sol_dollars) NOT IN ('integer', 'real')
+  OR typeof(NEW.terra_dollars) NOT IN ('integer', 'real')
+  OR typeof(NEW.luna_dollars) NOT IN ('integer', 'real')
+  OR NEW.sol_dollars < 0.0 OR NEW.sol_dollars >= 1e999
+  OR NEW.terra_dollars < 0.0 OR NEW.terra_dollars >= 1e999
+  OR NEW.luna_dollars < 0.0 OR NEW.luna_dollars >= 1e999
+  OR typeof(NEW.sol_tokens) <> 'integer' OR NEW.sol_tokens < 0
+  OR typeof(NEW.terra_tokens) <> 'integer' OR NEW.terra_tokens < 0
+  OR typeof(NEW.luna_tokens) <> 'integer' OR NEW.luna_tokens < 0
+BEGIN
+    SELECT RAISE(ABORT, 'invalid canonical usage history row');
+END;
+
+CREATE TRIGGER usage_history_canonical_update_guard
+BEFORE UPDATE ON usage_history
+WHEN typeof(NEW.timestamp) <> 'integer'
+  OR typeof(NEW.reset_at) <> 'integer'
+  OR NEW.timestamp <= 0 OR NEW.reset_at <= 0 OR NEW.timestamp > NEW.reset_at
+  OR (NEW.remaining_percent IS NOT NULL AND (
+      typeof(NEW.remaining_percent) NOT IN ('integer', 'real')
+      OR NEW.remaining_percent < 0.0 OR NEW.remaining_percent > 100.0
+  ))
+  OR typeof(NEW.sol_dollars) NOT IN ('integer', 'real')
+  OR typeof(NEW.terra_dollars) NOT IN ('integer', 'real')
+  OR typeof(NEW.luna_dollars) NOT IN ('integer', 'real')
+  OR NEW.sol_dollars < 0.0 OR NEW.sol_dollars >= 1e999
+  OR NEW.terra_dollars < 0.0 OR NEW.terra_dollars >= 1e999
+  OR NEW.luna_dollars < 0.0 OR NEW.luna_dollars >= 1e999
+  OR typeof(NEW.sol_tokens) <> 'integer' OR NEW.sol_tokens < 0
+  OR typeof(NEW.terra_tokens) <> 'integer' OR NEW.terra_tokens < 0
+  OR typeof(NEW.luna_tokens) <> 'integer' OR NEW.luna_tokens < 0
+BEGIN
+    SELECT RAISE(ABORT, 'invalid canonical usage history row');
+END;
+
+CREATE TRIGGER usage_model_history_canonical_insert_guard
+BEFORE INSERT ON usage_model_history
+WHEN NOT EXISTS (
+    SELECT 1 FROM usage_history
+     WHERE timestamp=NEW.timestamp AND reset_at=NEW.reset_at
+)
+BEGIN
+    SELECT RAISE(ABORT, 'orphan usage model history row');
+END;
+
+CREATE TRIGGER usage_model_history_canonical_update_guard
+BEFORE UPDATE ON usage_model_history
+WHEN NOT EXISTS (
+    SELECT 1 FROM usage_history
+     WHERE timestamp=NEW.timestamp AND reset_at=NEW.reset_at
+)
+BEGIN
+    SELECT RAISE(ABORT, 'orphan usage model history row');
+END;
+
+CREATE TRIGGER durable_history_observation_insert_guard
+BEFORE INSERT ON durable_state
+WHEN NEW.singleton >= 2 AND CASE
+    WHEN NOT json_valid(NEW.snapshot_json) THEN 1
+    ELSE
+        json_extract(NEW.snapshot_json, '$.kind') IS NOT 'codex-info-usage-observation-v1'
+        OR json_type(NEW.snapshot_json, '$.timestamp') IS NOT 'integer'
+        OR json_extract(NEW.snapshot_json, '$.timestamp') IS NOT NEW.data_generation
+        OR json_type(NEW.snapshot_json, '$.reset_at') IS NOT 'integer'
+        OR json_extract(NEW.snapshot_json, '$.reset_at') <= 0
+        OR json_type(NEW.snapshot_json, '$.remaining_percent') IS NULL
+        OR json_type(NEW.snapshot_json, '$.remaining_percent') NOT IN ('null', 'integer', 'real')
+        OR json_extract(NEW.snapshot_json, '$.remaining_percent') < 0.0
+        OR json_extract(NEW.snapshot_json, '$.remaining_percent') > 100.0
+        OR json_extract(NEW.snapshot_json, '$.model_source') IS NULL
+        OR json_extract(NEW.snapshot_json, '$.model_source') NOT IN (
+            'confirmed', 'reconstructed-from-session', 'unavailable', 'legacy-unknown'
+        )
+        OR (
+            json_extract(NEW.snapshot_json, '$.model_source') <> 'unavailable'
+            AND NOT EXISTS (
+                SELECT 1 FROM usage_history AS history
+                 WHERE history.timestamp=NEW.data_generation
+                   AND history.reset_at=json_extract(NEW.snapshot_json, '$.reset_at')
+                   AND json_extract(NEW.snapshot_json, '$.remaining_percent') IS history.remaining_percent
+                   AND json_extract(NEW.snapshot_json, '$.sol_dollars') IS history.sol_dollars
+                   AND json_extract(NEW.snapshot_json, '$.terra_dollars') IS history.terra_dollars
+                   AND json_extract(NEW.snapshot_json, '$.luna_dollars') IS history.luna_dollars
+                   AND json_extract(NEW.snapshot_json, '$.sol_tokens') IS history.sol_tokens
+                   AND json_extract(NEW.snapshot_json, '$.terra_tokens') IS history.terra_tokens
+                   AND json_extract(NEW.snapshot_json, '$.luna_tokens') IS history.luna_tokens
+            )
+        )
+        OR (
+            json_extract(NEW.snapshot_json, '$.model_source') = 'unavailable'
+            AND (
+                json_type(NEW.snapshot_json, '$.sol_dollars') IS NOT 'null'
+                OR json_type(NEW.snapshot_json, '$.terra_dollars') IS NOT 'null'
+                OR json_type(NEW.snapshot_json, '$.luna_dollars') IS NOT 'null'
+                OR json_type(NEW.snapshot_json, '$.sol_tokens') IS NOT 'null'
+                OR json_type(NEW.snapshot_json, '$.terra_tokens') IS NOT 'null'
+                OR json_type(NEW.snapshot_json, '$.luna_tokens') IS NOT 'null'
+                OR EXISTS (
+                    SELECT 1 FROM usage_history AS history
+                     WHERE history.timestamp=NEW.data_generation
+                )
+            )
+        )
+END
+BEGIN
+    SELECT RAISE(ABORT, 'orphan durable history observation');
+END;
+
+CREATE TRIGGER durable_history_observation_update_guard
+BEFORE UPDATE ON durable_state
+WHEN NEW.singleton >= 2 AND CASE
+    WHEN NOT json_valid(NEW.snapshot_json) THEN 1
+    ELSE
+        json_extract(NEW.snapshot_json, '$.kind') IS NOT 'codex-info-usage-observation-v1'
+        OR json_type(NEW.snapshot_json, '$.timestamp') IS NOT 'integer'
+        OR json_extract(NEW.snapshot_json, '$.timestamp') IS NOT NEW.data_generation
+        OR json_type(NEW.snapshot_json, '$.reset_at') IS NOT 'integer'
+        OR json_extract(NEW.snapshot_json, '$.reset_at') <= 0
+        OR json_type(NEW.snapshot_json, '$.remaining_percent') IS NULL
+        OR json_type(NEW.snapshot_json, '$.remaining_percent') NOT IN ('null', 'integer', 'real')
+        OR json_extract(NEW.snapshot_json, '$.remaining_percent') < 0.0
+        OR json_extract(NEW.snapshot_json, '$.remaining_percent') > 100.0
+        OR json_extract(NEW.snapshot_json, '$.model_source') IS NULL
+        OR json_extract(NEW.snapshot_json, '$.model_source') NOT IN (
+            'confirmed', 'reconstructed-from-session', 'unavailable', 'legacy-unknown'
+        )
+        OR (
+            json_extract(NEW.snapshot_json, '$.model_source') <> 'unavailable'
+            AND NOT EXISTS (
+                SELECT 1 FROM usage_history AS history
+                 WHERE history.timestamp=NEW.data_generation
+                   AND history.reset_at=json_extract(NEW.snapshot_json, '$.reset_at')
+                   AND json_extract(NEW.snapshot_json, '$.remaining_percent') IS history.remaining_percent
+                   AND json_extract(NEW.snapshot_json, '$.sol_dollars') IS history.sol_dollars
+                   AND json_extract(NEW.snapshot_json, '$.terra_dollars') IS history.terra_dollars
+                   AND json_extract(NEW.snapshot_json, '$.luna_dollars') IS history.luna_dollars
+                   AND json_extract(NEW.snapshot_json, '$.sol_tokens') IS history.sol_tokens
+                   AND json_extract(NEW.snapshot_json, '$.terra_tokens') IS history.terra_tokens
+                   AND json_extract(NEW.snapshot_json, '$.luna_tokens') IS history.luna_tokens
+            )
+        )
+        OR (
+            json_extract(NEW.snapshot_json, '$.model_source') = 'unavailable'
+            AND (
+                json_type(NEW.snapshot_json, '$.sol_dollars') IS NOT 'null'
+                OR json_type(NEW.snapshot_json, '$.terra_dollars') IS NOT 'null'
+                OR json_type(NEW.snapshot_json, '$.luna_dollars') IS NOT 'null'
+                OR json_type(NEW.snapshot_json, '$.sol_tokens') IS NOT 'null'
+                OR json_type(NEW.snapshot_json, '$.terra_tokens') IS NOT 'null'
+                OR json_type(NEW.snapshot_json, '$.luna_tokens') IS NOT 'null'
+                OR EXISTS (
+                    SELECT 1 FROM usage_history AS history
+                     WHERE history.timestamp=NEW.data_generation
+                )
+            )
+        )
+END
+BEGIN
+    SELECT RAISE(ABORT, 'orphan durable history observation');
+END;
+
+CREATE TRIGGER usage_history_sidecar_update_guard
+BEFORE UPDATE OF timestamp, reset_at ON usage_history
+WHEN EXISTS (
+    SELECT 1 FROM usage_model_history
+     WHERE timestamp=OLD.timestamp AND reset_at=OLD.reset_at
+) OR EXISTS (
+    SELECT 1 FROM durable_state
+     WHERE singleton >= 2 AND data_generation=OLD.timestamp
+       AND json_valid(snapshot_json)
+       AND json_extract(snapshot_json, '$.reset_at')=OLD.reset_at
+)
+BEGIN
+    SELECT RAISE(ABORT, 'canonical history key still has sidecars');
+END;
+
+CREATE TRIGGER usage_history_sidecar_delete_guard
+BEFORE DELETE ON usage_history
+WHEN EXISTS (
+    SELECT 1 FROM usage_model_history
+     WHERE timestamp=OLD.timestamp AND reset_at=OLD.reset_at
+) OR EXISTS (
+    SELECT 1 FROM durable_state
+     WHERE singleton >= 2 AND data_generation=OLD.timestamp
+       AND json_valid(snapshot_json)
+       AND json_extract(snapshot_json, '$.reset_at')=OLD.reset_at
+)
+BEGIN
+    SELECT RAISE(ABORT, 'canonical history key still has sidecars');
+END;
+"#;
+
 const GAP_LEDGER_REASONS: [&str; 3] = [
     "daemon_stop_unrecoverable",
     "reset_hint_expired",
@@ -370,7 +643,8 @@ const DURABLE_STATE_OBSERVATION_MIN_SINGLETON: i64 = 2;
 const MAX_OBSERVATION_JSON_BYTES: usize = 16 * 1024;
 const OBSERVATION_JSON_KIND: &str = "codex-info-usage-observation-v1";
 pub const MAX_SESSION_MODEL_BYTES: usize = 512;
-const ACCOUNT_DB_SCHEMA_VERSION: i64 = 7;
+const ACCOUNT_DB_SCHEMA_VERSION: i64 = HISTORY_CANONICAL_SCHEMA_VERSION;
+const MAX_LOGIN_ID_SCALARS: usize = 254;
 const MAX_ACTIVE_THREADS: usize = 256;
 const MAX_ACTIVE_THREAD_ID_SCALARS: usize = 512;
 const MAX_ACTIVE_THREAD_TITLE_SCALARS: usize = 512;
@@ -520,6 +794,13 @@ fn active_thread_text_valid(value: &str, max_scalars: usize) -> bool {
         })
 }
 
+fn valid_login_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && value.chars().count() <= MAX_LOGIN_ID_SCALARS
+        && !value.chars().any(char::is_control)
+}
+
 fn validate_active_thread_record(record: &ActiveThreadRecord) -> Result<()> {
     if record.updated_at <= 0
         || record.updated_at > MAX_PUBLIC_UNIX_SECONDS
@@ -646,11 +927,12 @@ impl ModelSource {
     }
 }
 
-/// One bounded model/quota observation, including local-source provenance.
-/// Model fields are all present for `confirmed`, `reconstructed-from-session`,
-/// and `legacy-unknown`, and all absent for `unavailable`; mixed vectors are
-/// rejected at the storage edge. Model-set completeness is independent from
-/// provenance: a reconstructed vector can still enumerate every model.
+/// One bounded internal model/quota record, including local-source provenance.
+/// Model fields are all present for `confirmed`, internal audit-only
+/// `reconstructed-from-session`, and `legacy-unknown`, and all absent for
+/// `unavailable`; mixed vectors are rejected at the storage edge. Public
+/// readers must strip reconstructed model numerics and expose only their
+/// source/time/quota metadata.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageHistoryObservation {
     pub timestamp: i64,
@@ -918,6 +1200,51 @@ pub struct SessionRange {
     pub record_sha256: String,
 }
 
+/// A verified source span whose task lifecycle records have been inspected.
+/// The range identity is the same immutable identity used by `session_ranges`;
+/// a marker may cover a checkpoint prefix or an older accepted range.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SessionTaskIndexedRange {
+    pub root_identity: String,
+    pub relative_path: String,
+    pub file_device: u64,
+    pub file_inode: u64,
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub collector_epoch: u128,
+    pub cycle_seq: u64,
+    pub prefix_generation: u128,
+    pub record_sha256: String,
+}
+
+/// One canonical Session task lifecycle observation. `event_index` is the
+/// stable record index within the exact source span, not an index assigned by
+/// the current quota projection.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SessionTaskEvent {
+    pub root_identity: String,
+    pub relative_path: String,
+    pub file_device: u64,
+    pub file_inode: u64,
+    pub prefix_generation: u128,
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub record_sha256: String,
+    pub event_index: u64,
+    pub timestamp: i64,
+    pub running: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionTaskEvidence {
+    pub events: Vec<SessionTaskEvent>,
+    pub indexed_ranges: Vec<SessionTaskIndexedRange>,
+    pub all_ranges_indexed: bool,
+}
+
+type SessionTaskIndexedRangeKey = (String, String, u64, u64, u128, u64, u64, String);
+type SessionTaskEventKey = (String, String, u64, u64, u128, u64, u64, String, u64);
+
 /// Exact source evidence which was read but could not be attributed to a
 /// trusted usage vector.  Pending rows are keyed by source lineage and start
 /// offset so a later parser can re-evaluate the same bytes without moving the
@@ -1158,6 +1485,22 @@ pub struct SessionCollectionCommit<'a> {
     pub recorded_sessions: &'a [RecordedSessionSource],
 }
 
+pub struct SessionTaskEvidenceInput<'a> {
+    pub events: &'a [SessionEvent],
+    pub pending_ranges: &'a [SessionPendingRange],
+    pub task_events: &'a [SessionTaskEvent],
+    pub task_indexed_ranges: &'a [SessionTaskIndexedRange],
+}
+
+struct CollectionEvidence<'a> {
+    cumulative_recovery: Option<&'a SessionCumulativeRecovery>,
+    timeline_recovery: Option<&'a SessionTimelineRecovery>,
+    pending_ranges: Option<&'a [SessionPendingRange]>,
+    events: Option<&'a [SessionEvent]>,
+    task_events: Option<&'a [SessionTaskEvent]>,
+    task_indexed_ranges: Option<&'a [SessionTaskIndexedRange]>,
+}
+
 pub struct SessionCollectionCommitResult {
     pub data_generation: u64,
     pub canonical_samples: Vec<UsageHistorySample>,
@@ -1188,6 +1531,18 @@ pub struct MigrationReport {
     pub source_fingerprint: String,
     pub candidate_fingerprint: String,
     pub preserved_backup: std::path::PathBuf,
+}
+
+/// Opaque proof that `.bak.1` was created and read back for one exact account
+/// partition before canonical history replacement. Only this module can
+/// construct the proof; the migration rechecks its raw fingerprint while
+/// holding the SQLite write transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedPartitionBackup {
+    database: PathBuf,
+    partition_id: String,
+    raw_rows: usize,
+    raw_fingerprint: String,
 }
 
 /// Errors returned while opening or using a usage history database.
@@ -1298,6 +1653,11 @@ impl UsageHistorySample {
                 field: "reset_at",
                 value: self.reset_at,
             });
+        }
+        if self.timestamp > self.reset_at {
+            return Err(UsageStoreError::InvalidImport(
+                "timestamp must not exceed reset_at".into(),
+            ));
         }
         if [self.sol_tokens, self.terra_tokens, self.luna_tokens]
             .into_iter()
@@ -1704,6 +2064,38 @@ fn validate_session_range(range: &SessionRange) -> Result<()> {
     Ok(())
 }
 
+fn validate_session_task_indexed_range(range: &SessionTaskIndexedRange) -> Result<()> {
+    validate_session_key(&range.root_identity, &range.relative_path)?;
+    if range.start_offset >= range.end_offset
+        || range.end_offset > i64::MAX as u64
+        || range.collector_epoch == 0
+        || range.cycle_seq == 0
+        || range.prefix_generation == 0
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "session task indexed range is invalid".into(),
+        ));
+    }
+    validate_sha256(&range.record_sha256, "session task indexed range record")?;
+    Ok(())
+}
+
+fn validate_session_task_event(event: &SessionTaskEvent) -> Result<()> {
+    validate_session_key(&event.root_identity, &event.relative_path)?;
+    if event.start_offset >= event.end_offset
+        || event.end_offset > i64::MAX as u64
+        || event.event_index > i64::MAX as u64
+        || event.prefix_generation == 0
+        || event.timestamp <= 0
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "session task event is invalid".into(),
+        ));
+    }
+    validate_sha256(&event.record_sha256, "session task event record")?;
+    Ok(())
+}
+
 fn validate_session_pending_range(range: &SessionPendingRange) -> Result<()> {
     validate_session_key(&range.root_identity, &range.relative_path)?;
     if range.start_offset > i64::MAX as u64
@@ -1911,20 +2303,16 @@ pub enum QuotaTransition {
     Rejected,
 }
 
-/// Returns the durable period authority when two reset timestamps are
-/// aliases of the same provider window. The tolerance is the existing
-/// history grouping contract; callers must not introduce a second threshold.
-pub fn canonical_reset_period(previous_reset_at: i64, candidate_reset_at: i64) -> Option<i64> {
-    same_reset_group(previous_reset_at, candidate_reset_at).then_some(previous_reset_at)
-}
-
-/// Classify a quota observation using only durable time authority. Percentage
-/// changes and a replacement reset timestamp before the accepted deadline are
-/// observations, not proof of a new period.
+/// Classify a raw quota observation before choosing its durable period key.
+/// `reset_at` is a mutable provider observation, so a replacement timestamp is
+/// never a boundary by itself. A boundary needs either a quota recovery at the
+/// replacement window's observed start or a successor window whose start
+/// matches the accepted deadline.
 pub fn classify_quota_transition(
     previous_reset_at: Option<i64>,
     previous_window_seconds: i64,
     previous_observed_at: Option<i64>,
+    previous_remaining_percent: Option<f64>,
     next_reset_at: i64,
     next_window_seconds: i64,
     next_remaining_percent: Option<f64>,
@@ -1946,18 +2334,17 @@ pub fn classify_quota_transition(
     let Some(previous_observed_at) = previous_observed_at else {
         return QuotaTransition::Rejected;
     };
+    let Some(previous_remaining_percent) = previous_remaining_percent else {
+        return QuotaTransition::Rejected;
+    };
     if previous_reset_at <= 0
         || previous_window_seconds <= 0
         || previous_observed_at <= 0
         || observed_at < previous_observed_at
+        || !previous_remaining_percent.is_finite()
+        || !(0.0..=100.0).contains(&previous_remaining_percent)
     {
         return QuotaTransition::Rejected;
-    }
-    if next_reset_at == previous_reset_at
-        && next_window_seconds == previous_window_seconds
-        && previous_reset_at > observed_at
-    {
-        return QuotaTransition::SamePeriod;
     }
     let newly_started_window = reset_window_started_between_observations(
         previous_reset_at,
@@ -1966,10 +2353,23 @@ pub fn classify_quota_transition(
         next_window_seconds,
         observed_at,
     );
-    if next_reset_at > previous_reset_at
-        && (previous_reset_at <= observed_at || newly_started_window)
+    let successor_window_started_at_accepted_deadline = previous_reset_at <= observed_at
+        && next_reset_at > previous_reset_at
+        && next_start_at
+            .is_some_and(|next_start_at| same_reset_group(previous_reset_at, next_start_at));
+    let quota_recovered =
+        next_remaining_percent.is_some_and(|next| next > previous_remaining_percent);
+    if successor_window_started_at_accepted_deadline
+        || (next_reset_at > previous_reset_at && newly_started_window && quota_recovered)
     {
         return QuotaTransition::Boundary;
+    }
+    if next_window_seconds == previous_window_seconds
+        && (same_reset_group(previous_reset_at, next_reset_at)
+            || (next_reset_at > previous_reset_at
+                && next_remaining_percent.is_some_and(|next| next <= previous_remaining_percent)))
+    {
+        return QuotaTransition::SamePeriod;
     }
     QuotaTransition::Rejected
 }
@@ -1977,7 +2377,7 @@ pub fn classify_quota_transition(
 /// Selects the newest retained state only when all usable retained states
 /// agree on one still-live period and the current state is its valid but
 /// premature replacement. This is the shared upgrade authority used before
-/// Session replay; counters and percentage movement do not decide it.
+/// Session replay.
 pub fn select_predeadline_quota_authority(
     current: &SessionCollectionState,
     retained: &[SessionCollectionState],
@@ -1987,6 +2387,7 @@ pub fn select_predeadline_quota_authority(
         || classify_quota_transition(
             None,
             0,
+            None,
             None,
             current.reset_at,
             current.window_seconds,
@@ -2010,20 +2411,25 @@ pub fn select_predeadline_quota_authority(
                     None,
                     0,
                     None,
+                    None,
                     candidate.reset_at,
                     candidate.window_seconds,
                     Some(observation.remaining_percent),
                     observation.observed_at,
                 ) == QuotaTransition::Initial
-                && classify_quota_transition(
-                    Some(candidate.reset_at),
-                    candidate.window_seconds,
-                    Some(observation.observed_at),
-                    current.reset_at,
-                    current.window_seconds,
-                    Some(current_observation.remaining_percent),
-                    current_observation.observed_at,
-                ) == QuotaTransition::Rejected
+                && matches!(
+                    classify_quota_transition(
+                        Some(candidate.reset_at),
+                        candidate.window_seconds,
+                        Some(observation.observed_at),
+                        Some(observation.remaining_percent),
+                        current.reset_at,
+                        current.window_seconds,
+                        Some(current_observation.remaining_percent),
+                        current_observation.observed_at,
+                    ),
+                    QuotaTransition::SamePeriod | QuotaTransition::Rejected
+                )
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -2842,6 +3248,7 @@ fn validate_cumulative_recovery_source_generation(
         Some(recovery.canonical_reset_at),
         recovery.window_seconds,
         Some(canonical_observation.observed_at),
+        Some(canonical_observation.remaining_percent),
         source.reset_at,
         source.window_seconds,
         Some(source.remaining_percent),
@@ -3144,53 +3551,6 @@ fn timeline_recovery_point_for(
     index
         .checked_sub(1)
         .and_then(|index| recovery.points.get(index))
-}
-
-fn apply_timeline_recoveries_to_sample<'a>(
-    sample: &mut UsageHistorySample,
-    recoveries: impl Iterator<Item = &'a SessionTimelineRecovery>,
-) -> Result<()> {
-    for recovery in recoveries {
-        let Some(point) = timeline_recovery_point_for(recovery, sample.reset_at, sample.timestamp)
-        else {
-            continue;
-        };
-        sample.sol_dollars += point.offset_sol_dollars;
-        sample.terra_dollars += point.offset_terra_dollars;
-        sample.luna_dollars += point.offset_luna_dollars;
-        for (value, model) in [
-            (&mut sample.sol_tokens, "SOL"),
-            (&mut sample.terra_tokens, "TERRA"),
-            (&mut sample.luna_tokens, "LUNA"),
-        ] {
-            *value = value
-                .checked_add(
-                    point
-                        .offset_model_totals
-                        .iter()
-                        .find(|total| total.model == model)
-                        .map(|total| total.total_tokens)
-                        .unwrap_or(0),
-                )
-                .ok_or(UsageStoreError::GenerationOverflow)?;
-            if *value > i64::MAX as u64 {
-                return Err(UsageStoreError::GenerationOverflow);
-            }
-        }
-        if [
-            sample.sol_dollars,
-            sample.terra_dollars,
-            sample.luna_dollars,
-        ]
-        .into_iter()
-        .any(|value| !value.is_finite() || value < 0.0)
-        {
-            return Err(UsageStoreError::InvalidImport(
-                "timeline recovery dollar projection overflowed".into(),
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn add_timeline_offsets_to_models(
@@ -3756,60 +4116,185 @@ fn reconcile_existing_sample(
     Ok(reconciled)
 }
 
+#[derive(Debug)]
+struct CanonicalizedSamples {
+    rows: Vec<UsageHistorySample>,
+    source_to_canonical: BTreeMap<(i64, i64), (i64, i64)>,
+}
+
+fn canonicalize_samples_with_sources(
+    transaction: &rusqlite::Transaction<'_>,
+    samples: &[UsageHistorySample],
+    preserve_existing: bool,
+    preserve_existing_before: Option<i64>,
+) -> Result<CanonicalizedSamples> {
+    let canonical_storage = canonical_history_constraints_present(transaction)?;
+    let incoming = if canonical_storage {
+        let (current_reset_at, window_seconds): (i64, i64) = transaction.query_row(
+            "SELECT reset_at, window_seconds FROM collection_generation WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let raw = samples
+            .iter()
+            .map(|sample| {
+                sample.validate()?;
+                Ok(CanonicalRawSample {
+                    timestamp: sample.timestamp,
+                    reset_at: sample.reset_at,
+                    remaining_percent: sample.remaining_percent,
+                    sol_dollars: sample.sol_dollars,
+                    terra_dollars: sample.terra_dollars,
+                    luna_dollars: sample.luna_dollars,
+                    sol_tokens: sample.sol_tokens,
+                    terra_tokens: sample.terra_tokens,
+                    luna_tokens: sample.luna_tokens,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let canonical = canonicalize_history_for_storage_with_sources(
+            &raw,
+            (current_reset_at > 0).then_some(current_reset_at),
+            window_seconds.max(0),
+        )
+        .map_err(|error| {
+            UsageStoreError::InvalidImport(format!(
+                "incoming history canonicalization failed: {error}"
+            ))
+        })?;
+        canonical
+            .into_iter()
+            .map(|canonical| {
+                let sample = canonical.sample;
+                (
+                    UsageHistorySample {
+                        timestamp: sample.timestamp,
+                        reset_at: sample.reset_at,
+                        remaining_percent: sample.remaining_percent,
+                        sol_dollars: sample.sol_dollars,
+                        terra_dollars: sample.terra_dollars,
+                        luna_dollars: sample.luna_dollars,
+                        sol_tokens: sample.sol_tokens,
+                        terra_tokens: sample.terra_tokens,
+                        luna_tokens: sample.luna_tokens,
+                    },
+                    (canonical.source_reset_at, canonical.source_timestamp),
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let mut grouped = std::collections::BTreeMap::<(i64, i64), Vec<UsageHistorySample>>::new();
+        for sample in samples {
+            sample.validate()?;
+            grouped
+                .entry((sample.reset_at, sample.timestamp))
+                .or_default()
+                .push(sample.clone());
+        }
+        grouped
+            .into_iter()
+            .map(|(source_key, observations)| {
+                canonicalize_sample_group(&observations).map(|sample| (sample, source_key))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    let query = if canonical_storage {
+        "SELECT timestamp, reset_at, remaining_percent, sol_dollars,
+                terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+         FROM usage_history WHERE timestamp = ?1"
+    } else {
+        "SELECT timestamp, reset_at, remaining_percent, sol_dollars,
+                terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+         FROM usage_history WHERE reset_at = ?1 AND timestamp = ?2"
+    };
+    let mut existing_statement = transaction.prepare(query)?;
+    let mut canonical = Vec::with_capacity(incoming.len());
+    let mut source_to_canonical = BTreeMap::new();
+    for (mut incoming, source_key) in incoming {
+        let decode = |row: &rusqlite::Row<'_>| {
+            let sample = valid_sample_from_row(row)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            sample.ok_or(rusqlite::Error::InvalidQuery)
+        };
+        let existing = if canonical_storage {
+            existing_statement
+                .query_row([incoming.timestamp], decode)
+                .optional()?
+        } else {
+            existing_statement
+                .query_row(params![incoming.reset_at, incoming.timestamp], decode)
+                .optional()?
+        };
+        if let Some(existing) = existing.as_ref() {
+            // The canonical timestamp already owns its one durable period
+            // key. An incoming reset alias cannot create or rename that row.
+            incoming.reset_at = existing.reset_at;
+        }
+        let selected = match existing {
+            Some(existing)
+                if preserve_existing
+                    || preserve_existing_before
+                        .is_some_and(|cutoff| incoming.timestamp < cutoff) =>
+            {
+                existing
+            }
+            Some(existing) => reconcile_existing_sample(existing, incoming)?,
+            None => incoming,
+        };
+        source_to_canonical.insert(source_key, (selected.reset_at, selected.timestamp));
+        canonical.push(selected);
+    }
+
+    if canonical_storage {
+        let mut timestamps = BTreeSet::new();
+        for sample in &canonical {
+            sample.validate()?;
+            if sample.timestamp.rem_euclid(60) != 0 || !timestamps.insert(sample.timestamp) {
+                return Err(UsageStoreError::InvalidImport(
+                    "incoming canonical timestamp is not globally unique".into(),
+                ));
+            }
+        }
+    }
+
+    Ok(CanonicalizedSamples {
+        rows: canonical,
+        source_to_canonical,
+    })
+}
+
 fn canonicalize_samples(
     transaction: &rusqlite::Transaction<'_>,
     samples: &[UsageHistorySample],
     preserve_existing: bool,
+    preserve_existing_before: Option<i64>,
 ) -> Result<Vec<UsageHistorySample>> {
-    let mut grouped = std::collections::BTreeMap::<(i64, i64), Vec<UsageHistorySample>>::new();
-    for sample in samples {
-        sample.validate()?;
-        grouped
-            .entry((sample.reset_at, sample.timestamp))
-            .or_default()
-            .push(sample.clone());
-    }
-
-    let incoming = grouped
-        .into_values()
-        .map(|observations| canonicalize_sample_group(&observations))
-        .collect::<Result<Vec<_>>>()?;
-
-    let mut existing_statement = transaction.prepare(
-        "SELECT timestamp, reset_at, remaining_percent, sol_dollars, \
-                terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens \
-         FROM usage_history WHERE reset_at = ?1 AND timestamp = ?2",
-    )?;
-    let mut canonical = Vec::with_capacity(incoming.len());
-    for incoming in incoming {
-        let existing = existing_statement
-            .query_row(params![incoming.reset_at, incoming.timestamp], |row| {
-                let sample = valid_sample_from_row(row)
-                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-                sample.ok_or(rusqlite::Error::InvalidQuery)
-            })
-            .optional()?;
-        canonical.push(match existing {
-            Some(existing) if preserve_existing => existing,
-            Some(existing) => reconcile_existing_sample(existing, incoming)?,
-            None => incoming,
-        });
-    }
-
-    Ok(canonical)
+    canonicalize_samples_with_sources(
+        transaction,
+        samples,
+        preserve_existing,
+        preserve_existing_before,
+    )
+    .map(|canonical| canonical.rows)
 }
 
 fn upsert_canonical_samples(
     transaction: &rusqlite::Transaction<'_>,
     samples: &[UsageHistorySample],
     preserve_existing: bool,
+    preserve_existing_before: Option<i64>,
 ) -> Result<()> {
-    let mut statement = transaction.prepare(if preserve_existing {
-        INSERT_SAMPLE_IF_ABSENT
-    } else {
-        UPSERT_SAMPLE
-    })?;
+    let mut insert_if_absent = transaction.prepare(INSERT_SAMPLE_IF_ABSENT)?;
+    let mut upsert = transaction.prepare(UPSERT_SAMPLE)?;
     for sample in samples {
+        let statement = if preserve_existing
+            || preserve_existing_before.is_some_and(|cutoff| sample.timestamp < cutoff)
+        {
+            &mut insert_if_absent
+        } else {
+            &mut upsert
+        };
         statement.execute(params![
             sample.timestamp,
             sample.reset_at,
@@ -4059,11 +4544,278 @@ fn upsert_session_events(
     Ok(())
 }
 
+fn upsert_session_task_indexed_ranges(
+    transaction: &rusqlite::Transaction<'_>,
+    ranges: &BTreeMap<SessionTaskIndexedRangeKey, SessionTaskIndexedRange>,
+) -> Result<()> {
+    let mut insert = transaction.prepare(
+        "INSERT INTO session_task_indexed_ranges (
+            root_identity, relative_path, file_device, file_inode,
+            start_offset, end_offset, collector_epoch, cycle_seq,
+            prefix_generation, record_sha256
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT DO NOTHING",
+    )?;
+    for range in ranges.values() {
+        insert.execute(params![
+            &range.root_identity,
+            &range.relative_path,
+            range.file_device.to_string(),
+            range.file_inode.to_string(),
+            range.start_offset as i64,
+            range.end_offset as i64,
+            format!("{:032x}", range.collector_epoch),
+            range.cycle_seq.to_string(),
+            format!("{:032x}", range.prefix_generation),
+            &range.record_sha256,
+        ])?;
+    }
+    drop(insert);
+    for range in ranges.values() {
+        let stored: Option<SessionTaskIndexedRange> = transaction
+            .query_row(
+                "SELECT root_identity, relative_path, file_device, file_inode,
+                        start_offset, end_offset, collector_epoch, cycle_seq,
+                        prefix_generation, record_sha256
+                 FROM session_task_indexed_ranges
+                 WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3
+                   AND file_inode=?4 AND prefix_generation=?5 AND start_offset=?6
+                   AND end_offset=?7 AND record_sha256=?8",
+                params![
+                    &range.root_identity,
+                    &range.relative_path,
+                    range.file_device.to_string(),
+                    range.file_inode.to_string(),
+                    format!("{:032x}", range.prefix_generation),
+                    range.start_offset as i64,
+                    range.end_offset as i64,
+                    &range.record_sha256,
+                ],
+                |row| {
+                    let start_offset = row.get::<_, i64>(4)?;
+                    let end_offset = row.get::<_, i64>(5)?;
+                    Ok(SessionTaskIndexedRange {
+                        root_identity: row.get(0)?,
+                        relative_path: row.get(1)?,
+                        file_device: row
+                            .get::<_, String>(2)?
+                            .parse()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        file_inode: row
+                            .get::<_, String>(3)?
+                            .parse()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        start_offset: u64::try_from(start_offset)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        end_offset: u64::try_from(end_offset)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        collector_epoch: u128::from_str_radix(&row.get::<_, String>(6)?, 16)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        cycle_seq: row
+                            .get::<_, String>(7)?
+                            .parse()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        prefix_generation: u128::from_str_radix(&row.get::<_, String>(8)?, 16)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        record_sha256: row.get(9)?,
+                    })
+                },
+            )
+            .optional()?;
+        let same_identity = stored.as_ref().is_some_and(|stored| {
+            stored.root_identity == range.root_identity
+                && stored.relative_path == range.relative_path
+                && stored.file_device == range.file_device
+                && stored.file_inode == range.file_inode
+                && stored.start_offset == range.start_offset
+                && stored.end_offset == range.end_offset
+                && stored.prefix_generation == range.prefix_generation
+                && stored.record_sha256 == range.record_sha256
+        });
+        if !same_identity {
+            return Err(UsageStoreError::InvalidImport(
+                "session task indexed range replay conflicts with stored evidence".into(),
+            ));
+        }
+        validate_session_task_indexed_range(stored.as_ref().expect("indexed range was inserted"))?;
+    }
+    Ok(())
+}
+
+fn upsert_session_task_events(
+    transaction: &rusqlite::Transaction<'_>,
+    events: &BTreeMap<SessionTaskEventKey, SessionTaskEvent>,
+) -> Result<()> {
+    let mut insert = transaction.prepare(
+        "INSERT INTO session_task_events (
+            root_identity, relative_path, file_device, file_inode,
+            prefix_generation, start_offset, end_offset, record_sha256,
+            event_index, timestamp, running
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT DO NOTHING",
+    )?;
+    for event in events.values() {
+        insert.execute(params![
+            &event.root_identity,
+            &event.relative_path,
+            event.file_device.to_string(),
+            event.file_inode.to_string(),
+            format!("{:032x}", event.prefix_generation),
+            event.start_offset as i64,
+            event.end_offset as i64,
+            &event.record_sha256,
+            event.event_index as i64,
+            event.timestamp,
+            i64::from(event.running),
+        ])?;
+    }
+    drop(insert);
+    for event in events.values() {
+        let stored: Option<SessionTaskEvent> = transaction
+            .query_row(
+                "SELECT root_identity, relative_path, file_device, file_inode,
+                        prefix_generation, start_offset, end_offset, record_sha256,
+                        event_index, timestamp, running
+                 FROM session_task_events
+                 WHERE root_identity=?1 AND relative_path=?2 AND file_device=?3
+                   AND file_inode=?4 AND prefix_generation=?5 AND start_offset=?6
+                   AND end_offset=?7 AND record_sha256=?8 AND event_index=?9",
+                params![
+                    &event.root_identity,
+                    &event.relative_path,
+                    event.file_device.to_string(),
+                    event.file_inode.to_string(),
+                    format!("{:032x}", event.prefix_generation),
+                    event.start_offset as i64,
+                    event.end_offset as i64,
+                    &event.record_sha256,
+                    event.event_index as i64,
+                ],
+                |row| {
+                    Ok(SessionTaskEvent {
+                        root_identity: row.get(0)?,
+                        relative_path: row.get(1)?,
+                        file_device: row
+                            .get::<_, String>(2)?
+                            .parse()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        file_inode: row
+                            .get::<_, String>(3)?
+                            .parse()
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        prefix_generation: u128::from_str_radix(&row.get::<_, String>(4)?, 16)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        start_offset: u64::try_from(row.get::<_, i64>(5)?)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        end_offset: u64::try_from(row.get::<_, i64>(6)?)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        record_sha256: row.get(7)?,
+                        event_index: u64::try_from(row.get::<_, i64>(8)?)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        timestamp: row.get(9)?,
+                        running: match row.get::<_, i64>(10)? {
+                            0 => false,
+                            1 => true,
+                            _ => return Err(rusqlite::Error::InvalidQuery),
+                        },
+                    })
+                },
+            )
+            .optional()?;
+        if stored.as_ref() != Some(event) {
+            return Err(UsageStoreError::InvalidImport(
+                "session task event replay conflicts with stored evidence".into(),
+            ));
+        }
+        validate_session_task_event(stored.as_ref().expect("task event was inserted"))?;
+    }
+    Ok(())
+}
+
+fn canonicalize_task_evidence(
+    task_events: Option<&[SessionTaskEvent]>,
+    indexed_ranges: Option<&[SessionTaskIndexedRange]>,
+) -> Result<(
+    BTreeMap<SessionTaskIndexedRangeKey, SessionTaskIndexedRange>,
+    BTreeMap<SessionTaskEventKey, SessionTaskEvent>,
+)> {
+    let mut canonical_ranges: BTreeMap<SessionTaskIndexedRangeKey, SessionTaskIndexedRange> =
+        BTreeMap::new();
+    for range in indexed_ranges.unwrap_or(&[]) {
+        validate_session_task_indexed_range(range)?;
+        let key = (
+            range.root_identity.clone(),
+            range.relative_path.clone(),
+            range.file_device,
+            range.file_inode,
+            range.prefix_generation,
+            range.start_offset,
+            range.end_offset,
+            range.record_sha256.clone(),
+        );
+        if let Some(existing) = canonical_ranges.get(&key) {
+            if (range.collector_epoch, range.cycle_seq)
+                < (existing.collector_epoch, existing.cycle_seq)
+            {
+                canonical_ranges.insert(key, range.clone());
+            }
+            continue;
+        }
+        canonical_ranges.insert(key, range.clone());
+    }
+    let mut canonical_events: BTreeMap<SessionTaskEventKey, SessionTaskEvent> = BTreeMap::new();
+    for event in task_events.unwrap_or(&[]) {
+        validate_session_task_event(event)?;
+        let matching_range = canonical_ranges.values().any(|range| {
+            range.root_identity == event.root_identity
+                && range.relative_path == event.relative_path
+                && range.file_device == event.file_device
+                && range.file_inode == event.file_inode
+                && range.prefix_generation == event.prefix_generation
+                && range.start_offset == event.start_offset
+                && range.end_offset == event.end_offset
+                && range.record_sha256 == event.record_sha256
+        });
+        if !matching_range {
+            return Err(UsageStoreError::InvalidImport(
+                "session task event has no indexed source range".into(),
+            ));
+        }
+        let key = (
+            event.root_identity.clone(),
+            event.relative_path.clone(),
+            event.file_device,
+            event.file_inode,
+            event.prefix_generation,
+            event.start_offset,
+            event.end_offset,
+            event.record_sha256.clone(),
+            event.event_index,
+        );
+        if let Some(existing) = canonical_events.get(&key) {
+            if existing.timestamp != event.timestamp || existing.running != event.running {
+                return Err(UsageStoreError::InvalidImport(
+                    "duplicate session task event conflicts with its evidence".into(),
+                ));
+            }
+            continue;
+        }
+        canonical_events.insert(key, event.clone());
+    }
+    Ok((canonical_ranges, canonical_events))
+}
+
 fn canonicalize_observations(
     transaction: &rusqlite::Transaction<'_>,
     observations: &[UsageHistoryObservation],
     canonical_samples: &[UsageHistorySample],
+    source_to_canonical: &BTreeMap<(i64, i64), (i64, i64)>,
 ) -> Result<Vec<UsageHistoryObservation>> {
+    let canonical_storage = canonical_history_constraints_present(transaction)?;
+    let samples_by_timestamp = canonical_samples
+        .iter()
+        .map(|sample| (sample.timestamp, sample))
+        .collect::<BTreeMap<_, _>>();
     let canonical_samples = canonical_samples
         .iter()
         .map(|sample| ((sample.reset_at, sample.timestamp), sample))
@@ -4071,8 +4823,23 @@ fn canonicalize_observations(
     let mut canonical = BTreeMap::new();
     for observation in observations {
         observation.validate()?;
+        let mut observation = observation.clone();
+        if canonical_storage && observation.model_source != ModelSource::Unavailable {
+            let source_key = (observation.reset_at, observation.timestamp);
+            let Some((canonical_reset_at, canonical_timestamp)) =
+                source_to_canonical.get(&source_key)
+            else {
+                // The single history authority rejected this raw minute (for
+                // example, conflicting quota or a non-comparable whole
+                // vector). Its dependent model observation must be excluded
+                // with it rather than attached to another retained row.
+                continue;
+            };
+            observation.reset_at = *canonical_reset_at;
+            observation.timestamp = *canonical_timestamp;
+        }
         let key = (observation.reset_at, observation.timestamp);
-        if canonical.insert(key, observation.clone()).is_some() {
+        if canonical.insert(key, observation).is_some() {
             return Err(UsageStoreError::InvalidImport(
                 "duplicate usage observation key".into(),
             ));
@@ -4131,7 +4898,9 @@ fn canonicalize_observations(
                 observation.luna_tokens = Some(sample.luna_tokens);
             }
             ModelSource::Unavailable => {
-                if canonical_samples.contains_key(key) {
+                if canonical_samples.contains_key(key)
+                    || (canonical_storage && samples_by_timestamp.contains_key(&key.1))
+                {
                     return Err(UsageStoreError::InvalidImport(
                         "unavailable observation conflicts with usage_history vector".into(),
                     ));
@@ -4222,9 +4991,9 @@ fn upsert_observation_model_totals(
     transaction: &rusqlite::Transaction<'_>,
     observations: &[UsageHistoryObservation],
     preserve_existing: bool,
+    preserve_existing_before: Option<i64>,
 ) -> Result<()> {
-    let mut delete = transaction
-        .prepare("DELETE FROM usage_model_history WHERE reset_at = ?1 AND timestamp = ?2")?;
+    let mut delete = transaction.prepare("DELETE FROM usage_model_history WHERE timestamp = ?1")?;
     let mut insert = transaction.prepare(
         "INSERT INTO usage_model_history (
             reset_at, timestamp, model, total_tokens, input_tokens,
@@ -4237,20 +5006,22 @@ fn upsert_observation_model_totals(
             continue;
         };
         let model_totals = canonicalize_model_totals(model_totals)?;
-        if preserve_existing {
+        if preserve_existing
+            || preserve_existing_before.is_some_and(|cutoff| observation.timestamp < cutoff)
+        {
             let exists: bool = transaction.query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM usage_model_history
-                    WHERE reset_at = ?1 AND timestamp = ?2
+                    WHERE timestamp = ?1
                 )",
-                params![observation.reset_at, observation.timestamp],
+                [observation.timestamp],
                 |row| row.get(0),
             )?;
             if exists {
                 continue;
             }
         }
-        delete.execute(params![observation.reset_at, observation.timestamp])?;
+        delete.execute([observation.timestamp])?;
         for total in model_totals {
             insert.execute(params![
                 observation.reset_at,
@@ -4281,7 +5052,10 @@ fn numeric_sqlite_value(value: Value) -> Option<f64> {
     }
 }
 
-fn valid_sample_from_row(row: &rusqlite::Row<'_>) -> Result<Option<UsageHistorySample>> {
+fn sample_from_row_with_quota_policy(
+    row: &rusqlite::Row<'_>,
+    legacy_minus_one_quota_is_missing: bool,
+) -> Result<Option<UsageHistorySample>> {
     let timestamp = match row.get::<_, Value>(0)? {
         Value::Integer(value) => value,
         _ => return Ok(None),
@@ -4296,7 +5070,11 @@ fn valid_sample_from_row(row: &rusqlite::Row<'_>) -> Result<Option<UsageHistoryS
             let Some(value) = numeric_sqlite_value(value) else {
                 return Ok(None);
             };
-            Some(value)
+            if legacy_minus_one_quota_is_missing && value == -1.0 {
+                None
+            } else {
+                Some(value)
+            }
         }
     };
     let sol_dollars = match numeric_sqlite_value(row.get(3)?) {
@@ -4350,6 +5128,19 @@ fn valid_sample_from_row(row: &rusqlite::Row<'_>) -> Result<Option<UsageHistoryS
     Ok(Some(sample))
 }
 
+fn valid_sample_from_row(row: &rusqlite::Row<'_>) -> Result<Option<UsageHistorySample>> {
+    sample_from_row_with_quota_policy(row, false)
+}
+
+fn canonicalizable_legacy_sample_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<Option<UsageHistorySample>> {
+    // Only the exact sentinel emitted by the legacy writer is migration
+    // input. Every other out-of-domain value remains corruption and aborts
+    // the partition transaction.
+    sample_from_row_with_quota_policy(row, true)
+}
+
 fn samples_fingerprint(samples: &[UsageHistorySample]) -> String {
     // A deterministic, dependency-free fingerprint is sufficient for the
     // migration gate: it detects any row/value/order change between the
@@ -4379,6 +5170,596 @@ fn samples_fingerprint(samples: &[UsageHistorySample]) -> String {
         feed(&sample.luna_tokens.to_le_bytes());
     }
     format!("{hash:016x}")
+}
+
+fn load_valid_samples_from_table(
+    connection: &Connection,
+    table: &str,
+    cutoff: Option<i64>,
+) -> Result<Vec<UsageHistorySample>> {
+    if table != "usage_history" {
+        return Err(UsageStoreError::InvalidImport(
+            "history table selector is invalid".into(),
+        ));
+    }
+    let query = if cutoff.is_some() {
+        format!(
+            "SELECT timestamp, reset_at, remaining_percent, sol_dollars, \
+                    terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens \
+             FROM {table} WHERE timestamp > ?1 ORDER BY reset_at, timestamp"
+        )
+    } else {
+        format!(
+            "SELECT timestamp, reset_at, remaining_percent, sol_dollars, \
+                    terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens \
+             FROM {table} ORDER BY reset_at, timestamp"
+        )
+    };
+    let mut statement = connection.prepare(&query)?;
+    let mut rows = match cutoff {
+        Some(cutoff) => statement.query([cutoff])?,
+        None => statement.query([])?,
+    };
+    let mut samples = Vec::new();
+    while let Some(row) = rows.next()? {
+        let sample = valid_sample_from_row(row)?;
+        let Some(sample) = sample else {
+            return Err(UsageStoreError::InvalidImport(format!(
+                "{table} contains an invalid row"
+            )));
+        };
+        samples.push(sample);
+    }
+    Ok(samples)
+}
+
+fn legacy_raw_evidence(connection: &Connection) -> Result<(usize, String)> {
+    let mut statement = connection.prepare(
+        "SELECT timestamp, reset_at, remaining_percent, sol_dollars,
+                terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+         FROM usage_history ORDER BY reset_at, timestamp",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut digest = Sha256::new();
+    digest.update(b"codex-info-legacy-usage-history-sqlite-values-v1\0");
+    let mut row_count = 0_usize;
+    while let Some(row) = rows.next()? {
+        if canonicalizable_legacy_sample_from_row(row)?.is_none() {
+            return Err(UsageStoreError::InvalidImport(
+                "usage_history contains an invalid raw row".into(),
+            ));
+        }
+        row_count = row_count
+            .checked_add(1)
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+        for column in 0..9 {
+            match row.get::<_, Value>(column)? {
+                Value::Null => digest.update([0]),
+                Value::Integer(value) => {
+                    digest.update([1]);
+                    digest.update(value.to_be_bytes());
+                }
+                Value::Real(value) => {
+                    digest.update([2]);
+                    digest.update(value.to_bits().to_be_bytes());
+                }
+                Value::Text(value) => {
+                    digest.update([3]);
+                    digest.update((value.len() as u64).to_be_bytes());
+                    digest.update(value.as_bytes());
+                }
+                Value::Blob(value) => {
+                    digest.update([4]);
+                    digest.update((value.len() as u64).to_be_bytes());
+                    digest.update(&value);
+                }
+            }
+        }
+    }
+    Ok((row_count, format!("{:x}", digest.finalize())))
+}
+
+const HISTORY_CANONICAL_INDEX_NAMES: [&str; 2] = [
+    "usage_history_canonical_timestamp_idx",
+    "usage_model_history_canonical_timestamp_model_idx",
+];
+const HISTORY_CANONICAL_TRIGGER_NAMES: [&str; 8] = [
+    "usage_history_canonical_insert_guard",
+    "usage_history_canonical_update_guard",
+    "usage_model_history_canonical_insert_guard",
+    "usage_model_history_canonical_update_guard",
+    "durable_history_observation_insert_guard",
+    "durable_history_observation_update_guard",
+    "usage_history_sidecar_update_guard",
+    "usage_history_sidecar_delete_guard",
+];
+
+#[derive(Clone, Debug)]
+struct HistoryModelGroup {
+    timestamp: i64,
+    reset_at: i64,
+    totals: Vec<SessionModelTotal>,
+    complete: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CanonicalHistoryMigrationRow {
+    sample: UsageHistorySample,
+    source_timestamp: i64,
+    source_reset_at: i64,
+}
+
+fn named_schema_object_count(connection: &Connection, kind: &str, names: &[&str]) -> Result<usize> {
+    let mut count = 0_usize;
+    for name in names {
+        let present: bool = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_schema WHERE type=?1 AND name=?2
+             )",
+            params![kind, name],
+            |row| row.get(0),
+        )?;
+        count += usize::from(present);
+    }
+    Ok(count)
+}
+
+fn canonical_history_constraints_present(connection: &Connection) -> Result<bool> {
+    Ok(
+        named_schema_object_count(connection, "index", &HISTORY_CANONICAL_INDEX_NAMES)?
+            == HISTORY_CANONICAL_INDEX_NAMES.len()
+            && named_schema_object_count(connection, "trigger", &HISTORY_CANONICAL_TRIGGER_NAMES)?
+                == HISTORY_CANONICAL_TRIGGER_NAMES.len(),
+    )
+}
+
+fn load_history_model_groups(connection: &Connection) -> Result<Vec<HistoryModelGroup>> {
+    let mut statement = connection.prepare(
+        "SELECT reset_at, timestamp, model, total_tokens, input_tokens,
+                cached_input_tokens, output_tokens, cache_write_input_tokens,
+                model_set_complete
+         FROM usage_model_history
+         ORDER BY timestamp, reset_at, model",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut groups = BTreeMap::<(i64, i64), (Vec<SessionModelTotal>, bool)>::new();
+    while let Some(row) = rows.next()? {
+        let reset_at: i64 = row.get(0)?;
+        let timestamp: i64 = row.get(1)?;
+        let complete = match row.get::<_, i64>(8)? {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(UsageStoreError::InvalidImport(
+                    "history model completeness is invalid".into(),
+                ));
+            }
+        };
+        if reset_at <= 0 || timestamp <= 0 || timestamp > reset_at {
+            return Err(UsageStoreError::InvalidImport(
+                "history model key is invalid".into(),
+            ));
+        }
+        let cache_write: Option<String> = row.get(7)?;
+        let total = SessionModelTotal {
+            model: row.get(2)?,
+            total_tokens: canonical_u64_text(&row.get::<_, String>(3)?, "history total")?,
+            input_tokens: canonical_u64_text(&row.get::<_, String>(4)?, "history input")?,
+            cached_input_tokens: canonical_u64_text(
+                &row.get::<_, String>(5)?,
+                "history cached input",
+            )?,
+            output_tokens: canonical_u64_text(&row.get::<_, String>(6)?, "history output")?,
+            cache_write_input_tokens: cache_write
+                .as_deref()
+                .map(|value| canonical_u64_text(value, "history cache write"))
+                .transpose()?,
+        };
+        let entry = groups
+            .entry((timestamp, reset_at))
+            .or_insert_with(|| (Vec::new(), complete));
+        if entry.1 != complete {
+            return Err(UsageStoreError::InvalidImport(
+                "history model completeness differs inside one observation".into(),
+            ));
+        }
+        entry.0.push(total);
+    }
+    groups
+        .into_iter()
+        .map(|((timestamp, reset_at), (totals, complete))| {
+            Ok(HistoryModelGroup {
+                timestamp,
+                reset_at,
+                totals: canonicalize_model_totals(&totals)?,
+                complete,
+            })
+        })
+        .collect()
+}
+
+fn observation_matches_sample(
+    observation: &UsageHistoryObservation,
+    sample: &UsageHistorySample,
+) -> bool {
+    observation.remaining_percent == sample.remaining_percent
+        && observation.sol_dollars == Some(sample.sol_dollars)
+        && observation.terra_dollars == Some(sample.terra_dollars)
+        && observation.luna_dollars == Some(sample.luna_dollars)
+        && observation.sol_tokens == Some(sample.sol_tokens)
+        && observation.terra_tokens == Some(sample.terra_tokens)
+        && observation.luna_tokens == Some(sample.luna_tokens)
+}
+
+fn validate_canonical_history_storage(connection: &Connection) -> Result<()> {
+    if !canonical_history_constraints_present(connection)? {
+        return Err(UsageStoreError::InvalidImport(
+            "canonical history constraint set is incomplete".into(),
+        ));
+    }
+    let invalid: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM usage_history
+         WHERE typeof(timestamp) <> 'integer' OR timestamp <= 0 OR timestamp % 60 <> 0
+            OR typeof(reset_at) <> 'integer' OR reset_at <= 0 OR timestamp > reset_at
+            OR (remaining_percent IS NOT NULL AND (
+                typeof(remaining_percent) NOT IN ('integer', 'real')
+                OR remaining_percent < 0.0 OR remaining_percent > 100.0
+            ))
+            OR typeof(sol_dollars) NOT IN ('integer', 'real')
+            OR typeof(terra_dollars) NOT IN ('integer', 'real')
+            OR typeof(luna_dollars) NOT IN ('integer', 'real')
+            OR sol_dollars < 0.0 OR sol_dollars >= 1e999
+            OR terra_dollars < 0.0 OR terra_dollars >= 1e999
+            OR luna_dollars < 0.0 OR luna_dollars >= 1e999
+            OR typeof(sol_tokens) <> 'integer' OR sol_tokens < 0
+            OR typeof(terra_tokens) <> 'integer' OR terra_tokens < 0
+            OR typeof(luna_tokens) <> 'integer' OR luna_tokens < 0",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid != 0 {
+        return Err(UsageStoreError::InvalidImport(
+            "canonical usage history contains invalid rows".into(),
+        ));
+    }
+    let samples = load_valid_samples_from_table(connection, "usage_history", None)?;
+    let samples_by_key = samples
+        .iter()
+        .map(|sample| ((sample.timestamp, sample.reset_at), sample))
+        .collect::<BTreeMap<_, _>>();
+    for group in load_history_model_groups(connection)? {
+        if !samples_by_key.contains_key(&(group.timestamp, group.reset_at)) {
+            return Err(UsageStoreError::InvalidImport(
+                "history model row has no canonical usage parent".into(),
+            ));
+        }
+    }
+    let mut statement = connection.prepare(
+        "SELECT data_generation, data_hash, snapshot_json
+         FROM durable_state WHERE singleton >= ?1 ORDER BY singleton",
+    )?;
+    let mut rows = statement.query([DURABLE_STATE_OBSERVATION_MIN_SINGLETON])?;
+    while let Some(row) = rows.next()? {
+        let observation = observation_from_sql(row.get(0)?, row.get(1)?, row.get(2)?)?;
+        if observation.model_source == ModelSource::Unavailable {
+            if samples
+                .iter()
+                .any(|sample| sample.timestamp == observation.timestamp)
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "unavailable durable observation conflicts with canonical usage".into(),
+                ));
+            }
+            continue;
+        }
+        let Some(sample) = samples_by_key.get(&(observation.timestamp, observation.reset_at))
+        else {
+            return Err(UsageStoreError::InvalidImport(
+                "durable history observation has no canonical usage parent".into(),
+            ));
+        };
+        if !observation_matches_sample(&observation, sample) {
+            let mismatched_fields = [
+                (
+                    "remaining_percent",
+                    observation.remaining_percent == sample.remaining_percent,
+                ),
+                (
+                    "sol_dollars",
+                    observation.sol_dollars == Some(sample.sol_dollars),
+                ),
+                (
+                    "terra_dollars",
+                    observation.terra_dollars == Some(sample.terra_dollars),
+                ),
+                (
+                    "luna_dollars",
+                    observation.luna_dollars == Some(sample.luna_dollars),
+                ),
+                (
+                    "sol_tokens",
+                    observation.sol_tokens == Some(sample.sol_tokens),
+                ),
+                (
+                    "terra_tokens",
+                    observation.terra_tokens == Some(sample.terra_tokens),
+                ),
+                (
+                    "luna_tokens",
+                    observation.luna_tokens == Some(sample.luna_tokens),
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(field, matches)| (!matches).then_some(field))
+            .collect::<Vec<_>>()
+            .join(",");
+            return Err(UsageStoreError::InvalidImport(
+                format!(
+                    "durable history observation differs from canonical usage at timestamp={} reset_at={} fields={mismatched_fields}",
+                    observation.timestamp, observation.reset_at
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_canonical_history_constraints(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    let index_count =
+        named_schema_object_count(transaction, "index", &HISTORY_CANONICAL_INDEX_NAMES)?;
+    let trigger_count =
+        named_schema_object_count(transaction, "trigger", &HISTORY_CANONICAL_TRIGGER_NAMES)?;
+    if index_count == 0 && trigger_count == 0 {
+        transaction.execute_batch(HISTORY_CANONICAL_CONSTRAINTS)?;
+    } else if index_count != HISTORY_CANONICAL_INDEX_NAMES.len()
+        || trigger_count != HISTORY_CANONICAL_TRIGGER_NAMES.len()
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "partial canonical history constraints are not recoverable automatically".into(),
+        ));
+    }
+    validate_canonical_history_storage(transaction)
+}
+
+fn load_legacy_samples_for_migration(connection: &Connection) -> Result<Vec<UsageHistorySample>> {
+    let mut statement = connection.prepare(
+        "SELECT timestamp, reset_at, remaining_percent, sol_dollars,
+                terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+         FROM usage_history ORDER BY timestamp, reset_at",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut samples = Vec::new();
+    while let Some(row) = rows.next()? {
+        let Some(sample) = canonicalizable_legacy_sample_from_row(row)? else {
+            return Err(UsageStoreError::InvalidImport(
+                "usage_history contains a non-migratable row".into(),
+            ));
+        };
+        samples.push(sample);
+    }
+    Ok(samples)
+}
+
+fn canonicalize_legacy_usage_history(
+    connection: &Connection,
+    legacy: &[UsageHistorySample],
+) -> Result<Vec<CanonicalHistoryMigrationRow>> {
+    let (current_reset_at, window_seconds): (i64, i64) = connection.query_row(
+        "SELECT reset_at, window_seconds FROM collection_generation WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let raw = legacy
+        .iter()
+        .map(|sample| CanonicalRawSample {
+            timestamp: sample.timestamp,
+            reset_at: sample.reset_at,
+            remaining_percent: sample.remaining_percent,
+            sol_dollars: sample.sol_dollars,
+            terra_dollars: sample.terra_dollars,
+            luna_dollars: sample.luna_dollars,
+            sol_tokens: sample.sol_tokens,
+            terra_tokens: sample.terra_tokens,
+            luna_tokens: sample.luna_tokens,
+        })
+        .collect::<Vec<_>>();
+    let canonical = canonicalize_history_for_storage_with_sources(
+        &raw,
+        (current_reset_at > 0).then_some(current_reset_at),
+        window_seconds.max(0),
+    )
+    .map_err(|error| {
+        UsageStoreError::InvalidImport(format!("history canonicalization failed: {error}"))
+    })?;
+    if !legacy.is_empty() && canonical.is_empty() {
+        return Err(UsageStoreError::InvalidImport(
+            "non-empty history has no unambiguous canonical rows".into(),
+        ));
+    }
+    let mut timestamps = BTreeSet::new();
+    canonical
+        .into_iter()
+        .map(|canonical| {
+            let sample = canonical.sample;
+            let sample = UsageHistorySample {
+                timestamp: sample.timestamp,
+                reset_at: sample.reset_at,
+                remaining_percent: sample.remaining_percent,
+                sol_dollars: sample.sol_dollars,
+                terra_dollars: sample.terra_dollars,
+                luna_dollars: sample.luna_dollars,
+                sol_tokens: sample.sol_tokens,
+                terra_tokens: sample.terra_tokens,
+                luna_tokens: sample.luna_tokens,
+            };
+            sample.validate()?;
+            if sample.timestamp.rem_euclid(60) != 0 || !timestamps.insert(sample.timestamp) {
+                return Err(UsageStoreError::InvalidImport(
+                    "canonical history timestamp is not globally unique".into(),
+                ));
+            }
+            Ok(CanonicalHistoryMigrationRow {
+                sample,
+                source_timestamp: canonical.source_timestamp,
+                source_reset_at: canonical.source_reset_at,
+            })
+        })
+        .collect()
+}
+
+fn canonicalize_history_model_groups(
+    legacy_groups: Vec<HistoryModelGroup>,
+    canonical_rows: &[CanonicalHistoryMigrationRow],
+) -> Result<Vec<HistoryModelGroup>> {
+    let canonical_by_source = canonical_rows
+        .iter()
+        .map(|row| ((row.source_timestamp, row.source_reset_at), &row.sample))
+        .collect::<BTreeMap<_, _>>();
+    let mut canonical = Vec::new();
+    for group in legacy_groups {
+        let Some(sample) = canonical_by_source.get(&(group.timestamp, group.reset_at)) else {
+            continue;
+        };
+        canonical.push(HistoryModelGroup {
+            timestamp: sample.timestamp,
+            reset_at: sample.reset_at,
+            totals: group.totals,
+            complete: group.complete,
+        });
+    }
+    Ok(canonical)
+}
+
+fn model_source_rank(source: ModelSource) -> u8 {
+    match source {
+        ModelSource::Unavailable => 0,
+        ModelSource::LegacyUnknown => 1,
+        ModelSource::ReconstructedFromSession => 2,
+        ModelSource::Confirmed => 3,
+    }
+}
+
+fn canonicalize_durable_history_observations(
+    connection: &Connection,
+    canonical_rows: &[CanonicalHistoryMigrationRow],
+) -> Result<Vec<(i64, UsageHistoryObservation)>> {
+    let canonical_by_source = canonical_rows
+        .iter()
+        .map(|row| ((row.source_timestamp, row.source_reset_at), &row.sample))
+        .collect::<BTreeMap<_, _>>();
+    let mut statement = connection.prepare(
+        "SELECT singleton, data_generation, data_hash, snapshot_json
+         FROM durable_state WHERE singleton >= ?1 ORDER BY singleton",
+    )?;
+    let mut rows = statement.query([DURABLE_STATE_OBSERVATION_MIN_SINGLETON])?;
+    let mut selected = BTreeMap::<i64, (i64, UsageHistoryObservation)>::new();
+    while let Some(row) = rows.next()? {
+        let singleton: i64 = row.get(0)?;
+        let mut observation = observation_from_sql(row.get(1)?, row.get(2)?, row.get(3)?)?;
+        let Some(sample) = canonical_by_source.get(&(observation.timestamp, observation.reset_at))
+        else {
+            continue;
+        };
+        if observation.model_source == ModelSource::Unavailable
+            || !observation_matches_sample(&observation, sample)
+        {
+            continue;
+        }
+        observation.timestamp = sample.timestamp;
+        observation.reset_at = sample.reset_at;
+        observation.validate()?;
+        let replace = selected
+            .get(&sample.timestamp)
+            .is_none_or(|(stored_singleton, stored)| {
+                model_source_rank(observation.model_source) > model_source_rank(stored.model_source)
+                    || (model_source_rank(observation.model_source)
+                        == model_source_rank(stored.model_source)
+                        && singleton < *stored_singleton)
+            });
+        if replace {
+            selected.insert(sample.timestamp, (singleton, observation));
+        }
+    }
+    Ok(selected.into_values().collect())
+}
+
+fn rewrite_canonical_history(
+    transaction: &rusqlite::Transaction<'_>,
+    canonical_samples: &[UsageHistorySample],
+    canonical_models: &[HistoryModelGroup],
+    canonical_observations: &[(i64, UsageHistoryObservation)],
+) -> Result<()> {
+    transaction.execute("DELETE FROM usage_model_history", [])?;
+    transaction.execute(
+        "DELETE FROM durable_state WHERE singleton >= ?1",
+        [DURABLE_STATE_OBSERVATION_MIN_SINGLETON],
+    )?;
+    transaction.execute("DELETE FROM usage_history", [])?;
+    {
+        let mut insert = transaction.prepare(
+            "INSERT INTO usage_history (
+                 timestamp, reset_at, remaining_percent, sol_dollars,
+                 terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        for sample in canonical_samples {
+            insert.execute(params![
+                sample.timestamp,
+                sample.reset_at,
+                sample.remaining_percent,
+                sample.sol_dollars,
+                sample.terra_dollars,
+                sample.luna_dollars,
+                i64::try_from(sample.sol_tokens)
+                    .map_err(|_| UsageStoreError::GenerationOverflow)?,
+                i64::try_from(sample.terra_tokens)
+                    .map_err(|_| UsageStoreError::GenerationOverflow)?,
+                i64::try_from(sample.luna_tokens)
+                    .map_err(|_| UsageStoreError::GenerationOverflow)?,
+            ])?;
+        }
+    }
+    {
+        let mut insert = transaction.prepare(
+            "INSERT INTO usage_model_history (
+                 reset_at, timestamp, model, total_tokens, input_tokens,
+                 cached_input_tokens, output_tokens, cache_write_input_tokens,
+                 model_set_complete
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        for group in canonical_models {
+            for total in &group.totals {
+                insert.execute(params![
+                    group.reset_at,
+                    group.timestamp,
+                    &total.model,
+                    total.total_tokens.to_string(),
+                    total.input_tokens.to_string(),
+                    total.cached_input_tokens.to_string(),
+                    total.output_tokens.to_string(),
+                    total
+                        .cache_write_input_tokens
+                        .map(|value| value.to_string()),
+                    i64::from(group.complete),
+                ])?;
+            }
+        }
+    }
+    {
+        let mut insert = transaction.prepare(
+            "INSERT INTO durable_state (singleton, data_generation, data_hash, snapshot_json)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (singleton, observation) in canonical_observations {
+            insert.execute(params![
+                singleton,
+                observation.timestamp,
+                observation_data_hash(observation.reset_at, observation.timestamp),
+                observation_json(observation)?,
+            ])?;
+        }
+    }
+    Ok(())
 }
 
 fn load_history_continuity(connection: &Connection) -> Result<Option<HistoryContinuity>> {
@@ -4909,6 +6290,7 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
                 ("account_scope_id", "TEXT", 0),
                 ("storage_epoch", "TEXT", 0),
                 ("partition_id", "TEXT", 0),
+                ("login_id", "TEXT", 0),
             ],
         ),
         (
@@ -4998,6 +6380,37 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
                 ("cached_input_tokens", "TEXT", 0),
                 ("output_tokens", "TEXT", 0),
                 ("cache_write_input_tokens", "TEXT", 0),
+            ],
+        ),
+        (
+            "session_task_events",
+            &[
+                ("root_identity", "TEXT", 1),
+                ("relative_path", "TEXT", 2),
+                ("file_device", "TEXT", 3),
+                ("file_inode", "TEXT", 4),
+                ("prefix_generation", "TEXT", 5),
+                ("start_offset", "INTEGER", 6),
+                ("end_offset", "INTEGER", 7),
+                ("record_sha256", "TEXT", 8),
+                ("event_index", "INTEGER", 9),
+                ("timestamp", "INTEGER", 0),
+                ("running", "INTEGER", 0),
+            ],
+        ),
+        (
+            "session_task_indexed_ranges",
+            &[
+                ("root_identity", "TEXT", 1),
+                ("relative_path", "TEXT", 2),
+                ("file_device", "TEXT", 3),
+                ("file_inode", "TEXT", 4),
+                ("start_offset", "INTEGER", 6),
+                ("end_offset", "INTEGER", 7),
+                ("collector_epoch", "TEXT", 0),
+                ("cycle_seq", "TEXT", 0),
+                ("prefix_generation", "TEXT", 5),
+                ("record_sha256", "TEXT", 8),
             ],
         ),
         (
@@ -5101,7 +6514,8 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
         .iter()
         .map(|(table, _)| (*table).to_owned())
         .collect::<BTreeSet<_>>();
-    let mut pre_continuity_tables = expected_tables.clone();
+    let expected_for_version = expected_tables.clone();
+    let mut pre_continuity_tables = expected_for_version.clone();
     pre_continuity_tables.remove("history_continuity");
     pre_continuity_tables.remove("usage_model_history");
     pre_continuity_tables.remove("session_cumulative_recoveries");
@@ -5109,34 +6523,38 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
     pre_continuity_tables.remove("session_pending_ranges");
     pre_continuity_tables.remove("session_events");
     pre_continuity_tables.remove("active_thread_snapshot");
-    let mut pre_model_history_tables = expected_tables.clone();
+    let mut pre_model_history_tables = expected_for_version.clone();
     pre_model_history_tables.remove("usage_model_history");
     pre_model_history_tables.remove("session_cumulative_recoveries");
     pre_model_history_tables.remove("session_timeline_recoveries");
     pre_model_history_tables.remove("session_pending_ranges");
     pre_model_history_tables.remove("session_events");
     pre_model_history_tables.remove("active_thread_snapshot");
-    let mut pre_cumulative_recovery_tables = expected_tables.clone();
+    let mut pre_cumulative_recovery_tables = expected_for_version.clone();
     pre_cumulative_recovery_tables.remove("session_cumulative_recoveries");
     pre_cumulative_recovery_tables.remove("session_timeline_recoveries");
     pre_cumulative_recovery_tables.remove("session_pending_ranges");
     pre_cumulative_recovery_tables.remove("session_events");
     pre_cumulative_recovery_tables.remove("active_thread_snapshot");
-    let mut pre_timeline_recovery_tables = expected_tables.clone();
+    let mut pre_timeline_recovery_tables = expected_for_version.clone();
     pre_timeline_recovery_tables.remove("session_timeline_recoveries");
     pre_timeline_recovery_tables.remove("session_pending_ranges");
     pre_timeline_recovery_tables.remove("session_events");
     pre_timeline_recovery_tables.remove("active_thread_snapshot");
-    let mut pre_pending_range_tables = expected_tables.clone();
+    let mut pre_pending_range_tables = expected_for_version.clone();
     pre_pending_range_tables.remove("session_pending_ranges");
     pre_pending_range_tables.remove("session_events");
     pre_pending_range_tables.remove("active_thread_snapshot");
-    let mut pre_session_event_tables = expected_tables.clone();
+    let mut pre_session_event_tables = expected_for_version.clone();
     pre_session_event_tables.remove("session_events");
     pre_session_event_tables.remove("active_thread_snapshot");
+    let mut pre_session_task_evidence_tables = expected_for_version.clone();
+    pre_session_task_evidence_tables.remove("session_task_events");
+    pre_session_task_evidence_tables.remove("session_task_indexed_ranges");
+    pre_session_task_evidence_tables.remove("active_thread_snapshot");
     let mut actual_tables_without_active = actual_tables.clone();
     actual_tables_without_active.remove("active_thread_snapshot");
-    if actual_tables != expected_tables
+    if actual_tables != expected_for_version
         && !(allow_unversioned_legacy
             && (actual_tables == pre_continuity_tables
                 || actual_tables_without_active == pre_continuity_tables))
@@ -5155,6 +6573,9 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
         && !(schema_version < 6
             && (actual_tables == pre_session_event_tables
                 || actual_tables_without_active == pre_session_event_tables))
+        && !(schema_version < 8
+            && (actual_tables == pre_session_task_evidence_tables
+                || actual_tables_without_active == pre_session_task_evidence_tables))
     {
         return Err(UsageStoreError::InvalidImport(
             "account partition table set mismatch".into(),
@@ -5168,6 +6589,8 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
             || *table == "session_timeline_recoveries"
             || *table == "session_pending_ranges"
             || *table == "session_events"
+            || *table == "session_task_events"
+            || *table == "session_task_indexed_ranges"
             || *table == "active_thread_snapshot")
             && !actual_tables.contains(*table)
         {
@@ -5196,6 +6619,10 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
             matches!(*table, "session_checkpoints" | "session_model_totals")
                 && actual.len() + 1 == expected.len()
                 && actual == expected[..actual.len()];
+        let legacy_storage_partition_login_id = *table == "storage_partition"
+            && schema_version < 9
+            && actual.len() + 1 == expected.len()
+            && actual == expected[..actual.len()];
         let legacy_active_thread_snapshot_columns = *table == "active_thread_snapshot"
             && schema_version < 7
             && actual == legacy_active_thread_snapshot_columns();
@@ -5206,8 +6633,10 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
                     || (*table == "session_checkpoints"
                         && actual == legacy_session_checkpoint_columns())
                     || legacy_history_continuity
-                    || legacy_cache_write_columns))
+                    || legacy_cache_write_columns
+                    || legacy_storage_partition_login_id))
             && !legacy_active_thread_snapshot_columns
+            && !legacy_storage_partition_login_id
         {
             return Err(UsageStoreError::InvalidImport(format!(
                 "account partition {table} schema mismatch"
@@ -5449,6 +6878,76 @@ fn ensure_session_event_schema(transaction: &rusqlite::Transaction<'_>) -> Resul
     Ok(())
 }
 
+fn ensure_session_task_event_schema(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS session_task_events (
+            root_identity TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            file_device TEXT NOT NULL,
+            file_inode TEXT NOT NULL,
+            prefix_generation TEXT NOT NULL CHECK (
+                length(prefix_generation) = 32
+                AND prefix_generation NOT GLOB '*[^0-9a-f]*'
+            ),
+            start_offset INTEGER NOT NULL CHECK (start_offset >= 0),
+            end_offset INTEGER NOT NULL CHECK (end_offset > start_offset),
+            record_sha256 TEXT NOT NULL CHECK (
+                length(record_sha256) = 64
+                AND record_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            event_index INTEGER NOT NULL CHECK (event_index >= 0),
+            timestamp INTEGER NOT NULL CHECK (timestamp > 0),
+            running INTEGER NOT NULL CHECK (running IN (0, 1)),
+            PRIMARY KEY (
+                root_identity,
+                relative_path,
+                file_device,
+                file_inode,
+                prefix_generation,
+                start_offset,
+                end_offset,
+                record_sha256,
+                event_index
+            )
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS session_task_indexed_ranges (
+            root_identity TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            file_device TEXT NOT NULL,
+            file_inode TEXT NOT NULL,
+            start_offset INTEGER NOT NULL CHECK (start_offset >= 0),
+            end_offset INTEGER NOT NULL CHECK (end_offset > start_offset),
+            collector_epoch TEXT NOT NULL CHECK (
+                length(collector_epoch) = 32
+                AND collector_epoch NOT GLOB '*[^0-9a-f]*'
+            ),
+            cycle_seq TEXT NOT NULL,
+            prefix_generation TEXT NOT NULL CHECK (
+                length(prefix_generation) = 32
+                AND prefix_generation NOT GLOB '*[^0-9a-f]*'
+            ),
+            record_sha256 TEXT NOT NULL CHECK (
+                length(record_sha256) = 64
+                AND record_sha256 NOT GLOB '*[^0-9a-f]*'
+            ),
+            PRIMARY KEY (
+                root_identity,
+                relative_path,
+                file_device,
+                file_inode,
+                prefix_generation,
+                start_offset,
+                end_offset,
+                record_sha256
+            )
+        ) WITHOUT ROWID;
+        "#,
+    )?;
+    Ok(())
+}
+
 /// Add the active-thread publication row without rewriting any existing
 /// candidate.  Older partitions either have no table or the original
 /// three-column table; the nullable-looking state is represented by a
@@ -5493,6 +6992,36 @@ fn session_checkpoint_running_column_present(connection: &Connection) -> Result<
             |row| row.get(0),
         )
         .map_err(Into::into)
+}
+
+/// Add the nullable display-only login identifier to a legacy partition.
+/// This shape-only migration intentionally does not touch collection state or
+/// any usage/session rows; the caller stamps schema version 9 only after all
+/// partition migrations and validation succeed in the same transaction.
+fn ensure_storage_partition_login_id_schema(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    let table_exists: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_schema
+            WHERE type = 'table' AND name = 'storage_partition'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        return Ok(());
+    }
+    let login_id_present: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('storage_partition')
+            WHERE name = 'login_id'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !login_id_present {
+        transaction.execute("ALTER TABLE storage_partition ADD COLUMN login_id TEXT", [])?;
+    }
+    Ok(())
 }
 
 fn ensure_session_checkpoint_schema(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
@@ -5934,6 +7463,7 @@ impl UsageStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA)?;
         transaction.execute_batch(PARTITION_SCHEMA)?;
+        ensure_storage_partition_login_id_schema(&transaction)?;
         ensure_durable_state_schema(&transaction)?;
         ensure_recorder_gap_ledger_schema(&transaction)?;
         ensure_session_checkpoint_schema(&transaction)?;
@@ -5943,7 +7473,9 @@ impl UsageStore {
         ensure_session_timeline_recovery_schema(&transaction)?;
         ensure_session_pending_range_schema(&transaction)?;
         ensure_session_event_schema(&transaction)?;
+        ensure_session_task_event_schema(&transaction)?;
         ensure_active_thread_snapshot_schema(&transaction)?;
+        ensure_canonical_history_constraints(&transaction)?;
         stamp_current_account_db_schema(&transaction)?;
         transaction.execute(
             "INSERT INTO storage_partition (
@@ -5987,11 +7519,19 @@ impl UsageStore {
         // database belonging to another account must never be migrated merely
         // because it happens to contain the legacy fixture ledger.
         validate_storage_partition_identity(&probe, identity)?;
+        let schema_version = account_db_schema_version(&probe)?;
+        if schema_version != HISTORY_CANONICAL_SCHEMA_VERSION {
+            return Err(UsageStoreError::InvalidImport(
+                "account partition canonical history migration is required".into(),
+            ));
+        }
+        validate_canonical_history_storage(&probe)?;
         drop(probe);
         let mut store = Self::open(path)?;
         let transaction = store
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_storage_partition_login_id_schema(&transaction)?;
         ensure_recorder_gap_ledger_schema(&transaction)?;
         ensure_session_checkpoint_schema(&transaction)?;
         ensure_history_continuity_schema(&transaction)?;
@@ -6000,7 +7540,9 @@ impl UsageStore {
         ensure_session_timeline_recovery_schema(&transaction)?;
         ensure_session_pending_range_schema(&transaction)?;
         ensure_session_event_schema(&transaction)?;
+        ensure_session_task_event_schema(&transaction)?;
         ensure_active_thread_snapshot_schema(&transaction)?;
+        ensure_canonical_history_constraints(&transaction)?;
         stamp_current_account_db_schema(&transaction)?;
         validate_storage_partition(&transaction, identity)?;
         transaction.commit()?;
@@ -6021,6 +7563,67 @@ impl UsageStore {
         // integrity scan on every minute poll is not an access check.
         validate_storage_partition_metadata(&store.connection, identity)?;
         Ok(store)
+    }
+
+    /// Read the persisted display-only login identifier without mutating the
+    /// partition.  The caller must have opened this store through the
+    /// identity-validating partition constructor.
+    pub fn partition_login_id(&self) -> Result<Option<String>> {
+        let login_id: Option<String> = self.connection.query_row(
+            "SELECT login_id FROM storage_partition WHERE singleton = 1",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )?;
+        if login_id
+            .as_deref()
+            .is_some_and(|value| !valid_login_id(value))
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "stored partition login id is invalid".into(),
+            ));
+        }
+        Ok(login_id)
+    }
+
+    /// Persist the authenticated account's display-only login identifier.
+    ///
+    /// The serialized partition writer owns this mutation.  The value is
+    /// stored only in `storage_partition`; it is never part of the opaque
+    /// partition identity or collection generation.  Replaying the same
+    /// value commits no UPDATE and remains a metadata-only no-op.
+    pub fn set_partition_login_id(&mut self, login_id: &str) -> Result<()> {
+        if !valid_login_id(login_id) {
+            return Err(UsageStoreError::InvalidImport(
+                "partition login id is invalid".into(),
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_storage_partition_login_id_schema(&transaction)?;
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT login_id FROM storage_partition WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        if existing.as_deref() == Some(login_id) {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let changed = transaction.execute(
+            "UPDATE storage_partition SET login_id = ?1 WHERE singleton = 1",
+            [login_id],
+        )?;
+        if changed != 1 {
+            return Err(UsageStoreError::InvalidImport(
+                "storage partition singleton is missing".into(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Atomically publishes one complete active-thread candidate.  The
@@ -6215,7 +7818,27 @@ impl UsageStore {
         identity: &StoragePartitionIdentity,
         generations: usize,
     ) -> Result<()> {
+        if generations == 0 {
+            let source = Self::open_read_only_partitioned(path, identity)?;
+            drop(source);
+            return Ok(());
+        }
+        Self::backup_generations_partitioned_verified(path, identity, generations).map(|_| ())
+    }
+
+    /// Backup variant that returns an opaque source proof for the one caller
+    /// authorized to replace legacy aliases in the live history table.
+    pub fn backup_generations_partitioned_verified<P: AsRef<Path>>(
+        path: P,
+        identity: &StoragePartitionIdentity,
+        generations: usize,
+    ) -> Result<VerifiedPartitionBackup> {
         let path = path.as_ref();
+        if generations == 0 {
+            return Err(UsageStoreError::InvalidImport(
+                "verified partition backup requires at least one generation".into(),
+            ));
+        }
         let source = Self::open_read_only_partitioned(path, identity)?;
         drop(source);
         // `backup_generations` validates the live source, creates one
@@ -6225,7 +7848,120 @@ impl UsageStore {
         // can delay the recorder beyond its activation deadline. Validate a
         // retained generation when it is actually selected for recovery.
         Self::backup_generations(path, generations)?;
-        Ok(())
+        let latest = path.with_extension("sqlite3.bak.1");
+        let backup = Self::open_read_only_partitioned(&latest, identity)?;
+        let (raw_rows, raw_fingerprint) = legacy_raw_evidence(&backup.connection)?;
+        Ok(VerifiedPartitionBackup {
+            database: path.to_owned(),
+            partition_id: identity.partition_id.clone(),
+            raw_rows,
+            raw_fingerprint,
+        })
+    }
+
+    /// Returns true only when this exact partition already has the current,
+    /// internally consistent single-table canonical history. A legacy schema
+    /// is a normal `false`; malformed or mismatched partitions remain errors.
+    pub fn partition_history_is_current<P: AsRef<Path>>(
+        path: P,
+        identity: &StoragePartitionIdentity,
+    ) -> Result<bool> {
+        let path = path.as_ref();
+        let store = Self::open_read_only_partitioned(path, identity)?;
+        let version = account_db_schema_version(&store.connection)?;
+        if version < HISTORY_CANONICAL_SCHEMA_VERSION {
+            return Ok(false);
+        }
+        validate_canonical_history_storage(&store.connection)?;
+        Ok(true)
+    }
+
+    /// Replaces legacy aliases in `usage_history` after a verified online
+    /// backup. History and both existing sidecars move in one transaction.
+    pub fn migrate_partition_history_after_verified_backup<P: AsRef<Path>>(
+        path: P,
+        identity: &StoragePartitionIdentity,
+        backup: &VerifiedPartitionBackup,
+    ) -> Result<bool> {
+        let path = path.as_ref();
+        if backup.database != path
+            || backup.partition_id != identity.partition_id
+            || !path.is_absolute()
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "verified backup does not belong to this partition".into(),
+            ));
+        }
+        validate_partition_file(path)?;
+        let probe = Self::open_read_only_partitioned(path, identity)?;
+        let version = account_db_schema_version(&probe.connection)?;
+        if version > HISTORY_CANONICAL_SCHEMA_VERSION {
+            return Err(UsageStoreError::InvalidImport(
+                "account partition schema is newer than this executable".into(),
+            ));
+        }
+        if version == HISTORY_CANONICAL_SCHEMA_VERSION {
+            validate_canonical_history_storage(&probe.connection)?;
+            return Ok(false);
+        }
+        let source_evidence = legacy_raw_evidence(&probe.connection)?;
+        if source_evidence != (backup.raw_rows, backup.raw_fingerprint.clone()) {
+            return Err(UsageStoreError::InvalidImport(
+                "partition changed after its verified backup".into(),
+            ));
+        }
+        drop(probe);
+
+        let mut connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(Duration::from_secs(2))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_storage_partition_metadata(&transaction, identity)?;
+        if legacy_raw_evidence(&transaction)? != source_evidence {
+            return Err(UsageStoreError::InvalidImport(
+                "partition raw history changed during migration admission".into(),
+            ));
+        }
+        ensure_storage_partition_login_id_schema(&transaction)?;
+        ensure_durable_state_schema(&transaction)?;
+        ensure_recorder_gap_ledger_schema(&transaction)?;
+        ensure_session_checkpoint_schema(&transaction)?;
+        ensure_history_continuity_schema(&transaction)?;
+        ensure_usage_model_history_schema(&transaction)?;
+        ensure_session_cumulative_recovery_schema(&transaction)?;
+        ensure_session_timeline_recovery_schema(&transaction)?;
+        ensure_session_pending_range_schema(&transaction)?;
+        ensure_session_event_schema(&transaction)?;
+        ensure_session_task_event_schema(&transaction)?;
+        ensure_active_thread_snapshot_schema(&transaction)?;
+        let legacy_samples = load_legacy_samples_for_migration(&transaction)?;
+        let canonical_rows = canonicalize_legacy_usage_history(&transaction, &legacy_samples)?;
+        let canonical_samples = canonical_rows
+            .iter()
+            .map(|row| row.sample.clone())
+            .collect::<Vec<_>>();
+        let canonical_models = canonicalize_history_model_groups(
+            load_history_model_groups(&transaction)?,
+            &canonical_rows,
+        )?;
+        let canonical_observations =
+            canonicalize_durable_history_observations(&transaction, &canonical_rows)?;
+        rewrite_canonical_history(
+            &transaction,
+            &canonical_samples,
+            &canonical_models,
+            &canonical_observations,
+        )?;
+        ensure_canonical_history_constraints(&transaction)?;
+        stamp_current_account_db_schema(&transaction)?;
+        validate_storage_partition(&transaction, identity)?;
+        transaction.commit()?;
+
+        let read_back = Self::open_read_only_partitioned(path, identity)?;
+        validate_canonical_history_storage(&read_back.connection)?;
+        Ok(true)
     }
 
     /// Opens `path`, creating its parent directories and schema as needed.
@@ -6707,47 +8443,27 @@ impl UsageStore {
     pub fn load_all(&self) -> Result<Vec<UsageHistorySample>> {
         let mut samples = self.load_all_raw()?;
         let recoveries = self.load_session_cumulative_recoveries()?;
-        let timeline_recoveries = self.load_session_timeline_recoveries()?;
         for sample in &mut samples {
             apply_cumulative_recoveries_to_sample(
                 sample,
                 recoveries.iter().map(|(recovery, _, _)| recovery),
-            )?;
-            apply_timeline_recoveries_to_sample(
-                sample,
-                timeline_recoveries.iter().map(|(recovery, _, _)| recovery),
             )?;
         }
         Ok(samples)
     }
 
     fn load_all_raw(&self) -> Result<Vec<UsageHistorySample>> {
-        let mut statement = self.connection.prepare(
-            "SELECT timestamp, reset_at, remaining_percent, sol_dollars, \
-                    terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens \
-             FROM usage_history \
-             ORDER BY reset_at ASC, timestamp ASC",
-        )?;
-        let mut rows = statement.query([])?;
-        let mut samples = Vec::new();
-
-        while let Some(row) = rows.next()? {
-            if let Some(sample) = valid_sample_from_row(row)? {
-                samples.push(sample);
-            }
-        }
-
-        Ok(samples)
+        load_valid_samples_from_table(&self.connection, "usage_history", None)
     }
 
     fn load_recent_history_raw(&self, now: DateTime<Utc>) -> Result<Vec<UsageHistorySample>> {
         let cutoff = one_month_before(now).timestamp();
         let now_timestamp = now.timestamp();
         let mut statement = self.connection.prepare(
-            "SELECT timestamp, reset_at, remaining_percent, sol_dollars, \
-                    terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens \
-             FROM usage_history \
-             WHERE timestamp > ?1 AND timestamp <= ?2 \
+            "SELECT timestamp, reset_at, remaining_percent, sol_dollars,
+                    terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+             FROM usage_history
+             WHERE timestamp > ?1 AND timestamp <= ?2
              ORDER BY timestamp DESC, reset_at DESC",
         )?;
         let mut rows = statement.query(params![cutoff, now_timestamp])?;
@@ -6772,15 +8488,10 @@ impl UsageStore {
     pub fn load_recent_history(&self, now: DateTime<Utc>) -> Result<Vec<UsageHistorySample>> {
         let mut samples = self.load_recent_history_raw(now)?;
         let recoveries = self.load_session_cumulative_recoveries()?;
-        let timeline_recoveries = self.load_session_timeline_recoveries()?;
         for sample in &mut samples {
             apply_cumulative_recoveries_to_sample(
                 sample,
                 recoveries.iter().map(|(recovery, _, _)| recovery),
-            )?;
-            apply_timeline_recoveries_to_sample(
-                sample,
-                timeline_recoveries.iter().map(|(recovery, _, _)| recovery),
             )?;
         }
         Ok(samples)
@@ -6894,15 +8605,10 @@ impl UsageStore {
     ) -> Result<Vec<UsageHistoryObservation>> {
         let mut observations = self.load_recent_observations_raw(now)?;
         let recoveries = self.load_session_cumulative_recoveries()?;
-        let timeline_recoveries = self.load_session_timeline_recoveries()?;
         for observation in &mut observations {
             apply_cumulative_recoveries_to_observation(
                 observation,
                 recoveries.iter().map(|(recovery, _, _)| recovery),
-            )?;
-            apply_timeline_recoveries_to_observation(
-                observation,
-                timeline_recoveries.iter().map(|(recovery, _, _)| recovery),
             )?;
         }
         Ok(observations)
@@ -7068,16 +8774,21 @@ impl UsageStore {
             let Some(canonical_observation) = canonical_observation else {
                 return Ok(None);
             };
+            let transition = classify_quota_transition(
+                Some(canonical_reset_at),
+                window_seconds,
+                Some(canonical_observation.timestamp),
+                canonical_observation.remaining_percent,
+                source_state.reset_at,
+                source_state.window_seconds,
+                Some(source_observation.remaining_percent),
+                source_observation.observed_at,
+            );
             if canonical_reset_at <= source_observation.observed_at
-                || classify_quota_transition(
-                    Some(canonical_reset_at),
-                    window_seconds,
-                    Some(canonical_observation.timestamp),
-                    source_state.reset_at,
-                    source_state.window_seconds,
-                    Some(source_observation.remaining_percent),
-                    source_observation.observed_at,
-                ) != QuotaTransition::Rejected
+                || !matches!(
+                    transition,
+                    QuotaTransition::SamePeriod | QuotaTransition::Rejected
+                )
             {
                 return Ok(None);
             }
@@ -7384,11 +9095,11 @@ impl UsageStore {
             .filter(|sample| sample.timestamp < continuity.boundary_timestamp)
             .cloned()
             .collect::<Vec<_>>();
-        let historical = canonicalize_samples(&transaction, &historical, false)?;
-        upsert_canonical_samples(&transaction, &historical, false)?;
+        let historical = canonicalize_samples(&transaction, &historical, false, None)?;
+        upsert_canonical_samples(&transaction, &historical, false, None)?;
         let adjusted_current = apply_history_continuity(&transaction, &current_samples)?;
-        let adjusted_current = canonicalize_samples(&transaction, &adjusted_current, false)?;
-        upsert_canonical_samples(&transaction, &adjusted_current, false)?;
+        let adjusted_current = canonicalize_samples(&transaction, &adjusted_current, false, None)?;
+        upsert_canonical_samples(&transaction, &adjusted_current, false, None)?;
         let generation: String = transaction.query_row(
             "SELECT data_generation FROM collection_generation WHERE singleton=1",
             [],
@@ -7414,8 +9125,8 @@ impl UsageStore {
         let transaction =
             rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let adjusted = apply_history_continuity(&transaction, std::slice::from_ref(sample))?;
-        let canonical = canonicalize_samples(&transaction, &adjusted, false)?;
-        upsert_canonical_samples(&transaction, &canonical, false)?;
+        let canonical = canonicalize_samples(&transaction, &adjusted, false, None)?;
+        upsert_canonical_samples(&transaction, &canonical, false, None)?;
         transaction.commit()?;
         Ok(())
     }
@@ -7441,8 +9152,8 @@ impl UsageStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let adjusted = apply_history_continuity(&transaction, samples)?;
-        let canonical = canonicalize_samples(&transaction, &adjusted, false)?;
-        upsert_canonical_samples(&transaction, &canonical, false)?;
+        let canonical = canonicalize_samples(&transaction, &adjusted, false, None)?;
+        upsert_canonical_samples(&transaction, &canonical, false, None)?;
         replace_recorded_session_markers(&transaction, &sources)?;
         for source in &sources {
             if !recorded_session_matches_in(&transaction, source)? {
@@ -7888,6 +9599,69 @@ impl UsageStore {
         Ok(true)
     }
 
+    pub fn verify_session_task_batch(
+        &self,
+        indexed_ranges: &[SessionTaskIndexedRange],
+        events: &[SessionTaskEvent],
+    ) -> Result<bool> {
+        for range in indexed_ranges {
+            validate_session_task_indexed_range(range)?;
+            let exists: i64 = self.connection.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM session_task_indexed_ranges
+                    WHERE root_identity=?1 AND relative_path=?2
+                      AND file_device=?3 AND file_inode=?4
+                      AND prefix_generation=?5 AND start_offset=?6
+                      AND end_offset=?7 AND record_sha256=?8
+                )",
+                params![
+                    &range.root_identity,
+                    &range.relative_path,
+                    range.file_device.to_string(),
+                    range.file_inode.to_string(),
+                    format!("{:032x}", range.prefix_generation),
+                    range.start_offset as i64,
+                    range.end_offset as i64,
+                    &range.record_sha256,
+                ],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                return Ok(false);
+            }
+        }
+        for event in events {
+            validate_session_task_event(event)?;
+            let stored: Option<(i64, i64)> = self
+                .connection
+                .query_row(
+                    "SELECT timestamp, running
+                     FROM session_task_events
+                     WHERE root_identity=?1 AND relative_path=?2
+                       AND file_device=?3 AND file_inode=?4
+                       AND prefix_generation=?5 AND start_offset=?6
+                       AND end_offset=?7 AND record_sha256=?8 AND event_index=?9",
+                    params![
+                        &event.root_identity,
+                        &event.relative_path,
+                        event.file_device.to_string(),
+                        event.file_inode.to_string(),
+                        format!("{:032x}", event.prefix_generation),
+                        event.start_offset as i64,
+                        event.end_offset as i64,
+                        &event.record_sha256,
+                        event.event_index as i64,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if stored != Some((event.timestamp, i64::from(event.running))) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Return pending-evidence visibility without materializing the ledger.
     pub fn session_pending_range_count(&self) -> Result<usize> {
         let count: i64 = self.connection.query_row(
@@ -7965,6 +9739,203 @@ impl UsageStore {
             validate_session_event(event)?;
         }
         Ok(rows)
+    }
+
+    /// Load the source-proven task lifecycle evidence and its fail-closed
+    /// coverage verdict. The coverage check is intentionally independent of
+    /// the event rows: an empty event list is valid only when every inspected
+    /// span is itself durably marked.
+    pub fn load_session_task_evidence(&self) -> Result<SessionTaskEvidence> {
+        let events = self.load_session_task_events()?;
+        let indexed_ranges = self.load_session_task_indexed_ranges()?;
+        let all_ranges_indexed = self.session_task_coverage_complete()?;
+        Ok(SessionTaskEvidence {
+            events,
+            indexed_ranges,
+            all_ranges_indexed,
+        })
+    }
+
+    pub fn load_session_task_events(&self) -> Result<Vec<SessionTaskEvent>> {
+        if !self.session_task_tables_present()? {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT root_identity, relative_path, file_device, file_inode,
+                    prefix_generation, start_offset, end_offset, record_sha256,
+                    event_index, timestamp, running
+             FROM session_task_events
+             ORDER BY timestamp, root_identity, relative_path, start_offset, event_index",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(SessionTaskEvent {
+                    root_identity: row.get(0)?,
+                    relative_path: row.get(1)?,
+                    file_device: row
+                        .get::<_, String>(2)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    file_inode: row
+                        .get::<_, String>(3)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    prefix_generation: u128::from_str_radix(&row.get::<_, String>(4)?, 16)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    start_offset: u64::try_from(row.get::<_, i64>(5)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    end_offset: u64::try_from(row.get::<_, i64>(6)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    record_sha256: row.get(7)?,
+                    event_index: u64::try_from(row.get::<_, i64>(8)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    timestamp: row.get(9)?,
+                    running: match row.get::<_, i64>(10)? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(rusqlite::Error::InvalidQuery),
+                    },
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for event in &rows {
+            validate_session_task_event(event)?;
+        }
+        Ok(rows)
+    }
+
+    pub fn load_session_task_indexed_ranges(&self) -> Result<Vec<SessionTaskIndexedRange>> {
+        if !self.session_task_tables_present()? {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT root_identity, relative_path, file_device, file_inode,
+                    start_offset, end_offset, collector_epoch, cycle_seq,
+                    prefix_generation, record_sha256
+             FROM session_task_indexed_ranges
+             ORDER BY root_identity, relative_path, file_device, file_inode,
+                      prefix_generation, start_offset, end_offset, record_sha256",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(SessionTaskIndexedRange {
+                    root_identity: row.get(0)?,
+                    relative_path: row.get(1)?,
+                    file_device: row
+                        .get::<_, String>(2)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    file_inode: row
+                        .get::<_, String>(3)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    start_offset: u64::try_from(row.get::<_, i64>(4)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    end_offset: u64::try_from(row.get::<_, i64>(5)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    collector_epoch: u128::from_str_radix(&row.get::<_, String>(6)?, 16)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    cycle_seq: row
+                        .get::<_, String>(7)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    prefix_generation: u128::from_str_radix(&row.get::<_, String>(8)?, 16)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    record_sha256: row.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for range in &rows {
+            validate_session_task_indexed_range(range)?;
+        }
+        Ok(rows)
+    }
+
+    pub fn session_task_coverage_complete(&self) -> Result<bool> {
+        if !self.session_task_tables_present()? {
+            return Ok(false);
+        }
+        let indexed_ranges = self.load_session_task_indexed_ranges()?;
+        let mut checkpoint_statement = self.connection.prepare(
+            "SELECT root_identity, relative_path, file_device, file_inode,
+                    committed_offset, prefix_generation
+             FROM session_checkpoints
+             ORDER BY root_identity, relative_path, file_device, file_inode, prefix_generation",
+        )?;
+        let checkpoints = checkpoint_statement
+            .query_map([], |row| {
+                let committed_offset = row.get::<_, i64>(4)?;
+                let prefix_generation = u128::from_str_radix(&row.get::<_, String>(5)?, 16)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    u64::try_from(committed_offset).map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    prefix_generation,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (root, path, device, inode, end, prefix_generation) in checkpoints {
+            if end == 0 {
+                continue;
+            }
+            let mut spans = indexed_ranges
+                .iter()
+                .filter(|range| {
+                    range.root_identity == root
+                        && range.relative_path == path
+                        && range.file_device.to_string() == device
+                        && range.file_inode.to_string() == inode
+                        && range.prefix_generation == prefix_generation
+                })
+                .collect::<Vec<_>>();
+            spans.sort_by_key(|range| (range.start_offset, range.end_offset));
+            let mut covered = 0_u64;
+            for span in spans {
+                if span.start_offset > covered {
+                    break;
+                }
+                covered = covered.max(span.end_offset);
+                if covered >= end {
+                    break;
+                }
+            }
+            if covered < end {
+                return Ok(false);
+            }
+        }
+
+        for session_range in self.load_session_ranges()? {
+            // A task-indexed super-range authenticates and parses the same
+            // immutable source bytes. Its digest covers a different span and
+            // therefore must not be compared with the sub-range digest.
+            let contained = indexed_ranges.iter().any(|indexed| {
+                indexed.root_identity == session_range.root_identity
+                    && indexed.relative_path == session_range.relative_path
+                    && indexed.file_device == session_range.file_device
+                    && indexed.file_inode == session_range.file_inode
+                    && indexed.prefix_generation == session_range.prefix_generation
+                    && indexed.start_offset <= session_range.start_offset
+                    && indexed.end_offset >= session_range.end_offset
+            });
+            if !contained {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn session_task_tables_present(&self) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) = 2 FROM sqlite_schema
+                 WHERE type='table' AND name IN ('session_task_events', 'session_task_indexed_ranges')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     /// Read every ledger row for this account partition. Rows are returned in
@@ -8379,10 +10350,14 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             &observations,
-            None,
-            None,
-            None,
-            None,
+            CollectionEvidence {
+                cumulative_recovery: None,
+                timeline_recovery: None,
+                pending_ranges: None,
+                events: None,
+                task_events: None,
+                task_indexed_ranges: None,
+            },
         )
     }
 
@@ -8398,10 +10373,14 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
-            None,
-            None,
-            None,
-            None,
+            CollectionEvidence {
+                cumulative_recovery: None,
+                timeline_recovery: None,
+                pending_ranges: None,
+                events: None,
+                task_events: None,
+                task_indexed_ranges: None,
+            },
         )
     }
 
@@ -8418,10 +10397,14 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
-            Some(recovery),
-            None,
-            None,
-            None,
+            CollectionEvidence {
+                cumulative_recovery: Some(recovery),
+                timeline_recovery: None,
+                pending_ranges: None,
+                events: None,
+                task_events: None,
+                task_indexed_ranges: None,
+            },
         )
     }
 
@@ -8437,10 +10420,14 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
-            None,
-            Some(recovery),
-            None,
-            None,
+            CollectionEvidence {
+                cumulative_recovery: None,
+                timeline_recovery: Some(recovery),
+                pending_ranges: None,
+                events: None,
+                task_events: None,
+                task_indexed_ranges: None,
+            },
         )
     }
 
@@ -8457,10 +10444,14 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
-            None,
-            None,
-            Some(pending_ranges),
-            None,
+            CollectionEvidence {
+                cumulative_recovery: None,
+                timeline_recovery: None,
+                pending_ranges: Some(pending_ranges),
+                events: None,
+                task_events: None,
+                task_indexed_ranges: None,
+            },
         )
     }
 
@@ -8476,10 +10467,14 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
-            None,
-            Some(recovery),
-            Some(pending_ranges),
-            None,
+            CollectionEvidence {
+                cumulative_recovery: None,
+                timeline_recovery: Some(recovery),
+                pending_ranges: Some(pending_ranges),
+                events: None,
+                task_events: None,
+                task_indexed_ranges: None,
+            },
         )
     }
 
@@ -8497,10 +10492,14 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
-            None,
-            None,
-            Some(pending_ranges),
-            Some(events),
+            CollectionEvidence {
+                cumulative_recovery: None,
+                timeline_recovery: None,
+                pending_ranges: Some(pending_ranges),
+                events: Some(events),
+                task_events: None,
+                task_indexed_ranges: None,
+            },
         )
     }
 
@@ -8516,10 +10515,59 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
-            None,
-            Some(recovery),
-            Some(pending_ranges),
-            Some(events),
+            CollectionEvidence {
+                cumulative_recovery: None,
+                timeline_recovery: Some(recovery),
+                pending_ranges: Some(pending_ranges),
+                events: Some(events),
+                task_events: None,
+                task_indexed_ranges: None,
+            },
+        )
+    }
+
+    /// Commits Session token evidence and task lifecycle evidence together.
+    /// The indexed spans and task events are written by the same transaction
+    /// that advances the recorder generation, so an acknowledgement cannot
+    /// expose only one half of a source inspection.
+    pub fn commit_session_collection_with_task_evidence(
+        &mut self,
+        commit: SessionCollectionCommit<'_>,
+        observations: &[UsageHistoryObservation],
+        evidence: SessionTaskEvidenceInput<'_>,
+    ) -> Result<SessionCollectionCommitResult> {
+        self.commit_session_collection_with_observations_inner(
+            commit,
+            observations,
+            CollectionEvidence {
+                cumulative_recovery: None,
+                timeline_recovery: None,
+                pending_ranges: Some(evidence.pending_ranges),
+                events: Some(evidence.events),
+                task_events: Some(evidence.task_events),
+                task_indexed_ranges: Some(evidence.task_indexed_ranges),
+            },
+        )
+    }
+
+    pub fn commit_session_collection_with_timeline_recovery_and_task_evidence(
+        &mut self,
+        commit: SessionCollectionCommit<'_>,
+        observations: &[UsageHistoryObservation],
+        recovery: &SessionTimelineRecovery,
+        evidence: SessionTaskEvidenceInput<'_>,
+    ) -> Result<SessionCollectionCommitResult> {
+        self.commit_session_collection_with_observations_inner(
+            commit,
+            observations,
+            CollectionEvidence {
+                cumulative_recovery: None,
+                timeline_recovery: Some(recovery),
+                pending_ranges: Some(evidence.pending_ranges),
+                events: Some(evidence.events),
+                task_events: Some(evidence.task_events),
+                task_indexed_ranges: Some(evidence.task_indexed_ranges),
+            },
         )
     }
 
@@ -8527,11 +10575,16 @@ impl UsageStore {
         &mut self,
         commit: SessionCollectionCommit<'_>,
         observations: &[UsageHistoryObservation],
-        cumulative_recovery: Option<&SessionCumulativeRecovery>,
-        timeline_recovery: Option<&SessionTimelineRecovery>,
-        pending_ranges: Option<&[SessionPendingRange]>,
-        events: Option<&[SessionEvent]>,
+        evidence: CollectionEvidence<'_>,
     ) -> Result<SessionCollectionCommitResult> {
+        let CollectionEvidence {
+            cumulative_recovery,
+            timeline_recovery,
+            pending_ranges,
+            events,
+            task_events,
+            task_indexed_ranges,
+        } = evidence;
         let SessionCollectionCommit {
             reset_at,
             window_seconds,
@@ -8662,6 +10715,8 @@ impl UsageStore {
                 ));
             }
         }
+        let (canonical_task_indexed_ranges, canonical_task_events) =
+            canonicalize_task_evidence(task_events, task_indexed_ranges)?;
         let model_totals = canonicalize_model_totals(model_totals)?;
         let recorded_sessions = canonicalize_recorded_sessions_for_commit(recorded_sessions)?;
         for marker in &recorded_sessions {
@@ -8691,16 +10746,42 @@ impl UsageStore {
             }
         }
 
+        // A timeline recovery is an immutable correction for the historical
+        // prefix ending at `projection_end_exclusive`. Later recorder cycles
+        // may replay the same Session events while materializing minutes that
+        // were absent during the outage. Existing raw rows in that proven
+        // prefix remain the original evidence; only previously absent minutes
+        // may be inserted. Current and future minutes still use the ordinary
+        // reconciliation path.
+        let preserve_existing_before = self
+            .load_session_timeline_recoveries()?
+            .into_iter()
+            .map(|(recovery, _, _)| recovery.projection_end_exclusive)
+            .chain(
+                timeline_recovery
+                    .iter()
+                    .map(|recovery| recovery.projection_end_exclusive),
+            )
+            .max();
+
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let adjusted_samples = apply_history_continuity(&transaction, samples)?;
-        let preserve_existing_history =
-            cumulative_recovery.is_some() || timeline_recovery.is_some();
-        let canonical_samples =
-            canonicalize_samples(&transaction, &adjusted_samples, preserve_existing_history)?;
-        let canonical_observations =
-            canonicalize_observations(&transaction, observations, &canonical_samples)?;
+        let preserve_all_existing_history = cumulative_recovery.is_some();
+        let canonical_projection = canonicalize_samples_with_sources(
+            &transaction,
+            &adjusted_samples,
+            cumulative_recovery.is_some(),
+            preserve_existing_before,
+        )?;
+        let canonical_samples = canonical_projection.rows;
+        let canonical_observations = canonicalize_observations(
+            &transaction,
+            observations,
+            &canonical_samples,
+            &canonical_projection.source_to_canonical,
+        )?;
         let current_generation: (String, i64, i64, Option<String>, String) = transaction
             .query_row(
                 "SELECT data_generation, reset_at, window_seconds, collector_epoch, cycle_seq
@@ -8938,11 +11019,7 @@ impl UsageStore {
                 // incrementing durable state on an acknowledgement retry.
                 let replay_observations =
                     upsert_observations(&transaction, &canonical_observations)?;
-                upsert_observation_model_totals(
-                    &transaction,
-                    &replay_observations,
-                    preserve_existing_history,
-                )?;
+                upsert_observation_model_totals(&transaction, &replay_observations, true, None)?;
                 replace_session_pending_ranges(
                     &transaction,
                     &canonical_pending_ranges,
@@ -8950,6 +11027,8 @@ impl UsageStore {
                     replace_incomplete_pending_ranges,
                 )?;
                 upsert_session_events(&transaction, &canonical_events)?;
+                upsert_session_task_indexed_ranges(&transaction, &canonical_task_indexed_ranges)?;
+                upsert_session_task_events(&transaction, &canonical_task_events)?;
                 transaction.commit()?;
                 return Ok(SessionCollectionCommitResult {
                     data_generation: current_data_generation,
@@ -9042,12 +11121,18 @@ impl UsageStore {
             }
         }
 
-        upsert_canonical_samples(&transaction, &canonical_samples, preserve_existing_history)?;
+        upsert_canonical_samples(
+            &transaction,
+            &canonical_samples,
+            preserve_all_existing_history,
+            preserve_existing_before,
+        )?;
         let persisted_observations = upsert_observations(&transaction, &canonical_observations)?;
         upsert_observation_model_totals(
             &transaction,
             &persisted_observations,
-            preserve_existing_history,
+            preserve_all_existing_history,
+            preserve_existing_before,
         )?;
         {
             let mut statement = transaction.prepare(
@@ -9080,6 +11165,8 @@ impl UsageStore {
             replace_incomplete_pending_ranges,
         )?;
         upsert_session_events(&transaction, &canonical_events)?;
+        upsert_session_task_indexed_ranges(&transaction, &canonical_task_indexed_ranges)?;
+        upsert_session_task_events(&transaction, &canonical_task_events)?;
         {
             let mut statement = transaction.prepare(
                 "INSERT INTO session_checkpoints (
@@ -9448,7 +11535,7 @@ impl UsageStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let canonical = canonicalize_samples(&transaction, samples, false)?;
+        let canonical = canonicalize_samples(&transaction, samples, false, None)?;
         validate_data_hash(data_hash)?;
         validate_snapshot_json(snapshot_json)?;
         let current_raw: Option<(i64, String, String)> = transaction
@@ -9482,7 +11569,7 @@ impl UsageStore {
         let sqlite_generation =
             i64::try_from(next_generation).map_err(|_| UsageStoreError::GenerationOverflow)?;
 
-        upsert_canonical_samples(&transaction, &canonical, false)?;
+        upsert_canonical_samples(&transaction, &canonical, false, None)?;
         transaction.execute(
             "INSERT INTO durable_state (singleton, data_generation, data_hash, snapshot_json) \
              VALUES (1, ?1, ?2, ?3) \
@@ -9570,17 +11657,14 @@ impl UsageStore {
 
     /// Removes observations older than the exclusive UTC calendar-month cutoff.
     ///
-    /// This is the only destructive usage-history operation in the store.
-    /// Exact recorded-source marker lifecycle is independent. The cutoff is
-    /// strictly exclusive, so observations at the cutoff or in the future
-    /// remain stored regardless of reset period.
+    /// Account partitions prune the canonical table and its existing
+    /// sidecars in one transaction. Exact recorded-source marker lifecycle is
+    /// independent. The cutoff is
+    /// strictly exclusive, so projected observations at the cutoff or in the
+    /// future remain visible regardless of reset period.
     pub fn prune_older_than_three_months(&mut self, now: DateTime<Utc>) -> Result<usize> {
         let cutoff = three_months_before(now).timestamp();
         let transaction = self.connection.transaction()?;
-        let deleted = transaction.execute(
-            "DELETE FROM usage_history WHERE timestamp < ?1",
-            params![cutoff],
-        )?;
         transaction.execute(
             "DELETE FROM durable_state
              WHERE singleton >= ?1 AND data_generation < ?2",
@@ -9588,6 +11672,10 @@ impl UsageStore {
         )?;
         transaction.execute(
             "DELETE FROM usage_model_history WHERE timestamp < ?1",
+            params![cutoff],
+        )?;
+        let deleted = transaction.execute(
+            "DELETE FROM usage_history WHERE timestamp < ?1",
             params![cutoff],
         )?;
         transaction.commit()?;
@@ -9640,6 +11728,129 @@ mod tests {
             sol_tokens: 11,
             terra_tokens: 22,
             luna_tokens: 33,
+        }
+    }
+
+    #[test]
+    fn quota_transition_uses_quota_and_window_evidence_not_reset_at_alone() {
+        const WINDOW: i64 = 7 * 24 * 60 * 60;
+        let previous_observed = 1_789_200_605;
+        let previous_reset = 1_789_773_095;
+        let boundary_observed = 1_789_200_649;
+        let boundary_reset = 1_789_805_415;
+
+        assert_eq!(
+            classify_quota_transition(
+                Some(previous_reset),
+                WINDOW,
+                Some(previous_observed),
+                Some(61.0),
+                boundary_reset,
+                WINDOW,
+                Some(100.0),
+                boundary_observed,
+            ),
+            QuotaTransition::Boundary,
+            "quota recovery at the replacement window start is one real boundary"
+        );
+
+        assert_eq!(
+            classify_quota_transition(
+                Some(boundary_reset),
+                WINDOW,
+                Some(boundary_observed),
+                Some(100.0),
+                boundary_reset + 134,
+                WINDOW,
+                Some(100.0),
+                boundary_observed + 180,
+            ),
+            QuotaTransition::SamePeriod,
+            "a corrected deadline without quota recovery stays in the accepted period"
+        );
+
+        for start_drift in [-60, 0, 60] {
+            assert_eq!(
+                classify_quota_transition(
+                    Some(boundary_reset),
+                    WINDOW,
+                    Some(boundary_observed),
+                    Some(1.0),
+                    boundary_reset + WINDOW + start_drift,
+                    WINDOW,
+                    Some(100.0),
+                    boundary_reset,
+                ),
+                QuotaTransition::Boundary,
+                "the next full window is a boundary at the existing tolerance endpoints"
+            );
+        }
+
+        let alias_a = 1_789_437_490;
+        let alias_b = 1_789_300_251;
+        assert_eq!(
+            classify_quota_transition(
+                Some(alias_a),
+                WINDOW,
+                Some(1_788_972_900),
+                Some(29.0),
+                alias_b,
+                WINDOW,
+                Some(17.0),
+                1_788_975_540,
+            ),
+            QuotaTransition::Rejected
+        );
+        assert_eq!(
+            classify_quota_transition(
+                Some(alias_b),
+                WINDOW,
+                Some(1_788_975_540),
+                Some(17.0),
+                alias_a,
+                WINDOW,
+                Some(29.0),
+                1_788_975_600,
+            ),
+            QuotaTransition::Rejected,
+            "quota recovery without a matching time boundary is not a rollover"
+        );
+
+        for (next_reset, next_window, next_remaining, next_observed) in [
+            (
+                boundary_reset - 61,
+                WINDOW,
+                Some(99.0),
+                boundary_observed + 60,
+            ),
+            (
+                boundary_reset,
+                WINDOW + 1,
+                Some(99.0),
+                boundary_observed + 60,
+            ),
+            (boundary_reset, WINDOW, None, boundary_observed + 60),
+            (
+                boundary_reset,
+                WINDOW,
+                Some(f64::NAN),
+                boundary_observed + 60,
+            ),
+            (boundary_reset, WINDOW, Some(99.0), boundary_observed - 1),
+        ] {
+            assert_eq!(
+                classify_quota_transition(
+                    Some(boundary_reset),
+                    WINDOW,
+                    Some(boundary_observed),
+                    Some(100.0),
+                    next_reset,
+                    next_window,
+                    next_remaining,
+                    next_observed,
+                ),
+                QuotaTransition::Rejected
+            );
         }
     }
 
@@ -9878,6 +12089,328 @@ mod tests {
             storage_epoch: epoch,
             partition_id: account_byte.to_string().repeat(64),
         }
+    }
+
+    fn downgrade_canonical_history_to_v9(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP TRIGGER usage_history_canonical_insert_guard;
+                 DROP TRIGGER usage_history_canonical_update_guard;
+                 DROP TRIGGER usage_model_history_canonical_insert_guard;
+                 DROP TRIGGER usage_model_history_canonical_update_guard;
+                 DROP TRIGGER durable_history_observation_insert_guard;
+                 DROP TRIGGER durable_history_observation_update_guard;
+                 DROP TRIGGER usage_history_sidecar_update_guard;
+                 DROP TRIGGER usage_history_sidecar_delete_guard;
+                 DROP INDEX usage_history_canonical_timestamp_idx;
+                 DROP INDEX usage_model_history_canonical_timestamp_model_idx;
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn account_history_migration_replaces_aliases_and_sidecars_and_enforces_boundary() {
+        let path = database_path("account-history-canonical-migration");
+        let identity = partition_identity('9', 61);
+        drop(UsageStore::create_partitioned(&path, &identity).unwrap());
+
+        let minute = 1_800_000_000_i64;
+        let reset_a = 1_800_604_800_i64;
+        let reset_b = reset_a + 60;
+        let weaker = sample(minute + 5, reset_a, Some(71.0), 1.0);
+        let stronger = sample(minute + 40, reset_b, Some(70.0), 2.0);
+        let weaker_model = SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 10,
+            input_tokens: 8,
+            cached_input_tokens: 2,
+            output_tokens: 2,
+            cache_write_input_tokens: Some(0),
+        };
+        let stronger_model = SessionModelTotal {
+            total_tokens: 20,
+            input_tokens: 16,
+            cached_input_tokens: 4,
+            output_tokens: 4,
+            ..weaker_model.clone()
+        };
+        let connection = Connection::open(&path).unwrap();
+        downgrade_canonical_history_to_v9(&connection);
+        connection
+            .execute(
+                "UPDATE collection_generation SET reset_at=?1, window_seconds=?2
+                 WHERE singleton=1",
+                params![reset_b, 604_800_i64],
+            )
+            .unwrap();
+        for (row, raw_remaining) in [(&weaker, Some(71.0_f64)), (&stronger, Some(70.0_f64))] {
+            connection
+                .execute(
+                    "INSERT INTO usage_history (
+                         timestamp, reset_at, remaining_percent, sol_dollars,
+                         terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        row.timestamp,
+                        row.reset_at,
+                        raw_remaining,
+                        row.sol_dollars,
+                        row.terra_dollars,
+                        row.luna_dollars,
+                        row.sol_tokens as i64,
+                        row.terra_tokens as i64,
+                        row.luna_tokens as i64,
+                    ],
+                )
+                .unwrap();
+        }
+        for (row, total, complete) in [
+            (&weaker, &weaker_model, 0_i64),
+            (&stronger, &stronger_model, 1_i64),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO usage_model_history (
+                         reset_at, timestamp, model, total_tokens, input_tokens,
+                         cached_input_tokens, output_tokens, cache_write_input_tokens,
+                         model_set_complete
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        row.reset_at,
+                        row.timestamp,
+                        &total.model,
+                        total.total_tokens.to_string(),
+                        total.input_tokens.to_string(),
+                        total.cached_input_tokens.to_string(),
+                        total.output_tokens.to_string(),
+                        total
+                            .cache_write_input_tokens
+                            .map(|value| value.to_string()),
+                        complete,
+                    ],
+                )
+                .unwrap();
+        }
+        for (singleton, observation) in [
+            (2_i64, UsageHistoryObservation::legacy_unknown(&weaker)),
+            (3_i64, UsageHistoryObservation::confirmed(&stronger)),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO durable_state (
+                         singleton, data_generation, data_hash, snapshot_json
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        singleton,
+                        observation.timestamp,
+                        observation_data_hash(observation.reset_at, observation.timestamp),
+                        observation_json(&observation).unwrap(),
+                    ],
+                )
+                .unwrap();
+        }
+        let raw_before = legacy_raw_evidence(&connection).unwrap();
+        drop(connection);
+
+        let backup =
+            UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
+        assert!(UsageStore::migrate_partition_history_after_verified_backup(
+            &path, &identity, &backup
+        )
+        .unwrap());
+        assert!(
+            !UsageStore::migrate_partition_history_after_verified_backup(&path, &identity, &backup)
+                .unwrap()
+        );
+
+        let mut store = UsageStore::open_partitioned(&path, &identity).unwrap();
+        let backup_path = path.with_extension("sqlite3.bak.1");
+        let backup_store = Connection::open_with_flags(
+            backup_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        assert_eq!(legacy_raw_evidence(&backup_store).unwrap(), raw_before);
+        let canonical = store.load_all_raw().unwrap();
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].timestamp, minute);
+        assert_eq!(canonical[0].reset_at, reset_b);
+        assert_eq!(canonical[0].sol_dollars, stronger.sol_dollars);
+        assert_eq!(canonical[0].remaining_percent, Some(70.0));
+        let model_groups = load_history_model_groups(&store.connection).unwrap();
+        assert_eq!(model_groups.len(), 1);
+        assert_eq!(model_groups[0].timestamp, minute);
+        assert_eq!(model_groups[0].reset_at, reset_b);
+        assert_eq!(model_groups[0].totals, vec![stronger_model]);
+        assert!(model_groups[0].complete);
+        let observations = store
+            .load_recent_observations(Utc.timestamp_opt(minute + 60, 0).unwrap())
+            .unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].timestamp, minute);
+        assert_eq!(observations[0].reset_at, reset_b);
+        assert_eq!(observations[0].model_source, ModelSource::Confirmed);
+        assert!(store
+            .connection
+            .execute(
+                "INSERT INTO usage_history (
+                     timestamp, reset_at, remaining_percent, sol_dollars,
+                     terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+                 ) VALUES (?1, ?2, -1, 1, 1, 1, 1, 1, 1)",
+                params![minute + 60, reset_b],
+            )
+            .is_err());
+        assert!(store
+            .connection
+            .execute(
+                "INSERT INTO usage_history (
+                     timestamp, reset_at, remaining_percent, sol_dollars,
+                     terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+                 ) VALUES (?1, ?2, 70, 2, 2, 3, 11, 22, 33)",
+                params![minute, reset_b + 60],
+            )
+            .is_err());
+        assert!(store
+            .connection
+            .execute(
+                "INSERT INTO usage_model_history (
+                     reset_at, timestamp, model, total_tokens, input_tokens,
+                     cached_input_tokens, output_tokens, cache_write_input_tokens,
+                     model_set_complete
+                 ) VALUES (?1, ?2, 'SOL', '1', '1', '0', '0', '0', 1)",
+                params![reset_b, minute + 60],
+            )
+            .is_err());
+        let orphan_observation =
+            UsageHistoryObservation::confirmed(&sample(minute + 180, reset_b, Some(66.0), 5.0));
+        assert!(store
+            .connection
+            .execute(
+                "INSERT INTO durable_state (
+                     singleton, data_generation, data_hash, snapshot_json
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    99_i64,
+                    orphan_observation.timestamp,
+                    observation_data_hash(
+                        orphan_observation.reset_at,
+                        orphan_observation.timestamp
+                    ),
+                    observation_json(&orphan_observation).unwrap(),
+                ],
+            )
+            .is_err());
+
+        // Normal post-migration writes must collapse observations in one
+        // minute onto the existing canonical timestamp and reset key. A
+        // rolling reset alias cannot recreate a second period or a second
+        // row for that minute.
+        let next_observation = sample(minute + 65, reset_b, Some(69.0), 3.0);
+        store.upsert_sample(&next_observation).unwrap();
+        let replay_with_reset_alias = sample(minute + 80, reset_b + 30, Some(68.0), 4.0);
+        store.upsert_sample(&replay_with_reset_alias).unwrap();
+        let canonical = store.load_all_raw().unwrap();
+        assert_eq!(canonical.len(), 2);
+        assert_eq!(canonical[1].timestamp, minute + 60);
+        assert_eq!(canonical[1].reset_at, reset_b);
+        assert_eq!(canonical[1].remaining_percent, Some(68.0));
+        assert_eq!(canonical[1].sol_dollars, 4.0);
+
+        // Quota-only acquisition remains an independent durable fact when no
+        // usage vector exists for that timestamp.
+        let unavailable = UsageHistoryObservation::unavailable(minute + 120, reset_b, Some(67.0));
+        let transaction = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            upsert_observations(&transaction, std::slice::from_ref(&unavailable)).unwrap(),
+            vec![unavailable.clone()]
+        );
+        transaction.commit().unwrap();
+        let observations = store
+            .load_recent_observations(Utc.timestamp_opt(minute + 180, 0).unwrap())
+            .unwrap();
+        assert!(observations.contains(&unavailable));
+
+        drop(backup_store);
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn account_history_migration_rolls_back_incoherent_owned_minute() {
+        let path = database_path("account-history-canonical-incoherent-minute");
+        let identity = partition_identity('8', 62);
+        drop(UsageStore::create_partitioned(&path, &identity).unwrap());
+
+        let minute = 1_800_000_000_i64;
+        let reset_at = 1_800_604_800_i64;
+        let rows = [
+            sample(minute + 5, reset_at, Some(99.0), 1.0),
+            sample(minute + 45, reset_at, Some(100.0), 2.0),
+        ];
+        let connection = Connection::open(&path).unwrap();
+        downgrade_canonical_history_to_v9(&connection);
+        connection
+            .execute(
+                "UPDATE collection_generation SET reset_at=?1, window_seconds=?2
+                 WHERE singleton=1",
+                params![reset_at, 604_800_i64],
+            )
+            .unwrap();
+        for row in &rows {
+            connection
+                .execute(
+                    "INSERT INTO usage_history (
+                         timestamp, reset_at, remaining_percent, sol_dollars,
+                         terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        row.timestamp,
+                        row.reset_at,
+                        row.remaining_percent,
+                        row.sol_dollars,
+                        row.terra_dollars,
+                        row.luna_dollars,
+                        row.sol_tokens as i64,
+                        row.terra_tokens as i64,
+                        row.luna_tokens as i64,
+                    ],
+                )
+                .unwrap();
+        }
+        let raw_before = legacy_raw_evidence(&connection).unwrap();
+        drop(connection);
+
+        let backup =
+            UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
+        let error =
+            UsageStore::migrate_partition_history_after_verified_backup(&path, &identity, &backup)
+                .expect_err("an increasing remaining quota must abort the whole migration");
+        assert!(error
+            .to_string()
+            .contains("remaining quota increases within minute"));
+
+        let retained = Connection::open(&path).unwrap();
+        assert_eq!(legacy_raw_evidence(&retained).unwrap(), raw_before);
+        assert_eq!(
+            retained
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            9
+        );
+        drop(retained);
+        let retained_backup = Connection::open_with_flags(
+            path.with_extension("sqlite3.bak.1"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .unwrap();
+        assert_eq!(legacy_raw_evidence(&retained_backup).unwrap(), raw_before);
+        drop(retained_backup);
+
+        remove_database(&path);
     }
 
     fn recorder_gap(
@@ -10831,6 +13364,469 @@ mod tests {
         assert_eq!(range_count, 1);
         assert!(store.recorded_session_matches(&source).unwrap());
 
+        remove_database(&path);
+    }
+
+    #[test]
+    fn storage_partition_login_id_v8_migration_preserves_existing_state() {
+        let path = database_path("partition-login-id-v8-migration");
+        let identity = partition_identity('7', 41);
+        let reset_at = 1_800_604_800;
+        let mut source = recorded_source("2026/09/login-id-migration.jsonl", 77);
+        source.file_bytes = 10;
+        let checkpoint = checkpoint(&source, 10);
+        let committed_sample = sample(1_800_000_000, reset_at, Some(73.0), 4.0);
+
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at,
+                window_seconds: 604_800,
+                collector_epoch: checkpoint.collector_epoch,
+                cycle_seq: checkpoint.cycle_seq,
+                samples: std::slice::from_ref(&committed_sample),
+                checkpoints: std::slice::from_ref(&checkpoint),
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: std::slice::from_ref(&source),
+            })
+            .unwrap();
+        let samples_before = store.load_all_raw().unwrap();
+        let state_before = store.load_session_collection_state().unwrap();
+        assert_eq!(state_before.data_generation, 1);
+        assert!(store.recorded_session_matches(&source).unwrap());
+        drop(store);
+
+        // Reproduce the v8 shape exactly: only the new nullable column is
+        // absent and every pre-existing row remains in place.
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE storage_partition DROP COLUMN login_id;
+                 PRAGMA user_version = 8;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated = UsageStore::open_partitioned(&path, &identity).unwrap();
+        let schema_version: i64 = migrated
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema_version, 9);
+        let login_id: Option<String> = migrated
+            .connection
+            .query_row(
+                "SELECT login_id FROM storage_partition WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap();
+        assert_eq!(login_id, None);
+        assert_eq!(migrated.partition_login_id().unwrap(), None);
+        assert_eq!(migrated.load_all_raw().unwrap(), samples_before);
+        assert_eq!(
+            migrated.load_session_collection_state().unwrap(),
+            state_before
+        );
+        assert!(migrated.recorded_session_matches(&source).unwrap());
+
+        let stored_identity: (i64, String, String, String, String, String) = migrated
+            .connection
+            .query_row(
+                "SELECT singleton, schema_version, profile_scope_id, account_scope_id,
+                        storage_epoch, partition_id
+                 FROM storage_partition WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            stored_identity,
+            (
+                1,
+                identity.schema_version,
+                identity.profile_scope_id,
+                identity.account_scope_id,
+                identity.storage_epoch.to_string(),
+                identity.partition_id,
+            )
+        );
+        drop(migrated);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn partition_login_id_roundtrips_and_changes_only_storage_metadata() {
+        let path = database_path("partition-login-id-roundtrip");
+        let identity = partition_identity('8', 42);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let generation_before: String = store
+            .connection
+            .query_row(
+                "SELECT data_generation FROM collection_generation WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation_before, "0");
+
+        let maximum = "名".repeat(MAX_LOGIN_ID_SCALARS);
+        store.set_partition_login_id(&maximum).unwrap();
+        assert_eq!(
+            store.partition_login_id().unwrap().as_deref(),
+            Some(maximum.as_str())
+        );
+        store.set_partition_login_id("user@example.com").unwrap();
+        assert_eq!(
+            store.partition_login_id().unwrap().as_deref(),
+            Some("user@example.com")
+        );
+        let stored: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT login_id FROM storage_partition WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("user@example.com"));
+
+        // A trigger that rejects every login-id UPDATE proves the equal-value
+        // path is a genuine no-op rather than an UPDATE with identical data.
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_login_id_update
+                 BEFORE UPDATE OF login_id ON storage_partition
+                 BEGIN SELECT RAISE(ABORT, 'login id update must be skipped'); END;",
+            )
+            .unwrap();
+        store.set_partition_login_id("user@example.com").unwrap();
+        let generation_after_same: String = store
+            .connection
+            .query_row(
+                "SELECT data_generation FROM collection_generation WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation_after_same, generation_before);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_login_id_update")
+            .unwrap();
+
+        store.set_partition_login_id("other@example.com").unwrap();
+        let changed: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT login_id FROM storage_partition WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap();
+        assert_eq!(changed.as_deref(), Some("other@example.com"));
+        let generation_after_change: String = store
+            .connection
+            .query_row(
+                "SELECT data_generation FROM collection_generation WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation_after_change, generation_before);
+
+        drop(store);
+        let reopened = UsageStore::open_partitioned(&path, &identity).unwrap();
+        assert_eq!(
+            reopened.partition_login_id().unwrap().as_deref(),
+            Some("other@example.com")
+        );
+        let roundtripped: Option<String> = reopened
+            .connection
+            .query_row(
+                "SELECT login_id FROM storage_partition WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap();
+        assert_eq!(roundtripped.as_deref(), Some("other@example.com"));
+        let reopened_generation: String = reopened
+            .connection
+            .query_row(
+                "SELECT data_generation FROM collection_generation WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reopened_generation, generation_before);
+        drop(reopened);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn partition_login_id_rejects_empty_oversized_and_control_values() {
+        let path = database_path("partition-login-id-invalid");
+        let identity = partition_identity('9', 43);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let oversized = "x".repeat(MAX_LOGIN_ID_SCALARS + 1);
+        for invalid in [
+            "",
+            " leading",
+            "trailing ",
+            "line\nfeed",
+            "delete\u{007f}",
+            oversized.as_str(),
+        ] {
+            assert!(
+                store.set_partition_login_id(invalid).is_err(),
+                "invalid login id was accepted: {invalid:?}"
+            );
+        }
+        let stored: Option<String> = store
+            .connection
+            .query_row(
+                "SELECT login_id FROM storage_partition WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None);
+        let generation: String = store
+            .connection
+            .query_row(
+                "SELECT data_generation FROM collection_generation WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, "0");
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn session_task_schema_v8_migrates_legacy_partition() {
+        let path = database_path("session-task-schema-migration");
+        let identity = partition_identity('f', 21);
+        let store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE session_task_events;
+                 DROP TABLE session_task_indexed_ranges;
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated = UsageStore::open_partitioned(&path, &identity).unwrap();
+        let schema_version: i64 = migrated
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema_version, ACCOUNT_DB_SCHEMA_VERSION);
+        for table in ["session_task_events", "session_task_indexed_ranges"] {
+            let present: i64 = migrated
+                .connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1
+                     )",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "table {table}");
+        }
+        remove_database(&path);
+    }
+
+    #[test]
+    fn session_task_evidence_is_zero_event_idempotent_and_complete() {
+        let path = database_path("session-task-zero-event");
+        let identity = partition_identity('a', 22);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let reset_at = 1_800_604_800;
+        let mut source = recorded_source("2026/09/session-task.jsonl", 31);
+        source.file_bytes = 10;
+        let mut checkpoint = checkpoint(&source, 10);
+        checkpoint.prefix_sha256 = "11".repeat(32);
+        let range = SessionRange {
+            root_identity: source.root_identity.clone(),
+            relative_path: source.relative_path.clone(),
+            file_device: source.file_device,
+            file_inode: source.file_inode,
+            start_offset: 0,
+            end_offset: 10,
+            collector_epoch: checkpoint.collector_epoch,
+            cycle_seq: checkpoint.cycle_seq,
+            prefix_generation: checkpoint.prefix_generation,
+            record_sha256: checkpoint.prefix_sha256.clone(),
+        };
+        let indexed = SessionTaskIndexedRange {
+            root_identity: range.root_identity.clone(),
+            relative_path: range.relative_path.clone(),
+            file_device: range.file_device,
+            file_inode: range.file_inode,
+            start_offset: range.start_offset,
+            end_offset: range.end_offset,
+            collector_epoch: range.collector_epoch,
+            cycle_seq: range.cycle_seq,
+            prefix_generation: range.prefix_generation,
+            record_sha256: range.record_sha256.clone(),
+        };
+        let first = store
+            .commit_session_collection_with_task_evidence(
+                SessionCollectionCommit {
+                    reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch: checkpoint.collector_epoch,
+                    cycle_seq: checkpoint.cycle_seq,
+                    samples: &[],
+                    checkpoints: std::slice::from_ref(&checkpoint),
+                    ranges: std::slice::from_ref(&range),
+                    model_totals: &[],
+                    recorded_sessions: &[],
+                },
+                &[],
+                SessionTaskEvidenceInput {
+                    events: &[],
+                    pending_ranges: &[],
+                    task_events: &[],
+                    task_indexed_ranges: std::slice::from_ref(&indexed),
+                },
+            )
+            .unwrap();
+        assert_eq!(first.data_generation, 1);
+        assert!(store.load_session_task_events().unwrap().is_empty());
+        assert_eq!(
+            store.load_session_task_indexed_ranges().unwrap(),
+            std::slice::from_ref(&indexed)
+        );
+        assert!(store.session_task_coverage_complete().unwrap());
+
+        let replay = store
+            .commit_session_collection_with_task_evidence(
+                SessionCollectionCommit {
+                    reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch: checkpoint.collector_epoch,
+                    cycle_seq: checkpoint.cycle_seq,
+                    samples: &[],
+                    checkpoints: std::slice::from_ref(&checkpoint),
+                    ranges: std::slice::from_ref(&range),
+                    model_totals: &[],
+                    recorded_sessions: &[],
+                },
+                &[],
+                SessionTaskEvidenceInput {
+                    events: &[],
+                    pending_ranges: &[],
+                    task_events: &[],
+                    task_indexed_ranges: std::slice::from_ref(&indexed),
+                },
+            )
+            .unwrap();
+        assert_eq!(replay.data_generation, first.data_generation);
+        assert_eq!(store.load_session_task_indexed_ranges().unwrap(), [indexed]);
+        assert!(store.session_task_coverage_complete().unwrap());
+        remove_database(&path);
+    }
+
+    #[test]
+    fn session_task_evidence_failure_rolls_back_collection_and_marker() {
+        let path = database_path("session-task-atomic-failure");
+        let identity = partition_identity('b', 23);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let reset_at = 1_800_604_800;
+        let mut source = recorded_source("2026/09/session-task-failure.jsonl", 32);
+        source.file_bytes = 10;
+        let checkpoint = checkpoint(&source, 10);
+        let range = SessionRange {
+            root_identity: source.root_identity.clone(),
+            relative_path: source.relative_path.clone(),
+            file_device: source.file_device,
+            file_inode: source.file_inode,
+            start_offset: 0,
+            end_offset: 10,
+            collector_epoch: checkpoint.collector_epoch,
+            cycle_seq: checkpoint.cycle_seq,
+            prefix_generation: checkpoint.prefix_generation,
+            record_sha256: "00".repeat(32),
+        };
+        let indexed = SessionTaskIndexedRange {
+            root_identity: range.root_identity.clone(),
+            relative_path: range.relative_path.clone(),
+            file_device: range.file_device,
+            file_inode: range.file_inode,
+            start_offset: range.start_offset,
+            end_offset: range.end_offset,
+            collector_epoch: range.collector_epoch,
+            cycle_seq: range.cycle_seq,
+            prefix_generation: range.prefix_generation,
+            record_sha256: range.record_sha256.clone(),
+        };
+        store
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_task_marker
+                 BEFORE INSERT ON session_task_indexed_ranges
+                 BEGIN SELECT RAISE(ABORT, 'reject task marker'); END;",
+            )
+            .unwrap();
+        assert!(store
+            .commit_session_collection_with_task_evidence(
+                SessionCollectionCommit {
+                    reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch: checkpoint.collector_epoch,
+                    cycle_seq: checkpoint.cycle_seq,
+                    samples: &[],
+                    checkpoints: std::slice::from_ref(&checkpoint),
+                    ranges: std::slice::from_ref(&range),
+                    model_totals: &[],
+                    recorded_sessions: &[],
+                },
+                &[],
+                SessionTaskEvidenceInput {
+                    events: &[],
+                    pending_ranges: &[],
+                    task_events: &[],
+                    task_indexed_ranges: std::slice::from_ref(&indexed),
+                },
+            )
+            .is_err());
+        assert_eq!(
+            store.load_session_collection_state().unwrap(),
+            SessionCollectionState::default()
+        );
+        for table in [
+            "session_ranges",
+            "session_checkpoints",
+            "session_task_indexed_ranges",
+            "session_task_events",
+        ] {
+            let count: i64 = store
+                .connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "table {table}");
+        }
         remove_database(&path);
     }
 
@@ -11970,11 +14966,13 @@ mod tests {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
         let canonical_samples =
-            canonicalize_samples(&transaction, std::slice::from_ref(&smaller), false).unwrap();
+            canonicalize_samples(&transaction, std::slice::from_ref(&smaller), false, None)
+                .unwrap();
         let canonical_observations = canonicalize_observations(
             &transaction,
             std::slice::from_ref(&UsageHistoryObservation::confirmed(&smaller)),
             &canonical_samples,
+            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(canonical_observations.len(), 1);
@@ -11983,6 +14981,43 @@ mod tests {
             ModelSource::LegacyUnknown
         );
         assert_eq!(canonical_observations[0].sol_dollars, Some(9.5));
+        drop(transaction);
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn recovered_prefix_keeps_existing_non_comparable_row_without_blocking_append() {
+        let path = database_path("recovered-prefix-preserves-existing");
+        let timestamp = 1_700_000_060;
+        let reset_at = 1_700_604_800;
+        let existing = sample(timestamp, reset_at, Some(75.0), 10.0);
+        let mut replayed = sample(timestamp, reset_at, None, 1.0);
+        replayed.luna_dollars = 4.0;
+
+        let mut store = UsageStore::open(&path).unwrap();
+        store.upsert_sample(&existing).unwrap();
+        let transaction = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+
+        let preserved = canonicalize_samples(
+            &transaction,
+            std::slice::from_ref(&replayed),
+            false,
+            Some(timestamp + 60),
+        )
+        .unwrap();
+        assert_eq!(preserved, vec![existing]);
+        assert!(canonicalize_samples(
+            &transaction,
+            std::slice::from_ref(&replayed),
+            false,
+            Some(timestamp),
+        )
+        .is_err());
+
         drop(transaction);
         drop(store);
         remove_database(&path);
@@ -12039,6 +15074,28 @@ mod tests {
             observation.validate(),
             Err(UsageStoreError::InvalidImport(_))
         ));
+    }
+
+    #[test]
+    fn observation_json_round_trip_preserves_binary64_storage_value() {
+        let mut expected = sample(1_700_000_040, 1_700_604_800, Some(71.0), 1.0);
+        // This exact value exposed the production startup failure: without
+        // serde_json's round-trip parser the JSON path moved by one ULP from
+        // the same value stored as SQLite REAL.
+        expected.luna_dollars = f64::from_bits(0x3ffcd65251dc6ba7);
+        let observation = UsageHistoryObservation::confirmed(&expected);
+        let decoded = observation_from_sql(
+            observation.timestamp,
+            observation_data_hash(observation.reset_at, observation.timestamp),
+            observation_json(&observation).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            decoded.luna_dollars.map(f64::to_bits),
+            Some(expected.luna_dollars.to_bits())
+        );
+        assert!(observation_matches_sample(&decoded, &expected));
     }
 
     #[test]
@@ -12163,6 +15220,117 @@ mod tests {
             .unwrap();
         assert_eq!(singleton_count, 1);
         drop(connection);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn canonical_commit_projects_usage_and_model_observation_to_one_storage_key() {
+        let path = database_path("canonical-commit-source-key");
+        let identity = partition_identity('a', 1);
+        let minute = 1_800_000_000_i64;
+        let reset_at = minute + 604_800;
+        let observed = sample(minute + 20, reset_at, Some(64.0), 1.5);
+        let model = SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 11,
+            input_tokens: 8,
+            cached_input_tokens: 2,
+            output_tokens: 3,
+            cache_write_input_tokens: Some(0),
+        };
+        let observation =
+            UsageHistoryObservation::confirmed_with_models(&observed, vec![model.clone()]);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+
+        let result = store
+            .commit_session_collection_with_observations(
+                SessionCollectionCommit {
+                    reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch: 1,
+                    cycle_seq: 1,
+                    samples: std::slice::from_ref(&observed),
+                    checkpoints: &[],
+                    ranges: &[],
+                    model_totals: std::slice::from_ref(&model),
+                    recorded_sessions: &[],
+                },
+                std::slice::from_ref(&observation),
+            )
+            .unwrap();
+
+        assert_eq!(result.canonical_samples.len(), 1);
+        assert_eq!(result.canonical_samples[0].timestamp, minute);
+        assert_eq!(result.canonical_samples[0].reset_at, reset_at);
+        assert_eq!(result.canonical_observations.len(), 1);
+        assert_eq!(result.canonical_observations[0].timestamp, minute);
+        assert_eq!(result.canonical_observations[0].reset_at, reset_at);
+        assert_eq!(store.load_all_raw().unwrap(), result.canonical_samples);
+        let model_groups = load_history_model_groups(&store.connection).unwrap();
+        assert_eq!(model_groups.len(), 1);
+        assert_eq!(model_groups[0].timestamp, minute);
+        assert_eq!(model_groups[0].reset_at, reset_at);
+        assert_eq!(model_groups[0].totals, vec![model]);
+
+        drop(store);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn canonical_commit_excludes_one_conflicted_minute_with_its_sidecars() {
+        let path = database_path("canonical-commit-conflicted-minute");
+        let identity = partition_identity('b', 1);
+        let minute = 1_800_000_000_i64;
+        let reset_at = minute + 604_800;
+        let first = sample(minute + 5, reset_at, Some(64.0), 1.5);
+        let second = sample(minute + 40, reset_at, Some(63.0), 1.5);
+        let model = SessionModelTotal {
+            model: "SOL".into(),
+            total_tokens: 11,
+            input_tokens: 8,
+            cached_input_tokens: 2,
+            output_tokens: 3,
+            cache_write_input_tokens: Some(0),
+        };
+        let samples = vec![first.clone(), second.clone()];
+        let observations = samples
+            .iter()
+            .map(|sample| {
+                UsageHistoryObservation::confirmed_with_models(sample, vec![model.clone()])
+            })
+            .collect::<Vec<_>>();
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+
+        let result = store
+            .commit_session_collection_with_observations(
+                SessionCollectionCommit {
+                    reset_at,
+                    window_seconds: 604_800,
+                    collector_epoch: 1,
+                    cycle_seq: 1,
+                    samples: &samples,
+                    checkpoints: &[],
+                    ranges: &[],
+                    model_totals: std::slice::from_ref(&model),
+                    recorded_sessions: &[],
+                },
+                &observations,
+            )
+            .unwrap();
+
+        assert_eq!(result.data_generation, 1);
+        assert!(result.canonical_samples.is_empty());
+        assert!(result.canonical_observations.is_empty());
+        assert!(store.load_all_raw().unwrap().is_empty());
+        assert!(load_history_model_groups(&store.connection)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .load_recent_observations(Utc.timestamp_opt(minute + 60, 0).unwrap())
+            .unwrap()
+            .is_empty());
+
+        drop(store);
         remove_database(&path);
     }
 
@@ -12451,7 +15619,8 @@ mod tests {
             terra_tokens: 0,
             luna_tokens: 50,
         };
-        let base_samples = vec![base(first_at, 90.0), base(second_at, 89.0)];
+        let stale_anchor = base(anchor_at, 88.0);
+        let base_samples = vec![base(first_at, 90.0), base(second_at, 89.0), stale_anchor];
         let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
         let base_observations = base_samples
             .iter()
@@ -12573,24 +15742,24 @@ mod tests {
         };
         store
             .connection
-            .execute_batch(
+            .execute_batch(&format!(
                 "CREATE TEMP TRIGGER timeline_keep_usage_update
-                 BEFORE UPDATE ON usage_history
+                 BEFORE UPDATE ON usage_history WHEN OLD.timestamp < {anchor_at}
                  BEGIN
                      SELECT RAISE(ABORT, 'timeline rewrote measured usage');
                  END;
                  CREATE TEMP TRIGGER timeline_keep_usage_delete
-                 BEFORE DELETE ON usage_history
+                 BEFORE DELETE ON usage_history WHEN OLD.timestamp < {anchor_at}
                  BEGIN
                      SELECT RAISE(ABORT, 'timeline deleted measured usage');
                  END;
                  CREATE TEMP TRIGGER timeline_keep_models_update
-                 BEFORE UPDATE ON usage_model_history
+                 BEFORE UPDATE ON usage_model_history WHEN OLD.timestamp < {anchor_at}
                  BEGIN
                      SELECT RAISE(ABORT, 'timeline rewrote measured models');
                  END;
                  CREATE TEMP TRIGGER timeline_keep_models_delete
-                 BEFORE DELETE ON usage_model_history
+                 BEFORE DELETE ON usage_model_history WHEN OLD.timestamp < {anchor_at}
                  BEGIN
                      SELECT RAISE(ABORT, 'timeline deleted measured models');
                  END;
@@ -12598,8 +15767,8 @@ mod tests {
                  BEFORE UPDATE ON collection_generation
                  BEGIN
                      SELECT RAISE(ABORT, 'injected timeline recovery failure');
-                 END;",
-            )
+                 END;"
+            ))
             .unwrap();
         assert!(store
             .commit_session_collection_with_timeline_recovery(
@@ -12650,41 +15819,47 @@ mod tests {
 
         assert_eq!(
             store.load_all_raw().unwrap(),
-            [base_samples.clone(), vec![anchor.clone()]].concat()
+            vec![
+                base_samples[0].clone(),
+                base_samples[1].clone(),
+                anchor.clone()
+            ]
         );
         let logical = store.load_all().unwrap();
-        assert_eq!(logical[0].sol_tokens, 110);
-        assert_eq!(logical[0].sol_dollars, 1.1);
+        assert_eq!(logical[0].sol_tokens, 100);
+        assert_eq!(logical[0].sol_dollars, 1.0);
         assert_eq!(logical[0].luna_tokens, 50);
         assert_eq!(logical[0].remaining_percent, Some(90.0));
-        assert_eq!(logical[1].sol_tokens, 120);
-        assert_eq!(logical[1].sol_dollars, 1.2);
+        assert_eq!(logical[1].sol_tokens, 100);
+        assert_eq!(logical[1].sol_dollars, 1.0);
         assert_eq!(logical[1].remaining_percent, Some(89.0));
         assert_eq!(logical[2], anchor);
         let observations = store
             .load_recent_observations(Utc.timestamp_opt(anchor_at + 1, 0).unwrap())
             .unwrap();
-        assert_eq!(
-            observations[0].model_source,
-            ModelSource::ReconstructedFromSession
-        );
-        assert_eq!(
-            observations[1].model_source,
-            ModelSource::ReconstructedFromSession
-        );
+        assert_eq!(observations[0].model_source, ModelSource::Confirmed);
+        assert_eq!(observations[1].model_source, ModelSource::Confirmed);
         assert_eq!(observations[2].model_source, ModelSource::Confirmed);
         assert_eq!(
             observations[1]
                 .model_totals
                 .as_ref()
+                .and_then(|totals| totals.iter().find(|total| total.model == "SOL"))
+                .map(|total| total.total_tokens),
+            Some(100)
+        );
+        assert_eq!(
+            observations[2]
+                .model_totals
+                .as_ref()
                 .and_then(|totals| totals.iter().find(|total| total.model == "SOL")),
             Some(&SessionModelTotal {
                 model: "SOL".into(),
-                total_tokens: 120,
-                input_tokens: 108,
-                cached_input_tokens: 60,
+                total_tokens: 125,
+                input_tokens: 113,
+                cached_input_tokens: 62,
                 output_tokens: 12,
-                cache_write_input_tokens: Some(0),
+                cache_write_input_tokens: None,
             })
         );
         assert_eq!(

@@ -2125,6 +2125,7 @@ function Assert-E2EFixtureHistorySamples {
     $samples = @($DetailsJson.history_samples)
     $expectedSampleKeys = @(
         'timestamp', 'reset_at', 'remaining_percent',
+        'task_active_since_previous',
         'sol_dollars', 'terra_dollars', 'luna_dollars',
         'sol_tokens', 'terra_tokens', 'luna_tokens', 'model_source'
     )
@@ -2143,6 +2144,10 @@ function Assert-E2EFixtureHistorySamples {
         $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'sol_tokens' -Integer
         $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'terra_tokens' -Integer
         $null = Assert-E2EFixtureNumericProperty -Json $sample -Name 'luna_tokens' -Integer
+        $taskActiveProperty = $sample.PSObject.Properties['task_active_since_previous']
+        Assert-E2E ($null -ne $taskActiveProperty -and
+            ($null -eq $taskActiveProperty.Value -or $taskActiveProperty.Value -is [bool])) `
+            'Fixture history sample task_active_since_previous must be boolean or null.'
         Assert-E2E ([string]$sample.model_source -ceq 'confirmed') 'Fixture history sample model_source must be confirmed.'
         Assert-E2E (($timestamp % 60) -eq 0) "Fixture history sample timestamp must be minute bucket aligned (timestamp % 60 == 0): $timestamp."
         $matchingPeriods = @($periodRecords | Where-Object { $_.ResetAt -eq $reset })
@@ -2258,7 +2263,7 @@ function New-E2EFixtureDocuments {
     # strict thirteen-field contract; serializing nested PowerShell dictionaries
     # can silently change null/number kinds between Windows PowerShell builds.
     $details = @"
-{"api_version":"v2","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400,"input_dollars":1.20,"cached_input_dollars":0.20,"output_dollars":0.40},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800,"input_dollars":2.40,"cached_input_dollars":0.50,"output_dollars":0.80},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100,"input_dollars":3.60,"cached_input_dollars":0.70,"output_dollars":1.10}],"active_thread_count":3,"history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$pastStart,"end_at":$pastReset,"reset_at":$pastReset,"label":"Past period","current":false}],"history_samples":[{"timestamp":$currentStart,"reset_at":$currentReset,"remaining_percent":92.0,"sol_dollars":0.25,"terra_dollars":0.50,"luna_dollars":0.75,"sol_tokens":100,"terra_tokens":200,"luna_tokens":300,"model_source":"confirmed"},{"timestamp":$now,"reset_at":$currentReset,"remaining_percent":72.0,"sol_dollars":1.20,"terra_dollars":2.40,"luna_dollars":3.60,"sol_tokens":1200,"terra_tokens":2400,"luna_tokens":3600,"model_source":"confirmed"},{"timestamp":$pastStart,"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150,"model_source":"confirmed"},{"timestamp":$($pastStart + 60),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150,"model_source":"confirmed"},{"timestamp":$($pastStart + 120),"reset_at":$pastReset,"remaining_percent":98.0,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150,"model_source":"confirmed"},{"timestamp":$pastReset,"reset_at":$pastReset,"remaining_percent":84.0,"sol_dollars":0.60,"terra_dollars":1.20,"luna_dollars":1.80,"sol_tokens":600,"terra_tokens":1200,"luna_tokens":1800,"model_source":"confirmed"}],"threads":[{"id":"e2e-root","title":"E2E root task","parent_thread_id":null,"model":"TERRA","model_label":"TERRA","total_tokens":2400,"context_usage_tokens":800,"context_window_tokens":16000,"created_at":$($now - 3600),"last_user_message_at":$($now - 300),"is_subagent":false,"depth":0},{"id":"e2e-child","title":"E2E child task","parent_thread_id":"e2e-root","model":"LUNA","model_label":"LUNA","total_tokens":1200,"context_usage_tokens":400,"context_window_tokens":16000,"created_at":$($now - 2400),"last_user_message_at":$($now - 600),"is_subagent":true,"depth":1},{"id":"e2e-orphan","title":"E2E orphan task","parent_thread_id":"missing-parent","model":"SOL","model_label":"SOL","total_tokens":600,"context_usage_tokens":null,"context_window_tokens":null,"created_at":$($now - 1200),"last_user_message_at":null,"is_subagent":true,"depth":null}],"estimated_cost_label":"USD 12.34"}
+{"api_version":"v2","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"name":"SOL","input_tokens":1200,"cached_input_tokens":200,"output_tokens":400,"input_dollars":1.20,"cached_input_dollars":0.20,"output_dollars":0.40},{"name":"TERRA","input_tokens":2400,"cached_input_tokens":500,"output_tokens":800,"input_dollars":2.40,"cached_input_dollars":0.50,"output_dollars":0.80},{"name":"LUNA","input_tokens":3600,"cached_input_tokens":700,"output_tokens":1100,"input_dollars":3.60,"cached_input_dollars":0.70,"output_dollars":1.10}],"active_thread_count":3,"history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$pastStart,"end_at":$pastReset,"reset_at":$pastReset,"label":"Past period","current":false}],"history_samples":[{"timestamp":$currentStart,"reset_at":$currentReset,"remaining_percent":92.0,"task_active_since_previous":null,"sol_dollars":0.25,"terra_dollars":0.50,"luna_dollars":0.75,"sol_tokens":100,"terra_tokens":200,"luna_tokens":300,"model_source":"confirmed"},{"timestamp":$now,"reset_at":$currentReset,"remaining_percent":72.0,"task_active_since_previous":true,"sol_dollars":1.20,"terra_dollars":2.40,"luna_dollars":3.60,"sol_tokens":1200,"terra_tokens":2400,"luna_tokens":3600,"model_source":"confirmed"},{"timestamp":$pastStart,"reset_at":$pastReset,"remaining_percent":98.0,"task_active_since_previous":null,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150,"model_source":"confirmed"},{"timestamp":$($pastStart + 60),"reset_at":$pastReset,"remaining_percent":98.0,"task_active_since_previous":false,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150,"model_source":"confirmed"},{"timestamp":$($pastStart + 120),"reset_at":$pastReset,"remaining_percent":98.0,"task_active_since_previous":false,"sol_dollars":0.10,"terra_dollars":0.20,"luna_dollars":0.30,"sol_tokens":50,"terra_tokens":100,"luna_tokens":150,"model_source":"confirmed"},{"timestamp":$pastReset,"reset_at":$pastReset,"remaining_percent":84.0,"task_active_since_previous":true,"sol_dollars":0.60,"terra_dollars":1.20,"luna_dollars":1.80,"sol_tokens":600,"terra_tokens":1200,"luna_tokens":1800,"model_source":"confirmed"}],"threads":[{"id":"e2e-root","title":"E2E root task","parent_thread_id":null,"model":"TERRA","model_label":"TERRA","total_tokens":2400,"context_usage_tokens":800,"context_window_tokens":16000,"created_at":$($now - 3600),"last_user_message_at":$($now - 300),"is_subagent":false,"depth":0},{"id":"e2e-child","title":"E2E child task","parent_thread_id":"e2e-root","model":"LUNA","model_label":"LUNA","total_tokens":1200,"context_usage_tokens":400,"context_window_tokens":16000,"created_at":$($now - 2400),"last_user_message_at":$($now - 600),"is_subagent":true,"depth":1},{"id":"e2e-orphan","title":"E2E orphan task","parent_thread_id":"missing-parent","model":"SOL","model_label":"SOL","total_tokens":600,"context_usage_tokens":null,"context_window_tokens":null,"created_at":$($now - 1200),"last_user_message_at":null,"is_subagent":true,"depth":null}],"estimated_cost_label":"USD 12.34"}
 "@
     # Keep the explicit sample values above while enforcing the wire order
     # independently of PowerShell object serialization: past -> current.
@@ -2490,30 +2495,44 @@ function Invoke-E2EFixtureContractTests {
     Assert-E2EExpectedContractFailure -Name 'history-gaps-missing' -Health $health -Details $detailsWithoutGaps
 
     $detailsJson = ConvertFrom-Json -InputObject $documents.Details
+    $currentPeriod = @($detailsJson.history_periods | Where-Object { $_.id -eq 'e2e-current' })
+    Assert-E2E ($currentPeriod.Count -eq 1) 'Fixture must contain exactly one e2e-current period.'
+    $currentSamples = @($detailsJson.history_samples |
+        Where-Object { [Int64]$_.reset_at -eq [Int64]$currentPeriod[0].reset_at } |
+        Sort-Object timestamp)
+    Assert-E2E ($currentSamples.Count -eq 2) 'Current fixture must contain start and latest observations.'
+    Assert-E2E ($null -eq $currentSamples[0].task_active_since_previous -and
+        $currentSamples[1].task_active_since_previous -eq $true) `
+        'Current fixture lifecycle must be null at period start and true at the latest observation.'
     $pastPeriod = @($detailsJson.history_periods | Where-Object { $_.id -eq 'e2e-past' })
     Assert-E2E ($pastPeriod.Count -eq 1) 'Fixture must contain exactly one e2e-past period.'
     $pastSamples = @($detailsJson.history_samples |
         Where-Object { [Int64]$_.reset_at -eq [Int64]$pastPeriod[0].reset_at } |
         Sort-Object timestamp)
     Assert-E2E ($pastSamples.Count -eq 4) `
-        'Past fixture must contain three idle observations followed by one active observation.'
+        'Past fixture must contain a lifecycle-confirmed idle run followed by one active observation.'
+    Assert-E2E ($null -eq $pastSamples[0].task_active_since_previous -and
+        $pastSamples[1].task_active_since_previous -eq $false -and
+        $pastSamples[2].task_active_since_previous -eq $false -and
+        $pastSamples[3].task_active_since_previous -eq $true) `
+        'Past fixture lifecycle must be null, false, false, true across its four observations.'
     foreach ($index in 0..1) {
         Assert-E2E (([Int64]$pastSamples[$index + 1].timestamp -
             [Int64]$pastSamples[$index].timestamp) -eq 60) `
-            'Past fixture idle observations must use exact one-minute cadence.'
+            'Past fixture lifecycle-confirmed idle observations must use exact one-minute cadence.'
         foreach ($model in @('sol', 'terra', 'luna')) {
             $tokenProperty = "${model}_tokens"
             $beforeTokens = [Int64]$pastSamples[$index].PSObject.Properties[$tokenProperty].Value
             $afterTokens = [Int64]$pastSamples[$index + 1].PSObject.Properties[$tokenProperty].Value
             Assert-E2E ($beforeTokens -eq $afterTokens) `
-                "Past fixture $model tokens changed inside the sustained idle evidence."
+                "Past fixture $model tokens changed inside lifecycle-confirmed idle evidence."
         }
     }
     Assert-E2E (([Int64]$pastSamples[3].sol_tokens -gt [Int64]$pastSamples[2].sol_tokens) -and
         ([Int64]$pastSamples[3].terra_tokens -gt [Int64]$pastSamples[2].terra_tokens) -and
         ([Int64]$pastSamples[3].luna_tokens -gt [Int64]$pastSamples[2].luna_tokens)) `
-        'Past fixture final observation must end the idle run with token activity.'
-    Write-E2E 'fixture-graph-idle-evidence: PASS two measured flat-token intervals then activity'
+        'Past fixture final observation must end the lifecycle-confirmed idle run with token activity.'
+    Write-E2E 'fixture-graph-idle-evidence: PASS lifecycle-confirmed idle intervals with flat tokens then activity'
     $unorderedSamples = @($detailsJson.history_samples)
     $firstSample = $unorderedSamples[0]
     $unorderedSamples[0] = $unorderedSamples[2]

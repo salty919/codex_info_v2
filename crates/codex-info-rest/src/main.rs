@@ -1,6 +1,8 @@
-use codex_info_account_locator::locate_existing_partition;
-use codex_info_db_reader::DbReader;
-use codex_info_rest::{loopback_addr, RestServer};
+use codex_info_account_locator::{
+    locate_existing_partition, locate_existing_partitions, AccountPartition,
+};
+use codex_info_db_reader::{DbReader, ReadInterval, ReadIntervals, StoragePartitionIdentity};
+use codex_info_rest::{loopback_addr, AccountReader, RestServer};
 use std::env;
 use std::path::PathBuf;
 use std::thread;
@@ -62,19 +64,26 @@ fn run() -> Result<(), String> {
     let requested_database = database.or(environment_database);
     let fixture_mode = fixture_database_mode();
     validate_database_override(requested_database.as_deref(), fixture_mode)?;
-    let database = match requested_database {
-        Some(path) if fixture_mode => path,
+    let (accounts, default_account_id) = match requested_database {
+        Some(path) if fixture_mode => {
+            let database = absolutize(path)?;
+            let reader = DbReader::open(&database).map_err(|error| error.to_string())?;
+            (
+                vec![AccountReader::new("account-1", 1, true, None, None, reader)],
+                "account-1".to_owned(),
+            )
+        }
         Some(_) => unreachable!("non-fixture database path rejected above"),
-        None => default_database_path()?,
+        None => default_account_readers()?,
     };
-    let database = absolutize(database)?;
-    let reader = DbReader::open(&database).map_err(|error| error.to_string())?;
     let address = loopback_addr(&port).map_err(|error| error.to_string())?;
-    let server = RestServer::start(reader, address).map_err(|error| error.to_string())?;
+    let server = RestServer::start_with_accounts(accounts, &default_account_id, address)
+        .map_err(|error| error.to_string())?;
     eprintln!(
-        "codex_info_rest: read-only listener={} database={}",
+        "codex_info_rest: read-only listener={} accounts={} default={}",
         server.local_addr(),
-        database.display()
+        server.store().account_descriptors().len(),
+        default_account_id,
     );
     // systemd owns lifecycle and sends SIGTERM.  No recorder or writer is
     // started here; this binary only owns the read-only REST listener.
@@ -112,19 +121,89 @@ fn absolutize(path: PathBuf) -> Result<PathBuf, String> {
     }
 }
 
-fn default_database_path() -> Result<PathBuf, String> {
+fn default_account_readers() -> Result<(Vec<AccountReader>, String), String> {
     let codex_home = env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
         .ok_or_else(|| {
             "CODEX_HOME or HOME is required to locate the account database".to_owned()
         })?;
+    let codex_home = absolutize(codex_home)?;
     let data_root = env::var_os("CODEX_INFO_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| codex_home.clone());
-    locate_existing_partition(&codex_home, &data_root)
-        .map(|partition| partition.database_path)
-        .map_err(|error| format!("locate existing account database: {error}"))
+    let data_root = absolutize(data_root)?;
+    let current = locate_existing_partition(&codex_home, &data_root)
+        .map_err(|error| format!("locate current account database: {error}"))?;
+    let partitions = locate_existing_partitions(&codex_home, &data_root)
+        .map_err(|error| format!("locate account databases: {error}"))?;
+    let default_account_id = current.public_id();
+    let mut readers = Vec::with_capacity(partitions.len());
+    for partition in partitions {
+        let identity = partition_identity(&partition);
+        let read_intervals = partition_read_intervals(&partition)?;
+        let reader = DbReader::open_partitioned_with_intervals(
+            &partition.database_path,
+            &identity,
+            read_intervals,
+        )
+        .map_err(|error| {
+            format!(
+                "open account partition {} ({}) read-only: {error}",
+                partition.public_id(),
+                partition.database_path.display()
+            )
+        })?;
+        let database_login_id = reader.partition_login_id().map_err(|error| {
+            format!(
+                "read account partition {} display identity: {error}",
+                partition.public_id()
+            )
+        })?;
+        readers.push(
+            AccountReader::new(
+                partition.public_id(),
+                partition.storage_epoch,
+                partition.account_scope_id == current.account_scope_id,
+                partition.current_interval_start,
+                partition.current_interval_end,
+                reader,
+            )
+            .with_login_id(database_login_id.or(partition.login_id.clone())),
+        );
+    }
+    Ok((readers, default_account_id))
+}
+
+fn partition_read_intervals(partition: &AccountPartition) -> Result<ReadIntervals, String> {
+    let intervals = partition
+        .lifecycle_intervals
+        .iter()
+        .map(|interval| ReadInterval::new(interval.start_at, interval.end_at))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!(
+                "account partition {} has an invalid lifecycle interval: {error}",
+                partition.public_id()
+            )
+        })?;
+    ReadIntervals::new(intervals).map_err(|error| {
+        format!(
+            "account partition {} has invalid lifecycle ownership: {error}",
+            partition.public_id()
+        )
+    })
+}
+
+fn partition_identity(partition: &AccountPartition) -> StoragePartitionIdentity {
+    let identity = partition.storage_identity();
+    StoragePartitionIdentity {
+        schema_version: identity.schema_version,
+        profile_scope_id: identity.profile_scope_id,
+        account_scope_id: identity.account_scope_id,
+        storage_epoch: identity.storage_epoch,
+        partition_id: identity.partition_id,
+    }
 }
 
 #[cfg(test)]

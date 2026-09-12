@@ -40,13 +40,13 @@ if [[ "$profile" == history-graph ]]; then
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_shared_v3_oracle_matches_values_roles_idle_and_pair_through_http_parser
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_continuity_v4_oracle_is_identical_for_dollars_tokens_and_exact_period_end
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_idle_and_anomaly_counterexamples_match_the_shared_oracle
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_remaining_smoothing_uses_only_token_active_seconds
+        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_remaining_smoothing_uses_coherent_token_delta_or_elapsed_weights
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_cumulative_anomaly_fixture_never_paints_a_vertical_drop
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_shared_oracle_matches_regression_and_quota_anomaly_rules
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Remaining_stair_step_is_smoothed_across_token_active_seconds
+        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Remaining_stair_step_is_smoothed_across_coherent_token_deltas
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.IdleBandRasterIsOpaqueAboveTheMajorGridAndBelowDataSeries
         CodexInfo.WindowsClient.Presentation.Tests.DetailsPresentationCoverageTests.GraphWindow_ExactStaleCursorRetriesHeadOnceAndPreservesResetStateAcrossFailures
-        CodexInfo.WindowsClient.Presentation.Tests.DetailsPresentationCoverageTests.GraphWindow_PublishedPairChangeUsesProvenCursorAndAtomicallyAppends
+        CodexInfo.WindowsClient.Presentation.Tests.DetailsPresentationCoverageTests.GraphWindow_PublishedPairAdvanceRealignsOnceWithoutFalseFailure
         CodexInfo.WindowsClient.Presentation.Tests.DetailsPresentationCoverageTests.GraphWindow_DuplicateTimestampsRejectWholeCandidateAndPreserveLastGood
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Confirmed_history_gap_is_continuous_and_dashed_across_the_gap
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Remaining_quota_observations_survive_flat_model_rows_as_unattributed_dashes

@@ -7,10 +7,11 @@
 
 use codex_info_db_reader::{DbReader, DbSnapshot};
 use codex_info_rest_contract::{
-    PublicDetails, PublicDetailsV2, PublicDetailsV3, PublicHistoryGap, PublicState, API_VERSION,
-    API_VERSION_V2, API_VERSION_V3,
+    PublicAccountV3, PublicAccountsV3, PublicDetails, PublicDetailsV2, PublicDetailsV3,
+    PublicHistoryGap, PublicState, API_VERSION, API_VERSION_V2, API_VERSION_V3,
 };
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -53,6 +54,25 @@ impl PublishedSnapshot {
             history_samples_v2: snapshot.history_samples_v2,
         }
     }
+
+    fn from_db_for_account(snapshot: DbSnapshot, storage_epoch: u64) -> Self {
+        let mut published = Self::from_db(snapshot);
+        // Keep the established v1:<64 hex> wire shape while binding both the
+        // stable account-partition namespace and the complete content
+        // identity.  The fixed layout is epoch (64 bit), generation (64 bit),
+        // and the first 128 bits of the reader's SHA-256 data hash.  In
+        // particular, a restart after a same-generation content rewrite must
+        // not turn an old conditional request into a false 304.
+        let hash_prefix = published
+            .data_hash
+            .get(..32)
+            .expect("DbReader data hashes are canonical 64-character hex");
+        published.pair = format!(
+            "v1:{storage_epoch:016x}{:016x}{hash_prefix}",
+            published.generation
+        );
+        published
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,18 +95,18 @@ struct StoreInner {
     degraded: bool,
 }
 
-/// Reader/cache boundary.  The cache is an in-memory last-good snapshot, not
-/// a second persistence authority and is never written to disk.
-pub struct SnapshotStore {
+struct AccountStore {
     reader: DbReader,
+    storage_epoch: u64,
     refresh_lock: Mutex<()>,
     inner: RwLock<StoreInner>,
 }
 
-impl SnapshotStore {
-    pub fn new(reader: DbReader) -> Self {
+impl AccountStore {
+    fn new(reader: DbReader, storage_epoch: u64) -> Self {
         Self {
             reader,
+            storage_epoch,
             refresh_lock: Mutex::new(()),
             inner: RwLock::new(StoreInner {
                 current: None,
@@ -95,13 +115,13 @@ impl SnapshotStore {
         }
     }
 
-    pub fn reader(&self) -> &DbReader {
+    fn reader(&self) -> &DbReader {
         &self.reader
     }
 
     /// Read one candidate and atomically replace the current generation only
     /// after the reader has completed all schema/value/domain checks.
-    pub fn refresh(&self) -> RefreshStatus {
+    fn refresh(&self) -> RefreshStatus {
         let _refresh_guard = self
             .refresh_lock
             .lock()
@@ -149,7 +169,10 @@ impl SnapshotStore {
                 }
             }
         }
-        let candidate = self.reader.read_snapshot().map(PublishedSnapshot::from_db);
+        let candidate = self
+            .reader
+            .read_snapshot()
+            .map(|snapshot| PublishedSnapshot::from_db_for_account(snapshot, self.storage_epoch));
         let mut inner = self
             .inner
             .write()
@@ -218,7 +241,7 @@ impl SnapshotStore {
         }
     }
 
-    pub fn status(&self) -> StoreStatus {
+    fn status(&self) -> StoreStatus {
         let inner = self
             .inner
             .read()
@@ -229,7 +252,7 @@ impl SnapshotStore {
         }
     }
 
-    pub fn snapshot(&self) -> Option<Arc<PublishedSnapshot>> {
+    fn snapshot(&self) -> Option<Arc<PublishedSnapshot>> {
         self.inner
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -240,12 +263,201 @@ impl SnapshotStore {
     /// Return the last-good snapshot and its publication health atomically.
     /// Keeping these values under one read lock prevents a concurrent refresh
     /// from pairing a new generation with the previous degraded flag.
-    pub fn snapshot_with_status(&self) -> (Option<Arc<PublishedSnapshot>>, bool) {
+    fn snapshot_with_status(&self) -> (Option<Arc<PublishedSnapshot>>, bool) {
         let inner = self
             .inner
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         (inner.current.clone(), inner.degraded)
+    }
+}
+
+/// Reader metadata supplied by production account discovery.  The reader is
+/// already opened read-only (and, in production, identity-validated) before
+/// this value is handed to the REST cache.
+#[derive(Debug)]
+pub struct AccountReader {
+    pub id: String,
+    pub storage_epoch: u64,
+    pub is_current: bool,
+    pub activation_at: Option<i64>,
+    pub deactivation_at: Option<i64>,
+    pub login_id: Option<String>,
+    pub reader: DbReader,
+}
+
+impl AccountReader {
+    pub fn new(
+        id: impl Into<String>,
+        storage_epoch: u64,
+        is_current: bool,
+        activation_at: Option<i64>,
+        deactivation_at: Option<i64>,
+        reader: DbReader,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            storage_epoch,
+            is_current,
+            activation_at,
+            deactivation_at,
+            login_id: None,
+            reader,
+        }
+    }
+
+    pub fn with_login_id(mut self, login_id: Option<String>) -> Self {
+        self.login_id = login_id;
+        self
+    }
+}
+
+/// Reader/cache boundary.  The cache is an in-memory last-good snapshot per
+/// account partition, not a second persistence authority and is never written
+/// to disk.  `new(DbReader)` remains the fixture-compatible single-reader API.
+pub struct SnapshotStore {
+    default_account_id: String,
+    accounts: BTreeMap<String, AccountStore>,
+    account_descriptors: Vec<PublicAccountV3>,
+}
+
+impl SnapshotStore {
+    pub fn new(reader: DbReader) -> Self {
+        Self::new_with_accounts(
+            vec![AccountReader::new("account-1", 1, true, None, None, reader)],
+            "account-1",
+        )
+        .expect("single fixture account configuration is valid")
+    }
+
+    pub fn new_with_accounts(
+        mut accounts: Vec<AccountReader>,
+        default_account_id: impl Into<String>,
+    ) -> Result<Self, RestServerError> {
+        if accounts.is_empty() {
+            return Err(RestServerError::InvalidAccounts(
+                "at least one account reader is required".to_owned(),
+            ));
+        }
+        let default_account_id = default_account_id.into();
+        accounts.sort_by(|left, right| {
+            right
+                .is_current
+                .cmp(&left.is_current)
+                .then_with(|| right.storage_epoch.cmp(&left.storage_epoch))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let mut descriptors = Vec::with_capacity(accounts.len());
+        let mut stores = BTreeMap::new();
+        for account in accounts {
+            if account.id != format!("account-{}", account.storage_epoch)
+                || account.storage_epoch == 0
+            {
+                return Err(RestServerError::InvalidAccounts(
+                    "account selector does not match storage epoch".to_owned(),
+                ));
+            }
+            let descriptor = PublicAccountV3 {
+                id: account.id.clone(),
+                is_current: account.is_current,
+                activation_at: account.activation_at,
+                deactivation_at: account.deactivation_at,
+                login_id: account.login_id,
+            };
+            descriptors.push(descriptor);
+            if stores
+                .insert(
+                    account.id,
+                    AccountStore::new(account.reader, account.storage_epoch),
+                )
+                .is_some()
+            {
+                return Err(RestServerError::InvalidAccounts(
+                    "duplicate account selector".to_owned(),
+                ));
+            }
+        }
+        let public = PublicAccountsV3 {
+            default_account_id: default_account_id.clone(),
+            accounts: descriptors.clone(),
+        };
+        public.validate().map_err(|error| {
+            RestServerError::InvalidAccounts(format!("invalid account selector: {error}"))
+        })?;
+        Ok(Self {
+            default_account_id,
+            accounts: stores,
+            account_descriptors: descriptors,
+        })
+    }
+
+    pub fn reader(&self) -> &DbReader {
+        self.accounts
+            .get(&self.default_account_id)
+            .expect("validated default account")
+            .reader()
+    }
+
+    pub fn refresh(&self) -> RefreshStatus {
+        self.refresh_account(&self.default_account_id)
+    }
+
+    pub fn refresh_account(&self, account_id: &str) -> RefreshStatus {
+        self.accounts
+            .get(account_id)
+            .map(AccountStore::refresh)
+            .unwrap_or(RefreshStatus::Unavailable)
+    }
+
+    pub fn status(&self) -> StoreStatus {
+        self.status_account(&self.default_account_id)
+    }
+
+    pub fn status_account(&self, account_id: &str) -> StoreStatus {
+        self.accounts
+            .get(account_id)
+            .map(AccountStore::status)
+            .unwrap_or(StoreStatus {
+                generation: None,
+                degraded: true,
+            })
+    }
+
+    pub fn snapshot(&self) -> Option<Arc<PublishedSnapshot>> {
+        self.snapshot_account(&self.default_account_id)
+    }
+
+    pub fn snapshot_account(&self, account_id: &str) -> Option<Arc<PublishedSnapshot>> {
+        self.accounts
+            .get(account_id)
+            .and_then(AccountStore::snapshot)
+    }
+
+    pub fn snapshot_with_status(&self) -> (Option<Arc<PublishedSnapshot>>, bool) {
+        self.snapshot_with_status_account(&self.default_account_id)
+    }
+
+    pub fn snapshot_with_status_account(
+        &self,
+        account_id: &str,
+    ) -> (Option<Arc<PublishedSnapshot>>, bool) {
+        self.accounts
+            .get(account_id)
+            .map(AccountStore::snapshot_with_status)
+            .unwrap_or((None, true))
+    }
+
+    pub fn has_account(&self, account_id: &str) -> bool {
+        self.accounts.contains_key(account_id)
+    }
+
+    pub fn default_account_id(&self) -> &str {
+        &self.default_account_id
+    }
+
+    pub fn account_descriptors(&self) -> &[PublicAccountV3] {
+        &self.account_descriptors
     }
 }
 
@@ -255,6 +467,7 @@ pub enum RestServerError {
     Bind(io::Error),
     Listener(io::Error),
     InvalidPort,
+    InvalidAccounts(String),
 }
 
 impl fmt::Display for RestServerError {
@@ -264,6 +477,7 @@ impl fmt::Display for RestServerError {
             Self::Bind(error) => write!(formatter, "REST listener bind failed: {error}"),
             Self::Listener(error) => write!(formatter, "REST listener failed: {error}"),
             Self::InvalidPort => formatter.write_str("REST port is invalid"),
+            Self::InvalidAccounts(error) => write!(formatter, "REST accounts are invalid: {error}"),
         }
     }
 }
@@ -279,6 +493,21 @@ pub struct RestServer {
 
 impl RestServer {
     pub fn start(reader: DbReader, listen_addr: SocketAddr) -> Result<Self, RestServerError> {
+        Self::start_with_accounts(
+            vec![AccountReader::new("account-1", 1, true, None, None, reader)],
+            "account-1",
+            listen_addr,
+        )
+    }
+
+    /// Start the REST listener with every registry-authoritative initialized
+    /// account partition.  The default is the one marked current by the
+    /// production locator; all account caches remain physically independent.
+    pub fn start_with_accounts(
+        accounts: Vec<AccountReader>,
+        default_account_id: impl Into<String>,
+        listen_addr: SocketAddr,
+    ) -> Result<Self, RestServerError> {
         if !listen_addr.ip().is_loopback() {
             return Err(RestServerError::NonLoopbackAddress);
         }
@@ -287,7 +516,10 @@ impl RestServer {
             .set_nonblocking(true)
             .map_err(RestServerError::Listener)?;
         let local_addr = listener.local_addr().map_err(RestServerError::Listener)?;
-        let store = Arc::new(SnapshotStore::new(reader));
+        let store = Arc::new(SnapshotStore::new_with_accounts(
+            accounts,
+            default_account_id,
+        )?);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker_store = Arc::clone(&store);
@@ -348,6 +580,7 @@ enum Route {
     Details,
     DetailsV2,
     DetailsV3,
+    AccountsV3,
     CurrentV3,
     HistoryPeriodsV3,
     HistoryV3,
@@ -359,6 +592,7 @@ impl Route {
         matches!(
             self,
             Self::DetailsV3
+                | Self::AccountsV3
                 | Self::CurrentV3
                 | Self::HistoryPeriodsV3
                 | Self::HistoryV3
@@ -371,6 +605,7 @@ impl Route {
 struct Request {
     method: String,
     route: Option<Route>,
+    account: Option<String>,
     period: Option<String>,
     cursor: Option<usize>,
     if_none_match: Option<String>,
@@ -435,10 +670,34 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
         return;
     }
 
+    if route == Route::AccountsV3 {
+        let accounts = PublicAccountsV3 {
+            default_account_id: store.default_account_id().to_owned(),
+            accounts: store.account_descriptors().to_vec(),
+        };
+        match flatten_with_version(API_VERSION_V3, &accounts) {
+            Ok(body) => write_json_response(stream, 200, body, None, false),
+            Err(RouteError::Serialization) => {
+                write_json_response(stream, 500, error_body("serialization_failed"), None, false)
+            }
+            Err(_) => unreachable!("account descriptors are validated at startup"),
+        }
+        return;
+    }
+
+    let account_id = request
+        .account
+        .as_deref()
+        .unwrap_or_else(|| store.default_account_id());
+    if !store.has_account(account_id) {
+        write_json_response(stream, 400, error_body("unknown_account"), None, false);
+        return;
+    }
+
     // A malformed request never reaches refresh, so parser errors cannot
     // influence published generation or trigger a database access.
-    let refresh = store.refresh();
-    let (snapshot, degraded) = store.snapshot_with_status();
+    let refresh = store.refresh_account(account_id);
+    let (snapshot, degraded) = store.snapshot_with_status_account(account_id);
     let Some(snapshot) = snapshot else {
         let _ = refresh;
         write_json_response(stream, 503, error_body("snapshot_unavailable"), None, false);
@@ -563,13 +822,14 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, ParseError> {
     if content_length > trailing.len() {
         return Err(ParseError::BodyNotAllowed);
     }
-    let (route, period, cursor) = parse_target(target)?;
+    let (route, account, period, cursor) = parse_target(target)?;
     let if_none_match = header(&headers, "if-none-match")
         .map(parse_etag)
         .transpose()?;
     Ok(Request {
         method,
         route,
+        account,
         period,
         cursor,
         if_none_match,
@@ -600,7 +860,17 @@ fn parse_etag(value: &str) -> Result<String, ParseError> {
     Ok(pair.to_owned())
 }
 
-type ParsedTarget = (Option<Route>, Option<String>, Option<usize>);
+type ParsedTarget = (Option<Route>, Option<String>, Option<String>, Option<usize>);
+
+fn valid_account_selector(value: &str) -> bool {
+    let Some(epoch) = value.strip_prefix("account-") else {
+        return false;
+    };
+    let Ok(epoch) = epoch.parse::<u64>() else {
+        return false;
+    };
+    epoch > 0 && value == format!("account-{epoch}")
+}
 
 fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
     if target.is_empty() || target.contains('#') || !target.starts_with('/') {
@@ -612,6 +882,7 @@ fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
         "/v1/details" => Some(Route::Details),
         "/v2/details" => Some(Route::DetailsV2),
         "/v3/details" => Some(Route::DetailsV3),
+        "/v3/accounts" => Some(Route::AccountsV3),
         "/v3/current" => Some(Route::CurrentV3),
         "/v3/history/periods" => Some(Route::HistoryPeriodsV3),
         "/v3/history" => Some(Route::HistoryV3),
@@ -619,22 +890,56 @@ fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
         _ => None,
     };
     if route != Some(Route::HistoryV3) {
-        if !query.is_empty() {
-            return Ok((None, None, None));
+        if route.is_some_and(Route::v3) {
+            if target.contains('?') && query.is_empty() {
+                return Err(ParseError::BadRequest);
+            }
+            if route == Some(Route::AccountsV3) {
+                if !query.is_empty() {
+                    return Err(ParseError::BadRequest);
+                }
+                return Ok((route, None, None, None));
+            }
+            if query.is_empty() {
+                return Ok((route, None, None, None));
+            }
+            if query.contains('%') {
+                return Err(ParseError::BadRequest);
+            }
+            let mut account = None;
+            for pair in query.split('&') {
+                let (name, value) = pair.split_once('=').ok_or(ParseError::BadRequest)?;
+                if name != "account"
+                    || value.is_empty()
+                    || value.contains('=')
+                    || !valid_account_selector(value)
+                    || account.replace(value.to_owned()).is_some()
+                {
+                    return Err(ParseError::BadRequest);
+                }
+            }
+            return Ok((route, account, None, None));
         }
-        return Ok((route, None, None));
+        if !query.is_empty() {
+            return Ok((None, None, None, None));
+        }
+        return Ok((route, None, None, None));
     }
     if query.is_empty() || query.contains('%') {
         return Err(ParseError::BadRequest);
     }
+    let mut account = None;
     let mut period = None;
     let mut cursor = None;
     for pair in query.split('&') {
         let (name, value) = pair.split_once('=').ok_or(ParseError::BadRequest)?;
-        if value.is_empty() {
+        if value.is_empty() || value.contains('=') {
             return Err(ParseError::BadRequest);
         }
         match name {
+            "account" if account.is_none() && valid_account_selector(value) => {
+                account = Some(value.to_owned())
+            }
             "period" if period.is_none() => period = Some(value.to_owned()),
             "cursor" if cursor.is_none() => {
                 cursor = Some(value.parse::<usize>().map_err(|_| ParseError::BadRequest)?);
@@ -642,7 +947,7 @@ fn parse_target(target: &str) -> Result<ParsedTarget, ParseError> {
             _ => return Err(ParseError::BadRequest),
         }
     }
-    Ok((Some(Route::HistoryV3), period, cursor))
+    Ok((Some(Route::HistoryV3), account, period, cursor))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -674,6 +979,7 @@ fn serialize_route(
             let details = details_v3(snapshot, degraded);
             flatten_with_version(API_VERSION_V3, &details)
         }
+        Route::AccountsV3 => Err(RouteError::Serialization),
         Route::CurrentV3 => {
             let state = if degraded {
                 PublicState::Error
@@ -897,7 +1203,7 @@ mod tests {
         let connection = Connection::open(path).expect("fixture");
         connection
             .execute_batch(
-                "CREATE TABLE usage_history(
+                r#"CREATE TABLE usage_history(
                     timestamp INTEGER NOT NULL, reset_at INTEGER NOT NULL,
                     remaining_percent REAL, sol_dollars REAL NOT NULL,
                     terra_dollars REAL NOT NULL, luna_dollars REAL NOT NULL,
@@ -909,7 +1215,14 @@ mod tests {
                     reset_at INTEGER NOT NULL, window_seconds INTEGER NOT NULL,
                     collector_epoch TEXT, cycle_seq TEXT NOT NULL
                 );
-                INSERT INTO collection_generation VALUES(1,'1',1800000060,3600,NULL,'0');",
+                CREATE TABLE durable_state(
+                    singleton INTEGER PRIMARY KEY, data_generation INTEGER NOT NULL,
+                    data_hash TEXT NOT NULL, snapshot_json TEXT NOT NULL
+                );
+                INSERT INTO collection_generation VALUES(1,'1',1800000060,3600,NULL,'0');
+                INSERT INTO durable_state VALUES
+                    (2,1800000000,'fixture-legacy-observation',
+                     '{"kind":"codex-info-usage-observation-v1","timestamp":1800000000,"reset_at":1800000060,"remaining_percent":50.0,"model_source":"legacy-unknown"}');"#,
             )
             .expect("schema");
         connection
@@ -947,6 +1260,70 @@ mod tests {
             .lines()
             .find_map(|line| line.strip_prefix("Codex-Info-Published-Pair: "))
             .expect("published pair")
+    }
+
+    #[test]
+    fn v3_history_page_boundary_preserves_task_activity_field() {
+        let reset_at = 1_800_000_600_i64;
+        let start_at = 1_800_000_000_i64;
+        let history_samples = (0..1_025)
+            .map(
+                |index| codex_info_rest_contract::PublicHistoryObservationV3 {
+                    timestamp: start_at + index * 60,
+                    reset_at,
+                    remaining_percent: None,
+                    task_active_since_previous: Some(index % 2 == 0),
+                    models: None,
+                    models_complete: false,
+                    model_source: "legacy-unknown".to_owned(),
+                },
+            )
+            .collect::<Vec<_>>();
+        let mut details = codex_info_rest_contract::PublicDetails::default();
+        details
+            .history_periods
+            .push(codex_info_rest_contract::PublicHistoryPeriod {
+                id: reset_at.to_string(),
+                start_at,
+                end_at: start_at + 1_024 * 60,
+                reset_at,
+                label: "task page".to_owned(),
+                current: true,
+            });
+        let snapshot = PublishedSnapshot {
+            generation: 1,
+            data_hash: "hash".to_owned(),
+            pair: "pair".to_owned(),
+            has_pending_ranges: false,
+            details,
+            models_v3: Vec::new(),
+            history_samples_v2: Vec::new(),
+            history_samples_v3: history_samples,
+        };
+
+        let first: serde_json::Value = serde_json::from_slice(
+            &serialize_history(&snapshot, Some(&reset_at.to_string()), None)
+                .expect("first history page"),
+        )
+        .expect("first page JSON");
+        let second: serde_json::Value = serde_json::from_slice(
+            &serialize_history(&snapshot, Some(&reset_at.to_string()), Some(1_024))
+                .expect("second history page"),
+        )
+        .expect("second page JSON");
+
+        assert_eq!(first["history_samples"].as_array().unwrap().len(), 1_024);
+        assert_eq!(
+            first["history_samples"][1023]["task_active_since_previous"],
+            false
+        );
+        assert_eq!(first["next_cursor"], "1024");
+        assert_eq!(second["history_samples"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            second["history_samples"][0]["task_active_since_previous"],
+            true
+        );
+        assert_eq!(second["resume_cursor"], "1025");
     }
 
     #[test]
@@ -1001,13 +1378,10 @@ mod tests {
             .expect("model schema");
         connection
             .execute_batch(
-                "CREATE TABLE durable_state(
-                    singleton INTEGER PRIMARY KEY, data_generation INTEGER NOT NULL,
-                    data_hash TEXT NOT NULL, snapshot_json TEXT NOT NULL
-                );
-                INSERT INTO durable_state VALUES
-                    (2,1800000000,'history-observation',
-                     '{\"kind\":\"codex-info-usage-observation-v1\",\"timestamp\":1800000000,\"reset_at\":1800000060,\"remaining_percent\":50.0,\"sol_dollars\":1.0,\"terra_dollars\":2.0,\"luna_dollars\":3.0,\"sol_tokens\":10,\"terra_tokens\":20,\"luna_tokens\":30,\"model_source\":\"confirmed\"}');
+                "UPDATE durable_state SET
+                    data_hash='history-observation',
+                    snapshot_json='{\"kind\":\"codex-info-usage-observation-v1\",\"timestamp\":1800000000,\"reset_at\":1800000060,\"remaining_percent\":50.0,\"model_source\":\"confirmed\"}'
+                    WHERE singleton=2;
                 CREATE TABLE usage_model_history(
                     reset_at INTEGER NOT NULL, timestamp INTEGER NOT NULL,
                     model TEXT NOT NULL, total_tokens TEXT NOT NULL,
@@ -1067,6 +1441,7 @@ mod tests {
         assert!(v3["models"][2]["estimated_cost"].is_null());
         assert_eq!(v3["history_samples"][0]["model_source"], "confirmed");
         assert_eq!(v3["history_samples"][0]["models_complete"], true);
+        assert!(v3["history_samples"][0]["task_active_since_previous"].is_null());
         assert_eq!(
             v3["history_samples"][0]["models"]
                 .as_array()
@@ -1080,10 +1455,7 @@ mod tests {
             v3["history_samples"][0]["models"][0]["cache_write_input_tokens"],
             100_000
         );
-        assert_eq!(
-            v3["history_samples"][0]["models"][0]["total_dollars"],
-            13.45
-        );
+        assert!(v3["history_samples"][0]["models"][0]["total_dollars"].is_null());
         server.shutdown();
         fs::remove_file(path).expect("cleanup");
     }
@@ -1253,6 +1625,165 @@ mod tests {
         assert_eq!(recovered_json["state"], "ready");
         server.shutdown();
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn v3_account_selector_reads_each_partition_and_scopes_etag() {
+        let path_a = temp_db("accounts-a");
+        let path_b = temp_db("accounts-b");
+        fixture(&path_a, 10);
+        fixture(&path_b, 20);
+        let connection = Connection::open(&path_b).expect("account B fixture db");
+        connection
+            .execute_batch(
+                "UPDATE usage_history
+                    SET timestamp=1800000120, reset_at=1800000180;
+                 UPDATE collection_generation SET reset_at=1800000180;
+                 UPDATE durable_state SET
+                    data_generation=1800000120,
+                    snapshot_json='{\"kind\":\"codex-info-usage-observation-v1\",\"timestamp\":1800000120,\"reset_at\":1800000180,\"remaining_percent\":50.0,\"model_source\":\"legacy-unknown\"}'
+                    WHERE singleton=2;",
+            )
+            .expect("account B timestamp");
+        drop(connection);
+
+        let reader_a = DbReader::open(&path_a).expect("account A reader");
+        let reader_b = DbReader::open(&path_b).expect("account B reader");
+        let mut server = RestServer::start_with_accounts(
+            vec![
+                AccountReader::new("account-7", 7, true, Some(1_800_000_000), None, reader_a),
+                AccountReader::new("account-13", 13, false, None, None, reader_b),
+            ],
+            "account-7",
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .expect("multi-account server");
+
+        let accounts_response = request(
+            server.local_addr(),
+            "GET /v3/accounts HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        assert!(accounts_response.starts_with("HTTP/1.1 200"));
+        let accounts: serde_json::Value =
+            serde_json::from_str(body(&accounts_response)).expect("accounts JSON");
+        assert_eq!(accounts["api_version"], "v3");
+        assert_eq!(accounts["default_account_id"], "account-7");
+        assert_eq!(accounts["accounts"][0]["id"], "account-7");
+        assert_eq!(accounts["accounts"][0]["is_current"], true);
+        assert_eq!(accounts["accounts"][0]["activation_at"], 1_800_000_000_i64);
+        assert!(accounts["accounts"][0]["deactivation_at"].is_null());
+        assert_eq!(accounts["accounts"][1]["id"], "account-13");
+        assert_eq!(accounts["accounts"][1]["is_current"], false);
+        assert!(accounts["accounts"][1]["activation_at"].is_null());
+        assert!(accounts["accounts"][1]["deactivation_at"].is_null());
+
+        let default_response = request(
+            server.local_addr(),
+            "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        let default_json: serde_json::Value =
+            serde_json::from_str(body(&default_response)).expect("default current JSON");
+        assert_eq!(default_json["observed_at"], 1_800_000_000_i64);
+
+        let selected_response = request(
+            server.local_addr(),
+            "GET /v3/current?account=account-13 HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        let selected_json: serde_json::Value =
+            serde_json::from_str(body(&selected_response)).expect("selected current JSON");
+        assert_eq!(selected_json["observed_at"], 1_800_000_120_i64);
+
+        for target in [
+            "/v3/details?account=account-13",
+            "/v3/history/periods?account=account-13",
+            "/v3/threads?account=account-13",
+            "/v3/history?account=account-13&period=1800000180",
+        ] {
+            let response = request(
+                server.local_addr(),
+                &format!("GET {target} HTTP/1.1\r\nHost:x\r\n\r\n"),
+            );
+            assert!(response.starts_with("HTTP/1.1 200"), "{target}: {response}");
+        }
+
+        let default_details = request(
+            server.local_addr(),
+            "GET /v3/details HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        let selected_details = request(
+            server.local_addr(),
+            "GET /v3/details?account=account-13 HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        let default_pair = published_pair(&default_details).to_owned();
+        let selected_pair = published_pair(&selected_details).to_owned();
+        assert_ne!(default_pair, selected_pair);
+        assert!(default_pair.starts_with("v1:"));
+        assert!(selected_pair.starts_with("v1:"));
+        assert_eq!(default_pair.len(), 67);
+        assert_eq!(selected_pair.len(), 67);
+        assert_eq!(&default_pair[3..19], format!("{:016x}", 7));
+        assert_eq!(&selected_pair[3..19], format!("{:016x}", 13));
+        assert_eq!(&default_pair[19..35], &selected_pair[19..35]);
+        assert_ne!(&default_pair[35..], &selected_pair[35..]);
+        let cross_account_conditional = request(
+            server.local_addr(),
+            &format!(
+                "GET /v3/details?account=account-13 HTTP/1.1\r\nHost:x\r\nIf-None-Match: \"{default_pair}\"\r\n\r\n"
+            ),
+        );
+        assert!(cross_account_conditional.starts_with("HTTP/1.1 200"));
+
+        // A recorder rewrite that accidentally keeps the same generation is
+        // still a new content identity.  Simulate the process boundary by
+        // restarting REST after changing only the durable projection value,
+        // then prove the old pair cannot produce a false 304.
+        server.shutdown();
+        let connection = Connection::open(&path_b).expect("account B rewrite db");
+        connection
+            .execute("UPDATE usage_history SET sol_dollars=9.0", [])
+            .expect("same-generation content rewrite");
+        drop(connection);
+        let reader_a = DbReader::open(&path_a).expect("restarted account A reader");
+        let reader_b = DbReader::open(&path_b).expect("restarted account B reader");
+        let mut restarted = RestServer::start_with_accounts(
+            vec![
+                AccountReader::new("account-7", 7, true, Some(1_800_000_000), None, reader_a),
+                AccountReader::new("account-13", 13, false, None, None, reader_b),
+            ],
+            "account-7",
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .expect("restarted multi-account server");
+        let same_account_changed = request(
+            restarted.local_addr(),
+            &format!(
+                "GET /v3/details?account=account-13 HTTP/1.1\r\nHost:x\r\nIf-None-Match: \"{selected_pair}\"\r\n\r\n"
+            ),
+        );
+        assert!(same_account_changed.starts_with("HTTP/1.1 200"));
+        let rewritten_pair = published_pair(&same_account_changed);
+        assert_ne!(rewritten_pair, selected_pair);
+        assert_eq!(&rewritten_pair[3..19], &selected_pair[3..19]);
+        assert_eq!(&rewritten_pair[19..35], &selected_pair[19..35]);
+        assert_ne!(&rewritten_pair[35..], &selected_pair[35..]);
+
+        for target in [
+            "/v3/details?account=account-999",
+            "/v3/details?account=account-7&account=account-13",
+            "/v3/details?account=not-an-account",
+            "/v3/details?unknown=1",
+            "/v3/accounts?account=account-7",
+        ] {
+            let response = request(
+                restarted.local_addr(),
+                &format!("GET {target} HTTP/1.1\r\nHost:x\r\n\r\n"),
+            );
+            assert!(response.starts_with("HTTP/1.1 400"), "{target}: {response}");
+        }
+
+        restarted.shutdown();
+        fs::remove_file(path_a).expect("account A cleanup");
+        fs::remove_file(path_b).expect("account B cleanup");
     }
 
     #[test]

@@ -337,7 +337,7 @@ internal static class GraphPlotProjection
             var current = RemainingValue(scene, index);
             var elapsed = scene.Timestamps[index] - scene.Timestamps[previous];
             var contiguous = index == previous + 1;
-            if (scene.HasHardBreakBetween(
+            if (scene.HasRemainingHardBreakBetween(
                     scene.Timestamps[previous],
                     scene.Timestamps[index]))
             {
@@ -394,7 +394,7 @@ internal static class GraphPlotProjection
     }
 
     private static bool RemainingOriginHasMeasuredQuota(GraphRemainingOrigin origin) =>
-        origin is GraphRemainingOrigin.Raw or GraphRemainingOrigin.ActivitySmoothed;
+        origin is GraphRemainingOrigin.Raw;
 
     /// <summary>
     /// Projects the flat, rising, and inferred cumulative-model paths used by
@@ -435,7 +435,7 @@ internal static class GraphPlotProjection
             var startAt = scene.Timestamps[previous];
             var endAt = scene.Timestamps[index];
             var elapsed = endAt - startAt;
-            if (scene.HasHardBreakBetween(startAt, endAt))
+            if (scene.HasModelHardBreakBetween(values, startAt, endAt))
             {
                 AppendSegment(dashedX, dashedY, startAt, before, endAt, value);
                 previous = index;

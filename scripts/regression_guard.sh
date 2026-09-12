@@ -65,8 +65,8 @@ case "$1" in
             graph_parity_v3_fixture_drives_linux_production_projection
             graph_continuity_v4_fixture_matches_values_roles_idle_and_period_end
             graph_idle_counterexamples_are_token_based_and_metric_specific
-            graph_remaining_smoothing_distributes_only_across_token_active_seconds
-            graph_long_history_keeps_one_continuous_idle_band_without_pixel_cadence
+            graph_remaining_smoothing_uses_coherent_token_deltas_or_elapsed_fallback
+            graph_collision_preview_matches_the_historical_singleton_oracle
             graph_correction_fixture_holds_regressions_without_a_vertical_drop
             graph_oracle_distinguishes_unconfirmed_regression_from_confirmed_correction
             graph_oracle_preserves_raw_quota_increase_but_displays_monotonic_hold
@@ -83,7 +83,7 @@ case "$1" in
             run_exact_test --bin=codex_info "tests::$test_name"
         done
         for test_name in "${store_tests[@]}"; do
-            run_exact_test --test=usage_store "wave_b_correction_tests::$test_name"
+            run_exact_test --package=codex-info-db-writer "wave_b_correction_tests::$test_name"
         done
         echo 'regression-guard: PASS check=rust-history-graph cases=27'
         ;;
@@ -114,7 +114,7 @@ case "$1" in
             run_exact_test --lib "server::tests::$test_name"
         done
         for test_name in "${store_tests[@]}"; do
-            run_exact_test --lib "usage_store::tests::$test_name"
+            run_exact_test --package=codex-info-db-writer "tests::$test_name"
         done
         echo 'regression-guard: PASS check=rust-model-history cases=13'
         ;;

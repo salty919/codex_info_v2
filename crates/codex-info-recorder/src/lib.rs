@@ -8,14 +8,15 @@
 #![deny(unsafe_code)]
 
 use chrono::{DateTime, Months, Utc};
-use codex_info::{security, thread_contract};
+use codex_info::{protocol_contract, security, thread_contract};
 use codex_info_db_writer::{
-    canonical_reset_period, classify_quota_transition, finalize_session_timeline_recovery,
-    ActiveThreadRecord, ActiveThreadSnapshot, QuotaTransition, RecordedSessionSource,
-    SessionCheckpoint, SessionCollectionCommit, SessionCollectionState, SessionEvent,
-    SessionModelTotal, SessionPendingRange, SessionRange, SessionTimelineRecovery,
-    SessionTimelineRecoveryPoint, StoragePartitionIdentity, UsageHistoryObservation,
-    UsageHistorySample, UsageStore, UsageStoreError,
+    classify_quota_transition, finalize_session_timeline_recovery, ActiveThreadRecord,
+    ActiveThreadSnapshot, QuotaTransition, RecordedSessionSource, SessionCheckpoint,
+    SessionCollectionCommit, SessionCollectionState, SessionEvent, SessionModelTotal,
+    SessionPendingRange, SessionRange, SessionTaskEvent, SessionTaskEvidenceInput,
+    SessionTaskIndexedRange, SessionTimelineRecovery, SessionTimelineRecoveryPoint,
+    StoragePartitionIdentity, UsageHistoryObservation, UsageHistorySample, UsageStore,
+    UsageStoreError,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -25,7 +26,9 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+use std::sync::{RwLock, RwLockReadGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -48,13 +51,26 @@ const MAX_CODEX_PROCESS_FDS: usize = 16_384;
 const MAX_OPEN_SESSION_FILES: usize = 1_024;
 const MAX_ACTIVE_THREAD_ROWS: usize = 256;
 const MAX_THREAD_CHECKPOINTS: usize = 65_536;
+const MAX_LOGIN_ID_SCALARS: usize = 254;
+const AUTH_FILE_NAME: &str = "auth.json";
+const MAX_AUTH_FILE_BYTES: usize = 64 * 1024;
+const MAX_ACCOUNT_ID_BYTES: usize = 512;
+// A currently open rollout can use the modern stream format, which has no
+// task_started/task_complete records.  Two recorder cycles cover the race in
+// which the durable scanner reaches EOF immediately before the thread poll.
+const OPEN_ROLLOUT_ACTIVITY_WINDOW: Duration =
+    Duration::from_secs(DEFAULT_INTERVAL_SECS.saturating_mul(2));
 const MAX_THREAD_ID_SCALARS: usize = 128;
+const MAX_TASK_BACKFILL_TARGETS: usize = 4_096;
+const MAX_RECORDER_STATE_BYTES: u64 = 64 * 1024;
+const RECORDER_STATE_SCHEMA: &str = "codex-info-recorder-state-v1";
 
 #[derive(Debug)]
 pub enum RecorderError {
     Io(io::Error),
     Writer(UsageStoreError),
     Invalid(String),
+    AccountBoundaryChanged,
 }
 
 impl fmt::Display for RecorderError {
@@ -63,6 +79,9 @@ impl fmt::Display for RecorderError {
             Self::Io(error) => write!(formatter, "recorder I/O error: {error}"),
             Self::Writer(error) => write!(formatter, "recorder writer error: {error}"),
             Self::Invalid(error) => formatter.write_str(error),
+            Self::AccountBoundaryChanged => {
+                formatter.write_str("Codex account authority changed before recorder commit")
+            }
         }
     }
 }
@@ -78,6 +97,231 @@ impl From<io::Error> for RecorderError {
 impl From<UsageStoreError> for RecorderError {
     fn from(error: UsageStoreError) -> Self {
         Self::Writer(error)
+    }
+}
+
+// The account worker and the recorder share no mutable account object.  A
+// short-lived app-server identity change therefore has to be visible to the
+// recorder's final commit guard without carrying the raw account key across
+// the public event surface.  The bit is process-local and intentionally never
+// cleared in production: the owning daemon exits at this boundary and starts
+// a new identity window after the account locator has selected the partition.
+static APP_SERVER_ACCOUNT_BOUNDARY_CHANGED: AtomicBool = AtomicBool::new(false);
+static APP_SERVER_ACCOUNT_BOUNDARY_PENDING: AtomicBool = AtomicBool::new(false);
+static APP_SERVER_ACCOUNT_BOUNDARY_GENERATION: AtomicU64 = AtomicU64::new(0);
+static APP_SERVER_ACCOUNT_COMMIT_FENCE: RwLock<()> = RwLock::new(());
+
+fn signal_account_boundary_changed() {
+    // Prevent a later reader from overtaking this boundary even on an
+    // implementation whose RwLock does not guarantee writer preference.
+    APP_SERVER_ACCOUNT_BOUNDARY_PENDING.store(true, Ordering::Release);
+    let _fence = APP_SERVER_ACCOUNT_COMMIT_FENCE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !APP_SERVER_ACCOUNT_BOUNDARY_CHANGED.swap(true, Ordering::AcqRel) {
+        APP_SERVER_ACCOUNT_BOUNDARY_GENERATION.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+fn account_boundary_changed() -> bool {
+    APP_SERVER_ACCOUNT_BOUNDARY_PENDING.load(Ordering::Acquire)
+        || APP_SERVER_ACCOUNT_BOUNDARY_CHANGED.load(Ordering::Acquire)
+}
+
+fn account_boundary_generation() -> u64 {
+    APP_SERVER_ACCOUNT_BOUNDARY_GENERATION.load(Ordering::Acquire)
+}
+
+/// Linearize each durable mutation against an in-process account/updated
+/// notification. A writer that acquires the fence first belongs to the old
+/// epoch; a notification that acquires it first prevents every later write.
+fn account_epoch_commit_fence() -> Result<RwLockReadGuard<'static, ()>, RecorderError> {
+    let fence = APP_SERVER_ACCOUNT_COMMIT_FENCE.read().map_err(|_| {
+        RecorderError::Invalid("Codex account commit fence is unavailable".to_owned())
+    })?;
+    if account_boundary_changed() {
+        return Err(RecorderError::AccountBoundaryChanged);
+    }
+    Ok(fence)
+}
+
+#[cfg(test)]
+fn clear_account_boundary_changed() {
+    let _fence = APP_SERVER_ACCOUNT_COMMIT_FENCE
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    APP_SERVER_ACCOUNT_BOUNDARY_CHANGED.store(false, Ordering::Release);
+    APP_SERVER_ACCOUNT_BOUNDARY_PENDING.store(false, Ordering::Release);
+}
+
+/// The raw `tokens.account_id` is an authority input only.  It must never
+/// acquire a formatting implementation that could accidentally put it in a
+/// log line, panic payload, or test failure.
+#[derive(Clone, Eq, PartialEq)]
+struct AccountAuthorityId(Vec<u8>);
+
+impl fmt::Debug for AccountAuthorityId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AccountAuthorityId([redacted])")
+    }
+}
+
+impl AccountAuthorityId {
+    fn from_str(value: &str) -> Result<Self, String> {
+        if value.is_empty()
+            || value.len() > MAX_ACCOUNT_ID_BYTES
+            || value.chars().any(char::is_control)
+        {
+            return Err("Codex account authority is invalid".to_owned());
+        }
+        Ok(Self(value.as_bytes().to_vec()))
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct AccountAuthority {
+    account_id: AccountAuthorityId,
+}
+
+impl fmt::Debug for AccountAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AccountAuthority([redacted])")
+    }
+}
+
+/// Opaque proof that an asynchronous result was produced inside one stable
+/// authenticated recorder epoch. The raw authority is retained only for an
+/// exact in-memory comparison and is always redacted from diagnostics.
+#[derive(Clone, Eq, PartialEq)]
+pub struct AccountEpochProof {
+    authority: AccountAuthority,
+    boundary_generation: u64,
+}
+
+impl fmt::Debug for AccountEpochProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AccountEpochProof([redacted])")
+    }
+}
+
+impl AccountEpochProof {
+    fn from_verified_authority(authority: AccountAuthority) -> Result<Self, String> {
+        let boundary_generation = account_boundary_generation();
+        if account_boundary_changed() || account_boundary_generation() != boundary_generation {
+            return Err("Codex account epoch changed while being captured".to_owned());
+        }
+        Ok(Self {
+            authority,
+            boundary_generation,
+        })
+    }
+
+    pub fn capture(codex_home: &Path) -> Result<Self, String> {
+        let generation_before = account_boundary_generation();
+        if account_boundary_changed() {
+            return Err("Codex account epoch is no longer current".to_owned());
+        }
+        let authority = read_account_authority(codex_home)?;
+        if account_boundary_changed() || account_boundary_generation() != generation_before {
+            return Err("Codex account epoch changed while being captured".to_owned());
+        }
+        Ok(Self {
+            authority,
+            boundary_generation: generation_before,
+        })
+    }
+
+    /// Re-read the exact authority at an admission boundary. The daemon owns
+    /// the resulting process exit; this value never exposes the raw identity.
+    pub fn validate_current(&self, codex_home: &Path) -> bool {
+        if account_boundary_changed() || account_boundary_generation() != self.boundary_generation {
+            return false;
+        }
+        read_account_authority(codex_home).is_ok_and(|authority| {
+            authority == self.authority
+                && !account_boundary_changed()
+                && account_boundary_generation() == self.boundary_generation
+        })
+    }
+
+    /// Run one bounded non-SQLite metadata mutation in the same linearized
+    /// epoch as recorder commits. This is intentionally used only for the
+    /// account registry label written from an already-validated quota result.
+    pub fn run_if_current<T>(
+        &self,
+        codex_home: &Path,
+        operation: impl FnOnce() -> T,
+    ) -> Result<T, RecorderError> {
+        let _epoch_fence = account_epoch_commit_fence()?;
+        if !self.validate_current(codex_home) {
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
+        Ok(operation())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AccountUpdateTracker {
+    generation: u64,
+    valid: bool,
+    signal_boundary: bool,
+}
+
+impl Default for AccountUpdateTracker {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            valid: true,
+            signal_boundary: false,
+        }
+    }
+}
+
+impl AccountUpdateTracker {
+    fn for_app_server() -> Self {
+        Self {
+            signal_boundary: true,
+            ..Self::default()
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.valid = false;
+        if self.signal_boundary {
+            signal_account_boundary_changed();
+        }
+    }
+
+    /// Consume one JSON-RPC line before request-id matching.  Notifications
+    /// are out-of-band responses and must not be silently discarded while a
+    /// quota or thread request is in flight.
+    fn observe(&mut self, value: &Value, raw: &str) -> Result<bool, String> {
+        if !value.is_object() {
+            return Ok(false);
+        }
+        let is_account_updated = protocol_contract::is_account_updated_notification_json(raw)
+            .map_err(|_| {
+                self.invalidate();
+                "Codex account update notification is invalid".to_owned()
+            })?;
+        if !is_account_updated {
+            return Ok(false);
+        }
+        if !self.valid
+            || protocol_contract::validate_account_updated_notification_json(raw).is_err()
+        {
+            self.invalidate();
+            return Err("Codex account update notification is invalid".to_owned());
+        }
+        let Some(generation) = self.generation.checked_add(1) else {
+            self.invalidate();
+            return Err("Codex account update generation is exhausted".to_owned());
+        };
+        self.generation = generation;
+        if self.signal_boundary {
+            signal_account_boundary_changed();
+        }
+        Ok(true)
     }
 }
 
@@ -122,15 +366,66 @@ pub struct QuotaSnapshot {
     pub remaining_percent: Option<f64>,
 }
 
-type QuotaPollResult = Result<QuotaSnapshot, String>;
+#[derive(Clone, PartialEq)]
+struct QuotaPollSuccess {
+    snapshot: QuotaSnapshot,
+    login_id: String,
+    epoch: AccountEpochProof,
+}
+
+impl fmt::Debug for QuotaPollSuccess {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QuotaPollSuccess")
+            .field("snapshot", &self.snapshot)
+            .field("login_id", &"[redacted]")
+            .field("epoch", &self.epoch)
+            .finish()
+    }
+}
+
+type QuotaPollResult = Result<QuotaPollSuccess, String>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuotaPollCandidate {
+    snapshot: QuotaSnapshot,
+    epoch: AccountEpochProof,
+}
+
+impl QuotaPollCandidate {
+    pub fn snapshot(&self) -> &QuotaSnapshot {
+        &self.snapshot
+    }
+
+    pub fn validate_current(&self, codex_home: &Path) -> bool {
+        self.epoch.validate_current(codex_home)
+    }
+}
 
 /// Health transitions from the isolated quota lane. The payload is retained
 /// only for a successful observation; failures are intentionally categorical
 /// so a malformed app-server response cannot leak into recorder diagnostics.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum QuotaPollEvent {
-    Ready(QuotaSnapshot),
+    Ready {
+        snapshot: QuotaSnapshot,
+        login_id: String,
+        epoch: AccountEpochProof,
+    },
     Failed,
+}
+
+impl fmt::Debug for QuotaPollEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ready { snapshot, .. } => formatter
+                .debug_struct("QuotaPollEvent::Ready")
+                .field("snapshot", snapshot)
+                .field("login_id", &"[redacted]")
+                .finish(),
+            Self::Failed => formatter.write_str("QuotaPollEvent::Failed"),
+        }
+    }
 }
 
 /// Polls the Codex app-server in a lane independent of Session collection.
@@ -139,7 +434,7 @@ pub enum QuotaPollEvent {
 pub struct QuotaPoller {
     receiver: Receiver<QuotaPollResult>,
     _worker: JoinHandle<()>,
-    latest: Option<QuotaSnapshot>,
+    latest: Option<QuotaPollCandidate>,
     events: Vec<QuotaPollEvent>,
 }
 
@@ -170,12 +465,19 @@ impl QuotaPoller {
         }
     }
 
-    pub fn latest(&mut self) -> Option<QuotaSnapshot> {
+    pub fn latest(&mut self) -> Option<QuotaPollCandidate> {
         while let Ok(result) = self.receiver.try_recv() {
             match result {
-                Ok(snapshot) => {
-                    self.latest = Some(snapshot.clone());
-                    self.events.push(QuotaPollEvent::Ready(snapshot));
+                Ok(success) => {
+                    self.latest = Some(QuotaPollCandidate {
+                        snapshot: success.snapshot.clone(),
+                        epoch: success.epoch.clone(),
+                    });
+                    self.events.push(QuotaPollEvent::Ready {
+                        snapshot: success.snapshot,
+                        login_id: success.login_id,
+                        epoch: success.epoch,
+                    });
                 }
                 Err(error) => {
                     eprintln!("recorder degraded: quota poll failed: {error}");
@@ -196,8 +498,13 @@ impl QuotaPoller {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActiveThreadPollResult {
-    Snapshot(ActiveThreadSnapshot),
-    Empty,
+    Snapshot {
+        snapshot: ActiveThreadSnapshot,
+        epoch: AccountEpochProof,
+    },
+    Empty {
+        epoch: AccountEpochProof,
+    },
     Failed(String),
 }
 
@@ -252,13 +559,342 @@ impl ThreadPoller {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 struct AppServerAccount {
     email: String,
     plan_type: String,
 }
 
+impl fmt::Debug for AppServerAccount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AppServerAccount([redacted])")
+    }
+}
+
+/// One authenticated app-server collection window.  The local auth key,
+/// account/read identity, and process-local notification generation are one
+/// invariant: all three must remain unchanged from the first account/read
+/// through the final account/read before a quota/thread result is admitted.
+#[derive(Clone, Eq, PartialEq)]
+struct AccountIdentityWindow {
+    authority: AccountAuthority,
+    account: AppServerAccount,
+    update_generation: u64,
+}
+
+impl fmt::Debug for AccountIdentityWindow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AccountIdentityWindow([redacted])")
+    }
+}
+
+impl AccountIdentityWindow {
+    fn new(authority: AccountAuthority, account: AppServerAccount, update_generation: u64) -> Self {
+        Self {
+            authority,
+            account,
+            update_generation,
+        }
+    }
+
+    fn is_stable(
+        &self,
+        authority: &AccountAuthority,
+        account: &AppServerAccount,
+        updates: &AccountUpdateTracker,
+    ) -> bool {
+        updates.valid
+            && updates.generation == self.update_generation
+            && self.authority == *authority
+            && self.account == *account
+    }
+}
+
+fn default_codex_home() -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+        .unwrap_or_else(|| PathBuf::from(".codex"))
+}
+
+fn read_account_authority(codex_home: &Path) -> Result<AccountAuthority, String> {
+    let root = security::validate_absolute_root(codex_home)
+        .map_err(|_| "Codex account authority is unavailable".to_owned())?;
+    let bytes = read_stable_auth_file(&root.join(AUTH_FILE_NAME))?;
+    parse_account_authority(&bytes)
+}
+
+#[cfg(unix)]
+fn private_auth_directory(metadata: &Metadata) -> bool {
+    metadata.is_dir()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == rustix::process::geteuid().as_raw()
+        && metadata.mode() & 0o777 == 0o700
+}
+
+#[cfg(unix)]
+fn private_auth_file(metadata: &Metadata) -> bool {
+    metadata.is_file()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == rustix::process::geteuid().as_raw()
+        && metadata.mode() & 0o777 == 0o600
+        && (1..=MAX_AUTH_FILE_BYTES as u64).contains(&metadata.len())
+}
+
+#[cfg(unix)]
+fn same_private_auth_file(before: &Metadata, opened: &Metadata, after: &Metadata) -> bool {
+    before.dev() == opened.dev()
+        && before.ino() == opened.ino()
+        && before.len() == opened.len()
+        && before.uid() == opened.uid()
+        && before.mode() == opened.mode()
+        && before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.uid() == after.uid()
+        && before.mode() == after.mode()
+}
+
+#[cfg(unix)]
+fn read_stable_auth_file(path: &Path) -> Result<Vec<u8>, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Codex account authority is unavailable".to_owned())?;
+    let root_before = fs::symlink_metadata(parent)
+        .map_err(|_| "Codex account authority is unavailable".to_owned())?;
+    if !private_auth_directory(&root_before) {
+        return Err("Codex account authority is unavailable".to_owned());
+    }
+    let before = fs::symlink_metadata(path)
+        .map_err(|_| "Codex account authority is unavailable".to_owned())?;
+    if !private_auth_file(&before) {
+        return Err("Codex account authority is unavailable".to_owned());
+    }
+
+    let fd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|_| "Codex account authority is unavailable".to_owned())?;
+    let mut file = File::from(fd);
+    let opened = file
+        .metadata()
+        .map_err(|_| "Codex account authority is unavailable".to_owned())?;
+    if !private_auth_file(&opened) {
+        return Err("Codex account authority is unavailable".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_AUTH_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Codex account authority is unavailable".to_owned())?;
+    let after = fs::symlink_metadata(path)
+        .map_err(|_| "Codex account authority is unavailable".to_owned())?;
+    let root_after = fs::symlink_metadata(parent)
+        .map_err(|_| "Codex account authority is unavailable".to_owned())?;
+    if bytes.len() as u64 != opened.len()
+        || !private_auth_file(&after)
+        || !same_private_auth_file(&before, &opened, &after)
+        || !private_auth_directory(&root_after)
+        || root_before.dev() != root_after.dev()
+        || root_before.ino() != root_after.ino()
+    {
+        return Err("Codex account authority changed while being read".to_owned());
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_stable_auth_file(_path: &Path) -> Result<Vec<u8>, String> {
+    Err("Codex account authority is unavailable".to_owned())
+}
+
+fn parse_account_authority(bytes: &[u8]) -> Result<AccountAuthority, String> {
+    if bytes.is_empty() || bytes.len() > MAX_AUTH_FILE_BYTES {
+        return Err("Codex account authority is invalid".to_owned());
+    }
+    reject_duplicate_json_keys(bytes)
+        .map_err(|_| "Codex account authority is invalid".to_owned())?;
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|_| "Codex account authority is invalid".to_owned())?;
+    let account_id = value
+        .as_object()
+        .and_then(|object| object.get("tokens"))
+        .and_then(Value::as_object)
+        .and_then(|tokens| tokens.get("account_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Codex account authority is invalid".to_owned())?;
+    Ok(AccountAuthority {
+        account_id: AccountAuthorityId::from_str(account_id)?,
+    })
+}
+
+const MAX_AUTH_JSON_DEPTH: usize = 128;
+
+struct AuthJsonKeyScanner<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    depth: usize,
+}
+
+impl<'a> AuthJsonKeyScanner<'a> {
+    fn scan(mut self) -> Result<(), ()> {
+        self.scan_value()?;
+        self.skip_whitespace();
+        (self.offset == self.bytes.len()).then_some(()).ok_or(())
+    }
+
+    fn scan_value(&mut self) -> Result<(), ()> {
+        self.skip_whitespace();
+        match self.bytes.get(self.offset).copied() {
+            Some(b'"') => self.scan_string().map(|_| ()),
+            Some(b'{') => self.scan_object(),
+            Some(b'[') => self.scan_array(),
+            Some(_) => self.scan_scalar(),
+            None => Err(()),
+        }
+    }
+
+    fn scan_object(&mut self) -> Result<(), ()> {
+        self.enter_container()?;
+        self.offset += 1;
+        self.skip_whitespace();
+        let result = if self.consume(b'}') {
+            Ok(())
+        } else {
+            let mut keys = BTreeSet::new();
+            loop {
+                self.skip_whitespace();
+                let start = self.offset;
+                self.scan_string()?;
+                let key = serde_json::from_slice::<String>(&self.bytes[start..self.offset])
+                    .map_err(|_| ())?;
+                if !keys.insert(key) {
+                    return Err(());
+                }
+                self.skip_whitespace();
+                if !self.consume(b':') {
+                    return Err(());
+                }
+                self.scan_value()?;
+                self.skip_whitespace();
+                if self.consume(b'}') {
+                    break Ok(());
+                }
+                if !self.consume(b',') {
+                    return Err(());
+                }
+            }
+        };
+        self.leave_container();
+        result
+    }
+
+    fn scan_array(&mut self) -> Result<(), ()> {
+        self.enter_container()?;
+        self.offset += 1;
+        self.skip_whitespace();
+        let result = if self.consume(b']') {
+            Ok(())
+        } else {
+            loop {
+                self.scan_value()?;
+                self.skip_whitespace();
+                if self.consume(b']') {
+                    break Ok(());
+                }
+                if !self.consume(b',') {
+                    return Err(());
+                }
+            }
+        };
+        self.leave_container();
+        result
+    }
+
+    fn scan_string(&mut self) -> Result<usize, ()> {
+        let start = self.offset;
+        if !self.consume(b'"') {
+            return Err(());
+        }
+        while let Some(byte) = self.bytes.get(self.offset).copied() {
+            self.offset += 1;
+            match byte {
+                b'"' => return Ok(start),
+                b'\\' => {
+                    if self.offset >= self.bytes.len() {
+                        return Err(());
+                    }
+                    self.offset += 1;
+                }
+                byte if byte < 0x20 => return Err(()),
+                _ => {}
+            }
+        }
+        Err(())
+    }
+
+    fn scan_scalar(&mut self) -> Result<(), ()> {
+        let start = self.offset;
+        while let Some(byte) = self.bytes.get(self.offset).copied() {
+            if matches!(byte, b' ' | b'\n' | b'\r' | b'\t' | b',' | b']' | b'}') {
+                break;
+            }
+            self.offset += 1;
+        }
+        (self.offset > start).then_some(()).ok_or(())
+    }
+
+    fn enter_container(&mut self) -> Result<(), ()> {
+        self.depth = self.depth.checked_add(1).ok_or(())?;
+        if self.depth > MAX_AUTH_JSON_DEPTH {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn leave_container(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .bytes
+            .get(self.offset)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+        {
+            self.offset += 1;
+        }
+    }
+
+    fn consume(&mut self, expected: u8) -> bool {
+        if self.bytes.get(self.offset).copied() == Some(expected) {
+            self.offset += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn reject_duplicate_json_keys(bytes: &[u8]) -> Result<(), ()> {
+    AuthJsonKeyScanner {
+        bytes,
+        offset: 0,
+        depth: 0,
+    }
+    .scan()
+}
+
 fn fetch_quota_snapshot() -> QuotaPollResult {
+    let authority_before = match read_account_authority(&default_codex_home()) {
+        Ok(authority) => authority,
+        Err(error) => {
+            signal_account_boundary_changed();
+            return Err(error);
+        }
+    };
     let executable = resolve_codex_executable()?;
     let mut child = Command::new(executable)
         .args(["app-server", "--stdio"])
@@ -280,6 +916,7 @@ fn fetch_quota_snapshot() -> QuotaPollResult {
     };
     let output = app_server_reader(stdout);
     let result = (|| {
+        let mut account_updates = AccountUpdateTracker::for_app_server();
         request_app_server(
             &mut input,
             &output,
@@ -292,23 +929,59 @@ fn fetch_quota_snapshot() -> QuotaPollResult {
                 },
                 "capabilities": {"experimentalApi": true}
             }),
+            &mut account_updates,
         )?;
-        let account_value = request_app_server(&mut input, &output, 2, "account/read", json!({}))?;
+        let generation_before_read = account_updates.generation;
+        let account_value = request_app_server(
+            &mut input,
+            &output,
+            2,
+            "account/read",
+            json!({}),
+            &mut account_updates,
+        )?;
+        if !account_updates.valid || account_updates.generation != generation_before_read {
+            signal_account_boundary_changed();
+            return Err("Codex account identity changed during account read".to_owned());
+        }
         let account = decode_app_server_account(&account_value)?;
+        let identity = AccountIdentityWindow::new(
+            authority_before.clone(),
+            account.clone(),
+            account_updates.generation,
+        );
         let rate_limits = request_app_server(
             &mut input,
             &output,
             3,
             "account/rateLimits/read",
             Value::Null,
+            &mut account_updates,
         )?;
         let snapshot = parse_app_server_quota(&rate_limits, &account.plan_type)?;
-        let account_recheck =
-            request_app_server(&mut input, &output, 4, "account/read", json!({}))?;
-        if decode_app_server_account(&account_recheck)? != account {
+        let account_recheck = request_app_server(
+            &mut input,
+            &output,
+            4,
+            "account/read",
+            json!({}),
+            &mut account_updates,
+        )?;
+        let account_after = decode_app_server_account(&account_recheck)?;
+        let authority_after = read_account_authority(&default_codex_home()).map_err(|_| {
+            signal_account_boundary_changed();
+            "Codex account identity changed during quota read".to_owned()
+        })?;
+        if !identity.is_stable(&authority_after, &account_after, &account_updates) {
+            signal_account_boundary_changed();
             return Err("Codex account identity changed during quota read".to_owned());
         }
-        Ok(snapshot)
+        let epoch = AccountEpochProof::from_verified_authority(authority_after)?;
+        Ok(QuotaPollSuccess {
+            snapshot,
+            login_id: account.email,
+            epoch,
+        })
     })();
     drop(input);
     // The recorder owns this short-lived app-server connection. Reap it on
@@ -419,6 +1092,7 @@ fn request_app_server(
     id: u64,
     method: &str,
     params: Value,
+    account_updates: &mut AccountUpdateTracker,
 ) -> Result<Value, String> {
     request_app_server_before_deadline(
         input,
@@ -427,6 +1101,7 @@ fn request_app_server(
         method,
         params,
         Instant::now() + APP_SERVER_RESPONSE_TIMEOUT,
+        account_updates,
     )
 }
 
@@ -437,6 +1112,7 @@ fn request_app_server_before_deadline(
     method: &str,
     params: Value,
     deadline: Instant,
+    account_updates: &mut AccountUpdateTracker,
 ) -> Result<Value, String> {
     let message = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
     writeln!(input, "{message}")
@@ -467,6 +1143,9 @@ fn request_app_server_before_deadline(
                 continue;
             }
         };
+        if account_updates.observe(&value, &line)? {
+            continue;
+        }
         if value.get("id").and_then(Value::as_u64) != Some(id) {
             ignored = ignored.saturating_add(1);
             if ignored > APP_SERVER_MAX_IGNORED_MESSAGES {
@@ -490,7 +1169,13 @@ fn collect_active_thread_snapshot(
         Err(error) => return ActiveThreadPollResult::Failed(error),
     };
     if active_paths.is_empty() {
-        return ActiveThreadPollResult::Empty;
+        return match AccountEpochProof::capture(&default_codex_home()) {
+            Ok(epoch) => ActiveThreadPollResult::Empty { epoch },
+            Err(error) => {
+                signal_account_boundary_changed();
+                ActiveThreadPollResult::Failed(error)
+            }
+        };
     }
 
     let root_metadata = match fs::metadata(&sessions_root) {
@@ -543,6 +1228,13 @@ fn collect_active_thread_snapshot(
             )
         }
     };
+    let authority_before = match read_account_authority(&default_codex_home()) {
+        Ok(authority) => authority,
+        Err(error) => {
+            signal_account_boundary_changed();
+            return ActiveThreadPollResult::Failed(error);
+        }
+    };
     let mut child = match Command::new(executable)
         .args(["app-server", "--stdio"])
         .stdin(Stdio::piped())
@@ -568,6 +1260,7 @@ fn collect_active_thread_snapshot(
     };
     let output = app_server_reader(stdout);
     let result = (|| {
+        let mut account_updates = AccountUpdateTracker::for_app_server();
         request_app_server_before_deadline(
             &mut input,
             &output,
@@ -581,8 +1274,29 @@ fn collect_active_thread_snapshot(
                 "capabilities": {"experimentalApi": true}
             }),
             deadline,
+            &mut account_updates,
         )?;
-        let mut next_request_id = 2_u64;
+        let generation_before_read = account_updates.generation;
+        let account_value = request_app_server_before_deadline(
+            &mut input,
+            &output,
+            2,
+            "account/read",
+            json!({}),
+            deadline,
+            &mut account_updates,
+        )?;
+        if !account_updates.valid || account_updates.generation != generation_before_read {
+            signal_account_boundary_changed();
+            return Err("Codex account identity changed during thread read".to_owned());
+        }
+        let account = decode_app_server_account(&account_value)?;
+        let identity = AccountIdentityWindow::new(
+            authority_before.clone(),
+            account,
+            account_updates.generation,
+        );
+        let mut next_request_id = 3_u64;
         let mut seen_ids = BTreeSet::new();
         let mut rollouts = BTreeMap::new();
         let mut thread_items = Vec::with_capacity(candidates.len());
@@ -599,6 +1313,7 @@ fn collect_active_thread_snapshot(
                 "thread/read",
                 json!({"threadId": thread_id, "includeTurns": false}),
                 deadline,
+                &mut account_updates,
             )?;
             let result_object = result
                 .as_object()
@@ -624,6 +1339,25 @@ fn collect_active_thread_snapshot(
             rollouts.insert(thread_id.clone(), rollout);
             thread_items.push(thread_item.clone());
         }
+        let account_recheck = request_app_server_before_deadline(
+            &mut input,
+            &output,
+            next_request_id,
+            "account/read",
+            json!({}),
+            deadline,
+            &mut account_updates,
+        )?;
+        let account_after = decode_app_server_account(&account_recheck)?;
+        let authority_after = read_account_authority(&default_codex_home()).map_err(|_| {
+            signal_account_boundary_changed();
+            "Codex account identity changed during thread read".to_owned()
+        })?;
+        if !identity.is_stable(&authority_after, &account_after, &account_updates) {
+            signal_account_boundary_changed();
+            return Err("Codex account identity changed during thread read".to_owned());
+        }
+        let epoch = AccountEpochProof::from_verified_authority(authority_after)?;
         let mut accumulator = thread_contract::ThreadCycleAccumulator::new();
         accumulator
             .accept_page(&json!({"data": thread_items}))
@@ -652,34 +1386,40 @@ fn collect_active_thread_snapshot(
                 return Err("active thread cycle rejected".to_owned())
             }
         };
-        Ok(snapshots
-            .into_iter()
-            .map(|snapshot| ActiveThreadRecord {
-                id: snapshot.thread_id,
-                title: snapshot.title,
-                model: snapshot.model,
-                model_label: snapshot.model_label,
-                created_at: Some(snapshot.created_at),
-                updated_at: snapshot.updated_at,
-                last_user_message_at: snapshot.last_user_message_at,
-                total_tokens: snapshot.total_tokens,
-                context_usage_tokens: snapshot.context_usage_tokens,
-                context_window_tokens: snapshot.context_window_tokens,
-                is_subagent: snapshot.is_subagent,
-                parent_thread_id: snapshot.parent_thread_id,
-                depth: snapshot.depth,
-            })
-            .collect::<Vec<_>>())
+        Ok((
+            snapshots
+                .into_iter()
+                .map(|snapshot| ActiveThreadRecord {
+                    id: snapshot.thread_id,
+                    title: snapshot.title,
+                    model: snapshot.model,
+                    model_label: snapshot.model_label,
+                    created_at: Some(snapshot.created_at),
+                    updated_at: snapshot.updated_at,
+                    last_user_message_at: snapshot.last_user_message_at,
+                    total_tokens: snapshot.total_tokens,
+                    context_usage_tokens: snapshot.context_usage_tokens,
+                    context_window_tokens: snapshot.context_window_tokens,
+                    is_subagent: snapshot.is_subagent,
+                    parent_thread_id: snapshot.parent_thread_id,
+                    depth: snapshot.depth,
+                })
+                .collect::<Vec<_>>(),
+            epoch,
+        ))
     })();
     drop(input);
     let _ = child.kill();
     let _ = child.wait();
     match result {
-        Ok(threads) if threads.is_empty() => ActiveThreadPollResult::Empty,
-        Ok(threads) => ActiveThreadPollResult::Snapshot(ActiveThreadSnapshot {
-            observed_at: Utc::now().timestamp(),
-            threads,
-        }),
+        Ok((threads, epoch)) if threads.is_empty() => ActiveThreadPollResult::Empty { epoch },
+        Ok((threads, epoch)) => ActiveThreadPollResult::Snapshot {
+            snapshot: ActiveThreadSnapshot {
+                observed_at: Utc::now().timestamp(),
+                threads,
+            },
+            epoch,
+        },
         Err(error) => ActiveThreadPollResult::Failed(error),
     }
 }
@@ -706,7 +1446,6 @@ fn read_active_rollout(
         .map_err(|_| "active rollout stat failed".to_owned())?;
     if !same_file_identity(&before_path, &before_file)
         || !same_file_identity(&before_file, expected_metadata)
-        || before_file.len() > security::MAX_SESSION_FILE_BYTES
     {
         return Err("active rollout identity rejected".to_owned());
     }
@@ -728,12 +1467,20 @@ fn read_active_rollout(
     } else {
         complete_rollout_range_end(&mut file, parse_start, snapshot_len)?
     };
+    let modified_age = expected_metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok());
+    let running_seed = open_rollout_running_seed(
+        checkpoint.last_task_running,
+        checkpoint.last_model.is_some(),
+        complete_len > parse_start,
+        modified_age,
+    );
     let mut parser = thread_contract::RolloutAccumulator::seeded(
         checkpoint.last_model.clone(),
         checkpoint.previous_total,
-        checkpoint
-            .last_task_running
-            .or_else(|| (complete_len > parse_start).then_some(true)),
+        running_seed,
     );
     if complete_len > parse_start {
         file.seek(SeekFrom::Start(parse_start))
@@ -761,6 +1508,29 @@ fn read_active_rollout(
         return Err("active rollout changed during read".to_owned());
     }
     Ok(snapshot)
+}
+
+fn open_rollout_running_seed(
+    recorded: Option<bool>,
+    has_model: bool,
+    has_uncommitted_records: bool,
+    modified_age: Option<Duration>,
+) -> Option<bool> {
+    match recorded {
+        // Explicit task lifecycle evidence always wins, including a recent
+        // post-completion bookkeeping write.
+        Some(value) => Some(value),
+        None if has_model
+            && (has_uncommitted_records
+                || modified_age.is_some_and(|age| age <= OPEN_ROLLOUT_ACTIVITY_WINDOW)) =>
+        {
+            // The path is already proven open by a live Codex process. Model
+            // evidence excludes metadata-only files; recency bridges only the
+            // scanner/thread-poller EOF race.
+            Some(true)
+        }
+        None => None,
+    }
 }
 
 fn first_rollout_newline_end(
@@ -1048,7 +1818,7 @@ fn decode_app_server_account(value: &Value) -> Result<AppServerAccount, String> 
     let email = account
         .get("email")
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+        .filter(|value| valid_login_id(value))
         .ok_or_else(|| "Codex account email is unavailable".to_owned())?;
     let plan_type = account
         .get("planType")
@@ -1059,6 +1829,13 @@ fn decode_app_server_account(value: &Value) -> Result<AppServerAccount, String> 
         email: email.to_owned(),
         plan_type: plan_type.to_owned(),
     })
+}
+
+fn valid_login_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && value.chars().count() <= MAX_LOGIN_ID_SCALARS
+        && !value.chars().any(char::is_control)
 }
 
 fn is_supported_plan(value: &str) -> bool {
@@ -1203,6 +1980,18 @@ impl TokenSnapshot {
                     .checked_add(writes)
                     .is_some_and(|value| value <= self.input)
             })
+    }
+
+    fn is_at_most(self, other: Self) -> bool {
+        self.total <= other.total
+            && self.input <= other.input
+            && self.cached_input <= other.cached_input
+            && self.output <= other.output
+            && match (self.cache_write_input, other.cache_write_input) {
+                (Some(value), Some(limit)) => value <= limit,
+                (Some(_), None) => false,
+                (None, _) => true,
+            }
     }
 
     fn has_usage(self) -> bool {
@@ -1495,6 +2284,8 @@ struct PendingBatch {
     checkpoints: Vec<SessionCheckpoint>,
     ranges: Vec<SessionRange>,
     durable_events: Vec<SessionEvent>,
+    task_events: Vec<SessionTaskEvent>,
+    task_indexed_ranges: Vec<SessionTaskIndexedRange>,
     pending_evidence: Vec<SessionPendingRange>,
     model_totals: Vec<SessionModelTotal>,
     timeline_recovery: Option<SessionTimelineRecovery>,
@@ -1504,6 +2295,114 @@ struct PendingBatch {
 
 struct WriterLock {
     _file: File,
+}
+
+struct TaskBackfillRequest {
+    targets: Vec<TaskBackfillTarget>,
+}
+
+struct TaskBackfillTarget {
+    path: PathBuf,
+    range: SessionTaskIndexedRange,
+    expected_record_sha256: Option<String>,
+}
+
+struct TaskBackfillResult {
+    events: Vec<SessionTaskEvent>,
+    indexed_ranges: Vec<SessionTaskIndexedRange>,
+}
+
+enum TaskBackfillMessage {
+    Indexed(TaskBackfillResult),
+    Finished,
+}
+
+struct TaskBackfillWorker {
+    requests: SyncSender<Option<TaskBackfillRequest>>,
+    results: Receiver<TaskBackfillMessage>,
+    in_flight: bool,
+    _thread: JoinHandle<()>,
+}
+
+impl TaskBackfillWorker {
+    fn start() -> Self {
+        let (requests, request_receiver) = mpsc::sync_channel::<Option<TaskBackfillRequest>>(1);
+        let (result_sender, results) = mpsc::channel::<TaskBackfillMessage>();
+        let thread = thread::Builder::new()
+            .name("codex-info-task-backfill".to_owned())
+            .spawn(move || {
+                while let Ok(Some(request)) = request_receiver.recv() {
+                    for target in request.targets {
+                        let result = task_backfill_request(TaskBackfillRequest {
+                            targets: vec![target],
+                        });
+                        if (!result.indexed_ranges.is_empty() || !result.events.is_empty())
+                            && result_sender
+                                .send(TaskBackfillMessage::Indexed(result))
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    if result_sender.send(TaskBackfillMessage::Finished).is_err() {
+                        return;
+                    }
+                }
+            })
+            .expect("task backfill worker thread must start");
+        Self {
+            requests,
+            results,
+            in_flight: false,
+            _thread: thread,
+        }
+    }
+
+    fn submit(&mut self, request: TaskBackfillRequest) {
+        if self.in_flight || request.targets.is_empty() {
+            return;
+        }
+        if self.requests.try_send(Some(request)).is_ok() {
+            self.in_flight = true;
+        }
+    }
+
+    fn take_result(&mut self) -> Option<TaskBackfillResult> {
+        let mut combined = TaskBackfillResult {
+            events: Vec::new(),
+            indexed_ranges: Vec::new(),
+        };
+        loop {
+            match self.results.try_recv() {
+                Ok(TaskBackfillMessage::Indexed(mut result)) => {
+                    combined.events.append(&mut result.events);
+                    combined.indexed_ranges.append(&mut result.indexed_ranges);
+                }
+                Ok(TaskBackfillMessage::Finished) => {
+                    self.in_flight = false;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.in_flight = false;
+                    break;
+                }
+            }
+        }
+        if combined.indexed_ranges.is_empty() && combined.events.is_empty() {
+            return None;
+        }
+        combined.indexed_ranges.sort();
+        combined.indexed_ranges.dedup();
+        combined.events.sort();
+        combined.events.dedup();
+        Some(combined)
+    }
+}
+
+impl Drop for TaskBackfillWorker {
+    fn drop(&mut self) {
+        let _ = self.requests.try_send(None);
+    }
 }
 
 /// Profile-level process lease expected by the installer.  The JSON identity
@@ -1596,7 +2495,131 @@ pub struct RecorderStateWriter {
     last_state: Option<SessionCollectionState>,
 }
 
+/// Last durable profile-wide recorder authority. The opaque fingerprint is
+/// used only to derive a stable, crash-repeatable collector epoch for one
+/// account transition; neither field contains the external account key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreviousRecorderAuthority {
+    pub partition_id: String,
+    pub transition_fingerprint: String,
+}
+
 impl RecorderStateWriter {
+    /// Read the last recorder authority before constructing the next state
+    /// writer. The caller must already own the profile lease, so this file
+    /// cannot change while the account transition is being admitted.
+    pub fn read_previous_authority(
+        data_root: impl AsRef<Path>,
+    ) -> Result<Option<PreviousRecorderAuthority>, RecorderError> {
+        let history = data_root.as_ref().join("history");
+        let history_metadata = fs::symlink_metadata(&history)?;
+        if history_metadata.file_type().is_symlink() || !history_metadata.is_dir() {
+            return Err(RecorderError::Invalid(
+                "recorder state parent is not a regular directory".to_owned(),
+            ));
+        }
+        let path = history.join("recorder-state.json");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_RECORDER_STATE_BYTES
+        {
+            return Err(RecorderError::Invalid(
+                "recorder state is not a bounded regular file".to_owned(),
+            ));
+        }
+        #[cfg(unix)]
+        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o777 != 0o600
+        {
+            return Err(RecorderError::Invalid(
+                "recorder state is not owner-private".to_owned(),
+            ));
+        }
+        let bytes = fs::read(&path)?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| RecorderError::Invalid("recorder state JSON is invalid".to_owned()))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| RecorderError::Invalid("recorder state is not an object".to_owned()))?;
+        const KEYS: [&str; 11] = [
+            "schema",
+            "pid",
+            "process_starttime",
+            "owner_nonce",
+            "write_state",
+            "partition_id_hash",
+            "data_generation",
+            "collector_epoch",
+            "cycle_seq",
+            "last_commit_unix",
+            "updated_at_unix",
+        ];
+        if object.len() != KEYS.len() || KEYS.iter().any(|key| !object.contains_key(*key)) {
+            return Err(RecorderError::Invalid(
+                "recorder state key set is invalid".to_owned(),
+            ));
+        }
+        let string = |key: &str| object.get(key).and_then(Value::as_str);
+        let positive = |key: &str| {
+            object
+                .get(key)
+                .and_then(Value::as_u64)
+                .is_some_and(|v| v > 0)
+        };
+        let optional_positive = |key: &str| {
+            object
+                .get(key)
+                .is_some_and(|value| value.is_null() || value.as_u64().is_some_and(|v| v > 0))
+        };
+        let optional_positive_i64 = |key: &str| {
+            object
+                .get(key)
+                .is_some_and(|value| value.is_null() || value.as_i64().is_some_and(|v| v > 0))
+        };
+        let valid_hex = |value: &str, bytes: usize| {
+            value.len() == bytes * 2
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        let partition_id = string("partition_id_hash").ok_or_else(|| {
+            RecorderError::Invalid("recorder state partition is missing".to_owned())
+        })?;
+        let collector_epoch_valid = object.get("collector_epoch").is_some_and(|value| {
+            value.is_null()
+                || value
+                    .as_str()
+                    .is_some_and(|candidate| valid_hex(candidate, 16))
+        });
+        if string("schema") != Some(RECORDER_STATE_SCHEMA)
+            || !positive("pid")
+            || !positive("process_starttime")
+            || !string("owner_nonce").is_some_and(|value| valid_hex(value, 16))
+            || !matches!(string("write_state"), Some("ready" | "degraded"))
+            || !valid_hex(partition_id, 32)
+            || !optional_positive("data_generation")
+            || !collector_epoch_valid
+            || !optional_positive("cycle_seq")
+            || !optional_positive_i64("last_commit_unix")
+            || !object
+                .get("updated_at_unix")
+                .and_then(Value::as_i64)
+                .is_some_and(|value| value > 0)
+        {
+            return Err(RecorderError::Invalid(
+                "recorder state identity or bounds are invalid".to_owned(),
+            ));
+        }
+        Ok(Some(PreviousRecorderAuthority {
+            partition_id: partition_id.to_owned(),
+            transition_fingerprint: hex_digest(Sha256::digest(&bytes).as_slice()),
+        }))
+    }
+
     pub fn new(
         data_root: impl AsRef<Path>,
         identity: &StoragePartitionIdentity,
@@ -1624,6 +2647,7 @@ impl RecorderStateWriter {
         &mut self,
         state: Option<&SessionCollectionState>,
     ) -> Result<(), RecorderError> {
+        let _epoch_fence = account_epoch_commit_fence()?;
         let state = state.or(self.last_state.as_ref());
         // A degraded write must retain the last successful commit identity.
         // On a fresh process there may be no durable commit yet; leave an
@@ -1654,6 +2678,7 @@ impl RecorderStateWriter {
         state: &SessionCollectionState,
         has_pending: bool,
     ) -> Result<(), RecorderError> {
+        let _epoch_fence = account_epoch_commit_fence()?;
         let now = Utc::now().timestamp();
         self.last_commit_unix = Some(now);
         self.last_state = Some(state.clone());
@@ -1789,6 +2814,76 @@ impl WriterLock {
     }
 }
 
+/// Bring one initialized, inactive account partition to the current schema
+/// and persist its display-only login ID. A current value is a read-only
+/// no-op, so normal recorder restarts do not create redundant backups or DB
+/// writes. The caller must hold the profile lease that serializes account
+/// admission; the per-partition lock below remains the final writer boundary.
+pub fn synchronize_partition_login_id(
+    database: impl AsRef<Path>,
+    identity: &StoragePartitionIdentity,
+    login_id: &str,
+) -> Result<(), RecorderError> {
+    synchronize_inactive_partition(database, identity, Some(login_id))
+}
+
+/// Bring every initialized inactive account partition to the same durable
+/// history schema. Display metadata is optional and never decides whether a
+/// partition is migrated.
+pub fn synchronize_inactive_partition(
+    database: impl AsRef<Path>,
+    identity: &StoragePartitionIdentity,
+    login_id: Option<&str>,
+) -> Result<(), RecorderError> {
+    if account_boundary_changed() {
+        return Err(RecorderError::AccountBoundaryChanged);
+    }
+    if login_id.is_some_and(|value| !valid_login_id(value)) {
+        return Err(RecorderError::Invalid(
+            "partition login id is invalid".to_owned(),
+        ));
+    }
+    let database = database.as_ref().to_owned();
+    if UsageStore::partition_history_is_current(&database, identity).unwrap_or(false) {
+        if let Ok(reader) = UsageStore::open_read_only_partitioned(&database, identity) {
+            let login_is_current = match login_id {
+                Some(login_id) => reader
+                    .partition_login_id()
+                    .is_ok_and(|stored| stored.as_deref() == Some(login_id)),
+                None => true,
+            };
+            if login_is_current {
+                return Ok(());
+            }
+        }
+    }
+
+    let _lock = WriterLock::acquire(&database)?;
+    let metadata = fs::symlink_metadata(&database)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(RecorderError::Invalid(
+            "partition database must be a regular file".to_owned(),
+        ));
+    }
+    let backup = UsageStore::backup_generations_partitioned_verified(&database, identity, 3)?;
+    UsageStore::migrate_partition_history_after_verified_backup(&database, identity, &backup)?;
+    let mut writer = UsageStore::open_partitioned(&database, identity)?;
+    if let Some(login_id) = login_id {
+        writer.set_partition_login_id(login_id)?;
+        if writer.partition_login_id()?.as_deref() != Some(login_id) {
+            return Err(RecorderError::Invalid(
+                "partition login id read-back mismatch".to_owned(),
+            ));
+        }
+    }
+    if !UsageStore::partition_history_is_current(&database, identity)? {
+        return Err(RecorderError::Invalid(
+            "partition canonical history read-back mismatch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 pub struct Recorder {
     config: RecorderConfig,
     writer: UsageStore,
@@ -1797,6 +2892,9 @@ pub struct Recorder {
     _writer_lock: Option<WriterLock>,
     pending: Option<PendingBatch>,
     last_ranges: Vec<SessionRange>,
+    task_backfill: TaskBackfillWorker,
+    activation_timestamp: Option<i64>,
+    account_boundary_epoch: Option<u128>,
 }
 
 impl Recorder {
@@ -1808,8 +2906,57 @@ impl Recorder {
         database: impl AsRef<Path>,
         identity: &StoragePartitionIdentity,
     ) -> Result<Self, RecorderError> {
+        Self::open_partitioned_with_activation(config, database, identity, None)
+    }
+
+    /// Open an account partition with an inclusive Session admission
+    /// boundary. The boundary is supplied by the account registry so a
+    /// restart cannot reinterpret another account's earlier shared logs.
+    pub fn open_partitioned_with_activation(
+        config: RecorderConfig,
+        database: impl AsRef<Path>,
+        identity: &StoragePartitionIdentity,
+        activation_timestamp: Option<i64>,
+    ) -> Result<Self, RecorderError> {
+        Self::open_partitioned_for_account(config, database, identity, activation_timestamp, None)
+    }
+
+    /// Open an account partition with an optional, stable transition
+    /// fingerprint. A transition gets a new collector epoch and baselines the
+    /// shared Session files at their current physical EOF. Repeating the same
+    /// fingerprint after a crash resumes the already committed boundary.
+    pub fn open_partitioned_for_account(
+        config: RecorderConfig,
+        database: impl AsRef<Path>,
+        identity: &StoragePartitionIdentity,
+        activation_timestamp: Option<i64>,
+        transition_fingerprint: Option<&str>,
+    ) -> Result<Self, RecorderError> {
         config.validate()?;
+        if activation_timestamp.is_some_and(|value| value <= 0) {
+            return Err(RecorderError::Invalid(
+                "account activation timestamp must be positive".to_owned(),
+            ));
+        }
         let database = database.as_ref().to_owned();
+        if transition_fingerprint.is_some_and(|value| {
+            value.len() != 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            return Err(RecorderError::Invalid(
+                "account transition fingerprint is invalid".to_owned(),
+            ));
+        }
+        let account_boundary_epoch = transition_fingerprint.map(|fingerprint| {
+            account_boundary_collector_epoch(
+                &config.sessions_root,
+                &database,
+                &identity.partition_id,
+                fingerprint,
+            )
+        });
         let lock = WriterLock::acquire(&database)?;
         let existing_database = match fs::symlink_metadata(&database) {
             Ok(metadata) => {
@@ -1823,8 +2970,12 @@ impl Recorder {
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
         };
-        if existing_database {
-            UsageStore::backup_generations_partitioned(&database, identity, 3)?;
+        if existing_database && !UsageStore::partition_history_is_current(&database, identity)? {
+            let backup =
+                UsageStore::backup_generations_partitioned_verified(&database, identity, 3)?;
+            UsageStore::migrate_partition_history_after_verified_backup(
+                &database, identity, &backup,
+            )?;
         }
         let mut writer = if existing_database {
             UsageStore::open_partitioned(&database, identity)?
@@ -1840,6 +2991,9 @@ impl Recorder {
             _writer_lock: Some(lock),
             pending: None,
             last_ranges: Vec::new(),
+            task_backfill: TaskBackfillWorker::start(),
+            activation_timestamp,
+            account_boundary_epoch,
         })
     }
 
@@ -1859,15 +3013,41 @@ impl Recorder {
             _writer_lock: None,
             pending: None,
             last_ranges: Vec::new(),
+            task_backfill: TaskBackfillWorker::start(),
+            activation_timestamp: None,
+            account_boundary_epoch: None,
         })
     }
 
     pub fn generation(&self) -> Result<u64, RecorderError> {
+        if account_boundary_changed() {
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
         Ok(self.writer.load_session_collection_state()?.data_generation)
     }
 
     pub fn state(&self) -> Result<SessionCollectionState, RecorderError> {
+        if account_boundary_changed() {
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
         Ok(self.writer.load_session_collection_state()?)
+    }
+
+    /// Persist the display label through the already-owned current account
+    /// writer. This metadata does not advance collection generation and its
+    /// failure never changes the pending Session batch.
+    pub fn set_partition_login_id(&mut self, login_id: &str) -> Result<(), RecorderError> {
+        let _epoch_fence = account_epoch_commit_fence()?;
+        if account_boundary_changed() {
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
+        self.writer.set_partition_login_id(login_id)?;
+        if self.writer.partition_login_id()?.as_deref() != Some(login_id) {
+            return Err(RecorderError::Invalid(
+                "partition login id read-back mismatch".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Publish a complete active-thread candidate through the writer's
@@ -1879,16 +3059,28 @@ impl Recorder {
         snapshot: &ActiveThreadSnapshot,
         acquisition_degraded: bool,
     ) -> Result<u64, RecorderError> {
+        let _epoch_fence = account_epoch_commit_fence()?;
+        if account_boundary_changed() {
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
         Ok(self
             .writer
             .commit_active_thread_snapshot_with_health(snapshot, acquisition_degraded)?)
     }
 
     pub fn mark_active_thread_snapshot_degraded(&mut self) -> Result<u64, RecorderError> {
+        let _epoch_fence = account_epoch_commit_fence()?;
+        if account_boundary_changed() {
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
         Ok(self.writer.mark_active_thread_snapshot_degraded()?)
     }
 
     pub fn clear_active_thread_snapshot_degraded(&mut self) -> Result<u64, RecorderError> {
+        let _epoch_fence = account_epoch_commit_fence()?;
+        if account_boundary_changed() {
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
         Ok(self.writer.clear_active_thread_snapshot_degraded()?)
     }
 
@@ -1932,7 +3124,30 @@ impl Recorder {
         &mut self,
         quota: Option<QuotaSnapshot>,
     ) -> Result<Option<CycleReport>, RecorderError> {
+        self.run_cycle_with_quota_guarded(quota, || true)
+    }
+
+    /// Prepare a cycle, then revalidate the caller-owned account authority at
+    /// the last boundary before the SQLite transaction. A rejected guard
+    /// discards the uncommitted candidate so an old account completion can
+    /// never be retried into either partition.
+    pub fn run_cycle_with_quota_guarded<F>(
+        &mut self,
+        quota: Option<QuotaSnapshot>,
+        commit_guard: F,
+    ) -> Result<Option<CycleReport>, RecorderError>
+    where
+        F: FnOnce() -> bool,
+    {
+        if account_boundary_changed() {
+            self.pending = None;
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
         if self.pending.is_some() {
+            if account_boundary_changed() || !commit_guard() {
+                self.pending = None;
+                return Err(RecorderError::AccountBoundaryChanged);
+            }
             return self.commit_pending().map(Some);
         }
 
@@ -1962,8 +3177,10 @@ impl Recorder {
             Some(QuotaTransition::Initial | QuotaTransition::Boundary)
         ) || !period_available;
         let discovery = discover_sources(&self.config.sessions_root);
-        let collector_epoch = state.collector_epoch.unwrap_or_else(|| {
-            collector_epoch(&self.config.sessions_root, self.database.as_deref(), &state)
+        let collector_epoch = self.account_boundary_epoch.unwrap_or_else(|| {
+            state.collector_epoch.unwrap_or_else(|| {
+                collector_epoch(&self.config.sessions_root, self.database.as_deref(), &state)
+            })
         });
         let cycle_seq = state
             .cycle_seq
@@ -1984,8 +3201,35 @@ impl Recorder {
                 }],
             ),
         };
-        let baseline_existing =
-            state.checkpoints.is_empty() && state.collector_epoch != Some(collector_epoch);
+        let backfill_result = self.task_backfill.take_result();
+        let mut task_events = backfill_result
+            .as_ref()
+            .map(|result| result.events.clone())
+            .unwrap_or_default();
+        let mut task_indexed_ranges = backfill_result
+            .map(|result| result.indexed_ranges)
+            .unwrap_or_default();
+        if !self.writer.session_task_coverage_complete()? {
+            let persisted_ranges = self.writer.load_session_ranges()?;
+            let mut indexed_ranges = self.writer.load_session_task_indexed_ranges()?;
+            indexed_ranges.extend(task_indexed_ranges.iter().cloned());
+            self.task_backfill.submit(TaskBackfillRequest {
+                targets: build_task_backfill_targets(
+                    &self.config.sessions_root,
+                    &inventory_root,
+                    &sources,
+                    &state.checkpoints,
+                    &persisted_ranges,
+                    &indexed_ranges,
+                ),
+            });
+        }
+        let boundary_not_committed = self
+            .account_boundary_epoch
+            .is_some_and(|boundary| state.collector_epoch != Some(boundary));
+        let baseline_new_partition = self.activation_timestamp.is_some()
+            && state.checkpoints.is_empty()
+            && state.collector_epoch != Some(collector_epoch);
         let mut totals = if period_restarted || state.data_generation == 0 {
             ModelTotals::default()
         } else {
@@ -2011,7 +3255,10 @@ impl Recorder {
         if durable_pending_count != 0 {
             pending_ranges = pending_ranges.max(1);
         }
-        let window_start = reset_at.saturating_sub(window_seconds);
+        let window_start = self.activation_timestamp.map_or_else(
+            || reset_at.saturating_sub(window_seconds),
+            |boundary| reset_at.saturating_sub(window_seconds).max(boundary),
+        );
         let timeline_end = if period_available {
             quota
                 .as_ref()
@@ -2045,6 +3292,11 @@ impl Recorder {
         for logical_index in 0..source_count {
             let source = &sources[(first_source + logical_index) % source_count];
             let prior = prior_checkpoint(&state.checkpoints, source);
+            let baseline_existing = boundary_not_committed
+                || baseline_new_partition
+                || (state.collector_epoch == Some(collector_epoch)
+                    && prior
+                        .is_some_and(|checkpoint| checkpoint.collector_epoch != collector_epoch));
             if consumed_budget >= self.config.chunk_bytes {
                 if checkpoint_covers_observed_end(prior, source) {
                     continue;
@@ -2112,6 +3364,8 @@ impl Recorder {
             if let Some(range) = result.range {
                 ranges.push(range);
             }
+            task_events.extend(result.task_events);
+            task_indexed_ranges.extend(result.task_indexed_ranges);
             durable_events.extend(result.events);
             pending_evidence.extend(result.pending);
         }
@@ -2159,6 +3413,12 @@ impl Recorder {
             )
         };
         let quota_sample = quota.as_ref().and_then(|candidate| {
+            if self
+                .activation_timestamp
+                .is_some_and(|boundary| candidate.observed_at < boundary)
+            {
+                return None;
+            }
             admitted_quota.as_ref().and_then(|(_, canonical_reset, _)| {
                 candidate.remaining_percent.map(|remaining| {
                     totals.history_sample(candidate.observed_at, *canonical_reset, remaining)
@@ -2167,7 +3427,31 @@ impl Recorder {
         });
         let mut samples = samples;
         if let Some(sample) = quota_sample {
-            samples.push(sample);
+            if let Some(index) = samples.iter().position(|existing| {
+                existing.reset_at == sample.reset_at && existing.timestamp == sample.timestamp
+            }) {
+                let dominates = |candidate: &UsageHistorySample, observed: &UsageHistorySample| {
+                    candidate.sol_dollars >= observed.sol_dollars
+                        && candidate.terra_dollars >= observed.terra_dollars
+                        && candidate.luna_dollars >= observed.luna_dollars
+                        && candidate.sol_tokens >= observed.sol_tokens
+                        && candidate.terra_tokens >= observed.terra_tokens
+                        && candidate.luna_tokens >= observed.luna_tokens
+                };
+                if dominates(&sample, &samples[index]) {
+                    samples[index] = sample;
+                } else if dominates(&samples[index], &sample) {
+                    samples[index].remaining_percent = sample
+                        .remaining_percent
+                        .or(samples[index].remaining_percent);
+                } else {
+                    // Preserve the storage boundary's whole-vector rejection
+                    // for a genuinely contradictory observation.
+                    samples.push(sample);
+                }
+            } else {
+                samples.push(sample);
+            }
         }
         let observations = samples
             .iter()
@@ -2187,6 +3471,14 @@ impl Recorder {
             })
             .collect::<Vec<_>>();
         let model_totals = totals.to_totals();
+        durable_events.retain(|event| {
+            self.activation_timestamp
+                .is_none_or(|boundary| event.timestamp >= boundary)
+        });
+        task_events.retain(|event| {
+            self.activation_timestamp
+                .is_none_or(|boundary| event.timestamp >= boundary)
+        });
         self.pending = Some(PendingBatch {
             reset_at,
             window_seconds,
@@ -2199,10 +3491,16 @@ impl Recorder {
             checkpoints,
             ranges,
             durable_events,
+            task_events,
+            task_indexed_ranges,
             pending_evidence,
             model_totals,
             timeline_recovery,
         });
+        if account_boundary_changed() || !commit_guard() {
+            self.pending = None;
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
         self.commit_pending().map(Some)
     }
 
@@ -2211,6 +3509,11 @@ impl Recorder {
     }
 
     fn commit_pending(&mut self) -> Result<CycleReport, RecorderError> {
+        let _epoch_fence = account_epoch_commit_fence()?;
+        if account_boundary_changed() {
+            self.pending = None;
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
         let pending = self.pending.as_ref().ok_or_else(|| {
             RecorderError::Invalid("recorder pending batch is missing".to_owned())
         })?;
@@ -2227,21 +3530,28 @@ impl Recorder {
         };
         let result = if let Some(recovery) = pending.timeline_recovery.as_ref() {
             self.writer
-                .commit_session_collection_with_timeline_recovery_events_and_pending_ranges(
+                .commit_session_collection_with_timeline_recovery_and_task_evidence(
                     commit,
                     &pending.observations,
                     recovery,
-                    &pending.durable_events,
-                    &pending.pending_evidence,
+                    SessionTaskEvidenceInput {
+                        events: &pending.durable_events,
+                        pending_ranges: &pending.pending_evidence,
+                        task_events: &pending.task_events,
+                        task_indexed_ranges: &pending.task_indexed_ranges,
+                    },
                 )?
         } else {
-            self.writer
-                .commit_session_collection_with_events_and_pending_ranges(
-                    commit,
-                    &pending.observations,
-                    &pending.durable_events,
-                    &pending.pending_evidence,
-                )?
+            self.writer.commit_session_collection_with_task_evidence(
+                commit,
+                &pending.observations,
+                SessionTaskEvidenceInput {
+                    events: &pending.durable_events,
+                    pending_ranges: &pending.pending_evidence,
+                    task_events: &pending.task_events,
+                    task_indexed_ranges: &pending.task_indexed_ranges,
+                },
+            )?
         };
         let read_back = self.writer.load_session_collection_state()?;
         if read_back.data_generation != result.data_generation
@@ -2259,6 +3569,9 @@ impl Recorder {
                 &pending.durable_events,
                 &pending.pending_evidence,
             )?
+            || !self
+                .writer
+                .verify_session_task_batch(&pending.task_indexed_ranges, &pending.task_events)?
         {
             return Err(RecorderError::Invalid(
                 "session collection read-back did not match committed batch".to_owned(),
@@ -2296,22 +3609,15 @@ fn admit_quota_period(
         eprintln!("recorder degraded: quota response has an invalid remaining percentage");
         return None;
     }
-    let canonical_reset_at = if state.reset_at > 0 {
-        canonical_reset_period(state.reset_at, candidate.reset_at).unwrap_or(candidate.reset_at)
-    } else {
-        candidate.reset_at
-    };
     let previous_reset_at =
         (state.data_generation > 0 && state.reset_at > 0).then_some(state.reset_at);
-    let previous_observed_at = state
-        .last_quota_observation
-        .as_ref()
-        .map(|observation| observation.observed_at);
+    let previous_observation = state.last_quota_observation.as_ref();
     let transition = classify_quota_transition(
         previous_reset_at,
         state.window_seconds,
-        previous_observed_at,
-        canonical_reset_at,
+        previous_observation.map(|observation| observation.observed_at),
+        previous_observation.map(|observation| observation.remaining_percent),
+        candidate.reset_at,
         candidate.window_seconds,
         Some(remaining_percent),
         candidate.observed_at,
@@ -2326,7 +3632,7 @@ fn admit_quota_period(
     let (reset_at, window_seconds) = if transition == QuotaTransition::SamePeriod {
         (state.reset_at, state.window_seconds)
     } else {
-        (canonical_reset_at, candidate.window_seconds)
+        (candidate.reset_at, candidate.window_seconds)
     };
     Some((transition, reset_at, window_seconds))
 }
@@ -2419,10 +3725,18 @@ struct SourceOutcome {
     checkpoint: SessionCheckpoint,
     range: Option<SessionRange>,
     events: Vec<SessionEvent>,
+    task_events: Vec<SessionTaskEvent>,
+    task_indexed_ranges: Vec<SessionTaskIndexedRange>,
     pending: Vec<SessionPendingRange>,
     unresolved: bool,
     changed: bool,
     consumed_bytes: u64,
+}
+
+struct TaskObservation {
+    event_index: u64,
+    timestamp: i64,
+    running: bool,
 }
 
 fn discover_sources(root: &Path) -> Result<SourceInventory, RecorderError> {
@@ -2661,13 +3975,17 @@ fn scan_source(
     // changes inode, scan from zero and re-synchronize on the durable token
     // vector below instead of guessing that the old byte boundary survived.
     let continuous = prior.filter(|checkpoint| {
-        checkpoint.root_identity == source.recorded.root_identity
+        !baseline_existing
+            && checkpoint.collector_epoch == collector_epoch
+            && checkpoint.root_identity == source.recorded.root_identity
             && checkpoint.relative_path == source.recorded.relative_path
             && checkpoint.file_device == source.recorded.file_device
             && checkpoint.file_inode == source.recorded.file_inode
             && checkpoint.committed_offset <= before_file.len()
     });
-    let recovery_anchor = prior
+    let recovery_anchor = (!baseline_existing)
+        .then_some(prior)
+        .flatten()
         .filter(|_| continuous.is_none())
         .map(|checkpoint| TokenSnapshot {
             total: checkpoint.previous_total,
@@ -2705,6 +4023,28 @@ fn scan_source(
             checkpoint.prefix_generation,
             checkpoint.prefix_sha256.clone(),
         )
+    } else if baseline_existing {
+        // A new account partition must start at the physical source boundary
+        // observed during activation. Parsing the pre-existing prefix and
+        // filtering by payload timestamps would mix accounts when clocks are
+        // skewed or an old event is appended late. Persist only the EOF
+        // checkpoint; the first append after this boundary is handled by the
+        // next cycle.
+        let boundary_offset = before_file.len();
+        let discard_until_lf = session_file_has_partial_tail(&source.path, boundary_offset)?;
+        let (prefix_generation, prefix_sha256) =
+            session_boundary_lineage(collector_epoch, &source.recorded, prior, boundary_offset);
+        (
+            boundary_offset,
+            discard_until_lf,
+            false,
+            false,
+            None,
+            None,
+            TokenSnapshot::default(),
+            prefix_generation,
+            prefix_sha256,
+        )
     } else {
         (
             0,
@@ -2733,6 +4073,7 @@ fn scan_source(
     let mut pending_evidence = Vec::<(u64, u64, &'static str, bool)>::new();
     let mut candidate_totals = totals.clone();
     let mut candidate_events = Vec::new();
+    let mut candidate_task_events = Vec::new();
     // Keep every source-proven timestamped delta in the event ledger even
     // when the last quota authority cannot cover its period.  `candidate_events`
     // is only the currently materialized history projection; this second
@@ -2743,7 +4084,10 @@ fn scan_source(
     let mut recovery_stream_events = Vec::new();
     let mut recovery_stream_proven = true;
     let mut recovery_last = None;
+    let mut history_base_pending = false;
+    let mut token_count_seen = false;
     let mut read_any = false;
+    let mut record_index = 0_u64;
     loop {
         if consumed_bytes >= max_bytes && read_any {
             break;
@@ -2754,6 +4098,7 @@ fn scan_source(
             RecordRead::End => break,
             RecordRead::Present(summary, bytes) => (summary, bytes),
             RecordRead::Invalid(bytes, terminated) => {
+                record_index = record_index.saturating_add(1);
                 consumed_bytes = consumed_bytes.saturating_add(bytes);
                 unresolved = true;
                 if terminated {
@@ -2793,9 +4138,22 @@ fn scan_source(
                 break;
             }
         };
+        let current_record_index = record_index;
+        record_index = record_index.saturating_add(1);
         read_any = true;
         consumed_bytes = consumed_bytes.saturating_add(bytes);
         physical_offset = physical_offset.saturating_add(bytes);
+        if summary.history_base_continuation()
+            && !token_count_seen
+            && prior.is_none()
+            && !baseline_existing
+            && recovery_anchor.is_none()
+        {
+            history_base_pending = true;
+        }
+        if summary.event_type() == Some("token_count") {
+            token_count_seen = true;
+        }
         if summary.usage_unparsed() {
             unresolved = true;
             // This is a complete line with an untrusted usage shape. Admit
@@ -2811,6 +4169,22 @@ fn scan_source(
         }
         if let Some(running) = summary.task_running() {
             last_task_running = Some(running);
+            let timestamp = summary.event_timestamp();
+            if timestamp <= 0 {
+                unresolved = true;
+                pending_evidence.push((
+                    record_start,
+                    physical_offset,
+                    "task-event-timestamp-invalid",
+                    true,
+                ));
+            } else {
+                candidate_task_events.push(TaskObservation {
+                    event_index: current_record_index,
+                    timestamp,
+                    running,
+                });
+            }
         }
         if summary.event_type() != Some("thread_settings_applied") || last_model.is_none() {
             if let Some(model) = summary.event_model() {
@@ -2866,31 +4240,51 @@ fn scan_source(
             recovery_stream_events.clear();
             continue;
         }
-        if !baseline_known {
-            previous = current;
+        let delta = if history_base_pending {
+            history_base_pending = false;
             baseline_known = true;
-            continue;
-        }
-        if current.total < previous.total
-            || current.input < previous.input
-            || current.cached_input < previous.cached_input
-            || current.output < previous.output
-            || matches!(
-                (current.cache_write_input, previous.cache_write_input),
-                (Some(current), Some(previous)) if current < previous
-            )
-        {
+            let last = summary.last_token_snapshot();
+            if !last.is_some_and(|last| last.valid() && last.is_at_most(current)) {
+                unresolved = true;
+                pending_evidence.push((
+                    record_start,
+                    physical_offset,
+                    "history-base-last-token-usage-invalid",
+                    true,
+                ));
+                previous = current;
+                continue;
+            }
             previous = current;
-            continue;
-        }
-        let delta = TokenSnapshot {
-            total: current.total - previous.total,
-            input: current.input - previous.input,
-            cached_input: current.cached_input - previous.cached_input,
-            output: current.output - previous.output,
-            cache_write_input: current.cache_write_delta_from(previous),
+            last.expect("validated history-base last token usage")
+        } else {
+            if !baseline_known {
+                previous = current;
+                baseline_known = true;
+                continue;
+            }
+            if current.total < previous.total
+                || current.input < previous.input
+                || current.cached_input < previous.cached_input
+                || current.output < previous.output
+                || matches!(
+                    (current.cache_write_input, previous.cache_write_input),
+                    (Some(current), Some(previous)) if current < previous
+                )
+            {
+                previous = current;
+                continue;
+            }
+            let delta = TokenSnapshot {
+                total: current.total - previous.total,
+                input: current.input - previous.input,
+                cached_input: current.cached_input - previous.cached_input,
+                output: current.output - previous.output,
+                cache_write_input: current.cache_write_delta_from(previous),
+            };
+            previous = current;
+            delta
         };
-        previous = current;
         let timestamp = summary.event_timestamp();
         let model = ModelTotals::usage_model(last_model.as_deref());
         let timed_event = (timestamp > 0 && delta.has_usage()).then(|| TimedModelUsage {
@@ -3026,6 +4420,43 @@ fn scan_source(
         prefix_generation: checkpoint.prefix_generation,
         record_sha256: accepted_digest.expect("accepted range has a digest"),
     });
+    let task_indexed_range =
+        range
+            .as_ref()
+            .filter(|_| !unresolved)
+            .map(|range| SessionTaskIndexedRange {
+                root_identity: range.root_identity.clone(),
+                relative_path: range.relative_path.clone(),
+                file_device: range.file_device,
+                file_inode: range.file_inode,
+                start_offset: range.start_offset,
+                end_offset: range.end_offset,
+                collector_epoch: range.collector_epoch,
+                cycle_seq: range.cycle_seq,
+                prefix_generation: range.prefix_generation,
+                record_sha256: range.record_sha256.clone(),
+            });
+    let task_events = task_indexed_range
+        .as_ref()
+        .map(|indexed| {
+            candidate_task_events
+                .into_iter()
+                .map(|event| SessionTaskEvent {
+                    root_identity: indexed.root_identity.clone(),
+                    relative_path: indexed.relative_path.clone(),
+                    file_device: indexed.file_device,
+                    file_inode: indexed.file_inode,
+                    prefix_generation: indexed.prefix_generation,
+                    start_offset: indexed.start_offset,
+                    end_offset: indexed.end_offset,
+                    record_sha256: indexed.record_sha256.clone(),
+                    event_index: event.event_index,
+                    timestamp: event.timestamp,
+                    running: event.running,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let durable_events = if let Some(range) = range.as_ref() {
         all_candidate_events
             .iter()
@@ -3093,11 +4524,332 @@ fn scan_source(
         checkpoint,
         range,
         events: durable_events,
+        task_events,
+        task_indexed_ranges: task_indexed_range.into_iter().collect(),
         pending,
         unresolved,
         changed,
         consumed_bytes,
     }))
+}
+
+fn build_task_backfill_targets(
+    sessions_root: &Path,
+    current_root_identity: &str,
+    sources: &[Source],
+    checkpoints: &[SessionCheckpoint],
+    persisted_ranges: &[SessionRange],
+    indexed_ranges: &[SessionTaskIndexedRange],
+) -> Vec<TaskBackfillTarget> {
+    let mut checkpoint_targets = Vec::new();
+    for checkpoint in checkpoints {
+        if checkpoint.committed_offset == 0 {
+            continue;
+        }
+        let missing_spans = task_indexed_checkpoint_missing_spans(checkpoint, indexed_ranges);
+        if missing_spans.is_empty() {
+            continue;
+        }
+        let Some(source) = sources.iter().find(|source| {
+            source.recorded.root_identity == checkpoint.root_identity
+                && source.recorded.relative_path == checkpoint.relative_path
+                && source.recorded.file_device == checkpoint.file_device
+                && source.recorded.file_inode == checkpoint.file_inode
+        }) else {
+            continue;
+        };
+        checkpoint_targets.extend(missing_spans.into_iter().map(|(start_offset, end_offset)| {
+            TaskBackfillTarget {
+                path: source.path.clone(),
+                range: SessionTaskIndexedRange {
+                    root_identity: checkpoint.root_identity.clone(),
+                    relative_path: checkpoint.relative_path.clone(),
+                    file_device: checkpoint.file_device,
+                    file_inode: checkpoint.file_inode,
+                    start_offset,
+                    end_offset,
+                    collector_epoch: checkpoint.collector_epoch,
+                    cycle_seq: checkpoint.cycle_seq,
+                    prefix_generation: checkpoint.prefix_generation,
+                    // This gap is verified and hashed independently. Already
+                    // indexed spans are never rescanned, so their lifecycle
+                    // events cannot be duplicated while a prefix backfill is
+                    // still in progress.
+                    record_sha256: EMPTY_SHA256.to_owned(),
+                },
+                expected_record_sha256: None,
+            }
+        }));
+    }
+    let mut persisted_targets = Vec::new();
+    for range in persisted_ranges {
+        let Some(path) = sources
+            .iter()
+            .find(|source| {
+                source.recorded.root_identity == range.root_identity
+                    && source.recorded.relative_path == range.relative_path
+                    && source.recorded.file_device == range.file_device
+                    && source.recorded.file_inode == range.file_inode
+            })
+            .map(|source| source.path.clone())
+            .or_else(|| {
+                if range.root_identity != current_root_identity {
+                    return None;
+                }
+                let path = sessions_root.join(&range.relative_path);
+                let metadata = fs::symlink_metadata(&path).ok()?;
+                (!metadata.file_type().is_symlink()
+                    && metadata.is_file()
+                    && metadata.len() >= range.end_offset)
+                    .then_some(path)
+            })
+        else {
+            continue;
+        };
+        if task_indexed_session_range_is_covered(range, indexed_ranges) {
+            continue;
+        }
+        if checkpoint_targets.iter().any(|target| {
+            target.range.root_identity == range.root_identity
+                && target.range.relative_path == range.relative_path
+                && target.range.file_device == range.file_device
+                && target.range.file_inode == range.file_inode
+                && target.range.prefix_generation == range.prefix_generation
+                && target.range.start_offset <= range.start_offset
+                && target.range.end_offset >= range.end_offset
+        }) {
+            continue;
+        }
+        persisted_targets.push(TaskBackfillTarget {
+            path,
+            range: SessionTaskIndexedRange {
+                root_identity: range.root_identity.clone(),
+                relative_path: range.relative_path.clone(),
+                file_device: range.file_device,
+                file_inode: range.file_inode,
+                start_offset: range.start_offset,
+                end_offset: range.end_offset,
+                collector_epoch: range.collector_epoch,
+                cycle_seq: range.cycle_seq,
+                prefix_generation: range.prefix_generation,
+                record_sha256: range.record_sha256.clone(),
+            },
+            expected_record_sha256: Some(range.record_sha256.clone()),
+        });
+    }
+    checkpoint_targets.sort_by(|left, right| {
+        right
+            .range
+            .cmp(&left.range)
+            .then_with(|| right.path.cmp(&left.path))
+    });
+    checkpoint_targets.dedup_by(|left, right| left.range == right.range);
+    checkpoint_targets.truncate(MAX_TASK_BACKFILL_TARGETS);
+    if checkpoint_targets.len() == MAX_TASK_BACKFILL_TARGETS {
+        return checkpoint_targets;
+    }
+
+    persisted_targets.sort_by(|left, right| {
+        right
+            .range
+            .cmp(&left.range)
+            .then_with(|| right.path.cmp(&left.path))
+    });
+    persisted_targets.dedup_by(|left, right| left.range == right.range);
+    persisted_targets.truncate(MAX_TASK_BACKFILL_TARGETS - checkpoint_targets.len());
+    checkpoint_targets.extend(persisted_targets);
+    checkpoint_targets
+}
+
+fn task_indexed_checkpoint_missing_spans(
+    checkpoint: &SessionCheckpoint,
+    indexed_ranges: &[SessionTaskIndexedRange],
+) -> Vec<(u64, u64)> {
+    let mut spans = indexed_ranges
+        .iter()
+        .filter(|range| {
+            range.root_identity == checkpoint.root_identity
+                && range.relative_path == checkpoint.relative_path
+                && range.file_device == checkpoint.file_device
+                && range.file_inode == checkpoint.file_inode
+                && range.prefix_generation == checkpoint.prefix_generation
+                && range.start_offset < checkpoint.committed_offset
+        })
+        .map(|range| {
+            (
+                range.start_offset.min(checkpoint.committed_offset),
+                range.end_offset.min(checkpoint.committed_offset),
+            )
+        })
+        .collect::<Vec<_>>();
+    spans.sort();
+    let mut missing = Vec::new();
+    let mut covered = 0_u64;
+    for (start, end) in spans {
+        if end <= covered {
+            continue;
+        }
+        if start > covered {
+            missing.push((covered, start));
+        }
+        covered = covered.max(end);
+    }
+    if covered < checkpoint.committed_offset {
+        missing.push((covered, checkpoint.committed_offset));
+    }
+    missing
+}
+
+fn task_indexed_session_range_is_covered(
+    session_range: &SessionRange,
+    indexed_ranges: &[SessionTaskIndexedRange],
+) -> bool {
+    indexed_ranges.iter().any(|indexed| {
+        indexed.root_identity == session_range.root_identity
+            && indexed.relative_path == session_range.relative_path
+            && indexed.file_device == session_range.file_device
+            && indexed.file_inode == session_range.file_inode
+            && indexed.prefix_generation == session_range.prefix_generation
+            && indexed.start_offset <= session_range.start_offset
+            && indexed.end_offset >= session_range.end_offset
+    })
+}
+
+fn task_backfill_request(request: TaskBackfillRequest) -> TaskBackfillResult {
+    let mut result = TaskBackfillResult {
+        events: Vec::new(),
+        indexed_ranges: Vec::new(),
+    };
+    for target in request.targets {
+        let Ok(Some((indexed_range, events))) = scan_task_backfill_target(&target) else {
+            continue;
+        };
+        result.indexed_ranges.push(indexed_range);
+        result.events.extend(events);
+    }
+    result.indexed_ranges.sort();
+    result.indexed_ranges.dedup();
+    result.events.sort();
+    result.events.dedup();
+    result
+}
+
+fn scan_task_backfill_target(
+    target: &TaskBackfillTarget,
+) -> Result<Option<(SessionTaskIndexedRange, Vec<SessionTaskEvent>)>, RecorderError> {
+    let before_path = fs::symlink_metadata(&target.path)?;
+    if before_path.file_type().is_symlink() || !before_path.is_file() {
+        return Ok(None);
+    }
+    let before_file = fs::metadata(&target.path)?;
+    let source_identity = file_identity(&before_file);
+    if !same_file_identity(&before_path, &before_file)
+        || (target.expected_record_sha256.is_none()
+            && source_identity != (target.range.file_device, target.range.file_inode))
+        || target.range.start_offset >= target.range.end_offset
+        || target.range.end_offset > before_file.len()
+    {
+        return Ok(None);
+    }
+    let mut file = File::open(&target.path)?;
+    file.seek(SeekFrom::Start(target.range.start_offset))?;
+    let mut reader = BufReader::new(
+        file.take(
+            target
+                .range
+                .end_offset
+                .saturating_sub(target.range.start_offset),
+        ),
+    );
+    let mut offset = target.range.start_offset;
+    let mut range_record_index = 0_u64;
+    let mut range_start_seen = true;
+    let mut events = Vec::new();
+    loop {
+        let record_start = offset;
+        let record = read_streaming_record(&mut reader)?;
+        let (summary, bytes) = match record {
+            RecordRead::End => break,
+            RecordRead::Present(summary, bytes) => (summary, bytes),
+            RecordRead::Invalid(bytes, true) => {
+                let Some(next_offset) = offset.checked_add(bytes) else {
+                    return Ok(None);
+                };
+                if next_offset > target.range.end_offset {
+                    return Ok(None);
+                }
+                offset = next_offset;
+                range_record_index = range_record_index.saturating_add(1);
+                continue;
+            }
+            RecordRead::Invalid(_, false) | RecordRead::Unterminated(_) => return Ok(None),
+        };
+        let Some(next_offset) = offset.checked_add(bytes) else {
+            return Ok(None);
+        };
+        if next_offset > target.range.end_offset {
+            return Ok(None);
+        }
+        if record_start < target.range.start_offset {
+            if next_offset > target.range.start_offset {
+                return Ok(None);
+            }
+            offset = next_offset;
+            continue;
+        }
+        range_start_seen = true;
+        if let Some(running) = summary.task_running() {
+            let timestamp = summary.event_timestamp();
+            if timestamp <= 0 {
+                return Ok(None);
+            }
+            if record_start >= target.range.start_offset {
+                events.push(SessionTaskEvent {
+                    root_identity: target.range.root_identity.clone(),
+                    relative_path: target.range.relative_path.clone(),
+                    file_device: target.range.file_device,
+                    file_inode: target.range.file_inode,
+                    prefix_generation: target.range.prefix_generation,
+                    start_offset: target.range.start_offset,
+                    end_offset: target.range.end_offset,
+                    record_sha256: target.range.record_sha256.clone(),
+                    event_index: range_record_index,
+                    timestamp,
+                    running,
+                });
+            }
+        }
+        offset = next_offset;
+        range_record_index = range_record_index.saturating_add(1);
+    }
+    if offset != target.range.end_offset || !range_start_seen {
+        return Ok(None);
+    }
+    let record_sha256 = sha256_file_range(
+        &target.path,
+        target.range.start_offset,
+        target.range.end_offset,
+    )?;
+    let after_file = fs::metadata(&target.path)?;
+    let after_path = fs::symlink_metadata(&target.path)?;
+    if after_path.file_type().is_symlink()
+        || !after_path.is_file()
+        || !same_file_identity(&after_file, &after_path)
+        || file_identity(&after_file) != source_identity
+        || after_file.len() < target.range.end_offset
+        || target
+            .expected_record_sha256
+            .as_deref()
+            .is_some_and(|expected| expected != record_sha256)
+    {
+        return Ok(None);
+    }
+    let mut indexed_range = target.range.clone();
+    indexed_range.record_sha256 = record_sha256;
+    for event in &mut events {
+        event.record_sha256 = indexed_range.record_sha256.clone();
+    }
+    Ok(Some((indexed_range, events)))
 }
 
 fn file_identity(metadata: &Metadata) -> (u64, u64) {
@@ -3156,6 +4908,48 @@ fn sha256_file_range(path: &Path, start: u64, end: u64) -> Result<String, Record
     Ok(hex_digest(hasher.finalize().as_slice()))
 }
 
+fn session_file_has_partial_tail(path: &Path, file_bytes: u64) -> Result<bool, RecorderError> {
+    if file_bytes == 0 {
+        return Ok(false);
+    }
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(file_bytes - 1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
+}
+
+fn session_boundary_lineage(
+    collector_epoch: u128,
+    source: &RecordedSessionSource,
+    prior: Option<&SessionCheckpoint>,
+    boundary_len: u64,
+) -> (u128, String) {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex-info-session-boundary-lineage-v1\0");
+    hasher.update(collector_epoch.to_be_bytes());
+    hasher.update(source.root_identity.as_bytes());
+    hasher.update([0]);
+    hasher.update(source.relative_path.as_bytes());
+    hasher.update(source.file_device.to_be_bytes());
+    hasher.update(source.file_inode.to_be_bytes());
+    hasher.update(boundary_len.to_be_bytes());
+    if let Some(prior) = prior {
+        hasher.update(prior.prefix_generation.to_be_bytes());
+        hasher.update(prior.prefix_sha256.as_bytes());
+    } else {
+        hasher.update(0_u128.to_be_bytes());
+        hasher.update(b"no-prior-lineage");
+    }
+    let digest = hasher.finalize();
+    let mut generation = [0_u8; 16];
+    generation.copy_from_slice(&digest[..16]);
+    (
+        u128::from_be_bytes(generation).max(1),
+        hex_digest(digest.as_slice()),
+    )
+}
+
 fn prefix_generation(
     collector_epoch: u128,
     source: &RecordedSessionSource,
@@ -3185,6 +4979,27 @@ fn collector_epoch(root: &Path, database: Option<&Path>, state: &SessionCollecti
         hasher.update(database.to_string_lossy().as_bytes());
     }
     hasher.update(state.data_generation.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    u128::from_be_bytes(bytes).max(1)
+}
+
+fn account_boundary_collector_epoch(
+    root: &Path,
+    database: &Path,
+    partition_id: &str,
+    transition_fingerprint: &str,
+) -> u128 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex-info-account-boundary-collector-epoch-v1\0");
+    hasher.update(root.to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(database.to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(partition_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(transition_fingerprint.as_bytes());
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
@@ -3375,8 +5190,10 @@ enum SessionJsonKey {
     Model,
     Payload,
     ThreadSettings,
+    HistoryBase,
     Info,
     TotalTokenUsage,
+    LastTokenUsage,
     TotalTokens,
     CacheWriteInputTokens,
     InputTokens,
@@ -3385,14 +5202,16 @@ enum SessionJsonKey {
     Other,
 }
 
-const SESSION_JSON_KEYS: [(&[u8], SessionJsonKey); 12] = [
+const SESSION_JSON_KEYS: [(&[u8], SessionJsonKey); 14] = [
     (b"type", SessionJsonKey::Type),
     (b"timestamp", SessionJsonKey::Timestamp),
     (b"model", SessionJsonKey::Model),
     (b"payload", SessionJsonKey::Payload),
     (b"thread_settings", SessionJsonKey::ThreadSettings),
+    (b"history_base", SessionJsonKey::HistoryBase),
     (b"info", SessionJsonKey::Info),
     (b"total_token_usage", SessionJsonKey::TotalTokenUsage),
+    (b"last_token_usage", SessionJsonKey::LastTokenUsage),
     (b"total_tokens", SessionJsonKey::TotalTokens),
     (
         b"cache_write_input_tokens",
@@ -3410,6 +5229,7 @@ enum SessionJsonObject {
     ThreadSettings,
     Info,
     TokenUsage,
+    LastTokenUsage,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3433,6 +5253,10 @@ impl TokenUsageSummary {
             output: self.output.unwrap_or(0),
         })
     }
+
+    fn valid_snapshot(&self) -> Option<TokenSnapshot> {
+        (!self.malformed).then(|| self.snapshot()).flatten()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3446,12 +5270,17 @@ struct PayloadSummary {
     thread_settings_model: Option<String>,
     thread_settings_model_seen: bool,
     thread_settings_model_malformed: bool,
+    history_base_seen: bool,
+    history_base_non_null: bool,
     info_seen: bool,
     info_null: bool,
     info_object: bool,
     token_usage_seen: bool,
     token_usage_object: bool,
     token_usage: TokenUsageSummary,
+    last_token_usage_seen: bool,
+    last_token_usage_object: bool,
+    last_token_usage: TokenUsageSummary,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3518,6 +5347,23 @@ impl SessionRecordSummary {
     fn token_snapshot(&self) -> Option<TokenSnapshot> {
         (self.event_type() == Some("token_count") && self.payload_object)
             .then(|| self.payload.token_usage.snapshot())
+            .flatten()
+    }
+
+    fn history_base_continuation(&self) -> bool {
+        self.outer_type.as_deref() == Some("session_meta")
+            && self.payload_object
+            && self.payload.history_base_seen
+            && self.payload.history_base_non_null
+    }
+
+    fn last_token_snapshot(&self) -> Option<TokenSnapshot> {
+        (self.event_type() == Some("token_count")
+            && self.payload_object
+            && self.payload.info_object
+            && self.payload.last_token_usage_seen
+            && self.payload.last_token_usage_object)
+            .then(|| self.payload.last_token_usage.valid_snapshot())
             .flatten()
     }
 
@@ -3779,6 +5625,11 @@ impl<'a, R: BufRead> SessionRecordInput<'a, R> {
                         self.skip_value()?;
                     }
                 }
+                SessionJsonKey::HistoryBase => {
+                    summary.payload.history_base_seen = true;
+                    summary.payload.history_base_non_null = self.peek_byte()? != Some(b'n');
+                    self.skip_value()?;
+                }
                 SessionJsonKey::Info => {
                     summary.payload.info_seen = true;
                     summary.payload.info_null = self.peek_byte()? == Some(b'n');
@@ -3820,39 +5671,60 @@ impl<'a, R: BufRead> SessionRecordInput<'a, R> {
                         self.skip_value()?;
                         summary.payload.token_usage.malformed = true;
                     }
+                } else if key == SessionJsonKey::LastTokenUsage {
+                    summary.payload.last_token_usage_seen = true;
+                    summary.payload.last_token_usage_object = false;
+                    summary.payload.last_token_usage = TokenUsageSummary::default();
+                    if self.peek_byte()? == Some(b'{') {
+                        summary.payload.last_token_usage_object = true;
+                        self.parse_object(SessionJsonObject::LastTokenUsage, summary)?;
+                        if !summary.payload.last_token_usage.total_seen {
+                            summary.payload.last_token_usage.malformed = true;
+                        }
+                    } else {
+                        self.skip_value()?;
+                        summary.payload.last_token_usage.malformed = true;
+                    }
                 } else {
                     self.skip_value()?;
                 }
             }
-            SessionJsonObject::TokenUsage => match key {
-                SessionJsonKey::TotalTokens => {
-                    summary.payload.token_usage.total_seen = true;
-                    let (value, malformed) = self.parse_u64_value()?;
-                    summary.payload.token_usage.total = value;
-                    summary.payload.token_usage.malformed |= malformed || value.is_none();
+            SessionJsonObject::TokenUsage | SessionJsonObject::LastTokenUsage => {
+                let token_usage = match object {
+                    SessionJsonObject::TokenUsage => &mut summary.payload.token_usage,
+                    SessionJsonObject::LastTokenUsage => &mut summary.payload.last_token_usage,
+                    _ => unreachable!("token usage parser object is exhaustive"),
+                };
+                match key {
+                    SessionJsonKey::TotalTokens => {
+                        token_usage.total_seen = true;
+                        let (value, malformed) = self.parse_u64_value()?;
+                        token_usage.total = value;
+                        token_usage.malformed |= malformed || value.is_none();
+                    }
+                    SessionJsonKey::CacheWriteInputTokens => {
+                        let (value, malformed) = self.parse_u64_value()?;
+                        token_usage.cache_write_input = value;
+                        token_usage.malformed |= malformed;
+                    }
+                    SessionJsonKey::InputTokens => {
+                        let (value, malformed) = self.parse_u64_value()?;
+                        token_usage.input = value;
+                        token_usage.malformed |= malformed;
+                    }
+                    SessionJsonKey::CachedInputTokens => {
+                        let (value, malformed) = self.parse_u64_value()?;
+                        token_usage.cached_input = value;
+                        token_usage.malformed |= malformed;
+                    }
+                    SessionJsonKey::OutputTokens => {
+                        let (value, malformed) = self.parse_u64_value()?;
+                        token_usage.output = value;
+                        token_usage.malformed |= malformed;
+                    }
+                    _ => self.skip_value()?,
                 }
-                SessionJsonKey::CacheWriteInputTokens => {
-                    let (value, malformed) = self.parse_u64_value()?;
-                    summary.payload.token_usage.cache_write_input = value;
-                    summary.payload.token_usage.malformed |= malformed;
-                }
-                SessionJsonKey::InputTokens => {
-                    let (value, malformed) = self.parse_u64_value()?;
-                    summary.payload.token_usage.input = value;
-                    summary.payload.token_usage.malformed |= malformed;
-                }
-                SessionJsonKey::CachedInputTokens => {
-                    let (value, malformed) = self.parse_u64_value()?;
-                    summary.payload.token_usage.cached_input = value;
-                    summary.payload.token_usage.malformed |= malformed;
-                }
-                SessionJsonKey::OutputTokens => {
-                    let (value, malformed) = self.parse_u64_value()?;
-                    summary.payload.token_usage.output = value;
-                    summary.payload.token_usage.malformed |= malformed;
-                }
-                _ => self.skip_value()?,
-            },
+            }
         }
         Ok(())
     }
@@ -4256,7 +6128,7 @@ impl<'a, R: BufRead> SessionRecordInput<'a, R> {
     }
 }
 
-fn read_streaming_record(reader: &mut BufReader<File>) -> Result<RecordRead, RecorderError> {
+fn read_streaming_record<R: BufRead>(reader: &mut R) -> Result<RecordRead, RecorderError> {
     if reader.fill_buf()?.is_empty() {
         return Ok(RecordRead::End);
     }
@@ -4352,6 +6224,10 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    static ACCOUNT_BOUNDARY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn temp_root(name: &str) -> PathBuf {
         let root =
@@ -4395,6 +6271,38 @@ mod tests {
         (root, database)
     }
 
+    fn downgrade_canonical_history_to_v9(connection: &Connection) {
+        connection
+            .execute_batch(
+                "DROP TRIGGER usage_history_canonical_insert_guard;
+                 DROP TRIGGER usage_history_canonical_update_guard;
+                 DROP TRIGGER usage_model_history_canonical_insert_guard;
+                 DROP TRIGGER usage_model_history_canonical_update_guard;
+                 DROP TRIGGER durable_history_observation_insert_guard;
+                 DROP TRIGGER durable_history_observation_update_guard;
+                 DROP TRIGGER usage_history_sidecar_update_guard;
+                 DROP TRIGGER usage_history_sidecar_delete_guard;
+                 DROP INDEX usage_history_canonical_timestamp_idx;
+                 DROP INDEX usage_model_history_canonical_timestamp_model_idx;
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_test_account_authority(root: &Path, account_id: &str) {
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
+        let auth = root.join(AUTH_FILE_NAME);
+        fs::write(
+            &auth,
+            format!(
+                "{{\"tokens\":{{\"account_id\":\"{account_id}\",\"access_token\":\"secret-test-value\"}}}}"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(auth, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
     fn token(total: u64, timestamp: i64) -> String {
         format!(
             "{{\"type\":\"event_msg\",\"timestamp\":\"{}\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"total_tokens\":{},\"input_tokens\":{},\"cached_input_tokens\":0,\"output_tokens\":0}}}}}}}}\n",
@@ -4403,6 +6311,173 @@ mod tests {
                 .to_rfc3339(),
             total,
             total
+        )
+    }
+
+    fn paginated_token(total: u64, last_total: u64, timestamp: i64) -> String {
+        format!(
+            "{{\"type\":\"event_msg\",\"timestamp\":\"{}\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"total_tokens\":{},\"input_tokens\":{},\"cached_input_tokens\":0,\"output_tokens\":0}},\"last_token_usage\":{{\"total_tokens\":{},\"input_tokens\":{},\"cached_input_tokens\":0,\"output_tokens\":0}}}}}}}}\n",
+            DateTime::<Utc>::from_timestamp(timestamp, 0)
+                .unwrap()
+                .to_rfc3339(),
+            total,
+            total,
+            last_total,
+            last_total
+        )
+    }
+
+    #[test]
+    fn recorder_account_identity_contract_authority_is_exact_and_redacted() {
+        let authority = parse_account_authority(
+            br#"{"email":"person@example.invalid","tokens":{"account_id":"authority-1","access_token":"opaque"}}"#,
+        )
+        .expect("valid account authority");
+        assert!(authority.account_id.0 == b"authority-1");
+
+        let debug = format!("{authority:?}");
+        assert!(!debug.contains("person@example.invalid"));
+        assert!(!debug.contains("opaque"));
+        assert!(!debug.contains("authority-1"));
+
+        assert!(parse_account_authority(
+            br#"{"tokens":{"account_id":"authority-1","account_id":"authority-2"}}"#,
+        )
+        .is_err());
+        assert!(parse_account_authority(br#"{"tokens":{"account_id":1}}"#).is_err());
+        assert!(parse_account_authority(br#"{"tokens":{"account_id":""}}"#).is_err());
+    }
+
+    #[test]
+    fn recorder_account_identity_contract_window_rejects_authority_account_and_generation_changes()
+    {
+        let authority = AccountAuthority {
+            account_id: AccountAuthorityId::from_str("authority-1").unwrap(),
+        };
+        let account = AppServerAccount {
+            email: "person@example.invalid".to_owned(),
+            plan_type: "pro".to_owned(),
+        };
+        let window = AccountIdentityWindow::new(authority.clone(), account.clone(), 7);
+        let stable_updates = AccountUpdateTracker {
+            generation: 7,
+            ..AccountUpdateTracker::default()
+        };
+        assert!(window.is_stable(&authority, &account, &stable_updates));
+
+        let changed_authority = AccountAuthority {
+            account_id: AccountAuthorityId::from_str("authority-2").unwrap(),
+        };
+        assert!(!window.is_stable(&changed_authority, &account, &stable_updates));
+
+        let changed_account = AppServerAccount {
+            email: "other@example.invalid".to_owned(),
+            ..account.clone()
+        };
+        assert!(!window.is_stable(&authority, &changed_account, &stable_updates));
+
+        let changed_generation = AccountUpdateTracker {
+            generation: 8,
+            ..stable_updates
+        };
+        assert!(!window.is_stable(&authority, &account, &changed_generation));
+    }
+
+    #[test]
+    fn recorder_account_identity_contract_tracks_account_updated_as_boundary() {
+        let _guard = ACCOUNT_BOUNDARY_TEST_LOCK.lock().unwrap();
+        clear_account_boundary_changed();
+        let raw = r#"{"jsonrpc":"2.0","method":"account/updated","params":{"authMode":"chatgpt","planType":"pro"}}"#;
+        let value: Value = serde_json::from_str(raw).unwrap();
+        let mut tracker = AccountUpdateTracker::for_app_server();
+        assert!(tracker.observe(&value, raw).unwrap());
+        assert_eq!(tracker.generation, 1);
+        assert!(tracker.valid);
+        assert!(account_boundary_changed());
+        clear_account_boundary_changed();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorder_account_identity_contract_rejects_queued_result_after_authority_change() {
+        let _guard = ACCOUNT_BOUNDARY_TEST_LOCK.lock().unwrap();
+        clear_account_boundary_changed();
+        let root = temp_root("queued-account-epoch");
+        write_test_account_authority(&root, "authority-1");
+        let epoch = AccountEpochProof::capture(&root).unwrap();
+        let success = QuotaPollSuccess {
+            snapshot: QuotaSnapshot {
+                observed_at: 100,
+                reset_at: 200,
+                window_seconds: 100,
+                remaining_percent: Some(90.0),
+            },
+            login_id: "person@example.invalid".to_owned(),
+            epoch,
+        };
+        let (sender, receiver) = mpsc::sync_channel(2);
+        sender.try_send(Ok(success)).unwrap();
+        drop(sender);
+        let worker = thread::spawn(|| {});
+        let mut poller = QuotaPoller {
+            receiver,
+            _worker: worker,
+            latest: None,
+            events: Vec::new(),
+        };
+
+        let candidate = poller.latest().expect("queued candidate");
+        assert!(candidate.validate_current(&root));
+        let event_epoch = match poller.take_events().pop().expect("ready event") {
+            QuotaPollEvent::Ready { epoch, .. } => epoch,
+            QuotaPollEvent::Failed => panic!("unexpected failed event"),
+        };
+        assert!(event_epoch.validate_current(&root));
+        assert!(!format!("{candidate:?}").contains("authority-1"));
+        assert!(!format!("{candidate:?}").contains("secret-test-value"));
+
+        write_test_account_authority(&root, "authority-2");
+        assert!(!candidate.validate_current(&root));
+        assert!(!event_epoch.validate_current(&root));
+        clear_account_boundary_changed();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recorder_account_identity_contract_linearizes_commit_before_update_boundary() {
+        let _guard = ACCOUNT_BOUNDARY_TEST_LOCK.lock().unwrap();
+        clear_account_boundary_changed();
+        let generation_before = account_boundary_generation();
+        let commit = account_epoch_commit_fence().unwrap();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_start = start.clone();
+        let worker = thread::spawn(move || {
+            worker_start.wait();
+            signal_account_boundary_changed();
+        });
+
+        start.wait();
+        while !APP_SERVER_ACCOUNT_BOUNDARY_PENDING.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        assert!(!APP_SERVER_ACCOUNT_BOUNDARY_CHANGED.load(Ordering::Acquire));
+        drop(commit);
+        worker.join().unwrap();
+        assert!(APP_SERVER_ACCOUNT_BOUNDARY_CHANGED.load(Ordering::Acquire));
+        assert_eq!(account_boundary_generation(), generation_before + 1);
+        assert!(matches!(
+            account_epoch_commit_fence(),
+            Err(RecorderError::AccountBoundaryChanged)
+        ));
+        clear_account_boundary_changed();
+    }
+
+    fn task_event(kind: &str, timestamp: i64) -> String {
+        format!(
+            "{{\"type\":\"{kind}\",\"timestamp\":\"{}\"}}\n",
+            DateTime::<Utc>::from_timestamp(timestamp, 0)
+                .unwrap()
+                .to_rfc3339()
         )
     }
 
@@ -4441,6 +6516,390 @@ mod tests {
             5
         );
         assert_eq!(recorder.run_cycle().unwrap().unwrap().generation, 3);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_range_persists_task_lifecycle_events_and_index() {
+        let (root, database) = prepare("task-events");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        fs::write(
+            &source,
+            format!(
+                "{}{}{}",
+                task_event("task_started", now),
+                task_event("task_completed", now + 1),
+                task_event("turn_aborted", now + 2)
+            ),
+        )
+        .unwrap();
+
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        assert_eq!(recorder.run_cycle().unwrap().unwrap().accepted_ranges, 1);
+
+        let events = recorder.writer.load_session_task_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.event_index, event.timestamp, event.running))
+                .collect::<Vec<_>>(),
+            vec![(0, now, true), (1, now + 1, false), (2, now + 2, false)]
+        );
+        assert_eq!(
+            recorder
+                .writer
+                .load_session_task_indexed_ranges()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(recorder.writer.session_task_coverage_complete().unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_zero_event_range_is_indexed_without_inventing_lifecycle_state() {
+        let (root, database) = prepare("task-zero-event");
+        let source = root.join("sessions/one.jsonl");
+        fs::write(&source, "{\"type\":\"session_meta\"}\n").unwrap();
+
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        assert_eq!(recorder.run_cycle().unwrap().unwrap().accepted_ranges, 1);
+        assert!(recorder
+            .writer
+            .load_session_task_events()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            recorder
+                .writer
+                .load_session_task_indexed_ranges()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(recorder.writer.session_task_coverage_complete().unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn task_backfill_targets_advance_after_indexed_batch() {
+        let total = MAX_TASK_BACKFILL_TARGETS + 2;
+        let mut sources = Vec::with_capacity(total);
+        let mut checkpoints = Vec::with_capacity(total);
+        for index in 0..total {
+            let relative_path = format!("session-{index:05}.jsonl");
+            let file_inode = index as u64 + 1;
+            sources.push(Source {
+                path: PathBuf::from("/sessions").join(&relative_path),
+                recorded: RecordedSessionSource {
+                    root_identity: "root".to_owned(),
+                    relative_path: relative_path.clone(),
+                    file_bytes: 1,
+                    modified_nanos: 1,
+                    file_device: 7,
+                    file_inode,
+                },
+            });
+            checkpoints.push(SessionCheckpoint {
+                root_identity: "root".to_owned(),
+                relative_path,
+                file_device: 7,
+                file_inode,
+                committed_offset: 1,
+                discard_until_lf: false,
+                collector_epoch: 1,
+                cycle_seq: 1,
+                prefix_generation: 1,
+                prefix_sha256: EMPTY_SHA256.to_owned(),
+                fully_attributed_from_zero: true,
+                token_baseline_known: true,
+                last_model: None,
+                last_task_running: None,
+                previous_total: 0,
+                previous_input: 0,
+                previous_cached_input: 0,
+                previous_output: 0,
+                previous_cache_write_input: None,
+            });
+        }
+
+        let first_batch = build_task_backfill_targets(
+            Path::new("/sessions"),
+            "root",
+            &sources,
+            &checkpoints,
+            &[],
+            &[],
+        );
+        assert_eq!(first_batch.len(), MAX_TASK_BACKFILL_TARGETS);
+        let indexed_after_first_batch = first_batch
+            .iter()
+            .map(|target| target.range.clone())
+            .collect::<Vec<_>>();
+
+        let second_batch = build_task_backfill_targets(
+            Path::new("/sessions"),
+            "root",
+            &sources,
+            &checkpoints,
+            &[],
+            &indexed_after_first_batch,
+        );
+        assert_eq!(second_batch.len(), 2);
+        assert_eq!(second_batch[0].range.relative_path, "session-00001.jsonl");
+        assert_eq!(second_batch[1].range.relative_path, "session-00000.jsonl");
+        assert!(second_batch.iter().all(|target| {
+            !indexed_after_first_batch
+                .iter()
+                .any(|indexed| indexed == &target.range)
+        }));
+    }
+
+    #[test]
+    fn task_backfill_targets_keep_partial_coverage_and_match_writer_rules() {
+        let source = |relative_path: &str, file_inode| Source {
+            path: PathBuf::from("/sessions").join(relative_path),
+            recorded: RecordedSessionSource {
+                root_identity: "root".to_owned(),
+                relative_path: relative_path.to_owned(),
+                file_bytes: 100,
+                modified_nanos: 1,
+                file_device: 7,
+                file_inode,
+            },
+        };
+        let checkpoint = |relative_path: &str, file_inode, prefix_generation, committed_offset| {
+            SessionCheckpoint {
+                root_identity: "root".to_owned(),
+                relative_path: relative_path.to_owned(),
+                file_device: 7,
+                file_inode,
+                committed_offset,
+                discard_until_lf: false,
+                collector_epoch: 1,
+                cycle_seq: 1,
+                prefix_generation,
+                prefix_sha256: EMPTY_SHA256.to_owned(),
+                fully_attributed_from_zero: true,
+                token_baseline_known: true,
+                last_model: None,
+                last_task_running: None,
+                previous_total: 0,
+                previous_input: 0,
+                previous_cached_input: 0,
+                previous_output: 0,
+                previous_cache_write_input: None,
+            }
+        };
+        let session_range = |relative_path: &str,
+                             file_inode,
+                             prefix_generation,
+                             start_offset,
+                             end_offset,
+                             sha256: &str| {
+            SessionRange {
+                root_identity: "root".to_owned(),
+                relative_path: relative_path.to_owned(),
+                file_device: 7,
+                file_inode,
+                start_offset,
+                end_offset,
+                collector_epoch: 1,
+                cycle_seq: 1,
+                prefix_generation,
+                record_sha256: sha256.to_owned(),
+            }
+        };
+        let indexed_range = |relative_path: &str,
+                             file_inode,
+                             prefix_generation,
+                             start_offset,
+                             end_offset,
+                             sha256: &str| {
+            SessionTaskIndexedRange {
+                root_identity: "root".to_owned(),
+                relative_path: relative_path.to_owned(),
+                file_device: 7,
+                file_inode,
+                start_offset,
+                end_offset,
+                collector_epoch: 1,
+                cycle_seq: 1,
+                prefix_generation,
+                record_sha256: sha256.to_owned(),
+            }
+        };
+
+        let sources = vec![
+            source("checkpoint-full.jsonl", 1),
+            source("checkpoint-partial.jsonl", 2),
+            source("range-full.jsonl", 3),
+            source("range-partial.jsonl", 4),
+        ];
+        let checkpoints = vec![
+            checkpoint("checkpoint-full.jsonl", 1, 11, 100),
+            checkpoint("checkpoint-partial.jsonl", 2, 12, 100),
+        ];
+        let persisted_ranges = vec![
+            session_range("range-full.jsonl", 3, 21, 20, 40, "range-full-sha"),
+            session_range("range-partial.jsonl", 4, 22, 20, 40, "range-partial-sha"),
+        ];
+        let indexed_ranges = vec![
+            indexed_range("checkpoint-full.jsonl", 1, 11, 0, 100, "other-sha"),
+            indexed_range("checkpoint-partial.jsonl", 2, 12, 0, 50, "partial-sha"),
+            indexed_range("range-full.jsonl", 3, 21, 0, 50, "range-full-sha"),
+            indexed_range("range-partial.jsonl", 4, 22, 0, 30, "range-partial-sha"),
+        ];
+
+        let targets = build_task_backfill_targets(
+            Path::new("/sessions"),
+            "root",
+            &sources,
+            &checkpoints,
+            &persisted_ranges,
+            &indexed_ranges,
+        );
+        assert_eq!(targets.len(), 2);
+        let checkpoint_target = targets
+            .iter()
+            .find(|target| target.range.relative_path == "checkpoint-partial.jsonl")
+            .expect("partial checkpoint coverage remains scheduled");
+        assert_eq!(checkpoint_target.range.start_offset, 50);
+        assert_eq!(checkpoint_target.range.end_offset, 100);
+        assert!(checkpoint_target.expected_record_sha256.is_none());
+        let persisted_target = targets
+            .iter()
+            .find(|target| target.range.relative_path == "range-partial.jsonl")
+            .expect("partial persisted coverage remains scheduled");
+        assert_eq!(persisted_target.range.start_offset, 20);
+        assert_eq!(persisted_target.range.end_offset, 40);
+        assert_eq!(
+            persisted_target.expected_record_sha256.as_deref(),
+            Some("range-partial-sha")
+        );
+    }
+
+    #[test]
+    fn background_backfill_indexes_existing_range_and_rejects_sha_mismatch() {
+        let (root, database) = prepare("task-backfill");
+        let sessions = root.join("sessions");
+        let source = sessions.join("one.jsonl");
+        let now = Utc::now().timestamp();
+        fs::write(
+            &source,
+            format!(
+                "{}{}",
+                task_event("task_started", now),
+                task_event("task_completed", now + 1)
+            ),
+        )
+        .unwrap();
+        let source_metadata = fs::metadata(&source).unwrap();
+        let sessions_metadata = fs::metadata(&sessions).unwrap();
+        let recorded = RecordedSessionSource {
+            root_identity: root_identity(&sessions, &sessions_metadata),
+            relative_path: "one.jsonl".to_owned(),
+            file_bytes: source_metadata.len(),
+            modified_nanos: 1,
+            file_device: file_device(&source_metadata),
+            file_inode: file_inode(&source_metadata),
+        };
+        let record_sha256 = sha256_file_range(&source, 0, recorded.file_bytes).unwrap();
+        let collector_epoch = 0xabc_u128;
+        let prefix_generation = prefix_generation(collector_epoch, &recorded, EMPTY_SHA256);
+        let checkpoint = SessionCheckpoint {
+            root_identity: recorded.root_identity.clone(),
+            relative_path: recorded.relative_path.clone(),
+            file_device: recorded.file_device,
+            file_inode: recorded.file_inode,
+            committed_offset: recorded.file_bytes,
+            discard_until_lf: false,
+            collector_epoch,
+            cycle_seq: 1,
+            prefix_generation,
+            prefix_sha256: EMPTY_SHA256.to_owned(),
+            fully_attributed_from_zero: true,
+            token_baseline_known: true,
+            last_model: None,
+            last_task_running: None,
+            previous_total: 0,
+            previous_input: 0,
+            previous_cached_input: 0,
+            previous_output: 0,
+            previous_cache_write_input: None,
+        };
+        let range = SessionRange {
+            root_identity: recorded.root_identity.clone(),
+            relative_path: recorded.relative_path.clone(),
+            file_device: recorded.file_device,
+            file_inode: recorded.file_inode,
+            start_offset: 0,
+            end_offset: recorded.file_bytes,
+            collector_epoch,
+            cycle_seq: 1,
+            prefix_generation,
+            record_sha256: record_sha256.clone(),
+        };
+        let mut store = UsageStore::open_partitioned(&database, &identity()).unwrap();
+        store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at: 1_800_604_800,
+                window_seconds: 3_600,
+                collector_epoch,
+                cycle_seq: 1,
+                samples: &[],
+                checkpoints: std::slice::from_ref(&checkpoint),
+                ranges: std::slice::from_ref(&range),
+                model_totals: &[],
+                recorded_sessions: &[],
+            })
+            .unwrap();
+        drop(store);
+
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        let mut complete = false;
+        for _ in 0..20 {
+            recorder.run_cycle().unwrap().unwrap();
+            complete = recorder.writer.session_task_coverage_complete().unwrap();
+            if complete {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(complete);
+        let events = recorder.writer.load_session_task_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.event_index, event.timestamp, event.running))
+                .collect::<Vec<_>>(),
+            vec![(0, now, true), (1, now + 1, false)]
+        );
+
+        let invalid_target = TaskBackfillTarget {
+            path: source,
+            range: SessionTaskIndexedRange {
+                root_identity: range.root_identity,
+                relative_path: range.relative_path,
+                file_device: range.file_device,
+                file_inode: range.file_inode,
+                start_offset: range.start_offset,
+                end_offset: range.end_offset,
+                collector_epoch: range.collector_epoch,
+                cycle_seq: range.cycle_seq,
+                prefix_generation: range.prefix_generation,
+                record_sha256: "00".repeat(32),
+            },
+            expected_record_sha256: Some("00".repeat(32)),
+        };
+        assert!(scan_task_backfill_target(&invalid_target)
+            .unwrap()
+            .is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4773,6 +7232,78 @@ mod tests {
     }
 
     #[test]
+    fn reset_deadline_correction_keeps_one_recorder_period() {
+        let (root, database) = prepare("reset-deadline-correction");
+        let source = root.join("sessions/one.jsonl");
+        let observed_at = Utc::now().timestamp();
+        let window_seconds = 7 * 24 * 60 * 60;
+        let canonical_reset_at = observed_at + window_seconds;
+        fs::write(&source, token(10, observed_at)).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at,
+                reset_at: canonical_reset_at,
+                window_seconds,
+                remaining_percent: Some(100.0),
+            }))
+            .unwrap()
+            .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(token(15, observed_at + 1).as_bytes())
+            .unwrap();
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: observed_at + 2,
+                reset_at: canonical_reset_at,
+                window_seconds,
+                remaining_percent: Some(99.0),
+            }))
+            .unwrap()
+            .unwrap();
+        let before = recorder.state().unwrap();
+        assert!(!before.model_totals.is_empty());
+        assert!(!before.checkpoints.is_empty());
+
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: observed_at + 180,
+                reset_at: canonical_reset_at + 134,
+                window_seconds,
+                remaining_percent: Some(99.0),
+            }))
+            .unwrap()
+            .unwrap();
+        let after = recorder.state().unwrap();
+        assert_eq!(after.reset_at, canonical_reset_at);
+        assert_eq!(after.window_seconds, window_seconds);
+        assert_eq!(after.model_totals, before.model_totals);
+        assert_eq!(after.checkpoints, before.checkpoints);
+        assert_eq!(
+            after.last_quota_observation,
+            Some(codex_info_db_writer::SessionQuotaObservation {
+                observed_at: observed_at + 180,
+                remaining_percent: 99.0,
+            })
+        );
+        let reset_count: i64 = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(DISTINCT reset_at) FROM usage_history",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reset_count, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn existing_checkpoint_does_not_drop_first_token_of_new_source() {
         let (root, database) = prepare("new-source-baseline");
         let first_source = root.join("sessions/first.jsonl");
@@ -4787,6 +7318,41 @@ mod tests {
         assert_eq!(
             recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
             20
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn paginated_history_base_uses_last_usage_before_total_deltas() {
+        let (root, database) = prepare("paginated-history-base");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        let session_meta =
+            "{\"type\":\"session_meta\",\"payload\":{\"history_mode\":\"paginated\",\"history_base\":{\"id\":\"prior\"}}}\n";
+        fs::write(
+            &source,
+            format!(
+                "{}{}{}",
+                session_meta,
+                paginated_token(2_049_976_186, 111_860, now),
+                token(2_049_976_193, now + 1)
+            ),
+        )
+        .unwrap();
+
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL],
+            TokenSnapshot {
+                total: 111_867,
+                input: 111_867,
+                cached_input: 0,
+                output: 0,
+                cache_write_input: None,
+            }
         );
         let _ = fs::remove_dir_all(root);
     }
@@ -4927,6 +7493,130 @@ mod tests {
     }
 
     #[test]
+    fn historical_login_id_sync_is_persisted_and_repeated_as_read_only_noop() {
+        let (root, database) = prepare("historical-login-id-sync");
+        let connection = Connection::open(&database).unwrap();
+        downgrade_canonical_history_to_v9(&connection);
+        connection
+            .execute_batch(
+                "ALTER TABLE storage_partition DROP COLUMN login_id;
+                 PRAGMA user_version = 8;",
+            )
+            .unwrap();
+        drop(connection);
+        synchronize_partition_login_id(&database, &identity(), "past@example.com").unwrap();
+
+        let reader = UsageStore::open_read_only_partitioned(&database, &identity()).unwrap();
+        assert_eq!(
+            reader.partition_login_id().unwrap().as_deref(),
+            Some("past@example.com")
+        );
+        assert_eq!(
+            reader
+                .load_session_collection_state()
+                .unwrap()
+                .data_generation,
+            0
+        );
+        drop(reader);
+        let backup_count = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("usage_history.sqlite3.bak.")
+            })
+            .count();
+        assert_eq!(backup_count, 1);
+
+        synchronize_partition_login_id(&database, &identity(), "past@example.com").unwrap();
+        let repeated_backup_count = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("usage_history.sqlite3.bak.")
+            })
+            .count();
+        assert_eq!(repeated_backup_count, backup_count);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inactive_partition_without_login_id_receives_canonical_history_migration() {
+        let (root, database) = prepare("inactive-history-without-login-id");
+        let connection = Connection::open(&database).unwrap();
+        downgrade_canonical_history_to_v9(&connection);
+        drop(connection);
+
+        synchronize_inactive_partition(&database, &identity(), None).unwrap();
+        assert!(UsageStore::partition_history_is_current(&database, &identity()).unwrap());
+        let reader = UsageStore::open_read_only_partitioned(&database, &identity()).unwrap();
+        assert_eq!(reader.partition_login_id().unwrap(), None);
+        drop(reader);
+        let backup_count = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("usage_history.sqlite3.bak.")
+            })
+            .count();
+        assert_eq!(backup_count, 1);
+
+        synchronize_inactive_partition(&database, &identity(), None).unwrap();
+        let repeated_backup_count = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("usage_history.sqlite3.bak.")
+            })
+            .count();
+        assert_eq!(repeated_backup_count, backup_count);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn current_active_partition_restart_does_not_rotate_history_backup() {
+        let (root, database) = prepare("current-active-history-noop");
+        let backup_count = || {
+            fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("usage_history.sqlite3.bak.")
+                })
+                .count()
+        };
+
+        let recorder =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        drop(recorder);
+        assert_eq!(backup_count(), 0);
+
+        let restarted =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        drop(restarted);
+        assert_eq!(backup_count(), 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn partial_tail_keeps_start_and_replays_when_completed() {
         let (root, database) = prepare("partial");
         let source = root.join("sessions/one.jsonl");
@@ -4950,6 +7640,178 @@ mod tests {
             recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
             5
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn account_activation_baselines_existing_prefix_and_commits_only_appends() {
+        let (root, database) = prepare("account-activation-baseline");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        let existing = format!(
+            "{}{}{}",
+            task_event("task_started", now - 2),
+            token(10, now - 1),
+            token(15, now)
+        );
+        fs::write(&source, &existing).unwrap();
+        let existing_bytes = existing.len() as u64;
+        let mut recorder = Recorder::open_partitioned_with_activation(
+            config(&root, 1024),
+            &database,
+            &identity(),
+            Some(now),
+        )
+        .unwrap();
+
+        recorder.run_cycle().unwrap().unwrap();
+        let state = recorder.state().unwrap();
+        assert_eq!(state.checkpoints[0].committed_offset, existing_bytes);
+        assert!(!state.checkpoints[0].fully_attributed_from_zero);
+        assert!(recorder.model_totals().unwrap().is_empty());
+        let connection = Connection::open(&database).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM session_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM session_task_events", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(connection);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{}{}", token(20, now + 1), token(25, now + 2)).as_bytes())
+            .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            5
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn returning_account_rebaselines_shared_sessions_without_mixing_other_accounts() {
+        let (root, database) = prepare("returning-account-boundary");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        fs::write(&source, format!("{}{}", token(10, now), token(15, now + 1))).unwrap();
+        let mut first =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        first.run_cycle().unwrap().unwrap();
+        let initial_total = first.model_totals().unwrap()[UNATTRIBUTED_MODEL].total;
+        let original_epoch = first.state().unwrap().collector_epoch.unwrap();
+        drop(first);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{}{}", token(30, now + 2), token(35, now + 3)).as_bytes())
+            .unwrap();
+        let first_transition = "aa".repeat(32);
+        let mut returned = Recorder::open_partitioned_for_account(
+            config(&root, 4096),
+            &database,
+            &identity(),
+            None,
+            Some(&first_transition),
+        )
+        .unwrap();
+        returned.run_cycle().unwrap().unwrap();
+        let first_boundary_state = returned.state().unwrap();
+        assert_ne!(first_boundary_state.collector_epoch, Some(original_epoch));
+        assert_eq!(
+            first_boundary_state.checkpoints[0].committed_offset,
+            fs::metadata(&source).unwrap().len()
+        );
+        assert_eq!(
+            returned.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            initial_total
+        );
+        drop(returned);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{}{}", token(40, now + 4), token(45, now + 5)).as_bytes())
+            .unwrap();
+        let mut crash_restart = Recorder::open_partitioned_for_account(
+            config(&root, 4096),
+            &database,
+            &identity(),
+            None,
+            Some(&first_transition),
+        )
+        .unwrap();
+        crash_restart.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            crash_restart.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            initial_total + 5
+        );
+        drop(crash_restart);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{}{}", token(100, now + 6), token(105, now + 7)).as_bytes())
+            .unwrap();
+        let second_transition = "bb".repeat(32);
+        let mut returned_again = Recorder::open_partitioned_for_account(
+            config(&root, 4096),
+            &database,
+            &identity(),
+            None,
+            Some(&second_transition),
+        )
+        .unwrap();
+        returned_again.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            returned_again.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            initial_total + 5
+        );
+        assert_eq!(
+            returned_again.state().unwrap().checkpoints[0].committed_offset,
+            fs::metadata(&source).unwrap().len()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn account_guard_rejects_prepared_batch_without_a_commit() {
+        let (root, database) = prepare("account-commit-guard");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        fs::write(&source, format!("{}{}", token(10, now), token(15, now + 1))).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+
+        assert!(matches!(
+            recorder.run_cycle_with_quota_guarded(None, || false),
+            Err(RecorderError::AccountBoundaryChanged)
+        ));
+        assert_eq!(recorder.generation().unwrap(), 0);
+        let connection = Connection::open(&database).unwrap();
+        for table in ["session_events", "session_ranges", "session_checkpoints"] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
         let _ = fs::remove_dir_all(root);
     }
 
@@ -5080,5 +7942,76 @@ mod tests {
         assert_eq!(snapshot.model_label(), "gpt-5.6-sol");
         assert_eq!(snapshot.total_tokens(), Some(43));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_rollout_reads_bounded_append_after_large_committed_prefix() {
+        let root = temp_root("active-thread-large-prefix");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("large.jsonl");
+        let committed_offset = security::MAX_SESSION_FILE_BYTES + 1;
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(committed_offset).unwrap();
+        drop(file);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(token(43, Utc::now().timestamp()).as_bytes())
+            .unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let root_metadata = fs::metadata(&sessions).unwrap();
+        let checkpoint = SessionCheckpoint {
+            root_identity: root_identity(&sessions, &root_metadata),
+            relative_path: "large.jsonl".to_owned(),
+            file_device: file_device(&metadata),
+            file_inode: file_inode(&metadata),
+            committed_offset,
+            discard_until_lf: false,
+            collector_epoch: 7,
+            cycle_seq: 3,
+            prefix_generation: 9,
+            prefix_sha256: EMPTY_SHA256.to_owned(),
+            fully_attributed_from_zero: true,
+            token_baseline_known: true,
+            last_model: Some("gpt-5.6-sol".to_owned()),
+            last_task_running: Some(true),
+            previous_total: 42,
+            previous_input: 40,
+            previous_cached_input: 0,
+            previous_output: 2,
+            previous_cache_write_input: Some(0),
+        };
+
+        let snapshot = read_active_rollout(&sessions, &path, &metadata, &checkpoint).unwrap();
+        assert!(snapshot.is_running());
+        assert_eq!(snapshot.total_tokens(), Some(43));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_rollout_recency_bridges_only_unknown_lifecycle_state() {
+        assert_eq!(
+            open_rollout_running_seed(None, true, false, Some(OPEN_ROLLOUT_ACTIVITY_WINDOW)),
+            Some(true)
+        );
+        assert_eq!(
+            open_rollout_running_seed(
+                None,
+                true,
+                false,
+                Some(OPEN_ROLLOUT_ACTIVITY_WINDOW + Duration::from_secs(1))
+            ),
+            None
+        );
+        assert_eq!(
+            open_rollout_running_seed(None, false, true, Some(Duration::ZERO)),
+            None
+        );
+        assert_eq!(
+            open_rollout_running_seed(Some(false), true, true, Some(Duration::ZERO)),
+            Some(false)
+        );
     }
 }

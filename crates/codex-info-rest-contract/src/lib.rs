@@ -17,7 +17,9 @@ pub const MAX_PUBLIC_HISTORY_PERIODS: usize = 128;
 pub const MAX_PUBLIC_HISTORY_SAMPLES: usize = 31 * 24 * 60;
 pub const MAX_PUBLIC_HISTORY_GAPS: usize = 4_096;
 pub const MAX_PUBLIC_THREADS: usize = 256;
+pub const MAX_PUBLIC_ACCOUNTS: usize = 256;
 pub const MAX_PUBLIC_ID_SCALARS: usize = 512;
+pub const MAX_PUBLIC_LOGIN_ID_SCALARS: usize = 254;
 const MAX_PUBLIC_UNIX_SECONDS: i64 = 253_402_300_799;
 const MAX_PUBLIC_HISTORY_LABEL_SCALARS: usize = 512;
 const MAX_PUBLIC_STATUS_SCALARS: usize = 160;
@@ -121,6 +123,99 @@ pub struct PublicThread {
     pub last_user_message_at: Option<i64>,
     pub is_subagent: bool,
     pub depth: Option<i32>,
+}
+
+/// One account-partition choice exposed by the local v3 account selector.
+///
+/// The request id remains the opaque registry storage epoch. `login_id` is
+/// bounded display metadata only; it never carries a token and never takes
+/// part in storage selection. A missing display id or deactivation boundary
+/// is represented as `null` rather than guessed.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicAccountV3 {
+    pub id: String,
+    pub is_current: bool,
+    pub activation_at: Option<i64>,
+    pub deactivation_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_id: Option<String>,
+}
+
+/// Internal v3 account-selector payload.  The REST layer adds the common
+/// `api_version` envelope field when serializing it on the wire.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicAccountsV3 {
+    pub default_account_id: String,
+    pub accounts: Vec<PublicAccountV3>,
+}
+
+fn valid_public_account_id(value: &str) -> bool {
+    let Some(epoch) = value.strip_prefix("account-") else {
+        return false;
+    };
+    let Ok(epoch) = epoch.parse::<u64>() else {
+        return false;
+    };
+    epoch > 0 && value == format!("account-{epoch}")
+}
+
+fn valid_public_login_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && value.chars().count() <= MAX_PUBLIC_LOGIN_ID_SCALARS
+        && !value.chars().any(char::is_control)
+}
+
+impl PublicAccountsV3 {
+    /// Validate the bounded account selector before it crosses the REST
+    /// process boundary.
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.accounts.is_empty() || self.accounts.len() > MAX_PUBLIC_ACCOUNTS {
+            return Err(ContractError::TooManyItems);
+        }
+        if !valid_public_account_id(&self.default_account_id) {
+            return Err(ContractError::InvalidModel);
+        }
+        let mut ids = HashSet::with_capacity(self.accounts.len());
+        let mut current_count = 0usize;
+        let mut default_found = false;
+        for account in &self.accounts {
+            if !valid_public_account_id(&account.id)
+                || !ids.insert(account.id.as_str())
+                || account
+                    .activation_at
+                    .is_some_and(|timestamp| !valid_timestamp(timestamp))
+                || account
+                    .deactivation_at
+                    .is_some_and(|timestamp| !valid_timestamp(timestamp))
+                || account
+                    .activation_at
+                    .zip(account.deactivation_at)
+                    .is_some_and(|(activation, deactivation)| deactivation < activation)
+                || account
+                    .login_id
+                    .as_deref()
+                    .is_some_and(|value| !valid_public_login_id(value))
+            {
+                return Err(ContractError::InvalidModel);
+            }
+            if account.id == self.default_account_id {
+                default_found = true;
+                if !account.is_current {
+                    return Err(ContractError::InvalidModel);
+                }
+            }
+            if account.is_current {
+                current_count = current_count.saturating_add(1);
+            }
+        }
+        if !default_found || current_count != 1 {
+            return Err(ContractError::InvalidModel);
+        }
+        Ok(())
+    }
 }
 
 /// The exact v1 details root.  The `api_version` field is supplied by the
@@ -532,6 +627,11 @@ pub struct PublicHistoryObservationV3 {
     pub timestamp: i64,
     pub reset_at: i64,
     pub remaining_percent: Option<f64>,
+    /// Whether any task was active between the preceding sample in this
+    /// canonical period and this sample.  `None` is fail-closed: the source
+    /// task evidence was absent or its coverage could not be verified.
+    #[serde(default)]
+    pub task_active_since_previous: Option<bool>,
     pub models: Option<Vec<PublicHistoryModelUsageV3>>,
     pub models_complete: bool,
     pub model_source: String,
@@ -543,7 +643,7 @@ pub struct PublicHistoryObservationV3 {
 pub fn legacy_history_models_v3(
     sample: &PublicHistoryObservation,
 ) -> Option<Vec<PublicHistoryModelUsageV3>> {
-    if sample.model_source == "unavailable" {
+    if !matches!(sample.model_source.as_str(), "confirmed" | "legacy-unknown") {
         return None;
     }
     Some(vec![
@@ -609,35 +709,24 @@ impl PublicDetailsV3 {
             .history_samples
             .iter()
             .map(|sample| {
-                let models = match (
-                    sample.sol_tokens,
-                    sample.terra_tokens,
-                    sample.luna_tokens,
-                    sample.sol_dollars,
-                    sample.terra_dollars,
-                    sample.luna_dollars,
-                ) {
-                    (
-                        Some(sol_tokens),
-                        Some(terra_tokens),
-                        Some(luna_tokens),
-                        Some(sol_dollars),
-                        Some(terra_dollars),
-                        Some(luna_dollars),
-                    ) => Some(vec![
-                        legacy_model("SOL", sol_tokens, sol_dollars),
-                        legacy_model("TERRA", terra_tokens, terra_dollars),
-                        legacy_model("LUNA", luna_tokens, luna_dollars),
-                    ]),
-                    _ => None,
+                // V2 has no generic-model completeness proof.  It can carry
+                // exact legacy rows, but a session-reconstructed row is
+                // audit metadata rather than a point-in-time observation and
+                // must never cross the REST boundary as model values.
+                let models = legacy_history_models_v3(sample);
+                let model_source = match sample.model_source.as_str() {
+                    "confirmed" | "legacy-unknown" if models.is_some() => "legacy-unknown",
+                    "reconstructed-from-session" => "reconstructed-from-session",
+                    _ => "unavailable",
                 };
                 PublicHistoryObservationV3 {
                     timestamp: sample.timestamp,
                     reset_at: sample.reset_at,
                     remaining_percent: sample.remaining_percent,
+                    task_active_since_previous: None,
                     models,
                     models_complete: false,
-                    model_source: sample.model_source.clone(),
+                    model_source: model_source.to_owned(),
                 }
             })
             .collect();
@@ -735,8 +824,125 @@ mod tests {
         assert_eq!(v2.history_samples[0].model_source, "legacy-unknown");
         let v3 = PublicDetailsV3::from(&v2);
         assert!(!v3.history_samples[0].models_complete);
+        assert_eq!(v3.history_samples[0].task_active_since_previous, None);
         assert_eq!(v3.models[0].input_tokens, 100);
         assert_eq!(v3.models[0].cached_input_tokens, 40);
         assert_eq!(v3.models[0].total_tokens, 110);
+    }
+
+    #[test]
+    fn task_activity_field_is_nullable_and_backward_deserializable() {
+        let value = serde_json::json!({
+            "timestamp": 1_800_000_000_i64,
+            "reset_at": 1_800_000_600_i64,
+            "remaining_percent": null,
+            "models": null,
+            "models_complete": false,
+            "model_source": "legacy-unknown"
+        });
+        let decoded: PublicHistoryObservationV3 =
+            serde_json::from_value(value).expect("old v3 sample remains readable");
+        assert_eq!(decoded.task_active_since_previous, None);
+
+        let encoded = serde_json::to_value(PublicHistoryObservationV3 {
+            timestamp: 1_800_000_000,
+            reset_at: 1_800_000_600,
+            remaining_percent: None,
+            task_active_since_previous: Some(true),
+            models: None,
+            models_complete: false,
+            model_source: "legacy-unknown".to_owned(),
+        })
+        .expect("task activity serializes");
+        assert_eq!(encoded["task_active_since_previous"], true);
+    }
+
+    #[test]
+    fn reconstructed_v2_rows_become_value_less_v3_metadata() {
+        let sample = PublicHistoryObservation {
+            timestamp: 1_800_000_000,
+            reset_at: 1_800_000_600,
+            remaining_percent: Some(50.0),
+            sol_dollars: Some(1.0),
+            terra_dollars: Some(2.0),
+            luna_dollars: Some(3.0),
+            sol_tokens: Some(10),
+            terra_tokens: Some(20),
+            luna_tokens: Some(30),
+            model_source: "reconstructed-from-session".to_owned(),
+        };
+        assert!(legacy_history_models_v3(&sample).is_none());
+
+        let v2 = PublicDetailsV2 {
+            state: PublicState::Ready,
+            observed_at: Some(1_800_000_000),
+            authenticated: true,
+            plan_label: None,
+            quota: None,
+            models: Vec::new(),
+            active_thread_count: 0,
+            history_periods: Vec::new(),
+            history_samples: vec![sample],
+            history_gaps: Vec::new(),
+            threads: Vec::new(),
+            estimated_cost_label: "estimate unavailable".to_owned(),
+        };
+        let v3 = PublicDetailsV3::from_v2_with_models(&v2, &[]);
+        assert_eq!(
+            v3.history_samples[0].model_source,
+            "reconstructed-from-session"
+        );
+        assert!(v3.history_samples[0].models.is_none());
+        assert!(!v3.history_samples[0].models_complete);
+        assert_eq!(v3.history_samples[0].remaining_percent, Some(50.0));
+    }
+
+    #[test]
+    fn account_selector_contract_is_opaque_and_bounded() {
+        let accounts = PublicAccountsV3 {
+            default_account_id: "account-7".to_owned(),
+            accounts: vec![
+                PublicAccountV3 {
+                    id: "account-7".to_owned(),
+                    is_current: true,
+                    activation_at: Some(1_800_000_000),
+                    deactivation_at: None,
+                    login_id: Some("current@example.com".to_owned()),
+                },
+                PublicAccountV3 {
+                    id: "account-13".to_owned(),
+                    is_current: false,
+                    activation_at: None,
+                    deactivation_at: None,
+                    login_id: None,
+                },
+            ],
+        };
+        accounts.validate().expect("account selector contract");
+        let encoded = serde_json::to_value(&accounts).expect("selector JSON");
+        assert_eq!(encoded["default_account_id"], "account-7");
+        assert_eq!(encoded["accounts"][0]["activation_at"], 1_800_000_000_i64);
+        assert_eq!(encoded["accounts"][0]["login_id"], "current@example.com");
+        assert!(encoded["accounts"][0]["deactivation_at"].is_null());
+        assert!(encoded["accounts"][1].get("login_id").is_none());
+        assert!(serde_json::from_value::<PublicAccountsV3>(encoded).is_ok());
+
+        let mut invalid = accounts;
+        invalid.accounts[1].id = "account-0013".to_owned();
+        assert_eq!(invalid.validate(), Err(ContractError::InvalidModel));
+
+        let mut invalid_login = PublicAccountsV3 {
+            default_account_id: "account-7".to_owned(),
+            accounts: vec![PublicAccountV3 {
+                id: "account-7".to_owned(),
+                is_current: true,
+                activation_at: None,
+                deactivation_at: None,
+                login_id: Some(" current@example.com".to_owned()),
+            }],
+        };
+        assert_eq!(invalid_login.validate(), Err(ContractError::InvalidModel));
+        invalid_login.accounts[0].login_id = Some("current@example.com".to_owned());
+        invalid_login.validate().expect("bounded login id is valid");
     }
 }

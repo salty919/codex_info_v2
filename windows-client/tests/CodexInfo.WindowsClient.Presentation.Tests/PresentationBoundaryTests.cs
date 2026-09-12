@@ -72,6 +72,17 @@ public sealed class PresentationBoundaryTests
     }
 
     [Fact]
+    public void PeriodSelectorLabelsLeadWithStateAndContainOnlyLocalStart()
+    {
+        var japanese = LocalizationService.Languages.Single(language => language.LanguageCode == "ja");
+
+        Assert.Equal("現在｜開始 9/12 08:00", japanese.FormatPeriodSelectorLabel("9/12 08:00", current: true));
+        Assert.Equal("履歴｜開始 9/10 14:40", japanese.FormatPeriodSelectorLabel("9/10 14:40", current: false));
+        Assert.DoesNotContain("終了", japanese.FormatPeriodSelectorLabel("9/10 14:40", current: false), StringComparison.Ordinal);
+        Assert.Equal("期間", japanese.PeriodSelectorHeading);
+    }
+
+    [Fact]
     public void SettingsViewModelSaveNormalizesLocaleTimezoneAndRaisesSaved()
     {
         var originalSettings = App.CurrentSettings;
