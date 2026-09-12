@@ -11,9 +11,24 @@ fail() { echo "x11-service-recovery-visual-gate: FAIL: $*" >&2; exit 1; }
 for command in cp curl python3 readlink xprop xwd xwininfo; do
     command -v "$command" >/dev/null 2>&1 || hold "$command is unavailable"
 done
-binary="${CODEX_INFO_ACCEPTANCE_BINARY:-$root_dir/target/release/codex_info}"
+default_binary="$root_dir/target/release/codex_info"
+binary="${CODEX_INFO_ACCEPTANCE_BINARY:-$default_binary}"
 [[ "$binary" == /* ]] || binary="$root_dir/$binary"
-[[ -x "$binary" && ! -L "$binary" ]] || fail "acceptance binary is not an executable regular file: $binary"
+binary_dir="$(cd -- "$(dirname -- "$binary")" 2>/dev/null && pwd -P)" \
+    || fail 'acceptance binary parent directory is unavailable'
+binary="$binary_dir/$(basename -- "$binary")"
+recorder_binary="$binary_dir/codex_info_recorder"
+rest_binary="$binary_dir/codex_info_rest"
+if [[ "$binary" == "$default_binary" &&
+      ( ! -x "$binary" || ! -x "$recorder_binary" || ! -x "$rest_binary" ) ]]; then
+    command -v cargo >/dev/null 2>&1 || fail 'cargo is required to build missing release binaries'
+    cargo build --release --locked \
+        -p codex_info -p codex-info-recorder -p codex-info-rest
+fi
+for release_binary in "$binary" "$recorder_binary" "$rest_binary"; do
+    [[ -f "$release_binary" && -x "$release_binary" && ! -L "$release_binary" ]] \
+        || fail "acceptance binary is not an executable regular file: $release_binary"
+done
 
 # The product rejects executables below world/group-writable ancestors.  Keep
 # the fixture below the checked-out repository (whose ancestors are trusted)
@@ -25,6 +40,7 @@ case "$temp_root" in
     *) fail "unexpected temporary path: $temp_root" ;;
 esac
 service_pid=''
+recorder_pid=''
 ui_pid=''
 reference_ui_pid=''
 holder_pid=''
@@ -42,6 +58,7 @@ threads_headers="$temp_root/ready-threads.headers"
 reference_frame="$temp_root/thread-summary-reference.xwd"
 thread_reference_dir="$temp_root/thread-summary-reference"
 service_starttime=''
+recorder_starttime=''
 ui_starttime=''
 reference_ui_starttime=''
 holder_starttime=''
@@ -215,13 +232,13 @@ assert_threads_window_closed() {
 }
 
 terminate_owned() {
-    local pid="$1" label="$2" expected_starttime="$3"
+    local pid="$1" label="$2" expected_starttime="$3" expected_exe="$4"
     [[ "$pid" =~ ^[0-9]+$ ]] || return 0
     if ! kill -0 "$pid" 2>/dev/null; then
         wait "$pid" 2>/dev/null || true
         return 0
     fi
-    [[ "$(readlink "/proc/$pid/exe" 2>/dev/null || true)" == "$binary" ]] || {
+    [[ "$(readlink "/proc/$pid/exe" 2>/dev/null || true)" == "$expected_exe" ]] || {
         echo "x11-service-recovery-visual-gate: refusing to terminate unowned $label PID $pid" >&2
         return 1
     }
@@ -235,7 +252,7 @@ terminate_owned() {
         sleep 0.1
     done
     if kill -0 "$pid" 2>/dev/null; then
-        [[ "$(readlink "/proc/$pid/exe" 2>/dev/null || true)" == "$binary" ]] || return 1
+        [[ "$(readlink "/proc/$pid/exe" 2>/dev/null || true)" == "$expected_exe" ]] || return 1
         [[ "$(proc_starttime "$pid")" == "$expected_starttime" ]] || return 1
         kill -KILL "$pid" 2>/dev/null || true
     fi
@@ -272,13 +289,16 @@ terminate_holder() {
 
 cleanup_resources() {
     local cleanup_failed=0
-    if ! terminate_owned "$reference_ui_pid" reference-UI "$reference_ui_starttime"; then
+    if ! terminate_owned "$reference_ui_pid" reference-UI "$reference_ui_starttime" "$binary"; then
         cleanup_failed=1
     fi
-    if ! terminate_owned "$ui_pid" UI "$ui_starttime"; then
+    if ! terminate_owned "$ui_pid" UI "$ui_starttime" "$binary"; then
         cleanup_failed=1
     fi
-    if ! terminate_owned "$service_pid" service "$service_starttime"; then
+    if ! terminate_owned "$service_pid" REST "$service_starttime" "$rest_binary"; then
+        cleanup_failed=1
+    fi
+    if ! terminate_owned "$recorder_pid" recorder "$recorder_starttime" "$recorder_binary"; then
         cleanup_failed=1
     fi
     if ! terminate_holder; then
@@ -432,11 +452,62 @@ run_with_common_env() {
     env -u CODEX_INFO_PREVIEW -u CODEX_INFO_PREVIEW_SIZE "${common_env[@]}" "$@"
 }
 launch_service() {
-    env -u CODEX_INFO_PREVIEW -u CODEX_INFO_PREVIEW_SIZE "${common_env[@]}" "$binary" --port "$port" \
+    env -u CODEX_INFO_PREVIEW -u CODEX_INFO_PREVIEW_SIZE "${common_env[@]}" "$rest_binary" --port "$port" \
         >"$temp_root/service-$RANDOM.log" 2>&1 &
     service_pid="$!"
     service_starttime="$(proc_starttime "$service_pid")"
     [[ "$service_starttime" =~ ^[0-9]+$ ]] || fail 'resident service starttime could not be recorded'
+}
+launch_recorder() {
+    env -u CODEX_INFO_PREVIEW -u CODEX_INFO_PREVIEW_SIZE "${common_env[@]}" \
+        "$recorder_binary" --sessions-root "$temp_root/codex/sessions" --interval-secs 2 \
+        >"$temp_root/recorder.log" 2>&1 &
+    recorder_pid="$!"
+    recorder_starttime="$(proc_starttime "$recorder_pid")"
+    [[ "$recorder_starttime" =~ ^[0-9]+$ ]] \
+        || fail 'recorder starttime could not be recorded'
+}
+recorder_ready() {
+    kill -0 "$recorder_pid" 2>/dev/null || return 1
+    [[ "$(readlink "/proc/$recorder_pid/exe" 2>/dev/null || true)" == "$recorder_binary" ]] \
+        || return 1
+    python3 - "$temp_root/data" <<'PY'
+import pathlib
+import sqlite3
+import sys
+
+databases = list(pathlib.Path(sys.argv[1]).glob(
+    "history/accounts/v1/*/epoch-*/usage_history.sqlite3"
+))
+if len(databases) != 1:
+    raise SystemExit(1)
+try:
+    connection = sqlite3.connect(
+        f"file:{databases[0]}?mode=ro", uri=True, timeout=0.2
+    )
+    count = connection.execute(
+        "SELECT COUNT(*) FROM session_checkpoints"
+    ).fetchone()[0]
+except sqlite3.Error:
+    raise SystemExit(1)
+finally:
+    if "connection" in locals():
+        connection.close()
+raise SystemExit(0 if count >= 1 else 1)
+PY
+}
+wait_recorder_ready() {
+    for _ in $(seq 1 80); do
+        recorder_ready && return 0
+        sleep 0.25
+    done
+    sed -n '1,160p' "$temp_root/recorder.log" >&2 2>/dev/null || true
+    return 1
+}
+assert_recorder_unchanged() {
+    kill -0 "$recorder_pid" 2>/dev/null \
+        && [[ "$(readlink "/proc/$recorder_pid/exe" 2>/dev/null || true)" == "$recorder_binary" ]] \
+        && [[ "$(proc_starttime "$recorder_pid")" == "$recorder_starttime" ]]
 }
 service_ready() {
     local details
@@ -609,6 +680,8 @@ wait_service_last_good_error() {
     return 1
 }
 
+launch_recorder
+wait_recorder_ready || fail 'fixture recorder did not publish its first durable checkpoint'
 launch_service
 wait_service_ready || fail 'fixture-backed resident service did not publish ready details'
 append_verified_usage
@@ -690,7 +763,7 @@ if ((reference_ready != 1)); then
     fail 'reference thread-summary components did not render exactly'
 fi
 rm -- "$reference_frame"
-terminate_owned "$reference_ui_pid" reference-UI "$reference_ui_starttime" \
+terminate_owned "$reference_ui_pid" reference-UI "$reference_ui_starttime" "$binary" \
     || fail 'reference UI did not stop cleanly'
 reference_ui_pid=''
 reference_ui_starttime=''
@@ -866,6 +939,13 @@ done
 # graph is inspected. Pin both the current Main frame and the service root
 # immediately before injecting the failure, instead of comparing with the
 # pre-graph frame.
+service_thread_bundle_ready \
+    || fail 'one-SOL wire bundle changed before failure injection'
+# The graph window overlaps Main under the CI window manager. Raise Main before
+# reading its drawable so XGetImage cannot return pixels from the obscuring
+# graph window in the exact thread-summary comparison.
+click_window "$window_id" 500 30
+sleep 0.1
 capture_state ready >/dev/null \
     || fail 'Main did not remain ready after the graph acceptance step'
 cp -- "$frame" "$ready_frame"
@@ -874,6 +954,7 @@ assert_thread_summary_components "$ready_frame" \
 curl --fail --silent --show-error --max-time 1 "http://127.0.0.1:$port/v3/current" >"$ready_current"
 touch "$temp_root/app-server-failure"
 wait_service_last_good_error || fail 'resident service did not publish authenticated last-good error state'
+assert_recorder_unchanged || fail 'recorder changed during the app-server failure'
 error_frame=0
 # A rejected current/threads pair retries unconditionally every ten seconds.
 # Keep a finite three-attempt window so one publication race cannot make the
@@ -888,6 +969,7 @@ if ((error_frame != 1)); then
 fi
 rm -- "$temp_root/app-server-failure"
 wait_service_models_ready || fail 'resident service did not recover after the bounded app-server failure'
+assert_recorder_unchanged || fail 'recorder changed during app-server recovery'
 ready_capture=0
 for _ in $(seq 1 60); do
     if capture_state ready "$ready_frame" >/dev/null 2>/dev/null; then ready_capture=1; break; fi
@@ -895,9 +977,11 @@ for _ in $(seq 1 60); do
 done
 ((ready_capture == 1)) || fail 'UI did not recover from authenticated last-good error state'
 
-terminate_owned "$service_pid" service "$service_starttime" || fail 'fixture service did not stop cleanly'
+terminate_owned "$service_pid" REST "$service_starttime" "$rest_binary" \
+    || fail 'fixture REST service did not stop cleanly'
 service_pid=''
 service_starttime=''
+assert_recorder_unchanged || fail 'stopping REST also stopped or replaced the recorder'
 error_frame=0
 for _ in $(seq 1 60); do
     if capture_state error "$ready_frame" >/dev/null 2>/dev/null; then error_frame=1; break; fi
@@ -907,6 +991,7 @@ done
 
 launch_service
 wait_service_ready || fail 'fixture-backed resident service did not recover'
+assert_recorder_unchanged || fail 'restarting REST also replaced the recorder'
 ready_capture=0
 for _ in $(seq 1 60); do
     if capture_state ready "$ready_frame" >/dev/null 2>/dev/null; then ready_capture=1; break; fi

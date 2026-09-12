@@ -452,7 +452,10 @@ public sealed class PresentationCoverageTests
         Assert.NotEqual(LocalizationService.Current.UnavailableValue, main.QuotaRemainingText);
         Assert.Equal("エンタープライズ", main.PlanText);
         Assert.Equal(LocalizationService.Current.Connected, main.AuthenticationText);
-        Assert.Equal("current", main.ModelUsagePeriodText);
+        var expectedUsagePeriod = $"{TimeZoneInfo.ConvertTime(
+            DateTimeOffset.FromUnixTimeSeconds(now - 100),
+            LocalizationService.DisplayTimeZone):M/d HH:mm}{LocalizationService.Current.CurrentPeriodSuffix}";
+        Assert.Equal(expectedUsagePeriod, main.ModelUsagePeriodText);
         Assert.Equal("概算 $9", main.EstimatedCostText);
         Assert.Contains("最新", main.DetailsStatusText, StringComparison.Ordinal);
         Assert.Equal(3, main.Models.Count);

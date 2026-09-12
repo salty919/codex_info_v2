@@ -28,7 +28,7 @@ fn fixture_path() -> PathBuf {
 fn sample(timestamp: i64, sol_tokens: u64, sol_dollars: f64) -> UsageHistorySample {
     UsageHistorySample {
         timestamp,
-        reset_at: 1_700_000_000,
+        reset_at: 1_700_003_600,
         remaining_percent: Some(75.0),
         sol_dollars,
         terra_dollars: 2.0,

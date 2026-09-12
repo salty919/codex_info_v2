@@ -406,7 +406,11 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         mapping("windows.manifest.env", manifest.get("env"), {
             "REPOSITORY": "${{ github.repository }}",
         })
-        upload = _step(windows_job, uses="actions/upload-artifact@v4")
+        upload = _step(
+            windows_job,
+            name="Upload release candidate",
+            uses="actions/upload-artifact@v4",
+        )
         expect(
             "windows.upload.if",
             upload.get("if"),
@@ -421,7 +425,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
 
         expect(
             "rust.unit.if",
-            _step(rust_job, name="Run native unit tests").get("if"),
+            _step(rust_job, name="Run native unit tests with coverage").get("if"),
             None,
         )
         for step_name in (
@@ -748,6 +752,8 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     for marker in (
         "dotnet format windows-client/CodexInfo.WindowsClient.sln",
         "dotnet test windows-client/CodexInfo.WindowsClient.sln",
+        '--collect:"Code Coverage"',
+        "codacy-coverage-windows-v1-head-${{ inputs.source_sha }}",
         "Build-WindowsInstaller.ps1",
         "/releases/latest",
         "Previous stable installer failed",
@@ -776,21 +782,22 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     ):
         if forbidden in windows:
             errors.append(f"windows-client.yml: unrelated or stale gate remains: {forbidden}")
-    count("windows-client.yml", "uses: actions/upload-artifact@v4", 1)
+    count("windows-client.yml", "uses: actions/upload-artifact@v4", 2)
 
     rust = workflows["rust.yml"]
     for marker in (
         "cargo fmt --check",
-        "cargo test --locked --all-targets -- --nocapture",
-        "cargo build --release --locked",
+        "cargo llvm-cov --workspace --locked --all-targets --cobertura",
+        "codacy-coverage-rust-v1-head-${{ inputs.source_sha }}",
+        "cargo clippy --workspace --locked --all-targets -- -D warnings",
+        "cargo build --workspace --release --locked",
         "scripts/cli_contract_e2e.sh",
         "scripts/record_daemon_e2e.sh",
         "xvfb-run --auto-servernum",
     ):
         if marker not in rust:
             errors.append(f"rust.yml: missing {marker}")
-    if "upload-artifact" in rust:
-        errors.append("rust.yml: evidence-only artifact remains")
+    count("rust.yml", "uses: actions/upload-artifact@v4", 1)
     count("rust.yml", "quality_profile", 0)
     count("linux-ui-quality.yml", "quality_profile", 0)
     count("windows-client.yml", "quality_profile", 0)
@@ -2969,7 +2976,9 @@ def _materialize_candidate_handoff(
 
     windows = _workflow_document(windows_workflow)
     upload = _step(
-        _job(windows, "windows-quality"), uses="actions/upload-artifact@v4"
+        _job(windows, "windows-quality"),
+        name="Upload release candidate",
+        uses="actions/upload-artifact@v4",
     )
     release = _workflow_document(release_workflow)
     download = _step(_job(release, "publish"), uses="actions/download-artifact@v4")
@@ -3089,8 +3098,12 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
             [
                 "bash",
                 str(ROOT / "scripts" / "build_linux_bundle.sh"),
-                "--binary",
+                "--ui-binary",
                 str(Path("/usr/bin/true").resolve()),
+                "--recorder-binary",
+                str(Path("/usr/bin/bash").resolve()),
+                "--rest-binary",
+                str(Path("/usr/bin/dash").resolve()),
                 "--version",
                 _VERSION,
                 "--source-sha",
@@ -3325,12 +3338,17 @@ def workflow_selection_self_test() -> int:
         ),
         (
             "rust.yml",
-            "cargo test --locked --all-targets -- --nocapture",
+            "cargo llvm-cov --workspace --locked --all-targets --cobertura",
+            "true",
+        ),
+        (
+            "rust.yml",
+            "cargo clippy --workspace --locked --all-targets -- -D warnings",
             "true",
         ),
         (
             "windows-client.yml",
-            "dotnet test windows-client/CodexInfo.WindowsClient.sln --no-restore --configuration Release",
+            '--collect:"Code Coverage"',
             "true",
         ),
         (
@@ -3408,7 +3426,12 @@ def self_test() -> int:
             'CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info"',
             'CODEX_INFO_ACCEPTANCE_BINARY="$GITHUB_WORKSPACE/target/release/codex_info"',
         ),
-        ("rust.yml", "cargo test --locked --all-targets -- --nocapture", "true"),
+        (
+            "rust.yml",
+            "cargo llvm-cov --workspace --locked --all-targets --cobertura",
+            "true",
+        ),
+        ("rust.yml", "cargo clippy --workspace --locked --all-targets -- -D warnings", "true"),
         ("codeql.yml", "  workflow_call:\n", "  schedule:\n"),
         (
             "release.yml",

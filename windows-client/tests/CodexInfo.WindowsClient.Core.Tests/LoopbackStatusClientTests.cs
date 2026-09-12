@@ -43,6 +43,41 @@ public sealed class LoopbackStatusClientTests
         Assert.Equal("ASTRA", Assert.Single(result.Snapshot.Models).Name);
         Assert.Equal("ASTRA", Assert.Single(result.Snapshot.HistorySamples[0].Models).Name);
         Assert.Equal(ApiHistorySample.ConfirmedModelSource, result.Snapshot.HistorySamples[0].ModelSource);
+        Assert.Null(result.Snapshot.HistorySamples[0].TaskActiveSincePrevious);
+    }
+
+    [Theory]
+    [InlineData("false", false)]
+    [InlineData("true", true)]
+    public async Task DetailsV3CarriesOptionalTaskActivityMarker(string jsonValue, bool expected)
+    {
+        var json = ValidDetailsV3Json().Replace(
+            "\"model_source\":\"confirmed\"",
+            $"\"model_source\":\"confirmed\",\"task_active_since_previous\":{jsonValue}",
+            StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(json, includePublishedPair: true)));
+
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal(expected, result.Snapshot!.HistorySamples[0].TaskActiveSincePrevious);
+    }
+
+    [Fact]
+    public async Task DetailsV3CarriesNullTaskActivityMarker()
+    {
+        var json = ValidDetailsV3Json().Replace(
+            "\"model_source\":\"confirmed\"",
+            "\"model_source\":\"confirmed\",\"task_active_since_previous\":null",
+            StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(json, includePublishedPair: true)));
+
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Null(result.Snapshot!.HistorySamples[0].TaskActiveSincePrevious);
     }
 
     [Fact]
@@ -62,11 +97,11 @@ public sealed class LoopbackStatusClientTests
         var sample = Assert.Single(result.Snapshot!.HistorySamples);
         Assert.Equal(ApiHistorySample.ReconstructedFromSessionModelSource, sample.ModelSource);
         Assert.False(sample.ModelsComplete);
-        Assert.Equal(6UL, Assert.Single(sample.Models).TotalTokens);
+        Assert.Empty(sample.Models);
     }
 
     [Fact]
-    public async Task DetailsV3PreservesReconstructedSessionSourceMarkedComplete()
+    public async Task DetailsV3StripsReconstructedSessionValuesEvenWhenMarkedComplete()
     {
         var json = ValidDetailsV3Json()
             .Replace(
@@ -81,11 +116,12 @@ public sealed class LoopbackStatusClientTests
         Assert.True(result.IsSuccess);
         var sample = Assert.Single(result.Snapshot!.HistorySamples);
         Assert.Equal(ApiHistorySample.ReconstructedFromSessionModelSource, sample.ModelSource);
-        Assert.True(sample.ModelsComplete);
+        Assert.False(sample.ModelsComplete);
+        Assert.Empty(sample.Models);
     }
 
     [Fact]
-    public async Task DetailsV3RejectsReconstructedSessionSourceWithoutModelsWhenMarkedComplete()
+    public async Task DetailsV3AcceptsReconstructedSessionMetadataWithoutModelsWhenMarkedComplete()
     {
         var json = ValidDetailsV3Json()
             .Replace(
@@ -101,8 +137,40 @@ public sealed class LoopbackStatusClientTests
 
         var result = await client.FetchDetailsAsync(CancellationToken.None);
 
-        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
-        Assert.Null(result.Snapshot);
+        Assert.True(result.IsSuccess);
+        var sample = Assert.Single(result.Snapshot!.HistorySamples);
+        Assert.Equal(ApiHistorySample.ReconstructedFromSessionModelSource, sample.ModelSource);
+        Assert.False(sample.ModelsComplete);
+        Assert.Empty(sample.Models);
+    }
+
+    [Theory]
+    [InlineData("future-source")]
+    [InlineData(null)]
+    public async Task DetailsV3KeepsQuotaMetadataButDiscardsModelsForUnknownOrMissingSource(
+        string? source)
+    {
+        var sourceProperty = source is null ? string.Empty : $",\"model_source\":\"{source}\"";
+        var json = ValidDetailsV3Json()
+            .Replace(
+                "\"models\":[{\"model\":\"ASTRA\",\"total_tokens\":6,\"input_tokens\":4,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":2,\"total_dollars\":0.25}]",
+                "\"models\":{\"malformed\":true}",
+                StringComparison.Ordinal)
+            .Replace(
+                ",\"model_source\":\"confirmed\"",
+                sourceProperty,
+                StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(json, includePublishedPair: true)));
+
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        var sample = Assert.Single(result.Snapshot!.HistorySamples);
+        Assert.Equal(ApiHistorySample.UnavailableModelSource, sample.ModelSource);
+        Assert.False(sample.ModelsComplete);
+        Assert.Empty(sample.Models);
+        Assert.Equal(42.5, sample.RemainingPercent);
     }
 
     [Fact]
@@ -124,7 +192,30 @@ public sealed class LoopbackStatusClientTests
         var sample = Assert.Single(result.Snapshot!.HistorySamples);
         Assert.Equal(ApiHistorySample.ReconstructedFromSessionModelSource, sample.ModelSource);
         Assert.False(sample.ModelsComplete);
+        Assert.Null(sample.SolTokens);
+        Assert.All(sample.Models, model =>
+        {
+            Assert.Null(model.TotalTokens);
+            Assert.Null(model.TotalDollars);
+        });
+    }
+
+    [Fact]
+    public async Task DetailsV2FixedColumnsRemainLegacyDisplayOnly()
+    {
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+            request.RequestUri!.AbsolutePath == "/v3/details"
+                ? NotFoundResponse()
+                : JsonResponse(ValidDetailsV2Json(), includePublishedPair: true)));
+
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        var sample = Assert.Single(result.Snapshot!.HistorySamples);
+        Assert.Equal(ApiHistorySample.LegacyUnknownModelSource, sample.ModelSource);
+        Assert.False(sample.ModelsComplete);
         Assert.Equal(6UL, sample.SolTokens);
+        Assert.Equal(1.25, sample.SolDollars);
     }
 
     [Fact]
@@ -179,6 +270,257 @@ public sealed class LoopbackStatusClientTests
         Assert.Equal(["/v3/current"], paths);
         Assert.Equal("ASTRA", result.Snapshot!.Models.Single().Name);
         Assert.Equal(1UL, result.Snapshot.ActiveThreadCount);
+    }
+
+    [Fact]
+    public async Task AccountsReadsTheDirectoryWithUnknownLabelsWithoutLifecycleText()
+    {
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+            request.RequestUri!.AbsolutePath == "/v3/accounts"
+                ? JsonResponse(ValidAccountsJson())
+                : NotFoundResponse()));
+
+        var result = await client.FetchAccountsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("account-7", result.Snapshot!.DefaultAccountId);
+        Assert.Equal(2, result.Snapshot.Accounts.Count);
+        Assert.Equal("account-7", result.Snapshot.Accounts[0].Id);
+        Assert.Equal("アカウント 7 · ID未復元", result.Snapshot.Accounts[0].DisplayLabel);
+        Assert.Equal("アカウント 13 · ID未復元", result.Snapshot.Accounts[1].DisplayLabel);
+        Assert.DoesNotContain("email", result.Snapshot.Accounts[0].DisplayLabel, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("account-7", result.Snapshot.Accounts[0].DisplayLabel, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AccountsDisambiguateDuplicateLoginLabelsWithPublicIds()
+    {
+        const string json =
+            "{\"api_version\":\"v3\",\"default_account_id\":\"account-7\",\"accounts\":[" +
+            "{\"id\":\"account-7\",\"is_current\":true,\"activation_at\":1789167600,\"deactivation_at\":null}," +
+            "{\"id\":\"account-13\",\"is_current\":false,\"activation_at\":null,\"deactivation_at\":null,\"login_id\":\"same@example.com\"}," +
+            "{\"id\":\"account-19\",\"is_current\":false,\"activation_at\":null,\"deactivation_at\":null,\"login_id\":\"same@example.com\"}]}";
+        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json)));
+
+        var result = await client.FetchAccountsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        var previous = result.Snapshot!.Accounts.Where(account => !account.IsCurrent).ToArray();
+        Assert.Equal(2, previous.Length);
+        Assert.All(previous, account => Assert.EndsWith($" · {account.Id}", account.DisplayLabel, StringComparison.Ordinal));
+        Assert.NotEqual(previous[0].DisplayLabel, previous[1].DisplayLabel);
+    }
+
+    [Fact]
+    public async Task AccountsUseTrimmedLoginIdsInCurrentAndHistoricalLabels()
+    {
+        const string json =
+            "{\"api_version\":\"v3\",\"default_account_id\":\"account-7\",\"accounts\":[" +
+            "{\"id\":\"account-7\",\"is_current\":true,\"activation_at\":1789167600,\"deactivation_at\":null,\"login_id\":\"current@example.com\"}," +
+            "{\"id\":\"account-13\",\"is_current\":false,\"activation_at\":null,\"deactivation_at\":null,\"login_id\":\"previous@example.com\"}]}";
+        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json)));
+
+        var result = await client.FetchAccountsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Equal("current@example.com", result.Snapshot!.Accounts[0].LoginId);
+        Assert.Equal("previous@example.com", result.Snapshot.Accounts[1].LoginId);
+        Assert.Equal("current@example.com", result.Snapshot.Accounts[0].DisplayLabel);
+        Assert.Equal("previous@example.com", result.Snapshot.Accounts[1].DisplayLabel);
+        Assert.DoesNotContain("account-7", result.Snapshot.Accounts[0].DisplayLabel, StringComparison.Ordinal);
+        Assert.DoesNotContain("1789167600", result.Snapshot.Accounts[0].DisplayLabel, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(" ")]
+    [InlineData(" current@example.com")]
+    [InlineData("current@example.com ")]
+    [InlineData("current\u0007@example.com")]
+    public async Task AccountsRejectInvalidOptionalLoginIds(string loginId)
+    {
+        var escapedLoginId = System.Text.Json.JsonSerializer.Serialize(loginId);
+        var json = ValidAccountsJson().Replace(
+            "\"deactivation_at\":null}",
+            $"\"deactivation_at\":null,\"login_id\":{escapedLoginId}}}",
+            StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json)));
+
+        var result = await client.FetchAccountsAsync(CancellationToken.None);
+
+        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
+        Assert.Null(result.Snapshot);
+    }
+
+    [Fact]
+    public async Task AccountsAcceptNullOptionalLoginId()
+    {
+        var json = ValidAccountsJson().Replace(
+            "\"deactivation_at\":null}",
+            "\"deactivation_at\":null,\"login_id\":null}",
+            StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json)));
+
+        var result = await client.FetchAccountsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Null(result.Snapshot!.Accounts[0].LoginId);
+    }
+
+    [Fact]
+    public async Task AccountsRejectLoginIdsLongerThan254UnicodeScalars()
+    {
+        var loginId = new string('a', 255);
+        var json = ValidAccountsJson().Replace(
+            "\"deactivation_at\":null}",
+            $"\"deactivation_at\":null,\"login_id\":{System.Text.Json.JsonSerializer.Serialize(loginId)}}}",
+            StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(json)));
+
+        var result = await client.FetchAccountsAsync(CancellationToken.None);
+
+        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
+        Assert.Null(result.Snapshot);
+    }
+
+    [Fact]
+    public async Task AccountsRejectsZeroAndUnknownFields()
+    {
+        using var zeroClient = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(ValidAccountsJson().Replace("account-7", "account-0", StringComparison.Ordinal))));
+        using var unknownClient = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(ValidAccountsJson().Replace(
+                "\"deactivation_at\":null}",
+                "\"deactivation_at\":null,\"email\":\"private@example.com\"}",
+                StringComparison.Ordinal))));
+
+        var zero = await zeroClient.FetchAccountsAsync(CancellationToken.None);
+        var unknown = await unknownClient.FetchAccountsAsync(CancellationToken.None);
+
+        Assert.Equal(DetailsFetchFailure.Response, zero.Failure);
+        Assert.Equal(DetailsFetchFailure.Response, unknown.Failure);
+    }
+
+    [Theory]
+    [InlineData("account-0")]
+    [InlineData("account-01")]
+    [InlineData("account-x")]
+    public async Task ScopedResourcesRejectInvalidPublicAccountIdsBeforeSendingRequests(string accountId)
+    {
+        var requestCount = 0;
+        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+        {
+            requestCount++;
+            return JsonResponse(ValidCurrentJson(), includePublishedPair: true);
+        }));
+
+        var result = await client.FetchCurrentAsync(accountId, CancellationToken.None);
+
+        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
+        Assert.Equal(0, requestCount);
+    }
+
+    [Fact]
+    public async Task ScopedCurrentUsesEncodedAccountAndDropsThePreviousConditionalCache()
+    {
+        var requests = new List<HttpRequestMessage>();
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            requests.Add(request);
+            return request.RequestUri!.AbsolutePath == "/v3/current"
+                ? JsonResponse(ValidCurrentJson(), includePublishedPair: true)
+                : NotFoundResponse();
+        }));
+
+        var first = await client.FetchCurrentAsync("account-7", CancellationToken.None);
+        var second = await client.FetchCurrentAsync("account-13", CancellationToken.None);
+
+        Assert.True(first.IsSuccess);
+        Assert.True(second.IsSuccess);
+        Assert.Equal("account-7", first.Snapshot!.AccountId);
+        Assert.Equal("account-13", second.Snapshot!.AccountId);
+        Assert.Equal("?account=account-7", requests[0].RequestUri!.Query);
+        Assert.Equal("?account=account-13", requests[1].RequestUri!.Query);
+        Assert.Empty(requests[1].Headers.IfNoneMatch);
+
+        var unscopedThreads = await client.FetchThreadsAsync(CancellationToken.None);
+        var unscopedCurrent = await client.FetchCurrentAsync(CancellationToken.None);
+        var unscopedPeriods = await client.FetchHistoryPeriodsAsync(CancellationToken.None);
+        var unscopedPage = await client.FetchHistoryPageAsync(
+            "period",
+            cancellationToken: CancellationToken.None);
+        var unscopedDetails = await client.FetchDetailsAsync(CancellationToken.None);
+        Assert.Equal(DetailsFetchFailure.Response, unscopedThreads.Failure);
+        Assert.Equal(DetailsFetchFailure.Response, unscopedCurrent.Failure);
+        Assert.Equal(DetailsFetchFailure.Response, unscopedPeriods.Failure);
+        Assert.Equal(DetailsFetchFailure.Response, unscopedPage.Failure);
+        Assert.Equal(DetailsFetchFailure.Response, unscopedDetails.Failure);
+        Assert.Equal(2, requests.Count);
+    }
+
+    [Fact]
+    public async Task EveryScopedV3ResourceCarriesTheSelectedAccountQuery()
+    {
+        var requests = new List<Uri>();
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+        {
+            requests.Add(request.RequestUri!);
+            return request.RequestUri!.AbsolutePath switch
+            {
+                "/v3/current" => JsonResponse(ValidCurrentJson(), includePublishedPair: true),
+                "/v3/history/periods" => JsonResponse(
+                    "{\"api_version\":\"v3\",\"history_periods\":[]}",
+                    includePublishedPair: true),
+                "/v3/history" => JsonResponse(ValidHistoryPageJson(), includePublishedPair: true),
+                "/v3/threads" => JsonResponse(
+                    "{\"api_version\":\"v3\",\"threads\":[]}",
+                    includePublishedPair: true),
+                _ => throw new InvalidOperationException("unexpected route"),
+            };
+        }));
+
+        var current = await client.FetchCurrentAsync("account-13", CancellationToken.None);
+        var periods = await client.FetchHistoryPeriodsAsync("account-13", CancellationToken.None);
+        var page = await client.FetchHistoryPageAsync(
+            "account-13",
+            "period/opaque",
+            null,
+            CancellationToken.None);
+        var threads = await client.FetchThreadsAsync("account-13", CancellationToken.None);
+
+        Assert.True(current.IsSuccess);
+        Assert.True(periods.IsSuccess);
+        Assert.True(page.IsSuccess);
+        Assert.True(threads.IsSuccess);
+        Assert.Equal("account-13", current.Snapshot!.AccountId);
+        Assert.Equal("account-13", periods.Snapshot!.AccountId);
+        Assert.Equal("account-13", page.Page!.AccountId);
+        Assert.Equal("account-13", threads.Snapshot!.AccountId);
+        Assert.Equal(
+            [
+                "?account=account-13",
+                "?account=account-13",
+                "?period=period%2Fopaque&account=account-13",
+                "?account=account-13",
+            ],
+            requests.Select(request => request.Query).ToArray());
+    }
+
+    [Fact]
+    public async Task CurrentKeepsReadyUsageWhenTheOptionalPlanLabelIsUnavailable()
+    {
+        var json = ValidCurrentJson().Replace(
+            "\"plan_label\":\"Pro\"",
+            "\"plan_label\":null",
+            StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(_ =>
+            JsonResponse(json, includePublishedPair: true)));
+
+        var result = await client.FetchCurrentAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Null(result.Snapshot!.PlanLabel);
+        Assert.NotNull(result.Snapshot.Quota);
+        Assert.NotEmpty(result.Snapshot.Models);
     }
 
     [Fact]
@@ -466,7 +808,7 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
-    public async Task DetailsV2RejectsPartiallyNullUnavailableModelVector()
+    public async Task DetailsV2DiscardsUnavailableModelVectorWithoutRejectingQuotaMetadata()
     {
         var json = ValidDetailsV2Json()
             .Replace("\"model_source\":\"confirmed\"", "\"model_source\":\"unavailable\"", StringComparison.Ordinal)
@@ -484,9 +826,38 @@ public sealed class LoopbackStatusClientTests
 
         var result = await client.FetchDetailsAsync(CancellationToken.None);
 
-        Assert.Equal(DetailsFetchFailure.Response, result.Failure);
-        Assert.Null(result.Snapshot);
+        Assert.True(result.IsSuccess);
+        var sample = Assert.Single(result.Snapshot!.HistorySamples);
+        Assert.Equal(ApiHistorySample.UnavailableModelSource, sample.ModelSource);
+        Assert.Null(sample.SolDollars);
+        Assert.Null(sample.SolTokens);
+        Assert.Equal(42.5, sample.RemainingPercent);
         Assert.Equal(["/v3/details", "/v2/details"], paths);
+    }
+
+    [Theory]
+    [InlineData("future-source")]
+    [InlineData(null)]
+    public async Task DetailsV2KeepsQuotaMetadataButDiscardsModelsForUnknownOrMissingSource(
+        string? source)
+    {
+        var sourceProperty = source is null ? string.Empty : $",\"model_source\":\"{source}\"";
+        var json = ValidDetailsV2Json()
+            .Replace("\"sol_dollars\":1.25", "\"sol_dollars\":{\"malformed\":true}", StringComparison.Ordinal)
+            .Replace(",\"model_source\":\"confirmed\"", sourceProperty, StringComparison.Ordinal);
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+            request.RequestUri!.AbsolutePath == "/v3/details"
+                ? NotFoundResponse()
+                : JsonResponse(json, includePublishedPair: true)));
+
+        var result = await client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        var sample = Assert.Single(result.Snapshot!.HistorySamples);
+        Assert.Equal(ApiHistorySample.UnavailableModelSource, sample.ModelSource);
+        Assert.Null(sample.SolDollars);
+        Assert.Null(sample.SolTokens);
+        Assert.Equal(42.5, sample.RemainingPercent);
     }
 
     [Fact]
@@ -814,12 +1185,27 @@ public sealed class LoopbackStatusClientTests
         Assert.Equal(monthly, result.Snapshot.Quota!.Monthly);
     }
 
+    [Fact]
+    public async Task DetailsAcceptsUnavailableOptionalPlanWithAuthenticatedUsage()
+    {
+        var json = ValidDetailsJson().Replace(
+            "\"plan_label\":\"Pro\"",
+            "\"plan_label\":null",
+            StringComparison.Ordinal);
+
+        var result = await FetchDetails(json);
+
+        Assert.True(result.IsSuccess);
+        Assert.Null(result.Snapshot!.PlanLabel);
+        Assert.NotNull(result.Snapshot.Quota);
+        Assert.NotEmpty(result.Snapshot.Models);
+    }
+
     [Theory]
     [InlineData("\"pro\"", false)]
     [InlineData("\"Enterprise\"", true)]
     [InlineData("\"エンタープライズ\"", false)]
     [InlineData("\"Pro\"", true)]
-    [InlineData("null", false)]
     public async Task DetailsRejectsNonCanonicalPlanOrMonthlyDomain(
         string planLabelJson,
         bool monthly)
@@ -1166,14 +1552,14 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
-    public void ClientTimeoutIsFixedAtOneSecond()
+    public void ClientTimeoutMatchesTheRestRequestBudget()
     {
         using var client = new LoopbackStatusClient(new StubHandler(_ => JsonResponse(ValidDetailsJson())));
         var field = typeof(LoopbackStatusClient).GetField("_httpClient", BindingFlags.NonPublic | BindingFlags.Instance);
         Assert.NotNull(field);
         var httpClient = Assert.IsType<HttpClient>(field!.GetValue(client));
 
-        Assert.Equal(TimeSpan.FromSeconds(1), httpClient.Timeout);
+        Assert.Equal(TimeSpan.FromSeconds(3), httpClient.Timeout);
     }
 
     [Fact]
@@ -1295,6 +1681,9 @@ public sealed class LoopbackStatusClientTests
 
     private static string ValidCurrentJson() =>
         "{\"api_version\":\"v3\",\"state\":\"ready\",\"observed_at\":253402300740,\"authenticated\":true,\"plan_label\":\"Pro\",\"quota\":{\"remaining_percent\":98.5,\"reset_at\":253402300799,\"window_seconds\":604800,\"monthly\":false},\"models\":[{\"model\":\"ASTRA\",\"total_tokens\":13,\"input_tokens\":10,\"cached_input_tokens\":2,\"cache_write_input_tokens\":1,\"output_tokens\":3,\"estimated_cost\":{\"price_version\":\"ASTRA_USER_2026-09-05\",\"ordinary_input_dollars\":1.0,\"cached_input_dollars\":2.0,\"cache_write_input_dollars\":3.0,\"output_dollars\":4.0,\"total_dollars\":10.0}}],\"active_thread_count\":1}";
+
+    private static string ValidAccountsJson() =>
+        "{\"api_version\":\"v3\",\"default_account_id\":\"account-7\",\"accounts\":[{\"id\":\"account-7\",\"is_current\":true,\"activation_at\":1789167600,\"deactivation_at\":null},{\"id\":\"account-13\",\"is_current\":false,\"activation_at\":null,\"deactivation_at\":null}]}";
 
     private static string ValidHistoryPageJson() =>
         $"{{\"api_version\":\"v3\",\"history_samples\":[{{\"timestamp\":253402300680,\"reset_at\":253402300799,\"remaining_percent\":42.5,\"models\":[{{\"model\":\"ASTRA\",\"total_tokens\":6,\"input_tokens\":4,\"cached_input_tokens\":1,\"cache_write_input_tokens\":0,\"output_tokens\":2,\"total_dollars\":0.25}}],\"models_complete\":true,\"model_source\":\"confirmed\"}}],\"history_gaps\":[],\"next_cursor\":null,\"resume_cursor\":\"resume-opaque\"}}";

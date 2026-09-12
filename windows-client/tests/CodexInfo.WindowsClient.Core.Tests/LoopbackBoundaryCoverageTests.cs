@@ -26,7 +26,7 @@ public sealed class LoopbackBoundaryCoverageTests
             "_httpClient",
             BindingFlags.NonPublic | BindingFlags.Instance);
         var httpClient = Assert.IsType<HttpClient>(field!.GetValue(client));
-        Assert.Equal(TimeSpan.FromSeconds(1), httpClient.Timeout);
+        Assert.Equal(TimeSpan.FromSeconds(3), httpClient.Timeout);
     }
 
     [Fact]

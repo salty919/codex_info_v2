@@ -1,0 +1,19 @@
+[Unit]
+Description=Codex Info read-only REST service
+After=default.target codex-info-recorder.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/codex_info_rest --port 8787
+Restart=always
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+Environment=CODEX_INFO_SYSTEMD_MANAGED=1
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

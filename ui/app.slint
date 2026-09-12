@@ -43,6 +43,12 @@ export component MainWindow inherits Window {
     in-out property <bool> has-error: false;
     in-out property <bool> service-unavailable: false;
     in-out property <bool> startup-loading: false;
+    // Historical accounts are immutable final snapshots. They never expose a
+    // live reset countdown or current-thread panel.
+    in-out property <bool> historical-account: false;
+    in-out property <bool> account-view-loading: false;
+    in property <[string]> account-options;
+    in property <int> selected-account-index: 0;
     in-out property <string> quota-title;
     in-out property <bool> has-quota-percent: true;
     in-out property <bool> has-active-thread: false;
@@ -74,6 +80,7 @@ export component MainWindow inherits Window {
     callback check-auth();
     callback retry();
     callback open-graph();
+    callback select-account(string);
     callback open-threads();
     callback open-legal-notice();
     callback begin-window-drag();
@@ -121,7 +128,7 @@ export component MainWindow inherits Window {
         width: root.content-width;
         height: root.height - self.y - DesignTokens.outer-margin-compact;
 
-        if root.authenticated : VerticalLayout {
+        if root.authenticated || root.historical-account || root.account-view-loading : VerticalLayout {
             x: 0px;
             y: 0px;
             width: root.content-width;
@@ -134,8 +141,11 @@ export component MainWindow inherits Window {
                 preferred-width: root.content-width;
                 horizontal-stretch: 1;
                 period-label: root.model-usage-period;
-                show-graph: true;
+                show-graph: root.authenticated && !root.account-view-loading;
+                account-options: root.account-options;
+                selected-account-index: root.selected-account-index;
                 open-graph => { root.open-graph(); }
+                select-account(value) => { root.select-account(value); }
                 open-legal-notice => { root.open-legal-notice(); }
                 begin-window-drag => { root.begin-window-drag(); }
                 minimize-window => { root.minimize-window(); }
@@ -151,14 +161,14 @@ export component MainWindow inherits Window {
                 has-quota-percent: root.has-quota-percent;
                 estimated-cost-label: root.estimated-cost-label;
             }
-            if root.has-usage && root.has-quota-percent : WeekGauge {
+            if root.has-usage && root.has-quota-percent && !root.historical-account : WeekGauge {
                 width: root.content-width;
                 preferred-width: root.content-width;
                 horizontal-stretch: 1;
                 remaining-days: root.remaining-days;
                 remaining-label: root.week-label;
             }
-            AccountActivity {
+            if !root.historical-account && !root.account-view-loading : AccountActivity {
                 strings: root.strings;
                 active-thread-count-label: root.active-thread-count-label;
                 width: root.content-width;
@@ -197,7 +207,7 @@ export component MainWindow inherits Window {
                 retry => { root.retry(); }
             }
         }
-        if root.authenticated && root.startup-loading : Rectangle {
+        if (root.authenticated || root.historical-account || root.account-view-loading) && root.startup-loading : Rectangle {
             x: 0px;
             y: 48px;
             width: parent.width;
@@ -216,7 +226,7 @@ export component MainWindow inherits Window {
                 vertical-alignment: center;
             }
         }
-        if !root.authenticated : VerticalLayout {
+        if !root.authenticated && !root.historical-account && !root.account-view-loading : VerticalLayout {
             x: 0px;
             y: 0px;
             width: root.content-width;
@@ -230,6 +240,9 @@ export component MainWindow inherits Window {
                 horizontal-stretch: 1;
                 period-label: "";
                 show-graph: false;
+                account-options: root.account-options;
+                selected-account-index: root.selected-account-index;
+                select-account(value) => { root.select-account(value); }
                 open-legal-notice => { root.open-legal-notice(); }
                 begin-window-drag => { root.begin-window-drag(); }
                 minimize-window => { root.minimize-window(); }

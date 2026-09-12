@@ -42,7 +42,9 @@ jobs:
       - name: Install bundle validation tools
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes binutils jq xvfb xauth xdotool x11-utils x11-apps libxkbcommon-x11-0
       - name: Build the exact Linux target
-        run: cargo build --release --locked --target "$LINUX_BUNDLE_TARGET"
+        run: >-
+          cargo build --release --locked --target "$LINUX_BUNDLE_TARGET"
+          -p codex_info -p codex-info-recorder -p codex-info-rest
       - name: Create and validate the Linux bundle
         id: bundle
         env:
@@ -55,7 +57,9 @@ jobs:
           output_dir="$RUNNER_TEMP/codex-info-linux-bundle"
           mkdir -p "$output_dir"
           bash scripts/build_linux_bundle.sh \
-            --binary "target/$LINUX_BUNDLE_TARGET/release/codex_info" \
+            --ui-binary "target/$LINUX_BUNDLE_TARGET/release/codex_info" \
+            --recorder-binary "target/$LINUX_BUNDLE_TARGET/release/codex_info_recorder" \
+            --rest-binary "target/$LINUX_BUNDLE_TARGET/release/codex_info_rest" \
             --output-dir "$output_dir" \
             --source-sha "$SOURCE_SHA" \
             --run-id "$RUN_ID" \

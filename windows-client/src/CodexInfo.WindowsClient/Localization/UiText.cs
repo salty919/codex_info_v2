@@ -73,9 +73,95 @@ public sealed record UiText(
 {
     public string Format(string template, params object[] values) => string.Format(CultureInfo.CurrentCulture, template, values);
 
+    public string GraphWindowTitle => LanguageCode switch
+    {
+        "ja" => "利用状況の推移",
+        "zh-Hans" => "使用情况趋势",
+        "ko" => "사용량 추이",
+        "es" => "Uso a lo largo del tiempo",
+        "fr" => "Utilisation au fil du temps",
+        "de" => "Nutzung im Zeitverlauf",
+        "pt" => "Uso ao longo do tempo",
+        "it" => "Utilizzo nel tempo",
+        "ru" => "Использование с течением времени",
+        _ => "Usage over time"
+    };
+
+    public string PeriodSelectorHeading => LanguageCode switch
+    {
+        "ja" => "期間",
+        "zh-Hans" => "期间",
+        "ko" => "기간",
+        "es" => "Período",
+        "fr" => "Période",
+        "de" => "Zeitraum",
+        "pt" => "Período",
+        "it" => "Periodo",
+        "ru" => "Период",
+        _ => "Period"
+    };
+
+    public string GraphDollarMetric => LanguageCode switch
+    {
+        "ja" => "ドル",
+        "zh-Hans" => "美元",
+        "ko" => "달러",
+        "es" => "Dólares",
+        "fr" => "Dollars",
+        "de" => "Dollar",
+        "pt" => "Dólares",
+        "it" => "Dollari",
+        "ru" => "Доллары",
+        _ => "Dollars"
+    };
+
+    public string GraphTokenMetric => Tokens;
+
+    public string GraphDollarDescription => LanguageCode switch
+    {
+        "ja" => "時間ごとの累積消費ドル（モデル別） / 残量%",
+        "zh-Hans" => "每小时累计消费美元（按模型）/ 剩余%",
+        "ko" => "시간별 누적 소비 달러(모델별) / 잔여%",
+        "es" => "Gasto acumulado por hora (por modelo) / % restante",
+        "fr" => "Dépense cumulée par heure (par modèle) / % restant",
+        "de" => "Kumulierte Ausgaben pro Stunde (nach Modell) / verbleibend %",
+        "pt" => "Gasto acumulado por hora (por modelo) / % restante",
+        "it" => "Spesa cumulativa oraria (per modello) / % restante",
+        "ru" => "Накопленные расходы по часам (по моделям) / остаток %",
+        _ => "Hourly cumulative spend (by model) / remaining %"
+    };
+
+    public string GraphTokenDescription => LanguageCode switch
+    {
+        "ja" => "時間ごとのトークン使用量（モデル別） / 残量%",
+        "zh-Hans" => "每小时令牌使用量（按模型）/ 剩余%",
+        "ko" => "시간별 토큰 사용량(모델별) / 잔여%",
+        "es" => "Uso de tokens por hora (por modelo) / % restante",
+        "fr" => "Utilisation horaire des jetons (par modèle) / % restant",
+        "de" => "Token-Nutzung pro Stunde (nach Modell) / verbleibend %",
+        "pt" => "Uso de tokens por hora (por modelo) / % restante",
+        "it" => "Utilizzo orario dei token (per modello) / % restante",
+        "ru" => "Использование токенов по часам (по моделям) / остаток %",
+        _ => "Hourly token usage (by model) / remaining %"
+    };
+
     public string ModelUsageDescription => LanguageCode == "ja"
         ? $"{Input} / {CachedInput} / {Output}（{Tokens}・{Dollars}）"
         : $"{Input} / {CachedInput} / {Output} ({Tokens} / {Dollars})";
+
+    public string ModelLabel => LanguageCode switch
+    {
+        "ja" => "モデル",
+        "zh-Hans" => "模型",
+        "ko" => "모델",
+        "es" => "Modelo",
+        "fr" => "Modèle",
+        "de" => "Modell",
+        "pt" => "Modelo",
+        "it" => "Modello",
+        "ru" => "Модель",
+        _ => "Model"
+    };
 
     public string UnavailableValue => LanguageCode switch
     {
@@ -249,6 +335,37 @@ public sealed record UiText(
     public string CountUnit => LanguageCode switch { "ja" => "件", "zh-Hans" => "项", "ko" => "개", "es" => "", "fr" => "", "de" => "", "pt" => "", "it" => "", "ru" => "", _ => "" };
     public string EstimatedUnavailable => LanguageCode == "ja" ? "概算 —" : $"{Dollars} —";
     public string LastReceivedPrefix => LanguageCode switch { "ja" => "前回受信", "zh-Hans" => "上次接收", "ko" => "마지막 수신", "es" => "Última recepción", "fr" => "Dernière réception", "de" => "Letzter Empfang", "pt" => "Último recebimento", "it" => "Ultima ricezione", "ru" => "Последнее получение", _ => "Last received" };
+    public string HistoricalLastRecordedPrefix => LanguageCode switch { "ja" => "最終記録", "zh-Hans" => "最后记录", "ko" => "최종 기록", "es" => "Último registro", "fr" => "Dernier enregistrement", "de" => "Letzte Aufzeichnung", "pt" => "Último registro", "it" => "Ultima registrazione", "ru" => "Последняя запись", _ => "Last recorded" };
+    public string HistoricalQuotaPeriod => LanguageCode switch { "ja" => "記録終了時の期間", "zh-Hans" => "记录结束时的周期", "ko" => "기록 종료 시점의 기간", "es" => "Período al finalizar el registro", "fr" => "Période à la fin de l’enregistrement", "de" => "Zeitraum am Ende der Aufzeichnung", "pt" => "Período no fim do registro", "it" => "Periodo alla fine della registrazione", "ru" => "Период на конец записи", _ => "Recorded ending period" };
+    public string HistoricalAccountDetail => LanguageCode switch { "ja" => "過去の記録を表示しています", "zh-Hans" => "正在显示历史记录", "ko" => "과거 기록을 표시하고 있습니다", "es" => "Se muestra un registro histórico", "fr" => "Un enregistrement historique est affiché", "de" => "Eine historische Aufzeichnung wird angezeigt", "pt" => "Um registro histórico está sendo exibido", "it" => "È visualizzata una registrazione storica", "ru" => "Показана историческая запись", _ => "A historical record is displayed" };
+    public string HistoricalThreadsUnavailable => LanguageCode switch { "ja" => "記録された実行スレッドはありません", "zh-Hans" => "没有记录的运行线程", "ko" => "기록된 실행 중 스레드가 없습니다", "es" => "No hay hilos en ejecución registrados", "fr" => "Aucun thread en cours enregistré", "de" => "Keine laufenden Threads aufgezeichnet", "pt" => "Não há threads em execução registrados", "it" => "Nessun thread in esecuzione registrato", "ru" => "Нет записанных выполняющихся потоков", _ => "No running threads were recorded" };
+    public string SignedInAccountSuffix => LanguageCode switch { "ja" => "［ログイン中］", "zh-Hans" => "［已登录］", "ko" => " [로그인 중]", "es" => " [sesión activa]", "fr" => " [connecté]", "de" => " [angemeldet]", "pt" => " [sessão ativa]", "it" => " [accesso]", "ru" => " [выполнен вход]", _ => " [signed in]" };
+    public string HistoricalAccountSuffix => LanguageCode switch { "ja" => "［履歴］", "zh-Hans" => "［历史］", "ko" => " [기록]", "es" => " [historial]", "fr" => " [historique]", "de" => " [Verlauf]", "pt" => " [histórico]", "it" => " [cronologia]", "ru" => " [история]", _ => " [history]" };
+    public string CurrentPeriodSuffix => LanguageCode switch { "ja" => "（現在）", "zh-Hans" => "（当前）", "ko" => " (현재)", "es" => " (actual)", "fr" => " (actuelle)", "de" => " (aktuell)", "pt" => " (atual)", "it" => " (corrente)", "ru" => " (текущий)", _ => " (current)" };
+
+    public string FormatPeriodSelectorLabel(string localStart, bool current) => (LanguageCode, current) switch
+    {
+        ("ja", true) => $"現在｜開始 {localStart}",
+        ("ja", false) => $"履歴｜開始 {localStart}",
+        ("zh-Hans", true) => $"当前｜开始 {localStart}",
+        ("zh-Hans", false) => $"历史｜开始 {localStart}",
+        ("ko", true) => $"현재 · 시작 {localStart}",
+        ("ko", false) => $"기록 · 시작 {localStart}",
+        ("es", true) => $"Actual · Inicio {localStart}",
+        ("es", false) => $"Historial · Inicio {localStart}",
+        ("fr", true) => $"Actuelle · Début {localStart}",
+        ("fr", false) => $"Historique · Début {localStart}",
+        ("de", true) => $"Aktuell · Beginn {localStart}",
+        ("de", false) => $"Verlauf · Beginn {localStart}",
+        ("pt", true) => $"Atual · Início {localStart}",
+        ("pt", false) => $"Histórico · Início {localStart}",
+        ("it", true) => $"Corrente · Inizio {localStart}",
+        ("it", false) => $"Cronologia · Inizio {localStart}",
+        ("ru", true) => $"Текущий · Начало {localStart}",
+        ("ru", false) => $"История · Начало {localStart}",
+        (_, true) => $"Current · Start {localStart}",
+        _ => $"History · Start {localStart}",
+    };
 
     public string UpdateAvailableText(string version) => LanguageCode switch
     {

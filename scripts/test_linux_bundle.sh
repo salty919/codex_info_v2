@@ -109,7 +109,7 @@ if set(data) != set(expected) | {"manifest.json", "SHA256SUMS"}:
 for path, (size, sha, mode) in expected.items():
     if len(data[path]) != size or digest(data[path]) != sha or modes[path] != mode:
         reject(f"archive member identity mismatch: {path}")
-    required_mode = 0o755 if path in {"codex_info", "run.sh", "install.sh"} else 0o644
+    required_mode = 0o755 if path in {"codex_info", "codex_info_recorder", "codex_info_rest", "run.sh", "install.sh"} else 0o644
     if mode != required_mode:
         reject(f"archive member mode is not canonical: {path}")
 if modes.get("manifest.json") != 0o644 or modes.get("SHA256SUMS") != 0o644:
@@ -148,11 +148,13 @@ fake_home="$TEST_ROOT/home"
 fake_proc="$TEST_ROOT/proc"
 fixture_root="$TEST_ROOT/fixture"
 output_root="$TEST_ROOT/output"
+legacy_output_root="$TEST_ROOT/legacy-output"
 release_json="$TEST_ROOT/release.json"
 release_assets="$TEST_ROOT/release-assets"
 update_tmp="$TEST_ROOT/update-tmp"
 log="$TEST_ROOT/commands.log"
-mkdir -p -- "$fake_bin" "$fake_home" "$fake_proc/net" "$fixture_root" "$output_root" "$release_assets" "$update_tmp"
+mkdir -p -- "$fake_bin" "$fake_home" "$fake_proc/net" "$fixture_root" "$output_root" \
+    "$legacy_output_root" "$release_assets" "$update_tmp"
 : > "$fake_proc/net/tcp"
 
 cat > "$fake_bin/systemctl" <<'FAKE_SYSTEMCTL'
@@ -165,15 +167,26 @@ case "${1-}" in
     is-enabled)
         unit="${*: -1}"
         case "$unit" in
-            codex-info.service)
+            codex-info-recorder.service)
                 [[ -v FAKE_MAIN_ENABLED ]] && { [[ "$FAKE_MAIN_ENABLED" == 1 ]] && exit 0 || exit 1; }
-                unit_path="$HOME/.config/systemd/user/codex-info.service"
-                enable_path="$HOME/.config/systemd/user/default.target.wants/codex-info.service"
+                unit_path="$HOME/.config/systemd/user/codex-info-recorder.service"
+                enable_path="$HOME/.config/systemd/user/default.target.wants/codex-info-recorder.service"
+                ;;
+            codex-info-rest.service)
+                [[ -v FAKE_REST_ENABLED ]] && { [[ "$FAKE_REST_ENABLED" == 1 ]] && exit 0 || exit 1; }
+                unit_path="$HOME/.config/systemd/user/codex-info-rest.service"
+                enable_path="$HOME/.config/systemd/user/default.target.wants/codex-info-rest.service"
                 ;;
             codex-info-update.timer)
                 [[ -v FAKE_TIMER_ENABLED ]] && { [[ "$FAKE_TIMER_ENABLED" == 1 ]] && exit 0 || exit 1; }
                 unit_path="$HOME/.config/systemd/user/codex-info-update.timer"
                 enable_path="$HOME/.config/systemd/user/timers.target.wants/codex-info-update.timer"
+                ;;
+            codex-info.service)
+                if [[ -n "${FAKE_LEGACY_ENABLED_FILE:-}" && -f "$FAKE_LEGACY_ENABLED_FILE" ]]; then exit 0; fi
+                [[ -v FAKE_LEGACY_ENABLED ]] && { [[ "$FAKE_LEGACY_ENABLED" == 1 ]] && exit 0 || exit 1; }
+                unit_path="$HOME/.config/systemd/user/codex-info.service"
+                enable_path="$HOME/.config/systemd/user/default.target.wants/codex-info.service"
                 ;;
             *) exit 1 ;;
         esac
@@ -184,26 +197,112 @@ case "${1-}" in
     is-active)
         unit="${*: -1}"
         case "$unit" in
-            codex-info.service)
+            codex-info-recorder.service)
                 if [[ -n "${FAKE_MAIN_ACTIVE_FILE:-}" && -f "$FAKE_MAIN_ACTIVE_FILE" ]]; then exit 0; fi
                 [[ "${FAKE_MAIN_ACTIVE:-0}" == 1 ]] && exit 0 || exit 3
                 ;;
+            codex-info-rest.service)
+                if [[ -n "${FAKE_REST_ACTIVE_FILE:-}" && -f "$FAKE_REST_ACTIVE_FILE" ]]; then exit 0; fi
+                [[ "${FAKE_REST_ACTIVE:-0}" == 1 ]] && exit 0 || exit 3
+                ;;
             codex-info-update.timer) [[ "${FAKE_TIMER_ACTIVE:-0}" == 1 ]] && exit 0 || exit 3 ;;
+            codex-info.service)
+                if [[ -n "${FAKE_LEGACY_ACTIVE_FILE:-}" && -f "$FAKE_LEGACY_ACTIVE_FILE" ]]; then exit 0; fi
+                [[ "${FAKE_LEGACY_ACTIVE:-0}" == 1 ]] && exit 0 || exit 3
+                ;;
             *) exit 3 ;;
         esac
         ;;
     show)
-        [[ "$*" == *MainPID* ]] && printf '%s\n' "${FAKE_MAIN_PID:-0}"
+        if [[ "$*" == *MainPID* ]]; then
+            unit="${*: -1}"
+            if [[ "$unit" == codex-info-rest.service ]]; then
+                printf '%s\n' "${FAKE_REST_PID:-${FAKE_MAIN_PID:-0}}"
+            elif [[ "$unit" == codex-info.service && -n "${FAKE_LEGACY_PID_FILE:-}" && -f "$FAKE_LEGACY_PID_FILE" ]]; then
+                cat -- "$FAKE_LEGACY_PID_FILE"
+            elif [[ "$unit" == codex-info.service ]]; then
+                printf '%s\n' "${FAKE_LEGACY_PID:-0}"
+            else
+                printf '%s\n' "${FAKE_MAIN_PID:-0}"
+            fi
+        fi
         exit 0
         ;;
     daemon-reload|enable|disable|start|stop|restart)
         unit="${*: -1}"
-        if [[ "$unit" == codex-info.service && -n "${FAKE_MAIN_ACTIVE_FILE:-}" ]]; then
+        if [[ "$unit" == codex-info-recorder.service && -n "${FAKE_MAIN_ACTIVE_FILE:-}" ]]; then
+            if [[ ("$1" == start || "$1" == restart) && "${FAKE_FAIL_START_UNIT:-}" == "$unit" &&
+                  ( -z "${FAKE_FAIL_START_ONCE_FILE:-}" || ! -e "$FAKE_FAIL_START_ONCE_FILE" ) ]]; then
+                [[ -z "${FAKE_FAIL_START_ONCE_FILE:-}" ]] || : > "$FAKE_FAIL_START_ONCE_FILE"
+                exit 1
+            fi
             if [[ "$1" == start || "$1" == restart ]]; then : > "$FAKE_MAIN_ACTIVE_FILE"; fi
             if [[ "$1" == stop ]]; then rm -f -- "$FAKE_MAIN_ACTIVE_FILE"; fi
+            if [[ ("$1" == start || "$1" == restart) && -n "${FAKE_RECORDER_REFRESH:-}" ]]; then
+                python3 - "$FAKE_RECORDER_REFRESH" "$FAKE_MAIN_PID" "$FAKE_PROC_ROOT" <<'PY_REFRESH'
+import json, os, pathlib, stat, sys, time
+history = pathlib.Path(sys.argv[1])
+pid = int(sys.argv[2])
+proc_root = pathlib.Path(sys.argv[3])
+stat_path = proc_root / str(pid) / "stat"
+fields = stat_path.read_text(encoding="utf-8").rsplit(") ", 1)[1].split()
+starttime = int(fields[19])
+executable = proc_root / str(pid) / "exe"
+metadata = executable.stat()
+nonce = "ab" * 16
+lock = history / "usage_record_daemon.lock"
+state = history / "recorder-state.json"
+lock.write_text(json.dumps({
+    "pid": pid, "started_at": int(time.time()), "starttime_ticks": starttime,
+    "executable_device": metadata.st_dev, "executable_inode": metadata.st_ino,
+    "owner_nonce": nonce,
+}) + "\n", encoding="utf-8")
+os.chmod(lock, stat.S_IRUSR | stat.S_IWUSR)
+state.write_text(json.dumps({
+    "schema": "codex-info-recorder-state-v1", "pid": pid,
+    "process_starttime": starttime, "owner_nonce": nonce,
+    "write_state": "idle_no_account", "partition_id_hash": None,
+    "data_generation": None, "collector_epoch": None, "cycle_seq": None,
+    "last_commit_unix": None,
+    "updated_at_unix": int(time.time()),
+}) + "\n", encoding="utf-8")
+os.chmod(state, stat.S_IRUSR | stat.S_IWUSR)
+PY_REFRESH
+            fi
+        fi
+        if [[ "$unit" == codex-info-rest.service && -n "${FAKE_REST_ACTIVE_FILE:-}" ]]; then
+            if [[ ("$1" == start || "$1" == restart) && "${FAKE_FAIL_START_UNIT:-}" == "$unit" &&
+                  ( -z "${FAKE_FAIL_START_ONCE_FILE:-}" || ! -e "$FAKE_FAIL_START_ONCE_FILE" ) ]]; then
+                [[ -z "${FAKE_FAIL_START_ONCE_FILE:-}" ]] || : > "$FAKE_FAIL_START_ONCE_FILE"
+                exit 1
+            fi
+            if [[ "$1" == start || "$1" == restart ]]; then : > "$FAKE_REST_ACTIVE_FILE"; fi
+            if [[ "$1" == stop ]]; then rm -f -- "$FAKE_REST_ACTIVE_FILE"; fi
+            if [[ ("$1" == start || "$1" == restart) && -n "${FAKE_REST_SOCKET_NET_FILE:-}" && -n "${FAKE_REST_SOCKET_CONTENT:-}" ]]; then
+                printf '%s' "$FAKE_REST_SOCKET_CONTENT" > "$FAKE_REST_SOCKET_NET_FILE"
+            fi
+        fi
+        if [[ "$unit" == codex-info.service ]]; then
+            if [[ ("$1" == start || "$1" == restart) && "${FAKE_FAIL_START_UNIT:-}" == "$unit" ]]; then exit 1; fi
+            if [[ "$1" == stop ]]; then
+                [[ -z "${FAKE_LEGACY_ACTIVE_FILE:-}" ]] || rm -f -- "$FAKE_LEGACY_ACTIVE_FILE"
+                [[ -z "${FAKE_LEGACY_PID_FILE:-}" ]] || rm -f -- "$FAKE_LEGACY_PID_FILE"
+                [[ -z "${FAKE_LEGACY_SOCKET_NET_FILE:-}" ]] || : > "$FAKE_LEGACY_SOCKET_NET_FILE"
+            fi
+            if [[ "$1" == disable ]]; then
+                [[ -z "${FAKE_LEGACY_ENABLE_PATH:-}" ]] || rm -f -- "$FAKE_LEGACY_ENABLE_PATH"
+                [[ -z "${FAKE_LEGACY_ENABLED_FILE:-}" ]] || rm -f -- "$FAKE_LEGACY_ENABLED_FILE"
+            fi
+            if [[ "$1" == start || "$1" == restart ]]; then
+                [[ -z "${FAKE_LEGACY_ACTIVE_FILE:-}" ]] || : > "$FAKE_LEGACY_ACTIVE_FILE"
+                if [[ -n "${FAKE_LEGACY_PID_FILE:-}" ]]; then printf '%s\n' "${FAKE_LEGACY_PID:-0}" > "$FAKE_LEGACY_PID_FILE"; fi
+                if [[ -n "${FAKE_LEGACY_SOCKET_NET_FILE:-}" && -n "${FAKE_LEGACY_SOCKET_CONTENT:-}" ]]; then
+                    printf '%s' "$FAKE_LEGACY_SOCKET_CONTENT" > "$FAKE_LEGACY_SOCKET_NET_FILE"
+                fi
+            fi
         fi
         if [[ "${FAKE_STARTUP_CONDITION:-0}" == 1 &&
-              "$unit" == codex-info.service &&
+              "$unit" == codex-info-recorder.service &&
               ("$1" == start || "$1" == restart) ]]; then
             [[ -n "${FAKE_INSTALLER:-}" ]] || exit 1
             transaction="${FAKE_INSTALLER%/.local/libexec/codex-info-install.sh}/.local/share/codex-info/install-transaction.json"
@@ -315,15 +414,26 @@ fi
 FAKE_LDD
 chmod 0755 "$fake_bin/ldd"
 
-printf 'fixture binary generation one\n' > "$fixture_root/codex_info"
-chmod 0755 "$fixture_root/codex_info"
+printf 'fixture UI generation one\n' > "$fixture_root/codex_info"
+printf 'fixture recorder generation one\n' > "$fixture_root/codex_info_recorder"
+printf 'fixture REST generation one\n' > "$fixture_root/codex_info_rest"
+chmod 0755 "$fixture_root/codex_info" "$fixture_root/codex_info_recorder" "$fixture_root/codex_info_rest"
 
 build_bundle() {
     local source="$1" version="$2"
     SOURCE_SHA="$source" RUN_ID=92001 RUN_ATTEMPT=1 OBJDUMP_BIN="$fake_bin/objdump" \
-        bash "$BUILD_SCRIPT" --binary "$fixture_root/codex_info" --version "$version" \
+        bash "$BUILD_SCRIPT" --ui-binary "$fixture_root/codex_info" \
+        --recorder-binary "$fixture_root/codex_info_recorder" --rest-binary "$fixture_root/codex_info_rest" \
+        --version "$version" \
         --output-dir "$output_root" >/dev/null
     printf '%s/codex-info-%s-x86_64-unknown-linux-gnu.tar.gz\n' "$output_root" "$version"
+}
+
+build_legacy_caller_bundle() {
+    local source="$1" version="$2"
+    SOURCE_SHA="$source" RUN_ID=92000 RUN_ATTEMPT=1 OBJDUMP_BIN="$fake_bin/objdump" \
+        bash "$BUILD_SCRIPT" --binary "$fixture_root/codex_info" \
+        --version "$version" --output-dir "$legacy_output_root" >/dev/null
 }
 
 archive_version() {
@@ -382,6 +492,23 @@ run_install() {
     script="$(extract_installer "$archive")"
     HOME="$home" CODEX_HOME="$home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
         CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+        bash "$script" --bundle "$archive"
+}
+run_legacy_install() {
+    local archive="$1" home="$2" fail_unit="${3:-}" fail_once_file="${4:-}" script
+    script="$(extract_installer "$archive")"
+    HOME="$home" CODEX_HOME="$home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        FAKE_LEGACY_ENABLED_FILE="$home/.legacy-enabled" \
+        FAKE_LEGACY_ACTIVE_FILE="$home/.legacy-active" FAKE_LEGACY_PID_FILE="$home/.legacy-pid" \
+        FAKE_LEGACY_PID=6100 FAKE_LEGACY_ENABLE_PATH="$home/.config/systemd/user/default.target.wants/codex-info.service" \
+        FAKE_LEGACY_SOCKET_NET_FILE="$fake_proc/net/tcp" FAKE_LEGACY_SOCKET_CONTENT="${legacy_socket_content:-}" \
+        FAKE_MAIN_ACTIVE_FILE="$home/.recorder-active" FAKE_REST_ACTIVE_FILE="$home/.rest-active" \
+        FAKE_MAIN_PID="${legacy_recorder_pid:-6101}" FAKE_REST_PID="${legacy_rest_pid:-6102}" \
+        FAKE_RECORDER_REFRESH="$home/.codex/history" FAKE_PROC_ROOT="$fake_proc" \
+        FAKE_REST_SOCKET_NET_FILE="$fake_proc/net/tcp" FAKE_REST_SOCKET_CONTENT="${split_socket_content:-}" \
+        FAKE_FAIL_START_UNIT="$fail_unit" FAKE_FAIL_START_ONCE_FILE="$fail_once_file" \
+        CODEX_INFO_PROC_ROOT="$fake_proc" \
+        SYSTEMCTL_BIN=systemctl CURL_BIN=curl FAKE_HEALTH_VERSION="${legacy_candidate_version:-1.0.20}" \
         bash "$script" --bundle "$archive"
 }
 run_install_glibc() {
@@ -443,6 +570,124 @@ PY
 }
 
 # Hold a real descriptor-9 lock while exposing an unsettled journal.  This
+make_legacy_combined_home() {
+    local home="$1" stage old_generation
+    stage="$home/.local/share/codex-info/generations/.legacy-stage"
+    mkdir -p -- "$home/.local/bin" "$home/.local/libexec" "$home/.local/share/codex-info/generations" \
+        "$home/.config/systemd/user/default.target.wants" "$home/.codex/history"
+    write_stopped_state "$home"
+    tar -xOf "$archive_v1" codex_info > "$stage.codex_info"
+    tar -xOf "$archive_v1" install.sh > "$stage.install.sh"
+    tar -xOf "$archive_v1" codex-info-update.service > "$stage.codex-info-update.service"
+    tar -xOf "$archive_v1" codex-info-update.timer > "$stage.codex-info-update.timer"
+    mkdir -p -- "$stage"
+    mv -- "$stage.codex_info" "$stage/codex_info"
+    mv -- "$stage.install.sh" "$stage/install.sh"
+    mv -- "$stage.codex-info-update.service" "$stage/codex-info-update.service"
+    mv -- "$stage.codex-info-update.timer" "$stage/codex-info-update.timer"
+    cat > "$stage/codex-info.service" <<'OLD_COMBINED_UNIT'
+[Unit]
+Description=Codex Info legacy combined service
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/codex_info --port 8787
+Restart=always
+RestartSec=5s
+StartLimitIntervalSec=0
+TimeoutStopSec=20s
+Environment=CODEX_INFO_SYSTEMD_MANAGED=1
+
+[Install]
+WantedBy=default.target
+OLD_COMBINED_UNIT
+    chmod 0755 "$stage/codex_info" "$stage/install.sh"
+    chmod 0644 "$stage/codex-info.service" "$stage/codex-info-update.service" "$stage/codex-info-update.timer"
+    old_generation="$(python3 - "$stage" "$home/.local/share/codex-info/generations" <<'PY'
+import hashlib, json, pathlib, sys
+stage, generations = map(pathlib.Path, sys.argv[1:])
+source = "3" * 40
+names = ["codex-info-update.service", "codex-info-update.timer", "codex-info.service", "codex_info", "install.sh"]
+entries = []
+for name in names:
+    data = (stage / name).read_bytes()
+    entries.append({"path": name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+document = {
+    "schema": "codex-info-linux-bundle-v1", "product": "codex_info",
+    "version": "1.0.48", "source_sha": source, "run_id": "92000", "run_attempt": 1,
+    "target": "x86_64-unknown-linux-gnu", "compatibility": "glibc", "glibc_minimum": "2.31",
+    "files": entries,
+}
+raw = (json.dumps(document, indent=2) + "\n").encode()
+(stage / "manifest.json").write_bytes(raw)
+(stage / "manifest.json").chmod(0o644)
+generation = generations / f"1.0.48-{source}-{hashlib.sha256(raw).hexdigest()}"
+stage.rename(generation)
+generation.chmod(0o700)
+print(generation.name)
+PY
+)"
+    ln -s -- "generations/$old_generation" "$home/.local/share/codex-info/current"
+    ln -s -- '../share/codex-info/current/codex_info' "$home/.local/bin/codex_info"
+    ln -s -- '../share/codex-info/current/run.sh' "$home/.local/bin/codex-info"
+    ln -s -- '../share/codex-info/current/install.sh' "$home/.local/libexec/codex-info-install.sh"
+    ln -s -- 'current/manifest.json' "$home/.local/share/codex-info/manifest.json"
+    ln -s -- '../../../.local/share/codex-info/current/codex-info.service' \
+        "$home/.config/systemd/user/codex-info.service"
+    ln -s -- '../../../.local/share/codex-info/current/codex-info-update.service' \
+        "$home/.config/systemd/user/codex-info-update.service"
+    ln -s -- '../../../.local/share/codex-info/current/codex-info-update.timer' \
+        "$home/.config/systemd/user/codex-info-update.timer"
+    ln -s -- '../codex-info.service' \
+        "$home/.config/systemd/user/default.target.wants/codex-info.service"
+    : > "$home/.legacy-enabled"
+    : > "$home/.legacy-active"
+    printf '6100\n' > "$home/.legacy-pid"
+    python3 - "$home/.local/share/codex-info/control-state.json" "$old_generation" <<'PY'
+import json, pathlib, sys, time
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text(encoding="utf-8"))
+value["desired_state"] = "running"
+value["generation_id"] = sys.argv[2]
+value["updated_at_unix"] = int(time.time())
+path.write_text(json.dumps(value, separators=(",", ":")) + "\n", encoding="utf-8")
+path.chmod(0o600)
+PY
+    printf '%s\n' "$old_generation"
+}
+prepare_legacy_process_fixture() {
+    local home="$1" base="$2" recorder_pid rest_pid
+    recorder_pid=$((base + 1)); rest_pid=$((base + 2))
+    legacy_recorder_pid="$recorder_pid"
+    legacy_rest_pid="$rest_pid"
+    mkdir -p -- "$fake_proc/$recorder_pid/fd" "$fake_proc/$rest_pid/fd" "$home/.codex/history"
+    ln -s -- "$home/.local/share/codex-info/current/codex_info_recorder" "$fake_proc/$recorder_pid/exe"
+    ln -s -- "$home/.local/share/codex-info/current/codex_info_rest" "$fake_proc/$rest_pid/exe"
+    ln -s -- 'socket:[9100]' "$fake_proc/$rest_pid/fd/3"
+    python3 - "$fake_proc/$recorder_pid/stat" "$fake_proc/$rest_pid/stat" "$recorder_pid" "$rest_pid" <<'PY'
+import pathlib, sys
+recorder_stat, rest_stat, recorder_pid, rest_pid = sys.argv[1:]
+for path, pid, name, start in ((recorder_stat, recorder_pid, "codex_info_recorder", 6111), (rest_stat, rest_pid, "codex_info_rest", 6112)):
+    fields = ["S"] + ["0"] * 18 + [str(start)]
+    pathlib.Path(path).write_text(f"{pid} ({name}) " + " ".join(fields) + "\n", encoding="utf-8")
+PY
+    split_socket_content=$'  sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n0: 0100007F:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 9100 1\n'
+}
+prepare_legacy_listener_fixture() {
+    local home="$1" pid=6100
+    mkdir -p -- "$fake_proc/$pid/fd"
+    ln -s -- "$home/.local/share/codex-info/current/codex_info" "$fake_proc/$pid/exe"
+    ln -s -- 'socket:[9000]' "$fake_proc/$pid/fd/3"
+    python3 - "$fake_proc/$pid/stat" "$pid" <<'PY'
+import pathlib, sys
+path, pid = sys.argv[1:]
+fields = ["S"] + ["0"] * 18 + ["6100"]
+pathlib.Path(path).write_text(f"{pid} (codex_info) " + " ".join(fields) + "\n", encoding="utf-8")
+PY
+    legacy_socket_content=$'  sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n0: 0100007F:2253 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 9000 1\n'
+    printf '%s' "$legacy_socket_content" > "$fake_proc/net/tcp"
+}
 # models systemd's separate ExecCondition process observing the installer
 # that owns the active transaction, without granting the condition an
 # environment-only bypass.
@@ -547,6 +792,21 @@ run_active_startup_condition_case() {
     rm -f -- "$ready_path" "$hold_pipe"
 }
 
+build_legacy_caller_bundle 0000000000000000000000000000000000000001 1.0.18
+validate_workflow_candidate "$legacy_output_root"
+mixed_contract_error="$TEST_ROOT/mixed-binary-contract.err"
+if SOURCE_SHA=0000000000000000000000000000000000000002 RUN_ID=92000 RUN_ATTEMPT=1 \
+    OBJDUMP_BIN="$fake_bin/objdump" bash "$BUILD_SCRIPT" \
+    --binary "$fixture_root/codex_info" --ui-binary "$fixture_root/codex_info" \
+    --recorder-binary "$fixture_root/codex_info_recorder" \
+    --rest-binary "$fixture_root/codex_info_rest" --version 1.0.18 \
+    --output-dir "$TEST_ROOT/mixed-output" > /dev/null 2>"$mixed_contract_error"; then
+    fail 'mixed legacy/new bundle binary contract unexpectedly succeeded'
+fi
+grep -Fq 'cannot combine --binary with the split binary options' "$mixed_contract_error" \
+    || fail 'mixed legacy/new bundle binary contract did not fail explicitly'
+printf 'case trusted-main legacy bundle caller compatibility: PASS\n'
+
 archive_v1="$(build_bundle 1111111111111111111111111111111111111111 1.0.19)"
 archive_v2=''
 
@@ -582,9 +842,9 @@ with tarfile.open(archive, "r:gz") as stream:
     assert manifest == external
     for entry in manifest["files"]:
         assert set(entry) == {"path", "size", "sha256", "mode"}
-        assert entry["mode"] == (0o755 if entry["path"] in {"codex_info", "run.sh", "install.sh"} else 0o644)
+        assert entry["mode"] == (0o755 if entry["path"] in {"codex_info", "codex_info_recorder", "codex_info_rest", "run.sh", "install.sh"} else 0o644)
     for item in members:
-        assert stat.S_IMODE(item.mode) == (0o755 if item.name in {"codex_info","run.sh","install.sh"} else 0o644)
+        assert stat.S_IMODE(item.mode) == (0o755 if item.name in {"codex_info","codex_info_recorder","codex_info_rest","run.sh","install.sh"} else 0o644)
     assert stream.extractfile("run.sh").read() == source.read_bytes()
 print("case archive/hash/modes: PASS")
 PY
@@ -615,10 +875,13 @@ printf 'case manifest mode rejection: PASS\n'
 
 for path in \
     "$fake_home/.local/bin/codex_info" \
+    "$fake_home/.local/bin/codex_info_recorder" \
+    "$fake_home/.local/bin/codex_info_rest" \
     "$fake_home/.local/bin/codex-info" \
     "$fake_home/.local/libexec/codex-info-install.sh" \
     "$fake_home/.local/share/codex-info/manifest.json" \
-    "$fake_home/.config/systemd/user/codex-info.service" \
+    "$fake_home/.config/systemd/user/codex-info-recorder.service" \
+    "$fake_home/.config/systemd/user/codex-info-rest.service" \
     "$fake_home/.config/systemd/user/codex-info-update.service" \
     "$fake_home/.config/systemd/user/codex-info-update.timer"; do
     assert_symlink "$path"
@@ -640,9 +903,9 @@ run_update "$fake_home" >/dev/null
 [[ -z "$(find "$update_tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]] || fail 'no-update left temporary files'
 printf 'case equal-version no-update: PASS\n'
 
-rm -- "$fake_home/.config/systemd/user/codex-info.service"
+rm -- "$fake_home/.config/systemd/user/codex-info-recorder.service"
 run_update "$fake_home" >/dev/null
-assert_symlink "$fake_home/.config/systemd/user/codex-info.service"
+assert_symlink "$fake_home/.config/systemd/user/codex-info-recorder.service"
 printf 'case equal-version repair: PASS\n'
 
 rm -- "$fake_home/.local/share/codex-info/manifest.json"
@@ -654,17 +917,44 @@ printf 'case equal-version manifest repair: PASS\n'
 # executable identity, lock record, and recorder state for the installed tuple.
 health_pid=4242
 health_starttime=12345
+health_recorder_pid=4241
+health_recorder_starttime=12344
 health_generation="$(readlink -- "$fake_home/.local/share/codex-info/current")"
 health_generation_dir="$fake_home/.local/share/codex-info/$health_generation"
 mkdir -p -- "$fake_proc/$health_pid/fd" "$fake_home/.codex/history"
-ln -s -- "$health_generation_dir/codex_info" "$fake_proc/$health_pid/exe"
+ln -s -- "$health_generation_dir/codex_info_rest" "$fake_proc/$health_pid/exe"
 ln -s -- 'socket:[9001]' "$fake_proc/$health_pid/fd/3"
 python3 - "$fake_proc/$health_pid/stat" "$fake_home/.codex/history/usage_record_daemon.lock" \
-    "$fake_home/.codex/history/recorder-state.json" "$health_generation_dir/codex_info" "$health_pid" "$health_starttime" <<'PY'
+    "$fake_home/.codex/history/recorder-state.json" "$health_generation_dir/codex_info_rest" "$health_pid" "$health_starttime" <<'PY'
 import hashlib, json, os, pathlib, stat, sys
 stat_path, lock_path, state_path, executable, pid, starttime = sys.argv[1:]
 fields = ["S"] + ["0"] * 18 + [starttime]
-pathlib.Path(stat_path).write_text(f"{pid} (codex_info) " + " ".join(fields) + "\n")
+pathlib.Path(stat_path).write_text(f"{pid} (codex_info_rest) " + " ".join(fields) + "\n")
+metadata = os.stat(executable)
+nonce = "ab" * 16
+pathlib.Path(lock_path).write_text(json.dumps({
+    "pid": int(pid), "started_at": 1, "starttime_ticks": int(starttime),
+    "executable_device": metadata.st_dev, "executable_inode": metadata.st_ino,
+    "owner_nonce": nonce,
+}) + "\n")
+pathlib.Path(lock_path).chmod(stat.S_IRUSR | stat.S_IWUSR)
+pathlib.Path(state_path).write_text(json.dumps({
+    "schema": "codex-info-recorder-state-v1", "pid": int(pid),
+    "process_starttime": int(starttime), "owner_nonce": nonce,
+    "write_state": "idle_no_account", "partition_id_hash": None,
+    "data_generation": None, "collector_epoch": None, "cycle_seq": None,
+    "last_commit_unix": None, "updated_at_unix": int(__import__('time').time()),
+}) + "\n")
+pathlib.Path(state_path).chmod(stat.S_IRUSR | stat.S_IWUSR)
+PY
+mkdir -p -- "$fake_proc/$health_recorder_pid/fd"
+ln -s -- "$health_generation_dir/codex_info_recorder" "$fake_proc/$health_recorder_pid/exe"
+python3 - "$fake_proc/$health_recorder_pid/stat" "$fake_home/.codex/history/usage_record_daemon.lock" \
+    "$fake_home/.codex/history/recorder-state.json" "$health_generation_dir/codex_info_recorder" "$health_recorder_pid" "$health_recorder_starttime" <<'PY'
+import json, os, pathlib, stat, sys
+stat_path, lock_path, state_path, executable, pid, starttime = sys.argv[1:]
+fields = ["S"] + ["0"] * 18 + [starttime]
+pathlib.Path(stat_path).write_text(f"{pid} (codex_info_recorder) " + " ".join(fields) + "\n")
 metadata = os.stat(executable)
 nonce = "ab" * 16
 pathlib.Path(lock_path).write_text(json.dumps({
@@ -688,21 +978,21 @@ health_source="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))
 health_manifest="$(sha256sum "$fake_home/.local/share/codex-info/current/manifest.json" | awk '{print $1}')"
 HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
     FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" TMPDIR="$update_tmp" \
-    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    FAKE_MAIN_ENABLED=1 FAKE_REST_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_REST_ACTIVE=1 FAKE_MAIN_PID="$health_recorder_pid" FAKE_REST_PID="$health_pid" \
     FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_SOURCE="$health_source" \
     FAKE_HEALTH_MANIFEST="$health_manifest" CODEX_INFO_PROC_ROOT="$fake_proc" \
     SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
     bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null
 printf 'case source-bound health/readiness: PASS\n'
 HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
-    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    FAKE_MAIN_ENABLED=1 FAKE_REST_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_REST_ACTIVE=1 FAKE_MAIN_PID="$health_recorder_pid" FAKE_REST_PID="$health_pid" \
     FAKE_HEALTH_VERSION="$health_version" FAKE_DETAILS_PADDING_BYTES=$((300 * 1024)) \
     CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
     bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null
 printf 'case large details response via stdin: PASS\n'
 for health_shape in extra duplicate old; do
     if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
-        FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+        FAKE_MAIN_ENABLED=1 FAKE_REST_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_REST_ACTIVE=1 FAKE_MAIN_PID="$health_recorder_pid" FAKE_REST_PID="$health_pid" \
         FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_SHAPE="$health_shape" CODEX_INFO_PROC_ROOT="$fake_proc" \
         SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
         bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null 2>&1; then
@@ -710,12 +1000,12 @@ for health_shape in extra duplicate old; do
     fi
 done
 HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
-    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    FAKE_MAIN_ENABLED=1 FAKE_REST_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_REST_ACTIVE=1 FAKE_MAIN_PID="$health_recorder_pid" FAKE_REST_PID="$health_pid" \
     FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_SHAPE=exact FAKE_DETAILS_STATE=error \
     CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
     bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null
 if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
-    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    FAKE_MAIN_ENABLED=1 FAKE_REST_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_REST_ACTIVE=1 FAKE_MAIN_PID="$health_recorder_pid" FAKE_REST_PID="$health_pid" \
     FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_SHAPE=exact FAKE_DETAILS_STATE=unknown \
     CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
     bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null 2>&1; then
@@ -729,7 +1019,7 @@ path = pathlib.Path(sys.argv[1]); value = json.loads(path.read_text()); value["u
 path.write_text(json.dumps(value) + "\n")
 PY
 if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
-    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_recorder_pid" FAKE_REST_PID="$health_pid" \
     FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_SHAPE=exact CODEX_INFO_PROC_ROOT="$fake_proc" \
     SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
     bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null 2>&1; then
@@ -743,27 +1033,44 @@ import json, pathlib, sys, time
 path, case = sys.argv[1:]
 value = json.loads(pathlib.Path(path).read_text())
 value["write_state"] = case
-value["updated_at_unix"] = int(time.time())
-if case == "ready":
-    value.update({"partition_id_hash": "cd" * 32, "data_generation": 1,
-                  "collector_epoch": "ef" * 16, "cycle_seq": 1,
-                  "last_commit_unix": 1})
+now = int(time.time())
+value.update({"updated_at_unix": now, "partition_id_hash": "cd" * 32,
+              "data_generation": 1, "collector_epoch": "ef" * 16,
+              "cycle_seq": 1, "last_commit_unix": now})
 pathlib.Path(path).write_text(json.dumps(value) + "\n")
 PY
-    if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
-        FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    if ! HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+        FAKE_MAIN_ENABLED=1 FAKE_REST_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_REST_ACTIVE=1 FAKE_MAIN_PID="$health_recorder_pid" FAKE_REST_PID="$health_pid" \
         FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_SHAPE=exact CODEX_INFO_PROC_ROOT="$fake_proc" \
         SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
         bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null 2>&1; then
-        fail "recorder $recorder_case state unexpectedly accepted"
+        fail "recorder $recorder_case state was rejected despite a fresh successful commit"
     fi
     mv -- "$state_backup" "$fake_home/.codex/history/recorder-state.json"
 done
+cp -- "$fake_home/.codex/history/recorder-state.json" "$state_backup"
+python3 - "$fake_home/.codex/history/recorder-state.json" <<'PY'
+import json, pathlib
+path = pathlib.Path(__import__('sys').argv[1])
+value = json.loads(path.read_text())
+value.update({"write_state": "degraded", "partition_id_hash": None,
+              "data_generation": None, "collector_epoch": None,
+              "cycle_seq": None, "last_commit_unix": None})
+path.write_text(json.dumps(value) + "\n")
+PY
+if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
+    FAKE_MAIN_ENABLED=1 FAKE_REST_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_REST_ACTIVE=1 FAKE_MAIN_PID="$health_recorder_pid" FAKE_REST_PID="$health_pid" \
+    FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_SHAPE=exact CODEX_INFO_PROC_ROOT="$fake_proc" \
+    SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
+    bash "$fake_home/.local/libexec/codex-info-install.sh" --verify-runtime >/dev/null 2>&1; then
+    fail 'degraded recorder state with missing commit identity unexpectedly passed'
+fi
+mv -- "$state_backup" "$fake_home/.codex/history/recorder-state.json"
 printf 'case external-error tolerance/health schema/heartbeat rejection: PASS\n'
 
 write_running_state "$fake_home"
 if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
-    FAKE_RELEASE_FAILURE=1 FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    FAKE_RELEASE_FAILURE=1 FAKE_MAIN_ENABLED=1 FAKE_REST_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_REST_ACTIVE=1 FAKE_MAIN_PID="$health_recorder_pid" FAKE_REST_PID="$health_pid" \
     FAKE_HEALTH_VERSION="$health_version" CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
     bash "$fake_home/.local/libexec/codex-info-install.sh" --update >/dev/null 2>&1; then
     fail 'release API failure unexpectedly reported success'
@@ -784,7 +1091,7 @@ startup_state_hash="$(sha256sum "$fake_home/.local/share/codex-info/control-stat
 startup_output="$TEST_ROOT/startup-update-failure.out"
 if ! HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
     FAKE_RELEASE_FAILURE=1 FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" \
-    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=0 TMPDIR="$update_tmp" CODEX_INFO_PROC_ROOT="$fake_proc" \
+    FAKE_MAIN_ENABLED=1 FAKE_REST_ENABLED=1 FAKE_MAIN_ACTIVE=0 FAKE_REST_ACTIVE=0 TMPDIR="$update_tmp" CODEX_INFO_PROC_ROOT="$fake_proc" \
     SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
     bash "$fake_home/.local/libexec/codex-info-install.sh" --startup-reconcile >"$startup_output" 2>&1; then
     fail 'startup update failure blocked a verified local generation'
@@ -847,8 +1154,8 @@ pathlib.Path(path).chmod(0o600)
 PY
 HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
     FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" TMPDIR="$update_tmp" \
-    FAKE_MAIN_ENABLED=1 FAKE_TIMER_ENABLED=1 FAKE_MAIN_ACTIVE_FILE="$resume_active_file" \
-    FAKE_MAIN_PID="$health_pid" FAKE_HEALTH_VERSION="$health_version" \
+    FAKE_MAIN_ENABLED=1 FAKE_REST_ENABLED=1 FAKE_TIMER_ENABLED=1 FAKE_REST_ACTIVE=1 FAKE_MAIN_ACTIVE_FILE="$resume_active_file" \
+    FAKE_MAIN_PID="$health_recorder_pid" FAKE_REST_PID="$health_pid" FAKE_HEALTH_VERSION="$health_version" \
     CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
     bash "$fake_home/.local/libexec/codex-info-install.sh" --update >/dev/null
 [[ -f "$resume_active_file" ]] || fail 'rollback resume did not start the known predecessor'
@@ -863,11 +1170,13 @@ write_stopped_state "$fake_home"
 mkdir -p -- "$fake_home/.config/systemd/user/default.target.wants" \
     "$fake_home/.config/systemd/user/timers.target.wants"
 for path in \
-    "$fake_home/.config/systemd/user/default.target.wants/codex-info.service" \
+    "$fake_home/.config/systemd/user/default.target.wants/codex-info-recorder.service" \
+    "$fake_home/.config/systemd/user/default.target.wants/codex-info-rest.service" \
     "$fake_home/.config/systemd/user/timers.target.wants/codex-info-update.timer"; do
     if [[ -e "$path" || -L "$path" ]]; then
         case "$(basename -- "$path")" in
-            codex-info.service) expected='../codex-info.service' ;;
+            codex-info-recorder.service) expected='../codex-info-recorder.service' ;;
+            codex-info-rest.service) expected='../codex-info-rest.service' ;;
             codex-info-update.timer) expected='../codex-info-update.timer' ;;
         esac
         [[ -L "$path" && "$(readlink -- "$path")" == "$expected" ]] ||
@@ -875,20 +1184,24 @@ for path in \
         rm -- "$path"
     fi
 done
-ln -s -- "$health_generation_dir/codex-info.service" \
-    "$fake_home/.config/systemd/user/default.target.wants/codex-info.service"
+ln -s -- "$health_generation_dir/codex-info-recorder.service" \
+    "$fake_home/.config/systemd/user/default.target.wants/codex-info-recorder.service"
+ln -s -- "$health_generation_dir/codex-info-rest.service" \
+    "$fake_home/.config/systemd/user/default.target.wants/codex-info-rest.service"
 ln -s -- "$health_generation_dir/codex-info-update.timer" \
     "$fake_home/.config/systemd/user/timers.target.wants/codex-info-update.timer"
 HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
     FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" TMPDIR="$update_tmp" \
-    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    FAKE_MAIN_ENABLED=1 FAKE_REST_ENABLED=1 FAKE_REST_PID="$health_pid" FAKE_MAIN_ACTIVE=1 FAKE_REST_ACTIVE=1 FAKE_MAIN_PID="$health_recorder_pid" \
     FAKE_HEALTH_VERSION="$health_version" FAKE_HEALTH_FAILURES=2 FAKE_HEALTH_COUNT_FILE="$health_count" \
     FAKE_HEALTH_SHAPE=exact CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
     CODEX_INFO_CLOCK_BIN="$clock_bin" CODEX_INFO_SLEEP_BIN="$sleep_bin" READINESS_CLOCK_FILE="$clock_file" \
     bash "$fake_home/.local/libexec/codex-info-install.sh" --start >/dev/null
 [[ "$(<"$health_count")" -ge 3 ]] || fail 'readiness did not retry transient health failure'
-[[ "$(readlink -- "$fake_home/.config/systemd/user/default.target.wants/codex-info.service")" == '../codex-info.service' ]] ||
-    fail 'service enable link remained pinned to a generation'
+[[ "$(readlink -- "$fake_home/.config/systemd/user/default.target.wants/codex-info-recorder.service")" == '../codex-info-recorder.service' ]] ||
+    fail 'recorder enable link remained pinned to a generation'
+[[ "$(readlink -- "$fake_home/.config/systemd/user/default.target.wants/codex-info-rest.service")" == '../codex-info-rest.service' ]] ||
+    fail 'REST enable link remained pinned to a generation'
 [[ "$(readlink -- "$fake_home/.config/systemd/user/timers.target.wants/codex-info-update.timer")" == '../codex-info-update.timer' ]] ||
     fail 'timer enable link remained pinned to a generation'
 write_stopped_state "$fake_home"
@@ -897,7 +1210,9 @@ printf 'case bounded readiness retry/stable enable links: PASS\n'
 # The next fixture models a clean stopped service; leave the prior health
 # owner out of the synthetic proc tree so the updater need not retire it.
 : > "$fake_proc/net/tcp"
-printf 'fixture binary generation two\n' > "$fixture_root/codex_info"
+printf 'fixture UI generation two\n' > "$fixture_root/codex_info"
+printf 'fixture recorder generation two\n' > "$fixture_root/codex_info_recorder"
+printf 'fixture REST generation two\n' > "$fixture_root/codex_info_rest"
 archive_v2="$(build_bundle 2222222222222222222222222222222222222222 1.0.20)"
 write_release "$archive_v2"
 if CODEX_INFO_INTERRUPT_PHASE=current_switched run_update "$fake_home" >/dev/null 2>&1; then
@@ -917,8 +1232,10 @@ grep -Fq '"phase": "committed"' "$fake_home/.local/share/codex-info/install-tran
     fail 'journal did not resume to committed'
 [[ "$(readlink -- "$fake_home/.local/share/codex-info/current")" == generations/1.0.20-* ]] ||
     fail 'resume did not converge to v2'
-[[ "$(readlink -- "$fake_home/.config/systemd/user/default.target.wants/codex-info.service")" == '../codex-info.service' ]] ||
-    fail 'current_switched resume retained a generation-pinned service link'
+[[ "$(readlink -- "$fake_home/.config/systemd/user/default.target.wants/codex-info-recorder.service")" == '../codex-info-recorder.service' ]] ||
+    fail 'current_switched resume retained a generation-pinned recorder link'
+[[ "$(readlink -- "$fake_home/.config/systemd/user/default.target.wants/codex-info-rest.service")" == '../codex-info-rest.service' ]] ||
+    fail 'current_switched resume retained a generation-pinned REST link'
 [[ "$(readlink -- "$fake_home/.config/systemd/user/timers.target.wants/codex-info-update.timer")" == '../codex-info-update.timer' ]] ||
     fail 'current_switched resume retained a generation-pinned timer link'
 printf 'case journal interruption/resume: PASS\n'
@@ -927,10 +1244,13 @@ printf 'case journal interruption/resume: PASS\n'
 # its predecessor. Resume must normalize both before committing recovery.
 rollback_generation="$(readlink -- "$fake_home/.local/share/codex-info/current")"
 rollback_generation="${rollback_generation#generations/}"
-rm -- "$fake_home/.config/systemd/user/default.target.wants/codex-info.service" \
+rm -- "$fake_home/.config/systemd/user/default.target.wants/codex-info-recorder.service" \
+    "$fake_home/.config/systemd/user/default.target.wants/codex-info-rest.service" \
     "$fake_home/.config/systemd/user/timers.target.wants/codex-info-update.timer"
-ln -s -- "$fake_home/.local/share/codex-info/generations/$rollback_generation/codex-info.service" \
-    "$fake_home/.config/systemd/user/default.target.wants/codex-info.service"
+ln -s -- "$fake_home/.local/share/codex-info/generations/$rollback_generation/codex-info-recorder.service" \
+    "$fake_home/.config/systemd/user/default.target.wants/codex-info-recorder.service"
+ln -s -- "$fake_home/.local/share/codex-info/generations/$rollback_generation/codex-info-rest.service" \
+    "$fake_home/.config/systemd/user/default.target.wants/codex-info-rest.service"
 ln -s -- "$fake_home/.local/share/codex-info/generations/$rollback_generation/codex-info-update.timer" \
     "$fake_home/.config/systemd/user/timers.target.wants/codex-info-update.timer"
 python3 - "$fake_home/.local/share/codex-info/install-transaction.json" "$boot_id_value" "$rollback_generation" <<'PY'
@@ -953,8 +1273,10 @@ PY
 run_update "$fake_home" >/dev/null
 grep -Fq '"phase": "committed"' "$fake_home/.local/share/codex-info/install-transaction.json" ||
     fail 'rollback resume did not commit recovery'
-[[ "$(readlink -- "$fake_home/.config/systemd/user/default.target.wants/codex-info.service")" == '../codex-info.service' ]] ||
-    fail 'rollback resume retained a generation-pinned service link'
+[[ "$(readlink -- "$fake_home/.config/systemd/user/default.target.wants/codex-info-recorder.service")" == '../codex-info-recorder.service' ]] ||
+    fail 'rollback resume retained a generation-pinned recorder link'
+[[ "$(readlink -- "$fake_home/.config/systemd/user/default.target.wants/codex-info-rest.service")" == '../codex-info-rest.service' ]] ||
+    fail 'rollback resume retained a generation-pinned REST link'
 [[ "$(readlink -- "$fake_home/.config/systemd/user/timers.target.wants/codex-info-update.timer")" == '../codex-info-update.timer' ]] ||
     fail 'rollback resume retained a generation-pinned timer link'
 printf 'case rollback journal stable-link resume: PASS\n'
@@ -995,15 +1317,15 @@ write_running_state "$fake_home"
 restart_log_start="$(wc -l < "$log")"
 if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH" FAKE_LOG="$log" \
     FAKE_RELEASE_JSON="$release_json" FAKE_RELEASE_ASSETS="$release_assets" TMPDIR="$update_tmp" \
-    FAKE_MAIN_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_MAIN_PID="$health_pid" \
+    FAKE_MAIN_ENABLED=1 FAKE_REST_ENABLED=1 FAKE_MAIN_ACTIVE=1 FAKE_REST_ACTIVE=1 FAKE_REST_PID="$health_pid" FAKE_MAIN_PID="$health_recorder_pid" \
     CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
     CODEX_INFO_CLOCK_BIN="$clock_bin" CODEX_INFO_SLEEP_BIN="$sleep_bin" READINESS_CLOCK_FILE="$clock_file" \
     bash "$fake_home/.local/libexec/codex-info-install.sh" --update >/dev/null 2>&1; then
     fail 'known old managed MainPID unexpectedly reached a healthy terminal'
 fi
-tail -n +$((restart_log_start + 1)) "$log" | grep -Fq 'systemctl --user restart --no-block codex-info.service' ||
+tail -n +$((restart_log_start + 1)) "$log" | grep -Fq 'systemctl --user restart --no-block codex-info-recorder.service' ||
     fail 'known old managed MainPID was not repaired through systemd restart'
-tail -n +$((restart_log_start + 1)) "$log" | grep -Fq 'systemctl --user reset-failed codex-info.service' ||
+tail -n +$((restart_log_start + 1)) "$log" | grep -Fq 'systemctl --user reset-failed codex-info-recorder.service' ||
     fail 'managed restart did not reset the start-limit epoch'
 write_stopped_state "$fake_home"
 printf 'case known-managed wrong-PID systemd repair: PASS\n'
@@ -1031,30 +1353,136 @@ HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PATH"
     CODEX_INFO_PROC_ROOT="$fake_proc" SYSTEMCTL_BIN=systemctl CURL_BIN=curl \
     bash "$fake_home/.local/libexec/codex-info-install.sh" --disable-autostart >/dev/null
 for path in \
-    "$fake_home/.config/systemd/user/codex-info.service" \
+    "$fake_home/.config/systemd/user/codex-info-recorder.service" \
+    "$fake_home/.config/systemd/user/codex-info-rest.service" \
     "$fake_home/.config/systemd/user/codex-info-update.service" \
     "$fake_home/.config/systemd/user/codex-info-update.timer"; do
     assert_symlink "$path"
 done
 for path in \
-    "$fake_home/.config/systemd/user/default.target.wants/codex-info.service" \
+    "$fake_home/.config/systemd/user/default.target.wants/codex-info-recorder.service" \
+    "$fake_home/.config/systemd/user/default.target.wants/codex-info-rest.service" \
     "$fake_home/.config/systemd/user/timers.target.wants/codex-info-update.timer"; do
     [[ ! -e "$path" && ! -L "$path" ]] || fail "disable retained enable link: $path"
 done
 write_stopped_state "$fake_home"
 printf 'case disable retains recoverable unit entrypoints: PASS\n'
 
+combined_upgrade_home="$TEST_ROOT/combined-upgrade-home"
+combined_old_generation="$(make_legacy_combined_home "$combined_upgrade_home")"
+printf 'combined profile sentinel\n' > "$combined_upgrade_home/.codex/session.jsonl"
+printf 'combined database sentinel\n' > "$combined_upgrade_home/.local/share/codex-info/usage.sqlite3"
+combined_profile_hash="$(sha256sum "$combined_upgrade_home/.codex/session.jsonl" "$combined_upgrade_home/.local/share/codex-info/usage.sqlite3")"
+prepare_legacy_listener_fixture "$combined_upgrade_home"
+prepare_legacy_process_fixture "$combined_upgrade_home" 6300
+legacy_candidate_version=1.0.20
+combined_log_start="$(wc -l < "$log")"
+run_legacy_install "$archive_v2" "$combined_upgrade_home" >/dev/null
+combined_log="$(tail -n +$((combined_log_start + 1)) "$log")"
+combined_stop_line="$(grep -n -m1 'systemctl --user stop --no-block codex-info.service' <<<"$combined_log" | cut -d: -f1 || true)"
+combined_recorder_start_line="$(grep -n -m1 'systemctl --user start --no-block codex-info-recorder.service' <<<"$combined_log" | cut -d: -f1 || true)"
+combined_rest_start_line="$(grep -n -m1 'systemctl --user start --no-block codex-info-rest.service' <<<"$combined_log" | cut -d: -f1 || true)"
+[[ -n "$combined_stop_line" && -n "$combined_recorder_start_line" && -n "$combined_rest_start_line" ]] ||
+    fail 'combined upgrade did not record old stop and split starts'
+(( combined_stop_line < combined_recorder_start_line && combined_recorder_start_line < combined_rest_start_line )) ||
+    fail 'combined upgrade started split services before old combined stop or in the wrong order'
+[[ ! -e "$combined_upgrade_home/.config/systemd/user/codex-info.service" &&
+   ! -L "$combined_upgrade_home/.config/systemd/user/codex-info.service" ]] ||
+    fail 'combined upgrade retained the old unit entrypoint'
+[[ ! -e "$combined_upgrade_home/.config/systemd/user/default.target.wants/codex-info.service" &&
+   ! -L "$combined_upgrade_home/.config/systemd/user/default.target.wants/codex-info.service" ]] ||
+    fail 'combined upgrade retained the old enable link'
+[[ ! -e "$combined_upgrade_home/.legacy-active" && ! -e "$combined_upgrade_home/.legacy-pid" ]] ||
+    fail 'combined upgrade old PID remained active or reappeared'
+if HOME="$combined_upgrade_home" FAKE_LOG="$log" FAKE_LEGACY_ACTIVE_FILE="$combined_upgrade_home/.legacy-active" \
+    "$fake_bin/systemctl" --user is-active --quiet codex-info.service >/dev/null 2>&1; then
+    fail 'combined service became active again after retirement'
+fi
+grep -Fq 'Restart=always' "$combined_upgrade_home/.local/share/codex-info/generations/$combined_old_generation/codex-info.service" ||
+    fail 'combined fixture did not contain the historical Restart contract'
+[[ "$(readlink -- "$combined_upgrade_home/.local/share/codex-info/current")" == generations/1.0.20-* ]] ||
+    fail 'combined upgrade did not publish the new generation'
+for path in \
+    "$combined_upgrade_home/.config/systemd/user/codex-info-recorder.service" \
+    "$combined_upgrade_home/.config/systemd/user/codex-info-rest.service"; do
+    assert_symlink "$path"
+done
+[[ -f "$combined_upgrade_home/.recorder-active" && -f "$combined_upgrade_home/.rest-active" ]] ||
+    fail 'combined upgrade did not activate both split services'
+combined_recorder_pid="$(FAKE_LOG="$log" FAKE_MAIN_PID="$legacy_recorder_pid" "$fake_bin/systemctl" --user show --property=MainPID --value codex-info-recorder.service)"
+combined_rest_pid="$(FAKE_LOG="$log" FAKE_REST_PID="$legacy_rest_pid" "$fake_bin/systemctl" --user show --property=MainPID --value codex-info-rest.service)"
+[[ "$combined_recorder_pid" =~ ^[1-9][0-9]*$ && "$combined_rest_pid" =~ ^[1-9][0-9]*$ &&
+   "$combined_recorder_pid" != "$combined_rest_pid" ]] ||
+    fail 'combined upgrade did not expose distinct recorder and REST PIDs'
+[[ "$(readlink -f "$fake_proc/$legacy_recorder_pid/exe")" == "$(readlink -f "$combined_upgrade_home/.local/share/codex-info/current/codex_info_recorder")" &&
+   "$(readlink -f "$fake_proc/$legacy_rest_pid/exe")" == "$(readlink -f "$combined_upgrade_home/.local/share/codex-info/current/codex_info_rest")" ]] ||
+    fail 'combined upgrade split executable identities are not current generation members'
+[[ "$(sha256sum "$combined_upgrade_home/.codex/session.jsonl" "$combined_upgrade_home/.local/share/codex-info/usage.sqlite3")" == "$combined_profile_hash" ]] ||
+    fail 'combined upgrade modified Session or database fixture data'
+printf 'case legacy combined active upgrade/retirement: PASS\n'
+: > "$fake_proc/net/tcp"
+rm -r -- "${fake_proc:?}/6100" "${fake_proc:?}/${legacy_recorder_pid:?}" "${fake_proc:?}/${legacy_rest_pid:?}"
+
+combined_rollback_home="$TEST_ROOT/combined-rollback-home"
+combined_rollback_old_generation="$(make_legacy_combined_home "$combined_rollback_home")"
+printf 'rollback profile sentinel\n' > "$combined_rollback_home/.codex/session.jsonl"
+printf 'rollback database sentinel\n' > "$combined_rollback_home/.local/share/codex-info/usage.sqlite3"
+combined_rollback_profile_hash="$(sha256sum "$combined_rollback_home/.codex/session.jsonl" "$combined_rollback_home/.local/share/codex-info/usage.sqlite3")"
+prepare_legacy_listener_fixture "$combined_rollback_home"
+prepare_legacy_process_fixture "$combined_rollback_home" 6400
+legacy_candidate_version=1.0.20
+combined_log_start="$(wc -l < "$log")"
+if run_legacy_install "$archive_v2" "$combined_rollback_home" codex-info-rest.service >/dev/null 2>&1; then
+    fail 'combined rollback start failure unexpectedly succeeded'
+fi
+combined_log="$(tail -n +$((combined_log_start + 1)) "$log")"
+combined_stop_line="$(grep -n -m1 'systemctl --user stop --no-block codex-info.service' <<<"$combined_log" | cut -d: -f1 || true)"
+combined_recorder_start_line="$(grep -n -m1 'systemctl --user start --no-block codex-info-recorder.service' <<<"$combined_log" | cut -d: -f1 || true)"
+combined_rest_start_line="$(grep -n -m1 'systemctl --user start --no-block codex-info-rest.service' <<<"$combined_log" | cut -d: -f1 || true)"
+combined_old_start_line="$(grep -n -m1 'systemctl --user start --no-block codex-info.service' <<<"$combined_log" | tail -n1 | cut -d: -f1 || true)"
+[[ -n "$combined_stop_line" && -n "$combined_recorder_start_line" && -n "$combined_rest_start_line" && -n "$combined_old_start_line" ]] ||
+    fail 'combined rollback did not record stop, split activation failure, and old restart'
+(( combined_stop_line < combined_recorder_start_line && combined_recorder_start_line < combined_rest_start_line && combined_rest_start_line < combined_old_start_line )) ||
+    fail 'combined rollback lifecycle order is not bounded and causal'
+[[ "$(readlink -- "$combined_rollback_home/.local/share/codex-info/current")" == "generations/$combined_rollback_old_generation" ]] ||
+    fail 'combined rollback did not restore the old current generation'
+assert_symlink "$combined_rollback_home/.config/systemd/user/codex-info.service"
+assert_symlink "$combined_rollback_home/.config/systemd/user/default.target.wants/codex-info.service"
+[[ -f "$combined_rollback_home/.legacy-active" && -f "$combined_rollback_home/.legacy-pid" ]] ||
+    fail 'combined rollback did not restore the old active PID'
+[[ "$(<"$combined_rollback_home/.legacy-pid")" == 6100 ]] || fail 'combined rollback restored the wrong old PID'
+cmp -s "$fake_proc/net/tcp" <(printf '%s' "$legacy_socket_content") ||
+    fail 'combined rollback did not restore the old 8787 listener fixture'
+for path in \
+    "$combined_rollback_home/.config/systemd/user/codex-info-recorder.service" \
+    "$combined_rollback_home/.config/systemd/user/codex-info-rest.service" \
+    "$combined_rollback_home/.config/systemd/user/default.target.wants/codex-info-recorder.service" \
+    "$combined_rollback_home/.config/systemd/user/default.target.wants/codex-info-rest.service"; do
+    [[ ! -e "$path" && ! -L "$path" ]] || fail "combined rollback retained split entrypoint: $path"
+done
+[[ ! -e "$combined_rollback_home/.recorder-active" && ! -e "$combined_rollback_home/.rest-active" ]] ||
+    fail 'combined rollback left a split service active'
+[[ "$(sha256sum "$combined_rollback_home/.codex/session.jsonl" "$combined_rollback_home/.local/share/codex-info/usage.sqlite3")" == "$combined_rollback_profile_hash" ]] ||
+    fail 'combined rollback modified Session or database fixture data'
+printf 'case legacy combined activation-failure rollback: PASS\n'
+: > "$fake_proc/net/tcp"
+rm -r -- "$fake_proc/6100" "$fake_proc/6401" "$fake_proc/6402"
+
 legacy_home="$TEST_ROOT/legacy-home"
 write_stopped_state "$legacy_home"
 mkdir -p -- "$legacy_home/.local/bin" "$legacy_home/.local/libexec" \
     "$legacy_home/.local/share/codex-info" "$legacy_home/.config/systemd/user"
 tar -xOf "$archive_v1" codex_info > "$legacy_home/.local/bin/codex_info"
+tar -xOf "$archive_v1" codex_info_recorder > "$legacy_home/.local/bin/codex_info_recorder"
+tar -xOf "$archive_v1" codex_info_rest > "$legacy_home/.local/bin/codex_info_rest"
 tar -xOf "$archive_v1" install.sh > "$legacy_home/.local/libexec/codex-info-install.sh"
-tar -xOf "$archive_v1" codex-info.service > "$legacy_home/.config/systemd/user/codex-info.service"
+tar -xOf "$archive_v1" codex-info-recorder.service > "$legacy_home/.config/systemd/user/codex-info-recorder.service"
+tar -xOf "$archive_v1" codex-info-rest.service > "$legacy_home/.config/systemd/user/codex-info-rest.service"
 tar -xOf "$archive_v1" codex-info-update.service > "$legacy_home/.config/systemd/user/codex-info-update.service"
 tar -xOf "$archive_v1" codex-info-update.timer > "$legacy_home/.config/systemd/user/codex-info-update.timer"
-chmod 0755 "$legacy_home/.local/bin/codex_info" "$legacy_home/.local/libexec/codex-info-install.sh"
-chmod 0644 "$legacy_home/.config/systemd/user/codex-info.service" \
+chmod 0755 "$legacy_home/.local/bin/codex_info" "$legacy_home/.local/bin/codex_info_recorder" "$legacy_home/.local/bin/codex_info_rest" "$legacy_home/.local/libexec/codex-info-install.sh"
+chmod 0644 "$legacy_home/.config/systemd/user/codex-info-recorder.service" \
+    "$legacy_home/.config/systemd/user/codex-info-rest.service" \
     "$legacy_home/.config/systemd/user/codex-info-update.service" \
     "$legacy_home/.config/systemd/user/codex-info-update.timer"
 python3 - "$archive_v1" "$legacy_home/.local/share/codex-info/manifest.json" <<'PY'
@@ -1081,7 +1509,8 @@ run_remove() {
 }
 run_remove >/dev/null
 for path in \
-    "$fake_home/.config/systemd/user/codex-info.service" \
+    "$fake_home/.config/systemd/user/codex-info-recorder.service" \
+    "$fake_home/.config/systemd/user/codex-info-rest.service" \
     "$fake_home/.config/systemd/user/codex-info-update.service" \
     "$fake_home/.config/systemd/user/codex-info-update.timer"; do
     [[ ! -e "$path" && ! -L "$path" ]] || fail "remove retained unit link: $path"
@@ -1109,7 +1538,8 @@ if HOME="$fake_home" CODEX_HOME="$fake_home/.codex" PATH="$fake_bin:$ORIGINAL_PA
     fail 'remove-to-start fixture unexpectedly reached healthy fake service'
 fi
 for path in \
-    "$fake_home/.config/systemd/user/codex-info.service" \
+    "$fake_home/.config/systemd/user/codex-info-recorder.service" \
+    "$fake_home/.config/systemd/user/codex-info-rest.service" \
     "$fake_home/.config/systemd/user/codex-info-update.service" \
     "$fake_home/.config/systemd/user/codex-info-update.timer"; do
     assert_symlink "$path"
@@ -1117,13 +1547,103 @@ done
 write_stopped_state "$fake_home"
 printf 'case remove-to-start unit republish: PASS\n'
 
+# Updating only the UI/REST artifacts must not recycle an unchanged recorder.
+# Keep the synthetic recorder executable pinned to its predecessor generation,
+# just as a real process remains mapped to the inode it was started from.
+: > "$fake_proc/net/tcp"
+printf 'fixture UI generation three\n' > "$fixture_root/codex_info"
+printf 'fixture REST generation three\n' > "$fixture_root/codex_info_rest"
+archive_v3="$(build_bundle 3333333333333333333333333333333333333333 1.0.21)"
+split_hash_home="$TEST_ROOT/split-hash-home"
+write_stopped_state "$split_hash_home"
+run_install "$archive_v2" "$split_hash_home" >/dev/null
+write_running_state "$split_hash_home"
+prepare_legacy_process_fixture "$split_hash_home" 6500
+hash_previous_generation="$(readlink -- "$split_hash_home/.local/share/codex-info/current")"
+hash_previous_generation="${hash_previous_generation#generations/}"
+rm -- "$fake_proc/$legacy_recorder_pid/exe"
+ln -s -- "$split_hash_home/.local/share/codex-info/generations/$hash_previous_generation/codex_info_recorder" \
+    "$fake_proc/$legacy_recorder_pid/exe"
+FAKE_LOG="$log" FAKE_MAIN_ACTIVE_FILE="$split_hash_home/.recorder-active" \
+    FAKE_MAIN_PID="$legacy_recorder_pid" FAKE_RECORDER_REFRESH="$split_hash_home/.codex/history" \
+    FAKE_PROC_ROOT="$fake_proc" "$fake_bin/systemctl" --user start --no-block codex-info-recorder.service
+FAKE_LOG="$log" FAKE_REST_ACTIVE_FILE="$split_hash_home/.rest-active" \
+    FAKE_REST_PID="$legacy_rest_pid" FAKE_PROC_ROOT="$fake_proc" \
+    FAKE_REST_SOCKET_NET_FILE="$fake_proc/net/tcp" FAKE_REST_SOCKET_CONTENT="$split_socket_content" \
+    "$fake_bin/systemctl" --user start --no-block codex-info-rest.service
+hash_recorder_pid_before="$legacy_recorder_pid"
+hash_recorder_before="$(sha256sum -- "$fake_proc/$legacy_recorder_pid/exe" | awk '{print $1}')"
+hash_candidate_recorder="$(tar -xOf "$archive_v3" codex_info_recorder | sha256sum | awk '{print $1}')"
+[[ "$hash_recorder_before" == "$hash_candidate_recorder" ]] || fail 'same-hash fixture recorder artifacts differ'
+legacy_candidate_version=1.0.21
+hash_log_start="$(wc -l < "$log")"
+run_legacy_install "$archive_v3" "$split_hash_home" >/dev/null
+hash_log="$(tail -n +$((hash_log_start + 1)) "$log")"
+if grep -Fq 'systemctl --user stop --no-block codex-info-recorder.service' <<<"$hash_log" ||
+   grep -Fq 'systemctl --user restart --no-block codex-info-recorder.service' <<<"$hash_log"; then
+    fail 'same-hash update recycled the recorder service'
+fi
+grep -Fq 'systemctl --user restart --no-block codex-info-rest.service' <<<"$hash_log" ||
+    fail 'same-hash update did not restart REST'
+[[ "$(readlink -- "$split_hash_home/.local/share/codex-info/current")" == generations/1.0.21-* ]] ||
+    fail 'same-hash update did not publish the candidate generation'
+[[ -f "$split_hash_home/.recorder-active" && "$legacy_recorder_pid" == "$hash_recorder_pid_before" ]] ||
+    fail 'same-hash update did not preserve the recorder PID'
+[[ "$(sha256sum -- "$fake_proc/$legacy_recorder_pid/exe" | awk '{print $1}')" == "$hash_candidate_recorder" ]] ||
+    fail 'same-hash update preserved a recorder with the wrong artifact hash'
+printf 'case same-recorder-hash update preserves recorder PID: PASS\n'
+
+# A REST activation failure must roll back to the predecessor while retaining
+# the already-running recorder. The fail-once marker lets rollback restore
+# REST without making the fixture emulate a second recorder lifecycle.
+hash_current_generation="$(readlink -- "$split_hash_home/.local/share/codex-info/current")"
+printf 'fixture UI generation four\n' > "$fixture_root/codex_info"
+printf 'fixture REST generation four\n' > "$fixture_root/codex_info_rest"
+archive_v4="$(build_bundle 4444444444444444444444444444444444444444 1.0.22)"
+hash_fail_once_file="$TEST_ROOT/hash-rest-fail-once"
+rm -f -- "$hash_fail_once_file"
+hash_rollback_log_start="$(wc -l < "$log")"
+if run_legacy_install "$archive_v4" "$split_hash_home" codex-info-rest.service "$hash_fail_once_file" >/dev/null 2>&1; then
+    fail 'same-hash REST failure unexpectedly succeeded'
+fi
+hash_rollback_log="$(tail -n +$((hash_rollback_log_start + 1)) "$log")"
+if grep -Fq 'systemctl --user stop --no-block codex-info-recorder.service' <<<"$hash_rollback_log" ||
+   grep -Fq 'systemctl --user restart --no-block codex-info-recorder.service' <<<"$hash_rollback_log"; then
+    fail 'same-hash rollback recycled the recorder service'
+fi
+[[ "$(readlink -- "$split_hash_home/.local/share/codex-info/current")" == "$hash_current_generation" ]] ||
+    fail 'same-hash rollback did not restore the predecessor generation'
+[[ -f "$split_hash_home/.recorder-active" && "$legacy_recorder_pid" == "$hash_recorder_pid_before" &&
+   -f "$split_hash_home/.rest-active" ]] || fail 'same-hash rollback did not restore split runtime state'
+printf 'case same-recorder-hash REST rollback preserves recorder runtime: PASS\n'
+
 grep -Fq 'OnActiveSec=5min' "$ROOT_DIR/packaging/codex-info-update.timer"
 grep -Fq 'OnUnitActiveSec=1h' "$ROOT_DIR/packaging/codex-info-update.timer"
 grep -Fq 'AccuracySec=1s' "$ROOT_DIR/packaging/codex-info-update.timer"
-grep -Fq 'Restart=always' "$ROOT_DIR/packaging/codex-info.service"
-grep -Fq 'RestartSec=5s' "$ROOT_DIR/packaging/codex-info.service"
-grep -Fq 'StartLimitIntervalSec=0' "$ROOT_DIR/packaging/codex-info.service"
-if grep -q '^StartLimitBurst=' "$ROOT_DIR/packaging/codex-info.service"; then
+for unit in codex-info-recorder.service codex-info-rest.service; do
+    if grep -Eq '^(Requires|BindsTo|PartOf)=' "$ROOT_DIR/packaging/$unit"; then
+        fail "$unit must not couple recorder and REST lifecycle"
+    fi
+done
+grep -Fq 'Restart=always' "$ROOT_DIR/packaging/codex-info-recorder.service"
+grep -Fq 'RestartSec=5s' "$ROOT_DIR/packaging/codex-info-recorder.service"
+grep -Fq 'StartLimitIntervalSec=0' "$ROOT_DIR/packaging/codex-info-recorder.service"
+grep -Fq 'ExecStart=%h/.local/bin/codex_info_recorder' "$ROOT_DIR/packaging/codex-info-recorder.service"
+if grep -Eq '^Exec(StartPre|Condition)=' "$ROOT_DIR/packaging/codex-info-recorder.service"; then
+    fail 'recorder unit restart path must not depend on installer reconciliation'
+fi
+if grep -Fq -- '--port' "$ROOT_DIR/packaging/codex-info-recorder.service"; then
+    fail 'recorder unit must not own the REST listener'
+fi
+grep -Fq 'Restart=always' "$ROOT_DIR/packaging/codex-info-rest.service"
+grep -Fq 'RestartSec=5s' "$ROOT_DIR/packaging/codex-info-rest.service"
+grep -Fq 'ExecStart=%h/.local/bin/codex_info_rest --port 8787' "$ROOT_DIR/packaging/codex-info-rest.service"
+recorder_pid_before="$(FAKE_MAIN_PID=4242 FAKE_LOG="$log" "$fake_bin/systemctl" --user show --property=MainPID --value codex-info-recorder.service)"
+FAKE_MAIN_PID="$recorder_pid_before" FAKE_LOG="$log" "$fake_bin/systemctl" --user stop codex-info-rest.service >/dev/null
+FAKE_MAIN_PID="$recorder_pid_before" FAKE_LOG="$log" "$fake_bin/systemctl" --user restart codex-info-rest.service >/dev/null
+recorder_pid_after="$(FAKE_MAIN_PID="$recorder_pid_before" FAKE_LOG="$log" "$fake_bin/systemctl" --user show --property=MainPID --value codex-info-recorder.service)"
+[[ "$recorder_pid_after" == "$recorder_pid_before" ]] || fail 'REST stop/restart changed recorder PID'
+if grep -q '^StartLimitBurst=' "$ROOT_DIR/packaging/codex-info-recorder.service"; then
     fail 'daemon start-rate limiting must stay disabled'
 fi
 grep -Fq 'TimeoutStartSec=1h20min31s' "$ROOT_DIR/packaging/codex-info-update.service"

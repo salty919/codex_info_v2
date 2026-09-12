@@ -16,19 +16,34 @@ public partial class GraphWindow : Window
 {
     private string? periodSelectionAtOpen;
     private string? metricSelectionAtOpen;
+    private string? accountSelectionAtOpen;
 
     public GraphWindow()
     {
         InitializeComponent();
         AttachMenuDismissHandlers();
+        AttachResponsiveLayout();
     }
 
     public GraphWindow(GraphWindowViewModel viewModel)
     {
         InitializeComponent();
         AttachMenuDismissHandlers();
+        AttachResponsiveLayout();
         DataContext = viewModel;
         Closed += (_, _) => viewModel.Dispose();
+    }
+
+    private void AttachResponsiveLayout()
+    {
+        SizeChanged += (_, _) => UpdateContentMargin();
+        UpdateContentMargin();
+    }
+
+    private void UpdateContentMargin()
+    {
+        var horizontal = Math.Clamp(20d + ((Bounds.Width - 700d) / 24d), 20d, 30d);
+        GraphContent.Margin = new Thickness(horizontal, 24d, horizontal, 24d);
     }
 
     private void OnMinimizeWindow(object? sender, Avalonia.Interactivity.RoutedEventArgs eventArgs)
@@ -74,6 +89,22 @@ public partial class GraphWindow : Window
         }
     }
 
+    private void OnAccountSelectorCheckedChanged(object? sender, RoutedEventArgs eventArgs)
+    {
+        var open = AccountSelector.IsChecked == true;
+        accountSelectionAtOpen = open
+            ? (DataContext as GraphWindowViewModel)?.SelectedAccount?.Id
+            : null;
+        SetMenuOpen(AccountMenu, open);
+        if (open)
+        {
+            SetMenuOpen(PeriodMenu, false);
+            SetMenuOpen(MetricMenu, false);
+            PeriodSelector.IsChecked = false;
+            MetricSelector.IsChecked = false;
+        }
+    }
+
     private void OnPeriodSelectionChanged(object? sender, SelectionChangedEventArgs eventArgs)
     {
         if (!PeriodMenu.IsEnabled || sender is not ListBox { SelectedItem: ApiHistoryPeriod selected } ||
@@ -96,6 +127,18 @@ public partial class GraphWindow : Window
 
         SetMenuOpen(MetricMenu, false);
         MetricSelector.IsChecked = false;
+    }
+
+    private void OnAccountSelectionChanged(object? sender, SelectionChangedEventArgs eventArgs)
+    {
+        if (!AccountMenu.IsEnabled || sender is not ListBox { SelectedItem: ApiAccount selected } ||
+            string.Equals(selected.Id, accountSelectionAtOpen, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        SetMenuOpen(AccountMenu, false);
+        AccountSelector.IsChecked = false;
     }
 
     private static void SetMenuOpen(Control menu, bool open)
@@ -126,12 +169,14 @@ public partial class GraphWindow : Window
         if (IsWithin(eventArgs.Source, PeriodSelector) ||
             IsWithin(eventArgs.Source, PeriodMenu) ||
             IsWithin(eventArgs.Source, MetricSelector) ||
-            IsWithin(eventArgs.Source, MetricMenu))
+            IsWithin(eventArgs.Source, MetricMenu) ||
+            IsWithin(eventArgs.Source, AccountSelector) ||
+            IsWithin(eventArgs.Source, AccountMenu))
         {
             return;
         }
 
-        if (PeriodMenu.IsEnabled || MetricMenu.IsEnabled)
+        if (PeriodMenu.IsEnabled || MetricMenu.IsEnabled || AccountMenu.IsEnabled)
         {
             CloseMenus();
             eventArgs.Handled = true;
@@ -165,8 +210,10 @@ public partial class GraphWindow : Window
     {
         SetMenuOpen(PeriodMenu, false);
         SetMenuOpen(MetricMenu, false);
+        SetMenuOpen(AccountMenu, false);
         PeriodSelector.IsChecked = false;
         MetricSelector.IsChecked = false;
+        AccountSelector.IsChecked = false;
     }
 
     private static bool IsWithin(object? source, Visual ancestor)

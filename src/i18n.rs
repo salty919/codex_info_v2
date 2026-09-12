@@ -60,16 +60,16 @@ impl Language {
     /// silently diverging in language or launch semantics.
     pub const fn launch_help(self) -> &'static str {
         match self {
-            Self::Japanese => "使用法: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (引数なし)       daemon+REST（127.0.0.1:8787）\n  --port PORT      daemon+RESTのポート（アドレスは127.0.0.1に固定）\n  --ui             daemon+REST + X UI\n  --ui --port PORT 指定ポートでdaemon+REST + X UI\n  --stop           常駐daemonを停止\n  --help, --h, -h  このヘルプを表示",
-            Self::English => "Usage: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (no arguments)   daemon+REST (127.0.0.1:8787)\n  --port PORT      daemon+REST port (address fixed to 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI on the selected port\n  --stop           stop the resident daemon\n  --help, --h, -h  show this help",
-            Self::SimplifiedChinese => "用法: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (无参数)         daemon+REST（127.0.0.1:8787）\n  --port PORT      daemon+REST端口（地址固定为127.0.0.1）\n  --ui             daemon+REST + X UI\n  --ui --port PORT 在指定端口启动daemon+REST + X UI\n  --stop           停止常驻daemon\n  --help, --h, -h  显示此帮助",
-            Self::Korean => "사용법: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (인수 없음)      daemon+REST (127.0.0.1:8787)\n  --port PORT      daemon+REST 포트 (주소는 127.0.0.1로 고정)\n  --ui             daemon+REST + X UI\n  --ui --port PORT 지정 포트에서 daemon+REST + X UI\n  --stop           상주 daemon 중지\n  --help, --h, -h  이 도움말 표시",
-            Self::Spanish => "Uso: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (sin argumentos) daemon+REST (127.0.0.1:8787)\n  --port PORT      puerto daemon+REST (dirección fija a 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI en el puerto indicado\n  --stop           detener el daemon residente\n  --help, --h, -h  mostrar esta ayuda",
-            Self::French => "Usage : codex_info [--ui] [--port PORT] | --stop | --help\n\n  (aucun argument) daemon+REST (127.0.0.1:8787)\n  --port PORT      port daemon+REST (adresse fixée à 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI sur le port choisi\n  --stop           arrêter le daemon résident\n  --help, --h, -h  afficher cette aide",
-            Self::German => "Aufruf: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (keine Argumente) daemon+REST (127.0.0.1:8787)\n  --port PORT      daemon+REST-Port (Adresse fest auf 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI am gewählten Port\n  --stop           residenten Daemon stoppen\n  --help, --h, -h  diese Hilfe anzeigen",
-            Self::Portuguese => "Uso: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (sem argumentos) daemon+REST (127.0.0.1:8787)\n  --port PORT      porta daemon+REST (endereço fixado em 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI na porta escolhida\n  --stop           parar o daemon residente\n  --help, --h, -h  mostrar esta ajuda",
-            Self::Italian => "Uso: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (nessun argomento) daemon+REST (127.0.0.1:8787)\n  --port PORT      porta daemon+REST (indirizzo fissato a 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI sulla porta scelta\n  --stop           arresta il daemon residente\n  --help, --h, -h  mostra questo aiuto",
-            Self::Russian => "Использование: codex_info [--ui] [--port PORT] | --stop | --help\n\n  (без аргументов) daemon+REST (127.0.0.1:8787)\n  --port PORT      порт daemon+REST (адрес фиксирован: 127.0.0.1)\n  --ui             daemon+REST + X UI\n  --ui --port PORT daemon+REST + X UI на выбранном порту\n  --stop           остановить daemon\n  --help, --h, -h  показать эту справку",
+            Self::Japanese => "使用法: codex_info [--ui [--port PORT]] | --help\n\n  (引数なし), --ui UIクライアントを起動\n  --ui --port PORT 指定ポートのRESTへ接続してUIを起動\n  --help, --h, -h  このヘルプを表示",
+            Self::English => "Usage: codex_info [--ui [--port PORT]] | --help\n\n  (no arguments), --ui start the UI client\n  --ui --port PORT connect the UI to REST on the selected port\n  --help, --h, -h  show this help",
+            Self::SimplifiedChinese => "用法: codex_info [--ui [--port PORT]] | --help\n\n  （无参数）, --ui 启动UI客户端\n  --ui --port PORT 连接指定端口的REST并启动UI\n  --help, --h, -h  显示此帮助",
+            Self::Korean => "사용법: codex_info [--ui [--port PORT]] | --help\n\n  (인수 없음), --ui UI 클라이언트 시작\n  --ui --port PORT 지정 포트의 REST에 연결하여 UI 시작\n  --help, --h, -h  이 도움말 표시",
+            Self::Spanish => "Uso: codex_info [--ui [--port PORT]] | --help\n\n  (sin argumentos), --ui iniciar el cliente UI\n  --ui --port PORT conectar la UI al REST del puerto indicado\n  --help, --h, -h  mostrar esta ayuda",
+            Self::French => "Usage : codex_info [--ui [--port PORT]] | --help\n\n  (aucun argument), --ui démarrer le client UI\n  --ui --port PORT connecter l’UI au REST sur le port choisi\n  --help, --h, -h  afficher cette aide",
+            Self::German => "Aufruf: codex_info [--ui [--port PORT]] | --help\n\n  (keine Argumente), --ui UI-Client starten\n  --ui --port PORT UI mit REST am gewählten Port verbinden\n  --help, --h, -h  diese Hilfe anzeigen",
+            Self::Portuguese => "Uso: codex_info [--ui [--port PORT]] | --help\n\n  (sem argumentos), --ui iniciar o cliente UI\n  --ui --port PORT ligar a UI ao REST na porta escolhida\n  --help, --h, -h  mostrar esta ajuda",
+            Self::Italian => "Uso: codex_info [--ui [--port PORT]] | --help\n\n  (nessun argomento), --ui avvia il client UI\n  --ui --port PORT collega la UI al REST sulla porta scelta\n  --help, --h, -h  mostra questo aiuto",
+            Self::Russian => "Использование: codex_info [--ui [--port PORT]] | --help\n\n  (без аргументов), --ui запустить UI-клиент\n  --ui --port PORT подключить UI к REST на выбранном порту\n  --help, --h, -h  показать эту справку",
         }
     }
 
@@ -669,6 +669,114 @@ impl I18n {
         )
     }
 
+    /// Format the beginning of a selectable usage period.  A period choice
+    /// is identified by its start, so its reset/end time is deliberately not
+    /// repeated in the selector.  The year is omitted and the configured
+    /// local timezone is always applied.
+    pub fn format_period_start(&self, timestamp: i64) -> Option<String> {
+        let time = DateTime::<Utc>::from_timestamp(timestamp, 0)?;
+        let local = time.with_timezone(&self.timezone);
+        let pattern = match self.language {
+            Language::Japanese
+            | Language::English
+            | Language::SimplifiedChinese
+            | Language::Korean => "%m/%d %H:%M",
+            Language::Spanish
+            | Language::French
+            | Language::German
+            | Language::Portuguese
+            | Language::Italian
+            | Language::Russian => "%d/%m %H:%M",
+        };
+        Some(local.format(pattern).to_string())
+    }
+
+    /// Build the period-selector label from the local start time only.  The
+    /// state is placed first so the current row remains distinguishable even
+    /// when a narrow selector clips the timestamp.  Period end/reset time is
+    /// intentionally excluded.
+    pub fn format_period_selector_label(&self, timestamp: i64, current: bool) -> Option<String> {
+        let start = self.format_period_start(timestamp)?;
+        let label = match (self.language, current) {
+            (Language::Japanese, true) => format!("現在｜開始 {start}"),
+            (Language::Japanese, false) => format!("履歴｜開始 {start}"),
+            (Language::English, true) => format!("Current · Start {start}"),
+            (Language::English, false) => format!("History · Start {start}"),
+            (Language::SimplifiedChinese, true) => format!("当前｜开始 {start}"),
+            (Language::SimplifiedChinese, false) => format!("历史｜开始 {start}"),
+            (Language::Korean, true) => format!("현재 · 시작 {start}"),
+            (Language::Korean, false) => format!("기록 · 시작 {start}"),
+            (Language::Spanish, true) => format!("Actual · Inicio {start}"),
+            (Language::Spanish, false) => format!("Historial · Inicio {start}"),
+            (Language::French, true) => format!("Actuelle · Début {start}"),
+            (Language::French, false) => format!("Historique · Début {start}"),
+            (Language::German, true) => format!("Aktuell · Beginn {start}"),
+            (Language::German, false) => format!("Verlauf · Beginn {start}"),
+            (Language::Portuguese, true) => format!("Atual · Início {start}"),
+            (Language::Portuguese, false) => format!("Histórico · Início {start}"),
+            (Language::Italian, true) => format!("Corrente · Inizio {start}"),
+            (Language::Italian, false) => format!("Cronologia · Inizio {start}"),
+            (Language::Russian, true) => format!("Текущий · Начало {start}"),
+            (Language::Russian, false) => format!("История · Начало {start}"),
+        };
+        Some(label)
+    }
+
+    pub fn account_selector_status(&self, current: bool) -> &'static str {
+        match (self.language, current) {
+            (Language::Japanese, true) => "［ログイン中］",
+            (Language::Japanese, false) => "［履歴］",
+            (Language::English, true) => " [signed in]",
+            (Language::English, false) => " [history]",
+            (Language::SimplifiedChinese, true) => "［已登录］",
+            (Language::SimplifiedChinese, false) => "［历史］",
+            (Language::Korean, true) => " [로그인 중]",
+            (Language::Korean, false) => " [기록]",
+            (Language::Spanish, true) => " [sesión activa]",
+            (Language::Spanish, false) => " [historial]",
+            (Language::French, true) => " [connecté]",
+            (Language::French, false) => " [historique]",
+            (Language::German, true) => " [angemeldet]",
+            (Language::German, false) => " [Verlauf]",
+            (Language::Portuguese, true) => " [sessão ativa]",
+            (Language::Portuguese, false) => " [histórico]",
+            (Language::Italian, true) => " [accesso]",
+            (Language::Italian, false) => " [cronologia]",
+            (Language::Russian, true) => " [выполнен вход]",
+            (Language::Russian, false) => " [история]",
+        }
+    }
+
+    pub fn account_selector_heading(&self) -> &'static str {
+        match self.language {
+            Language::Japanese => "アカウント",
+            Language::English => "Account",
+            Language::SimplifiedChinese => "账户",
+            Language::Korean => "계정",
+            Language::Spanish => "Cuenta",
+            Language::French => "Compte",
+            Language::German => "Konto",
+            Language::Portuguese => "Conta",
+            Language::Italian => "Account",
+            Language::Russian => "Аккаунт",
+        }
+    }
+
+    pub fn period_selector_heading(&self) -> &'static str {
+        match self.language {
+            Language::Japanese => "期間",
+            Language::English => "Period",
+            Language::SimplifiedChinese => "期间",
+            Language::Korean => "기간",
+            Language::Spanish => "Período",
+            Language::French => "Période",
+            Language::German => "Zeitraum",
+            Language::Portuguese => "Período",
+            Language::Italian => "Periodo",
+            Language::Russian => "Период",
+        }
+    }
+
     pub fn format_clock(&self, timestamp: i64) -> Option<String> {
         let time = DateTime::<Utc>::from_timestamp(timestamp, 0)?;
         Some(
@@ -811,6 +919,81 @@ impl I18n {
             .and_then(|ts| self.format_clock(ts))
             .unwrap_or_else(|| "—".into());
         format!("{} {}", self.text(TextKey::LastUpdated), time)
+    }
+
+    /// Label an immutable account snapshot with its full observation time.
+    /// A clock-only label would make yesterday's record look current.
+    pub fn format_historical_record(&self, timestamp: Option<i64>) -> String {
+        let time = timestamp
+            .and_then(|ts| self.format_timestamp(ts))
+            .unwrap_or_else(|| "—".into());
+        match self.language {
+            Language::Japanese => format!("最終記録 {time}"),
+            Language::English => format!("Final record {time}"),
+            Language::SimplifiedChinese => format!("最终记录 {time}"),
+            Language::Korean => format!("최종 기록 {time}"),
+            Language::Spanish => format!("Registro final {time}"),
+            Language::French => format!("Dernier relevé {time}"),
+            Language::German => format!("Letzter Datensatz {time}"),
+            Language::Portuguese => format!("Registo final {time}"),
+            Language::Italian => format!("Registrazione finale {time}"),
+            Language::Russian => format!("Последняя запись {time}"),
+        }
+    }
+
+    pub fn historical_quota_title(&self, monthly: bool) -> String {
+        match (self.language, monthly) {
+            (Language::Japanese, false) => "最終記録時の残り利用枠".into(),
+            (Language::Japanese, true) => "最終記録時の月間残り利用枠".into(),
+            (Language::English, false) => "Remaining quota at final record".into(),
+            (Language::English, true) => "Monthly quota at final record".into(),
+            (Language::SimplifiedChinese, false) => "最终记录时的剩余额度".into(),
+            (Language::SimplifiedChinese, true) => "最终记录时的月度剩余额度".into(),
+            (Language::Korean, false) => "최종 기록 시 남은 할당량".into(),
+            (Language::Korean, true) => "최종 기록 시 월간 남은 할당량".into(),
+            (Language::Spanish, false) => "Cuota restante en el registro final".into(),
+            (Language::Spanish, true) => "Cuota mensual en el registro final".into(),
+            (Language::French, false) => "Quota restant au dernier relevé".into(),
+            (Language::French, true) => "Quota mensuel au dernier relevé".into(),
+            (Language::German, false) => "Restkontingent beim letzten Datensatz".into(),
+            (Language::German, true) => "Monatskontingent beim letzten Datensatz".into(),
+            (Language::Portuguese, false) => "Quota restante no registo final".into(),
+            (Language::Portuguese, true) => "Quota mensal no registo final".into(),
+            (Language::Italian, false) => "Quota residua alla registrazione finale".into(),
+            (Language::Italian, true) => "Quota mensile alla registrazione finale".into(),
+            (Language::Russian, false) => "Остаток лимита в последней записи".into(),
+            (Language::Russian, true) => "Месячный лимит в последней записи".into(),
+        }
+    }
+
+    pub fn format_historical_account_status(&self, timestamp: Option<i64>) -> String {
+        let record = self.format_historical_record(timestamp);
+        match self.language {
+            Language::Japanese => format!("過去アカウントの確定済み記録です。{record}"),
+            Language::English => {
+                format!("This is the confirmed record for a previous account. {record}")
+            }
+            Language::SimplifiedChinese => format!("这是先前账户的已确认记录。{record}"),
+            Language::Korean => format!("이전 계정의 확정된 기록입니다. {record}"),
+            Language::Spanish => {
+                format!("Este es el registro confirmado de una cuenta anterior. {record}")
+            }
+            Language::French => {
+                format!("Ceci est le relevé confirmé d’un compte précédent. {record}")
+            }
+            Language::German => {
+                format!("Dies ist der bestätigte Datensatz eines früheren Kontos. {record}")
+            }
+            Language::Portuguese => {
+                format!("Este é o registo confirmado de uma conta anterior. {record}")
+            }
+            Language::Italian => {
+                format!("Questa è la registrazione confermata di un account precedente. {record}")
+            }
+            Language::Russian => {
+                format!("Это подтверждённая запись предыдущей учётной записи. {record}")
+            }
+        }
     }
 
     pub fn format_stale_status(&self, timestamp: Option<i64>) -> String {
@@ -1988,7 +2171,7 @@ mod tests {
             let help = language.launch_help();
             assert!(help.contains("--ui"), "{}", language.code());
             assert!(help.contains("--port"), "{}", language.code());
-            assert!(help.contains("--stop"), "{}", language.code());
+            assert!(!help.contains("--stop"), "{}", language.code());
             assert!(help.contains("--help, --h, -h"), "{}", language.code());
             for legacy in [
                 "--service",
@@ -2139,6 +2322,27 @@ mod tests {
             .format_timestamp(1_715_000_000)
             .unwrap()
             .ends_with("-04:00"));
+        assert_eq!(
+            i18n.format_period_start(1_709_900_000).unwrap(),
+            "03/08 07:13"
+        );
+        assert_eq!(
+            i18n.format_period_selector_label(1_709_900_000, true)
+                .unwrap(),
+            "Current · Start 03/08 07:13"
+        );
+
+        let french = I18n::from_parts(Language::French, Tz::Asia__Tokyo);
+        assert_eq!(
+            french.format_period_start(1_709_900_000).unwrap(),
+            "08/03 21:13"
+        );
+        assert_eq!(
+            french
+                .format_period_selector_label(1_709_900_000, false)
+                .unwrap(),
+            "Historique · Début 08/03 21:13"
+        );
     }
 
     #[test]

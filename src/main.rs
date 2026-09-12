@@ -3,7 +3,9 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(test)]
 mod account_scope;
+#[cfg(test)]
 mod daemon;
 
 use chrono::{DateTime, Months, Utc};
@@ -11,22 +13,29 @@ use codex_info::app_server_sqlite::PreparedGeneration;
 use codex_info::i18n::{CliTextKey, I18n, PeriodKind, TextKey};
 use codex_info::protocol_contract;
 use codex_info::security;
+#[cfg(test)]
 use codex_info::server::{
-    legacy_history_models_v3, validate_public_threads, ApiServer, ApiServerConfig,
-    PublicDetailedModelUsage, PublicDetails, PublicDetailsV2, PublicDetailsV3, PublicHistoryGap,
-    PublicHistoryModelUsageV3, PublicHistoryObservation, PublicHistoryObservationV3,
-    PublicHistoryPeriod, PublicHistorySample, PublicModelCostV3, PublicModelUsageV3, PublicQuota,
-    PublicState, PublicThread,
+    legacy_history_models_v3, ApiServer, PublicDetailedModelUsage, PublicHistorySample,
+    PublicModelCostV3,
 };
-use codex_info::thread_contract::{
-    self, ThreadCycleAccumulator, ThreadCycleOutcome, ThreadTopologyNode,
+use codex_info::server::{
+    validate_public_threads, ApiServerConfig, PublicDetails, PublicDetailsV2, PublicDetailsV3,
+    PublicHistoryGap, PublicHistoryModelUsageV3, PublicHistoryObservation,
+    PublicHistoryObservationV3, PublicHistoryPeriod, PublicModelUsageV3, PublicQuota, PublicState,
+    PublicThread,
 };
+use codex_info::thread_contract::{self, ThreadTopologyNode};
+#[cfg(test)]
+use codex_info::thread_contract::{ThreadCycleAccumulator, ThreadCycleOutcome};
+use codex_info::usage_store;
+#[cfg(test)]
 use codex_info::usage_store::{
-    self, classify_quota_transition, select_predeadline_quota_authority, QuotaTransition,
+    classify_quota_transition, select_predeadline_quota_authority, QuotaTransition,
     StoragePartitionIdentity, UsageStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
 use slint::{CloseRequestResponse, ComponentHandle, Model, Timer, TimerMode};
@@ -34,15 +43,20 @@ use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::fs;
+#[cfg(test)]
+use std::fs::File;
+#[cfg(test)]
+use std::io::{BufRead, Seek, SeekFrom};
+use std::io::{BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+#[cfg(test)]
+use std::process::Child;
+use std::process::{Command, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,13 +64,16 @@ slint::include_modules!();
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AccountCommand {
+    #[cfg(test)]
     Read,
     Login,
+    #[cfg(test)]
     FinishFallback,
     Stop,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct AccountAdmission {
     account_update_generation: u64,
     profile_scope_id: String,
@@ -66,30 +83,33 @@ struct AccountAdmission {
 }
 
 #[derive(Clone)]
+#[cfg(test)]
 enum ThreadCommand {
     Read {
         auth_epoch: u64,
         admission: AccountAdmission,
-        account_partition: account_scope::AccountPartition,
+        account_partition: Box<account_scope::AccountPartition>,
     },
     Stop,
 }
 
 #[derive(Clone)]
+#[cfg(test)]
 enum LocalCommand {
     Collect {
         auth_epoch: u64,
         admission: AccountAdmission,
         collection_state: Box<usage_store::SessionCollectionState>,
         regression_recovery_state: Option<Box<usage_store::SessionCollectionState>>,
-        history_continuity_recovery: Option<usage_store::HistoryContinuityRecovery>,
-        cumulative_recovery: Option<usage_store::SessionCumulativeRecovery>,
+        history_continuity_recovery: Box<Option<usage_store::HistoryContinuityRecovery>>,
+        cumulative_recovery: Box<Option<usage_store::SessionCumulativeRecovery>>,
         reset_at: i64,
         window_seconds: i64,
     },
     Stop,
 }
 
+#[cfg(test)]
 struct UsageEvent {
     account_key: account_scope::AccountKey,
     account_update_generation: u64,
@@ -103,6 +123,7 @@ struct UsageEvent {
 
 enum Event {
     Ready,
+    #[cfg(test)]
     Account {
         email: Option<String>,
         authenticated: bool,
@@ -111,11 +132,13 @@ enum Event {
         account_update_generation: u64,
     },
     AuthUrl(String),
+    #[cfg(test)]
     Usage(Box<UsageEvent>),
     IdentityError(String),
     Error(String),
 }
 
+#[cfg(test)]
 enum ThreadEvent {
     Ready,
     Update {
@@ -130,6 +153,7 @@ enum ThreadEvent {
     },
 }
 
+#[cfg(test)]
 struct LocalUsageResult {
     auth_epoch: u64,
     reset_at: i64,
@@ -142,6 +166,7 @@ struct LocalUsageResult {
     cleanup_plan: Option<SessionCleanupPlan>,
 }
 
+#[cfg(test)]
 struct LocalUsageCandidate {
     result: LocalUsageResult,
     admission: AccountAdmission,
@@ -155,6 +180,7 @@ struct LocalUsageCandidate {
     timeline_recovery: Option<usage_store::SessionTimelineRecovery>,
 }
 
+#[cfg(test)]
 enum LocalEvent {
     Usage(Box<LocalUsageCandidate>),
     Error {
@@ -169,6 +195,7 @@ enum LocalEvent {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(test)]
 struct TokenSnapshot {
     total: u64,
     input: u64,
@@ -177,6 +204,7 @@ struct TokenSnapshot {
     cache_write_input: Option<u64>,
 }
 
+#[cfg(test)]
 impl TokenSnapshot {
     fn cache_write_delta_from(self, previous: Self) -> Option<u64> {
         match (self.cache_write_input, previous.cache_write_input) {
@@ -194,7 +222,9 @@ const SOL_PRICE_PER_MILLION: (f64, f64, f64) = (5.0, 0.5, 30.0);
 const TERRA_PRICE_PER_MILLION: (f64, f64, f64) = (2.0, 0.2, 12.0);
 const LUNA_PRICE_PER_MILLION: (f64, f64, f64) = (0.2, 0.02, 1.2);
 const ASTRA_PRICE_PER_MILLION: (f64, f64, f64, f64) = (10.0, 1.0, 12.5, 50.0);
+#[cfg(test)]
 const ASTRA_PRICE_VERSION: &str = "ASTRA_USER_2026-09-05";
+#[cfg(test)]
 const UNATTRIBUTED_SESSION_MODEL: &str = "UNATTRIBUTED";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -225,6 +255,7 @@ impl ModelUsageRow {
             self.output_tokens as f64 * output_rate / 1_000_000.0,
         ))
     }
+    #[cfg(test)]
     fn new(name: &str) -> Self {
         Self {
             name: name.into(),
@@ -233,6 +264,7 @@ impl ModelUsageRow {
         }
     }
 
+    #[cfg(test)]
     fn add(&mut self, snapshot: TokenSnapshot) {
         self.cache_write_input_tokens =
             match (self.cache_write_input_tokens, snapshot.cache_write_input) {
@@ -271,6 +303,7 @@ impl ModelUsageRow {
         )
     }
 
+    #[cfg(test)]
     fn public_v3(&self) -> PublicModelUsageV3 {
         let estimated_cost = if self.name == "ASTRA" {
             self.astra_dollar_costs().map(
@@ -312,6 +345,7 @@ impl ModelUsageRow {
     }
 }
 
+#[cfg(test)]
 fn history_model_usage_v3(
     total: &usage_store::SessionModelTotal,
     legacy: &PublicHistoryObservation,
@@ -320,17 +354,10 @@ fn history_model_usage_v3(
         "SOL" => legacy.sol_dollars,
         "TERRA" => legacy.terra_dollars,
         "LUNA" => legacy.luna_dollars,
-        _ => ModelUsageRow {
-            name: total.model.clone(),
-            tokens: total.total_tokens,
-            input_tokens: total.input_tokens,
-            cached_input_tokens: total.cached_input_tokens,
-            output_tokens: total.output_tokens,
-            cache_write_input_tokens: total.cache_write_input_tokens,
-        }
-        .public_v3()
-        .estimated_cost
-        .map(|cost| cost.total_dollars),
+        // Historical dollars are observations.  The current price table may
+        // render an estimate elsewhere, but it cannot manufacture a stored
+        // historical value for an arbitrary model.
+        _ => None,
     };
     PublicHistoryModelUsageV3 {
         model: total.model.clone(),
@@ -343,6 +370,7 @@ fn history_model_usage_v3(
     }
 }
 
+#[cfg(test)]
 fn history_models_v3(
     source: Option<&usage_store::UsageHistoryObservation>,
     sample: &PublicHistoryObservation,
@@ -375,6 +403,7 @@ fn history_models_v3(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct ModelUsageTotals {
     sol: ModelUsageRow,
     terra: ModelUsageRow,
@@ -397,6 +426,7 @@ struct ModelTokenTotals {
     luna: u64,
 }
 
+#[cfg(test)]
 impl Default for ModelUsageTotals {
     fn default() -> Self {
         Self {
@@ -409,6 +439,7 @@ impl Default for ModelUsageTotals {
     }
 }
 
+#[cfg(test)]
 impl ModelUsageTotals {
     fn add(&mut self, model: &str, snapshot: TokenSnapshot) {
         let Some(model) = Self::canonical_model(model) else {
@@ -644,6 +675,7 @@ impl ModelUsageTotals {
     }
 }
 
+#[cfg(test)]
 fn session_model_total_has_usage(total: &usage_store::SessionModelTotal) -> bool {
     total.total_tokens > 0
         || total.input_tokens > 0
@@ -692,11 +724,11 @@ const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
 // increase must be shown as a thin inferred bridge, never as a measured rate
 // or a confirmed idle interval.
 const MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS: i64 = 60;
-// A single unchanged recorder bucket is not evidence that an agent was
-// unused: cumulative token counters are published in bursts. Require three
-// accepted observations (two measured flat intervals), without inventing an
-// arbitrary wall-clock duration threshold.
-const CONFIRMED_IDLE_MIN_OBSERVED_INTERVALS: usize = 2;
+// The gray background represents sustained unused time, not every short pause
+// between task publications. Keep the exact-token/quota proof above as the
+// candidate authority, merge every provably continuous run first, and only
+// then expose a session-level break of at least 30 minutes.
+const SUSTAINED_UNUSED_MIN_DURATION_SECONDS: i64 = 30 * 60;
 const MOVING_RESET_MIN_HORIZON_SECONDS: i64 = 86_400;
 
 /// Return the start of the collector's minute bucket using mathematical
@@ -1456,6 +1488,7 @@ fn ascii_title_part(value: &str, fallback: &str) -> String {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
+#[cfg(test)]
 struct RateLimitSnapshot {
     remaining_percent: Option<f64>,
     reset_at: i64,
@@ -1483,6 +1516,7 @@ struct ActiveThread {
 }
 
 impl ActiveThread {
+    #[cfg(test)]
     fn to_public_thread(&self) -> PublicThread {
         PublicThread {
             id: self.id.clone(),
@@ -1512,6 +1546,7 @@ struct ThreadPresentationRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 enum ActiveThreadUpdate {
     Snapshot(Vec<ActiveThread>),
     NoThread,
@@ -1519,6 +1554,7 @@ enum ActiveThreadUpdate {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct RolloutFileIdentity {
     #[cfg(unix)]
     device: u64,
@@ -1528,6 +1564,7 @@ struct RolloutFileIdentity {
     is_file: bool,
 }
 
+#[cfg(test)]
 fn rollout_file_identity(metadata: &fs::Metadata) -> RolloutFileIdentity {
     #[cfg(unix)]
     {
@@ -1545,6 +1582,7 @@ fn rollout_file_identity(metadata: &fs::Metadata) -> RolloutFileIdentity {
     }
 }
 
+#[cfg(test)]
 struct ThreadRolloutCacheEntry {
     identity: RolloutFileIdentity,
     observed_len: u64,
@@ -1556,6 +1594,7 @@ struct ThreadRolloutCacheEntry {
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct ThreadRolloutCache {
     entries: BTreeMap<PathBuf, ThreadRolloutCacheEntry>,
 }
@@ -1572,6 +1611,7 @@ fn debug_runtime(message: impl AsRef<str>) {
     }
 }
 
+#[cfg(test)]
 fn plan_type_label(plan_type: Option<&str>) -> String {
     protocol_contract::plan_label(plan_type)
 }
@@ -1585,6 +1625,7 @@ fn monthly_window_seconds(reset_at: i64) -> i64 {
         .unwrap_or(31 * 86_400)
 }
 
+#[cfg(test)]
 fn parse_rate_limits(
     rate: &Value,
     plan_type: Option<&str>,
@@ -1608,6 +1649,7 @@ fn parse_rate_limits(
             monthly: quota.monthly,
         })
 }
+#[cfg(test)]
 fn same_rollout_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
 
@@ -1619,6 +1661,7 @@ fn same_rollout_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.is_file() && right.is_file()
 }
 
+#[cfg(test)]
 fn complete_rollout_prefix_len(file: &mut File, snapshot_len: u64) -> Result<u64, ()> {
     if snapshot_len == 0 {
         return Ok(0);
@@ -1647,6 +1690,7 @@ fn complete_rollout_prefix_len(file: &mut File, snapshot_len: u64) -> Result<u64
     Ok(0)
 }
 
+#[cfg(test)]
 fn complete_rollout_range_end(
     file: &mut File,
     start_offset: u64,
@@ -1688,6 +1732,7 @@ fn complete_rollout_range_end(
     Ok(start_offset)
 }
 
+#[cfg(test)]
 fn first_rollout_newline_end(
     file: &mut File,
     start_offset: u64,
@@ -1730,6 +1775,7 @@ fn first_rollout_newline_end(
     Ok(None)
 }
 
+#[cfg(test)]
 fn rollout_checkpoint_key(
     sessions_root: &Path,
     canonical: &Path,
@@ -1760,6 +1806,7 @@ fn rollout_checkpoint_key(
     Ok((root_identity, relative_path, device, inode))
 }
 
+#[cfg(test)]
 fn matching_rollout_checkpoint<'a>(
     sessions_root: &Path,
     canonical: &Path,
@@ -1776,6 +1823,7 @@ fn matching_rollout_checkpoint<'a>(
     })
 }
 
+#[cfg(test)]
 fn load_thread_rollout_checkpoints(
     partition: &account_scope::AccountPartition,
 ) -> Vec<usage_store::SessionCheckpoint> {
@@ -1794,6 +1842,7 @@ fn load_thread_rollout_checkpoints(
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn read_thread_session_meta_id(file: &mut File) -> Result<String, ()> {
     file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
     let max_record_bytes = security::MAX_JSONL_LINE_BYTES.checked_add(1).ok_or(())?;
@@ -1918,6 +1967,7 @@ fn read_active_thread_rollout_cached(
     read_active_thread_rollout_cached_with_checkpoints(sessions_root, candidate_path, cache, &[])
 }
 
+#[cfg(test)]
 fn read_active_thread_rollout_cached_with_checkpoints(
     sessions_root: &Path,
     candidate_path: &Path,
@@ -2057,7 +2107,7 @@ fn read_active_thread_rollout_cached_with_checkpoints(
                         .or_else(|| (complete_len > parse_start).then_some(true)),
                 )
             })
-            .unwrap_or_else(thread_contract::RolloutAccumulator::new);
+            .unwrap_or_default();
         let thread_id = read_thread_session_meta_id(&mut file)?;
         if complete_len > parse_start {
             let appended_len = complete_len.checked_sub(parse_start).ok_or(())?;
@@ -2097,10 +2147,14 @@ fn read_active_thread_rollout_cached_with_checkpoints(
     Ok((thread_id, snapshot))
 }
 
+#[cfg(test)]
 const MAX_PROC_PROCESS_ENTRIES: usize = 65_536;
+#[cfg(test)]
 const MAX_CODEX_PROCESS_FDS: usize = 16_384;
+#[cfg(test)]
 const MAX_OPEN_SESSION_FILES: usize = 1_024;
 
+#[cfg(test)]
 fn proc_value_or_disappeared<T>(result: std::io::Result<T>) -> Result<Option<T>, ()> {
     match result {
         Ok(value) => Ok(Some(value)),
@@ -2112,6 +2166,7 @@ fn proc_value_or_disappeared<T>(result: std::io::Result<T>) -> Result<Option<T>,
     }
 }
 
+#[cfg(test)]
 fn open_codex_session_paths(
     proc_root: &Path,
     sessions_root: &Path,
@@ -2185,6 +2240,7 @@ fn open_codex_session_paths(
     Ok(open_files)
 }
 
+#[cfg(test)]
 fn active_thread_paths(codex_root: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>), ()> {
     let sessions_root = codex_root.join("sessions");
     let active_paths = open_codex_session_paths(Path::new("/proc"), &sessions_root)?;
@@ -2193,6 +2249,7 @@ fn active_thread_paths(codex_root: &Path) -> Result<(PathBuf, BTreeSet<PathBuf>)
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
+#[cfg(test)]
 struct SessionCleanupReport {
     deleted: Vec<usage_store::RecordedSessionSource>,
     retained: usize,
@@ -2200,6 +2257,7 @@ struct SessionCleanupReport {
     process_scan_failed: bool,
 }
 
+#[cfg(test)]
 fn current_session_candidate(
     sessions_root: &Path,
     expected_path: &Path,
@@ -2221,6 +2279,7 @@ fn current_session_candidate(
     Ok((canonical, source))
 }
 
+#[cfg(test)]
 fn cleanup_recorded_session_overflow_partitioned_with<F>(
     database: &Path,
     partition_identity: Option<&StoragePartitionIdentity>,
@@ -2326,22 +2385,6 @@ where
     )
 }
 
-fn cleanup_recorded_session_overflow_partitioned(
-    database: &Path,
-    partition_identity: &StoragePartitionIdentity,
-    plan: &SessionCleanupPlan,
-    proc_root: &Path,
-) -> SessionCleanupReport {
-    let active_paths = open_codex_session_paths(proc_root, &plan.sessions_root);
-    cleanup_recorded_session_overflow_partitioned_with(
-        database,
-        Some(partition_identity),
-        plan,
-        active_paths,
-        |path| fs::remove_file(path),
-    )
-}
-
 #[cfg(test)]
 fn cleanup_recorded_session_overflow(
     database: &Path,
@@ -2354,26 +2397,23 @@ fn cleanup_recorded_session_overflow(
     })
 }
 
-fn fetch_active_thread_update(
-    input: &mut impl Write,
-    output: &Receiver<RpcReadEvent>,
-    next_id: &mut u64,
-    sessions_root: &Path,
-    active_paths: &BTreeSet<PathBuf>,
+#[cfg(test)]
+struct ActiveThreadUpdateContext<'a, W: Write> {
+    input: &'a mut W,
+    output: &'a Receiver<RpcReadEvent>,
+    next_id: &'a mut u64,
+    sessions_root: &'a Path,
+    active_paths: &'a BTreeSet<PathBuf>,
     deadline: Instant,
-    rollout_cache: &mut ThreadRolloutCache,
-    checkpoints: &[usage_store::SessionCheckpoint],
+    rollout_cache: &'a mut ThreadRolloutCache,
+    checkpoints: &'a [usage_store::SessionCheckpoint],
+}
+
+#[cfg(test)]
+fn fetch_active_thread_update<W: Write>(
+    context: &mut ActiveThreadUpdateContext<'_, W>,
 ) -> ActiveThreadUpdate {
-    fetch_active_thread_update_before_deadline_with_cache(
-        input,
-        output,
-        next_id,
-        sessions_root,
-        active_paths,
-        deadline,
-        rollout_cache,
-        checkpoints,
-    )
+    fetch_active_thread_update_before_deadline_with_cache(context)
 }
 
 #[cfg(test)]
@@ -2404,29 +2444,28 @@ fn fetch_active_thread_update_for_paths_and_state(
     _codex_root: Option<&Path>,
 ) -> ActiveThreadUpdate {
     let mut rollout_cache = ThreadRolloutCache::default();
-    fetch_active_thread_update_before_deadline_with_cache(
+    let mut context = ActiveThreadUpdateContext {
         input,
         output,
         next_id,
         sessions_root,
         active_paths,
-        Instant::now() + security::RPC_RESPONSE_TIMEOUT,
-        &mut rollout_cache,
-        &[],
-    )
+        deadline: Instant::now() + security::RPC_RESPONSE_TIMEOUT,
+        rollout_cache: &mut rollout_cache,
+        checkpoints: &[],
+    };
+    fetch_active_thread_update_before_deadline_with_cache(&mut context)
 }
 
-fn fetch_active_thread_update_before_deadline_with_cache(
-    input: &mut impl Write,
-    output: &Receiver<RpcReadEvent>,
-    next_id: &mut u64,
-    sessions_root: &Path,
-    active_paths: &BTreeSet<PathBuf>,
-    deadline: Instant,
-    rollout_cache: &mut ThreadRolloutCache,
-    checkpoints: &[usage_store::SessionCheckpoint],
+#[cfg(test)]
+fn fetch_active_thread_update_before_deadline_with_cache<W: Write>(
+    context: &mut ActiveThreadUpdateContext<'_, W>,
 ) -> ActiveThreadUpdate {
-    rollout_cache
+    let sessions_root = context.sessions_root;
+    let active_paths = context.active_paths;
+    let checkpoints = context.checkpoints;
+    context
+        .rollout_cache
         .entries
         .retain(|path, _| active_paths.contains(path));
     let mut rollouts = BTreeMap::new();
@@ -2435,7 +2474,7 @@ fn fetch_active_thread_update_before_deadline_with_cache(
         let (thread_id, rollout) = match read_active_thread_rollout_cached_with_checkpoints(
             sessions_root,
             active_path,
-            rollout_cache,
+            context.rollout_cache,
             checkpoints,
         ) {
             Ok(value) => value,
@@ -2444,18 +2483,18 @@ fn fetch_active_thread_update_before_deadline_with_cache(
                 return ActiveThreadUpdate::Failed;
             }
         };
-        let request_id = *next_id;
-        let Some(following_id) = next_id.checked_add(1) else {
+        let request_id = *context.next_id;
+        let Some(following_id) = context.next_id.checked_add(1) else {
             return ActiveThreadUpdate::Failed;
         };
-        *next_id = following_id;
-        let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
+        *context.next_id = following_id;
+        let Some(wait) = context.deadline.checked_duration_since(Instant::now()) else {
             debug_runtime("thread read cycle timed out");
             return ActiveThreadUpdate::Failed;
         };
         let result = match request_with_timeout_observed(
-            input,
-            output,
+            context.input,
+            context.output,
             request_id,
             "thread/read",
             json!({"threadId": thread_id, "includeTurns": false}),
@@ -2484,7 +2523,7 @@ fn fetch_active_thread_update_before_deadline_with_cache(
             }
         };
         let response_path = candidate.path().and_then(|path| {
-            security::canonical_regular_file_under(sessions_root, Path::new(path)).ok()
+            security::canonical_regular_file_under(context.sessions_root, Path::new(path)).ok()
         });
         if candidate.id() != thread_id || response_path.as_ref() != Some(active_path) {
             debug_runtime("thread read identity mismatch");
@@ -2577,6 +2616,7 @@ struct UsageHistorySample {
 }
 
 impl UsageHistorySample {
+    #[cfg(test)]
     fn from_store(sample: usage_store::UsageHistorySample) -> Self {
         Self {
             timestamp: sample.timestamp,
@@ -2647,6 +2687,7 @@ impl UsageHistorySample {
         Self::from_model_history_with_usage(timestamp, reset_at, costs, ModelTokenTotals::default())
     }
 
+    #[cfg(test)]
     fn from_model_history_with_usage(
         timestamp: i64,
         reset_at: i64,
@@ -2688,7 +2729,7 @@ fn same_reset_period(left: i64, right: i64) -> bool {
 #[cfg(test)]
 fn reset_transition_is_boundary(
     previous_reset: Option<i64>,
-    _previous_remaining: Option<f64>,
+    previous_remaining: Option<f64>,
     next_reset: i64,
     next_remaining: Option<f64>,
     previous_observed_at: Option<i64>,
@@ -2699,6 +2740,7 @@ fn reset_transition_is_boundary(
         previous_reset,
         window_seconds,
         previous_observed_at,
+        previous_remaining,
         next_reset,
         window_seconds,
         next_remaining,
@@ -2712,6 +2754,7 @@ fn reset_transition_is_boundary(
 /// changed quota window starts the next cumulative period at zero. Session
 /// checkpoints deliberately survive both paths because token records remain
 /// append-only across quota periods.
+#[cfg(test)]
 fn admit_session_collection_period(
     state: &mut usage_store::SessionCollectionState,
     next_reset_at: i64,
@@ -2724,6 +2767,7 @@ fn admit_session_collection_period(
             None,
             0,
             None,
+            None,
             next_reset_at,
             next_window_seconds,
             next_remaining_percent,
@@ -2735,6 +2779,7 @@ fn admit_session_collection_period(
         (state.reset_at > 0).then_some(state.reset_at),
         state.window_seconds,
         observation.map(|value| value.observed_at),
+        observation.map(|value| value.remaining_percent),
         next_reset_at,
         next_window_seconds,
         next_remaining_percent,
@@ -2746,6 +2791,7 @@ fn admit_session_collection_period(
     transition
 }
 
+#[cfg(test)]
 fn select_started_boundary_collection_state(
     current_generation: u64,
     reset_at: i64,
@@ -2794,6 +2840,22 @@ struct HistoryPeriod {
     start: i64,
     end: i64,
     label: String,
+}
+
+fn disambiguate_period_start_labels(periods: &mut [HistoryPeriod]) {
+    let mut totals = BTreeMap::new();
+    for period in periods.iter() {
+        *totals.entry(period.label.clone()).or_insert(0usize) += 1;
+    }
+    let mut occurrences = BTreeMap::new();
+    for period in periods.iter_mut() {
+        let total = totals.get(&period.label).copied().unwrap_or(1);
+        if total > 1 {
+            let occurrence = occurrences.entry(period.label.clone()).or_insert(0usize);
+            *occurrence += 1;
+            period.label = format!("{} · {}/{}", period.label, *occurrence, total);
+        }
+    }
 }
 
 fn display_history_samples(samples: &[UsageHistorySample]) -> Vec<&UsageHistorySample> {
@@ -2926,10 +2988,9 @@ fn reset_sample_groups(samples: &[UsageHistorySample]) -> Vec<ResetSampleGroup> 
             if !moving_started
                 && candidate.timestamp == anchor.timestamp
                 && candidate.reset_at.abs_diff(anchor.reset_at) > RESET_AT_TOLERANCE_SECONDS as u64
+                && !has_forward_observation[index]
             {
-                if !has_forward_observation[index] {
-                    break;
-                }
+                break;
             }
             if !moving_started
                 && candidate.reset_at < anchor.reset_at
@@ -3683,12 +3744,13 @@ fn canonicalize_public_history_samples(samples: &[UsageHistorySample]) -> Vec<Us
 
 #[derive(Debug, Default)]
 struct UsageHistory {
-    db_path: Option<PathBuf>,
-    partition_identity: Option<StoragePartitionIdentity>,
     samples: Vec<UsageHistorySample>,
     observations: Vec<usage_store::UsageHistoryObservation>,
+    #[cfg(test)]
     pending_store_samples: Vec<usage_store::UsageHistorySample>,
+    #[cfg(test)]
     pending_store_observations: Vec<usage_store::UsageHistoryObservation>,
+    #[cfg(test)]
     startup_maintenance_done: bool,
 }
 
@@ -3711,6 +3773,12 @@ fn main_sample_from_observation(
 fn main_sample_from_public_observation(
     observation: &PublicHistoryObservation,
 ) -> Option<UsageHistorySample> {
+    if !matches!(
+        observation.model_source.as_str(),
+        "confirmed" | "legacy-unknown"
+    ) {
+        return None;
+    }
     Some(UsageHistorySample {
         timestamp: observation.timestamp,
         reset_at: observation.reset_at,
@@ -3727,22 +3795,22 @@ fn main_sample_from_public_observation(
 fn store_observation_from_public(
     observation: &PublicHistoryObservation,
 ) -> usage_store::UsageHistoryObservation {
-    let model_source = match observation.model_source.as_str() {
-        "confirmed" => usage_store::ModelSource::Confirmed,
-        "reconstructed-from-session" => usage_store::ModelSource::ReconstructedFromSession,
-        "unavailable" => usage_store::ModelSource::Unavailable,
-        _ => usage_store::ModelSource::LegacyUnknown,
+    let (model_source, accept_models) = match observation.model_source.as_str() {
+        "confirmed" => (usage_store::ModelSource::Confirmed, true),
+        "legacy-unknown" => (usage_store::ModelSource::LegacyUnknown, true),
+        "reconstructed-from-session" => (usage_store::ModelSource::ReconstructedFromSession, false),
+        _ => (usage_store::ModelSource::Unavailable, false),
     };
     usage_store::UsageHistoryObservation {
         timestamp: observation.timestamp,
         reset_at: observation.reset_at,
         remaining_percent: observation.remaining_percent,
-        sol_dollars: observation.sol_dollars,
-        terra_dollars: observation.terra_dollars,
-        luna_dollars: observation.luna_dollars,
-        sol_tokens: observation.sol_tokens,
-        terra_tokens: observation.terra_tokens,
-        luna_tokens: observation.luna_tokens,
+        sol_dollars: accept_models.then_some(observation.sol_dollars).flatten(),
+        terra_dollars: accept_models.then_some(observation.terra_dollars).flatten(),
+        luna_dollars: accept_models.then_some(observation.luna_dollars).flatten(),
+        sol_tokens: accept_models.then_some(observation.sol_tokens).flatten(),
+        terra_tokens: accept_models.then_some(observation.terra_tokens).flatten(),
+        luna_tokens: accept_models.then_some(observation.luna_tokens).flatten(),
         model_source,
         model_totals: None,
         model_totals_complete: false,
@@ -3759,60 +3827,75 @@ fn v3_model_by_name<'a>(
 fn main_sample_from_public_observation_v3(
     observation: &PublicHistoryObservationV3,
 ) -> Option<UsageHistorySample> {
+    // Compatibility samples may contain only values which the service names
+    // as stored observations.  Session reconstruction and unknown source
+    // strings are fail-closed here; keeping their quota timestamp does not
+    // justify importing their model vector.
+    if observation.model_source != "confirmed" || !observation.models_complete {
+        return None;
+    }
     let models = observation.models.as_deref();
-    let value = |name: &str| {
-        v3_model_by_name(models, name)
-            .and_then(|model| model.total_dollars)
-            .unwrap_or(if observation.models_complete {
-                0.0
-            } else {
-                -1.0
-            })
+    // This legacy fixed-column carrier has no representation for an absent
+    // model.  Requiring the exact row is therefore the only lossless
+    // conversion: absence must not be rewritten as an observed zero.  The
+    // generic service history remains available to the graph independently.
+    let fixed = |name: &str| {
+        let model = v3_model_by_name(models, name)?;
+        Some((model.total_tokens, model.total_dollars?))
     };
-    let tokens = |name: &str| {
-        v3_model_by_name(models, name)
-            .map(|model| model.total_tokens)
-            .unwrap_or(0)
-    };
+    let (sol_tokens, sol_dollars) = fixed("SOL")?;
+    let (terra_tokens, terra_dollars) = fixed("TERRA")?;
+    let (luna_tokens, luna_dollars) = fixed("LUNA")?;
     Some(UsageHistorySample {
         timestamp: observation.timestamp,
         reset_at: observation.reset_at,
         remaining_percent: observation.remaining_percent.unwrap_or(-1.0),
-        sol_dollars: value("SOL"),
-        terra_dollars: value("TERRA"),
-        luna_dollars: value("LUNA"),
-        sol_tokens: tokens("SOL"),
-        terra_tokens: tokens("TERRA"),
-        luna_tokens: tokens("LUNA"),
+        sol_dollars,
+        terra_dollars,
+        luna_dollars,
+        sol_tokens,
+        terra_tokens,
+        luna_tokens,
     })
 }
 
 fn store_observation_from_public_v3(
     observation: &PublicHistoryObservationV3,
 ) -> usage_store::UsageHistoryObservation {
-    let model_source = match observation.model_source.as_str() {
-        "confirmed" => usage_store::ModelSource::Confirmed,
-        "reconstructed-from-session" => usage_store::ModelSource::ReconstructedFromSession,
-        "unavailable" => usage_store::ModelSource::Unavailable,
-        _ => usage_store::ModelSource::LegacyUnknown,
+    let (model_source, accept_models, models_complete) = match observation.model_source.as_str() {
+        "confirmed" => (
+            usage_store::ModelSource::Confirmed,
+            true,
+            observation.models_complete,
+        ),
+        "legacy-unknown" => (usage_store::ModelSource::LegacyUnknown, true, false),
+        "unavailable" => (usage_store::ModelSource::Unavailable, false, false),
+        // A reconstructed or unrecognized model vector is not a public
+        // measurement. Preserve only independently observed quota metadata.
+        _ => (usage_store::ModelSource::Unavailable, false, false),
     };
-    let models = observation.models.as_ref();
-    let model_totals = models.map(|models| {
+    let models = accept_models
+        .then_some(observation.models.as_ref())
+        .flatten();
+    // The compatibility carrier cannot represent missing token components.
+    // Keep a model group only when every required component was actually
+    // published; substituting zero here would turn absence into an observation.
+    let model_totals = models.and_then(|models| {
         models
             .iter()
-            .map(|model| usage_store::SessionModelTotal {
-                model: model.model.clone(),
-                total_tokens: model.total_tokens,
-                // v3 intentionally omits unknown components.  These fields
-                // are only a persistence carrier; graph/UI projections use
-                // total_tokens and total_dollars and retain source quality.
-                input_tokens: model.input_tokens.unwrap_or(0),
-                cached_input_tokens: model.cached_input_tokens.unwrap_or(0),
-                output_tokens: model.output_tokens.unwrap_or(0),
-                cache_write_input_tokens: model.cache_write_input_tokens,
+            .map(|model| {
+                Some(usage_store::SessionModelTotal {
+                    model: model.model.clone(),
+                    total_tokens: model.total_tokens,
+                    input_tokens: model.input_tokens?,
+                    cached_input_tokens: model.cached_input_tokens?,
+                    output_tokens: model.output_tokens?,
+                    cache_write_input_tokens: model.cache_write_input_tokens,
+                })
             })
-            .collect::<Vec<_>>()
+            .collect::<Option<Vec<_>>>()
     });
+    let model_totals_complete = models_complete && model_totals.is_some();
     usage_store::UsageHistoryObservation {
         timestamp: observation.timestamp,
         reset_at: observation.reset_at,
@@ -3831,7 +3914,7 @@ fn store_observation_from_public_v3(
             .map(|model| model.total_tokens),
         model_source,
         model_totals,
-        model_totals_complete: observation.models_complete,
+        model_totals_complete,
     }
 }
 
@@ -3852,6 +3935,7 @@ fn prefer_model_source(
     }
 }
 
+#[cfg(test)]
 fn model_source_rank(source: usage_store::ModelSource) -> u8 {
     match source {
         usage_store::ModelSource::Unavailable => 0,
@@ -3945,6 +4029,7 @@ fn canonical_reset_aliases(samples: &[UsageHistorySample]) -> (BTreeMap<i64, i64
     (aliases, canonical_resets)
 }
 
+#[cfg(test)]
 fn observation_matches_history_period(
     observation: &usage_store::UsageHistoryObservation,
     period: &PublicHistoryPeriod,
@@ -3996,6 +4081,7 @@ fn observation_reset_matches_period(
 }
 
 impl UsageHistory {
+    #[cfg(test)]
     fn resolve_observation(
         existing: usage_store::UsageHistoryObservation,
         incoming: usage_store::UsageHistoryObservation,
@@ -4016,6 +4102,7 @@ impl UsageHistory {
         }
     }
 
+    #[cfg(test)]
     fn merge_observation(
         observations: &mut Vec<usage_store::UsageHistoryObservation>,
         incoming: usage_store::UsageHistoryObservation,
@@ -4038,6 +4125,7 @@ impl UsageHistory {
     /// Merge an acquired batch in key order so backfill/replay does not pay a
     /// full vector shift for every observation. Equal keys use the same source
     /// monotonicity as `merge_observation`.
+    #[cfg(test)]
     fn merge_observations(
         observations: &mut Vec<usage_store::UsageHistoryObservation>,
         mut incoming: Vec<usage_store::UsageHistoryObservation>,
@@ -4091,6 +4179,7 @@ impl UsageHistory {
         *observations = merged;
     }
 
+    #[cfg(test)]
     fn confirmed_gaps_from_partition(
         partition: &account_scope::AccountPartition,
     ) -> Result<Vec<PublicHistoryGap>, String> {
@@ -4147,8 +4236,6 @@ impl UsageHistory {
             })
             .unwrap_or_default();
         let mut history = Self {
-            db_path,
-            partition_identity: None,
             samples,
             observations,
             pending_store_samples: Vec::new(),
@@ -4159,6 +4246,7 @@ impl UsageHistory {
         history
     }
 
+    #[cfg(test)]
     fn load_from_partition(partition: &account_scope::AccountPartition) -> Result<Self, String> {
         let now = Utc::now();
         let identity = partition.storage_identity();
@@ -4180,8 +4268,6 @@ impl UsageHistory {
             .filter_map(main_sample_from_observation)
             .collect::<Vec<_>>();
         let mut history = Self {
-            db_path: Some(partition.database_path.clone()),
-            partition_identity: Some(identity),
             samples,
             observations,
             pending_store_samples: Vec::new(),
@@ -4250,12 +4336,13 @@ impl UsageHistory {
         );
         let samples = previous.chain(current).collect();
         Self {
-            db_path: None,
-            partition_identity: None,
             samples,
             observations: Vec::new(),
+            #[cfg(test)]
             pending_store_samples: Vec::new(),
+            #[cfg(test)]
             pending_store_observations: Vec::new(),
+            #[cfg(test)]
             startup_maintenance_done: true,
         }
     }
@@ -4264,6 +4351,7 @@ impl UsageHistory {
     ///
     /// The visible in-memory set is always bounded, even if persistent pruning
     /// is unavailable. A storage failure must never expose an old or future row.
+    #[cfg(test)]
     fn startup_maintenance(&mut self, now: DateTime<Utc>) {
         if self.startup_maintenance_done {
             return;
@@ -4289,6 +4377,7 @@ impl UsageHistory {
         );
     }
 
+    #[cfg(test)]
     fn record_with_models_from_source(
         &mut self,
         sample: UsageHistorySample,
@@ -4330,6 +4419,7 @@ impl UsageHistory {
         self.apply_backfill_samples_with_models(reset_at, samples, Vec::new(), false);
     }
 
+    #[cfg(test)]
     fn apply_backfill_samples_with_models(
         &mut self,
         reset_at: i64,
@@ -4381,19 +4471,23 @@ impl UsageHistory {
         }
     }
 
+    #[cfg(test)]
     fn take_pending_store_samples(&mut self) -> Vec<usage_store::UsageHistorySample> {
         std::mem::take(&mut self.pending_store_samples)
     }
 
+    #[cfg(test)]
     fn take_pending_store_observations(&mut self) -> Vec<usage_store::UsageHistoryObservation> {
         std::mem::take(&mut self.pending_store_observations)
     }
 
+    #[cfg(test)]
     fn restore_pending_store_samples(&mut self, mut samples: Vec<usage_store::UsageHistorySample>) {
         samples.append(&mut self.pending_store_samples);
         self.pending_store_samples = samples;
     }
 
+    #[cfg(test)]
     fn restore_pending_store_observations(
         &mut self,
         mut observations: Vec<usage_store::UsageHistoryObservation>,
@@ -4404,6 +4498,7 @@ impl UsageHistory {
         Self::merge_observations(pending, observations);
     }
 
+    #[cfg(test)]
     fn record_unavailable(
         &mut self,
         timestamp: i64,
@@ -4424,31 +4519,7 @@ impl UsageHistory {
         self.retain_acquisition_window(timestamp.div_euclid(60) * 60);
     }
 
-    fn refresh_from_store(&mut self, now: DateTime<Utc>) -> bool {
-        let Some(path) = self.db_path.as_ref() else {
-            return false;
-        };
-        let store = match self.partition_identity.as_ref() {
-            Some(identity) => UsageStore::open_read_only_partitioned(path, identity),
-            None => UsageStore::open_read_only(path),
-        };
-        let Ok(store) = store else {
-            return false;
-        };
-        let Ok(observations) = store.load_recent_observations(now) else {
-            return false;
-        };
-        self.observations = observations;
-        self.samples = self
-            .observations
-            .iter()
-            .filter_map(main_sample_from_observation)
-            .into_iter()
-            .collect();
-        self.normalize();
-        true
-    }
-
+    #[cfg(test)]
     fn apply_committed_samples(
         &mut self,
         samples: Vec<usage_store::UsageHistorySample>,
@@ -4475,6 +4546,7 @@ impl UsageHistory {
         true
     }
 
+    #[cfg(test)]
     fn apply_committed_observations(
         &mut self,
         observations: Vec<usage_store::UsageHistoryObservation>,
@@ -4606,6 +4678,7 @@ impl UsageHistory {
             .collect()
     }
 
+    #[cfg(test)]
     fn normalize(&mut self) {
         // Keep every raw observation distinguishable until the sole public
         // HistoryCanonicalizer validates its cycle/minute group. Sorting is
@@ -4622,6 +4695,7 @@ impl UsageHistory {
     /// Bounds the in-memory/API/graph working set without deleting SQLite
     /// retention rows. Persistent deletion remains exclusively the three-month
     /// startup prune.
+    #[cfg(test)]
     fn retain_acquisition_window(&mut self, end_timestamp: i64) {
         let Some(end) = DateTime::<Utc>::from_timestamp(end_timestamp, 0) else {
             return;
@@ -4670,12 +4744,14 @@ fn usage_data_root() -> Option<PathBuf> {
     prepared_data_root(path)
 }
 
+#[cfg(test)]
 fn three_months_before_utc(now: DateTime<Utc>) -> i64 {
     now.checked_sub_months(Months::new(3))
         .expect("subtracting three calendar months from UTC now must be representable")
         .timestamp()
 }
 
+#[cfg(test)]
 fn one_month_before_utc(now: DateTime<Utc>) -> i64 {
     now.checked_sub_months(Months::new(1))
         .expect("subtracting one calendar month from UTC now must be representable")
@@ -4684,6 +4760,9 @@ fn one_month_before_utc(now: DateTime<Utc>) -> i64 {
 
 #[derive(Default)]
 struct GraphPaths {
+    /// Whether the selected metric has any accepted presentation evidence.
+    /// This is UI state; the compatibility JSON is not a model-data oracle.
+    has_data: bool,
     remaining: String,
     remaining_solid: String,
     remaining_inferred: String,
@@ -4722,18 +4801,63 @@ struct GraphPaths {
     current_astra_y: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum GraphModelOrigin {
+    #[default]
+    Rejected,
+    Unknown,
+    Direct,
+    /// A value stored by an older schema without a complete, confirmed model
+    /// vector.  It may be drawn for historical continuity, but it is never an
+    /// arithmetic or inactivity authority.
+    LegacyObserved,
+    BoundedFlat,
+    Interpolated,
+    Held,
+}
+
+impl GraphModelOrigin {
+    fn arithmetic_reliable(self) -> bool {
+        self == Self::Direct
+    }
+
+    fn line_is_exact(self) -> bool {
+        self == Self::Direct
+    }
+
+    fn display_weightable(self) -> bool {
+        self == Self::Direct
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct GraphModelPoint {
     dollar: f64,
     tokens: f64,
-    reliable: bool,
-    published: bool,
+    /// Lossless cumulative token authority; `tokens` is display-only f64.
+    raw_tokens: Option<u64>,
+    origin: GraphModelOrigin,
 }
 
 type GraphModelTimelines = BTreeMap<String, BTreeMap<i64, GraphModelPoint>>;
 
+struct GraphSelectionInput<'a> {
+    samples: &'a [&'a UsageHistorySample],
+    period_start: i64,
+    period_end: i64,
+    show_luna: bool,
+    show_terra: bool,
+    show_sol: bool,
+    show_astra: bool,
+    show_tokens: bool,
+    untrusted_minutes: &'a BTreeSet<i64>,
+    confirmed_gaps: &'a [GraphConfirmedGap],
+    model_timelines: &'a GraphModelTimelines,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GraphRemainingOrigin {
+    ResetBoundary,
     Raw,
     ActivitySmoothed,
     Interpolated,
@@ -4741,6 +4865,19 @@ enum GraphRemainingOrigin {
     TerminalNullHold,
     SyntheticTailHold,
     MonotonicHold,
+}
+
+fn period_start_is_quota_reset_boundary(
+    samples: &[&UsageHistorySample],
+    period_start: i64,
+) -> bool {
+    samples.iter().any(|sample| {
+        let reset_at = sample.reset_at;
+        let weekly_start = reset_at.saturating_sub(WEEK_SECONDS);
+        let monthly_start = reset_at.saturating_sub(monthly_window_seconds(reset_at));
+        weekly_start.abs_diff(period_start) <= RESET_AT_TOLERANCE_SECONDS as u64
+            || monthly_start.abs_diff(period_start) <= RESET_AT_TOLERANCE_SECONDS as u64
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -4759,17 +4896,42 @@ fn graph_model_value(point: &GraphModelPoint, show_tokens: bool) -> f64 {
     }
 }
 
+fn set_graph_model_value(point: &mut GraphModelPoint, show_tokens: bool, value: f64) {
+    if show_tokens {
+        point.tokens = value;
+    } else {
+        point.dollar = value;
+    }
+}
+
+fn graph_model_raw_tokens(point: &GraphModelPoint) -> Option<u64> {
+    point.raw_tokens
+}
+
 fn accepted_graph_model_timelines(
     timelines: &GraphModelTimelines,
-    _trusted_complete_minutes: &BTreeSet<i64>,
+    projection_minutes: &BTreeSet<i64>,
     show_tokens: bool,
     _confirmed_gaps: &[GraphConfirmedGap],
 ) -> (GraphModelTimelines, BTreeSet<i64>) {
     let mut accepted = timelines.clone();
+    let mut correction_starts = BTreeSet::new();
+    let mut all_timestamps = accepted
+        .values()
+        .flat_map(BTreeMap::keys)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    all_timestamps.extend(projection_minutes.iter().copied());
     for timeline in accepted.values_mut() {
         let raw = timeline
             .iter()
-            .map(|(timestamp, point)| (*timestamp, graph_model_value(point, show_tokens)))
+            .map(|(timestamp, point)| {
+                (
+                    *timestamp,
+                    graph_model_value(point, show_tokens),
+                    point.origin,
+                )
+            })
             .collect::<Vec<_>>();
         let isolated = raw
             .windows(3)
@@ -4783,41 +4945,367 @@ fn accepted_graph_model_timelines(
                     .into_iter()
                     .all(|value| value.is_finite() && value >= 0.0);
                 (exact_cadence
+                    && [left.2, middle.2, right.2]
+                        .into_iter()
+                        .all(GraphModelOrigin::line_is_exact)
                     && finite
                     && left.1 <= right.1
                     && (middle.1 < left.1 || middle.1 > right.1))
                     .then_some(middle.0)
             })
             .collect::<BTreeSet<_>>();
-        let mut baseline = None::<f64>;
-        for (timestamp, raw_value) in raw {
+        let mut direct_baseline = None::<f64>;
+        for (timestamp, raw_value, source_origin) in raw {
             let Some(point) = timeline.get_mut(&timestamp) else {
                 continue;
             };
-            point.reliable = false;
             if !raw_value.is_finite() || raw_value < 0.0 {
+                point.origin = GraphModelOrigin::Unknown;
+                set_graph_model_value(point, show_tokens, f64::NAN);
                 continue;
             }
-            let rejected = isolated.contains(&timestamp)
-                || baseline.is_some_and(|accepted_value| raw_value < accepted_value);
-            if rejected {
-                if let Some(accepted_value) = baseline {
-                    if show_tokens {
-                        point.tokens = accepted_value;
+            match source_origin {
+                GraphModelOrigin::Direct => {
+                    point.origin = GraphModelOrigin::Rejected;
+                    let rejected = isolated.contains(&timestamp)
+                        || direct_baseline.is_some_and(|accepted_value| raw_value < accepted_value);
+                    if rejected {
+                        correction_starts.insert(timestamp);
+                        if let Some(accepted_value) = direct_baseline {
+                            set_graph_model_value(point, show_tokens, accepted_value);
+                        } else {
+                            set_graph_model_value(point, show_tokens, f64::NAN);
+                        }
                     } else {
-                        point.dollar = accepted_value;
+                        direct_baseline = Some(raw_value);
+                        point.origin = GraphModelOrigin::Direct;
                     }
                 }
+                GraphModelOrigin::LegacyObserved => {
+                    // Retain the saved legacy value for presentation only.
+                    // It cannot become the baseline for accepting direct data.
+                    point.origin = GraphModelOrigin::LegacyObserved;
+                }
+                _ => {
+                    point.origin = GraphModelOrigin::Unknown;
+                    set_graph_model_value(point, show_tokens, f64::NAN);
+                }
+            }
+        }
+
+        // A legacy value may be drawn only when it fits between the surrounding
+        // accepted direct observations. Out-of-bounds legacy values are removed
+        // from the displayed series and may be replaced below by an explicitly
+        // inferred UI value. Neither outcome changes direct-data acceptance.
+        let direct_anchors = timeline
+            .iter()
+            .filter_map(|(timestamp, point)| {
+                (point.origin == GraphModelOrigin::Direct)
+                    .then_some((*timestamp, graph_model_value(point, show_tokens)))
+            })
+            .collect::<Vec<_>>();
+        let mut display_floor = None::<f64>;
+        for (timestamp, point) in timeline.iter_mut() {
+            let value = graph_model_value(point, show_tokens);
+            match point.origin {
+                GraphModelOrigin::Direct => display_floor = Some(value),
+                GraphModelOrigin::LegacyObserved => {
+                    let next = direct_anchors.partition_point(|(at, _)| *at <= *timestamp);
+                    let upper = direct_anchors.get(next).map(|(_, value)| *value);
+                    let outside_bounds = display_floor.is_some_and(|floor| value < floor)
+                        || upper.is_some_and(|ceiling| value > ceiling);
+                    if outside_bounds {
+                        point.origin = GraphModelOrigin::Unknown;
+                        set_graph_model_value(point, show_tokens, f64::NAN);
+                    } else {
+                        display_floor = Some(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Normalize partial source rows model-by-model. Equal accepted
+        // endpoints make every interior cumulative value exactly equal by
+        // monotonicity (`BoundedFlat`). Differing endpoints admit only an
+        // affine display estimate. Only direct observations are anchors;
+        // legacy and inferred values never acquire arithmetic authority.
+        let anchors = timeline
+            .iter()
+            .filter_map(|(timestamp, point)| {
+                point.origin.arithmetic_reliable().then_some(*timestamp)
+            })
+            .collect::<Vec<_>>();
+        for pair in anchors.windows(2) {
+            let [left_at, right_at] = pair else {
+                continue;
+            };
+            let (Some(left), Some(right)) = (
+                timeline.get(left_at).copied(),
+                timeline.get(right_at).copied(),
+            ) else {
+                continue;
+            };
+            let left_value = graph_model_value(&left, show_tokens);
+            let right_value = graph_model_value(&right, show_tokens);
+            let elapsed = right_at.saturating_sub(*left_at);
+            if elapsed <= 0
+                || !left_value.is_finite()
+                || !right_value.is_finite()
+                || left_value < 0.0
+                || right_value < left_value
+            {
                 continue;
             }
-            baseline = Some(raw_value);
-            point.reliable = true;
+            let interior = all_timestamps
+                .range((
+                    std::ops::Bound::Excluded(*left_at),
+                    std::ops::Bound::Excluded(*right_at),
+                ))
+                .copied()
+                .collect::<Vec<_>>();
+            for timestamp in interior {
+                if timeline
+                    .get(&timestamp)
+                    .is_some_and(|point| point.origin != GraphModelOrigin::Unknown)
+                {
+                    continue;
+                }
+                let fraction = timestamp.saturating_sub(*left_at) as f64 / elapsed as f64;
+                let value = left_value + (right_value - left_value) * fraction;
+                let mut point = timeline.get(&timestamp).copied().unwrap_or(left);
+                if show_tokens {
+                    point.tokens = value;
+                } else {
+                    point.dollar = value;
+                }
+                point.origin = if right_value == left_value {
+                    GraphModelOrigin::BoundedFlat
+                } else {
+                    GraphModelOrigin::Interpolated
+                };
+                timeline.insert(timestamp, point);
+            }
+        }
+
+        // Once at least one value is accepted, an unbounded tail is displayed
+        // as last-known-value only. It remains a Held prediction and can never
+        // participate in quota allocation or idle detection.
+        if let Some((last_at, last_point)) = timeline
+            .iter()
+            .filter(|(_, point)| point.origin.arithmetic_reliable())
+            .next_back()
+            .map(|(timestamp, point)| (*timestamp, *point))
+        {
+            let tail = all_timestamps
+                .range((
+                    std::ops::Bound::Excluded(last_at),
+                    std::ops::Bound::Unbounded,
+                ))
+                .copied()
+                .collect::<Vec<_>>();
+            for timestamp in tail {
+                match timeline.entry(timestamp) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(GraphModelPoint {
+                            origin: GraphModelOrigin::Held,
+                            ..last_point
+                        });
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry)
+                        if entry.get().origin == GraphModelOrigin::Unknown =>
+                    {
+                        let point = entry.get_mut();
+                        if show_tokens {
+                            point.tokens = last_point.tokens;
+                        } else {
+                            point.dollar = last_point.dollar;
+                        }
+                        point.origin = GraphModelOrigin::Held;
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {}
+                }
+            }
+        }
+
+        // A valid legacy observation is still the newest saved display
+        // evidence even though it cannot authorize arithmetic or idle.  Keep
+        // an unbounded UI tail horizontal from that point; rejected/missing
+        // rows remain Held and therefore render dashed.  This is presentation
+        // state only and never feeds the raw idle oracle below.
+        if let Some((last_at, last_point)) = timeline
+            .iter()
+            .filter(|(_, point)| {
+                matches!(
+                    point.origin,
+                    GraphModelOrigin::Direct | GraphModelOrigin::LegacyObserved
+                )
+            })
+            .next_back()
+            .map(|(timestamp, point)| (*timestamp, *point))
+        {
+            let tail = all_timestamps
+                .range((
+                    std::ops::Bound::Excluded(last_at),
+                    std::ops::Bound::Unbounded,
+                ))
+                .copied()
+                .collect::<Vec<_>>();
+            for timestamp in tail {
+                match timeline.entry(timestamp) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(GraphModelPoint {
+                            origin: GraphModelOrigin::Held,
+                            ..last_point
+                        });
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry)
+                        if matches!(
+                            entry.get().origin,
+                            GraphModelOrigin::Unknown | GraphModelOrigin::Held
+                        ) =>
+                    {
+                        let point = entry.get_mut();
+                        if show_tokens {
+                            point.tokens = last_point.tokens;
+                        } else {
+                            point.dollar = last_point.dollar;
+                        }
+                        point.origin = GraphModelOrigin::Held;
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => {}
+                }
+            }
         }
     }
 
-    // Metric anomalies are carried on their own points. They are prediction
-    // intervals, not cross-series correction boundaries.
-    (accepted, BTreeSet::new())
+    (accepted, correction_starts)
+}
+
+fn activity_relevant_token_timelines(timelines: &GraphModelTimelines) -> GraphModelTimelines {
+    let relevant = timelines
+        .iter()
+        .filter(|(_, timeline)| {
+            let has_exact_zero = timeline.values().any(|point| {
+                point.origin.arithmetic_reliable()
+                    && point.tokens.is_finite()
+                    && point.tokens == 0.0
+            });
+            let neutral_zero_only = has_exact_zero
+                && timeline.values().all(|point| {
+                    point.origin.arithmetic_reliable()
+                        && point.tokens.is_finite()
+                        && point.tokens == 0.0
+                });
+            !neutral_zero_only
+        })
+        .map(|(name, timeline)| (name.clone(), timeline.clone()))
+        .collect::<GraphModelTimelines>();
+    if relevant.is_empty() {
+        timelines.clone()
+    } else {
+        relevant
+    }
+}
+
+fn shape_inferred_model_timelines_by_task_activity(
+    timelines: &mut GraphModelTimelines,
+    show_tokens: bool,
+    task_activity_by_minute: Option<&BTreeMap<i64, Option<bool>>>,
+) {
+    let Some(activity) = task_activity_by_minute else {
+        return;
+    };
+    for timeline in timelines.values_mut() {
+        // Only directly measured values are absolute anchors. Interior values
+        // may be theoretical, but complete lifecycle evidence proves that a
+        // cumulative series cannot move during a fully idle minute.
+        let anchors = timeline
+            .iter()
+            .filter_map(|(timestamp, point)| point.origin.line_is_exact().then_some(*timestamp))
+            .collect::<Vec<_>>();
+        for pair in anchors.windows(2) {
+            let [left_at, right_at] = pair else {
+                continue;
+            };
+            let (Some(left), Some(right)) = (
+                timeline.get(left_at).copied(),
+                timeline.get(right_at).copied(),
+            ) else {
+                continue;
+            };
+            let left_value = graph_model_value(&left, show_tokens);
+            let right_value = graph_model_value(&right, show_tokens);
+            if right_at <= left_at
+                || !left_value.is_finite()
+                || !right_value.is_finite()
+                || left_value < 0.0
+                || right_value < left_value
+            {
+                continue;
+            }
+            let timestamps = timeline
+                .range((
+                    std::ops::Bound::Excluded(*left_at),
+                    std::ops::Bound::Included(*right_at),
+                ))
+                .map(|(timestamp, _)| *timestamp)
+                .collect::<Vec<_>>();
+            let mut previous = *left_at;
+            let mut intervals = Vec::with_capacity(timestamps.len());
+            let mut has_idle = false;
+            let mut active_duration = 0.0;
+            let mut complete = true;
+            for timestamp in &timestamps {
+                let Some(active) = activity.get(timestamp).copied().flatten() else {
+                    complete = false;
+                    break;
+                };
+                let elapsed = timestamp.saturating_sub(previous).max(0) as f64;
+                has_idle |= !active;
+                if active {
+                    active_duration += elapsed;
+                }
+                intervals.push((*timestamp, active, elapsed));
+                previous = *timestamp;
+            }
+            if !complete
+                || !has_idle
+                || (right_value > left_value && active_duration <= f64::EPSILON)
+            {
+                continue;
+            }
+
+            let mut active_elapsed = 0.0;
+            for (timestamp, active, elapsed) in intervals {
+                if active {
+                    active_elapsed += elapsed;
+                }
+                if timestamp == *right_at {
+                    continue;
+                }
+                let fraction = if right_value == left_value {
+                    0.0
+                } else {
+                    (active_elapsed / active_duration).clamp(0.0, 1.0)
+                };
+                let value = left_value + (right_value - left_value) * fraction;
+                let Some(point) = timeline.get_mut(&timestamp) else {
+                    continue;
+                };
+                if show_tokens {
+                    point.tokens = value;
+                } else {
+                    point.dollar = value;
+                }
+                point.origin = if active {
+                    GraphModelOrigin::Interpolated
+                } else {
+                    GraphModelOrigin::BoundedFlat
+                };
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -4946,8 +5434,8 @@ fn graph_paths_with_sources(
                         GraphModelPoint {
                             dollar,
                             tokens: tokens as f64,
-                            reliable: true,
-                            published: true,
+                            raw_tokens: Some(tokens),
+                            origin: GraphModelOrigin::Direct,
                         },
                     ))
                 })
@@ -4955,9 +5443,13 @@ fn graph_paths_with_sources(
             (name.to_owned(), timeline)
         })
         .collect::<GraphModelTimelines>();
+    let projection_minutes = samples
+        .iter()
+        .map(|sample| sample.timestamp.div_euclid(60) * 60)
+        .collect::<BTreeSet<_>>();
     let (token_timelines, _) = accepted_graph_model_timelines(
         &raw_token_timelines,
-        &BTreeSet::new(),
+        &projection_minutes,
         true,
         confirmed_gaps,
     );
@@ -4982,6 +5474,7 @@ fn graph_paths_with_sources(
         .collect::<Vec<_>>()
         .join(" ");
     GraphPaths {
+        has_data: !samples.is_empty(),
         remaining: remaining_path,
         remaining_solid,
         remaining_inferred,
@@ -5056,96 +5549,37 @@ fn graph_paths_for_selection(
     show_sol: bool,
     show_tokens: bool,
 ) -> GraphPaths {
-    graph_paths_for_selection_with_confirmed_gaps(
+    let untrusted_minutes = BTreeSet::new();
+    let confirmed_gaps = [];
+    let model_timelines = BTreeMap::new();
+    graph_paths_for_selection_with_confirmed_gaps(GraphSelectionInput {
         samples,
         period_start,
         period_end,
         show_luna,
         show_terra,
         show_sol,
+        show_astra: false,
         show_tokens,
-        &[],
-    )
+        untrusted_minutes: &untrusted_minutes,
+        confirmed_gaps: &confirmed_gaps,
+        model_timelines: &model_timelines,
+    })
 }
 
 #[cfg(test)]
-fn graph_paths_for_selection_with_confirmed_gaps(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    show_luna: bool,
-    show_terra: bool,
-    show_sol: bool,
-    show_tokens: bool,
-    confirmed_gaps: &[GraphConfirmedGap],
-) -> GraphPaths {
-    graph_paths_for_selection_with_sources(
-        samples,
-        period_start,
-        period_end,
-        show_luna,
-        show_terra,
-        show_sol,
-        show_tokens,
-        &BTreeSet::new(),
-        confirmed_gaps,
-    )
+fn graph_paths_for_selection_with_confirmed_gaps(input: GraphSelectionInput<'_>) -> GraphPaths {
+    graph_paths_for_selection_with_sources(input)
 }
 
 #[cfg(test)]
-fn graph_paths_for_selection_with_sources(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    show_luna: bool,
-    show_terra: bool,
-    show_sol: bool,
-    show_tokens: bool,
-    untrusted_minutes: &BTreeSet<i64>,
-    confirmed_gaps: &[GraphConfirmedGap],
-) -> GraphPaths {
-    graph_paths_for_selection_with_sources_and_astra(
-        samples,
-        period_start,
-        period_end,
-        show_luna,
-        show_terra,
-        show_sol,
-        false,
-        show_tokens,
-        untrusted_minutes,
-        confirmed_gaps,
-        &BTreeMap::new(),
-    )
+fn graph_paths_for_selection_with_sources(input: GraphSelectionInput<'_>) -> GraphPaths {
+    graph_paths_for_selection_with_sources_and_astra(input)
 }
 
 #[cfg(test)]
-fn graph_paths_for_selection_with_sources_and_astra(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    show_luna: bool,
-    show_terra: bool,
-    show_sol: bool,
-    show_astra: bool,
-    show_tokens: bool,
-    untrusted_minutes: &BTreeSet<i64>,
-    confirmed_gaps: &[GraphConfirmedGap],
-    model_timelines: &GraphModelTimelines,
-) -> GraphPaths {
-    graph_paths_for_selection_with_sources_and_astra_with_lineage(
-        samples,
-        period_start,
-        period_end,
-        show_luna,
-        show_terra,
-        show_sol,
-        show_astra,
-        show_tokens,
-        untrusted_minutes,
-        confirmed_gaps,
-        model_timelines,
-    )
+fn graph_paths_for_selection_with_sources_and_astra(input: GraphSelectionInput<'_>) -> GraphPaths {
+    graph_paths_for_selection_with_sources_and_astra_with_lineage(input)
 }
 
 fn graph_minute_points_with_model_timelines(
@@ -5163,13 +5597,18 @@ fn graph_minute_points_with_model_timelines(
     );
     for point in &mut minute {
         let value = |name: &str, fallback: f64| {
-            let timeline = model_timelines.get(name);
+            if model_timelines.is_empty() {
+                return fallback;
+            }
+            let Some(timeline) = model_timelines.get(name) else {
+                return -1.0;
+            };
             timeline
-                .and_then(|values| values.get(&point.timestamp))
+                .get(&point.timestamp)
                 .or_else(|| {
                     (point.timestamp == period_end)
                         .then(|| {
-                            timeline?
+                            timeline
                                 .range(..=period_end)
                                 .next_back()
                                 .map(|(_, model)| model)
@@ -5177,7 +5616,10 @@ fn graph_minute_points_with_model_timelines(
                         .flatten()
                 })
                 .map(|model| graph_model_value(model, show_tokens))
-                .unwrap_or(fallback)
+                // A named generic timeline is authoritative. Falling back to
+                // legacy fixed columns at a missing point fabricates a
+                // complete vector and can paint idle behind a dashed line.
+                .unwrap_or(-1.0)
         };
         point.sol = value("SOL", point.sol);
         point.terra = value("TERRA", point.terra);
@@ -5195,7 +5637,7 @@ fn graph_model_untrusted_minutes(
     let mut minutes = timeline
         .into_iter()
         .flat_map(BTreeMap::iter)
-        .filter(|(_, point)| !point.reliable)
+        .filter(|(_, point)| !point.origin.line_is_exact())
         .map(|(minute, _)| *minute)
         .collect::<BTreeSet<_>>();
     if minute.last().is_some_and(|point| {
@@ -5207,19 +5649,43 @@ fn graph_model_untrusted_minutes(
     minutes
 }
 
+/// Return correction boundaries for one model only. A correction in another
+/// model must not turn this model's otherwise exact segment into a bridge.
+fn graph_model_correction_starts(
+    timeline: Option<&BTreeMap<i64, GraphModelPoint>>,
+) -> BTreeSet<i64> {
+    timeline
+        .into_iter()
+        .flat_map(BTreeMap::iter)
+        .filter(|(_, point)| point.origin == GraphModelOrigin::Rejected)
+        .map(|(timestamp, _)| *timestamp)
+        .collect()
+}
+
+#[cfg(test)]
 fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    show_luna: bool,
-    show_terra: bool,
-    show_sol: bool,
-    show_astra: bool,
-    show_tokens: bool,
-    untrusted_minutes: &BTreeSet<i64>,
-    confirmed_gaps: &[GraphConfirmedGap],
-    raw_model_timelines: &GraphModelTimelines,
+    input: GraphSelectionInput<'_>,
 ) -> GraphPaths {
+    graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(input, None)
+}
+
+fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+    input: GraphSelectionInput<'_>,
+    task_activity_by_minute: Option<&BTreeMap<i64, Option<bool>>>,
+) -> GraphPaths {
+    let GraphSelectionInput {
+        samples,
+        period_start,
+        period_end,
+        show_luna,
+        show_terra,
+        show_sol,
+        show_astra,
+        show_tokens,
+        untrusted_minutes,
+        confirmed_gaps,
+        model_timelines,
+    } = input;
     let mut paths = graph_paths_with_sources(
         samples,
         period_start,
@@ -5232,29 +5698,44 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
     // rejected token regression and makes dollar/token idle bands disagree.
     // Display metric and idle/activity evidence therefore have independent
     // anomaly state, while idle and quota smoothing always use raw tokens.
-    let (display_timelines, display_anomaly_starts) = accepted_graph_model_timelines(
-        raw_model_timelines,
-        &BTreeSet::new(),
-        show_tokens,
-        confirmed_gaps,
+    let mut projection_minutes = samples
+        .iter()
+        .map(|sample| sample.timestamp.div_euclid(60) * 60)
+        .collect::<BTreeSet<_>>();
+    if let Some(activity) = task_activity_by_minute {
+        projection_minutes.extend(activity.keys().copied());
+    }
+    let (mut dollar_timelines, _dollar_anomaly_starts) =
+        accepted_graph_model_timelines(model_timelines, &projection_minutes, false, confirmed_gaps);
+    let (mut token_timelines, token_anomaly_starts) =
+        accepted_graph_model_timelines(model_timelines, &projection_minutes, true, confirmed_gaps);
+    shape_inferred_model_timelines_by_task_activity(
+        &mut dollar_timelines,
+        false,
+        task_activity_by_minute,
     );
-    let (token_timelines, token_anomaly_starts) =
-        accepted_graph_model_timelines(raw_model_timelines, &BTreeSet::new(), true, confirmed_gaps);
-    let minute = graph_minute_points_with_model_timelines(
-        samples,
-        period_start,
-        period_end,
-        show_tokens,
-        untrusted_minutes,
-        &display_timelines,
+    shape_inferred_model_timelines_by_task_activity(
+        &mut token_timelines,
+        true,
+        task_activity_by_minute,
     );
+    // A model that is observed only at cumulative zero contributes no activity
+    // weight only while every point is an exact zero. A held/unknown tail is
+    // omitted-model evidence, not a published zero, and must stay in quota
+    // projection so it can force the elapsed fallback.
+    let activity_token_timelines = activity_relevant_token_timelines(&token_timelines);
+    let display_timelines = if show_tokens {
+        token_timelines.clone()
+    } else {
+        dollar_timelines.clone()
+    };
     // Quota activity is token-based in both display modes. A cheap model's
     // rounded dollar series must not turn real token movement into idle time.
     let remaining_evidence = remaining_evidence_from_model_timelines(
         samples,
         period_start,
         period_end,
-        &token_timelines,
+        &activity_token_timelines,
         true,
         confirmed_gaps,
         &token_anomaly_starts,
@@ -5263,23 +5744,39 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
         .iter()
         .map(|point| (point.timestamp, point.effective))
         .collect::<Vec<_>>();
+    let minute = graph_minute_points_with_model_timelines(
+        samples,
+        period_start,
+        period_end,
+        show_tokens,
+        untrusted_minutes,
+        &display_timelines,
+    );
     let has_remaining_observation = samples
         .iter()
         .any(|sample| sample.remaining_percent.is_finite() && sample.remaining_percent >= 0.0);
-    let model_timeline_evidence = (!token_timelines.is_empty()).then_some((&token_timelines, true));
+    paths.has_data = has_remaining_observation
+        || display_timelines.values().any(|timeline| {
+            timeline.values().any(|point| {
+                let value = graph_model_value(point, show_tokens);
+                value.is_finite() && value >= 0.0
+            })
+        });
+    let model_timeline_evidence =
+        (!activity_token_timelines.is_empty()).then_some((&activity_token_timelines, true));
     if has_remaining_observation {
         if let Some(remaining) = remaining_points.last().map(|(_, value)| *value) {
-            let (solid, inferred) = remaining_paths_with_boundaries(
-                &remaining_points,
+            let (solid, inferred) = remaining_paths_with_boundaries(RemainingPathContext {
+                points: &remaining_points,
                 samples,
-                &minute,
+                model_points: &minute,
                 period_start,
                 period_end,
                 confirmed_gaps,
-                &token_anomaly_starts,
-                model_timeline_evidence,
-                Some(&remaining_evidence),
-            );
+                correction_starts: &token_anomaly_starts,
+                model_timelines: model_timeline_evidence,
+                remaining_evidence: Some(&remaining_evidence),
+            });
             paths.remaining = [solid.as_str(), inferred.as_str()]
                 .into_iter()
                 .filter(|path| !path.is_empty())
@@ -5295,12 +5792,18 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
             paths.current_remaining_point_y = normalized;
         }
     }
-    paths.unused_intervals = token_idle_interval_positions(
+    paths.unused_intervals = token_idle_interval_positions_with_render_evidence(
         samples,
         period_start,
         period_end,
-        &token_timelines,
+        // Confirmed idle comes from raw direct lineage. Display filtering,
+        // interpolation and activity shaping cannot create or erase it.
+        model_timelines,
         confirmed_gaps,
+        Some(&GraphIdleRenderEvidence {
+            untrusted_minutes,
+            task_activity_by_minute,
+        }),
     );
     let maximum = minute
         .iter()
@@ -5376,17 +5879,20 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
     let graph_y =
         |value: f64| ((99.0 - value / scale_maximum * 98.0) / 100.0).clamp(0.01, 0.99) as f32;
     if show_luna {
-        let (flat, rising, inferred) = split_metric_line_paths_with_boundaries(
-            &minute,
+        let untrusted_minutes = model_untrusted("LUNA");
+        let correction_starts = graph_model_correction_starts(display_timelines.get("LUNA"));
+        let context = MetricLinePathContext {
+            points: &minute,
             period_start,
             period_end,
-            scale_maximum,
-            |point| point.luna,
+            maximum: scale_maximum,
             confirmed_gaps,
-            &model_untrusted("LUNA"),
-            false,
-            &display_anomaly_starts,
-        );
+            untrusted_minutes: &untrusted_minutes,
+            require_legacy_vector: false,
+            correction_starts: &correction_starts,
+        };
+        let (flat, rising, inferred) =
+            split_metric_line_paths_with_boundaries(&context, |point| point.luna);
         paths.luna_flat = flat;
         paths.luna_rising = rising;
         paths.luna_inferred = inferred;
@@ -5406,17 +5912,20 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
         }
     }
     if show_terra {
-        let (flat, rising, inferred) = split_metric_line_paths_with_boundaries(
-            &minute,
+        let untrusted_minutes = model_untrusted("TERRA");
+        let correction_starts = graph_model_correction_starts(display_timelines.get("TERRA"));
+        let context = MetricLinePathContext {
+            points: &minute,
             period_start,
             period_end,
-            scale_maximum,
-            |point| point.terra,
+            maximum: scale_maximum,
             confirmed_gaps,
-            &model_untrusted("TERRA"),
-            false,
-            &display_anomaly_starts,
-        );
+            untrusted_minutes: &untrusted_minutes,
+            require_legacy_vector: false,
+            correction_starts: &correction_starts,
+        };
+        let (flat, rising, inferred) =
+            split_metric_line_paths_with_boundaries(&context, |point| point.terra);
         paths.terra_flat = flat;
         paths.terra_rising = rising;
         paths.terra_inferred = inferred;
@@ -5436,17 +5945,20 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
         }
     }
     if show_sol {
-        let (flat, rising, inferred) = split_metric_line_paths_with_boundaries(
-            &minute,
+        let untrusted_minutes = model_untrusted("SOL");
+        let correction_starts = graph_model_correction_starts(display_timelines.get("SOL"));
+        let context = MetricLinePathContext {
+            points: &minute,
             period_start,
             period_end,
-            scale_maximum,
-            |point| point.sol,
+            maximum: scale_maximum,
             confirmed_gaps,
-            &model_untrusted("SOL"),
-            false,
-            &display_anomaly_starts,
-        );
+            untrusted_minutes: &untrusted_minutes,
+            require_legacy_vector: false,
+            correction_starts: &correction_starts,
+        };
+        let (flat, rising, inferred) =
+            split_metric_line_paths_with_boundaries(&context, |point| point.sol);
         paths.sol_flat = flat;
         paths.sol_rising = rising;
         paths.sol_inferred = inferred;
@@ -5466,17 +5978,20 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
         }
     }
     if show_astra {
-        let (flat, rising, inferred) = split_metric_line_paths_with_boundaries(
-            &minute,
+        let untrusted_minutes = model_untrusted("ASTRA");
+        let correction_starts = graph_model_correction_starts(display_timelines.get("ASTRA"));
+        let context = MetricLinePathContext {
+            points: &minute,
             period_start,
             period_end,
-            scale_maximum,
-            |point| point.astra,
+            maximum: scale_maximum,
             confirmed_gaps,
-            &model_untrusted("ASTRA"),
-            false,
-            &display_anomaly_starts,
-        );
+            untrusted_minutes: &untrusted_minutes,
+            require_legacy_vector: false,
+            correction_starts: &correction_starts,
+        };
+        let (flat, rising, inferred) =
+            split_metric_line_paths_with_boundaries(&context, |point| point.astra);
         paths.astra_flat = flat;
         paths.astra_rising = rising;
         paths.astra_inferred = inferred;
@@ -5881,6 +6396,17 @@ fn graph_interval_has_hard_break(
         || graph_interval_crosses_correction(start_at, end_at, correction_starts)
 }
 
+struct MetricLinePathContext<'a> {
+    points: &'a [HourlyModelSpend],
+    period_start: i64,
+    period_end: i64,
+    maximum: f64,
+    confirmed_gaps: &'a [GraphConfirmedGap],
+    untrusted_minutes: &'a BTreeSet<i64>,
+    require_legacy_vector: bool,
+    correction_starts: &'a BTreeSet<i64>,
+}
+
 fn split_metric_line_paths_with_confirmed_gaps(
     points: &[HourlyModelSpend],
     period_start: i64,
@@ -5889,39 +6415,26 @@ fn split_metric_line_paths_with_confirmed_gaps(
     value: impl Fn(&HourlyModelSpend) -> f64,
     confirmed_gaps: &[GraphConfirmedGap],
 ) -> (String, String, String) {
-    split_metric_line_paths_with_evidence(
+    let untrusted_minutes = BTreeSet::new();
+    let correction_starts = BTreeSet::new();
+    let context = MetricLinePathContext {
         points,
         period_start,
         period_end,
         maximum,
-        value,
         confirmed_gaps,
-        &BTreeSet::new(),
-        true,
-    )
+        untrusted_minutes: &untrusted_minutes,
+        require_legacy_vector: true,
+        correction_starts: &correction_starts,
+    };
+    split_metric_line_paths_with_evidence(&context, value)
 }
 
 fn split_metric_line_paths_with_evidence(
-    points: &[HourlyModelSpend],
-    period_start: i64,
-    period_end: i64,
-    maximum: f64,
+    context: &MetricLinePathContext<'_>,
     value: impl Fn(&HourlyModelSpend) -> f64,
-    confirmed_gaps: &[GraphConfirmedGap],
-    untrusted_minutes: &BTreeSet<i64>,
-    require_legacy_vector: bool,
 ) -> (String, String, String) {
-    split_metric_line_paths_with_boundaries(
-        points,
-        period_start,
-        period_end,
-        maximum,
-        value,
-        confirmed_gaps,
-        untrusted_minutes,
-        require_legacy_vector,
-        &BTreeSet::new(),
-    )
+    split_metric_line_paths_with_boundaries(context, value)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6031,20 +6544,13 @@ fn metric_line_segments_with_boundaries(
 }
 
 fn split_metric_line_paths_with_boundaries(
-    points: &[HourlyModelSpend],
-    period_start: i64,
-    period_end: i64,
-    maximum: f64,
+    context: &MetricLinePathContext<'_>,
     value: impl Fn(&HourlyModelSpend) -> f64,
-    confirmed_gaps: &[GraphConfirmedGap],
-    untrusted_minutes: &BTreeSet<i64>,
-    require_legacy_vector: bool,
-    correction_starts: &BTreeSet<i64>,
 ) -> (String, String, String) {
-    let span = (period_end - period_start).max(1) as f64;
-    let scale = maximum.max(1.0);
+    let span = (context.period_end - context.period_start).max(1) as f64;
+    let scale = context.maximum.max(1.0);
     let coordinate = |point: &HourlyModelSpend| {
-        let x = ((point.timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
+        let x = ((point.timestamp - context.period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
         let y = (99.0 - value(point).max(0.0) / scale * 98.0).clamp(1.0, 99.0);
         (
             canonical_graph_viewbox_value(x),
@@ -6055,15 +6561,15 @@ fn split_metric_line_paths_with_boundaries(
     let mut rising = String::new();
     let mut inferred = String::new();
     for segment in metric_line_segments_with_boundaries(
-        points,
+        context.points,
         &value,
-        confirmed_gaps,
-        untrusted_minutes,
-        require_legacy_vector,
-        correction_starts,
+        context.confirmed_gaps,
+        context.untrusted_minutes,
+        context.require_legacy_vector,
+        context.correction_starts,
     ) {
-        let start = coordinate(&points[segment.start_index]);
-        let end = coordinate(&points[segment.end_index]);
+        let start = coordinate(&context.points[segment.start_index]);
+        let end = coordinate(&context.points[segment.end_index]);
         let target = match segment.kind {
             GraphMetricSegmentKind::Flat => &mut flat,
             GraphMetricSegmentKind::Rising => &mut rising,
@@ -6285,121 +6791,118 @@ fn accepted_remaining_samples(
         .collect()
 }
 
-fn token_idle_timestamp_intervals(
+struct GraphIdleRenderEvidence<'a> {
+    untrusted_minutes: &'a BTreeSet<i64>,
+    task_activity_by_minute: Option<&'a BTreeMap<i64, Option<bool>>>,
+}
+
+fn token_idle_timestamp_intervals_with_render_evidence(
     samples: &[&UsageHistorySample],
     period_start: i64,
     period_end: i64,
     token_timelines: &GraphModelTimelines,
     confirmed_gaps: &[GraphConfirmedGap],
+    render_evidence: Option<&GraphIdleRenderEvidence<'_>>,
 ) -> Vec<(i64, i64)> {
-    let remaining = accepted_remaining_samples(samples, period_start, period_end);
-    // A row with a missing/invalid Remaining value is still a token
-    // observation at that timestamp. Keep it in the cadence so the token
-    // sequence remains continuous without inventing a missing sample.
-    let timestamps = samples
-        .iter()
-        .filter(|sample| sample.timestamp >= period_start && sample.timestamp <= period_end)
-        .map(|sample| sample.timestamp)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if timestamps.len() < 2 || token_timelines.is_empty() || period_end <= period_start {
+    if token_timelines.is_empty() || period_end <= period_start {
         return Vec::new();
     }
-    let evidence_equal = |before: i64, after: i64| {
-        if graph_interval_overlaps_confirmed_gap(before, after, confirmed_gaps) {
-            return false;
+    let untrusted_minutes = render_evidence
+        .map(|evidence| evidence.untrusted_minutes)
+        .cloned()
+        .unwrap_or_default();
+    let task_activity_by_minute =
+        render_evidence.and_then(|evidence| evidence.task_activity_by_minute);
+
+    // Only a complete vector of direct, same-minute observations can prove
+    // inactivity.  Interpolated/held/smoothed/legacy points remain display
+    // artifacts and never enter this oracle.
+    let direct_vector = |timestamp: i64| -> Option<Vec<(String, u64)>> {
+        if untrusted_minutes.contains(&timestamp) {
+            return None;
         }
-        let before_names = token_timelines
+        token_timelines
             .iter()
-            .filter(|(_, timeline)| timeline.get(&before).is_some_and(|point| point.published))
-            .map(|(name, _)| name.as_str())
-            .collect::<BTreeSet<_>>();
-        let after_names = token_timelines
-            .iter()
-            .filter(|(_, timeline)| timeline.get(&after).is_some_and(|point| point.published))
-            .map(|(name, _)| name.as_str())
-            .collect::<BTreeSet<_>>();
-        !before_names.is_empty()
-            && before_names == after_names
-            && before_names.into_iter().all(|name| {
-                let timeline = &token_timelines[name];
-                let Some(left) = timeline.get(&before) else {
-                    return false;
-                };
-                let Some(right) = timeline.get(&after) else {
-                    return false;
-                };
-                left.reliable
-                    && right.reliable
-                    && left.tokens.is_finite()
-                    && right.tokens.is_finite()
-                    && left.tokens >= 0.0
-                    && left.tokens == right.tokens
+            .map(|(name, timeline)| {
+                let point = timeline.get(&timestamp)?;
+                (point.origin == GraphModelOrigin::Direct)
+                    .then(|| Some((name.clone(), graph_model_raw_tokens(point)?)))
+                    .flatten()
             })
+            .collect()
+    };
+    let direct_remaining = |timestamp: i64| -> Option<u64> {
+        let mut accepted = None;
+        for sample in samples.iter().filter(|sample| {
+            sample.timestamp.div_euclid(60) * 60 == timestamp
+                && sample.timestamp >= period_start
+                && sample.timestamp <= period_end
+        }) {
+            let value = sample.remaining_percent;
+            if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                return None;
+            }
+            let bits = value.to_bits();
+            if accepted.is_some_and(|prior| prior != bits) {
+                return None;
+            }
+            accepted = Some(bits);
+        }
+        accepted
     };
 
-    let remaining_contradicts = |start: i64, end: i64| {
-        let mut observed = remaining
-            .range(start..=end)
-            .filter_map(|(_, sample)| sample.reliable.then_some(sample.raw));
-        let first = observed.next();
-        first.is_some_and(|value| observed.any(|candidate| candidate != value))
-    };
-    let mut raw_intervals = timestamps
-        .windows(2)
-        .filter_map(|pair| {
-            let [before, after] = pair else {
-                return None;
-            };
-            (after.saturating_sub(*before) <= MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS
-                && after > before
-                && evidence_equal(*before, *after)
-                && !remaining_contradicts(*before, *after))
-            .then_some((*before, *after, 1usize))
+    let mut anchors = token_timelines
+        .values()
+        .flat_map(BTreeMap::keys)
+        .filter(|timestamp| **timestamp >= period_start && **timestamp <= period_end)
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|timestamp| {
+            Some((
+                timestamp,
+                direct_vector(timestamp)?,
+                direct_remaining(timestamp)?,
+            ))
         })
         .collect::<Vec<_>>();
-    let basic = raw_intervals
-        .iter()
-        .map(|(start, end, _)| (*start, *end))
-        .collect::<BTreeSet<_>>();
-    for window in timestamps.windows(4) {
-        let [t0, t1, t2, t3] = window else {
+    anchors.sort_by_key(|(timestamp, _, _)| *timestamp);
+
+    let task_was_active = |start: i64, end: i64| {
+        task_activity_by_minute.is_some_and(|activity| {
+            activity
+                .range((
+                    std::ops::Bound::Excluded(start),
+                    std::ops::Bound::Included(end),
+                ))
+                .any(|(_, state)| *state == Some(true))
+        })
+    };
+    let mut proven = Vec::<(i64, i64)>::new();
+    for pair in anchors.windows(2) {
+        let [(start, start_vector, start_remaining), (end, end_vector, end_remaining)] = pair
+        else {
             continue;
         };
-        if t1.saturating_sub(*t0) == 60
-            && t2.saturating_sub(*t1) == 120
-            && t3.saturating_sub(*t2) == 60
-            && basic.contains(&(*t0, *t1))
-            && basic.contains(&(*t2, *t3))
-            && evidence_equal(*t1, *t2)
-            && !remaining_contradicts(*t1, *t2)
+        if end <= start
+            || start_vector != end_vector
+            || start_remaining != end_remaining
+            || task_was_active(*start, *end)
+            || graph_interval_overlaps_confirmed_gap(*start, *end, confirmed_gaps)
         {
-            raw_intervals.push((*t1, *t2, 0));
+            continue;
         }
-    }
-    raw_intervals.sort_unstable();
-    let mut merged = Vec::<(i64, i64, usize)>::new();
-    for (start, end, observed_intervals) in raw_intervals {
-        if let Some(last) = merged.last_mut() {
-            if start <= last.1 {
-                last.1 = last.1.max(end);
-                last.2 += observed_intervals;
+        if let Some(last) = proven.last_mut() {
+            if last.1 == *start {
+                last.1 = *end;
                 continue;
             }
         }
-        merged.push((start, end, observed_intervals));
+        proven.push((*start, *end));
     }
-    merged
+    proven
         .into_iter()
-        .filter_map(|(start, end, observed_intervals)| {
-            let start = start.max(period_start);
-            let end = end.min(period_end);
-            if observed_intervals < CONFIRMED_IDLE_MIN_OBSERVED_INTERVALS || end <= start {
-                return None;
-            }
-            Some((start, end))
-        })
+        .filter(|(start, end)| end.saturating_sub(*start) >= SUSTAINED_UNUSED_MIN_DURATION_SECONDS)
         .collect()
 }
 
@@ -6410,13 +6913,32 @@ fn token_idle_interval_positions(
     token_timelines: &GraphModelTimelines,
     confirmed_gaps: &[GraphConfirmedGap],
 ) -> Vec<UnusedIntervalPosition> {
-    let span = (period_end - period_start).max(1) as f64;
-    token_idle_timestamp_intervals(
+    token_idle_interval_positions_with_render_evidence(
         samples,
         period_start,
         period_end,
         token_timelines,
         confirmed_gaps,
+        None,
+    )
+}
+
+fn token_idle_interval_positions_with_render_evidence(
+    samples: &[&UsageHistorySample],
+    period_start: i64,
+    period_end: i64,
+    token_timelines: &GraphModelTimelines,
+    confirmed_gaps: &[GraphConfirmedGap],
+    render_evidence: Option<&GraphIdleRenderEvidence<'_>>,
+) -> Vec<UnusedIntervalPosition> {
+    let span = (period_end - period_start).max(1) as f64;
+    token_idle_timestamp_intervals_with_render_evidence(
+        samples,
+        period_start,
+        period_end,
+        token_timelines,
+        confirmed_gaps,
+        render_evidence,
     )
     .into_iter()
     .map(|(start, end)| UnusedIntervalPosition {
@@ -6551,6 +7073,7 @@ fn remaining_evidence_from_model_timelines(
     struct Row {
         timestamp: i64,
         raw: Option<f64>,
+        reset_boundary: bool,
         synthetic_tail: bool,
     }
 
@@ -6564,14 +7087,57 @@ fn remaining_evidence_from_model_timelines(
         .then_some(sample.remaining_percent);
         by_timestamp.entry(sample.timestamp).or_default().push(raw);
     }
+    // Model timelines also contain the model-less lifecycle cadence supplied
+    // by REST. Preserve those timestamps so quota interpolation can spend no
+    // distance inside a lifecycle-confirmed idle interval.
+    for timestamp in model_timelines.values().flat_map(BTreeMap::keys).copied() {
+        if timestamp >= period_start && timestamp <= period_end {
+            by_timestamp.entry(timestamp).or_default();
+        }
+    }
+    let mut accepted_remaining = accepted_remaining_samples(samples, period_start, period_end);
+    let first_reliable_remaining_at = accepted_remaining
+        .iter()
+        .find_map(|(timestamp, sample)| sample.reliable.then_some(*timestamp));
+    let can_reconstruct_reset_boundary = first_reliable_remaining_at.is_some_and(|first| {
+        first > period_start
+            && !accepted_remaining.contains_key(&period_start)
+            && period_start_is_quota_reset_boundary(samples, period_start)
+            && !confirmed_gaps
+                .iter()
+                .any(|gap| gap.start_at < first && gap.end_at > period_start)
+            && model_timelines.values().any(|timeline| {
+                timeline.range(period_start..=first).any(|(_, point)| {
+                    point.origin.arithmetic_reliable()
+                        && point.tokens.is_finite()
+                        && point.tokens >= 0.0
+                })
+            })
+    });
+    if can_reconstruct_reset_boundary {
+        by_timestamp.entry(period_start).or_default();
+        accepted_remaining.insert(
+            period_start,
+            AcceptedRemainingSample {
+                raw: 100.0,
+                reliable: true,
+            },
+        );
+    }
     let mut rows = by_timestamp
         .into_iter()
         .map(|(timestamp, candidates)| {
             let first = candidates.first().copied().flatten();
             let conflict = candidates.iter().any(|candidate| *candidate != first);
+            let reset_boundary = can_reconstruct_reset_boundary
+                && timestamp == period_start
+                && candidates.iter().all(Option::is_none);
             Row {
                 timestamp,
-                raw: (!conflict).then_some(first).flatten(),
+                raw: reset_boundary
+                    .then_some(100.0)
+                    .or_else(|| (!conflict).then_some(first).flatten()),
+                reset_boundary,
                 synthetic_tail: false,
             }
         })
@@ -6583,13 +7149,13 @@ fn remaining_evidence_from_model_timelines(
         rows.push(Row {
             timestamp: period_end,
             raw: None,
+            reset_boundary: false,
             synthetic_tail: true,
         });
     }
 
     let mut values = vec![None; rows.len()];
     let mut origins = vec![None; rows.len()];
-    let accepted_remaining = accepted_remaining_samples(samples, period_start, period_end);
     let mut minimum = None::<f64>;
     for (index, row) in rows.iter().enumerate() {
         let Some(raw) = row.raw else {
@@ -6603,24 +7169,17 @@ fn remaining_evidence_from_model_timelines(
             origins[index] = Some(GraphRemainingOrigin::MonotonicHold);
         } else {
             values[index] = Some(raw);
-            origins[index] = Some(GraphRemainingOrigin::Raw);
+            origins[index] = Some(if row.reset_boundary {
+                GraphRemainingOrigin::ResetBoundary
+            } else {
+                GraphRemainingOrigin::Raw
+            });
             minimum = Some(raw);
         }
     }
 
     let can_carry = |before: usize, after: usize| {
         after == before + 1 && rows[after].timestamp > rows[before].timestamp
-    };
-    let can_interpolate = |before: usize, after: usize| {
-        can_carry(before, after)
-            && rows[after].timestamp.saturating_sub(rows[before].timestamp)
-                <= MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS
-            && !graph_interval_has_hard_break(
-                rows[before].timestamp,
-                rows[after].timestamp,
-                confirmed_gaps,
-                correction_starts,
-            )
     };
     let mut run_start = 0;
     while run_start < rows.len() {
@@ -6642,44 +7201,35 @@ fn remaining_evidence_from_model_timelines(
         };
         let bounded = run_end < rows.len() && values[run_end].is_some();
         let mut interpolated = false;
-        if bounded && values[run_end].is_some_and(|right| right < left_value) {
-            let elapsed_seconds = rows[run_end].timestamp.saturating_sub(rows[left].timestamp);
-            if elapsed_seconds > 0 {
-                let right_value = values[run_end].expect("bounded value exists");
-                let segment_weights = (left..run_end)
-                    .map(|segment| {
-                        let elapsed = rows[segment + 1]
-                            .timestamp
-                            .saturating_sub(rows[segment].timestamp)
-                            as f64;
-                        let observed = can_interpolate(segment, segment + 1);
-                        let (available, advanced) = generic_model_interval_evidence(
-                            model_timelines,
-                            true,
-                            rows[segment].timestamp,
-                            rows[segment + 1].timestamp,
-                        );
-                        if observed && available && !advanced {
-                            0.0
-                        } else {
-                            elapsed
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let weighted_seconds = segment_weights.iter().sum::<f64>();
-                if weighted_seconds > f64::EPSILON {
-                    let mut weighted_elapsed = 0.0;
-                    for (offset, index) in (run_start..run_end).enumerate() {
-                        weighted_elapsed += segment_weights[offset];
-                        values[index] = Some(
-                            left_value
-                                + (right_value - left_value)
-                                    * (weighted_elapsed / weighted_seconds),
-                        );
-                        origins[index] = Some(GraphRemainingOrigin::Interpolated);
-                    }
-                    interpolated = true;
+        if bounded
+            && values[run_end].is_some_and(|right| right < left_value)
+            && rows[run_end].timestamp > rows[left].timestamp
+        {
+            let right_value = values[run_end].expect("bounded value exists");
+            let timestamps = rows[left..=run_end]
+                .iter()
+                .map(|row| row.timestamp)
+                .collect::<Vec<_>>();
+            let (segment_weights, _, _) = remaining_drop_distribution_weights(
+                &timestamps,
+                model_timelines,
+                confirmed_gaps,
+                correction_starts,
+            );
+            let total_weight = segment_weights.iter().sum::<f64>();
+            if total_weight > f64::EPSILON {
+                let mut cumulative_weight = 0.0;
+                for (offset, index) in (run_start..run_end).enumerate() {
+                    cumulative_weight += segment_weights[offset];
+                    values[index] = Some(
+                        left_value
+                            + (right_value - left_value) * (cumulative_weight / total_weight),
+                    );
+                    // A missing quota row is still inferred even when
+                    // its position is weighted by complete token data.
+                    origins[index] = Some(GraphRemainingOrigin::Interpolated);
                 }
+                interpolated = true;
             }
         }
         if !interpolated {
@@ -6704,9 +7254,12 @@ fn remaining_evidence_from_model_timelines(
     }
 
     // Remote quota observations often arrive as a staircase. Between two
-    // accepted change anchors, distribute the drop over measured token-active
-    // seconds only. Repeated raw samples stay available as evidence, while
-    // the presentation line remains horizontal throughout token-idle spans.
+    // accepted change anchors, distribute the drop in proportion to the
+    // complete, reliable per-model token deltas. This preserves the observed
+    // workload shape instead of inventing a constant time-based burn rate.
+    // If any token interval is unavailable or contradictory, the whole span
+    // uses an explicitly inferred elapsed-time bridge; raw quota anchors stay
+    // intact, but no part of that bridge is presented as measured smoothing.
     let change_anchors = rows
         .iter()
         .enumerate()
@@ -6745,55 +7298,49 @@ fn remaining_evidence_from_model_timelines(
         if crosses_remaining_anomaly {
             continue;
         }
-        let mut weighted_seconds = 0.0;
-        let mut activity = Vec::with_capacity(right - left);
-        for segment in *left..*right {
-            let observed = can_interpolate(segment, segment + 1);
-            let (available, advanced) = generic_model_interval_evidence(
-                model_timelines,
-                true,
-                rows[segment].timestamp,
-                rows[segment + 1].timestamp,
-            );
-            let elapsed = rows[segment + 1]
-                .timestamp
-                .saturating_sub(rows[segment].timestamp) as f64;
-            let inferred = !observed || !available;
-            let weight = if !inferred && !advanced { 0.0 } else { elapsed };
-            weighted_seconds += weight;
-            activity.push((weight, inferred));
-        }
-        if weighted_seconds <= f64::EPSILON {
+        let timestamps = rows[*left..=*right]
+            .iter()
+            .map(|row| row.timestamp)
+            .collect::<Vec<_>>();
+        let (weights, inferred_intervals, model_shaped) = remaining_drop_distribution_weights(
+            &timestamps,
+            model_timelines,
+            confirmed_gaps,
+            correction_starts,
+        );
+        let total_weight = weights.iter().sum::<f64>();
+        if total_weight <= f64::EPSILON {
             continue;
         }
-        let mut weighted_elapsed = 0.0;
+        let mut cumulative_weight = 0.0;
         for (offset, index) in ((*left + 1)..*right).enumerate() {
-            let (weight, inferred) = activity[offset];
-            weighted_elapsed += weight;
+            cumulative_weight += weights[offset];
             let smoothed =
-                left_value + (right_value - left_value) * (weighted_elapsed / weighted_seconds);
+                left_value + (right_value - left_value) * (cumulative_weight / total_weight);
+            let prior_value = values[index];
+            let prior_origin = origins[index];
             values[index] = Some(smoothed);
             let remains_exact_raw = rows[index].raw == Some(smoothed)
                 && accepted_remaining
                     .get(&rows[index].timestamp)
                     .is_some_and(|sample| sample.reliable);
-            if !remains_exact_raw {
+            let remains_exact_bounded_hold = rows[index].raw.is_none()
+                && prior_value == Some(smoothed)
+                && prior_origin == Some(GraphRemainingOrigin::BoundedNullHold);
+            if remains_exact_raw || remains_exact_bounded_hold {
+                continue;
+            }
+            if rows[index].raw.is_none()
+                || !model_shaped
+                || inferred_intervals.get(offset).copied().unwrap_or(true)
+            {
+                origins[index] = Some(GraphRemainingOrigin::Interpolated);
+            } else if !remains_exact_raw {
                 // A raw observation still exists at a normally smoothed
                 // staircase point. Keep that measured provenance distinct
                 // from a raw-null interpolation so presentation smoothing
                 // cannot be misreported as a recorder/API incident.
-                origins[index] = Some(
-                    if !inferred
-                        && rows[index].raw.is_some()
-                        && accepted_remaining
-                            .get(&rows[index].timestamp)
-                            .is_some_and(|sample| sample.reliable)
-                    {
-                        GraphRemainingOrigin::ActivitySmoothed
-                    } else {
-                        GraphRemainingOrigin::Interpolated
-                    },
-                );
+                origins[index] = Some(GraphRemainingOrigin::ActivitySmoothed);
             }
         }
     }
@@ -7302,49 +7849,148 @@ fn generic_model_interval_evidence(
     show_tokens: bool,
     start: i64,
     end: i64,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     if timelines.is_empty()
         || end <= start
         || end.saturating_sub(start) > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS
     {
-        return (false, false);
-    }
-    let before_names = timelines
-        .iter()
-        .filter(|(_, timeline)| timeline.get(&start).is_some_and(|point| point.published))
-        .map(|(name, _)| name.as_str())
-        .collect::<BTreeSet<_>>();
-    let after_names = timelines
-        .iter()
-        .filter(|(_, timeline)| timeline.get(&end).is_some_and(|point| point.published))
-        .map(|(name, _)| name.as_str())
-        .collect::<BTreeSet<_>>();
-    if before_names.is_empty() || before_names != after_names {
-        return (false, false);
+        return (false, false, true);
     }
     let mut advanced = false;
-    for name in before_names {
-        let timeline = &timelines[name];
+    let inferred = false;
+    for timeline in timelines.values() {
         let Some(before) = timeline.get(&start) else {
-            return (false, false);
+            return (false, false, true);
         };
         let Some(after) = timeline.get(&end) else {
-            return (false, false);
+            return (false, false, true);
         };
         let before = graph_model_value(before, show_tokens);
         let after = graph_model_value(after, show_tokens);
-        if !timeline[&start].reliable
-            || !timeline[&end].reliable
+        if !timeline[&start].origin.arithmetic_reliable()
+            || !timeline[&end].origin.arithmetic_reliable()
             || !before.is_finite()
             || !after.is_finite()
             || before < 0.0
             || after < 0.0
         {
-            return (false, false);
+            return (false, false, true);
         }
         advanced |= after > before;
     }
-    (true, advanced)
+    (true, advanced, inferred)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GraphProjectedTokenDelta {
+    delta: f64,
+    inferred: bool,
+    exact_zero: bool,
+}
+
+/// Returns a token delta only from direct observations. Display interpolation,
+/// legacy values and holds may draw their own dashed model segments, but they
+/// cannot become input evidence for a second quota prediction.
+fn projected_model_token_delta(
+    timelines: &GraphModelTimelines,
+    start: i64,
+    end: i64,
+    confirmed_gaps: &[GraphConfirmedGap],
+    correction_starts: &BTreeSet<i64>,
+) -> Option<GraphProjectedTokenDelta> {
+    if timelines.is_empty()
+        || end <= start
+        || graph_interval_has_hard_break(start, end, confirmed_gaps, correction_starts)
+    {
+        return None;
+    }
+    let mut total = 0.0;
+    let mut exact = true;
+    let mut inferred = end.saturating_sub(start) > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
+    for timeline in timelines.values() {
+        let before = timeline.get(&start)?;
+        let after = timeline.get(&end)?;
+        if !before.origin.display_weightable()
+            || !after.origin.display_weightable()
+            || !before.tokens.is_finite()
+            || !after.tokens.is_finite()
+            || before.tokens < 0.0
+            || after.tokens < before.tokens
+        {
+            return None;
+        }
+        total += after.tokens - before.tokens;
+        if !total.is_finite() {
+            return None;
+        }
+        exact &= before.origin.arithmetic_reliable() && after.origin.arithmetic_reliable();
+        inferred |= !before.origin.arithmetic_reliable() || !after.origin.arithmetic_reliable();
+    }
+    Some(GraphProjectedTokenDelta {
+        delta: total,
+        inferred,
+        exact_zero: exact && total <= f64::EPSILON,
+    })
+}
+
+/// Chooses one coherent weighting basis for a quota-drop span. A fully shaped
+/// span uses exact or theoretical token deltas. If any interval is unknown,
+/// elapsed time is used only among intervals not proven token-flat; a later
+/// gap therefore cannot smear a quota drop backwards through exact idle time.
+/// A quota drop with zero tokens everywhere is contradictory and falls back to
+/// a wholly inferred elapsed bridge instead of claiming idle.
+fn remaining_drop_distribution_weights(
+    timestamps: &[i64],
+    timelines: &GraphModelTimelines,
+    confirmed_gaps: &[GraphConfirmedGap],
+    correction_starts: &BTreeSet<i64>,
+) -> (Vec<f64>, Vec<bool>, bool) {
+    let elapsed = timestamps
+        .windows(2)
+        .map(|pair| pair[1].saturating_sub(pair[0]).max(0) as f64)
+        .collect::<Vec<_>>();
+    let token_deltas = timestamps
+        .windows(2)
+        .map(|pair| {
+            projected_model_token_delta(
+                timelines,
+                pair[0],
+                pair[1],
+                confirmed_gaps,
+                correction_starts,
+            )
+        })
+        .collect::<Vec<_>>();
+    if token_deltas.iter().all(Option::is_some) {
+        let projected = token_deltas
+            .iter()
+            .copied()
+            .map(|delta| delta.expect("all token deltas were checked"))
+            .collect::<Vec<_>>();
+        if projected.iter().map(|item| item.delta).sum::<f64>() > f64::EPSILON {
+            return (
+                projected.iter().map(|item| item.delta).collect(),
+                projected.iter().map(|item| item.inferred).collect(),
+                true,
+            );
+        }
+        return (elapsed, vec![true; token_deltas.len()], false);
+    }
+    let mut fallback = Vec::with_capacity(elapsed.len());
+    let mut inferred = Vec::with_capacity(elapsed.len());
+    for (duration, projection) in elapsed.iter().zip(&token_deltas) {
+        if projection.is_some_and(|item| item.exact_zero) {
+            fallback.push(0.0);
+            inferred.push(false);
+        } else {
+            fallback.push(*duration);
+            inferred.push(true);
+        }
+    }
+    if fallback.iter().sum::<f64>() <= f64::EPSILON {
+        return (elapsed, vec![true; token_deltas.len()], false);
+    }
+    (fallback, inferred, false)
 }
 
 /// Solid segments require matching, contiguous quota observations and a
@@ -7361,17 +8007,18 @@ fn remaining_paths_with_evidence(
     period_end: i64,
     confirmed_gaps: &[GraphConfirmedGap],
 ) -> (String, String) {
-    remaining_paths_with_boundaries(
+    let correction_starts = BTreeSet::new();
+    remaining_paths_with_boundaries(RemainingPathContext {
         points,
         samples,
         model_points,
         period_start,
         period_end,
         confirmed_gaps,
-        &BTreeSet::new(),
-        None,
-        None,
-    )
+        correction_starts: &correction_starts,
+        model_timelines: None,
+        remaining_evidence: None,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7442,14 +8089,20 @@ fn remaining_segments_with_boundaries_and_evidence(
                         samples,
                         after,
                     ) && quota_interval_is_contiguously_observed(samples, before.0, after.0);
-                let (model_evidence, model_advanced) = model_timelines.map_or_else(
-                    || model_interval_evidence(model_points, before.0, after.0),
+                let (model_evidence, model_advanced, model_inferred) = model_timelines.map_or_else(
+                    || {
+                        let (available, advanced) =
+                            model_interval_evidence(model_points, before.0, after.0);
+                        (available, advanced, false)
+                    },
                     |(timelines, show_tokens)| {
                         generic_model_interval_evidence(timelines, show_tokens, before.0, after.0)
                     },
                 );
                 let quota_decreased = after.1 < before.1;
-                if quota_evidence && (!quota_decreased || model_evidence && model_advanced) {
+                if quota_evidence
+                    && (!quota_decreased || model_evidence && model_advanced && !model_inferred)
+                {
                     GraphRemainingSegmentKind::Solid
                 } else {
                     GraphRemainingSegmentKind::Inferred
@@ -7480,10 +8133,12 @@ fn remaining_point_has_measured_quota(
         return false;
     }
     match item.origin {
-        GraphRemainingOrigin::Raw | GraphRemainingOrigin::ActivitySmoothed => item
+        GraphRemainingOrigin::Raw => item
             .raw
             .is_some_and(|raw| quota_point_is_observed(samples, point.0, raw)),
-        GraphRemainingOrigin::Interpolated
+        GraphRemainingOrigin::ResetBoundary
+        | GraphRemainingOrigin::ActivitySmoothed
+        | GraphRemainingOrigin::Interpolated
         | GraphRemainingOrigin::BoundedNullHold
         | GraphRemainingOrigin::TerminalNullHold
         | GraphRemainingOrigin::SyntheticTailHold
@@ -7491,17 +8146,30 @@ fn remaining_point_has_measured_quota(
     }
 }
 
-fn remaining_paths_with_boundaries(
-    points: &[(i64, f64)],
-    samples: &[&UsageHistorySample],
-    model_points: &[HourlyModelSpend],
+struct RemainingPathContext<'a> {
+    points: &'a [(i64, f64)],
+    samples: &'a [&'a UsageHistorySample],
+    model_points: &'a [HourlyModelSpend],
     period_start: i64,
     period_end: i64,
-    confirmed_gaps: &[GraphConfirmedGap],
-    correction_starts: &BTreeSet<i64>,
-    model_timelines: Option<(&GraphModelTimelines, bool)>,
-    remaining_evidence: Option<&[GraphRemainingEvidence]>,
-) -> (String, String) {
+    confirmed_gaps: &'a [GraphConfirmedGap],
+    correction_starts: &'a BTreeSet<i64>,
+    model_timelines: Option<(&'a GraphModelTimelines, bool)>,
+    remaining_evidence: Option<&'a [GraphRemainingEvidence]>,
+}
+
+fn remaining_paths_with_boundaries(context: RemainingPathContext<'_>) -> (String, String) {
+    let RemainingPathContext {
+        points,
+        samples,
+        model_points,
+        period_start,
+        period_end,
+        confirmed_gaps,
+        correction_starts,
+        model_timelines,
+        remaining_evidence,
+    } = context;
     let span = (period_end - period_start).max(1) as f64;
     let coordinate = |(timestamp, raw): (i64, f64)| {
         let x = ((timestamp - period_start) as f64 / span * 100.0).clamp(0.0, 100.0);
@@ -7619,6 +8287,7 @@ fn smooth_model_spend(points: &[HourlyModelSpend]) -> Vec<HourlyModelSpend> {
     smoothed
 }
 
+#[cfg(test)]
 fn local_sessions_root() -> Option<PathBuf> {
     codex_home_root().map(|root| root.join("sessions"))
 }
@@ -7632,10 +8301,12 @@ fn codex_home_root() -> Option<PathBuf> {
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct SessionTraversalBudget {
     files: usize,
 }
 
+#[cfg(test)]
 impl SessionTraversalBudget {
     fn admit_file(
         &mut self,
@@ -7660,6 +8331,7 @@ impl SessionTraversalBudget {
     }
 }
 
+#[cfg(test)]
 fn session_jsonl_files(root: &Path) -> Result<Vec<PathBuf>, security::SecurityError> {
     fn visit(
         directory: &Path,
@@ -7714,6 +8386,7 @@ fn session_jsonl_files(root: &Path) -> Result<Vec<PathBuf>, security::SecurityEr
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct LocalInputFileFingerprint {
     path: PathBuf,
     length: u64,
@@ -7725,19 +8398,23 @@ struct LocalInputFileFingerprint {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct LocalInputFingerprint {
     session_files: Vec<LocalInputFileFingerprint>,
     recovery_file: Option<LocalInputFileFingerprint>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct SessionFileCandidate {
     fingerprint: LocalInputFileFingerprint,
     recorded_source: usage_store::RecordedSessionSource,
 }
 
+#[cfg(test)]
 type SessionInventoryKey = (String, String);
 
+#[cfg(test)]
 fn session_inventory_key(candidate: &SessionFileCandidate) -> SessionInventoryKey {
     (
         candidate.recorded_source.root_identity.clone(),
@@ -7745,6 +8422,7 @@ fn session_inventory_key(candidate: &SessionFileCandidate) -> SessionInventoryKe
     )
 }
 
+#[cfg(test)]
 fn session_inventory_keys(inventory: &LocalInputInventory) -> BTreeSet<SessionInventoryKey> {
     inventory
         .selected_session_files
@@ -7755,6 +8433,7 @@ fn session_inventory_keys(inventory: &LocalInputInventory) -> BTreeSet<SessionIn
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct SessionCleanupPlan {
     sessions_root: PathBuf,
     selected_paths: BTreeSet<PathBuf>,
@@ -7762,6 +8441,7 @@ struct SessionCleanupPlan {
 }
 
 #[derive(Clone)]
+#[cfg(test)]
 struct LocalInputInventory {
     selected_session_files: Vec<SessionFileCandidate>,
     overflow_session_files: Vec<SessionFileCandidate>,
@@ -7771,6 +8451,7 @@ struct LocalInputInventory {
     fingerprint: LocalInputFingerprint,
 }
 
+#[cfg(test)]
 fn local_input_file_fingerprint(
     path: &Path,
     metadata: &fs::Metadata,
@@ -7803,6 +8484,7 @@ fn local_input_file_fingerprint(
     })
 }
 
+#[cfg(test)]
 fn session_root_identity(
     root: &Path,
     metadata: &fs::Metadata,
@@ -7827,6 +8509,7 @@ fn session_root_identity(
     }
 }
 
+#[cfg(test)]
 fn recorded_session_source(
     sessions_root: &Path,
     root_identity: &str,
@@ -7865,6 +8548,7 @@ fn recorded_session_source(
     })
 }
 
+#[cfg(test)]
 fn select_latest_session_prefix(
     mut files: Vec<SessionFileCandidate>,
     selected_byte_limit: u64,
@@ -7897,6 +8581,7 @@ fn select_latest_session_prefix(
     Ok((selected, overflow))
 }
 
+#[cfg(test)]
 fn local_input_inventory_for_paths(
     sessions_root: Option<&Path>,
     recovery_path: Option<PathBuf>,
@@ -7908,6 +8593,7 @@ fn local_input_inventory_for_paths(
     )
 }
 
+#[cfg(test)]
 fn local_input_inventory_for_paths_with_limit(
     sessions_root: Option<&Path>,
     recovery_path: Option<PathBuf>,
@@ -7994,6 +8680,7 @@ fn local_input_inventory_for_paths_with_limit(
     })
 }
 
+#[cfg(test)]
 fn local_input_inventory() -> Result<LocalInputInventory, security::SecurityError> {
     let sessions_root = local_sessions_root();
     // The profile-wide delegation recovery log has no durable account
@@ -8003,6 +8690,7 @@ fn local_input_inventory() -> Result<LocalInputInventory, security::SecurityErro
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 struct LocalUsageCollection {
     model_usage: ModelUsageTotals,
     model_totals_complete: bool,
@@ -8017,6 +8705,7 @@ struct LocalUsageCollection {
     cleanup_plan: Option<SessionCleanupPlan>,
 }
 
+#[cfg(test)]
 impl LocalUsageCollection {
     fn mark_model_totals_incomplete(&mut self) {
         self.model_totals_complete = false;
@@ -8030,6 +8719,7 @@ impl LocalUsageCollection {
     }
 }
 
+#[cfg(test)]
 fn apply_regression_recovery(
     collection: &mut LocalUsageCollection,
     recovered: ModelUsageTotals,
@@ -8093,6 +8783,7 @@ fn apply_regression_recovery(
 /// Apply a source-proven cumulative baseline to the newly collected current
 /// vector. Historical rows deliberately stay raw: the durable recovery marker
 /// owns their bounded read projection after the recorder commits atomically.
+#[cfg(test)]
 fn apply_cumulative_recovery_to_current(
     collection: &mut LocalUsageCollection,
     recovery: &usage_store::SessionCumulativeRecovery,
@@ -8110,6 +8801,7 @@ fn apply_cumulative_recovery_to_current(
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 struct QuotaGenerationRecoveryPlan {
     source_state: usage_store::SessionCollectionState,
     collection_state: usage_store::SessionCollectionState,
@@ -8117,6 +8809,7 @@ struct QuotaGenerationRecoveryPlan {
     cumulative_recovery: usage_store::SessionCumulativeRecovery,
 }
 
+#[cfg(test)]
 fn load_quota_generation_recovery_plan(
     partition: &account_scope::AccountPartition,
     current: &usage_store::SessionCollectionState,
@@ -8192,6 +8885,7 @@ fn load_quota_generation_recovery_plan(
     })
 }
 
+#[cfg(test)]
 fn load_started_boundary_collection_state(
     partition: &account_scope::AccountPartition,
     current_generation: u64,
@@ -8231,6 +8925,7 @@ fn load_started_boundary_collection_state(
     Some(selected)
 }
 
+#[cfg(test)]
 fn load_regression_recovery_state(
     partition: &account_scope::AccountPartition,
     current: &usage_store::SessionCollectionState,
@@ -8297,6 +8992,7 @@ fn load_regression_recovery_state(
     selected
 }
 
+#[cfg(test)]
 fn cleanup_plan_for_inventory(inventory: &LocalInputInventory) -> Option<SessionCleanupPlan> {
     let sessions_root = inventory.sessions_root.clone()?;
     if inventory.overflow_session_files.is_empty() {
@@ -8425,6 +9121,7 @@ impl DelegationUsageRecoveryEntry {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 fn read_recovery_entries_for_ranges(
     path: &Path,
     window_start: i64,
@@ -8486,6 +9183,7 @@ fn read_recovery_entries_for_ranges(
 }
 
 #[cfg(test)]
+#[cfg(test)]
 fn collect_recovery_usage(
     path: Option<&Path>,
     window_start: i64,
@@ -8517,16 +9215,19 @@ fn collect_recovery_usage(
 }
 
 #[derive(Clone)]
+#[cfg(test)]
 struct TimedModelUsage {
     timestamp: i64,
     model: String,
     delta: TokenSnapshot,
 }
 
+#[cfg(test)]
 fn canonical_session_minute(timestamp: i64) -> i64 {
     timestamp.div_euclid(60) * 60
 }
 
+#[cfg(test)]
 fn timeline_model_totals_with_usage(
     mut totals: Vec<usage_store::SessionModelTotal>,
 ) -> Option<Vec<usage_store::SessionModelTotal>> {
@@ -8535,6 +9236,7 @@ fn timeline_model_totals_with_usage(
     (!totals.is_empty()).then_some(totals)
 }
 
+#[cfg(test)]
 fn timeline_current_model_totals(
     totals: &ModelUsageTotals,
     source_totals: &[usage_store::SessionModelTotal],
@@ -8554,17 +9256,34 @@ fn timeline_current_model_totals(
     current
 }
 
-fn build_session_timeline_recovery(
-    events: &[TimedModelUsage],
+#[cfg(test)]
+struct SessionTimelineRecoveryContext<'a> {
+    events: &'a [TimedModelUsage],
     reset_at: i64,
     window_seconds: i64,
     timeline_end: i64,
-    collection_state: &usage_store::SessionCollectionState,
-    ranges: &[usage_store::SessionRange],
+    collection_state: &'a usage_store::SessionCollectionState,
+    ranges: &'a [usage_store::SessionRange],
     collector_epoch: u128,
     cycle_seq: u64,
-    collected_totals: &ModelUsageTotals,
+    collected_totals: &'a ModelUsageTotals,
+}
+
+#[cfg(test)]
+fn build_session_timeline_recovery(
+    context: SessionTimelineRecoveryContext<'_>,
 ) -> Result<Option<usage_store::SessionTimelineRecovery>, security::SecurityError> {
+    let SessionTimelineRecoveryContext {
+        events,
+        reset_at,
+        window_seconds,
+        timeline_end,
+        collection_state,
+        ranges,
+        collector_epoch,
+        cycle_seq,
+        collected_totals,
+    } = context;
     if collection_state.data_generation == 0 || ranges.is_empty() {
         return Ok(None);
     }
@@ -8694,6 +9413,7 @@ fn build_session_timeline_recovery(
 /// own bounded contract and consumes malformed lines before continuing.
 #[cfg(test)]
 const SESSION_RECORD_INITIAL_CAPACITY: usize = 8 * 1024;
+#[cfg(test)]
 const SESSION_APPEND_BYTES_PER_CYCLE: u64 = 64 * 1024 * 1024;
 
 #[cfg(test)]
@@ -8762,12 +9482,14 @@ fn read_recoverable_session_record_into<R: BufRead>(
 /// `BufRead` source while only the fields needed for usage attribution are
 /// retained.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum SessionRecordParseError {
     Syntax,
     Io,
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 enum SessionRecordStatus {
     End,
     Present(Box<SessionRecordSummary>),
@@ -8775,6 +9497,7 @@ enum SessionRecordStatus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum SessionJsonKey {
     Type,
     Timestamp,
@@ -8791,6 +9514,7 @@ enum SessionJsonKey {
     Other,
 }
 
+#[cfg(test)]
 const SESSION_JSON_KEYS: [(&[u8], SessionJsonKey); 12] = [
     (b"type", SessionJsonKey::Type),
     (b"timestamp", SessionJsonKey::Timestamp),
@@ -8810,6 +9534,7 @@ const SESSION_JSON_KEYS: [(&[u8], SessionJsonKey); 12] = [
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum SessionJsonObject {
     Root,
     Payload,
@@ -8819,6 +9544,7 @@ enum SessionJsonObject {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 struct SessionTokenUsageSummary {
     total: Option<u64>,
     cache_write_input: Option<u64>,
@@ -8829,6 +9555,7 @@ struct SessionTokenUsageSummary {
     malformed: bool,
 }
 
+#[cfg(test)]
 impl SessionTokenUsageSummary {
     fn snapshot(&self) -> Option<TokenSnapshot> {
         Some(TokenSnapshot {
@@ -8842,6 +9569,7 @@ impl SessionTokenUsageSummary {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 struct SessionPayloadSummary {
     event_type: Option<String>,
     model: Option<String>,
@@ -8861,6 +9589,7 @@ struct SessionPayloadSummary {
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 struct SessionRecordSummary {
     outer_type: Option<String>,
     timestamp: Option<String>,
@@ -8874,6 +9603,7 @@ struct SessionRecordSummary {
     payload: SessionPayloadSummary,
 }
 
+#[cfg(test)]
 impl SessionRecordSummary {
     fn event_type(&self) -> Option<&str> {
         match self.outer_type.as_deref() {
@@ -8968,6 +9698,7 @@ impl SessionRecordSummary {
     }
 }
 
+#[cfg(test)]
 struct SessionRecordInput<'a, R: BufRead> {
     reader: &'a mut R,
     saw_bytes: bool,
@@ -8976,6 +9707,7 @@ struct SessionRecordInput<'a, R: BufRead> {
     depth: usize,
 }
 
+#[cfg(test)]
 impl<'a, R: BufRead> SessionRecordInput<'a, R> {
     fn new(reader: &'a mut R) -> Self {
         Self {
@@ -9647,6 +10379,7 @@ impl<'a, R: BufRead> SessionRecordInput<'a, R> {
     }
 }
 
+#[cfg(test)]
 fn read_streaming_session_record<R: BufRead>(
     reader: &mut R,
 ) -> Result<SessionRecordStatus, security::SecurityError> {
@@ -9689,6 +10422,7 @@ fn read_streaming_session_record<R: BufRead>(
     ))
 }
 
+#[cfg(test)]
 #[cfg(test)]
 fn read_recoverable_session_line<R: BufRead>(
     reader: &mut R,
@@ -9778,6 +10512,7 @@ fn session_token_snapshot(value: &Value) -> Option<TokenSnapshot> {
     })
 }
 
+#[cfg(test)]
 fn collect_session_usage_records<R: BufRead>(
     reader: &mut R,
     window_start: i64,
@@ -9844,6 +10579,7 @@ fn collect_session_usage_records<R: BufRead>(
 }
 
 #[cfg(test)]
+#[cfg(test)]
 fn model_usage_timeline_from_events(
     events: Vec<TimedModelUsage>,
     reset_at: i64,
@@ -9851,6 +10587,7 @@ fn model_usage_timeline_from_events(
     model_usage_timeline_from_events_with_initial(events, reset_at, ModelUsageTotals::default())
 }
 
+#[cfg(test)]
 #[cfg(test)]
 fn model_usage_timeline_from_events_with_initial(
     events: Vec<TimedModelUsage>,
@@ -9860,6 +10597,7 @@ fn model_usage_timeline_from_events_with_initial(
     model_usage_timeline_with_models_from_events_with_initial(events, reset_at, totals, true).0
 }
 
+#[cfg(test)]
 fn model_usage_timeline_with_models_from_events_with_initial(
     mut events: Vec<TimedModelUsage>,
     reset_at: i64,
@@ -9898,6 +10636,7 @@ fn model_usage_timeline_with_models_from_events_with_initial(
     (samples, model_history)
 }
 
+#[cfg(test)]
 fn discard_session_partial_tail<R: BufRead>(
     reader: &mut R,
 ) -> Result<bool, security::SecurityError> {
@@ -9917,6 +10656,7 @@ fn discard_session_partial_tail<R: BufRead>(
     }
 }
 
+#[cfg(test)]
 fn sha256_file_range(
     file: &mut File,
     start_offset: u64,
@@ -9949,6 +10689,7 @@ fn sha256_file_range(
     Ok(hex::encode(hasher.finalize()))
 }
 
+#[cfg(test)]
 fn session_file_has_partial_tail(
     file: &mut File,
     file_bytes: u64,
@@ -9964,6 +10705,7 @@ fn session_file_has_partial_tail(
     Ok(last[0] != b'\n')
 }
 
+#[cfg(test)]
 fn session_prefix_generation(
     collector_epoch: u128,
     source: &usage_store::RecordedSessionSource,
@@ -9984,6 +10726,7 @@ fn session_prefix_generation(
     u128::from_be_bytes(generation).max(1)
 }
 
+#[cfg(test)]
 fn session_boundary_lineage(
     collector_epoch: u128,
     source: &usage_store::RecordedSessionSource,
@@ -10018,6 +10761,7 @@ fn session_boundary_lineage(
 }
 
 #[derive(Clone, Copy)]
+#[cfg(test)]
 struct SessionAppendContext {
     baseline_existing: bool,
     allow_prior_continuity: bool,
@@ -10028,6 +10772,7 @@ struct SessionAppendContext {
     max_append_bytes: u64,
 }
 
+#[cfg(test)]
 struct SessionAppendResult {
     checkpoint: usage_store::SessionCheckpoint,
     range: Option<usage_store::SessionRange>,
@@ -10036,6 +10781,7 @@ struct SessionAppendResult {
     source_complete: bool,
 }
 
+#[cfg(test)]
 fn same_session_checkpoint_state(
     left: &usage_store::SessionCheckpoint,
     right: &usage_store::SessionCheckpoint,
@@ -10059,6 +10805,7 @@ fn same_session_checkpoint_state(
         && left.previous_cache_write_input == right.previous_cache_write_input
 }
 
+#[cfg(test)]
 fn session_source_complete(
     end_offset: u64,
     candidate_length: u64,
@@ -10068,6 +10815,7 @@ fn session_source_complete(
     end_offset == candidate_length && observed_length == candidate_length && !discard_until_lf
 }
 
+#[cfg(test)]
 fn collect_session_append(
     candidate: &SessionFileCandidate,
     prior: Option<&usage_store::SessionCheckpoint>,
@@ -10363,6 +11111,7 @@ fn collect_session_append(
 }
 
 #[derive(Clone, Copy)]
+#[cfg(test)]
 struct IncrementalSessionContext {
     reset_at: i64,
     window_seconds: i64,
@@ -10371,6 +11120,7 @@ struct IncrementalSessionContext {
     cycle_seq: u64,
 }
 
+#[cfg(test)]
 fn collect_incremental_local_usage(
     inventory: &LocalInputInventory,
     collection_state: &usage_store::SessionCollectionState,
@@ -10386,6 +11136,7 @@ fn collect_incremental_local_usage(
     )
 }
 
+#[cfg(test)]
 fn collect_incremental_local_usage_with_budget(
     inventory: &LocalInputInventory,
     collection_state: &usage_store::SessionCollectionState,
@@ -10530,17 +11281,17 @@ fn collect_incremental_local_usage_with_budget(
         }
     }
     model_totals_complete &= processed_sources == inventory.selected_session_files.len();
-    let timeline_recovery = build_session_timeline_recovery(
-        &events,
+    let timeline_recovery = build_session_timeline_recovery(SessionTimelineRecoveryContext {
+        events: &events,
         reset_at,
         window_seconds,
         timeline_end,
         collection_state,
-        &ranges,
+        ranges: &ranges,
         collector_epoch,
         cycle_seq,
-        &totals,
-    )?;
+        collected_totals: &totals,
+    })?;
     let (history_samples, history_model_totals) = if timeline_recovery.is_some() {
         // The timeline marker projects the exact accepted ranges over the
         // entire catch-up window. Keeping ordinary samples from those same
@@ -10578,6 +11329,7 @@ fn collect_incremental_local_usage_with_budget(
 }
 
 #[cfg(test)]
+#[cfg(test)]
 fn collect_session_usage_file(
     path: &Path,
     window_start: i64,
@@ -10595,6 +11347,7 @@ fn collect_session_usage_file(
     .map(|_| ())
 }
 
+#[cfg(test)]
 #[cfg(test)]
 fn collect_session_usage_file_with_recordability(
     path: &Path,
@@ -10650,6 +11403,7 @@ fn collect_session_usage_file_with_recordability(
     Ok(fully_recordable)
 }
 
+#[cfg(test)]
 fn recover_checkpointed_history_model_totals(
     inventory: &LocalInputInventory,
     recovery: &usage_store::HistoryContinuityRecovery,
@@ -10873,6 +11627,7 @@ impl AppServerBridge<AccountCommand, Event> {
     }
 }
 
+#[cfg(test)]
 impl AppServerBridge<ThreadCommand, ThreadEvent> {
     fn start() -> Self {
         let (tx, commands) = mpsc::channel::<ThreadCommand>();
@@ -10882,12 +11637,15 @@ impl AppServerBridge<ThreadCommand, ThreadEvent> {
     }
 }
 
+#[cfg(test)]
 struct LocalUsageBridge {
     tx: Sender<LocalCommand>,
     rx: Receiver<LocalEvent>,
 }
 
+#[cfg(test)]
 impl LocalUsageBridge {
+    #[cfg(test)]
     fn start() -> Self {
         let (tx, commands) = mpsc::channel::<LocalCommand>();
         let (events, rx) = mpsc::channel::<LocalEvent>();
@@ -10901,6 +11659,7 @@ impl LocalUsageBridge {
         Self { tx, rx }
     }
 
+    #[cfg(test)]
     fn send(&self, command: LocalCommand) -> bool {
         self.tx.send(command).is_ok()
     }
@@ -11127,6 +11886,7 @@ fn start_account_app_server(
     Err(last_error)
 }
 
+#[cfg(test)]
 fn fallback_account_cycle_complete(global_fallback: bool, command: &AccountCommand) -> bool {
     global_fallback && matches!(command, AccountCommand::FinishFallback)
 }
@@ -11155,11 +11915,15 @@ fn account_server_worker(
     debug_runtime("account worker ready");
     let mut id = 2u64;
     while let Ok(command) = commands.recv() {
+        #[cfg(test)]
         let finish_fallback = fallback_account_cycle_complete(global_fallback, &command);
+        #[cfg(not(test))]
+        let _ = global_fallback;
         match command {
             AccountCommand::Stop => {
                 break;
             }
+            #[cfg(test)]
             AccountCommand::FinishFallback => {
                 // Isolated workers persist across cycles; this command only
                 // closes the single unconfirmed global fallback cycle.
@@ -11208,6 +11972,7 @@ fn account_server_worker(
                 };
                 id = next_id;
             }
+            #[cfg(test)]
             AccountCommand::Read => {
                 debug_runtime("account read requested");
                 let generation_before = account_updates.generation;
@@ -11395,6 +12160,7 @@ fn account_server_worker(
                 }
             }
         }
+        #[cfg(test)]
         if finish_fallback {
             break;
         }
@@ -11402,6 +12168,7 @@ fn account_server_worker(
     server.shutdown();
 }
 
+#[cfg(test)]
 fn start_app_server(deadline: Instant) -> Result<RunningAppServer, String> {
     let Some(codex) = resolved_executable("CODEX_INFO_CODEX_BIN", "codex") else {
         return Err("Codex app-serverの安全な実行ファイルを確認できません。".into());
@@ -11427,6 +12194,7 @@ fn start_app_server(deadline: Instant) -> Result<RunningAppServer, String> {
     Ok(server)
 }
 
+#[cfg(test)]
 fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<ThreadEvent>) {
     debug_runtime("thread worker starting");
     // The thread bridge is lazy: construction of CodexInfoState does not issue
@@ -11527,16 +12295,17 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
                 let Some(server_ref) = server.as_mut() else {
                     continue;
                 };
-                let update = fetch_active_thread_update(
-                    &mut server_ref.input,
-                    &server_ref.output,
-                    &mut next_id,
-                    &sessions_root,
-                    &active_paths,
+                let mut context = ActiveThreadUpdateContext {
+                    input: &mut server_ref.input,
+                    output: &server_ref.output,
+                    next_id: &mut next_id,
+                    sessions_root: &sessions_root,
+                    active_paths: &active_paths,
                     deadline,
-                    &mut rollout_cache,
-                    &durable_checkpoints,
-                );
+                    rollout_cache: &mut rollout_cache,
+                    checkpoints: &durable_checkpoints,
+                };
+                let update = fetch_active_thread_update(&mut context);
                 if update == ActiveThreadUpdate::Failed {
                     debug_runtime("thread read failed");
                     let _ = events.send(ThreadEvent::Error {
@@ -11572,6 +12341,7 @@ fn thread_server_worker(commands: Receiver<ThreadCommand>, events: Sender<Thread
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct LocalUsageCache {
     partitioned_collector_epoch: Option<u128>,
     verified_session_inventory: BTreeSet<SessionInventoryKey>,
@@ -11584,6 +12354,7 @@ struct LocalUsageCache {
     legacy_model_usage: ModelUsageTotals,
 }
 
+#[cfg(test)]
 struct PartitionedLocalCollection {
     reset_at: i64,
     window_seconds: i64,
@@ -11593,6 +12364,7 @@ struct PartitionedLocalCollection {
     cycle_seq: u64,
 }
 
+#[cfg(test)]
 impl LocalUsageCache {
     fn collect_partitioned(
         &mut self,
@@ -11691,6 +12463,7 @@ impl LocalUsageCache {
     }
 }
 
+#[cfg(test)]
 fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEvent>) {
     debug_runtime("local usage worker starting");
     let mut cache = LocalUsageCache::default();
@@ -11710,6 +12483,8 @@ fn local_usage_worker(commands: Receiver<LocalCommand>, events: Sender<LocalEven
                 reset_at,
                 window_seconds,
             } => {
+                let history_continuity_recovery = *history_continuity_recovery;
+                let cumulative_recovery = *cumulative_recovery;
                 debug_runtime(format!(
                     "local collect requested epoch={auth_epoch} reset_at={reset_at} window_seconds={window_seconds}"
                 ));
@@ -12079,6 +12854,7 @@ fn request_with_timeout_observed(
 }
 
 #[derive(Clone, Debug, Default)]
+#[cfg(test)]
 struct PendingRecorderBatch {
     auth_epoch: Option<u64>,
     admission: Option<AccountAdmission>,
@@ -12101,6 +12877,7 @@ struct PendingRecorderBatch {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 struct AcknowledgedRecorderCommit {
     auth_epoch: u64,
     partition_id: String,
@@ -12110,6 +12887,7 @@ struct AcknowledgedRecorderCommit {
     last_commit_unix: i64,
 }
 
+#[cfg(test)]
 impl PendingRecorderBatch {
     fn is_empty(&self) -> bool {
         self.samples.is_empty()
@@ -12134,15 +12912,45 @@ struct StagedServiceCurrentBundle {
     active_threads: Vec<ActiveThread>,
 }
 
+/// The v3 account directory exposes stable public ids, lifecycle boundaries,
+/// and an optional bounded display-only login id. It never carries tokens,
+/// account-scope hashes, filesystem paths, or backend authority values.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ServiceAccountV3 {
+    id: String,
+    is_current: bool,
+    activation_at: Option<i64>,
+    deactivation_at: Option<i64>,
+    login_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ServiceAccountsV3Document {
+    api_version: String,
+    default_account_id: String,
+    accounts: Vec<ServiceAccountV3>,
+}
+
+const MAX_SERVICE_ACCOUNTS: usize = 256;
+
 struct CodexInfoState {
     i18n: I18n,
     bridge: AppServerBridge<AccountCommand, Event>,
+    #[cfg(test)]
     thread_bridge: Option<AppServerBridge<ThreadCommand, ThreadEvent>>,
+    #[cfg(test)]
     local_bridge: LocalUsageBridge,
+    #[cfg(test)]
     auth_epoch: u64,
+    #[cfg(test)]
     auth_epoch_valid: bool,
+    #[cfg(test)]
     account_key: Option<account_scope::AccountKey>,
+    #[cfg(test)]
     account_update_generation: u64,
+    #[cfg(test)]
     account_partition: Option<account_scope::AccountPartition>,
     global_account_fallback_available: bool,
     email: Option<String>,
@@ -12168,17 +12976,29 @@ struct CodexInfoState {
     estimated_cost_label: String,
     history: UsageHistory,
     history_gaps: Vec<PublicHistoryGap>,
+    #[cfg(test)]
     pending_recorded_sessions: Vec<usage_store::RecordedSessionSource>,
+    #[cfg(test)]
     pending_session_checkpoints: Vec<usage_store::SessionCheckpoint>,
+    #[cfg(test)]
     pending_session_ranges: Vec<usage_store::SessionRange>,
+    #[cfg(test)]
     pending_session_model_totals: Vec<usage_store::SessionModelTotal>,
+    #[cfg(test)]
     pending_history_continuity_recovery: Option<usage_store::HistoryContinuityModelRecovery>,
+    #[cfg(test)]
     pending_cumulative_recovery: Option<usage_store::SessionCumulativeRecovery>,
+    #[cfg(test)]
     pending_timeline_recovery: Option<usage_store::SessionTimelineRecovery>,
+    #[cfg(test)]
     pending_collector_generation: Option<(u128, u64)>,
+    #[cfg(test)]
     pending_session_period: Option<(i64, i64)>,
+    #[cfg(test)]
     pending_recorder_admission: Option<(u64, AccountAdmission)>,
+    #[cfg(test)]
     pending_session_cleanup: Vec<SessionCleanupPlan>,
+    #[cfg(test)]
     pending_quota_source_rescan_complete: bool,
     selected_reset_at: Option<i64>,
     selected_history_period: String,
@@ -12197,19 +13017,23 @@ struct CodexInfoState {
     /// Whether the in-flight local scan follows an accepted quota sample.
     /// Rejected remote candidates may not be stamped onto durable history.
     pending_quota_observation_confirmed: bool,
+    #[cfg(test)]
     pending_local_verification: Option<LocalUsageCandidate>,
     /// A completed snapshot remains visible while a later quota-only refresh
     /// collects the next local payload. This is cleared only with account
     /// identity, never at each periodic refresh or reset timestamp update.
     usage_snapshot_committed: bool,
+    #[cfg(test)]
     last_thread_poll: Instant,
     /// The last persisted reset period is enough to backfill local session
     /// usage while app-server/REST is unavailable. It is never exposed until
     /// a fresh authenticated quota snapshot is committed.
+    #[cfg(test)]
     recovery_period: Option<(i64, i64)>,
     /// The single local collector lane is scheduled independently of account
     /// availability. This timestamp throttles that same lane during an
     /// app-server outage; it does not introduce a second scanner.
+    #[cfg(test)]
     last_local_poll: Instant,
     /// In UI mode, the service listener is the single owner of the visible
     /// snapshot. Keep a failed selected endpoint latched until that same
@@ -12247,6 +13071,10 @@ struct CodexInfoState {
     service_history_samples: Vec<PublicHistoryObservationV3>,
     service_history_pair: Option<String>,
     service_history_period_id: Option<String>,
+    /// A manual period choice is only a request until its complete page set
+    /// validates. The committed selection and graph remain last-good.
+    service_history_pending_reset_at: Option<i64>,
+    service_history_pending_failures: u8,
     service_history_cursor: Option<String>,
     /// The saved cursor still belongs to the last-good scene, but the next
     /// candidate must start at the selected period head after a proven stale
@@ -12259,6 +13087,18 @@ struct CodexInfoState {
     service_threads_last_poll: Instant,
     service_threads_force_poll: bool,
     service_threads_error: Option<String>,
+    /// Account metadata is a separate small v3 resource. The list is kept as
+    /// the last-good selector authority while current/history/threads are
+    /// replaced atomically for the selected public id.
+    service_accounts: Vec<ServiceAccountV3>,
+    service_default_account_id: Option<String>,
+    service_selected_account_id: Option<String>,
+    service_accounts_supported: bool,
+    service_accounts_known: bool,
+    service_accounts_last_poll: Instant,
+    service_accounts_force_poll: bool,
+    service_accounts_error: Option<String>,
+    #[cfg(test)]
     acknowledged_recorder_commit: Option<AcknowledgedRecorderCommit>,
 }
 
@@ -12345,6 +13185,7 @@ fn stage_service_current_bundle(
     }))
 }
 
+#[cfg(test)]
 fn local_account_authority_matches(
     current_admission: Option<&AccountAdmission>,
     expected_admission: &AccountAdmission,
@@ -12355,6 +13196,17 @@ fn local_account_authority_matches(
     current_admission == Some(expected_admission)
         && state_account_key.is_some_and(|current| current.same_account(expected_account_key))
         && local_account_key.is_some_and(|current| current.same_account(expected_account_key))
+}
+
+#[cfg(test)]
+struct LocalUsageErrorContext {
+    auth_epoch: u64,
+    admission: Option<AccountAdmission>,
+    reset_at: i64,
+    window_seconds: i64,
+    collector_epoch: Option<u128>,
+    cycle_seq: Option<u64>,
+    durable_model_totals: Vec<usage_store::SessionModelTotal>,
 }
 
 impl CodexInfoState {
@@ -12389,11 +13241,10 @@ impl CodexInfoState {
             return true;
         }
 
-        // The resident producer may publish local usage only after its own
-        // account-partition transaction has been acknowledged. This private
-        // proof never crosses the REST boundary; clients trust the complete
-        // published root above rather than inventing a second wire identity.
-        let recorder_commit_current =
+        #[cfg(test)]
+        {
+            // The retired resident producer could publish local usage only
+            // after its own account-partition transaction was acknowledged.
             self.acknowledged_recorder_commit
                 .as_ref()
                 .is_some_and(|commit| {
@@ -12410,8 +13261,10 @@ impl CodexInfoState {
                         && commit.last_commit_unix <= now
                         && now.saturating_sub(commit.last_commit_unix)
                             <= daemon::RECORDER_LAST_COMMIT_MAX_AGE_SECS
-                });
-        recorder_commit_current
+                })
+        }
+        #[cfg(not(test))]
+        false
     }
 
     fn has_visible_usage(&self) -> bool {
@@ -12429,10 +13282,12 @@ impl CodexInfoState {
         self.public_details_candidate_at(now)
     }
 
+    #[cfg(test)]
     fn public_details_candidates(&self) -> (PublicDetails, PublicDetailsV2, PublicDetailsV3) {
         self.public_details_candidates_at(Utc::now().timestamp())
     }
 
+    #[cfg(test)]
     fn public_details_candidates_at(
         &self,
         now: i64,
@@ -12447,6 +13302,7 @@ impl CodexInfoState {
         (v1, v2, v3)
     }
 
+    #[cfg(test)]
     fn public_details_v3_from_v2(&self, v2: PublicDetailsV2) -> PublicDetailsV3 {
         let mut models = if self.authenticated && self.has_visible_usage() {
             self.model_usage
@@ -12483,12 +13339,17 @@ impl CodexInfoState {
                             model_source_rank(observation.model_source),
                         )
                     });
-                let model_totals = history_models_v3(source, sample);
+                let reconstructed = source.is_some_and(|observation| {
+                    observation.model_source == usage_store::ModelSource::ReconstructedFromSession
+                });
+                let model_totals = if reconstructed || sample.model_source == "unavailable" {
+                    None
+                } else {
+                    history_models_v3(source, sample)
+                };
                 let model_source = if sample.model_source == "unavailable" {
                     "unavailable"
-                } else if source.is_some_and(|observation| {
-                    observation.model_source == usage_store::ModelSource::ReconstructedFromSession
-                }) {
+                } else if reconstructed {
                     "reconstructed-from-session"
                 } else if model_totals.is_some()
                     && source.is_some_and(|observation| {
@@ -12504,9 +13365,9 @@ impl CodexInfoState {
                     timestamp: sample.timestamp,
                     reset_at: sample.reset_at,
                     remaining_percent: sample.remaining_percent,
+                    task_active_since_previous: None,
                     models: model_totals,
-                    models_complete: source
-                        .is_some_and(|observation| observation.model_totals_complete),
+                    models_complete: model_source == "confirmed",
                     model_source: model_source.to_owned(),
                 }
             })
@@ -12526,6 +13387,7 @@ impl CodexInfoState {
         }
     }
 
+    #[cfg(test)]
     fn public_details_v2_from_v1_at(&self, v1: PublicDetails, now: i64) -> PublicDetailsV2 {
         let effective_observed_at = v1.observed_at.unwrap_or(now);
         let history_cutoff = DateTime::<Utc>::from_timestamp(effective_observed_at, 0)
@@ -12601,6 +13463,7 @@ impl CodexInfoState {
         v2
     }
 
+    #[cfg(test)]
     fn public_details_candidate_at(&self, now: i64) -> PublicDetails {
         // A same-identity transport or refresh failure retains the last
         // complete values even while the state reports that error. Identity
@@ -12862,104 +13725,6 @@ impl CodexInfoState {
         )
     }
 
-    fn new() -> Self {
-        let i18n = I18n::detect();
-        let resident_now = Instant::now();
-        let bridge = AppServerBridge::<AccountCommand, Event>::start(true);
-        bridge.send(AccountCommand::Read);
-        Self {
-            i18n,
-            bridge,
-            thread_bridge: None,
-            local_bridge: LocalUsageBridge::start(),
-            auth_epoch: 0,
-            auth_epoch_valid: true,
-            account_key: None,
-            account_update_generation: 0,
-            account_partition: None,
-            global_account_fallback_available: true,
-            email: None,
-            authenticated: false,
-            plan_label: String::new(),
-            auth_url: None,
-            remaining_percent: None,
-            has_quota_percent: false,
-            has_usage: false,
-            reset_at: None,
-            window_seconds: WEEK_SECONDS,
-            limit_name: "Codex".into(),
-            quota_title: "残り利用枠".into(),
-            monthly: false,
-            account_error: None,
-            error: None,
-            status: "Codex app-serverへ接続しています…".into(),
-            checking: true,
-            last_poll: resident_now,
-            last_success_at: None,
-            model_usage: Vec::new(),
-            active_threads: Vec::new(),
-            estimated_cost_label: "概算 —".into(),
-            history: UsageHistory::default(),
-            history_gaps: Vec::new(),
-            pending_recorded_sessions: Vec::new(),
-            pending_session_checkpoints: Vec::new(),
-            pending_session_ranges: Vec::new(),
-            pending_session_model_totals: Vec::new(),
-            pending_history_continuity_recovery: None,
-            pending_cumulative_recovery: None,
-            pending_timeline_recovery: None,
-            pending_collector_generation: None,
-            pending_session_period: None,
-            pending_recorder_admission: None,
-            pending_session_cleanup: Vec::new(),
-            pending_quota_source_rescan_complete: false,
-            selected_reset_at: None,
-            selected_history_period: "履歴なし".into(),
-            selected_metric: "ドル".into(),
-            preview: false,
-            auth_polling: false,
-            thread_checking: false,
-            thread_error: false,
-            local_usage_error: false,
-            recorder_store_error: false,
-            local_usage_pending: false,
-            pending_quota_observation_confirmed: false,
-            pending_local_verification: None,
-            usage_snapshot_committed: false,
-            last_thread_poll: resident_now,
-            recovery_period: None,
-            last_local_poll: resident_now
-                .checked_sub(daemon::daemon_interval_from_environment())
-                .unwrap_or(resident_now),
-            service_endpoint_error: None,
-            service_owner_probe_failed: false,
-            service_published_pair: None,
-            service_v3_published_pair: None,
-            service_current_snapshot: None,
-            service_current_active_thread_count: None,
-            service_current_pair: None,
-            service_current_last_poll: resident_now,
-            service_current_force_poll: false,
-            service_current_bundle_retry_pending: false,
-            service_split_capable: false,
-            service_history_periods: Vec::new(),
-            service_history_periods_pair: None,
-            service_history_samples: Vec::new(),
-            service_history_pair: None,
-            service_history_period_id: None,
-            service_history_cursor: None,
-            service_history_cursor_reset_required: false,
-            service_history_last_poll: resident_now,
-            service_history_force_poll: false,
-            service_history_error: None,
-            service_threads_pair: None,
-            service_threads_last_poll: resident_now,
-            service_threads_force_poll: false,
-            service_threads_error: None,
-            acknowledged_recorder_commit: None,
-        }
-    }
-
     /// Construct the Linux UI adapter. Visible account, quota, local usage,
     /// history, and thread fields remain empty until one strict REST details
     /// generation replaces the root. The account bridge exists only for the
@@ -12969,12 +13734,19 @@ impl CodexInfoState {
         Self {
             i18n: I18n::detect(),
             bridge: AppServerBridge::<AccountCommand, Event>::start(true),
+            #[cfg(test)]
             thread_bridge: None,
+            #[cfg(test)]
             local_bridge: LocalUsageBridge::inactive(),
+            #[cfg(test)]
             auth_epoch: 0,
+            #[cfg(test)]
             auth_epoch_valid: true,
+            #[cfg(test)]
             account_key: None,
+            #[cfg(test)]
             account_update_generation: 0,
+            #[cfg(test)]
             account_partition: None,
             global_account_fallback_available: true,
             email: None,
@@ -13000,17 +13772,29 @@ impl CodexInfoState {
             estimated_cost_label: "概算 —".into(),
             history: UsageHistory::default(),
             history_gaps: Vec::new(),
+            #[cfg(test)]
             pending_recorded_sessions: Vec::new(),
+            #[cfg(test)]
             pending_session_checkpoints: Vec::new(),
+            #[cfg(test)]
             pending_session_ranges: Vec::new(),
+            #[cfg(test)]
             pending_session_model_totals: Vec::new(),
+            #[cfg(test)]
             pending_history_continuity_recovery: None,
+            #[cfg(test)]
             pending_cumulative_recovery: None,
+            #[cfg(test)]
             pending_timeline_recovery: None,
+            #[cfg(test)]
             pending_collector_generation: None,
+            #[cfg(test)]
             pending_session_period: None,
+            #[cfg(test)]
             pending_recorder_admission: None,
+            #[cfg(test)]
             pending_session_cleanup: Vec::new(),
+            #[cfg(test)]
             pending_quota_source_rescan_complete: false,
             selected_reset_at: None,
             selected_history_period: "履歴なし".into(),
@@ -13023,10 +13807,14 @@ impl CodexInfoState {
             recorder_store_error: false,
             local_usage_pending: false,
             pending_quota_observation_confirmed: false,
+            #[cfg(test)]
             pending_local_verification: None,
             usage_snapshot_committed: false,
+            #[cfg(test)]
             last_thread_poll: Instant::now(),
+            #[cfg(test)]
             recovery_period: None,
+            #[cfg(test)]
             last_local_poll: Instant::now(),
             service_endpoint_error: None,
             service_owner_probe_failed: false,
@@ -13046,6 +13834,8 @@ impl CodexInfoState {
             service_history_samples: Vec::new(),
             service_history_pair: None,
             service_history_period_id: None,
+            service_history_pending_reset_at: None,
+            service_history_pending_failures: 0,
             service_history_cursor: None,
             service_history_cursor_reset_required: false,
             service_history_last_poll: service_now,
@@ -13055,6 +13845,15 @@ impl CodexInfoState {
             service_threads_last_poll: service_now,
             service_threads_force_poll: false,
             service_threads_error: None,
+            service_accounts: Vec::new(),
+            service_default_account_id: None,
+            service_selected_account_id: None,
+            service_accounts_supported: false,
+            service_accounts_known: false,
+            service_accounts_last_poll: service_now,
+            service_accounts_force_poll: true,
+            service_accounts_error: None,
+            #[cfg(test)]
             acknowledged_recorder_commit: None,
         }
     }
@@ -13071,18 +13870,27 @@ impl CodexInfoState {
             preview_model_row("LUNA", 155_294_770, 100_000_000, 40_000_000, 15_294_770),
         ];
         let preview_costs = ModelDollarTotals::from_rows(&model_usage);
+        #[cfg(test)]
         let preview_account_key = account_scope::AccountKey::synthetic_preview("preview-account");
+        #[cfg(test)]
         let preview_partition =
             account_scope::AccountPartition::synthetic_preview(&preview_account_key);
         let mut state = Self {
             i18n,
             bridge,
+            #[cfg(test)]
             thread_bridge: None,
+            #[cfg(test)]
             local_bridge: LocalUsageBridge::inactive(),
+            #[cfg(test)]
             auth_epoch: 0,
+            #[cfg(test)]
             auth_epoch_valid: true,
+            #[cfg(test)]
             account_key: Some(preview_account_key),
+            #[cfg(test)]
             account_update_generation: 1,
+            #[cfg(test)]
             account_partition: Some(preview_partition),
             global_account_fallback_available: false,
             email: Some("preview@example.com".into()),
@@ -13105,17 +13913,29 @@ impl CodexInfoState {
             window_seconds: WEEK_SECONDS,
             history: UsageHistory::preview(now, reset_at, preview_costs),
             history_gaps: Vec::new(),
+            #[cfg(test)]
             pending_recorded_sessions: Vec::new(),
+            #[cfg(test)]
             pending_session_checkpoints: Vec::new(),
+            #[cfg(test)]
             pending_session_ranges: Vec::new(),
+            #[cfg(test)]
             pending_session_model_totals: Vec::new(),
+            #[cfg(test)]
             pending_history_continuity_recovery: None,
+            #[cfg(test)]
             pending_cumulative_recovery: None,
+            #[cfg(test)]
             pending_timeline_recovery: None,
+            #[cfg(test)]
             pending_collector_generation: None,
+            #[cfg(test)]
             pending_session_period: None,
+            #[cfg(test)]
             pending_recorder_admission: None,
+            #[cfg(test)]
             pending_session_cleanup: Vec::new(),
+            #[cfg(test)]
             pending_quota_source_rescan_complete: false,
             model_usage,
             active_threads: vec![ActiveThread {
@@ -13145,13 +13965,17 @@ impl CodexInfoState {
             recorder_store_error: false,
             local_usage_pending: false,
             pending_quota_observation_confirmed: false,
+            #[cfg(test)]
             pending_local_verification: None,
             // Preview is one complete in-memory generation. Individual
             // startup fixtures clear this bit when they intentionally model
             // an incomplete first collection.
             usage_snapshot_committed: true,
+            #[cfg(test)]
             last_thread_poll: Instant::now(),
+            #[cfg(test)]
             recovery_period: None,
+            #[cfg(test)]
             last_local_poll: Instant::now(),
             service_endpoint_error: None,
             service_owner_probe_failed: false,
@@ -13169,6 +13993,8 @@ impl CodexInfoState {
             service_history_samples: Vec::new(),
             service_history_pair: None,
             service_history_period_id: None,
+            service_history_pending_reset_at: None,
+            service_history_pending_failures: 0,
             service_history_cursor: None,
             service_history_cursor_reset_required: false,
             service_history_last_poll: resident_now,
@@ -13178,6 +14004,15 @@ impl CodexInfoState {
             service_threads_last_poll: resident_now,
             service_threads_force_poll: false,
             service_threads_error: None,
+            service_accounts: Vec::new(),
+            service_default_account_id: None,
+            service_selected_account_id: None,
+            service_accounts_supported: false,
+            service_accounts_known: false,
+            service_accounts_last_poll: resident_now,
+            service_accounts_force_poll: false,
+            service_accounts_error: None,
+            #[cfg(test)]
             acknowledged_recorder_commit: None,
         };
         match kind {
@@ -13482,6 +14317,52 @@ impl CodexInfoState {
                         )
                     })
                     .collect();
+                // The visual oracle must exercise the production idle path,
+                // not the removed cadence heuristic. Only the contiguous
+                // minute rows after the sparse opening span carry explicit
+                // recorder evidence that no task ran since the prior row.
+                state.service_history_samples = state
+                    .history
+                    .samples
+                    .iter()
+                    .filter(|sample| sample.reset_at == selected_reset)
+                    .map(|sample| {
+                        let astra_tokens = if sample.timestamp == period_start {
+                            500_000
+                        } else {
+                            1_000_000
+                        };
+                        let models = [
+                            ("SOL", sample.sol_tokens, Some(sample.sol_dollars)),
+                            ("TERRA", sample.terra_tokens, Some(sample.terra_dollars)),
+                            ("LUNA", sample.luna_tokens, Some(sample.luna_dollars)),
+                            ("ASTRA", astra_tokens, None),
+                        ]
+                        .into_iter()
+                        .map(
+                            |(model, total_tokens, total_dollars)| PublicHistoryModelUsageV3 {
+                                model: model.to_owned(),
+                                total_tokens,
+                                input_tokens: Some(total_tokens),
+                                cached_input_tokens: Some(0),
+                                cache_write_input_tokens: Some(0),
+                                output_tokens: Some(0),
+                                total_dollars,
+                            },
+                        )
+                        .collect();
+                        PublicHistoryObservationV3 {
+                            timestamp: sample.timestamp,
+                            reset_at: sample.reset_at,
+                            remaining_percent: Some(sample.remaining_percent),
+                            task_active_since_previous: (sample.timestamp > inferred_end)
+                                .then_some(false),
+                            models: Some(models),
+                            models_complete: true,
+                            model_source: "confirmed".to_owned(),
+                        }
+                    })
+                    .collect();
                 state.reset_at = Some(selected_reset);
                 state.selected_reset_at = Some(selected_reset);
                 state.status = state.normal_status();
@@ -13577,8 +14458,205 @@ impl CodexInfoState {
         self.service_current_force_poll = true;
     }
 
+    fn account_selector_options(&self) -> Vec<String> {
+        service_account_labels(&self.service_accounts, &self.i18n)
+    }
+
+    fn selected_service_account(&self) -> Option<&ServiceAccountV3> {
+        let selected = self.service_selected_account_id.as_deref()?;
+        self.service_accounts
+            .iter()
+            .find(|account| account.id == selected)
+    }
+
+    /// A saved account is a historical projection unless the account
+    /// directory explicitly marks it as the sole current writer.  The UI must
+    /// not derive current reset/thread semantics from a closed lifecycle.
+    fn selected_account_is_historical(&self) -> bool {
+        self.selected_service_account()
+            .is_some_and(|account| !account.is_current)
+    }
+
+    fn selected_account_view_loading(&self) -> bool {
+        !self.preview
+            && self.service_accounts_supported
+            && self.service_selected_account_id.is_some()
+            && self.service_current_pair.is_none()
+            && self.checking
+    }
+
+    fn selected_account_index(&self) -> usize {
+        self.service_selected_account_id
+            .as_deref()
+            .and_then(|selected| {
+                self.service_accounts
+                    .iter()
+                    .position(|account| account.id == selected)
+            })
+            .unwrap_or(0)
+    }
+
+    fn select_account_label(&mut self, label: &str) -> bool {
+        let account_id = self
+            .account_selector_options()
+            .iter()
+            .position(|option| option == label)
+            .and_then(|index| self.service_accounts.get(index))
+            .map(|account| account.id.clone());
+        account_id
+            .as_deref()
+            .is_some_and(|account_id| self.select_account(account_id))
+    }
+
+    /// Clear all visible and cached data owned by the selected account. The
+    /// account directory itself remains resident so the next request can use
+    /// the newly selected public id. This is the single atomic switch boundary
+    /// for current, graph, threads, and pending/error state.
+    fn clear_selected_account_state(&mut self) {
+        self.email = None;
+        self.authenticated = false;
+        self.plan_label.clear();
+        self.auth_url = None;
+        self.remaining_percent = None;
+        self.has_quota_percent = false;
+        self.has_usage = false;
+        self.reset_at = None;
+        self.window_seconds = WEEK_SECONDS;
+        self.limit_name = "Codex".into();
+        self.quota_title = "残り利用枠".into();
+        self.monthly = false;
+        self.account_error = None;
+        self.error = None;
+        self.status = "利用状況を更新しています…".into();
+        self.checking = true;
+        self.auth_polling = false;
+        self.last_success_at = None;
+        self.model_usage.clear();
+        self.active_threads.clear();
+        self.estimated_cost_label = "概算 —".into();
+        self.history = UsageHistory::default();
+        self.history_gaps.clear();
+        self.selected_reset_at = None;
+        self.selected_history_period = self.i18n.text(TextKey::NoHistory).into();
+        self.thread_checking = false;
+        self.thread_error = false;
+        self.local_usage_error = false;
+        self.recorder_store_error = false;
+        self.local_usage_pending = false;
+        self.pending_quota_observation_confirmed = false;
+        self.usage_snapshot_committed = false;
+        self.service_endpoint_error = None;
+        self.service_owner_probe_failed = false;
+        self.service_published_pair = None;
+        self.service_v3_published_pair = None;
+        self.service_current_snapshot = None;
+        self.service_current_active_thread_count = None;
+        self.service_current_pair = None;
+        self.service_current_last_poll = Instant::now()
+            .checked_sub(SERVICE_CURRENT_POLL_INTERVAL)
+            .unwrap_or_else(Instant::now);
+        self.service_current_force_poll = true;
+        self.service_current_bundle_retry_pending = false;
+        self.service_split_capable = false;
+        self.service_history_periods.clear();
+        self.service_history_periods_pair = None;
+        self.service_history_samples.clear();
+        self.service_history_pair = None;
+        self.service_history_period_id = None;
+        self.service_history_pending_reset_at = None;
+        self.service_history_pending_failures = 0;
+        self.service_history_cursor = None;
+        self.service_history_cursor_reset_required = false;
+        self.service_history_last_poll = Instant::now();
+        // A newly selected account owns a different immutable REST pair. Its
+        // small period catalog must be requested on the next one-second UI
+        // cycle instead of waiting for the ordinary 60-second refresh.
+        self.service_history_force_poll = true;
+        self.service_history_error = None;
+        self.service_threads_pair = None;
+        self.service_threads_last_poll = Instant::now();
+        self.service_threads_force_poll = false;
+        self.service_threads_error = None;
+        self.service_accounts_error = None;
+
+        #[cfg(test)]
+        {
+            self.stop_thread_bridge();
+            self.account_key = None;
+            self.account_update_generation = 0;
+            self.account_partition = None;
+            self.pending_recorded_sessions.clear();
+            self.pending_session_checkpoints.clear();
+            self.pending_session_ranges.clear();
+            self.pending_session_model_totals.clear();
+            self.pending_history_continuity_recovery = None;
+            self.pending_cumulative_recovery = None;
+            self.pending_timeline_recovery = None;
+            self.pending_collector_generation = None;
+            self.pending_session_period = None;
+            self.pending_recorder_admission = None;
+            self.pending_session_cleanup.clear();
+            self.pending_quota_source_rescan_complete = false;
+            self.pending_local_verification = None;
+            self.acknowledged_recorder_commit = None;
+        }
+    }
+
+    fn select_account(&mut self, account_id: &str) -> bool {
+        if self.preview
+            || !self.service_accounts_supported
+            || !valid_public_account_id(account_id)
+            || !self
+                .service_accounts
+                .iter()
+                .any(|account| account.id == account_id)
+            || self.service_selected_account_id.as_deref() == Some(account_id)
+        {
+            return false;
+        }
+        self.service_selected_account_id = Some(account_id.to_owned());
+        self.clear_selected_account_state();
+        true
+    }
+
+    fn apply_service_accounts(
+        &mut self,
+        document: ServiceAccountsV3Document,
+    ) -> Result<bool, String> {
+        validate_service_accounts(&document)?;
+        let previous_selection = self.service_selected_account_id.clone();
+        let selection = previous_selection
+            .as_deref()
+            .filter(|selected| {
+                document
+                    .accounts
+                    .iter()
+                    .any(|account| &account.id == selected)
+            })
+            .map(str::to_owned)
+            .or_else(|| Some(document.default_account_id.clone()));
+        if selection.is_none() {
+            return Err("accounts document has no selectable default account".into());
+        }
+        let list_changed = self.service_accounts != document.accounts
+            || self.service_default_account_id != Some(document.default_account_id.clone());
+        let selection_changed = previous_selection != selection;
+        self.service_accounts = document.accounts;
+        self.service_default_account_id = Some(document.default_account_id);
+        self.service_accounts_supported = true;
+        self.service_accounts_known = true;
+        self.service_accounts_error = None;
+        if selection_changed {
+            self.service_selected_account_id = selection;
+            self.clear_selected_account_state();
+            self.service_current_force_poll = true;
+        }
+        Ok(list_changed || selection_changed)
+    }
+
     /// Ask the resident producer for its next account/quota generation.
     /// The UI never calls this path: it consumes the immutable details root.
+    #[cfg(test)]
     fn request_account_refresh(&mut self, status: &str) {
         if self.preview {
             return;
@@ -13601,6 +14679,7 @@ impl CodexInfoState {
     /// Own every periodic producer request in the resident service. Completed
     /// events are drained before this method runs, so `checking` and
     /// `thread_checking` are the single-flight completion boundaries.
+    #[cfg(test)]
     fn schedule_resident_refresh(&mut self, now: Instant) -> bool {
         let mut publication_changed = false;
         let account_due = !self.recorder_store_error
@@ -13687,7 +14766,9 @@ impl CodexInfoState {
                 }
                 // Account/quota reads belong to the resident service. The UI
                 // control bridge must never mutate the visible root with them.
-                Event::Ready | Event::Account { .. } | Event::Usage(_) => {}
+                Event::Ready => {}
+                #[cfg(test)]
+                Event::Account { .. } | Event::Usage(_) => {}
             }
         }
     }
@@ -13756,7 +14837,12 @@ impl CodexInfoState {
                 .iter()
                 .map(store_observation_from_public)
                 .collect(),
-            ..UsageHistory::default()
+            #[cfg(test)]
+            pending_store_samples: Vec::new(),
+            #[cfg(test)]
+            pending_store_observations: Vec::new(),
+            #[cfg(test)]
+            startup_maintenance_done: false,
         };
         let next_threads = details
             .threads
@@ -13905,7 +14991,12 @@ impl CodexInfoState {
                 .iter()
                 .map(store_observation_from_public_v3)
                 .collect(),
-            ..UsageHistory::default()
+            #[cfg(test)]
+            pending_store_samples: Vec::new(),
+            #[cfg(test)]
+            pending_store_observations: Vec::new(),
+            #[cfg(test)]
+            startup_maintenance_done: false,
         };
         let next_threads = details
             .threads
@@ -13988,6 +15079,8 @@ impl CodexInfoState {
         self.service_history_samples = full_snapshot.history_samples.clone();
         self.service_history_pair = Some(published_pair.clone());
         self.service_history_period_id = next_selected_period_id;
+        self.service_history_pending_reset_at = None;
+        self.service_history_pending_failures = 0;
         self.service_history_cursor = None;
         self.service_history_cursor_reset_required = false;
         self.service_history_error = None;
@@ -14080,6 +15173,8 @@ impl CodexInfoState {
                 self.service_history_periods_pair = None;
                 self.service_history_pair = None;
                 self.service_history_period_id = None;
+                self.service_history_pending_reset_at = None;
+                self.service_history_pending_failures = 0;
                 self.service_history_cursor = None;
                 self.service_history_cursor_reset_required = false;
             }
@@ -14201,7 +15296,8 @@ impl CodexInfoState {
             || self.history.observations != next_observations
             || self.history_gaps != gaps;
         let selected_period = self
-            .selected_reset_at
+            .service_history_pending_reset_at
+            .or(self.selected_reset_at)
             .and_then(|selected| {
                 periods.iter().find(|period| {
                     period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
@@ -14209,6 +15305,7 @@ impl CodexInfoState {
             })
             .or_else(|| periods.iter().find(|period| period.current))
             .or_else(|| periods.first());
+        // A successful page is the commit point for its period identity.
         self.service_history_period_id = selected_period.map(|period| period.id.clone());
         self.selected_reset_at = selected_period.map(|period| period.reset_at);
         self.selected_history_period = selected_period
@@ -14218,6 +15315,8 @@ impl CodexInfoState {
         self.service_history_periods_pair = Some(published_pair.clone());
         self.service_history_samples = samples;
         self.service_history_pair = Some(published_pair);
+        self.service_history_pending_reset_at = None;
+        self.service_history_pending_failures = 0;
         self.service_history_cursor = cursor;
         self.service_history_cursor_reset_required = false;
         self.history.samples = next_samples;
@@ -14247,7 +15346,8 @@ impl CodexInfoState {
         let changed = self.service_history_periods_pair.as_deref() != Some(published_pair.as_str())
             || self.service_history_periods != periods;
         let selected_period = self
-            .selected_reset_at
+            .service_history_pending_reset_at
+            .or(self.selected_reset_at)
             .and_then(|selected| {
                 periods.iter().find(|period| {
                     period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
@@ -14255,7 +15355,10 @@ impl CodexInfoState {
             })
             .or_else(|| periods.iter().find(|period| period.current))
             .or_else(|| periods.first());
-        self.service_history_period_id = selected_period.map(|period| period.id.clone());
+        // Metadata does not commit a history page. Keep the period id of the
+        // last committed page until its matching page is published so a new
+        // target cannot inherit the old page's cursor or look ready while its
+        // samples are still pending.
         self.selected_reset_at = selected_period.map(|period| period.reset_at);
         self.selected_history_period = selected_period
             .map(|period| period.label.clone())
@@ -14322,6 +15425,7 @@ impl CodexInfoState {
 
     fn hold_service_endpoint_error(&mut self, error: String) {
         if self.service_endpoint_error.is_none() {
+            #[cfg(test)]
             if !self.advance_auth_epoch() {
                 return;
             }
@@ -14331,6 +15435,7 @@ impl CodexInfoState {
         self.checking = false;
     }
 
+    #[cfg(test)]
     fn advance_auth_epoch(&mut self) -> bool {
         if !self.auth_epoch_valid {
             return false;
@@ -14343,6 +15448,7 @@ impl CodexInfoState {
         true
     }
 
+    #[cfg(test)]
     fn enter_auth_epoch_recovery(&mut self) {
         self.auth_epoch_valid = false;
         self.stop_thread_bridge();
@@ -14354,18 +15460,21 @@ impl CodexInfoState {
         self.status = error.into();
     }
 
+    #[cfg(test)]
     fn stop_thread_bridge(&mut self) {
         if let Some(bridge) = self.thread_bridge.take() {
             let _ = bridge.send(ThreadCommand::Stop);
         }
     }
 
+    #[cfg(test)]
     fn ensure_thread_bridge(&mut self) {
         if !self.preview && self.thread_bridge.is_none() {
             self.thread_bridge = Some(AppServerBridge::<ThreadCommand, ThreadEvent>::start());
         }
     }
 
+    #[cfg(test)]
     fn request_thread_update(&mut self) -> bool {
         if self.preview || !self.authenticated {
             return false;
@@ -14384,7 +15493,7 @@ impl CodexInfoState {
         let command = ThreadCommand::Read {
             auth_epoch: self.auth_epoch,
             admission,
-            account_partition,
+            account_partition: Box::new(account_partition),
         };
         let sent = self
             .thread_bridge
@@ -14409,10 +15518,12 @@ impl CodexInfoState {
         }
     }
 
+    #[cfg(test)]
     fn request_local_usage(&mut self, reset_at: i64, window_seconds: i64) -> bool {
         self.request_local_usage_with_recovery(reset_at, window_seconds, None)
     }
 
+    #[cfg(test)]
     fn request_local_usage_with_recovery(
         &mut self,
         reset_at: i64,
@@ -14552,10 +15663,14 @@ impl CodexInfoState {
                 .then_some(regression_recovery_state)
                 .flatten()
                 .map(Box::new),
-            history_continuity_recovery: (!period_boundary)
-                .then_some(history_continuity_recovery)
-                .flatten(),
-            cumulative_recovery: (!period_boundary).then_some(cumulative_recovery).flatten(),
+            history_continuity_recovery: Box::new(
+                (!period_boundary)
+                    .then_some(history_continuity_recovery)
+                    .flatten(),
+            ),
+            cumulative_recovery: Box::new(
+                (!period_boundary).then_some(cumulative_recovery).flatten(),
+            ),
             reset_at: canonical_reset_at,
             window_seconds: canonical_window_seconds,
         };
@@ -14570,6 +15685,7 @@ impl CodexInfoState {
         true
     }
 
+    #[cfg(test)]
     fn take_pending_recorder_batch(&mut self) -> PendingRecorderBatch {
         let period = self.pending_session_period.take();
         let collector = self.pending_collector_generation.take();
@@ -14598,6 +15714,7 @@ impl CodexInfoState {
         }
     }
 
+    #[cfg(test)]
     fn has_pending_recorder_batch(&self) -> bool {
         !self.history.pending_store_samples.is_empty()
             || !self.history.pending_store_observations.is_empty()
@@ -14615,6 +15732,7 @@ impl CodexInfoState {
             || !self.pending_session_cleanup.is_empty()
     }
 
+    #[cfg(test)]
     fn restore_pending_recorder_batch(&mut self, mut batch: PendingRecorderBatch) {
         let current_admission = self.current_account_admission();
         if batch.auth_epoch != Some(self.auth_epoch)
@@ -14663,6 +15781,7 @@ impl CodexInfoState {
         self.pending_session_cleanup = batch.cleanup_plans;
     }
 
+    #[cfg(test)]
     fn discard_pending_recorder_batch(&mut self) {
         let _ = self.history.take_pending_store_samples();
         let _ = self.history.take_pending_store_observations();
@@ -14680,6 +15799,7 @@ impl CodexInfoState {
         self.pending_session_cleanup.clear();
     }
 
+    #[cfg(test)]
     fn clear_account_visible_state(&mut self) -> bool {
         if !self.advance_auth_epoch() {
             return false;
@@ -14688,6 +15808,7 @@ impl CodexInfoState {
         true
     }
 
+    #[cfg(test)]
     fn clear_account_visible_fields(&mut self) {
         self.stop_thread_bridge();
         self.account_key = None;
@@ -14747,6 +15868,8 @@ impl CodexInfoState {
         self.service_history_samples.clear();
         self.service_history_pair = None;
         self.service_history_period_id = None;
+        self.service_history_pending_reset_at = None;
+        self.service_history_pending_failures = 0;
         self.service_history_cursor = None;
         self.service_history_cursor_reset_required = false;
         self.service_history_last_poll = Instant::now();
@@ -14758,6 +15881,7 @@ impl CodexInfoState {
         self.service_threads_error = None;
     }
 
+    #[cfg(test)]
     fn current_account_admission(&self) -> Option<AccountAdmission> {
         let partition = self.account_partition.as_ref()?;
         (self.auth_epoch_valid && self.authenticated).then(|| AccountAdmission {
@@ -14769,6 +15893,7 @@ impl CodexInfoState {
         })
     }
 
+    #[cfg(test)]
     fn admit_active_thread_update(&mut self, update: ActiveThreadUpdate) -> bool {
         match update {
             ActiveThreadUpdate::Snapshot(threads) => {
@@ -14807,10 +15932,12 @@ impl CodexInfoState {
         }
     }
 
+    #[cfg(test)]
     fn apply_active_thread_update(&mut self, update: ActiveThreadUpdate) -> bool {
         self.admit_active_thread_update(update)
     }
 
+    #[cfg(test)]
     fn apply_usage_event(&mut self, event: UsageEvent) {
         if !self.auth_epoch_valid {
             return;
@@ -14838,6 +15965,7 @@ impl CodexInfoState {
         let mut previous_reset_at = self.reset_at;
         let mut previous_window_seconds = self.window_seconds;
         let mut previous_observed_at = self.last_success_at;
+        let mut previous_remaining_percent = self.remaining_percent;
         let mut durable_authority = None;
         let mut quota_generation_recovery = None;
         if let Some(partition) = self.account_partition.as_ref() {
@@ -14852,6 +15980,8 @@ impl CodexInfoState {
                         previous_reset_at = Some(plan.cumulative_recovery.canonical_reset_at);
                         previous_window_seconds = plan.cumulative_recovery.window_seconds;
                         previous_observed_at = Some(plan.canonical_observation.observed_at);
+                        previous_remaining_percent =
+                            Some(plan.canonical_observation.remaining_percent);
                         durable_authority = Some((
                             plan.cumulative_recovery.canonical_reset_at,
                             plan.cumulative_recovery.window_seconds,
@@ -14864,6 +15994,7 @@ impl CodexInfoState {
                             previous_reset_at = (durable.reset_at > 0).then_some(durable.reset_at);
                             previous_window_seconds = durable.window_seconds;
                             previous_observed_at = Some(observation.observed_at);
+                            previous_remaining_percent = Some(observation.remaining_percent);
                         }
                         durable_authority = Some((
                             durable.reset_at,
@@ -14879,6 +16010,7 @@ impl CodexInfoState {
             previous_reset_at,
             previous_window_seconds,
             previous_observed_at,
+            previous_remaining_percent,
             reset_at,
             window_seconds,
             remaining_percent,
@@ -14985,43 +16117,57 @@ impl CodexInfoState {
     }
 
     fn apply_account_error(&mut self, error: String) {
-        debug_runtime(format!("state account error: {error}"));
-        // Once this process has admitted an account partition, an external
-        // app-server/quota failure is presentation-only. Keep the independent
-        // local recorder generation, pending batch and cursor live.
-        if self.current_account_admission().is_some() {
+        #[cfg(test)]
+        {
+            debug_runtime(format!("state account error: {error}"));
+            // Once this process has admitted an account partition, an external
+            // app-server/quota failure is presentation-only. Keep the independent
+            // local recorder generation, pending batch and cursor live.
+            if self.current_account_admission().is_some() {
+                self.checking = false;
+                self.account_error = Some(error.clone());
+                self.error = Some(error);
+                self.status =
+                    "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
+                return;
+            }
+            // The failed account connection is a publication boundary. Results
+            // requested before this error may still be queued on the independent
+            // thread/local channels, so invalidate their epoch without clearing
+            // the last valid visible values. Let the thread scheduler issue a
+            // fresh request instead of remaining stuck behind the stale one.
+            if !self.advance_auth_epoch() {
+                return;
+            }
+            self.discard_pending_recorder_batch();
+            self.thread_checking = false;
+            self.checking = false;
+            if self.pending_local_verification.take().is_some() {
+                self.local_usage_pending = false;
+            }
+            // If the local lane is already running, the epoch change makes that
+            // exact result stale. Keep the lane occupied until its terminal event
+            // arrives; otherwise a second full session scan could be queued.
+            self.account_error = Some(error.clone());
+            self.error = Some(error);
+            self.status =
+                "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
+            // The resident scheduler owns outage recovery at the established
+            // interval. Error handling only records the failed account boundary.
+        }
+        #[cfg(not(test))]
+        {
+            debug_runtime(format!("UI auth control error: {error}"));
+            self.auth_polling = false;
             self.checking = false;
             self.account_error = Some(error.clone());
             self.error = Some(error);
             self.status =
                 "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
-            return;
         }
-        // The failed account connection is a publication boundary. Results
-        // requested before this error may still be queued on the independent
-        // thread/local channels, so invalidate their epoch without clearing
-        // the last valid visible values. Let the thread scheduler issue a
-        // fresh request instead of remaining stuck behind the stale one.
-        if !self.advance_auth_epoch() {
-            return;
-        }
-        self.discard_pending_recorder_batch();
-        self.thread_checking = false;
-        self.checking = false;
-        if self.pending_local_verification.take().is_some() {
-            self.local_usage_pending = false;
-        }
-        // If the local lane is already running, the epoch change makes that
-        // exact result stale. Keep the lane occupied until its terminal event
-        // arrives; otherwise a second full session scan could be queued.
-        self.account_error = Some(error.clone());
-        self.error = Some(error);
-        self.status =
-            "利用状況を取得できません。Codex app-serverへの接続を確認してください。".into();
-        // The resident scheduler owns outage recovery at the established
-        // interval. Error handling only records the failed account boundary.
     }
 
+    #[cfg(test)]
     fn apply_identity_error(&mut self, error: String) {
         debug_runtime(format!("state identity error: {error}"));
         if !self.clear_account_visible_state() {
@@ -15033,6 +16179,7 @@ impl CodexInfoState {
         self.status = "アカウントidentityまたは保存先を安全に確認できませんでした。".into();
     }
 
+    #[cfg(test)]
     fn apply_confirmed_account_event(
         &mut self,
         email: Option<String>,
@@ -15081,6 +16228,7 @@ impl CodexInfoState {
         );
     }
 
+    #[cfg(test)]
     fn apply_resolved_confirmed_account_event(
         &mut self,
         email: Option<String>,
@@ -15210,6 +16358,7 @@ impl CodexInfoState {
         .into();
     }
 
+    #[cfg(test)]
     fn current_local_period_matches(&self, reset_at: i64, window_seconds: i64) -> bool {
         if self.authenticated {
             return self.window_seconds == window_seconds
@@ -15222,6 +16371,7 @@ impl CodexInfoState {
         self.recovery_period == Some((reset_at, window_seconds))
     }
 
+    #[cfg(test)]
     fn apply_local_usage_success(&mut self, result: LocalUsageResult) {
         if !self.auth_epoch_valid
             || result.auth_epoch != self.auth_epoch
@@ -15324,6 +16474,7 @@ impl CodexInfoState {
         ));
     }
 
+    #[cfg(test)]
     fn request_local_usage_verification(&mut self, candidate: LocalUsageCandidate) {
         let admission_matches =
             self.current_account_admission().as_ref() == Some(&candidate.admission);
@@ -15363,6 +16514,7 @@ impl CodexInfoState {
         let _ = self.bridge.send(AccountCommand::FinishFallback);
     }
 
+    #[cfg(test)]
     fn apply_account_verification(&mut self, admission: AccountAdmission, valid: bool) {
         let Some(candidate) = self.pending_local_verification.take() else {
             return;
@@ -15429,28 +16581,30 @@ impl CodexInfoState {
         }
     }
 
+    #[cfg(test)]
     fn apply_local_usage_error(&mut self, auth_epoch: u64, reset_at: i64, window_seconds: i64) {
-        self.apply_local_usage_error_with_generation(
+        self.apply_local_usage_error_with_generation(LocalUsageErrorContext {
             auth_epoch,
-            None,
+            admission: None,
             reset_at,
             window_seconds,
-            None,
-            None,
-            Vec::new(),
-        );
+            collector_epoch: None,
+            cycle_seq: None,
+            durable_model_totals: Vec::new(),
+        });
     }
 
-    fn apply_local_usage_error_with_generation(
-        &mut self,
-        auth_epoch: u64,
-        admission: Option<AccountAdmission>,
-        reset_at: i64,
-        window_seconds: i64,
-        collector_epoch: Option<u128>,
-        cycle_seq: Option<u64>,
-        durable_model_totals: Vec<usage_store::SessionModelTotal>,
-    ) {
+    #[cfg(test)]
+    fn apply_local_usage_error_with_generation(&mut self, context: LocalUsageErrorContext) {
+        let LocalUsageErrorContext {
+            auth_epoch,
+            admission,
+            reset_at,
+            window_seconds,
+            collector_epoch,
+            cycle_seq,
+            durable_model_totals,
+        } = context;
         if !self.auth_epoch_valid
             || auth_epoch != self.auth_epoch
             || !self.current_local_period_matches(reset_at, window_seconds)
@@ -15509,6 +16663,7 @@ impl CodexInfoState {
         self.refresh_partial_failure_status();
     }
 
+    #[cfg(test)]
     fn apply_recorder_store_error(&mut self) {
         self.recorder_store_error = true;
         self.local_usage_pending = false;
@@ -15516,6 +16671,7 @@ impl CodexInfoState {
         self.refresh_partial_failure_status();
     }
 
+    #[cfg(test)]
     fn clear_recorder_store_error(&mut self) {
         if self.recorder_store_error {
             self.recorder_store_error = false;
@@ -15523,25 +16679,7 @@ impl CodexInfoState {
         }
     }
 
-    fn refresh_history_gaps(&mut self) -> bool {
-        let Some(partition) = self.account_partition.clone() else {
-            self.history_gaps.clear();
-            return true;
-        };
-        match UsageHistory::confirmed_gaps_from_partition(&partition) {
-            Ok(gaps) => {
-                self.history_gaps = gaps;
-                true
-            }
-            Err(error) => {
-                self.apply_identity_error(format!(
-                    "アカウント別の履歴gap ledgerを安全に確認できませんでした: {error}"
-                ));
-                false
-            }
-        }
-    }
-
+    #[cfg(test)]
     fn acknowledge_recorder_commit(
         &mut self,
         admission: &AccountAdmission,
@@ -15568,6 +16706,7 @@ impl CodexInfoState {
         });
     }
 
+    #[cfg(test)]
     fn apply_thread_result_for_admission(
         &mut self,
         auth_epoch: u64,
@@ -15583,6 +16722,7 @@ impl CodexInfoState {
         self.apply_admitted_thread_result(update)
     }
 
+    #[cfg(test)]
     fn apply_admitted_thread_result(&mut self, update: ActiveThreadUpdate) -> bool {
         let previous_threads = self.active_threads.clone();
         let previous_thread_error = self.thread_error;
@@ -15606,6 +16746,7 @@ impl CodexInfoState {
         let _ = self.apply_admitted_thread_result(update);
     }
 
+    #[cfg(test)]
     fn apply_thread_error_for_admission(
         &mut self,
         auth_epoch: u64,
@@ -15628,6 +16769,7 @@ impl CodexInfoState {
         !previous_thread_error
     }
 
+    #[cfg(test)]
     fn apply_thread_error(&mut self, auth_epoch: u64, message: String) -> bool {
         let Some(admission) = self.current_account_admission() else {
             return false;
@@ -15677,6 +16819,7 @@ impl CodexInfoState {
     /// Apply one FIFO batch from the current account bridge. An account error
     /// invalidates the connection, so later events already drained from that
     /// same receiver must not cross the replacement boundary.
+    #[cfg(test)]
     fn apply_account_event_batch(&mut self, events: Vec<Event>) -> bool {
         for event in events {
             match event {
@@ -15721,6 +16864,7 @@ impl CodexInfoState {
         false
     }
 
+    #[cfg(test)]
     fn poll(&mut self) -> bool {
         if self.preview {
             return false;
@@ -15784,15 +16928,15 @@ impl CodexInfoState {
                     collector_epoch,
                     cycle_seq,
                     durable_model_totals,
-                } => self.apply_local_usage_error_with_generation(
+                } => self.apply_local_usage_error_with_generation(LocalUsageErrorContext {
                     auth_epoch,
-                    Some(admission),
+                    admission: Some(admission),
                     reset_at,
                     window_seconds,
                     collector_epoch,
                     cycle_seq,
                     durable_model_totals,
-                ),
+                }),
             }
         }
         observed_event
@@ -15857,15 +17001,21 @@ impl CodexInfoState {
                 None
             };
             if let Some(periods) = authoritative_periods {
-                return periods
+                let mut localized = periods
                     .iter()
                     .map(|period| HistoryPeriod {
                         canonical_reset_at: period.reset_at,
                         start: period.start_at,
                         end: period.end_at,
-                        label: period.label.clone(),
+                        label: self
+                            .i18n
+                            .format_period_selector_label(period.start_at, period.current)
+                            .unwrap_or_default(),
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                localized.retain(|period| !period.label.is_empty());
+                disambiguate_period_start_labels(&mut localized);
+                return localized;
             }
         }
         let projected_history = self.projected_history();
@@ -15894,41 +17044,16 @@ impl CodexInfoState {
             current_history_period_reset(&periods, self.reset_at, observed_at);
         for period in &mut periods {
             let is_current = current_period_reset == Some(period.canonical_reset_at);
-            // The visible current period runs through its next reset, while
-            // `end` is intentionally clipped to `now` for graph rendering.
-            let label_end = if is_current {
-                period.canonical_reset_at
-            } else {
-                period.end
-            };
-            let Some(mut label) = self.i18n.format_period(period.start, label_end) else {
+            let Some(label) = self
+                .i18n
+                .format_period_selector_label(period.start, is_current)
+            else {
                 period.label.clear();
                 continue;
             };
-            if is_current {
-                label.push_str(self.i18n.text(TextKey::CurrentSuffix));
-            }
             period.label = label;
         }
-        let base_labels = periods
-            .iter()
-            .map(|period| period.label.clone())
-            .collect::<Vec<_>>();
-        for index in 0..periods.len() {
-            if base_labels
-                .iter()
-                .filter(|label| **label == base_labels[index])
-                .count()
-                > 1
-            {
-                if let Some(suffix) = self
-                    .i18n
-                    .format_deadline_suffix(periods[index].canonical_reset_at)
-                {
-                    periods[index].label.push_str(&suffix);
-                }
-            }
-        }
+        disambiguate_period_start_labels(&mut periods);
         periods.retain(|period| !period.label.is_empty());
         periods
     }
@@ -15944,6 +17069,13 @@ impl CodexInfoState {
 
     fn selected_history_period_label(&self) -> String {
         let periods = self.history_periods();
+        if let Some(pending) = self.service_history_pending_reset_at {
+            if let Some(period) = periods.iter().find(|period| {
+                period.canonical_reset_at.abs_diff(pending) <= RESET_AT_TOLERANCE_SECONDS as u64
+            }) {
+                return period.label.clone();
+            }
+        }
         if let Some(period) = periods
             .iter()
             .find(|period| period.label == self.selected_history_period)
@@ -15972,17 +17104,27 @@ impl CodexInfoState {
     }
 
     fn graph_history_loading(&self) -> bool {
-        if self.preview || !self.service_split_capable || self.service_history_error.is_some() {
+        if self.preview || !self.service_split_capable {
             return false;
         }
         let Some(current_pair) = self.service_current_pair.as_deref() else {
             return false;
         };
+        // An exact stale-cursor response schedules a head recovery. Until
+        // that recovery commits, keep the last-good scene behind loading;
+        // the transient recovery error is not a terminal empty/error state.
+        if self.service_history_cursor_reset_required {
+            return true;
+        }
+        if self.service_history_error.is_some() {
+            return false;
+        }
         if self.service_history_periods_pair.as_deref() != Some(current_pair) {
             return true;
         }
         let selected_period = self
-            .selected_reset_at
+            .service_history_pending_reset_at
+            .or(self.selected_reset_at)
             .and_then(|selected| {
                 self.service_history_periods.iter().find(|period| {
                     period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
@@ -15995,9 +17137,11 @@ impl CodexInfoState {
             })
             .or_else(|| self.service_history_periods.first());
         let Some(selected_period) = selected_period else {
-            // A complete, same-pair empty periods resource is a confirmed
-            // empty state rather than an in-flight history request.
-            return false;
+            // An empty period list is confirmed only after an empty page has
+            // committed for the same pair. A retained page or an initial
+            // page-less state is still waiting for the history resource.
+            return self.service_history_period_id.is_some()
+                || self.service_history_pair.as_deref() != Some(current_pair);
         };
         self.service_history_pair.as_deref() != Some(current_pair)
             || self.service_history_period_id.as_deref() != Some(selected_period.id.as_str())
@@ -16009,9 +17153,36 @@ impl CodexInfoState {
             .into_iter()
             .find(|period| period.label == label)
         {
-            self.selected_history_period = label.into();
-            self.selected_reset_at = Some(period.canonical_reset_at);
-            if !self.preview {
+            if !self.preview && self.service_split_capable {
+                let same_selection = self.selected_reset_at.is_some_and(|selected| {
+                    selected.abs_diff(period.canonical_reset_at)
+                        <= RESET_AT_TOLERANCE_SECONDS as u64
+                });
+                let selected_period_id = self
+                    .service_history_periods
+                    .iter()
+                    .find(|candidate| {
+                        candidate.reset_at.abs_diff(period.canonical_reset_at)
+                            <= RESET_AT_TOLERANCE_SECONDS as u64
+                    })
+                    .map(|candidate| candidate.id.as_str());
+                let already_committed = same_selection
+                    && self
+                        .service_current_pair
+                        .as_deref()
+                        .is_some_and(|pair| self.service_history_pair.as_deref() == Some(pair))
+                    && selected_period_id.is_some()
+                    && self.service_history_period_id.as_deref() == selected_period_id;
+                self.service_history_pending_reset_at =
+                    (!same_selection).then_some(period.canonical_reset_at);
+                self.service_history_pending_failures = 0;
+                self.service_history_force_poll = !already_committed;
+                self.service_history_error = None;
+            } else {
+                self.selected_history_period = label.into();
+                self.selected_reset_at = Some(period.canonical_reset_at);
+            }
+            if !self.preview && !self.service_split_capable {
                 self.service_history_force_poll = true;
                 self.service_history_error = None;
             }
@@ -16081,7 +17252,12 @@ impl CodexInfoState {
             })
             .or_else(|| periods.first());
         if let Some(period) = selected {
-            self.selected_history_period = period.label.clone();
+            let label = period.label.clone();
+            if !self.preview && self.service_split_capable {
+                self.select_history(&label);
+                return;
+            }
+            self.selected_history_period = label;
             self.selected_reset_at = Some(period.canonical_reset_at);
         } else {
             self.selected_history_period = "履歴なし".into();
@@ -16202,10 +17378,9 @@ impl CodexInfoState {
 
     /// Build graph input from the same canonical rows as the public details
     /// projection, while retaining source quality that the legacy nine-field
-    /// sample cannot carry. Untrusted complete rows become unreliable points;
-    /// Reconstructed session rows and unavailable quota-only observations
-    /// become bounded unreliable points in their canonical period. Neither
-    /// case is extended through an open-ended local gap.
+    /// sample cannot carry. Rows without numeric authority contribute only
+    /// their observed timestamp/quota position; they never become model
+    /// points and are never extended through an open-ended local gap.
     fn graph_samples_for_selection(
         &self,
         selected_reset: i64,
@@ -16215,53 +17390,90 @@ impl CodexInfoState {
         let mut samples = self
             .projected_history()
             .samples_for_reset(Some(selected_reset));
-        let source_by_sample = canonical_model_sources(&self.history.observations, &samples);
-        // Legacy resources cannot name the acquisition source, but their
-        // complete numeric model vector is still an observed value, not an
-        // inferred one. Reconstructed rows are source-backed but remain
-        // untrusted for graph reliability; confirmed gaps remain responsible
-        // for the dashed interval between observations.
+        let (reset_aliases, canonical_resets) = canonical_reset_aliases(&self.history.samples);
+        let service_rows = self
+            .service_history_samples
+            .iter()
+            .filter(|observation| {
+                observation.timestamp >= period_start
+                    && observation.timestamp <= period_end
+                    && observation.reset_at.abs_diff(selected_reset)
+                        <= RESET_AT_TOLERANCE_SECONDS as u64
+            })
+            .collect::<Vec<_>>();
+        let direct_minutes = if !service_rows.is_empty() {
+            service_rows
+                .iter()
+                .filter(|observation| {
+                    observation.model_source == "confirmed" && observation.models_complete
+                })
+                .map(|observation| observation.timestamp.div_euclid(60) * 60)
+                .collect::<BTreeSet<_>>()
+        } else {
+            self.history
+                .observations
+                .iter()
+                .filter(|observation| {
+                    observation.model_source == usage_store::ModelSource::Confirmed
+                        && observation.model_totals_complete
+                        && observation_matches_period_bounds(
+                            observation,
+                            selected_reset,
+                            period_start,
+                            period_end,
+                            &reset_aliases,
+                            &canonical_resets,
+                        )
+                })
+                .map(|observation| observation.timestamp.div_euclid(60) * 60)
+                .collect::<BTreeSet<_>>()
+        };
         let mut untrusted_minutes = samples
             .iter()
-            .filter(|sample| {
-                matches!(
-                    source_by_sample.get(&(sample.reset_at, sample.timestamp)),
-                    Some(
-                        &usage_store::ModelSource::Unavailable
-                            | &usage_store::ModelSource::ReconstructedFromSession
-                    )
-                )
-            })
             .map(|sample| sample.timestamp.div_euclid(60) * 60)
+            .filter(|minute| !direct_minutes.contains(minute))
             .collect::<BTreeSet<_>>();
-        let confirmed_minutes = samples
+        let mut observed_minutes = samples
             .iter()
-            .filter(|sample| {
-                !matches!(
-                    source_by_sample.get(&(sample.reset_at, sample.timestamp)),
-                    Some(
-                        &usage_store::ModelSource::Unavailable
-                            | &usage_store::ModelSource::ReconstructedFromSession
-                    )
-                )
-            })
             .map(|sample| sample.timestamp.div_euclid(60) * 60)
             .collect::<BTreeSet<_>>();
-        let mut unavailable_minutes = BTreeSet::new();
-        let (reset_aliases, canonical_resets) = canonical_reset_aliases(&self.history.samples);
+        // The fixed-column UsageHistorySample is only a timestamp/quota
+        // carrier for generic v3 rows.  Add missing sampling positions with
+        // no model values; graph_model_points_for_selection supplies the
+        // per-model observations independently.  This keeps legacy and bad
+        // source rows visible without converting either into arithmetic
+        // evidence or into three fabricated zero-valued models.
+        for observation in &service_rows {
+            let minute = observation.timestamp.div_euclid(60) * 60;
+            if observed_minutes.insert(minute) {
+                samples.push(UsageHistorySample {
+                    timestamp: minute,
+                    reset_at: selected_reset,
+                    remaining_percent: observation.remaining_percent.unwrap_or(-1.0),
+                    sol_dollars: -1.0,
+                    terra_dollars: -1.0,
+                    luna_dollars: -1.0,
+                    sol_tokens: 0,
+                    terra_tokens: 0,
+                    luna_tokens: 0,
+                });
+            }
+            if !direct_minutes.contains(&minute) {
+                untrusted_minutes.insert(minute);
+            }
+        }
         for observation in self.history.observations.iter().filter(|observation| {
-            observation.model_source == usage_store::ModelSource::Unavailable
-                && observation_matches_period_bounds(
-                    observation,
-                    selected_reset,
-                    period_start,
-                    period_end,
-                    &reset_aliases,
-                    &canonical_resets,
-                )
+            observation_matches_period_bounds(
+                observation,
+                selected_reset,
+                period_start,
+                period_end,
+                &reset_aliases,
+                &canonical_resets,
+            )
         }) {
             let minute = observation.timestamp.div_euclid(60) * 60;
-            if confirmed_minutes.contains(&minute) || !unavailable_minutes.insert(minute) {
+            if !observed_minutes.insert(minute) {
                 continue;
             }
             samples.push(UsageHistorySample {
@@ -16275,10 +17487,38 @@ impl CodexInfoState {
                 terra_tokens: 0,
                 luna_tokens: 0,
             });
-            untrusted_minutes.insert(minute);
+            if !direct_minutes.contains(&minute) {
+                untrusted_minutes.insert(minute);
+            }
         }
         samples.sort_by_key(|sample| (sample.timestamp, sample.reset_at));
         (samples, untrusted_minutes)
+    }
+
+    fn graph_task_activity_for_selection(
+        &self,
+        selected_reset: i64,
+        period_start: i64,
+        period_end: i64,
+    ) -> BTreeMap<i64, Option<bool>> {
+        let mut activity = BTreeMap::new();
+        for observation in self.service_history_samples.iter().filter(|observation| {
+            observation.timestamp >= period_start
+                && observation.timestamp <= period_end
+                && observation.reset_at.abs_diff(selected_reset)
+                    <= RESET_AT_TOLERANCE_SECONDS as u64
+        }) {
+            let minute = observation.timestamp.div_euclid(60) * 60;
+            activity
+                .entry(minute)
+                .and_modify(|accepted| {
+                    if *accepted != observation.task_active_since_previous {
+                        *accepted = None;
+                    }
+                })
+                .or_insert(observation.task_active_since_previous);
+        }
+        activity
     }
 
     fn graph_model_points_for_selection(
@@ -16288,8 +17528,56 @@ impl CodexInfoState {
         period_end: i64,
         model_name: &str,
     ) -> BTreeMap<i64, GraphModelPoint> {
-        let (reset_aliases, canonical_resets) = canonical_reset_aliases(&self.history.samples);
+        // The accepted REST history is the lossless graph authority: unlike
+        // the compatibility store shape it retains each model's persisted
+        // cumulative dollars. A missing dollar is kept unknown so only that
+        // span is interpolated/held; cumulative tokens must never be repriced
+        // wholesale with today's tariff.
         let mut points = BTreeMap::new();
+        let mut has_service_rows = false;
+        for observation in self.service_history_samples.iter().filter(|observation| {
+            observation.timestamp >= period_start
+                && observation.timestamp <= period_end
+                && observation.reset_at.abs_diff(selected_reset)
+                    <= RESET_AT_TOLERANCE_SECONDS as u64
+        }) {
+            has_service_rows = true;
+            let origin = match observation.model_source.as_str() {
+                "confirmed" if observation.models_complete => GraphModelOrigin::Direct,
+                "confirmed" | "legacy-unknown" => GraphModelOrigin::LegacyObserved,
+                // Reconstructed, unavailable and unknown source values are
+                // not point-in-time model observations.  Fail closed for the
+                // model vector while allowing other rows to render.
+                _ => continue,
+            };
+            let model = observation
+                .models
+                .as_deref()
+                .and_then(|models| models.iter().find(|model| model.model == model_name));
+            let Some(model) = model else {
+                // An omitted model is unknown, even in a complete row. A
+                // zero carrier here would become false cumulative evidence
+                // for both the graph and the idle oracle.
+                continue;
+            };
+            let minute = observation.timestamp.div_euclid(60) * 60;
+            points.insert(
+                minute,
+                GraphModelPoint {
+                    // Historical prices are observations, not a function of
+                    // today's tariff.  Missing dollars remain unknown.
+                    dollar: model.total_dollars.unwrap_or(-1.0),
+                    tokens: model.total_tokens as f64,
+                    raw_tokens: Some(model.total_tokens),
+                    origin,
+                },
+            );
+        }
+        if has_service_rows {
+            return points;
+        }
+
+        let (reset_aliases, canonical_resets) = canonical_reset_aliases(&self.history.samples);
         for observation in self.history.observations.iter().filter(|observation| {
             observation_matches_period_bounds(
                 observation,
@@ -16300,80 +17588,68 @@ impl CodexInfoState {
                 &canonical_resets,
             )
         }) {
+            let origin = match observation.model_source {
+                usage_store::ModelSource::Confirmed if observation.model_totals_complete => {
+                    GraphModelOrigin::Direct
+                }
+                usage_store::ModelSource::Confirmed | usage_store::ModelSource::LegacyUnknown => {
+                    GraphModelOrigin::LegacyObserved
+                }
+                usage_store::ModelSource::ReconstructedFromSession
+                | usage_store::ModelSource::Unavailable => continue,
+            };
             let model = observation
                 .model_totals
                 .as_deref()
                 .and_then(|models| models.iter().find(|model| model.model == model_name));
             let minute = observation.timestamp.div_euclid(60) * 60;
-            let reconstructed =
-                observation.model_source == usage_store::ModelSource::ReconstructedFromSession;
-            let complete = observation.model_totals_complete;
             let Some(model) = model else {
-                let legacy = if observation.model_source != usage_store::ModelSource::Unavailable {
-                    match model_name {
-                        "SOL" => observation
-                            .sol_dollars
-                            .zip(observation.sol_tokens)
-                            .map(|(dollar, tokens)| (dollar, tokens as f64)),
-                        "TERRA" => observation
-                            .terra_dollars
-                            .zip(observation.terra_tokens)
-                            .map(|(dollar, tokens)| (dollar, tokens as f64)),
-                        "LUNA" => observation
-                            .luna_dollars
-                            .zip(observation.luna_tokens)
-                            .map(|(dollar, tokens)| (dollar, tokens as f64)),
-                        _ => None,
-                    }
-                } else {
-                    None
+                // If a model vector exists but omits this model, its legacy
+                // fixed columns are not a valid substitute. Only rows with
+                // no model vector at all may use the compatibility columns.
+                if observation.model_totals.is_some() {
+                    continue;
+                }
+                let legacy = match model_name {
+                    "SOL" => observation
+                        .sol_dollars
+                        .zip(observation.sol_tokens)
+                        .map(|(dollar, tokens)| (dollar, tokens)),
+                    "TERRA" => observation
+                        .terra_dollars
+                        .zip(observation.terra_tokens)
+                        .map(|(dollar, tokens)| (dollar, tokens)),
+                    "LUNA" => observation
+                        .luna_dollars
+                        .zip(observation.luna_tokens)
+                        .map(|(dollar, tokens)| (dollar, tokens)),
+                    _ => None,
                 };
                 if let Some((dollar, tokens)) = legacy {
                     points.insert(
                         minute,
                         GraphModelPoint {
                             dollar,
-                            tokens,
-                            reliable: !reconstructed,
-                            published: true,
+                            tokens: tokens as f64,
+                            raw_tokens: Some(tokens),
+                            origin,
                         },
                     );
                     continue;
                 }
-                // A complete model set makes absence an observed zero. An
-                // incomplete set says nothing about an omitted model and must
-                // not manufacture a zero line.
-                if complete {
-                    points.insert(
-                        minute,
-                        GraphModelPoint {
-                            dollar: 0.0,
-                            tokens: 0.0,
-                            reliable: !reconstructed,
-                            published: false,
-                        },
-                    );
-                }
+                // Row-level completeness never turns an omitted cumulative
+                // period model into zero. Only an explicitly published zero
+                // is a zero-valued observation.
                 continue;
             };
-            // Completeness describes the model set, not the evidence quality
-            // of a row that is present. A row recovered from the session log
-            // is source-backed but remains unreliable for graph rendering.
+            // The compatibility store retains exact legacy dollars only for
+            // these fixed models. Generic token totals without a persisted
+            // dollar remain unknown; current prices are not historical data.
             let dollar = match model_name {
                 "SOL" => observation.sol_dollars,
                 "TERRA" => observation.terra_dollars,
                 "LUNA" => observation.luna_dollars,
-                _ => ModelUsageRow {
-                    name: model.model.clone(),
-                    tokens: model.total_tokens,
-                    input_tokens: model.input_tokens,
-                    cached_input_tokens: model.cached_input_tokens,
-                    output_tokens: model.output_tokens,
-                    cache_write_input_tokens: model.cache_write_input_tokens,
-                }
-                .public_v3()
-                .estimated_cost
-                .map(|cost| cost.total_dollars),
+                _ => None,
             }
             .unwrap_or(-1.0);
             points.insert(
@@ -16381,8 +17657,8 @@ impl CodexInfoState {
                 GraphModelPoint {
                     dollar,
                     tokens: model.total_tokens as f64,
-                    reliable: !reconstructed,
-                    published: true,
+                    raw_tokens: Some(model.total_tokens),
+                    origin,
                 },
             );
         }
@@ -16390,16 +17666,26 @@ impl CodexInfoState {
     }
 
     #[cfg(test)]
-    fn graph_trusted_complete_minutes(
+    fn graph_projection_minutes_for_selection(
         &self,
         selected_reset: i64,
         period_start: i64,
         period_end: i64,
-        model_names: &BTreeSet<String>,
     ) -> BTreeSet<i64> {
-        let legacy_universe = model_names
+        let service_minutes = self
+            .service_history_samples
             .iter()
-            .all(|name| matches!(name.as_str(), "SOL" | "TERRA" | "LUNA"));
+            .filter(|observation| {
+                observation.timestamp >= period_start
+                    && observation.timestamp <= period_end
+                    && observation.reset_at.abs_diff(selected_reset)
+                        <= RESET_AT_TOLERANCE_SECONDS as u64
+            })
+            .map(|observation| observation.timestamp.div_euclid(60) * 60)
+            .collect::<BTreeSet<_>>();
+        if !service_minutes.is_empty() {
+            return service_minutes;
+        }
         let (reset_aliases, canonical_resets) = canonical_reset_aliases(&self.history.samples);
         self.history
             .observations
@@ -16412,16 +17698,7 @@ impl CodexInfoState {
                     period_end,
                     &reset_aliases,
                     &canonical_resets,
-                ) && observation.model_source == usage_store::ModelSource::Confirmed
-                    && (observation.model_totals_complete
-                        || (observation.model_totals.is_none()
-                            && legacy_universe
-                            && observation.sol_dollars.is_some()
-                            && observation.terra_dollars.is_some()
-                            && observation.luna_dollars.is_some()
-                            && observation.sol_tokens.is_some()
-                            && observation.terra_tokens.is_some()
-                            && observation.luna_tokens.is_some()))
+                )
             })
             .map(|observation| observation.timestamp.div_euclid(60) * 60)
             .collect()
@@ -16433,6 +17710,30 @@ impl CodexInfoState {
         period_start: i64,
         period_end: i64,
     ) -> BTreeSet<String> {
+        let service_rows = self
+            .service_history_samples
+            .iter()
+            .filter(|observation| {
+                observation.timestamp >= period_start
+                    && observation.timestamp <= period_end
+                    && observation.reset_at.abs_diff(selected_reset)
+                        <= RESET_AT_TOLERANCE_SECONDS as u64
+            })
+            .collect::<Vec<_>>();
+        if !service_rows.is_empty() {
+            return service_rows
+                .into_iter()
+                .filter(|observation| {
+                    matches!(
+                        observation.model_source.as_str(),
+                        "confirmed" | "legacy-unknown"
+                    )
+                })
+                .filter_map(|observation| observation.models.as_deref())
+                .flatten()
+                .map(|model| model.model.clone())
+                .collect();
+        }
         let (reset_aliases, canonical_resets) = canonical_reset_aliases(&self.history.samples);
         let mut model_names = BTreeSet::new();
         for observation in self.history.observations.iter().filter(|observation| {
@@ -16445,6 +17746,13 @@ impl CodexInfoState {
                 &canonical_resets,
             )
         }) {
+            if matches!(
+                observation.model_source,
+                usage_store::ModelSource::ReconstructedFromSession
+                    | usage_store::ModelSource::Unavailable
+            ) {
+                continue;
+            }
             if let Some(models) = observation.model_totals.as_ref() {
                 model_names.extend(models.iter().map(|model| model.model.clone()));
                 continue;
@@ -16474,19 +17782,13 @@ impl CodexInfoState {
         show_tokens: bool,
         confirmed_gaps: &[GraphConfirmedGap],
     ) -> (GraphModelTimelines, BTreeSet<i64>) {
-        let model_names =
-            self.graph_model_universe_for_selection(selected_reset, period_start, period_end);
-        let trusted_complete_minutes = self.graph_trusted_complete_minutes(
-            selected_reset,
-            period_start,
-            period_end,
-            &model_names,
-        );
+        let projection_minutes =
+            self.graph_projection_minutes_for_selection(selected_reset, period_start, period_end);
         let raw_model_timelines =
             self.graph_raw_model_timelines_for_selection(selected_reset, period_start, period_end);
         accepted_graph_model_timelines(
             &raw_model_timelines,
-            &trusted_complete_minutes,
+            &projection_minutes,
             show_tokens,
             confirmed_gaps,
         )
@@ -16572,18 +17874,23 @@ impl CodexInfoState {
             .collect::<Vec<_>>();
         let raw_model_timelines =
             self.graph_raw_model_timelines_for_selection(selected_reset, period_start, period_end);
-        let mut paths = graph_paths_for_selection_with_sources_and_astra_with_lineage(
-            &sample_references,
-            period_start,
-            period_end,
-            show_luna,
-            show_terra,
-            show_sol,
-            show_astra,
-            show_tokens,
-            &untrusted_minutes,
-            &confirmed_gaps,
-            &raw_model_timelines,
+        let task_activity =
+            self.graph_task_activity_for_selection(selected_reset, period_start, period_end);
+        let mut paths = graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+            GraphSelectionInput {
+                samples: &sample_references,
+                period_start,
+                period_end,
+                show_luna,
+                show_terra,
+                show_sol,
+                show_astra,
+                show_tokens,
+                untrusted_minutes: &untrusted_minutes,
+                confirmed_gaps: &confirmed_gaps,
+                model_timelines: &raw_model_timelines,
+            },
+            Some(&task_activity),
         );
         if !self.has_quota_percent {
             paths.remaining.clear();
@@ -16599,9 +17906,14 @@ impl CodexInfoState {
 
 fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
     graph.set_strings(ui_strings(&state.i18n));
-    graph.set_history_loading(state.graph_history_loading());
+    graph.set_history_loading(
+        state.selected_account_view_loading() || state.graph_history_loading(),
+    );
     graph.set_history_load_error(
-        !state.preview && state.service_split_capable && state.service_history_error.is_some(),
+        !state.preview
+            && state.service_split_capable
+            && state.service_history_error.is_some()
+            && !state.service_history_cursor_reset_required,
     );
     graph.set_window_title(
         native_detail_window_title(
@@ -16633,7 +17945,7 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
         graph.get_show_astra(),
     );
     let time_labels = state.graph_time_labels_at(observed_at);
-    graph.set_graph_data(state.graph_data().into());
+    graph.set_has_graph_data(paths.has_data);
     graph.set_unused_intervals(slint::ModelRc::new(slint::VecModel::from(
         paths
             .unused_intervals
@@ -16644,6 +17956,17 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
             })
             .collect::<Vec<_>>(),
     )));
+    let account_options = state.account_selector_options();
+    graph.set_account_options(slint::ModelRc::new(slint::VecModel::from(
+        account_options
+            .iter()
+            .cloned()
+            .map(slint::SharedString::from)
+            .collect::<Vec<_>>(),
+    )));
+    graph.set_selected_account_index(
+        i32::try_from(state.selected_account_index()).unwrap_or(i32::MAX),
+    );
     let history_period_options = state.history_period_options();
     graph.set_has_history_options(
         !history_period_options.is_empty()
@@ -16654,12 +17977,29 @@ fn sync_graph_window(state: &CodexInfoState, graph: &GraphWindow) {
         .iter()
         .position(|period| period == &selected_history_period)
         .unwrap_or(0);
-    graph.set_history_period_options(slint::ModelRc::new(slint::VecModel::from(
-        history_period_options
-            .into_iter()
-            .map(slint::SharedString::from)
-            .collect::<Vec<_>>(),
-    )));
+    let current_history_period_options = graph.get_history_period_options();
+    let history_period_options_changed = current_history_period_options.row_count()
+        != history_period_options.len()
+        || history_period_options
+            .iter()
+            .enumerate()
+            .any(|(index, expected)| {
+                current_history_period_options
+                    .row_data(index)
+                    .is_none_or(|actual| actual.as_str() != expected)
+            });
+    // Replacing the model while the popup is open rebuilds every row under
+    // the pointer and resets ListView interaction. Keep the existing model
+    // when the period labels have not changed; real period changes still
+    // publish a fresh model on the next sync.
+    if history_period_options_changed {
+        graph.set_history_period_options(slint::ModelRc::new(slint::VecModel::from(
+            history_period_options
+                .into_iter()
+                .map(slint::SharedString::from)
+                .collect::<Vec<_>>(),
+        )));
+    }
     graph.set_selected_history_index(i32::try_from(selected_history_index).unwrap_or(i32::MAX));
     graph.set_metric_options(slint::ModelRc::new(slint::VecModel::from(vec![
         slint::SharedString::from(state.i18n.text(TextKey::DollarMetric)),
@@ -17275,6 +18615,8 @@ fn ui_strings(i18n: &I18n) -> UiStrings {
         check_auth: i18n.text(TextKey::CheckAuth).into(),
         auth_cli: i18n.text(TextKey::AuthCli).into(),
         no_history: i18n.text(TextKey::NoHistory).into(),
+        account_selector_heading: i18n.account_selector_heading().into(),
+        period_selector_heading: i18n.period_selector_heading().into(),
     }
 }
 
@@ -17296,6 +18638,7 @@ fn normal_status_text(remaining: f64, seconds: i64, last_success_at: Option<&str
     }
 }
 
+#[cfg(test)]
 fn automatic_refresh_interval(authenticated: bool, auth_polling: bool) -> Duration {
     if !authenticated && auth_polling {
         Duration::from_secs(2)
@@ -17304,6 +18647,7 @@ fn automatic_refresh_interval(authenticated: bool, auth_polling: bool) -> Durati
     }
 }
 
+#[cfg(test)]
 fn account_refresh_due(
     now: Instant,
     last_poll: Instant,
@@ -17368,6 +18712,10 @@ impl CodexInfoState {
     fn status_level(&self) -> &'static str {
         if self.has_display_error() {
             "error"
+        } else if self.selected_account_is_historical() {
+            // A closed account has no live reset countdown or low-quota
+            // warning. Its quota is the value at the final observation.
+            "info"
         } else if self.reset_at.is_some() && self.seconds_to_reset().abs() <= 86_400
             || (self.has_quota_percent && self.remaining_percent.unwrap_or(0.0) <= 10.0)
         {
@@ -17398,6 +18746,11 @@ impl CodexInfoState {
             } else {
                 self.i18n.text(TextKey::CannotFetchUsage).into()
             };
+        }
+        if self.selected_account_is_historical() {
+            return self
+                .i18n
+                .format_historical_account_status(self.last_success_at);
         }
         match self.status.as_str() {
             "Codex app-serverへ接続しています…" => {
@@ -17490,6 +18843,8 @@ impl CodexInfoState {
     }
 
     fn sync_ui(&self, ui: &MainWindow) {
+        let historical_account = self.selected_account_is_historical();
+        let account_view_loading = self.selected_account_view_loading();
         let remaining = self
             .remaining_percent
             .map(|remaining| remaining.clamp(0.0, 100.0))
@@ -17500,29 +18855,46 @@ impl CodexInfoState {
             .map(|reset_at| self.period_seconds_for_reset(reset_at))
             .unwrap_or(self.window_seconds.max(WEEK_SECONDS));
         ui.set_authenticated(self.authenticated);
+        ui.set_historical_account(historical_account);
+        ui.set_account_view_loading(account_view_loading);
+        let account_options = self.account_selector_options();
+        ui.set_account_options(slint::ModelRc::new(slint::VecModel::from(
+            account_options
+                .into_iter()
+                .map(slint::SharedString::from)
+                .collect::<Vec<_>>(),
+        )));
+        ui.set_selected_account_index(
+            i32::try_from(self.selected_account_index()).unwrap_or(i32::MAX),
+        );
         ui.set_strings(ui_strings(&self.i18n));
         ui.set_has_usage(self.has_visible_usage());
         ui.set_has_auth_url(self.auth_url.is_some());
         ui.set_checking(self.checking);
         ui.set_has_error(self.has_display_error());
         ui.set_service_unavailable(self.service_endpoint_error.is_some());
-        ui.set_startup_loading(native_startup_loading(
-            self.authenticated,
-            self.has_visible_usage(),
-            self.local_usage_error,
-            self.account_error.is_some(),
-            self.has_display_error(),
-        ));
+        ui.set_startup_loading(
+            account_view_loading
+                || native_startup_loading(
+                    self.authenticated,
+                    self.has_visible_usage(),
+                    self.local_usage_error,
+                    self.account_error.is_some(),
+                    self.has_display_error(),
+                ),
+        );
         ui.set_window_title(native_account_window_title(&self.window_title()).into());
-        let quota_title = if self.monthly {
-            self.i18n.text(TextKey::MonthlyQuotaRemaining)
+        let quota_title = if historical_account {
+            self.i18n.historical_quota_title(self.monthly)
+        } else if self.monthly {
+            self.i18n.text(TextKey::MonthlyQuotaRemaining).into()
         } else if self.quota_title == "利用枠" {
-            self.i18n.text(TextKey::UsageLimit)
+            self.i18n.text(TextKey::UsageLimit).into()
         } else {
-            self.i18n.text(TextKey::QuotaRemaining)
+            self.i18n.text(TextKey::QuotaRemaining).into()
         };
         ui.set_quota_title(
-            security::shorten_unicode(quota_title, security::MAX_LIMIT_NAME_SCALARS).into(),
+            security::shorten_unicode(&quota_title, security::MAX_LIMIT_NAME_SCALARS).into(),
         );
         ui.set_has_quota_percent(self.has_quota_percent);
         ui.set_remaining_label(
@@ -17533,7 +18905,7 @@ impl CodexInfoState {
             }
             .into(),
         );
-        ui.set_week_label(if self.has_quota_percent {
+        ui.set_week_label(if self.has_quota_percent && !historical_account {
             self.i18n
                 .format_period_remaining(
                     seconds,
@@ -17581,7 +18953,7 @@ impl CodexInfoState {
         ui.set_status(self.display_status().into());
         ui.set_status_level(self.status_level().into());
         ui.set_remaining_percent(remaining as f32);
-        ui.set_remaining_days(if self.has_quota_percent {
+        ui.set_remaining_days(if self.has_quota_percent && !historical_account {
             (seconds.max(0) as f32 / period_seconds.max(1) as f32 * 7.0).clamp(0.0, 7.0)
         } else {
             0.0
@@ -17674,7 +19046,9 @@ fn format_period_label(start: i64, end: i64) -> String {
 impl Drop for CodexInfoState {
     fn drop(&mut self) {
         let _ = self.bridge.send(AccountCommand::Stop);
+        #[cfg(test)]
         self.stop_thread_bridge();
+        #[cfg(test)]
         let _ = self.local_bridge.send(LocalCommand::Stop);
     }
 }
@@ -18148,7 +19522,11 @@ fn clamp_graph_preview_size((width, height): (u32, u32)) -> (u32, u32) {
 }
 
 const DEFAULT_SERVICE_ADDRESS: &str = "127.0.0.1:8787";
-const BACKGROUND_SERVICE_START_TIMEOUT: Duration = Duration::from_secs(5);
+// Transport completion must fit the standalone REST server's own three-second
+// request budget. Performance-derived polling values are intentionally left
+// to the separately planned post-optimization measurement work.
+const SERVICE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
 const BACKGROUND_CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const DETAILS_RESPONSE_MAX_BYTES: usize = 32 * 1024 * 1024;
 const DETAILS_RESPONSE_HEADER_MAX_BYTES: usize = 8 * 1024;
@@ -18387,6 +19765,9 @@ fn parse_details_v2_document(bytes: &[u8]) -> Result<PublicDetailsV2, String> {
     {
         return Err("details document api_version is not v2".into());
     }
+    if let Some(rows) = object.get_mut("history_samples") {
+        sanitize_untrusted_history_v2_json_rows(rows);
+    }
     let details: PublicDetailsV2 =
         serde_json::from_value(document).map_err(|error| error.to_string())?;
     details.validate().map_err(|error| error.to_string())?;
@@ -18422,6 +19803,98 @@ fn parse_details_v2_document(bytes: &[u8]) -> Result<PublicDetailsV2, String> {
     Ok(details)
 }
 
+fn sanitize_untrusted_history_observation_v3(observation: &mut PublicHistoryObservationV3) {
+    match observation.model_source.as_str() {
+        "confirmed" if observation.models_complete && observation.models.is_some() => {}
+        "confirmed" if observation.models.is_some() => {
+            // The values may be stored observations, but the endpoint did not
+            // prove a complete generic model set.  Keep them display-only.
+            observation.model_source = "legacy-unknown".to_owned();
+            observation.models_complete = false;
+        }
+        "legacy-unknown" => {
+            observation.models_complete = false;
+        }
+        "reconstructed-from-session" | "unavailable" => {
+            // These sources can retain independently observed quota/time
+            // metadata, never a model vector reconstructed by the service.
+            observation.models = None;
+            observation.models_complete = false;
+        }
+        _ => {
+            // An unknown future/broken source must not discard other valid
+            // rows from the response or become numeric graph evidence.
+            observation.models = None;
+            observation.models_complete = false;
+            observation.model_source = "unavailable".to_owned();
+        }
+    }
+}
+
+/// Remove model numerics from rows whose source cannot authorize them before
+/// typed decoding. This isolates an old/broken REST row without allowing its
+/// payload shape to reject otherwise valid observations in the same page.
+fn sanitize_untrusted_history_json_rows(rows: &mut Value) {
+    let Some(rows) = rows.as_array_mut() else {
+        return;
+    };
+    for row in rows {
+        let Some(object) = row.as_object_mut() else {
+            continue;
+        };
+        let source = object.get("model_source").and_then(Value::as_str);
+        if matches!(source, Some("confirmed" | "legacy-unknown")) {
+            continue;
+        }
+        if !matches!(source, Some("reconstructed-from-session" | "unavailable")) {
+            object.insert(
+                "model_source".to_owned(),
+                Value::String("unavailable".to_owned()),
+            );
+        }
+        object.insert("models".to_owned(), Value::Null);
+        object.insert("models_complete".to_owned(), Value::Bool(false));
+    }
+}
+
+fn sanitize_untrusted_history_v2_json_rows(rows: &mut Value) {
+    let Some(rows) = rows.as_array_mut() else {
+        return;
+    };
+    const MODEL_FIELDS: [&str; 6] = [
+        "sol_dollars",
+        "terra_dollars",
+        "luna_dollars",
+        "sol_tokens",
+        "terra_tokens",
+        "luna_tokens",
+    ];
+    for row in rows {
+        let Some(object) = row.as_object_mut() else {
+            continue;
+        };
+        let source = object.get("model_source").and_then(Value::as_str);
+        if matches!(source, Some("confirmed" | "legacy-unknown")) {
+            continue;
+        }
+        if !matches!(source, Some("reconstructed-from-session" | "unavailable")) {
+            object.insert(
+                "model_source".to_owned(),
+                Value::String("unavailable".to_owned()),
+            );
+        }
+        for field in MODEL_FIELDS {
+            object.insert(field.to_owned(), Value::Null);
+        }
+    }
+}
+
+fn sanitize_untrusted_history_v3(samples: &mut [PublicHistoryObservationV3]) {
+    for sample in samples {
+        sanitize_untrusted_history_observation_v3(sample);
+    }
+}
+
 fn parse_details_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, String> {
     let mut document = decode_unique_json(bytes)?;
     let object = document
@@ -18453,8 +19926,12 @@ fn parse_details_v3_document(bytes: &[u8]) -> Result<PublicDetailsV3, String> {
     {
         return Err("details document api_version is not v3".into());
     }
-    let details: PublicDetailsV3 =
+    if let Some(rows) = object.get_mut("history_samples") {
+        sanitize_untrusted_history_json_rows(rows);
+    }
+    let mut details: PublicDetailsV3 =
         serde_json::from_value(document).map_err(|error| error.to_string())?;
+    sanitize_untrusted_history_v3(&mut details.history_samples);
     details.validate().map_err(|error| error.to_string())?;
     if details.active_thread_count != details.threads.len() as u64 {
         return Err("details thread count does not match rows".into());
@@ -18507,34 +19984,75 @@ fn request_service_details_with_etag(
     route: &str,
     if_none_match: Option<&str>,
 ) -> Result<ServiceDetailsHttpResponse, String> {
+    request_service_details_with_etag_and_timeout(
+        address,
+        route,
+        if_none_match,
+        SERVICE_RESPONSE_TIMEOUT,
+    )
+}
+
+fn service_response_remaining(deadline: Instant) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "details response deadline exceeded".to_owned())
+}
+
+fn request_service_details_with_etag_and_timeout(
+    address: SocketAddr,
+    route: &str,
+    if_none_match: Option<&str>,
+    timeout: Duration,
+) -> Result<ServiceDetailsHttpResponse, String> {
     if let Some(pair) = if_none_match {
         if !valid_published_pair(pair) {
             return Err("invalid details generation header".into());
         }
     }
-    let timeout = Duration::from_millis(500);
-    let mut stream = TcpStream::connect_timeout(&address, timeout).map_err(|_| "connect failed")?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|_| "read timeout setup failed")?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|_| "write timeout setup failed")?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "details response deadline is invalid".to_owned())?;
+    let mut stream = TcpStream::connect_timeout(&address, service_response_remaining(deadline)?)
+        .map_err(|_| "connect failed")?;
     let conditional = if_none_match
         .map(|pair| format!("If-None-Match: \"{pair}\"\r\n"))
         .unwrap_or_default();
     let request = format!(
         "GET {route} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n{conditional}\r\n"
     );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|_| "details request failed")?;
+    let mut request_offset = 0;
+    while request_offset < request.len() {
+        stream
+            .set_write_timeout(Some(service_response_remaining(deadline)?))
+            .map_err(|_| "write timeout setup failed")?;
+        let written = stream
+            .write(&request.as_bytes()[request_offset..])
+            .map_err(|_| "details request failed")?;
+        if written == 0 {
+            return Err("details request failed".into());
+        }
+        request_offset += written;
+    }
     let maximum = DETAILS_RESPONSE_MAX_BYTES + DETAILS_RESPONSE_HEADER_MAX_BYTES + 1;
-    let mut response = Vec::new();
-    stream
-        .take(maximum as u64)
-        .read_to_end(&mut response)
-        .map_err(|_| "details response read failed")?;
+    let mut response = Vec::with_capacity(maximum.min(8 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        stream
+            .set_read_timeout(Some(service_response_remaining(deadline)?))
+            .map_err(|_| "read timeout setup failed")?;
+        let available = (maximum - response.len()).min(buffer.len());
+        let read = stream
+            .read(&mut buffer[..available])
+            .map_err(|_| "details response read failed")?;
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&buffer[..read]);
+        if response.len() >= maximum {
+            break;
+        }
+    }
     if response.len() >= maximum {
         return Err("details response exceeds bounded size".into());
     }
@@ -18572,12 +20090,16 @@ fn request_service_details_with_etag(
         let (name, value) = line
             .split_once(": ")
             .ok_or_else(|| "details response header is malformed".to_owned())?;
-        match name {
-            "Codex-Info-Published-Pair" if pair.is_none() => pair = Some(value.to_owned()),
-            "content-type" if !content_type && value == "application/json; charset=utf-8" => {
+        let name = name.to_ascii_lowercase();
+        match name.as_str() {
+            "codex-info-published-pair" if pair.is_none() => pair = Some(value.to_owned()),
+            "content-type"
+                if !content_type
+                    && value.eq_ignore_ascii_case("application/json; charset=utf-8") =>
+            {
                 content_type = true;
             }
-            "cache-control" if !cache_control && value == "no-store" => {
+            "cache-control" if !cache_control && value.eq_ignore_ascii_case("no-store") => {
                 cache_control = true;
             }
             "content-length" if content_length.is_none() => {
@@ -18587,11 +20109,18 @@ fn request_service_details_with_etag(
                         .map_err(|_| "invalid details content length")?,
                 );
             }
-            "connection" if !connection_close && value == "close" => connection_close = true,
+            "connection" if !connection_close && value.eq_ignore_ascii_case("close") => {
+                connection_close = true;
+            }
             _ => return Err("unexpected or duplicate details response header".into()),
         }
     }
-    if status == 200 || status == 304 {
+    // The account directory is metadata rather than a snapshot generation;
+    // the standalone REST owner intentionally omits the published-pair
+    // header there. Every other successful details resource remains bound to
+    // one immutable generation.
+    let account_directory = route == "/v3/accounts";
+    if (status == 200 || status == 304) && !account_directory {
         let pair_value = pair
             .as_deref()
             .ok_or_else(|| "missing details generation header".to_owned())?;
@@ -18599,7 +20128,10 @@ fn request_service_details_with_etag(
             return Err("details response generation header is invalid".into());
         }
     }
-    if status != 200 && status != 304 && pair.is_some() {
+    if account_directory && status != 200 {
+        return Err("accounts response is not HTTP 200".into());
+    }
+    if !account_directory && status != 200 && status != 304 && pair.is_some() {
         return Err("non-success details response has a generation header".into());
     }
     if !content_type || !cache_control || !connection_close {
@@ -18908,12 +20440,13 @@ fn parse_service_history_page_document(bytes: &[u8]) -> Result<ServiceHistoryPag
                 .ok_or_else(|| "history page resume_cursor is invalid".to_owned())
         })
         .transpose()?;
-    let samples: Vec<PublicHistoryObservationV3> = serde_json::from_value(
-        object
-            .remove("history_samples")
-            .ok_or_else(|| "history page document is missing samples".to_owned())?,
-    )
-    .map_err(|error| error.to_string())?;
+    let mut history_rows = object
+        .remove("history_samples")
+        .ok_or_else(|| "history page document is missing samples".to_owned())?;
+    sanitize_untrusted_history_json_rows(&mut history_rows);
+    let mut samples: Vec<PublicHistoryObservationV3> =
+        serde_json::from_value(history_rows).map_err(|error| error.to_string())?;
+    sanitize_untrusted_history_v3(&mut samples);
     let gaps: Vec<PublicHistoryGap> = serde_json::from_value(
         object
             .remove("history_gaps")
@@ -19022,6 +20555,8 @@ enum ServiceResourceFetch<T> {
     NotModified { pair: String },
 }
 
+type ServiceThreadsResource = (Option<u64>, Vec<PublicThread>);
+
 fn fetch_service_history_periods_with_etag<F>(
     mut request: F,
     prior_pair: Option<&str>,
@@ -19051,6 +20586,136 @@ where
         pair,
         value: periods,
     })
+}
+
+fn valid_public_account_id(value: &str) -> bool {
+    let Some(number) = value.strip_prefix("account-") else {
+        return false;
+    };
+    !number.is_empty()
+        && !number.starts_with('0')
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+        && number.parse::<u64>().is_ok()
+}
+
+fn validate_service_accounts(document: &ServiceAccountsV3Document) -> Result<(), String> {
+    if document.api_version != "v3" {
+        return Err("accounts document api_version is not v3".into());
+    }
+    if document.accounts.is_empty() || document.accounts.len() > MAX_SERVICE_ACCOUNTS {
+        return Err("accounts document exceeds the public safety bound".into());
+    }
+    if !valid_public_account_id(&document.default_account_id) {
+        return Err("accounts document has no valid default account".into());
+    }
+    let mut ids = BTreeSet::new();
+    let mut current_count = 0usize;
+    let mut default_is_current = false;
+    for account in &document.accounts {
+        if !valid_public_account_id(&account.id) || !ids.insert(account.id.as_str()) {
+            return Err("accounts document contains an invalid or duplicate public id".into());
+        }
+        if account.login_id.as_deref().is_some_and(|value| {
+            value.is_empty()
+                || value.trim() != value
+                || value.chars().count() > 254
+                || value.chars().any(char::is_control)
+        }) {
+            return Err("accounts document contains an invalid login id".into());
+        }
+        for timestamp in [account.activation_at, account.deactivation_at]
+            .into_iter()
+            .flatten()
+        {
+            if DateTime::<Utc>::from_timestamp(timestamp, 0).is_none() {
+                return Err("accounts document contains an invalid lifecycle timestamp".into());
+            }
+        }
+        if account
+            .activation_at
+            .zip(account.deactivation_at)
+            .is_some_and(|(activation, deactivation)| activation > deactivation)
+        {
+            return Err("accounts document contains a reversed lifecycle boundary".into());
+        }
+        if account.is_current {
+            current_count = current_count.saturating_add(1);
+        }
+        if account.id == document.default_account_id {
+            default_is_current = account.is_current;
+        }
+    }
+    if !ids.contains(document.default_account_id.as_str())
+        || !default_is_current
+        || current_count != 1
+    {
+        return Err("accounts document default id is not present in accounts".into());
+    }
+    Ok(())
+}
+
+fn parse_service_accounts_v3_document(bytes: &[u8]) -> Result<ServiceAccountsV3Document, String> {
+    let mut document = decode_unique_json(bytes)?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| "accounts document is not an object".to_owned())?;
+    let expected = BTreeSet::from(["accounts", "api_version", "default_account_id"]);
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err("accounts document fields differ from v3".into());
+    }
+    let accounts: ServiceAccountsV3Document =
+        serde_json::from_value(document).map_err(|error| error.to_string())?;
+    validate_service_accounts(&accounts)?;
+    Ok(accounts)
+}
+
+fn service_account_labels(accounts: &[ServiceAccountV3], i18n: &I18n) -> Vec<String> {
+    let base = accounts
+        .iter()
+        .map(|account| {
+            let number = account.id.strip_prefix("account-").unwrap_or(&account.id);
+            let identity = account
+                .login_id
+                .clone()
+                .unwrap_or_else(|| format!("アカウント {number} · ID未復元"));
+            format!(
+                "{identity}{}",
+                i18n.account_selector_status(account.is_current)
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut counts = BTreeMap::new();
+    for label in &base {
+        *counts.entry(label.clone()).or_insert(0usize) += 1;
+    }
+    base.into_iter()
+        .zip(accounts)
+        .map(|(label, account)| {
+            if counts.get(&label).copied().unwrap_or(0) > 1 {
+                format!("{label} · {}", account.id)
+            } else {
+                label
+            }
+        })
+        .collect()
+}
+
+/// Add the selected public account to every v3 data read. `/v3/accounts` is
+/// the directory itself and therefore intentionally has no account selector.
+/// Legacy v1/v2 fallback routes remain unchanged.
+fn service_route_with_account(route: &str, account_id: Option<&str>) -> String {
+    if !route.starts_with("/v3/") || route == "/v3/accounts" {
+        return route.to_owned();
+    }
+    let Some(account_id) = account_id else {
+        return route.to_owned();
+    };
+    let separator = if route.contains('?') { '&' } else { '?' };
+    format!(
+        "{route}{separator}account={}",
+        percent_encode_query_component(account_id)
+    )
 }
 
 fn percent_encode_query_component(value: &str) -> String {
@@ -19137,7 +20802,7 @@ where
 fn fetch_service_threads_with_etag<F>(
     mut request: F,
     prior_pair: Option<&str>,
-) -> Result<ServiceResourceFetch<(Option<u64>, Vec<PublicThread>)>, String>
+) -> Result<ServiceResourceFetch<ServiceThreadsResource>, String>
 where
     F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
 {
@@ -19171,12 +20836,9 @@ fn cli_error(key: CliTextKey) -> String {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LaunchMode {
-    /// Mode 1: one resident owner containing recorder + REST.
-    Service(ApiServerConfig),
-    /// Mode 2: ensure a resident service exists at this address, then add X UI.
-    All(ApiServerConfig),
-    /// Stop this profile's verified resident service and wait for its lock to disappear.
-    Stop,
+    /// The public binary is a REST client. Recorder and REST are separate
+    /// packaged executables and are never started by this process.
+    Ui(ApiServerConfig),
     /// Print CLI usage without starting a daemon or UI.
     Help,
 }
@@ -19209,27 +20871,31 @@ where
 {
     let arguments = arguments.into_iter().collect::<Vec<_>>();
     match arguments.as_slice() {
-        [] => default_service_config().map(LaunchMode::Service),
+        [] => default_service_config().map(LaunchMode::Ui),
         [value] if value == "--help" || value == "--h" || value == "-h" => Ok(LaunchMode::Help),
-        [value] if value == "--ui" => default_service_config().map(LaunchMode::All),
-        [stop] if stop == "--stop" => Ok(LaunchMode::Stop),
-        [port, value] if port == "--port" => {
-            service_config_for_port(value).map(LaunchMode::Service)
+        [value] if value == "--ui" => default_service_config().map(LaunchMode::Ui),
+        // These were legacy combined-service controls. Reject them before
+        // probing, stopping, binding, or spawning anything.
+        [stop] if stop == "--stop" => Err(I18n::detect().language().launch_help().to_owned()),
+        [port, _value] if port == "--port" => {
+            Err(I18n::detect().language().launch_help().to_owned())
         }
         [ui, port, value] if ui == "--ui" && port == "--port" => {
-            service_config_for_port(value).map(LaunchMode::All)
+            service_config_for_port(value).map(LaunchMode::Ui)
         }
         _ => Err(I18n::detect().language().launch_help().to_owned()),
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum ServiceHealthVersion {
     Current,
     Different,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum ServiceEndpointState {
     Absent,
     Current,
@@ -19247,6 +20913,7 @@ struct VersionedServiceHealth {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg(test)]
 struct LegacyServiceHealth {
     api_version: String,
     service: String,
@@ -19254,6 +20921,7 @@ struct LegacyServiceHealth {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
+#[cfg(test)]
 enum ServiceHealthDocument {
     Versioned(VersionedServiceHealth),
     Legacy(LegacyServiceHealth),
@@ -19272,6 +20940,7 @@ fn is_stable_product_version(value: &str) -> bool {
         && components.next().is_none()
 }
 
+#[cfg(test)]
 fn service_health_response_version(response: &[u8]) -> Option<ServiceHealthVersion> {
     if !response.starts_with(b"HTTP/1.1 200 ") {
         return None;
@@ -19309,6 +20978,7 @@ fn is_service_health_response(response: &[u8]) -> bool {
     service_health_response_version(response) == Some(ServiceHealthVersion::Current)
 }
 
+#[cfg(test)]
 fn service_endpoint_state(address: SocketAddr) -> ServiceEndpointState {
     let timeout = Duration::from_millis(150);
     let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
@@ -19408,66 +21078,10 @@ fn service_is_healthy(address: SocketAddr) -> bool {
         && is_stable_product_version(&document.product_version)
 }
 
-fn recorder_owner_is_healthy(owner: &daemon::DaemonOwnerIdentity) -> bool {
-    let Ok(Some(state)) = daemon::read_recorder_state() else {
-        return false;
-    };
-    let now = Utc::now().timestamp().max(1);
-    if state.pid != owner.pid
-        || state.process_starttime != owner.starttime_ticks
-        || state.owner_nonce != owner.owner_nonce
-        || state.updated_at_unix > now
-        || now.saturating_sub(state.updated_at_unix) > daemon::RECORDER_LAST_COMMIT_MAX_AGE_SECS
-    {
-        return false;
-    }
-    match state.write_state {
-        daemon::RecorderWriteState::IdleNoAccount => true,
-        daemon::RecorderWriteState::Ready => state.last_commit_unix.is_some_and(|last_commit| {
-            now.saturating_sub(last_commit) <= daemon::RECORDER_LAST_COMMIT_MAX_AGE_SECS
-        }),
-        daemon::RecorderWriteState::Degraded => false,
-    }
-}
-
-fn healthy_combined_service_owner(address: SocketAddr) -> Option<u32> {
-    if !service_is_healthy(address) {
-        return None;
-    }
-    // A healthy HTTP document is not an owner credential.  Only a current
-    // lock whose process is an explicitly managed service or an exact known
-    // Codex invocation may be paired with the endpoint; a foreign/malformed
-    // owner must never be adopted by UI attachment or startup races.
-    if !matches!(
-        daemon::classify_profile_owner(),
-        daemon::OwnerClassification::ManagedActive
-            | daemon::OwnerClassification::KnownUnmanagedCodex
-    ) {
-        return None;
-    }
-    let owner = daemon::current_daemon_owner_identity()?;
-    if daemon::daemon_owner_port(&owner) != Some(address.port()) {
-        return None;
-    }
-    if !recorder_owner_is_healthy(&owner) {
-        return None;
-    }
-    // Re-read the endpoint after the lock snapshot.  A stale HTTP 200 from a
-    // listener that is closing must never be paired with a newer/different
-    // profile owner during UI attachment or concurrent startup.
-    (service_is_healthy(address)
-        && daemon::current_daemon_owner_identity().is_some_and(|current| current == owner))
-    .then_some(owner.pid)
-}
-
-fn systemd_managed_activation() -> bool {
-    std::env::var_os("CODEX_INFO_SYSTEMD_MANAGED").is_some_and(|value| value == "1")
-}
-
-/// The installed launcher sets this marker only for its verified fallback
-/// path after a service-start failure.  That path is a UI client, never a
-/// second resident owner: malformed marker values fail closed instead of
-/// silently falling back to the direct-development `--ui` contract.
+/// The installed launcher sets this marker for every packaged UI start.  The
+/// UI is a REST client and never a second resident owner; malformed marker
+/// values fail closed instead of silently enabling the development-only
+/// combined-service path.
 fn ui_client_only_marker_value(value: Option<&std::ffi::OsStr>) -> Result<bool, String> {
     match value {
         None => Ok(false),
@@ -19478,226 +21092,6 @@ fn ui_client_only_marker_value(value: Option<&std::ffi::OsStr>) -> Result<bool, 
 
 fn ui_client_only_mode() -> Result<bool, String> {
     ui_client_only_marker_value(std::env::var_os("CODEX_INFO_UI_CLIENT_ONLY").as_deref())
-}
-
-/// Reconcile the profile owner before a systemd-managed service binds its
-/// listener.  A managed activation may retire only an exact, known Codex
-/// owner validated by the existing lock/PID/starttime/executable identity
-/// contract.  An owner with an unknown executable, malformed lock, or no lock
-/// is never guessed at or killed, even when the port happens to look healthy.
-fn reconcile_managed_service_owner(address: SocketAddr) -> Result<bool, String> {
-    let deadline = Instant::now() + BACKGROUND_SERVICE_START_TIMEOUT;
-    loop {
-        let endpoint = service_endpoint_state(address);
-        match daemon::classify_profile_owner() {
-            daemon::OwnerClassification::ManagedActive
-                if endpoint == ServiceEndpointState::Current =>
-            {
-                if let Some(owner) = daemon::current_daemon_owner_identity() {
-                    if recorder_owner_is_healthy(&owner) {
-                        return Ok(true);
-                    }
-                }
-                // The marker identifies a managed process, but stale/missing
-                // recorder state is not health. Retire only this exact owner
-                // and establish a fresh state/listener below.
-                daemon::stop_daemon().map_err(|error| {
-                    format!("managed service could not retire unhealthy owner: {error:?}")
-                })?;
-            }
-            daemon::OwnerClassification::ManagedActive
-            | daemon::OwnerClassification::KnownUnmanagedCodex => {
-                daemon::stop_daemon().map_err(|error| {
-                    format!("managed service could not retire verified owner: {error:?}")
-                })?;
-            }
-            daemon::OwnerClassification::Stale => {
-                // The lock acquisition path will reclaim a dead/stale lock
-                // using the same inode race check.  A listener that survives
-                // without a valid owner remains an unknown occupant.
-                if endpoint == ServiceEndpointState::Absent {
-                    return Ok(false);
-                }
-                // A dead owner can leave its socket in the process of closing;
-                // wait for that listener instead of adopting an old HTTP 200.
-            }
-            daemon::OwnerClassification::NoOwner => {
-                if endpoint == ServiceEndpointState::Absent {
-                    return Ok(false);
-                }
-                // The verified owner has just released its lock.  Its socket
-                // may close slightly later, so keep waiting without assigning
-                // authority to the lockless listener.
-            }
-            daemon::OwnerClassification::Malformed | daemon::OwnerClassification::Foreign => {
-                return Err(cli_error(CliTextKey::ServiceStateUnavailable));
-            }
-        }
-
-        // stop_daemon waits for lock release, but the old listener may close
-        // a few milliseconds later.  Keep the decision bounded and do not
-        // treat an old HTTP 200 as permission to attach to an unknown owner.
-        if Instant::now() >= deadline {
-            return Err(cli_error(CliTextKey::ServiceCleanupFailed));
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-fn retire_different_version_service(address: SocketAddr) -> Result<(), String> {
-    if service_endpoint_state(address) != ServiceEndpointState::Different {
-        return Ok(());
-    }
-    if !matches!(
-        daemon::classify_profile_owner(),
-        daemon::OwnerClassification::ManagedActive
-            | daemon::OwnerClassification::KnownUnmanagedCodex
-    ) {
-        // A different-version response without an exact known Codex owner is
-        // still an unknown occupant. Never send the public stop signal based
-        // on HTTP health or a bare PID.
-        return Err(cli_error(CliTextKey::ServiceStateUnavailable));
-    }
-    daemon::stop_daemon().map_err(|error| format!("verified service stop failed: {error:?}"))?;
-    // The legacy process releases its recorder lock immediately before closing
-    // the REST listener. A malformed/incomplete response still means that the
-    // port is occupied, so wait for an actually absent listener or a concurrent
-    // current-version winner before the one-shot start decision below.
-    let deadline = Instant::now() + BACKGROUND_SERVICE_START_TIMEOUT;
-    loop {
-        match service_endpoint_state(address) {
-            ServiceEndpointState::Absent | ServiceEndpointState::Current => return Ok(()),
-            ServiceEndpointState::Different | ServiceEndpointState::Unrecognized => {}
-        }
-        if Instant::now() >= deadline {
-            return Err(cli_error(CliTextKey::ServiceCleanupFailed));
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-}
-
-fn terminate_and_reap_owned_child(child: &mut Child) -> bool {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return true;
-    }
-    // The child is ours, but still pin its process instance before requesting
-    // termination. A forceful Child::kill would bypass the pidfd contract used
-    // by the public --stop path.
-    if !daemon::send_term_to_owned_process(child.id()) {
-        return false;
-    }
-    let deadline = Instant::now() + BACKGROUND_CHILD_CLEANUP_TIMEOUT;
-    loop {
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn ensure_background_service(config: ApiServerConfig) -> Result<(), String> {
-    let address = config.listen_addr();
-    if healthy_combined_service_owner(address).is_some() {
-        return Ok(());
-    }
-    retire_different_version_service(address)?;
-    let executable =
-        std::env::current_exe().map_err(|_| cli_error(CliTextKey::ServiceExecutableUnavailable))?;
-    let port_text = address.port().to_string();
-    let child = Command::new(executable)
-        .args(["--port", port_text.as_str()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| cli_error(CliTextKey::ServiceStartFailed))?;
-    let child_pid = child.id();
-    let mut owned_child = Some(child);
-    let deadline = Instant::now() + BACKGROUND_SERVICE_START_TIMEOUT;
-    loop {
-        let healthy_owner = healthy_combined_service_owner(address);
-        if healthy_owner == Some(child_pid) {
-            // This is the resident child this UI+service invocation intentionally
-            // created. Dropping the process handle detaches it; it must remain
-            // alive after the X UI closes.
-            return Ok(());
-        }
-        if healthy_owner.is_some() {
-            // A concurrent UI/service launcher won recorder ownership and became
-            // healthy. This invocation must reap only the child it spawned
-            // before attaching its UI to that winner.
-            if let Some(child) = owned_child.as_mut() {
-                if !terminate_and_reap_owned_child(child) {
-                    return Err(cli_error(CliTextKey::ServiceCleanupFailed));
-                }
-            }
-            return Ok(());
-        }
-
-        if let Some(child) = owned_child.as_mut() {
-            match child.try_wait() {
-                Ok(Some(_)) => owned_child = None,
-                Ok(None) => {}
-                Err(_) => {
-                    let reaped = terminate_and_reap_owned_child(child);
-                    return Err(if reaped {
-                        cli_error(CliTextKey::ServiceStateUnavailable)
-                    } else {
-                        cli_error(CliTextKey::ServiceCleanupFailed)
-                    });
-                }
-            }
-        }
-        if owned_child.is_none() && daemon::current_daemon_owner_pid().is_none() {
-            return Err(cli_error(CliTextKey::ServiceExitedBeforeHealthy));
-        }
-        if Instant::now() >= deadline {
-            let reaped = owned_child
-                .as_mut()
-                .is_none_or(terminate_and_reap_owned_child);
-            return Err(if reaped {
-                cli_error(CliTextKey::ServiceNotHealthy)
-            } else {
-                cli_error(CliTextKey::ServiceCleanupFailed)
-            });
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn start_background_service_retry<F>(
-    state: &mut CodexInfoState,
-    config: ApiServerConfig,
-    in_flight: &Arc<AtomicBool>,
-    start_service: F,
-) -> bool
-where
-    F: FnOnce(ApiServerConfig) -> Result<(), String> + Send + 'static,
-{
-    if state.service_endpoint_error.is_none()
-        || in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
-        return false;
-    }
-    state.request_service_read("利用状況を更新しています…");
-    let worker_in_flight = Arc::clone(in_flight);
-    if thread::Builder::new()
-        .spawn(move || {
-            let _ = start_service(config);
-            worker_in_flight.store(false, Ordering::Release);
-        })
-        .is_err()
-    {
-        in_flight.store(false, Ordering::Release);
-        state.hold_service_endpoint_error(cli_error(CliTextKey::ServiceStartFailed));
-        return false;
-    }
-    true
 }
 
 #[cfg(test)]
@@ -19722,14 +21116,16 @@ fn poll_service_state_with_owner_check<F>(
         return;
     }
     let previous_v3_pair = state.service_v3_published_pair.clone();
+    let selected_account = state.service_selected_account_id.clone();
     let fetched = fetch_service_details_v3_with_etag(
         |route, if_none_match| {
-            if route == "/v3/details" {
-                request_service_details_with_etag(service_endpoint, route, if_none_match)
+            let route = service_route_with_account(route, selected_account.as_deref());
+            if route.starts_with("/v3/") {
+                request_service_details_with_etag(service_endpoint, &route, if_none_match)
             } else {
                 // Fallback requests intentionally omit If-None-Match so an
                 // older daemon receives the exact legacy request shape.
-                request_service_details(service_endpoint, route)
+                request_service_details(service_endpoint, &route)
             }
         },
         previous_v3_pair.as_deref(),
@@ -19765,12 +21161,11 @@ fn poll_service_state_with_owner_check<F>(
 
 #[cfg(test)]
 fn poll_service_state(state: &mut CodexInfoState, service_endpoint: SocketAddr) {
-    poll_service_state_with_owner_check(state, service_endpoint, |address| {
-        healthy_combined_service_owner(address).is_some()
-    });
+    poll_service_state_with_owner_check(state, service_endpoint, service_is_healthy);
 }
 
 const SERVICE_CURRENT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const SERVICE_ACCOUNTS_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const SERVICE_HISTORY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const SERVICE_THREADS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -19818,6 +21213,96 @@ enum ServiceCurrentPollOutcome {
     Failure,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ServiceAccountsPollOutcome {
+    NotDue,
+    Success,
+    LegacyUnsupported,
+    Failure,
+}
+
+fn service_accounts_ready(state: &CodexInfoState) -> bool {
+    state.service_accounts_known
+        && (!state.service_accounts_supported
+            || state.service_accounts.is_empty()
+            || state.service_selected_account_id.is_some())
+}
+
+fn poll_service_accounts_with<F>(
+    state: &mut CodexInfoState,
+    now: Instant,
+    mut request: F,
+) -> ServiceAccountsPollOutcome
+where
+    F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
+{
+    if !service_poll_due(
+        state.service_accounts_last_poll,
+        state.service_accounts_force_poll,
+        SERVICE_ACCOUNTS_POLL_INTERVAL,
+        now,
+    ) {
+        return ServiceAccountsPollOutcome::NotDue;
+    }
+    state.service_accounts_last_poll = now;
+    state.service_accounts_force_poll = false;
+    let result = request("/v3/accounts", None);
+    match result {
+        Ok(response) if response.status == 404 => {
+            let had_selection = state.service_selected_account_id.take().is_some();
+            state.service_accounts.clear();
+            state.service_default_account_id = None;
+            state.service_accounts_supported = false;
+            state.service_accounts_known = true;
+            state.service_accounts_error = None;
+            if had_selection {
+                state.clear_selected_account_state();
+            }
+            ServiceAccountsPollOutcome::LegacyUnsupported
+        }
+        Ok(response) if response.status == 200 => {
+            match parse_service_accounts_v3_document(&response.body)
+                .and_then(|document| state.apply_service_accounts(document).map(|_| ()))
+            {
+                Ok(()) => ServiceAccountsPollOutcome::Success,
+                Err(error) => {
+                    state.service_accounts_error = Some(error);
+                    if !service_accounts_ready(state) {
+                        state.hold_service_endpoint_error(
+                            "アカウント一覧を安全に取得できませんでした。".into(),
+                        );
+                        ServiceAccountsPollOutcome::Failure
+                    } else {
+                        ServiceAccountsPollOutcome::Success
+                    }
+                }
+            }
+        }
+        Ok(_) => {
+            state.service_accounts_error = Some("accounts response is not HTTP 200".into());
+            if !service_accounts_ready(state) {
+                state.hold_service_endpoint_error(
+                    "アカウント一覧を安全に取得できませんでした。".into(),
+                );
+                ServiceAccountsPollOutcome::Failure
+            } else {
+                ServiceAccountsPollOutcome::Success
+            }
+        }
+        Err(error) => {
+            state.service_accounts_error = Some(error);
+            if !service_accounts_ready(state) {
+                state.hold_service_endpoint_error(
+                    "アカウント一覧を安全に取得できませんでした。".into(),
+                );
+                ServiceAccountsPollOutcome::Failure
+            } else {
+                ServiceAccountsPollOutcome::Success
+            }
+        }
+    }
+}
+
 fn poll_service_current_resources_with<F>(
     state: &mut CodexInfoState,
     now: Instant,
@@ -19826,6 +21311,12 @@ fn poll_service_current_resources_with<F>(
 where
     F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
 {
+    let account_poll = poll_service_accounts_with(state, now, |route, if_none_match| {
+        request(route, if_none_match)
+    });
+    if account_poll == ServiceAccountsPollOutcome::Failure || !service_accounts_ready(state) {
+        return ServiceCurrentPollOutcome::Failure;
+    }
     let retry_pending = state.service_current_bundle_retry_pending;
     let retry_due = now >= state.service_current_last_poll
         && now.duration_since(state.service_current_last_poll) >= SERVICE_CURRENT_POLL_INTERVAL;
@@ -19851,8 +21342,12 @@ where
                 .map(str::to_owned)
         })
         .flatten();
+    let selected_account = state.service_selected_account_id.clone();
     let fetched = fetch_service_current_v3_with_etag(
-        |route, if_none_match| request(route, if_none_match),
+        |route, if_none_match| {
+            let route = service_route_with_account(route, selected_account.as_deref());
+            request(&route, if_none_match)
+        },
         previous_pair.as_deref(),
     );
     let mut positive_bundle_attempted = false;
@@ -19876,7 +21371,10 @@ where
             } else {
                 positive_bundle_attempted = true;
                 let threads = fetch_service_threads_with_etag(
-                    |route, if_none_match| request(route, if_none_match),
+                    |route, if_none_match| {
+                        let route = service_route_with_account(route, selected_account.as_deref());
+                        request(&route, if_none_match)
+                    },
                     None,
                 )?;
                 let ServiceResourceFetch::Fresh {
@@ -19987,6 +21485,28 @@ fn poll_service_graph_resources(
     });
 }
 
+fn select_service_history_and_poll(
+    state: &mut CodexInfoState,
+    label: &str,
+    service_endpoint: SocketAddr,
+) {
+    select_service_history_and_poll_with(state, label, Instant::now(), |route, if_none_match| {
+        request_service_details_with_etag(service_endpoint, route, if_none_match)
+    });
+}
+
+fn select_service_history_and_poll_with<F>(
+    state: &mut CodexInfoState,
+    label: &str,
+    now: Instant,
+    request: F,
+) where
+    F: FnMut(&str, Option<&str>) -> Result<ServiceDetailsHttpResponse, String>,
+{
+    state.select_history(label);
+    poll_service_graph_resources_with(state, now, true, request);
+}
+
 fn poll_service_graph_resources_with<F>(
     state: &mut CodexInfoState,
     now: Instant,
@@ -20013,6 +21533,7 @@ fn poll_service_graph_resources_with<F>(
     let previous_page_pair = state.service_history_pair.clone();
     let previous_period_id = state.service_history_period_id.clone();
     let previous_cursor = state.service_history_cursor.clone();
+    let selected_account = state.service_selected_account_id.clone();
     let mut periods = state.service_history_periods.clone();
     let refresh_periods = force
         || periods.is_empty()
@@ -20024,7 +21545,10 @@ fn poll_service_graph_resources_with<F>(
     let result = (|| {
         if refresh_periods {
             match fetch_service_history_periods_with_etag(
-                |route, if_none_match| request(route, if_none_match),
+                |route, if_none_match| {
+                    let route = service_route_with_account(route, selected_account.as_deref());
+                    request(&route, if_none_match)
+                },
                 previous_periods_pair.as_deref(),
             )? {
                 ServiceResourceFetch::Fresh { pair, value } => {
@@ -20052,7 +21576,8 @@ fn poll_service_graph_resources_with<F>(
             return Ok::<(), String>(());
         }
         let selected_period = state
-            .selected_reset_at
+            .service_history_pending_reset_at
+            .or(state.selected_reset_at)
             .and_then(|selected| {
                 periods.iter().find(|period| {
                     period.reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
@@ -20108,7 +21633,10 @@ fn poll_service_graph_resources_with<F>(
             };
             let saved_cursor_request = first_page && append_prefix && request_cursor.is_some();
             let page_result = fetch_service_history_page(
-                |route, if_none_match| request(route, if_none_match),
+                |route, if_none_match| {
+                    let route = service_route_with_account(route, selected_account.as_deref());
+                    request(&route, if_none_match)
+                },
                 &period_id,
                 request_cursor.as_deref(),
                 conditional_pair,
@@ -20217,6 +21745,7 @@ fn poll_service_graph_resources_with<F>(
         Ok(()) => {
             state.service_history_force_poll = false;
             state.service_history_cursor_reset_required = false;
+            state.service_history_pending_failures = 0;
             state.service_history_error = None;
         }
         Err(error) => {
@@ -20227,9 +21756,17 @@ fn poll_service_graph_resources_with<F>(
             // reset-required flag selects a head request on the next owner
             // cycle; if that head also fails, normal 60-second pacing resumes
             // without ever falling back to the saved cursor.
-            state.service_history_force_poll = newly_requires_head && !reset_required;
-            state.service_history_cursor_reset_required |= newly_requires_head;
-            state.service_history_error = Some(error);
+            if state.service_history_pending_reset_at.is_some() && !newly_requires_head {
+                state.service_history_pending_failures =
+                    state.service_history_pending_failures.saturating_add(1);
+                let retry_pending = state.service_history_pending_failures < 2;
+                state.service_history_force_poll = retry_pending;
+                state.service_history_error = (!retry_pending).then_some(error);
+            } else {
+                state.service_history_force_poll = newly_requires_head && !reset_required;
+                state.service_history_cursor_reset_required |= newly_requires_head;
+                state.service_history_error = Some(error);
+            }
         }
     }
 }
@@ -20259,8 +21796,12 @@ where
         .service_threads_pair
         .clone()
         .filter(|pair| pair == &current_pair);
+    let selected_account = state.service_selected_account_id.clone();
     let result = fetch_service_threads_with_etag(
-        |route, if_none_match| request(route, if_none_match),
+        |route, if_none_match| {
+            let route = service_route_with_account(route, selected_account.as_deref());
+            request(&route, if_none_match)
+        },
         previous_pair.as_deref(),
     )
     .and_then(|result| match result {
@@ -20301,7 +21842,9 @@ fn run_ui_service_timer_cycle_with_windows(
         service_endpoint,
         graph_open,
         threads_open,
-        |address| healthy_combined_service_owner(address).is_some(),
+        // The UI trusts only the REST health contract. Recorder ownership is
+        // deliberately outside this process and must not gate client reads.
+        service_is_healthy,
     );
 }
 
@@ -20357,43 +21900,27 @@ fn run_ui_service_timer_cycle_with_owner_check_and_current_poll(
     }
 }
 
-async fn service_shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let ctrl_c = tokio::signal::ctrl_c();
-        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
-            tokio::select! {
-                _ = ctrl_c => {}
-                _ = terminate.recv() => {}
-            }
-        } else {
-            let _ = ctrl_c.await;
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-}
-
 #[derive(Debug)]
+#[cfg(test)]
 enum ResidentServiceCycleError {
-    Store(String),
+    Store,
     Publish(codex_info::server::ApiSnapshotError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 enum ResidentServiceCycleOutcome {
     Published,
     HeldIncomplete,
     Unchanged,
 }
 
+#[cfg(test)]
 fn recorder_attempt_due(now: Instant, retry_at: Option<Instant>) -> bool {
     retry_at.is_none_or(|retry_at| now >= retry_at)
 }
 
+#[cfg(test)]
 fn recorder_retry_deadline_after_attempt(
     now: Instant,
     current: Option<Instant>,
@@ -20410,68 +21937,8 @@ fn recorder_retry_deadline_after_attempt(
     }
 }
 
-fn pending_gap_for_shutdown(
-    state: &CodexInfoState,
-    active_partition: Option<&str>,
-) -> Option<usage_store::RecorderGap> {
-    let active_partition = active_partition?;
-    let partition = state.account_partition.as_ref()?;
-    if partition.partition_id != active_partition {
-        return None;
-    }
-    let now = Utc::now().timestamp().max(1);
-    let acknowledged = state
-        .acknowledged_recorder_commit
-        .as_ref()
-        .filter(|commit| commit.partition_id == active_partition);
-    let start_at = acknowledged
-        .map(|commit| commit.last_commit_unix)
-        .filter(|timestamp| *timestamp > 0 && *timestamp <= now)
-        .unwrap_or(now);
-    let owner_collector_epoch = acknowledged
-        .map(|commit| commit.collector_epoch)
-        .filter(|epoch| *epoch > 0)
-        .unwrap_or(1);
-    let confirmation_cycle_seq = acknowledged
-        .map(|commit| commit.cycle_seq)
-        .filter(|cycle| *cycle > 0)
-        .unwrap_or(1);
-    let cursor = acknowledged
-        .map(|commit| format!("generation-{}", commit.data_generation))
-        .unwrap_or_else(|| "generation-0".into());
-    let stopped_at_monotonic_ns = daemon::monotonic_now_ns();
-    if stopped_at_monotonic_ns == 0 {
-        return None;
-    }
-    let mut digest = Sha256::new();
-    digest.update(active_partition.as_bytes());
-    digest.update(stopped_at_monotonic_ns.to_be_bytes());
-    digest.update(std::process::id().to_be_bytes());
-    let digest = digest.finalize();
-    let gap_id = digest[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Some(usage_store::RecorderGap {
-        gap_id,
-        partition_id: active_partition.to_owned(),
-        source_identity_before: format!("resident:{active_partition}"),
-        source_identity_after: "unresolved".into(),
-        cursor_before: cursor,
-        cursor_after: "unresolved".into(),
-        stopped_at_monotonic_ns,
-        resumed_at_monotonic_ns: None,
-        start_at,
-        end_at: now,
-        reset_at: state.reset_at.filter(|reset| *reset > 0),
-        reason: "daemon_stop_unrecoverable".into(),
-        state: "pending".into(),
-        owner_collector_epoch,
-        confirmation_cycle_seq,
-    })
-}
-
 #[derive(Default)]
+#[cfg(test)]
 struct ResidentPublicationState {
     /// Exact last complete root accepted by the REST publisher. This is the
     /// publication buffer, not another collector: failures may change only
@@ -20487,6 +21954,7 @@ struct ResidentPublicationState {
     last_published_v3: Option<PublicDetailsV3>,
 }
 
+#[cfg(test)]
 fn resident_publication_error_root(
     publication: &ResidentPublicationState,
 ) -> (PublicDetails, PublicDetailsV2, PublicDetailsV3) {
@@ -20519,6 +21987,7 @@ fn resident_publication_error_root(
     (details, details_v2, details_v3)
 }
 
+#[cfg(test)]
 fn publish_resident_error_root<P>(
     publication: &mut ResidentPublicationState,
     publish: &mut P,
@@ -20632,6 +22101,7 @@ where
     )
 }
 
+#[cfg(test)]
 fn resident_service_cycle_with_publication_policy_v3<W, P>(
     state: &mut CodexInfoState,
     publication: &mut ResidentPublicationState,
@@ -20739,8 +22209,8 @@ where
         && publication.last_published_v2.as_ref() == Some(&candidate_v2)
         && publication.last_published_v3.as_ref() == Some(&candidate_v3)
     {
-        return if let Some(error) = store_error {
-            Err(ResidentServiceCycleError::Store(error))
+        return if store_error.is_some() {
+            Err(ResidentServiceCycleError::Store)
         } else {
             Ok(ResidentServiceCycleOutcome::Unchanged)
         };
@@ -20766,394 +22236,42 @@ where
         publication.last_complete_v2 = None;
         publication.last_complete_v3 = None;
     }
-    if let Some(error) = store_error {
-        Err(ResidentServiceCycleError::Store(error))
+    if store_error.is_some() {
+        Err(ResidentServiceCycleError::Store)
     } else {
         Ok(ResidentServiceCycleOutcome::Published)
     }
 }
 
-fn run_combined_service(config: ApiServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let mut recorder = daemon::RecorderWorker::start()
-        .map_err(|_| std::io::Error::other(cli_error(CliTextKey::ServiceStartFailed)))?;
-    if !recorder.is_active() {
-        recorder.shutdown();
-        return Err(std::io::Error::other(cli_error(CliTextKey::ServiceAlreadyOwned)).into());
+#[cfg(test)]
+fn terminate_and_reap_owned_child(child: &mut Child) -> bool {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return true;
     }
-    // Bind REST only after this process owns the recorder. Concurrent service
-    // children therefore exit before publishing a listener, and an API bind
-    // failure drops the worker and releases its exact lock identity.
-    let mut api_server = ApiServer::start(config)
-        .map_err(|_| std::io::Error::other(cli_error(CliTextKey::ServiceStartFailed)))?;
-    let publisher = api_server.publisher();
-    let mut state = CodexInfoState::new();
-    let (initial_candidate, initial_candidate_v2, initial_candidate_v3) =
-        state.public_details_candidates();
-    publisher.publish_details_v3(
-        initial_candidate.clone(),
-        initial_candidate_v2.clone(),
-        initial_candidate_v3.clone(),
-    )?;
-    let mut publication = ResidentPublicationState {
-        last_published: Some(initial_candidate),
-        last_published_v2: Some(initial_candidate_v2),
-        last_published_v3: Some(initial_candidate_v3),
-        ..ResidentPublicationState::default()
-    };
-    let mut last_recorder_error = None;
-    let mut last_publish_error = None;
-    let mut active_recorder_partition: Option<String> = None;
-    eprintln!(
-        "codex-info: daemon+REST listening on {} recorder_owner={}",
-        api_server.local_addr(),
-        recorder.is_active()
-    );
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()?;
-    let runtime_result = runtime.block_on(async {
-        let mut ticker = tokio::time::interval(Duration::from_secs(1));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let publication_interval = daemon::daemon_interval_from_environment();
-        let shutdown = service_shutdown_signal();
-        tokio::pin!(shutdown);
-        let mut recorder_retry_at: Option<Instant> = None;
-        loop {
-            tokio::select! {
-                _ = &mut shutdown => return Ok::<(), String>(()),
-                _ = ticker.tick() => {
-                    if let Err(error) = recorder.probe() {
-                        return Err(format!("recorder worker stopped: {error}"));
-                    }
-                    let now = Instant::now();
-                    let desired_partition_id = state
-                        .account_partition
-                        .as_ref()
-                        .map(|partition| partition.partition_id.as_str());
-                    let recorder_work_pending = state.has_pending_recorder_batch();
-                    let recorder_attempt = recorder_attempt_due(now, recorder_retry_at)
-                        && (recorder_work_pending
-                            || desired_partition_id != active_recorder_partition.as_deref());
-                    let result = resident_service_cycle_with_publication_policy_v3(
-                        &mut state,
-                        &mut publication,
-                        recorder_attempt,
-                        false,
-                        |state, pending| {
-                            let batch_is_empty = pending.is_empty();
-                            let PendingRecorderBatch {
-                                auth_epoch,
-                                admission,
-                                partition_id,
-                                collector_epoch,
-                                cycle_seq,
-                                quota_source_rescan_complete,
-                                samples,
-                                observations,
-                                recorded_sessions,
-                                session_checkpoints,
-                                session_ranges,
-                                session_model_totals,
-                                history_continuity_recovery,
-                                cumulative_recovery,
-                                timeline_recovery,
-                                reset_at,
-                                window_seconds,
-                                cleanup_plans,
-                            } = pending;
-                            let current_admission = state.current_account_admission();
-                            if !batch_is_empty
-                                && (auth_epoch != Some(state.auth_epoch)
-                                    || admission.as_ref() != current_admission.as_ref()
-                                    || partition_id.as_deref()
-                                        != current_admission.as_ref().map(|current| {
-                                            current.partition_id.as_str()
-                                        }))
-                            {
-                                state.apply_identity_error(
-                                    "保存batchのアカウント世代が失効しました。".into(),
-                                );
-                                let _ = recorder.deactivate_partition();
-                                active_recorder_partition = None;
-                                return Err("recorder batch admission mismatch".into());
-                            }
-                            let desired_partition = state.account_partition.clone();
-                            let desired_id = desired_partition
-                                .as_ref()
-                                .map(|partition| partition.partition_id.clone());
-                            if desired_id != active_recorder_partition {
-                                let activation = match desired_partition {
-                                    Some(partition) => recorder
-                                        .activate_partition(partition, Utc::now()),
-                                    None => recorder.deactivate_partition(),
-                                };
-                                if let Err(error) = activation {
-                                    let _ = recorder.deactivate_partition();
-                                    active_recorder_partition = None;
-                                    state.apply_identity_error(
-                                        "アカウント別DBを安全に有効化できませんでした。".into(),
-                                    );
-                                    return Err(error);
-                                }
-                                active_recorder_partition = desired_id;
-                            }
-                            if collector_epoch.is_some()
-                                || cycle_seq.is_some()
-                                || !samples.is_empty()
-                                || !observations.is_empty()
-                                || !recorded_sessions.is_empty()
-                                || !session_checkpoints.is_empty()
-                                || !session_ranges.is_empty()
-                                || !session_model_totals.is_empty()
-                                || history_continuity_recovery.is_some()
-                                || cumulative_recovery.is_some()
-                                || timeline_recovery.is_some()
-                            {
-                                let Some(batch_partition_id) = partition_id.as_ref() else {
-                                    state.apply_identity_error(
-                                        "保存batchにアカウントpartitionがありません。".into(),
-                                    );
-                                    let _ = recorder.deactivate_partition();
-                                    active_recorder_partition = None;
-                                    return Err("recorder batch has no account partition".into());
-                                };
-                                if active_recorder_partition.as_deref()
-                                    != Some(batch_partition_id.as_str())
-                                {
-                                    state.apply_identity_error(
-                                        "保存batchと有効なアカウントpartitionが一致しません。".into(),
-                                    );
-                                    let _ = recorder.deactivate_partition();
-                                    active_recorder_partition = None;
-                                    return Err("recorder batch account partition mismatch".into());
-                                }
-                                let timeline_history_recovered = timeline_recovery.is_some();
-                                let commit_ack = match recorder.store_generation(
-                                    batch_partition_id.clone(),
-                                    daemon::RecorderGeneration {
-                                        reset_at: reset_at.ok_or_else(|| {
-                                            "recorder batch reset period is missing".to_owned()
-                                        })?,
-                                        window_seconds: window_seconds.ok_or_else(|| {
-                                            "recorder batch window is missing".to_owned()
-                                        })?,
-                                        collector_epoch: collector_epoch.ok_or_else(|| {
-                                            "recorder batch collector epoch is missing".to_owned()
-                                        })?,
-                                        cycle_seq: cycle_seq.ok_or_else(|| {
-                                            "recorder batch cycle sequence is missing".to_owned()
-                                        })?,
-                                        samples,
-                                        observations,
-                                        recorded_sessions,
-                                        session_checkpoints,
-                                        session_ranges,
-                                        session_model_totals,
-                                        history_continuity_recovery,
-                                        cumulative_recovery,
-                                        timeline_recovery,
-                                        quota_source_rescan_complete,
-                                    },
-                                ) {
-                                    Ok(ack) => ack,
-                                    Err(error) => {
-                                        // Keep the admitted account and active
-                                        // writer lane intact. The outer cycle
-                                        // restores this exact batch and gates
-                                        // the next database attempt by the
-                                        // normal recorder interval. Storage
-                                        // failure degrades publication; it
-                                        // does not terminate the resident
-                                        // recorder.
-                                        return Err(error);
-                                    }
-                                };
-                                let Some(batch_admission) = admission.as_ref() else {
-                                    return Err("recorder batch admission disappeared after commit".into());
-                                };
-                                let canonical_samples = commit_ack.canonical_samples.clone();
-                                let canonical_observations =
-                                    commit_ack.canonical_observations.clone();
-                                let legacy_history_bridged = commit_ack.legacy_history_bridged;
-                                let cumulative_history_recovered =
-                                    commit_ack.cumulative_history_recovered;
-                                state.acknowledge_recorder_commit(batch_admission, commit_ack);
-                                let refreshed = if legacy_history_bridged
-                                    || cumulative_history_recovered
-                                    || timeline_history_recovered
-                                {
-                                    state.history.refresh_from_store(Utc::now())
-                                } else {
-                                    state.history.apply_committed_samples(
-                                        canonical_samples,
-                                        Utc::now(),
-                                    ) && state.history.apply_committed_observations(
-                                        canonical_observations,
-                                        Utc::now(),
-                                    )
-                                };
-                                if !refreshed {
-                                    return Err("history refresh after recorder commit failed".into());
-                                }
-                            }
-                            if !batch_is_empty && !state.refresh_history_gaps() {
-                                return Err("history gap refresh after recorder commit failed".into());
-                            }
-                            for plan in cleanup_plans {
-                                let Some(database) = state.history.db_path.as_deref() else {
-                                    debug_runtime("session cleanup retained all files: database unavailable");
-                                    continue;
-                                };
-                                let Some(partition_identity) =
-                                    state.history.partition_identity.as_ref()
-                                else {
-                                    state.apply_identity_error(
-                                        "Session cleanupの保存partitionを確認できませんでした。"
-                                            .into(),
-                                    );
-                                    return Err("cleanup partition identity is missing".into());
-                                };
-                                let report = cleanup_recorded_session_overflow_partitioned(
-                                    database,
-                                    partition_identity,
-                                    &plan,
-                                    Path::new("/proc"),
-                                );
-                                let deleted_count = report.deleted.len();
-                                if deleted_count > 0
-                                    && recorder
-                                        .forget_recorded_sessions(
-                                            partition_id.clone().ok_or_else(|| {
-                                                "cleanup partition is missing".to_owned()
-                                            })?,
-                                            report.deleted,
-                                        )
-                                        .is_err()
-                                {
-                                    debug_runtime(format!(
-                                        "session cleanup marker retirement failed deleted={deleted_count}"
-                                    ));
-                                }
-                                debug_runtime(format!(
-                                    "session cleanup deleted={deleted_count} retained={} database_failed={} process_scan_failed={}",
-                                    report.retained,
-                                    report.database_failed,
-                                    report.process_scan_failed
-                                ));
-                            }
-                            Ok(())
-                        },
-                        |candidate, candidate_v2, candidate_v3| {
-                            if candidate.state == PublicState::Ready
-                                && !recorder.owner_is_live()
-                            {
-                                return Err(
-                                    codex_info::server::ApiSnapshotError::Serialization,
-                                );
-                            }
-                            publisher.publish_details_v3(candidate, candidate_v2, candidate_v3)
-                        },
-                    );
-                    let store_failed = state.recorder_store_error;
-                    recorder_retry_at = recorder_retry_deadline_after_attempt(
-                        Instant::now(),
-                        recorder_retry_at,
-                        recorder_attempt,
-                        store_failed,
-                        publication_interval,
-                    );
-                    if recorder_attempt && !store_failed {
-                        if last_recorder_error.take().is_some() {
-                            eprintln!("codex-info: recorder state commit recovered");
-                        }
-                    }
-                    match result {
-                        Ok(outcome) => {
-                            if outcome == ResidentServiceCycleOutcome::Published
-                                && last_publish_error.take().is_some()
-                            {
-                                eprintln!("codex-info: REST snapshot publication recovered");
-                            }
-                        }
-                        Err(ResidentServiceCycleError::Store(error)) => {
-                            if last_recorder_error.as_deref() != Some(error.as_str()) {
-                                eprintln!("codex-info: recorder state commit rejected: {error}");
-                                last_recorder_error = Some(error.clone());
-                            }
-                            // A response timeout cannot distinguish a busy
-                            // serialized writer from a dead one. Keep the
-                            // exact pending batch and the last-good public
-                            // root, then retry once at the normal recorder
-                            // interval. Actual thread death is detected by
-                            // recorder.probe() on the one-second owner loop.
-                        }
-                        Err(ResidentServiceCycleError::Publish(error)) => {
-                            if last_publish_error != Some(error) {
-                                eprintln!("codex-info: REST snapshot publication rejected: {error}");
-                                last_publish_error = Some(error);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-    if let Some(gap) = pending_gap_for_shutdown(&state, active_recorder_partition.as_deref()) {
-        if let Err(error) = recorder.begin_gap(gap.partition_id.clone(), gap) {
-            eprintln!("codex-info: recorder stop gap was not persisted: {error}");
-        }
+    // The child is ours, but still pin its process instance before requesting
+    // termination. A forceful Child::kill would bypass the pidfd contract used
+    // by the legacy test-only stop path.
+    if !daemon::send_term_to_owned_process(child.id()) {
+        return false;
     }
-    api_server.shutdown();
-    recorder.shutdown();
-    runtime_result.map_err(std::io::Error::other)?;
-    Ok(())
-}
-
-fn run_service_mode(config: ApiServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let address = config.listen_addr();
-    if systemd_managed_activation() {
-        if reconcile_managed_service_owner(address).map_err(std::io::Error::other)? {
-            eprintln!(
-                "codex-info: {}",
-                I18n::detect().cli_text(CliTextKey::ServiceReused)
-            );
-            return Ok(());
+    let deadline = Instant::now() + BACKGROUND_CHILD_CLEANUP_TIMEOUT;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
         }
-    } else {
-        retire_different_version_service(address).map_err(std::io::Error::other)?;
-        if healthy_combined_service_owner(address).is_some() {
-            eprintln!(
-                "codex-info: {}",
-                I18n::detect().cli_text(CliTextKey::ServiceReused)
-            );
-            return Ok(());
+        if Instant::now() >= deadline {
+            return false;
         }
+        thread::sleep(Duration::from_millis(10));
     }
-    run_combined_service(config)
-}
-
-fn stop_service_mode() -> Result<(), Box<dyn std::error::Error>> {
-    daemon::stop_daemon().map_err(|error| {
-        let key = match error {
-            daemon::StopError::LockUnavailable => CliTextKey::StopLockUnavailable,
-            daemon::StopError::LockInvalid => CliTextKey::StopLockInvalid,
-            daemon::StopError::OwnerChanged => CliTextKey::StopOwnerChanged,
-            daemon::StopError::SignalFailed => CliTextKey::StopSignalFailed,
-            daemon::StopError::Timeout => CliTextKey::StopTimeout,
-            daemon::StopError::Unsupported => CliTextKey::StopUnsupported,
-        };
-        std::io::Error::other(cli_error(key)).into()
-    })
 }
 
 fn run_ui(
     initial_service_error: Option<String>,
     service_config: ApiServerConfig,
-    client_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ui = MainWindow::new()?;
+    let service_endpoint = service_config.listen_addr();
     install_fixed_window_guard(ui.window());
     place_main_window_on_primary_monitor(ui.window());
     let preview_size = std::env::var("CODEX_INFO_PREVIEW_SIZE")
@@ -21179,8 +22297,6 @@ fn run_ui(
     let threads_window = Rc::new(RefCell::new(None::<ThreadsWindow>));
     let legal_notice_window = Rc::new(RefCell::new(None::<LegalNoticeWindow>));
     let x11_monitor = Rc::new(X11WindowStateMonitor::connect());
-    let service_retry_in_flight = Arc::new(AtomicBool::new(false));
-
     {
         let weak_ui = ui.as_weak();
         ui.on_begin_window_drag(move || {
@@ -21221,26 +22337,35 @@ fn run_ui(
     }
     {
         let state = Rc::clone(&state);
-        let service_retry_in_flight = Arc::clone(&service_retry_in_flight);
         ui.on_retry(move || {
             let mut state = state.borrow_mut();
             if state.service_endpoint_error.is_some() {
-                if client_only {
-                    // The verified launcher fallback is explicitly a UI
-                    // client. Retry only the selected endpoint; allowing this
-                    // callback to spawn a raw `--port` child would recreate
-                    // the resident owner after the launcher reported failure.
-                    state.request_service_read("利用状況を更新しています…");
-                } else {
-                    start_background_service_retry(
-                        &mut state,
-                        service_config,
-                        &service_retry_in_flight,
-                        ensure_background_service,
-                    );
-                }
+                // Retry only the selected REST endpoint. The UI binary never
+                // spawns a recorder or a combined resident service.
+                state.request_service_read("利用状況を更新しています…");
             } else {
                 state.request_service_read("利用状況を更新しています…");
+            }
+        });
+    }
+    {
+        let state = Rc::clone(&state);
+        let weak_ui = ui.as_weak();
+        let graph_window = Rc::clone(&graph_window);
+        ui.on_select_account(move |label| {
+            {
+                let mut state = state.borrow_mut();
+                if state.select_account_label(label.as_str()) {
+                    state.request_service_read("アカウントを切り替えています…");
+                }
+            }
+            if let Some(ui) = weak_ui.upgrade() {
+                state.borrow().sync_ui(&ui);
+            }
+            if let Some(graph) = graph_window.borrow().as_ref() {
+                if graph.window().is_visible() {
+                    sync_graph_window(&state.borrow(), graph);
+                }
             }
         });
     }
@@ -21252,6 +22377,7 @@ fn run_ui(
         let graph_old_preview = preview_kind.as_deref() == Some("graph-old");
         let graph_period_preview =
             matches!(preview_kind.as_deref(), Some("graph-period" | "graph-many"));
+        let weak_ui_for_account = ui.as_weak();
         ui.on_open_graph(move || {
             if !graph_old_preview {
                 state.borrow_mut().select_latest_history();
@@ -21372,11 +22498,36 @@ fn run_ui(
                     let weak_graph = graph.as_weak();
                     let state_for_history = Rc::clone(&state);
                     graph.on_select_history(move |label| {
+                        let weak_graph = weak_graph.clone();
+                        let state_for_history = Rc::clone(&state_for_history);
+                        // GraphSelect emits `selected` before it closes its popup.
+                        // Run on the next event-loop turn so the popup can close,
+                        // but do not wait for the unrelated one-second owner tick.
+                        Timer::single_shot(Duration::ZERO, move || {
+                            if let Some(graph) = weak_graph.upgrade() {
+                                select_service_history_and_poll(
+                                    &mut state_for_history.borrow_mut(),
+                                    label.as_str(),
+                                    service_endpoint,
+                                );
+                                sync_graph_window(&state_for_history.borrow(), &graph);
+                            }
+                        });
+                    });
+                    let weak_graph = graph.as_weak();
+                    let state_for_account = Rc::clone(&state);
+                    let weak_ui = weak_ui_for_account.clone();
+                    graph.on_select_account(move |label| {
                         if let Some(graph) = weak_graph.upgrade() {
-                            state_for_history
-                                .borrow_mut()
-                                .select_history(label.as_str());
-                            sync_graph_window(&state_for_history.borrow(), &graph);
+                            let mut state = state_for_account.borrow_mut();
+                            if state.select_account_label(label.as_str()) {
+                                state.request_service_read("アカウントを切り替えています…");
+                            }
+                            drop(state);
+                            if let Some(ui) = weak_ui.upgrade() {
+                                state_for_account.borrow().sync_ui(&ui);
+                            }
+                            sync_graph_window(&state_for_account.borrow(), &graph);
                         }
                     });
                     *graph_window = Some(graph);
@@ -21608,11 +22759,24 @@ fn run_ui(
     let weak_ui = ui.as_weak();
     let graph_window_for_timer = Rc::clone(&graph_window);
     let threads_window_for_timer = Rc::clone(&threads_window);
-    let service_retry_for_timer = Arc::clone(&service_retry_in_flight);
     let timer = Timer::default();
     if !state.borrow().preview {
         timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
             if let Some(ui) = weak_ui.upgrade() {
+                let history_popup_open =
+                    graph_window_for_timer
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|graph| {
+                            graph.window().is_visible() && graph.get_history_popup_open()
+                        });
+                // Network reads and graph projection run on this UI event
+                // loop. Suspending one-second work while the period popup is
+                // open prevents both input starvation and popup destruction;
+                // the first tick after explicit dismissal catches up.
+                if history_popup_open {
+                    return;
+                }
                 let graph_open = graph_window_for_timer
                     .borrow()
                     .as_ref()
@@ -21622,17 +22786,18 @@ fn run_ui(
                     .as_ref()
                     .is_some_and(|window| window.window().is_visible());
                 let mut state = state.borrow_mut();
-                if !service_retry_for_timer.load(Ordering::Acquire) {
-                    run_ui_service_timer_cycle_with_windows(
-                        &mut state,
-                        service_config.listen_addr(),
-                        graph_open,
-                        threads_open,
-                    );
-                }
+                run_ui_service_timer_cycle_with_windows(
+                    &mut state,
+                    service_config.listen_addr(),
+                    graph_open,
+                    threads_open,
+                );
                 state.sync_ui(&ui);
                 if let Some(graph) = graph_window_for_timer.borrow().as_ref() {
-                    if graph.window().is_visible() {
+                    // Keep the period selector responsive and stable while
+                    // the user is navigating it. The next timer tick renders
+                    // any service changes immediately after the popup closes.
+                    if graph.window().is_visible() && !graph.get_history_popup_open() {
                         sync_graph_window(&state, graph);
                     }
                 }
@@ -21652,20 +22817,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let mode = parse_launch_mode(arguments).map_err(std::io::Error::other)?;
     match mode {
-        LaunchMode::Service(config) => run_service_mode(config),
-        LaunchMode::Stop => stop_service_mode(),
-        LaunchMode::All(config) => {
-            let client_only = ui_client_only_mode().map_err(std::io::Error::other)?;
-            let startup_error = if client_only {
-                // The installed launcher has already performed generation,
-                // payload, and owner verification.  Preserve the existing
-                // localized failure/retry surface while this process only
-                // polls the selected endpoint and never starts a resident.
-                Some(cli_error(CliTextKey::ServiceStartFailed))
-            } else {
-                ensure_background_service(config).err()
-            };
-            run_ui(startup_error, config, client_only)
+        LaunchMode::Ui(config) => {
+            // Preserve the launcher's exact-marker validation, but service
+            // recovery remains outside this binary in all environments.
+            ui_client_only_mode().map_err(std::io::Error::other)?;
+            run_ui(None, config)
         }
         LaunchMode::Help => {
             let language = I18n::detect().language();
@@ -21958,9 +23114,15 @@ mod tests {
         format!("v1:{epoch:032x}{counter:032x}")
     }
 
+    fn disable_account_directory_for_fixture(state: &mut CodexInfoState) {
+        state.service_accounts_known = true;
+        state.service_accounts_force_poll = false;
+    }
+
     fn seeded_split_service_client(pair: &str) -> CodexInfoState {
         let (current, threads) = split_current_fixture();
         let mut state = CodexInfoState::service_client();
+        disable_account_directory_for_fixture(&mut state);
         state
             .apply_service_current_bundle(pair.to_owned(), current, None, threads)
             .expect("same-generation current and threads fixture is admitted");
@@ -22100,6 +23262,177 @@ mod tests {
             .unwrap_or_else(|| panic!("{expected_name} header"))
     }
 
+    #[test]
+    fn v3_accounts_parser_and_labels_are_strict_and_unambiguous() {
+        let body = br#"{
+            "api_version":"v3",
+            "default_account_id":"account-7",
+            "accounts":[
+                {"id":"account-7","is_current":true,"activation_at":1800000000,"deactivation_at":null,"login_id":"current@example.com"},
+                {"id":"account-13","is_current":false,"activation_at":null,"deactivation_at":null},
+                {"id":"account-15","is_current":false,"activation_at":null,"deactivation_at":1799000000,"login_id":"past@example.com"}
+            ]
+        }"#;
+        let document = super::parse_service_accounts_v3_document(body).expect("valid accounts");
+        assert_eq!(document.default_account_id, "account-7");
+        assert_eq!(
+            super::service_account_labels(
+                &document.accounts,
+                &I18n::from_parts(
+                    codex_info::i18n::Language::Japanese,
+                    chrono_tz::Tz::Asia__Tokyo,
+                ),
+            ),
+            vec![
+                "current@example.com［ログイン中］",
+                "アカウント 13 · ID未復元［履歴］",
+                "past@example.com［履歴］",
+            ]
+        );
+
+        let malformed = br#"{
+            "api_version":"v3",
+            "default_account_id":"account-7",
+            "accounts":[
+                {"id":"account-7","is_current":true,"activation_at":1800000000,"deactivation_at":null,"email":"private@example.com"}
+            ]
+        }"#;
+        assert!(super::parse_service_accounts_v3_document(malformed).is_err());
+
+        let zero_id = br#"{
+            "api_version":"v3",
+            "default_account_id":"account-0",
+            "accounts":[
+                {"id":"account-0","is_current":true,"activation_at":null,"deactivation_at":null}
+            ]
+        }"#;
+        assert!(super::parse_service_accounts_v3_document(zero_id).is_err());
+    }
+
+    #[test]
+    fn every_selected_v3_read_route_carries_the_encoded_account() {
+        let account = Some("account-13");
+        for route in [
+            "/v3/current",
+            "/v3/details",
+            "/v3/history/periods",
+            "/v3/threads",
+            "/v3/history?period=period-1&cursor=cursor-2",
+        ] {
+            let selected = super::service_route_with_account(route, account);
+            assert!(selected.contains("account=account-13"), "route={selected}");
+        }
+        assert_eq!(
+            super::service_route_with_account("/v3/accounts", account),
+            "/v3/accounts"
+        );
+        assert_eq!(
+            super::service_route_with_account("/v2/details", account),
+            "/v2/details"
+        );
+    }
+
+    #[test]
+    fn switching_account_clears_the_complete_visible_scene_before_refetch() {
+        let body = br#"{
+            "api_version":"v3",
+            "default_account_id":"account-7",
+            "accounts":[
+                {"id":"account-7","is_current":true,"activation_at":1800000000,"deactivation_at":null},
+                {"id":"account-13","is_current":false,"activation_at":null,"deactivation_at":null}
+            ]
+        }"#;
+        let document = super::parse_service_accounts_v3_document(body).expect("valid accounts");
+        let mut state = CodexInfoState::service_client();
+        state
+            .apply_service_accounts(document)
+            .expect("account directory admitted");
+        state.authenticated = true;
+        state.has_usage = true;
+        state.usage_snapshot_committed = true;
+        state.service_current_pair = Some("account-7:v1:0001".into());
+        state.service_published_pair = Some("account-7:v1:0001".into());
+        state.service_history_period_id = Some("period-7".into());
+        state.service_history_cursor = Some("cursor-7".into());
+        state.service_history_error = Some("old history error".into());
+        state.service_threads_pair = Some("account-7:v1:0001".into());
+        state.active_threads.push(ActiveThread {
+            id: "thread-7".into(),
+            ..ActiveThread::default()
+        });
+        state.history.samples.push(UsageHistorySample::new(
+            1_800_000_000,
+            1_800_000_600,
+            90.0,
+            ModelDollarTotals::default(),
+        ));
+
+        let labels = state.account_selector_options();
+        assert_eq!(
+            labels[1],
+            format!(
+                "アカウント 13 · ID未復元{}",
+                state.i18n.account_selector_status(false)
+            )
+        );
+        assert!(state.select_account_label(&labels[1]));
+        assert_eq!(
+            state.service_selected_account_id.as_deref(),
+            Some("account-13")
+        );
+        assert_eq!(state.service_accounts.len(), 2);
+        assert!(!state.authenticated);
+        assert!(!state.has_usage);
+        assert!(!state.usage_snapshot_committed);
+        assert!(state.service_current_pair.is_none());
+        assert!(state.service_published_pair.is_none());
+        assert!(state.service_history_period_id.is_none());
+        assert!(state.service_history_cursor.is_none());
+        assert!(state.service_history_error.is_none());
+        assert!(state.service_threads_pair.is_none());
+        assert!(state.active_threads.is_empty());
+        assert!(state.history.samples.is_empty());
+        assert!(state.service_current_force_poll);
+        assert!(state.service_history_force_poll);
+    }
+
+    #[test]
+    fn graph_window_exposes_account_selector_callback_separately_from_history_and_metric() {
+        let source = include_str!("../ui/components.slint");
+        let graph = source
+            .split("export component GraphWindow inherits Window {")
+            .nth(1)
+            .expect("GraphWindow");
+        assert!(graph.contains("in property <[string]> account-options;"));
+        assert!(graph.contains("in property <int> selected-account-index: 0;"));
+        assert!(graph.contains("callback select-account(string);"));
+        assert!(graph.contains("model: root.account-options;"));
+        assert!(graph.contains("empty-label: \"アカウントなし\";"));
+        assert!(graph.contains("selected(value) => { root.select-account(value); }"));
+    }
+
+    #[test]
+    fn main_window_exposes_the_same_account_selector_contract() {
+        let app = include_str!("../ui/app.slint");
+        let main = app
+            .split("export component MainWindow inherits Window {")
+            .nth(1)
+            .expect("MainWindow");
+        assert!(main.contains("in property <[string]> account-options;"));
+        assert!(main.contains("in property <int> selected-account-index: 0;"));
+        assert!(main.contains("callback select-account(string);"));
+        assert!(main.contains("account-options: root.account-options;"));
+        assert!(main.contains("select-account(value) => { root.select-account(value); }"));
+
+        let components = include_str!("../ui/components.slint");
+        let header = components
+            .split("export component Header inherits Rectangle {")
+            .nth(1)
+            .expect("Header");
+        assert!(header.contains("model: root.account-options;"));
+        assert!(header.contains("current-index: root.selected-account-index;"));
+    }
+
     use super::{
         claim_manual_x11_action, forbidden_x11_states, manual_resize_geometry,
         manual_window_geometry, motif_wm_functions, motif_wm_resizable_functions, X11StateAtoms,
@@ -22114,9 +23447,8 @@ mod tests {
     use std::io::{BufReader, Read, Seek, SeekFrom, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     fn launch_args(values: &[&str]) -> Vec<std::ffi::OsString> {
@@ -22126,13 +23458,12 @@ mod tests {
     #[test]
     fn launch_options_follow_the_public_contract() {
         let default_address = DEFAULT_SERVICE_ADDRESS.parse().unwrap();
-        let LaunchMode::Service(default_config) = parse_launch_mode(launch_args(&[])).unwrap()
-        else {
-            panic!("default mode was not service-only");
+        let LaunchMode::Ui(default_config) = parse_launch_mode(launch_args(&[])).unwrap() else {
+            panic!("default mode was not UI client");
         };
         assert_eq!(default_config.listen_addr(), default_address);
-        let LaunchMode::All(ui_config) = parse_launch_mode(launch_args(&["--ui"])).unwrap() else {
-            panic!("--ui mode was not all");
+        let LaunchMode::Ui(ui_config) = parse_launch_mode(launch_args(&["--ui"])).unwrap() else {
+            panic!("--ui mode was not UI client");
         };
         assert_eq!(ui_config.listen_addr(), default_address);
         assert_eq!(
@@ -22147,30 +23478,19 @@ mod tests {
             parse_launch_mode(launch_args(&["-h"])).unwrap(),
             LaunchMode::Help
         );
-        assert_eq!(
-            parse_launch_mode(launch_args(&["--stop"])).unwrap(),
-            LaunchMode::Stop
-        );
-        let LaunchMode::Service(config) =
-            parse_launch_mode(launch_args(&["--port", "9876"])).unwrap()
-        else {
-            panic!("service mode was not selected");
-        };
-        assert_eq!(config.listen_addr(), "127.0.0.1:9876".parse().unwrap());
-        let LaunchMode::All(config) =
+        assert!(parse_launch_mode(launch_args(&["--stop"])).is_err());
+        assert!(parse_launch_mode(launch_args(&["--port", "9876"])).is_err());
+        let LaunchMode::Ui(config) =
             parse_launch_mode(launch_args(&["--ui", "--port", "4321"])).unwrap()
         else {
-            panic!("UI mode with explicit port was not selected");
+            panic!("UI client mode with explicit port was not selected");
         };
         assert_eq!(config.listen_addr(), "127.0.0.1:4321".parse().unwrap());
 
-        for port in ["1", "65535"] {
-            assert!(parse_launch_mode(launch_args(&["--port", port])).is_ok());
-        }
-        for invalid in ["0", "65536", "-1", "abc", "127.0.0.1:9876", ""] {
+        for port in ["1", "65535", "0", "65536", "-1", "abc", ""] {
             assert!(
-                parse_launch_mode(launch_args(&["--port", invalid])).is_err(),
-                "invalid port accepted: {invalid:?}"
+                parse_launch_mode(launch_args(&["--port", port])).is_err(),
+                "legacy service option accepted: {port:?}"
             );
         }
         for legacy in [
@@ -22235,11 +23555,9 @@ mod tests {
         poll_service_state(&mut state, endpoint);
         assert_eq!(
             state.service_endpoint_error.as_deref(),
-            Some("selected endpoint unavailable"),
-            "HTTP health without a verified resident owner must remain rejected"
+            None,
+            "a healthy REST endpoint is sufficient for the client"
         );
-        poll_service_state_with_owner_check(&mut state, endpoint, service_is_healthy);
-        assert!(state.service_endpoint_error.is_none());
         let admitted_pair = state.service_published_pair.clone();
         let admitted_details = state.public_details();
         let admitted_status = state.display_status();
@@ -22258,50 +23576,6 @@ mod tests {
         assert_eq!(state.service_published_pair, admitted_pair);
         assert_eq!(state.public_details(), admitted_details);
         server.shutdown();
-    }
-
-    #[test]
-    fn explicit_service_retry_starts_once_without_replacing_last_good_data() {
-        let mut state = CodexInfoState::preview("normal");
-        state.preview = false;
-        state.service_published_pair = Some("pair:7".into());
-        state.hold_service_endpoint_error("selected endpoint unavailable".into());
-        let admitted_details = state.public_details();
-        let in_flight = Arc::new(AtomicBool::new(false));
-        let (started_tx, started_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let config = ApiServerConfig::new("127.0.0.1:18787".parse().unwrap()).unwrap();
-
-        assert!(super::start_background_service_retry(
-            &mut state,
-            config,
-            &in_flight,
-            move |started_config| {
-                started_tx.send(started_config.listen_addr()).unwrap();
-                release_rx.recv().unwrap();
-                Ok(())
-            },
-        ));
-        assert_eq!(
-            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            config.listen_addr()
-        );
-        assert!(!super::start_background_service_retry(
-            &mut state,
-            config,
-            &in_flight,
-            |_| Ok(()),
-        ));
-        assert!(state.checking);
-        assert!(state.has_display_error());
-        assert_eq!(state.public_details(), admitted_details);
-
-        release_tx.send(()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while in_flight.load(Ordering::Acquire) && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(!in_flight.load(Ordering::Acquire));
     }
 
     #[test]
@@ -22378,6 +23652,70 @@ mod tests {
         });
 
         assert!(service_is_healthy(address));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn service_client_accepts_standard_case_insensitive_http_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let pair = format!("v1:{}", "1".repeat(64));
+        let body = br#"{"api_version":"v3","state":"ready","observed_at":1800000000,"authenticated":true,"plan_label":null,"quota":null,"models":[],"active_thread_count":0}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nCodex-Info-Published-Pair: {pair}\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request);
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+
+        let fetched = super::request_service_details_with_etag(address, "/v3/current", None)
+            .expect("HTTP field names are case-insensitive");
+        assert_eq!(fetched.status, 200);
+        assert_eq!(fetched.pair.as_deref(), Some(pair.as_str()));
+        assert_eq!(fetched.body, body);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn service_client_response_budget_matches_the_rest_request_budget() {
+        assert_eq!(super::SERVICE_RESPONSE_TIMEOUT, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn service_client_response_budget_is_an_absolute_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request);
+            for chunk in std::iter::once(b"HTTP/1.1 200 OK\r\n".as_slice())
+                .chain(std::iter::repeat_n(b"X-Pad: x\r\n".as_slice(), 10))
+            {
+                std::thread::sleep(Duration::from_millis(60));
+                if stream.write_all(chunk).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let result = super::request_service_details_with_etag_and_timeout(
+            address,
+            "/v3/current",
+            None,
+            Duration::from_millis(100),
+        );
+        assert!(
+            result.is_err(),
+            "a slow-drip response exceeded its deadline"
+        );
+        assert!(started.elapsed() < Duration::from_millis(350));
         worker.join().unwrap();
     }
 
@@ -23033,6 +24371,80 @@ mod tests {
     }
 
     #[test]
+    fn split_history_discards_bad_source_values_without_hiding_valid_rows() {
+        let model = |tokens| {
+            serde_json::json!({
+                "model": "SOL",
+                "total_tokens": tokens,
+                "input_tokens": tokens,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+                "total_dollars": 1.0
+            })
+        };
+        let page = serde_json::json!({
+            "api_version": "v3",
+            "history_samples": [
+                {
+                    "timestamp": 1_800_000_000_i64,
+                    "reset_at": 1_800_000_600_i64,
+                    "remaining_percent": 90.0,
+                    "models": [model(10)],
+                    "models_complete": true,
+                    "model_source": "confirmed"
+                },
+                {
+                    "timestamp": 1_800_000_060_i64,
+                    "reset_at": 1_800_000_600_i64,
+                    "remaining_percent": 89.0,
+                    "models": [model(999)],
+                    "models_complete": true,
+                    "model_source": "reconstructed-from-session"
+                },
+                {
+                    "timestamp": 1_800_000_120_i64,
+                    "reset_at": 1_800_000_600_i64,
+                    "remaining_percent": 88.0,
+                    "models": [model(9999)],
+                    "models_complete": true,
+                    "model_source": "future-source"
+                },
+                {
+                    "timestamp": 1_800_000_180_i64,
+                    "reset_at": 1_800_000_600_i64,
+                    "remaining_percent": 87.0,
+                    "models": [{"this_is_not_a_model": true}],
+                    "models_complete": true
+                }
+            ],
+            "history_gaps": [],
+            "next_cursor": null,
+            "resume_cursor": "3"
+        });
+
+        let parsed = super::parse_service_history_page_document(
+            &serde_json::to_vec(&page).expect("history page bytes"),
+        )
+        .expect("one bad row must not hide the valid page");
+
+        assert_eq!(parsed.samples.len(), 4);
+        assert_eq!(parsed.samples[0].model_source, "confirmed");
+        assert_eq!(
+            parsed.samples[0].models.as_ref().unwrap()[0].total_tokens,
+            10
+        );
+        assert_eq!(parsed.samples[1].model_source, "reconstructed-from-session");
+        assert!(parsed.samples[1].models.is_none());
+        assert!(!parsed.samples[1].models_complete);
+        assert_eq!(parsed.samples[2].model_source, "unavailable");
+        assert!(parsed.samples[2].models.is_none());
+        assert!(!parsed.samples[2].models_complete);
+        assert_eq!(parsed.samples[3].model_source, "unavailable");
+        assert!(parsed.samples[3].models.is_none());
+        assert!(!parsed.samples[3].models_complete);
+    }
+
+    #[test]
     fn split_history_apply_is_atomic_at_the_current_pair_boundary() {
         let source = CodexInfoState::preview("normal");
         let mut current = source.public_details_candidates().2;
@@ -23319,6 +24731,7 @@ mod tests {
         assert_eq!(failed.service_history_cursor.as_deref(), Some("C0"));
         assert!(failed.service_history_cursor_reset_required);
         assert!(failed.service_history_force_poll);
+        assert!(failed.graph_history_loading());
 
         let mut retry_requests = Vec::new();
         super::poll_service_graph_resources_with(
@@ -23478,6 +24891,7 @@ mod tests {
 
         fn origin_name(origin: super::GraphRemainingOrigin) -> &'static str {
             match origin {
+                super::GraphRemainingOrigin::ResetBoundary => "reset_boundary",
                 super::GraphRemainingOrigin::Raw => "raw",
                 super::GraphRemainingOrigin::ActivitySmoothed => "activity_smoothed",
                 super::GraphRemainingOrigin::Interpolated => "interpolated",
@@ -23915,6 +25329,11 @@ mod tests {
             period.start_at,
             period.end_at,
         );
+        let task_activity = state.graph_task_activity_for_selection(
+            period.reset_at,
+            period.start_at,
+            period.end_at,
+        );
         let mut actual_segments = Vec::<Value>::new();
         let mut render_contracts = serde_json::Map::new();
         let mut token_timelines = None;
@@ -23936,18 +25355,21 @@ mod tests {
                 &timelines,
             );
             let mut render_paths =
-                super::graph_paths_for_selection_with_sources_and_astra_with_lineage(
-                    &references,
-                    period.start_at,
-                    period.end_at,
-                    true,
-                    true,
-                    true,
-                    true,
-                    show_tokens,
-                    &untrusted_minutes,
-                    &confirmed_gaps,
-                    &raw_model_timelines,
+                super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                    super::GraphSelectionInput {
+                        samples: &references,
+                        period_start: period.start_at,
+                        period_end: period.end_at,
+                        show_luna: true,
+                        show_terra: true,
+                        show_sol: true,
+                        show_astra: true,
+                        show_tokens,
+                        untrusted_minutes: &untrusted_minutes,
+                        confirmed_gaps: &confirmed_gaps,
+                        model_timelines: &raw_model_timelines,
+                    },
+                    Some(&task_activity),
                 );
             super::separate_current_label_positions(
                 &mut render_paths,
@@ -23981,6 +25403,17 @@ mod tests {
                         "x": format!("{:.12}", marker.x),
                         "y_top": format!("{:.12}", marker.y),
                         "boundary": marker.boundary,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let latest = minute.last().expect("live graph endpoint");
+            let endpoint_values = timelines
+                .keys()
+                .map(|model| {
+                    serde_json::json!({
+                        "series": model,
+                        "timestamp": period.end_at,
+                        "value": model_value(latest, model),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -24099,6 +25532,8 @@ mod tests {
                         "1.000000000000",
                     ],
                     "endpoint_labels": endpoint_labels,
+                    "endpoint_values": endpoint_values,
+                    "latest_timestamp": period.end_at,
                     "layout": {
                         "reference_data_width": 788,
                         "plot_width": plot_width,
@@ -24191,6 +25626,7 @@ mod tests {
             .iter()
             .map(|point| {
                 let origin = match point.origin {
+                    super::GraphRemainingOrigin::ResetBoundary => "reset_boundary",
                     super::GraphRemainingOrigin::Raw => "raw",
                     super::GraphRemainingOrigin::ActivitySmoothed => "activity_smoothed",
                     super::GraphRemainingOrigin::Interpolated => "interpolated",
@@ -24207,13 +25643,23 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for contract in render_contracts.values_mut() {
-            contract
-                .as_object_mut()
-                .expect("render contract object")
-                .insert(
-                    "remaining_points".to_owned(),
-                    Value::Array(remaining_contract_points.clone()),
-                );
+            let object = contract.as_object_mut().expect("render contract object");
+            object
+                .get_mut("endpoint_values")
+                .and_then(Value::as_array_mut)
+                .expect("render endpoint values")
+                .push(serde_json::json!({
+                    "series": "remaining",
+                    "timestamp": period.end_at,
+                    "value": remaining_evidence
+                        .last()
+                        .expect("live remaining endpoint")
+                        .effective,
+                }));
+            object.insert(
+                "remaining_points".to_owned(),
+                Value::Array(remaining_contract_points.clone()),
+            );
         }
         let remaining_points = remaining_evidence
             .iter()
@@ -24255,18 +25701,56 @@ mod tests {
             })
             .collect::<Vec<_>>();
         expected_segments.sort_by_key(segment_key);
-        assert_eq!(
-            actual_segments, expected_segments,
-            "Linux live graph segments"
-        );
+        if actual_segments != expected_segments {
+            let mismatch = actual_segments
+                .iter()
+                .zip(&expected_segments)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or_else(|| actual_segments.len().min(expected_segments.len()));
+            let mismatch_bounds = actual_segments.get(mismatch).and_then(|segment| {
+                Some((segment["start_at"].as_i64()?, segment["end_at"].as_i64()?))
+            });
+            panic!(
+                "Linux live graph segment mismatch at {mismatch}; actual={:?}; expected={:?}; actual_count={}; expected_count={}; remaining_context={:?}; token_corrections={:?}; token_context={:?}",
+                actual_segments.get(mismatch),
+                expected_segments.get(mismatch),
+                actual_segments.len(),
+                expected_segments.len(),
+                remaining_evidence
+                    .iter()
+                    .filter(|point| mismatch_bounds.is_some_and(|(start, end)| {
+                        point.timestamp >= start && point.timestamp <= end
+                    }))
+                    .collect::<Vec<_>>(),
+                token_correction_starts,
+                token_timelines
+                    .iter()
+                    .map(|(name, timeline)| {
+                        (
+                            name,
+                            timeline
+                                .iter()
+                                .filter(|(timestamp, _)| mismatch_bounds.is_some_and(|(start, end)| {
+                                    **timestamp >= start && **timestamp <= end
+                                }))
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
 
         let span = (period.end_at - period.start_at).max(1) as f64;
-        let mut actual_idle = super::token_idle_interval_positions(
+        let mut actual_idle = super::token_idle_interval_positions_with_render_evidence(
             &references,
             period.start_at,
             period.end_at,
             &token_timelines,
             &confirmed_gaps,
+            Some(&super::GraphIdleRenderEvidence {
+                untrusted_minutes: &untrusted_minutes,
+                task_activity_by_minute: Some(&task_activity),
+            }),
         )
         .into_iter()
         .map(|interval| {
@@ -24286,7 +25770,20 @@ mod tests {
             .as_array()
             .expect("expected idle intervals")
             .to_vec();
-        assert_eq!(actual_idle, expected_idle, "Linux live idle intervals");
+        if actual_idle != expected_idle {
+            let mismatch = actual_idle
+                .iter()
+                .zip(&expected_idle)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or_else(|| actual_idle.len().min(expected_idle.len()));
+            panic!(
+                "Linux live idle mismatch at {mismatch}; actual={:?}; expected={:?}; actual_count={}; expected_count={}",
+                actual_idle.get(mismatch),
+                expected_idle.get(mismatch),
+                actual_idle.len(),
+                expected_idle.len(),
+            );
+        }
 
         let document = serde_json::json!({
             "schema_version": "graph-actual-v1",
@@ -24324,6 +25821,7 @@ mod tests {
 
         fn origin_name(origin: super::GraphRemainingOrigin) -> &'static str {
             match origin {
+                super::GraphRemainingOrigin::ResetBoundary => "reset_boundary",
                 super::GraphRemainingOrigin::Raw => "raw",
                 super::GraphRemainingOrigin::ActivitySmoothed => "activity_smoothed",
                 super::GraphRemainingOrigin::Interpolated => "interpolated",
@@ -24404,6 +25902,7 @@ mod tests {
             period.end_at,
         );
         let mut token_timelines = super::GraphModelTimelines::new();
+        let mut token_correction_starts = BTreeSet::new();
 
         for show_tokens in [false, true] {
             let (timelines, correction_starts) = state.graph_model_lineage_for_selection(
@@ -24413,7 +25912,14 @@ mod tests {
                 show_tokens,
                 &[],
             );
-            assert!(correction_starts.is_empty());
+            assert_eq!(
+                correction_starts
+                    .iter()
+                    .map(|timestamp| timestamp - period.start_at)
+                    .collect::<Vec<_>>(),
+                serde_json::from_value::<Vec<i64>>(expected["correction_starts"].clone())
+                    .expect("expected correction starts")
+            );
             assert_eq!(
                 timelines.keys().cloned().collect::<Vec<_>>(),
                 expected_universe
@@ -24466,13 +25972,15 @@ mod tests {
                     &minute,
                     period.end_at,
                 );
+                let model_correction_starts =
+                    super::graph_model_correction_starts(timelines.get(model));
                 let segments = super::metric_line_segments_with_boundaries(
                     &minute,
                     value,
                     &[],
                     &untrusted,
                     false,
-                    &correction_starts,
+                    &model_correction_starts,
                 );
                 let actual = |kind| {
                     segments
@@ -24523,17 +26031,19 @@ mod tests {
             }
             if show_tokens {
                 token_timelines = timelines;
+                token_correction_starts = correction_starts;
             }
         }
 
+        let activity_token_timelines = super::activity_relevant_token_timelines(&token_timelines);
         let remaining = super::remaining_evidence_from_model_timelines(
             &references,
             period.start_at,
             period.end_at,
-            &token_timelines,
+            &activity_token_timelines,
             true,
             &[],
-            &BTreeSet::new(),
+            &token_correction_starts,
         );
         assert_eq!(
             remaining
@@ -24573,8 +26083,8 @@ mod tests {
             &references,
             &minute,
             &[],
-            &BTreeSet::new(),
-            Some((&token_timelines, true)),
+            &token_correction_starts,
+            Some((&activity_token_timelines, true)),
         );
         let actual_remaining = |kind| {
             remaining_segments
@@ -24611,19 +26121,27 @@ mod tests {
         );
 
         let expected_idle = intervals(&expected["idle_intervals"]);
+        let task_activity = state.graph_task_activity_for_selection(
+            period.reset_at,
+            period.start_at,
+            period.end_at,
+        );
         let graph = |show_tokens| {
-            super::graph_paths_for_selection_with_sources_and_astra(
-                &references,
-                period.start_at,
-                period.end_at,
-                true,
-                true,
-                true,
-                true,
-                show_tokens,
-                &untrusted_minutes,
-                &[],
-                &raw_timelines,
+            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: period.start_at,
+                    period_end: period.end_at,
+                    show_luna: true,
+                    show_terra: true,
+                    show_sol: true,
+                    show_astra: true,
+                    show_tokens,
+                    untrusted_minutes: &untrusted_minutes,
+                    confirmed_gaps: &[],
+                    model_timelines: &raw_timelines,
+                },
+                Some(&task_activity),
             )
         };
         let dollars = graph(false);
@@ -24739,6 +26257,16 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let references = samples.iter().collect::<Vec<_>>();
+            let activity = rows
+                .iter()
+                .map(|row| {
+                    (
+                        row["timestamp"].as_i64().unwrap(),
+                        row.get("task_active_since_previous")
+                            .and_then(Value::as_bool),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
             let raw = BTreeMap::from([(
                 "SOL".to_owned(),
                 rows.iter()
@@ -24748,8 +26276,8 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar: row["dollars"].as_f64().unwrap(),
                                 tokens: row["tokens"].as_u64().unwrap() as f64,
-                                reliable: true,
-                                published: true,
+                                raw_tokens: row["tokens"].as_u64(),
+                                origin: super::GraphModelOrigin::Direct,
                             },
                         )
                     })
@@ -24775,18 +26303,21 @@ mod tests {
                 &confirmed_gaps,
             );
             let graph = |show_tokens| {
-                super::graph_paths_for_selection_with_sources_and_astra(
-                    &references,
-                    start,
-                    end,
-                    false,
-                    false,
-                    true,
-                    false,
-                    show_tokens,
-                    &BTreeSet::new(),
-                    &confirmed_gaps,
-                    &raw,
+                super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                    super::GraphSelectionInput {
+                        samples: &references,
+                        period_start: start,
+                        period_end: end,
+                        show_luna: false,
+                        show_terra: false,
+                        show_sol: true,
+                        show_astra: false,
+                        show_tokens,
+                        untrusted_minutes: &BTreeSet::new(),
+                        confirmed_gaps: &confirmed_gaps,
+                        model_timelines: &raw,
+                    },
+                    Some(&activity),
                 )
             };
             let dollars = graph(false);
@@ -24921,7 +26452,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_remaining_smoothing_distributes_only_across_token_active_seconds() {
+    fn graph_remaining_smoothing_uses_coherent_token_deltas_or_elapsed_fallback() {
         fn intervals(value: &Value) -> Vec<(i64, i64)> {
             value
                 .as_array()
@@ -24933,6 +26464,7 @@ mod tests {
 
         fn origin_name(origin: super::GraphRemainingOrigin) -> &'static str {
             match origin {
+                super::GraphRemainingOrigin::ResetBoundary => "reset_boundary",
                 super::GraphRemainingOrigin::Raw => "raw",
                 super::GraphRemainingOrigin::ActivitySmoothed => "activity_smoothed",
                 super::GraphRemainingOrigin::Interpolated => "interpolated",
@@ -24975,6 +26507,16 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let references = samples.iter().collect::<Vec<_>>();
+            let activity = rows
+                .iter()
+                .map(|row| {
+                    (
+                        row["timestamp"].as_i64().unwrap(),
+                        row.get("task_active_since_previous")
+                            .and_then(Value::as_bool),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
             let raw = BTreeMap::from([(
                 "SOL".to_owned(),
                 rows.iter()
@@ -24984,8 +26526,8 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar: row["dollars"].as_f64().unwrap(),
                                 tokens: row["tokens"].as_u64().unwrap() as f64,
-                                reliable: true,
-                                published: true,
+                                raw_tokens: row["tokens"].as_u64(),
+                                origin: super::GraphModelOrigin::Direct,
                             },
                         )
                     })
@@ -25031,19 +26573,23 @@ mod tests {
                 serde_json::from_value::<Vec<String>>(case["remaining_origins"].clone()).unwrap(),
                 "origin {name}"
             );
-            let graph = super::graph_paths_for_selection_with_sources_and_astra(
-                &references,
-                start,
-                end,
-                false,
-                false,
-                true,
-                false,
-                false,
-                &BTreeSet::new(),
-                &confirmed_gaps,
-                &raw,
-            );
+            let graph =
+                super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                    super::GraphSelectionInput {
+                        samples: &references,
+                        period_start: start,
+                        period_end: end,
+                        show_luna: false,
+                        show_terra: false,
+                        show_sol: true,
+                        show_astra: false,
+                        show_tokens: false,
+                        untrusted_minutes: &BTreeSet::new(),
+                        confirmed_gaps: &confirmed_gaps,
+                        model_timelines: &raw,
+                    },
+                    Some(&activity),
+                );
             let span = (end - start) as f64;
             let actual_idle = graph
                 .unused_intervals
@@ -25125,7 +26671,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_long_history_keeps_one_continuous_idle_band_without_pixel_cadence() {
+    fn graph_long_direct_history_without_active_lifecycle_confirms_idle() {
         let samples = (0..5_000)
             .map(|index| {
                 UsageHistorySample::new_with_usage(
@@ -25154,8 +26700,8 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: sample.sol_dollars,
                             tokens: sample.sol_tokens as f64,
-                            reliable: true,
-                            published: true,
+                            raw_tokens: Some(sample.sol_tokens),
+                            origin: super::GraphModelOrigin::Direct,
                         },
                     )
                 })
@@ -25163,24 +26709,27 @@ mod tests {
         )]);
         let period_end = 5_000 * 60;
 
-        let graph = super::graph_paths_for_selection_with_sources_and_astra(
-            &references,
-            0,
-            period_end,
-            false,
-            false,
-            true,
-            false,
-            false,
-            &BTreeSet::new(),
-            &[],
-            &raw,
-        );
+        let graph =
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end,
+                show_luna: false,
+                show_terra: false,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: false,
+                untrusted_minutes: &BTreeSet::new(),
+                confirmed_gaps: &[],
+                model_timelines: &raw,
+            });
 
-        let idle = graph.unused_intervals.as_slice();
-        assert_eq!(idle.len(), 1);
-        assert_eq!(idle[0].start, 0.0);
-        assert!((idle[0].width - 4_999.0 / 5_000.0 * 100.0).abs() < 1e-9);
+        assert_eq!(graph.unused_intervals.len(), 1);
+        assert_eq!(graph.unused_intervals[0].start, 0.0);
+        assert_eq!(
+            graph.unused_intervals[0].width,
+            samples.last().unwrap().timestamp as f64 / period_end as f64 * 100.0
+        );
     }
 
     #[test]
@@ -25369,9 +26918,17 @@ mod tests {
             for sample in samples {
                 let timestamp = sample["timestamp"].as_i64().expect("sample timestamp");
                 timestamps.push(timestamp);
-                if sample["model_source"].as_str() == Some("confirmed")
-                    && sample["models_complete"].as_bool() == Some(true)
-                {
+                let origin = match (
+                    sample["model_source"].as_str(),
+                    sample["models_complete"].as_bool(),
+                ) {
+                    (Some("confirmed"), Some(true)) => super::GraphModelOrigin::Direct,
+                    (Some("legacy-unknown"), _) | (Some("confirmed"), _) => {
+                        super::GraphModelOrigin::LegacyObserved
+                    }
+                    _ => super::GraphModelOrigin::Unknown,
+                };
+                if origin == super::GraphModelOrigin::Direct {
                     trusted_complete.insert(timestamp);
                 }
                 for model in sample["models"].as_array().expect("sample models") {
@@ -25381,8 +26938,8 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: model["total_dollars"].as_f64().expect("model dollars"),
                             tokens: model["total_tokens"].as_u64().expect("model tokens") as f64,
-                            reliable: true,
-                            published: true,
+                            raw_tokens: model["total_tokens"].as_u64(),
+                            origin,
                         },
                     );
                 }
@@ -25449,7 +27006,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let untrusted = timelines["SOL"]
                 .iter()
-                .filter(|(_, point)| !point.reliable)
+                .filter(|(_, point)| !point.origin.line_is_exact())
                 .map(|(timestamp, _)| *timestamp)
                 .collect::<BTreeSet<_>>();
             let segments = super::metric_line_segments_with_boundaries(
@@ -25523,8 +27080,8 @@ mod tests {
                     super::GraphModelPoint {
                         dollar,
                         tokens: token as f64,
-                        reliable: true,
-                        published: true,
+                        raw_tokens: Some(token),
+                        origin: super::GraphModelOrigin::Direct,
                     },
                 );
             }
@@ -25658,6 +27215,289 @@ mod tests {
             .expect("a complete empty selected period is valid");
         assert!(!client.graph_history_loading());
         assert_eq!(client.graph_data(), "[]");
+    }
+
+    #[test]
+    fn graph_open_forces_only_a_missing_exact_account_period_page() {
+        let pair = published_pair(23, 1);
+        let (period, samples) = split_graph_fixture();
+        let mut client = seeded_split_graph_client(&pair, &period, &samples[0], "C0");
+
+        client.select_latest_history();
+        assert!(!client.service_history_force_poll);
+
+        client.service_history_pair = None;
+        client.select_latest_history();
+        assert!(client.service_history_force_poll);
+    }
+
+    #[test]
+    fn linux_period_selection_polls_immediately_without_next_tick_duplicate() {
+        const PERIOD_SHIFT_SECONDS: i64 = 1_800;
+
+        let pair = published_pair(23, 2);
+        let (period, samples) = split_graph_fixture();
+        let mut client = seeded_split_graph_client(&pair, &period, &samples[0], "C0");
+        let mut target_period = period.clone();
+        target_period.id = "immediate-period".into();
+        target_period.label = "即時取得期間".into();
+        target_period.current = false;
+        target_period.start_at -= PERIOD_SHIFT_SECONDS;
+        target_period.end_at -= PERIOD_SHIFT_SECONDS;
+        target_period.reset_at -= PERIOD_SHIFT_SECONDS;
+        let mut target_sample = samples[0].clone();
+        target_sample.timestamp -= PERIOD_SHIFT_SECONDS;
+        target_sample.reset_at -= PERIOD_SHIFT_SECONDS;
+        let periods = vec![period, target_period.clone()];
+        client
+            .apply_service_history_periods_resource(pair.clone(), periods.clone())
+            .expect("the selected period catalog is valid");
+        let target_label = client
+            .history_periods()
+            .into_iter()
+            .find(|candidate| candidate.canonical_reset_at == target_period.reset_at)
+            .map(|candidate| candidate.label)
+            .expect("the target period has a localized selector label");
+
+        let periods_body = serde_json::to_vec(&json!({
+            "api_version": "v3",
+            "history_periods": periods,
+        }))
+        .expect("period catalog serializes");
+        let page_body = split_history_page_body(&[target_sample.clone()], None, Some("C1"));
+        let selected_at = Instant::now();
+        let mut requests = Vec::new();
+        super::select_service_history_and_poll_with(
+            &mut client,
+            &target_label,
+            selected_at,
+            |route, conditional| {
+                requests.push((route.to_owned(), conditional.map(str::to_owned)));
+                Ok(if route == "/v3/history/periods" {
+                    super::ServiceDetailsHttpResponse {
+                        status: 200,
+                        pair: Some(pair.clone()),
+                        body: periods_body.clone(),
+                    }
+                } else {
+                    assert_eq!(route, super::service_history_route(&target_period.id, None));
+                    super::ServiceDetailsHttpResponse {
+                        status: 200,
+                        pair: Some(pair.clone()),
+                        body: page_body.clone(),
+                    }
+                })
+            },
+        );
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].0,
+            super::service_history_route(&target_period.id, None)
+        );
+        assert_eq!(client.selected_reset_at, Some(target_period.reset_at));
+        assert_eq!(client.selected_history_period, target_period.label);
+        assert_eq!(client.service_history_samples, [target_sample]);
+        assert!(!client.service_history_force_poll);
+        assert!(!client.graph_history_loading());
+
+        let mut next_tick_requests = 0;
+        super::poll_service_graph_resources_with(
+            &mut client,
+            selected_at + Duration::from_secs(1),
+            true,
+            |_, _| {
+                next_tick_requests += 1;
+                Err("the next owner tick must not repeat the selection fetch".into())
+            },
+        );
+        assert_eq!(next_tick_requests, 0);
+    }
+
+    #[test]
+    fn linux_graph_period_metadata_does_not_commit_old_page_cursor() {
+        let pair = published_pair(24, 1);
+        let (period, samples) = split_graph_fixture();
+        let mut client = seeded_split_graph_client(&pair, &period, &samples[0], "C0");
+        let mut next_period = period.clone();
+        next_period.id = format!("{}-next", period.id);
+        next_period.label = "次の履歴".into();
+        next_period.current = true;
+
+        client
+            .apply_service_history_periods_resource(pair.clone(), vec![next_period.clone()])
+            .expect("same-pair period metadata is valid");
+
+        // Metadata selects the next target, but the committed page is still
+        // the old period. The old page identity must keep loading pending.
+        assert_eq!(
+            client.service_history_period_id.as_deref(),
+            Some(period.id.as_str())
+        );
+        assert!(client.graph_history_loading());
+
+        client.service_history_force_poll = true;
+        let periods_body = split_history_periods_body(&next_period);
+        let page_body = split_history_page_body(&samples[1..2], None, Some("C1"));
+        let mut requests = Vec::new();
+        super::poll_service_graph_resources_with(
+            &mut client,
+            Instant::now(),
+            true,
+            |route, conditional| {
+                requests.push((route.to_owned(), conditional.map(str::to_owned)));
+                if route == "/v3/history/periods" {
+                    Ok(super::ServiceDetailsHttpResponse {
+                        status: 200,
+                        pair: Some(pair.clone()),
+                        body: periods_body.clone(),
+                    })
+                } else {
+                    assert_eq!(route, super::service_history_route(&next_period.id, None));
+                    assert!(conditional.is_none());
+                    Ok(super::ServiceDetailsHttpResponse {
+                        status: 200,
+                        pair: Some(pair.clone()),
+                        body: page_body.clone(),
+                    })
+                }
+            },
+        );
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].0,
+            super::service_history_route(&next_period.id, None)
+        );
+        assert_eq!(
+            client.service_history_period_id.as_deref(),
+            Some(next_period.id.as_str())
+        );
+        assert_eq!(client.service_history_cursor.as_deref(), Some("C1"));
+        assert!(!client.graph_history_loading());
+        assert!(client.service_history_error.is_none());
+    }
+
+    #[test]
+    fn period_switch_holds_last_good_scene_through_one_transient_failure() {
+        const PERIOD_SHIFT_SECONDS: i64 = 1_800;
+
+        let pair = published_pair(25, 1);
+        let (period, samples) = split_graph_fixture();
+        let mut client = seeded_split_graph_client(&pair, &period, &samples[0], "C0");
+        let mut target_period = period.clone();
+        target_period.id = "older-period".into();
+        target_period.label = "以前の期間".into();
+        target_period.start_at -= PERIOD_SHIFT_SECONDS;
+        target_period.end_at -= PERIOD_SHIFT_SECONDS;
+        target_period.reset_at -= PERIOD_SHIFT_SECONDS;
+        let mut target_sample = samples[0].clone();
+        target_sample.timestamp -= PERIOD_SHIFT_SECONDS;
+        target_sample.reset_at -= PERIOD_SHIFT_SECONDS;
+        let periods = vec![period.clone(), target_period.clone()];
+        client
+            .apply_service_history_periods_resource(pair.clone(), periods.clone())
+            .expect("the next period catalog is valid");
+        let target_label = client
+            .history_periods()
+            .into_iter()
+            .find(|candidate| candidate.canonical_reset_at == target_period.reset_at)
+            .map(|candidate| candidate.label)
+            .expect("the target period has a localized selector label");
+
+        let last_good = (
+            client.selected_reset_at,
+            client.selected_history_period.clone(),
+            client.service_history_period_id.clone(),
+            client.service_history_samples.clone(),
+            client.history.samples.clone(),
+        );
+        client.select_history(&target_label);
+
+        assert_eq!(
+            client.service_history_pending_reset_at,
+            Some(target_period.reset_at)
+        );
+        assert_eq!(
+            (
+                client.selected_reset_at,
+                client.selected_history_period.clone(),
+                client.service_history_period_id.clone(),
+                client.service_history_samples.clone(),
+                client.history.samples.clone(),
+            ),
+            last_good
+        );
+        assert!(client.graph_history_loading());
+        assert!(client.service_history_error.is_none());
+
+        let periods_body = serde_json::to_vec(&json!({
+            "api_version": "v3",
+            "history_periods": periods,
+        }))
+        .expect("period catalog serializes");
+        super::poll_service_graph_resources_with(&mut client, Instant::now(), true, |route, _| {
+            if route == "/v3/history/periods" {
+                Ok(super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: Some(pair.clone()),
+                    body: periods_body.clone(),
+                })
+            } else {
+                Err("transient history transport failure".into())
+            }
+        });
+
+        assert_eq!(client.service_history_pending_failures, 1);
+        assert!(client.service_history_force_poll);
+        assert!(client.service_history_error.is_none());
+        assert!(client.graph_history_loading());
+        assert_eq!(
+            (
+                client.selected_reset_at,
+                client.selected_history_period.clone(),
+                client.service_history_period_id.clone(),
+                client.service_history_samples.clone(),
+                client.history.samples.clone(),
+            ),
+            last_good
+        );
+
+        let page_body = split_history_page_body(&[target_sample.clone()], None, Some("C1"));
+        super::poll_service_graph_resources_with(
+            &mut client,
+            Instant::now() + Duration::from_secs(1),
+            true,
+            |route, _| {
+                Ok(if route == "/v3/history/periods" {
+                    super::ServiceDetailsHttpResponse {
+                        status: 200,
+                        pair: Some(pair.clone()),
+                        body: periods_body.clone(),
+                    }
+                } else {
+                    assert_eq!(route, super::service_history_route(&target_period.id, None));
+                    super::ServiceDetailsHttpResponse {
+                        status: 200,
+                        pair: Some(pair.clone()),
+                        body: page_body.clone(),
+                    }
+                })
+            },
+        );
+
+        assert_eq!(client.service_history_pending_reset_at, None);
+        assert_eq!(client.service_history_pending_failures, 0);
+        assert_eq!(client.selected_reset_at, Some(target_period.reset_at));
+        assert_eq!(client.selected_history_period, target_period.label);
+        assert_eq!(
+            client.service_history_period_id.as_deref(),
+            Some(target_period.id.as_str())
+        );
+        assert_eq!(client.service_history_samples, [target_sample]);
+        assert!(!client.service_history_force_poll);
+        assert!(!client.graph_history_loading());
+        assert!(client.service_history_error.is_none());
     }
 
     #[test]
@@ -26760,13 +28600,14 @@ mod tests {
     }
 
     #[test]
-    fn quota_transition_follows_only_the_durable_time_authority() {
+    fn quota_transition_requires_consistent_quota_and_time_evidence() {
         let observed = 2_000_000_000;
         let reset = observed + WEEK_SECONDS;
         assert_eq!(
             super::classify_quota_transition(
                 None,
                 0,
+                None,
                 None,
                 reset,
                 WEEK_SECONDS,
@@ -26780,6 +28621,7 @@ mod tests {
                 Some(reset),
                 WEEK_SECONDS,
                 Some(observed),
+                Some(50.0),
                 reset,
                 WEEK_SECONDS,
                 Some(49.0),
@@ -26789,7 +28631,6 @@ mod tests {
         );
         for (next_reset, next_window, remaining, next_observed) in [
             (reset - 137_239, WEEK_SECONDS, Some(17.0), observed + 60),
-            (reset + 1, WEEK_SECONDS, Some(29.0), observed + 60),
             (reset, WEEK_SECONDS + 1, Some(29.0), observed + 60),
             (reset, WEEK_SECONDS, None, observed + 60),
             (reset, WEEK_SECONDS, Some(f64::NAN), observed + 60),
@@ -26801,6 +28642,7 @@ mod tests {
                     Some(reset),
                     WEEK_SECONDS,
                     Some(observed),
+                    Some(50.0),
                     next_reset,
                     next_window,
                     remaining,
@@ -26809,18 +28651,21 @@ mod tests {
                 super::QuotaTransition::Rejected
             );
         }
-        assert_eq!(
-            super::classify_quota_transition(
-                Some(reset),
-                WEEK_SECONDS,
-                Some(observed),
-                reset + WEEK_SECONDS,
-                WEEK_SECONDS,
-                Some(100.0),
-                reset,
-            ),
-            super::QuotaTransition::Boundary
-        );
+        for successor_start_drift in [-60, 0, 60] {
+            assert_eq!(
+                super::classify_quota_transition(
+                    Some(reset),
+                    WEEK_SECONDS,
+                    Some(observed),
+                    Some(1.0),
+                    reset + WEEK_SECONDS + successor_start_drift,
+                    WEEK_SECONDS,
+                    Some(100.0),
+                    reset,
+                ),
+                super::QuotaTransition::Boundary
+            );
+        }
     }
 
     #[test]
@@ -26937,9 +28782,12 @@ mod tests {
                 Some(69.0),
                 now,
             ),
-            super::QuotaTransition::Rejected
+            super::QuotaTransition::SamePeriod
         );
-        assert_eq!(restarted.model_totals, [durable_total.clone()]);
+        assert_eq!(
+            restarted.model_totals.as_slice(),
+            std::slice::from_ref(&durable_total)
+        );
 
         let mut rollover = super::usage_store::SessionCollectionState {
             data_generation: 8,
@@ -27459,8 +29307,6 @@ mod tests {
         ));
         let _ = fs::remove_file(&db_path);
         state.history = UsageHistory {
-            db_path: Some(db_path.clone()),
-            partition_identity: None,
             samples: Vec::new(),
             observations: Vec::new(),
             pending_store_samples: Vec::new(),
@@ -27684,6 +29530,12 @@ mod tests {
                 .unwrap();
         let mut state = CodexInfoState::preview("normal");
         state.preview = false;
+        // Keep this owner-recovery test independent of the optional account
+        // directory resource exposed only by the partitioned REST service.
+        state.service_accounts_known = true;
+        state.service_accounts_supported = false;
+        state.service_accounts_force_poll = false;
+        state.service_accounts_last_poll = Instant::now();
         state.service_current_last_poll = Instant::now();
         state.service_current_force_poll = false;
 
@@ -27896,7 +29748,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(super::ResidentServiceCycleError::Store(_))
+            Err(super::ResidentServiceCycleError::Store)
         ));
         let mut expected_error = last_complete.clone();
         expected_error.state = PublicState::Error;
@@ -27961,7 +29813,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(super::ResidentServiceCycleError::Store(_))
+            Err(super::ResidentServiceCycleError::Store)
         ));
         let initial_error = emitted_initial_error
             .into_inner()
@@ -28408,6 +30260,13 @@ mod tests {
         assert!((wire_total - 0.187_152_6).abs() > 300.0);
 
         let mut linux = CodexInfoState::service_client();
+        // This focused publisher fixture has no account catalog. Mark that
+        // optional split resource as legacy-unsupported so the assertion
+        // exercises only the current/history recovery contract.
+        linux.service_accounts_known = true;
+        linux.service_accounts_supported = false;
+        linux.service_accounts_force_poll = false;
+        linux.service_accounts_last_poll = Instant::now();
         assert_eq!(
             super::poll_service_current_resources(&mut linux, server.local_addr()),
             super::ServiceCurrentPollOutcome::Success
@@ -28577,7 +30436,7 @@ mod tests {
         );
         assert!(matches!(
             first,
-            Err(super::ResidentServiceCycleError::Store(_))
+            Err(super::ResidentServiceCycleError::Store)
         ));
         assert_eq!(attempts.get(), 1);
         assert!(state.recorder_store_error);
@@ -28851,15 +30710,15 @@ mod tests {
             .current_account_admission()
             .expect("preview admission");
 
-        state.apply_local_usage_error_with_generation(
-            state.auth_epoch,
-            Some(admission),
+        state.apply_local_usage_error_with_generation(super::LocalUsageErrorContext {
+            auth_epoch: state.auth_epoch,
+            admission: Some(admission),
             reset_at,
-            WEEK_SECONDS,
-            Some(0x138),
-            Some(2),
-            durable_model_totals.clone(),
-        );
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(0x138),
+            cycle_seq: Some(2),
+            durable_model_totals: durable_model_totals.clone(),
+        });
 
         assert!(!state.local_usage_pending);
         assert!(state.local_usage_error);
@@ -28909,15 +30768,15 @@ mod tests {
         let admission = state
             .current_account_admission()
             .expect("preview admission");
-        state.apply_local_usage_error_with_generation(
-            state.auth_epoch,
-            Some(admission),
+        state.apply_local_usage_error_with_generation(super::LocalUsageErrorContext {
+            auth_epoch: state.auth_epoch,
+            admission: Some(admission),
             reset_at,
-            WEEK_SECONDS,
-            Some(0x139),
-            Some(3),
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(0x139),
+            cycle_seq: Some(3),
             durable_model_totals,
-        );
+        });
         let pending_before = state.history.pending_store_observations.clone();
         let mut publication = super::ResidentPublicationState::default();
         let attempts = std::cell::Cell::new(0_u8);
@@ -28941,7 +30800,7 @@ mod tests {
         );
         assert!(matches!(
             first,
-            Err(super::ResidentServiceCycleError::Store(_))
+            Err(super::ResidentServiceCycleError::Store)
         ));
         assert_eq!(attempts.get(), 1);
         assert_eq!(state.history.pending_store_observations, pending_before);
@@ -28997,30 +30856,30 @@ mod tests {
         let mut stale_admission = admission.clone();
         stale_admission.partition_id.push_str("-stale");
 
-        state.apply_local_usage_error_with_generation(
-            state.auth_epoch,
-            Some(stale_admission),
+        state.apply_local_usage_error_with_generation(super::LocalUsageErrorContext {
+            auth_epoch: state.auth_epoch,
+            admission: Some(stale_admission),
             reset_at,
-            WEEK_SECONDS,
-            Some(0x13a),
-            Some(4),
-            Vec::new(),
-        );
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(0x13a),
+            cycle_seq: Some(4),
+            durable_model_totals: Vec::new(),
+        });
         assert!(!state.local_usage_error);
         assert!(state.history.pending_store_samples.is_empty());
         assert!(!state.has_pending_recorder_batch());
 
         state.account_error = Some("remote outage".into());
         state.local_usage_pending = true;
-        state.apply_local_usage_error_with_generation(
-            state.auth_epoch,
-            Some(admission),
+        state.apply_local_usage_error_with_generation(super::LocalUsageErrorContext {
+            auth_epoch: state.auth_epoch,
+            admission: Some(admission),
             reset_at,
-            WEEK_SECONDS,
-            Some(0x13a),
-            Some(5),
-            Vec::new(),
-        );
+            window_seconds: WEEK_SECONDS,
+            collector_epoch: Some(0x13a),
+            cycle_seq: Some(5),
+            durable_model_totals: Vec::new(),
+        });
         assert!(!state.local_usage_pending);
         assert!(state.history.pending_store_samples.is_empty());
         assert!(!state.has_pending_recorder_batch());
@@ -29485,17 +31344,11 @@ mod tests {
         assert_eq!((retained_legacy.sol, retained_legacy.luna), (2.0, 0.5));
 
         let paths = state.graph_paths_for_selection_at(observed_at, true, false, true, false);
-        assert!(
-            !paths.sol_rising.is_empty(),
-            "known legacy SOL observations are measured values, not predictions"
-        );
-        assert!(
-            !paths.luna_rising.is_empty(),
-            "known legacy LUNA observations are measured values, not predictions"
-        );
+        assert!(paths.sol_rising.is_empty());
+        assert!(paths.luna_rising.is_empty());
         assert!(
             paths.sol_inferred.matches('M').count() > 1,
-            "only the unavailable interval is bridged as inferred"
+            "legacy and unavailable spans must remain display-only"
         );
         assert!(paths.luna_inferred.matches('M').count() > 1);
         assert!(
@@ -29504,7 +31357,7 @@ mod tests {
         );
         assert_eq!(paths.current_sol_label, "$3.00");
         assert_eq!(paths.current_luna_label, "$0.80");
-        assert!(!paths.remaining_solid.is_empty());
+        assert!(paths.remaining_solid.is_empty());
         assert!(
             !paths.remaining_inferred.is_empty(),
             "quota changes adjacent to unavailable model evidence stay inferred"
@@ -29710,6 +31563,11 @@ mod tests {
                 .unwrap(),
         );
         let connection = rusqlite::Connection::open(&partition.database_path).unwrap();
+        // Model an already-corrupted/legacy file. Normal writers must retain
+        // the guard; this test exercises only fail-closed reading.
+        connection
+            .execute_batch("DROP TRIGGER durable_history_observation_insert_guard;")
+            .unwrap();
         connection
             .execute(
                 "INSERT INTO durable_state
@@ -32388,19 +34246,20 @@ mod tests {
         for event in &events {
             collected_totals.add(&event.model, event.delta);
         }
-        let recovery = super::build_session_timeline_recovery(
-            &events,
-            reset_at,
-            window_seconds,
-            1_859,
-            &collection_state,
-            &ranges,
-            collector_epoch,
-            cycle_seq,
-            &collected_totals,
-        )
-        .unwrap()
-        .expect("durable quota lag requires timeline catch-up");
+        let recovery =
+            super::build_session_timeline_recovery(super::SessionTimelineRecoveryContext {
+                events: &events,
+                reset_at,
+                window_seconds,
+                timeline_end: 1_859,
+                collection_state: &collection_state,
+                ranges: &ranges,
+                collector_epoch,
+                cycle_seq,
+                collected_totals: &collected_totals,
+            })
+            .unwrap()
+            .expect("durable quota lag requires timeline catch-up");
 
         assert_eq!(recovery.projection_end_exclusive, 1_800);
         assert_eq!(
@@ -33579,7 +35438,7 @@ mod tests {
             let sessions = root.join("sessions");
             fs::create_dir(&sessions).unwrap();
             let session = sessions.join("current.jsonl");
-            let observed_at = Utc::now().timestamp();
+            let observed_at = Utc::now().timestamp().div_euclid(60) * 60;
             let reset_at = observed_at + 3_600;
             let context = json!({
                 "timestamp": Utc::now().to_rfc3339(),
@@ -34201,7 +36060,7 @@ mod tests {
                 Some(79.0),
                 now.timestamp(),
             ),
-            super::QuotaTransition::Rejected
+            super::QuotaTransition::SamePeriod
         );
         let cumulative = super::collect_incremental_local_usage(
             &inventory,
@@ -34860,11 +36719,11 @@ mod tests {
     #[test]
     fn startup_maintenance_prunes_before_the_calendar_cutoff_only_once() {
         let db_path = test_history_path("startup-maintenance");
-        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 56).unwrap();
+        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 0).unwrap();
         let cutoff = three_months_before_utc(now);
         let samples = [
             UsageHistorySample {
-                timestamp: cutoff - 1,
+                timestamp: cutoff - 60,
                 reset_at: cutoff + 10_000,
                 remaining_percent: 80.0,
                 sol_dollars: 1.0,
@@ -34925,7 +36784,7 @@ mod tests {
         assert!(history
             .samples
             .iter()
-            .any(|sample| sample.timestamp == cutoff - 1));
+            .any(|sample| sample.timestamp == cutoff - 60));
         let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
 
@@ -34947,8 +36806,6 @@ mod tests {
             luna_tokens: 0,
         };
         let mut history = UsageHistory {
-            db_path: Some(db_path.clone()),
-            partition_identity: None,
             samples: vec![
                 sample(1),
                 sample(now.timestamp()),
@@ -35157,7 +37014,7 @@ mod tests {
     #[test]
     fn sqlite_history_cutoff_and_period_list_integration() {
         let db_path = test_history_path("cutoff-period-list");
-        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 56).unwrap();
+        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 0).unwrap();
         let cutoff = three_months_before_utc(now);
         let record = |timestamp, reset_at, remaining_percent| UsageHistorySample {
             timestamp,
@@ -35171,10 +37028,10 @@ mod tests {
             luna_tokens: 0,
         };
         let records = [
-            record(cutoff - 1, cutoff + 10_000, 90.0),
+            record(cutoff - 60, cutoff + 10_000, 90.0),
             record(cutoff, cutoff + 20_000, 80.0),
             record(now.timestamp(), now.timestamp() + 30_000, 70.0),
-            record(now.timestamp() + 1, now.timestamp() + 40_000, 60.0),
+            record(now.timestamp() + 60, now.timestamp() + 30_000, 60.0),
         ];
         let identity = usage_store::StoragePartitionIdentity {
             schema_version: "codex-info-account-db-v1".into(),
@@ -35224,7 +37081,7 @@ mod tests {
                 .iter()
                 .map(|sample| sample.timestamp)
                 .collect::<Vec<_>>(),
-            vec![cutoff, now.timestamp(), now.timestamp() + 1]
+            vec![cutoff, now.timestamp(), now.timestamp() + 60]
         );
         let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
@@ -36059,10 +37916,12 @@ mod tests {
             fixture.expected_graph_timestamps
         );
         let graph = state.graph_paths_for_selection_at(observed_at, true, true, true, false);
-        // The v1 fallback has an incomplete model set, but every legacy row
-        // that is present remains an exact model observation. Keep its SOL
-        // increase solid and leave only omitted models unknown.
-        assert!(!graph.sol_rising.is_empty());
+        // v1 cannot carry source completeness. Its saved values remain
+        // displayable, but every segment is inferred and may not become an
+        // arithmetic or idle authority.
+        assert!(graph.sol_flat.is_empty());
+        assert!(graph.sol_rising.is_empty());
+        assert!(!graph.sol_inferred.is_empty());
         assert_eq!(graph.current_sol_label, "$420.40");
         // The model universe is exactly the three names published by v1.
         // One final flat recorder interval is rendered as a thin measured
@@ -36681,18 +38540,31 @@ mod tests {
         let threads_body = split_threads_body(&threads);
         let now = Instant::now();
         let mut state = CodexInfoState::service_client();
+        let accounts_body = br#"{
+            "api_version":"v3",
+            "default_account_id":"account-7",
+            "accounts":[
+                {"id":"account-7","is_current":true,"activation_at":null,"deactivation_at":null}
+            ]
+        }"#
+        .to_vec();
         state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
         let mut requests = Vec::new();
 
         let outcome = super::poll_service_current_resources_with(&mut state, now, |route, etag| {
             requests.push((route.to_owned(), etag.map(str::to_owned)));
             Ok(match route {
-                "/v3/current" => super::ServiceDetailsHttpResponse {
+                "/v3/accounts" => super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: None,
+                    body: accounts_body.clone(),
+                },
+                "/v3/current?account=account-7" => super::ServiceDetailsHttpResponse {
                     status: 200,
                     pair: Some(pair.clone()),
                     body: current_body.clone(),
                 },
-                "/v3/threads" => super::ServiceDetailsHttpResponse {
+                "/v3/threads?account=account-7" => super::ServiceDetailsHttpResponse {
                     status: 200,
                     pair: Some(pair.clone()),
                     body: threads_body.clone(),
@@ -36704,7 +38576,11 @@ mod tests {
         assert_eq!(outcome, super::ServiceCurrentPollOutcome::Success);
         assert_eq!(
             requests,
-            [("/v3/current".into(), None), ("/v3/threads".into(), None)]
+            [
+                ("/v3/accounts".into(), None),
+                ("/v3/current?account=account-7".into(), None),
+                ("/v3/threads?account=account-7".into(), None),
+            ]
         );
         assert_eq!(state.service_current_pair.as_deref(), Some(pair.as_str()));
         assert_eq!(state.service_threads_pair.as_deref(), Some(pair.as_str()));
@@ -37066,6 +38942,7 @@ mod tests {
         let v1_body = serde_json::to_vec(&v1_document).unwrap();
         let now = Instant::now();
         let mut legacy_state = CodexInfoState::service_client();
+        disable_account_directory_for_fixture(&mut legacy_state);
         legacy_state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
         let mut legacy_routes = Vec::new();
         let legacy_outcome =
@@ -38609,19 +40486,23 @@ mod tests {
             ),
         ];
         let references = samples.iter().collect::<Vec<_>>();
-        let graph = graph_paths_for_selection_with_confirmed_gaps(
-            &references,
-            0,
-            180,
-            false,
-            false,
-            true,
-            false,
-            &[GraphConfirmedGap {
-                start_at: 60,
-                end_at: 120,
-            }],
-        );
+        let confirmed_gaps = [GraphConfirmedGap {
+            start_at: 60,
+            end_at: 120,
+        }];
+        let graph = graph_paths_for_selection_with_confirmed_gaps(super::GraphSelectionInput {
+            samples: &references,
+            period_start: 0,
+            period_end: 180,
+            show_luna: false,
+            show_terra: false,
+            show_sol: true,
+            show_astra: false,
+            show_tokens: false,
+            untrusted_minutes: &BTreeSet::new(),
+            confirmed_gaps: &confirmed_gaps,
+            model_timelines: &BTreeMap::new(),
+        });
 
         assert!(graph.sol_rising.contains("M0.00 99.00 L33.33 66.33"));
         assert!(!graph.sol_rising.contains("M33.33 66.33 L66.67 33.67"));
@@ -39113,8 +40994,8 @@ mod tests {
                 },
             ),
             // Model usage continues while the measured quota reread is
-            // unchanged. Smooth the staircase for presentation, but keep the
-            // raw observation as measured provenance and render it solid.
+            // unchanged. Smooth the staircase for presentation, but do not
+            // present the changed display value as a measured quota point.
             UsageHistorySample::new_with_usage(
                 120,
                 1_000,
@@ -39177,31 +41058,32 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: sample.sol_dollars,
                             tokens: sample.sol_tokens as f64,
-                            reliable: true,
-                            published: true,
+                            raw_tokens: Some(sample.sol_tokens),
+                            origin: super::GraphModelOrigin::Direct,
                         },
                     )
                 })
                 .collect::<BTreeMap<_, _>>(),
         )]);
-        let paths = super::graph_paths_for_selection_with_sources_and_astra(
-            &references,
-            0,
-            240,
-            false,
-            false,
-            true,
-            false,
-            false,
-            &BTreeSet::new(),
-            &[],
-            &raw_timelines,
-        );
+        let paths =
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end: 240,
+                show_luna: false,
+                show_terra: false,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: false,
+                untrusted_minutes: &BTreeSet::new(),
+                confirmed_gaps: &[],
+                model_timelines: &raw_timelines,
+            });
         assert_eq!(
             paths.remaining_solid,
-            "M0.00 1.00 L25.00 10.80 M25.00 10.80 L50.00 15.70 M50.00 15.70 L75.00 20.60 M75.00 20.60 L100.00 20.60"
+            "M0.00 1.00 L25.00 10.80 M75.00 20.60 L100.00 20.60"
         );
-        assert!(paths.remaining_inferred.is_empty());
+        assert!(!paths.remaining_inferred.is_empty());
         assert!(!paths.remaining.contains("L50.00 10.80 L50.00 15.70"));
         assert_eq!(paths.current_remaining_label, "80%");
     }
@@ -39752,8 +41634,8 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: 0.0,
                             tokens: 0.0,
-                            reliable: true,
-                            published: true,
+                            raw_tokens: Some(0),
+                            origin: super::GraphModelOrigin::Direct,
                         },
                     ),
                     (
@@ -39761,8 +41643,8 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: 0.0,
                             tokens: 100.0,
-                            reliable: true,
-                            published: true,
+                            raw_tokens: Some(100),
+                            origin: super::GraphModelOrigin::Direct,
                         },
                     ),
                     (
@@ -39770,8 +41652,8 @@ mod tests {
                         super::GraphModelPoint {
                             dollar: 0.0,
                             tokens: 200.0,
-                            reliable: true,
-                            published: true,
+                            raw_tokens: Some(200),
+                            origin: super::GraphModelOrigin::Direct,
                         },
                     ),
                 ]),
@@ -39782,24 +41664,21 @@ mod tests {
                     (
                         0,
                         super::GraphModelPoint {
-                            reliable: true,
-                            published: true,
+                            origin: super::GraphModelOrigin::Direct,
                             ..super::GraphModelPoint::default()
                         },
                     ),
                     (
                         120,
                         super::GraphModelPoint {
-                            reliable: true,
-                            published: true,
+                            origin: super::GraphModelOrigin::Direct,
                             ..super::GraphModelPoint::default()
                         },
                     ),
                     (
                         180,
                         super::GraphModelPoint {
-                            reliable: true,
-                            published: true,
+                            origin: super::GraphModelOrigin::Direct,
                             ..super::GraphModelPoint::default()
                         },
                     ),
@@ -39811,43 +41690,41 @@ mod tests {
                     (
                         0,
                         super::GraphModelPoint {
-                            reliable: true,
-                            published: true,
+                            origin: super::GraphModelOrigin::Direct,
                             ..super::GraphModelPoint::default()
                         },
                     ),
                     (
                         120,
                         super::GraphModelPoint {
-                            reliable: true,
-                            published: true,
+                            origin: super::GraphModelOrigin::Direct,
                             ..super::GraphModelPoint::default()
                         },
                     ),
                     (
                         180,
                         super::GraphModelPoint {
-                            reliable: true,
-                            published: true,
+                            origin: super::GraphModelOrigin::Direct,
                             ..super::GraphModelPoint::default()
                         },
                     ),
                 ]),
             ),
         ]);
-        let tokens = super::graph_paths_for_selection_with_sources_and_astra(
-            &references,
-            0,
-            240,
-            true,
-            true,
-            true,
-            false,
-            true,
-            &BTreeSet::new(),
-            &[],
-            &model_timelines,
-        );
+        let tokens =
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end: 240,
+                show_luna: true,
+                show_terra: true,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: true,
+                untrusted_minutes: &BTreeSet::new(),
+                confirmed_gaps: &[],
+                model_timelines: &model_timelines,
+            });
 
         assert_eq!(
             tokens.remaining_solid, "M50.00 10.80 L75.00 20.60",
@@ -40278,8 +42155,8 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 1.0,
                         tokens: 10.0,
-                        reliable: true,
-                        published: true,
+                        raw_tokens: Some(10),
+                        origin: super::GraphModelOrigin::Direct,
                     },
                 ),
                 (
@@ -40287,8 +42164,8 @@ mod tests {
                     super::GraphModelPoint {
                         dollar: 2.0,
                         tokens: 20.0,
-                        reliable: true,
-                        published: true,
+                        raw_tokens: Some(20),
+                        origin: super::GraphModelOrigin::Direct,
                     },
                 ),
             ]),
@@ -40363,7 +42240,7 @@ mod tests {
     }
 
     #[test]
-    fn unused_intervals_use_tokens_in_both_display_metrics() {
+    fn idle_requires_lifecycle_in_both_display_metrics() {
         let samples = [
             UsageHistorySample::new_with_usage(
                 0,
@@ -40440,8 +42317,8 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar: sample.sol_dollars,
                                 tokens: sample.sol_tokens as f64,
-                                reliable: true,
-                                published: true,
+                                raw_tokens: Some(sample.sol_tokens),
+                                origin: super::GraphModelOrigin::Direct,
                             },
                         )
                     })
@@ -40457,8 +42334,8 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar: 0.0,
                                 tokens: 0.0,
-                                reliable: true,
-                                published: true,
+                                raw_tokens: Some(0),
+                                origin: super::GraphModelOrigin::Direct,
                             },
                         )
                     })
@@ -40474,8 +42351,8 @@ mod tests {
                             super::GraphModelPoint {
                                 dollar: 0.0,
                                 tokens: 0.0,
-                                reliable: true,
-                                published: true,
+                                raw_tokens: Some(0),
+                                origin: super::GraphModelOrigin::Direct,
                             },
                         )
                     })
@@ -40485,29 +42362,1092 @@ mod tests {
         .into_iter()
         .collect();
         let graph = |tokens| {
-            super::graph_paths_for_selection_with_sources_and_astra(
-                &references,
-                0,
-                240,
-                true,
-                true,
-                true,
-                false,
-                tokens,
-                &Default::default(),
-                &[],
-                &timelines,
-            )
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end: 240,
+                show_luna: true,
+                show_terra: true,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: tokens,
+                untrusted_minutes: &Default::default(),
+                confirmed_gaps: &[],
+                model_timelines: &timelines,
+            })
         };
         let dollars = graph(false);
         let tokens = graph(true);
 
-        assert_eq!(dollars.unused_intervals.len(), 1);
-        assert!((dollars.unused_intervals[0].start - 50.0).abs() < 0.000_001);
-        assert!((dollars.unused_intervals[0].width - 50.0).abs() < 0.000_001);
-        assert_eq!(tokens.unused_intervals.len(), 1);
-        assert!((tokens.unused_intervals[0].start - 50.0).abs() < 0.000_001);
-        assert!((tokens.unused_intervals[0].width - 50.0).abs() < 0.000_001);
+        assert!(dollars.unused_intervals.is_empty());
+        assert!(tokens.unused_intervals.is_empty());
+    }
+
+    #[test]
+    fn incomplete_model_vectors_are_neither_idle_nor_staircase_evidence() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 17.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(60, 1_000, 17.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(120, 1_000, 17.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(180, 1_000, 17.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(240, 1_000, 16.0, ModelDollarTotals::default()),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let observed = |tokens| super::GraphModelPoint {
+            dollar: 0.0,
+            tokens,
+            raw_tokens: Some(tokens as u64),
+            origin: super::GraphModelOrigin::Direct,
+        };
+        // SOL and LUNA belong to the period-wide model universe but disappear
+        // after the first row.  Equal TERRA-only subsets must not prove that
+        // every model was idle, nor concentrate a later quota drop at the
+        // first incomplete interval.
+        let timelines = BTreeMap::from([
+            ("SOL".to_owned(), BTreeMap::from([(0, observed(100.0))])),
+            ("LUNA".to_owned(), BTreeMap::from([(0, observed(10.0))])),
+            (
+                "TERRA".to_owned(),
+                [0, 60, 120, 180, 240]
+                    .into_iter()
+                    .map(|timestamp| (timestamp, observed(0.0)))
+                    .collect(),
+            ),
+        ]);
+        let graph =
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end: 240,
+                show_luna: true,
+                show_terra: true,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: false,
+                untrusted_minutes: &BTreeSet::new(),
+                confirmed_gaps: &[],
+                model_timelines: &timelines,
+            });
+        assert!(
+            graph.unused_intervals.is_empty(),
+            "a repeated incomplete subset is not evidence that every period model was idle"
+        );
+
+        let (accepted, corrections) =
+            super::accepted_graph_model_timelines(&timelines, &BTreeSet::new(), true, &[]);
+        let remaining = super::remaining_evidence_from_model_timelines(
+            &references,
+            0,
+            240,
+            &accepted,
+            true,
+            &[],
+            &corrections,
+        );
+        assert_eq!(remaining.len(), 5);
+        assert!((remaining[1].effective - 16.75).abs() < 0.000_001);
+        assert!((remaining[2].effective - 16.50).abs() < 0.000_001);
+        assert!((remaining[3].effective - 16.25).abs() < 0.000_001);
+        assert!(remaining[1..4]
+            .iter()
+            .all(|point| point.origin == super::GraphRemainingOrigin::Interpolated));
+        assert!(!graph.remaining_inferred.is_empty());
+    }
+
+    #[test]
+    fn complete_lifecycle_keeps_later_token_burst_out_of_prior_idle_minutes() {
+        let point = |tokens, origin| super::GraphModelPoint {
+            dollar: tokens / 1_000_000.0,
+            tokens,
+            raw_tokens: Some(tokens as u64),
+            origin,
+        };
+        let mut timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([
+                (0, point(100.0, super::GraphModelOrigin::Direct)),
+                (60, point(125.0, super::GraphModelOrigin::Interpolated)),
+                (120, point(150.0, super::GraphModelOrigin::Interpolated)),
+                (180, point(175.0, super::GraphModelOrigin::Interpolated)),
+                (240, point(200.0, super::GraphModelOrigin::Direct)),
+            ]),
+        )]);
+        let activity = BTreeMap::from([
+            (60, Some(false)),
+            (120, Some(false)),
+            (180, Some(false)),
+            (240, Some(true)),
+        ]);
+
+        super::shape_inferred_model_timelines_by_task_activity(
+            &mut timelines,
+            true,
+            Some(&activity),
+        );
+
+        let sol = &timelines["SOL"];
+        for timestamp in [60, 120, 180] {
+            assert_eq!(sol[&timestamp].tokens, 100.0);
+            assert_eq!(sol[&timestamp].origin, super::GraphModelOrigin::BoundedFlat);
+        }
+        assert_eq!(sol[&240].tokens, 200.0);
+        assert_eq!(sol[&240].origin, super::GraphModelOrigin::Direct);
+    }
+
+    #[test]
+    fn final_render_evidence_is_the_single_idle_authority() {
+        let sample = |timestamp, remaining| {
+            UsageHistorySample::new(timestamp, 1_000, remaining, ModelDollarTotals::default())
+        };
+        let samples = [
+            sample(0, 17.0),
+            sample(60, 17.0),
+            sample(120, 17.0),
+            sample(180, 17.0),
+            sample(240, 17.0),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let observed = |tokens| super::GraphModelPoint {
+            dollar: 0.0,
+            tokens,
+            raw_tokens: Some(tokens as u64),
+            origin: super::GraphModelOrigin::Direct,
+        };
+        let complete_flat = BTreeMap::from([
+            (
+                "SOL".to_owned(),
+                [0, 60, 120, 180, 240]
+                    .into_iter()
+                    .map(|timestamp| (timestamp, observed(100.0)))
+                    .collect(),
+            ),
+            (
+                "LUNA".to_owned(),
+                [0, 60, 120, 180, 240]
+                    .into_iter()
+                    .map(|timestamp| (timestamp, observed(10.0)))
+                    .collect(),
+            ),
+            (
+                "TERRA".to_owned(),
+                [0, 60, 120, 180, 240]
+                    .into_iter()
+                    .map(|timestamp| (timestamp, observed(0.0)))
+                    .collect(),
+            ),
+        ]);
+        let graph = |samples: &[&UsageHistorySample], timelines| {
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples,
+                period_start: 0,
+                period_end: 240,
+                show_luna: true,
+                show_terra: true,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: false,
+                untrusted_minutes: &BTreeSet::new(),
+                confirmed_gaps: &[],
+                model_timelines: timelines,
+            })
+        };
+        assert!(graph(&references, &complete_flat)
+            .unused_intervals
+            .is_empty());
+
+        let graph_with_activity = |activity: &BTreeMap<i64, Option<bool>>| {
+            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: 0,
+                    period_end: 240,
+                    show_luna: true,
+                    show_terra: true,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: false,
+                    untrusted_minutes: &BTreeSet::new(),
+                    confirmed_gaps: &[],
+                    model_timelines: &complete_flat,
+                },
+                Some(activity),
+            )
+        };
+        let unknown_activity = [60, 120, 180, 240]
+            .into_iter()
+            .map(|timestamp| (timestamp, None))
+            .collect();
+        assert!(graph_with_activity(&unknown_activity)
+            .unused_intervals
+            .is_empty());
+        let observed_activity = BTreeMap::from([
+            (60, Some(true)),
+            (120, Some(false)),
+            (180, Some(false)),
+            (240, Some(true)),
+        ]);
+        assert!(graph_with_activity(&observed_activity)
+            .unused_intervals
+            .is_empty());
+
+        // A missing quota observation makes the rendered Remaining segments
+        // inferred. The same time must therefore never be painted idle.
+        let missing_remaining = [
+            sample(0, 17.0),
+            sample(60, 17.0),
+            sample(120, -1.0),
+            sample(180, 17.0),
+            sample(240, 17.0),
+        ];
+        let missing_references = missing_remaining.iter().collect::<Vec<_>>();
+        let missing_graph = graph(&missing_references, &complete_flat);
+        assert!(!missing_graph.remaining_inferred.is_empty());
+        assert!(missing_graph.unused_intervals.is_empty());
+
+        // Token equality is the activity rule. Dollar changes are not an
+        // idle input: price projection can move independently, and cheap
+        // models can round to an unchanged displayed dollar value.
+        let mut dollar_change = complete_flat.clone();
+        dollar_change
+            .get_mut("SOL")
+            .unwrap()
+            .get_mut(&120)
+            .unwrap()
+            .dollar = 1.0;
+        dollar_change
+            .get_mut("SOL")
+            .unwrap()
+            .get_mut(&180)
+            .unwrap()
+            .dollar = 1.0;
+        dollar_change
+            .get_mut("SOL")
+            .unwrap()
+            .get_mut(&240)
+            .unwrap()
+            .dollar = 1.0;
+        let inactive_activity = [60, 120, 180, 240]
+            .into_iter()
+            .map(|timestamp| (timestamp, Some(false)))
+            .collect::<BTreeMap<_, _>>();
+        let changing_graph =
+            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: 0,
+                    period_end: 240,
+                    show_luna: true,
+                    show_terra: true,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: false,
+                    untrusted_minutes: &BTreeSet::new(),
+                    confirmed_gaps: &[],
+                    model_timelines: &dollar_change,
+                },
+                Some(&inactive_activity),
+            );
+        assert!(!changing_graph.sol_rising.is_empty());
+        assert!(changing_graph.unused_intervals.is_empty());
+
+        let mut legacy = complete_flat.clone();
+        legacy.values_mut().for_each(|timeline| {
+            timeline.get_mut(&120).unwrap().origin = super::GraphModelOrigin::LegacyObserved;
+        });
+        let legacy_graph = graph(&references, &legacy);
+        assert!(!legacy_graph.sol_inferred.is_empty());
+        assert!(!legacy_graph.sol_flat.is_empty());
+        assert!(legacy_graph.unused_intervals.is_empty());
+    }
+
+    #[test]
+    fn idle_bridges_missing_cadence_only_between_two_proven_flat_runs() {
+        let sample = |timestamp| {
+            UsageHistorySample::new(timestamp, 1_000, 90.0, ModelDollarTotals::default())
+        };
+        let samples = [
+            sample(0),
+            sample(60),
+            sample(120),
+            sample(240),
+            sample(300),
+            sample(360),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let activity = [60, 120, 240, 300, 360]
+            .into_iter()
+            .map(|timestamp| (timestamp, Some(false)))
+            .collect::<BTreeMap<_, _>>();
+        let graph = |right_tokens| {
+            let timeline = [
+                (0, 100.0),
+                (60, 100.0),
+                (120, 100.0),
+                (240, right_tokens),
+                (300, right_tokens),
+                (360, right_tokens),
+            ]
+            .into_iter()
+            .map(|(timestamp, tokens)| {
+                (
+                    timestamp,
+                    super::GraphModelPoint {
+                        dollar: 0.0,
+                        tokens,
+                        raw_tokens: Some(tokens as u64),
+                        origin: super::GraphModelOrigin::Direct,
+                    },
+                )
+            })
+            .collect();
+            let timelines = BTreeMap::from([("SOL".to_owned(), timeline)]);
+            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: 0,
+                    period_end: 360,
+                    show_luna: false,
+                    show_terra: false,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: false,
+                    untrusted_minutes: &BTreeSet::new(),
+                    confirmed_gaps: &[],
+                    model_timelines: &timelines,
+                },
+                Some(&activity),
+            )
+            .unused_intervals
+        };
+
+        assert!(graph(100.0).is_empty());
+        let separated = graph(200.0);
+        assert!(separated.is_empty());
+    }
+
+    #[test]
+    fn only_sustained_flat_runs_render_as_unused_time() {
+        let samples = (0..=30)
+            .map(|minute| {
+                UsageHistorySample::new(minute * 60, 10_000, 90.0, ModelDollarTotals::default())
+            })
+            .collect::<Vec<_>>();
+        let references = samples.iter().collect::<Vec<_>>();
+        let timeline = samples
+            .iter()
+            .map(|sample| {
+                (
+                    sample.timestamp,
+                    super::GraphModelPoint {
+                        dollar: 1.0,
+                        tokens: 100.0,
+                        raw_tokens: Some(100),
+                        origin: super::GraphModelOrigin::Direct,
+                    },
+                )
+            })
+            .collect();
+        let timelines = BTreeMap::from([("SOL".to_owned(), timeline)]);
+        let activity = (1..=30)
+            .map(|minute| (minute * 60, Some(false)))
+            .collect::<BTreeMap<_, _>>();
+        let graph = |period_end| {
+            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: 0,
+                    period_end,
+                    show_luna: false,
+                    show_terra: false,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: false,
+                    untrusted_minutes: &BTreeSet::new(),
+                    confirmed_gaps: &[],
+                    model_timelines: &timelines,
+                },
+                Some(&activity),
+            )
+            .unused_intervals
+        };
+
+        assert!(graph(29 * 60).is_empty());
+        assert_eq!(
+            graph(30 * 60),
+            [super::UnusedIntervalPosition {
+                start: 0.0,
+                width: 100.0,
+                preserve_boundary: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn display_interpolation_cannot_change_confirmed_idle() {
+        let samples = [
+            UsageHistorySample::new(0, 10_000, 90.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(1_800, 10_000, 90.0, ModelDollarTotals::default()),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let direct = super::GraphModelPoint {
+            dollar: 1.0,
+            tokens: 100.0,
+            raw_tokens: Some(100),
+            origin: super::GraphModelOrigin::Direct,
+        };
+        let raw = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([(0, direct), (1_800, direct)]),
+        )]);
+        let mut display_enriched = raw.clone();
+        for timestamp in (60..1_800).step_by(60) {
+            display_enriched.get_mut("SOL").unwrap().insert(
+                timestamp,
+                super::GraphModelPoint {
+                    origin: super::GraphModelOrigin::Interpolated,
+                    ..direct
+                },
+            );
+        }
+        let render = |timelines: &super::GraphModelTimelines| {
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end: 1_800,
+                show_luna: false,
+                show_terra: false,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: true,
+                untrusted_minutes: &BTreeSet::new(),
+                confirmed_gaps: &[],
+                model_timelines: timelines,
+            })
+            .unused_intervals
+        };
+        let expected = [super::UnusedIntervalPosition {
+            start: 0.0,
+            width: 100.0,
+            preserve_boundary: false,
+        }];
+        assert_eq!(render(&raw), expected);
+        assert_eq!(render(&display_enriched), expected);
+    }
+
+    #[test]
+    fn equal_exact_token_anchors_bound_long_idle_after_task_stop() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 90.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(300, 1_000, 90.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(3_600, 1_000, 90.0, ModelDollarTotals::default()),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([
+                (
+                    0,
+                    super::GraphModelPoint {
+                        dollar: 1.0,
+                        tokens: 100.0,
+                        raw_tokens: Some(100),
+                        origin: super::GraphModelOrigin::Direct,
+                    },
+                ),
+                (
+                    300,
+                    super::GraphModelPoint {
+                        dollar: 1.0,
+                        tokens: 100.0,
+                        raw_tokens: Some(100),
+                        origin: super::GraphModelOrigin::Direct,
+                    },
+                ),
+                (
+                    3_600,
+                    super::GraphModelPoint {
+                        dollar: 1.0,
+                        tokens: 100.0,
+                        raw_tokens: Some(100),
+                        origin: super::GraphModelOrigin::Direct,
+                    },
+                ),
+            ]),
+        )]);
+        let activity = BTreeMap::from([(300, Some(true)), (3_600, None)]);
+
+        let graph =
+            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: 0,
+                    period_end: 3_600,
+                    show_luna: false,
+                    show_terra: false,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: true,
+                    untrusted_minutes: &BTreeSet::new(),
+                    confirmed_gaps: &[],
+                    model_timelines: &timelines,
+                },
+                Some(&activity),
+            );
+
+        assert_eq!(graph.unused_intervals.len(), 1);
+        assert!((graph.unused_intervals[0].start - 100.0 / 12.0).abs() < 0.000_001);
+        assert!((graph.unused_intervals[0].width - 1100.0 / 12.0).abs() < 0.000_001);
+        assert!(
+            !graph.sol_inferred.is_empty(),
+            "missing interior samples remain visibly dashed"
+        );
+    }
+
+    #[test]
+    fn legacy_observed_timeline_never_becomes_arithmetic_authority() {
+        let point = |value, reliable: bool| super::GraphModelPoint {
+            dollar: value,
+            tokens: value * 1_000.0,
+            raw_tokens: reliable.then_some((value * 1_000.0) as u64),
+            origin: if reliable {
+                super::GraphModelOrigin::Direct
+            } else {
+                super::GraphModelOrigin::LegacyObserved
+            },
+        };
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([
+                (0, point(0.0, true)),
+                (60, point(1.0, false)),
+                (120, point(2.0, false)),
+            ]),
+        )]);
+
+        for show_tokens in [false, true] {
+            let (accepted, _) = super::accepted_graph_model_timelines(
+                &timelines,
+                &BTreeSet::new(),
+                show_tokens,
+                &[],
+            );
+            assert_eq!(accepted["SOL"][&0].origin, super::GraphModelOrigin::Direct);
+            assert_eq!(
+                accepted["SOL"][&60].origin,
+                super::GraphModelOrigin::LegacyObserved
+            );
+            assert_eq!(
+                accepted["SOL"][&120].origin,
+                super::GraphModelOrigin::LegacyObserved
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_outlier_cannot_reject_or_move_later_direct_observation() {
+        let point = |value, origin| super::GraphModelPoint {
+            dollar: value,
+            tokens: value,
+            raw_tokens: matches!(origin, super::GraphModelOrigin::Direct).then_some(value as u64),
+            origin,
+        };
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([
+                (0, point(100.0, super::GraphModelOrigin::Direct)),
+                (60, point(1_000.0, super::GraphModelOrigin::LegacyObserved)),
+                (120, point(110.0, super::GraphModelOrigin::Direct)),
+            ]),
+        )]);
+
+        for show_tokens in [false, true] {
+            let (accepted, correction_starts) = super::accepted_graph_model_timelines(
+                &timelines,
+                &BTreeSet::from([0, 60, 120]),
+                show_tokens,
+                &[],
+            );
+            let timeline = &accepted["SOL"];
+            assert_eq!(timeline[&120].origin, super::GraphModelOrigin::Direct);
+            assert_eq!(
+                super::graph_model_value(&timeline[&120], show_tokens),
+                110.0
+            );
+            assert_eq!(
+                timeline[&60].origin,
+                super::GraphModelOrigin::Interpolated,
+                "the UI replaces an out-of-bounds display-only legacy point using direct anchors"
+            );
+            assert_eq!(super::graph_model_value(&timeline[&60], show_tokens), 105.0);
+            assert!(correction_starts.is_empty());
+        }
+    }
+
+    #[test]
+    fn quota_staircase_follows_non_uniform_token_deltas() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(60, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(120, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(180, 1_000, 70.0, ModelDollarTotals::default()),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let point = |tokens| super::GraphModelPoint {
+            dollar: 0.0,
+            tokens,
+            raw_tokens: Some(tokens as u64),
+            origin: super::GraphModelOrigin::Direct,
+        };
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([
+                (0, point(0.0)),
+                (60, point(10.0)),
+                (120, point(20.0)),
+                (180, point(100.0)),
+            ]),
+        )]);
+
+        let remaining = super::remaining_evidence_from_model_timelines(
+            &references,
+            0,
+            180,
+            &timelines,
+            true,
+            &[],
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|point| point.effective)
+                .collect::<Vec<_>>(),
+            vec![100.0, 97.0, 94.0, 70.0]
+        );
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|point| point.origin)
+                .collect::<Vec<_>>(),
+            vec![
+                super::GraphRemainingOrigin::Raw,
+                super::GraphRemainingOrigin::ActivitySmoothed,
+                super::GraphRemainingOrigin::ActivitySmoothed,
+                super::GraphRemainingOrigin::Raw,
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_leading_quota_is_reconstructed_from_the_reset_boundary() {
+        let period_start = 0;
+        let reset_at = period_start + super::WEEK_SECONDS;
+        let sample = |timestamp, remaining_percent| UsageHistorySample {
+            timestamp,
+            reset_at,
+            remaining_percent,
+            sol_dollars: -1.0,
+            terra_dollars: -1.0,
+            luna_dollars: -1.0,
+            sol_tokens: 0,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        let samples = [
+            sample(0, -1.0),
+            sample(60, -1.0),
+            sample(120, -1.0),
+            sample(180, 98.0),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let point = |tokens| super::GraphModelPoint {
+            dollar: tokens / 1_000_000.0,
+            tokens,
+            raw_tokens: Some(tokens as u64),
+            // Reset-boundary quota projection is allowed only when the model
+            // timeline is backed by direct, complete observations. Legacy
+            // values may be displayed but cannot drive this arithmetic.
+            origin: super::GraphModelOrigin::Direct,
+        };
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([
+                (0, point(10.0)),
+                (60, point(20.0)),
+                (120, point(60.0)),
+                (180, point(100.0)),
+            ]),
+        )]);
+
+        let remaining = super::remaining_evidence_from_model_timelines(
+            &references,
+            period_start,
+            180,
+            &timelines,
+            true,
+            &[],
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(remaining.first().map(|point| point.timestamp), Some(0));
+        assert_eq!(remaining.first().map(|point| point.effective), Some(100.0));
+        assert_eq!(
+            remaining.first().map(|point| point.origin),
+            Some(super::GraphRemainingOrigin::ResetBoundary)
+        );
+        assert!(remaining[1..3].iter().all(|point| {
+            point.effective < 100.0
+                && point.effective > 98.0
+                && point.origin == super::GraphRemainingOrigin::Interpolated
+        }));
+        assert_eq!(remaining.last().map(|point| point.effective), Some(98.0));
+    }
+
+    #[test]
+    fn legacy_model_values_do_not_reconstruct_missing_leading_quota() {
+        let period_start = 0;
+        let reset_at = period_start + super::WEEK_SECONDS;
+        let samples = [
+            UsageHistorySample {
+                timestamp: 0,
+                reset_at,
+                remaining_percent: -1.0,
+                sol_dollars: -1.0,
+                terra_dollars: -1.0,
+                luna_dollars: -1.0,
+                sol_tokens: 0,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            },
+            UsageHistorySample {
+                timestamp: 180,
+                reset_at,
+                remaining_percent: 98.0,
+                sol_dollars: -1.0,
+                terra_dollars: -1.0,
+                luna_dollars: -1.0,
+                sol_tokens: 0,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            },
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([
+                (
+                    0,
+                    super::GraphModelPoint {
+                        dollar: 0.0,
+                        tokens: 10.0,
+                        raw_tokens: None,
+                        origin: super::GraphModelOrigin::LegacyObserved,
+                    },
+                ),
+                (
+                    180,
+                    super::GraphModelPoint {
+                        dollar: 0.0,
+                        tokens: 100.0,
+                        raw_tokens: None,
+                        origin: super::GraphModelOrigin::LegacyObserved,
+                    },
+                ),
+            ]),
+        )]);
+
+        let remaining = super::remaining_evidence_from_model_timelines(
+            &references,
+            period_start,
+            180,
+            &timelines,
+            true,
+            &[],
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].timestamp, 180);
+        assert_eq!(remaining[0].effective, 98.0);
+        assert_eq!(remaining[0].origin, super::GraphRemainingOrigin::Raw);
+    }
+
+    #[test]
+    fn zero_token_interval_keeps_smoothed_remaining_horizontal() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(60, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(120, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(180, 1_000, 70.0, ModelDollarTotals::default()),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let point = |tokens| super::GraphModelPoint {
+            dollar: 0.0,
+            tokens,
+            raw_tokens: Some(tokens as u64),
+            origin: super::GraphModelOrigin::Direct,
+        };
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([
+                (0, point(0.0)),
+                (60, point(0.0)),
+                (120, point(50.0)),
+                (180, point(100.0)),
+            ]),
+        )]);
+
+        let remaining = super::remaining_evidence_from_model_timelines(
+            &references,
+            0,
+            180,
+            &timelines,
+            true,
+            &[],
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|point| point.effective)
+                .collect::<Vec<_>>(),
+            vec![100.0, 100.0, 85.0, 70.0]
+        );
+    }
+
+    #[test]
+    fn token_weighted_null_quota_rows_remain_inferred() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::from_model_history(60, 1_000, ModelDollarTotals::default()),
+            UsageHistorySample::from_model_history(120, 1_000, ModelDollarTotals::default()),
+            UsageHistorySample::new(180, 1_000, 70.0, ModelDollarTotals::default()),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let point = |tokens| super::GraphModelPoint {
+            dollar: 0.0,
+            tokens,
+            raw_tokens: Some(tokens as u64),
+            origin: super::GraphModelOrigin::Direct,
+        };
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([
+                (0, point(0.0)),
+                (60, point(10.0)),
+                (120, point(20.0)),
+                (180, point(100.0)),
+            ]),
+        )]);
+
+        let remaining = super::remaining_evidence_from_model_timelines(
+            &references,
+            0,
+            180,
+            &timelines,
+            true,
+            &[],
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|point| point.effective)
+                .collect::<Vec<_>>(),
+            vec![100.0, 97.0, 94.0, 70.0]
+        );
+        assert!(remaining[1..3]
+            .iter()
+            .all(|point| point.origin == super::GraphRemainingOrigin::Interpolated));
+    }
+
+    #[test]
+    fn missing_graph_model_never_falls_back_to_fixed_zero_columns() {
+        let samples = [
+            UsageHistorySample::new_with_usage(
+                0,
+                1_000,
+                100.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 4,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                60,
+                1_000,
+                100.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 4,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([
+                (
+                    0,
+                    super::GraphModelPoint {
+                        dollar: 1.0,
+                        tokens: 4.0,
+                        raw_tokens: Some(4),
+                        origin: super::GraphModelOrigin::Direct,
+                    },
+                ),
+                (
+                    60,
+                    super::GraphModelPoint {
+                        dollar: 1.0,
+                        tokens: 4.0,
+                        raw_tokens: Some(4),
+                        origin: super::GraphModelOrigin::Direct,
+                    },
+                ),
+            ]),
+        )]);
+
+        let minute = super::graph_minute_points_with_model_timelines(
+            &references,
+            0,
+            60,
+            false,
+            &BTreeSet::new(),
+            &timelines,
+        );
+        assert_eq!(minute.len(), 2);
+        assert!(minute
+            .iter()
+            .all(|point| point.terra.is_sign_negative() && point.luna.is_sign_negative()));
+
+        let missing_dollars = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([(
+                0,
+                super::GraphModelPoint {
+                    dollar: -1.0,
+                    tokens: 4.0,
+                    raw_tokens: Some(4),
+                    origin: super::GraphModelOrigin::Direct,
+                },
+            )]),
+        )]);
+        let (accepted, _) = super::accepted_graph_model_timelines(
+            &missing_dollars,
+            &BTreeSet::from([0]),
+            false,
+            &[],
+        );
+        assert!(accepted["SOL"][&0].dollar.is_nan());
+    }
+
+    #[test]
+    fn idle_uses_raw_u64_tokens_when_display_f64s_collide() {
+        let first = 9_007_199_254_740_992_u64;
+        let second = first + 1;
+        assert_eq!(first as f64, second as f64);
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 90.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(1_800, 1_000, 90.0, ModelDollarTotals::default()),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let point = |tokens, raw_tokens| super::GraphModelPoint {
+            dollar: 1.0,
+            tokens,
+            raw_tokens: Some(raw_tokens),
+            origin: super::GraphModelOrigin::Direct,
+        };
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([
+                (0, point(first as f64, first)),
+                (1_800, point(second as f64, second)),
+            ]),
+        )]);
+
+        assert!(
+            super::token_idle_interval_positions(&references, 0, 1_800, &timelines, &[],)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn falling_quota_does_not_fabricate_missing_model_usage() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(60, 1_000, 75.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(120, 1_000, 50.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(180, 1_000, 25.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(240, 1_000, 0.0, ModelDollarTotals::default()),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let point = |dollar| super::GraphModelPoint {
+            dollar,
+            tokens: dollar * 1_000.0,
+            raw_tokens: Some((dollar * 1_000.0) as u64),
+            origin: super::GraphModelOrigin::Direct,
+        };
+        let timelines = BTreeMap::from([
+            (
+                "SOL".to_owned(),
+                BTreeMap::from([(0, point(0.0)), (60, point(50.0)), (120, point(100.0))]),
+            ),
+            (
+                "TERRA".to_owned(),
+                [0, 60, 120, 180, 240]
+                    .into_iter()
+                    .map(|timestamp| (timestamp, point(0.0)))
+                    .collect(),
+            ),
+        ]);
+        let sol = &timelines["SOL"];
+        assert!(!sol.contains_key(&180));
+        assert!(!sol.contains_key(&240));
+
+        let graph =
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end: 240,
+                show_luna: false,
+                show_terra: true,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: false,
+                untrusted_minutes: &BTreeSet::new(),
+                confirmed_gaps: &[],
+                model_timelines: &BTreeMap::from([
+                    (
+                        "SOL".to_owned(),
+                        BTreeMap::from([(0, point(0.0)), (60, point(50.0)), (120, point(100.0))]),
+                    ),
+                    (
+                        "TERRA".to_owned(),
+                        [0, 60, 120, 180, 240]
+                            .into_iter()
+                            .map(|timestamp| (timestamp, point(0.0)))
+                            .collect(),
+                    ),
+                ]),
+            });
+        assert_eq!(graph.current_sol_label, "$100.00");
+        assert!(
+            !graph.sol_inferred.is_empty(),
+            "the missing SOL tail must hold its last observation as dashed"
+        );
+        assert!(graph.unused_intervals.is_empty());
     }
 
     #[test]
@@ -40577,6 +43517,279 @@ mod tests {
     fn remaining_graph_stays_empty_without_observations() {
         let paths = graph_paths(&[], 100, 300);
         assert!(paths.remaining.is_empty());
+    }
+
+    #[test]
+    fn legacy_observed_dollars_remain_sparse_and_never_repriced() {
+        let reset_at = 10_000;
+        let mut client = CodexInfoState::service_client();
+        client.service_history_samples = [
+            (0, 1_000_000_000_u64, Some(1.0)),
+            (60, 2_000_000_000, None),
+            (120, 3_000_000_000, Some(3.0)),
+            (180, 4_000_000_000, None),
+        ]
+        .into_iter()
+        .map(
+            |(timestamp, total_tokens, total_dollars)| super::PublicHistoryObservationV3 {
+                timestamp,
+                reset_at,
+                remaining_percent: Some(90.0),
+                task_active_since_previous: None,
+                models: Some(vec![super::PublicHistoryModelUsageV3 {
+                    model: "SOL".into(),
+                    total_tokens,
+                    input_tokens: Some(total_tokens),
+                    cached_input_tokens: Some(0),
+                    cache_write_input_tokens: None,
+                    output_tokens: Some(0),
+                    total_dollars,
+                }]),
+                models_complete: false,
+                model_source: "legacy-unknown".into(),
+            },
+        )
+        .collect();
+
+        let raw = client.graph_model_points_for_selection(reset_at, 0, 180, "SOL");
+        assert_eq!(raw[&60].dollar, -1.0);
+        assert_eq!(raw[&180].dollar, -1.0);
+        assert_eq!(raw[&180].tokens, 4_000_000_000.0);
+
+        let timelines = BTreeMap::from([("SOL".to_owned(), raw)]);
+        let minutes = BTreeSet::from([0, 60, 120, 180]);
+        let (dollars, _) = super::accepted_graph_model_timelines(&timelines, &minutes, false, &[]);
+        assert_eq!(dollars["SOL"][&0].dollar, 1.0);
+        assert!(dollars["SOL"][&60].dollar.is_nan());
+        assert_eq!(dollars["SOL"][&60].origin, super::GraphModelOrigin::Unknown);
+        assert_eq!(dollars["SOL"][&120].dollar, 3.0);
+        assert_eq!(dollars["SOL"][&180].dollar, 3.0);
+        assert_eq!(dollars["SOL"][&180].origin, super::GraphModelOrigin::Held);
+
+        let (tokens, _) = super::accepted_graph_model_timelines(&timelines, &minutes, true, &[]);
+        assert_eq!(tokens["SOL"][&60].tokens, 2_000_000_000.0);
+        assert_eq!(tokens["SOL"][&180].tokens, 4_000_000_000.0);
+
+        let carriers = [0, 60, 120, 180]
+            .into_iter()
+            .map(|timestamp| UsageHistorySample {
+                timestamp,
+                reset_at,
+                remaining_percent: -1.0,
+                sol_dollars: -1.0,
+                terra_dollars: -1.0,
+                luna_dollars: -1.0,
+                sol_tokens: 0,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            })
+            .collect::<Vec<_>>();
+        let carrier_refs = carriers.iter().collect::<Vec<_>>();
+        let paths =
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &carrier_refs,
+                period_start: 0,
+                period_end: 180,
+                show_luna: false,
+                show_terra: false,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: false,
+                untrusted_minutes: &minutes,
+                confirmed_gaps: &[],
+                model_timelines: &timelines,
+            });
+        assert!(
+            paths.has_data,
+            "display-only legacy model evidence must prevent a false no-records overlay"
+        );
+    }
+
+    #[test]
+    fn reconstructed_session_values_never_enter_the_graph_or_price_projection() {
+        let reset_at = 20_000;
+        let mut client = CodexInfoState::service_client();
+        client.service_history_samples = vec![super::PublicHistoryObservationV3 {
+            timestamp: 60,
+            reset_at,
+            remaining_percent: None,
+            task_active_since_previous: Some(true),
+            models: Some(vec![super::PublicHistoryModelUsageV3 {
+                model: "SOL".into(),
+                total_tokens: 17_781_344,
+                input_tokens: Some(17_714_953),
+                cached_input_tokens: Some(16_983_936),
+                cache_write_input_tokens: Some(0),
+                output_tokens: Some(66_391),
+                total_dollars: None,
+            }]),
+            models_complete: false,
+            model_source: "reconstructed-from-session".into(),
+        }];
+
+        for source in ["reconstructed-from-session", "future-source", ""] {
+            client.service_history_samples[0].model_source = source.into();
+            let points = client.graph_model_points_for_selection(reset_at, 0, 120, "SOL");
+            assert!(points.is_empty(), "source={source}");
+            assert!(super::main_sample_from_public_observation_v3(
+                &client.service_history_samples[0]
+            )
+            .is_none());
+            let stored =
+                super::store_observation_from_public_v3(&client.service_history_samples[0]);
+            assert_eq!(
+                stored.model_source,
+                super::usage_store::ModelSource::Unavailable
+            );
+            assert!(stored.model_totals.is_none());
+            assert!(!stored.model_totals_complete);
+        }
+    }
+
+    #[test]
+    fn incomplete_public_model_components_are_not_zero_filled_in_compatibility_state() {
+        let observation = super::PublicHistoryObservationV3 {
+            timestamp: 60,
+            reset_at: 20_000,
+            remaining_percent: Some(90.0),
+            task_active_since_previous: None,
+            models: Some(vec![super::PublicHistoryModelUsageV3 {
+                model: "SOL".into(),
+                total_tokens: 17,
+                input_tokens: None,
+                cached_input_tokens: Some(0),
+                cache_write_input_tokens: None,
+                output_tokens: Some(1),
+                total_dollars: Some(2.5),
+            }]),
+            models_complete: false,
+            model_source: "legacy-unknown".into(),
+        };
+
+        let stored = super::store_observation_from_public_v3(&observation);
+
+        assert_eq!(
+            stored.model_source,
+            super::usage_store::ModelSource::LegacyUnknown
+        );
+        assert_eq!(stored.sol_tokens, Some(17));
+        assert_eq!(stored.sol_dollars, Some(2.5));
+        assert!(stored.model_totals.is_none());
+        assert!(!stored.model_totals_complete);
+    }
+
+    #[test]
+    fn confirmed_complete_zero_omissions_are_exact_but_reconstructed_rows_are_missing() {
+        let reset_at = 1_000;
+        let model = |name: &str, tokens, dollars| super::PublicHistoryModelUsageV3 {
+            model: name.into(),
+            total_tokens: tokens,
+            input_tokens: Some(tokens),
+            cached_input_tokens: Some(0),
+            cache_write_input_tokens: None,
+            output_tokens: Some(0),
+            total_dollars: Some(dollars),
+        };
+        let mut client = CodexInfoState::service_client();
+        client.service_history_samples = vec![
+            super::PublicHistoryObservationV3 {
+                timestamp: 0,
+                reset_at,
+                remaining_percent: Some(100.0),
+                task_active_since_previous: None,
+                models: Some(vec![
+                    model("SOL", 0, 0.0),
+                    model("LUNA", 0, 0.0),
+                    model("TERRA", 0, 0.0),
+                ]),
+                models_complete: true,
+                model_source: "confirmed".into(),
+            },
+            super::PublicHistoryObservationV3 {
+                timestamp: 60,
+                reset_at,
+                remaining_percent: Some(99.0),
+                task_active_since_previous: None,
+                models: Some(vec![model("SOL", 100, 1.0)]),
+                models_complete: true,
+                model_source: "confirmed".into(),
+            },
+            super::PublicHistoryObservationV3 {
+                timestamp: 120,
+                reset_at,
+                remaining_percent: Some(98.0),
+                task_active_since_previous: None,
+                models: Some(vec![model("SOL", 200, 2.0)]),
+                models_complete: true,
+                model_source: "reconstructed-from-session".into(),
+            },
+            super::PublicHistoryObservationV3 {
+                timestamp: 180,
+                reset_at,
+                remaining_percent: Some(97.0),
+                task_active_since_previous: None,
+                models: Some(vec![model("SOL", 300, 3.0), model("LUNA", 10, 0.1)]),
+                models_complete: true,
+                model_source: "confirmed".into(),
+            },
+            super::PublicHistoryObservationV3 {
+                timestamp: 240,
+                reset_at,
+                remaining_percent: Some(96.0),
+                task_active_since_previous: None,
+                models: Some(vec![model("SOL", 400, 4.0)]),
+                models_complete: true,
+                model_source: "confirmed".into(),
+            },
+        ];
+
+        let luna = client.graph_model_points_for_selection(reset_at, 0, 240, "LUNA");
+        assert_eq!(luna[&0].tokens, 0.0);
+        assert!(!luna.contains_key(&60));
+        assert!(!luna.contains_key(&120));
+        assert!(!luna.contains_key(&240));
+        assert!(
+            super::main_sample_from_public_observation_v3(&client.service_history_samples[0])
+                .is_some()
+        );
+        assert!(
+            super::main_sample_from_public_observation_v3(&client.service_history_samples[1])
+                .is_none()
+        );
+
+        let samples = [
+            UsageHistorySample::new(0, reset_at, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(60, reset_at, 99.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(120, reset_at, 98.0, ModelDollarTotals::default()),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let timelines = ["SOL", "LUNA", "TERRA"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    client.graph_model_points_for_selection(reset_at, 0, 120, name),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let graph =
+            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+                samples: &references,
+                period_start: 0,
+                period_end: 120,
+                show_luna: true,
+                show_terra: true,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: false,
+                untrusted_minutes: &BTreeSet::new(),
+                confirmed_gaps: &[],
+                model_timelines: &timelines,
+            });
+        assert!(!graph.sol_inferred.is_empty());
+        assert!(!graph.sol_rising.is_empty());
+        assert!(!graph.remaining_inferred.is_empty());
+        assert!(graph.remaining_solid.is_empty());
     }
 
     #[test]
@@ -40867,7 +44080,10 @@ mod tests {
                     .is_some_and(|models| models.iter().any(|model| model.model == "ASTRA"))
             })
             .count();
-        assert_eq!(astra_observations, 4);
+        assert_eq!(
+            astra_observations, 2,
+            "legacy generic models stay on the lossless service graph path and do not enter the fixed-column compatibility store"
+        );
         let astra_points = client.graph_model_points_for_selection(
             historical.reset_at,
             historical.start_at,
@@ -40878,13 +44094,13 @@ mod tests {
         assert_eq!(
             astra_points
                 .values()
-                .map(|point| (point.dollar, point.tokens, point.reliable))
+                .map(|point| (point.dollar, point.tokens, point.origin))
                 .collect::<Vec<_>>(),
             [
-                (10.0, 1_000_000.0, true),
-                (20.0, 2_000_000.0, true),
-                (30.0, 3_000_000.0, true),
-                (40.0, 4_000_000.0, true),
+                (-1.0, 1_000_000.0, super::GraphModelOrigin::LegacyObserved),
+                (-1.0, 2_000_000.0, super::GraphModelOrigin::LegacyObserved),
+                (-1.0, 3_000_000.0, super::GraphModelOrigin::Direct),
+                (-1.0, 4_000_000.0, super::GraphModelOrigin::Direct),
             ]
         );
         let paths = client.graph_paths_for_selection_at_with_astra(
@@ -40896,8 +44112,9 @@ mod tests {
             false,
         );
         assert!(paths.astra_flat.is_empty());
-        assert!(!paths.astra_rising.is_empty());
-        assert_eq!(paths.current_astra_label, "$40.00");
+        assert!(paths.astra_rising.is_empty());
+        assert!(paths.astra_inferred.is_empty());
+        assert!(paths.current_astra_label.is_empty());
         let luna_points = client.graph_model_points_for_selection(
             historical.reset_at,
             historical.start_at,
@@ -40957,6 +44174,15 @@ mod tests {
             .expect("GraphSelect component");
         assert!(graph_select.contains("in property <int> current-index: 0;"));
         assert!(!graph_select.contains("root.current-index = index;"));
+        let row_click = graph_select
+            .split_once("item-touch := TouchArea {")
+            .map(|(_, source)| source)
+            .expect("GraphSelect row click handler");
+        assert!(
+            row_click.find("root.selected(value);").unwrap()
+                < row_click.find("popup.close();").unwrap(),
+            "the selected row must be committed before closing its popup owner"
+        );
         let graph = source
             .split("export component GraphWindow inherits Window {")
             .nth(1)
@@ -41005,16 +44231,21 @@ mod tests {
             .nth(1)
             .expect("GraphWindow");
         assert!(graph.contains("popup-above: false;"));
-        assert!(graph.contains("y: 72px;"));
+        assert!(graph.contains("y: 84px;"));
         assert!(graph.contains("history-toggle-y: 144px;"));
         assert!(!graph.contains("history-toggle-y: history-select.popup-open ?"));
         assert!(graph.contains("z: 2;"));
         assert!(graph.contains("y: root.history-toggle-y + 32px;"));
         assert!(source.contains("y: root.popup-above ? 0px : root.height;"));
         assert!(source.contains(
-            "out property <length> popup-height: min(130px, max(root.item-height + 2px, root.model.length * root.item-height + 2px));"
+            "out property <length> popup-height: min(root.max-visible-items * root.item-height + 2px, max(root.item-height + 2px, root.model.length * root.item-height + 2px));"
         ));
         assert!(source.contains("popup-list := ListView"));
+        assert!(source.contains("mouse-drag-pan-enabled: true;"));
+        assert!(source.contains("ScrollBarPolicy.always-on"));
+        assert!(graph.contains("popup-width: min(620px, parent.width);"));
+        assert!(graph.contains("max-visible-items: 10;"));
+        assert!(source.contains("close-policy: no-auto-close;"));
     }
 
     #[test]
@@ -41040,7 +44271,7 @@ mod tests {
             .nth(1)
             .expect("GraphWindow");
         assert!(source.contains(
-            "out property <length> popup-height: min(130px, max(root.item-height + 2px, root.model.length * root.item-height + 2px));"
+            "out property <length> popup-height: min(root.max-visible-items * root.item-height + 2px, max(root.item-height + 2px, root.model.length * root.item-height + 2px));"
         ));
         assert!(graph.contains("background: DesignTokens.graph-control-surface;"));
         assert!(graph.contains("opacity: 0.72;"));
@@ -41211,30 +44442,22 @@ mod tests {
         );
         // The opening observations are ten minutes apart: use dashed
         // reference paths, not solid rising paths that would imply
-        // continuous recording. The later minute-by-minute observations
-        // retain measured idle coverage across most of the same frame. The
-        // renderer may split that coverage into adjacent presentation bands,
-        // so the contract is their evidence-backed total, not one band's
-        // incidental width.
+        // continuous recording. The later contiguous rows carry explicit
+        // false lifecycle evidence and therefore form one continuous band.
         assert!(!paths.sol_flat.is_empty());
         assert!(!paths.terra_flat.is_empty());
         assert!(!paths.luna_flat.is_empty());
         assert!(paths.sol_rising.is_empty());
         assert!(paths.terra_rising.is_empty());
         assert!(paths.luna_rising.is_empty());
-        assert!(!paths.astra_flat.is_empty());
+        assert!(paths.astra_flat.is_empty());
         assert!(paths.astra_rising.is_empty());
-        assert!(!paths.astra_inferred.is_empty());
-        let measured_idle_width = paths
-            .unused_intervals
-            .iter()
-            .map(|interval| interval.width)
-            .sum::<f64>();
-        assert!(
-            measured_idle_width >= 60.0,
-            "idle width={}",
-            measured_idle_width
-        );
+        assert!(paths.astra_inferred.is_empty());
+        assert!(paths.current_astra_label.is_empty());
+        assert_eq!(paths.unused_intervals.len(), 1);
+        let idle = &paths.unused_intervals[0];
+        assert!((idle.start - 100.0 / 12.0).abs() < 0.001);
+        assert!((idle.width - 100.0 * 11.0 / 12.0).abs() < 0.001);
     }
 
     #[test]

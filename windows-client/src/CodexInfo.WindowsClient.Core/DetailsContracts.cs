@@ -33,6 +33,9 @@ public sealed record ApiDetailsSnapshot(
     /// <summary>The opaque identity of the accepted details response pair.</summary>
     public PublishedPairIdentity? PublishedPair { get; init; }
 
+    /// <summary>Explicit account used for this resource, when scoped.</summary>
+    public string? AccountId { get; init; }
+
     public IReadOnlyList<ApiHistoryPeriod> History => HistoryPeriods;
 
     /// <summary>Confirmed, redacted recorder gaps for the history periods.</summary>
@@ -166,6 +169,13 @@ public sealed record ApiHistorySample(
     public bool ModelsComplete { get; init; } = true;
 
     /// <summary>
+    /// Whether the task was active since the preceding history sample. A null
+    /// value means that the producer did not establish the activity state;
+    /// consumers must not infer an idle interval from it.
+    /// </summary>
+    public bool? TaskActiveSincePrevious { get; init; }
+
+    /// <summary>
     /// Presentation-only bounded hold added at a period edge. Wire parsers
     /// never set this flag and the value is never persisted or republished.
     /// </summary>
@@ -226,6 +236,73 @@ public sealed record ApiThreadDetails(
         : null;
 }
 
+/// <summary>
+/// An account choice exposed by the v3 account selector.  The request id is
+/// the public account-N key; the optional login id is display metadata and is
+/// never used to scope a resource request.
+/// </summary>
+public sealed record ApiAccount(
+    string Id,
+    bool IsCurrent,
+    long? ActivationAt,
+    long? DeactivationAt,
+    string? LoginId = null)
+{
+    /// <summary>Localized state marker; it never contains a lifecycle time.</summary>
+    public string? DisplayStatusSuffix { get; init; }
+
+    /// <summary>
+    /// Public id suffix used only when two login-id labels are ambiguous. It
+    /// never contains an email, hash, or filesystem path.
+    /// </summary>
+    public string? DisplayLabelSuffix { get; init; }
+
+    /// <summary>
+    /// Selector text derived only from the validated optional login id. A
+    /// missing login id is rendered as the public account number. Lifecycle
+    /// boundaries, tokens, hashes, and filesystem paths are never included.
+    /// </summary>
+    public string DisplayLabel
+    {
+        get
+        {
+            var disambiguator = string.IsNullOrEmpty(DisplayLabelSuffix)
+                ? string.Empty
+                : $" · {DisplayLabelSuffix}";
+            var identity = LoginId is { Length: > 0 } loginId
+                ? loginId
+                : $"アカウント {GetAccountNumber()} · ID未復元";
+            return $"{identity}{DisplayStatusSuffix}{disambiguator}";
+        }
+    }
+
+    private string GetAccountNumber() => Id.StartsWith("account-", StringComparison.Ordinal)
+        ? Id["account-".Length..]
+        : Id;
+
+    /// <summary>
+    /// Keeps ordinary labels compact while making duplicate login-id labels
+    /// deterministic and unambiguous for keyboard/UI automation selection.
+    /// </summary>
+    public static IReadOnlyList<ApiAccount> EnsureUniqueDisplayLabels(
+        IEnumerable<ApiAccount> source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        var accounts = source.ToArray();
+        var duplicateIds = accounts
+            .GroupBy(account => account.DisplayLabel, StringComparer.Ordinal)
+            .Where(group => group.Count() > 1)
+            .SelectMany(group => group)
+            .Select(account => account.Id)
+            .ToHashSet(StringComparer.Ordinal);
+        return accounts
+            .Select(account => duplicateIds.Contains(account.Id)
+                ? account with { DisplayLabelSuffix = account.Id }
+                : account)
+            .ToArray();
+    }
+}
+
 /// <summary>Static legal/licensing text safe to render in the client.</summary>
 public sealed record ApiLegalNotice(string Name, string Text);
 
@@ -272,6 +349,45 @@ public interface ILoopbackResourceClient
     Task<ThreadsFetchResult> FetchThreadsAsync(CancellationToken cancellationToken = default);
 }
 
+/// <summary>Reads the redacted account choices for the selector.</summary>
+public interface ILoopbackAccountsClient
+{
+    Task<AccountsFetchResult> FetchAccountsAsync(CancellationToken cancellationToken = default);
+}
+
+/// <summary>
+/// Account-scoped v3 resources. The account key is explicit at the transport
+/// boundary so a previous account cannot be silently reused by a child view.
+/// </summary>
+public interface ILoopbackAccountResourceClient
+{
+    Task<CurrentFetchResult> FetchCurrentAsync(
+        string accountId,
+        CancellationToken cancellationToken = default);
+
+    Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
+        string accountId,
+        CancellationToken cancellationToken = default);
+
+    Task<HistoryPageFetchResult> FetchHistoryPageAsync(
+        string accountId,
+        string periodId,
+        string? cursor = null,
+        CancellationToken cancellationToken = default);
+
+    Task<ThreadsFetchResult> FetchThreadsAsync(
+        string accountId,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>Validated account selector response from /v3/accounts.</summary>
+public sealed record ApiAccountsSnapshot(
+    string DefaultAccountId,
+    IReadOnlyList<ApiAccount> Accounts)
+{
+    public string ApiVersion { get; init; } = "v3";
+}
+
 /// <summary>The v3/current resource. History and thread rows are intentionally absent.</summary>
 public sealed record ApiCurrentSnapshot(
     ApiState State,
@@ -284,6 +400,9 @@ public sealed record ApiCurrentSnapshot(
     PublishedPairIdentity PublishedPair)
 {
     public string ApiVersion { get; init; } = "v3";
+
+    /// <summary>Explicit account used for this resource, when scoped.</summary>
+    public string? AccountId { get; init; }
 
     internal static ApiCurrentSnapshot FromDetails(ApiDetailsSnapshot details)
     {
@@ -310,6 +429,8 @@ public sealed record ApiHistoryPeriodsSnapshot(
 {
     public string ApiVersion { get; init; } = "v3";
 
+    public string? AccountId { get; init; }
+
     internal static ApiHistoryPeriodsSnapshot FromDetails(ApiDetailsSnapshot details) =>
         new(details.HistoryPeriods, details.PublishedPair ?? default)
         {
@@ -327,6 +448,8 @@ public sealed record ApiHistoryPage(
     PublishedPairIdentity PublishedPair)
 {
     public string ApiVersion { get; init; } = "v3";
+
+    public string? AccountId { get; init; }
 
     public bool IsLegacyFallback { get; init; }
 
@@ -357,6 +480,8 @@ public sealed record ApiThreadsSnapshot(
     PublishedPairIdentity PublishedPair)
 {
     public string ApiVersion { get; init; } = "v3";
+
+    public string? AccountId { get; init; }
 
     internal static ApiThreadsSnapshot FromDetails(ApiDetailsSnapshot details) =>
         new(details.Threads, details.PublishedPair ?? default)
@@ -430,5 +555,21 @@ public sealed record ThreadsFetchResult(
     }
 
     public static ThreadsFetchResult FromFailure(DetailsFetchFailure failure) =>
+        new(null, failure);
+}
+
+public sealed record AccountsFetchResult(
+    ApiAccountsSnapshot? Snapshot,
+    DetailsFetchFailure? Failure)
+{
+    public bool IsSuccess => Snapshot is not null && Failure is null;
+
+    public static AccountsFetchResult Success(ApiAccountsSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        return new AccountsFetchResult(snapshot, null);
+    }
+
+    public static AccountsFetchResult FromFailure(DetailsFetchFailure failure) =>
         new(null, failure);
 }

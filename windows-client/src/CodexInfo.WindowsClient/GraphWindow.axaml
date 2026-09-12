@@ -26,45 +26,66 @@
       <Setter Property="Foreground" Value="#78879C" />
     </Style>
     <Style Selector="ToggleButton.selector">
-      <Setter Property="Height" Value="34" />
+      <Setter Property="Height" Value="36" />
       <Setter Property="Padding" Value="12,0" />
       <Setter Property="HorizontalAlignment" Value="Stretch" />
       <Setter Property="HorizontalContentAlignment" Value="Left" />
       <Setter Property="VerticalContentAlignment" Value="Center" />
-      <Setter Property="Background" Value="#151F2D" />
-      <Setter Property="BorderBrush" Value="#31445B" />
+      <Setter Property="Background" Value="#111B2C" />
+      <Setter Property="BorderBrush" Value="#405779" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="6" />
       <Setter Property="Foreground" Value="#E9EFF8" />
     </Style>
     <Style Selector="ToggleButton.selector:pointerover">
       <Setter Property="Background" Value="#1B2A3D" />
       <Setter Property="BorderBrush" Value="#47769F" />
     </Style>
+    <Style Selector="ToggleButton.selector:checked">
+      <Setter Property="Background" Value="#244D74" />
+      <Setter Property="BorderBrush" Value="#56B2F5" />
+    </Style>
     <Style Selector="ToggleButton.series-toggle">
-      <Setter Property="Height" Value="34" />
-      <Setter Property="Padding" Value="12,0" />
+      <Setter Property="Width" Value="96" />
+      <Setter Property="Height" Value="24" />
+      <Setter Property="Padding" Value="0" />
       <Setter Property="HorizontalAlignment" Value="Stretch" />
       <Setter Property="HorizontalContentAlignment" Value="Stretch" />
       <Setter Property="VerticalContentAlignment" Value="Center" />
-      <Setter Property="Background" Value="#151F2D" />
-      <Setter Property="BorderBrush" Value="#263548" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
       <Setter Property="Foreground" Value="#E9EFF8" />
+      <Setter Property="FontSize" Value="11" />
       <Setter Property="Opacity" Value="0.55" />
+      <Setter Property="Template">
+        <ControlTemplate>
+          <Border Background="Transparent">
+            <ContentPresenter Content="{TemplateBinding Content}"
+                              ContentTemplate="{TemplateBinding ContentTemplate}"
+                              HorizontalContentAlignment="{TemplateBinding HorizontalContentAlignment}"
+                              VerticalContentAlignment="{TemplateBinding VerticalContentAlignment}" />
+          </Border>
+        </ControlTemplate>
+      </Setter>
     </Style>
     <Style Selector="ToggleButton.series-toggle:checked">
       <Setter Property="Opacity" Value="1" />
-      <Setter Property="Background" Value="#1A2737" />
-      <Setter Property="BorderBrush" Value="#47769F" />
-    </Style>
-    <Style Selector="ToggleButton.series-toggle:pointerover">
-      <Setter Property="Background" Value="#203149" />
-    </Style>
-    <Style Selector="Button.window-control">
-      <Setter Property="Width" Value="34" />
-      <Setter Property="Height" Value="32" />
-      <Setter Property="Padding" Value="0" />
-      <Setter Property="FontSize" Value="17" />
       <Setter Property="Background" Value="Transparent" />
       <Setter Property="BorderBrush" Value="Transparent" />
+    </Style>
+    <Style Selector="ToggleButton.series-toggle:pointerover">
+      <Setter Property="Background" Value="#1A2838" />
+    </Style>
+    <Style Selector="Button.window-control">
+      <Setter Property="Width" Value="36" />
+      <Setter Property="Height" Value="28" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="FontSize" Value="17" />
+      <Setter Property="Background" Value="#111B2C" />
+      <Setter Property="BorderBrush" Value="#2D3D56" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="4" />
       <Setter Property="Foreground" Value="#A8B7CA" />
     </Style>
     <Style Selector="Button.window-control:pointerover">
@@ -73,113 +94,140 @@
     </Style>
   </Window.Styles>
 
-  <Grid Margin="22" RowDefinitions="Auto,Auto,Auto,Auto,*" RowSpacing="10">
-    <Grid ColumnDefinitions="*,Auto" Background="Transparent">
-        <StackPanel Spacing="2">
-        <TextBlock FontSize="25" FontWeight="SemiBold" Text="{Binding Texts.Graph}" />
-        <TextBlock Classes="label" Text="{Binding Texts.ModelUsage}" />
-      </StackPanel>
-      <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2">
-        <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" AutomationProperties.AutomationId="Graph.Window.Minimize" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
-        <Button Classes="window-control" Click="OnMaximizeWindow" AutomationProperties.Name="{Binding Texts.Maximize}" AutomationProperties.AutomationId="Graph.Window.Maximize" Content="□" ToolTip.Tip="{Binding Texts.Maximize}" />
-        <Button Classes="window-control" Click="OnCloseWindow" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Graph.Window.Close" Content="×" ToolTip.Tip="{Binding Texts.Close}" />
-      </StackPanel>
-    </Grid>
+  <Grid>
+    <Grid x:Name="GraphContent" Margin="30,24" RowDefinitions="36,36,36,36,32,*">
+      <Border Grid.Row="1" Grid.RowSpan="4" Background="#111B2C" />
 
-    <Grid Grid.Row="1" ColumnDefinitions="*,160" ColumnSpacing="10">
+      <Grid Grid.Row="0" ColumnDefinitions="*,128,108" Background="Transparent">
+        <TextBlock FontSize="24" FontWeight="Bold" VerticalAlignment="Center" Text="{Binding Texts.GraphWindowTitle}" />
+        <ToggleButton x:Name="MetricSelector" Grid.Column="1" Classes="selector"
+                      ClickMode="Press"
+                      IsCheckedChanged="OnMetricSelectorCheckedChanged" Content="{Binding SelectedMetric}"
+                      AutomationProperties.Name="{Binding Texts.ModelUsage}"
+                      AutomationProperties.AutomationId="Graph.MetricSelector"
+                      AutomationProperties.HelpText="{Binding SelectedMetric}"
+                      ToolTip.Tip="{Binding Texts.ModelUsage}" />
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="0" VerticalAlignment="Top">
+          <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" AutomationProperties.AutomationId="Graph.Window.Minimize" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
+          <Button Classes="window-control" Click="OnMaximizeWindow" AutomationProperties.Name="{Binding Texts.Maximize}" AutomationProperties.AutomationId="Graph.Window.Maximize" Content="□" ToolTip.Tip="{Binding Texts.Maximize}" />
+          <Button Classes="window-control" Click="OnCloseWindow" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Graph.Window.Close" Content="×" ToolTip.Tip="{Binding Texts.Close}" />
+        </StackPanel>
+      </Grid>
+
+      <ToggleButton x:Name="AccountSelector" Grid.Row="1" Classes="selector"
+                    ClickMode="Press"
+                    IsCheckedChanged="OnAccountSelectorCheckedChanged" Content="{Binding SelectedAccountText}"
+                    IsEnabled="{Binding HasAccounts}" AutomationProperties.Name="{Binding Texts.Account}"
+                    AutomationProperties.AutomationId="Graph.AccountSelector"
+                    AutomationProperties.HelpText="{Binding SelectedAccountText}"
+                    ToolTip.Tip="{Binding SelectedAccountText}" />
+
       <ToggleButton x:Name="PeriodSelector" Classes="selector"
+                    Grid.Row="2"
                     ClickMode="Press"
                     IsCheckedChanged="OnPeriodSelectorCheckedChanged" Content="{Binding SelectedPeriodText}"
                     IsEnabled="{Binding HasPeriods}" AutomationProperties.Name="{Binding Texts.ResetTime}"
                     AutomationProperties.AutomationId="Graph.PeriodSelector"
                     AutomationProperties.HelpText="{Binding SelectedPeriodText}"
                     ToolTip.Tip="{Binding SelectedPeriodText}" />
-      <ToggleButton x:Name="MetricSelector" Grid.Column="1" Classes="selector"
-                    ClickMode="Press"
-                    IsCheckedChanged="OnMetricSelectorCheckedChanged" Content="{Binding SelectedMetric}"
-                    AutomationProperties.Name="{Binding Texts.ModelUsage}"
-                    AutomationProperties.AutomationId="Graph.MetricSelector"
-                    AutomationProperties.HelpText="{Binding SelectedMetric}"
-                    ToolTip.Tip="{Binding Texts.ModelUsage}" />
-    </Grid>
 
-    <!-- One five-column control group: label length never changes geometry. -->
-    <Grid Grid.Row="2" ColumnDefinitions="*,*,*,*,*" ColumnSpacing="8">
+      <Grid Grid.Row="4" Width="504" Height="24" HorizontalAlignment="Left"
+            ColumnDefinitions="96,96,96,96,96" ColumnSpacing="6">
       <ToggleButton Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowRemaining}" AutomationProperties.Name="{Binding Texts.RemainingQuota}" AutomationProperties.AutomationId="Graph.Toggle.Remaining" ToolTip.Tip="{Binding Texts.RemainingQuota}">
-        <Grid ColumnDefinitions="18,*" ColumnSpacing="7"><Border Width="14" Height="4" CornerRadius="2" Background="#56B2F5" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Text="{Binding Texts.RemainingQuota}" /></Grid>
+        <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="#56B2F5" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="{Binding Texts.RemainingQuota}" /></Grid>
       </ToggleButton>
       <ToggleButton Grid.Column="1" Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowLuna}" AutomationProperties.Name="LUNA" AutomationProperties.AutomationId="Graph.Toggle.LUNA" ToolTip.Tip="LUNA">
-        <Grid ColumnDefinitions="18,*" ColumnSpacing="7"><Border Width="14" Height="4" CornerRadius="2" Background="#E6A23C" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Text="LUNA" /></Grid>
+        <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="#E6A23C" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="LUNA" /></Grid>
       </ToggleButton>
       <ToggleButton Grid.Column="2" Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowTerra}" AutomationProperties.Name="TERRA" AutomationProperties.AutomationId="Graph.Toggle.TERRA" ToolTip.Tip="TERRA">
-        <Grid ColumnDefinitions="18,*" ColumnSpacing="7"><Border Width="14" Height="4" CornerRadius="2" Background="#5DC98A" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Text="TERRA" /></Grid>
+        <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="#5DC98A" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="TERRA" /></Grid>
       </ToggleButton>
       <ToggleButton Grid.Column="3" Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowSol}" AutomationProperties.Name="SOL" AutomationProperties.AutomationId="Graph.Toggle.SOL" ToolTip.Tip="SOL">
-        <Grid ColumnDefinitions="18,*" ColumnSpacing="7"><Border Width="14" Height="4" CornerRadius="2" Background="#A88CF5" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Text="SOL" /></Grid>
+        <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="#A88CF5" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="SOL" /></Grid>
       </ToggleButton>
       <ToggleButton Grid.Column="4" Classes="series-toggle" ClickMode="Press" IsChecked="{Binding ShowAstra}" AutomationProperties.Name="ASTRA" AutomationProperties.AutomationId="Graph.Toggle.ASTRA" ToolTip.Tip="ASTRA">
-        <Grid ColumnDefinitions="18,*" ColumnSpacing="7"><Border Width="14" Height="4" CornerRadius="2" Background="#EF6A6A" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Center" VerticalAlignment="Center" Text="ASTRA" /></Grid>
+        <Grid ColumnDefinitions="28,*"><Border Width="14" Height="4" Margin="8,0,6,0" CornerRadius="2" Background="#EF6A6A" HorizontalAlignment="Left" VerticalAlignment="Center" /><TextBlock Grid.Column="1" HorizontalAlignment="Left" VerticalAlignment="Center" Text="ASTRA" /></Grid>
       </ToggleButton>
-    </Grid>
+      </Grid>
 
-    <Grid Grid.Row="3" ColumnDefinitions="*,Auto" ColumnSpacing="12" MinHeight="24">
-      <StackPanel Spacing="2" VerticalAlignment="Center">
-        <TextBlock Classes="label" Text="{Binding DetailsStatusText}" />
-        <TextBlock Foreground="#F0A35B" FontSize="12" IsVisible="{Binding HasLoadError}" Text="{Binding LoadErrorText}" />
-      </StackPanel>
-      <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" IsVisible="{Binding IsLoading}" IsHitTestVisible="False" VerticalAlignment="Center">
-        <ProgressBar Width="72" Height="4" IsIndeterminate="True" />
-        <TextBlock Classes="label" Text="{Binding LoadingText}" />
-      </StackPanel>
-    </Grid>
-
-    <Border Grid.Row="4" Background="#121C2C" BorderBrush="#3B506F" BorderThickness="1" CornerRadius="10" Padding="14">
-      <Grid RowDefinitions="Auto,*" RowSpacing="8">
-        <StackPanel Spacing="2">
-          <TextBlock Classes="label" FontWeight="SemiBold" Text="{Binding MetricAxisText}" />
-          <TextBlock Classes="label" FontSize="11" Opacity="0.72" Text="{Binding GraphGapHintText}" />
-        </StackPanel>
-        <plot:GraphPlotControl Grid.Row="1" Scene="{Binding Scene}"
+      <Border Grid.Row="5" Background="#121C2C" BorderBrush="#3B506F" BorderThickness="1" CornerRadius="10" ClipToBounds="True">
+        <Grid>
+          <plot:GraphPlotControl Scene="{Binding Scene}"
                                ShowRemaining="{Binding ShowRemaining}" ShowSol="{Binding ShowSol}"
                                ShowTerra="{Binding ShowTerra}" ShowLuna="{Binding ShowLuna}"
                                ShowAstra="{Binding ShowAstra}"
                                AutomationProperties.Name="{Binding Texts.Graph}"
                                AutomationProperties.AutomationId="Graph.Plot"
                                IsVisible="{Binding HasPoints}" />
-        <TextBlock Grid.Row="1" Classes="label" HorizontalAlignment="Center" VerticalAlignment="Center"
-                   IsVisible="{Binding HasNoPoints}" Text="{Binding Texts.UnavailableDetails}" />
-      </Grid>
-    </Border>
+          <TextBlock Classes="label" Margin="92,6,0,0" HorizontalAlignment="Left" VerticalAlignment="Top"
+                     FontWeight="SemiBold" Text="{Binding MetricAxisText}" IsHitTestVisible="False" />
+          <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8"
+                      IsVisible="{Binding IsLoading}" IsHitTestVisible="False">
+            <ProgressBar Width="72" Height="4" IsIndeterminate="True" />
+            <TextBlock Classes="label" Text="{Binding LoadingText}" />
+          </StackPanel>
+          <TextBlock Classes="label" HorizontalAlignment="Center" VerticalAlignment="Center"
+                     IsVisible="{Binding HasBlockingLoadError}" IsHitTestVisible="False"
+                     Foreground="#F0A35B" Text="{Binding LoadErrorText}" />
+          <TextBlock Classes="label" HorizontalAlignment="Center" VerticalAlignment="Center"
+                     IsVisible="{Binding HasNoPoints}" IsHitTestVisible="False"
+                     Text="{Binding Texts.UnavailableDetails}" />
+        </Grid>
+      </Border>
 
-    <!-- Pre-measured in-window menus: opening them is an opacity-only change. -->
-    <Grid Grid.RowSpan="5" ZIndex="100">
-      <Border x:Name="PeriodMenu" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="0,102,0,0"
+      <!-- Pre-measured in-window menus: opening them is an opacity-only change. -->
+      <Grid Grid.RowSpan="6" ZIndex="100">
+      <Border x:Name="AccountMenu" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="0,72,0,0"
+              Opacity="0" IsEnabled="False" IsHitTestVisible="False" Width="560" MaxWidth="700" MaxHeight="320" Padding="4"
+              Background="#1B2838" BorderBrush="#47769F" BorderThickness="1" CornerRadius="6">
+        <ListBox ItemsSource="{Binding Accounts}" SelectedItem="{Binding SelectedAccount, Mode=TwoWay}"
+                 SelectionChanged="OnAccountSelectionChanged"
+                 AutomationProperties.AutomationId="Graph.AccountMenu">
+          <ListBox.ItemTemplate>
+            <DataTemplate x:DataType="core:ApiAccount">
+              <TextBlock Text="{Binding DisplayLabel}"
+                         TextWrapping="Wrap"
+                         ToolTip.Tip="{Binding DisplayLabel}"
+                         AutomationProperties.Name="{Binding DisplayLabel}"
+                         AutomationProperties.HelpText="{Binding DisplayLabel}" />
+            </DataTemplate>
+          </ListBox.ItemTemplate>
+        </ListBox>
+      </Border>
+      <Border x:Name="PeriodMenu" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="0,108,0,0"
               Opacity="0" IsEnabled="False" IsHitTestVisible="False" Width="560" MaxWidth="700" MaxHeight="320" Padding="4"
               Background="#1B2838" BorderBrush="#47769F" BorderThickness="1" CornerRadius="6">
         <ListBox ItemsSource="{Binding Periods}" SelectedItem="{Binding SelectedPeriod, Mode=TwoWay}"
                  SelectionChanged="OnPeriodSelectionChanged"
                  AutomationProperties.AutomationId="Graph.PeriodMenu">
           <ListBox.ItemTemplate>
-            <DataTemplate x:DataType="core:ApiHistoryPeriod"><TextBlock Text="{Binding Label}" TextTrimming="CharacterEllipsis" /></DataTemplate>
+            <DataTemplate x:DataType="core:ApiHistoryPeriod">
+              <TextBlock Text="{Binding Label}"
+                         TextWrapping="Wrap"
+                         ToolTip.Tip="{Binding Label}"
+                         AutomationProperties.Name="{Binding Label}"
+                         AutomationProperties.HelpText="{Binding Label}" />
+            </DataTemplate>
           </ListBox.ItemTemplate>
         </ListBox>
       </Border>
-      <Border x:Name="MetricMenu" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,102,0,0"
-              Opacity="0" IsEnabled="False" IsHitTestVisible="False" Width="160" MaxHeight="160" Padding="4"
+      <Border x:Name="MetricMenu" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,36,108,0"
+              Opacity="0" IsEnabled="False" IsHitTestVisible="False" Width="128" MaxHeight="160" Padding="4"
               Background="#1B2838" BorderBrush="#47769F" BorderThickness="1" CornerRadius="6">
         <ListBox ItemsSource="{Binding MetricOptions}" SelectedItem="{Binding SelectedMetric, Mode=TwoWay}"
                  SelectionChanged="OnMetricSelectionChanged"
                  AutomationProperties.AutomationId="Graph.MetricMenu" />
       </Border>
+      </Grid>
     </Grid>
 
-    <Border x:Name="ResizeNorthWest" Grid.RowSpan="5" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="-22" Background="Transparent" PointerPressed="OnResizeNorthWest" />
-    <Border x:Name="ResizeNorthEast" Grid.RowSpan="5" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="-22" Background="Transparent" PointerPressed="OnResizeNorthEast" />
-    <Border x:Name="ResizeSouthWest" Grid.RowSpan="5" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="-22" Background="Transparent" PointerPressed="OnResizeSouthWest" />
-    <Border x:Name="ResizeSouthEast" Grid.RowSpan="5" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="-22" Background="Transparent" PointerPressed="OnResizeSouthEast" />
-    <Border x:Name="ResizeNorth" Grid.RowSpan="5" Height="10" HorizontalAlignment="Stretch" VerticalAlignment="Top" Margin="18,-22,18,0" Background="Transparent" PointerPressed="OnResizeNorth" />
-    <Border x:Name="ResizeSouth" Grid.RowSpan="5" Height="10" HorizontalAlignment="Stretch" VerticalAlignment="Bottom" Margin="18,0,18,-22" Background="Transparent" PointerPressed="OnResizeSouth" />
-    <Border x:Name="ResizeWest" Grid.RowSpan="5" Width="10" HorizontalAlignment="Left" VerticalAlignment="Stretch" Margin="-22,18,0,18" Background="Transparent" PointerPressed="OnResizeWest" />
-    <Border x:Name="ResizeEast" Grid.RowSpan="5" Width="10" HorizontalAlignment="Right" VerticalAlignment="Stretch" Margin="0,18,-22,18" Background="Transparent" PointerPressed="OnResizeEast" />
+    <Border x:Name="ResizeNorthWest" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Top" Background="Transparent" PointerPressed="OnResizeNorthWest" />
+    <Border x:Name="ResizeNorthEast" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" PointerPressed="OnResizeNorthEast" />
+    <Border x:Name="ResizeSouthWest" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Bottom" Background="Transparent" PointerPressed="OnResizeSouthWest" />
+    <Border x:Name="ResizeSouthEast" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Background="Transparent" PointerPressed="OnResizeSouthEast" />
+    <Border x:Name="ResizeNorth" Height="10" HorizontalAlignment="Stretch" VerticalAlignment="Top" Margin="18,0" Background="Transparent" PointerPressed="OnResizeNorth" />
+    <Border x:Name="ResizeSouth" Height="10" HorizontalAlignment="Stretch" VerticalAlignment="Bottom" Margin="18,0" Background="Transparent" PointerPressed="OnResizeSouth" />
+    <Border x:Name="ResizeWest" Width="10" HorizontalAlignment="Left" VerticalAlignment="Stretch" Margin="0,18" Background="Transparent" PointerPressed="OnResizeWest" />
+    <Border x:Name="ResizeEast" Width="10" HorizontalAlignment="Right" VerticalAlignment="Stretch" Margin="0,18" Background="Transparent" PointerPressed="OnResizeEast" />
   </Grid>
 </Window>
