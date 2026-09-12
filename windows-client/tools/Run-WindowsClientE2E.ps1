@@ -62,7 +62,8 @@ $script:e2eSourceSha = if (-not [string]::IsNullOrWhiteSpace($SourceSha)) { $Sou
 $script:e2eWindowRecords = [System.Collections.Generic.List[object]]::new()
 $script:e2eProcess = $null
 $script:e2eFixtureRunning = $false
-$script:e2eFixturePort = 8787
+$script:e2eFixturePort = 0
+$script:e2eFixturePortVariable = 'CODEX_INFO_WINDOWS_E2E_FIXTURE_PORT'
 $script:e2ePreviewEnabled = -not [string]::IsNullOrWhiteSpace($env:CODEX_INFO_WINDOWS_PREVIEW)
 $script:e2eSettingsPath = Join-Path $env:LOCALAPPDATA 'CodexInfo\settings.json'
 $script:e2eSettingsBackup = Join-Path ([IO.Path]::GetTempPath()) ("codex-info-e2e-settings-" + [Guid]::NewGuid().ToString('N') + '.json')
@@ -2308,7 +2309,9 @@ function Enter-E2EFixture {
     New-Item -ItemType Directory -Path $settingsDirectory -Force | Out-Null
     $settingsJson = '{"language":"en","setupCompleted":true,"connectionConfigured":true,"timeZoneId":"UTC","connectionProfile":"none","connectionSelector":"none"}'
     [IO.File]::WriteAllText($script:e2eSettingsPath, $settingsJson, [Text.UTF8Encoding]::new($false))
-    Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start($documents.Details, $documents.PublishedPair, $script:e2eProductVersion, $script:e2eFixturePort)) "Could not bind the fixture to loopback port $script:e2eFixturePort."
+    Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start($documents.Details, $documents.PublishedPair, $script:e2eProductVersion, 0)) 'Could not bind the fixture to an ephemeral loopback port.'
+    $script:e2eFixturePort = [CodexInfoWindowsE2EFixtureServer]::BoundPort()
+    Assert-E2E ($script:e2eFixturePort -ge 1 -and $script:e2eFixturePort -le 65535) 'Fixture did not report a valid bound port.'
     $script:e2eFixtureRunning = $true
     Write-E2E "fixture: PASS periods=2 threads=3 endpoint=http://127.0.0.1:$script:e2eFixturePort"
 }
@@ -2658,7 +2661,25 @@ try {
     if ($Fixture) {
         Invoke-E2EFixturePreflight | Out-Null
     }
-    $script:e2eProcess = Start-Process -FilePath $resolvedClientPath -PassThru
+    $fixturePortWasPresent = Test-Path -LiteralPath "Env:$($script:e2eFixturePortVariable)"
+    $previousFixturePort = [Environment]::GetEnvironmentVariable($script:e2eFixturePortVariable, 'Process')
+    try {
+        if ($Fixture) {
+            [Environment]::SetEnvironmentVariable(
+                $script:e2eFixturePortVariable,
+                $script:e2eFixturePort.ToString([Globalization.CultureInfo]::InvariantCulture),
+                'Process')
+        }
+        $script:e2eProcess = Start-Process -FilePath $resolvedClientPath -PassThru
+    }
+    finally {
+        if ($fixturePortWasPresent) {
+            [Environment]::SetEnvironmentVariable($script:e2eFixturePortVariable, $previousFixturePort, 'Process')
+        }
+        else {
+            [Environment]::SetEnvironmentVariable($script:e2eFixturePortVariable, $null, 'Process')
+        }
+    }
     $clientPid = $script:e2eProcess.Id
     Write-E2E "process: pid=$clientPid"
 
