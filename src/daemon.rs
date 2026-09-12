@@ -2917,7 +2917,7 @@ mod tests {
             .join("08")
             .join("22");
         fs::create_dir_all(&sessions).unwrap();
-        let now = unix_now().max(1);
+        let now = unix_now().max(1).div_euclid(60) * 60;
         let reset_at = now + 3_600;
         let session = sessions.join("must-not-be-collected.jsonl");
         let context = serde_json::json!({
