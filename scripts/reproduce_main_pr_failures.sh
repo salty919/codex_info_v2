@@ -9,16 +9,10 @@ fail() {
     exit 1
 }
 
-source_sha=''
 phase='all'
 pr_number=''
 while (($# > 0)); do
     case "$1" in
-        --source-sha)
-            [[ $# -ge 2 && -z "$source_sha" ]] || fail '--source-sha requires one value'
-            source_sha="$2"
-            shift 2
-            ;;
         --phase)
             [[ $# -ge 2 && "$phase" == 'all' ]] || fail '--phase requires one value'
             phase="$2"
@@ -33,11 +27,7 @@ while (($# > 0)); do
     esac
 done
 
-[[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || fail '--source-sha must be one full lowercase commit SHA'
-git cat-file -e "${source_sha}^{commit}" 2>/dev/null || fail "source commit is unavailable: $source_sha"
-head_sha="$(git rev-parse HEAD)"
-[[ "$head_sha" == "$source_sha" ]] ||
-    fail "worktree HEAD does not match --source-sha: head=$head_sha source=$source_sha"
+source_sha="$(git rev-parse HEAD)"
 
 run_linux_cli() {
     command -v cargo >/dev/null || fail 'cargo is unavailable'

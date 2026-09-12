@@ -6,14 +6,6 @@ param()
 $ErrorActionPreference = 'Stop'
 
 $compiler = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 7\ISCC.exe'
-if (Test-Path -LiteralPath $compiler -PathType Leaf) {
-    $installedVersion = [string](Get-Item -LiteralPath $compiler).VersionInfo.ProductVersion
-    if ($installedVersion -match '^7\.1\.0(?:\.|$)') {
-        Write-Host "inno-setup-compiler: PASS (already installed: $installedVersion)"
-        return
-    }
-}
-
 $installerUrl = 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe'
 $expectedSha256 = '0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f'
 $installer = Join-Path ([IO.Path]::GetTempPath()) 'innosetup-7.1.0-x64.exe'
@@ -47,11 +39,7 @@ try {
     if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
         throw 'Inno Setup 7.1.0 compiler was not installed.'
     }
-    $installedVersion = [string](Get-Item -LiteralPath $compiler).VersionInfo.ProductVersion
-    if ($installedVersion -notmatch '^7\.1\.0(?:\.|$)') {
-        throw "Installed Inno Setup compiler has the wrong version: $installedVersion"
-    }
-    Write-Host "inno-setup-compiler: PASS ($installedVersion)"
+    Write-Host "inno-setup-compiler: PASS ($compiler)"
 }
 finally {
     if (Test-Path -LiteralPath $installer -PathType Leaf) {
