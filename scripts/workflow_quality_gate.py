@@ -764,11 +764,8 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf))",
         "Candidate upgrade removed user settings",
         "windows-installer-upgrade: PASS",
-        "Run-WindowsClientE2E.ps1",
-        "E2E uninstall removed user settings.",
-        "windows_window_move_smoke.ps1",
-        "$moveSmokeOutput = @(& ./scripts/windows_window_move_smoke.ps1",
-        "[string]$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS'",
+        "Reproduce-WindowsInstalledE2E.ps1",
+        "-CleanupInstallation",
         "New-WindowsUpdateManifest.ps1",
         "name: release-candidate-v1-pr-${{ inputs.pr_number }}",
     ):

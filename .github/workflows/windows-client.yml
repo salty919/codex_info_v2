@@ -240,38 +240,11 @@ jobs:
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
-          $install = Join-Path $env:LOCALAPPDATA 'Programs\Codex Info Monitor'
-          $exe = Join-Path $install 'CodexInfo.WindowsClient.exe'
           $e2eOutput = Join-Path $env:RUNNER_TEMP 'codex-info-windows-e2e'
-          try {
-            New-Item -ItemType Directory -Path $e2eOutput -Force | Out-Null
-            $moveSmokeLog = Join-Path $e2eOutput 'window-move-smoke.log'
-            & ./windows-client/tools/Run-WindowsClientE2E.ps1 -ClientPath $exe -OutputDirectory $e2eOutput -Fixture -SourceSha $env:SOURCE_SHA
-            "source-sha: $env:SOURCE_SHA" | Set-Content -LiteralPath $moveSmokeLog -Encoding utf8
-            $moveSmokeOutput = @(& ./scripts/windows_window_move_smoke.ps1 -ClientPath $exe -AllowPhysicalInput *>&1)
-            $moveSmokeOutput | Tee-Object -FilePath $moveSmokeLog -Append
-            if ($moveSmokeOutput.Count -eq 0 -or [string]$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS') {
-              throw 'Physical window move smoke did not report its terminal PASS contract.'
-            }
-          }
-          finally {
-            $uninstaller = Get-ChildItem -LiteralPath $install -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($null -ne $uninstaller) {
-              $uninstallProcess = Start-Process -FilePath $uninstaller.FullName -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
-              if ($uninstallProcess.ExitCode -ne 0) { throw "E2E cleanup uninstall failed with exit code $($uninstallProcess.ExitCode)" }
-            }
-            $sentinel = Join-Path $env:LOCALAPPDATA 'CodexInfo\installer-preserve-sentinel.txt'
-            $start = Join-Path ([Environment]::GetFolderPath('Programs')) 'Codex Info\Codex Info Monitor.lnk'
-            $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Codex Info Monitor.lnk'
-            $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexInfo.WindowsClient_is1'
-            Start-Sleep -Seconds 4
-            if (Test-Path -LiteralPath $install) { throw 'Install directory still exists after E2E uninstall.' }
-            if (Test-Path -LiteralPath $start) { throw 'Start-menu shortcut still exists after E2E uninstall.' }
-            if (Test-Path -LiteralPath $desktop) { throw 'Desktop shortcut still exists after E2E uninstall.' }
-            if (Test-Path -LiteralPath $key) { throw 'Apps registration still exists after E2E uninstall.' }
-            if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf)) { throw 'E2E uninstall removed user settings.' }
-            Remove-Item -LiteralPath $sentinel -Force
-          }
+          ./windows-client/tools/Reproduce-WindowsInstalledE2E.ps1 `
+            -SourceSha $env:SOURCE_SHA `
+            -OutputDirectory $e2eOutput `
+            -CleanupInstallation
       - name: Create release manifest
         id: manifest
         if: inputs.release_candidate
