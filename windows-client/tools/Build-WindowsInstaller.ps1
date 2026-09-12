@@ -3,7 +3,8 @@
 param(
     [string]$Configuration = 'Release',
     [string]$Runtime = 'win-x64',
-    [string]$OutputDirectory = 'artifacts/windows-installer'
+    [string]$OutputDirectory = 'artifacts/windows-installer',
+    [string]$SourceSha = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,6 +48,10 @@ function Get-AuthoritativeVersion {
 }
 
 $version = Get-AuthoritativeVersion -Path $versionProps
+if (-not [string]::IsNullOrWhiteSpace($SourceSha) -and
+    $SourceSha -cnotmatch '^[0-9a-f]{40}$') {
+    throw "SourceSha is not a full lowercase commit SHA: $SourceSha"
+}
 
 $compilerCandidates = @(
     $env:INNO_SETUP_COMPILER,
@@ -67,7 +72,12 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "dotnet restore failed with exit code $LASTEXITCODE"
     }
-    dotnet publish $clientProject --configuration $Configuration --runtime $Runtime --self-contained true --output $payload --no-restore
+    $revisionArgument = @()
+    if (-not [string]::IsNullOrWhiteSpace($SourceSha)) {
+        $revisionArgument = @("-p:SourceRevisionId=$SourceSha")
+    }
+    dotnet publish $clientProject --configuration $Configuration --runtime $Runtime `
+        --self-contained true --output $payload --no-restore @revisionArgument
     if ($LASTEXITCODE -ne 0) {
         throw "dotnet publish failed with exit code $LASTEXITCODE"
     }

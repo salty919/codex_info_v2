@@ -35,6 +35,13 @@ RELEASE_ACCEPTANCE_SCRIPTS = {
     "app-server-failure": "scripts/fake_codex_app_server.py",
 }
 
+WINDOWS_GATE_SCRIPTS = {
+    "compiler": "windows-client/tools/Ensure-InnoSetupCompiler.ps1",
+    "build": "windows-client/tools/Build-WindowsInstaller.ps1",
+    "upgrade": "windows-client/tools/Install-WindowsCandidateForE2E.ps1",
+    "e2e": "windows-client/tools/Reproduce-WindowsInstalledE2E.ps1",
+}
+
 
 def sources() -> dict[str, str]:
     return {
@@ -48,6 +55,54 @@ def release_acceptance_sources() -> dict[str, str]:
         name: (ROOT / path).read_text(encoding="utf-8")
         for name, path in RELEASE_ACCEPTANCE_SCRIPTS.items()
     }
+
+
+def windows_gate_sources() -> dict[str, str]:
+    return {
+        name: (ROOT / path).read_text(encoding="utf-8")
+        for name, path in WINDOWS_GATE_SCRIPTS.items()
+    }
+
+
+def _windows_gate_script_errors(scripts: Mapping[str, str]) -> list[str]:
+    required = {
+        "compiler": (
+            "innosetup-7.1.0-x64.exe",
+            "0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f",
+            "Get-AuthenticodeSignature",
+            "Pyrsys B.V.",
+        ),
+        "build": (
+            "[string]$SourceSha = ''",
+            "-p:SourceRevisionId=$SourceSha",
+        ),
+        "upgrade": (
+            "/releases/latest",
+            "Previous stable installer failed",
+            "if ($previousHash -cne [string]$manifest.installer.sha256)",
+            "Latest stable Windows Setup digest does not match its published manifest",
+            '$expectedProductVersion = "$candidateVersionText+$SourceSha"',
+            "Set-Content -LiteralPath $sentinel -Value 'preserve'",
+            "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf))",
+            "Candidate upgrade removed user settings",
+            "windows-installer-upgrade: PASS",
+        ),
+        "e2e": (
+            "[switch]$PrepareCandidate",
+            "Ensure-InnoSetupCompiler.ps1",
+            "Build-WindowsInstaller.ps1",
+            "Install-WindowsCandidateForE2E.ps1",
+            "-SourceSha $SourceSha",
+        ),
+    }
+    errors: list[str] = []
+    if set(scripts) != set(required):
+        return ["Windows gate script set differs from its declared contract"]
+    for name, markers in required.items():
+        for marker in markers:
+            if marker not in scripts[name]:
+                errors.append(f"Windows gate script {name} is missing {marker}")
+    return errors
 
 
 def _release_acceptance_script_errors(scripts: Mapping[str, str]) -> list[str]:
@@ -469,6 +524,21 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
                 _step(windows_job, name=step_name).get("if"),
                 "inputs.release_candidate",
             )
+        compiler_script = _step(
+            windows_job,
+            name="Install locked Inno Setup compiler",
+        ).get("run")
+        if "Ensure-InnoSetupCompiler.ps1" not in str(compiler_script):
+            errors.append("workflow wiring Windows compiler preparation is not shared")
+        build_step = _step(
+            windows_job,
+            name="Build standard Windows setup wizard",
+        )
+        mapping("windows.build.env", build_step.get("env"), {
+            "SOURCE_SHA": "${{ inputs.source_sha }}",
+        })
+        if "-SourceSha $env:SOURCE_SHA" not in str(build_step.get("run", "")):
+            errors.append("workflow wiring Windows build does not bind the source SHA")
         upgrade_script = _step(
             windows_job,
             name="Upgrade latest published Windows release to the exact candidate",
@@ -477,8 +547,9 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             errors.append("workflow wiring windows upgrade script is missing")
         else:
             for marker in (
-                "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf)) {",
-                "throw 'Candidate upgrade removed user settings.'",
+                "Install-WindowsCandidateForE2E.ps1",
+                "-SourceSha $env:SOURCE_SHA",
+                "-RetainSentinel",
             ):
                 if marker not in upgrade_script:
                     errors.append(
@@ -754,16 +825,11 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "dotnet test windows-client/CodexInfo.WindowsClient.sln",
         '--collect:"Code Coverage"',
         "codacy-coverage-windows-v1-head-${{ inputs.source_sha }}",
+        "Ensure-InnoSetupCompiler.ps1",
         "Build-WindowsInstaller.ps1",
-        "/releases/latest",
-        "Previous stable installer failed",
-        "if ($previousHash -cne [string]$manifest.installer.sha256)",
-        "Latest stable Windows Setup digest does not match its published manifest",
-        '$expectedProductVersion = "$candidateVersionText+$SourceSha"',
-        "Set-Content -LiteralPath $sentinel -Value 'preserve'",
-        "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf))",
-        "Candidate upgrade removed user settings",
-        "windows-installer-upgrade: PASS",
+        "Install-WindowsCandidateForE2E.ps1",
+        "-SourceSha $env:SOURCE_SHA",
+        "-RetainSentinel",
         "Reproduce-WindowsInstalledE2E.ps1",
         "-CleanupInstallation",
         "New-WindowsUpdateManifest.ps1",
@@ -771,6 +837,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     ):
         if marker not in windows:
             errors.append(f"windows-client.yml: missing {marker}")
+    errors.extend(_windows_gate_script_errors(windows_gate_sources()))
     for forbidden in (
         "Measure-WindowsGraphLatency.ps1",
         "Smoke-test install and uninstall lifecycle",
@@ -3402,21 +3469,20 @@ def self_test() -> int:
         ),
         ("selective-quality.yml", "  windows-quality:\n", "  omitted-windows-quality:\n"),
         ("windows-client.yml", "New-WindowsUpdateManifest.ps1", "Omitted-Manifest.ps1"),
-        ("windows-client.yml", "/releases/latest", "/releases/omitted"),
         (
             "windows-client.yml",
-            '$expectedProductVersion = "$candidateVersionText+$SourceSha"',
-            '$expectedProductVersion = "$candidateVersionText"',
+            "Ensure-InnoSetupCompiler.ps1",
+            "Omitted-InnoSetupCompiler.ps1",
         ),
         (
             "windows-client.yml",
-            "if ($previousHash -cne [string]$manifest.installer.sha256)",
-            "if ($previousHash -ceq [string]$manifest.installer.sha256)",
+            "Install-WindowsCandidateForE2E.ps1",
+            "Omitted-WindowsCandidateForE2E.ps1",
         ),
         (
             "windows-client.yml",
-            "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf))",
-            "if (Test-Path -LiteralPath $sentinel -PathType Leaf)",
+            "-SourceSha $env:SOURCE_SHA",
+            "-SourceSha $env:WRONG_SHA",
         ),
         (
             "linux-distribution.yml",
@@ -3509,6 +3575,40 @@ def self_test() -> int:
         candidate[name] = candidate[name].replace(old, new, 1)
         if not validate(candidate):
             raise AssertionError(f"workflow mutation was accepted: {name}: {old}")
+        cases += 1
+    windows_gate_baseline = windows_gate_sources()
+    windows_gate_mutations = (
+        ("compiler", "Get-AuthenticodeSignature", "Get-Item"),
+        (
+            "build",
+            "-p:SourceRevisionId=$SourceSha",
+            "-p:SourceRevisionId=unknown",
+        ),
+        ("upgrade", "/releases/latest", "/releases/omitted"),
+        (
+            "upgrade",
+            '$expectedProductVersion = "$candidateVersionText+$SourceSha"',
+            '$expectedProductVersion = "$candidateVersionText"',
+        ),
+        (
+            "upgrade",
+            "if ($previousHash -cne [string]$manifest.installer.sha256)",
+            "if ($previousHash -ceq [string]$manifest.installer.sha256)",
+        ),
+        (
+            "upgrade",
+            "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf))",
+            "if (Test-Path -LiteralPath $sentinel -PathType Leaf)",
+        ),
+        ("e2e", "[switch]$PrepareCandidate", "[string]$PrepareCandidate"),
+    )
+    for name, old, new in windows_gate_mutations:
+        candidate = dict(windows_gate_baseline)
+        if old not in candidate[name]:
+            raise AssertionError(f"Windows gate mutation target is missing: {name}: {old}")
+        candidate[name] = candidate[name].replace(old, new, 1)
+        if not _windows_gate_script_errors(candidate):
+            raise AssertionError(f"Windows gate mutation was accepted: {name}: {old}")
         cases += 1
     acceptance_mutations = (
         (

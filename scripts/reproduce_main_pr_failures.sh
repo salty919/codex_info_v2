@@ -91,7 +91,7 @@ run_windows_ui() {
     local runner
     runner="$(wslpath -w "$repo_root/windows-client/tools/Reproduce-WindowsInstalledE2E.ps1")"
     powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
-        -File "$runner" -SourceSha "$source_sha"
+        -File "$runner" -SourceSha "$source_sha" -PrepareCandidate
 }
 
 show_external_checks() {

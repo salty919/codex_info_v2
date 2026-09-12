@@ -42,6 +42,12 @@ class OwnerSelectionTests(unittest.TestCase):
             "windows-client/tools/Reproduce-WindowsInstalledE2E.ps1": (
                 ("WINDOWS",), False, ()
             ),
+            "windows-client/tools/Ensure-InnoSetupCompiler.ps1": (
+                ("WINDOWS",), False, ()
+            ),
+            "windows-client/tools/Install-WindowsCandidateForE2E.ps1": (
+                ("WINDOWS",), False, ()
+            ),
         }
         for path, expected in cases.items():
             with self.subTest(path=path):

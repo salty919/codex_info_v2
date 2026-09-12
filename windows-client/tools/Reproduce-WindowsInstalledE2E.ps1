@@ -9,6 +9,8 @@ param(
 
     [string]$ClientPath = '',
     [string]$OutputDirectory = '',
+    [string]$CandidateOutputDirectory = 'artifacts/windows-installer',
+    [switch]$PrepareCandidate,
     [switch]$CleanupInstallation
 )
 
@@ -25,14 +27,14 @@ if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
 
 $runner = Join-Path $PSScriptRoot 'Run-WindowsClientE2E.ps1'
 $moveSmoke = Join-Path $repositoryRoot 'scripts/windows_window_move_smoke.ps1'
+$ensureCompiler = Join-Path $PSScriptRoot 'Ensure-InnoSetupCompiler.ps1'
+$buildInstaller = Join-Path $PSScriptRoot 'Build-WindowsInstaller.ps1'
+$installCandidate = Join-Path $PSScriptRoot 'Install-WindowsCandidateForE2E.ps1'
 if (-not (Test-Path -LiteralPath $runner -PathType Leaf)) {
     throw "Windows UI E2E runner is missing: $runner"
 }
 if (-not (Test-Path -LiteralPath $moveSmoke -PathType Leaf)) {
     throw "Physical window-move smoke is missing: $moveSmoke"
-}
-if (-not (Test-Path -LiteralPath $ClientPath -PathType Leaf)) {
-    throw "Installed Windows client is missing: $ClientPath"
 }
 $versionPropsPath = Join-Path $repositoryRoot 'windows-client/Directory.Build.props'
 $versionDocument = [xml](Get-Content -LiteralPath $versionPropsPath -Raw)
@@ -42,6 +44,27 @@ if ($versionNodes.Count -ne 1) {
     throw 'Directory.Build.props must contain exactly one Version element.'
 }
 $expectedProductVersion = "$($versionNodes[0].InnerText.Trim())+$SourceSha"
+$installedMatches = (Test-Path -LiteralPath $ClientPath -PathType Leaf) -and
+    ((Get-Item -LiteralPath $ClientPath).VersionInfo.ProductVersion -ceq $expectedProductVersion)
+if ($PrepareCandidate -and -not $installedMatches) {
+    foreach ($requiredScript in ($ensureCompiler, $buildInstaller, $installCandidate)) {
+        if (-not (Test-Path -LiteralPath $requiredScript -PathType Leaf)) {
+            throw "Windows candidate preparation script is missing: $requiredScript"
+        }
+    }
+    if ([IO.Path]::IsPathRooted($CandidateOutputDirectory)) {
+        throw 'CandidateOutputDirectory must be relative to the repository root.'
+    }
+    & $ensureCompiler
+    & $buildInstaller -OutputDirectory $CandidateOutputDirectory -SourceSha $SourceSha
+    $candidateSetup = Join-Path $repositoryRoot `
+        (Join-Path $CandidateOutputDirectory 'CodexInfo.WindowsClient.Setup.exe')
+    & $installCandidate -SourceSha $SourceSha -CandidateSetup $candidateSetup `
+        -RetainSentinel:$CleanupInstallation
+}
+if (-not (Test-Path -LiteralPath $ClientPath -PathType Leaf)) {
+    throw "Installed Windows client is missing: $ClientPath"
+}
 $actualProductVersion = (Get-Item -LiteralPath $ClientPath).VersionInfo.ProductVersion
 if ($actualProductVersion -cne $expectedProductVersion) {
     throw "Installed client identity mismatch: expected $expectedProductVersion, found $actualProductVersion"
