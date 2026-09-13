@@ -401,7 +401,14 @@ converge_enable_links() {
 probe_active() {
     local unit="$1" status=0
     systemctl_user is-active --quiet "$unit" >/dev/null 2>&1 || status="$?"
-    case "$status" in 0) return 0 ;; 3) return 1 ;; *) die "could not inspect active state for $unit" ;; esac
+    case "$status" in
+        0) return 0 ;;
+        # systemd reports an inactive known unit as 3 and a unit which has
+        # not been published yet as 4.  Both are the same inactive pre-state
+        # during the one-way combined-service to split-service migration.
+        3|4) return 1 ;;
+        *) die "could not inspect active state for $unit" ;;
+    esac
 }
 now_unix() {
     local value
@@ -421,18 +428,12 @@ sleep_interval() {
     fi
 }
 wait_inactive() {
-    local unit="$1" now deadline status
+    local unit="$1" now deadline
     now="$(now_unix)" || return 1
     deadline=$(( now + STOP_TIMEOUT ))
     if (( operation_deadline > 0 && operation_deadline < deadline )); then deadline=$operation_deadline; fi
     while :; do
-        status=0
-        timeout --foreground "$STOP_TIMEOUT" "$SYSTEMCTL_BIN" --user is-active --quiet "$unit" >/dev/null 2>&1 || status="$?"
-        case "$status" in
-            3) return 0 ;;
-            0) ;;
-            *) return 1 ;;
-        esac
+        probe_active "$unit" || return 0
         now="$(now_unix)" || return 1
         (( now < deadline )) || return 1
         sleep_interval 1

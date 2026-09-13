@@ -130,6 +130,7 @@ CREATE TABLE session_checkpoints (
     previous_output TEXT NOT NULL,
     last_task_running INTEGER CHECK (last_task_running IS NULL OR last_task_running IN (0, 1)),
     previous_cache_write_input TEXT,
+    history_base_pending INTEGER NOT NULL DEFAULT 0 CHECK (history_base_pending IN (0, 1)),
     PRIMARY KEY (
         root_identity,
         relative_path,
@@ -1178,6 +1179,7 @@ pub struct SessionCheckpoint {
     pub prefix_sha256: String,
     pub fully_attributed_from_zero: bool,
     pub token_baseline_known: bool,
+    pub history_base_pending: bool,
     pub last_model: Option<String>,
     pub last_task_running: Option<bool>,
     pub previous_total: u64,
@@ -6537,6 +6539,7 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
                 ("previous_output", "TEXT", 0),
                 ("last_task_running", "INTEGER", 0),
                 ("previous_cache_write_input", "TEXT", 0),
+                ("history_base_pending", "INTEGER", 0),
             ],
         ),
         (
@@ -6826,10 +6829,16 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
         let legacy_history_continuity = *table == "history_continuity"
             && actual.len() + 1 == expected.len()
             && actual == expected[..actual.len()];
-        let legacy_cache_write_columns =
-            matches!(*table, "session_checkpoints" | "session_model_totals")
-                && actual.len() + 1 == expected.len()
-                && actual == expected[..actual.len()];
+        let legacy_cache_write_columns = *table == "session_model_totals"
+            && actual.len() + 1 == expected.len()
+            && actual == expected[..actual.len()];
+        let legacy_history_base_pending = *table == "session_checkpoints"
+            && actual.len() + 1 == expected.len()
+            && actual == expected[..actual.len()];
+        let legacy_session_checkpoint_suffix = *table == "session_checkpoints"
+            && actual.len() < expected.len()
+            && actual.len() + 2 >= expected.len()
+            && actual == expected[..actual.len()];
         let legacy_storage_partition_login_id = *table == "storage_partition"
             && schema_version < 9
             && actual.len() + 1 == expected.len()
@@ -6843,11 +6852,13 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
                     && actual == legacy_recorder_gap_ledger_columns())
                     || (*table == "session_checkpoints"
                         && actual == legacy_session_checkpoint_columns())
+                    || legacy_session_checkpoint_suffix
                     || legacy_history_continuity
                     || legacy_cache_write_columns
                     || legacy_storage_partition_login_id))
             && !legacy_active_thread_snapshot_columns
             && !legacy_storage_partition_login_id
+            && !legacy_history_base_pending
         {
             return Err(UsageStoreError::InvalidImport(format!(
                 "account partition {table} schema mismatch"
@@ -7251,7 +7262,28 @@ fn ensure_session_checkpoint_schema(transaction: &rusqlite::Transaction<'_>) -> 
             transaction.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])?;
         }
     }
+    if !session_checkpoint_history_base_column_present(transaction)? {
+        transaction.execute(
+            "ALTER TABLE session_checkpoints
+             ADD COLUMN history_base_pending INTEGER NOT NULL DEFAULT 0
+             CHECK (history_base_pending IN (0, 1))",
+            [],
+        )?;
+    }
     Ok(())
+}
+
+fn session_checkpoint_history_base_column_present(connection: &Connection) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('session_checkpoints')
+                WHERE name = 'history_base_pending'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
 }
 
 fn cache_write_column_present(connection: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -9437,13 +9469,26 @@ impl UsageStore {
             "SELECT root_identity, relative_path, file_device, file_inode,
                     committed_offset, discard_until_lf, collector_epoch, cycle_seq,
                     prefix_generation, prefix_sha256, fully_attributed_from_zero,
-                    token_baseline_known, last_model, {task_running_column}, previous_total, previous_input,
+                    token_baseline_known, {history_base_column}, last_model,
+                    {task_running_column}, previous_total, previous_input,
                     previous_cached_input, previous_output, {cache_write_column}
              FROM session_checkpoints
-             ORDER BY root_identity, relative_path, file_device, file_inode, prefix_generation"
-        , cache_write_column = if cache_write_column_present(&transaction, "session_checkpoints", "previous_cache_write_input")? {
-            "previous_cache_write_input"
-        } else { "NULL" });
+             ORDER BY root_identity, relative_path, file_device, file_inode, prefix_generation",
+            history_base_column = if session_checkpoint_history_base_column_present(&transaction)? {
+                "history_base_pending"
+            } else {
+                "0"
+            },
+            cache_write_column = if cache_write_column_present(
+                &transaction,
+                "session_checkpoints",
+                "previous_cache_write_input"
+            )? {
+                "previous_cache_write_input"
+            } else {
+                "NULL"
+            }
+        );
         let checkpoints = {
             let mut checkpoint_statement = transaction.prepare(&checkpoint_query)?;
             let rows = checkpoint_statement.query_map([], |row| {
@@ -9477,31 +9522,32 @@ impl UsageStore {
                     prefix_sha256: row.get(9)?,
                     fully_attributed_from_zero: row.get::<_, i64>(10)? == 1,
                     token_baseline_known: row.get::<_, i64>(11)? == 1,
-                    last_model: row.get(12)?,
-                    last_task_running: match row.get::<_, Option<i64>>(13)? {
+                    history_base_pending: row.get::<_, i64>(12)? == 1,
+                    last_model: row.get(13)?,
+                    last_task_running: match row.get::<_, Option<i64>>(14)? {
                         None => None,
                         Some(0) => Some(false),
                         Some(1) => Some(true),
                         Some(_) => return Err(rusqlite::Error::InvalidQuery),
                     },
                     previous_total: row
-                        .get::<_, String>(14)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    previous_input: row
                         .get::<_, String>(15)?
                         .parse()
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    previous_cached_input: row
+                    previous_input: row
                         .get::<_, String>(16)?
                         .parse()
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    previous_output: row
+                    previous_cached_input: row
                         .get::<_, String>(17)?
                         .parse()
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    previous_output: row
+                        .get::<_, String>(18)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
                     previous_cache_write_input: row
-                        .get::<_, Option<String>>(18)?
+                        .get::<_, Option<String>>(19)?
                         .map(|text| {
                             text.parse::<u64>()
                                 .map_err(|_| rusqlite::Error::InvalidQuery)
@@ -11401,11 +11447,12 @@ impl UsageStore {
                     root_identity, relative_path, file_device, file_inode,
                     committed_offset, discard_until_lf, collector_epoch, cycle_seq,
                     prefix_generation, prefix_sha256, fully_attributed_from_zero,
-                    token_baseline_known, last_model, last_task_running, previous_total, previous_input,
+                    token_baseline_known, history_base_pending, last_model,
+                    last_task_running, previous_total, previous_input,
                     previous_cached_input, previous_output, previous_cache_write_input
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                    ?14, ?15, ?16, ?17, ?18, ?19
+                    ?14, ?15, ?16, ?17, ?18, ?19, ?20
                  )
                  ON CONFLICT (
                     root_identity, relative_path, file_device, file_inode, prefix_generation
@@ -11417,6 +11464,7 @@ impl UsageStore {
                     prefix_sha256 = excluded.prefix_sha256,
                     fully_attributed_from_zero = excluded.fully_attributed_from_zero,
                     token_baseline_known = excluded.token_baseline_known,
+                    history_base_pending = excluded.history_base_pending,
                     last_model = excluded.last_model,
                     last_task_running = excluded.last_task_running,
                     previous_total = excluded.previous_total,
@@ -11439,6 +11487,7 @@ impl UsageStore {
                     &checkpoint.prefix_sha256,
                     i64::from(checkpoint.fully_attributed_from_zero),
                     i64::from(checkpoint.token_baseline_known),
+                    i64::from(checkpoint.history_base_pending),
                     checkpoint.last_model.as_deref(),
                     checkpoint.last_task_running.map(i64::from),
                     checkpoint.previous_total.to_string(),
@@ -12688,6 +12737,7 @@ mod tests {
             prefix_sha256: "00".repeat(32),
             fully_attributed_from_zero: true,
             token_baseline_known: true,
+            history_base_pending: false,
             last_model: Some("SOL".into()),
             last_task_running: None,
             previous_total: 20,
@@ -12821,6 +12871,13 @@ mod tests {
             .connection
             .execute(
                 "ALTER TABLE session_checkpoints DROP COLUMN last_task_running",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "ALTER TABLE session_checkpoints DROP COLUMN history_base_pending",
                 [],
             )
             .unwrap();
