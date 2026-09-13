@@ -3805,6 +3805,7 @@ fn initial_source_baseline_checkpoint(
         prefix_sha256: EMPTY_SHA256.to_owned(),
         fully_attributed_from_zero: false,
         token_baseline_known: false,
+        history_base_pending: false,
         last_model: None,
         last_task_running: None,
         previous_total: 0,
@@ -4060,12 +4061,18 @@ fn scan_source(
     if before_path.file_type().is_symlink() || !before_path.is_file() {
         return Ok(None);
     }
-    let before_file = fs::metadata(&source.path)?;
-    if before_file.len() != source.recorded.file_bytes
+    let mut file = File::open(&source.path)?;
+    let before_file = file.metadata()?;
+    if before_file.len() < source.recorded.file_bytes
         || file_identity(&before_file) != (source.recorded.file_device, source.recorded.file_inode)
     {
         return Ok(None);
     }
+    // Inventory and scan are separate bounded phases. Growth between them is
+    // the normal append-only case, so freeze the prefix visible at open and
+    // leave any later bytes for the next cycle. A shrink or identity change
+    // still rejects the source without admitting a guessed boundary.
+    let snapshot_len = before_file.len();
     // A byte offset is valid only for the same physical file. If a restore
     // changes inode, scan from zero and re-synchronize on the durable token
     // vector below instead of guessing that the old byte boundary survived.
@@ -4076,7 +4083,7 @@ fn scan_source(
             && checkpoint.relative_path == source.recorded.relative_path
             && checkpoint.file_device == source.recorded.file_device
             && checkpoint.file_inode == source.recorded.file_inode
-            && checkpoint.committed_offset <= before_file.len()
+            && checkpoint.committed_offset <= snapshot_len
     });
     let recovery_anchor = (!baseline_existing)
         .then_some(prior)
@@ -4096,6 +4103,7 @@ fn scan_source(
         mut discard_until_lf,
         mut fully_attributed,
         mut baseline_known,
+        mut history_base_pending,
         mut last_model,
         mut last_task_running,
         mut previous,
@@ -4107,6 +4115,7 @@ fn scan_source(
             checkpoint.discard_until_lf,
             checkpoint.fully_attributed_from_zero,
             checkpoint.token_baseline_known,
+            checkpoint.history_base_pending,
             checkpoint.last_model.clone(),
             checkpoint.last_task_running,
             TokenSnapshot {
@@ -4126,13 +4135,14 @@ fn scan_source(
         // skewed or an old event is appended late. Persist only the EOF
         // checkpoint; the first append after this boundary is handled by the
         // next cycle.
-        let boundary_offset = before_file.len();
+        let boundary_offset = snapshot_len;
         let discard_until_lf = session_file_has_partial_tail(&source.path, boundary_offset)?;
         let (prefix_generation, prefix_sha256) =
             session_boundary_lineage(collector_epoch, &source.recorded, prior, boundary_offset);
         (
             boundary_offset,
             discard_until_lf,
+            false,
             false,
             false,
             None,
@@ -4147,6 +4157,7 @@ fn scan_source(
             false,
             prior.is_none() && !baseline_existing,
             prior.is_none() && !baseline_existing && !baseline_first_counter,
+            false,
             None,
             None,
             TokenSnapshot::default(),
@@ -4154,13 +4165,13 @@ fn scan_source(
             EMPTY_SHA256.to_owned(),
         )
     };
-    if start_offset > before_file.len() {
+    if start_offset > snapshot_len {
         return Ok(None);
     }
 
     let resumed_partial = discard_until_lf;
-    let mut reader = BufReader::new(File::open(&source.path)?);
-    reader.seek(SeekFrom::Start(start_offset))?;
+    file.seek(SeekFrom::Start(start_offset))?;
+    let mut reader = BufReader::new(file.take(snapshot_len - start_offset));
     let admitted_start = start_offset;
     let mut physical_offset = start_offset;
     let mut consumed_bytes = 0_u64;
@@ -4180,7 +4191,6 @@ fn scan_source(
     let mut recovery_stream_events = Vec::new();
     let mut recovery_stream_proven = true;
     let mut recovery_last = None;
-    let mut history_base_pending = false;
     let mut token_count_seen = false;
     let mut read_any = false;
     let mut record_index = 0_u64;
@@ -4413,12 +4423,12 @@ fn scan_source(
     }
 
     let end_offset = unresolved_start.unwrap_or(physical_offset);
-    let after_file = reader.get_ref().metadata()?;
+    let after_file = reader.get_ref().get_ref().metadata()?;
     let after_path = fs::symlink_metadata(&source.path)?;
     if after_path.file_type().is_symlink()
         || !after_path.is_file()
         || file_identity(&after_file) != file_identity(&before_file)
-        || after_file.len() < end_offset
+        || after_file.len() < snapshot_len
     {
         return Ok(None);
     }
@@ -4496,6 +4506,7 @@ fn scan_source(
         prefix_sha256,
         fully_attributed_from_zero: fully_attributed,
         token_baseline_known: baseline_known,
+        history_base_pending,
         last_model,
         last_task_running,
         previous_total: previous.total,
@@ -6707,6 +6718,7 @@ mod tests {
                 prefix_sha256: EMPTY_SHA256.to_owned(),
                 fully_attributed_from_zero: true,
                 token_baseline_known: true,
+                history_base_pending: false,
                 last_model: None,
                 last_task_running: None,
                 previous_total: 0,
@@ -6776,6 +6788,7 @@ mod tests {
                 prefix_sha256: EMPTY_SHA256.to_owned(),
                 fully_attributed_from_zero: true,
                 token_baseline_known: true,
+                history_base_pending: false,
                 last_model: None,
                 last_task_running: None,
                 previous_total: 0,
@@ -6914,6 +6927,7 @@ mod tests {
             prefix_sha256: EMPTY_SHA256.to_owned(),
             fully_attributed_from_zero: true,
             token_baseline_known: true,
+            history_base_pending: false,
             last_model: None,
             last_task_running: None,
             previous_total: 0,
@@ -7413,23 +7427,40 @@ mod tests {
     }
 
     #[test]
-    fn paginated_history_base_uses_last_usage_before_total_deltas() {
+    fn paginated_history_base_survives_cycle_and_restart_before_first_token() {
         let (root, database) = prepare("paginated-history-base");
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "ALTER TABLE session_checkpoints DROP COLUMN history_base_pending",
+                [],
+            )
+            .unwrap();
         let source = root.join("sessions/one.jsonl");
         let now = Utc::now().timestamp();
         let session_meta =
             "{\"type\":\"session_meta\",\"payload\":{\"history_mode\":\"paginated\",\"history_base\":{\"id\":\"prior\"}}}\n";
-        fs::write(
-            &source,
-            format!(
-                "{}{}{}",
-                session_meta,
-                paginated_token(2_049_976_186, 111_860, now),
-                token(2_049_976_193, now + 1)
-            ),
-        )
-        .unwrap();
+        fs::write(&source, session_meta).unwrap();
 
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        assert!(recorder.state().unwrap().checkpoints[0].history_base_pending);
+        drop(recorder);
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}{}",
+                    paginated_token(2_049_976_186, 111_860, now),
+                    token(2_049_976_193, now + 1)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
         let mut recorder =
             Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
         recorder.run_cycle().unwrap().unwrap();
@@ -7444,6 +7475,82 @@ mod tests {
                 cache_write_input: None,
             }
         );
+        assert!(!recorder.state().unwrap().checkpoints[0].history_base_pending);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn append_after_inventory_is_scanned_from_a_fixed_prefix_without_degraded_state() {
+        let root = temp_root("append-after-inventory");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("one.jsonl");
+        let now = Utc::now().timestamp();
+        let first = token(10, now);
+        fs::write(&path, &first).unwrap();
+
+        let root_metadata = fs::metadata(&sessions).unwrap();
+        let recorded = recorded_source(
+            root_identity(&sessions, &root_metadata),
+            "one.jsonl".to_owned(),
+            fs::metadata(&path).unwrap(),
+        );
+        let collector_epoch = 7;
+        let prefix_sha256 = sha256_file_range(&path, 0, first.len() as u64).unwrap();
+        let checkpoint = SessionCheckpoint {
+            root_identity: recorded.root_identity.clone(),
+            relative_path: recorded.relative_path.clone(),
+            file_device: recorded.file_device,
+            file_inode: recorded.file_inode,
+            committed_offset: first.len() as u64,
+            discard_until_lf: false,
+            collector_epoch,
+            cycle_seq: 1,
+            prefix_generation: prefix_generation(collector_epoch, &recorded, &prefix_sha256),
+            prefix_sha256,
+            fully_attributed_from_zero: true,
+            token_baseline_known: true,
+            history_base_pending: false,
+            last_model: None,
+            last_task_running: None,
+            previous_total: 10,
+            previous_input: 10,
+            previous_cached_input: 0,
+            previous_output: 0,
+            previous_cache_write_input: None,
+        };
+        let second = token(15, now + 1);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(second.as_bytes())
+            .unwrap();
+
+        let source = Source { path, recorded };
+        let mut totals = ModelTotals::default();
+        let mut events = Vec::new();
+        let outcome = scan_source(
+            &source,
+            Some(&checkpoint),
+            false,
+            false,
+            collector_epoch,
+            2,
+            now + 60,
+            now - 60,
+            4096,
+            &mut totals,
+            &mut events,
+        )
+        .unwrap()
+        .expect("same-inode append after inventory must remain collectable");
+
+        assert!(!outcome.unresolved);
+        assert!(outcome.pending.is_empty());
+        assert_eq!(outcome.range.unwrap().start_offset, first.len() as u64);
+        assert_eq!(totals.to_totals()[0].total_tokens, 5);
+        assert_eq!(events.len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -8011,6 +8118,7 @@ mod tests {
             prefix_sha256: EMPTY_SHA256.to_owned(),
             fully_attributed_from_zero: true,
             token_baseline_known: true,
+            history_base_pending: false,
             last_model: Some("gpt-5.6-sol".to_owned()),
             last_task_running: Some(true),
             previous_total: 42,
@@ -8065,6 +8173,7 @@ mod tests {
             prefix_sha256: EMPTY_SHA256.to_owned(),
             fully_attributed_from_zero: true,
             token_baseline_known: true,
+            history_base_pending: false,
             last_model: Some("gpt-5.6-sol".to_owned()),
             last_task_running: Some(true),
             previous_total: 42,

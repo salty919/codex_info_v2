@@ -10800,6 +10800,7 @@ fn same_session_checkpoint_state(
         && left.prefix_sha256 == right.prefix_sha256
         && left.fully_attributed_from_zero == right.fully_attributed_from_zero
         && left.token_baseline_known == right.token_baseline_known
+        && left.history_base_pending == right.history_base_pending
         && left.last_task_running == right.last_task_running
         && left.last_model == right.last_model
         && left.previous_total == right.previous_total
@@ -11077,6 +11078,7 @@ fn collect_session_append(
         prefix_sha256,
         fully_attributed_from_zero: fully_attributed,
         token_baseline_known: baseline_known,
+        history_base_pending: false,
         last_task_running,
         last_model: model.as_deref().and_then(ModelUsageTotals::canonical_model),
         previous_total: previous.total,
@@ -28823,6 +28825,7 @@ mod tests {
             prefix_sha256: "22".repeat(32),
             fully_attributed_from_zero: true,
             token_baseline_known: true,
+            history_base_pending: false,
             last_model: Some("LUNA".into()),
             last_task_running: Some(false),
             previous_total: 686_397,
@@ -28926,6 +28929,7 @@ mod tests {
             prefix_sha256: "22".repeat(32),
             fully_attributed_from_zero: true,
             token_baseline_known: true,
+            history_base_pending: false,
             last_model: Some("SOL".into()),
             last_task_running: Some(true),
             previous_total: 100,
@@ -29080,6 +29084,7 @@ mod tests {
                 prefix_sha256: "00".repeat(32),
                 fully_attributed_from_zero: true,
                 token_baseline_known: true,
+                history_base_pending: false,
                 last_model: None,
                 last_task_running: None,
                 previous_total: 0,
@@ -30520,6 +30525,7 @@ mod tests {
             prefix_sha256: "11".repeat(32),
             fully_attributed_from_zero: true,
             token_baseline_known: true,
+            history_base_pending: false,
             last_task_running: None,
             last_model: Some("SOL".into()),
             previous_total: 100,
@@ -32873,6 +32879,7 @@ mod tests {
             prefix_sha256: "11".repeat(32),
             fully_attributed_from_zero: true,
             token_baseline_known: true,
+            history_base_pending: false,
             last_task_running: Some(true),
             last_model: Some("SOL".into()),
             previous_total: 100,
@@ -35465,6 +35472,7 @@ mod tests {
                     prefix_sha256: "11".repeat(32),
                     fully_attributed_from_zero,
                     token_baseline_known: fully_attributed_from_zero,
+                    history_base_pending: false,
                     last_task_running: None,
                     last_model: fully_attributed_from_zero.then(|| "SOL".into()),
                     previous_total: u64::from(fully_attributed_from_zero) * 129,
@@ -35593,6 +35601,7 @@ mod tests {
                     prefix_sha256: "33".repeat(32),
                     fully_attributed_from_zero: false,
                     token_baseline_known: true,
+                    history_base_pending: false,
                     last_task_running: None,
                     last_model: Some("SOL".into()),
                     previous_total: 229,
