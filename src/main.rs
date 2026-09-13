@@ -3827,6 +3827,29 @@ fn v3_model_by_name<'a>(
     models?.iter().find(|model| model.model == name)
 }
 
+fn history_model_dollars(model: &PublicHistoryModelUsageV3) -> Option<f64> {
+    if let Some(dollars) = model.total_dollars {
+        return (dollars.is_finite() && dollars >= 0.0).then_some(dollars);
+    }
+    if model.model != "ASTRA" {
+        return None;
+    }
+
+    let input = model.input_tokens?;
+    let cached = model.cached_input_tokens?;
+    let writes = model.cache_write_input_tokens?;
+    let output = model.output_tokens?;
+    let ordinary = input.checked_sub(cached)?.checked_sub(writes)?;
+    let (input_rate, cached_rate, write_rate, output_rate) = ASTRA_PRICE_PER_MILLION;
+    Some(
+        (ordinary as f64 * input_rate
+            + cached as f64 * cached_rate
+            + writes as f64 * write_rate
+            + output as f64 * output_rate)
+            / 1_000_000.0,
+    )
+}
+
 fn main_sample_from_public_observation_v3(
     observation: &PublicHistoryObservationV3,
 ) -> Option<UsageHistorySample> {
@@ -17571,9 +17594,11 @@ impl CodexInfoState {
             points.insert(
                 minute,
                 GraphModelPoint {
-                    // Historical prices are observations, not a function of
-                    // today's tariff.  Missing dollars remain unknown.
-                    dollar: model.total_dollars.unwrap_or(-1.0),
+                    // Stored historical dollars remain authoritative. ASTRA
+                    // is the sole exception defined by ASTRA-COST-01: the UI
+                    // may derive its display value from a complete, internally
+                    // consistent historical token vector.
+                    dollar: history_model_dollars(model).unwrap_or(-1.0),
                     tokens: model.total_tokens as f64,
                     raw_tokens: Some(model.total_tokens),
                     origin,
@@ -44098,10 +44123,10 @@ mod tests {
                 .map(|point| (point.dollar, point.tokens, point.origin))
                 .collect::<Vec<_>>(),
             [
-                (-1.0, 1_000_000.0, super::GraphModelOrigin::LegacyObserved),
-                (-1.0, 2_000_000.0, super::GraphModelOrigin::LegacyObserved),
-                (-1.0, 3_000_000.0, super::GraphModelOrigin::Direct),
-                (-1.0, 4_000_000.0, super::GraphModelOrigin::Direct),
+                (10.0, 1_000_000.0, super::GraphModelOrigin::LegacyObserved),
+                (20.0, 2_000_000.0, super::GraphModelOrigin::LegacyObserved),
+                (30.0, 3_000_000.0, super::GraphModelOrigin::Direct),
+                (40.0, 4_000_000.0, super::GraphModelOrigin::Direct),
             ]
         );
         let paths = client.graph_paths_for_selection_at_with_astra(
@@ -44113,9 +44138,9 @@ mod tests {
             false,
         );
         assert!(paths.astra_flat.is_empty());
-        assert!(paths.astra_rising.is_empty());
-        assert!(paths.astra_inferred.is_empty());
-        assert!(paths.current_astra_label.is_empty());
+        assert!(!paths.astra_rising.is_empty());
+        assert!(!paths.astra_inferred.is_empty());
+        assert_eq!(paths.current_astra_label, "$40.00");
         let luna_points = client.graph_model_points_for_selection(
             historical.reset_at,
             historical.start_at,
