@@ -247,20 +247,32 @@ is_uint() {
 }
 
 wait_for_quota_observation() {
+    local minimum_inclusive="${1:-1}"
     local row="" observed="" reset="" window=""
+    is_uint "$minimum_inclusive" || return 1
     for _ in $(seq 1 80); do
-        row="$(read_sql '
-            SELECT h.timestamp || "|" || h.reset_at || "|" || c.window_seconds
-            FROM usage_history AS h
+        row="$(read_sql "
+            SELECT json_extract(d.snapshot_json, '$.source_timestamp')
+                   || '|' || json_extract(d.snapshot_json, '$.reset_at')
+                   || '|' || c.window_seconds
+            FROM durable_state AS d
             JOIN collection_generation AS c
-              ON c.singleton = 1 AND c.reset_at = h.reset_at
-            WHERE h.remaining_percent IS NOT NULL
-            ORDER BY h.timestamp DESC
+              ON c.singleton = 1
+             AND c.reset_at = json_extract(d.snapshot_json, '$.reset_at')
+            WHERE d.singleton >= 2
+              AND json_valid(d.snapshot_json)
+              AND json_type(d.snapshot_json, '$.source_timestamp') = 'integer'
+              AND json_type(d.snapshot_json, '$.remaining_percent')
+                  IN ('integer', 'real')
+            ORDER BY json_extract(d.snapshot_json, '$.source_timestamp') DESC,
+                     d.data_generation DESC,
+                     d.singleton DESC
             LIMIT 1
-        ' 2>/dev/null || true)"
+        " 2>/dev/null || true)"
         IFS='|' read -r observed reset window <<<"$row"
         if is_uint "$observed" && is_uint "$reset" && is_uint "$window" \
             && ((10#$observed > 0 && 10#$reset > 0 && 10#$window > 0 \
+                && 10#$observed >= 10#$minimum_inclusive \
                 && 10#$observed >= 10#$reset - 10#$window \
                 && 10#$observed <= 10#$reset)); then
             printf '%s\n' "$observed"
@@ -269,6 +281,32 @@ wait_for_quota_observation() {
         sleep 0.25
     done
     return 1
+}
+
+read_account_activation() {
+    python3 - "$case_data/history/account_profile_v1.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    document = json.load(source)
+accounts = document.get("accounts")
+if not isinstance(accounts, dict) or len(accounts) != 1:
+    raise SystemExit(1)
+entry = next(iter(accounts.values()))
+intervals = entry.get("lifecycle_intervals")
+if not isinstance(intervals, list) or len(intervals) != 1:
+    raise SystemExit(1)
+current = intervals[0]
+if not isinstance(current, dict) or current.get("end_at") is not None:
+    raise SystemExit(1)
+activation = current.get("start_at")
+if not isinstance(activation, int) or isinstance(activation, bool) or activation <= 0:
+    raise SystemExit(1)
+if entry.get("activation_timestamp") != activation:
+    raise SystemExit(1)
+print(activation)
+PY
 }
 
 write_fixture() {
@@ -386,16 +424,16 @@ collection_generation_state() {
     read_sql 'SELECT data_generation || "|" || COALESCE(collector_epoch, "") || "|" || cycle_seq FROM collection_generation WHERE singleton = 1'
 }
 
-matching_range_count() {
-    local epoch="$1" cycle="$2"
-    [[ "$epoch" =~ ^[0-9a-f]{32}$ && "$cycle" =~ ^[0-9]+$ ]] || return 1
-    read_sql "SELECT COUNT(*) FROM session_ranges WHERE collector_epoch='$epoch' AND cycle_seq='$cycle'"
+canonical_range_count() {
+    local epoch="$1"
+    [[ "$epoch" =~ ^[0-9a-f]{32}$ ]] || return 1
+    read_sql "SELECT COUNT(*) FROM session_ranges WHERE collector_epoch='$epoch'"
 }
 
-matching_checkpoint_offset() {
-    local epoch="$1" cycle="$2"
-    [[ "$epoch" =~ ^[0-9a-f]{32}$ && "$cycle" =~ ^[0-9]+$ ]] || return 1
-    read_sql "SELECT COALESCE(MAX(committed_offset),0) FROM session_checkpoints WHERE collector_epoch='$epoch' AND cycle_seq='$cycle'"
+canonical_checkpoint_offset() {
+    local epoch="$1"
+    [[ "$epoch" =~ ^[0-9a-f]{32}$ ]] || return 1
+    read_sql "SELECT COALESCE(MAX(committed_offset),0) FROM session_checkpoints WHERE collector_epoch='$epoch'"
 }
 
 canonical_model_total() {
@@ -403,27 +441,24 @@ canonical_model_total() {
 }
 
 recorder_projection_snapshot() {
-    local state generation epoch cycle matching_ranges checkpoint total_ranges models
+    local state generation epoch cycle checkpoint ranges models
     state="$(collection_generation_state)" || return 1
     IFS='|' read -r generation epoch cycle <<<"$state"
-    matching_ranges="$(matching_range_count "$epoch" "$cycle")" || return 1
-    checkpoint="$(matching_checkpoint_offset "$epoch" "$cycle")" || return 1
-    total_ranges="$(read_sql 'SELECT COUNT(*) FROM session_ranges')" || return 1
+    checkpoint="$(canonical_checkpoint_offset "$epoch")" || return 1
+    ranges="$(canonical_range_count "$epoch")" || return 1
     models="$(canonical_model_total)" || return 1
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$generation" "$epoch" "$cycle" "$matching_ranges" "$checkpoint" "$total_ranges" "$models"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$generation" "$epoch" "$cycle" "$checkpoint" "$ranges" "$models"
 }
 
 wait_for_recorder_generation() {
-    local minimum="$1" require_range="${2:-1}" snapshot="" generation="" epoch="" cycle="" matching_ranges="" checkpoint="" total_ranges="" models=""
+    local minimum="$1" snapshot="" generation="" epoch="" cycle="" checkpoint="" ranges="" models=""
     for _ in $(seq 1 80); do
         snapshot="$(recorder_projection_snapshot 2>/dev/null || true)"
-        IFS=$'\t' read -r generation epoch cycle matching_ranges checkpoint total_ranges models <<<"$snapshot"
+        IFS=$'\t' read -r generation epoch cycle checkpoint ranges models <<<"$snapshot"
         if valid_collection_snapshot "$generation" "$epoch" "$cycle" \
-            && is_uint "$matching_ranges" && is_uint "$checkpoint" \
-            && is_uint "$total_ranges" && is_uint "$models" \
-            && ((10#$generation >= minimum && 10#$checkpoint > 0)) \
-            && (( ! require_range || (10#$matching_ranges > 0 && 10#$total_ranges > 0) )); then
+            && is_uint "$checkpoint" && is_uint "$ranges" && is_uint "$models" \
+            && ((10#$generation >= minimum && 10#$checkpoint > 0)); then
             printf '%s\n' "$snapshot"
             return 0
         fi
@@ -589,21 +624,25 @@ PY
 wait_for_recorder_advance() {
     local before="$1" model_before="$2" ranges_before="$3" checkpoint_before="$4" require_quota="${5:-0}"
     local before_generation="" before_epoch="" before_cycle="" generation="" epoch="" cycle=""
-    local matching_ranges="" checkpoint="" total_ranges="" models="" history="" quota="" snapshot=""
+    local checkpoint="" ranges="" models="" history="" quota="" snapshot=""
     IFS='|' read -r before_generation before_epoch before_cycle <<<"$before"
     valid_collection_snapshot "$before_generation" "$before_epoch" "$before_cycle" || return 1
+    # collection_generation advances on every acknowledged heartbeat, while
+    # ranges and checkpoints retain the cycle that admitted their source
+    # bytes. Prove the append from durable growth relative to the baseline;
+    # equality with the moving current cycle would make success timing-only.
     for _ in $(seq 1 80); do
         process_matches_scope "$recorder_pid" recorder || return 1
         snapshot="$(recorder_projection_snapshot 2>/dev/null || true)"
-        IFS=$'\t' read -r generation epoch cycle matching_ranges checkpoint total_ranges models <<<"$snapshot"
+        IFS=$'\t' read -r generation epoch cycle checkpoint ranges models <<<"$snapshot"
         if valid_collection_snapshot "$generation" "$epoch" "$cycle" \
-            && is_uint "$matching_ranges" && is_uint "$checkpoint" \
-            && is_uint "$total_ranges" && is_uint "$models" \
+            && [[ "$epoch" == "$before_epoch" ]] \
+            && is_uint "$checkpoint" && is_uint "$ranges" && is_uint "$models" \
             && ((10#$generation > 10#$before_generation \
-                && 10#$total_ranges > 10#$ranges_before \
+                && 10#$cycle > 10#$before_cycle \
+                && 10#$ranges > 10#$ranges_before \
                 && 10#$checkpoint > 10#$checkpoint_before \
-                && 10#$models > 10#$model_before \
-                && 10#$matching_ranges > 0)); then
+                && 10#$models > 10#$model_before)); then
             if ((require_quota)); then
                 history="$(read_sql 'SELECT COUNT(*) FROM usage_history' 2>/dev/null || true)"
                 quota="$(read_sql 'SELECT COUNT(*) FROM usage_history WHERE remaining_percent IS NOT NULL' 2>/dev/null || true)"
@@ -686,25 +725,27 @@ for _ in $(seq 1 20); do
     sleep 0.1
 done
 assert_one_scoped_process recorder "$recorder_pid" 'recorder startup'
-baseline_snapshot="$(wait_for_recorder_generation 1 0 2>/dev/null || true)"
+baseline_snapshot="$(wait_for_recorder_generation 1 2>/dev/null || true)"
 [[ "$baseline_snapshot" != 0 ]] \
     || fail 'recorder did not produce the first durable generation/ack'
-IFS=$'\t' read -r baseline_generation baseline_epoch baseline_cycle baseline_matching_ranges baseline_checkpoint baseline_ranges baseline_model <<<"$baseline_snapshot"
+IFS=$'\t' read -r baseline_generation baseline_epoch baseline_cycle baseline_checkpoint baseline_ranges baseline_model <<<"$baseline_snapshot"
 valid_collection_snapshot "$baseline_generation" "$baseline_epoch" "$baseline_cycle" \
     || fail 'first recorder acknowledgement has invalid collection_generation identity'
-is_uint "$baseline_matching_ranges" && is_uint "$baseline_checkpoint" \
-    && is_uint "$baseline_ranges" && is_uint "$baseline_model" \
+is_uint "$baseline_checkpoint" && is_uint "$baseline_ranges" && is_uint "$baseline_model" \
     || fail 'first recorder acknowledgement has invalid range/checkpoint/model readback'
 
-# The new partition's physical EOF baseline and its quota period must both be
-# durable before this fixture appends account-owned usage.  Use the recorder's
-# admitted quota observation as the Session timestamp so the counter belongs
-# to both the account lifecycle and the canonical period without a wall-clock
-# race. The first counter is the post-boundary baseline; the second is its
-# first delta. No SQLite row is created directly by this fixture.
-fixture_event_time="$(wait_for_quota_observation 2>/dev/null || true)"
-is_uint "$fixture_event_time" && ((10#$fixture_event_time > 0)) \
-    || fail 'recorder did not publish a canonical quota observation before Session input'
+# The registry owns the inclusive account boundary. The quota observation's
+# exact source second (not usage_history's graph-minute bucket) proves that the
+# Session bytes belong to both the account lifecycle and the admitted period.
+# JSONL byte order owns counter order, so the baseline and delta may correctly
+# share this observed second without inventing timestamps or SQLite rows.
+fixture_activation_time="$(read_account_activation 2>/dev/null || true)"
+is_uint "$fixture_activation_time" && ((10#$fixture_activation_time > 0)) \
+    || fail 'recorder did not persist the account activation boundary'
+fixture_event_time="$(wait_for_quota_observation \
+    "$fixture_activation_time" 2>/dev/null || true)"
+is_uint "$fixture_event_time" && ((10#$fixture_event_time >= 10#$fixture_activation_time)) \
+    || fail 'recorder did not publish an account-owned quota observation before Session input'
 append_session_usage "$fixture_event_time" 240 200 160 40
 append_session_usage "$fixture_event_time" 360 300 240 60
 first_snapshot="$(wait_for_recorder_advance \
@@ -712,7 +753,7 @@ first_snapshot="$(wait_for_recorder_advance \
     "$baseline_ranges" "$baseline_checkpoint" 1 2>/dev/null || true)"
 [[ -n "$first_snapshot" && "$first_snapshot" != 0 ]] \
     || fail 'recorder did not produce non-empty quota/history/models from Session input'
-IFS=$'\t' read -r first_generation first_epoch first_cycle _ first_checkpoint first_ranges first_model <<<"$first_snapshot"
+IFS=$'\t' read -r first_generation first_epoch first_cycle first_checkpoint first_ranges first_model <<<"$first_snapshot"
 valid_collection_snapshot "$first_generation" "$first_epoch" "$first_cycle" \
     || fail 'first append acknowledgement has invalid collection_generation identity'
 assert_one_scoped_process recorder "$recorder_pid" 'recorder projection'
@@ -755,6 +796,9 @@ assert_no_scoped_process rest 'REST shutdown'
 process_matches_scope "$recorder_pid" recorder \
     || fail 'recorder stopped or changed executable during REST outage'
 
+# REST ownership ends at the HTTP projection. It does not own quota polling,
+# Session byte order, or recorder commits. Reuse the already-admitted event
+# second so this phase tests only a later source append during the REST outage.
 append_session_usage "$fixture_event_time" 480 400 320 80
 outage_snapshot=""
 outage_snapshot="$(wait_for_recorder_advance \
