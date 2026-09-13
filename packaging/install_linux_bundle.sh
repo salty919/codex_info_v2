@@ -428,18 +428,12 @@ sleep_interval() {
     fi
 }
 wait_inactive() {
-    local unit="$1" now deadline status
+    local unit="$1" now deadline
     now="$(now_unix)" || return 1
     deadline=$(( now + STOP_TIMEOUT ))
     if (( operation_deadline > 0 && operation_deadline < deadline )); then deadline=$operation_deadline; fi
     while :; do
-        status=0
-        timeout --foreground "$STOP_TIMEOUT" "$SYSTEMCTL_BIN" --user is-active --quiet "$unit" >/dev/null 2>&1 || status="$?"
-        case "$status" in
-            3) return 0 ;;
-            0) ;;
-            *) return 1 ;;
-        esac
+        probe_active "$unit" || return 0
         now="$(now_unix)" || return 1
         (( now < deadline )) || return 1
         sleep_interval 1
