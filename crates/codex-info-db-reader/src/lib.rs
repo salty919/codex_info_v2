@@ -1769,7 +1769,7 @@ fn read_history_projection_for_intervals(
     task_evidence: &TaskActivityEvidence,
     intervals: &ReadIntervals,
 ) -> Result<Vec<PublicHistoryObservationV3>, ReaderError> {
-    let observations =
+    let (observations, provenance_generations) =
         read_stored_history_observations_for_intervals(connection, cutoff, observed_at, intervals)?;
     let model_groups =
         read_history_model_groups_for_intervals(connection, cutoff, observed_at, intervals)?;
@@ -1807,10 +1807,17 @@ fn read_history_projection_for_intervals(
         let group = model_groups.get(&(sample.reset_at, sample.timestamp));
         let model_source = stored
             .map(|observation| observation.model_source)
-            // Missing or malformed provenance is not evidence that a row was
-            // explicitly saved as legacy. Keep its quota/time metadata while
-            // failing closed for every model value.
-            .unwrap_or(HistoryModelSource::Unavailable);
+            // A valid usage_history row with no durable provenance is the
+            // pre-provenance legacy format. A durable record at the same
+            // generation that is malformed or belongs to another exact key
+            // remains unavailable instead of being downgraded to legacy.
+            .unwrap_or_else(|| {
+                if provenance_generations.contains(&sample.timestamp) {
+                    HistoryModelSource::Unavailable
+                } else {
+                    HistoryModelSource::LegacyUnknown
+                }
+            });
         let group_models_complete = group.is_some_and(HistoryModelGroup::model_set_complete);
         let source = if model_source == HistoryModelSource::Unavailable {
             HistoryModelSource::Unavailable
@@ -1833,7 +1840,7 @@ fn read_history_projection_for_intervals(
         ) {
             None
         } else {
-            history_models_v3(group, sample)
+            history_models_v3(group, sample, models_complete)
         };
         history.insert(
             (sample.reset_at, sample.timestamp),
@@ -2338,9 +2345,9 @@ fn read_stored_history_observations_for_intervals(
     cutoff: i64,
     observed_at: i64,
     intervals: &ReadIntervals,
-) -> Result<Vec<StoredHistoryObservation>, ReaderError> {
+) -> Result<(Vec<StoredHistoryObservation>, BTreeSet<i64>), ReaderError> {
     if !table_exists(connection, "durable_state")? {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), BTreeSet::new()));
     }
     let mut statement = connection.prepare(
         "SELECT singleton, data_generation, snapshot_json
@@ -2350,10 +2357,17 @@ fn read_stored_history_observations_for_intervals(
     )?;
     let mut rows = statement.query(params![cutoff, observed_at])?;
     let mut observations = BTreeMap::<(i64, i64), StoredHistoryObservation>::new();
+    let mut provenance_generations = BTreeSet::new();
     while let Some(row) = rows.next()? {
         let Some(data_generation) = sql_i64(row, 1) else {
             continue;
         };
+        if !valid_public_timestamp(data_generation)
+            || !intervals.intersects_canonical_minute(data_generation)
+        {
+            continue;
+        }
+        provenance_generations.insert(data_generation);
         let Some(snapshot_json) = sql_text(row, 2) else {
             continue;
         };
@@ -2363,11 +2377,9 @@ fn read_stored_history_observations_for_intervals(
             // history or unrelated sidecar rows.
             continue;
         };
-        if intervals.intersects_canonical_minute(observation.timestamp) {
-            observations.insert((observation.reset_at, observation.timestamp), observation);
-        }
+        observations.insert((observation.reset_at, observation.timestamp), observation);
     }
-    Ok(observations.into_values().collect())
+    Ok((observations.into_values().collect(), provenance_generations))
 }
 
 fn parse_stored_history_observation(
@@ -2582,6 +2594,7 @@ fn sql_i64(row: &Row<'_>, index: usize) -> Option<i64> {
 fn history_models_v3(
     group: Option<&HistoryModelGroup>,
     sample: &PublicHistorySample,
+    models_complete: bool,
 ) -> Option<Vec<PublicHistoryModelUsageV3>> {
     let mut models = group
         .map(|group| {
@@ -2592,8 +2605,36 @@ fn history_models_v3(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    if !models_complete {
+        for legacy in legacy_history_models_v3(sample) {
+            if !models.iter().any(|model| model.model == legacy.model) {
+                models.push(legacy);
+            }
+        }
+    }
     models.sort_by(|left, right| left.model.cmp(&right.model));
     (!models.is_empty()).then_some(models)
+}
+
+fn legacy_history_models_v3(sample: &PublicHistorySample) -> Vec<PublicHistoryModelUsageV3> {
+    [
+        ("SOL", sample.sol_tokens, sample.sol_dollars),
+        ("TERRA", sample.terra_tokens, sample.terra_dollars),
+        ("LUNA", sample.luna_tokens, sample.luna_dollars),
+    ]
+    .into_iter()
+    .map(
+        |(model, total_tokens, total_dollars)| PublicHistoryModelUsageV3 {
+            model: model.to_owned(),
+            total_tokens,
+            input_tokens: None,
+            cached_input_tokens: None,
+            cache_write_input_tokens: None,
+            output_tokens: None,
+            total_dollars: Some(total_dollars),
+        },
+    )
+    .collect()
 }
 
 fn history_model_usage_v3(
@@ -4153,6 +4194,33 @@ mod tests {
         assert_eq!(snapshot.details.active_thread_count, 0);
         assert!(snapshot.details.threads.is_empty());
         assert!(!snapshot.has_pending_ranges);
+        assert_eq!(snapshot.details.history_samples.len(), 1);
+        let history = &snapshot.history_samples_v3[0];
+        assert_eq!(history.model_source, "legacy-unknown");
+        assert!(!history.models_complete);
+        assert_eq!(
+            history
+                .models
+                .as_ref()
+                .expect("saved legacy totals")
+                .iter()
+                .map(|model| {
+                    (
+                        model.model.as_str(),
+                        model.total_tokens,
+                        model.input_tokens,
+                        model.cached_input_tokens,
+                        model.output_tokens,
+                        model.total_dollars,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("LUNA", 30, None, None, None, Some(3.0)),
+                ("SOL", 10, None, None, None, Some(1.0)),
+                ("TERRA", 20, None, None, None, Some(2.0)),
+            ]
+        );
         fs::remove_file(path).expect("cleanup");
     }
 
@@ -4182,9 +4250,12 @@ mod tests {
             .read_snapshot()
             .expect("usage history remains readable");
         assert!(snapshot.has_pending_ranges);
-        assert!(snapshot.details.history_samples.is_empty());
+        assert_eq!(snapshot.details.history_samples.len(), 1);
         assert_eq!(snapshot.history_samples_v3.len(), 1);
-        assert_eq!(snapshot.history_samples_v3[0].model_source, "unavailable");
+        assert_eq!(
+            snapshot.history_samples_v3[0].model_source,
+            "legacy-unknown"
+        );
         assert_eq!(snapshot.details.active_thread_count, 0);
         assert!(snapshot.details.threads.is_empty());
         fs::remove_file(path).expect("cleanup");
@@ -4201,9 +4272,12 @@ mod tests {
             .read_snapshot()
             .expect("usage history remains readable");
         assert!(snapshot.has_pending_ranges);
-        assert!(snapshot.details.history_samples.is_empty());
+        assert_eq!(snapshot.details.history_samples.len(), 1);
         assert_eq!(snapshot.history_samples_v3.len(), 1);
-        assert_eq!(snapshot.history_samples_v3[0].model_source, "unavailable");
+        assert_eq!(
+            snapshot.history_samples_v3[0].model_source,
+            "legacy-unknown"
+        );
         assert!(snapshot.details.threads.is_empty());
         fs::remove_file(path).expect("cleanup");
     }
@@ -4417,12 +4491,12 @@ mod tests {
         );
         assert_eq!(old.details.active_thread_count, 0);
         assert!(old.details.threads.is_empty());
-        assert!(old.details.history_samples.is_empty());
+        assert_eq!(old.details.history_samples.len(), 1);
         assert_eq!(old.history_samples_v3.len(), 1);
         assert!(old
             .history_samples_v3
             .iter()
-            .all(|sample| sample.timestamp < boundary));
+            .all(|sample| sample.timestamp < boundary && sample.model_source == "legacy-unknown"));
         assert!(old
             .details
             .history_periods
@@ -4450,12 +4524,12 @@ mod tests {
             .threads
             .iter()
             .any(|thread| thread.id == "old-thread"));
-        assert!(current.details.history_samples.is_empty());
+        assert_eq!(current.details.history_samples.len(), 2);
         assert_eq!(current.history_samples_v3.len(), 2);
         assert!(current
             .history_samples_v3
             .iter()
-            .all(|sample| sample.timestamp >= boundary));
+            .all(|sample| sample.timestamp >= boundary && sample.model_source == "legacy-unknown"));
         assert!(current
             .details
             .history_periods
@@ -4477,7 +4551,7 @@ mod tests {
             .read_snapshot()
             .expect("reactivated snapshot");
         assert_eq!(reactivated.details.observed_at, Some(boundary + 60));
-        assert!(reactivated.details.history_samples.is_empty());
+        assert_eq!(reactivated.details.history_samples.len(), 2);
         assert_eq!(reactivated.history_samples_v3.len(), 2);
         assert!(reactivated
             .history_samples_v3
@@ -4629,9 +4703,9 @@ mod tests {
             .expect("incomplete fixture");
         let pending = reader.read_snapshot().expect("pending snapshot");
         assert!(pending.has_pending_ranges);
-        assert!(pending.details.history_samples.is_empty());
+        assert_eq!(pending.details.history_samples.len(), 1);
         assert_eq!(pending.history_samples_v3.len(), 1);
-        assert_eq!(pending.history_samples_v3[0].model_source, "unavailable");
+        assert_eq!(pending.history_samples_v3[0].model_source, "legacy-unknown");
 
         connection
             .execute("DELETE FROM session_pending_ranges", [])
@@ -4721,9 +4795,12 @@ mod tests {
             .read_snapshot()
             .expect("one malformed row must not reject the candidate");
         assert_eq!(snapshot.details.state, PublicState::Ready);
-        assert!(snapshot.details.history_samples.is_empty());
+        assert_eq!(snapshot.details.history_samples.len(), 1);
         assert_eq!(snapshot.history_samples_v3.len(), 1);
-        assert_eq!(snapshot.history_samples_v3[0].model_source, "unavailable");
+        assert_eq!(
+            snapshot.history_samples_v3[0].model_source,
+            "legacy-unknown"
+        );
         fs::remove_file(path).expect("cleanup");
     }
 
@@ -4781,7 +4858,7 @@ mod tests {
                 .iter()
                 .map(|model| model.model.as_str())
                 .collect::<Vec<_>>(),
-            vec!["SOL"]
+            vec!["LUNA", "SOL", "TERRA"]
         );
         fs::remove_file(path).expect("cleanup");
     }
@@ -5009,24 +5086,24 @@ mod tests {
         assert_eq!(snapshot.details.state, PublicState::Ready);
         assert!(!snapshot.details.models.is_empty());
         assert_eq!(snapshot.details.history_periods.len(), 1);
-        assert!(snapshot.details.history_samples.is_empty());
+        assert_eq!(snapshot.details.history_samples.len(), 3);
         assert_eq!(snapshot.history_samples_v3.len(), 3);
         assert!(snapshot
             .history_samples_v3
             .iter()
-            .all(|sample| sample.model_source == "unavailable"));
+            .all(|sample| sample.model_source == "legacy-unknown"));
         assert!(snapshot
             .history_samples_v3
             .iter()
             .all(|sample| !sample.models_complete));
-        assert!(snapshot
-            .history_samples_v3
-            .iter()
-            .all(|sample| sample.models.is_none()));
+        assert!(snapshot.history_samples_v3.iter().all(|sample| sample
+            .models
+            .as_ref()
+            .is_some_and(|models| models.len() == 3)));
         assert!(snapshot
             .history_samples_v2
             .iter()
-            .all(|sample| sample.model_source == "unavailable"));
+            .all(|sample| sample.model_source == "legacy-unknown"));
         assert!(snapshot
             .history_samples_v3
             .iter()
