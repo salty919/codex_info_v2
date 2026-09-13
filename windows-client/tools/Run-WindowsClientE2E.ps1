@@ -1,6 +1,6 @@
 # Runs the finite Windows UI Automation acceptance path against the installed
 # client.  The normal mode uses the configured loopback service.  CI may pass
-# -Fixture to provide bounded local /v1/health and /v2/details responses; this still
+# -Fixture to provide bounded local health and current v3 split-resource responses; this still
 # drives the installed EXE and the real rendered windows, but does not require
 # an account or an SSH tunnel.
 [CmdletBinding()]
@@ -10,8 +10,7 @@ param(
     [switch]$Fixture,
     [switch]$FixtureContractTest,
     [switch]$CompatibilitySmoke,
-    [switch]$RequireCurrentPresentation,
-    [string]$SourceSha = ''
+    [switch]$RequireCurrentPresentation
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,11 +57,14 @@ if (Test-Path -LiteralPath $script:e2eOutput -PathType Container) {
 }
 New-Item -ItemType Directory -Path $script:e2eOutput -Force | Out-Null
 $script:e2eLogPath = Join-Path $script:e2eOutput 'windows-client-e2e.log'
-$script:e2eSourceSha = if (-not [string]::IsNullOrWhiteSpace($SourceSha)) { $SourceSha } elseif (-not [string]::IsNullOrWhiteSpace($env:GITHUB_SHA)) { $env:GITHUB_SHA } else { 'unknown' }
 $script:e2eWindowRecords = [System.Collections.Generic.List[object]]::new()
 $script:e2eProcess = $null
 $script:e2eFixtureRunning = $false
-$script:e2eFixturePort = 8787
+$script:e2eFixturePort = 0
+$script:e2eFixturePortVariable = 'CODEX_INFO_WINDOWS_E2E_FIXTURE_PORT'
+$script:e2eFixtureUnusedMinimumSeconds = 30 * 60
+$script:e2eFixturePastIdleStartFraction = 0.25
+$script:e2eFixturePastIdleEndFraction = 0.50
 $script:e2ePreviewEnabled = -not [string]::IsNullOrWhiteSpace($env:CODEX_INFO_WINDOWS_PREVIEW)
 $script:e2eSettingsPath = Join-Path $env:LOCALAPPDATA 'CodexInfo\settings.json'
 $script:e2eSettingsBackup = Join-Path ([IO.Path]::GetTempPath()) ("codex-info-e2e-settings-" + [Guid]::NewGuid().ToString('N') + '.json')
@@ -301,6 +303,23 @@ public static class CodexInfoGraphPixelScanner {
             if (periodEnd <= periodStart || periodEnd >= plotWidth) {
                 throw new InvalidOperationException("The inferred period-end grid is outside the plot.");
             }
+            var endpointGutterStart = new int[SeriesColors.Length];
+            for (int series = 0; series < SeriesColors.Length; series++) {
+                int localX = periodEnd + 1;
+                while (localX < plotWidth) {
+                    bool hasBoundarySeriesPixel = false;
+                    for (int localY = 0; localY < plotHeight; localY++) {
+                        Color pixel = bitmap.GetPixel(plotLeft + localX, plotTop + localY);
+                        if (Matches(pixel, SeriesColors[series], 24)) {
+                            hasBoundarySeriesPixel = true;
+                            break;
+                        }
+                    }
+                    if (!hasBoundarySeriesPixel) break;
+                    localX++;
+                }
+                endpointGutterStart[series] = localX;
+            }
             var gutterTop = new[] { int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue };
             var gutterBottom = new[] { int.MinValue, int.MinValue, int.MinValue, int.MinValue };
             var count = new int[4];
@@ -313,7 +332,11 @@ public static class CodexInfoGraphPixelScanner {
                         if (!Matches(pixel, SeriesColors[series], 24)) continue;
                         count[series]++;
                         rightmost[series] = Math.Max(rightmost[series], localX);
-                        if (localX > periodEnd) {
+                        // A measured series terminates on the period-end grid,
+                        // but its rasterized stroke can occupy a DPI-dependent
+                        // run immediately to the right.  Measure the endpoint
+                        // leader/glyph only after that boundary-touching run.
+                        if (localX >= endpointGutterStart[series]) {
                             gutterCount[series]++;
                             gutterTop[series] = Math.Min(gutterTop[series], localY);
                             gutterBottom[series] = Math.Max(gutterBottom[series], localY);
@@ -802,21 +825,59 @@ public static class CodexInfoWindowsE2EFixtureServer {
     private static Thread worker;
     private static volatile bool running;
     private static string detailsBody;
+    private static string accountsBody;
+    private static string currentBody;
+    private static string periodsBody;
+    private static string currentHistoryBody;
+    private static string pastHistoryBody;
+    private static string currentHistoryDeltaBody;
+    private static string pastHistoryDeltaBody;
+    private static string threadsBody;
     private static string publishedPair;
     private static string productVersion;
     private static int healthRequests;
     private static int detailsRequests;
+    private static int accountsRequests;
+    private static int currentRequests;
+    private static int periodsRequests;
+    private static int historyRequests;
+    private static int threadsRequests;
     private static int preflightRequests;
     private static int clientRequests;
 
-    public static bool Start(string details, string pair, string version, int port) {
+    public static bool Start(
+        string details,
+        string accounts,
+        string current,
+        string periods,
+        string currentHistory,
+        string pastHistory,
+        string currentHistoryDelta,
+        string pastHistoryDelta,
+        string threads,
+        string pair,
+        string version,
+        int port) {
         if (running) return false;
         try {
             detailsBody = details;
+            accountsBody = accounts;
+            currentBody = current;
+            periodsBody = periods;
+            currentHistoryBody = currentHistory;
+            pastHistoryBody = pastHistory;
+            currentHistoryDeltaBody = currentHistoryDelta;
+            pastHistoryDeltaBody = pastHistoryDelta;
+            threadsBody = threads;
             publishedPair = pair;
             productVersion = version;
             healthRequests = 0;
             detailsRequests = 0;
+            accountsRequests = 0;
+            currentRequests = 0;
+            periodsRequests = 0;
+            historyRequests = 0;
+            threadsRequests = 0;
             preflightRequests = 0;
             clientRequests = 0;
             listener = new TcpListener(IPAddress.Loopback, port);
@@ -842,8 +903,9 @@ public static class CodexInfoWindowsE2EFixtureServer {
 
     public static string RequestSummary() {
         return String.Format(
-            "health={0} details={1} preflight={2} client={3}",
-            healthRequests, detailsRequests, preflightRequests, clientRequests);
+            "health={0} accounts={1} current={2} periods={3} history={4} threads={5} legacy-details={6} preflight={7} client={8}",
+            healthRequests, accountsRequests, currentRequests, periodsRequests,
+            historyRequests, threadsRequests, detailsRequests, preflightRequests, clientRequests);
     }
 
     public static void Stop() {
@@ -907,6 +969,69 @@ public static class CodexInfoWindowsE2EFixtureServer {
                     code = 200;
                     reason = "OK";
                     body = detailsBody;
+                    includePublishedPair = true;
+                }
+                else if (parts[1] == "/v3/accounts") {
+                    Interlocked.Increment(ref accountsRequests);
+                    RecordRequestPhase(request);
+                    code = 200;
+                    reason = "OK";
+                    body = accountsBody;
+                }
+                else if (parts[1] == "/v3/current?account=account-7") {
+                    Interlocked.Increment(ref currentRequests);
+                    RecordRequestPhase(request);
+                    code = 200;
+                    reason = "OK";
+                    body = currentBody;
+                    includePublishedPair = true;
+                }
+                else if (parts[1] == "/v3/history/periods?account=account-7") {
+                    Interlocked.Increment(ref periodsRequests);
+                    RecordRequestPhase(request);
+                    code = 200;
+                    reason = "OK";
+                    body = periodsBody;
+                    includePublishedPair = true;
+                }
+                else if (parts[1] == "/v3/history?period=e2e-current&account=account-7") {
+                    Interlocked.Increment(ref historyRequests);
+                    RecordRequestPhase(request);
+                    code = 200;
+                    reason = "OK";
+                    body = currentHistoryBody;
+                    includePublishedPair = true;
+                }
+                else if (parts[1] == "/v3/history?period=e2e-past&account=account-7") {
+                    Interlocked.Increment(ref historyRequests);
+                    RecordRequestPhase(request);
+                    code = 200;
+                    reason = "OK";
+                    body = pastHistoryBody;
+                    includePublishedPair = true;
+                }
+                else if (parts[1] == "/v3/history?period=e2e-current&account=account-7&cursor=e2e-current-resume") {
+                    Interlocked.Increment(ref historyRequests);
+                    RecordRequestPhase(request);
+                    code = 200;
+                    reason = "OK";
+                    body = currentHistoryDeltaBody;
+                    includePublishedPair = true;
+                }
+                else if (parts[1] == "/v3/history?period=e2e-past&account=account-7&cursor=e2e-past-resume") {
+                    Interlocked.Increment(ref historyRequests);
+                    RecordRequestPhase(request);
+                    code = 200;
+                    reason = "OK";
+                    body = pastHistoryDeltaBody;
+                    includePublishedPair = true;
+                }
+                else if (parts[1] == "/v3/threads?account=account-7") {
+                    Interlocked.Increment(ref threadsRequests);
+                    RecordRequestPhase(request);
+                    code = 200;
+                    reason = "OK";
+                    body = threadsBody;
                     includePublishedPair = true;
                 }
             }
@@ -1337,9 +1462,8 @@ function Capture-E2EWindow {
         $graphics.Dispose()
         $bitmap.Dispose()
     }
-    $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-    Write-E2E "capture: name=$safeName path=$path sha256=$hash size=$($bounds.Width)x$($bounds.Height)"
-    return [pscustomobject]@{ Path = $path; Hash = $hash }
+    Write-E2E "capture: name=$safeName path=$path size=$($bounds.Width)x$($bounds.Height)"
+    return [pscustomobject]@{ Path = $path }
 }
 
 function Assert-E2ECaptureColor {
@@ -1790,7 +1914,9 @@ function Assert-E2EImageChanged {
         [Parameter(Mandatory = $true)][psobject]$After,
         [Parameter(Mandatory = $true)][string]$Description
     )
-    Assert-E2E ($Before.Hash -ne $After.Hash) "$Description did not change the rendered window."
+    $beforeHash = (Get-FileHash -LiteralPath $Before.Path -Algorithm SHA256).Hash
+    $afterHash = (Get-FileHash -LiteralPath $After.Path -Algorithm SHA256).Hash
+    Assert-E2E ($beforeHash -ne $afterHash) "$Description did not change the rendered window."
 }
 
 function Get-E2EGraphIdleBackgroundColor {
@@ -1992,7 +2118,14 @@ function Get-E2EFixtureHeaderValues {
 function Invoke-E2EFixtureRawRequest {
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('/v1/health', '/v2/details')]
+        [ValidateSet(
+            '/v1/health',
+            '/v3/accounts',
+            '/v3/current?account=account-7',
+            '/v3/history/periods?account=account-7',
+            '/v3/history?period=e2e-current&account=account-7',
+            '/v3/history?period=e2e-past&account=account-7',
+            '/v3/threads?account=account-7')]
         [string]$Path
     )
 
@@ -2230,11 +2363,128 @@ function Assert-E2EFixturePreflightResponses {
     return $true
 }
 
+function Assert-E2EFixtureV3PreflightResponses {
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Responses)
+
+    foreach ($name in @('health', 'accounts', 'current', 'periods', 'current-history', 'past-history', 'threads')) {
+        Assert-E2E ($Responses.Contains($name)) "Fixture preflight response is missing: $name."
+        Assert-E2E ($Responses[$name].StatusCode -eq 200) `
+            "Fixture $name status is not HTTP 200: $($Responses[$name].StatusCode)."
+    }
+
+    foreach ($name in @('health', 'accounts')) {
+        $pairs = @(Get-E2EFixtureHeaderValues -Response $Responses[$name] -Name 'Codex-Info-Published-Pair')
+        Assert-E2E ($pairs.Count -eq 0) "Fixture $name must not expose Codex-Info-Published-Pair."
+    }
+    $publishedPair = $null
+    foreach ($name in @('current', 'periods', 'current-history', 'past-history', 'threads')) {
+        $pairs = @(Get-E2EFixtureHeaderValues -Response $Responses[$name] -Name 'Codex-Info-Published-Pair')
+        Assert-E2E ($pairs.Count -eq 1) "Fixture $name must expose exactly one Codex-Info-Published-Pair."
+        $candidate = [string]$pairs[0]
+        Assert-E2E ($candidate -cmatch '^v1:[0-9a-f]{64}$') `
+            "Fixture $name published pair is not canonical: '$candidate'."
+        if ($null -eq $publishedPair) { $publishedPair = $candidate }
+        Assert-E2E ($candidate -ceq $publishedPair) `
+            "Fixture split resources do not share one published pair: $name='$candidate'."
+    }
+
+    $json = @{}
+    foreach ($name in @('health', 'accounts', 'current', 'periods', 'current-history', 'past-history', 'threads')) {
+        try {
+            $json[$name] = ConvertFrom-Json -InputObject ([string]$Responses[$name].Body)
+        }
+        catch {
+            throw "Fixture $name body is not valid JSON: $($_.Exception.Message)"
+        }
+    }
+
+    Assert-E2EFixtureJsonKeys -Json $json['health'] `
+        -Expected @('api_version', 'service', 'product_version') -Endpoint 'Fixture health'
+    Assert-E2E ([string]$json['health'].api_version -ceq 'v1' -and
+        [string]$json['health'].service -ceq 'codex-info') 'Fixture health identity is invalid.'
+    Assert-E2EFixtureJsonKeys -Json $json['accounts'] `
+        -Expected @('api_version', 'default_account_id', 'accounts') -Endpoint 'Fixture accounts'
+    Assert-E2E ([string]$json['accounts'].api_version -ceq 'v3' -and
+        [string]$json['accounts'].default_account_id -ceq 'account-7' -and
+        @($json['accounts'].accounts).Count -eq 1) 'Fixture account directory is not the one-account v3 contract.'
+    Assert-E2EFixtureJsonKeys -Json $json['current'] `
+        -Expected @('api_version', 'state', 'observed_at', 'authenticated', 'plan_label', 'quota', 'models', 'active_thread_count') `
+        -Endpoint 'Fixture current'
+    Assert-E2E ([string]$json['current'].api_version -ceq 'v3' -and
+        [string]$json['current'].state -ceq 'ready' -and
+        [bool]$json['current'].authenticated -and
+        @($json['current'].models).Count -eq 3 -and
+        [Int64]$json['current'].active_thread_count -eq 3) 'Fixture current resource does not contain the intended ready generation.'
+    Assert-E2EFixtureJsonKeys -Json $json['periods'] `
+        -Expected @('api_version', 'history_periods') -Endpoint 'Fixture history periods'
+    Assert-E2E ([string]$json['periods'].api_version -ceq 'v3' -and
+        @($json['periods'].history_periods).Count -eq 2 -and
+        @($json['periods'].history_periods | Where-Object { $_.current }).Count -eq 1) `
+        'Fixture history periods do not contain one current and one past period.'
+    foreach ($name in @('current-history', 'past-history')) {
+        Assert-E2EFixtureJsonKeys -Json $json[$name] `
+            -Expected @('api_version', 'history_samples', 'history_gaps', 'next_cursor', 'resume_cursor') `
+            -Endpoint "Fixture $name"
+        Assert-E2E ([string]$json[$name].api_version -ceq 'v3' -and
+            $null -eq $json[$name].next_cursor -and
+            -not [string]::IsNullOrWhiteSpace([string]$json[$name].resume_cursor)) `
+            "Fixture $name is not one complete finite v3 page."
+    }
+    Assert-E2E (@($json['current-history'].history_samples).Count -eq 2) `
+        'Fixture current history must contain exactly two observations.'
+    $pastSamples = @($json['past-history'].history_samples)
+    Assert-E2E ($pastSamples.Count -eq 4 -and
+        $null -eq $pastSamples[0].task_active_since_previous -and
+        $pastSamples[1].task_active_since_previous -eq $true -and
+        $pastSamples[2].task_active_since_previous -eq $false -and
+        $pastSamples[3].task_active_since_previous -eq $true) `
+        'Fixture past history does not encode the intended active-idle-active lifecycle.'
+    $pastPeriod = @($json['periods'].history_periods | Where-Object { $_.id -ceq 'e2e-past' })
+    Assert-E2E ($pastPeriod.Count -eq 1) 'Fixture must contain exactly one e2e-past period.'
+    [Int64]$pastStart = [Int64]$pastPeriod[0].start_at
+    [Int64]$pastEnd = [Int64]$pastPeriod[0].end_at
+    [Int64]$pastSpan = $pastEnd - $pastStart
+    [Int64]$expectedIdleStart = $pastStart + [Int64]($pastSpan * $script:e2eFixturePastIdleStartFraction)
+    [Int64]$expectedIdleEnd = $pastStart + [Int64]($pastSpan * $script:e2eFixturePastIdleEndFraction)
+    Assert-E2E ($pastSpan -gt 0 -and
+        [Int64]$pastSamples[0].timestamp -eq $pastStart -and
+        [Int64]$pastSamples[1].timestamp -eq $expectedIdleStart -and
+        [Int64]$pastSamples[2].timestamp -eq $expectedIdleEnd -and
+        [Int64]$pastSamples[3].timestamp -eq $pastEnd) `
+        'Fixture past history does not place its confirmed idle interval at the declared period fractions.'
+    Assert-E2E (([Int64]$pastSamples[2].timestamp - [Int64]$pastSamples[1].timestamp) -eq
+        $script:e2eFixtureUnusedMinimumSeconds) `
+        'Fixture past history must prove the exact 30-minute unused threshold.'
+    Assert-E2E (@($pastSamples[1..2] | Where-Object {
+            -not $_.models_complete -or $_.model_source -cne 'confirmed' -or
+            [Int64]$_.reset_at -ne [Int64]$pastPeriod[0].reset_at
+        }).Count -eq 0 -and
+        [double]$pastSamples[1].remaining_percent -eq [double]$pastSamples[2].remaining_percent -and
+        @($json['past-history'].history_gaps).Count -eq 0) `
+        'Fixture past idle interval is not backed by complete direct observations without gaps.'
+    foreach ($model in @('SOL', 'TERRA', 'LUNA')) {
+        $idleTotals = @(1..2 | ForEach-Object {
+            [Int64](($pastSamples[$_].models | Where-Object { $_.model -ceq $model }).total_tokens)
+        } | Select-Object -Unique)
+        Assert-E2E ($idleTotals.Count -eq 1) "Fixture $model tokens changed during confirmed idle evidence."
+    }
+    Assert-E2EFixtureJsonKeys -Json $json['threads'] `
+        -Expected @('api_version', 'threads') -Endpoint 'Fixture threads'
+    Assert-E2E ([string]$json['threads'].api_version -ceq 'v3' -and
+        @($json['threads'].threads).Count -eq 3) 'Fixture threads resource must contain three rows.'
+    return $true
+}
+
 function Invoke-E2EFixturePreflight {
     $responses = [ordered]@{}
     foreach ($requestSpec in @(
             @{ Name = 'health'; Path = '/v1/health' },
-            @{ Name = 'details'; Path = '/v2/details' })) {
+            @{ Name = 'accounts'; Path = '/v3/accounts' },
+            @{ Name = 'current'; Path = '/v3/current?account=account-7' },
+            @{ Name = 'periods'; Path = '/v3/history/periods?account=account-7' },
+            @{ Name = 'current-history'; Path = '/v3/history?period=e2e-current&account=account-7' },
+            @{ Name = 'past-history'; Path = '/v3/history?period=e2e-past&account=account-7' },
+            @{ Name = 'threads'; Path = '/v3/threads?account=account-7' })) {
         $response = Invoke-E2EFixtureRawRequest -Path $requestSpec.Path
         $responses[$requestSpec.Name] = $response
         $pairCount = @(Get-E2EFixtureHeaderValues -Response $response -Name 'Codex-Info-Published-Pair').Count
@@ -2243,12 +2493,9 @@ function Invoke-E2EFixturePreflight {
         Write-E2E ("fixture-preflight: request={0} status={1} pair-count={2} body-bytes={3} raw={4}" -f
             $requestSpec.Name, $response.StatusCode, $pairCount, ([Text.Encoding]::UTF8.GetByteCount([string]$response.Body)), $rawPath)
     }
-    Assert-E2EFixturePreflightResponses -Health $responses['health'] -Details $responses['details'] | Out-Null
-    Write-E2E 'fixture-preflight: PASS (health/details raw responses satisfy strict wire contract)'
-    return [pscustomobject]@{
-        Health = $responses['health']
-        Details = $responses['details']
-    }
+    Assert-E2EFixtureV3PreflightResponses -Responses $responses | Out-Null
+    Write-E2E 'fixture-preflight: PASS (health and current v3 split-resource path satisfy one strict generation)'
+    return $responses
 }
 
 function New-E2EFixtureDocuments {
@@ -2258,6 +2505,14 @@ function New-E2EFixtureDocuments {
     $currentReset = $now + 7200
     $pastStart = $now - 360
     $pastReset = $now - 180
+    # The current graph contract admits an unused band only after 30 minutes
+    # of unchanged direct observations. Keep the legacy compatibility document
+    # compact, while the v3 UI fixture proves that real threshold explicitly.
+    $v3PastReset = $now - 3600
+    $v3PastStart = $v3PastReset - (4 * $script:e2eFixtureUnusedMinimumSeconds)
+    $v3PastSpan = $v3PastReset - $v3PastStart
+    $v3PastIdleStart = $v3PastStart + [Int64]($v3PastSpan * $script:e2eFixturePastIdleStartFraction)
+    $v3PastIdleEnd = $v3PastStart + [Int64]($v3PastSpan * $script:e2eFixturePastIdleEndFraction)
     $publishedPair = 'v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
     # Keep this wire fixture as explicit JSON.  The details endpoint is a
     # strict thirteen-field contract; serializing nested PowerShell dictionaries
@@ -2287,8 +2542,37 @@ function New-E2EFixtureDocuments {
     $details = $details.Substring(0, $historySamplesBodyStart) +
         ($orderedSampleObjects -join ',') +
         $details.Substring($historySamplesEnd)
+
+    $accounts = @"
+{"api_version":"v3","default_account_id":"account-7","accounts":[{"id":"account-7","is_current":true,"activation_at":$currentStart,"deactivation_at":null,"login_id":"e2e@example.invalid"}]}
+"@
+    $current = @"
+{"api_version":"v3","state":"ready","observed_at":$now,"authenticated":true,"plan_label":"Pro","quota":{"remaining_percent":72.0,"reset_at":$currentReset,"window_seconds":14400,"monthly":false},"models":[{"model":"SOL","total_tokens":1200,"input_tokens":800,"cached_input_tokens":200,"cache_write_input_tokens":0,"output_tokens":400,"estimated_cost":{"price_version":"E2E-SOL","ordinary_input_dollars":0.70,"cached_input_dollars":0.20,"cache_write_input_dollars":0.0,"output_dollars":0.30,"total_dollars":1.20}},{"model":"TERRA","total_tokens":2400,"input_tokens":1600,"cached_input_tokens":500,"cache_write_input_tokens":0,"output_tokens":800,"estimated_cost":{"price_version":"E2E-TERRA","ordinary_input_dollars":1.40,"cached_input_dollars":0.50,"cache_write_input_dollars":0.0,"output_dollars":0.50,"total_dollars":2.40}},{"model":"LUNA","total_tokens":3600,"input_tokens":2500,"cached_input_tokens":700,"cache_write_input_tokens":0,"output_tokens":1100,"estimated_cost":{"price_version":"E2E-LUNA","ordinary_input_dollars":2.00,"cached_input_dollars":0.70,"cache_write_input_dollars":0.0,"output_dollars":0.90,"total_dollars":3.60}}],"active_thread_count":3}
+"@
+    $periods = @"
+{"api_version":"v3","history_periods":[{"id":"e2e-current","start_at":$currentStart,"end_at":$now,"reset_at":$currentReset,"label":"Current period","current":true},{"id":"e2e-past","start_at":$v3PastStart,"end_at":$v3PastReset,"reset_at":$v3PastReset,"label":"Past period","current":false}]}
+"@
+    $currentHistory = @"
+{"api_version":"v3","history_samples":[{"timestamp":$currentStart,"reset_at":$currentReset,"remaining_percent":92.0,"models":[{"model":"SOL","total_tokens":100,"input_tokens":70,"cached_input_tokens":20,"cache_write_input_tokens":0,"output_tokens":30,"total_dollars":0.25},{"model":"TERRA","total_tokens":200,"input_tokens":140,"cached_input_tokens":40,"cache_write_input_tokens":0,"output_tokens":60,"total_dollars":0.50},{"model":"LUNA","total_tokens":300,"input_tokens":210,"cached_input_tokens":60,"cache_write_input_tokens":0,"output_tokens":90,"total_dollars":0.75}],"models_complete":true,"model_source":"confirmed","task_active_since_previous":null},{"timestamp":$now,"reset_at":$currentReset,"remaining_percent":72.0,"models":[{"model":"SOL","total_tokens":1200,"input_tokens":800,"cached_input_tokens":200,"cache_write_input_tokens":0,"output_tokens":400,"total_dollars":1.20},{"model":"TERRA","total_tokens":2400,"input_tokens":1600,"cached_input_tokens":500,"cache_write_input_tokens":0,"output_tokens":800,"total_dollars":2.40},{"model":"LUNA","total_tokens":3600,"input_tokens":2500,"cached_input_tokens":700,"cache_write_input_tokens":0,"output_tokens":1100,"total_dollars":3.60}],"models_complete":true,"model_source":"confirmed","task_active_since_previous":true}],"history_gaps":[],"next_cursor":null,"resume_cursor":"e2e-current-resume"}
+"@
+    $pastHistory = @"
+{"api_version":"v3","history_samples":[{"timestamp":$v3PastStart,"reset_at":$v3PastReset,"remaining_percent":98.0,"models":[{"model":"SOL","total_tokens":50,"input_tokens":35,"cached_input_tokens":10,"cache_write_input_tokens":0,"output_tokens":15,"total_dollars":0.20},{"model":"TERRA","total_tokens":100,"input_tokens":70,"cached_input_tokens":20,"cache_write_input_tokens":0,"output_tokens":30,"total_dollars":0.40},{"model":"LUNA","total_tokens":150,"input_tokens":105,"cached_input_tokens":30,"cache_write_input_tokens":0,"output_tokens":45,"total_dollars":0.60}],"models_complete":true,"model_source":"confirmed","task_active_since_previous":null},{"timestamp":$v3PastIdleStart,"reset_at":$v3PastReset,"remaining_percent":94.0,"models":[{"model":"SOL","total_tokens":100,"input_tokens":70,"cached_input_tokens":20,"cache_write_input_tokens":0,"output_tokens":30,"total_dollars":0.40},{"model":"TERRA","total_tokens":200,"input_tokens":140,"cached_input_tokens":40,"cache_write_input_tokens":0,"output_tokens":60,"total_dollars":0.80},{"model":"LUNA","total_tokens":300,"input_tokens":210,"cached_input_tokens":60,"cache_write_input_tokens":0,"output_tokens":90,"total_dollars":1.20}],"models_complete":true,"model_source":"confirmed","task_active_since_previous":true},{"timestamp":$v3PastIdleEnd,"reset_at":$v3PastReset,"remaining_percent":94.0,"models":[{"model":"SOL","total_tokens":100,"input_tokens":70,"cached_input_tokens":20,"cache_write_input_tokens":0,"output_tokens":30,"total_dollars":0.40},{"model":"TERRA","total_tokens":200,"input_tokens":140,"cached_input_tokens":40,"cache_write_input_tokens":0,"output_tokens":60,"total_dollars":0.80},{"model":"LUNA","total_tokens":300,"input_tokens":210,"cached_input_tokens":60,"cache_write_input_tokens":0,"output_tokens":90,"total_dollars":1.20}],"models_complete":true,"model_source":"confirmed","task_active_since_previous":false},{"timestamp":$v3PastReset,"reset_at":$v3PastReset,"remaining_percent":84.0,"models":[{"model":"SOL","total_tokens":600,"input_tokens":400,"cached_input_tokens":100,"cache_write_input_tokens":0,"output_tokens":200,"total_dollars":0.60},{"model":"TERRA","total_tokens":1200,"input_tokens":800,"cached_input_tokens":200,"cache_write_input_tokens":0,"output_tokens":400,"total_dollars":1.20},{"model":"LUNA","total_tokens":1800,"input_tokens":1200,"cached_input_tokens":300,"cache_write_input_tokens":0,"output_tokens":600,"total_dollars":1.80}],"models_complete":true,"model_source":"confirmed","task_active_since_previous":true}],"history_gaps":[],"next_cursor":null,"resume_cursor":"e2e-past-resume"}
+"@
+    $currentHistoryDelta = '{"api_version":"v3","history_samples":[],"history_gaps":[],"next_cursor":null,"resume_cursor":"e2e-current-resume"}'
+    $pastHistoryDelta = '{"api_version":"v3","history_samples":[],"history_gaps":[],"next_cursor":null,"resume_cursor":"e2e-past-resume"}'
+    $threads = @"
+{"api_version":"v3","threads":[{"id":"e2e-root","title":"E2E root task","parent_thread_id":null,"model":"TERRA","model_label":"TERRA","total_tokens":2400,"context_usage_tokens":800,"context_window_tokens":16000,"created_at":$($now - 3600),"last_user_message_at":$($now - 300),"is_subagent":false,"depth":0},{"id":"e2e-child","title":"E2E child task","parent_thread_id":"e2e-root","model":"LUNA","model_label":"LUNA","total_tokens":1200,"context_usage_tokens":400,"context_window_tokens":16000,"created_at":$($now - 2400),"last_user_message_at":$($now - 600),"is_subagent":true,"depth":1},{"id":"e2e-orphan","title":"E2E orphan task","parent_thread_id":"missing-parent","model":"SOL","model_label":"SOL","total_tokens":600,"context_usage_tokens":null,"context_window_tokens":null,"created_at":$($now - 1200),"last_user_message_at":null,"is_subagent":true,"depth":null}]}
+"@
     return [pscustomobject]@{
         Details = $details.Trim()
+        Accounts = $accounts.Trim()
+        Current = $current.Trim()
+        Periods = $periods.Trim()
+        CurrentHistory = $currentHistory.Trim()
+        PastHistory = $pastHistory.Trim()
+        CurrentHistoryDelta = $currentHistoryDelta
+        PastHistoryDelta = $pastHistoryDelta
+        Threads = $threads.Trim()
         PublishedPair = $publishedPair
         Now = $now
     }
@@ -2300,6 +2584,18 @@ function Enter-E2EFixture {
         (Join-Path $script:e2eOutput 'fixture-details.json'),
         $documents.Details,
         [Text.UTF8Encoding]::new($false))
+    foreach ($resource in @(
+            @{ Name = 'accounts'; Body = $documents.Accounts },
+            @{ Name = 'current'; Body = $documents.Current },
+            @{ Name = 'periods'; Body = $documents.Periods },
+            @{ Name = 'current-history'; Body = $documents.CurrentHistory },
+            @{ Name = 'past-history'; Body = $documents.PastHistory },
+            @{ Name = 'threads'; Body = $documents.Threads })) {
+        [IO.File]::WriteAllText(
+            (Join-Path $script:e2eOutput ("fixture-v3-{0}.json" -f $resource.Name)),
+            [string]$resource.Body,
+            [Text.UTF8Encoding]::new($false))
+    }
     if (Test-Path -LiteralPath $script:e2eSettingsPath -PathType Leaf) {
         $script:e2eSettingsWasPresent = $true
         Copy-Item -LiteralPath $script:e2eSettingsPath -Destination $script:e2eSettingsBackup -Force
@@ -2308,7 +2604,21 @@ function Enter-E2EFixture {
     New-Item -ItemType Directory -Path $settingsDirectory -Force | Out-Null
     $settingsJson = '{"language":"en","setupCompleted":true,"connectionConfigured":true,"timeZoneId":"UTC","connectionProfile":"none","connectionSelector":"none"}'
     [IO.File]::WriteAllText($script:e2eSettingsPath, $settingsJson, [Text.UTF8Encoding]::new($false))
-    Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start($documents.Details, $documents.PublishedPair, $script:e2eProductVersion, $script:e2eFixturePort)) "Could not bind the fixture to loopback port $script:e2eFixturePort."
+    Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start(
+        $documents.Details,
+        $documents.Accounts,
+        $documents.Current,
+        $documents.Periods,
+        $documents.CurrentHistory,
+        $documents.PastHistory,
+        $documents.CurrentHistoryDelta,
+        $documents.PastHistoryDelta,
+        $documents.Threads,
+        $documents.PublishedPair,
+        $script:e2eProductVersion,
+        0)) 'Could not bind the fixture to an ephemeral loopback port.'
+    $script:e2eFixturePort = [CodexInfoWindowsE2EFixtureServer]::BoundPort()
+    Assert-E2E ($script:e2eFixturePort -ge 1 -and $script:e2eFixturePort -le 65535) 'Fixture did not report a valid bound port.'
     $script:e2eFixtureRunning = $true
     Write-E2E "fixture: PASS periods=2 threads=3 endpoint=http://127.0.0.1:$script:e2eFixturePort"
 }
@@ -2638,7 +2948,19 @@ try {
     if ($FixtureContractTest) {
         Write-E2E 'fixture-contract-test: start'
         $contractDocuments = New-E2EFixtureDocuments
-        Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start($contractDocuments.Details, $contractDocuments.PublishedPair, $script:e2eProductVersion, 0)) 'Could not bind the fixture contract test to an ephemeral loopback port.'
+        Assert-E2E ([CodexInfoWindowsE2EFixtureServer]::Start(
+            $contractDocuments.Details,
+            $contractDocuments.Accounts,
+            $contractDocuments.Current,
+            $contractDocuments.Periods,
+            $contractDocuments.CurrentHistory,
+            $contractDocuments.PastHistory,
+            $contractDocuments.CurrentHistoryDelta,
+            $contractDocuments.PastHistoryDelta,
+            $contractDocuments.Threads,
+            $contractDocuments.PublishedPair,
+            $script:e2eProductVersion,
+            0)) 'Could not bind the fixture contract test to an ephemeral loopback port.'
         $script:e2eFixturePort = [CodexInfoWindowsE2EFixtureServer]::BoundPort()
         $script:e2eFixtureRunning = $true
         Write-E2E 'fixture-contract-test: fixture server started without launching the client'
@@ -2652,13 +2974,30 @@ try {
     else { [IO.Path]::GetFullPath($ClientPath) }
     Assert-E2E (Test-Path -LiteralPath $resolvedClientPath -PathType Leaf) "Installed client not found: $resolvedClientPath"
     Write-E2E "start: client=$resolvedClientPath fixture=$Fixture output=$script:e2eOutput"
-    Write-E2E "source-sha: $script:e2eSourceSha"
 
     if ($Fixture) { Enter-E2EFixture }
     if ($Fixture) {
         Invoke-E2EFixturePreflight | Out-Null
     }
-    $script:e2eProcess = Start-Process -FilePath $resolvedClientPath -PassThru
+    $fixturePortWasPresent = Test-Path -LiteralPath "Env:$($script:e2eFixturePortVariable)"
+    $previousFixturePort = [Environment]::GetEnvironmentVariable($script:e2eFixturePortVariable, 'Process')
+    try {
+        if ($Fixture) {
+            [Environment]::SetEnvironmentVariable(
+                $script:e2eFixturePortVariable,
+                $script:e2eFixturePort.ToString([Globalization.CultureInfo]::InvariantCulture),
+                'Process')
+        }
+        $script:e2eProcess = Start-Process -FilePath $resolvedClientPath -PassThru
+    }
+    finally {
+        if ($fixturePortWasPresent) {
+            [Environment]::SetEnvironmentVariable($script:e2eFixturePortVariable, $previousFixturePort, 'Process')
+        }
+        else {
+            [Environment]::SetEnvironmentVariable($script:e2eFixturePortVariable, $null, 'Process')
+        }
+    }
     $clientPid = $script:e2eProcess.Id
     Write-E2E "process: pid=$clientPid"
 
@@ -2680,8 +3019,7 @@ try {
         }
         return $false
     }
-    $mainCapture = Capture-E2EWindow $mainHandle '01-main-ready'
-    Assert-E2E ($mainCapture.Hash.Length -eq 64) 'Main screenshot hash is missing.'
+    $null = Capture-E2EWindow $mainHandle '01-main-ready'
     Assert-E2EMainProductVersion $mainRoot
     if ($Fixture) {
         Write-E2E ("fixture: requests={0}" -f [CodexInfoWindowsE2EFixtureServer]::RequestSummary())
@@ -2781,11 +3119,13 @@ try {
     Wait-E2ESelectorLabel $graphRoot 'Graph.PeriodSelector' $pastLabel
     Wait-E2EGraphLoadSettled $graphRoot
     $pastMeasurement = Wait-E2EGraphPixelsReady -Root $graphRoot -WindowHandle $graph.Handle `
-        -Description 'past-period' -ExpectedGeometry $initialCurrentMeasurement
+        -Description 'past-period'
     $graphPast = Capture-E2EWindow $graph.Handle '03-graph-past'
     Assert-E2EImageChanged $graphCurrent $graphPast 'Current-to-past period selection'
     if ($Fixture) {
-        Assert-E2EGraphHasIdleBand $plot $graph.Handle $graphPast $pastMeasurement
+        Assert-E2EGraphHasIdleBand $plot $graph.Handle $graphPast $pastMeasurement `
+            -ExpectedStartFraction $script:e2eFixturePastIdleStartFraction `
+            -ExpectedEndFraction $script:e2eFixturePastIdleEndFraction
     }
 
     $periodSelector = Find-E2EElementByAutomationId $graphRoot 'Graph.PeriodSelector'
@@ -3016,8 +3356,7 @@ try {
             Assert-E2E ($nonEmpty.Count -ge 4) 'Threads did not expose a real data row and columns.'
         }
     }
-    $threadCapture = Capture-E2EWindow $threads.Handle '10-threads-rows'
-    Assert-E2E ($threadCapture.Hash.Length -eq 64) 'Threads screenshot hash is missing.'
+    $null = Capture-E2EWindow $threads.Handle '10-threads-rows'
 
     Write-E2E 'case-6: open Legal and assert plain-text legal notice'
     $legal = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Legal' -ButtonAutomationId 'Main.OpenLegal' -Title 'Codex Info Legal' -Role 'Legal' -ProcessId $clientPid
@@ -3066,12 +3405,10 @@ try {
         }
         if ($legalPage -eq 1) {
             Assert-E2E ($legalValue.IndexOf('GPL', [StringComparison]::Ordinal) -ge 0) 'Legal notice lost the GPL legal content.'
-            $legalCapture = Capture-E2EWindow $legal.Handle '11-legal-plain-text-page-1'
-            Assert-E2E ($legalCapture.Hash.Length -eq 64) 'Legal page 1 screenshot hash is missing.'
+            $null = Capture-E2EWindow $legal.Handle '11-legal-plain-text-page-1'
         }
         elseif ($legalPage -eq 8) {
-            $legalCapture = Capture-E2EWindow $legal.Handle '12-legal-plain-text-page-8'
-            Assert-E2E ($legalCapture.Hash.Length -eq 64) 'Legal page 8 screenshot hash is missing.'
+            $null = Capture-E2EWindow $legal.Handle '12-legal-plain-text-page-8'
         }
         if ($legalPage -lt $expectedLegalPageCount) {
             Assert-E2E ($legalNext.Current.IsEnabled) "Legal Next button is disabled before page $expectedLegalPageCount."

@@ -9,9 +9,10 @@ using System.Text.Json;
 namespace CodexInfo.WindowsClient.Core;
 
 /// <remarks>
-/// The endpoint and all network policy are fixed here so callers cannot accidentally
-/// turn the client into a general-purpose HTTP client.  A handler constructor is
-/// provided solely to make the transport boundary testable.
+/// The loopback host and all network policy are fixed here so callers cannot accidentally
+/// turn the client into a general-purpose HTTP client.  The installed UI E2E may select
+/// an isolated loopback port for its child process; normal startup always uses port 8787.
+/// A handler constructor is provided solely to make the transport boundary testable.
 /// </remarks>
 public sealed class LoopbackStatusClient :
     ILoopbackHealthClient,
@@ -21,15 +22,18 @@ public sealed class LoopbackStatusClient :
     ILoopbackAccountResourceClient,
     IDisposable
 {
-    private const string AccountsEndpoint = "http://127.0.0.1:8787/v3/accounts";
-    private const string CurrentEndpoint = "http://127.0.0.1:8787/v3/current";
-    private const string HistoryPeriodsEndpoint = "http://127.0.0.1:8787/v3/history/periods";
-    private const string HistoryEndpoint = "http://127.0.0.1:8787/v3/history";
-    private const string ThreadsEndpoint = "http://127.0.0.1:8787/v3/threads";
-    private const string DetailsV3Endpoint = "http://127.0.0.1:8787/v3/details";
-    private const string DetailsV2Endpoint = "http://127.0.0.1:8787/v2/details";
-    private const string DetailsEndpoint = "http://127.0.0.1:8787/v1/details";
-    private const string HealthEndpoint = "http://127.0.0.1:8787/v1/health";
+    private const int DefaultLoopbackPort = 8787;
+    private const string E2EFixturePortVariable = "CODEX_INFO_WINDOWS_E2E_FIXTURE_PORT";
+    private static readonly string EndpointRoot = ResolveEndpointRoot();
+    private static readonly string AccountsEndpoint = $"{EndpointRoot}/v3/accounts";
+    private static readonly string CurrentEndpoint = $"{EndpointRoot}/v3/current";
+    private static readonly string HistoryPeriodsEndpoint = $"{EndpointRoot}/v3/history/periods";
+    private static readonly string HistoryEndpoint = $"{EndpointRoot}/v3/history";
+    private static readonly string ThreadsEndpoint = $"{EndpointRoot}/v3/threads";
+    private static readonly string DetailsV3Endpoint = $"{EndpointRoot}/v3/details";
+    private static readonly string DetailsV2Endpoint = $"{EndpointRoot}/v2/details";
+    private static readonly string DetailsEndpoint = $"{EndpointRoot}/v1/details";
+    private static readonly string HealthEndpoint = $"{EndpointRoot}/v1/health";
     private const string PublishedPairHeader = "Codex-Info-Published-Pair";
     private const int MaxResponseHeaderBytes = 8 * 1024;
     private const int MaxHealthBodyBytes = 1024;
@@ -1390,6 +1394,22 @@ public sealed class LoopbackStatusClient :
     }
 
     public void Dispose() => _httpClient.Dispose();
+
+    private static string ResolveEndpointRoot()
+    {
+        var configuredPort = Environment.GetEnvironmentVariable(E2EFixturePortVariable);
+        if (string.IsNullOrWhiteSpace(configuredPort))
+        {
+            return $"http://127.0.0.1:{DefaultLoopbackPort}";
+        }
+
+        if (!int.TryParse(configuredPort.Trim(), out var port) || port is < 1 or > 65_535)
+        {
+            throw new InvalidOperationException($"{E2EFixturePortVariable} must be a valid TCP port.");
+        }
+
+        return $"http://127.0.0.1:{port}";
+    }
 
     private static HttpMessageHandler CreateDefaultHandler() => new HttpClientHandler
     {

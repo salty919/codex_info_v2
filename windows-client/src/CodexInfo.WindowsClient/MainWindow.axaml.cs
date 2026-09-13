@@ -248,8 +248,8 @@ public partial class MainWindow : Window
             return;
         }
 
-        window.Width = width;
-        window.Height = height;
+        window.Width = Math.Clamp(width, window.MinWidth, window.MaxWidth);
+        window.Height = Math.Clamp(height, window.MinHeight, window.MaxHeight);
     }
 
     private void OnTitlePointerPressed(object? sender, PointerPressedEventArgs eventArgs)

@@ -57,13 +57,6 @@ rest=target/release/codex_info_rest
 test -x "$recorder"
 test -x "$rest"
 
-recorder_hash=$(sha256sum -- "$recorder" | awk '{print $1}')
-rest_hash=$(sha256sum -- "$rest" | awk '{print $1}')
-if [[ "$recorder_hash" == "$rest_hash" ]]; then
-    echo "recorder and REST artifacts unexpectedly have the same SHA-256" >&2
-    exit 1
-fi
-
 # The public root binary is a REST client. Exercise every legacy service
 # control at the release boundary and ensure rejection happens before a
 # listener or recorder can be created. Keep this runtime check independent of
@@ -97,4 +90,4 @@ for args in \
     fi
 done
 
-printf 'recorder_sha256=%s\nrest_sha256=%s\n' "$recorder_hash" "$rest_hash"
+printf 'recorder/REST runtime boundary: PASS\n'

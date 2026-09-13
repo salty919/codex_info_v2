@@ -202,6 +202,19 @@ impl ReadIntervals {
             .any(|interval| interval.contains(timestamp))
     }
 
+    /// Canonical history timestamps identify a complete minute bucket rather
+    /// than the exact second at which its source observation was accepted.
+    /// Keep that bucket when any of its seconds belong to this account. Raw
+    /// Session/task/thread timestamps continue to use exact `contains`.
+    fn intersects_canonical_minute(&self, timestamp: i64) -> bool {
+        let minute_start = timestamp.saturating_sub(timestamp.rem_euclid(60));
+        let minute_end = minute_start.saturating_add(60);
+        self.0.iter().any(|interval| {
+            interval.end_at.is_none_or(|end| end > minute_start)
+                && interval.start_at.is_none_or(|start| start < minute_end)
+        })
+    }
+
     fn interval_containing(&self, timestamp: i64) -> Option<ReadInterval> {
         self.0
             .iter()
@@ -431,7 +444,14 @@ impl DbReader {
         let history_is_canonical = self.expected_partition_identity.is_some();
         let raw = read_history(&transaction, history_is_canonical)?
             .into_iter()
-            .filter(|row| self.read_intervals.contains(row.timestamp))
+            .filter(|row| {
+                if history_is_canonical {
+                    self.read_intervals
+                        .intersects_canonical_minute(row.timestamp)
+                } else {
+                    self.read_intervals.contains(row.timestamp)
+                }
+            })
             .collect::<Vec<_>>();
         let generation = read_generation(&transaction, raw.iter().map(|row| row.timestamp))?;
         let task_evidence = read_task_activity_evidence_for_intervals(
@@ -567,14 +587,6 @@ struct StoredActiveThread {
     last_user_message_at: Option<i64>,
     is_subagent: bool,
     depth: Option<i32>,
-}
-
-fn read_active_thread_snapshot_or_degraded(connection: &Connection) -> (Vec<PublicThread>, bool) {
-    // Active-thread presence is auxiliary to the durable usage history. A
-    // malformed or unreadable thread row must not make quota, model totals,
-    // or history disappear; publish those values as degraded and retry the
-    // complete thread snapshot on the next recorder generation.
-    read_active_thread_snapshot(connection).unwrap_or_else(|_| (Vec::new(), true))
 }
 
 fn read_active_thread_snapshot_or_degraded_for_intervals(
@@ -775,12 +787,6 @@ fn active_thread_table_shape(connection: &Connection) -> Result<bool, ReaderErro
 /// Reads the optional singleton publication row.  Missing tables and rows are
 /// the legacy empty state; a present but malformed candidate rejects the
 /// whole read so REST can retain its last-good pair.
-fn read_active_thread_snapshot(
-    connection: &Connection,
-) -> Result<(Vec<PublicThread>, bool), ReaderError> {
-    read_active_thread_snapshot_for_intervals(connection, &ReadIntervals::unbounded())
-}
-
 fn read_active_thread_snapshot_for_intervals(
     connection: &Connection,
     intervals: &ReadIntervals,
@@ -1877,6 +1883,7 @@ fn read_history_projection_for_intervals(
     Ok(history.into_values().collect())
 }
 
+#[cfg(test)]
 fn assign_task_activity(
     history: &mut BTreeMap<(i64, i64), PublicHistoryObservationV3>,
     periods: &[PublicHistoryPeriod],
@@ -2098,7 +2105,7 @@ impl TaskActivityIntervals {
         activity.verified_idle_union = merge_closed_intervals(activity.verified_idle.clone());
         activity
             .verified_transition_minutes
-            .retain(|timestamp| intervals.contains(*timestamp));
+            .retain(|timestamp| intervals.intersects_canonical_minute(*timestamp));
         activity
     }
 }
@@ -2356,7 +2363,7 @@ fn read_stored_history_observations_for_intervals(
             // history or unrelated sidecar rows.
             continue;
         };
-        if intervals.contains(observation.timestamp) {
+        if intervals.intersects_canonical_minute(observation.timestamp) {
             observations.insert((observation.reset_at, observation.timestamp), observation);
         }
     }
@@ -2450,7 +2457,7 @@ fn read_history_model_groups_for_intervals(
         let Some(timestamp) = sql_i64(row, 1) else {
             continue;
         };
-        if !intervals.contains(timestamp) {
+        if !intervals.intersects_canonical_minute(timestamp) {
             continue;
         }
         let complete_index = if has_cache_write { 8 } else { 7 };
@@ -3188,20 +3195,15 @@ fn canonicalize_history_with_sources_and_limit(
         for (minute, mut minute_rows) in by_minute {
             minute_rows.sort_by_key(|row| (row.source_timestamp, row.source_reset_at));
             let mut final_quota = None;
-            let mut quota_increased = false;
+            let mut quota_conflicted = false;
             for value in minute_rows.iter().filter_map(|row| row.remaining_percent) {
-                if final_quota.is_some_and(|previous| value > previous) {
-                    quota_increased = true;
+                if final_quota.is_some_and(|previous| value != previous) {
+                    quota_conflicted = true;
                     break;
                 }
                 final_quota = Some(value);
             }
-            if quota_increased {
-                if reject_ambiguous {
-                    return Err(ReaderError::InvalidValue(format!(
-                        "history remaining quota increases within minute {minute}"
-                    )));
-                }
+            if quota_conflicted {
                 continue;
             }
             let maximums = minute_rows.iter().fold(
@@ -3226,11 +3228,6 @@ fn canonicalize_history_with_sources_and_limit(
                     && final_quota.is_none_or(|remaining| row.remaining_percent == Some(remaining))
             });
             let Some(dominant) = dominant else {
-                if reject_ambiguous {
-                    return Err(ReaderError::InvalidValue(format!(
-                        "history minute has no observed row containing its canonical values at timestamp {minute}"
-                    )));
-                }
                 continue;
             };
             let mut sample = public_sample_from_raw(&dominant.row);
@@ -3587,7 +3584,7 @@ fn read_model_projection_for_intervals(
         let Some(timestamp) = sql_i64(row, 1) else {
             continue;
         };
-        if !intervals.contains(timestamp) {
+        if !intervals.intersects_canonical_minute(timestamp) {
             continue;
         }
         let Some(model) = sql_text(row, 2) else {
@@ -4069,7 +4066,7 @@ mod tests {
             .expect("canonical fixture schema version");
         connection
             .execute_batch(
-                "CREATE TABLE usage_model_history(
+                "CREATE TABLE IF NOT EXISTS usage_model_history(
                     reset_at INTEGER NOT NULL,
                     timestamp INTEGER NOT NULL,
                     model TEXT NOT NULL
@@ -4505,12 +4502,46 @@ mod tests {
         let boundary = 1_800_000_017_i64;
         let visible_boundary = boundary - boundary.rem_euclid(60);
         make_boundary_db(&path, boundary);
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".to_owned(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 13,
+            partition_id: "33".repeat(32),
+        };
+        let connection = Connection::open(&path).expect("subminute fixture db");
+        connection
+            .execute(
+                "DELETE FROM usage_history WHERE timestamp != ?1",
+                [boundary],
+            )
+            .expect("retain first owned history observation");
+        connection
+            .execute(
+                "UPDATE usage_history SET timestamp=?1 WHERE timestamp=?2",
+                params![visible_boundary, boundary],
+            )
+            .expect("canonicalize history minute");
+        connection
+            .execute(
+                "DELETE FROM usage_model_history WHERE timestamp != ?1",
+                [boundary],
+            )
+            .expect("retain first owned model observation");
+        connection
+            .execute(
+                "UPDATE usage_model_history SET timestamp=?1 WHERE timestamp=?2",
+                params![visible_boundary, boundary],
+            )
+            .expect("canonicalize model minute");
+        drop(connection);
+        add_partition_identity(&path, &identity);
         let intervals = ReadIntervals::new(vec![
             ReadInterval::new(Some(boundary), None).expect("current interval")
         ])
         .expect("current lifecycle domain");
 
-        let snapshot = DbReader::open_with_intervals(&path, intervals)
+        let snapshot = DbReader::open_partitioned_with_intervals(&path, &identity, intervals)
             .expect("bounded reader")
             .read_snapshot()
             .expect("subminute activation snapshot");
@@ -4519,7 +4550,8 @@ mod tests {
             .details
             .validate()
             .expect("valid public projection");
-        assert_eq!(snapshot.details.observed_at, Some(boundary + 60));
+        assert_eq!(snapshot.details.observed_at, Some(visible_boundary));
+        assert!(snapshot.details.authenticated);
         assert!(snapshot
             .details
             .history_samples
@@ -4530,7 +4562,7 @@ mod tests {
             .history_periods
             .iter()
             .all(|period| period.start_at >= visible_boundary));
-        assert_eq!(snapshot.models_v3[0].total_tokens, 30);
+        assert_eq!(snapshot.models_v3[0].total_tokens, 20);
 
         fs::remove_file(path).expect("cleanup");
     }
@@ -5595,7 +5627,7 @@ mod tests {
     }
 
     #[test]
-    fn same_period_quota_transition_retains_latest_dominant_source() {
+    fn same_period_quota_conflict_excludes_only_its_minute() {
         let minute = 1_800_000_000;
         let reset_at = 1_800_604_800;
         let row = |timestamp, remaining_percent, sol_tokens| RawSample {
@@ -5617,19 +5649,13 @@ mod tests {
 
         let canonical =
             canonicalize_history_for_storage_with_sources(&rows, Some(reset_at), 604_800)
-                .expect("a decreasing in-minute quota transition is one valid observation series");
+                .expect("one conflicted minute must not reject the complete candidate");
 
-        assert_eq!(canonical.len(), 1);
-        assert_eq!(canonical[0].sample.timestamp, minute);
-        assert_eq!(canonical[0].sample.reset_at, reset_at);
-        assert_eq!(canonical[0].sample.remaining_percent, Some(99.0));
-        assert_eq!(canonical[0].sample.sol_tokens, 30);
-        assert_eq!(canonical[0].source_timestamp, minute + 58);
-        assert_eq!(canonical[0].source_reset_at, reset_at);
+        assert!(canonical.is_empty());
     }
 
     #[test]
-    fn ambiguous_owned_minute_is_hidden_publicly_and_rejected_for_storage() {
+    fn ambiguous_owned_minute_is_excluded_from_public_and_storage() {
         let minute = 1_800_000_000;
         let reset_at = 1_800_604_800;
         let row = |timestamp, remaining_percent, sol_tokens, luna_tokens| -> RawSample {
@@ -5660,7 +5686,8 @@ mod tests {
             Some(reset_at),
             604_800,
         )
-        .is_err());
+        .expect("one quota-conflicted minute must not reject the complete candidate")
+        .is_empty());
 
         let incomparable = vec![
             row(minute + 5, Some(100.0), 20, 10),
@@ -5676,7 +5703,8 @@ mod tests {
             Some(reset_at),
             604_800,
         )
-        .is_err());
+        .expect("one incomparable minute must not reject the complete candidate")
+        .is_empty());
     }
 
     #[test]

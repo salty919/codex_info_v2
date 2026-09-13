@@ -665,6 +665,7 @@ const OBSERVATION_JSON_KEYS: &[&str] = &[
     "luna_tokens",
     "model_source",
 ];
+const OBSERVATION_SOURCE_TIMESTAMP_KEY: &str = "source_timestamp";
 const MAX_RECORDED_ROOT_IDENTITY_BYTES: usize = 256;
 const MAX_RECORDED_RELATIVE_PATH_BYTES: usize = 4_096;
 /// Maximum minute buckets materialized by a single one-month history read.
@@ -2303,21 +2304,75 @@ pub enum QuotaTransition {
     Rejected,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PreviousQuotaState {
+    pub reset_at: Option<i64>,
+    pub window_seconds: i64,
+    pub observed_at: Option<i64>,
+    pub remaining_percent: Option<f64>,
+}
+
+impl PreviousQuotaState {
+    pub const fn new(
+        reset_at: Option<i64>,
+        window_seconds: i64,
+        observed_at: Option<i64>,
+        remaining_percent: Option<f64>,
+    ) -> Self {
+        Self {
+            reset_at,
+            window_seconds,
+            observed_at,
+            remaining_percent,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuotaCandidate {
+    pub reset_at: i64,
+    pub window_seconds: i64,
+    pub remaining_percent: Option<f64>,
+    pub observed_at: i64,
+}
+
+impl QuotaCandidate {
+    pub const fn new(
+        reset_at: i64,
+        window_seconds: i64,
+        remaining_percent: Option<f64>,
+        observed_at: i64,
+    ) -> Self {
+        Self {
+            reset_at,
+            window_seconds,
+            remaining_percent,
+            observed_at,
+        }
+    }
+}
+
 /// Classify a raw quota observation before choosing its durable period key.
 /// `reset_at` is a mutable provider observation, so a replacement timestamp is
 /// never a boundary by itself. A boundary needs either a quota recovery at the
 /// replacement window's observed start or a successor window whose start
 /// matches the accepted deadline.
 pub fn classify_quota_transition(
-    previous_reset_at: Option<i64>,
-    previous_window_seconds: i64,
-    previous_observed_at: Option<i64>,
-    previous_remaining_percent: Option<f64>,
-    next_reset_at: i64,
-    next_window_seconds: i64,
-    next_remaining_percent: Option<f64>,
-    observed_at: i64,
+    previous: PreviousQuotaState,
+    candidate: QuotaCandidate,
 ) -> QuotaTransition {
+    let PreviousQuotaState {
+        reset_at: previous_reset_at,
+        window_seconds: previous_window_seconds,
+        observed_at: previous_observed_at,
+        remaining_percent: previous_remaining_percent,
+    } = previous;
+    let QuotaCandidate {
+        reset_at: next_reset_at,
+        window_seconds: next_window_seconds,
+        remaining_percent: next_remaining_percent,
+        observed_at,
+    } = candidate;
     let next_start_at = next_reset_at.checked_sub(next_window_seconds);
     let candidate_is_valid = observed_at > 0
         && next_reset_at > observed_at
@@ -2385,14 +2440,18 @@ pub fn select_predeadline_quota_authority(
     let current_observation = current.last_quota_observation.as_ref()?;
     if current.data_generation == 0
         || classify_quota_transition(
-            None,
-            0,
-            None,
-            None,
-            current.reset_at,
-            current.window_seconds,
-            Some(current_observation.remaining_percent),
-            current_observation.observed_at,
+            PreviousQuotaState {
+                reset_at: None,
+                window_seconds: 0,
+                observed_at: None,
+                remaining_percent: None,
+            },
+            QuotaCandidate {
+                reset_at: current.reset_at,
+                window_seconds: current.window_seconds,
+                remaining_percent: Some(current_observation.remaining_percent),
+                observed_at: current_observation.observed_at,
+            },
         ) != QuotaTransition::Initial
     {
         return None;
@@ -2408,25 +2467,33 @@ pub fn select_predeadline_quota_authority(
                 && observation.observed_at <= current_observation.observed_at
                 && candidate.reset_at > current_observation.observed_at
                 && classify_quota_transition(
-                    None,
-                    0,
-                    None,
-                    None,
-                    candidate.reset_at,
-                    candidate.window_seconds,
-                    Some(observation.remaining_percent),
-                    observation.observed_at,
+                    PreviousQuotaState {
+                        reset_at: None,
+                        window_seconds: 0,
+                        observed_at: None,
+                        remaining_percent: None,
+                    },
+                    QuotaCandidate {
+                        reset_at: candidate.reset_at,
+                        window_seconds: candidate.window_seconds,
+                        remaining_percent: Some(observation.remaining_percent),
+                        observed_at: observation.observed_at,
+                    },
                 ) == QuotaTransition::Initial
                 && matches!(
                     classify_quota_transition(
-                        Some(candidate.reset_at),
-                        candidate.window_seconds,
-                        Some(observation.observed_at),
-                        Some(observation.remaining_percent),
-                        current.reset_at,
-                        current.window_seconds,
-                        Some(current_observation.remaining_percent),
-                        current_observation.observed_at,
+                        PreviousQuotaState {
+                            reset_at: Some(candidate.reset_at),
+                            window_seconds: candidate.window_seconds,
+                            observed_at: Some(observation.observed_at),
+                            remaining_percent: Some(observation.remaining_percent),
+                        },
+                        QuotaCandidate {
+                            reset_at: current.reset_at,
+                            window_seconds: current.window_seconds,
+                            remaining_percent: Some(current_observation.remaining_percent),
+                            observed_at: current_observation.observed_at,
+                        },
                     ),
                     QuotaTransition::SamePeriod | QuotaTransition::Rejected
                 )
@@ -3245,14 +3312,18 @@ fn validate_cumulative_recovery_source_generation(
         ));
     }
     let transition = classify_quota_transition(
-        Some(recovery.canonical_reset_at),
-        recovery.window_seconds,
-        Some(canonical_observation.observed_at),
-        Some(canonical_observation.remaining_percent),
-        source.reset_at,
-        source.window_seconds,
-        Some(source.remaining_percent),
-        source.observed_at,
+        PreviousQuotaState::new(
+            Some(recovery.canonical_reset_at),
+            recovery.window_seconds,
+            Some(canonical_observation.observed_at),
+            Some(canonical_observation.remaining_percent),
+        ),
+        QuotaCandidate::new(
+            source.reset_at,
+            source.window_seconds,
+            Some(source.remaining_percent),
+            source.observed_at,
+        ),
     );
     match transition {
         QuotaTransition::SamePeriod => {
@@ -3322,23 +3393,69 @@ fn last_quota_observation_for_reset(
         .map_err(|_| UsageStoreError::GenerationOverflow)?;
     let lower = reset_at.saturating_sub(tolerance).max(1);
     let upper = reset_at.saturating_add(tolerance);
-    let observation = connection
+    // `usage_history.timestamp` is the graph's canonical minute. Quota
+    // transition ordering instead needs the exact acquisition second retained
+    // in its durable observation sidecar. Legacy sidecars have no explicit
+    // source timestamp, so their original data_generation remains the fallback.
+    let durable = connection
         .query_row(
-            "SELECT timestamp, remaining_percent
+            "SELECT data_generation, data_hash, snapshot_json
+             FROM durable_state
+             WHERE singleton >= ?1
+               AND json_valid(snapshot_json)
+               AND json_extract(snapshot_json, '$.reset_at') BETWEEN ?2 AND ?3
+               AND json_type(snapshot_json, '$.remaining_percent') IN ('integer', 'real')
+               AND (
+                   json_type(snapshot_json, '$.source_timestamp') IS NULL
+                   OR json_type(snapshot_json, '$.source_timestamp') = 'integer'
+               )
+             ORDER BY COALESCE(
+                          json_extract(snapshot_json, '$.source_timestamp'),
+                          data_generation
+                      ) DESC,
+                      data_generation DESC,
+                      singleton DESC
+             LIMIT 1",
+            params![DURABLE_STATE_OBSERVATION_MIN_SINGLETON, lower, upper],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let observation = if let Some((generation, hash, snapshot_json)) = durable {
+        let observed_at = observation_source_timestamp(&snapshot_json)?;
+        let durable = observation_from_sql(generation, hash, snapshot_json)?;
+        Some(SessionQuotaObservation {
+            observed_at,
+            remaining_percent: durable.remaining_percent.ok_or_else(|| {
+                UsageStoreError::InvalidImport(
+                    "last durable quota observation has no percentage".into(),
+                )
+            })?,
+        })
+    } else {
+        connection
+            .query_row(
+                "SELECT timestamp, remaining_percent
              FROM usage_history
              WHERE reset_at BETWEEN ?1 AND ?2
                AND remaining_percent IS NOT NULL
              ORDER BY timestamp DESC, reset_at DESC
              LIMIT 1",
-            params![lower, upper],
-            |row| {
-                Ok(SessionQuotaObservation {
-                    observed_at: row.get(0)?,
-                    remaining_percent: row.get(1)?,
-                })
-            },
-        )
-        .optional()?;
+                params![lower, upper],
+                |row| {
+                    Ok(SessionQuotaObservation {
+                        observed_at: row.get(0)?,
+                        remaining_percent: row.get(1)?,
+                    })
+                },
+            )
+            .optional()?
+    };
     if observation.as_ref().is_some_and(|value| {
         value.observed_at <= 0
             || !value.remaining_percent.is_finite()
@@ -4805,12 +4922,17 @@ fn canonicalize_task_evidence(
     Ok((canonical_ranges, canonical_events))
 }
 
-fn canonicalize_observations(
+struct CanonicalizedObservations {
+    rows: Vec<UsageHistoryObservation>,
+    source_timestamps: BTreeMap<(i64, i64), i64>,
+}
+
+fn canonicalize_observations_with_sources(
     transaction: &rusqlite::Transaction<'_>,
     observations: &[UsageHistoryObservation],
     canonical_samples: &[UsageHistorySample],
     source_to_canonical: &BTreeMap<(i64, i64), (i64, i64)>,
-) -> Result<Vec<UsageHistoryObservation>> {
+) -> Result<CanonicalizedObservations> {
     let canonical_storage = canonical_history_constraints_present(transaction)?;
     let samples_by_timestamp = canonical_samples
         .iter()
@@ -4821,9 +4943,11 @@ fn canonicalize_observations(
         .map(|sample| ((sample.reset_at, sample.timestamp), sample))
         .collect::<BTreeMap<_, _>>();
     let mut canonical = BTreeMap::new();
+    let mut source_timestamps = BTreeMap::new();
     for observation in observations {
         observation.validate()?;
         let mut observation = observation.clone();
+        let source_timestamp = observation.timestamp;
         if canonical_storage && observation.model_source != ModelSource::Unavailable {
             let source_key = (observation.reset_at, observation.timestamp);
             let Some((canonical_reset_at, canonical_timestamp)) =
@@ -4844,6 +4968,7 @@ fn canonicalize_observations(
                 "duplicate usage observation key".into(),
             ));
         }
+        source_timestamps.insert(key, source_timestamp);
     }
     for (key, observation) in canonical.iter_mut() {
         match observation.model_source {
@@ -4909,12 +5034,40 @@ fn canonicalize_observations(
         }
         observation.validate()?;
     }
-    Ok(canonical.into_values().collect())
+    Ok(CanonicalizedObservations {
+        rows: canonical.into_values().collect(),
+        source_timestamps,
+    })
 }
 
+#[cfg(test)]
+fn canonicalize_observations(
+    transaction: &rusqlite::Transaction<'_>,
+    observations: &[UsageHistoryObservation],
+    canonical_samples: &[UsageHistorySample],
+    source_to_canonical: &BTreeMap<(i64, i64), (i64, i64)>,
+) -> Result<Vec<UsageHistoryObservation>> {
+    canonicalize_observations_with_sources(
+        transaction,
+        observations,
+        canonical_samples,
+        source_to_canonical,
+    )
+    .map(|canonical| canonical.rows)
+}
+
+#[cfg(test)]
 fn upsert_observations(
     transaction: &rusqlite::Transaction<'_>,
     observations: &[UsageHistoryObservation],
+) -> Result<Vec<UsageHistoryObservation>> {
+    upsert_observations_with_sources(transaction, observations, &BTreeMap::new())
+}
+
+fn upsert_observations_with_sources(
+    transaction: &rusqlite::Transaction<'_>,
+    observations: &[UsageHistoryObservation],
+    source_timestamps: &BTreeMap<(i64, i64), i64>,
 ) -> Result<Vec<UsageHistoryObservation>> {
     if observations.is_empty() {
         return Ok(Vec::new());
@@ -4931,7 +5084,10 @@ fn upsert_observations(
     }
     let mut persisted = BTreeMap::new();
     for observation in observations {
-        let snapshot_json = observation_json(observation)?;
+        let source_timestamp = source_timestamps
+            .get(&(observation.reset_at, observation.timestamp))
+            .copied();
+        let snapshot_json = observation_json_with_source_timestamp(observation, source_timestamp)?;
         let data_hash = observation_data_hash(observation.reset_at, observation.timestamp);
         let existing: Option<(i64, i64, String)> = transaction
             .query_row(
@@ -4975,7 +5131,11 @@ fn upsert_observations(
                 existing.clone()
             };
         if selected != existing {
-            let selected_json = observation_json(&selected)?;
+            let selected_source_timestamp = source_timestamps
+                .get(&(selected.reset_at, selected.timestamp))
+                .copied();
+            let selected_json =
+                observation_json_with_source_timestamp(&selected, selected_source_timestamp)?;
             transaction.execute(
                 "UPDATE durable_state SET data_generation = ?1, snapshot_json = ?2
                  WHERE singleton = ?3",
@@ -5571,11 +5731,6 @@ fn canonicalize_legacy_usage_history(
     .map_err(|error| {
         UsageStoreError::InvalidImport(format!("history canonicalization failed: {error}"))
     })?;
-    if !legacy.is_empty() && canonical.is_empty() {
-        return Err(UsageStoreError::InvalidImport(
-            "non-empty history has no unambiguous canonical rows".into(),
-        ));
-    }
     let mut timestamps = BTreeSet::new();
     canonical
         .into_iter()
@@ -5642,7 +5797,7 @@ fn model_source_rank(source: ModelSource) -> u8 {
 fn canonicalize_durable_history_observations(
     connection: &Connection,
     canonical_rows: &[CanonicalHistoryMigrationRow],
-) -> Result<Vec<(i64, UsageHistoryObservation)>> {
+) -> Result<Vec<(i64, UsageHistoryObservation, i64)>> {
     let canonical_by_source = canonical_rows
         .iter()
         .map(|row| ((row.source_timestamp, row.source_reset_at), &row.sample))
@@ -5652,10 +5807,12 @@ fn canonicalize_durable_history_observations(
          FROM durable_state WHERE singleton >= ?1 ORDER BY singleton",
     )?;
     let mut rows = statement.query([DURABLE_STATE_OBSERVATION_MIN_SINGLETON])?;
-    let mut selected = BTreeMap::<i64, (i64, UsageHistoryObservation)>::new();
+    let mut selected = BTreeMap::<i64, (i64, UsageHistoryObservation, i64)>::new();
     while let Some(row) = rows.next()? {
         let singleton: i64 = row.get(0)?;
-        let mut observation = observation_from_sql(row.get(1)?, row.get(2)?, row.get(3)?)?;
+        let snapshot_json: String = row.get(3)?;
+        let source_timestamp = observation_source_timestamp(&snapshot_json)?;
+        let mut observation = observation_from_sql(row.get(1)?, row.get(2)?, snapshot_json)?;
         let Some(sample) = canonical_by_source.get(&(observation.timestamp, observation.reset_at))
         else {
             continue;
@@ -5668,16 +5825,18 @@ fn canonicalize_durable_history_observations(
         observation.timestamp = sample.timestamp;
         observation.reset_at = sample.reset_at;
         observation.validate()?;
-        let replace = selected
-            .get(&sample.timestamp)
-            .is_none_or(|(stored_singleton, stored)| {
-                model_source_rank(observation.model_source) > model_source_rank(stored.model_source)
-                    || (model_source_rank(observation.model_source)
-                        == model_source_rank(stored.model_source)
-                        && singleton < *stored_singleton)
-            });
+        let replace =
+            selected
+                .get(&sample.timestamp)
+                .is_none_or(|(stored_singleton, stored, _)| {
+                    model_source_rank(observation.model_source)
+                        > model_source_rank(stored.model_source)
+                        || (model_source_rank(observation.model_source)
+                            == model_source_rank(stored.model_source)
+                            && singleton < *stored_singleton)
+                });
         if replace {
-            selected.insert(sample.timestamp, (singleton, observation));
+            selected.insert(sample.timestamp, (singleton, observation, source_timestamp));
         }
     }
     Ok(selected.into_values().collect())
@@ -5687,7 +5846,7 @@ fn rewrite_canonical_history(
     transaction: &rusqlite::Transaction<'_>,
     canonical_samples: &[UsageHistorySample],
     canonical_models: &[HistoryModelGroup],
-    canonical_observations: &[(i64, UsageHistoryObservation)],
+    canonical_observations: &[(i64, UsageHistoryObservation, i64)],
 ) -> Result<()> {
     transaction.execute("DELETE FROM usage_model_history", [])?;
     transaction.execute(
@@ -5750,12 +5909,12 @@ fn rewrite_canonical_history(
             "INSERT INTO durable_state (singleton, data_generation, data_hash, snapshot_json)
              VALUES (?1, ?2, ?3, ?4)",
         )?;
-        for (singleton, observation) in canonical_observations {
+        for (singleton, observation, source_timestamp) in canonical_observations {
             insert.execute(params![
                 singleton,
                 observation.timestamp,
                 observation_data_hash(observation.reset_at, observation.timestamp),
-                observation_json(observation)?,
+                observation_json_with_source_timestamp(observation, Some(*source_timestamp))?,
             ])?;
         }
     }
@@ -5955,8 +6114,11 @@ fn observation_data_hash(reset_at: i64, timestamp: i64) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn observation_json_value(observation: &UsageHistoryObservation) -> serde_json::Value {
-    serde_json::json!({
+fn observation_json_value(
+    observation: &UsageHistoryObservation,
+    source_timestamp: Option<i64>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
         "kind": OBSERVATION_JSON_KIND,
         "timestamp": observation.timestamp,
         "reset_at": observation.reset_at,
@@ -5968,16 +6130,41 @@ fn observation_json_value(observation: &UsageHistoryObservation) -> serde_json::
         "terra_tokens": observation.terra_tokens,
         "luna_tokens": observation.luna_tokens,
         "model_source": observation.model_source.as_str(),
-    })
+    });
+    if let Some(source_timestamp) = source_timestamp {
+        value
+            .as_object_mut()
+            .expect("observation JSON is an object")
+            .insert(
+                OBSERVATION_SOURCE_TIMESTAMP_KEY.to_owned(),
+                serde_json::Value::from(source_timestamp),
+            );
+    }
+    value
 }
 
+#[cfg(test)]
 fn observation_json(observation: &UsageHistoryObservation) -> Result<String> {
+    observation_json_with_source_timestamp(observation, None)
+}
+
+fn observation_json_with_source_timestamp(
+    observation: &UsageHistoryObservation,
+    source_timestamp: Option<i64>,
+) -> Result<String> {
     observation.validate()?;
-    let encoded = serde_json::to_string(&observation_json_value(observation)).map_err(|error| {
-        UsageStoreError::InvalidDurableRecord(format!(
-            "observation JSON serialization failed: {error}"
-        ))
-    })?;
+    if source_timestamp.is_some_and(|timestamp| !(1..=MAX_PUBLIC_UNIX_SECONDS).contains(&timestamp))
+    {
+        return Err(UsageStoreError::InvalidDurableRecord(
+            "observation source timestamp is invalid".into(),
+        ));
+    }
+    let encoded = serde_json::to_string(&observation_json_value(observation, source_timestamp))
+        .map_err(|error| {
+            UsageStoreError::InvalidDurableRecord(format!(
+                "observation JSON serialization failed: {error}"
+            ))
+        })?;
     validate_observation_json(&encoded)?;
     Ok(encoded)
 }
@@ -5999,7 +6186,9 @@ fn validate_observation_json(snapshot_json: &str) -> Result<serde_json::Value> {
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
-    if actual != expected {
+    let mut expected_with_source = expected.clone();
+    expected_with_source.insert(OBSERVATION_SOURCE_TIMESTAMP_KEY);
+    if actual != expected && actual != expected_with_source {
         return Err(UsageStoreError::InvalidDurableRecord(
             "observation JSON fields differ from the strict contract".into(),
         ));
@@ -6009,7 +6198,29 @@ fn validate_observation_json(snapshot_json: &str) -> Result<serde_json::Value> {
             "observation JSON kind is invalid".into(),
         ));
     }
+    if let Some(source_timestamp) = object.get(OBSERVATION_SOURCE_TIMESTAMP_KEY) {
+        if !source_timestamp
+            .as_i64()
+            .is_some_and(|timestamp| (1..=MAX_PUBLIC_UNIX_SECONDS).contains(&timestamp))
+        {
+            return Err(UsageStoreError::InvalidDurableRecord(
+                "observation source timestamp is invalid".into(),
+            ));
+        }
+    }
     Ok(value)
+}
+
+fn observation_source_timestamp(snapshot_json: &str) -> Result<i64> {
+    let value = validate_observation_json(snapshot_json)?;
+    value
+        .get(OBSERVATION_SOURCE_TIMESTAMP_KEY)
+        .or_else(|| value.get("timestamp"))
+        .and_then(serde_json::Value::as_i64)
+        .filter(|timestamp| *timestamp > 0)
+        .ok_or_else(|| {
+            UsageStoreError::InvalidDurableRecord("observation source timestamp is invalid".into())
+        })
 }
 
 fn observation_from_sql(
@@ -8469,9 +8680,12 @@ impl UsageStore {
         let mut rows = statement.query(params![cutoff, now_timestamp])?;
         let mut samples = Vec::with_capacity(MAX_RECENT_HISTORY_SAMPLES);
         while let Some(row) = rows.next()? {
-            if let Some(sample) = valid_sample_from_row(row)? {
-                samples.push(sample);
-            }
+            let Some(sample) = valid_sample_from_row(row)? else {
+                return Err(UsageStoreError::InvalidImport(
+                    "usage_history contains an invalid row".into(),
+                ));
+            };
+            samples.push(sample);
         }
         samples.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
         Ok(samples)
@@ -8775,14 +8989,18 @@ impl UsageStore {
                 return Ok(None);
             };
             let transition = classify_quota_transition(
-                Some(canonical_reset_at),
-                window_seconds,
-                Some(canonical_observation.timestamp),
-                canonical_observation.remaining_percent,
-                source_state.reset_at,
-                source_state.window_seconds,
-                Some(source_observation.remaining_percent),
-                source_observation.observed_at,
+                PreviousQuotaState::new(
+                    Some(canonical_reset_at),
+                    window_seconds,
+                    Some(canonical_observation.timestamp),
+                    canonical_observation.remaining_percent,
+                ),
+                QuotaCandidate::new(
+                    source_state.reset_at,
+                    source_state.window_seconds,
+                    Some(source_observation.remaining_percent),
+                    source_observation.observed_at,
+                ),
             );
             if canonical_reset_at <= source_observation.observed_at
                 || !matches!(
@@ -10776,7 +10994,10 @@ impl UsageStore {
             preserve_existing_before,
         )?;
         let canonical_samples = canonical_projection.rows;
-        let canonical_observations = canonicalize_observations(
+        let CanonicalizedObservations {
+            rows: canonical_observations,
+            source_timestamps: observation_source_timestamps,
+        } = canonicalize_observations_with_sources(
             &transaction,
             observations,
             &canonical_samples,
@@ -11017,8 +11238,11 @@ impl UsageStore {
                 // The complete transaction for this epoch/cycle already
                 // committed. Return its exact generation rather than
                 // incrementing durable state on an acknowledgement retry.
-                let replay_observations =
-                    upsert_observations(&transaction, &canonical_observations)?;
+                let replay_observations = upsert_observations_with_sources(
+                    &transaction,
+                    &canonical_observations,
+                    &observation_source_timestamps,
+                )?;
                 upsert_observation_model_totals(&transaction, &replay_observations, true, None)?;
                 replace_session_pending_ranges(
                     &transaction,
@@ -11127,7 +11351,11 @@ impl UsageStore {
             preserve_all_existing_history,
             preserve_existing_before,
         )?;
-        let persisted_observations = upsert_observations(&transaction, &canonical_observations)?;
+        let persisted_observations = upsert_observations_with_sources(
+            &transaction,
+            &canonical_observations,
+            &observation_source_timestamps,
+        )?;
         upsert_observation_model_totals(
             &transaction,
             &persisted_observations,
@@ -11731,6 +11959,15 @@ mod tests {
         }
     }
 
+    fn migrate_partition_history_to_current(path: &Path, identity: &StoragePartitionIdentity) {
+        let backup =
+            UsageStore::backup_generations_partitioned_verified(path, identity, 1).unwrap();
+        assert!(UsageStore::migrate_partition_history_after_verified_backup(
+            path, identity, &backup
+        )
+        .unwrap());
+    }
+
     #[test]
     fn quota_transition_uses_quota_and_window_evidence_not_reset_at_alone() {
         const WINDOW: i64 = 7 * 24 * 60 * 60;
@@ -11741,14 +11978,13 @@ mod tests {
 
         assert_eq!(
             classify_quota_transition(
-                Some(previous_reset),
-                WINDOW,
-                Some(previous_observed),
-                Some(61.0),
-                boundary_reset,
-                WINDOW,
-                Some(100.0),
-                boundary_observed,
+                PreviousQuotaState::new(
+                    Some(previous_reset),
+                    WINDOW,
+                    Some(previous_observed),
+                    Some(61.0),
+                ),
+                QuotaCandidate::new(boundary_reset, WINDOW, Some(100.0), boundary_observed),
             ),
             QuotaTransition::Boundary,
             "quota recovery at the replacement window start is one real boundary"
@@ -11756,14 +11992,18 @@ mod tests {
 
         assert_eq!(
             classify_quota_transition(
-                Some(boundary_reset),
-                WINDOW,
-                Some(boundary_observed),
-                Some(100.0),
-                boundary_reset + 134,
-                WINDOW,
-                Some(100.0),
-                boundary_observed + 180,
+                PreviousQuotaState::new(
+                    Some(boundary_reset),
+                    WINDOW,
+                    Some(boundary_observed),
+                    Some(100.0),
+                ),
+                QuotaCandidate::new(
+                    boundary_reset + 134,
+                    WINDOW,
+                    Some(100.0),
+                    boundary_observed + 180,
+                ),
             ),
             QuotaTransition::SamePeriod,
             "a corrected deadline without quota recovery stays in the accepted period"
@@ -11772,14 +12012,18 @@ mod tests {
         for start_drift in [-60, 0, 60] {
             assert_eq!(
                 classify_quota_transition(
-                    Some(boundary_reset),
-                    WINDOW,
-                    Some(boundary_observed),
-                    Some(1.0),
-                    boundary_reset + WINDOW + start_drift,
-                    WINDOW,
-                    Some(100.0),
-                    boundary_reset,
+                    PreviousQuotaState::new(
+                        Some(boundary_reset),
+                        WINDOW,
+                        Some(boundary_observed),
+                        Some(1.0),
+                    ),
+                    QuotaCandidate::new(
+                        boundary_reset + WINDOW + start_drift,
+                        WINDOW,
+                        Some(100.0),
+                        boundary_reset,
+                    ),
                 ),
                 QuotaTransition::Boundary,
                 "the next full window is a boundary at the existing tolerance endpoints"
@@ -11790,27 +12034,15 @@ mod tests {
         let alias_b = 1_789_300_251;
         assert_eq!(
             classify_quota_transition(
-                Some(alias_a),
-                WINDOW,
-                Some(1_788_972_900),
-                Some(29.0),
-                alias_b,
-                WINDOW,
-                Some(17.0),
-                1_788_975_540,
+                PreviousQuotaState::new(Some(alias_a), WINDOW, Some(1_788_972_900), Some(29.0),),
+                QuotaCandidate::new(alias_b, WINDOW, Some(17.0), 1_788_975_540),
             ),
             QuotaTransition::Rejected
         );
         assert_eq!(
             classify_quota_transition(
-                Some(alias_b),
-                WINDOW,
-                Some(1_788_975_540),
-                Some(17.0),
-                alias_a,
-                WINDOW,
-                Some(29.0),
-                1_788_975_600,
+                PreviousQuotaState::new(Some(alias_b), WINDOW, Some(1_788_975_540), Some(17.0),),
+                QuotaCandidate::new(alias_a, WINDOW, Some(29.0), 1_788_975_600),
             ),
             QuotaTransition::Rejected,
             "quota recovery without a matching time boundary is not a rollover"
@@ -11840,14 +12072,13 @@ mod tests {
         ] {
             assert_eq!(
                 classify_quota_transition(
-                    Some(boundary_reset),
-                    WINDOW,
-                    Some(boundary_observed),
-                    Some(100.0),
-                    next_reset,
-                    next_window,
-                    next_remaining,
-                    next_observed,
+                    PreviousQuotaState::new(
+                        Some(boundary_reset),
+                        WINDOW,
+                        Some(boundary_observed),
+                        Some(100.0),
+                    ),
+                    QuotaCandidate::new(next_reset, next_window, next_remaining, next_observed,),
                 ),
                 QuotaTransition::Rejected
             );
@@ -12091,7 +12322,7 @@ mod tests {
         }
     }
 
-    fn downgrade_canonical_history_to_v9(connection: &Connection) {
+    fn drop_canonical_history_constraints(connection: &Connection) {
         connection
             .execute_batch(
                 "DROP TRIGGER usage_history_canonical_insert_guard;
@@ -12103,10 +12334,14 @@ mod tests {
                  DROP TRIGGER usage_history_sidecar_update_guard;
                  DROP TRIGGER usage_history_sidecar_delete_guard;
                  DROP INDEX usage_history_canonical_timestamp_idx;
-                 DROP INDEX usage_model_history_canonical_timestamp_model_idx;
-                 PRAGMA user_version = 9;",
+                 DROP INDEX usage_model_history_canonical_timestamp_model_idx;",
             )
             .unwrap();
+    }
+
+    fn downgrade_canonical_history_to_v9(connection: &Connection) {
+        drop_canonical_history_constraints(connection);
+        connection.pragma_update(None, "user_version", 9).unwrap();
     }
 
     #[test]
@@ -12118,7 +12353,7 @@ mod tests {
         let minute = 1_800_000_000_i64;
         let reset_a = 1_800_604_800_i64;
         let reset_b = reset_a + 60;
-        let weaker = sample(minute + 5, reset_a, Some(71.0), 1.0);
+        let weaker = sample(minute + 5, reset_a, Some(70.0), 1.0);
         let stronger = sample(minute + 40, reset_b, Some(70.0), 2.0);
         let weaker_model = SessionModelTotal {
             model: "SOL".into(),
@@ -12144,7 +12379,7 @@ mod tests {
                 params![reset_b, 604_800_i64],
             )
             .unwrap();
-        for (row, raw_remaining) in [(&weaker, Some(71.0_f64)), (&stronger, Some(70.0_f64))] {
+        for (row, raw_remaining) in [(&weaker, Some(70.0_f64)), (&stronger, Some(70.0_f64))] {
             connection
                 .execute(
                     "INSERT INTO usage_history (
@@ -12340,7 +12575,7 @@ mod tests {
     }
 
     #[test]
-    fn account_history_migration_rolls_back_incoherent_owned_minute() {
+    fn account_history_migration_excludes_incoherent_owned_minute_after_backup() {
         let path = database_path("account-history-canonical-incoherent-minute");
         let identity = partition_identity('8', 62);
         drop(UsageStore::create_partitioned(&path, &identity).unwrap());
@@ -12386,20 +12621,19 @@ mod tests {
 
         let backup =
             UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
-        let error =
-            UsageStore::migrate_partition_history_after_verified_backup(&path, &identity, &backup)
-                .expect_err("an increasing remaining quota must abort the whole migration");
-        assert!(error
-            .to_string()
-            .contains("remaining quota increases within minute"));
+        assert!(UsageStore::migrate_partition_history_after_verified_backup(
+            &path, &identity, &backup
+        )
+        .unwrap());
 
-        let retained = Connection::open(&path).unwrap();
-        assert_eq!(legacy_raw_evidence(&retained).unwrap(), raw_before);
+        let retained = UsageStore::open_partitioned(&path, &identity).unwrap();
+        assert!(retained.load_all_raw().unwrap().is_empty());
         assert_eq!(
             retained
+                .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            9
+            ACCOUNT_DB_SCHEMA_VERSION
         );
         drop(retained);
         let retained_backup = Connection::open_with_flags(
@@ -12582,6 +12816,7 @@ mod tests {
             .unwrap();
         let legacy_history = store.load_all().unwrap();
         let legacy_state = store.load_session_collection_state().unwrap();
+        drop_canonical_history_constraints(&store.connection);
         store
             .connection
             .execute(
@@ -12647,7 +12882,7 @@ mod tests {
 
         // Retained generations from the previous executable remain valid
         // recovery inputs; only the writable current DB is migrated.
-        UsageStore::backup_generations_partitioned(&path, &identity, 1).unwrap();
+        migrate_partition_history_to_current(&path, &identity);
 
         let mut migrated = UsageStore::open_partitioned(&path, &identity).unwrap();
         let migrated_state = migrated.load_session_collection_state().unwrap();
@@ -12714,7 +12949,7 @@ mod tests {
                     window_seconds: 604_800,
                     collector_epoch: running.collector_epoch,
                     cycle_seq: 2,
-                    samples: &[],
+                    samples: std::slice::from_ref(&legacy_sample),
                     checkpoints: std::slice::from_ref(&running),
                     ranges: &[],
                     model_totals: &current_totals,
@@ -13215,6 +13450,7 @@ mod tests {
         #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
+        migrate_partition_history_to_current(&path, &identity);
         let opened = UsageStore::open_partitioned(&path, &identity).unwrap();
         assert_eq!(opened.load_all().unwrap().len(), 1);
         let recorded_count: i64 = opened
@@ -13408,12 +13644,13 @@ mod tests {
             .unwrap();
         drop(connection);
 
+        migrate_partition_history_to_current(&path, &identity);
         let migrated = UsageStore::open_partitioned(&path, &identity).unwrap();
         let schema_version: i64 = migrated
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(schema_version, 9);
+        assert_eq!(schema_version, ACCOUNT_DB_SCHEMA_VERSION);
         let login_id: Option<String> = migrated
             .connection
             .query_row(
@@ -13632,6 +13869,7 @@ mod tests {
             .unwrap();
         drop(connection);
 
+        migrate_partition_history_to_current(&path, &identity);
         let migrated = UsageStore::open_partitioned(&path, &identity).unwrap();
         let schema_version: i64 = migrated
             .connection
@@ -15402,19 +15640,20 @@ mod tests {
     #[test]
     fn three_month_prune_removes_old_sidecars_but_keeps_new_rows_and_row_one() {
         let path = database_path("prune-observation-sidecars");
-        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 56).unwrap();
+        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 0).unwrap();
         let cutoff = three_months_before(now).timestamp();
-        let old = sample(cutoff - 60, 1_700_604_800, Some(10.0), 1.0);
-        let retained = sample(cutoff, 1_700_604_800, Some(20.0), 2.0);
-        let old_timestamp = cutoff.div_euclid(60) * 60 - 60;
-        let new_timestamp = cutoff.div_euclid(60) * 60 + 60;
-        let old_observation =
-            UsageHistoryObservation::unavailable(old_timestamp, 1_700_604_800, Some(90.0));
+        let reset_at = now.timestamp() + 604_800;
+        let old = sample(cutoff - 60, reset_at, Some(10.0), 1.0);
+        let retained = sample(cutoff, reset_at, Some(20.0), 2.0);
+        let new_timestamp = cutoff + 60;
+        let old_observation = UsageHistoryObservation::confirmed(&old);
         let new_observation =
-            UsageHistoryObservation::unavailable(new_timestamp, 1_700_604_800, Some(80.0));
+            UsageHistoryObservation::unavailable(new_timestamp, reset_at, Some(80.0));
         let identity = partition_identity('a', 1);
         let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
-        store.upsert_samples(&[old, retained.clone()]).unwrap();
+        store
+            .upsert_samples(&[old.clone(), retained.clone()])
+            .unwrap();
         let durable = store
             .commit_durable_state(&[], "0".repeat(64), r#"{"kind":"row-one"}"#)
             .unwrap();
@@ -15459,27 +15698,49 @@ mod tests {
     #[test]
     fn pruning_removes_only_old_rows_and_preserves_boundary_across_reset_periods() {
         let path = database_path("prune");
-        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 56).unwrap();
-        let cutoff = 1_709_210_096_i64;
-        let old = sample(cutoff - 1, 1_700_604_800, Some(10.0), 1.0);
-        let old_other_period = sample(cutoff - 1, 1_701_209_600, Some(11.0), 1.1);
-        let boundary = sample(cutoff, 1_700_604_800, Some(20.0), 2.0);
-        let boundary_other_period = sample(cutoff, 1_701_209_600, Some(21.0), 2.1);
-        let newer = sample(cutoff + 1, 1_701_814_400, Some(30.0), 3.0);
-        let future = sample(now.timestamp() + 1, 1_701_814_400, Some(40.0), 4.0);
+        let now = Utc.with_ymd_and_hms(2024, 5, 31, 12, 34, 0).unwrap();
+        let cutoff = three_months_before(now).timestamp();
+        let first_reset_at = now.timestamp() + 604_800;
+        let second_reset_at = first_reset_at + 604_800;
+        let third_reset_at = second_reset_at + 604_800;
+        let old = sample(cutoff - 120, first_reset_at, Some(10.0), 1.0);
+        let old_other_period = sample(cutoff - 60, second_reset_at, Some(11.0), 1.1);
+        let boundary = sample(cutoff, first_reset_at, Some(20.0), 2.0);
+        let boundary_other_period = sample(cutoff + 60, second_reset_at, Some(21.0), 2.1);
+        let newer = sample(cutoff + 120, third_reset_at, Some(30.0), 3.0);
+        let future = sample(now.timestamp() + 60, third_reset_at, Some(40.0), 4.0);
 
         let identity = partition_identity('a', 1);
         let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
-        store
-            .upsert_samples(&[
-                old,
-                old_other_period,
-                boundary.clone(),
-                boundary_other_period.clone(),
-                newer.clone(),
-                future.clone(),
-            ])
-            .unwrap();
+        for row in [
+            &old,
+            &old_other_period,
+            &boundary,
+            &boundary_other_period,
+            &newer,
+            &future,
+        ] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO usage_history (
+                         timestamp, reset_at, remaining_percent, sol_dollars,
+                         terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        row.timestamp,
+                        row.reset_at,
+                        row.remaining_percent,
+                        row.sol_dollars,
+                        row.terra_dollars,
+                        row.luna_dollars,
+                        row.sol_tokens as i64,
+                        row.terra_tokens as i64,
+                        row.luna_tokens as i64,
+                    ],
+                )
+                .unwrap();
+        }
         assert_eq!(store.prune_older_than_three_months(now).unwrap(), 2);
         assert_eq!(
             store.load_all().unwrap(),
@@ -16230,7 +16491,7 @@ mod wave_b_correction_tests {
         for (case_number, (now_epoch, cutoff_epoch)) in cases.into_iter().enumerate() {
             let path = database_path(&format!("recent-{case_number}"));
             let now = Utc.timestamp_opt(now_epoch, 0).single().unwrap();
-            let reset_at = 1_700_000_000 + case_number as i64;
+            let reset_at = now_epoch + 604_800;
             let mut store = UsageStore::open(&path).unwrap();
             store
                 .upsert_samples(&[
@@ -16256,14 +16517,15 @@ mod wave_b_correction_tests {
     }
 
     #[test]
-    fn recent_read_filters_invalid_values_without_deleting_rows() {
+    fn recent_read_rejects_invalid_values_without_deleting_rows() {
         let path = database_path("recent-invalid");
         let now_epoch = 1_717_156_800_i64;
         let cutoff_epoch = 1_714_478_400_i64;
         let now = Utc.timestamp_opt(now_epoch, 0).single().unwrap();
+        let reset_at = now_epoch + 604_800;
         let store = UsageStore::open(&path).unwrap();
         store
-            .upsert_sample(&sample(cutoff_epoch, 1_700_000_000, Some(50.0), 1.0))
+            .upsert_sample(&sample(cutoff_epoch, reset_at, Some(50.0), 1.0))
             .unwrap();
         let connection = Connection::open(&path).unwrap();
         connection
@@ -16271,7 +16533,7 @@ mod wave_b_correction_tests {
                 "INSERT INTO usage_history
                     (timestamp, reset_at, remaining_percent, sol_dollars, terra_dollars, luna_dollars)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![cutoff_epoch + 10, 1_700_000_010_i64, -1.0, 1.0, 2.0, 3.0],
+                params![cutoff_epoch + 10, reset_at, -1.0, 1.0, 2.0, 3.0],
             )
             .unwrap();
         connection
@@ -16279,7 +16541,7 @@ mod wave_b_correction_tests {
                 "INSERT INTO usage_history
                     (timestamp, reset_at, remaining_percent, sol_dollars, terra_dollars, luna_dollars)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![cutoff_epoch + 11, 1_700_000_011_i64, 101.0, 1.0, 2.0, 3.0],
+                params![cutoff_epoch + 11, reset_at, 101.0, 1.0, 2.0, 3.0],
             )
             .unwrap();
         connection
@@ -16287,7 +16549,7 @@ mod wave_b_correction_tests {
                 "INSERT INTO usage_history
                     (timestamp, reset_at, remaining_percent, sol_dollars, terra_dollars, luna_dollars)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![cutoff_epoch + 12, 1_700_000_012_i64, 50.0, -1.0, 2.0, 3.0],
+                params![cutoff_epoch + 12, reset_at, 50.0, -1.0, 2.0, 3.0],
             )
             .unwrap();
         connection
@@ -16295,26 +16557,18 @@ mod wave_b_correction_tests {
                 "INSERT INTO usage_history
                     (timestamp, reset_at, remaining_percent, sol_dollars, terra_dollars, luna_dollars)
                  VALUES (?1, ?2, 1e999, 1e999, 2.0, 3.0)",
-                params![cutoff_epoch + 13, 1_700_000_013_i64],
+                params![cutoff_epoch + 13, reset_at],
             )
             .unwrap();
         drop(connection);
-        assert_eq!(
-            store
-                .load_recent_one_month(now)
-                .unwrap()
-                .into_iter()
-                .map(|row| row.timestamp)
-                .collect::<Vec<_>>(),
-            Vec::<i64>::new()
-        );
+        assert!(store.load_recent_one_month(now).is_err());
         assert_eq!(history_rows(&path).len(), 5);
         drop(store);
         cleanup(&path);
     }
 
     #[test]
-    fn load_all_filters_negative_token_rows_without_coercion_or_deletion() {
+    fn load_all_rejects_negative_token_rows_without_coercion_or_deletion() {
         let path = database_path("load-all-negative-tokens");
         let valid_timestamp = 1_700_000_000_i64;
         let valid_reset_at = 1_700_000_100_i64;
@@ -16344,9 +16598,7 @@ mod wave_b_correction_tests {
         drop(connection);
 
         let store = UsageStore::open(&path).unwrap();
-        let samples = store.load_all().unwrap();
-        assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].timestamp, valid_timestamp);
+        assert!(store.load_all().is_err());
         drop(store);
 
         let connection = Connection::open(&path).unwrap();
@@ -16441,7 +16693,7 @@ mod wave_b_correction_tests {
     #[test]
     fn durable_commit_is_one_transaction_and_is_visible_to_a_separate_connection() {
         let path = database_path("commit");
-        let committed = sample(1_700_000_123, 1_700_000_000, Some(64.0), 1.5);
+        let committed = sample(1_700_000_123, 1_700_604_800, Some(64.0), 1.5);
         let mut store = UsageStore::open(&path).unwrap();
         let record = store
             .commit_durable_state(
@@ -16477,7 +16729,7 @@ mod wave_b_correction_tests {
     #[test]
     fn validation_conflict_overflow_and_sql_failures_leave_prior_state_unchanged() {
         let path = database_path("rollback");
-        let baseline = sample(1_700_000_100, 1_700_000_000, Some(70.0), 7.0);
+        let baseline = sample(1_700_000_100, 1_700_604_800, Some(70.0), 7.0);
         let mut store = UsageStore::open(&path).unwrap();
         store
             .commit_durable_state(
@@ -16561,7 +16813,7 @@ mod wave_b_correction_tests {
     fn durable_update_trigger_rolls_back_history_and_durable_state() {
         let path = database_path("durable-update-trigger");
         let mut store = UsageStore::open(&path).unwrap();
-        let baseline = sample(1_700_000_100, 1_700_000_000, Some(50.0), 1.0);
+        let baseline = sample(1_700_000_100, 1_700_604_800, Some(50.0), 1.0);
         store
             .commit_durable_state(
                 std::slice::from_ref(&baseline),
@@ -16584,7 +16836,7 @@ mod wave_b_correction_tests {
 
         assert!(store
             .commit_durable_state(
-                &[sample(1_700_000_200, 1_700_000_000, Some(55.0), 5.5)],
+                &[sample(1_700_000_200, 1_700_604_800, Some(55.0), 5.5)],
                 VALID_HASH,
                 r#"{"generation":2}"#,
             )
@@ -16824,6 +17076,7 @@ mod wave_b_correction_tests {
     fn storage_focus11_public_write_numeric_partition_table() {
         let path = database_path("storage-focus11-public-write-numeric-partitions");
         let mut store = UsageStore::open(&path).unwrap();
+        let reset_at = 3;
 
         let sql_rows = |path: &std::path::Path| {
             let connection = Connection::open(path).unwrap();
@@ -16875,7 +17128,7 @@ mod wave_b_correction_tests {
 
         let valid_none = UsageHistorySample {
             timestamp: 1,
-            reset_at: 1,
+            reset_at,
             remaining_percent: None,
             sol_dollars: 0.0,
             terra_dollars: 0.0,
@@ -16888,7 +17141,7 @@ mod wave_b_correction_tests {
 
         let valid_zero = UsageHistorySample {
             timestamp: 2,
-            reset_at: 1,
+            reset_at,
             remaining_percent: Some(0.0),
             sol_dollars: 0.0,
             terra_dollars: 0.0,
@@ -16903,7 +17156,7 @@ mod wave_b_correction_tests {
 
         let valid_full = UsageHistorySample {
             timestamp: 3,
-            reset_at: 1,
+            reset_at,
             remaining_percent: Some(100.0),
             sol_dollars: 0.0,
             terra_dollars: 0.0,
@@ -16927,9 +17180,19 @@ mod wave_b_correction_tests {
         assert_eq!(
             sql_rows(&path),
             vec![
-                (1, 1, None, 0.0, 0.0, 0.0, 0, 0, 0),
-                (2, 1, Some(0.0), 0.0, 0.0, 0.0, i64::MAX, i64::MAX, i64::MAX,),
-                (3, 1, Some(100.0), 0.0, 0.0, 0.0, 0, 0, 0),
+                (1, reset_at, None, 0.0, 0.0, 0.0, 0, 0, 0),
+                (
+                    2,
+                    reset_at,
+                    Some(0.0),
+                    0.0,
+                    0.0,
+                    0.0,
+                    i64::MAX,
+                    i64::MAX,
+                    i64::MAX,
+                ),
+                (3, reset_at, Some(100.0), 0.0, 0.0, 0.0, 0, 0, 0),
             ]
         );
         assert_eq!(
@@ -18132,37 +18395,19 @@ mod wave_b_correction_tests {
         );
         assert_eq!(raw_cumulative_history_fingerprint(&store), raw_before);
 
-        store
-            .connection
-            .execute(
-                "INSERT INTO usage_history (
+        let duplicate_endpoint = store.connection.execute(
+            "INSERT INTO usage_history (
                     timestamp, reset_at, remaining_percent, sol_dollars,
                     terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
                  )
-                 SELECT timestamp, ?1, remaining_percent, sol_dollars,
+                 SELECT timestamp, ?1, remaining_percent + 1.0, sol_dollars,
                         terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
-                 FROM usage_history WHERE reset_at=?2 AND timestamp=?3",
-                params![reset_a + 120, reset_a, endpoint.timestamp],
-            )
-            .unwrap();
-        let through_conflict = store.commit_session_collection_with_cumulative_recovery(
-            SessionCollectionCommit {
-                reset_at: reset_a,
-                window_seconds: 604_800,
-                collector_epoch,
-                cycle_seq: 4,
-                samples: &[],
-                checkpoints: &[],
-                ranges: &[],
-                model_totals: &corrected,
-                recorded_sessions: &[],
-            },
-            &[],
-            &recovery,
+                 FROM usage_history WHERE timestamp=?2",
+            params![reset_a + 120, endpoint.timestamp],
         );
         assert!(
-            through_conflict.is_err(),
-            "a conflicting reset alias at the recovery endpoint must reject only the recovery"
+            duplicate_endpoint.is_err(),
+            "canonical storage must reject a second raw row at the recovery endpoint"
         );
         assert_eq!(
             store
@@ -18171,13 +18416,6 @@ mod wave_b_correction_tests {
                 .data_generation,
             3
         );
-        store
-            .connection
-            .execute(
-                "DELETE FROM usage_history WHERE reset_at=?1 AND timestamp=?2",
-                params![reset_a + 120, endpoint.timestamp],
-            )
-            .unwrap();
         assert_eq!(raw_cumulative_history_fingerprint(&store), raw_before);
 
         let committed = store
@@ -18206,7 +18444,9 @@ mod wave_b_correction_tests {
         let projected = store.load_all().unwrap();
         let projected_endpoint = projected
             .iter()
-            .find(|sample| sample.reset_at == reset_a && sample.timestamp == endpoint.timestamp)
+            .find(|sample| {
+                same_reset_group(sample.reset_at, reset_a) && sample.timestamp == endpoint.timestamp
+            })
             .unwrap();
         assert_eq!(projected_endpoint.sol_tokens, 100);
         assert_eq!(projected_endpoint.luna_tokens, 55);

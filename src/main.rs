@@ -30,8 +30,8 @@ use codex_info::thread_contract::{ThreadCycleAccumulator, ThreadCycleOutcome};
 use codex_info::usage_store;
 #[cfg(test)]
 use codex_info::usage_store::{
-    classify_quota_transition, select_predeadline_quota_authority, QuotaTransition,
-    StoragePartitionIdentity, UsageStore,
+    classify_quota_transition, select_predeadline_quota_authority, PreviousQuotaState,
+    QuotaCandidate, QuotaTransition, StoragePartitionIdentity, UsageStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2737,14 +2737,13 @@ fn reset_transition_is_boundary(
     window_seconds: i64,
 ) -> bool {
     classify_quota_transition(
-        previous_reset,
-        window_seconds,
-        previous_observed_at,
-        previous_remaining,
-        next_reset,
-        window_seconds,
-        next_remaining,
-        now,
+        PreviousQuotaState::new(
+            previous_reset,
+            window_seconds,
+            previous_observed_at,
+            previous_remaining,
+        ),
+        QuotaCandidate::new(next_reset, window_seconds, next_remaining, now),
     ) == QuotaTransition::Boundary
 }
 
@@ -2764,26 +2763,29 @@ fn admit_session_collection_period(
 ) -> QuotaTransition {
     if state.data_generation == 0 {
         return classify_quota_transition(
-            None,
-            0,
-            None,
-            None,
-            next_reset_at,
-            next_window_seconds,
-            next_remaining_percent,
-            now,
+            PreviousQuotaState::new(None, 0, None, None),
+            QuotaCandidate::new(
+                next_reset_at,
+                next_window_seconds,
+                next_remaining_percent,
+                now,
+            ),
         );
     }
     let observation = state.last_quota_observation.as_ref();
     let transition = classify_quota_transition(
-        (state.reset_at > 0).then_some(state.reset_at),
-        state.window_seconds,
-        observation.map(|value| value.observed_at),
-        observation.map(|value| value.remaining_percent),
-        next_reset_at,
-        next_window_seconds,
-        next_remaining_percent,
-        now,
+        PreviousQuotaState::new(
+            (state.reset_at > 0).then_some(state.reset_at),
+            state.window_seconds,
+            observation.map(|value| value.observed_at),
+            observation.map(|value| value.remaining_percent),
+        ),
+        QuotaCandidate::new(
+            next_reset_at,
+            next_window_seconds,
+            next_remaining_percent,
+            now,
+        ),
     );
     if transition == QuotaTransition::Boundary {
         state.model_totals.clear();
@@ -3754,6 +3756,7 @@ struct UsageHistory {
     startup_maintenance_done: bool,
 }
 
+#[cfg(test)]
 fn main_sample_from_observation(
     observation: &usage_store::UsageHistoryObservation,
 ) -> Option<UsageHistorySample> {
@@ -3918,6 +3921,7 @@ fn store_observation_from_public_v3(
     }
 }
 
+#[cfg(test)]
 fn prefer_model_source(
     current: usage_store::ModelSource,
     candidate: usage_store::ModelSource,
@@ -3948,6 +3952,7 @@ fn model_source_rank(source: usage_store::ModelSource) -> u8 {
 /// Attribute each v1-canonical model vector to the source row selected by the
 /// same reset-group/dominant-vector canonicalizer. A timestamp-only lookup is
 /// unsafe when a legacy singleton or a reset-drift duplicate shares a minute.
+#[cfg(test)]
 fn canonical_model_sources(
     observations: &[usage_store::UsageHistoryObservation],
     canonical_samples: &[UsageHistorySample],
@@ -4585,6 +4590,7 @@ impl UsageHistory {
             .map_or(reset_at, |period| period.canonical_reset_at)
     }
 
+    #[cfg(test)]
     fn graph_data_for_reset(&self, reset_at: i64) -> String {
         let samples = self.samples_for_reset(Some(reset_at));
         serde_json::to_string(&samples).unwrap_or_else(|_| "[]".into())
@@ -5093,8 +5099,7 @@ fn accepted_graph_model_timelines(
         // participate in quota allocation or idle detection.
         if let Some((last_at, last_point)) = timeline
             .iter()
-            .filter(|(_, point)| point.origin.arithmetic_reliable())
-            .next_back()
+            .rfind(|(_, point)| point.origin.arithmetic_reliable())
             .map(|(timestamp, point)| (*timestamp, *point))
         {
             let tail = all_timestamps
@@ -5135,13 +5140,12 @@ fn accepted_graph_model_timelines(
         // state only and never feeds the raw idle oracle below.
         if let Some((last_at, last_point)) = timeline
             .iter()
-            .filter(|(_, point)| {
+            .rfind(|(_, point)| {
                 matches!(
                     point.origin,
                     GraphModelOrigin::Direct | GraphModelOrigin::LegacyObserved
                 )
             })
-            .next_back()
             .map(|(timestamp, point)| (*timestamp, *point))
         {
             let tail = all_timestamps
@@ -16007,14 +16011,13 @@ impl CodexInfoState {
             }
         }
         let transition = classify_quota_transition(
-            previous_reset_at,
-            previous_window_seconds,
-            previous_observed_at,
-            previous_remaining_percent,
-            reset_at,
-            window_seconds,
-            remaining_percent,
-            now,
+            PreviousQuotaState::new(
+                previous_reset_at,
+                previous_window_seconds,
+                previous_observed_at,
+                previous_remaining_percent,
+            ),
+            QuotaCandidate::new(reset_at, window_seconds, remaining_percent, now),
         );
         let recover_before_period_change =
             quota_generation_recovery.is_some() && transition != QuotaTransition::SamePeriod;
@@ -17197,10 +17200,12 @@ impl CodexInfoState {
         }
     }
 
+    #[cfg(test)]
     fn graph_data(&self) -> String {
         self.graph_data_at(Utc::now().timestamp())
     }
 
+    #[cfg(test)]
     fn graph_data_at(&self, observed_at: i64) -> String {
         let Some(reset_at) = self.selected_history_reset_at(observed_at) else {
             return "[]".into();
@@ -17611,18 +17616,9 @@ impl CodexInfoState {
                     continue;
                 }
                 let legacy = match model_name {
-                    "SOL" => observation
-                        .sol_dollars
-                        .zip(observation.sol_tokens)
-                        .map(|(dollar, tokens)| (dollar, tokens)),
-                    "TERRA" => observation
-                        .terra_dollars
-                        .zip(observation.terra_tokens)
-                        .map(|(dollar, tokens)| (dollar, tokens)),
-                    "LUNA" => observation
-                        .luna_dollars
-                        .zip(observation.luna_tokens)
-                        .map(|(dollar, tokens)| (dollar, tokens)),
+                    "SOL" => observation.sol_dollars.zip(observation.sol_tokens),
+                    "TERRA" => observation.terra_dollars.zip(observation.terra_tokens),
+                    "LUNA" => observation.luna_dollars.zip(observation.luna_tokens),
                     _ => None,
                 };
                 if let Some((dollar, tokens)) = legacy {
@@ -28605,27 +28601,20 @@ mod tests {
         let reset = observed + WEEK_SECONDS;
         assert_eq!(
             super::classify_quota_transition(
-                None,
-                0,
-                None,
-                None,
-                reset,
-                WEEK_SECONDS,
-                Some(50.0),
-                observed,
+                super::PreviousQuotaState::new(None, 0, None, None),
+                super::QuotaCandidate::new(reset, WEEK_SECONDS, Some(50.0), observed),
             ),
             super::QuotaTransition::Initial
         );
         assert_eq!(
             super::classify_quota_transition(
-                Some(reset),
-                WEEK_SECONDS,
-                Some(observed),
-                Some(50.0),
-                reset,
-                WEEK_SECONDS,
-                Some(49.0),
-                observed + 60,
+                super::PreviousQuotaState::new(
+                    Some(reset),
+                    WEEK_SECONDS,
+                    Some(observed),
+                    Some(50.0),
+                ),
+                super::QuotaCandidate::new(reset, WEEK_SECONDS, Some(49.0), observed + 60),
             ),
             super::QuotaTransition::SamePeriod
         );
@@ -28639,14 +28628,13 @@ mod tests {
         ] {
             assert_eq!(
                 super::classify_quota_transition(
-                    Some(reset),
-                    WEEK_SECONDS,
-                    Some(observed),
-                    Some(50.0),
-                    next_reset,
-                    next_window,
-                    remaining,
-                    next_observed,
+                    super::PreviousQuotaState::new(
+                        Some(reset),
+                        WEEK_SECONDS,
+                        Some(observed),
+                        Some(50.0),
+                    ),
+                    super::QuotaCandidate::new(next_reset, next_window, remaining, next_observed,),
                 ),
                 super::QuotaTransition::Rejected
             );
@@ -28654,14 +28642,18 @@ mod tests {
         for successor_start_drift in [-60, 0, 60] {
             assert_eq!(
                 super::classify_quota_transition(
-                    Some(reset),
-                    WEEK_SECONDS,
-                    Some(observed),
-                    Some(1.0),
-                    reset + WEEK_SECONDS + successor_start_drift,
-                    WEEK_SECONDS,
-                    Some(100.0),
-                    reset,
+                    super::PreviousQuotaState::new(
+                        Some(reset),
+                        WEEK_SECONDS,
+                        Some(observed),
+                        Some(1.0),
+                    ),
+                    super::QuotaCandidate::new(
+                        reset + WEEK_SECONDS + successor_start_drift,
+                        WEEK_SECONDS,
+                        Some(100.0),
+                        reset,
+                    ),
                 ),
                 super::QuotaTransition::Boundary
             );

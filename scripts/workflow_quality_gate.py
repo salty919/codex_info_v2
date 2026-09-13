@@ -35,6 +35,13 @@ RELEASE_ACCEPTANCE_SCRIPTS = {
     "app-server-failure": "scripts/fake_codex_app_server.py",
 }
 
+WINDOWS_GATE_SCRIPTS = {
+    "sdk": "windows-client/tools/Ensure-DotNetSdk.ps1",
+    "build": "windows-client/tools/Build-WindowsInstaller.ps1",
+    "upgrade": "windows-client/tools/Install-WindowsCandidateForE2E.ps1",
+    "e2e": "windows-client/tools/Reproduce-WindowsInstalledE2E.ps1",
+}
+
 
 def sources() -> dict[str, str]:
     return {
@@ -48,6 +55,58 @@ def release_acceptance_sources() -> dict[str, str]:
         name: (ROOT / path).read_text(encoding="utf-8")
         for name, path in RELEASE_ACCEPTANCE_SCRIPTS.items()
     }
+
+
+def windows_gate_sources() -> dict[str, str]:
+    return {
+        name: (ROOT / path).read_text(encoding="utf-8")
+        for name, path in WINDOWS_GATE_SCRIPTS.items()
+    }
+
+
+def _windows_gate_script_errors(scripts: Mapping[str, str]) -> list[str]:
+    required = {
+        "sdk": (
+            "https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json",
+            "'latest-sdk'",
+            "dotnet-sdk-win-x64.zip",
+            "Get-FileHash -LiteralPath $archive -Algorithm SHA512",
+            "$env:DOTNET_ROOT = $sdkRoot",
+            "& $dotnet --list-sdks",
+        ),
+        "build": (
+            "[string]$SourceSha = ''",
+            "-p:SourceRevisionId=$SourceSha",
+            "--artifacts-path $buildArtifacts",
+        ),
+        "upgrade": (
+            "/releases/latest",
+            "Previous stable installer failed",
+            "if ($previousHash -cne [string]$manifest.installer.sha256)",
+            "Latest stable Windows Setup digest does not match its published manifest",
+            '$expectedProductVersion = "$candidateVersionText+$SourceSha"',
+            "Set-Content -LiteralPath $sentinel -Value 'preserve'",
+            "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf))",
+            "Candidate upgrade removed user settings",
+            "windows-installer-upgrade: PASS",
+        ),
+        "e2e": (
+            "[switch]$PrepareCandidate",
+            "Ensure-DotNetSdk.ps1",
+            "Ensure-InnoSetupCompiler.ps1",
+            "Build-WindowsInstaller.ps1",
+            "Candidate installer failed with exit code",
+            "-SourceSha $SourceSha",
+        ),
+    }
+    errors: list[str] = []
+    if set(scripts) != set(required):
+        return ["Windows gate script set differs from its declared contract"]
+    for name, markers in required.items():
+        for marker in markers:
+            if marker not in scripts[name]:
+                errors.append(f"Windows gate script {name} is missing {marker}")
+    return errors
 
 
 def _release_acceptance_script_errors(scripts: Mapping[str, str]) -> list[str]:
@@ -469,6 +528,21 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
                 _step(windows_job, name=step_name).get("if"),
                 "inputs.release_candidate",
             )
+        compiler_script = _step(
+            windows_job,
+            name="Install locked Inno Setup compiler",
+        ).get("run")
+        if "Ensure-InnoSetupCompiler.ps1" not in str(compiler_script):
+            errors.append("workflow wiring Windows compiler preparation is not shared")
+        build_step = _step(
+            windows_job,
+            name="Build standard Windows setup wizard",
+        )
+        mapping("windows.build.env", build_step.get("env"), {
+            "SOURCE_SHA": "${{ inputs.source_sha }}",
+        })
+        if "-SourceSha $env:SOURCE_SHA" not in str(build_step.get("run", "")):
+            errors.append("workflow wiring Windows build does not bind the source SHA")
         upgrade_script = _step(
             windows_job,
             name="Upgrade latest published Windows release to the exact candidate",
@@ -477,8 +551,9 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             errors.append("workflow wiring windows upgrade script is missing")
         else:
             for marker in (
-                "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf)) {",
-                "throw 'Candidate upgrade removed user settings.'",
+                "Install-WindowsCandidateForE2E.ps1",
+                "-SourceSha $env:SOURCE_SHA",
+                "-RetainSentinel",
             ):
                 if marker not in upgrade_script:
                     errors.append(
@@ -505,7 +580,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         output_keys = (
             "publish", "fingerprint", "tag", "version", "pr_number", "final_head",
             "merge_sha", "run_id", "run_number", "run_attempt", "artifact_id",
-            "artifact_name", "artifact_digest", "artifact_ids", "linux_present",
+            "artifact_name", "artifact_ids", "linux_present",
             "windows_present",
         )
         for key in output_keys:
@@ -515,8 +590,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect("release.publish.needs", publish.get("needs"), ["resolve"])
         expect("release.publish.if", publish.get("if"), "needs.resolve.outputs.publish == 'true'")
         for env_key, output_key in {
-            "ARTIFACT_DIGEST": "artifact_digest", "ARTIFACT_ID": "artifact_id",
-            "ARTIFACT_IDS": "artifact_ids",
+            "ARTIFACT_ID": "artifact_id", "ARTIFACT_IDS": "artifact_ids",
             "ARTIFACT_NAME": "artifact_name", "FINAL_HEAD": "final_head",
             "FINGERPRINT": "fingerprint", "MERGE_SHA": "merge_sha",
             "LINUX_PRESENT": "linux_present",
@@ -731,6 +805,11 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     )
     count("selective-quality.yml", "--requested-check requirements-authority", 0)
     count("selective-quality.yml", "--requested-check governance-contract", 1)
+    count(
+        "selective-quality.yml",
+        "python3 scripts/workflow_inno_acquisition_gate.py --self-test",
+        1,
+    )
 
     linux_distribution = workflows["linux-distribution.yml"]
     for marker in (
@@ -754,26 +833,19 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "dotnet test windows-client/CodexInfo.WindowsClient.sln",
         '--collect:"Code Coverage"',
         "codacy-coverage-windows-v1-head-${{ inputs.source_sha }}",
+        "Ensure-InnoSetupCompiler.ps1",
         "Build-WindowsInstaller.ps1",
-        "/releases/latest",
-        "Previous stable installer failed",
-        "if ($previousHash -cne [string]$manifest.installer.sha256)",
-        "Latest stable Windows Setup digest does not match its published manifest",
-        '$expectedProductVersion = "$candidateVersionText+$SourceSha"',
-        "Set-Content -LiteralPath $sentinel -Value 'preserve'",
-        "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf))",
-        "Candidate upgrade removed user settings",
-        "windows-installer-upgrade: PASS",
-        "Run-WindowsClientE2E.ps1",
-        "E2E uninstall removed user settings.",
-        "windows_window_move_smoke.ps1",
-        "$moveSmokeOutput = @(& ./scripts/windows_window_move_smoke.ps1",
-        "[string]$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS'",
+        "Install-WindowsCandidateForE2E.ps1",
+        "-SourceSha $env:SOURCE_SHA",
+        "-RetainSentinel",
+        "Reproduce-WindowsInstalledE2E.ps1",
+        "-CleanupInstallation",
         "New-WindowsUpdateManifest.ps1",
         "name: release-candidate-v1-pr-${{ inputs.pr_number }}",
     ):
         if marker not in windows:
             errors.append(f"windows-client.yml: missing {marker}")
+    errors.extend(_windows_gate_script_errors(windows_gate_sources()))
     for forbidden in (
         "Measure-WindowsGraphLatency.ps1",
         "Smoke-test install and uninstall lifecycle",
@@ -1766,7 +1838,6 @@ _PR_NUMBER = 44
 _FINAL_HEAD = "a" * 40
 _MERGE_SHA = "b" * 40
 _VERSION = "1.2.3"
-_ARTIFACT_DIGEST = "sha256:" + "c" * 64
 _HEAD_REF = "issue-44-order-independent-release"
 
 
@@ -1868,7 +1939,6 @@ def _release_candidate(
     return {
         "id": artifact_id if artifact_id is not None else run_id * 100 + attempt,
         "name": name,
-        "digest": _ARTIFACT_DIGEST,
         "expired": expired,
     }
 
@@ -2570,7 +2640,6 @@ def _execute_revalidation(
         environment = os.environ.copy()
         environment.update(
             {
-                "ARTIFACT_DIGEST": authority["artifact_digest"],
                 "ARTIFACT_ID": authority["artifact_id"],
                 "ARTIFACT_IDS": authority.get("artifact_ids", authority["artifact_id"]),
                 "ARTIFACT_NAME": authority["artifact_name"],
@@ -3405,21 +3474,20 @@ def self_test() -> int:
         ),
         ("selective-quality.yml", "  windows-quality:\n", "  omitted-windows-quality:\n"),
         ("windows-client.yml", "New-WindowsUpdateManifest.ps1", "Omitted-Manifest.ps1"),
-        ("windows-client.yml", "/releases/latest", "/releases/omitted"),
         (
             "windows-client.yml",
-            '$expectedProductVersion = "$candidateVersionText+$SourceSha"',
-            '$expectedProductVersion = "$candidateVersionText"',
+            "Ensure-InnoSetupCompiler.ps1",
+            "Omitted-InnoSetupCompiler.ps1",
         ),
         (
             "windows-client.yml",
-            "if ($previousHash -cne [string]$manifest.installer.sha256)",
-            "if ($previousHash -ceq [string]$manifest.installer.sha256)",
+            "Install-WindowsCandidateForE2E.ps1",
+            "Omitted-WindowsCandidateForE2E.ps1",
         ),
         (
             "windows-client.yml",
-            "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf))",
-            "if (Test-Path -LiteralPath $sentinel -PathType Leaf)",
+            "-SourceSha $env:SOURCE_SHA",
+            "-SourceSha $env:WRONG_SHA",
         ),
         (
             "linux-distribution.yml",
@@ -3512,6 +3580,44 @@ def self_test() -> int:
         candidate[name] = candidate[name].replace(old, new, 1)
         if not validate(candidate):
             raise AssertionError(f"workflow mutation was accepted: {name}: {old}")
+        cases += 1
+    windows_gate_baseline = windows_gate_sources()
+    windows_gate_mutations = (
+        (
+            "sdk",
+            "Get-FileHash -LiteralPath $archive -Algorithm SHA512",
+            "Get-FileHash -LiteralPath $archive -Algorithm SHA256",
+        ),
+        (
+            "build",
+            "-p:SourceRevisionId=$SourceSha",
+            "-p:SourceRevisionId=unknown",
+        ),
+        ("upgrade", "/releases/latest", "/releases/omitted"),
+        (
+            "upgrade",
+            '$expectedProductVersion = "$candidateVersionText+$SourceSha"',
+            '$expectedProductVersion = "$candidateVersionText"',
+        ),
+        (
+            "upgrade",
+            "if ($previousHash -cne [string]$manifest.installer.sha256)",
+            "if ($previousHash -ceq [string]$manifest.installer.sha256)",
+        ),
+        (
+            "upgrade",
+            "if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf))",
+            "if (Test-Path -LiteralPath $sentinel -PathType Leaf)",
+        ),
+        ("e2e", "[switch]$PrepareCandidate", "[string]$PrepareCandidate"),
+    )
+    for name, old, new in windows_gate_mutations:
+        candidate = dict(windows_gate_baseline)
+        if old not in candidate[name]:
+            raise AssertionError(f"Windows gate mutation target is missing: {name}: {old}")
+        candidate[name] = candidate[name].replace(old, new, 1)
+        if not _windows_gate_script_errors(candidate):
+            raise AssertionError(f"Windows gate mutation was accepted: {name}: {old}")
         cases += 1
     acceptance_mutations = (
         (
