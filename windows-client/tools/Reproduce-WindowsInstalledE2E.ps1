@@ -1,6 +1,8 @@
 # Reproduces the installed Windows UI Automation step used by the main-PR
-# release-candidate workflow. The UI assertions and physical window-move smoke
-# are identical for local and CI runs; installation cleanup is CI opt-in.
+# release-candidate workflow. Local preparation installs the exact candidate
+# directly; published-release upgrade validation remains a separate CI step.
+# The UI assertions and physical window-move smoke are identical for local and
+# CI runs; installation cleanup is CI opt-in.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -30,7 +32,6 @@ $moveSmoke = Join-Path $repositoryRoot 'scripts/windows_window_move_smoke.ps1'
 $ensureDotNetSdk = Join-Path $PSScriptRoot 'Ensure-DotNetSdk.ps1'
 $ensureCompiler = Join-Path $PSScriptRoot 'Ensure-InnoSetupCompiler.ps1'
 $buildInstaller = Join-Path $PSScriptRoot 'Build-WindowsInstaller.ps1'
-$installCandidate = Join-Path $PSScriptRoot 'Install-WindowsCandidateForE2E.ps1'
 if (-not (Test-Path -LiteralPath $runner -PathType Leaf)) {
     throw "Windows UI E2E runner is missing: $runner"
 }
@@ -48,7 +49,7 @@ $expectedProductVersion = "$($versionNodes[0].InnerText.Trim())+$SourceSha"
 $installedMatches = (Test-Path -LiteralPath $ClientPath -PathType Leaf) -and
     ((Get-Item -LiteralPath $ClientPath).VersionInfo.ProductVersion -ceq $expectedProductVersion)
 if ($PrepareCandidate -and -not $installedMatches) {
-    foreach ($requiredScript in ($ensureDotNetSdk, $ensureCompiler, $buildInstaller, $installCandidate)) {
+    foreach ($requiredScript in ($ensureDotNetSdk, $ensureCompiler, $buildInstaller)) {
         if (-not (Test-Path -LiteralPath $requiredScript -PathType Leaf)) {
             throw "Windows candidate preparation script is missing: $requiredScript"
         }
@@ -61,8 +62,12 @@ if ($PrepareCandidate -and -not $installedMatches) {
     & $buildInstaller -OutputDirectory $CandidateOutputDirectory -SourceSha $SourceSha
     $candidateSetup = Join-Path $repositoryRoot `
         (Join-Path $CandidateOutputDirectory 'CodexInfo.WindowsClient.Setup.exe')
-    & $installCandidate -SourceSha $SourceSha -CandidateSetup $candidateSetup `
-        -RetainSentinel:$CleanupInstallation
+    $candidateInstall = Start-Process -FilePath $candidateSetup `
+        -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') `
+        -Wait -PassThru
+    if ($candidateInstall.ExitCode -ne 0) {
+        throw "Candidate installer failed with exit code $($candidateInstall.ExitCode)."
+    }
 }
 if (-not (Test-Path -LiteralPath $ClientPath -PathType Leaf)) {
     throw "Installed Windows client is missing: $ClientPath"

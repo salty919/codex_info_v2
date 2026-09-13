@@ -102,7 +102,7 @@ def _windows_gate_script_errors(scripts: Mapping[str, str]) -> list[str]:
             "Ensure-DotNetSdk.ps1",
             "Ensure-InnoSetupCompiler.ps1",
             "Build-WindowsInstaller.ps1",
-            "Install-WindowsCandidateForE2E.ps1",
+            "Candidate installer failed with exit code",
             "-SourceSha $SourceSha",
         ),
     }
