@@ -1294,6 +1294,14 @@ pub struct SessionEvent {
     pub cache_write_input_tokens: Option<u64>,
 }
 
+/// One exact, source-verified correction of a token event whose model context
+/// was previously lost at an account activation boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionEventReattribution {
+    pub event: SessionEvent,
+    pub corrected_model: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionModelTotal {
     pub model: String,
@@ -2184,6 +2192,39 @@ fn canonicalize_model_totals(totals: &[SessionModelTotal]) -> Result<Vec<Session
         }
     }
     Ok(canonical.into_values().collect())
+}
+
+fn checked_add_model_total(
+    target: &mut SessionModelTotal,
+    source: &SessionModelTotal,
+) -> Result<()> {
+    target.total_tokens = target
+        .total_tokens
+        .checked_add(source.total_tokens)
+        .ok_or(UsageStoreError::GenerationOverflow)?;
+    target.input_tokens = target
+        .input_tokens
+        .checked_add(source.input_tokens)
+        .ok_or(UsageStoreError::GenerationOverflow)?;
+    target.cached_input_tokens = target
+        .cached_input_tokens
+        .checked_add(source.cached_input_tokens)
+        .ok_or(UsageStoreError::GenerationOverflow)?;
+    target.output_tokens = target
+        .output_tokens
+        .checked_add(source.output_tokens)
+        .ok_or(UsageStoreError::GenerationOverflow)?;
+    target.cache_write_input_tokens = match (
+        target.cache_write_input_tokens,
+        source.cache_write_input_tokens,
+    ) {
+        (Some(left), Some(right)) => Some(
+            left.checked_add(right)
+                .ok_or(UsageStoreError::GenerationOverflow)?,
+        ),
+        _ => None,
+    };
+    Ok(())
 }
 
 fn model_total_dominates(left: &SessionModelTotal, right: &SessionModelTotal) -> bool {
@@ -10003,6 +10044,189 @@ impl UsageStore {
             validate_session_event(event)?;
         }
         Ok(rows)
+    }
+
+    /// Replace only an exact set of currently-unattributed events after the
+    /// recorder has reverified their immutable source ranges. The current
+    /// UNATTRIBUTED total must equal the complete correction set, preventing a
+    /// partial repair from hiding unrelated or still-unproven usage.
+    pub fn reattribute_unattributed_session_events(
+        &mut self,
+        corrections: &[SessionEventReattribution],
+    ) -> Result<u64> {
+        let current_generation = || -> Result<u64> {
+            let value: String = self.connection.query_row(
+                "SELECT data_generation FROM collection_generation WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?;
+            canonical_u64_text(&value, "collection generation")
+        };
+        if corrections.is_empty() {
+            return current_generation();
+        }
+
+        let mut keys = BTreeSet::new();
+        let mut moved = BTreeMap::<String, SessionModelTotal>::new();
+        let mut unattributed = SessionModelTotal {
+            model: "UNATTRIBUTED".to_owned(),
+            total_tokens: 0,
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            cache_write_input_tokens: Some(0),
+        };
+        for correction in corrections {
+            validate_session_event(&correction.event)?;
+            if correction.event.model != "UNATTRIBUTED"
+                || correction.corrected_model == "UNATTRIBUTED"
+                || !valid_session_model(&correction.corrected_model)
+                || !keys.insert((
+                    correction.event.root_identity.clone(),
+                    correction.event.relative_path.clone(),
+                    correction.event.file_device,
+                    correction.event.file_inode,
+                    correction.event.prefix_generation,
+                    correction.event.range_start,
+                    correction.event.range_end,
+                    correction.event.record_sha256.clone(),
+                    correction.event.event_index,
+                ))
+            {
+                return Err(UsageStoreError::InvalidImport(
+                    "session event reattribution is invalid".into(),
+                ));
+            }
+            let delta = SessionModelTotal {
+                model: correction.corrected_model.clone(),
+                total_tokens: correction.event.total_tokens,
+                input_tokens: correction.event.input_tokens,
+                cached_input_tokens: correction.event.cached_input_tokens,
+                output_tokens: correction.event.output_tokens,
+                cache_write_input_tokens: correction.event.cache_write_input_tokens,
+            };
+            checked_add_model_total(&mut unattributed, &delta)?;
+            let target = moved
+                .entry(correction.corrected_model.clone())
+                .or_insert_with(|| SessionModelTotal {
+                    model: correction.corrected_model.clone(),
+                    total_tokens: 0,
+                    input_tokens: 0,
+                    cached_input_tokens: 0,
+                    output_tokens: 0,
+                    cache_write_input_tokens: Some(0),
+                });
+            checked_add_model_total(target, &delta)?;
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current =
+            canonicalize_model_totals(&session_model_totals_from_transaction(&transaction)?)?;
+        let current_unattributed = current.iter().find(|total| total.model == "UNATTRIBUTED");
+        if current_unattributed != Some(&unattributed) {
+            return Err(UsageStoreError::InvalidImport(
+                "session event reattribution does not cover the current unattributed total".into(),
+            ));
+        }
+
+        {
+            let mut update = transaction.prepare(
+                "UPDATE session_events SET model=?1
+                 WHERE root_identity=?2 AND relative_path=?3 AND file_device=?4
+                   AND file_inode=?5 AND prefix_generation=?6 AND range_start=?7
+                   AND range_end=?8 AND record_sha256=?9 AND event_index=?10
+                   AND timestamp=?11 AND model=?12 AND total_tokens=?13
+                   AND input_tokens=?14 AND cached_input_tokens=?15
+                   AND output_tokens=?16 AND cache_write_input_tokens IS ?17",
+            )?;
+            for correction in corrections {
+                let event = &correction.event;
+                if update.execute(params![
+                    &correction.corrected_model,
+                    &event.root_identity,
+                    &event.relative_path,
+                    event.file_device.to_string(),
+                    event.file_inode.to_string(),
+                    format!("{:032x}", event.prefix_generation),
+                    event.range_start as i64,
+                    event.range_end as i64,
+                    &event.record_sha256,
+                    event.event_index as i64,
+                    event.timestamp,
+                    &event.model,
+                    event.total_tokens.to_string(),
+                    event.input_tokens.to_string(),
+                    event.cached_input_tokens.to_string(),
+                    event.output_tokens.to_string(),
+                    event
+                        .cache_write_input_tokens
+                        .map(|value| value.to_string()),
+                ])? != 1
+                {
+                    return Err(UsageStoreError::InvalidImport(
+                        "session event reattribution evidence changed".into(),
+                    ));
+                }
+            }
+        }
+
+        let mut repaired = current
+            .into_iter()
+            .filter(|total| total.model != "UNATTRIBUTED")
+            .map(|total| (total.model.clone(), total))
+            .collect::<BTreeMap<_, _>>();
+        for correction in moved.into_values() {
+            let target =
+                repaired
+                    .entry(correction.model.clone())
+                    .or_insert_with(|| SessionModelTotal {
+                        model: correction.model.clone(),
+                        total_tokens: 0,
+                        input_tokens: 0,
+                        cached_input_tokens: 0,
+                        output_tokens: 0,
+                        cache_write_input_tokens: Some(0),
+                    });
+            checked_add_model_total(target, &correction)?;
+        }
+        let repaired = canonicalize_model_totals(&repaired.into_values().collect::<Vec<_>>())?;
+        transaction.execute("DELETE FROM session_model_totals", [])?;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO session_model_totals(
+                    model, total_tokens, input_tokens, cached_input_tokens,
+                    output_tokens, cache_write_input_tokens
+                 ) VALUES(?1,?2,?3,?4,?5,?6)",
+            )?;
+            for total in repaired {
+                insert.execute(params![
+                    total.model,
+                    total.total_tokens.to_string(),
+                    total.input_tokens.to_string(),
+                    total.cached_input_tokens.to_string(),
+                    total.output_tokens.to_string(),
+                    total
+                        .cache_write_input_tokens
+                        .map(|value| value.to_string()),
+                ])?;
+            }
+        }
+        let generation: String = transaction.query_row(
+            "SELECT data_generation FROM collection_generation WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        let next = canonical_u64_text(&generation, "collection generation")?
+            .checked_add(1)
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+        transaction.execute(
+            "UPDATE collection_generation SET data_generation=?1 WHERE singleton=1",
+            [next.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(next)
     }
 
     /// Load the source-proven task lifecycle evidence and its fail-closed
