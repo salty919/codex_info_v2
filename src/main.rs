@@ -3754,6 +3754,7 @@ struct UsageHistory {
     startup_maintenance_done: bool,
 }
 
+#[cfg(test)]
 fn main_sample_from_observation(
     observation: &usage_store::UsageHistoryObservation,
 ) -> Option<UsageHistorySample> {
@@ -3918,6 +3919,7 @@ fn store_observation_from_public_v3(
     }
 }
 
+#[cfg(test)]
 fn prefer_model_source(
     current: usage_store::ModelSource,
     candidate: usage_store::ModelSource,
@@ -3948,6 +3950,7 @@ fn model_source_rank(source: usage_store::ModelSource) -> u8 {
 /// Attribute each v1-canonical model vector to the source row selected by the
 /// same reset-group/dominant-vector canonicalizer. A timestamp-only lookup is
 /// unsafe when a legacy singleton or a reset-drift duplicate shares a minute.
+#[cfg(test)]
 fn canonical_model_sources(
     observations: &[usage_store::UsageHistoryObservation],
     canonical_samples: &[UsageHistorySample],
@@ -4585,6 +4588,7 @@ impl UsageHistory {
             .map_or(reset_at, |period| period.canonical_reset_at)
     }
 
+    #[cfg(test)]
     fn graph_data_for_reset(&self, reset_at: i64) -> String {
         let samples = self.samples_for_reset(Some(reset_at));
         serde_json::to_string(&samples).unwrap_or_else(|_| "[]".into())
@@ -17197,10 +17201,12 @@ impl CodexInfoState {
         }
     }
 
+    #[cfg(test)]
     fn graph_data(&self) -> String {
         self.graph_data_at(Utc::now().timestamp())
     }
 
+    #[cfg(test)]
     fn graph_data_at(&self, observed_at: i64) -> String {
         let Some(reset_at) = self.selected_history_reset_at(observed_at) else {
             return "[]".into();

@@ -9,6 +9,52 @@ fail() {
     exit 1
 }
 
+linux_ui_tools_available() {
+    local command_name
+    for command_name in xvfb-run xauth xwininfo xprop xwd python3; do
+        command -v "$command_name" >/dev/null || return 1
+    done
+    if command -v ldconfig >/dev/null; then
+        ldconfig -p 2>/dev/null | grep -F 'libxkbcommon-x11.so.0' >/dev/null || return 1
+    fi
+}
+
+ensure_linux_ui_host_dependencies() {
+    linux_ui_tools_available && return
+
+    command -v dpkg-query >/dev/null ||
+        fail 'Linux UI tools are missing and automatic provisioning requires dpkg/apt-get'
+    command -v apt-get >/dev/null ||
+        fail 'Linux UI tools are missing and automatic provisioning requires dpkg/apt-get'
+
+    local package_name
+    local -a missing_packages=()
+    for package_name in xvfb xauth x11-utils x11-apps libxkbcommon-x11-0; do
+        if ! dpkg-query -W -f='${db:Status-Abbrev}' "$package_name" 2>/dev/null |
+            grep -qx 'ii '; then
+            missing_packages+=("$package_name")
+        fi
+    done
+    if ! command -v python3 >/dev/null; then
+        missing_packages+=(python3)
+    fi
+
+    if ((${#missing_packages[@]} > 0)); then
+        local -a apt_command=(apt-get)
+        if ((EUID != 0)); then
+            command -v sudo >/dev/null ||
+                fail "root access is required to install: ${missing_packages[*]}"
+            apt_command=(sudo apt-get)
+        fi
+        echo "main-pr-reproduction: installing missing Linux UI packages: ${missing_packages[*]}"
+        "${apt_command[@]}" update
+        "${apt_command[@]}" install --no-install-recommends --yes "${missing_packages[@]}"
+    fi
+
+    linux_ui_tools_available ||
+        fail 'Linux UI dependencies remain unavailable after host provisioning'
+}
+
 phase='all'
 pr_number=''
 while (($# > 0)); do
@@ -37,8 +83,9 @@ run_linux_cli() {
 
 run_linux_ui() {
     command -v cargo >/dev/null || fail 'cargo is unavailable'
-    command -v xvfb-run >/dev/null || fail 'xvfb-run is unavailable'
-    cargo build --release --locked
+    ensure_linux_ui_host_dependencies
+    cargo build --release --locked \
+        -p codex_info -p codex-info-recorder -p codex-info-rest
     xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
         bash scripts/x11_startup_visual_gate.sh
     xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
@@ -47,7 +94,7 @@ run_linux_ui() {
 
 run_linux_distribution() {
     command -v cargo >/dev/null || fail 'cargo is unavailable'
-    command -v xvfb-run >/dev/null || fail 'xvfb-run is unavailable'
+    ensure_linux_ui_host_dependencies
     command -v jq >/dev/null || fail 'jq is unavailable'
     local target='x86_64-unknown-linux-gnu'
     local output_root candidate_root archive

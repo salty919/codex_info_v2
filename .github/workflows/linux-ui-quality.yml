@@ -32,7 +32,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install --no-install-recommends --yes xvfb xauth x11-utils x11-apps libxkbcommon-x11-0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: Build native release for UI evaluation
-        run: cargo build --release --locked
+        run: cargo build --release --locked -p codex_info -p codex-info-recorder -p codex-info-rest
       - name: Run startup UI image and failure-state acceptance
         if: inputs.release_candidate
         run: xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' bash scripts/x11_startup_visual_gate.sh
