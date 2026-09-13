@@ -138,7 +138,7 @@ show_external_checks() {
 }
 
 case "$phase" in
-    linux-cli) run_linux_cli ;;
+    native-quality | linux-cli) run_linux_cli ;;
     linux-ui) run_linux_ui ;;
     linux-distribution) run_linux_distribution ;;
     windows-ui) run_windows_ui ;;
