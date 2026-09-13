@@ -12877,6 +12877,13 @@ mod tests {
         store
             .connection
             .execute(
+                "ALTER TABLE session_checkpoints DROP COLUMN history_base_pending",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
                 "ALTER TABLE session_checkpoints DROP COLUMN previous_cache_write_input",
                 [],
             )
