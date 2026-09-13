@@ -44476,10 +44476,10 @@ mod tests {
         assert!(paths.sol_rising.is_empty());
         assert!(paths.terra_rising.is_empty());
         assert!(paths.luna_rising.is_empty());
-        assert!(paths.astra_flat.is_empty());
+        assert!(!paths.astra_flat.is_empty());
         assert!(paths.astra_rising.is_empty());
-        assert!(paths.astra_inferred.is_empty());
-        assert!(paths.current_astra_label.is_empty());
+        assert!(!paths.astra_inferred.is_empty());
+        assert_eq!(paths.current_astra_label, "$10.00");
         assert_eq!(paths.unused_intervals.len(), 1);
         let idle = &paths.unused_intervals[0];
         assert!((idle.start - 100.0 / 12.0).abs() < 0.001);
