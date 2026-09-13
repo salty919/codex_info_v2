@@ -1337,6 +1337,44 @@ mod tests {
     }
 
     #[test]
+    fn v3_history_exposes_saved_legacy_totals_without_inventing_components() {
+        let path = temp_db("legacy-history-wire");
+        fixture(&path, 10);
+        Connection::open(&path)
+            .expect("fixture")
+            .execute("DELETE FROM durable_state", [])
+            .expect("remove post-legacy provenance");
+
+        let reader = DbReader::open(&path).expect("reader");
+        let mut server = RestServer::start(reader, "127.0.0.1:0".parse().unwrap()).expect("server");
+        let response = request(
+            server.local_addr(),
+            "GET /v3/history?period=1800000060 HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200"));
+        let value: serde_json::Value =
+            serde_json::from_str(body(&response)).expect("v3 history JSON");
+        let sample = &value["history_samples"][0];
+        assert_eq!(sample["model_source"], "legacy-unknown");
+        assert_eq!(sample["models_complete"], false);
+        let models = sample["models"].as_array().expect("legacy model totals");
+        for (name, tokens, dollars) in [("SOL", 10_u64, 1.0), ("TERRA", 2, 2.0), ("LUNA", 3, 3.0)] {
+            let model = models
+                .iter()
+                .find(|model| model["model"] == name)
+                .expect("saved legacy model");
+            assert_eq!(model["total_tokens"], tokens);
+            assert_eq!(model["total_dollars"], dollars);
+            assert!(model.get("input_tokens").is_none());
+            assert!(model.get("cached_input_tokens").is_none());
+            assert!(model.get("cache_write_input_tokens").is_none());
+            assert!(model.get("output_tokens").is_none());
+        }
+        server.shutdown();
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
     fn malformed_http_isolated_from_snapshot_refresh() {
         let path = temp_db("malformed-http");
         fixture(&path, 10);
