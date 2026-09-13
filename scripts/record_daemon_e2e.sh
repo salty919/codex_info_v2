@@ -77,10 +77,7 @@ case_data=""
 case_db=""
 sessions_root=""
 session_file=""
-fixture_activation_time=""
-fixture_first_time=""
-fixture_second_time=""
-fixture_third_time=""
+fixture_event_time=""
 case_port=""
 common_env=()
 recorder_pid=""
@@ -249,18 +246,36 @@ is_uint() {
     [[ "$1" =~ ^[0-9]+$ ]]
 }
 
+wait_for_quota_observation() {
+    local row="" observed="" reset="" window=""
+    for _ in $(seq 1 80); do
+        row="$(read_sql '
+            SELECT h.timestamp || "|" || h.reset_at || "|" || c.window_seconds
+            FROM usage_history AS h
+            JOIN collection_generation AS c
+              ON c.singleton = 1 AND c.reset_at = h.reset_at
+            WHERE h.remaining_percent IS NOT NULL
+            ORDER BY h.timestamp DESC
+            LIMIT 1
+        ' 2>/dev/null || true)"
+        IFS='|' read -r observed reset window <<<"$row"
+        if is_uint "$observed" && is_uint "$reset" && is_uint "$window" \
+            && ((10#$observed > 0 && 10#$reset > 0 && 10#$window > 0 \
+                && 10#$observed >= 10#$reset - 10#$window \
+                && 10#$observed <= 10#$reset)); then
+            printf '%s\n' "$observed"
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 1
+}
+
 write_fixture() {
-    local now minute baseline_time activation_time first_time second_time third_time auth_file
+    local now minute baseline_time auth_file
     now="$(date -u +%s)"
     minute=$((now - now % 60))
     baseline_time=$((minute - 180))
-    activation_time=$((minute - 150))
-    first_time=$((minute - 120))
-    second_time=$((minute - 60))
-    third_time="$minute"
-    ((baseline_time < activation_time && activation_time < first_time \
-        && first_time < second_time && second_time < third_time)) \
-        || fail 'recorder fixture account timeline is not strictly ordered'
     mkdir -p "$sessions_root" "$case_data/history"
     chmod 700 "$case_home" "$case_data"
     auth_file="$case_home/auth.json"
@@ -273,10 +288,6 @@ write_fixture() {
         "{\"type\":\"event_msg\",\"timestamp\":\"$(date -u -d "@$baseline_time" +%Y-%m-%dT%H:%M:%SZ)\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":120,\"input_tokens\":100,\"cached_input_tokens\":80,\"output_tokens\":20}}}}" \
         >"$session_file"
     chmod 600 "$session_file"
-    fixture_activation_time="$activation_time"
-    fixture_first_time="$first_time"
-    fixture_second_time="$second_time"
-    fixture_third_time="$third_time"
 }
 
 append_session_usage() {
@@ -634,31 +645,32 @@ wait_for_ui_rest_connection() {
             return 1
         fi
         # The client uses short-lived HTTP connections that normally reach
-        # TIME_WAIT before a 250 ms process-table sample. Compare client tuples
-        # with the pre-launch baseline so the completed connection remains a
-        # durable proof instead of relying on a chance ESTABLISHED observation.
+        # TIME_WAIT before a 250 ms process-table sample. Either endpoint can
+        # own TIME_WAIT, so compare both directions with the pre-launch
+        # baseline instead of relying on a chance ESTABLISHED observation.
         while IFS= read -r tuple; do
             [[ -n "$tuple" ]] || continue
             if ! rg -Fqx -- "$tuple" <<<"$ui_rest_connection_baseline"; then
                 return 0
             fi
-        done < <(rest_client_tuples)
+        done < <(rest_connection_tuples)
         sleep 0.25
     done
     return 1
 }
 
-rest_client_tuples() {
-    local remote
-    printf -v remote '0100007F:%04X' "$case_port"
-    awk -v remote="$remote" '
-        NR > 1 && toupper($3) == remote { print toupper($2 "|" $3) }
+rest_connection_tuples() {
+    local endpoint
+    printf -v endpoint '0100007F:%04X' "$case_port"
+    awk -v endpoint="$endpoint" '
+        NR > 1 && (toupper($2) == endpoint || toupper($3) == endpoint) {
+            print toupper($2 "|" $3)
+        }
     ' /proc/net/tcp 2>/dev/null
 }
 
 setup_case
 write_fixture
-common_env+=("CODEX_INFO_ACCOUNT_ACTIVATION_UNIX=$fixture_activation_time")
 
 # The sentinel is deliberately outside the product scope.  It must survive
 # every product termination below, proving that PID cleanup is not a broad
@@ -684,12 +696,17 @@ is_uint "$baseline_matching_ranges" && is_uint "$baseline_checkpoint" \
     && is_uint "$baseline_ranges" && is_uint "$baseline_model" \
     || fail 'first recorder acknowledgement has invalid range/checkpoint/model readback'
 
-# A new account partition deliberately baselines the first counter after the
-# pre-activation file prefix. The next counter is therefore the first durable
-# post-activation delta used by REST. No SQLite row is created by this fixture;
-# quota/history must come from the recorder or a real existing UsageStore state.
-append_session_usage "$fixture_first_time" 240 200 160 40
-append_session_usage "$fixture_second_time" 360 300 240 60
+# The new partition's physical EOF baseline and its quota period must both be
+# durable before this fixture appends account-owned usage.  Use the recorder's
+# admitted quota observation as the Session timestamp so the counter belongs
+# to both the account lifecycle and the canonical period without a wall-clock
+# race. The first counter is the post-boundary baseline; the second is its
+# first delta. No SQLite row is created directly by this fixture.
+fixture_event_time="$(wait_for_quota_observation 2>/dev/null || true)"
+is_uint "$fixture_event_time" && ((10#$fixture_event_time > 0)) \
+    || fail 'recorder did not publish a canonical quota observation before Session input'
+append_session_usage "$fixture_event_time" 240 200 160 40
+append_session_usage "$fixture_event_time" 360 300 240 60
 first_snapshot="$(wait_for_recorder_advance \
     "$baseline_generation|$baseline_epoch|$baseline_cycle" "$baseline_model" \
     "$baseline_ranges" "$baseline_checkpoint" 1 2>/dev/null || true)"
@@ -738,7 +755,7 @@ assert_no_scoped_process rest 'REST shutdown'
 process_matches_scope "$recorder_pid" recorder \
     || fail 'recorder stopped or changed executable during REST outage'
 
-append_session_usage "$fixture_third_time" 480 400 320 80
+append_session_usage "$fixture_event_time" 480 400 320 80
 outage_snapshot=""
 outage_snapshot="$(wait_for_recorder_advance \
     "$generation_before|$epoch_before|$cycle_before" "$model_before" \
@@ -770,7 +787,7 @@ assert_model_growth "$details_before" "$details_after" \
 # The UI receives only the REST endpoint in this invocation. Its executable,
 # marker, and port are checked independently, while recorder and REST PIDs
 # remain untouched and no UI-owned recorder process may appear.
-ui_rest_connection_baseline="$(rest_client_tuples)"
+ui_rest_connection_baseline="$(rest_connection_tuples)"
 launch_ui ui-client-only
 assert_one_scoped_process ui "$ui_pid" 'client-only UI startup'
 [[ "$ui_pid" != "$recorder_pid" && "$ui_pid" != "$rest_pid" ]] \
