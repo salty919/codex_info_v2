@@ -40,6 +40,7 @@ WINDOWS_GATE_SCRIPTS = {
     "build": "windows-client/tools/Build-WindowsInstaller.ps1",
     "upgrade": "windows-client/tools/Install-WindowsCandidateForE2E.ps1",
     "e2e": "windows-client/tools/Reproduce-WindowsInstalledE2E.ps1",
+    "runner": "windows-client/tools/Run-WindowsClientE2E.ps1",
 }
 
 
@@ -97,6 +98,10 @@ def _windows_gate_script_errors(scripts: Mapping[str, str]) -> list[str]:
             "Build-WindowsInstaller.ps1",
             "Candidate installer failed with exit code",
             "-SourceSha $SourceSha",
+        ),
+        "runner": (
+            "[string]$SourceSha = ''",
+            'Write-E2E "source-sha: $script:e2eSourceSha"',
         ),
     }
     errors: list[str] = []

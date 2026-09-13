@@ -69,13 +69,14 @@ proc_starttime() {
     awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true
 }
 
-click_window() {
-    python3 - "$1" "$2" "$3" <<'PY'
+window_action() {
+    python3 - "$1" "$2" "$3" "$4" <<'PY'
 import ctypes
 import sys
 import time
 
-window, x, y = (int(value, 0) for value in sys.argv[1:])
+window, x, y = (int(value, 0) for value in sys.argv[1:4])
+action = sys.argv[4]
 x11 = ctypes.CDLL("libX11.so.6")
 xtst = ctypes.CDLL("libXtst.so.6")
 x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
@@ -93,14 +94,18 @@ if not display:
     raise SystemExit("X display is unavailable")
 try:
     x11.XRaiseWindow(display, window)
-    x11.XWarpPointer(display, 0, window, 0, 0, 0, 0, x, y)
     x11.XSync(display, 0)
-    time.sleep(0.05)
-    if not xtst.XTestFakeButtonEvent(display, 1, 1, 0):
-        raise SystemExit("X button press failed")
-    if not xtst.XTestFakeButtonEvent(display, 1, 0, 0):
-        raise SystemExit("X button release failed")
-    x11.XSync(display, 0)
+    if action == "click":
+        x11.XWarpPointer(display, 0, window, 0, 0, 0, 0, x, y)
+        x11.XSync(display, 0)
+        time.sleep(0.05)
+        if not xtst.XTestFakeButtonEvent(display, 1, 1, 0):
+            raise SystemExit("X button press failed")
+        if not xtst.XTestFakeButtonEvent(display, 1, 0, 0):
+            raise SystemExit("X button release failed")
+        x11.XSync(display, 0)
+    elif action != "raise":
+        raise SystemExit(f"unknown X11 window action: {action}")
 finally:
     x11.XCloseDisplay(display)
 PY
@@ -869,7 +874,7 @@ assert_thread_summary_components "$ready_frame" \
 # Exercise the actual lazy boundary: the authenticated main window has already
 # rendered with period metadata, and only this user action may materialize the
 # selected history page and graph window.
-click_window "$window_id" 750 30
+window_action "$window_id" 750 30 click
 for _ in $(seq 1 100); do
     while read -r candidate; do
         [[ "$candidate" != "$window_id" ]] || continue
@@ -941,12 +946,16 @@ done
 # pre-graph frame.
 service_thread_bundle_ready \
     || fail 'one-SOL wire bundle changed before failure injection'
-# The graph window overlaps Main under the CI window manager. Raise Main before
-# reading its drawable so XGetImage cannot return pixels from the obscuring
-# graph window in the exact thread-summary comparison.
-click_window "$window_id" 500 30
-sleep 0.1
-capture_state ready >/dev/null \
+# The graph window overlaps Main under the CI window manager. Raise Main without
+# injecting an unrelated click, then wait only for its exposed ready frame so
+# XGetImage cannot return pixels from the obscuring graph window.
+window_action "$window_id" 0 0 raise
+ready_capture=0
+for _ in $(seq 1 60); do
+    if capture_state ready >/dev/null 2>/dev/null; then ready_capture=1; break; fi
+    sleep 0.25
+done
+((ready_capture == 1)) \
     || fail 'Main did not remain ready after the graph acceptance step'
 cp -- "$frame" "$ready_frame"
 assert_thread_summary_components "$ready_frame" \
