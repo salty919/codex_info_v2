@@ -77,6 +77,10 @@ case_data=""
 case_db=""
 sessions_root=""
 session_file=""
+fixture_activation_time=""
+fixture_first_time=""
+fixture_second_time=""
+fixture_third_time=""
 case_port=""
 common_env=()
 recorder_pid=""
@@ -246,12 +250,17 @@ is_uint() {
 }
 
 write_fixture() {
-    local now minute baseline_time first_time second_time auth_file
+    local now minute baseline_time activation_time first_time second_time third_time auth_file
     now="$(date -u +%s)"
     minute=$((now - now % 60))
-    baseline_time=$((minute - 120))
-    first_time=$((minute - 60))
-    second_time="$minute"
+    baseline_time=$((minute - 180))
+    activation_time=$((minute - 150))
+    first_time=$((minute - 120))
+    second_time=$((minute - 60))
+    third_time="$minute"
+    ((baseline_time < activation_time && activation_time < first_time \
+        && first_time < second_time && second_time < third_time)) \
+        || fail 'recorder fixture account timeline is not strictly ordered'
     mkdir -p "$sessions_root" "$case_data/history"
     chmod 700 "$case_home" "$case_data"
     auth_file="$case_home/auth.json"
@@ -264,8 +273,10 @@ write_fixture() {
         "{\"type\":\"event_msg\",\"timestamp\":\"$(date -u -d "@$baseline_time" +%Y-%m-%dT%H:%M:%SZ)\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":120,\"input_tokens\":100,\"cached_input_tokens\":80,\"output_tokens\":20}}}}" \
         >"$session_file"
     chmod 600 "$session_file"
+    fixture_activation_time="$activation_time"
     fixture_first_time="$first_time"
     fixture_second_time="$second_time"
+    fixture_third_time="$third_time"
 }
 
 append_session_usage() {
@@ -647,6 +658,7 @@ rest_client_tuples() {
 
 setup_case
 write_fixture
+common_env+=("CODEX_INFO_ACCOUNT_ACTIVATION_UNIX=$fixture_activation_time")
 
 # The sentinel is deliberately outside the product scope.  It must survive
 # every product termination below, proving that PID cleanup is not a broad
@@ -672,10 +684,12 @@ is_uint "$baseline_matching_ranges" && is_uint "$baseline_checkpoint" \
     && is_uint "$baseline_ranges" && is_uint "$baseline_model" \
     || fail 'first recorder acknowledgement has invalid range/checkpoint/model readback'
 
-# First append establishes the non-empty, recorder-produced quota/history/model
-# snapshot used by REST. No SQLite schema or row is created by this fixture;
+# A new account partition deliberately baselines the first counter after the
+# pre-activation file prefix. The next counter is therefore the first durable
+# post-activation delta used by REST. No SQLite row is created by this fixture;
 # quota/history must come from the recorder or a real existing UsageStore state.
 append_session_usage "$fixture_first_time" 240 200 160 40
+append_session_usage "$fixture_second_time" 360 300 240 60
 first_snapshot="$(wait_for_recorder_advance \
     "$baseline_generation|$baseline_epoch|$baseline_cycle" "$baseline_model" \
     "$baseline_ranges" "$baseline_checkpoint" 1 2>/dev/null || true)"
@@ -724,7 +738,7 @@ assert_no_scoped_process rest 'REST shutdown'
 process_matches_scope "$recorder_pid" recorder \
     || fail 'recorder stopped or changed executable during REST outage'
 
-append_session_usage "$fixture_second_time" 360 300 240 60
+append_session_usage "$fixture_third_time" 480 400 320 80
 outage_snapshot=""
 outage_snapshot="$(wait_for_recorder_advance \
     "$generation_before|$epoch_before|$cycle_before" "$model_before" \

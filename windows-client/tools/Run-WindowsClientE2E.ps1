@@ -10,7 +10,8 @@ param(
     [switch]$Fixture,
     [switch]$FixtureContractTest,
     [switch]$CompatibilitySmoke,
-    [switch]$RequireCurrentPresentation
+    [switch]$RequireCurrentPresentation,
+    [string]$SourceSha = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -57,6 +58,7 @@ if (Test-Path -LiteralPath $script:e2eOutput -PathType Container) {
 }
 New-Item -ItemType Directory -Path $script:e2eOutput -Force | Out-Null
 $script:e2eLogPath = Join-Path $script:e2eOutput 'windows-client-e2e.log'
+$script:e2eSourceSha = if ([string]::IsNullOrWhiteSpace($SourceSha)) { 'not-supplied' } else { $SourceSha }
 $script:e2eWindowRecords = [System.Collections.Generic.List[object]]::new()
 $script:e2eProcess = $null
 $script:e2eFixtureRunning = $false
@@ -2974,6 +2976,7 @@ try {
     else { [IO.Path]::GetFullPath($ClientPath) }
     Assert-E2E (Test-Path -LiteralPath $resolvedClientPath -PathType Leaf) "Installed client not found: $resolvedClientPath"
     Write-E2E "start: client=$resolvedClientPath fixture=$Fixture output=$script:e2eOutput"
+    Write-E2E "source-sha: $script:e2eSourceSha"
 
     if ($Fixture) { Enter-E2EFixture }
     if ($Fixture) {
