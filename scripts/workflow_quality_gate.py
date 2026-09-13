@@ -230,7 +230,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
             "feat.classify.checkout",
             _step(feat_classify, uses="actions/checkout@v5").get("with"),
             {
-                "ref": "${{ github.workflow_sha }}",
+                "ref": "${{ github.event.pull_request.base.sha }}",
                 "fetch-depth": 0,
                 "persist-credentials": False,
             },
@@ -3460,7 +3460,7 @@ def self_test() -> int:
         ),
         (
             "feat-integration.yml",
-            "ref: ${{ github.workflow_sha }}",
+            "ref: ${{ github.event.pull_request.base.sha }}",
             "ref: ${{ github.event.pull_request.head.sha }}",
         ),
         (
