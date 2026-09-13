@@ -3,11 +3,12 @@
 param(
     [string]$Configuration = 'Release',
     [string]$Runtime = 'win-x64',
-    [string]$OutputDirectory = 'artifacts/windows-installer'
+    [string]$OutputDirectory = 'artifacts/windows-installer',
+    [string]$SourceSha = ''
 )
 
 $ErrorActionPreference = 'Stop'
-$root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).ProviderPath
 $clientProject = Join-Path $root 'windows-client\src\CodexInfo.WindowsClient\CodexInfo.WindowsClient.csproj'
 $versionProps = Join-Path $root 'windows-client\Directory.Build.props'
 $installerScript = Join-Path $root 'windows-client\installer\CodexInfo.WindowsClient.iss'
@@ -15,6 +16,7 @@ $productIcon = Join-Path $root 'windows-client\src\CodexInfo.WindowsClient\Asset
 $output = Join-Path $root $OutputDirectory
 $work = Join-Path ([IO.Path]::GetTempPath()) ("codex-info-installer-" + [Guid]::NewGuid().ToString('N'))
 $payload = Join-Path $work 'payload'
+$buildArtifacts = Join-Path $work 'artifacts'
 
 function Get-AuthoritativeVersion {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -47,6 +49,10 @@ function Get-AuthoritativeVersion {
 }
 
 $version = Get-AuthoritativeVersion -Path $versionProps
+if (-not [string]::IsNullOrWhiteSpace($SourceSha) -and
+    $SourceSha -cnotmatch '^[0-9a-f]{40}$') {
+    throw "SourceSha is not a full lowercase commit SHA: $SourceSha"
+}
 
 $compilerCandidates = @(
     $env:INNO_SETUP_COMPILER,
@@ -63,11 +69,18 @@ if ([string]::IsNullOrWhiteSpace($compiler)) {
 
 try {
     New-Item -ItemType Directory -Path $payload -Force | Out-Null
-    dotnet restore $clientProject --runtime $Runtime --locked-mode
+    dotnet restore $clientProject --runtime $Runtime --locked-mode `
+        --artifacts-path $buildArtifacts
     if ($LASTEXITCODE -ne 0) {
         throw "dotnet restore failed with exit code $LASTEXITCODE"
     }
-    dotnet publish $clientProject --configuration $Configuration --runtime $Runtime --self-contained true --output $payload --no-restore
+    $revisionArgument = @()
+    if (-not [string]::IsNullOrWhiteSpace($SourceSha)) {
+        $revisionArgument = @("-p:SourceRevisionId=$SourceSha")
+    }
+    dotnet publish $clientProject --configuration $Configuration --runtime $Runtime `
+        --self-contained true --output $payload --no-restore `
+        --artifacts-path $buildArtifacts @revisionArgument
     if ($LASTEXITCODE -ne 0) {
         throw "dotnet publish failed with exit code $LASTEXITCODE"
     }

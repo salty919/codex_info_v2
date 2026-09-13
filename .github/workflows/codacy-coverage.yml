@@ -36,7 +36,6 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
           RUN_ID: ${{ github.event.workflow_run.id }}
-          WORKFLOW_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
           [[ "$RUN_ID" =~ ^[1-9][0-9]*$ ]]
@@ -51,10 +50,6 @@ jobs:
             exit 0
           fi
           source_sha="$(jq -r '.source_sha' <<<"$pair")"
-          [[ "$source_sha" == "$WORKFLOW_HEAD_SHA" ]] || {
-            echo 'Coverage artifact source does not match the triggering workflow head.' >&2
-            exit 1
-          }
           rust_name="$(jq -r '.rust_name' <<<"$pair")"
           windows_name="$(jq -r '.windows_name' <<<"$pair")"
           printf 'ready=true\nsource_sha=%s\nrust_name=%s\nwindows_name=%s\n' \

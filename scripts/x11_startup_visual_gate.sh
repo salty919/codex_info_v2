@@ -13,10 +13,12 @@ temp_root="$(mktemp -d "$temp_parent/codex-info-x11-startup.XXXXXX")"
 preview_pid=""
 failure_pid=""
 blocker_pid=""
+display_guard_pid=""
 cleanup() {
     if [[ -n "$preview_pid" ]] && kill -0 "$preview_pid" 2>/dev/null; then kill "$preview_pid" 2>/dev/null || true; wait "$preview_pid" 2>/dev/null || true; fi
     if [[ -n "$failure_pid" ]] && kill -0 "$failure_pid" 2>/dev/null; then kill "$failure_pid" 2>/dev/null || true; wait "$failure_pid" 2>/dev/null || true; fi
     if [[ -n "$blocker_pid" ]] && kill -0 "$blocker_pid" 2>/dev/null; then kill "$blocker_pid" 2>/dev/null || true; wait "$blocker_pid" 2>/dev/null || true; fi
+    if [[ -n "$display_guard_pid" ]] && kill -0 "$display_guard_pid" 2>/dev/null; then kill "$display_guard_pid" 2>/dev/null || true; wait "$display_guard_pid" 2>/dev/null || true; fi
     case "$temp_root" in
         "$temp_parent"/codex-info-x11-startup.*) rm -rf -- "$temp_root" ;;
         *) echo 'x11-startup-visual-gate: refusing unexpected cleanup' >&2 ;;
@@ -25,6 +27,11 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "$temp_root"/{home,config,data,cache,state,runtime}
 chmod 700 "$temp_root/runtime"
+# Keep one X11 client connected across the two UI processes below. Without
+# this invariant, Xvfb may reset after the startup-preview client exits and
+# reject the failure-port client while the server is resetting.
+xprop -root -spy _NET_CLIENT_LIST >"$temp_root/display-guard.log" 2>&1 &
+display_guard_pid="$!"
 env HOME="$temp_root/home" XDG_CONFIG_HOME="$temp_root/config" XDG_DATA_HOME="$temp_root/data" XDG_CACHE_HOME="$temp_root/cache" XDG_STATE_HOME="$temp_root/state" XDG_RUNTIME_DIR="$temp_root/runtime" CODEX_INFO_PREVIEW=startup-loading CODEX_INFO_PREVIEW_SIZE=900x480 "$binary" --ui >"$temp_root/client.log" 2>&1 &
 preview_pid="$!"
 window_id=""
@@ -128,6 +135,10 @@ fi
 # Occupy an ephemeral loopback port with a non-codex HTTP listener. The GUI
 # must remain visible in its bounded failure/retry surface and must not fall
 # back to a healthy service on the default port.
+kill -0 "$display_guard_pid" 2>/dev/null || {
+    sed -n '1,80p' "$temp_root/display-guard.log" >&2 || true
+    fail 'X11 display guard exited before the startup-state transition'
+}
 kill "$preview_pid" 2>/dev/null || true
 wait "$preview_pid" 2>/dev/null || true
 preview_pid=""
