@@ -199,11 +199,19 @@ case "${1-}" in
         case "$unit" in
             codex-info-recorder.service)
                 if [[ -n "${FAKE_MAIN_ACTIVE_FILE:-}" && -f "$FAKE_MAIN_ACTIVE_FILE" ]]; then exit 0; fi
-                [[ "${FAKE_MAIN_ACTIVE:-0}" == 1 ]] && exit 0 || exit 3
+                if [[ "${FAKE_MAIN_ACTIVE:-0}" == 1 ]]; then exit 0; fi
+                if [[ "${FAKE_SPLIT_MISSING_IS_ACTIVE:-0}" == 1 &&
+                      ! -e "$HOME/.config/systemd/user/codex-info-recorder.service" &&
+                      ! -L "$HOME/.config/systemd/user/codex-info-recorder.service" ]]; then exit 4; fi
+                exit 3
                 ;;
             codex-info-rest.service)
                 if [[ -n "${FAKE_REST_ACTIVE_FILE:-}" && -f "$FAKE_REST_ACTIVE_FILE" ]]; then exit 0; fi
-                [[ "${FAKE_REST_ACTIVE:-0}" == 1 ]] && exit 0 || exit 3
+                if [[ "${FAKE_REST_ACTIVE:-0}" == 1 ]]; then exit 0; fi
+                if [[ "${FAKE_SPLIT_MISSING_IS_ACTIVE:-0}" == 1 &&
+                      ! -e "$HOME/.config/systemd/user/codex-info-rest.service" &&
+                      ! -L "$HOME/.config/systemd/user/codex-info-rest.service" ]]; then exit 4; fi
+                exit 3
                 ;;
             codex-info-update.timer) [[ "${FAKE_TIMER_ACTIVE:-0}" == 1 ]] && exit 0 || exit 3 ;;
             codex-info.service)
@@ -501,6 +509,7 @@ run_legacy_install() {
         FAKE_LEGACY_ENABLED_FILE="$home/.legacy-enabled" \
         FAKE_LEGACY_ACTIVE_FILE="$home/.legacy-active" FAKE_LEGACY_PID_FILE="$home/.legacy-pid" \
         FAKE_LEGACY_PID=6100 FAKE_LEGACY_ENABLE_PATH="$home/.config/systemd/user/default.target.wants/codex-info.service" \
+        FAKE_SPLIT_MISSING_IS_ACTIVE=1 \
         FAKE_LEGACY_SOCKET_NET_FILE="$fake_proc/net/tcp" FAKE_LEGACY_SOCKET_CONTENT="${legacy_socket_content:-}" \
         FAKE_MAIN_ACTIVE_FILE="$home/.recorder-active" FAKE_REST_ACTIVE_FILE="$home/.rest-active" \
         FAKE_MAIN_PID="${legacy_recorder_pid:-6101}" FAKE_REST_PID="${legacy_rest_pid:-6102}" \
