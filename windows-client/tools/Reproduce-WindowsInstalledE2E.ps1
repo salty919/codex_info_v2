@@ -80,8 +80,7 @@ if ($actualProductVersion -cne $expectedProductVersion) {
 try {
     New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
     $moveSmokeLog = Join-Path $OutputDirectory 'window-move-smoke.log'
-    & $runner -ClientPath $ClientPath -OutputDirectory $OutputDirectory -Fixture -SourceSha $SourceSha
-    "source-sha: $SourceSha" | Set-Content -LiteralPath $moveSmokeLog -Encoding utf8
+    & $runner -ClientPath $ClientPath -OutputDirectory $OutputDirectory -Fixture
     $moveSmokeOutput = @(& $moveSmoke -ClientPath $ClientPath -AllowPhysicalInput *>&1)
     $moveSmokeOutput | Tee-Object -FilePath $moveSmokeLog -Append
     if ($moveSmokeOutput.Count -eq 0 -or [string]$moveSmokeOutput[-1] -ne 'window-move-smoke: PASS') {

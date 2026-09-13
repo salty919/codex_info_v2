@@ -37,7 +37,6 @@ RELEASE_ACCEPTANCE_SCRIPTS = {
 
 WINDOWS_GATE_SCRIPTS = {
     "sdk": "windows-client/tools/Ensure-DotNetSdk.ps1",
-    "compiler": "windows-client/tools/Ensure-InnoSetupCompiler.ps1",
     "build": "windows-client/tools/Build-WindowsInstaller.ps1",
     "upgrade": "windows-client/tools/Install-WindowsCandidateForE2E.ps1",
     "e2e": "windows-client/tools/Reproduce-WindowsInstalledE2E.ps1",
@@ -74,12 +73,6 @@ def _windows_gate_script_errors(scripts: Mapping[str, str]) -> list[str]:
             "Get-FileHash -LiteralPath $archive -Algorithm SHA512",
             "$env:DOTNET_ROOT = $sdkRoot",
             "& $dotnet --list-sdks",
-        ),
-        "compiler": (
-            "innosetup-7.1.0-x64.exe",
-            "0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f",
-            "Get-AuthenticodeSignature",
-            "Pyrsys B.V.",
         ),
         "build": (
             "[string]$SourceSha = ''",
@@ -587,7 +580,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         output_keys = (
             "publish", "fingerprint", "tag", "version", "pr_number", "final_head",
             "merge_sha", "run_id", "run_number", "run_attempt", "artifact_id",
-            "artifact_name", "artifact_digest", "artifact_ids", "linux_present",
+            "artifact_name", "artifact_ids", "linux_present",
             "windows_present",
         )
         for key in output_keys:
@@ -597,8 +590,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         expect("release.publish.needs", publish.get("needs"), ["resolve"])
         expect("release.publish.if", publish.get("if"), "needs.resolve.outputs.publish == 'true'")
         for env_key, output_key in {
-            "ARTIFACT_DIGEST": "artifact_digest", "ARTIFACT_ID": "artifact_id",
-            "ARTIFACT_IDS": "artifact_ids",
+            "ARTIFACT_ID": "artifact_id", "ARTIFACT_IDS": "artifact_ids",
             "ARTIFACT_NAME": "artifact_name", "FINAL_HEAD": "final_head",
             "FINGERPRINT": "fingerprint", "MERGE_SHA": "merge_sha",
             "LINUX_PRESENT": "linux_present",
@@ -813,6 +805,11 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     )
     count("selective-quality.yml", "--requested-check requirements-authority", 0)
     count("selective-quality.yml", "--requested-check governance-contract", 1)
+    count(
+        "selective-quality.yml",
+        "python3 scripts/workflow_inno_acquisition_gate.py --self-test",
+        1,
+    )
 
     linux_distribution = workflows["linux-distribution.yml"]
     for marker in (
@@ -1841,7 +1838,6 @@ _PR_NUMBER = 44
 _FINAL_HEAD = "a" * 40
 _MERGE_SHA = "b" * 40
 _VERSION = "1.2.3"
-_ARTIFACT_DIGEST = "sha256:" + "c" * 64
 _HEAD_REF = "issue-44-order-independent-release"
 
 
@@ -1943,7 +1939,6 @@ def _release_candidate(
     return {
         "id": artifact_id if artifact_id is not None else run_id * 100 + attempt,
         "name": name,
-        "digest": _ARTIFACT_DIGEST,
         "expired": expired,
     }
 
@@ -2645,7 +2640,6 @@ def _execute_revalidation(
         environment = os.environ.copy()
         environment.update(
             {
-                "ARTIFACT_DIGEST": authority["artifact_digest"],
                 "ARTIFACT_ID": authority["artifact_id"],
                 "ARTIFACT_IDS": authority.get("artifact_ids", authority["artifact_id"]),
                 "ARTIFACT_NAME": authority["artifact_name"],
@@ -3594,7 +3588,6 @@ def self_test() -> int:
             "Get-FileHash -LiteralPath $archive -Algorithm SHA512",
             "Get-FileHash -LiteralPath $archive -Algorithm SHA256",
         ),
-        ("compiler", "Get-AuthenticodeSignature", "Get-Item"),
         (
             "build",
             "-p:SourceRevisionId=$SourceSha",

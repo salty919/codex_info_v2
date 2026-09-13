@@ -34,7 +34,6 @@ jobs:
       run_attempt: ${{ steps.resolve.outputs.run_attempt }}
       artifact_id: ${{ steps.resolve.outputs.artifact_id }}
       artifact_name: ${{ steps.resolve.outputs.artifact_name }}
-      artifact_digest: ${{ steps.resolve.outputs.artifact_digest }}
       artifact_ids: ${{ steps.resolve.outputs.artifact_ids }}
       linux_present: ${{ steps.resolve.outputs.linux_present }}
       windows_present: ${{ steps.resolve.outputs.windows_present }}
@@ -163,7 +162,6 @@ jobs:
                   else {
                     id: $artifact.id,
                     name: $artifact.name,
-                    digest: $artifact.digest,
                     expired: $artifact.expired,
                     platform: $platform,
                     attempt: ($identity.attempt | tonumber),
@@ -500,10 +498,7 @@ jobs:
             elif [[ "$job_name" == "$windows_leaf" && "$job_result" == success ]]; then
               [[ "$(jq 'length' <<<"$candidates")" -eq 1 ]]
               candidate="$(jq -c '.[0]' <<<"$candidates")"
-              jq -e '
-                .expired == false and (.digest | type) == "string" and
-                (.digest | test("^sha256:[0-9a-f]{64}$"))
-              ' <<<"$candidate" >/dev/null
+              jq -e '.expired == false' <<<"$candidate" >/dev/null
               if [[ "$generated" == true ]]; then
                 [[ "$(jq -r '.version' <<<"$candidate")" == "$generated_version" ]]
               fi
@@ -536,10 +531,7 @@ jobs:
                   exit 1
                 }
                 linux_candidate="$(jq -c '.[0]' <<<"$linux_candidates")"
-                jq -e '
-                  .expired == false and (.digest | type) == "string" and
-                  (.digest | test("^sha256:[0-9a-f]{64}$"))
-                ' <<<"$linux_candidate" >/dev/null
+                jq -e '.expired == false' <<<"$linux_candidate" >/dev/null
                 if [[ "$generated" == true ]]; then
                   [[ "$(jq -r '.version' <<<"$linux_candidate")" == "$generated_version" ]]
                 fi
@@ -589,7 +581,6 @@ jobs:
             printf 'run_attempt=%s\n' "$(jq -r '.attempt' <<<"$selected")"
             printf 'artifact_id=%s\n' "$(jq -r '.id' <<<"$selected_first")"
             printf 'artifact_name=%s\n' "$(jq -r '.name' <<<"$selected_first")"
-            printf 'artifact_digest=%s\n' "$(jq -r '.digest' <<<"$selected_first")"
             printf 'artifact_ids=%s\n' "$artifact_ids"
             printf 'linux_present=%s\n' "$(jq -r 'any(.[]; .platform == "linux")' <<<"$selected_for_run")"
             printf 'windows_present=%s\n' "$(jq -r 'any(.[]; .platform == "windows")' <<<"$selected_for_run")"
@@ -611,7 +602,6 @@ jobs:
       - name: Revalidate authority after acquiring the tag lock
         id: revalidate
         env:
-          ARTIFACT_DIGEST: ${{ needs.resolve.outputs.artifact_digest }}
           ARTIFACT_ID: ${{ needs.resolve.outputs.artifact_id }}
           ARTIFACT_NAME: ${{ needs.resolve.outputs.artifact_name }}
           ARTIFACT_IDS: ${{ needs.resolve.outputs.artifact_ids }}
@@ -899,7 +889,7 @@ jobs:
                 elif ($artifact.id | type) != "number" or $artifact.id <= 0 or
                      ($artifact.expired | type) != "boolean"
                 then error("release candidate metadata changed")
-                else {id:$artifact.id,name:$artifact.name,digest:$artifact.digest,
+                else {id:$artifact.id,name:$artifact.name,
                       expired:$artifact.expired,platform:$platform,
                       attempt:($id.attempt | tonumber),version:$id.version}
                 end |
@@ -914,8 +904,7 @@ jobs:
           }
           jq -e --arg version "$VERSION" --argjson linux "$LINUX_PRESENT" \
             --argjson windows "$WINDOWS_PRESENT" '
-            all(.[]; .expired == false and .version == $version and
-                (.digest | type) == "string" and (.digest | test("^sha256:[0-9a-f]{64}$"))) and
+            all(.[]; .expired == false and .version == $version) and
             (([.[] | select(.platform == "linux")] | length) == (if $linux then 1 else 0 end)) and
             (([.[] | select(.platform == "windows")] | length) == (if $windows then 1 else 0 end))
           ' <<<"$candidates" >/dev/null

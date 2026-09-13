@@ -71,9 +71,6 @@ if ($installer.Length -le 0) {
 }
 
 $sha256 = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($sha256 -notmatch '^[0-9a-f]{64}$') {
-    throw "Installer SHA-256 hash is not a lowercase 64-character hexadecimal value."
-}
 
 $manifestPath = if ([IO.Path]::IsPathRooted($OutputPath)) {
     [IO.Path]::GetFullPath($OutputPath)

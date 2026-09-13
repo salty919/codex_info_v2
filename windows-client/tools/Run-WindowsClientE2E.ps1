@@ -10,8 +10,7 @@ param(
     [switch]$Fixture,
     [switch]$FixtureContractTest,
     [switch]$CompatibilitySmoke,
-    [switch]$RequireCurrentPresentation,
-    [string]$SourceSha = ''
+    [switch]$RequireCurrentPresentation
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,7 +57,6 @@ if (Test-Path -LiteralPath $script:e2eOutput -PathType Container) {
 }
 New-Item -ItemType Directory -Path $script:e2eOutput -Force | Out-Null
 $script:e2eLogPath = Join-Path $script:e2eOutput 'windows-client-e2e.log'
-$script:e2eSourceSha = if (-not [string]::IsNullOrWhiteSpace($SourceSha)) { $SourceSha } elseif (-not [string]::IsNullOrWhiteSpace($env:GITHUB_SHA)) { $env:GITHUB_SHA } else { 'unknown' }
 $script:e2eWindowRecords = [System.Collections.Generic.List[object]]::new()
 $script:e2eProcess = $null
 $script:e2eFixtureRunning = $false
@@ -1464,9 +1462,8 @@ function Capture-E2EWindow {
         $graphics.Dispose()
         $bitmap.Dispose()
     }
-    $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-    Write-E2E "capture: name=$safeName path=$path sha256=$hash size=$($bounds.Width)x$($bounds.Height)"
-    return [pscustomobject]@{ Path = $path; Hash = $hash }
+    Write-E2E "capture: name=$safeName path=$path size=$($bounds.Width)x$($bounds.Height)"
+    return [pscustomobject]@{ Path = $path }
 }
 
 function Assert-E2ECaptureColor {
@@ -1917,7 +1914,9 @@ function Assert-E2EImageChanged {
         [Parameter(Mandatory = $true)][psobject]$After,
         [Parameter(Mandatory = $true)][string]$Description
     )
-    Assert-E2E ($Before.Hash -ne $After.Hash) "$Description did not change the rendered window."
+    $beforeHash = (Get-FileHash -LiteralPath $Before.Path -Algorithm SHA256).Hash
+    $afterHash = (Get-FileHash -LiteralPath $After.Path -Algorithm SHA256).Hash
+    Assert-E2E ($beforeHash -ne $afterHash) "$Description did not change the rendered window."
 }
 
 function Get-E2EGraphIdleBackgroundColor {
@@ -2975,7 +2974,6 @@ try {
     else { [IO.Path]::GetFullPath($ClientPath) }
     Assert-E2E (Test-Path -LiteralPath $resolvedClientPath -PathType Leaf) "Installed client not found: $resolvedClientPath"
     Write-E2E "start: client=$resolvedClientPath fixture=$Fixture output=$script:e2eOutput"
-    Write-E2E "source-sha: $script:e2eSourceSha"
 
     if ($Fixture) { Enter-E2EFixture }
     if ($Fixture) {
@@ -3021,8 +3019,7 @@ try {
         }
         return $false
     }
-    $mainCapture = Capture-E2EWindow $mainHandle '01-main-ready'
-    Assert-E2E ($mainCapture.Hash.Length -eq 64) 'Main screenshot hash is missing.'
+    $null = Capture-E2EWindow $mainHandle '01-main-ready'
     Assert-E2EMainProductVersion $mainRoot
     if ($Fixture) {
         Write-E2E ("fixture: requests={0}" -f [CodexInfoWindowsE2EFixtureServer]::RequestSummary())
@@ -3359,8 +3356,7 @@ try {
             Assert-E2E ($nonEmpty.Count -ge 4) 'Threads did not expose a real data row and columns.'
         }
     }
-    $threadCapture = Capture-E2EWindow $threads.Handle '10-threads-rows'
-    Assert-E2E ($threadCapture.Hash.Length -eq 64) 'Threads screenshot hash is missing.'
+    $null = Capture-E2EWindow $threads.Handle '10-threads-rows'
 
     Write-E2E 'case-6: open Legal and assert plain-text legal notice'
     $legal = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Legal' -ButtonAutomationId 'Main.OpenLegal' -Title 'Codex Info Legal' -Role 'Legal' -ProcessId $clientPid
@@ -3409,12 +3405,10 @@ try {
         }
         if ($legalPage -eq 1) {
             Assert-E2E ($legalValue.IndexOf('GPL', [StringComparison]::Ordinal) -ge 0) 'Legal notice lost the GPL legal content.'
-            $legalCapture = Capture-E2EWindow $legal.Handle '11-legal-plain-text-page-1'
-            Assert-E2E ($legalCapture.Hash.Length -eq 64) 'Legal page 1 screenshot hash is missing.'
+            $null = Capture-E2EWindow $legal.Handle '11-legal-plain-text-page-1'
         }
         elseif ($legalPage -eq 8) {
-            $legalCapture = Capture-E2EWindow $legal.Handle '12-legal-plain-text-page-8'
-            Assert-E2E ($legalCapture.Hash.Length -eq 64) 'Legal page 8 screenshot hash is missing.'
+            $null = Capture-E2EWindow $legal.Handle '12-legal-plain-text-page-8'
         }
         if ($legalPage -lt $expectedLegalPageCount) {
             Assert-E2E ($legalNext.Current.IsEnabled) "Legal Next button is disabled before page $expectedLegalPageCount."

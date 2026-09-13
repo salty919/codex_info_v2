@@ -75,10 +75,36 @@ done
 
 source_sha="$(git rev-parse HEAD)"
 
-run_linux_cli() {
+ensure_native_quality_host_dependencies() {
     command -v cargo >/dev/null || fail 'cargo is unavailable'
+    command -v rustup >/dev/null || fail 'rustup is unavailable'
+    if ! rustup component list --installed | grep -Eq '^llvm-tools-preview(-|$)'; then
+        rustup component add llvm-tools-preview
+    fi
+    if ! cargo llvm-cov --version 2>/dev/null | grep -Eq '^cargo-llvm-cov 0\.9\.0([[:space:]]|$)'; then
+        cargo install cargo-llvm-cov --version 0.9.0 --locked
+    fi
+    ensure_linux_ui_host_dependencies
+}
+
+run_native_quality() {
+    ensure_native_quality_host_dependencies
+    mkdir -p artifacts/codacy-coverage-rust
+    cargo llvm-cov --workspace --locked --all-targets --cobertura \
+        --output-path artifacts/codacy-coverage-rust/rust.cobertura.xml \
+        -- --nocapture
+    local report='artifacts/codacy-coverage-rust/rust.cobertura.xml'
+    test -s "$report"
+    grep -Eq 'lines-valid="[1-9][0-9]*"' "$report"
+    if grep -Eq 'filename="(/|[A-Za-z]:[\\/])' "$report"; then
+        fail 'Rust Cobertura contains a runner-specific path'
+    fi
+    cargo clippy --workspace --locked --all-targets -- -D warnings
     cargo build --workspace --release --locked
+    bash scripts/check_recorder_rest_boundary.sh --static-only
     bash scripts/cli_contract_e2e.sh
+    xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
+        bash scripts/record_daemon_e2e.sh
 }
 
 run_linux_ui() {
@@ -138,13 +164,13 @@ show_external_checks() {
 }
 
 case "$phase" in
-    native-quality | linux-cli) run_linux_cli ;;
+    native-quality) run_native_quality ;;
     linux-ui) run_linux_ui ;;
     linux-distribution) run_linux_distribution ;;
     windows-ui) run_windows_ui ;;
     external-checks) show_external_checks ;;
     all)
-        run_linux_cli
+        run_native_quality
         run_linux_ui
         run_linux_distribution
         run_windows_ui

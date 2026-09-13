@@ -52,7 +52,6 @@ def main() -> int:
         "github.event.workflow_run.actor.login != 'dependabot[bot]'",
         "github.event.workflow_run.triggering_actor.login != 'dependabot[bot]'",
         "python3 scripts/codacy_coverage_artifacts.py",
-        '[[ "$source_sha" == "$WORKFLOW_HEAD_SHA" ]]',
         "steps.pair.outputs.ready == 'true'",
         "CODACY_API_TOKEN: ${{ secrets.CODACY_API_TOKEN }}",
         "CODACY_ORGANIZATION_PROVIDER: gh",
@@ -63,7 +62,12 @@ def main() -> int:
         "15c5f052207d27b8501ab5d5910c68c206ea70b0157ee1725132780530580875",
     ):
         require(UPLOAD, marker)
-    for marker in ("  push:\n", "  pull_request:\n", "secrets: inherit"):
+    for marker in (
+        "  push:\n",
+        "  pull_request:\n",
+        "secrets: inherit",
+        "WORKFLOW_HEAD_SHA",
+    ):
         forbid(UPLOAD, marker)
 
     print("codacy-coverage-workflow-test: PASS cases=4")
