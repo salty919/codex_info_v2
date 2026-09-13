@@ -945,6 +945,23 @@ fn load_metadata(data_root: &Path) -> Result<ProfileMetadata> {
     Ok(metadata)
 }
 
+fn is_known_epoch_artifact(name: &str) -> bool {
+    // SQLite's rollback journal is part of an active transaction on the
+    // canonical database, not a second storage authority. Keep the allowlist
+    // exact so similarly named or unrelated files still fail closed.
+    matches!(
+        name,
+        "usage_history.sqlite3"
+            | "usage_history.sqlite3-journal"
+            | "usage_history.sqlite3.candidate"
+            | "account-writer.lock"
+            | "account-recorder.lock"
+            | "usage_history.sqlite3.bak.1"
+            | "usage_history.sqlite3.bak.2"
+            | "usage_history.sqlite3.bak.3"
+    )
+}
+
 fn validate_registry_artifacts(data_root: &Path, metadata: &ProfileMetadata) -> Result<()> {
     let root = accounts_root(data_root);
     let root_metadata = match fs::symlink_metadata(&root) {
@@ -1041,19 +1058,9 @@ fn validate_registry_artifacts(data_root: &Path, metadata: &ProfileMetadata) -> 
                 .file_name()
                 .into_string()
                 .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
-            let allowed = name == "usage_history.sqlite3"
-                || name == "usage_history.sqlite3.candidate"
-                || name == "account-writer.lock"
-                || name == "account-recorder.lock"
-                || matches!(
-                    name.as_str(),
-                    "usage_history.sqlite3.bak.1"
-                        | "usage_history.sqlite3.bak.2"
-                        | "usage_history.sqlite3.bak.3"
-                );
             let artifact = fs::symlink_metadata(entry.path())
                 .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
-            if !allowed || !validate_artifact_file(&artifact) {
+            if !is_known_epoch_artifact(&name) || !validate_artifact_file(&artifact) {
                 return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
             }
             database_exists |= name == "usage_history.sqlite3";
@@ -1236,17 +1243,7 @@ pub fn ensure_partition_with_activation(
                     .file_name()
                     .into_string()
                     .map_err(|_| LocatorError::new(LocatorErrorKind::RecoveryRequired))?;
-                if name != "usage_history.sqlite3"
-                    && name != "usage_history.sqlite3.candidate"
-                    && name != "account-writer.lock"
-                    && name != "account-recorder.lock"
-                    && !matches!(
-                        name.as_str(),
-                        "usage_history.sqlite3.bak.1"
-                            | "usage_history.sqlite3.bak.2"
-                            | "usage_history.sqlite3.bak.3"
-                    )
-                {
+                if !is_known_epoch_artifact(&name) {
                     return Err(LocatorError::new(LocatorErrorKind::RecoveryRequired));
                 }
                 if !validate_artifact_file(
@@ -1691,6 +1688,45 @@ mod tests {
         for partition in partitions {
             assert!(!partition.public_id().contains(&partition.account_scope_id));
         }
+    }
+
+    #[test]
+    fn sqlite_rollback_journal_does_not_hide_an_initialized_partition() {
+        let (codex_home, data_root, scope_a, _, _) = fixture();
+        let epoch_directory = data_root
+            .join("history")
+            .join("accounts")
+            .join("v1")
+            .join(scope_a)
+            .join("epoch-7");
+        let journal = epoch_directory.join("usage_history.sqlite3-journal");
+        write_private_file(&journal, b"sqlite rollback journal");
+
+        assert_eq!(
+            locate_existing_partition(&codex_home, &data_root)
+                .expect("current partition while SQLite transaction is active")
+                .storage_epoch,
+            7
+        );
+        assert_eq!(
+            locate_existing_partitions(&codex_home, &data_root)
+                .expect("all partitions while SQLite transaction is active")
+                .len(),
+            2
+        );
+
+        fs::remove_file(journal).unwrap();
+        write_private_file(
+            &epoch_directory.join("usage_history.sqlite3-journal.unowned"),
+            b"unknown artifact",
+        );
+        assert_eq!(
+            locate_existing_partition(&codex_home, &data_root)
+                .expect_err("similar unknown names must remain rejected")
+                .kind(),
+            LocatorErrorKind::RecoveryRequired
+        );
+        let _ = fs::remove_dir_all(data_root.parent().unwrap());
     }
 
     #[test]
