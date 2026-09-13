@@ -3195,20 +3195,15 @@ fn canonicalize_history_with_sources_and_limit(
         for (minute, mut minute_rows) in by_minute {
             minute_rows.sort_by_key(|row| (row.source_timestamp, row.source_reset_at));
             let mut final_quota = None;
-            let mut quota_increased = false;
+            let mut quota_conflicted = false;
             for value in minute_rows.iter().filter_map(|row| row.remaining_percent) {
-                if final_quota.is_some_and(|previous| value > previous) {
-                    quota_increased = true;
+                if final_quota.is_some_and(|previous| value != previous) {
+                    quota_conflicted = true;
                     break;
                 }
                 final_quota = Some(value);
             }
-            if quota_increased {
-                if reject_ambiguous {
-                    return Err(ReaderError::InvalidValue(format!(
-                        "history remaining quota increases within minute {minute}"
-                    )));
-                }
+            if quota_conflicted {
                 continue;
             }
             let maximums = minute_rows.iter().fold(
@@ -3233,11 +3228,6 @@ fn canonicalize_history_with_sources_and_limit(
                     && final_quota.is_none_or(|remaining| row.remaining_percent == Some(remaining))
             });
             let Some(dominant) = dominant else {
-                if reject_ambiguous {
-                    return Err(ReaderError::InvalidValue(format!(
-                        "history minute has no observed row containing its canonical values at timestamp {minute}"
-                    )));
-                }
                 continue;
             };
             let mut sample = public_sample_from_raw(&dominant.row);
@@ -5637,7 +5627,7 @@ mod tests {
     }
 
     #[test]
-    fn same_period_quota_transition_retains_latest_dominant_source() {
+    fn same_period_quota_conflict_excludes_only_its_minute() {
         let minute = 1_800_000_000;
         let reset_at = 1_800_604_800;
         let row = |timestamp, remaining_percent, sol_tokens| RawSample {
@@ -5659,19 +5649,13 @@ mod tests {
 
         let canonical =
             canonicalize_history_for_storage_with_sources(&rows, Some(reset_at), 604_800)
-                .expect("a decreasing in-minute quota transition is one valid observation series");
+                .expect("one conflicted minute must not reject the complete candidate");
 
-        assert_eq!(canonical.len(), 1);
-        assert_eq!(canonical[0].sample.timestamp, minute);
-        assert_eq!(canonical[0].sample.reset_at, reset_at);
-        assert_eq!(canonical[0].sample.remaining_percent, Some(99.0));
-        assert_eq!(canonical[0].sample.sol_tokens, 30);
-        assert_eq!(canonical[0].source_timestamp, minute + 58);
-        assert_eq!(canonical[0].source_reset_at, reset_at);
+        assert!(canonical.is_empty());
     }
 
     #[test]
-    fn ambiguous_owned_minute_is_hidden_publicly_and_rejected_for_storage() {
+    fn ambiguous_owned_minute_is_excluded_from_public_and_storage() {
         let minute = 1_800_000_000;
         let reset_at = 1_800_604_800;
         let row = |timestamp, remaining_percent, sol_tokens, luna_tokens| -> RawSample {
@@ -5702,7 +5686,8 @@ mod tests {
             Some(reset_at),
             604_800,
         )
-        .is_err());
+        .expect("one quota-conflicted minute must not reject the complete candidate")
+        .is_empty());
 
         let incomparable = vec![
             row(minute + 5, Some(100.0), 20, 10),
@@ -5718,7 +5703,8 @@ mod tests {
             Some(reset_at),
             604_800,
         )
-        .is_err());
+        .expect("one incomparable minute must not reject the complete candidate")
+        .is_empty());
     }
 
     #[test]

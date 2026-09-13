@@ -11,12 +11,12 @@ use chrono::{DateTime, Months, Utc};
 use codex_info::{protocol_contract, security, thread_contract};
 use codex_info_db_writer::{
     classify_quota_transition, finalize_session_timeline_recovery, ActiveThreadRecord,
-    ActiveThreadSnapshot, QuotaTransition, RecordedSessionSource, SessionCheckpoint,
-    SessionCollectionCommit, SessionCollectionState, SessionEvent, SessionModelTotal,
-    SessionPendingRange, SessionRange, SessionTaskEvent, SessionTaskEvidenceInput,
-    SessionTaskIndexedRange, SessionTimelineRecovery, SessionTimelineRecoveryPoint,
-    StoragePartitionIdentity, UsageHistoryObservation, UsageHistorySample, UsageStore,
-    UsageStoreError,
+    ActiveThreadSnapshot, PreviousQuotaState, QuotaCandidate, QuotaTransition,
+    RecordedSessionSource, SessionCheckpoint, SessionCollectionCommit, SessionCollectionState,
+    SessionEvent, SessionModelTotal, SessionPendingRange, SessionRange, SessionTaskEvent,
+    SessionTaskEvidenceInput, SessionTaskIndexedRange, SessionTimelineRecovery,
+    SessionTimelineRecoveryPoint, StoragePartitionIdentity, UsageHistoryObservation,
+    UsageHistorySample, UsageStore, UsageStoreError,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -106,52 +106,74 @@ impl From<UsageStoreError> for RecorderError {
 // the public event surface.  The bit is process-local and intentionally never
 // cleared in production: the owning daemon exits at this boundary and starts
 // a new identity window after the account locator has selected the partition.
-static APP_SERVER_ACCOUNT_BOUNDARY_CHANGED: AtomicBool = AtomicBool::new(false);
-static APP_SERVER_ACCOUNT_BOUNDARY_PENDING: AtomicBool = AtomicBool::new(false);
-static APP_SERVER_ACCOUNT_BOUNDARY_GENERATION: AtomicU64 = AtomicU64::new(0);
-static APP_SERVER_ACCOUNT_COMMIT_FENCE: RwLock<()> = RwLock::new(());
+struct AccountBoundaryState {
+    changed: AtomicBool,
+    pending: AtomicBool,
+    generation: AtomicU64,
+    commit_fence: RwLock<()>,
+}
 
-fn signal_account_boundary_changed() {
-    // Prevent a later reader from overtaking this boundary even on an
-    // implementation whose RwLock does not guarantee writer preference.
-    APP_SERVER_ACCOUNT_BOUNDARY_PENDING.store(true, Ordering::Release);
-    let _fence = APP_SERVER_ACCOUNT_COMMIT_FENCE
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !APP_SERVER_ACCOUNT_BOUNDARY_CHANGED.swap(true, Ordering::AcqRel) {
-        APP_SERVER_ACCOUNT_BOUNDARY_GENERATION.fetch_add(1, Ordering::AcqRel);
+impl AccountBoundaryState {
+    const fn new() -> Self {
+        Self {
+            changed: AtomicBool::new(false),
+            pending: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            commit_fence: RwLock::new(()),
+        }
+    }
+
+    fn signal(&self) {
+        // Prevent a later reader from overtaking this boundary even on an
+        // implementation whose RwLock does not guarantee writer preference.
+        self.pending.store(true, Ordering::Release);
+        let _fence = self
+            .commit_fence
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.changed.swap(true, Ordering::AcqRel) {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn changed(&self) -> bool {
+        self.pending.load(Ordering::Acquire) || self.changed.load(Ordering::Acquire)
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn commit_fence(&self) -> Result<RwLockReadGuard<'_, ()>, RecorderError> {
+        let fence = self.commit_fence.read().map_err(|_| {
+            RecorderError::Invalid("Codex account commit fence is unavailable".to_owned())
+        })?;
+        if self.changed() {
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
+        Ok(fence)
     }
 }
 
+static APP_SERVER_ACCOUNT_BOUNDARY: AccountBoundaryState = AccountBoundaryState::new();
+
+fn signal_account_boundary_changed() {
+    APP_SERVER_ACCOUNT_BOUNDARY.signal();
+}
+
 fn account_boundary_changed() -> bool {
-    APP_SERVER_ACCOUNT_BOUNDARY_PENDING.load(Ordering::Acquire)
-        || APP_SERVER_ACCOUNT_BOUNDARY_CHANGED.load(Ordering::Acquire)
+    APP_SERVER_ACCOUNT_BOUNDARY.changed()
 }
 
 fn account_boundary_generation() -> u64 {
-    APP_SERVER_ACCOUNT_BOUNDARY_GENERATION.load(Ordering::Acquire)
+    APP_SERVER_ACCOUNT_BOUNDARY.generation()
 }
 
 /// Linearize each durable mutation against an in-process account/updated
 /// notification. A writer that acquires the fence first belongs to the old
 /// epoch; a notification that acquires it first prevents every later write.
 fn account_epoch_commit_fence() -> Result<RwLockReadGuard<'static, ()>, RecorderError> {
-    let fence = APP_SERVER_ACCOUNT_COMMIT_FENCE.read().map_err(|_| {
-        RecorderError::Invalid("Codex account commit fence is unavailable".to_owned())
-    })?;
-    if account_boundary_changed() {
-        return Err(RecorderError::AccountBoundaryChanged);
-    }
-    Ok(fence)
-}
-
-#[cfg(test)]
-fn clear_account_boundary_changed() {
-    let _fence = APP_SERVER_ACCOUNT_COMMIT_FENCE
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    APP_SERVER_ACCOUNT_BOUNDARY_CHANGED.store(false, Ordering::Release);
-    APP_SERVER_ACCOUNT_BOUNDARY_PENDING.store(false, Ordering::Release);
+    APP_SERVER_ACCOUNT_BOUNDARY.commit_fence()
 }
 
 /// The raw `tokens.account_id` is an authority input only.  It must never
@@ -285,10 +307,10 @@ impl AccountUpdateTracker {
         }
     }
 
-    fn invalidate(&mut self) {
+    fn invalidate(&mut self, boundary: &AccountBoundaryState) {
         self.valid = false;
         if self.signal_boundary {
-            signal_account_boundary_changed();
+            boundary.signal();
         }
     }
 
@@ -296,12 +318,21 @@ impl AccountUpdateTracker {
     /// are out-of-band responses and must not be silently discarded while a
     /// quota or thread request is in flight.
     fn observe(&mut self, value: &Value, raw: &str) -> Result<bool, String> {
+        self.observe_with_boundary(value, raw, &APP_SERVER_ACCOUNT_BOUNDARY)
+    }
+
+    fn observe_with_boundary(
+        &mut self,
+        value: &Value,
+        raw: &str,
+        boundary: &AccountBoundaryState,
+    ) -> Result<bool, String> {
         if !value.is_object() {
             return Ok(false);
         }
         let is_account_updated = protocol_contract::is_account_updated_notification_json(raw)
             .map_err(|_| {
-                self.invalidate();
+                self.invalidate(boundary);
                 "Codex account update notification is invalid".to_owned()
             })?;
         if !is_account_updated {
@@ -310,16 +341,16 @@ impl AccountUpdateTracker {
         if !self.valid
             || protocol_contract::validate_account_updated_notification_json(raw).is_err()
         {
-            self.invalidate();
+            self.invalidate(boundary);
             return Err("Codex account update notification is invalid".to_owned());
         }
         let Some(generation) = self.generation.checked_add(1) else {
-            self.invalidate();
+            self.invalidate(boundary);
             return Err("Codex account update generation is exhausted".to_owned());
         };
         self.generation = generation;
         if self.signal_boundary {
-            signal_account_boundary_changed();
+            boundary.signal();
         }
         Ok(true)
     }
@@ -3297,9 +3328,25 @@ impl Recorder {
                 || (state.collector_epoch == Some(collector_epoch)
                     && prior
                         .is_some_and(|checkpoint| checkpoint.collector_epoch != collector_epoch));
-            if consumed_budget >= self.config.chunk_bytes {
+            // At process start the first absolute token counter in each
+            // already-present source is a baseline, not usage since zero. A
+            // source discovered after a committed cycle is new activity and
+            // therefore still starts from zero. Account transitions retain
+            // their stronger physical-EOF boundary above.
+            let baseline_first_counter = state.data_generation == 0
+                && state.checkpoints.is_empty()
+                && prior.is_none()
+                && !baseline_existing;
+            if consumed_budget >= self.config.chunk_bytes && !baseline_existing {
                 if checkpoint_covers_observed_end(prior, source) {
                     continue;
+                }
+                if baseline_first_counter {
+                    checkpoints.push(initial_source_baseline_checkpoint(
+                        source,
+                        collector_epoch,
+                        cycle_seq,
+                    ));
                 }
                 pending_ranges = pending_ranges.saturating_add(1);
                 pending_evidence.push(pending_source_issue(
@@ -3315,6 +3362,7 @@ impl Recorder {
                 source,
                 prior,
                 baseline_existing,
+                baseline_first_counter,
                 collector_epoch,
                 cycle_seq,
                 reset_at,
@@ -3333,6 +3381,13 @@ impl Recorder {
                         "recorder degraded: session source {} was not collected: {error}",
                         source.recorded.relative_path
                     );
+                    if baseline_first_counter {
+                        checkpoints.push(initial_source_baseline_checkpoint(
+                            source,
+                            collector_epoch,
+                            cycle_seq,
+                        ));
+                    }
                     pending_ranges = pending_ranges.saturating_add(1);
                     pending_evidence.push(pending_source_issue(
                         source,
@@ -3344,6 +3399,13 @@ impl Recorder {
                     continue;
                 }
             }) else {
+                if baseline_first_counter {
+                    checkpoints.push(initial_source_baseline_checkpoint(
+                        source,
+                        collector_epoch,
+                        cycle_seq,
+                    ));
+                }
                 pending_ranges = pending_ranges.saturating_add(1);
                 pending_evidence.push(pending_source_issue(
                     source,
@@ -3613,14 +3675,18 @@ fn admit_quota_period(
         (state.data_generation > 0 && state.reset_at > 0).then_some(state.reset_at);
     let previous_observation = state.last_quota_observation.as_ref();
     let transition = classify_quota_transition(
-        previous_reset_at,
-        state.window_seconds,
-        previous_observation.map(|observation| observation.observed_at),
-        previous_observation.map(|observation| observation.remaining_percent),
-        candidate.reset_at,
-        candidate.window_seconds,
-        Some(remaining_percent),
-        candidate.observed_at,
+        PreviousQuotaState::new(
+            previous_reset_at,
+            state.window_seconds,
+            previous_observation.map(|observation| observation.observed_at),
+            previous_observation.map(|observation| observation.remaining_percent),
+        ),
+        QuotaCandidate::new(
+            candidate.reset_at,
+            candidate.window_seconds,
+            Some(remaining_percent),
+            candidate.observed_at,
+        ),
     );
     if transition == QuotaTransition::Rejected {
         eprintln!(
@@ -3718,6 +3784,34 @@ fn pending_source_issue(
         parser_version: PARSER_VERSION.to_owned(),
         reason: reason.to_owned(),
         complete: false,
+    }
+}
+
+fn initial_source_baseline_checkpoint(
+    source: &Source,
+    collector_epoch: u128,
+    cycle_seq: u64,
+) -> SessionCheckpoint {
+    SessionCheckpoint {
+        root_identity: source.recorded.root_identity.clone(),
+        relative_path: source.recorded.relative_path.clone(),
+        file_device: source.recorded.file_device,
+        file_inode: source.recorded.file_inode,
+        committed_offset: 0,
+        discard_until_lf: false,
+        collector_epoch,
+        cycle_seq,
+        prefix_generation: prefix_generation(collector_epoch, &source.recorded, EMPTY_SHA256),
+        prefix_sha256: EMPTY_SHA256.to_owned(),
+        fully_attributed_from_zero: false,
+        token_baseline_known: false,
+        last_model: None,
+        last_task_running: None,
+        previous_total: 0,
+        previous_input: 0,
+        previous_cached_input: 0,
+        previous_output: 0,
+        previous_cache_write_input: None,
     }
 }
 
@@ -3953,6 +4047,7 @@ fn scan_source(
     source: &Source,
     prior: Option<&SessionCheckpoint>,
     baseline_existing: bool,
+    baseline_first_counter: bool,
     collector_epoch: u128,
     cycle_seq: u64,
     reset_at: i64,
@@ -3986,6 +4081,7 @@ fn scan_source(
     let recovery_anchor = (!baseline_existing)
         .then_some(prior)
         .flatten()
+        .filter(|checkpoint| checkpoint.token_baseline_known)
         .filter(|_| continuous.is_none())
         .map(|checkpoint| TokenSnapshot {
             total: checkpoint.previous_total,
@@ -4050,7 +4146,7 @@ fn scan_source(
             0,
             false,
             prior.is_none() && !baseline_existing,
-            prior.is_none() && !baseline_existing,
+            prior.is_none() && !baseline_existing && !baseline_first_counter,
             None,
             None,
             TokenSnapshot::default(),
@@ -6227,8 +6323,6 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    static ACCOUNT_BOUNDARY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn temp_root(name: &str) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("codex-info-recorder-{name}-{}", std::process::id()));
@@ -6385,23 +6479,21 @@ mod tests {
 
     #[test]
     fn recorder_account_identity_contract_tracks_account_updated_as_boundary() {
-        let _guard = ACCOUNT_BOUNDARY_TEST_LOCK.lock().unwrap();
-        clear_account_boundary_changed();
+        let boundary = AccountBoundaryState::new();
         let raw = r#"{"jsonrpc":"2.0","method":"account/updated","params":{"authMode":"chatgpt","planType":"pro"}}"#;
         let value: Value = serde_json::from_str(raw).unwrap();
         let mut tracker = AccountUpdateTracker::for_app_server();
-        assert!(tracker.observe(&value, raw).unwrap());
+        assert!(tracker
+            .observe_with_boundary(&value, raw, &boundary)
+            .unwrap());
         assert_eq!(tracker.generation, 1);
         assert!(tracker.valid);
-        assert!(account_boundary_changed());
-        clear_account_boundary_changed();
+        assert!(boundary.changed());
     }
 
     #[cfg(unix)]
     #[test]
     fn recorder_account_identity_contract_rejects_queued_result_after_authority_change() {
-        let _guard = ACCOUNT_BOUNDARY_TEST_LOCK.lock().unwrap();
-        clear_account_boundary_changed();
         let root = temp_root("queued-account-epoch");
         write_test_account_authority(&root, "authority-1");
         let epoch = AccountEpochProof::capture(&root).unwrap();
@@ -6439,37 +6531,35 @@ mod tests {
         write_test_account_authority(&root, "authority-2");
         assert!(!candidate.validate_current(&root));
         assert!(!event_epoch.validate_current(&root));
-        clear_account_boundary_changed();
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn recorder_account_identity_contract_linearizes_commit_before_update_boundary() {
-        let _guard = ACCOUNT_BOUNDARY_TEST_LOCK.lock().unwrap();
-        clear_account_boundary_changed();
-        let generation_before = account_boundary_generation();
-        let commit = account_epoch_commit_fence().unwrap();
+        let boundary = std::sync::Arc::new(AccountBoundaryState::new());
+        let generation_before = boundary.generation();
+        let commit = boundary.commit_fence().unwrap();
         let start = std::sync::Arc::new(std::sync::Barrier::new(2));
         let worker_start = start.clone();
+        let worker_boundary = boundary.clone();
         let worker = thread::spawn(move || {
             worker_start.wait();
-            signal_account_boundary_changed();
+            worker_boundary.signal();
         });
 
         start.wait();
-        while !APP_SERVER_ACCOUNT_BOUNDARY_PENDING.load(Ordering::Acquire) {
+        while !boundary.pending.load(Ordering::Acquire) {
             thread::yield_now();
         }
-        assert!(!APP_SERVER_ACCOUNT_BOUNDARY_CHANGED.load(Ordering::Acquire));
+        assert!(!boundary.changed.load(Ordering::Acquire));
         drop(commit);
         worker.join().unwrap();
-        assert!(APP_SERVER_ACCOUNT_BOUNDARY_CHANGED.load(Ordering::Acquire));
-        assert_eq!(account_boundary_generation(), generation_before + 1);
+        assert!(boundary.changed.load(Ordering::Acquire));
+        assert_eq!(boundary.generation(), generation_before + 1);
         assert!(matches!(
-            account_epoch_commit_fence(),
+            boundary.commit_fence(),
             Err(RecorderError::AccountBoundaryChanged)
         ));
-        clear_account_boundary_changed();
     }
 
     fn task_event(kind: &str, timestamp: i64) -> String {
