@@ -14654,16 +14654,22 @@ impl CodexInfoState {
     ) -> Result<bool, String> {
         validate_service_accounts(&document)?;
         let previous_selection = self.service_selected_account_id.clone();
-        let selection = previous_selection
-            .as_deref()
-            .filter(|selected| {
-                document
-                    .accounts
-                    .iter()
-                    .any(|account| &account.id == selected)
-            })
-            .map(str::to_owned)
-            .or_else(|| Some(document.default_account_id.clone()));
+        let followed_previous_default =
+            previous_selection.as_deref() == self.service_default_account_id.as_deref();
+        let selection = if followed_previous_default {
+            Some(document.default_account_id.clone())
+        } else {
+            previous_selection
+                .as_deref()
+                .filter(|selected| {
+                    document
+                        .accounts
+                        .iter()
+                        .any(|account| &account.id == selected)
+                })
+                .map(str::to_owned)
+                .or_else(|| Some(document.default_account_id.clone()))
+        };
         if selection.is_none() {
             return Err("accounts document has no selectable default account".into());
         }
@@ -23137,6 +23143,35 @@ mod tests {
         format!("v1:{epoch:032x}{counter:032x}")
     }
 
+    const ACCOUNTS_A_CURRENT: &[u8] = br#"{
+        "api_version":"v3",
+        "default_account_id":"account-7",
+        "accounts":[
+            {"id":"account-7","is_current":true,"activation_at":1800000000,"deactivation_at":null,"login_id":"a@example.invalid"},
+            {"id":"account-13","is_current":false,"activation_at":null,"deactivation_at":null,"login_id":"b@example.invalid"},
+            {"id":"account-15","is_current":false,"activation_at":null,"deactivation_at":null,"login_id":"c@example.invalid"}
+        ]
+    }"#;
+
+    const ACCOUNTS_B_CURRENT: &[u8] = br#"{
+        "api_version":"v3",
+        "default_account_id":"account-13",
+        "accounts":[
+            {"id":"account-7","is_current":false,"activation_at":1800000000,"deactivation_at":1800000100,"login_id":"a@example.invalid"},
+            {"id":"account-13","is_current":true,"activation_at":1800000100,"deactivation_at":null,"login_id":"b@example.invalid"},
+            {"id":"account-15","is_current":false,"activation_at":null,"deactivation_at":null,"login_id":"c@example.invalid"}
+        ]
+    }"#;
+
+    const ACCOUNTS_B_CURRENT_WITHOUT_C: &[u8] = br#"{
+        "api_version":"v3",
+        "default_account_id":"account-13",
+        "accounts":[
+            {"id":"account-7","is_current":false,"activation_at":1800000000,"deactivation_at":1800000100,"login_id":"a@example.invalid"},
+            {"id":"account-13","is_current":true,"activation_at":1800000100,"deactivation_at":null,"login_id":"b@example.invalid"}
+        ]
+    }"#;
+
     fn disable_account_directory_for_fixture(state: &mut CodexInfoState) {
         state.service_accounts_known = true;
         state.service_accounts_force_poll = false;
@@ -23417,6 +23452,189 @@ mod tests {
         assert!(state.history.samples.is_empty());
         assert!(state.service_current_force_poll);
         assert!(state.service_history_force_poll);
+    }
+
+    #[test]
+    fn account_directory_reconciliation_follows_only_the_previous_default() {
+        let initial = super::parse_service_accounts_v3_document(ACCOUNTS_A_CURRENT)
+            .expect("initial account directory");
+        let switched = super::parse_service_accounts_v3_document(ACCOUNTS_B_CURRENT)
+            .expect("switched account directory");
+        let removed = super::parse_service_accounts_v3_document(ACCOUNTS_B_CURRENT_WITHOUT_C)
+            .expect("account directory without selected history");
+
+        let mut automatic = CodexInfoState::service_client();
+        automatic
+            .apply_service_accounts(initial.clone())
+            .expect("initial account directory admitted");
+        assert_eq!(
+            automatic.service_selected_account_id.as_deref(),
+            Some("account-7")
+        );
+
+        automatic.authenticated = true;
+        automatic.has_usage = true;
+        automatic.usage_snapshot_committed = true;
+        automatic.last_success_at = Some(1_800_000_001);
+        automatic.service_current_pair = Some("account-7:current".into());
+        automatic.service_published_pair = Some("account-7:published".into());
+        automatic.service_v3_published_pair = Some("account-7:v3".into());
+        automatic.service_history_period_id = Some("account-7:period".into());
+        automatic.service_history_pair = Some("account-7:history".into());
+        automatic.service_history_cursor = Some("account-7:cursor".into());
+        automatic.service_threads_pair = Some("account-7:threads".into());
+        automatic.service_current_bundle_retry_pending = true;
+        automatic.local_usage_pending = true;
+        automatic.error = Some("account-7 presentation error".into());
+        automatic.service_endpoint_error = Some("account-7 endpoint error".into());
+        automatic.service_history_error = Some("account-7 history error".into());
+        automatic.service_threads_error = Some("account-7 threads error".into());
+        automatic.history.samples.push(UsageHistorySample::new(
+            1_800_000_000,
+            1_800_000_600,
+            90.0,
+            ModelDollarTotals::default(),
+        ));
+        automatic.active_threads.push(ActiveThread {
+            id: "account-7-thread".into(),
+            ..ActiveThread::default()
+        });
+
+        automatic
+            .apply_service_accounts(switched.clone())
+            .expect("switched account directory admitted");
+
+        assert_eq!(
+            automatic.service_default_account_id.as_deref(),
+            Some("account-13")
+        );
+        assert_eq!(
+            automatic.service_selected_account_id.as_deref(),
+            Some("account-13")
+        );
+        assert_eq!(automatic.selected_account_index(), 1);
+        assert!(automatic
+            .selected_service_account()
+            .is_some_and(|account| account.is_current));
+        assert!(!automatic.authenticated);
+        assert!(!automatic.has_usage);
+        assert!(!automatic.usage_snapshot_committed);
+        assert!(automatic.last_success_at.is_none());
+        assert!(automatic.service_current_pair.is_none());
+        assert!(automatic.service_published_pair.is_none());
+        assert!(automatic.service_v3_published_pair.is_none());
+        assert!(automatic.service_history_period_id.is_none());
+        assert!(automatic.service_history_pair.is_none());
+        assert!(automatic.service_history_cursor.is_none());
+        assert!(automatic.service_threads_pair.is_none());
+        assert!(!automatic.service_current_bundle_retry_pending);
+        assert!(!automatic.local_usage_pending);
+        assert!(automatic.error.is_none());
+        assert!(automatic.service_endpoint_error.is_none());
+        assert!(automatic.service_history_error.is_none());
+        assert!(automatic.service_threads_error.is_none());
+        assert!(automatic.history.samples.is_empty());
+        assert!(automatic.active_threads.is_empty());
+
+        let mut historical = CodexInfoState::service_client();
+        historical
+            .apply_service_accounts(initial)
+            .expect("initial account directory admitted");
+        assert!(historical.select_account("account-15"));
+        historical.service_current_pair = Some("account-15:current".into());
+        historical.history.samples.push(UsageHistorySample::new(
+            1_700_000_000,
+            1_700_000_600,
+            75.0,
+            ModelDollarTotals::default(),
+        ));
+
+        historical
+            .apply_service_accounts(switched)
+            .expect("new current with retained history admitted");
+        assert_eq!(
+            historical.service_selected_account_id.as_deref(),
+            Some("account-15")
+        );
+        assert_eq!(
+            historical.service_current_pair.as_deref(),
+            Some("account-15:current")
+        );
+        assert_eq!(historical.history.samples.len(), 1);
+
+        historical
+            .apply_service_accounts(removed)
+            .expect("directory without selected history admitted");
+        assert_eq!(
+            historical.service_selected_account_id.as_deref(),
+            Some("account-13")
+        );
+        assert!(historical.service_current_pair.is_none());
+        assert!(historical.history.samples.is_empty());
+    }
+
+    #[test]
+    fn login_change_routes_the_first_refetch_to_the_new_current_account() {
+        let old_pair = published_pair(21, 1);
+        let new_pair = published_pair(21, 2);
+        let (current, threads) = split_current_fixture();
+        let current_body = split_current_body(&current);
+        let threads_body = split_threads_body(&threads);
+        let mut state = CodexInfoState::service_client();
+        state
+            .apply_service_accounts(
+                super::parse_service_accounts_v3_document(ACCOUNTS_A_CURRENT)
+                    .expect("initial account directory"),
+            )
+            .expect("initial account directory admitted");
+        state
+            .apply_service_current_bundle(old_pair, current, None, threads)
+            .expect("old current bundle admitted");
+        state.service_accounts_force_poll = true;
+        state.service_current_force_poll = true;
+        let now = Instant::now();
+        state.service_current_last_poll = now - super::SERVICE_CURRENT_POLL_INTERVAL;
+        let mut requests = Vec::new();
+
+        let outcome = super::poll_service_current_resources_with(&mut state, now, |route, etag| {
+            requests.push((route.to_owned(), etag.map(str::to_owned)));
+            Ok(match route {
+                "/v3/accounts" => super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: None,
+                    body: ACCOUNTS_B_CURRENT.to_vec(),
+                },
+                "/v3/current?account=account-13" => super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: Some(new_pair.clone()),
+                    body: current_body.clone(),
+                },
+                "/v3/threads?account=account-13" => super::ServiceDetailsHttpResponse {
+                    status: 200,
+                    pair: Some(new_pair.clone()),
+                    body: threads_body.clone(),
+                },
+                _ => panic!("unexpected account-switch route: {route}"),
+            })
+        });
+
+        assert_eq!(outcome, super::ServiceCurrentPollOutcome::Success);
+        assert_eq!(
+            requests,
+            [
+                ("/v3/accounts".into(), None),
+                ("/v3/current?account=account-13".into(), None),
+                ("/v3/threads?account=account-13".into(), None),
+            ]
+        );
+        assert_eq!(
+            state.service_selected_account_id.as_deref(),
+            Some("account-13")
+        );
+        assert_eq!(
+            state.service_current_pair.as_deref(),
+            Some(new_pair.as_str())
+        );
     }
 
     #[test]
