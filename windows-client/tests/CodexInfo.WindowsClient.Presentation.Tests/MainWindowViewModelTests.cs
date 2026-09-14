@@ -195,6 +195,77 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public void AccountDirectoryReconciliationFollowsOnlyThePreviousDefault()
+    {
+        using var automatic = new MainWindowViewModel(new AccountScopedClient());
+
+        Assert.True(ApplyAccountsSnapshot(automatic, AccountsAIsCurrent()));
+        Assert.Equal("account-7", automatic.SelectedAccount?.Id);
+        var automaticGeneration = AccountSelectionGeneration(automatic);
+
+        Assert.True(ApplyAccountsSnapshot(automatic, AccountsBIsCurrent()));
+        Assert.Equal("account-13", automatic.SelectedAccount?.Id);
+        Assert.Equal(
+            "アカウント 13 · ID未復元［ログイン中］",
+            automatic.SelectedAccountText);
+        Assert.True(AccountSelectionGeneration(automatic) > automaticGeneration);
+
+        using var historical = new MainWindowViewModel(new AccountScopedClient());
+        Assert.True(ApplyAccountsSnapshot(historical, AccountsAIsCurrent()));
+        Assert.True(historical.SelectAccount("account-15"));
+        var historicalGeneration = AccountSelectionGeneration(historical);
+
+        Assert.True(ApplyAccountsSnapshot(historical, AccountsBIsCurrent()));
+        Assert.Equal("account-15", historical.SelectedAccount?.Id);
+        Assert.Equal(
+            "アカウント 15 · ID未復元［履歴］",
+            historical.SelectedAccountText);
+        Assert.Equal(historicalGeneration, AccountSelectionGeneration(historical));
+
+        Assert.True(ApplyAccountsSnapshot(historical, AccountsBIsCurrentWithoutC()));
+        Assert.Equal("account-13", historical.SelectedAccount?.Id);
+        Assert.True(AccountSelectionGeneration(historical) > historicalGeneration);
+    }
+
+    [Fact]
+    public async Task LoginChangeClearsOldPresentationAndRoutesTheNextRefreshToCurrent()
+    {
+        var client = new AccountScopedClient();
+        using var viewModel = new MainWindowViewModel(client);
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.IsAuthenticated &&
+            viewModel.DetailsSnapshot?.AccountId == "account-7");
+        var priorCurrentRequests = client.CurrentAccountIds.Count;
+        var priorThreadRequests = client.ThreadAccountIds.Count;
+        var priorGeneration = AccountSelectionGeneration(viewModel);
+        var switched = AccountsBIsCurrent();
+        client.SetAccountsSnapshot(switched);
+
+        Assert.True(ApplyAccountsSnapshot(viewModel, switched));
+        Assert.Equal("account-13", viewModel.SelectedAccount?.Id);
+        Assert.Equal(
+            "アカウント 13 · ID未復元［ログイン中］",
+            viewModel.SelectedAccountText);
+        Assert.True(AccountSelectionGeneration(viewModel) > priorGeneration);
+        Assert.Null(viewModel.DetailsSnapshot);
+        Assert.False(viewModel.HasDetails);
+        Assert.False(viewModel.IsAuthenticated);
+        Assert.Empty(viewModel.Models);
+
+        await InvokePrivateTask(viewModel, "RunPeriodicRefreshAsync");
+        await EventuallyAsync(() => viewModel.IsAuthenticated &&
+            viewModel.DetailsSnapshot?.AccountId == "account-13");
+
+        var currentRequests = client.CurrentAccountIds.Skip(priorCurrentRequests).ToArray();
+        var threadRequests = client.ThreadAccountIds.Skip(priorThreadRequests).ToArray();
+        Assert.NotEmpty(currentRequests);
+        Assert.NotEmpty(threadRequests);
+        Assert.All(currentRequests, accountId => Assert.Equal("account-13", accountId));
+        Assert.All(threadRequests, accountId => Assert.Equal("account-13", accountId));
+    }
+
+    [Fact]
     public async Task PeriodicRefreshDoesNotResetStableMainCollectionsOrItemsSources()
     {
         var client = new AccountScopedClient();
@@ -1467,6 +1538,54 @@ public sealed class MainWindowViewModelTests
             ?.GetValue(viewModel)
         ?? throw new InvalidOperationException("The VM did not install a generation context.");
 
+    private static bool ApplyAccountsSnapshot(
+        MainWindowViewModel viewModel,
+        ApiAccountsSnapshot snapshot) =>
+        (bool)(typeof(MainWindowViewModel)
+            .GetMethod("ApplyAccountsSnapshot", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?.Invoke(viewModel, [snapshot])
+        ?? throw new MissingMethodException(
+            typeof(MainWindowViewModel).FullName,
+            "ApplyAccountsSnapshot"));
+
+    private static long AccountSelectionGeneration(MainWindowViewModel viewModel) =>
+        (long)(typeof(MainWindowViewModel)
+            .GetField("accountSelectionGeneration", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?.GetValue(viewModel)
+        ?? throw new MissingFieldException(
+            typeof(MainWindowViewModel).FullName,
+            "accountSelectionGeneration"));
+
+    private static ApiAccountsSnapshot AccountsAIsCurrent() => new(
+        "account-7",
+        [
+            new ApiAccount("account-7", true, 1_800_000_000, null),
+            new ApiAccount("account-13", false, null, null),
+            new ApiAccount("account-15", false, null, null),
+        ]);
+
+    private static ApiAccountsSnapshot AccountsAIsCurrentWithoutC() => new(
+        "account-7",
+        [
+            new ApiAccount("account-7", true, 1_800_000_000, null),
+            new ApiAccount("account-13", false, null, null),
+        ]);
+
+    private static ApiAccountsSnapshot AccountsBIsCurrent() => new(
+        "account-13",
+        [
+            new ApiAccount("account-7", false, 1_800_000_000, 1_800_000_100),
+            new ApiAccount("account-13", true, 1_800_000_100, null),
+            new ApiAccount("account-15", false, null, null),
+        ]);
+
+    private static ApiAccountsSnapshot AccountsBIsCurrentWithoutC() => new(
+        "account-13",
+        [
+            new ApiAccount("account-7", false, 1_800_000_000, 1_800_000_100),
+            new ApiAccount("account-13", true, 1_800_000_100, null),
+        ]);
+
     private static Task InvokePrivateTask(MainWindowViewModel viewModel, string methodName) =>
         (Task)(typeof(MainWindowViewModel)
             .GetMethod(methodName, BindingFlags.Instance | BindingFlags.NonPublic)
@@ -2219,6 +2338,7 @@ public sealed class MainWindowViewModelTests
     {
         private readonly bool blockFirstCurrent;
         private readonly object gate = new();
+        private ApiAccountsSnapshot accountsSnapshot = AccountsAIsCurrentWithoutC();
         private readonly List<string> currentAccountIds = [];
         private readonly List<string> threadAccountIds = [];
         private readonly List<string> historyPeriodAccountIds = [];
@@ -2241,6 +2361,14 @@ public sealed class MainWindowViewModelTests
         }
 
         public Task FirstCurrentStarted => firstCurrentStarted.Task;
+
+        public void SetAccountsSnapshot(ApiAccountsSnapshot snapshot)
+        {
+            lock (gate)
+            {
+                accountsSnapshot = snapshot;
+            }
+        }
 
         public void CompleteFirstCurrent()
         {
@@ -2302,13 +2430,13 @@ public sealed class MainWindowViewModelTests
             throw new InvalidOperationException("Account-scoped tests must not request combined details.");
 
         public Task<AccountsFetchResult> FetchAccountsAsync(
-            CancellationToken cancellationToken = default) =>
-            Task.FromResult(AccountsFetchResult.Success(new ApiAccountsSnapshot(
-                "account-7",
-                [
-                    new ApiAccount("account-7", true, 1_789_167_600, null),
-                    new ApiAccount("account-13", false, null, null),
-                ])));
+            CancellationToken cancellationToken = default)
+        {
+            lock (gate)
+            {
+                return Task.FromResult(AccountsFetchResult.Success(accountsSnapshot));
+            }
+        }
 
         public Task<CurrentFetchResult> FetchCurrentAsync(
             CancellationToken cancellationToken = default) =>
@@ -2332,10 +2460,11 @@ public sealed class MainWindowViewModelTests
             string accountId,
             CancellationToken cancellationToken = default)
         {
-            var historical = accountId == "account-13";
+            bool historical;
             lock (gate)
             {
                 currentAccountIds.Add(accountId);
+                historical = accountId != accountsSnapshot.DefaultAccountId;
             }
 
             var result = CurrentFetchResult.Success(
@@ -2422,11 +2551,13 @@ public sealed class MainWindowViewModelTests
 
         private Task<ThreadsFetchResult> FetchThreadsForAccount(string accountId)
         {
+            bool current;
             lock (gate)
             {
                 threadAccountIds.Add(accountId);
+                current = accountId == accountsSnapshot.DefaultAccountId;
             }
-            IReadOnlyList<ApiThreadDetails> rows = accountId == "account-7"
+            IReadOnlyList<ApiThreadDetails> rows = current
                 ? [ThreadDetails("gpt-5.6-sol")]
                 : [];
             return Task.FromResult(ThreadsFetchResult.Success(

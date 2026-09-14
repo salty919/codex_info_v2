@@ -693,6 +693,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     private bool ApplyAccountsSnapshot(ApiAccountsSnapshot snapshot)
     {
         var previousId = selectedAccount?.Id;
+        var previousDefaultId = accounts.FirstOrDefault(account => account.IsCurrent)?.Id;
         var normalizedAccounts = ApiAccount.EnsureUniqueDisplayLabels(snapshot.Accounts
             .Select(account => account with
             {
@@ -708,9 +709,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             accounts.NotifyReset();
         }
 
-        var next = previousId is not null
-            ? accounts.FirstOrDefault(account => account.Id == previousId)
-            : null;
+        var followedPreviousDefault = previousId is null ||
+            string.Equals(previousId, previousDefaultId, StringComparison.Ordinal);
+        var next = followedPreviousDefault
+            ? accounts.FirstOrDefault(account => account.Id == snapshot.DefaultAccountId)
+            : accounts.FirstOrDefault(account => account.Id == previousId);
         next ??= accounts.FirstOrDefault(account => account.Id == snapshot.DefaultAccountId);
         next ??= accounts.FirstOrDefault(account => account.IsCurrent);
         if (next is null)
