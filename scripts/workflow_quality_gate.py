@@ -220,7 +220,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         resolve = _job(release, "resolve")
         publish = _job(release, "publish")
         revalidate = _step(publish, step_id="revalidate")
-        download = _step(publish, uses="actions/download-artifact@v4")
+        download = _step(publish, uses="actions/download-artifact@v7")
         release_token = _step(
             publish,
             uses="actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
@@ -473,7 +473,7 @@ def _semantic_workflow_errors(workflows: Mapping[str, str]) -> list[str]:
         upload = _step(
             windows_job,
             name="Upload release candidate",
-            uses="actions/upload-artifact@v4",
+            uses="actions/upload-artifact@v6",
         )
         expect(
             "windows.upload.if",
@@ -825,12 +825,12 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "scripts/test_linux_bundle.sh",
         'CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info"',
         "scripts/x11_service_recovery_visual_gate.sh",
-        "uses: actions/upload-artifact@v4",
+        "uses: actions/upload-artifact@v6",
         "release-candidate-linux-v1-pr-${{ inputs.pr_number }}",
     ):
         if marker not in linux_distribution:
             errors.append(f"linux-distribution.yml: missing {marker}")
-    count("linux-distribution.yml", "uses: actions/upload-artifact@v4", 1)
+    count("linux-distribution.yml", "uses: actions/upload-artifact@v6", 1)
 
     windows = workflows["windows-client.yml"]
     for marker in (
@@ -859,7 +859,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     ):
         if forbidden in windows:
             errors.append(f"windows-client.yml: unrelated or stale gate remains: {forbidden}")
-    count("windows-client.yml", "uses: actions/upload-artifact@v4", 2)
+    count("windows-client.yml", "uses: actions/upload-artifact@v6", 2)
 
     rust = workflows["rust.yml"]
     for marker in (
@@ -874,7 +874,7 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
     ):
         if marker not in rust:
             errors.append(f"rust.yml: missing {marker}")
-    count("rust.yml", "uses: actions/upload-artifact@v4", 1)
+    count("rust.yml", "uses: actions/upload-artifact@v6", 1)
     count("rust.yml", "quality_profile", 0)
     count("linux-ui-quality.yml", "quality_profile", 0)
     count("windows-client.yml", "quality_profile", 0)
@@ -3046,16 +3046,16 @@ def _materialize_candidate_handoff(
     release_workflow: str,
     case_root: Path,
 ) -> tuple[Path, Path]:
-    """Model only the v4 upload/download filesystem contract used in production."""
+    """Model the Node 24 artifact upload/download contract used in production."""
 
     windows = _workflow_document(windows_workflow)
     upload = _step(
         _job(windows, "windows-quality"),
         name="Upload release candidate",
-        uses="actions/upload-artifact@v4",
+        uses="actions/upload-artifact@v6",
     )
     release = _workflow_document(release_workflow)
-    download = _step(_job(release, "publish"), uses="actions/download-artifact@v4")
+    download = _step(_job(release, "publish"), uses="actions/download-artifact@v7")
     upload_with = upload.get("with")
     download_with = download.get("with")
     if not isinstance(upload_with, dict) or not isinstance(download_with, dict):
