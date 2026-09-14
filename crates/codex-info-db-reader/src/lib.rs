@@ -215,25 +215,17 @@ impl ReadIntervals {
         })
     }
 
-    /// Return the beginning of the first lifecycle interval that overlaps a
-    /// quota window, but only when that interval starts strictly inside the
-    /// window.  An interval already active at the quota start (including an
-    /// unbounded prefix) means the reader cannot distinguish later gaps from
-    /// another account's quota observations, so no external prefix is safe.
+    /// Return the end of the lifecycle interval that contains a quota-window
+    /// boundary.  A quota-only prefix is safe only while this account was
+    /// already active at that boundary; rows before a later account
+    /// activation have no account attribution and must not be projected.
+    /// Restricting the end to the containing interval also prevents an
+    /// A→B→A gap from being mistaken for this account's external quota use.
     fn quota_only_prefix_end(&self, quota_start: i64) -> Option<i64> {
-        let mut first_start = None;
-        for interval in &self.0 {
-            let end = interval.end_at.unwrap_or(i64::MAX);
-            if end <= quota_start {
-                continue;
-            }
-            let start = interval.start_at?;
-            if start <= quota_start {
-                return None;
-            }
-            first_start = Some(first_start.map_or(start, |current: i64| current.min(start)));
-        }
-        first_start
+        self.0
+            .iter()
+            .find(|interval| interval.contains(quota_start))
+            .map(|interval| interval.end_at.unwrap_or(i64::MAX))
     }
 
     fn interval_containing(&self, timestamp: i64) -> Option<ReadInterval> {
@@ -1233,9 +1225,10 @@ fn build_details_for_intervals(
     let mut quota_only_keys = BTreeSet::new();
     for quota_only in quota_only_samples {
         // A canonical minute selected by this account remains authoritative
-        // even when the raw row carries a reset alias.  External quota rows
-        // may only fill the leading prefix before this account's first local
-        // observation; they must never duplicate an owned point.
+        // even when the raw row carries a reset alias.  Quota-only rows are
+        // eligible only inside a lifecycle interval that already covered the
+        // quota boundary; they must never cross an account-switch boundary or
+        // duplicate an owned point.
         if samples.iter().any(|sample| {
             sample.timestamp == quota_only.timestamp
                 && sample.reset_at.abs_diff(quota_only.reset_at)
@@ -2762,15 +2755,16 @@ fn quota_period_start(reset_at: i64, window_seconds: i64) -> Option<i64> {
 }
 
 /// Keep only durable remaining-quota observations that precede the first
-/// locally-owned observation of the current quota window.
+/// locally-owned observation while the selected account was already active at
+/// the current quota boundary.
 ///
 /// A partition can contain rows written while another account (or an external
-/// client) consumed the same provider quota.  Those rows are not local
-/// Session/model evidence and must not be attributed to the current account.
-/// They are nevertheless useful for the Remaining line, so expose their
-/// actual recorded percentage with an unavailable model source.  The leading
-/// prefix rule is intentional: a later A→B→A lifecycle gap is not treated as
-/// an external prefix merely because it is outside the current interval.
+/// client) consumed the same provider quota.  Rows before a later account
+/// activation are not attributable to the selected account and are excluded.
+/// When the account was active at the quota boundary, a leading row without
+/// local Session/model evidence may still be exposed as actual Remaining-only
+/// data with an unavailable model source.  A later A→B→A lifecycle gap is
+/// never treated as an external prefix.
 fn quota_only_history_projection_samples(
     all_history: &[RawSample],
     owned_history: &[RawSample],
@@ -4889,8 +4883,8 @@ mod tests {
     }
 
     #[test]
-    fn canonical_reader_keeps_external_quota_prefix_without_local_models() {
-        let path = temp_db("external-quota-prefix");
+    fn canonical_reader_drops_quota_prefix_before_account_activation() {
+        let path = temp_db("account-switch-quota-prefix");
         let boundary = 1_800_000_000_i64;
         make_boundary_db(&path, boundary);
         let identity = StoragePartitionIdentity {
@@ -4902,37 +4896,29 @@ mod tests {
         };
         add_partition_identity(&path, &identity);
         let intervals = ReadIntervals::new(vec![
-            ReadInterval::new(Some(boundary), None).expect("current interval")
+            ReadInterval::new(Some(boundary), None).expect("post-switch interval")
         ])
-        .expect("current lifecycle domain");
+        .expect("post-switch lifecycle domain");
 
         let snapshot = DbReader::open_partitioned_with_intervals(&path, &identity, intervals)
             .expect("bounded partition reader")
             .read_snapshot()
-            .expect("external quota prefix snapshot");
+            .expect("post-switch snapshot");
 
-        let prefix = snapshot
+        assert!(snapshot
             .history_samples_v3
             .iter()
-            .find(|sample| sample.timestamp == boundary - 60)
-            .expect("external quota prefix row");
-        assert_eq!(prefix.remaining_percent, Some(80.0));
-        assert_eq!(prefix.model_source, "unavailable");
-        assert!(!prefix.models_complete);
-        assert!(prefix.models.is_none());
-        assert!(snapshot
+            .all(|sample| sample.timestamp != boundary - 60));
+        assert!(!snapshot
             .history_samples_v2
             .iter()
-            .any(|sample| sample.timestamp == boundary - 60
-                && sample.model_source == "unavailable"
-                && sample.sol_tokens.is_none()
-                && sample.sol_dollars.is_none()));
+            .any(|sample| sample.timestamp == boundary - 60));
         assert!(snapshot
             .details
             .history_samples
             .iter()
             .all(|sample| sample.timestamp >= boundary));
-        assert_eq!(snapshot.history_samples_v3.len(), 3);
+        assert_eq!(snapshot.history_samples_v3.len(), 2);
         assert_eq!(snapshot.details.history_samples.len(), 2);
 
         let quota_start =
@@ -4990,40 +4976,40 @@ mod tests {
         let reset_at = 1_800_001_000_i64;
         let window_seconds = 86_400_i64;
         let quota_start = quota_period_start(reset_at, window_seconds).expect("quota start");
-        let activation = quota_start + 600;
-        let intervals = ReadIntervals::new(vec![
-            ReadInterval::new(Some(activation), None).expect("current lifecycle interval")
-        ])
-        .expect("current lifecycle domain");
-        let raw = |timestamp: i64, remaining_percent: f64| RawSample {
-            timestamp,
-            reset_at,
-            remaining_percent: Some(remaining_percent),
-            sol_dollars: 0.0,
-            terra_dollars: 0.0,
-            luna_dollars: 0.0,
-            sol_tokens: 0,
-            terra_tokens: 0,
-            luna_tokens: 0,
-        };
-        let external = raw(quota_start + 300, 0.0);
-        let local = raw(activation, 25.0);
-        let projected = quota_only_history_projection_samples(
-            &[external.clone(), local.clone()],
-            std::slice::from_ref(&local),
+        let raw =
+            |timestamp: i64, remaining_percent: f64, sol_dollars: f64, sol_tokens| RawSample {
+                timestamp,
+                reset_at,
+                remaining_percent: Some(remaining_percent),
+                sol_dollars,
+                terra_dollars: 0.0,
+                luna_dollars: 0.0,
+                sol_tokens,
+                terra_tokens: 0,
+                luna_tokens: 0,
+            };
+        let first_zero = raw(quota_start + 600, 0.0, 1.0, 10);
+        let later_zero = raw(quota_start + 1_200, 0.0, 2.0, 20);
+        let samples = canonicalize_history(
+            &[first_zero, later_zero],
             Some(reset_at),
             window_seconds,
-            activation,
-            &intervals,
-        );
-        assert_eq!(projected.len(), 1);
-        assert_eq!(projected[0].remaining_percent, Some(0.0));
+            quota_start + 1_200,
+        )
+        .expect("zero quota canonical history");
+        assert_eq!(samples.len(), 2);
+        assert!(samples
+            .iter()
+            .all(|sample| sample.remaining_percent == Some(0.0)));
+        assert_eq!(samples[0].sol_tokens, 10);
+        assert_eq!(samples[1].sol_tokens, 20);
 
-        let samples = vec![
-            public_sample_from_raw(&external),
-            public_sample_from_raw(&local),
-        ];
-        let periods = history_periods(&samples, activation, Some(reset_at), window_seconds);
+        let periods = history_periods(
+            &samples,
+            quota_start + 1_200,
+            Some(reset_at),
+            window_seconds,
+        );
         assert_eq!(periods.len(), 1);
         assert_eq!(periods[0].reset_at, reset_at);
         assert_eq!(periods[0].start_at, quota_start);
