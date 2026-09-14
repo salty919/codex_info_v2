@@ -4,7 +4,9 @@ use codex_info_account_locator::{
     locate_existing_partitions, mark_partition_initialized, prepare_recorder_data_root,
     set_partition_login_id as set_registry_login_id, AccountPartition,
 };
-use codex_info_db_writer::{ActiveThreadSnapshot, StoragePartitionIdentity};
+use codex_info_db_writer::{
+    ActiveThreadSnapshot, SessionLifecycleInterval, StoragePartitionIdentity, UsageStore,
+};
 use codex_info_recorder::{
     synchronize_inactive_partition, AccountEpochProof, ActiveThreadPollResult, ProfileLease,
     QuotaPollEvent, QuotaPoller, Recorder, RecorderConfig, RecorderError, RecorderStateWriter,
@@ -113,7 +115,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .filter(|previous| previous.partition_id != options.identity.partition_id)
         .map(|previous| previous.transition_fingerprint.as_str());
-    let mut recorder = Recorder::open_partitioned_for_account(
+    let lifecycle_intervals = options
+        .partition
+        .lifecycle_intervals
+        .iter()
+        .map(|interval| SessionLifecycleInterval::new(interval.start_at, interval.end_at))
+        .collect();
+    let mut recorder = Recorder::open_partitioned_for_account_with_lifecycle(
         RecorderConfig {
             sessions_root: options.sessions_root.clone(),
             chunk_bytes: options.chunk_bytes,
@@ -122,7 +130,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &options.identity,
         options.partition.activation_timestamp,
         transition_fingerprint,
+        lifecycle_intervals,
     )?;
+    let startup_epoch = AccountEpochProof::capture(&options.codex_home)
+        .map_err(|_| RecorderError::AccountBoundaryChanged)?;
+    let startup_backup = UsageStore::backup_generations_partitioned_verified(
+        &options.database,
+        &options.identity,
+        3,
+    )?;
+    if recorder.reconcile_session_lifecycle_guarded(&startup_backup, || {
+        recorder_epoch_matches(&options, &startup_epoch)
+    })? {
+        eprintln!("codex-info-recorder repaired session totals across account lifecycles");
+    }
     mark_partition_initialized(&options.data_root, &options.partition)
         .map_err(|error| format!("mark account partition initialized: {error}"))?;
     // Existing inactive partitions have no live writer. Bring every
