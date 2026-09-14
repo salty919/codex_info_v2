@@ -2882,6 +2882,36 @@ fn session_event_primary_key(
     )
 }
 
+fn session_event_replay_group_key(
+    event: &SessionEvent,
+) -> (
+    String,
+    String,
+    u64,
+    u64,
+    i64,
+    String,
+    u64,
+    u64,
+    u64,
+    u64,
+    Option<u64>,
+) {
+    (
+        event.root_identity.clone(),
+        event.relative_path.clone(),
+        event.file_device,
+        event.file_inode,
+        event.timestamp,
+        event.model.clone(),
+        event.total_tokens,
+        event.input_tokens,
+        event.cached_input_tokens,
+        event.output_tokens,
+        event.cache_write_input_tokens,
+    )
+}
+
 /// Collapse replayed records from overlapping physical source ranges. A new
 /// prefix generation can rescan bytes that an older generation already
 /// committed (for example after an account transition). The event key
@@ -2891,15 +2921,90 @@ fn session_event_primary_key(
 /// sessions. The repair path removes the discarded raw rows after a verified
 /// backup; ambiguous records are never guessed away.
 fn canonicalize_session_events(events: Vec<SessionEvent>) -> (Vec<SessionEvent>, bool) {
-    let mut canonical = Vec::with_capacity(events.len());
-    let mut deduplicated = false;
+    // Equal payloads are the only rows which can be replays. Partitioning by
+    // immutable source identity and payload avoids comparing every event with
+    // every other event when a real database contains tens of thousands of
+    // records. Within one group, an end-offset index tracks only ranges that
+    // are still capable of overlapping the next sorted range.
+    let mut groups = BTreeMap::<
+        (
+            String,
+            String,
+            u64,
+            u64,
+            i64,
+            String,
+            u64,
+            u64,
+            u64,
+            u64,
+            Option<u64>,
+        ),
+        Vec<SessionEvent>,
+    >::new();
     for event in events {
-        let duplicate = canonical
-            .iter()
-            .any(|existing: &SessionEvent| session_event_is_replay(existing, &event));
-        if duplicate {
-            deduplicated = true;
-        } else {
+        groups
+            .entry(session_event_replay_group_key(&event))
+            .or_default()
+            .push(event);
+    }
+
+    let mut canonical = Vec::with_capacity(groups.values().map(Vec::len).sum());
+    let mut deduplicated = false;
+    for mut group in groups.into_values() {
+        group.sort_by_key(|event| {
+            (
+                event.range_start,
+                event.range_end,
+                event.prefix_generation,
+                event.record_sha256.clone(),
+                event.event_index,
+            )
+        });
+        let mut active_by_end = BTreeMap::<u64, Vec<u128>>::new();
+        let mut active_by_prefix = BTreeMap::<u128, usize>::new();
+        let mut active_total = 0_usize;
+        let mut seen_primary_keys = BTreeSet::new();
+        for event in group {
+            // All stored offsets are bounded by SQLite's signed integer range,
+            // so adding one cannot overflow here.
+            let future = if event.range_start == u64::MAX {
+                BTreeMap::new()
+            } else {
+                active_by_end.split_off(&(event.range_start + 1))
+            };
+            for prefixes in std::mem::replace(&mut active_by_end, future).into_values() {
+                active_total = active_total.saturating_sub(prefixes.len());
+                for prefix in prefixes {
+                    let remove_prefix = if let Some(count) = active_by_prefix.get_mut(&prefix) {
+                        *count = count.saturating_sub(1);
+                        *count == 0
+                    } else {
+                        false
+                    };
+                    if remove_prefix {
+                        active_by_prefix.remove(&prefix);
+                    }
+                }
+            }
+
+            let primary_key = session_event_primary_key(&event);
+            let same_primary_key = !seen_primary_keys.insert(primary_key);
+            let same_prefix_active = active_by_prefix
+                .get(&event.prefix_generation)
+                .copied()
+                .unwrap_or(0);
+            let has_other_prefix_overlap = active_total > same_prefix_active;
+            if same_primary_key || has_other_prefix_overlap {
+                deduplicated = true;
+                continue;
+            }
+            active_by_end
+                .entry(event.range_end)
+                .or_default()
+                .push(event.prefix_generation);
+            *active_by_prefix.entry(event.prefix_generation).or_default() += 1;
+            active_total += 1;
             canonical.push(event);
         }
     }
