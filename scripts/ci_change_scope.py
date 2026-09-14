@@ -43,6 +43,7 @@ LINUX_TEST_EXACT = frozenset(
         "scripts/test_run_launcher_version_sync.sh",
     }
 )
+QUALITY_GATE_EXACT = frozenset({"scripts/regression_guard.sh"})
 LINUX_UI_EXACT = frozenset(
     {
         "scripts/x11_graph_visual_gate.sh",
@@ -144,6 +145,8 @@ def _selection_for_path(path: str) -> PathSelection:
             else frozenset()
         )
         return PathSelection(frozenset({"GOVERNANCE"}), False, languages)
+    if path in QUALITY_GATE_EXACT:
+        return PathSelection(frozenset({"GOVERNANCE", "LINUX_BACKEND"}), False)
     if path in WINDOWS_TEST_SCRIPT_EXACT:
         return PathSelection(frozenset({"WINDOWS"}), False)
     if path in LINUX_PRODUCT_EXACT or path.startswith("packaging/"):

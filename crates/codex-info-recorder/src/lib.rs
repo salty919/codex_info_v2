@@ -10,8 +10,8 @@
 use chrono::{DateTime, Months, Utc};
 use codex_info::{protocol_contract, security, thread_contract};
 use codex_info_db_writer::{
-    classify_quota_transition, finalize_session_timeline_recovery, ActiveThreadRecord,
-    ActiveThreadSnapshot, PreviousQuotaState, QuotaCandidate, QuotaTransition,
+    classify_quota_transition, finalize_session_timeline_recovery, session_event_is_replay,
+    ActiveThreadRecord, ActiveThreadSnapshot, PreviousQuotaState, QuotaCandidate, QuotaTransition,
     RecordedSessionSource, SessionCheckpoint, SessionCollectionCommit, SessionCollectionState,
     SessionEvent, SessionEventReattribution, SessionLifecycleInterval, SessionModelTotal,
     SessionPendingRange, SessionRange, SessionTaskEvent, SessionTaskEvidenceInput,
@@ -2219,6 +2219,54 @@ impl ModelTotals {
         self.values.entry(model).or_default().add(delta)
     }
 
+    fn subtract(&mut self, model: &str, delta: TokenSnapshot) -> Result<(), RecorderError> {
+        if !delta.has_usage() {
+            return Ok(());
+        }
+        let model = Self::canonical_model(model).unwrap_or_else(|| UNATTRIBUTED_MODEL.to_owned());
+        let counter = self.values.get_mut(&model).ok_or_else(|| {
+            RecorderError::Invalid("replayed session event is absent from totals".to_owned())
+        })?;
+        counter.total = counter
+            .total
+            .checked_sub(delta.total)
+            .ok_or_else(|| RecorderError::Invalid("replayed session total underflow".to_owned()))?;
+        counter.input = counter
+            .input
+            .checked_sub(delta.input)
+            .ok_or_else(|| RecorderError::Invalid("replayed session input underflow".to_owned()))?;
+        counter.cached_input = counter
+            .cached_input
+            .checked_sub(delta.cached_input)
+            .ok_or_else(|| {
+                RecorderError::Invalid("replayed session cached input underflow".to_owned())
+            })?;
+        counter.output = counter.output.checked_sub(delta.output).ok_or_else(|| {
+            RecorderError::Invalid("replayed session output underflow".to_owned())
+        })?;
+        counter.cache_write_input = match (counter.cache_write_input, delta.cache_write_input) {
+            (Some(current), Some(replayed)) => {
+                Some(current.checked_sub(replayed).ok_or_else(|| {
+                    RecorderError::Invalid("replayed session cache-write underflow".to_owned())
+                })?)
+            }
+            _ => None,
+        };
+        if counter.cached_input > counter.input
+            || counter.cache_write_input.is_some_and(|writes| {
+                counter
+                    .cached_input
+                    .checked_add(writes)
+                    .is_none_or(|value| value > counter.input)
+            })
+        {
+            return Err(RecorderError::Invalid(
+                "replayed session token components are inconsistent".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn to_totals(&self) -> Vec<SessionModelTotal> {
         self.values
             .iter()
@@ -3390,6 +3438,12 @@ impl Recorder {
             totals.add(&event.model, event.delta)?;
         }
         let initial_totals = totals.clone();
+        // The writer exposes one canonical logical event stream. Keep that
+        // stream as the admission set while this cycle scans sources so an
+        // account-switch/restart prefix replay is removed before it reaches
+        // either totals or history. Proven duplicates are filtered; any
+        // non-identical record remains normal source data.
+        let mut admitted_session_events = self.writer.load_session_events()?;
 
         let source_count = sources.len();
         let first_source = if source_count == 0 {
@@ -3448,7 +3502,7 @@ impl Recorder {
                 &mut totals,
                 &mut events,
             );
-            let Some(result) = (match result {
+            let Some(mut result) = (match result {
                 Ok(result) => result,
                 Err(error) => {
                     // A source can disappear or be replaced while the
@@ -3493,6 +3547,32 @@ impl Recorder {
                 ));
                 continue;
             };
+            let mut admitted_events = Vec::with_capacity(result.events.len());
+            for event in result.events {
+                let replay = admitted_session_events
+                    .iter()
+                    .any(|existing| session_event_is_replay(existing, &event));
+                if replay {
+                    if reset_at > 0
+                        && event.timestamp >= window_start
+                        && event.timestamp <= reset_at
+                    {
+                        let timed = session_event_to_timed_usage(event.clone())?;
+                        totals.subtract(&timed.model, timed.delta)?;
+                        if let Some(index) = events.iter().position(|candidate| {
+                            candidate.timestamp == timed.timestamp
+                                && candidate.model == timed.model
+                                && candidate.delta == timed.delta
+                        }) {
+                            events.remove(index);
+                        }
+                    }
+                } else {
+                    admitted_session_events.push(event.clone());
+                    admitted_events.push(event);
+                }
+            }
+            result.events = admitted_events;
             consumed_budget = consumed_budget.saturating_add(result.consumed_bytes);
             if result.unresolved {
                 pending_ranges = pending_ranges.saturating_add(result.pending.len().max(1));
@@ -8524,6 +8604,91 @@ mod tests {
             restarted.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
             5
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn overlapping_prefix_replay_is_removed_without_dropping_a_following_event() {
+        let (root, database) = prepare("prefix-replay-no-double");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        fs::write(&source, token(10, now)).unwrap();
+        let mut recorder =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(token(15, now + 1).as_bytes())
+            .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            5
+        );
+        let before = recorder.state().unwrap();
+        let checkpoint = before.checkpoints[0].clone();
+
+        // Simulate the incident's physical cause: the same JSONL prefix is
+        // admitted again under a fresh lineage after a restart/account
+        // transition. The recorder must classify the overlapping token row as
+        // the same physical evidence before it reaches totals or history.
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE session_checkpoints
+                 SET committed_offset=0, prefix_generation=?1,
+                     prefix_sha256=?2, fully_attributed_from_zero=0,
+                     token_baseline_known=0, previous_total='0',
+                     previous_input='0', previous_cached_input='0',
+                     previous_output='0', previous_cache_write_input=NULL
+                 WHERE root_identity=?3 AND relative_path=?4
+                   AND file_device=?5 AND file_inode=?6",
+                rusqlite::params![
+                    format!("{:032x}", 0x99_u128),
+                    EMPTY_SHA256,
+                    &checkpoint.root_identity,
+                    &checkpoint.relative_path,
+                    checkpoint.file_device.to_string(),
+                    checkpoint.file_inode.to_string(),
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            5
+        );
+        let connection = Connection::open(&database).unwrap();
+        let event_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count, 1, "the replay row must never be persisted");
+        drop(connection);
+
+        // A genuinely new append after the replay is still admitted. This is
+        // the guard against a blanket dedupe that would lose normal usage.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(token(20, now + 2).as_bytes())
+            .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            10
+        );
+        let connection = Connection::open(&database).unwrap();
+        let event_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count, 2);
+        drop(connection);
         let _ = fs::remove_dir_all(root);
     }
 

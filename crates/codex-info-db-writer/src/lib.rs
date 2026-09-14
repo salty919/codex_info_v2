@@ -1247,6 +1247,19 @@ pub struct SessionTaskEvidence {
 
 type SessionTaskIndexedRangeKey = (String, String, u64, u64, u128, u64, u64, String);
 type SessionTaskEventKey = (String, String, u64, u64, u128, u64, u64, String, u64);
+type SessionEventReplayGroupKey = (
+    String,
+    String,
+    u64,
+    u64,
+    i64,
+    String,
+    u64,
+    u64,
+    u64,
+    u64,
+    Option<u64>,
+);
 
 /// Exact source evidence which was read but could not be attributed to a
 /// trusted usage vector.  Pending rows are keyed by source lineage and start
@@ -2766,7 +2779,7 @@ fn session_totals_history_values(totals: &[SessionModelTotal]) -> (f64, f64, f64
     )
 }
 
-fn load_session_events_from_connection(connection: &Connection) -> Result<Vec<SessionEvent>> {
+fn load_raw_session_events_from_connection(connection: &Connection) -> Result<Vec<SessionEvent>> {
     let mut statement = connection.prepare(
         "SELECT root_identity, relative_path, file_device, file_inode,
                 prefix_generation, range_start, range_end, record_sha256,
@@ -2826,6 +2839,175 @@ fn load_session_events_from_connection(connection: &Connection) -> Result<Vec<Se
         validate_session_event(event)?;
     }
     Ok(rows)
+}
+
+/// Returns whether two session rows prove the same physical token record.
+///
+/// An exact primary-key replay is idempotent.  A different prefix lineage is
+/// also a replay only when the immutable source identity, token payload, and
+/// overlapping byte ranges all agree.  Equal timestamps alone are not enough:
+/// two independent source records may legitimately have the same timestamp.
+pub fn session_event_is_replay(existing: &SessionEvent, candidate: &SessionEvent) -> bool {
+    let same_payload = existing.timestamp == candidate.timestamp
+        && existing.model == candidate.model
+        && existing.total_tokens == candidate.total_tokens
+        && existing.input_tokens == candidate.input_tokens
+        && existing.cached_input_tokens == candidate.cached_input_tokens
+        && existing.output_tokens == candidate.output_tokens
+        && existing.cache_write_input_tokens == candidate.cache_write_input_tokens;
+    if !same_payload
+        || existing.root_identity != candidate.root_identity
+        || existing.relative_path != candidate.relative_path
+        || existing.file_device != candidate.file_device
+        || existing.file_inode != candidate.file_inode
+    {
+        return false;
+    }
+    let same_primary_key = existing.prefix_generation == candidate.prefix_generation
+        && existing.range_start == candidate.range_start
+        && existing.range_end == candidate.range_end
+        && existing.record_sha256 == candidate.record_sha256
+        && existing.event_index == candidate.event_index;
+    same_primary_key
+        || (existing.prefix_generation != candidate.prefix_generation
+            && existing.range_start < candidate.range_end
+            && candidate.range_start < existing.range_end)
+}
+
+fn session_event_is_cross_prefix_replay(existing: &SessionEvent, candidate: &SessionEvent) -> bool {
+    existing.prefix_generation != candidate.prefix_generation
+        && session_event_is_replay(existing, candidate)
+}
+
+fn session_event_primary_key(
+    event: &SessionEvent,
+) -> (String, String, u64, u64, u128, u64, u64, String, u64) {
+    (
+        event.root_identity.clone(),
+        event.relative_path.clone(),
+        event.file_device,
+        event.file_inode,
+        event.prefix_generation,
+        event.range_start,
+        event.range_end,
+        event.record_sha256.clone(),
+        event.event_index,
+    )
+}
+
+fn session_event_replay_group_key(event: &SessionEvent) -> SessionEventReplayGroupKey {
+    (
+        event.root_identity.clone(),
+        event.relative_path.clone(),
+        event.file_device,
+        event.file_inode,
+        event.timestamp,
+        event.model.clone(),
+        event.total_tokens,
+        event.input_tokens,
+        event.cached_input_tokens,
+        event.output_tokens,
+        event.cache_write_input_tokens,
+    )
+}
+
+/// Collapse replayed records from overlapping physical source ranges. A new
+/// prefix generation can rescan bytes that an older generation already
+/// committed (for example after an account transition). The event key
+/// deliberately ignores only lineage fields; two equal token records are
+/// collapsed only when their source identities and byte ranges overlap, which
+/// proves they came from the same physical bytes rather than two independent
+/// sessions. The repair path removes the discarded raw rows after a verified
+/// backup; ambiguous records are never guessed away.
+fn canonicalize_session_events(events: Vec<SessionEvent>) -> (Vec<SessionEvent>, bool) {
+    // Equal payloads are the only rows which can be replays. Partitioning by
+    // immutable source identity and payload avoids comparing every event with
+    // every other event when a real database contains tens of thousands of
+    // records. Within one group, an end-offset index tracks only ranges that
+    // are still capable of overlapping the next sorted range.
+    let mut groups = BTreeMap::<SessionEventReplayGroupKey, Vec<SessionEvent>>::new();
+    for event in events {
+        groups
+            .entry(session_event_replay_group_key(&event))
+            .or_default()
+            .push(event);
+    }
+
+    let mut canonical = Vec::with_capacity(groups.values().map(Vec::len).sum());
+    let mut deduplicated = false;
+    for mut group in groups.into_values() {
+        group.sort_by_key(|event| {
+            (
+                event.range_start,
+                event.range_end,
+                event.prefix_generation,
+                event.record_sha256.clone(),
+                event.event_index,
+            )
+        });
+        let mut active_by_end = BTreeMap::<u64, Vec<u128>>::new();
+        let mut active_by_prefix = BTreeMap::<u128, usize>::new();
+        let mut active_total = 0_usize;
+        let mut seen_primary_keys = BTreeSet::new();
+        for event in group {
+            // All stored offsets are bounded by SQLite's signed integer range,
+            // so adding one cannot overflow here.
+            let future = if event.range_start == u64::MAX {
+                BTreeMap::new()
+            } else {
+                active_by_end.split_off(&(event.range_start + 1))
+            };
+            for prefixes in std::mem::replace(&mut active_by_end, future).into_values() {
+                active_total = active_total.saturating_sub(prefixes.len());
+                for prefix in prefixes {
+                    let remove_prefix = if let Some(count) = active_by_prefix.get_mut(&prefix) {
+                        *count = count.saturating_sub(1);
+                        *count == 0
+                    } else {
+                        false
+                    };
+                    if remove_prefix {
+                        active_by_prefix.remove(&prefix);
+                    }
+                }
+            }
+
+            let primary_key = session_event_primary_key(&event);
+            let same_primary_key = !seen_primary_keys.insert(primary_key);
+            let same_prefix_active = active_by_prefix
+                .get(&event.prefix_generation)
+                .copied()
+                .unwrap_or(0);
+            let has_other_prefix_overlap = active_total > same_prefix_active;
+            if same_primary_key || has_other_prefix_overlap {
+                deduplicated = true;
+                continue;
+            }
+            active_by_end
+                .entry(event.range_end)
+                .or_default()
+                .push(event.prefix_generation);
+            *active_by_prefix.entry(event.prefix_generation).or_default() += 1;
+            active_total += 1;
+            canonical.push(event);
+        }
+    }
+    canonical.sort_by_key(|event| {
+        (
+            event.timestamp,
+            event.root_identity.clone(),
+            event.relative_path.clone(),
+            event.range_start,
+            event.event_index,
+        )
+    });
+    (canonical, deduplicated)
+}
+
+fn load_session_events_from_connection(connection: &Connection) -> Result<Vec<SessionEvent>> {
+    let (events, _) =
+        canonicalize_session_events(load_raw_session_events_from_connection(connection)?);
+    Ok(events)
 }
 
 /// Reconciles the last raw vector of a retained canonical period with the
@@ -10263,7 +10445,17 @@ impl UsageStore {
         let period_start = reset_at
             .checked_sub(window_seconds)
             .ok_or(UsageStoreError::GenerationOverflow)?;
-        let events = load_session_events_from_connection(&transaction)?;
+        let raw_events = load_raw_session_events_from_connection(&transaction)?;
+        let (events, duplicate_lineage) = canonicalize_session_events(raw_events.clone());
+        let canonical_event_keys = events
+            .iter()
+            .map(session_event_primary_key)
+            .collect::<BTreeSet<_>>();
+        let replayed_event_rows = raw_events
+            .iter()
+            .filter(|event| !canonical_event_keys.contains(&session_event_primary_key(event)))
+            .cloned()
+            .collect::<Vec<_>>();
         let period_events = events
             .iter()
             .filter(|event| event.timestamp >= period_start && event.timestamp <= reset_at)
@@ -10279,9 +10471,44 @@ impl UsageStore {
             event_has_usage(event) && !lifecycle_contains(&intervals, event.timestamp)
         });
         let stored_totals = session_model_totals_from_connection(&transaction)?;
-        if !has_external_usage || stored_totals != all_totals || all_totals == owned_totals {
+        // A proven physical replay is sufficient evidence for repair. Do not
+        // require the persisted vector to match one guessed ownership slice:
+        // the same table may contain external-account events, and a previous
+        // partial repair may already have changed the vector. The canonical
+        // event ledger is the only source used to rebuild totals/history.
+        let duplicate_repair = duplicate_lineage && !replayed_event_rows.is_empty();
+        let lifecycle_repair =
+            has_external_usage && stored_totals == all_totals && all_totals != owned_totals;
+        if !duplicate_repair && !lifecycle_repair {
             transaction.commit()?;
             return Ok(None);
+        }
+
+        // The duplicated prefix rows are not an independent source.  Delete
+        // only the exact primary-key rows proven to replay an already kept
+        // physical record; ambiguous records remain untouched and therefore
+        // cannot cause a normal source event to disappear.
+        if !replayed_event_rows.is_empty() {
+            let mut delete = transaction.prepare(
+                "DELETE FROM session_events
+                 WHERE root_identity=?1 AND relative_path=?2
+                   AND file_device=?3 AND file_inode=?4
+                   AND prefix_generation=?5 AND range_start=?6
+                   AND range_end=?7 AND record_sha256=?8 AND event_index=?9",
+            )?;
+            for event in &replayed_event_rows {
+                delete.execute(params![
+                    &event.root_identity,
+                    &event.relative_path,
+                    event.file_device.to_string(),
+                    event.file_inode.to_string(),
+                    format!("{:032x}", event.prefix_generation),
+                    event.range_start as i64,
+                    event.range_end as i64,
+                    &event.record_sha256,
+                    event.event_index as i64,
+                ])?;
+            }
         }
 
         // Read the rows and sidecars before removing them.  A sidecar is
@@ -11683,6 +11910,26 @@ impl UsageStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_events = load_raw_session_events_from_connection(&transaction)?;
+        if canonical_events.values().any(|candidate| {
+            existing_events
+                .iter()
+                .any(|existing| session_event_is_cross_prefix_replay(existing, candidate))
+        }) {
+            return Err(UsageStoreError::InvalidImport(
+                "session event overlaps an existing prefix lineage replay".into(),
+            ));
+        }
+        let incoming = canonical_events.values().collect::<Vec<_>>();
+        if incoming.iter().enumerate().any(|(index, candidate)| {
+            incoming[index + 1..]
+                .iter()
+                .any(|other| session_event_is_cross_prefix_replay(candidate, other))
+        }) {
+            return Err(UsageStoreError::InvalidImport(
+                "session batch contains overlapping prefix lineage replays".into(),
+            ));
+        }
         let adjusted_samples = apply_history_continuity(&transaction, samples)?;
         let preserve_all_existing_history = cumulative_recovery.is_some();
         let canonical_projection = canonicalize_samples_with_sources(
@@ -13083,6 +13330,166 @@ mod tests {
             .repair_session_lifecycle(&[SessionLifecycleInterval::new(Some(1_400), None)], &backup)
             .unwrap();
         assert_eq!(repaired, Some(1));
+        let state = store.load_session_collection_state().unwrap();
+        assert_eq!(state.model_totals[0].total_tokens, 100);
+        let row: (f64, i64) = store
+            .connection
+            .query_row(
+                "SELECT sol_dollars, sol_tokens FROM usage_history
+                 WHERE timestamp=1500 AND reset_at=2000",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.1, 100);
+        assert!((row.0 - 0.0005).abs() < f64::EPSILON);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn session_event_replay_requires_physical_source_payload_and_overlap_proof() {
+        let existing = SessionEvent {
+            root_identity: "root".to_owned(),
+            relative_path: "session.jsonl".to_owned(),
+            file_device: 1,
+            file_inode: 2,
+            prefix_generation: 1,
+            range_start: 0,
+            range_end: 100,
+            record_sha256: "1".repeat(64),
+            event_index: 0,
+            timestamp: 1_500,
+            model: "SOL".to_owned(),
+            total_tokens: 100,
+            input_tokens: 100,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            cache_write_input_tokens: Some(0),
+        };
+        assert!(session_event_is_replay(&existing, &existing));
+
+        let overlapping_prefix = SessionEvent {
+            prefix_generation: 2,
+            range_start: 50,
+            range_end: 150,
+            record_sha256: "2".repeat(64),
+            ..existing.clone()
+        };
+        assert!(session_event_is_replay(&existing, &overlapping_prefix));
+
+        let different_source = SessionEvent {
+            file_inode: 3,
+            ..overlapping_prefix.clone()
+        };
+        assert!(!session_event_is_replay(&existing, &different_source));
+
+        let different_payload = SessionEvent {
+            total_tokens: 101,
+            input_tokens: 101,
+            ..overlapping_prefix.clone()
+        };
+        assert!(!session_event_is_replay(&existing, &different_payload));
+
+        let disjoint_range = SessionEvent {
+            range_start: 100,
+            range_end: 200,
+            ..overlapping_prefix
+        };
+        assert!(!session_event_is_replay(&existing, &disjoint_range));
+    }
+
+    #[test]
+    fn lifecycle_repair_collapses_overlapping_prefix_lineage_replays() {
+        let path = database_path("lifecycle-prefix-replay");
+        let identity = partition_identity('b', 8);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let reset_at = 2_000_i64;
+        store
+            .connection
+            .execute(
+                "UPDATE collection_generation SET reset_at=?1, window_seconds=?2",
+                params![reset_at, 1_000_i64],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO usage_history (
+                    timestamp, reset_at, remaining_percent, sol_dollars,
+                    terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+                 ) VALUES (1500, 2000, 70.0, 0.001, 0.0, 0.0, 200, 0, 0)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO session_model_totals (
+                    model, total_tokens, input_tokens, cached_input_tokens,
+                    output_tokens, cache_write_input_tokens
+                 ) VALUES ('SOL', '200', '200', '0', '0', '0')",
+                [],
+            )
+            .unwrap();
+        for (prefix, range_start, range_end) in [(1_u128, 0_i64, 100_i64), (2, 50, 150)] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO session_events (
+                        root_identity, relative_path, file_device, file_inode,
+                        prefix_generation, range_start, range_end, record_sha256,
+                        event_index, timestamp, model, total_tokens, input_tokens,
+                        cached_input_tokens, output_tokens, cache_write_input_tokens
+                     ) VALUES ('root', 'session.jsonl', '1', '2', ?1, ?2, ?3, ?4,
+                               0, 1500, 'SOL', '100', '100', '0', '0', '0')",
+                    params![
+                        format!("{prefix:032x}"),
+                        range_start,
+                        range_end,
+                        format!("{prefix:064x}"),
+                    ],
+                )
+                .unwrap();
+        }
+        // A distinct record from the previous account/lifecycle is normal
+        // evidence and must survive the replay cleanup.
+        store
+            .connection
+            .execute(
+                "INSERT INTO session_events (
+                    root_identity, relative_path, file_device, file_inode,
+                    prefix_generation, range_start, range_end, record_sha256,
+                    event_index, timestamp, model, total_tokens, input_tokens,
+                    cached_input_tokens, output_tokens, cache_write_input_tokens
+                 ) VALUES ('root', 'session.jsonl', '1', '2', ?1, 150, 200, ?2,
+                           0, 1300, 'SOL', '50', '50', '0', '0', '0')",
+                params![format!("{:032x}", 3_u128), "3".repeat(64)],
+            )
+            .unwrap();
+        // The persisted vector still reflects the incident until the
+        // verified writer repair runs; readers must not silently guess a
+        // lifecycle ownership split from the mixed raw ledger.
+        let before_repair = store.load_session_collection_state().unwrap();
+        assert_eq!(before_repair.model_totals[0].total_tokens, 200);
+        let raw_event_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(raw_event_count, 3);
+        let backup =
+            UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
+        let repaired = store
+            .repair_session_lifecycle(&[SessionLifecycleInterval::new(Some(1_400), None)], &backup)
+            .unwrap();
+        assert_eq!(repaired, Some(1));
+        let canonical_events = store.load_session_events().unwrap();
+        assert_eq!(canonical_events.len(), 2);
+        assert!(canonical_events.iter().any(|event| event.timestamp == 1300));
+        let raw_event_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM session_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(raw_event_count, 2, "repair removes only the replay row");
         let state = store.load_session_collection_state().unwrap();
         assert_eq!(state.model_totals[0].total_tokens, 100);
         let row: (f64, i64) = store

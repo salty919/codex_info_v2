@@ -86,7 +86,7 @@ fi
 ((${#checks[@]} > 0)) || fail 'quality plan contains no checks'
 
 run_governance_contract() {
-    local path run_authority_fixtures=0 run_selector_fixtures=0 run_workflow_fixtures=0 run_codeql_fixture=0 run_codacy_coverage_fixture=0
+    local path run_authority_fixtures=0 run_selector_fixtures=0 run_regression_guard_fixture=0 run_workflow_fixtures=0 run_codeql_fixture=0 run_codacy_coverage_fixture=0
     for path in "${changed_paths[@]}"; do
         if [[ "$path" == *.sh && -f "$path" ]]; then
             bash -n "$path"
@@ -107,6 +107,9 @@ PY
             scripts/quality_plan.py|scripts/test_quality_plan.py|scripts/ci_change_scope.py|scripts/test_ci_change_scope.py|scripts/selected_quality_gate.py|scripts/test_selected_quality_gate.py|scripts/pre_pr_gate.sh)
                 run_selector_fixtures=1
                 ;;
+            scripts/regression_guard.sh|scripts/test_regression_guard.py)
+                run_regression_guard_fixture=1
+                ;;
             .github/workflows/*|scripts/workflow_quality_gate.py)
                 run_workflow_fixtures=1
                 ;;
@@ -126,6 +129,9 @@ PY
         python3 scripts/test_quality_plan.py
         python3 scripts/test_ci_change_scope.py
         python3 scripts/test_selected_quality_gate.py
+    fi
+    if ((run_regression_guard_fixture != 0)); then
+        python3 scripts/test_regression_guard.py
     fi
     if ((run_workflow_fixtures != 0)); then
         python3 scripts/workflow_quality_gate.py \

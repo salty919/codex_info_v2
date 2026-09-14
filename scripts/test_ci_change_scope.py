@@ -28,6 +28,9 @@ class OwnerSelectionTests(unittest.TestCase):
                 ("GOVERNANCE",), False, ("actions",)
             ),
             "scripts/ci_change_scope.py": (("GOVERNANCE",), False, ("python",)),
+            "scripts/regression_guard.sh": (
+                ("GOVERNANCE", "LINUX_BACKEND"), False, ()
+            ),
             "scripts/check_recorder_rest_boundary.sh": (
                 ("LINUX_BACKEND",), False, ()
             ),

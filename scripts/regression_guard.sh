@@ -35,7 +35,11 @@ case "$1" in
         echo 'regression-guard: PASS check=rust-format'
         ;;
     --test)
-        test_output="$(cargo test --locked --all-targets -- --nocapture 2>&1)" || {
+        # The product is a Cargo workspace. A root-package-only invocation
+        # silently skips recorder/writer/reader unit tests, allowing a daemon
+        # data regression to pass this gate. Keep the gate aligned with the
+        # release workflow and execute every workspace target once.
+        test_output="$(cargo test --locked --workspace --all-targets -- --nocapture 2>&1)" || {
             printf '%s\n' "$test_output" >&2
             fail 'Rust tests failed'
         }
