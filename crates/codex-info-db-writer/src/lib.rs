@@ -1312,6 +1312,45 @@ pub struct SessionModelTotal {
     pub cache_write_input_tokens: Option<u64>,
 }
 
+/// One account-owned half-open Unix-second interval.  The registry is the
+/// authority for these values; the database stores neither auth material nor
+/// a second copy of the lifecycle timeline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionLifecycleInterval {
+    pub start_at: Option<i64>,
+    pub end_at: Option<i64>,
+}
+
+impl SessionLifecycleInterval {
+    pub fn new(start_at: Option<i64>, end_at: Option<i64>) -> Self {
+        Self { start_at, end_at }
+    }
+
+    fn contains(self, timestamp: i64) -> bool {
+        self.start_at.is_none_or(|start| timestamp >= start)
+            && self.end_at.is_none_or(|end| timestamp < end)
+    }
+}
+
+/// Opaque, generation-bound plan for removing another account's Session
+/// deltas from this partition's current cumulative period.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionLifecycleRepair {
+    data_generation: u64,
+    reset_at: i64,
+    window_seconds: i64,
+    intervals: Vec<SessionLifecycleInterval>,
+    stored_model_totals: Vec<SessionModelTotal>,
+    all_model_totals: Vec<SessionModelTotal>,
+    owned_model_totals: Vec<SessionModelTotal>,
+}
+
+impl SessionLifecycleRepair {
+    pub fn owned_model_totals(&self) -> &[SessionModelTotal] {
+        &self.owned_model_totals
+    }
+}
+
 /// Cumulative Session-derived delta at one canonical minute. These values are
 /// reconstructed from an exact, committed JSONL byte range; they are not a
 /// point-in-time measurement and never replace an existing DB value.
@@ -2591,6 +2630,204 @@ fn checked_add_model_totals(
     canonicalize_model_totals(&combined.into_values().collect::<Vec<_>>()).ok()
 }
 
+fn canonical_lifecycle_intervals(
+    intervals: &[SessionLifecycleInterval],
+) -> Result<Vec<SessionLifecycleInterval>> {
+    if intervals.is_empty() {
+        return Err(UsageStoreError::InvalidImport(
+            "account lifecycle intervals are missing".into(),
+        ));
+    }
+    let mut canonical = intervals.to_vec();
+    canonical.sort_by_key(|interval| {
+        (
+            interval.start_at.unwrap_or(i64::MIN),
+            interval.end_at.unwrap_or(i64::MAX),
+        )
+    });
+    for (index, interval) in canonical.iter().enumerate() {
+        if interval.start_at.is_some_and(|value| value <= 0)
+            || interval.end_at.is_some_and(|value| value <= 0)
+            || interval.start_at.is_none() && index != 0
+            || interval.end_at.is_none() && index + 1 != canonical.len()
+            || matches!((interval.start_at, interval.end_at), (Some(start), Some(end)) if start >= end)
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "account lifecycle interval is invalid".into(),
+            ));
+        }
+    }
+    let mut merged: Vec<SessionLifecycleInterval> = Vec::new();
+    for interval in canonical {
+        if let Some(previous) = merged.last_mut() {
+            let previous_end = previous.end_at.unwrap_or(i64::MAX);
+            let next_start = interval.start_at.unwrap_or(i64::MIN);
+            if next_start < previous_end {
+                return Err(UsageStoreError::InvalidImport(
+                    "account lifecycle intervals overlap".into(),
+                ));
+            }
+            if next_start == previous_end {
+                previous.end_at = interval.end_at;
+                continue;
+            }
+        }
+        merged.push(interval);
+    }
+    Ok(merged)
+}
+
+fn lifecycle_contains(intervals: &[SessionLifecycleInterval], timestamp: i64) -> bool {
+    intervals
+        .iter()
+        .copied()
+        .any(|interval| interval.contains(timestamp))
+}
+
+fn event_model_total(event: &SessionEvent) -> SessionModelTotal {
+    SessionModelTotal {
+        model: event.model.clone(),
+        total_tokens: event.total_tokens,
+        input_tokens: event.input_tokens,
+        cached_input_tokens: event.cached_input_tokens,
+        output_tokens: event.output_tokens,
+        cache_write_input_tokens: event.cache_write_input_tokens,
+    }
+}
+
+fn sum_session_events<'a>(
+    events: impl Iterator<Item = &'a SessionEvent>,
+) -> Result<Vec<SessionModelTotal>> {
+    let mut totals = Vec::new();
+    for event in events {
+        validate_session_event(event)?;
+        totals = checked_add_model_totals(&totals, &[event_model_total(event)])
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+    }
+    Ok(totals)
+}
+
+fn event_has_usage(event: &SessionEvent) -> bool {
+    event.total_tokens > 0
+        || event.input_tokens > 0
+        || event.cached_input_tokens > 0
+        || event.output_tokens > 0
+        || event
+            .cache_write_input_tokens
+            .is_some_and(|value| value > 0)
+}
+
+fn session_total_dollars(total: &SessionModelTotal) -> f64 {
+    let input = total.input_tokens.saturating_sub(total.cached_input_tokens) as f64;
+    let cached = total.cached_input_tokens as f64;
+    let output = total.output_tokens as f64;
+    match total.model.as_str() {
+        "SOL" => (input * 5.0 + cached * 0.5 + output * 30.0) / 1_000_000.0,
+        "TERRA" => (input * 2.0 + cached * 0.2 + output * 12.0) / 1_000_000.0,
+        "LUNA" => (input * 0.2 + cached * 0.02 + output * 1.2) / 1_000_000.0,
+        "ASTRA" => {
+            let Some(writes) = total.cache_write_input_tokens else {
+                return 0.0;
+            };
+            let ordinary = total
+                .input_tokens
+                .saturating_sub(total.cached_input_tokens)
+                .saturating_sub(writes);
+            (ordinary as f64 * 10.0 + cached * 1.0 + writes as f64 * 12.5 + output * 50.0)
+                / 1_000_000.0
+        }
+        _ => 0.0,
+    }
+}
+
+fn session_totals_history_values(totals: &[SessionModelTotal]) -> (f64, f64, f64, u64, u64, u64) {
+    let mut dollars = (0.0, 0.0, 0.0);
+    let mut tokens: (u64, u64, u64) = (0, 0, 0);
+    for total in totals {
+        let value = session_total_dollars(total);
+        match total.model.as_str() {
+            "SOL" => {
+                dollars.0 += value;
+                tokens.0 = tokens.0.saturating_add(total.total_tokens);
+            }
+            "TERRA" => {
+                dollars.1 += value;
+                tokens.1 = tokens.1.saturating_add(total.total_tokens);
+            }
+            "LUNA" => {
+                dollars.2 += value;
+                tokens.2 = tokens.2.saturating_add(total.total_tokens);
+            }
+            _ => {}
+        }
+    }
+    (
+        dollars.0, dollars.1, dollars.2, tokens.0, tokens.1, tokens.2,
+    )
+}
+
+fn load_session_events_from_connection(connection: &Connection) -> Result<Vec<SessionEvent>> {
+    let mut statement = connection.prepare(
+        "SELECT root_identity, relative_path, file_device, file_inode,
+                prefix_generation, range_start, range_end, record_sha256,
+                event_index, timestamp, model, total_tokens, input_tokens,
+                cached_input_tokens, output_tokens, cache_write_input_tokens
+         FROM session_events
+         ORDER BY timestamp, root_identity, relative_path, range_start, event_index",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(SessionEvent {
+                root_identity: row.get(0)?,
+                relative_path: row.get(1)?,
+                file_device: row
+                    .get::<_, String>(2)?
+                    .parse()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                file_inode: row
+                    .get::<_, String>(3)?
+                    .parse()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                prefix_generation: u128::from_str_radix(&row.get::<_, String>(4)?, 16)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                range_start: u64::try_from(row.get::<_, i64>(5)?)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                range_end: u64::try_from(row.get::<_, i64>(6)?)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                record_sha256: row.get(7)?,
+                event_index: u64::try_from(row.get::<_, i64>(8)?)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                timestamp: row.get(9)?,
+                model: row.get(10)?,
+                total_tokens: row
+                    .get::<_, String>(11)?
+                    .parse()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                input_tokens: row
+                    .get::<_, String>(12)?
+                    .parse()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                cached_input_tokens: row
+                    .get::<_, String>(13)?
+                    .parse()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                output_tokens: row
+                    .get::<_, String>(14)?
+                    .parse()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                cache_write_input_tokens: row
+                    .get::<_, Option<String>>(15)?
+                    .map(|value| value.parse().map_err(|_| rusqlite::Error::InvalidQuery))
+                    .transpose()?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for event in &rows {
+        validate_session_event(event)?;
+    }
+    Ok(rows)
+}
+
 /// Reconciles the last raw vector of a retained canonical period with the
 /// current vector stored under a valid-but-rejected period alias. Each model
 /// has exactly one admissible interpretation: monotonic continuation is an
@@ -3389,10 +3626,8 @@ fn validate_cumulative_recovery_source_generation(
     Ok(())
 }
 
-fn session_model_totals_from_transaction(
-    transaction: &rusqlite::Transaction<'_>,
-) -> Result<Vec<SessionModelTotal>> {
-    let mut statement = transaction.prepare(
+fn session_model_totals_from_connection(connection: &Connection) -> Result<Vec<SessionModelTotal>> {
+    let mut statement = connection.prepare(
         "SELECT model, total_tokens, input_tokens, cached_input_tokens,
                 output_tokens, cache_write_input_tokens
          FROM session_model_totals ORDER BY model",
@@ -3423,6 +3658,12 @@ fn session_model_totals_from_transaction(
         });
     }
     canonicalize_model_totals(&totals)
+}
+
+fn session_model_totals_from_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<Vec<SessionModelTotal>> {
+    session_model_totals_from_connection(transaction)
 }
 
 fn last_quota_observation_for_reset(
@@ -9981,69 +10222,241 @@ impl UsageStore {
         })
     }
 
+    /// Reconcile a current cumulative Session projection against the complete
+    /// account lifecycle.  This is intentionally writer-side: readers must
+    /// never guess which account owned a shared Session event.
+    pub fn repair_session_lifecycle(
+        &mut self,
+        lifecycle_intervals: &[SessionLifecycleInterval],
+        backup: &VerifiedPartitionBackup,
+    ) -> Result<Option<u64>> {
+        let intervals = canonical_lifecycle_intervals(lifecycle_intervals)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let partition_id: String = transaction.query_row(
+            "SELECT partition_id FROM storage_partition WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if partition_id != backup.partition_id {
+            return Err(UsageStoreError::InvalidImport(
+                "lifecycle repair backup partition changed".into(),
+            ));
+        }
+        if legacy_raw_evidence(&transaction)? != (backup.raw_rows, backup.raw_fingerprint.clone()) {
+            return Err(UsageStoreError::InvalidImport(
+                "lifecycle repair raw history changed after backup".into(),
+            ));
+        }
+        let (generation, reset_at, window_seconds): (String, i64, i64) = transaction.query_row(
+            "SELECT data_generation, reset_at, window_seconds
+             FROM collection_generation WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let generation = canonical_u64_text(&generation, "collection generation")?;
+        if reset_at <= 0 || window_seconds <= 0 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let period_start = reset_at
+            .checked_sub(window_seconds)
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+        let events = load_session_events_from_connection(&transaction)?;
+        let period_events = events
+            .iter()
+            .filter(|event| event.timestamp >= period_start && event.timestamp <= reset_at)
+            .collect::<Vec<_>>();
+        let all_totals = sum_session_events(period_events.iter().copied())?;
+        let owned_events = period_events
+            .iter()
+            .copied()
+            .filter(|event| lifecycle_contains(&intervals, event.timestamp))
+            .collect::<Vec<_>>();
+        let owned_totals = sum_session_events(owned_events.iter().copied())?;
+        let has_external_usage = period_events.iter().any(|event| {
+            event_has_usage(event) && !lifecycle_contains(&intervals, event.timestamp)
+        });
+        let stored_totals = session_model_totals_from_connection(&transaction)?;
+        if !has_external_usage || stored_totals != all_totals || all_totals == owned_totals {
+            transaction.commit()?;
+            return Ok(None);
+        }
+
+        // Read the rows and sidecars before removing them.  A sidecar is
+        // recreated with the same singleton and source timestamp so the
+        // durable observation remains the authority for quota metadata.
+        let mut history = Vec::<(
+            UsageHistorySample,
+            Option<(i64, UsageHistoryObservation, i64)>,
+        )>::new();
+        let mut statement = transaction.prepare(
+            "SELECT timestamp, reset_at, remaining_percent, sol_dollars,
+                    terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+             FROM usage_history WHERE reset_at=?1 ORDER BY timestamp",
+        )?;
+        let rows = statement.query_map([reset_at], |row| {
+            valid_sample_from_row(row)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+                .ok_or(rusqlite::Error::InvalidQuery)
+        })?;
+        let samples = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for sample in samples {
+            let raw: Option<(i64, i64, String, String)> = transaction
+                .query_row(
+                    "SELECT singleton, data_generation, data_hash, snapshot_json
+                     FROM durable_state
+                     WHERE singleton>=?1 AND data_generation=?2
+                       AND json_valid(snapshot_json)
+                       AND json_extract(snapshot_json, '$.reset_at')=?3
+                     ORDER BY singleton LIMIT 1",
+                    params![
+                        DURABLE_STATE_OBSERVATION_MIN_SINGLETON,
+                        sample.timestamp,
+                        sample.reset_at
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let sidecar = raw
+                .map(|(singleton, data_generation, data_hash, snapshot_json)| {
+                    let source_timestamp = observation_source_timestamp(&snapshot_json)?;
+                    let observation =
+                        observation_from_sql(data_generation, data_hash, snapshot_json)?;
+                    Ok::<(i64, UsageHistoryObservation, i64), UsageStoreError>((
+                        singleton,
+                        observation,
+                        source_timestamp,
+                    ))
+                })
+                .transpose()?;
+            history.push((sample, sidecar));
+        }
+
+        transaction.execute(
+            "DELETE FROM usage_model_history WHERE reset_at=?1",
+            [reset_at],
+        )?;
+        transaction.execute(
+            "DELETE FROM durable_state
+             WHERE singleton>=?1
+               AND json_valid(snapshot_json)
+               AND json_extract(snapshot_json, '$.reset_at')=?2",
+            params![DURABLE_STATE_OBSERVATION_MIN_SINGLETON, reset_at],
+        )?;
+
+        for (mut sample, sidecar) in history {
+            let prefix = sum_session_events(
+                owned_events
+                    .iter()
+                    .copied()
+                    .filter(|event| event.timestamp <= sample.timestamp),
+            )?;
+            let (sol_dollars, terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens) =
+                session_totals_history_values(&prefix);
+            sample.sol_dollars = sol_dollars;
+            sample.terra_dollars = terra_dollars;
+            sample.luna_dollars = luna_dollars;
+            sample.sol_tokens = sol_tokens;
+            sample.terra_tokens = terra_tokens;
+            sample.luna_tokens = luna_tokens;
+            sample.validate()?;
+            transaction.execute(
+                "UPDATE usage_history SET sol_dollars=?1, terra_dollars=?2,
+                    luna_dollars=?3, sol_tokens=?4, terra_tokens=?5, luna_tokens=?6
+                 WHERE reset_at=?7 AND timestamp=?8",
+                params![
+                    sample.sol_dollars,
+                    sample.terra_dollars,
+                    sample.luna_dollars,
+                    i64::try_from(sample.sol_tokens)
+                        .map_err(|_| UsageStoreError::GenerationOverflow)?,
+                    i64::try_from(sample.terra_tokens)
+                        .map_err(|_| UsageStoreError::GenerationOverflow)?,
+                    i64::try_from(sample.luna_tokens)
+                        .map_err(|_| UsageStoreError::GenerationOverflow)?,
+                    sample.reset_at,
+                    sample.timestamp,
+                ],
+            )?;
+            for total in &prefix {
+                transaction.execute(
+                    "INSERT INTO usage_model_history (
+                        reset_at, timestamp, model, total_tokens, input_tokens,
+                        cached_input_tokens, output_tokens, cache_write_input_tokens,
+                        model_set_complete
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+                    params![
+                        sample.reset_at,
+                        sample.timestamp,
+                        &total.model,
+                        total.total_tokens.to_string(),
+                        total.input_tokens.to_string(),
+                        total.cached_input_tokens.to_string(),
+                        total.output_tokens.to_string(),
+                        total
+                            .cache_write_input_tokens
+                            .map(|value| value.to_string()),
+                    ],
+                )?;
+            }
+            if let Some((singleton, previous, source_timestamp)) = sidecar {
+                let observation = UsageHistoryObservation::confirmed_with_models(&sample, prefix);
+                let snapshot_json =
+                    observation_json_with_source_timestamp(&observation, Some(source_timestamp))?;
+                transaction.execute(
+                    "INSERT INTO durable_state
+                        (singleton, data_generation, data_hash, snapshot_json)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        singleton,
+                        sample.timestamp,
+                        observation_data_hash(sample.reset_at, sample.timestamp),
+                        snapshot_json,
+                    ],
+                )?;
+                let _ = previous;
+            }
+        }
+
+        transaction.execute("DELETE FROM session_model_totals", [])?;
+        let mut insert = transaction.prepare(
+            "INSERT INTO session_model_totals (
+                model, total_tokens, input_tokens, cached_input_tokens,
+                output_tokens, cache_write_input_tokens
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for total in &owned_totals {
+            insert.execute(params![
+                &total.model,
+                total.total_tokens.to_string(),
+                total.input_tokens.to_string(),
+                total.cached_input_tokens.to_string(),
+                total.output_tokens.to_string(),
+                total
+                    .cache_write_input_tokens
+                    .map(|value| value.to_string()),
+            ])?;
+        }
+        drop(insert);
+        let next = generation
+            .checked_add(1)
+            .ok_or(UsageStoreError::GenerationOverflow)?;
+        transaction.execute(
+            "UPDATE collection_generation SET data_generation=?1 WHERE singleton=1",
+            [next.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(Some(next))
+    }
+
     /// Read source-proven token deltas independently of quota period
     /// materialization. This bounded projection is used only during an
     /// accepted period boundary to reconstruct the current window.
     pub fn load_session_events(&self) -> Result<Vec<SessionEvent>> {
-        let mut statement = self.connection.prepare(
-            "SELECT root_identity, relative_path, file_device, file_inode,
-                    prefix_generation, range_start, range_end, record_sha256,
-                    event_index, timestamp, model, total_tokens, input_tokens,
-                    cached_input_tokens, output_tokens, cache_write_input_tokens
-             FROM session_events
-             ORDER BY timestamp, root_identity, relative_path, range_start, event_index",
-        )?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok(SessionEvent {
-                    root_identity: row.get(0)?,
-                    relative_path: row.get(1)?,
-                    file_device: row
-                        .get::<_, String>(2)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    file_inode: row
-                        .get::<_, String>(3)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    prefix_generation: u128::from_str_radix(&row.get::<_, String>(4)?, 16)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    range_start: u64::try_from(row.get::<_, i64>(5)?)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    range_end: u64::try_from(row.get::<_, i64>(6)?)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    record_sha256: row.get(7)?,
-                    event_index: u64::try_from(row.get::<_, i64>(8)?)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    timestamp: row.get(9)?,
-                    model: row.get(10)?,
-                    total_tokens: row
-                        .get::<_, String>(11)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    input_tokens: row
-                        .get::<_, String>(12)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    cached_input_tokens: row
-                        .get::<_, String>(13)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    output_tokens: row
-                        .get::<_, String>(14)?
-                        .parse()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    cache_write_input_tokens: row
-                        .get::<_, Option<String>>(15)?
-                        .map(|value| value.parse().map_err(|_| rusqlite::Error::InvalidQuery))
-                        .transpose()?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for event in &rows {
-            validate_session_event(event)?;
-        }
-        Ok(rows)
+        load_session_events_from_connection(&self.connection)
     }
 
     /// Replace only an exact set of unattributed events after the recorder has
@@ -12607,6 +13020,82 @@ mod tests {
             storage_epoch: epoch,
             partition_id: account_byte.to_string().repeat(64),
         }
+    }
+
+    #[test]
+    fn lifecycle_repair_excludes_external_session_events_from_totals_and_history() {
+        let path = database_path("lifecycle-repair");
+        let identity = partition_identity('a', 7);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        let reset_at = 2_000_i64;
+        store
+            .connection
+            .execute(
+                "UPDATE collection_generation SET reset_at=?1, window_seconds=?2",
+                params![reset_at, 1_000_i64],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO usage_history (
+                    timestamp, reset_at, remaining_percent, sol_dollars,
+                    terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens
+                 ) VALUES (1500, 2000, 70.0, 0.0015, 0.0, 0.0, 300, 0, 0)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO session_model_totals (
+                    model, total_tokens, input_tokens, cached_input_tokens,
+                    output_tokens, cache_write_input_tokens
+                 ) VALUES ('SOL', '300', '300', '0', '0', '0')",
+                [],
+            )
+            .unwrap();
+        for (event_index, timestamp, input) in [(0_i64, 1200_i64, 200_u64), (1, 1500, 100)] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO session_events (
+                        root_identity, relative_path, file_device, file_inode,
+                        prefix_generation, range_start, range_end, record_sha256,
+                        event_index, timestamp, model, total_tokens, input_tokens,
+                        cached_input_tokens, output_tokens, cache_write_input_tokens
+                     ) VALUES ('root', 'session.jsonl', '1', '2', ?1, 0, 1, ?2,
+                               ?3, ?4, 'SOL', ?5, ?5, '0', '0', '0')",
+                    params![
+                        format!("{0:032x}", 1_u128),
+                        "0".repeat(64),
+                        event_index,
+                        timestamp,
+                        input.to_string()
+                    ],
+                )
+                .unwrap();
+        }
+        let backup =
+            UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
+        let repaired = store
+            .repair_session_lifecycle(&[SessionLifecycleInterval::new(Some(1_400), None)], &backup)
+            .unwrap();
+        assert_eq!(repaired, Some(1));
+        let state = store.load_session_collection_state().unwrap();
+        assert_eq!(state.model_totals[0].total_tokens, 100);
+        let row: (f64, i64) = store
+            .connection
+            .query_row(
+                "SELECT sol_dollars, sol_tokens FROM usage_history
+                 WHERE timestamp=1500 AND reset_at=2000",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.1, 100);
+        assert!((row.0 - 0.0005).abs() < f64::EPSILON);
+        remove_database(&path);
     }
 
     fn drop_canonical_history_constraints(connection: &Connection) {
