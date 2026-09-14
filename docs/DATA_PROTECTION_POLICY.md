@@ -25,6 +25,7 @@ U128-19
 ## RECORDER-MODEL-01 — モデル追加・source障害時の記録継続
 
 - Sessionが返す有効なmodel IDは固定allowlistで捨てず、正規化したIDごとに既存account DBへ記録する。既知の`gpt-6-astra` / `ASTRA`を含め、入力、cached入力、cache write入力、出力の各tokenを保持する。価格未登録モデルもtoken事実は保存し、価格だけを未確定とする。
+- account lifecycleの異なるSession eventを同じ累積値へ混在させない。writerはregistryの全half-open interval、保存済みevent、保存値の三者を照合し、verified backupを取得できた完全一致ケースだけで現行periodのmodel totals/historyを補正する。raw event/range/checkpointは削除せず、所属を証明できない履歴はUnavailableとして公開し、reader/UIの後付け補償を行わない。
 - `cache_write_input_tokens` の未提供と明示的な0を区別する。提供されない内訳を推測して確定値にしない。
 - model totalsとsource checkpointは同じtransactionで保存し、再起動・同一range再取得で重複加算しない。未対応モデルを未保存のままrecorded markerとして確定しない。
 - 既存cursorより前に読み飛ばされたASTRAは、保持sourceからモデル別に回収する。既存SOL/TERRA/LUNAの確定累計や履歴を再加算・削除しない。回収済みの範囲を永続化し、再実行で同じ補正を加えない。

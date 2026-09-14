@@ -13,10 +13,11 @@ use codex_info_db_writer::{
     classify_quota_transition, finalize_session_timeline_recovery, ActiveThreadRecord,
     ActiveThreadSnapshot, PreviousQuotaState, QuotaCandidate, QuotaTransition,
     RecordedSessionSource, SessionCheckpoint, SessionCollectionCommit, SessionCollectionState,
-    SessionEvent, SessionEventReattribution, SessionModelTotal, SessionPendingRange, SessionRange,
-    SessionTaskEvent, SessionTaskEvidenceInput, SessionTaskIndexedRange, SessionTimelineRecovery,
-    SessionTimelineRecoveryPoint, StoragePartitionIdentity, UsageHistoryObservation,
-    UsageHistorySample, UsageStore, UsageStoreError,
+    SessionEvent, SessionEventReattribution, SessionLifecycleInterval, SessionModelTotal,
+    SessionPendingRange, SessionRange, SessionTaskEvent, SessionTaskEvidenceInput,
+    SessionTaskIndexedRange, SessionTimelineRecovery, SessionTimelineRecoveryPoint,
+    StoragePartitionIdentity, UsageHistoryObservation, UsageHistorySample, UsageStore,
+    UsageStoreError, VerifiedPartitionBackup,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -2925,6 +2926,7 @@ pub struct Recorder {
     last_ranges: Vec<SessionRange>,
     task_backfill: TaskBackfillWorker,
     activation_timestamp: Option<i64>,
+    lifecycle_intervals: Vec<SessionLifecycleInterval>,
     account_boundary_epoch: Option<u128>,
 }
 
@@ -2963,7 +2965,34 @@ impl Recorder {
         activation_timestamp: Option<i64>,
         transition_fingerprint: Option<&str>,
     ) -> Result<Self, RecorderError> {
+        let lifecycle_intervals = vec![SessionLifecycleInterval::new(activation_timestamp, None)];
+        Self::open_partitioned_for_account_with_lifecycle(
+            config,
+            database,
+            identity,
+            activation_timestamp,
+            transition_fingerprint,
+            lifecycle_intervals,
+        )
+    }
+
+    /// Open an account partition with the complete registry-owned lifecycle.
+    /// The interval list is the only authority used to reattribute shared
+    /// Session evidence; it is never persisted with credentials.
+    pub fn open_partitioned_for_account_with_lifecycle(
+        config: RecorderConfig,
+        database: impl AsRef<Path>,
+        identity: &StoragePartitionIdentity,
+        activation_timestamp: Option<i64>,
+        transition_fingerprint: Option<&str>,
+        lifecycle_intervals: Vec<SessionLifecycleInterval>,
+    ) -> Result<Self, RecorderError> {
         config.validate()?;
+        if lifecycle_intervals.is_empty() {
+            return Err(RecorderError::Invalid(
+                "account lifecycle intervals are missing".to_owned(),
+            ));
+        }
         if activation_timestamp.is_some_and(|value| value <= 0) {
             return Err(RecorderError::Invalid(
                 "account activation timestamp must be positive".to_owned(),
@@ -3032,6 +3061,7 @@ impl Recorder {
             last_ranges: Vec::new(),
             task_backfill: TaskBackfillWorker::start(),
             activation_timestamp,
+            lifecycle_intervals,
             account_boundary_epoch,
         })
     }
@@ -3054,6 +3084,7 @@ impl Recorder {
             last_ranges: Vec::new(),
             task_backfill: TaskBackfillWorker::start(),
             activation_timestamp: None,
+            lifecycle_intervals: vec![SessionLifecycleInterval::new(None, None)],
             account_boundary_epoch: None,
         })
     }
@@ -3141,6 +3172,35 @@ impl Recorder {
                 )
             })
             .collect())
+    }
+
+    /// Correct a current cumulative projection whose raw Session evidence
+    /// spans another account lifecycle.  The verified SQLite backup is the
+    /// recovery proof; a failed authority fence leaves the partition intact.
+    pub fn reconcile_session_lifecycle_guarded<F>(
+        &mut self,
+        backup: &VerifiedPartitionBackup,
+        commit_guard: F,
+    ) -> Result<bool, RecorderError>
+    where
+        F: FnOnce() -> bool,
+    {
+        let _epoch_fence = account_epoch_commit_fence()?;
+        if account_boundary_changed() || !commit_guard() {
+            return Err(RecorderError::AccountBoundaryChanged);
+        }
+        let repaired = self
+            .writer
+            .repair_session_lifecycle(&self.lifecycle_intervals, backup)?;
+        if let Some(generation) = repaired {
+            let state = self.writer.load_session_collection_state()?;
+            if state.data_generation != generation {
+                return Err(RecorderError::Invalid(
+                    "lifecycle repair generation read-back mismatch".to_owned(),
+                ));
+            }
+        }
+        Ok(repaired.is_some())
     }
 
     pub fn ranges(&self) -> &[SessionRange] {
@@ -3311,7 +3371,16 @@ impl Recorder {
             self.writer
                 .load_session_events()?
                 .into_iter()
-                .filter(|event| event.timestamp >= window_start && event.timestamp <= timeline_end)
+                .filter(|event| {
+                    event.timestamp >= reset_at.saturating_sub(window_seconds)
+                        && event.timestamp <= timeline_end
+                        && self.lifecycle_intervals.iter().any(|interval| {
+                            interval
+                                .start_at
+                                .is_none_or(|start| event.timestamp >= start)
+                                && interval.end_at.is_none_or(|end| event.timestamp < end)
+                        })
+                })
                 .map(session_event_to_timed_usage)
                 .collect::<Result<Vec<_>, RecorderError>>()?
         } else {
