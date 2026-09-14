@@ -1247,6 +1247,19 @@ pub struct SessionTaskEvidence {
 
 type SessionTaskIndexedRangeKey = (String, String, u64, u64, u128, u64, u64, String);
 type SessionTaskEventKey = (String, String, u64, u64, u128, u64, u64, String, u64);
+type SessionEventReplayGroupKey = (
+    String,
+    String,
+    u64,
+    u64,
+    i64,
+    String,
+    u64,
+    u64,
+    u64,
+    u64,
+    Option<u64>,
+);
 
 /// Exact source evidence which was read but could not be attributed to a
 /// trusted usage vector.  Pending rows are keyed by source lineage and start
@@ -2882,21 +2895,7 @@ fn session_event_primary_key(
     )
 }
 
-fn session_event_replay_group_key(
-    event: &SessionEvent,
-) -> (
-    String,
-    String,
-    u64,
-    u64,
-    i64,
-    String,
-    u64,
-    u64,
-    u64,
-    u64,
-    Option<u64>,
-) {
+fn session_event_replay_group_key(event: &SessionEvent) -> SessionEventReplayGroupKey {
     (
         event.root_identity.clone(),
         event.relative_path.clone(),
@@ -2926,22 +2925,7 @@ fn canonicalize_session_events(events: Vec<SessionEvent>) -> (Vec<SessionEvent>,
     // every other event when a real database contains tens of thousands of
     // records. Within one group, an end-offset index tracks only ranges that
     // are still capable of overlapping the next sorted range.
-    let mut groups = BTreeMap::<
-        (
-            String,
-            String,
-            u64,
-            u64,
-            i64,
-            String,
-            u64,
-            u64,
-            u64,
-            u64,
-            Option<u64>,
-        ),
-        Vec<SessionEvent>,
-    >::new();
+    let mut groups = BTreeMap::<SessionEventReplayGroupKey, Vec<SessionEvent>>::new();
     for event in events {
         groups
             .entry(session_event_replay_group_key(&event))
