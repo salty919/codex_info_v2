@@ -215,6 +215,27 @@ impl ReadIntervals {
         })
     }
 
+    /// Return the beginning of the first lifecycle interval that overlaps a
+    /// quota window, but only when that interval starts strictly inside the
+    /// window.  An interval already active at the quota start (including an
+    /// unbounded prefix) means the reader cannot distinguish later gaps from
+    /// another account's quota observations, so no external prefix is safe.
+    fn quota_only_prefix_end(&self, quota_start: i64) -> Option<i64> {
+        let mut first_start = None;
+        for interval in &self.0 {
+            let end = interval.end_at.unwrap_or(i64::MAX);
+            if end <= quota_start {
+                continue;
+            }
+            let start = interval.start_at?;
+            if start <= quota_start {
+                return None;
+            }
+            first_start = Some(first_start.map_or(start, |current: i64| current.min(start)));
+        }
+        first_start
+    }
+
     fn interval_containing(&self, timestamp: i64) -> Option<ReadInterval> {
         self.0
             .iter()
@@ -1243,6 +1264,7 @@ fn build_details_for_intervals(
         intervals,
         current_reset_at,
         window_seconds,
+        history_is_canonical,
     )?;
     let models = model_projection.v1;
     let history_projection_context = HistoryProjectionContext {
@@ -2779,6 +2801,10 @@ fn quota_only_history_projection_samples(
     else {
         return Vec::new();
     };
+    let Some(lifecycle_prefix_end) = intervals.quota_only_prefix_end(authoritative_start) else {
+        return Vec::new();
+    };
+    let prefix_end = first_owned_timestamp.min(lifecycle_prefix_end);
 
     // Canonical rows should already be unique by timestamp.  If a malformed
     // legacy alias supplies conflicting percentages for one minute, omit that
@@ -2790,7 +2816,7 @@ fn quota_only_history_projection_samples(
             continue;
         };
         if row.timestamp < authoritative_start
-            || row.timestamp >= first_owned_timestamp
+            || row.timestamp >= prefix_end
             || row.timestamp > observed_at
             || row.reset_at.abs_diff(authority) > RESET_AT_TOLERANCE_SECONDS as u64
             || intervals.intersects_canonical_minute(row.timestamp)
@@ -3816,6 +3842,7 @@ fn read_model_projection_for_intervals(
     intervals: &ReadIntervals,
     current_reset_at: Option<i64>,
     window_seconds: i64,
+    history_is_canonical: bool,
 ) -> Result<ModelProjection, ReaderError> {
     // An unbounded partition reader still needs the same current quota
     // authority as a lifecycle-bounded reader.  The timestamp-less session
@@ -3823,7 +3850,15 @@ fn read_model_projection_for_intervals(
     // used only when no current quota authority is available.
     let current_scope = current_reset_at.filter(|reset_at| intervals.contains(*reset_at));
     if intervals.is_unbounded() && current_scope.is_none() {
-        return read_model_projection(connection);
+        return if history_is_canonical {
+            // A canonical partition without a validated current quota
+            // authority cannot prove ownership of timestamp-less session
+            // totals.  Keep the model projection empty instead of reviving
+            // values from a different account epoch.
+            Ok(ModelProjection::default())
+        } else {
+            read_model_projection(connection)
+        };
     }
     if let Some(authority) = current_scope {
         if quota_period_start(authority, window_seconds).is_none() {
@@ -4912,6 +4947,45 @@ mod tests {
     }
 
     #[test]
+    fn external_quota_prefix_stops_before_lifecycle_gap() {
+        let reset_at = 1_800_001_000_i64;
+        let window_seconds = 86_400_i64;
+        let quota_start = quota_period_start(reset_at, window_seconds).expect("quota start");
+        let intervals = ReadIntervals::new(vec![
+            ReadInterval::new(Some(quota_start - 600), Some(quota_start + 600))
+                .expect("first lifecycle interval"),
+            ReadInterval::new(Some(quota_start + 1_200), None).expect("current lifecycle interval"),
+        ])
+        .expect("disjoint lifecycle intervals");
+        let sample = |timestamp: i64, remaining_percent: f64| RawSample {
+            timestamp,
+            reset_at,
+            remaining_percent: Some(remaining_percent),
+            sol_dollars: 99.0,
+            terra_dollars: 88.0,
+            luna_dollars: 77.0,
+            sol_tokens: 99,
+            terra_tokens: 88,
+            luna_tokens: 77,
+        };
+        let all_history = vec![
+            sample(quota_start + 900, 40.0),
+            sample(quota_start + 1_200, 30.0),
+        ];
+        let owned_history = vec![sample(quota_start + 1_200, 30.0)];
+
+        let projected = quota_only_history_projection_samples(
+            &all_history,
+            &owned_history,
+            Some(reset_at),
+            window_seconds,
+            quota_start + 1_200,
+            &intervals,
+        );
+        assert!(projected.is_empty());
+    }
+
+    #[test]
     fn subminute_account_activation_keeps_exact_rows_in_a_valid_minute_projection() {
         let path = temp_db("subminute-lifecycle-boundary");
         let boundary = 1_800_000_017_i64;
@@ -5384,6 +5458,7 @@ mod tests {
             &intervals,
             Some(reset_at),
             window_seconds,
+            false,
         )
         .expect("prefix-only projection");
         assert!(prefix_only.v1.is_empty());
@@ -5395,13 +5470,14 @@ mod tests {
             &intervals,
             Some(reset_at),
             window_seconds,
+            false,
         )
         .expect("current projection");
         assert_eq!(current.v3.len(), 1);
         assert_eq!(current.v3[0].model, "SOL");
         assert_eq!(current.v3[0].total_tokens, 12);
         let invalid_window =
-            read_model_projection_for_intervals(&connection, &intervals, Some(reset_at), 0)
+            read_model_projection_for_intervals(&connection, &intervals, Some(reset_at), 0, false)
                 .expect("invalid-window projection");
         assert!(invalid_window.v1.is_empty());
         assert!(invalid_window.v3.is_empty());
@@ -5424,10 +5500,16 @@ mod tests {
             &intervals,
             Some(reset_at),
             window_seconds,
+            false,
         )
         .expect("unscoped projection");
         assert!(unscoped.v1.is_empty());
         assert!(unscoped.v3.is_empty());
+        let canonical_without_authority =
+            read_model_projection_for_intervals(&session_connection, &intervals, None, 0, true)
+                .expect("canonical authority fail-closed projection");
+        assert!(canonical_without_authority.v1.is_empty());
+        assert!(canonical_without_authority.v3.is_empty());
         fs::remove_file(session_path).expect("cleanup timestamp-less fixture");
     }
 
