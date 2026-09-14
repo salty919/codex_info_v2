@@ -398,7 +398,7 @@ public sealed class GraphPlotControlTests
                 ModelsComplete = true,
                 ModelSamples =
                 [
-                    new ApiHistoryModelSample("ASTRA", 1, 0, 0, 10) { CacheWriteInputTokens = 0, TotalTokens = 1 },
+                    new ApiHistoryModelSample("ASTRA", 1_000_000, 200_000, 100_000, null) { CacheWriteInputTokens = 100_000, TotalTokens = 1_100_000 },
                     new ApiHistoryModelSample("LUNA", 1, 0, 0, 1) { CacheWriteInputTokens = 0, TotalTokens = 1 },
                 ],
             },
@@ -409,7 +409,7 @@ public sealed class GraphPlotControlTests
                 ModelsComplete = true,
                 ModelSamples =
                 [
-                    new ApiHistoryModelSample("ASTRA", 2, 0, 0, 20) { CacheWriteInputTokens = 0, TotalTokens = 2 },
+                    new ApiHistoryModelSample("ASTRA", 2_000_000, 400_000, 200_000, null) { CacheWriteInputTokens = 200_000, TotalTokens = 2_200_000 },
                     new ApiHistoryModelSample("LUNA", 2, 0, 0, 2) { CacheWriteInputTokens = 0, TotalTokens = 2 },
                     new ApiHistoryModelSample("SOL", 3, 0, 0, 3) { CacheWriteInputTokens = 0, TotalTokens = 3 },
                 ],
@@ -421,7 +421,7 @@ public sealed class GraphPlotControlTests
                 ModelsComplete = true,
                 ModelSamples =
                 [
-                    new ApiHistoryModelSample("ASTRA", 3, 0, 0, 30) { CacheWriteInputTokens = 0, TotalTokens = 3 },
+                    new ApiHistoryModelSample("ASTRA", 3_000_000, 600_000, 300_000, null) { CacheWriteInputTokens = 300_000, TotalTokens = 3_300_000 },
                     new ApiHistoryModelSample("LUNA", 2, 0, 0, 2) { CacheWriteInputTokens = 0, TotalTokens = 2 },
                     new ApiHistoryModelSample("SOL", 4, 0, 0, 4) { CacheWriteInputTokens = 0, TotalTokens = 4 },
                 ],
@@ -433,13 +433,13 @@ public sealed class GraphPlotControlTests
         var luna = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
         var sol = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
 
-        Assert.Equal([10d, 20d, 30d], scene.Astra);
-        Assert.Equal([10d, 20d, 30d], scene.ModelSeries["ASTRA"]);
+        Assert.Equal([13.45d, 26.9d, 40.35d], scene.Astra);
+        Assert.Equal([13.45d, 26.9d, 40.35d], scene.ModelSeries["ASTRA"]);
         Assert.Equal([1d, 2d, 2d], scene.Luna);
         Assert.True(double.IsNaN(scene.Sol[0]));
         Assert.Equal([3d, 4d], scene.Sol.Skip(1));
         Assert.Equal([1_000d, 1_060d, 1_120d], astra.Rising.X);
-        Assert.Equal([10d, 20d, 30d], astra.Rising.Y);
+        Assert.Equal([13.45d, 26.9d, 40.35d], astra.Rising.Y);
         Assert.Empty(astra.Dashed.X);
         Assert.Equal([1_000d, 1_060d], luna.Rising.X);
         Assert.Equal([1_060d, 1_120d], luna.Flat.X);

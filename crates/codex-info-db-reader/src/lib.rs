@@ -3591,9 +3591,10 @@ fn read_model_projection(connection: &Connection) -> Result<ModelProjection, Rea
 /// `session_model_totals` is intentionally not used here: it has no timestamp
 /// and therefore cannot prove that its current values belong to the selected
 /// account interval.  The history sidecar is the only source that can bind the
-/// model projection to the same time domain as usage samples.  For each model,
-/// the newest valid row inside the union is selected, so A→B→A keeps the later
-/// A interval visible while excluding the B interval in between.
+/// model projection to the same time domain as usage samples. The projection
+/// is one latest complete timestamp group inside the union; combining each
+/// model's independent latest row would retain a stale model after it vanished
+/// from a later complete observation.
 fn read_model_projection_for_intervals(
     connection: &Connection,
     intervals: &ReadIntervals,
@@ -3611,44 +3612,66 @@ fn read_model_projection_for_intervals(
     )?;
     let query = if has_cache_write {
         "SELECT reset_at, timestamp, model, total_tokens, input_tokens,
-                cached_input_tokens, output_tokens, cache_write_input_tokens
+                cached_input_tokens, output_tokens, cache_write_input_tokens,
+                model_set_complete
          FROM usage_model_history ORDER BY timestamp DESC, reset_at DESC, model ASC"
     } else {
         "SELECT reset_at, timestamp, model, total_tokens, input_tokens,
-                cached_input_tokens, output_tokens
+                cached_input_tokens, output_tokens, model_set_complete
          FROM usage_model_history ORDER BY timestamp DESC, reset_at DESC, model ASC"
     };
     let mut statement = connection.prepare(query)?;
     let mut rows = statement.query([])?;
-    let mut selected = BTreeMap::<String, RawModelTotal>::new();
+    let mut group_key = None;
+    let mut group_complete = true;
+    let mut group = BTreeMap::<String, RawModelTotal>::new();
     while let Some(row) = rows.next()? {
+        let Some(reset_at) = sql_i64(row, 0) else {
+            continue;
+        };
         let Some(timestamp) = sql_i64(row, 1) else {
             continue;
         };
         if !intervals.intersects_canonical_minute(timestamp) {
             continue;
         }
-        let Some(model) = sql_text(row, 2) else {
-            continue;
-        };
-        if selected.contains_key(&model) {
+        let key = (timestamp, reset_at);
+        if group_key.is_some_and(|current| current != key) {
+            if group_complete && !group.is_empty() {
+                return Ok(project_model_totals(group.into_values()));
+            }
+            group.clear();
+            group_complete = true;
+        }
+        group_key = Some(key);
+        let complete_index = if has_cache_write { 8 } else { 7 };
+        if sql_i64(row, complete_index) != Some(1) {
+            group_complete = false;
             continue;
         }
+        let Some(model) = sql_text(row, 2) else {
+            group_complete = false;
+            continue;
+        };
         let Some(total_tokens) = sql_text(row, 3).and_then(|value| value.parse::<u64>().ok())
         else {
+            group_complete = false;
             continue;
         };
         let Some(input_tokens) = sql_text(row, 4).and_then(|value| value.parse::<u64>().ok())
         else {
+            group_complete = false;
             continue;
         };
         let Some(cached_input_tokens) =
             sql_text(row, 5).and_then(|value| value.parse::<u64>().ok())
         else {
+            group_complete = false;
             continue;
         };
         let Some(output_tokens) = sql_text(row, 6).and_then(|value| value.parse::<u64>().ok())
         else {
+            group_complete = false;
             continue;
         };
         let cache_write_input_tokens = if has_cache_write {
@@ -3658,13 +3681,18 @@ fn read_model_projection_for_intervals(
                 None => None,
             };
             let Some(parsed) = parsed else {
+                group_complete = false;
                 continue;
             };
             parsed
         } else {
             None
         };
-        selected.insert(
+        if group.contains_key(&model) {
+            group_complete = false;
+            continue;
+        }
+        group.insert(
             model.clone(),
             RawModelTotal {
                 model,
@@ -3676,7 +3704,10 @@ fn read_model_projection_for_intervals(
             },
         );
     }
-    Ok(project_model_totals(selected.into_values()))
+    if group_complete {
+        return Ok(project_model_totals(group.into_values()));
+    }
+    Ok(ModelProjection::default())
 }
 
 impl ReadIntervals {
@@ -4075,6 +4106,12 @@ mod tests {
                 )
                 .expect("boundary model row");
         }
+        connection
+            .execute(
+                "INSERT INTO usage_model_history VALUES(?1,?2,'UNATTRIBUTED','5','5','0','0',NULL,1)",
+                params![reset_at, boundary - 60],
+            )
+            .expect("stale unattributed model row");
     }
 
     fn add_active_thread_table(path: &Path, json: &str, degraded: i64) {
@@ -4536,6 +4573,10 @@ mod tests {
             .iter()
             .all(|period| { period.start_at >= boundary && period.end_at >= boundary }));
         assert_eq!(current.models_v3[0].total_tokens, 30);
+        assert!(current
+            .models_v3
+            .iter()
+            .all(|model| model.model != "UNATTRIBUTED"));
         assert_ne!(old.data_hash, current.data_hash);
 
         // A→B→A is represented as a union, not as one stale upper-bound

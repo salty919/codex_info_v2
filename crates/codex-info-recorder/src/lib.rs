@@ -13,8 +13,8 @@ use codex_info_db_writer::{
     classify_quota_transition, finalize_session_timeline_recovery, ActiveThreadRecord,
     ActiveThreadSnapshot, PreviousQuotaState, QuotaCandidate, QuotaTransition,
     RecordedSessionSource, SessionCheckpoint, SessionCollectionCommit, SessionCollectionState,
-    SessionEvent, SessionModelTotal, SessionPendingRange, SessionRange, SessionTaskEvent,
-    SessionTaskEvidenceInput, SessionTaskIndexedRange, SessionTimelineRecovery,
+    SessionEvent, SessionEventReattribution, SessionModelTotal, SessionPendingRange, SessionRange,
+    SessionTaskEvent, SessionTaskEvidenceInput, SessionTaskIndexedRange, SessionTimelineRecovery,
     SessionTimelineRecoveryPoint, StoragePartitionIdentity, UsageHistoryObservation,
     UsageHistorySample, UsageStore, UsageStoreError,
 };
@@ -3013,6 +3013,14 @@ impl Recorder {
         } else {
             UsageStore::create_partitioned(&database, identity)?
         };
+        if existing_database {
+            if let Ok(inventory) = discover_sources(&config.sessions_root) {
+                let corrections = prove_unattributed_event_models(&writer, &inventory.sources)?;
+                if !corrections.is_empty() {
+                    writer.reattribute_unattributed_session_events(&corrections)?;
+                }
+            }
+        }
         writer.prune_older_than_three_months(Utc::now())?;
         Ok(Self {
             config,
@@ -4137,6 +4145,7 @@ fn scan_source(
         // next cycle.
         let boundary_offset = snapshot_len;
         let discard_until_lf = session_file_has_partial_tail(&source.path, boundary_offset)?;
+        let last_model = model_context_before_boundary(&mut file, boundary_offset)?;
         let (prefix_generation, prefix_sha256) =
             session_boundary_lineage(collector_epoch, &source.recorded, prior, boundary_offset);
         (
@@ -4145,7 +4154,7 @@ fn scan_source(
             false,
             false,
             false,
-            None,
+            last_model,
             None,
             TokenSnapshot::default(),
             prefix_generation,
@@ -4638,6 +4647,222 @@ fn scan_source(
         changed,
         consumed_bytes,
     }))
+}
+
+fn previous_line_feed(file: &mut File, before: u64) -> Result<Option<u64>, RecorderError> {
+    const BLOCK_BYTES: usize = 64 * 1024;
+    let mut end = before;
+    let mut buffer = vec![0_u8; BLOCK_BYTES];
+    while end > 0 {
+        let start = end.saturating_sub(BLOCK_BYTES as u64);
+        let length = usize::try_from(end - start)
+            .map_err(|_| RecorderError::Invalid("session line range is invalid".to_owned()))?;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer[..length])?;
+        if let Some(index) = buffer[..length].iter().rposition(|byte| *byte == b'\n') {
+            return Ok(Some(start + index as u64));
+        }
+        end = start;
+    }
+    Ok(None)
+}
+
+fn model_context_before_boundary(
+    file: &mut File,
+    boundary: u64,
+) -> Result<Option<String>, RecorderError> {
+    const BLOCK_BYTES: usize = 64 * 1024;
+    const CONTEXT_MARKERS: [&[u8]; 3] = [
+        b"turn_context",
+        b"thread_context",
+        b"thread_settings_applied",
+    ];
+    if boundary == 0 {
+        return Ok(None);
+    }
+
+    file.seek(SeekFrom::Start(boundary - 1))?;
+    let mut final_byte = [0_u8; 1];
+    file.read_exact(&mut final_byte)?;
+    let complete_end = if final_byte[0] == b'\n' {
+        boundary
+    } else {
+        previous_line_feed(file, boundary)?.map_or(0, |offset| offset + 1)
+    };
+    let overlap = CONTEXT_MARKERS
+        .iter()
+        .map(|marker| marker.len())
+        .max()
+        .unwrap_or(1)
+        - 1;
+    let mut scan_end = complete_end;
+    let mut buffer = vec![0_u8; BLOCK_BYTES + overlap];
+    let mut initial_settings_model = None;
+    let mut parsed_line_start = None;
+    while scan_end > 0 {
+        let start = scan_end.saturating_sub(BLOCK_BYTES as u64);
+        let read_end = complete_end.min(scan_end.saturating_add(overlap as u64));
+        let length = usize::try_from(read_end - start)
+            .map_err(|_| RecorderError::Invalid("session context range is invalid".to_owned()))?;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer[..length])?;
+        let candidate_limit = usize::try_from(scan_end - start)
+            .map_err(|_| RecorderError::Invalid("session context range is invalid".to_owned()))?;
+        for index in (0..candidate_limit).rev() {
+            if !CONTEXT_MARKERS.iter().any(|marker| {
+                buffer
+                    .get(index..index.saturating_add(marker.len()))
+                    .is_some_and(|candidate| candidate == *marker)
+            }) {
+                continue;
+            }
+            let candidate_at = start + index as u64;
+            let line_start = previous_line_feed(file, candidate_at)?.map_or(0, |offset| offset + 1);
+            if parsed_line_start == Some(line_start) {
+                continue;
+            }
+            parsed_line_start = Some(line_start);
+            file.seek(SeekFrom::Start(line_start))?;
+            let record = {
+                let mut reader = BufReader::new((&mut *file).take(complete_end - line_start));
+                read_streaming_record(&mut reader)?
+            };
+            if let RecordRead::Present(summary, _) = record {
+                match summary.event_type() {
+                    Some("turn_context" | "thread_context") => {
+                        if let Some(model) = summary
+                            .event_model()
+                            .and_then(ModelTotals::checkpoint_model)
+                        {
+                            return Ok(Some(model));
+                        }
+                    }
+                    Some("thread_settings_applied") => {
+                        if let Some(model) = summary
+                            .event_model()
+                            .and_then(ModelTotals::checkpoint_model)
+                        {
+                            // Forward parsing accepts settings only before a
+                            // turn/thread context. Walking backward therefore
+                            // retains the earliest valid settings candidate.
+                            initial_settings_model = Some(model);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        scan_end = start;
+    }
+    Ok(initial_settings_model)
+}
+
+fn range_contains_model_context(
+    file: &mut File,
+    start: u64,
+    end: u64,
+) -> Result<bool, RecorderError> {
+    file.seek(SeekFrom::Start(start))?;
+    let mut reader = BufReader::new((&mut *file).take(end - start));
+    let mut consumed = 0_u64;
+    while consumed < end - start {
+        match read_streaming_record(&mut reader)? {
+            RecordRead::Present(summary, bytes) => {
+                consumed = consumed.checked_add(bytes).ok_or_else(|| {
+                    RecorderError::Invalid("session repair range overflow".to_owned())
+                })?;
+                if matches!(
+                    summary.event_type(),
+                    Some("turn_context" | "thread_context" | "thread_settings_applied")
+                ) && summary.event_model().is_some()
+                {
+                    return Ok(true);
+                }
+            }
+            RecordRead::Invalid(bytes, true) => {
+                consumed = consumed.checked_add(bytes).ok_or_else(|| {
+                    RecorderError::Invalid("session repair range overflow".to_owned())
+                })?;
+            }
+            RecordRead::End if consumed == end - start => break,
+            RecordRead::End | RecordRead::Invalid(_, false) | RecordRead::Unterminated(_) => {
+                return Err(RecorderError::Invalid(
+                    "session repair range framing changed".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[allow(clippy::type_complexity)]
+fn prove_unattributed_event_models(
+    writer: &UsageStore,
+    sources: &[Source],
+) -> Result<Vec<SessionEventReattribution>, RecorderError> {
+    let unattributed = writer
+        .load_session_events()?
+        .into_iter()
+        .filter(|event| event.model == UNATTRIBUTED_MODEL)
+        .collect::<Vec<_>>();
+    if unattributed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut groups =
+        BTreeMap::<(String, String, u64, u64, u128, u64, u64, String), Vec<SessionEvent>>::new();
+    for event in unattributed {
+        groups
+            .entry((
+                event.root_identity.clone(),
+                event.relative_path.clone(),
+                event.file_device,
+                event.file_inode,
+                event.prefix_generation,
+                event.range_start,
+                event.range_end,
+                event.record_sha256.clone(),
+            ))
+            .or_default()
+            .push(event);
+    }
+
+    let mut corrections = Vec::new();
+    for ((root, relative, device, inode, _, start, end, expected_sha), events) in groups {
+        let Some(source) = sources.iter().find(|source| {
+            source.recorded.root_identity == root
+                && source.recorded.relative_path == relative
+                && source.recorded.file_device == device
+                && source.recorded.file_inode == inode
+        }) else {
+            return Ok(Vec::new());
+        };
+        if start >= end
+            || end > source.recorded.file_bytes
+            || sha256_file_range(&source.path, start, end)? != expected_sha
+        {
+            return Ok(Vec::new());
+        }
+        let before = fs::metadata(&source.path)?;
+        let mut file = File::open(&source.path)?;
+        let model = model_context_before_boundary(&mut file, start)?;
+        let corrected_model = ModelTotals::usage_model(model.as_deref());
+        if corrected_model == UNATTRIBUTED_MODEL
+            || range_contains_model_context(&mut file, start, end)?
+            || sha256_file_range(&source.path, start, end)? != expected_sha
+        {
+            return Ok(Vec::new());
+        }
+        let after = fs::metadata(&source.path)?;
+        if !same_file_identity(&before, &after) || after.len() < end {
+            return Ok(Vec::new());
+        }
+        corrections.extend(events.into_iter().map(|event| SessionEventReattribution {
+            event,
+            corrected_model: corrected_model.clone(),
+        }));
+    }
+    Ok(corrections)
 }
 
 fn build_task_backfill_targets(
@@ -7846,7 +8071,8 @@ mod tests {
         let source = root.join("sessions/one.jsonl");
         let now = Utc::now().timestamp();
         let existing = format!(
-            "{}{}{}",
+            "{}\n{}{}{}",
+            json!({"type":"thread_context","model":"gpt-5.6-sol"}),
             task_event("task_started", now - 2),
             token(10, now - 1),
             token(15, now)
@@ -7890,10 +8116,96 @@ mod tests {
             .write_all(format!("{}{}", token(20, now + 1), token(25, now + 2)).as_bytes())
             .unwrap();
         recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(recorder.model_totals().unwrap()["SOL"].total, 5);
+        assert!(!recorder
+            .model_totals()
+            .unwrap()
+            .contains_key(UNATTRIBUTED_MODEL));
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(
+                format!(
+                    "{}\n{}{}",
+                    json!({"type":"turn_context","model":"gpt-5.6-luna"}),
+                    token(30, now + 3),
+                    token(35, now + 4)
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        assert_eq!(recorder.model_totals().unwrap()["SOL"].total, 5);
+        assert_eq!(recorder.model_totals().unwrap()["LUNA"].total, 10);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exact_unattributed_boundary_events_are_repaired_once_from_unchanged_source() {
+        let (root, database) = prepare("account-boundary-model-repair");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        fs::write(
+            &source,
+            format!(
+                "{}\n{}{}",
+                json!({"type":"thread_context","model":"gpt-5.6-sol"}),
+                token(10, now - 1),
+                token(15, now)
+            ),
+        )
+        .unwrap();
+        let mut recorder = Recorder::open_partitioned_with_activation(
+            config(&root, 4096),
+            &database,
+            &identity(),
+            Some(now),
+        )
+        .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        drop(recorder);
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute("UPDATE session_checkpoints SET last_model=NULL", [])
+            .unwrap();
+        drop(connection);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{}{}", token(20, now + 1), token(25, now + 2)).as_bytes())
+            .unwrap();
+
+        let mut old_behavior =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        old_behavior.run_cycle().unwrap().unwrap();
         assert_eq!(
-            recorder.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            old_behavior.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
             5
         );
+        drop(old_behavior);
+
+        let repaired =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        let repaired_generation = repaired.generation().unwrap();
+        let totals = repaired.model_totals().unwrap();
+        assert_eq!(totals["SOL"].total, 5);
+        assert!(!totals.contains_key(UNATTRIBUTED_MODEL));
+        assert!(repaired
+            .writer
+            .load_session_events()
+            .unwrap()
+            .iter()
+            .all(|event| event.model == "SOL"));
+        drop(repaired);
+
+        let reopened =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        assert_eq!(reopened.generation().unwrap(), repaired_generation);
+        assert_eq!(reopened.model_totals().unwrap()["SOL"].total, 5);
         let _ = fs::remove_dir_all(root);
     }
 

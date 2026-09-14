@@ -1559,9 +1559,27 @@ public sealed class GraphScene
     {
         if (metric == GraphMetric.Dollars)
         {
-            // A missing wire dollar is missing evidence. Token-derived price
-            // reconstruction belongs to the recorder, not this renderer.
-            return FiniteNonNegative(model.TotalDollars);
+            if (model.TotalDollars is not null)
+            {
+                return FiniteNonNegative(model.TotalDollars);
+            }
+
+            // ASTRA-COST-01 explicitly assigns this presentation-only
+            // calculation to the UI. The REST/DB value stays absent, and any
+            // missing or inconsistent component remains missing here too.
+            if (model.Name == "ASTRA" &&
+                model.InputTokens is ulong input &&
+                model.CachedInputTokens is ulong cached &&
+                model.CacheWriteInputTokens is ulong writes &&
+                model.OutputTokens is ulong output &&
+                cached <= input && writes <= input - cached)
+            {
+                var ordinary = input - cached - writes;
+                return (ordinary * 10.0 + cached * 1.0 + writes * 12.5 + output * 50.0) /
+                    1_000_000.0;
+            }
+
+            return double.NaN;
         }
 
         return model.TotalTokens is ulong tokens ? tokens : double.NaN;
