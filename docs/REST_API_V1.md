@@ -316,7 +316,7 @@ exact `v2`とする。`history_samples`の各rowはv1の9キーに`model_source`
 | `confirmed` | 全て非null | 同じmodel keyの直接観測とatomic commitを持つ。集計・idle判定の根拠になれる |
 | `reconstructed-from-session` | 全てnull | sessionからの復元であり、model key/sourceと欠損metadataだけを返す。モデル線・集計・idle判定には使わない |
 | `unknown` | 全てnull | 観測不明。model key/sourceと欠損metadataだけを返し、数値を推測しない |
-| `unavailable` | 全てnull | そのtimestampのlocal model値は未取得。freshな`remaining_percent`だけを保持でき、model数値は返さない |
+| `unavailable` | 全てnull | そのtimestampのlocal model値は未取得。freshな`remaining_percent`だけを保持でき、model数値は返さない。現行quota windowの先頭から最初のlocally-owned observationまでの未帰属provider観測もこのsourceで公開する |
 | `legacy-unknown` | 全て非null | provenance導入前またはv1 fallbackの保存済み同じmodel keyの値。表示投影だけに使い、集計・予測・idle判定には使わない |
 
 `confirmed`/`legacy-unknown`でmodel 6値の一部だけがnull、または`reconstructed-from-session`/`unknown`/`unavailable`で
