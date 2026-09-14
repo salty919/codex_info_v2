@@ -116,6 +116,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 - canonical ChatGPT account identityは、owner-onlyかつstableに読めた`CODEX_HOME/auth.json`のexact `tokens.account_id`と前後2回の`account/read`、その間の`account/updated`世代不変で確定する。emailを保存scopeや認証authorityへ使わず、raw AccountKeyとtokenをpath、DB、metadata、log、RESTへ保存しない。前後の同一`account/read`で確認した1..254 Unicode scalar、trim済み・control文字なしのlogin IDだけは表示専用値としてowner-only account registryと当該account DBの`storage_partition.login_id`へ保存し、loopback限定`GET /v3/accounts`のnullable `login_id`として返せる。login IDをpath、partition ID、hint、journal、診断logへ入れず、欠落しても記録を停止しない。
 - 保存単位を`(OS user, ProfileScopeId, AccountScopeId, StorageEpoch)`とし、accountごとに`history/accounts/v1/<AccountScopeId>/epoch-<StorageEpoch>/usage_history.sqlite3`へ物理分離する。同一accountへの再切替は同じStorageEpoch/DBを再利用し、別accountのrow、writer lock、backup、Session checkpoint/marker/gapを混合しない。新規書込みは現在認証済みaccountだけ、保持済み履歴の読出しは明示選択した一つのaccountだけとする。
 - account lifecycleが`A→B→A`のように分割される場合、Session eventはregistryの全half-open intervalで所属判定し、writerだけが現在periodの累積model totalsと可視historyを再計算する。`all events`と`owned events`が一致しないうえ保存値が`all events`と完全一致する場合だけ、verified SQLite backup後に補正する。不一致・不足・不明は補正せず停止し、別accountのSession値をUI/readerで減算しない。
+- 同じ物理Session JSONLの重複`prefix_generation`がaccount切替・再起動で検出された場合、重複するsource identity、byte range、token recordは一つの物理証拠へcanonicalizeし、重複event rowを保存しない。既存の重複rowはverified backup後のwriter repairで削除し、累積model totals、history、graphへ二重加算しない。source identity・payload・byte rangeが一致せず一意に重複と確定できない場合は正常データを削除せず`unattributed`として保持する。
 - logout、account切替、identity/metadata/DB検証失敗では旧accountのdurable dataとSession sourceを保持し、current公開rootだけをstrict emptyの`auth_required`、`initializing`、または`error`へ切り替える。旧account DBへのfallbackと自動migrationを行わない。
 - account partitionの旧`reset_at` aliasと既知の`-1` quota sentinelは、DATA owner `HISTORY-CANONICAL-134`の検証済みbackup後migrationで`usage_history`単一正本へ置換する。既存model/provenance sidecarは`HistoryCanonicalizer`が実際に採用したraw usage rowのexact旧キーに結び付くものだけを同じcanonical keyへ再所属し、捨てたaliasのsidecarを比較選択・混合・補間しない。現在・過去accountへ同じmigration/write契約を適用し、稼働DBにraw/canonical並列表、revision同期、reader/UI補償を残さない。同一period内でquotaまたはvectorを一意化できない局所minuteは値を作らずlive集合から除外し、period ownerまたはcycle境界不明時だけpartition全体を無変更としてverified backupとlast-good publicationを保持する。
 - migration、restore、updateはcandidateを完全検証してからatomic switchする。検証またはswitch失敗時は旧世代だけをcurrentとして保持する。
@@ -296,6 +297,12 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 aliasを返していても現行periodへcanonicalizeする。rawのsource reset/timestampはprovenanceとして保持し、
 同一minuteの相反値は値を合成せず除外する。現行period外およびcompleted periodは従来のcanonical
 reset authorityを使い、account lifecycleや外部利用を推測してmodel数値を付け替えない。
+現行periodの先頭から最初のlocally-owned observationまでに保存された`remaining_percent`は、accountがその区間の
+Session/modelを所有した証拠がない場合でもprovider-levelの未帰属quota観測として履歴へ保持する。該当rowは
+`model_source=unavailable`、model数値なしで公開し、GraphのRemainingだけを破線の参考線として描画する。
+quota-window開始時点より前に終了したlifecycle intervalはこのprefixを隠さず、`A→B→A`の再入場でも再入場直前までを
+表示対象とする。一方、lifecycle intervalがquota-window開始を所有する場合、または再入場境界を一意に決められない場合は
+fail-closedでprefixを推測しない。未帰属quotaを特定modelの消費へ付け替えたり、model 0へ補完したりしない。
 
 1. `G137-1`: 選択期間の全accepted pageに実際に掲載された`models[].model`の和集合を
    model universe `U`とする。model名はexact wire stringをUTF-8 unsigned byte列の

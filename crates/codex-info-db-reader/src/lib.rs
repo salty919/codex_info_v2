@@ -218,28 +218,24 @@ impl ReadIntervals {
     /// Return the first lifecycle boundary inside a quota window.  A leading
     /// quota-only prefix is a provider-level observation: it may precede this
     /// account's first local Session observation, but it must stop exactly at
-    /// that activation.  If this account was already active at the quota
-    /// boundary, if an earlier lifecycle interval ended before the quota
-    /// boundary, or if the first interval is unbounded, there is no safe
-    /// external prefix.  An earlier interval means that a later activation
-    /// could be an A→B→A re-entry rather than this account's first ownership
-    /// in the quota window, so fail closed instead of attributing the gap.
+    /// that activation.  An interval which ended before the quota boundary is
+    /// outside the requested provider window and must not suppress the prefix:
+    /// an A→B→A account switch still leaves a valid, unattributed provider
+    /// history between the boundary and the current activation.  An account
+    /// that owns the boundary itself, or an unbounded interval covering it,
+    /// has no safe external prefix.
     fn quota_only_prefix_end(&self, quota_start: i64) -> Option<i64> {
-        if self
-            .0
-            .iter()
-            .any(|interval| interval.end_at.is_some_and(|end| end <= quota_start))
-        {
-            return None;
-        }
-
         let mut first_start = None;
         for interval in &self.0 {
-            let start = interval.start_at?;
-            if start <= quota_start {
+            let starts_before_or_at_boundary =
+                interval.start_at.is_none_or(|start| start <= quota_start);
+            let reaches_boundary = interval.end_at.is_none_or(|end| end > quota_start);
+            if starts_before_or_at_boundary && reaches_boundary {
                 return None;
             }
-            first_start = Some(first_start.map_or(start, |current: i64| current.min(start)));
+            if let Some(start) = interval.start_at.filter(|start| *start > quota_start) {
+                first_start = Some(first_start.map_or(start, |current: i64| current.min(start)));
+            }
         }
         first_start
     }
@@ -2899,9 +2895,12 @@ fn normalize_current_period_samples(
 /// client) consumed the same provider quota.  Those rows are not local
 /// Session/model evidence and must not be attributed to the current account.
 /// They are nevertheless useful for the Remaining line, so expose their
-/// actual recorded percentage with an unavailable model source.  The leading
-/// prefix rule is intentional: a later A→B→A lifecycle gap is not treated as
-/// an external prefix merely because it is outside the current interval.
+/// actual recorded percentage with an unavailable model source.  A lifecycle
+/// interval that ended at or before the current quota-window start is outside
+/// this provider window and does not suppress the prefix: a later A→B→A
+/// re-entry still exposes the provider-level observations up to re-entry.
+/// An interval that owns the quota-window start remains fail-closed because it
+/// cannot be distinguished from locally-owned history.
 fn quota_only_history_projection_samples(
     all_history: &[RawSample],
     owned_history: &[RawSample],
@@ -5135,6 +5134,67 @@ mod tests {
     }
 
     #[test]
+    fn canonical_reader_keeps_quota_prefix_after_account_reentry() {
+        let path = temp_db("external-quota-prefix-reentry");
+        let boundary = 1_800_000_000_i64;
+        make_boundary_db(&path, boundary);
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".to_owned(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 13,
+            partition_id: "33".repeat(32),
+        };
+        add_partition_identity(&path, &identity);
+        let quota_start =
+            quota_period_start(boundary + 3_600, 86_400).expect("quota-window boundary");
+        let intervals = ReadIntervals::new(vec![
+            ReadInterval::new(None, Some(quota_start)).expect("previous account interval"),
+            ReadInterval::new(Some(boundary + 60), None).expect("re-entry interval"),
+        ])
+        .expect("A-to-B-to-A lifecycle domain");
+
+        let snapshot = DbReader::open_partitioned_with_intervals(&path, &identity, intervals)
+            .expect("bounded partition reader")
+            .read_snapshot()
+            .expect("external quota prefix snapshot");
+
+        let prefix = snapshot
+            .history_samples_v3
+            .iter()
+            .filter(|sample| sample.timestamp < boundary + 60)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prefix
+                .iter()
+                .map(|sample| sample.timestamp)
+                .collect::<Vec<_>>(),
+            vec![boundary - 60, boundary]
+        );
+        assert_eq!(
+            prefix
+                .iter()
+                .map(|sample| sample.remaining_percent)
+                .collect::<Vec<_>>(),
+            vec![Some(80.0), Some(70.0)]
+        );
+        assert!(prefix.iter().all(|sample| {
+            sample.model_source == "unavailable"
+                && !sample.models_complete
+                && sample.models.is_none()
+        }));
+        assert_eq!(snapshot.history_samples_v3.len(), 3);
+        assert_eq!(snapshot.details.history_samples.len(), 1);
+        assert!(snapshot
+            .details
+            .history_periods
+            .iter()
+            .all(|period| period.start_at == quota_start));
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
     fn external_quota_prefix_stops_before_lifecycle_gap() {
         let reset_at = 1_800_001_000_i64;
         let window_seconds = 86_400_i64;
@@ -5174,7 +5234,7 @@ mod tests {
     }
 
     #[test]
-    fn external_quota_prefix_rejects_reentry_after_pre_boundary_interval() {
+    fn external_quota_prefix_survives_reentry_after_pre_boundary_interval() {
         let reset_at = 1_800_001_000_i64;
         let window_seconds = 86_400_i64;
         let quota_start = quota_period_start(reset_at, window_seconds).expect("quota start");
@@ -5209,7 +5269,9 @@ mod tests {
             quota_start + 200,
             &intervals,
         );
-        assert!(projected.is_empty());
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].timestamp, quota_start + 100);
+        assert_eq!(projected[0].remaining_percent, Some(40.0));
     }
 
     #[test]
