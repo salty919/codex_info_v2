@@ -10348,11 +10348,12 @@ impl UsageStore {
         )?;
 
         for (mut sample, sidecar) in history {
+            let minute_end = sample.timestamp.saturating_add(59);
             let prefix = sum_session_events(
                 owned_events
                     .iter()
                     .copied()
-                    .filter(|event| event.timestamp <= sample.timestamp),
+                    .filter(|event| event.timestamp <= minute_end),
             )?;
             let (sol_dollars, terra_dollars, luna_dollars, sol_tokens, terra_tokens, luna_tokens) =
                 session_totals_history_values(&prefix);
