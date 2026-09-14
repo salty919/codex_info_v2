@@ -442,8 +442,9 @@ impl DbReader {
         );
         let has_pending_ranges = read_pending_ranges(&transaction)? || acquisition_degraded;
         let history_is_canonical = self.expected_partition_identity.is_some();
-        let raw = read_history(&transaction, history_is_canonical)?
-            .into_iter()
+        let all_history = read_history(&transaction, history_is_canonical)?;
+        let raw = all_history
+            .iter()
             .filter(|row| {
                 if history_is_canonical {
                     self.read_intervals
@@ -452,6 +453,7 @@ impl DbReader {
                     self.read_intervals.contains(row.timestamp)
                 }
             })
+            .cloned()
             .collect::<Vec<_>>();
         let generation = read_generation(&transaction, raw.iter().map(|row| row.timestamp))?;
         let task_evidence = read_task_activity_evidence_for_intervals(
@@ -463,6 +465,7 @@ impl DbReader {
             build_details_for_intervals(
                 &transaction,
                 &raw,
+                &all_history,
                 &threads,
                 &task_evidence,
                 &self.read_intervals,
@@ -1163,6 +1166,7 @@ type DetailsBuild = (
 fn build_details_for_intervals(
     connection: &Connection,
     raw: &[RawSample],
+    all_history: &[RawSample],
     threads: &[PublicThread],
     task_evidence: &TaskActivityEvidence,
     intervals: &ReadIntervals,
@@ -1192,6 +1196,36 @@ fn build_details_for_intervals(
     };
     let samples =
         authoritative_history_projection_samples(samples, current_reset_at, window_seconds);
+    let quota_only_samples = if history_is_canonical {
+        quota_only_history_projection_samples(
+            all_history,
+            raw,
+            current_reset_at,
+            window_seconds,
+            observed_at,
+            intervals,
+        )
+    } else {
+        Vec::new()
+    };
+    let mut samples = samples;
+    let mut quota_only_keys = BTreeSet::new();
+    for quota_only in quota_only_samples {
+        // A canonical minute selected by this account remains authoritative
+        // even when the raw row carries a reset alias.  External quota rows
+        // may only fill the leading prefix before this account's first local
+        // observation; they must never duplicate an owned point.
+        if samples.iter().any(|sample| {
+            sample.timestamp == quota_only.timestamp
+                && sample.reset_at.abs_diff(quota_only.reset_at)
+                    <= RESET_AT_TOLERANCE_SECONDS as u64
+        }) {
+            continue;
+        }
+        quota_only_keys.insert((quota_only.reset_at, quota_only.timestamp));
+        samples.push(quota_only);
+    }
+    samples.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
     let mut periods = history_periods(&samples, observed_at, current_reset_at, window_seconds);
     clip_history_periods(&mut periods, intervals);
     let quota = latest_quota_row(raw, current_reset_at)
@@ -1211,14 +1245,18 @@ fn build_details_for_intervals(
         window_seconds,
     )?;
     let models = model_projection.v1;
+    let history_projection_context = HistoryProjectionContext {
+        task_evidence,
+        intervals,
+        quota_only_keys: &quota_only_keys,
+    };
     let history_samples_v3 = read_history_projection_for_intervals(
         connection,
         &samples,
         &mut periods,
         observed_at,
         cutoff,
-        task_evidence,
-        intervals,
+        history_projection_context,
     )?;
     clip_history_periods(&mut periods, intervals);
     assign_history_period_labels(&mut periods);
@@ -1763,6 +1801,12 @@ fn canonical_timeline_u64(value: &str) -> Option<u64> {
     (parsed.to_string() == value).then_some(parsed)
 }
 
+struct HistoryProjectionContext<'a> {
+    task_evidence: &'a TaskActivityEvidence,
+    intervals: &'a ReadIntervals,
+    quota_only_keys: &'a BTreeSet<(i64, i64)>,
+}
+
 /// Build the v3 graph rows from the durable observation JSON and model-history
 /// sidecar.  The legacy `usage_history` row remains the v1 source of truth for
 /// period ownership and the three displayed dollar columns; sidecar faults
@@ -1773,13 +1817,20 @@ fn read_history_projection_for_intervals(
     periods: &mut [PublicHistoryPeriod],
     observed_at: i64,
     cutoff: i64,
-    task_evidence: &TaskActivityEvidence,
-    intervals: &ReadIntervals,
+    context: HistoryProjectionContext<'_>,
 ) -> Result<Vec<PublicHistoryObservationV3>, ReaderError> {
-    let (observations, provenance_generations) =
-        read_stored_history_observations_for_intervals(connection, cutoff, observed_at, intervals)?;
-    let model_groups =
-        read_history_model_groups_for_intervals(connection, cutoff, observed_at, intervals)?;
+    let (observations, provenance_generations) = read_stored_history_observations_for_intervals(
+        connection,
+        cutoff,
+        observed_at,
+        context.intervals,
+    )?;
+    let model_groups = read_history_model_groups_for_intervals(
+        connection,
+        cutoff,
+        observed_at,
+        context.intervals,
+    )?;
 
     // Durable observation provenance and model totals are authoritative only
     // for their exact (reset_at, timestamp) key. A timestamp-only or
@@ -1809,23 +1860,30 @@ fn read_history_projection_for_intervals(
 
     let mut history = BTreeMap::<(i64, i64), PublicHistoryObservationV3>::new();
     for sample in samples {
+        let quota_only = context
+            .quota_only_keys
+            .contains(&(sample.reset_at, sample.timestamp));
         let stored = observations_by_key
             .get(&(sample.reset_at, sample.timestamp))
             .copied();
         let group = model_groups.get(&(sample.reset_at, sample.timestamp));
-        let model_source = stored
-            .map(|observation| observation.model_source)
-            // A valid usage_history row with no durable provenance is the
-            // pre-provenance legacy format. A durable record at the same
-            // generation that is malformed or belongs to another exact key
-            // remains unavailable instead of being downgraded to legacy.
-            .unwrap_or_else(|| {
-                if provenance_generations.contains(&sample.timestamp) {
-                    HistoryModelSource::Unavailable
-                } else {
-                    HistoryModelSource::LegacyUnknown
-                }
-            });
+        let model_source = if quota_only {
+            HistoryModelSource::Unavailable
+        } else {
+            stored
+                .map(|observation| observation.model_source)
+                // A valid usage_history row with no durable provenance is the
+                // pre-provenance legacy format. A durable record at the same
+                // generation that is malformed or belongs to another exact key
+                // remains unavailable instead of being downgraded to legacy.
+                .unwrap_or_else(|| {
+                    if provenance_generations.contains(&sample.timestamp) {
+                        HistoryModelSource::Unavailable
+                    } else {
+                        HistoryModelSource::LegacyUnknown
+                    }
+                })
+        };
         let group_models_complete = group.is_some_and(HistoryModelGroup::model_set_complete);
         let source = if model_source == HistoryModelSource::Unavailable {
             HistoryModelSource::Unavailable
@@ -1893,7 +1951,12 @@ fn read_history_projection_for_intervals(
             });
     }
     suppress_regressing_history_models(&mut history);
-    assign_task_activity_for_intervals(&mut history, periods, task_evidence, intervals);
+    assign_task_activity_for_intervals(
+        &mut history,
+        periods,
+        context.task_evidence,
+        context.intervals,
+    );
     assign_history_period_labels(periods);
     Ok(history.into_values().collect())
 }
@@ -2674,6 +2737,100 @@ fn quota_period_start(reset_at: i64, window_seconds: i64) -> Option<i64> {
         .flatten()
         .and_then(|start| start.div_euclid(60).checked_mul(60))
         .filter(|start| valid_public_timestamp(*start))
+}
+
+/// Keep only durable remaining-quota observations that precede the first
+/// locally-owned observation of the current quota window.
+///
+/// A partition can contain rows written while another account (or an external
+/// client) consumed the same provider quota.  Those rows are not local
+/// Session/model evidence and must not be attributed to the current account.
+/// They are nevertheless useful for the Remaining line, so expose their
+/// actual recorded percentage with an unavailable model source.  The leading
+/// prefix rule is intentional: a later A→B→A lifecycle gap is not treated as
+/// an external prefix merely because it is outside the current interval.
+fn quota_only_history_projection_samples(
+    all_history: &[RawSample],
+    owned_history: &[RawSample],
+    current_reset_at: Option<i64>,
+    window_seconds: i64,
+    observed_at: i64,
+    intervals: &ReadIntervals,
+) -> Vec<PublicHistorySample> {
+    let Some(authority) = current_reset_at else {
+        return Vec::new();
+    };
+    if !intervals.contains(authority) {
+        return Vec::new();
+    }
+    let Some(authoritative_start) = quota_period_start(authority, window_seconds) else {
+        return Vec::new();
+    };
+
+    let Some(first_owned_timestamp) = owned_history
+        .iter()
+        .filter(|row| {
+            row.reset_at.abs_diff(authority) <= RESET_AT_TOLERANCE_SECONDS as u64
+                && row.timestamp >= authoritative_start
+                && row.timestamp <= observed_at
+        })
+        .map(|row| row.timestamp)
+        .min()
+    else {
+        return Vec::new();
+    };
+
+    // Canonical rows should already be unique by timestamp.  If a malformed
+    // legacy alias supplies conflicting percentages for one minute, omit that
+    // minute rather than picking an arbitrary value for the public graph.
+    let mut candidates = BTreeMap::<i64, f64>::new();
+    let mut conflicts = BTreeSet::new();
+    for row in all_history {
+        let Some(remaining_percent) = row.remaining_percent else {
+            continue;
+        };
+        if row.timestamp < authoritative_start
+            || row.timestamp >= first_owned_timestamp
+            || row.timestamp > observed_at
+            || row.reset_at.abs_diff(authority) > RESET_AT_TOLERANCE_SECONDS as u64
+            || intervals.intersects_canonical_minute(row.timestamp)
+        {
+            continue;
+        }
+        match candidates.entry(row.timestamp) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(remaining_percent);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if *entry.get() != remaining_percent {
+                    conflicts.insert(row.timestamp);
+                }
+            }
+        }
+    }
+
+    let mut samples = Vec::new();
+    for (timestamp, remaining_percent) in candidates {
+        if conflicts.contains(&timestamp) {
+            continue;
+        }
+        samples.push(PublicHistorySample {
+            timestamp,
+            reset_at: authority,
+            remaining_percent: Some(remaining_percent),
+            // These values are deliberately zeroed because v1/v2 cannot
+            // represent an unavailable model vector.  The source-aware v2/v3
+            // projection strips them before publication; no zero is exposed
+            // as a model total.
+            sol_dollars: 0.0,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 0,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        });
+    }
+    samples
 }
 
 fn authoritative_history_projection_samples(
@@ -4692,6 +4849,64 @@ mod tests {
             .iter()
             .any(|sample| sample.timestamp == boundary));
         assert_eq!(reactivated.models_v3[0].total_tokens, 30);
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn canonical_reader_keeps_external_quota_prefix_without_local_models() {
+        let path = temp_db("external-quota-prefix");
+        let boundary = 1_800_000_000_i64;
+        make_boundary_db(&path, boundary);
+        let identity = StoragePartitionIdentity {
+            schema_version: "codex-info-account-db-v1".to_owned(),
+            profile_scope_id: "11".repeat(16),
+            account_scope_id: "22".repeat(32),
+            storage_epoch: 13,
+            partition_id: "33".repeat(32),
+        };
+        add_partition_identity(&path, &identity);
+        let intervals = ReadIntervals::new(vec![
+            ReadInterval::new(Some(boundary), None).expect("current interval")
+        ])
+        .expect("current lifecycle domain");
+
+        let snapshot = DbReader::open_partitioned_with_intervals(&path, &identity, intervals)
+            .expect("bounded partition reader")
+            .read_snapshot()
+            .expect("external quota prefix snapshot");
+
+        let prefix = snapshot
+            .history_samples_v3
+            .iter()
+            .find(|sample| sample.timestamp == boundary - 60)
+            .expect("external quota prefix row");
+        assert_eq!(prefix.remaining_percent, Some(80.0));
+        assert_eq!(prefix.model_source, "unavailable");
+        assert!(!prefix.models_complete);
+        assert!(prefix.models.is_none());
+        assert!(snapshot
+            .history_samples_v2
+            .iter()
+            .any(|sample| sample.timestamp == boundary - 60
+                && sample.model_source == "unavailable"
+                && sample.sol_tokens.is_none()
+                && sample.sol_dollars.is_none()));
+        assert!(snapshot
+            .details
+            .history_samples
+            .iter()
+            .all(|sample| sample.timestamp >= boundary));
+        assert_eq!(snapshot.history_samples_v3.len(), 3);
+        assert_eq!(snapshot.details.history_samples.len(), 2);
+
+        let quota_start =
+            quota_period_start(boundary + 3_600, 86_400).expect("quota-window boundary");
+        assert!(snapshot
+            .details
+            .history_periods
+            .iter()
+            .all(|period| period.start_at == quota_start));
 
         fs::remove_file(path).expect("cleanup");
     }
