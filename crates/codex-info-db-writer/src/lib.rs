@@ -10046,10 +10046,11 @@ impl UsageStore {
         Ok(rows)
     }
 
-    /// Replace only an exact set of currently-unattributed events after the
-    /// recorder has reverified their immutable source ranges. The current
-    /// UNATTRIBUTED total must equal the complete correction set, preventing a
-    /// partial repair from hiding unrelated or still-unproven usage.
+    /// Replace only an exact set of unattributed events after the recorder has
+    /// reverified their immutable source ranges. The current model snapshot is
+    /// adjusted only when its UNATTRIBUTED total is exactly the correction set.
+    /// A later snapshot may already have rebased those historical events; in
+    /// that case only the event evidence is corrected, without adding it again.
     pub fn reattribute_unattributed_session_events(
         &mut self,
         corrections: &[SessionEventReattribution],
@@ -10124,12 +10125,23 @@ impl UsageStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current =
             canonicalize_model_totals(&session_model_totals_from_transaction(&transaction)?)?;
-        let current_unattributed = current.iter().find(|total| total.model == "UNATTRIBUTED");
-        if current_unattributed != Some(&unattributed) {
-            return Err(UsageStoreError::InvalidImport(
-                "session event reattribution does not cover the current unattributed total".into(),
-            ));
-        }
+        let repair_current_totals = match current.iter().find(|total| total.model == "UNATTRIBUTED")
+        {
+            Some(current_unattributed) if current_unattributed == &unattributed => true,
+            None => false,
+            // The source proves the event labels, but it does not prove which
+            // part of a different current aggregate they represent. Preserve
+            // both projections unchanged rather than guessing or preventing
+            // the recorder from starting.
+            Some(_) => {
+                let generation: String = transaction.query_row(
+                    "SELECT data_generation FROM collection_generation WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                return canonical_u64_text(&generation, "collection generation");
+            }
+        };
 
         {
             let mut update = transaction.prepare(
@@ -10177,19 +10189,21 @@ impl UsageStore {
             .filter(|total| total.model != "UNATTRIBUTED")
             .map(|total| (total.model.clone(), total))
             .collect::<BTreeMap<_, _>>();
-        for correction in moved.into_values() {
-            let target =
-                repaired
-                    .entry(correction.model.clone())
-                    .or_insert_with(|| SessionModelTotal {
-                        model: correction.model.clone(),
-                        total_tokens: 0,
-                        input_tokens: 0,
-                        cached_input_tokens: 0,
-                        output_tokens: 0,
-                        cache_write_input_tokens: Some(0),
-                    });
-            checked_add_model_total(target, &correction)?;
+        if repair_current_totals {
+            for correction in moved.into_values() {
+                let target =
+                    repaired
+                        .entry(correction.model.clone())
+                        .or_insert_with(|| SessionModelTotal {
+                            model: correction.model.clone(),
+                            total_tokens: 0,
+                            input_tokens: 0,
+                            cached_input_tokens: 0,
+                            output_tokens: 0,
+                            cache_write_input_tokens: Some(0),
+                        });
+                checked_add_model_total(target, &correction)?;
+            }
         }
         let repaired = canonicalize_model_totals(&repaired.into_values().collect::<Vec<_>>())?;
         transaction.execute("DELETE FROM session_model_totals", [])?;

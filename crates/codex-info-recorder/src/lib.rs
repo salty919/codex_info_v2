@@ -8210,6 +8210,112 @@ mod tests {
     }
 
     #[test]
+    fn historical_unattributed_events_do_not_reenter_rebased_current_totals() {
+        let (root, database) = prepare("historical-model-repair-after-rebase");
+        let source = root.join("sessions/one.jsonl");
+        let now = Utc::now().timestamp();
+        fs::write(
+            &source,
+            format!(
+                "{}\n{}{}",
+                json!({"type":"thread_context","model":"gpt-5.6-sol"}),
+                token(10, now - 1),
+                token(15, now)
+            ),
+        )
+        .unwrap();
+        let mut recorder = Recorder::open_partitioned_with_activation(
+            config(&root, 4096),
+            &database,
+            &identity(),
+            Some(now),
+        )
+        .unwrap();
+        recorder.run_cycle().unwrap().unwrap();
+        drop(recorder);
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute("UPDATE session_checkpoints SET last_model=NULL", [])
+            .unwrap();
+        drop(connection);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap()
+            .write_all(format!("{}{}", token(20, now + 1), token(25, now + 2)).as_bytes())
+            .unwrap();
+
+        let mut old_behavior =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        old_behavior.run_cycle().unwrap().unwrap();
+        assert_eq!(
+            old_behavior.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            5
+        );
+        drop(old_behavior);
+
+        // A different current aggregate cannot be mapped back to the proven
+        // event subset. It is preserved without making recorder startup fail.
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE session_model_totals
+                 SET total_tokens=CAST(total_tokens AS INTEGER)+1,
+                     input_tokens=CAST(input_tokens AS INTEGER)+1
+                 WHERE model='UNATTRIBUTED'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let unchanged =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        let unchanged_generation = unchanged.generation().unwrap();
+        assert_eq!(
+            unchanged.model_totals().unwrap()[UNATTRIBUTED_MODEL].total,
+            6
+        );
+        assert!(unchanged
+            .writer
+            .load_session_events()
+            .unwrap()
+            .iter()
+            .any(|event| event.model == UNATTRIBUTED_MODEL));
+        drop(unchanged);
+
+        // A later current snapshot has already attributed this total. The
+        // retained historical event still needs correction, but adding it to
+        // the current SOL total again would double count it.
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE session_model_totals SET model='SOL' WHERE model='UNATTRIBUTED'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let repaired =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        let repaired_generation = repaired.generation().unwrap();
+        assert!(repaired_generation > unchanged_generation);
+        assert_eq!(repaired.model_totals().unwrap()["SOL"].total, 6);
+        assert!(repaired
+            .writer
+            .load_session_events()
+            .unwrap()
+            .iter()
+            .all(|event| event.model == "SOL"));
+        drop(repaired);
+
+        let reopened =
+            Recorder::open_partitioned(config(&root, 4096), &database, &identity()).unwrap();
+        assert_eq!(reopened.generation().unwrap(), repaired_generation);
+        assert_eq!(reopened.model_totals().unwrap()["SOL"].total, 6);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn returning_account_rebaselines_shared_sessions_without_mixing_other_accounts() {
         let (root, database) = prepare("returning-account-boundary");
         let source = root.join("sessions/one.jsonl");
