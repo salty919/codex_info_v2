@@ -79,7 +79,7 @@ jobs:
           cp "$output_dir"/*.tar.gz "$output_dir"/*.sha256 "$output_dir"/*.manifest.json artifacts/linux-bundle/
       - name: Upload release candidate
         if: inputs.release_candidate
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: release-candidate-linux-v1-pr-${{ inputs.pr_number }}-head-${{ inputs.source_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}-version-${{ steps.bundle.outputs.version }}
           path: artifacts/linux-bundle/*
