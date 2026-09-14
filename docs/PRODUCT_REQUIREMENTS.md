@@ -291,6 +291,12 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 表示geometryと色はUX owner、wireのschemaとheaderはWIRE ownerが所有するが、次の
 入力状態から表示上の事実へ至る意味とfailure isolationは本契約だけが所有する。
 
+現行periodの所属は、表示時に`period_start = reset_at - window_seconds`から決める。
+`period_start <= timestamp <= reset_at`にある観測は、providerがプラン切替中に旧`reset_at`
+aliasを返していても現行periodへcanonicalizeする。rawのsource reset/timestampはprovenanceとして保持し、
+同一minuteの相反値は値を合成せず除外する。現行period外およびcompleted periodは従来のcanonical
+reset authorityを使い、account lifecycleや外部利用を推測してmodel数値を付け替えない。
+
 1. `G137-1`: 選択期間の全accepted pageに実際に掲載された`models[].model`の和集合を
    model universe `U`とする。model名はexact wire stringをUTF-8 unsigned byte列の
    case-sensitive lexicographic順（Unicode normalizationなし）に並べる。未掲載の
@@ -467,7 +473,7 @@ token量と秒数を混在させずspan全体をelapsed比で補間し、全中�
 `HistoryCanonicalizer`はDATA owner `HISTORY-CANONICAL-134`が定めるcanonical `usage_history`を生成する唯一のauthorityであり、
 同じprofile-owned transaction snapshot内で、値形状ではなく既存`timestamp/reset_at`のbounded rolling規則から
 同一cycleと検証できたminuteのrowだけを対象にする。account readerはschema制約を満たす`usage_history`一表をsole period authorityとして直接読み、
-読出しごとに旧aliasを再解釈しない。今回の回復に新しいpartition列、永続CycleSeq、並列履歴表、revision stateを要求しない。
+現行periodだけは`reset_at - window_seconds`からtimestamp範囲を検証して旧aliasを公開projectionのcanonical resetへ正規化する。raw source keyはprovenanceとして保持する。今回の回復に新しいpartition列、永続CycleSeq、並列履歴表、revision stateを要求しない。
 quota観測のないbackfill reset群がquota確認済みcycleと重なる場合と、継続する
 quota確認済みcycleの内部だけに存在するreset断片はperiod authorityにしない。
 distinct non-null quotaが0または1個で、既存のcumulative vector
@@ -485,7 +491,7 @@ component別max、last-row、null化、任意mergeを行わない。
 1. 同一の認証主体でquotaを定期更新している間は、前回の完全なモデル使用量・履歴・threadを保持する。更新途中の欠測を空、0、未取得へ置き換えない。
 2. `reset_at`がサービスのrolling値として移動しても同一期間を維持する。実際の期間切替は、quotaの回復または期間境界を示す観測がある場合だけ新期間へ移す。
 3. モデル使用量（ドル・token）と残量（%）は別観測として扱う。残量観測がない時間帯をモデル使用量から逆算せず、遅れて届いた残量観測はその時刻へ反映する。
-4. DATA owner `HISTORY-CANONICAL-134`に従い、同じprofile-owned transaction snapshot内で、既存`timestamp/reset_at`のbounded rolling規則から同一cycleと検証できた同じminuteのrowだけを`HistoryCanonicalizer`が1 logical sampleへ正規化し、`usage_history`単一表へ一括commitする。account readerはこの表だけをperiod authorityとして読み、読出し時に旧aliasを再mergeしない。quota観測を持たずquota確認済みcycleと重なるbackfill reset群と、継続cycleの内部だけにあるreset断片はperiod authorityにしない。実resetの秒をminute-startへ丸めて旧cycle末尾と新cycle先頭が同じ分になり、旧cycleがそこで終了して新cycleだけが後続分へ継続すると確認できる場合は、その境界分を新cycleへ一意に所属させる。distinct non-null quotaは最大1個、cumulative vectorは既存のcomponentwise-dominant値だけを採用し、同値duplicateは冪等に扱う。同一period内のquota競合・非比較・dominant不存在は値を推測せずそのminuteと対応sidecarだけをlive canonical集合から除外する。別cycle間のownerまたは境界不明はmigration transaction全体をrejectする。既知の旧`-1`だけをmigration時に`NULL`へ置換し、通常reader/writerでは範囲外値を拒否する。100%・7日窓など数値の形で除外せず、UI/REST/Windowsでmerge/max/last/null化しない。
+4. DATA owner `HISTORY-CANONICAL-134`に従い、同じprofile-owned transaction snapshot内で、既存`timestamp/reset_at`のbounded rolling規則から同一cycleと検証できた同じminuteのrowだけを`HistoryCanonicalizer`が1 logical sampleへ正規化し、`usage_history`単一表へ一括commitする。account readerはこの表をperiod authorityとして読み、現行periodだけは`reset_at - window_seconds`からtimestamp範囲を検証し、範囲内の旧aliasを公開projectionのcanonical resetへ正規化する。raw source keyはprovenanceとして保持し、読出し時に異なるsourceを再mergeしない。quota観測を持たずquota確認済みcycleと重なるbackfill reset群と、継続cycleの内部だけにあるreset断片はperiod authorityにしない。実resetの秒をminute-startへ丸めて旧cycle末尾と新cycle先頭が同じ分になり、旧cycleがそこで終了して新cycleだけが後続分へ継続すると確認できる場合は、その境界分を新cycleへ一意に所属させる。distinct non-null quotaは最大1個、cumulative vectorは既存のcomponentwise-dominant値だけを採用し、同値duplicateは冪等に扱う。同一period内のquota競合・非比較・dominant不存在は値を推測せずそのminuteと対応sidecarだけをlive canonical集合から除外する。別cycle間のownerまたは境界不明はmigration transaction全体をrejectする。既知の旧`-1`だけをmigration時に`NULL`へ置換し、通常reader/writerでは範囲外値を拒否する。100%・7日窓など数値の形で除外せず、UI/REST/Windowsでmerge/max/last/null化しない。
 5. 明示的なログアウトまたは認証主体変更だけが可視状態を消去する。通信失敗・quota更新中・local収集中は最後の完全表示を保持し、失敗状態は別途表示する。
 6. 製品バージョンはメイン画面に一度だけ表示し、子ウインドウのタイトルやボタンへ重複表示しない。値はX版・Windows版とも同じリリースversion authorityから導出する。
 7. Windows版の初回起動では、health readiness後に最初のstrict validation済み`/v3/current` generation（新resourceがexact 404の旧serviceだけ上記legacy chain）が揃うまで内容領域を表示せず、固定レイアウト上にスピナーを表示する。control応答とのmerge、途中fieldの順番描画をせず、初回取得失敗時はスピナーを解除して失敗状態と再試行手段を表示する。Linux / WindowsのMainに実行中model別件数を表示するため、`active_thread_count>0`のcurrentに限り同じMain cycleでthreadsを1回取得し、同一published pairかつ件数一致の組だけを一括表示する。`active_thread_count=0`はthreadsを要求せず同じcurrent pairのthread行を空として一括表示する。Mainの合計と`SOL/TERRA/LUNA/ASTRA/その他`はこの一つの受理済み行集合だけから導出し、常に合計＝各bucketの和とする。threads失敗・世代不一致・件数不一致ではcurrentだけを反映せず直前の完全表示を保持する。positive bundle失敗後は10秒後にcurrentを条件headerなしで1回だけ再取得し、そのbundleが成功するまでforce、Graph、独立Threads取得で待機を迂回せず、保持中のerrorを解除しない。Graphを開いていない間はGraph resourceを取得せず、Threads詳細windowを閉じている間はこのMain bundle以外の5秒周期threads取得を行わない。

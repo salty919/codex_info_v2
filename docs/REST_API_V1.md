@@ -241,8 +241,11 @@ v2/v3 projectionを使用する。互換性のためのv1固定列へ保存済�
 
 `reset_at`はperiod groupのcanonical reset境界であり、sampleの所属判定に使う。`end_at`は現在期間では
 観測時刻、途中で次期間へ切り替わった過去期間では次期間開始へclipできるため、`end_at`をcanonical
-reset境界として代用してはならない。clientは`id`をparseせず、sampleの`reset_at`がperiodの
-`reset_at - 60 <= sample.reset_at <= reset_at`に入るものだけを同periodへcanonicalizeする。各sampleは
+reset境界として代用してはならない。現在periodについては、serverが`period_start = reset_at -
+window_seconds`を計算し、`period_start <= timestamp <= reset_at`のrowを、raw rowの`reset_at`が
+切替中の旧aliasであっても現在periodのcanonical resetへ正規化する。raw source keyはDB内のprovenanceとして
+保持し、同一minuteの相反値は従来どおり公開しない。completed periodでは従来のcanonical reset authorityを
+使用する。clientは`id`をparseせず、serverが正規化したsampleだけをperiodへ受理する。各sampleは
 exactly one periodへ所属し、そのperiodの`start_at <= timestamp <= end_at`を満たす。実reset境界の秒を
 minute-startへ丸めたため旧cycle末尾と新cycle先頭が同じ分になる場合は、旧cycleがその分で終了し、
 新cycleがその分から始まって後続分へ継続することを既存時系列から確認できるときだけ、新cycleが境界分を
