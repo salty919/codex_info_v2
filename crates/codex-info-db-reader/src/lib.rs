@@ -1216,10 +1216,13 @@ fn build_details_for_intervals(
         if raw.len() > MAX_HISTORY_ROWS {
             return Err(ReaderError::TooManyRows(raw.len()));
         }
-        raw.iter()
+        let mut samples = raw
+            .iter()
             .filter(|row| row.timestamp > cutoff && row.timestamp <= observed_at)
             .map(public_sample_from_raw)
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        normalize_current_period_samples(&mut samples, current_reset_at, window_seconds);
+        samples
     } else {
         canonicalize_history_for_public_window(raw, current_reset_at, window_seconds)?
     };
@@ -1258,11 +1261,16 @@ fn build_details_for_intervals(
     samples.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
     let mut periods = history_periods(&samples, observed_at, current_reset_at, window_seconds);
     clip_history_periods(&mut periods, intervals);
-    let quota = latest_quota_row(raw, current_reset_at)
+    let quota = latest_quota_row(raw, current_reset_at, window_seconds)
         .and_then(|row| {
             row.remaining_percent.map(|remaining_percent| PublicQuota {
                 remaining_percent,
-                reset_at: row.reset_at,
+                reset_at: canonical_period_reset_at(
+                    row.reset_at,
+                    row.timestamp,
+                    current_reset_at,
+                    window_seconds,
+                ),
                 window_seconds,
                 monthly: false,
             })
@@ -1280,6 +1288,8 @@ fn build_details_for_intervals(
         task_evidence,
         intervals,
         quota_only_keys: &quota_only_keys,
+        current_reset_at,
+        window_seconds,
     };
     let history_samples_v3 = read_history_projection_for_intervals(
         connection,
@@ -1798,6 +1808,7 @@ fn task_positive_u64(row: &Row<'_>, index: usize, field: &str) -> Result<u64, Re
 #[derive(Clone, Debug)]
 struct HistoryModelGroup {
     totals: BTreeMap<String, RawModelTotal>,
+    source_reset_at: BTreeMap<String, i64>,
     complete: bool,
     complete_known: bool,
     valid: bool,
@@ -1807,6 +1818,7 @@ impl Default for HistoryModelGroup {
     fn default() -> Self {
         Self {
             totals: BTreeMap::new(),
+            source_reset_at: BTreeMap::new(),
             complete: false,
             complete_known: false,
             valid: true,
@@ -1836,6 +1848,8 @@ struct HistoryProjectionContext<'a> {
     task_evidence: &'a TaskActivityEvidence,
     intervals: &'a ReadIntervals,
     quota_only_keys: &'a BTreeSet<(i64, i64)>,
+    current_reset_at: Option<i64>,
+    window_seconds: i64,
 }
 
 /// Build the v3 graph rows from the durable observation JSON and model-history
@@ -1855,17 +1869,23 @@ fn read_history_projection_for_intervals(
         cutoff,
         observed_at,
         context.intervals,
+        context.current_reset_at,
+        context.window_seconds,
     )?;
     let model_groups = read_history_model_groups_for_intervals(
         connection,
         cutoff,
         observed_at,
         context.intervals,
+        context.current_reset_at,
+        context.window_seconds,
     )?;
 
-    // Durable observation provenance and model totals are authoritative only
-    // for their exact (reset_at, timestamp) key. A timestamp-only or
-    // reset-tolerance join can attach a sidecar from another quota period.
+    // Durable observation provenance and model totals are authoritative for
+    // the canonical period key.  During a provider transition, a row may
+    // retain the previous reset value even though its timestamp is inside the
+    // current window; the readers below normalize that timestamp to the
+    // current reset before joining the sidecars.
     let mut observations_by_key = BTreeMap::<(i64, i64), &StoredHistoryObservation>::new();
     for observation in &observations {
         observations_by_key.insert((observation.reset_at, observation.timestamp), observation);
@@ -2447,6 +2467,8 @@ fn read_stored_history_observations_for_intervals(
     cutoff: i64,
     observed_at: i64,
     intervals: &ReadIntervals,
+    current_reset_at: Option<i64>,
+    window_seconds: i64,
 ) -> Result<(Vec<StoredHistoryObservation>, BTreeSet<i64>), ReaderError> {
     if !table_exists(connection, "durable_state")? {
         return Ok((Vec::new(), BTreeSet::new()));
@@ -2458,7 +2480,7 @@ fn read_stored_history_observations_for_intervals(
          ORDER BY data_generation ASC, singleton ASC",
     )?;
     let mut rows = statement.query(params![cutoff, observed_at])?;
-    let mut observations = BTreeMap::<(i64, i64), StoredHistoryObservation>::new();
+    let mut observations = BTreeMap::<(i64, i64), (i64, StoredHistoryObservation)>::new();
     let mut provenance_generations = BTreeSet::new();
     while let Some(row) = rows.next()? {
         let Some(data_generation) = sql_i64(row, 1) else {
@@ -2479,9 +2501,41 @@ fn read_stored_history_observations_for_intervals(
             // history or unrelated sidecar rows.
             continue;
         };
-        observations.insert((observation.reset_at, observation.timestamp), observation);
+        let source_reset_at = observation.reset_at;
+        let canonical_reset = canonical_period_reset_at(
+            observation.reset_at,
+            observation.timestamp,
+            current_reset_at,
+            window_seconds,
+        );
+        let mut observation = observation;
+        observation.reset_at = canonical_reset;
+        let key = (canonical_reset, observation.timestamp);
+        match observations.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((source_reset_at, observation));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let existing_source_reset_at = entry.get().0;
+                let authoritative_source_wins = current_reset_at.is_some_and(|authority| {
+                    source_reset_at == authority && existing_source_reset_at != authority
+                });
+                let existing_authoritative_wins = current_reset_at.is_some_and(|authority| {
+                    existing_source_reset_at == authority && source_reset_at != authority
+                });
+                if authoritative_source_wins || !existing_authoritative_wins {
+                    entry.insert((source_reset_at, observation));
+                }
+            }
+        }
     }
-    Ok((observations.into_values().collect(), provenance_generations))
+    Ok((
+        observations
+            .into_values()
+            .map(|(_, observation)| observation)
+            .collect(),
+        provenance_generations,
+    ))
 }
 
 fn parse_stored_history_observation(
@@ -2538,6 +2592,8 @@ fn read_history_model_groups_for_intervals(
     cutoff: i64,
     observed_at: i64,
     intervals: &ReadIntervals,
+    current_reset_at: Option<i64>,
+    window_seconds: i64,
 ) -> Result<BTreeMap<(i64, i64), HistoryModelGroup>, ReaderError> {
     if !table_exists(connection, "usage_model_history")? {
         return Ok(BTreeMap::new());
@@ -2575,7 +2631,9 @@ fn read_history_model_groups_for_intervals(
             continue;
         }
         let complete_index = if has_cache_write { 8 } else { 7 };
-        let group = groups.entry((reset_at, timestamp)).or_default();
+        let canonical_reset =
+            canonical_period_reset_at(reset_at, timestamp, current_reset_at, window_seconds);
+        let group = groups.entry((canonical_reset, timestamp)).or_default();
         let Some(complete) = sql_i64(row, complete_index) else {
             group.valid = false;
             continue;
@@ -2588,14 +2646,6 @@ fn read_history_model_groups_for_intervals(
                 continue;
             }
         };
-        if group.complete_known {
-            if group.complete != complete {
-                group.valid = false;
-            }
-        } else {
-            group.complete = complete;
-            group.complete_known = true;
-        }
         let Some(model) = sql_text(row, 2) else {
             group.valid = false;
             continue;
@@ -2656,11 +2706,44 @@ fn read_history_model_groups_for_intervals(
                     .checked_add(writes)
                     .is_none_or(|discounted| discounted > row.input_tokens)
             })
-            || group.totals.contains_key(&row.model)
         {
             group.valid = false;
             continue;
         }
+        if let Some(existing_source_reset_at) = group.source_reset_at.get(&row.model).copied() {
+            let replacing_stale_alias = current_reset_at.is_some_and(|authority| {
+                canonical_reset == authority
+                    && reset_at == authority
+                    && existing_source_reset_at != authority
+            });
+            let keeping_authoritative_row = current_reset_at.is_some_and(|authority| {
+                canonical_reset == authority
+                    && existing_source_reset_at == authority
+                    && reset_at != authority
+            });
+            if keeping_authoritative_row {
+                continue;
+            }
+            if !replacing_stale_alias {
+                group.valid = false;
+                continue;
+            }
+            let model_key = row.model.clone();
+            group.totals.insert(model_key.clone(), row);
+            group.source_reset_at.insert(model_key, reset_at);
+            group.complete = complete;
+            group.complete_known = true;
+            continue;
+        }
+        if group.complete_known {
+            if group.complete != complete {
+                group.valid = false;
+            }
+        } else {
+            group.complete = complete;
+            group.complete_known = true;
+        }
+        group.source_reset_at.insert(row.model.clone(), reset_at);
         group.totals.insert(row.model.clone(), row);
     }
     Ok(groups)
@@ -2770,6 +2853,45 @@ fn quota_period_start(reset_at: i64, window_seconds: i64) -> Option<i64> {
         .filter(|start| valid_public_timestamp(*start))
 }
 
+/// Return the current period key for an observation whose timestamp falls in
+/// the authoritative time window.  A provider can keep returning the prior
+/// reset value for a short transition interval; period ownership is therefore
+/// determined from the reset deadline minus the window length, not from that
+/// stale alias alone.
+fn canonical_period_reset_at(
+    observed_reset_at: i64,
+    timestamp: i64,
+    current_reset_at: Option<i64>,
+    window_seconds: i64,
+) -> i64 {
+    let Some(authority) = current_reset_at else {
+        return observed_reset_at;
+    };
+    let Some(start) = quota_period_start(authority, window_seconds) else {
+        return observed_reset_at;
+    };
+    if timestamp >= start && timestamp <= authority {
+        authority
+    } else {
+        observed_reset_at
+    }
+}
+
+fn normalize_current_period_samples(
+    samples: &mut [PublicHistorySample],
+    current_reset_at: Option<i64>,
+    window_seconds: i64,
+) {
+    for sample in samples {
+        sample.reset_at = canonical_period_reset_at(
+            sample.reset_at,
+            sample.timestamp,
+            current_reset_at,
+            window_seconds,
+        );
+    }
+}
+
 /// Keep only durable remaining-quota observations that precede the first
 /// locally-owned observation of the current quota window.
 ///
@@ -2798,8 +2920,8 @@ fn quota_only_history_projection_samples(
     let Some(first_owned_timestamp) = owned_history
         .iter()
         .filter(|row| {
-            row.reset_at.abs_diff(authority) <= RESET_AT_TOLERANCE_SECONDS as u64
-                && row.timestamp >= authoritative_start
+            row.timestamp >= authoritative_start
+                && row.timestamp <= authority
                 && row.timestamp <= observed_at
         })
         .map(|row| row.timestamp)
@@ -2822,9 +2944,9 @@ fn quota_only_history_projection_samples(
             continue;
         };
         if row.timestamp < authoritative_start
+            || row.timestamp > authority
             || row.timestamp >= prefix_end
             || row.timestamp > observed_at
-            || row.reset_at.abs_diff(authority) > RESET_AT_TOLERANCE_SECONDS as u64
             || intervals.intersects_canonical_minute(row.timestamp)
         {
             continue;
@@ -3099,8 +3221,31 @@ fn civil_date_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
-fn latest_quota_row(rows: &[RawSample], current_reset_at: Option<i64>) -> Option<&RawSample> {
+fn latest_quota_row(
+    rows: &[RawSample],
+    current_reset_at: Option<i64>,
+    window_seconds: i64,
+) -> Option<&RawSample> {
     if let Some(authority) = current_reset_at {
+        if let Some(start) = quota_period_start(authority, window_seconds) {
+            if let Some(row) = rows
+                .iter()
+                .filter(|row| {
+                    row.remaining_percent.is_some()
+                        && row.timestamp >= start
+                        && row.timestamp <= authority
+                })
+                .max_by_key(|row| {
+                    (
+                        row.timestamp,
+                        (row.reset_at == authority) as u8,
+                        row.reset_at,
+                    )
+                })
+            {
+                return Some(row);
+            }
+        }
         if let Some(row) = rows
             .iter()
             .filter(|row| {
@@ -3162,6 +3307,7 @@ pub fn canonicalize_history_for_public_window(
         .cloned()
         .collect::<Vec<_>>();
     let mut samples = canonicalize_history(&recent, current_reset_at, window_seconds, observed_at)?;
+    normalize_current_period_samples(&mut samples, current_reset_at, window_seconds);
     if samples.is_empty() && !recent.is_empty() {
         // A stale/missing collection-generation window must not turn an
         // existing history database into a fabricated empty root. Retain the
@@ -3885,17 +4031,40 @@ fn read_model_projection_for_intervals(
         "cache_write_input_tokens",
     )?;
     let query = if has_cache_write {
-        "SELECT reset_at, timestamp, model, total_tokens, input_tokens,
-                cached_input_tokens, output_tokens, cache_write_input_tokens,
-                model_set_complete
-         FROM usage_model_history ORDER BY timestamp DESC, reset_at DESC, model ASC"
+        if current_scope.is_some() {
+            "SELECT reset_at, timestamp, model, total_tokens, input_tokens,
+                    cached_input_tokens, output_tokens, cache_write_input_tokens,
+                    model_set_complete
+             FROM usage_model_history
+             ORDER BY timestamp DESC,
+                      CASE WHEN reset_at = ?1 THEN 0 ELSE 1 END,
+                      reset_at DESC, model ASC"
+        } else {
+            "SELECT reset_at, timestamp, model, total_tokens, input_tokens,
+                    cached_input_tokens, output_tokens, cache_write_input_tokens,
+                    model_set_complete
+             FROM usage_model_history ORDER BY timestamp DESC, reset_at DESC, model ASC"
+        }
     } else {
-        "SELECT reset_at, timestamp, model, total_tokens, input_tokens,
-                cached_input_tokens, output_tokens, model_set_complete
-         FROM usage_model_history ORDER BY timestamp DESC, reset_at DESC, model ASC"
+        if current_scope.is_some() {
+            "SELECT reset_at, timestamp, model, total_tokens, input_tokens,
+                    cached_input_tokens, output_tokens, model_set_complete
+             FROM usage_model_history
+             ORDER BY timestamp DESC,
+                      CASE WHEN reset_at = ?1 THEN 0 ELSE 1 END,
+                      reset_at DESC, model ASC"
+        } else {
+            "SELECT reset_at, timestamp, model, total_tokens, input_tokens,
+                    cached_input_tokens, output_tokens, model_set_complete
+             FROM usage_model_history ORDER BY timestamp DESC, reset_at DESC, model ASC"
+        }
     };
     let mut statement = connection.prepare(query)?;
-    let mut rows = statement.query([])?;
+    let mut rows = if let Some(authority) = current_scope {
+        statement.query(params![authority])?
+    } else {
+        statement.query([])?
+    };
     let mut group_key = None;
     let mut group_complete = true;
     let mut group = BTreeMap::<String, RawModelTotal>::new();
@@ -3910,13 +4079,18 @@ fn read_model_projection_for_intervals(
             continue;
         }
         if let Some(authority) = current_scope {
-            if reset_at.abs_diff(authority) > RESET_AT_TOLERANCE_SECONDS as u64
+            let in_current_window = authoritative_start
+                .is_some_and(|start| timestamp >= start && timestamp <= authority);
+            if (!in_current_window
+                && reset_at.abs_diff(authority) > RESET_AT_TOLERANCE_SECONDS as u64)
                 || authoritative_start.is_some_and(|start| timestamp < start)
             {
                 continue;
             }
         }
-        let key = (timestamp, reset_at);
+        let canonical_reset =
+            canonical_period_reset_at(reset_at, timestamp, current_scope, window_seconds);
+        let key = (timestamp, canonical_reset);
         if group_key.is_some_and(|current| current != key) {
             if group_complete && !group.is_empty() {
                 return Ok(project_model_totals(group.into_values()));
@@ -3970,6 +4144,14 @@ fn read_model_projection_for_intervals(
             None
         };
         if group.contains_key(&model) {
+            // The authoritative reset is ordered before a stale alias at the
+            // same timestamp. Keep the canonical row instead of making the
+            // current-period group incomplete because of that duplicate.
+            if current_scope
+                .is_some_and(|authority| canonical_reset == authority && reset_at != authority)
+            {
+                continue;
+            }
             group_complete = false;
             continue;
         }
@@ -5075,6 +5257,48 @@ mod tests {
     }
 
     #[test]
+    fn current_period_rehomes_transition_aliases_by_window_start() {
+        let current_reset_at = 1_800_001_000_i64;
+        let window_seconds = 3_600_i64;
+        let period_start =
+            quota_period_start(current_reset_at, window_seconds).expect("current period start");
+        let stale_reset_at = current_reset_at - 86_400;
+        let row = |timestamp: i64, reset_at: i64, tokens: u64| RawSample {
+            timestamp,
+            reset_at,
+            remaining_percent: Some(0.0),
+            sol_dollars: tokens as f64,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: tokens,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        let samples = canonicalize_history_for_public_window(
+            &[
+                row(period_start - 60, stale_reset_at, 10),
+                row(period_start + 60, stale_reset_at, 20),
+            ],
+            Some(current_reset_at),
+            window_seconds,
+        )
+        .expect("transition alias history");
+
+        let before_start = samples
+            .iter()
+            .find(|sample| sample.timestamp == period_start - 60)
+            .expect("pre-period observation");
+        assert_eq!(before_start.reset_at, stale_reset_at);
+
+        let current = samples
+            .iter()
+            .find(|sample| sample.timestamp == period_start + 60)
+            .expect("current-period transition observation");
+        assert_eq!(current.reset_at, current_reset_at);
+        assert_eq!(current.sol_tokens, 20);
+    }
+
+    #[test]
     fn subminute_account_activation_keeps_exact_rows_in_a_valid_minute_projection() {
         let path = temp_db("subminute-lifecycle-boundary");
         let boundary = 1_800_000_017_i64;
@@ -5510,7 +5734,7 @@ mod tests {
     }
 
     #[test]
-    fn current_model_projection_rejects_quota_prefix_and_unscoped_totals() {
+    fn current_model_projection_assigns_time_window_aliases_and_rejects_unscoped_totals() {
         let path = temp_db("model-quota-boundary");
         let connection = Connection::open(&path).expect("model fixture db");
         connection
@@ -5537,8 +5761,9 @@ mod tests {
                 )
                 .expect("model history row");
         };
-        // This current-reset row is before the quota window.  An older-period
-        // row is also present to prove that the reader cannot fall back to it.
+        // This current-reset row is before the quota window.  The older-reset
+        // row is inside the current time window and therefore belongs to the
+        // current period despite the stale reset alias.
         insert(quota_start - 60, reset_at, 100);
         insert(quota_start + 120, reset_at - 86_400, 50);
         let intervals = ReadIntervals::unbounded();
@@ -5550,8 +5775,9 @@ mod tests {
             false,
         )
         .expect("prefix-only projection");
-        assert!(prefix_only.v1.is_empty());
-        assert!(prefix_only.v3.is_empty());
+        assert_eq!(prefix_only.v1.len(), 1);
+        assert_eq!(prefix_only.v3.len(), 1);
+        assert_eq!(prefix_only.v3[0].total_tokens, 50);
 
         insert(quota_start + 120, reset_at, 12);
         let current = read_model_projection_for_intervals(
@@ -5775,7 +6001,7 @@ mod tests {
     }
 
     #[test]
-    fn public_history_uses_exact_saved_keys_and_never_reconstructs_models() {
+    fn public_history_normalizes_current_window_aliases_without_reconstructing_models() {
         let path = temp_db("public-history-boundary");
         make_db(&path);
         let reset_at = 1_800_000_600_i64;
@@ -5919,23 +6145,25 @@ mod tests {
             .iter()
             .any(|sample| sample.timestamp == timestamps[3] + 60));
         let mismatched = &snapshot.history_samples_v3[0];
-        assert_eq!(mismatched.model_source, "unavailable");
-        assert!(mismatched.models.is_none());
-        assert!(!mismatched.models_complete);
+        assert_eq!(mismatched.model_source, "confirmed");
+        assert!(mismatched.models_complete);
+        assert_eq!(
+            mismatched
+                .models
+                .as_ref()
+                .and_then(|models| models.first())
+                .map(|model| model.total_tokens),
+            Some(10)
+        );
 
         let reconstructed = &snapshot.history_samples_v3[1];
         assert_eq!(reconstructed.model_source, "reconstructed-from-session");
         assert!(reconstructed.models.is_none());
         assert!(!reconstructed.models_complete);
         assert_eq!(reconstructed.remaining_percent, Some(89.0));
-        assert!(snapshot.history_samples_v2[..3].iter().all(|sample| {
-            sample.sol_dollars.is_none()
-                && sample.terra_dollars.is_none()
-                && sample.luna_dollars.is_none()
-                && sample.sol_tokens.is_none()
-                && sample.terra_tokens.is_none()
-                && sample.luna_tokens.is_none()
-        }));
+        assert!(snapshot.history_samples_v2[0].sol_tokens.is_some());
+        assert!(snapshot.history_samples_v2[1].sol_tokens.is_none());
+        assert!(snapshot.history_samples_v2[2].sol_tokens.is_none());
 
         let unavailable = &snapshot.history_samples_v3[2];
         assert_eq!(unavailable.model_source, "unavailable");
@@ -5957,8 +6185,17 @@ mod tests {
         assert_eq!(unknown.model_source, "unavailable");
         assert!(unknown.models.is_none());
         assert!(snapshot.history_samples_v2[4].sol_tokens.is_none());
-        assert_eq!(snapshot.details.history_samples.len(), 1);
-        assert_eq!(snapshot.details.history_samples[0].timestamp, timestamps[3]);
+        assert_eq!(snapshot.details.history_samples.len(), 2);
+        assert!(snapshot
+            .details
+            .history_samples
+            .iter()
+            .any(|sample| sample.timestamp == timestamps[0]));
+        assert!(snapshot
+            .details
+            .history_samples
+            .iter()
+            .any(|sample| sample.timestamp == timestamps[3]));
 
         fs::remove_file(path).expect("cleanup");
     }
