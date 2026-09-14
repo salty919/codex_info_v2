@@ -4986,6 +4986,50 @@ mod tests {
     }
 
     #[test]
+    fn zero_remaining_continues_in_the_current_quota_period() {
+        let reset_at = 1_800_001_000_i64;
+        let window_seconds = 86_400_i64;
+        let quota_start = quota_period_start(reset_at, window_seconds).expect("quota start");
+        let activation = quota_start + 600;
+        let intervals = ReadIntervals::new(vec![
+            ReadInterval::new(Some(activation), None).expect("current lifecycle interval")
+        ])
+        .expect("current lifecycle domain");
+        let raw = |timestamp: i64, remaining_percent: f64| RawSample {
+            timestamp,
+            reset_at,
+            remaining_percent: Some(remaining_percent),
+            sol_dollars: 0.0,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 0,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        let external = raw(quota_start + 300, 0.0);
+        let local = raw(activation, 25.0);
+        let projected = quota_only_history_projection_samples(
+            &[external.clone(), local.clone()],
+            std::slice::from_ref(&local),
+            Some(reset_at),
+            window_seconds,
+            activation,
+            &intervals,
+        );
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].remaining_percent, Some(0.0));
+
+        let samples = vec![
+            public_sample_from_raw(&external),
+            public_sample_from_raw(&local),
+        ];
+        let periods = history_periods(&samples, activation, Some(reset_at), window_seconds);
+        assert_eq!(periods.len(), 1);
+        assert_eq!(periods[0].reset_at, reset_at);
+        assert_eq!(periods[0].start_at, quota_start);
+    }
+
+    #[test]
     fn subminute_account_activation_keeps_exact_rows_in_a_valid_minute_projection() {
         let path = temp_db("subminute-lifecycle-boundary");
         let boundary = 1_800_000_017_i64;
