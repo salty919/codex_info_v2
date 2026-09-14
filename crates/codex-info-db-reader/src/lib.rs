@@ -1190,6 +1190,8 @@ fn build_details_for_intervals(
     } else {
         canonicalize_history_for_public_window(raw, current_reset_at, window_seconds)?
     };
+    let samples =
+        authoritative_history_projection_samples(samples, current_reset_at, window_seconds);
     let mut periods = history_periods(&samples, observed_at, current_reset_at, window_seconds);
     clip_history_periods(&mut periods, intervals);
     let quota = latest_quota_row(raw, current_reset_at)
@@ -1202,7 +1204,12 @@ fn build_details_for_intervals(
             })
         })
         .filter(|quota| quota.window_seconds > 0);
-    let model_projection = read_model_projection_for_intervals(connection, intervals)?;
+    let model_projection = read_model_projection_for_intervals(
+        connection,
+        intervals,
+        current_reset_at,
+        window_seconds,
+    )?;
     let models = model_projection.v1;
     let history_samples_v3 = read_history_projection_for_intervals(
         connection,
@@ -1793,6 +1800,7 @@ fn read_history_projection_for_intervals(
         if let Some(period) = periods.iter_mut().find(|period| {
             observation.reset_at >= period.reset_at.saturating_sub(RESET_AT_TOLERANCE_SECONDS)
                 && observation.reset_at <= period.reset_at
+                && observation.timestamp >= period.start_at
                 && observation.timestamp <= period.end_at
         }) {
             period.start_at = period.start_at.min(observation.timestamp);
@@ -2660,11 +2668,53 @@ fn history_model_usage_v3(
     }
 }
 
+fn quota_period_start(reset_at: i64, window_seconds: i64) -> Option<i64> {
+    (window_seconds > 0)
+        .then(|| reset_at.checked_sub(window_seconds))
+        .flatten()
+        .and_then(|start| start.div_euclid(60).checked_mul(60))
+        .filter(|start| valid_public_timestamp(*start))
+}
+
+fn authoritative_history_projection_samples(
+    samples: Vec<PublicHistorySample>,
+    current_reset_at: Option<i64>,
+    window_seconds: i64,
+) -> Vec<PublicHistorySample> {
+    let Some(authority) = current_reset_at else {
+        return samples;
+    };
+    let Some(current_reset) = samples
+        .iter()
+        .map(|sample| sample.reset_at)
+        .filter(|reset_at| reset_at.abs_diff(authority) <= RESET_AT_TOLERANCE_SECONDS as u64)
+        .min_by(|left, right| {
+            authority
+                .abs_diff(*left)
+                .cmp(&authority.abs_diff(*right))
+                .then_with(|| right.cmp(left))
+        })
+    else {
+        return samples;
+    };
+    let Some(authoritative_start) = quota_period_start(authority, window_seconds) else {
+        return samples;
+    };
+
+    samples
+        .into_iter()
+        .filter(|sample| {
+            !(sample.reset_at.abs_diff(current_reset) <= RESET_AT_TOLERANCE_SECONDS as u64
+                && sample.timestamp < authoritative_start)
+        })
+        .collect()
+}
+
 fn history_periods(
     samples: &[PublicHistorySample],
     observed_at: i64,
     current_reset_at: Option<i64>,
-    _window_seconds: i64,
+    window_seconds: i64,
 ) -> Vec<PublicHistoryPeriod> {
     let mut ranges = BTreeMap::<i64, (i64, i64)>::new();
     for sample in samples {
@@ -2693,18 +2743,20 @@ fn history_periods(
         .into_iter()
         .map(|(reset_at, (observed_start, observed_end))| {
             let is_current = Some(reset_at) == current;
-            let start_at = observed_start;
+            let start_at = if is_current {
+                current_reset_at
+                    .and_then(|authority| quota_period_start(authority, window_seconds))
+                    .filter(|start| *start <= observed_start)
+                    .unwrap_or(observed_start)
+            } else {
+                observed_start
+            };
             let mut end_at = observed_end.min(observed_at);
             if is_current {
-                // `canonicalize_history` is the single authority for period
-                // membership. A corrected rolling reset deadline can move
-                // `reset_at - window` forward after the observed quota
-                // recovery; re-clipping here would orphan those canonical
-                // samples and split one physical cycle between two starts.
                 // Samples are canonicalized to minute starts, while the
                 // recorder's observed_at may retain event-level seconds.
-                // The contract's current-period boundary is the exact
-                // authority/observation minimum, not the rounded sample end.
+                // The contract's current-period end remains the exact
+                // quota/reset observation boundary.
                 end_at = reset_at.min(observed_at);
             } else {
                 end_at = end_at.min(reset_at);
@@ -2768,11 +2820,18 @@ fn clip_history_periods(periods: &mut Vec<PublicHistoryPeriod>, intervals: &Read
             .last()
             .copied()
             .unwrap_or((first_start, first_start));
-        period.start_at = first_start;
-        period.end_at = last_end;
-        if !intervals.contains(period.reset_at) {
+        let current_interval_is_owned = intervals.contains(period.reset_at);
+        if !current_interval_is_owned {
             period.current = false;
         }
+        // A current period may begin before this account's first lifecycle
+        // interval.  Keep the validated quota-window boundary so the graph
+        // shows the real weekly frame with an empty pre-activation span; the
+        // interval still owns every published row and no value is fabricated.
+        if !period.current {
+            period.start_at = first_start;
+        }
+        period.end_at = last_end;
         period.start_at <= period.end_at
     });
 }
@@ -3598,13 +3657,30 @@ fn read_model_projection(connection: &Connection) -> Result<ModelProjection, Rea
 fn read_model_projection_for_intervals(
     connection: &Connection,
     intervals: &ReadIntervals,
+    current_reset_at: Option<i64>,
+    window_seconds: i64,
 ) -> Result<ModelProjection, ReaderError> {
-    if intervals.is_unbounded() {
+    // An unbounded partition reader still needs the same current quota
+    // authority as a lifecycle-bounded reader.  The timestamp-less session
+    // totals table cannot prove ownership across an account switch, so it is
+    // used only when no current quota authority is available.
+    let current_scope = current_reset_at.filter(|reset_at| intervals.contains(*reset_at));
+    if intervals.is_unbounded() && current_scope.is_none() {
         return read_model_projection(connection);
+    }
+    if let Some(authority) = current_scope {
+        if quota_period_start(authority, window_seconds).is_none() {
+            // A current quota authority without a valid window cannot
+            // establish which timestamped model totals belong to the public
+            // window.
+            return Ok(ModelProjection::default());
+        }
     }
     if !table_exists(connection, "usage_model_history")? {
         return Ok(ModelProjection::default());
     }
+    let authoritative_start =
+        current_scope.and_then(|reset_at| quota_period_start(reset_at, window_seconds));
     let has_cache_write = table_has_column(
         connection,
         "usage_model_history",
@@ -3634,6 +3710,13 @@ fn read_model_projection_for_intervals(
         };
         if !intervals.intersects_canonical_minute(timestamp) {
             continue;
+        }
+        if let Some(authority) = current_scope {
+            if reset_at.abs_diff(authority) > RESET_AT_TOLERANCE_SECONDS as u64
+                || authoritative_start.is_some_and(|start| timestamp < start)
+            {
+                continue;
+            }
         }
         let key = (timestamp, reset_at);
         if group_key.is_some_and(|current| current != key) {
@@ -4567,11 +4650,13 @@ mod tests {
             .history_samples_v3
             .iter()
             .all(|sample| sample.timestamp >= boundary && sample.model_source == "legacy-unknown"));
+        let quota_start =
+            quota_period_start(boundary + 3_600, 86_400).expect("positive quota-window boundary");
         assert!(current
             .details
             .history_periods
             .iter()
-            .all(|period| { period.start_at >= boundary && period.end_at >= boundary }));
+            .all(|period| { period.start_at == quota_start && period.end_at >= boundary }));
         assert_eq!(current.models_v3[0].total_tokens, 30);
         assert!(current
             .models_v3
@@ -4672,11 +4757,13 @@ mod tests {
             .history_samples
             .iter()
             .all(|sample| sample.timestamp >= visible_boundary));
+        let quota_start =
+            quota_period_start(boundary + 3_600, 86_400).expect("positive quota-window boundary");
         assert!(snapshot
             .details
             .history_periods
             .iter()
-            .all(|period| period.start_at >= visible_boundary));
+            .all(|period| period.start_at == quota_start));
         assert_eq!(snapshot.models_v3[0].total_tokens, 20);
 
         fs::remove_file(path).expect("cleanup");
@@ -4978,6 +5065,155 @@ mod tests {
         details
             .validate()
             .expect("unrounded recorder observation must remain contract-valid");
+    }
+
+    #[test]
+    fn current_period_uses_quota_boundary_without_publishing_pre_boundary_rows() {
+        let reset_at = 1_800_001_000_i64;
+        let window_seconds = 3_600_i64;
+        let quota_start =
+            quota_period_start(reset_at, window_seconds).expect("positive quota-window boundary");
+        let sample = |timestamp, remaining_percent| PublicHistorySample {
+            timestamp,
+            reset_at,
+            remaining_percent: Some(remaining_percent),
+            sol_dollars: 0.0,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 0,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        let samples = vec![
+            sample(quota_start - 60, 100.0),
+            sample(quota_start + 120, 56.0),
+        ];
+        let projected =
+            authoritative_history_projection_samples(samples, Some(reset_at), window_seconds);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].timestamp, quota_start + 120);
+
+        let observed_at = quota_start + 120;
+        let mut periods = history_periods(&projected, observed_at, Some(reset_at), window_seconds);
+        assert_eq!(periods.len(), 1);
+        assert_eq!(periods[0].start_at, quota_start);
+
+        let intervals = ReadIntervals::new(vec![
+            ReadInterval::new(Some(quota_start + 120), None).expect("current interval")
+        ])
+        .expect("lifecycle interval");
+        clip_history_periods(&mut periods, &intervals);
+        assert_eq!(periods.len(), 1);
+        assert_eq!(periods[0].start_at, quota_start);
+
+        let details = PublicDetails {
+            state: PublicState::Ready,
+            observed_at: Some(observed_at),
+            authenticated: true,
+            history_periods: periods,
+            history_samples: projected,
+            ..PublicDetails::default()
+        };
+        details
+            .validate()
+            .expect("quota-bound period with a blank prefix is valid");
+
+        let unbounded_samples = authoritative_history_projection_samples(
+            vec![
+                sample(quota_start - 60, 100.0),
+                sample(quota_start + 120, 56.0),
+            ],
+            Some(reset_at),
+            0,
+        );
+        let fallback_periods = history_periods(&unbounded_samples, observed_at, Some(reset_at), 0);
+        assert_eq!(fallback_periods.len(), 1);
+        assert_eq!(fallback_periods[0].start_at, quota_start - 60);
+    }
+
+    #[test]
+    fn current_model_projection_rejects_quota_prefix_and_unscoped_totals() {
+        let path = temp_db("model-quota-boundary");
+        let connection = Connection::open(&path).expect("model fixture db");
+        connection
+            .execute_batch(
+                "CREATE TABLE usage_model_history(
+                    reset_at INTEGER NOT NULL, timestamp INTEGER NOT NULL,
+                    model TEXT NOT NULL, total_tokens TEXT NOT NULL,
+                    input_tokens TEXT NOT NULL, cached_input_tokens TEXT NOT NULL,
+                    output_tokens TEXT NOT NULL, cache_write_input_tokens TEXT,
+                    model_set_complete INTEGER NOT NULL
+                );",
+            )
+            .expect("timestamped model schema");
+        let reset_at = 1_800_001_000_i64;
+        let window_seconds = 3_600_i64;
+        let quota_start =
+            quota_period_start(reset_at, window_seconds).expect("positive quota-window boundary");
+        let insert = |timestamp: i64, reset: i64, total: u64| {
+            connection
+                .execute(
+                    "INSERT INTO usage_model_history
+                     VALUES(?1,?2,'SOL',?3,?3,'0','0',NULL,1)",
+                    params![reset, timestamp, total.to_string()],
+                )
+                .expect("model history row");
+        };
+        // This current-reset row is before the quota window.  An older-period
+        // row is also present to prove that the reader cannot fall back to it.
+        insert(quota_start - 60, reset_at, 100);
+        insert(quota_start + 120, reset_at - 86_400, 50);
+        let intervals = ReadIntervals::unbounded();
+        let prefix_only = read_model_projection_for_intervals(
+            &connection,
+            &intervals,
+            Some(reset_at),
+            window_seconds,
+        )
+        .expect("prefix-only projection");
+        assert!(prefix_only.v1.is_empty());
+        assert!(prefix_only.v3.is_empty());
+
+        insert(quota_start + 120, reset_at, 12);
+        let current = read_model_projection_for_intervals(
+            &connection,
+            &intervals,
+            Some(reset_at),
+            window_seconds,
+        )
+        .expect("current projection");
+        assert_eq!(current.v3.len(), 1);
+        assert_eq!(current.v3[0].model, "SOL");
+        assert_eq!(current.v3[0].total_tokens, 12);
+        let invalid_window =
+            read_model_projection_for_intervals(&connection, &intervals, Some(reset_at), 0)
+                .expect("invalid-window projection");
+        assert!(invalid_window.v1.is_empty());
+        assert!(invalid_window.v3.is_empty());
+        fs::remove_file(path).expect("cleanup timestamped fixture");
+
+        let session_path = temp_db("model-unscoped-totals");
+        let session_connection = Connection::open(&session_path).expect("session fixture db");
+        session_connection
+            .execute_batch(
+                "CREATE TABLE session_model_totals(
+                    model TEXT NOT NULL, total_tokens TEXT NOT NULL,
+                    input_tokens TEXT NOT NULL, cached_input_tokens TEXT NOT NULL,
+                    output_tokens TEXT NOT NULL
+                );
+                INSERT INTO session_model_totals VALUES('SOL','100','100','0','0');",
+            )
+            .expect("timestamp-less model schema");
+        let unscoped = read_model_projection_for_intervals(
+            &session_connection,
+            &intervals,
+            Some(reset_at),
+            window_seconds,
+        )
+        .expect("unscoped projection");
+        assert!(unscoped.v1.is_empty());
+        assert!(unscoped.v3.is_empty());
+        fs::remove_file(session_path).expect("cleanup timestamp-less fixture");
     }
 
     #[test]
