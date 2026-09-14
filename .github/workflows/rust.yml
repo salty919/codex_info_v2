@@ -59,7 +59,7 @@ jobs:
             exit 1
           fi
       - name: Preserve native coverage for isolated upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: codacy-coverage-rust-v1-head-${{ inputs.source_sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
           path: artifacts/codacy-coverage-rust/rust.cobertura.xml
