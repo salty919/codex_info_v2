@@ -2441,6 +2441,36 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void Idle_bridge_allows_finite_modelless_metadata_row()
+    {
+        static ApiHistorySample Metadata(long timestamp) =>
+            new(
+                timestamp,
+                1_000,
+                90,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.LegacyUnknownModelSource)
+            {
+                ModelsComplete = false,
+                TaskActiveSincePrevious = false,
+                ModelSamples = null,
+            };
+
+        static ApiHistorySample Direct(long timestamp) =>
+            CompleteModelSample(timestamp, 90, 100, 1);
+
+        var samples = new[] { Direct(0), Metadata(900), Direct(1_800) };
+        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 0, 1_800);
+
+        Assert.Equal([new GraphIdleInterval(0, 1_800, false)], scene.IdleIntervals);
+    }
+
+    [Fact]
     public void Only_complete_measured_flat_points_form_an_idle_interval()
     {
         var samples = Enumerable.Range(0, 31)
@@ -2456,6 +2486,151 @@ public sealed class GraphPlotControlTests
         Assert.Equal(31, remaining.Solid.X.Count);
         Assert.Empty(model.Dashed.X);
         Assert.Empty(remaining.Dashed.X);
+    }
+
+    [Fact]
+    public void Legacy_only_model_does_not_veto_later_common_direct_idle()
+    {
+        static ApiHistoryModelSample Model(string name, ulong tokens, double dollars) =>
+            new(name, null, null, null, dollars)
+            {
+                TotalTokens = tokens,
+            };
+
+        static ApiHistorySample LegacyTransition() =>
+            new(
+                0,
+                10_000,
+                90,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.LegacyUnknownModelSource)
+            {
+                ModelsComplete = false,
+                TaskActiveSincePrevious = false,
+                ModelSamples =
+                [
+                    Model("SOL", 100, 1),
+                    Model("LUNA", 200, 2),
+                    Model("TERRA", 0, 0),
+                ],
+            };
+
+        static ApiHistorySample Direct(long timestamp) =>
+            new(
+                timestamp,
+                10_000,
+                90,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.ConfirmedModelSource)
+            {
+                ModelsComplete = true,
+                TaskActiveSincePrevious = false,
+                ModelSamples =
+                [
+                    Model("SOL", 100, 1),
+                    Model("LUNA", 200, 2),
+                ],
+            };
+
+        var samples = new[] { LegacyTransition() }
+            .Concat(Enumerable.Range(1, 31).Select(minute => Direct(minute * 60)))
+            .ToArray();
+
+        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 0, 1_860);
+
+        Assert.Equal([new GraphIdleInterval(60, 1_860, false)], scene.IdleIntervals);
+    }
+
+    [Fact]
+    public void Idle_compares_endpoint_intersection_and_fails_closed_without_common_model()
+    {
+        static ApiHistoryModelSample Model(string name, ulong tokens) =>
+            new(name, null, null, null, (double)tokens)
+            {
+                TotalTokens = tokens,
+            };
+
+        static ApiHistorySample Direct(long timestamp, params ApiHistoryModelSample[] models) =>
+            new(
+                timestamp,
+                10_000,
+                90,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.ConfirmedModelSource)
+            {
+                ModelsComplete = true,
+                TaskActiveSincePrevious = false,
+                ModelSamples = models,
+            };
+
+        var oneSided = Enumerable.Range(0, 31)
+            .Select(minute => minute == 0
+                ? Direct(0, Model("SOL", 100), Model("LUNA", 200))
+                : Direct(minute * 60, Model("SOL", 100), Model("LUNA", 200), Model("TERRA", 300)))
+            .ToArray();
+        var scene = GraphScene.Create(oneSided, GraphMetric.Dollars, 0, 1_800);
+        Assert.Equal([new GraphIdleInterval(0, 1_800, false)], scene.IdleIntervals);
+
+        var disjoint = Enumerable.Range(0, 31)
+            .Select(minute => Direct(
+                minute * 60,
+                Model(minute % 2 == 0 ? "SOL" : "LUNA", 100)))
+            .ToArray();
+        scene = GraphScene.Create(disjoint, GraphMetric.Dollars, 0, 1_800);
+        Assert.Empty(scene.IdleIntervals);
+    }
+
+    [Fact]
+    public void Idle_merge_rechecks_endpoint_common_models_at_intermediate_direct_rows()
+    {
+        static ApiHistoryModelSample Model(string name, ulong tokens) =>
+            new(name, null, null, null, (double)tokens)
+            {
+                TotalTokens = tokens,
+            };
+
+        static ApiHistorySample Direct(long timestamp, params ApiHistoryModelSample[] models) =>
+            new(
+                timestamp,
+                10_000,
+                90,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.ConfirmedModelSource)
+            {
+                ModelsComplete = true,
+                TaskActiveSincePrevious = false,
+                ModelSamples = models,
+            };
+
+        var samples = Enumerable.Range(0, 59)
+            .Select(minute => minute == 29
+                ? Direct(minute * 60, Model("SOL", 100))
+                : Direct(minute * 60, Model("SOL", 100), Model("LUNA", 200)))
+            .ToArray();
+
+        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 0, 3_480);
+
+        Assert.Empty(scene.IdleIntervals);
     }
 
     [Fact]

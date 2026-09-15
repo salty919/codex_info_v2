@@ -6884,15 +6884,34 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         if untrusted_minutes.contains(&timestamp) {
             return None;
         }
-        token_timelines
+        let vector = token_timelines
             .iter()
-            .map(|(name, timeline)| {
+            .filter_map(|(name, timeline)| {
                 let point = timeline.get(&timestamp)?;
                 (point.origin == GraphModelOrigin::Direct)
                     .then(|| Some((name.clone(), graph_model_raw_tokens(point)?)))
                     .flatten()
             })
-            .collect()
+            .collect::<Vec<_>>();
+        // The model set is allowed to change over a period.  Only the models
+        // directly observed at this timestamp form the vector; a model that
+        // appeared in a legacy row elsewhere must not be fabricated here.
+        (!vector.is_empty()).then_some(vector)
+    };
+    let common_direct_tokens = |left: &[(String, u64)], right: &[(String, u64)]| {
+        let right_by_name = right
+            .iter()
+            .map(|(name, value)| (name.as_str(), *value))
+            .collect::<BTreeMap<_, _>>();
+        let common = left
+            .iter()
+            .filter_map(|(name, left_value)| {
+                right_by_name
+                    .get(name.as_str())
+                    .map(|right_value| (name.clone(), *left_value, *right_value))
+            })
+            .collect::<Vec<_>>();
+        (!common.is_empty()).then_some(common)
     };
     let direct_remaining = |timestamp: i64| -> Option<u64> {
         let mut accepted = None;
@@ -6914,6 +6933,54 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         accepted
     };
 
+    let direct_model_timestamps = token_timelines
+        .values()
+        .flat_map(BTreeMap::keys)
+        .filter(|timestamp| **timestamp >= period_start && **timestamp <= period_end)
+        .filter(|timestamp| {
+            token_timelines.values().any(|timeline| {
+                timeline
+                    .get(timestamp)
+                    .is_some_and(|point| point.origin == GraphModelOrigin::Direct)
+            })
+        })
+        .copied()
+        .collect::<BTreeSet<_>>();
+
+    // When adjacent proven pairs are merged, retain the endpoint-common
+    // model set and require every intermediate direct observation to carry
+    // those same models with the same raw token values. A model disappearing
+    // for one direct row must split the idle run instead of being hidden by
+    // pair-local intersections.
+    let direct_models_remain_flat = |start: i64, end: i64, common_tokens: &[(String, u64, u64)]| {
+        let baseline = common_tokens
+            .iter()
+            .map(|(name, left, _)| (name.as_str(), *left))
+            .collect::<BTreeMap<_, _>>();
+        for timestamp in direct_model_timestamps.range((
+            std::ops::Bound::Excluded(start),
+            std::ops::Bound::Excluded(end),
+        )) {
+            if direct_remaining(*timestamp).is_none() {
+                return false;
+            }
+            let Some(vector) = direct_vector(*timestamp) else {
+                return false;
+            };
+            let values = vector
+                .iter()
+                .map(|(name, value)| (name.as_str(), *value))
+                .collect::<BTreeMap<_, _>>();
+            if baseline
+                .iter()
+                .any(|(name, expected)| values.get(name).copied() != Some(*expected))
+            {
+                return false;
+            }
+        }
+        true
+    };
+
     let mut anchors = token_timelines
         .values()
         .flat_map(BTreeMap::keys)
@@ -6930,6 +6997,11 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         })
         .collect::<Vec<_>>();
     anchors.sort_by_key(|(timestamp, _, _)| *timestamp);
+    // `anchors` is built from the union of every direct model timestamp, so a
+    // sparse pair is the only kind of bridge left here: any intermediate
+    // direct observation is already a boundary in `windows(2)`.  Comparing
+    // the endpoint intersection therefore validates every direct point in a
+    // bridge without requiring an identical full model set.
 
     let task_was_active = |start: i64, end: i64| {
         task_activity_by_minute.is_some_and(|activity| {
@@ -6977,33 +7049,65 @@ fn token_idle_timestamp_intervals_with_render_evidence(
                 })
         })
     };
-    let mut proven = Vec::<(i64, i64)>::new();
+    let mut proven = Vec::<(i64, i64, BTreeMap<String, u64>, BTreeMap<String, u64>)>::new();
     for pair in anchors.windows(2) {
         let [(start, start_vector, start_remaining), (end, end_vector, end_remaining)] = pair
         else {
             continue;
         };
+        let Some(common_tokens) = common_direct_tokens(start_vector, end_vector) else {
+            continue;
+        };
         if end <= start
-            || start_vector != end_vector
+            || !common_tokens
+                .iter()
+                .all(|(_, left_value, right_value)| left_value == right_value)
             || start_remaining != end_remaining
             || task_was_active(*start, *end)
             || has_numeric_incomplete_row(*start, *end)
             || has_unavailable_incomplete_row(*start, *end)
+            || !direct_models_remain_flat(*start, *end, &common_tokens)
             || graph_interval_overlaps_confirmed_gap(*start, *end, confirmed_gaps)
         {
             continue;
         }
+        let start_values = start_vector
+            .iter()
+            .map(|(name, value)| (name.clone(), *value))
+            .collect::<BTreeMap<_, _>>();
+        let end_values = end_vector
+            .iter()
+            .map(|(name, value)| (name.clone(), *value))
+            .collect::<BTreeMap<_, _>>();
         if let Some(last) = proven.last_mut() {
-            if last.1 == *start {
+            if last.1 == *start
+                && ({
+                    let endpoint_common = last
+                        .2
+                        .keys()
+                        .filter(|name| end_values.contains_key(*name))
+                        .collect::<Vec<_>>();
+                    !endpoint_common.is_empty()
+                        && endpoint_common.iter().all(|name| {
+                            let baseline = last.2[*name];
+                            end_values.get(*name) == Some(&baseline)
+                                && start_values.get(*name) == Some(&baseline)
+                        })
+                })
+            {
                 last.1 = *end;
+                last.3 = end_values;
                 continue;
             }
         }
-        proven.push((*start, *end));
+        proven.push((*start, *end, start_values, end_values));
     }
     proven
         .into_iter()
-        .filter(|(start, end)| end.saturating_sub(*start) >= SUSTAINED_UNUSED_MIN_DURATION_SECONDS)
+        .filter_map(|(start, end, _, _)| {
+            (end.saturating_sub(start) >= SUSTAINED_UNUSED_MIN_DURATION_SECONDS)
+                .then_some((start, end))
+        })
         .collect()
 }
 
@@ -25502,6 +25606,14 @@ mod tests {
             }
         }
 
+        fn json_number(value: f64) -> Value {
+            if value.is_finite() && value.fract() == 0.0 && value.abs() < (1_u64 << 53) as f64 {
+                Value::from(value as i64)
+            } else {
+                serde_json::json!(value)
+            }
+        }
+
         fn segment_key(value: &Value) -> (u8, Vec<u8>, i64, i64, Vec<u8>) {
             let metric = value["metric"].as_str().expect("segment metric");
             let metric_rank = match metric {
@@ -25747,7 +25859,7 @@ mod tests {
                     serde_json::json!({
                         "series": model,
                         "timestamp": period.end_at,
-                        "value": model_value(latest, model),
+                        "value": json_number(model_value(latest, model)),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -25954,7 +26066,7 @@ mod tests {
             &references,
             period.start_at,
             period.end_at,
-            &token_timelines,
+            &super::activity_relevant_token_timelines(&token_timelines),
             true,
             &confirmed_gaps,
             &token_correction_starts,
@@ -25988,10 +26100,12 @@ mod tests {
                 .push(serde_json::json!({
                     "series": "remaining",
                     "timestamp": period.end_at,
-                    "value": remaining_evidence
-                        .last()
-                        .expect("live remaining endpoint")
-                        .effective,
+                    "value": json_number(
+                        remaining_evidence
+                            .last()
+                            .expect("live remaining endpoint")
+                            .effective,
+                    ),
                 }));
             object.insert(
                 "remaining_points".to_owned(),
@@ -26008,7 +26122,10 @@ mod tests {
             &token_minute,
             &confirmed_gaps,
             &token_correction_starts,
-            Some((&token_timelines, true)),
+            Some((
+                &super::activity_relevant_token_timelines(&token_timelines),
+                true,
+            )),
             Some(&remaining_evidence),
         ) {
             actual_segments.push(serde_json::json!({
@@ -43245,6 +43362,35 @@ mod tests {
     }
 
     #[test]
+    fn idle_bridge_allows_finite_modelless_metadata_row() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 90.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(900, 1_000, 90.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(1_800, 1_000, 90.0, ModelDollarTotals::default()),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let direct = super::GraphModelPoint {
+            dollar: 1.0,
+            tokens: 100.0,
+            raw_tokens: Some(100),
+            origin: super::GraphModelOrigin::Direct,
+        };
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([(0, direct), (1_800, direct)]),
+        )]);
+        let idle = super::token_idle_timestamp_intervals_with_render_evidence(
+            &references,
+            0,
+            1_800,
+            &timelines,
+            &[],
+            None,
+        );
+        assert_eq!(idle, vec![(0, 1_800)]);
+    }
+
+    #[test]
     fn only_sustained_flat_runs_render_as_unused_time() {
         let samples = (0..=30)
             .map(|minute| {
@@ -43430,6 +43576,149 @@ mod tests {
             });
 
         assert!(graph.unused_intervals.is_empty());
+    }
+
+    #[test]
+    fn legacy_only_model_does_not_veto_later_common_direct_idle() {
+        let samples = (0..=31)
+            .map(|minute| {
+                UsageHistorySample::new(minute * 60, 10_000, 90.0, ModelDollarTotals::default())
+            })
+            .collect::<Vec<_>>();
+        let references = samples.iter().collect::<Vec<_>>();
+        let direct = |tokens| super::GraphModelPoint {
+            dollar: tokens,
+            tokens,
+            raw_tokens: Some(tokens as u64),
+            origin: super::GraphModelOrigin::Direct,
+        };
+        let mut sol = BTreeMap::new();
+        let mut luna = BTreeMap::new();
+        for timestamp in (60..=1_860).step_by(60) {
+            sol.insert(timestamp, direct(100.0));
+            luna.insert(timestamp, direct(200.0));
+        }
+        let timelines = BTreeMap::from([
+            ("LUNA".to_owned(), luna),
+            ("SOL".to_owned(), sol),
+            (
+                "TERRA".to_owned(),
+                BTreeMap::from([(
+                    0,
+                    super::GraphModelPoint {
+                        dollar: 0.0,
+                        tokens: 0.0,
+                        raw_tokens: Some(0),
+                        origin: super::GraphModelOrigin::LegacyObserved,
+                    },
+                )]),
+            ),
+        ]);
+
+        let idle = super::token_idle_timestamp_intervals_with_render_evidence(
+            &references,
+            0,
+            1_860,
+            &timelines,
+            &[],
+            None,
+        );
+        assert_eq!(idle, vec![(60, 1_860)]);
+    }
+
+    #[test]
+    fn idle_compares_endpoint_intersection_and_fails_closed_without_common_model() {
+        let samples = (0..=30)
+            .map(|minute| {
+                UsageHistorySample::new(minute * 60, 10_000, 90.0, ModelDollarTotals::default())
+            })
+            .collect::<Vec<_>>();
+        let references = samples.iter().collect::<Vec<_>>();
+        let direct = |tokens| super::GraphModelPoint {
+            dollar: tokens as f64,
+            tokens: tokens as f64,
+            raw_tokens: Some(tokens),
+            origin: super::GraphModelOrigin::Direct,
+        };
+
+        let mut sol = BTreeMap::new();
+        let mut luna = BTreeMap::new();
+        let mut terra = BTreeMap::new();
+        for timestamp in (0..=1_800).step_by(60) {
+            sol.insert(timestamp, direct(100));
+            luna.insert(timestamp, direct(200));
+            if timestamp > 0 {
+                terra.insert(timestamp, direct(300));
+            }
+        }
+        let one_sided = BTreeMap::from([
+            ("LUNA".to_owned(), luna),
+            ("SOL".to_owned(), sol),
+            ("TERRA".to_owned(), terra),
+        ]);
+        let idle = super::token_idle_timestamp_intervals_with_render_evidence(
+            &references,
+            0,
+            1_800,
+            &one_sided,
+            &[],
+            None,
+        );
+        assert_eq!(idle, vec![(0, 1_800)]);
+
+        let mut sol = BTreeMap::new();
+        let mut luna = BTreeMap::new();
+        for timestamp in (0..=1_800).step_by(60) {
+            if timestamp % 120 == 0 {
+                sol.insert(timestamp, direct(100));
+            } else {
+                luna.insert(timestamp, direct(100));
+            }
+        }
+        let disjoint = BTreeMap::from([("LUNA".to_owned(), luna), ("SOL".to_owned(), sol)]);
+        let idle = super::token_idle_timestamp_intervals_with_render_evidence(
+            &references,
+            0,
+            1_800,
+            &disjoint,
+            &[],
+            None,
+        );
+        assert!(idle.is_empty());
+    }
+
+    #[test]
+    fn idle_merge_rechecks_endpoint_common_models_at_intermediate_direct_rows() {
+        let samples = (0..=58)
+            .map(|minute| {
+                UsageHistorySample::new(minute * 60, 10_000, 90.0, ModelDollarTotals::default())
+            })
+            .collect::<Vec<_>>();
+        let references = samples.iter().collect::<Vec<_>>();
+        let direct = |tokens| super::GraphModelPoint {
+            dollar: tokens as f64,
+            tokens: tokens as f64,
+            raw_tokens: Some(tokens),
+            origin: super::GraphModelOrigin::Direct,
+        };
+        let mut sol = BTreeMap::new();
+        let mut luna = BTreeMap::new();
+        for timestamp in (0..=3_480).step_by(60) {
+            sol.insert(timestamp, direct(100));
+            if timestamp != 1_740 {
+                luna.insert(timestamp, direct(200));
+            }
+        }
+        let timelines = BTreeMap::from([("LUNA".to_owned(), luna), ("SOL".to_owned(), sol)]);
+        let idle = super::token_idle_timestamp_intervals_with_render_evidence(
+            &references,
+            0,
+            3_480,
+            &timelines,
+            &[],
+            None,
+        );
+        assert!(idle.is_empty());
     }
 
     #[test]
