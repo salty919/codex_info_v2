@@ -1171,34 +1171,32 @@ public sealed class GraphScene
             return Array.Empty<GraphIdleInterval>();
         }
 
-        var allModelNames = samples
-            .SelectMany(PublishedModels)
-            .Select(model => model.Name)
-            .Distinct(StringComparer.Ordinal)
-            .ToArray();
         var direct = new List<(int Index, IReadOnlyDictionary<string, DirectModelValue> Vector)>();
         for (var index = 0; index < samples.Count; index++)
         {
             if (TryGetDirectModelVector(samples[index], out var vector) &&
-                vector.Count == allModelNames.Length &&
-                allModelNames.All(vector.ContainsKey) &&
+                vector.Count > 0 &&
                 double.IsFinite(samples[index].RemainingPercent ?? double.NaN))
             {
                 direct.Add((index, vector));
             }
         }
 
-        var candidates = new List<GraphIdleInterval>();
+        var candidates = new List<(
+            GraphIdleInterval Interval,
+            IReadOnlyDictionary<string, ulong> StartTokens,
+            IReadOnlyDictionary<string, ulong> EndTokens)>();
         for (var observation = 1; observation < direct.Count; observation++)
         {
             var before = direct[observation - 1];
             var after = direct[observation];
             var left = samples[before.Index];
             var right = samples[after.Index];
+            var commonModels = CommonModelNames(before.Vector, after.Vector);
             if (right.Timestamp <= left.Timestamp ||
                 left.ResetAt != right.ResetAt ||
                 !RemainingBitsEqual(left.RemainingPercent!.Value, right.RemainingPercent!.Value) ||
-                !TokenVectorsEqual(before.Vector, after.Vector) ||
+                !TokenVectorsEqualForModels(before.Vector, after.Vector, commonModels) ||
                 HasConfirmedGapBetween(
                     confirmedGaps,
                     left.Timestamp,
@@ -1208,7 +1206,8 @@ public sealed class GraphScene
                     before.Index,
                     after.Index,
                     left.ResetAt,
-                    before.Vector))
+                    before.Vector,
+                    commonModels))
             {
                 continue;
             }
@@ -1217,19 +1216,42 @@ public sealed class GraphScene
             var end = Math.Min(periodEnd, right.Timestamp);
             if (end > start)
             {
-                candidates.Add(new GraphIdleInterval(start, end, false));
+                candidates.Add((
+                    new GraphIdleInterval(start, end, false),
+                    before.Vector.Keys.ToDictionary(
+                        model => model,
+                        model => before.Vector[model].TotalTokens,
+                        StringComparer.Ordinal),
+                    after.Vector.Keys.ToDictionary(
+                        model => model,
+                        model => after.Vector[model].TotalTokens,
+                        StringComparer.Ordinal)));
             }
         }
 
-        var merged = new List<GraphIdleInterval>();
-        foreach (var candidate in candidates.OrderBy(interval => interval.StartAt))
+        var merged = new List<(
+            GraphIdleInterval Interval,
+            IReadOnlyDictionary<string, ulong> StartTokens,
+            IReadOnlyDictionary<string, ulong> EndTokens)>();
+        foreach (var candidate in candidates.OrderBy(item => item.Interval.StartAt))
         {
-            if (merged.Count > 0 && candidate.StartAt <= merged[^1].EndAt)
+            if (merged.Count > 0 && candidate.Interval.StartAt == merged[^1].Interval.EndAt &&
+                merged[^1].StartTokens.Keys
+                    .Intersect(candidate.EndTokens.Keys, StringComparer.Ordinal)
+                    .ToArray() is { Length: > 0 } endpointCommonModels &&
+                endpointCommonModels.All(model =>
+                    candidate.StartTokens.TryGetValue(model, out var boundaryValue) &&
+                    boundaryValue == merged[^1].StartTokens[model] &&
+                    candidate.EndTokens.TryGetValue(model, out var endValue) &&
+                    endValue == merged[^1].StartTokens[model]))
             {
-                merged[^1] = merged[^1] with
-                {
-                    EndAt = Math.Max(merged[^1].EndAt, candidate.EndAt),
-                };
+                merged[^1] = (
+                    merged[^1].Interval with
+                    {
+                        EndAt = Math.Max(merged[^1].Interval.EndAt, candidate.Interval.EndAt),
+                    },
+                    merged[^1].StartTokens,
+                    candidate.EndTokens);
             }
             else
             {
@@ -1238,6 +1260,7 @@ public sealed class GraphScene
         }
 
         return merged
+            .Select(item => item.Interval)
             .Where(interval => interval.EndAt - interval.StartAt >= SustainedUnusedMinimumSeconds)
             .ToArray();
     }
@@ -1247,7 +1270,8 @@ public sealed class GraphScene
         int before,
         int after,
         long resetAt,
-        IReadOnlyDictionary<string, DirectModelValue> baseline)
+        IReadOnlyDictionary<string, DirectModelValue> baseline,
+        IReadOnlySet<string> commonModels)
     {
         for (var index = before + 1; index <= after; index++)
         {
@@ -1274,7 +1298,7 @@ public sealed class GraphScene
 
             if (sample.ResetAt != resetAt ||
                 !TryGetDirectModelVector(sample, out var vector) ||
-                !TokenVectorsEqual(baseline, vector))
+                !TokenVectorsEqualForModels(baseline, vector, commonModels))
             {
                 return true;
             }
@@ -1337,6 +1361,22 @@ public sealed class GraphScene
         left.Count == right.Count && left.Keys.All(name =>
             right.TryGetValue(name, out var candidate) &&
             candidate.TotalTokens == left[name].TotalTokens);
+
+    private static IReadOnlySet<string> CommonModelNames(
+        IReadOnlyDictionary<string, DirectModelValue> left,
+        IReadOnlyDictionary<string, DirectModelValue> right) =>
+        new HashSet<string>(
+            left.Keys.Where(right.ContainsKey),
+            StringComparer.Ordinal);
+
+    private static bool TokenVectorsEqualForModels(
+        IReadOnlyDictionary<string, DirectModelValue> left,
+        IReadOnlyDictionary<string, DirectModelValue> right,
+        IReadOnlySet<string> models) =>
+        models.Count > 0 && models.All(name =>
+            left.TryGetValue(name, out var leftValue) &&
+            right.TryGetValue(name, out var rightValue) &&
+            leftValue.TotalTokens == rightValue.TotalTokens);
 
     private static bool RemainingBitsEqual(double left, double right) =>
         BitConverter.DoubleToInt64Bits(left) == BitConverter.DoubleToInt64Bits(right);
