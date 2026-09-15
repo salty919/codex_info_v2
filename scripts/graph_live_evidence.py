@@ -1285,8 +1285,6 @@ def _idle_intervals(
         left_index, right_index = index - 1, index + 1
         if timestamps[right_index] - timestamps[left_index] != 120:
             continue
-        if rows[left_index].get("task_active_since_previous") is not True:
-            continue
         left_names = _model_names_at(token_models, left_index, {"direct"})
         right_names = _model_names_at(token_models, right_index, {"direct"})
         common_names = left_names & right_names
@@ -1317,6 +1315,21 @@ def _idle_intervals(
 
     merged: list[list[int]] = []
     for start, end, observed_count in sorted(intervals):
+        if merged and start == merged[-1][1]:
+            candidate_has_unavailable = any(
+                row.get("model_source") == "unavailable"
+                for row in rows[by_timestamp[start] + 1 : by_timestamp[end]]
+            )
+            prior_has_unavailable = any(
+                row.get("model_source") == "unavailable"
+                for row in rows[by_timestamp[merged[-1][0]] + 1 : by_timestamp[start]]
+            )
+            if candidate_has_unavailable and prior_has_unavailable:
+                # Do not seed a new band with the two-minute span around a
+                # second missing row when the preceding band already crossed
+                # one. The next direct interval will start after this dashed
+                # anomaly, leaving the boundary visible.
+                continue
         if merged and start == merged[-1][1] and direct_span_is_flat(merged[-1][0], end):
             # A model may appear at a later direct endpoint, but a model that
             # was already part of the proven baseline must not disappear from
