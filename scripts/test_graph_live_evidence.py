@@ -248,6 +248,139 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         )
         self.assertEqual([], oracle.build_expected(incomplete)[1])
 
+    def test_idle_uses_later_common_model_set_after_legacy_model_transition(self):
+        rows = [
+            {
+                "timestamp": 0,
+                "remaining_percent": 90.0,
+                "models": [
+                    {"model": "SOL", "total_tokens": 100, "total_dollars": 1.0},
+                    {"model": "LUNA", "total_tokens": 200, "total_dollars": 2.0},
+                    {"model": "TERRA", "total_tokens": 0, "total_dollars": 0.0},
+                ],
+                "models_complete": False,
+                "model_source": "legacy-unknown",
+            }
+        ]
+        rows.extend(
+            {
+                "timestamp": minute * 60,
+                "remaining_percent": 90.0,
+                "models": [
+                    {"model": "SOL", "total_tokens": 100, "total_dollars": 1.0},
+                    {"model": "LUNA", "total_tokens": 200, "total_dollars": 2.0},
+                ],
+                "models_complete": True,
+                "model_source": "confirmed",
+                "task_active_since_previous": False,
+            }
+            for minute in range(1, 32)
+        )
+
+        _, idle = oracle.build_expected(v3_fixture(rows, period_id="model-set-transition"))
+
+        self.assertEqual([{"start_at": 60, "end_at": 1_860}], idle)
+
+    def test_idle_uses_endpoint_intersection_and_fails_closed_without_common_model(self):
+        def model(name, tokens):
+            return {
+                "model": name,
+                "total_tokens": tokens,
+                "total_dollars": float(tokens),
+            }
+
+        rows = [
+            {
+                "timestamp": minute * 60,
+                "remaining_percent": 90.0,
+                "models": (
+                    [model("SOL", 100), model("LUNA", 200)]
+                    if minute == 0
+                    else [model("SOL", 100), model("LUNA", 200), model("TERRA", 300)]
+                ),
+                "models_complete": True,
+                "model_source": "confirmed",
+                "task_active_since_previous": False,
+            }
+            for minute in range(31)
+        ]
+        _, idle = oracle.build_expected(v3_fixture(rows, period_id="one-sided-direct-model"))
+        self.assertEqual([{"start_at": 0, "end_at": 1_800}], idle)
+
+        disjoint_rows = [
+            {
+                "timestamp": minute * 60,
+                "remaining_percent": 90.0,
+                "models": [model("SOL" if minute % 2 == 0 else "LUNA", 100)],
+                "models_complete": True,
+                "model_source": "confirmed",
+                "task_active_since_previous": False,
+            }
+            for minute in range(31)
+        ]
+        _, idle = oracle.build_expected(v3_fixture(disjoint_rows, period_id="empty-common-model"))
+        self.assertEqual([], idle)
+
+    def test_idle_bridge_allows_finite_modelless_metadata_row(self):
+        def model(name, tokens):
+            return {
+                "model": name,
+                "total_tokens": tokens,
+                "total_dollars": float(tokens),
+            }
+
+        rows = []
+        for minute in list(range(15)) + list(range(16, 31)):
+            rows.append(
+                {
+                    "timestamp": minute * 60,
+                    "remaining_percent": 90.0,
+                    "models": [model("SOL", 100), model("LUNA", 200)],
+                    "models_complete": True,
+                    "model_source": "confirmed",
+                    "task_active_since_previous": False,
+                }
+            )
+        rows.insert(
+            15,
+            {
+                "timestamp": 900,
+                "remaining_percent": 90.0,
+                "models": None,
+                "models_complete": False,
+                "model_source": "legacy-unknown",
+                "task_active_since_previous": False,
+            },
+        )
+        _, idle = oracle.build_expected(v3_fixture(rows, period_id="metadata-only-bridge"))
+        self.assertEqual([{"start_at": 0, "end_at": 1_800}], idle)
+
+    def test_idle_merge_rechecks_endpoint_common_models_at_intermediate_direct_rows(self):
+        def model(name, tokens):
+            return {
+                "model": name,
+                "total_tokens": tokens,
+                "total_dollars": float(tokens),
+            }
+
+        rows = [
+            {
+                "timestamp": minute * 60,
+                "remaining_percent": 90.0,
+                "models": (
+                    [model("SOL", 100)]
+                    if minute == 29
+                    else [model("SOL", 100), model("LUNA", 200)]
+                ),
+                "models_complete": True,
+                "model_source": "confirmed",
+                "task_active_since_previous": False,
+            }
+            for minute in range(59)
+        ]
+        _, idle = oracle.build_expected(v3_fixture(rows, period_id="intermediate-model-gap"))
+        self.assertEqual([], idle)
+
     def test_idle_requires_thirty_minutes_and_exact_sparse_anchors_can_prove_it(self):
         self.assertEqual(
             [{"start_at": 0, "end_at": 1_800}],

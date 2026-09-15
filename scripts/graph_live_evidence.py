@@ -630,6 +630,21 @@ def _period_model_universe(
     )
 
 
+def _model_names_at(
+    projections: dict[str, list[ModelEvidence]],
+    index: int,
+    origins: set[str],
+) -> frozenset[str]:
+    return frozenset(
+        model
+        for model, projection in projections.items()
+        if index < len(projection)
+        and projection[index].value is not None
+        and projection[index].reliable
+        and projection[index].origin in origins
+    )
+
+
 def _token_interval_evidence(
     rows: list[dict[str, Any]],
     projections: dict[str, list[ModelEvidence]],
@@ -1047,11 +1062,92 @@ def _idle_intervals(
 ) -> list[dict[str, int]]:
     rows = [dict(sample, synthetic=False) for sample in samples]
     timestamps = [row["timestamp"] for row in rows]
-    universe = tuple(token_models)
     remaining = {
         point.timestamp: point
         for point in _remaining_projection(period, rows, token_models, gaps)
     }
+
+    def has_numeric_model_values(row: dict[str, Any]) -> bool:
+        return any(
+            model.get("total_tokens") is not None
+            or (
+                isinstance(model.get("total_dollars"), (int, float))
+                and math.isfinite(float(model["total_dollars"]))
+            )
+            for model in row.get("models") or []
+        )
+
+    def is_metadata_only_row(row: dict[str, Any]) -> bool:
+        value = row.get("remaining_percent")
+        return (
+            isinstance(value, (int, float))
+            and math.isfinite(float(value))
+            and 0 <= float(value) <= 100
+        )
+
+    def direct_models_remain_flat(
+        left_index: int,
+        right_index: int,
+        model_names: frozenset[str],
+    ) -> bool:
+        """Validate every point inside a sparse direct endpoint bridge."""
+
+        for index in range(left_index + 1, right_index):
+            row = rows[index]
+            if row.get("task_active_since_previous") is True:
+                return False
+            if row.get("model_source") != "confirmed" or not row.get("models_complete"):
+                if has_numeric_model_values(row) or not is_metadata_only_row(row):
+                    return False
+                continue
+            if not model_names <= _model_names_at(token_models, index, {"direct"}):
+                return False
+            for model in model_names:
+                point = token_models[model][index]
+                baseline = token_models[model][left_index]
+                if (
+                    point.value is None
+                    or not point.reliable
+                    or point.origin != "direct"
+                    or point.value != baseline.value
+                ):
+                    return False
+        return True
+
+    by_timestamp = {timestamp: index for index, timestamp in enumerate(timestamps)}
+
+    def direct_span_is_flat(start: int, end: int) -> bool:
+        """Re-check the endpoint-common model set before merging adjacent runs."""
+
+        left_index = by_timestamp.get(start)
+        right_index = by_timestamp.get(end)
+        if left_index is None or right_index is None or right_index <= left_index:
+            return False
+        left_names = _model_names_at(token_models, left_index, {"direct"})
+        right_names = _model_names_at(token_models, right_index, {"direct"})
+        common_names = left_names & right_names
+        if not common_names:
+            return False
+        if any(
+            token_models[model][left_index].value
+            != token_models[model][right_index].value
+            for model in common_names
+        ):
+            return False
+        left_remaining = remaining.get(start)
+        right_remaining = remaining.get(end)
+        if (
+            left_remaining is None
+            or right_remaining is None
+            or left_remaining.raw is None
+            or right_remaining.raw is None
+            or not math.isfinite(left_remaining.raw)
+            or not math.isfinite(right_remaining.raw)
+            or struct.pack("!d", left_remaining.raw)
+            != struct.pack("!d", right_remaining.raw)
+        ):
+            return False
+        return direct_models_remain_flat(left_index, right_index, common_names)
 
     intervals: list[tuple[int, int, int]] = []
     for index in range(len(rows) - 1):
@@ -1065,25 +1161,32 @@ def _idle_intervals(
         if _hard_break(start, end, gaps):
             continue
         if elapsed == 60:
-            available, advanced, _, _, _ = _token_interval_evidence(
-                rows,
-                token_models,
-                index,
-                index + 1,
-                universe,
-            )
+            left_names = _model_names_at(token_models, index, {"direct"})
+            right_names = _model_names_at(token_models, index + 1, {"direct"})
+            common_names = left_names & right_names
+            available = advanced = False
+            if common_names:
+                available, advanced, _, _, _ = _token_interval_evidence(
+                    rows,
+                    token_models,
+                    index,
+                    index + 1,
+                    tuple(sorted(common_names)),
+                )
             observed_count = 1 if available and not advanced else 0
         elif elapsed >= 120:
-            exact_origins = {"direct", "session"}
-            observed_count = 2 if universe and all(
-                token_models[model][index].value is not None
-                and token_models[model][index + 1].value is not None
-                and token_models[model][index].origin in exact_origins
-                and token_models[model][index + 1].origin in exact_origins
-                and token_models[model][index].value
+            # Sparse idle anchors still need direct recorder observations at
+            # both endpoints. Session/display reconstruction is presentation
+            # evidence only and cannot establish an idle authority.
+            exact_origins = {"direct"}
+            left_names = _model_names_at(token_models, index, exact_origins)
+            right_names = _model_names_at(token_models, index + 1, exact_origins)
+            common_names = left_names & right_names
+            observed_count = 2 if common_names and all(
+                token_models[model][index].value
                 == token_models[model][index + 1].value
-                for model in universe
-            ) else 0
+                for model in common_names
+            ) and direct_models_remain_flat(index, index + 1, common_names) else 0
         else:
             observed_count = 0
         if observed_count == 0:
@@ -1106,12 +1209,22 @@ def _idle_intervals(
             "interpolated",
         }:
             continue
-        if before.effective != after.effective:
+        # Idle authority is the raw provider quota at the two direct
+        # endpoints. Presentation interpolation may slope between equal raw
+        # anchors when a later quota drop is distributed across a gap; that
+        # display-only slope must not erase a proven flat interval.
+        if (
+            before.raw is None
+            or after.raw is None
+            or not math.isfinite(before.raw)
+            or not math.isfinite(after.raw)
+            or struct.pack("!d", before.raw) != struct.pack("!d", after.raw)
+        ):
             continue
         intervals.append((start, end, observed_count))
     merged: list[list[int]] = []
     for start, end, observed_count in sorted(intervals):
-        if merged and start == merged[-1][1]:
+        if merged and start == merged[-1][1] and direct_span_is_flat(merged[-1][0], end):
             merged[-1][1] = max(merged[-1][1], end)
             merged[-1][2] += observed_count
         else:
@@ -1122,8 +1235,12 @@ def _idle_intervals(
         if observed_count >= 2
         and min(end, period["end_at"]) > max(start, period["start_at"])
     ]
-    by_timestamp = {timestamp: index for index, timestamp in enumerate(timestamps)}
-    exact_model_origins = {"direct", "session", "bounded_flat"}
+    # Keep the timestamp index available for both adjacent-run validation and
+    # the sparse bridge check below.
+    # Bridge validation is likewise limited to direct recorder observations;
+    # session recovery and bounded display holds cannot prove that no tokens
+    # were spent during the missing cadence.
+    exact_model_origins = {"direct"}
     accepted_remaining_origins = {
         "raw",
         "activity_smoothed",
@@ -1143,7 +1260,12 @@ def _idle_intervals(
             for row in rows[left_index + 1 : right_index + 1]
         ):
             return False
-        for model in universe:
+        exact_names = _model_names_at(token_models, left_index, exact_model_origins)
+        right_names = _model_names_at(token_models, right_index, exact_model_origins)
+        exact_names &= right_names
+        if not exact_names:
+            return False
+        for model in exact_names:
             projection = token_models.get(model)
             if projection is None:
                 return False
@@ -1157,18 +1279,19 @@ def _idle_intervals(
                 or left.value != right.value
             ):
                 return False
-            if any(
-                point.value != left.value
-                or not point.reliable
-                or point.origin not in exact_model_origins
-                for point in projection[left_index : right_index + 1]
-            ):
-                return False
+        if not direct_models_remain_flat(left_index, right_index, exact_names):
+            return False
         left_remaining = remaining.get(start)
         right_remaining = remaining.get(end)
         if (
             left_remaining is None
             or right_remaining is None
+            or left_remaining.raw is None
+            or right_remaining.raw is None
+            or not math.isfinite(left_remaining.raw)
+            or not math.isfinite(right_remaining.raw)
+            or struct.pack("!d", left_remaining.raw)
+            != struct.pack("!d", right_remaining.raw)
             or left_remaining.origin not in accepted_remaining_origins
             or right_remaining.origin not in accepted_remaining_origins
             or left_remaining.effective != right_remaining.effective
@@ -1349,6 +1472,14 @@ def _native_graph_y(value: float, maximum: float) -> float:
 
 def _format_token_count(value: float) -> str:
     return f"{math.floor(max(0.0, value) + 0.5):,}"
+
+
+def _json_number(value: float) -> int | float:
+    """Use one JSON spelling for integral values across both renderers."""
+
+    if math.isfinite(value) and value.is_integer() and -(2**53) < value < 2**53:
+        return int(value)
+    return value
 
 
 def _format_token_axis_value(value: float) -> str:
@@ -1536,7 +1667,11 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
             {
                 "series": model,
                 "timestamp": period["end_at"],
-                "value": projections[model][-1].value,
+                "value": (
+                    None
+                    if projections[model][-1].value is None
+                    else _json_number(projections[model][-1].value)
+                ),
             }
             for model in renderable_universe
         ]
@@ -1544,7 +1679,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
             {
                 "series": "remaining",
                 "timestamp": period["end_at"],
-                "value": remaining_evidence[-1].effective,
+                "value": _json_number(remaining_evidence[-1].effective),
             }
         )
         contracts[metric] = {
