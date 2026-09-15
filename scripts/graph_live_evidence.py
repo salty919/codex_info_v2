@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 
-SUSTAINED_UNUSED_MIN_DURATION_SECONDS = 30 * 60
+SUSTAINED_UNUSED_MIN_DURATION_SECONDS = 10 * 60
 
 PAIR_HEADER = "Codex-Info-Published-Pair"
 CAUSE_ORDER = (
@@ -1056,11 +1056,10 @@ def _remaining_segments(
 
 def _idle_intervals(
     period: dict[str, Any],
-    samples: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
     token_models: dict[str, list[ModelEvidence]],
     gaps: list[dict[str, Any]],
 ) -> list[dict[str, int]]:
-    rows = [dict(sample, synthetic=False) for sample in samples]
     timestamps = [row["timestamp"] for row in rows]
     remaining = {
         point.timestamp: point
@@ -1085,6 +1084,49 @@ def _idle_intervals(
             and 0 <= float(value) <= 100
         )
 
+    def is_neutral_unavailable_row(
+        index: int,
+        left_index: int,
+        right_index: int,
+        model_names: frozenset[str],
+    ) -> bool:
+        """Allow one explicitly inactive, one-minute unavailable observation.
+
+        The row is still rendered as an unavailable/dashed observation.  It is
+        only neutral for the idle-band authority when both adjacent rows are
+        complete direct observations for the endpoint-common models.  This
+        prevents a recorder/API metadata miss from creating a false one-minute
+        split while keeping unknown or active intervals fail-closed.
+        """
+
+        if index <= left_index or index >= right_index:
+            return False
+        row = rows[index]
+        if (
+            row.get("model_source") != "unavailable"
+            or row.get("task_active_since_previous") is not False
+            or has_numeric_model_values(row)
+            or is_metadata_only_row(row)
+            or index == 0
+            or index + 1 >= len(rows)
+            or rows[index]["timestamp"] - rows[index - 1]["timestamp"] != 60
+            or rows[index + 1]["timestamp"] - rows[index]["timestamp"] != 60
+        ):
+            return False
+        previous = rows[index - 1]
+        following = rows[index + 1]
+        if (
+            previous.get("model_source") != "confirmed"
+            or not previous.get("models_complete")
+            or following.get("model_source") != "confirmed"
+            or not following.get("models_complete")
+        ):
+            return False
+        return model_names <= (
+            _model_names_at(token_models, index - 1, {"direct"})
+            & _model_names_at(token_models, index + 1, {"direct"})
+        )
+
     def direct_models_remain_flat(
         left_index: int,
         right_index: int,
@@ -1092,11 +1134,18 @@ def _idle_intervals(
     ) -> bool:
         """Validate every point inside a sparse direct endpoint bridge."""
 
+        neutral_unavailable = 0
         for index in range(left_index + 1, right_index):
             row = rows[index]
+            if row.get("model_source") == "unavailable":
+                neutral_unavailable += 1
+                if neutral_unavailable > 1:
+                    return False
             if row.get("task_active_since_previous") is True:
                 return False
             if row.get("model_source") != "confirmed" or not row.get("models_complete"):
+                if is_neutral_unavailable_row(index, left_index, right_index, model_names):
+                    continue
                 if has_numeric_model_values(row) or not is_metadata_only_row(row):
                     return False
                 continue
@@ -1134,6 +1183,11 @@ def _idle_intervals(
             for model in common_names
         ):
             return False
+        if sum(
+            row.get("model_source") == "unavailable"
+            for row in rows[left_index + 1 : right_index]
+        ) > 1:
+            return False
         left_remaining = remaining.get(start)
         right_remaining = remaining.get(end)
         if (
@@ -1149,6 +1203,12 @@ def _idle_intervals(
             return False
         return direct_models_remain_flat(left_index, right_index, common_names)
 
+    accepted_remaining_origins = {
+        "raw",
+        "activity_smoothed",
+        "bounded_null_hold",
+        "interpolated",
+    }
     intervals: list[tuple[int, int, int]] = []
     for index in range(len(rows) - 1):
         elapsed = timestamps[index + 1] - timestamps[index]
@@ -1195,19 +1255,9 @@ def _idle_intervals(
         after = remaining.get(end)
         if before is None or after is None:
             continue
-        if before.origin not in {
-            "raw",
-            "activity_smoothed",
-            "bounded_null_hold",
-            "interpolated",
-        }:
+        if before.origin not in accepted_remaining_origins:
             continue
-        if after.origin not in {
-            "raw",
-            "activity_smoothed",
-            "bounded_null_hold",
-            "interpolated",
-        }:
+        if after.origin not in accepted_remaining_origins:
             continue
         # Idle authority is the raw provider quota at the two direct
         # endpoints. Presentation interpolation may slope between equal raw
@@ -1222,9 +1272,79 @@ def _idle_intervals(
         ):
             continue
         intervals.append((start, end, observed_count))
+
+    # A single neutral unavailable row can be the first observation after an
+    # active minute.  In that shape there is no already-confirmed interval on
+    # its left to bridge from, but the two direct endpoints still prove the
+    # same idle value.  Add the two-minute endpoint span so the subsequent
+    # merge uses the same authority as the native and Windows projections.
+    for index in range(1, len(rows) - 1):
+        row = rows[index]
+        if row.get("model_source") != "unavailable":
+            continue
+        left_index, right_index = index - 1, index + 1
+        if timestamps[right_index] - timestamps[left_index] != 120:
+            continue
+        left_names = _model_names_at(token_models, left_index, {"direct"})
+        right_names = _model_names_at(token_models, right_index, {"direct"})
+        common_names = left_names & right_names
+        if (
+            not common_names
+            or not is_neutral_unavailable_row(
+                index, left_index, right_index, common_names
+            )
+            or not direct_models_remain_flat(left_index, right_index, common_names)
+        ):
+            continue
+        left_remaining = remaining.get(timestamps[left_index])
+        right_remaining = remaining.get(timestamps[right_index])
+        if (
+            left_remaining is None
+            or right_remaining is None
+            or left_remaining.raw is None
+            or right_remaining.raw is None
+            or not math.isfinite(left_remaining.raw)
+            or not math.isfinite(right_remaining.raw)
+            or struct.pack("!d", left_remaining.raw)
+            != struct.pack("!d", right_remaining.raw)
+            or left_remaining.origin not in accepted_remaining_origins
+            or right_remaining.origin not in accepted_remaining_origins
+        ):
+            continue
+        intervals.append((timestamps[left_index], timestamps[right_index], 2))
+
     merged: list[list[int]] = []
     for start, end, observed_count in sorted(intervals):
+        if merged and start == merged[-1][1]:
+            candidate_has_unavailable = any(
+                row.get("model_source") == "unavailable"
+                for row in rows[by_timestamp[start] + 1 : by_timestamp[end]]
+            )
+            prior_has_unavailable = any(
+                row.get("model_source") == "unavailable"
+                for row in rows[by_timestamp[merged[-1][0]] + 1 : by_timestamp[start]]
+            )
+            if candidate_has_unavailable and prior_has_unavailable:
+                # Do not seed a new band with the two-minute span around a
+                # second missing row when the preceding band already crossed
+                # one. The next direct interval will start after this dashed
+                # anomaly, leaving the boundary visible.
+                continue
         if merged and start == merged[-1][1] and direct_span_is_flat(merged[-1][0], end):
+            # A model may appear at a later direct endpoint, but a model that
+            # was already part of the proven baseline must not disappear from
+            # one merged idle band.  Otherwise a partial vector can be hidden
+            # by endpoint intersection and the band crosses a data-integrity
+            # boundary.
+            prior_names = _model_names_at(
+                token_models,
+                by_timestamp[merged[-1][0]],
+                {"direct"},
+            )
+            end_names = _model_names_at(token_models, by_timestamp[end], {"direct"})
+            if not prior_names <= end_names:
+                merged.append([start, end, observed_count])
+                continue
             merged[-1][1] = max(merged[-1][1], end)
             merged[-1][2] += observed_count
         else:
@@ -1241,19 +1361,22 @@ def _idle_intervals(
     # session recovery and bounded display holds cannot prove that no tokens
     # were spent during the missing cadence.
     exact_model_origins = {"direct"}
-    accepted_remaining_origins = {
-        "raw",
-        "activity_smoothed",
-        "bounded_null_hold",
-        "interpolated",
-    }
-
-    def bridge_is_confirmed_flat(start: int, end: int) -> bool:
+    def bridge_is_confirmed_flat(
+        start: int,
+        end: int,
+        combined_start: int | None = None,
+    ) -> bool:
         if end <= start or _hard_break(start, end, gaps):
             return False
         left_index = by_timestamp.get(start)
         right_index = by_timestamp.get(end)
         if left_index is None or right_index is None or right_index <= left_index:
+            return False
+        combined_left_index = by_timestamp.get(combined_start, left_index)
+        if sum(
+            row.get("model_source") == "unavailable"
+            for row in rows[combined_left_index + 1 : right_index]
+        ) > 1:
             return False
         if any(
             row.get("task_active_since_previous") is True
@@ -1262,6 +1385,12 @@ def _idle_intervals(
             return False
         exact_names = _model_names_at(token_models, left_index, exact_model_origins)
         right_names = _model_names_at(token_models, right_index, exact_model_origins)
+        # Never bridge across a direct row that drops a model already present
+        # in the preceding proven band.  Endpoint intersection alone would
+        # hide that partial vector and turn a data-integrity boundary into one
+        # continuous idle band.
+        if not exact_names <= right_names:
+            return False
         exact_names &= right_names
         if not exact_names:
             return False
@@ -1294,21 +1423,19 @@ def _idle_intervals(
             != struct.pack("!d", right_remaining.raw)
             or left_remaining.origin not in accepted_remaining_origins
             or right_remaining.origin not in accepted_remaining_origins
-            or left_remaining.effective != right_remaining.effective
         ):
             return False
-        return all(
-            point.origin in accepted_remaining_origins
-            and point.effective == left_remaining.effective
-            for point in (
-                remaining[timestamp]
-                for timestamp in timestamps[left_index : right_index + 1]
-            )
-        )
+        # Intermediate quota points may carry a presentation-only smoothing
+        # origin/effective value when a later drop is distributed.  Idle
+        # authority is the endpoint raw quota equality; the display line may
+        # still slope or dash without invalidating that proven flat band.
+        return True
 
     bridged: list[list[int]] = []
     for start, end in confirmed:
-        if bridged and start > bridged[-1][1] and bridge_is_confirmed_flat(bridged[-1][1], start):
+        if bridged and start > bridged[-1][1] and bridge_is_confirmed_flat(
+            bridged[-1][1], start, bridged[-1][0]
+        ):
             bridged[-1][1] = end
         else:
             bridged.append([start, end])
@@ -1336,7 +1463,7 @@ def build_expected(fixture: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
         for model in renderable_universe:
             segments.extend(_model_segments(rows, model, metric, projections[metric][model], gaps))
     segments.sort(key=_segment_key)
-    return segments, _idle_intervals(period, samples, token_models, gaps)
+    return segments, _idle_intervals(period, rows, token_models, gaps)
 
 
 def _canonical_coordinate(
@@ -1596,7 +1723,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
         token_models,
         gaps,
     )
-    idle = _idle_intervals(period, samples, token_models, gaps)
+    idle = _idle_intervals(period, rows, token_models, gaps)
     idle_geometry = [
         {
             "start": f"{(interval['start_at'] - period['start_at']) / max(1, period['end_at'] - period['start_at']) * 100.0:.12f}",

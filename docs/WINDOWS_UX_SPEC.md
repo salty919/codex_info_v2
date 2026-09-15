@@ -293,6 +293,7 @@ component順や表示所有者を変更しない。
 - `reconstructed-from-session`、`unknown`、`unavailable`および（`legacy-unknown`を除く）`models_complete=false`ではモデル数値を表示せず、
   model key/sourceと欠損metadataだけを表示する。`legacy-unknown`は保存済みの同じmodel keyの値だけ表示できるが、集計・予測・idle判定には使わない。
   直接観測(`confirmed`)の値だけを通常線とし、補間・hold・smoothing・予測はUI presentation-onlyでAPI/DBへ書き戻さない。
+  これらの破線はDBまたは取得記録の欠損・異常を示すNG表示であり、正常な実線の代替ではない。
 - model系列の有限表示状態は次を正本とし、model名ごとの全直積には展開しない。
 
   | 入力状態 | 表示契約 |
@@ -311,9 +312,11 @@ component順や表示所有者を変更しない。
   アイドル帯はsame `reset_at`のperiod内で、両endpointが`confirmed`かつ`models_complete=true`、同じmodel key集合、全raw
   `total_tokens`がexact equal、raw Remainingがfiniteかつbitwise equalであり、active、confirmed gap、直接観測値の矛盾が
   ない区間だけを候補にする。`legacy-unknown`、`unknown`、`unavailable`、欠損・補間・hold・smoothing・予測値はendpointまたは
-  矛盾なしのauthorityにしない。ただし完全directな同値endpoint間の数値なしmetadata rowは、両endpointが境界づけた不変区間を
-  否定しない。上記条件を満たす連続30分以上のrunだけをgray表示し、観測点数・cadence・direct endpointを欠く欠測時間だけで確定しない。
-  30分は画面幅に依存しない意味閾値とし、pixel幅filter、最小表示幅、gridまたはsegment境界によって削除・周期分断しない。
+  矛盾なしのauthorityにしない。ただし完全directな同値endpoint間に、数値を持たず
+  `task_active_since_previous=false`の`unavailable` rowが正確に1件だけあり、前後が1分cadenceの同じdirect model集合で
+  境界づけられる場合は、中立的な欠測としてidle帯だけを橋渡しできる（その表示線は破線のまま）。連続または複数の
+  `unavailable`、active/unknown、cadence欠落、その他の不完全rowは分断する。上記条件を満たす連続10分以上のrunだけをgray表示し、観測点数・cadence・direct endpointを欠く欠測時間だけで確定しない。
+  10分は画面幅に依存しない意味閾値とし、pixel幅filter、最小表示幅、gridまたはsegment境界によって削除・周期分断しない。
   Remainingは`G137-6`に従い、完全な全modelの`Direct` token証拠があるspanでは各隣接intervalのtoken増分合計に比例して
   低下を配分し、token増分0のintervalと未使用帯ではexactな水平線とする。実利用が偏ったspanを一定速度の直線へ
   捏造しない。1 intervalでもtoken証拠が欠けるか矛盾する場合はspan全体をelapsed比の参考bridgeへfallbackし、

@@ -323,7 +323,7 @@ fail-closedでprefixを推測しない。未帰属quotaを特定modelの消費�
    `candidate >= baseline`の値だけをaccepted recoveryとしてstateを抜ける。それまでの候補は全て異常である。
    model pointは`Unknown`（当該metric欠測）、`Direct`（同じmodel keyの周期実測）、`Interpolated`、`Held`、
    `Rejected`を区別する。`Direct`だけがAPI/DB公開、集計、idle判定に利用でき、その他はUI presentation-onlyの
-   破線または欠損表示とする。
+   破線または欠損表示とする。この破線はDBまたは取得記録の欠損・異常を示すNG表示であり、正常な実線の代替ではない。
    保存済み累積ドルを実測anchorとし、ドル欠測点は`Unknown`のまま前後anchor間だけ補間し、右anchorが
    なければ最後の実測ドルをperiod endまで水平holdする。現在または単一versionの単価で過去の累積token全量を
    再評価して実測ドルを置換してはならない。
@@ -353,14 +353,16 @@ fail-closedでprefixを推測しない。未帰属quotaを特定modelの消費�
    `model_source=confirmed`かつ`models_complete=true`であり、全modelのraw `total_tokens`がexact equal、raw
    `remaining_percent`がfiniteかつbitwise equalで、task active、confirmed gap、直接観測値の矛盾がないことを必須とする。
    `legacy-unknown`、`unknown`、`unavailable`、欠損・補間・hold・smoothing・予測値をendpointまたは矛盾なしの証拠にはせず、
-   false/nullのmetadataも非activeの証明へ変換しない。ただし、完全directな同値endpoint間に数値を持たないmetadata rowしか
-   ない場合、そのrow自体は両endpointが境界づけた不変区間を否定しない。上記条件を満たす連続runが30分以上の場合だけ、その
-   run全体をsession-levelのidle bandとして表示する。30分未満のrun、cadenceの数や観測点数だけでの確定、direct endpointを
+   false/nullのmetadataも非activeの証明へ変換しない。ただし、完全directな同値endpoint間に、数値を持たず
+   `task_active_since_previous=false`の`unavailable` rowが正確に1件だけあり、前後が1分cadenceの同じdirect model集合で
+   境界づけられる場合は、そのrowをidle authorityの中立的な欠測として橋渡しできる（表示線は破線のまま）。連続または
+   複数の`unavailable`、active/unknown、cadence欠落、その他の不完全rowは候補を分断する。上記条件を満たす連続runが10分以上の場合だけ、その
+   run全体をsession-levelのidle bandとして表示する。10分未満のrun、cadenceの数や観測点数だけでの確定、direct endpointを
    欠く欠測時間だけのbridgeはidleへ昇格しない。画面幅やpixel数によって閾値を変えない。
    画面幅、pixel丸め、gridまたはsegment境界を理由にbandを削除・周期分断しない。
 
    periodの和集合`U`に存在しても両endpointで未掲載のmodelはその区間へ創作しない。ドル値・単価・丸めは
-   未使用判定へ一切使用しない。token増加、片endpointだけのmodel欠落、model集合変更、unavailable、confirmed gap、
+   未使用判定へ一切使用しない。token増加、片endpointだけのmodel欠落、model集合変更、（上記の単発中立欠測を除く）unavailable、confirmed gap、
    token異常、Remaining変化、Remaining anomaly／terminal hold、task lifecycleのactiveは未使用へ
    読み替えない。Remainingがraw-nullまたは理論配分の区間は、finite raw Remainingがないためidle候補にできない。
    lifecycle unknownだけでは他の完全な証拠をidleへ昇格しない。
