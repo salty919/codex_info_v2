@@ -321,6 +321,25 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         _, idle = oracle.build_expected(v3_fixture(disjoint_rows, period_id="empty-common-model"))
         self.assertEqual([], idle)
 
+    def test_idle_rows_stay_aligned_when_reset_boundary_is_inserted(self):
+        rows = [
+            {
+                "timestamp": minute * 60,
+                "remaining_percent": 90.0,
+                "tokens": 100,
+                "task_active_since_previous": False,
+            }
+            for minute in range(1, 32)
+        ]
+        fixture = v3_fixture(rows, period_id="reset-boundary-idle-alignment")
+        fixture["period"].update(start_at=0, reset_at=604_800)
+        for sample in fixture["history_page"]["history_samples"]:
+            sample["reset_at"] = 604_800
+
+        _, idle = oracle.build_expected(fixture)
+
+        self.assertEqual([{"start_at": 60, "end_at": 1_860}], idle)
+
     def test_idle_bridge_allows_finite_modelless_metadata_row(self):
         def model(name, tokens):
             return {
@@ -379,11 +398,14 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             for minute in range(59)
         ]
         _, idle = oracle.build_expected(v3_fixture(rows, period_id="intermediate-model-gap"))
-        self.assertEqual([], idle)
-
-    def test_idle_requires_thirty_minutes_and_exact_sparse_anchors_can_prove_it(self):
         self.assertEqual(
-            [{"start_at": 0, "end_at": 1_800}],
+            [{"start_at": 0, "end_at": 1_680}, {"start_at": 1_740, "end_at": 3_480}],
+            idle,
+        )
+
+    def test_idle_requires_ten_minutes_and_exact_sparse_anchors_can_prove_it(self):
+        self.assertEqual(
+            [{"start_at": 0, "end_at": 600}],
             oracle.build_expected(
                 v3_fixture(
                     [
@@ -393,7 +415,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
                             "tokens": 100,
                             "task_active_since_previous": False,
                         }
-                        for minute in range(31)
+                        for minute in range(11)
                     ]
                 )
             )[1],
@@ -429,6 +451,73 @@ class GraphLiveEvidenceTests(unittest.TestCase):
                     ]
                 )
             )[1],
+        )
+
+    def test_idle_bridges_one_inactive_unavailable_minute_but_not_consecutive_or_active(self):
+        rows = [
+            {
+                "timestamp": minute * 60,
+                "remaining_percent": 90.0,
+                "tokens": 100,
+                "task_active_since_previous": False,
+            }
+            for minute in range(11)
+        ]
+        rows[5].update(
+            {
+                "remaining_percent": None,
+                "models": None,
+                "models_complete": False,
+                "model_source": "unavailable",
+            }
+        )
+        self.assertEqual(
+            [{"start_at": 0, "end_at": 600}],
+            oracle.build_expected(v3_fixture(rows, period_id="inactive-unavailable-bridge"))[1],
+        )
+
+        consecutive = copy.deepcopy(rows)
+        consecutive[6].update(
+            {
+                "remaining_percent": None,
+                "models": None,
+                "models_complete": False,
+                "model_source": "unavailable",
+            }
+        )
+        self.assertEqual(
+            [],
+            oracle.build_expected(v3_fixture(consecutive, period_id="consecutive-unavailable"))[1],
+        )
+
+        active = copy.deepcopy(rows)
+        active[5]["task_active_since_previous"] = True
+        self.assertEqual(
+            [],
+            oracle.build_expected(v3_fixture(active, period_id="active-unavailable"))[1],
+        )
+
+        separated = [
+            {
+                "timestamp": minute * 60,
+                "remaining_percent": 90.0,
+                "tokens": 100,
+                "task_active_since_previous": False,
+            }
+            for minute in range(35)
+        ]
+        for minute in (5, 21):
+            separated[minute].update(
+                {
+                    "remaining_percent": None,
+                    "models": None,
+                    "models_complete": False,
+                    "model_source": "unavailable",
+                }
+            )
+        self.assertEqual(
+            [{"start_at": 0, "end_at": 1_200}, {"start_at": 1_320, "end_at": 2_040}],
+            oracle.build_expected(v3_fixture(separated, period_id="separated-unavailable"))[1],
         )
 
     def test_idle_bridges_missing_cadence_only_between_two_proven_flat_runs(self):

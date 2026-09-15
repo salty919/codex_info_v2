@@ -64,7 +64,7 @@ $script:e2eProcess = $null
 $script:e2eFixtureRunning = $false
 $script:e2eFixturePort = 0
 $script:e2eFixturePortVariable = 'CODEX_INFO_WINDOWS_E2E_FIXTURE_PORT'
-$script:e2eFixtureUnusedMinimumSeconds = 30 * 60
+$script:e2eFixtureUnusedMinimumSeconds = 10 * 60
 $script:e2eFixturePastIdleStartFraction = 0.25
 $script:e2eFixturePastIdleEndFraction = 0.50
 $script:e2ePreviewEnabled = -not [string]::IsNullOrWhiteSpace($env:CODEX_INFO_WINDOWS_PREVIEW)
@@ -2456,7 +2456,7 @@ function Assert-E2EFixtureV3PreflightResponses {
         'Fixture past history does not place its confirmed idle interval at the declared period fractions.'
     Assert-E2E (([Int64]$pastSamples[2].timestamp - [Int64]$pastSamples[1].timestamp) -eq
         $script:e2eFixtureUnusedMinimumSeconds) `
-        'Fixture past history must prove the exact 30-minute unused threshold.'
+        'Fixture past history must prove the exact 10-minute unused threshold.'
     Assert-E2E (@($pastSamples[1..2] | Where-Object {
             -not $_.models_complete -or $_.model_source -cne 'confirmed' -or
             [Int64]$_.reset_at -ne [Int64]$pastPeriod[0].reset_at
@@ -2507,7 +2507,7 @@ function New-E2EFixtureDocuments {
     $currentReset = $now + 7200
     $pastStart = $now - 360
     $pastReset = $now - 180
-    # The current graph contract admits an unused band only after 30 minutes
+    # The current graph contract admits an unused band only after 10 minutes
     # of unchanged direct observations. Keep the legacy compatibility document
     # compact, while the v3 UI fixture proves that real threshold explicitly.
     $v3PastReset = $now - 3600

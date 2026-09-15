@@ -824,6 +824,8 @@ def validate(workflows: Mapping[str, str]) -> list[str]:
         "scripts/build_linux_bundle.sh",
         "scripts/test_linux_bundle.sh",
         'CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info"',
+        "xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -noreset -ac'",
+        "env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET",
         "scripts/x11_service_recovery_visual_gate.sh",
         "uses: actions/upload-artifact@v6",
         "release-candidate-linux-v1-pr-${{ inputs.pr_number }}",
