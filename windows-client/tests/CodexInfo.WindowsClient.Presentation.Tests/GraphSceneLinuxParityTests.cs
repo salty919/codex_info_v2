@@ -251,30 +251,75 @@ public sealed class GraphSceneLinuxParityTests
     }
 
     [Fact]
-    public void IdleRejectsUnavailableRowsWithoutQuotaBetweenDirectEndpoints()
+    public void IdleBridgesOneInactiveUnavailableMinuteBetweenDirectEndpoints()
     {
-        var samples = new[]
-        {
-            V3Sample(1_000, 90, Model("SOL", 10, 1), Model("TERRA", 0, 0)),
-            new ApiHistorySample(
-                1_900,
-                10_000,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                null,
-                ApiHistorySample.UnavailableModelSource)
-            {
-                ModelsComplete = false,
-                TaskActiveSincePrevious = false,
-            },
-            V3Sample(2_800, 90, Model("SOL", 10, 1), Model("TERRA", 0, 0)),
-        };
+        var samples = Enumerable.Range(0, 11)
+            .Select(minute => minute == 5
+                ? new ApiHistorySample(
+                    1_000 + minute * 60,
+                    10_000,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    ApiHistorySample.UnavailableModelSource)
+                {
+                    ModelsComplete = false,
+                    TaskActiveSincePrevious = false,
+                }
+                : V3Sample(1_000 + minute * 60, 90, Model("SOL", 10, 1), Model("TERRA", 0, 0)))
+            .ToArray();
 
-        Assert.Empty(GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 2_800).IdleIntervals);
+        Assert.Equal(
+            [new GraphIdleInterval(1_000, 1_600, false)],
+            GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_600).IdleIntervals);
+    }
+
+    [Fact]
+    public void IdleRejectsConsecutiveInactiveUnavailableMinutes()
+    {
+        var samples = Enumerable.Range(0, 11)
+            .Select(minute => minute is 5 or 6
+                ? new ApiHistorySample(
+                    1_000 + minute * 60,
+                    10_000,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    ApiHistorySample.UnavailableModelSource)
+                {
+                    ModelsComplete = false,
+                    TaskActiveSincePrevious = false,
+                }
+                : V3Sample(1_000 + minute * 60, 90, Model("SOL", 10, 1), Model("TERRA", 0, 0)))
+            .ToArray();
+
+        Assert.Empty(GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_600).IdleIntervals);
+    }
+
+    [Fact]
+    public void ActiveMinuteSplitsTenMinuteIdleBands()
+    {
+        var samples = Enumerable.Range(0, 22)
+            .Select(minute => V3Sample(1_000 + minute * 60, 90, Model("SOL", 10, 1)) with
+            {
+                TaskActiveSincePrevious = minute == 11,
+            })
+            .ToArray();
+
+        Assert.Equal(
+            [
+                new GraphIdleInterval(1_000, 1_600, false),
+                new GraphIdleInterval(1_660, 2_260, false),
+            ],
+            GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 2_260).IdleIntervals);
     }
 
     [Fact]

@@ -291,8 +291,9 @@ public sealed class GraphPlotControlTests
             GraphPlotProjection.BuildAxes(hiddenTokens, TimeZoneInfo.Utc, CultureInfo.InvariantCulture)
                 .ModelDisplayMaximum);
 
-        Assert.Empty(dollars.IdleIntervals);
-        Assert.Empty(hiddenDollars.IdleIntervals);
+        var expectedIdle = new[] { new GraphIdleInterval(1_000, 2_740, false) };
+        Assert.Equal(expectedIdle, dollars.IdleIntervals);
+        Assert.Equal(expectedIdle, hiddenDollars.IdleIntervals);
         Assert.Contains("TERRA", dollars.ModelSeries.Keys);
         Assert.DoesNotContain("TERRA", hiddenDollars.ModelSeries.Keys);
         Assert.Contains(
@@ -1111,27 +1112,32 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Idle_intervals_require_thirty_minutes_between_equal_direct_endpoints()
+    public void Idle_intervals_require_ten_minutes_between_equal_direct_endpoints()
     {
-        var points = Enumerable.Range(0, 31)
+        var points = Enumerable.Range(0, 11)
             .Select(minute => Point(1_000 + minute * 60, 100, 0, 0, 0))
             .ToArray();
 
-        var intervals = Scene(points, 1_000, 2_800).IdleIntervals;
+        var intervals = Scene(points, 1_000, 1_600).IdleIntervals;
 
         Assert.Single(intervals);
-        Assert.Equal((1_000L, 2_800L, false), (intervals[0].StartAt, intervals[0].EndAt, intervals[0].PreserveBoundary));
+        Assert.Equal((1_000L, 1_600L, false), (intervals[0].StartAt, intervals[0].EndAt, intervals[0].PreserveBoundary));
 
         var sparse = new[]
         {
             Point(1_000, 100, 0, 0, 0),
-            Point(2_800, 100, 0, 0, 0),
+            Point(1_600, 100, 0, 0, 0),
         };
-        var sparseIntervals = Scene(sparse, 1_000, 2_800).IdleIntervals;
+        var sparseIntervals = Scene(sparse, 1_000, 1_600).IdleIntervals;
 
         Assert.Equal(
-            [new GraphIdleInterval(1_000, 2_800, false)],
+            [new GraphIdleInterval(1_000, 1_600, false)],
             sparseIntervals);
+
+        var nineMinutes = Enumerable.Range(0, 10)
+            .Select(minute => Point(1_000 + minute * 60, 100, 0, 0, 0))
+            .ToArray();
+        Assert.Empty(Scene(nineMinutes, 1_000, 1_540).IdleIntervals);
     }
 
     [Fact]
@@ -2630,7 +2636,12 @@ public sealed class GraphPlotControlTests
 
         var scene = GraphScene.Create(samples, GraphMetric.Dollars, 0, 3_480);
 
-        Assert.Empty(scene.IdleIntervals);
+        Assert.Equal(
+            [
+                new GraphIdleInterval(0, 1_680, false),
+                new GraphIdleInterval(1_740, 3_480, false),
+            ],
+            scene.IdleIntervals);
     }
 
     [Fact]
@@ -2754,7 +2765,12 @@ public sealed class GraphPlotControlTests
         var activeScene = GraphScene.Create(active, GraphMetric.Dollars, 1_000, 2_800);
 
         Assert.Equal([new GraphIdleInterval(1_000, 2_800, false)], unknownScene.IdleIntervals);
-        Assert.Empty(activeScene.IdleIntervals);
+        Assert.Equal(
+            [
+                new GraphIdleInterval(1_000, 1_840, false),
+                new GraphIdleInterval(1_900, 2_800, false),
+            ],
+            activeScene.IdleIntervals);
     }
 
     [Fact]

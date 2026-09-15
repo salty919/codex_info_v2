@@ -56,7 +56,7 @@ public sealed class GraphScene
     // A gray band denotes a sustained session-level break. Two adjacent exact
     // flat intervals establish a candidate, but ordinary short publication
     // pauses must remain part of the foreground timeline.
-    private const long SustainedUnusedMinimumSeconds = 30 * 60;
+    private const long SustainedUnusedMinimumSeconds = 10 * 60;
     private const long WeeklyQuotaWindowSeconds = 7 * 24 * 60 * 60;
     private const long ResetAtToleranceSeconds = 60;
 
@@ -1239,6 +1239,7 @@ public sealed class GraphScene
                 merged[^1].StartTokens.Keys
                     .Intersect(candidate.EndTokens.Keys, StringComparer.Ordinal)
                     .ToArray() is { Length: > 0 } endpointCommonModels &&
+                merged[^1].StartTokens.Keys.All(candidate.EndTokens.ContainsKey) &&
                 endpointCommonModels.All(model =>
                     candidate.StartTokens.TryGetValue(model, out var boundaryValue) &&
                     boundaryValue == merged[^1].StartTokens[model] &&
@@ -1273,6 +1274,7 @@ public sealed class GraphScene
         IReadOnlyDictionary<string, DirectModelValue> baseline,
         IReadOnlySet<string> commonModels)
     {
+        var neutralUnavailableCount = 0;
         for (var index = before + 1; index <= after; index++)
         {
             var sample = samples[index];
@@ -1284,6 +1286,23 @@ public sealed class GraphScene
             if (sample.ModelSource != ApiHistorySample.ConfirmedModelSource ||
                 !sample.ModelsComplete)
             {
+                if (IsNeutralUnavailableRow(
+                    samples,
+                    index,
+                    before,
+                    after,
+                    resetAt,
+                    commonModels))
+                {
+                    neutralUnavailableCount++;
+                    if (neutralUnavailableCount > 1)
+                    {
+                        return true;
+                    }
+
+                    continue;
+                }
+
                 // A non-direct row with model numerics is an observed but
                 // incomplete vector, so it disproves an otherwise flat idle
                 // span. Rows carrying only lifecycle/quota metadata remain
@@ -1316,6 +1335,36 @@ public sealed class GraphScene
         sample.RemainingPercent is double remaining &&
         double.IsFinite(remaining) &&
         remaining is >= 0 and <= 100;
+
+    private static bool IsNeutralUnavailableRow(
+        IReadOnlyList<ApiHistorySample> samples,
+        int index,
+        int before,
+        int after,
+        long resetAt,
+        IReadOnlySet<string> commonModels)
+    {
+        var sample = samples[index];
+        if (index <= before || index >= after ||
+            sample.ModelSource != ApiHistorySample.UnavailableModelSource ||
+            sample.TaskActiveSincePrevious is not false ||
+            HasNumericModelValues(sample) ||
+            HasMetadataOnlyEvidence(sample) ||
+            index == 0 ||
+            index + 1 >= samples.Count ||
+            sample.Timestamp - samples[index - 1].Timestamp != 60 ||
+            samples[index + 1].Timestamp - sample.Timestamp != 60 ||
+            samples[index - 1].ResetAt != resetAt ||
+            samples[index + 1].ResetAt != resetAt ||
+            !TryGetDirectModelVector(samples[index - 1], out var previous) ||
+            !TryGetDirectModelVector(samples[index + 1], out var following))
+        {
+            return false;
+        }
+
+        return commonModels.All(model =>
+            previous.ContainsKey(model) && following.ContainsKey(model));
+    }
 
     private static bool TryGetDirectModelVector(
         ApiHistorySample sample,

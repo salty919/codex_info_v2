@@ -727,8 +727,8 @@ const MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS: i64 = 60;
 // The gray background represents sustained unused time, not every short pause
 // between task publications. Keep the exact-token/quota proof above as the
 // candidate authority, merge every provably continuous run first, and only
-// then expose a session-level break of at least 30 minutes.
-const SUSTAINED_UNUSED_MIN_DURATION_SECONDS: i64 = 30 * 60;
+// then expose a session-level break of at least 10 minutes.
+const SUSTAINED_UNUSED_MIN_DURATION_SECONDS: i64 = 10 * 60;
 const MOVING_RESET_MIN_HORIZON_SECONDS: i64 = 86_400;
 
 /// Return the start of the collector's minute bucket using mathematical
@@ -6653,8 +6653,9 @@ fn split_metric_line_paths_with_boundaries(
 }
 
 /// Return horizontal bands only where every represented cumulative model
-/// series is confirmed unchanged. Missing and unavailable evidence belongs to
-/// the thin dashed paths and must never be labelled as idle.
+/// series is confirmed unchanged. Missing and unavailable evidence remains in
+/// the thin dashed paths; only one explicitly inactive, one-minute unavailable
+/// row bounded by direct neighbors may be neutral for the idle band.
 #[cfg(test)]
 fn unused_interval_positions(
     points: &[HourlyModelSpend],
@@ -7031,24 +7032,67 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         })
     };
     // A source row with neither a complete model vector nor a valid quota is
-    // an unavailable observation, not harmless metadata. It must break an
-    // idle candidate even when the row has no model timeline entry at all.
-    let has_unavailable_incomplete_row = |start: i64, end: i64| {
-        samples.iter().any(|sample| {
-            let minute = sample.timestamp.div_euclid(60) * 60;
-            minute > start
-                && minute <= end
-                && untrusted_minutes.contains(&minute)
-                && (!sample.remaining_percent.is_finite()
-                    || !(0.0..=100.0).contains(&sample.remaining_percent))
-                && !token_timelines.values().any(|timeline| {
-                    timeline.get(&minute).is_some_and(|point| {
-                        point.origin == GraphModelOrigin::LegacyObserved
-                            && point.raw_tokens.is_some()
+    // normally an unavailable observation and must break an idle candidate.
+    // The one bounded exception is a single, one-minute unavailable row whose
+    // lifecycle marker explicitly says inactive and whose immediate neighbors
+    // are complete direct rows for the endpoint-common model set.  It remains
+    // dashed in the rendered series; it is only neutral for the idle band so
+    // a recorder/API metadata miss does not create a false one-minute split.
+    let has_unavailable_incomplete_row =
+        |start: i64, end: i64, common_tokens: &[(String, u64, u64)]| {
+            let mut neutral_unavailable = 0usize;
+            for (index, sample) in samples.iter().enumerate() {
+                let minute = sample.timestamp.div_euclid(60) * 60;
+                if minute <= start
+                    || minute >= end
+                    || !untrusted_minutes.contains(&minute)
+                    || (sample.remaining_percent.is_finite()
+                        && (0.0..=100.0).contains(&sample.remaining_percent))
+                    || token_timelines.values().any(|timeline| {
+                        timeline.get(&minute).is_some_and(|point| {
+                            point.origin == GraphModelOrigin::LegacyObserved
+                                && point.raw_tokens.is_some()
+                        })
                     })
-                })
-        })
-    };
+                {
+                    continue;
+                }
+
+                let explicitly_inactive = task_activity_by_minute
+                    .is_some_and(|activity| activity.get(&minute).copied() == Some(Some(false)));
+                let adjacent_direct = index > 0
+                    && index + 1 < samples.len()
+                    && samples[index].timestamp - samples[index - 1].timestamp == 60
+                    && samples[index + 1].timestamp - samples[index].timestamp == 60
+                    && direct_vector(samples[index - 1].timestamp).is_some_and(|vector| {
+                        let values = vector
+                            .into_iter()
+                            .map(|(name, value)| (name, value))
+                            .collect::<BTreeMap<_, _>>();
+                        common_tokens
+                            .iter()
+                            .all(|(name, _, _)| values.contains_key(name))
+                    })
+                    && direct_vector(samples[index + 1].timestamp).is_some_and(|vector| {
+                        let values = vector
+                            .into_iter()
+                            .map(|(name, value)| (name, value))
+                            .collect::<BTreeMap<_, _>>();
+                        common_tokens
+                            .iter()
+                            .all(|(name, _, _)| values.contains_key(name))
+                    });
+                if explicitly_inactive && adjacent_direct {
+                    neutral_unavailable += 1;
+                    if neutral_unavailable > 1 {
+                        return true;
+                    }
+                } else {
+                    return true;
+                }
+            }
+            false
+        };
     let mut proven = Vec::<(i64, i64, BTreeMap<String, u64>, BTreeMap<String, u64>)>::new();
     for pair in anchors.windows(2) {
         let [(start, start_vector, start_remaining), (end, end_vector, end_remaining)] = pair
@@ -7065,7 +7109,7 @@ fn token_idle_timestamp_intervals_with_render_evidence(
             || start_remaining != end_remaining
             || task_was_active(*start, *end)
             || has_numeric_incomplete_row(*start, *end)
-            || has_unavailable_incomplete_row(*start, *end)
+            || has_unavailable_incomplete_row(*start, *end, &common_tokens)
             || !direct_models_remain_flat(*start, *end, &common_tokens)
             || graph_interval_overlaps_confirmed_gap(*start, *end, confirmed_gaps)
         {
@@ -7087,7 +7131,14 @@ fn token_idle_timestamp_intervals_with_render_evidence(
                         .keys()
                         .filter(|name| end_values.contains_key(*name))
                         .collect::<Vec<_>>();
+                    // A model may be added at a later direct endpoint, but
+                    // a model that was already part of the proven baseline
+                    // must never disappear inside one merged idle band.
+                    // Otherwise a one-minute partial vector could be hidden
+                    // by the endpoint intersection and the band would cross
+                    // a real data-integrity boundary.
                     !endpoint_common.is_empty()
+                        && last.2.keys().all(|name| end_values.contains_key(name))
                         && endpoint_common.iter().all(|name| {
                             let baseline = last.2[*name];
                             end_values.get(*name) == Some(&baseline)
@@ -43392,7 +43443,7 @@ mod tests {
 
     #[test]
     fn only_sustained_flat_runs_render_as_unused_time() {
-        let samples = (0..=30)
+        let samples = (0..=10)
             .map(|minute| {
                 UsageHistorySample::new(minute * 60, 10_000, 90.0, ModelDollarTotals::default())
             })
@@ -43436,9 +43487,9 @@ mod tests {
             .unused_intervals
         };
 
-        assert!(graph(29 * 60).is_empty());
+        assert!(graph(9 * 60).is_empty());
         assert_eq!(
-            graph(30 * 60),
+            graph(10 * 60),
             [super::UnusedIntervalPosition {
                 start: 0.0,
                 width: 100.0,
@@ -43574,6 +43625,126 @@ mod tests {
                 confirmed_gaps: &[],
                 model_timelines: &timelines,
             });
+
+        assert!(graph.unused_intervals.is_empty());
+    }
+
+    #[test]
+    fn inactive_single_unavailable_minute_bridges_idle_band() {
+        let samples = (0..=10)
+            .map(|minute| {
+                UsageHistorySample::new(
+                    minute * 60,
+                    1_000,
+                    if minute == 5 { f64::NAN } else { 90.0 },
+                    ModelDollarTotals::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let references = samples.iter().collect::<Vec<_>>();
+        let direct = |timestamp| {
+            (
+                timestamp,
+                super::GraphModelPoint {
+                    dollar: 1.0,
+                    tokens: 100.0,
+                    raw_tokens: Some(100),
+                    origin: super::GraphModelOrigin::Direct,
+                },
+            )
+        };
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            (0..=10)
+                .filter(|minute| *minute != 5)
+                .map(|minute| direct(minute * 60))
+                .collect(),
+        )]);
+        let activity = (1..=10)
+            .map(|minute| (minute * 60, Some(false)))
+            .collect::<BTreeMap<_, _>>();
+        let untrusted_minutes = BTreeSet::from([300]);
+
+        let graph =
+            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: 0,
+                    period_end: 600,
+                    show_luna: false,
+                    show_terra: false,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: true,
+                    untrusted_minutes: &untrusted_minutes,
+                    confirmed_gaps: &[],
+                    model_timelines: &timelines,
+                },
+                Some(&activity),
+            );
+
+        assert_eq!(graph.unused_intervals.len(), 1);
+        assert_eq!(graph.unused_intervals[0].start, 0.0);
+        assert_eq!(graph.unused_intervals[0].width, 100.0);
+    }
+
+    #[test]
+    fn consecutive_unavailable_minutes_still_break_idle_band() {
+        let samples = (0..=10)
+            .map(|minute| {
+                UsageHistorySample::new(
+                    minute * 60,
+                    1_000,
+                    if minute == 5 || minute == 6 {
+                        f64::NAN
+                    } else {
+                        90.0
+                    },
+                    ModelDollarTotals::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let references = samples.iter().collect::<Vec<_>>();
+        let direct = |timestamp| {
+            (
+                timestamp,
+                super::GraphModelPoint {
+                    dollar: 1.0,
+                    tokens: 100.0,
+                    raw_tokens: Some(100),
+                    origin: super::GraphModelOrigin::Direct,
+                },
+            )
+        };
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            (0..=10)
+                .filter(|minute| *minute != 5 && *minute != 6)
+                .map(|minute| direct(minute * 60))
+                .collect(),
+        )]);
+        let activity = (1..=10)
+            .map(|minute| (minute * 60, Some(false)))
+            .collect::<BTreeMap<_, _>>();
+        let untrusted_minutes = BTreeSet::from([300, 360]);
+
+        let graph =
+            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: 0,
+                    period_end: 600,
+                    show_luna: false,
+                    show_terra: false,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: true,
+                    untrusted_minutes: &untrusted_minutes,
+                    confirmed_gaps: &[],
+                    model_timelines: &timelines,
+                },
+                Some(&activity),
+            );
 
         assert!(graph.unused_intervals.is_empty());
     }
@@ -43718,7 +43889,7 @@ mod tests {
             &[],
             None,
         );
-        assert!(idle.is_empty());
+        assert_eq!(idle, vec![(0, 1_680), (1_740, 3_480)]);
     }
 
     #[test]

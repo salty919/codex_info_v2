@@ -37,7 +37,7 @@ period先頭、未索引範囲、矛盾または旧schemaは`null`とする。�
 Graphでgray idleを表示するclientはsame `reset_at`のperiod内で、両endpointが`confirmed`かつ`models_complete=true`、同じmodel key集合、
 全raw `total_tokens`のexact equal、finite raw Remainingのbitwise equal、active/gap/直接観測値の矛盾なしを同時に要求する。
 `legacy-unknown`、`unknown`、`unavailable`、補間・hold・smoothing・予測値はendpointまたは矛盾なしのidle authorityにしない。
-ただし完全directな同値endpoint間の数値なしmetadata rowは境界済み不変区間を否定しない。上記条件を満たす連続30分以上のrunだけを
+ただし完全directな同値endpoint間の数値なしmetadata rowは境界済み不変区間を否定しない。上記条件を満たす連続10分以上のrunだけを
 gray表示する。詳しい表示判定は`G137-GRAPH-01`に従う。
 
 `API-DEPRECATION-01`: `/v1/details`、`/v2/details`、全表示情報を一体化した`/v3/details`は互換adapterである。互換期間中は同じatomic generationから生成し、既存field、値型、header allowlistを変更しない。新clientはv3 split resourceを優先し、`/v3/current`がexact 404の場合だけ`/v3/details`、さらにexact 404の場合だけv2、v1へfallbackし、世代をmergeしない。廃止日は未決定であり、決定前に`Sunset`を送らない。将来の削除対象は旧details route、adapter、client fallbackだけで、Session collector、SQLite writer、domain model、`/health`は対象外とする。

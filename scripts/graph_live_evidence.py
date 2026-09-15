@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 
-SUSTAINED_UNUSED_MIN_DURATION_SECONDS = 30 * 60
+SUSTAINED_UNUSED_MIN_DURATION_SECONDS = 10 * 60
 
 PAIR_HEADER = "Codex-Info-Published-Pair"
 CAUSE_ORDER = (
@@ -1084,6 +1084,49 @@ def _idle_intervals(
             and 0 <= float(value) <= 100
         )
 
+    def is_neutral_unavailable_row(
+        index: int,
+        left_index: int,
+        right_index: int,
+        model_names: frozenset[str],
+    ) -> bool:
+        """Allow one explicitly inactive, one-minute unavailable observation.
+
+        The row is still rendered as an unavailable/dashed observation.  It is
+        only neutral for the idle-band authority when both adjacent rows are
+        complete direct observations for the endpoint-common models.  This
+        prevents a recorder/API metadata miss from creating a false one-minute
+        split while keeping unknown or active intervals fail-closed.
+        """
+
+        if index <= left_index or index >= right_index:
+            return False
+        row = rows[index]
+        if (
+            row.get("model_source") != "unavailable"
+            or row.get("task_active_since_previous") is not False
+            or has_numeric_model_values(row)
+            or is_metadata_only_row(row)
+            or index == 0
+            or index + 1 >= len(rows)
+            or rows[index]["timestamp"] - rows[index - 1]["timestamp"] != 60
+            or rows[index + 1]["timestamp"] - rows[index]["timestamp"] != 60
+        ):
+            return False
+        previous = rows[index - 1]
+        following = rows[index + 1]
+        if (
+            previous.get("model_source") != "confirmed"
+            or not previous.get("models_complete")
+            or following.get("model_source") != "confirmed"
+            or not following.get("models_complete")
+        ):
+            return False
+        return model_names <= (
+            _model_names_at(token_models, index - 1, {"direct"})
+            & _model_names_at(token_models, index + 1, {"direct"})
+        )
+
     def direct_models_remain_flat(
         left_index: int,
         right_index: int,
@@ -1091,11 +1134,17 @@ def _idle_intervals(
     ) -> bool:
         """Validate every point inside a sparse direct endpoint bridge."""
 
+        neutral_unavailable = 0
         for index in range(left_index + 1, right_index):
             row = rows[index]
             if row.get("task_active_since_previous") is True:
                 return False
             if row.get("model_source") != "confirmed" or not row.get("models_complete"):
+                if is_neutral_unavailable_row(index, left_index, right_index, model_names):
+                    neutral_unavailable += 1
+                    if neutral_unavailable > 1:
+                        return False
+                    continue
                 if has_numeric_model_values(row) or not is_metadata_only_row(row):
                     return False
                 continue
@@ -1224,6 +1273,20 @@ def _idle_intervals(
     merged: list[list[int]] = []
     for start, end, observed_count in sorted(intervals):
         if merged and start == merged[-1][1] and direct_span_is_flat(merged[-1][0], end):
+            # A model may appear at a later direct endpoint, but a model that
+            # was already part of the proven baseline must not disappear from
+            # one merged idle band.  Otherwise a partial vector can be hidden
+            # by endpoint intersection and the band crosses a data-integrity
+            # boundary.
+            prior_names = _model_names_at(
+                token_models,
+                by_timestamp[merged[-1][0]],
+                {"direct"},
+            )
+            end_names = _model_names_at(token_models, by_timestamp[end], {"direct"})
+            if not prior_names <= end_names:
+                merged.append([start, end, observed_count])
+                continue
             merged[-1][1] = max(merged[-1][1], end)
             merged[-1][2] += observed_count
         else:
@@ -1261,6 +1324,12 @@ def _idle_intervals(
             return False
         exact_names = _model_names_at(token_models, left_index, exact_model_origins)
         right_names = _model_names_at(token_models, right_index, exact_model_origins)
+        # Never bridge across a direct row that drops a model already present
+        # in the preceding proven band.  Endpoint intersection alone would
+        # hide that partial vector and turn a data-integrity boundary into one
+        # continuous idle band.
+        if not exact_names <= right_names:
+            return False
         exact_names &= right_names
         if not exact_names:
             return False
