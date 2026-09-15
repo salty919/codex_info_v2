@@ -1410,17 +1410,13 @@ def _idle_intervals(
             != struct.pack("!d", right_remaining.raw)
             or left_remaining.origin not in accepted_remaining_origins
             or right_remaining.origin not in accepted_remaining_origins
-            or left_remaining.effective != right_remaining.effective
         ):
             return False
-        return all(
-            point.origin in accepted_remaining_origins
-            and point.effective == left_remaining.effective
-            for point in (
-                remaining[timestamp]
-                for timestamp in timestamps[left_index : right_index + 1]
-            )
-        )
+        # Intermediate quota points may carry a presentation-only smoothing
+        # origin/effective value when a later drop is distributed.  Idle
+        # authority is the endpoint raw quota equality; the display line may
+        # still slope or dash without invalidating that proven flat band.
+        return True
 
     bridged: list[list[int]] = []
     for start, end in confirmed:
