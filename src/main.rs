@@ -7065,19 +7065,13 @@ fn token_idle_timestamp_intervals_with_render_evidence(
                     && samples[index].timestamp - samples[index - 1].timestamp == 60
                     && samples[index + 1].timestamp - samples[index].timestamp == 60
                     && direct_vector(samples[index - 1].timestamp).is_some_and(|vector| {
-                        let values = vector
-                            .into_iter()
-                            .map(|(name, value)| (name, value))
-                            .collect::<BTreeMap<_, _>>();
+                        let values = vector.into_iter().collect::<BTreeMap<_, _>>();
                         common_tokens
                             .iter()
                             .all(|(name, _, _)| values.contains_key(name))
                     })
                     && direct_vector(samples[index + 1].timestamp).is_some_and(|vector| {
-                        let values = vector
-                            .into_iter()
-                            .map(|(name, value)| (name, value))
-                            .collect::<BTreeMap<_, _>>();
+                        let values = vector.into_iter().collect::<BTreeMap<_, _>>();
                         common_tokens
                             .iter()
                             .all(|(name, _, _)| values.contains_key(name))
