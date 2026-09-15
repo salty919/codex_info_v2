@@ -10,6 +10,8 @@ Evidence is written only to an explicitly supplied directory outside the repo.
 from __future__ import annotations
 
 import argparse
+import calendar
+import datetime as _datetime
 import hashlib
 import http.client
 import json
@@ -44,6 +46,16 @@ CAUSE_ORDER = (
 )
 CAUSE_RANK = {cause: index for index, cause in enumerate(CAUSE_ORDER)}
 METRIC_RANK = {"remaining": 0, "tokens": 1, "dollars": 2}
+# The wire model universe is intentionally open-ended so unknown models remain
+# part of quota attribution and idle authority. The graph itself has four
+# fixed colored model slots; unknown names are retained semantically but are
+# not emitted as painted model paths.
+RENDERABLE_MODELS = frozenset(("ASTRA", "LUNA", "SOL", "TERRA"))
+# ASTRA is the only model whose history rows carry token components but no
+# stored cumulative-dollar column.  Keep this oracle calculation byte-for-
+# byte aligned with the production history projection; it is still derived
+# evidence, never a replacement for a missing SOL/TERRA/LUNA dollar value.
+ASTRA_PRICE_PER_MILLION = (10.0, 1.0, 12.5, 50.0)
 MAX_PAGES = 32
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 64 * 1024 * 1024
@@ -240,6 +252,70 @@ def _validate_fixture(fixture: dict[str, Any]) -> tuple[dict[str, Any], list[dic
 
 def _rows_with_tail(period: dict[str, Any], samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows = [dict(sample, synthetic=False) for sample in samples]
+    if rows and rows[0]["timestamp"] > period["start_at"]:
+        reset_at = period["reset_at"]
+        weekly_start = reset_at - 7 * 86_400
+        reset_end = _datetime.datetime.fromtimestamp(reset_at, _datetime.timezone.utc)
+        previous_month = reset_end.month - 1
+        previous_year = reset_end.year
+        if previous_month == 0:
+            previous_month = 12
+            previous_year -= 1
+        previous_day = min(
+            reset_end.day,
+            calendar.monthrange(previous_year, previous_month)[1],
+        )
+        monthly_start = int(
+            _datetime.datetime(
+                previous_year,
+                previous_month,
+                previous_day,
+                reset_end.hour,
+                reset_end.minute,
+                reset_end.second,
+                tzinfo=_datetime.timezone.utc,
+            ).timestamp()
+        )
+        first_remaining_at = next(
+            (
+                sample["timestamp"]
+                for sample in rows
+                if sample.get("remaining_percent") is not None
+            ),
+            None,
+        )
+        has_reliable_model = first_remaining_at is not None and any(
+            sample.get("model_source") == "confirmed"
+            and sample.get("models_complete") is True
+            and sample["timestamp"] <= first_remaining_at
+            and any(
+                isinstance(model.get("total_tokens"), int)
+                and not isinstance(model.get("total_tokens"), bool)
+                and model["total_tokens"] >= 0
+                for model in sample.get("models") or []
+            )
+            for sample in rows
+        )
+        if (
+            has_reliable_model
+            and (
+                abs(period["start_at"] - weekly_start) <= 60
+                or abs(period["start_at"] - monthly_start) <= 60
+            )
+        ):
+            rows.insert(
+                0,
+                {
+                    "timestamp": period["start_at"],
+                    "reset_at": period["reset_at"],
+                    "remaining_percent": 100.0,
+                    "models": None,
+                    "models_complete": False,
+                    "model_source": "unavailable",
+                    "synthetic": False,
+                    "reset_boundary": True,
+                },
+            )
     if rows[-1]["timestamp"] < period["end_at"]:
         rows.append(
             {
@@ -280,6 +356,28 @@ def _raw_model_values(
             raw.append(None)
             continue
         value = item.get(field)
+        if value is None and metric == "dollars" and model == "ASTRA":
+            input_tokens = item.get("input_tokens")
+            cached_tokens = item.get("cached_input_tokens")
+            write_tokens = item.get("cache_write_input_tokens")
+            output_tokens = item.get("output_tokens")
+            if all(
+                isinstance(token, int) and not isinstance(token, bool)
+                for token in (
+                    input_tokens,
+                    cached_tokens,
+                    write_tokens,
+                    output_tokens,
+                )
+            ) and input_tokens >= cached_tokens + write_tokens:
+                input_rate, cached_rate, write_rate, output_rate = ASTRA_PRICE_PER_MILLION
+                ordinary_tokens = input_tokens - cached_tokens - write_tokens
+                value = (
+                    ordinary_tokens * input_rate
+                    + cached_tokens * cached_rate
+                    + write_tokens * write_rate
+                    + output_tokens * output_rate
+                ) / 1_000_000.0
         raw.append(None if value is None else float(value))
     return raw
 
@@ -427,7 +525,94 @@ def _model_projection(
                     "held",
                     rows[index].get("synthetic", False),
                 )
+
+    _shape_model_projection_by_task_activity(rows, result)
+
+    # A sparse interpolation can fall below a preceding legacy display value
+    # even when both direct anchors are monotonic.  Keep the visible cumulative
+    # line monotonic by holding that inferred point at the last display value;
+    # it remains non-authoritative and is emitted as a dashed bridge.
+    display_floor: float | None = None
+    for index, point in enumerate(result):
+        if point.value is None or not math.isfinite(point.value) or point.value < 0:
+            continue
+        if display_floor is not None and point.value < display_floor:
+            if point.origin != "direct":
+                result[index] = ModelEvidence(display_floor, False, "held", point.synthetic)
+                point = result[index]
+            else:
+                result[index] = ModelEvidence(display_floor, False, "rejected", point.synthetic)
+                point = result[index]
+        display_floor = max(display_floor, point.value) if display_floor is not None else point.value
     return result
+
+
+def _shape_model_projection_by_task_activity(
+    rows: list[dict[str, Any]], result: list[ModelEvidence]
+) -> None:
+    """Mirror the native activity-weighted model interpolation.
+
+    Complete task-activity markers can prove that cumulative growth happened
+    only during active minutes.  Idle intervals therefore remain horizontal
+    while the total change is allocated across active elapsed time.  This is
+    presentation-only; direct rows remain the sole arithmetic anchors.
+    """
+    anchors = [
+        index
+        for index, point in enumerate(result)
+        if point.origin == "direct" and point.value is not None
+    ]
+    for left, right in pairwise(anchors):
+        left_value = result[left].value
+        right_value = result[right].value
+        if (
+            left_value is None
+            or right_value is None
+            or rows[right]["timestamp"] <= rows[left]["timestamp"]
+            or left_value < 0
+            or right_value < left_value
+        ):
+            continue
+        intervals: list[tuple[int, bool, float]] = []
+        has_idle = False
+        active_duration = 0.0
+        complete = True
+        for index in range(left + 1, right + 1):
+            marker = rows[index].get("task_active_since_previous")
+            if not isinstance(marker, bool):
+                complete = False
+                break
+            elapsed = max(
+                0,
+                rows[index]["timestamp"] - rows[index - 1]["timestamp"],
+            )
+            has_idle |= not marker
+            if marker:
+                active_duration += elapsed
+            intervals.append((index, marker, elapsed))
+        if (
+            not complete
+            or not has_idle
+            or (right_value > left_value and active_duration <= 0)
+        ):
+            continue
+        active_elapsed = 0.0
+        for index, active, elapsed in intervals:
+            if active:
+                active_elapsed += elapsed
+            if index == right:
+                continue
+            fraction = (
+                0.0
+                if right_value == left_value
+                else min(1.0, max(0.0, active_elapsed / active_duration))
+            )
+            result[index] = ModelEvidence(
+                left_value + (right_value - left_value) * fraction,
+                False,
+                "interpolated" if active else "bounded_flat",
+                result[index].synthetic,
+            )
 
 
 def _period_model_universe(
@@ -574,7 +759,12 @@ def _remaining_projection(
     for index, value in enumerate(raw):
         if value is None:
             continue
-        if index in isolated or baseline is not None and value > baseline:
+        if rows[index].get("reset_boundary", False):
+            values[index] = value
+            origins[index] = "reset_boundary"
+            raw_reliable[index] = True
+            baseline = value
+        elif index in isolated or baseline is not None and value > baseline:
             values[index] = baseline
             origins[index] = "monotonic_hold"
         else:
@@ -1010,6 +1200,7 @@ def build_expected(fixture: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
     period, samples, gaps = _validate_fixture(fixture)
     rows = _rows_with_tail(period, samples)
     universe = _period_model_universe(samples)
+    renderable_universe = tuple(model for model in universe if model in RENDERABLE_MODELS)
     projections = {
         metric: {model: _model_projection(rows, model, metric) for model in universe}
         for metric in ("tokens", "dollars")
@@ -1019,7 +1210,7 @@ def build_expected(fixture: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
     remaining = _remaining_projection(period, rows, token_models, gaps)
     segments.extend(_remaining_segments(samples, rows, remaining, token_models, gaps))
     for metric in ("tokens", "dollars"):
-        for model in universe:
+        for model in renderable_universe:
             segments.extend(_model_segments(rows, model, metric, projections[metric][model], gaps))
     segments.sort(key=_segment_key)
     return segments, _idle_intervals(period, samples, token_models, gaps)
@@ -1217,23 +1408,32 @@ def _endpoint_labels(
     if not candidates:
         return []
 
-    half = _f32(8.0 / 204.0)
-    separation = _f32(16.0 / 204.0)
-    lower = half
-    upper = _f32(1.0 - half)
-    label_y = [min(upper, max(lower, item["point_y"])) for item in candidates]
-    for index in range(1, len(label_y)):
-        label_y[index] = max(
-            min(upper, max(lower, label_y[index])),
-            _f32(label_y[index - 1] + separation),
+    # Match GraphPlotProjection.BuildEndpointLabels exactly. NativeGraphY is
+    # quantized to float, but ArrangeEndpointLabelTops uses doubles and only
+    # the final arranged center is quantized to float. Quantizing the
+    # intermediate arithmetic causes one-ULP disagreements for tight labels.
+    half = 8.0 / 204.0
+    label_height = 16.0 / 204.0
+    separation = label_height
+    lower = 0.0
+    upper = 1.0
+    maximum_top = max(lower, upper - label_height)
+    ideal_tops = [item["point_y"] - half for item in candidates]
+    label_tops = [min(maximum_top, max(lower, ideal)) for ideal in ideal_tops]
+    for index in range(1, len(label_tops)):
+        label_tops[index] = max(
+            label_tops[index], label_tops[index - 1] + separation
         )
-    if label_y[-1] > upper:
-        label_y[-1] = upper
-        for index in range(len(label_y) - 2, -1, -1):
-            label_y[index] = min(
-                label_y[index],
-                _f32(label_y[index + 1] - separation),
+    if label_tops[-1] > maximum_top:
+        label_tops[-1] = maximum_top
+        for index in range(len(label_tops) - 2, -1, -1):
+            label_tops[index] = min(
+                label_tops[index], label_tops[index + 1] - separation
             )
+    if label_tops[0] < lower:
+        shift = lower - label_tops[0]
+        label_tops = [value + shift for value in label_tops]
+    label_y = [_f32(top + half) for top in label_tops]
 
     return [
         {
@@ -1250,6 +1450,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
     period, samples, gaps = _validate_fixture(fixture)
     rows = _rows_with_tail(period, samples)
     universe = _period_model_universe(samples)
+    renderable_universe = tuple(model for model in universe if model in RENDERABLE_MODELS)
     token_models = {
         model: _model_projection(rows, model, "tokens") for model in universe
     }
@@ -1291,9 +1492,12 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
         projections = {
             model: _model_projection(rows, model, metric) for model in universe
         }
+        renderable_projections = {
+            model: projections[model] for model in renderable_universe
+        }
         finite_values = [
             point.value
-            for projection in projections.values()
+            for projection in renderable_projections.values()
             for point in projection
             if point.value is not None and math.isfinite(point.value) and point.value >= 0
         ]
@@ -1307,7 +1511,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
             for fraction in (1.0, 0.75, 0.5, 0.25, 0.0)
         ]
         models = []
-        for model in universe:
+        for model in renderable_universe:
             segments = _model_segments(rows, model, metric, projections[model], gaps)
             values = {
                 row["timestamp"]: point.value
@@ -1334,7 +1538,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
                 "timestamp": period["end_at"],
                 "value": projections[model][-1].value,
             }
-            for model in universe
+            for model in renderable_universe
         ]
         endpoint_values.append(
             {
@@ -1350,7 +1554,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
             "axis_labels": axis_labels,
             "axis_grid_y": [f"{fraction:.12f}" for fraction in (0.0, 0.25, 0.5, 0.75, 1.0)],
             "endpoint_labels": _endpoint_labels(
-                projections,
+                renderable_projections,
                 maximum,
                 metric,
                 remaining_evidence,

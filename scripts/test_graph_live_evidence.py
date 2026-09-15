@@ -71,14 +71,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
     def test_remaining_smoothing_literal_cases_distinguish_measured_and_missing(self):
         for name, case in self.document["remaining_smoothing_v4"].items():
             fixture = v3_fixture(
-                [
-                    {
-                        **row,
-                        "models_complete": False,
-                        "model_source": "legacy-unknown",
-                    }
-                    for row in case["samples"]
-                ],
+                case["samples"],
                 gaps=[
                     {"start_at": start, "end_at": end}
                     for start, end in case.get("confirmed_gaps", [])
