@@ -7093,6 +7093,25 @@ fn token_idle_timestamp_intervals_with_render_evidence(
             }
             false
         };
+    let unavailable_row_count = |start: i64, end: i64| {
+        samples
+            .iter()
+            .filter(|sample| {
+                let minute = sample.timestamp.div_euclid(60) * 60;
+                minute > start
+                    && minute < end
+                    && untrusted_minutes.contains(&minute)
+                    && (!sample.remaining_percent.is_finite()
+                        || !(0.0..=100.0).contains(&sample.remaining_percent))
+                    && !token_timelines.values().any(|timeline| {
+                        timeline.get(&minute).is_some_and(|point| {
+                            point.origin == GraphModelOrigin::LegacyObserved
+                                && point.raw_tokens.is_some()
+                        })
+                    })
+            })
+            .count()
+    };
     let mut proven = Vec::<(i64, i64, BTreeMap<String, u64>, BTreeMap<String, u64>)>::new();
     for pair in anchors.windows(2) {
         let [(start, start_vector, start_remaining), (end, end_vector, end_remaining)] = pair
@@ -7124,31 +7143,40 @@ fn token_idle_timestamp_intervals_with_render_evidence(
             .map(|(name, value)| (name.clone(), *value))
             .collect::<BTreeMap<_, _>>();
         if let Some(last) = proven.last_mut() {
-            if last.1 == *start
-                && ({
-                    let endpoint_common = last
-                        .2
-                        .keys()
-                        .filter(|name| end_values.contains_key(*name))
-                        .collect::<Vec<_>>();
-                    // A model may be added at a later direct endpoint, but
-                    // a model that was already part of the proven baseline
-                    // must never disappear inside one merged idle band.
-                    // Otherwise a one-minute partial vector could be hidden
-                    // by the endpoint intersection and the band would cross
-                    // a real data-integrity boundary.
-                    !endpoint_common.is_empty()
-                        && last.2.keys().all(|name| end_values.contains_key(name))
-                        && endpoint_common.iter().all(|name| {
-                            let baseline = last.2[*name];
-                            end_values.get(*name) == Some(&baseline)
-                                && start_values.get(*name) == Some(&baseline)
-                        })
-                })
-            {
-                last.1 = *end;
-                last.3 = end_values;
-                continue;
+            if last.1 == *start {
+                let endpoint_common = last
+                    .2
+                    .keys()
+                    .filter(|name| end_values.contains_key(*name))
+                    .collect::<Vec<_>>();
+                let current_has_unavailable = unavailable_row_count(*start, *end) > 0;
+                let prior_has_unavailable = unavailable_row_count(last.0, *start) > 0;
+                // If the current pair contains a neutral unavailable row and
+                // the already-proven band has one too, keep the recorder/API
+                // anomaly as a visible boundary.  The pair after the missing
+                // minute can then start a fresh idle candidate instead of
+                // silently merging multiple dashed gaps into one band.
+                if current_has_unavailable && prior_has_unavailable {
+                    continue;
+                }
+                // A model may be added at a later direct endpoint, but a
+                // model that was already part of the proven baseline must
+                // never disappear inside one merged idle band.  Otherwise a
+                // one-minute partial vector could be hidden by the endpoint
+                // intersection and the band would cross a real data-integrity
+                // boundary.
+                if !endpoint_common.is_empty()
+                    && last.2.keys().all(|name| end_values.contains_key(name))
+                    && endpoint_common.iter().all(|name| {
+                        let baseline = last.2[*name];
+                        end_values.get(*name) == Some(&baseline)
+                            && start_values.get(*name) == Some(&baseline)
+                    })
+                {
+                    last.1 = *end;
+                    last.3 = end_values;
+                    continue;
+                }
             }
         }
         proven.push((*start, *end, start_values, end_values));
@@ -43747,6 +43775,71 @@ mod tests {
             );
 
         assert!(graph.unused_intervals.is_empty());
+    }
+
+    #[test]
+    fn separated_unavailable_minutes_split_idle_bands() {
+        let samples = (0..=34)
+            .map(|minute| {
+                UsageHistorySample::new(
+                    minute * 60,
+                    1_000,
+                    if minute == 5 || minute == 21 {
+                        f64::NAN
+                    } else {
+                        90.0
+                    },
+                    ModelDollarTotals::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let references = samples.iter().collect::<Vec<_>>();
+        let direct = |timestamp| {
+            (
+                timestamp,
+                super::GraphModelPoint {
+                    dollar: 1.0,
+                    tokens: 100.0,
+                    raw_tokens: Some(100),
+                    origin: super::GraphModelOrigin::Direct,
+                },
+            )
+        };
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            (0..=34)
+                .filter(|minute| *minute != 5 && *minute != 21)
+                .map(|minute| direct(minute * 60))
+                .collect(),
+        )]);
+        let activity = (1..=34)
+            .map(|minute| (minute * 60, Some(false)))
+            .collect::<BTreeMap<_, _>>();
+        let untrusted_minutes = BTreeSet::from([300, 1_260]);
+
+        let graph =
+            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: 0,
+                    period_end: 2_040,
+                    show_luna: false,
+                    show_terra: false,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: true,
+                    untrusted_minutes: &untrusted_minutes,
+                    confirmed_gaps: &[],
+                    model_timelines: &timelines,
+                },
+                Some(&activity),
+            );
+
+        assert_eq!(graph.unused_intervals.len(), 2);
+        assert!((graph.unused_intervals[0].start - 0.0).abs() < 1e-9);
+        assert!((graph.unused_intervals[0].width - (1_200.0 / 2_040.0 * 100.0)).abs() < 1e-9);
+        assert!((graph.unused_intervals[1].start - (1_320.0 / 2_040.0 * 100.0)).abs() < 1e-9);
+        assert!((graph.unused_intervals[1].width - (720.0 / 2_040.0 * 100.0)).abs() < 1e-9);
     }
 
     #[test]

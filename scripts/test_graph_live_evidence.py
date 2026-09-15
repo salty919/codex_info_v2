@@ -497,6 +497,29 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             oracle.build_expected(v3_fixture(active, period_id="active-unavailable"))[1],
         )
 
+        separated = [
+            {
+                "timestamp": minute * 60,
+                "remaining_percent": 90.0,
+                "tokens": 100,
+                "task_active_since_previous": False,
+            }
+            for minute in range(35)
+        ]
+        for minute in (5, 21):
+            separated[minute].update(
+                {
+                    "remaining_percent": None,
+                    "models": None,
+                    "models_complete": False,
+                    "model_source": "unavailable",
+                }
+            )
+        self.assertEqual(
+            [{"start_at": 0, "end_at": 1_200}, {"start_at": 1_320, "end_at": 2_040}],
+            oracle.build_expected(v3_fixture(separated, period_id="separated-unavailable"))[1],
+        )
+
     def test_idle_bridges_missing_cadence_only_between_two_proven_flat_runs(self):
         def fixture(token_at_right):
             left = [

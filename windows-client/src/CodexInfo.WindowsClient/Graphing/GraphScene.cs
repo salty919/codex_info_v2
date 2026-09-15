@@ -1236,6 +1236,23 @@ public sealed class GraphScene
         foreach (var candidate in candidates.OrderBy(item => item.Interval.StartAt))
         {
             if (merged.Count > 0 && candidate.Interval.StartAt == merged[^1].Interval.EndAt &&
+                CountUnavailableRows(
+                    samples,
+                    candidate.Interval.StartAt,
+                    candidate.Interval.EndAt) > 0 &&
+                CountUnavailableRows(
+                    samples,
+                    merged[^1].Interval.StartAt,
+                    candidate.Interval.StartAt) > 0)
+            {
+                // Keep two separate unavailable observations as a visible
+                // anomaly boundary. The current candidate is the two-minute
+                // span around the second missing row; dropping it lets the
+                // following direct row start a fresh idle band after that
+                // dashed gap.
+                continue;
+            }
+            if (merged.Count > 0 && candidate.Interval.StartAt == merged[^1].Interval.EndAt &&
                 merged[^1].StartTokens.Keys
                     .Intersect(candidate.EndTokens.Keys, StringComparer.Ordinal)
                     .ToArray() is { Length: > 0 } endpointCommonModels &&
@@ -1275,9 +1292,18 @@ public sealed class GraphScene
         IReadOnlySet<string> commonModels)
     {
         var neutralUnavailableCount = 0;
+        var unavailableCount = 0;
         for (var index = before + 1; index <= after; index++)
         {
             var sample = samples[index];
+            if (sample.ModelSource == ApiHistorySample.UnavailableModelSource)
+            {
+                unavailableCount++;
+                if (unavailableCount > 1)
+                {
+                    return true;
+                }
+            }
             if (sample.TaskActiveSincePrevious is true)
             {
                 return true;
@@ -1325,6 +1351,15 @@ public sealed class GraphScene
 
         return false;
     }
+
+    private static int CountUnavailableRows(
+        IReadOnlyList<ApiHistorySample> samples,
+        long startAt,
+        long endAt) =>
+        samples.Count(sample =>
+            sample.Timestamp > startAt &&
+            sample.Timestamp < endAt &&
+            sample.ModelSource == ApiHistorySample.UnavailableModelSource);
 
     private static bool HasNumericModelValues(ApiHistorySample sample) =>
         PublishedModels(sample).Any(model =>

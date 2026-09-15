@@ -1137,13 +1137,14 @@ def _idle_intervals(
         neutral_unavailable = 0
         for index in range(left_index + 1, right_index):
             row = rows[index]
+            if row.get("model_source") == "unavailable":
+                neutral_unavailable += 1
+                if neutral_unavailable > 1:
+                    return False
             if row.get("task_active_since_previous") is True:
                 return False
             if row.get("model_source") != "confirmed" or not row.get("models_complete"):
                 if is_neutral_unavailable_row(index, left_index, right_index, model_names):
-                    neutral_unavailable += 1
-                    if neutral_unavailable > 1:
-                        return False
                     continue
                 if has_numeric_model_values(row) or not is_metadata_only_row(row):
                     return False
@@ -1182,6 +1183,11 @@ def _idle_intervals(
             for model in common_names
         ):
             return False
+        if sum(
+            row.get("model_source") == "unavailable"
+            for row in rows[left_index + 1 : right_index]
+        ) > 1:
+            return False
         left_remaining = remaining.get(start)
         right_remaining = remaining.get(end)
         if (
@@ -1197,6 +1203,12 @@ def _idle_intervals(
             return False
         return direct_models_remain_flat(left_index, right_index, common_names)
 
+    accepted_remaining_origins = {
+        "raw",
+        "activity_smoothed",
+        "bounded_null_hold",
+        "interpolated",
+    }
     intervals: list[tuple[int, int, int]] = []
     for index in range(len(rows) - 1):
         elapsed = timestamps[index + 1] - timestamps[index]
@@ -1243,19 +1255,9 @@ def _idle_intervals(
         after = remaining.get(end)
         if before is None or after is None:
             continue
-        if before.origin not in {
-            "raw",
-            "activity_smoothed",
-            "bounded_null_hold",
-            "interpolated",
-        }:
+        if before.origin not in accepted_remaining_origins:
             continue
-        if after.origin not in {
-            "raw",
-            "activity_smoothed",
-            "bounded_null_hold",
-            "interpolated",
-        }:
+        if after.origin not in accepted_remaining_origins:
             continue
         # Idle authority is the raw provider quota at the two direct
         # endpoints. Presentation interpolation may slope between equal raw
@@ -1270,6 +1272,49 @@ def _idle_intervals(
         ):
             continue
         intervals.append((start, end, observed_count))
+
+    # A single neutral unavailable row can be the first observation after an
+    # active minute.  In that shape there is no already-confirmed interval on
+    # its left to bridge from, but the two direct endpoints still prove the
+    # same idle value.  Add the two-minute endpoint span so the subsequent
+    # merge uses the same authority as the native and Windows projections.
+    for index in range(1, len(rows) - 1):
+        row = rows[index]
+        if row.get("model_source") != "unavailable":
+            continue
+        left_index, right_index = index - 1, index + 1
+        if timestamps[right_index] - timestamps[left_index] != 120:
+            continue
+        if rows[left_index].get("task_active_since_previous") is not True:
+            continue
+        left_names = _model_names_at(token_models, left_index, {"direct"})
+        right_names = _model_names_at(token_models, right_index, {"direct"})
+        common_names = left_names & right_names
+        if (
+            not common_names
+            or not is_neutral_unavailable_row(
+                index, left_index, right_index, common_names
+            )
+            or not direct_models_remain_flat(left_index, right_index, common_names)
+        ):
+            continue
+        left_remaining = remaining.get(timestamps[left_index])
+        right_remaining = remaining.get(timestamps[right_index])
+        if (
+            left_remaining is None
+            or right_remaining is None
+            or left_remaining.raw is None
+            or right_remaining.raw is None
+            or not math.isfinite(left_remaining.raw)
+            or not math.isfinite(right_remaining.raw)
+            or struct.pack("!d", left_remaining.raw)
+            != struct.pack("!d", right_remaining.raw)
+            or left_remaining.origin not in accepted_remaining_origins
+            or right_remaining.origin not in accepted_remaining_origins
+        ):
+            continue
+        intervals.append((timestamps[left_index], timestamps[right_index], 2))
+
     merged: list[list[int]] = []
     for start, end, observed_count in sorted(intervals):
         if merged and start == merged[-1][1] and direct_span_is_flat(merged[-1][0], end):
@@ -1303,19 +1348,22 @@ def _idle_intervals(
     # session recovery and bounded display holds cannot prove that no tokens
     # were spent during the missing cadence.
     exact_model_origins = {"direct"}
-    accepted_remaining_origins = {
-        "raw",
-        "activity_smoothed",
-        "bounded_null_hold",
-        "interpolated",
-    }
-
-    def bridge_is_confirmed_flat(start: int, end: int) -> bool:
+    def bridge_is_confirmed_flat(
+        start: int,
+        end: int,
+        combined_start: int | None = None,
+    ) -> bool:
         if end <= start or _hard_break(start, end, gaps):
             return False
         left_index = by_timestamp.get(start)
         right_index = by_timestamp.get(end)
         if left_index is None or right_index is None or right_index <= left_index:
+            return False
+        combined_left_index = by_timestamp.get(combined_start, left_index)
+        if sum(
+            row.get("model_source") == "unavailable"
+            for row in rows[combined_left_index + 1 : right_index]
+        ) > 1:
             return False
         if any(
             row.get("task_active_since_previous") is True
@@ -1376,7 +1424,9 @@ def _idle_intervals(
 
     bridged: list[list[int]] = []
     for start, end in confirmed:
-        if bridged and start > bridged[-1][1] and bridge_is_confirmed_flat(bridged[-1][1], start):
+        if bridged and start > bridged[-1][1] and bridge_is_confirmed_flat(
+            bridged[-1][1], start, bridged[-1][0]
+        ):
             bridged[-1][1] = end
         else:
             bridged.append([start, end])

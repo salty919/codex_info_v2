@@ -305,6 +305,37 @@ public sealed class GraphSceneLinuxParityTests
     }
 
     [Fact]
+    public void IdleSplitsSeparatedInactiveUnavailableMinutes()
+    {
+        var samples = Enumerable.Range(0, 35)
+            .Select(minute => minute is 5 or 21
+                ? new ApiHistorySample(
+                    1_000 + minute * 60,
+                    10_000,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    null,
+                    ApiHistorySample.UnavailableModelSource)
+                {
+                    ModelsComplete = false,
+                    TaskActiveSincePrevious = false,
+                }
+                : V3Sample(1_000 + minute * 60, 90, Model("SOL", 10, 1), Model("TERRA", 0, 0)))
+            .ToArray();
+
+        Assert.Equal(
+            [
+                new GraphIdleInterval(1_000, 2_200, false),
+                new GraphIdleInterval(2_320, 3_040, false),
+            ],
+            GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 3_040).IdleIntervals);
+    }
+
+    [Fact]
     public void ActiveMinuteSplitsTenMinuteIdleBands()
     {
         var samples = Enumerable.Range(0, 22)
