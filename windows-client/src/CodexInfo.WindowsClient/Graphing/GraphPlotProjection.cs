@@ -394,7 +394,7 @@ internal static class GraphPlotProjection
     }
 
     private static bool RemainingOriginHasMeasuredQuota(GraphRemainingOrigin origin) =>
-        origin is GraphRemainingOrigin.Raw;
+        origin is GraphRemainingOrigin.Raw or GraphRemainingOrigin.ActivitySmoothed;
 
     /// <summary>
     /// Projects the flat, rising, and inferred cumulative-model paths used by

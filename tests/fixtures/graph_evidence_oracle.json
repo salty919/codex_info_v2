@@ -241,8 +241,8 @@
       "effective": [100.0,99.66666666666667,99.33333333333333,99.0],
       "remaining_origins": ["raw","activity_smoothed","activity_smoothed","raw"],
       "idle_intervals": [],
-      "remaining_solid": [],
-      "remaining_dashed": [[0,60],[60,120],[120,180]]
+      "remaining_solid": [[0,60],[60,120],[120,180]],
+      "remaining_dashed": []
     },
     "idle_middle": {
       "samples": [
@@ -254,8 +254,8 @@
       "effective": [100.0,99.5,99.5,99.0],
       "remaining_origins": ["raw","activity_smoothed","activity_smoothed","raw"],
       "idle_intervals": [],
-      "remaining_solid": [],
-      "remaining_dashed": [[0,60],[60,120],[120,180]]
+      "remaining_solid": [[0,60],[60,120],[120,180]],
+      "remaining_dashed": []
     },
     "token_weighted_nonuniform": {
       "samples": [
@@ -267,8 +267,8 @@
       "effective": [100.0,98.8,98.8,94.0],
       "remaining_origins": ["raw","activity_smoothed","interpolated","raw"],
       "idle_intervals": [],
-      "remaining_solid": [],
-      "remaining_dashed": [[0,60],[60,120],[120,180]]
+      "remaining_solid": [[0,60]],
+      "remaining_dashed": [[60,120],[120,180]]
     },
     "no_token_activity": {
       "samples": [
