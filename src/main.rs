@@ -30512,8 +30512,14 @@ mod tests {
 
     #[test]
     fn recovered_generation_publishes_the_exact_cost_to_rest_and_linux_ui() {
-        let canonical_reset = 1_789_437_490;
-        let transient_reset = 1_789_300_251;
+        // Keep the synthetic reset just ahead of the observation clock.  The
+        // fixture intentionally exercises a current period; a wall-clock
+        // fixed reset eventually crosses into the past and makes the public
+        // period lose its `current` marker, producing an unrelated
+        // InvalidHistoryPeriod failure in CI.
+        let canonical_reset = Utc::now().timestamp().saturating_add(3_600);
+        let reset_shift = canonical_reset.saturating_sub(1_789_437_490_i64);
+        let transient_reset = 1_789_300_251_i64.saturating_add(reset_shift);
         let baseline = vec![
             usage_store::SessionModelTotal {
                 model: "LUNA".into(),
@@ -30581,21 +30587,21 @@ mod tests {
         };
         let observations = vec![
             observation(
-                1_788_975_540,
+                1_788_975_540_i64.saturating_add(reset_shift),
                 transient_reset,
                 370.814_975,
                 1.423_482_24,
                 baseline,
             ),
             observation(
-                1_788_975_600,
+                1_788_975_600_i64.saturating_add(reset_shift),
                 canonical_reset,
                 0.0,
                 0.012_395_44,
                 first_suffix,
             ),
             observation(
-                1_788_996_000,
+                1_788_996_000_i64.saturating_add(reset_shift),
                 canonical_reset,
                 0.0,
                 0.187_152_6,
@@ -30606,7 +30612,7 @@ mod tests {
             &"33".repeat(32),
             canonical_reset,
             WEEK_SECONDS,
-            1_788_996_001,
+            1_788_996_001_i64.saturating_add(reset_shift),
             &current_suffix,
             &observations,
         )
