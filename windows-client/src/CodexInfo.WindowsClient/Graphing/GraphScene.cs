@@ -618,6 +618,12 @@ public sealed class GraphScene
             }
 
             ShapeInferredModelSeriesByTaskActivity(samples, accepted, acceptedOrigins);
+            NormalizeMonotonicDisplaySeries(
+                samples,
+                accepted,
+                acceptedOrigins,
+                modelCorrectionStarts,
+                correctionStarts);
             var acceptedReliability = acceptedOrigins
                 .Select(ModelOriginArithmeticReliable)
                 .ToArray();
@@ -642,6 +648,49 @@ public sealed class GraphScene
             origins,
             correctionStartsByModel,
             correctionStarts);
+    }
+
+    /// <summary>
+    /// Prevent a sparse inferred value from moving a cumulative display
+    /// backwards after a legacy observation. Direct values remain the only
+    /// arithmetic authority; inferred regressions become dashed holds.
+    /// </summary>
+    private static void NormalizeMonotonicDisplaySeries(
+        IReadOnlyList<ApiHistorySample> samples,
+        double[] values,
+        GraphModelOrigin[] origins,
+        ISet<long> modelCorrectionStarts,
+        ISet<long> correctionStarts)
+    {
+        double? displayFloor = null;
+        for (var index = 0; index < values.Length; index++)
+        {
+            var value = values[index];
+            if (!double.IsFinite(value) || value < 0)
+            {
+                continue;
+            }
+            if (displayFloor is { } floor && value < floor &&
+                !ModelOriginLineIsExact(origins[index]))
+            {
+                values[index] = floor;
+                origins[index] = GraphModelOrigin.Held;
+                value = floor;
+            }
+            else if (displayFloor is { } directFloor && value < directFloor)
+            {
+                // This is defensive only: direct regressions are rejected
+                // above, but fail closed if a future source path bypasses it.
+                values[index] = directFloor;
+                origins[index] = GraphModelOrigin.Rejected;
+                modelCorrectionStarts.Add(samples[index].Timestamp);
+                correctionStarts.Add(samples[index].Timestamp);
+                value = directFloor;
+            }
+            displayFloor = displayFloor is { } prior
+                ? Math.Max(prior, value)
+                : value;
+        }
     }
 
     private static void ShapeInferredModelSeriesByTaskActivity(
@@ -1019,6 +1068,7 @@ public sealed class GraphScene
             }
 
             var useTokenWeights = tokenEvidenceComplete && tokenWeight > double.Epsilon;
+            var modelShaped = useTokenWeights;
             if (useTokenWeights)
             {
                 // Every interval has an exact or bounded-theoretical token
@@ -1090,11 +1140,12 @@ public sealed class GraphScene
                 }
                 else if (!(rawReliable[index] && rawValues[index] == smoothed))
                 {
-                    // A changed presentation value is not by itself missing
-                    // evidence.  Normal staircase smoothing retains the raw
-                    // quota observation at this timestamp and is a measured,
-                    // solid line.  Only a raw-null point is interpolation.
-                    origins[index] = !interval.Inferred && rawReliable[index] && rawValues[index] is not null
+                    // Any value changed from the raw quota observation is a
+                    // presentation estimate. Token-shaped smoothing retains
+                    // its measured/activity provenance; elapsed fallback is
+                    // inferred and must remain dashed rather than being left
+                    // with a stale Raw origin.
+                    origins[index] = modelShaped && rawReliable[index] && rawValues[index] is not null
                         ? GraphRemainingOrigin.ActivitySmoothed
                         : GraphRemainingOrigin.Interpolated;
                 }
@@ -1120,10 +1171,17 @@ public sealed class GraphScene
             return Array.Empty<GraphIdleInterval>();
         }
 
+        var allModelNames = samples
+            .SelectMany(PublishedModels)
+            .Select(model => model.Name)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
         var direct = new List<(int Index, IReadOnlyDictionary<string, DirectModelValue> Vector)>();
         for (var index = 0; index < samples.Count; index++)
         {
             if (TryGetDirectModelVector(samples[index], out var vector) &&
+                vector.Count == allModelNames.Length &&
+                allModelNames.All(vector.ContainsKey) &&
                 double.IsFinite(samples[index].RemainingPercent ?? double.NaN))
             {
                 direct.Add((index, vector));
@@ -1202,6 +1260,15 @@ public sealed class GraphScene
             if (sample.ModelSource != ApiHistorySample.ConfirmedModelSource ||
                 !sample.ModelsComplete)
             {
+                // A non-direct row with model numerics is an observed but
+                // incomplete vector, so it disproves an otherwise flat idle
+                // span. Rows carrying only lifecycle/quota metadata remain
+                // neutral and preserve the G137-5 allowance for metadata-only
+                // rows between two complete direct endpoints.
+                if (HasNumericModelValues(sample) || !HasMetadataOnlyEvidence(sample))
+                {
+                    return true;
+                }
                 continue;
             }
 
@@ -1215,6 +1282,16 @@ public sealed class GraphScene
 
         return false;
     }
+
+    private static bool HasNumericModelValues(ApiHistorySample sample) =>
+        PublishedModels(sample).Any(model =>
+            model.TotalTokens is not null ||
+            model.TotalDollars is double dollars && double.IsFinite(dollars));
+
+    private static bool HasMetadataOnlyEvidence(ApiHistorySample sample) =>
+        sample.RemainingPercent is double remaining &&
+        double.IsFinite(remaining) &&
+        remaining is >= 0 and <= 100;
 
     private static bool TryGetDirectModelVector(
         ApiHistorySample sample,

@@ -223,6 +223,105 @@ public sealed class GraphSceneLinuxParityTests
             GraphScene.Create(dollarOnlyChange, GraphMetric.Dollars, 1_000, 2_800).IdleIntervals);
     }
 
+    [Fact]
+    public void IdleRejectsNumericIncompleteRowsBetweenDirectEndpoints()
+    {
+        var samples = new[]
+        {
+            V3Sample(1_000, 90, Model("SOL", 10, 1), Model("TERRA", 0, 0)),
+            new ApiHistorySample(
+                1_900,
+                10_000,
+                90,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.ConfirmedModelSource)
+            {
+                ModelsComplete = false,
+                ModelSamples = [Model("SOL", 10, 1)],
+            },
+            V3Sample(2_800, 90, Model("SOL", 10, 1), Model("TERRA", 0, 0)),
+        };
+
+        Assert.Empty(GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 2_800).IdleIntervals);
+    }
+
+    [Fact]
+    public void IdleRejectsUnavailableRowsWithoutQuotaBetweenDirectEndpoints()
+    {
+        var samples = new[]
+        {
+            V3Sample(1_000, 90, Model("SOL", 10, 1), Model("TERRA", 0, 0)),
+            new ApiHistorySample(
+                1_900,
+                10_000,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.UnavailableModelSource)
+            {
+                ModelsComplete = false,
+                TaskActiveSincePrevious = false,
+            },
+            V3Sample(2_800, 90, Model("SOL", 10, 1), Model("TERRA", 0, 0)),
+        };
+
+        Assert.Empty(GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 2_800).IdleIntervals);
+    }
+
+    [Fact]
+    public void IdleRequiresTheSameCompleteModelUniverseAtBothEndpoints()
+    {
+        var samples = new[]
+        {
+            V3Sample(1_000, 90, Model("SOL", 10, 1)),
+            new ApiHistorySample(
+                1_900,
+                10_000,
+                90,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.LegacyUnknownModelSource)
+            {
+                ModelsComplete = false,
+                ModelSamples = [Model("SOL", 10, 1), Model("TERRA", 0, 0)],
+            },
+            V3Sample(2_800, 90, Model("SOL", 10, 1)),
+        };
+
+        Assert.Empty(GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 2_800).IdleIntervals);
+    }
+
+    [Fact]
+    public void ActivitySmoothedRawQuotaRemainsAMeasuredSolidSegment()
+    {
+        var samples = new[]
+        {
+            V3Sample(1_000, 100, Model("SOL", 0, 0)),
+            V3Sample(1_060, 100, Model("SOL", 10, 0)),
+            V3Sample(1_120, 100, Model("SOL", 20, 0)),
+            V3Sample(1_180, 70, Model("SOL", 100, 0)),
+        };
+
+        var scene = GraphScene.Create(samples, GraphMetric.Tokens, 1_000, 1_180);
+        var lines = GraphPlotProjection.BuildRemainingLines(scene);
+
+        Assert.Equal([1_000d, 1_060d, 1_120d, 1_180d], lines.Solid.X);
+        Assert.Empty(lines.Dashed.X);
+    }
+
     private static ApiHistorySample V3Sample(
         long timestamp,
         double? remaining,

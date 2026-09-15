@@ -19,11 +19,22 @@ BINARY="$ROOT_DIR/target/release/codex_info"
 
 temp_parent="${TMPDIR:-/tmp}"
 temp_root="$(mktemp -d "$temp_parent/codex-info-x11-graph.XXXXXX")"
+evidence_dir="${CODEX_INFO_X11_EVIDENCE_DIR:-}"
+if [[ -n "$evidence_dir" ]]; then
+    [[ "$evidence_dir" = /* ]] || fail 'CODEX_INFO_X11_EVIDENCE_DIR must be absolute'
+    case "$evidence_dir" in
+        "$ROOT_DIR"|"$ROOT_DIR"/*) fail 'X11 evidence must remain outside the repository' ;;
+    esac
+    mkdir -p -- "$evidence_dir"
+fi
 preview_pid=""
 cleanup() {
     if [[ -n "$preview_pid" ]] && kill -0 "$preview_pid" 2>/dev/null; then
         kill "$preview_pid" 2>/dev/null || true
         wait "$preview_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$evidence_dir" && -f "$temp_root/graph.xwd" ]]; then
+        cp -- "$temp_root/graph.xwd" "$evidence_dir/graph.xwd"
     fi
     case "$temp_root" in
         "$temp_parent"/codex-info-x11-graph.*) rm -rf -- "$temp_root" ;;

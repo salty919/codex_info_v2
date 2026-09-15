@@ -21,6 +21,9 @@ public sealed class GraphPlotControlTests
     private const string CanonicalPublishedPair =
         "v1:00112233445566778899aabbccddeeff00000000000000000000000000000001";
 
+    private static bool IsRenderableModel(string model) =>
+        model is "ASTRA" or "LUNA" or "SOL" or "TERRA";
+
     [Fact]
     public void ContractMaximumReductionIsViewportBoundedAndPreservesExactEndpoints()
     {
@@ -1537,7 +1540,7 @@ public sealed class GraphPlotControlTests
                 tokenScene = scene;
             }
 
-            foreach (var model in scene.ModelSeries)
+            foreach (var model in scene.ModelSeries.Where(pair => IsRenderableModel(pair.Key)))
             {
                 var lines = GraphPlotProjection.BuildModelLines(scene, model.Value);
                 AddLiveSegments(actualSegments, name, model.Key, "flat", lines.Flat);
@@ -1602,6 +1605,100 @@ public sealed class GraphPlotControlTests
             var imageControl = new GraphPlotControl { Scene = dollarScene };
             imageControl.Plot.SavePng(fullImagePath, 940, 480);
         }
+    }
+
+    [Fact]
+    public async Task Issue137_live_evidence_exports_windows_idle_projection()
+    {
+        var evidencePath = Environment.GetEnvironmentVariable("CODEX_INFO_GRAPH_IDLE_LIVE_EVIDENCE");
+        var outputPath = Environment.GetEnvironmentVariable("CODEX_INFO_GRAPH_IDLE_ACTUAL_OUTPUT");
+        var sourceSha = Environment.GetEnvironmentVariable("CODEX_INFO_GRAPH_SOURCE_SHA");
+        var repositoryRoot = Environment.GetEnvironmentVariable("CODEX_INFO_GRAPH_REPOSITORY_ROOT");
+        if (evidencePath is null && outputPath is null && sourceSha is null && repositoryRoot is null)
+        {
+            return;
+        }
+
+        Assert.False(string.IsNullOrWhiteSpace(evidencePath));
+        Assert.False(string.IsNullOrWhiteSpace(outputPath));
+        Assert.False(string.IsNullOrWhiteSpace(sourceSha));
+        Assert.False(string.IsNullOrWhiteSpace(repositoryRoot));
+        var fullEvidencePath = Path.GetFullPath(evidencePath!);
+        var fullOutputPath = Path.GetFullPath(outputPath!);
+        var fullRepositoryRoot = Path.GetFullPath(repositoryRoot!);
+        Assert.True(Path.IsPathFullyQualified(evidencePath));
+        Assert.True(Path.IsPathFullyQualified(outputPath));
+        Assert.True(Path.IsPathFullyQualified(repositoryRoot));
+        Assert.True(File.Exists(fullEvidencePath));
+        Assert.False(File.Exists(fullOutputPath));
+        Assert.True(Directory.Exists(Path.GetDirectoryName(fullOutputPath)));
+        Assert.False(PathIsInside(fullEvidencePath, fullRepositoryRoot));
+        Assert.False(PathIsInside(fullOutputPath, fullRepositoryRoot));
+
+        using var artifact = JsonDocument.Parse(File.ReadAllText(fullEvidencePath));
+        var root = artifact.RootElement;
+        Assert.Equal("graph-evidence-v1", root.GetProperty("schema_version").GetString());
+        var fixture = root.GetProperty("fixture");
+        var pair = root.GetProperty("published_pair").GetString()!;
+        Assert.Equal(pair, fixture.GetProperty("published_pair").GetString());
+        var periodElement = fixture.GetProperty("period");
+        var periodBody = Encoding.UTF8.GetBytes(
+            "{\"api_version\":\"v3\",\"history_periods\":[" +
+            periodElement.GetRawText() +
+            "]}");
+        var historyBody = Encoding.UTF8.GetBytes(fixture.GetProperty("history_page").GetRawText());
+        var periodId = periodElement.GetProperty("id").GetString()!;
+        var handler = new SplitHistoryFixtureHandler(periodBody, historyBody, pair, periodId);
+        using var client = new LoopbackStatusClient(handler);
+        var periodsResult = await client.FetchHistoryPeriodsAsync(CancellationToken.None);
+        var pageResult = await client.FetchHistoryPageAsync(periodId, cancellationToken: CancellationToken.None);
+        Assert.True(periodsResult.IsSuccess);
+        Assert.True(pageResult.IsSuccess);
+        var periods = Assert.IsType<ApiHistoryPeriodsSnapshot>(periodsResult.Snapshot);
+        var page = Assert.IsType<ApiHistoryPage>(pageResult.Page);
+        Assert.Equal(periods.PublishedPair, page.PublishedPair);
+        var parsedPeriod = Assert.Single(periods.Periods, candidate => candidate.Id == periodId);
+        var period = parsedPeriod with { Samples = page.Samples };
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, period.EndAt);
+        var gaps = page.HistoryGaps
+            .Select(gap => new GraphConfirmedGap(gap.StartAt, gap.EndAt))
+            .ToArray();
+        var dollarScene = GraphScene.Create(samples, GraphMetric.Dollars, period.StartAt, period.EndAt, gaps);
+        var tokenScene = GraphScene.Create(samples, GraphMetric.Tokens, period.StartAt, period.EndAt, gaps);
+        Assert.Equal(dollarScene.IdleIntervals, tokenScene.IdleIntervals);
+
+        var actualIdle = tokenScene.IdleIntervals
+            .Select(interval => new LiveIdleInterval(interval.StartAt, interval.EndAt))
+            .OrderBy(interval => interval.StartAt)
+            .ThenBy(interval => interval.EndAt)
+            .ToArray();
+        var expectedIdle = root.GetProperty("expected_idle_intervals")
+            .EnumerateArray()
+            .Select(interval => new LiveIdleInterval(
+                interval.GetProperty("start_at").GetInt64(),
+                interval.GetProperty("end_at").GetInt64()))
+            .OrderBy(interval => interval.StartAt)
+            .ThenBy(interval => interval.EndAt)
+            .ToArray();
+        Assert.Equal(expectedIdle, actualIdle);
+
+        var document = new Dictionary<string, object?>
+        {
+            ["schema_version"] = "graph-idle-actual-v1",
+            ["source_sha"] = sourceSha,
+            ["input_source_sha"] = root.GetProperty("source_sha").GetString(),
+            ["input_sha256"] = root.GetProperty("input_sha256").GetString(),
+            ["account_id"] = root.GetProperty("account_id").GetString(),
+            ["period"] = periodId,
+            ["published_pair"] = pair,
+            ["platform"] = "windows",
+            ["idle_intervals"] = actualIdle,
+        };
+        File.WriteAllText(fullOutputPath, JsonSerializer.Serialize(document, new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+            WriteIndented = true,
+        }));
     }
 
     [Fact]
@@ -2228,12 +2325,12 @@ public sealed class GraphPlotControlTests
         Assert.Equal(86.66666666666667d, effective[2], precision: 12);
         Assert.Equal(83.33333333333333d, effective[3], precision: 12);
         Assert.Equal(80d, effective[4]);
-        Assert.Equal([1_000d, 1_060d], lines.Solid.X);
-        Assert.Equal([100d, 90d], lines.Solid.Y);
-        Assert.Equal([1_060d, 1_120d, 1_180d, 1_240d], lines.Dashed.X);
+        Assert.Equal([1_000d, 1_060d, 1_120d, 1_180d, 1_240d], lines.Solid.X);
         Assert.Equal(
-            [90d, 86.66666666666667d, 83.33333333333333d, 80d],
-            lines.Dashed.Y);
+            [100d, 90d, 86.66666666666667d, 83.33333333333333d, 80d],
+            lines.Solid.Y);
+        Assert.Empty(lines.Dashed.X);
+        Assert.Empty(lines.Dashed.Y);
         Assert.DoesNotContain(
             lines.Solid.X.Zip(lines.Solid.X.Skip(1)),
             pair => pair.First == pair.Second);
@@ -2841,6 +2938,7 @@ public sealed class GraphPlotControlTests
     {
         var span = Math.Max(1d, scene.PeriodEndAt - scene.PeriodStartAt);
         var models = scene.ModelSeries
+            .Where(pair => IsRenderableModel(pair.Key))
             .OrderBy(pair => pair.Key, StringComparer.Ordinal)
             .Select(pair =>
             {
@@ -2880,6 +2978,7 @@ public sealed class GraphPlotControlTests
                 label.ArrangedTop.ToString("F9", CultureInfo.InvariantCulture)))
             .ToArray();
         var endpointValues = scene.ModelSeries
+            .Where(pair => IsRenderableModel(pair.Key))
             .OrderBy(pair => pair.Key, StringComparer.Ordinal)
             .Select(pair => new LiveEndpointValue(
                 pair.Key,
