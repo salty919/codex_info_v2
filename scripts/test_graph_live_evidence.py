@@ -321,6 +321,25 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         _, idle = oracle.build_expected(v3_fixture(disjoint_rows, period_id="empty-common-model"))
         self.assertEqual([], idle)
 
+    def test_idle_rows_stay_aligned_when_reset_boundary_is_inserted(self):
+        rows = [
+            {
+                "timestamp": minute * 60,
+                "remaining_percent": 90.0,
+                "tokens": 100,
+                "task_active_since_previous": False,
+            }
+            for minute in range(1, 32)
+        ]
+        fixture = v3_fixture(rows, period_id="reset-boundary-idle-alignment")
+        fixture["period"].update(start_at=0, reset_at=604_800)
+        for sample in fixture["history_page"]["history_samples"]:
+            sample["reset_at"] = 604_800
+
+        _, idle = oracle.build_expected(fixture)
+
+        self.assertEqual([{"start_at": 60, "end_at": 1_860}], idle)
+
     def test_idle_bridge_allows_finite_modelless_metadata_row(self):
         def model(name, tokens):
             return {

@@ -1056,11 +1056,10 @@ def _remaining_segments(
 
 def _idle_intervals(
     period: dict[str, Any],
-    samples: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
     token_models: dict[str, list[ModelEvidence]],
     gaps: list[dict[str, Any]],
 ) -> list[dict[str, int]]:
-    rows = [dict(sample, synthetic=False) for sample in samples]
     timestamps = [row["timestamp"] for row in rows]
     remaining = {
         point.timestamp: point
@@ -1336,7 +1335,7 @@ def build_expected(fixture: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
         for model in renderable_universe:
             segments.extend(_model_segments(rows, model, metric, projections[metric][model], gaps))
     segments.sort(key=_segment_key)
-    return segments, _idle_intervals(period, samples, token_models, gaps)
+    return segments, _idle_intervals(period, rows, token_models, gaps)
 
 
 def _canonical_coordinate(
@@ -1596,7 +1595,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
         token_models,
         gaps,
     )
-    idle = _idle_intervals(period, samples, token_models, gaps)
+    idle = _idle_intervals(period, rows, token_models, gaps)
     idle_geometry = [
         {
             "start": f"{(interval['start_at'] - period['start_at']) / max(1, period['end_at'] - period['start_at']) * 100.0:.12f}",
