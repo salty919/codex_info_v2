@@ -144,7 +144,8 @@ run_linux_distribution() {
     [[ -n "$archive" ]] || fail 'Linux bundle archive is missing'
     tar -xzf "$archive" -C "$candidate_root" --no-same-owner
     CODEX_INFO_ACCEPTANCE_BINARY="$candidate_root/codex_info" \
-        xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' \
+        xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24 -noreset -ac' \
+        env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET \
         bash scripts/x11_service_recovery_visual_gate.sh
 }
 
