@@ -66,7 +66,13 @@ public sealed record ApiDetailsSnapshot(
     }
 }
 
-/// <summary>Token and expected-dollar totals for one model in the current quota period.</summary>
+/// <summary>
+/// Token and expected-dollar totals for one model in the current quota period.
+/// The three primary token and dollar pairs are presentation buckets: Input
+/// excludes cached input but includes cache-write input, CachedInput is the
+/// cached bucket, and Output is the output bucket. The v3 wire adapter alone
+/// converts its gross input fields into this common contract.
+/// </summary>
 public sealed record ApiDetailsModelUsage(
     string Name,
     ulong InputTokens,
@@ -79,10 +85,16 @@ public sealed record ApiDetailsModelUsage(
     /// <summary>The server-provided cumulative token total when using v3.</summary>
     public ulong TotalTokens { get; init; } = AddTokens(InputTokens, CachedInputTokens, OutputTokens);
 
-    /// <summary>v3 cache-write input tokens, which are absent from v1/v2.</summary>
+    /// <summary>
+    /// The v3 cache-write subcomponent retained for provenance. It is already
+    /// included in the primary InputTokens presentation bucket.
+    /// </summary>
     public ulong? CacheWriteInputTokens { get; init; }
 
-    /// <summary>v3 cache-write input dollars, which are absent from v1/v2.</summary>
+    /// <summary>
+    /// The v3 cache-write dollar subcomponent retained for provenance. It is
+    /// already included in the primary InputDollars presentation bucket.
+    /// </summary>
     public double CacheWriteInputDollars { get; init; } = double.NaN;
 
     /// <summary>Opaque price-table identity supplied by the v3 server.</summary>
@@ -103,8 +115,7 @@ public sealed record ApiDetailsModelUsage(
     /// </summary>
     public double TotalDollars => EstimatedTotalDollars ??
         (double.IsFinite(InputDollars + CachedInputDollars + OutputDollars)
-            ? InputDollars + CachedInputDollars + OutputDollars +
-              (double.IsFinite(CacheWriteInputDollars) ? CacheWriteInputDollars : 0)
+            ? InputDollars + CachedInputDollars + OutputDollars
             : double.NaN);
 
     private static ulong AddTokens(ulong input, ulong cached, ulong output) =>

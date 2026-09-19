@@ -1,0 +1,128 @@
+{
+  "contract_id": "MODEL-USAGE-DISPLAY-01",
+  "rows": [
+    {
+      "wire": {
+        "model": "SOL",
+        "total_tokens": 79923732,
+        "input_tokens": 79659638,
+        "cached_input_tokens": 78023168,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 264094,
+        "estimated_cost": {
+          "price_version": "LOCAL_ESTIMATE_V1_2026-08-14",
+          "ordinary_input_dollars": 8.18235,
+          "cached_input_dollars": 39.011584,
+          "cache_write_input_dollars": 0.0,
+          "output_dollars": 7.92282,
+          "total_dollars": 55.116754
+        }
+      },
+      "expected": {
+        "input_tokens": "1,636,470",
+        "input_dollars": "$8.18",
+        "cached_input_tokens": "78,023,168",
+        "cached_input_dollars": "$39.01",
+        "output_tokens": "264,094",
+        "output_dollars": "$7.92"
+      }
+    },
+    {
+      "wire": {
+        "model": "LUNA",
+        "total_tokens": 4854533,
+        "input_tokens": 4738954,
+        "cached_input_tokens": 4218368,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 115579,
+        "estimated_cost": {
+          "price_version": "LOCAL_ESTIMATE_V1_2026-08-14",
+          "ordinary_input_dollars": 0.1041172,
+          "cached_input_dollars": 0.08436736,
+          "cache_write_input_dollars": 0.0,
+          "output_dollars": 0.1386948,
+          "total_dollars": 0.32717936
+        }
+      },
+      "expected": {
+        "input_tokens": "520,586",
+        "input_dollars": "$0.10",
+        "cached_input_tokens": "4,218,368",
+        "cached_input_dollars": "$0.08",
+        "output_tokens": "115,579",
+        "output_dollars": "$0.14"
+      }
+    },
+    {
+      "wire": {
+        "model": "TERRA",
+        "total_tokens": 3500000,
+        "input_tokens": 3000000,
+        "cached_input_tokens": 1000000,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 500000,
+        "estimated_cost": {
+          "price_version": "LOCAL_ESTIMATE_V1_2026-08-14",
+          "ordinary_input_dollars": 4.0,
+          "cached_input_dollars": 0.2,
+          "cache_write_input_dollars": 0.0,
+          "output_dollars": 6.0,
+          "total_dollars": 10.2
+        }
+      },
+      "expected": {
+        "input_tokens": "2,000,000",
+        "input_dollars": "$4.00",
+        "cached_input_tokens": "1,000,000",
+        "cached_input_dollars": "$0.20",
+        "output_tokens": "500,000",
+        "output_dollars": "$6.00"
+      }
+    },
+    {
+      "wire": {
+        "model": "ASTRA",
+        "total_tokens": 1050000,
+        "input_tokens": 1000000,
+        "cached_input_tokens": 200000,
+        "cache_write_input_tokens": 100000,
+        "output_tokens": 50000,
+        "estimated_cost": {
+          "price_version": "ASTRA_USER_2026-09-05",
+          "ordinary_input_dollars": 7.0,
+          "cached_input_dollars": 0.2,
+          "cache_write_input_dollars": 1.25,
+          "output_dollars": 2.5,
+          "total_dollars": 10.95
+        }
+      },
+      "expected": {
+        "input_tokens": "800,000",
+        "input_dollars": "$8.25",
+        "cached_input_tokens": "200,000",
+        "cached_input_dollars": "$0.20",
+        "output_tokens": "50,000",
+        "output_dollars": "$2.50"
+      }
+    },
+    {
+      "wire": {
+        "model": "UNPRICED",
+        "total_tokens": 1050,
+        "input_tokens": 1000,
+        "cached_input_tokens": 200,
+        "cache_write_input_tokens": null,
+        "output_tokens": 50,
+        "estimated_cost": null
+      },
+      "expected": {
+        "input_tokens": "800",
+        "input_dollars": null,
+        "cached_input_tokens": "200",
+        "cached_input_dollars": null,
+        "output_tokens": "50",
+        "output_dollars": null
+      }
+    }
+  ]
+}

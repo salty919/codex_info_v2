@@ -19505,7 +19505,7 @@ fn format_dollar_cost(value: f64) -> String {
     if !value.is_finite() || value < 0.0 {
         return "—".into();
     }
-    format!("${}", value as u64)
+    format!("${value:.2}")
 }
 
 fn estimated_cost_label_from_v3(models: &[PublicModelUsageV3]) -> String {
@@ -23211,19 +23211,19 @@ mod tests {
         open_codex_session_paths, parse_details_document, parse_launch_mode, parse_preview_size,
         parse_rate_limits, parse_resize_direction, period_remaining_text,
         period_selector_display_start, physical_size_for_logical, plan_type_label,
-        poll_service_state, poll_service_state_with_owner_check, preview_model_row,
-        published_pair_is_fresh, read_active_thread_rollout_cached,
-        read_recovery_entries_for_ranges, read_thread_rollout_path, remaining_graph_points,
-        remaining_graph_points_for_metric, remaining_graph_y, remaining_marker_positions,
-        remaining_marker_positions_on_points, request_with_timeout, reset_transition_is_boundary,
-        same_rollout_identity, separate_current_label_positions, service_endpoint_state,
-        service_health_response_version, service_is_healthy, session_event_model,
-        session_event_type, session_jsonl_files, session_token_snapshot, smooth_model_spend,
-        split_metric_line_paths, terminate_and_reap_owned_child, thread_presentation_rows,
-        three_months_before_utc, unreliable_model_spend, unused_interval_positions,
-        visible_window_position, week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer,
-        ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphConfirmedGap, GraphPaths,
-        GraphWindow, HistoryPeriod, HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint,
+        poll_service_state, poll_service_state_with_owner_check, published_pair_is_fresh,
+        read_active_thread_rollout_cached, read_recovery_entries_for_ranges,
+        read_thread_rollout_path, remaining_graph_points, remaining_graph_points_for_metric,
+        remaining_graph_y, remaining_marker_positions, remaining_marker_positions_on_points,
+        request_with_timeout, reset_transition_is_boundary, same_rollout_identity,
+        separate_current_label_positions, service_endpoint_state, service_health_response_version,
+        service_is_healthy, session_event_model, session_event_type, session_jsonl_files,
+        session_token_snapshot, smooth_model_spend, split_metric_line_paths,
+        terminate_and_reap_owned_child, thread_presentation_rows, three_months_before_utc,
+        unreliable_model_spend, unused_interval_positions, visible_window_position,
+        week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer, ApiServerConfig,
+        CodexInfoState, Event, FixedResizeDecision, GraphConfirmedGap, GraphPaths, GraphWindow,
+        HistoryPeriod, HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint,
         LocalUsageCache, LocalUsageCandidate, LocalUsageResult, ManualX11Geometry,
         ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
         ModelUsageTotals, PublicDetails, PublicDetailsV2, PublicDetailsV3, PublicHistoryGap,
@@ -23249,6 +23249,38 @@ mod tests {
         expected_sol_max: f64,
         expected_period_count: usize,
         details_response: GraphFixtureDetailsResponse,
+    }
+
+    #[derive(Deserialize)]
+    struct ModelUsageDisplayFixture {
+        contract_id: String,
+        rows: Vec<ModelUsageDisplayFixtureRow>,
+    }
+
+    #[derive(Deserialize)]
+    struct ModelUsageDisplayFixtureRow {
+        wire: ModelUsageDisplayWireRow,
+        expected: ModelUsageDisplayExpectedRow,
+    }
+
+    #[derive(Deserialize)]
+    struct ModelUsageDisplayWireRow {
+        model: String,
+        total_tokens: u64,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        cache_write_input_tokens: Option<u64>,
+        output_tokens: u64,
+    }
+
+    #[derive(Deserialize)]
+    struct ModelUsageDisplayExpectedRow {
+        input_tokens: String,
+        input_dollars: Option<String>,
+        cached_input_tokens: String,
+        cached_input_dollars: Option<String>,
+        output_tokens: String,
+        output_dollars: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -34960,21 +34992,65 @@ mod tests {
     }
 
     #[test]
-    fn model_usage_is_explicitly_token_based() {
+    fn model_usage_display_matches_the_shared_cross_platform_oracle() {
+        let fixture: ModelUsageDisplayFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/model_usage_display_oracle.json"
+        ))
+        .expect("model usage display fixture");
+        assert_eq!(fixture.contract_id, "MODEL-USAGE-DISPLAY-01");
+
+        let rows = fixture
+            .rows
+            .iter()
+            .map(|fixture_row| {
+                let wire = &fixture_row.wire;
+                assert_eq!(
+                    wire.total_tokens,
+                    wire.input_tokens.saturating_add(wire.output_tokens),
+                    "{} total token authority",
+                    wire.model
+                );
+                ModelUsageRow {
+                    name: wire.model.clone(),
+                    tokens: wire.total_tokens,
+                    input_tokens: wire.input_tokens,
+                    cached_input_tokens: wire.cached_input_tokens,
+                    output_tokens: wire.output_tokens,
+                    cache_write_input_tokens: wire.cache_write_input_tokens,
+                }
+            })
+            .collect::<Vec<_>>();
+        let expected_column = |value: fn(&ModelUsageDisplayExpectedRow) -> &String| {
+            fixture
+                .rows
+                .iter()
+                .map(|row| value(&row.expected).as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let expected_dollar_column =
+            |value: fn(&ModelUsageDisplayExpectedRow) -> Option<&String>| {
+                fixture
+                    .rows
+                    .iter()
+                    .map(|row| value(&row.expected).map_or("—", String::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+
         assert_eq!(
-            format_model_usage_columns(&[
-                preview_model_row("SOL", 1_234_567, 1_234_567, 234_567, 234_567),
-                preview_model_row("TERRA", 99, 99, 0, 0),
-                preview_model_row("LUNA", 42, 42, 0, 0),
-            ]),
+            format_model_usage_columns(&rows),
             (
-                "SOL\nTERRA\nLUNA".into(),
-                "1,000,000\n99\n42".into(),
-                "$5\n$0\n$0".into(),
-                "234,567\n0\n0".into(),
-                "$0\n$0\n$0".into(),
-                "234,567\n0\n0".into(),
-                "$7\n$0\n$0".into()
+                rows.iter()
+                    .map(|row| row.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                expected_column(|row| &row.input_tokens),
+                expected_dollar_column(|row| row.input_dollars.as_ref()),
+                expected_column(|row| &row.cached_input_tokens),
+                expected_dollar_column(|row| row.cached_input_dollars.as_ref()),
+                expected_column(|row| &row.output_tokens),
+                expected_dollar_column(|row| row.output_dollars.as_ref()),
             )
         );
     }

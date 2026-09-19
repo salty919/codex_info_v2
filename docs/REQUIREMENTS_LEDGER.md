@@ -6,6 +6,7 @@
 | --- | --- | --- | --- | --- |
 | RECORDER-MODEL-01 | DATA | `src/main.rs`、`src/usage_store.rs` | 任意model差分/cache write保存、source単位隔離、旧DB保持、restart/range再適用、ASTRAのみbackfillと旧3モデル既知値を不完全履歴として保持する直接case | implemented |
 | ASTRA-COST-01 | PRODUCT | `src/main.rs`、REST/各UIの価格projection | 指定4単価、cache write二重計上なし、未提供/不整合の未確定表示 | implemented |
+| MODEL-USAGE-DISPLAY-01 | PRODUCT | `src/main.rs`、Windows v3 adapter・`ModelUsageViewModel`、`tests/fixtures/model_usage_display_oracle.json` | SOL/LUNA/TERRA/ASTRA/価格未定の同一fixtureから両platformのInput/Cached/Output token＋隣接ドルを照合し、v3だけを正規化、v1/v2二重減算0、小数2桁、cache write二重計上0を直接検証 | implemented |
 | API-LIFECYCLE-01 | PRODUCT | `src/server.rs`、`docs/REST_API_V1.md`、各client contract adapter | current/periods/selected-history/delta/threadsを同じdomain pairから分離し、Linux/Windows positive-current＋same-pair threadsのatomic commit、count 0のthreads request 0、合計＝bucket和、失敗後10秒無条件retry中の依存request 0、prefix証明delta、閉surface request 0、DB/collector非依存、任意model、旧details互換を直接検証 | implemented |
 | ACCOUNT-LIFECYCLE-134 | PRODUCT | 独立recorder、account locator、REST、Linux/Windows UI | 同時writerは認証中account一つ、A→B→Aで各partitionを保持・再開し、selector変更後は一つのaccount resource集合だけを表示 | implemented |
 | ACCOUNT-PARTITION-134 | DATA | account registry、partitioned recorder、read-only DB identity gate | 境界前prefix混入0、復元済み範囲の一回適用、旧DB不変、全初期化済みpartition列挙、wrong DB identity拒否 | implemented |

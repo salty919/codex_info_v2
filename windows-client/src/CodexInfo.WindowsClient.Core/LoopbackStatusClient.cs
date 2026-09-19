@@ -2098,10 +2098,12 @@ public sealed class LoopbackStatusClient :
 
             models.Add(new ApiDetailsModelUsage(
                 name,
-                inputTokens,
+                inputTokens - cachedInputTokens,
                 cachedInputTokens,
                 outputTokens,
-                cost?.OrdinaryInputDollars ?? double.NaN,
+                cost is { } priced
+                    ? priced.OrdinaryInputDollars + priced.CacheWriteInputDollars
+                    : double.NaN,
                 cost?.CachedInputDollars ?? double.NaN,
                 cost?.OutputDollars ?? double.NaN)
             {
