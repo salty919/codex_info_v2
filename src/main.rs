@@ -2844,6 +2844,21 @@ struct HistoryPeriod {
     label: String,
 }
 
+fn period_selector_display_start(
+    canonical_start_at: i64,
+    current: bool,
+    latest_quota_reset_at: Option<i64>,
+    window_seconds: i64,
+) -> i64 {
+    if !current || window_seconds <= 0 {
+        return canonical_start_at;
+    }
+    latest_quota_reset_at
+        .and_then(|reset_at| reset_at.checked_sub(window_seconds))
+        .filter(|start_at| *start_at > 0)
+        .unwrap_or(canonical_start_at)
+}
+
 fn disambiguate_period_start_labels(periods: &mut [HistoryPeriod]) {
     let mut totals = BTreeMap::new();
     for period in periods.iter() {
@@ -17322,14 +17337,22 @@ impl CodexInfoState {
             if let Some(periods) = authoritative_periods {
                 let mut localized = periods
                     .iter()
-                    .map(|period| HistoryPeriod {
-                        canonical_reset_at: period.reset_at,
-                        start: period.start_at,
-                        end: period.end_at,
-                        label: self
-                            .i18n
-                            .format_period_selector_label(period.start_at, period.current)
-                            .unwrap_or_default(),
+                    .map(|period| {
+                        let display_start = period_selector_display_start(
+                            period.start_at,
+                            period.current,
+                            self.reset_at,
+                            self.window_seconds,
+                        );
+                        HistoryPeriod {
+                            canonical_reset_at: period.reset_at,
+                            start: period.start_at,
+                            end: period.end_at,
+                            label: self
+                                .i18n
+                                .format_period_selector_label(display_start, period.current)
+                                .unwrap_or_default(),
+                        }
                     })
                     .collect::<Vec<_>>();
                 localized.retain(|period| !period.label.is_empty());
@@ -17363,9 +17386,15 @@ impl CodexInfoState {
             current_history_period_reset(&periods, self.reset_at, observed_at);
         for period in &mut periods {
             let is_current = current_period_reset == Some(period.canonical_reset_at);
+            let display_start = period_selector_display_start(
+                period.start,
+                is_current,
+                self.reset_at,
+                self.window_seconds,
+            );
             let Some(label) = self
                 .i18n
-                .format_period_selector_label(period.start, is_current)
+                .format_period_selector_label(display_start, is_current)
             else {
                 period.label.clear();
                 continue;
@@ -23181,20 +23210,20 @@ mod tests {
         native_legal_pages, native_startup_loading, normal_status_text, one_month_before_utc,
         open_codex_session_paths, parse_details_document, parse_launch_mode, parse_preview_size,
         parse_rate_limits, parse_resize_direction, period_remaining_text,
-        physical_size_for_logical, plan_type_label, poll_service_state,
-        poll_service_state_with_owner_check, preview_model_row, published_pair_is_fresh,
-        read_active_thread_rollout_cached, read_recovery_entries_for_ranges,
-        read_thread_rollout_path, remaining_graph_points, remaining_graph_points_for_metric,
-        remaining_graph_y, remaining_marker_positions, remaining_marker_positions_on_points,
-        request_with_timeout, reset_transition_is_boundary, same_rollout_identity,
-        separate_current_label_positions, service_endpoint_state, service_health_response_version,
-        service_is_healthy, session_event_model, session_event_type, session_jsonl_files,
-        session_token_snapshot, smooth_model_spend, split_metric_line_paths,
-        terminate_and_reap_owned_child, thread_presentation_rows, three_months_before_utc,
-        unreliable_model_spend, unused_interval_positions, visible_window_position,
-        week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer, ApiServerConfig,
-        CodexInfoState, Event, FixedResizeDecision, GraphConfirmedGap, GraphPaths, GraphWindow,
-        HistoryPeriod, HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint,
+        period_selector_display_start, physical_size_for_logical, plan_type_label,
+        poll_service_state, poll_service_state_with_owner_check, preview_model_row,
+        published_pair_is_fresh, read_active_thread_rollout_cached,
+        read_recovery_entries_for_ranges, read_thread_rollout_path, remaining_graph_points,
+        remaining_graph_points_for_metric, remaining_graph_y, remaining_marker_positions,
+        remaining_marker_positions_on_points, request_with_timeout, reset_transition_is_boundary,
+        same_rollout_identity, separate_current_label_positions, service_endpoint_state,
+        service_health_response_version, service_is_healthy, session_event_model,
+        session_event_type, session_jsonl_files, session_token_snapshot, smooth_model_spend,
+        split_metric_line_paths, terminate_and_reap_owned_child, thread_presentation_rows,
+        three_months_before_utc, unreliable_model_spend, unused_interval_positions,
+        visible_window_position, week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer,
+        ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphConfirmedGap, GraphPaths,
+        GraphWindow, HistoryPeriod, HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint,
         LocalUsageCache, LocalUsageCandidate, LocalUsageResult, ManualX11Geometry,
         ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
         ModelUsageTotals, PublicDetails, PublicDetailsV2, PublicDetailsV3, PublicHistoryGap,
@@ -29375,6 +29404,7 @@ mod tests {
         let mut state = super::usage_store::SessionCollectionState {
             data_generation: 9_000,
             reset_at: reset_b,
+            latest_quota_reset_at: reset_b,
             window_seconds: WEEK_SECONDS,
             last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
                 observed_at: observed_b,
@@ -29487,6 +29517,7 @@ mod tests {
             super::usage_store::SessionCollectionState {
                 data_generation: generation,
                 reset_at,
+                latest_quota_reset_at: reset_at,
                 window_seconds: WEEK_SECONDS,
                 last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
                     observed_at,
@@ -29574,6 +29605,7 @@ mod tests {
         let mut restarted = super::usage_store::SessionCollectionState {
             data_generation: 7,
             reset_at: now - two_days + WEEK_SECONDS,
+            latest_quota_reset_at: now - two_days + WEEK_SECONDS,
             window_seconds: WEEK_SECONDS,
             last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
                 observed_at: now - two_days,
@@ -29600,6 +29632,7 @@ mod tests {
         let mut rollover = super::usage_store::SessionCollectionState {
             data_generation: 8,
             reset_at: now + 30,
+            latest_quota_reset_at: now + 30,
             window_seconds: WEEK_SECONDS,
             last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
                 observed_at: now - 60,
@@ -29650,6 +29683,7 @@ mod tests {
         let retained = super::usage_store::SessionCollectionState {
             data_generation: 9_800,
             reset_at,
+            latest_quota_reset_at: reset_at,
             window_seconds: WEEK_SECONDS,
             collector_epoch: Some(3),
             cycle_seq: 4,
@@ -29670,6 +29704,7 @@ mod tests {
         let old_period = super::usage_store::SessionCollectionState {
             data_generation: 9_799,
             reset_at: 1_789_437_490,
+            latest_quota_reset_at: 1_789_437_490,
             window_seconds: WEEK_SECONDS,
             last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
                 observed_at: 1_789_018_740,
@@ -35024,6 +35059,7 @@ mod tests {
         let collection_state = usage_store::SessionCollectionState {
             data_generation: 7,
             reset_at,
+            latest_quota_reset_at: reset_at,
             window_seconds,
             last_quota_observation: None,
             model_totals: vec![usage_store::SessionModelTotal {
@@ -35970,6 +36006,7 @@ mod tests {
             &second_inventory,
             &super::usage_store::SessionCollectionState {
                 reset_at,
+                latest_quota_reset_at: reset_at,
                 window_seconds: WEEK_SECONDS,
                 collector_epoch: Some(0x1111),
                 cycle_seq: 1,
@@ -36009,6 +36046,7 @@ mod tests {
             &second_inventory,
             &super::usage_store::SessionCollectionState {
                 reset_at,
+                latest_quota_reset_at: reset_at,
                 window_seconds: WEEK_SECONDS,
                 collector_epoch: Some(0x2222),
                 cycle_seq: 1,
@@ -36101,6 +36139,7 @@ mod tests {
         let state = super::usage_store::SessionCollectionState {
             data_generation: 1,
             reset_at,
+            latest_quota_reset_at: reset_at,
             window_seconds: WEEK_SECONDS,
             collector_epoch: Some(0x1111),
             cycle_seq: 1,
@@ -36136,6 +36175,7 @@ mod tests {
         let append_state = super::usage_store::SessionCollectionState {
             data_generation: 2,
             reset_at,
+            latest_quota_reset_at: reset_at,
             window_seconds: WEEK_SECONDS,
             collector_epoch: Some(0x1111),
             cycle_seq: 2,
@@ -36170,6 +36210,7 @@ mod tests {
         let switched_state = super::usage_store::SessionCollectionState {
             data_generation: 3,
             reset_at,
+            latest_quota_reset_at: reset_at,
             window_seconds: WEEK_SECONDS,
             collector_epoch: Some(0x1111),
             cycle_seq: 3,
@@ -36652,6 +36693,7 @@ mod tests {
             &super::usage_store::SessionCollectionState {
                 data_generation: 1,
                 reset_at,
+                latest_quota_reset_at: reset_at,
                 window_seconds: WEEK_SECONDS,
                 collector_epoch: Some(0x4444),
                 cycle_seq: 1,
@@ -36761,6 +36803,7 @@ mod tests {
             &super::usage_store::SessionCollectionState {
                 data_generation: 1,
                 reset_at,
+                latest_quota_reset_at: reset_at,
                 window_seconds: WEEK_SECONDS,
                 collector_epoch: Some(0x5555),
                 cycle_seq: 1,
@@ -36865,6 +36908,7 @@ mod tests {
         let mut durable_state = super::usage_store::SessionCollectionState {
             data_generation: 3,
             reset_at: reset_at - 1,
+            latest_quota_reset_at: reset_at - 1,
             window_seconds: WEEK_SECONDS,
             last_quota_observation: Some(super::usage_store::SessionQuotaObservation {
                 observed_at: now.timestamp() - 60,
@@ -40155,6 +40199,33 @@ mod tests {
             );
         }
         server.shutdown();
+    }
+
+    #[test]
+    fn live_quota_reset_current_selector_uses_window_without_moving_history() {
+        let canonical_start_at = 1_789_805_607_i64;
+        let latest_quota_reset_at = 1_790_426_338_i64;
+        let window_seconds = 604_800_i64;
+
+        assert_eq!(
+            period_selector_display_start(
+                canonical_start_at,
+                true,
+                Some(latest_quota_reset_at),
+                window_seconds,
+            ),
+            latest_quota_reset_at - window_seconds
+        );
+        assert_eq!(
+            period_selector_display_start(
+                canonical_start_at,
+                false,
+                Some(latest_quota_reset_at),
+                window_seconds,
+            ),
+            canonical_start_at,
+            "completed history keeps its canonical start"
+        );
     }
 
     #[test]

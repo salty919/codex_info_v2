@@ -2452,6 +2452,7 @@ fn session_event_to_timed_usage(event: SessionEvent) -> Result<TimedModelUsage, 
 #[derive(Clone)]
 struct PendingBatch {
     reset_at: i64,
+    latest_quota_reset_at: i64,
     window_seconds: i64,
     collector_epoch: u128,
     cycle_seq: u64,
@@ -3461,13 +3462,30 @@ impl Recorder {
         let admitted_quota = quota
             .as_ref()
             .and_then(|candidate| admit_quota_period(&state, candidate));
-        let (reset_at, window_seconds, reset_transition) = admitted_quota
+        let (reset_at, latest_quota_reset_at, window_seconds, reset_transition) = admitted_quota
             .as_ref()
-            .map(|(transition, reset_at, window_seconds)| {
-                (*reset_at, *window_seconds, Some(*transition))
-            })
-            .unwrap_or((state.reset_at, state.window_seconds, None));
-        if reset_at < 0 || window_seconds < 0 || (reset_at == 0) != (window_seconds == 0) {
+            .map(
+                |(transition, reset_at, latest_quota_reset_at, window_seconds)| {
+                    (
+                        *reset_at,
+                        *latest_quota_reset_at,
+                        *window_seconds,
+                        Some(*transition),
+                    )
+                },
+            )
+            .unwrap_or((
+                state.reset_at,
+                state.latest_quota_reset_at,
+                state.window_seconds,
+                None,
+            ));
+        if reset_at < 0
+            || latest_quota_reset_at < 0
+            || window_seconds < 0
+            || (reset_at == 0) != (window_seconds == 0)
+            || (latest_quota_reset_at == 0) != (window_seconds == 0)
+        {
             return Err(RecorderError::Invalid(
                 "durable session period is invalid".to_owned(),
             ));
@@ -3792,11 +3810,13 @@ impl Recorder {
             {
                 return None;
             }
-            admitted_quota.as_ref().and_then(|(_, canonical_reset, _)| {
-                candidate.remaining_percent.map(|remaining| {
-                    totals.history_sample(candidate.observed_at, *canonical_reset, remaining)
+            admitted_quota
+                .as_ref()
+                .and_then(|(_, canonical_reset, _, _)| {
+                    candidate.remaining_percent.map(|remaining| {
+                        totals.history_sample(candidate.observed_at, *canonical_reset, remaining)
+                    })
                 })
-            })
         });
         let mut samples = samples;
         if let Some(sample) = quota_sample {
@@ -3854,6 +3874,7 @@ impl Recorder {
         });
         self.pending = Some(PendingBatch {
             reset_at,
+            latest_quota_reset_at,
             window_seconds,
             collector_epoch,
             cycle_seq,
@@ -3906,6 +3927,7 @@ impl Recorder {
                 .commit_session_collection_with_timeline_recovery_and_task_evidence(
                     commit,
                     &pending.observations,
+                    pending.latest_quota_reset_at,
                     recovery,
                     SessionTaskEvidenceInput {
                         events: &pending.durable_events,
@@ -3918,6 +3940,7 @@ impl Recorder {
             self.writer.commit_session_collection_with_task_evidence(
                 commit,
                 &pending.observations,
+                pending.latest_quota_reset_at,
                 SessionTaskEvidenceInput {
                     events: &pending.durable_events,
                     pending_ranges: &pending.pending_evidence,
@@ -3930,6 +3953,7 @@ impl Recorder {
         if read_back.data_generation != result.data_generation
             || read_back.collector_epoch != Some(pending.collector_epoch)
             || read_back.cycle_seq != pending.cycle_seq
+            || read_back.latest_quota_reset_at != pending.latest_quota_reset_at
             || read_back.model_totals != pending.model_totals
             || pending.checkpoints.iter().any(|expected| {
                 !read_back
@@ -3966,7 +3990,7 @@ impl Recorder {
 fn admit_quota_period(
     state: &SessionCollectionState,
     candidate: &QuotaSnapshot,
-) -> Option<(QuotaTransition, i64, i64)> {
+) -> Option<(QuotaTransition, i64, i64, i64)> {
     if candidate.reset_at <= 0 || candidate.window_seconds <= 0 || candidate.observed_at <= 0 {
         eprintln!(
             "recorder degraded: quota response has an invalid period reset_at={} window_seconds={} observed_at={}",
@@ -3981,6 +4005,19 @@ fn admit_quota_period(
     if !remaining_percent.is_finite() || !(0.0..=100.0).contains(&remaining_percent) {
         eprintln!("recorder degraded: quota response has an invalid remaining percentage");
         return None;
+    }
+    if let Some(previous) = state.last_quota_observation.as_ref() {
+        if candidate.observed_at == previous.observed_at
+            && (candidate.reset_at != state.latest_quota_reset_at
+                || candidate.window_seconds != state.window_seconds
+                || remaining_percent.to_bits() != previous.remaining_percent.to_bits())
+        {
+            eprintln!(
+                "recorder degraded: quota response conflicts with the admitted observation at observed_at={}",
+                candidate.observed_at
+            );
+            return None;
+        }
     }
     let previous_reset_at =
         (state.data_generation > 0 && state.reset_at > 0).then_some(state.reset_at);
@@ -4011,7 +4048,7 @@ fn admit_quota_period(
     } else {
         (candidate.reset_at, candidate.window_seconds)
     };
-    Some((transition, reset_at, window_seconds))
+    Some((transition, reset_at, candidate.reset_at, window_seconds))
 }
 
 struct Source {
@@ -6897,7 +6934,7 @@ mod tests {
         connection
             .execute(
                 "UPDATE collection_generation
-                 SET reset_at=?1, window_seconds=?2",
+                 SET reset_at=?1, latest_quota_reset_at=?1, window_seconds=?2",
                 (Utc::now().timestamp() + 3600, 3600_i64),
             )
             .unwrap();
@@ -7838,7 +7875,8 @@ mod tests {
         Connection::open(&database)
             .unwrap()
             .execute(
-                "UPDATE collection_generation SET reset_at=0, window_seconds=0",
+                "UPDATE collection_generation
+                 SET reset_at=0, latest_quota_reset_at=0, window_seconds=0",
                 [],
             )
             .unwrap();
@@ -7892,7 +7930,8 @@ mod tests {
         Connection::open(&database)
             .unwrap()
             .execute(
-                "UPDATE collection_generation SET reset_at=?1, window_seconds=?2",
+                "UPDATE collection_generation
+                 SET reset_at=?1, latest_quota_reset_at=?1, window_seconds=?2",
                 (0_i64, 0_i64),
             )
             .unwrap();
@@ -7935,7 +7974,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_deadline_correction_keeps_one_recorder_period() {
+    fn live_quota_reset_deadline_correction_keeps_one_recorder_period() {
         let (root, database) = prepare("reset-deadline-correction");
         let source = root.join("sessions/one.jsonl");
         let observed_at = Utc::now().timestamp();
@@ -7970,13 +8009,15 @@ mod tests {
             .unwrap()
             .unwrap();
         let before = recorder.state().unwrap();
+        assert_eq!(before.latest_quota_reset_at, canonical_reset_at);
         assert!(!before.model_totals.is_empty());
         assert!(!before.checkpoints.is_empty());
 
+        let latest_quota_reset_at = canonical_reset_at + 134;
         recorder
             .run_cycle_with_quota(Some(QuotaSnapshot {
                 observed_at: observed_at + 180,
-                reset_at: canonical_reset_at + 134,
+                reset_at: latest_quota_reset_at,
                 window_seconds,
                 remaining_percent: Some(99.0),
             }))
@@ -7984,6 +8025,7 @@ mod tests {
             .unwrap();
         let after = recorder.state().unwrap();
         assert_eq!(after.reset_at, canonical_reset_at);
+        assert_eq!(after.latest_quota_reset_at, latest_quota_reset_at);
         assert_eq!(after.window_seconds, window_seconds);
         assert_eq!(after.model_totals, before.model_totals);
         assert_eq!(after.checkpoints, before.checkpoints);
@@ -7994,6 +8036,20 @@ mod tests {
                 remaining_percent: 99.0,
             })
         );
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: observed_at + 180,
+                reset_at: latest_quota_reset_at + 60,
+                window_seconds,
+                remaining_percent: Some(99.0),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorder.state().unwrap().latest_quota_reset_at,
+            latest_quota_reset_at,
+            "a conflicting result at the same observation instant is not newer"
+        );
         let reset_count: i64 = Connection::open(&database)
             .unwrap()
             .query_row(
@@ -8003,6 +8059,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reset_count, 1);
+        drop(recorder);
+        let reopened =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        let reopened_state = reopened.state().unwrap();
+        assert_eq!(reopened_state.reset_at, canonical_reset_at);
+        assert_eq!(reopened_state.latest_quota_reset_at, latest_quota_reset_at);
+        assert_eq!(reopened_state.model_totals, before.model_totals);
+        drop(reopened);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -201,6 +201,14 @@ AccountKey/profile metadata/partition検証失敗は`error`とする。この3�
 `estimated_cost_label="概算 —"`で固定する。旧accountのquota/model/history/threadを混ぜず、同じconfirmed
 accountのtransport/quota/local一時失敗だけは従来どおり最後の完全rootを保持して`error`へ遷移する。
 
+`quota.reset_at`はhistory periodのcanonical境界ではなく、current account partition・AuthEpochで最後に受理した
+quota観測のprovider `resetsAt` Unix秒である。`quota.window_seconds`はその観測と同じtransactionの値とし、
+latestはdeadlineの大小ではなく`observed_at`とcollector generationの順序で決める。遅着した古い観測、同時刻の
+矛盾candidate、別account/epochの値を公開しない。同一periodのrolling更新では`quota.reset_at`だけが前進または
+補正され得るが、`history_periods[].id/start_at/reset_at`、既存sample、model totalsは変更しない。Linuxの現在period
+selectorに表示する開始時刻はwireのhistory `start_at`を書き換えず、同じcurrent rootの
+`quota.reset_at - quota.window_seconds`から求める。Windowsのリセット時刻は同じrootの`quota.reset_at`を表示する。
+
 wireに `ready` boolean keyは存在しない。dataの利用可能判定は、完全schemaを受理した一つのdetails rootについて
 `state == "ready" && authenticated == true` の論理積だけである。
 `state="ready",authenticated=false` と `state="auth_required",authenticated=true` はdomain不整合として
