@@ -4,7 +4,9 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Collections.Concurrent;
+using System.Text.Json;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Graphing;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.Settings;
 using CodexInfo.WindowsClient.ViewModels;
@@ -256,6 +258,105 @@ public sealed class DetailsWindowViewModelTests
         Assert.DoesNotContain("LUNA", graph.Scene.ModelSeries.Keys);
         graph.ShowLuna = true;
         Assert.Contains("LUNA", graph.Scene.ModelSeries.Keys);
+    }
+
+    [Fact]
+    public async Task SharedPeriodStartOracleKeepsResetSeparateFromEveryWindowsStartSurface()
+    {
+        var fixturePath = Path.Combine(
+            AppContext.BaseDirectory,
+            "Fixtures",
+            "graph_period_start_oracle.json");
+        using var document = JsonDocument.Parse(File.ReadAllText(fixturePath));
+        var root = document.RootElement;
+        Assert.Equal("graph-period-start-v1", root.GetProperty("schema_version").GetString());
+
+        var observedAt = root.GetProperty("observed_at").GetInt64();
+        var quotaJson = root.GetProperty("quota");
+        var quotaResetAt = quotaJson.GetProperty("reset_at").GetInt64();
+        var windowSeconds = quotaJson.GetProperty("window_seconds").GetInt64();
+        var periodJson = root.GetProperty("history_period");
+        var periodStartAt = periodJson.GetProperty("start_at").GetInt64();
+        var periodEndAt = periodJson.GetProperty("end_at").GetInt64();
+        var periodResetAt = periodJson.GetProperty("reset_at").GetInt64();
+        Assert.NotEqual(periodStartAt, quotaResetAt - windowSeconds);
+
+        var samples = root.GetProperty("history_samples")
+            .EnumerateArray()
+            .Select(sample => new ApiHistorySample(
+                sample.GetProperty("timestamp").GetInt64(),
+                sample.GetProperty("reset_at").GetInt64(),
+                sample.GetProperty("remaining_percent").GetDouble(),
+                sample.GetProperty("sol_dollars").GetDouble(),
+                sample.GetProperty("terra_dollars").GetDouble(),
+                sample.GetProperty("luna_dollars").GetDouble(),
+                sample.GetProperty("sol_tokens").GetUInt64(),
+                sample.GetProperty("terra_tokens").GetUInt64(),
+                sample.GetProperty("luna_tokens").GetUInt64()))
+            .ToArray();
+        var period = new ApiHistoryPeriod(
+            periodJson.GetProperty("id").GetString()!,
+            periodStartAt,
+            periodEndAt,
+            periodJson.GetProperty("current").GetBoolean(),
+            periodJson.GetProperty("label").GetString()!)
+        {
+            ResetAt = periodResetAt,
+            Samples = samples,
+        };
+        var quota = new ApiQuota(
+            quotaJson.GetProperty("remaining_percent").GetDouble(),
+            quotaResetAt,
+            windowSeconds,
+            quotaJson.GetProperty("monthly").GetBoolean());
+        var details = new ApiDetailsSnapshot(
+            ApiState.Ready,
+            observedAt,
+            true,
+            "Pro",
+            quota,
+            [],
+            0,
+            [period],
+            samples,
+            [],
+            "概算 —")
+        {
+            PublishedPair = PublishedPairTestFixtures.Canonical,
+        };
+
+        using var main = new MainWindowViewModel(
+            new SingleCombinedClient(DetailsFetchResult.Success(details)),
+            new SingleDetailsClient(DetailsFetchResult.Success(details)));
+        main.Start();
+        await EventuallyAsync(() => main.HasDetails);
+
+        var expectedMainPeriod = $"{TimeZoneInfo.ConvertTime(
+            DateTimeOffset.FromUnixTimeSeconds(periodStartAt),
+            LocalizationService.DisplayTimeZone):M/d HH:mm}{main.Texts.CurrentPeriodSuffix}";
+        var expectedReset = TimeZoneInfo.ConvertTime(
+                DateTimeOffset.FromUnixTimeSeconds(quotaResetAt),
+                LocalizationService.DisplayTimeZone)
+            .ToString("g", CultureInfo.CurrentCulture);
+        Assert.Equal(expectedMainPeriod, main.ModelUsagePeriodText);
+        Assert.Equal(expectedReset, main.ResetAtText);
+
+        using var graph = new GraphWindowViewModel(main);
+        Assert.True(graph.Scene.HasPoints);
+        Assert.Equal(periodStartAt, graph.SelectedPeriodStartAt);
+        Assert.Equal(periodStartAt, graph.Scene.PeriodStartAt);
+        var expectedSelector = $"{graph.Texts.PeriodSelectorHeading}｜" +
+            graph.Texts.FormatPeriodSelectorLabel(
+                GraphWindowViewModel.FormatPeriodStart(periodStartAt, graph.Texts.LanguageCode),
+                current: true);
+        Assert.Equal(expectedSelector, graph.SelectedPeriodText);
+
+        var axes = GraphPlotProjection.BuildAxes(
+            graph.Scene,
+            LocalizationService.DisplayTimeZone,
+            CultureInfo.CurrentCulture);
+        Assert.Equal(periodStartAt, axes.BottomTimestampValues[0]);
+        Assert.Equal(periodEndAt, axes.BottomTimestampValues[^1]);
     }
 
     [Fact]

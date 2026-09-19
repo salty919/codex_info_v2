@@ -281,7 +281,10 @@ component順や表示所有者を変更しない。
 - 期間を連続選択した場合は旧候補をcancelし、最新revisionだけをpublishする。失敗・timeout・cancelを
   空graphや部分graphへ変換せず、直前graphを保持してbounded errorを表示する。キャッシュ済みで次paint
   までに切替できる場合はprogressを点滅させない。クリック反応SLOと期間データ完成時間P90/P95を混同しない。
-- plotの横軸はaccepted periods resourceの同じpairにあるexact `start_at..end_at`を使う。current periodの
+- 期間欄、メイン画面の利用期間、selected period start、plotの横軸左端はaccepted periods resourceの
+  同じselected periodにあるexact `start_at`を使い、plot範囲は同じpairのexact `start_at..end_at`とする。
+  current表示は同じperiodの`current`を使う。quotaの`reset_at`はリセット時刻表示の別項目であり、
+  `reset_at - window_seconds`から期間開始を再計算しない。current periodの
   `end_at`は同じatomic published rootのaccepted観測終端であり、UI取得後のlocal現在時刻へ延ばさない。
   completed periodは保存された固定`end_at`までを右端とする。
 - 期間欄、横軸、折れ線、右端値は同じselected reset IDだけから一括投影する。poll後の
