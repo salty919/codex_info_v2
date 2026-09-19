@@ -261,7 +261,7 @@ public sealed class DetailsWindowViewModelTests
     }
 
     [Fact]
-    public async Task SharedPeriodStartOracleKeepsResetSeparateFromEveryWindowsStartSurface()
+    public async Task SharedCurrentBoundsOracleDrivesEveryWindowsPeriodSurface()
     {
         var fixturePath = Path.Combine(
             AppContext.BaseDirectory,
@@ -279,7 +279,8 @@ public sealed class DetailsWindowViewModelTests
         var periodStartAt = periodJson.GetProperty("start_at").GetInt64();
         var periodEndAt = periodJson.GetProperty("end_at").GetInt64();
         var periodResetAt = periodJson.GetProperty("reset_at").GetInt64();
-        Assert.NotEqual(periodStartAt, quotaResetAt - windowSeconds);
+        Assert.Equal(quotaResetAt - windowSeconds, periodStartAt);
+        Assert.Equal(Math.Min(quotaResetAt, observedAt), periodEndAt);
 
         var samples = root.GetProperty("history_samples")
             .EnumerateArray()

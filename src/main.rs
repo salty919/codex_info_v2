@@ -731,16 +731,6 @@ const MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS: i64 = 60;
 const SUSTAINED_UNUSED_MIN_DURATION_SECONDS: i64 = 10 * 60;
 const MOVING_RESET_MIN_HORIZON_SECONDS: i64 = 86_400;
 
-/// Return the start of the collector's minute bucket using mathematical
-/// floor semantics, including for timestamps before the Unix epoch.
-///
-/// The authoritative period boundary is an external timestamp and therefore
-/// cannot be allowed to wrap if converting its bucket index back to seconds
-/// ever overflows. Callers that cannot represent the bucket must fail closed.
-fn minute_start(timestamp: i64) -> Option<i64> {
-    timestamp.div_euclid(60).checked_mul(60)
-}
-
 #[cfg(test)]
 const GRAPH_METRIC_OPTIONS: [&str; 2] = ["ドル", "トークン"];
 const FIXED_WINDOW_WIDTH: u32 = 900;
@@ -3207,17 +3197,19 @@ fn authoritative_history_projection_samples(
     window_seconds: i64,
     observed_at: i64,
 ) -> Vec<UsageHistorySample> {
+    let Some(window_reset_at) = current_reset_at else {
+        return samples.to_vec();
+    };
     let Some(canonical_reset_at) = nearest_current_reset(
         samples.iter().map(|sample| sample.reset_at),
-        current_reset_at,
+        Some(window_reset_at),
         observed_at,
     ) else {
         return samples.to_vec();
     };
     let Some(authoritative_start) = (window_seconds > 0)
-        .then(|| canonical_reset_at.checked_sub(window_seconds))
+        .then(|| window_reset_at.checked_sub(window_seconds))
         .flatten()
-        .and_then(minute_start)
     else {
         return samples.to_vec();
     };
@@ -3253,11 +3245,14 @@ fn apply_authoritative_current_bounds(
     window_seconds: i64,
     observed_at: i64,
 ) -> Vec<HistoryPeriod> {
+    let Some(window_reset_at) = current_reset_at else {
+        return periods;
+    };
     // Use the same deterministic nearest-alias decision as the current-period
     // marker. Picking the first tolerant match can widen a different reset
     // fragment and make one sample belong to two public periods.
     let Some(canonical_reset_at) =
-        current_history_period_reset(&periods, current_reset_at, observed_at)
+        current_history_period_reset(&periods, Some(window_reset_at), observed_at)
     else {
         return periods;
     };
@@ -3268,23 +3263,19 @@ fn apply_authoritative_current_bounds(
         return periods;
     };
     let Some(authoritative_start) = (window_seconds > 0)
-        .then(|| canonical_reset_at.checked_sub(window_seconds))
+        .then(|| window_reset_at.checked_sub(window_seconds))
         .flatten()
     else {
         periods.remove(current_index);
         return periods;
     };
-    let Some(start) = minute_start(authoritative_start) else {
-        periods.remove(current_index);
-        return periods;
-    };
-    let end = canonical_reset_at.min(observed_at);
-    if end < start {
+    let end = window_reset_at.min(observed_at);
+    if end < authoritative_start {
         periods.remove(current_index);
         return periods;
     }
 
-    periods[current_index].start = start;
+    periods[current_index].start = authoritative_start;
     periods[current_index].end = end;
     periods
 }
@@ -40139,12 +40130,11 @@ mod tests {
     }
 
     #[test]
-    fn current_period_bounds_stay_canonical_across_selected_reset_drift() {
+    fn current_period_bounds_follow_latest_quota_without_rekeying_history() {
         const CANONICAL_RESET: i64 = 2_000_010_000;
         const WINDOW_SECONDS: i64 = 3_600;
         const OBSERVED_AT: i64 = CANONICAL_RESET - 30;
         const CANONICAL_START: i64 = CANONICAL_RESET - WINDOW_SECONDS;
-        const CANONICAL_END: i64 = OBSERVED_AT;
         const OFFSETS: [i64; 6] = [-60, -30, -1, 1, 30, 60];
 
         let mut server =
@@ -40210,13 +40200,15 @@ mod tests {
                 period.canonical_reset_at, CANONICAL_RESET,
                 "offset={offset}"
             );
-            assert_eq!(period.start, CANONICAL_START, "offset={offset}");
-            assert_eq!(period.end, CANONICAL_END, "offset={offset}");
+            let expected_start = quota_reset - WINDOW_SECONDS;
+            let expected_end = quota_reset.min(OBSERVED_AT);
+            assert_eq!(period.start, expected_start, "offset={offset}");
+            assert_eq!(period.end, expected_end, "offset={offset}");
             assert!(period.current, "offset={offset}");
             let expected_period_label = state
                 .i18n
-                .format_period_selector_label(CANONICAL_START, true)
-                .expect("canonical current label");
+                .format_period_selector_label(expected_start, true)
+                .expect("current quota-window label");
             assert_eq!(period.label, expected_period_label, "offset={offset}");
 
             let selected = state.history.samples_for_reset(Some(quota_reset));
@@ -40231,8 +40223,8 @@ mod tests {
 
             let labels = state.graph_time_labels_at(OBSERVED_AT);
             let expected_labels = [0.0, 0.25, 0.5, 0.75, 1.0].map(|fraction| {
-                let span = (CANONICAL_END - CANONICAL_START) as f64;
-                let timestamp = CANONICAL_START + (span * fraction) as i64;
+                let span = (expected_end - expected_start) as f64;
+                let timestamp = expected_start + (span * fraction) as i64;
                 state.i18n.format_graph_time(timestamp).unwrap_or_default()
             });
             assert_eq!(labels, expected_labels, "offset={offset}");
@@ -40248,13 +40240,13 @@ mod tests {
                 "offset={offset}"
             );
             assert_eq!(public_period.reset_at, CANONICAL_RESET, "offset={offset}");
-            assert_eq!(public_period.start_at, CANONICAL_START, "offset={offset}");
+            assert_eq!(public_period.start_at, expected_start, "offset={offset}");
             assert_eq!(
                 public_period.end_at,
-                public_period.reset_at.min(OBSERVED_AT),
+                quota_reset.min(OBSERVED_AT),
                 "offset={offset}"
             );
-            assert_eq!(public_period.end_at, CANONICAL_END, "offset={offset}");
+            assert_eq!(public_period.end_at, expected_end, "offset={offset}");
             assert_eq!(
                 state
                     .history
@@ -40265,32 +40257,28 @@ mod tests {
                 vec![CANONICAL_RESET, CANONICAL_RESET],
                 "offset={offset}"
             );
-            assert!(
-                server.publisher().publish_details(details).is_ok(),
-                "offset={offset}"
-            );
+            let publication = server.publisher().publish_details(details);
+            assert!(publication.is_ok(), "offset={offset}: {publication:?}");
         }
         server.shutdown();
     }
 
     #[test]
-    fn live_quota_reset_stays_separate_from_every_linux_period_start_surface() {
+    fn current_quota_bounds_drive_every_linux_period_surface() {
         let fixture: GraphPeriodStartFixture = serde_json::from_str(include_str!(
             "../tests/fixtures/graph_period_start_oracle.json"
         ))
         .expect("shared graph period start fixture");
         assert_eq!(fixture.schema_version, "graph-period-start-v1");
 
-        let history_start = fixture.history_period.start_at;
-        let live_window_start = fixture
+        let published_start = fixture.history_period.start_at;
+        let expected_window_start = fixture
             .quota
             .reset_at
             .checked_sub(fixture.quota.window_seconds)
             .expect("valid live quota window");
-        assert_ne!(
-            history_start, live_window_start,
-            "fixture must exercise drift"
-        );
+        assert_eq!(published_start, expected_window_start);
+        assert_ne!(fixture.history_period.reset_at, fixture.quota.reset_at);
 
         let pair = published_pair(129, 1);
         let mut state = CodexInfoState::preview("normal");
@@ -40316,19 +40304,14 @@ mod tests {
         let period = periods.first().expect("one accepted current period");
         assert_eq!(periods.len(), 1);
         assert!(period.current);
-        assert_eq!(period.start, history_start);
+        assert_eq!(period.start, expected_window_start);
         assert_eq!(period.canonical_reset_at, fixture.history_period.reset_at);
 
         let expected_period_label = state
             .i18n
-            .format_period_selector_label(history_start, true)
-            .expect("canonical period label");
-        let rejected_live_window_label = state
-            .i18n
-            .format_period_selector_label(live_window_start, true)
-            .expect("live quota window label");
+            .format_period_selector_label(expected_window_start, true)
+            .expect("current quota-window label");
         assert_eq!(period.label, expected_period_label);
-        assert_ne!(period.label, rejected_live_window_label);
         assert_eq!(state.selected_history_period_label(), expected_period_label);
         assert_eq!(state.model_usage_period(), expected_period_label);
         assert_eq!(
@@ -40339,15 +40322,15 @@ mod tests {
             state.graph_time_labels_at(fixture.observed_at)[0],
             state
                 .i18n
-                .format_graph_time(history_start)
-                .expect("canonical graph start label")
+                .format_graph_time(expected_window_start)
+                .expect("current graph start label")
         );
 
         assert_eq!(fixture.history_samples.len(), 2);
         assert!(fixture
             .history_samples
             .iter()
-            .all(|sample| sample.timestamp >= history_start
+            .all(|sample| sample.timestamp >= expected_window_start
                 && sample.timestamp <= fixture.history_period.end_at));
     }
 

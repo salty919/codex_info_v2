@@ -484,8 +484,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 100)
         : 0;
 
-    // History StartAt owns the usage-period display. Quota ResetAt is the
-    // separate live deadline shown by ResetAtText and must not move this field.
+    // CORE publishes the current quota-window bounds once in History. Windows
+    // consumes that StartAt directly; ResetAtText remains the quota deadline.
     public string ModelUsagePeriodText
     {
         get

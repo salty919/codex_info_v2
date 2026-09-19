@@ -410,7 +410,17 @@ impl PublicDetails {
                 let Some(observed_at) = self.observed_at else {
                     return Err(ContractError::InvalidPeriod);
                 };
-                if period.end_at != period.reset_at.min(observed_at) {
+                let current_reset_at = self
+                    .quota
+                    .as_ref()
+                    .map_or(period.reset_at, |quota| quota.reset_at);
+                let expected_start_at = self
+                    .quota
+                    .as_ref()
+                    .and_then(|quota| quota.reset_at.checked_sub(quota.window_seconds));
+                if expected_start_at.is_some_and(|start_at| period.start_at != start_at)
+                    || period.end_at != current_reset_at.min(observed_at)
+                {
                     return Err(ContractError::InvalidPeriod);
                 }
             }
