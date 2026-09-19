@@ -3278,15 +3278,20 @@ mod tests {
     }
 
     fn detailed_fixture() -> PublicDetails {
+        let observed_at = 1_780_000_020;
+        let reset_at = 1_780_400_000;
+        let window_seconds = 604_800;
+        let (start_at, end_at) = current_period_bounds(reset_at, window_seconds, observed_at)
+            .expect("valid current-period fixture bounds");
         PublicDetails {
             state: PublicState::Ready,
-            observed_at: Some(1_780_000_020),
+            observed_at: Some(observed_at),
             authenticated: true,
             plan_label: Some("Pro".into()),
             quota: Some(PublicQuota {
                 remaining_percent: 98.0,
-                reset_at: 1_780_400_000,
-                window_seconds: 604_800,
+                reset_at,
+                window_seconds,
                 monthly: false,
             }),
             models: vec![PublicDetailedModelUsage {
@@ -3301,15 +3306,15 @@ mod tests {
             active_thread_count: 1,
             history_periods: vec![PublicHistoryPeriod {
                 id: "1780400000".into(),
-                start_at: 1_779_395_200,
-                end_at: 1_780_000_020,
-                reset_at: 1_780_400_000,
+                start_at,
+                end_at,
+                reset_at,
                 label: "2026/06/01 — 2026/06/08".into(),
                 current: true,
             }],
             history_samples: vec![PublicHistorySample {
-                timestamp: 1_780_000_020,
-                reset_at: 1_780_400_000,
+                timestamp: observed_at,
+                reset_at,
                 remaining_percent: None,
                 sol_dollars: 0.01665,
                 terra_dollars: 0.0,
@@ -3341,10 +3346,11 @@ mod tests {
         let mut details = detailed_fixture();
         let end = 1_800_000_000_i64;
         let start = end - sample_count as i64 * 60;
+        let reset_at = start + 604_800;
         details.observed_at = Some(end);
         details.quota = Some(PublicQuota {
             remaining_percent: 48.0,
-            reset_at: end + 604_800,
+            reset_at,
             window_seconds: 604_800,
             monthly: false,
         });
@@ -3352,7 +3358,7 @@ mod tests {
             id: "slo-period".into(),
             start_at: start,
             end_at: end,
-            reset_at: end + 604_800,
+            reset_at,
             label: "SLO fixture".into(),
             current: true,
         }];
@@ -3361,7 +3367,7 @@ mod tests {
                 let fraction = index as f64 / sample_count.max(1) as f64;
                 PublicHistorySample {
                     timestamp: start + index as i64 * 60,
-                    reset_at: end + 604_800,
+                    reset_at,
                     remaining_percent: Some(100.0 - 52.0 * fraction),
                     sol_dollars: 8.75 * fraction,
                     terra_dollars: 4.5 * fraction,
@@ -4254,11 +4260,14 @@ mod tests {
     #[test]
     fn history_gap_validation_is_exact_and_period_bounded() {
         let mut details = detailed_fixture();
+        let period = details.history_periods[0].clone();
+        let gap_start = period.start_at + 60;
+        let gap_end = gap_start + 60;
         details.history_gaps = vec![PublicHistoryGap {
             gap_id: "0123456789abcdef0123456789abcdef".into(),
-            reset_at: 1_780_400_000,
-            start_at: 1_779_500_000,
-            end_at: 1_779_500_060,
+            reset_at: period.reset_at,
+            start_at: gap_start,
+            end_at: gap_end,
             reason: "daemon_stop_unrecoverable".into(),
         }];
         details.validate().unwrap();
@@ -4280,21 +4289,21 @@ mod tests {
         assert_eq!(invalid.validate(), Err(ApiSnapshotError::InvalidHistoryGap));
 
         let mut invalid = details.clone();
-        invalid.history_gaps[0].start_at = 1_779_500_061;
+        invalid.history_gaps[0].start_at = gap_end + 1;
         assert_eq!(invalid.validate(), Err(ApiSnapshotError::InvalidHistoryGap));
 
         let mut invalid = details.clone();
         invalid.history_gaps.push(PublicHistoryGap {
             gap_id: "fedcba9876543210fedcba9876543210".into(),
-            reset_at: 1_780_400_000,
-            start_at: 1_779_500_060,
-            end_at: 1_779_500_120,
+            reset_at: period.reset_at,
+            start_at: gap_end,
+            end_at: gap_end + 60,
             reason: "reset_hint_expired".into(),
         });
         assert_eq!(invalid.validate(), Err(ApiSnapshotError::InvalidHistoryGap));
 
         let mut invalid = details.clone();
-        invalid.history_gaps[0].end_at = 1_780_000_080;
+        invalid.history_gaps[0].end_at = period.end_at + 60;
         assert_eq!(invalid.validate(), Err(ApiSnapshotError::InvalidHistoryGap));
     }
 
