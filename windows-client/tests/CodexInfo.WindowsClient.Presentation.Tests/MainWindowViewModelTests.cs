@@ -126,13 +126,27 @@ public sealed class MainWindowViewModelTests
             "Pro",
             new ApiQuota(45, 2, 604800, false),
             [
-                new ApiDetailsModelUsage("SOL", 553_537_987, 544_468_480, 1_774_440, 0, 0, 0)
+                new ApiDetailsModelUsage(
+                    "SOL",
+                    9_069_507,
+                    544_468_480,
+                    1_774_440,
+                    45.347535,
+                    272.23424,
+                    53.2332)
                 {
                     TotalTokens = 555_312_427,
                     CacheWriteInputTokens = 0,
                     EstimatedTotalDollars = 370.814975,
                 },
-                new ApiDetailsModelUsage("LUNA", 24_726_033, 22_103_552, 536_723, 0, 0, 0)
+                new ApiDetailsModelUsage(
+                    "LUNA",
+                    2_622_481,
+                    22_103_552,
+                    536_723,
+                    0.5244962,
+                    0.44207104,
+                    0.6440676)
                 {
                     TotalTokens = 25_262_756,
                     CacheWriteInputTokens = 0,

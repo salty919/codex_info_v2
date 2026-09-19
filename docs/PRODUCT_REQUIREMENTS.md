@@ -1,6 +1,7 @@
 <!-- codex-info-requirement-owner: PRODUCT -->
 <!-- codex-info-master-ids:
 ASTRA-COST-01
+MODEL-USAGE-DISPLAY-01
 API-LIFECYCLE-01
 ACCOUNT-LIFECYCLE-134
 LIVE-RESET-129
@@ -58,6 +59,7 @@ U128-36
 この文書は製品要件の唯一の入口であり、各契約領域のownerを次表で一意に登録する。
 
 `ASTRA-COST-01`: ASTRAの概算はユーザー指定単価（100万token当たり通常入力$10、cached入力$1、cache write入力$12.50、出力$50）による。入力総数をI、cached入力をC、cache write入力をW、出力をOとして、通常入力はI-C-W、合計は `((I-C-W)*10+C*1+W*12.50+O*50)/1_000_000`。未提供のWや矛盾する内訳を0として確定表示しない。既存3モデルの単価は変更しない。
+`MODEL-USAGE-DISPLAY-01`: 現在期間のモデル別利用量は、LinuxとWindowsで同じ3組の表示bucketを使う。v3 wireの入力総数をI、cached入力をC、cache write入力をW、出力をOとすると、表示Inputはtoken `I-C`と概算ドル「通常入力＋cache write」、表示Cached inputはtoken Cとcached入力ドル、表示Outputはtoken Oと出力ドルを必ず隣接させる。したがって独立列を持たないcache writeはInputのtokenとドルの双方に含め、片方だけへ含めない。v3 adapterだけがraw値をこの表示契約へ正規化し、既に表示bucketを返すv1/v2を再減算しない。有限の概算ドルは小数2桁、価格未定または非有限値は0へ推測せず利用不可として表示する。
 `API-LIFECYCLE-01`: canonicalな収集・DB domainはUIの固定field、表示文言、画面構成および特定client versionへ依存させない。public APIは同じcommit済みdomain snapshotから作るversion別read-only adapterとし、client変更でcollectorまたはDB writerを変更しない。現行v3は現在値、履歴期間、選択期間の有限履歴page、Threadsを独立resourceとして公開し、各UIは可視surfaceに必要なresourceだけを取得する。全resourceは同じopaqueなpublished pairへ結合し、一つの取得cycleで一つのsurfaceが必要とする全pageを同一pairで受理した場合だけatomic表示する。履歴差分だけは、直前rootのcursorが同じperiodの既取得prefix不変を証明した場合に限り、新pairの全pageを揃えて旧prefixへatomic appendできる。prefixのsampleまたはgapが補正された場合はcursorを拒否し、先頭から再取得する。modelは固定3列でなく有界な配列として公開し、未知モデルのtoken事実と価格未確定を区別する。旧v1/v2と`/v3/details`は互換期間中だけ同一snapshotのdeprecated projectionとして保持し、旧API削除はadapter・route・client fallbackだけで完結させ、記録、DB schema、常駐監視、安定health endpointを変更しない。Sunset日時は別途明示決定されるまで推測しない。
 REST/DBの公開応答に含めるモデル数値は、同じmodel keyを持つ直接観測(`model_source=confirmed`)のraw値だけとする。`reconstructed-from-session`、`unknown`、`unavailable`はモデル数値を公開せず、model key/sourceと欠損metadataだけを公開する。`legacy-unknown`は保存済みの同じmodel keyの値だけを表示へ投影できるが、集計、予測、idle判定のauthorityにはしない。補間、hold、smoothing、予測およびそれらの派生値はUI presentation-onlyであり、API/DBへ書き戻さない。集計とidleの根拠は直接観測値だけである。
 `ACCOUNT-LIFECYCLE-134`: 一つのCodex profileは同時に一つの`auth.json` authorityだけを持つため、resident recorderが同時に書き込むのは現在認証を再確認できた一つのaccount partitionだけとする。認証されていないaccountを並行取得・推測更新しない。認証済みになった全accountのpartitionは削除せず、切替後も保持し、同一accountへ戻った場合は同じpartitionを境界後から再開する。REST/UIは初期化済みpartitionを列挙し、既定を現accountとして利用者が一つだけ選択して読み出せる。選択変更はcurrent、history、threads、pair、cursor、last-goodを同じaccount境界で一括破棄・再取得し、複数partitionの値を一画面へ混合しない。

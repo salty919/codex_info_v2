@@ -193,7 +193,7 @@ public sealed class DetailsWindowViewModelTests
     }
 
     [Fact]
-    public void ModelNumbersAreReformattedFromRawValuesWhenCultureChanges()
+    public void ModelNumbersAreReformattedFromPresentationValuesWhenCultureChanges()
     {
         var previousCulture = CultureInfo.CurrentCulture;
         try
