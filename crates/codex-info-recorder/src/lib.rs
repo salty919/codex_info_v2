@@ -603,6 +603,102 @@ impl fmt::Debug for AppServerAccount {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexAuthenticationState {
+    Authenticated,
+    AuthRequired,
+}
+
+fn decode_codex_authentication_state(value: &Value) -> Result<CodexAuthenticationState, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Codex account response is unavailable".to_owned())?;
+    let requires_openai_auth = object
+        .get("requiresOpenaiAuth")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "Codex account response is invalid".to_owned())?;
+    match object.get("account") {
+        Some(Value::Null) if requires_openai_auth => Ok(CodexAuthenticationState::AuthRequired),
+        Some(Value::Object(_)) if !requires_openai_auth => {
+            decode_app_server_account(value)?;
+            Ok(CodexAuthenticationState::Authenticated)
+        }
+        _ => Err("Codex account response is inconsistent".to_owned()),
+    }
+}
+
+/// Confirm the current Codex authentication state through two reads from one
+/// app-server process. A missing local auth file is never enough to claim
+/// logout: both reads must independently report the documented auth-required
+/// shape without an intervening account/updated generation.
+pub fn probe_codex_authentication_state() -> Result<CodexAuthenticationState, String> {
+    let executable = resolve_codex_executable()?;
+    let mut child = Command::new(executable)
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "Codex app-server could not be started".to_owned())?;
+    let Some(mut input) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("Codex app-server stdin is unavailable".to_owned());
+    };
+    let Some(stdout) = child.stdout.take() else {
+        drop(input);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("Codex app-server stdout is unavailable".to_owned());
+    };
+    let output = app_server_reader(stdout);
+    let result = (|| {
+        let mut account_updates = AccountUpdateTracker::for_app_server();
+        request_app_server(
+            &mut input,
+            &output,
+            1,
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "codex-info-recorder-auth-probe",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {"experimentalApi": true}
+            }),
+            &mut account_updates,
+        )?;
+        let generation = account_updates.generation;
+        let before = decode_codex_authentication_state(&request_app_server(
+            &mut input,
+            &output,
+            2,
+            "account/read",
+            json!({}),
+            &mut account_updates,
+        )?)?;
+        if !account_updates.valid || account_updates.generation != generation {
+            return Err("Codex account identity changed during auth probe".to_owned());
+        }
+        let after = decode_codex_authentication_state(&request_app_server(
+            &mut input,
+            &output,
+            3,
+            "account/read",
+            json!({}),
+            &mut account_updates,
+        )?)?;
+        if !account_updates.valid || account_updates.generation != generation || before != after {
+            return Err("Codex account identity changed during auth probe".to_owned());
+        }
+        Ok(before)
+    })();
+    drop(input);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
 /// One authenticated app-server collection window.  The local auth key,
 /// account/read identity, and process-local notification generation are one
 /// invariant: all three must remain unchanged from the first account/read
@@ -2356,6 +2452,7 @@ fn session_event_to_timed_usage(event: SessionEvent) -> Result<TimedModelUsage, 
 #[derive(Clone)]
 struct PendingBatch {
     reset_at: i64,
+    latest_quota_reset_at: i64,
     window_seconds: i64,
     collector_epoch: u128,
     cycle_seq: u64,
@@ -2567,7 +2664,7 @@ impl ProfileLease {
 /// the fixed v1 key set consumed by `recorder_identity_check`.
 pub struct RecorderStateWriter {
     path: PathBuf,
-    partition_id: String,
+    partition_id: Option<String>,
     pid: u32,
     starttime_ticks: i64,
     owner_nonce: String,
@@ -2580,7 +2677,7 @@ pub struct RecorderStateWriter {
 /// account transition; neither field contains the external account key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreviousRecorderAuthority {
-    pub partition_id: String,
+    pub partition_id: Option<String>,
     pub transition_fingerprint: String,
 }
 
@@ -2666,6 +2763,36 @@ impl RecorderStateWriter {
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         };
+        let write_state = string("write_state");
+        if write_state == Some("idle_no_account") {
+            if object.get("partition_id_hash") != Some(&Value::Null)
+                || object.get("data_generation") != Some(&Value::Null)
+                || object.get("collector_epoch") != Some(&Value::Null)
+                || object.get("cycle_seq") != Some(&Value::Null)
+                || object.get("last_commit_unix") != Some(&Value::Null)
+            {
+                return Err(RecorderError::Invalid(
+                    "idle recorder state is inconsistent".to_owned(),
+                ));
+            }
+            if string("schema") != Some(RECORDER_STATE_SCHEMA)
+                || !positive("pid")
+                || !positive("process_starttime")
+                || !string("owner_nonce").is_some_and(|value| valid_hex(value, 16))
+                || !object
+                    .get("updated_at_unix")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|value| value > 0)
+            {
+                return Err(RecorderError::Invalid(
+                    "idle recorder state identity or bounds are invalid".to_owned(),
+                ));
+            }
+            return Ok(Some(PreviousRecorderAuthority {
+                partition_id: None,
+                transition_fingerprint: hex_digest(Sha256::digest(&bytes).as_slice()),
+            }));
+        }
         let partition_id = string("partition_id_hash").ok_or_else(|| {
             RecorderError::Invalid("recorder state partition is missing".to_owned())
         })?;
@@ -2679,7 +2806,7 @@ impl RecorderStateWriter {
             || !positive("pid")
             || !positive("process_starttime")
             || !string("owner_nonce").is_some_and(|value| valid_hex(value, 16))
-            || !matches!(string("write_state"), Some("ready" | "degraded"))
+            || !matches!(write_state, Some("ready" | "degraded"))
             || !valid_hex(partition_id, 32)
             || !optional_positive("data_generation")
             || !collector_epoch_valid
@@ -2695,7 +2822,7 @@ impl RecorderStateWriter {
             ));
         }
         Ok(Some(PreviousRecorderAuthority {
-            partition_id: partition_id.to_owned(),
+            partition_id: Some(partition_id.to_owned()),
             transition_fingerprint: hex_digest(Sha256::digest(&bytes).as_slice()),
         }))
     }
@@ -2714,13 +2841,41 @@ impl RecorderStateWriter {
         }
         Ok(Self {
             path: history.join("recorder-state.json"),
-            partition_id: identity.partition_id.clone(),
+            partition_id: Some(identity.partition_id.clone()),
             pid: lease.pid,
             starttime_ticks: lease.starttime_ticks,
             owner_nonce: lease.owner_nonce.clone(),
             last_commit_unix: None,
             last_state: None,
         })
+    }
+
+    pub fn new_idle(
+        data_root: impl AsRef<Path>,
+        lease: &ProfileLease,
+    ) -> Result<Self, RecorderError> {
+        let history = data_root.as_ref().join("history");
+        let metadata = fs::symlink_metadata(&history)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(RecorderError::Invalid(
+                "recorder state parent is not a regular directory".to_owned(),
+            ));
+        }
+        Ok(Self {
+            path: history.join("recorder-state.json"),
+            partition_id: None,
+            pid: lease.pid,
+            starttime_ticks: lease.starttime_ticks,
+            owner_nonce: lease.owner_nonce.clone(),
+            last_commit_unix: None,
+            last_state: None,
+        })
+    }
+
+    pub fn write_idle_no_account(&mut self) -> Result<(), RecorderError> {
+        self.last_commit_unix = None;
+        self.last_state = None;
+        self.write_document("idle_no_account", None, None)
     }
 
     pub fn write_degraded(
@@ -3307,13 +3462,30 @@ impl Recorder {
         let admitted_quota = quota
             .as_ref()
             .and_then(|candidate| admit_quota_period(&state, candidate));
-        let (reset_at, window_seconds, reset_transition) = admitted_quota
+        let (reset_at, latest_quota_reset_at, window_seconds, reset_transition) = admitted_quota
             .as_ref()
-            .map(|(transition, reset_at, window_seconds)| {
-                (*reset_at, *window_seconds, Some(*transition))
-            })
-            .unwrap_or((state.reset_at, state.window_seconds, None));
-        if reset_at < 0 || window_seconds < 0 || (reset_at == 0) != (window_seconds == 0) {
+            .map(
+                |(transition, reset_at, latest_quota_reset_at, window_seconds)| {
+                    (
+                        *reset_at,
+                        *latest_quota_reset_at,
+                        *window_seconds,
+                        Some(*transition),
+                    )
+                },
+            )
+            .unwrap_or((
+                state.reset_at,
+                state.latest_quota_reset_at,
+                state.window_seconds,
+                None,
+            ));
+        if reset_at < 0
+            || latest_quota_reset_at < 0
+            || window_seconds < 0
+            || (reset_at == 0) != (window_seconds == 0)
+            || (latest_quota_reset_at == 0) != (window_seconds == 0)
+        {
             return Err(RecorderError::Invalid(
                 "durable session period is invalid".to_owned(),
             ));
@@ -3638,11 +3810,13 @@ impl Recorder {
             {
                 return None;
             }
-            admitted_quota.as_ref().and_then(|(_, canonical_reset, _)| {
-                candidate.remaining_percent.map(|remaining| {
-                    totals.history_sample(candidate.observed_at, *canonical_reset, remaining)
+            admitted_quota
+                .as_ref()
+                .and_then(|(_, canonical_reset, _, _)| {
+                    candidate.remaining_percent.map(|remaining| {
+                        totals.history_sample(candidate.observed_at, *canonical_reset, remaining)
+                    })
                 })
-            })
         });
         let mut samples = samples;
         if let Some(sample) = quota_sample {
@@ -3700,6 +3874,7 @@ impl Recorder {
         });
         self.pending = Some(PendingBatch {
             reset_at,
+            latest_quota_reset_at,
             window_seconds,
             collector_epoch,
             cycle_seq,
@@ -3752,6 +3927,7 @@ impl Recorder {
                 .commit_session_collection_with_timeline_recovery_and_task_evidence(
                     commit,
                     &pending.observations,
+                    pending.latest_quota_reset_at,
                     recovery,
                     SessionTaskEvidenceInput {
                         events: &pending.durable_events,
@@ -3764,6 +3940,7 @@ impl Recorder {
             self.writer.commit_session_collection_with_task_evidence(
                 commit,
                 &pending.observations,
+                pending.latest_quota_reset_at,
                 SessionTaskEvidenceInput {
                     events: &pending.durable_events,
                     pending_ranges: &pending.pending_evidence,
@@ -3776,6 +3953,7 @@ impl Recorder {
         if read_back.data_generation != result.data_generation
             || read_back.collector_epoch != Some(pending.collector_epoch)
             || read_back.cycle_seq != pending.cycle_seq
+            || read_back.latest_quota_reset_at != pending.latest_quota_reset_at
             || read_back.model_totals != pending.model_totals
             || pending.checkpoints.iter().any(|expected| {
                 !read_back
@@ -3812,7 +3990,7 @@ impl Recorder {
 fn admit_quota_period(
     state: &SessionCollectionState,
     candidate: &QuotaSnapshot,
-) -> Option<(QuotaTransition, i64, i64)> {
+) -> Option<(QuotaTransition, i64, i64, i64)> {
     if candidate.reset_at <= 0 || candidate.window_seconds <= 0 || candidate.observed_at <= 0 {
         eprintln!(
             "recorder degraded: quota response has an invalid period reset_at={} window_seconds={} observed_at={}",
@@ -3827,6 +4005,19 @@ fn admit_quota_period(
     if !remaining_percent.is_finite() || !(0.0..=100.0).contains(&remaining_percent) {
         eprintln!("recorder degraded: quota response has an invalid remaining percentage");
         return None;
+    }
+    if let Some(previous) = state.last_quota_observation.as_ref() {
+        if candidate.observed_at == previous.observed_at
+            && (candidate.reset_at != state.latest_quota_reset_at
+                || candidate.window_seconds != state.window_seconds
+                || remaining_percent.to_bits() != previous.remaining_percent.to_bits())
+        {
+            eprintln!(
+                "recorder degraded: quota response conflicts with the admitted observation at observed_at={}",
+                candidate.observed_at
+            );
+            return None;
+        }
     }
     let previous_reset_at =
         (state.data_generation > 0 && state.reset_at > 0).then_some(state.reset_at);
@@ -3857,7 +4048,7 @@ fn admit_quota_period(
     } else {
         (candidate.reset_at, candidate.window_seconds)
     };
-    Some((transition, reset_at, window_seconds))
+    Some((transition, reset_at, candidate.reset_at, window_seconds))
 }
 
 struct Source {
@@ -6743,7 +6934,7 @@ mod tests {
         connection
             .execute(
                 "UPDATE collection_generation
-                 SET reset_at=?1, window_seconds=?2",
+                 SET reset_at=?1, latest_quota_reset_at=?1, window_seconds=?2",
                 (Utc::now().timestamp() + 3600, 3600_i64),
             )
             .unwrap();
@@ -6825,6 +7016,77 @@ mod tests {
         .is_err());
         assert!(parse_account_authority(br#"{"tokens":{"account_id":1}}"#).is_err());
         assert!(parse_account_authority(br#"{"tokens":{"account_id":""}}"#).is_err());
+    }
+
+    #[test]
+    fn recorder_auth_state_requires_an_exact_consistent_account_shape() {
+        assert_eq!(
+            decode_codex_authentication_state(&json!({
+                "account": null,
+                "requiresOpenaiAuth": true
+            })),
+            Ok(CodexAuthenticationState::AuthRequired)
+        );
+        assert_eq!(
+            decode_codex_authentication_state(&json!({
+                "account": {
+                    "type": "chatgpt",
+                    "email": "current@example.com",
+                    "planType": "pro"
+                },
+                "requiresOpenaiAuth": false
+            })),
+            Ok(CodexAuthenticationState::Authenticated)
+        );
+        for inconsistent in [
+            json!({"account": null, "requiresOpenaiAuth": false}),
+            json!({
+                "account": {
+                    "type": "chatgpt",
+                    "email": "current@example.com",
+                    "planType": "pro"
+                },
+                "requiresOpenaiAuth": true
+            }),
+            json!({"account": null}),
+        ] {
+            assert!(decode_codex_authentication_state(&inconsistent).is_err());
+        }
+    }
+
+    #[test]
+    fn recorder_auth_state_idle_publication_has_no_account_or_generation_authority() {
+        let root = temp_root("idle-no-account-state");
+        fs::create_dir_all(root.join("history")).expect("history directory");
+        let lease = ProfileLease::acquire(&root).expect("profile lease");
+        let mut writer = RecorderStateWriter::new_idle(&root, &lease).expect("idle writer");
+        writer
+            .write_idle_no_account()
+            .expect("idle recorder publication");
+
+        let value: Value = serde_json::from_slice(
+            &fs::read(root.join("history/recorder-state.json")).expect("idle state"),
+        )
+        .expect("idle state JSON");
+        assert_eq!(value["write_state"], "idle_no_account");
+        for field in [
+            "partition_id_hash",
+            "data_generation",
+            "collector_epoch",
+            "cycle_seq",
+            "last_commit_unix",
+        ] {
+            assert!(value[field].is_null(), "{field}");
+        }
+        let boundary = RecorderStateWriter::read_previous_authority(&root)
+            .expect("idle previous authority")
+            .expect("idle boundary fingerprint");
+        assert!(boundary.partition_id.is_none());
+        assert_eq!(boundary.transition_fingerprint.len(), 64);
+
+        drop(writer);
+        drop(lease);
+        fs::remove_dir_all(root).expect("idle state cleanup");
     }
 
     #[test]
@@ -7613,7 +7875,8 @@ mod tests {
         Connection::open(&database)
             .unwrap()
             .execute(
-                "UPDATE collection_generation SET reset_at=0, window_seconds=0",
+                "UPDATE collection_generation
+                 SET reset_at=0, latest_quota_reset_at=0, window_seconds=0",
                 [],
             )
             .unwrap();
@@ -7667,7 +7930,8 @@ mod tests {
         Connection::open(&database)
             .unwrap()
             .execute(
-                "UPDATE collection_generation SET reset_at=?1, window_seconds=?2",
+                "UPDATE collection_generation
+                 SET reset_at=?1, latest_quota_reset_at=?1, window_seconds=?2",
                 (0_i64, 0_i64),
             )
             .unwrap();
@@ -7710,7 +7974,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_deadline_correction_keeps_one_recorder_period() {
+    fn live_quota_reset_deadline_correction_keeps_one_recorder_period() {
         let (root, database) = prepare("reset-deadline-correction");
         let source = root.join("sessions/one.jsonl");
         let observed_at = Utc::now().timestamp();
@@ -7745,13 +8009,15 @@ mod tests {
             .unwrap()
             .unwrap();
         let before = recorder.state().unwrap();
+        assert_eq!(before.latest_quota_reset_at, canonical_reset_at);
         assert!(!before.model_totals.is_empty());
         assert!(!before.checkpoints.is_empty());
 
+        let latest_quota_reset_at = canonical_reset_at + 134;
         recorder
             .run_cycle_with_quota(Some(QuotaSnapshot {
                 observed_at: observed_at + 180,
-                reset_at: canonical_reset_at + 134,
+                reset_at: latest_quota_reset_at,
                 window_seconds,
                 remaining_percent: Some(99.0),
             }))
@@ -7759,6 +8025,7 @@ mod tests {
             .unwrap();
         let after = recorder.state().unwrap();
         assert_eq!(after.reset_at, canonical_reset_at);
+        assert_eq!(after.latest_quota_reset_at, latest_quota_reset_at);
         assert_eq!(after.window_seconds, window_seconds);
         assert_eq!(after.model_totals, before.model_totals);
         assert_eq!(after.checkpoints, before.checkpoints);
@@ -7769,6 +8036,20 @@ mod tests {
                 remaining_percent: 99.0,
             })
         );
+        recorder
+            .run_cycle_with_quota(Some(QuotaSnapshot {
+                observed_at: observed_at + 180,
+                reset_at: latest_quota_reset_at + 60,
+                window_seconds,
+                remaining_percent: Some(99.0),
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorder.state().unwrap().latest_quota_reset_at,
+            latest_quota_reset_at,
+            "a conflicting result at the same observation instant is not newer"
+        );
         let reset_count: i64 = Connection::open(&database)
             .unwrap()
             .query_row(
@@ -7778,6 +8059,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reset_count, 1);
+        drop(recorder);
+        let reopened =
+            Recorder::open_partitioned(config(&root, 1024), &database, &identity()).unwrap();
+        let reopened_state = reopened.state().unwrap();
+        assert_eq!(reopened_state.reset_at, canonical_reset_at);
+        assert_eq!(reopened_state.latest_quota_reset_at, latest_quota_reset_at);
+        assert_eq!(reopened_state.model_totals, before.model_totals);
+        drop(reopened);
         let _ = fs::remove_dir_all(root);
     }
 

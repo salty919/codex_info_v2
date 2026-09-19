@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 const MAX_HISTORY_ROWS: usize = 31 * 24 * 60;
 const HISTORY_WINDOW_SECONDS: i64 = 31 * 24 * 60 * 60;
-pub const HISTORY_CANONICAL_SCHEMA_VERSION: i64 = 10;
+pub const HISTORY_CANONICAL_SCHEMA_VERSION: i64 = 11;
 const RESET_AT_TOLERANCE_SECONDS: i64 = 60;
 const MOVING_RESET_GROUP_MAX_DRIFT_SECONDS: i64 = 5 * 60;
 const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
@@ -1119,6 +1119,7 @@ fn table_has_column(
         "session_model_totals" => "PRAGMA table_info(session_model_totals)",
         "usage_model_history" => "PRAGMA table_info(usage_model_history)",
         "session_pending_ranges" => "PRAGMA table_info(session_pending_ranges)",
+        "collection_generation" => "PRAGMA table_info(collection_generation)",
         _ => return Ok(false),
     };
     let mut statement = connection.prepare(query)?;
@@ -1206,7 +1207,8 @@ fn build_details_for_intervals(
         return Ok((details, Vec::new(), Vec::new(), Vec::new()));
     }
     let observed_at = raw.iter().map(|row| row.timestamp).max().unwrap_or(0);
-    let (current_reset_at, window_seconds) = read_collection_config(connection)?;
+    let (current_reset_at, latest_quota_reset_at, window_seconds) =
+        read_collection_config(connection)?;
     let cutoff = observed_at.saturating_sub(HISTORY_WINDOW_SECONDS);
     let samples = if history_is_canonical {
         if raw.len() > MAX_HISTORY_ROWS {
@@ -1257,18 +1259,15 @@ fn build_details_for_intervals(
     samples.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
     let mut periods = history_periods(&samples, observed_at, current_reset_at, window_seconds);
     clip_history_periods(&mut periods, intervals);
-    let quota = latest_quota_row(raw, current_reset_at, window_seconds)
-        .and_then(|row| {
-            row.remaining_percent.map(|remaining_percent| PublicQuota {
-                remaining_percent,
-                reset_at: canonical_period_reset_at(
-                    row.reset_at,
-                    row.timestamp,
-                    current_reset_at,
+    let quota = latest_quota_reset_at
+        .and_then(|latest_reset_at| {
+            latest_quota_row(raw, current_reset_at, window_seconds).and_then(|row| {
+                row.remaining_percent.map(|remaining_percent| PublicQuota {
+                    remaining_percent,
+                    reset_at: latest_reset_at,
                     window_seconds,
-                ),
-                window_seconds,
-                monthly: false,
+                    monthly: false,
+                })
             })
         })
         .filter(|quota| quota.window_seconds > 0);
@@ -3261,29 +3260,53 @@ fn latest_quota_row(
         .max_by_key(|row| (row.timestamp, row.reset_at))
 }
 
-fn read_collection_config(connection: &Connection) -> Result<(Option<i64>, i64), ReaderError> {
+fn read_collection_config(
+    connection: &Connection,
+) -> Result<(Option<i64>, Option<i64>, i64), ReaderError> {
     if !table_exists(connection, "collection_generation")? {
-        return Ok((None, 0));
+        return Ok((None, None, 0));
     }
+    let has_latest_quota_reset =
+        table_has_column(connection, "collection_generation", "latest_quota_reset_at")?;
+    let query = if has_latest_quota_reset {
+        "SELECT reset_at, latest_quota_reset_at, window_seconds
+         FROM collection_generation WHERE singleton = 1"
+    } else {
+        // Generic legacy fixtures and pre-v11 read-only probes have only the
+        // canonical reset. Treat it as the last known live deadline until the
+        // serialized writer performs the additive migration.
+        "SELECT reset_at, reset_at, window_seconds
+         FROM collection_generation WHERE singleton = 1"
+    };
     let value = connection
-        .query_row(
-            "SELECT reset_at, window_seconds FROM collection_generation WHERE singleton = 1",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
+        .query_row(query, [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
         .optional()?;
     Ok(value
-        .map(|(reset_at, window_seconds)| {
-            (
+        .map(|(reset_at, latest_quota_reset_at, window_seconds)| {
+            if reset_at < 0
+                || latest_quota_reset_at < 0
+                || window_seconds < 0
+                || (reset_at == 0) != (window_seconds == 0)
+                || (latest_quota_reset_at == 0) != (window_seconds == 0)
+            {
+                return Err(ReaderError::InvalidValue(
+                    "collection quota deadline is invalid".to_owned(),
+                ));
+            }
+            Ok((
                 (reset_at > 0).then_some(reset_at),
-                if window_seconds > 0 {
-                    window_seconds
-                } else {
-                    0
-                },
-            )
+                (latest_quota_reset_at > 0).then_some(latest_quota_reset_at),
+                window_seconds,
+            ))
         })
-        .unwrap_or((None, 0)))
+        .transpose()?
+        .unwrap_or((None, None, 0)))
 }
 
 /// Canonicalizes the same bounded public history window used by every
@@ -4487,6 +4510,50 @@ mod tests {
 
     fn active_thread_json(id: &str, updated_at: i64) -> String {
         serde_json::json!([active_thread_value(id, updated_at)]).to_string()
+    }
+
+    #[test]
+    fn live_quota_reset_is_public_without_rekeying_history_period() {
+        let path = temp_db("latest-quota-reset");
+        make_db(&path);
+        let canonical_reset_at = 1_800_000_060_i64;
+        let latest_quota_reset_at = canonical_reset_at + 300;
+        let connection = Connection::open(&path).expect("fixture db");
+        connection
+            .execute_batch(
+                "ALTER TABLE collection_generation
+                 ADD COLUMN latest_quota_reset_at INTEGER NOT NULL DEFAULT 0;",
+            )
+            .expect("add latest quota deadline");
+        connection
+            .execute(
+                "UPDATE collection_generation SET latest_quota_reset_at = ?1
+                 WHERE singleton = 1",
+                [latest_quota_reset_at],
+            )
+            .expect("set latest quota deadline");
+        drop(connection);
+
+        let snapshot = DbReader::open(&path)
+            .expect("reader")
+            .read_snapshot()
+            .expect("snapshot");
+        let quota = snapshot.details.quota.expect("quota");
+        assert_eq!(quota.reset_at, latest_quota_reset_at);
+        assert_eq!(quota.window_seconds, 3_600);
+        let period = snapshot
+            .details
+            .history_periods
+            .first()
+            .expect("canonical history period");
+        assert_eq!(period.id, canonical_reset_at.to_string());
+        assert_eq!(period.reset_at, canonical_reset_at);
+        assert_eq!(period.start_at, canonical_reset_at - quota.window_seconds);
+        assert_eq!(
+            snapshot.details.history_samples[0].reset_at,
+            canonical_reset_at
+        );
+        fs::remove_file(path).expect("cleanup");
     }
 
     fn active_thread_value(id: &str, updated_at: i64) -> serde_json::Value {

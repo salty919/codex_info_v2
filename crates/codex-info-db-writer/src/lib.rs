@@ -90,6 +90,7 @@ CREATE TABLE collection_generation (
     window_seconds INTEGER NOT NULL CHECK (window_seconds >= 0),
     collector_epoch TEXT,
     cycle_seq TEXT NOT NULL,
+    latest_quota_reset_at INTEGER NOT NULL DEFAULT 0 CHECK (latest_quota_reset_at >= 0),
     CHECK (
         collector_epoch IS NULL OR (
             length(collector_epoch) = 32
@@ -98,8 +99,9 @@ CREATE TABLE collection_generation (
     )
 );
 INSERT INTO collection_generation (
-    singleton, data_generation, reset_at, window_seconds, collector_epoch, cycle_seq
-) VALUES (1, '0', 0, 0, NULL, '0');
+    singleton, data_generation, reset_at, window_seconds, collector_epoch, cycle_seq,
+    latest_quota_reset_at
+) VALUES (1, '0', 0, 0, NULL, '0', 0);
 
 CREATE TABLE session_checkpoints (
     root_identity TEXT NOT NULL,
@@ -645,6 +647,7 @@ const MAX_OBSERVATION_JSON_BYTES: usize = 16 * 1024;
 const OBSERVATION_JSON_KIND: &str = "codex-info-usage-observation-v1";
 pub const MAX_SESSION_MODEL_BYTES: usize = 512;
 const ACCOUNT_DB_SCHEMA_VERSION: i64 = HISTORY_CANONICAL_SCHEMA_VERSION;
+const LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION: i64 = 10;
 const MAX_LOGIN_ID_SCALARS: usize = 254;
 const MAX_ACTIVE_THREADS: usize = 256;
 const MAX_ACTIVE_THREAD_ID_SCALARS: usize = 512;
@@ -1505,7 +1508,11 @@ pub struct SessionQuotaObservation {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SessionCollectionState {
     pub data_generation: u64,
+    /// Stable history-period identity. Rolling provider deadlines do not
+    /// replace this value until quota evidence confirms a real boundary.
     pub reset_at: i64,
+    /// Exact provider deadline from the latest admitted quota observation.
+    pub latest_quota_reset_at: i64,
     pub window_seconds: i64,
     pub collector_epoch: Option<u128>,
     pub cycle_seq: u64,
@@ -6979,6 +6986,7 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
                 ("window_seconds", "INTEGER", 0),
                 ("collector_epoch", "TEXT", 0),
                 ("cycle_seq", "TEXT", 0),
+                ("latest_quota_reset_at", "INTEGER", 0),
             ],
         ),
         (
@@ -7307,6 +7315,10 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
             && schema_version < 9
             && actual.len() + 1 == expected.len()
             && actual == expected[..actual.len()];
+        let legacy_collection_generation_quota_reset = *table == "collection_generation"
+            && schema_version <= LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION
+            && actual.len() + 1 == expected.len()
+            && actual == expected[..actual.len()];
         let legacy_active_thread_snapshot_columns = *table == "active_thread_snapshot"
             && schema_version < 7
             && actual == legacy_active_thread_snapshot_columns();
@@ -7322,6 +7334,7 @@ fn validate_partition_schema(connection: &Connection, schema_version: i64) -> Re
                     || legacy_storage_partition_login_id))
             && !legacy_active_thread_snapshot_columns
             && !legacy_storage_partition_login_id
+            && !legacy_collection_generation_quota_reset
             && !legacy_history_base_pending
         {
             return Err(UsageStoreError::InvalidImport(format!(
@@ -7678,6 +7691,61 @@ fn session_checkpoint_running_column_present(connection: &Connection) -> Result<
             |row| row.get(0),
         )
         .map_err(Into::into)
+}
+
+/// Add the exact latest provider quota deadline without changing the stable
+/// history-period key. Version-10 partitions did not persist this independent
+/// value, so their only lossless bootstrap is the accepted canonical reset;
+/// the next fresh quota observation replaces it in the normal recorder
+/// transaction.
+fn ensure_collection_generation_live_quota_schema(
+    transaction: &rusqlite::Transaction<'_>,
+    backfill_legacy: bool,
+) -> Result<()> {
+    let present: bool = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('collection_generation')
+            WHERE name = 'latest_quota_reset_at'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !present {
+        transaction.execute(
+            "ALTER TABLE collection_generation
+             ADD COLUMN latest_quota_reset_at INTEGER NOT NULL DEFAULT 0
+             CHECK (latest_quota_reset_at >= 0)",
+            [],
+        )?;
+    }
+    if backfill_legacy {
+        transaction.execute(
+            "UPDATE collection_generation
+             SET latest_quota_reset_at = reset_at
+             WHERE latest_quota_reset_at = 0 AND reset_at > 0",
+            [],
+        )?;
+    }
+    let (reset_at, latest_quota_reset_at, window_seconds): (i64, i64, i64) = transaction
+        .query_row(
+            "SELECT reset_at, latest_quota_reset_at, window_seconds
+             FROM collection_generation WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    if reset_at < 0
+        || latest_quota_reset_at < 0
+        || reset_at > MAX_PUBLIC_UNIX_SECONDS
+        || latest_quota_reset_at > MAX_PUBLIC_UNIX_SECONDS
+        || window_seconds < 0
+        || (reset_at == 0) != (window_seconds == 0)
+        || (latest_quota_reset_at == 0) != (window_seconds == 0)
+    {
+        return Err(UsageStoreError::InvalidImport(
+            "collection quota deadline is invalid".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Add the nullable display-only login identifier to a legacy partition.
@@ -8170,6 +8238,7 @@ impl UsageStore {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(SCHEMA)?;
         transaction.execute_batch(PARTITION_SCHEMA)?;
+        ensure_collection_generation_live_quota_schema(&transaction, false)?;
         ensure_storage_partition_login_id_schema(&transaction)?;
         ensure_durable_state_schema(&transaction)?;
         ensure_recorder_gap_ledger_schema(&transaction)?;
@@ -8238,6 +8307,7 @@ impl UsageStore {
         let transaction = store
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_collection_generation_live_quota_schema(&transaction, false)?;
         ensure_storage_partition_login_id_schema(&transaction)?;
         ensure_recorder_gap_ledger_schema(&transaction)?;
         ensure_session_checkpoint_schema(&transaction)?;
@@ -8630,6 +8700,20 @@ impl UsageStore {
             return Err(UsageStoreError::InvalidImport(
                 "partition raw history changed during migration admission".into(),
             ));
+        }
+        ensure_collection_generation_live_quota_schema(&transaction, true)?;
+        if version == LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION {
+            // Version 10 already has the canonical single-table history and
+            // all sidecar constraints. This upgrade only adds the independent
+            // live quota deadline; rewriting history would add cost without
+            // changing any accepted row.
+            stamp_current_account_db_schema(&transaction)?;
+            validate_canonical_history_storage(&transaction)?;
+            validate_storage_partition(&transaction, identity)?;
+            transaction.commit()?;
+            let read_back = Self::open_read_only_partitioned(path, identity)?;
+            validate_canonical_history_storage(&read_back.connection)?;
+            return Ok(true);
         }
         ensure_storage_partition_login_id_schema(&transaction)?;
         ensure_durable_state_schema(&transaction)?;
@@ -9889,14 +9973,16 @@ impl UsageStore {
         // commit cannot be observed between these SELECTs.
         let transaction =
             rusqlite::Transaction::new_unchecked(&self.connection, TransactionBehavior::Deferred)?;
-        let (generation, reset_at, window_seconds, collector_epoch, cycle_seq): (
-            String,
-            i64,
-            i64,
-            Option<String>,
-            String,
-        ) = transaction.query_row(
-            "SELECT data_generation, reset_at, window_seconds, collector_epoch, cycle_seq
+        let (
+            generation,
+            reset_at,
+            window_seconds,
+            collector_epoch,
+            cycle_seq,
+            latest_quota_reset_at,
+        ): (String, i64, i64, Option<String>, String, i64) = transaction.query_row(
+            "SELECT data_generation, reset_at, window_seconds, collector_epoch, cycle_seq,
+                    latest_quota_reset_at
              FROM collection_generation WHERE singleton = 1",
             [],
             |row| {
@@ -9906,6 +9992,7 @@ impl UsageStore {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )?;
@@ -9918,6 +10005,18 @@ impl UsageStore {
         if collector_epoch.is_none() != (cycle_seq == 0) {
             return Err(UsageStoreError::InvalidImport(
                 "collector generation is inconsistent".into(),
+            ));
+        }
+        if reset_at < 0
+            || latest_quota_reset_at < 0
+            || reset_at > MAX_PUBLIC_UNIX_SECONDS
+            || latest_quota_reset_at > MAX_PUBLIC_UNIX_SECONDS
+            || window_seconds < 0
+            || (reset_at == 0) != (window_seconds == 0)
+            || (latest_quota_reset_at == 0) != (window_seconds == 0)
+        {
+            return Err(UsageStoreError::InvalidImport(
+                "durable session quota deadline is invalid".into(),
             ));
         }
         let task_running_column = if session_checkpoint_running_column_present(&transaction)? {
@@ -10079,6 +10178,7 @@ impl UsageStore {
         Ok(SessionCollectionState {
             data_generation,
             reset_at,
+            latest_quota_reset_at,
             window_seconds,
             collector_epoch,
             cycle_seq,
@@ -11493,6 +11593,7 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             &observations,
+            None,
             CollectionEvidence {
                 cumulative_recovery: None,
                 timeline_recovery: None,
@@ -11516,6 +11617,7 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
+            None,
             CollectionEvidence {
                 cumulative_recovery: None,
                 timeline_recovery: None,
@@ -11540,6 +11642,7 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
+            None,
             CollectionEvidence {
                 cumulative_recovery: Some(recovery),
                 timeline_recovery: None,
@@ -11563,6 +11666,7 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
+            None,
             CollectionEvidence {
                 cumulative_recovery: None,
                 timeline_recovery: Some(recovery),
@@ -11587,6 +11691,7 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
+            None,
             CollectionEvidence {
                 cumulative_recovery: None,
                 timeline_recovery: None,
@@ -11610,6 +11715,7 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
+            None,
             CollectionEvidence {
                 cumulative_recovery: None,
                 timeline_recovery: Some(recovery),
@@ -11635,6 +11741,7 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
+            None,
             CollectionEvidence {
                 cumulative_recovery: None,
                 timeline_recovery: None,
@@ -11658,6 +11765,7 @@ impl UsageStore {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
+            None,
             CollectionEvidence {
                 cumulative_recovery: None,
                 timeline_recovery: Some(recovery),
@@ -11677,11 +11785,13 @@ impl UsageStore {
         &mut self,
         commit: SessionCollectionCommit<'_>,
         observations: &[UsageHistoryObservation],
+        latest_quota_reset_at: i64,
         evidence: SessionTaskEvidenceInput<'_>,
     ) -> Result<SessionCollectionCommitResult> {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
+            Some(latest_quota_reset_at),
             CollectionEvidence {
                 cumulative_recovery: None,
                 timeline_recovery: None,
@@ -11697,12 +11807,14 @@ impl UsageStore {
         &mut self,
         commit: SessionCollectionCommit<'_>,
         observations: &[UsageHistoryObservation],
+        latest_quota_reset_at: i64,
         recovery: &SessionTimelineRecovery,
         evidence: SessionTaskEvidenceInput<'_>,
     ) -> Result<SessionCollectionCommitResult> {
         self.commit_session_collection_with_observations_inner(
             commit,
             observations,
+            Some(latest_quota_reset_at),
             CollectionEvidence {
                 cumulative_recovery: None,
                 timeline_recovery: Some(recovery),
@@ -11718,6 +11830,7 @@ impl UsageStore {
         &mut self,
         commit: SessionCollectionCommit<'_>,
         observations: &[UsageHistoryObservation],
+        latest_quota_reset_at: Option<i64>,
         evidence: CollectionEvidence<'_>,
     ) -> Result<SessionCollectionCommitResult> {
         let CollectionEvidence {
@@ -11739,9 +11852,14 @@ impl UsageStore {
             model_totals,
             recorded_sessions,
         } = commit;
+        let latest_quota_reset_at = latest_quota_reset_at.unwrap_or(reset_at);
         if reset_at < 0
+            || latest_quota_reset_at < 0
+            || reset_at > MAX_PUBLIC_UNIX_SECONDS
+            || latest_quota_reset_at > MAX_PUBLIC_UNIX_SECONDS
             || window_seconds < 0
             || (reset_at == 0) != (window_seconds == 0)
+            || (latest_quota_reset_at == 0) != (window_seconds == 0)
             || collector_epoch == 0
             || cycle_seq == 0
         {
@@ -12443,7 +12561,7 @@ impl UsageStore {
         transaction.execute(
             "UPDATE collection_generation
              SET data_generation = ?1, reset_at = ?2, window_seconds = ?3,
-                 collector_epoch = ?4, cycle_seq = ?5
+                 collector_epoch = ?4, cycle_seq = ?5, latest_quota_reset_at = ?6
              WHERE singleton = 1",
             params![
                 next.to_string(),
@@ -12451,6 +12569,7 @@ impl UsageStore {
                 window_seconds,
                 format!("{collector_epoch:032x}"),
                 cycle_seq.to_string(),
+                latest_quota_reset_at,
             ],
         )?;
         transaction.commit()?;
@@ -13279,7 +13398,8 @@ mod tests {
         store
             .connection
             .execute(
-                "UPDATE collection_generation SET reset_at=?1, window_seconds=?2",
+                "UPDATE collection_generation
+                 SET reset_at=?1, latest_quota_reset_at=?1, window_seconds=?2",
                 params![reset_at, 1_000_i64],
             )
             .unwrap();
@@ -13407,7 +13527,8 @@ mod tests {
         store
             .connection
             .execute(
-                "UPDATE collection_generation SET reset_at=?1, window_seconds=?2",
+                "UPDATE collection_generation
+                 SET reset_at=?1, latest_quota_reset_at=?1, window_seconds=?2",
                 params![reset_at, 1_000_i64],
             )
             .unwrap();
@@ -14182,6 +14303,71 @@ mod tests {
         drop(migrated);
         assert!(UsageStore::open_read_only_partitioned(&path, &identity).is_err());
 
+        remove_database(&path);
+    }
+
+    #[test]
+    fn live_quota_reset_schema_v10_adds_deadline_without_rewriting_history() {
+        let path = database_path("live-quota-reset-v10");
+        let identity = partition_identity('e', 24);
+        let reset_at = 1_800_604_800_i64;
+        let history = sample(1_800_000_000, reset_at, Some(73.0), 4.0);
+        let source = recorded_source("2026/09/live-quota-reset.jsonl", 40);
+        let checkpoint = checkpoint(&source, 10);
+        let mut store = UsageStore::create_partitioned(&path, &identity).unwrap();
+        store
+            .commit_session_collection(SessionCollectionCommit {
+                reset_at,
+                window_seconds: 604_800,
+                collector_epoch: checkpoint.collector_epoch,
+                cycle_seq: checkpoint.cycle_seq,
+                samples: std::slice::from_ref(&history),
+                checkpoints: std::slice::from_ref(&checkpoint),
+                ranges: &[],
+                model_totals: &[],
+                recorded_sessions: &[],
+            })
+            .unwrap();
+        let history_before = legacy_raw_evidence(&store.connection).unwrap();
+        store
+            .connection
+            .execute(
+                "ALTER TABLE collection_generation DROP COLUMN latest_quota_reset_at",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .pragma_update(
+                None,
+                "user_version",
+                LIVE_QUOTA_RESET_PREVIOUS_SCHEMA_VERSION,
+            )
+            .unwrap();
+        drop(store);
+
+        let backup =
+            UsageStore::backup_generations_partitioned_verified(&path, &identity, 1).unwrap();
+        assert!(UsageStore::migrate_partition_history_after_verified_backup(
+            &path, &identity, &backup,
+        )
+        .unwrap());
+        let migrated = UsageStore::open_partitioned(&path, &identity).unwrap();
+        assert_eq!(
+            legacy_raw_evidence(&migrated.connection).unwrap(),
+            history_before
+        );
+        let state = migrated.load_session_collection_state().unwrap();
+        assert_eq!(state.reset_at, reset_at);
+        assert_eq!(state.latest_quota_reset_at, reset_at);
+        assert_eq!(
+            migrated
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            ACCOUNT_DB_SCHEMA_VERSION
+        );
+        drop(migrated);
         remove_database(&path);
     }
 
@@ -15132,6 +15318,7 @@ mod tests {
                     recorded_sessions: &[],
                 },
                 &[],
+                reset_at,
                 SessionTaskEvidenceInput {
                     events: &[],
                     pending_ranges: &[],
@@ -15162,6 +15349,7 @@ mod tests {
                     recorded_sessions: &[],
                 },
                 &[],
+                reset_at,
                 SessionTaskEvidenceInput {
                     events: &[],
                     pending_ranges: &[],
@@ -15231,6 +15419,7 @@ mod tests {
                     recorded_sessions: &[],
                 },
                 &[],
+                reset_at,
                 SessionTaskEvidenceInput {
                     events: &[],
                     pending_ranges: &[],
