@@ -84,8 +84,10 @@ impl PublishedSnapshot {
         };
         let identity = (state_code << 64) | u128::from(generation);
         let data_hash = format!("{identity:064x}");
-        let mut details = PublicDetails::default();
-        details.state = state;
+        let details = PublicDetails {
+            state,
+            ..PublicDetails::default()
+        };
         Self {
             generation,
             // A state transition changes the opaque namespace, while repeated
