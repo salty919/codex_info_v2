@@ -484,6 +484,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                 100)
         : 0;
 
+    // History StartAt owns the usage-period display. Quota ResetAt is the
+    // separate live deadline shown by ResetAtText and must not move this field.
     public string ModelUsagePeriodText
     {
         get
