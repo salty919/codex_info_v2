@@ -236,6 +236,7 @@ public sealed class MainWindowViewModelTests
         viewModel.Start();
         await EventuallyAsync(() => viewModel.IsAuthenticated &&
             viewModel.DetailsSnapshot?.AccountId == "account-7");
+        Assert.Equal(1_800_000_600, viewModel.DetailsSnapshot!.Quota!.ResetAt);
         var priorCurrentRequests = client.CurrentAccountIds.Count;
         var priorThreadRequests = client.ThreadAccountIds.Count;
         var priorGeneration = AccountSelectionGeneration(viewModel);
@@ -256,6 +257,7 @@ public sealed class MainWindowViewModelTests
         await InvokePrivateTask(viewModel, "RunPeriodicRefreshAsync");
         await EventuallyAsync(() => viewModel.IsAuthenticated &&
             viewModel.DetailsSnapshot?.AccountId == "account-13");
+        Assert.Equal(1_800_001_200, viewModel.DetailsSnapshot!.Quota!.ResetAt);
 
         var currentRequests = client.CurrentAccountIds.Skip(priorCurrentRequests).ToArray();
         var threadRequests = client.ThreadAccountIds.Skip(priorThreadRequests).ToArray();
@@ -263,6 +265,41 @@ public sealed class MainWindowViewModelTests
         Assert.NotEmpty(threadRequests);
         Assert.All(currentRequests, accountId => Assert.Equal("account-13", accountId));
         Assert.All(threadRequests, accountId => Assert.Equal("account-13", accountId));
+    }
+
+    [Fact]
+    public async Task LogoutClearsSelectedAccountAndOldQuotaBeforeShowingAuthRequired()
+    {
+        var client = new AccountScopedClient();
+        using var viewModel = new MainWindowViewModel(client);
+
+        viewModel.Start();
+        await EventuallyAsync(() => viewModel.IsAuthenticated && viewModel.HasQuota);
+        Assert.NotEqual("未取得", viewModel.ResetAtText);
+
+        var loggedOut = new ApiAccountsSnapshot(
+            null,
+            [new ApiAccount(
+                "account-7",
+                false,
+                1_800_000_000,
+                1_800_000_600,
+                "previous@example.com")]);
+        client.SetAccountsSnapshot(loggedOut);
+
+        Assert.True(ApplyAccountsSnapshot(viewModel, loggedOut));
+        Assert.Null(viewModel.SelectedAccount);
+        Assert.Null(viewModel.DetailsSnapshot);
+        Assert.False(viewModel.IsAuthenticated);
+        Assert.False(viewModel.HasQuota);
+        Assert.Equal("未取得", viewModel.ResetAtText);
+
+        await InvokePrivateTask(viewModel, "RunPeriodicRefreshAsync");
+        await EventuallyAsync(() => viewModel.IsAuthRequired);
+        Assert.Null(viewModel.SelectedAccount);
+        Assert.False(viewModel.IsAuthenticated);
+        Assert.False(viewModel.HasQuota);
+        Assert.Equal("未取得", viewModel.ResetAtText);
     }
 
     [Fact]
@@ -2439,8 +2476,26 @@ public sealed class MainWindowViewModelTests
         }
 
         public Task<CurrentFetchResult> FetchCurrentAsync(
-            CancellationToken cancellationToken = default) =>
-            throw new InvalidOperationException("The unscoped current route must not be used.");
+            CancellationToken cancellationToken = default)
+        {
+            lock (gate)
+            {
+                if (accountsSnapshot.DefaultAccountId is not null)
+                {
+                    throw new InvalidOperationException("The unscoped current route must not be used.");
+                }
+            }
+            return Task.FromResult(CurrentFetchResult.Success(
+                new ApiCurrentSnapshot(
+                    ApiState.AuthRequired,
+                    null,
+                    false,
+                    null,
+                    null,
+                    [],
+                    0,
+                    PublishedPair(CanonicalPublishedPair))));
+        }
 
         public Task<HistoryPeriodsFetchResult> FetchHistoryPeriodsAsync(
             CancellationToken cancellationToken = default) =>
@@ -2474,8 +2529,12 @@ public sealed class MainWindowViewModelTests
                     true,
                     "Pro",
                     new ApiQuota(
-                        historical ? 73 : 80,
-                        historical ? 1_700_000_600 : 1_800_001_200,
+                        historical ? 73 : accountId == "account-13" ? 64 : 80,
+                        historical
+                            ? 1_700_000_600
+                            : accountId == "account-13"
+                                ? 1_800_001_200
+                                : 1_800_000_600,
                         604_800,
                         false),
                     [new ApiDetailsModelUsage("SOL", 1, 0, 0, historical ? 42 : 1, 0, 0)],

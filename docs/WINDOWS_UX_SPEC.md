@@ -230,7 +230,7 @@ Mainを既定の到達先とし、保存済みselectorで次回自動再接続�
 自動再構築ごとにSetup/app確認を再表示しない。更新は明示ボタンとbounded自動更新を同じ状態機械で扱い、
 更新中の再クリック、重複要求、値の一時消去を禁止する。
 
-Mainはstrict validation済み`/v3/current`、Graphは`/v3/history/periods`と選択期間のhistory page、Threadsは`/v3/threads`を使う。account selectorは`/v3/accounts`の非秘密IDを使い、既定を現accountとし、過去accountを一つずつ選択できる。選択変更時はMain、Graph、Threadsの旧account値、pair、cursor、pending、errorを一括破棄し、選択accountのresourceだけを再取得する。各取得cycleは必要な応答が全て同じaccountかつ同じpublished pairの場合だけatomic置換する。Graph差分だけは直前cursorで既取得prefix不変が証明され、かつ新pairの全pageを受理した場合に限りatomic appendする。prefix補正時は先頭から再取得する。`/v3/current`がexact 404の旧serviceだけ単一`/v3/details`、さらにexact 404の場合だけ単一v2、v1へfallbackする。
+Mainはstrict validation済み`/v3/current`、Graphは`/v3/history/periods`と選択期間のhistory page、Threadsは`/v3/threads`を使う。account selectorは`/v3/accounts`の非秘密IDを使い、既定を現accountとし、過去accountを一つずつ選択できる。`default_account_id=null`はログアウトとして選択中accountを0件にし、Linux/Windowsとも旧accountのidentity、quota、reset、model、threadを同じ境界で消去して、selectorなし`/v3/current`の`auth_required`を表示する。選択変更時はMain、Graph、Threadsの旧account値、pair、cursor、pending、errorを一括破棄し、選択accountのresourceだけを再取得する。各取得cycleは必要な応答が全て同じaccountかつ同じpublished pairの場合だけatomic置換する。Graph差分だけは直前cursorで既取得prefix不変が証明され、かつ新pairの全pageを受理した場合に限りatomic appendする。prefix補正時は先頭から再取得する。`/v3/current`がexact 404の旧serviceだけ単一`/v3/details`、さらにexact 404の場合だけ単一v2、v1へfallbackする。
 exact 404でlegacy details modeへ入った接続は、一つの受理済みdetails rootをMain、Graph、Threadsへ同時投影し、split routeを追加要求しない。再接続時に`/v3/current`から能力判定をやり直す。
 Mainは10秒、Graph差分はopen中60秒、Threadsはopen中5秒で確認し、Graph/Threadsを閉じている間は対応requestを送らない。SQLite、別pair、認証control応答でfieldを補完せず、quota/history/threadの再収集、
 値の再計算、同一minuteのmerge/max/last/null化をUIで行わない。候補拒否時は該当surfaceだけが同じlast-good rootを保持し、他surfaceやrecorderを変更しない。

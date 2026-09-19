@@ -13227,7 +13227,7 @@ struct ServiceAccountV3 {
 #[serde(deny_unknown_fields)]
 struct ServiceAccountsV3Document {
     api_version: String,
-    default_account_id: String,
+    default_account_id: Option<String>,
     accounts: Vec<ServiceAccountV3>,
 }
 
@@ -14925,28 +14925,29 @@ impl CodexInfoState {
         let previous_selection = self.service_selected_account_id.clone();
         let followed_previous_default =
             previous_selection.as_deref() == self.service_default_account_id.as_deref();
-        let selection = if followed_previous_default {
-            Some(document.default_account_id.clone())
+        let selection = if let Some(default_account_id) = document.default_account_id.as_ref() {
+            if followed_previous_default {
+                Some(default_account_id.clone())
+            } else {
+                previous_selection
+                    .as_deref()
+                    .filter(|selected| {
+                        document
+                            .accounts
+                            .iter()
+                            .any(|account| &account.id == selected)
+                    })
+                    .map(str::to_owned)
+                    .or_else(|| Some(default_account_id.clone()))
+            }
         } else {
-            previous_selection
-                .as_deref()
-                .filter(|selected| {
-                    document
-                        .accounts
-                        .iter()
-                        .any(|account| &account.id == selected)
-                })
-                .map(str::to_owned)
-                .or_else(|| Some(document.default_account_id.clone()))
+            None
         };
-        if selection.is_none() {
-            return Err("accounts document has no selectable default account".into());
-        }
         let list_changed = self.service_accounts != document.accounts
-            || self.service_default_account_id != Some(document.default_account_id.clone());
+            || self.service_default_account_id != document.default_account_id;
         let selection_changed = previous_selection != selection;
         self.service_accounts = document.accounts;
-        self.service_default_account_id = Some(document.default_account_id);
+        self.service_default_account_id = document.default_account_id;
         self.service_accounts_supported = true;
         self.service_accounts_known = true;
         self.service_accounts_error = None;
@@ -17081,6 +17082,21 @@ impl CodexInfoState {
     }
 
     fn refresh_partial_failure_status(&mut self) {
+        if let Some(current) = self.service_current_snapshot.as_ref() {
+            match current.state {
+                PublicState::AuthRequired => {
+                    self.error = None;
+                    self.status = "未認証です。認証を開始してください。".into();
+                    return;
+                }
+                PublicState::Initializing => {
+                    self.error = None;
+                    self.status = "常駐サービスが利用状況を取得しています…".into();
+                    return;
+                }
+                PublicState::Ready | PublicState::Error => {}
+            }
+        }
         if let Some(account_error) = self.account_error.clone() {
             self.error = Some(account_error);
             self.status =
@@ -20900,10 +20916,14 @@ fn validate_service_accounts(document: &ServiceAccountsV3Document) -> Result<(),
     if document.api_version != "v3" {
         return Err("accounts document api_version is not v3".into());
     }
-    if document.accounts.is_empty() || document.accounts.len() > MAX_SERVICE_ACCOUNTS {
+    if document.accounts.len() > MAX_SERVICE_ACCOUNTS {
         return Err("accounts document exceeds the public safety bound".into());
     }
-    if !valid_public_account_id(&document.default_account_id) {
+    if document
+        .default_account_id
+        .as_deref()
+        .is_some_and(|account_id| !valid_public_account_id(account_id))
+    {
         return Err("accounts document has no valid default account".into());
     }
     let mut ids = BTreeSet::new();
@@ -20939,15 +20959,20 @@ fn validate_service_accounts(document: &ServiceAccountsV3Document) -> Result<(),
         if account.is_current {
             current_count = current_count.saturating_add(1);
         }
-        if account.id == document.default_account_id {
+        if document.default_account_id.as_deref() == Some(account.id.as_str()) {
             default_is_current = account.is_current;
         }
     }
-    if !ids.contains(document.default_account_id.as_str())
-        || !default_is_current
-        || current_count != 1
-    {
-        return Err("accounts document default id is not present in accounts".into());
+    match document.default_account_id.as_deref() {
+        Some(default_account_id)
+            if !ids.contains(default_account_id) || !default_is_current || current_count != 1 =>
+        {
+            return Err("accounts document default id is not present in accounts".into())
+        }
+        None if current_count != 0 => {
+            return Err("accounts document has a current account without a default".into())
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -21522,7 +21547,7 @@ enum ServiceAccountsPollOutcome {
 fn service_accounts_ready(state: &CodexInfoState) -> bool {
     state.service_accounts_known
         && (!state.service_accounts_supported
-            || state.service_accounts.is_empty()
+            || state.service_default_account_id.is_none()
             || state.service_selected_account_id.is_some())
 }
 
@@ -23601,7 +23626,7 @@ mod tests {
             ]
         }"#;
         let document = super::parse_service_accounts_v3_document(body).expect("valid accounts");
-        assert_eq!(document.default_account_id, "account-7");
+        assert_eq!(document.default_account_id.as_deref(), Some("account-7"));
         assert_eq!(
             super::service_account_labels(
                 &document.accounts,
@@ -23634,6 +23659,67 @@ mod tests {
             ]
         }"#;
         assert!(super::parse_service_accounts_v3_document(zero_id).is_err());
+    }
+
+    #[test]
+    fn logout_directory_clears_current_identity_quota_and_reset() {
+        let initial = super::parse_service_accounts_v3_document(ACCOUNTS_A_CURRENT)
+            .expect("initial account directory");
+        let logged_out = super::parse_service_accounts_v3_document(
+            br#"{
+                "api_version":"v3",
+                "default_account_id":null,
+                "accounts":[
+                    {"id":"account-7","is_current":false,"activation_at":1800000000,"deactivation_at":1800000600,"login_id":"previous@example.com"}
+                ]
+            }"#,
+        )
+        .expect("logged-out account directory");
+        let mut state = CodexInfoState::service_client();
+        state
+            .apply_service_accounts(initial)
+            .expect("initial account directory admitted");
+        state.authenticated = true;
+        state.remaining_percent = Some(12.5);
+        state.has_quota_percent = true;
+        state.has_usage = true;
+        state.reset_at = Some(1_800_001_200);
+        state.usage_snapshot_committed = true;
+
+        state
+            .apply_service_accounts(logged_out)
+            .expect("logged-out account directory admitted");
+        assert!(state.service_default_account_id.is_none());
+        assert!(state.service_selected_account_id.is_none());
+        assert!(state
+            .service_accounts
+            .iter()
+            .all(|account| !account.is_current));
+        assert!(!state.authenticated);
+        assert!(state.remaining_percent.is_none());
+        assert!(!state.has_quota_percent);
+        assert!(!state.has_usage);
+        assert!(state.reset_at.is_none());
+        assert!(!state.usage_snapshot_committed);
+        assert_eq!(
+            super::service_route_with_account("/v3/current", None),
+            "/v3/current"
+        );
+
+        let (mut auth_required, _) = split_current_fixture();
+        auth_required.state = PublicState::AuthRequired;
+        auth_required.observed_at = None;
+        auth_required.authenticated = false;
+        auth_required.plan_label = None;
+        auth_required.quota = None;
+        auth_required.models.clear();
+        auth_required.active_thread_count = 0;
+        state
+            .apply_service_current_v3(published_pair(29, 1), auth_required)
+            .expect("auth-required current root admitted");
+        assert_eq!(state.status, "未認証です。認証を開始してください。");
+        assert!(!state.authenticated);
+        assert!(state.reset_at.is_none());
     }
 
     #[test]
@@ -23742,6 +23828,9 @@ mod tests {
         );
 
         automatic.authenticated = true;
+        automatic.remaining_percent = Some(12.5);
+        automatic.has_quota_percent = true;
+        automatic.reset_at = Some(1_800_000_600);
         automatic.has_usage = true;
         automatic.usage_snapshot_committed = true;
         automatic.last_success_at = Some(1_800_000_001);
@@ -23786,6 +23875,9 @@ mod tests {
             .selected_service_account()
             .is_some_and(|account| account.is_current));
         assert!(!automatic.authenticated);
+        assert!(automatic.remaining_percent.is_none());
+        assert!(!automatic.has_quota_percent);
+        assert!(automatic.reset_at.is_none());
         assert!(!automatic.has_usage);
         assert!(!automatic.usage_snapshot_committed);
         assert!(automatic.last_success_at.is_none());
@@ -23846,7 +23938,11 @@ mod tests {
     fn login_change_routes_the_first_refetch_to_the_new_current_account() {
         let old_pair = published_pair(21, 1);
         let new_pair = published_pair(21, 2);
-        let (current, threads) = split_current_fixture();
+        let (mut current, threads) = split_current_fixture();
+        let old_reset_at = 1_800_000_600;
+        let new_reset_at = 1_800_001_200;
+        current.quota.as_mut().expect("B quota").reset_at = new_reset_at;
+        current.quota.as_mut().expect("B quota").remaining_percent = 64.0;
         let current_body = split_current_body(&current);
         let threads_body = split_threads_body(&threads);
         let mut state = CodexInfoState::service_client();
@@ -23856,9 +23952,17 @@ mod tests {
                     .expect("initial account directory"),
             )
             .expect("initial account directory admitted");
+        let mut previous_current = current.clone();
+        previous_current.quota.as_mut().expect("A quota").reset_at = old_reset_at;
+        previous_current
+            .quota
+            .as_mut()
+            .expect("A quota")
+            .remaining_percent = 12.5;
         state
-            .apply_service_current_bundle(old_pair, current, None, threads)
+            .apply_service_current_bundle(old_pair, previous_current, None, threads)
             .expect("old current bundle admitted");
+        assert_eq!(state.reset_at, Some(old_reset_at));
         state.service_accounts_force_poll = true;
         state.service_current_force_poll = true;
         let now = Instant::now();
@@ -23904,6 +24008,14 @@ mod tests {
             state.service_current_pair.as_deref(),
             Some(new_pair.as_str())
         );
+        assert_eq!(
+            state
+                .selected_service_account()
+                .and_then(|account| account.login_id.as_deref()),
+            Some("b@example.invalid")
+        );
+        assert_eq!(state.remaining_percent, Some(64.0));
+        assert_eq!(state.reset_at, Some(new_reset_at));
     }
 
     #[test]

@@ -147,7 +147,7 @@ pub struct PublicAccountV3 {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicAccountsV3 {
-    pub default_account_id: String,
+    pub default_account_id: Option<String>,
     pub accounts: Vec<PublicAccountV3>,
 }
 
@@ -172,10 +172,14 @@ impl PublicAccountsV3 {
     /// Validate the bounded account selector before it crosses the REST
     /// process boundary.
     pub fn validate(&self) -> Result<(), ContractError> {
-        if self.accounts.is_empty() || self.accounts.len() > MAX_PUBLIC_ACCOUNTS {
+        if self.accounts.len() > MAX_PUBLIC_ACCOUNTS {
             return Err(ContractError::TooManyItems);
         }
-        if !valid_public_account_id(&self.default_account_id) {
+        if self
+            .default_account_id
+            .as_deref()
+            .is_some_and(|account_id| !valid_public_account_id(account_id))
+        {
             return Err(ContractError::InvalidModel);
         }
         let mut ids = HashSet::with_capacity(self.accounts.len());
@@ -201,7 +205,7 @@ impl PublicAccountsV3 {
             {
                 return Err(ContractError::InvalidModel);
             }
-            if account.id == self.default_account_id {
+            if self.default_account_id.as_deref() == Some(account.id.as_str()) {
                 default_found = true;
                 if !account.is_current {
                     return Err(ContractError::InvalidModel);
@@ -211,8 +215,12 @@ impl PublicAccountsV3 {
                 current_count = current_count.saturating_add(1);
             }
         }
-        if !default_found || current_count != 1 {
-            return Err(ContractError::InvalidModel);
+        match self.default_account_id.as_ref() {
+            Some(_) if !default_found || current_count != 1 => {
+                return Err(ContractError::InvalidModel)
+            }
+            None if current_count != 0 => return Err(ContractError::InvalidModel),
+            _ => {}
         }
         Ok(())
     }
@@ -900,7 +908,7 @@ mod tests {
     #[test]
     fn account_selector_contract_is_opaque_and_bounded() {
         let accounts = PublicAccountsV3 {
-            default_account_id: "account-7".to_owned(),
+            default_account_id: Some("account-7".to_owned()),
             accounts: vec![
                 PublicAccountV3 {
                     id: "account-7".to_owned(),
@@ -932,7 +940,7 @@ mod tests {
         assert_eq!(invalid.validate(), Err(ContractError::InvalidModel));
 
         let mut invalid_login = PublicAccountsV3 {
-            default_account_id: "account-7".to_owned(),
+            default_account_id: Some("account-7".to_owned()),
             accounts: vec![PublicAccountV3 {
                 id: "account-7".to_owned(),
                 is_current: true,
@@ -944,5 +952,35 @@ mod tests {
         assert_eq!(invalid_login.validate(), Err(ContractError::InvalidModel));
         invalid_login.accounts[0].login_id = Some("current@example.com".to_owned());
         invalid_login.validate().expect("bounded login id is valid");
+    }
+
+    #[test]
+    fn account_selector_contract_represents_logout_with_no_current_account() {
+        let logged_out = PublicAccountsV3 {
+            default_account_id: None,
+            accounts: vec![PublicAccountV3 {
+                id: "account-7".to_owned(),
+                is_current: false,
+                activation_at: Some(1_800_000_000),
+                deactivation_at: Some(1_800_000_600),
+                login_id: Some("previous@example.com".to_owned()),
+            }],
+        };
+        logged_out.validate().expect("logged-out selector contract");
+        let encoded = serde_json::to_value(&logged_out).expect("logged-out selector JSON");
+        assert!(encoded["default_account_id"].is_null());
+        assert_eq!(encoded["accounts"][0]["is_current"], false);
+
+        let empty = PublicAccountsV3 {
+            default_account_id: None,
+            accounts: Vec::new(),
+        };
+        empty
+            .validate()
+            .expect("empty logged-out selector contract");
+
+        let mut inconsistent = logged_out;
+        inconsistent.accounts[0].is_current = true;
+        assert_eq!(inconsistent.validate(), Err(ContractError::InvalidModel));
     }
 }

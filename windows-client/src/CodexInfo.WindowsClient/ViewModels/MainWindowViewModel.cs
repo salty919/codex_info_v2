@@ -711,20 +711,24 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
         var followedPreviousDefault = previousId is null ||
             string.Equals(previousId, previousDefaultId, StringComparison.Ordinal);
-        var next = followedPreviousDefault
-            ? accounts.FirstOrDefault(account => account.Id == snapshot.DefaultAccountId)
-            : accounts.FirstOrDefault(account => account.Id == previousId);
-        next ??= accounts.FirstOrDefault(account => account.Id == snapshot.DefaultAccountId);
-        next ??= accounts.FirstOrDefault(account => account.IsCurrent);
-        if (next is null)
+        ApiAccount? next = null;
+        if (snapshot.DefaultAccountId is { } defaultAccountId)
+        {
+            next = followedPreviousDefault
+                ? accounts.FirstOrDefault(account => account.Id == defaultAccountId)
+                : accounts.FirstOrDefault(account => account.Id == previousId);
+            next ??= accounts.FirstOrDefault(account => account.Id == defaultAccountId);
+            next ??= accounts.FirstOrDefault(account => account.IsCurrent);
+        }
+        if (snapshot.DefaultAccountId is not null && next is null)
         {
             return false;
         }
 
         var previousSelected = selectedAccount;
-        var changed = previousSelected?.Id != next.Id;
-        var accountKindChanged = previousSelected?.IsCurrent != next.IsCurrent;
-        var labelChanged = previousSelected?.DisplayLabel != next.DisplayLabel;
+        var changed = previousSelected?.Id != next?.Id;
+        var accountKindChanged = previousSelected?.IsCurrent != next?.IsCurrent;
+        var labelChanged = previousSelected?.DisplayLabel != next?.DisplayLabel;
         selectedAccount = next;
         if (changed || accountKindChanged)
         {
@@ -1142,7 +1146,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
                     return;
                 }
 
-                if (selectedAccountId is null || accountResourceClient is null)
+                if (selectedAccountId is not null && accountResourceClient is null)
                 {
                     MutateIfCurrent(context, () =>
                     {
