@@ -1479,6 +1479,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     private static ApiHistoryPeriod FormatPeriodForDisplay(ApiHistoryPeriod period)
     {
+        // The same accepted StartAt owns the selector, Scene and X-axis.
+        // The live quota deadline is deliberately not an input here.
         var label = LocalizationService.Current.FormatPeriodSelectorLabel(
             FormatPeriodStart(period.StartAt),
             period.Current);

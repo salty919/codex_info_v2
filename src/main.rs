@@ -2842,21 +2842,7 @@ struct HistoryPeriod {
     start: i64,
     end: i64,
     label: String,
-}
-
-fn period_selector_display_start(
-    canonical_start_at: i64,
     current: bool,
-    latest_quota_reset_at: Option<i64>,
-    window_seconds: i64,
-) -> i64 {
-    if !current || window_seconds <= 0 {
-        return canonical_start_at;
-    }
-    latest_quota_reset_at
-        .and_then(|reset_at| reset_at.checked_sub(window_seconds))
-        .filter(|start_at| *start_at > 0)
-        .unwrap_or(canonical_start_at)
 }
 
 fn disambiguate_period_start_labels(periods: &mut [HistoryPeriod]) {
@@ -3134,6 +3120,7 @@ fn history_periods_for_samples(
                 start: group.start,
                 end,
                 label,
+                current: is_current,
             }
         })
         .collect::<Vec<_>>();
@@ -17337,22 +17324,15 @@ impl CodexInfoState {
             if let Some(periods) = authoritative_periods {
                 let mut localized = periods
                     .iter()
-                    .map(|period| {
-                        let display_start = period_selector_display_start(
-                            period.start_at,
-                            period.current,
-                            self.reset_at,
-                            self.window_seconds,
-                        );
-                        HistoryPeriod {
-                            canonical_reset_at: period.reset_at,
-                            start: period.start_at,
-                            end: period.end_at,
-                            label: self
-                                .i18n
-                                .format_period_selector_label(display_start, period.current)
-                                .unwrap_or_default(),
-                        }
+                    .map(|period| HistoryPeriod {
+                        canonical_reset_at: period.reset_at,
+                        start: period.start_at,
+                        end: period.end_at,
+                        label: self
+                            .i18n
+                            .format_period_selector_label(period.start_at, period.current)
+                            .unwrap_or_default(),
+                        current: period.current,
                     })
                     .collect::<Vec<_>>();
                 localized.retain(|period| !period.label.is_empty());
@@ -17386,15 +17366,10 @@ impl CodexInfoState {
             current_history_period_reset(&periods, self.reset_at, observed_at);
         for period in &mut periods {
             let is_current = current_period_reset == Some(period.canonical_reset_at);
-            let display_start = period_selector_display_start(
-                period.start,
-                is_current,
-                self.reset_at,
-                self.window_seconds,
-            );
+            period.current = is_current;
             let Some(label) = self
                 .i18n
-                .format_period_selector_label(display_start, is_current)
+                .format_period_selector_label(period.start, is_current)
             else {
                 period.label.clear();
                 continue;
@@ -17444,6 +17419,9 @@ impl CodexInfoState {
             }) {
                 return period.label.clone();
             }
+        }
+        if let Some(period) = periods.iter().find(|period| period.current) {
+            return period.label.clone();
         }
         periods
             .first()
@@ -17564,23 +17542,7 @@ impl CodexInfoState {
 
     fn selected_history_reset_at(&self, observed_at: i64) -> Option<i64> {
         let periods = self.history_periods_at(observed_at);
-        periods
-            .iter()
-            .find(|period| period.label == self.selected_history_period)
-            .map(|period| period.canonical_reset_at)
-            .or_else(|| {
-                self.selected_reset_at.and_then(|selected| {
-                    periods
-                        .iter()
-                        .find(|period| {
-                            period.canonical_reset_at.abs_diff(selected)
-                                <= RESET_AT_TOLERANCE_SECONDS as u64
-                        })
-                        .map(|period| period.canonical_reset_at)
-                })
-            })
-            .or(self.reset_at)
-            .or_else(|| periods.first().map(|period| period.canonical_reset_at))
+        self.selected_history_reset_for_periods(&periods)
     }
 
     fn select_latest_history(&mut self) {
@@ -17592,14 +17554,11 @@ impl CodexInfoState {
         let selected = self
             .reset_at
             .and_then(|reset| {
-                periods
-                    .iter()
-                    .find(|period| {
-                        period.canonical_reset_at.abs_diff(reset)
-                            <= RESET_AT_TOLERANCE_SECONDS as u64
-                    })
-                    .or_else(|| periods.first())
+                periods.iter().find(|period| {
+                    period.canonical_reset_at.abs_diff(reset) <= RESET_AT_TOLERANCE_SECONDS as u64
+                })
             })
+            .or_else(|| periods.iter().find(|period| period.current))
             .or_else(|| periods.first());
         if let Some(period) = selected {
             let label = period.label.clone();
@@ -17707,23 +17666,24 @@ impl CodexInfoState {
             return Some(period.canonical_reset_at);
         }
         if let Some(selected) = self.selected_reset_at {
-            return periods
-                .iter()
-                .find(|period| {
-                    period.canonical_reset_at.abs_diff(selected)
-                        <= RESET_AT_TOLERANCE_SECONDS as u64
-                })
-                .map(|period| period.canonical_reset_at);
+            if let Some(period) = periods.iter().find(|period| {
+                period.canonical_reset_at.abs_diff(selected) <= RESET_AT_TOLERANCE_SECONDS as u64
+            }) {
+                return Some(period.canonical_reset_at);
+            }
         }
         if let Some(current) = self.reset_at {
-            return periods
-                .iter()
-                .find(|period| {
-                    period.canonical_reset_at.abs_diff(current) <= RESET_AT_TOLERANCE_SECONDS as u64
-                })
-                .map(|period| period.canonical_reset_at);
+            if let Some(period) = periods.iter().find(|period| {
+                period.canonical_reset_at.abs_diff(current) <= RESET_AT_TOLERANCE_SECONDS as u64
+            }) {
+                return Some(period.canonical_reset_at);
+            }
         }
-        periods.first().map(|period| period.canonical_reset_at)
+        periods
+            .iter()
+            .find(|period| period.current)
+            .or_else(|| periods.first())
+            .map(|period| period.canonical_reset_at)
     }
 
     /// Build graph input from the same canonical rows as the public details
@@ -19332,14 +19292,12 @@ impl CodexInfoState {
     }
 
     fn model_usage_period(&self) -> String {
-        self.history_periods()
-            .into_iter()
-            .find(|period| {
-                self.reset_at.is_some_and(|reset| {
-                    period.canonical_reset_at.abs_diff(reset) <= RESET_AT_TOLERANCE_SECONDS as u64
-                })
-            })
-            .map(|period| period.label)
+        let periods = self.history_periods();
+        periods
+            .iter()
+            .find(|period| period.current)
+            .or_else(|| periods.first())
+            .map(|period| period.label.clone())
             .unwrap_or_else(|| "履歴なし".into())
     }
 
@@ -19505,7 +19463,7 @@ fn format_dollar_cost(value: f64) -> String {
     if !value.is_finite() || value < 0.0 {
         return "—".into();
     }
-    format!("${}", value as u64)
+    format!("${value:.2}")
 }
 
 fn estimated_cost_label_from_v3(models: &[PublicModelUsageV3]) -> String {
@@ -23210,28 +23168,28 @@ mod tests {
         native_legal_pages, native_startup_loading, normal_status_text, one_month_before_utc,
         open_codex_session_paths, parse_details_document, parse_launch_mode, parse_preview_size,
         parse_rate_limits, parse_resize_direction, period_remaining_text,
-        period_selector_display_start, physical_size_for_logical, plan_type_label,
-        poll_service_state, poll_service_state_with_owner_check, preview_model_row,
-        published_pair_is_fresh, read_active_thread_rollout_cached,
-        read_recovery_entries_for_ranges, read_thread_rollout_path, remaining_graph_points,
-        remaining_graph_points_for_metric, remaining_graph_y, remaining_marker_positions,
-        remaining_marker_positions_on_points, request_with_timeout, reset_transition_is_boundary,
-        same_rollout_identity, separate_current_label_positions, service_endpoint_state,
-        service_health_response_version, service_is_healthy, session_event_model,
-        session_event_type, session_jsonl_files, session_token_snapshot, smooth_model_spend,
-        split_metric_line_paths, terminate_and_reap_owned_child, thread_presentation_rows,
-        three_months_before_utc, unreliable_model_spend, unused_interval_positions,
-        visible_window_position, week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer,
-        ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphConfirmedGap, GraphPaths,
-        GraphWindow, HistoryPeriod, HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint,
+        physical_size_for_logical, plan_type_label, poll_service_state,
+        poll_service_state_with_owner_check, published_pair_is_fresh,
+        read_active_thread_rollout_cached, read_recovery_entries_for_ranges,
+        read_thread_rollout_path, remaining_graph_points, remaining_graph_points_for_metric,
+        remaining_graph_y, remaining_marker_positions, remaining_marker_positions_on_points,
+        request_with_timeout, reset_transition_is_boundary, same_rollout_identity,
+        separate_current_label_positions, service_endpoint_state, service_health_response_version,
+        service_is_healthy, session_event_model, session_event_type, session_jsonl_files,
+        session_token_snapshot, smooth_model_spend, split_metric_line_paths,
+        terminate_and_reap_owned_child, thread_presentation_rows, three_months_before_utc,
+        unreliable_model_spend, unused_interval_positions, visible_window_position,
+        week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer, ApiServerConfig,
+        CodexInfoState, Event, FixedResizeDecision, GraphConfirmedGap, GraphPaths, GraphWindow,
+        HistoryPeriod, HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint,
         LocalUsageCache, LocalUsageCandidate, LocalUsageResult, ManualX11Geometry,
         ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
         ModelUsageTotals, PublicDetails, PublicDetailsV2, PublicDetailsV3, PublicHistoryGap,
-        RpcReadEvent, ServiceEndpointState, ServiceHealthVersion, SessionFileCandidate,
-        SessionTraversalBudget, ThreadRolloutCache, TimedModelUsage, TokenSnapshot,
-        UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample, UsageStore,
-        DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH, GRAPH_METRIC_OPTIONS,
-        GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION,
+        PublicHistoryPeriod, RpcReadEvent, ServiceEndpointState, ServiceHealthVersion,
+        SessionFileCandidate, SessionTraversalBudget, ThreadRolloutCache, TimedModelUsage,
+        TokenSnapshot, UnusedIntervalPosition, UsageEvent, UsageHistory, UsageHistorySample,
+        UsageStore, DEFAULT_SERVICE_ADDRESS, FIXED_WINDOW_HEIGHT, FIXED_WINDOW_WIDTH,
+        GRAPH_METRIC_OPTIONS, GRAPH_WINDOW_PURPOSE, LOCAL_ESTIMATE_PRICE_VERSION, PRODUCT_VERSION,
         THREADS_WINDOW_PURPOSE, UNAUTHENTICATED_WINDOW_TITLE, WEEK_SECONDS,
     };
     use codex_info::usage_store;
@@ -23249,6 +23207,48 @@ mod tests {
         expected_sol_max: f64,
         expected_period_count: usize,
         details_response: GraphFixtureDetailsResponse,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GraphPeriodStartFixture {
+        schema_version: String,
+        observed_at: i64,
+        quota: GraphFixtureQuota,
+        history_period: GraphFixtureHistoryPeriod,
+        history_samples: Vec<GraphFixtureHistorySample>,
+    }
+
+    #[derive(Deserialize)]
+    struct ModelUsageDisplayFixture {
+        contract_id: String,
+        rows: Vec<ModelUsageDisplayFixtureRow>,
+    }
+
+    #[derive(Deserialize)]
+    struct ModelUsageDisplayFixtureRow {
+        wire: ModelUsageDisplayWireRow,
+        expected: ModelUsageDisplayExpectedRow,
+    }
+
+    #[derive(Deserialize)]
+    struct ModelUsageDisplayWireRow {
+        model: String,
+        total_tokens: u64,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        cache_write_input_tokens: Option<u64>,
+        output_tokens: u64,
+    }
+
+    #[derive(Deserialize)]
+    struct ModelUsageDisplayExpectedRow {
+        input_tokens: String,
+        input_dollars: Option<String>,
+        cached_input_tokens: String,
+        cached_input_dollars: Option<String>,
+        output_tokens: String,
+        output_dollars: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -31902,11 +31902,21 @@ mod tests {
     }
 
     #[test]
-    fn quota_reset_moves_an_auto_selected_graph_to_the_new_period() {
+    fn quota_reset_moves_an_auto_selected_graph_to_the_accepted_new_period() {
         let mut state = CodexInfoState::preview("normal");
-        let previous_reset = Utc::now().timestamp();
+        let observed_at = Utc::now().timestamp();
+        let previous_reset = observed_at;
         state.reset_at = Some(previous_reset);
-        state.last_success_at = Some(previous_reset - 60);
+        state.last_success_at = Some(observed_at);
+        state.history = UsageHistory {
+            samples: vec![UsageHistorySample::new(
+                observed_at - 60,
+                previous_reset,
+                100.0,
+                ModelDollarTotals::default(),
+            )],
+            ..UsageHistory::default()
+        };
         state.selected_reset_at = Some(previous_reset);
         state.selected_history_period.clear();
         assert_eq!(state.selected_reset_at, Some(previous_reset));
@@ -31932,7 +31942,19 @@ mod tests {
             recorded_sessions: Vec::new(),
             cleanup_plan: None,
         });
-        assert_eq!(state.selected_history_reset(), Some(next_reset));
+        let selected_period = state
+            .selected_history_reset()
+            .expect("one accepted period is selected");
+        assert_ne!(selected_period, previous_reset);
+        assert!(state
+            .history_periods()
+            .iter()
+            .any(|period| period.canonical_reset_at == selected_period));
+        assert!(state
+            .history
+            .samples_for_reset(Some(selected_period))
+            .iter()
+            .any(|sample| (sample.remaining_percent - 22.0).abs() < f64::EPSILON));
     }
 
     #[test]
@@ -34960,21 +34982,65 @@ mod tests {
     }
 
     #[test]
-    fn model_usage_is_explicitly_token_based() {
+    fn model_usage_display_matches_the_shared_cross_platform_oracle() {
+        let fixture: ModelUsageDisplayFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/model_usage_display_oracle.json"
+        ))
+        .expect("model usage display fixture");
+        assert_eq!(fixture.contract_id, "MODEL-USAGE-DISPLAY-01");
+
+        let rows = fixture
+            .rows
+            .iter()
+            .map(|fixture_row| {
+                let wire = &fixture_row.wire;
+                assert_eq!(
+                    wire.total_tokens,
+                    wire.input_tokens.saturating_add(wire.output_tokens),
+                    "{} total token authority",
+                    wire.model
+                );
+                ModelUsageRow {
+                    name: wire.model.clone(),
+                    tokens: wire.total_tokens,
+                    input_tokens: wire.input_tokens,
+                    cached_input_tokens: wire.cached_input_tokens,
+                    output_tokens: wire.output_tokens,
+                    cache_write_input_tokens: wire.cache_write_input_tokens,
+                }
+            })
+            .collect::<Vec<_>>();
+        let expected_column = |value: fn(&ModelUsageDisplayExpectedRow) -> &String| {
+            fixture
+                .rows
+                .iter()
+                .map(|row| value(&row.expected).as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let expected_dollar_column =
+            |value: fn(&ModelUsageDisplayExpectedRow) -> Option<&String>| {
+                fixture
+                    .rows
+                    .iter()
+                    .map(|row| value(&row.expected).map_or("—", String::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+
         assert_eq!(
-            format_model_usage_columns(&[
-                preview_model_row("SOL", 1_234_567, 1_234_567, 234_567, 234_567),
-                preview_model_row("TERRA", 99, 99, 0, 0),
-                preview_model_row("LUNA", 42, 42, 0, 0),
-            ]),
+            format_model_usage_columns(&rows),
             (
-                "SOL\nTERRA\nLUNA".into(),
-                "1,000,000\n99\n42".into(),
-                "$5\n$0\n$0".into(),
-                "234,567\n0\n0".into(),
-                "$0\n$0\n$0".into(),
-                "234,567\n0\n0".into(),
-                "$7\n$0\n$0".into()
+                rows.iter()
+                    .map(|row| row.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                expected_column(|row| &row.input_tokens),
+                expected_dollar_column(|row| row.input_dollars.as_ref()),
+                expected_column(|row| &row.cached_input_tokens),
+                expected_dollar_column(|row| row.cached_input_dollars.as_ref()),
+                expected_column(|row| &row.output_tokens),
+                expected_dollar_column(|row| row.output_dollars.as_ref()),
             )
         );
     }
@@ -40146,6 +40212,12 @@ mod tests {
             );
             assert_eq!(period.start, CANONICAL_START, "offset={offset}");
             assert_eq!(period.end, CANONICAL_END, "offset={offset}");
+            assert!(period.current, "offset={offset}");
+            let expected_period_label = state
+                .i18n
+                .format_period_selector_label(CANONICAL_START, true)
+                .expect("canonical current label");
+            assert_eq!(period.label, expected_period_label, "offset={offset}");
 
             let selected = state.history.samples_for_reset(Some(quota_reset));
             assert_eq!(selected.len(), 2, "offset={offset}");
@@ -40202,30 +40274,81 @@ mod tests {
     }
 
     #[test]
-    fn live_quota_reset_current_selector_uses_window_without_moving_history() {
-        let canonical_start_at = 1_789_805_607_i64;
-        let latest_quota_reset_at = 1_790_426_338_i64;
-        let window_seconds = 604_800_i64;
+    fn live_quota_reset_stays_separate_from_every_linux_period_start_surface() {
+        let fixture: GraphPeriodStartFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/graph_period_start_oracle.json"
+        ))
+        .expect("shared graph period start fixture");
+        assert_eq!(fixture.schema_version, "graph-period-start-v1");
 
+        let history_start = fixture.history_period.start_at;
+        let live_window_start = fixture
+            .quota
+            .reset_at
+            .checked_sub(fixture.quota.window_seconds)
+            .expect("valid live quota window");
+        assert_ne!(
+            history_start, live_window_start,
+            "fixture must exercise drift"
+        );
+
+        let pair = published_pair(129, 1);
+        let mut state = CodexInfoState::preview("normal");
+        state.preview = false;
+        state.reset_at = Some(fixture.quota.reset_at);
+        state.window_seconds = fixture.quota.window_seconds;
+        state.last_success_at = Some(fixture.observed_at);
+        state.service_split_capable = true;
+        state.service_current_pair = Some(pair.clone());
+        state.service_history_periods_pair = Some(pair);
+        state.service_history_periods = vec![PublicHistoryPeriod {
+            id: fixture.history_period.id.clone(),
+            start_at: fixture.history_period.start_at,
+            end_at: fixture.history_period.end_at,
+            reset_at: fixture.history_period.reset_at,
+            label: fixture.history_period.label.clone(),
+            current: fixture.history_period.current,
+        }];
+        state.selected_reset_at = Some(fixture.quota.reset_at);
+        state.selected_history_period.clear();
+
+        let periods = state.history_periods_at(fixture.observed_at);
+        let period = periods.first().expect("one accepted current period");
+        assert_eq!(periods.len(), 1);
+        assert!(period.current);
+        assert_eq!(period.start, history_start);
+        assert_eq!(period.canonical_reset_at, fixture.history_period.reset_at);
+
+        let expected_period_label = state
+            .i18n
+            .format_period_selector_label(history_start, true)
+            .expect("canonical period label");
+        let rejected_live_window_label = state
+            .i18n
+            .format_period_selector_label(live_window_start, true)
+            .expect("live quota window label");
+        assert_eq!(period.label, expected_period_label);
+        assert_ne!(period.label, rejected_live_window_label);
+        assert_eq!(state.selected_history_period_label(), expected_period_label);
+        assert_eq!(state.model_usage_period(), expected_period_label);
         assert_eq!(
-            period_selector_display_start(
-                canonical_start_at,
-                true,
-                Some(latest_quota_reset_at),
-                window_seconds,
-            ),
-            latest_quota_reset_at - window_seconds
+            state.selected_history_reset_at(fixture.observed_at),
+            Some(fixture.history_period.reset_at)
         );
         assert_eq!(
-            period_selector_display_start(
-                canonical_start_at,
-                false,
-                Some(latest_quota_reset_at),
-                window_seconds,
-            ),
-            canonical_start_at,
-            "completed history keeps its canonical start"
+            state.graph_time_labels_at(fixture.observed_at)[0],
+            state
+                .i18n
+                .format_graph_time(history_start)
+                .expect("canonical graph start label")
         );
+
+        assert_eq!(fixture.history_samples.len(), 2);
+        assert!(fixture
+            .history_samples
+            .iter()
+            .all(|sample| sample.timestamp >= history_start
+                && sample.timestamp <= fixture.history_period.end_at));
     }
 
     #[test]
@@ -40243,12 +40366,14 @@ mod tests {
                 start: PERIOD_START,
                 end: PERIOD_START + 60,
                 label: "older fragment".into(),
+                current: false,
             },
             HistoryPeriod {
                 canonical_reset_at: CURRENT_RESET + 1,
                 start: PERIOD_START + 240,
                 end: OBSERVED_AT,
                 label: "nearest fragment".into(),
+                current: false,
             },
         ];
         let selected = current_history_period_reset(&periods, Some(CURRENT_RESET), OBSERVED_AT)

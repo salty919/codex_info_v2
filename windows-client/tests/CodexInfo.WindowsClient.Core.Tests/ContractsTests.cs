@@ -64,6 +64,11 @@ public sealed class ContractsTests
     {
         var usage = new ApiDetailsModelUsage("TERRA", 1, 2, 3, 1.25, 2.5, 4.75);
         Assert.Equal(8.5, usage.TotalDollars);
+        var cacheWriteAlreadyInInput = new ApiDetailsModelUsage("ASTRA", 1, 2, 3, 2, 3, 4)
+        {
+            CacheWriteInputDollars = 5,
+        };
+        Assert.Equal(9, cacheWriteAlreadyInInput.TotalDollars);
 
         var zeroLength = new ApiHistoryPeriod("zero", 100, 100, false, "zero");
         Assert.Equal(100, zeroLength.ResetAt);

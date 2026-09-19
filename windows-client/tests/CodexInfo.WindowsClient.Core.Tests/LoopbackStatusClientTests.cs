@@ -26,6 +26,28 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
+    public async Task LegacyV1AndV2InputPresentationBucketsAreNotNormalizedTwice()
+    {
+        var v1 = await FetchDetails(ValidDetailsJson());
+        using var v2Client = new LoopbackStatusClient(new StubHandler(request =>
+            request.RequestUri?.AbsolutePath == "/v3/details"
+                ? NotFoundResponse()
+                : JsonResponse(ValidDetailsV2Json(), includePublishedPair: true)));
+        var v2 = await v2Client.FetchDetailsAsync(CancellationToken.None);
+
+        Assert.True(v1.IsSuccess);
+        Assert.True(v2.IsSuccess);
+        foreach (var snapshot in new[] { v1.Snapshot!, v2.Snapshot! })
+        {
+            var model = Assert.Single(snapshot.Models);
+            Assert.Equal(10UL, model.InputTokens);
+            Assert.Equal(2UL, model.CachedInputTokens);
+            Assert.Equal(0.5, model.InputDollars);
+            Assert.Equal(0.25, model.CachedInputDollars);
+        }
+    }
+
+    [Fact]
     public async Task DetailsV3IsPreferredAndCarriesAstraHistory()
     {
         var paths = new List<string>();

@@ -1,0 +1,42 @@
+{
+  "schema_version": "graph-period-start-v1",
+  "observed_at": 1789854360,
+  "quota": {
+    "remaining_percent": 89.0,
+    "reset_at": 1790426338,
+    "window_seconds": 604800,
+    "monthly": false
+  },
+  "history_period": {
+    "id": "1790410407",
+    "start_at": 1789805607,
+    "end_at": 1789854360,
+    "reset_at": 1790410407,
+    "label": "wire label is not a display authority",
+    "current": true
+  },
+  "history_samples": [
+    {
+      "timestamp": 1789805667,
+      "reset_at": 1790410407,
+      "remaining_percent": 100.0,
+      "sol_dollars": 0.0,
+      "terra_dollars": 0.0,
+      "luna_dollars": 0.0,
+      "sol_tokens": 0,
+      "terra_tokens": 0,
+      "luna_tokens": 0
+    },
+    {
+      "timestamp": 1789854300,
+      "reset_at": 1790410407,
+      "remaining_percent": 89.0,
+      "sol_dollars": 66.51,
+      "terra_dollars": 0.0,
+      "luna_dollars": 0.4,
+      "sol_tokens": 1000,
+      "terra_tokens": 0,
+      "luna_tokens": 10
+    }
+  ]
+}

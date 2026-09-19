@@ -27,7 +27,7 @@ API-DEPRECATION-01
 ログアウト、account切替、またはidentity検証失敗中のselectorなしrouteは、旧accountのquota・reset・model・threadを
 返さず、strict emptyな`auth_required`、`initializing`、または`error` rootだけを返す。
 
-`API-V3-MODELS-01`: v3の`current`と`history` resourceはcommit済みdomain snapshotを、有界な`models`配列として返す。model ID、token内訳、価格計算可否を事実として分離し、UI固定列や表示文言をwire fieldにしない。モデルの数値は同じmodel keyを持つ直接観測(`model_source=confirmed`)のraw値だけを公開する。`reconstructed-from-session`、`unknown`、`unavailable`はmodel key/sourceと欠損metadataだけを返し、モデル数値を返さない。`legacy-unknown`は保存済みの同じmodel keyの数値を表示投影に限って返せるが、集計・予測・idle判定のauthorityにはしない。補間、hold、smoothing、予測および派生値はUI presentation-onlyで、API/DBへ書き戻さない。`/health`はAPI世代から独立したread-only readiness endpointとし、collector、DB writer、外部quota取得の生存状態を混同しない。
+`API-V3-MODELS-01`: v3の`current`と`history` resourceはcommit済みdomain snapshotを、有界な`models`配列として返す。model ID、token内訳、価格計算可否を事実として分離し、UI固定列や表示文言をwire fieldにしない。top-level current modelの`input_tokens`はcached入力と、存在する場合はcache write入力を含むraw入力総数であり、UI表示へのprojectionはPRODUCTの`MODEL-USAGE-DISPLAY-01`だけを参照する。モデルの数値は同じmodel keyを持つ直接観測(`model_source=confirmed`)のraw値だけを公開する。`reconstructed-from-session`、`unknown`、`unavailable`はmodel key/sourceと欠損metadataだけを返し、モデル数値を返さない。`legacy-unknown`は保存済みの同じmodel keyの数値を表示投影に限って返せるが、集計・予測・idle判定のauthorityにはしない。補間、hold、smoothing、予測および派生値はUI presentation-onlyで、API/DBへ書き戻さない。`/health`はAPI世代から独立したread-only readiness endpointとし、collector、DB writer、外部quota取得の生存状態を混同しない。
 
 v3の各履歴rowは`models`、`models_complete`、nullable boolean `task_active_since_previous`を持つ。
 `task_active_since_previous`は同じcanonical periodの直前rowより後から当該row時刻までにtaskが実行中だったかを表し、
@@ -205,9 +205,10 @@ accountのtransport/quota/local一時失敗だけは従来どおり最後の完�
 quota観測のprovider `resetsAt` Unix秒である。`quota.window_seconds`はその観測と同じtransactionの値とし、
 latestはdeadlineの大小ではなく`observed_at`とcollector generationの順序で決める。遅着した古い観測、同時刻の
 矛盾candidate、別account/epochの値を公開しない。同一periodのrolling更新では`quota.reset_at`だけが前進または
-補正され得るが、`history_periods[].id/start_at/reset_at`、既存sample、model totalsは変更しない。Linuxの現在period
-selectorに表示する開始時刻はwireのhistory `start_at`を書き換えず、同じcurrent rootの
-`quota.reset_at - quota.window_seconds`から求める。Windowsのリセット時刻は同じrootの`quota.reset_at`を表示する。
+補正され得るが、`history_periods[].id/start_at/reset_at`、既存sample、model totalsは変更しない。Linux/Windowsの
+期間欄、メイン利用期間、selected period start、グラフ横軸は、選択中のaccepted `history_periods[].start_at`を
+そのまま使う。current identityは同じperiodの`current`を使い、`quota.reset_at - quota.window_seconds`から
+history開始表示を再計算しない。リセット時刻は同じrootの`quota.reset_at`を表示する。
 
 wireに `ready` boolean keyは存在しない。dataの利用可能判定は、完全schemaを受理した一つのdetails rootについて
 `state == "ready" && authenticated == true` の論理積だけである。
