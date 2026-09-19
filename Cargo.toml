@@ -23,6 +23,7 @@ members = [
 
 [dependencies]
 codex-info-db-writer = { path = "crates/codex-info-db-writer" }
+codex-info-rest-contract = { path = "crates/codex-info-rest-contract" }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 iana-time-zone = "0.1"

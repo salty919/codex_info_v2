@@ -6,10 +6,11 @@
 //! is enabled and read back before any product query is issued.
 
 use codex_info_rest_contract::{
-    is_valid_public_model_name, ContractError, PublicDetailedModelUsage, PublicDetails,
-    PublicHistoryGap, PublicHistoryModelUsageV3, PublicHistoryObservation,
-    PublicHistoryObservationV3, PublicHistoryPeriod, PublicHistorySample, PublicModelCostV3,
-    PublicModelUsageV3, PublicQuota, PublicState, PublicThread, MAX_PUBLIC_MODELS_V3,
+    current_period_bounds, current_period_start_at, is_valid_public_model_name, ContractError,
+    PublicDetailedModelUsage, PublicDetails, PublicHistoryGap, PublicHistoryModelUsageV3,
+    PublicHistoryObservation, PublicHistoryObservationV3, PublicHistoryPeriod, PublicHistorySample,
+    PublicModelCostV3, PublicModelUsageV3, PublicQuota, PublicState, PublicThread,
+    MAX_PUBLIC_MODELS_V3,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
@@ -2855,11 +2856,7 @@ fn history_model_usage_v3(
 }
 
 fn quota_period_start(reset_at: i64, window_seconds: i64) -> Option<i64> {
-    (window_seconds > 0)
-        .then(|| reset_at.checked_sub(window_seconds))
-        .flatten()
-        .and_then(|start| start.div_euclid(60).checked_mul(60))
-        .filter(|start| valid_public_timestamp(*start))
+    current_period_start_at(reset_at, window_seconds)
 }
 
 /// Return the current period key for an observation whose timestamp falls in
@@ -3071,34 +3068,27 @@ fn history_periods(
             .max_by_key(|sample| (sample.timestamp, sample.reset_at))
             .map(|sample| sample.reset_at)
     });
+    let current_bounds = current_window_reset_at
+        .and_then(|reset_at| current_period_bounds(reset_at, window_seconds, observed_at));
     let mut periods = ranges
         .into_iter()
         .map(|(reset_at, (observed_start, observed_end))| {
             let is_current = Some(reset_at) == current;
-            let start_at = if is_current {
-                current_window_reset_at
-                    .and_then(|authority| quota_period_start(authority, window_seconds))
-                    .unwrap_or(observed_start)
+            let (start_at, end_at) = if is_current {
+                // The public current period is the exact quota observation
+                // window. Stored samples remain minute buckets and are not
+                // rewritten to manufacture these bounds.
+                current_bounds.unwrap_or((observed_start, observed_end.min(observed_at)))
             } else {
-                observed_start
+                (observed_start, observed_end.min(observed_at).min(reset_at))
             };
-            let mut end_at = observed_end.min(observed_at);
-            if is_current {
-                // Samples are canonicalized to minute starts, while the
-                // recorder's observed_at may retain event-level seconds.
-                // The contract's current-period end remains the exact
-                // quota/reset observation boundary.
-                end_at = current_window_reset_at.unwrap_or(reset_at).min(observed_at);
-            } else {
-                end_at = end_at.min(reset_at);
-            }
             PublicHistoryPeriod {
                 // The root UI uses the canonical reset instant as its period
                 // ID. Keep this stable numeric identity across REST and
                 // Windows selections; labels remain presentation text.
                 id: reset_at.to_string(),
                 start_at,
-                end_at: end_at.max(start_at),
+                end_at,
                 reset_at,
                 label: String::new(),
                 current: is_current || Some(reset_at) == fallback_current,

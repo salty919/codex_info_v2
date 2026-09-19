@@ -8,6 +8,7 @@
 //! snapshot into [`ApiSnapshotPublisher`]; HTTP handlers only read that copy.
 
 use crate::security;
+use codex_info_rest_contract::current_period_bounds;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -284,17 +285,16 @@ impl PublicDetails {
                 let Some(observed_at) = self.observed_at else {
                     return Err(ApiSnapshotError::InvalidHistoryPeriod);
                 };
-                let current_reset_at = self
-                    .quota
-                    .as_ref()
-                    .map_or(period.reset_at, |quota| quota.reset_at);
-                let expected_start_at = self
-                    .quota
-                    .as_ref()
-                    .and_then(|quota| quota.reset_at.checked_sub(quota.window_seconds));
-                if expected_start_at.is_some_and(|start_at| period.start_at != start_at)
-                    || period.end_at != current_reset_at.min(observed_at)
-                {
+                if let Some(quota) = self.quota.as_ref() {
+                    let Some((expected_start_at, expected_end_at)) =
+                        current_period_bounds(quota.reset_at, quota.window_seconds, observed_at)
+                    else {
+                        return Err(ApiSnapshotError::InvalidHistoryPeriod);
+                    };
+                    if period.start_at != expected_start_at || period.end_at != expected_end_at {
+                        return Err(ApiSnapshotError::InvalidHistoryPeriod);
+                    }
+                } else if period.end_at != period.reset_at.min(observed_at) {
                     return Err(ApiSnapshotError::InvalidHistoryPeriod);
                 }
             }

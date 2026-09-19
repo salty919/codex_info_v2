@@ -33,6 +33,7 @@ use codex_info::usage_store::{
     classify_quota_transition, select_predeadline_quota_authority, PreviousQuotaState,
     QuotaCandidate, QuotaTransition, StoragePartitionIdentity, UsageStore,
 };
+use codex_info_rest_contract::{current_period_bounds, current_period_start_at};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[cfg(test)]
@@ -3207,10 +3208,7 @@ fn authoritative_history_projection_samples(
     ) else {
         return samples.to_vec();
     };
-    let Some(authoritative_start) = (window_seconds > 0)
-        .then(|| window_reset_at.checked_sub(window_seconds))
-        .flatten()
-    else {
+    let Some(authoritative_start) = current_period_start_at(window_reset_at, window_seconds) else {
         return samples.to_vec();
     };
 
@@ -3262,18 +3260,12 @@ fn apply_authoritative_current_bounds(
     else {
         return periods;
     };
-    let Some(authoritative_start) = (window_seconds > 0)
-        .then(|| window_reset_at.checked_sub(window_seconds))
-        .flatten()
+    let Some((authoritative_start, end)) =
+        current_period_bounds(window_reset_at, window_seconds, observed_at)
     else {
         periods.remove(current_index);
         return periods;
     };
-    let end = window_reset_at.min(observed_at);
-    if end < authoritative_start {
-        periods.remove(current_index);
-        return periods;
-    }
 
     periods[current_index].start = authoritative_start;
     periods[current_index].end = end;
