@@ -73,6 +73,36 @@ impl PublishedSnapshot {
         );
         published
     }
+
+    fn account_boundary(state: PublicState, generation: u64) -> Self {
+        debug_assert!(state != PublicState::Ready);
+        let state_code = match state {
+            PublicState::Initializing => 1_u128,
+            PublicState::AuthRequired => 2_u128,
+            PublicState::Error => 3_u128,
+            PublicState::Ready => 0_u128,
+        };
+        let identity = (state_code << 64) | u128::from(generation);
+        let data_hash = format!("{identity:064x}");
+        let details = PublicDetails {
+            state,
+            ..PublicDetails::default()
+        };
+        Self {
+            generation,
+            // A state transition changes the opaque namespace, while repeated
+            // publications of one state advance the counter. This keeps the
+            // Linux freshness gate monotonic without borrowing any prior
+            // account's partition identity.
+            pair: format!("v1:{:016x}{state_code:016x}{generation:032x}", 0),
+            data_hash,
+            has_pending_ranges: false,
+            details,
+            models_v3: Vec::new(),
+            history_samples_v3: Vec::new(),
+            history_samples_v2: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -316,9 +346,16 @@ impl AccountReader {
 /// account partition, not a second persistence authority and is never written
 /// to disk.  `new(DbReader)` remains the fixture-compatible single-reader API.
 pub struct SnapshotStore {
-    default_account_id: String,
+    default_account_id: Option<String>,
     accounts: BTreeMap<String, AccountStore>,
     account_descriptors: Vec<PublicAccountV3>,
+    boundary: RwLock<BoundaryPublication>,
+}
+
+#[derive(Debug)]
+struct BoundaryPublication {
+    generation: u64,
+    snapshot: Option<Arc<PublishedSnapshot>>,
 }
 
 impl SnapshotStore {
@@ -379,28 +416,52 @@ impl SnapshotStore {
             }
         }
         let public = PublicAccountsV3 {
-            default_account_id: default_account_id.clone(),
+            default_account_id: Some(default_account_id.clone()),
             accounts: descriptors.clone(),
         };
         public.validate().map_err(|error| {
             RestServerError::InvalidAccounts(format!("invalid account selector: {error}"))
         })?;
         Ok(Self {
-            default_account_id,
+            default_account_id: Some(default_account_id),
             accounts: stores,
             account_descriptors: descriptors,
+            boundary: RwLock::new(BoundaryPublication {
+                generation: 0,
+                snapshot: None,
+            }),
         })
     }
 
+    pub fn new_without_account(state: PublicState) -> Self {
+        debug_assert!(state != PublicState::Ready);
+        Self {
+            default_account_id: None,
+            accounts: BTreeMap::new(),
+            account_descriptors: Vec::new(),
+            boundary: RwLock::new(BoundaryPublication {
+                generation: 1,
+                snapshot: Some(Arc::new(PublishedSnapshot::account_boundary(state, 1))),
+            }),
+        }
+    }
+
     pub fn reader(&self) -> &DbReader {
+        let default_account_id = self
+            .default_account_id
+            .as_deref()
+            .expect("fixture store has a default account");
         self.accounts
-            .get(&self.default_account_id)
+            .get(default_account_id)
             .expect("validated default account")
             .reader()
     }
 
     pub fn refresh(&self) -> RefreshStatus {
-        self.refresh_account(&self.default_account_id)
+        self.default_account_id
+            .as_deref()
+            .map(|account_id| self.refresh_account(account_id))
+            .unwrap_or(RefreshStatus::Unavailable)
     }
 
     pub fn refresh_account(&self, account_id: &str) -> RefreshStatus {
@@ -411,7 +472,13 @@ impl SnapshotStore {
     }
 
     pub fn status(&self) -> StoreStatus {
-        self.status_account(&self.default_account_id)
+        self.default_account_id
+            .as_deref()
+            .map(|account_id| self.status_account(account_id))
+            .unwrap_or(StoreStatus {
+                generation: None,
+                degraded: false,
+            })
     }
 
     pub fn status_account(&self, account_id: &str) -> StoreStatus {
@@ -425,7 +492,11 @@ impl SnapshotStore {
     }
 
     pub fn snapshot(&self) -> Option<Arc<PublishedSnapshot>> {
-        self.snapshot_account(&self.default_account_id)
+        self.boundary_snapshot().or_else(|| {
+            self.default_account_id
+                .as_deref()
+                .and_then(|account_id| self.snapshot_account(account_id))
+        })
     }
 
     pub fn snapshot_account(&self, account_id: &str) -> Option<Arc<PublishedSnapshot>> {
@@ -435,7 +506,13 @@ impl SnapshotStore {
     }
 
     pub fn snapshot_with_status(&self) -> (Option<Arc<PublishedSnapshot>>, bool) {
-        self.snapshot_with_status_account(&self.default_account_id)
+        if let Some(snapshot) = self.boundary_snapshot() {
+            return (Some(snapshot), false);
+        }
+        self.default_account_id
+            .as_deref()
+            .map(|account_id| self.snapshot_with_status_account(account_id))
+            .unwrap_or((None, false))
     }
 
     pub fn snapshot_with_status_account(
@@ -452,12 +529,63 @@ impl SnapshotStore {
         self.accounts.contains_key(account_id)
     }
 
-    pub fn default_account_id(&self) -> &str {
-        &self.default_account_id
+    pub fn default_account_id(&self) -> Option<&str> {
+        self.default_account_id.as_deref()
     }
 
     pub fn account_descriptors(&self) -> &[PublicAccountV3] {
         &self.account_descriptors
+    }
+
+    pub fn public_accounts(&self) -> PublicAccountsV3 {
+        let boundary = self.boundary_snapshot().is_some();
+        let mut accounts = self.account_descriptors.clone();
+        if boundary {
+            for account in &mut accounts {
+                account.is_current = false;
+            }
+        }
+        PublicAccountsV3 {
+            default_account_id: (!boundary)
+                .then(|| self.default_account_id.clone())
+                .flatten(),
+            accounts,
+        }
+    }
+
+    pub fn publish_account_boundary(&self, state: PublicState) {
+        debug_assert!(state != PublicState::Ready);
+        let mut boundary = self
+            .boundary
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if boundary
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.details.state == state)
+        {
+            return;
+        }
+        boundary.generation = boundary.generation.saturating_add(1).max(1);
+        let generation = boundary.generation;
+        boundary.snapshot = Some(Arc::new(PublishedSnapshot::account_boundary(
+            state, generation,
+        )));
+    }
+
+    pub fn clear_account_boundary(&self) {
+        self.boundary
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot = None;
+    }
+
+    fn boundary_snapshot(&self) -> Option<Arc<PublishedSnapshot>> {
+        self.boundary
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot
+            .clone()
     }
 }
 
@@ -520,6 +648,43 @@ impl RestServer {
             accounts,
             default_account_id,
         )?);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_store = Arc::clone(&store);
+        let worker = thread::Builder::new()
+            .name("codex-info-rest".to_owned())
+            .spawn(move || serve(listener, worker_store, worker_stop))
+            .map_err(RestServerError::Listener)?;
+        Ok(Self {
+            local_addr,
+            stop,
+            worker: Some(worker),
+            store,
+        })
+    }
+
+    /// Start a read-only listener while no Codex account is authenticated.
+    /// The store contains no selectable current account and publishes only
+    /// the strict empty boundary root until the production supervisor exits
+    /// and restarts this process with a freshly admitted account catalog.
+    pub fn start_without_account(
+        state: PublicState,
+        listen_addr: SocketAddr,
+    ) -> Result<Self, RestServerError> {
+        if !listen_addr.ip().is_loopback() {
+            return Err(RestServerError::NonLoopbackAddress);
+        }
+        if state == PublicState::Ready {
+            return Err(RestServerError::InvalidAccounts(
+                "a ready REST store requires a current account".to_owned(),
+            ));
+        }
+        let listener = TcpListener::bind(listen_addr).map_err(RestServerError::Bind)?;
+        listener
+            .set_nonblocking(true)
+            .map_err(RestServerError::Listener)?;
+        let local_addr = listener.local_addr().map_err(RestServerError::Listener)?;
+        let store = Arc::new(SnapshotStore::new_without_account(state));
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker_store = Arc::clone(&store);
@@ -671,10 +836,7 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
     }
 
     if route == Route::AccountsV3 {
-        let accounts = PublicAccountsV3 {
-            default_account_id: store.default_account_id().to_owned(),
-            accounts: store.account_descriptors().to_vec(),
-        };
+        let accounts = store.public_accounts();
         match flatten_with_version(API_VERSION_V3, &accounts) {
             Ok(body) => write_json_response(stream, 200, body, None, false),
             Err(RouteError::Serialization) => {
@@ -685,21 +847,27 @@ fn handle_connection(stream: &mut TcpStream, store: &SnapshotStore) {
         return;
     }
 
-    let account_id = request
-        .account
-        .as_deref()
-        .unwrap_or_else(|| store.default_account_id());
-    if !store.has_account(account_id) {
-        write_json_response(stream, 400, error_body("unknown_account"), None, false);
-        return;
-    }
-
-    // A malformed request never reaches refresh, so parser errors cannot
-    // influence published generation or trigger a database access.
-    let refresh = store.refresh_account(account_id);
-    let (snapshot, degraded) = store.snapshot_with_status_account(account_id);
+    let (snapshot, degraded) = if request.account.is_none() {
+        if let Some(snapshot) = store.boundary_snapshot() {
+            (Some(snapshot), false)
+        } else {
+            let Some(account_id) = store.default_account_id() else {
+                write_json_response(stream, 503, error_body("snapshot_unavailable"), None, false);
+                return;
+            };
+            let _refresh = store.refresh_account(account_id);
+            store.snapshot_with_status_account(account_id)
+        }
+    } else {
+        let account_id = request.account.as_deref().expect("account checked above");
+        if !store.has_account(account_id) {
+            write_json_response(stream, 400, error_body("unknown_account"), None, false);
+            return;
+        }
+        let _refresh = store.refresh_account(account_id);
+        store.snapshot_with_status_account(account_id)
+    };
     let Some(snapshot) = snapshot else {
-        let _ = refresh;
         write_json_response(stream, 503, error_body("snapshot_unavailable"), None, false);
         return;
     };
@@ -1822,6 +1990,63 @@ mod tests {
         restarted.shutdown();
         fs::remove_file(path_a).expect("account A cleanup");
         fs::remove_file(path_b).expect("account B cleanup");
+    }
+
+    #[test]
+    fn account_boundary_clears_current_account_and_unscoped_quota() {
+        let path = temp_db("account-logout-boundary");
+        fixture(&path, 10);
+        let reader = DbReader::open(&path).expect("account reader");
+        let mut server = RestServer::start_with_accounts(
+            vec![AccountReader::new(
+                "account-7",
+                7,
+                true,
+                Some(1_800_000_000),
+                None,
+                reader,
+            )],
+            "account-7",
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .expect("account server");
+
+        let ready = request(
+            server.local_addr(),
+            "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        let ready: serde_json::Value =
+            serde_json::from_str(body(&ready)).expect("ready current JSON");
+        assert_eq!(ready["state"], "ready");
+        assert!(ready["quota"].is_object());
+
+        server
+            .store()
+            .publish_account_boundary(PublicState::AuthRequired);
+        let accounts = request(
+            server.local_addr(),
+            "GET /v3/accounts HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        let accounts: serde_json::Value =
+            serde_json::from_str(body(&accounts)).expect("logged-out accounts JSON");
+        assert!(accounts["default_account_id"].is_null());
+        assert_eq!(accounts["accounts"][0]["is_current"], false);
+
+        let logged_out = request(
+            server.local_addr(),
+            "GET /v3/current HTTP/1.1\r\nHost:x\r\n\r\n",
+        );
+        let logged_out: serde_json::Value =
+            serde_json::from_str(body(&logged_out)).expect("logged-out current JSON");
+        assert_eq!(logged_out["state"], "auth_required");
+        assert_eq!(logged_out["authenticated"], false);
+        assert!(logged_out["observed_at"].is_null());
+        assert!(logged_out["quota"].is_null());
+        assert!(logged_out["models"].as_array().is_some_and(Vec::is_empty));
+        assert_eq!(logged_out["active_thread_count"], 0);
+
+        server.shutdown();
+        fs::remove_file(path).expect("account boundary cleanup");
     }
 
     #[test]

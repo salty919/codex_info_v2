@@ -293,6 +293,25 @@ public sealed class LoopbackStatusClientTests
     }
 
     [Fact]
+    public async Task AccountsAcceptLogoutDirectoryWithNoCurrentAccount()
+    {
+        const string json =
+            "{\"api_version\":\"v3\",\"default_account_id\":null,\"accounts\":[" +
+            "{\"id\":\"account-7\",\"is_current\":false,\"activation_at\":1789167600,\"deactivation_at\":1789168200,\"login_id\":\"previous@example.com\"}]}";
+        using var client = new LoopbackStatusClient(new StubHandler(request =>
+            request.RequestUri!.AbsolutePath == "/v3/accounts"
+                ? JsonResponse(json)
+                : NotFoundResponse()));
+
+        var result = await client.FetchAccountsAsync(CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.Null(result.Snapshot!.DefaultAccountId);
+        Assert.DoesNotContain(result.Snapshot.Accounts, account => account.IsCurrent);
+        Assert.Equal("previous@example.com", result.Snapshot.Accounts.Single().LoginId);
+    }
+
+    [Fact]
     public async Task AccountsDisambiguateDuplicateLoginLabelsWithPublicIds()
     {
         const string json =

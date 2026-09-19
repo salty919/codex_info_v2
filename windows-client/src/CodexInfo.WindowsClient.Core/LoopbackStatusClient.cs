@@ -1665,11 +1665,11 @@ public sealed class LoopbackStatusClient :
             if (!HasExactlyProperties(root, AccountsTopLevelProperties, 3) ||
                 !TryGetString(root, "api_version", out var apiVersion) ||
                 apiVersion != "v3" ||
-                !TryGetBoundedString(root, "default_account_id", 1, 512, out var defaultId) ||
-                !IsSafeAccountId(defaultId) ||
+                !TryGetNullableBoundedString(root, "default_account_id", 1, 512, out var defaultId) ||
+                (defaultId is not null && !IsSafeAccountId(defaultId)) ||
                 !root.TryGetProperty("accounts", out var accountProperty) ||
                 accountProperty.ValueKind != JsonValueKind.Array ||
-                accountProperty.GetArrayLength() is < 1 or > MaxAccounts)
+                accountProperty.GetArrayLength() > MaxAccounts)
             {
                 return null;
             }
@@ -1701,7 +1701,10 @@ public sealed class LoopbackStatusClient :
                 accounts.Add(new ApiAccount(id, isCurrent, activationAt, deactivationAt, loginId));
             }
 
-            if (currentCount != 1 || !accounts.Any(account => account.Id == defaultId && account.IsCurrent))
+            if ((defaultId is null && currentCount != 0) ||
+                (defaultId is not null &&
+                 (currentCount != 1 ||
+                  !accounts.Any(account => account.Id == defaultId && account.IsCurrent))))
             {
                 return null;
             }

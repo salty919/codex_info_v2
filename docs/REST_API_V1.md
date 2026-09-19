@@ -16,12 +16,16 @@ API-DEPRECATION-01
 
 `ACCOUNT-SELECT-134`: `GET /v3/accounts`は初期化済みaccount partitionの有限catalogを返す。各要素は
 `id`（`account-<StorageEpoch>`形式の非秘密selector）、`is_current`、nullableな`activation_at`、
-`deactivation_at`、`login_id`だけを持ち、rootは`default_account_id`を一つ持つ。`login_id`は前後の同一
+`deactivation_at`、`login_id`だけを持つ。認証中はrootの`default_account_id`が唯一の`is_current=true`要素を
+指し、ログアウト中は`default_account_id=null`かつ`is_current=true`が0件となる（保持済みaccountを履歴要素として
+返してもよい）。`login_id`は前後の同一
 `account/read`で確認し、owner-onlyな当該account DBへ保存した1..254 Unicode scalar、trim済み・control文字なしの
 表示専用値であり、欠落時はnullとする。AccountScopeId、partition ID、raw AccountKey、token、pathをwireへ出さない。
 `/v3/details`、`/v3/current`、`/v3/history/periods`、`/v3/history`、`/v3/threads`は
 任意の`account=<id>`を一つだけ受理し、省略時は現accountを選ぶ。未知・重複・不正selectorは別accountへfallbackせず
 400とする。published pairとcursorはaccount IDへnamespace bindし、別accountのETag、cursor、last-goodを受理しない。
+ログアウト、account切替、またはidentity検証失敗中のselectorなしrouteは、旧accountのquota・reset・model・threadを
+返さず、strict emptyな`auth_required`、`initializing`、または`error` rootだけを返す。
 
 `API-V3-MODELS-01`: v3の`current`と`history` resourceはcommit済みdomain snapshotを、有界な`models`配列として返す。model ID、token内訳、価格計算可否を事実として分離し、UI固定列や表示文言をwire fieldにしない。モデルの数値は同じmodel keyを持つ直接観測(`model_source=confirmed`)のraw値だけを公開する。`reconstructed-from-session`、`unknown`、`unavailable`はmodel key/sourceと欠損metadataだけを返し、モデル数値を返さない。`legacy-unknown`は保存済みの同じmodel keyの数値を表示投影に限って返せるが、集計・予測・idle判定のauthorityにはしない。補間、hold、smoothing、予測および派生値はUI presentation-onlyで、API/DBへ書き戻さない。`/health`はAPI世代から独立したread-only readiness endpointとし、collector、DB writer、外部quota取得の生存状態を混同しない。
 

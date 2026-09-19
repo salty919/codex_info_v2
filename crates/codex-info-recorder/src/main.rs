@@ -8,10 +8,13 @@ use codex_info_db_writer::{
     ActiveThreadSnapshot, SessionLifecycleInterval, StoragePartitionIdentity, UsageStore,
 };
 use codex_info_recorder::{
-    synchronize_inactive_partition, AccountEpochProof, ActiveThreadPollResult, ProfileLease,
-    QuotaPollEvent, QuotaPoller, Recorder, RecorderConfig, RecorderError, RecorderStateWriter,
-    ThreadPoller, DEFAULT_CHUNK_BYTES, DEFAULT_INTERVAL_SECS,
+    probe_codex_authentication_state, synchronize_inactive_partition, AccountEpochProof,
+    ActiveThreadPollResult, CodexAuthenticationState, ProfileLease, QuotaPollEvent, QuotaPoller,
+    Recorder, RecorderConfig, RecorderError, RecorderStateWriter, ThreadPoller,
+    DEFAULT_CHUNK_BYTES, DEFAULT_INTERVAL_SECS,
 };
+use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -77,6 +80,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| format!("prepare recorder data root: {error}"))?;
     let _profile_lease = ProfileLease::acquire(&options.data_root)?;
     let previous_authority = RecorderStateWriter::read_previous_authority(&options.data_root)?;
+    if AccountEpochProof::capture(&options.codex_home).is_err() {
+        let auth_path = options.codex_home.join("auth.json");
+        match fs::symlink_metadata(&auth_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return run_without_account(&options, &_profile_lease)
+            }
+            _ => {
+                return Err(RecorderError::Invalid(
+                    "Codex account authority is present but invalid".to_owned(),
+                )
+                .into())
+            }
+        }
+    }
     // A configured activation is useful for deterministic restart fixtures,
     // but it must never become the boundary of a future account switch.  If
     // the currently-authenticated partition is not the registry's open
@@ -113,7 +130,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     options.partition = partition;
     let transition_fingerprint = previous_authority
         .as_ref()
-        .filter(|previous| previous.partition_id != options.identity.partition_id)
+        .filter(|previous| {
+            previous.partition_id.as_deref() != Some(options.identity.partition_id.as_str())
+        })
         .map(|previous| previous.transition_fingerprint.as_str());
     let lifecycle_intervals = options
         .partition
@@ -352,6 +371,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(RecorderError::AccountBoundaryChanged.into());
         }
         match publication {
+            CyclePublication::Committed { .. } if quota_health != LaneHealth::Ready => {
+                // A newly admitted account is not public-current until its
+                // own app-server quota has been committed. Leaving the prior
+                // recorder authority untouched keeps REST in `initializing`
+                // instead of exposing the previous account's reset time.
+                eprintln!("codex-info-recorder awaiting fresh current-account quota");
+            }
             CyclePublication::Committed { has_pending } => match recorder.state() {
                 Ok(state) => {
                     if !recorder_epoch_matches(&options, &cycle_epoch) {
@@ -386,6 +412,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         std::thread::sleep(Duration::from_secs(options.interval_secs));
+    }
+}
+
+fn run_without_account(
+    options: &Options,
+    profile_lease: &ProfileLease,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match probe_codex_authentication_state()
+        .map_err(|error| RecorderError::Invalid(format!("confirm Codex logout: {error}")))?
+    {
+        CodexAuthenticationState::AuthRequired => {}
+        CodexAuthenticationState::Authenticated => {
+            return Err(RecorderError::Invalid(
+                "Codex is authenticated but the local account authority is unavailable".to_owned(),
+            )
+            .into())
+        }
+    }
+    let mut state_writer = RecorderStateWriter::new_idle(&options.data_root, profile_lease)?;
+    state_writer.write_idle_no_account()?;
+    if options.once {
+        return Ok(());
+    }
+    let heartbeat = Duration::from_secs(options.interval_secs.clamp(1, 5));
+    loop {
+        std::thread::sleep(heartbeat);
+        let auth_path = options.codex_home.join("auth.json");
+        match fs::symlink_metadata(&auth_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                state_writer.write_idle_no_account()?;
+            }
+            Ok(_) if AccountEpochProof::capture(&options.codex_home).is_ok() => {
+                return Err(RecorderError::AccountBoundaryChanged.into())
+            }
+            _ => {
+                return Err(RecorderError::Invalid(
+                    "Codex account authority appeared but is invalid".to_owned(),
+                )
+                .into())
+            }
+        }
     }
 }
 

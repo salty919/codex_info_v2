@@ -382,7 +382,7 @@ public interface ILoopbackAccountResourceClient
 
 /// <summary>Validated account selector response from /v3/accounts.</summary>
 public sealed record ApiAccountsSnapshot(
-    string DefaultAccountId,
+    string? DefaultAccountId,
     IReadOnlyList<ApiAccount> Accounts)
 {
     public string ApiVersion { get; init; } = "v3";

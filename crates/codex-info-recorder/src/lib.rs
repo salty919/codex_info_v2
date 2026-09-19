@@ -603,6 +603,102 @@ impl fmt::Debug for AppServerAccount {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexAuthenticationState {
+    Authenticated,
+    AuthRequired,
+}
+
+fn decode_codex_authentication_state(value: &Value) -> Result<CodexAuthenticationState, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "Codex account response is unavailable".to_owned())?;
+    let requires_openai_auth = object
+        .get("requiresOpenaiAuth")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "Codex account response is invalid".to_owned())?;
+    match object.get("account") {
+        Some(Value::Null) if requires_openai_auth => Ok(CodexAuthenticationState::AuthRequired),
+        Some(Value::Object(_)) if !requires_openai_auth => {
+            decode_app_server_account(value)?;
+            Ok(CodexAuthenticationState::Authenticated)
+        }
+        _ => Err("Codex account response is inconsistent".to_owned()),
+    }
+}
+
+/// Confirm the current Codex authentication state through two reads from one
+/// app-server process. A missing local auth file is never enough to claim
+/// logout: both reads must independently report the documented auth-required
+/// shape without an intervening account/updated generation.
+pub fn probe_codex_authentication_state() -> Result<CodexAuthenticationState, String> {
+    let executable = resolve_codex_executable()?;
+    let mut child = Command::new(executable)
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "Codex app-server could not be started".to_owned())?;
+    let Some(mut input) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("Codex app-server stdin is unavailable".to_owned());
+    };
+    let Some(stdout) = child.stdout.take() else {
+        drop(input);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("Codex app-server stdout is unavailable".to_owned());
+    };
+    let output = app_server_reader(stdout);
+    let result = (|| {
+        let mut account_updates = AccountUpdateTracker::for_app_server();
+        request_app_server(
+            &mut input,
+            &output,
+            1,
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "codex-info-recorder-auth-probe",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {"experimentalApi": true}
+            }),
+            &mut account_updates,
+        )?;
+        let generation = account_updates.generation;
+        let before = decode_codex_authentication_state(&request_app_server(
+            &mut input,
+            &output,
+            2,
+            "account/read",
+            json!({}),
+            &mut account_updates,
+        )?)?;
+        if !account_updates.valid || account_updates.generation != generation {
+            return Err("Codex account identity changed during auth probe".to_owned());
+        }
+        let after = decode_codex_authentication_state(&request_app_server(
+            &mut input,
+            &output,
+            3,
+            "account/read",
+            json!({}),
+            &mut account_updates,
+        )?)?;
+        if !account_updates.valid || account_updates.generation != generation || before != after {
+            return Err("Codex account identity changed during auth probe".to_owned());
+        }
+        Ok(before)
+    })();
+    drop(input);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
 /// One authenticated app-server collection window.  The local auth key,
 /// account/read identity, and process-local notification generation are one
 /// invariant: all three must remain unchanged from the first account/read
@@ -2567,7 +2663,7 @@ impl ProfileLease {
 /// the fixed v1 key set consumed by `recorder_identity_check`.
 pub struct RecorderStateWriter {
     path: PathBuf,
-    partition_id: String,
+    partition_id: Option<String>,
     pid: u32,
     starttime_ticks: i64,
     owner_nonce: String,
@@ -2580,7 +2676,7 @@ pub struct RecorderStateWriter {
 /// account transition; neither field contains the external account key.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreviousRecorderAuthority {
-    pub partition_id: String,
+    pub partition_id: Option<String>,
     pub transition_fingerprint: String,
 }
 
@@ -2666,6 +2762,36 @@ impl RecorderStateWriter {
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         };
+        let write_state = string("write_state");
+        if write_state == Some("idle_no_account") {
+            if object.get("partition_id_hash") != Some(&Value::Null)
+                || object.get("data_generation") != Some(&Value::Null)
+                || object.get("collector_epoch") != Some(&Value::Null)
+                || object.get("cycle_seq") != Some(&Value::Null)
+                || object.get("last_commit_unix") != Some(&Value::Null)
+            {
+                return Err(RecorderError::Invalid(
+                    "idle recorder state is inconsistent".to_owned(),
+                ));
+            }
+            if string("schema") != Some(RECORDER_STATE_SCHEMA)
+                || !positive("pid")
+                || !positive("process_starttime")
+                || !string("owner_nonce").is_some_and(|value| valid_hex(value, 16))
+                || !object
+                    .get("updated_at_unix")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|value| value > 0)
+            {
+                return Err(RecorderError::Invalid(
+                    "idle recorder state identity or bounds are invalid".to_owned(),
+                ));
+            }
+            return Ok(Some(PreviousRecorderAuthority {
+                partition_id: None,
+                transition_fingerprint: hex_digest(Sha256::digest(&bytes).as_slice()),
+            }));
+        }
         let partition_id = string("partition_id_hash").ok_or_else(|| {
             RecorderError::Invalid("recorder state partition is missing".to_owned())
         })?;
@@ -2679,7 +2805,7 @@ impl RecorderStateWriter {
             || !positive("pid")
             || !positive("process_starttime")
             || !string("owner_nonce").is_some_and(|value| valid_hex(value, 16))
-            || !matches!(string("write_state"), Some("ready" | "degraded"))
+            || !matches!(write_state, Some("ready" | "degraded"))
             || !valid_hex(partition_id, 32)
             || !optional_positive("data_generation")
             || !collector_epoch_valid
@@ -2695,7 +2821,7 @@ impl RecorderStateWriter {
             ));
         }
         Ok(Some(PreviousRecorderAuthority {
-            partition_id: partition_id.to_owned(),
+            partition_id: Some(partition_id.to_owned()),
             transition_fingerprint: hex_digest(Sha256::digest(&bytes).as_slice()),
         }))
     }
@@ -2714,13 +2840,41 @@ impl RecorderStateWriter {
         }
         Ok(Self {
             path: history.join("recorder-state.json"),
-            partition_id: identity.partition_id.clone(),
+            partition_id: Some(identity.partition_id.clone()),
             pid: lease.pid,
             starttime_ticks: lease.starttime_ticks,
             owner_nonce: lease.owner_nonce.clone(),
             last_commit_unix: None,
             last_state: None,
         })
+    }
+
+    pub fn new_idle(
+        data_root: impl AsRef<Path>,
+        lease: &ProfileLease,
+    ) -> Result<Self, RecorderError> {
+        let history = data_root.as_ref().join("history");
+        let metadata = fs::symlink_metadata(&history)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(RecorderError::Invalid(
+                "recorder state parent is not a regular directory".to_owned(),
+            ));
+        }
+        Ok(Self {
+            path: history.join("recorder-state.json"),
+            partition_id: None,
+            pid: lease.pid,
+            starttime_ticks: lease.starttime_ticks,
+            owner_nonce: lease.owner_nonce.clone(),
+            last_commit_unix: None,
+            last_state: None,
+        })
+    }
+
+    pub fn write_idle_no_account(&mut self) -> Result<(), RecorderError> {
+        self.last_commit_unix = None;
+        self.last_state = None;
+        self.write_document("idle_no_account", None, None)
     }
 
     pub fn write_degraded(
@@ -6825,6 +6979,77 @@ mod tests {
         .is_err());
         assert!(parse_account_authority(br#"{"tokens":{"account_id":1}}"#).is_err());
         assert!(parse_account_authority(br#"{"tokens":{"account_id":""}}"#).is_err());
+    }
+
+    #[test]
+    fn recorder_auth_state_requires_an_exact_consistent_account_shape() {
+        assert_eq!(
+            decode_codex_authentication_state(&json!({
+                "account": null,
+                "requiresOpenaiAuth": true
+            })),
+            Ok(CodexAuthenticationState::AuthRequired)
+        );
+        assert_eq!(
+            decode_codex_authentication_state(&json!({
+                "account": {
+                    "type": "chatgpt",
+                    "email": "current@example.com",
+                    "planType": "pro"
+                },
+                "requiresOpenaiAuth": false
+            })),
+            Ok(CodexAuthenticationState::Authenticated)
+        );
+        for inconsistent in [
+            json!({"account": null, "requiresOpenaiAuth": false}),
+            json!({
+                "account": {
+                    "type": "chatgpt",
+                    "email": "current@example.com",
+                    "planType": "pro"
+                },
+                "requiresOpenaiAuth": true
+            }),
+            json!({"account": null}),
+        ] {
+            assert!(decode_codex_authentication_state(&inconsistent).is_err());
+        }
+    }
+
+    #[test]
+    fn recorder_auth_state_idle_publication_has_no_account_or_generation_authority() {
+        let root = temp_root("idle-no-account-state");
+        fs::create_dir_all(root.join("history")).expect("history directory");
+        let lease = ProfileLease::acquire(&root).expect("profile lease");
+        let mut writer = RecorderStateWriter::new_idle(&root, &lease).expect("idle writer");
+        writer
+            .write_idle_no_account()
+            .expect("idle recorder publication");
+
+        let value: Value = serde_json::from_slice(
+            &fs::read(root.join("history/recorder-state.json")).expect("idle state"),
+        )
+        .expect("idle state JSON");
+        assert_eq!(value["write_state"], "idle_no_account");
+        for field in [
+            "partition_id_hash",
+            "data_generation",
+            "collector_epoch",
+            "cycle_seq",
+            "last_commit_unix",
+        ] {
+            assert!(value[field].is_null(), "{field}");
+        }
+        let boundary = RecorderStateWriter::read_previous_authority(&root)
+            .expect("idle previous authority")
+            .expect("idle boundary fingerprint");
+        assert!(boundary.partition_id.is_none());
+        assert_eq!(boundary.transition_fingerprint.len(), 64);
+
+        drop(writer);
+        drop(lease);
+        fs::remove_dir_all(root).expect("idle state cleanup");
     }
 
     #[test]
