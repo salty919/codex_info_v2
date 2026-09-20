@@ -330,9 +330,11 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    model pointは`Unknown`（当該metric欠測）、`Direct`（同じmodel keyの周期実測）、`Interpolated`、`Held`、
    `Rejected`を区別する。`Direct`だけがAPI/DB公開、集計、idle判定に利用でき、その他はUI presentation-onlyの
    破線または欠損表示とする。この破線はDBまたは取得記録の欠損・異常を示すNG表示であり、正常な実線の代替ではない。
-   保存済み累積ドルを実測anchorとし、ドル欠測点は`Unknown`のまま前後anchor間だけ補間し、右anchorが
-   なければ最後の実測ドルをperiod endまで水平holdする。現在または単一versionの単価で過去の累積token全量を
-   再評価して実測ドルを置換してはならない。
+   保存済み累積ドルを通常表示のanchorとするが、ドルはtokenから得る派生表示値でありidle authorityにはしない。
+   同じmodelの直接観測raw `total_tokens`が不変なのにドルだけが変化する場合はドル側の矛盾として、DB/API rawを
+   書き換えずread-time表示だけを区間左端のドル値へ水平補正する。ドル欠測点は、同じtoken不変run内に有限なドルanchorが
+   ある場合だけ同値へ補正し、それ以外は`Unknown`のまま前後anchor間だけ補間する。右anchorがなければ最後の実測ドルを
+   period endまで水平holdする。現在または単一versionの単価で過去の累積token全量を再評価して実測ドルを置換してはならない。
    rejected値の期間は直前baselineを細い破線holdし、accepted recoveryへ細い破線で接続する。period endまで復帰が
    なければ同じbaselineを終端まで破線holdする。これをraw tokenとraw dollarへ独立に適用し、tokenだけ異常なら
    token線だけ、dollarだけ異常ならdollar線だけを破線にする。他metricと他modelのaccepted実測は保持する。
@@ -344,8 +346,9 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    異常またはrecorder gapを跨がない区間だけを、そのmodelのcontiguous measuredとする。他modelの出現／消失、
    `confirmed`同士の共通modelはmodel集合の完全性だけを理由にこの区間を破線化しない。`legacy-unknown`が一方でも
    含まれる区間は表示専用で、連続実測・集計・idle authorityにはしない。正常な直接観測endpoint間はtimestamp差だけで
-   欠損へ降格せず、同値・増加とも同じ3px実線で結ぶ。exact 60秒の1 sampling slotだけが`unavailable`で、その前後が
-   same reset、同一model集合、全modelのraw token・表示metric値exact equal、raw Remaining bitwise equalかつgapなしなら、
+   欠損へ降格せず、利用中の同値・増加は同じ3px実線で結ぶ。後述の10分以上のconfirmed idleに含まれる同値区間だけは
+   idle bandと同じX範囲の1px水平実線へ分離する。exact 60秒の1 sampling slotだけが`unavailable`で、その前後が
+   same reset、同一model集合、全modelのraw token exact equal、raw Remaining bitwise equalかつgapなしなら、
    そのrowだけをread-time表示入力から除外して前後を3px実線で結ぶ。この限定補完はDB、history、API rawを変更せず、
    当該rowを直接観測または新anchorへ昇格させない。それ以外の明示欠測は1px破線とする。raw値は元時刻・元値の証拠として保持する一方、未使用と確定できない
    sampling由来の同値反復は表示geometryの必須通過点にせず、有効変化点間を単調かつovershootしないPCHIP
@@ -366,17 +369,19 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    `remaining_percent`がfiniteかつbitwise equalで、confirmed gap、欠測、直接観測値の矛盾がないことを必須とする。
    `legacy-unknown`、`unknown`、`unavailable`、欠損・補間・hold・smoothing・予測値をendpointまたは矛盾なしの証拠にはせず、
    lifecycle metadataを値変化または非変化のauthorityにしない。ただしexact 60秒の1 sampling slotだけが
-   `unavailable`で、その前後がsame reset、同一model集合、全modelのraw token・表示metric値exact equal、raw Remaining
+   `unavailable`で、その前後がsame reset、同一model集合、全modelのraw token exact equal、raw Remaining
    bitwise equalかつgapなしの場合は、周期不足／sampling jitterとしてそのrowだけをread-time表示入力から除外し、idle候補を
    分断しない。この限定補完はDB、history、API rawを書き換えず、`unavailable` rowをauthorityへ昇格させない。2 slot以上連続、
    前後値またはmodel集合の相違、reset境界、confirmed gap、`unknown`、その他の不完全rowは候補を分断する。
    rowのtimestamp不連続だけはgapまたは利用の証拠にせず、正常なdirect endpointが上記条件を満たすintervalを分断しない。上記条件を満たす連続runが10分以上の場合だけ、その
-   run全体をsession-levelのidle bandとして表示する。10分未満のrun、cadenceの数や観測点数だけでの確定、direct endpointを
+   run全体をsession-levelのidle bandとして表示し、同じX範囲にある全modelとRemainingを1pxの水平実線で表示する。
+   ドル表示は同じmodelのtoken不変runの左端ドル値へread-timeで補正し、ドルの変化・欠測・異常をidleの開始・分断・終了条件にしない。
+   bandだけ、または水平実線だけを作らない。10分未満のrun、cadenceの数や観測点数だけでの確定、direct endpointを
    欠く欠測時間だけのbridgeはidleへ昇格しない。画面幅やpixel数によって閾値を変えない。
    画面幅、pixel丸め、gridまたはsegment境界を理由にbandを削除・周期分断しない。
 
-   periodの和集合`U`に存在しても両endpointで未掲載のmodelはその区間へ創作しない。ドル値・単価・丸めは
-   未使用判定へ一切使用しない。token増加、片endpointだけのmodel欠落、model集合変更、unavailable、confirmed gap、
+   periodの和集合`U`に存在しても両endpointで未掲載のmodelはその区間へ創作しない。表示丸めまたは単価から未使用を
+   推測せず、ドルはidle authorityから完全に除外する。tokenの増加、片endpointだけのmodel欠落、model集合変更、unavailable、confirmed gap、
    token異常、Remaining変化、Remaining anomaly／terminal holdは未使用へ読み替えない。task lifecycleのactiveだけを
    使用の証拠にはせず、上記のexact equalなDirect値による判定を変更しない。Remainingがraw-nullまたは予測値の区間は、
    finite raw Remainingがないためidle候補にできない。
@@ -393,8 +398,8 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
 
    Remainingのaccepted raw値は全て元時刻・元値の証拠として保持し、token増分、task lifecycle、model availabilityで
    移動または置換しない。表示geometryでは、sampling由来の同値反復を未使用と確定できない区間の折れ点にせず、前後の
-   有効な変化点を非増加かつovershootしないPCHIP（Fritsch–Carlson）の3px実線で滑らかにつなぐ。confirmed idleの両端は
-   exactな水平境界として保持し、明示欠損・異常・reset/correctionの境界は平滑化で跨がない。変化量による別閾値は設けない。
+   有効な変化点を非増加かつovershootしないPCHIP（Fritsch–Carlson）の3px実線で滑らかにつなぐ。confirmed idleは
+   bandと同じX範囲をexactな1px水平実線として分離し、明示欠損・異常・reset/correctionの境界は平滑化で跨がない。変化量による別閾値は設けない。
    これはread-timeのgeometry生成だけであり、DB、history row、gap ledger、raw値を書き換えない。timestampの疎または
    sampling jitterだけでは欠損・予測へ降格しない。
 
@@ -407,8 +412,10 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    carryする。accepted raw Remainingが1点以上あれば、最後のeffective pointからexact period endまでを長さに
    関係なく時間幅のある破線holdとし、空白や同一X座標の垂直落下を作らない。`Remaining`のeffective値から
    model系列の値またはそのperiod tailを外挿しない。
-7. `G137-7`: model線は`Direct`同士のexact値の増加・不変を同じ3px実線とし、timestamp差だけでは破線化しない。raw列を
-   変更せず、未使用と確定できないsampling同値反復を折れ点から外して有効変化点間を単調PCHIPで滑らかにつなぐ。途中に
+7. `G137-7`: model線は`Direct`同士のexact値の増加と、10分未満またはsession-level idleではない不変区間を同じ3px実線とし、
+   confirmed idleに含まれる不変区間だけをbandと同じX範囲の1px水平実線へ分離する。timestamp差だけでは破線化しない。raw列を
+   変更せず、ドル表示では同じmodelのraw tokenが不変なrunを左端ドル値へ水平補正してから同じ線種規則を適用する。
+   未使用と確定できないsampling同値反復は折れ点から外して有効変化点間を単調PCHIPで滑らかにつなぐ。途中に
    当該modelのunknown rowがあるnearest-finite接続、限定補完条件を満たさないraw-null補間点の両側、
    monotonic hold、bounded/terminal hold、synthetic tailは1px破線とする。raw quota同値のcontiguous区間は
    model availabilityと独立した実測実線である。raw-nullの`Interpolated`だけを欠測破線とする。model線は当該modelの当該表示metric anomaly、Remaining線はRemaining

@@ -35,12 +35,14 @@ internal readonly record struct GraphLineProjection(
 
 /// <summary>Separate X-compatible paths for quiet and changing segments.</summary>
 internal readonly record struct GraphModelLineProjection(
+    GraphLineProjection Idle,
     GraphLineProjection Flat,
     GraphLineProjection Rising,
     GraphLineProjection Dashed);
 
 /// <summary>Separate solid and reference-only remaining-quota paths.</summary>
 internal readonly record struct GraphRemainingLineProjection(
+    GraphLineProjection Idle,
     GraphLineProjection Solid,
     GraphLineProjection Dashed);
 
@@ -53,11 +55,13 @@ internal readonly record struct GraphCanonicalLineProjection(
     string Path);
 
 internal readonly record struct GraphCanonicalModelLineProjection(
+    GraphCanonicalLineProjection Idle,
     GraphCanonicalLineProjection Flat,
     GraphCanonicalLineProjection Rising,
     GraphCanonicalLineProjection Dashed);
 
 internal readonly record struct GraphCanonicalRemainingLineProjection(
+    GraphCanonicalLineProjection Idle,
     GraphCanonicalLineProjection Solid,
     GraphCanonicalLineProjection Dashed);
 
@@ -220,6 +224,7 @@ internal static class GraphPlotProjection
     {
         var semantic = BuildModelLines(scene, values, smooth: true);
         return new GraphCanonicalModelLineProjection(
+            CanonicalizeLine(scene, semantic.Idle, scene.ModelMaximum, remaining: false, dashed: false),
             CanonicalizeLine(scene, semantic.Flat, scene.ModelMaximum, remaining: false, dashed: false),
             CanonicalizeLine(scene, semantic.Rising, scene.ModelMaximum, remaining: false, dashed: false),
             CanonicalizeLine(scene, semantic.Dashed, scene.ModelMaximum, remaining: false, dashed: true));
@@ -230,6 +235,7 @@ internal static class GraphPlotProjection
     {
         var semantic = BuildRemainingLines(scene, smooth: true);
         return new GraphCanonicalRemainingLineProjection(
+            CanonicalizeLine(scene, semantic.Idle, 100, remaining: true, dashed: false),
             CanonicalizeLine(scene, semantic.Solid, 100, remaining: true, dashed: false),
             CanonicalizeLine(scene, semantic.Dashed, 100, remaining: true, dashed: true));
     }
@@ -307,6 +313,7 @@ internal static class GraphPlotProjection
         {
             return new GraphRemainingLineProjection(
                 new GraphLineProjection([], []),
+                new GraphLineProjection([], []),
                 new GraphLineProjection([], []));
         }
 
@@ -317,9 +324,12 @@ internal static class GraphPlotProjection
         {
             return new GraphRemainingLineProjection(
                 new GraphLineProjection([], []),
+                new GraphLineProjection([], []),
                 new GraphLineProjection([], []));
         }
 
+        var idleX = new List<double>();
+        var idleY = new List<double>();
         var solidX = new List<double>();
         var solidY = new List<double>();
         var dashedX = new List<double>();
@@ -351,14 +361,28 @@ internal static class GraphPlotProjection
             }
             else
             {
-                smoothableIntervals.Add((
-                    left,
-                    right,
-                    scene.HasRemainingHardBreakBetween(
+                var dashed = scene.HasRemainingHardBreakBetween(
                         scene.Timestamps[left],
                         scene.Timestamps[right]) ||
                     crossesPrediction ||
-                    !measured));
+                    !measured;
+                if (!dashed && current == before && IsConfirmedIdleInterval(
+                        scene,
+                        scene.Timestamps[left],
+                        scene.Timestamps[right]))
+                {
+                    AppendSegment(
+                        idleX,
+                        idleY,
+                        scene.Timestamps[left],
+                        before,
+                        scene.Timestamps[right],
+                        current);
+                }
+                else
+                {
+                    smoothableIntervals.Add((left, right, dashed));
+                }
             }
         }
         if (smooth)
@@ -404,6 +428,7 @@ internal static class GraphPlotProjection
         }
 
         return new GraphRemainingLineProjection(
+            new GraphLineProjection(idleX, idleY),
             new GraphLineProjection(solidX, solidY),
             new GraphLineProjection(dashedX, dashedY));
     }
@@ -432,6 +457,8 @@ internal static class GraphPlotProjection
             throw new ArgumentException("A model series must match the graph timestamp count.", nameof(values));
         }
 
+        var idleX = new List<double>();
+        var idleY = new List<double>();
         var flatX = new List<double>();
         var flatY = new List<double>();
         var risingX = new List<double>();
@@ -482,14 +509,30 @@ internal static class GraphPlotProjection
                         scene.Timestamps[left],
                         scene.Timestamps[right]) ||
                     crossesPrediction;
-                smoothableIntervals.Add((
-                    left,
-                    right,
-                    dashed
-                        ? ProjectionStyle.Dashed
-                        : current == before
-                            ? ProjectionStyle.Flat
-                            : ProjectionStyle.Rising));
+                if (!dashed && current == before && IsConfirmedIdleInterval(
+                        scene,
+                        scene.Timestamps[left],
+                        scene.Timestamps[right]))
+                {
+                    AppendSegment(
+                        idleX,
+                        idleY,
+                        scene.Timestamps[left],
+                        before,
+                        scene.Timestamps[right],
+                        current);
+                }
+                else
+                {
+                    smoothableIntervals.Add((
+                        left,
+                        right,
+                        dashed
+                            ? ProjectionStyle.Dashed
+                            : current == before
+                                ? ProjectionStyle.Flat
+                                : ProjectionStyle.Rising));
+                }
             }
         }
         if (smooth)
@@ -539,10 +582,15 @@ internal static class GraphPlotProjection
         }
 
         return new GraphModelLineProjection(
+            new GraphLineProjection(idleX, idleY),
             new GraphLineProjection(flatX, flatY),
             new GraphLineProjection(risingX, risingY),
             new GraphLineProjection(dashedX, dashedY));
     }
+
+    private static bool IsConfirmedIdleInterval(GraphScene scene, double startAt, double endAt) =>
+        scene.IdleIntervals.Any(interval =>
+            startAt >= interval.StartAt && endAt <= interval.EndAt);
 
     /// <summary>Returns every evidence interval without a pixel-width filter.</summary>
     public static IReadOnlyList<GraphIdleInterval> BuildVisibleIdleIntervals(GraphScene scene)

@@ -571,6 +571,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
                 "timestamp": minute * 60,
                 "remaining_percent": 90.0,
                 "tokens": 100,
+                "dollars": 1.0 if minute < 6 else 2.0,
                 "task_active_since_previous": False,
             }
             for minute in range(11)
@@ -1147,6 +1148,114 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         self.assertEqual([99, 98, 97, 96, 95, 94, 93, 92, 91, 90], [
             marker["boundary"] for marker in dollars["remaining_markers"]
         ])
+
+    def test_legacy_raw_model_values_render_solid_without_idle_authority(self):
+        fixture = v3_fixture([
+            {
+                "timestamp": 0,
+                "remaining_percent": 100,
+                "tokens": 0,
+                "dollars": 0,
+                "models_complete": False,
+                "model_source": "legacy-unknown",
+            },
+            {
+                "timestamp": 60,
+                "remaining_percent": 90,
+                "tokens": 10,
+                "dollars": 1,
+                "models_complete": False,
+                "model_source": "legacy-unknown",
+            },
+        ], period_id="legacy-display-only")
+
+        segments, idle = oracle.build_expected(fixture)
+
+        self.assertEqual([], idle)
+        for metric in ("tokens", "dollars"):
+            self.assertEqual([[0, 60]], pairs(segments, "rising", metric, "SOL"))
+            self.assertEqual([], pairs(segments, "dashed", metric, "SOL"))
+
+    def test_idle_render_contract_separates_sustained_thin_solids_from_short_flats_and_missing(self):
+        def models(value, *, astra_dollars=None):
+            return [
+                {
+                    "model": name,
+                    "total_tokens": value * 100 + index,
+                    "total_dollars": (
+                        astra_dollars
+                        if name == "ASTRA" and astra_dollars is not None
+                        else value + index
+                    ),
+                }
+                for index, name in enumerate(("SOL", "TERRA", "LUNA", "ASTRA"))
+            ]
+
+        sustained = v3_fixture([
+            {"timestamp": 0, "remaining_percent": 90, "models": models(1)},
+            {"timestamp": 600, "remaining_percent": 90, "models": models(1)},
+        ])
+        segments, idle = oracle.build_expected(sustained)
+        self.assertEqual([{"start_at": 0, "end_at": 600}], idle)
+        for metric in ("dollars", "tokens"):
+            for series in ("SOL", "TERRA", "LUNA", "ASTRA"):
+                self.assertEqual([[0, 600]], pairs(segments, "idle", metric, series))
+            self.assertEqual([[0, 600]], pairs(segments, "idle"))
+        render = oracle.build_expected_render_contracts(sustained)
+        for metric in ("dollars", "tokens"):
+            self.assertEqual(1, render[metric]["styles"]["idle_width"])
+            self.assertEqual(1, render[metric]["styles"]["inferred_width"])
+            self.assertEqual(3, render[metric]["styles"]["flat_width"])
+            self.assertTrue(all(model["idle"] for model in render[metric]["models"]))
+            self.assertTrue(render[metric]["remaining"]["idle"])
+
+        short = v3_fixture([
+            {"timestamp": 0, "remaining_percent": 90, "models": models(1)},
+            {"timestamp": 540, "remaining_percent": 90, "models": models(1)},
+        ])
+        short_segments, short_idle = oracle.build_expected(short)
+        self.assertEqual([], short_idle)
+        self.assertEqual([[0, 540]], pairs(short_segments, "flat", "dollars", "SOL"))
+
+        changed_dollar = v3_fixture([
+            {"timestamp": 0, "remaining_percent": 90, "models": models(1)},
+            {
+                "timestamp": 600,
+                "remaining_percent": 90,
+                "models": models(1, astra_dollars=4.01),
+            },
+        ])
+        changed_segments, changed_idle = oracle.build_expected(changed_dollar)
+        self.assertEqual([{"start_at": 0, "end_at": 600}], changed_idle)
+        self.assertEqual(
+            [[0, 600]],
+            pairs(changed_segments, "idle", "dollars", "ASTRA"),
+        )
+        changed_render = oracle.build_expected_render_contracts(changed_dollar)
+        astra_idle = next(
+            model["idle"]
+            for model in changed_render["dollars"]["models"]
+            if model["series"] == "ASTRA"
+        )
+        self.assertTrue(astra_idle)
+        _, start_y, _, end_y = astra_idle.split()
+        self.assertEqual(start_y, end_y)
+
+        missing = v3_fixture([
+            {"timestamp": 0, "remaining_percent": 90, "models": models(1)},
+            {
+                "timestamp": 60,
+                "remaining_percent": None,
+                "models": None,
+                "models_complete": False,
+                "model_source": "unavailable",
+            },
+            {"timestamp": 120, "remaining_percent": 80, "models": models(2)},
+        ])
+        missing_segments, missing_idle = oracle.build_expected(missing)
+        self.assertEqual([], missing_idle)
+        self.assertEqual([[0, 120]], pairs(missing_segments, "dashed", "dollars", "SOL"))
+        self.assertEqual([[0, 120]], pairs(missing_segments, "dashed"))
 
 
 if __name__ == "__main__":

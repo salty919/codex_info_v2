@@ -758,7 +758,8 @@ public sealed class GraphPlotControlTests
 
         Assert.Equal([new GraphIdleInterval(2_000, 7_000, false)], visible);
         var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
-        Assert.Equal([1_000d, 1_060d, double.NaN, 2_000d, 7_000d], model.Flat.X);
+        Assert.Equal([1_000d, 1_060d], model.Flat.X);
+        Assert.Equal([2_000d, 7_000d], model.Idle.X);
         Assert.Equal([1_060d, 2_000d], model.Rising.X);
         Assert.Equal([7_000d, 87_400d], model.Dashed.X);
 
@@ -821,6 +822,110 @@ public sealed class GraphPlotControlTests
             GraphPlotControl.MeasuredFlatModelLineWidth);
         Assert.True(GraphPlotControl.InferredLineWidth < GraphPlotControl.MeasuredModelLineWidth);
         Assert.True(GraphPlotControl.InferredLineWidth < GraphPlotControl.MeasuredRemainingLineWidth);
+    }
+
+    [Fact]
+    public void IdleRenderContractSeparatesSustainedThinSolidsFromShortFlatsAndMissing()
+    {
+        static ApiHistorySample Complete(long timestamp, double? remaining, double value) =>
+            new(
+                timestamp,
+                2_000,
+                remaining,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.ConfirmedModelSource)
+            {
+                ModelsComplete = true,
+                TaskActiveSincePrevious = false,
+                ModelSamples = new[] { "SOL", "TERRA", "LUNA", "ASTRA" }
+                    .Select((name, index) => new ApiHistoryModelSample(
+                        name,
+                        null,
+                        null,
+                        null,
+                        value + index)
+                    {
+                        TotalTokens = (ulong)(value * 100) + (ulong)index,
+                    })
+                    .ToArray(),
+            };
+
+        var samples = new[]
+        {
+            Complete(0, 90, 1),
+            Complete(600, 90, 1),
+            Complete(660, 80, 2),
+            Complete(959, 80, 2),
+            Complete(1_200, 70, 3),
+            Complete(1_260, null, 3) with
+            {
+                ModelSource = ApiHistorySample.UnavailableModelSource,
+                ModelsComplete = false,
+                ModelSamples = [],
+            },
+            Complete(1_320, 60, 4),
+        };
+
+        foreach (var metric in new[] { GraphMetric.Dollars, GraphMetric.Tokens })
+        {
+            var scene = GraphScene.Create(samples, metric, 0, 1_320);
+            Assert.Equal([new GraphIdleInterval(0, 600, false)], scene.IdleIntervals);
+            foreach (var values in scene.ModelSeries.Values)
+            {
+                var lines = GraphPlotProjection.BuildModelLines(scene, values);
+                Assert.Equal([(0L, 600L)], SegmentPairs(lines.Idle));
+                Assert.Contains((660L, 959L), SegmentPairs(lines.Flat));
+                Assert.NotEmpty(lines.Rising.X);
+                Assert.NotEmpty(lines.Dashed.X);
+                Assert.All(lines.Idle.Y, value => Assert.Equal(lines.Idle.Y[0], value));
+            }
+            var remaining = GraphPlotProjection.BuildRemainingLines(scene);
+            Assert.Equal([(0L, 600L)], SegmentPairs(remaining.Idle));
+            Assert.Contains((660L, 959L), SegmentPairs(remaining.Solid));
+            Assert.NotEmpty(remaining.Dashed.X);
+            Assert.All(remaining.Idle.Y, value => Assert.Equal(remaining.Idle.Y[0], value));
+        }
+
+        var dollarChange = new[]
+        {
+            Complete(0, 90, 1),
+            Complete(600, 90, 1) with
+            {
+                ModelSamples = Complete(600, 90, 1).ModelSamples!
+                    .Select(model => model.Name == "ASTRA"
+                        ? model with { Dollars = model.Dollars + 0.01 }
+                        : model)
+                    .ToArray(),
+            },
+        };
+        var repricedDollarScene = GraphScene.Create(dollarChange, GraphMetric.Dollars, 0, 600);
+        Assert.Equal(
+            [new GraphIdleInterval(0, 600, false)],
+            repricedDollarScene.IdleIntervals);
+        Assert.Equal(repricedDollarScene.Astra[0], repricedDollarScene.Astra[1]);
+        var repricedDollarLines = GraphPlotProjection.BuildModelLines(
+            repricedDollarScene,
+            repricedDollarScene.Astra);
+        Assert.Equal([(0L, 600L)], SegmentPairs(repricedDollarLines.Idle));
+        Assert.Empty(repricedDollarLines.Rising.X);
+        Assert.All(
+            repricedDollarLines.Idle.Y,
+            value => Assert.Equal(repricedDollarLines.Idle.Y[0], value));
+
+        var repricedTokenScene = GraphScene.Create(dollarChange, GraphMetric.Tokens, 0, 600);
+        Assert.Equal(
+            [new GraphIdleInterval(0, 600, false)],
+            repricedTokenScene.IdleIntervals);
+
+        Assert.Equal(1f, GraphPlotControl.IdleLineWidth);
+        Assert.Equal(1f, GraphPlotControl.InferredLineWidth);
+        Assert.Equal(3f, GraphPlotControl.MeasuredModelLineWidth);
+        Assert.Equal(3f, GraphPlotControl.MeasuredRemainingLineWidth);
     }
 
     [Fact]
@@ -1445,7 +1550,7 @@ public sealed class GraphPlotControlTests
             var expectedSegments = modelSegments.GetProperty(model.Key);
             Assert.Equal(
                 SegmentPairs(expectedSegments.GetProperty("solid")),
-                SegmentPairs(lines.Flat, lines.Rising));
+                SegmentPairs(lines.Idle, lines.Flat, lines.Rising));
             Assert.Equal(
                 SegmentPairs(expectedSegments.GetProperty("dashed")),
                 SegmentPairs(lines.Dashed));
@@ -1455,7 +1560,7 @@ public sealed class GraphPlotControlTests
         var expectedRemainingSegments = expected.GetProperty("remaining_segments");
         Assert.Equal(
             SegmentPairs(expectedRemainingSegments.GetProperty("solid")),
-            SegmentPairs(remainingLines.Solid));
+            SegmentPairs(remainingLines.Idle, remainingLines.Solid));
         Assert.Equal(
             SegmentPairs(expectedRemainingSegments.GetProperty("dashed")),
             SegmentPairs(remainingLines.Dashed));
@@ -1630,6 +1735,7 @@ public sealed class GraphPlotControlTests
             foreach (var model in scene.ModelSeries.Where(pair => IsRenderableModel(pair.Key)))
             {
                 var lines = GraphPlotProjection.BuildModelLines(scene, model.Value);
+                AddLiveSegments(actualSegments, name, model.Key, "idle", lines.Idle);
                 AddLiveSegments(actualSegments, name, model.Key, "flat", lines.Flat);
                 AddLiveSegments(actualSegments, name, model.Key, "rising", lines.Rising);
                 AddLiveSegments(actualSegments, name, model.Key, "dashed", lines.Dashed);
@@ -1640,6 +1746,7 @@ public sealed class GraphPlotControlTests
         Assert.NotNull(tokenScene);
         Assert.Equal(dollarScene.IdleIntervals, tokenScene.IdleIntervals);
         var remaining = GraphPlotProjection.BuildRemainingLines(tokenScene);
+        AddLiveSegments(actualSegments, "remaining", "remaining", "idle", remaining.Idle);
         AddLiveSegments(actualSegments, "remaining", "remaining", "solid", remaining.Solid);
         AddLiveSegments(actualSegments, "remaining", "remaining", "dashed", remaining.Dashed);
         var orderedActual = OrderLiveSegments(actualSegments);
@@ -1887,7 +1994,7 @@ public sealed class GraphPlotControlTests
                 var expectedSegments = expected.GetProperty("model_segments").GetProperty(model!);
                 Assert.Equal(
                     SegmentPairs(expectedSegments.GetProperty("flat")),
-                    RelativeSegmentPairs(origin, lines.Flat));
+                    RelativeSegmentPairs(origin, lines.Idle, lines.Flat));
                 Assert.Equal(
                     SegmentPairs(expectedSegments.GetProperty("rising")),
                     RelativeSegmentPairs(origin, lines.Rising));
@@ -1911,7 +2018,7 @@ public sealed class GraphPlotControlTests
             var remaining = GraphPlotProjection.BuildRemainingLines(scene);
             Assert.Equal(
                 SegmentPairs(expected.GetProperty("remaining_segments").GetProperty("solid")),
-                RelativeSegmentPairs(origin, remaining.Solid));
+                RelativeSegmentPairs(origin, remaining.Idle, remaining.Solid));
             Assert.Equal(
                 SegmentPairs(expected.GetProperty("remaining_segments").GetProperty("dashed")),
                 RelativeSegmentPairs(origin, remaining.Dashed));
@@ -1988,7 +2095,7 @@ public sealed class GraphPlotControlTests
                 var prefix = metric == GraphMetric.Dollars ? "dollar" : "token";
                 if (fixture.TryGetProperty(prefix + "_flat", out var expectedFlat))
                 {
-                    Assert.Equal(SegmentPairs(expectedFlat), SegmentPairs(model.Flat));
+                    Assert.Equal(SegmentPairs(expectedFlat), SegmentPairs(model.Idle, model.Flat));
                 }
                 if (fixture.TryGetProperty(prefix + "_rising", out var expectedRising))
                 {
@@ -2065,12 +2172,12 @@ public sealed class GraphPlotControlTests
             var remainingLines = GraphPlotProjection.BuildRemainingLines(scene);
             Assert.Equal(
                 SegmentPairs(fixture.GetProperty("remaining_solid")),
-                SegmentPairs(remainingLines.Solid));
+                SegmentPairs(remainingLines.Idle, remainingLines.Solid));
             Assert.Equal(
                 SegmentPairs(fixture.GetProperty("remaining_dashed")),
                 SegmentPairs(remainingLines.Dashed));
             Assert.All(
-                SegmentPairs(remainingLines.Solid, remainingLines.Dashed),
+                SegmentPairs(remainingLines.Idle, remainingLines.Solid, remainingLines.Dashed),
                 segment => Assert.True(segment.StartAt < segment.EndAt));
             foreach (var interval in scene.IdleIntervals)
             {
@@ -2190,13 +2297,13 @@ public sealed class GraphPlotControlTests
 
         Assert.Equal(
             SegmentPairs(expected.GetProperty("model_segments").GetProperty("SOL").GetProperty("solid")),
-            SegmentPairs(model.Flat, model.Rising));
+            SegmentPairs(model.Idle, model.Flat, model.Rising));
         Assert.Equal(
             SegmentPairs(expected.GetProperty("model_segments").GetProperty("SOL").GetProperty("dashed")),
             SegmentPairs(model.Dashed));
         Assert.Equal(
             SegmentPairs(expected.GetProperty("remaining_segments").GetProperty("solid")),
-            SegmentPairs(remaining.Solid));
+            SegmentPairs(remaining.Idle, remaining.Solid));
         Assert.Equal(
             SegmentPairs(expected.GetProperty("remaining_segments").GetProperty("dashed")),
             SegmentPairs(remaining.Dashed));
@@ -2412,7 +2519,9 @@ public sealed class GraphPlotControlTests
         var scene = Scene(points);
         var effective = scene.Remaining;
         var rawLines = GraphPlotProjection.BuildRemainingLines(scene);
-        var rendered = GraphPlotProjection.BuildCanonicalRemainingLines(scene).Solid.Line;
+        var canonicalRemaining = GraphPlotProjection.BuildCanonicalRemainingLines(scene);
+        var rendered = canonicalRemaining.Solid.Line;
+        var renderedIdle = canonicalRemaining.Idle.Line;
 
         static double RenderedAt(GraphLineProjection line, double timestamp) =>
             line.X.Zip(line.Y)
@@ -2426,16 +2535,19 @@ public sealed class GraphPlotControlTests
         Assert.Equal(99d, effective[3]);
         Assert.Equal(98d, effective[4]);
         Assert.Equal(98d, effective[5]);
-        Assert.Equal([1_000d, 1_600d, 2_200d, 2_800d, 3_400d, 4_000d], rawLines.Solid.X);
-        Assert.Equal([100d, 100d, 99d, 99d, 98d, 98d], rawLines.Solid.Y);
+        Assert.Equal([1_000d, 1_600d, 2_200d, 2_800d, 3_400d], rawLines.Solid.X);
+        Assert.Equal([100d, 100d, 99d, 99d, 98d], rawLines.Solid.Y);
+        Assert.Equal([3_400d, 4_000d], rawLines.Idle.X);
+        Assert.Equal([98d, 98d], rawLines.Idle.Y);
         Assert.InRange(RenderedAt(rendered, 1_600), 99.000_001, 99.999_999);
         Assert.InRange(RenderedAt(rendered, 2_800), 98.000_001, 98.999_999);
-        Assert.Equal(98d, RenderedAt(rendered, 3_400), precision: 6);
-        Assert.Equal(98d, RenderedAt(rendered, 4_000), precision: 6);
+        Assert.Equal(98d, RenderedAt(renderedIdle, 3_400), precision: 6);
+        Assert.Equal(98d, RenderedAt(renderedIdle, 4_000), precision: 6);
         var idle = Assert.Single(scene.IdleIntervals);
         Assert.Equal(3_400, idle.StartAt);
         Assert.Equal(4_000, idle.EndAt);
         Assert.Equal(3f, GraphPlotControl.MeasuredRemainingLineWidth);
+        Assert.Equal(1f, GraphPlotControl.IdleLineWidth);
         Assert.Equal(1f, GraphPlotControl.InferredLineWidth);
 
         var activeTailPoints = new[]
@@ -2488,8 +2600,8 @@ public sealed class GraphPlotControlTests
             idleModelScene,
             idleModelScene.Sol);
         Assert.Single(idleModelScene.IdleIntervals);
-        Assert.Equal(80d, RenderedAt(idleModel.Flat.Line, 3_400), precision: 6);
-        Assert.Equal(80d, RenderedAt(idleModel.Flat.Line, 4_000), precision: 6);
+        Assert.Equal(80d, RenderedAt(idleModel.Idle.Line, 3_400), precision: 6);
+        Assert.Equal(80d, RenderedAt(idleModel.Idle.Line, 4_000), precision: 6);
     }
 
     [Fact]
@@ -2562,7 +2674,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Idle_ignores_a_dashed_dollar_interval_when_token_and_remaining_are_flat()
+    public void Idle_ignores_and_normalizes_a_dollar_only_anomaly()
     {
         var samples = Enumerable.Range(0, 31)
             .Select(minute => CompleteModelSample(
@@ -2575,8 +2687,13 @@ public sealed class GraphPlotControlTests
         var scene = GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 2_800);
         var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
 
-        Assert.NotEmpty(model.Dashed.X);
-        Assert.Equal([new GraphIdleInterval(1_000, 2_800, false)], scene.IdleIntervals);
+        Assert.Equal(
+            [new GraphIdleInterval(1_000, 2_800, false)],
+            scene.IdleIntervals);
+        Assert.NotEmpty(model.Idle.X);
+        Assert.Empty(model.Dashed.X);
+        Assert.Empty(model.Rising.X);
+        Assert.All(model.Idle.Y, value => Assert.Equal(model.Idle.Y[0], value));
     }
 
     [Fact]
@@ -2628,8 +2745,28 @@ public sealed class GraphPlotControlTests
         var recoveredRemaining = GraphPlotProjection.BuildRemainingLines(recovered);
 
         Assert.Equal([new GraphIdleInterval(0, 600, false)], recovered.IdleIntervals);
+        Assert.NotEmpty(recoveredModel.Idle.X);
+        Assert.Empty(recoveredModel.Flat.X);
         Assert.Empty(recoveredModel.Dashed.X);
+        Assert.NotEmpty(recoveredRemaining.Idle.X);
+        Assert.Empty(recoveredRemaining.Solid.X);
         Assert.Empty(recoveredRemaining.Dashed.X);
+
+        var repriced = Enumerable.Range(0, 11)
+            .Select(minute => minute switch
+            {
+                5 => Unavailable(300),
+                >= 6 => CompleteModelSample(minute * 60, 90, 101, 1),
+                _ => Direct(minute * 60),
+            })
+            .ToArray();
+        var repricedScene = GraphScene.Create(repriced, GraphMetric.Dollars, 0, 600);
+        Assert.Equal([new GraphIdleInterval(0, 600, false)], repricedScene.IdleIntervals);
+        var repricedModel = GraphPlotProjection.BuildModelLines(repricedScene, repricedScene.Sol);
+        Assert.NotEmpty(repricedModel.Idle.X);
+        Assert.Empty(repricedModel.Rising.X);
+        Assert.Empty(repricedModel.Dashed.X);
+        Assert.All(repricedModel.Idle.Y, value => Assert.Equal(repricedModel.Idle.Y[0], value));
 
         var changed = Enumerable.Range(0, 11)
             .Select(minute => minute switch
@@ -2661,8 +2798,10 @@ public sealed class GraphPlotControlTests
         var remaining = GraphPlotProjection.BuildRemainingLines(scene);
 
         Assert.Equal([new GraphIdleInterval(1_000, 2_800, false)], scene.IdleIntervals);
-        Assert.Equal(31, model.Flat.X.Count);
-        Assert.Equal(31, remaining.Solid.X.Count);
+        Assert.Equal(31, model.Idle.X.Count);
+        Assert.Empty(model.Flat.X);
+        Assert.Equal(31, remaining.Idle.X.Count);
+        Assert.Empty(remaining.Solid.X);
         Assert.Empty(model.Dashed.X);
         Assert.Empty(remaining.Dashed.X);
     }
@@ -3292,6 +3431,7 @@ public sealed class GraphPlotControlTests
                 var lines = GraphPlotProjection.BuildCanonicalModelLines(scene, pair.Value);
                 return new LiveModelRenderPaths(
                     pair.Key,
+                    lines.Idle.Path,
                     lines.Flat.Path,
                     lines.Rising.Path,
                     lines.Dashed.Path);
@@ -3392,6 +3532,7 @@ public sealed class GraphPlotControlTests
                 GraphPlotControl.TerraColorHex,
                 GraphPlotControl.LunaColorHex,
                 GraphPlotControl.AstraColorHex,
+                GraphPlotControl.IdleLineWidth,
                 GraphPlotControl.MeasuredFlatModelLineWidth,
                 GraphPlotControl.MeasuredModelLineWidth,
                 GraphPlotControl.InferredLineWidth,
@@ -3402,7 +3543,10 @@ public sealed class GraphPlotControlTests
                 "0.72"),
             idle,
             models,
-            new LiveRemainingRenderPaths(remaining.Solid.Path, remaining.Dashed.Path),
+            new LiveRemainingRenderPaths(
+                remaining.Idle.Path,
+                remaining.Solid.Path,
+                remaining.Dashed.Path),
             markers,
             remainingPoints);
     }
@@ -3420,11 +3564,12 @@ public sealed class GraphPlotControlTests
 
     private sealed record LiveModelRenderPaths(
         string Series,
+        string Idle,
         string Flat,
         string Rising,
         string Dashed);
 
-    private sealed record LiveRemainingRenderPaths(string Solid, string Dashed);
+    private sealed record LiveRemainingRenderPaths(string Idle, string Solid, string Dashed);
 
     private sealed record LiveRemainingMarker(string X, string YTop, int Boundary);
 
@@ -3460,6 +3605,7 @@ public sealed class GraphPlotControlTests
         string Terra,
         string Luna,
         string Astra,
+        float IdleWidth,
         float FlatWidth,
         float RisingWidth,
         float InferredWidth,

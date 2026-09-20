@@ -290,9 +290,6 @@ def _direct_sampling_signature(row: dict[str, Any]) -> tuple[Any, ...] | None:
             model.get("cached_input_tokens"),
             model.get("cache_write_input_tokens"),
             model.get("output_tokens"),
-            None
-            if model.get("total_dollars") is None
-            else _float_bits(float(model["total_dollars"])),
         )
         for model in sorted(models, key=lambda item: item["model"].encode("utf-8"))
     )
@@ -545,6 +542,67 @@ def _model_projection(
     return result
 
 
+def _normalize_dollars_from_token_identity(
+    rows: list[dict[str, Any]],
+    model: str,
+    dollars: list[ModelEvidence],
+    tokens: list[ModelEvidence],
+) -> list[ModelEvidence]:
+    """Correct only the presentation copy of a token-flat dollar run."""
+
+    normalized = list(dollars)
+    runs: list[list[int]] = []
+    run: list[int] = []
+    run_tokens: int | None = None
+    for index, (row, token) in enumerate(zip(rows, tokens, strict=True)):
+        raw_model = next(
+            (item for item in row.get("models") or [] if item.get("model") == model),
+            None,
+        )
+        raw_tokens = None if raw_model is None else raw_model.get("total_tokens")
+        direct_tokens = (
+            raw_tokens
+            if token.origin == "direct"
+            and token.reliable
+            and isinstance(raw_tokens, int)
+            and not isinstance(raw_tokens, bool)
+            and raw_tokens >= 0
+            else None
+        )
+        if direct_tokens is not None and direct_tokens == run_tokens:
+            run.append(index)
+        elif direct_tokens is not None:
+            if run:
+                runs.append(run)
+            run = [index]
+            run_tokens = direct_tokens
+        else:
+            if run:
+                runs.append(run)
+            run = []
+            run_tokens = None
+    if run:
+        runs.append(run)
+
+    for run in (candidate for candidate in runs if len(candidate) >= 2):
+        baseline = next(
+            (
+                normalized[index].value
+                for index in run
+                if normalized[index].origin == "direct"
+                and normalized[index].value is not None
+                and math.isfinite(normalized[index].value)
+                and normalized[index].value >= 0
+            ),
+            None,
+        )
+        if baseline is None:
+            continue
+        for index in run:
+            normalized[index] = ModelEvidence(baseline, True, "direct")
+    return normalized
+
+
 def _period_model_universe(
     samples: list[dict[str, Any]],
 ) -> tuple[str, ...]:
@@ -648,6 +706,7 @@ def _model_segments(
     metric: str,
     projection: list[ModelEvidence],
     gaps: list[dict[str, Any]],
+    idle_intervals: list[dict[str, int]],
 ) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
     exact = [
@@ -656,8 +715,7 @@ def _model_segments(
         if point.value is not None
         and math.isfinite(point.value)
         and point.value >= 0
-        and point.reliable
-        and point.origin == "direct"
+        and point.origin in {"direct", "legacy"}
     ]
     for previous, index in pairwise(exact):
         start, end = rows[previous]["timestamp"], rows[index]["timestamp"]
@@ -680,6 +738,9 @@ def _model_segments(
         style = (
             "dashed"
             if causes
+            else "idle"
+            if previous_value == current_value
+            and _is_idle_interval(start, end, idle_intervals)
             else "flat"
             if previous_value == current_value
             else "rising"
@@ -733,6 +794,7 @@ def _remaining_segments(
     evidence: list[RemainingEvidence],
     _token_models: dict[str, list[ModelEvidence]],
     gaps: list[dict[str, Any]],
+    idle_intervals: list[dict[str, int]],
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     anchors = [
@@ -761,7 +823,14 @@ def _remaining_segments(
                 "series": "remaining",
                 "start_at": before.timestamp,
                 "end_at": after.timestamp,
-                "style": "dashed" if causes else "solid",
+                "style": (
+                    "dashed"
+                    if causes
+                    else "idle"
+                    if before.effective == after.effective
+                    and _is_idle_interval(before.timestamp, after.timestamp, idle_intervals)
+                    else "solid"
+                ),
                 "causes": _causes(causes),
             }
         )
@@ -832,6 +901,19 @@ def _idle_intervals(
             for name in left_names
         ):
             continue
+        left_models = {model["model"]: model for model in left.get("models") or []}
+        right_models = {model["model"]: model for model in right.get("models") or []}
+        if any(
+            not isinstance(left_models[name].get("total_tokens"), int)
+            or isinstance(left_models[name].get("total_tokens"), bool)
+            or left_models[name]["total_tokens"] < 0
+            or not isinstance(right_models[name].get("total_tokens"), int)
+            or isinstance(right_models[name].get("total_tokens"), bool)
+            or right_models[name]["total_tokens"] < 0
+            or left_models[name]["total_tokens"] != right_models[name]["total_tokens"]
+            for name in left_names
+        ):
+            continue
         before = remaining.get(start)
         after = remaining.get(end)
         if (
@@ -861,24 +943,53 @@ def _idle_intervals(
     ]
 
 
+def _is_idle_interval(
+    start: int,
+    end: int,
+    idle_intervals: list[dict[str, int]],
+) -> bool:
+    return any(
+        start >= interval["start_at"] and end <= interval["end_at"]
+        for interval in idle_intervals
+    )
+
+
 def build_expected(fixture: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, int]]]:
     period, samples, gaps = _validate_fixture(fixture)
     rows = _without_recoverable_sampling_jitter(_rows_with_tail(period, samples), gaps)
     universe = _period_model_universe(samples)
     renderable_universe = tuple(model for model in universe if model in RENDERABLE_MODELS)
-    projections = {
-        metric: {model: _model_projection(rows, model, metric) for model in universe}
-        for metric in ("tokens", "dollars")
+    token_models = {
+        model: _model_projection(rows, model, "tokens") for model in universe
     }
+    dollar_models = {
+        model: _normalize_dollars_from_token_identity(
+            rows,
+            model,
+            _model_projection(rows, model, "dollars"),
+            token_models[model],
+        )
+        for model in universe
+    }
+    projections = {"tokens": token_models, "dollars": dollar_models}
     segments: list[dict[str, Any]] = []
-    token_models = projections["tokens"]
     remaining = _remaining_projection(period, rows, token_models, gaps)
-    segments.extend(_remaining_segments(samples, rows, remaining, token_models, gaps))
+    idle = _idle_intervals(period, rows, token_models, gaps)
+    segments.extend(_remaining_segments(samples, rows, remaining, token_models, gaps, idle))
     for metric in ("tokens", "dollars"):
         for model in renderable_universe:
-            segments.extend(_model_segments(rows, model, metric, projections[metric][model], gaps))
+            segments.extend(
+                _model_segments(
+                    rows,
+                    model,
+                    metric,
+                    projections[metric][model],
+                    gaps,
+                    idle,
+                )
+            )
     segments.sort(key=_segment_key)
-    return segments, _idle_intervals(period, rows, token_models, gaps)
+    return segments, idle
 
 
 def _canonical_coordinate(
@@ -954,6 +1065,8 @@ def _segment_is_smoothable(
     values: dict[int, float],
     remaining: bool,
 ) -> bool:
+    if segment["style"] == "idle":
+        return False
     causes = set(segment.get("causes", []))
     if "terminal_unobserved" in causes or any(
         cause in causes
@@ -1396,18 +1509,28 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
     token_models = {
         model: _model_projection(rows, model, "tokens") for model in universe
     }
+    dollar_models = {
+        model: _normalize_dollars_from_token_identity(
+            rows,
+            model,
+            _model_projection(rows, model, "dollars"),
+            token_models[model],
+        )
+        for model in universe
+    }
     remaining_evidence = _remaining_projection(period, rows, token_models, gaps)
     remaining_values = {
         point.timestamp: point.effective for point in remaining_evidence
     }
+    idle = _idle_intervals(period, rows, token_models, gaps)
     remaining_segments = _remaining_segments(
         samples,
         rows,
         remaining_evidence,
         token_models,
         gaps,
+        idle,
     )
-    idle = _idle_intervals(period, rows, token_models, gaps)
     idle_geometry = [
         {
             "start": f"{(interval['start_at'] - period['start_at']) / max(1, period['end_at'] - period['start_at']) * 100.0:.12f}",
@@ -1431,9 +1554,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
     ]
     contracts: dict[str, Any] = {}
     for metric in ("dollars", "tokens"):
-        projections = {
-            model: _model_projection(rows, model, metric) for model in universe
-        }
+        projections = token_models if metric == "tokens" else dollar_models
         renderable_projections = {
             model: projections[model] for model in renderable_universe
         }
@@ -1454,7 +1575,14 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
         ]
         models = []
         for model in renderable_universe:
-            segments = _model_segments(rows, model, metric, projections[model], gaps)
+            segments = _model_segments(
+                rows,
+                model,
+                metric,
+                projections[model],
+                gaps,
+                idle,
+            )
             values = {
                 row["timestamp"]: point.value
                 for row, point in zip(rows, projections[model], strict=True)
@@ -1463,6 +1591,9 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
             models.append(
                 {
                     "series": model,
+                    "idle": _canonical_path(
+                        segments, "idle", values, period, maximum, False, idle
+                    ),
                     "flat": _canonical_path(
                         segments, "flat", values, period, maximum, False, idle
                     ),
@@ -1526,6 +1657,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
                 "terra": "#5dc98a",
                 "luna": "#e6a23c",
                 "astra": "#ef6a6a",
+                "idle_width": 1,
                 "flat_width": 3,
                 "rising_width": 3,
                 "inferred_width": 1,
@@ -1538,6 +1670,15 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
             "idle_geometry": idle_geometry,
             "models": models,
             "remaining": {
+                "idle": _canonical_path(
+                    remaining_segments,
+                    "idle",
+                    remaining_values,
+                    period,
+                    100,
+                    True,
+                    idle,
+                ),
                 "solid": _canonical_path(
                     remaining_segments,
                     "solid",
@@ -1780,7 +1921,11 @@ def _actual_document(path: Path, platform: str, artifact: dict[str, Any]) -> dic
             raise EvidenceError(f"{platform} actual segment has an unexpected schema")
         metric, series, style = segment["metric"], segment["series"], segment["style"]
         start, end = segment["start_at"], segment["end_at"]
-        allowed_styles = {"solid", "dashed"} if metric == "remaining" else {"flat", "rising", "dashed"}
+        allowed_styles = (
+            {"idle", "solid", "dashed"}
+            if metric == "remaining"
+            else {"idle", "flat", "rising", "dashed"}
+        )
         if (
             metric not in METRIC_RANK
             or not isinstance(series, str)

@@ -39,10 +39,10 @@ period先頭、未索引範囲、矛盾または旧schemaは`null`とする。�
 旧`usage_history`のSOL/TERRA/LUNA列は、同じmodel keyの保存済み値である場合だけ`legacy-unknown`として表示投影へ渡す。異なるkeyの値をgeneric modelへmergeせず、旧schemaにない内訳や未掲載modelを0・推測値で補わない。`models_complete=true`は同じ直接観測で全モデル集合を確定できた場合だけ許可し、`model_source=confirmed`と非nullの`models`を必要とする。保持ログから一部modelだけを回収した場合は欠損metadataを返し、数値を生成しない。clientは直接観測の掲載modelだけを通常線で表示し、その他の補完線はpresentation-onlyとする。
 
 Graphでgray idleを表示するclientはsame `reset_at`のperiod内で、両endpointが`confirmed`かつ`models_complete=true`、同じmodel key集合、
-全raw `total_tokens`のexact equal、finite raw Remainingのbitwise equal、active/gap/直接観測値の矛盾なしを同時に要求する。
+全raw `total_tokens`のexact equal、finite raw Remainingのbitwise equal、gap/直接観測token値の矛盾なしを同時に要求する。ドルはtokenから得る派生表示値なのでidle判定へ入力しない。
 `legacy-unknown`、`unknown`、`unavailable`、補間・hold・smoothing・予測値はendpointまたは矛盾なしのidle authorityにしない。
 ただし完全directな同値endpoint間の数値なしmetadata rowとtimestamp sparsityだけは境界済み不変区間を否定しない。timestamp差からgapや利用を推測せず、上記条件を満たす連続10分以上のrunだけを
-gray表示する。詳しい表示判定は`G137-GRAPH-01`に従う。
+gray表示し、同じ区間の全表示系列を1px水平実線にする。同じmodelのtoken不変runでドルだけが変化または欠測した場合は、DB/API rawを変更せずread-time表示を左端の有限ドル値へ水平補正する。短い水平線はgray表示せず通常実線のままとする。詳しい表示判定は`G137-GRAPH-01`に従う。
 
 `API-DEPRECATION-01`: `/v1/details`、`/v2/details`、全表示情報を一体化した`/v3/details`は互換adapterである。互換期間中は同じatomic generationから生成し、既存field、値型、header allowlistを変更しない。新clientはv3 split resourceを優先し、`/v3/current`がexact 404の場合だけ`/v3/details`、さらにexact 404の場合だけv2、v1へfallbackし、世代をmergeしない。廃止日は未決定であり、決定前に`Sunset`を送らない。将来の削除対象は旧details route、adapter、client fallbackだけで、Session collector、SQLite writer、domain model、`/health`は対象外とする。
 

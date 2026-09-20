@@ -301,7 +301,7 @@ component順や表示所有者を変更しない。
 
   | 入力状態 | 表示契約 |
   | --- | --- |
-  | 同一periodの実測累積が増加／不変 | 増加・不変とも同じ3px実線。sampling由来の同値反復を未使用確定区間以外の折れ点にせず、有効な変化点間を単調PCHIPで滑らかにつなぐ。confirmed idleだけはexactな水平線とし、未使用帯は全modelとRemainingを別途判定する |
+  | 同一periodの実測累積が増加／不変 | 増加と未使用確定でない不変は3px実線。sampling由来の同値反復を折れ点にせず、有効な変化点間を単調PCHIPで滑らかにつなぐ。confirmed idleだけはbandと同じX範囲の1px水平実線へ分離する |
   | 当該model値はログ実測、全model集合は不完全 | 直接観測(`confirmed`)の値だけを保持する。未掲載modelは欠損metadataだけとし、数値を作らない |
   | 他modelの出現／消失、または`confirmed`と`legacy-unknown`の切替 | `confirmed`の同じmodel keyは通常線を維持する。`legacy-unknown`は保存済み同じkeyの値だけを表示し、集計・予測・idle判定には使わない。新規modelは最初の直接観測時刻から開始し、消失modelのholdは表示専用とする |
   | 正常な直接観測点のtimestampだけが疎 | timestamp差だけでは欠損化せず、同値・増加とも3px実線で結ぶ。明示的なunavailable、confirmed gap、異常とは分離する（`G137-4`,`G137-7`） |
@@ -310,22 +310,22 @@ component順や表示所有者を変更しない。
   | period内の最初の既知点 | 0からの斜線を捏造せず、その値・時刻から開始する |
   | 60秒以内のreset alias／正式reset境界 | 前者は同一periodへ正規化し、後者は別periodとして混ぜない |
   | 確認済み0／model行なし | 前者だけ0として描き、後者は未知として数値・線を作らない |
-  | ドル／token切替 | 同じ観測時刻列を使い、単位と値だけを切り替える |
+  | ドル／token切替 | 同じ観測時刻列を使い、単位と値だけを切り替える。ドルはtokenから得る派生表示値でありidle authorityにはしない。同じmodelのraw token不変runでドルだけが変化または欠測した場合は、DB/API rawを変えず左端の有限ドル値へread-timeで水平補正する |
 
   アイドル帯はsame `reset_at`のperiod内で、両endpointが`confirmed`かつ`models_complete=true`、同じmodel key集合、全raw
-  `total_tokens`がexact equal、raw Remainingがfiniteかつbitwise equalであり、confirmed gap、欠測、直接観測値の矛盾が
+  `total_tokens`がexact equal、raw Remainingがfiniteかつbitwise equalであり、confirmed gap、token／Remainingの欠測、直接観測値の矛盾が
   ない区間だけを候補にする。`legacy-unknown`、`unknown`、`unavailable`、欠損・補間・hold・smoothing・予測値はendpointまたは
   矛盾なしのauthorityにしない。単発を含む`unavailable`、unknown、その他の不完全rowは分断する。task lifecycleだけは
   値変化のauthorityにせず、exact equalなDirect値をactive metadataだけで使用済みに変更しない。timestamp不連続だけは
-  gapまたは利用の証拠にせず、正常なdirect endpointが上記条件を満たすintervalを分断しない。上記条件を満たす連続10分以上のrunだけをgray表示し、観測点数やdirect endpointを欠く欠測時間だけで確定しない。
+  gapまたは利用の証拠にせず、正常なdirect endpointが上記条件を満たすintervalを分断しない。ドルの変化・欠測・異常はidleの開始・分断・終了条件にしない。上記条件を満たす連続10分以上のrunだけをgray表示し、同じX範囲の全modelとRemainingを1px水平実線にする。観測点数やdirect endpointを欠く欠測時間だけで確定しない。
   10分は画面幅に依存しない意味閾値とし、pixel幅filter、最小表示幅、gridまたはsegment境界によって削除・周期分断しない。
   Remainingは`G137-6`に従い、accepted raw値を元時刻・元値の証拠として保持し、token増分またはtask lifecycleでraw値を
   移動しない。表示geometryでは未使用と確定できないsampling由来の同値反復を折れ点にせず、有効な変化点間を単調PCHIPの
-  3px実線で滑らかにつなぐ。confirmed idleの両端だけはexactな水平境界とする。raw-null、unavailable、confirmed gap、異常、
+  3px実線で滑らかにつなぐ。confirmed idleだけはbandと同じX範囲のexactな1px水平実線として分離する。raw-null、unavailable、confirmed gap、異常、
   terminal holdだけを1px破線の予測とし、導出値をanchorへ昇格させずAPI/DBへ書き戻さない。
   `Remaining`のeffective値からmodel系列の値またはそのperiod tailを外挿しない。
   raw-null補間、gap、異常、終端hold等の欠測・予測の破線は
-  X版では1px、Windows版では1px相当とする。model実測は増加・不変とも3px、Remaining実測も3pxとし、1px破線だけを欠測・予測に使う。
+  X版では1px、Windows版では1px相当とする。通常のmodel／Remaining実測は3px、confirmed idle実線は1px、欠測・予測破線は1pxとし、solid/dashedで意味を区別する。
   破線は幅の広いplotでも切替点が判別できる短く密な周期とし、長い線片・隙間で通常線に見せない。
 
   plotの描画layerは`background/grid → idle band → series/labels`とする。idle bandは最終合成色`#1A2838`を

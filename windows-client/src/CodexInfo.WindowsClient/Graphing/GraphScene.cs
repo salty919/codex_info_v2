@@ -272,6 +272,10 @@ public sealed class GraphScene
         // models still participate in exact token and idle evidence.
         var dollarProjection = BuildAcceptedModelProjection(samples, allModelNames, GraphMetric.Dollars);
         var tokenProjection = BuildAcceptedModelProjection(samples, allModelNames, GraphMetric.Tokens);
+        dollarProjection = NormalizeDollarProjectionFromTokenIdentity(
+            samples,
+            dollarProjection,
+            tokenProjection);
         var semanticProjection = metric == GraphMetric.Dollars
             ? dollarProjection
             : tokenProjection;
@@ -382,7 +386,12 @@ public sealed class GraphScene
             displayProjection.CorrectionStartsByModel,
             correctionStarts,
             tokenCorrectionStarts,
-            BuildConfirmedIdleIntervals(samples, start, end, normalizedGaps),
+            BuildConfirmedIdleIntervals(
+                samples,
+                start,
+                end,
+                normalizedGaps,
+                tokenProjection),
             maximum);
     }
 
@@ -452,14 +461,8 @@ public sealed class GraphScene
             pair.First.InputTokens == pair.Second.InputTokens &&
             pair.First.CachedInputTokens == pair.Second.CachedInputTokens &&
             pair.First.CacheWriteInputTokens == pair.Second.CacheWriteInputTokens &&
-            pair.First.OutputTokens == pair.Second.OutputTokens &&
-            NullableDoubleBitsEqual(pair.First.TotalDollars, pair.Second.TotalDollars));
+            pair.First.OutputTokens == pair.Second.OutputTokens);
     }
-
-    private static bool NullableDoubleBitsEqual(double? left, double? right) =>
-        left is null && right is null ||
-        left is double leftValue && right is double rightValue &&
-            RemainingBitsEqual(leftValue, rightValue);
 
     private static double[] SeriesOrMissing(
         IReadOnlyDictionary<string, IReadOnlyList<double>> series,
@@ -689,6 +692,130 @@ public sealed class GraphScene
             correctionStarts);
     }
 
+    private static ModelProjection NormalizeDollarProjectionFromTokenIdentity(
+        IReadOnlyList<ApiHistorySample> samples,
+        ModelProjection dollars,
+        ModelProjection tokens)
+    {
+        var valueArrays = dollars.Values.ToDictionary(
+            pair => pair.Key,
+            pair => pair.Value.ToArray(),
+            StringComparer.Ordinal);
+        var reliabilityArrays = dollars.Reliability.ToDictionary(
+            pair => pair.Key,
+            pair => pair.Value.ToArray(),
+            StringComparer.Ordinal);
+        var lineReliabilityArrays = dollars.LineReliability.ToDictionary(
+            pair => pair.Key,
+            pair => pair.Value.ToArray(),
+            StringComparer.Ordinal);
+        var originArrays = dollars.Origins.ToDictionary(
+            pair => pair.Key,
+            pair => pair.Value.ToArray(),
+            StringComparer.Ordinal);
+        var correctionSets = dollars.CorrectionStartsByModel.ToDictionary(
+            pair => pair.Key,
+            pair => pair.Value.ToHashSet(),
+            StringComparer.Ordinal);
+
+        foreach (var name in valueArrays.Keys)
+        {
+            if (!tokens.Origins.TryGetValue(name, out var tokenOrigins))
+            {
+                continue;
+            }
+            var values = valueArrays[name];
+            var reliable = reliabilityArrays[name];
+            var lineReliable = lineReliabilityArrays[name];
+            var origins = originArrays[name];
+            var runs = new List<List<int>>();
+            var run = new List<int>();
+            ulong? runTokens = null;
+            for (var index = 0; index < samples.Count; index++)
+            {
+                var rawTokens = tokenOrigins[index] is GraphModelOrigin.Direct
+                    ? PublishedModels(samples[index])
+                        .FirstOrDefault(model => model.Name == name)
+                        ?.TotalTokens
+                    : null;
+                if (rawTokens is ulong current && runTokens == current)
+                {
+                    run.Add(index);
+                }
+                else if (rawTokens is ulong next)
+                {
+                    if (run.Count > 0)
+                    {
+                        runs.Add(run);
+                    }
+                    run = [index];
+                    runTokens = next;
+                }
+                else
+                {
+                    if (run.Count > 0)
+                    {
+                        runs.Add(run);
+                    }
+                    run = [];
+                    runTokens = null;
+                }
+            }
+            if (run.Count > 0)
+            {
+                runs.Add(run);
+            }
+
+            foreach (var tokenFlatRun in runs.Where(candidate => candidate.Count >= 2))
+            {
+                var baselineIndex = tokenFlatRun.FirstOrDefault(
+                    index => origins[index] is GraphModelOrigin.Direct &&
+                        double.IsFinite(values[index]) &&
+                        values[index] >= 0,
+                    -1);
+                if (baselineIndex < 0)
+                {
+                    continue;
+                }
+                var baseline = values[baselineIndex];
+                foreach (var index in tokenFlatRun)
+                {
+                    values[index] = baseline;
+                    reliable[index] = true;
+                    lineReliable[index] = true;
+                    origins[index] = GraphModelOrigin.Direct;
+                    correctionSets[name].Remove(samples[index].Timestamp);
+                }
+            }
+        }
+
+        var correctionStarts = correctionSets.Values
+            .SelectMany(set => set)
+            .ToHashSet();
+        return new ModelProjection(
+            valueArrays.ToDictionary(
+                pair => pair.Key,
+                pair => (IReadOnlyList<double>)pair.Value,
+                StringComparer.Ordinal),
+            reliabilityArrays.ToDictionary(
+                pair => pair.Key,
+                pair => (IReadOnlyList<bool>)pair.Value,
+                StringComparer.Ordinal),
+            lineReliabilityArrays.ToDictionary(
+                pair => pair.Key,
+                pair => (IReadOnlyList<bool>)pair.Value,
+                StringComparer.Ordinal),
+            originArrays.ToDictionary(
+                pair => pair.Key,
+                pair => (IReadOnlyList<GraphModelOrigin>)pair.Value,
+                StringComparer.Ordinal),
+            correctionSets.ToDictionary(
+                pair => pair.Key,
+                pair => (IReadOnlySet<long>)pair.Value,
+                StringComparer.Ordinal),
+            correctionStarts);
+    }
+
     /// <summary>
     /// Prevent a sparse inferred value from moving a cumulative display
     /// backwards after a legacy observation. Direct values remain the only
@@ -736,7 +863,7 @@ public sealed class GraphScene
         origin is GraphModelOrigin.Direct;
 
     private static bool ModelOriginLineIsExact(GraphModelOrigin origin) =>
-        origin is GraphModelOrigin.Direct;
+        origin is GraphModelOrigin.Direct or GraphModelOrigin.LegacyUnknown;
 
     private static double RawModelValue(ApiHistorySample sample, string name, GraphMetric metric)
     {
@@ -864,7 +991,8 @@ public sealed class GraphScene
         IReadOnlyList<ApiHistorySample> samples,
         long periodStart,
         long periodEnd,
-        IReadOnlyList<GraphConfirmedGap> confirmedGaps)
+        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
+        ModelProjection tokenProjection)
     {
         if (periodEnd <= periodStart || samples.Count < 2)
         {
@@ -876,6 +1004,7 @@ public sealed class GraphScene
         {
             if (TryGetDirectModelVector(samples[index], out var vector) &&
                 vector.Count > 0 &&
+                AcceptedIdleVectorAt(index, vector, tokenProjection) &&
                 double.IsFinite(samples[index].RemainingPercent ?? double.NaN))
             {
                 direct.Add((index, vector));
@@ -902,7 +1031,9 @@ public sealed class GraphScene
                     before.Index,
                     after.Index,
                     left.ResetAt,
-                    before.Vector))
+                    before.Vector,
+                    left.RemainingPercent.Value,
+                    tokenProjection))
             {
                 continue;
             }
@@ -941,7 +1072,9 @@ public sealed class GraphScene
         int before,
         int after,
         long resetAt,
-        IReadOnlyDictionary<string, DirectModelValue> baseline)
+        IReadOnlyDictionary<string, DirectModelValue> baseline,
+        double baselineRemaining,
+        ModelProjection tokenProjection)
     {
         for (var index = before + 1; index <= after; index++)
         {
@@ -953,7 +1086,11 @@ public sealed class GraphScene
             }
 
             if (sample.ResetAt != resetAt ||
+                sample.RemainingPercent is not double remaining ||
+                !double.IsFinite(remaining) ||
+                !RemainingBitsEqual(baselineRemaining, remaining) ||
                 !TryGetDirectModelVector(sample, out var vector) ||
+                !AcceptedIdleVectorAt(index, vector, tokenProjection) ||
                 !TokenVectorsEqual(baseline, vector))
             {
                 return true;
@@ -962,6 +1099,15 @@ public sealed class GraphScene
 
         return false;
     }
+
+    private static bool AcceptedIdleVectorAt(
+        int index,
+        IReadOnlyDictionary<string, DirectModelValue> vector,
+        ModelProjection tokenProjection) =>
+        vector.Keys.All(name =>
+            tokenProjection.Origins.TryGetValue(name, out var tokenOrigins) &&
+            index < tokenOrigins.Count &&
+            tokenOrigins[index] is GraphModelOrigin.Direct);
 
     private static bool TryGetDirectModelVector(
         ApiHistorySample sample,
@@ -984,13 +1130,12 @@ public sealed class GraphScene
         var result = new Dictionary<string, DirectModelValue>(StringComparer.Ordinal);
         foreach (var model in models)
         {
-            if (model.TotalTokens is not ulong totalTokens ||
-                model.TotalDollars is double dollars && !double.IsFinite(dollars))
+            if (model.TotalTokens is not ulong totalTokens)
             {
                 vector = new Dictionary<string, DirectModelValue>(StringComparer.Ordinal);
                 return false;
             }
-            if (!result.TryAdd(model.Name, new DirectModelValue(totalTokens, model.TotalDollars)))
+            if (!result.TryAdd(model.Name, new DirectModelValue(totalTokens)))
             {
                 vector = new Dictionary<string, DirectModelValue>(StringComparer.Ordinal);
                 return false;
@@ -1267,7 +1412,7 @@ public sealed class GraphScene
             names.SelectMany(name => CorrectionStartsByModel[name]).ToHashSet());
     }
 
-    private readonly record struct DirectModelValue(ulong TotalTokens, double? TotalDollars);
+    private readonly record struct DirectModelValue(ulong TotalTokens);
 
     private sealed class Utf8ModelNameComparer : IComparer<string>
     {
