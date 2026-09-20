@@ -2597,20 +2597,20 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Idle_does_not_cross_finite_modelless_metadata_row()
+    public void Idle_recovers_only_a_single_bounded_unavailable_sampling_slot()
     {
-        static ApiHistorySample Metadata(long timestamp) =>
+        static ApiHistorySample Unavailable(long timestamp) =>
             new(
                 timestamp,
-                1_000,
-                90,
+                2_000,
                 null,
                 null,
                 null,
                 null,
                 null,
                 null,
-                ApiHistorySample.LegacyUnknownModelSource)
+                null,
+                ApiHistorySample.UnavailableModelSource)
             {
                 ModelsComplete = false,
                 TaskActiveSincePrevious = false,
@@ -2620,10 +2620,33 @@ public sealed class GraphPlotControlTests
         static ApiHistorySample Direct(long timestamp) =>
             CompleteModelSample(timestamp, 90, 100, 1);
 
-        var samples = new[] { Direct(0), Metadata(900), Direct(1_800) };
-        var scene = GraphScene.Create(samples, GraphMetric.Dollars, 0, 1_800);
+        var singleSlot = Enumerable.Range(0, 11)
+            .Select(minute => minute == 5 ? Unavailable(300) : Direct(minute * 60))
+            .ToArray();
+        var recovered = GraphScene.Create(singleSlot, GraphMetric.Dollars, 0, 600);
+        var recoveredModel = GraphPlotProjection.BuildModelLines(recovered, recovered.Sol);
+        var recoveredRemaining = GraphPlotProjection.BuildRemainingLines(recovered);
 
-        Assert.Empty(scene.IdleIntervals);
+        Assert.Equal([new GraphIdleInterval(0, 600, false)], recovered.IdleIntervals);
+        Assert.Empty(recoveredModel.Dashed.X);
+        Assert.Empty(recoveredRemaining.Dashed.X);
+
+        var changed = Enumerable.Range(0, 11)
+            .Select(minute => minute switch
+            {
+                5 => Unavailable(300),
+                >= 6 => CompleteModelSample(minute * 60, 90, 101, 2),
+                _ => Direct(minute * 60),
+            })
+            .ToArray();
+        Assert.Empty(GraphScene.Create(changed, GraphMetric.Dollars, 0, 600).IdleIntervals);
+
+        var longGap = GraphScene.Create(
+            [Direct(0), Unavailable(900), Direct(1_800)],
+            GraphMetric.Dollars,
+            0,
+            1_800);
+        Assert.Empty(longGap.IdleIntervals);
     }
 
     [Fact]
