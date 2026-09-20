@@ -983,7 +983,7 @@ public sealed class GraphScene
     }
 
     /// <summary>
-    /// Computes idle bands from the recorder's direct raw observations. The
+    /// Computes idle bands from lossless raw observations. The
     /// renderer may add holds, smoothing, and interpolation, but those values
     /// are intentionally absent from this authority path.
     /// </summary>
@@ -1002,7 +1002,7 @@ public sealed class GraphScene
         var direct = new List<(int Index, IReadOnlyDictionary<string, DirectModelValue> Vector)>();
         for (var index = 0; index < samples.Count; index++)
         {
-            if (TryGetDirectModelVector(samples[index], out var vector) &&
+            if (TryGetIdleModelVector(samples[index], out var vector) &&
                 vector.Count > 0 &&
                 AcceptedIdleVectorAt(index, vector, tokenProjection) &&
                 double.IsFinite(samples[index].RemainingPercent ?? double.NaN))
@@ -1026,7 +1026,7 @@ public sealed class GraphScene
                     confirmedGaps,
                     left.Timestamp,
                     right.Timestamp) ||
-                HasDirectIdleContradiction(
+                HasIdleContradiction(
                     samples,
                     before.Index,
                     after.Index,
@@ -1067,7 +1067,7 @@ public sealed class GraphScene
             .ToArray();
     }
 
-    private static bool HasDirectIdleContradiction(
+    private static bool HasIdleContradiction(
         IReadOnlyList<ApiHistorySample> samples,
         int before,
         int after,
@@ -1079,17 +1079,11 @@ public sealed class GraphScene
         for (var index = before + 1; index <= after; index++)
         {
             var sample = samples[index];
-            if (sample.ModelSource != ApiHistorySample.ConfirmedModelSource ||
-                !sample.ModelsComplete)
-            {
-                return true;
-            }
-
             if (sample.ResetAt != resetAt ||
                 sample.RemainingPercent is not double remaining ||
                 !double.IsFinite(remaining) ||
                 !RemainingBitsEqual(baselineRemaining, remaining) ||
-                !TryGetDirectModelVector(sample, out var vector) ||
+                !TryGetIdleModelVector(sample, out var vector) ||
                 !AcceptedIdleVectorAt(index, vector, tokenProjection) ||
                 !TokenVectorsEqual(baseline, vector))
             {
@@ -1107,7 +1101,41 @@ public sealed class GraphScene
         vector.Keys.All(name =>
             tokenProjection.Origins.TryGetValue(name, out var tokenOrigins) &&
             index < tokenOrigins.Count &&
-            tokenOrigins[index] is GraphModelOrigin.Direct);
+            ModelOriginLineIsExact(tokenOrigins[index]));
+
+    private static bool TryGetIdleModelVector(
+        ApiHistorySample sample,
+        out IReadOnlyDictionary<string, DirectModelValue> vector)
+    {
+        if (sample.ModelSource == ApiHistorySample.ConfirmedModelSource && sample.ModelsComplete)
+        {
+            return TryGetDirectModelVector(sample, out vector);
+        }
+
+        vector = new Dictionary<string, DirectModelValue>(StringComparer.Ordinal);
+        if (sample.IsSyntheticTail ||
+            sample.ModelSource != ApiHistorySample.LegacyUnknownModelSource)
+        {
+            return false;
+        }
+
+        var result = new Dictionary<string, DirectModelValue>(StringComparer.Ordinal);
+        foreach (var model in PublishedModels(sample))
+        {
+            if (model.TotalTokens is not ulong totalTokens ||
+                !result.TryAdd(model.Name, new DirectModelValue(totalTokens)))
+            {
+                return false;
+            }
+        }
+        if (result.Count == 0)
+        {
+            return false;
+        }
+
+        vector = result;
+        return true;
+    }
 
     private static bool TryGetDirectModelVector(
         ApiHistorySample sample,

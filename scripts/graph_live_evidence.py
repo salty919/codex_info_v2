@@ -863,6 +863,15 @@ def _idle_intervals(
     token_models: dict[str, list[ModelEvidence]],
     gaps: list[dict[str, Any]],
 ) -> list[dict[str, int]]:
+    def raw_idle_origin(row: dict[str, Any], point: ModelEvidence) -> bool:
+        if row.get("synthetic", False):
+            return False
+        if row.get("model_source") == "confirmed" and row.get("models_complete") is True:
+            return point.origin == "direct" and point.reliable
+        if row.get("model_source") == "legacy-unknown":
+            return point.origin == "legacy" and point.value is not None
+        return False
+
     remaining = {
         point.timestamp: point
         for point in _remaining_projection(period, rows, token_models, gaps)
@@ -876,14 +885,7 @@ def _idle_intervals(
             continue
         if _hard_break(start, end, gaps):
             continue
-        if (
-            left.get("synthetic", False)
-            or right.get("synthetic", False)
-            or left.get("model_source") != "confirmed"
-            or right.get("model_source") != "confirmed"
-            or left.get("models_complete") is not True
-            or right.get("models_complete") is not True
-        ):
+        if left.get("synthetic", False) or right.get("synthetic", False):
             continue
         left_names = frozenset(model["model"] for model in left.get("models") or [])
         right_names = frozenset(model["model"] for model in right.get("models") or [])
@@ -893,10 +895,8 @@ def _idle_intervals(
             name not in token_models
             or index >= len(token_models[name])
             or index + 1 >= len(token_models[name])
-            or token_models[name][index].origin != "direct"
-            or token_models[name][index + 1].origin != "direct"
-            or not token_models[name][index].reliable
-            or not token_models[name][index + 1].reliable
+            or not raw_idle_origin(left, token_models[name][index])
+            or not raw_idle_origin(right, token_models[name][index + 1])
             or token_models[name][index].value != token_models[name][index + 1].value
             for name in left_names
         ):
@@ -1251,6 +1251,16 @@ def _canonical_smooth_path(
     idle_intervals: list[dict[str, int]],
 ) -> str:
     commands: list[str] = []
+    last_end: tuple[float, float] | None = None
+
+    def append_solid(start: tuple[float, float], end: tuple[float, float]) -> None:
+        nonlocal last_end
+        if last_end == start:
+            commands.append(f"L{end[0]:.2f} {end[1]:.2f}")
+        else:
+            commands.append(_canonical_segment(start, end))
+        last_end = end
+
     run_start = 0
     while run_start < len(segments):
         if not _segment_is_smoothable(segments[run_start], values, remaining):
@@ -1275,7 +1285,9 @@ def _canonical_smooth_path(
                 if style == "dashed":
                     commands.extend(_canonical_dashes(start, end))
                 else:
-                    commands.append(_canonical_segment(start, end))
+                    append_solid(start, end)
+            elif style != "dashed":
+                last_end = None
             run_start += 1
             continue
         run_end = run_start + 1
@@ -1305,8 +1317,11 @@ def _canonical_smooth_path(
             preserved_timestamps,
             preserved_indices,
         )
+        last_end = None
         for interval, segment in enumerate(run):
             if segment["style"] != style:
+                if style != "dashed":
+                    last_end = None
                 continue
             points = _canonical_curve_interval(
                 timestamps,
@@ -1319,10 +1334,8 @@ def _canonical_smooth_path(
             if style == "dashed":
                 commands.extend(_canonical_dashes_polyline(points))
             else:
-                commands.extend(
-                    _canonical_segment(start, end)
-                    for start, end in pairwise(points)
-                )
+                for start, end in pairwise(points):
+                    append_solid(start, end)
         run_start = run_end
     return " ".join(commands)
 
@@ -1348,40 +1361,12 @@ def _canonical_path(
 
 
 def _remaining_markers(
-    evidence: list[RemainingEvidence],
-    period: dict[str, Any],
+    _evidence: list[RemainingEvidence],
+    _period: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    span = max(1, period["end_at"] - period["start_at"])
-    seen: set[int] = set()
-    markers: list[dict[str, Any]] = []
-    for before, after in pairwise(evidence):
-        if after.timestamp < before.timestamp or after.effective >= before.effective:
-            continue
-        boundary = math.floor(before.effective)
-        if abs(before.effective - boundary) <= sys.float_info.epsilon:
-            boundary -= 1
-        lowest = math.ceil(after.effective)
-        while boundary >= lowest:
-            if boundary < before.effective and boundary >= after.effective and boundary not in seen:
-                seen.add(boundary)
-                fraction = min(
-                    1.0,
-                    max(
-                        0.0,
-                        (boundary - before.effective)
-                        / (after.effective - before.effective),
-                    ),
-                )
-                timestamp = before.timestamp + (after.timestamp - before.timestamp) * fraction
-                markers.append(
-                    {
-                        "x": f"{(timestamp - period['start_at']) / span * 100.0:.12f}",
-                        "y_top": f"{99.0 - boundary * 0.98:.12f}",
-                        "boundary": boundary,
-                    }
-                )
-            boundary -= 1
-    return markers
+    # The smooth measured quota path is the sole trajectory. Integer-boundary
+    # dots sampled from raw rows would visually create a second quota line.
+    return []
 
 
 def _f32(value: float) -> float:

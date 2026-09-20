@@ -90,6 +90,28 @@ class GraphLiveEvidenceTests(unittest.TestCase):
                 name,
             )
 
+    def test_saved_legacy_raw_flat_run_across_midnight_is_idle(self):
+        start = 1_788_879_300  # 2026-09-08 23:55 JST
+        rows = [
+            {
+                "timestamp": start + minute * 60,
+                "remaining_percent": 79.0,
+                "models_complete": False,
+                "model_source": "legacy-unknown",
+                "models": [
+                    {"model": "LUNA", "total_tokens": 8_364_408, "total_dollars": 0.54},
+                    {"model": "SOL", "total_tokens": 172_318_074, "total_dollars": 119.86},
+                    {"model": "TERRA", "total_tokens": 0, "total_dollars": 0.0},
+                ],
+            }
+            for minute in range(31)
+        ]
+
+        self.assertEqual(
+            [{"start_at": start, "end_at": start + 1_800}],
+            oracle.build_expected(v3_fixture(rows, period_id="legacy-midnight-idle"))[1],
+        )
+
     def test_monotone_cubic_projection_matches_fixed_no_overshoot_oracle(self):
         self.assertEqual(
             [0.3671875, 0.6875, 0.9140625],
@@ -1078,7 +1100,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             },
         )
 
-    def test_render_contract_fixes_native_viewbox_dash_ticks_and_markers(self):
+    def test_render_contract_fixes_native_viewbox_dash_ticks_without_a_second_remaining_trajectory(self):
         fixture = {
             "period": {
                 "id": "render-contract",
@@ -1145,9 +1167,22 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         ])
         self.assertEqual(694, dollars["layout"]["plot_width"])
         self.assertEqual(94, dollars["layout"]["gutter_width"])
-        self.assertEqual([99, 98, 97, 96, 95, 94, 93, 92, 91, 90], [
-            marker["boundary"] for marker in dollars["remaining_markers"]
-        ])
+        self.assertEqual([], dollars["remaining_markers"])
+
+    def test_continuous_measured_run_uses_one_joined_canonical_path(self):
+        fixture = v3_fixture(
+            [
+                {"timestamp": 0, "remaining_percent": 100.0, "tokens": 0},
+                {"timestamp": 60, "remaining_percent": 90.0, "tokens": 1},
+                {"timestamp": 120, "remaining_percent": 80.0, "tokens": 2},
+            ],
+            period_id="joined-solid-path",
+        )
+
+        tokens = oracle.build_expected_render_contracts(fixture)["tokens"]
+
+        self.assertEqual(1, tokens["models"][0]["rising"].count("M"))
+        self.assertEqual(1, tokens["remaining"]["solid"].count("M"))
 
     def test_legacy_raw_model_values_render_solid_without_idle_authority(self):
         fixture = v3_fixture([

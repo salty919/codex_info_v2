@@ -953,6 +953,27 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void Continuous_measured_run_uses_one_joined_canonical_path()
+    {
+        var scene = Scene(
+            [
+                Point(1_000, 100, 0, 0, 0),
+                Point(1_060, 90, 1, 0, 0),
+                Point(1_120, 80, 2, 0, 0),
+            ],
+            1_000,
+            1_120);
+
+        var model = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol);
+        var remaining = GraphPlotProjection.BuildCanonicalRemainingLines(scene);
+
+        Assert.Equal(1, model.Rising.Path.Count(character => character == 'M'));
+        Assert.Equal(1, remaining.Solid.Path.Count(character => character == 'M'));
+        Assert.DoesNotContain(model.Rising.Line.X, double.IsNaN);
+        Assert.DoesNotContain(remaining.Solid.Line.X, double.IsNaN);
+    }
+
+    [Fact]
     public void BoundedMissingIntervalUsesTheSameSmoothedAnchorGeometry()
     {
         var scene = GraphScene.Create(
@@ -1056,7 +1077,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void RemainingMarkersUseTheSameNormalizedIntegerBoundariesAsNative()
+    public void RemainingDoesNotCreateASecondBoundaryMarkerTrajectory()
     {
         var scene = Scene(
             [
@@ -1068,12 +1089,7 @@ public sealed class GraphPlotControlTests
 
         var markers = GraphPlotProjection.BuildCanonicalRemainingMarkers(scene);
 
-        Assert.Equal([99, 98], markers.Select(marker => marker.Boundary));
-        Assert.Equal([40d, 80d], markers.Select(marker => marker.X));
-        Assert.Collection(
-            markers,
-            marker => Assert.Equal(1.98d, marker.YTop, precision: 12),
-            marker => Assert.Equal(2.96d, marker.YTop, precision: 12));
+        Assert.Empty(markers);
     }
 
     [Fact]
@@ -2804,6 +2820,43 @@ public sealed class GraphPlotControlTests
         Assert.Empty(remaining.Solid.X);
         Assert.Empty(model.Dashed.X);
         Assert.Empty(remaining.Dashed.X);
+    }
+
+    [Fact]
+    public void Saved_legacy_raw_flat_run_across_midnight_is_idle()
+    {
+        const long start = 1_788_879_300; // 2026-09-08 23:55 JST
+        static ApiHistoryModelSample Model(string name, ulong tokens, double dollars) =>
+            new(name, null, null, null, dollars) { TotalTokens = tokens };
+
+        var samples = Enumerable.Range(0, 31)
+            .Select(minute => new ApiHistorySample(
+                start + minute * 60,
+                1_789_437_492,
+                79,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                ApiHistorySample.LegacyUnknownModelSource)
+            {
+                ModelsComplete = false,
+                ModelSamples =
+                [
+                    Model("LUNA", 8_364_408, 0.54),
+                    Model("SOL", 172_318_074, 119.86),
+                    Model("TERRA", 0, 0),
+                ],
+            })
+            .ToArray();
+
+        var scene = GraphScene.Create(samples, GraphMetric.Tokens, start, start + 1_800);
+
+        Assert.Equal(
+            [new GraphIdleInterval(start, start + 1_800, false)],
+            scene.IdleIntervals);
     }
 
     [Fact]

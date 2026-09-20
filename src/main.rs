@@ -4824,9 +4824,9 @@ enum GraphModelOrigin {
     Rejected,
     Unknown,
     Direct,
-    /// A value stored by an older schema without a complete, confirmed model
-    /// vector.  It may be drawn for historical continuity, but it is never an
-    /// arithmetic or inactivity authority.
+    /// A lossless value stored by an older schema without confirmed model-set
+    /// metadata. It never becomes an arithmetic baseline, but a complete
+    /// exact-equal raw run may prove inactivity together with raw Remaining.
     LegacyObserved,
     BoundedFlat,
     Interpolated,
@@ -6162,51 +6162,14 @@ fn remaining_marker_positions(
 }
 
 fn remaining_marker_positions_on_points(
-    points: &[(i64, f64)],
-    period_start: i64,
-    period_end: i64,
+    _points: &[(i64, f64)],
+    _period_start: i64,
+    _period_end: i64,
 ) -> Vec<RemainingMarkerPosition> {
-    let span = (period_end - period_start).max(1) as f64;
-    let mut markers = Vec::new();
-    let mut seen_boundaries = BTreeSet::new();
-    let Some(&(mut previous_timestamp, mut previous_value)) = points.first() else {
-        return markers;
-    };
-
-    // Pathと同じ平滑化済み点列を走査し、各整数%境界をその線分上で補間する。
-    for &(timestamp, current) in points.iter().skip(1) {
-        if timestamp >= previous_timestamp && current < previous_value {
-            let mut boundary = previous_value.floor() as i32;
-            if (previous_value - boundary as f64).abs() <= f64::EPSILON {
-                boundary -= 1;
-            }
-            let lowest_boundary = current.ceil() as i32;
-            while boundary >= lowest_boundary {
-                let boundary_value = boundary as f64;
-                if boundary_value < previous_value
-                    && boundary_value >= current
-                    && seen_boundaries.insert(boundary)
-                {
-                    let fraction = ((boundary_value - previous_value) / (current - previous_value))
-                        .clamp(0.0, 1.0);
-                    let marker_timestamp = previous_timestamp as f64
-                        + (timestamp - previous_timestamp) as f64 * fraction;
-                    let x =
-                        ((marker_timestamp - period_start as f64) / span * 100.0).clamp(0.0, 100.0);
-                    markers.push(RemainingMarkerPosition {
-                        x,
-                        y: remaining_graph_y(boundary_value),
-                        boundary,
-                    });
-                }
-                boundary -= 1;
-            }
-        }
-        previous_timestamp = timestamp;
-        previous_value = current;
-    }
-
-    markers
+    // The smoothed measured quota path is the sole trajectory. Integer
+    // boundary dots sampled from the unsmoothed rows form a second apparent
+    // line and therefore are intentionally absent.
+    Vec::new()
 }
 
 fn graph_time_endpoints(
@@ -6455,6 +6418,20 @@ fn append_graph_path_segment(commands: &mut String, start: (f64, f64), end: (f64
         "M{:.2} {:.2} L{:.2} {:.2}",
         start.0, start.1, end.0, end.1
     ));
+}
+
+fn append_continuous_graph_path_segment(
+    commands: &mut String,
+    last_end: &mut Option<(f64, f64)>,
+    start: (f64, f64),
+    end: (f64, f64),
+) {
+    if last_end.is_some_and(|previous| previous == start) {
+        commands.push_str(&format!(" L{:.2} {:.2}", end.0, end.1));
+    } else {
+        append_graph_path_segment(commands, start, end);
+    }
+    *last_end = Some(end);
 }
 
 fn append_dashed_polyline(commands: &mut String, points: &[(f64, f64)]) {
@@ -6841,6 +6818,7 @@ fn monotone_cubic_interval_polyline(
 
 fn append_monotone_cubic_interval(
     path: &mut String,
+    last_end: &mut Option<(f64, f64)>,
     timestamps: &[f64],
     values: &[f64],
     interval: usize,
@@ -6857,7 +6835,7 @@ fn append_monotone_cubic_interval(
         graph_y,
     );
     for pair in points.windows(2) {
-        append_graph_path_segment(path, pair[0], pair[1]);
+        append_continuous_graph_path_segment(path, last_end, pair[0], pair[1]);
     }
 }
 
@@ -7036,6 +7014,8 @@ fn split_metric_line_paths_with_evidence_and_idle(
             &preserved_timestamps,
             &preserved_indices,
         );
+        let mut flat_last_end = None;
+        let mut rising_last_end = None;
         for (interval, segment) in run.iter().enumerate() {
             if segment.kind == GraphMetricSegmentKind::Inferred {
                 append_monotone_cubic_dashed_interval(
@@ -7048,14 +7028,15 @@ fn split_metric_line_paths_with_evidence_and_idle(
                     |raw| (99.0 - raw.max(0.0) / scale * 98.0).clamp(1.0, 99.0),
                 );
             } else {
-                let target = match segment.kind {
+                let (target, last_end) = match segment.kind {
                     GraphMetricSegmentKind::Idle => unreachable!("idle is never smoothed"),
-                    GraphMetricSegmentKind::Flat => &mut flat,
-                    GraphMetricSegmentKind::Rising => &mut rising,
+                    GraphMetricSegmentKind::Flat => (&mut flat, &mut flat_last_end),
+                    GraphMetricSegmentKind::Rising => (&mut rising, &mut rising_last_end),
                     GraphMetricSegmentKind::Inferred => unreachable!("handled above"),
                 };
                 append_monotone_cubic_interval(
                     target,
+                    last_end,
                     &timestamps,
                     &values,
                     interval,
@@ -7067,6 +7048,7 @@ fn split_metric_line_paths_with_evidence_and_idle(
         }
         run_start = run_end;
     }
+    let mut idle_last_end = None;
     for segment in segments
         .iter()
         .filter(|segment| segment.kind == GraphMetricSegmentKind::Idle)
@@ -7074,7 +7056,7 @@ fn split_metric_line_paths_with_evidence_and_idle(
         let start = coordinate(&context.points[segment.start_index]);
         let mut end = coordinate(&context.points[segment.end_index]);
         end.1 = start.1;
-        append_graph_path_segment(&mut idle, start, end);
+        append_continuous_graph_path_segment(&mut idle, &mut idle_last_end, start, end);
     }
     for segment in segments
         .iter()
@@ -7088,7 +7070,7 @@ fn split_metric_line_paths_with_evidence_and_idle(
 }
 
 /// Return horizontal bands only where every represented cumulative model
-/// series is confirmed unchanged. Missing and unavailable evidence always
+/// series has lossless unchanged raw values. Missing and unavailable evidence
 /// split the idle authority; timestamp sparsity alone does not.
 #[cfg(test)]
 fn unused_interval_positions(
@@ -7309,25 +7291,22 @@ fn token_idle_timestamp_intervals_with_render_evidence(
     let (accepted_tokens, _) =
         accepted_graph_model_timelines(raw_timelines, &projection_minutes, true, confirmed_gaps);
 
-    // Only a complete vector of direct, same-minute observations can prove
-    // inactivity.  Interpolated/held/smoothed/legacy points remain display
-    // artifacts and never enter this oracle.
-    let direct_vector = |timestamp: i64| -> Option<Vec<(String, u64)>> {
-        if untrusted_minutes.contains(&timestamp) {
-            return None;
-        }
+    // Only a non-empty vector of lossless same-minute raw observations can
+    // prove inactivity. Legacy raw values participate only in exact equality
+    // here; they remain excluded from arithmetic baselines.
+    let raw_idle_vector = |timestamp: i64| -> Option<Vec<(String, u64)>> {
         let mut vector = Vec::new();
         for (name, timeline) in raw_timelines {
             let Some(point) = timeline.get(&timestamp) else {
                 continue;
             };
-            if point.origin != GraphModelOrigin::Direct {
+            if !point.origin.line_is_exact() {
                 return None;
             }
             if !accepted_tokens
                 .get(name)
                 .and_then(|timeline| timeline.get(&timestamp))
-                .is_some_and(|accepted| accepted.origin == GraphModelOrigin::Direct)
+                .is_some_and(|accepted| accepted.origin.line_is_exact())
             {
                 return None;
             }
@@ -7358,7 +7337,7 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         accepted
     };
 
-    let direct_model_timestamps = raw_timelines
+    let exact_model_timestamps = raw_timelines
         .values()
         .flat_map(BTreeMap::keys)
         .filter(|timestamp| **timestamp >= period_start && **timestamp <= period_end)
@@ -7366,7 +7345,7 @@ fn token_idle_timestamp_intervals_with_render_evidence(
             raw_timelines.values().any(|timeline| {
                 timeline
                     .get(timestamp)
-                    .is_some_and(|point| point.origin == GraphModelOrigin::Direct)
+                    .is_some_and(|point| point.origin.line_is_exact())
             })
         })
         .copied()
@@ -7381,14 +7360,14 @@ fn token_idle_timestamp_intervals_with_render_evidence(
                 .iter()
                 .map(|(name, tokens)| (name.as_str(), *tokens))
                 .collect::<BTreeMap<_, _>>();
-            for timestamp in direct_model_timestamps.range((
+            for timestamp in exact_model_timestamps.range((
                 std::ops::Bound::Excluded(start),
                 std::ops::Bound::Excluded(end),
             )) {
                 if direct_remaining(*timestamp) != Some(remaining_bits) {
                     return false;
                 }
-                let Some(vector) = direct_vector(*timestamp) else {
+                let Some(vector) = raw_idle_vector(*timestamp) else {
                     return false;
                 };
                 let values = vector
@@ -7416,13 +7395,13 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         .filter_map(|timestamp| {
             Some((
                 timestamp,
-                direct_vector(timestamp)?,
+                raw_idle_vector(timestamp)?,
                 direct_remaining(timestamp)?,
             ))
         })
         .collect::<Vec<_>>();
     anchors.sort_by_key(|(timestamp, _, _)| *timestamp);
-    // Any explicit incomplete source row is a boundary. Timestamp sparsity by
+    // Any explicit non-raw source row is a boundary. Timestamp sparsity by
     // itself is not: two adjacent valid anchors may still be far apart.
     let has_numeric_incomplete_row = |start: i64, end: i64| {
         raw_timelines.values().any(|timeline| {
@@ -7431,15 +7410,16 @@ fn token_idle_timestamp_intervals_with_render_evidence(
                     std::ops::Bound::Excluded(start),
                     std::ops::Bound::Included(end),
                 ))
-                .any(|(_, point)| {
-                    point.origin == GraphModelOrigin::LegacyObserved && point.raw_tokens.is_some()
-                })
+                .any(|(_, point)| !point.origin.line_is_exact() && point.raw_tokens.is_some())
         })
     };
     let has_unavailable_incomplete_row = |start: i64, end: i64| {
         samples.iter().any(|sample| {
             let minute = sample.timestamp.div_euclid(60) * 60;
-            minute > start && minute < end && untrusted_minutes.contains(&minute)
+            minute > start
+                && minute < end
+                && untrusted_minutes.contains(&minute)
+                && raw_idle_vector(minute).is_none()
         })
     };
     let mut proven = Vec::<(i64, i64)>::new();
@@ -8132,6 +8112,7 @@ fn remaining_paths_with_boundaries_and_idle(
             &preserved_timestamps,
             &preserved_indices,
         );
+        let mut solid_last_end = None;
         for (interval, segment) in run.iter().enumerate() {
             if segment.kind == GraphRemainingSegmentKind::Inferred {
                 append_monotone_cubic_dashed_interval(
@@ -8147,6 +8128,7 @@ fn remaining_paths_with_boundaries_and_idle(
                 debug_assert_eq!(segment.kind, GraphRemainingSegmentKind::Solid);
                 append_monotone_cubic_interval(
                     &mut solid_commands,
+                    &mut solid_last_end,
                     &timestamps,
                     &values,
                     interval,
@@ -8158,6 +8140,7 @@ fn remaining_paths_with_boundaries_and_idle(
         }
         run_start = run_end;
     }
+    let mut idle_last_end = None;
     for segment in segments
         .iter()
         .filter(|segment| segment.kind == GraphRemainingSegmentKind::Idle)
@@ -8165,7 +8148,7 @@ fn remaining_paths_with_boundaries_and_idle(
         let start = coordinate(points[segment.start_index]);
         let end = coordinate(points[segment.end_index]);
         debug_assert_eq!(start.1, end.1);
-        append_graph_path_segment(&mut idle_commands, start, end);
+        append_continuous_graph_path_segment(&mut idle_commands, &mut idle_last_end, start, end);
     }
     for segment in segments.iter().filter(|segment| {
         segment.kind == GraphRemainingSegmentKind::Inferred && !segment.smoothable
@@ -8175,10 +8158,6 @@ fn remaining_paths_with_boundaries_and_idle(
         append_dashed_segment(&mut inferred_commands, start, end);
     }
     (idle_commands, solid_commands, inferred_commands)
-}
-
-fn remaining_graph_y(remaining: f64) -> f64 {
-    (99.0 - remaining * 0.98).clamp(1.0, 99.0)
 }
 
 fn smooth_model_spend(points: &[HourlyModelSpend]) -> Vec<HourlyModelSpend> {
@@ -22800,16 +22779,15 @@ mod tests {
         poll_service_state_with_owner_check, published_pair_is_fresh,
         read_active_thread_rollout_cached, read_recovery_entries_for_ranges,
         read_thread_rollout_path, remaining_graph_points, remaining_graph_points_for_metric,
-        remaining_graph_y, remaining_marker_positions, remaining_marker_positions_on_points,
-        request_with_timeout, reset_transition_is_boundary, same_rollout_identity,
-        separate_current_label_positions, service_endpoint_state, service_health_response_version,
-        service_is_healthy, session_event_model, session_event_type, session_jsonl_files,
-        session_token_snapshot, smooth_model_spend, split_metric_line_paths,
-        terminate_and_reap_owned_child, thread_presentation_rows, three_months_before_utc,
-        unreliable_model_spend, unused_interval_positions, visible_window_position,
-        week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer, ApiServerConfig,
-        CodexInfoState, Event, FixedResizeDecision, GraphConfirmedGap, GraphPaths, GraphWindow,
-        HistoryPeriod, HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint,
+        remaining_marker_positions, request_with_timeout, reset_transition_is_boundary,
+        same_rollout_identity, separate_current_label_positions, service_endpoint_state,
+        service_health_response_version, service_is_healthy, session_event_model,
+        session_event_type, session_jsonl_files, session_token_snapshot, smooth_model_spend,
+        split_metric_line_paths, terminate_and_reap_owned_child, thread_presentation_rows,
+        three_months_before_utc, unreliable_model_spend, unused_interval_positions,
+        visible_window_position, week_remaining_text, ActiveThread, ActiveThreadUpdate, ApiServer,
+        ApiServerConfig, CodexInfoState, Event, FixedResizeDecision, GraphConfirmedGap, GraphPaths,
+        GraphWindow, HistoryPeriod, HourlyModelSpend, I18n, LaunchMode, LocalInputFileFingerprint,
         LocalUsageCache, LocalUsageCandidate, LocalUsageResult, ManualX11Geometry,
         ManualX11WindowAction, ModelDollarTotals, ModelTokenTotals, ModelUsageRow,
         ModelUsageTotals, PublicDetails, PublicDetailsV2, PublicDetailsV3, PublicHistoryGap,
@@ -42146,116 +42124,14 @@ mod tests {
     }
 
     #[test]
-    fn remaining_markers_interpolate_each_integer_boundary() {
+    fn remaining_does_not_create_a_second_boundary_marker_trajectory() {
         let first = UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default());
         let second = UsageHistorySample::new(60, 1_000, 99.0, ModelDollarTotals::default());
         let third = UsageHistorySample::new(120, 1_000, 97.0, ModelDollarTotals::default());
 
         let markers = remaining_marker_positions(&[&first, &second, &third], 0, 120);
 
-        assert_eq!(
-            markers
-                .iter()
-                .map(|marker| marker.boundary)
-                .collect::<Vec<_>>(),
-            [99, 98, 97]
-        );
-        assert!((markers[0].x - 50.0).abs() < f64::EPSILON);
-        assert!((markers[1].x - 75.0).abs() < 0.000_000_1);
-        assert!((markers[2].x - 100.0).abs() < f64::EPSILON);
-        for (marker, boundary) in markers.iter().zip([99.0, 98.0, 97.0]) {
-            let expected_y = 99.0 - boundary * 0.98;
-            assert!((marker.y - expected_y).abs() < f64::EPSILON);
-        }
-    }
-
-    #[test]
-    fn remaining_markers_are_on_the_same_smoothed_line_segments() {
-        let first = UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default());
-        let second = UsageHistorySample::new(60, 1_000, 99.0, ModelDollarTotals::default());
-        let third = UsageHistorySample::new(120, 1_000, 97.0, ModelDollarTotals::default());
-        let samples = [&first, &second, &third];
-        let points = remaining_graph_points(&samples, 0, 120);
-        let markers = remaining_marker_positions_on_points(&points, 0, 120);
-
-        assert_eq!(points.first(), Some(&(0, 100.0)));
-        assert!(points.windows(2).all(|pair| pair[0].0 < pair[1].0));
-        for marker in markers {
-            let marker_timestamp = marker.x / 100.0 * 120.0;
-            let Some([before, after]) = points.windows(2).find_map(|window| {
-                let [before, after] = window else { return None };
-                (marker_timestamp >= before.0 as f64
-                    && marker_timestamp <= after.0 as f64
-                    && after.0 > before.0)
-                    .then_some([before, after])
-            }) else {
-                panic!("marker must lie on a remaining path segment: {marker:?}");
-            };
-            let fraction = (marker_timestamp - before.0 as f64) / (after.0 - before.0) as f64;
-            let line_value = before.1 + (after.1 - before.1) * fraction;
-            assert!((marker.y - remaining_graph_y(line_value)).abs() < 0.000_000_1);
-        }
-    }
-
-    #[test]
-    fn remaining_markers_do_not_duplicate_a_boundary() {
-        let samples = [
-            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
-            UsageHistorySample::new(60, 1_000, 99.0, ModelDollarTotals::default()),
-            UsageHistorySample::new(120, 1_000, 97.0, ModelDollarTotals::default()),
-            UsageHistorySample::new(180, 1_000, 98.0, ModelDollarTotals::default()),
-            UsageHistorySample::new(240, 1_000, 96.0, ModelDollarTotals::default()),
-        ];
-
-        let references = samples.iter().collect::<Vec<_>>();
-        let markers = remaining_marker_positions(&references, 0, 240);
-
-        assert_eq!(
-            markers
-                .iter()
-                .map(|marker| marker.boundary)
-                .collect::<Vec<_>>(),
-            [99, 98, 97, 96]
-        );
-    }
-
-    #[test]
-    fn remaining_markers_filter_out_missing_values() {
-        let first = UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default());
-        let second = UsageHistorySample::new(60, 1_000, 99.0, ModelDollarTotals::default());
-        let missing =
-            UsageHistorySample::from_model_history(120, 1_000, ModelDollarTotals::default());
-        let last = UsageHistorySample::new(180, 1_000, 97.0, ModelDollarTotals::default());
-
-        let markers = remaining_marker_positions(&[&first, &second, &missing, &last], 0, 180);
-
-        assert_eq!(
-            markers
-                .iter()
-                .map(|marker| marker.boundary)
-                .collect::<Vec<_>>(),
-            [99, 98, 97]
-        );
-    }
-
-    #[test]
-    fn remaining_markers_ignore_a_missing_prefix_and_terminal_hold() {
-        let first_missing =
-            UsageHistorySample::from_model_history(0, 1_000, ModelDollarTotals::default());
-        let second_missing =
-            UsageHistorySample::from_model_history(60, 1_000, ModelDollarTotals::default());
-        let first_observed =
-            UsageHistorySample::new(120, 1_000, 97.0, ModelDollarTotals::default());
-
-        let markers =
-            remaining_marker_positions(&[&first_missing, &second_missing, &first_observed], 0, 180);
-
         assert!(markers.is_empty());
-    }
-
-    #[test]
-    fn remaining_markers_are_empty_without_data() {
-        assert!(remaining_marker_positions(&[], 0, 120).is_empty());
     }
 
     #[test]
@@ -44348,6 +44224,54 @@ mod tests {
     }
 
     #[test]
+    fn saved_legacy_raw_flat_run_across_midnight_is_idle() {
+        const START: i64 = 1_788_879_300; // 2026-09-08 23:55 JST
+        let samples = (0..=30)
+            .map(|minute| {
+                UsageHistorySample::new(
+                    START + minute * 60,
+                    1_789_437_492,
+                    79.0,
+                    ModelDollarTotals::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let references = samples.iter().collect::<Vec<_>>();
+        let legacy = |tokens| super::GraphModelPoint {
+            dollar: 0.0,
+            tokens: tokens as f64,
+            raw_tokens: Some(tokens),
+            origin: super::GraphModelOrigin::LegacyObserved,
+        };
+        let timeline = |tokens| {
+            (0..=30)
+                .map(|minute| (START + minute * 60, legacy(tokens)))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let timelines = BTreeMap::from([
+            ("LUNA".to_owned(), timeline(8_364_408)),
+            ("SOL".to_owned(), timeline(172_318_074)),
+            ("TERRA".to_owned(), timeline(0)),
+        ]);
+        let legacy_minutes = (0..=30)
+            .map(|minute| START + minute * 60)
+            .collect::<BTreeSet<_>>();
+
+        let idle = super::token_idle_timestamp_intervals_with_render_evidence(
+            &references,
+            START,
+            START + 1_800,
+            &timelines,
+            &[],
+            Some(&super::GraphIdleRenderEvidence {
+                untrusted_minutes: &legacy_minutes,
+            }),
+        );
+
+        assert_eq!(idle, vec![(START, START + 1_800)]);
+    }
+
+    #[test]
     fn legacy_outlier_cannot_reject_or_move_later_direct_observation() {
         let point = |value, origin| super::GraphModelPoint {
             dollar: value,
@@ -46084,6 +46008,46 @@ mod tests {
         )
         .expect("valid second interval");
         assert!((second[0] - 81.458_333_333_333_33).abs() < 1e-12);
+    }
+
+    #[test]
+    fn continuous_measured_run_uses_one_joined_path() {
+        let points = [
+            HourlyModelSpend {
+                timestamp: 0,
+                sol: 0.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 60,
+                sol: 1.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 120,
+                sol: 2.0,
+                ..HourlyModelSpend::default()
+            },
+        ];
+        let boundaries = BTreeSet::new();
+        let context = super::MetricLinePathContext {
+            points: &points,
+            period_start: 0,
+            period_end: 120,
+            maximum: 2.0,
+            confirmed_gaps: &[],
+            untrusted_minutes: &boundaries,
+            require_legacy_vector: false,
+            correction_starts: &boundaries,
+            idle_timestamp_intervals: &[],
+        };
+
+        let (_, _, rising, inferred) =
+            super::split_metric_line_paths_with_evidence_and_idle(&context, |point| point.sol);
+
+        assert_eq!(rising.matches('M').count(), 1, "{rising}");
+        assert!(rising.matches('L').count() > 2, "{rising}");
+        assert!(inferred.is_empty());
     }
 
     #[test]

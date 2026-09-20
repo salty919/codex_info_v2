@@ -317,9 +317,11 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
 2. `G137-2`: 公開・DB viewのmodel数値は、同じmodel keyを持つ直接観測(`model_source=confirmed`)の
    finiteかつnon-negativeなraw値だけを保持する。`reconstructed-from-session`、`unknown`、`unavailable`は
    model key/sourceと欠損metadataだけを公開し、`total_tokens`、dollar、内訳などのモデル数値を公開しない。
-   `legacy-unknown`は保存済みの同じmodel keyの数値だけ表示へ投影できるが、集計・予測・idle判定には利用しない。
-   掲載されないmodelを0へ補完せず、v1/v2のfixed-column rowも直接観測かつ全fieldがstrict parse済みの場合だけ
-   complete相当とする。
+   `legacy-unknown`は保存済みの同じmodel keyの数値だけ表示へ投影でき、集計・予測のauthorityには利用しない。ただし
+   同一runの全raw rowに同じ非空model集合とlosslessな`total_tokens`が存在し、全model値とraw Remainingがexactに
+   不変で、欠測・異常・confirmed gapがない場合に限り、その保存raw vectorをidle判定に利用できる。
+   掲載されないmodelを0へ補完しない。v1/v2のfixed-column rowも、保存されたmodel fieldをstrict parseした
+   `legacy-unknown` raw vectorとして上記の限定idle条件だけに利用し、未掲載modelを創作しない。
 3. `G137-3`: 同一periodの累積model値は減少しない。baselineはmodelごとの直前accepted finite値とし、
    source completenessを問わずbaseline未満のraw値は計測異常として表示値へ採用せずbaselineを更新しない。
    隣接する実測点`left,middle,right`で`left <= right`かつ`middle < left || middle > right`となる
@@ -328,7 +330,7 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    metricだけrecovery stateへ入り値を採用しない。recovery中もbaselineを固定し、最初のfinite non-negativeかつ
    `candidate >= baseline`の値だけをaccepted recoveryとしてstateを抜ける。それまでの候補は全て異常である。
    model pointは`Unknown`（当該metric欠測）、`Direct`（同じmodel keyの周期実測）、`Interpolated`、`Held`、
-   `Rejected`を区別する。`Direct`だけがAPI/DB公開、集計、idle判定に利用でき、その他はUI presentation-onlyの
+   `Rejected`を区別する。`Direct`だけがAPI/DB公開と集計に利用でき、その他はUI presentation-onlyの
    破線または欠損表示とする。この破線はDBまたは取得記録の欠損・異常を示すNG表示であり、正常な実線の代替ではない。
    保存済み累積ドルを通常表示のanchorとするが、ドルはtokenから得る派生表示値でありidle authorityにはしない。
    同じmodelの直接観測raw `total_tokens`が不変なのにドルだけが変化する場合はドル側の矛盾として、DB/API rawを
@@ -338,14 +340,15 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    rejected値の期間は直前baselineを細い破線holdし、accepted recoveryへ細い破線で接続する。period endまで復帰が
    なければ同じbaselineを終端まで破線holdする。これをraw tokenとraw dollarへ独立に適用し、tokenだけ異常なら
    token線だけ、dollarだけ異常ならdollar線だけを破線にする。他metricと他modelのaccepted実測は保持する。
-   idle判定の根拠は`Direct`のraw値だけとし、confirmed gap、欠測、または直接観測値の矛盾・異常がある区間は
-   idle不可とする。task lifecycleは値変化の代替証拠にせず、Direct値がexact equalの区間をactive metadataだけで
-   使用済みへ変更しない。補間、hold、smoothing、予測、`legacy-unknown`はidleの根拠にしない。
+   idle判定の根拠はaccepted raw token vectorとraw Remainingだけとし、confirmed gap、欠測、または観測値の矛盾・異常が
+   ある区間はidle不可とする。`legacy-unknown`は、同一runの全rowに同じ非空model集合とlosslessなraw tokenがあり、
+   全model値とraw Remainingがexactに不変な場合だけidle authorityに含める。task lifecycleは値変化の代替証拠にせず、
+   exact equalの区間をactive metadataだけで使用済みへ変更しない。補間、hold、smoothing、予測はidleの根拠にしない。
    period境界だけが新しい0起点を許し、period内補正を垂直落下または低い新lineageとして表示しない。
-4. `G137-4`: 同じmodel keyが両endpointに直接観測され、当該表示metricの
+4. `G137-4`: 同じmodel keyが両endpointの保存rawに存在し、当該表示metricの
    異常またはrecorder gapを跨がない区間だけを、そのmodelのcontiguous measuredとする。他modelの出現／消失、
-   `confirmed`同士の共通modelはmodel集合の完全性だけを理由にこの区間を破線化しない。`legacy-unknown`が一方でも
-   含まれる区間は表示専用で、連続実測・集計・idle authorityにはしない。正常な直接観測endpoint間はtimestamp差だけで
+   `confirmed`同士の共通modelはmodel集合の完全性だけを理由にこの区間を破線化しない。`legacy-unknown`は集計authorityには
+   しないが、両endpointと全interior rowに同じ非空model集合のlossless raw tokenが存在する区間はidle authorityにできる。正常な観測endpoint間はtimestamp差だけで
    欠損へ降格せず、利用中の同値・増加は同じ3px実線で結ぶ。後述の10分以上のconfirmed idleに含まれる同値区間だけは
    idle bandと同じX範囲の1px水平実線へ分離する。exact 60秒の1 sampling slotだけが`unavailable`で、その前後が
    same reset、同一model集合、全modelのraw token exact equal、raw Remaining bitwise equalかつgapなしなら、
@@ -364,10 +367,10 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    model集合変更は、未掲載または新規model自身の線と未使用判定にだけ反映し、Remainingの形状・線種には反映しない。
    集合変更区間でも共通modelのaccepted値は実線を維持し、raw Remainingの両endpointがacceptedなら
    Remainingも実線を維持する。`source_mismatch`は欠測または利用不能という主原因があるbridgeの補助理由に限定する。
-5. `G137-5`: idle判定はsame `reset_at`のperiod内でのみ行う。両endpointに同じmodel key集合が揃い、両方が
-   `model_source=confirmed`かつ`models_complete=true`であり、全modelのraw `total_tokens`がexact equal、raw
-   `remaining_percent`がfiniteかつbitwise equalで、confirmed gap、欠測、直接観測値の矛盾がないことを必須とする。
-   `legacy-unknown`、`unknown`、`unavailable`、欠損・補間・hold・smoothing・予測値をendpointまたは矛盾なしの証拠にはせず、
+5. `G137-5`: idle判定はsame `reset_at`のperiod内でのみ行う。両endpointと全interior raw rowに同じ非空model key集合が揃い、
+   各rowが`model_source=confirmed && models_complete=true`または保存済みlossless token vectorを持つ`legacy-unknown`であり、
+   全modelのraw `total_tokens`がexact equal、raw `remaining_percent`がfiniteかつbitwise equalで、confirmed gap、欠測、
+   観測値の矛盾がないことを必須とする。`unknown`、`unavailable`、欠損・補間・hold・smoothing・予測値をendpointまたは矛盾なしの証拠にはせず、
    lifecycle metadataを値変化または非変化のauthorityにしない。ただしexact 60秒の1 sampling slotだけが
    `unavailable`で、その前後がsame reset、同一model集合、全modelのraw token exact equal、raw Remaining
    bitwise equalかつgapなしの場合は、周期不足／sampling jitterとしてそのrowだけをread-time表示入力から除外し、idle候補を

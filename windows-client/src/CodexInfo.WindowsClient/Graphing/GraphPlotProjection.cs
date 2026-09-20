@@ -244,58 +244,10 @@ internal static class GraphPlotProjection
         GraphScene scene)
     {
         ArgumentNullException.ThrowIfNull(scene);
-        if (!scene.HasPoints || scene.PeriodEndAt <= scene.PeriodStartAt)
-        {
-            return Array.Empty<GraphCanonicalRemainingMarker>();
-        }
-
-        var markers = new List<GraphCanonicalRemainingMarker>();
-        var seen = new HashSet<int>();
-        var previous = -1;
-        for (var index = 0; index < scene.Timestamps.Count; index++)
-        {
-            if (!double.IsFinite(scene.Remaining[index]))
-            {
-                continue;
-            }
-            if (previous < 0)
-            {
-                previous = index;
-                continue;
-            }
-
-            var before = scene.Remaining[previous];
-            var current = scene.Remaining[index];
-            if (scene.Timestamps[index] >= scene.Timestamps[previous] && current < before)
-            {
-                var boundary = (int)Math.Floor(before);
-                if (Math.Abs(before - boundary) <= double.Epsilon)
-                {
-                    boundary--;
-                }
-                var lowest = (int)Math.Ceiling(current);
-                while (boundary >= lowest)
-                {
-                    if (boundary < before && boundary >= current && seen.Add(boundary))
-                    {
-                        var fraction = Math.Clamp(
-                            (boundary - before) / (current - before),
-                            0,
-                            1);
-                        var timestamp = scene.Timestamps[previous] +
-                            (scene.Timestamps[index] - scene.Timestamps[previous]) * fraction;
-                        markers.Add(new GraphCanonicalRemainingMarker(
-                            (timestamp - scene.PeriodStartAt) /
-                                (scene.PeriodEndAt - scene.PeriodStartAt) * 100,
-                            99 - boundary * 0.98,
-                            boundary));
-                    }
-                    boundary--;
-                }
-            }
-            previous = index;
-        }
-        return markers;
+        // The smooth measured quota path is the only trajectory. Boundary
+        // dots derived from unsmoothed integer samples would look like a
+        // second line and are intentionally not rendered.
+        return Array.Empty<GraphCanonicalRemainingMarker>();
     }
 
     /// <summary>
@@ -814,7 +766,8 @@ internal static class GraphPlotProjection
                         run[index - 1],
                         run[index],
                         maximum,
-                        remaining);
+                        remaining,
+                        continuePath: index > 1);
                 }
             }
             run.Clear();
@@ -902,7 +855,8 @@ internal static class GraphPlotProjection
                         new CanonicalPoint(start.X + dx * from, start.YTop + dy * from),
                         new CanonicalPoint(start.X + dx * to, start.YTop + dy * to),
                         maximum,
-                        remaining);
+                        remaining,
+                        continuePath: false);
                 }
                 offset += advance;
                 phase += advance;
@@ -926,10 +880,28 @@ internal static class GraphPlotProjection
         CanonicalPoint start,
         CanonicalPoint end,
         double maximum,
-        bool remaining)
+        bool remaining,
+        bool continuePath)
     {
         var roundedStart = RoundCanonical(start);
         var roundedEnd = RoundCanonical(end);
+        var startTimestamp = CanonicalTimestamp(scene, roundedStart.X);
+        var startValue = CanonicalAxisValue(roundedStart.YTop, maximum, remaining);
+        var endTimestamp = CanonicalTimestamp(scene, roundedEnd.X);
+        var endValue = CanonicalAxisValue(roundedEnd.YTop, maximum, remaining);
+        var canContinue = continuePath &&
+            x.Count > 0 &&
+            double.IsFinite(x[^1]) &&
+            x[^1] == startTimestamp &&
+            y[^1] == startValue;
+        if (canContinue)
+        {
+            path.Append(CultureInfo.InvariantCulture, $" L{roundedEnd.X:0.00} {roundedEnd.YTop:0.00}");
+            x.Add(endTimestamp);
+            y.Add(endValue);
+            return;
+        }
+
         if (path.Length > 0)
         {
             path.Append(' ');
@@ -941,10 +913,10 @@ internal static class GraphPlotProjection
             x.Add(double.NaN);
             y.Add(double.NaN);
         }
-        x.Add(CanonicalTimestamp(scene, roundedStart.X));
-        y.Add(CanonicalAxisValue(roundedStart.YTop, maximum, remaining));
-        x.Add(CanonicalTimestamp(scene, roundedEnd.X));
-        y.Add(CanonicalAxisValue(roundedEnd.YTop, maximum, remaining));
+        x.Add(startTimestamp);
+        y.Add(startValue);
+        x.Add(endTimestamp);
+        y.Add(endValue);
     }
 
     private static CanonicalPoint RoundCanonical(CanonicalPoint point) =>
