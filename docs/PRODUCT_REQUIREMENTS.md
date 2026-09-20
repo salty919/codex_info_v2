@@ -146,7 +146,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 - `desired_state=running`で完了したlauncher/startup/timer/update収束のterminal stateは、完全に検証した新世代がmanagedかつfunctionally readyなA、または完全に検証した旧世代がmanagedかつfunctionally readyなBのいずれかだけとする。`desired_state=stopped|disabled|removed`の操作は、対応するservice/timer/unit状態、listener不在、保持対象、local generation整合をread-backした場合だけ別の正常な非稼働terminalとする。unknown/foreign/malformed listenerまたはlockを安全に識別できない場合だけ、何も停止・上書きせず30秒以内に明示的`SAFE_BLOCKED`で終了できる。この安全例外を成功やA/Bへ読み替えず、次のmanual/startup/timer triggerを妨げない。manual/startupは20分30秒、control RPCは30秒、local validate/publishは60秒、stopは20秒、readinessは30秒、rollbackは60秒以内で必ずterminalになる。
 - installer/controlはL1 `.install.lock`だけ、resident runtimeはL2 profile recorder lockの後に必要な場合だけL3 account writer lockを取得する。installerはL2/L3を取得せず、serviceはL1を取得しない。systemd start/restartは`--no-block`で要求後にread-only pollする。これを唯一のlock順序として、launcher、startup、timer、removeのcycleを作らない。
 - `codex-info-recorder.service`と`codex-info-rest.service`はunexpected exitを`Restart=always`、`RestartSec=5s`、`StartLimitIntervalSec=0`で再起動し続け、start limitによる永久inactiveを作らない。反復失敗中は失敗のまま可視化し、成功扱いしない。admitted accountでは新規rowが0件でもrecorderが各scheduled generationをtransaction commitし、commit確認後だけowner-only `recorder-state.json`の`last_commit_unix`を更新する。全write stateのheartbeat `updated_at_unix`とadmitted accountの`last_commit_unix`はfuture skewを拒否しfreshness上限150秒とする。account未確定時は`idle_no_account`とし、架空のpartition/commitを作らない。
-- recorderのDB書込み障害は同callbackでretryせず`degraded`へ進み、daemonとexact pending batchを保持したまま次のscheduled cycle（60秒以内）で一度だけ再試行する。timeout、busy、full、readonly、corrupt等のDB応答をworker死亡と推測してdaemonを終了しない。writer threadの実終了だけは1秒owner loopの`JoinHandle`で確定して非0終了し、systemdへ復旧を委ねる。停止区間のSession usageだけは検証済みsource cursorからbounded backfillできるが、quota/残量を補間・複製しない。gapの状態・証拠境界・公開は`U128-19`へ従う。
+- recorderとquota laneのscheduled cycleはmonotonic anchorからのfixed-rateとし、cycle処理時間を次の60秒へ加算しない。deadline超過時はbusy catch-upせず1回だけ直ちに実行後、最初のfuture deadlineへ戻る。timestamp間隔だけからDB row、degraded、gapを作らない。DB書込み障害は同callbackでretryせず`degraded`へ進み、daemonとexact pending batchを保持したまま次のscheduled cycle（60秒以内）で一度だけ再試行する。timeout、busy、full、readonly、corrupt等のDB応答をworker死亡と推測してdaemonを終了しない。writer threadの実終了だけは1秒owner loopの`JoinHandle`で確定して非0終了し、systemdへ復旧を委ねる。停止区間のSession usageだけは検証済みsource cursorからbounded backfillできるが、quota/残量を補間・複製しない。gapの状態・証拠境界・公開は`U128-19`へ従う。
 - 利用者操作は`codex-info --update`、`codex-info --status`、`codex-info --stop`、`codex-info --disable-autostart`、`codex-info --remove`を使用する。raw `systemctl`は診断用で、直接stopは永続的な製品停止意図ではなく次の更新でmanaged runningへ正規化され得る。`--remove`はrecorder/REST/update unitだけを停止・無効化・解除し、installed generation、launcher、installer、manifest、履歴DB、verified backup、reset hint、gap/recorder/control state、Codex session JSONL、設定を削除しない。
 
 ## 6. Windows導入・更新・削除
@@ -341,8 +341,8 @@ fail-closedでprefixを推測しない。未帰属quotaを特定modelの消費�
 4. `G137-4`: 同じmodel keyが両endpointに直接観測され、当該表示metricの
    異常またはrecorder gapを跨がない区間だけを、そのmodelのcontiguous measuredとする。他modelの出現／消失、
    `confirmed`同士の共通modelはmodel集合の完全性だけを理由にこの区間を破線化しない。`legacy-unknown`が一方でも
-   含まれる区間は表示専用で、連続実測・集計・idle authorityにはしない。それ以外の
-   疎な既知点間、当該modelの欠測、後退／回復、confirmed recorder gap、bounded／terminal holdは既知endpoint間を細い
+   含まれる区間は表示専用で、連続実測・集計・idle authorityにはしない。正常な直接観測endpoint間はtimestamp差だけで
+   欠損へ降格せず、同値を細い実線、増加を太い実線で結ぶ。当該modelの明示的欠測、後退／回復、confirmed recorder gap、bounded／terminal holdは既知endpoint間を細い
    破線で連続補完する。補間・holdはUI presentation-onlyで、API/DBへ書き戻さず、直接観測または集計・idleの
    根拠へ昇格させない。
    period endはaccepted periods resourceの同じpairにあるexact `end_at`とし、currentか
@@ -361,7 +361,7 @@ fail-closedでprefixを推測しない。未帰属quotaを特定modelの消費�
    false/nullのmetadataも非activeの証明へ変換しない。ただし、完全directな同値endpoint間に、数値を持たず
    `task_active_since_previous=false`の`unavailable` rowが正確に1件だけあり、前後が1分cadenceの同じdirect model集合で
    境界づけられる場合は、そのrowをidle authorityの中立的な欠測として橋渡しできる（表示線は破線のまま）。連続または
-   複数の`unavailable`、active/unknown、cadence欠落、その他の不完全rowは候補を分断する。上記条件を満たす連続runが10分以上の場合だけ、その
+   複数の`unavailable`、active/unknown、その他の不完全rowは候補を分断する。rowのtimestamp不連続だけはgapまたは利用の証拠にせず、正常なdirect endpointが上記条件を満たすintervalを分断しない。上記条件を満たす連続runが10分以上の場合だけ、その
    run全体をsession-levelのidle bandとして表示する。10分未満のrun、cadenceの数や観測点数だけでの確定、direct endpointを
    欠く欠測時間だけのbridgeはidleへ昇格しない。画面幅やpixel数によって閾値を変えない。
    画面幅、pixel丸め、gridまたはsegment境界を理由にbandを削除・周期分断しない。
@@ -400,7 +400,7 @@ fail-closedでprefixを推測しない。未帰属quotaを特定modelの消費�
    carryする。accepted raw Remainingが1点以上あれば、最後のeffective pointからexact period endまでを長さに
    関係なく時間幅のある破線holdとし、空白や同一X座標の垂直落下を作らない。`Remaining`のeffective値から
    model系列の値またはそのperiod tailを外挿しない。
-7. `G137-7`: model線は`Direct`同士のcontiguous exact値の増加を太い実線、不変を細い実線とする。疎な区間、途中に
+7. `G137-7`: model線は`Direct`同士のexact値の増加を太い実線、不変を細い実線とし、timestamp差だけでは破線化しない。途中に
    当該modelのunknown rowがあるnearest-finite接続、raw-null補間点の両側、unattributed quota drop、
    monotonic hold、bounded/terminal hold、synthetic tailは破線とする。raw quota同値のcontiguous区間は
    model availabilityと独立した実測実線である。`G137-6`の`ActivitySmoothed`はraw観測とtoken証拠を持つ
@@ -452,7 +452,7 @@ parse済みでtimestamp重複なしとして次の相対offsetを固定する。
 このliteral oracleの期待する未使用帯は`[]`である。明示的な`false`があっても、same `reset_at`、両endpointの
 `confirmed`＋`models_complete=true`、同じmodel key集合、全raw tokenのexact equal、finite raw Remainingのbitwise equal、
 active／confirmed gap／直接観測値の矛盾なしが全て揃わない区間は帯にしない。legacy-unknownの保存値は表示専用で、集計・予測・idleへ使わない。
-空白区間と`x1 == x2`のsegmentは0件とし、欠測cadenceをgrayでbridgeしない。
+空白区間と`x1 == x2`のsegmentは0件とする。明示的な欠測endpointはgrayでbridgeしないが、正常なdirect endpoint間のtimestamp sparsityだけでは実線またはidle bandを分断しない。
 追加反例として、同じドル値でもtokenが`100→101`かつdollarが`1.00→1.00`、accepted Remainingが局所的に
 `90→89`、tokenのisolated pulse、confirmed gapを跨ぐ同値endpointはいずれも未使用0件とする。棄却されるRemaining
 isolated pulseはtoken不変runを消さない。tokenとRemainingが同値でdollarだけ`1.00→0.99→1.00`のisolated pulseなら、

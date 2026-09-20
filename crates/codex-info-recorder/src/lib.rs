@@ -66,6 +66,79 @@ const MAX_TASK_BACKFILL_TARGETS: usize = 4_096;
 const MAX_RECORDER_STATE_BYTES: u64 = 64 * 1024;
 const RECORDER_STATE_SCHEMA: &str = "codex-info-recorder-state-v1";
 
+/// Fixed-rate pacing anchored to a monotonic clock.
+///
+/// Cycle work is not added to the configured interval. When work crosses one
+/// or more deadlines, the caller runs one immediate cycle and then resumes at
+/// the first future deadline instead of busy-looping through missed samples.
+#[derive(Debug)]
+pub struct FixedRateSchedule {
+    interval: Duration,
+    next_deadline: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FixedRateWait {
+    pub sleep_for: Duration,
+    pub missed_deadlines: u64,
+}
+
+impl FixedRateSchedule {
+    pub fn new(interval: Duration) -> Self {
+        Self::anchored(Instant::now(), interval)
+    }
+
+    pub fn anchored(anchor: Instant, interval: Duration) -> Self {
+        assert!(!interval.is_zero(), "fixed-rate interval must be positive");
+        let next_deadline = anchor
+            .checked_add(interval)
+            .expect("fixed-rate deadline must fit the monotonic clock");
+        Self {
+            interval,
+            next_deadline,
+        }
+    }
+
+    pub fn complete_cycle(&mut self, now: Instant) -> FixedRateWait {
+        if now <= self.next_deadline {
+            let sleep_for = self.next_deadline.saturating_duration_since(now);
+            self.next_deadline = self
+                .next_deadline
+                .checked_add(self.interval)
+                .or_else(|| now.checked_add(self.interval))
+                .unwrap_or(now);
+            return FixedRateWait {
+                sleep_for,
+                missed_deadlines: 0,
+            };
+        }
+
+        let interval_nanos = self.interval.as_nanos();
+        let late_nanos = now.duration_since(self.next_deadline).as_nanos();
+        let missed = late_nanos
+            .checked_div(interval_nanos)
+            .and_then(|value| value.checked_add(1))
+            .unwrap_or(u128::MAX);
+        let missed_deadlines = u64::try_from(missed).unwrap_or(u64::MAX);
+        self.next_deadline = checked_duration_mul(self.interval, missed_deadlines)
+            .and_then(|advance| self.next_deadline.checked_add(advance))
+            .filter(|deadline| *deadline > now)
+            .or_else(|| now.checked_add(self.interval))
+            .unwrap_or(now);
+        FixedRateWait {
+            sleep_for: Duration::ZERO,
+            missed_deadlines,
+        }
+    }
+}
+
+fn checked_duration_mul(duration: Duration, count: u64) -> Option<Duration> {
+    let nanos = duration.as_nanos().checked_mul(u128::from(count))?;
+    let seconds = nanos / 1_000_000_000;
+    let subsec_nanos = (nanos % 1_000_000_000) as u32;
+    Some(Duration::new(u64::try_from(seconds).ok()?, subsec_nanos))
+}
+
 #[derive(Debug)]
 pub enum RecorderError {
     Io(io::Error),
@@ -481,13 +554,25 @@ impl QuotaPoller {
     pub fn start_with_interval(interval_secs: u64) -> Self {
         let (sender, receiver) = mpsc::sync_channel(2);
         let interval_secs = interval_secs.max(1);
-        let worker = thread::spawn(move || loop {
-            let result = fetch_quota_snapshot();
-            match sender.try_send(result) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Disconnected(_)) => break,
+        let worker = thread::spawn(move || {
+            let mut schedule = FixedRateSchedule::new(Duration::from_secs(interval_secs));
+            loop {
+                let result = fetch_quota_snapshot();
+                match sender.try_send(result) {
+                    Ok(()) | Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Disconnected(_)) => break,
+                }
+                let wait = schedule.complete_cycle(Instant::now());
+                if wait.missed_deadlines != 0 {
+                    eprintln!(
+                        "recorder quota sampling overrun: missed_deadlines={}",
+                        wait.missed_deadlines
+                    );
+                }
+                if !wait.sleep_for.is_zero() {
+                    thread::sleep(wait.sleep_for);
+                }
             }
-            thread::sleep(Duration::from_secs(interval_secs));
         });
         Self {
             receiver,
@@ -6894,6 +6979,64 @@ fn executable_identity() -> Result<(u64, u64), RecorderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_rate_schedule_removes_work_time_drift_and_bounds_overrun_recovery() {
+        let interval = Duration::from_secs(60);
+        let anchor = Instant::now();
+
+        let mut exact = FixedRateSchedule::anchored(anchor, interval);
+        assert_eq!(
+            exact.complete_cycle(anchor + interval),
+            FixedRateWait {
+                sleep_for: Duration::ZERO,
+                missed_deadlines: 0,
+            }
+        );
+
+        let mut one_late = FixedRateSchedule::anchored(anchor, interval);
+        assert_eq!(
+            one_late.complete_cycle(anchor + Duration::from_secs(61)),
+            FixedRateWait {
+                sleep_for: Duration::ZERO,
+                missed_deadlines: 1,
+            }
+        );
+        assert_eq!(
+            one_late.complete_cycle(anchor + Duration::from_secs(62)),
+            FixedRateWait {
+                sleep_for: Duration::from_secs(58),
+                missed_deadlines: 0,
+            }
+        );
+
+        let mut two_late = FixedRateSchedule::anchored(anchor, interval);
+        assert_eq!(
+            two_late.complete_cycle(anchor + Duration::from_secs(130)),
+            FixedRateWait {
+                sleep_for: Duration::ZERO,
+                missed_deadlines: 2,
+            }
+        );
+        assert_eq!(
+            two_late.complete_cycle(anchor + Duration::from_secs(131)),
+            FixedRateWait {
+                sleep_for: Duration::from_secs(49),
+                missed_deadlines: 0,
+            }
+        );
+
+        let mut steady = FixedRateSchedule::anchored(anchor, interval);
+        let work = Duration::from_millis(250);
+        let mut now = anchor;
+        for cycle in 1..=120_u32 {
+            now += work;
+            let wait = steady.complete_cycle(now);
+            assert_eq!(wait.missed_deadlines, 0);
+            now += wait.sleep_for;
+            assert_eq!(now, anchor + interval * cycle);
+        }
+    }
     use rusqlite::Connection;
     use std::io::Write;
     #[cfg(unix)]
