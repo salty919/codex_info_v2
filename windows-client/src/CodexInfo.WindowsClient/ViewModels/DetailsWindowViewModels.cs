@@ -297,29 +297,6 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         // source vector as-is; graph code must not invent a pre-observation
         // baseline or repair model components from older rows.
         var normalized = observed.ToList();
-        if (ShouldInsertResetBoundary(period, normalized))
-        {
-            // The quota reset is a real period boundary even when the first
-            // recorder row arrived late. This presentation-only marker lets
-            // GraphScene reconstruct the 100% starting quota when direct
-            // model evidence already exists before the first quota reading.
-            normalized.Insert(
-                0,
-                new ApiHistorySample(
-                    period.StartAt,
-                    period.ResetAt,
-                    null,
-                    null,
-                    null,
-                    null,
-                    null,
-                    null,
-                    null,
-                    ApiHistorySample.UnavailableModelSource)
-                {
-                    ModelsComplete = false,
-                });
-        }
 
         var result = new List<ApiHistorySample>(normalized.Count + 1);
         result.AddRange(normalized);
@@ -339,58 +316,6 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         return result;
-    }
-
-    private static bool ShouldInsertResetBoundary(
-        ApiHistoryPeriod period,
-        IReadOnlyList<ApiHistorySample> samples)
-    {
-        if (samples.Count == 0 || samples[0].Timestamp <= period.StartAt ||
-            !IsQuotaResetBoundary(period))
-        {
-            return false;
-        }
-
-        var firstRemaining = Enumerable.Range(0, samples.Count)
-            .FirstOrDefault(index => samples[index].RemainingPercent is { } value &&
-                double.IsFinite(value) && value is >= 0 and <= 100, -1);
-        if (firstRemaining <= 0)
-        {
-            return false;
-        }
-
-        // At least one complete direct model vector must cover the prefix up
-        // to the first quota observation. A legacy row alone is insufficient
-        // evidence for reconstructing the reset baseline.
-        return samples
-            .Take(firstRemaining + 1)
-            .Any(sample => sample.ModelSource == ApiHistorySample.ConfirmedModelSource &&
-                sample.ModelsComplete &&
-                sample.Models.Any(model => model.TotalTokens is not null));
-    }
-
-    private static bool IsQuotaResetBoundary(ApiHistoryPeriod period)
-    {
-        static bool Within(long left, long right) =>
-            left >= right ? left - right <= 60 : right - left <= 60;
-
-        if (Within(period.ResetAt - (long)TimeSpan.FromDays(7).TotalSeconds, period.StartAt))
-        {
-            return true;
-        }
-
-        try
-        {
-            var monthlyStart = DateTimeOffset
-                .FromUnixTimeSeconds(period.ResetAt)
-                .AddMonths(-1)
-                .ToUnixTimeSeconds();
-            return Within(monthlyStart, period.StartAt);
-        }
-        catch (ArgumentOutOfRangeException)
-        {
-            return false;
-        }
     }
 
     internal static IReadOnlyList<ApiHistorySample> ReduceGraphSamples(

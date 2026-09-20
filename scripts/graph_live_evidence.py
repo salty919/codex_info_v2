@@ -10,8 +10,6 @@ Evidence is written only to an explicitly supplied directory outside the repo.
 from __future__ import annotations
 
 import argparse
-import calendar
-import datetime as _datetime
 import hashlib
 import http.client
 import json
@@ -41,7 +39,6 @@ CAUSE_ORDER = (
     "remaining_anomaly",
     "model_token_anomaly",
     "model_dollar_anomaly",
-    "quota_unattributed",
     "terminal_unobserved",
 )
 CAUSE_RANK = {cause: index for index, cause in enumerate(CAUSE_ORDER)}
@@ -252,70 +249,6 @@ def _validate_fixture(fixture: dict[str, Any]) -> tuple[dict[str, Any], list[dic
 
 def _rows_with_tail(period: dict[str, Any], samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows = [dict(sample, synthetic=False) for sample in samples]
-    if rows and rows[0]["timestamp"] > period["start_at"]:
-        reset_at = period["reset_at"]
-        weekly_start = reset_at - 7 * 86_400
-        reset_end = _datetime.datetime.fromtimestamp(reset_at, _datetime.timezone.utc)
-        previous_month = reset_end.month - 1
-        previous_year = reset_end.year
-        if previous_month == 0:
-            previous_month = 12
-            previous_year -= 1
-        previous_day = min(
-            reset_end.day,
-            calendar.monthrange(previous_year, previous_month)[1],
-        )
-        monthly_start = int(
-            _datetime.datetime(
-                previous_year,
-                previous_month,
-                previous_day,
-                reset_end.hour,
-                reset_end.minute,
-                reset_end.second,
-                tzinfo=_datetime.timezone.utc,
-            ).timestamp()
-        )
-        first_remaining_at = next(
-            (
-                sample["timestamp"]
-                for sample in rows
-                if sample.get("remaining_percent") is not None
-            ),
-            None,
-        )
-        has_reliable_model = first_remaining_at is not None and any(
-            sample.get("model_source") == "confirmed"
-            and sample.get("models_complete") is True
-            and sample["timestamp"] <= first_remaining_at
-            and any(
-                isinstance(model.get("total_tokens"), int)
-                and not isinstance(model.get("total_tokens"), bool)
-                and model["total_tokens"] >= 0
-                for model in sample.get("models") or []
-            )
-            for sample in rows
-        )
-        if (
-            has_reliable_model
-            and (
-                abs(period["start_at"] - weekly_start) <= 60
-                or abs(period["start_at"] - monthly_start) <= 60
-            )
-        ):
-            rows.insert(
-                0,
-                {
-                    "timestamp": period["start_at"],
-                    "reset_at": period["reset_at"],
-                    "remaining_percent": 100.0,
-                    "models": None,
-                    "models_complete": False,
-                    "model_source": "unavailable",
-                    "synthetic": False,
-                    "reset_boundary": True,
-                },
-            )
     if rows[-1]["timestamp"] < period["end_at"]:
         rows.append(
             {
@@ -396,9 +329,7 @@ def _model_projection(
     for index in range(1, len(rows) - 1):
         left, middle, right = raw[index - 1], raw[index], raw[index + 1]
         if (
-            rows[index]["timestamp"] - rows[index - 1]["timestamp"] == 60
-            and rows[index + 1]["timestamp"] - rows[index]["timestamp"] == 60
-            and left is not None
+            left is not None
             and middle is not None
             and right is not None
             and direct[index - 1]
@@ -526,8 +457,6 @@ def _model_projection(
                     rows[index].get("synthetic", False),
                 )
 
-    _shape_model_projection_by_task_activity(rows, result)
-
     # A sparse interpolation can fall below a preceding legacy display value
     # even when both direct anchors are monotonic.  Keep the visible cumulative
     # line monotonic by holding that inferred point at the last display value;
@@ -547,74 +476,6 @@ def _model_projection(
     return result
 
 
-def _shape_model_projection_by_task_activity(
-    rows: list[dict[str, Any]], result: list[ModelEvidence]
-) -> None:
-    """Mirror the native activity-weighted model interpolation.
-
-    Complete task-activity markers can prove that cumulative growth happened
-    only during active minutes.  Idle intervals therefore remain horizontal
-    while the total change is allocated across active elapsed time.  This is
-    presentation-only; direct rows remain the sole arithmetic anchors.
-    """
-    anchors = [
-        index
-        for index, point in enumerate(result)
-        if point.origin == "direct" and point.value is not None
-    ]
-    for left, right in pairwise(anchors):
-        left_value = result[left].value
-        right_value = result[right].value
-        if (
-            left_value is None
-            or right_value is None
-            or rows[right]["timestamp"] <= rows[left]["timestamp"]
-            or left_value < 0
-            or right_value < left_value
-        ):
-            continue
-        intervals: list[tuple[int, bool, float]] = []
-        has_idle = False
-        active_duration = 0.0
-        complete = True
-        for index in range(left + 1, right + 1):
-            marker = rows[index].get("task_active_since_previous")
-            if not isinstance(marker, bool):
-                complete = False
-                break
-            elapsed = max(
-                0,
-                rows[index]["timestamp"] - rows[index - 1]["timestamp"],
-            )
-            has_idle |= not marker
-            if marker:
-                active_duration += elapsed
-            intervals.append((index, marker, elapsed))
-        if (
-            not complete
-            or not has_idle
-            or (right_value > left_value and active_duration <= 0)
-        ):
-            continue
-        active_elapsed = 0.0
-        for index, active, elapsed in intervals:
-            if active:
-                active_elapsed += elapsed
-            if index == right:
-                continue
-            fraction = (
-                0.0
-                if right_value == left_value
-                else min(1.0, max(0.0, active_elapsed / active_duration))
-            )
-            result[index] = ModelEvidence(
-                left_value + (right_value - left_value) * fraction,
-                False,
-                "interpolated" if active else "bounded_flat",
-                result[index].synthetic,
-            )
-
-
 def _period_model_universe(
     samples: list[dict[str, Any]],
 ) -> tuple[str, ...]:
@@ -630,137 +491,18 @@ def _period_model_universe(
     )
 
 
-def _model_names_at(
-    projections: dict[str, list[ModelEvidence]],
-    index: int,
-    origins: set[str],
-) -> frozenset[str]:
-    return frozenset(
-        model
-        for model, projection in projections.items()
-        if index < len(projection)
-        and projection[index].value is not None
-        and projection[index].reliable
-        and projection[index].origin in origins
-    )
-
-
-def _token_interval_evidence(
-    rows: list[dict[str, Any]],
-    projections: dict[str, list[ModelEvidence]],
-    before: int,
-    after: int,
-    universe: Iterable[str] | None = None,
-) -> tuple[bool, bool, float, bool, list[str]]:
-    """Validate a complete adjacent raw-token interval.
-
-    The boolean result is intentionally strict: a projection value that was
-    held after an anomaly, a missing period model, or a non-monotonic raw
-    vector is not evidence.  The returned delta is only meaningful when the
-    interval is complete and reliable.
-    """
-
-    start = rows[before]["timestamp"]
-    end = rows[after]["timestamp"]
-    if end <= start or end - start > 60:
-        return False, False, 0.0, True, ["model_missing"]
-    names = tuple(universe or projections.keys())
-    if not names:
-        return False, False, 0.0, True, ["model_missing"]
-    causes: list[str] = []
-    total_delta = 0.0
-    inferred = False
-    for model in names:
-        left_projection = projections.get(model, [])[before] if model in projections else None
-        right_projection = projections.get(model, [])[after] if model in projections else None
-        if left_projection is None or right_projection is None:
-            causes.append("model_missing")
-            continue
-        left = left_projection.value
-        right = right_projection.value
-        if left is None or right is None:
-            causes.append("model_missing")
-            continue
-        if (
-            not left_projection.reliable
-            or not right_projection.reliable
-            or left < 0
-            or right < 0
-            or right < left
-        ):
-            causes.append("model_token_anomaly")
-            continue
-        total_delta += right - left
-    if causes or not math.isfinite(total_delta):
-        return (
-            False,
-            False,
-            0.0,
-            True,
-            list(dict.fromkeys(causes or ["model_token_anomaly"])),
-        )
-    return True, total_delta > 0.0, total_delta, inferred, []
-
-
-def _projected_token_interval_delta(
-    rows: list[dict[str, Any]],
-    projections: dict[str, list[ModelEvidence]],
-    before: int,
-    after: int,
-    universe: Iterable[str] | None = None,
-) -> tuple[bool, float, bool, bool]:
-    """Return direct/bounded token shape for UI quota presentation only.
-
-    Legacy observations may be drawn, but they cannot weight a second
-    prediction. Doing so would promote an explicitly incomplete saved model
-    vector into arithmetic authority.
-    """
-
-    start = rows[before]["timestamp"]
-    end = rows[after]["timestamp"]
-    names = tuple(universe or projections.keys())
-    if end <= start or not names:
-        return False, 0.0, True, False
-    total_delta = 0.0
-    exact = True
-    inferred = end - start > 60
-    for model in names:
-        values = projections.get(model)
-        if values is None:
-            return False, 0.0, True, False
-        left = values[before]
-        right = values[after]
-        if (
-            left.value is None
-            or right.value is None
-            or left.origin in {"held", "legacy", "rejected"}
-            or right.origin in {"held", "legacy", "rejected"}
-            or left.value < 0
-            or right.value < left.value
-        ):
-            return False, 0.0, True, False
-        total_delta += right.value - left.value
-        if not math.isfinite(total_delta):
-            return False, 0.0, True, False
-        exact &= left.reliable and right.reliable
-        inferred |= not left.reliable or not right.reliable
-    return True, total_delta, inferred, exact and total_delta <= sys.float_info.epsilon
-
-
 def _remaining_projection(
-    period: dict[str, Any],
+    _period: dict[str, Any],
     rows: list[dict[str, Any]],
-    token_models: dict[str, list[ModelEvidence]],
-    gaps: list[dict[str, Any]],
+    _token_models: dict[str, list[ModelEvidence]],
+    _gaps: list[dict[str, Any]],
 ) -> list[RemainingEvidence]:
     raw = [None if row.get("synthetic", False) else row["remaining_percent"] for row in rows]
     isolated: set[int] = set()
     for index in range(1, len(rows) - 1):
         left, middle, right = raw[index - 1], raw[index], raw[index + 1]
         if (
-            rows[index]["timestamp"] - rows[index - 1]["timestamp"] == 60
-            and rows[index + 1]["timestamp"] - rows[index]["timestamp"] == 60
-            and left is not None
+            left is not None
             and middle is not None
             and right is not None
             and left >= right
@@ -774,12 +516,7 @@ def _remaining_projection(
     for index, value in enumerate(raw):
         if value is None:
             continue
-        if rows[index].get("reset_boundary", False):
-            values[index] = value
-            origins[index] = "reset_boundary"
-            raw_reliable[index] = True
-            baseline = value
-        elif index in isolated or baseline is not None and value > baseline:
+        if index in isolated or baseline is not None and value > baseline:
             values[index] = baseline
             origins[index] = "monotonic_hold"
         else:
@@ -787,59 +524,6 @@ def _remaining_projection(
             values[index] = value
             origins[index] = "raw"
             raw_reliable[index] = True
-
-    universe = tuple(token_models)
-
-    def token_interval(before: int, after: int) -> tuple[bool, bool, float, bool, list[str]]:
-        if _hard_break(rows[before]["timestamp"], rows[after]["timestamp"], gaps):
-            return False, False, 0.0, True, ["confirmed_gap"]
-        return _token_interval_evidence(
-            rows,
-            token_models,
-            before,
-            after,
-            universe,
-        )
-
-    def span_weights(left: int, right: int) -> tuple[list[float], list[bool], bool]:
-        """Choose exactly one weighting basis for a whole quota-drop span."""
-
-        elapsed = [
-            max(0, rows[index + 1]["timestamp"] - rows[index]["timestamp"])
-            for index in range(left, right)
-        ]
-        evidence = []
-        for index in range(left, right):
-            start = rows[index]["timestamp"]
-            end = rows[index + 1]["timestamp"]
-            if _hard_break(start, end, gaps):
-                evidence.append((False, 0.0, True, False))
-            else:
-                evidence.append(
-                    _projected_token_interval_delta(
-                        rows,
-                        token_models,
-                        index,
-                        index + 1,
-                        universe,
-                    )
-                )
-        if evidence and all(item[0] for item in evidence):
-            token_weights = [item[1] for item in evidence]
-            if sum(token_weights) > 0.0:
-                return token_weights, [item[2] for item in evidence], True
-            return elapsed, [True] * len(elapsed), False
-        # Do not mix token units and seconds. Unknown intervals use elapsed
-        # weights, while exact token-flat intervals keep weight zero so a
-        # later data gap cannot smear a quota drop into proven idle time.
-        fallback = [
-            0 if item[0] and item[3] else elapsed[index]
-            for index, item in enumerate(evidence)
-        ]
-        inferred = [not (item[0] and item[3]) for item in evidence]
-        if sum(fallback) <= 0:
-            return elapsed, [True] * len(elapsed), False
-        return fallback, inferred, False
 
     run_start = 0
     while run_start < len(rows):
@@ -855,16 +539,16 @@ def _remaining_projection(
             continue
         bounded = run_end < len(rows) and values[run_end] is not None
         interpolated = False
-        if bounded and values[run_end] < values[left]:
-            weights, inferred, _ = span_weights(left, run_end)
-            weighted_seconds = sum(weights)
-            if weighted_seconds > 0:
-                weighted_elapsed = 0
+        if (
+            bounded
+            and values[run_end] < values[left]
+            and rows[run_end]["timestamp"] > rows[left]["timestamp"]
+        ):
+            elapsed = rows[run_end]["timestamp"] - rows[left]["timestamp"]
+            if elapsed > 0:
                 for index in range(run_start, run_end):
-                    weight = weights[index - left - 1]
-                    weighted_elapsed += weight
                     values[index] = values[left] + (values[run_end] - values[left]) * (
-                        weighted_elapsed / weighted_seconds
+                        (rows[index]["timestamp"] - rows[left]["timestamp"]) / elapsed
                     )
                     origins[index] = "interpolated"
                 interpolated = True
@@ -882,45 +566,6 @@ def _remaining_projection(
                 )
         run_start = run_end
 
-    anchors: list[int] = []
-    for index, value in enumerate(raw):
-        if value is None or not raw_reliable[index]:
-            continue
-        if not anchors or raw[anchors[-1]] != value:
-            anchors.append(index)
-    for left, right in pairwise(anchors):
-        if right - left < 2 or values[right] >= values[left]:
-            continue
-        if any(raw[index] is not None and not raw_reliable[index] for index in range(left + 1, right)):
-            continue
-        weights, inferred, model_shaped = span_weights(left, right)
-        weighted_seconds = sum(weights)
-        if weighted_seconds <= 0:
-            continue
-        weighted_elapsed = 0
-        for offset, index in enumerate(range(left + 1, right)):
-            weight = weights[offset]
-            weighted_elapsed += weight
-            smoothed = values[left] + (values[right] - values[left]) * (
-                weighted_elapsed / weighted_seconds
-            )
-            prior_value = values[index]
-            prior_origin = origins[index]
-            values[index] = smoothed
-            if raw_reliable[index] and raw[index] == smoothed:
-                continue
-            if (
-                raw[index] is None
-                and prior_value == smoothed
-                and prior_origin == "bounded_null_hold"
-            ):
-                continue
-            origins[index] = (
-                "activity_smoothed"
-                if model_shaped and not inferred[offset] and raw_reliable[index]
-                else "interpolated"
-            )
-
     return [
         RemainingEvidence(row["timestamp"], raw[index], values[index], origins[index])
         for index, row in enumerate(rows)
@@ -936,40 +581,38 @@ def _model_segments(
     gaps: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
-    previous: int | None = None
-    for index, point in enumerate(projection):
-        if point.value is None:
-            continue
-        if previous is None:
-            previous = index
-            continue
+    exact = [
+        index
+        for index, point in enumerate(projection)
+        if point.value is not None
+        and math.isfinite(point.value)
+        and point.value >= 0
+        and point.reliable
+        and point.origin == "direct"
+    ]
+    for previous, index in pairwise(exact):
         start, end = rows[previous]["timestamp"], rows[index]["timestamp"]
         causes: list[str] = []
         if _hard_break(start, end, gaps):
             causes.append("confirmed_gap")
-        if index != previous + 1 or end - start > 60:
+        predicted = list(range(previous + 1, index))
+        if predicted:
             causes.append("model_missing")
-        interval_sources = {row["model_source"] for row in rows[previous : index + 1]}
+        interval_sources = {rows[offset]["model_source"] for offset in predicted}
         if "unavailable" in interval_sources:
             causes.append("source_unavailable")
-        if len(interval_sources) > 1 and causes:
-            causes.append("source_mismatch")
-        origins = {projection[previous].origin, point.origin}
-        if "rejected" in origins:
+        if any(projection[offset].origin == "rejected" for offset in predicted):
             causes.append("model_token_anomaly" if metric == "tokens" else "model_dollar_anomaly")
-        elif (
-            not origins.issubset({"direct", "session"})
-            or not projection[previous].reliable
-            or not point.reliable
-        ):
-            causes.append("model_missing")
-        if rows[index].get("synthetic", False) or rows[previous].get("synthetic", False):
-            causes.append("terminal_unobserved")
+        previous_value = projection[previous].value
+        current_value = projection[index].value
+        assert previous_value is not None and current_value is not None
+        if current_value < previous_value:
+            causes.append("model_token_anomaly" if metric == "tokens" else "model_dollar_anomaly")
         style = (
             "dashed"
             if causes
             else "flat"
-            if projection[previous].value == point.value
+            if previous_value == current_value
             else "rising"
         )
         segments.append(
@@ -982,65 +625,67 @@ def _model_segments(
                 "causes": _causes(causes),
             }
         )
-        previous = index
+    if exact:
+        last_anchor = exact[-1]
+        last_renderable = next(
+            (
+                index
+                for index in range(len(projection) - 1, last_anchor, -1)
+                if projection[index].value is not None
+                and math.isfinite(projection[index].value)
+                and projection[index].value >= 0
+            ),
+            None,
+        )
+        if last_renderable is not None:
+            start = rows[last_anchor]["timestamp"]
+            end = rows[last_renderable]["timestamp"]
+            causes = ["model_missing"]
+            if _hard_break(start, end, gaps):
+                causes.append("confirmed_gap")
+            if rows[last_renderable].get("synthetic", False):
+                causes.append("terminal_unobserved")
+            segments.append(
+                {
+                    "metric": metric,
+                    "series": model,
+                    "start_at": start,
+                    "end_at": end,
+                    "style": "dashed",
+                    "causes": _causes(causes),
+                }
+            )
     return segments
 
 
 def _remaining_segments(
-    samples: list[dict[str, Any]],
+    _samples: list[dict[str, Any]],
     rows: list[dict[str, Any]],
     evidence: list[RemainingEvidence],
-    token_models: dict[str, list[ModelEvidence]],
+    _token_models: dict[str, list[ModelEvidence]],
     gaps: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    row_index = {row["timestamp"]: index for index, row in enumerate(rows)}
-    observed_minutes = {
-        sample["timestamp"] for sample in samples if sample["remaining_percent"] is not None
-    }
     result: list[dict[str, Any]] = []
-    for before, after in pairwise(evidence):
-        left, right = row_index[before.timestamp], row_index[after.timestamp]
+    anchors = [
+        index
+        for index, point in enumerate(evidence)
+        if point.origin == "raw"
+        and math.isfinite(point.effective)
+    ]
+    for left, right in pairwise(anchors):
+        before = evidence[left]
+        after = evidence[right]
         causes: list[str] = []
         if _hard_break(before.timestamp, after.timestamp, gaps):
             causes.append("confirmed_gap")
-        measured_origins = {"raw", "activity_smoothed"}
-        if before.origin not in measured_origins or after.origin not in measured_origins:
+        predicted = evidence[left + 1 : right]
+        measured = before.origin == "raw" and after.origin == "raw"
+        if not measured or predicted:
             causes.append("remaining_missing")
-        if before.origin == "monotonic_hold" or after.origin == "monotonic_hold":
+        if after.effective > before.effective or any(
+            point.origin == "monotonic_hold" for point in predicted
+        ):
             causes.append("remaining_anomaly")
-        if after.origin == "synthetic_tail_hold" or before.origin == "synthetic_tail_hold":
-            causes.append("terminal_unobserved")
-        contiguous_quota = (
-            before.timestamp in observed_minutes
-            and after.timestamp in observed_minutes
-            and after.timestamp - before.timestamp <= 60
-        )
-        if _hard_break(before.timestamp, after.timestamp, gaps):
-            available, advanced, _, inferred, model_causes = (
-                False,
-                False,
-                0.0,
-                True,
-                ["confirmed_gap"],
-            )
-        else:
-            available, advanced, _, inferred, model_causes = _token_interval_evidence(
-                rows,
-                token_models,
-                left,
-                right,
-                tuple(token_models),
-            )
-        if after.effective < before.effective and (not available or not advanced):
-            causes.append("quota_unattributed")
-            causes.extend(model_causes)
-        elif after.effective < before.effective and inferred:
-            # The drop is token-shaped, but the model cadence was restored
-            # from session evidence or an exact bounded-flat proof rather
-            # than observed directly by the periodic recorder.
-            causes.append("model_missing")
-        if not contiguous_quota:
-            causes.append("remaining_missing")
         result.append(
             {
                 "metric": "remaining",
@@ -1051,6 +696,26 @@ def _remaining_segments(
                 "causes": _causes(causes),
             }
         )
+    if anchors:
+        last_anchor = anchors[-1]
+        if last_anchor + 1 < len(evidence):
+            after = evidence[-1]
+            if after.timestamp > evidence[last_anchor].timestamp:
+                causes = ["remaining_missing"]
+                if _hard_break(evidence[last_anchor].timestamp, after.timestamp, gaps):
+                    causes.append("confirmed_gap")
+                if after.origin == "synthetic_tail_hold":
+                    causes.append("terminal_unobserved")
+                result.append(
+                    {
+                        "metric": "remaining",
+                        "series": "remaining",
+                        "start_at": evidence[last_anchor].timestamp,
+                        "end_at": after.timestamp,
+                        "style": "dashed",
+                        "causes": _causes(causes),
+                    }
+                )
     return result
 
 
@@ -1060,388 +725,69 @@ def _idle_intervals(
     token_models: dict[str, list[ModelEvidence]],
     gaps: list[dict[str, Any]],
 ) -> list[dict[str, int]]:
-    timestamps = [row["timestamp"] for row in rows]
     remaining = {
         point.timestamp: point
         for point in _remaining_projection(period, rows, token_models, gaps)
     }
-
-    def has_numeric_model_values(row: dict[str, Any]) -> bool:
-        return any(
-            model.get("total_tokens") is not None
-            or (
-                isinstance(model.get("total_dollars"), (int, float))
-                and math.isfinite(float(model["total_dollars"]))
-            )
-            for model in row.get("models") or []
-        )
-
-    def is_metadata_only_row(row: dict[str, Any]) -> bool:
-        value = row.get("remaining_percent")
-        return (
-            isinstance(value, (int, float))
-            and math.isfinite(float(value))
-            and 0 <= float(value) <= 100
-        )
-
-    def is_neutral_unavailable_row(
-        index: int,
-        left_index: int,
-        right_index: int,
-        model_names: frozenset[str],
-    ) -> bool:
-        """Allow one explicitly inactive, one-minute unavailable observation.
-
-        The row is still rendered as an unavailable/dashed observation.  It is
-        only neutral for the idle-band authority when both adjacent rows are
-        complete direct observations for the endpoint-common models.  This
-        prevents a recorder/API metadata miss from creating a false one-minute
-        split while keeping unknown or active intervals fail-closed.
-        """
-
-        if index <= left_index or index >= right_index:
-            return False
-        row = rows[index]
-        if (
-            row.get("model_source") != "unavailable"
-            or row.get("task_active_since_previous") is not False
-            or has_numeric_model_values(row)
-            or is_metadata_only_row(row)
-            or index == 0
-            or index + 1 >= len(rows)
-            or rows[index]["timestamp"] - rows[index - 1]["timestamp"] != 60
-            or rows[index + 1]["timestamp"] - rows[index]["timestamp"] != 60
-        ):
-            return False
-        previous = rows[index - 1]
-        following = rows[index + 1]
-        if (
-            previous.get("model_source") != "confirmed"
-            or not previous.get("models_complete")
-            or following.get("model_source") != "confirmed"
-            or not following.get("models_complete")
-        ):
-            return False
-        return model_names <= (
-            _model_names_at(token_models, index - 1, {"direct"})
-            & _model_names_at(token_models, index + 1, {"direct"})
-        )
-
-    def direct_models_remain_flat(
-        left_index: int,
-        right_index: int,
-        model_names: frozenset[str],
-    ) -> bool:
-        """Validate every point inside a sparse direct endpoint bridge."""
-
-        neutral_unavailable = 0
-        for index in range(left_index + 1, right_index):
-            row = rows[index]
-            if row.get("model_source") == "unavailable":
-                neutral_unavailable += 1
-                if neutral_unavailable > 1:
-                    return False
-            if row.get("task_active_since_previous") is True:
-                return False
-            if row.get("model_source") != "confirmed" or not row.get("models_complete"):
-                if is_neutral_unavailable_row(index, left_index, right_index, model_names):
-                    continue
-                if has_numeric_model_values(row) or not is_metadata_only_row(row):
-                    return False
-                continue
-            if not model_names <= _model_names_at(token_models, index, {"direct"}):
-                return False
-            for model in model_names:
-                point = token_models[model][index]
-                baseline = token_models[model][left_index]
-                if (
-                    point.value is None
-                    or not point.reliable
-                    or point.origin != "direct"
-                    or point.value != baseline.value
-                ):
-                    return False
-        return True
-
-    by_timestamp = {timestamp: index for index, timestamp in enumerate(timestamps)}
-
-    def direct_span_is_flat(start: int, end: int) -> bool:
-        """Re-check the endpoint-common model set before merging adjacent runs."""
-
-        left_index = by_timestamp.get(start)
-        right_index = by_timestamp.get(end)
-        if left_index is None or right_index is None or right_index <= left_index:
-            return False
-        left_names = _model_names_at(token_models, left_index, {"direct"})
-        right_names = _model_names_at(token_models, right_index, {"direct"})
-        common_names = left_names & right_names
-        if not common_names:
-            return False
-        if any(
-            token_models[model][left_index].value
-            != token_models[model][right_index].value
-            for model in common_names
-        ):
-            return False
-        if sum(
-            row.get("model_source") == "unavailable"
-            for row in rows[left_index + 1 : right_index]
-        ) > 1:
-            return False
-        left_remaining = remaining.get(start)
-        right_remaining = remaining.get(end)
-        if (
-            left_remaining is None
-            or right_remaining is None
-            or left_remaining.raw is None
-            or right_remaining.raw is None
-            or not math.isfinite(left_remaining.raw)
-            or not math.isfinite(right_remaining.raw)
-            or struct.pack("!d", left_remaining.raw)
-            != struct.pack("!d", right_remaining.raw)
-        ):
-            return False
-        return direct_models_remain_flat(left_index, right_index, common_names)
-
-    accepted_remaining_origins = {
-        "raw",
-        "activity_smoothed",
-        "bounded_null_hold",
-        "interpolated",
-    }
-    intervals: list[tuple[int, int, int]] = []
+    intervals: list[tuple[int, int]] = []
     for index in range(len(rows) - 1):
-        elapsed = timestamps[index + 1] - timestamps[index]
-        start, end = timestamps[index], timestamps[index + 1]
-        # Reliable token/quota observations are the idle authority. A known
-        # active task disproves idle, while unavailable historical lifecycle
-        # evidence must not erase an otherwise observed flat interval.
-        if rows[index + 1].get("task_active_since_previous") is True:
+        left = rows[index]
+        right = rows[index + 1]
+        start, end = left["timestamp"], right["timestamp"]
+        if end <= start:
             continue
         if _hard_break(start, end, gaps):
             continue
-        if elapsed == 60:
-            left_names = _model_names_at(token_models, index, {"direct"})
-            right_names = _model_names_at(token_models, index + 1, {"direct"})
-            common_names = left_names & right_names
-            available = advanced = False
-            if common_names:
-                available, advanced, _, _, _ = _token_interval_evidence(
-                    rows,
-                    token_models,
-                    index,
-                    index + 1,
-                    tuple(sorted(common_names)),
-                )
-            observed_count = 1 if available and not advanced else 0
-        elif elapsed >= 120:
-            # Sparse idle anchors still need direct recorder observations at
-            # both endpoints. Session/display reconstruction is presentation
-            # evidence only and cannot establish an idle authority.
-            exact_origins = {"direct"}
-            left_names = _model_names_at(token_models, index, exact_origins)
-            right_names = _model_names_at(token_models, index + 1, exact_origins)
-            common_names = left_names & right_names
-            observed_count = 2 if common_names and all(
-                token_models[model][index].value
-                == token_models[model][index + 1].value
-                for model in common_names
-            ) and direct_models_remain_flat(index, index + 1, common_names) else 0
-        else:
-            observed_count = 0
-        if observed_count == 0:
+        if (
+            left.get("synthetic", False)
+            or right.get("synthetic", False)
+            or left.get("model_source") != "confirmed"
+            or right.get("model_source") != "confirmed"
+            or left.get("models_complete") is not True
+            or right.get("models_complete") is not True
+        ):
+            continue
+        left_names = frozenset(model["model"] for model in left.get("models") or [])
+        right_names = frozenset(model["model"] for model in right.get("models") or [])
+        if not left_names or left_names != right_names:
+            continue
+        if any(
+            name not in token_models
+            or index >= len(token_models[name])
+            or index + 1 >= len(token_models[name])
+            or token_models[name][index].origin != "direct"
+            or token_models[name][index + 1].origin != "direct"
+            or not token_models[name][index].reliable
+            or not token_models[name][index + 1].reliable
+            or token_models[name][index].value != token_models[name][index + 1].value
+            for name in left_names
+        ):
             continue
         before = remaining.get(start)
         after = remaining.get(end)
-        if before is None or after is None:
-            continue
-        if before.origin not in accepted_remaining_origins:
-            continue
-        if after.origin not in accepted_remaining_origins:
-            continue
-        # Idle authority is the raw provider quota at the two direct
-        # endpoints. Presentation interpolation may slope between equal raw
-        # anchors when a later quota drop is distributed across a gap; that
-        # display-only slope must not erase a proven flat interval.
         if (
-            before.raw is None
+            before is None
+            or after is None
+            or before.origin != "raw"
+            or after.origin != "raw"
+            or before.raw is None
             or after.raw is None
             or not math.isfinite(before.raw)
             or not math.isfinite(after.raw)
             or struct.pack("!d", before.raw) != struct.pack("!d", after.raw)
         ):
             continue
-        intervals.append((start, end, observed_count))
-
-    # A single neutral unavailable row can be the first observation after an
-    # active minute.  In that shape there is no already-confirmed interval on
-    # its left to bridge from, but the two direct endpoints still prove the
-    # same idle value.  Add the two-minute endpoint span so the subsequent
-    # merge uses the same authority as the native and Windows projections.
-    for index in range(1, len(rows) - 1):
-        row = rows[index]
-        if row.get("model_source") != "unavailable":
-            continue
-        left_index, right_index = index - 1, index + 1
-        if timestamps[right_index] - timestamps[left_index] != 120:
-            continue
-        left_names = _model_names_at(token_models, left_index, {"direct"})
-        right_names = _model_names_at(token_models, right_index, {"direct"})
-        common_names = left_names & right_names
-        if (
-            not common_names
-            or not is_neutral_unavailable_row(
-                index, left_index, right_index, common_names
-            )
-            or not direct_models_remain_flat(left_index, right_index, common_names)
-        ):
-            continue
-        left_remaining = remaining.get(timestamps[left_index])
-        right_remaining = remaining.get(timestamps[right_index])
-        if (
-            left_remaining is None
-            or right_remaining is None
-            or left_remaining.raw is None
-            or right_remaining.raw is None
-            or not math.isfinite(left_remaining.raw)
-            or not math.isfinite(right_remaining.raw)
-            or struct.pack("!d", left_remaining.raw)
-            != struct.pack("!d", right_remaining.raw)
-            or left_remaining.origin not in accepted_remaining_origins
-            or right_remaining.origin not in accepted_remaining_origins
-        ):
-            continue
-        intervals.append((timestamps[left_index], timestamps[right_index], 2))
+        intervals.append((start, end))
 
     merged: list[list[int]] = []
-    for start, end, observed_count in sorted(intervals):
+    for start, end in intervals:
         if merged and start == merged[-1][1]:
-            candidate_has_unavailable = any(
-                row.get("model_source") == "unavailable"
-                for row in rows[by_timestamp[start] + 1 : by_timestamp[end]]
-            )
-            prior_has_unavailable = any(
-                row.get("model_source") == "unavailable"
-                for row in rows[by_timestamp[merged[-1][0]] + 1 : by_timestamp[start]]
-            )
-            if candidate_has_unavailable and prior_has_unavailable:
-                # Do not seed a new band with the two-minute span around a
-                # second missing row when the preceding band already crossed
-                # one. The next direct interval will start after this dashed
-                # anomaly, leaving the boundary visible.
-                continue
-        if merged and start == merged[-1][1] and direct_span_is_flat(merged[-1][0], end):
-            # A model may appear at a later direct endpoint, but a model that
-            # was already part of the proven baseline must not disappear from
-            # one merged idle band.  Otherwise a partial vector can be hidden
-            # by endpoint intersection and the band crosses a data-integrity
-            # boundary.
-            prior_names = _model_names_at(
-                token_models,
-                by_timestamp[merged[-1][0]],
-                {"direct"},
-            )
-            end_names = _model_names_at(token_models, by_timestamp[end], {"direct"})
-            if not prior_names <= end_names:
-                merged.append([start, end, observed_count])
-                continue
-            merged[-1][1] = max(merged[-1][1], end)
-            merged[-1][2] += observed_count
+            merged[-1][1] = end
         else:
-            merged.append([start, end, observed_count])
-    confirmed = [
-        [max(start, period["start_at"]), min(end, period["end_at"])]
-        for start, end, observed_count in merged
-        if observed_count >= 2
-        and min(end, period["end_at"]) > max(start, period["start_at"])
-    ]
-    # Keep the timestamp index available for both adjacent-run validation and
-    # the sparse bridge check below.
-    # Bridge validation is likewise limited to direct recorder observations;
-    # session recovery and bounded display holds cannot prove that no tokens
-    # were spent during the missing cadence.
-    exact_model_origins = {"direct"}
-    def bridge_is_confirmed_flat(
-        start: int,
-        end: int,
-        combined_start: int | None = None,
-    ) -> bool:
-        if end <= start or _hard_break(start, end, gaps):
-            return False
-        left_index = by_timestamp.get(start)
-        right_index = by_timestamp.get(end)
-        if left_index is None or right_index is None or right_index <= left_index:
-            return False
-        combined_left_index = by_timestamp.get(combined_start, left_index)
-        if sum(
-            row.get("model_source") == "unavailable"
-            for row in rows[combined_left_index + 1 : right_index]
-        ) > 1:
-            return False
-        if any(
-            row.get("task_active_since_previous") is True
-            for row in rows[left_index + 1 : right_index + 1]
-        ):
-            return False
-        exact_names = _model_names_at(token_models, left_index, exact_model_origins)
-        right_names = _model_names_at(token_models, right_index, exact_model_origins)
-        # Never bridge across a direct row that drops a model already present
-        # in the preceding proven band.  Endpoint intersection alone would
-        # hide that partial vector and turn a data-integrity boundary into one
-        # continuous idle band.
-        if not exact_names <= right_names:
-            return False
-        exact_names &= right_names
-        if not exact_names:
-            return False
-        for model in exact_names:
-            projection = token_models.get(model)
-            if projection is None:
-                return False
-            left = projection[left_index]
-            right = projection[right_index]
-            if (
-                left.value is None
-                or right.value is None
-                or left.origin not in exact_model_origins
-                or right.origin not in exact_model_origins
-                or left.value != right.value
-            ):
-                return False
-        if not direct_models_remain_flat(left_index, right_index, exact_names):
-            return False
-        left_remaining = remaining.get(start)
-        right_remaining = remaining.get(end)
-        if (
-            left_remaining is None
-            or right_remaining is None
-            or left_remaining.raw is None
-            or right_remaining.raw is None
-            or not math.isfinite(left_remaining.raw)
-            or not math.isfinite(right_remaining.raw)
-            or struct.pack("!d", left_remaining.raw)
-            != struct.pack("!d", right_remaining.raw)
-            or left_remaining.origin not in accepted_remaining_origins
-            or right_remaining.origin not in accepted_remaining_origins
-        ):
-            return False
-        # Intermediate quota points may carry a presentation-only smoothing
-        # origin/effective value when a later drop is distributed.  Idle
-        # authority is the endpoint raw quota equality; the display line may
-        # still slope or dash without invalidating that proven flat band.
-        return True
-
-    bridged: list[list[int]] = []
-    for start, end in confirmed:
-        if bridged and start > bridged[-1][1] and bridge_is_confirmed_flat(
-            bridged[-1][1], start, bridged[-1][0]
-        ):
-            bridged[-1][1] = end
-        else:
-            bridged.append([start, end])
+            merged.append([start, end])
     return [
         {"start_at": start, "end_at": end}
-        for start, end in bridged
+        for start, end in merged
         if end - start >= SUSTAINED_UNUSED_MIN_DURATION_SECONDS
     ]
 
@@ -1487,32 +833,247 @@ def _canonical_segment(start: tuple[float, float], end: tuple[float, float]) -> 
     return f"M{start[0]:.2f} {start[1]:.2f} L{end[0]:.2f} {end[1]:.2f}"
 
 
-def _canonical_dashes(start: tuple[float, float], end: tuple[float, float]) -> list[str]:
-    dx = end[0] - start[0]
-    dy = end[1] - start[1]
-    length = math.hypot(dx, dy)
-    if not math.isfinite(length) or length <= sys.float_info.epsilon:
-        return []
+def _canonical_dashes_polyline(points: list[tuple[float, float]]) -> list[str]:
     result: list[str] = []
-    offset = 0.0
-    while offset < length:
-        dash_end = min(offset + 0.45, length)
-        start_fraction = offset / length
-        end_fraction = dash_end / length
-        result.append(
-            _canonical_segment(
-                (
-                    start[0] + dx * start_fraction,
-                    start[1] + dy * start_fraction,
-                ),
-                (
-                    start[0] + dx * end_fraction,
-                    start[1] + dy * end_fraction,
-                ),
-            )
-        )
-        offset += 0.75
+    dash, period = 0.45, 0.75
+    epsilon = 1e-12
+    phase = 0.0
+    for start, end in pairwise(points):
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length = math.hypot(dx, dy)
+        if not math.isfinite(length) or length <= epsilon:
+            continue
+        offset = 0.0
+        while offset < length:
+            in_dash = phase < dash
+            phase_end = dash if in_dash else period
+            advance = min(phase_end - phase, length - offset)
+            if advance <= epsilon:
+                phase = 0.0 if phase_end >= period else phase_end
+                continue
+            if in_dash:
+                start_fraction = offset / length
+                end_fraction = (offset + advance) / length
+                result.append(
+                    _canonical_segment(
+                        (
+                            start[0] + dx * start_fraction,
+                            start[1] + dy * start_fraction,
+                        ),
+                        (
+                            start[0] + dx * end_fraction,
+                            start[1] + dy * end_fraction,
+                        ),
+                    )
+                )
+            offset += advance
+            phase += advance
+            if phase >= period - epsilon:
+                phase = 0.0
+            elif abs(phase - dash) <= epsilon:
+                phase = dash
     return result
+
+
+def _canonical_dashes(start: tuple[float, float], end: tuple[float, float]) -> list[str]:
+    return _canonical_dashes_polyline([start, end])
+
+
+def _segment_is_smoothable(
+    segment: dict[str, Any],
+    values: dict[int, float],
+    remaining: bool,
+) -> bool:
+    causes = set(segment.get("causes", []))
+    if "terminal_unobserved" in causes or any(
+        cause in causes
+        for cause in (
+            "model_token_anomaly",
+            "model_dollar_anomaly",
+            "remaining_anomaly",
+        )
+    ):
+        return False
+    start = values.get(segment["start_at"])
+    end = values.get(segment["end_at"])
+    if start is None or end is None or not math.isfinite(start) or not math.isfinite(end):
+        return False
+    return end <= start if remaining else end >= start
+
+
+def _canonical_curve_interval(
+    timestamps: list[int],
+    raw_values: list[float],
+    interval: int,
+    period: dict[str, Any],
+    maximum: float,
+    remaining: bool,
+) -> list[tuple[float, float]]:
+    period_span = max(1, period["end_at"] - period["start_at"])
+    viewbox_width = (
+        abs(timestamps[interval + 1] - timestamps[interval])
+        / period_span
+        * 100.0
+    )
+    steps = max(1, math.ceil(viewbox_width / 0.25))
+    fractions = [step / steps for step in range(steps + 1)]
+    projected = _monotone_cubic_interval_values(
+        [float(timestamp) for timestamp in timestamps],
+        raw_values,
+        interval,
+        fractions,
+    )
+    return [
+        _canonical_coordinate(
+            timestamps[interval]
+            + (timestamps[interval + 1] - timestamps[interval]) * fraction,
+            projected[step],
+            period["start_at"],
+            period["end_at"],
+            maximum,
+            remaining,
+        )
+        for step, fraction in enumerate(fractions)
+    ]
+
+
+def _monotone_cubic_slopes(x: list[float], y: list[float]) -> list[float]:
+    if (
+        len(x) != len(y)
+        or len(x) < 2
+        or any(not math.isfinite(value) for value in [*x, *y])
+        or any(right <= left for left, right in pairwise(x))
+    ):
+        raise ValueError("monotone cubic anchors must be finite and strictly ordered")
+    widths = [right - left for left, right in pairwise(x)]
+    deltas = [
+        (right - left) / width
+        for (left, right), width in zip(pairwise(y), widths, strict=True)
+    ]
+    if len(x) == 2:
+        return [deltas[0], deltas[0]]
+
+    def endpoint(width: float, next_width: float, delta: float, next_delta: float) -> float:
+        candidate = ((2.0 * width + next_width) * delta - width * next_delta) / (
+            width + next_width
+        )
+        if candidate * delta <= 0.0:
+            return 0.0
+        if delta * next_delta < 0.0 and abs(candidate) > 3.0 * abs(delta):
+            return 3.0 * delta
+        return candidate
+
+    slopes = [0.0] * len(x)
+    slopes[0] = endpoint(widths[0], widths[1], deltas[0], deltas[1])
+    for index in range(1, len(x) - 1):
+        before = deltas[index - 1]
+        after = deltas[index]
+        if before * after <= 0.0:
+            slopes[index] = 0.0
+            continue
+        before_width = widths[index - 1]
+        after_width = widths[index]
+        first_weight = 2.0 * after_width + before_width
+        second_weight = after_width + 2.0 * before_width
+        slopes[index] = (first_weight + second_weight) / (
+            first_weight / before + second_weight / after
+        )
+    slopes[-1] = endpoint(widths[-1], widths[-2], deltas[-1], deltas[-2])
+    return slopes
+
+
+def _monotone_cubic_interval_values(
+    x: list[float],
+    y: list[float],
+    interval: int,
+    fractions: list[float],
+) -> list[float]:
+    slopes = _monotone_cubic_slopes(x, y)
+    if interval < 0 or interval + 1 >= len(x):
+        raise ValueError("monotone cubic interval is outside the anchor range")
+    if any(not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0 for fraction in fractions):
+        raise ValueError("monotone cubic fractions must be finite and within zero to one")
+    width = x[interval + 1] - x[interval]
+    result: list[float] = []
+    for fraction in fractions:
+        squared = fraction * fraction
+        cubed = squared * fraction
+        result.append(
+            (2.0 * cubed - 3.0 * squared + 1.0) * y[interval]
+            + (cubed - 2.0 * squared + fraction) * width * slopes[interval]
+            + (-2.0 * cubed + 3.0 * squared) * y[interval + 1]
+            + (cubed - squared) * width * slopes[interval + 1]
+        )
+    return result
+
+
+def _canonical_smooth_path(
+    segments: list[dict[str, Any]],
+    style: str,
+    values: dict[int, float],
+    period: dict[str, Any],
+    maximum: float,
+    remaining: bool,
+) -> str:
+    commands: list[str] = []
+    run_start = 0
+    while run_start < len(segments):
+        if not _segment_is_smoothable(segments[run_start], values, remaining):
+            segment = segments[run_start]
+            if segment["style"] == style:
+                start = _canonical_coordinate(
+                    segment["start_at"],
+                    values[segment["start_at"]],
+                    period["start_at"],
+                    period["end_at"],
+                    maximum,
+                    remaining,
+                )
+                end = _canonical_coordinate(
+                    segment["end_at"],
+                    values[segment["end_at"]],
+                    period["start_at"],
+                    period["end_at"],
+                    maximum,
+                    remaining,
+                )
+                if style == "dashed":
+                    commands.extend(_canonical_dashes(start, end))
+                else:
+                    commands.append(_canonical_segment(start, end))
+            run_start += 1
+            continue
+        run_end = run_start + 1
+        while (
+            run_end < len(segments)
+            and _segment_is_smoothable(segments[run_end], values, remaining)
+            and segments[run_end]["start_at"] == segments[run_end - 1]["end_at"]
+        ):
+            run_end += 1
+        run = segments[run_start:run_end]
+        timestamps = [run[0]["start_at"], *[segment["end_at"] for segment in run]]
+        raw_values = [values[timestamp] for timestamp in timestamps]
+        for interval, segment in enumerate(run):
+            if segment["style"] != style:
+                continue
+            points = _canonical_curve_interval(
+                timestamps,
+                raw_values,
+                interval,
+                period,
+                maximum,
+                remaining,
+            )
+            if style == "dashed":
+                commands.extend(_canonical_dashes_polyline(points))
+            else:
+                commands.extend(
+                    _canonical_segment(start, end)
+                    for start, end in pairwise(points)
+                )
+        run_start = run_end
+    return " ".join(commands)
 
 
 def _canonical_path(
@@ -1523,31 +1084,14 @@ def _canonical_path(
     maximum: float,
     remaining: bool,
 ) -> str:
-    commands: list[str] = []
-    for segment in segments:
-        if segment["style"] != style:
-            continue
-        start = _canonical_coordinate(
-            segment["start_at"],
-            values[segment["start_at"]],
-            period["start_at"],
-            period["end_at"],
-            maximum,
-            remaining,
-        )
-        end = _canonical_coordinate(
-            segment["end_at"],
-            values[segment["end_at"]],
-            period["start_at"],
-            period["end_at"],
-            maximum,
-            remaining,
-        )
-        if style == "dashed":
-            commands.extend(_canonical_dashes(start, end))
-        else:
-            commands.append(_canonical_segment(start, end))
-    return " ".join(commands)
+    return _canonical_smooth_path(
+        segments,
+        style,
+        values,
+        period,
+        maximum,
+        remaining,
+    )
 
 
 def _remaining_markers(
@@ -1842,7 +1386,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
                 "terra": "#5dc98a",
                 "luna": "#e6a23c",
                 "astra": "#ef6a6a",
-                "flat_width": 1,
+                "flat_width": 3,
                 "rising_width": 3,
                 "inferred_width": 1,
                 "remaining_width": 3,
