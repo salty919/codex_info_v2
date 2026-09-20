@@ -2854,13 +2854,13 @@ public sealed class GraphPlotControlTests
                 ModelSamples =
                 [
                     Model("LUNA", 8_364_408, 0.54),
-                    Model("SOL", 172_318_074, 119.86),
+                    Model("SOL", 172_318_074, minute == 15 ? 120.86 : 119.86),
                     Model("TERRA", 0, 0),
                 ],
             })
             .ToArray();
 
-        var scene = GraphScene.Create(samples, GraphMetric.Tokens, start, start + 1_800);
+        var scene = GraphScene.Create(samples, GraphMetric.Dollars, start, start + 1_800);
         var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
         var remaining = GraphPlotProjection.BuildRemainingLines(scene);
 
@@ -2871,6 +2871,8 @@ public sealed class GraphPlotControlTests
         Assert.Empty(model.Flat.X);
         Assert.Empty(model.Rising.X);
         Assert.Empty(model.Dashed.X);
+        Assert.All(model.Idle.Y, value => Assert.Equal(model.Idle.Y[0], value));
+        Assert.All(scene.ModelReliability["SOL"], Assert.False);
         Assert.Equal(31, remaining.Idle.X.Count);
         Assert.Empty(remaining.Solid.X);
         Assert.Empty(remaining.Dashed.X);

@@ -4942,50 +4942,68 @@ fn graph_model_is_lossless_idle_observation(point: &GraphModelPoint) -> bool {
     ) && point.raw_tokens.is_some()
 }
 
-/// Normalize only the presentation copy of derived dollars. A direct token
-/// total that is unchanged over a run proves that the same model accrued no
-/// additional cost; a changed, missing, or rejected dollar inside that run is
-/// therefore a dollar-side projection error, not usage evidence.
+/// Normalize only the presentation copy of derived dollars. A lossless raw
+/// token total that is unchanged over a same-origin run proves that the same
+/// model accrued no additional cost; a changed, missing, or rejected dollar
+/// inside that run is therefore a dollar-side projection error, not usage
+/// evidence. Legacy observations are eligible only inside an independently
+/// confirmed idle interval and retain their non-authoritative provenance.
 fn normalize_graph_dollars_from_token_identity(
     dollar_timelines: &mut GraphModelTimelines,
     token_timelines: &GraphModelTimelines,
+    idle_timestamp_intervals: &[(i64, i64)],
 ) {
     for (name, token_timeline) in token_timelines {
         let Some(dollar_timeline) = dollar_timelines.get_mut(name) else {
             continue;
         };
-        let mut runs = Vec::<Vec<i64>>::new();
+        let mut runs = Vec::<(GraphModelOrigin, Vec<i64>)>::new();
         let mut run = Vec::<i64>::new();
-        let mut run_tokens = None::<u64>;
+        let mut run_identity = None::<(GraphModelOrigin, u64)>;
         for (timestamp, point) in token_timeline {
-            let direct_tokens = (point.origin == GraphModelOrigin::Direct)
+            let eligible_origin = point.origin == GraphModelOrigin::Direct
+                || point.origin == GraphModelOrigin::LegacyObserved
+                    && idle_timestamp_intervals
+                        .iter()
+                        .any(|(start, end)| *start <= *timestamp && *timestamp <= *end);
+            let identity = eligible_origin
                 .then(|| graph_model_raw_tokens(point))
-                .flatten();
-            match direct_tokens {
-                Some(tokens) if run_tokens == Some(tokens) => run.push(*timestamp),
-                Some(tokens) => {
+                .flatten()
+                .map(|tokens| (point.origin, tokens));
+            match identity {
+                Some(identity) if run_identity == Some(identity) => run.push(*timestamp),
+                Some(identity) => {
                     if !run.is_empty() {
-                        runs.push(std::mem::take(&mut run));
+                        runs.push((
+                            run_identity.expect("a non-empty run has an identity").0,
+                            std::mem::take(&mut run),
+                        ));
                     }
-                    run_tokens = Some(tokens);
+                    run_identity = Some(identity);
                     run.push(*timestamp);
                 }
                 None => {
                     if !run.is_empty() {
-                        runs.push(std::mem::take(&mut run));
+                        runs.push((
+                            run_identity.expect("a non-empty run has an identity").0,
+                            std::mem::take(&mut run),
+                        ));
                     }
-                    run_tokens = None;
+                    run_identity = None;
                 }
             }
         }
         if !run.is_empty() {
-            runs.push(run);
+            runs.push((
+                run_identity.expect("a non-empty run has an identity").0,
+                run,
+            ));
         }
 
-        for run in runs.into_iter().filter(|run| run.len() >= 2) {
+        for (run_origin, run) in runs.into_iter().filter(|(_, run)| run.len() >= 2) {
             let baseline = run.iter().find_map(|timestamp| {
                 dollar_timeline.get(timestamp).and_then(|point| {
-                    (point.origin == GraphModelOrigin::Direct
+                    ((point.origin == run_origin || run_origin == GraphModelOrigin::LegacyObserved)
                         && point.dollar.is_finite()
                         && point.dollar >= 0.0)
                         .then_some(point.dollar)
@@ -4997,7 +5015,7 @@ fn normalize_graph_dollars_from_token_identity(
             for timestamp in run {
                 if let Some(point) = dollar_timeline.get_mut(&timestamp) {
                     point.dollar = baseline;
-                    point.origin = GraphModelOrigin::Direct;
+                    point.origin = run_origin;
                 }
             }
         }
@@ -5026,7 +5044,6 @@ fn accepted_graph_model_timelines(
                     *timestamp,
                     graph_model_value(point, show_tokens),
                     point.origin,
-                    graph_model_line_is_exact(point),
                 )
             })
             .collect::<Vec<_>>();
@@ -5039,7 +5056,9 @@ fn accepted_graph_model_timelines(
                 let finite = [left.1, middle.1, right.1]
                     .into_iter()
                     .all(|value| value.is_finite() && value >= 0.0);
-                ([left.3, middle.3, right.3].into_iter().all(|exact| exact)
+                ([left.2, middle.2, right.2]
+                    .into_iter()
+                    .all(|origin| origin == GraphModelOrigin::Direct)
                     && finite
                     && left.1 <= right.1
                     && (middle.1 < left.1 || middle.1 > right.1))
@@ -5047,7 +5066,7 @@ fn accepted_graph_model_timelines(
             })
             .collect::<BTreeSet<_>>();
         let mut direct_baseline = None::<f64>;
-        for (timestamp, raw_value, source_origin, _) in raw {
+        for (timestamp, raw_value, source_origin) in raw {
             let Some(point) = timeline.get_mut(&timestamp) else {
                 continue;
             };
@@ -5839,7 +5858,19 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sa
     for timeline in token_timelines.values_mut() {
         normalize_graph_model_display_monotonic(timeline, true);
     }
-    normalize_graph_dollars_from_token_identity(&mut dollar_timelines, &token_timelines);
+    let idle_timestamp_intervals = token_idle_timestamp_intervals_with_render_evidence(
+        samples,
+        period_start,
+        period_end,
+        model_timelines,
+        confirmed_gaps,
+        Some(&GraphIdleRenderEvidence { untrusted_minutes }),
+    );
+    normalize_graph_dollars_from_token_identity(
+        &mut dollar_timelines,
+        &token_timelines,
+        &idle_timestamp_intervals,
+    );
     let display_timelines = if show_tokens {
         token_timelines.clone()
     } else {
@@ -5858,14 +5889,6 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sa
         .iter()
         .map(|point| (point.timestamp, point.effective))
         .collect::<Vec<_>>();
-    let idle_timestamp_intervals = token_idle_timestamp_intervals_with_render_evidence(
-        samples,
-        period_start,
-        period_end,
-        model_timelines,
-        confirmed_gaps,
-        Some(&GraphIdleRenderEvidence { untrusted_minutes }),
-    );
     let remaining_correction_starts = BTreeSet::new();
     let minute = graph_minute_points_with_model_timelines(
         samples,
@@ -25764,7 +25787,11 @@ mod tests {
         for timeline in token_timelines.values_mut() {
             super::normalize_graph_model_display_monotonic(timeline, true);
         }
-        super::normalize_graph_dollars_from_token_identity(&mut dollar_timelines, &token_timelines);
+        super::normalize_graph_dollars_from_token_identity(
+            &mut dollar_timelines,
+            &token_timelines,
+            &idle_timestamp_intervals,
+        );
         let dollar_correction_starts = dollar_timelines
             .values()
             .flat_map(|timeline| super::graph_model_correction_starts(Some(timeline)))
@@ -26927,9 +26954,11 @@ mod tests {
                 true,
                 &confirmed_gaps,
             );
+            let expected_idle = intervals(&case["idle_intervals"]);
             super::normalize_graph_dollars_from_token_identity(
                 &mut dollar_timelines,
                 &token_timelines,
+                &expected_idle,
             );
             let graph = |show_tokens| {
                 super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
@@ -26965,7 +26994,6 @@ mod tests {
                     "token maximum {name}"
                 );
             }
-            let expected_idle = intervals(&case["idle_intervals"]);
             assert_eq!(
                 idle_as_timestamps(&dollars.unused_intervals, start, end),
                 expected_idle,
@@ -32013,12 +32041,12 @@ mod tests {
         assert_eq!((retained_legacy.sol, retained_legacy.luna), (2.0, 0.5));
 
         let paths = state.graph_paths_for_selection_at(observed_at, true, false, true, false);
-        assert!(paths.sol_rising.is_empty());
-        assert!(paths.luna_rising.is_empty());
+        assert!(!paths.sol_rising.is_empty());
+        assert!(!paths.luna_rising.is_empty());
         assert!(paths.sol_flat.is_empty());
         assert!(paths.luna_flat.is_empty());
-        assert!(paths.sol_inferred.is_empty());
-        assert!(paths.luna_inferred.is_empty());
+        assert!(!paths.sol_inferred.is_empty());
+        assert!(!paths.luna_inferred.is_empty());
         assert_eq!(paths.current_sol_label, "$3.00");
         assert_eq!(paths.current_luna_label, "$0.80");
         assert!(!paths.remaining_solid.is_empty());
@@ -38633,10 +38661,11 @@ mod tests {
             fixture.expected_graph_timestamps
         );
         let graph = state.graph_paths_for_selection_at(observed_at, true, true, true, false);
-        // v1 cannot carry source completeness. Its latest saved value remains
-        // label-only; it cannot become a line, arithmetic, or idle authority.
-        assert!(graph.sol_flat.is_empty());
-        assert!(graph.sol_rising.is_empty());
+        // v1 cannot carry source completeness, but its lossless saved legacy
+        // values remain measured display evidence. They never become
+        // arithmetic authority or prove a session-level idle interval.
+        assert!(!graph.sol_flat.is_empty());
+        assert!(!graph.sol_rising.is_empty());
         assert!(graph.sol_inferred.is_empty());
         assert_eq!(graph.current_sol_label, "$420.40");
         // The model universe is exactly the three names published by v1.
@@ -40473,7 +40502,7 @@ mod tests {
         assert!(!paths.remaining_inferred.is_empty());
         assert!(paths.sol_flat.is_empty());
         assert!(paths.sol_rising.is_empty());
-        assert!(paths.sol_inferred.is_empty());
+        assert!(!paths.sol_inferred.is_empty());
         assert_eq!(paths.current_sol_label, "$3.00");
     }
 
@@ -43491,7 +43520,7 @@ mod tests {
             timeline.get_mut(&120).unwrap().origin = super::GraphModelOrigin::LegacyObserved;
         });
         let legacy_graph = graph(&references, &legacy);
-        assert!(!legacy_graph.sol_inferred.is_empty());
+        assert!(legacy_graph.sol_inferred.is_empty());
         assert!(!legacy_graph.sol_flat.is_empty());
         assert!(legacy_graph.unused_intervals.is_empty());
     }
@@ -44420,15 +44449,20 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let references = samples.iter().collect::<Vec<_>>();
-        let legacy = |tokens| super::GraphModelPoint {
-            dollar: 0.0,
+        let legacy = |tokens, dollar| super::GraphModelPoint {
+            dollar,
             tokens: tokens as f64,
             raw_tokens: Some(tokens),
             origin: super::GraphModelOrigin::LegacyObserved,
         };
         let timeline = |tokens| {
             (0..=30)
-                .map(|minute| (START + minute * 60, legacy(tokens)))
+                .map(|minute| {
+                    (
+                        START + minute * 60,
+                        legacy(tokens, if minute == 15 { 1.0 } else { 0.0 }),
+                    )
+                })
                 .collect::<BTreeMap<_, _>>()
         };
         let timelines = BTreeMap::from([
@@ -44452,6 +44486,17 @@ mod tests {
         );
 
         assert_eq!(idle, vec![(START, START + 1_800)]);
+
+        let mut normalized_dollars = timelines.clone();
+        super::normalize_graph_dollars_from_token_identity(
+            &mut normalized_dollars,
+            &timelines,
+            &idle,
+        );
+        assert!(normalized_dollars
+            .values()
+            .all(|timeline| timeline.values().all(|point| point.dollar == 0.0
+                && point.origin == super::GraphModelOrigin::LegacyObserved)));
 
         let graph =
             super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
@@ -45797,6 +45842,20 @@ mod tests {
         );
         assert!(!paths.luna_rising.is_empty());
         assert!(!paths.sol_rising.is_empty());
+        let (accepted_dollars, _) = client.graph_model_lineage_for_selection(
+            historical.reset_at,
+            historical.start_at,
+            historical.end_at,
+            false,
+            &[],
+        );
+        assert_eq!(
+            accepted_dollars["LUNA"]
+                .values()
+                .next_back()
+                .map(|point| (point.dollar, point.origin)),
+            Some((30.0, super::GraphModelOrigin::Held)),
+        );
         assert_eq!(
             paths.current_luna_label, "$30.00",
             "the later lower unconfirmed values remain hidden until recovery; raw={luna_points:?}"

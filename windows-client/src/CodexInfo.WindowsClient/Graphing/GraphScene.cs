@@ -272,10 +272,17 @@ public sealed class GraphScene
         // models still participate in exact token and idle evidence.
         var dollarProjection = BuildAcceptedModelProjection(samples, allModelNames, GraphMetric.Dollars);
         var tokenProjection = BuildAcceptedModelProjection(samples, allModelNames, GraphMetric.Tokens);
+        var idleIntervals = BuildConfirmedIdleIntervals(
+            samples,
+            start,
+            end,
+            normalizedGaps,
+            tokenProjection);
         dollarProjection = NormalizeDollarProjectionFromTokenIdentity(
             samples,
             dollarProjection,
-            tokenProjection);
+            tokenProjection,
+            idleIntervals);
         var semanticProjection = metric == GraphMetric.Dollars
             ? dollarProjection
             : tokenProjection;
@@ -386,12 +393,7 @@ public sealed class GraphScene
             displayProjection.CorrectionStartsByModel,
             correctionStarts,
             tokenCorrectionStarts,
-            BuildConfirmedIdleIntervals(
-                samples,
-                start,
-                end,
-                normalizedGaps,
-                tokenProjection),
+            idleIntervals,
             maximum);
     }
 
@@ -695,7 +697,8 @@ public sealed class GraphScene
     private static ModelProjection NormalizeDollarProjectionFromTokenIdentity(
         IReadOnlyList<ApiHistorySample> samples,
         ModelProjection dollars,
-        ModelProjection tokens)
+        ModelProjection tokens,
+        IReadOnlyList<GraphIdleInterval> idleIntervals)
     {
         var valueArrays = dollars.Values.ToDictionary(
             pair => pair.Key,
@@ -728,48 +731,58 @@ public sealed class GraphScene
             var reliable = reliabilityArrays[name];
             var lineReliable = lineReliabilityArrays[name];
             var origins = originArrays[name];
-            var runs = new List<List<int>>();
+            var runs = new List<(GraphModelOrigin Origin, List<int> Indices)>();
             var run = new List<int>();
-            ulong? runTokens = null;
+            (GraphModelOrigin Origin, ulong Tokens)? runIdentity = null;
             for (var index = 0; index < samples.Count; index++)
             {
-                var rawTokens = tokenOrigins[index] is GraphModelOrigin.Direct
+                var tokenOrigin = tokenOrigins[index];
+                var eligibleOrigin = tokenOrigin is GraphModelOrigin.Direct ||
+                    tokenOrigin is GraphModelOrigin.LegacyUnknown && idleIntervals.Any(
+                        interval => interval.StartAt <= samples[index].Timestamp &&
+                            samples[index].Timestamp <= interval.EndAt);
+                var rawTokens = eligibleOrigin
                     ? PublishedModels(samples[index])
                         .FirstOrDefault(model => model.Name == name)
                         ?.TotalTokens
                     : null;
-                if (rawTokens is ulong current && runTokens == current)
+                var identity = rawTokens is ulong current
+                    ? (tokenOrigin, current)
+                    : ((GraphModelOrigin Origin, ulong Tokens)?)null;
+                if (identity is { } currentIdentity && runIdentity == currentIdentity)
                 {
                     run.Add(index);
                 }
-                else if (rawTokens is ulong next)
+                else if (identity is { } nextIdentity)
                 {
                     if (run.Count > 0)
                     {
-                        runs.Add(run);
+                        runs.Add((runIdentity!.Value.Origin, run));
                     }
                     run = [index];
-                    runTokens = next;
+                    runIdentity = nextIdentity;
                 }
                 else
                 {
                     if (run.Count > 0)
                     {
-                        runs.Add(run);
+                        runs.Add((runIdentity!.Value.Origin, run));
                     }
                     run = [];
-                    runTokens = null;
+                    runIdentity = null;
                 }
             }
             if (run.Count > 0)
             {
-                runs.Add(run);
+                runs.Add((runIdentity!.Value.Origin, run));
             }
 
-            foreach (var tokenFlatRun in runs.Where(candidate => candidate.Count >= 2))
+            foreach (var (runOrigin, tokenFlatRun) in
+                runs.Where(candidate => candidate.Indices.Count >= 2))
             {
                 var baselineIndex = tokenFlatRun.FirstOrDefault(
-                    index => origins[index] is GraphModelOrigin.Direct &&
+                    index => (origins[index] == runOrigin ||
+                            runOrigin is GraphModelOrigin.LegacyUnknown) &&
                         double.IsFinite(values[index]) &&
                         values[index] >= 0,
                     -1);
@@ -781,9 +794,9 @@ public sealed class GraphScene
                 foreach (var index in tokenFlatRun)
                 {
                     values[index] = baseline;
-                    reliable[index] = true;
+                    reliable[index] = runOrigin is GraphModelOrigin.Direct;
                     lineReliable[index] = true;
-                    origins[index] = GraphModelOrigin.Direct;
+                    origins[index] = runOrigin;
                     correctionSets[name].Remove(samples[index].Timestamp);
                 }
             }

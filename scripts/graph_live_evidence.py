@@ -547,49 +547,66 @@ def _normalize_dollars_from_token_identity(
     model: str,
     dollars: list[ModelEvidence],
     tokens: list[ModelEvidence],
+    idle_intervals: list[dict[str, int]],
 ) -> list[ModelEvidence]:
     """Correct only the presentation copy of a token-flat dollar run."""
 
     normalized = list(dollars)
-    runs: list[list[int]] = []
+    runs: list[tuple[str, list[int]]] = []
     run: list[int] = []
-    run_tokens: int | None = None
+    run_identity: tuple[str, int] | None = None
     for index, (row, token) in enumerate(zip(rows, tokens, strict=True)):
         raw_model = next(
             (item for item in row.get("models") or [] if item.get("model") == model),
             None,
         )
         raw_tokens = None if raw_model is None else raw_model.get("total_tokens")
-        direct_tokens = (
-            raw_tokens
-            if token.origin == "direct"
-            and token.reliable
+        legacy_idle = token.origin == "legacy" and any(
+            interval["start_at"] <= row["timestamp"] <= interval["end_at"]
+            for interval in idle_intervals
+        )
+        token_origin = (
+            token.origin
+            if ((token.origin == "direct" and token.reliable) or legacy_idle)
             and isinstance(raw_tokens, int)
             and not isinstance(raw_tokens, bool)
             and raw_tokens >= 0
             else None
         )
-        if direct_tokens is not None and direct_tokens == run_tokens:
+        identity = (
+            (token_origin, raw_tokens)
+            if token_origin is not None and isinstance(raw_tokens, int)
+            else None
+        )
+        if identity is not None and identity == run_identity:
             run.append(index)
-        elif direct_tokens is not None:
+        elif identity is not None:
             if run:
-                runs.append(run)
+                assert run_identity is not None
+                runs.append((run_identity[0], run))
             run = [index]
-            run_tokens = direct_tokens
+            run_identity = identity
         else:
             if run:
-                runs.append(run)
+                assert run_identity is not None
+                runs.append((run_identity[0], run))
             run = []
-            run_tokens = None
+            run_identity = None
     if run:
-        runs.append(run)
+        assert run_identity is not None
+        runs.append((run_identity[0], run))
 
-    for run in (candidate for candidate in runs if len(candidate) >= 2):
+    for run_origin, run in (
+        candidate for candidate in runs if len(candidate[1]) >= 2
+    ):
         baseline = next(
             (
                 normalized[index].value
                 for index in run
-                if normalized[index].origin == "direct"
+                if (
+                    normalized[index].origin == run_origin
+                    or run_origin == "legacy"
+                )
                 and normalized[index].value is not None
                 and math.isfinite(normalized[index].value)
                 and normalized[index].value >= 0
@@ -599,7 +616,12 @@ def _normalize_dollars_from_token_identity(
         if baseline is None:
             continue
         for index in run:
-            normalized[index] = ModelEvidence(baseline, True, "direct")
+            normalized[index] = ModelEvidence(
+                baseline,
+                run_origin == "direct",
+                run_origin,
+                normalized[index].synthetic,
+            )
     return normalized
 
 
@@ -976,19 +998,20 @@ def build_expected(fixture: dict[str, Any]) -> tuple[list[dict[str, Any]], list[
     token_models = {
         model: _model_projection(rows, model, "tokens") for model in universe
     }
+    idle = _idle_intervals(period, rows, token_models, gaps)
     dollar_models = {
         model: _normalize_dollars_from_token_identity(
             rows,
             model,
             _model_projection(rows, model, "dollars"),
             token_models[model],
+            idle,
         )
         for model in universe
     }
     projections = {"tokens": token_models, "dollars": dollar_models}
     segments: list[dict[str, Any]] = []
     remaining = _remaining_projection(period, rows, token_models, gaps)
-    idle = _idle_intervals(period, rows, token_models, gaps)
     segments.extend(_remaining_segments(samples, rows, remaining, token_models, gaps, idle))
     for metric in ("tokens", "dollars"):
         for model in renderable_universe:
@@ -1510,12 +1533,14 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
     token_models = {
         model: _model_projection(rows, model, "tokens") for model in universe
     }
+    idle = _idle_intervals(period, rows, token_models, gaps)
     dollar_models = {
         model: _normalize_dollars_from_token_identity(
             rows,
             model,
             _model_projection(rows, model, "dollars"),
             token_models[model],
+            idle,
         )
         for model in universe
     }
@@ -1523,7 +1548,6 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
     remaining_values = {
         point.timestamp: point.effective for point in remaining_evidence
     }
-    idle = _idle_intervals(period, rows, token_models, gaps)
     remaining_segments = _remaining_segments(
         samples,
         rows,

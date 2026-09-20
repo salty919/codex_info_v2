@@ -106,13 +106,20 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             }
             for minute in range(31)
         ]
+        rows[15]["models"][1]["total_dollars"] = 120.86
 
-        segments, idle = oracle.build_expected(v3_fixture(rows, period_id="legacy-midnight-idle"))
+        fixture = v3_fixture(rows, period_id="legacy-midnight-idle")
+        segments, idle = oracle.build_expected(fixture)
         self.assertEqual([{"start_at": start, "end_at": start + 1_800}], idle)
         for metric in ("tokens", "dollars"):
             for series in ("LUNA", "SOL", "TERRA"):
                 self.assertEqual(30, len(pairs(segments, "idle", metric, series)))
         self.assertEqual(30, len(pairs(segments, "idle")))
+        rendered = oracle.build_expected_render_contracts(fixture)["dollars"]
+        sol_idle = next(
+            model["idle"] for model in rendered["models"] if model["series"] == "SOL"
+        )
+        self.assertEqual(1, len(set(sol_idle.split()[1::2])))
 
     def test_monotone_cubic_projection_matches_fixed_no_overshoot_oracle(self):
         self.assertEqual(
