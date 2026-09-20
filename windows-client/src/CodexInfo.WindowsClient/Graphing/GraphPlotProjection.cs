@@ -1184,6 +1184,16 @@ internal static class GraphPlotProjection
                 .ToArray();
             var timestamps = indices.Select(index => scene.Timestamps[index]).ToArray();
             var runValues = indices.Select(index => values[index]).ToArray();
+            var preservedIndices = run
+                .SelectMany((interval, index) => interval.Style is ProjectionStyle.Dashed
+                    ? new[] { index, index + 1 }
+                    : Array.Empty<int>())
+                .ToHashSet();
+            runValues = SmoothSamplingPlateaus(
+                scene,
+                timestamps,
+                runValues,
+                preservedIndices);
             for (var interval = 0; interval < run.Length; interval++)
             {
                 var (targetX, targetY) = run[interval].Style switch

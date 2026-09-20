@@ -5400,8 +5400,11 @@ fn graph_paths_with_sources(
             period_end,
             dollar_max,
             |point| point.luna,
-            confirmed_gaps,
-            &model_untrusted_minutes,
+            MetricLineRenderEvidence {
+                confirmed_gaps,
+                untrusted_minutes: &model_untrusted_minutes,
+                idle_timestamp_intervals: &idle_timestamp_intervals,
+            },
         ),
         terra: metric_line_path_with_confirmed_gaps(
             &minute,
@@ -5409,8 +5412,11 @@ fn graph_paths_with_sources(
             period_end,
             dollar_max,
             |point| point.terra,
-            confirmed_gaps,
-            &model_untrusted_minutes,
+            MetricLineRenderEvidence {
+                confirmed_gaps,
+                untrusted_minutes: &model_untrusted_minutes,
+                idle_timestamp_intervals: &idle_timestamp_intervals,
+            },
         ),
         sol: metric_line_path_with_confirmed_gaps(
             &minute,
@@ -5418,8 +5424,11 @@ fn graph_paths_with_sources(
             period_end,
             dollar_max,
             |point| point.sol,
-            confirmed_gaps,
-            &model_untrusted_minutes,
+            MetricLineRenderEvidence {
+                confirmed_gaps,
+                untrusted_minutes: &model_untrusted_minutes,
+                idle_timestamp_intervals: &idle_timestamp_intervals,
+            },
         ),
         dollar_labels: dollar_axis_labels(dollar_max),
         current_remaining_label: remaining.map(format_percent).unwrap_or_else(|| "—".into()),
@@ -5789,6 +5798,7 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
             untrusted_minutes: &untrusted_minutes,
             require_legacy_vector: false,
             correction_starts: &correction_starts,
+            idle_timestamp_intervals: &idle_timestamp_intervals,
         };
         let (flat, rising, inferred) =
             split_metric_line_paths_with_boundaries(&context, |point| point.luna);
@@ -5822,6 +5832,7 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
             untrusted_minutes: &untrusted_minutes,
             require_legacy_vector: false,
             correction_starts: &correction_starts,
+            idle_timestamp_intervals: &idle_timestamp_intervals,
         };
         let (flat, rising, inferred) =
             split_metric_line_paths_with_boundaries(&context, |point| point.terra);
@@ -5855,6 +5866,7 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
             untrusted_minutes: &untrusted_minutes,
             require_legacy_vector: false,
             correction_starts: &correction_starts,
+            idle_timestamp_intervals: &idle_timestamp_intervals,
         };
         let (flat, rising, inferred) =
             split_metric_line_paths_with_boundaries(&context, |point| point.sol);
@@ -5888,6 +5900,7 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
             untrusted_minutes: &untrusted_minutes,
             require_legacy_vector: false,
             correction_starts: &correction_starts,
+            idle_timestamp_intervals: &idle_timestamp_intervals,
         };
         let (flat, rising, inferred) =
             split_metric_line_paths_with_boundaries(&context, |point| point.astra);
@@ -6184,14 +6197,19 @@ fn minute_model_spend_for_metric_with_untrusted(
 
 /// Draws one metric independently from the other model series. Token mode
 /// uses this path so enabling LUNA cannot turn SOL into a LUNA+SOL boundary.
+struct MetricLineRenderEvidence<'a> {
+    confirmed_gaps: &'a [GraphConfirmedGap],
+    untrusted_minutes: &'a BTreeSet<i64>,
+    idle_timestamp_intervals: &'a [(i64, i64)],
+}
+
 fn metric_line_path_with_confirmed_gaps(
     points: &[HourlyModelSpend],
     period_start: i64,
     period_end: i64,
     maximum: f64,
     value: impl Fn(&HourlyModelSpend) -> f64,
-    confirmed_gaps: &[GraphConfirmedGap],
-    untrusted_minutes: &BTreeSet<i64>,
+    evidence: MetricLineRenderEvidence<'_>,
 ) -> String {
     if points.is_empty() {
         return String::new();
@@ -6202,10 +6220,11 @@ fn metric_line_path_with_confirmed_gaps(
         period_start,
         period_end,
         maximum,
-        confirmed_gaps,
-        untrusted_minutes,
+        confirmed_gaps: evidence.confirmed_gaps,
+        untrusted_minutes: evidence.untrusted_minutes,
         require_legacy_vector: true,
         correction_starts: &correction_starts,
+        idle_timestamp_intervals: evidence.idle_timestamp_intervals,
     };
     let (flat, rising, inferred) = split_metric_line_paths_with_evidence(&context, value);
     [flat, rising, inferred]
@@ -6343,6 +6362,7 @@ struct MetricLinePathContext<'a> {
     untrusted_minutes: &'a BTreeSet<i64>,
     require_legacy_vector: bool,
     correction_starts: &'a BTreeSet<i64>,
+    idle_timestamp_intervals: &'a [(i64, i64)],
 }
 
 #[cfg(test)]
@@ -6365,6 +6385,7 @@ fn split_metric_line_paths_with_confirmed_gaps(
         untrusted_minutes: &untrusted_minutes,
         require_legacy_vector: true,
         correction_starts: &correction_starts,
+        idle_timestamp_intervals: &[],
     };
     split_metric_line_paths_with_evidence(&context, value)
 }
@@ -6733,6 +6754,23 @@ fn split_metric_line_paths_with_boundaries(
             .iter()
             .map(|index| value(&context.points[*index]))
             .collect::<Vec<_>>();
+        let preserved_timestamps = context
+            .idle_timestamp_intervals
+            .iter()
+            .flat_map(|(start, end)| [*start, *end])
+            .collect::<BTreeSet<_>>();
+        let preserved_indices = run
+            .iter()
+            .enumerate()
+            .filter(|(_, segment)| segment.kind == GraphMetricSegmentKind::Inferred)
+            .flat_map(|(interval, _)| [interval, interval + 1])
+            .collect::<BTreeSet<_>>();
+        let values = sampling_smoothed_values(
+            &timestamps,
+            &values,
+            &preserved_timestamps,
+            &preserved_indices,
+        );
         for (interval, segment) in run.iter().enumerate() {
             if segment.kind == GraphMetricSegmentKind::Inferred {
                 append_monotone_cubic_dashed_interval(
@@ -40885,6 +40923,7 @@ mod tests {
             untrusted_minutes: &untrusted_minutes,
             require_legacy_vector: true,
             correction_starts: &correction_starts,
+            idle_timestamp_intervals: &[],
         };
         let (_, rising, inferred) =
             super::split_metric_line_paths_with_evidence(&context, |point| point.sol);
@@ -41578,6 +41617,46 @@ mod tests {
         assert!(!active_tail_graph.remaining_solid.contains("M80.00 79.40"));
         assert!(!active_tail_graph.remaining_solid.contains("L80.00 79.40"));
         assert!(active_tail_graph.remaining_solid.ends_with("L100.00 79.40"));
+
+        let model_points = [0.0, 0.0, 40.0, 40.0, 80.0, 80.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, sol)| HourlyModelSpend {
+                timestamp: index as i64 * 600,
+                sol,
+                ..HourlyModelSpend::default()
+            })
+            .collect::<Vec<_>>();
+        let untrusted_minutes = BTreeSet::new();
+        let correction_starts = BTreeSet::new();
+        let context = super::MetricLinePathContext {
+            points: &model_points,
+            period_start: 0,
+            period_end: 3_000,
+            maximum: 80.0,
+            confirmed_gaps: &[],
+            untrusted_minutes: &untrusted_minutes,
+            require_legacy_vector: false,
+            correction_starts: &correction_starts,
+            idle_timestamp_intervals: &[],
+        };
+        let (model_flat, model_rising, model_inferred) =
+            super::split_metric_line_paths_with_boundaries(&context, |point| point.sol);
+        assert!(model_inferred.is_empty());
+        assert!(!model_flat.contains("L20.00 99.00"));
+        assert!(!model_flat.contains("L60.00 50.00"));
+        assert!(!model_flat.contains("L80.00 1.00"));
+        assert!(!model_rising.is_empty());
+        assert!(model_flat.ends_with("L100.00 1.00"));
+
+        let idle_context = super::MetricLinePathContext {
+            idle_timestamp_intervals: &[(2_400, 3_000)],
+            ..context
+        };
+        let (idle_flat, _, _) =
+            super::split_metric_line_paths_with_boundaries(&idle_context, |point| point.sol);
+        assert!(idle_flat.contains("M80.00 1.00"));
+        assert!(idle_flat.ends_with("L100.00 1.00"));
     }
 
     #[test]
@@ -44721,8 +44800,11 @@ mod tests {
             240,
             0.0,
             |point| point.sol,
-            &[],
-            &BTreeSet::new(),
+            super::MetricLineRenderEvidence {
+                confirmed_gaps: &[],
+                untrusted_minutes: &BTreeSet::new(),
+                idle_timestamp_intervals: &[],
+            },
         );
         assert!(path.starts_with("M75.00 99.00"));
         assert!(path.ends_with("L100.00 99.00"));
@@ -45323,6 +45405,7 @@ mod tests {
             untrusted_minutes: &untrusted_minutes,
             require_legacy_vector: false,
             correction_starts: &correction_starts,
+            idle_timestamp_intervals: &[],
         };
         let (_, rising, inferred) =
             super::split_metric_line_paths_with_boundaries(&context, |point| point.sol);

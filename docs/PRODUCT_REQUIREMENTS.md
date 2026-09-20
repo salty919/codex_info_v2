@@ -344,8 +344,9 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    異常またはrecorder gapを跨がない区間だけを、そのmodelのcontiguous measuredとする。他modelの出現／消失、
    `confirmed`同士の共通modelはmodel集合の完全性だけを理由にこの区間を破線化しない。`legacy-unknown`が一方でも
    含まれる区間は表示専用で、連続実測・集計・idle authorityにはしない。正常な直接観測endpoint間はtimestamp差だけで
-   欠損へ降格せず、同値・増加とも同じ3px実線で結ぶ。連続する有効anchor列は各anchorをexactに通り、区間内で単調かつ
-   overshootしないPCHIP（Fritsch–Carlson）で滑らかにつなぐ。当該modelの明示的欠測、後退／回復、confirmed recorder gap、bounded／terminal holdは既知endpoint間を1pxの
+   欠損へ降格せず、同値・増加とも同じ3px実線で結ぶ。raw値は元時刻・元値の証拠として保持する一方、未使用と確定できない
+   sampling由来の同値反復は表示geometryの必須通過点にせず、有効変化点間を単調かつovershootしないPCHIP
+   （Fritsch–Carlson）で滑らかにつなぐ。当該modelの明示的欠測、後退／回復、confirmed recorder gap、bounded／terminal holdは既知endpoint間を1pxの
    破線で連続補完する。補間・holdはUI presentation-onlyで、API/DBへ書き戻さず、直接観測または集計・idleの
    根拠へ昇格させない。
    period endはaccepted periods resourceの同じpairにあるexact `end_at`とし、currentか
@@ -399,8 +400,8 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    carryする。accepted raw Remainingが1点以上あれば、最後のeffective pointからexact period endまでを長さに
    関係なく時間幅のある破線holdとし、空白や同一X座標の垂直落下を作らない。`Remaining`のeffective値から
    model系列の値またはそのperiod tailを外挿しない。
-7. `G137-7`: model線は`Direct`同士のexact値の増加・不変を同じ3px実線とし、timestamp差だけでは破線化しない。正常な
-   有効anchor列は各anchorを通る単調PCHIPで滑らかにつなぎ、sampling由来の段差を描画geometryへ固定しない。途中に
+7. `G137-7`: model線は`Direct`同士のexact値の増加・不変を同じ3px実線とし、timestamp差だけでは破線化しない。raw列を
+   変更せず、未使用と確定できないsampling同値反復を折れ点から外して有効変化点間を単調PCHIPで滑らかにつなぐ。途中に
    当該modelのunknown rowがあるnearest-finite接続、raw-null補間点の両側、
    monotonic hold、bounded/terminal hold、synthetic tailは1px破線とする。raw quota同値のcontiguous区間は
    model availabilityと独立した実測実線である。raw-nullの`Interpolated`だけを欠測破線とする。model線は当該modelの当該表示metric anomaly、Remaining線はRemaining

@@ -2454,6 +2454,42 @@ public sealed class GraphPlotControlTests
         Assert.Empty(activeTailScene.IdleIntervals);
         Assert.InRange(RenderedAt(activeTailRendered, 3_400), 20.000_001, 59.999_999);
         Assert.Equal(20d, RenderedAt(activeTailRendered, 4_000), precision: 6);
+
+        var activeModelPoints = new[]
+        {
+            Point(1_000, 100, 0, 0, 0),
+            Point(1_600, 99, 0, 1, 0),
+            Point(2_200, 98, 40, 2, 0),
+            Point(2_800, 97, 40, 3, 0),
+            Point(3_400, 96, 80, 4, 0),
+            Point(4_000, 95, 80, 5, 0),
+        };
+        var activeModelScene = Scene(activeModelPoints);
+        var activeModel = GraphPlotProjection.BuildCanonicalModelLines(
+            activeModelScene,
+            activeModelScene.Sol);
+        Assert.Empty(activeModelScene.IdleIntervals);
+        Assert.InRange(RenderedAt(activeModel.Flat.Line, 1_600), 0.000_001, 39.999_999);
+        Assert.InRange(RenderedAt(activeModel.Flat.Line, 2_800), 40.000_001, 79.999_999);
+        Assert.InRange(RenderedAt(activeModel.Flat.Line, 3_400), 40.000_001, 79.999_999);
+        Assert.Equal(80d, RenderedAt(activeModel.Flat.Line, 4_000), precision: 6);
+
+        var idleModelPoints = new[]
+        {
+            Point(1_000, 100, 0, 0, 0),
+            Point(1_600, 99, 0, 1, 0),
+            Point(2_200, 98, 40, 2, 0),
+            Point(2_800, 97, 40, 3, 0),
+            Point(3_400, 96, 80, 4, 0),
+            Point(4_000, 96, 80, 4, 0),
+        };
+        var idleModelScene = Scene(idleModelPoints);
+        var idleModel = GraphPlotProjection.BuildCanonicalModelLines(
+            idleModelScene,
+            idleModelScene.Sol);
+        Assert.Single(idleModelScene.IdleIntervals);
+        Assert.Equal(80d, RenderedAt(idleModel.Flat.Line, 3_400), precision: 6);
+        Assert.Equal(80d, RenderedAt(idleModel.Flat.Line, 4_000), precision: 6);
     }
 
     [Fact]
