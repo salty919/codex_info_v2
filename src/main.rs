@@ -4957,9 +4957,9 @@ fn normalize_graph_dollars_from_token_identity(
         let Some(dollar_timeline) = dollar_timelines.get_mut(name) else {
             continue;
         };
-        let mut runs = Vec::<(GraphModelOrigin, Vec<i64>)>::new();
+        let mut runs = Vec::<Vec<i64>>::new();
         let mut run = Vec::<i64>::new();
-        let mut run_identity = None::<(GraphModelOrigin, u64)>;
+        let mut run_identity = None::<u64>;
         for (timestamp, point) in token_timeline {
             let eligible_origin = point.origin == GraphModelOrigin::Direct
                 || point.origin == GraphModelOrigin::LegacyObserved
@@ -4968,54 +4968,49 @@ fn normalize_graph_dollars_from_token_identity(
                         .any(|(start, end)| *start <= *timestamp && *timestamp <= *end);
             let identity = eligible_origin
                 .then(|| graph_model_raw_tokens(point))
-                .flatten()
-                .map(|tokens| (point.origin, tokens));
+                .flatten();
             match identity {
                 Some(identity) if run_identity == Some(identity) => run.push(*timestamp),
                 Some(identity) => {
                     if !run.is_empty() {
-                        runs.push((
-                            run_identity.expect("a non-empty run has an identity").0,
-                            std::mem::take(&mut run),
-                        ));
+                        runs.push(std::mem::take(&mut run));
                     }
                     run_identity = Some(identity);
                     run.push(*timestamp);
                 }
                 None => {
                     if !run.is_empty() {
-                        runs.push((
-                            run_identity.expect("a non-empty run has an identity").0,
-                            std::mem::take(&mut run),
-                        ));
+                        runs.push(std::mem::take(&mut run));
                     }
                     run_identity = None;
                 }
             }
         }
         if !run.is_empty() {
-            runs.push((
-                run_identity.expect("a non-empty run has an identity").0,
-                run,
-            ));
+            runs.push(run);
         }
 
-        for (run_origin, run) in runs.into_iter().filter(|(_, run)| run.len() >= 2) {
+        for run in runs.into_iter().filter(|run| run.len() >= 2) {
             let baseline = run.iter().find_map(|timestamp| {
-                dollar_timeline.get(timestamp).and_then(|point| {
-                    ((point.origin == run_origin || run_origin == GraphModelOrigin::LegacyObserved)
-                        && point.dollar.is_finite()
-                        && point.dollar >= 0.0)
-                        .then_some(point.dollar)
-                })
+                let token_point = token_timeline.get(timestamp)?;
+                let dollar_point = dollar_timeline.get(timestamp)?;
+                ((dollar_point.origin == token_point.origin
+                    || token_point.origin == GraphModelOrigin::LegacyObserved)
+                    && dollar_point.dollar.is_finite()
+                    && dollar_point.dollar >= 0.0)
+                    .then_some(dollar_point.dollar)
             });
             let Some(baseline) = baseline else {
                 continue;
             };
             for timestamp in run {
+                let Some(token_origin) = token_timeline.get(&timestamp).map(|point| point.origin)
+                else {
+                    continue;
+                };
                 if let Some(point) = dollar_timeline.get_mut(&timestamp) {
                     point.dollar = baseline;
-                    point.origin = run_origin;
+                    point.origin = token_origin;
                 }
             }
         }
@@ -7431,42 +7426,36 @@ fn token_idle_timestamp_intervals_with_render_evidence(
     // Every direct observation inside a sparse interval must preserve the
     // exact endpoint model set and lossless token totals. Dollars are derived
     // display values and never participate in this authority path.
-    let direct_models_remain_flat = |start: i64,
-                                     end: i64,
-                                     values: &[(String, u64)],
-                                     baseline_is_legacy: bool,
-                                     remaining_bits: u64| {
-        let baseline = values
-            .iter()
-            .map(|(name, tokens)| (name.as_str(), *tokens))
-            .collect::<BTreeMap<_, _>>();
-        for timestamp in exact_model_timestamps.range((
-            std::ops::Bound::Excluded(start),
-            std::ops::Bound::Excluded(end),
-        )) {
-            if direct_remaining(*timestamp) != Some(remaining_bits) {
-                return false;
-            }
-            let Some((vector, is_legacy)) = raw_idle_vector(*timestamp) else {
-                return false;
-            };
-            if is_legacy != baseline_is_legacy {
-                return false;
-            }
-            let values = vector
+    let direct_models_remain_flat =
+        |start: i64, end: i64, values: &[(String, u64)], remaining_bits: u64| {
+            let baseline = values
                 .iter()
                 .map(|(name, tokens)| (name.as_str(), *tokens))
                 .collect::<BTreeMap<_, _>>();
-            if values.len() != baseline.len()
-                || baseline
+            for timestamp in exact_model_timestamps.range((
+                std::ops::Bound::Excluded(start),
+                std::ops::Bound::Excluded(end),
+            )) {
+                if direct_remaining(*timestamp) != Some(remaining_bits) {
+                    return false;
+                }
+                let Some((vector, _)) = raw_idle_vector(*timestamp) else {
+                    return false;
+                };
+                let values = vector
                     .iter()
-                    .any(|(name, expected)| values.get(name).copied() != Some(*expected))
-            {
-                return false;
+                    .map(|(name, tokens)| (name.as_str(), *tokens))
+                    .collect::<BTreeMap<_, _>>();
+                if values.len() != baseline.len()
+                    || baseline
+                        .iter()
+                        .any(|(name, expected)| values.get(name).copied() != Some(*expected))
+                {
+                    return false;
+                }
             }
-        }
-        true
-    };
+            true
+        };
 
     let mut anchors = raw_timelines
         .values()
@@ -7509,24 +7498,16 @@ fn token_idle_timestamp_intervals_with_render_evidence(
     };
     let mut proven = Vec::<(i64, i64)>::new();
     for pair in anchors.windows(2) {
-        let [(start, start_vector, start_remaining, start_is_legacy), (end, end_vector, end_remaining, end_is_legacy)] =
-            pair
+        let [(start, start_vector, start_remaining, _), (end, end_vector, end_remaining, _)] = pair
         else {
             continue;
         };
         if end <= start
             || start_vector != end_vector
             || start_remaining != end_remaining
-            || start_is_legacy != end_is_legacy
             || has_numeric_incomplete_row(*start, *end)
             || has_unavailable_incomplete_row(*start, *end)
-            || !direct_models_remain_flat(
-                *start,
-                *end,
-                start_vector,
-                *start_is_legacy,
-                *start_remaining,
-            )
+            || !direct_models_remain_flat(*start, *end, start_vector, *start_remaining)
             || graph_interval_overlaps_confirmed_gap(*start, *end, confirmed_gaps)
         {
             continue;
@@ -44524,6 +44505,91 @@ mod tests {
         assert!(!graph.remaining_idle.is_empty());
         assert!(graph.remaining_solid.is_empty());
         assert!(graph.remaining_inferred.is_empty());
+    }
+
+    #[test]
+    fn lossless_source_transitions_do_not_split_idle_or_dollar_hold() {
+        for legacy_first in [false, true] {
+            let samples = (0..=10)
+                .map(|minute| {
+                    UsageHistorySample::new(minute * 60, 1_000, 90.0, ModelDollarTotals::default())
+                })
+                .collect::<Vec<_>>();
+            let references = samples.iter().collect::<Vec<_>>();
+            let timeline = (0..=10)
+                .map(|minute| {
+                    let before_transition = minute <= 5;
+                    let legacy = before_transition == legacy_first;
+                    (
+                        minute * 60,
+                        super::GraphModelPoint {
+                            dollar: if before_transition { 1.0 } else { 2.0 },
+                            tokens: 100.0,
+                            raw_tokens: Some(100),
+                            origin: if legacy {
+                                super::GraphModelOrigin::LegacyObserved
+                            } else {
+                                super::GraphModelOrigin::Direct
+                            },
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let timelines = BTreeMap::from([("SOL".to_owned(), timeline)]);
+            let legacy_minutes = (0..=10)
+                .filter(|minute| (*minute <= 5) == legacy_first)
+                .map(|minute| minute * 60)
+                .collect::<BTreeSet<_>>();
+
+            let idle = super::token_idle_timestamp_intervals_with_render_evidence(
+                &references,
+                0,
+                600,
+                &timelines,
+                &[],
+                Some(&super::GraphIdleRenderEvidence {
+                    untrusted_minutes: &legacy_minutes,
+                }),
+            );
+            assert_eq!(idle, vec![(0, 600)]);
+
+            let mut normalized_dollars = timelines.clone();
+            super::normalize_graph_dollars_from_token_identity(
+                &mut normalized_dollars,
+                &timelines,
+                &idle,
+            );
+            for (timestamp, normalized) in &normalized_dollars["SOL"] {
+                assert_eq!(normalized.dollar, 1.0);
+                assert_eq!(normalized.origin, timelines["SOL"][timestamp].origin);
+            }
+
+            let graph =
+                super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                    super::GraphSelectionInput {
+                        samples: &references,
+                        period_start: 0,
+                        period_end: 600,
+                        show_luna: false,
+                        show_terra: false,
+                        show_sol: true,
+                        show_astra: false,
+                        show_tokens: false,
+                        untrusted_minutes: &legacy_minutes,
+                        confirmed_gaps: &[],
+                        model_timelines: &timelines,
+                    },
+                    None,
+                );
+            assert_eq!(graph.unused_intervals.len(), 1);
+            assert!(!graph.sol_idle.is_empty());
+            assert!(graph.sol_flat.is_empty());
+            assert!(graph.sol_rising.is_empty());
+            assert!(graph.sol_inferred.is_empty());
+            assert!(!graph.remaining_idle.is_empty());
+            assert!(graph.remaining_solid.is_empty());
+            assert!(graph.remaining_inferred.is_empty());
+        }
     }
 
     #[test]

@@ -552,9 +552,9 @@ def _normalize_dollars_from_token_identity(
     """Correct only the presentation copy of a token-flat dollar run."""
 
     normalized = list(dollars)
-    runs: list[tuple[str, list[int]]] = []
+    runs: list[list[int]] = []
     run: list[int] = []
-    run_identity: tuple[str, int] | None = None
+    run_identity: int | None = None
     for index, (row, token) in enumerate(zip(rows, tokens, strict=True)):
         raw_model = next(
             (item for item in row.get("models") or [] if item.get("model") == model),
@@ -573,39 +573,30 @@ def _normalize_dollars_from_token_identity(
             and raw_tokens >= 0
             else None
         )
-        identity = (
-            (token_origin, raw_tokens)
-            if token_origin is not None and isinstance(raw_tokens, int)
-            else None
-        )
+        identity = raw_tokens if token_origin is not None else None
         if identity is not None and identity == run_identity:
             run.append(index)
         elif identity is not None:
             if run:
-                assert run_identity is not None
-                runs.append((run_identity[0], run))
+                runs.append(run)
             run = [index]
             run_identity = identity
         else:
             if run:
-                assert run_identity is not None
-                runs.append((run_identity[0], run))
+                runs.append(run)
             run = []
             run_identity = None
     if run:
-        assert run_identity is not None
-        runs.append((run_identity[0], run))
+        runs.append(run)
 
-    for run_origin, run in (
-        candidate for candidate in runs if len(candidate[1]) >= 2
-    ):
+    for run in (candidate for candidate in runs if len(candidate) >= 2):
         baseline = next(
             (
                 normalized[index].value
                 for index in run
                 if (
-                    normalized[index].origin == run_origin
-                    or run_origin == "legacy"
+                    normalized[index].origin == tokens[index].origin
+                    or tokens[index].origin == "legacy"
                 )
                 and normalized[index].value is not None
                 and math.isfinite(normalized[index].value)
@@ -616,10 +607,11 @@ def _normalize_dollars_from_token_identity(
         if baseline is None:
             continue
         for index in run:
+            token_origin = tokens[index].origin
             normalized[index] = ModelEvidence(
                 baseline,
-                run_origin == "direct",
-                run_origin,
+                token_origin == "direct",
+                token_origin,
                 normalized[index].synthetic,
             )
     return normalized
@@ -917,11 +909,7 @@ def _idle_intervals(
             continue
         if _hard_break(start, end, gaps):
             continue
-        if (
-            left.get("synthetic", False)
-            or right.get("synthetic", False)
-            or left.get("model_source") != right.get("model_source")
-        ):
+        if left.get("synthetic", False) or right.get("synthetic", False):
             continue
         left_names = frozenset(model["model"] for model in left.get("models") or [])
         right_names = frozenset(model["model"] for model in right.get("models") or [])

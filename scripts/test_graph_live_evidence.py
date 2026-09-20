@@ -121,6 +121,49 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(1, len(set(sol_idle.split()[1::2])))
 
+    def test_lossless_source_transitions_do_not_split_idle_or_dollar_hold(self):
+        for legacy_first in (False, True):
+            rows = []
+            for minute in range(11):
+                before_transition = minute <= 5
+                legacy = before_transition == legacy_first
+                rows.append(
+                    {
+                        "timestamp": minute * 60,
+                        "remaining_percent": 90.0,
+                        "models_complete": not legacy,
+                        "model_source": "legacy-unknown" if legacy else "confirmed",
+                        "task_active_since_previous": False,
+                        "models": [
+                            {
+                                "model": "SOL",
+                                "total_tokens": 100,
+                                "total_dollars": 1.0 if before_transition else 2.0,
+                            }
+                        ],
+                    }
+                )
+
+            fixture = v3_fixture(
+                rows,
+                period_id=f"source-transition-{legacy_first}",
+            )
+            segments, idle = oracle.build_expected(fixture)
+
+            self.assertEqual([{"start_at": 0, "end_at": 600}], idle)
+            for metric in ("tokens", "dollars"):
+                self.assertEqual(
+                    10,
+                    len(pairs(segments, "idle", metric, "SOL")),
+                )
+            rendered = oracle.build_expected_render_contracts(fixture)["dollars"]
+            sol_idle = next(
+                model["idle"]
+                for model in rendered["models"]
+                if model["series"] == "SOL"
+            )
+            self.assertEqual(1, len(set(sol_idle.split()[1::2])))
+
     def test_monotone_cubic_projection_matches_fixed_no_overshoot_oracle(self):
         self.assertEqual(
             [0.3671875, 0.6875, 0.9140625],

@@ -2879,6 +2879,61 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
+    public void Lossless_source_transitions_do_not_split_idle_or_dollar_hold()
+    {
+        static ApiHistoryModelSample Model(double dollars) =>
+            new("SOL", null, null, null, dollars) { TotalTokens = 100 };
+
+        foreach (var legacyFirst in new[] { false, true })
+        {
+            var samples = Enumerable.Range(0, 11)
+                .Select(minute =>
+                {
+                    var beforeTransition = minute <= 5;
+                    var legacy = beforeTransition == legacyFirst;
+                    return new ApiHistorySample(
+                        minute * 60,
+                        1_000,
+                        90,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        legacy
+                            ? ApiHistorySample.LegacyUnknownModelSource
+                            : ApiHistorySample.ConfirmedModelSource)
+                    {
+                        ModelsComplete = !legacy,
+                        TaskActiveSincePrevious = false,
+                        ModelSamples = [Model(beforeTransition ? 1 : 2)],
+                    };
+                })
+                .ToArray();
+
+            var scene = GraphScene.Create(samples, GraphMetric.Dollars, 0, 600);
+            var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+            var remaining = GraphPlotProjection.BuildRemainingLines(scene);
+
+            Assert.Equal([new GraphIdleInterval(0, 600, false)], scene.IdleIntervals);
+            Assert.NotEmpty(model.Idle.X);
+            Assert.All(model.Idle.Y, value => Assert.Equal(model.Idle.Y[0], value));
+            Assert.Empty(model.Flat.X);
+            Assert.Empty(model.Rising.X);
+            Assert.Empty(model.Dashed.X);
+            Assert.NotEmpty(remaining.Idle.X);
+            Assert.Empty(remaining.Solid.X);
+            Assert.Empty(remaining.Dashed.X);
+            for (var minute = 0; minute <= 10; minute++)
+            {
+                var expectedReliable = (minute <= 5) != legacyFirst;
+                Assert.Equal(expectedReliable, scene.ModelReliability["SOL"][minute]);
+            }
+        }
+    }
+
+    [Fact]
     public void Legacy_only_model_does_not_veto_later_common_direct_idle()
     {
         static ApiHistoryModelSample Model(string name, ulong tokens, double dollars) =>

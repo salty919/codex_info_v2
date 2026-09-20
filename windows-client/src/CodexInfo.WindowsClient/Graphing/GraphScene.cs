@@ -731,9 +731,9 @@ public sealed class GraphScene
             var reliable = reliabilityArrays[name];
             var lineReliable = lineReliabilityArrays[name];
             var origins = originArrays[name];
-            var runs = new List<(GraphModelOrigin Origin, List<int> Indices)>();
+            var runs = new List<List<int>>();
             var run = new List<int>();
-            (GraphModelOrigin Origin, ulong Tokens)? runIdentity = null;
+            ulong? runIdentity = null;
             for (var index = 0; index < samples.Count; index++)
             {
                 var tokenOrigin = tokenOrigins[index];
@@ -746,9 +746,7 @@ public sealed class GraphScene
                         .FirstOrDefault(model => model.Name == name)
                         ?.TotalTokens
                     : null;
-                var identity = rawTokens is ulong current
-                    ? (tokenOrigin, current)
-                    : ((GraphModelOrigin Origin, ulong Tokens)?)null;
+                var identity = rawTokens;
                 if (identity is { } currentIdentity && runIdentity == currentIdentity)
                 {
                     run.Add(index);
@@ -757,7 +755,7 @@ public sealed class GraphScene
                 {
                     if (run.Count > 0)
                     {
-                        runs.Add((runIdentity!.Value.Origin, run));
+                        runs.Add(run);
                     }
                     run = [index];
                     runIdentity = nextIdentity;
@@ -766,7 +764,7 @@ public sealed class GraphScene
                 {
                     if (run.Count > 0)
                     {
-                        runs.Add((runIdentity!.Value.Origin, run));
+                        runs.Add(run);
                     }
                     run = [];
                     runIdentity = null;
@@ -774,15 +772,14 @@ public sealed class GraphScene
             }
             if (run.Count > 0)
             {
-                runs.Add((runIdentity!.Value.Origin, run));
+                runs.Add(run);
             }
 
-            foreach (var (runOrigin, tokenFlatRun) in
-                runs.Where(candidate => candidate.Indices.Count >= 2))
+            foreach (var tokenFlatRun in runs.Where(candidate => candidate.Count >= 2))
             {
                 var baselineIndex = tokenFlatRun.FirstOrDefault(
-                    index => (origins[index] == runOrigin ||
-                            runOrigin is GraphModelOrigin.LegacyUnknown) &&
+                    index => (origins[index] == tokenOrigins[index] ||
+                            tokenOrigins[index] is GraphModelOrigin.LegacyUnknown) &&
                         double.IsFinite(values[index]) &&
                         values[index] >= 0,
                     -1);
@@ -794,9 +791,9 @@ public sealed class GraphScene
                 foreach (var index in tokenFlatRun)
                 {
                     values[index] = baseline;
-                    reliable[index] = runOrigin is GraphModelOrigin.Direct;
+                    reliable[index] = tokenOrigins[index] is GraphModelOrigin.Direct;
                     lineReliable[index] = true;
-                    origins[index] = runOrigin;
+                    origins[index] = tokenOrigins[index];
                     correctionSets[name].Remove(samples[index].Timestamp);
                 }
             }
@@ -1035,7 +1032,6 @@ public sealed class GraphScene
             var left = samples[before.Index];
             var right = samples[after.Index];
             if (right.Timestamp <= left.Timestamp ||
-                !StringComparer.Ordinal.Equals(left.ModelSource, right.ModelSource) ||
                 left.ResetAt != right.ResetAt ||
                 !RemainingBitsEqual(left.RemainingPercent!.Value, right.RemainingPercent!.Value) ||
                 !TokenVectorsEqual(before.Vector, after.Vector) ||
@@ -1047,7 +1043,6 @@ public sealed class GraphScene
                     samples,
                     before.Index,
                     after.Index,
-                    left.ModelSource,
                     left.ResetAt,
                     before.Vector,
                     left.RemainingPercent.Value,
@@ -1089,7 +1084,6 @@ public sealed class GraphScene
         IReadOnlyList<ApiHistorySample> samples,
         int before,
         int after,
-        string modelSource,
         long resetAt,
         IReadOnlyDictionary<string, DirectModelValue> baseline,
         double baselineRemaining,
@@ -1098,8 +1092,7 @@ public sealed class GraphScene
         for (var index = before + 1; index <= after; index++)
         {
             var sample = samples[index];
-            if (!StringComparer.Ordinal.Equals(sample.ModelSource, modelSource) ||
-                sample.ResetAt != resetAt ||
+            if (sample.ResetAt != resetAt ||
                 sample.RemainingPercent is not double remaining ||
                 !double.IsFinite(remaining) ||
                 !RemainingBitsEqual(baselineRemaining, remaining) ||
