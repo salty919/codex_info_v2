@@ -42380,8 +42380,9 @@ mod tests {
             split_metric_line_paths(&points, 0, 240, 4.0, |point| point.sol);
 
         assert!(flat.starts_with("M0.00 74.50"));
-        assert!(flat.ends_with("L25.00 74.50"));
-        assert!(rising.starts_with("M25.00 74.50"));
+        assert!(flat.contains("L25.00 "));
+        assert!(!flat.ends_with("L25.00 74.50"));
+        assert!(rising.starts_with("M25.00 "));
         assert!(rising.ends_with("L50.00 25.50"));
         assert!(inferred.matches('M').count() > 1);
         assert!(!flat.contains("M50.00"));
@@ -42419,10 +42420,11 @@ mod tests {
             split_metric_line_paths(&smoothed, 0, 3_660, 2.0, |point| point.luna);
         // Both cumulative endpoints are direct observations. Sampling
         // sparsity alone is not a missing-data marker, so the interval keeps
-        // the same measured line role as an ordinary one-minute sample.
+        // the measured line role while non-idle sampling plateaus are removed
+        // from render geometry.
         assert!(!flat.contains("M1.64 50.00 L98.36 50.00"));
-        assert!(rising.starts_with("M1.64 50.00"));
-        assert!(rising.ends_with("L98.36 1.00"));
+        assert!(rising.starts_with("M1.64 "));
+        assert!(rising.contains("L98.36 "));
         assert!(inferred.is_empty());
 
         let equal_endpoints = [
