@@ -7166,42 +7166,6 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         .collect()
 }
 
-fn token_idle_interval_positions(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    token_timelines: &GraphModelTimelines,
-    confirmed_gaps: &[GraphConfirmedGap],
-) -> Vec<UnusedIntervalPosition> {
-    token_idle_interval_positions_with_render_evidence(
-        samples,
-        period_start,
-        period_end,
-        token_timelines,
-        confirmed_gaps,
-        None,
-    )
-}
-
-fn token_idle_interval_positions_with_render_evidence(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    token_timelines: &GraphModelTimelines,
-    confirmed_gaps: &[GraphConfirmedGap],
-    render_evidence: Option<&GraphIdleRenderEvidence<'_>>,
-) -> Vec<UnusedIntervalPosition> {
-    let intervals = token_idle_timestamp_intervals_with_render_evidence(
-        samples,
-        period_start,
-        period_end,
-        token_timelines,
-        confirmed_gaps,
-        render_evidence,
-    );
-    unused_interval_positions_from_timestamp_intervals(&intervals, period_start, period_end)
-}
-
 fn unused_interval_positions_from_timestamp_intervals(
     intervals: &[(i64, i64)],
     period_start: i64,
@@ -25691,8 +25655,7 @@ mod tests {
             );
         }
 
-        let span = (period.end_at - period.start_at).max(1) as f64;
-        let mut actual_idle = super::token_idle_interval_positions_with_render_evidence(
+        let mut actual_idle = super::token_idle_timestamp_intervals_with_render_evidence(
             &references,
             period.start_at,
             period.end_at,
@@ -25703,12 +25666,7 @@ mod tests {
             }),
         )
         .into_iter()
-        .map(|interval| {
-            let start_at = period.start_at + (interval.start / 100.0 * span).round() as i64;
-            let end_at =
-                period.start_at + ((interval.start + interval.width) / 100.0 * span).round() as i64;
-            serde_json::json!({"start_at": start_at, "end_at": end_at})
-        })
+        .map(|(start_at, end_at)| serde_json::json!({"start_at": start_at, "end_at": end_at}))
         .collect::<Vec<_>>();
         actual_idle.sort_by_key(|interval| {
             (
@@ -44293,10 +44251,15 @@ mod tests {
             ]),
         )]);
 
-        assert!(
-            super::token_idle_interval_positions(&references, 0, 1_800, &timelines, &[],)
-                .is_empty()
-        );
+        assert!(super::token_idle_timestamp_intervals_with_render_evidence(
+            &references,
+            0,
+            1_800,
+            &timelines,
+            &[],
+            None,
+        )
+        .is_empty());
     }
 
     #[test]
