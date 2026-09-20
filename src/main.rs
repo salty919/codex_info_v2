@@ -14517,8 +14517,18 @@ impl CodexInfoState {
                     .map(str::to_owned)
                     .or_else(|| Some(default_account_id.clone()))
             }
-        } else {
+        } else if followed_previous_default {
             None
+        } else {
+            previous_selection
+                .as_deref()
+                .filter(|selected| {
+                    document
+                        .accounts
+                        .iter()
+                        .any(|account| &account.id == selected)
+                })
+                .map(str::to_owned)
         };
         let list_changed = self.service_accounts != document.accounts
             || self.service_default_account_id != document.default_account_id;
@@ -23567,6 +23577,40 @@ mod tests {
         );
         assert!(historical.service_current_pair.is_none());
         assert!(historical.history.samples.is_empty());
+    }
+
+    #[test]
+    fn defaultless_account_poll_preserves_manual_history_selection() {
+        let directory = super::parse_service_accounts_v3_document(
+            br#"{
+                "api_version":"v3",
+                "default_account_id":null,
+                "accounts":[
+                    {"id":"account-2","is_current":false,"activation_at":1789774038,"deactivation_at":null,"login_id":"ytanaka80@gmail.com"},
+                    {"id":"account-1","is_current":false,"activation_at":1789773766,"deactivation_at":1789774038,"login_id":"salty919@gmail.com"}
+                ]
+            }"#,
+        )
+        .expect("defaultless account directory");
+        let mut state = CodexInfoState::service_client();
+        state
+            .apply_service_accounts(directory.clone())
+            .expect("initial account directory admitted");
+        assert!(state.select_account("account-1"));
+        state.service_current_pair = Some("account-1:current".into());
+
+        state
+            .apply_service_accounts(directory)
+            .expect("unchanged account directory admitted");
+
+        assert_eq!(
+            state.service_selected_account_id.as_deref(),
+            Some("account-1")
+        );
+        assert_eq!(
+            state.service_current_pair.as_deref(),
+            Some("account-1:current")
+        );
     }
 
     #[test]
