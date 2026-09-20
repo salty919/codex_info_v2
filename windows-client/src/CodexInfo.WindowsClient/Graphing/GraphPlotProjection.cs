@@ -318,7 +318,7 @@ internal static class GraphPlotProjection
                         scene.Timestamps[right]) ||
                     crossesPrediction ||
                     !measured;
-                if (!dashed && current == before && IsConfirmedIdleInterval(
+                if (!dashed && SameDoubleBits(current, before) && IsConfirmedIdleInterval(
                         scene,
                         scene.Timestamps[left],
                         scene.Timestamps[right]))
@@ -388,6 +388,9 @@ internal static class GraphPlotProjection
     private static bool RemainingOriginHasMeasuredQuota(GraphRemainingOrigin origin) =>
         origin is GraphRemainingOrigin.Raw;
 
+    private static bool SameDoubleBits(double left, double right) =>
+        BitConverter.DoubleToInt64Bits(left) == BitConverter.DoubleToInt64Bits(right);
+
     /// <summary>
     /// Projects the flat, rising, and inferred cumulative-model paths used by
     /// the renderer. Confirmed gaps remain disconnected.
@@ -420,7 +423,8 @@ internal static class GraphPlotProjection
         var anchors = Enumerable.Range(0, values.Count)
             .Where(index => double.IsFinite(values[index]) && values[index] >= 0 &&
                 !scene.ModelSynthetic[index] &&
-                scene.IsModelIntervalReliable(values, index, index))
+                (scene.IsModelIntervalReliable(values, index, index) ||
+                 IsConfirmedIdleTimestamp(scene, scene.Timestamps[index])))
             .ToArray();
         var smoothableIntervals = new List<(int Left, int Right, ProjectionStyle Style)>();
         for (var anchor = 1; anchor < anchors.Length; anchor++)
@@ -429,13 +433,34 @@ internal static class GraphPlotProjection
             var right = anchors[anchor];
             var before = values[left];
             var current = values[right];
-            var crossesPrediction = Enumerable.Range(left + 1, right - left - 1)
-                .Any(index => !scene.IsModelIntervalReliable(values, index, index));
+            var confirmedIdle = IsConfirmedIdleInterval(
+                scene,
+                scene.Timestamps[left],
+                scene.Timestamps[right]);
+            if (!confirmedIdle &&
+                (!scene.IsModelIntervalReliable(values, left, left) ||
+                 !scene.IsModelIntervalReliable(values, right, right)))
+            {
+                continue;
+            }
+            var crossesPrediction = !confirmedIdle &&
+                Enumerable.Range(left + 1, right - left - 1)
+                    .Any(index => !scene.IsModelIntervalReliable(values, index, index));
             var crossesCorrection = scene.HasModelCorrectionBetween(
                 values,
                 scene.Timestamps[left],
                 scene.Timestamps[right]);
-            if (current < before)
+            if (confirmedIdle)
+            {
+                AppendSegment(
+                    idleX,
+                    idleY,
+                    scene.Timestamps[left],
+                    before,
+                    scene.Timestamps[right],
+                    before);
+            }
+            else if (current < before)
             {
                 AppendSegment(
                     dashedX,
@@ -461,30 +486,14 @@ internal static class GraphPlotProjection
                         scene.Timestamps[left],
                         scene.Timestamps[right]) ||
                     crossesPrediction;
-                if (!dashed && current == before && IsConfirmedIdleInterval(
-                        scene,
-                        scene.Timestamps[left],
-                        scene.Timestamps[right]))
-                {
-                    AppendSegment(
-                        idleX,
-                        idleY,
-                        scene.Timestamps[left],
-                        before,
-                        scene.Timestamps[right],
-                        current);
-                }
-                else
-                {
-                    smoothableIntervals.Add((
-                        left,
-                        right,
-                        dashed
-                            ? ProjectionStyle.Dashed
-                            : current == before
-                                ? ProjectionStyle.Flat
-                                : ProjectionStyle.Rising));
-                }
+                smoothableIntervals.Add((
+                    left,
+                    right,
+                    dashed
+                        ? ProjectionStyle.Dashed
+                        : current == before
+                            ? ProjectionStyle.Flat
+                            : ProjectionStyle.Rising));
             }
         }
         if (smooth)
@@ -543,6 +552,10 @@ internal static class GraphPlotProjection
     private static bool IsConfirmedIdleInterval(GraphScene scene, double startAt, double endAt) =>
         scene.IdleIntervals.Any(interval =>
             startAt >= interval.StartAt && endAt <= interval.EndAt);
+
+    private static bool IsConfirmedIdleTimestamp(GraphScene scene, double timestamp) =>
+        scene.IdleIntervals.Any(interval =>
+            timestamp >= interval.StartAt && timestamp <= interval.EndAt);
 
     /// <summary>Returns every evidence interval without a pixel-width filter.</summary>
     public static IReadOnlyList<GraphIdleInterval> BuildVisibleIdleIntervals(GraphScene scene)

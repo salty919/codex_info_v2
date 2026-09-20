@@ -102,7 +102,7 @@
         {"timestamp":120,"remaining_percent":90.0,"tokens":100,"dollars":1.0,"task_active_since_previous":false}
       ],
       "idle_intervals": [],
-      "dollar_dashed": [[0,120]],
+      "dollar_flat": [[0,60],[60,120]],
       "token_flat": [[0,60],[60,120]]
     },
     "dollar_only_high_pulse": {
@@ -112,7 +112,7 @@
         {"timestamp":120,"remaining_percent":90.0,"tokens":100,"dollars":1.0,"task_active_since_previous":false}
       ],
       "idle_intervals": [],
-      "dollar_dashed": [[0,120]],
+      "dollar_flat": [[0,60],[60,120]],
       "token_flat": [[0,60],[60,120]],
       "dollar_maximum": 1.0
     },

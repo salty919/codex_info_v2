@@ -863,6 +863,9 @@ public sealed class GraphScene
         origin is GraphModelOrigin.Direct;
 
     private static bool ModelOriginLineIsExact(GraphModelOrigin origin) =>
+        origin is GraphModelOrigin.Direct;
+
+    private static bool ModelOriginIsLosslessIdleObservation(GraphModelOrigin origin) =>
         origin is GraphModelOrigin.Direct or GraphModelOrigin.LegacyUnknown;
 
     private static double RawModelValue(ApiHistorySample sample, string name, GraphMetric metric)
@@ -1019,6 +1022,7 @@ public sealed class GraphScene
             var left = samples[before.Index];
             var right = samples[after.Index];
             if (right.Timestamp <= left.Timestamp ||
+                !StringComparer.Ordinal.Equals(left.ModelSource, right.ModelSource) ||
                 left.ResetAt != right.ResetAt ||
                 !RemainingBitsEqual(left.RemainingPercent!.Value, right.RemainingPercent!.Value) ||
                 !TokenVectorsEqual(before.Vector, after.Vector) ||
@@ -1030,6 +1034,7 @@ public sealed class GraphScene
                     samples,
                     before.Index,
                     after.Index,
+                    left.ModelSource,
                     left.ResetAt,
                     before.Vector,
                     left.RemainingPercent.Value,
@@ -1071,6 +1076,7 @@ public sealed class GraphScene
         IReadOnlyList<ApiHistorySample> samples,
         int before,
         int after,
+        string modelSource,
         long resetAt,
         IReadOnlyDictionary<string, DirectModelValue> baseline,
         double baselineRemaining,
@@ -1079,7 +1085,8 @@ public sealed class GraphScene
         for (var index = before + 1; index <= after; index++)
         {
             var sample = samples[index];
-            if (sample.ResetAt != resetAt ||
+            if (!StringComparer.Ordinal.Equals(sample.ModelSource, modelSource) ||
+                sample.ResetAt != resetAt ||
                 sample.RemainingPercent is not double remaining ||
                 !double.IsFinite(remaining) ||
                 !RemainingBitsEqual(baselineRemaining, remaining) ||
@@ -1101,7 +1108,7 @@ public sealed class GraphScene
         vector.Keys.All(name =>
             tokenProjection.Origins.TryGetValue(name, out var tokenOrigins) &&
             index < tokenOrigins.Count &&
-            ModelOriginLineIsExact(tokenOrigins[index]));
+            ModelOriginIsLosslessIdleObservation(tokenOrigins[index]));
 
     private static bool TryGetIdleModelVector(
         ApiHistorySample sample,

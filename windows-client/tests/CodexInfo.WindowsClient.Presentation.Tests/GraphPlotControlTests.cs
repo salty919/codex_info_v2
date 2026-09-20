@@ -2853,10 +2853,19 @@ public sealed class GraphPlotControlTests
             .ToArray();
 
         var scene = GraphScene.Create(samples, GraphMetric.Tokens, start, start + 1_800);
+        var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
+        var remaining = GraphPlotProjection.BuildRemainingLines(scene);
 
         Assert.Equal(
             [new GraphIdleInterval(start, start + 1_800, false)],
             scene.IdleIntervals);
+        Assert.Equal(31, model.Idle.X.Count);
+        Assert.Empty(model.Flat.X);
+        Assert.Empty(model.Rising.X);
+        Assert.Empty(model.Dashed.X);
+        Assert.Equal(31, remaining.Idle.X.Count);
+        Assert.Empty(remaining.Solid.X);
+        Assert.Empty(remaining.Dashed.X);
     }
 
     [Fact]

@@ -4839,7 +4839,7 @@ impl GraphModelOrigin {
     }
 
     fn line_is_exact(self) -> bool {
-        matches!(self, Self::Direct | Self::LegacyObserved)
+        self == Self::Direct
     }
 }
 
@@ -4932,6 +4932,13 @@ fn normalize_graph_model_display_monotonic(
 
 fn graph_model_raw_tokens(point: &GraphModelPoint) -> Option<u64> {
     point.raw_tokens
+}
+
+fn graph_model_is_lossless_idle_observation(point: &GraphModelPoint) -> bool {
+    matches!(
+        point.origin,
+        GraphModelOrigin::Direct | GraphModelOrigin::LegacyObserved
+    ) && point.raw_tokens.is_some()
 }
 
 /// Normalize only the presentation copy of derived dollars. A direct token
@@ -6817,8 +6824,7 @@ fn monotone_cubic_interval_polyline(
 }
 
 fn append_monotone_cubic_interval(
-    path: &mut String,
-    last_end: &mut Option<(f64, f64)>,
+    output: (&mut String, &mut Option<(f64, f64)>),
     timestamps: &[f64],
     values: &[f64],
     interval: usize,
@@ -6826,6 +6832,7 @@ fn append_monotone_cubic_interval(
     period_span: f64,
     graph_y: impl Fn(f64) -> f64,
 ) {
+    let (path, last_end) = output;
     let points = monotone_cubic_interval_polyline(
         timestamps,
         values,
@@ -6859,6 +6866,7 @@ fn append_monotone_cubic_dashed_interval(
     append_dashed_polyline(path, &points);
 }
 
+#[cfg(test)]
 fn metric_line_segments_with_boundaries(
     points: &[HourlyModelSpend],
     value: impl Fn(&HourlyModelSpend) -> f64,
@@ -6866,6 +6874,26 @@ fn metric_line_segments_with_boundaries(
     untrusted_minutes: &BTreeSet<i64>,
     require_legacy_vector: bool,
     correction_starts: &BTreeSet<i64>,
+) -> Vec<GraphMetricSegment> {
+    metric_line_segments_with_boundaries_and_idle(
+        points,
+        value,
+        confirmed_gaps,
+        untrusted_minutes,
+        require_legacy_vector,
+        correction_starts,
+        &[],
+    )
+}
+
+fn metric_line_segments_with_boundaries_and_idle(
+    points: &[HourlyModelSpend],
+    value: impl Fn(&HourlyModelSpend) -> f64,
+    confirmed_gaps: &[GraphConfirmedGap],
+    untrusted_minutes: &BTreeSet<i64>,
+    require_legacy_vector: bool,
+    correction_starts: &BTreeSet<i64>,
+    idle_timestamp_intervals: &[(i64, i64)],
 ) -> Vec<GraphMetricSegment> {
     let is_exact = |index: usize| {
         let point = &points[index];
@@ -6875,8 +6903,17 @@ fn metric_line_segments_with_boundaries(
             && !untrusted_minutes.contains(&point.timestamp)
             && (!require_legacy_vector || model_spend_is_reliable(point))
     };
+    let is_idle_anchor = |index: usize| {
+        let point = &points[index];
+        let point_value = value(point);
+        point_value.is_finite()
+            && point_value >= 0.0
+            && idle_timestamp_intervals
+                .iter()
+                .any(|(start, end)| point.timestamp >= *start && point.timestamp <= *end)
+    };
     let anchors = (0..points.len())
-        .filter(|index| is_exact(*index))
+        .filter(|index| is_exact(*index) || is_idle_anchor(*index))
         .collect::<Vec<_>>();
     let mut segments = Vec::new();
     for pair in anchors.windows(2) {
@@ -6884,31 +6921,43 @@ fn metric_line_segments_with_boundaries(
         let end_index = pair[1];
         let previous = value(&points[start_index]);
         let current = value(&points[end_index]);
-        let crosses_prediction = ((start_index + 1)..end_index).any(|index| !is_exact(index));
+        let confirmed_idle = graph_interval_is_confirmed_idle(
+            points[start_index].timestamp,
+            points[end_index].timestamp,
+            idle_timestamp_intervals,
+        );
+        if !confirmed_idle && (!is_exact(start_index) || !is_exact(end_index)) {
+            continue;
+        }
+        let crosses_prediction =
+            !confirmed_idle && ((start_index + 1)..end_index).any(|index| !is_exact(index));
         let crosses_correction = graph_interval_crosses_correction(
             points[start_index].timestamp,
             points[end_index].timestamp,
             correction_starts,
         );
-        let inferred = current < previous
-            || crosses_prediction
-            || graph_interval_has_hard_break(
-                points[start_index].timestamp,
-                points[end_index].timestamp,
-                confirmed_gaps,
-                correction_starts,
-            );
+        let inferred = !confirmed_idle
+            && (current < previous
+                || crosses_prediction
+                || graph_interval_has_hard_break(
+                    points[start_index].timestamp,
+                    points[end_index].timestamp,
+                    confirmed_gaps,
+                    correction_starts,
+                ));
         segments.push(GraphMetricSegment {
             start_index,
             end_index,
-            kind: if inferred {
+            kind: if confirmed_idle {
+                GraphMetricSegmentKind::Idle
+            } else if inferred {
                 GraphMetricSegmentKind::Inferred
             } else if current == previous {
                 GraphMetricSegmentKind::Flat
             } else {
                 GraphMetricSegmentKind::Rising
             },
-            smoothable: current >= previous && !crosses_correction,
+            smoothable: !confirmed_idle && current >= previous && !crosses_correction,
         });
     }
     if let Some(last_anchor) = anchors.last().copied() {
@@ -6956,13 +7005,14 @@ fn split_metric_line_paths_with_evidence_and_idle(
             canonical_graph_viewbox_value(y),
         )
     };
-    let mut segments = metric_line_segments_with_boundaries(
+    let mut segments = metric_line_segments_with_boundaries_and_idle(
         context.points,
         &value,
         context.confirmed_gaps,
         context.untrusted_minutes,
         context.require_legacy_vector,
         context.correction_starts,
+        context.idle_timestamp_intervals,
     );
     apply_confirmed_idle_to_metric_segments(
         &mut segments,
@@ -7035,8 +7085,7 @@ fn split_metric_line_paths_with_evidence_and_idle(
                     GraphMetricSegmentKind::Inferred => unreachable!("handled above"),
                 };
                 append_monotone_cubic_interval(
-                    target,
-                    last_end,
+                    (target, last_end),
                     &timestamps,
                     &values,
                     interval,
@@ -7294,28 +7343,33 @@ fn token_idle_timestamp_intervals_with_render_evidence(
     // Only a non-empty vector of lossless same-minute raw observations can
     // prove inactivity. Legacy raw values participate only in exact equality
     // here; they remain excluded from arithmetic baselines.
-    let raw_idle_vector = |timestamp: i64| -> Option<Vec<(String, u64)>> {
+    let raw_idle_vector = |timestamp: i64| -> Option<(Vec<(String, u64)>, bool)> {
         let mut vector = Vec::new();
+        let mut all_legacy = true;
         for (name, timeline) in raw_timelines {
             let Some(point) = timeline.get(&timestamp) else {
                 continue;
             };
-            if !point.origin.line_is_exact() {
+            if !graph_model_is_lossless_idle_observation(point) {
                 return None;
             }
+            all_legacy &= point.origin == GraphModelOrigin::LegacyObserved;
             if !accepted_tokens
                 .get(name)
                 .and_then(|timeline| timeline.get(&timestamp))
-                .is_some_and(|accepted| accepted.origin.line_is_exact())
+                .is_some_and(graph_model_is_lossless_idle_observation)
             {
                 return None;
             }
             vector.push((name.clone(), graph_model_raw_tokens(point)?));
         }
+        if untrusted_minutes.contains(&timestamp) && !all_legacy {
+            return None;
+        }
         // The model set is allowed to change over a period.  Only the models
         // directly observed at this timestamp form the vector; a model that
         // appeared in a legacy row elsewhere must not be fabricated here.
-        (!vector.is_empty()).then_some(vector)
+        (!vector.is_empty()).then_some((vector, all_legacy))
     };
     let direct_remaining = |timestamp: i64| -> Option<u64> {
         let mut accepted = None;
@@ -7345,7 +7399,7 @@ fn token_idle_timestamp_intervals_with_render_evidence(
             raw_timelines.values().any(|timeline| {
                 timeline
                     .get(timestamp)
-                    .is_some_and(|point| point.origin.line_is_exact())
+                    .is_some_and(graph_model_is_lossless_idle_observation)
             })
         })
         .copied()
@@ -7354,36 +7408,42 @@ fn token_idle_timestamp_intervals_with_render_evidence(
     // Every direct observation inside a sparse interval must preserve the
     // exact endpoint model set and lossless token totals. Dollars are derived
     // display values and never participate in this authority path.
-    let direct_models_remain_flat =
-        |start: i64, end: i64, values: &[(String, u64)], remaining_bits: u64| {
-            let baseline = values
+    let direct_models_remain_flat = |start: i64,
+                                     end: i64,
+                                     values: &[(String, u64)],
+                                     baseline_is_legacy: bool,
+                                     remaining_bits: u64| {
+        let baseline = values
+            .iter()
+            .map(|(name, tokens)| (name.as_str(), *tokens))
+            .collect::<BTreeMap<_, _>>();
+        for timestamp in exact_model_timestamps.range((
+            std::ops::Bound::Excluded(start),
+            std::ops::Bound::Excluded(end),
+        )) {
+            if direct_remaining(*timestamp) != Some(remaining_bits) {
+                return false;
+            }
+            let Some((vector, is_legacy)) = raw_idle_vector(*timestamp) else {
+                return false;
+            };
+            if is_legacy != baseline_is_legacy {
+                return false;
+            }
+            let values = vector
                 .iter()
                 .map(|(name, tokens)| (name.as_str(), *tokens))
                 .collect::<BTreeMap<_, _>>();
-            for timestamp in exact_model_timestamps.range((
-                std::ops::Bound::Excluded(start),
-                std::ops::Bound::Excluded(end),
-            )) {
-                if direct_remaining(*timestamp) != Some(remaining_bits) {
-                    return false;
-                }
-                let Some(vector) = raw_idle_vector(*timestamp) else {
-                    return false;
-                };
-                let values = vector
+            if values.len() != baseline.len()
+                || baseline
                     .iter()
-                    .map(|(name, tokens)| (name.as_str(), *tokens))
-                    .collect::<BTreeMap<_, _>>();
-                if values.len() != baseline.len()
-                    || baseline
-                        .iter()
-                        .any(|(name, expected)| values.get(name).copied() != Some(*expected))
-                {
-                    return false;
-                }
+                    .any(|(name, expected)| values.get(name).copied() != Some(*expected))
+            {
+                return false;
             }
-            true
-        };
+        }
+        true
+    };
 
     let mut anchors = raw_timelines
         .values()
@@ -7393,14 +7453,11 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .filter_map(|timestamp| {
-            Some((
-                timestamp,
-                raw_idle_vector(timestamp)?,
-                direct_remaining(timestamp)?,
-            ))
+            let (vector, is_legacy) = raw_idle_vector(timestamp)?;
+            Some((timestamp, vector, direct_remaining(timestamp)?, is_legacy))
         })
         .collect::<Vec<_>>();
-    anchors.sort_by_key(|(timestamp, _, _)| *timestamp);
+    anchors.sort_by_key(|(timestamp, _, _, _)| *timestamp);
     // Any explicit non-raw source row is a boundary. Timestamp sparsity by
     // itself is not: two adjacent valid anchors may still be far apart.
     let has_numeric_incomplete_row = |start: i64, end: i64| {
@@ -7410,7 +7467,12 @@ fn token_idle_timestamp_intervals_with_render_evidence(
                     std::ops::Bound::Excluded(start),
                     std::ops::Bound::Included(end),
                 ))
-                .any(|(_, point)| !point.origin.line_is_exact() && point.raw_tokens.is_some())
+                .any(|(_, point)| {
+                    matches!(
+                        point.origin,
+                        GraphModelOrigin::Unknown | GraphModelOrigin::Rejected
+                    ) && point.raw_tokens.is_some()
+                })
         })
     };
     let has_unavailable_incomplete_row = |start: i64, end: i64| {
@@ -7424,16 +7486,24 @@ fn token_idle_timestamp_intervals_with_render_evidence(
     };
     let mut proven = Vec::<(i64, i64)>::new();
     for pair in anchors.windows(2) {
-        let [(start, start_vector, start_remaining), (end, end_vector, end_remaining)] = pair
+        let [(start, start_vector, start_remaining, start_is_legacy), (end, end_vector, end_remaining, end_is_legacy)] =
+            pair
         else {
             continue;
         };
         if end <= start
             || start_vector != end_vector
             || start_remaining != end_remaining
+            || start_is_legacy != end_is_legacy
             || has_numeric_incomplete_row(*start, *end)
             || has_unavailable_incomplete_row(*start, *end)
-            || !direct_models_remain_flat(*start, *end, start_vector, *start_remaining)
+            || !direct_models_remain_flat(
+                *start,
+                *end,
+                start_vector,
+                *start_is_legacy,
+                *start_remaining,
+            )
             || graph_interval_overlaps_confirmed_gap(*start, *end, confirmed_gaps)
         {
             continue;
@@ -8127,8 +8197,7 @@ fn remaining_paths_with_boundaries_and_idle(
             } else {
                 debug_assert_eq!(segment.kind, GraphRemainingSegmentKind::Solid);
                 append_monotone_cubic_interval(
-                    &mut solid_commands,
-                    &mut solid_last_end,
+                    (&mut solid_commands, &mut solid_last_end),
                     &timestamps,
                     &values,
                     interval,
@@ -41883,7 +41952,8 @@ mod tests {
         let graph = graph_paths_for_selection(&references, 0, 180, true, true, true, true);
         assert_eq!(graph.current_remaining_label, "99%");
         assert!(!graph.remaining.is_empty());
-        assert!(graph.remaining.matches('M').count() > 2);
+        assert_eq!(graph.remaining.matches('M').count(), 1);
+        assert!(graph.remaining.matches('L').count() >= 3);
         assert!(!graph.remaining.contains("L100.00 99.00 L100.00 1.98"));
     }
 
@@ -42105,7 +42175,7 @@ mod tests {
         let (idle_flat, _, _) =
             super::split_metric_line_paths_with_boundaries(&idle_context, |point| point.sol);
         assert!(idle_flat.contains("M80.00 1.00"));
-        assert!(idle_flat.ends_with("L100.00 1.00"));
+        assert!(idle_flat.contains("L100.00 1.00"));
     }
 
     #[test]
@@ -42394,7 +42464,7 @@ mod tests {
 
         assert_eq!(dollars.current_remaining_label, "90%");
         assert_eq!(tokens.current_remaining_label, "90%");
-        assert!(tokens.remaining.matches('M').count() > 2);
+        assert_eq!(tokens.remaining.matches('M').count(), 1);
     }
 
     #[test]
@@ -44210,7 +44280,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_observed_values_render_measured_lines_without_idle_authority() {
+    fn legacy_values_without_lossless_tokens_have_no_line_or_idle_authority() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
             UsageHistorySample::new(60, 1_000, 90.0, ModelDollarTotals::default()),
@@ -44261,7 +44331,7 @@ mod tests {
                 );
 
             assert!(graph.sol_flat.is_empty());
-            assert!(!graph.sol_rising.is_empty());
+            assert!(graph.sol_rising.is_empty());
             assert!(graph.sol_inferred.is_empty());
             assert!(graph.unused_intervals.is_empty());
         }
@@ -44313,6 +44383,33 @@ mod tests {
         );
 
         assert_eq!(idle, vec![(START, START + 1_800)]);
+
+        let graph =
+            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: START,
+                    period_end: START + 1_800,
+                    show_luna: true,
+                    show_terra: true,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: true,
+                    untrusted_minutes: &legacy_minutes,
+                    confirmed_gaps: &[],
+                    model_timelines: &timelines,
+                },
+                None,
+            );
+        assert!(!graph.sol_idle.is_empty());
+        assert!(!graph.terra_idle.is_empty());
+        assert!(!graph.luna_idle.is_empty());
+        assert!(graph.sol_flat.is_empty());
+        assert!(graph.sol_rising.is_empty());
+        assert!(graph.sol_inferred.is_empty());
+        assert!(!graph.remaining_idle.is_empty());
+        assert!(graph.remaining_solid.is_empty());
+        assert!(graph.remaining_inferred.is_empty());
     }
 
     #[test]
@@ -46266,9 +46363,11 @@ mod tests {
         assert!(!paths.sol_idle.is_empty());
         assert!(!paths.terra_idle.is_empty());
         assert!(!paths.luna_idle.is_empty());
-        assert!(!paths.sol_rising.is_empty());
+        assert!(paths.sol_rising.is_empty());
+        assert!(!paths.sol_flat.is_empty());
         assert!(paths.terra_rising.is_empty());
-        assert!(!paths.luna_rising.is_empty());
+        assert!(paths.luna_rising.is_empty());
+        assert!(!paths.luna_flat.is_empty());
         assert!(!paths.astra_idle.is_empty());
         assert!(!paths.astra_rising.is_empty());
         assert!(paths.astra_inferred.is_empty());

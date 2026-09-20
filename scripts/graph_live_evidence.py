@@ -709,16 +709,34 @@ def _model_segments(
     idle_intervals: list[dict[str, int]],
 ) -> list[dict[str, Any]]:
     segments: list[dict[str, Any]] = []
+
+    def is_idle_timestamp(timestamp: int) -> bool:
+        return any(
+            interval["start_at"] <= timestamp <= interval["end_at"]
+            for interval in idle_intervals
+        )
+
     exact = [
         index
         for index, point in enumerate(projection)
         if point.value is not None
         and math.isfinite(point.value)
         and point.value >= 0
-        and point.origin in {"direct", "legacy"}
+        and (
+            (point.origin == "direct" and point.reliable)
+            or (point.origin == "legacy" and is_idle_timestamp(rows[index]["timestamp"]))
+        )
     ]
     for previous, index in pairwise(exact):
         start, end = rows[previous]["timestamp"], rows[index]["timestamp"]
+        previous_origin = projection[previous].origin
+        current_origin = projection[index].origin
+        confirmed_idle = _is_idle_interval(start, end, idle_intervals)
+        if "legacy" in {previous_origin, current_origin} and not (
+            previous_origin == current_origin == "legacy"
+            and confirmed_idle
+        ):
+            continue
         causes: list[str] = []
         if _hard_break(start, end, gaps):
             causes.append("confirmed_gap")
@@ -739,8 +757,7 @@ def _model_segments(
             "dashed"
             if causes
             else "idle"
-            if previous_value == current_value
-            and _is_idle_interval(start, end, idle_intervals)
+            if confirmed_idle
             else "flat"
             if previous_value == current_value
             else "rising"
@@ -885,7 +902,11 @@ def _idle_intervals(
             continue
         if _hard_break(start, end, gaps):
             continue
-        if left.get("synthetic", False) or right.get("synthetic", False):
+        if (
+            left.get("synthetic", False)
+            or right.get("synthetic", False)
+            or left.get("model_source") != right.get("model_source")
+        ):
             continue
         left_names = frozenset(model["model"] for model in left.get("models") or [])
         right_names = frozenset(model["model"] for model in right.get("models") or [])
@@ -1282,6 +1303,8 @@ def _canonical_smooth_path(
                     maximum,
                     remaining,
                 )
+                if style == "idle":
+                    end = (end[0], start[1])
                 if style == "dashed":
                     commands.extend(_canonical_dashes(start, end))
                 else:
