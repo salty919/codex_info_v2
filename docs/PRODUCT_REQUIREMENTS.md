@@ -383,10 +383,12 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    raw証拠は保持するが、表示は直前baselineを破線holdする。period endまで復帰しなければ同じbaselineを終端まで
    破線holdする。このRemaining anomalyとrecovery bridgeは未使用の証拠にしない。
 
-   Remainingのaccepted raw値は全て有効anchorとして元時刻・元値を保持し、token増分、task lifecycle、model availabilityで
-   中間raw値を移動または置換しない。連続するaccepted raw anchor列は各anchorをexactに通り、非増加かつovershootしない
-   PCHIP（Fritsch–Carlson）を3px実線として描画する。これはread-timeのgeometry生成だけであり、DB、history row、
-   gap ledger、raw値を書き換えない。timestampの疎またはsampling jitterだけでは欠損・予測へ降格しない。
+   Remainingのaccepted raw値は全て元時刻・元値の証拠として保持し、token増分、task lifecycle、model availabilityで
+   移動または置換しない。表示geometryでは、sampling由来の同値反復を未使用と確定できない区間の折れ点にせず、前後の
+   有効な変化点を非増加かつovershootしないPCHIP（Fritsch–Carlson）の3px実線で滑らかにつなぐ。confirmed idleの両端は
+   exactな水平境界として保持し、明示欠損・異常・reset/correctionの境界は平滑化で跨がない。変化量による別閾値は設けない。
+   これはread-timeのgeometry生成だけであり、DB、history row、gap ledger、raw値を書き換えない。timestampの疎または
+   sampling jitterだけでは欠損・予測へ降格しない。
 
    raw-null、`Held`、`Rejected`、明示的unavailableまたはconfirmed gapを含む区間だけを予測とし、両側のaccepted raw
    anchor間は同じ単調補間geometryを1px破線で描く。予測した中間値を新しいanchorへ昇格しない。token anomalyや
@@ -457,8 +459,10 @@ isolated pulseはtoken不変runを消さない。tokenとRemainingが同値でdo
 dollar線だけを破線hold／recovery、直接観測のtoken線を3px実線、未使用帯を表示する。逆にtokenだけ`100→90→100`ならdollarが
 同値でもtoken線だけを破線にして未使用帯を表示しない。
 valid-anchor smoothing oracleは、時系列tokenが`10,20,20,50`でraw Remainingが`100,100,100,99`なら、
-effective anchorも`100,100,100,99`のまま保持し、token列またはtask lifecycleを変えても同一geometryとする。
-正常区間は全raw anchorを通る3px単調PCHIP、明示欠損を挟む区間だけを1px破線予測とする。
+raw/effective列を`100,100,100,99`のまま保持する一方、未使用と確定できない中間の同値raw点を表示geometryの必須通過点に
+しない。正常区間は前後の有効変化点を滑らかにつなぐ3px単調PCHIPとし、confirmed idleだけはexactな水平線、明示欠損を
+挟む区間だけは1px破線予測とする。Direct tokenのexact-equalはconfirmed idleの二値判定だけに使い、token deltaの量・比率や
+task lifecycleでRemaining低下を配分または成形しない。
 `correction_v2`は直接観測されたraw Remainingを元時刻のanchorとして保持し、terminal holdを含む
 `remaining_values`を`[73.0,73.0,73.0,70.0,70.0,62.0,62.0]`とする。model累積値の後退・回復を
 Remainingの配分または線種へ波及させず、直接観測anchor間は3px実線PCHIP、最後のraw anchorからperiod endだけを

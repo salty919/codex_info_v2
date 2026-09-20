@@ -301,7 +301,7 @@ component順や表示所有者を変更しない。
 
   | 入力状態 | 表示契約 |
   | --- | --- |
-  | 同一periodの実測累積が増加／不変 | 増加・不変とも同じ3px実線。全有効anchorを通る単調PCHIPで滑らかにつなぎ、未使用帯は全modelとRemainingを別途判定する |
+  | 同一periodの実測累積が増加／不変 | 増加・不変とも同じ3px実線。sampling由来の同値反復を未使用確定区間以外の折れ点にせず、有効な変化点間を単調PCHIPで滑らかにつなぐ。confirmed idleだけはexactな水平線とし、未使用帯は全modelとRemainingを別途判定する |
   | 当該model値はログ実測、全model集合は不完全 | 直接観測(`confirmed`)の値だけを保持する。未掲載modelは欠損metadataだけとし、数値を作らない |
   | 他modelの出現／消失、または`confirmed`と`legacy-unknown`の切替 | `confirmed`の同じmodel keyは通常線を維持する。`legacy-unknown`は保存済み同じkeyの値だけを表示し、集計・予測・idle判定には使わない。新規modelは最初の直接観測時刻から開始し、消失modelのholdは表示専用とする |
   | 正常な直接観測点のtimestampだけが疎 | timestamp差だけでは欠損化せず、同値・増加とも3px実線で結ぶ。明示的なunavailable、confirmed gap、異常とは分離する（`G137-4`,`G137-7`） |
@@ -319,8 +319,9 @@ component順や表示所有者を変更しない。
   値変化のauthorityにせず、exact equalなDirect値をactive metadataだけで使用済みに変更しない。timestamp不連続だけは
   gapまたは利用の証拠にせず、正常なdirect endpointが上記条件を満たすintervalを分断しない。上記条件を満たす連続10分以上のrunだけをgray表示し、観測点数やdirect endpointを欠く欠測時間だけで確定しない。
   10分は画面幅に依存しない意味閾値とし、pixel幅filter、最小表示幅、gridまたはsegment境界によって削除・周期分断しない。
-  Remainingは`G137-6`に従い、accepted raw値を全て有効anchorとして保持し、token増分またはtask lifecycleで中間raw値を
-  移動しない。正常なanchor列は全anchorを通る単調PCHIPの3px実線とする。raw-null、unavailable、confirmed gap、異常、
+  Remainingは`G137-6`に従い、accepted raw値を元時刻・元値の証拠として保持し、token増分またはtask lifecycleでraw値を
+  移動しない。表示geometryでは未使用と確定できないsampling由来の同値反復を折れ点にせず、有効な変化点間を単調PCHIPの
+  3px実線で滑らかにつなぐ。confirmed idleの両端だけはexactな水平境界とする。raw-null、unavailable、confirmed gap、異常、
   terminal holdだけを1px破線の予測とし、導出値をanchorへ昇格させずAPI/DBへ書き戻さない。
   `Remaining`のeffective値からmodel系列の値またはそのperiod tailを外挿しない。
   raw-null補間、gap、異常、終端hold等の欠測・予測の破線は
