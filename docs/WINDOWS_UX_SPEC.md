@@ -301,10 +301,10 @@ component順や表示所有者を変更しない。
 
   | 入力状態 | 表示契約 |
   | --- | --- |
-  | 同一periodの実測累積が増加／不変 | 増加は太い実線、当該modelの不変は細い実線。同じ実測濃度を使い、最初と最後の値を同じ系列へ使う。未使用帯は全modelとRemainingを別途判定する |
+  | 同一periodの実測累積が増加／不変 | 増加・不変とも同じ3px実線。全有効anchorを通る単調PCHIPで滑らかにつなぎ、未使用帯は全modelとRemainingを別途判定する |
   | 当該model値はログ実測、全model集合は不完全 | 直接観測(`confirmed`)の値だけを保持する。未掲載modelは欠損metadataだけとし、数値を作らない |
   | 他modelの出現／消失、または`confirmed`と`legacy-unknown`の切替 | `confirmed`の同じmodel keyは通常線を維持する。`legacy-unknown`は保存済み同じkeyの値だけを表示し、集計・予測・idle判定には使わない。新規modelは最初の直接観測時刻から開始し、消失modelのholdは表示専用とする |
-  | 正常な直接観測点のtimestampだけが疎 | timestamp差だけでは欠損化せず、同値を細い実線、増加を太い実線で結ぶ。明示的なunavailable、confirmed gap、異常とは分離する（`G137-4`,`G137-7`） |
+  | 正常な直接観測点のtimestampだけが疎 | timestamp差だけでは欠損化せず、同値・増加とも3px実線で結ぶ。明示的なunavailable、confirmed gap、異常とは分離する（`G137-4`,`G137-7`） |
   | model値自体が未取得、または確認済みrecorder停止区間 | model key/sourceと欠損metadataだけを表示し、数値を0補完しない。必要な破線bridge／holdは表示専用で、API/DB、集計、idle判定へ反映しない。`Remaining`からmodel値やtailを外挿しない |
   | 累積が後退し、その後に回復 | source completenessを問わず最後のaccepted値を下回るrawを表示値へ採用せず、当該modelだけを回復点まで細い破線hold／bridgeとする（`G137-3`） |
   | period内の最初の既知点 | 0からの斜線を捏造せず、その値・時刻から開始する |
@@ -313,21 +313,18 @@ component順や表示所有者を変更しない。
   | ドル／token切替 | 同じ観測時刻列を使い、単位と値だけを切り替える |
 
   アイドル帯はsame `reset_at`のperiod内で、両endpointが`confirmed`かつ`models_complete=true`、同じmodel key集合、全raw
-  `total_tokens`がexact equal、raw Remainingがfiniteかつbitwise equalであり、active、confirmed gap、直接観測値の矛盾が
+  `total_tokens`がexact equal、raw Remainingがfiniteかつbitwise equalであり、confirmed gap、欠測、直接観測値の矛盾が
   ない区間だけを候補にする。`legacy-unknown`、`unknown`、`unavailable`、欠損・補間・hold・smoothing・予測値はendpointまたは
-  矛盾なしのauthorityにしない。ただし完全directな同値endpoint間に、数値を持たず
-  `task_active_since_previous=false`の`unavailable` rowが正確に1件だけあり、前後が1分cadenceの同じdirect model集合で
-  境界づけられる場合は、中立的な欠測としてidle帯だけを橋渡しできる（その表示線は破線のまま）。連続または複数の
-  `unavailable`、active/unknown、その他の不完全rowは分断する。timestamp不連続だけはgapまたは利用の証拠にせず、正常なdirect endpointが上記条件を満たすintervalを分断しない。上記条件を満たす連続10分以上のrunだけをgray表示し、観測点数やdirect endpointを欠く欠測時間だけで確定しない。
+  矛盾なしのauthorityにしない。単発を含む`unavailable`、unknown、その他の不完全rowは分断する。task lifecycleだけは
+  値変化のauthorityにせず、exact equalなDirect値をactive metadataだけで使用済みに変更しない。timestamp不連続だけは
+  gapまたは利用の証拠にせず、正常なdirect endpointが上記条件を満たすintervalを分断しない。上記条件を満たす連続10分以上のrunだけをgray表示し、観測点数やdirect endpointを欠く欠測時間だけで確定しない。
   10分は画面幅に依存しない意味閾値とし、pixel幅filter、最小表示幅、gridまたはsegment境界によって削除・周期分断しない。
-  Remainingは`G137-6`に従い、完全な全modelの`Direct` token証拠があるspanでは各隣接intervalのtoken増分合計に比例して
-  低下を配分し、token増分0のintervalと未使用帯ではexactな水平線とする。実利用が偏ったspanを一定速度の直線へ
-  捏造しない。1 intervalでもtoken証拠が欠けるか矛盾する場合はspan全体をelapsed比の参考bridgeへfallbackし、
-  全中間点を破線にする。token量と秒数を同一spanで混在させない。平滑化・補間は`ActivitySmoothed`などの表示専用線に限り、
-  raw-null点はtoken比で位置を決めても破線にする。導出値をAPI/DBへ書き戻さない。
+  Remainingは`G137-6`に従い、accepted raw値を全て有効anchorとして保持し、token増分またはtask lifecycleで中間raw値を
+  移動しない。正常なanchor列は全anchorを通る単調PCHIPの3px実線とする。raw-null、unavailable、confirmed gap、異常、
+  terminal holdだけを1px破線の予測とし、導出値をanchorへ昇格させずAPI/DBへ書き戻さない。
   `Remaining`のeffective値からmodel系列の値またはそのperiod tailを外挿しない。
   raw-null補間、gap、異常、終端hold等の欠測・予測の破線は
-  X版では1px、Windows版では1px相当とする。model利用増加の実測は3px、model未使用の実測は1px実線、Remaining実測は3pxとし、破線の有無で未使用実測と欠測・予測を区別する。
+  X版では1px、Windows版では1px相当とする。model実測は増加・不変とも3px、Remaining実測も3pxとし、1px破線だけを欠測・予測に使う。
   破線は幅の広いplotでも切替点が判別できる短く密な周期とし、長い線片・隙間で通常線に見せない。
 
   plotの描画layerは`background/grid → idle band → series/labels`とする。idle bandは最終合成色`#1A2838`を
@@ -347,7 +344,7 @@ component順や表示所有者を変更しない。
   片方の描画ヘルパーが生成した値をもう片方の期待値には使用せず、fixtureのliteral oracleを独立に使う。
 - finite oracleは、shared rolloverのperiod A→B `100% / $1 → 41% / $323.674247`、
   `graph_delayed_quota`のfirst observation・遅延quota・missing quota、model別回帰/回復、
-  confirmed gap、unattributed quota、current/historical右端、no-historyの9 causal caseとする。
+  confirmed gap、raw-null quota、current/historical右端、no-historyの9 causal caseとする。
   ASTRAのtoken/指定4単価、旧3モデルだけが既知のincomplete period、period選択後pollのbounded reset aliasは
   今回観測した同じ到達経路へ統合し、別の全直積を作らない。
   X/Windowsは同じfixtureの固定期待値を独立に検査し、値形状による100%・7日・quota-only除外、

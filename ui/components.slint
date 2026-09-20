@@ -2006,9 +2006,9 @@ export component GraphWindow inherits Window {
                 commands: root.luna-flat-path;
                 visible: root.show-luna;
                 stroke: DesignTokens.graph-luna;
-                // A flat measured total means confirmed non-use. Keep it
-                // thin and solid; only unknown intervals use thin dashes.
-                stroke-width: 1px;
+                // Every valid measured interval uses one uniform solid width.
+                // Only prediction intervals use the thin dashed treatment.
+                stroke-width: 3px;
                 fill: transparent;
                 opacity: 0.95;
                 stroke-line-cap: round;
@@ -2026,7 +2026,7 @@ export component GraphWindow inherits Window {
                 commands: root.astra-flat-path;
                 visible: root.show-astra;
                 stroke: DesignTokens.graph-astra;
-                stroke-width: 1px;
+                stroke-width: 3px;
                 fill: transparent;
                 opacity: 0.95;
                 stroke-line-cap: round;
@@ -2080,9 +2080,9 @@ export component GraphWindow inherits Window {
                 commands: root.terra-flat-path;
                 visible: root.show-terra;
                 stroke: DesignTokens.graph-terra;
-                // Exact flat observations are confirmed non-use: thin solid.
-                // Only missing intervals are thin and dashed.
-                stroke-width: 1px;
+                // Exact flat observations are confirmed non-use, with the
+                // same solid width as every changing measured interval.
+                stroke-width: 3px;
                 fill: transparent;
                 opacity: 0.95;
                 stroke-line-cap: round;
@@ -2118,9 +2118,9 @@ export component GraphWindow inherits Window {
                 commands: root.sol-flat-path;
                 visible: root.show-sol;
                 stroke: DesignTokens.graph-sol;
-                // Exact flat observations are confirmed non-use: thin solid.
-                // Only missing intervals are thin and dashed.
-                stroke-width: 1px;
+                // Exact flat observations are confirmed non-use, with the
+                // same solid width as every changing measured interval.
+                stroke-width: 3px;
                 fill: transparent;
                 opacity: 0.95;
                 stroke-line-cap: round;

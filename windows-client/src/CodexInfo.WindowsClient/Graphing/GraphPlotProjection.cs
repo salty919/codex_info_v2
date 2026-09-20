@@ -105,6 +105,8 @@ internal static class GraphPlotProjection
     internal const double MinimumPlotHeight = 204;
     internal const double CanonicalDashLength = 0.45;
     internal const double CanonicalDashGap = 0.30;
+    private const double CurveMaximumViewboxStep = 0.25;
+    private const double CanonicalGeometryEpsilon = 1e-12;
 
     public static GraphAxisProjection BuildAxes(
         GraphScene scene,
@@ -216,7 +218,7 @@ internal static class GraphPlotProjection
         GraphScene scene,
         IReadOnlyList<double> values)
     {
-        var semantic = BuildModelLines(scene, values);
+        var semantic = BuildModelLines(scene, values, smooth: true);
         return new GraphCanonicalModelLineProjection(
             CanonicalizeLine(scene, semantic.Flat, scene.ModelMaximum, remaining: false, dashed: false),
             CanonicalizeLine(scene, semantic.Rising, scene.ModelMaximum, remaining: false, dashed: false),
@@ -226,7 +228,7 @@ internal static class GraphPlotProjection
     internal static GraphCanonicalRemainingLineProjection BuildCanonicalRemainingLines(
         GraphScene scene)
     {
-        var semantic = BuildRemainingLines(scene);
+        var semantic = BuildRemainingLines(scene, smooth: true);
         return new GraphCanonicalRemainingLineProjection(
             CanonicalizeLine(scene, semantic.Solid, 100, remaining: true, dashed: false),
             CanonicalizeLine(scene, semantic.Dashed, 100, remaining: true, dashed: true));
@@ -292,10 +294,13 @@ internal static class GraphPlotProjection
 
     /// <summary>
     /// Builds the quota path while keeping remote observations independent
-    /// from model availability. Any missing or unattributed interval is
-    /// emitted only into the dashed reference path.
+    /// from model availability. Only explicit missing or anomalous intervals
+    /// are emitted into the dashed prediction path.
     /// </summary>
-    public static GraphRemainingLineProjection BuildRemainingLines(GraphScene scene)
+    public static GraphRemainingLineProjection BuildRemainingLines(GraphScene scene) =>
+        BuildRemainingLines(scene, smooth: false);
+
+    private static GraphRemainingLineProjection BuildRemainingLines(GraphScene scene, bool smooth)
     {
         ArgumentNullException.ThrowIfNull(scene);
         if (!scene.HasPoints)
@@ -319,56 +324,69 @@ internal static class GraphPlotProjection
         var solidY = new List<double>();
         var dashedX = new List<double>();
         var dashedY = new List<double>();
-        var previous = -1;
-        for (var index = firstRenderable; index < scene.Timestamps.Count; index++)
+        var anchors = Enumerable.Range(firstRenderable, scene.Timestamps.Count - firstRenderable)
+            .Where(index => double.IsFinite(scene.Remaining[index]) &&
+                scene.RemainingOrigins[index] is GraphRemainingOrigin.Raw)
+            .ToArray();
+        var smoothableIntervals = new List<(int Left, int Right, bool Dashed)>();
+        for (var anchor = 1; anchor < anchors.Length; anchor++)
         {
-            if (!double.IsFinite(scene.Remaining[index]))
-            {
-                continue;
-            }
-            if (previous < 0)
-            {
-                previous = index;
-                continue;
-            }
-
-            var before = RemainingValue(scene, previous);
-            var current = RemainingValue(scene, index);
-            var contiguous = index == previous + 1;
-            if (scene.HasRemainingHardBreakBetween(
-                    scene.Timestamps[previous],
-                    scene.Timestamps[index]))
+            var left = anchors[anchor - 1];
+            var right = anchors[anchor];
+            var before = RemainingValue(scene, left);
+            var current = RemainingValue(scene, right);
+            var crossesPrediction = Enumerable.Range(left + 1, right - left - 1)
+                .Any(index => scene.RemainingOrigins[index] is not GraphRemainingOrigin.Raw);
+            var measured = RemainingOriginHasMeasuredQuota(scene.RemainingOrigins[left]) &&
+                RemainingOriginHasMeasuredQuota(scene.RemainingOrigins[right]);
+            if (current > before)
             {
                 AppendSegment(
                     dashedX,
                     dashedY,
-                    scene.Timestamps[previous],
+                    scene.Timestamps[left],
                     before,
-                    scene.Timestamps[index],
-                    current);
-                previous = index;
-                continue;
-            }
-            var observed = RemainingOriginHasMeasuredQuota(scene.RemainingOrigins[previous]) &&
-                RemainingOriginHasMeasuredQuota(scene.RemainingOrigins[index]);
-            var modelAvailable = scene.TryGetTokenIntervalEvidence(
-                previous,
-                index,
-                out var modelAdvanced);
-            var quotaDropped = current < before;
-            var unattributed = quotaDropped && (!modelAvailable || !modelAdvanced);
-            var dashed = !contiguous || !observed || unattributed;
-            if (dashed)
-            {
-                AppendSegment(dashedX, dashedY, scene.Timestamps[previous], before, scene.Timestamps[index], current);
+                    scene.Timestamps[right],
+                    before);
             }
             else
             {
-                AppendSegment(solidX, solidY, scene.Timestamps[previous], before, scene.Timestamps[index], current);
+                smoothableIntervals.Add((
+                    left,
+                    right,
+                    scene.HasRemainingHardBreakBetween(
+                        scene.Timestamps[left],
+                        scene.Timestamps[right]) ||
+                    crossesPrediction ||
+                    !measured));
             }
-            previous = index;
+        }
+        if (smooth)
+        {
+            AppendSmoothedRemainingRuns(
+                scene,
+                scene.Remaining,
+                smoothableIntervals,
+                solidX,
+                solidY,
+                dashedX,
+                dashedY);
+        }
+        else
+        {
+            foreach (var interval in smoothableIntervals)
+            {
+                AppendSegment(
+                    interval.Dashed ? dashedX : solidX,
+                    interval.Dashed ? dashedY : solidY,
+                    scene.Timestamps[interval.Left],
+                    scene.Remaining[interval.Left],
+                    scene.Timestamps[interval.Right],
+                    scene.Remaining[interval.Right]);
+            }
         }
 
+        var previous = anchors.LastOrDefault(-1);
         if (previous >= 0 && scene.PeriodEndAt > scene.Timestamps[previous])
         {
             // The remote source may stop while the current period continues.
@@ -391,7 +409,7 @@ internal static class GraphPlotProjection
     }
 
     private static bool RemainingOriginHasMeasuredQuota(GraphRemainingOrigin origin) =>
-        origin is GraphRemainingOrigin.Raw or GraphRemainingOrigin.ActivitySmoothed;
+        origin is GraphRemainingOrigin.Raw;
 
     /// <summary>
     /// Projects the flat, rising, and inferred cumulative-model paths used by
@@ -399,7 +417,13 @@ internal static class GraphPlotProjection
     /// </summary>
     internal static GraphModelLineProjection BuildModelLines(
         GraphScene scene,
-        IReadOnlyList<double> values)
+        IReadOnlyList<double> values) =>
+        BuildModelLines(scene, values, smooth: false);
+
+    private static GraphModelLineProjection BuildModelLines(
+        GraphScene scene,
+        IReadOnlyList<double> values,
+        bool smooth)
     {
         ArgumentNullException.ThrowIfNull(scene);
         ArgumentNullException.ThrowIfNull(values);
@@ -414,52 +438,95 @@ internal static class GraphPlotProjection
         var risingY = new List<double>();
         var dashedX = new List<double>();
         var dashedY = new List<double>();
-        var previous = -1;
-        for (var index = 0; index < values.Count; index++)
+        var anchors = Enumerable.Range(0, values.Count)
+            .Where(index => double.IsFinite(values[index]) && values[index] >= 0 &&
+                !scene.ModelSynthetic[index] &&
+                scene.IsModelIntervalReliable(values, index, index))
+            .ToArray();
+        var smoothableIntervals = new List<(int Left, int Right, ProjectionStyle Style)>();
+        for (var anchor = 1; anchor < anchors.Length; anchor++)
         {
-            var value = values[index];
-            if (!double.IsFinite(value))
+            var left = anchors[anchor - 1];
+            var right = anchors[anchor];
+            var before = values[left];
+            var current = values[right];
+            var crossesPrediction = Enumerable.Range(left + 1, right - left - 1)
+                .Any(index => !scene.IsModelIntervalReliable(values, index, index));
+            var crossesCorrection = scene.HasModelCorrectionBetween(
+                values,
+                scene.Timestamps[left],
+                scene.Timestamps[right]);
+            if (current < before)
             {
-                continue;
+                AppendSegment(
+                    dashedX,
+                    dashedY,
+                    scene.Timestamps[left],
+                    before,
+                    scene.Timestamps[right],
+                    before);
             }
-            if (previous < 0)
+            else if (crossesCorrection)
             {
-                previous = index;
-                continue;
-            }
-
-            var before = values[previous];
-            var startAt = scene.Timestamps[previous];
-            var endAt = scene.Timestamps[index];
-            if (scene.HasModelHardBreakBetween(values, startAt, endAt))
-            {
-                AppendSegment(dashedX, dashedY, startAt, before, endAt, value);
-                previous = index;
-                continue;
-            }
-            if (value < before)
-            {
-                AppendSegment(dashedX, dashedY, startAt, before, endAt, before);
-                previous = index;
-                continue;
-            }
-            if (index != previous + 1 || scene.ModelSynthetic[previous] ||
-                scene.ModelSynthetic[index] ||
-                !scene.IsModelIntervalReliable(values, previous, index))
-            {
-                AppendSegment(dashedX, dashedY, startAt, before, endAt, value);
-            }
-            else if (value == before)
-            {
-                AppendSegment(flatX, flatY, startAt, before, endAt, value);
+                AppendSegment(
+                    dashedX,
+                    dashedY,
+                    scene.Timestamps[left],
+                    before,
+                    scene.Timestamps[right],
+                    current);
             }
             else
             {
-                AppendSegment(risingX, risingY, startAt, before, endAt, value);
+                var dashed = scene.HasConfirmedGapBetween(
+                        scene.Timestamps[left],
+                        scene.Timestamps[right]) ||
+                    crossesPrediction;
+                smoothableIntervals.Add((
+                    left,
+                    right,
+                    dashed
+                        ? ProjectionStyle.Dashed
+                        : current == before
+                            ? ProjectionStyle.Flat
+                            : ProjectionStyle.Rising));
             }
-            previous = index;
+        }
+        if (smooth)
+        {
+            AppendSmoothedModelRuns(
+                scene,
+                values,
+                smoothableIntervals,
+                flatX,
+                flatY,
+                risingX,
+                risingY,
+                dashedX,
+                dashedY);
+        }
+        else
+        {
+            foreach (var interval in smoothableIntervals)
+            {
+                var (targetX, targetY) = interval.Style switch
+                {
+                    ProjectionStyle.Flat => (flatX, flatY),
+                    ProjectionStyle.Rising => (risingX, risingY),
+                    ProjectionStyle.Dashed => (dashedX, dashedY),
+                    _ => throw new InvalidOperationException("Unknown graph projection style."),
+                };
+                AppendSegment(
+                    targetX,
+                    targetY,
+                    scene.Timestamps[interval.Left],
+                    values[interval.Left],
+                    scene.Timestamps[interval.Right],
+                    values[interval.Right]);
+            }
         }
 
+        var previous = anchors.LastOrDefault(-1);
         if (previous >= 0 && scene.PeriodEndAt > scene.Timestamps[previous])
         {
             AppendSegment(
@@ -667,61 +734,62 @@ internal static class GraphPlotProjection
         bool dashed)
     {
         ArgumentNullException.ThrowIfNull(scene);
+        if (source.X.Count != source.Y.Count)
+        {
+            throw new ArgumentException("Line coordinate arrays must have the same length.", nameof(source));
+        }
         var x = new List<double>();
         var y = new List<double>();
         var path = new StringBuilder();
-        foreach (var segment in EnumerateLineSegments(source))
+        var run = new List<CanonicalPoint>();
+
+        void FlushRun()
         {
-            var start = CanonicalPointFor(
-                scene,
-                segment.X1,
-                segment.Y1,
-                maximum,
-                remaining);
-            var end = CanonicalPointFor(
-                scene,
-                segment.X2,
-                segment.Y2,
-                maximum,
-                remaining);
+            if (run.Count < 2)
+            {
+                run.Clear();
+                return;
+            }
             if (dashed)
             {
-                AppendCanonicalDashes(scene, x, y, path, start, end, maximum, remaining);
+                AppendCanonicalDashes(scene, x, y, path, run, maximum, remaining);
             }
             else
             {
-                AppendCanonicalSegment(scene, x, y, path, start, end, maximum, remaining);
+                for (var index = 1; index < run.Count; index++)
+                {
+                    AppendCanonicalSegment(
+                        scene,
+                        x,
+                        y,
+                        path,
+                        run[index - 1],
+                        run[index],
+                        maximum,
+                        remaining);
+                }
             }
+            run.Clear();
         }
+
+        for (var index = 0; index < source.X.Count; index++)
+        {
+            if (!double.IsFinite(source.X[index]) || !double.IsFinite(source.Y[index]))
+            {
+                FlushRun();
+                continue;
+            }
+            run.Add(CanonicalPointFor(
+                scene,
+                source.X[index],
+                source.Y[index],
+                maximum,
+                remaining));
+        }
+        FlushRun();
         return new GraphCanonicalLineProjection(
             new GraphLineProjection(x, y),
             path.ToString());
-    }
-
-    private static IEnumerable<LineSegment> EnumerateLineSegments(GraphLineProjection line)
-    {
-        if (line.X.Count != line.Y.Count)
-        {
-            throw new ArgumentException("Line coordinate arrays must have the same length.", nameof(line));
-        }
-        var previous = -1;
-        for (var index = 0; index < line.X.Count; index++)
-        {
-            if (!double.IsFinite(line.X[index]) || !double.IsFinite(line.Y[index]))
-            {
-                previous = -1;
-                continue;
-            }
-            if (previous >= 0)
-            {
-                yield return new LineSegment(
-                    line.X[previous],
-                    line.Y[previous],
-                    line.X[index],
-                    line.Y[index]);
-            }
-            previous = index;
-        }
     }
 
     private static CanonicalPoint CanonicalPointFor(
@@ -746,34 +814,59 @@ internal static class GraphPlotProjection
         List<double> x,
         List<double> y,
         StringBuilder path,
-        CanonicalPoint start,
-        CanonicalPoint end,
+        IReadOnlyList<CanonicalPoint> points,
         double maximum,
         bool remaining)
     {
-        var dx = end.X - start.X;
-        var dy = end.YTop - start.YTop;
-        var length = Math.Sqrt(dx * dx + dy * dy);
-        if (!double.IsFinite(length) || length <= double.Epsilon)
+        var period = CanonicalDashLength + CanonicalDashGap;
+        var phase = 0d;
+        for (var index = 1; index < points.Count; index++)
         {
-            return;
-        }
-        var offset = 0d;
-        while (offset < length)
-        {
-            var dashEnd = Math.Min(offset + CanonicalDashLength, length);
-            var from = offset / length;
-            var to = dashEnd / length;
-            AppendCanonicalSegment(
-                scene,
-                x,
-                y,
-                path,
-                new CanonicalPoint(start.X + dx * from, start.YTop + dy * from),
-                new CanonicalPoint(start.X + dx * to, start.YTop + dy * to),
-                maximum,
-                remaining);
-            offset += CanonicalDashLength + CanonicalDashGap;
+            var start = points[index - 1];
+            var end = points[index];
+            var dx = end.X - start.X;
+            var dy = end.YTop - start.YTop;
+            var length = Math.Sqrt(dx * dx + dy * dy);
+            if (!double.IsFinite(length) || length <= CanonicalGeometryEpsilon)
+            {
+                continue;
+            }
+            var offset = 0d;
+            while (offset < length)
+            {
+                var inDash = phase < CanonicalDashLength;
+                var phaseEnd = inDash ? CanonicalDashLength : period;
+                var advance = Math.Min(phaseEnd - phase, length - offset);
+                if (advance <= CanonicalGeometryEpsilon)
+                {
+                    phase = phaseEnd >= period ? 0 : phaseEnd;
+                    continue;
+                }
+                if (inDash)
+                {
+                    var from = offset / length;
+                    var to = (offset + advance) / length;
+                    AppendCanonicalSegment(
+                        scene,
+                        x,
+                        y,
+                        path,
+                        new CanonicalPoint(start.X + dx * from, start.YTop + dy * from),
+                        new CanonicalPoint(start.X + dx * to, start.YTop + dy * to),
+                        maximum,
+                        remaining);
+                }
+                offset += advance;
+                phase += advance;
+                if (phase >= period - CanonicalGeometryEpsilon)
+                {
+                    phase = 0;
+                }
+                else if (Math.Abs(phase - CanonicalDashLength) <= CanonicalGeometryEpsilon)
+                {
+                    phase = CanonicalDashLength;
+                }
+            }
         }
     }
 
@@ -869,6 +962,215 @@ internal static class GraphPlotProjection
             ? Math.Clamp((99 - yTop) / 0.98, 0, 100)
             : Math.Clamp((99 - yTop) / 98 * Math.Max(maximum, 1), 0, Math.Max(maximum, 1));
 
+    internal static IReadOnlyList<double> EvaluateMonotoneCubicInterval(
+        IReadOnlyList<double> x,
+        IReadOnlyList<double> y,
+        int interval,
+        IReadOnlyList<double> fractions)
+    {
+        ArgumentNullException.ThrowIfNull(x);
+        ArgumentNullException.ThrowIfNull(y);
+        ArgumentNullException.ThrowIfNull(fractions);
+        var slopes = BuildMonotoneCubicSlopes(x, y);
+        if (interval < 0 || interval + 1 >= x.Count ||
+            fractions.Any(fraction => !double.IsFinite(fraction) || fraction is < 0 or > 1))
+        {
+            throw new ArgumentOutOfRangeException(nameof(interval));
+        }
+
+        var width = x[interval + 1] - x[interval];
+        return fractions.Select(fraction =>
+        {
+            var squared = fraction * fraction;
+            var cubed = squared * fraction;
+            return (2 * cubed - 3 * squared + 1) * y[interval] +
+                (cubed - 2 * squared + fraction) * width * slopes[interval] +
+                (-2 * cubed + 3 * squared) * y[interval + 1] +
+                (cubed - squared) * width * slopes[interval + 1];
+        }).ToArray();
+    }
+
+    private static double[] BuildMonotoneCubicSlopes(
+        IReadOnlyList<double> x,
+        IReadOnlyList<double> y)
+    {
+        if (x.Count != y.Count || x.Count < 2 ||
+            x.Any(value => !double.IsFinite(value)) ||
+            y.Any(value => !double.IsFinite(value)))
+        {
+            throw new ArgumentException("Curve coordinates must be finite and have matching lengths.");
+        }
+
+        var widths = new double[x.Count - 1];
+        var deltas = new double[x.Count - 1];
+        for (var index = 0; index < widths.Length; index++)
+        {
+            widths[index] = x[index + 1] - x[index];
+            if (widths[index] <= 0)
+            {
+                throw new ArgumentException("Curve timestamps must be strictly increasing.", nameof(x));
+            }
+            deltas[index] = (y[index + 1] - y[index]) / widths[index];
+        }
+        if (x.Count == 2)
+        {
+            return [deltas[0], deltas[0]];
+        }
+
+        static double Endpoint(double firstWidth, double secondWidth, double firstDelta, double secondDelta)
+        {
+            var candidate = ((2 * firstWidth + secondWidth) * firstDelta -
+                firstWidth * secondDelta) / (firstWidth + secondWidth);
+            if (candidate * firstDelta <= 0)
+            {
+                return 0;
+            }
+            if (firstDelta * secondDelta < 0 && Math.Abs(candidate) > 3 * Math.Abs(firstDelta))
+            {
+                return 3 * firstDelta;
+            }
+            return candidate;
+        }
+
+        var slopes = new double[x.Count];
+        slopes[0] = Endpoint(widths[0], widths[1], deltas[0], deltas[1]);
+        for (var index = 1; index < x.Count - 1; index++)
+        {
+            var before = deltas[index - 1];
+            var after = deltas[index];
+            if (before * after <= 0)
+            {
+                slopes[index] = 0;
+                continue;
+            }
+            var firstWeight = 2 * widths[index] + widths[index - 1];
+            var secondWeight = widths[index] + 2 * widths[index - 1];
+            slopes[index] = (firstWeight + secondWeight) /
+                (firstWeight / before + secondWeight / after);
+        }
+        var last = x.Count - 1;
+        slopes[last] = Endpoint(
+            widths[last - 1],
+            widths[last - 2],
+            deltas[last - 1],
+            deltas[last - 2]);
+        return slopes;
+    }
+
+    private static void AppendSmoothedRemainingRuns(
+        GraphScene scene,
+        IReadOnlyList<double> values,
+        IReadOnlyList<(int Left, int Right, bool Dashed)> intervals,
+        List<double> solidX,
+        List<double> solidY,
+        List<double> dashedX,
+        List<double> dashedY)
+    {
+        var runStart = 0;
+        while (runStart < intervals.Count)
+        {
+            var runEnd = runStart + 1;
+            while (runEnd < intervals.Count &&
+                intervals[runEnd].Left == intervals[runEnd - 1].Right)
+            {
+                runEnd++;
+            }
+            var run = intervals.Skip(runStart).Take(runEnd - runStart).ToArray();
+            var indices = new[] { run[0].Left }
+                .Concat(run.Select(interval => interval.Right))
+                .ToArray();
+            var timestamps = indices.Select(index => scene.Timestamps[index]).ToArray();
+            var runValues = indices.Select(index => values[index]).ToArray();
+            for (var interval = 0; interval < run.Length; interval++)
+            {
+                AppendMonotoneCubicInterval(
+                    scene,
+                    timestamps,
+                    runValues,
+                    interval,
+                    run[interval].Dashed ? dashedX : solidX,
+                    run[interval].Dashed ? dashedY : solidY);
+            }
+            runStart = runEnd;
+        }
+    }
+
+    private static void AppendSmoothedModelRuns(
+        GraphScene scene,
+        IReadOnlyList<double> values,
+        IReadOnlyList<(int Left, int Right, ProjectionStyle Style)> intervals,
+        List<double> flatX,
+        List<double> flatY,
+        List<double> risingX,
+        List<double> risingY,
+        List<double> dashedX,
+        List<double> dashedY)
+    {
+        var runStart = 0;
+        while (runStart < intervals.Count)
+        {
+            var runEnd = runStart + 1;
+            while (runEnd < intervals.Count &&
+                intervals[runEnd].Left == intervals[runEnd - 1].Right)
+            {
+                runEnd++;
+            }
+            var run = intervals.Skip(runStart).Take(runEnd - runStart).ToArray();
+            var indices = new[] { run[0].Left }
+                .Concat(run.Select(interval => interval.Right))
+                .ToArray();
+            var timestamps = indices.Select(index => scene.Timestamps[index]).ToArray();
+            var runValues = indices.Select(index => values[index]).ToArray();
+            for (var interval = 0; interval < run.Length; interval++)
+            {
+                var (targetX, targetY) = run[interval].Style switch
+                {
+                    ProjectionStyle.Flat => (flatX, flatY),
+                    ProjectionStyle.Rising => (risingX, risingY),
+                    ProjectionStyle.Dashed => (dashedX, dashedY),
+                    _ => throw new InvalidOperationException("Unknown graph projection style."),
+                };
+                AppendMonotoneCubicInterval(
+                    scene,
+                    timestamps,
+                    runValues,
+                    interval,
+                    targetX,
+                    targetY);
+            }
+            runStart = runEnd;
+        }
+    }
+
+    private static void AppendMonotoneCubicInterval(
+        GraphScene scene,
+        IReadOnlyList<double> timestamps,
+        IReadOnlyList<double> values,
+        int interval,
+        List<double> x,
+        List<double> y)
+    {
+        var span = Math.Max(1d, scene.PeriodEndAt - scene.PeriodStartAt);
+        var viewboxWidth = Math.Abs(timestamps[interval + 1] - timestamps[interval]) / span * 100;
+        var steps = Math.Max(1, (int)Math.Ceiling(viewboxWidth / CurveMaximumViewboxStep));
+        var fractions = Enumerable.Range(0, steps + 1)
+            .Select(step => step / (double)steps)
+            .ToArray();
+        var projected = EvaluateMonotoneCubicInterval(
+            timestamps,
+            values,
+            interval,
+            fractions);
+        for (var step = 0; step < steps; step++)
+        {
+            var startAt = timestamps[interval] +
+                (timestamps[interval + 1] - timestamps[interval]) * fractions[step];
+            var endAt = timestamps[interval] +
+                (timestamps[interval + 1] - timestamps[interval]) * fractions[step + 1];
+            AppendSegment(x, y, startAt, projected[step], endAt, projected[step + 1]);
+        }
+    }
+
     private static void AppendSegment(
         List<double> x,
         List<double> y,
@@ -906,11 +1208,13 @@ internal static class GraphPlotProjection
         double NormalizedTop,
         double PointAxisValue);
 
+    private enum ProjectionStyle
+    {
+        Flat,
+        Rising,
+        Dashed,
+    }
+
     private readonly record struct CanonicalPoint(double X, double YTop);
 
-    private readonly record struct LineSegment(
-        double X1,
-        double Y1,
-        double X2,
-        double Y2);
 }

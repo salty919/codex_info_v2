@@ -36,7 +36,7 @@ public sealed class GraphPlotControl : AvaPlot
     internal const string IdleBandColorHex = "#1A2838";
     internal const double IdleBandOpacity = 1.0;
     internal const float MeasuredModelLineWidth = 3f;
-    internal const float MeasuredFlatModelLineWidth = 1f;
+    internal const float MeasuredFlatModelLineWidth = MeasuredModelLineWidth;
     internal const float MeasuredRemainingLineWidth = 3f;
     internal const float InferredLineWidth = 1f;
     private static readonly ScottPlot.Color IdleBandColor = new(IdleBandColorHex);

@@ -56,20 +56,21 @@ case "$1" in
             startup_load_keeps_dense_alias_history_and_publishes_each_period
             shared_graph_fixture_is_the_x_history_oracle
             weekly_reset_rollover_projects_one_current_cycle_without_mixing
-            current_period_bounds_stay_canonical_across_selected_reset_drift
+            current_period_bounds_follow_latest_quota_without_rekeying_history
             incident_shape_never_turns_a_regressed_scan_into_a_late_vertical_drop
             confirmed_recorder_gap_breaks_both_sources_instead_of_interpolating
             graph_paths_start_at_first_observation_without_inventing_a_reset_value
-            remaining_graph_preserves_unattributed_quota_changes_as_inferred
+            remaining_graph_keeps_direct_quota_changes_solid_independent_of_model_spend
             remaining_graph_does_not_infer_quota_loss_from_model_spend
-            model_graph_does_not_invent_spend_during_an_unobserved_gap
+            graph_model_points_extend_an_open_local_log_gap_as_a_dashed_hold
             remaining_graph_stays_empty_without_observations
             zero_cost_period_starts_at_the_first_observation
             graph_breaks_for_legacy_and_unavailable_until_confirmed_recovery
             graph_parity_v3_fixture_drives_linux_production_projection
             graph_continuity_v4_fixture_matches_values_roles_idle_and_period_end
             graph_idle_counterexamples_are_token_based_and_metric_specific
-            graph_remaining_smoothing_uses_coherent_token_deltas_or_elapsed_fallback
+            graph_valid_anchor_projection_is_token_and_activity_independent
+            bounded_missing_interval_uses_the_same_smoothed_anchor_geometry
             graph_collision_preview_matches_the_historical_singleton_oracle
             graph_correction_fixture_holds_regressions_without_a_vertical_drop
             graph_oracle_distinguishes_unconfirmed_regression_from_confirmed_correction
@@ -81,7 +82,7 @@ case "$1" in
         )
         store_tests=(
             recent_read_uses_one_month_half_open_interval_at_month_ends
-            recent_read_filters_invalid_values_without_deleting_rows
+            recent_read_rejects_invalid_values_without_deleting_rows
         )
         for test_name in "${main_tests[@]}"; do
             run_exact_test --bin=codex_info "tests::$test_name"
@@ -89,7 +90,7 @@ case "$1" in
         for test_name in "${store_tests[@]}"; do
             run_exact_test --package=codex-info-db-writer "wave_b_correction_tests::$test_name"
         done
-        echo 'regression-guard: PASS check=rust-history-graph cases=27'
+        echo 'regression-guard: PASS check=rust-history-graph cases=28'
         ;;
     --model-history)
         main_tests=(
