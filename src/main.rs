@@ -31888,7 +31888,7 @@ mod tests {
     fn quota_reset_moves_an_auto_selected_graph_to_the_accepted_new_period() {
         let mut state = CodexInfoState::preview("normal");
         let observed_at = Utc::now().timestamp();
-        let previous_reset = observed_at;
+        let previous_reset = observed_at.div_euclid(60) * 60;
         state.reset_at = Some(previous_reset);
         state.last_success_at = Some(observed_at);
         state.history = UsageHistory {
@@ -31928,7 +31928,8 @@ mod tests {
         let selected_period = state
             .selected_history_reset()
             .expect("one accepted period is selected");
-        assert_ne!(selected_period, previous_reset);
+        assert_eq!(state.reset_at, Some(next_reset));
+        assert_eq!(selected_period, next_reset);
         assert!(state
             .history_periods()
             .iter()
@@ -40570,6 +40571,7 @@ mod tests {
         let current_alias = canonical_reset - 1;
         let old_reset = raw_start - 60;
         let floor_start = raw_start.div_euclid(60) * 60;
+        let authoritative_start = current_alias - WINDOW_SECONDS;
         assert_ne!(raw_start, floor_start);
 
         let current_samples = [
@@ -40634,8 +40636,8 @@ mod tests {
             .find(|period| period.canonical_reset_at == canonical_reset)
             .expect("current minute period survives authoritative bounds");
         assert_eq!(periods.len(), 2);
-        assert_eq!(current.start, floor_start);
-        assert!(current.start <= current_samples[0].timestamp);
+        assert_eq!(current.start, authoritative_start);
+        assert!(current_samples[0].timestamp < current.start);
         assert!(!current.label.is_empty());
 
         state.select_latest_history_at(observed_at);
@@ -40656,7 +40658,8 @@ mod tests {
 
         let graph_samples: Vec<UsageHistorySample> =
             serde_json::from_str(&state.graph_data_at(observed_at)).expect("selected graph JSON");
-        assert_eq!(graph_samples.len(), current_samples.len());
+        assert_eq!(graph_samples.len(), 1);
+        assert_eq!(graph_samples[0].timestamp, current_samples[1].timestamp);
         assert!(graph_samples
             .iter()
             .all(|sample| sample.reset_at == canonical_reset));
@@ -40724,7 +40727,7 @@ mod tests {
         state.selected_history_period.clear();
 
         let retained_raw = state.history.samples.clone();
-        let authoritative_start = raw_start.div_euclid(60) * 60;
+        let authoritative_start = current_alias - WINDOW_SECONDS;
         let early_timestamp = (raw_start - 60).div_euclid(60) * 60;
 
         let periods = state.history_periods_at(observed_at);
