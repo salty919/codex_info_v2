@@ -114,6 +114,15 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         self.assertAlmostEqual(96.04166666666667, descending[0])
         self.assertAlmostEqual(81.45833333333333, descending[1])
         self.assertTrue(all(70.0 <= value <= 100.0 for value in descending))
+        self.assertEqual(
+            [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0],
+            oracle._sampling_smoothed_values(
+                [0, 60, 120, 180],
+                [0.0, 0.0, 1.0, 1.0],
+                set(),
+                set(),
+            ),
+        )
 
     def test_bounded_missing_interval_uses_the_same_smoothed_anchor_geometry(self):
         fixture = v3_fixture(
@@ -556,7 +565,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             )[1],
         )
 
-    def test_idle_does_not_cross_unavailable_minutes_and_ignores_activity_metadata(self):
+    def test_idle_recovers_only_isolated_equal_sampling_jitter(self):
         rows = [
             {
                 "timestamp": minute * 60,
@@ -575,7 +584,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             }
         )
         self.assertEqual(
-            [],
+            [{"start_at": 0, "end_at": 600}],
             oracle.build_expected(v3_fixture(rows, period_id="inactive-unavailable-split"))[1],
         )
 
@@ -596,8 +605,15 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         active = copy.deepcopy(rows)
         active[5]["task_active_since_previous"] = True
         self.assertEqual(
-            [],
+            [{"start_at": 0, "end_at": 600}],
             oracle.build_expected(v3_fixture(active, period_id="active-unavailable"))[1],
+        )
+
+        changed = copy.deepcopy(rows)
+        changed[6]["tokens"] = 101
+        self.assertEqual(
+            [],
+            oracle.build_expected(v3_fixture(changed, period_id="changed-unavailable"))[1],
         )
 
         separated = [
@@ -619,7 +635,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
                 }
             )
         self.assertEqual(
-            [{"start_at": 360, "end_at": 1_200}, {"start_at": 1_320, "end_at": 2_040}],
+            [{"start_at": 0, "end_at": 2_040}],
             oracle.build_expected(v3_fixture(separated, period_id="separated-unavailable"))[1],
         )
 

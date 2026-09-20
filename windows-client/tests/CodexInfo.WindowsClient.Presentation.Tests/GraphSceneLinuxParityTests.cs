@@ -254,7 +254,7 @@ public sealed class GraphSceneLinuxParityTests
     }
 
     [Fact]
-    public void IdleRejectsOneUnavailableMinuteBetweenDirectEndpoints()
+    public void IdleRecoversOneUnavailableSamplingMinuteBetweenEqualDirectEndpoints()
     {
         var samples = Enumerable.Range(0, 11)
             .Select(minute => minute == 5
@@ -276,7 +276,9 @@ public sealed class GraphSceneLinuxParityTests
                 : V3Sample(1_000 + minute * 60, 90, Model("SOL", 10, 1), Model("TERRA", 0, 0)))
             .ToArray();
 
-        Assert.Empty(GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_600).IdleIntervals);
+        Assert.Equal(
+            [new GraphIdleInterval(1_000, 1_600, false)],
+            GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_600).IdleIntervals);
     }
 
     [Fact]
@@ -306,7 +308,7 @@ public sealed class GraphSceneLinuxParityTests
     }
 
     [Fact]
-    public void IdleSplitsSeparatedInactiveUnavailableMinutes()
+    public void IdleRecoversSeparatedSingleUnavailableSamplingMinutes()
     {
         var samples = Enumerable.Range(0, 35)
             .Select(minute => minute is 5 or 21
@@ -329,10 +331,7 @@ public sealed class GraphSceneLinuxParityTests
             .ToArray();
 
         Assert.Equal(
-            [
-                new GraphIdleInterval(1_360, 2_200, false),
-                new GraphIdleInterval(2_320, 3_040, false),
-            ],
+            [new GraphIdleInterval(1_000, 3_040, false)],
             GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 3_040).IdleIntervals);
     }
 

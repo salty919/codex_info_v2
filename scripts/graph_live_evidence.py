@@ -264,6 +264,75 @@ def _rows_with_tail(period: dict[str, Any], samples: list[dict[str, Any]]) -> li
     return rows
 
 
+def _float_bits(value: float) -> bytes:
+    return struct.pack("!d", value)
+
+
+def _direct_sampling_signature(row: dict[str, Any]) -> tuple[Any, ...] | None:
+    remaining = row.get("remaining_percent")
+    models = row.get("models")
+    if (
+        row.get("synthetic", False)
+        or row.get("model_source") != "confirmed"
+        or row.get("models_complete") is not True
+        or not isinstance(remaining, (int, float))
+        or isinstance(remaining, bool)
+        or not math.isfinite(float(remaining))
+        or not isinstance(models, list)
+        or not models
+    ):
+        return None
+    model_signature = tuple(
+        (
+            model["model"],
+            model.get("total_tokens"),
+            model.get("input_tokens"),
+            model.get("cached_input_tokens"),
+            model.get("cache_write_input_tokens"),
+            model.get("output_tokens"),
+            None
+            if model.get("total_dollars") is None
+            else _float_bits(float(model["total_dollars"])),
+        )
+        for model in sorted(models, key=lambda item: item["model"].encode("utf-8"))
+    )
+    return row["reset_at"], _float_bits(float(remaining)), model_signature
+
+
+def _without_recoverable_sampling_jitter(
+    rows: list[dict[str, Any]],
+    gaps: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    recovered: set[int] = set()
+    for index in range(1, len(rows) - 1):
+        left, middle, right = rows[index - 1 : index + 2]
+        if (
+            middle.get("synthetic", False)
+            or middle.get("model_source") != "unavailable"
+            or middle.get("models_complete") is not False
+            or middle["timestamp"] - left["timestamp"] != 60
+            or right["timestamp"] - middle["timestamp"] != 60
+            or middle.get("reset_at") != left.get("reset_at")
+            or right.get("reset_at") != left.get("reset_at")
+            or _hard_break(left["timestamp"], right["timestamp"], gaps)
+        ):
+            continue
+        left_signature = _direct_sampling_signature(left)
+        right_signature = _direct_sampling_signature(right)
+        if left_signature is None or left_signature != right_signature:
+            continue
+        middle_remaining = middle.get("remaining_percent")
+        if middle_remaining is not None and (
+            not isinstance(middle_remaining, (int, float))
+            or isinstance(middle_remaining, bool)
+            or not math.isfinite(float(middle_remaining))
+            or _float_bits(float(middle_remaining)) != left_signature[1]
+        ):
+            continue
+        recovered.add(index)
+    return [row for index, row in enumerate(rows) if index not in recovered]
+
+
 def _raw_model_values(
     rows: list[dict[str, Any]], model: str, metric: str
 ) -> list[float | None]:
@@ -794,7 +863,7 @@ def _idle_intervals(
 
 def build_expected(fixture: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, int]]]:
     period, samples, gaps = _validate_fixture(fixture)
-    rows = _rows_with_tail(period, samples)
+    rows = _without_recoverable_sampling_jitter(_rows_with_tail(period, samples), gaps)
     universe = _period_model_universe(samples)
     renderable_universe = tuple(model for model in universe if model in RENDERABLE_MODELS)
     projections = {
@@ -1008,6 +1077,57 @@ def _monotone_cubic_interval_values(
     return result
 
 
+def _sampling_smoothed_values(
+    timestamps: list[int],
+    values: list[float],
+    preserved_timestamps: set[int],
+    preserved_indices: set[int],
+) -> list[float]:
+    if len(timestamps) != len(values) or len(values) < 3:
+        return list(values)
+    last = len(values) - 1
+    knots = [
+        index
+        for index in range(len(values))
+        if index in {0, last}
+        or timestamps[index] in preserved_timestamps
+        or index in preserved_indices
+        or values[index] != values[index - 1]
+        and values[index] != values[index + 1]
+    ]
+    knot_timestamps = [float(timestamps[index]) for index in knots]
+    knot_values = [values[index] for index in knots]
+    if len(knots) < 2:
+        return list(values)
+    smoothed: list[float] = []
+    for timestamp in timestamps:
+        if timestamp in (timestamps[index] for index in knots):
+            smoothed.append(knot_values[knot_timestamps.index(float(timestamp))])
+            continue
+        right = next(
+            (index for index, candidate in enumerate(knot_timestamps) if candidate > timestamp),
+            len(knot_timestamps),
+        )
+        if right == 0:
+            smoothed.append(knot_values[0])
+        elif right >= len(knot_timestamps):
+            smoothed.append(knot_values[-1])
+        else:
+            left = right - 1
+            fraction = (timestamp - knot_timestamps[left]) / (
+                knot_timestamps[right] - knot_timestamps[left]
+            )
+            smoothed.append(
+                _monotone_cubic_interval_values(
+                    knot_timestamps,
+                    knot_values,
+                    left,
+                    [fraction],
+                )[0]
+            )
+    return smoothed
+
+
 def _canonical_smooth_path(
     segments: list[dict[str, Any]],
     style: str,
@@ -1015,6 +1135,7 @@ def _canonical_smooth_path(
     period: dict[str, Any],
     maximum: float,
     remaining: bool,
+    idle_intervals: list[dict[str, int]],
 ) -> str:
     commands: list[str] = []
     run_start = 0
@@ -1054,12 +1175,29 @@ def _canonical_smooth_path(
         run = segments[run_start:run_end]
         timestamps = [run[0]["start_at"], *[segment["end_at"] for segment in run]]
         raw_values = [values[timestamp] for timestamp in timestamps]
+        preserved_timestamps = {
+            timestamp
+            for interval in idle_intervals
+            for timestamp in (interval["start_at"], interval["end_at"])
+        }
+        preserved_indices = {
+            index
+            for interval, segment in enumerate(run)
+            if segment["style"] == "dashed"
+            for index in (interval, interval + 1)
+        }
+        smoothed_values = _sampling_smoothed_values(
+            timestamps,
+            raw_values,
+            preserved_timestamps,
+            preserved_indices,
+        )
         for interval, segment in enumerate(run):
             if segment["style"] != style:
                 continue
             points = _canonical_curve_interval(
                 timestamps,
-                raw_values,
+                smoothed_values,
                 interval,
                 period,
                 maximum,
@@ -1083,6 +1221,7 @@ def _canonical_path(
     period: dict[str, Any],
     maximum: float,
     remaining: bool,
+    idle_intervals: list[dict[str, int]],
 ) -> str:
     return _canonical_smooth_path(
         segments,
@@ -1091,6 +1230,7 @@ def _canonical_path(
         period,
         maximum,
         remaining,
+        idle_intervals,
     )
 
 
@@ -1250,7 +1390,7 @@ def _endpoint_labels(
 
 def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
     period, samples, gaps = _validate_fixture(fixture)
-    rows = _rows_with_tail(period, samples)
+    rows = _without_recoverable_sampling_jitter(_rows_with_tail(period, samples), gaps)
     universe = _period_model_universe(samples)
     renderable_universe = tuple(model for model in universe if model in RENDERABLE_MODELS)
     token_models = {
@@ -1324,13 +1464,13 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
                 {
                     "series": model,
                     "flat": _canonical_path(
-                        segments, "flat", values, period, maximum, False
+                        segments, "flat", values, period, maximum, False, idle
                     ),
                     "rising": _canonical_path(
-                        segments, "rising", values, period, maximum, False
+                        segments, "rising", values, period, maximum, False, idle
                     ),
                     "dashed": _canonical_path(
-                        segments, "dashed", values, period, maximum, False
+                        segments, "dashed", values, period, maximum, False, idle
                     ),
                 }
             )
@@ -1405,6 +1545,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
                     period,
                     100,
                     True,
+                    idle,
                 ),
                 "dashed": _canonical_path(
                     remaining_segments,
@@ -1413,6 +1554,7 @@ def build_expected_render_contracts(fixture: dict[str, Any]) -> dict[str, Any]:
                     period,
                     100,
                     True,
+                    idle,
                 ),
             },
             "remaining_markers": markers,
