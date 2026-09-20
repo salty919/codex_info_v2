@@ -5591,9 +5591,123 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
     graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(input, None)
 }
 
+#[cfg(test)]
 fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
     input: GraphSelectionInput<'_>,
+    task_activity_by_minute: Option<&BTreeMap<i64, Option<bool>>>,
+) -> GraphPaths {
+    graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sampling(
+        input,
+        task_activity_by_minute,
+        None,
+    )
+}
+
+fn recoverable_sampling_jitter_minutes(
+    samples: &[&UsageHistorySample],
+    period_start: i64,
+    period_end: i64,
+    model_timelines: &GraphModelTimelines,
+    untrusted_minutes: &BTreeSet<i64>,
+    sampling_unavailable_minutes: &BTreeSet<i64>,
+    confirmed_gaps: &[GraphConfirmedGap],
+) -> BTreeSet<i64> {
+    let direct_model_vector = |timestamp: i64| -> Option<Vec<(String, u64, u64, u64)>> {
+        let mut vector = Vec::new();
+        for (name, timeline) in model_timelines {
+            let Some(point) = timeline.get(&timestamp) else {
+                continue;
+            };
+            if point.origin != GraphModelOrigin::Direct {
+                return None;
+            }
+            vector.push((
+                name.clone(),
+                graph_model_raw_tokens(point)?,
+                point.tokens.to_bits(),
+                point.dollar.to_bits(),
+            ));
+        }
+        (!vector.is_empty()).then_some(vector)
+    };
+    let direct_quota = |timestamp: i64| -> Option<(i64, u64)> {
+        let mut accepted = None;
+        for sample in samples.iter().filter(|sample| {
+            sample.timestamp.div_euclid(60) * 60 == timestamp
+                && sample.timestamp >= period_start
+                && sample.timestamp <= period_end
+        }) {
+            if !sample.remaining_percent.is_finite()
+                || !(0.0..=100.0).contains(&sample.remaining_percent)
+            {
+                return None;
+            }
+            let candidate = (sample.reset_at, sample.remaining_percent.to_bits());
+            if accepted.is_some_and(|prior| prior != candidate) {
+                return None;
+            }
+            accepted = Some(candidate);
+        }
+        accepted
+    };
+
+    sampling_unavailable_minutes
+        .iter()
+        .copied()
+        .filter(|minute| untrusted_minutes.contains(minute))
+        .filter(|minute| *minute >= period_start && *minute <= period_end)
+        .filter(|minute| {
+            let Some(left) = minute.checked_sub(60) else {
+                return false;
+            };
+            let Some(right) = minute.checked_add(60) else {
+                return false;
+            };
+            if left < period_start
+                || right > period_end
+                || untrusted_minutes.contains(&left)
+                || untrusted_minutes.contains(&right)
+                || graph_interval_overlaps_confirmed_gap(left, right, confirmed_gaps)
+                || model_timelines
+                    .values()
+                    .any(|timeline| timeline.contains_key(minute))
+            {
+                return false;
+            }
+            let (Some(left_models), Some(right_models)) =
+                (direct_model_vector(left), direct_model_vector(right))
+            else {
+                return false;
+            };
+            if left_models != right_models {
+                return false;
+            }
+            let (Some(left_quota), Some(right_quota)) = (direct_quota(left), direct_quota(right))
+            else {
+                return false;
+            };
+            if left_quota != right_quota {
+                return false;
+            }
+            let middle = samples
+                .iter()
+                .filter(|sample| sample.timestamp.div_euclid(60) * 60 == *minute)
+                .collect::<Vec<_>>();
+            !middle.is_empty()
+                && middle.iter().all(|sample| {
+                    sample.reset_at == left_quota.0
+                        && (!sample.remaining_percent.is_finite()
+                            || !(0.0..=100.0).contains(&sample.remaining_percent)
+                            || sample.remaining_percent.to_bits() == left_quota.1)
+                })
+        })
+        .collect()
+}
+
+fn graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sampling(
+    input: GraphSelectionInput<'_>,
     _task_activity_by_minute: Option<&BTreeMap<i64, Option<bool>>>,
+    sampling_unavailable_minutes: Option<&BTreeSet<i64>>,
 ) -> GraphPaths {
     let GraphSelectionInput {
         samples,
@@ -5608,6 +5722,32 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
         confirmed_gaps,
         model_timelines,
     } = input;
+    let recovered_sampling_minutes = sampling_unavailable_minutes
+        .map(|minutes| {
+            recoverable_sampling_jitter_minutes(
+                samples,
+                period_start,
+                period_end,
+                model_timelines,
+                untrusted_minutes,
+                minutes,
+                confirmed_gaps,
+            )
+        })
+        .unwrap_or_default();
+    let presentation_samples = samples
+        .iter()
+        .copied()
+        .filter(|sample| {
+            !recovered_sampling_minutes.contains(&(sample.timestamp.div_euclid(60) * 60))
+        })
+        .collect::<Vec<_>>();
+    let presentation_untrusted_minutes = untrusted_minutes
+        .difference(&recovered_sampling_minutes)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let samples = presentation_samples.as_slice();
+    let untrusted_minutes = &presentation_untrusted_minutes;
     let mut paths = graph_paths_with_sources(
         samples,
         period_start,
@@ -16988,7 +17128,7 @@ impl CodexInfoState {
         selected_reset: i64,
         period_start: i64,
         period_end: i64,
-    ) -> (Vec<UsageHistorySample>, BTreeSet<i64>) {
+    ) -> (Vec<UsageHistorySample>, BTreeSet<i64>, BTreeSet<i64>) {
         let mut samples = self
             .projected_history()
             .samples_for_reset(Some(selected_reset));
@@ -17018,6 +17158,30 @@ impl CodexInfoState {
                 .filter(|observation| {
                     observation.model_source == usage_store::ModelSource::Confirmed
                         && observation.model_totals_complete
+                        && observation_matches_period_bounds(
+                            observation,
+                            selected_reset,
+                            period_start,
+                            period_end,
+                            &reset_aliases,
+                            &canonical_resets,
+                        )
+                })
+                .map(|observation| observation.timestamp.div_euclid(60) * 60)
+                .collect::<BTreeSet<_>>()
+        };
+        let sampling_unavailable_minutes = if !service_rows.is_empty() {
+            service_rows
+                .iter()
+                .filter(|observation| observation.model_source == "unavailable")
+                .map(|observation| observation.timestamp.div_euclid(60) * 60)
+                .collect::<BTreeSet<_>>()
+        } else {
+            self.history
+                .observations
+                .iter()
+                .filter(|observation| {
+                    observation.model_source == usage_store::ModelSource::Unavailable
                         && observation_matches_period_bounds(
                             observation,
                             selected_reset,
@@ -17094,7 +17258,7 @@ impl CodexInfoState {
             }
         }
         samples.sort_by_key(|sample| (sample.timestamp, sample.reset_at));
-        (samples, untrusted_minutes)
+        (samples, untrusted_minutes, sampling_unavailable_minutes)
     }
 
     fn graph_task_activity_for_selection(
@@ -17451,7 +17615,7 @@ impl CodexInfoState {
         };
         let period_start = period.start;
         let period_end = period.end.max(period_start + 1);
-        let (samples, untrusted_minutes) =
+        let (samples, untrusted_minutes, sampling_unavailable_minutes) =
             self.graph_samples_for_selection(selected_reset, period_start, period_end);
         let sample_references = samples.iter().collect::<Vec<_>>();
         let confirmed_gaps = self
@@ -17471,22 +17635,24 @@ impl CodexInfoState {
             self.graph_raw_model_timelines_for_selection(selected_reset, period_start, period_end);
         let task_activity =
             self.graph_task_activity_for_selection(selected_reset, period_start, period_end);
-        let mut paths = graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
-            GraphSelectionInput {
-                samples: &sample_references,
-                period_start,
-                period_end,
-                show_luna,
-                show_terra,
-                show_sol,
-                show_astra,
-                show_tokens,
-                untrusted_minutes: &untrusted_minutes,
-                confirmed_gaps: &confirmed_gaps,
-                model_timelines: &raw_model_timelines,
-            },
-            Some(&task_activity),
-        );
+        let mut paths =
+            graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sampling(
+                GraphSelectionInput {
+                    samples: &sample_references,
+                    period_start,
+                    period_end,
+                    show_luna,
+                    show_terra,
+                    show_sol,
+                    show_astra,
+                    show_tokens,
+                    untrusted_minutes: &untrusted_minutes,
+                    confirmed_gaps: &confirmed_gaps,
+                    model_timelines: &raw_model_timelines,
+                },
+                Some(&task_activity),
+                Some(&sampling_unavailable_minutes),
+            );
         if !self.has_quota_percent {
             paths.remaining.clear();
             paths.remaining_solid.clear();
@@ -24898,7 +25064,7 @@ mod tests {
         let selected_reset = period.reset_at;
         let period_start = period.start_at;
         let period_end = period.end_at;
-        let (samples, untrusted_minutes) =
+        let (samples, untrusted_minutes, _) =
             state.graph_samples_for_selection(selected_reset, period_start, period_end);
         let sample_references = samples.iter().collect::<Vec<_>>();
         let confirmed_gaps = state
@@ -25262,7 +25428,7 @@ mod tests {
             )
             .expect("same-pair live history root");
 
-        let (samples, untrusted_minutes) =
+        let (samples, untrusted_minutes, sampling_unavailable_minutes) =
             state.graph_samples_for_selection(period.reset_at, period.start_at, period.end_at);
         let references = samples.iter().collect::<Vec<_>>();
         let confirmed_gaps = state
@@ -25278,6 +25444,30 @@ mod tests {
             period.start_at,
             period.end_at,
         );
+        let recovered_sampling_minutes = super::recoverable_sampling_jitter_minutes(
+            &references,
+            period.start_at,
+            period.end_at,
+            &raw_model_timelines,
+            &untrusted_minutes,
+            &sampling_unavailable_minutes,
+            &confirmed_gaps,
+        );
+        let presentation_references = references
+            .iter()
+            .copied()
+            .filter(|sample| {
+                !recovered_sampling_minutes.contains(&(sample.timestamp.div_euclid(60) * 60))
+            })
+            .collect::<Vec<_>>();
+        let presentation_untrusted = untrusted_minutes
+            .difference(&recovered_sampling_minutes)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let projection_minutes = presentation_references
+            .iter()
+            .map(|sample| sample.timestamp.div_euclid(60) * 60)
+            .collect::<BTreeSet<_>>();
         let task_activity = state.graph_task_activity_for_selection(
             period.reset_at,
             period.start_at,
@@ -25288,23 +25478,25 @@ mod tests {
         let mut token_timelines = None;
         let mut token_correction_starts = BTreeSet::new();
         for (show_tokens, metric) in [(false, "dollars"), (true, "tokens")] {
-            let (timelines, correction_starts) = state.graph_model_lineage_for_selection(
-                period.reset_at,
-                period.start_at,
-                period.end_at,
+            let (mut timelines, correction_starts) = super::accepted_graph_model_timelines(
+                &raw_model_timelines,
+                &projection_minutes,
                 show_tokens,
                 &confirmed_gaps,
             );
+            for timeline in timelines.values_mut() {
+                super::normalize_graph_model_display_monotonic(timeline, show_tokens);
+            }
             let minute = super::graph_minute_points_with_model_timelines(
-                &references,
+                &presentation_references,
                 period.start_at,
                 period.end_at,
                 show_tokens,
-                &untrusted_minutes,
+                &presentation_untrusted,
                 &timelines,
             );
             let mut render_paths =
-                super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                super::graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sampling(
                     super::GraphSelectionInput {
                         samples: &references,
                         period_start: period.start_at,
@@ -25319,6 +25511,7 @@ mod tests {
                         model_timelines: &raw_model_timelines,
                     },
                     Some(&task_activity),
+                    Some(&sampling_unavailable_minutes),
                 );
             super::separate_current_label_positions(
                 &mut render_paths,
@@ -25559,15 +25752,15 @@ mod tests {
         }
         let token_timelines = token_timelines.expect("token projection");
         let token_minute = super::graph_minute_points_with_model_timelines(
-            &references,
+            &presentation_references,
             period.start_at,
             period.end_at,
             true,
-            &untrusted_minutes,
+            &presentation_untrusted,
             &token_timelines,
         );
         let remaining_evidence = super::remaining_evidence_from_model_timelines(
-            &references,
+            &presentation_references,
             period.start_at,
             period.end_at,
             &token_timelines,
@@ -25620,7 +25813,7 @@ mod tests {
             .collect::<Vec<_>>();
         for segment in super::remaining_segments_with_boundaries_and_evidence(
             &remaining_points,
-            &references,
+            &presentation_references,
             &token_minute,
             &confirmed_gaps,
             &token_correction_starts,
@@ -25694,13 +25887,13 @@ mod tests {
         }
 
         let mut actual_idle = super::token_idle_timestamp_intervals_with_render_evidence(
-            &references,
+            &presentation_references,
             period.start_at,
             period.end_at,
             &token_timelines,
             &confirmed_gaps,
             Some(&super::GraphIdleRenderEvidence {
-                untrusted_minutes: &untrusted_minutes,
+                untrusted_minutes: &presentation_untrusted,
             }),
         )
         .into_iter()
@@ -25860,7 +26053,7 @@ mod tests {
             )
             .expect("same-pair idle history root");
 
-        let (samples, untrusted_minutes) =
+        let (samples, untrusted_minutes, sampling_unavailable_minutes) =
             state.graph_samples_for_selection(period.reset_at, period.start_at, period.end_at);
         let references = samples.iter().collect::<Vec<_>>();
         let confirmed_gaps = state
@@ -25878,14 +26071,39 @@ mod tests {
             true,
             &confirmed_gaps,
         );
-        let actual_idle = super::token_idle_timestamp_intervals_with_render_evidence(
+        let raw_model_timelines = state.graph_raw_model_timelines_for_selection(
+            period.reset_at,
+            period.start_at,
+            period.end_at,
+        );
+        let recovered_sampling_minutes = super::recoverable_sampling_jitter_minutes(
             &references,
+            period.start_at,
+            period.end_at,
+            &raw_model_timelines,
+            &untrusted_minutes,
+            &sampling_unavailable_minutes,
+            &confirmed_gaps,
+        );
+        let presentation_references = references
+            .iter()
+            .copied()
+            .filter(|sample| {
+                !recovered_sampling_minutes.contains(&(sample.timestamp.div_euclid(60) * 60))
+            })
+            .collect::<Vec<_>>();
+        let presentation_untrusted = untrusted_minutes
+            .difference(&recovered_sampling_minutes)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let actual_idle = super::token_idle_timestamp_intervals_with_render_evidence(
+            &presentation_references,
             period.start_at,
             period.end_at,
             &token_timelines,
             &confirmed_gaps,
             Some(&super::GraphIdleRenderEvidence {
-                untrusted_minutes: &untrusted_minutes,
+                untrusted_minutes: &presentation_untrusted,
             }),
         )
         .into_iter()
@@ -25998,7 +26216,7 @@ mod tests {
         assert_eq!(state.service_current_pair.as_deref(), Some(pair.as_str()));
         assert_eq!(state.service_history_pair.as_deref(), Some(pair.as_str()));
 
-        let (samples, untrusted_minutes) =
+        let (samples, untrusted_minutes, _) =
             state.graph_samples_for_selection(period.reset_at, period.start_at, period.end_at);
         let references = samples.iter().collect::<Vec<_>>();
         let expected_timestamps =
@@ -26881,7 +27099,7 @@ mod tests {
         let period_start = fixture["expected_period_start"].as_i64().unwrap();
         let period_end = fixture["expected_period_end"].as_i64().unwrap();
         let selected_reset = fixture["expected_reset_at"].as_i64().unwrap();
-        let (samples, untrusted_minutes) =
+        let (samples, untrusted_minutes, _) =
             state.graph_samples_for_selection(selected_reset, period_start, period_end);
         let sample_references = samples.iter().collect::<Vec<_>>();
         let (model_timelines, correction_starts) = state.graph_model_lineage_for_selection(
@@ -31482,7 +31700,7 @@ mod tests {
             .iter()
             .find(|period| period.canonical_reset_at == selected_reset)
             .expect("selected period bounds");
-        let (graph_samples, untrusted) =
+        let (graph_samples, untrusted, _) =
             state.graph_samples_for_selection(selected_reset, period.start, period.end);
         let graph_sample_refs = graph_samples.iter().collect::<Vec<_>>();
         let model_points =
@@ -43323,7 +43541,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_row_without_quota_between_direct_endpoints_vetoes_idle() {
+    fn unavailable_sampling_is_not_recovered_without_exact_bounded_match() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 90.0, ModelDollarTotals::default()),
             UsageHistorySample::new(900, 1_000, f64::NAN, ModelDollarTotals::default()),
@@ -43342,8 +43560,8 @@ mod tests {
         )]);
         let untrusted_minutes = BTreeSet::from([900]);
 
-        let graph =
-            super::graph_paths_for_selection_with_sources_and_astra(super::GraphSelectionInput {
+        let graph = super::graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sampling(
+            super::GraphSelectionInput {
                 samples: &references,
                 period_start: 0,
                 period_end: 1_800,
@@ -43355,13 +43573,57 @@ mod tests {
                 untrusted_minutes: &untrusted_minutes,
                 confirmed_gaps: &[],
                 model_timelines: &timelines,
-            });
+            },
+            None,
+            Some(&untrusted_minutes),
+        );
 
         assert!(graph.unused_intervals.is_empty());
+
+        let changed_samples = (0..=10)
+            .map(|minute| {
+                UsageHistorySample::new(
+                    minute * 60,
+                    1_000,
+                    if minute == 5 { f64::NAN } else { 90.0 },
+                    ModelDollarTotals::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let changed_references = changed_samples.iter().collect::<Vec<_>>();
+        let changed_timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            (0..=10)
+                .filter(|minute| *minute != 5)
+                .map(|minute| {
+                    let tokens = if minute < 5 { 100 } else { 101 };
+                    (minute * 60, direct(tokens))
+                })
+                .collect(),
+        )]);
+        let changed_untrusted = BTreeSet::from([300]);
+        let changed = super::graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sampling(
+            super::GraphSelectionInput {
+                samples: &changed_references,
+                period_start: 0,
+                period_end: 600,
+                show_luna: false,
+                show_terra: false,
+                show_sol: true,
+                show_astra: false,
+                show_tokens: true,
+                untrusted_minutes: &changed_untrusted,
+                confirmed_gaps: &[],
+                model_timelines: &changed_timelines,
+            },
+            None,
+            Some(&changed_untrusted),
+        );
+        assert!(changed.unused_intervals.is_empty());
     }
 
     #[test]
-    fn single_unavailable_minute_splits_idle_band_regardless_of_activity() {
+    fn single_unavailable_sampling_minute_is_recovered_for_idle_and_solid_lines() {
         let samples = (0..=10)
             .map(|minute| {
                 UsageHistorySample::new(
@@ -43397,7 +43659,7 @@ mod tests {
         let untrusted_minutes = BTreeSet::from([300]);
 
         let graph =
-            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sampling(
                 super::GraphSelectionInput {
                     samples: &references,
                     period_start: 0,
@@ -43412,9 +43674,16 @@ mod tests {
                     model_timelines: &timelines,
                 },
                 Some(&activity),
+                Some(&untrusted_minutes),
             );
 
-        assert!(graph.unused_intervals.is_empty());
+        assert_eq!(graph.unused_intervals.len(), 1);
+        assert!((graph.unused_intervals[0].start - 0.0).abs() < 1e-9);
+        assert!((graph.unused_intervals[0].width - 100.0).abs() < 1e-9);
+        assert!(!graph.sol_flat.is_empty());
+        assert!(graph.sol_inferred.is_empty());
+        assert!(!graph.remaining_solid.is_empty());
+        assert!(graph.remaining_inferred.is_empty());
     }
 
     #[test]
@@ -43458,7 +43727,7 @@ mod tests {
         let untrusted_minutes = BTreeSet::from([300, 360]);
 
         let graph =
-            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sampling(
                 super::GraphSelectionInput {
                     samples: &references,
                     period_start: 0,
@@ -43473,13 +43742,14 @@ mod tests {
                     model_timelines: &timelines,
                 },
                 Some(&activity),
+                Some(&untrusted_minutes),
             );
 
         assert!(graph.unused_intervals.is_empty());
     }
 
     #[test]
-    fn separated_unavailable_minutes_split_idle_bands() {
+    fn separated_single_unavailable_sampling_minutes_are_both_recovered() {
         let samples = (0..=34)
             .map(|minute| {
                 UsageHistorySample::new(
@@ -43519,7 +43789,7 @@ mod tests {
         let untrusted_minutes = BTreeSet::from([300, 1_260]);
 
         let graph =
-            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_activity_and_sampling(
                 super::GraphSelectionInput {
                     samples: &references,
                     period_start: 0,
@@ -43534,13 +43804,12 @@ mod tests {
                     model_timelines: &timelines,
                 },
                 Some(&activity),
+                Some(&untrusted_minutes),
             );
 
-        assert_eq!(graph.unused_intervals.len(), 2);
-        assert!((graph.unused_intervals[0].start - (360.0 / 2_040.0 * 100.0)).abs() < 1e-9);
-        assert!((graph.unused_intervals[0].width - (840.0 / 2_040.0 * 100.0)).abs() < 1e-9);
-        assert!((graph.unused_intervals[1].start - (1_320.0 / 2_040.0 * 100.0)).abs() < 1e-9);
-        assert!((graph.unused_intervals[1].width - (720.0 / 2_040.0 * 100.0)).abs() < 1e-9);
+        assert_eq!(graph.unused_intervals.len(), 1);
+        assert!((graph.unused_intervals[0].start - 0.0).abs() < 1e-9);
+        assert!((graph.unused_intervals[0].width - 100.0).abs() < 1e-9);
     }
 
     #[test]

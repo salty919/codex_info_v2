@@ -255,6 +255,7 @@ public sealed class GraphScene
                 .Where(gap => gap.EndAt > gap.StartAt)
                 .OrderBy(gap => gap.StartAt)
                 .ToArray();
+        samples = WithoutRecoverableSamplingJitter(samples, normalizedGaps);
         var allModelNames = samples
             .SelectMany(PublishedModels)
             .Select(model => model.Name)
@@ -384,6 +385,81 @@ public sealed class GraphScene
             BuildConfirmedIdleIntervals(samples, start, end, normalizedGaps),
             maximum);
     }
+
+    private static IReadOnlyList<ApiHistorySample> WithoutRecoverableSamplingJitter(
+        IReadOnlyList<ApiHistorySample> samples,
+        IReadOnlyList<GraphConfirmedGap> confirmedGaps)
+    {
+        if (samples.Count < 3)
+        {
+            return samples;
+        }
+
+        var recovered = new HashSet<int>();
+        for (var index = 1; index + 1 < samples.Count; index++)
+        {
+            var left = samples[index - 1];
+            var middle = samples[index];
+            var right = samples[index + 1];
+            if (middle.IsSyntheticTail ||
+                middle.ModelSource != ApiHistorySample.UnavailableModelSource ||
+                middle.ModelsComplete ||
+                middle.Timestamp - left.Timestamp != 60 ||
+                right.Timestamp - middle.Timestamp != 60 ||
+                left.ResetAt != middle.ResetAt ||
+                left.ResetAt != right.ResetAt ||
+                left.RemainingPercent is not double leftRemaining ||
+                right.RemainingPercent is not double rightRemaining ||
+                !double.IsFinite(leftRemaining) ||
+                !double.IsFinite(rightRemaining) ||
+                !RemainingBitsEqual(leftRemaining, rightRemaining) ||
+                middle.RemainingPercent is double middleRemaining &&
+                    (!double.IsFinite(middleRemaining) ||
+                        !RemainingBitsEqual(leftRemaining, middleRemaining)) ||
+                HasConfirmedGapBetween(confirmedGaps, left.Timestamp, right.Timestamp) ||
+                !DirectSamplingEndpointsEqual(left, right))
+            {
+                continue;
+            }
+            recovered.Add(index);
+        }
+
+        return recovered.Count == 0
+            ? samples
+            : samples.Where((_, index) => !recovered.Contains(index)).ToArray();
+    }
+
+    private static bool DirectSamplingEndpointsEqual(
+        ApiHistorySample left,
+        ApiHistorySample right)
+    {
+        if (!TryGetDirectModelVector(left, out var leftTokens) ||
+            !TryGetDirectModelVector(right, out var rightTokens) ||
+            !TokenVectorsEqual(leftTokens, rightTokens))
+        {
+            return false;
+        }
+
+        var leftModels = PublishedModels(left)
+            .OrderBy(model => model.Name, Utf8ModelNameComparer.Instance)
+            .ToArray();
+        var rightModels = PublishedModels(right)
+            .OrderBy(model => model.Name, Utf8ModelNameComparer.Instance)
+            .ToArray();
+        return leftModels.Length == rightModels.Length && leftModels.Zip(rightModels).All(pair =>
+            pair.First.Name == pair.Second.Name &&
+            pair.First.TotalTokens == pair.Second.TotalTokens &&
+            pair.First.InputTokens == pair.Second.InputTokens &&
+            pair.First.CachedInputTokens == pair.Second.CachedInputTokens &&
+            pair.First.CacheWriteInputTokens == pair.Second.CacheWriteInputTokens &&
+            pair.First.OutputTokens == pair.Second.OutputTokens &&
+            NullableDoubleBitsEqual(pair.First.TotalDollars, pair.Second.TotalDollars));
+    }
+
+    private static bool NullableDoubleBitsEqual(double? left, double? right) =>
+        left is null && right is null ||
+        left is double leftValue && right is double rightValue &&
+            RemainingBitsEqual(leftValue, rightValue);
 
     private static double[] SeriesOrMissing(
         IReadOnlyDictionary<string, IReadOnlyList<double>> series,
