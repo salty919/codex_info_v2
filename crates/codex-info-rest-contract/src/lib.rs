@@ -27,6 +27,34 @@ const MAX_PUBLIC_PLAN_SCALARS: usize = 64;
 pub const MAX_PUBLIC_MODEL_SCALARS: usize = 128;
 const MAX_PUBLIC_MODEL_LABEL_SCALARS: usize = 24;
 
+/// Return the authoritative start of the current public quota window.
+///
+/// The provider deadline and window length are one observation.  Keeping this
+/// derivation in the wire contract prevents Linux, Windows, and the standalone
+/// reader from inventing platform-specific period boundaries.
+pub fn current_period_start_at(reset_at: i64, window_seconds: i64) -> Option<i64> {
+    if !valid_timestamp(reset_at) || window_seconds <= 0 {
+        return None;
+    }
+    reset_at
+        .checked_sub(window_seconds)
+        .filter(|start_at| valid_timestamp(*start_at))
+}
+
+/// Return the authoritative current public period `(start_at, end_at)`.
+pub fn current_period_bounds(
+    reset_at: i64,
+    window_seconds: i64,
+    observed_at: i64,
+) -> Option<(i64, i64)> {
+    if !valid_timestamp(observed_at) {
+        return None;
+    }
+    let start_at = current_period_start_at(reset_at, window_seconds)?;
+    let end_at = reset_at.min(observed_at);
+    (end_at >= start_at).then_some((start_at, end_at))
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicState {
@@ -410,7 +438,16 @@ impl PublicDetails {
                 let Some(observed_at) = self.observed_at else {
                     return Err(ContractError::InvalidPeriod);
                 };
-                if period.end_at != period.reset_at.min(observed_at) {
+                if let Some(quota) = self.quota.as_ref() {
+                    let Some((expected_start_at, expected_end_at)) =
+                        current_period_bounds(quota.reset_at, quota.window_seconds, observed_at)
+                    else {
+                        return Err(ContractError::InvalidPeriod);
+                    };
+                    if period.start_at != expected_start_at || period.end_at != expected_end_at {
+                        return Err(ContractError::InvalidPeriod);
+                    }
+                } else if period.end_at != period.reset_at.min(observed_at) {
                     return Err(ContractError::InvalidPeriod);
                 }
             }

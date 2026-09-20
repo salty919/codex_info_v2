@@ -3,7 +3,7 @@
 
 [package]
 name = "codex_info"
-version = "1.0.67"
+version = "1.0.68"
 edition = "2021"
 default-run = "codex_info"
 license = "GPL-3.0-only"
@@ -23,6 +23,7 @@ members = [
 
 [dependencies]
 codex-info-db-writer = { path = "crates/codex-info-db-writer" }
+codex-info-rest-contract = { path = "crates/codex-info-rest-contract" }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 iana-time-zone = "0.1"

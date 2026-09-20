@@ -205,10 +205,11 @@ accountのtransport/quota/local一時失敗だけは従来どおり最後の完�
 quota観測のprovider `resetsAt` Unix秒である。`quota.window_seconds`はその観測と同じtransactionの値とし、
 latestはdeadlineの大小ではなく`observed_at`とcollector generationの順序で決める。遅着した古い観測、同時刻の
 矛盾candidate、別account/epochの値を公開しない。同一periodのrolling更新では`quota.reset_at`だけが前進または
-補正され得るが、`history_periods[].id/start_at/reset_at`、既存sample、model totalsは変更しない。Linux/Windowsの
-期間欄、メイン利用期間、selected period start、グラフ横軸は、選択中のaccepted `history_periods[].start_at`を
-そのまま使う。current identityは同じperiodの`current`を使い、`quota.reset_at - quota.window_seconds`から
-history開始表示を再計算しない。リセット時刻は同じrootの`quota.reset_at`を表示する。
+補正され得る。current `history_periods[]`は同じquota観測から`start_at = quota.reset_at - quota.window_seconds`、
+`end_at = min(quota.reset_at, observed_at)`を一度だけ投影し、Linux/Windowsの期間欄、メイン利用期間、selected
+period start、グラフ横軸はそのpairを使う。stable `id`とcanonical `reset_at`、durable sample、model totalsは
+rolling driftだけでは書き換えず、公開windowより前のsampleだけをcurrent公開から除外する。completed/historical
+periodは保存済み`start_at/end_at`を使い、リセット時刻は同じrootの`quota.reset_at`を表示する。
 
 wireに `ready` boolean keyは存在しない。dataの利用可能判定は、完全schemaを受理した一つのdetails rootについて
 `state == "ready" && authenticated == true` の論理積だけである。

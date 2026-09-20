@@ -806,12 +806,13 @@ dependencies = [
 
 [[package]]
 name = "codex_info"
-version = "1.0.67"
+version = "1.0.68"
 dependencies = [
  "axum",
  "chrono",
  "chrono-tz",
  "codex-info-db-writer",
+ "codex-info-rest-contract",
  "fontique",
  "getrandom 0.3.4",
  "hex",
