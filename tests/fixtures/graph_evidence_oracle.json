@@ -50,9 +50,9 @@
       "idle_intervals": [],
       "model_segments": {
         "ASTRA": {"flat":[[0,60],[60,120]],"rising":[],"dashed":[[120,600]]},
-        "LUNA": {"flat":[[0,60],[60,120]],"rising":[],"dashed":[[120,600]]},
-        "SOL": {"flat":[[0,60]],"rising":[[60,120]],"dashed":[[120,600]]},
-        "TERRA": {"flat":[[0,60],[60,120]],"rising":[],"dashed":[[120,600]]}
+        "LUNA": {"flat":[[0,60],[60,120],[120,180],[180,240],[240,360],[360,420],[420,480],[480,540]],"rising":[],"dashed":[[540,600]]},
+        "SOL": {"flat":[[0,60],[120,180],[180,240],[240,360],[360,420]],"rising":[[60,120]],"dashed":[[420,540],[540,600]]},
+        "TERRA": {"flat":[[0,60],[60,120],[120,180],[180,240],[240,360],[360,420],[420,480],[480,540]],"rising":[],"dashed":[[540,600]]}
       },
       "remaining_values": [90.0,90.0,89.0,89.0,89.0,89.0,89.0,89.0,88.0,88.0],
       "remaining_origins": ["raw","raw","raw","raw","raw","raw","raw","raw","raw","synthetic_tail_hold"],
@@ -367,9 +367,9 @@
         "LUNA": [1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,null,null,1.0]
       },
       "model_segments": {
-        "SOL": {"solid":[],"dashed":[],"break":[]},
-        "TERRA": {"solid":[],"dashed":[],"break":[]},
-        "LUNA": {"solid":[],"dashed":[],"break":[]}
+        "SOL": {"solid":[[2100000000,2100000060],[2100000060,2100000120],[2100000120,2100000180],[2100000180,2100000240],[2100000240,2100000300],[2100000300,2100000360],[2100000420,2100000480]],"dashed":[[2100000360,2100000420],[2100000480,2100000600],[2100000600,2100000660]],"break":[]},
+        "TERRA": {"solid":[[2100000000,2100000060],[2100000060,2100000120],[2100000120,2100000180],[2100000180,2100000240],[2100000240,2100000300],[2100000300,2100000360],[2100000420,2100000480]],"dashed":[[2100000360,2100000420],[2100000480,2100000600],[2100000600,2100000660]],"break":[]},
+        "LUNA": {"solid":[[2100000000,2100000060],[2100000060,2100000120],[2100000120,2100000180],[2100000180,2100000240],[2100000240,2100000300],[2100000300,2100000360]],"dashed":[[2100000360,2100000420],[2100000420,2100000600],[2100000600,2100000660]],"break":[]}
       },
       "remaining_points": [
         {"timestamp":2100000000,"raw":96.0,"effective":96.0,"origin":"raw"},
@@ -405,9 +405,9 @@
     "corrections": [],
     "idle_intervals": [],
     "model_segments": {
-      "SOL": {"solid":[],"dashed":[],"break":[]},
-      "TERRA": {"solid":[],"dashed":[],"break":[]},
-      "LUNA": {"solid":[],"dashed":[],"break":[]}
+      "SOL": {"solid":[[1788441660,1788441720]],"dashed":[[1788441720,1788476340]],"break":[]},
+      "TERRA": {"solid":[[1788441660,1788441720],[1788441720,1788441780],[1788441780,1788445260],[1788445260,1788445320],[1788445320,1788476280]],"dashed":[[1788476280,1788476340]],"break":[]},
+      "LUNA": {"solid":[[1788441660,1788441720]],"dashed":[[1788441720,1788476340]],"break":[]}
     },
     "remaining_segments": {"solid":[[1788441660,1788441720],[1788441720,1788441780],[1788441780,1788445260],[1788445260,1788445320],[1788445320,1788476280]],"dashed":[[1788476280,1788476340]],"break":[]},
     "latest_labels": {"SOL":"$176.04","remaining":"62%"}
@@ -551,7 +551,7 @@
       {"timestamp":3180,"remaining_percent":97.0,"models":[{"model":"SOL","total_tokens":11,"total_dollars":11.0},{"model":"TERRA","total_tokens":8,"total_dollars":8.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
       {"timestamp":3240,"remaining_percent":96.0,"models":[{"model":"SOL","total_tokens":13,"total_dollars":13.0},{"model":"TERRA","total_tokens":9,"total_dollars":9.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"}
     ],
-    "expected": {"accepted_sol":[10.0,12.0,null,null,13.0],"sol_solid":[],"sol_dashed":[],"corrections":[],"idle_intervals":[]}
+    "expected": {"accepted_sol":[10.0,12.0,null,null,13.0],"sol_solid":[[3000,3060]],"sol_dashed":[[3060,3240]],"corrections":[],"idle_intervals":[]}
   },
   "mixed_confirmed_v3": {
     "samples": [
@@ -561,7 +561,7 @@
       {"timestamp":3180,"remaining_percent":97.0,"models":[{"model":"SOL","total_tokens":11,"total_dollars":11.0},{"model":"TERRA","total_tokens":8,"total_dollars":8.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"},
       {"timestamp":3240,"remaining_percent":96.0,"models":[{"model":"SOL","total_tokens":13,"total_dollars":13.0},{"model":"TERRA","total_tokens":9,"total_dollars":9.0},{"model":"LUNA","total_tokens":1,"total_dollars":1.0}],"models_complete":false,"model_source":"legacy-unknown"}
     ],
-    "expected": {"accepted_sol":[null,null,7.0,11.0,13.0],"sol_solid":[],"sol_dashed":[[3120,3240]],"corrections":[],"idle_intervals":[]}
+    "expected": {"accepted_sol":[null,null,7.0,11.0,13.0],"sol_solid":[[3120,3180],[3180,3240]],"sol_dashed":[],"corrections":[],"idle_intervals":[]}
   },
   "quota_raw_increase": {
     "period_start": 4000,

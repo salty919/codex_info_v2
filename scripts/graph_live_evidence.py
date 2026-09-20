@@ -724,19 +724,12 @@ def _model_segments(
         and point.value >= 0
         and (
             (point.origin == "direct" and point.reliable)
-            or (point.origin == "legacy" and is_idle_timestamp(rows[index]["timestamp"]))
+            or point.origin == "legacy"
         )
     ]
     for previous, index in pairwise(exact):
         start, end = rows[previous]["timestamp"], rows[index]["timestamp"]
-        previous_origin = projection[previous].origin
-        current_origin = projection[index].origin
         confirmed_idle = _is_idle_interval(start, end, idle_intervals)
-        if "legacy" in {previous_origin, current_origin} and not (
-            previous_origin == current_origin == "legacy"
-            and confirmed_idle
-        ):
-            continue
         causes: list[str] = []
         if _hard_break(start, end, gaps):
             causes.append("confirmed_gap")

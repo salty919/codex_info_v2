@@ -1462,7 +1462,9 @@ public sealed class GraphPlotControlTests
         Assert.Equal(expectedPeriodEnd, scene.Timestamps[^1]);
 
         var firstObservation = expectedRawTimestamps[0];
-        Assert.Empty(terraLines.Flat.X);
+        Assert.Equal(
+            expectedRawTimestamps.Zip(expectedRawTimestamps.Skip(1)),
+            SegmentPairs(terraLines.Flat));
         Assert.Empty(terraLines.Rising.X);
         Assert.Empty(terraLines.Dashed.X);
         Assert.NotEmpty(remainingLines.Dashed.X);
@@ -1470,10 +1472,16 @@ public sealed class GraphPlotControlTests
         Assert.Equal(87d, remainingLines.Dashed.Y[0]);
         Assert.DoesNotContain(remainingLines.Solid.X, timestamp => timestamp < firstObservation);
         Assert.DoesNotContain(remainingLines.Dashed.X, timestamp => timestamp < firstObservation);
-        Assert.Empty(solLines.Flat.X);
-        Assert.Empty(solLines.Rising.X);
+        Assert.Equal(
+            expectedRawTimestamps.Skip(2).Zip(expectedRawTimestamps.Skip(3)),
+            SegmentPairs(solLines.Flat));
+        Assert.Equal(
+            expectedRawTimestamps.Take(2).Zip(expectedRawTimestamps.Skip(1).Take(2)),
+            SegmentPairs(solLines.Rising));
         Assert.Empty(solLines.Dashed.X);
-        Assert.Empty(lunaLines.Flat.X);
+        Assert.Equal(
+            expectedRawTimestamps.Zip(expectedRawTimestamps.Skip(1)),
+            SegmentPairs(lunaLines.Flat));
         Assert.Empty(lunaLines.Rising.X);
         Assert.Empty(lunaLines.Dashed.X);
         Assert.Equal([2_000_000_220d, 2_000_000_280d], remainingLines.Solid.X);

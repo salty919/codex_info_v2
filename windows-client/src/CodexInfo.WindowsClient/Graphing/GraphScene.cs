@@ -863,7 +863,7 @@ public sealed class GraphScene
         origin is GraphModelOrigin.Direct;
 
     private static bool ModelOriginLineIsExact(GraphModelOrigin origin) =>
-        origin is GraphModelOrigin.Direct;
+        origin is GraphModelOrigin.Direct or GraphModelOrigin.LegacyUnknown;
 
     private static bool ModelOriginIsLosslessIdleObservation(GraphModelOrigin origin) =>
         origin is GraphModelOrigin.Direct or GraphModelOrigin.LegacyUnknown;

@@ -4837,10 +4837,6 @@ impl GraphModelOrigin {
     fn arithmetic_reliable(self) -> bool {
         self == Self::Direct
     }
-
-    fn line_is_exact(self) -> bool {
-        self == Self::Direct
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -4918,7 +4914,7 @@ fn normalize_graph_model_display_monotonic(
             continue;
         }
         if let Some(floor) = display_floor {
-            if value < floor && !point.origin.line_is_exact() {
+            if value < floor && !graph_model_line_is_exact(point) {
                 set_graph_model_value(point, show_tokens, floor);
                 point.origin = GraphModelOrigin::Held;
             }
@@ -4932,6 +4928,11 @@ fn normalize_graph_model_display_monotonic(
 
 fn graph_model_raw_tokens(point: &GraphModelPoint) -> Option<u64> {
     point.raw_tokens
+}
+
+fn graph_model_line_is_exact(point: &GraphModelPoint) -> bool {
+    point.origin == GraphModelOrigin::Direct
+        || point.origin == GraphModelOrigin::LegacyObserved && point.raw_tokens.is_some()
 }
 
 fn graph_model_is_lossless_idle_observation(point: &GraphModelPoint) -> bool {
@@ -5025,6 +5026,7 @@ fn accepted_graph_model_timelines(
                     *timestamp,
                     graph_model_value(point, show_tokens),
                     point.origin,
+                    graph_model_line_is_exact(point),
                 )
             })
             .collect::<Vec<_>>();
@@ -5037,9 +5039,7 @@ fn accepted_graph_model_timelines(
                 let finite = [left.1, middle.1, right.1]
                     .into_iter()
                     .all(|value| value.is_finite() && value >= 0.0);
-                ([left.2, middle.2, right.2]
-                    .into_iter()
-                    .all(GraphModelOrigin::line_is_exact)
+                ([left.3, middle.3, right.3].into_iter().all(|exact| exact)
                     && finite
                     && left.1 <= right.1
                     && (middle.1 < left.1 || middle.1 > right.1))
@@ -5047,7 +5047,7 @@ fn accepted_graph_model_timelines(
             })
             .collect::<BTreeSet<_>>();
         let mut direct_baseline = None::<f64>;
-        for (timestamp, raw_value, source_origin) in raw {
+        for (timestamp, raw_value, source_origin, _) in raw {
             let Some(point) = timeline.get_mut(&timestamp) else {
                 continue;
             };
@@ -5629,7 +5629,7 @@ fn graph_model_untrusted_minutes(
     let mut minutes = timeline
         .into_iter()
         .flat_map(BTreeMap::iter)
-        .filter(|(_, point)| !point.origin.line_is_exact())
+        .filter(|(_, point)| !graph_model_line_is_exact(point))
         .map(|(minute, _)| *minute)
         .collect::<BTreeSet<_>>();
     if minute.last().is_some_and(|point| {
@@ -27640,7 +27640,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let untrusted = timelines["SOL"]
                 .iter()
-                .filter(|(_, point)| !point.origin.line_is_exact())
+                .filter(|(_, point)| !super::graph_model_line_is_exact(point))
                 .map(|(timestamp, _)| *timestamp)
                 .collect::<BTreeSet<_>>();
             let segments = super::metric_line_segments_with_boundaries(
@@ -44335,6 +44335,75 @@ mod tests {
             assert!(graph.sol_inferred.is_empty());
             assert!(graph.unused_intervals.is_empty());
         }
+    }
+
+    #[test]
+    fn legacy_values_with_lossless_tokens_render_measured_without_arithmetic_authority() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(60, 1_000, 90.0, ModelDollarTotals::default()),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([
+                (
+                    0,
+                    super::GraphModelPoint {
+                        dollar: 0.0,
+                        tokens: 0.0,
+                        raw_tokens: Some(0),
+                        origin: super::GraphModelOrigin::LegacyObserved,
+                    },
+                ),
+                (
+                    60,
+                    super::GraphModelPoint {
+                        dollar: 1.0,
+                        tokens: 10.0,
+                        raw_tokens: Some(10),
+                        origin: super::GraphModelOrigin::LegacyObserved,
+                    },
+                ),
+            ]),
+        )]);
+        let points = [
+            HourlyModelSpend {
+                timestamp: 0,
+                sol: 0.0,
+                ..HourlyModelSpend::default()
+            },
+            HourlyModelSpend {
+                timestamp: 60,
+                sol: 10.0,
+                ..HourlyModelSpend::default()
+            },
+        ];
+        let untrusted_minutes =
+            super::graph_model_untrusted_minutes(timelines.get("SOL"), &points, 60);
+
+        let graph =
+            super::graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
+                super::GraphSelectionInput {
+                    samples: &references,
+                    period_start: 0,
+                    period_end: 60,
+                    show_luna: false,
+                    show_terra: false,
+                    show_sol: true,
+                    show_astra: false,
+                    show_tokens: true,
+                    untrusted_minutes: &untrusted_minutes,
+                    confirmed_gaps: &[],
+                    model_timelines: &timelines,
+                },
+                None,
+            );
+
+        assert!(graph.sol_flat.is_empty());
+        assert!(!graph.sol_rising.is_empty());
+        assert!(graph.sol_inferred.is_empty());
+        assert!(graph.unused_intervals.is_empty());
     }
 
     #[test]

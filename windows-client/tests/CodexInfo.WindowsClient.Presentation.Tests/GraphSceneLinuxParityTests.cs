@@ -122,7 +122,7 @@ public sealed class GraphSceneLinuxParityTests
     }
 
     [Fact]
-    public void LegacyUnknownRowsDoNotBecomeModelAnchorsOrQuotaAuthorities()
+    public void LegacyUnknownRowsRenderMeasuredLinesWithoutBecomingQuotaAuthorities()
     {
         var samples = new[]
         {
@@ -146,7 +146,7 @@ public sealed class GraphSceneLinuxParityTests
         Assert.False(scene.TryGetTokenIntervalEvidence(0, 1, out _));
         var modelLines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
         Assert.Empty(modelLines.Flat.X);
-        Assert.Empty(modelLines.Rising.X);
+        Assert.Equal([1_000d, 1_060d], modelLines.Rising.X);
         Assert.Empty(modelLines.Dashed.X);
         var remainingLines = GraphPlotProjection.BuildRemainingLines(scene);
         Assert.Equal([1_000d, 1_060d], remainingLines.Solid.X);

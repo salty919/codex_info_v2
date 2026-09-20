@@ -1186,7 +1186,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         self.assertEqual(1, tokens["models"][0]["rising"].count("M"))
         self.assertEqual(1, tokens["remaining"]["solid"].count("M"))
 
-    def test_legacy_raw_model_values_do_not_become_non_idle_line_anchors(self):
+    def test_legacy_raw_model_values_render_solid_without_idle_authority(self):
         fixture = v3_fixture([
             {
                 "timestamp": 0,
@@ -1210,7 +1210,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
 
         self.assertEqual([], idle)
         for metric in ("tokens", "dollars"):
-            self.assertEqual([], pairs(segments, "rising", metric, "SOL"))
+            self.assertEqual([[0, 60]], pairs(segments, "rising", metric, "SOL"))
             self.assertEqual([], pairs(segments, "dashed", metric, "SOL"))
 
     def test_idle_render_contract_separates_sustained_thin_solids_from_short_flats_and_missing(self):
