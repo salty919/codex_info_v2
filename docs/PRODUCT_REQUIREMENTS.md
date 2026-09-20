@@ -62,7 +62,7 @@ U128-36
 `ASTRA-COST-01`: ASTRAの概算はユーザー指定単価（100万token当たり通常入力$10、cached入力$1、cache write入力$12.50、出力$50）による。入力総数をI、cached入力をC、cache write入力をW、出力をOとして、通常入力はI-C-W、合計は `((I-C-W)*10+C*1+W*12.50+O*50)/1_000_000`。未提供のWや矛盾する内訳を0として確定表示しない。既存3モデルの単価は変更しない。
 `MODEL-USAGE-DISPLAY-01`: 現在期間のモデル別利用量は、LinuxとWindowsで同じ3組の表示bucketを使う。v3 wireの入力総数をI、cached入力をC、cache write入力をW、出力をOとすると、表示Inputはtoken `I-C`と概算ドル「通常入力＋cache write」、表示Cached inputはtoken Cとcached入力ドル、表示Outputはtoken Oと出力ドルを必ず隣接させる。したがって独立列を持たないcache writeはInputのtokenとドルの双方に含め、片方だけへ含めない。v3 adapterだけがraw値をこの表示契約へ正規化し、既に表示bucketを返すv1/v2を再減算しない。有限の概算ドルは小数2桁、価格未定または非有限値は0へ推測せず利用不可として表示する。
 `API-LIFECYCLE-01`: canonicalな収集・DB domainはUIの固定field、表示文言、画面構成および特定client versionへ依存させない。public APIは同じcommit済みdomain snapshotから作るversion別read-only adapterとし、client変更でcollectorまたはDB writerを変更しない。現行v3は現在値、履歴期間、選択期間の有限履歴page、Threadsを独立resourceとして公開し、各UIは可視surfaceに必要なresourceだけを取得する。全resourceは同じopaqueなpublished pairへ結合し、一つの取得cycleで一つのsurfaceが必要とする全pageを同一pairで受理した場合だけatomic表示する。履歴差分だけは、直前rootのcursorが同じperiodの既取得prefix不変を証明した場合に限り、新pairの全pageを揃えて旧prefixへatomic appendできる。prefixのsampleまたはgapが補正された場合はcursorを拒否し、先頭から再取得する。modelは固定3列でなく有界な配列として公開し、未知モデルのtoken事実と価格未確定を区別する。旧v1/v2と`/v3/details`は互換期間中だけ同一snapshotのdeprecated projectionとして保持し、旧API削除はadapter・route・client fallbackだけで完結させ、記録、DB schema、常駐監視、安定health endpointを変更しない。Sunset日時は別途明示決定されるまで推測しない。
-REST/DBの公開応答に含めるモデル数値は、同じmodel keyを持つ直接観測(`model_source=confirmed`)のraw値だけとする。`reconstructed-from-session`、`unknown`、`unavailable`はモデル数値を公開せず、model key/sourceと欠損metadataだけを公開する。`legacy-unknown`は保存済みの同じmodel keyの値だけを表示へ投影できるが、集計、予測、idle判定のauthorityにはしない。補間、hold、smoothing、予測およびそれらの派生値はUI presentation-onlyであり、API/DBへ書き戻さない。集計とidleの根拠は直接観測値だけである。
+REST/DBの公開応答に含めるモデル数値は、同じmodel keyを持つ直接観測(`model_source=confirmed`)のraw値、または保存済みの同じmodel keyをlosslessに保持する`legacy-unknown`値だけとする。`reconstructed-from-session`、`unknown`、`unavailable`はモデル数値を公開せず、model key/sourceと欠損metadataだけを公開する。`legacy-unknown`は集計・予測のauthorityにはせず、`G137-5`の同一非空model集合・全lossless raw tokenとraw Remainingのexact不変・欠測／異常／confirmed gapなしをrun全体で満たす場合だけidle判定に利用できる。補間、hold、smoothing、予測およびそれらの派生値はUI presentation-onlyであり、API/DBへ書き戻さない。
 `ACCOUNT-LIFECYCLE-134`: 一つのCodex profileは同時に一つの`auth.json` authorityだけを持つため、resident recorderが同時に書き込むのは現在認証を再確認できた一つのaccount partitionだけとする。認証されていないaccountを並行取得・推測更新しない。認証済みになった全accountのpartitionは削除せず、切替後も保持し、同一accountへ戻った場合は同じpartitionを境界後から再開する。REST/UIは初期化済みpartitionを列挙し、既定を現accountとして利用者が一つだけ選択して読み出せる。選択変更はcurrent、history、threads、pair、cursor、last-goodを同じaccount境界で一括破棄・再取得し、複数partitionの値を一画面へ混合しない。
 一つの外部観測可能な契約IDを複数ownerへ置かず、下流文書、要求台帳、実装、testは登録済みownerの
 契約IDを参照する。監査履歴、作業経過、文書SHA一覧、test名やagent運用は製品要件ではない。
@@ -132,7 +132,7 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 - backup作成または検証に失敗した場合は既存のverified世代をpruneしない。
 - crash、reboot、再実行はjournalの同一operationを再開し、commit、publication、deleteを各1回以下にする。
 - local session inventoryは既存のdepth・file数・1 file・1 line上限を先に検証し、mtime nanoseconds降順・canonical path降順のwhole-file prefixから最大2GiBだけを収集する。全inventoryの2GiB超過だけでLinux detailsを停止しない。
-- 2GiBは1 cycleで新規rangeを検証する入力上限であり、同一account・同一stable usage periodの累計母集団ではない。account DBへcommit済みのモデル別token/価格累計はselected prefixからsourceが外れても保持し、source identityとcheckpointで検証した未記録rangeだけを累計・cursor・history sampleへ同一transactionでexactly once加算する。ただしREST/DBの公開viewへ出すモデル数値は、同じmodel keyの直接観測として確認できた値だけに限定する。`reconstructed-from-session`、`unknown`、`unavailable`は欠損metadataのみ、`legacy-unknown`は保存済み同じkeyの表示投影のみとし、集計・予測・idle authorityへ使わない。rolling `reset_at` driftでは累計を継続し、quota回復または期間境界の観測で確認した真のrolloverだけ旧累計を新期間へcarryしない。identity、generation、period境界またはrangeの検証に失敗したcycleは縮退値を保存・公開せず、既存durable dataとlast-good details rootを保持する。
+- 2GiBは1 cycleで新規rangeを検証する入力上限であり、同一account・同一stable usage periodの累計母集団ではない。account DBへcommit済みのモデル別token/価格累計はselected prefixからsourceが外れても保持し、source identityとcheckpointで検証した未記録rangeだけを累計・cursor・history sampleへ同一transactionでexactly once加算する。ただしREST/DBの公開viewへ出すモデル数値は、同じmodel keyの直接観測、または保存済みの同じkeyをlosslessに保持する`legacy-unknown`値に限定する。`reconstructed-from-session`、`unknown`、`unavailable`は欠損metadataのみとする。`legacy-unknown`は集計・予測へ使わず、`G137-5`の限定条件をrun全体で満たす場合だけidle authorityにできる。rolling `reset_at` driftでは累計を継続し、quota回復または期間境界の観測で確認した真のrolloverだけ旧累計を新期間へcarryしない。identity、generation、period境界またはrangeの検証に失敗したcycleは縮退値を保存・公開せず、既存durable dataとlast-good details rootを保持する。
 - 2GiBから外れた古いsessionは、その完全fingerprintのusageとrecorded markerがSQLiteへ同一transactionでcommit済みで、fresh DB readback・path/identity再検査・Codex open-FD不在を満たす場合だけruntimeに1 fileずつ削除できる。未記録・legacy・変更済み・active・selected sessionと、履歴DB/backup/reset hint/recovery JSONLは保持する。
 
 ## 5. Linux bundle導入・自動更新・削除
@@ -330,7 +330,7 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    metricだけrecovery stateへ入り値を採用しない。recovery中もbaselineを固定し、最初のfinite non-negativeかつ
    `candidate >= baseline`の値だけをaccepted recoveryとしてstateを抜ける。それまでの候補は全て異常である。
    model pointは`Unknown`（当該metric欠測）、`Direct`（同じmodel keyの周期実測）、`Interpolated`、`Held`、
-   `Rejected`を区別する。`Direct`だけがAPI/DB公開と集計に利用でき、その他はUI presentation-onlyの
+   `Rejected`を区別する。`Direct`だけが集計に利用でき、保存済み`LegacyObserved` rawは`G137-2`の表示と`G137-5`の限定idle判定だけに利用できる。`Interpolated`、`Held`、`Rejected`はUI presentation-onlyの
    破線または欠損表示とする。この破線はDBまたは取得記録の欠損・異常を示すNG表示であり、正常な実線の代替ではない。
    保存済み累積ドルを通常表示のanchorとするが、ドルはtokenから得る派生表示値でありidle authorityにはしない。
    同じmodelの直接観測raw `total_tokens`が不変なのにドルだけが変化する場合はドル側の矛盾として、DB/API rawを
@@ -349,7 +349,7 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    異常またはrecorder gapを跨がない区間だけを、そのmodelのcontiguous measuredとする。他modelの出現／消失、
    `confirmed`同士の共通modelはmodel集合の完全性だけを理由にこの区間を破線化しない。`legacy-unknown`は集計authorityには
    しないが、両endpointと全interior rowに同じ非空model集合のlossless raw tokenが存在する区間はidle authorityにできる。正常な観測endpoint間はtimestamp差だけで
-   欠損へ降格せず、利用中の同値・増加は同じ3px実線で結ぶ。後述の10分以上のconfirmed idleに含まれる同値区間だけは
+   欠損へ降格せず、利用中の同値・増加は同じ3px実線で結ぶ。後述の10分以上の確定idleに含まれる同値区間だけは
    idle bandと同じX範囲の1px水平実線へ分離する。exact 60秒の1 sampling slotだけが`unavailable`で、その前後が
    same reset、同一model集合、全modelのraw token exact equal、raw Remaining bitwise equalかつgapなしなら、
    そのrowだけをread-time表示入力から除外して前後を3px実線で結ぶ。この限定補完はDB、history、API rawを変更せず、
@@ -401,7 +401,7 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
 
    Remainingのaccepted raw値は全て元時刻・元値の証拠として保持し、token増分、task lifecycle、model availabilityで
    移動または置換しない。表示geometryでは、sampling由来の同値反復を未使用と確定できない区間の折れ点にせず、前後の
-   有効な変化点を非増加かつovershootしないPCHIP（Fritsch–Carlson）の3px実線で滑らかにつなぐ。confirmed idleは
+   有効な変化点を非増加かつovershootしないPCHIP（Fritsch–Carlson）の3px実線で滑らかにつなぐ。確定idleは
    bandと同じX範囲をexactな1px水平実線として分離し、明示欠損・異常・reset/correctionの境界は平滑化で跨がない。変化量による別閾値は設けない。
    これはread-timeのgeometry生成だけであり、DB、history row、gap ledger、raw値を書き換えない。timestampの疎または
    sampling jitterだけでは欠損・予測へ降格しない。
@@ -415,8 +415,8 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    carryする。accepted raw Remainingが1点以上あれば、最後のeffective pointからexact period endまでを長さに
    関係なく時間幅のある破線holdとし、空白や同一X座標の垂直落下を作らない。`Remaining`のeffective値から
    model系列の値またはそのperiod tailを外挿しない。
-7. `G137-7`: model線は`Direct`同士のexact値の増加と、10分未満またはsession-level idleではない不変区間を同じ3px実線とし、
-   confirmed idleに含まれる不変区間だけをbandと同じX範囲の1px水平実線へ分離する。timestamp差だけでは破線化しない。raw列を
+7. `G137-7`: model線はaccepted raw同士のexact値の増加と、10分未満またはsession-level idleではない不変区間を同じ3px実線とし、
+   確定idleに含まれる不変区間だけをbandと同じX範囲の1px水平実線へ分離する。timestamp差だけでは破線化しない。raw列を
    変更せず、ドル表示では同じmodelのraw tokenが不変なrunを左端ドル値へ水平補正してから同じ線種規則を適用する。
    未使用と確定できないsampling同値反復は折れ点から外して有効変化点間を単調PCHIPで滑らかにつなぐ。途中に
    当該modelのunknown rowがあるnearest-finite接続、限定補完条件を満たさないraw-null補間点の両側、
@@ -469,8 +469,8 @@ parse済みでtimestamp重複なしとして次の相対offsetを固定する。
 このliteral oracleの期待する未使用帯は`[]`である。明示的な`false`があっても、same `reset_at`、両endpointの
 `confirmed`＋`models_complete=true`、同じmodel key集合、全raw tokenのexact equal、finite raw Remainingのbitwise equal、
 confirmed gap／欠測／直接観測値の矛盾なしが全て揃わない区間は帯にしない。active metadataだけは値変化の証拠にしない。
-legacy-unknownの保存値は表示専用で、集計・予測・idleへ使わない。
-空白区間と`x1 == x2`のsegmentは0件とする。明示的な欠測endpointはgrayでbridgeしないが、正常なdirect endpoint間のtimestamp sparsityだけでは実線またはidle bandを分断しない。
+このliteral oracleの`legacy-unknown`列はmodel集合変更、途中欠測、token異常またはRemaining変化を含むため、限定idle条件を満たさず、集計・予測・idleへ使わない。
+空白区間と`x1 == x2`のsegmentは0件とする。明示的な欠測endpointはgrayでbridgeしないが、正常なaccepted raw endpoint間のtimestamp sparsityだけでは実線またはidle bandを分断しない。
 追加反例として、同じドル値でもtokenが`100→101`かつdollarが`1.00→1.00`、accepted Remainingが局所的に
 `90→89`、tokenのisolated pulse、confirmed gapを跨ぐ同値endpointはいずれも未使用0件とする。棄却されるRemaining
 isolated pulseはtoken不変runを消さない。tokenとRemainingが同値でdollarだけ`1.00→0.99→1.00`のisolated pulseなら、
@@ -478,8 +478,8 @@ dollar線だけを破線hold／recovery、直接観測のtoken線を3px実線、
 同値でもtoken線だけを破線にして未使用帯を表示しない。
 valid-anchor smoothing oracleは、時系列tokenが`10,20,20,50`でraw Remainingが`100,100,100,99`なら、
 raw/effective列を`100,100,100,99`のまま保持する一方、未使用と確定できない中間の同値raw点を表示geometryの必須通過点に
-しない。正常区間は前後の有効変化点を滑らかにつなぐ3px単調PCHIPとし、confirmed idleだけはexactな水平線、明示欠損を
-挟む区間だけは1px破線予測とする。Direct tokenのexact-equalはconfirmed idleの二値判定だけに使い、token deltaの量・比率や
+しない。正常区間は前後の有効変化点を滑らかにつなぐ3px単調PCHIPとし、確定idleだけはexactな水平線、明示欠損を
+挟む区間だけは1px破線予測とする。accepted raw tokenのexact-equalは確定idleの二値判定だけに使い、token deltaの量・比率や
 task lifecycleでRemaining低下を配分または成形しない。
 `correction_v2`は直接観測されたraw Remainingを元時刻のanchorとして保持し、terminal holdを含む
 `remaining_values`を`[73.0,73.0,73.0,70.0,70.0,62.0,62.0]`とする。model累積値の後退・回復を

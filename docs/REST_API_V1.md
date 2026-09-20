@@ -27,7 +27,7 @@ API-DEPRECATION-01
 ログアウト、account切替、またはidentity検証失敗中のselectorなしrouteは、旧accountのquota・reset・model・threadを
 返さず、strict emptyな`auth_required`、`initializing`、または`error` rootだけを返す。
 
-`API-V3-MODELS-01`: v3の`current`と`history` resourceはcommit済みdomain snapshotを、有界な`models`配列として返す。model ID、token内訳、価格計算可否を事実として分離し、UI固定列や表示文言をwire fieldにしない。top-level current modelの`input_tokens`はcached入力と、存在する場合はcache write入力を含むraw入力総数であり、UI表示へのprojectionはPRODUCTの`MODEL-USAGE-DISPLAY-01`だけを参照する。モデルの数値は同じmodel keyを持つ直接観測(`model_source=confirmed`)のraw値だけを公開する。`reconstructed-from-session`、`unknown`、`unavailable`はmodel key/sourceと欠損metadataだけを返し、モデル数値を返さない。`legacy-unknown`は保存済みの同じmodel keyの数値を表示投影に限って返せるが、集計・予測・idle判定のauthorityにはしない。補間、hold、smoothing、予測および派生値はUI presentation-onlyで、API/DBへ書き戻さない。`/health`はAPI世代から独立したread-only readiness endpointとし、collector、DB writer、外部quota取得の生存状態を混同しない。
+`API-V3-MODELS-01`: v3の`current`と`history` resourceはcommit済みdomain snapshotを、有界な`models`配列として返す。model ID、token内訳、価格計算可否を事実として分離し、UI固定列や表示文言をwire fieldにしない。top-level current modelの`input_tokens`はcached入力と、存在する場合はcache write入力を含むraw入力総数であり、UI表示へのprojectionはPRODUCTの`MODEL-USAGE-DISPLAY-01`だけを参照する。モデルの数値は同じmodel keyを持つ直接観測(`model_source=confirmed`)のraw値、または保存済みの同じmodel keyをlosslessに保持する`legacy-unknown`値だけを公開する。`reconstructed-from-session`、`unknown`、`unavailable`はmodel key/sourceと欠損metadataだけを返し、モデル数値を返さない。`legacy-unknown`は集計・予測のauthorityにはせず、`G137-5`の限定条件をrun全体で満たす場合だけidle判定に利用できる。補間、hold、smoothing、予測および派生値はUI presentation-onlyで、API/DBへ書き戻さない。`/health`はAPI世代から独立したread-only readiness endpointとし、collector、DB writer、外部quota取得の生存状態を混同しない。
 
 v3の各履歴rowは`models`、`models_complete`、nullable boolean `task_active_since_previous`を持つ。
 `task_active_since_previous`は同じcanonical periodの直前rowより後から当該row時刻までにtaskが実行中だったかを表し、
@@ -36,12 +36,12 @@ graphのinterval判定ではafter rowの値として扱う。
 period先頭、未索引範囲、矛盾または旧schemaは`null`とする。欠落fieldを受理する互換clientも`null`として扱い、
 `false`や履歴の見た目へ推測変換しない。各model rowの`total_tokens`と`total_dollars`は個別に確認できた累計、
 入力・cached入力・cache write入力・出力は確認できたfieldだけを持ち、未確認fieldを反復`null`で送らない。
-旧`usage_history`のSOL/TERRA/LUNA列は、同じmodel keyの保存済み値である場合だけ`legacy-unknown`として表示投影へ渡す。異なるkeyの値をgeneric modelへmergeせず、旧schemaにない内訳や未掲載modelを0・推測値で補わない。`models_complete=true`は同じ直接観測で全モデル集合を確定できた場合だけ許可し、`model_source=confirmed`と非nullの`models`を必要とする。保持ログから一部modelだけを回収した場合は欠損metadataを返し、数値を生成しない。clientは直接観測の掲載modelだけを通常線で表示し、その他の補完線はpresentation-onlyとする。
+旧`usage_history`のSOL/TERRA/LUNA列は、同じmodel keyの保存済み値である場合だけ`legacy-unknown`として表示投影へ渡す。異なるkeyの値をgeneric modelへmergeせず、旧schemaにない内訳や未掲載modelを0・推測値で補わない。`models_complete=true`は同じ直接観測で全モデル集合を確定できた場合だけ許可し、`model_source=confirmed`と非nullの`models`を必要とする。保持ログから一部modelだけを回収した場合は欠損metadataを返し、数値を生成しない。clientは直接観測または保存済みlossless `legacy-unknown`の掲載modelを実線で表示し、補間・hold・予測だけをpresentation-onlyの破線とする。
 
-Graphでgray idleを表示するclientはsame `reset_at`のperiod内で、両endpointが`confirmed`かつ`models_complete=true`、同じmodel key集合、
-全raw `total_tokens`のexact equal、finite raw Remainingのbitwise equal、gap/直接観測token値の矛盾なしを同時に要求する。ドルはtokenから得る派生表示値なのでidle判定へ入力しない。
-`legacy-unknown`、`unknown`、`unavailable`、補間・hold・smoothing・予測値はendpointまたは矛盾なしのidle authorityにしない。
-ただし完全directな同値endpoint間の数値なしmetadata rowとtimestamp sparsityだけは境界済み不変区間を否定しない。timestamp差からgapや利用を推測せず、上記条件を満たす連続10分以上のrunだけを
+Graphでgray idleを表示するclientはsame `reset_at`のperiod内で、run全体が`confirmed && models_complete=true`または保存済みlossless token vectorを持つ`legacy-unknown`であり、同じ非空model key集合、
+全raw `total_tokens`のexact equal、finite raw Remainingのbitwise equal、gap／欠測／token・Remaining異常なしを同時に要求する。ドルはtokenから得る派生表示値なのでidle判定へ入力しない。
+`unknown`、`unavailable`、補間・hold・smoothing・予測値はendpointまたは矛盾なしのidle authorityにしない。
+ただしexact 60秒の1 sampling slotだけが`unavailable`で、その前後がsame reset、同一model集合、全raw token／Remaining exact equalかつgapなしなら、そのrowをread-time表示入力から除外して境界済み不変区間を分断しない。2 slot以上、前後値またはmodel集合の相違、`unknown`、その他の不完全rowは分断する。timestamp sparsityだけからgapや利用を推測せず、上記条件を満たす連続10分以上のrunだけを
 gray表示し、同じ区間の全表示系列を1px水平実線にする。同じmodelのtoken不変runでドルだけが変化または欠測した場合は、DB/API rawを変更せずread-time表示を左端の有限ドル値へ水平補正する。短い水平線はgray表示せず通常実線のままとする。詳しい表示判定は`G137-GRAPH-01`に従う。
 
 `API-DEPRECATION-01`: `/v1/details`、`/v2/details`、全表示情報を一体化した`/v3/details`は互換adapterである。互換期間中は同じatomic generationから生成し、既存field、値型、header allowlistを変更しない。新clientはv3 split resourceを優先し、`/v3/current`がexact 404の場合だけ`/v3/details`、さらにexact 404の場合だけv2、v1へfallbackし、世代をmergeしない。廃止日は未決定であり、決定前に`Sunset`を送らない。将来の削除対象は旧details route、adapter、client fallbackだけで、Session collector、SQLite writer、domain model、`/health`は対象外とする。
@@ -331,7 +331,7 @@ exact `v2`とする。`history_samples`の各rowはv1の9キーに`model_source`
 | `reconstructed-from-session` | 全てnull | sessionからの復元であり、model key/sourceと欠損metadataだけを返す。モデル線・集計・idle判定には使わない |
 | `unknown` | 全てnull | 観測不明。model key/sourceと欠損metadataだけを返し、数値を推測しない |
 | `unavailable` | 全てnull | そのtimestampのlocal model値は未取得。freshな`remaining_percent`だけを保持でき、model数値は返さない。現行quota windowの先頭から最初のlocally-owned observationまでの未帰属provider観測もこのsourceで公開する |
-| `legacy-unknown` | 全て非null | provenance導入前またはv1 fallbackの保存済み同じmodel keyの値。表示投影だけに使い、集計・予測・idle判定には使わない |
+| `legacy-unknown` | 全て非null | provenance導入前またはv1 fallbackの保存済み同じmodel keyの値。集計・予測には使わず、`G137-5`の同一非空model集合・lossless token／Remaining完全不変・欠測／異常／gapなしをrun全体で満たす場合だけidle判定に利用できる |
 
 `confirmed`/`legacy-unknown`でmodel 6値の一部だけがnull、または`reconstructed-from-session`/`unknown`/`unavailable`で
 一つでも非nullのcandidateは全体rejectする。local取得失敗時に直前model vectorを新しいtimestampへ複製せず、quotaが取得できた場合だけ
