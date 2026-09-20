@@ -6,10 +6,11 @@
 //! is enabled and read back before any product query is issued.
 
 use codex_info_rest_contract::{
-    is_valid_public_model_name, ContractError, PublicDetailedModelUsage, PublicDetails,
-    PublicHistoryGap, PublicHistoryModelUsageV3, PublicHistoryObservation,
-    PublicHistoryObservationV3, PublicHistoryPeriod, PublicHistorySample, PublicModelCostV3,
-    PublicModelUsageV3, PublicQuota, PublicState, PublicThread, MAX_PUBLIC_MODELS_V3,
+    current_period_bounds, current_period_start_at, is_valid_public_model_name, ContractError,
+    PublicDetailedModelUsage, PublicDetails, PublicHistoryGap, PublicHistoryModelUsageV3,
+    PublicHistoryObservation, PublicHistoryObservationV3, PublicHistoryPeriod, PublicHistorySample,
+    PublicModelCostV3, PublicModelUsageV3, PublicQuota, PublicState, PublicThread,
+    MAX_PUBLIC_MODELS_V3,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
@@ -1209,6 +1210,7 @@ fn build_details_for_intervals(
     let observed_at = raw.iter().map(|row| row.timestamp).max().unwrap_or(0);
     let (current_reset_at, latest_quota_reset_at, window_seconds) =
         read_collection_config(connection)?;
+    let current_window_reset_at = latest_quota_reset_at.or(current_reset_at);
     let cutoff = observed_at.saturating_sub(HISTORY_WINDOW_SECONDS);
     let samples = if history_is_canonical {
         if raw.len() > MAX_HISTORY_ROWS {
@@ -1224,13 +1226,18 @@ fn build_details_for_intervals(
     } else {
         canonicalize_history_for_public_window(raw, current_reset_at, window_seconds)?
     };
-    let samples =
-        authoritative_history_projection_samples(samples, current_reset_at, window_seconds);
+    let samples = authoritative_history_projection_samples(
+        samples,
+        current_reset_at,
+        current_window_reset_at,
+        window_seconds,
+    );
     let quota_only_samples = if history_is_canonical {
         quota_only_history_projection_samples(
             all_history,
             raw,
             current_reset_at,
+            current_window_reset_at,
             window_seconds,
             observed_at,
             intervals,
@@ -1257,7 +1264,13 @@ fn build_details_for_intervals(
         samples.push(quota_only);
     }
     samples.sort_by_key(|sample| (sample.reset_at, sample.timestamp));
-    let mut periods = history_periods(&samples, observed_at, current_reset_at, window_seconds);
+    let mut periods = history_periods(
+        &samples,
+        observed_at,
+        current_reset_at,
+        current_window_reset_at,
+        window_seconds,
+    );
     clip_history_periods(&mut periods, intervals);
     let quota = latest_quota_reset_at
         .and_then(|latest_reset_at| {
@@ -1284,6 +1297,7 @@ fn build_details_for_intervals(
         intervals,
         quota_only_keys: &quota_only_keys,
         current_reset_at,
+        current_window_reset_at,
         window_seconds,
     };
     let history_samples_v3 = read_history_projection_for_intervals(
@@ -1295,7 +1309,7 @@ fn build_details_for_intervals(
         history_projection_context,
     )?;
     clip_history_periods(&mut periods, intervals);
-    assign_history_period_labels(&mut periods);
+    assign_history_period_labels(&mut periods, current_window_reset_at);
     let history_samples_v2 = history_observations_v2(&samples, &history_samples_v3);
     let history_samples_v1 = history_samples_v1(&history_samples_v2);
     let estimated_cost_label = format_estimated_cost(&models);
@@ -1844,6 +1858,7 @@ struct HistoryProjectionContext<'a> {
     intervals: &'a ReadIntervals,
     quota_only_keys: &'a BTreeSet<(i64, i64)>,
     current_reset_at: Option<i64>,
+    current_window_reset_at: Option<i64>,
     window_seconds: i64,
 }
 
@@ -2003,7 +2018,7 @@ fn read_history_projection_for_intervals(
         context.task_evidence,
         context.intervals,
     );
-    assign_history_period_labels(periods);
+    assign_history_period_labels(periods, context.current_window_reset_at);
     Ok(history.into_values().collect())
 }
 
@@ -2841,9 +2856,11 @@ fn history_model_usage_v3(
 }
 
 fn quota_period_start(reset_at: i64, window_seconds: i64) -> Option<i64> {
-    (window_seconds > 0)
-        .then(|| reset_at.checked_sub(window_seconds))
-        .flatten()
+    current_period_start_at(reset_at, window_seconds)
+}
+
+fn quota_period_minute_start(reset_at: i64, window_seconds: i64) -> Option<i64> {
+    quota_period_start(reset_at, window_seconds)
         .and_then(|start| start.div_euclid(60).checked_mul(60))
         .filter(|start| valid_public_timestamp(*start))
 }
@@ -2904,6 +2921,7 @@ fn quota_only_history_projection_samples(
     all_history: &[RawSample],
     owned_history: &[RawSample],
     current_reset_at: Option<i64>,
+    current_window_reset_at: Option<i64>,
     window_seconds: i64,
     observed_at: i64,
     intervals: &ReadIntervals,
@@ -2911,7 +2929,10 @@ fn quota_only_history_projection_samples(
     let Some(authority) = current_reset_at else {
         return Vec::new();
     };
-    let Some(authoritative_start) = quota_period_start(authority, window_seconds) else {
+    let Some(window_reset_at) = current_window_reset_at else {
+        return Vec::new();
+    };
+    let Some(authoritative_start) = quota_period_start(window_reset_at, window_seconds) else {
         return Vec::new();
     };
 
@@ -2919,7 +2940,7 @@ fn quota_only_history_projection_samples(
         .iter()
         .filter(|row| {
             row.timestamp >= authoritative_start
-                && row.timestamp <= authority
+                && row.timestamp <= window_reset_at
                 && row.timestamp <= observed_at
         })
         .map(|row| row.timestamp)
@@ -2942,7 +2963,7 @@ fn quota_only_history_projection_samples(
             continue;
         };
         if row.timestamp < authoritative_start
-            || row.timestamp > authority
+            || row.timestamp > window_reset_at
             || row.timestamp >= prefix_end
             || row.timestamp > observed_at
             || intervals.intersects_canonical_minute(row.timestamp)
@@ -2988,6 +3009,7 @@ fn quota_only_history_projection_samples(
 fn authoritative_history_projection_samples(
     samples: Vec<PublicHistorySample>,
     current_reset_at: Option<i64>,
+    current_window_reset_at: Option<i64>,
     window_seconds: i64,
 ) -> Vec<PublicHistorySample> {
     let Some(authority) = current_reset_at else {
@@ -3006,7 +3028,10 @@ fn authoritative_history_projection_samples(
     else {
         return samples;
     };
-    let Some(authoritative_start) = quota_period_start(authority, window_seconds) else {
+    let Some(window_reset_at) = current_window_reset_at else {
+        return samples;
+    };
+    let Some(authoritative_start) = quota_period_start(window_reset_at, window_seconds) else {
         return samples;
     };
 
@@ -3023,6 +3048,7 @@ fn history_periods(
     samples: &[PublicHistorySample],
     observed_at: i64,
     current_reset_at: Option<i64>,
+    current_window_reset_at: Option<i64>,
     window_seconds: i64,
 ) -> Vec<PublicHistoryPeriod> {
     let mut ranges = BTreeMap::<i64, (i64, i64)>::new();
@@ -3048,42 +3074,34 @@ fn history_periods(
             .max_by_key(|sample| (sample.timestamp, sample.reset_at))
             .map(|sample| sample.reset_at)
     });
+    let current_bounds = current_window_reset_at
+        .and_then(|reset_at| current_period_bounds(reset_at, window_seconds, observed_at));
     let mut periods = ranges
         .into_iter()
         .map(|(reset_at, (observed_start, observed_end))| {
             let is_current = Some(reset_at) == current;
-            let start_at = if is_current {
-                current_reset_at
-                    .and_then(|authority| quota_period_start(authority, window_seconds))
-                    .filter(|start| *start <= observed_start)
-                    .unwrap_or(observed_start)
+            let (start_at, end_at) = if is_current {
+                // The public current period is the exact quota observation
+                // window. Stored samples remain minute buckets and are not
+                // rewritten to manufacture these bounds.
+                current_bounds.unwrap_or((observed_start, observed_end.min(observed_at)))
             } else {
-                observed_start
+                (observed_start, observed_end.min(observed_at).min(reset_at))
             };
-            let mut end_at = observed_end.min(observed_at);
-            if is_current {
-                // Samples are canonicalized to minute starts, while the
-                // recorder's observed_at may retain event-level seconds.
-                // The contract's current-period end remains the exact
-                // quota/reset observation boundary.
-                end_at = reset_at.min(observed_at);
-            } else {
-                end_at = end_at.min(reset_at);
-            }
             PublicHistoryPeriod {
                 // The root UI uses the canonical reset instant as its period
                 // ID. Keep this stable numeric identity across REST and
                 // Windows selections; labels remain presentation text.
                 id: reset_at.to_string(),
                 start_at,
-                end_at: end_at.max(start_at),
+                end_at,
                 reset_at,
                 label: String::new(),
                 current: is_current || Some(reset_at) == fallback_current,
             }
         })
         .collect::<Vec<_>>();
-    assign_history_period_labels(&mut periods);
+    assign_history_period_labels(&mut periods, current_window_reset_at);
     // The Windows client treats period order as part of the wire contract:
     // newest starts must precede older starts.  Keep reset/id as deterministic
     // tie-breakers for clipped or same-minute periods.
@@ -3145,12 +3163,15 @@ fn clip_history_periods(periods: &mut Vec<PublicHistoryPeriod>, intervals: &Read
     });
 }
 
-fn assign_history_period_labels(periods: &mut [PublicHistoryPeriod]) {
+fn assign_history_period_labels(
+    periods: &mut [PublicHistoryPeriod],
+    current_window_reset_at: Option<i64>,
+) {
     for period in periods.iter_mut() {
         period.label = format_jst_period_label(
             period.start_at,
             if period.current {
-                period.reset_at
+                current_window_reset_at.unwrap_or(period.reset_at)
             } else {
                 period.end_at
             },
@@ -3523,10 +3544,8 @@ fn canonicalize_history_with_sources_and_limit(
             .min_by_key(|(_, group)| group.canonical_reset_at.abs_diff(authority))
             .map(|(index, _)| index)
     });
-    let theoretical_current_start = current_reset_at
-        .zip((window_seconds > 0).then_some(window_seconds))
-        .and_then(|(reset, window)| reset.checked_sub(window))
-        .map(|start| start - start.rem_euclid(60));
+    let theoretical_current_start =
+        current_reset_at.and_then(|reset_at| quota_period_minute_start(reset_at, window_seconds));
     let current_start = current_group.map(|index| {
         let observed_group_start = groups[index].start - groups[index].start.rem_euclid(60);
         theoretical_current_start
@@ -4545,10 +4564,12 @@ mod tests {
             .details
             .history_periods
             .first()
-            .expect("canonical history period");
+            .expect("current public period");
         assert_eq!(period.id, canonical_reset_at.to_string());
         assert_eq!(period.reset_at, canonical_reset_at);
-        assert_eq!(period.start_at, canonical_reset_at - quota.window_seconds);
+        assert!(period.current);
+        assert_eq!(period.start_at, quota.reset_at - quota.window_seconds);
+        assert_ne!(period.start_at, canonical_reset_at - quota.window_seconds);
         assert_eq!(
             snapshot.details.history_samples[0].reset_at,
             canonical_reset_at
@@ -5293,6 +5314,7 @@ mod tests {
             &all_history,
             &owned_history,
             Some(reset_at),
+            Some(reset_at),
             window_seconds,
             quota_start + 1_200,
             &intervals,
@@ -5331,6 +5353,7 @@ mod tests {
         let projected = quota_only_history_projection_samples(
             &all_history,
             &owned_history,
+            Some(reset_at),
             Some(reset_at),
             window_seconds,
             quota_start + 200,
@@ -5378,6 +5401,7 @@ mod tests {
             &samples,
             quota_start + 1_200,
             Some(reset_at),
+            Some(reset_at),
             window_seconds,
         );
         assert_eq!(periods.len(), 1);
@@ -5389,8 +5413,8 @@ mod tests {
     fn current_period_rehomes_transition_aliases_by_window_start() {
         let current_reset_at = 1_800_001_000_i64;
         let window_seconds = 3_600_i64;
-        let period_start =
-            quota_period_start(current_reset_at, window_seconds).expect("current period start");
+        let period_start = quota_period_minute_start(current_reset_at, window_seconds)
+            .expect("current period minute start");
         let stale_reset_at = current_reset_at - 86_400;
         let row = |timestamp: i64, reset_at: i64, tokens: u64| RawSample {
             timestamp,
@@ -5748,7 +5772,7 @@ mod tests {
                 luna_tokens: 30,
             },
         ];
-        let periods = history_periods(&samples, 1_800_000_120, None, 0);
+        let periods = history_periods(&samples, 1_800_000_120, None, None, 0);
         assert_eq!(periods[0].reset_at, 1_800_001_000);
         assert_eq!(periods[1].reset_at, 1_800_001_200);
         assert!(periods[0].start_at > periods[1].start_at);
@@ -5781,7 +5805,13 @@ mod tests {
             luna_tokens: 31,
         }];
         let observed_at = 1_800_000_123;
-        let periods = history_periods(&samples, observed_at, Some(1_800_001_000), 604_800);
+        let periods = history_periods(
+            &samples,
+            observed_at,
+            Some(1_800_001_000),
+            Some(1_800_001_000),
+            604_800,
+        );
         assert_eq!(periods.len(), 1);
         assert_eq!(periods[0].end_at, observed_at);
 
@@ -5802,8 +5832,10 @@ mod tests {
     fn current_period_uses_quota_boundary_without_publishing_pre_boundary_rows() {
         let reset_at = 1_800_001_000_i64;
         let window_seconds = 3_600_i64;
-        let quota_start =
-            quota_period_start(reset_at, window_seconds).expect("positive quota-window boundary");
+        let quota_start = quota_period_start(reset_at, window_seconds)
+            .expect("positive exact quota-window boundary");
+        let quota_minute_start = quota_period_minute_start(reset_at, window_seconds)
+            .expect("positive quota-window minute boundary");
         let sample = |timestamp, remaining_percent| PublicHistorySample {
             timestamp,
             reset_at,
@@ -5816,22 +5848,34 @@ mod tests {
             luna_tokens: 0,
         };
         let samples = vec![
-            sample(quota_start - 60, 100.0),
-            sample(quota_start + 120, 56.0),
+            sample(quota_minute_start - 60, 100.0),
+            sample(quota_minute_start + 120, 56.0),
         ];
-        let projected =
-            authoritative_history_projection_samples(samples, Some(reset_at), window_seconds);
+        let projected = authoritative_history_projection_samples(
+            samples,
+            Some(reset_at),
+            Some(reset_at),
+            window_seconds,
+        );
         assert_eq!(projected.len(), 1);
-        assert_eq!(projected[0].timestamp, quota_start + 120);
+        assert_eq!(projected[0].timestamp, quota_minute_start + 120);
 
-        let observed_at = quota_start + 120;
-        let mut periods = history_periods(&projected, observed_at, Some(reset_at), window_seconds);
+        let observed_at = quota_minute_start + 120;
+        let mut periods = history_periods(
+            &projected,
+            observed_at,
+            Some(reset_at),
+            Some(reset_at),
+            window_seconds,
+        );
         assert_eq!(periods.len(), 1);
         assert_eq!(periods[0].start_at, quota_start);
 
-        let intervals = ReadIntervals::new(vec![
-            ReadInterval::new(Some(quota_start + 120), None).expect("current interval")
-        ])
+        let intervals = ReadIntervals::new(vec![ReadInterval::new(
+            Some(quota_minute_start + 120),
+            None,
+        )
+        .expect("current interval")])
         .expect("lifecycle interval");
         clip_history_periods(&mut periods, &intervals);
         assert_eq!(periods.len(), 1);
@@ -5851,15 +5895,22 @@ mod tests {
 
         let unbounded_samples = authoritative_history_projection_samples(
             vec![
-                sample(quota_start - 60, 100.0),
-                sample(quota_start + 120, 56.0),
+                sample(quota_minute_start - 60, 100.0),
+                sample(quota_minute_start + 120, 56.0),
             ],
+            Some(reset_at),
             Some(reset_at),
             0,
         );
-        let fallback_periods = history_periods(&unbounded_samples, observed_at, Some(reset_at), 0);
+        let fallback_periods = history_periods(
+            &unbounded_samples,
+            observed_at,
+            Some(reset_at),
+            Some(reset_at),
+            0,
+        );
         assert_eq!(fallback_periods.len(), 1);
-        assert_eq!(fallback_periods[0].start_at, quota_start - 60);
+        assert_eq!(fallback_periods[0].start_at, quota_minute_start - 60);
     }
 
     #[test]
@@ -6445,7 +6496,7 @@ mod tests {
                 && sample.timestamp >= next_period_start
         }));
 
-        let periods = history_periods(&canonical, observed_at, None, 0);
+        let periods = history_periods(&canonical, observed_at, None, None, 0);
         assert_eq!(periods.len(), 3, "{periods:#?}");
         assert!(periods
             .iter()
@@ -6483,8 +6534,13 @@ mod tests {
             real_reset - 30,
         )
         .expect("current label fixture");
-        let current_periods =
-            history_periods(&current_samples, real_reset - 30, Some(real_reset), 3_600);
+        let current_periods = history_periods(
+            &current_samples,
+            real_reset - 30,
+            Some(real_reset),
+            Some(real_reset),
+            3_600,
+        );
         assert_eq!(current_periods.len(), 1);
         assert_eq!(current_periods[0].end_at, real_reset - 30);
         assert!(current_periods[0]
@@ -6663,15 +6719,29 @@ mod tests {
             .expect("corrected minute is retained");
         assert_eq!(selected.source_timestamp, duplicate_timestamp);
         assert_eq!(selected.source_reset_at, original_reset);
+        let public_start = quota_period_start(corrected_reset, 7 * 24 * 60 * 60)
+            .expect("exact public quota-window boundary");
+        let projected = authoritative_history_projection_samples(
+            canonical.clone(),
+            Some(corrected_reset),
+            Some(corrected_reset),
+            7 * 24 * 60 * 60,
+        );
+        assert_eq!(projected.len(), 2);
+        assert!(canonical[0].timestamp < public_start);
+        assert!(projected
+            .iter()
+            .all(|sample| sample.timestamp >= public_start));
         let periods = history_periods(
-            &canonical,
+            &projected,
             duplicate_timestamp + 60,
+            Some(corrected_reset),
             Some(corrected_reset),
             7 * 24 * 60 * 60,
         );
         assert_eq!(periods.len(), 1);
-        assert_eq!(periods[0].start_at, canonical[0].timestamp);
-        assert!(canonical.iter().all(|sample| {
+        assert_eq!(periods[0].start_at, public_start);
+        assert!(projected.iter().all(|sample| {
             periods
                 .iter()
                 .filter(|period| {

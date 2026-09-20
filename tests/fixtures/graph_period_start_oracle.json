@@ -9,7 +9,7 @@
   },
   "history_period": {
     "id": "1790410407",
-    "start_at": 1789805607,
+    "start_at": 1789821538,
     "end_at": 1789854360,
     "reset_at": 1790410407,
     "label": "wire label is not a display authority",
@@ -17,7 +17,7 @@
   },
   "history_samples": [
     {
-      "timestamp": 1789805667,
+      "timestamp": 1789821598,
       "reset_at": 1790410407,
       "remaining_percent": 100.0,
       "sol_dollars": 0.0,
