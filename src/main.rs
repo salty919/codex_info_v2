@@ -6494,8 +6494,7 @@ fn sampling_smoothed_values(
                 || *index == last
                 || preserved_timestamps.contains(&(timestamps[*index] as i64))
                 || preserved_indices.contains(index)
-                || (values[*index] != values[*index - 1]
-                    && values[*index] != values[*index + 1])
+                || (values[*index] != values[*index - 1] && values[*index] != values[*index + 1])
         })
         .collect::<Vec<_>>();
     let knot_timestamps = knot_indices
@@ -6512,7 +6511,10 @@ fn sampling_smoothed_values(
     timestamps
         .iter()
         .map(|timestamp| {
-            if let Some(knot) = knot_timestamps.iter().position(|candidate| candidate == timestamp) {
+            if let Some(knot) = knot_timestamps
+                .iter()
+                .position(|candidate| candidate == timestamp)
+            {
                 return knot_values[knot];
             }
             let right = knot_timestamps.partition_point(|candidate| candidate < timestamp);
@@ -6526,14 +6528,9 @@ fn sampling_smoothed_values(
             let left = right - 1;
             let fraction = (*timestamp - knot_timestamps[left])
                 / (knot_timestamps[right] - knot_timestamps[left]);
-            monotone_cubic_interval_values(
-                &knot_timestamps,
-                &knot_values,
-                left,
-                &[fraction],
-            )
-            .and_then(|projected| projected.into_iter().next())
-            .unwrap_or(knot_values[left])
+            monotone_cubic_interval_values(&knot_timestamps, &knot_values, left, &[fraction])
+                .and_then(|projected| projected.into_iter().next())
+                .unwrap_or(knot_values[left])
         })
         .collect()
 }
