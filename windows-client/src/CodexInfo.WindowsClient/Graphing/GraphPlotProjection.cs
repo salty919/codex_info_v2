@@ -1081,6 +1081,16 @@ internal static class GraphPlotProjection
                 .ToArray();
             var timestamps = indices.Select(index => scene.Timestamps[index]).ToArray();
             var runValues = indices.Select(index => values[index]).ToArray();
+            var preservedIndices = run
+                .SelectMany((interval, index) => interval.Dashed
+                    ? new[] { index, index + 1 }
+                    : Array.Empty<int>())
+                .ToHashSet();
+            runValues = SmoothSamplingPlateaus(
+                scene,
+                timestamps,
+                runValues,
+                preservedIndices);
             for (var interval = 0; interval < run.Length; interval++)
             {
                 AppendMonotoneCubicInterval(
@@ -1093,6 +1103,59 @@ internal static class GraphPlotProjection
             }
             runStart = runEnd;
         }
+    }
+
+    private static double[] SmoothSamplingPlateaus(
+        GraphScene scene,
+        IReadOnlyList<double> timestamps,
+        IReadOnlyList<double> values,
+        IReadOnlySet<int> preservedIndices)
+    {
+        if (timestamps.Count != values.Count || values.Count < 3)
+        {
+            return values.ToArray();
+        }
+
+        var last = values.Count - 1;
+        var knotIndices = Enumerable.Range(0, values.Count)
+            .Where(index =>
+                index == 0 ||
+                index == last ||
+                preservedIndices.Contains(index) ||
+                scene.IdleIntervals.Any(interval =>
+                    interval.StartAt == timestamps[index] ||
+                    interval.EndAt == timestamps[index]) ||
+                (values[index] != values[index - 1] &&
+                    values[index] != values[index + 1]))
+            .ToArray();
+        var knotTimestamps = knotIndices.Select(index => timestamps[index]).ToArray();
+        var knotValues = knotIndices.Select(index => values[index]).ToArray();
+        if (knotTimestamps.Length < 2)
+        {
+            return values.ToArray();
+        }
+
+        return timestamps.Select(timestamp =>
+        {
+            var knot = Array.IndexOf(knotTimestamps, timestamp);
+            if (knot >= 0)
+            {
+                return knotValues[knot];
+            }
+            var right = Array.FindIndex(knotTimestamps, candidate => candidate > timestamp);
+            if (right <= 0)
+            {
+                return right == 0 ? knotValues[0] : knotValues[^1];
+            }
+            var left = right - 1;
+            var fraction = (timestamp - knotTimestamps[left]) /
+                (knotTimestamps[right] - knotTimestamps[left]);
+            return EvaluateMonotoneCubicInterval(
+                knotTimestamps,
+                knotValues,
+                left,
+                [fraction])[0];
+        }).ToArray();
     }
 
     private static void AppendSmoothedModelRuns(
