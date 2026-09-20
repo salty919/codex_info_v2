@@ -302,12 +302,13 @@ owner文書が他領域の契約を必要とする場合は、その契約を複
 aliasを返していても現行periodへcanonicalizeする。rawのsource reset/timestampはprovenanceとして保持し、
 同一minuteの相反値は値を合成せず除外する。現行period外およびcompleted periodは従来のcanonical
 reset authorityを使い、account lifecycleや外部利用を推測してmodel数値を付け替えない。
-現行periodの先頭から最初のlocally-owned observationまでに保存された`remaining_percent`は、accountがその区間の
-Session/modelを所有した証拠がない場合でもprovider-levelの未帰属quota観測として履歴へ保持する。該当rowは
-`model_source=unavailable`、model数値なしで公開し、GraphのRemainingだけを破線の参考線として描画する。
-quota-window開始時点より前に終了したlifecycle intervalはこのprefixを隠さず、`A→B→A`の再入場でも再入場直前までを
-表示対象とする。一方、lifecycle intervalがquota-window開始を所有する場合、または再入場境界を一意に決められない場合は
-fail-closedでprefixを推測しない。未帰属quotaを特定modelの消費へ付け替えたり、model 0へ補完したりしない。
+現行periodの先頭から最初のlocally-owned model observationまでに保存されたfiniteな`remaining_percent`も、providerから
+直接取得したraw quota観測として元時刻・元値のまま履歴へ保持する。Session/model ownershipを確認できないrowは
+`model_source=unavailable`、model数値なしで公開するが、そのmetadataだけでraw Remainingを欠損または予測へ降格させない。
+有効なraw Remainingは他のraw anchorと同じ3px実線のauthorityであり、raw-null、競合、範囲外、明示gapまたは棄却異常だけを
+1px破線にする。quota-window開始前のlifecycle interval、`A→B→A`の再入場、task activityはいずれもraw quotaを隠したり
+線種・形状を変更したりしない。ownershipまたは再入場境界を一意に決められない場合はmodel帰属だけをfail-closedとし、raw
+quotaを特定modelの消費へ付け替えたり、model 0へ補完したりしない。
 
 1. `G137-1`: 選択期間の全accepted pageに実際に掲載された`models[].model`の和集合を
    model universe `U`とする。model名はexact wire stringをUTF-8 unsigned byte列の
@@ -335,14 +336,16 @@ fail-closedでprefixを推測しない。未帰属quotaを特定modelの消費�
    rejected値の期間は直前baselineを細い破線holdし、accepted recoveryへ細い破線で接続する。period endまで復帰が
    なければ同じbaselineを終端まで破線holdする。これをraw tokenとraw dollarへ独立に適用し、tokenだけ異常なら
    token線だけ、dollarだけ異常ならdollar線だけを破線にする。他metricと他modelのaccepted実測は保持する。
-   idle判定の根拠は`Direct`のraw値だけとし、task lifecycleがactive、confirmed gap、または直接観測値の矛盾・異常が
-   ある区間はidle不可とする。補間、hold、smoothing、予測、`legacy-unknown`はidleの根拠にしない。
+   idle判定の根拠は`Direct`のraw値だけとし、confirmed gap、欠測、または直接観測値の矛盾・異常がある区間は
+   idle不可とする。task lifecycleは値変化の代替証拠にせず、Direct値がexact equalの区間をactive metadataだけで
+   使用済みへ変更しない。補間、hold、smoothing、予測、`legacy-unknown`はidleの根拠にしない。
    period境界だけが新しい0起点を許し、period内補正を垂直落下または低い新lineageとして表示しない。
 4. `G137-4`: 同じmodel keyが両endpointに直接観測され、当該表示metricの
    異常またはrecorder gapを跨がない区間だけを、そのmodelのcontiguous measuredとする。他modelの出現／消失、
    `confirmed`同士の共通modelはmodel集合の完全性だけを理由にこの区間を破線化しない。`legacy-unknown`が一方でも
    含まれる区間は表示専用で、連続実測・集計・idle authorityにはしない。正常な直接観測endpoint間はtimestamp差だけで
-   欠損へ降格せず、同値を細い実線、増加を太い実線で結ぶ。当該modelの明示的欠測、後退／回復、confirmed recorder gap、bounded／terminal holdは既知endpoint間を細い
+   欠損へ降格せず、同値・増加とも同じ3px実線で結ぶ。連続する有効anchor列は各anchorをexactに通り、区間内で単調かつ
+   overshootしないPCHIP（Fritsch–Carlson）で滑らかにつなぐ。当該modelの明示的欠測、後退／回復、confirmed recorder gap、bounded／terminal holdは既知endpoint間を1pxの
    破線で連続補完する。補間・holdはUI presentation-onlyで、API/DBへ書き戻さず、直接観測または集計・idleの
    根拠へ昇格させない。
    period endはaccepted periods resourceの同じpairにあるexact `end_at`とし、currentか
@@ -351,25 +354,24 @@ fail-closedでprefixを推測しない。未帰属quotaを特定modelの消費�
    より前は創作せず、accepted値が0点のmodelは線・右端labelを、全modelが0点なら未使用帯も作らない。
    最終accepted point後は長さを問わずperiod endまで細い破線holdとする。破線は予測表示であり、それ単独では
    未使用の証拠にしない。
-   model集合変更は、未掲載または新規model自身の線と、その区間のRemaining低下のtoken帰属および未使用判定にだけ
-   反映する。集合変更区間でも共通modelのaccepted値は実線を維持し、raw Remainingの両endpointがacceptedかつ同値なら
+   model集合変更は、未掲載または新規model自身の線と未使用判定にだけ反映し、Remainingの形状・線種には反映しない。
+   集合変更区間でも共通modelのaccepted値は実線を維持し、raw Remainingの両endpointがacceptedなら
    Remainingも実線を維持する。`source_mismatch`は欠測または利用不能という主原因があるbridgeの補助理由に限定する。
 5. `G137-5`: idle判定はsame `reset_at`のperiod内でのみ行う。両endpointに同じmodel key集合が揃い、両方が
    `model_source=confirmed`かつ`models_complete=true`であり、全modelのraw `total_tokens`がexact equal、raw
-   `remaining_percent`がfiniteかつbitwise equalで、task active、confirmed gap、直接観測値の矛盾がないことを必須とする。
+   `remaining_percent`がfiniteかつbitwise equalで、confirmed gap、欠測、直接観測値の矛盾がないことを必須とする。
    `legacy-unknown`、`unknown`、`unavailable`、欠損・補間・hold・smoothing・予測値をendpointまたは矛盾なしの証拠にはせず、
-   false/nullのmetadataも非activeの証明へ変換しない。ただし、完全directな同値endpoint間に、数値を持たず
-   `task_active_since_previous=false`の`unavailable` rowが正確に1件だけあり、前後が1分cadenceの同じdirect model集合で
-   境界づけられる場合は、そのrowをidle authorityの中立的な欠測として橋渡しできる（表示線は破線のまま）。連続または
-   複数の`unavailable`、active/unknown、その他の不完全rowは候補を分断する。rowのtimestamp不連続だけはgapまたは利用の証拠にせず、正常なdirect endpointが上記条件を満たすintervalを分断しない。上記条件を満たす連続runが10分以上の場合だけ、その
+   lifecycle metadataを値変化または非変化のauthorityにしない。単発を含む`unavailable`、unknown、その他の不完全rowは
+   候補を分断する。rowのtimestamp不連続だけはgapまたは利用の証拠にせず、正常なdirect endpointが上記条件を満たすintervalを分断しない。上記条件を満たす連続runが10分以上の場合だけ、その
    run全体をsession-levelのidle bandとして表示する。10分未満のrun、cadenceの数や観測点数だけでの確定、direct endpointを
    欠く欠測時間だけのbridgeはidleへ昇格しない。画面幅やpixel数によって閾値を変えない。
    画面幅、pixel丸め、gridまたはsegment境界を理由にbandを削除・周期分断しない。
 
    periodの和集合`U`に存在しても両endpointで未掲載のmodelはその区間へ創作しない。ドル値・単価・丸めは
-   未使用判定へ一切使用しない。token増加、片endpointだけのmodel欠落、model集合変更、（上記の単発中立欠測を除く）unavailable、confirmed gap、
-   token異常、Remaining変化、Remaining anomaly／terminal hold、task lifecycleのactiveは未使用へ
-   読み替えない。Remainingがraw-nullまたは理論配分の区間は、finite raw Remainingがないためidle候補にできない。
+   未使用判定へ一切使用しない。token増加、片endpointだけのmodel欠落、model集合変更、unavailable、confirmed gap、
+   token異常、Remaining変化、Remaining anomaly／terminal holdは未使用へ読み替えない。task lifecycleのactiveだけを
+   使用の証拠にはせず、上記のexact equalなDirect値による判定を変更しない。Remainingがraw-nullまたは予測値の区間は、
+   finite raw Remainingがないためidle候補にできない。
    lifecycle unknownだけでは他の完全な証拠をidleへ昇格しない。
    これらは当該局所区間だけを除外し、前後の独立した候補まで棄却しない。
 6. `G137-6`: non-nullでfiniteな0..100のRemainingをraw観測として元時刻に保持し、繰返しrawを
@@ -381,30 +383,25 @@ fail-closedでprefixを推測しない。未帰属quotaを特定modelの消費�
    raw証拠は保持するが、表示は直前baselineを破線holdする。period endまで復帰しなければ同じbaselineを終端まで
    破線holdする。このRemaining anomalyとrecovery bridgeは未使用の証拠にしない。
 
-   Remaining表示は生の階段をそのまま正規線にせず、前回のaccepted raw変化anchorから次の低いaccepted raw
-   anchorまでを一つの配分spanとする。span内の全隣接intervalで、model universe全体のaccepted finite
-   `total_tokens`が両端に`Direct`として揃い、単調非減少であれば、dropを各intervalの全model token増分合計へ
-   比例配分する。token増分0のintervalはexactに水平とする。これはUI上の表示配分であり、API/DBの値を変更しない。
-   途中の同値raw観測は証拠として保持するが、新しい変化anchorにはしない。period-wide `U`の未掲載値を補完せず、
-   token anomalyまたはhard breakを有効なtoken差分へ採用しない。補間、hold、smoothing、elapsed比bridgeは全て
-   presentation-onlyで、集計やidleの根拠にしない。
+   Remainingのaccepted raw値は全て有効anchorとして元時刻・元値を保持し、token増分、task lifecycle、model availabilityで
+   中間raw値を移動または置換しない。連続するaccepted raw anchor列は各anchorをexactに通り、非増加かつovershootしない
+   PCHIP（Fritsch–Carlson）を3px実線として描画する。これはread-timeのgeometry生成だけであり、DB、history row、
+   gap ledger、raw値を書き換えない。timestampの疎またはsampling jitterだけでは欠損・予測へ降格しない。
 
-   `Interpolated` endpointを含むintervalは表示専用の破線とし、理論token増分をAPI/DBへ書き戻さない。`Held`、
-   `Rejected`、hard breakまたはendpoint不存在でtoken増分自体が不明なintervalは集計から除外し、必要なbridgeは
-   presentation-onlyで描画する。span全体のtoken増分が0なのにRemainingが低下する矛盾ではidleを主張せず、span全体を
-   不確実な表示bridgeとする。token証拠が完全なspanで各timestampにaccepted raw Remainingがある場合でも、
-   `ActivitySmoothed`はUI表示名に留め、raw値・Direct値をAPI/DBへ置換しない。
-   raw-nullの中間点または`Interpolated` tokenを使用したintervalだけを`Interpolated`の破線とする。
+   raw-null、`Held`、`Rejected`、明示的unavailableまたはconfirmed gapを含む区間だけを予測とし、両側のaccepted raw
+   anchor間は同じ単調補間geometryを1px破線で描く。予測した中間値を新しいanchorへ昇格しない。token anomalyや
+   task activityはRemainingの形状・配分・線種を決めない。明示reset/correctionではspline runを分割し、境界を跨いで
+   滑らかにつながない。
    raw Remaining labelは変更しない。Remaining anomalyを跨ぐdropは配分せず、既知endpoint間を破線bridgeして
    未使用帯を作らない。右anchorなしのterminal nullは直前effectiveを
    carryする。accepted raw Remainingが1点以上あれば、最後のeffective pointからexact period endまでを長さに
    関係なく時間幅のある破線holdとし、空白や同一X座標の垂直落下を作らない。`Remaining`のeffective値から
    model系列の値またはそのperiod tailを外挿しない。
-7. `G137-7`: model線は`Direct`同士のexact値の増加を太い実線、不変を細い実線とし、timestamp差だけでは破線化しない。途中に
-   当該modelのunknown rowがあるnearest-finite接続、raw-null補間点の両側、unattributed quota drop、
-   monotonic hold、bounded/terminal hold、synthetic tailは破線とする。raw quota同値のcontiguous区間は
-   model availabilityと独立した実測実線である。`G137-6`の`ActivitySmoothed`はraw観測とtoken証拠を持つ
-   実測実線であり、raw-nullの`Interpolated`だけを欠測破線とする。model線は当該modelの当該表示metric anomaly、Remaining線はRemaining
+7. `G137-7`: model線は`Direct`同士のexact値の増加・不変を同じ3px実線とし、timestamp差だけでは破線化しない。正常な
+   有効anchor列は各anchorを通る単調PCHIPで滑らかにつなぎ、sampling由来の段差を描画geometryへ固定しない。途中に
+   当該modelのunknown rowがあるnearest-finite接続、raw-null補間点の両側、
+   monotonic hold、bounded/terminal hold、synthetic tailは1px破線とする。raw quota同値のcontiguous区間は
+   model availabilityと独立した実測実線である。raw-nullの`Interpolated`だけを欠測破線とする。model線は当該modelの当該表示metric anomaly、Remaining線はRemaining
    anomaly、全線はgapを跨ぐ区間だけを破線bridgeとし、別metricのanomalyを正常線へ波及させない。右端model
    labelは最後のaccepted raw model値を表示し、実測0を未掲載と同一視して隠さない。Remaining labelは最後の
    raw観測時刻におけるeffective値を表示する。
@@ -438,7 +435,7 @@ parse済みでtimestamp重複なしとして次の相対offsetを固定する。
 | offset | model evidence | `models_complete`,`model_source` | raw Remaining | `task_active_since_previous` | 固定期待 |
 | ---: | --- | --- | ---: | --- | --- |
 | 0 | `V4`の`SOL:(10,0.000010)`版 | `true,confirmed` | 90 | `null` | 最初のaccepted point。0から線を創作しない |
-| 60 | 同上 | `true,confirmed` | 90 | `true` | 単発token不変の細い実線。activeなので未使用帯にはしない |
+| 60 | 同上 | `true,confirmed` | 90 | `true` | 値不変の3px実線。active metadata単独は利用証拠にせず、この1分区間は10分閾値未満なので未使用帯にはしない |
 | 120 | `V4` | `true,confirmed` | 89 | `true` | token増加かつquota低下。`[60,120]`はactive |
 | 180 | `V3` | `false,legacy-unknown` | 89 | `false` | model集合変更／不完全vector。未使用帯なし |
 | 240 | `V3` | `false,legacy-unknown` | 89 | `false` | complete/reliable全vectorでないため未使用帯なし |
@@ -451,20 +448,21 @@ parse済みでtimestamp重複なしとして次の相対offsetを固定する。
 
 このliteral oracleの期待する未使用帯は`[]`である。明示的な`false`があっても、same `reset_at`、両endpointの
 `confirmed`＋`models_complete=true`、同じmodel key集合、全raw tokenのexact equal、finite raw Remainingのbitwise equal、
-active／confirmed gap／直接観測値の矛盾なしが全て揃わない区間は帯にしない。legacy-unknownの保存値は表示専用で、集計・予測・idleへ使わない。
+confirmed gap／欠測／直接観測値の矛盾なしが全て揃わない区間は帯にしない。active metadataだけは値変化の証拠にしない。
+legacy-unknownの保存値は表示専用で、集計・予測・idleへ使わない。
 空白区間と`x1 == x2`のsegmentは0件とする。明示的な欠測endpointはgrayでbridgeしないが、正常なdirect endpoint間のtimestamp sparsityだけでは実線またはidle bandを分断しない。
 追加反例として、同じドル値でもtokenが`100→101`かつdollarが`1.00→1.00`、accepted Remainingが局所的に
 `90→89`、tokenのisolated pulse、confirmed gapを跨ぐ同値endpointはいずれも未使用0件とする。棄却されるRemaining
 isolated pulseはtoken不変runを消さない。tokenとRemainingが同値でdollarだけ`1.00→0.99→1.00`のisolated pulseなら、
-dollar線だけを破線hold／recovery、直接観測のtoken線を細い実線、未使用帯を表示する。逆にtokenだけ`100→90→100`ならdollarが
+dollar線だけを破線hold／recovery、直接観測のtoken線を3px実線、未使用帯を表示する。逆にtokenだけ`100→90→100`ならdollarが
 同値でもtoken線だけを破線にして未使用帯を表示しない。
-quota smoothing oracleは、時系列tokenが`10,20,20,50`（interval deltaが`10,0,30`）、raw Remainingが
-`100,100,100,99`なら表示Remainingを`100,99.75,99.75,99`とする。dropの形はtoken増分比だけで定め、
-token増分0のintervalはexactに水平とする。span内に不完全・矛盾するintervalが1つでもある、または総token deltaが0なら、
-token量と秒数を混在させずspan全体をelapsed比で補間し、全中間点を破線とする。
-`correction_v2`の先頭drop（`1660..5260`、73→70、3600秒）はwhole-span elapsed fallbackで、
-`remaining_values`を`[73.0,72.95,72.9,70.0]`とし、中間全区間を`Interpolated`の
-破線にする。`Remaining`からmodel系列のtailを外挿しない。
+valid-anchor smoothing oracleは、時系列tokenが`10,20,20,50`でraw Remainingが`100,100,100,99`なら、
+effective anchorも`100,100,100,99`のまま保持し、token列またはtask lifecycleを変えても同一geometryとする。
+正常区間は全raw anchorを通る3px単調PCHIP、明示欠損を挟む区間だけを1px破線予測とする。
+`correction_v2`は直接観測されたraw Remainingを元時刻のanchorとして保持し、terminal holdを含む
+`remaining_values`を`[73.0,73.0,73.0,70.0,70.0,62.0,62.0]`とする。model累積値の後退・回復を
+Remainingの配分または線種へ波及させず、直接観測anchor間は3px実線PCHIP、最後のraw anchorからperiod endだけを
+1px破線holdとする。`Remaining`からmodel系列のtailを外挿しない。
 
 ## グラフ表示への参照
 

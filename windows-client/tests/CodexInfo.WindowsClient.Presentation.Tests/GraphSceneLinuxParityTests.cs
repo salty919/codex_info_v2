@@ -50,7 +50,7 @@ public sealed class GraphSceneLinuxParityTests
     }
 
     [Fact]
-    public void HiddenModelsRemainQuotaSmoothingAuthorityAcrossUnequalIntervals()
+    public void RemainingNullInterpolationIsIndependentOfHiddenModelActivity()
     {
         var samples = new[]
         {
@@ -68,7 +68,7 @@ public sealed class GraphSceneLinuxParityTests
             confirmedGaps: null,
             hiddenModelNames: new HashSet<string>(StringComparer.Ordinal) { "TERRA" });
 
-        Assert.Equal([100d, 90d, 90d, 70d], full.Remaining);
+        Assert.Equal([100d, 94d, 88d, 70d], full.Remaining);
         Assert.Equal(full.Remaining, hidden.Remaining);
     }
 
@@ -122,7 +122,7 @@ public sealed class GraphSceneLinuxParityTests
     }
 
     [Fact]
-    public void LegacyUnknownRowsAreDisplayOnlyDashedAndCannotAttributeQuota()
+    public void LegacyUnknownRowsDoNotBecomeModelAnchorsOrQuotaAuthorities()
     {
         var samples = new[]
         {
@@ -147,10 +147,10 @@ public sealed class GraphSceneLinuxParityTests
         var modelLines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
         Assert.Empty(modelLines.Flat.X);
         Assert.Empty(modelLines.Rising.X);
-        Assert.Equal([1_000d, 1_060d], modelLines.Dashed.X);
+        Assert.Empty(modelLines.Dashed.X);
         var remainingLines = GraphPlotProjection.BuildRemainingLines(scene);
-        Assert.Empty(remainingLines.Solid.X);
-        Assert.Equal([1_000d, 1_060d], remainingLines.Dashed.X);
+        Assert.Equal([1_000d, 1_060d], remainingLines.Solid.X);
+        Assert.Empty(remainingLines.Dashed.X);
     }
 
     [Theory]
@@ -180,7 +180,7 @@ public sealed class GraphSceneLinuxParityTests
     }
 
     [Fact]
-    public void IdleUsesRawDirectVectorsAndIgnoresDisplayEstimatedRows()
+    public void IdleUsesRawDirectVectorsAndSplitsAtDisplayEstimatedRows()
     {
         var direct = Enumerable.Range(0, 31)
             .Select(minute => V3Sample(
@@ -203,7 +203,10 @@ public sealed class GraphSceneLinuxParityTests
             .Concat(direct.Skip(15))
             .ToArray();
         Assert.Equal(
-            expected,
+            [
+                new GraphIdleInterval(1_000, 1_840, false),
+                new GraphIdleInterval(1_900, 2_800, false),
+            ],
             GraphScene.Create(withEstimatedRow, GraphMetric.Dollars, 1_000, 2_800).IdleIntervals);
 
         var dollarOnlyChange = direct
@@ -251,7 +254,7 @@ public sealed class GraphSceneLinuxParityTests
     }
 
     [Fact]
-    public void IdleBridgesOneInactiveUnavailableMinuteBetweenDirectEndpoints()
+    public void IdleRejectsOneUnavailableMinuteBetweenDirectEndpoints()
     {
         var samples = Enumerable.Range(0, 11)
             .Select(minute => minute == 5
@@ -273,9 +276,7 @@ public sealed class GraphSceneLinuxParityTests
                 : V3Sample(1_000 + minute * 60, 90, Model("SOL", 10, 1), Model("TERRA", 0, 0)))
             .ToArray();
 
-        Assert.Equal(
-            [new GraphIdleInterval(1_000, 1_600, false)],
-            GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_600).IdleIntervals);
+        Assert.Empty(GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 1_600).IdleIntervals);
     }
 
     [Fact]
@@ -329,14 +330,14 @@ public sealed class GraphSceneLinuxParityTests
 
         Assert.Equal(
             [
-                new GraphIdleInterval(1_000, 2_200, false),
+                new GraphIdleInterval(1_360, 2_200, false),
                 new GraphIdleInterval(2_320, 3_040, false),
             ],
             GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 3_040).IdleIntervals);
     }
 
     [Fact]
-    public void ActiveMinuteSplitsTenMinuteIdleBands()
+    public void ActiveMetadataAloneDoesNotSplitExactIdle()
     {
         var samples = Enumerable.Range(0, 22)
             .Select(minute => V3Sample(1_000 + minute * 60, 90, Model("SOL", 10, 1)) with
@@ -346,10 +347,7 @@ public sealed class GraphSceneLinuxParityTests
             .ToArray();
 
         Assert.Equal(
-            [
-                new GraphIdleInterval(1_000, 1_600, false),
-                new GraphIdleInterval(1_660, 2_260, false),
-            ],
+            [new GraphIdleInterval(1_000, 2_260, false)],
             GraphScene.Create(samples, GraphMetric.Dollars, 1_000, 2_260).IdleIntervals);
     }
 
@@ -381,7 +379,7 @@ public sealed class GraphSceneLinuxParityTests
     }
 
     [Fact]
-    public void ActivitySmoothedRawQuotaRemainsAMeasuredSolidSegment()
+    public void ValidRawQuotaRemainsAMeasuredSolidSegment()
     {
         var samples = new[]
         {

@@ -23,9 +23,7 @@ internal readonly record struct GraphConfirmedGap(long StartAt, long EndAt);
 internal enum GraphRemainingOrigin
 {
     Missing,
-    ResetBoundary,
     Raw,
-    ActivitySmoothed,
     Interpolated,
     BoundedNullHold,
     TerminalNullHold,
@@ -57,8 +55,6 @@ public sealed class GraphScene
     // flat intervals establish a candidate, but ordinary short publication
     // pauses must remain part of the foreground timeline.
     private const long SustainedUnusedMinimumSeconds = 10 * 60;
-    private const long WeeklyQuotaWindowSeconds = 7 * 24 * 60 * 60;
-    private const long ResetAtToleranceSeconds = 60;
 
     private GraphScene(
         long periodStartAt,
@@ -75,7 +71,6 @@ public sealed class GraphScene
         IReadOnlyDictionary<string, IReadOnlyList<bool>> modelReliability,
         IReadOnlyDictionary<string, IReadOnlyList<bool>> tokenReliability,
         IReadOnlyDictionary<string, IReadOnlyList<bool>> modelLineReliability,
-        IReadOnlyDictionary<string, IReadOnlyList<bool>> tokenWeightability,
         IReadOnlyList<IReadOnlySet<string>> publishedModelNames,
         bool[] modelVectorAvailable,
         bool[] modelSynthetic,
@@ -104,7 +99,6 @@ public sealed class GraphScene
         ModelReliability = modelReliability;
         TokenReliability = tokenReliability;
         ModelLineReliability = modelLineReliability;
-        TokenWeightability = tokenWeightability;
         PublishedModelNames = publishedModelNames;
         ModelVectorAvailable = modelVectorAvailable;
         ModelSynthetic = modelSynthetic;
@@ -153,8 +147,6 @@ public sealed class GraphScene
     internal IReadOnlyDictionary<string, IReadOnlyList<bool>> TokenReliability { get; }
 
     internal IReadOnlyDictionary<string, IReadOnlyList<bool>> ModelLineReliability { get; }
-
-    internal IReadOnlyDictionary<string, IReadOnlyList<bool>> TokenWeightability { get; }
 
     internal IReadOnlyList<IReadOnlySet<string>> PublishedModelNames { get; }
 
@@ -208,7 +200,6 @@ public sealed class GraphScene
             new Dictionary<string, IReadOnlyList<bool>>(StringComparer.Ordinal),
             new Dictionary<string, IReadOnlyList<bool>>(StringComparer.Ordinal),
             new Dictionary<string, IReadOnlyList<bool>>(StringComparer.Ordinal),
-            new Dictionary<string, IReadOnlyList<bool>>(StringComparer.Ordinal),
             [],
             [],
             [],
@@ -254,7 +245,6 @@ public sealed class GraphScene
 
         var start = periodStartAt >= 0 ? periodStartAt : samples[0].Timestamp;
         var end = periodEndAt > start ? periodEndAt : Math.Max(start + 1, samples[^1].Timestamp);
-        var periodStartIsQuotaResetBoundary = IsPeriodStartQuotaResetBoundary(samples, start);
         var normalizedGaps = confirmedGaps is null
             ? Array.Empty<GraphConfirmedGap>()
             : confirmedGaps
@@ -278,15 +268,13 @@ public sealed class GraphScene
                 .ToArray();
         // Semantic evidence is derived from the complete published model
         // universe. A visibility toggle is a rendering concern only: hidden
-        // models still participate in token activity, quota attribution,
-        // idle detection, and completeness/correction evidence.
+        // models still participate in exact token and idle evidence.
         var dollarProjection = BuildAcceptedModelProjection(samples, allModelNames, GraphMetric.Dollars);
         var tokenProjection = BuildAcceptedModelProjection(samples, allModelNames, GraphMetric.Tokens);
         var semanticProjection = metric == GraphMetric.Dollars
             ? dollarProjection
             : tokenProjection;
         var displayProjection = semanticProjection.Filter(displayModelNames);
-        var activityTokenProjection = ActivityRelevantTokenProjection(tokenProjection);
         var publishedModelNames = samples
             .Select(sample => (IReadOnlySet<string>)(sample.IsSyntheticTail ||
                 sample.ModelSource is ApiHistorySample.UnavailableModelSource or
@@ -337,25 +325,10 @@ public sealed class GraphScene
                 modelDataAvailable,
                 modelDataAvailable,
                 sample.IsSyntheticTail,
-                ResetBoundary: IsResetBoundaryPoint(sample, start),
                 TaskActiveSincePrevious: sample.TaskActiveSincePrevious);
         }
 
-        var remainingProjection = BuildEffectiveRemainingWithOrigins(
-            points,
-            activityTokenProjection.Values,
-            activityTokenProjection.Reliability,
-            activityTokenProjection.Weightability,
-            publishedModelNames,
-            normalizedGaps,
-            tokenCorrectionStarts,
-            CanReconstructResetBoundary(
-                points,
-                start,
-                activityTokenProjection.Values,
-                activityTokenProjection.Reliability,
-                normalizedGaps,
-                periodStartIsQuotaResetBoundary));
+        var remainingProjection = BuildEffectiveRemainingWithOrigins(points);
         var effectiveRemaining = remainingProjection.Values;
         var timestamps = points.Select(point => (double)point.Timestamp).ToArray();
         var observedRemainingValues = points
@@ -393,11 +366,10 @@ public sealed class GraphScene
             luna,
             astra,
             modelSeries,
-            activityTokenProjection.Values,
+            tokenProjection.Values,
             displayProjection.Reliability,
-            activityTokenProjection.Reliability,
+            tokenProjection.Reliability,
             displayProjection.LineReliability,
-            activityTokenProjection.Weightability,
             publishedModelNames,
             modelVectorAvailable,
             modelSynthetic,
@@ -442,7 +414,6 @@ public sealed class GraphScene
         var values = new Dictionary<string, IReadOnlyList<double>>(StringComparer.Ordinal);
         var reliability = new Dictionary<string, IReadOnlyList<bool>>(StringComparer.Ordinal);
         var lineReliability = new Dictionary<string, IReadOnlyList<bool>>(StringComparer.Ordinal);
-        var weightability = new Dictionary<string, IReadOnlyList<bool>>(StringComparer.Ordinal);
         var origins = new Dictionary<string, IReadOnlyList<GraphModelOrigin>>(StringComparer.Ordinal);
         var correctionStartsByModel = new Dictionary<string, IReadOnlySet<long>>(StringComparer.Ordinal);
         var correctionStarts = new HashSet<long>();
@@ -469,8 +440,6 @@ public sealed class GraphScene
                 var middle = raw[index];
                 var right = raw[index + 1];
                 isolated[index] =
-                    samples[index].Timestamp - samples[index - 1].Timestamp == 60 &&
-                    samples[index + 1].Timestamp - samples[index].Timestamp == 60 &&
                     !samples[index - 1].IsSyntheticTail &&
                     !samples[index].IsSyntheticTail &&
                     !samples[index + 1].IsSyntheticTail &&
@@ -617,7 +586,6 @@ public sealed class GraphScene
                 }
             }
 
-            ShapeInferredModelSeriesByTaskActivity(samples, accepted, acceptedOrigins);
             NormalizeMonotonicDisplaySeries(
                 samples,
                 accepted,
@@ -630,13 +598,9 @@ public sealed class GraphScene
             var acceptedLineReliability = acceptedOrigins
                 .Select(ModelOriginLineIsExact)
                 .ToArray();
-            var acceptedWeightability = acceptedOrigins
-                .Select(ModelOriginDisplayWeightable)
-                .ToArray();
             values[name] = accepted;
             reliability[name] = acceptedReliability;
             lineReliability[name] = acceptedLineReliability;
-            weightability[name] = acceptedWeightability;
             origins[name] = acceptedOrigins;
             correctionStartsByModel[name] = modelCorrectionStarts;
         }
@@ -644,7 +608,6 @@ public sealed class GraphScene
             values,
             reliability,
             lineReliability,
-            weightability,
             origins,
             correctionStartsByModel,
             correctionStarts);
@@ -693,95 +656,11 @@ public sealed class GraphScene
         }
     }
 
-    private static void ShapeInferredModelSeriesByTaskActivity(
-        IReadOnlyList<ApiHistorySample> samples,
-        double[] values,
-        GraphModelOrigin[] origins)
-    {
-        var anchors = Enumerable.Range(0, samples.Count)
-            .Where(index => ModelOriginLineIsExact(origins[index]))
-            .ToArray();
-        for (var anchor = 1; anchor < anchors.Length; anchor++)
-        {
-            var left = anchors[anchor - 1];
-            var right = anchors[anchor];
-            if (samples[right].Timestamp <= samples[left].Timestamp ||
-                !double.IsFinite(values[left]) || !double.IsFinite(values[right]) ||
-                values[left] < 0 || values[right] < values[left])
-            {
-                continue;
-            }
-
-            var hasIdle = false;
-            var activeDuration = 0d;
-            var complete = true;
-            for (var index = left + 1; index <= right; index++)
-            {
-                if (samples[index].TaskActiveSincePrevious is not { } active)
-                {
-                    complete = false;
-                    break;
-                }
-                var elapsed = Math.Max(0, samples[index].Timestamp - samples[index - 1].Timestamp);
-                hasIdle |= !active;
-                if (active)
-                {
-                    activeDuration += elapsed;
-                }
-            }
-            if (!complete || !hasIdle || values[right] > values[left] && activeDuration <= double.Epsilon)
-            {
-                continue;
-            }
-
-            var activeElapsed = 0d;
-            for (var index = left + 1; index < right; index++)
-            {
-                var active = samples[index].TaskActiveSincePrevious is true;
-                if (active)
-                {
-                    activeElapsed += Math.Max(0, samples[index].Timestamp - samples[index - 1].Timestamp);
-                }
-                var fraction = values[right] == values[left]
-                    ? 0
-                    : Math.Clamp(activeElapsed / activeDuration, 0, 1);
-                values[index] = values[left] + (values[right] - values[left]) * fraction;
-                origins[index] = active
-                    ? GraphModelOrigin.Interpolated
-                    : GraphModelOrigin.BoundedFlat;
-            }
-        }
-    }
-
-    private static ModelProjection ActivityRelevantTokenProjection(ModelProjection projection)
-    {
-        var neutral = projection.Values.Keys
-            .Where(name =>
-                projection.Values[name].Select((value, index) => (value, index))
-                    .Any(point => projection.Reliability[name][point.index] && point.value == 0) &&
-                projection.Values[name].Select((value, index) => (value, index))
-                    .All(point => double.IsFinite(point.value) && point.value == 0 &&
-                        ModelOriginArithmeticReliable(projection.Origins[name][point.index])))
-            .ToHashSet(StringComparer.Ordinal);
-        var relevant = projection.Values.Keys
-            .Where(name => !neutral.Contains(name))
-            .ToArray();
-        if (relevant.Length == 0)
-        {
-            return projection;
-        }
-
-        return projection.Filter(relevant);
-    }
-
     private static bool ModelOriginArithmeticReliable(GraphModelOrigin origin) =>
         origin is GraphModelOrigin.Direct;
 
     private static bool ModelOriginLineIsExact(GraphModelOrigin origin) =>
         origin is GraphModelOrigin.Direct;
-
-    private static bool ModelOriginDisplayWeightable(GraphModelOrigin origin) =>
-        ModelOriginArithmeticReliable(origin);
 
     private static double RawModelValue(ApiHistorySample sample, string name, GraphMetric metric)
     {
@@ -799,142 +678,14 @@ public sealed class GraphScene
         return double.NaN;
     }
 
-    private static bool IsResetBoundaryPoint(ApiHistorySample sample, long periodStart) =>
-        sample.Timestamp == periodStart &&
-        (sample.RemainingPercent is not { } raw ||
-         !double.IsFinite(raw) || raw is < 0 or > 100);
-
-    private static bool IsPeriodStartQuotaResetBoundary(
-        IReadOnlyList<ApiHistorySample> samples,
-        long periodStart)
-    {
-        foreach (var sample in samples)
-        {
-            if (sample.ResetAt >= long.MinValue + WeeklyQuotaWindowSeconds &&
-                WithinResetAtTolerance(
-                    sample.ResetAt - WeeklyQuotaWindowSeconds,
-                    periodStart))
-            {
-                return true;
-            }
-
-            try
-            {
-                var monthlyStart = DateTimeOffset
-                    .FromUnixTimeSeconds(sample.ResetAt)
-                    .AddMonths(-1)
-                    .ToUnixTimeSeconds();
-                if (WithinResetAtTolerance(monthlyStart, periodStart))
-                {
-                    return true;
-                }
-            }
-            catch (ArgumentOutOfRangeException)
-            {
-                // The wire parser normally rejects values outside the Unix
-                // range. Keep this projection fail-closed if a direct caller
-                // supplies one anyway.
-            }
-        }
-
-        return false;
-    }
-
-    private static bool WithinResetAtTolerance(long left, long right) =>
-        left >= right
-            ? left - right <= ResetAtToleranceSeconds
-            : right - left <= ResetAtToleranceSeconds;
-
-    private static bool CanReconstructResetBoundary(
-        IReadOnlyList<ScenePoint> points,
-        long periodStart,
-        IReadOnlyDictionary<string, IReadOnlyList<double>> tokenSeries,
-        IReadOnlyDictionary<string, IReadOnlyList<bool>> tokenReliability,
-        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
-        bool periodStartIsQuotaResetBoundary)
-    {
-        if (!periodStartIsQuotaResetBoundary)
-        {
-            return false;
-        }
-
-        var boundary = Enumerable.Range(0, points.Count)
-            .FirstOrDefault(index => points[index].ResetBoundary, -1);
-        var firstObserved = Enumerable.Range(0, points.Count)
-            .FirstOrDefault(index => points[index].Remaining is { } raw &&
-                double.IsFinite(raw) && raw is >= 0 and <= 100, -1);
-        if (boundary < 0 || firstObserved <= boundary ||
-            points[boundary].Timestamp != periodStart ||
-            HasConfirmedGapBetween(
-                confirmedGaps,
-                periodStart,
-                points[firstObserved].Timestamp))
-        {
-            return false;
-        }
-
-        return tokenSeries.Any(pair =>
-            tokenReliability.TryGetValue(pair.Key, out var reliability) &&
-            pair.Value.Count == points.Count &&
-            reliability.Count == points.Count &&
-            Enumerable.Range(boundary, firstObserved - boundary + 1).Any(index =>
-                reliability[index] && double.IsFinite(pair.Value[index]) &&
-                pair.Value[index] >= 0));
-    }
-
-    internal static IReadOnlyList<double?> BuildEffectiveRemaining(
-        IReadOnlyList<ScenePoint> points,
-        IReadOnlyList<GraphConfirmedGap>? confirmedGaps = null)
-    {
-        var legacySeries = new Dictionary<string, IReadOnlyList<double>>(StringComparer.Ordinal)
-        {
-            ["SOL"] = points.Select(point => point.Sol).ToArray(),
-            ["TERRA"] = points.Select(point => point.Terra).ToArray(),
-            ["LUNA"] = points.Select(point => point.Luna).ToArray(),
-        };
-        if (points.Any(point => double.IsFinite(point.Astra) && point.Astra >= 0))
-        {
-            legacySeries["ASTRA"] = points.Select(point => point.Astra).ToArray();
-        }
-        var reliability = legacySeries.ToDictionary(
-            pair => pair.Key,
-            pair => (IReadOnlyList<bool>)pair.Value.Select(value => double.IsFinite(value) && value >= 0).ToArray(),
-            StringComparer.Ordinal);
-        var published = Enumerable.Range(0, points.Count)
-            .Select(index => (IReadOnlySet<string>)legacySeries
-                .Where(pair => double.IsFinite(pair.Value[index]) && pair.Value[index] >= 0)
-                .Select(pair => pair.Key)
-                .ToHashSet(StringComparer.Ordinal))
-            .ToArray();
-        return BuildEffectiveRemainingWithOrigins(
-                points,
-                legacySeries,
-                reliability,
-                reliability,
-                published,
-                confirmedGaps ?? Array.Empty<GraphConfirmedGap>(),
-                new HashSet<long>(),
-                resetBoundaryEligible: false)
-            .Values;
-    }
-
     private static RemainingProjection BuildEffectiveRemainingWithOrigins(
-        IReadOnlyList<ScenePoint> points,
-        IReadOnlyDictionary<string, IReadOnlyList<double>> tokenSeries,
-        IReadOnlyDictionary<string, IReadOnlyList<bool>> tokenReliability,
-        IReadOnlyDictionary<string, IReadOnlyList<bool>> tokenWeightability,
-        IReadOnlyList<IReadOnlySet<string>> publishedModelNames,
-        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
-        IReadOnlySet<long> correctionStarts,
-        bool resetBoundaryEligible)
+        IReadOnlyList<ScenePoint> points)
     {
         var values = new double?[points.Count];
         var origins = Enumerable.Repeat(GraphRemainingOrigin.Missing, points.Count).ToArray();
         var rawReliable = new bool[points.Count];
         var rawValues = points
-            .Select(point => point.ResetBoundary && resetBoundaryEligible
-                ? 100d
-                : !point.SyntheticTail && point.Remaining is { } raw &&
+            .Select(point => !point.SyntheticTail && point.Remaining is { } raw &&
                     double.IsFinite(raw) && raw is >= 0 and <= 100
                     ? raw
                     : (double?)null)
@@ -949,9 +700,7 @@ public sealed class GraphScene
             {
                 continue;
             }
-            isolated[index] = points[index].Timestamp - points[index - 1].Timestamp == 60 &&
-                points[index + 1].Timestamp - points[index].Timestamp == 60 &&
-                left >= right && (middle > left || middle < right);
+            isolated[index] = left >= right && (middle > left || middle < right);
         }
 
         double? minimum = null;
@@ -969,9 +718,7 @@ public sealed class GraphScene
             else
             {
                 values[index] = raw;
-                origins[index] = points[index].ResetBoundary && resetBoundaryEligible
-                    ? GraphRemainingOrigin.ResetBoundary
-                    : GraphRemainingOrigin.Raw;
+                origins[index] = GraphRemainingOrigin.Raw;
                 rawReliable[index] = true;
                 minimum = raw;
             }
@@ -999,157 +746,34 @@ public sealed class GraphScene
             }
 
             var bounded = runEnd < rawValues.Length && values[runEnd] is not null;
+            var canInterpolate = bounded && values[runEnd] is { } rightValue &&
+                values[left] is { } leftValue && rightValue < leftValue &&
+                points[runEnd].Timestamp > points[left].Timestamp;
             for (var index = runStart; index < runEnd; index++)
             {
                 if (values[index - 1] is not { } prior)
                 {
                     break;
                 }
-                values[index] = prior;
-                origins[index] = points[index].SyntheticTail
-                    ? GraphRemainingOrigin.SyntheticTailHold
-                    : bounded
-                        ? GraphRemainingOrigin.BoundedNullHold
-                        : GraphRemainingOrigin.TerminalNullHold;
-            }
-            runStart = runEnd;
-        }
-
-        var changeAnchors = new List<int>();
-        for (var index = 0; index < rawValues.Length; index++)
-        {
-            if (!rawReliable[index] || rawValues[index] is not { } raw)
-            {
-                continue;
-            }
-            if (changeAnchors.Count == 0 || rawValues[changeAnchors[^1]] != raw)
-            {
-                changeAnchors.Add(index);
-            }
-        }
-        for (var anchor = 1; anchor < changeAnchors.Count; anchor++)
-        {
-            var left = changeAnchors[anchor - 1];
-            var right = changeAnchors[anchor];
-            if (right - left < 2 || values[left] is not { } leftValue ||
-                values[right] is not { } rightValue || rightValue >= leftValue)
-            {
-                continue;
-            }
-            var crossesRemainingAnomaly = Enumerable.Range(left + 1, right - left - 1)
-                .Any(index => rawValues[index] is not null && !rawReliable[index]);
-            if (crossesRemainingAnomaly)
-            {
-                continue;
-            }
-            var activity = new List<ProjectedTokenDelta?>();
-            var tokenEvidenceComplete = true;
-            var tokenWeight = 0d;
-            for (var segment = left; segment < right; segment++)
-            {
-                var projected = ProjectTokenIntervalDelta(
-                    points,
-                    tokenSeries,
-                    tokenReliability,
-                    tokenWeightability,
-                    confirmedGaps,
-                    correctionStarts,
-                    segment,
-                    segment + 1);
-                if (projected is null)
+                if (canInterpolate)
                 {
-                    tokenEvidenceComplete = false;
+                    var fraction = (points[index].Timestamp - points[left].Timestamp) /
+                        (double)(points[runEnd].Timestamp - points[left].Timestamp);
+                    values[index] = values[left]!.Value +
+                        (values[runEnd]!.Value - values[left]!.Value) * fraction;
+                    origins[index] = GraphRemainingOrigin.Interpolated;
                 }
                 else
                 {
-                    tokenWeight += projected.Value.Delta;
-                }
-                activity.Add(projected);
-            }
-
-            var useTokenWeights = tokenEvidenceComplete && tokenWeight > double.Epsilon;
-            var modelShaped = useTokenWeights;
-            if (useTokenWeights)
-            {
-                // Every interval has an exact or bounded-theoretical token
-                // delta. Allocate the quota drop by those deltas; zero-delta
-                // intervals remain horizontal and sparse theoretical spans
-                // retain inferred provenance.
-            }
-            else
-            {
-                // A single incomplete/contradictory interval makes the
-                // attributable part of the anchor span time-weighted. Exact
-                // zero-token intervals remain weightless so a later unknown
-                // interval cannot smear quota loss backwards through a proven
-                // idle run. If every interval is known but the total token
-                // delta is zero, the quota drop is contradictory and the
-                // entire span remains an inferred elapsed-time bridge.
-                var elapsedWeight = 0d;
-                for (var segment = left; segment < right; segment++)
-                {
-                    var index = segment - left;
-                    var exactZero = !tokenEvidenceComplete &&
-                        activity[index] is { ExactZero: true };
-                    var weight = exactZero
-                        ? 0d
-                        : points[segment + 1].Timestamp - points[segment].Timestamp;
-                    elapsedWeight += weight;
-                    activity[index] = new ProjectedTokenDelta(
-                        weight,
-                        Inferred: !exactZero,
-                        ExactZero: exactZero);
-                }
-                tokenWeight = elapsedWeight;
-            }
-
-            if (tokenEvidenceComplete && !useTokenWeights)
-            {
-                // A quota drop with zero tokens everywhere is contradictory.
-                // Do not claim idle; connect the accepted quota anchors only
-                // with a wholly inferred elapsed-time bridge.
-                tokenWeight = 0d;
-                for (var segment = left; segment < right; segment++)
-                {
-                    var weight = points[segment + 1].Timestamp - points[segment].Timestamp;
-                    tokenWeight += weight;
-                    activity[segment - left] = new ProjectedTokenDelta(
-                        weight,
-                        Inferred: true,
-                        ExactZero: false);
+                    values[index] = prior;
+                    origins[index] = points[index].SyntheticTail
+                        ? GraphRemainingOrigin.SyntheticTailHold
+                        : bounded
+                            ? GraphRemainingOrigin.BoundedNullHold
+                            : GraphRemainingOrigin.TerminalNullHold;
                 }
             }
-
-            var weightedSeconds = tokenWeight;
-            if (weightedSeconds <= double.Epsilon)
-            {
-                continue;
-            }
-            var weightedElapsed = 0d;
-            for (var index = left + 1; index < right; index++)
-            {
-                var interval = activity[index - left - 1]
-                    ?? throw new InvalidOperationException("Quota span weight was not resolved.");
-                weightedElapsed += interval.Weight;
-                var smoothed = leftValue +
-                    (rightValue - leftValue) * (weightedElapsed / weightedSeconds);
-                values[index] = smoothed;
-                if (interval.Inferred)
-                {
-                    origins[index] = GraphRemainingOrigin.Interpolated;
-                }
-                else if (!(rawReliable[index] && rawValues[index] == smoothed))
-                {
-                    // Any value changed from the raw quota observation is a
-                    // presentation estimate. Token-shaped smoothing retains
-                    // its measured/activity provenance; elapsed fallback is
-                    // inferred and must remain dashed rather than being left
-                    // with a stale Raw origin.
-                    origins[index] = modelShaped && rawReliable[index] && rawValues[index] is not null
-                        ? GraphRemainingOrigin.ActivitySmoothed
-                        : GraphRemainingOrigin.Interpolated;
-                }
-            }
+            runStart = runEnd;
         }
 
         return new RemainingProjection(values, origins, rawReliable);
@@ -1182,21 +806,17 @@ public sealed class GraphScene
             }
         }
 
-        var candidates = new List<(
-            GraphIdleInterval Interval,
-            IReadOnlyDictionary<string, ulong> StartTokens,
-            IReadOnlyDictionary<string, ulong> EndTokens)>();
+        var candidates = new List<GraphIdleInterval>();
         for (var observation = 1; observation < direct.Count; observation++)
         {
             var before = direct[observation - 1];
             var after = direct[observation];
             var left = samples[before.Index];
             var right = samples[after.Index];
-            var commonModels = CommonModelNames(before.Vector, after.Vector);
             if (right.Timestamp <= left.Timestamp ||
                 left.ResetAt != right.ResetAt ||
                 !RemainingBitsEqual(left.RemainingPercent!.Value, right.RemainingPercent!.Value) ||
-                !TokenVectorsEqualForModels(before.Vector, after.Vector, commonModels) ||
+                !TokenVectorsEqual(before.Vector, after.Vector) ||
                 HasConfirmedGapBetween(
                     confirmedGaps,
                     left.Timestamp,
@@ -1206,8 +826,7 @@ public sealed class GraphScene
                     before.Index,
                     after.Index,
                     left.ResetAt,
-                    before.Vector,
-                    commonModels))
+                    before.Vector))
             {
                 continue;
             }
@@ -1216,60 +835,19 @@ public sealed class GraphScene
             var end = Math.Min(periodEnd, right.Timestamp);
             if (end > start)
             {
-                candidates.Add((
-                    new GraphIdleInterval(start, end, false),
-                    before.Vector.Keys.ToDictionary(
-                        model => model,
-                        model => before.Vector[model].TotalTokens,
-                        StringComparer.Ordinal),
-                    after.Vector.Keys.ToDictionary(
-                        model => model,
-                        model => after.Vector[model].TotalTokens,
-                        StringComparer.Ordinal)));
+                candidates.Add(new GraphIdleInterval(start, end, false));
             }
         }
 
-        var merged = new List<(
-            GraphIdleInterval Interval,
-            IReadOnlyDictionary<string, ulong> StartTokens,
-            IReadOnlyDictionary<string, ulong> EndTokens)>();
-        foreach (var candidate in candidates.OrderBy(item => item.Interval.StartAt))
+        var merged = new List<GraphIdleInterval>();
+        foreach (var candidate in candidates.OrderBy(item => item.StartAt))
         {
-            if (merged.Count > 0 && candidate.Interval.StartAt == merged[^1].Interval.EndAt &&
-                CountUnavailableRows(
-                    samples,
-                    candidate.Interval.StartAt,
-                    candidate.Interval.EndAt) > 0 &&
-                CountUnavailableRows(
-                    samples,
-                    merged[^1].Interval.StartAt,
-                    candidate.Interval.StartAt) > 0)
+            if (merged.Count > 0 && candidate.StartAt == merged[^1].EndAt)
             {
-                // Keep two separate unavailable observations as a visible
-                // anomaly boundary. The current candidate is the two-minute
-                // span around the second missing row; dropping it lets the
-                // following direct row start a fresh idle band after that
-                // dashed gap.
-                continue;
-            }
-            if (merged.Count > 0 && candidate.Interval.StartAt == merged[^1].Interval.EndAt &&
-                merged[^1].StartTokens.Keys
-                    .Intersect(candidate.EndTokens.Keys, StringComparer.Ordinal)
-                    .ToArray() is { Length: > 0 } endpointCommonModels &&
-                merged[^1].StartTokens.Keys.All(candidate.EndTokens.ContainsKey) &&
-                endpointCommonModels.All(model =>
-                    candidate.StartTokens.TryGetValue(model, out var boundaryValue) &&
-                    boundaryValue == merged[^1].StartTokens[model] &&
-                    candidate.EndTokens.TryGetValue(model, out var endValue) &&
-                    endValue == merged[^1].StartTokens[model]))
-            {
-                merged[^1] = (
-                    merged[^1].Interval with
-                    {
-                        EndAt = Math.Max(merged[^1].Interval.EndAt, candidate.Interval.EndAt),
-                    },
-                    merged[^1].StartTokens,
-                    candidate.EndTokens);
+                merged[^1] = merged[^1] with
+                {
+                    EndAt = Math.Max(merged[^1].EndAt, candidate.EndAt),
+                };
             }
             else
             {
@@ -1278,7 +856,6 @@ public sealed class GraphScene
         }
 
         return merged
-            .Select(item => item.Interval)
             .Where(interval => interval.EndAt - interval.StartAt >= SustainedUnusedMinimumSeconds)
             .ToArray();
     }
@@ -1288,117 +865,26 @@ public sealed class GraphScene
         int before,
         int after,
         long resetAt,
-        IReadOnlyDictionary<string, DirectModelValue> baseline,
-        IReadOnlySet<string> commonModels)
+        IReadOnlyDictionary<string, DirectModelValue> baseline)
     {
-        var neutralUnavailableCount = 0;
-        var unavailableCount = 0;
         for (var index = before + 1; index <= after; index++)
         {
             var sample = samples[index];
-            if (sample.ModelSource == ApiHistorySample.UnavailableModelSource)
-            {
-                unavailableCount++;
-                if (unavailableCount > 1)
-                {
-                    return true;
-                }
-            }
-            if (sample.TaskActiveSincePrevious is true)
+            if (sample.ModelSource != ApiHistorySample.ConfirmedModelSource ||
+                !sample.ModelsComplete)
             {
                 return true;
             }
 
-            if (sample.ModelSource != ApiHistorySample.ConfirmedModelSource ||
-                !sample.ModelsComplete)
-            {
-                if (IsNeutralUnavailableRow(
-                    samples,
-                    index,
-                    before,
-                    after,
-                    resetAt,
-                    commonModels))
-                {
-                    neutralUnavailableCount++;
-                    if (neutralUnavailableCount > 1)
-                    {
-                        return true;
-                    }
-
-                    continue;
-                }
-
-                // A non-direct row with model numerics is an observed but
-                // incomplete vector, so it disproves an otherwise flat idle
-                // span. Rows carrying only lifecycle/quota metadata remain
-                // neutral and preserve the G137-5 allowance for metadata-only
-                // rows between two complete direct endpoints.
-                if (HasNumericModelValues(sample) || !HasMetadataOnlyEvidence(sample))
-                {
-                    return true;
-                }
-                continue;
-            }
-
             if (sample.ResetAt != resetAt ||
                 !TryGetDirectModelVector(sample, out var vector) ||
-                !TokenVectorsEqualForModels(baseline, vector, commonModels))
+                !TokenVectorsEqual(baseline, vector))
             {
                 return true;
             }
         }
 
         return false;
-    }
-
-    private static int CountUnavailableRows(
-        IReadOnlyList<ApiHistorySample> samples,
-        long startAt,
-        long endAt) =>
-        samples.Count(sample =>
-            sample.Timestamp > startAt &&
-            sample.Timestamp < endAt &&
-            sample.ModelSource == ApiHistorySample.UnavailableModelSource);
-
-    private static bool HasNumericModelValues(ApiHistorySample sample) =>
-        PublishedModels(sample).Any(model =>
-            model.TotalTokens is not null ||
-            model.TotalDollars is double dollars && double.IsFinite(dollars));
-
-    private static bool HasMetadataOnlyEvidence(ApiHistorySample sample) =>
-        sample.RemainingPercent is double remaining &&
-        double.IsFinite(remaining) &&
-        remaining is >= 0 and <= 100;
-
-    private static bool IsNeutralUnavailableRow(
-        IReadOnlyList<ApiHistorySample> samples,
-        int index,
-        int before,
-        int after,
-        long resetAt,
-        IReadOnlySet<string> commonModels)
-    {
-        var sample = samples[index];
-        if (index <= before || index >= after ||
-            sample.ModelSource != ApiHistorySample.UnavailableModelSource ||
-            sample.TaskActiveSincePrevious is not false ||
-            HasNumericModelValues(sample) ||
-            HasMetadataOnlyEvidence(sample) ||
-            index == 0 ||
-            index + 1 >= samples.Count ||
-            sample.Timestamp - samples[index - 1].Timestamp != 60 ||
-            samples[index + 1].Timestamp - sample.Timestamp != 60 ||
-            samples[index - 1].ResetAt != resetAt ||
-            samples[index + 1].ResetAt != resetAt ||
-            !TryGetDirectModelVector(samples[index - 1], out var previous) ||
-            !TryGetDirectModelVector(samples[index + 1], out var following))
-        {
-            return false;
-        }
-
-        return commonModels.All(model =>
-            previous.ContainsKey(model) && following.ContainsKey(model));
     }
 
     private static bool TryGetDirectModelVector(
@@ -1446,143 +932,8 @@ public sealed class GraphScene
             right.TryGetValue(name, out var candidate) &&
             candidate.TotalTokens == left[name].TotalTokens);
 
-    private static IReadOnlySet<string> CommonModelNames(
-        IReadOnlyDictionary<string, DirectModelValue> left,
-        IReadOnlyDictionary<string, DirectModelValue> right) =>
-        new HashSet<string>(
-            left.Keys.Where(right.ContainsKey),
-            StringComparer.Ordinal);
-
-    private static bool TokenVectorsEqualForModels(
-        IReadOnlyDictionary<string, DirectModelValue> left,
-        IReadOnlyDictionary<string, DirectModelValue> right,
-        IReadOnlySet<string> models) =>
-        models.Count > 0 && models.All(name =>
-            left.TryGetValue(name, out var leftValue) &&
-            right.TryGetValue(name, out var rightValue) &&
-            leftValue.TotalTokens == rightValue.TotalTokens);
-
     private static bool RemainingBitsEqual(double left, double right) =>
         BitConverter.DoubleToInt64Bits(left) == BitConverter.DoubleToInt64Bits(right);
-
-    private static bool HasTokenIntervalEvidence(
-        IReadOnlyList<ScenePoint> points,
-        IReadOnlyDictionary<string, IReadOnlyList<double>> tokenSeries,
-        IReadOnlyDictionary<string, IReadOnlyList<bool>> tokenReliability,
-        IReadOnlyList<IReadOnlySet<string>> publishedModelNames,
-        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
-        IReadOnlySet<long> correctionStarts,
-        int before,
-        int after,
-        out bool advanced) =>
-        HasTokenIntervalEvidence(
-            points,
-            tokenSeries,
-            tokenReliability,
-            publishedModelNames,
-            confirmedGaps,
-            correctionStarts,
-            before,
-            after,
-            out advanced,
-            out _);
-
-    private static bool HasTokenIntervalEvidence(
-        IReadOnlyList<ScenePoint> points,
-        IReadOnlyDictionary<string, IReadOnlyList<double>> tokenSeries,
-        IReadOnlyDictionary<string, IReadOnlyList<bool>> tokenReliability,
-        IReadOnlyList<IReadOnlySet<string>> publishedModelNames,
-        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
-        IReadOnlySet<long> correctionStarts,
-        int before,
-        int after,
-        out bool advanced,
-        out double tokenDelta)
-    {
-        advanced = false;
-        tokenDelta = 0;
-        if (before < 0 || after != before + 1 || after >= points.Count ||
-            points[after].Timestamp <= points[before].Timestamp ||
-            points[before].SyntheticTail || points[after].SyntheticTail ||
-            HasConfirmedGapBetween(confirmedGaps, points[before].Timestamp, points[after].Timestamp) ||
-            HasCorrectionBetween(correctionStarts, points[before].Timestamp, points[after].Timestamp))
-        {
-            return false;
-        }
-        if (tokenSeries.Count == 0)
-        {
-            return false;
-        }
-        foreach (var name in tokenSeries.Keys)
-        {
-            if (!tokenSeries.TryGetValue(name, out var values) ||
-                !tokenReliability.TryGetValue(name, out var reliable) ||
-                before >= values.Count || after >= values.Count ||
-                before >= reliable.Count || after >= reliable.Count ||
-                !reliable[before] || !reliable[after] ||
-                !double.IsFinite(values[before]) || !double.IsFinite(values[after]) ||
-                values[before] < 0 || values[after] < values[before])
-            {
-                return false;
-            }
-            var delta = values[after] - values[before];
-            tokenDelta += delta;
-            advanced |= delta > 0;
-        }
-        return double.IsFinite(tokenDelta);
-    }
-
-    private static ProjectedTokenDelta? ProjectTokenIntervalDelta(
-        IReadOnlyList<ScenePoint> points,
-        IReadOnlyDictionary<string, IReadOnlyList<double>> tokenSeries,
-        IReadOnlyDictionary<string, IReadOnlyList<bool>> tokenReliability,
-        IReadOnlyDictionary<string, IReadOnlyList<bool>> tokenWeightability,
-        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
-        IReadOnlySet<long> correctionStarts,
-        int before,
-        int after)
-    {
-        if (before < 0 || after != before + 1 || after >= points.Count ||
-            points[after].Timestamp <= points[before].Timestamp ||
-            points[before].SyntheticTail || points[after].SyntheticTail ||
-            HasConfirmedGapBetween(confirmedGaps, points[before].Timestamp, points[after].Timestamp) ||
-            HasCorrectionBetween(correctionStarts, points[before].Timestamp, points[after].Timestamp) ||
-            tokenSeries.Count == 0)
-        {
-            return null;
-        }
-
-        var total = 0d;
-        var exact = true;
-        var inferred = false;
-        foreach (var name in tokenSeries.Keys)
-        {
-            if (!tokenSeries.TryGetValue(name, out var values) ||
-                !tokenReliability.TryGetValue(name, out var reliable) ||
-                !tokenWeightability.TryGetValue(name, out var weightable) ||
-                before >= values.Count || after >= values.Count ||
-                before >= reliable.Count || after >= reliable.Count ||
-                before >= weightable.Count || after >= weightable.Count ||
-                !weightable[before] || !weightable[after] ||
-                !double.IsFinite(values[before]) || !double.IsFinite(values[after]) ||
-                values[before] < 0 || values[after] < values[before])
-            {
-                return null;
-            }
-            total += values[after] - values[before];
-            if (!double.IsFinite(total))
-            {
-                return null;
-            }
-            exact &= reliable[before] && reliable[after];
-            inferred |= !reliable[before] || !reliable[after];
-        }
-
-        return new ProjectedTokenDelta(
-            total,
-            Inferred: inferred,
-            ExactZero: exact && total <= double.Epsilon);
-    }
 
     internal bool TryGetTokenIntervalEvidence(int before, int after, out bool advanced) =>
         TryGetTokenIntervalEvidence(before, after, out advanced, out _);
@@ -1642,22 +993,30 @@ public sealed class GraphScene
         double startAt,
         double endAt)
     {
+        return HasConfirmedGapBetween(startAt, endAt) ||
+            HasModelCorrectionBetween(values, startAt, endAt);
+    }
+
+    internal bool HasModelCorrectionBetween(
+        IReadOnlyList<double> values,
+        double startAt,
+        double endAt)
+    {
         var name = ModelSeries
             .FirstOrDefault(pair => ReferenceEquals(pair.Value, values))
             .Key;
         if (name is not null && ModelCorrectionStarts.TryGetValue(name, out var correctionStarts))
         {
-            return HasConfirmedGapBetween(startAt, endAt) ||
-                HasCorrectionBetween(correctionStarts, startAt, endAt);
+            return HasCorrectionBetween(correctionStarts, startAt, endAt);
         }
 
         // An unregistered series has no model identity. Preserve the conservative
-        // union behavior so an unknown correction boundary is never painted solid.
-        return HasModelHardBreakBetween(startAt, endAt);
+        // union behavior so an unknown correction boundary is never smoothed.
+        return HasCorrectionBetween(startAt, endAt);
     }
 
     internal bool HasRemainingHardBreakBetween(double startAt, double endAt) =>
-        HasConfirmedGapBetween(startAt, endAt) || HasTokenCorrectionBetween(startAt, endAt);
+        HasConfirmedGapBetween(startAt, endAt);
 
     internal bool HasHardBreakBetween(double startAt, double endAt) =>
         HasModelHardBreakBetween(startAt, endAt);
@@ -1673,36 +1032,6 @@ public sealed class GraphScene
         double startAt,
         double endAt) =>
         correctionStarts.Any(timestamp => timestamp > startAt && timestamp <= endAt);
-
-    private static bool CanCarryQuota(
-        IReadOnlyList<ScenePoint> points,
-        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
-        IReadOnlySet<long> correctionStarts,
-        int before,
-        int after) =>
-        after == before + 1 &&
-        points[after].Timestamp > points[before].Timestamp &&
-        !HasConfirmedGapBetween(confirmedGaps, points[before].Timestamp, points[after].Timestamp) &&
-        !HasCorrectionBetween(correctionStarts, points[before].Timestamp, points[after].Timestamp);
-
-    private static bool HasFullModelEvidence(
-        IReadOnlyList<ScenePoint> points,
-        IReadOnlyList<IReadOnlyList<double>> modelSeries,
-        IReadOnlyList<GraphConfirmedGap> confirmedGaps,
-        IReadOnlySet<long> correctionStarts,
-        int before,
-        int after) =>
-        modelSeries.Count > 0 &&
-        CanCarryQuota(points, confirmedGaps, correctionStarts, before, after) &&
-        modelSeries.All(values =>
-            before < values.Count && after < values.Count &&
-            double.IsFinite(values[before]) && double.IsFinite(values[after]));
-
-    private static bool ModelAdvanced(
-        IReadOnlyList<IReadOnlyList<double>> modelSeries,
-        int before,
-        int after) =>
-        modelSeries.Any(values => values[after] > values[before]);
 
     internal static IReadOnlyList<double> ArrangeEndpointLabelTops(
         IReadOnlyList<double> idealTops,
@@ -1849,7 +1178,6 @@ public sealed class GraphScene
         IReadOnlyDictionary<string, IReadOnlyList<double>> Values,
         IReadOnlyDictionary<string, IReadOnlyList<bool>> Reliability,
         IReadOnlyDictionary<string, IReadOnlyList<bool>> LineReliability,
-        IReadOnlyDictionary<string, IReadOnlyList<bool>> Weightability,
         IReadOnlyDictionary<string, IReadOnlyList<GraphModelOrigin>> Origins,
         IReadOnlyDictionary<string, IReadOnlySet<long>> CorrectionStartsByModel,
         IReadOnlySet<long> CorrectionStarts)
@@ -1858,18 +1186,9 @@ public sealed class GraphScene
             names.ToDictionary(name => name, name => Values[name], StringComparer.Ordinal),
             names.ToDictionary(name => name, name => Reliability[name], StringComparer.Ordinal),
             names.ToDictionary(name => name, name => LineReliability[name], StringComparer.Ordinal),
-            names.ToDictionary(name => name, name => Weightability[name], StringComparer.Ordinal),
             names.ToDictionary(name => name, name => Origins[name], StringComparer.Ordinal),
             names.ToDictionary(name => name, name => CorrectionStartsByModel[name], StringComparer.Ordinal),
             names.SelectMany(name => CorrectionStartsByModel[name]).ToHashSet());
-    }
-
-    private readonly record struct ProjectedTokenDelta(
-        double Weight,
-        bool Inferred,
-        bool ExactZero)
-    {
-        internal double Delta => Weight;
     }
 
     private readonly record struct DirectModelValue(ulong TotalTokens, double? TotalDollars);
@@ -1907,6 +1226,5 @@ public sealed class GraphScene
         bool ModelAvailable,
         bool DataAvailable,
         bool SyntheticTail = false,
-        bool ResetBoundary = false,
         bool? TaskActiveSincePrevious = null);
 }

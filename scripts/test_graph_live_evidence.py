@@ -68,8 +68,8 @@ class GraphLiveEvidenceTests(unittest.TestCase):
     def setUpClass(cls):
         cls.document = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
-    def test_remaining_smoothing_literal_cases_distinguish_measured_and_missing(self):
-        for name, case in self.document["remaining_smoothing_v4"].items():
+    def test_valid_anchor_projection_literal_cases_distinguish_measured_and_missing(self):
+        for name, case in self.document["valid_anchor_projection_v5"].items():
             fixture = v3_fixture(
                 case["samples"],
                 gaps=[
@@ -89,6 +89,67 @@ class GraphLiveEvidenceTests(unittest.TestCase):
                 idle,
                 name,
             )
+
+    def test_monotone_cubic_projection_matches_fixed_no_overshoot_oracle(self):
+        self.assertEqual(
+            [0.3671875, 0.6875, 0.9140625],
+            oracle._monotone_cubic_interval_values(
+                [0.0, 1.0, 2.0],
+                [0.0, 1.0, 1.0],
+                0,
+                [0.25, 0.5, 0.75],
+            ),
+        )
+        descending = oracle._monotone_cubic_interval_values(
+            [0.0, 1.0, 2.0],
+            [100.0, 90.0, 70.0],
+            0,
+            [0.5],
+        ) + oracle._monotone_cubic_interval_values(
+            [0.0, 1.0, 2.0],
+            [100.0, 90.0, 70.0],
+            1,
+            [0.5],
+        )
+        self.assertAlmostEqual(96.04166666666667, descending[0])
+        self.assertAlmostEqual(81.45833333333333, descending[1])
+        self.assertTrue(all(70.0 <= value <= 100.0 for value in descending))
+
+    def test_bounded_missing_interval_uses_the_same_smoothed_anchor_geometry(self):
+        fixture = v3_fixture(
+            [
+                {"timestamp": 0, "remaining_percent": 100.0, "tokens": 0},
+                {
+                    "timestamp": 60,
+                    "remaining_percent": None,
+                    "models": None,
+                    "models_complete": False,
+                    "model_source": "unavailable",
+                },
+                {"timestamp": 120, "remaining_percent": 90.0, "tokens": 1},
+                {"timestamp": 180, "remaining_percent": 70.0, "tokens": 3},
+            ],
+            period_id="smoothed-missing-bridge",
+        )
+        contract = oracle.build_expected_render_contracts(fixture)["tokens"]
+        dashed = next(model["dashed"] for model in contract["models"] if model["series"] == "SOL")
+        straight = " ".join(
+            oracle._canonical_dashes(
+                oracle._canonical_coordinate(0, 0, 0, 180, 3, False),
+                oracle._canonical_coordinate(120, 1, 0, 180, 3, False),
+            )
+        )
+        self.assertTrue(dashed)
+        self.assertNotEqual(straight, dashed)
+        remaining_dashed = contract["remaining"]["dashed"]
+        straight_remaining = " ".join(
+            oracle._canonical_dashes(
+                oracle._canonical_coordinate(0, 100, 0, 180, 100, True),
+                oracle._canonical_coordinate(120, 90, 0, 180, 100, True),
+            )
+        )
+        self.assertTrue(remaining_dashed)
+        self.assertNotEqual(straight_remaining, remaining_dashed)
 
     def test_parity_fixture_matches_existing_dollar_remaining_and_idle_oracles(self):
         fixture = self.document["parity_v3"]
@@ -197,14 +258,11 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         }
         segments, idle = oracle.build_expected(fixture)
         self.assertEqual([], idle)
-        self.assertIn([60, 120], pairs(segments, "dashed"))
+        self.assertEqual([[0, 180]], pairs(segments, "dashed"))
 
-    def test_idle_uses_exact_tokens_while_true_lifecycle_vetoes(self):
-        for activity, expected in (
-            (None, [{"start_at": 0, "end_at": 1_800}]),
-            (False, [{"start_at": 0, "end_at": 1_800}]),
-            (True, []),
-        ):
+    def test_idle_uses_exact_tokens_independently_of_lifecycle_activity(self):
+        expected = [{"start_at": 0, "end_at": 1_800}]
+        for activity in (None, False, True):
             rows = [
                 {
                     "timestamp": minute * 60,
@@ -281,7 +339,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
 
         self.assertEqual([{"start_at": 60, "end_at": 1_860}], idle)
 
-    def test_idle_uses_endpoint_intersection_and_fails_closed_without_common_model(self):
+    def test_idle_requires_identical_endpoint_model_sets(self):
         def model(name, tokens):
             return {
                 "model": name,
@@ -305,7 +363,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             for minute in range(31)
         ]
         _, idle = oracle.build_expected(v3_fixture(rows, period_id="one-sided-direct-model"))
-        self.assertEqual([{"start_at": 0, "end_at": 1_800}], idle)
+        self.assertEqual([{"start_at": 60, "end_at": 1_800}], idle)
 
         disjoint_rows = [
             {
@@ -321,7 +379,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         _, idle = oracle.build_expected(v3_fixture(disjoint_rows, period_id="empty-common-model"))
         self.assertEqual([], idle)
 
-    def test_idle_rows_stay_aligned_when_reset_boundary_is_inserted(self):
+    def test_idle_rows_stay_aligned_when_period_starts_before_first_sample(self):
         rows = [
             {
                 "timestamp": minute * 60,
@@ -340,7 +398,49 @@ class GraphLiveEvidenceTests(unittest.TestCase):
 
         self.assertEqual([{"start_at": 60, "end_at": 1_860}], idle)
 
-    def test_idle_bridge_allows_finite_modelless_metadata_row(self):
+    def test_missing_leading_quota_starts_only_at_the_first_direct_anchor(self):
+        fixture = v3_fixture(
+            [{"timestamp": 180, "remaining_percent": 98.0, "tokens": 100}],
+            period_id="no-leading-quota-invention",
+        )
+        fixture["period"].update(start_at=0, end_at=180, reset_at=604_800)
+        fixture["history_page"]["history_samples"][0]["reset_at"] = 604_800
+
+        contracts = oracle.build_expected_render_contracts(fixture)["tokens"]
+
+        self.assertEqual(
+            [{"timestamp": 180, "value": "98.000000000000", "origin": "raw"}],
+            contracts["remaining_points"],
+        )
+        self.assertEqual("", contracts["remaining"]["solid"])
+        self.assertEqual("", contracts["remaining"]["dashed"])
+
+    def test_isolated_anomalies_are_detected_across_sampling_jitter(self):
+        fixture = v3_fixture(
+            [
+                {"timestamp": 0, "remaining_percent": 90.0, "tokens": 10},
+                {"timestamp": 120, "remaining_percent": 80.0, "tokens": 20},
+                {"timestamp": 300, "remaining_percent": 89.0, "tokens": 11},
+            ],
+            period_id="jittered-isolated-anomaly",
+        )
+        period, samples, gaps = oracle._validate_fixture(fixture)
+        rows = oracle._rows_with_tail(period, samples)
+        model_projection = oracle._model_projection(rows, "SOL", "tokens")
+        remaining_projection = oracle._remaining_projection(
+            period,
+            rows,
+            {"SOL": model_projection},
+            gaps,
+        )
+
+        self.assertEqual("rejected", model_projection[1].origin)
+        self.assertEqual("direct", model_projection[2].origin)
+        self.assertEqual("monotonic_hold", remaining_projection[1].origin)
+        self.assertEqual("raw", remaining_projection[2].origin)
+        self.assertEqual(89.0, remaining_projection[2].effective)
+
+    def test_idle_does_not_cross_finite_modelless_metadata_row(self):
         def model(name, tokens):
             return {
                 "model": name,
@@ -372,7 +472,10 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             },
         )
         _, idle = oracle.build_expected(v3_fixture(rows, period_id="metadata-only-bridge"))
-        self.assertEqual([{"start_at": 0, "end_at": 1_800}], idle)
+        self.assertEqual(
+            [{"start_at": 0, "end_at": 840}, {"start_at": 960, "end_at": 1_800}],
+            idle,
+        )
 
     def test_idle_merge_rechecks_endpoint_common_models_at_intermediate_direct_rows(self):
         def model(name, tokens):
@@ -399,7 +502,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         ]
         _, idle = oracle.build_expected(v3_fixture(rows, period_id="intermediate-model-gap"))
         self.assertEqual(
-            [{"start_at": 0, "end_at": 1_680}, {"start_at": 1_740, "end_at": 3_480}],
+            [{"start_at": 0, "end_at": 1_680}, {"start_at": 1_800, "end_at": 3_480}],
             idle,
         )
 
@@ -453,7 +556,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             )[1],
         )
 
-    def test_idle_bridges_one_inactive_unavailable_minute_but_not_consecutive_or_active(self):
+    def test_idle_does_not_cross_unavailable_minutes_and_ignores_activity_metadata(self):
         rows = [
             {
                 "timestamp": minute * 60,
@@ -472,8 +575,8 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             }
         )
         self.assertEqual(
-            [{"start_at": 0, "end_at": 600}],
-            oracle.build_expected(v3_fixture(rows, period_id="inactive-unavailable-bridge"))[1],
+            [],
+            oracle.build_expected(v3_fixture(rows, period_id="inactive-unavailable-split"))[1],
         )
 
         consecutive = copy.deepcopy(rows)
@@ -516,11 +619,11 @@ class GraphLiveEvidenceTests(unittest.TestCase):
                 }
             )
         self.assertEqual(
-            [{"start_at": 0, "end_at": 1_200}, {"start_at": 1_320, "end_at": 2_040}],
+            [{"start_at": 360, "end_at": 1_200}, {"start_at": 1_320, "end_at": 2_040}],
             oracle.build_expected(v3_fixture(separated, period_id="separated-unavailable"))[1],
         )
 
-    def test_idle_bridges_missing_cadence_only_between_two_proven_flat_runs(self):
+    def test_idle_bridges_sparse_cadence_only_between_two_proven_flat_runs(self):
         def fixture(token_at_right):
             left = [
                 {"timestamp": minute * 60, "remaining_percent": 90.0, "tokens": 100}
@@ -619,12 +722,12 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             pairs(segments, "rising", "tokens", "SOL"),
         )
         self.assertEqual(
-            [[60, 120], [120, 180]],
+            [[60, 180]],
             pairs(segments, "dashed", "tokens", "SOL"),
         )
         self.assertEqual([], idle)
 
-    def test_remaining_drop_uses_one_token_or_elapsed_weight_for_the_whole_span(self):
+    def test_remaining_projection_is_independent_of_token_weight_and_model_availability(self):
         token_weighted = v3_fixture(
             [
                 {"timestamp": 0, "remaining_percent": 100.0, "tokens": 0},
@@ -636,10 +739,10 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         )
         segments, _ = oracle.build_expected(token_weighted)
         points = oracle.build_expected_render_contracts(token_weighted)["tokens"]["remaining_points"]
-        self.assertEqual([100.0, 98.8, 98.8, 94.0], [float(point["value"]) for point in points])
-        self.assertEqual(["raw", "activity_smoothed", "interpolated", "raw"], [point["origin"] for point in points])
+        self.assertEqual([100.0, 100.0, 97.0, 94.0], [float(point["value"]) for point in points])
+        self.assertEqual(["raw", "raw", "interpolated", "raw"], [point["origin"] for point in points])
         self.assertEqual([[0, 60]], pairs(segments, "solid"))
-        self.assertEqual([[60, 120], [120, 180]], pairs(segments, "dashed"))
+        self.assertEqual([[60, 180]], pairs(segments, "dashed"))
 
         fallback = v3_fixture(
             [
@@ -659,10 +762,46 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         )
         fallback_segments, _ = oracle.build_expected(fallback)
         fallback_points = oracle.build_expected_render_contracts(fallback)["tokens"]["remaining_points"]
-        self.assertEqual([100.0, 98.8, 96.4, 94.0], [float(point["value"]) for point in fallback_points])
-        self.assertEqual(["raw", "activity_smoothed", "interpolated", "raw"], [point["origin"] for point in fallback_points])
-        self.assertEqual([[0, 60]], pairs(fallback_segments, "solid"))
-        self.assertEqual([[60, 120], [120, 180]], pairs(fallback_segments, "dashed"))
+        self.assertEqual([100.0, 100.0, 100.0, 94.0], [float(point["value"]) for point in fallback_points])
+        self.assertEqual(["raw", "raw", "raw", "raw"], [point["origin"] for point in fallback_points])
+        self.assertEqual([[0, 60], [60, 120], [120, 180]], pairs(fallback_segments, "solid"))
+        self.assertEqual([], pairs(fallback_segments, "dashed"))
+
+    def test_task_activity_does_not_shape_model_or_remaining_geometry(self):
+        def fixture(activity):
+            return v3_fixture(
+                [
+                    {"timestamp": 0, "remaining_percent": 100.0, "tokens": 0},
+                    {
+                        "timestamp": 60,
+                        "remaining_percent": None,
+                        "models": None,
+                        "models_complete": False,
+                        "model_source": "unavailable",
+                        "task_active_since_previous": activity,
+                    },
+                    {
+                        "timestamp": 120,
+                        "remaining_percent": None,
+                        "models": None,
+                        "models_complete": False,
+                        "model_source": "unavailable",
+                        "task_active_since_previous": activity,
+                    },
+                    {
+                        "timestamp": 180,
+                        "remaining_percent": 94.0,
+                        "tokens": 30,
+                        "task_active_since_previous": activity,
+                    },
+                ],
+                period_id="activity-independent",
+            )
+
+        self.assertEqual(
+            oracle.build_expected_render_contracts(fixture(False)),
+            oracle.build_expected_render_contracts(fixture(True)),
+        )
 
     def test_json_loader_rejects_duplicate_object_keys(self):
         with self.assertRaises(oracle.EvidenceError):
@@ -964,15 +1103,17 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         dollars = contracts["dollars"]
 
         self.assertTrue(
-            dollars["models"][0]["dashed"].startswith(
-                "M0.00 1.00 L0.45 1.00 M0.75 1.00"
-            )
+            dollars["models"][0]["flat"].startswith("M0.00 1.00 L0.25 1.00")
         )
+        self.assertEqual("", dollars["models"][0]["dashed"])
         self.assertTrue(
-            dollars["remaining"]["dashed"].startswith(
-                "M0.00 1.00 L0.45 1.04 M0.75 1.07"
-            )
+            dollars["remaining"]["solid"].startswith("M0.00 1.00 L0.25 1.02")
         )
+        self.assertEqual("", dollars["remaining"]["dashed"])
+        self.assertEqual(3, dollars["styles"]["flat_width"])
+        self.assertEqual(3, dollars["styles"]["rising_width"])
+        self.assertEqual(3, dollars["styles"]["remaining_width"])
+        self.assertEqual(1, dollars["styles"]["inferred_width"])
         self.assertEqual([1_020, 1_170, 1_320, 1_470, 1_620], dollars["time_ticks"])
         self.assertEqual(["$10.00", "$7.50", "$5.00", "$2.50", "$0.00"], dollars["axis_labels"])
         self.assertEqual(

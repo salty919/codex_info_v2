@@ -723,7 +723,6 @@ const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
 // Smoothing is deliberately local. This bound must never be reused as a
 // missing-data rule: two normal direct endpoints remain measured regardless
 // of timestamp sparsity.
-const MODEL_SMOOTHING_MAX_NEIGHBOR_GAP_SECONDS: i64 = 60;
 // The gray background represents sustained unused time, not every short pause
 // between task publications. Keep the exact-token/quota proof above as the
 // candidate authority, merge every provably continuous run first, and only
@@ -4837,10 +4836,6 @@ impl GraphModelOrigin {
     fn line_is_exact(self) -> bool {
         self == Self::Direct
     }
-
-    fn display_weightable(self) -> bool {
-        self == Self::Direct
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -4870,27 +4865,12 @@ struct GraphSelectionInput<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GraphRemainingOrigin {
-    ResetBoundary,
     Raw,
-    ActivitySmoothed,
     Interpolated,
     BoundedNullHold,
     TerminalNullHold,
     SyntheticTailHold,
     MonotonicHold,
-}
-
-fn period_start_is_quota_reset_boundary(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-) -> bool {
-    samples.iter().any(|sample| {
-        let reset_at = sample.reset_at;
-        let weekly_start = reset_at.saturating_sub(WEEK_SECONDS);
-        let monthly_start = reset_at.saturating_sub(monthly_window_seconds(reset_at));
-        weekly_start.abs_diff(period_start) <= RESET_AT_TOLERANCE_SECONDS as u64
-            || monthly_start.abs_diff(period_start) <= RESET_AT_TOLERANCE_SECONDS as u64
-    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -4980,15 +4960,12 @@ fn accepted_graph_model_timelines(
                 let [left, middle, right] = window else {
                     return None;
                 };
-                let exact_cadence =
-                    middle.0.saturating_sub(left.0) == 60 && right.0.saturating_sub(middle.0) == 60;
                 let finite = [left.1, middle.1, right.1]
                     .into_iter()
                     .all(|value| value.is_finite() && value >= 0.0);
-                (exact_cadence
-                    && [left.2, middle.2, right.2]
-                        .into_iter()
-                        .all(GraphModelOrigin::line_is_exact)
+                ([left.2, middle.2, right.2]
+                    .into_iter()
+                    .all(GraphModelOrigin::line_is_exact)
                     && finite
                     && left.1 <= right.1
                     && (middle.1 < left.1 || middle.1 > right.1))
@@ -5221,132 +5198,6 @@ fn accepted_graph_model_timelines(
     }
 
     (accepted, correction_starts)
-}
-
-fn activity_relevant_token_timelines(timelines: &GraphModelTimelines) -> GraphModelTimelines {
-    let relevant = timelines
-        .iter()
-        .filter(|(_, timeline)| {
-            let has_exact_zero = timeline.values().any(|point| {
-                point.origin.arithmetic_reliable()
-                    && point.tokens.is_finite()
-                    && point.tokens == 0.0
-            });
-            let neutral_zero_only = has_exact_zero
-                && timeline.values().all(|point| {
-                    point.origin.arithmetic_reliable()
-                        && point.tokens.is_finite()
-                        && point.tokens == 0.0
-                });
-            !neutral_zero_only
-        })
-        .map(|(name, timeline)| (name.clone(), timeline.clone()))
-        .collect::<GraphModelTimelines>();
-    if relevant.is_empty() {
-        timelines.clone()
-    } else {
-        relevant
-    }
-}
-
-fn shape_inferred_model_timelines_by_task_activity(
-    timelines: &mut GraphModelTimelines,
-    show_tokens: bool,
-    task_activity_by_minute: Option<&BTreeMap<i64, Option<bool>>>,
-) {
-    let Some(activity) = task_activity_by_minute else {
-        return;
-    };
-    for timeline in timelines.values_mut() {
-        // Only directly measured values are absolute anchors. Interior values
-        // may be theoretical, but complete lifecycle evidence proves that a
-        // cumulative series cannot move during a fully idle minute.
-        let anchors = timeline
-            .iter()
-            .filter_map(|(timestamp, point)| point.origin.line_is_exact().then_some(*timestamp))
-            .collect::<Vec<_>>();
-        for pair in anchors.windows(2) {
-            let [left_at, right_at] = pair else {
-                continue;
-            };
-            let (Some(left), Some(right)) = (
-                timeline.get(left_at).copied(),
-                timeline.get(right_at).copied(),
-            ) else {
-                continue;
-            };
-            let left_value = graph_model_value(&left, show_tokens);
-            let right_value = graph_model_value(&right, show_tokens);
-            if right_at <= left_at
-                || !left_value.is_finite()
-                || !right_value.is_finite()
-                || left_value < 0.0
-                || right_value < left_value
-            {
-                continue;
-            }
-            let timestamps = timeline
-                .range((
-                    std::ops::Bound::Excluded(*left_at),
-                    std::ops::Bound::Included(*right_at),
-                ))
-                .map(|(timestamp, _)| *timestamp)
-                .collect::<Vec<_>>();
-            let mut previous = *left_at;
-            let mut intervals = Vec::with_capacity(timestamps.len());
-            let mut has_idle = false;
-            let mut active_duration = 0.0;
-            let mut complete = true;
-            for timestamp in &timestamps {
-                let Some(active) = activity.get(timestamp).copied().flatten() else {
-                    complete = false;
-                    break;
-                };
-                let elapsed = timestamp.saturating_sub(previous).max(0) as f64;
-                has_idle |= !active;
-                if active {
-                    active_duration += elapsed;
-                }
-                intervals.push((*timestamp, active, elapsed));
-                previous = *timestamp;
-            }
-            if !complete
-                || !has_idle
-                || (right_value > left_value && active_duration <= f64::EPSILON)
-            {
-                continue;
-            }
-
-            let mut active_elapsed = 0.0;
-            for (timestamp, active, elapsed) in intervals {
-                if active {
-                    active_elapsed += elapsed;
-                }
-                if timestamp == *right_at {
-                    continue;
-                }
-                let fraction = if right_value == left_value {
-                    0.0
-                } else {
-                    (active_elapsed / active_duration).clamp(0.0, 1.0)
-                };
-                let value = left_value + (right_value - left_value) * fraction;
-                let Some(point) = timeline.get_mut(&timestamp) else {
-                    continue;
-                };
-                if show_tokens {
-                    point.tokens = value;
-                } else {
-                    point.dollar = value;
-                }
-                point.origin = if active {
-                    GraphModelOrigin::Interpolated
-                } else {
-                    GraphModelOrigin::BoundedFlat
-                };
-            }
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -5593,7 +5444,7 @@ fn graph_paths_with_sources(
 }
 
 /// Builds a view from the monotonic cumulative snapshots. Flat and increasing
-/// segments are kept in separate paths so the UI can render distinct widths.
+/// segments keep separate semantic paths but use the same measured width.
 #[cfg(test)]
 fn graph_paths_for_selection(
     samples: &[&UsageHistorySample],
@@ -5726,7 +5577,7 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage(
 
 fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
     input: GraphSelectionInput<'_>,
-    task_activity_by_minute: Option<&BTreeMap<i64, Option<bool>>>,
+    _task_activity_by_minute: Option<&BTreeMap<i64, Option<bool>>>,
 ) -> GraphPaths {
     let GraphSelectionInput {
         samples,
@@ -5751,52 +5602,32 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
     // Derive both views from the same raw observations.  Feeding an already
     // accepted display timeline back through the token validator can heal a
     // rejected token regression and makes dollar/token idle bands disagree.
-    // Display metric and idle/activity evidence therefore have independent
-    // anomaly state, while idle and quota smoothing always use raw tokens.
-    let mut projection_minutes = samples
+    // Display metric and idle evidence therefore have independent
+    // anomaly state. Remaining quota is projected independently from tokens.
+    let projection_minutes = samples
         .iter()
         .map(|sample| sample.timestamp.div_euclid(60) * 60)
         .collect::<BTreeSet<_>>();
-    if let Some(activity) = task_activity_by_minute {
-        projection_minutes.extend(activity.keys().copied());
-    }
     let (mut dollar_timelines, _dollar_anomaly_starts) =
         accepted_graph_model_timelines(model_timelines, &projection_minutes, false, confirmed_gaps);
     let (mut token_timelines, token_anomaly_starts) =
         accepted_graph_model_timelines(model_timelines, &projection_minutes, true, confirmed_gaps);
-    shape_inferred_model_timelines_by_task_activity(
-        &mut dollar_timelines,
-        false,
-        task_activity_by_minute,
-    );
-    shape_inferred_model_timelines_by_task_activity(
-        &mut token_timelines,
-        true,
-        task_activity_by_minute,
-    );
     for timeline in dollar_timelines.values_mut() {
         normalize_graph_model_display_monotonic(timeline, false);
     }
     for timeline in token_timelines.values_mut() {
         normalize_graph_model_display_monotonic(timeline, true);
     }
-    // A model that is observed only at cumulative zero contributes no activity
-    // weight only while every point is an exact zero. A held/unknown tail is
-    // omitted-model evidence, not a published zero, and must stay in quota
-    // projection so it can force the elapsed fallback.
-    let activity_token_timelines = activity_relevant_token_timelines(&token_timelines);
     let display_timelines = if show_tokens {
         token_timelines.clone()
     } else {
         dollar_timelines.clone()
     };
-    // Quota activity is token-based in both display modes. A cheap model's
-    // rounded dollar series must not turn real token movement into idle time.
     let remaining_evidence = remaining_evidence_from_model_timelines(
         samples,
         period_start,
         period_end,
-        &activity_token_timelines,
+        &token_timelines,
         true,
         confirmed_gaps,
         &token_anomaly_starts,
@@ -5805,6 +5636,7 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
         .iter()
         .map(|point| (point.timestamp, point.effective))
         .collect::<Vec<_>>();
+    let remaining_correction_starts = BTreeSet::new();
     let minute = graph_minute_points_with_model_timelines(
         samples,
         period_start,
@@ -5823,8 +5655,6 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
                 value.is_finite() && value >= 0.0
             })
         });
-    let model_timeline_evidence =
-        (!activity_token_timelines.is_empty()).then_some((&activity_token_timelines, true));
     if has_remaining_observation {
         if let Some(remaining) = remaining_points.last().map(|(_, value)| *value) {
             let (solid, inferred) = remaining_paths_with_boundaries(RemainingPathContext {
@@ -5834,8 +5664,8 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
                 period_start,
                 period_end,
                 confirmed_gaps,
-                correction_starts: &token_anomaly_starts,
-                model_timelines: model_timeline_evidence,
+                correction_starts: &remaining_correction_starts,
+                model_timelines: None,
                 remaining_evidence: Some(&remaining_evidence),
             });
             paths.remaining = [solid.as_str(), inferred.as_str()]
@@ -5857,14 +5687,11 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
         samples,
         period_start,
         period_end,
-        // Confirmed idle comes from raw direct lineage. Display filtering,
-        // interpolation and activity shaping cannot create or erase it.
+        // Confirmed idle comes only from unchanged direct values. Lifecycle
+        // activity is not a substitute for a cumulative value change.
         model_timelines,
         confirmed_gaps,
-        Some(&GraphIdleRenderEvidence {
-            untrusted_minutes,
-            task_activity_by_minute,
-        }),
+        Some(&GraphIdleRenderEvidence { untrusted_minutes }),
     );
     let maximum = minute
         .iter()
@@ -6377,33 +6204,67 @@ fn metric_line_path_with_confirmed_gaps(
         .join(" ")
 }
 
-fn append_dashed_segment(commands: &mut String, start: (f64, f64), end: (f64, f64)) {
-    let dx = end.0 - start.0;
-    let dy = end.1 - start.1;
-    let length = dx.hypot(dy);
-    if !length.is_finite() || length <= f64::EPSILON {
-        return;
+fn append_graph_path_segment(commands: &mut String, start: (f64, f64), end: (f64, f64)) {
+    if !commands.is_empty() {
+        commands.push(' ');
     }
+    commands.push_str(&format!(
+        "M{:.2} {:.2} L{:.2} {:.2}",
+        start.0, start.1, end.0, end.1
+    ));
+}
+
+fn append_dashed_polyline(commands: &mut String, points: &[(f64, f64)]) {
     // Keep inferred intervals visually distinct from measured strokes even
     // on a wide graph. Short, closely-spaced dashes make the transition point
-    // readable without increasing the 1px inferred stroke width.
+    // readable without increasing the 1px inferred stroke width. The phase is
+    // carried across every flattened PCHIP edge so subdivision cannot turn a
+    // dashed prediction into an apparently solid line.
     const DASH: f64 = 0.45;
     const GAP: f64 = 0.30;
-    let mut offset = 0.0;
-    while offset < length {
-        let dash_end = (offset + DASH).min(length);
-        let from = offset / length;
-        let to = dash_end / length;
-        let x1 = start.0 + dx * from;
-        let y1 = start.1 + dy * from;
-        let x2 = start.0 + dx * to;
-        let y2 = start.1 + dy * to;
-        if !commands.is_empty() {
-            commands.push(' ');
+    const PERIOD: f64 = DASH + GAP;
+    const EPSILON: f64 = 1e-12;
+    let mut phase = 0.0;
+    for pair in points.windows(2) {
+        let start = pair[0];
+        let end = pair[1];
+        let dx = end.0 - start.0;
+        let dy = end.1 - start.1;
+        let length = dx.hypot(dy);
+        if !length.is_finite() || length <= EPSILON {
+            continue;
         }
-        commands.push_str(&format!("M{x1:.2} {y1:.2} L{x2:.2} {y2:.2}"));
-        offset += DASH + GAP;
+        let mut offset = 0.0;
+        while offset < length {
+            let in_dash = phase < DASH;
+            let phase_end = if in_dash { DASH } else { PERIOD };
+            let advance = (phase_end - phase).min(length - offset);
+            if advance <= EPSILON {
+                phase = if phase_end >= PERIOD { 0.0 } else { phase_end };
+                continue;
+            }
+            if in_dash {
+                let from = offset / length;
+                let to = (offset + advance) / length;
+                append_graph_path_segment(
+                    commands,
+                    (start.0 + dx * from, start.1 + dy * from),
+                    (start.0 + dx * to, start.1 + dy * to),
+                );
+            }
+            offset += advance;
+            phase += advance;
+            if phase >= PERIOD - EPSILON {
+                phase = 0.0;
+            } else if (phase - DASH).abs() <= EPSILON {
+                phase = DASH;
+            }
+        }
     }
+}
+
+fn append_dashed_segment(commands: &mut String, start: (f64, f64), end: (f64, f64)) {
+    append_dashed_polyline(commands, &[start, end]);
 }
 
 fn canonical_graph_viewbox_value(value: f64) -> f64 {
@@ -6516,6 +6377,175 @@ struct GraphMetricSegment {
     start_index: usize,
     end_index: usize,
     kind: GraphMetricSegmentKind,
+    smoothable: bool,
+}
+
+const GRAPH_CURVE_MAX_VIEWBOX_STEP: f64 = 0.25;
+
+fn monotone_cubic_slopes(x: &[f64], y: &[f64]) -> Option<Vec<f64>> {
+    if x.len() != y.len()
+        || x.len() < 2
+        || x.iter().chain(y).any(|value| !value.is_finite())
+        || x.windows(2).any(|pair| pair[1] <= pair[0])
+    {
+        return None;
+    }
+
+    let h = x
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .collect::<Vec<_>>();
+    let delta = y
+        .windows(2)
+        .zip(&h)
+        .map(|(pair, width)| (pair[1] - pair[0]) / width)
+        .collect::<Vec<_>>();
+    if x.len() == 2 {
+        return Some(vec![delta[0], delta[0]]);
+    }
+
+    let endpoint = |h0: f64, h1: f64, d0: f64, d1: f64| {
+        let candidate = ((2.0 * h0 + h1) * d0 - h0 * d1) / (h0 + h1);
+        if candidate * d0 <= 0.0 {
+            0.0
+        } else if d0 * d1 < 0.0 && candidate.abs() > 3.0 * d0.abs() {
+            3.0 * d0
+        } else {
+            candidate
+        }
+    };
+
+    let mut slopes = vec![0.0; x.len()];
+    slopes[0] = endpoint(h[0], h[1], delta[0], delta[1]);
+    for index in 1..x.len() - 1 {
+        let before = delta[index - 1];
+        let after = delta[index];
+        if before * after <= 0.0 {
+            slopes[index] = 0.0;
+            continue;
+        }
+        let before_width = h[index - 1];
+        let after_width = h[index];
+        let first_weight = 2.0 * after_width + before_width;
+        let second_weight = after_width + 2.0 * before_width;
+        slopes[index] =
+            (first_weight + second_weight) / (first_weight / before + second_weight / after);
+    }
+    let last = x.len() - 1;
+    slopes[last] = endpoint(h[last - 1], h[last - 2], delta[last - 1], delta[last - 2]);
+    Some(slopes)
+}
+
+fn monotone_cubic_interval_values(
+    x: &[f64],
+    y: &[f64],
+    interval: usize,
+    fractions: &[f64],
+) -> Option<Vec<f64>> {
+    let slopes = monotone_cubic_slopes(x, y)?;
+    if interval + 1 >= x.len()
+        || fractions
+            .iter()
+            .any(|fraction| !fraction.is_finite() || !(0.0..=1.0).contains(fraction))
+    {
+        return None;
+    }
+    let width = x[interval + 1] - x[interval];
+    Some(
+        fractions
+            .iter()
+            .map(|fraction| {
+                let t = *fraction;
+                let t2 = t * t;
+                let t3 = t2 * t;
+                (2.0 * t3 - 3.0 * t2 + 1.0) * y[interval]
+                    + (t3 - 2.0 * t2 + t) * width * slopes[interval]
+                    + (-2.0 * t3 + 3.0 * t2) * y[interval + 1]
+                    + (t3 - t2) * width * slopes[interval + 1]
+            })
+            .collect(),
+    )
+}
+
+fn monotone_cubic_interval_polyline(
+    timestamps: &[f64],
+    values: &[f64],
+    interval: usize,
+    period_start: i64,
+    period_span: f64,
+    graph_y: impl Fn(f64) -> f64,
+) -> Vec<(f64, f64)> {
+    let viewbox_width =
+        (timestamps[interval + 1] - timestamps[interval]).abs() / period_span * 100.0;
+    let steps = (viewbox_width / GRAPH_CURVE_MAX_VIEWBOX_STEP)
+        .ceil()
+        .max(1.0) as usize;
+    let fractions = (0..=steps)
+        .map(|step| step as f64 / steps as f64)
+        .collect::<Vec<_>>();
+    let Some(projected) = monotone_cubic_interval_values(timestamps, values, interval, &fractions)
+    else {
+        return Vec::new();
+    };
+    let x_at = |fraction: f64| {
+        let timestamp =
+            timestamps[interval] + (timestamps[interval + 1] - timestamps[interval]) * fraction;
+        canonical_graph_viewbox_value(
+            ((timestamp - period_start as f64) / period_span * 100.0).clamp(0.0, 100.0),
+        )
+    };
+    fractions
+        .into_iter()
+        .zip(projected)
+        .map(|(fraction, projected)| {
+            (
+                x_at(fraction),
+                canonical_graph_viewbox_value(graph_y(projected)),
+            )
+        })
+        .collect()
+}
+
+fn append_monotone_cubic_interval(
+    path: &mut String,
+    timestamps: &[f64],
+    values: &[f64],
+    interval: usize,
+    period_start: i64,
+    period_span: f64,
+    graph_y: impl Fn(f64) -> f64,
+) {
+    let points = monotone_cubic_interval_polyline(
+        timestamps,
+        values,
+        interval,
+        period_start,
+        period_span,
+        graph_y,
+    );
+    for pair in points.windows(2) {
+        append_graph_path_segment(path, pair[0], pair[1]);
+    }
+}
+
+fn append_monotone_cubic_dashed_interval(
+    path: &mut String,
+    timestamps: &[f64],
+    values: &[f64],
+    interval: usize,
+    period_start: i64,
+    period_span: f64,
+    graph_y: impl Fn(f64) -> f64,
+) {
+    let points = monotone_cubic_interval_polyline(
+        timestamps,
+        values,
+        interval,
+        period_start,
+        period_span,
+        graph_y,
+    );
+    append_dashed_polyline(path, &points);
 }
 
 fn metric_line_segments_with_boundaries(
@@ -6526,85 +6556,63 @@ fn metric_line_segments_with_boundaries(
     require_legacy_vector: bool,
     correction_starts: &BTreeSet<i64>,
 ) -> Vec<GraphMetricSegment> {
+    let is_exact = |index: usize| {
+        let point = &points[index];
+        let point_value = value(point);
+        point_value.is_finite()
+            && point_value >= 0.0
+            && !untrusted_minutes.contains(&point.timestamp)
+            && (!require_legacy_vector || model_spend_is_reliable(point))
+    };
+    let anchors = (0..points.len())
+        .filter(|index| is_exact(*index))
+        .collect::<Vec<_>>();
     let mut segments = Vec::new();
-    for (start_index, pair) in points.windows(2).enumerate() {
-        let end_index = start_index + 1;
-        let previous = value(&pair[0]);
-        let current = value(&pair[1]);
-        if require_legacy_vector
-            && (!model_spend_is_reliable(&pair[0]) || !model_spend_is_reliable(&pair[1]))
-        {
-            continue;
-        }
-        // A gap can only infer a continuation for a series that has accepted
-        // endpoints.  Applying the gap rule first manufactured a zero-valued
-        // ASTRA line even when ASTRA had never been published.
-        if !previous.is_finite()
-            || !current.is_finite()
-            || previous < 0.0
-            || current < 0.0
-            || current < previous
-        {
-            continue;
-        }
-        if graph_interval_has_hard_break(
-            pair[0].timestamp,
-            pair[1].timestamp,
-            confirmed_gaps,
+    for pair in anchors.windows(2) {
+        let start_index = pair[0];
+        let end_index = pair[1];
+        let previous = value(&points[start_index]);
+        let current = value(&points[end_index]);
+        let crosses_prediction = ((start_index + 1)..end_index).any(|index| !is_exact(index));
+        let crosses_correction = graph_interval_crosses_correction(
+            points[start_index].timestamp,
+            points[end_index].timestamp,
             correction_starts,
-        ) {
-            segments.push(GraphMetricSegment {
-                start_index,
-                end_index,
-                kind: GraphMetricSegmentKind::Inferred,
-            });
-            continue;
-        }
-        let untrusted = untrusted_minutes.contains(&pair[0].timestamp)
-            || untrusted_minutes.contains(&pair[1].timestamp);
+        );
+        let inferred = current < previous
+            || crosses_prediction
+            || graph_interval_has_hard_break(
+                points[start_index].timestamp,
+                points[end_index].timestamp,
+                confirmed_gaps,
+                correction_starts,
+            );
         segments.push(GraphMetricSegment {
             start_index,
             end_index,
-            kind: if untrusted {
+            kind: if inferred {
                 GraphMetricSegmentKind::Inferred
             } else if current == previous {
                 GraphMetricSegmentKind::Flat
             } else {
                 GraphMetricSegmentKind::Rising
             },
+            smoothable: current >= previous && !crosses_correction,
         });
     }
-
-    // A later finite point closes a run where this model was not published.
-    // An anomalous-but-held point is already emitted by the adjacent loop and
-    // must not add a second, wider bridge over the same timestamps.
-    let mut last_finite = None::<usize>;
-    let mut crossed_missing = false;
-    for (index, point) in points.iter().enumerate() {
-        let point_value = value(point);
-        let value_is_finite = point_value.is_finite() && point_value >= 0.0;
-        if (require_legacy_vector && !model_spend_is_reliable(point)) || !value_is_finite {
-            crossed_missing |= last_finite.is_some();
-            continue;
+    if let Some(last_anchor) = anchors.last().copied() {
+        if let Some(last_renderable) = (last_anchor + 1..points.len()).rev().find(|index| {
+            let candidate = value(&points[*index]);
+            candidate.is_finite() && candidate >= 0.0
+        }) {
+            segments.push(GraphMetricSegment {
+                start_index: last_anchor,
+                end_index: last_renderable,
+                kind: GraphMetricSegmentKind::Inferred,
+                smoothable: false,
+            });
         }
-        if let Some(previous_index) = last_finite {
-            if crossed_missing {
-                segments.push(GraphMetricSegment {
-                    start_index: previous_index,
-                    end_index: index,
-                    kind: GraphMetricSegmentKind::Inferred,
-                });
-            }
-        }
-        last_finite = Some(index);
-        crossed_missing = false;
     }
-    segments.sort_by_key(|segment| {
-        (
-            points[segment.start_index].timestamp,
-            points[segment.end_index].timestamp,
-        )
-    });
     segments
 }
 
@@ -6622,42 +6630,85 @@ fn split_metric_line_paths_with_boundaries(
             canonical_graph_viewbox_value(y),
         )
     };
-    let mut flat = String::new();
-    let mut rising = String::new();
-    let mut inferred = String::new();
-    for segment in metric_line_segments_with_boundaries(
+    let segments = metric_line_segments_with_boundaries(
         context.points,
         &value,
         context.confirmed_gaps,
         context.untrusted_minutes,
         context.require_legacy_vector,
         context.correction_starts,
-    ) {
+    );
+    let mut flat = String::new();
+    let mut rising = String::new();
+    let mut inferred = String::new();
+    let curved = segments
+        .iter()
+        .copied()
+        .filter(|segment| segment.smoothable)
+        .collect::<Vec<_>>();
+    let mut run_start = 0;
+    while run_start < curved.len() {
+        let mut run_end = run_start + 1;
+        while run_end < curved.len() && curved[run_end].start_index == curved[run_end - 1].end_index
+        {
+            run_end += 1;
+        }
+        let run = &curved[run_start..run_end];
+        let mut indices = Vec::with_capacity(run.len() + 1);
+        indices.push(run[0].start_index);
+        indices.extend(run.iter().map(|segment| segment.end_index));
+        let timestamps = indices
+            .iter()
+            .map(|index| context.points[*index].timestamp as f64)
+            .collect::<Vec<_>>();
+        let values = indices
+            .iter()
+            .map(|index| value(&context.points[*index]))
+            .collect::<Vec<_>>();
+        for (interval, segment) in run.iter().enumerate() {
+            if segment.kind == GraphMetricSegmentKind::Inferred {
+                append_monotone_cubic_dashed_interval(
+                    &mut inferred,
+                    &timestamps,
+                    &values,
+                    interval,
+                    context.period_start,
+                    span,
+                    |raw| (99.0 - raw.max(0.0) / scale * 98.0).clamp(1.0, 99.0),
+                );
+            } else {
+                let target = match segment.kind {
+                    GraphMetricSegmentKind::Flat => &mut flat,
+                    GraphMetricSegmentKind::Rising => &mut rising,
+                    GraphMetricSegmentKind::Inferred => unreachable!("handled above"),
+                };
+                append_monotone_cubic_interval(
+                    target,
+                    &timestamps,
+                    &values,
+                    interval,
+                    context.period_start,
+                    span,
+                    |raw| (99.0 - raw.max(0.0) / scale * 98.0).clamp(1.0, 99.0),
+                );
+            }
+        }
+        run_start = run_end;
+    }
+    for segment in segments
+        .iter()
+        .filter(|segment| segment.kind == GraphMetricSegmentKind::Inferred && !segment.smoothable)
+    {
         let start = coordinate(&context.points[segment.start_index]);
         let end = coordinate(&context.points[segment.end_index]);
-        let target = match segment.kind {
-            GraphMetricSegmentKind::Flat => &mut flat,
-            GraphMetricSegmentKind::Rising => &mut rising,
-            GraphMetricSegmentKind::Inferred => {
-                append_dashed_segment(&mut inferred, start, end);
-                continue;
-            }
-        };
-        if !target.is_empty() {
-            target.push(' ');
-        }
-        target.push_str(&format!(
-            "M{:.2} {:.2} L{:.2} {:.2}",
-            start.0, start.1, end.0, end.1
-        ));
+        append_dashed_segment(&mut inferred, start, end);
     }
     (flat, rising, inferred)
 }
 
 /// Return horizontal bands only where every represented cumulative model
-/// series is confirmed unchanged. Missing and unavailable evidence remains in
-/// the thin dashed paths; only one explicitly inactive, one-minute unavailable
-/// row bounded by direct neighbors may be neutral for the idle band.
+/// series is confirmed unchanged. Missing and unavailable evidence always
+/// split the idle authority; timestamp sparsity alone does not.
 #[cfg(test)]
 fn unused_interval_positions(
     points: &[HourlyModelSpend],
@@ -6828,11 +6879,7 @@ fn accepted_remaining_samples(
             let [left, middle, right] = window else {
                 return None;
             };
-            (middle.0.saturating_sub(left.0) == 60
-                && right.0.saturating_sub(middle.0) == 60
-                && left.1 >= right.1
-                && (middle.1 > left.1 || middle.1 < right.1))
-                .then_some(middle.0)
+            (left.1 >= right.1 && (middle.1 > left.1 || middle.1 < right.1)).then_some(middle.0)
         })
         .collect::<BTreeSet<_>>();
     let mut baseline = None::<f64>;
@@ -6856,7 +6903,6 @@ fn accepted_remaining_samples(
 
 struct GraphIdleRenderEvidence<'a> {
     untrusted_minutes: &'a BTreeSet<i64>,
-    task_activity_by_minute: Option<&'a BTreeMap<i64, Option<bool>>>,
 }
 
 fn token_idle_timestamp_intervals_with_render_evidence(
@@ -6874,8 +6920,6 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         .map(|evidence| evidence.untrusted_minutes)
         .cloned()
         .unwrap_or_default();
-    let task_activity_by_minute =
-        render_evidence.and_then(|evidence| evidence.task_activity_by_minute);
 
     // Only a complete vector of direct, same-minute observations can prove
     // inactivity.  Interpolated/held/smoothed/legacy points remain display
@@ -6898,20 +6942,23 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         // appeared in a legacy row elsewhere must not be fabricated here.
         (!vector.is_empty()).then_some(vector)
     };
-    let common_direct_tokens = |left: &[(String, u64)], right: &[(String, u64)]| {
+    let matching_direct_tokens = |left: &[(String, u64)], right: &[(String, u64)]| {
+        if left.len() != right.len() {
+            return None;
+        }
         let right_by_name = right
             .iter()
             .map(|(name, value)| (name.as_str(), *value))
             .collect::<BTreeMap<_, _>>();
-        let common = left
+        let matching = left
             .iter()
-            .filter_map(|(name, left_value)| {
+            .map(|(name, left_value)| {
                 right_by_name
                     .get(name.as_str())
                     .map(|right_value| (name.clone(), *left_value, *right_value))
             })
-            .collect::<Vec<_>>();
-        (!common.is_empty()).then_some(common)
+            .collect::<Option<Vec<_>>>()?;
+        (!matching.is_empty()).then_some(matching)
     };
     let direct_remaining = |timestamp: i64| -> Option<u64> {
         let mut accepted = None;
@@ -6947,13 +6994,10 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         .copied()
         .collect::<BTreeSet<_>>();
 
-    // When adjacent proven pairs are merged, retain the endpoint-common
-    // model set and require every intermediate direct observation to carry
-    // those same models with the same raw token values. A model disappearing
-    // for one direct row must split the idle run instead of being hidden by
-    // pair-local intersections.
-    let direct_models_remain_flat = |start: i64, end: i64, common_tokens: &[(String, u64, u64)]| {
-        let baseline = common_tokens
+    // Every direct observation inside a sparse interval must preserve the
+    // exact endpoint model set and raw token vector.
+    let direct_models_remain_flat = |start: i64, end: i64, tokens: &[(String, u64, u64)]| {
+        let baseline = tokens
             .iter()
             .map(|(name, left, _)| (name.as_str(), *left))
             .collect::<BTreeMap<_, _>>();
@@ -6971,9 +7015,10 @@ fn token_idle_timestamp_intervals_with_render_evidence(
                 .iter()
                 .map(|(name, value)| (name.as_str(), *value))
                 .collect::<BTreeMap<_, _>>();
-            if baseline
-                .iter()
-                .any(|(name, expected)| values.get(name).copied() != Some(*expected))
+            if values.len() != baseline.len()
+                || baseline
+                    .iter()
+                    .any(|(name, expected)| values.get(name).copied() != Some(*expected))
             {
                 return false;
             }
@@ -6997,27 +7042,8 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         })
         .collect::<Vec<_>>();
     anchors.sort_by_key(|(timestamp, _, _)| *timestamp);
-    // `anchors` is built from the union of every direct model timestamp, so a
-    // sparse pair is the only kind of bridge left here: any intermediate
-    // direct observation is already a boundary in `windows(2)`.  Comparing
-    // the endpoint intersection therefore validates every direct point in a
-    // bridge without requiring an identical full model set.
-
-    let task_was_active = |start: i64, end: i64| {
-        task_activity_by_minute.is_some_and(|activity| {
-            activity
-                .range((
-                    std::ops::Bound::Excluded(start),
-                    std::ops::Bound::Included(end),
-                ))
-                .any(|(_, state)| *state == Some(true))
-        })
-    };
-    // A legacy/incomplete source row that still carries numeric model data is
-    // evidence that the interval is not fully observed. Metadata-only rows
-    // remain neutral, as required by G137-5. The raw graph lineage only uses
-    // `LegacyObserved` for such source rows; display interpolation has a
-    // different origin and must not veto a proven interval.
+    // Any explicit incomplete source row is a boundary. Timestamp sparsity by
+    // itself is not: two adjacent valid anchors may still be far apart.
     let has_numeric_incomplete_row = |start: i64, end: i64| {
         token_timelines.values().any(|timeline| {
             timeline
@@ -7030,153 +7056,42 @@ fn token_idle_timestamp_intervals_with_render_evidence(
                 })
         })
     };
-    // A source row with neither a complete model vector nor a valid quota is
-    // normally an unavailable observation and must break an idle candidate.
-    // The one bounded exception is a single, one-minute unavailable row whose
-    // lifecycle marker explicitly says inactive and whose immediate neighbors
-    // are complete direct rows for the endpoint-common model set.  It remains
-    // dashed in the rendered series; it is only neutral for the idle band so
-    // a recorder/API metadata miss does not create a false one-minute split.
-    let has_unavailable_incomplete_row =
-        |start: i64, end: i64, common_tokens: &[(String, u64, u64)]| {
-            let mut neutral_unavailable = 0usize;
-            for (index, sample) in samples.iter().enumerate() {
-                let minute = sample.timestamp.div_euclid(60) * 60;
-                if minute <= start
-                    || minute >= end
-                    || !untrusted_minutes.contains(&minute)
-                    || (sample.remaining_percent.is_finite()
-                        && (0.0..=100.0).contains(&sample.remaining_percent))
-                    || token_timelines.values().any(|timeline| {
-                        timeline.get(&minute).is_some_and(|point| {
-                            point.origin == GraphModelOrigin::LegacyObserved
-                                && point.raw_tokens.is_some()
-                        })
-                    })
-                {
-                    continue;
-                }
-
-                let explicitly_inactive = task_activity_by_minute
-                    .is_some_and(|activity| activity.get(&minute).copied() == Some(Some(false)));
-                let adjacent_direct = index > 0
-                    && index + 1 < samples.len()
-                    && samples[index].timestamp - samples[index - 1].timestamp == 60
-                    && samples[index + 1].timestamp - samples[index].timestamp == 60
-                    && direct_vector(samples[index - 1].timestamp).is_some_and(|vector| {
-                        let values = vector.into_iter().collect::<BTreeMap<_, _>>();
-                        common_tokens
-                            .iter()
-                            .all(|(name, _, _)| values.contains_key(name))
-                    })
-                    && direct_vector(samples[index + 1].timestamp).is_some_and(|vector| {
-                        let values = vector.into_iter().collect::<BTreeMap<_, _>>();
-                        common_tokens
-                            .iter()
-                            .all(|(name, _, _)| values.contains_key(name))
-                    });
-                if explicitly_inactive && adjacent_direct {
-                    neutral_unavailable += 1;
-                    if neutral_unavailable > 1 {
-                        return true;
-                    }
-                } else {
-                    return true;
-                }
-            }
-            false
-        };
-    let unavailable_row_count = |start: i64, end: i64| {
-        samples
-            .iter()
-            .filter(|sample| {
-                let minute = sample.timestamp.div_euclid(60) * 60;
-                minute > start
-                    && minute < end
-                    && untrusted_minutes.contains(&minute)
-                    && (!sample.remaining_percent.is_finite()
-                        || !(0.0..=100.0).contains(&sample.remaining_percent))
-                    && !token_timelines.values().any(|timeline| {
-                        timeline.get(&minute).is_some_and(|point| {
-                            point.origin == GraphModelOrigin::LegacyObserved
-                                && point.raw_tokens.is_some()
-                        })
-                    })
-            })
-            .count()
+    let has_unavailable_incomplete_row = |start: i64, end: i64| {
+        samples.iter().any(|sample| {
+            let minute = sample.timestamp.div_euclid(60) * 60;
+            minute > start && minute < end && untrusted_minutes.contains(&minute)
+        })
     };
-    let mut proven = Vec::<(i64, i64, BTreeMap<String, u64>, BTreeMap<String, u64>)>::new();
+    let mut proven = Vec::<(i64, i64)>::new();
     for pair in anchors.windows(2) {
         let [(start, start_vector, start_remaining), (end, end_vector, end_remaining)] = pair
         else {
             continue;
         };
-        let Some(common_tokens) = common_direct_tokens(start_vector, end_vector) else {
+        let Some(matching_tokens) = matching_direct_tokens(start_vector, end_vector) else {
             continue;
         };
         if end <= start
-            || !common_tokens
+            || !matching_tokens
                 .iter()
                 .all(|(_, left_value, right_value)| left_value == right_value)
             || start_remaining != end_remaining
-            || task_was_active(*start, *end)
             || has_numeric_incomplete_row(*start, *end)
-            || has_unavailable_incomplete_row(*start, *end, &common_tokens)
-            || !direct_models_remain_flat(*start, *end, &common_tokens)
+            || has_unavailable_incomplete_row(*start, *end)
+            || !direct_models_remain_flat(*start, *end, &matching_tokens)
             || graph_interval_overlaps_confirmed_gap(*start, *end, confirmed_gaps)
         {
             continue;
         }
-        let start_values = start_vector
-            .iter()
-            .map(|(name, value)| (name.clone(), *value))
-            .collect::<BTreeMap<_, _>>();
-        let end_values = end_vector
-            .iter()
-            .map(|(name, value)| (name.clone(), *value))
-            .collect::<BTreeMap<_, _>>();
-        if let Some(last) = proven.last_mut() {
-            if last.1 == *start {
-                let endpoint_common = last
-                    .2
-                    .keys()
-                    .filter(|name| end_values.contains_key(*name))
-                    .collect::<Vec<_>>();
-                let current_has_unavailable = unavailable_row_count(*start, *end) > 0;
-                let prior_has_unavailable = unavailable_row_count(last.0, *start) > 0;
-                // If the current pair contains a neutral unavailable row and
-                // the already-proven band has one too, keep the recorder/API
-                // anomaly as a visible boundary.  The pair after the missing
-                // minute can then start a fresh idle candidate instead of
-                // silently merging multiple dashed gaps into one band.
-                if current_has_unavailable && prior_has_unavailable {
-                    continue;
-                }
-                // A model may be added at a later direct endpoint, but a
-                // model that was already part of the proven baseline must
-                // never disappear inside one merged idle band.  Otherwise a
-                // one-minute partial vector could be hidden by the endpoint
-                // intersection and the band would cross a real data-integrity
-                // boundary.
-                if !endpoint_common.is_empty()
-                    && last.2.keys().all(|name| end_values.contains_key(name))
-                    && endpoint_common.iter().all(|name| {
-                        let baseline = last.2[*name];
-                        end_values.get(*name) == Some(&baseline)
-                            && start_values.get(*name) == Some(&baseline)
-                    })
-                {
-                    last.1 = *end;
-                    last.3 = end_values;
-                    continue;
-                }
-            }
+        if let Some(last) = proven.last_mut().filter(|last| last.1 == *start) {
+            last.1 = *end;
+        } else {
+            proven.push((*start, *end));
         }
-        proven.push((*start, *end, start_values, end_values));
     }
     proven
         .into_iter()
-        .filter_map(|(start, end, _, _)| {
+        .filter_map(|(start, end)| {
             (end.saturating_sub(start) >= SUSTAINED_UNUSED_MIN_DURATION_SECONDS)
                 .then_some((start, end))
         })
@@ -7357,16 +7272,15 @@ fn remaining_evidence_from_model_timelines(
     samples: &[&UsageHistorySample],
     period_start: i64,
     period_end: i64,
-    model_timelines: &GraphModelTimelines,
+    _model_timelines: &GraphModelTimelines,
     _show_tokens: bool,
-    confirmed_gaps: &[GraphConfirmedGap],
-    correction_starts: &BTreeSet<i64>,
+    _confirmed_gaps: &[GraphConfirmedGap],
+    _correction_starts: &BTreeSet<i64>,
 ) -> Vec<GraphRemainingEvidence> {
     #[derive(Clone, Copy)]
     struct Row {
         timestamp: i64,
         raw: Option<f64>,
-        reset_boundary: bool,
         synthetic_tail: bool,
     }
 
@@ -7380,57 +7294,15 @@ fn remaining_evidence_from_model_timelines(
         .then_some(sample.remaining_percent);
         by_timestamp.entry(sample.timestamp).or_default().push(raw);
     }
-    // Model timelines also contain the model-less lifecycle cadence supplied
-    // by REST. Preserve those timestamps so quota interpolation can spend no
-    // distance inside a lifecycle-confirmed idle interval.
-    for timestamp in model_timelines.values().flat_map(BTreeMap::keys).copied() {
-        if timestamp >= period_start && timestamp <= period_end {
-            by_timestamp.entry(timestamp).or_default();
-        }
-    }
-    let mut accepted_remaining = accepted_remaining_samples(samples, period_start, period_end);
-    let first_reliable_remaining_at = accepted_remaining
-        .iter()
-        .find_map(|(timestamp, sample)| sample.reliable.then_some(*timestamp));
-    let can_reconstruct_reset_boundary = first_reliable_remaining_at.is_some_and(|first| {
-        first > period_start
-            && !accepted_remaining.contains_key(&period_start)
-            && period_start_is_quota_reset_boundary(samples, period_start)
-            && !confirmed_gaps
-                .iter()
-                .any(|gap| gap.start_at < first && gap.end_at > period_start)
-            && model_timelines.values().any(|timeline| {
-                timeline.range(period_start..=first).any(|(_, point)| {
-                    point.origin.arithmetic_reliable()
-                        && point.tokens.is_finite()
-                        && point.tokens >= 0.0
-                })
-            })
-    });
-    if can_reconstruct_reset_boundary {
-        by_timestamp.entry(period_start).or_default();
-        accepted_remaining.insert(
-            period_start,
-            AcceptedRemainingSample {
-                raw: 100.0,
-                reliable: true,
-            },
-        );
-    }
+    let accepted_remaining = accepted_remaining_samples(samples, period_start, period_end);
     let mut rows = by_timestamp
         .into_iter()
         .map(|(timestamp, candidates)| {
             let first = candidates.first().copied().flatten();
             let conflict = candidates.iter().any(|candidate| *candidate != first);
-            let reset_boundary = can_reconstruct_reset_boundary
-                && timestamp == period_start
-                && candidates.iter().all(Option::is_none);
             Row {
                 timestamp,
-                raw: reset_boundary
-                    .then_some(100.0)
-                    .or_else(|| (!conflict).then_some(first).flatten()),
-                reset_boundary,
+                raw: (!conflict).then_some(first).flatten(),
                 synthetic_tail: false,
             }
         })
@@ -7442,7 +7314,6 @@ fn remaining_evidence_from_model_timelines(
         rows.push(Row {
             timestamp: period_end,
             raw: None,
-            reset_boundary: false,
             synthetic_tail: true,
         });
     }
@@ -7462,11 +7333,7 @@ fn remaining_evidence_from_model_timelines(
             origins[index] = Some(GraphRemainingOrigin::MonotonicHold);
         } else {
             values[index] = Some(raw);
-            origins[index] = Some(if row.reset_boundary {
-                GraphRemainingOrigin::ResetBoundary
-            } else {
-                GraphRemainingOrigin::Raw
-            });
+            origins[index] = Some(GraphRemainingOrigin::Raw);
             minimum = Some(raw);
         }
     }
@@ -7499,27 +7366,12 @@ fn remaining_evidence_from_model_timelines(
             && rows[run_end].timestamp > rows[left].timestamp
         {
             let right_value = values[run_end].expect("bounded value exists");
-            let timestamps = rows[left..=run_end]
-                .iter()
-                .map(|row| row.timestamp)
-                .collect::<Vec<_>>();
-            let (segment_weights, _, _) = remaining_drop_distribution_weights(
-                &timestamps,
-                model_timelines,
-                confirmed_gaps,
-                correction_starts,
-            );
-            let total_weight = segment_weights.iter().sum::<f64>();
-            if total_weight > f64::EPSILON {
-                let mut cumulative_weight = 0.0;
-                for (offset, index) in (run_start..run_end).enumerate() {
-                    cumulative_weight += segment_weights[offset];
-                    values[index] = Some(
-                        left_value
-                            + (right_value - left_value) * (cumulative_weight / total_weight),
-                    );
-                    // A missing quota row is still inferred even when
-                    // its position is weighted by complete token data.
+            let total_elapsed = rows[run_end].timestamp.saturating_sub(rows[left].timestamp) as f64;
+            if total_elapsed > f64::EPSILON {
+                for index in run_start..run_end {
+                    let elapsed = rows[index].timestamp.saturating_sub(rows[left].timestamp) as f64;
+                    values[index] =
+                        Some(left_value + (right_value - left_value) * (elapsed / total_elapsed));
                     origins[index] = Some(GraphRemainingOrigin::Interpolated);
                 }
                 interpolated = true;
@@ -7546,98 +7398,6 @@ fn remaining_evidence_from_model_timelines(
         run_start = run_end;
     }
 
-    // Remote quota observations often arrive as a staircase. Between two
-    // accepted change anchors, distribute the drop in proportion to the
-    // complete, reliable per-model token deltas. This preserves the observed
-    // workload shape instead of inventing a constant time-based burn rate.
-    // If any token interval is unavailable or contradictory, the whole span
-    // uses an explicitly inferred elapsed-time bridge; raw quota anchors stay
-    // intact, but no part of that bridge is presented as measured smoothing.
-    let change_anchors = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| {
-            row.raw.is_some()
-                && accepted_remaining
-                    .get(&row.timestamp)
-                    .is_some_and(|sample| sample.reliable)
-        })
-        .fold(Vec::<usize>::new(), |mut anchors, (index, row)| {
-            let changed = anchors
-                .last()
-                .and_then(|prior| rows[*prior].raw)
-                .is_none_or(|prior| row.raw != Some(prior));
-            if changed {
-                anchors.push(index);
-            }
-            anchors
-        });
-    for anchors in change_anchors.windows(2) {
-        let [left, right] = anchors else {
-            continue;
-        };
-        let (Some(left_value), Some(right_value)) = (values[*left], values[*right]) else {
-            continue;
-        };
-        if right_value >= left_value || right.saturating_sub(*left) < 2 {
-            continue;
-        }
-        let crosses_remaining_anomaly = ((*left + 1)..*right).any(|index| {
-            rows[index].raw.is_some()
-                && !accepted_remaining
-                    .get(&rows[index].timestamp)
-                    .is_some_and(|sample| sample.reliable)
-        });
-        if crosses_remaining_anomaly {
-            continue;
-        }
-        let timestamps = rows[*left..=*right]
-            .iter()
-            .map(|row| row.timestamp)
-            .collect::<Vec<_>>();
-        let (weights, inferred_intervals, model_shaped) = remaining_drop_distribution_weights(
-            &timestamps,
-            model_timelines,
-            confirmed_gaps,
-            correction_starts,
-        );
-        let total_weight = weights.iter().sum::<f64>();
-        if total_weight <= f64::EPSILON {
-            continue;
-        }
-        let mut cumulative_weight = 0.0;
-        for (offset, index) in ((*left + 1)..*right).enumerate() {
-            cumulative_weight += weights[offset];
-            let smoothed =
-                left_value + (right_value - left_value) * (cumulative_weight / total_weight);
-            let prior_value = values[index];
-            let prior_origin = origins[index];
-            values[index] = Some(smoothed);
-            let remains_exact_raw = rows[index].raw == Some(smoothed)
-                && accepted_remaining
-                    .get(&rows[index].timestamp)
-                    .is_some_and(|sample| sample.reliable);
-            let remains_exact_bounded_hold = rows[index].raw.is_none()
-                && prior_value == Some(smoothed)
-                && prior_origin == Some(GraphRemainingOrigin::BoundedNullHold);
-            if remains_exact_raw || remains_exact_bounded_hold {
-                continue;
-            }
-            if rows[index].raw.is_none()
-                || !model_shaped
-                || inferred_intervals.get(offset).copied().unwrap_or(true)
-            {
-                origins[index] = Some(GraphRemainingOrigin::Interpolated);
-            } else if !remains_exact_raw {
-                // A raw observation still exists at a normally smoothed
-                // staircase point. Keep that measured provenance distinct
-                // from a raw-null interpolation so presentation smoothing
-                // cannot be misreported as a recorder/API incident.
-                origins[index] = Some(GraphRemainingOrigin::ActivitySmoothed);
-            }
-        }
-    }
-
     rows.into_iter()
         .enumerate()
         .filter_map(|(index, row)| {
@@ -7651,17 +7411,10 @@ fn remaining_evidence_from_model_timelines(
         .collect()
 }
 
-/// Builds the remaining-quota line from the same cumulative model snapshots
-/// used by the SOL/TERRA/LUNA lines. Model snapshots define active versus idle
-/// intervals: idle intervals stay horizontal, while remaining samples in
-/// contiguous active intervals are connected by straight lines. If model
-/// usage advances while a quota reread repeats, the repeated value is treated
-/// as a stale/missed sample and interpolated between the surrounding changes;
-/// a `1 -> 1 -> 3` sequence therefore becomes `1 -> 2 -> 3`, not a false
-/// horizontal-then-drop corner. A first lower quota observation arriving
-/// after an unobserved active interval closes that interval even when the
-/// model snapshot has already stopped changing; a genuinely idle period that
-/// never had model usage remains horizontal.
+/// Builds a read-time quota projection without deriving values from model or
+/// lifecycle activity. Valid raw observations remain exact; explicit missing,
+/// conflicting, or rejected rows hold the last valid value only as a dashed
+/// presentation point.
 #[cfg(test)]
 fn remaining_graph_points(
     samples: &[&UsageHistorySample],
@@ -7697,388 +7450,47 @@ fn remaining_graph_points_for_metric_with_sources(
     samples: &[&UsageHistorySample],
     period_start: i64,
     period_end: i64,
-    show_tokens: bool,
-    untrusted_minutes: &BTreeSet<i64>,
+    _show_tokens: bool,
+    _untrusted_minutes: &BTreeSet<i64>,
 ) -> Vec<(i64, f64)> {
-    // A history read is normally period-scoped before it reaches this
-    // function. Keep a second, fail-closed boundary here as well: legacy
-    // databases can contain two different reset periods at the same minute.
-    // If those rows disagree, choosing the last row would manufacture a
-    // vertical quota drop (for example 88% -> 14% with no model usage).
-    // Ignore the conflicting timestamp until a period-scoped observation is
-    // available instead of inventing a value from row order.
-    let mut remaining_candidates = BTreeMap::<i64, Vec<f64>>::new();
+    let accepted = accepted_remaining_samples(samples, period_start, period_end);
+    let mut rows = BTreeMap::<i64, Vec<Option<f64>>>::new();
     for sample in samples {
-        let value = sample.remaining_percent;
-        if value.is_finite() && value >= 0.0 {
-            let timestamp = sample.timestamp.clamp(period_start, period_end);
-            remaining_candidates
-                .entry(timestamp)
-                .or_default()
-                .push(value);
-        }
-    }
-    let scoped_remaining = remaining_candidates
-        .into_iter()
-        .filter_map(|(timestamp, values)| {
-            let first = values.first().copied()?;
-            let conflicting = values
-                .iter()
-                .any(|value| (value - first).abs() > f64::EPSILON);
-            (!conflicting).then_some((timestamp, first.clamp(0.0, 100.0)))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut raw_remaining = Vec::with_capacity(scoped_remaining.len() + 1);
-    for (timestamp, value) in scoped_remaining.iter() {
-        raw_remaining.push((*timestamp, *value));
-    }
-    if raw_remaining.is_empty() {
-        return raw_remaining;
-    }
-    if scoped_remaining
-        .keys()
-        .next_back()
-        .is_some_and(|timestamp| *timestamp < period_end)
-    {
-        let last_value = raw_remaining
-            .last()
-            .map(|(_, value)| *value)
-            .expect("remaining observations are non-empty");
-        raw_remaining.push((period_end, last_value));
-    }
-    if raw_remaining.len() < 2 {
-        return raw_remaining;
-    }
-
-    let model_points = graph_time_endpoints(
-        minute_model_spend_for_metric_with_untrusted(samples, show_tokens, untrusted_minutes),
-        period_start,
-        period_end,
-    );
-    let remaining_by_timestamp = raw_remaining.iter().copied().collect::<BTreeMap<_, _>>();
-
-    let (initial_timestamp, initial_remaining) = raw_remaining[0];
-    let initial_remaining = initial_remaining.clamp(0.0, 100.0);
-    if model_points.len() < 2 {
-        // The remote quota source remains authoritative even when no local
-        // Session/log observation is available. Preserve every known quota
-        // endpoint at its real time; `remaining_path_with_evidence` renders
-        // these unattributed changes as dashed rather than hiding them and
-        // collapsing the whole loss into a later recovery point.
-        let mut points: Vec<(i64, f64)> = Vec::with_capacity(raw_remaining.len());
-        let mut previous = initial_remaining;
-        for (timestamp, raw) in raw_remaining {
-            let value = raw.min(previous);
-            if let Some(last) = points.last_mut() {
-                if last.0 == timestamp {
-                    last.1 = value;
-                    previous = value;
-                    continue;
-                }
-            }
-            points.push((timestamp, value));
-            previous = value;
-        }
-        return points;
-    }
-
-    // Walk the same minute intervals used by the model paths. A segment is
-    // active only when at least one cumulative model value increases across
-    // that interval. A lower quota reread remains a fact even when local
-    // model evidence is idle or unavailable; preserve it at its observed
-    // time and let the evidence renderer mark the mismatch as inferred.
-    // Repeated active quota samples are completed by interpolation below.
-    let mut points = vec![(initial_timestamp, initial_remaining)];
-    let mut active_segments = Vec::with_capacity(model_points.len() + 1);
-    let mut previous_remaining = initial_remaining;
-    let mut previous_model = model_points[0];
-    let mut previous_timestamp = initial_timestamp;
-    // A quota value can arrive after the last model snapshot (the recorder
-    // and quota poll are independent). Keep track of whether a real quota
-    // endpoint has already been observed since the latest model change; only
-    // the first lower value after an unobserved active interval may close that
-    // interval. This preserves genuinely idle flat segments while ensuring a
-    // delayed 1% quota response is not discarded merely because model totals
-    // have stopped changing.
-    let mut quota_observed_since_model_change = true;
-    for current_model in model_points.iter().copied().skip(1) {
-        let timestamp = current_model.timestamp;
-        if timestamp <= previous_timestamp {
-            previous_model = current_model;
+        if sample.timestamp < period_start || sample.timestamp > period_end {
             continue;
         }
-        let unreliable_model =
-            !model_spend_is_reliable(&previous_model) || !model_spend_is_reliable(&current_model);
-        let model_changed = current_model.sol > previous_model.sol
-            || current_model.terra > previous_model.terra
-            || current_model.luna > previous_model.luna;
-        let active = model_changed;
-        let matched_remaining = if model_changed && !unreliable_model {
-            latest_remaining_for_model_change(
-                &remaining_by_timestamp,
-                timestamp,
-                Some(previous_timestamp),
-            )
-            .filter(|value| value.is_finite())
-            .map(|value| value.clamp(0.0, 100.0))
-        } else {
-            None
-        };
-        let delayed_quota =
-            if !unreliable_model && !model_changed && !quota_observed_since_model_change {
-                remaining_by_timestamp
-                    .range((previous_timestamp + 1)..=timestamp)
-                    .next_back()
-                    .map(|(_, value)| *value)
-                    .filter(|value| value.is_finite() && *value < previous_remaining)
-                    .map(|value| value.clamp(0.0, 100.0))
-            } else {
-                None
-            };
-        let anomaly_quota = unreliable_model
-            .then(|| {
-                remaining_by_timestamp
-                    .range((previous_timestamp + 1)..=timestamp)
-                    .next_back()
-                    .map(|(_, value)| *value)
-                    .filter(|value| value.is_finite())
-                    .map(|value| value.clamp(0.0, 100.0))
-            })
-            .flatten();
-        let unattributed_quota = (!unreliable_model && !model_changed)
-            .then(|| {
-                remaining_by_timestamp
-                    .range((previous_timestamp + 1)..=timestamp)
-                    .next_back()
-                    .map(|(_, value)| *value)
-                    .filter(|value| value.is_finite() && *value < previous_remaining)
-                    .map(|value| value.clamp(0.0, 100.0))
-            })
-            .flatten();
-        let matched_quota = matched_remaining.is_some();
-        let delayed_quota_applied = delayed_quota.is_some();
-        let unattributed_quota_applied = unattributed_quota.is_some() && !delayed_quota_applied;
-        let next_remaining = matched_remaining
-            .or(delayed_quota)
-            .or(anomaly_quota)
-            .or(unattributed_quota)
-            .map(|value| previous_remaining.min(value))
-            .unwrap_or(previous_remaining);
-        if unreliable_model {
-            quota_observed_since_model_change = anomaly_quota.is_some();
-        } else if model_changed {
-            quota_observed_since_model_change = matched_quota;
-        } else if delayed_quota_applied || unattributed_quota.is_some() {
-            quota_observed_since_model_change = true;
-        }
-
-        if unreliable_model {
-            // Model attribution is unavailable, but quota observations still
-            // have their own authority. Keep them at their observed minute
-            // and let the evidence path render any completion across missing
-            // observations as a dashed, non-authoritative bridge.
-            points.push((timestamp, next_remaining));
-            active_segments.push(true);
-        } else {
-            points.push((timestamp, next_remaining));
-            // `true` means the quota line may move across this interval. An
-            // observed but locally unattributed decrease must survive the
-            // smoothing pass; evidence rendering still keeps it dashed
-            // because the model vector itself did not advance.
-            active_segments.push(active || unattributed_quota_applied);
-        }
-        previous_remaining = next_remaining;
-        previous_model = current_model;
-        previous_timestamp = timestamp;
+        let raw = (sample.remaining_percent.is_finite()
+            && (0.0..=100.0).contains(&sample.remaining_percent))
+        .then_some(sample.remaining_percent);
+        rows.entry(sample.timestamp).or_default().push(raw);
     }
-
-    if previous_timestamp < period_end {
-        points.push((period_end, previous_remaining));
-        active_segments.push(false);
-    }
-
-    collapse_repeated_idle_remaining_points(&mut points, &mut active_segments);
-    smooth_remaining_points_with_activity(&points, &active_segments)
-}
-
-fn collapse_repeated_idle_remaining_points(
-    points: &mut Vec<(i64, f64)>,
-    active_segments: &mut Vec<bool>,
-) {
-    let mut index = 1;
-    while index + 1 < points.len() {
-        let repeated = points[index - 1].1 == points[index].1;
-        let is_vertical_boundary =
-            points[index - 1].0 == points[index].0 || points[index].0 == points[index + 1].0;
-        let joins_idle_segments = active_segments.get(index - 1) == Some(&false)
-            && active_segments.get(index) == Some(&false);
-        if repeated && !is_vertical_boundary && joins_idle_segments {
-            points.remove(index);
-            active_segments.remove(index);
-        } else {
-            index += 1;
-        }
-    }
-}
-
-fn latest_remaining_for_model_change(
-    remaining_by_timestamp: &BTreeMap<i64, f64>,
-    change_timestamp: i64,
-    previous_change: Option<i64>,
-) -> Option<f64> {
-    // Model snapshots are grouped into minute buckets before their change
-    // points are drawn. Match quota observations to that same bucket so a
-    // sample at t=100 is not lost when its model point is drawn at t=60.
-    let change_bucket = change_timestamp.div_euclid(60) * 60;
-    let bucket_candidate = remaining_by_timestamp
-        .iter()
-        .filter(|(observed_at, value)| {
-            value.is_finite()
-                && observed_at.div_euclid(60) * 60 == change_bucket
-                && previous_change.is_none_or(|previous| {
-                    observed_at.div_euclid(60) * 60 > previous.div_euclid(60) * 60
-                        || **observed_at > previous
-                })
-        })
-        .map(|(_, value)| *value)
-        .next_back();
-    if bucket_candidate.is_some() {
-        return bucket_candidate;
-    }
-
-    // If a bucket has no quota reread, a later observation in the active
-    // interval is still a valid endpoint. This fallback is deliberately not
-    // used for the first model change: pre-change observations belong to an
-    // idle interval and must not create a delayed slope.
-    previous_change.and_then(|previous| {
-        remaining_by_timestamp
+    let mut points = Vec::with_capacity(rows.len() + 1);
+    let mut baseline = None::<f64>;
+    for (timestamp, candidates) in rows {
+        let first = candidates.first().copied().flatten();
+        let raw = candidates
             .iter()
-            .filter(|(observed_at, value)| {
-                value.is_finite() && **observed_at > previous && **observed_at <= change_timestamp
+            .all(|candidate| *candidate == first)
+            .then_some(first)
+            .flatten();
+        let value = raw
+            .filter(|candidate| {
+                accepted.get(&timestamp).is_some_and(|sample| {
+                    sample.reliable && sample.raw.to_bits() == candidate.to_bits()
+                })
             })
-            .map(|(_, value)| *value)
-            .next_back()
-    })
-}
-
-fn smooth_remaining_points_with_activity(
-    points: &[(i64, f64)],
-    active_segments: &[bool],
-) -> Vec<(i64, f64)> {
-    debug_assert_eq!(active_segments.len(), points.len().saturating_sub(1));
-    if points.len() < 3 {
-        return points.to_vec();
-    }
-
-    let mut smoothed = points.to_vec();
-    let mut interpolated = vec![false; points.len()];
-    let active_duration_between = |start: usize, end: usize| {
-        (start..end)
-            .filter(|segment| active_segments.get(*segment).copied().unwrap_or(false))
-            .map(|segment| {
-                points[segment + 1]
-                    .0
-                    .saturating_sub(points[segment].0)
-                    .max(0) as f64
-            })
-            .sum::<f64>()
-    };
-    // A model can advance through several minute buckets while the quota
-    // endpoint is still the previous reread. Treat a repeated value as a
-    // missed sample only when it is bounded by a later, observed lower value.
-    // For example, `1 -> 1 -> 3` becomes `1 -> 2 -> 3`. A terminal plateau
-    // remains at the latest observation: model activity is not evidence that
-    // the service's quota reading has fallen.
-    //
-    // The search deliberately crosses short idle intervals. The line must not
-    // slope while every model is idle, but an idle interval between two active
-    // samples must not prevent the active samples on either side from being
-    // completed. Interpolation therefore advances by active duration rather
-    // than wall-clock duration: active segments slope, idle segments hold the
-    // last value.
-    for index in 1..points.len() {
-        if interpolated[index] {
-            continue;
-        }
-        if points[index - 1].0 == points[index].0 || points[index - 1].1 != points[index].1 {
-            continue;
-        }
-
-        let left_index = index - 1;
-        let left_value = points[left_index].1;
-        let mut right_index = index + 1;
-        while right_index < points.len() && points[right_index].1 >= left_value {
-            right_index += 1;
-        }
-        if right_index >= points.len() {
-            // There is no later observed lower quota value. Do not turn the
-            // latest real reading into a consumption-rate estimate.
-            continue;
-        }
-        if right_index <= left_index || points[right_index].0 <= points[left_index].0 {
-            continue;
-        }
-
-        let active_duration = active_duration_between(left_index, right_index);
-        if active_duration <= f64::EPSILON {
-            continue;
-        }
-        let right_value = points[right_index].1;
-        if right_value >= left_value {
-            continue;
-        };
-
-        let mut active_elapsed = 0.0;
-        for point_index in index..right_index {
-            if point_index > left_index
-                && active_segments
-                    .get(point_index - 1)
-                    .copied()
-                    .unwrap_or(false)
-            {
-                active_elapsed += points[point_index]
-                    .0
-                    .saturating_sub(points[point_index - 1].0)
-                    .max(0) as f64;
-            }
-            let fraction = (active_elapsed / active_duration).clamp(0.0, 1.0);
-            smoothed[point_index].1 = left_value + (right_value - left_value) * fraction;
-            interpolated[point_index] = true;
-        }
-        // For a measured lower endpoint the loop above stops before
-        // right_index, so a later pass can use it as the next anchor without
-        // accumulating floating-point error.
-    }
-
-    for index in 1..points.len() - 1 {
-        let before_active = active_segments.get(index - 1).copied().unwrap_or(false);
-        let after_active = active_segments.get(index).copied().unwrap_or(false);
-        if !before_active
-            || !after_active
-            || points[index - 1].0 == points[index].0
-            || points[index].0 == points[index + 1].0
-            // Keep the explicitly interpolated line intact. A second moving
-            // average would move its surrounding anchors and reintroduce a
-            // fold at the edge of the explicitly interpolated quota span.
-            || interpolated[index.saturating_sub(1)]
-            || interpolated[index]
-            || interpolated[index + 1]
-        {
-            continue;
-        }
-        let average = (smoothed[index - 1].1 + (2.0 * points[index].1) + points[index + 1].1) / 4.0;
-        smoothed[index].1 = average.min(smoothed[index - 1].1);
-    }
-
-    for index in 1..smoothed.len() {
-        let active = active_segments.get(index - 1).copied().unwrap_or(false);
-        if !active && smoothed[index - 1].0 != smoothed[index].0 {
-            smoothed[index].1 = smoothed[index - 1].1;
-        } else if active {
-            smoothed[index].1 = smoothed[index].1.min(smoothed[index - 1].1);
+            .inspect(|candidate| baseline = Some(*candidate))
+            .or(baseline);
+        if let Some(value) = value {
+            points.push((timestamp, value));
         }
     }
-    smoothed
+    if let Some(&(last_at, last_value)) = points.last() {
+        if last_at < period_end {
+            points.push((period_end, last_value));
+        }
+    }
+    points
 }
 
 fn quota_point_is_observed(samples: &[&UsageHistorySample], timestamp: i64, value: f64) -> bool {
@@ -8091,194 +7503,9 @@ fn quota_point_is_observed(samples: &[&UsageHistorySample], timestamp: i64, valu
     })
 }
 
-fn quota_interval_has_observed_endpoints(
-    samples: &[&UsageHistorySample],
-    start: i64,
-    end: i64,
-) -> bool {
-    let start_minute = start.div_euclid(60) * 60;
-    let end_minute = end.div_euclid(60) * 60;
-    let mut observed = samples
-        .iter()
-        .filter(|sample| {
-            sample.remaining_percent.is_finite()
-                && sample.remaining_percent >= 0.0
-                && sample.timestamp.div_euclid(60) * 60 >= start_minute
-                && sample.timestamp.div_euclid(60) * 60 <= end_minute
-        })
-        .map(|sample| sample.timestamp.div_euclid(60) * 60)
-        .collect::<Vec<_>>();
-    observed.sort_unstable();
-    observed.dedup();
-    observed.first() == Some(&start_minute) && observed.last() == Some(&end_minute)
-}
-
-fn model_interval_evidence(points: &[HourlyModelSpend], start: i64, end: i64) -> (bool, bool) {
-    let interval = points
-        .iter()
-        .filter(|point| point.timestamp >= start && point.timestamp <= end)
-        .collect::<Vec<_>>();
-    if interval.len() < 2 || interval.iter().any(|point| !model_spend_is_reliable(point)) {
-        return (false, false);
-    }
-    let advanced = interval.windows(2).any(|pair| {
-        pair[1].sol > pair[0].sol || pair[1].terra > pair[0].terra || pair[1].luna > pair[0].luna
-    });
-    (true, advanced)
-}
-
-fn generic_model_interval_evidence(
-    timelines: &GraphModelTimelines,
-    show_tokens: bool,
-    start: i64,
-    end: i64,
-) -> (bool, bool, bool) {
-    if timelines.is_empty() || end <= start {
-        return (false, false, true);
-    }
-    let mut advanced = false;
-    let inferred = false;
-    for timeline in timelines.values() {
-        let Some(before) = timeline.get(&start) else {
-            return (false, false, true);
-        };
-        let Some(after) = timeline.get(&end) else {
-            return (false, false, true);
-        };
-        let before = graph_model_value(before, show_tokens);
-        let after = graph_model_value(after, show_tokens);
-        if !timeline[&start].origin.arithmetic_reliable()
-            || !timeline[&end].origin.arithmetic_reliable()
-            || !before.is_finite()
-            || !after.is_finite()
-            || before < 0.0
-            || after < 0.0
-        {
-            return (false, false, true);
-        }
-        advanced |= after > before;
-    }
-    (true, advanced, inferred)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct GraphProjectedTokenDelta {
-    delta: f64,
-    inferred: bool,
-    exact_zero: bool,
-}
-
-/// Returns a token delta only from direct observations. Display interpolation,
-/// legacy values and holds may draw their own dashed model segments, but they
-/// cannot become input evidence for a second quota prediction.
-fn projected_model_token_delta(
-    timelines: &GraphModelTimelines,
-    start: i64,
-    end: i64,
-    confirmed_gaps: &[GraphConfirmedGap],
-    correction_starts: &BTreeSet<i64>,
-) -> Option<GraphProjectedTokenDelta> {
-    if timelines.is_empty()
-        || end <= start
-        || graph_interval_has_hard_break(start, end, confirmed_gaps, correction_starts)
-    {
-        return None;
-    }
-    let mut total = 0.0;
-    let mut exact = true;
-    let mut inferred = false;
-    for timeline in timelines.values() {
-        let before = timeline.get(&start)?;
-        let after = timeline.get(&end)?;
-        if !before.origin.display_weightable()
-            || !after.origin.display_weightable()
-            || !before.tokens.is_finite()
-            || !after.tokens.is_finite()
-            || before.tokens < 0.0
-            || after.tokens < before.tokens
-        {
-            return None;
-        }
-        total += after.tokens - before.tokens;
-        if !total.is_finite() {
-            return None;
-        }
-        exact &= before.origin.arithmetic_reliable() && after.origin.arithmetic_reliable();
-        inferred |= !before.origin.arithmetic_reliable() || !after.origin.arithmetic_reliable();
-    }
-    Some(GraphProjectedTokenDelta {
-        delta: total,
-        inferred,
-        exact_zero: exact && total <= f64::EPSILON,
-    })
-}
-
-/// Chooses one coherent weighting basis for a quota-drop span. A fully shaped
-/// span uses exact or theoretical token deltas. If any interval is unknown,
-/// elapsed time is used only among intervals not proven token-flat; a later
-/// gap therefore cannot smear a quota drop backwards through exact idle time.
-/// A quota drop with zero tokens everywhere is contradictory and falls back to
-/// a wholly inferred elapsed bridge instead of claiming idle.
-fn remaining_drop_distribution_weights(
-    timestamps: &[i64],
-    timelines: &GraphModelTimelines,
-    confirmed_gaps: &[GraphConfirmedGap],
-    correction_starts: &BTreeSet<i64>,
-) -> (Vec<f64>, Vec<bool>, bool) {
-    let elapsed = timestamps
-        .windows(2)
-        .map(|pair| pair[1].saturating_sub(pair[0]).max(0) as f64)
-        .collect::<Vec<_>>();
-    let token_deltas = timestamps
-        .windows(2)
-        .map(|pair| {
-            projected_model_token_delta(
-                timelines,
-                pair[0],
-                pair[1],
-                confirmed_gaps,
-                correction_starts,
-            )
-        })
-        .collect::<Vec<_>>();
-    if token_deltas.iter().all(Option::is_some) {
-        let projected = token_deltas
-            .iter()
-            .copied()
-            .map(|delta| delta.expect("all token deltas were checked"))
-            .collect::<Vec<_>>();
-        if projected.iter().map(|item| item.delta).sum::<f64>() > f64::EPSILON {
-            return (
-                projected.iter().map(|item| item.delta).collect(),
-                projected.iter().map(|item| item.inferred).collect(),
-                true,
-            );
-        }
-        return (elapsed, vec![true; token_deltas.len()], false);
-    }
-    let mut fallback = Vec::with_capacity(elapsed.len());
-    let mut inferred = Vec::with_capacity(elapsed.len());
-    for (duration, projection) in elapsed.iter().zip(&token_deltas) {
-        if projection.is_some_and(|item| item.exact_zero) {
-            fallback.push(0.0);
-            inferred.push(false);
-        } else {
-            fallback.push(*duration);
-            inferred.push(true);
-        }
-    }
-    if fallback.iter().sum::<f64>() <= f64::EPSILON {
-        return (elapsed, vec![true; token_deltas.len()], false);
-    }
-    (fallback, inferred, false)
-}
-
-/// Solid segments require matching, contiguous quota observations and a
-/// reliable local model vector. A missing source or an unattributed quota
-/// decrease is joined only between known endpoints with short dashed
-/// strokes. A normal open-ended remote gap holds the last measured remaining
-/// value horizontally as an explicitly dashed last-good projection; a
-/// confirmed irrecoverable gap still breaks the path entirely.
+/// Valid remote quota observations are solid independently of model/token
+/// activity. Explicitly missing or rejected intervals use the dashed
+/// prediction path, including a horizontal terminal last-good hold.
 fn remaining_paths_with_evidence(
     points: &[(i64, f64)],
     samples: &[&UsageHistorySample],
@@ -8312,6 +7539,7 @@ struct GraphRemainingSegment {
     start_index: usize,
     end_index: usize,
     kind: GraphRemainingSegmentKind,
+    smoothable: bool,
 }
 
 #[cfg(test)]
@@ -8337,64 +7565,82 @@ fn remaining_segments_with_boundaries(
 fn remaining_segments_with_boundaries_and_evidence(
     points: &[(i64, f64)],
     samples: &[&UsageHistorySample],
-    model_points: &[HourlyModelSpend],
+    _model_points: &[HourlyModelSpend],
     confirmed_gaps: &[GraphConfirmedGap],
     correction_starts: &BTreeSet<i64>,
-    model_timelines: Option<(&GraphModelTimelines, bool)>,
+    _model_timelines: Option<(&GraphModelTimelines, bool)>,
     remaining_evidence: Option<&[GraphRemainingEvidence]>,
 ) -> Vec<GraphRemainingSegment> {
-    points
-        .windows(2)
-        .enumerate()
-        .map(|(start_index, pair)| {
-            let before = pair[0];
-            let after = pair[1];
-            let kind = if graph_interval_has_hard_break(
-                before.0,
-                after.0,
-                confirmed_gaps,
-                correction_starts,
-            ) {
-                GraphRemainingSegmentKind::Inferred
-            } else {
-                let quota_evidence =
-                    remaining_point_has_measured_quota(
-                        remaining_evidence,
-                        start_index,
-                        samples,
-                        before,
-                    ) && remaining_point_has_measured_quota(
-                        remaining_evidence,
-                        start_index + 1,
-                        samples,
-                        after,
-                    ) && quota_interval_has_observed_endpoints(samples, before.0, after.0);
-                let (model_evidence, model_advanced, model_inferred) = model_timelines.map_or_else(
-                    || {
-                        let (available, advanced) =
-                            model_interval_evidence(model_points, before.0, after.0);
-                        (available, advanced, false)
-                    },
-                    |(timelines, show_tokens)| {
-                        generic_model_interval_evidence(timelines, show_tokens, before.0, after.0)
-                    },
+    let is_anchor = |index: usize| {
+        let Some(point) = points.get(index).copied() else {
+            return false;
+        };
+        if !point.1.is_finite() {
+            return false;
+        }
+        remaining_evidence.map_or_else(
+            || quota_point_is_observed(samples, point.0, point.1),
+            |evidence| {
+                evidence.get(index).is_some_and(|item| {
+                    item.timestamp == point.0
+                        && item.effective == point.1
+                        && matches!(item.origin, GraphRemainingOrigin::Raw)
+                })
+            },
+        )
+    };
+    let anchors = (0..points.len())
+        .filter(|index| is_anchor(*index))
+        .collect::<Vec<_>>();
+    let mut segments = Vec::new();
+    for pair in anchors.windows(2) {
+        let start_index = pair[0];
+        let end_index = pair[1];
+        let before = points[start_index];
+        let after = points[end_index];
+        let measured =
+            remaining_point_has_measured_quota(remaining_evidence, start_index, samples, before)
+                && remaining_point_has_measured_quota(
+                    remaining_evidence,
+                    end_index,
+                    samples,
+                    after,
                 );
-                let quota_decreased = after.1 < before.1;
-                if quota_evidence
-                    && (!quota_decreased || model_evidence && model_advanced && !model_inferred)
-                {
-                    GraphRemainingSegmentKind::Solid
-                } else {
-                    GraphRemainingSegmentKind::Inferred
-                }
-            };
-            GraphRemainingSegment {
-                start_index,
-                end_index: start_index + 1,
-                kind,
-            }
-        })
-        .collect()
+        let crosses_prediction = ((start_index + 1)..end_index).any(|index| {
+            !remaining_point_has_measured_quota(remaining_evidence, index, samples, points[index])
+        });
+        let crosses_correction =
+            graph_interval_crosses_correction(before.0, after.0, correction_starts);
+        let kind = if after.1 > before.1
+            || !measured
+            || crosses_prediction
+            || graph_interval_has_hard_break(before.0, after.0, confirmed_gaps, correction_starts)
+        {
+            GraphRemainingSegmentKind::Inferred
+        } else {
+            GraphRemainingSegmentKind::Solid
+        };
+        segments.push(GraphRemainingSegment {
+            start_index,
+            end_index,
+            kind,
+            smoothable: after.1 <= before.1 && !crosses_correction,
+        });
+    }
+    if let Some(last_anchor) = anchors.last().copied() {
+        if let Some(last_renderable) = (last_anchor + 1..points.len())
+            .rev()
+            .find(|index| points[*index].1.is_finite())
+        {
+            segments.push(GraphRemainingSegment {
+                start_index: last_anchor,
+                end_index: last_renderable,
+                kind: GraphRemainingSegmentKind::Inferred,
+                smoothable: false,
+            });
+        }
+    }
+    segments
 }
 
 fn remaining_point_has_measured_quota(
@@ -8416,11 +7662,7 @@ fn remaining_point_has_measured_quota(
         GraphRemainingOrigin::Raw => item
             .raw
             .is_some_and(|raw| quota_point_is_observed(samples, point.0, raw)),
-        GraphRemainingOrigin::ActivitySmoothed => item
-            .raw
-            .is_some_and(|raw| quota_point_is_observed(samples, point.0, raw)),
-        GraphRemainingOrigin::ResetBoundary
-        | GraphRemainingOrigin::Interpolated
+        GraphRemainingOrigin::Interpolated
         | GraphRemainingOrigin::BoundedNullHold
         | GraphRemainingOrigin::TerminalNullHold
         | GraphRemainingOrigin::SyntheticTailHold
@@ -8461,9 +7703,7 @@ fn remaining_paths_with_boundaries(context: RemainingPathContext<'_>) -> (String
             canonical_graph_viewbox_value(y),
         )
     };
-    let mut solid_commands = String::new();
-    let mut inferred_commands = String::new();
-    for segment in remaining_segments_with_boundaries_and_evidence(
+    let segments = remaining_segments_with_boundaries_and_evidence(
         points,
         samples,
         model_points,
@@ -8471,23 +7711,64 @@ fn remaining_paths_with_boundaries(context: RemainingPathContext<'_>) -> (String
         correction_starts,
         model_timelines,
         remaining_evidence,
-    ) {
-        let start = coordinate(points[segment.start_index]);
-        let end = coordinate(points[segment.end_index]);
-        match segment.kind {
-            GraphRemainingSegmentKind::Solid => {
-                if !solid_commands.is_empty() {
-                    solid_commands.push(' ');
-                }
-                solid_commands.push_str(&format!(
-                    "M{:.2} {:.2} L{:.2} {:.2}",
-                    start.0, start.1, end.0, end.1
-                ));
-            }
-            GraphRemainingSegmentKind::Inferred => {
-                append_dashed_segment(&mut inferred_commands, start, end);
+    );
+    let mut solid_commands = String::new();
+    let mut inferred_commands = String::new();
+    let curved = segments
+        .iter()
+        .copied()
+        .filter(|segment| segment.smoothable)
+        .collect::<Vec<_>>();
+    let mut run_start = 0;
+    while run_start < curved.len() {
+        let mut run_end = run_start + 1;
+        while run_end < curved.len() && curved[run_end].start_index == curved[run_end - 1].end_index
+        {
+            run_end += 1;
+        }
+        let run = &curved[run_start..run_end];
+        let mut indices = Vec::with_capacity(run.len() + 1);
+        indices.push(run[0].start_index);
+        indices.extend(run.iter().map(|segment| segment.end_index));
+        let timestamps = indices
+            .iter()
+            .map(|index| points[*index].0 as f64)
+            .collect::<Vec<_>>();
+        let values = indices
+            .iter()
+            .map(|index| points[*index].1)
+            .collect::<Vec<_>>();
+        for (interval, segment) in run.iter().enumerate() {
+            if segment.kind == GraphRemainingSegmentKind::Inferred {
+                append_monotone_cubic_dashed_interval(
+                    &mut inferred_commands,
+                    &timestamps,
+                    &values,
+                    interval,
+                    period_start,
+                    span,
+                    |raw| (99.0 - raw.clamp(0.0, 100.0) * 0.98).clamp(1.0, 99.0),
+                );
+            } else {
+                append_monotone_cubic_interval(
+                    &mut solid_commands,
+                    &timestamps,
+                    &values,
+                    interval,
+                    period_start,
+                    span,
+                    |raw| (99.0 - raw.clamp(0.0, 100.0) * 0.98).clamp(1.0, 99.0),
+                );
             }
         }
+        run_start = run_end;
+    }
+    for segment in segments.iter().filter(|segment| {
+        segment.kind == GraphRemainingSegmentKind::Inferred && !segment.smoothable
+    }) {
+        let start = coordinate(points[segment.start_index]);
+        let end = coordinate(points[segment.end_index]);
+        append_dashed_segment(&mut inferred_commands, start, end);
     }
     (solid_commands, inferred_commands)
 }
@@ -8497,76 +7778,7 @@ fn remaining_graph_y(remaining: f64) -> f64 {
 }
 
 fn smooth_model_spend(points: &[HourlyModelSpend]) -> Vec<HourlyModelSpend> {
-    if points.len() < 3 {
-        return points.to_vec();
-    }
-    let mut smoothed = Vec::with_capacity(points.len());
-    smoothed.push(points[0]);
-    for index in 1..points.len() - 1 {
-        let previous = *smoothed.last().expect("previous point exists");
-        let current = points[index];
-        let next = points[index + 1];
-        if !model_spend_is_reliable(&previous)
-            || !model_spend_is_reliable(&current)
-            || !model_spend_is_reliable(&next)
-        {
-            // Never smooth across an unavailable cumulative vector. The
-            // evidence projection owns an explicitly dashed bridge once a
-            // later whole-vector observation recovers the interval.
-            smoothed.push(current);
-            continue;
-        }
-        let previous_gap = current.timestamp.saturating_sub(previous.timestamp)
-            > MODEL_SMOOTHING_MAX_NEIGHBOR_GAP_SECONDS;
-        let next_gap = next.timestamp.saturating_sub(current.timestamp)
-            > MODEL_SMOOTHING_MAX_NEIGHBOR_GAP_SECONDS;
-        if previous_gap || next_gap {
-            smoothed.push(HourlyModelSpend {
-                timestamp: current.timestamp,
-                sol: current.sol.max(previous.sol),
-                terra: current.terra.max(previous.terra),
-                luna: current.luna.max(previous.luna),
-                astra: if current.astra >= 0.0 && previous.astra >= 0.0 {
-                    current.astra.max(previous.astra)
-                } else {
-                    current.astra
-                },
-            });
-            continue;
-        }
-        let smooth = |before: f64, value: f64, after: f64, floor: f64| {
-            ((before + 2.0 * value + after) / 4.0).max(floor)
-        };
-        smoothed.push(HourlyModelSpend {
-            timestamp: current.timestamp,
-            sol: smooth(previous.sol, current.sol, next.sol, previous.sol),
-            terra: smooth(previous.terra, current.terra, next.terra, previous.terra),
-            luna: smooth(previous.luna, current.luna, next.luna, previous.luna),
-            astra: if previous.astra >= 0.0 && current.astra >= 0.0 && next.astra >= 0.0 {
-                smooth(previous.astra, current.astra, next.astra, previous.astra)
-            } else {
-                current.astra
-            },
-        });
-    }
-    let last = *points.last().expect("points has at least three items");
-    let previous = *smoothed.last().expect("anchor exists");
-    if !model_spend_is_reliable(&last) || !model_spend_is_reliable(&previous) {
-        smoothed.push(last);
-        return smoothed;
-    }
-    smoothed.push(HourlyModelSpend {
-        timestamp: last.timestamp,
-        sol: last.sol.max(previous.sol),
-        terra: last.terra.max(previous.terra),
-        luna: last.luna.max(previous.luna),
-        astra: if last.astra >= 0.0 && previous.astra >= 0.0 {
-            last.astra.max(previous.astra)
-        } else {
-            last.astra
-        },
-    });
-    smoothed
+    points.to_vec()
 }
 
 #[cfg(test)]
@@ -25522,9 +24734,7 @@ mod tests {
 
         fn origin_name(origin: super::GraphRemainingOrigin) -> &'static str {
             match origin {
-                super::GraphRemainingOrigin::ResetBoundary => "reset_boundary",
                 super::GraphRemainingOrigin::Raw => "raw",
-                super::GraphRemainingOrigin::ActivitySmoothed => "activity_smoothed",
                 super::GraphRemainingOrigin::Interpolated => "interpolated",
                 super::GraphRemainingOrigin::BoundedNullHold => "bounded_null_hold",
                 super::GraphRemainingOrigin::TerminalNullHold => "terminal_null_hold",
@@ -26193,7 +25403,7 @@ mod tests {
                         "terra": "#5dc98a",
                         "luna": "#e6a23c",
                         "astra": "#ef6a6a",
-                        "flat_width": 1,
+                        "flat_width": 3,
                         "rising_width": 3,
                         "inferred_width": 1,
                         "remaining_width": 3,
@@ -26260,7 +25470,7 @@ mod tests {
             &references,
             period.start_at,
             period.end_at,
-            &super::activity_relevant_token_timelines(&token_timelines),
+            &token_timelines,
             true,
             &confirmed_gaps,
             &token_correction_starts,
@@ -26269,9 +25479,7 @@ mod tests {
             .iter()
             .map(|point| {
                 let origin = match point.origin {
-                    super::GraphRemainingOrigin::ResetBoundary => "reset_boundary",
                     super::GraphRemainingOrigin::Raw => "raw",
-                    super::GraphRemainingOrigin::ActivitySmoothed => "activity_smoothed",
                     super::GraphRemainingOrigin::Interpolated => "interpolated",
                     super::GraphRemainingOrigin::BoundedNullHold => "bounded_null_hold",
                     super::GraphRemainingOrigin::TerminalNullHold => "terminal_null_hold",
@@ -26316,10 +25524,7 @@ mod tests {
             &token_minute,
             &confirmed_gaps,
             &token_correction_starts,
-            Some((
-                &super::activity_relevant_token_timelines(&token_timelines),
-                true,
-            )),
+            Some((&token_timelines, true)),
             Some(&remaining_evidence),
         ) {
             actual_segments.push(serde_json::json!({
@@ -26397,7 +25602,6 @@ mod tests {
             &confirmed_gaps,
             Some(&super::GraphIdleRenderEvidence {
                 untrusted_minutes: &untrusted_minutes,
-                task_activity_by_minute: Some(&task_activity),
             }),
         )
         .into_iter()
@@ -26580,11 +25784,6 @@ mod tests {
             true,
             &confirmed_gaps,
         );
-        let task_activity = state.graph_task_activity_for_selection(
-            period.reset_at,
-            period.start_at,
-            period.end_at,
-        );
         let actual_idle = super::token_idle_timestamp_intervals_with_render_evidence(
             &references,
             period.start_at,
@@ -26593,7 +25792,6 @@ mod tests {
             &confirmed_gaps,
             Some(&super::GraphIdleRenderEvidence {
                 untrusted_minutes: &untrusted_minutes,
-                task_activity_by_minute: Some(&task_activity),
             }),
         )
         .into_iter()
@@ -26642,9 +25840,7 @@ mod tests {
 
         fn origin_name(origin: super::GraphRemainingOrigin) -> &'static str {
             match origin {
-                super::GraphRemainingOrigin::ResetBoundary => "reset_boundary",
                 super::GraphRemainingOrigin::Raw => "raw",
-                super::GraphRemainingOrigin::ActivitySmoothed => "activity_smoothed",
                 super::GraphRemainingOrigin::Interpolated => "interpolated",
                 super::GraphRemainingOrigin::BoundedNullHold => "bounded_null_hold",
                 super::GraphRemainingOrigin::TerminalNullHold => "terminal_null_hold",
@@ -26856,12 +26052,11 @@ mod tests {
             }
         }
 
-        let activity_token_timelines = super::activity_relevant_token_timelines(&token_timelines);
         let remaining = super::remaining_evidence_from_model_timelines(
             &references,
             period.start_at,
             period.end_at,
-            &activity_token_timelines,
+            &token_timelines,
             true,
             &[],
             &token_correction_starts,
@@ -26905,7 +26100,7 @@ mod tests {
             &minute,
             &[],
             &token_correction_starts,
-            Some((&activity_token_timelines, true)),
+            Some((&token_timelines, true)),
         );
         let actual_remaining = |kind| {
             remaining_segments
@@ -27280,7 +26475,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_remaining_smoothing_uses_coherent_token_deltas_or_elapsed_fallback() {
+    fn graph_valid_anchor_projection_is_token_and_activity_independent() {
         fn intervals(value: &Value) -> Vec<(i64, i64)> {
             value
                 .as_array()
@@ -27292,9 +26487,7 @@ mod tests {
 
         fn origin_name(origin: super::GraphRemainingOrigin) -> &'static str {
             match origin {
-                super::GraphRemainingOrigin::ResetBoundary => "reset_boundary",
                 super::GraphRemainingOrigin::Raw => "raw",
-                super::GraphRemainingOrigin::ActivitySmoothed => "activity_smoothed",
                 super::GraphRemainingOrigin::Interpolated => "interpolated",
                 super::GraphRemainingOrigin::BoundedNullHold => "bounded_null_hold",
                 super::GraphRemainingOrigin::TerminalNullHold => "terminal_null_hold",
@@ -27306,9 +26499,9 @@ mod tests {
         let document: Value =
             serde_json::from_str(include_str!("../tests/fixtures/graph_evidence_oracle.json"))
                 .expect("shared graph evidence fixture");
-        for (name, case) in document["remaining_smoothing_v4"]
+        for (name, case) in document["valid_anchor_projection_v5"]
             .as_object()
-            .expect("smoothing map")
+            .expect("valid anchor projection map")
         {
             let rows = case["samples"].as_array().unwrap();
             let start = rows.first().unwrap()["timestamp"].as_i64().unwrap();
@@ -27388,7 +26581,7 @@ mod tests {
             for (actual, expected) in evidence.iter().zip(expected) {
                 assert!(
                     (actual.effective - expected).abs() < 1e-9,
-                    "smoothing {name} at {}: {} != {expected}",
+                    "projection {name} at {}: {} != {expected}",
                     actual.timestamp,
                     actual.effective
                 );
@@ -32209,22 +31402,14 @@ mod tests {
         let paths = state.graph_paths_for_selection_at(observed_at, true, false, true, false);
         assert!(paths.sol_rising.is_empty());
         assert!(paths.luna_rising.is_empty());
-        assert!(
-            paths.sol_inferred.matches('M').count() > 1,
-            "legacy and unavailable spans must remain display-only"
-        );
-        assert!(paths.luna_inferred.matches('M').count() > 1);
-        assert!(
-            paths.sol_inferred.contains("L100.00"),
-            "a known model must remain continuously visible through the exact period end"
-        );
+        assert!(paths.sol_flat.is_empty());
+        assert!(paths.luna_flat.is_empty());
+        assert!(paths.sol_inferred.is_empty());
+        assert!(paths.luna_inferred.is_empty());
         assert_eq!(paths.current_sol_label, "$3.00");
         assert_eq!(paths.current_luna_label, "$0.80");
-        assert!(paths.remaining_solid.is_empty());
-        assert!(
-            !paths.remaining_inferred.is_empty(),
-            "quota changes adjacent to unavailable model evidence stay inferred"
-        );
+        assert!(!paths.remaining_solid.is_empty());
+        assert!(!paths.remaining_inferred.is_empty());
     }
 
     #[test]
@@ -38835,12 +38020,11 @@ mod tests {
             fixture.expected_graph_timestamps
         );
         let graph = state.graph_paths_for_selection_at(observed_at, true, true, true, false);
-        // v1 cannot carry source completeness. Its saved values remain
-        // displayable, but every segment is inferred and may not become an
-        // arithmetic or idle authority.
+        // v1 cannot carry source completeness. Its latest saved value remains
+        // label-only; it cannot become a line, arithmetic, or idle authority.
         assert!(graph.sol_flat.is_empty());
         assert!(graph.sol_rising.is_empty());
-        assert!(!graph.sol_inferred.is_empty());
+        assert!(graph.sol_inferred.is_empty());
         assert_eq!(graph.current_sol_label, "$420.40");
         // The model universe is exactly the three names published by v1.
         // One final flat recorder interval is rendered as a thin measured
@@ -40672,8 +39856,11 @@ mod tests {
         }));
 
         let paths = state.graph_paths_for_selection_at(observed_at, true, true, true, false);
-        assert!(!paths.remaining.is_empty());
-        assert!(!paths.sol.is_empty());
+        assert!(paths.remaining_solid.is_empty());
+        assert!(!paths.remaining_inferred.is_empty());
+        assert!(paths.sol_flat.is_empty());
+        assert!(paths.sol_rising.is_empty());
+        assert!(paths.sol_inferred.is_empty());
         assert_eq!(paths.current_sol_label, "$3.00");
     }
 
@@ -41442,9 +40629,8 @@ mod tests {
             .all(|pair| pair[0].1 - pair[1].1 <= 1.0 + f64::EPSILON));
 
         let graph = graph_paths_for_selection(&references, 0, 300, true, true, true, false);
-        // Inferred model recovery and unattributed quota movement are drawn
-        // as multiple separated strokes, never a solid flat-then-vertical
-        // fiction at the recovery timestamp.
+        // Inferred model recovery is drawn as multiple separated strokes,
+        // while every accepted quota observation remains a measured anchor.
         assert!(graph.sol_inferred.matches('M').count() > 2);
         assert!(!graph.sol_rising.contains("M60.00"));
         assert!(graph.remaining.matches('M').count() > 5);
@@ -41503,15 +40689,17 @@ mod tests {
             model_timelines: &BTreeMap::new(),
         });
 
-        assert!(graph.sol_rising.contains("M0.00 99.00 L33.33 66.33"));
+        assert!(graph.sol_rising.starts_with("M0.00 99.00"));
+        assert!(graph.sol_rising.contains("L33.33 66.33"));
         assert!(!graph.sol_rising.contains("M33.33 66.33 L66.67 33.67"));
         assert!(
-            graph.sol_rising.contains("M66.67 33.67 L100.00 1.00"),
+            graph.sol_rising.contains("M66.67 33.67") && graph.sol_rising.ends_with("L100.00 1.00"),
             "sol_rising={}",
             graph.sol_rising
         );
         assert!(
-            graph.remaining.contains("M0.00 1.00 L33.33 10.80"),
+            graph.remaining_solid.starts_with("M0.00 1.00")
+                && graph.remaining_solid.contains("L33.33 10.80"),
             "remaining={} solid={} inferred={}",
             graph.remaining,
             graph.remaining_solid,
@@ -41519,7 +40707,8 @@ mod tests {
         );
         assert!(!graph.remaining.contains("M33.33 10.80 L66.67 20.60"));
         assert!(
-            graph.remaining.contains("M66.67 20.60 L100.00 30.40"),
+            graph.remaining_solid.contains("M66.67 20.60")
+                && graph.remaining_solid.ends_with("L100.00 30.40"),
             "remaining={} solid={} inferred={}",
             graph.remaining,
             graph.remaining_solid,
@@ -41716,7 +40905,7 @@ mod tests {
     }
 
     #[test]
-    fn remaining_graph_preserves_unattributed_quota_changes_as_inferred() {
+    fn remaining_graph_keeps_direct_quota_changes_solid_independent_of_model_spend() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
             UsageHistorySample::new(60, 1_000, 90.0, ModelDollarTotals::default()),
@@ -41724,10 +40913,8 @@ mod tests {
             UsageHistorySample::new(180, 1_000, 70.0, ModelDollarTotals::default()),
         ];
         let references = samples.iter().collect::<Vec<_>>();
-        // Remote quota observations are not discarded just because local
-        // logs stayed flat. They remain at their real timestamps, while the
-        // evidence path uses separated dash strokes because no model change
-        // attributes the loss.
+        // Remote quota observations are independent of local model activity.
+        // Every valid raw value remains a measured anchor at its timestamp.
         assert_eq!(
             remaining_graph_points(&references, 0, 240),
             vec![
@@ -41738,9 +40925,9 @@ mod tests {
                 (240, 70.0)
             ]
         );
-        let path = graph_paths(&references, 0, 240).remaining;
-        assert!(path.matches('M').count() > 5);
-        assert!(!path.contains("M0.00 1.00 L25.00 10.80"));
+        let paths = graph_paths(&references, 0, 240);
+        assert!(!paths.remaining_solid.is_empty());
+        assert!(paths.remaining_inferred.contains("M75.00 30.40"));
     }
 
     #[test]
@@ -41887,7 +41074,7 @@ mod tests {
     }
 
     #[test]
-    fn remaining_graph_keeps_idle_quota_observations_without_calling_them_model_attributed() {
+    fn remaining_graph_keeps_all_direct_quota_observations_independent_of_models() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
             UsageHistorySample::new(60, 1_000, 95.0, ModelDollarTotals::default()),
@@ -41935,13 +41122,14 @@ mod tests {
                 (240, 80.0)
             ]
         );
-        let path = graph_paths(&references, 0, 240).remaining;
-        assert!(path.matches('M').count() > 5);
-        assert!(path.contains("M25.00 5.90 L50.00 10.80"));
+        let paths = graph_paths(&references, 0, 240);
+        assert!(paths.remaining_inferred.is_empty());
+        assert!(paths.remaining_solid.starts_with("M0.00 1.00"));
+        assert!(paths.remaining_solid.ends_with("L100.00 20.60"));
     }
 
     #[test]
-    fn remaining_graph_aligns_quota_with_minute_bucket_model_changes() {
+    fn remaining_graph_keeps_quota_at_its_original_jittered_timestamps() {
         let mut initial = UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default());
         let mut idle = UsageHistorySample::new(0, 1_000, 95.0, ModelDollarTotals::default());
         let mut first_active = UsageHistorySample::new(
@@ -41962,8 +41150,8 @@ mod tests {
                 ..ModelDollarTotals::default()
             },
         );
-        // Keep quota observations at their actual timestamps while model
-        // snapshots are drawn at minute-bucket starts (60 and 120).
+        // Quota observations remain at their actual timestamps independently
+        // of the minute buckets used for model snapshots.
         initial.timestamp = 0;
         idle.timestamp = 40;
         first_active.timestamp = 100;
@@ -41973,16 +41161,21 @@ mod tests {
 
         assert_eq!(
             remaining_graph_points(&references, 0, 240),
-            vec![(0, 100.0), (60, 90.0), (120, 80.0), (240, 80.0)]
+            vec![
+                (0, 100.0),
+                (40, 95.0),
+                (100, 90.0),
+                (160, 80.0),
+                (240, 80.0)
+            ]
         );
-        let path = graph_paths(&references, 0, 240).remaining;
-        assert!(path.starts_with("M0.00 1.00 L25.00 10.80 M25.00 10.80 L50.00 20.60"));
-        assert!(path.matches('M').count() > 5);
-        assert!(!path.contains("L50.00 20.60 L100.00 20.60"));
+        let paths = graph_paths(&references, 0, 240);
+        assert!(paths.remaining_inferred.contains("M66.67 20.60"));
+        assert!(paths.remaining_solid.starts_with("M0.00 1.00"));
     }
 
     #[test]
-    fn remaining_graph_interpolates_repeated_active_quota_samples() {
+    fn remaining_graph_preserves_repeated_quota_samples_during_model_activity() {
         let samples = [
             UsageHistorySample::new_with_usage(
                 0,
@@ -42005,8 +41198,7 @@ mod tests {
                 },
             ),
             // Model usage continues while the measured quota reread is
-            // unchanged. Smooth the staircase for presentation, but do not
-            // present the changed display value as a measured quota point.
+            // unchanged. The raw quota anchor remains unchanged.
             UsageHistorySample::new_with_usage(
                 120,
                 1_000,
@@ -42054,7 +41246,7 @@ mod tests {
             vec![
                 (0, 100.0),
                 (60, 90.0),
-                (120, 85.0),
+                (120, 90.0),
                 (180, 80.0),
                 (240, 80.0)
             ]
@@ -42090,10 +41282,8 @@ mod tests {
                 confirmed_gaps: &[],
                 model_timelines: &raw_timelines,
             });
-        assert_eq!(
-            paths.remaining_solid,
-            "M0.00 1.00 L25.00 10.80 M25.00 10.80 L50.00 15.70 M50.00 15.70 L75.00 20.60 M75.00 20.60 L100.00 20.60"
-        );
+        assert!(paths.remaining_solid.starts_with("M0.00 1.00"));
+        assert!(paths.remaining_solid.ends_with("L100.00 20.60"));
         assert!(paths.remaining_inferred.is_empty());
         assert!(!paths.remaining.contains("L50.00 10.80 L50.00 15.70"));
         assert_eq!(paths.current_remaining_label, "80%");
@@ -42153,7 +41343,7 @@ mod tests {
     }
 
     #[test]
-    fn remaining_graph_interpolates_across_an_idle_sampling_gap() {
+    fn remaining_graph_preserves_repeated_direct_values_across_sampling_gaps() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
             UsageHistorySample::new(
@@ -42165,8 +41355,7 @@ mod tests {
                     ..ModelDollarTotals::default()
                 },
             ),
-            // The model advances again, but the quota reread repeats. This is
-            // a missing sample, not a reason to draw a horizontal fold.
+            // The model advances again, but the direct quota reread repeats.
             UsageHistorySample::new(
                 120,
                 1_000,
@@ -42176,8 +41365,8 @@ mod tests {
                     ..ModelDollarTotals::default()
                 },
             ),
-            // No model advances in this interval. The completed line must
-            // hold its value here rather than inventing a quota slope.
+            // No model advances in this interval; the direct quota still
+            // remains an independent raw anchor.
             UsageHistorySample::new(
                 180,
                 1_000,
@@ -42204,15 +41393,15 @@ mod tests {
             vec![
                 (0, 100.0),
                 (60, 90.0),
-                (120, 85.0),
-                (180, 85.0),
+                (120, 90.0),
+                (180, 90.0),
                 (240, 80.0)
             ]
         );
     }
 
     #[test]
-    fn remaining_graph_smooths_the_line_at_internal_model_change_points() {
+    fn remaining_graph_preserves_raw_values_at_internal_model_change_points() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
             UsageHistorySample::new(
@@ -42246,17 +41435,15 @@ mod tests {
         let references = samples.iter().collect::<Vec<_>>();
         let points = remaining_graph_points(&references, 0, 180);
 
-        // The internal 120-second change point is smoothed from its two
-        // neighboring active endpoints: (90 + 2*80 + 60) / 4 = 77.5.
         assert_eq!(
             points,
-            vec![(0, 100.0), (60, 90.0), (120, 77.5), (180, 60.0)]
+            vec![(0, 100.0), (60, 90.0), (120, 80.0), (180, 60.0)]
         );
         assert!(points.windows(2).all(|pair| pair[0].1 >= pair[1].1));
     }
 
     #[test]
-    fn remaining_label_matches_smoothed_path_endpoint() {
+    fn remaining_label_matches_the_accepted_anomaly_projection() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
             UsageHistorySample::new(60, 1_000, 0.0, ModelDollarTotals::default()),
@@ -42266,9 +41453,9 @@ mod tests {
         ];
         let references = samples.iter().collect::<Vec<_>>();
         let paths = graph_paths(&references, 0, 120);
-        assert_eq!(paths.current_remaining_label, "0%");
+        assert_eq!(paths.current_remaining_label, "10%");
         let remaining = remaining_graph_points(&references, 0, 120);
-        assert_eq!(remaining, [(0, 100.0), (60, 0.0), (120, 0.0)]);
+        assert_eq!(remaining, [(0, 100.0), (60, 100.0), (120, 10.0)]);
         assert!(paths.remaining.matches('M').count() > 2);
     }
 
@@ -42287,8 +41474,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             [99, 98, 97]
         );
-        assert!((markers[0].x - 40.0).abs() < f64::EPSILON);
-        assert!((markers[1].x - (500.0 / 7.0)).abs() < 0.000_000_1);
+        assert!((markers[0].x - 50.0).abs() < f64::EPSILON);
+        assert!((markers[1].x - 75.0).abs() < 0.000_000_1);
         assert!((markers[2].x - 100.0).abs() < f64::EPSILON);
         for (marker, boundary) in markers.iter().zip([99.0, 98.0, 97.0]) {
             let expected_y = 99.0 - boundary * 0.98;
@@ -42737,13 +41924,10 @@ mod tests {
                 model_timelines: &model_timelines,
             });
 
-        assert_eq!(
-            tokens.remaining_solid, "M0.00 1.00 L50.00 10.80 M50.00 10.80 L75.00 20.60",
-            "remaining={}",
-            tokens.remaining
-        );
+        assert!(tokens.remaining_solid.starts_with("M0.00 1.00"));
+        assert!(tokens.remaining_solid.ends_with("L75.00 20.60"));
         assert!(!tokens.remaining_inferred.is_empty());
-        assert!(tokens.remaining_solid.contains("M0.00"));
+        assert!(tokens.remaining_inferred.starts_with("M75.00 20.60"));
     }
 
     #[test]
@@ -42936,8 +42120,10 @@ mod tests {
         let (flat, rising, inferred) =
             split_metric_line_paths(&points, 0, 240, 4.0, |point| point.sol);
 
-        assert!(flat.contains("M0.00 74.50 L25.00 74.50"));
-        assert!(rising.contains("M25.00 74.50 L50.00 25.50"));
+        assert!(flat.starts_with("M0.00 74.50"));
+        assert!(flat.ends_with("L25.00 74.50"));
+        assert!(rising.starts_with("M25.00 74.50"));
+        assert!(rising.ends_with("L50.00 25.50"));
         assert!(inferred.matches('M').count() > 1);
         assert!(!flat.contains("M50.00"));
         assert!(!rising.contains("M50.00"));
@@ -42976,7 +42162,8 @@ mod tests {
         // sparsity alone is not a missing-data marker, so the interval keeps
         // the same measured line role as an ordinary one-minute sample.
         assert!(!flat.contains("M1.64 50.00 L98.36 50.00"));
-        assert!(rising.contains("M1.64 50.00 L98.36 1.00"));
+        assert!(rising.starts_with("M1.64 50.00"));
+        assert!(rising.ends_with("L98.36 1.00"));
         assert!(inferred.is_empty());
 
         let equal_endpoints = [
@@ -43052,7 +42239,8 @@ mod tests {
             split_metric_line_paths(&points, 0, 240, 4.0, |point| point.sol);
 
         assert!(!flat.contains("M0.00 99.00 L75.00 99.00"));
-        assert!(flat.contains("M75.00 1.00 L100.00 1.00"));
+        assert!(flat.starts_with("M75.00 1.00"));
+        assert!(flat.ends_with("L100.00 1.00"));
         assert!(!rising.contains("M75.00 99.00 L75.00 1.00"));
         assert!(!rising.contains("M0.00 99.00 L75.00 1.00"));
         assert!(inferred.is_empty());
@@ -43453,53 +42641,14 @@ mod tests {
             &corrections,
         );
         assert_eq!(remaining.len(), 5);
-        assert!((remaining[1].effective - 16.75).abs() < 0.000_001);
-        assert!((remaining[2].effective - 16.50).abs() < 0.000_001);
-        assert!((remaining[3].effective - 16.25).abs() < 0.000_001);
+        assert!((remaining[1].effective - 17.0).abs() < 0.000_001);
+        assert!((remaining[2].effective - 17.0).abs() < 0.000_001);
+        assert!((remaining[3].effective - 17.0).abs() < 0.000_001);
         assert!(remaining[1..4]
             .iter()
-            .all(|point| point.origin == super::GraphRemainingOrigin::Interpolated));
-        assert!(!graph.remaining_inferred.is_empty());
-    }
-
-    #[test]
-    fn complete_lifecycle_keeps_later_token_burst_out_of_prior_idle_minutes() {
-        let point = |tokens, origin| super::GraphModelPoint {
-            dollar: tokens / 1_000_000.0,
-            tokens,
-            raw_tokens: Some(tokens as u64),
-            origin,
-        };
-        let mut timelines = BTreeMap::from([(
-            "SOL".to_owned(),
-            BTreeMap::from([
-                (0, point(100.0, super::GraphModelOrigin::Direct)),
-                (60, point(125.0, super::GraphModelOrigin::Interpolated)),
-                (120, point(150.0, super::GraphModelOrigin::Interpolated)),
-                (180, point(175.0, super::GraphModelOrigin::Interpolated)),
-                (240, point(200.0, super::GraphModelOrigin::Direct)),
-            ]),
-        )]);
-        let activity = BTreeMap::from([
-            (60, Some(false)),
-            (120, Some(false)),
-            (180, Some(false)),
-            (240, Some(true)),
-        ]);
-
-        super::shape_inferred_model_timelines_by_task_activity(
-            &mut timelines,
-            true,
-            Some(&activity),
-        );
-
-        let sol = &timelines["SOL"];
-        for timestamp in [60, 120, 180] {
-            assert_eq!(sol[&timestamp].tokens, 100.0);
-            assert_eq!(sol[&timestamp].origin, super::GraphModelOrigin::BoundedFlat);
-        }
-        assert_eq!(sol[&240].tokens, 200.0);
-        assert_eq!(sol[&240].origin, super::GraphModelOrigin::Direct);
+            .all(|point| point.origin == super::GraphRemainingOrigin::Raw));
+        assert!(graph.remaining_inferred.is_empty());
+        assert!(!graph.remaining_solid.is_empty());
     }
 
     #[test]
@@ -43951,7 +43100,7 @@ mod tests {
     }
 
     #[test]
-    fn inactive_single_unavailable_minute_bridges_idle_band() {
+    fn single_unavailable_minute_splits_idle_band_regardless_of_activity() {
         let samples = (0..=10)
             .map(|minute| {
                 UsageHistorySample::new(
@@ -44004,9 +43153,7 @@ mod tests {
                 Some(&activity),
             );
 
-        assert_eq!(graph.unused_intervals.len(), 1);
-        assert_eq!(graph.unused_intervals[0].start, 0.0);
-        assert_eq!(graph.unused_intervals[0].width, 100.0);
+        assert!(graph.unused_intervals.is_empty());
     }
 
     #[test]
@@ -44129,8 +43276,8 @@ mod tests {
             );
 
         assert_eq!(graph.unused_intervals.len(), 2);
-        assert!((graph.unused_intervals[0].start - 0.0).abs() < 1e-9);
-        assert!((graph.unused_intervals[0].width - (1_200.0 / 2_040.0 * 100.0)).abs() < 1e-9);
+        assert!((graph.unused_intervals[0].start - (360.0 / 2_040.0 * 100.0)).abs() < 1e-9);
+        assert!((graph.unused_intervals[0].width - (840.0 / 2_040.0 * 100.0)).abs() < 1e-9);
         assert!((graph.unused_intervals[1].start - (1_320.0 / 2_040.0 * 100.0)).abs() < 1e-9);
         assert!((graph.unused_intervals[1].width - (720.0 / 2_040.0 * 100.0)).abs() < 1e-9);
     }
@@ -44184,7 +43331,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_compares_endpoint_intersection_and_fails_closed_without_common_model() {
+    fn idle_requires_identical_endpoint_model_sets() {
         let samples = (0..=30)
             .map(|minute| {
                 UsageHistorySample::new(minute * 60, 10_000, 90.0, ModelDollarTotals::default())
@@ -44221,7 +43368,7 @@ mod tests {
             &[],
             None,
         );
-        assert_eq!(idle, vec![(0, 1_800)]);
+        assert_eq!(idle, vec![(60, 1_800)]);
 
         let mut sol = BTreeMap::new();
         let mut luna = BTreeMap::new();
@@ -44275,7 +43422,7 @@ mod tests {
             &[],
             None,
         );
-        assert_eq!(idle, vec![(0, 1_680), (1_740, 3_480)]);
+        assert_eq!(idle, vec![(0, 1_680), (1_800, 3_480)]);
     }
 
     #[test]
@@ -44339,8 +43486,8 @@ mod tests {
             );
 
         assert_eq!(graph.unused_intervals.len(), 1);
-        assert!((graph.unused_intervals[0].start - 100.0 / 12.0).abs() < 0.000_001);
-        assert!((graph.unused_intervals[0].width - 1100.0 / 12.0).abs() < 0.000_001);
+        assert!(graph.unused_intervals[0].start.abs() < 0.000_001);
+        assert!((graph.unused_intervals[0].width - 100.0).abs() < 0.000_001);
         assert!(!graph.sol_flat.is_empty());
         assert!(
             graph.sol_inferred.is_empty(),
@@ -44429,7 +43576,7 @@ mod tests {
     }
 
     #[test]
-    fn quota_staircase_follows_non_uniform_token_deltas() {
+    fn quota_projection_preserves_valid_raw_anchors_independent_of_token_deltas() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
             UsageHistorySample::new(60, 1_000, 100.0, ModelDollarTotals::default()),
@@ -44468,7 +43615,7 @@ mod tests {
                 .iter()
                 .map(|point| point.effective)
                 .collect::<Vec<_>>(),
-            vec![100.0, 97.0, 94.0, 70.0]
+            vec![100.0, 100.0, 100.0, 70.0]
         );
         assert_eq!(
             remaining
@@ -44477,15 +43624,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 super::GraphRemainingOrigin::Raw,
-                super::GraphRemainingOrigin::ActivitySmoothed,
-                super::GraphRemainingOrigin::ActivitySmoothed,
+                super::GraphRemainingOrigin::Raw,
+                super::GraphRemainingOrigin::Raw,
                 super::GraphRemainingOrigin::Raw,
             ]
         );
     }
 
     #[test]
-    fn activity_smoothed_raw_quota_remains_a_measured_solid_segment() {
+    fn every_valid_raw_quota_anchor_remains_a_measured_solid_segment() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
             UsageHistorySample::new(60, 1_000, 100.0, ModelDollarTotals::default()),
@@ -44524,8 +43671,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 super::GraphRemainingOrigin::Raw,
-                super::GraphRemainingOrigin::ActivitySmoothed,
-                super::GraphRemainingOrigin::ActivitySmoothed,
+                super::GraphRemainingOrigin::Raw,
+                super::GraphRemainingOrigin::Raw,
                 super::GraphRemainingOrigin::Raw,
             ]
         );
@@ -44548,7 +43695,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_leading_quota_is_reconstructed_from_the_reset_boundary() {
+    fn missing_leading_quota_starts_only_at_the_first_direct_anchor() {
         let period_start = 0;
         let reset_at = period_start + super::WEEK_SECONDS;
         let sample = |timestamp, remaining_percent| UsageHistorySample {
@@ -44573,9 +43720,8 @@ mod tests {
             dollar: tokens / 1_000_000.0,
             tokens,
             raw_tokens: Some(tokens as u64),
-            // Reset-boundary quota projection is allowed only when the model
-            // timeline is backed by direct, complete observations. Legacy
-            // values may be displayed but cannot drive this arithmetic.
+            // Direct model evidence must not create a leading quota value.
+            // Remaining starts only at its own first direct observation.
             origin: super::GraphModelOrigin::Direct,
         };
         let timelines = BTreeMap::from([(
@@ -44598,18 +43744,10 @@ mod tests {
             &BTreeSet::new(),
         );
 
-        assert_eq!(remaining.first().map(|point| point.timestamp), Some(0));
-        assert_eq!(remaining.first().map(|point| point.effective), Some(100.0));
-        assert_eq!(
-            remaining.first().map(|point| point.origin),
-            Some(super::GraphRemainingOrigin::ResetBoundary)
-        );
-        assert!(remaining[1..3].iter().all(|point| {
-            point.effective < 100.0
-                && point.effective > 98.0
-                && point.origin == super::GraphRemainingOrigin::Interpolated
-        }));
-        assert_eq!(remaining.last().map(|point| point.effective), Some(98.0));
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].timestamp, 180);
+        assert_eq!(remaining[0].effective, 98.0);
+        assert_eq!(remaining[0].origin, super::GraphRemainingOrigin::Raw);
     }
 
     #[test]
@@ -44682,7 +43820,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_token_interval_keeps_smoothed_remaining_horizontal() {
+    fn valid_remaining_anchors_are_not_reshaped_by_token_intervals() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
             UsageHistorySample::new(60, 1_000, 100.0, ModelDollarTotals::default()),
@@ -44721,12 +43859,60 @@ mod tests {
                 .iter()
                 .map(|point| point.effective)
                 .collect::<Vec<_>>(),
-            vec![100.0, 100.0, 85.0, 70.0]
+            vec![100.0, 100.0, 100.0, 70.0]
         );
     }
 
     #[test]
-    fn token_weighted_null_quota_rows_remain_inferred() {
+    fn isolated_anomalies_are_detected_across_sampling_jitter() {
+        let samples = [
+            UsageHistorySample::new(0, 1_000, 90.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(61, 1_000, 80.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(183, 1_000, 89.0, ModelDollarTotals::default()),
+        ];
+        let references = samples.iter().collect::<Vec<_>>();
+        let point = |tokens| super::GraphModelPoint {
+            dollar: tokens,
+            tokens,
+            raw_tokens: Some(tokens as u64),
+            origin: super::GraphModelOrigin::Direct,
+        };
+        let timelines = BTreeMap::from([(
+            "SOL".to_owned(),
+            BTreeMap::from([(0, point(10.0)), (61, point(20.0)), (183, point(11.0))]),
+        )]);
+        let projection_minutes = BTreeSet::from([0, 61, 183]);
+
+        let (accepted, _) =
+            super::accepted_graph_model_timelines(&timelines, &projection_minutes, true, &[]);
+        assert_eq!(
+            accepted["SOL"][&61].origin,
+            super::GraphModelOrigin::Rejected
+        );
+        assert_eq!(
+            accepted["SOL"][&183].origin,
+            super::GraphModelOrigin::Direct
+        );
+
+        let remaining = super::remaining_evidence_from_model_timelines(
+            &references,
+            0,
+            183,
+            &timelines,
+            true,
+            &[],
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            remaining[1].origin,
+            super::GraphRemainingOrigin::MonotonicHold
+        );
+        assert_eq!(remaining[2].origin, super::GraphRemainingOrigin::Raw);
+        assert_eq!(remaining[2].effective, 89.0);
+    }
+
+    #[test]
+    fn null_quota_rows_use_elapsed_interpolation_and_remain_inferred() {
         let samples = [
             UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
             UsageHistorySample::from_model_history(60, 1_000, ModelDollarTotals::default()),
@@ -44765,7 +43951,7 @@ mod tests {
                 .iter()
                 .map(|point| point.effective)
                 .collect::<Vec<_>>(),
-            vec![100.0, 97.0, 94.0, 70.0]
+            vec![100.0, 90.0, 80.0, 70.0]
         );
         assert!(remaining[1..3]
             .iter()
@@ -45296,8 +44482,8 @@ mod tests {
             });
         assert!(!graph.sol_inferred.is_empty());
         assert!(!graph.sol_rising.is_empty());
-        assert!(!graph.remaining_inferred.is_empty());
-        assert!(graph.remaining_solid.is_empty());
+        assert!(graph.remaining_inferred.is_empty());
+        assert!(!graph.remaining_solid.is_empty());
     }
 
     #[test]
@@ -45344,18 +44530,17 @@ mod tests {
                 ..HourlyModelSpend::default()
             },
         ];
-        assert_eq!(
-            metric_line_path_with_confirmed_gaps(
-                &points,
-                0,
-                240,
-                0.0,
-                |point| point.sol,
-                &[],
-                &BTreeSet::new(),
-            ),
-            "M75.00 99.00 L100.00 99.00"
+        let path = metric_line_path_with_confirmed_gaps(
+            &points,
+            0,
+            240,
+            0.0,
+            |point| point.sol,
+            &[],
+            &BTreeSet::new(),
         );
+        assert!(path.starts_with("M75.00 99.00"));
+        assert!(path.ends_with("L100.00 99.00"));
     }
 
     #[test]
@@ -45837,7 +45022,7 @@ mod tests {
                 .split("Path {")
                 .find(|body| body.contains(&format!("commands: root.{path_name};")))
                 .expect(path_name);
-            assert!(path.contains("stroke-width: 1px;"), "{path_name}");
+            assert!(path.contains("stroke-width: 3px;"), "{path_name}");
             assert!(path.contains("opacity: 0.95;"), "{path_name}");
         }
         for path_name in [
@@ -45878,6 +45063,124 @@ mod tests {
         assert!(
             inferred.matches('M').count() >= 12,
             "inferred cadence must remain short and dense: {inferred}"
+        );
+    }
+
+    #[test]
+    fn monotone_cubic_projection_matches_fixed_no_overshoot_oracle() {
+        let increasing = super::monotone_cubic_interval_values(
+            &[0.0, 1.0, 2.0],
+            &[0.0, 1.0, 1.0],
+            0,
+            &[0.25, 0.5, 0.75],
+        )
+        .expect("valid increasing spline");
+        assert_eq!(increasing, vec![0.367_187_5, 0.687_5, 0.914_062_5]);
+
+        let decreasing = super::monotone_cubic_interval_values(
+            &[0.0, 1.0, 2.0],
+            &[100.0, 90.0, 70.0],
+            0,
+            &[0.5],
+        )
+        .expect("valid decreasing spline");
+        assert!((decreasing[0] - 96.041_666_666_666_67).abs() < 1e-12);
+        let second = super::monotone_cubic_interval_values(
+            &[0.0, 1.0, 2.0],
+            &[100.0, 90.0, 70.0],
+            1,
+            &[0.5],
+        )
+        .expect("valid second interval");
+        assert!((second[0] - 81.458_333_333_333_33).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bounded_missing_interval_uses_the_same_smoothed_anchor_geometry() {
+        let points = vec![
+            HourlyModelSpend {
+                timestamp: 0,
+                sol: 0.0,
+                terra: 0.0,
+                luna: 0.0,
+                astra: 0.0,
+            },
+            HourlyModelSpend {
+                timestamp: 60,
+                sol: 0.5,
+                terra: 0.0,
+                luna: 0.0,
+                astra: 0.0,
+            },
+            HourlyModelSpend {
+                timestamp: 120,
+                sol: 1.0,
+                terra: 0.0,
+                luna: 0.0,
+                astra: 0.0,
+            },
+            HourlyModelSpend {
+                timestamp: 180,
+                sol: 3.0,
+                terra: 0.0,
+                luna: 0.0,
+                astra: 0.0,
+            },
+        ];
+        let untrusted_minutes = BTreeSet::from([60]);
+        let correction_starts = BTreeSet::new();
+        let context = super::MetricLinePathContext {
+            points: &points,
+            period_start: 0,
+            period_end: 180,
+            maximum: 3.0,
+            confirmed_gaps: &[],
+            untrusted_minutes: &untrusted_minutes,
+            require_legacy_vector: false,
+            correction_starts: &correction_starts,
+        };
+        let (_, rising, inferred) =
+            super::split_metric_line_paths_with_boundaries(&context, |point| point.sol);
+
+        let mut straight_bridge = String::new();
+        super::append_dashed_segment(
+            &mut straight_bridge,
+            (0.0, 99.0),
+            (66.666_666_666_667, 66.333_333_333_333),
+        );
+        assert!(!rising.is_empty());
+        assert!(!inferred.is_empty());
+        assert_ne!(
+            inferred, straight_bridge,
+            "a bounded missing interval must retain the PCHIP curve defined by valid anchors"
+        );
+
+        let remaining_samples = [
+            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(120, 1_000, 90.0, ModelDollarTotals::default()),
+            UsageHistorySample::new(180, 1_000, 70.0, ModelDollarTotals::default()),
+        ];
+        let remaining_references = remaining_samples.iter().collect::<Vec<_>>();
+        let remaining = super::graph_paths_with_confirmed_gaps(
+            &remaining_references,
+            0,
+            180,
+            &[super::GraphConfirmedGap {
+                start_at: 0,
+                end_at: 120,
+            }],
+        );
+        let mut straight_remaining_bridge = String::new();
+        super::append_dashed_segment(
+            &mut straight_remaining_bridge,
+            (0.0, 1.0),
+            (66.666_666_666_667, 10.8),
+        );
+        assert!(!remaining.remaining_solid.is_empty());
+        assert!(!remaining.remaining_inferred.is_empty());
+        assert_ne!(
+            remaining.remaining_inferred, straight_remaining_bridge,
+            "a bounded missing Remaining interval must retain the PCHIP curve defined by valid anchors"
         );
     }
 

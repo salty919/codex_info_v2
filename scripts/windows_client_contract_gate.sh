@@ -40,16 +40,17 @@ if [[ "$profile" == history-graph ]]; then
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_shared_v3_oracle_matches_values_roles_idle_and_pair_through_http_parser
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_continuity_v4_oracle_is_identical_for_dollars_tokens_and_exact_period_end
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_idle_and_anomaly_counterexamples_match_the_shared_oracle
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_remaining_smoothing_uses_coherent_token_delta_or_elapsed_weights
+        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue134_valid_anchor_projection_is_token_and_activity_independent
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_cumulative_anomaly_fixture_never_paints_a_vertical_drop
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Issue137_shared_oracle_matches_regression_and_quota_anomaly_rules
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Remaining_stair_step_is_smoothed_across_coherent_token_deltas
+        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Remaining_stair_step_preserves_valid_anchors_and_smooths_only_render_geometry
+        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.BoundedMissingIntervalUsesTheSameSmoothedAnchorGeometry
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.IdleBandRasterIsOpaqueAboveTheMajorGridAndBelowDataSeries
         CodexInfo.WindowsClient.Presentation.Tests.DetailsPresentationCoverageTests.GraphWindow_ExactStaleCursorRetriesHeadOnceAndPreservesResetStateAcrossFailures
         CodexInfo.WindowsClient.Presentation.Tests.DetailsPresentationCoverageTests.GraphWindow_PublishedPairAdvanceRealignsOnceWithoutFalseFailure
         CodexInfo.WindowsClient.Presentation.Tests.DetailsPresentationCoverageTests.GraphWindow_DuplicateTimestampsRejectWholeCandidateAndPreserveLastGood
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Confirmed_history_gap_is_continuous_and_dashed_across_the_gap
-        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Remaining_quota_observations_survive_flat_model_rows_as_unattributed_dashes
+        CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Remaining_quota_observations_stay_solid_when_model_rows_are_flat
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Missing_remote_quota_is_never_painted_as_a_solid_bridge
         CodexInfo.WindowsClient.Presentation.Tests.GraphPlotControlTests.Reduction_preserves_regression_quota_and_confirmed_gap_boundaries
     )

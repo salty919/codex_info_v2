@@ -169,6 +169,26 @@ public sealed class GraphWindowViewModelProjectionTests
         Assert.Equal([1_200L, 2_000L], samples.Select(sample => sample.Timestamp));
         Assert.True(samples[^1].IsSyntheticTail);
     }
+
+    [Fact]
+    public void Graph_samples_do_not_insert_a_leading_reset_boundary_before_direct_quota()
+    {
+        var period = new ApiHistoryPeriod("604800", 0, 180, false, "historical")
+        {
+            ResetAt = 604_800,
+            Samples =
+            [
+                new ApiHistorySample(60, 604_800, null, 1, 0, 0, 10, 0, 0),
+                new ApiHistorySample(180, 604_800, 98, 2, 0, 0, 20, 0, 0),
+            ],
+        };
+
+        var samples = GraphWindowViewModel.BuildGraphSamples(period, 180);
+
+        Assert.Equal([60L, 180L], samples.Select(sample => sample.Timestamp));
+        Assert.Null(samples[0].RemainingPercent);
+        Assert.Equal(98, samples[1].RemainingPercent);
+    }
 }
 
 public sealed class WindowDragGeometryTests
