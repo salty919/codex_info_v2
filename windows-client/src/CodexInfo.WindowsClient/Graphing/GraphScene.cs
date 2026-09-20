@@ -1503,7 +1503,6 @@ public sealed class GraphScene
         tokenDelta = 0;
         if (before < 0 || after != before + 1 || after >= points.Count ||
             points[after].Timestamp <= points[before].Timestamp ||
-            points[after].Timestamp - points[before].Timestamp > 60 ||
             points[before].SyntheticTail || points[after].SyntheticTail ||
             HasConfirmedGapBetween(confirmedGaps, points[before].Timestamp, points[after].Timestamp) ||
             HasCorrectionBetween(correctionStarts, points[before].Timestamp, points[after].Timestamp))
@@ -1555,7 +1554,7 @@ public sealed class GraphScene
 
         var total = 0d;
         var exact = true;
-        var inferred = points[after].Timestamp - points[before].Timestamp > 60;
+        var inferred = false;
         foreach (var name in tokenSeries.Keys)
         {
             if (!tokenSeries.TryGetValue(name, out var values) ||
@@ -1598,7 +1597,6 @@ public sealed class GraphScene
         tokenDelta = 0;
         if (before < 0 || after != before + 1 || after >= Timestamps.Count ||
             Timestamps[after] <= Timestamps[before] ||
-            Timestamps[after] - Timestamps[before] > 60 ||
             ModelSynthetic[before] || ModelSynthetic[after] ||
             HasRemainingHardBreakBetween(Timestamps[before], Timestamps[after]))
         {
@@ -1684,7 +1682,6 @@ public sealed class GraphScene
         int after) =>
         after == before + 1 &&
         points[after].Timestamp > points[before].Timestamp &&
-        points[after].Timestamp - points[before].Timestamp <= 60 &&
         !HasConfirmedGapBetween(confirmedGaps, points[before].Timestamp, points[after].Timestamp) &&
         !HasCorrectionBetween(correctionStarts, points[before].Timestamp, points[after].Timestamp);
 
