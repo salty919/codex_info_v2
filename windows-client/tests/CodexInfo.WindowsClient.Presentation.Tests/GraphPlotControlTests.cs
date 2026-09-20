@@ -2397,34 +2397,63 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Remaining_stair_step_preserves_valid_anchors_and_smooths_only_render_geometry()
+    public void Remaining_sampling_plateaus_are_smoothed_only_in_renderer_geometry()
     {
         var points = new[]
         {
             Point(1_000, 100, 0, 0, 0),
-            Point(1_060, 90, 1, 0, 0),
-            Point(1_120, 90, 2, 0, 0),
-            Point(1_180, 90, 3, 0, 0),
-            Point(1_240, 80, 4, 0, 0),
+            Point(1_600, 100, 1, 0, 0),
+            Point(2_200, 99, 2, 0, 0),
+            Point(2_800, 99, 3, 0, 0),
+            Point(3_400, 98, 4, 0, 0),
+            Point(4_000, 98, 4, 0, 0),
         };
 
-        var effective = Scene(points).Remaining;
-        var lines = GraphPlotProjection.BuildRemainingLines(Scene(points));
+        var scene = Scene(points);
+        var effective = scene.Remaining;
+        var rawLines = GraphPlotProjection.BuildRemainingLines(scene);
+        var rendered = GraphPlotProjection.BuildCanonicalRemainingLines(scene).Solid.Line;
+
+        static double RenderedAt(GraphLineProjection line, double timestamp) =>
+            line.X.Zip(line.Y)
+                .Where(pair => double.IsFinite(pair.First) && Math.Abs(pair.First - timestamp) < 0.1)
+                .Select(pair => pair.Second)
+                .First();
 
         Assert.Equal(100d, effective[0]);
-        Assert.Equal(90d, effective[1]);
-        Assert.Equal(90d, effective[2], precision: 12);
-        Assert.Equal(90d, effective[3], precision: 12);
-        Assert.Equal(80d, effective[4]);
-        Assert.Equal([1_000d, 1_060d, 1_120d, 1_180d, 1_240d], lines.Solid.X);
-        Assert.Equal(
-            [100d, 90d, 90d, 90d, 80d],
-            lines.Solid.Y);
-        Assert.Empty(lines.Dashed.X);
-        Assert.Empty(lines.Dashed.Y);
-        Assert.DoesNotContain(
-            lines.Solid.X.Zip(lines.Solid.X.Skip(1)),
-            pair => pair.First == pair.Second);
+        Assert.Equal(100d, effective[1]);
+        Assert.Equal(99d, effective[2]);
+        Assert.Equal(99d, effective[3]);
+        Assert.Equal(98d, effective[4]);
+        Assert.Equal(98d, effective[5]);
+        Assert.Equal([1_000d, 1_600d, 2_200d, 2_800d, 3_400d, 4_000d], rawLines.Solid.X);
+        Assert.Equal([100d, 100d, 99d, 99d, 98d, 98d], rawLines.Solid.Y);
+        Assert.InRange(RenderedAt(rendered, 1_600), 99.000_001, 99.999_999);
+        Assert.InRange(RenderedAt(rendered, 2_800), 98.000_001, 98.999_999);
+        Assert.Equal(98d, RenderedAt(rendered, 3_400), precision: 6);
+        Assert.Equal(98d, RenderedAt(rendered, 4_000), precision: 6);
+        var idle = Assert.Single(scene.IdleIntervals);
+        Assert.Equal(3_400, idle.StartAt);
+        Assert.Equal(4_000, idle.EndAt);
+        Assert.Equal(3f, GraphPlotControl.MeasuredRemainingLineWidth);
+        Assert.Equal(1f, GraphPlotControl.InferredLineWidth);
+
+        var activeTailPoints = new[]
+        {
+            Point(1_000, 100, 0, 0, 0),
+            Point(1_600, 100, 1, 0, 0),
+            Point(2_200, 60, 2, 0, 0),
+            Point(2_800, 60, 3, 0, 0),
+            Point(3_400, 20, 4, 0, 0),
+            Point(4_000, 20, 5, 0, 0),
+        };
+        var activeTailScene = Scene(activeTailPoints);
+        var activeTailRendered = GraphPlotProjection
+            .BuildCanonicalRemainingLines(activeTailScene)
+            .Solid.Line;
+        Assert.Empty(activeTailScene.IdleIntervals);
+        Assert.InRange(RenderedAt(activeTailRendered, 3_400), 20.000_001, 59.999_999);
+        Assert.Equal(20d, RenderedAt(activeTailRendered, 4_000), precision: 6);
     }
 
     [Fact]

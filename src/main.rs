@@ -5356,12 +5356,18 @@ fn graph_paths_with_sources(
         true,
         confirmed_gaps,
     );
-    let unused_intervals = token_idle_interval_positions(
+    let idle_timestamp_intervals = token_idle_timestamp_intervals_with_render_evidence(
         samples,
         period_start,
         period_end,
         &token_timelines,
         confirmed_gaps,
+        None,
+    );
+    let unused_intervals = unused_interval_positions_from_timestamp_intervals(
+        &idle_timestamp_intervals,
+        period_start,
+        period_end,
     );
     let (remaining_solid, remaining_inferred) = remaining_paths_with_evidence(
         &remaining_points,
@@ -5370,6 +5376,7 @@ fn graph_paths_with_sources(
         period_start,
         period_end,
         confirmed_gaps,
+        &idle_timestamp_intervals,
     );
     let remaining_path = [remaining_solid.as_str(), remaining_inferred.as_str()]
         .into_iter()
@@ -5636,6 +5643,14 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
         .iter()
         .map(|point| (point.timestamp, point.effective))
         .collect::<Vec<_>>();
+    let idle_timestamp_intervals = token_idle_timestamp_intervals_with_render_evidence(
+        samples,
+        period_start,
+        period_end,
+        model_timelines,
+        confirmed_gaps,
+        Some(&GraphIdleRenderEvidence { untrusted_minutes }),
+    );
     let remaining_correction_starts = BTreeSet::new();
     let minute = graph_minute_points_with_model_timelines(
         samples,
@@ -5667,6 +5682,7 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
                 correction_starts: &remaining_correction_starts,
                 model_timelines: None,
                 remaining_evidence: Some(&remaining_evidence),
+                idle_timestamp_intervals: &idle_timestamp_intervals,
             });
             paths.remaining = [solid.as_str(), inferred.as_str()]
                 .into_iter()
@@ -5683,15 +5699,10 @@ fn graph_paths_for_selection_with_sources_and_astra_with_lineage_and_activity(
             paths.current_remaining_point_y = normalized;
         }
     }
-    paths.unused_intervals = token_idle_interval_positions_with_render_evidence(
-        samples,
+    paths.unused_intervals = unused_interval_positions_from_timestamp_intervals(
+        &idle_timestamp_intervals,
         period_start,
         period_end,
-        // Confirmed idle comes only from unchanged direct values. Lifecycle
-        // activity is not a substitute for a cumulative value change.
-        model_timelines,
-        confirmed_gaps,
-        Some(&GraphIdleRenderEvidence { untrusted_minutes }),
     );
     let maximum = minute
         .iter()
@@ -6467,6 +6478,63 @@ fn monotone_cubic_interval_values(
     )
 }
 
+fn sampling_smoothed_values(
+    timestamps: &[f64],
+    values: &[f64],
+    preserved_timestamps: &BTreeSet<i64>,
+    preserved_indices: &BTreeSet<usize>,
+) -> Vec<f64> {
+    if timestamps.len() != values.len() || values.len() < 3 {
+        return values.to_vec();
+    }
+    let last = values.len() - 1;
+    let knot_indices = (0..values.len())
+        .filter(|index| {
+            *index == 0
+                || *index == last
+                || preserved_timestamps.contains(&(timestamps[*index] as i64))
+                || preserved_indices.contains(index)
+                || (values[*index] != values[*index - 1] && values[*index] != values[*index + 1])
+        })
+        .collect::<Vec<_>>();
+    let knot_timestamps = knot_indices
+        .iter()
+        .map(|index| timestamps[*index])
+        .collect::<Vec<_>>();
+    let knot_values = knot_indices
+        .iter()
+        .map(|index| values[*index])
+        .collect::<Vec<_>>();
+    if knot_timestamps.len() < 2 {
+        return values.to_vec();
+    }
+    timestamps
+        .iter()
+        .map(|timestamp| {
+            if let Some(knot) = knot_timestamps
+                .iter()
+                .position(|candidate| candidate == timestamp)
+            {
+                return knot_values[knot];
+            }
+            let right = knot_timestamps.partition_point(|candidate| candidate < timestamp);
+            if right == 0 || right >= knot_timestamps.len() {
+                return if right == 0 {
+                    knot_values[0]
+                } else {
+                    *knot_values.last().expect("at least two smoothing knots")
+                };
+            }
+            let left = right - 1;
+            let fraction = (*timestamp - knot_timestamps[left])
+                / (knot_timestamps[right] - knot_timestamps[left]);
+            monotone_cubic_interval_values(&knot_timestamps, &knot_values, left, &[fraction])
+                .and_then(|projected| projected.into_iter().next())
+                .unwrap_or(knot_values[left])
+        })
+        .collect()
+}
+
 fn monotone_cubic_interval_polyline(
     timestamps: &[f64],
     values: &[f64],
@@ -7098,47 +7166,21 @@ fn token_idle_timestamp_intervals_with_render_evidence(
         .collect()
 }
 
-fn token_idle_interval_positions(
-    samples: &[&UsageHistorySample],
+fn unused_interval_positions_from_timestamp_intervals(
+    intervals: &[(i64, i64)],
     period_start: i64,
     period_end: i64,
-    token_timelines: &GraphModelTimelines,
-    confirmed_gaps: &[GraphConfirmedGap],
-) -> Vec<UnusedIntervalPosition> {
-    token_idle_interval_positions_with_render_evidence(
-        samples,
-        period_start,
-        period_end,
-        token_timelines,
-        confirmed_gaps,
-        None,
-    )
-}
-
-fn token_idle_interval_positions_with_render_evidence(
-    samples: &[&UsageHistorySample],
-    period_start: i64,
-    period_end: i64,
-    token_timelines: &GraphModelTimelines,
-    confirmed_gaps: &[GraphConfirmedGap],
-    render_evidence: Option<&GraphIdleRenderEvidence<'_>>,
 ) -> Vec<UnusedIntervalPosition> {
     let span = (period_end - period_start).max(1) as f64;
-    token_idle_timestamp_intervals_with_render_evidence(
-        samples,
-        period_start,
-        period_end,
-        token_timelines,
-        confirmed_gaps,
-        render_evidence,
-    )
-    .into_iter()
-    .map(|(start, end)| UnusedIntervalPosition {
-        start: (start - period_start) as f64 / span * 100.0,
-        width: (end - start) as f64 / span * 100.0,
-        preserve_boundary: false,
-    })
-    .collect()
+    intervals
+        .iter()
+        .copied()
+        .map(|(start, end)| UnusedIntervalPosition {
+            start: (start - period_start) as f64 / span * 100.0,
+            width: (end - start) as f64 / span * 100.0,
+            preserve_boundary: false,
+        })
+        .collect()
 }
 
 /// Keeps all visible right-edge labels inside the plot and at least 16px
@@ -7513,6 +7555,7 @@ fn remaining_paths_with_evidence(
     period_start: i64,
     period_end: i64,
     confirmed_gaps: &[GraphConfirmedGap],
+    idle_timestamp_intervals: &[(i64, i64)],
 ) -> (String, String) {
     let correction_starts = BTreeSet::new();
     remaining_paths_with_boundaries(RemainingPathContext {
@@ -7525,6 +7568,7 @@ fn remaining_paths_with_evidence(
         correction_starts: &correction_starts,
         model_timelines: None,
         remaining_evidence: None,
+        idle_timestamp_intervals,
     })
 }
 
@@ -7680,6 +7724,7 @@ struct RemainingPathContext<'a> {
     correction_starts: &'a BTreeSet<i64>,
     model_timelines: Option<(&'a GraphModelTimelines, bool)>,
     remaining_evidence: Option<&'a [GraphRemainingEvidence]>,
+    idle_timestamp_intervals: &'a [(i64, i64)],
 }
 
 fn remaining_paths_with_boundaries(context: RemainingPathContext<'_>) -> (String, String) {
@@ -7693,6 +7738,7 @@ fn remaining_paths_with_boundaries(context: RemainingPathContext<'_>) -> (String
         correction_starts,
         model_timelines,
         remaining_evidence,
+        idle_timestamp_intervals,
     } = context;
     let span = (period_end - period_start).max(1) as f64;
     let coordinate = |(timestamp, raw): (i64, f64)| {
@@ -7738,6 +7784,22 @@ fn remaining_paths_with_boundaries(context: RemainingPathContext<'_>) -> (String
             .iter()
             .map(|index| points[*index].1)
             .collect::<Vec<_>>();
+        let preserved_timestamps = idle_timestamp_intervals
+            .iter()
+            .flat_map(|(start, end)| [*start, *end])
+            .collect::<BTreeSet<_>>();
+        let preserved_indices = run
+            .iter()
+            .enumerate()
+            .filter(|(_, segment)| segment.kind == GraphRemainingSegmentKind::Inferred)
+            .flat_map(|(interval, _)| [interval, interval + 1])
+            .collect::<BTreeSet<_>>();
+        let values = sampling_smoothed_values(
+            &timestamps,
+            &values,
+            &preserved_timestamps,
+            &preserved_indices,
+        );
         for (interval, segment) in run.iter().enumerate() {
             if segment.kind == GraphRemainingSegmentKind::Inferred {
                 append_monotone_cubic_dashed_interval(
@@ -25593,8 +25655,7 @@ mod tests {
             );
         }
 
-        let span = (period.end_at - period.start_at).max(1) as f64;
-        let mut actual_idle = super::token_idle_interval_positions_with_render_evidence(
+        let mut actual_idle = super::token_idle_timestamp_intervals_with_render_evidence(
             &references,
             period.start_at,
             period.end_at,
@@ -25605,12 +25666,7 @@ mod tests {
             }),
         )
         .into_iter()
-        .map(|interval| {
-            let start_at = period.start_at + (interval.start / 100.0 * span).round() as i64;
-            let end_at =
-                period.start_at + ((interval.start + interval.width) / 100.0 * span).round() as i64;
-            serde_json::json!({"start_at": start_at, "end_at": end_at})
-        })
+        .map(|(start_at, end_at)| serde_json::json!({"start_at": start_at, "end_at": end_at}))
         .collect::<Vec<_>>();
         actual_idle.sort_by_key(|interval| {
             (
@@ -41343,61 +41399,185 @@ mod tests {
     }
 
     #[test]
-    fn remaining_graph_preserves_repeated_direct_values_across_sampling_gaps() {
+    fn remaining_sampling_plateaus_are_smoothed_only_in_render_geometry() {
         let samples = [
-            UsageHistorySample::new(0, 1_000, 100.0, ModelDollarTotals::default()),
-            UsageHistorySample::new(
-                60,
+            UsageHistorySample::new_with_usage(
+                0,
                 1_000,
-                90.0,
+                100.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals::default(),
+            ),
+            UsageHistorySample::new_with_usage(
+                600,
+                1_000,
+                100.0,
                 ModelDollarTotals {
                     sol: 1.0,
                     ..ModelDollarTotals::default()
                 },
+                ModelTokenTotals {
+                    sol: 1,
+                    ..ModelTokenTotals::default()
+                },
             ),
-            // The model advances again, but the direct quota reread repeats.
-            UsageHistorySample::new(
-                120,
+            UsageHistorySample::new_with_usage(
+                1_200,
                 1_000,
-                90.0,
+                99.0,
                 ModelDollarTotals {
                     sol: 2.0,
                     ..ModelDollarTotals::default()
                 },
-            ),
-            // No model advances in this interval; the direct quota still
-            // remains an independent raw anchor.
-            UsageHistorySample::new(
-                180,
-                1_000,
-                90.0,
-                ModelDollarTotals {
-                    sol: 2.0,
-                    ..ModelDollarTotals::default()
+                ModelTokenTotals {
+                    sol: 2,
+                    ..ModelTokenTotals::default()
                 },
             ),
-            UsageHistorySample::new(
-                240,
+            UsageHistorySample::new_with_usage(
+                1_800,
                 1_000,
-                80.0,
+                99.0,
                 ModelDollarTotals {
                     sol: 3.0,
                     ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 3,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                2_400,
+                1_000,
+                98.0,
+                ModelDollarTotals {
+                    sol: 4.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 4,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                3_000,
+                1_000,
+                98.0,
+                ModelDollarTotals {
+                    sol: 4.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 4,
+                    ..ModelTokenTotals::default()
                 },
             ),
         ];
         let references = samples.iter().collect::<Vec<_>>();
 
         assert_eq!(
-            remaining_graph_points(&references, 0, 240),
+            remaining_graph_points(&references, 0, 3_000),
             vec![
                 (0, 100.0),
-                (60, 90.0),
-                (120, 90.0),
-                (180, 90.0),
-                (240, 80.0)
+                (600, 100.0),
+                (1_200, 99.0),
+                (1_800, 99.0),
+                (2_400, 98.0),
+                (3_000, 98.0)
             ]
         );
+        let graph = graph_paths(&references, 0, 3_000);
+        assert_eq!(graph.unused_intervals.len(), 1);
+        assert!((graph.unused_intervals[0].start - 80.0).abs() < 1e-9);
+        assert!((graph.unused_intervals[0].width - 20.0).abs() < 1e-9);
+        assert!(!graph.remaining_solid.contains("M20.00 1.00"));
+        assert!(!graph.remaining_solid.contains("L20.00 1.00"));
+        assert!(!graph.remaining_solid.contains("M60.00 1.98"));
+        assert!(!graph.remaining_solid.contains("L60.00 1.98"));
+        assert!(graph.remaining_solid.contains("M80.00 2.96"));
+        assert!(graph.remaining_solid.ends_with("L100.00 2.96"));
+
+        let active_tail_samples = [
+            UsageHistorySample::new_with_usage(
+                0,
+                1_000,
+                100.0,
+                ModelDollarTotals::default(),
+                ModelTokenTotals::default(),
+            ),
+            UsageHistorySample::new_with_usage(
+                600,
+                1_000,
+                100.0,
+                ModelDollarTotals {
+                    sol: 1.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 1,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                1_200,
+                1_000,
+                60.0,
+                ModelDollarTotals {
+                    sol: 2.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 2,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                1_800,
+                1_000,
+                60.0,
+                ModelDollarTotals {
+                    sol: 3.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 3,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                2_400,
+                1_000,
+                20.0,
+                ModelDollarTotals {
+                    sol: 4.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 4,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+            UsageHistorySample::new_with_usage(
+                3_000,
+                1_000,
+                20.0,
+                ModelDollarTotals {
+                    sol: 5.0,
+                    ..ModelDollarTotals::default()
+                },
+                ModelTokenTotals {
+                    sol: 5,
+                    ..ModelTokenTotals::default()
+                },
+            ),
+        ];
+        let active_tail_references = active_tail_samples.iter().collect::<Vec<_>>();
+        let active_tail_graph = graph_paths(&active_tail_references, 0, 3_000);
+        assert!(active_tail_graph.unused_intervals.is_empty());
+        assert!(!active_tail_graph.remaining_solid.contains("M80.00 79.40"));
+        assert!(!active_tail_graph.remaining_solid.contains("L80.00 79.40"));
+        assert!(active_tail_graph.remaining_solid.ends_with("L100.00 79.40"));
     }
 
     #[test]
@@ -44071,10 +44251,15 @@ mod tests {
             ]),
         )]);
 
-        assert!(
-            super::token_idle_interval_positions(&references, 0, 1_800, &timelines, &[],)
-                .is_empty()
-        );
+        assert!(super::token_idle_timestamp_intervals_with_render_evidence(
+            &references,
+            0,
+            1_800,
+            &timelines,
+            &[],
+            None,
+        )
+        .is_empty());
     }
 
     #[test]
