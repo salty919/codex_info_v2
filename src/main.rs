@@ -17536,7 +17536,11 @@ impl CodexInfoState {
             has_service_rows = true;
             let origin = match observation.model_source.as_str() {
                 "confirmed" if observation.models_complete => GraphModelOrigin::Direct,
-                "confirmed" | "legacy-unknown" => GraphModelOrigin::LegacyObserved,
+                "legacy-unknown" => GraphModelOrigin::LegacyObserved,
+                // A confirmed row without a complete model vector is not a
+                // lossless legacy observation.  Keep its numeric payload as
+                // an explicit incomplete boundary, never idle authority.
+                "confirmed" => GraphModelOrigin::Unknown,
                 // Reconstructed, unavailable and unknown source values are
                 // not point-in-time model observations.  Fail closed for the
                 // model vector while allowing other rows to render.
@@ -17586,9 +17590,8 @@ impl CodexInfoState {
                 usage_store::ModelSource::Confirmed if observation.model_totals_complete => {
                     GraphModelOrigin::Direct
                 }
-                usage_store::ModelSource::Confirmed | usage_store::ModelSource::LegacyUnknown => {
-                    GraphModelOrigin::LegacyObserved
-                }
+                usage_store::ModelSource::LegacyUnknown => GraphModelOrigin::LegacyObserved,
+                usage_store::ModelSource::Confirmed => GraphModelOrigin::Unknown,
                 usage_store::ModelSource::ReconstructedFromSession
                 | usage_store::ModelSource::Unavailable => continue,
             };
@@ -43727,7 +43730,7 @@ mod tests {
             "SOL".to_owned(),
             BTreeMap::from([
                 (0, direct(100, super::GraphModelOrigin::Direct)),
-                (900, direct(100, super::GraphModelOrigin::LegacyObserved)),
+                (900, direct(100, super::GraphModelOrigin::Unknown)),
                 (1_800, direct(100, super::GraphModelOrigin::Direct)),
             ]),
         )]);
