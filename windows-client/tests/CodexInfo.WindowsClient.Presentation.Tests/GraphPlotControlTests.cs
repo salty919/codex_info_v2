@@ -532,7 +532,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Model_lines_dash_increasing_and_flat_unobserved_gaps()
+    public void Model_lines_keep_jittered_direct_intervals_measured()
     {
         var scene = Scene(
             [
@@ -544,11 +544,11 @@ public sealed class GraphPlotControlTests
 
         var lines = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
 
-        Assert.Equal([1_000d, 1_060d], lines.Rising.X);
-        Assert.Equal([0d, 1d], lines.Rising.Y);
-        Assert.Equal([1_060d, 1_121d, 1_242d], lines.Dashed.X);
-        Assert.Equal([1d, 2d, 2d], lines.Dashed.Y);
-        Assert.Empty(lines.Flat.X);
+        Assert.Equal([1_000d, 1_060d, 1_121d], lines.Rising.X);
+        Assert.Equal([0d, 1d, 2d], lines.Rising.Y);
+        Assert.Equal([1_121d, 1_242d], lines.Flat.X);
+        Assert.Equal([2d, 2d], lines.Flat.Y);
+        Assert.Empty(lines.Dashed.X);
     }
 
     [Fact]
@@ -651,7 +651,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void PlotProjectionDoesNotInventSpendDuringAnUnobservedGap()
+    public void PlotProjectionKeepsSparseEqualDirectEndpointsFlat()
     {
         var scene = Scene(
             [
@@ -663,15 +663,15 @@ public sealed class GraphPlotControlTests
 
         var lines = GraphPlotProjection.BuildModelLines(scene, scene.Luna);
 
-        Assert.Empty(lines.Flat.X);
+        Assert.Equal([1_060d, 3_600d], lines.Flat.X);
+        Assert.Equal([1d, 1d], lines.Flat.Y);
         Assert.Equal([1_000d, 1_060d, double.NaN, 3_600d, 3_660d], lines.Rising.X);
         Assert.Equal([0d, 1d, double.NaN, 1d, 2d], lines.Rising.Y);
-        Assert.Equal([1_060d, 3_600d], lines.Dashed.X);
-        Assert.Equal([1d, 1d], lines.Dashed.Y);
+        Assert.Empty(lines.Dashed.X);
     }
 
     [Fact]
-    public void PlotProjectionDashesTheLongFirstIntervalAndKeepsLaterEvidenceSolid()
+    public void PlotProjectionKeepsSparseDirectIncreaseMeasured()
     {
         var scene = Scene(
             [
@@ -684,16 +684,13 @@ public sealed class GraphPlotControlTests
         var remaining = GraphPlotProjection.BuildRemainingLines(scene);
 
         Assert.Empty(model.Flat.X);
-        Assert.Equal([1_120d, 1_180d], model.Rising.X);
-        Assert.Equal([1d, 2d], model.Rising.Y);
-        Assert.Equal([1_000d, 1_120d], model.Dashed.X);
-        Assert.Equal([0d, 1d], model.Dashed.Y);
-        Assert.Equal([1_120d, 1_180d], remaining.Solid.X);
-        Assert.Equal([90d, 80d], remaining.Solid.Y);
-        Assert.Equal([1_000d, 1_120d], remaining.Dashed.X);
-        Assert.Equal([100d, 90d], remaining.Dashed.Y);
+        Assert.Equal([1_000d, 1_120d, 1_180d], model.Rising.X);
+        Assert.Equal([0d, 1d, 2d], model.Rising.Y);
+        Assert.Empty(model.Dashed.X);
+        Assert.Equal([1_000d, 1_120d, 1_180d], remaining.Solid.X);
+        Assert.Equal([100d, 90d, 80d], remaining.Solid.Y);
+        Assert.Empty(remaining.Dashed.X);
         Assert.Empty(scene.IdleIntervals);
-        Assert.DoesNotContain(model.Rising.X, timestamp => timestamp < 1_120d);
     }
 
     [Fact]
@@ -742,7 +739,9 @@ public sealed class GraphPlotControlTests
 
         Assert.Equal([new GraphIdleInterval(2_000, 7_000, false)], visible);
         var model = GraphPlotProjection.BuildModelLines(scene, scene.Sol);
-        Assert.Equal([1_000d, 1_060d], model.Flat.X);
+        Assert.Equal([1_000d, 1_060d, double.NaN, 2_000d, 7_000d], model.Flat.X);
+        Assert.Equal([1_060d, 2_000d], model.Rising.X);
+        Assert.Equal([7_000d, 87_400d], model.Dashed.X);
 
         var boundaryScene = Scene(
             [
@@ -805,13 +804,15 @@ public sealed class GraphPlotControlTests
     [Fact]
     public void CanonicalRenderProjectionUsesTheNativeNormalizedDashCadence()
     {
-        var scene = Scene(
+        var scene = GraphScene.Create(
             [
                 Point(1_000, 100, 10, 0, 0),
                 Point(1_600, 90, 10, 0, 0),
             ],
+            GraphMetric.Dollars,
             1_000,
-            1_600);
+            1_600,
+            [new GraphConfirmedGap(1_000, 1_600)]);
 
         var model = GraphPlotProjection.BuildCanonicalModelLines(scene, scene.Sol);
         var remaining = GraphPlotProjection.BuildCanonicalRemainingLines(scene);
@@ -1908,6 +1909,10 @@ public sealed class GraphPlotControlTests
                 if (fixture.TryGetProperty(prefix + "_flat", out var expectedFlat))
                 {
                     Assert.Equal(SegmentPairs(expectedFlat), SegmentPairs(model.Flat));
+                }
+                if (fixture.TryGetProperty(prefix + "_rising", out var expectedRising))
+                {
+                    Assert.Equal(SegmentPairs(expectedRising), SegmentPairs(model.Rising));
                 }
                 if (fixture.TryGetProperty(prefix + "_dashed", out var expectedDashed))
                 {
@@ -3378,10 +3383,9 @@ public sealed class GraphPlotControlTests
         double terminalObserved)
     {
         Assert.Empty(lines.Flat.X);
-        Assert.Equal([1_120d, 1_180d], lines.Rising.X);
-        Assert.Equal([firstObserved, terminalObserved], lines.Rising.Y);
-        Assert.Equal([1_000d, 1_120d], lines.Dashed.X);
-        Assert.Equal([0d, firstObserved], lines.Dashed.Y);
+        Assert.Equal([1_000d, 1_120d, 1_180d], lines.Rising.X);
+        Assert.Equal([0d, firstObserved, terminalObserved], lines.Rising.Y);
+        Assert.Empty(lines.Dashed.X);
     }
 
     private static void AssertHistorySample(

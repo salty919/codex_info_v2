@@ -103,7 +103,6 @@ internal static class GraphPlotProjection
     internal const double EndpointLabelGapWidth = 10;
     internal const double EndpointLabelHeight = 16;
     internal const double MinimumPlotHeight = 204;
-    private const long ModelContiguousSampleMaxGapSeconds = 60;
     internal const double CanonicalDashLength = 0.45;
     internal const double CanonicalDashGap = 0.30;
 
@@ -335,7 +334,6 @@ internal static class GraphPlotProjection
 
             var before = RemainingValue(scene, previous);
             var current = RemainingValue(scene, index);
-            var elapsed = scene.Timestamps[index] - scene.Timestamps[previous];
             var contiguous = index == previous + 1;
             if (scene.HasRemainingHardBreakBetween(
                     scene.Timestamps[previous],
@@ -359,8 +357,7 @@ internal static class GraphPlotProjection
                 out var modelAdvanced);
             var quotaDropped = current < before;
             var unattributed = quotaDropped && (!modelAvailable || !modelAdvanced);
-            var dashed = !contiguous || elapsed > ModelContiguousSampleMaxGapSeconds ||
-                !observed || unattributed;
+            var dashed = !contiguous || !observed || unattributed;
             if (dashed)
             {
                 AppendSegment(dashedX, dashedY, scene.Timestamps[previous], before, scene.Timestamps[index], current);
@@ -434,7 +431,6 @@ internal static class GraphPlotProjection
             var before = values[previous];
             var startAt = scene.Timestamps[previous];
             var endAt = scene.Timestamps[index];
-            var elapsed = endAt - startAt;
             if (scene.HasModelHardBreakBetween(values, startAt, endAt))
             {
                 AppendSegment(dashedX, dashedY, startAt, before, endAt, value);
@@ -447,8 +443,8 @@ internal static class GraphPlotProjection
                 previous = index;
                 continue;
             }
-            if (index != previous + 1 || elapsed > ModelContiguousSampleMaxGapSeconds ||
-                scene.ModelSynthetic[previous] || scene.ModelSynthetic[index] ||
+            if (index != previous + 1 || scene.ModelSynthetic[previous] ||
+                scene.ModelSynthetic[index] ||
                 !scene.IsModelIntervalReliable(values, previous, index))
             {
                 AppendSegment(dashedX, dashedY, startAt, before, endAt, value);

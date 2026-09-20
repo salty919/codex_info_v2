@@ -9,9 +9,9 @@ use codex_info_db_writer::{
 };
 use codex_info_recorder::{
     probe_codex_authentication_state, synchronize_inactive_partition, AccountEpochProof,
-    ActiveThreadPollResult, CodexAuthenticationState, ProfileLease, QuotaPollEvent, QuotaPoller,
-    Recorder, RecorderConfig, RecorderError, RecorderStateWriter, ThreadPoller,
-    DEFAULT_CHUNK_BYTES, DEFAULT_INTERVAL_SECS,
+    ActiveThreadPollResult, CodexAuthenticationState, FixedRateSchedule, ProfileLease,
+    QuotaPollEvent, QuotaPoller, Recorder, RecorderConfig, RecorderError, RecorderStateWriter,
+    ThreadPoller, DEFAULT_CHUNK_BYTES, DEFAULT_INTERVAL_SECS,
 };
 use std::fs;
 use std::io;
@@ -201,6 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         RecorderStateWriter::new(&options.data_root, &options.identity, &_profile_lease)?;
     let mut quota_poller = QuotaPoller::start_with_interval(options.interval_secs);
     let thread_poller = ThreadPoller::start(options.sessions_root.clone());
+    let mut schedule = FixedRateSchedule::new(Duration::from_secs(options.interval_secs));
     let mut quota_health = LaneHealth::Unknown;
     let mut thread_health = LaneHealth::Unknown;
     loop {
@@ -411,7 +412,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if options.once {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_secs(options.interval_secs));
+        let wait = schedule.complete_cycle(std::time::Instant::now());
+        if wait.missed_deadlines != 0 {
+            eprintln!(
+                "codex-info-recorder sampling overrun: missed_deadlines={}",
+                wait.missed_deadlines
+            );
+        }
+        if !wait.sleep_for.is_zero() {
+            std::thread::sleep(wait.sleep_for);
+        }
     }
 }
 

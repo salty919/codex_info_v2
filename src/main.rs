@@ -720,11 +720,10 @@ const MOVING_RESET_STEP_TOLERANCE_SECONDS: i64 = 180;
 // snapshot.  A reset-id drift of only a few seconds is collector jitter and
 // keeps the latest observed quota; a larger drift is ambiguous and must not
 // let row order manufacture a quota drop.
-// A minute bucket is the collector's contiguous observation unit. Beyond this
-// boundary the elapsed interval is not observed, so a cumulative model
-// increase must be shown as a thin inferred bridge, never as a measured rate
-// or a confirmed idle interval.
-const MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS: i64 = 60;
+// Smoothing is deliberately local. This bound must never be reused as a
+// missing-data rule: two normal direct endpoints remain measured regardless
+// of timestamp sparsity.
+const MODEL_SMOOTHING_MAX_NEIGHBOR_GAP_SECONDS: i64 = 60;
 // The gray background represents sustained unused time, not every short pause
 // between task publications. Keep the exact-token/quota proof above as the
 // candidate authority, merge every provably continuous run first, and only
@@ -5405,12 +5404,23 @@ fn graph_paths_with_sources(
         false,
         untrusted_minutes,
     );
-    let raw_minute = graph_time_endpoints(
-        minute_model_spend_for_metric_with_untrusted(samples, false, untrusted_minutes),
-        period_start,
-        period_end,
-    );
+    let observed_minute =
+        minute_model_spend_for_metric_with_untrusted(samples, false, untrusted_minutes);
+    let has_observed_period_end = observed_minute
+        .iter()
+        .any(|point| point.timestamp == period_end);
+    let has_observation_before_period_end = observed_minute
+        .iter()
+        .any(|point| point.timestamp <= period_end);
+    let raw_minute = graph_time_endpoints(observed_minute, period_start, period_end);
     let minute = smooth_model_spend(&raw_minute);
+    let mut model_untrusted_minutes = untrusted_minutes.clone();
+    if has_observation_before_period_end && !has_observed_period_end {
+        // graph_time_endpoints adds a presentation-only terminal hold. Mark
+        // that endpoint explicitly; timestamp distance itself is not gap
+        // evidence and therefore cannot carry this responsibility.
+        model_untrusted_minutes.insert(period_end);
+    }
     // Dollar series are independent cumulative values.  The old stacked
     // implementation used the sum here, which made a model's line depend on
     // whether another model was enabled and could make a flat SOL history
@@ -5533,6 +5543,7 @@ fn graph_paths_with_sources(
             dollar_max,
             |point| point.luna,
             confirmed_gaps,
+            &model_untrusted_minutes,
         ),
         terra: metric_line_path_with_confirmed_gaps(
             &minute,
@@ -5541,6 +5552,7 @@ fn graph_paths_with_sources(
             dollar_max,
             |point| point.terra,
             confirmed_gaps,
+            &model_untrusted_minutes,
         ),
         sol: metric_line_path_with_confirmed_gaps(
             &minute,
@@ -5549,6 +5561,7 @@ fn graph_paths_with_sources(
             dollar_max,
             |point| point.sol,
             confirmed_gaps,
+            &model_untrusted_minutes,
         ),
         dollar_labels: dollar_axis_labels(dollar_max),
         current_remaining_label: remaining.map(format_percent).unwrap_or_else(|| "—".into()),
@@ -6340,18 +6353,23 @@ fn metric_line_path_with_confirmed_gaps(
     maximum: f64,
     value: impl Fn(&HourlyModelSpend) -> f64,
     confirmed_gaps: &[GraphConfirmedGap],
+    untrusted_minutes: &BTreeSet<i64>,
 ) -> String {
     if points.is_empty() {
         return String::new();
     }
-    let (flat, rising, inferred) = split_metric_line_paths_with_confirmed_gaps(
+    let correction_starts = BTreeSet::new();
+    let context = MetricLinePathContext {
         points,
         period_start,
         period_end,
         maximum,
-        value,
         confirmed_gaps,
-    );
+        untrusted_minutes,
+        require_legacy_vector: true,
+        correction_starts: &correction_starts,
+    };
+    let (flat, rising, inferred) = split_metric_line_paths_with_evidence(&context, value);
     [flat, rising, inferred]
         .into_iter()
         .filter(|path| !path.is_empty())
@@ -6455,6 +6473,7 @@ struct MetricLinePathContext<'a> {
     correction_starts: &'a BTreeSet<i64>,
 }
 
+#[cfg(test)]
 fn split_metric_line_paths_with_confirmed_gaps(
     points: &[HourlyModelSpend],
     period_start: i64,
@@ -6543,12 +6562,10 @@ fn metric_line_segments_with_boundaries(
         }
         let untrusted = untrusted_minutes.contains(&pair[0].timestamp)
             || untrusted_minutes.contains(&pair[1].timestamp);
-        let unobserved_gap = pair[1].timestamp.saturating_sub(pair[0].timestamp)
-            > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
         segments.push(GraphMetricSegment {
             start_index,
             end_index,
-            kind: if untrusted || unobserved_gap {
+            kind: if untrusted {
                 GraphMetricSegmentKind::Inferred
             } else if current == previous {
                 GraphMetricSegmentKind::Flat
@@ -6693,15 +6710,12 @@ fn unused_interval_positions_with_boundaries(
         if interval_end <= interval_start {
             continue;
         }
-        if current.timestamp.saturating_sub(previous.timestamp)
-            > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS
-            || graph_interval_has_hard_break(
-                previous.timestamp,
-                current.timestamp,
-                confirmed_gaps,
-                correction_starts,
-            )
-        {
+        if graph_interval_has_hard_break(
+            previous.timestamp,
+            current.timestamp,
+            confirmed_gaps,
+            correction_starts,
+        ) {
             continue;
         }
         let unreliable = !model_spend_is_reliable(previous) || !model_spend_is_reliable(current);
@@ -8045,7 +8059,7 @@ fn smooth_remaining_points_with_activity(
             || points[index].0 == points[index + 1].0
             // Keep the explicitly interpolated line intact. A second moving
             // average would move its surrounding anchors and reintroduce a
-            // fold at the edge of the completed sampling gap.
+            // fold at the edge of the explicitly interpolated quota span.
             || interpolated[index.saturating_sub(1)]
             || interpolated[index]
             || interpolated[index + 1]
@@ -8077,7 +8091,7 @@ fn quota_point_is_observed(samples: &[&UsageHistorySample], timestamp: i64, valu
     })
 }
 
-fn quota_interval_is_contiguously_observed(
+fn quota_interval_has_observed_endpoints(
     samples: &[&UsageHistorySample],
     start: i64,
     end: i64,
@@ -8096,11 +8110,7 @@ fn quota_interval_is_contiguously_observed(
         .collect::<Vec<_>>();
     observed.sort_unstable();
     observed.dedup();
-    observed.first() == Some(&start_minute)
-        && observed.last() == Some(&end_minute)
-        && observed
-            .windows(2)
-            .all(|pair| pair[1].saturating_sub(pair[0]) <= 60)
+    observed.first() == Some(&start_minute) && observed.last() == Some(&end_minute)
 }
 
 fn model_interval_evidence(points: &[HourlyModelSpend], start: i64, end: i64) -> (bool, bool) {
@@ -8108,13 +8118,7 @@ fn model_interval_evidence(points: &[HourlyModelSpend], start: i64, end: i64) ->
         .iter()
         .filter(|point| point.timestamp >= start && point.timestamp <= end)
         .collect::<Vec<_>>();
-    if interval.len() < 2
-        || interval.iter().any(|point| !model_spend_is_reliable(point))
-        || interval.windows(2).any(|pair| {
-            pair[1].timestamp.saturating_sub(pair[0].timestamp)
-                > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS
-        })
-    {
+    if interval.len() < 2 || interval.iter().any(|point| !model_spend_is_reliable(point)) {
         return (false, false);
     }
     let advanced = interval.windows(2).any(|pair| {
@@ -8129,10 +8133,7 @@ fn generic_model_interval_evidence(
     start: i64,
     end: i64,
 ) -> (bool, bool, bool) {
-    if timelines.is_empty()
-        || end <= start
-        || end.saturating_sub(start) > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS
-    {
+    if timelines.is_empty() || end <= start {
         return (false, false, true);
     }
     let mut advanced = false;
@@ -8185,7 +8186,7 @@ fn projected_model_token_delta(
     }
     let mut total = 0.0;
     let mut exact = true;
-    let mut inferred = end.saturating_sub(start) > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
+    let mut inferred = false;
     for timeline in timelines.values() {
         let before = timeline.get(&start)?;
         let after = timeline.get(&end)?;
@@ -8367,7 +8368,7 @@ fn remaining_segments_with_boundaries_and_evidence(
                         start_index + 1,
                         samples,
                         after,
-                    ) && quota_interval_is_contiguously_observed(samples, before.0, after.0);
+                    ) && quota_interval_has_observed_endpoints(samples, before.0, after.0);
                 let (model_evidence, model_advanced, model_inferred) = model_timelines.map_or_else(
                     || {
                         let (available, advanced) =
@@ -8516,9 +8517,9 @@ fn smooth_model_spend(points: &[HourlyModelSpend]) -> Vec<HourlyModelSpend> {
             continue;
         }
         let previous_gap = current.timestamp.saturating_sub(previous.timestamp)
-            > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
+            > MODEL_SMOOTHING_MAX_NEIGHBOR_GAP_SECONDS;
         let next_gap = next.timestamp.saturating_sub(current.timestamp)
-            > MODEL_CONTIGUOUS_SAMPLE_MAX_GAP_SECONDS;
+            > MODEL_SMOOTHING_MAX_NEIGHBOR_GAP_SECONDS;
         if previous_gap || next_gap {
             smoothed.push(HourlyModelSpend {
                 timestamp: current.timestamp,
@@ -14512,7 +14513,7 @@ impl CodexInfoState {
                 // fabricated vertical 14% drop.
                 let period_end = now.div_euclid(60).saturating_mul(60);
                 let period_start = period_end.saturating_sub(120 * 60);
-                let inferred_end = period_start + 10 * 60;
+                let sparse_end = period_start + 10 * 60;
                 let selected_reset = period_start + WEEK_SECONDS;
                 let conflicting_reset = selected_reset + 80_000;
                 let cumulative = ModelDollarTotals {
@@ -14540,11 +14541,9 @@ impl CodexInfoState {
                         ModelTokenTotals::default(),
                     ),
                 ];
-                // Keep one source-proven unknown interval at the start, then
-                // provide contiguous observed rows across most of the plot.
-                // The same frame therefore exercises a thin inferred bridge
-                // and a long measured line without manufacturing either.
-                for timestamp in (inferred_end..=period_end).step_by(60) {
+                // Keep one normal sparse interval at the start, then provide
+                // minute-spaced observed rows across most of the plot.
+                for timestamp in (sparse_end..=period_end).step_by(60) {
                     samples.push(UsageHistorySample::new_with_usage(
                         timestamp,
                         selected_reset,
@@ -14570,10 +14569,9 @@ impl CodexInfoState {
                         let model_totals = ["SOL", "TERRA", "LUNA", "ASTRA"]
                             .into_iter()
                             .map(|model| {
-                                // Give ASTRA its own visible series. The first
-                                // opening increase is intentionally
-                                // unobserved and must be dashed; the later
-                                // equal endpoints are an observed flat line.
+                                // Give ASTRA its own visible series. Its first
+                                // increase has normal direct endpoints despite
+                                // their spacing; later equal endpoints are flat.
                                 let astra_tokens =
                                     if model == "ASTRA" && sample.reset_at == selected_reset {
                                         if sample.timestamp == period_start {
@@ -14600,9 +14598,8 @@ impl CodexInfoState {
                         )
                     })
                     .collect();
-                // The visual oracle must exercise the production idle path,
-                // not the removed cadence heuristic. Only the contiguous
-                // minute rows after the sparse opening span carry explicit
+                // The visual oracle must exercise the production idle path.
+                // Only rows after the sparse opening span carry explicit
                 // recorder evidence that no task ran since the prior row.
                 state.service_history_samples = state
                     .history
@@ -14638,7 +14635,7 @@ impl CodexInfoState {
                             timestamp: sample.timestamp,
                             reset_at: sample.reset_at,
                             remaining_percent: Some(sample.remaining_percent),
-                            task_active_since_previous: (sample.timestamp > inferred_end)
+                            task_active_since_previous: (sample.timestamp > sparse_end)
                                 .then_some(false),
                             models: Some(models),
                             models_complete: true,
@@ -27211,6 +27208,13 @@ mod tests {
                         actual(super::GraphMetricSegmentKind::Flat),
                         intervals(expected),
                         "flat {name} {metric_name}"
+                    );
+                }
+                if let Some(expected) = case.get(format!("{metric_name}_rising")) {
+                    assert_eq!(
+                        actual(super::GraphMetricSegmentKind::Rising),
+                        intervals(expected),
+                        "rising {name} {metric_name}"
                     );
                 }
                 if let Some(expected) = case.get(format!("{metric_name}_dashed")) {
@@ -41625,8 +41629,20 @@ mod tests {
         );
 
         assert_eq!(points.last().map(|point| point.timestamp), Some(3_600));
+        let untrusted_minutes = BTreeSet::from([3_600]);
+        let correction_starts = BTreeSet::new();
+        let context = super::MetricLinePathContext {
+            points: &points,
+            period_start: 0,
+            period_end: 3_600,
+            maximum: 3.0,
+            confirmed_gaps: &[],
+            untrusted_minutes: &untrusted_minutes,
+            require_legacy_vector: true,
+            correction_starts: &correction_starts,
+        };
         let (_, rising, inferred) =
-            split_metric_line_paths(&points, 0, 3_600, 3.0, |point| point.sol);
+            super::split_metric_line_paths_with_evidence(&context, |point| point.sol);
         assert!(rising.is_empty());
         assert!(!inferred.is_empty());
         assert!(inferred.contains("L100.00"));
@@ -42589,7 +42605,7 @@ mod tests {
     }
 
     #[test]
-    fn token_remaining_line_dashes_sparse_input_and_connects_contiguous_change_points() {
+    fn token_remaining_line_keeps_sparse_direct_sampling_intervals_solid() {
         let samples = [
             UsageHistorySample::new_with_usage(
                 0,
@@ -42722,12 +42738,12 @@ mod tests {
             });
 
         assert_eq!(
-            tokens.remaining_solid, "M50.00 10.80 L75.00 20.60",
+            tokens.remaining_solid, "M0.00 1.00 L50.00 10.80 M50.00 10.80 L75.00 20.60",
             "remaining={}",
             tokens.remaining
         );
         assert!(!tokens.remaining_inferred.is_empty());
-        assert!(!tokens.remaining_solid.contains("M0.00"));
+        assert!(tokens.remaining_solid.contains("M0.00"));
     }
 
     #[test]
@@ -42928,7 +42944,7 @@ mod tests {
     }
 
     #[test]
-    fn model_graph_does_not_invent_spend_during_an_unobserved_gap() {
+    fn model_graph_keeps_sparse_direct_sampling_intervals_measured() {
         let points = [
             HourlyModelSpend {
                 timestamp: 0,
@@ -42956,12 +42972,12 @@ mod tests {
         assert_eq!(smoothed[2].luna, 2.0);
         let (flat, rising, inferred) =
             split_metric_line_paths(&smoothed, 0, 3_660, 2.0, |point| point.luna);
-        // Both endpoints are real, but the 60..3600 path is unknown. A
-        // dashed bridge communicates the bounded estimate without claiming
-        // a sudden recovery-time jump or an observed daytime rate.
+        // Both cumulative endpoints are direct observations. Sampling
+        // sparsity alone is not a missing-data marker, so the interval keeps
+        // the same measured line role as an ordinary one-minute sample.
         assert!(!flat.contains("M1.64 50.00 L98.36 50.00"));
-        assert!(!rising.contains("M98.36 50.00 L98.36 1.00"));
-        assert!(inferred.matches('M').count() > 2);
+        assert!(rising.contains("M1.64 50.00 L98.36 1.00"));
+        assert!(inferred.is_empty());
 
         let equal_endpoints = [
             HourlyModelSpend {
@@ -42978,14 +42994,11 @@ mod tests {
         let (flat, rising, inferred) =
             split_metric_line_paths(&equal_endpoints, 0, 3_600, 2.0, |point| point.luna);
         assert!(
-            flat.is_empty(),
-            "sparse equal endpoints do not prove the unsampled interval was idle"
+            !flat.is_empty(),
+            "equal direct endpoints are a measured flat interval"
         );
         assert!(rising.is_empty());
-        assert!(
-            !inferred.is_empty(),
-            "every sparse connection is inferred, including a flat one"
-        );
+        assert!(inferred.is_empty());
     }
 
     #[test]
@@ -43656,7 +43669,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_bridges_missing_cadence_only_between_two_proven_flat_runs() {
+    fn sparse_direct_anchors_do_not_bypass_idle_duration_or_flatness() {
         let sample = |timestamp| {
             UsageHistorySample::new(timestamp, 1_000, 90.0, ModelDollarTotals::default())
         };
@@ -44328,9 +44341,10 @@ mod tests {
         assert_eq!(graph.unused_intervals.len(), 1);
         assert!((graph.unused_intervals[0].start - 100.0 / 12.0).abs() < 0.000_001);
         assert!((graph.unused_intervals[0].width - 1100.0 / 12.0).abs() < 0.000_001);
+        assert!(!graph.sol_flat.is_empty());
         assert!(
-            !graph.sol_inferred.is_empty(),
-            "missing interior samples remain visibly dashed"
+            graph.sol_inferred.is_empty(),
+            "normal equal direct endpoints stay measured despite timestamp sparsity"
         );
     }
 
@@ -45331,7 +45345,15 @@ mod tests {
             },
         ];
         assert_eq!(
-            metric_line_path_with_confirmed_gaps(&points, 0, 240, 0.0, |point| point.sol, &[]),
+            metric_line_path_with_confirmed_gaps(
+                &points,
+                0,
+                240,
+                0.0,
+                |point| point.sol,
+                &[],
+                &BTreeSet::new(),
+            ),
             "M75.00 99.00 L100.00 99.00"
         );
     }
@@ -45934,19 +45956,19 @@ mod tests {
             true,
             false,
         );
-        // The opening observations are ten minutes apart: use dashed
-        // reference paths, not solid rising paths that would imply
-        // continuous recording. The later contiguous rows carry explicit
-        // false lifecycle evidence and therefore form one continuous band.
+        // The opening observations are ten minutes apart but both are normal
+        // direct cumulative endpoints. Timestamp sparsity alone must not
+        // demote their increase to a missing-data bridge. The later rows
+        // carry explicit false lifecycle evidence and form one idle band.
         assert!(!paths.sol_flat.is_empty());
         assert!(!paths.terra_flat.is_empty());
         assert!(!paths.luna_flat.is_empty());
-        assert!(paths.sol_rising.is_empty());
+        assert!(!paths.sol_rising.is_empty());
         assert!(paths.terra_rising.is_empty());
-        assert!(paths.luna_rising.is_empty());
+        assert!(!paths.luna_rising.is_empty());
         assert!(!paths.astra_flat.is_empty());
-        assert!(paths.astra_rising.is_empty());
-        assert!(!paths.astra_inferred.is_empty());
+        assert!(!paths.astra_rising.is_empty());
+        assert!(paths.astra_inferred.is_empty());
         assert_eq!(paths.current_astra_label, "$10.00");
         assert_eq!(paths.unused_intervals.len(), 1);
         let idle = &paths.unused_intervals[0];
