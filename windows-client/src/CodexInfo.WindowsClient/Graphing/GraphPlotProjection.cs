@@ -291,6 +291,19 @@ internal static class GraphPlotProjection
                 scene.RemainingOrigins[index] is GraphRemainingOrigin.Raw)
             .ToArray();
         var smoothableIntervals = new List<(int Left, int Right, bool Dashed)>();
+        if (anchors.Length > 0 && firstRenderable < anchors[0])
+        {
+            // The period-start quota point is a presentation convention, not
+            // a remote observation. Keep its connection to the first raw
+            // anchor visibly inferred and independent of smoothing.
+            AppendSegment(
+                dashedX,
+                dashedY,
+                scene.Timestamps[firstRenderable],
+                scene.Remaining[firstRenderable],
+                scene.Timestamps[anchors[0]],
+                scene.Remaining[anchors[0]]);
+        }
         for (var anchor = 1; anchor < anchors.Length; anchor++)
         {
             var left = anchors[anchor - 1];

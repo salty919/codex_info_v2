@@ -1238,13 +1238,17 @@ public sealed class GraphPlotControlTests
         Assert.Equal(90, samples[1].RemainingPercent);
         Assert.True(samples[^1].IsSyntheticTail);
         var scene = Scene(samples, period.StartAt, period.EndAt);
-        Assert.True(double.IsNaN(scene.Remaining[0]));
+        Assert.Equal(100, scene.Remaining[0]);
+        Assert.Equal(GraphRemainingOrigin.Missing, scene.RemainingOrigins[0]);
         Assert.Equal(90, scene.Remaining[1]);
+        Assert.Equal([false, true, false], scene.RemainingObserved);
+        Assert.True(double.IsNaN(scene.ObservedRemainingValues[0]));
+        Assert.Equal(90, scene.ObservedRemainingValues[1]);
+        Assert.True(double.IsNaN(scene.ObservedRemainingValues[2]));
         var lines = GraphPlotProjection.BuildRemainingLines(scene);
         Assert.Empty(lines.Solid.X);
-        Assert.Equal([1_080d, 1_200d], lines.Dashed.X);
-        Assert.Equal([90d, 90d], lines.Dashed.Y);
-        Assert.DoesNotContain(lines.Dashed.X, timestamp => timestamp < 1_080d);
+        Assert.Equal([1_020d, 1_080d, 1_200d], lines.Dashed.X);
+        Assert.Equal([100d, 90d, 90d], lines.Dashed.Y);
     }
 
     [Fact]
@@ -1307,8 +1311,8 @@ public sealed class GraphPlotControlTests
         Assert.Empty(unavailableModel.Flat.X);
         Assert.Empty(unavailableModel.Rising.X);
         Assert.Empty(unavailableModel.Dashed.X);
-        Assert.Equal([1_080d, 1_200d], unavailableRemaining.Dashed.X);
-        Assert.Equal([90d, 90d], unavailableRemaining.Dashed.Y);
+        Assert.Equal([1_020d, 1_080d, 1_200d], unavailableRemaining.Dashed.X);
+        Assert.Equal([100d, 90d, 90d], unavailableRemaining.Dashed.Y);
     }
 
     [Fact]
@@ -3084,7 +3088,7 @@ public sealed class GraphPlotControlTests
     }
 
     [Fact]
-    public void Missing_leading_quota_starts_only_at_the_first_direct_anchor()
+    public void Missing_leading_quota_starts_at_period_start_and_keeps_first_direct_anchor()
     {
         const long periodStart = 0;
         const long resetAt = 604_800;
@@ -3098,16 +3102,121 @@ public sealed class GraphPlotControlTests
 
         var scene = GraphScene.Create(samples, GraphMetric.Tokens, periodStart, 180);
 
-        Assert.All(scene.Remaining.Take(3), value => Assert.True(double.IsNaN(value)));
-        Assert.Equal(
-            [GraphRemainingOrigin.Missing, GraphRemainingOrigin.Missing, GraphRemainingOrigin.Missing],
-            scene.RemainingOrigins.Take(3));
+        Assert.Equal([100d, 100d, 100d, 98d], scene.Remaining);
+        Assert.Equal(GraphRemainingOrigin.Raw, scene.RemainingOrigins[^1]);
         Assert.Equal(98d, scene.Remaining[^1]);
         Assert.Equal([0d, 60d, 120d, 180d], scene.Timestamps);
 
         var lines = GraphPlotProjection.BuildRemainingLines(scene);
-        Assert.Empty(lines.Solid.X);
+        Assert.Contains((0L, 180L), SegmentPairs(lines.Idle, lines.Solid, lines.Dashed));
+    }
+
+    [Fact]
+    public void Period_start_display_begins_at_100_percent_until_first_raw_remaining_observation()
+    {
+        const long periodStart = 1_000;
+        const long firstObservation = 1_060;
+        const long secondObservation = 1_120;
+        var samples = new[]
+        {
+            CompleteModelSample(firstObservation, 90, 1, 10),
+            CompleteModelSample(secondObservation, 80, 1, 20),
+        };
+
+        var scene = GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            periodStart,
+            secondObservation);
+
+        // Independent display oracle: the period start is a 100% presentation
+        // point, while every later point remains the raw observation.
+        Assert.Equal([periodStart, firstObservation, secondObservation],
+            scene.Timestamps.Select(timestamp => (long)timestamp));
+        Assert.Equal([100d, 90d, 80d], scene.Remaining);
+        Assert.All(scene.RemainingOrigins.Skip(1), origin =>
+            Assert.Equal(GraphRemainingOrigin.Raw, origin));
+
+        var lines = GraphPlotProjection.BuildRemainingLines(scene);
+        Assert.Contains(
+            (periodStart, firstObservation),
+            SegmentPairs(lines.Idle, lines.Solid, lines.Dashed));
+        Assert.Contains(
+            (firstObservation, secondObservation),
+            SegmentPairs(lines.Idle, lines.Solid));
+    }
+
+    [Fact]
+    public void Period_start_equal_to_first_raw_observation_keeps_raw_point_without_synthetic_segment()
+    {
+        const long periodStart = 1_000;
+        const long secondObservation = 1_060;
+        var samples = new[]
+        {
+            CompleteModelSample(periodStart, 90, 1, 10),
+            CompleteModelSample(secondObservation, 80, 1, 20),
+        };
+
+        var scene = GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            periodStart,
+            secondObservation);
+
+        // Independent raw-observation oracle: T1 == T0 is already the first
+        // accepted point, so no presentation-only 100% point is inserted.
+        Assert.Equal(
+            [periodStart, secondObservation],
+            scene.Timestamps.Select(timestamp => (long)timestamp));
+        Assert.Equal([90d, 80d], scene.Remaining);
+        Assert.Equal([true, true], scene.RemainingObserved);
+        Assert.Equal([90d, 80d], scene.ObservedRemainingValues);
+        Assert.All(scene.RemainingOrigins, origin =>
+            Assert.Equal(GraphRemainingOrigin.Raw, origin));
+
+        var lines = GraphPlotProjection.BuildRemainingLines(scene);
+        Assert.Contains(
+            (periodStart, secondObservation),
+            SegmentPairs(lines.Idle, lines.Solid));
         Assert.Empty(lines.Dashed.X);
+        Assert.Empty(lines.Dashed.Y);
+    }
+
+    [Fact]
+    public void Missing_leading_quota_without_accepted_raw_has_no_baseline_or_lines()
+    {
+        const long periodStart = 1_000;
+        const long secondObservation = 1_060;
+        var samples = new[]
+        {
+            CompleteModelSample(periodStart, null, 1, 10),
+            CompleteModelSample(secondObservation, null, 1, 20),
+        };
+
+        var scene = GraphScene.Create(
+            samples,
+            GraphMetric.Dollars,
+            periodStart,
+            secondObservation);
+
+        // Missing observations must remain missing; a display baseline or
+        // inferred/raw line would invent quota data without an accepted raw.
+        Assert.Equal(
+            [periodStart, secondObservation],
+            scene.Timestamps.Select(timestamp => (long)timestamp));
+        Assert.All(scene.Remaining, value => Assert.True(double.IsNaN(value)));
+        Assert.All(scene.RemainingObserved, observed => Assert.False(observed));
+        Assert.All(scene.ObservedRemainingValues, value => Assert.True(double.IsNaN(value)));
+        Assert.All(scene.RemainingOrigins, origin =>
+            Assert.Equal(GraphRemainingOrigin.Missing, origin));
+
+        var lines = GraphPlotProjection.BuildRemainingLines(scene);
+        Assert.Empty(lines.Idle.X);
+        Assert.Empty(lines.Idle.Y);
+        Assert.Empty(lines.Solid.X);
+        Assert.Empty(lines.Solid.Y);
+        Assert.Empty(lines.Dashed.X);
+        Assert.Empty(lines.Dashed.Y);
     }
 
     [Fact]
