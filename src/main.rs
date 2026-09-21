@@ -4828,6 +4828,9 @@ enum GraphModelOrigin {
     /// metadata. It never becomes an arithmetic baseline, but a complete
     /// exact-equal raw run may prove inactivity together with raw Remaining.
     LegacyObserved,
+    /// A numeric value from a confirmed row whose model vector is incomplete.
+    /// It remains display evidence but can never prove inactivity.
+    IncompleteObserved,
     BoundedFlat,
     Interpolated,
     Held,
@@ -5087,9 +5090,10 @@ fn accepted_graph_model_timelines(
                         point.origin = GraphModelOrigin::Direct;
                     }
                 }
-                GraphModelOrigin::LegacyObserved => {
-                    // Retain the saved legacy value for presentation only.
-                    // It cannot become the baseline for accepting direct data.
+                GraphModelOrigin::LegacyObserved | GraphModelOrigin::IncompleteObserved => {
+                    // Retain saved non-direct values for presentation only.
+                    // Neither can become the baseline for accepting direct
+                    // data; only LegacyObserved remains eligible for idle.
                     point.origin = GraphModelOrigin::LegacyObserved;
                 }
                 _ => {
@@ -7482,7 +7486,9 @@ fn token_idle_timestamp_intervals_with_render_evidence(
                 .any(|(_, point)| {
                     matches!(
                         point.origin,
-                        GraphModelOrigin::Unknown | GraphModelOrigin::Rejected
+                        GraphModelOrigin::Unknown
+                            | GraphModelOrigin::Rejected
+                            | GraphModelOrigin::IncompleteObserved
                     ) && point.raw_tokens.is_some()
                 })
         })
@@ -17540,7 +17546,7 @@ impl CodexInfoState {
                 // A confirmed row without a complete model vector is not a
                 // lossless legacy observation.  Keep its numeric payload as
                 // an explicit incomplete boundary, never idle authority.
-                "confirmed" => GraphModelOrigin::Unknown,
+                "confirmed" => GraphModelOrigin::IncompleteObserved,
                 // Reconstructed, unavailable and unknown source values are
                 // not point-in-time model observations.  Fail closed for the
                 // model vector while allowing other rows to render.
@@ -17591,7 +17597,7 @@ impl CodexInfoState {
                     GraphModelOrigin::Direct
                 }
                 usage_store::ModelSource::LegacyUnknown => GraphModelOrigin::LegacyObserved,
-                usage_store::ModelSource::Confirmed => GraphModelOrigin::Unknown,
+                usage_store::ModelSource::Confirmed => GraphModelOrigin::IncompleteObserved,
                 usage_store::ModelSource::ReconstructedFromSession
                 | usage_store::ModelSource::Unavailable => continue,
             };
@@ -43730,7 +43736,10 @@ mod tests {
             "SOL".to_owned(),
             BTreeMap::from([
                 (0, direct(100, super::GraphModelOrigin::Direct)),
-                (900, direct(100, super::GraphModelOrigin::Unknown)),
+                (
+                    900,
+                    direct(100, super::GraphModelOrigin::IncompleteObserved),
+                ),
                 (1_800, direct(100, super::GraphModelOrigin::Direct)),
             ]),
         )]);
