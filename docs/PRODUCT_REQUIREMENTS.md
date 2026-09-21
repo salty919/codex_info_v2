@@ -406,6 +406,11 @@ quotaを特定modelの消費へ付け替えたり、model 0へ補完したりし
    これはread-timeのgeometry生成だけであり、DB、history row、gap ledger、raw値を書き換えない。timestampの疎または
    sampling jitterだけでは欠損・予測へ降格しない。
 
+   accepted raw Remainingが1点以上あり、その最初のtimestampが`period_start`より後なら、Linux / Windowsの両rendererは
+   表示専用の`(period_start,100%)`から最初のaccepted raw Remainingまでを1px破線で結ぶ。この100%はquota reset境界の
+   表示規約であり、history row、raw/effective anchor、変化時刻、model利用または原因帰属ではない。DB/APIへ追加せず、
+   model系列を`period_start`へbackfillせず、最初のraw以降のRemaining geometryにも混入させない。
+
    raw-null、`Held`、`Rejected`、上記の限定補完条件を満たさない明示的unavailableまたはconfirmed gapを含む区間だけを予測とし、両側のaccepted raw
    anchor間は同じ単調補間geometryを1px破線で描く。予測した中間値を新しいanchorへ昇格しない。token anomalyや
    task activityはRemainingの形状・配分・線種を決めない。明示reset/correctionではspline runを分割し、境界を跨いで

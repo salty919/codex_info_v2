@@ -8152,6 +8152,21 @@ fn remaining_paths_with_boundaries_and_idle(
     let mut idle_commands = String::new();
     let mut solid_commands = String::new();
     let mut inferred_commands = String::new();
+    if let Some((_, first_raw)) = points.iter().copied().enumerate().find(|(index, point)| {
+        remaining_point_has_measured_quota(remaining_evidence, *index, samples, *point)
+    }) {
+        if first_raw.0 > period_start {
+            // A quota window begins full, but the first persisted observation may
+            // arrive later. Keep that boundary convention in the renderer only:
+            // the dashed interval does not become a raw/effective history point
+            // and does not backfill any model series.
+            append_dashed_segment(
+                &mut inferred_commands,
+                coordinate((period_start, 100.0)),
+                coordinate(first_raw),
+            );
+        }
+    }
     let curved = segments
         .iter()
         .copied()
@@ -41492,14 +41507,14 @@ mod tests {
     }
 
     #[test]
-    fn graph_paths_start_at_first_observation_without_inventing_a_reset_value() {
+    fn graph_paths_show_period_start_quota_baseline_without_model_backfill() {
         let reset_at = 7_200;
         let first = UsageHistorySample::new(
             600,
             reset_at,
-            80.0,
+            89.0,
             ModelDollarTotals {
-                sol: 1.0,
+                sol: 0.0,
                 terra: 0.0,
                 luna: 0.0,
             },
@@ -41507,34 +41522,48 @@ mod tests {
         let latest = UsageHistorySample::new(
             3_600,
             reset_at,
-            70.0,
+            75.0,
             ModelDollarTotals {
-                sol: 4.0,
-                terra: 2.0,
-                luna: 1.0,
+                sol: 2.06,
+                terra: 0.0,
+                luna: 0.0,
             },
         );
         let selected = [&first, &latest];
         let remaining_points = remaining_graph_points(&selected, 0, 3_900);
         let paths = graph_paths(&selected, 0, 3_900);
-        assert!(paths.remaining.starts_with("M15.38 20.60"));
-        assert_eq!(remaining_points[0], (600, 80.0));
-        assert_eq!(remaining_points[1], (3_600, 70.0));
+        assert_eq!(remaining_points[0], (600, 89.0));
+        assert_eq!(remaining_points[1], (3_600, 75.0));
         assert!(remaining_points
             .windows(2)
             .all(|pair| pair[0].0 < pair[1].0));
-        assert!(paths.remaining.matches('M').count() > 2);
-        assert!(paths.sol.starts_with("M15.38 74.50"));
+        assert!(paths.remaining_inferred.starts_with("M0.00 1.00"));
+        assert!(paths.remaining_solid.starts_with("M15.38 11.78"));
+        assert!(paths.sol.starts_with("M15.38 99.00"));
+        assert!(!paths.sol.contains("M0.00"));
         assert!(paths.sol.contains("L100.00"));
-        assert!(paths.terra.contains("L100.00"));
-        assert!(paths.luna.contains("L100.00"));
-        assert_eq!(paths.current_remaining_label, "70%");
-        assert_eq!(paths.current_sol_label, "$4.00");
-        assert_eq!(paths.current_terra_label, "$2.00");
-        assert_eq!(paths.current_luna_label, "$1.00");
+        assert_eq!(paths.current_remaining_label, "75%");
+        assert_eq!(paths.current_sol_label, "$2.06");
         assert!((paths.current_sol_y - 0.01).abs() < 0.0001);
-        assert!((paths.current_terra_y - 0.50).abs() < 0.0001);
-        assert!((paths.current_luna_y - 0.745).abs() < 0.0001);
+
+        let boundary_first = UsageHistorySample::new(
+            0,
+            reset_at,
+            89.0,
+            ModelDollarTotals::default(),
+        );
+        let boundary_latest = UsageHistorySample::new(
+            3_600,
+            reset_at,
+            75.0,
+            ModelDollarTotals::default(),
+        );
+        let boundary_selected = [&boundary_first, &boundary_latest];
+        let boundary_paths = graph_paths(&boundary_selected, 0, 3_900);
+        assert!(boundary_paths.remaining_solid.starts_with("M0.00 11.78"));
+        assert!(!boundary_paths
+            .remaining_inferred
+            .starts_with("M0.00 1.00"));
     }
 
     #[test]
