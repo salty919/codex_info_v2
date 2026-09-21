@@ -98,7 +98,7 @@
     <Grid x:Name="GraphContent" Margin="30,24" RowDefinitions="36,36,36,36,32,*">
       <Border Grid.Row="1" Grid.RowSpan="4" Background="#111B2C" />
 
-      <Grid Grid.Row="0" ColumnDefinitions="*,128,108" Background="Transparent">
+      <Grid Grid.Row="0" ColumnDefinitions="*,128,12,116" Background="Transparent">
         <TextBlock FontSize="24" FontWeight="Bold" VerticalAlignment="Center" Text="{Binding Texts.GraphWindowTitle}" />
         <ToggleButton x:Name="MetricSelector" Grid.Column="1" Classes="selector"
                       ClickMode="Press"
@@ -107,7 +107,7 @@
                       AutomationProperties.AutomationId="Graph.MetricSelector"
                       AutomationProperties.HelpText="{Binding SelectedMetric}"
                       ToolTip.Tip="{Binding Texts.ModelUsage}" />
-        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="0" VerticalAlignment="Top">
+        <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="4" VerticalAlignment="Top">
           <Button Classes="window-control" Click="OnMinimizeWindow" AutomationProperties.Name="{Binding Texts.Minimize}" AutomationProperties.AutomationId="Graph.Window.Minimize" Content="—" ToolTip.Tip="{Binding Texts.Minimize}" />
           <Button Classes="window-control" Click="OnMaximizeWindow" AutomationProperties.Name="{Binding Texts.Maximize}" AutomationProperties.AutomationId="Graph.Window.Maximize" Content="□" ToolTip.Tip="{Binding Texts.Maximize}" />
           <Button Classes="window-control" Click="OnCloseWindow" AutomationProperties.Name="{Binding Texts.Close}" AutomationProperties.AutomationId="Graph.Window.Close" Content="×" ToolTip.Tip="{Binding Texts.Close}" />
@@ -211,7 +211,7 @@
           </ListBox.ItemTemplate>
         </ListBox>
       </Border>
-      <Border x:Name="MetricMenu" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,36,108,0"
+      <Border x:Name="MetricMenu" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,36,128,0"
               Opacity="0" IsEnabled="False" IsHitTestVisible="False" Width="128" MaxHeight="160" Padding="4"
               Background="#1B2838" BorderBrush="#47769F" BorderThickness="1" CornerRadius="6">
         <ListBox ItemsSource="{Binding MetricOptions}" SelectedItem="{Binding SelectedMetric, Mode=TwoWay}"
