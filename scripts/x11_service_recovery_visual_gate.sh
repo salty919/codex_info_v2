@@ -132,12 +132,12 @@ if stride < 3:
     raise SystemExit("reference image pixel stride is invalid")
 
 components = {
-    "total": ((50, 264, 126, 288), (86, 178, 245)),
-    "sol": ((182, 268, 258, 290), (245, 247, 251)),
-    "terra": ((270, 268, 354, 290), (245, 247, 251)),
-    "luna": ((366, 268, 442, 290), (245, 247, 251)),
-    "astra": ((454, 268, 538, 290), (245, 247, 251)),
-    "other": ((550, 268, 642, 290), (245, 247, 251)),
+    "total": ((50, 284, 250, 308), (86, 178, 245)),
+    "sol": ((270, 286, 350, 308), (86, 178, 245)),
+    "terra": ((350, 286, 442, 308), (93, 201, 138)),
+    "luna": ((442, 286, 522, 308), (230, 162, 60)),
+    "astra": ((522, 286, 614, 308), (239, 106, 106)),
+    "other": ((614, 286, 714, 308), (120, 135, 156)),
 }
 
 def rgb(x, y):
@@ -184,12 +184,12 @@ if stride < 3:
     raise SystemExit("real-service image pixel stride is invalid")
 
 components = {
-    "total": ((50, 264, 126, 288), (86, 178, 245)),
-    "sol": ((182, 268, 258, 290), (245, 247, 251)),
-    "terra": ((270, 268, 354, 290), (245, 247, 251)),
-    "luna": ((366, 268, 442, 290), (245, 247, 251)),
-    "astra": ((454, 268, 538, 290), (245, 247, 251)),
-    "other": ((550, 268, 642, 290), (245, 247, 251)),
+    "total": ((50, 284, 250, 308), (86, 178, 245)),
+    "sol": ((270, 286, 350, 308), (86, 178, 245)),
+    "terra": ((350, 286, 442, 308), (93, 201, 138)),
+    "luna": ((442, 286, 522, 308), (230, 162, 60)),
+    "astra": ((522, 286, 614, 308), (239, 106, 106)),
+    "other": ((614, 286, 714, 308), (120, 135, 156)),
 }
 
 def rgb(x, y):
@@ -847,7 +847,7 @@ if baseline_path:
         return baseline[index + 2], baseline[index + 1], baseline[index]
     # Compare stable authenticated payload surfaces. The status banner is
     # intentionally excluded because its text/color changes on outage.
-    payload_rects = ((10, 66, 890, 162), (10, 294, 890, 394))
+    payload_rects = ((10, 66, 890, 162), (10, 254, 890, 324), (10, 324, 890, 394))
     changed = total = 0
     for left, top, right, bottom in payload_rects:
         for y in range(top, bottom):
@@ -874,7 +874,9 @@ assert_thread_summary_components "$ready_frame" \
 # Exercise the actual lazy boundary: the authenticated main window has already
 # rendered with period metadata, and only this user action may materialize the
 # selected history page and graph window.
-window_action "$window_id" 750 30 click
+# At 900px the Main content begins at x=30, and Header graph-x=440 with
+# width=118, so x=529 targets the fixed center of the rendered Graph button.
+window_action "$window_id" 529 30 click
 for _ in $(seq 1 100); do
     while read -r candidate; do
         [[ "$candidate" != "$window_id" ]] || continue

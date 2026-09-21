@@ -168,7 +168,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             lock (stateGate)
             {
-                return selectedAccount?.DisplayLabel ?? Texts.UnavailableValue;
+                return selectedAccount?.MainDisplayLabel ?? Texts.UnavailableValue;
             }
         }
     }
@@ -547,10 +547,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
-    public string StatusTitle => selectedAccount is { IsCurrent: false }
-        ? selectedAccount.DisplayLabel
-        : presentationState switch
-        {
+    public string StatusTitle => presentationState switch
+    {
             ClientPresentationState.Connecting => Texts.Connecting,
             ClientPresentationState.Ready => Texts.Ready,
             ClientPresentationState.QuotaDanger => Texts.QuotaDanger,
@@ -562,7 +560,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             ClientPresentationState.TransportError => Texts.TransportError,
             ClientPresentationState.ResponseError => Texts.Unavailable,
             _ => Texts.Connecting,
-        };
+    };
 
     public string StatusDetail
     {
@@ -659,7 +657,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
             if (selectedAccount?.Id == next.Id)
             {
-                var labelChanged = selectedAccount?.DisplayLabel != next.DisplayLabel;
+            var labelChanged = selectedAccount?.MainDisplayLabel != next.MainDisplayLabel;
                 selectedAccount = next;
                 if (labelChanged)
                 {
@@ -696,13 +694,14 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         var previousId = selectedAccount?.Id;
         var previousDefaultId = accounts.FirstOrDefault(account => account.IsCurrent)?.Id;
-        var normalizedAccounts = ApiAccount.EnsureUniqueDisplayLabels(snapshot.Accounts
-            .Select(account => account with
-            {
-                DisplayStatusSuffix = account.IsCurrent
-                    ? Texts.SignedInAccountSuffix
-                    : Texts.HistoricalAccountSuffix,
-            }))
+        var normalizedAccounts = ApiAccount.EnsureUniqueMainDisplayLabels(
+            ApiAccount.EnsureUniqueDisplayLabels(snapshot.Accounts
+                .Select(account => account with
+                {
+                    DisplayStatusSuffix = account.IsCurrent
+                        ? Texts.SignedInAccountSuffix
+                        : Texts.HistoricalAccountSuffix,
+                })))
             .ToArray();
         var accountsChanged = !accounts.SequenceEqual(normalizedAccounts);
         if (accountsChanged)
@@ -734,7 +733,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
         var previousSelected = selectedAccount;
         var changed = previousSelected?.Id != next?.Id;
         var accountKindChanged = previousSelected?.IsCurrent != next?.IsCurrent;
-        var labelChanged = previousSelected?.DisplayLabel != next?.DisplayLabel;
+        var labelChanged = previousSelected?.MainDisplayLabel != next?.MainDisplayLabel;
         selectedAccount = next;
         if (changed || accountKindChanged)
         {

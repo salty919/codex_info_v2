@@ -3313,8 +3313,8 @@ try {
         return (Find-E2EWindow $clientPid 'Codex Info Graph') -eq [IntPtr]::Zero
     } | Out-Null
 
-    Write-E2E 'case-5: open Threads and assert root/child/orphan rows and columns'
-    $threads = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Threads' -ButtonAutomationId 'Main.OpenThreads' -Title 'Codex Info Threads' -Role 'Threads' -ProcessId $clientPid
+    Write-E2E 'case-5: open active-thread Details and assert root/child/orphan rows and columns'
+    $threads = Open-E2EChildWindow -MainRoot $mainRoot -ButtonName 'Details' -ButtonAutomationId 'Main.OpenThreadDetails' -Title 'Codex Info Threads' -Role 'Threads' -ProcessId $clientPid
     $threadsRoot = $threads.Root
     Assert-E2ENoChildProductVersion $threadsRoot 'Threads'
     $threadTexts = Wait-E2E -Description 'Threads rows' -Probe {

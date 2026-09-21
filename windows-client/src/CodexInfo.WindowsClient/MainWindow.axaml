@@ -117,7 +117,7 @@
   <!-- The six rows keep the complete overview on one surface without
        compressing labels or table rows below the product typography scale. -->
   <Grid Margin="22,14"
-        RowDefinitions="52,82,62,56,118,42"
+        RowDefinitions="52,82,78,56,102,42"
         RowSpacing="8">
     <!-- Header owns the application heading, endpoint, and navigation. -->
     <Grid Grid.Row="0"
@@ -138,7 +138,8 @@
           <TextBlock FontSize="22"
                      FontWeight="SemiBold"
                      Foreground="#E9EFF8"
-                     Text="{Binding Texts.UsageStatus}" />
+                     Text="{Binding Texts.UsageStatus}"
+                     AutomationProperties.AutomationId="Main.UsageStatus" />
           <TextBlock Classes="label"
                      AutomationProperties.AutomationId="Main.ProductVersion"
                      Text="{Binding ProductVersionText}" />
@@ -158,8 +159,13 @@
                     AutomationProperties.AutomationId="Main.AccountSelector"
                     AutomationProperties.HelpText="{Binding SelectedAccountText}"
                     ToolTip.Tip="{Binding SelectedAccountText}">
-        <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
-          <StackPanel Spacing="0" VerticalAlignment="Center">
+        <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="6">
+          <TextBlock Foreground="#5DC98A"
+                     Text="●"
+                     IsVisible="{Binding SelectedAccount.IsCurrent}"
+                     VerticalAlignment="Center"
+                     AutomationProperties.AutomationId="Main.SelectedAccountCurrentMarker" />
+          <StackPanel Grid.Column="1" Spacing="0" VerticalAlignment="Center">
             <TextBlock FontSize="9"
                        Foreground="#56B2F5"
                        Text="{Binding Texts.Account}" />
@@ -169,7 +175,7 @@
                        TextTrimming="CharacterEllipsis"
                        TextWrapping="NoWrap" />
           </StackPanel>
-          <TextBlock Grid.Column="1"
+          <TextBlock Grid.Column="2"
                      VerticalAlignment="Center"
                      Foreground="#9FB0C5"
                      Text="⌄" />
@@ -187,14 +193,6 @@
                 AutomationProperties.AutomationId="Main.OpenGraph"
                 ToolTip.Tip="{Binding Texts.Graph}">
           <StackPanel Orientation="Horizontal" Spacing="4"><TextBlock Text="▥" /><TextBlock Text="{Binding Texts.Graph}" /></StackPanel>
-        </Button>
-        <Button Classes="command"
-                IsVisible="{Binding ShowAuthenticatedContent}"
-                Click="OnOpenThreads"
-                AutomationProperties.Name="{Binding Texts.Threads}"
-                AutomationProperties.AutomationId="Main.OpenThreads"
-                ToolTip.Tip="{Binding Texts.Threads}">
-          <StackPanel Orientation="Horizontal" Spacing="4"><TextBlock Text="☷" /><TextBlock Text="{Binding Texts.Threads}" /></StackPanel>
         </Button>
         <Button Classes="command"
                 Click="OnOpenLegal"
@@ -228,7 +226,7 @@
     <!-- RemainingQuota owns the current percentage and the current-period
          local cost estimate.  The bar is absent until a quota is validated. -->
     <Border Grid.Row="1" Classes="section" Padding="14,6" IsVisible="{Binding ShowAuthenticatedContent}">
-      <Grid ColumnDefinitions="*,210" ColumnSpacing="14">
+      <Grid RowDefinitions="*,6" ColumnDefinitions="*,210" ColumnSpacing="14" RowSpacing="4">
         <StackPanel Spacing="2" VerticalAlignment="Center">
           <TextBlock Classes="label" Text="{Binding Texts.RemainingQuota}" />
           <TextBlock FontSize="36"
@@ -236,11 +234,6 @@
                      Foreground="#F2F6FC"
                      Text="{Binding RemainingPercentText}"
                      TextWrapping="NoWrap" />
-          <ProgressBar Minimum="0"
-                       Maximum="100"
-                       Value="{Binding RemainingPercentValue}"
-                       Height="6"
-                       IsVisible="{Binding HasQuota}" />
         </StackPanel>
         <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center">
           <TextBlock FontSize="20"
@@ -249,19 +242,36 @@
                      Text="{Binding EstimatedCostText}"
                      TextWrapping="NoWrap" />
         </StackPanel>
+        <ProgressBar Grid.Row="1"
+                     Grid.ColumnSpan="2"
+                     Minimum="0"
+                     Maximum="100"
+                     Value="{Binding RemainingPercentValue}"
+                     Height="6"
+                     HorizontalAlignment="Stretch"
+                     IsVisible="{Binding HasQuota}"
+                     AutomationProperties.AutomationId="Main.RemainingQuotaBar" />
       </Grid>
     </Border>
 
     <!-- WeekGauge owns the seven-cell weekly/monthly period gauge, the
          remaining countdown, and the exact reset/observation timestamps. -->
     <Border Grid.Row="2" Classes="section" Padding="12,6" IsVisible="{Binding ShowAuthenticatedContent}">
-      <Grid RowDefinitions="24,20" RowSpacing="4">
-        <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="10">
+      <Grid RowDefinitions="18,16,20" ColumnDefinitions="Auto,*,Auto,Auto" RowSpacing="3" ColumnSpacing="8">
           <TextBlock Classes="label"
+                     Grid.ColumnSpan="3"
                      VerticalAlignment="Center"
                      Text="{Binding QuotaWindowText}"
                      TextWrapping="NoWrap" />
-          <ItemsControl Grid.Column="1"
+          <TextBlock Grid.Column="3"
+                     Classes="value"
+                     FontSize="13"
+                     HorizontalAlignment="Right"
+                     VerticalAlignment="Center"
+                     Text="{Binding QuotaRemainingText}"
+                     TextWrapping="NoWrap" />
+          <ItemsControl Grid.Row="1"
+                        Grid.ColumnSpan="4"
                         VerticalAlignment="Center"
                         ItemsSource="{Binding QuotaSegments}"
                         IsVisible="{Binding HasQuota}">
@@ -291,7 +301,8 @@
                hit-test-free TextBlock is the real gauge bounds and carries
                the same semantic name/help text so installed E2E/UIA sees
                the rendered gauge rather than a source-only attribute. -->
-          <TextBlock Grid.Column="1"
+          <TextBlock Grid.Row="1"
+                     Grid.ColumnSpan="4"
                      HorizontalAlignment="Stretch"
                      VerticalAlignment="Stretch"
                      IsVisible="{Binding HasQuota}"
@@ -301,20 +312,10 @@
                      AutomationProperties.AutomationId="Main.QuotaPeriodGauge"
                      AutomationProperties.Name="{Binding QuotaWindowText}"
                      AutomationProperties.HelpText="{Binding QuotaRemainingText}" />
-          <TextBlock Grid.Column="2"
-                     Classes="value"
-                     FontSize="13"
-                     HorizontalAlignment="Right"
-                     VerticalAlignment="Center"
-                     Text="{Binding QuotaRemainingText}"
-                     TextWrapping="NoWrap" />
-        </Grid>
-        <Grid Grid.Row="1" ColumnDefinitions="Auto,Auto,Auto,Auto" ColumnSpacing="8">
-          <TextBlock Classes="metric-label" VerticalAlignment="Center" Text="{Binding Texts.ResetTime}" />
-          <TextBlock Grid.Column="1" Classes="metric-value" VerticalAlignment="Center" Text="{Binding ResetAtText}" />
-          <TextBlock Grid.Column="2" Classes="metric-label" Margin="12,0,0,0" VerticalAlignment="Center" Text="{Binding Texts.ObservedAt}" />
-          <TextBlock Grid.Column="3" Classes="metric-value" VerticalAlignment="Center" Text="{Binding ObservedAtText}" />
-        </Grid>
+          <TextBlock Grid.Row="2" Classes="metric-label" VerticalAlignment="Center" Text="{Binding Texts.ResetTime}" />
+          <TextBlock Grid.Row="2" Grid.Column="1" Classes="metric-value" VerticalAlignment="Center" Text="{Binding ResetAtText}" AutomationProperties.AutomationId="Main.QuotaResetAt" />
+          <TextBlock Grid.Row="2" Grid.Column="2" Classes="metric-label" Margin="12,0,0,0" VerticalAlignment="Center" Text="{Binding Texts.ObservedAt}" />
+          <TextBlock Grid.Row="2" Grid.Column="3" Classes="metric-value" VerticalAlignment="Center" Text="{Binding ObservedAtText}" AutomationProperties.AutomationId="Main.QuotaObservedAt" />
       </Grid>
     </Border>
 
@@ -366,6 +367,8 @@
                 Height="30"
                 Padding="5,2"
                 Click="OnOpenThreads"
+                IsVisible="{Binding HasActiveThreads}"
+                AutomationProperties.AutomationId="Main.OpenThreadDetails"
                 AutomationProperties.Name="{Binding Texts.Details}"
                 ToolTip.Tip="{Binding Texts.Details}"
                 Content="{Binding Texts.Details}" />
@@ -375,31 +378,9 @@
     <!-- ModelUsage is a compact table rather than one card per model.  The
          fixed row budget displays the expected three model rows without a
          nested scroll surface. -->
-    <Border Grid.Row="4" Classes="section" Padding="12,5" IsVisible="{Binding ShowAuthenticatedContent}">
-      <Grid RowDefinitions="22,20,*">
-        <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="10">
-          <TextBlock FontSize="17" FontWeight="SemiBold" Text="{Binding Texts.ModelUsage}" />
-          <TextBlock Grid.Column="1"
-                     Classes="metric-label"
-                     VerticalAlignment="Center"
-                     Text="{Binding Texts.ModelUsageDescription}"
-                     TextWrapping="NoWrap" />
-          <TextBlock Grid.Column="2"
-                     Classes="metric-label"
-                     HorizontalAlignment="Right"
-                     AutomationProperties.AutomationId="Main.DetailsStatus"
-                     Text="{Binding DetailsStatusText}"
-                     TextWrapping="NoWrap" />
-          <!-- Keep UI Automation independent from localized glyph decoding. -->
-          <TextBlock Grid.Column="2"
-                     Width="1"
-                     Height="1"
-                     Opacity="0"
-                     IsHitTestVisible="False"
-                     AutomationProperties.AutomationId="Main.DetailsGenerationContract"
-                     Text="{Binding DetailsStatusAutomationText}" />
-        </Grid>
-        <Grid Grid.Row="1"
+    <Border Grid.Row="4" Classes="section" Padding="12,5" IsVisible="{Binding ShowAuthenticatedContent}" AutomationProperties.AutomationId="Main.ModelUsageTable">
+      <Grid RowDefinitions="20,*">
+        <Grid
               ColumnDefinitions="2.4*,*,*,*,*,*,*"
               ColumnSpacing="6">
           <TextBlock Classes="metric-label" VerticalAlignment="Center" Text="{Binding Texts.ModelLabel}" />
@@ -407,12 +388,12 @@
           <TextBlock Grid.Column="3" Grid.ColumnSpan="2" Classes="metric-label" HorizontalAlignment="Center" Text="{Binding Texts.CachedInput}" />
           <TextBlock Grid.Column="5" Grid.ColumnSpan="2" Classes="metric-label" HorizontalAlignment="Center" Text="{Binding Texts.Output}" />
         </Grid>
-        <TextBlock Grid.Row="2"
+        <TextBlock Grid.Row="1"
                    Classes="label"
                    VerticalAlignment="Center"
                    IsVisible="{Binding HasNoModels}"
                    Text="{Binding ModelUsageUnavailableText}" />
-        <ItemsControl Grid.Row="2"
+        <ItemsControl Grid.Row="1"
                       IsVisible="{Binding HasModels}"
                       ItemsSource="{Binding Models}">
           <ItemsControl.ItemsPanel>
@@ -447,7 +428,8 @@
             BorderBrush="{Binding StatusBorder}"
             BorderThickness="1"
             CornerRadius="8"
-            Padding="10,4">
+            Padding="10,4"
+            AutomationProperties.AutomationId="Main.StatusBanner">
       <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
         <Border Width="8" Height="8" CornerRadius="4" Background="{Binding StatusAccent}" VerticalAlignment="Top" Margin="0,5,0,0" />
         <StackPanel Grid.Column="1" Spacing="1" VerticalAlignment="Center">
@@ -517,6 +499,23 @@
       </Grid>
     </Border>
 
+    <!-- Preserve the generation semantics for UI Automation without adding
+         a second visible model-usage heading. -->
+    <TextBlock Grid.Row="4"
+               Width="1"
+               Height="1"
+               Opacity="0"
+               IsHitTestVisible="False"
+               AutomationProperties.AutomationId="Main.DetailsStatus"
+               Text="{Binding DetailsStatusText}" />
+    <TextBlock Grid.Row="4"
+               Width="1"
+               Height="1"
+               Opacity="0"
+               IsHitTestVisible="False"
+               AutomationProperties.AutomationId="Main.DetailsGenerationContract"
+               Text="{Binding DetailsStatusAutomationText}" />
+
     <!-- The first frame is intentionally held behind one stable loading
          surface.  Status/details are published atomically from the view
          model, then this spinner is removed once the generation is ready. -->
@@ -559,11 +558,19 @@
                AutomationProperties.AutomationId="Main.AccountMenu">
         <ListBox.ItemTemplate>
           <DataTemplate x:DataType="core:ApiAccount">
-            <TextBlock Text="{Binding DisplayLabel}"
-                       TextWrapping="Wrap"
-                       ToolTip.Tip="{Binding DisplayLabel}"
-                       AutomationProperties.Name="{Binding DisplayLabel}"
-                       AutomationProperties.HelpText="{Binding DisplayLabel}" />
+            <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6">
+              <TextBlock Foreground="#5DC98A"
+                         Text="●"
+                         IsVisible="{Binding IsCurrent}"
+                         VerticalAlignment="Center"
+                         AutomationProperties.AutomationId="Main.AccountCurrentMarker" />
+              <TextBlock Grid.Column="1"
+                         Text="{Binding MainDisplayLabel}"
+                         TextWrapping="Wrap"
+                         ToolTip.Tip="{Binding MainDisplayLabel}"
+                         AutomationProperties.Name="{Binding MainDisplayLabel}"
+                         AutomationProperties.HelpText="{Binding MainDisplayLabel}" />
+            </Grid>
           </DataTemplate>
         </ListBox.ItemTemplate>
       </ListBox>

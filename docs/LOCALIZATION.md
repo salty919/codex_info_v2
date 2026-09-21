@@ -28,17 +28,29 @@ Codex Infoの固定UI文言、時刻表示、フォント、配布ライセン�
 
 localeは`LC_ALL`、`LC_MESSAGES`、`LANG`の順に最初の非空値を採用します。encoding suffix（`.UTF-8`）とmodifier（`@...`）を除き、`-`と`_`を同じ区切りとしてprimary subtagを判定します。`C`、`POSIX`、不正値、未対応言語は英語catalogへ対応付け、`zh_TW`と`zh-Hant`は簡体字catalogへ対応付けます。
 
-localeとtimezoneはプロセス起動時に確定します。`TZ`には`Asia/Tokyo`や`Europe/Berlin`などのIANA IDを指定でき、無効値はUTCへ対応付けます。
+localeはプロセス起動時に確定します。timezoneは起動時に保存済みselectorを解決し、Linux Settingsの
+保存成功時だけ同じprocessの表示timezoneを切り替えます。Linuxの`local`は`TZ`、実行hostのIANA zone、
+UTCの順で解決し、非空で不正な`TZ`はUTCへfail closedします。`TZ`には`Asia/Tokyo`や
+`Europe/Berlin`などのIANA IDを指定できます。
 
 ## 時刻基準
 
 - epoch秒、並び順、期間の境界はUTCで保持します。
-- 絶対時刻、履歴期間、グラフ横軸は起動時timezoneへ変換し、数値UTC offset（例`+09:00`）を付けます。
+- 絶対時刻、履歴期間、グラフ横軸はactive表示timezoneへ変換し、数値UTC offset（例`+09:00`）を付けます。
 - 日本語catalogの絶対時刻はGregorian calendar・ASCII digit・24時間表記の
   `yyyy/MM/dd HH:mm ±HH:MM`へ固定します。fixture `1787356800` はUTCで
   `2026/08/22 00:00 +00:00`、Asia/Tokyoで`2026/08/22 09:00 +09:00`です。
-  timezone selectorの保存値は`local`または`UTC`だけとし、`local`の具体IANA zoneは実行hostから
-  解決して表示へ使います。IANA zone名自体をWindows設定値として保存しません。
+  timezone selectorの保存値は両platformとも`local`または`UTC`だけとし、`local`の具体IANA zoneは
+  実行hostから解決して表示へ使います。IANA zone名自体を設定値として保存しません。Linuxの
+  presentation preferenceは`$XDG_CONFIG_HOME/codex-info/settings.json`、`XDG_CONFIG_HOME`未設定時は
+  `$HOME/.config/codex-info/settings.json`にexact one-key JSON `{"timeZoneId":"local|UTC"}`として保存します。
+  読込み時は大文字小文字を問わない`UTC`を`UTC`へ正規化し、それ以外を`local`へfail closedし、
+  次の保存では上記canonical値だけを書きます。
+  missing時は`local`、malformed・duplicate key・symlink・non-regular fileは適用せず`local`で表示を開始し、
+  Settingsを回復入口とします。保存は同一directoryのowner-only temporary fileへ書き込み、file dataを同期してから
+  atomic renameします。rename成功後にactive表示timezoneを切り替え、通常のprocess再起動後に保存値を復元します。
+  書込みまたはrenameの失敗時は保存値とactive表示timezoneを変更しません。これは表示専用設定であり、epoch、期間境界、
+  REST、DB、resident serviceを変更しません。
 - 経過時間と残り時間はUTC秒の差分を各言語の単位へ変換します。
 - 無効epochは値欄を`—`、グラフ軸を空値、履歴選択肢を除外として表示します。
 
@@ -144,6 +156,8 @@ raw記録する。Setupはexact key集合の一回性、unknown→en、単一res
 locale集合、key集合、fallback、UIA/semantic join規則は本Decisionで確定した。実artifact、fresh画像、
 スクリーンリーダー/UIA操作ログ、独立製品判定は未取得であり、製品状態は`PRODUCT_PENDING`である。
 X版の意味論を変更する判断、locale別にtopologyを変える判断、未登録locale/key/stateの推測は未採用である。
+Issue #349の`local|UTC` Linux preferenceと保存成功後の表示切替だけは実装・直接評価対象とするが、
+この限定決定は上記`PRODUCT_PENDING`または他の未取得証拠を解消しない。
 
 ## 配布ライセンス
 
