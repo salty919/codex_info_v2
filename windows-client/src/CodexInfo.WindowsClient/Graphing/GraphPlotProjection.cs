@@ -46,6 +46,13 @@ internal readonly record struct GraphRemainingLineProjection(
     GraphLineProjection Solid,
     GraphLineProjection Dashed);
 
+/// <summary>A finite presentation policy for the leading quota interval.</summary>
+internal enum GraphRemainingBaselineMode
+{
+    None,
+    PeriodStartAtFullQuota,
+}
+
 /// <summary>
 /// A renderer-ready line whose coordinates are quantized through the same
 /// 0..100, two-decimal viewbox used by the native Slint graph.
@@ -231,9 +238,14 @@ internal static class GraphPlotProjection
     }
 
     internal static GraphCanonicalRemainingLineProjection BuildCanonicalRemainingLines(
-        GraphScene scene)
+        GraphScene scene) =>
+        BuildCanonicalRemainingLines(scene, GraphRemainingBaselineMode.None);
+
+    internal static GraphCanonicalRemainingLineProjection BuildCanonicalRemainingLines(
+        GraphScene scene,
+        GraphRemainingBaselineMode baselineMode)
     {
-        var semantic = BuildRemainingLines(scene, smooth: true);
+        var semantic = BuildRemainingLines(scene, smooth: true, baselineMode);
         return new GraphCanonicalRemainingLineProjection(
             CanonicalizeLine(scene, semantic.Idle, 100, remaining: true, dashed: false),
             CanonicalizeLine(scene, semantic.Solid, 100, remaining: true, dashed: false),
@@ -256,11 +268,19 @@ internal static class GraphPlotProjection
     /// are emitted into the dashed prediction path.
     /// </summary>
     public static GraphRemainingLineProjection BuildRemainingLines(GraphScene scene) =>
-        BuildRemainingLines(scene, smooth: false);
+        BuildRemainingLines(scene, smooth: false, GraphRemainingBaselineMode.None);
 
-    private static GraphRemainingLineProjection BuildRemainingLines(GraphScene scene, bool smooth)
+    private static GraphRemainingLineProjection BuildRemainingLines(
+        GraphScene scene,
+        bool smooth,
+        GraphRemainingBaselineMode baselineMode)
     {
         ArgumentNullException.ThrowIfNull(scene);
+        if (baselineMode is not GraphRemainingBaselineMode.None and
+            not GraphRemainingBaselineMode.PeriodStartAtFullQuota)
+        {
+            throw new ArgumentOutOfRangeException(nameof(baselineMode));
+        }
         if (!scene.HasPoints)
         {
             return new GraphRemainingLineProjection(
@@ -291,16 +311,19 @@ internal static class GraphPlotProjection
                 scene.RemainingOrigins[index] is GraphRemainingOrigin.Raw)
             .ToArray();
         var smoothableIntervals = new List<(int Left, int Right, bool Dashed)>();
-        if (anchors.Length > 0 && firstRenderable < anchors[0])
+        if (baselineMode is GraphRemainingBaselineMode.PeriodStartAtFullQuota &&
+            anchors.Length > 0 &&
+            scene.RemainingObserved[anchors[0]] &&
+            scene.Timestamps[anchors[0]] > scene.PeriodStartAt)
         {
-            // The period-start quota point is a presentation convention, not
-            // a remote observation. Keep its connection to the first raw
-            // anchor visibly inferred and independent of smoothing.
+            // Full quota at the period boundary is a renderer-only convention.
+            // Keep it out of GraphScene's raw/history arrays and visibly infer
+            // only the interval leading to the first accepted observation.
             AppendSegment(
                 dashedX,
                 dashedY,
-                scene.Timestamps[firstRenderable],
-                scene.Remaining[firstRenderable],
+                scene.PeriodStartAt,
+                100,
                 scene.Timestamps[anchors[0]],
                 scene.Remaining[anchors[0]]);
         }

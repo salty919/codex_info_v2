@@ -1238,17 +1238,24 @@ public sealed class GraphPlotControlTests
         Assert.Equal(90, samples[1].RemainingPercent);
         Assert.True(samples[^1].IsSyntheticTail);
         var scene = Scene(samples, period.StartAt, period.EndAt);
-        Assert.Equal(100, scene.Remaining[0]);
+        Assert.True(double.IsNaN(scene.Remaining[0]));
         Assert.Equal(GraphRemainingOrigin.Missing, scene.RemainingOrigins[0]);
         Assert.Equal(90, scene.Remaining[1]);
         Assert.Equal([false, true, false], scene.RemainingObserved);
         Assert.True(double.IsNaN(scene.ObservedRemainingValues[0]));
         Assert.Equal(90, scene.ObservedRemainingValues[1]);
         Assert.True(double.IsNaN(scene.ObservedRemainingValues[2]));
-        var lines = GraphPlotProjection.BuildRemainingLines(scene);
-        Assert.Empty(lines.Solid.X);
-        Assert.Equal([1_020d, 1_080d, 1_200d], lines.Dashed.X);
-        Assert.Equal([100d, 90d, 90d], lines.Dashed.Y);
+        var rawLines = GraphPlotProjection.BuildRemainingLines(scene);
+        Assert.Empty(rawLines.Solid.X);
+        Assert.Equal([1_080d, 1_200d], rawLines.Dashed.X);
+        Assert.Equal([90d, 90d], rawLines.Dashed.Y);
+
+        var displayLines = GraphPlotProjection.BuildCanonicalRemainingLines(
+            scene,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        Assert.StartsWith("M0.00 1.00", displayLines.Dashed.Path);
+        Assert.Equal((double)period.StartAt, displayLines.Dashed.Line.X[0]);
+        Assert.Equal(100d, displayLines.Dashed.Line.Y[0]);
     }
 
     [Fact]
@@ -1311,8 +1318,8 @@ public sealed class GraphPlotControlTests
         Assert.Empty(unavailableModel.Flat.X);
         Assert.Empty(unavailableModel.Rising.X);
         Assert.Empty(unavailableModel.Dashed.X);
-        Assert.Equal([1_020d, 1_080d, 1_200d], unavailableRemaining.Dashed.X);
-        Assert.Equal([100d, 90d, 90d], unavailableRemaining.Dashed.Y);
+        Assert.Equal([1_080d, 1_200d], unavailableRemaining.Dashed.X);
+        Assert.Equal([90d, 90d], unavailableRemaining.Dashed.Y);
     }
 
     [Fact]
@@ -3102,13 +3109,42 @@ public sealed class GraphPlotControlTests
 
         var scene = GraphScene.Create(samples, GraphMetric.Tokens, periodStart, 180);
 
-        Assert.Equal([100d, 100d, 100d, 98d], scene.Remaining);
+        // GraphScene retains the raw observation authority. The period-start
+        // 100% point is renderer-only and must not be written into raw arrays.
+        Assert.All(scene.Remaining.Take(3), value => Assert.True(double.IsNaN(value)));
+        Assert.Equal(98d, scene.Remaining[^1]);
+        Assert.All(scene.ObservedRemainingValues.Take(3), value => Assert.True(double.IsNaN(value)));
+        Assert.Equal(98d, scene.ObservedRemainingValues[^1]);
+        Assert.Equal([false, false, false, true], scene.RemainingObserved);
+        Assert.Equal(
+            [
+                GraphRemainingOrigin.Missing,
+                GraphRemainingOrigin.Missing,
+                GraphRemainingOrigin.Missing,
+                GraphRemainingOrigin.Raw,
+            ],
+            scene.RemainingOrigins);
         Assert.Equal(GraphRemainingOrigin.Raw, scene.RemainingOrigins[^1]);
         Assert.Equal(98d, scene.Remaining[^1]);
         Assert.Equal([0d, 60d, 120d, 180d], scene.Timestamps);
 
-        var lines = GraphPlotProjection.BuildRemainingLines(scene);
-        Assert.Contains((0L, 180L), SegmentPairs(lines.Idle, lines.Solid, lines.Dashed));
+        // Default projection is the Issue 137/raw oracle: one raw anchor cannot
+        // manufacture a segment or a leading baseline.
+        var rawLines = GraphPlotProjection.BuildRemainingLines(scene);
+        Assert.Empty(rawLines.Idle.X);
+        Assert.Empty(rawLines.Solid.X);
+        Assert.Empty(rawLines.Dashed.X);
+
+        // The user-facing renderer opts into the period-start convention. Its
+        // explicit mode creates only the inferred dashed T0 -> first-raw path.
+        var displayLines = GraphPlotProjection.BuildCanonicalRemainingLines(
+            scene,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        Assert.StartsWith("M0.00 1.00", displayLines.Dashed.Path);
+        Assert.Equal((double)periodStart, displayLines.Dashed.Line.X[0]);
+        Assert.Equal(100d, displayLines.Dashed.Line.Y[0]);
+        Assert.Contains(displayLines.Dashed.Line.X, value => value > 90);
+        Assert.Empty(displayLines.Solid.Line.X);
     }
 
     [Fact]
@@ -3129,21 +3165,26 @@ public sealed class GraphPlotControlTests
             periodStart,
             secondObservation);
 
-        // Independent display oracle: the period start is a 100% presentation
-        // point, while every later point remains the raw observation.
-        Assert.Equal([periodStart, firstObservation, secondObservation],
+        // GraphScene retains raw timestamps and quota observations. The period
+        // start is a presentation-only 100% baseline in explicit display mode.
+        Assert.Equal([firstObservation, secondObservation],
             scene.Timestamps.Select(timestamp => (long)timestamp));
-        Assert.Equal([100d, 90d, 80d], scene.Remaining);
-        Assert.All(scene.RemainingOrigins.Skip(1), origin =>
+        Assert.Equal([90d, 80d], scene.Remaining);
+        Assert.All(scene.RemainingOrigins, origin =>
             Assert.Equal(GraphRemainingOrigin.Raw, origin));
 
-        var lines = GraphPlotProjection.BuildRemainingLines(scene);
-        Assert.Contains(
-            (periodStart, firstObservation),
-            SegmentPairs(lines.Idle, lines.Solid, lines.Dashed));
-        Assert.Contains(
-            (firstObservation, secondObservation),
-            SegmentPairs(lines.Idle, lines.Solid));
+        var rawLines = GraphPlotProjection.BuildRemainingLines(scene);
+        Assert.Equal([firstObservation, secondObservation], rawLines.Solid.X);
+        Assert.Equal([90d, 80d], rawLines.Solid.Y);
+        Assert.Empty(rawLines.Dashed.X);
+
+        var displayLines = GraphPlotProjection.BuildCanonicalRemainingLines(
+            scene,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        Assert.StartsWith("M0.00 1.00", displayLines.Dashed.Path);
+        Assert.NotEmpty(displayLines.Solid.Line.X);
+        Assert.Equal((double)periodStart, displayLines.Dashed.Line.X[0]);
+        Assert.Equal(100d, displayLines.Dashed.Line.Y[0]);
     }
 
     [Fact]
@@ -3174,12 +3215,19 @@ public sealed class GraphPlotControlTests
         Assert.All(scene.RemainingOrigins, origin =>
             Assert.Equal(GraphRemainingOrigin.Raw, origin));
 
-        var lines = GraphPlotProjection.BuildRemainingLines(scene);
+        var rawLines = GraphPlotProjection.BuildRemainingLines(scene);
         Assert.Contains(
             (periodStart, secondObservation),
-            SegmentPairs(lines.Idle, lines.Solid));
-        Assert.Empty(lines.Dashed.X);
-        Assert.Empty(lines.Dashed.Y);
+            SegmentPairs(rawLines.Idle, rawLines.Solid));
+        Assert.Empty(rawLines.Dashed.X);
+        Assert.Empty(rawLines.Dashed.Y);
+
+        var displayLines = GraphPlotProjection.BuildCanonicalRemainingLines(
+            scene,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        Assert.Empty(displayLines.Dashed.Line.X);
+        Assert.Empty(displayLines.Dashed.Line.Y);
+        Assert.Empty(displayLines.Dashed.Path);
     }
 
     [Fact]
@@ -3210,13 +3258,24 @@ public sealed class GraphPlotControlTests
         Assert.All(scene.RemainingOrigins, origin =>
             Assert.Equal(GraphRemainingOrigin.Missing, origin));
 
-        var lines = GraphPlotProjection.BuildRemainingLines(scene);
-        Assert.Empty(lines.Idle.X);
-        Assert.Empty(lines.Idle.Y);
-        Assert.Empty(lines.Solid.X);
-        Assert.Empty(lines.Solid.Y);
-        Assert.Empty(lines.Dashed.X);
-        Assert.Empty(lines.Dashed.Y);
+        var rawLines = GraphPlotProjection.BuildRemainingLines(scene);
+        Assert.Empty(rawLines.Idle.X);
+        Assert.Empty(rawLines.Idle.Y);
+        Assert.Empty(rawLines.Solid.X);
+        Assert.Empty(rawLines.Solid.Y);
+        Assert.Empty(rawLines.Dashed.X);
+        Assert.Empty(rawLines.Dashed.Y);
+
+        var displayLines = GraphPlotProjection.BuildCanonicalRemainingLines(
+            scene,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        Assert.Empty(displayLines.Idle.Line.X);
+        Assert.Empty(displayLines.Idle.Line.Y);
+        Assert.Empty(displayLines.Solid.Line.X);
+        Assert.Empty(displayLines.Solid.Line.Y);
+        Assert.Empty(displayLines.Dashed.Line.X);
+        Assert.Empty(displayLines.Dashed.Line.Y);
+        Assert.Empty(displayLines.Dashed.Path);
     }
 
     [Fact]

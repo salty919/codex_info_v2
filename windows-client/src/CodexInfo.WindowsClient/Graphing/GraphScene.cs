@@ -360,48 +360,6 @@ public sealed class GraphScene
         var modelReliability = displayProjection.Reliability;
         var tokenReliability = tokenProjection.Reliability;
         var modelLineReliability = displayProjection.LineReliability;
-        var firstAcceptedRemaining = Enumerable.Range(0, samples.Count)
-            .FirstOrDefault(index =>
-                remainingOrigins[index] is GraphRemainingOrigin.Raw &&
-                remainingObserved[index] &&
-                samples[index].Timestamp >= start &&
-                samples[index].Timestamp <= end,
-                -1);
-        if (firstAcceptedRemaining >= 0 &&
-            samples[firstAcceptedRemaining].Timestamp > start)
-        {
-            // A period is known to begin at full quota even when its first
-            // accepted observation arrives later. Keep that convention in
-            // the display projection only: the raw observation arrays remain
-            // missing until their original timestamp.
-            for (var index = 0; index < firstAcceptedRemaining; index++)
-            {
-                remaining[index] = 100;
-                remainingOrigins[index] = GraphRemainingOrigin.Missing;
-                remainingInterpolated[index] = true;
-            }
-
-            if (timestamps[0] > start)
-            {
-                timestamps = Prepend(timestamps, (double)start);
-                remaining = Prepend(remaining, 100d);
-                remainingOrigins = Prepend(remainingOrigins, GraphRemainingOrigin.Missing);
-                remainingInterpolated = Prepend(remainingInterpolated, true);
-                remainingObserved = Prepend(remainingObserved, false);
-                observedRemainingValues = Prepend(observedRemainingValues, double.NaN);
-                modelSeries = PrependSeries(modelSeries, double.NaN);
-                tokenModelSeries = PrependSeries(tokenModelSeries, double.NaN);
-                modelReliability = PrependSeries(modelReliability, false);
-                tokenReliability = PrependSeries(tokenReliability, false);
-                modelLineReliability = PrependSeries(modelLineReliability, false);
-                publishedModelNames = publishedModelNames
-                    .Prepend((IReadOnlySet<string>)new HashSet<string>(StringComparer.Ordinal))
-                    .ToArray();
-                modelVectorAvailable = Prepend(modelVectorAvailable, false);
-                modelSynthetic = Prepend(modelSynthetic, false);
-            }
-        }
-
         var sol = SeriesOrMissing(modelSeries, "SOL", timestamps.Length);
         var terra = SeriesOrMissing(modelSeries, "TERRA", timestamps.Length);
         var luna = SeriesOrMissing(modelSeries, "LUNA", timestamps.Length);
@@ -442,17 +400,6 @@ public sealed class GraphScene
             idleIntervals,
             maximum);
     }
-
-    private static T[] Prepend<T>(IReadOnlyList<T> values, T first) =>
-        values.Prepend(first).ToArray();
-
-    private static IReadOnlyDictionary<string, IReadOnlyList<T>> PrependSeries<T>(
-        IReadOnlyDictionary<string, IReadOnlyList<T>> series,
-        T first) =>
-        series.ToDictionary(
-            pair => pair.Key,
-            pair => (IReadOnlyList<T>)pair.Value.Prepend(first).ToArray(),
-            StringComparer.Ordinal);
 
     private static IReadOnlyList<ApiHistorySample> WithoutRecoverableSamplingJitter(
         IReadOnlyList<ApiHistorySample> samples,
