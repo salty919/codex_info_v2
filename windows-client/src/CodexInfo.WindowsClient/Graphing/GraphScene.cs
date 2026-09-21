@@ -356,10 +356,14 @@ public sealed class GraphScene
             .Select(origin => origin is not GraphRemainingOrigin.Raw)
             .ToArray();
         var modelSeries = displayProjection.Values;
-        var sol = SeriesOrMissing(modelSeries, "SOL", samples.Count);
-        var terra = SeriesOrMissing(modelSeries, "TERRA", samples.Count);
-        var luna = SeriesOrMissing(modelSeries, "LUNA", samples.Count);
-        var astra = SeriesOrMissing(modelSeries, "ASTRA", samples.Count);
+        var tokenModelSeries = tokenProjection.Values;
+        var modelReliability = displayProjection.Reliability;
+        var tokenReliability = tokenProjection.Reliability;
+        var modelLineReliability = displayProjection.LineReliability;
+        var sol = SeriesOrMissing(modelSeries, "SOL", timestamps.Length);
+        var terra = SeriesOrMissing(modelSeries, "TERRA", timestamps.Length);
+        var luna = SeriesOrMissing(modelSeries, "LUNA", timestamps.Length);
+        var astra = SeriesOrMissing(modelSeries, "ASTRA", timestamps.Length);
         var maximum = Math.Max(
             1,
             new[] { sol, terra, luna, astra }
@@ -378,10 +382,10 @@ public sealed class GraphScene
             luna,
             astra,
             modelSeries,
-            tokenProjection.Values,
-            displayProjection.Reliability,
-            tokenProjection.Reliability,
-            displayProjection.LineReliability,
+            tokenModelSeries,
+            modelReliability,
+            tokenReliability,
+            modelLineReliability,
             publishedModelNames,
             modelVectorAvailable,
             modelSynthetic,
