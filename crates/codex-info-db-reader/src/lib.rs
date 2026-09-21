@@ -3151,13 +3151,10 @@ fn clip_history_periods(periods: &mut Vec<PublicHistoryPeriod>, intervals: &Read
         if !current_interval_is_owned {
             period.current = false;
         }
-        // A current period may begin before this account's first lifecycle
-        // interval.  Keep the validated quota-window boundary so the graph
-        // shows the real weekly frame with an empty pre-activation span; the
-        // interval still owns every published row and no value is fabricated.
-        if !period.current {
-            period.start_at = first_start;
-        }
+        // Lifecycle ownership limits published rows, the visible end and the
+        // current marker. It must not replace the already validated quota
+        // boundary with the first owned observation; the leading interval is
+        // time-range context and contains no fabricated sample.
         period.end_at = last_end;
         period.start_at <= period.end_at
     });
@@ -5911,6 +5908,53 @@ mod tests {
         );
         assert_eq!(fallback_periods.len(), 1);
         assert_eq!(fallback_periods[0].start_at, quota_minute_start - 60);
+    }
+
+    #[test]
+    fn inactive_lifecycle_clipping_preserves_quota_window_start() {
+        let reset_at = 1_800_001_000_i64;
+        let window_seconds = 3_600_i64;
+        let quota_start = quota_period_start(reset_at, window_seconds)
+            .expect("positive exact quota-window boundary");
+        let first_observation = quota_start + 120;
+        let last_observation = first_observation + 60;
+        let sample = |timestamp, remaining_percent| PublicHistorySample {
+            timestamp,
+            reset_at,
+            remaining_percent: Some(remaining_percent),
+            sol_dollars: 0.0,
+            terra_dollars: 0.0,
+            luna_dollars: 0.0,
+            sol_tokens: 0,
+            terra_tokens: 0,
+            luna_tokens: 0,
+        };
+        let samples = vec![
+            sample(first_observation, 89.0),
+            sample(last_observation, 75.0),
+        ];
+        let mut periods = history_periods(
+            &samples,
+            last_observation,
+            Some(reset_at),
+            Some(reset_at),
+            window_seconds,
+        );
+        assert_eq!(periods.len(), 1);
+        assert_eq!(periods[0].start_at, quota_start);
+
+        let intervals = ReadIntervals::new(vec![ReadInterval::new(
+            Some(first_observation),
+            Some(last_observation + 1),
+        )
+        .expect("inactive account lifecycle")])
+        .expect("lifecycle intervals");
+        clip_history_periods(&mut periods, &intervals);
+
+        assert_eq!(periods.len(), 1);
+        assert!(!periods[0].current);
+        assert_eq!(periods[0].start_at, quota_start);
+        assert_eq!(periods[0].end_at, last_observation);
     }
 
     #[test]
