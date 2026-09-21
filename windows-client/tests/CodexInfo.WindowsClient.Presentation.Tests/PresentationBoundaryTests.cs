@@ -430,6 +430,53 @@ public sealed class PresentationBoundaryTests
     }
 
     [Fact]
+    public void GraphHeaderSeparatesMetricSelectorFromWindowControls()
+    {
+        var document = XDocument.Parse(LoadRepositoryFile(
+            "windows-client", "src", "CodexInfo.WindowsClient", "GraphWindow.axaml"));
+        var metricSelector = document.Descendants()
+            .Single(element => element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.MetricSelector");
+        var header = metricSelector.Parent;
+        Assert.NotNull(header);
+        Assert.Equal("Grid", header.Name.LocalName);
+
+        var columns = header.Attribute("ColumnDefinitions")!.Value.Split(',');
+        Assert.Equal(["*", "128", "12", "116"], columns);
+
+        var controls = header.Elements()
+            .Single(element => element.Name.LocalName == "StackPanel" &&
+                element.Elements().Any(button =>
+                    button.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.Window.Minimize"));
+        Assert.Equal("3", controls.Attribute("Grid.Column")?.Value);
+        var spacing = int.Parse(controls.Attribute("Spacing")!.Value);
+        Assert.Equal(4, spacing);
+
+        var buttons = controls.Elements()
+            .Where(element => element.Name.LocalName == "Button")
+            .ToArray();
+        Assert.Equal(
+            ["Graph.Window.Minimize", "Graph.Window.Maximize", "Graph.Window.Close"],
+            buttons.Select(button => button.Attribute("AutomationProperties.AutomationId")?.Value).ToArray());
+
+        var controlStyle = document.Descendants()
+            .Single(element => element.Name.LocalName == "Style" &&
+                element.Attribute("Selector")?.Value == "Button.window-control");
+        var buttonWidth = int.Parse(controlStyle.Descendants()
+            .Single(element => element.Name.LocalName == "Setter" &&
+                element.Attribute("Property")?.Value == "Width")
+            .Attribute("Value")!.Value);
+        var controlGroupWidth = (buttons.Length * buttonWidth) + ((buttons.Length - 1) * spacing);
+        Assert.Equal(controlGroupWidth, int.Parse(columns[3]));
+
+        var metricMenu = document.Descendants()
+            .Single(element => element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.MetricMenu")
+            .Parent;
+        Assert.NotNull(metricMenu);
+        var metricMenuRightMargin = int.Parse(metricMenu.Attribute("Margin")!.Value.Split(',')[2]);
+        Assert.Equal(int.Parse(columns[2]) + controlGroupWidth, metricMenuRightMargin);
+    }
+
+    [Fact]
     public void BorderlessWindowCloseControlsExposeStableAutomationIds()
     {
         var expected = new Dictionary<string, string>(StringComparer.Ordinal)
