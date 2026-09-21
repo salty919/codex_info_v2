@@ -1632,17 +1632,22 @@ export component GraphWindow inherits Window {
     in-out property <bool> app-maximized: false;
     in-out property <bool> show-tokens: false;
     in-out property <string> remaining-path;
+    in-out property <string> remaining-idle-path;
     in-out property <string> remaining-inferred-path;
     in-out property <[RemainingMarker]> remaining-markers;
+    in-out property <string> sol-idle-path;
     in-out property <string> sol-flat-path;
     in-out property <string> sol-rising-path;
     in-out property <string> sol-inferred-path;
+    in-out property <string> terra-idle-path;
     in-out property <string> terra-flat-path;
     in-out property <string> terra-rising-path;
     in-out property <string> terra-inferred-path;
+    in-out property <string> luna-idle-path;
     in-out property <string> luna-flat-path;
     in-out property <string> luna-rising-path;
     in-out property <string> luna-inferred-path;
+    in-out property <string> astra-idle-path;
     in-out property <string> astra-flat-path;
     in-out property <string> astra-rising-path;
     in-out property <string> astra-inferred-path;
@@ -1994,6 +1999,36 @@ export component GraphWindow inherits Window {
                 stroke: DesignTokens.graph-astra; stroke-width: 1px; fill: transparent; opacity: 0.72;
                 stroke-line-cap: round; stroke-line-join: round;
             }
+            // Confirmed sustained non-use is the only thin solid state. The
+            // background band and all five horizontal paths share intervals.
+            Path {
+                x: root.plot-left; y: 28px; width: root.plot-width; height: parent.height - 52px;
+                viewbox-width: 100; viewbox-height: 100; fit: fill; clip: true;
+                commands: root.luna-idle-path; visible: root.show-luna;
+                stroke: DesignTokens.graph-luna; stroke-width: 1px; fill: transparent; opacity: 0.95;
+                stroke-line-cap: round; stroke-line-join: round;
+            }
+            Path {
+                x: root.plot-left; y: 28px; width: root.plot-width; height: parent.height - 52px;
+                viewbox-width: 100; viewbox-height: 100; fit: fill; clip: true;
+                commands: root.terra-idle-path; visible: root.show-terra;
+                stroke: DesignTokens.graph-terra; stroke-width: 1px; fill: transparent; opacity: 0.95;
+                stroke-line-cap: round; stroke-line-join: round;
+            }
+            Path {
+                x: root.plot-left; y: 28px; width: root.plot-width; height: parent.height - 52px;
+                viewbox-width: 100; viewbox-height: 100; fit: fill; clip: true;
+                commands: root.sol-idle-path; visible: root.show-sol;
+                stroke: DesignTokens.graph-sol; stroke-width: 1px; fill: transparent; opacity: 0.95;
+                stroke-line-cap: round; stroke-line-join: round;
+            }
+            Path {
+                x: root.plot-left; y: 28px; width: root.plot-width; height: parent.height - 52px;
+                viewbox-width: 100; viewbox-height: 100; fit: fill; clip: true;
+                commands: root.astra-idle-path; visible: root.show-astra;
+                stroke: DesignTokens.graph-astra; stroke-width: 1px; fill: transparent; opacity: 0.95;
+                stroke-line-cap: round; stroke-line-join: round;
+            }
             Path {
                 x: root.plot-left;
                 y: 28px;
@@ -2159,6 +2194,23 @@ export component GraphWindow inherits Window {
                 stroke-width: 1px;
                 fill: transparent;
                 opacity: 0.72;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+            }
+            Path {
+                x: root.plot-left;
+                y: 28px;
+                width: root.plot-width;
+                height: parent.height - 52px;
+                viewbox-width: 100;
+                viewbox-height: 100;
+                fit: fill;
+                clip: true;
+                commands: root.remaining-idle-path;
+                visible: root.show-remaining;
+                stroke: DesignTokens.graph-remaining;
+                stroke-width: 1px;
+                fill: transparent;
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }

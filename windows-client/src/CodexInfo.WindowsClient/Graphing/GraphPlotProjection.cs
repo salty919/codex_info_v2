@@ -35,12 +35,14 @@ internal readonly record struct GraphLineProjection(
 
 /// <summary>Separate X-compatible paths for quiet and changing segments.</summary>
 internal readonly record struct GraphModelLineProjection(
+    GraphLineProjection Idle,
     GraphLineProjection Flat,
     GraphLineProjection Rising,
     GraphLineProjection Dashed);
 
 /// <summary>Separate solid and reference-only remaining-quota paths.</summary>
 internal readonly record struct GraphRemainingLineProjection(
+    GraphLineProjection Idle,
     GraphLineProjection Solid,
     GraphLineProjection Dashed);
 
@@ -53,11 +55,13 @@ internal readonly record struct GraphCanonicalLineProjection(
     string Path);
 
 internal readonly record struct GraphCanonicalModelLineProjection(
+    GraphCanonicalLineProjection Idle,
     GraphCanonicalLineProjection Flat,
     GraphCanonicalLineProjection Rising,
     GraphCanonicalLineProjection Dashed);
 
 internal readonly record struct GraphCanonicalRemainingLineProjection(
+    GraphCanonicalLineProjection Idle,
     GraphCanonicalLineProjection Solid,
     GraphCanonicalLineProjection Dashed);
 
@@ -220,6 +224,7 @@ internal static class GraphPlotProjection
     {
         var semantic = BuildModelLines(scene, values, smooth: true);
         return new GraphCanonicalModelLineProjection(
+            CanonicalizeLine(scene, semantic.Idle, scene.ModelMaximum, remaining: false, dashed: false),
             CanonicalizeLine(scene, semantic.Flat, scene.ModelMaximum, remaining: false, dashed: false),
             CanonicalizeLine(scene, semantic.Rising, scene.ModelMaximum, remaining: false, dashed: false),
             CanonicalizeLine(scene, semantic.Dashed, scene.ModelMaximum, remaining: false, dashed: true));
@@ -230,6 +235,7 @@ internal static class GraphPlotProjection
     {
         var semantic = BuildRemainingLines(scene, smooth: true);
         return new GraphCanonicalRemainingLineProjection(
+            CanonicalizeLine(scene, semantic.Idle, 100, remaining: true, dashed: false),
             CanonicalizeLine(scene, semantic.Solid, 100, remaining: true, dashed: false),
             CanonicalizeLine(scene, semantic.Dashed, 100, remaining: true, dashed: true));
     }
@@ -238,58 +244,10 @@ internal static class GraphPlotProjection
         GraphScene scene)
     {
         ArgumentNullException.ThrowIfNull(scene);
-        if (!scene.HasPoints || scene.PeriodEndAt <= scene.PeriodStartAt)
-        {
-            return Array.Empty<GraphCanonicalRemainingMarker>();
-        }
-
-        var markers = new List<GraphCanonicalRemainingMarker>();
-        var seen = new HashSet<int>();
-        var previous = -1;
-        for (var index = 0; index < scene.Timestamps.Count; index++)
-        {
-            if (!double.IsFinite(scene.Remaining[index]))
-            {
-                continue;
-            }
-            if (previous < 0)
-            {
-                previous = index;
-                continue;
-            }
-
-            var before = scene.Remaining[previous];
-            var current = scene.Remaining[index];
-            if (scene.Timestamps[index] >= scene.Timestamps[previous] && current < before)
-            {
-                var boundary = (int)Math.Floor(before);
-                if (Math.Abs(before - boundary) <= double.Epsilon)
-                {
-                    boundary--;
-                }
-                var lowest = (int)Math.Ceiling(current);
-                while (boundary >= lowest)
-                {
-                    if (boundary < before && boundary >= current && seen.Add(boundary))
-                    {
-                        var fraction = Math.Clamp(
-                            (boundary - before) / (current - before),
-                            0,
-                            1);
-                        var timestamp = scene.Timestamps[previous] +
-                            (scene.Timestamps[index] - scene.Timestamps[previous]) * fraction;
-                        markers.Add(new GraphCanonicalRemainingMarker(
-                            (timestamp - scene.PeriodStartAt) /
-                                (scene.PeriodEndAt - scene.PeriodStartAt) * 100,
-                            99 - boundary * 0.98,
-                            boundary));
-                    }
-                    boundary--;
-                }
-            }
-            previous = index;
-        }
-        return markers;
+        // The smooth measured quota path is the only trajectory. Boundary
+        // dots derived from unsmoothed integer samples would look like a
+        // second line and are intentionally not rendered.
+        return Array.Empty<GraphCanonicalRemainingMarker>();
     }
 
     /// <summary>
@@ -307,6 +265,7 @@ internal static class GraphPlotProjection
         {
             return new GraphRemainingLineProjection(
                 new GraphLineProjection([], []),
+                new GraphLineProjection([], []),
                 new GraphLineProjection([], []));
         }
 
@@ -317,9 +276,12 @@ internal static class GraphPlotProjection
         {
             return new GraphRemainingLineProjection(
                 new GraphLineProjection([], []),
+                new GraphLineProjection([], []),
                 new GraphLineProjection([], []));
         }
 
+        var idleX = new List<double>();
+        var idleY = new List<double>();
         var solidX = new List<double>();
         var solidY = new List<double>();
         var dashedX = new List<double>();
@@ -351,14 +313,28 @@ internal static class GraphPlotProjection
             }
             else
             {
-                smoothableIntervals.Add((
-                    left,
-                    right,
-                    scene.HasRemainingHardBreakBetween(
+                var dashed = scene.HasRemainingHardBreakBetween(
                         scene.Timestamps[left],
                         scene.Timestamps[right]) ||
                     crossesPrediction ||
-                    !measured));
+                    !measured;
+                if (!dashed && SameDoubleBits(current, before) && IsConfirmedIdleInterval(
+                        scene,
+                        scene.Timestamps[left],
+                        scene.Timestamps[right]))
+                {
+                    AppendSegment(
+                        idleX,
+                        idleY,
+                        scene.Timestamps[left],
+                        before,
+                        scene.Timestamps[right],
+                        current);
+                }
+                else
+                {
+                    smoothableIntervals.Add((left, right, dashed));
+                }
             }
         }
         if (smooth)
@@ -404,12 +380,16 @@ internal static class GraphPlotProjection
         }
 
         return new GraphRemainingLineProjection(
+            new GraphLineProjection(idleX, idleY),
             new GraphLineProjection(solidX, solidY),
             new GraphLineProjection(dashedX, dashedY));
     }
 
     private static bool RemainingOriginHasMeasuredQuota(GraphRemainingOrigin origin) =>
         origin is GraphRemainingOrigin.Raw;
+
+    private static bool SameDoubleBits(double left, double right) =>
+        BitConverter.DoubleToInt64Bits(left) == BitConverter.DoubleToInt64Bits(right);
 
     /// <summary>
     /// Projects the flat, rising, and inferred cumulative-model paths used by
@@ -432,6 +412,8 @@ internal static class GraphPlotProjection
             throw new ArgumentException("A model series must match the graph timestamp count.", nameof(values));
         }
 
+        var idleX = new List<double>();
+        var idleY = new List<double>();
         var flatX = new List<double>();
         var flatY = new List<double>();
         var risingX = new List<double>();
@@ -441,7 +423,8 @@ internal static class GraphPlotProjection
         var anchors = Enumerable.Range(0, values.Count)
             .Where(index => double.IsFinite(values[index]) && values[index] >= 0 &&
                 !scene.ModelSynthetic[index] &&
-                scene.IsModelIntervalReliable(values, index, index))
+                (scene.IsModelIntervalReliable(values, index, index) ||
+                 IsConfirmedIdleTimestamp(scene, scene.Timestamps[index])))
             .ToArray();
         var smoothableIntervals = new List<(int Left, int Right, ProjectionStyle Style)>();
         for (var anchor = 1; anchor < anchors.Length; anchor++)
@@ -450,13 +433,34 @@ internal static class GraphPlotProjection
             var right = anchors[anchor];
             var before = values[left];
             var current = values[right];
-            var crossesPrediction = Enumerable.Range(left + 1, right - left - 1)
-                .Any(index => !scene.IsModelIntervalReliable(values, index, index));
+            var confirmedIdle = IsConfirmedIdleInterval(
+                scene,
+                scene.Timestamps[left],
+                scene.Timestamps[right]);
+            if (!confirmedIdle &&
+                (!scene.IsModelIntervalReliable(values, left, left) ||
+                 !scene.IsModelIntervalReliable(values, right, right)))
+            {
+                continue;
+            }
+            var crossesPrediction = !confirmedIdle &&
+                Enumerable.Range(left + 1, right - left - 1)
+                    .Any(index => !scene.IsModelIntervalReliable(values, index, index));
             var crossesCorrection = scene.HasModelCorrectionBetween(
                 values,
                 scene.Timestamps[left],
                 scene.Timestamps[right]);
-            if (current < before)
+            if (confirmedIdle)
+            {
+                AppendSegment(
+                    idleX,
+                    idleY,
+                    scene.Timestamps[left],
+                    before,
+                    scene.Timestamps[right],
+                    before);
+            }
+            else if (current < before)
             {
                 AppendSegment(
                     dashedX,
@@ -539,10 +543,19 @@ internal static class GraphPlotProjection
         }
 
         return new GraphModelLineProjection(
+            new GraphLineProjection(idleX, idleY),
             new GraphLineProjection(flatX, flatY),
             new GraphLineProjection(risingX, risingY),
             new GraphLineProjection(dashedX, dashedY));
     }
+
+    private static bool IsConfirmedIdleInterval(GraphScene scene, double startAt, double endAt) =>
+        scene.IdleIntervals.Any(interval =>
+            startAt >= interval.StartAt && endAt <= interval.EndAt);
+
+    private static bool IsConfirmedIdleTimestamp(GraphScene scene, double timestamp) =>
+        scene.IdleIntervals.Any(interval =>
+            timestamp >= interval.StartAt && timestamp <= interval.EndAt);
 
     /// <summary>Returns every evidence interval without a pixel-width filter.</summary>
     public static IReadOnlyList<GraphIdleInterval> BuildVisibleIdleIntervals(GraphScene scene)
@@ -766,7 +779,8 @@ internal static class GraphPlotProjection
                         run[index - 1],
                         run[index],
                         maximum,
-                        remaining);
+                        remaining,
+                        continuePath: index > 1);
                 }
             }
             run.Clear();
@@ -854,7 +868,8 @@ internal static class GraphPlotProjection
                         new CanonicalPoint(start.X + dx * from, start.YTop + dy * from),
                         new CanonicalPoint(start.X + dx * to, start.YTop + dy * to),
                         maximum,
-                        remaining);
+                        remaining,
+                        continuePath: false);
                 }
                 offset += advance;
                 phase += advance;
@@ -878,10 +893,28 @@ internal static class GraphPlotProjection
         CanonicalPoint start,
         CanonicalPoint end,
         double maximum,
-        bool remaining)
+        bool remaining,
+        bool continuePath)
     {
         var roundedStart = RoundCanonical(start);
         var roundedEnd = RoundCanonical(end);
+        var startTimestamp = CanonicalTimestamp(scene, roundedStart.X);
+        var startValue = CanonicalAxisValue(roundedStart.YTop, maximum, remaining);
+        var endTimestamp = CanonicalTimestamp(scene, roundedEnd.X);
+        var endValue = CanonicalAxisValue(roundedEnd.YTop, maximum, remaining);
+        var canContinue = continuePath &&
+            x.Count > 0 &&
+            double.IsFinite(x[^1]) &&
+            x[^1] == startTimestamp &&
+            y[^1] == startValue;
+        if (canContinue)
+        {
+            path.Append(CultureInfo.InvariantCulture, $" L{roundedEnd.X:0.00} {roundedEnd.YTop:0.00}");
+            x.Add(endTimestamp);
+            y.Add(endValue);
+            return;
+        }
+
         if (path.Length > 0)
         {
             path.Append(' ');
@@ -893,10 +926,10 @@ internal static class GraphPlotProjection
             x.Add(double.NaN);
             y.Add(double.NaN);
         }
-        x.Add(CanonicalTimestamp(scene, roundedStart.X));
-        y.Add(CanonicalAxisValue(roundedStart.YTop, maximum, remaining));
-        x.Add(CanonicalTimestamp(scene, roundedEnd.X));
-        y.Add(CanonicalAxisValue(roundedEnd.YTop, maximum, remaining));
+        x.Add(startTimestamp);
+        y.Add(startValue);
+        x.Add(endTimestamp);
+        y.Add(endValue);
     }
 
     private static CanonicalPoint RoundCanonical(CanonicalPoint point) =>

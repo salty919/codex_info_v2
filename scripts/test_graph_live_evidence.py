@@ -90,6 +90,80 @@ class GraphLiveEvidenceTests(unittest.TestCase):
                 name,
             )
 
+    def test_saved_legacy_raw_flat_run_across_midnight_is_idle(self):
+        start = 1_788_879_300  # 2026-09-08 23:55 JST
+        rows = [
+            {
+                "timestamp": start + minute * 60,
+                "remaining_percent": 79.0,
+                "models_complete": False,
+                "model_source": "legacy-unknown",
+                "models": [
+                    {"model": "LUNA", "total_tokens": 8_364_408, "total_dollars": 0.54},
+                    {"model": "SOL", "total_tokens": 172_318_074, "total_dollars": 119.86},
+                    {"model": "TERRA", "total_tokens": 0, "total_dollars": 0.0},
+                ],
+            }
+            for minute in range(31)
+        ]
+        rows[15]["models"][1]["total_dollars"] = 120.86
+
+        fixture = v3_fixture(rows, period_id="legacy-midnight-idle")
+        segments, idle = oracle.build_expected(fixture)
+        self.assertEqual([{"start_at": start, "end_at": start + 1_800}], idle)
+        for metric in ("tokens", "dollars"):
+            for series in ("LUNA", "SOL", "TERRA"):
+                self.assertEqual(30, len(pairs(segments, "idle", metric, series)))
+        self.assertEqual(30, len(pairs(segments, "idle")))
+        rendered = oracle.build_expected_render_contracts(fixture)["dollars"]
+        sol_idle = next(
+            model["idle"] for model in rendered["models"] if model["series"] == "SOL"
+        )
+        self.assertEqual(1, len(set(sol_idle.split()[1::2])))
+
+    def test_lossless_source_transitions_do_not_split_idle_or_dollar_hold(self):
+        for legacy_first in (False, True):
+            rows = []
+            for minute in range(11):
+                before_transition = minute <= 5
+                legacy = before_transition == legacy_first
+                rows.append(
+                    {
+                        "timestamp": minute * 60,
+                        "remaining_percent": 90.0,
+                        "models_complete": not legacy,
+                        "model_source": "legacy-unknown" if legacy else "confirmed",
+                        "task_active_since_previous": False,
+                        "models": [
+                            {
+                                "model": "SOL",
+                                "total_tokens": 100,
+                                "total_dollars": 1.0 if before_transition else 2.0,
+                            }
+                        ],
+                    }
+                )
+
+            fixture = v3_fixture(
+                rows,
+                period_id=f"source-transition-{legacy_first}",
+            )
+            segments, idle = oracle.build_expected(fixture)
+
+            self.assertEqual([{"start_at": 0, "end_at": 600}], idle)
+            for metric in ("tokens", "dollars"):
+                self.assertEqual(
+                    10,
+                    len(pairs(segments, "idle", metric, "SOL")),
+                )
+            rendered = oracle.build_expected_render_contracts(fixture)["dollars"]
+            sol_idle = next(
+                model["idle"]
+                for model in rendered["models"]
+                if model["series"] == "SOL"
+            )
+            self.assertEqual(1, len(set(sol_idle.split()[1::2])))
+
     def test_monotone_cubic_projection_matches_fixed_no_overshoot_oracle(self):
         self.assertEqual(
             [0.3671875, 0.6875, 0.9140625],
@@ -571,6 +645,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
                 "timestamp": minute * 60,
                 "remaining_percent": 90.0,
                 "tokens": 100,
+                "dollars": 1.0 if minute < 6 else 2.0,
                 "task_active_since_previous": False,
             }
             for minute in range(11)
@@ -1077,7 +1152,7 @@ class GraphLiveEvidenceTests(unittest.TestCase):
             },
         )
 
-    def test_render_contract_fixes_native_viewbox_dash_ticks_and_markers(self):
+    def test_render_contract_fixes_native_viewbox_dash_ticks_without_a_second_remaining_trajectory(self):
         fixture = {
             "period": {
                 "id": "render-contract",
@@ -1144,9 +1219,130 @@ class GraphLiveEvidenceTests(unittest.TestCase):
         ])
         self.assertEqual(694, dollars["layout"]["plot_width"])
         self.assertEqual(94, dollars["layout"]["gutter_width"])
-        self.assertEqual([99, 98, 97, 96, 95, 94, 93, 92, 91, 90], [
-            marker["boundary"] for marker in dollars["remaining_markers"]
+        self.assertEqual([], dollars["remaining_markers"])
+
+    def test_continuous_measured_run_uses_one_joined_canonical_path(self):
+        fixture = v3_fixture(
+            [
+                {"timestamp": 0, "remaining_percent": 100.0, "tokens": 0},
+                {"timestamp": 60, "remaining_percent": 90.0, "tokens": 1},
+                {"timestamp": 120, "remaining_percent": 80.0, "tokens": 2},
+            ],
+            period_id="joined-solid-path",
+        )
+
+        tokens = oracle.build_expected_render_contracts(fixture)["tokens"]
+
+        self.assertEqual(1, tokens["models"][0]["rising"].count("M"))
+        self.assertEqual(1, tokens["remaining"]["solid"].count("M"))
+
+    def test_legacy_raw_model_values_render_solid_without_idle_authority(self):
+        fixture = v3_fixture([
+            {
+                "timestamp": 0,
+                "remaining_percent": 100,
+                "tokens": 0,
+                "dollars": 0,
+                "models_complete": False,
+                "model_source": "legacy-unknown",
+            },
+            {
+                "timestamp": 60,
+                "remaining_percent": 90,
+                "tokens": 10,
+                "dollars": 1,
+                "models_complete": False,
+                "model_source": "legacy-unknown",
+            },
+        ], period_id="legacy-display-only")
+
+        segments, idle = oracle.build_expected(fixture)
+
+        self.assertEqual([], idle)
+        for metric in ("tokens", "dollars"):
+            self.assertEqual([[0, 60]], pairs(segments, "rising", metric, "SOL"))
+            self.assertEqual([], pairs(segments, "dashed", metric, "SOL"))
+
+    def test_idle_render_contract_separates_sustained_thin_solids_from_short_flats_and_missing(self):
+        def models(value, *, astra_dollars=None):
+            return [
+                {
+                    "model": name,
+                    "total_tokens": value * 100 + index,
+                    "total_dollars": (
+                        astra_dollars
+                        if name == "ASTRA" and astra_dollars is not None
+                        else value + index
+                    ),
+                }
+                for index, name in enumerate(("SOL", "TERRA", "LUNA", "ASTRA"))
+            ]
+
+        sustained = v3_fixture([
+            {"timestamp": 0, "remaining_percent": 90, "models": models(1)},
+            {"timestamp": 600, "remaining_percent": 90, "models": models(1)},
         ])
+        segments, idle = oracle.build_expected(sustained)
+        self.assertEqual([{"start_at": 0, "end_at": 600}], idle)
+        for metric in ("dollars", "tokens"):
+            for series in ("SOL", "TERRA", "LUNA", "ASTRA"):
+                self.assertEqual([[0, 600]], pairs(segments, "idle", metric, series))
+            self.assertEqual([[0, 600]], pairs(segments, "idle"))
+        render = oracle.build_expected_render_contracts(sustained)
+        for metric in ("dollars", "tokens"):
+            self.assertEqual(1, render[metric]["styles"]["idle_width"])
+            self.assertEqual(1, render[metric]["styles"]["inferred_width"])
+            self.assertEqual(3, render[metric]["styles"]["flat_width"])
+            self.assertTrue(all(model["idle"] for model in render[metric]["models"]))
+            self.assertTrue(render[metric]["remaining"]["idle"])
+
+        short = v3_fixture([
+            {"timestamp": 0, "remaining_percent": 90, "models": models(1)},
+            {"timestamp": 540, "remaining_percent": 90, "models": models(1)},
+        ])
+        short_segments, short_idle = oracle.build_expected(short)
+        self.assertEqual([], short_idle)
+        self.assertEqual([[0, 540]], pairs(short_segments, "flat", "dollars", "SOL"))
+
+        changed_dollar = v3_fixture([
+            {"timestamp": 0, "remaining_percent": 90, "models": models(1)},
+            {
+                "timestamp": 600,
+                "remaining_percent": 90,
+                "models": models(1, astra_dollars=4.01),
+            },
+        ])
+        changed_segments, changed_idle = oracle.build_expected(changed_dollar)
+        self.assertEqual([{"start_at": 0, "end_at": 600}], changed_idle)
+        self.assertEqual(
+            [[0, 600]],
+            pairs(changed_segments, "idle", "dollars", "ASTRA"),
+        )
+        changed_render = oracle.build_expected_render_contracts(changed_dollar)
+        astra_idle = next(
+            model["idle"]
+            for model in changed_render["dollars"]["models"]
+            if model["series"] == "ASTRA"
+        )
+        self.assertTrue(astra_idle)
+        _, start_y, _, end_y = astra_idle.split()
+        self.assertEqual(start_y, end_y)
+
+        missing = v3_fixture([
+            {"timestamp": 0, "remaining_percent": 90, "models": models(1)},
+            {
+                "timestamp": 60,
+                "remaining_percent": None,
+                "models": None,
+                "models_complete": False,
+                "model_source": "unavailable",
+            },
+            {"timestamp": 120, "remaining_percent": 80, "models": models(2)},
+        ])
+        missing_segments, missing_idle = oracle.build_expected(missing)
+        self.assertEqual([], missing_idle)
+        self.assertEqual([[0, 120]], pairs(missing_segments, "dashed", "dollars", "SOL"))
+        self.assertEqual([[0, 120]], pairs(missing_segments, "dashed"))
 
 
 if __name__ == "__main__":

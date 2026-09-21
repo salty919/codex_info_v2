@@ -722,6 +722,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
             next ??= accounts.FirstOrDefault(account => account.Id == defaultAccountId);
             next ??= accounts.FirstOrDefault(account => account.IsCurrent);
         }
+        else if (!followedPreviousDefault)
+        {
+            next = accounts.FirstOrDefault(account => account.Id == previousId);
+        }
         if (snapshot.DefaultAccountId is not null && next is null)
         {
             return false;
