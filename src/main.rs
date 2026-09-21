@@ -30857,6 +30857,9 @@ mod tests {
         state.preview = false;
         // Keep this owner-recovery test independent of the optional account
         // directory resource exposed only by the partitioned REST service.
+        state.service_accounts.clear();
+        state.service_default_account_id = None;
+        state.service_selected_account_id = None;
         state.service_accounts_known = true;
         state.service_accounts_supported = false;
         state.service_accounts_force_poll = false;
@@ -35163,10 +35166,11 @@ mod tests {
             source
                 .matches("show_and_focus_window(window.window(),")
                 .count(),
-            2
+            3
         );
         assert_eq!(source.matches("ThreadsWindow::new()").count(), 1);
         assert_eq!(source.matches("LegalNoticeWindow::new()").count(), 1);
+        assert_eq!(source.matches("TimeZoneSettingsWindow::new()").count(), 1);
         assert!(!source.contains("graph.show()"));
         assert!(!source.contains("let _ = window.show();"));
     }
@@ -35177,12 +35181,12 @@ mod tests {
             .split_once("#[cfg(test)]\nmod tests")
             .map(|(source, _)| source)
             .expect("production source");
-        assert_eq!(source.matches("on_close_requested(move ||").count(), 3);
+        assert_eq!(source.matches("on_close_requested(move ||").count(), 4);
         assert_eq!(
             source
                 .matches("CloseRequestResponse::KeepWindowShown")
                 .count(),
-            3
+            4
         );
         assert!(source.contains("if graph.hide().is_ok()"));
         assert!(source.contains("if window.hide().is_ok()"));
@@ -35207,7 +35211,7 @@ mod tests {
                 .count(),
             0
         );
-        assert_eq!(source.matches("set_reset_close_buttons(true)").count(), 12);
+        assert_eq!(source.matches("set_reset_close_buttons(true)").count(), 13);
     }
 
     #[test]
