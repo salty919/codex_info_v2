@@ -41546,24 +41546,14 @@ mod tests {
         assert_eq!(paths.current_sol_label, "$2.06");
         assert!((paths.current_sol_y - 0.01).abs() < 0.0001);
 
-        let boundary_first = UsageHistorySample::new(
-            0,
-            reset_at,
-            89.0,
-            ModelDollarTotals::default(),
-        );
-        let boundary_latest = UsageHistorySample::new(
-            3_600,
-            reset_at,
-            75.0,
-            ModelDollarTotals::default(),
-        );
+        let boundary_first =
+            UsageHistorySample::new(0, reset_at, 89.0, ModelDollarTotals::default());
+        let boundary_latest =
+            UsageHistorySample::new(3_600, reset_at, 75.0, ModelDollarTotals::default());
         let boundary_selected = [&boundary_first, &boundary_latest];
         let boundary_paths = graph_paths(&boundary_selected, 0, 3_900);
         assert!(boundary_paths.remaining_solid.starts_with("M0.00 11.78"));
-        assert!(!boundary_paths
-            .remaining_inferred
-            .starts_with("M0.00 1.00"));
+        assert!(!boundary_paths.remaining_inferred.starts_with("M0.00 1.00"));
     }
 
     #[test]
