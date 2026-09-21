@@ -202,7 +202,9 @@ public sealed class GraphPlotControl : AvaPlot
         terraSeries = new ModelSeriesVisual(terraIdle, terraFlat, terraRising, terraDashed);
         solSeries = new ModelSeriesVisual(solIdle, solFlat, solRising, solDashed);
         astraSeries = new ModelSeriesVisual(astraIdle, astraFlat, astraRising, astraDashed);
-        var remainingLines = GraphPlotProjection.BuildCanonicalRemainingLines(scene);
+        var remainingLines = GraphPlotProjection.BuildCanonicalRemainingLines(
+            scene,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
         remainingDashedSeries = AddLine(
             remainingLines.Dashed.Line,
             RemainingColor.WithOpacity(0.72),
