@@ -242,6 +242,26 @@ public sealed class MainWindowViewModelTests
     }
 
     [Fact]
+    public void DefaultlessAccountPollPreservesManualHistoricalSelection()
+    {
+        var directory = new ApiAccountsSnapshot(
+            null,
+            [
+                new ApiAccount("account-2", false, 1_789_774_038, null, "ytanaka80@gmail.com"),
+                new ApiAccount("account-1", false, 1_789_773_766, 1_789_774_038, "salty919@gmail.com"),
+            ]);
+        using var viewModel = new MainWindowViewModel(new AccountScopedClient());
+        Assert.True(ApplyAccountsSnapshot(viewModel, directory));
+        Assert.True(viewModel.SelectAccount("account-1"));
+        var selectedGeneration = AccountSelectionGeneration(viewModel);
+
+        Assert.True(ApplyAccountsSnapshot(viewModel, directory));
+
+        Assert.Equal("account-1", viewModel.SelectedAccount?.Id);
+        Assert.Equal(selectedGeneration, AccountSelectionGeneration(viewModel));
+    }
+
+    [Fact]
     public async Task LoginChangeClearsOldPresentationAndRoutesTheNextRefreshToCurrent()
     {
         var client = new AccountScopedClient();

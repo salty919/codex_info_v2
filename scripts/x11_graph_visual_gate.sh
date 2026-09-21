@@ -163,7 +163,20 @@ if len(idle_band) < 1000:
 if max(x for x, _ in idle_band) - min(x for x, _ in idle_band) < 200:
     raise SystemExit('dedicated idle band does not span an observed quiet interval')
 
-remaining = [(x, y) for x, y in plot if near(rgb(x, y), (86, 178, 245))]
+remaining_color = (86, 178, 245)
+# A one-pixel horizontal stroke is anti-aliased against the opaque idle-band
+# surface. Count that deterministic composite as the same Remaining line;
+# requiring only the full source color would reject the specified thin idle
+# stroke while still seeing its thick non-idle prefix and endpoint label.
+idle_surface = (26, 40, 56)
+thin_remaining = tuple(
+    round(background + (foreground - background) * 0.87)
+    for background, foreground in zip(idle_surface, remaining_color)
+)
+remaining = [
+    (x, y) for x, y in plot
+    if near(rgb(x, y), remaining_color) or near(rgb(x, y), thin_remaining, 12)
+]
 if len(remaining) < 300:
     raise SystemExit(f'remaining line pixels are insufficient: {len(remaining)}')
 if max(x for x, _ in remaining) - min(x for x, _ in remaining) < 500:
