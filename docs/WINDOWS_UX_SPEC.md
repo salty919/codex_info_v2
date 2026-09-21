@@ -32,8 +32,11 @@ X版はデータ意味論、状態、所有権の参照元であり、Windows版
 無条件に複製する根拠にはならない。Windows固有の判断は、この文書に目的・代替案・
 採用理由・影響する要求ID・受入証拠を登録しない限り採用してはならない。
 
-要求抽出が `EXTRACTION_COMPLETE` になるまで、この文書の変更は文書化に限定する。
-実装、テスト、ビルド、インストール、画面評価、成果物差し替えは行わない。
+要求抽出が `EXTRACTION_COMPLETE` になるまで、未確定の契約は文書化に限定し、実装、テスト、
+ビルド、インストール、画面評価、成果物差し替えを行わない。Issue #349で利用者が確定した
+`WIN-PARITY-UX`、`ACCOUNT-UX-134`およびI18N ownerの`PROC-I18N-01`に属する下記Main構成と
+Linux timezone設定だけは有限scopeの実装・直接評価対象とする。この限定決定は本書全体の
+`PRODUCT_PENDING`を解除せず、他の未確定契約を`EXTRACTION_COMPLETE`として扱う根拠にしない。
 
 ## 1. UXの目的、利用者、主要タスク
 
@@ -185,7 +188,8 @@ page/step/detail/chapter/collapseで全主要情報、primary action、Back、Cl
 
 - 最上位の移動先はメニューまたは一貫したナビゲーション領域から開く。
 - メニュー項目はアイコンだけでなく文字名、ショートカット、アクセシブル名を持つ。
-- `Monitor / Trends / Threads / Settings / Legal / Help` の名称・順序・位置を全surfaceで一貫させる。
+- Main上部は`Monitor / Account / Trends / Legal / Settings`の順で両platformを一致させる。
+  Threadsは上部に置かず、実行中threadが1件以上あるMain概要の`Details`からだけ開く。
 - 現在位置、戻る、閉じる、処理中、無効、エラーを同じ視覚規則で表す。
 - ネイティブタイトルバーを置き換える場合は、全Windowの移動・最小化・閉じると、Graphだけの
   最大化/復元・リサイズを明示し、OSの作法を欠落させない。画面中央の見出しをタイトルバーの
@@ -208,9 +212,9 @@ X版から必ず継承するのは、値の正本、期間境界、欠測/重複
  ├─ 設定済み/未接続 ─ Main（disconnected） → Settings recovery / Setup
  ├─ 設定済み/接続済み ─ Main（saved selectorで次回自動再接続）
  │    ├─ Trends（Graph）
- │    ├─ Threads
- │    ├─ Settings
+ │    ├─ 実行中threadがある時だけDetails（Threads）
  │    ├─ Legal
+ │    ├─ Settings
  │    └─ Help / Connection guide
  └─ 起動後の失敗 ─ Monitor（last-good保持または未取得） → 明示された復旧操作
 ```
@@ -249,11 +253,25 @@ component順や表示所有者を変更しない。
 
 ### 4.1 Monitor
 
-- 画面上部にアプリ内タイトルとメニューを置く。
+- 画面上部は両platformとも`利用状況→アカウント→推移→法的通知→設定`の順とし、
+  window controlsをその後に置く。Threads入口を上部へ置かない。
+- Mainのaccount selectorとそのdropdownは検証済みlogin IDまたはpublic account番号だけを表示し、
+  `ログイン中`、`履歴`および各localeで同じ意味の状態語を付けない。現在認証中accountだけ、
+  labelの直前にsuccess green `#5DC98A`の`●`を置き、過去accountにはmarkerを置かない。
+  選択、partition、logout、Graph/Threadsのaccount表示意味は変更しない。
 - 認証済みMainのcomponent順は
   `Header→RemainingQuota→WeekGauge→AccountActivity→ModelUsage→StatusBanner`で固定する。
   残量を最初の主値とし、状態は常時viewport内のStatusBannerだけが所有する。状態を上段の
   duplicate cardへ増やさず、StatusBannerが末尾でもBack/Close/復旧CTAを隠さない。
+- RemainingQuotaはWindowsの単一card内で主値と概算を並べ、その下のbarをcard内の利用可能幅
+  全体へ伸ばす。WeekGaugeはLinuxのlabel上段＋7区分barを使い、その下にreset時刻とWindowsの
+  観測時刻を残す。quota値、期間境界、reset/observed epochをUIで再計算しない。
+- AccountActivityはWindowsのtotal＋model別件数構成を使う。0件ではempty表示だけを出して
+  `Details`を表示せず、1件以上でだけ`Details`を表示する。
+- ModelUsageはLinuxの単一table構成を使い、各modelのInput/Cached input/Outputについてtokenと
+  隣接する概算ドルを同じrowに置く。値の意味は`MODEL-USAGE-DISPLAY-01`を変更しない。
+- StatusBannerはWindowsのstate title、detail、該当する単一CTA、最終受信表示の構成を使う。
+  選択accountのID/labelをtitleまたはdetailへ重複表示しない。
 - 0%、中間、100%、未取得、警告、危険、APIエラー、認証要求で同じ構造を保つ。
 - エラーは既存値を保持するか未取得として明示し、0や100を仮の有効値として表示しない。
 - 数値、単位、説明、状態、操作の文字サイズと太さに役割差を付ける。細すぎるフォント、薄すぎる文字、
@@ -365,6 +383,12 @@ component順や表示所有者を変更しない。
 
 ### 4.4 Setup / Settings
 
+- Linux Settingsはtimezone一項目だけを持つsingleton Windowとする。選択肢と保存値はexact
+  `local|UTC`で、未保存変更はMain/Graphへ反映せず、取消またはCloseで破棄する。保存成功時だけ
+  同一directory内のatomic renameを完了してから開いているMain/Graphの時刻表示へ即時反映し、Windowを閉じる。
+  成功した保存値は通常のprocess再起動後に復元する。
+  保存失敗時はactive timezoneと既存表示を保持し、Settingsを開いたまま失敗を表示する。
+  Windows Settingsの項目、6-key schemaおよび動作は変更しない。
 - profile/selector、API到達性、readiness health、details state、auth-start、auth-checkを別概念として表示する。
 - exact settings keysは`language/setupCompleted/connectionConfigured/timeZoneId/connectionProfile/connectionSelector`。
   profile enumは`none|wsl|sshConfigAlias`、selectorは`none`、installed distribution exact token、または

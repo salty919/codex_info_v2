@@ -392,6 +392,29 @@ pub struct I18n {
     timezone: Tz,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimeZonePreference {
+    Local,
+    Utc,
+}
+
+impl TimeZonePreference {
+    pub fn normalize(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("UTC") {
+            Self::Utc
+        } else {
+            Self::Local
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Utc => "UTC",
+        }
+    }
+}
+
 impl I18n {
     pub fn detect() -> Self {
         Self {
@@ -410,6 +433,13 @@ impl I18n {
 
     pub const fn timezone(&self) -> Tz {
         self.timezone
+    }
+
+    pub fn set_time_zone_preference(&mut self, preference: TimeZonePreference) {
+        self.timezone = match preference {
+            TimeZonePreference::Local => detect_timezone(),
+            TimeZonePreference::Utc => Tz::UTC,
+        };
     }
 
     pub fn cli_text(&self, key: CliTextKey) -> &'static str {
@@ -448,7 +478,7 @@ impl I18n {
                 ModelThreads => "モデル別スレッド",
                 Other => "その他",
                 Details => "詳細",
-                NoRunningThreads => "実行中のスレッドなし",
+                NoRunningThreads => "実行中のスレッドはありません",
                 LegalCode => "Codex Info の独自コードと文書: GPL-3.0-only",
                 LegalWarranty => {
                     "本ソフトウェアは無保証です。GPL-3.0-only の条件で再配布できます。"
@@ -2377,5 +2407,32 @@ mod tests {
         let after = startup.format_timestamp(0).unwrap();
         assert_eq!(before, after);
         assert!(before.ends_with("+09:00"));
+    }
+
+    #[test]
+    fn issue_349_timezone_preference_switches_only_the_display_timezone() {
+        let mut i18n = I18n::from_parts(Language::English, Tz::Asia__Tokyo);
+        assert_eq!(
+            TimeZonePreference::normalize("local"),
+            TimeZonePreference::Local
+        );
+        assert_eq!(
+            TimeZonePreference::normalize("UTC"),
+            TimeZonePreference::Utc
+        );
+        assert_eq!(
+            TimeZonePreference::normalize("utc"),
+            TimeZonePreference::Utc
+        );
+        assert_eq!(
+            TimeZonePreference::normalize("unknown"),
+            TimeZonePreference::Local
+        );
+        assert_eq!(TimeZonePreference::Utc.as_str(), "UTC");
+
+        i18n.set_time_zone_preference(TimeZonePreference::Utc);
+
+        assert_eq!(i18n.timezone(), Tz::UTC);
+        assert!(i18n.format_timestamp(0).unwrap().ends_with("+00:00"));
     }
 }

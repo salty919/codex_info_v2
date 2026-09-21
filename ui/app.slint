@@ -1,12 +1,12 @@
 // Copyright (C) 2026 salty919
 // SPDX-License-Identifier: GPL-3.0-only
 
-import { UiStrings, Header, WindowDragArea, RemainingQuota, WeekGauge, AccountActivity, ModelUsage, StatusBanner, AuthPanel, GraphWindow, ThreadsWindow, LegalNoticeWindow } from "components.slint";
+import { UiStrings, MainAccountOption, Header, WindowDragArea, RemainingQuota, WeekGauge, AccountActivity, ModelUsage, StatusBanner, AuthPanel, GraphWindow, ThreadsWindow, LegalNoticeWindow, TimeZoneSettingsWindow } from "components.slint";
 import { DesignTokens } from "theme.slint";
 import "../assets/NotoSansJP.ttf";
 import "../assets/NotoSansKR.otf";
 
-export { GraphWindow, ThreadsWindow, LegalNoticeWindow, UiStrings }
+export { GraphWindow, ThreadsWindow, LegalNoticeWindow, TimeZoneSettingsWindow, UiStrings, MainAccountOption }
 
 export component MainWindow inherits Window {
     preferred-width: 900px;
@@ -47,7 +47,7 @@ export component MainWindow inherits Window {
     // live reset countdown or current-thread panel.
     in-out property <bool> historical-account: false;
     in-out property <bool> account-view-loading: false;
-    in property <[string]> account-options;
+    in property <[MainAccountOption]> account-options;
     in property <int> selected-account-index: 0;
     in-out property <string> quota-title;
     in-out property <bool> has-quota-percent: true;
@@ -62,6 +62,8 @@ export component MainWindow inherits Window {
     in-out property <string> estimated-cost-label;
     in-out property <string> remaining-label: "—";
     in-out property <string> week-label;
+    in-out property <string> reset-label;
+    in-out property <string> observed-label;
     in-out property <string> model-usage-names;
     in-out property <string> model-usage-input-tokens;
     in-out property <string> model-usage-input-costs;
@@ -72,6 +74,8 @@ export component MainWindow inherits Window {
     in-out property <string> model-usage-period;
     in-out property <bool> has-model-usage: false;
     in-out property <string> status;
+    in-out property <string> status-title;
+    in-out property <string> status-last-received;
     in-out property <string> status-level: "info";
     in-out property <float> remaining-percent: 0;
     in-out property <float> remaining-days: 0;
@@ -83,6 +87,7 @@ export component MainWindow inherits Window {
     callback select-account(string);
     callback open-threads();
     callback open-legal-notice();
+    callback open-settings();
     callback begin-window-drag();
     callback minimize-window();
     callback close-window();
@@ -147,6 +152,7 @@ export component MainWindow inherits Window {
                 open-graph => { root.open-graph(); }
                 select-account(value) => { root.select-account(value); }
                 open-legal-notice => { root.open-legal-notice(); }
+                open-settings => { root.open-settings(); }
                 begin-window-drag => { root.begin-window-drag(); }
                 minimize-window => { root.minimize-window(); }
                 close-window => { root.close-window(); }
@@ -167,6 +173,8 @@ export component MainWindow inherits Window {
                 horizontal-stretch: 1;
                 remaining-days: root.remaining-days;
                 remaining-label: root.week-label;
+                reset-label: root.reset-label;
+                observed-label: root.observed-label;
             }
             if !root.historical-account && !root.account-view-loading : AccountActivity {
                 strings: root.strings;
@@ -201,7 +209,9 @@ export component MainWindow inherits Window {
                 width: root.content-width;
                 preferred-width: root.content-width;
                 horizontal-stretch: 1;
-                message: root.status;
+                title: root.status-title;
+                detail: root.status;
+                last-received: root.status-last-received;
                 level: root.status-level;
                 show-retry: root.has-error;
                 retry => { root.retry(); }
@@ -244,6 +254,7 @@ export component MainWindow inherits Window {
                 selected-account-index: root.selected-account-index;
                 select-account(value) => { root.select-account(value); }
                 open-legal-notice => { root.open-legal-notice(); }
+                open-settings => { root.open-settings(); }
                 begin-window-drag => { root.begin-window-drag(); }
                 minimize-window => { root.minimize-window(); }
                 close-window => { root.close-window(); }
