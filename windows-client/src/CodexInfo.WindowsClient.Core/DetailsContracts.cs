@@ -269,6 +269,12 @@ public sealed record ApiAccount(
     public string? DisplayLabelSuffix { get; init; }
 
     /// <summary>
+    /// Public id suffix used only by Main when removing the lifecycle words
+    /// would otherwise make two account identities ambiguous.
+    /// </summary>
+    public string? MainDisplayLabelSuffix { get; init; }
+
+    /// <summary>
     /// Selector text derived only from the validated optional login id. A
     /// missing login id is rendered as the public account number. Lifecycle
     /// boundaries, tokens, hashes, and filesystem paths are never included.
@@ -286,6 +292,22 @@ public sealed record ApiAccount(
             return $"{identity}{DisplayStatusSuffix}{disambiguator}";
         }
     }
+
+    /// <summary>Main-only identity text. Current state is rendered separately.</summary>
+    public string MainDisplayLabel
+    {
+        get
+        {
+            var disambiguator = string.IsNullOrEmpty(MainDisplayLabelSuffix)
+                ? string.Empty
+                : $" · {MainDisplayLabelSuffix}";
+            return $"{IdentityLabel}{disambiguator}";
+        }
+    }
+
+    private string IdentityLabel => LoginId is { Length: > 0 } loginId
+        ? loginId
+        : $"アカウント {GetAccountNumber()} · ID未復元";
 
     private string GetAccountNumber() => Id.StartsWith("account-", StringComparison.Ordinal)
         ? Id["account-".Length..]
@@ -309,6 +331,24 @@ public sealed record ApiAccount(
         return accounts
             .Select(account => duplicateIds.Contains(account.Id)
                 ? account with { DisplayLabelSuffix = account.Id }
+                : account)
+            .ToArray();
+    }
+
+    public static IReadOnlyList<ApiAccount> EnsureUniqueMainDisplayLabels(
+        IEnumerable<ApiAccount> source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        var accounts = source.ToArray();
+        var duplicateIds = accounts
+            .GroupBy(account => account.MainDisplayLabel, StringComparer.Ordinal)
+            .Where(group => group.Count() > 1)
+            .SelectMany(group => group)
+            .Select(account => account.Id)
+            .ToHashSet(StringComparer.Ordinal);
+        return accounts
+            .Select(account => duplicateIds.Contains(account.Id)
+                ? account with { MainDisplayLabelSuffix = account.Id }
                 : account)
             .ToArray();
     }

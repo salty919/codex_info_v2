@@ -10,7 +10,7 @@ mod daemon;
 
 use chrono::{DateTime, Months, Utc};
 use codex_info::app_server_sqlite::PreparedGeneration;
-use codex_info::i18n::{CliTextKey, I18n, PeriodKind, TextKey};
+use codex_info::i18n::{CliTextKey, I18n, PeriodKind, TextKey, TimeZonePreference};
 use codex_info::protocol_contract;
 use codex_info::security;
 #[cfg(test)]
@@ -40,13 +40,13 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use slint::winit_030::{winit, EventResult, WinitWindowAccessor};
 use slint::{CloseRequestResponse, ComponentHandle, Model, Timer, TimerMode};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
-use std::ffi::OsString;
-use std::fs;
+use std::ffi::{OsStr, OsString};
 #[cfg(test)]
 use std::fs::File;
+use std::fs::{self, OpenOptions};
 #[cfg(test)]
 use std::io::{BufRead, Seek, SeekFrom};
 use std::io::{BufReader, Read, Write};
@@ -62,6 +62,117 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 slint::include_modules!();
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct LinuxTimeZoneSettingsFile {
+    time_zone_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct LinuxTimeZoneSettingsStore {
+    path: PathBuf,
+}
+
+impl LinuxTimeZoneSettingsStore {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn system() -> Result<Self, String> {
+        let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        let home = std::env::var_os("HOME");
+        linux_time_zone_settings_path(xdg_config_home.as_deref(), home.as_deref()).map(Self::new)
+    }
+
+    fn load(&self) -> Result<TimeZonePreference, String> {
+        let metadata = match fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(TimeZonePreference::Local);
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("timezone settings path is not a regular file".into());
+        }
+        let bytes = fs::read(&self.path).map_err(|error| error.to_string())?;
+        let settings: LinuxTimeZoneSettingsFile =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        Ok(TimeZonePreference::normalize(&settings.time_zone_id))
+    }
+
+    fn save(&self, preference: TimeZonePreference) -> Result<(), String> {
+        if let Ok(metadata) = fs::symlink_metadata(&self.path) {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err("timezone settings path is not a regular file".into());
+            }
+        }
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| "timezone settings path has no parent".to_owned())?;
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let temporary = parent.join(format!(
+            ".settings.json.{}.{}.tmp",
+            std::process::id(),
+            nonce
+        ));
+        let result = (|| -> Result<(), String> {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&temporary)
+                .map_err(|error| error.to_string())?;
+            let document = format!("{{\"timeZoneId\":\"{}\"}}", preference.as_str());
+            file.write_all(document.as_bytes())
+                .map_err(|error| error.to_string())?;
+            file.sync_all().map_err(|error| error.to_string())?;
+            drop(file);
+            fs::rename(&temporary, &self.path).map_err(|error| error.to_string())?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+}
+
+fn linux_time_zone_settings_path(
+    xdg_config_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<PathBuf, String> {
+    let root = xdg_config_home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .map(|value| value.join(".config"))
+        })
+        .ok_or_else(|| "XDG_CONFIG_HOME and HOME are unavailable".to_owned())?;
+    Ok(root.join("codex-info/settings.json"))
+}
+
+fn save_and_apply_time_zone_preference(
+    store: &LinuxTimeZoneSettingsStore,
+    i18n: &mut I18n,
+    preference: TimeZonePreference,
+) -> Result<(), String> {
+    store.save(preference)?;
+    i18n.set_time_zone_preference(preference);
+    Ok(())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AccountCommand {
@@ -738,6 +849,8 @@ const GRAPH_WINDOW_WIDTH: u32 = 940;
 const GRAPH_WINDOW_HEIGHT: u32 = 640;
 const LEGAL_WINDOW_WIDTH: u32 = 720;
 const LEGAL_WINDOW_HEIGHT: u32 = 520;
+const SETTINGS_WINDOW_WIDTH: u32 = 440;
+const SETTINGS_WINDOW_HEIGHT: u32 = 220;
 const UNAUTHENTICATED_WINDOW_TITLE: &str = "アカウント未接続 — プラン未設定";
 // Keep the native title-bar purpose suffix ASCII: some X11 window managers
 // render `_NET_WM_NAME` with a fallback font that turns Japanese glyphs into
@@ -14415,6 +14528,20 @@ impl CodexInfoState {
                 state.status = state.normal_status();
             }
         }
+        if kind == "normal" {
+            let preview_account = ServiceAccountV3 {
+                id: "account-preview".into(),
+                is_current: true,
+                activation_at: Some(now - 86_400),
+                deactivation_at: None,
+                login_id: state.email.clone(),
+            };
+            state.service_accounts = vec![preview_account];
+            state.service_default_account_id = Some("account-preview".into());
+            state.service_selected_account_id = Some("account-preview".into());
+            state.service_accounts_supported = true;
+            state.service_accounts_known = true;
+        }
         state
     }
 
@@ -14429,6 +14556,10 @@ impl CodexInfoState {
 
     fn account_selector_options(&self) -> Vec<String> {
         service_account_labels(&self.service_accounts, &self.i18n)
+    }
+
+    fn main_account_options(&self) -> Vec<(String, bool)> {
+        service_main_account_options(&self.service_accounts)
     }
 
     fn selected_service_account(&self) -> Option<&ServiceAccountV3> {
@@ -14466,10 +14597,16 @@ impl CodexInfoState {
     }
 
     fn select_account_label(&mut self, label: &str) -> bool {
-        let account_id = self
+        let graph_index = self
             .account_selector_options()
             .iter()
-            .position(|option| option == label)
+            .position(|option| option == label);
+        let main_index = self
+            .main_account_options()
+            .iter()
+            .position(|(option, _)| option == label);
+        let account_id = graph_index
+            .or(main_index)
             .and_then(|index| self.service_accounts.get(index))
             .map(|account| account.id.clone());
         account_id
@@ -18577,9 +18714,144 @@ fn native_legal_navigation(i18n: &I18n) -> (&'static str, &'static str, &'static
     }
 }
 
+fn native_main_labels(
+    i18n: &I18n,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    match i18n.language().code() {
+        "ja" => (
+            "設定",
+            "タイムゾーン",
+            "保存",
+            "キャンセル",
+            "正常",
+            "注意",
+            "エラー",
+            "リセット",
+            "観測",
+        ),
+        "zh-Hans" => (
+            "设置", "时区", "保存", "取消", "正常", "注意", "错误", "重置", "观测",
+        ),
+        "ko" => (
+            "설정",
+            "시간대",
+            "저장",
+            "취소",
+            "정상",
+            "주의",
+            "오류",
+            "재설정",
+            "관측",
+        ),
+        "es" => (
+            "Configuración",
+            "Zona horaria",
+            "Guardar",
+            "Cancelar",
+            "Listo",
+            "Aviso",
+            "Error",
+            "Restablecimiento",
+            "Observado",
+        ),
+        "fr" => (
+            "Paramètres",
+            "Fuseau horaire",
+            "Enregistrer",
+            "Annuler",
+            "Prêt",
+            "Attention",
+            "Erreur",
+            "Réinitialisation",
+            "Observé",
+        ),
+        "de" => (
+            "Einstellungen",
+            "Zeitzone",
+            "Speichern",
+            "Abbrechen",
+            "Bereit",
+            "Hinweis",
+            "Fehler",
+            "Zurücksetzung",
+            "Beobachtet",
+        ),
+        "pt" => (
+            "Configurações",
+            "Fuso horário",
+            "Salvar",
+            "Cancelar",
+            "Pronto",
+            "Aviso",
+            "Erro",
+            "Redefinição",
+            "Observado",
+        ),
+        "it" => (
+            "Impostazioni",
+            "Fuso orario",
+            "Salva",
+            "Annulla",
+            "Pronto",
+            "Avviso",
+            "Errore",
+            "Ripristino",
+            "Osservato",
+        ),
+        "ru" => (
+            "Настройки",
+            "Часовой пояс",
+            "Сохранить",
+            "Отмена",
+            "Готово",
+            "Внимание",
+            "Ошибка",
+            "Сброс",
+            "Наблюдение",
+        ),
+        _ => (
+            "Settings",
+            "Time zone",
+            "Save",
+            "Cancel",
+            "Ready",
+            "Warning",
+            "Error",
+            "Reset",
+            "Observed",
+        ),
+    }
+}
+
+fn native_settings_save_error(i18n: &I18n) -> &'static str {
+    match i18n.language().code() {
+        "ja" => "設定を保存できませんでした。",
+        "zh-Hans" => "无法保存设置。",
+        "ko" => "설정을 저장할 수 없습니다.",
+        "es" => "No se pudo guardar la configuración.",
+        "fr" => "Impossible d’enregistrer les paramètres.",
+        "de" => "Die Einstellungen konnten nicht gespeichert werden.",
+        "pt" => "Não foi possível salvar as configurações.",
+        "it" => "Impossibile salvare le impostazioni.",
+        "ru" => "Не удалось сохранить настройки.",
+        _ => "Could not save settings.",
+    }
+}
+
 fn ui_strings(i18n: &I18n) -> UiStrings {
     let (legal_page_names, legal_pages) = native_legal_pages(i18n);
     let (legal_back, legal_next, legal_page_position) = native_legal_navigation(i18n);
+    let (settings, time_zone, save, cancel, _, _, _, _, _) = native_main_labels(i18n);
     UiStrings {
         font_family: i18n.text(TextKey::FontFamily).into(),
         product_version: format!("v{PRODUCT_VERSION}").into(),
@@ -18590,6 +18862,10 @@ fn ui_strings(i18n: &I18n) -> UiStrings {
         legal_page_position: legal_page_position.into(),
         usage_status: i18n.text(TextKey::UsageStatus).into(),
         graph: i18n.text(TextKey::Graph).into(),
+        settings: settings.into(),
+        time_zone: time_zone.into(),
+        save: save.into(),
+        cancel: cancel.into(),
         legal_notices: i18n.text(TextKey::LegalNotices).into(),
         running: i18n.text(TextKey::Running).into(),
         model_threads: i18n.text(TextKey::ModelThreads).into(),
@@ -18820,6 +19096,17 @@ impl CodexInfoState {
         }
     }
 
+    fn display_status_detail(&self) -> String {
+        let detail = self.display_status();
+        if !self.selected_account_is_historical()
+            && detail == self.i18n.format_last_updated(self.last_success_at)
+        {
+            String::new()
+        } else {
+            detail
+        }
+    }
+
     fn open_auth(&mut self) {
         if self.service_endpoint_error.is_some() {
             return;
@@ -18874,11 +19161,14 @@ impl CodexInfoState {
         ui.set_authenticated(self.authenticated);
         ui.set_historical_account(historical_account);
         ui.set_account_view_loading(account_view_loading);
-        let account_options = self.account_selector_options();
+        let account_options = self.main_account_options();
         ui.set_account_options(slint::ModelRc::new(slint::VecModel::from(
             account_options
                 .into_iter()
-                .map(slint::SharedString::from)
+                .map(|(label, current)| MainAccountOption {
+                    label: label.into(),
+                    current,
+                })
                 .collect::<Vec<_>>(),
         )));
         ui.set_selected_account_index(
@@ -18936,6 +19226,18 @@ impl CodexInfoState {
         } else {
             "".into()
         });
+        let (_, _, _, _, status_ready, status_warning, status_error, reset_prefix, observed_prefix) =
+            native_main_labels(&self.i18n);
+        let reset_value = self
+            .reset_at
+            .and_then(|value| self.i18n.format_timestamp(value))
+            .unwrap_or_else(|| "—".into());
+        let observed_value = self
+            .last_success_at
+            .and_then(|value| self.i18n.format_timestamp(value))
+            .unwrap_or_else(|| "—".into());
+        ui.set_reset_label(format!("{reset_prefix} {reset_value}").into());
+        ui.set_observed_label(format!("{observed_prefix} {observed_value}").into());
         let (
             model_names,
             input_tokens,
@@ -18967,8 +19269,18 @@ impl CodexInfoState {
             self.i18n.format_estimate(total)
         };
         ui.set_estimated_cost_label(estimate.into());
-        ui.set_status(self.display_status().into());
-        ui.set_status_level(self.status_level().into());
+        ui.set_status(self.display_status_detail().into());
+        let status_level = self.status_level();
+        ui.set_status_level(status_level.into());
+        ui.set_status_title(
+            match status_level {
+                "error" => status_error,
+                "warning" => status_warning,
+                _ => status_ready,
+            }
+            .into(),
+        );
+        ui.set_status_last_received(self.i18n.format_last_updated(self.last_success_at).into());
         ui.set_remaining_percent(remaining as f32);
         ui.set_remaining_days(if self.has_quota_percent && !historical_account {
             (seconds.max(0) as f32 / period_seconds.max(1) as f32 * 7.0).clamp(0.0, 7.0)
@@ -20725,6 +21037,34 @@ fn service_account_labels(accounts: &[ServiceAccountV3], i18n: &I18n) -> Vec<Str
         .collect()
 }
 
+fn service_main_account_options(accounts: &[ServiceAccountV3]) -> Vec<(String, bool)> {
+    let base = accounts
+        .iter()
+        .map(|account| {
+            let number = account.id.strip_prefix("account-").unwrap_or(&account.id);
+            account
+                .login_id
+                .clone()
+                .unwrap_or_else(|| format!("アカウント {number} · ID未復元"))
+        })
+        .collect::<Vec<_>>();
+    let mut counts = BTreeMap::new();
+    for label in &base {
+        *counts.entry(label.clone()).or_insert(0usize) += 1;
+    }
+    base.into_iter()
+        .zip(accounts)
+        .map(|(label, account)| {
+            let label = if counts.get(&label).copied().unwrap_or(0) > 1 {
+                format!("{label} · {}", account.id)
+            } else {
+                label
+            };
+            (label, account.is_current)
+        })
+        .collect()
+}
+
 /// Add the selected public account to every v3 data read. `/v3/accounts` is
 /// the directory itself and therefore intentionally has no account selector.
 /// Legacy v1/v2 fallback routes remain unchanged.
@@ -22309,6 +22649,17 @@ fn run_ui(
             .map(|kind| CodexInfoState::preview(&kind))
             .unwrap_or_else(CodexInfoState::service_client),
     ));
+    let time_zone_store = Rc::new(LinuxTimeZoneSettingsStore::system().ok());
+    let initial_time_zone = time_zone_store
+        .as_ref()
+        .as_ref()
+        .and_then(|store| store.load().ok())
+        .unwrap_or(TimeZonePreference::Local);
+    state
+        .borrow_mut()
+        .i18n
+        .set_time_zone_preference(initial_time_zone);
+    let active_time_zone = Rc::new(Cell::new(initial_time_zone));
     if let Some(error) = initial_service_error {
         // A failed --ui service must not make the GUI disappear. Publish a
         // visible retry/error state and keep the window available for recovery.
@@ -22320,6 +22671,7 @@ fn run_ui(
     let graph_maximize_state = Rc::new(RefCell::new(GraphMaximizeState::default()));
     let threads_window = Rc::new(RefCell::new(None::<ThreadsWindow>));
     let legal_notice_window = Rc::new(RefCell::new(None::<LegalNoticeWindow>));
+    let settings_window = Rc::new(RefCell::new(None::<TimeZoneSettingsWindow>));
     let x11_monitor = Rc::new(X11WindowStateMonitor::connect());
     {
         let weak_ui = ui.as_weak();
@@ -22719,6 +23071,115 @@ fn run_ui(
             }
         });
     }
+    {
+        let state = Rc::clone(&state);
+        let time_zone_store = Rc::clone(&time_zone_store);
+        let active_time_zone = Rc::clone(&active_time_zone);
+        let settings_window = Rc::clone(&settings_window);
+        let graph_window = Rc::clone(&graph_window);
+        let weak_ui = ui.as_weak();
+        let x11_monitor = Rc::clone(&x11_monitor);
+        ui.on_open_settings(move || {
+            let mut settings_window = settings_window.borrow_mut();
+            if settings_window.is_none() {
+                if let Ok(window) = TimeZoneSettingsWindow::new() {
+                    install_window_size_guard(
+                        window.window(),
+                        SETTINGS_WINDOW_WIDTH,
+                        SETTINGS_WINDOW_HEIGHT,
+                    );
+                    let weak_window = window.as_weak();
+                    window.on_begin_window_drag(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            begin_window_drag(window.window());
+                        }
+                    });
+                    let weak_window = window.as_weak();
+                    window.on_minimize_window(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            minimize_window(window.window());
+                        }
+                    });
+                    let weak_window = window.as_weak();
+                    window.on_cancel_settings(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            window.set_reset_close_buttons(true);
+                            window.set_reset_close_buttons(false);
+                            let _ = window.hide();
+                        }
+                    });
+                    let weak_window = window.as_weak();
+                    window.on_close_window(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            let _ = window.hide();
+                        }
+                    });
+                    let weak_window = window.as_weak();
+                    window.window().on_close_requested(move || {
+                        if let Some(window) = weak_window.upgrade() {
+                            if window.hide().is_ok() {
+                                return CloseRequestResponse::KeepWindowShown;
+                            }
+                        }
+                        CloseRequestResponse::HideWindow
+                    });
+                    let weak_window = window.as_weak();
+                    let state_for_save = Rc::clone(&state);
+                    let store_for_save = Rc::clone(&time_zone_store);
+                    let preference_for_save = Rc::clone(&active_time_zone);
+                    let graph_for_save = Rc::clone(&graph_window);
+                    let weak_ui_for_save = weak_ui.clone();
+                    window.on_save_time_zone(move |value| {
+                        let preference = TimeZonePreference::normalize(value.as_str());
+                        let result = store_for_save.as_ref().as_ref().map_or_else(
+                            || Err("timezone settings path is unavailable".to_owned()),
+                            |store| {
+                                save_and_apply_time_zone_preference(
+                                    store,
+                                    &mut state_for_save.borrow_mut().i18n,
+                                    preference,
+                                )
+                            },
+                        );
+                        if let Some(window) = weak_window.upgrade() {
+                            if result.is_ok() {
+                                preference_for_save.set(preference);
+                                window.set_save_error("".into());
+                                if let Some(ui) = weak_ui_for_save.upgrade() {
+                                    state_for_save.borrow().sync_ui(&ui);
+                                }
+                                if let Some(graph) = graph_for_save.borrow().as_ref() {
+                                    if graph.window().is_visible() {
+                                        sync_graph_window(&state_for_save.borrow(), graph);
+                                    }
+                                }
+                                let _ = window.hide();
+                            } else {
+                                window.set_save_error(
+                                    native_settings_save_error(&state_for_save.borrow().i18n)
+                                        .into(),
+                                );
+                            }
+                        }
+                    });
+                    *settings_window = Some(window);
+                }
+            }
+            if let Some(window) = settings_window.as_ref() {
+                let state_ref = state.borrow();
+                window.set_strings(ui_strings(&state_ref.i18n));
+                window.set_window_title(native_main_labels(&state_ref.i18n).0.into());
+                window.set_time_zone_options(slint::ModelRc::new(slint::VecModel::from(vec![
+                    slint::SharedString::from("local"),
+                    slint::SharedString::from("UTC"),
+                ])));
+                window.set_selected_time_zone(active_time_zone.get().as_str().into());
+                window.set_save_error("".into());
+                drop(state_ref);
+                let _ = show_and_focus_window(window.window(), x11_monitor.as_ref().as_ref());
+            }
+        });
+    }
 
     if matches!(
         preview_kind.as_deref(),
@@ -22739,6 +23200,9 @@ fn run_ui(
     if preview_kind.as_deref() == Some("legal") {
         ui.invoke_open_legal_notice();
     }
+    if preview_kind.as_deref() == Some("settings") {
+        ui.invoke_open_settings();
+    }
 
     state.borrow().sync_ui(&ui);
     let weak_ui_for_bounds = ui.as_weak();
@@ -22746,6 +23210,7 @@ fn run_ui(
     let graph_window_for_resize = Rc::clone(&graph_window);
     let threads_window_for_bounds = Rc::clone(&threads_window);
     let legal_notice_window_for_bounds = Rc::clone(&legal_notice_window);
+    let settings_window_for_bounds = Rc::clone(&settings_window);
     let main_monitor_timer = Timer::default();
     main_monitor_timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
         if let Some(ui) = weak_ui_for_bounds.upgrade() {
@@ -22762,6 +23227,11 @@ fn run_ui(
                     }
                 }
                 if let Some(window) = legal_notice_window_for_bounds.borrow().as_ref() {
+                    if window.window().is_visible() {
+                        monitor.enforce(window.window());
+                    }
+                }
+                if let Some(window) = settings_window_for_bounds.borrow().as_ref() {
                     if window.window().is_visible() {
                         monitor.enforce(window.window());
                     }
@@ -22907,6 +23377,186 @@ mod tests {
     };
     use codex_info::usage_store;
     use serde::Deserialize;
+
+    #[test]
+    fn issue_349_linux_timezone_settings_save_before_live_apply_and_restore() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "codex-info-issue-349-timezone-{}-{unique}",
+            std::process::id()
+        ));
+        let path = root.join("codex-info/settings.json");
+        let store = super::LinuxTimeZoneSettingsStore::new(path.clone());
+        let mut active = I18n::from_parts(
+            codex_info::i18n::Language::English,
+            chrono_tz::Tz::Asia__Tokyo,
+        );
+
+        super::save_and_apply_time_zone_preference(
+            &store,
+            &mut active,
+            codex_info::i18n::TimeZonePreference::Utc,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"timeZoneId\":\"UTC\"}"
+        );
+        assert_eq!(active.timezone(), chrono_tz::Tz::UTC);
+        let restored = store.load().unwrap();
+        assert_eq!(restored, codex_info::i18n::TimeZonePreference::Utc);
+        let mut restarted = I18n::from_parts(
+            codex_info::i18n::Language::English,
+            chrono_tz::Tz::Asia__Tokyo,
+        );
+        restarted.set_time_zone_preference(restored);
+        assert_eq!(restarted.timezone(), chrono_tz::Tz::UTC);
+
+        let blocked_target = root.join("blocked-settings.json");
+        std::fs::create_dir_all(&blocked_target).unwrap();
+        let blocked_store = super::LinuxTimeZoneSettingsStore::new(blocked_target);
+        let mut retained = I18n::from_parts(
+            codex_info::i18n::Language::English,
+            chrono_tz::Tz::Asia__Tokyo,
+        );
+        assert!(super::save_and_apply_time_zone_preference(
+            &blocked_store,
+            &mut retained,
+            codex_info::i18n::TimeZonePreference::Utc,
+        )
+        .is_err());
+        assert_eq!(retained.timezone(), chrono_tz::Tz::Asia__Tokyo);
+
+        std::fs::write(&path, "{\"timeZoneId\":\"local\",\"timeZoneId\":\"UTC\"}").unwrap();
+        assert!(store.load().is_err());
+        std::fs::write(&path, "{\"timeZoneId\":\"future\"}").unwrap();
+        assert_eq!(
+            store.load().unwrap(),
+            codex_info::i18n::TimeZonePreference::Local
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue_349_linux_timezone_settings_use_the_xdg_config_root() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            super::linux_time_zone_settings_path(
+                Some(OsStr::new("/tmp/xdg-config")),
+                Some(OsStr::new("/tmp/home")),
+            )
+            .unwrap(),
+            std::path::PathBuf::from("/tmp/xdg-config/codex-info/settings.json")
+        );
+        assert_eq!(
+            super::linux_time_zone_settings_path(None, Some(OsStr::new("/tmp/home"))).unwrap(),
+            std::path::PathBuf::from("/tmp/home/.config/codex-info/settings.json")
+        );
+        assert!(super::linux_time_zone_settings_path(None, None).is_err());
+    }
+
+    #[test]
+    fn issue_349_linux_main_account_labels_separate_identity_from_current_state() {
+        let accounts = vec![
+            super::ServiceAccountV3 {
+                id: "account-7".into(),
+                is_current: true,
+                activation_at: Some(1),
+                deactivation_at: None,
+                login_id: Some("same@example.com".into()),
+            },
+            super::ServiceAccountV3 {
+                id: "account-13".into(),
+                is_current: false,
+                activation_at: Some(2),
+                deactivation_at: Some(3),
+                login_id: Some("same@example.com".into()),
+            },
+        ];
+        let i18n = I18n::from_parts(codex_info::i18n::Language::Japanese, chrono_tz::Tz::UTC);
+
+        assert_eq!(
+            super::service_main_account_options(&accounts),
+            vec![
+                ("same@example.com · account-7".to_owned(), true),
+                ("same@example.com · account-13".to_owned(), false),
+            ]
+        );
+        let graph = super::service_account_labels(&accounts, &i18n);
+        assert!(graph[0].contains("ログイン中"));
+        assert!(graph[1].contains("履歴"));
+    }
+
+    #[test]
+    fn issue_349_linux_main_source_owns_the_hybrid_layout_and_timezone_only_settings() {
+        let app = include_str!("../ui/app.slint");
+        let components = include_str!("../ui/components.slint");
+        let header = components
+            .split("export component Header inherits Rectangle {")
+            .nth(1)
+            .and_then(|source| source.split("export component RemainingQuota").next())
+            .expect("Header component");
+
+        for marker in [
+            "export struct MainAccountOption",
+            "export component MainAccountSelect",
+            "callback open-settings();",
+            "MainAccountSelect {",
+            "root.strings.settings",
+        ] {
+            assert!(
+                components.contains(marker),
+                "missing Linux Main marker: {marker}"
+            );
+        }
+        assert!(!header.contains("callback open-threads();"));
+        assert!(
+            header.find("MainAccountSelect {").unwrap()
+                < header.find("root.strings.usage-trend").unwrap()
+        );
+        assert!(
+            header.find("root.strings.usage-trend").unwrap()
+                < header.find("root.strings.legal-notices").unwrap()
+        );
+        assert!(
+            header.find("root.strings.legal-notices").unwrap()
+                < header.find("root.strings.settings").unwrap()
+        );
+
+        let week = components
+            .split("export component WeekGauge inherits Rectangle {")
+            .nth(1)
+            .and_then(|source| source.split("component ThreadModelStat").next())
+            .expect("WeekGauge component");
+        assert!(week.contains("reset-label"));
+        assert!(week.contains("observed-label"));
+        let status = components
+            .split("export component StatusBanner inherits Rectangle {")
+            .nth(1)
+            .and_then(|source| source.split("component GraphToggle").next())
+            .expect("StatusBanner component");
+        assert!(status.contains("in property <string> title"));
+        assert!(status.contains("in property <string> detail"));
+        assert!(status.contains("in property <string> last-received"));
+
+        for marker in [
+            "export component TimeZoneSettingsWindow",
+            "callback save-time-zone(string);",
+            "time-zone-options",
+            "save-error",
+            "root.open-settings();",
+        ] {
+            assert!(
+                app.contains(marker) || components.contains(marker),
+                "missing Linux Settings marker: {marker}"
+            );
+        }
+    }
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -23810,13 +24460,13 @@ mod tests {
     }
 
     #[test]
-    fn main_window_exposes_the_same_account_selector_contract() {
+    fn main_window_exposes_the_main_only_account_marker_contract() {
         let app = include_str!("../ui/app.slint");
         let main = app
             .split("export component MainWindow inherits Window {")
             .nth(1)
             .expect("MainWindow");
-        assert!(main.contains("in property <[string]> account-options;"));
+        assert!(main.contains("in property <[MainAccountOption]> account-options;"));
         assert!(main.contains("in property <int> selected-account-index: 0;"));
         assert!(main.contains("callback select-account(string);"));
         assert!(main.contains("account-options: root.account-options;"));
@@ -23829,6 +24479,9 @@ mod tests {
             .expect("Header");
         assert!(header.contains("model: root.account-options;"));
         assert!(header.contains("current-index: root.selected-account-index;"));
+        assert!(header.contains("MainAccountSelect {"));
+        assert!(components.contains("color: #5DC98A;"));
+        assert!(components.contains("visible: value.current;"));
     }
 
     use super::{
@@ -34735,24 +35388,34 @@ mod tests {
     }
 
     #[test]
-    fn account_activity_places_model_counts_on_a_separate_row() {
+    fn issue_349_linux_account_activity_matches_windows_zero_and_nonzero_contract() {
         let slint = include_str!("../ui/components.slint");
         let account = slint
             .split("export component AccountActivity inherits Rectangle {")
             .nth(1)
             .and_then(|body| {
-                body.split("export component ThreadsWindow inherits Window {")
+                body.split("export component LegalNoticeWindow inherits Window {")
                     .next()
             })
             .expect("AccountActivity");
+        assert!(account.contains("text: root.strings.active-threads;"));
+        assert!(!account.contains("text: root.strings.running;"));
+        assert!(!account.contains("text: root.strings.model-threads;"));
         assert!(account.contains("text: root.active-thread-count-label;"));
-        assert!(account.contains("text: root.strings.model-threads;"));
         assert!(account.contains("label: \"SOL\";"));
         assert!(account.contains("label: \"TERRA\";"));
         assert!(account.contains("label: \"LUNA\";"));
         assert!(account.contains("label: root.strings.other;"));
+        assert!(account.contains("if root.has-active-thread : ActionButton {"));
+        assert!(account.contains("if !root.has-active-thread : Text {"));
+        assert!(account.contains("text: root.strings.no-running-threads;"));
         assert!(account.contains("x: parent.width - 112px;"));
         assert!(account.contains("width: 100px;\n        height: 24px;"));
+        let japanese = I18n::from_parts(codex_info::i18n::Language::Japanese, chrono_tz::Tz::UTC);
+        assert_eq!(
+            japanese.text(codex_info::i18n::TextKey::NoRunningThreads),
+            "実行中のスレッドはありません"
+        );
     }
 
     #[test]

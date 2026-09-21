@@ -195,10 +195,10 @@ public sealed class MainWindowViewModelTests
         await EventuallyAsync(() => viewModel.IsAuthenticated &&
             viewModel.SelectedAccount?.Id == "account-7");
 
-        Assert.Equal("アカウント 7 · ID未復元［ログイン中］", viewModel.SelectedAccountText);
+        Assert.Equal("アカウント 7 · ID未復元", viewModel.SelectedAccountText);
         Assert.True(viewModel.SelectAccount("account-13"));
         Assert.NotEqual("account-7", viewModel.DetailsSnapshot?.AccountId);
-        Assert.Equal("アカウント 13 · ID未復元［履歴］", viewModel.SelectedAccountText);
+        Assert.Equal("アカウント 13 · ID未復元", viewModel.SelectedAccountText);
 
         await EventuallyAsync(() => viewModel.IsAuthenticated &&
             viewModel.DetailsSnapshot?.AccountId == "account-13");
@@ -220,7 +220,7 @@ public sealed class MainWindowViewModelTests
         Assert.True(ApplyAccountsSnapshot(automatic, AccountsBIsCurrent()));
         Assert.Equal("account-13", automatic.SelectedAccount?.Id);
         Assert.Equal(
-            "アカウント 13 · ID未復元［ログイン中］",
+            "アカウント 13 · ID未復元",
             automatic.SelectedAccountText);
         Assert.True(AccountSelectionGeneration(automatic) > automaticGeneration);
 
@@ -232,7 +232,7 @@ public sealed class MainWindowViewModelTests
         Assert.True(ApplyAccountsSnapshot(historical, AccountsBIsCurrent()));
         Assert.Equal("account-15", historical.SelectedAccount?.Id);
         Assert.Equal(
-            "アカウント 15 · ID未復元［履歴］",
+            "アカウント 15 · ID未復元",
             historical.SelectedAccountText);
         Assert.Equal(historicalGeneration, AccountSelectionGeneration(historical));
 
@@ -280,7 +280,7 @@ public sealed class MainWindowViewModelTests
         Assert.True(ApplyAccountsSnapshot(viewModel, switched));
         Assert.Equal("account-13", viewModel.SelectedAccount?.Id);
         Assert.Equal(
-            "アカウント 13 · ID未復元［ログイン中］",
+            "アカウント 13 · ID未復元",
             viewModel.SelectedAccountText);
         Assert.True(AccountSelectionGeneration(viewModel) > priorGeneration);
         Assert.Null(viewModel.DetailsSnapshot);
@@ -401,7 +401,7 @@ public sealed class MainWindowViewModelTests
             .ToString("M/d HH:mm", CultureInfo.CurrentCulture);
 
         Assert.True(viewModel.IsSelectedAccountHistorical);
-        Assert.Equal(viewModel.SelectedAccountText, viewModel.StatusTitle);
+        Assert.Equal(LocalizationService.Current.Ready, viewModel.StatusTitle);
         Assert.Equal("過去の記録を表示しています", viewModel.StatusDetail);
         Assert.Equal($"最終記録 {observedLocal}", viewModel.LastReceivedText);
         Assert.Equal("記録終了時の期間", viewModel.QuotaWindowText);
