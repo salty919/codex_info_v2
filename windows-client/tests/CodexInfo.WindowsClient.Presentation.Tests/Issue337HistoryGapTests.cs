@@ -13,7 +13,7 @@ namespace CodexInfo.WindowsClient.Presentation.Tests;
 public sealed class Issue337HistoryGapTests
 {
     [Fact]
-    public void Delayed_first_observation_keeps_true_period_axis_without_preobservation_geometry()
+    public void Delayed_first_observation_renders_quota_baseline_without_model_backfill()
     {
         var jst = TimeSpan.FromHours(9);
         var periodStart = new DateTimeOffset(2026, 9, 20, 7, 24, 36, jst).ToUnixTimeSeconds();
@@ -47,6 +47,14 @@ public sealed class Issue337HistoryGapTests
                 .Concat(remaining.Dashed.X)
                 .Where(double.IsFinite),
             timestamp => timestamp < firstObservation);
+
+        var displayRemaining = GraphPlotProjection.BuildCanonicalRemainingLines(
+            scene,
+            GraphRemainingBaselineMode.PeriodStartAtFullQuota);
+        Assert.Equal((double)periodStart, displayRemaining.Dashed.Line.X[0]);
+        Assert.Equal(100d, displayRemaining.Dashed.Line.Y[0]);
+        Assert.StartsWith("M0.00 1.00", displayRemaining.Dashed.Path);
+
         var sol = GraphPlotProjection.BuildModelLines(scene, scene.ModelSeries["SOL"]);
         Assert.DoesNotContain(
             sol.Idle.X
@@ -60,7 +68,7 @@ public sealed class Issue337HistoryGapTests
         var renderedLeadingQuota = typeof(GraphPlotControl)
             .GetField("remainingDashedSeries", BindingFlags.Instance | BindingFlags.NonPublic)
             ?? throw new MissingFieldException(typeof(GraphPlotControl).FullName, "remainingDashedSeries");
-        Assert.Null(renderedLeadingQuota.GetValue(control));
+        Assert.NotNull(renderedLeadingQuota.GetValue(control));
     }
 
     private static ApiHistorySample Sample(
