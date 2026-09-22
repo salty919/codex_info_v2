@@ -98,6 +98,34 @@ public sealed class PreviewEnvironmentTests
     }
 
     [Fact]
+    public async Task BranchPreviewContainsSiblingChildrenAndGrandchildrenForVisualReview()
+    {
+        var originalThreadCount = Environment.GetEnvironmentVariable("CODEX_INFO_WINDOWS_PREVIEW_THREAD_COUNT");
+        Environment.SetEnvironmentVariable("CODEX_INFO_WINDOWS_PREVIEW_THREAD_COUNT", "7");
+        await WithPreviewScenarioAsync("threads-branches", async () =>
+        {
+            try
+            {
+                using var client = new PreviewLoopbackClient();
+                var details = await client.FetchDetailsAsync(CancellationToken.None);
+                var threads = details.Snapshot!.Threads;
+
+                Assert.True(PreviewEnvironment.IsThreadsPreview);
+                Assert.Equal(7, threads.Count);
+                Assert.Equal(2, threads.Count(thread => thread.ParentId == "branch-root"));
+                Assert.Equal(2, threads.Count(thread => thread.ParentId == "branch-child-a"));
+                Assert.Equal(2, threads.Count(thread => thread.ParentId == "branch-child-b"));
+                Assert.Contains(threads, thread => thread.Title.Contains("wrap across two lines", StringComparison.Ordinal));
+                Assert.All(threads, thread => Assert.False(thread.IsOrphan));
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("CODEX_INFO_WINDOWS_PREVIEW_THREAD_COUNT", originalThreadCount);
+            }
+        });
+    }
+
+    [Fact]
     public async Task PreviewQuotaGaugeUsesTheExactHalfPeriodAcceptanceBoundary()
     {
         using var client = new CodexInfo.WindowsClient.PreviewLoopbackClient();

@@ -27,7 +27,7 @@ public static class PreviewEnvironment
 
     public static bool IsSetup => Scenario is "setup";
 
-    public static bool IsThreadsPreview => Scenario is "threads" or "threads-tree";
+    public static bool IsThreadsPreview => Scenario is "threads" or "threads-tree" or "threads-branches";
 
     public static bool IsChild(string child) => string.Equals(Scenario, child, StringComparison.OrdinalIgnoreCase);
 
@@ -189,7 +189,12 @@ public sealed class PreviewLoopbackClient : ILoopbackHealthClient, ILoopbackDeta
             ResetAt = pastReset,
             Samples = pastSamples,
         };
-        var threads = (scenario == "threads-tree" ? BuildTreePreviewThreads(now) : BuildPreviewThreads(now))
+        var threads = (scenario switch
+        {
+            "threads-tree" => BuildTreePreviewThreads(now),
+            "threads-branches" => BuildBranchPreviewThreads(now),
+            _ => BuildPreviewThreads(now),
+        })
             .Take(PreviewEnvironment.ThreadCount)
             .ToArray();
 
@@ -244,5 +249,16 @@ public sealed class PreviewLoopbackClient : ILoopbackHealthClient, ILoopbackDeta
         new("tree-child-b", "Native accessibility evidence review", "tree-root", "gpt-preview-terra", "TERRA", 5_600, 2_700, 16_000, now - 2_700, now - 240, true, 1, false),
         new("tree-grandchild-b1", "UI Automation bounds", "tree-child-b", "gpt-preview-sol", "SOL", 2_800, 1_100, 16_000, now - 2_100, now - 180, true, 2, false),
         new("tree-greatgrandchild-b1", "Text wrapping and tooltip coverage", "tree-grandchild-b1", "gpt-preview-luna", "LUNA", 2_400, 900, 16_000, now - 1_800, now - 120, true, 3, false),
+    ];
+
+    private static ApiThreadDetails[] BuildBranchPreviewThreads(long now) =>
+    [
+        new("branch-root", "Release orchestration root", null, "gpt-preview-astra", "ASTRA", 12_400, 4_000, 16_000, now - 5_400, now - 300, false, 0, false),
+        new("branch-child-a", "Windows client visual verification", "branch-root", "gpt-preview-sol", "SOL", 6_800, 2_900, 16_000, now - 4_800, now - 420, true, 1, false),
+        new("branch-grandchild-a1", "Direct child layout checks with a title long enough to wrap across two lines", "branch-child-a", "gpt-preview-luna", "LUNA", 3_900, 1_600, 16_000, now - 3_900, now - 540, true, 2, false),
+        new("branch-grandchild-a2", "Arrow and junction regression checks", "branch-child-a", "gpt-preview-astra", "ASTRA", 3_700, 1_400, 16_000, now - 3_600, now - 480, true, 2, false),
+        new("branch-child-b", "Native accessibility evidence review", "branch-root", "gpt-preview-terra", "TERRA", 5_600, 2_700, 16_000, now - 2_700, now - 240, true, 1, false),
+        new("branch-grandchild-b1", "UI Automation bounds", "branch-child-b", "gpt-preview-sol", "SOL", 2_800, 1_100, 16_000, now - 2_100, now - 180, true, 2, false),
+        new("branch-grandchild-b2", "Tooltip and token metadata coverage", "branch-child-b", "gpt-preview-luna", "LUNA", 2_400, 900, 16_000, now - 1_800, now - 120, true, 2, false),
     ];
 }
