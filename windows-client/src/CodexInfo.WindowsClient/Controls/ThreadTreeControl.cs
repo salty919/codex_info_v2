@@ -67,31 +67,38 @@ public sealed class ThreadTreeControl : Control
             }
         }
 
-        foreach (var connection in connections)
+        void AddArrow(double childTop)
         {
-            if (connection.ParentRow < 0 || connection.ChildRow <= connection.ParentRow)
-            {
-                continue;
-            }
-
-            var parentBottom = connection.ParentRow * rowHeight + cardBottomInset;
-            var childTop = connection.ChildRow * rowHeight + cardTopInset;
-            if (connection.ChildRow == connection.ParentRow + 1)
-            {
-                Add(new Point(cardX, parentBottom), new Point(cardX, childTop));
-            }
-            else
-            {
-                var routeX = Math.Max(8, cardLeft - routedInset - Math.Clamp(connection.ParentDepth, 0, 4) * routedStep);
-                Add(new Point(cardX, parentBottom), new Point(routeX, parentBottom));
-                Add(new Point(routeX, parentBottom), new Point(routeX, childTop));
-                Add(new Point(routeX, childTop), new Point(cardX, childTop));
-            }
-
-            // The arrow tip meets the child's top border. The card is rendered
-            // after this control, so the tip remains a clean edge connection.
             Add(new Point(cardX, childTop), new Point(cardX - arrowWidth, childTop - arrowHeight));
             Add(new Point(cardX, childTop), new Point(cardX + arrowWidth, childTop - arrowHeight));
+        }
+
+        var validConnections = connections
+            .Where(connection => connection.ParentRow >= 0 && connection.ChildRow > connection.ParentRow)
+            .ToArray();
+        foreach (var connection in validConnections.Where(connection => connection.ChildRow == connection.ParentRow + 1))
+        {
+            var parentBottom = connection.ParentRow * rowHeight + cardBottomInset;
+            var childTop = connection.ChildRow * rowHeight + cardTopInset;
+            Add(new Point(cardX, parentBottom), new Point(cardX, childTop));
+            AddArrow(childTop);
+        }
+
+        foreach (var group in validConnections
+                     .Where(connection => connection.ChildRow > connection.ParentRow + 1)
+                     .GroupBy(connection => (connection.ParentRow, connection.ParentDepth)))
+        {
+            var parentBottom = group.Key.ParentRow * rowHeight + cardBottomInset;
+            var routeX = Math.Max(8, cardLeft - routedInset - Math.Clamp(group.Key.ParentDepth, 0, 4) * routedStep);
+            var lastChildTop = group.Max(connection => connection.ChildRow) * rowHeight + cardTopInset;
+            Add(new Point(cardX, parentBottom), new Point(routeX, parentBottom));
+            Add(new Point(routeX, parentBottom), new Point(routeX, lastChildTop));
+            foreach (var connection in group.OrderBy(connection => connection.ChildRow))
+            {
+                var childTop = connection.ChildRow * rowHeight + cardTopInset;
+                Add(new Point(routeX, childTop), new Point(cardX, childTop));
+                AddArrow(childTop);
+            }
         }
 
         return new ThreadTreeGeometry(segments, null);

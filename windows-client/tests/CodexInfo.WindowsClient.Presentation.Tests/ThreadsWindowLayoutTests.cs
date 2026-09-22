@@ -219,6 +219,27 @@ public sealed class ThreadsWindowLayoutTests
         Assert.DoesNotContain(distant.Segments, segment =>
             segment.Start == new Point(cardAnchorX, 90) && segment.End == new Point(cardAnchorX, 294));
 
+        var threeChildren = ThreadTreeControl.BuildGeometry(
+            treeSurfaceWidth,
+            384,
+            [
+                new ThreadTreeConnection(0, 1, 0),
+                new ThreadTreeConnection(0, 2, 0),
+                new ThreadTreeConnection(0, 3, 0),
+            ]);
+        Assert.Contains(threeChildren.Segments, segment =>
+            segment.Start == new Point(cardAnchorX, 90) && segment.End == new Point(56, 90));
+        Assert.Contains(threeChildren.Segments, segment =>
+            segment.Start == new Point(56, 90) && segment.End == new Point(56, 294));
+        Assert.Contains(threeChildren.Segments, segment =>
+            segment.Start == new Point(56, 198) && segment.End == new Point(cardAnchorX, 198));
+        Assert.Contains(threeChildren.Segments, segment =>
+            segment.Start == new Point(56, 294) && segment.End == new Point(cardAnchorX, 294));
+        Assert.Equal(
+            1,
+            threeChildren.Segments.Count(segment =>
+                segment.Start == new Point(56, 90) && segment.End == new Point(56, 294)));
+
         var document = XDocument.Parse(LoadRepositoryFile(
             "windows-client", "src", "CodexInfo.WindowsClient", "ThreadsWindow.axaml"));
         var treeHost = Assert.Single(document.Descendants(
