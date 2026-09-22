@@ -441,7 +441,7 @@ public sealed class PresentationBoundaryTests
         Assert.Equal("Grid", header.Name.LocalName);
 
         var columns = header.Attribute("ColumnDefinitions")!.Value.Split(',');
-        Assert.Equal(["*", "128", "12", "116"], columns);
+        Assert.Equal(["*", "128", "8", "108"], columns);
 
         var controls = header.Elements()
             .Single(element => element.Name.LocalName == "StackPanel" &&
@@ -449,7 +449,7 @@ public sealed class PresentationBoundaryTests
                     button.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.Window.Minimize"));
         Assert.Equal("3", controls.Attribute("Grid.Column")?.Value);
         var spacing = int.Parse(controls.Attribute("Spacing")!.Value);
-        Assert.Equal(4, spacing);
+        Assert.Equal(0, spacing);
 
         var buttons = controls.Elements()
             .Where(element => element.Name.LocalName == "Button")
@@ -461,12 +461,44 @@ public sealed class PresentationBoundaryTests
         var controlStyle = document.Descendants()
             .Single(element => element.Name.LocalName == "Style" &&
                 element.Attribute("Selector")?.Value == "Button.window-control");
+        Assert.Equal("Center", controlStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" &&
+            element.Attribute("Property")?.Value == "HorizontalContentAlignment").Attribute("Value")?.Value);
+        Assert.Equal("Center", controlStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" &&
+            element.Attribute("Property")?.Value == "VerticalContentAlignment").Attribute("Value")?.Value);
         var buttonWidth = int.Parse(controlStyle.Descendants()
             .Single(element => element.Name.LocalName == "Setter" &&
                 element.Attribute("Property")?.Value == "Width")
             .Attribute("Value")!.Value);
         var controlGroupWidth = (buttons.Length * buttonWidth) + ((buttons.Length - 1) * spacing);
         Assert.Equal(controlGroupWidth, int.Parse(columns[3]));
+
+        var accountSelector = document.Descendants()
+            .Single(element => element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.AccountSelector");
+        Assert.Equal("0,6,0,0", accountSelector.Attribute("Margin")?.Value);
+        var accountFields = accountSelector.Descendants().Single(element => element.Name.LocalName == "Grid");
+        Assert.Equal("82,1,*,14", accountFields.Attribute("ColumnDefinitions")?.Value);
+        Assert.Equal("{Binding SelectedAccountValueText}", accountFields.Elements().Single(element => element.Attribute("Grid.Column")?.Value == "2").Attribute("Text")?.Value);
+
+        var periodSelector = document.Descendants()
+            .Single(element => element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.PeriodSelector");
+        Assert.Equal("0,12,0,0", periodSelector.Attribute("Margin")?.Value);
+        Assert.Equal("2", periodSelector.Attribute("Grid.Row")?.Value);
+        Assert.Equal("1", accountSelector.Attribute("Grid.Row")?.Value);
+        var periodFields = periodSelector.Descendants().Single(element => element.Name.LocalName == "Grid");
+        Assert.Equal("{Binding SelectedPeriodValueText}", periodFields.Elements().Single(element => element.Attribute("Grid.Column")?.Value == "2").Attribute("Text")?.Value);
+
+        var controlSurface = document.Descendants()
+            .Single(element => element.Name.LocalName == "Border" &&
+                element.Attribute("Grid.RowSpan")?.Value == "4");
+        Assert.Equal("0,6,0,0", controlSurface.Attribute("Margin")?.Value);
+
+        var legend = document.Descendants().Single(element =>
+            element.Name.LocalName == "Grid" &&
+            element.Attribute("Grid.Row")?.Value == "4" &&
+            element.Attribute("Width")?.Value == "504");
+        Assert.Equal("120,90,90,90,90", legend.Attribute("ColumnDefinitions")?.Value);
 
         var metricMenu = document.Descendants()
             .Single(element => element.Attribute("AutomationProperties.AutomationId")?.Value == "Graph.MetricMenu")

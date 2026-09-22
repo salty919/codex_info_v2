@@ -71,6 +71,100 @@ public sealed class MainLayoutParityTests
     }
 
     [Fact]
+    public void MainUsesTheIssue360FixedQuotaGaugeAndStatusGeometry()
+    {
+        var source = LoadRepositoryFile(
+            "windows-client", "src", "CodexInfo.WindowsClient", "MainWindow.axaml");
+        var document = XDocument.Parse(source);
+        var surface = document.Descendants()
+            .Single(element => element.Name.LocalName == "Grid" &&
+                element.Attribute("RowDefinitions")?.Value == "52,82,78,56,102,42");
+
+        Assert.Equal("22,14", surface.Attribute("Margin")?.Value);
+        Assert.Equal("8", surface.Attribute("RowSpacing")?.Value);
+
+        var quota = document.Descendants().Single(element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.RemainingQuotaBar");
+        var quotaGrid = quota.Parent;
+        Assert.NotNull(quotaGrid);
+        Assert.Equal("604,210", quotaGrid.Attribute("ColumnDefinitions")?.Value);
+        Assert.Equal("14", quotaGrid.Attribute("ColumnSpacing")?.Value);
+        Assert.Equal("13,5", quotaGrid.Parent?.Attribute("Padding")?.Value);
+        Assert.Contains(
+            document.Descendants().Where(element => element.Name.LocalName == "TextBlock"),
+            element => element.Attribute("Width")?.Value == "604" &&
+                element.Attribute("Text")?.Value == "{Binding RemainingPercentText}");
+        Assert.Equal("0,4,0,0", quota.Attribute("Margin")?.Value);
+        Assert.Equal("Top", quota.Attribute("VerticalAlignment")?.Value);
+
+        var gauge = document.Descendants().Single(element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.QuotaPeriodGauge");
+        var gaugeGrid = gauge.Parent;
+        Assert.NotNull(gaugeGrid);
+        Assert.Equal("18,20,20", gaugeGrid.Attribute("RowDefinitions")?.Value);
+        Assert.Equal("0", gaugeGrid.Attribute("RowSpacing")?.Value);
+        var quotaStyle = document.Descendants().Single(element =>
+            element.Name.LocalName == "Style" &&
+            element.Attribute("Selector")?.Value == "Border.quota-segment");
+        Assert.Equal("20", quotaStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" &&
+            element.Attribute("Property")?.Value == "Height").Attribute("Value")?.Value);
+
+        var status = document.Descendants().Single(element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.StatusBanner");
+        var statusGrid = status.Descendants().Single(element =>
+            element.Name.LocalName == "Grid" &&
+            element.Attribute("RowDefinitions")?.Value == "17,18");
+        Assert.Equal("11,2", status.Attribute("Padding")?.Value);
+        Assert.Contains(statusGrid.Descendants(), element =>
+            element.Name.LocalName == "Border" &&
+            element.Attribute("Margin")?.Value == "0,14,0,0");
+
+        var accountStyle = document.Descendants().Single(element =>
+            element.Name.LocalName == "Style" &&
+            element.Attribute("Selector")?.Value == "ToggleButton.account-selector");
+        Assert.Equal("#18283A", accountStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" &&
+            element.Attribute("Property")?.Value == "Background").Attribute("Value")?.Value);
+        Assert.Equal("#304A63", accountStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" &&
+            element.Attribute("Property")?.Value == "BorderBrush").Attribute("Value")?.Value);
+        Assert.Equal("6", accountStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" &&
+            element.Attribute("Property")?.Value == "CornerRadius").Attribute("Value")?.Value);
+
+        var legalCommand = document.Descendants().Single(element =>
+            element.Name.LocalName == "Button" &&
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.OpenLegal");
+        var legalClasses = legalCommand.Attribute("Classes")?.Value
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries) ?? [];
+        Assert.Contains("command", legalClasses);
+        Assert.Contains("legal", legalClasses);
+
+        var minimize = document.Descendants().Single(element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.Window.Minimize");
+        var close = document.Descendants().Single(element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.Window.Close");
+        var windowControlRow = minimize.Parent;
+        Assert.NotNull(windowControlRow);
+        Assert.Same(windowControlRow, close.Parent);
+        Assert.Same(legalCommand.Parent, windowControlRow.Parent);
+        Assert.Equal("StackPanel", windowControlRow.Name.LocalName);
+        Assert.Equal("Horizontal", windowControlRow.Attribute("Orientation")?.Value);
+        Assert.Equal("0", windowControlRow.Attribute("Spacing")?.Value);
+        Assert.Equal("12,0,0,0", windowControlRow.Attribute("Margin")?.Value);
+        var windowControlStyle = document.Descendants().Single(element =>
+            element.Name.LocalName == "Style" &&
+            element.Attribute("Selector")?.Value == "Button.window-control");
+        Assert.Equal("Center", windowControlStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" &&
+            element.Attribute("Property")?.Value == "HorizontalContentAlignment").Attribute("Value")?.Value);
+        Assert.Equal("Center", windowControlStyle.Descendants().Single(element =>
+            element.Name.LocalName == "Setter" &&
+            element.Attribute("Property")?.Value == "VerticalContentAlignment").Attribute("Value")?.Value);
+    }
+
+    [Fact]
     public void MainAccountLabelOmitsStateWordsWhileGraphLabelKeepsThem()
     {
         var account = new ApiAccount("account-7", true, 1, null)

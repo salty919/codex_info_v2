@@ -71,6 +71,7 @@
     </Style>
     <Style Selector="Button.command">
       <Setter Property="Padding" Value="8,5" />
+      <Setter Property="Width" Value="70" />
       <Setter Property="MinWidth" Value="70" />
       <Setter Property="FontSize" Value="12" />
       <Setter Property="HorizontalContentAlignment" Value="Center" />
@@ -83,12 +84,28 @@
       <Setter Property="Background" Value="#24415E" />
       <Setter Property="BorderBrush" Value="#5EA7E5" />
     </Style>
+    <Style Selector="Button.command.legal">
+      <Setter Property="Width" Value="84" />
+      <Setter Property="MinWidth" Value="84" />
+    </Style>
+    <Style Selector="ToggleButton.account-selector">
+      <Setter Property="Background" Value="#18283A" />
+      <Setter Property="BorderBrush" Value="#304A63" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="Foreground" Value="#EAF2FB" />
+      <Setter Property="Padding" Value="10,3" />
+    </Style>
+    <Style Selector="ToggleButton.account-selector:pointerover">
+      <Setter Property="Background" Value="#24415E" />
+      <Setter Property="BorderBrush" Value="#5EA7E5" />
+    </Style>
     <!-- WeekGauge cells use a fixed two-surface template instead of a themed
          progress control.  This keeps the gauge free of hover, animation, and
          indeterminate layers. -->
     <Style Selector="Border.quota-segment">
       <Setter Property="Background" Value="#326799" />
-      <Setter Property="Height" Value="12" />
+      <Setter Property="Height" Value="20" />
       <Setter Property="Margin" Value="0,0,4,0" />
     </Style>
     <Style Selector="Border.app-mark">
@@ -103,6 +120,8 @@
       <Setter Property="Width" Value="30" />
       <Setter Property="Height" Value="28" />
       <Setter Property="Padding" Value="0" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
       <Setter Property="FontSize" Value="16" />
       <Setter Property="Background" Value="Transparent" />
       <Setter Property="BorderBrush" Value="Transparent" />
@@ -146,12 +165,12 @@
         </StackPanel>
       </StackPanel>
       <ToggleButton Grid.Column="1"
+                    Classes="account-selector"
                     x:Name="AccountSelector"
                     Width="250"
                     Height="44"
                     HorizontalAlignment="Stretch"
                     HorizontalContentAlignment="Left"
-                    Padding="10,3"
                     ClickMode="Press"
                     IsCheckedChanged="OnAccountSelectorCheckedChanged"
                     IsVisible="{Binding HasAccounts}"
@@ -159,8 +178,9 @@
                     AutomationProperties.AutomationId="Main.AccountSelector"
                     AutomationProperties.HelpText="{Binding SelectedAccountText}"
                     ToolTip.Tip="{Binding SelectedAccountText}">
-        <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="6">
-          <TextBlock Foreground="#5DC98A"
+        <Grid ColumnDefinitions="18,*,14" ColumnSpacing="0">
+          <TextBlock Width="14"
+                     Foreground="#5DC98A"
                      Text="●"
                      IsVisible="{Binding SelectedAccount.IsCurrent}"
                      VerticalAlignment="Center"
@@ -176,6 +196,7 @@
                        TextWrapping="NoWrap" />
           </StackPanel>
           <TextBlock Grid.Column="2"
+                     HorizontalAlignment="Center"
                      VerticalAlignment="Center"
                      Foreground="#9FB0C5"
                      Text="⌄" />
@@ -194,7 +215,7 @@
                 ToolTip.Tip="{Binding Texts.Graph}">
           <StackPanel Orientation="Horizontal" Spacing="4"><TextBlock Text="▥" /><TextBlock Text="{Binding Texts.Graph}" /></StackPanel>
         </Button>
-        <Button Classes="command"
+        <Button Classes="command legal"
                 Click="OnOpenLegal"
                 AutomationProperties.Name="{Binding Texts.Legal}"
                 AutomationProperties.AutomationId="Main.OpenLegal"
@@ -208,32 +229,37 @@
                 ToolTip.Tip="{Binding Texts.Settings}">
           <StackPanel Orientation="Horizontal" Spacing="4"><TextBlock Text="⚙" /><TextBlock Text="{Binding Texts.Settings}" /></StackPanel>
         </Button>
-        <Button Classes="window-control"
-                Click="OnMinimizeWindow"
-                AutomationProperties.Name="{Binding Texts.Minimize}"
-                AutomationProperties.AutomationId="Main.Window.Minimize"
-                Content="—"
-                ToolTip.Tip="{Binding Texts.Minimize}" />
-        <Button Classes="window-control"
-                Click="OnCloseWindow"
-                AutomationProperties.Name="{Binding Texts.Close}"
-                AutomationProperties.AutomationId="Main.Window.Close"
-                Content="×"
-                ToolTip.Tip="{Binding Texts.Close}" />
+        <StackPanel Orientation="Horizontal"
+                    Spacing="0"
+                    Margin="12,0,0,0">
+          <Button Classes="window-control"
+                  Click="OnMinimizeWindow"
+                  AutomationProperties.Name="{Binding Texts.Minimize}"
+                  AutomationProperties.AutomationId="Main.Window.Minimize"
+                  Content="—"
+                  ToolTip.Tip="{Binding Texts.Minimize}" />
+          <Button Classes="window-control"
+                  Click="OnCloseWindow"
+                  AutomationProperties.Name="{Binding Texts.Close}"
+                  AutomationProperties.AutomationId="Main.Window.Close"
+                  Content="×"
+                  ToolTip.Tip="{Binding Texts.Close}" />
+        </StackPanel>
       </StackPanel>
     </Grid>
 
     <!-- RemainingQuota owns the current percentage and the current-period
          local cost estimate.  The bar is absent until a quota is validated. -->
-    <Border Grid.Row="1" Classes="section" Padding="14,6" IsVisible="{Binding ShowAuthenticatedContent}">
-      <Grid RowDefinitions="*,6" ColumnDefinitions="*,210" ColumnSpacing="14" RowSpacing="4">
+    <Border Grid.Row="1" Classes="section" Padding="13,5" IsVisible="{Binding ShowAuthenticatedContent}">
+      <Grid RowDefinitions="*,6" ColumnDefinitions="604,210" ColumnSpacing="14" RowSpacing="4">
         <StackPanel Spacing="2" VerticalAlignment="Center">
           <TextBlock Classes="label" Text="{Binding Texts.RemainingQuota}" />
           <TextBlock FontSize="36"
                      FontWeight="SemiBold"
                      Foreground="#F2F6FC"
                      Text="{Binding RemainingPercentText}"
-                     TextWrapping="NoWrap" />
+                     TextWrapping="NoWrap"
+                     Width="604" />
         </StackPanel>
         <StackPanel Grid.Column="1" HorizontalAlignment="Right" VerticalAlignment="Center">
           <TextBlock FontSize="20"
@@ -248,6 +274,8 @@
                      Maximum="100"
                      Value="{Binding RemainingPercentValue}"
                      Height="6"
+                     Margin="0,4,0,0"
+                     VerticalAlignment="Top"
                      HorizontalAlignment="Stretch"
                      IsVisible="{Binding HasQuota}"
                      AutomationProperties.AutomationId="Main.RemainingQuotaBar" />
@@ -256,8 +284,8 @@
 
     <!-- WeekGauge owns the seven-cell weekly/monthly period gauge, the
          remaining countdown, and the exact reset/observation timestamps. -->
-    <Border Grid.Row="2" Classes="section" Padding="12,6" IsVisible="{Binding ShowAuthenticatedContent}">
-      <Grid RowDefinitions="18,16,20" ColumnDefinitions="Auto,*,Auto,Auto" RowSpacing="3" ColumnSpacing="8">
+    <Border Grid.Row="2" Classes="section" Padding="11,4" IsVisible="{Binding ShowAuthenticatedContent}">
+      <Grid RowDefinitions="18,20,20" ColumnDefinitions="Auto,*,Auto,Auto" RowSpacing="0" ColumnSpacing="8">
           <TextBlock Classes="label"
                      Grid.ColumnSpan="3"
                      VerticalAlignment="Center"
@@ -272,6 +300,7 @@
                      TextWrapping="NoWrap" />
           <ItemsControl Grid.Row="1"
                         Grid.ColumnSpan="4"
+                        Margin="0,1,0,0"
                         VerticalAlignment="Center"
                         ItemsSource="{Binding QuotaSegments}"
                         IsVisible="{Binding HasQuota}">
@@ -312,10 +341,10 @@
                      AutomationProperties.AutomationId="Main.QuotaPeriodGauge"
                      AutomationProperties.Name="{Binding QuotaWindowText}"
                      AutomationProperties.HelpText="{Binding QuotaRemainingText}" />
-          <TextBlock Grid.Row="2" Classes="metric-label" VerticalAlignment="Center" Text="{Binding Texts.ResetTime}" />
-          <TextBlock Grid.Row="2" Grid.Column="1" Classes="metric-value" VerticalAlignment="Center" Text="{Binding ResetAtText}" AutomationProperties.AutomationId="Main.QuotaResetAt" />
-          <TextBlock Grid.Row="2" Grid.Column="2" Classes="metric-label" Margin="12,0,0,0" VerticalAlignment="Center" Text="{Binding Texts.ObservedAt}" />
-          <TextBlock Grid.Row="2" Grid.Column="3" Classes="metric-value" VerticalAlignment="Center" Text="{Binding ObservedAtText}" AutomationProperties.AutomationId="Main.QuotaObservedAt" />
+          <TextBlock Grid.Row="2" Classes="metric-label" Margin="0,6,0,0" VerticalAlignment="Top" Text="{Binding Texts.ResetTime}" />
+          <TextBlock Grid.Row="2" Grid.Column="1" Classes="metric-value" Margin="0,6,0,0" VerticalAlignment="Top" Text="{Binding ResetAtText}" AutomationProperties.AutomationId="Main.QuotaResetAt" />
+          <TextBlock Grid.Row="2" Grid.Column="2" Classes="metric-label" Margin="12,6,0,0" VerticalAlignment="Top" Text="{Binding Texts.ObservedAt}" />
+          <TextBlock Grid.Row="2" Grid.Column="3" Classes="metric-value" Margin="0,6,0,0" VerticalAlignment="Top" Text="{Binding ObservedAtText}" AutomationProperties.AutomationId="Main.QuotaObservedAt" />
       </Grid>
     </Border>
 
@@ -428,13 +457,13 @@
             BorderBrush="{Binding StatusBorder}"
             BorderThickness="1"
             CornerRadius="8"
-            Padding="10,4"
+            Padding="11,2"
             AutomationProperties.AutomationId="Main.StatusBanner">
-      <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
-        <Border Width="8" Height="8" CornerRadius="4" Background="{Binding StatusAccent}" VerticalAlignment="Top" Margin="0,5,0,0" />
-        <StackPanel Grid.Column="1" Spacing="1" VerticalAlignment="Center">
-          <TextBlock FontSize="13" FontWeight="SemiBold" Text="{Binding StatusTitle}" TextWrapping="NoWrap" />
-          <TextBlock Classes="label" FontSize="11" Text="{Binding StatusDetail}" TextWrapping="NoWrap" />
+      <Grid RowDefinitions="17,18" ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
+        <Border Grid.RowSpan="2" Width="8" Height="8" CornerRadius="4" Background="{Binding StatusAccent}" VerticalAlignment="Top" Margin="0,14,0,0" />
+        <StackPanel Grid.Column="1" Grid.RowSpan="2" Spacing="0" VerticalAlignment="Top">
+          <TextBlock FontSize="13" FontWeight="SemiBold" Height="17" Text="{Binding StatusTitle}" TextWrapping="NoWrap" />
+          <TextBlock Grid.Row="1" Classes="label" FontSize="11" Height="18" Text="{Binding StatusDetail}" TextWrapping="NoWrap" />
         </StackPanel>
         <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center" IsVisible="{Binding IsAuthStartVisible}">
           <Button Classes="refresh"

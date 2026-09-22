@@ -193,6 +193,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public string SelectedAccountText => $"{Texts.Account}｜{main.SelectedAccountText}";
 
+    public string SelectedAccountValueText => main.SelectedAccountText;
+
     public IReadOnlyList<string> MetricOptions => metricOptions;
 
     public string SelectedMetric
@@ -247,6 +249,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             Notify();
             Notify(nameof(HasPoints));
             Notify(nameof(SelectedPeriodText));
+            Notify(nameof(SelectedPeriodValueText));
             Notify(nameof(SelectedPeriodStartAt));
             Notify(nameof(SelectedPeriodEndAt));
         }
@@ -263,6 +266,8 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
     public string SelectedPeriodText => selectedPeriod is { } period
         ? $"{Texts.PeriodSelectorHeading}｜{period.Label}"
         : $"{Texts.PeriodSelectorHeading}｜{Texts.UnavailableValue}";
+
+    public string SelectedPeriodValueText => selectedPeriod?.Label ?? Texts.UnavailableValue;
 
     public long SelectedPeriodStartAt => scene.HasPoints ? scene.PeriodStartAt : displayedPeriod?.StartAt ?? 0;
 
@@ -708,6 +713,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(HasAccounts));
             Notify(nameof(SelectedAccount));
             Notify(nameof(SelectedAccountText));
+            Notify(nameof(SelectedAccountValueText));
             if (eventArgs.PropertyName == nameof(MainWindowViewModel.SelectedAccount))
             {
                 ClearAccountResourceState();
@@ -749,7 +755,10 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             Notify(nameof(Texts));
             Notify(nameof(MetricOptions));
             Notify(nameof(SelectedMetric));
+            Notify(nameof(SelectedAccountText));
+            Notify(nameof(SelectedAccountValueText));
             Notify(nameof(SelectedPeriodText));
+            Notify(nameof(SelectedPeriodValueText));
             Notify(nameof(MetricAxisText));
             Notify(nameof(GraphGapHintText));
         }
@@ -783,6 +792,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(Periods));
         Notify(nameof(SelectedPeriod));
         Notify(nameof(SelectedPeriodText));
+        Notify(nameof(SelectedPeriodValueText));
         Notify(nameof(SelectedPeriodStartAt));
         Notify(nameof(SelectedPeriodEndAt));
         Notify(nameof(Points));
@@ -1229,6 +1239,7 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
                 Notify(nameof(HasPeriods));
                 Notify(nameof(SelectedPeriod));
                 Notify(nameof(SelectedPeriodText));
+                Notify(nameof(SelectedPeriodValueText));
                 Notify(nameof(SelectedPeriodStartAt));
                 Notify(nameof(SelectedPeriodEndAt));
             }
