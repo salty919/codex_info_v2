@@ -133,8 +133,26 @@ public sealed class MainLayoutParityTests
             element.Name.LocalName == "Setter" &&
             element.Attribute("Property")?.Value == "CornerRadius").Attribute("Value")?.Value);
 
-        Assert.Contains("<Button Classes=\"command legal\"", source, StringComparison.Ordinal);
-        Assert.Contains("<StackPanel Orientation=\"Horizontal\"\n                    Spacing=\"0\"\n                    Margin=\"12,0,0,0\">", source, StringComparison.Ordinal);
+        var legalCommand = document.Descendants().Single(element =>
+            element.Name.LocalName == "Button" &&
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.OpenLegal");
+        var legalClasses = legalCommand.Attribute("Classes")?.Value
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries) ?? [];
+        Assert.Contains("command", legalClasses);
+        Assert.Contains("legal", legalClasses);
+
+        var minimize = document.Descendants().Single(element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.Window.Minimize");
+        var close = document.Descendants().Single(element =>
+            element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.Window.Close");
+        var windowControlRow = minimize.Parent;
+        Assert.NotNull(windowControlRow);
+        Assert.Same(windowControlRow, close.Parent);
+        Assert.Same(legalCommand.Parent, windowControlRow.Parent);
+        Assert.Equal("StackPanel", windowControlRow.Name.LocalName);
+        Assert.Equal("Horizontal", windowControlRow.Attribute("Orientation")?.Value);
+        Assert.Equal("0", windowControlRow.Attribute("Spacing")?.Value);
+        Assert.Equal("12,0,0,0", windowControlRow.Attribute("Margin")?.Value);
         var windowControlStyle = document.Descendants().Single(element =>
             element.Name.LocalName == "Style" &&
             element.Attribute("Selector")?.Value == "Button.window-control");
