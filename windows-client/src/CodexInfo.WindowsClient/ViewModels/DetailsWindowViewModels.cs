@@ -2016,18 +2016,24 @@ public sealed class ThreadItemViewModel
         bool connectedToParent, bool hasChildren, bool hasNextSibling,
         bool ancestorGuide1, bool ancestorGuide2, bool ancestorGuide3, string parentTitle)
     {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         Id = thread.Id;
         Title = thread.Title;
         RoleText = owner.ThreadRole(thread);
+        RoleStatusText = FormatRoleStatus(owner.Texts, thread);
         ParentText = string.IsNullOrWhiteSpace(parentTitle)
             ? owner.ParentText(thread)
             : $"{owner.ParentText(thread)} / {parentTitle}";
         ModelText = owner.ModelText(thread);
         ContextText = owner.ContextText(thread);
+        ContextUsageText = FormatContextUsage(owner.Texts, thread);
         TokenText = owner.TokenText(thread);
+        DisplayTokenText = FormatDisplayToken(owner.Texts, thread);
         DepthText = thread.Depth is { } depth ? $"{owner.Texts.Depth} {depth}" : $"{owner.Texts.Depth} —";
         AgeText = owner.Texts.FormatElapsed(thread.CreatedAt, owner.Texts.Elapsed);
         InstructionAgeText = owner.Texts.FormatElapsed(thread.LastUserMessageAt, owner.Texts.Instruction);
+        ElapsedMinutesText = FormatMinuteAge(owner.Texts, thread.CreatedAt, owner.Texts.Elapsed, now);
+        InstructionMinutesText = FormatMinuteAge(owner.Texts, thread.LastUserMessageAt, owner.Texts.Instruction, now);
         TreeDepth = treeDepth;
         ConnectedToParent = connectedToParent;
         HasChildren = hasChildren;
@@ -2041,13 +2047,22 @@ public sealed class ThreadItemViewModel
     public string Id { get; }
     public string Title { get; }
     public string RoleText { get; }
+    public string RoleStatusText { get; }
     public string ParentText { get; }
     public string ModelText { get; }
     public string ContextText { get; }
+    public string ContextUsageText { get; }
+    public bool HasContextUsage => ContextUsageText.Length > 0;
     public string TokenText { get; }
+    public string DisplayTokenText { get; }
+    public bool HasDisplayToken => DisplayTokenText.Length > 0;
     public string DepthText { get; }
     public string AgeText { get; }
     public string InstructionAgeText { get; }
+    public string ElapsedMinutesText { get; }
+    public bool HasElapsedMinutes => ElapsedMinutesText.Length > 0;
+    public string InstructionMinutesText { get; }
+    public bool HasInstructionMinutes => InstructionMinutesText.Length > 0;
     public int TreeDepth { get; }
     public bool ConnectedToParent { get; }
     public bool HasChildren { get; }
@@ -2056,6 +2071,65 @@ public sealed class ThreadItemViewModel
     public bool AncestorGuide2 { get; }
     public bool AncestorGuide3 { get; }
     public string ParentTitle { get; }
+
+    internal static string FormatRoleStatus(UiText texts, ApiThreadDetails thread)
+    {
+        var role = thread.IsSubAgent ? texts.SubThread : texts.MainThread;
+        var active = texts.LanguageCode switch
+        {
+            "ja" => "実行中",
+            "zh-Hans" => "活跃",
+            "ko" => "활성",
+            "es" => "Activo",
+            "fr" => "Actif",
+            "de" => "Aktiv",
+            "pt" => "Ativo",
+            "it" => "Attivo",
+            "ru" => "Активен",
+            _ => "Active",
+        };
+        return $"{role} · {active}";
+    }
+
+    internal static string FormatContextUsage(UiText texts, ApiThreadDetails thread)
+    {
+        if (thread.ContextPercent is not { } percent ||
+            thread.ContextTokens is not { } used ||
+            thread.ContextLimit is not { } limit ||
+            limit == 0)
+        {
+            return string.Empty;
+        }
+
+        return string.Create(
+            CultureInfo.CurrentCulture,
+            $"{texts.Context} {percent:0.#}%\n{used:N0} / {limit:N0} {texts.Tokens}");
+    }
+
+    internal static string FormatMinuteAge(UiText texts, long? timestamp, string label, long now)
+    {
+        if (timestamp is not { } value)
+        {
+            return string.Empty;
+        }
+
+        var minutes = Math.Max(0, now - value) / 60;
+        var unit = texts.LanguageCode switch
+        {
+            "ja" => "分",
+            "zh-Hans" => "分钟",
+            "ko" => "분",
+            "de" => "Min.",
+            "ru" => "мин",
+            _ => "min",
+        };
+        return string.Create(CultureInfo.CurrentCulture, $"{label} {minutes:N0} {unit}");
+    }
+
+    internal static string FormatDisplayToken(UiText texts, ApiThreadDetails thread) =>
+        thread.CumulativeTokens is { } tokens
+            ? string.Create(CultureInfo.CurrentCulture, $"{texts.Tokens} {tokens:N0}")
+            : string.Empty;
 
 }
 

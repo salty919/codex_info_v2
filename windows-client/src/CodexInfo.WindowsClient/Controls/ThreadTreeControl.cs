@@ -7,6 +7,12 @@ using Avalonia.Media;
 
 namespace CodexInfo.WindowsClient.Controls;
 
+internal readonly record struct ThreadTreeSegment(Point Start, Point End);
+
+internal sealed record ThreadTreeGeometry(
+    IReadOnlyList<ThreadTreeSegment> Segments,
+    Point? JunctionDot);
+
 /// <summary>Draws the parent/child rails in the dedicated thread gutter.</summary>
 public sealed class ThreadTreeControl : Control
 {
@@ -30,25 +36,60 @@ public sealed class ThreadTreeControl : Control
     {
         base.Render(context);
         var rail = new Pen(new SolidColorBrush(Color.Parse("#D5A43A")), 2);
+        var geometry = BuildGeometry(
+            Bounds.Width,
+            Bounds.Height,
+            TreeDepth,
+            ConnectedToParent,
+            HasChildren,
+            HasNextSibling,
+            AncestorGuide1,
+            AncestorGuide2,
+            AncestorGuide3);
+        foreach (var segment in geometry.Segments)
+        {
+            context.DrawLine(rail, segment.Start, segment.End);
+        }
+        if (geometry.JunctionDot is { } junctionDot)
+        {
+            context.DrawEllipse(rail.Brush, null, junctionDot, 3, 3);
+        }
+    }
+
+    internal static ThreadTreeGeometry BuildGeometry(
+        double width,
+        double height,
+        int treeDepth,
+        bool connectedToParent,
+        bool hasChildren,
+        bool hasNextSibling,
+        bool ancestorGuide1,
+        bool ancestorGuide2,
+        bool ancestorGuide3)
+    {
         const double baseX = 8;
         const double step = 12;
-        var junctionY = Bounds.Height / 2;
-        var junctionEndX = Math.Max(baseX + step, Bounds.Width - 5);
-        var depth = Math.Clamp(TreeDepth, 0, 3);
-        if (AncestorGuide1) context.DrawLine(rail, new Point(baseX, 0), new Point(baseX, Bounds.Height));
-        if (AncestorGuide2) context.DrawLine(rail, new Point(baseX + step, 0), new Point(baseX + step, Bounds.Height));
-        if (AncestorGuide3) context.DrawLine(rail, new Point(baseX + step * 2, 0), new Point(baseX + step * 2, Bounds.Height));
-        if (ConnectedToParent)
+        var junctionY = height / 2;
+        var junctionEndX = Math.Max(baseX + step, width - 5);
+        var depth = Math.Clamp(treeDepth, 0, 3);
+        var segments = new List<ThreadTreeSegment>(6);
+        if (ancestorGuide1) segments.Add(new(new Point(baseX, 0), new Point(baseX, height)));
+        if (ancestorGuide2) segments.Add(new(new Point(baseX + step, 0), new Point(baseX + step, height)));
+        if (ancestorGuide3) segments.Add(new(new Point(baseX + step * 2, 0), new Point(baseX + step * 2, height)));
+        Point? junctionDot = null;
+        if (connectedToParent)
         {
             var x = baseX + Math.Max(0, depth - 1) * step;
-            context.DrawLine(rail, new Point(x, 0), new Point(x, HasNextSibling ? Bounds.Height : junctionY));
-            context.DrawLine(rail, new Point(x, junctionY), new Point(junctionEndX, junctionY));
-            context.DrawEllipse(rail.Brush, null, new Point(junctionEndX, junctionY), 3, 3);
+            segments.Add(new(new Point(x, 0), new Point(x, hasNextSibling ? height : junctionY)));
+            segments.Add(new(new Point(x, junctionY), new Point(junctionEndX, junctionY)));
+            junctionDot = new Point(junctionEndX, junctionY);
         }
-        if (HasChildren)
+        if (hasChildren)
         {
             var x = baseX + depth * step;
-            context.DrawLine(rail, new Point(x, junctionY), new Point(x, Bounds.Height));
+            segments.Add(new(new Point(x, junctionY), new Point(x, height)));
         }
+
+        return new ThreadTreeGeometry(segments, junctionDot);
     }
 }
