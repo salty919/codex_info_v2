@@ -419,15 +419,12 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         var bucketCount = Math.Max(1, maximum / 2);
-        for (var bucket = 0; bucket < bucketCount && selected.Count < maximum; bucket++)
+        for (var bucket = 0; bucket < bucketCount; bucket++)
         {
             var start = (int)((long)bucket * samples.Count / bucketCount);
             var endExclusive = (int)((long)(bucket + 1) * samples.Count / bucketCount);
-            selected.Add(start);
-            if (selected.Count < maximum)
-            {
-                selected.Add(Math.Max(start, endExclusive - 1));
-            }
+            AddIfRoom(selected, start, maximum);
+            AddIfRoom(selected, Math.Max(start, endExclusive - 1), maximum);
         }
         // Odd/small caller-supplied maxima can leave one slot. Fill it with a
         // uniformly located sample without disturbing the bucket edges.
@@ -443,6 +440,14 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
             selected.Add(samples.Count - 1);
         }
         return selected.Take(maximum).Select(index => samples[index]).ToArray();
+    }
+
+    private static void AddIfRoom(SortedSet<int> selected, int index, int maximum)
+    {
+        if (selected.Count < maximum)
+        {
+            selected.Add(index);
+        }
     }
 
     private static bool TryGetCompleteModelVector(
