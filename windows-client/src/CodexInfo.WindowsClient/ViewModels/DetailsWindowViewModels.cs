@@ -8,6 +8,7 @@ using System.Runtime.CompilerServices;
 using System.Windows.Input;
 using Avalonia.Threading;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Graphing;
 using CodexInfo.WindowsClient.Localization;
 
@@ -1701,6 +1702,10 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public ReadOnlyObservableCollection<ThreadItemViewModel> Threads { get; }
 
+    public IReadOnlyList<ThreadTreeConnection> TreeConnections { get; private set; } = Array.Empty<ThreadTreeConnection>();
+
+    public int TreeSurfaceHeight => Math.Max(96, threads.Count * 96);
+
     public UiText Texts => LocalizationService.Current;
 
     public ReadOnlyObservableCollection<ApiAccount> Accounts => main.Accounts;
@@ -1805,9 +1810,12 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             {
                 resourceThreads = Array.Empty<ApiThreadDetails>();
                 threads.Clear();
+                TreeConnections = Array.Empty<ThreadTreeConnection>();
                 hasLoadError = false;
                 Notify(nameof(HasThreads));
                 Notify(nameof(HasNoThreads));
+                Notify(nameof(TreeConnections));
+                Notify(nameof(TreeSurfaceHeight));
                 Notify(nameof(HasLoadError));
                 if (resourceClient is null)
                 {
@@ -1931,6 +1939,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
     private void Rebuild()
     {
         threads.Clear();
+        var connections = new List<ThreadTreeConnection>();
         var source = main.IsSelectedAccountHistorical
             ? Array.Empty<ApiThreadDetails>()
             : resourceClient is not null
@@ -1940,10 +1949,18 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             var ordered = ParentFirst(source);
             var byId = source.ToDictionary(thread => thread.Id, StringComparer.Ordinal);
+            var rowById = ordered
+                .Select((thread, row) => (thread.Id, row))
+                .ToDictionary(item => item.Id, item => item.row, StringComparer.Ordinal);
             for (var index = 0; index < ordered.Count; index++)
             {
                 var thread = ordered[index];
                 var parentExists = thread.ParentId is { } parentId && byId.ContainsKey(parentId);
+                if (parentExists && thread.ParentId is { } connectionParentId && rowById.TryGetValue(connectionParentId, out var parentRow))
+                {
+                    var parentDepth = ordered[parentRow].Depth ?? CalculateDepth(ordered[parentRow], byId);
+                    connections.Add(new ThreadTreeConnection(parentRow, index, Math.Min(parentDepth, 4)));
+                }
                 var hasChildren = ordered.Any(candidate => candidate.ParentId == thread.Id);
                 var hasNextSibling = ordered.Skip(index + 1).Any(candidate => candidate.ParentId == thread.ParentId);
                 var depth = thread.Depth ?? CalculateDepth(thread, byId);
@@ -1954,7 +1971,9 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
                     ancestorGuides[guide - 1] = currentChain.Count >= guide && ordered.Skip(index + 1).Any(candidate =>
                     {
                         var candidateChain = AncestorChain(candidate, byId);
-                        return candidateChain.Count >= guide && candidateChain[guide - 1] == currentChain[guide - 1];
+                        return candidateChain.Count >= guide &&
+                            candidateChain.Count <= currentChain.Count &&
+                            candidateChain[guide - 1] == currentChain[guide - 1];
                     });
                 }
                 var parentTitle = thread.ParentId is { } id && byId.TryGetValue(id, out var parent)
@@ -1965,8 +1984,12 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             }
         }
 
+        TreeConnections = connections.AsReadOnly();
+
         Notify(nameof(HasThreads));
         Notify(nameof(HasNoThreads));
+        Notify(nameof(TreeConnections));
+        Notify(nameof(TreeSurfaceHeight));
     }
 
     private static int CalculateDepth(ApiThreadDetails thread, IReadOnlyDictionary<string, ApiThreadDetails> byId)
@@ -2036,6 +2059,7 @@ public sealed class ThreadItemViewModel
             ? owner.ParentText(thread)
             : $"{owner.ParentText(thread)} / {parentTitle}";
         ModelText = owner.ModelText(thread);
+        ModelAccentHex = FormatModelAccent(ModelText);
         ContextText = owner.ContextText(thread);
         ContextUsageText = FormatContextUsage(owner.Texts, thread);
         TokenText = owner.TokenText(thread);
@@ -2053,6 +2077,7 @@ public sealed class ThreadItemViewModel
         AncestorGuide2 = ancestorGuide2;
         AncestorGuide3 = ancestorGuide3;
         ParentTitle = parentTitle;
+        IsRootThread = !connectedToParent && !thread.IsOrphan;
     }
 
     public string Id { get; }
@@ -2061,6 +2086,7 @@ public sealed class ThreadItemViewModel
     public string RoleStatusText { get; }
     public string ParentText { get; }
     public string ModelText { get; }
+    public string ModelAccentHex { get; }
     public string ContextText { get; }
     public string ContextUsageText { get; }
     public bool HasContextUsage => ContextUsageText.Length > 0;
@@ -2082,24 +2108,52 @@ public sealed class ThreadItemViewModel
     public bool AncestorGuide2 { get; }
     public bool AncestorGuide3 { get; }
     public string ParentTitle { get; }
+    public bool IsRootThread { get; }
 
     internal static string FormatRoleStatus(UiText texts, ApiThreadDetails thread)
     {
         var role = thread.IsSubAgent ? texts.SubThread : texts.MainThread;
-        var active = texts.LanguageCode switch
+        return $"{role} · {FormatActiveStatus(texts)}";
+    }
+
+    internal static string FormatActiveStatus(UiText texts) => texts.LanguageCode switch
+    {
+        "ja" => "実行中",
+        "zh-Hans" => "活跃",
+        "ko" => "활성",
+        "es" => "Activo",
+        "fr" => "Actif",
+        "de" => "Aktiv",
+        "pt" => "Ativo",
+        "it" => "Attivo",
+        "ru" => "Активен",
+        _ => "Active",
+    };
+
+    internal static string FormatModelAccent(string model)
+    {
+        var normalized = model.ToUpperInvariant();
+        if (normalized.Contains("ASTRA", StringComparison.Ordinal))
         {
-            "ja" => "実行中",
-            "zh-Hans" => "活跃",
-            "ko" => "활성",
-            "es" => "Activo",
-            "fr" => "Actif",
-            "de" => "Aktiv",
-            "pt" => "Ativo",
-            "it" => "Attivo",
-            "ru" => "Активен",
-            _ => "Active",
-        };
-        return $"{role} · {active}";
+            return "#E86E9F";
+        }
+
+        if (normalized.Contains("LUNA", StringComparison.Ordinal))
+        {
+            return "#F1B35A";
+        }
+
+        if (normalized.Contains("TERRA", StringComparison.Ordinal))
+        {
+            return "#71D39A";
+        }
+
+        if (normalized.Contains("SOL", StringComparison.Ordinal))
+        {
+            return "#B79BFF";
+        }
+
+        return "#A8B7CA";
     }
 
     internal static string FormatContextUsage(UiText texts, ApiThreadDetails thread)

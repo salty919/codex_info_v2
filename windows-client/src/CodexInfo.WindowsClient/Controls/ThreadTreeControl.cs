@@ -13,83 +13,89 @@ internal sealed record ThreadTreeGeometry(
     IReadOnlyList<ThreadTreeSegment> Segments,
     Point? JunctionDot);
 
-/// <summary>Draws the parent/child rails in the dedicated thread gutter.</summary>
+/// <summary>
+/// Draws the parent-to-child connections for the complete, scrolled thread list.
+/// Adjacent rows use a short downwards connection. Only a child that is separated
+/// from its parent by another subtree gets a left-side routed connection.
+/// </summary>
 public sealed class ThreadTreeControl : Control
 {
-    public static readonly StyledProperty<int> TreeDepthProperty = AvaloniaProperty.Register<ThreadTreeControl, int>(nameof(TreeDepth));
-    public static readonly StyledProperty<bool> ConnectedToParentProperty = AvaloniaProperty.Register<ThreadTreeControl, bool>(nameof(ConnectedToParent));
-    public static readonly StyledProperty<bool> HasChildrenProperty = AvaloniaProperty.Register<ThreadTreeControl, bool>(nameof(HasChildren));
-    public static readonly StyledProperty<bool> HasNextSiblingProperty = AvaloniaProperty.Register<ThreadTreeControl, bool>(nameof(HasNextSibling));
-    public static readonly StyledProperty<bool> AncestorGuide1Property = AvaloniaProperty.Register<ThreadTreeControl, bool>(nameof(AncestorGuide1));
-    public static readonly StyledProperty<bool> AncestorGuide2Property = AvaloniaProperty.Register<ThreadTreeControl, bool>(nameof(AncestorGuide2));
-    public static readonly StyledProperty<bool> AncestorGuide3Property = AvaloniaProperty.Register<ThreadTreeControl, bool>(nameof(AncestorGuide3));
+    public static readonly StyledProperty<IReadOnlyList<ThreadTreeConnection>> ConnectionsProperty =
+        AvaloniaProperty.Register<ThreadTreeControl, IReadOnlyList<ThreadTreeConnection>>(
+            nameof(Connections), Array.Empty<ThreadTreeConnection>());
 
-    public int TreeDepth { get => GetValue(TreeDepthProperty); set => SetValue(TreeDepthProperty, value); }
-    public bool ConnectedToParent { get => GetValue(ConnectedToParentProperty); set => SetValue(ConnectedToParentProperty, value); }
-    public bool HasChildren { get => GetValue(HasChildrenProperty); set => SetValue(HasChildrenProperty, value); }
-    public bool HasNextSibling { get => GetValue(HasNextSiblingProperty); set => SetValue(HasNextSiblingProperty, value); }
-    public bool AncestorGuide1 { get => GetValue(AncestorGuide1Property); set => SetValue(AncestorGuide1Property, value); }
-    public bool AncestorGuide2 { get => GetValue(AncestorGuide2Property); set => SetValue(AncestorGuide2Property, value); }
-    public bool AncestorGuide3 { get => GetValue(AncestorGuide3Property); set => SetValue(AncestorGuide3Property, value); }
+    public IReadOnlyList<ThreadTreeConnection> Connections
+    {
+        get => GetValue(ConnectionsProperty);
+        set => SetValue(ConnectionsProperty, value);
+    }
 
     public override void Render(DrawingContext context)
     {
         base.Render(context);
-        var rail = new Pen(new SolidColorBrush(Color.Parse("#D5A43A")), 2);
-        var geometry = BuildGeometry(
-            Bounds.Width,
-            Bounds.Height,
-            TreeDepth,
-            ConnectedToParent,
-            HasChildren,
-            HasNextSibling,
-            AncestorGuide1,
-            AncestorGuide2,
-            AncestorGuide3);
+        var rail = new Pen(new SolidColorBrush(Color.Parse("#52718D")), 1.5);
+        var geometry = BuildGeometry(Bounds.Width, Bounds.Height, Connections);
         foreach (var segment in geometry.Segments)
         {
             context.DrawLine(rail, segment.Start, segment.End);
-        }
-        if (geometry.JunctionDot is { } junctionDot)
-        {
-            context.DrawEllipse(rail.Brush, null, junctionDot, 3, 3);
         }
     }
 
     internal static ThreadTreeGeometry BuildGeometry(
         double width,
         double height,
-        int treeDepth,
-        bool connectedToParent,
-        bool hasChildren,
-        bool hasNextSibling,
-        bool ancestorGuide1,
-        bool ancestorGuide2,
-        bool ancestorGuide3)
+        IReadOnlyList<ThreadTreeConnection> connections)
     {
-        const double baseX = 8;
-        const double step = 12;
-        var junctionY = height / 2;
-        var junctionEndX = Math.Max(baseX + step, width - 5);
-        var depth = Math.Clamp(treeDepth, 0, 3);
-        var segments = new List<ThreadTreeSegment>(6);
-        if (ancestorGuide1) segments.Add(new(new Point(baseX, 0), new Point(baseX, height)));
-        if (ancestorGuide2) segments.Add(new(new Point(baseX + step, 0), new Point(baseX + step, height)));
-        if (ancestorGuide3) segments.Add(new(new Point(baseX + step * 2, 0), new Point(baseX + step * 2, height)));
-        Point? junctionDot = null;
-        if (connectedToParent)
+        const double rowHeight = 96;
+        const double cardLeft = 80;
+        const double cardAnchorX = cardLeft + 16;
+        const double cardTopInset = 6;
+        const double cardBottomInset = 90;
+        const double routedInset = 24;
+        const double routedStep = 12;
+        const double arrowHeight = 5;
+        const double arrowWidth = 4;
+        var cardX = Math.Min(cardAnchorX, Math.Max(0, width - 1));
+        var segments = new List<ThreadTreeSegment>(connections.Count * 5);
+        var seen = new HashSet<ThreadTreeSegment>();
+
+        void Add(Point start, Point end)
         {
-            var x = baseX + Math.Max(0, depth - 1) * step;
-            segments.Add(new(new Point(x, 0), new Point(x, hasNextSibling ? height : junctionY)));
-            segments.Add(new(new Point(x, junctionY), new Point(junctionEndX, junctionY)));
-            junctionDot = new Point(junctionEndX, junctionY);
-        }
-        if (hasChildren)
-        {
-            var x = baseX + depth * step;
-            segments.Add(new(new Point(x, junctionY), new Point(x, height)));
+            if (start != end && seen.Add(new ThreadTreeSegment(start, end)))
+            {
+                segments.Add(new ThreadTreeSegment(start, end));
+            }
         }
 
-        return new ThreadTreeGeometry(segments, junctionDot);
+        foreach (var connection in connections)
+        {
+            if (connection.ParentRow < 0 || connection.ChildRow <= connection.ParentRow)
+            {
+                continue;
+            }
+
+            var parentBottom = connection.ParentRow * rowHeight + cardBottomInset;
+            var childTop = connection.ChildRow * rowHeight + cardTopInset;
+            if (connection.ChildRow == connection.ParentRow + 1)
+            {
+                Add(new Point(cardX, parentBottom), new Point(cardX, childTop));
+            }
+            else
+            {
+                var routeX = Math.Max(8, cardLeft - routedInset - Math.Clamp(connection.ParentDepth, 0, 4) * routedStep);
+                Add(new Point(cardX, parentBottom), new Point(routeX, parentBottom));
+                Add(new Point(routeX, parentBottom), new Point(routeX, childTop));
+                Add(new Point(routeX, childTop), new Point(cardX, childTop));
+            }
+
+            // The arrow tip meets the child's top border. The card is rendered
+            // after this control, so the tip remains a clean edge connection.
+            Add(new Point(cardX, childTop), new Point(cardX - arrowWidth, childTop - arrowHeight));
+            Add(new Point(cardX, childTop), new Point(cardX + arrowWidth, childTop - arrowHeight));
+        }
+
+        return new ThreadTreeGeometry(segments, null);
     }
 }
+
+public readonly record struct ThreadTreeConnection(int ParentRow, int ChildRow, int ParentDepth);

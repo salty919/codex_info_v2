@@ -9,6 +9,7 @@ using System.Globalization;
 using System.Reflection;
 using System.Xml.Linq;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Localization;
 using CodexInfo.WindowsClient.ViewModels;
 using Xunit;
@@ -471,12 +472,12 @@ public sealed class DetailsPresentationCoverageTests
             .Single(element => element.Name.LocalName == "Style" && element.Attribute("Selector")?.Value == "Border.thread-card");
         var cardHeightSetter = cardStyle.Descendants()
             .Single(element => element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Height");
-        Assert.Equal("92", cardHeightSetter.Attribute("Value")?.Value);
+        Assert.Equal("84", cardHeightSetter.Attribute("Value")?.Value);
 
-        const int cardHeight = 92;
-        const int cardGap = 4;
+        const int cardHeight = 84;
+        const int cardTopAndBottom = 12;
         const int visibleCardCount = 4;
-        const int viewportHeight = cardHeight * visibleCardCount + cardGap * visibleCardCount;
+        const int viewportHeight = (cardHeight + cardTopAndBottom) * visibleCardCount;
 
         var listScrollViewer = Assert.Single(document.Descendants(), element => element.Name.LocalName == "ScrollViewer");
         Assert.Equal("2", listScrollViewer.Attribute("Grid.Row")?.Value);
@@ -487,7 +488,7 @@ public sealed class DetailsPresentationCoverageTests
 
         var card = document.Descendants()
             .Single(element => element.Name.LocalName == "Border" && element.Attribute("Classes")?.Value == "thread-card");
-        Assert.Equal("72,0,0,4", card.Attribute("Margin")?.Value);
+        Assert.Equal("80,6,16,6", card.Attribute("Margin")?.Value);
     }
 
     [Fact]
@@ -528,6 +529,56 @@ public sealed class DetailsPresentationCoverageTests
         {
             LocalizationService.SetLanguage(previousLanguage);
         }
+    }
+
+    [Fact]
+    public async Task ThreadsWindow_BuildsConnectionsForRootsNestedChildrenAndDistantSiblings()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var source = new[]
+        {
+            new ApiThreadDetails("root", "Root", null, "model-root", "ROOT", 100, 10, 100, now - 300, now - 60, false, 0, false),
+            new ApiThreadDetails("child", "Child", "root", "model-child", "CHILD", 80, 8, 100, now - 240, now - 50, true, 1, false),
+            new ApiThreadDetails("grandchild", "Grandchild", "child", "model-grandchild", "GRAND", 60, 6, 100, now - 180, now - 40, true, 2, false),
+            new ApiThreadDetails("sibling", "Sibling", "root", "model-sibling", "SIBLING", 40, 4, 100, now - 120, now - 30, true, 1, false),
+        };
+        using var main = await StartMainAsync(CreateDetails(Array.Empty<ApiHistoryPeriod>(), source));
+        using var threads = new ThreadsWindowViewModel(main);
+
+        Assert.Equal(
+            [
+                new ThreadTreeConnection(0, 1, 0),
+                new ThreadTreeConnection(1, 2, 1),
+                new ThreadTreeConnection(0, 3, 0),
+            ],
+            threads.TreeConnections);
+        Assert.True(threads.TreeSurfaceHeight >= 4 * 96);
+        Assert.True(threads.Threads[0].IsRootThread);
+        Assert.False(threads.Threads[1].IsRootThread);
+        Assert.False(threads.Threads[2].IsRootThread);
+        Assert.False(threads.Threads[3].IsRootThread);
+    }
+
+    [Fact]
+    public async Task ThreadsWindow_UsesDistinctModelAccentsAndKeepsUnknownNeutral()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var source = new[]
+        {
+            new ApiThreadDetails("sol", "SOL task", null, "gpt-sol", "SOL", null, null, null, now, null, false, 0, false),
+            new ApiThreadDetails("terra", "TERRA task", null, "gpt-terra", "TERRA", null, null, null, now, null, false, 0, false),
+            new ApiThreadDetails("luna", "LUNA task", null, "gpt-luna", "LUNA", null, null, null, now, null, false, 0, false),
+            new ApiThreadDetails("astra", "ASTRA task", null, "gpt-astra", "ASTRA", null, null, null, now, null, false, 0, false),
+            new ApiThreadDetails("unknown", "Unknown task", null, "gpt-other", "OTHER", null, null, null, now, null, false, 0, false),
+        };
+        using var main = await StartMainAsync(CreateDetails(Array.Empty<ApiHistoryPeriod>(), source));
+        using var threads = new ThreadsWindowViewModel(main);
+
+        Assert.Equal("#B79BFF", Assert.Single(threads.Threads, item => item.Id == "sol").ModelAccentHex);
+        Assert.Equal("#71D39A", Assert.Single(threads.Threads, item => item.Id == "terra").ModelAccentHex);
+        Assert.Equal("#F1B35A", Assert.Single(threads.Threads, item => item.Id == "luna").ModelAccentHex);
+        Assert.Equal("#E86E9F", Assert.Single(threads.Threads, item => item.Id == "astra").ModelAccentHex);
+        Assert.Equal("#A8B7CA", Assert.Single(threads.Threads, item => item.Id == "unknown").ModelAccentHex);
     }
 
     [Fact]

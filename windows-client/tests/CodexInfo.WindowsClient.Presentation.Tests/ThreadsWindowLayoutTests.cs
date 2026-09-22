@@ -24,17 +24,16 @@ public sealed class ThreadsWindowLayoutTests
         const int expectedWindowHeight = 480;
         const int expectedRowHeight = 96;
         const int expectedVisibleRows = 4;
-        const int expectedContentWidth = 860;
-        const int expectedGutterWidth = 72;
-        const int expectedColumnGap = 10;
-        const int expectedRoleWidth = 110;
+        const int expectedListWidth = 860;
+        const int expectedCardLeft = 80;
+        const int expectedCardRight = 16;
+        const int expectedCardWidth = expectedListWidth - expectedCardLeft - expectedCardRight;
+        const int expectedColumnGap = 12;
+        const int expectedTitleWidth = 350;
         const int expectedModelWidth = 190;
-        const int expectedTimeWidth = 180;
-        const int expectedRightInset = 36;
-        var expectedTitleWidth = expectedContentWidth - expectedGutterWidth -
-            (3 * expectedColumnGap) - expectedRoleWidth - expectedModelWidth -
-            expectedTimeWidth - expectedRightInset;
-        Assert.Equal(242, expectedTitleWidth);
+        const int expectedTimeWidth = 198;
+        Assert.Equal(expectedCardWidth - 2,
+            expectedTitleWidth + expectedModelWidth + expectedTimeWidth + (2 * expectedColumnGap));
 
         var document = XDocument.Parse(LoadRepositoryFile(
             "windows-client",
@@ -61,42 +60,47 @@ public sealed class ThreadsWindowLayoutTests
         var cardHeight = int.Parse(StyleSetter(cardStyle, "Height"));
         var card = Assert.Single(document.Descendants(Avalonia + "Border"),
             element => element.Attribute("Classes")?.Value == "thread-card");
-        var cardGap = int.Parse(Assert.IsType<XAttribute>(card.Attribute("Margin")).Value.Split(',')[3]);
-        Assert.Equal(expectedRowHeight, cardHeight + cardGap);
-        Assert.Equal(expectedVisibleRows, viewportHeight / (cardHeight + cardGap));
-        Assert.Equal("0", StyleSetter(cardStyle, "Padding"));
-        Assert.Equal($"{expectedGutterWidth},0,0,4", card.Attribute("Margin")?.Value);
-
-        var row = Assert.Single(card.Descendants(Avalonia + "Grid"),
-            element => element.Attribute("ColumnDefinitions") is not null);
-        var laneWidths = Assert.IsType<XAttribute>(row.Attribute("ColumnDefinitions")).Value
+        var cardMargins = Assert.IsType<XAttribute>(card.Attribute("Margin")).Value
             .Split(',')
             .Select(int.Parse)
             .ToArray();
-        Assert.Equal(
-            [expectedRoleWidth, expectedTitleWidth, expectedModelWidth, expectedTimeWidth],
-            laneWidths);
+        Assert.Equal([expectedCardLeft, 6, expectedCardRight, 6], cardMargins);
+        Assert.Equal(expectedRowHeight, cardHeight + cardMargins[1] + cardMargins[3]);
+        Assert.Equal(expectedVisibleRows, viewportHeight / (cardHeight + cardMargins[1] + cardMargins[3]));
+        Assert.Equal("14,8", StyleSetter(cardStyle, "Padding"));
+
+        var row = Assert.Single(card.Elements(Avalonia + "Grid"));
+        Assert.Equal("*,180,208", row.Attribute("ColumnDefinitions")?.Value);
         Assert.Equal("0", row.Attribute("Margin")?.Value);
         Assert.Equal(expectedColumnGap.ToString(), row.Attribute("ColumnSpacing")?.Value);
         var treeControl = Assert.Single(document.Descendants(
             XName.Get("ThreadTreeControl", "using:CodexInfo.WindowsClient.Controls")));
-        Assert.Equal("64", treeControl.Attribute("Width")?.Value);
+        Assert.Equal(expectedListWidth.ToString(), treeControl.Attribute("Width")?.Value);
+        Assert.Equal("Left", treeControl.Attribute("HorizontalAlignment")?.Value);
 
         var title = BoundText(row, "{Binding Title}");
-        Assert.Equal("1", title.Attribute("Grid.Column")?.Value);
+        Assert.Equal("0", title.Attribute("Grid.Column")?.Value);
         Assert.Equal("Wrap", title.Attribute("TextWrapping")?.Value);
         Assert.Equal("2", title.Attribute("MaxLines")?.Value);
-        Assert.Equal("CharacterEllipsis", title.Attribute("TextTrimming")?.Value);
+        Assert.Null(title.Attribute("TextTrimming"));
         Assert.Equal("{Binding Title}", title.Attribute("AutomationProperties.Name")?.Value);
         Assert.Equal("{Binding Title}", title.Attribute("AutomationProperties.HelpText")?.Value);
         Assert.Equal("{Binding Title}", title.Attribute("ToolTip.Tip")?.Value);
         Assert.Equal("{Binding Title}", card.Attribute("AutomationProperties.Name")?.Value);
 
-        var role = BoundText(row, "{Binding RoleStatusText}");
-        Assert.Equal("0", role.Attribute("Grid.Column")?.Value ?? "0");
+        Assert.Null(card.Elements().SingleOrDefault(element => element.Name.LocalName == "Border.RenderTransform"));
+        Assert.DoesNotContain(document.Descendants(Avalonia + "TextBlock"),
+            element => element.Attribute("Text")?.Value == "{Binding RoleStatusText}");
+        var rootMarker = Assert.Single(row.Descendants(Avalonia + "Border"),
+            element => element.Attribute("Classes")?.Value == "thread-root-marker");
+        Assert.Equal("{Binding IsRootThread}", rootMarker.Attribute("IsVisible")?.Value);
         var model = BoundText(row, "{Binding ModelText}");
+        Assert.Equal("{Binding ModelAccentHex}", model.Attribute("Foreground")?.Value);
+        var modelAccent = Assert.Single(row.Descendants(Avalonia + "Border"),
+            element => element.Attribute("Classes")?.Value == "model-accent");
+        Assert.Equal("{Binding ModelAccentHex}", modelAccent.Attribute("Background")?.Value);
         var context = BoundText(row, "{Binding ContextUsageText}");
-        Assert.Equal("2", model.Parent?.Attribute("Grid.Column")?.Value);
+        Assert.Equal("1", model.Parent?.Attribute("Grid.Column")?.Value);
         Assert.Same(model.Parent, context.Parent);
         Assert.Equal("{Binding HasContextUsage}", context.Attribute("IsVisible")?.Value);
         Assert.Equal("Wrap", context.Attribute("TextWrapping")?.Value);
@@ -105,7 +109,7 @@ public sealed class ThreadsWindowLayoutTests
         Assert.Equal("{Binding ContextUsageText}", context.Attribute("AutomationProperties.Name")?.Value);
         Assert.Equal("{Binding ContextUsageText}", context.Attribute("ToolTip.Tip")?.Value);
         var elapsed = BoundText(row, "{Binding ElapsedMinutesText}");
-        Assert.Equal("3", elapsed.Parent?.Attribute("Grid.Column")?.Value);
+        Assert.Equal("2", elapsed.Parent?.Attribute("Grid.Column")?.Value);
         Assert.Equal("{Binding HasElapsedMinutes}", elapsed.Attribute("IsVisible")?.Value);
         Assert.Equal("{Binding HasInstructionMinutes}",
             BoundText(row, "{Binding InstructionMinutesText}").Attribute("IsVisible")?.Value);
@@ -171,66 +175,57 @@ public sealed class ThreadsWindowLayoutTests
     }
 
     [Fact]
-    public void ThreadTreeRailGeometryConnectsRowsAndStopsAtTheFinalBranch()
+    public void ThreadTreeConnectionsUseShortArrowsAndRouteOnlyDistantChildren()
     {
-        const double rowHeight = 96;
-        const double treeGutterWidth = 64;
-        const double junctionRightInset = 5;
-        const double rootRailX = 8;
-        const double nestedRailX = 20;
-        const double junctionEndX = treeGutterWidth - junctionRightInset;
+        const double treeSurfaceWidth = 860;
+        const double cardLeft = 80;
+        const double cardAnchorX = cardLeft + 16;
+        var direct = ThreadTreeControl.BuildGeometry(
+            treeSurfaceWidth,
+            192,
+            [new ThreadTreeConnection(0, 1, 0)]);
+        Assert.Contains(direct.Segments, segment =>
+            segment.Start == new Point(cardAnchorX, 90) &&
+            segment.End == new Point(cardAnchorX, 102));
+        Assert.Contains(direct.Segments, segment =>
+            segment.Start == new Point(cardAnchorX, 102) &&
+            segment.End == new Point(cardAnchorX - 4, 97));
+        Assert.Contains(direct.Segments, segment =>
+            segment.Start == new Point(cardAnchorX, 102) &&
+            segment.End == new Point(cardAnchorX + 4, 97));
+        Assert.Null(direct.JunctionDot);
 
-        var parent = InvokeRailGeometry(rowHeight, 0, connectedToParent: false, hasChildren: true, hasNextSibling: false);
-        var parentDown = Assert.Single(parent.Segments, segment =>
-            segment.Start == new Point(rootRailX, rowHeight / 2) &&
-            segment.End == new Point(rootRailX, rowHeight));
+        var nested = ThreadTreeControl.BuildGeometry(
+            treeSurfaceWidth,
+            288,
+            [new ThreadTreeConnection(0, 1, 0), new ThreadTreeConnection(1, 2, 1)]);
+        Assert.Contains(nested.Segments, segment =>
+            segment.Start == new Point(cardAnchorX, 186) &&
+            segment.End == new Point(cardAnchorX, 198));
 
-        var onlyChild = InvokeRailGeometry(rowHeight, 1, connectedToParent: true, hasChildren: false, hasNextSibling: false);
-        var childUp = Assert.Single(onlyChild.Segments, segment =>
-            segment.Start == new Point(rootRailX, 0) &&
-            segment.End == new Point(rootRailX, rowHeight / 2));
-        Assert.Equal(parentDown.End.X, childUp.Start.X);
-        Assert.Equal(parentDown.End.Y, rowHeight + childUp.Start.Y);
-        Assert.Contains(onlyChild.Segments, segment =>
-            segment.Start == new Point(rootRailX, rowHeight / 2) &&
-            segment.End == new Point(junctionEndX, rowHeight / 2));
-        Assert.Equal(new Point(junctionEndX, rowHeight / 2), onlyChild.JunctionDot);
-        Assert.DoesNotContain(onlyChild.Segments, segment =>
-            segment.Start.X == rootRailX && segment.End == new Point(rootRailX, rowHeight));
-
-        var firstSibling = InvokeRailGeometry(rowHeight, 1, connectedToParent: true, hasChildren: false, hasNextSibling: true);
-        Assert.Contains(firstSibling.Segments, segment =>
-            segment.Start == new Point(rootRailX, 0) &&
-            segment.End == new Point(rootRailX, rowHeight));
-
-        var nestedParent = InvokeRailGeometry(rowHeight, 1, connectedToParent: true, hasChildren: true, hasNextSibling: false);
-        var nestedChild = InvokeRailGeometry(rowHeight, 2, connectedToParent: true, hasChildren: false, hasNextSibling: false);
-        var nestedParentDown = Assert.Single(nestedParent.Segments, segment =>
-            segment.Start == new Point(nestedRailX, rowHeight / 2) &&
-            segment.End == new Point(nestedRailX, rowHeight));
-        var nestedChildUp = Assert.Single(nestedChild.Segments, segment =>
-            segment.Start == new Point(nestedRailX, 0) &&
-            segment.End == new Point(nestedRailX, rowHeight / 2));
-        Assert.Equal(nestedParentDown.End.X, nestedChildUp.Start.X);
-        Assert.Equal(nestedParentDown.End.Y, rowHeight + nestedChildUp.Start.Y);
-
-        var ancestor = InvokeRailGeometry(
-            rowHeight,
-            2,
-            connectedToParent: true,
-            hasChildren: false,
-            hasNextSibling: false,
-            ancestorGuide1: true);
-        Assert.Contains(ancestor.Segments, segment =>
-            segment.Start == new Point(rootRailX, 0) &&
-            segment.End == new Point(rootRailX, rowHeight));
+        var distant = ThreadTreeControl.BuildGeometry(
+            treeSurfaceWidth,
+            384,
+            [new ThreadTreeConnection(0, 3, 0)]);
+        Assert.Contains(distant.Segments, segment =>
+            segment.Start == new Point(cardAnchorX, 90) &&
+            segment.End == new Point(56, 90));
+        Assert.Contains(distant.Segments, segment =>
+            segment.Start == new Point(56, 90) &&
+            segment.End == new Point(56, 294));
+        Assert.Contains(distant.Segments, segment =>
+            segment.Start == new Point(56, 294) &&
+            segment.End == new Point(cardAnchorX, 294));
+        Assert.DoesNotContain(distant.Segments, segment =>
+            segment.Start == new Point(cardAnchorX, 90) && segment.End == new Point(cardAnchorX, 294));
 
         var document = XDocument.Parse(LoadRepositoryFile(
             "windows-client", "src", "CodexInfo.WindowsClient", "ThreadsWindow.axaml"));
         var treeHost = Assert.Single(document.Descendants(
             XName.Get("ThreadTreeControl", "using:CodexInfo.WindowsClient.Controls")));
-        Assert.Equal(treeGutterWidth.ToString(), treeHost.Attribute("Width")?.Value);
-        Assert.Equal(rowHeight.ToString(), treeHost.Attribute("Height")?.Value);
+        Assert.Equal(treeSurfaceWidth.ToString(), treeHost.Attribute("Width")?.Value);
+        Assert.Equal("{Binding TreeSurfaceHeight}", treeHost.Attribute("Height")?.Value);
+        Assert.Equal("{Binding TreeConnections}", treeHost.Attribute("Connections")?.Value);
 
         var linuxThreads = LoadRepositoryFile("ui", "components.slint")
             .Split("export component ThreadsWindow inherits Window {")[1]
@@ -282,50 +277,6 @@ public sealed class ThreadsWindowLayoutTests
         _ => "Active",
     };
 
-    private static RailGeometryFixture InvokeRailGeometry(
-        double height,
-        int depth,
-        bool connectedToParent,
-        bool hasChildren,
-        bool hasNextSibling,
-        bool ancestorGuide1 = false,
-        bool ancestorGuide2 = false,
-        bool ancestorGuide3 = false)
-    {
-        var factory = typeof(ThreadTreeControl).GetMethod(
-            "BuildGeometry",
-            BindingFlags.Static | BindingFlags.NonPublic);
-        Assert.NotNull(factory);
-        var value = factory!.Invoke(null,
-        [
-            64d,
-            height,
-            depth,
-            connectedToParent,
-            hasChildren,
-            hasNextSibling,
-            ancestorGuide1,
-            ancestorGuide2,
-            ancestorGuide3,
-        ]);
-        Assert.NotNull(value);
-        var type = value.GetType();
-        var segments = Assert.IsAssignableFrom<IEnumerable>(
-                Assert.IsAssignableFrom<PropertyInfo>(type.GetProperty("Segments")).GetValue(value))
-            .Cast<object>()
-            .Select(segment =>
-            {
-                var segmentType = segment.GetType();
-                var start = Assert.IsType<Point>(Assert.IsAssignableFrom<PropertyInfo>(segmentType.GetProperty("Start")).GetValue(segment));
-                var end = Assert.IsType<Point>(Assert.IsAssignableFrom<PropertyInfo>(segmentType.GetProperty("End")).GetValue(segment));
-                return new RailSegmentFixture(start, end);
-            })
-            .ToArray();
-        var junctionValue = Assert.IsAssignableFrom<PropertyInfo>(type.GetProperty("JunctionDot")).GetValue(value);
-        var junction = junctionValue is Point point ? point : (Point?)null;
-        return new RailGeometryFixture(segments, junction);
-    }
-
     private static string LoadRepositoryFile(params string[] segments)
     {
         for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
@@ -340,7 +291,4 @@ public sealed class ThreadsWindowLayoutTests
         throw new FileNotFoundException($"Could not locate repository file: {Path.Combine(segments)}");
     }
 
-    private sealed record RailGeometryFixture(IReadOnlyList<RailSegmentFixture> Segments, Point? JunctionDot);
-
-    private sealed record RailSegmentFixture(Point Start, Point End);
 }
