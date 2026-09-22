@@ -911,6 +911,54 @@ mod tests {
     }
 
     #[test]
+    fn inherited_root_lock_remains_busy_after_parent_drop_until_child_exit() {
+        let fixture = Fixture::new();
+        create_private_directory(&fixture.cache).unwrap();
+        let root_lock = acquire_root_lock(&fixture.cache).unwrap();
+        let inherited = root_lock.try_clone().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::from(inherited))
+            .spawn()
+            .unwrap();
+
+        drop(root_lock);
+        let blocked = acquire_root_lock(&fixture.cache)
+            .err()
+            .map(GenerationError::kind);
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        assert_eq!(blocked, Some(GenerationErrorKind::Busy));
+        let recovered = acquire_root_lock(&fixture.cache).unwrap();
+        release_root_lock(&recovered).unwrap();
+    }
+
+    #[test]
+    fn finish_root_lock_unlocks_while_child_lives_and_preserves_operation_error() {
+        let fixture = Fixture::new();
+        create_private_directory(&fixture.cache).unwrap();
+        let held_lock = acquire_root_lock(&fixture.cache).unwrap();
+        let inherited = held_lock.try_clone().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::from(inherited))
+            .spawn()
+            .unwrap();
+        let operation_error = GenerationError::new(GenerationErrorKind::Database);
+
+        let finished: Result<(), GenerationError> =
+            finish_root_lock(held_lock, Err(operation_error));
+        let reacquired = acquire_root_lock(&fixture.cache);
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        assert_eq!(finished.unwrap_err(), operation_error);
+        let reacquired = reacquired.unwrap();
+        release_root_lock(&reacquired).unwrap();
+    }
+
+    #[test]
     fn prepare_and_cleanup_both_finish_the_root_lock_explicitly() {
         let source = include_str!("app_server_sqlite.rs");
         let invocation = concat!("finish_root_", "lock(root_lock, ");
