@@ -3170,9 +3170,12 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
 
         linux_output = root / "bundle"
         linux_output.mkdir()
-        subprocess.run(
-            [
-                "bash",
+        bash = Path("/usr/bin/bash").resolve(strict=True)
+        if not bash.is_file():
+            raise AssertionError(f"validated bash executable is not a file: {bash}")
+        _command(
+            (
+                str(bash),
                 str(ROOT / "scripts" / "build_linux_bundle.sh"),
                 "--ui-binary",
                 str(Path("/usr/bin/true").resolve()),
@@ -3190,11 +3193,8 @@ def _release_publish_tests(windows_workflow: str, release_workflow: str) -> int:
                 "1",
                 "--output-dir",
                 str(linux_output),
-            ],
+            ),
             cwd=ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
         )
 
         def copy_linux_assets(candidate: Path) -> tuple[Path, ...]:

@@ -549,17 +549,17 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public string StatusTitle => presentationState switch
     {
-            ClientPresentationState.Connecting => Texts.Connecting,
-            ClientPresentationState.Ready => Texts.Ready,
-            ClientPresentationState.QuotaDanger => Texts.QuotaDanger,
-            ClientPresentationState.QuotaWarning => Texts.QuotaWarning,
-            ClientPresentationState.ResetWarning => Texts.ResetWarning,
-            ClientPresentationState.Initializing => Texts.Initializing,
-            ClientPresentationState.AuthRequired => Texts.AuthRequired,
-            ClientPresentationState.ApiError => Texts.ApiError,
-            ClientPresentationState.TransportError => Texts.TransportError,
-            ClientPresentationState.ResponseError => Texts.Unavailable,
-            _ => Texts.Connecting,
+        ClientPresentationState.Connecting => Texts.Connecting,
+        ClientPresentationState.Ready => Texts.Ready,
+        ClientPresentationState.QuotaDanger => Texts.QuotaDanger,
+        ClientPresentationState.QuotaWarning => Texts.QuotaWarning,
+        ClientPresentationState.ResetWarning => Texts.ResetWarning,
+        ClientPresentationState.Initializing => Texts.Initializing,
+        ClientPresentationState.AuthRequired => Texts.AuthRequired,
+        ClientPresentationState.ApiError => Texts.ApiError,
+        ClientPresentationState.TransportError => Texts.TransportError,
+        ClientPresentationState.ResponseError => Texts.Unavailable,
+        _ => Texts.Connecting,
     };
 
     public string StatusDetail
@@ -657,7 +657,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged, IDisposable
 
             if (selectedAccount?.Id == next.Id)
             {
-            var labelChanged = selectedAccount?.MainDisplayLabel != next.MainDisplayLabel;
+                var labelChanged = selectedAccount?.MainDisplayLabel != next.MainDisplayLabel;
                 selectedAccount = next;
                 if (labelChanged)
                 {
