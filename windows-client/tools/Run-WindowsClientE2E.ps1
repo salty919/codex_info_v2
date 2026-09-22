@@ -3340,9 +3340,6 @@ try {
         }
 
         $flattenedFixtureRows = $threadTexts -join "`n"
-        Assert-E2E ([regex]::IsMatch($flattenedFixtureRows, '(?m)^Sub\s+.\s+Active$')) `
-            'Child role and active state are missing.'
-
         foreach ($contextCase in @(
                 @{ Id = 'e2e-root'; Percent = 'Context 5%'; Usage = '800 / 16,000 Tokens' },
                 @{ Id = 'e2e-child'; Percent = 'Context 2.5%'; Usage = '400 / 16,000 Tokens' })) {
@@ -3358,6 +3355,7 @@ try {
         Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Instruction [0-9][0-9,]* min$').Count -eq 2) `
             'Root/child instruction values must use minute text and the orphan value must be hidden.'
         foreach ($forbidden in @(
+                @{ Pattern = '(?m)^(?:Main|Sub)\s+.\s+Active$'; Label = 'role/active label' },
                 @{ Pattern = '\bDepth\s+[0-9]+\b'; Label = 'Depth <n>' },
                 @{ Pattern = '\bD[0-9]+\b'; Label = 'Dn' },
                 @{ Pattern = 'Parent:'; Label = 'Parent:' },
