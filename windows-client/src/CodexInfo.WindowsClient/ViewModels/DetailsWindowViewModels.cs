@@ -1961,26 +1961,11 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
                     var parentDepth = ordered[parentRow].Depth ?? CalculateDepth(ordered[parentRow], byId);
                     connections.Add(new ThreadTreeConnection(parentRow, index, Math.Min(parentDepth, 4)));
                 }
-                var hasChildren = ordered.Any(candidate => candidate.ParentId == thread.Id);
-                var hasNextSibling = ordered.Skip(index + 1).Any(candidate => candidate.ParentId == thread.ParentId);
                 var depth = thread.Depth ?? CalculateDepth(thread, byId);
-                var currentChain = AncestorChain(thread, byId);
-                var ancestorGuides = new bool[3];
-                for (var guide = 1; guide <= 3; guide++)
-                {
-                    ancestorGuides[guide - 1] = currentChain.Count >= guide && ordered.Skip(index + 1).Any(candidate =>
-                    {
-                        var candidateChain = AncestorChain(candidate, byId);
-                        return candidateChain.Count >= guide &&
-                            candidateChain.Count <= currentChain.Count &&
-                            candidateChain[guide - 1] == currentChain[guide - 1];
-                    });
-                }
                 var parentTitle = thread.ParentId is { } id && byId.TryGetValue(id, out var parent)
                     ? parent.Title
                     : string.Empty;
-                threads.Add(new ThreadItemViewModel(this, thread, Math.Min(depth, 3), parentExists && !thread.IsOrphan,
-                    hasChildren, hasNextSibling, ancestorGuides[0], ancestorGuides[1], ancestorGuides[2], parentTitle));
+                threads.Add(new ThreadItemViewModel(this, thread, Math.Min(depth, 3), parentExists && !thread.IsOrphan, parentTitle));
             }
         }
 
@@ -2003,20 +1988,6 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             current = parent;
         }
         return depth;
-    }
-
-    private static IReadOnlyList<string> AncestorChain(ApiThreadDetails thread, IReadOnlyDictionary<string, ApiThreadDetails> byId)
-    {
-        var reverse = new List<string> { thread.Id };
-        var current = thread;
-        var seen = new HashSet<string>(StringComparer.Ordinal) { thread.Id };
-        while (current.ParentId is { } parentId && byId.TryGetValue(parentId, out var parent) && seen.Add(parentId))
-        {
-            reverse.Add(parent.Id);
-            current = parent;
-        }
-        reverse.Reverse();
-        return reverse;
     }
 
     private static IReadOnlyList<ApiThreadDetails> ParentFirst(IReadOnlyList<ApiThreadDetails> source)
@@ -2047,8 +2018,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 public sealed class ThreadItemViewModel
 {
     public ThreadItemViewModel(ThreadsWindowViewModel owner, ApiThreadDetails thread, int treeDepth,
-        bool connectedToParent, bool hasChildren, bool hasNextSibling,
-        bool ancestorGuide1, bool ancestorGuide2, bool ancestorGuide3, string parentTitle)
+        bool connectedToParent, string parentTitle)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         Id = thread.Id;
@@ -2071,11 +2041,6 @@ public sealed class ThreadItemViewModel
         InstructionMinutesText = FormatMinuteAge(owner.Texts, thread.LastUserMessageAt, owner.Texts.Instruction, now);
         TreeDepth = treeDepth;
         ConnectedToParent = connectedToParent;
-        HasChildren = hasChildren;
-        HasNextSibling = hasNextSibling;
-        AncestorGuide1 = ancestorGuide1;
-        AncestorGuide2 = ancestorGuide2;
-        AncestorGuide3 = ancestorGuide3;
         ParentTitle = parentTitle;
         IsRootThread = !connectedToParent && !thread.IsOrphan;
     }
@@ -2102,11 +2067,6 @@ public sealed class ThreadItemViewModel
     public bool HasInstructionMinutes => InstructionMinutesText.Length > 0;
     public int TreeDepth { get; }
     public bool ConnectedToParent { get; }
-    public bool HasChildren { get; }
-    public bool HasNextSibling { get; }
-    public bool AncestorGuide1 { get; }
-    public bool AncestorGuide2 { get; }
-    public bool AncestorGuide3 { get; }
     public string ParentTitle { get; }
     public bool IsRootThread { get; }
 
