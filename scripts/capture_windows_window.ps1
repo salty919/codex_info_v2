@@ -46,7 +46,7 @@ $env:CODEX_INFO_WINDOWS_PREVIEW_THREAD_COUNT = $ThreadCount
 $expectedTitle = switch ($Preview) {
     { $_ -in @('normal', 'auth', 'error', 'warning', 'danger', 'zero', 'full', 'update') } { 'Codex Info Monitor' }
     'graph' { 'Codex Info Graph' }
-    'threads' { 'Codex Info Threads' }
+    { $_ -in @('threads', 'threads-tree', 'threads-branches') } { 'Codex Info Threads' }
     'legal' { 'Codex Info Legal' }
     'settings' { 'Codex Info Settings' }
     default { 'Codex Info Setup' }

@@ -101,7 +101,7 @@ public sealed class MainLayoutParityTests
             element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.QuotaPeriodGauge");
         var gaugeGrid = gauge.Parent;
         Assert.NotNull(gaugeGrid);
-        Assert.Equal("18,20,20", gaugeGrid.Attribute("RowDefinitions")?.Value);
+        Assert.Equal("18,20,24", gaugeGrid.Attribute("RowDefinitions")?.Value);
         Assert.Equal("0", gaugeGrid.Attribute("RowSpacing")?.Value);
         var quotaStyle = document.Descendants().Single(element =>
             element.Name.LocalName == "Style" &&
@@ -109,6 +109,12 @@ public sealed class MainLayoutParityTests
         Assert.Equal("20", quotaStyle.Descendants().Single(element =>
             element.Name.LocalName == "Setter" &&
             element.Attribute("Property")?.Value == "Height").Attribute("Value")?.Value);
+        foreach (var timestamp in new[] { "Main.QuotaResetAt", "Main.QuotaObservedAt" })
+        {
+            var element = document.Descendants().Single(candidate =>
+                candidate.Attribute("AutomationProperties.AutomationId")?.Value == timestamp);
+            Assert.Equal("0,2,0,0", element.Attribute("Margin")?.Value);
+        }
 
         var status = document.Descendants().Single(element =>
             element.Attribute("AutomationProperties.AutomationId")?.Value == "Main.StatusBanner");

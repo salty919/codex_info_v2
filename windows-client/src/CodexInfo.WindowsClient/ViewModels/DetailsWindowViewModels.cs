@@ -8,6 +8,7 @@ using System.Runtime.CompilerServices;
 using System.Windows.Input;
 using Avalonia.Threading;
 using CodexInfo.WindowsClient.Core;
+using CodexInfo.WindowsClient.Controls;
 using CodexInfo.WindowsClient.Graphing;
 using CodexInfo.WindowsClient.Localization;
 
@@ -1701,6 +1702,12 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public ReadOnlyObservableCollection<ThreadItemViewModel> Threads { get; }
 
+    public IReadOnlyList<ThreadTreeConnection> TreeConnections { get; private set; } = Array.Empty<ThreadTreeConnection>();
+
+    public IReadOnlyList<int> TreeRootRows { get; private set; } = Array.Empty<int>();
+
+    public int TreeSurfaceHeight => Math.Max(96, threads.Count * 96);
+
     public UiText Texts => LocalizationService.Current;
 
     public ReadOnlyObservableCollection<ApiAccount> Accounts => main.Accounts;
@@ -1805,9 +1812,14 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             {
                 resourceThreads = Array.Empty<ApiThreadDetails>();
                 threads.Clear();
+                TreeConnections = Array.Empty<ThreadTreeConnection>();
+                TreeRootRows = Array.Empty<int>();
                 hasLoadError = false;
                 Notify(nameof(HasThreads));
                 Notify(nameof(HasNoThreads));
+                Notify(nameof(TreeConnections));
+                Notify(nameof(TreeRootRows));
+                Notify(nameof(TreeSurfaceHeight));
                 Notify(nameof(HasLoadError));
                 if (resourceClient is null)
                 {
@@ -1931,6 +1943,8 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
     private void Rebuild()
     {
         threads.Clear();
+        var connections = new List<ThreadTreeConnection>();
+        var rootRows = new List<int>();
         var source = main.IsSelectedAccountHistorical
             ? Array.Empty<ApiThreadDetails>()
             : resourceClient is not null
@@ -1940,60 +1954,42 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         {
             var ordered = ParentFirst(source);
             var byId = source.ToDictionary(thread => thread.Id, StringComparer.Ordinal);
+            var rowById = ordered
+                .Select((thread, row) => (thread.Id, row))
+                .ToDictionary(item => item.Id, item => item.row, StringComparer.Ordinal);
+            var displayDepthById = new Dictionary<string, int>(StringComparer.Ordinal);
             for (var index = 0; index < ordered.Count; index++)
             {
                 var thread = ordered[index];
                 var parentExists = thread.ParentId is { } parentId && byId.ContainsKey(parentId);
-                var hasChildren = ordered.Any(candidate => candidate.ParentId == thread.Id);
-                var hasNextSibling = ordered.Skip(index + 1).Any(candidate => candidate.ParentId == thread.ParentId);
-                var depth = thread.Depth ?? CalculateDepth(thread, byId);
-                var currentChain = AncestorChain(thread, byId);
-                var ancestorGuides = new bool[3];
-                for (var guide = 1; guide <= 3; guide++)
+                var displayDepth = 0;
+                var hasValidParent = parentExists && !thread.IsOrphan;
+                if (hasValidParent && thread.ParentId is { } connectionParentId && rowById.TryGetValue(connectionParentId, out var parentRow))
                 {
-                    ancestorGuides[guide - 1] = currentChain.Count >= guide && ordered.Skip(index + 1).Any(candidate =>
-                    {
-                        var candidateChain = AncestorChain(candidate, byId);
-                        return candidateChain.Count >= guide && candidateChain[guide - 1] == currentChain[guide - 1];
-                    });
+                    displayDepth = Math.Min(displayDepthById.GetValueOrDefault(connectionParentId) + 1, 32);
+                    connections.Add(new ThreadTreeConnection(parentRow, index, displayDepth - 1));
                 }
+                else
+                {
+                    rootRows.Add(index);
+                }
+                displayDepthById[thread.Id] = displayDepth;
                 var parentTitle = thread.ParentId is { } id && byId.TryGetValue(id, out var parent)
                     ? parent.Title
                     : string.Empty;
-                threads.Add(new ThreadItemViewModel(this, thread, Math.Min(depth, 3), parentExists && !thread.IsOrphan,
-                    hasChildren, hasNextSibling, ancestorGuides[0], ancestorGuides[1], ancestorGuides[2], parentTitle));
+                threads.Add(new ThreadItemViewModel(this, thread, Math.Min(displayDepth, 3), parentExists && !thread.IsOrphan,
+                    parentTitle));
             }
         }
 
+        TreeConnections = connections.AsReadOnly();
+        TreeRootRows = rootRows.AsReadOnly();
+
         Notify(nameof(HasThreads));
         Notify(nameof(HasNoThreads));
-    }
-
-    private static int CalculateDepth(ApiThreadDetails thread, IReadOnlyDictionary<string, ApiThreadDetails> byId)
-    {
-        var depth = 0;
-        var current = thread;
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        while (current.ParentId is { } parentId && byId.TryGetValue(parentId, out var parent) && seen.Add(parentId))
-        {
-            depth++;
-            current = parent;
-        }
-        return depth;
-    }
-
-    private static IReadOnlyList<string> AncestorChain(ApiThreadDetails thread, IReadOnlyDictionary<string, ApiThreadDetails> byId)
-    {
-        var reverse = new List<string> { thread.Id };
-        var current = thread;
-        var seen = new HashSet<string>(StringComparer.Ordinal) { thread.Id };
-        while (current.ParentId is { } parentId && byId.TryGetValue(parentId, out var parent) && seen.Add(parentId))
-        {
-            reverse.Add(parent.Id);
-            current = parent;
-        }
-        reverse.Reverse();
-        return reverse;
+        Notify(nameof(TreeConnections));
+        Notify(nameof(TreeRootRows));
+        Notify(nameof(TreeSurfaceHeight));
     }
 
     private static IReadOnlyList<ApiThreadDetails> ParentFirst(IReadOnlyList<ApiThreadDetails> source)
@@ -2024,8 +2020,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 public sealed class ThreadItemViewModel
 {
     public ThreadItemViewModel(ThreadsWindowViewModel owner, ApiThreadDetails thread, int treeDepth,
-        bool connectedToParent, bool hasChildren, bool hasNextSibling,
-        bool ancestorGuide1, bool ancestorGuide2, bool ancestorGuide3, string parentTitle)
+        bool connectedToParent, string parentTitle)
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         Id = thread.Id;
@@ -2036,6 +2031,7 @@ public sealed class ThreadItemViewModel
             ? owner.ParentText(thread)
             : $"{owner.ParentText(thread)} / {parentTitle}";
         ModelText = owner.ModelText(thread);
+        ModelAccentHex = FormatModelAccent(ModelText);
         ContextText = owner.ContextText(thread);
         ContextUsageText = FormatContextUsage(owner.Texts, thread);
         TokenText = owner.TokenText(thread);
@@ -2047,12 +2043,8 @@ public sealed class ThreadItemViewModel
         InstructionMinutesText = FormatMinuteAge(owner.Texts, thread.LastUserMessageAt, owner.Texts.Instruction, now);
         TreeDepth = treeDepth;
         ConnectedToParent = connectedToParent;
-        HasChildren = hasChildren;
-        HasNextSibling = hasNextSibling;
-        AncestorGuide1 = ancestorGuide1;
-        AncestorGuide2 = ancestorGuide2;
-        AncestorGuide3 = ancestorGuide3;
         ParentTitle = parentTitle;
+        IsRootThread = !connectedToParent && !thread.IsOrphan;
     }
 
     public string Id { get; }
@@ -2061,6 +2053,7 @@ public sealed class ThreadItemViewModel
     public string RoleStatusText { get; }
     public string ParentText { get; }
     public string ModelText { get; }
+    public string ModelAccentHex { get; }
     public string ContextText { get; }
     public string ContextUsageText { get; }
     public bool HasContextUsage => ContextUsageText.Length > 0;
@@ -2076,30 +2069,53 @@ public sealed class ThreadItemViewModel
     public bool HasInstructionMinutes => InstructionMinutesText.Length > 0;
     public int TreeDepth { get; }
     public bool ConnectedToParent { get; }
-    public bool HasChildren { get; }
-    public bool HasNextSibling { get; }
-    public bool AncestorGuide1 { get; }
-    public bool AncestorGuide2 { get; }
-    public bool AncestorGuide3 { get; }
     public string ParentTitle { get; }
+    public bool IsRootThread { get; }
 
     internal static string FormatRoleStatus(UiText texts, ApiThreadDetails thread)
     {
         var role = thread.IsSubAgent ? texts.SubThread : texts.MainThread;
-        var active = texts.LanguageCode switch
+        return $"{role} · {FormatActiveStatus(texts)}";
+    }
+
+    internal static string FormatActiveStatus(UiText texts) => texts.LanguageCode switch
+    {
+        "ja" => "実行中",
+        "zh-Hans" => "活跃",
+        "ko" => "활성",
+        "es" => "Activo",
+        "fr" => "Actif",
+        "de" => "Aktiv",
+        "pt" => "Ativo",
+        "it" => "Attivo",
+        "ru" => "Активен",
+        _ => "Active",
+    };
+
+    internal static string FormatModelAccent(string model)
+    {
+        var normalized = model.ToUpperInvariant();
+        if (normalized.Contains("ASTRA", StringComparison.Ordinal))
         {
-            "ja" => "実行中",
-            "zh-Hans" => "活跃",
-            "ko" => "활성",
-            "es" => "Activo",
-            "fr" => "Actif",
-            "de" => "Aktiv",
-            "pt" => "Ativo",
-            "it" => "Attivo",
-            "ru" => "Активен",
-            _ => "Active",
-        };
-        return $"{role} · {active}";
+            return "#E86E9F";
+        }
+
+        if (normalized.Contains("LUNA", StringComparison.Ordinal))
+        {
+            return "#F1B35A";
+        }
+
+        if (normalized.Contains("TERRA", StringComparison.Ordinal))
+        {
+            return "#71D39A";
+        }
+
+        if (normalized.Contains("SOL", StringComparison.Ordinal))
+        {
+            return "#B79BFF";
+        }
+
+        return "#A8B7CA";
     }
 
     internal static string FormatContextUsage(UiText texts, ApiThreadDetails thread)
