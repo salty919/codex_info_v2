@@ -35,15 +35,27 @@ case "$1" in
         echo 'regression-guard: PASS check=rust-format'
         ;;
     --test)
-        # The product is a Cargo workspace. A root-package-only invocation
-        # silently skips recorder/writer/reader unit tests, allowing a daemon
-        # data regression to pass this gate. Keep the gate aligned with the
-        # release workflow and execute every workspace target once.
-        test_output="$(cargo test --locked --workspace --all-targets -- --nocapture 2>&1)" || {
+        # Keep the local gate byte-for-byte aligned with the native CI test
+        # selection so source oracles and coverage-only execution behavior
+        # cannot first fail after push.
+        cargo llvm-cov --version 2>/dev/null | grep -Eq '^cargo-llvm-cov 0\.9\.0([[:space:]]|$)' ||
+            fail 'cargo-llvm-cov 0.9.0 is required for --test'
+        mkdir -p artifacts/codacy-coverage-rust
+        report=artifacts/codacy-coverage-rust/rust.cobertura.xml
+        rm -f -- "$report"
+        test_output="$(cargo llvm-cov --workspace --locked --all-targets --cobertura \
+            --output-path artifacts/codacy-coverage-rust/rust.cobertura.xml \
+            -- --nocapture 2>&1)" || {
             printf '%s\n' "$test_output" >&2
             fail 'Rust tests failed'
         }
         printf '%s\n' "$test_output"
+        [[ -s "$report" ]] || fail 'Rust Cobertura report is empty'
+        grep -Eq 'lines-valid="[1-9][0-9]*"' "$report" ||
+            fail 'Rust Cobertura report has no valid lines'
+        if grep -Eq 'filename="(/|[A-Za-z]:[\\/])' "$report"; then
+            fail 'Rust Cobertura contains a runner-specific path'
+        fi
         # A repository may legitimately contain a zero-test binary target.
         # Require positive evidence somewhere in the selected Rust test run;
         # do not enforce a brittle test-name inventory or arbitrary count.

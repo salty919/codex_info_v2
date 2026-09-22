@@ -38,7 +38,8 @@ class OwnerSelectionTests(unittest.TestCase):
             "crates/codex-info-rest/src/lib.rs": (
                 ("LINUX_BACKEND",), True, ("rust",)
             ),
-            "ui/app.slint": (("LINUX_UI",), True, ()),
+            "ui/app.slint": (("LINUX_BACKEND", "LINUX_UI"), True, ()),
+            "assets/codex-info.svg": (("LINUX_UI",), True, ()),
             "windows-client/src/CodexInfo.WindowsClient.Core/DetailsContracts.cs": (
                 ("WINDOWS",), True, ("csharp",)
             ),
