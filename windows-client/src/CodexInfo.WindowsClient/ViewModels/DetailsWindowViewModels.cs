@@ -1952,20 +1952,23 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
             var rowById = ordered
                 .Select((thread, row) => (thread.Id, row))
                 .ToDictionary(item => item.Id, item => item.row, StringComparer.Ordinal);
+            var displayDepthById = new Dictionary<string, int>(StringComparer.Ordinal);
             for (var index = 0; index < ordered.Count; index++)
             {
                 var thread = ordered[index];
                 var parentExists = thread.ParentId is { } parentId && byId.ContainsKey(parentId);
+                var displayDepth = 0;
                 if (parentExists && thread.ParentId is { } connectionParentId && rowById.TryGetValue(connectionParentId, out var parentRow))
                 {
-                    var parentDepth = ordered[parentRow].Depth ?? CalculateDepth(ordered[parentRow], byId);
-                    connections.Add(new ThreadTreeConnection(parentRow, index, Math.Min(parentDepth, 4)));
+                    displayDepth = Math.Min(displayDepthById.GetValueOrDefault(connectionParentId) + 1, 32);
+                    connections.Add(new ThreadTreeConnection(parentRow, index, displayDepth - 1));
                 }
-                var depth = thread.Depth ?? CalculateDepth(thread, byId);
+                displayDepthById[thread.Id] = displayDepth;
                 var parentTitle = thread.ParentId is { } id && byId.TryGetValue(id, out var parent)
                     ? parent.Title
                     : string.Empty;
-                threads.Add(new ThreadItemViewModel(this, thread, Math.Min(depth, 3), parentExists && !thread.IsOrphan, parentTitle));
+                threads.Add(new ThreadItemViewModel(this, thread, Math.Min(displayDepth, 3), parentExists && !thread.IsOrphan,
+                    parentTitle));
             }
         }
 
@@ -1975,19 +1978,6 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(HasNoThreads));
         Notify(nameof(TreeConnections));
         Notify(nameof(TreeSurfaceHeight));
-    }
-
-    private static int CalculateDepth(ApiThreadDetails thread, IReadOnlyDictionary<string, ApiThreadDetails> byId)
-    {
-        var depth = 0;
-        var current = thread;
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        while (current.ParentId is { } parentId && byId.TryGetValue(parentId, out var parent) && seen.Add(parentId))
-        {
-            depth++;
-            current = parent;
-        }
-        return depth;
     }
 
     private static IReadOnlyList<ApiThreadDetails> ParentFirst(IReadOnlyList<ApiThreadDetails> source)

@@ -34,14 +34,6 @@
       <Setter Property="Height" Value="84" />
       <Setter Property="Padding" Value="14,8" />
     </Style>
-    <Style Selector="Border.thread-root-marker">
-      <Setter Property="Background" Value="#94A3B8" />
-      <Setter Property="CornerRadius" Value="2" />
-      <Setter Property="Width" Value="3" />
-      <Setter Property="Margin" Value="-14,8,0,8" />
-      <Setter Property="HorizontalAlignment" Value="Left" />
-      <Setter Property="VerticalAlignment" Value="Stretch" />
-    </Style>
     <Style Selector="Border.model-accent">
       <Setter Property="Width" Value="2" />
       <Setter Property="Height" Value="12" />
@@ -79,12 +71,6 @@
                   VerticalScrollBarVisibility="Auto">
       <Grid Width="860" Height="{Binding TreeSurfaceHeight}">
         <TextBlock Classes="label" HorizontalAlignment="Center" VerticalAlignment="Top" IsVisible="{Binding HasNoThreads}" Text="{Binding EmptyText}" />
-        <tree:ThreadTreeControl Width="860"
-                                Height="{Binding TreeSurfaceHeight}"
-                                HorizontalAlignment="Left"
-                                VerticalAlignment="Top"
-                                IsHitTestVisible="False"
-                                Connections="{Binding TreeConnections}" />
         <ItemsControl Width="860" IsVisible="{Binding HasThreads}" ItemsSource="{Binding Threads}">
           <ItemsControl.ItemTemplate>
             <DataTemplate x:DataType="vm:ThreadItemViewModel">
@@ -95,9 +81,6 @@
                   <Grid Margin="0"
                         ColumnDefinitions="*,180,208"
                         ColumnSpacing="12">
-                    <Border Classes="thread-root-marker"
-                            IsVisible="{Binding IsRootThread}"
-                            AutomationProperties.Name="{Binding Title}" />
                     <TextBlock Grid.Column="0"
                                FontSize="15"
                                FontWeight="SemiBold"
@@ -155,6 +138,13 @@
             </DataTemplate>
           </ItemsControl.ItemTemplate>
         </ItemsControl>
+        <tree:ThreadTreeControl Width="860"
+                                Height="{Binding TreeSurfaceHeight}"
+                                HorizontalAlignment="Left"
+                                VerticalAlignment="Top"
+                                ZIndex="1"
+                                IsHitTestVisible="False"
+                                Connections="{Binding TreeConnections}" />
       </Grid>
     </ScrollViewer>
   </Grid>

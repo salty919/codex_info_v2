@@ -27,6 +27,8 @@ public static class PreviewEnvironment
 
     public static bool IsSetup => Scenario is "setup";
 
+    public static bool IsThreadsPreview => Scenario is "threads" or "threads-tree";
+
     public static bool IsChild(string child) => string.Equals(Scenario, child, StringComparison.OrdinalIgnoreCase);
 
     public static int GraphPointCount
@@ -187,16 +189,9 @@ public sealed class PreviewLoopbackClient : ILoopbackHealthClient, ILoopbackDeta
             ResetAt = pastReset,
             Samples = pastSamples,
         };
-        var threads = new[]
-        {
-            new ApiThreadDetails("preview-root", "Preview root task", null, "gpt-preview-terra", "TERRA", 12_400, 4_000, 16_000, now - 5_400, now - 300, false, 0, false),
-            new ApiThreadDetails("preview-child", "Child analysis", "preview-root", "gpt-preview-luna", "LUNA", 4_800, 2_100, 16_000, now - 3_600, now - 600, true, 1, false),
-            new ApiThreadDetails("preview-grandchild", "Graph parity evaluation", "preview-child", "gpt-preview-sol", "SOL", 3_900, 1_600, 16_000, now - 3_000, now - 480, true, 2, false),
-            new ApiThreadDetails("preview-second-root", "Windows installer verification", null, "gpt-preview-sol", "SOL", 9_200, 3_300, 16_000, now - 4_200, now - 420, false, 0, false),
-            new ApiThreadDetails("preview-second-child", "REST boundary tests", "preview-second-root", "gpt-preview-terra", "TERRA", 5_600, 2_700, 16_000, now - 2_700, now - 240, true, 1, false),
-            new ApiThreadDetails("preview-orphan", "Recovered worker", "missing-parent", "gpt-preview-sol", "SOL", 1_200, null, null, now - 1_800, null, true, null, true),
-            new ApiThreadDetails("preview-third-root", "Release smoke verification", null, "gpt-preview-luna", "LUNA", 2_400, 900, 16_000, now - 1_500, now - 180, false, 0, false),
-        }.Take(PreviewEnvironment.ThreadCount).ToArray();
+        var threads = (scenario == "threads-tree" ? BuildTreePreviewThreads(now) : BuildPreviewThreads(now))
+            .Take(PreviewEnvironment.ThreadCount)
+            .ToArray();
 
         details = new ApiDetailsSnapshot(
             previewState,
@@ -228,4 +223,26 @@ public sealed class PreviewLoopbackClient : ILoopbackHealthClient, ILoopbackDeta
     public void Dispose()
     {
     }
+
+    private static ApiThreadDetails[] BuildPreviewThreads(long now) =>
+    [
+        new("preview-root", "Preview root task", null, "gpt-preview-terra", "TERRA", 12_400, 4_000, 16_000, now - 5_400, now - 300, false, 0, false),
+        new("preview-child", "Child analysis", "preview-root", "gpt-preview-luna", "LUNA", 4_800, 2_100, 16_000, now - 3_600, now - 600, true, 1, false),
+        new("preview-grandchild", "Graph parity evaluation", "preview-child", "gpt-preview-sol", "SOL", 3_900, 1_600, 16_000, now - 3_000, now - 480, true, 2, false),
+        new("preview-second-root", "Windows installer verification", null, "gpt-preview-sol", "SOL", 9_200, 3_300, 16_000, now - 4_200, now - 420, false, 0, false),
+        new("preview-second-child", "REST boundary tests", "preview-second-root", "gpt-preview-terra", "TERRA", 5_600, 2_700, 16_000, now - 2_700, now - 240, true, 1, false),
+        new("preview-orphan", "Recovered worker", "missing-parent", "gpt-preview-sol", "SOL", 1_200, null, null, now - 1_800, null, true, null, true),
+        new("preview-third-root", "Release smoke verification", null, "gpt-preview-luna", "LUNA", 2_400, 900, 16_000, now - 1_500, now - 180, false, 0, false),
+    ];
+
+    private static ApiThreadDetails[] BuildTreePreviewThreads(long now) =>
+    [
+        new("tree-root", "Release orchestration root", null, "gpt-preview-astra", "ASTRA", 12_400, 4_000, 16_000, now - 5_400, now - 300, false, 0, false),
+        new("tree-child-a", "Windows client visual verification", "tree-root", "gpt-preview-sol", "SOL", 6_800, 2_900, 16_000, now - 4_800, now - 420, true, 1, false),
+        new("tree-grandchild-a1", "Direct child layout checks", "tree-child-a", "gpt-preview-luna", "LUNA", 3_900, 1_600, 16_000, now - 3_900, now - 540, true, 2, false),
+        new("tree-grandchild-a2", "Distant sibling route and arrow checks", "tree-child-a", "gpt-preview-astra", "ASTRA", 3_700, 1_400, 16_000, now - 3_600, now - 480, true, 2, false),
+        new("tree-child-b", "Native accessibility evidence review", "tree-root", "gpt-preview-terra", "TERRA", 5_600, 2_700, 16_000, now - 2_700, now - 240, true, 1, false),
+        new("tree-grandchild-b1", "UI Automation bounds", "tree-child-b", "gpt-preview-sol", "SOL", 2_800, 1_100, 16_000, now - 2_100, now - 180, true, 2, false),
+        new("tree-grandchild-b2", "Text wrapping and tooltip coverage", "tree-child-b", "gpt-preview-luna", "LUNA", 2_400, 900, 16_000, now - 1_800, now - 120, true, 2, false),
+    ];
 }

@@ -582,6 +582,79 @@ public sealed class DetailsPresentationCoverageTests
     }
 
     [Fact]
+    public async Task ThreadsWindow_PreservesManySiblingConnectionsWithoutDepthCollapse()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var source = new List<ApiThreadDetails>
+        {
+            new("root", "Root", null, "model-root", "ROOT", null, null, null, now, null, false, 0, false),
+        };
+        for (var index = 1; index <= 8; index++)
+        {
+            source.Add(new ApiThreadDetails(
+                $"child-{index}",
+                $"Child {index}",
+                "root",
+                "model-child",
+                "CHILD",
+                null,
+                null,
+                null,
+                now - index,
+                null,
+                true,
+                1,
+                false));
+        }
+
+        using var main = await StartMainAsync(CreateDetails(Array.Empty<ApiHistoryPeriod>(), source));
+        using var threads = new ThreadsWindowViewModel(main);
+
+        Assert.Equal(9, threads.Threads.Count);
+        Assert.Equal(8, threads.TreeConnections.Count);
+        Assert.All(threads.TreeConnections, connection =>
+        {
+            Assert.Equal(0, connection.ParentRow);
+            Assert.InRange(connection.ChildRow, 1, 8);
+        });
+        Assert.Equal(9 * 96, threads.TreeSurfaceHeight);
+    }
+
+    [Fact]
+    public async Task ThreadsWindow_PreservesMixedChildAndGrandchildBranches()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var source = new[]
+        {
+            new ApiThreadDetails("root", "Root", null, "model-root", "ROOT", null, null, null, now, null, false, 0, false),
+            new ApiThreadDetails("child-a", "Child A", "root", "model-a", "A", null, null, null, now - 1, null, true, 0, false),
+            new ApiThreadDetails("grand-a1", "Grandchild A1", "child-a", "model-a1", "A1", null, null, null, now - 2, null, true, 0, false),
+            new ApiThreadDetails("grand-a2", "Grandchild A2", "child-a", "model-a2", "A2", null, null, null, now - 3, null, true, 0, false),
+            new ApiThreadDetails("child-b", "Child B", "root", "model-b", "B", null, null, null, now - 4, null, true, 0, false),
+            new ApiThreadDetails("grand-b1", "Grandchild B1", "child-b", "model-b1", "B1", null, null, null, now - 5, null, true, 0, false),
+            new ApiThreadDetails("grand-b2", "Grandchild B2", "child-b", "model-b2", "B2", null, null, null, now - 6, null, true, 0, false),
+            new ApiThreadDetails("child-c", "Child C", "root", "model-c", "C", null, null, null, now - 7, null, true, 0, false),
+        };
+        using var main = await StartMainAsync(CreateDetails(Array.Empty<ApiHistoryPeriod>(), source));
+        using var threads = new ThreadsWindowViewModel(main);
+
+        Assert.Equal(8, threads.Threads.Count);
+        Assert.Equal(7, threads.TreeConnections.Count);
+        Assert.Contains(threads.TreeConnections, connection => connection.ParentRow == 0 && connection.ChildRow == 1);
+        Assert.Contains(threads.TreeConnections, connection => connection.ParentRow == 1 && connection.ChildRow == 2);
+        Assert.Contains(threads.TreeConnections, connection => connection.ParentRow == 1 && connection.ChildRow == 3);
+        Assert.Contains(threads.TreeConnections, connection => connection.ParentRow == 0 && connection.ChildRow == 4);
+        Assert.Contains(threads.TreeConnections, connection => connection.ParentRow == 4 && connection.ChildRow == 5);
+        Assert.Contains(threads.TreeConnections, connection => connection.ParentRow == 4 && connection.ChildRow == 6);
+        Assert.Contains(threads.TreeConnections, connection => connection.ParentRow == 0 && connection.ChildRow == 7);
+        Assert.All(threads.TreeConnections.Where(connection => connection.ParentRow == 0),
+            connection => Assert.Equal(0, connection.ParentDepth));
+        Assert.All(threads.TreeConnections.Where(connection => connection.ParentRow is 1 or 4),
+            connection => Assert.Equal(1, connection.ParentDepth));
+        Assert.All(threads.TreeConnections, connection => Assert.True(connection.ChildRow > connection.ParentRow));
+    }
+
+    [Fact]
     public void ModelUsage_MissingMoneyLocaleAndDisposeBoundariesAreMeaningful()
     {
         var previousCulture = CultureInfo.CurrentCulture;

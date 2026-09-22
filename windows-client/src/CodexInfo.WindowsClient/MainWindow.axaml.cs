@@ -44,7 +44,7 @@ public partial class MainWindow : Window
         {
             Dispatcher.UIThread.Post(OpenGraph, DispatcherPriority.Loaded);
         }
-        else if (PreviewEnvironment.IsChild("threads"))
+        else if (PreviewEnvironment.IsThreadsPreview)
         {
             Dispatcher.UIThread.Post(OpenThreads, DispatcherPriority.Loaded);
         }
