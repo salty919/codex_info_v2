@@ -154,8 +154,10 @@ case "$1" in
         module_tests=(
             cleanup_rejects_replaced_generation_without_touching_replacement
             crash_before_marker_is_recovered_without_permanent_block
+            finish_root_lock_unlocks_while_child_lives_and_preserves_operation_error
             foreign_root_entry_blocks_prepare_without_removal
             inherited_owner_lock_preserves_generation_until_child_exit
+            inherited_root_lock_remains_busy_after_parent_drop_until_child_exit
             live_generation_is_kept_and_dropped_generation_is_recovered
             online_backup_is_private_and_source_is_unchanged
             source_symlink_is_rejected_without_cache_growth
@@ -173,7 +175,7 @@ case "$1" in
         for test_name in "${main_tests[@]}"; do
             run_exact_test --bin=codex_info "tests::$test_name"
         done
-        echo 'regression-guard: PASS check=rust-app-server-isolation cases=12'
+        echo 'regression-guard: PASS check=rust-app-server-isolation cases=14'
         ;;
     --recorder-gap)
         run_exact_test --bin=codex_info \

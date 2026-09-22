@@ -23568,6 +23568,7 @@ mod tests {
         let app = include_str!("../ui/app.slint");
         let components = include_str!("../ui/components.slint");
         let theme = include_str!("../ui/theme.slint");
+        let startup_gate = include_str!("../scripts/x11_startup_visual_gate.sh");
 
         for marker in [
             "preferred-width: 900px;",
@@ -23741,6 +23742,25 @@ mod tests {
             assert!(
                 theme.contains(marker),
                 "missing Windows Main color: {marker}"
+            );
+        }
+
+        assert!(!startup_gate.contains("121 - failure_attempt"));
+        for marker in [
+            "failure_frame_ready=0\nfor _ in $(seq 1 120); do",
+            "status_bounds = (22, 424, 878, 466)",
+            "retry_bounds = (778, 431, 870, 459)",
+            "error_background = (58, 29, 36)",
+            "error_border = (142, 61, 77)",
+            "error_accent = (224, 107, 122)",
+            "main_text = (242, 246, 252)",
+            "main_label = (168, 183, 202)",
+            "retry_background = (41, 73, 104)",
+            "retry_border = (71, 118, 159)",
+        ] {
+            assert!(
+                startup_gate.contains(marker),
+                "startup failure-state gate drifted from fixed Main layout: {marker}"
             );
         }
     }
