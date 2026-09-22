@@ -541,16 +541,12 @@ mod tests {
 
     #[test]
     fn recorder_publication_admits_logout_and_only_fresh_current_partition() {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "codex-info-rest-account-boundary-{}-{suffix}",
-            std::process::id()
-        ));
-        let codex_home = root.join("codex-home");
-        let history = root.join("history");
+        let root = tempfile::Builder::new()
+            .prefix("codex-info-rest-account-boundary-")
+            .tempdir()
+            .expect("private account boundary root");
+        let codex_home = root.path().join("codex-home");
+        let history = root.path().join("history");
         fs::create_dir_all(&codex_home).expect("Codex home");
         fs::create_dir_all(&history).expect("history root");
         let now = i64::try_from(
@@ -582,7 +578,7 @@ mod tests {
             "last_commit_unix": null,
             "updated_at_unix": now
         }));
-        let idle = read_recorder_publication(&root).expect("fresh idle publication");
+        let idle = read_recorder_publication(root.path()).expect("fresh idle publication");
         assert_eq!(idle, RecorderPublication::Idle);
         assert_eq!(
             boundary_state_without_catalog(&codex_home, Some(&idle), false),
@@ -607,7 +603,7 @@ mod tests {
             "last_commit_unix": now,
             "updated_at_unix": now
         }));
-        let active = read_recorder_publication(&root).expect("fresh active publication");
+        let active = read_recorder_publication(root.path()).expect("fresh active publication");
         let catalog = AccountCatalog {
             readers: Vec::new(),
             default_account_id: "account-7".to_owned(),
@@ -622,7 +618,5 @@ mod tests {
             ..catalog
         };
         assert!(!catalog_is_fresh(&stale_activation, Some(&active)));
-
-        fs::remove_dir_all(root).expect("account boundary cleanup");
     }
 }

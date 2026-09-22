@@ -186,21 +186,25 @@ public sealed class LegalNoticeCatalogTests
 
     private static IEnumerable<string> ExtractMarkdownLinkDestinations(string source)
     {
-        for (var index = 0; index < source.Length; index++)
+        var index = 0;
+        while (index < source.Length)
         {
             if (source[index] != '[')
             {
+                index++;
                 continue;
             }
 
             var labelEnd = source.IndexOf(']', index + 1);
             if (labelEnd < 0 || labelEnd + 1 >= source.Length || source[labelEnd + 1] != '(')
             {
+                index++;
                 continue;
             }
 
             var destinationStart = labelEnd + 2;
             var parenthesisDepth = 0;
+            var nextIndex = index + 1;
             for (var destinationEnd = destinationStart; destinationEnd < source.Length; destinationEnd++)
             {
                 if (source[destinationEnd] == '(')
@@ -212,13 +216,15 @@ public sealed class LegalNoticeCatalogTests
                     if (parenthesisDepth == 0)
                     {
                         yield return source[destinationStart..destinationEnd];
-                        index = destinationEnd;
+                        nextIndex = destinationEnd + 1;
                         break;
                     }
 
                     parenthesisDepth--;
                 }
             }
+
+            index = nextIndex;
         }
     }
 

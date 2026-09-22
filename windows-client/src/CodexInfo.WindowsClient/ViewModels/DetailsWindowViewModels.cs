@@ -419,14 +419,11 @@ public sealed class GraphWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         var bucketCount = Math.Max(1, maximum / 2);
-        for (var bucket = 0; bucket < bucketCount; bucket++)
+        for (var bucket = 0; bucket < bucketCount && selected.Count < maximum; bucket++)
         {
             var start = (int)((long)bucket * samples.Count / bucketCount);
             var endExclusive = (int)((long)(bucket + 1) * samples.Count / bucketCount);
-            if (selected.Count < maximum)
-            {
-                selected.Add(start);
-            }
+            selected.Add(start);
             if (selected.Count < maximum)
             {
                 selected.Add(Math.Max(start, endExclusive - 1));
