@@ -18761,6 +18761,7 @@ fn native_main_labels(
     &'static str,
     &'static str,
     &'static str,
+    &'static str,
 ) {
     match i18n.language().code() {
         "ja" => (
@@ -18769,13 +18770,23 @@ fn native_main_labels(
             "保存",
             "キャンセル",
             "正常",
-            "注意",
-            "エラー",
+            "残量警告",
+            "残量不足",
+            "リセット警告",
             "リセット",
             "観測",
         ),
         "zh-Hans" => (
-            "设置", "时区", "保存", "取消", "正常", "注意", "错误", "重置", "观测",
+            "设置",
+            "时区",
+            "保存",
+            "取消",
+            "正常",
+            "配额警告",
+            "配额不足",
+            "即将重置",
+            "重置",
+            "观测",
         ),
         "ko" => (
             "설정",
@@ -18783,8 +18794,9 @@ fn native_main_labels(
             "저장",
             "취소",
             "정상",
-            "주의",
-            "오류",
+            "잔여량 경고",
+            "잔여량 부족",
+            "곧 재설정",
             "재설정",
             "관측",
         ),
@@ -18794,8 +18806,9 @@ fn native_main_labels(
             "Guardar",
             "Cancelar",
             "Listo",
-            "Aviso",
-            "Error",
+            "Advertencia de cuota",
+            "Cuota crítica",
+            "Restablecimiento próximo",
             "Restablecimiento",
             "Observado",
         ),
@@ -18805,8 +18818,9 @@ fn native_main_labels(
             "Enregistrer",
             "Annuler",
             "Prêt",
-            "Attention",
-            "Erreur",
+            "Alerte de quota",
+            "Quota critique",
+            "Réinitialisation imminente",
             "Réinitialisation",
             "Observé",
         ),
@@ -18816,8 +18830,9 @@ fn native_main_labels(
             "Speichern",
             "Abbrechen",
             "Bereit",
-            "Hinweis",
-            "Fehler",
+            "Kontingentwarnung",
+            "Kontingent kritisch",
+            "Zurücksetzung steht bevor",
             "Zurücksetzung",
             "Beobachtet",
         ),
@@ -18827,8 +18842,9 @@ fn native_main_labels(
             "Salvar",
             "Cancelar",
             "Pronto",
-            "Aviso",
-            "Erro",
+            "Aviso de cota",
+            "Cota crítica",
+            "Redefinição próxima",
             "Redefinição",
             "Observado",
         ),
@@ -18838,8 +18854,9 @@ fn native_main_labels(
             "Salva",
             "Annulla",
             "Pronto",
-            "Avviso",
-            "Errore",
+            "Avviso quota",
+            "Quota critica",
+            "Ripristino imminente",
             "Ripristino",
             "Osservato",
         ),
@@ -18849,8 +18866,9 @@ fn native_main_labels(
             "Сохранить",
             "Отмена",
             "Готово",
-            "Внимание",
-            "Ошибка",
+            "Предупреждение о квоте",
+            "Критическая квота",
+            "Скорый сброс",
             "Сброс",
             "Наблюдение",
         ),
@@ -18860,12 +18878,154 @@ fn native_main_labels(
             "Save",
             "Cancel",
             "Ready",
-            "Warning",
-            "Error",
+            "Quota warning",
+            "Quota critical",
+            "Reset soon",
             "Reset",
             "Observed",
         ),
     }
+}
+
+#[derive(Clone, Copy)]
+struct NativeStatusTitles {
+    connecting: &'static str,
+    initializing: &'static str,
+    auth_required: &'static str,
+    api_error: &'static str,
+    transport_error: &'static str,
+    response_error: &'static str,
+}
+
+fn native_status_titles(i18n: &I18n) -> NativeStatusTitles {
+    let (connecting, initializing, auth_required, api_error, transport_error, response_error) =
+        match i18n.language().code() {
+            "ja" => (
+                "接続中",
+                "Linux 側で準備中",
+                "Linux 側で認証が必要です",
+                "Linux 側の取得エラー",
+                "接続エラー",
+                "未取得",
+            ),
+            "zh-Hans" => (
+                "连接中",
+                "Linux is preparing",
+                "需要 Linux 认证",
+                "Linux API error",
+                "Connection error",
+                "不可用",
+            ),
+            "ko" => (
+                "연결 중",
+                "Linux is preparing",
+                "Linux 인증 필요",
+                "Linux API error",
+                "Connection error",
+                "Unavailable",
+            ),
+            "es" => (
+                "Conectando",
+                "Linux is preparing",
+                "Se requiere autenticación de Linux",
+                "Linux API error",
+                "Connection error",
+                "No disponible",
+            ),
+            "fr" => (
+                "Connexion…",
+                "Linux is preparing",
+                "Authentification Linux requise",
+                "Linux API error",
+                "Connection error",
+                "Indisponible",
+            ),
+            "de" => (
+                "Verbindung wird hergestellt",
+                "Linux is preparing",
+                "Linux-Authentifizierung erforderlich",
+                "Linux API error",
+                "Connection error",
+                "Nicht verfügbar",
+            ),
+            "pt" => (
+                "Conectando",
+                "Linux is preparing",
+                "Autenticação Linux necessária",
+                "Linux API error",
+                "Connection error",
+                "Indisponível",
+            ),
+            "it" => (
+                "Connessione in corso",
+                "Linux is preparing",
+                "Autenticazione Linux richiesta",
+                "Linux API error",
+                "Connection error",
+                "Non disponibile",
+            ),
+            "ru" => (
+                "Подключение",
+                "Linux is preparing",
+                "Требуется аутентификация Linux",
+                "Linux API error",
+                "Connection error",
+                "Недоступно",
+            ),
+            _ => (
+                "Connecting",
+                "Linux is preparing",
+                "Linux authentication required",
+                "Linux API error",
+                "Connection error",
+                "Unavailable",
+            ),
+        };
+    NativeStatusTitles {
+        connecting,
+        initializing,
+        auth_required,
+        api_error,
+        transport_error,
+        response_error,
+    }
+}
+
+fn native_status_title(state: &CodexInfoState) -> &'static str {
+    let titles = native_status_titles(&state.i18n);
+    let (_, _, _, _, ready, warning, danger, reset, _, _) = native_main_labels(&state.i18n);
+    if state.service_endpoint_error.is_some() {
+        return titles.transport_error;
+    }
+    if state.account_error.is_some() {
+        return titles.api_error;
+    }
+    if state.error.is_some() {
+        return titles.response_error;
+    }
+    if state.selected_account_is_historical() {
+        return ready;
+    }
+    if !state.authenticated && !state.checking {
+        return titles.auth_required;
+    }
+    if state.checking {
+        return if state.authenticated || state.auth_polling {
+            titles.initializing
+        } else {
+            titles.connecting
+        };
+    }
+    if state.has_quota_percent && state.remaining_percent.unwrap_or(0.0) <= 2.0 {
+        return danger;
+    }
+    if state.has_quota_percent && state.remaining_percent.unwrap_or(0.0) <= 10.0 {
+        return warning;
+    }
+    if state.reset_at.is_some() && state.seconds_to_reset().abs() <= 86_400 {
+        return reset;
+    }
+    ready
 }
 
 fn native_settings_save_error(i18n: &I18n) -> &'static str {
@@ -18886,7 +19046,7 @@ fn native_settings_save_error(i18n: &I18n) -> &'static str {
 fn ui_strings(i18n: &I18n) -> UiStrings {
     let (legal_page_names, legal_pages) = native_legal_pages(i18n);
     let (legal_back, legal_next, legal_page_position) = native_legal_navigation(i18n);
-    let (settings, time_zone, save, cancel, _, _, _, _, _) = native_main_labels(i18n);
+    let (settings, time_zone, save, cancel, _, _, _, _, _, _) = native_main_labels(i18n);
     UiStrings {
         font_family: i18n.text(TextKey::FontFamily).into(),
         product_version: format!("v{PRODUCT_VERSION}").into(),
@@ -18951,18 +19111,18 @@ fn ui_strings(i18n: &I18n) -> UiStrings {
 #[cfg(test)]
 fn normal_status_text(remaining: f64, seconds: i64, last_success_at: Option<&str>) -> String {
     let quota_notice = if remaining <= 2.0 {
-        Some("残り利用枠はほぼありません。")
+        Some("残量は 2% 以下です。")
     } else if remaining <= 10.0 {
-        Some("残り利用枠が少なくなっています。")
+        Some("残量は 10% 以下です。")
     } else {
         None
     };
     if let Some(notice) = quota_notice {
         notice.into()
     } else if seconds.abs() <= 86_400 {
-        "リセット前後24時間です。".into()
+        "24 時間以内に利用枠がリセットされます。".into()
     } else {
-        format!("最終更新 {}", last_success_at.unwrap_or("—"))
+        format!("前回受信 {}", last_success_at.unwrap_or("—"))
     }
 }
 
@@ -19049,6 +19209,10 @@ impl CodexInfoState {
             // Keep Initializing (`checking`) informational while authentication
             // state is still being resolved.
             "warning"
+        } else if self.has_quota_percent && self.remaining_percent.unwrap_or(0.0) <= 2.0 {
+            // Windows treats the critical quota state as an error surface.
+            // Keep the shared status palette driven by the same threshold.
+            "error"
         } else if self.reset_at.is_some() && self.seconds_to_reset().abs() <= 86_400
             || (self.has_quota_percent && self.remaining_percent.unwrap_or(0.0) <= 10.0)
         {
@@ -19266,7 +19430,7 @@ impl CodexInfoState {
         } else {
             "".into()
         });
-        let (_, _, _, _, status_ready, status_warning, status_error, reset_prefix, observed_prefix) =
+        let (_, _, _, _, _, _, _, _, reset_prefix, observed_prefix) =
             native_main_labels(&self.i18n);
         let reset_value = self
             .reset_at
@@ -19312,14 +19476,7 @@ impl CodexInfoState {
         ui.set_status(self.display_status_detail().into());
         let status_level = self.status_level();
         ui.set_status_level(status_level.into());
-        ui.set_status_title(
-            match status_level {
-                "error" => status_error,
-                "warning" => status_warning,
-                _ => status_ready,
-            }
-            .into(),
-        );
+        ui.set_status_title(native_status_title(self).into());
         ui.set_status_last_received(self.i18n.format_last_updated(self.last_success_at).into());
         ui.set_remaining_percent(remaining as f32);
         ui.set_remaining_days(if self.has_quota_percent && !historical_account {
@@ -23389,9 +23546,9 @@ mod tests {
         metric_line_path_with_confirmed_gaps, minute_model_spend, minute_model_spend_for_metric,
         minute_model_spend_for_metric_with_untrusted, model_spend_is_reliable,
         model_usage_timeline_from_events, monthly_window_seconds, native_account_window_title,
-        native_legal_pages, native_startup_loading, normal_status_text, one_month_before_utc,
-        open_codex_session_paths, parse_details_document, parse_launch_mode, parse_preview_size,
-        parse_rate_limits, parse_resize_direction, period_remaining_text,
+        native_legal_pages, native_startup_loading, native_status_title, normal_status_text,
+        one_month_before_utc, open_codex_session_paths, parse_details_document, parse_launch_mode,
+        parse_preview_size, parse_rate_limits, parse_resize_direction, period_remaining_text,
         physical_size_for_logical, plan_type_label, poll_service_state,
         poll_service_state_with_owner_check, published_pair_is_fresh,
         read_active_thread_rollout_cached, read_recovery_entries_for_ranges,
@@ -35577,14 +35734,14 @@ mod tests {
     fn unlimited_status_has_no_countdown_copy() {
         assert_eq!(
             normal_status_text(50.0, i64::MAX, Some("12:34")),
-            "最終更新 12:34"
+            "前回受信 12:34"
         );
         let state = CodexInfoState::preview("unlimited");
         assert!(!state.has_quota_percent);
         assert!(state.reset_at.is_none());
         assert!(state.model_usage.is_empty());
         assert_eq!(state.quota_title, "利用枠");
-        assert_eq!(state.normal_status(), "最終更新 12:34");
+        assert_eq!(state.normal_status(), "前回受信 12:34");
     }
 
     #[test]
@@ -35619,18 +35776,18 @@ mod tests {
     fn status_does_not_repeat_the_countdown() {
         assert_eq!(
             normal_status_text(5.0, 19 * 3_600, Some("12:34")),
-            "残り利用枠が少なくなっています。"
+            "残量は 10% 以下です。"
         );
         assert_eq!(
             normal_status_text(50.0, 19 * 3_600, Some("12:34")),
-            "リセット前後24時間です。"
+            "24 時間以内に利用枠がリセットされます。"
         );
     }
 
     #[test]
     fn reset_warning_preview_exposes_the_reset_notice_without_low_quota_precedence() {
         let state = CodexInfoState::preview("reset-warning");
-        assert_eq!(state.status, "リセット前後24時間です。");
+        assert_eq!(state.status, "24 時間以内に利用枠がリセットされます。");
         assert_eq!(state.status_level(), "warning");
     }
 
@@ -35646,7 +35803,7 @@ mod tests {
         assert!(!rust_production.contains(&old_interval_copy));
         assert_eq!(slint.matches("自動更新").count(), 0);
         assert_eq!(slint.matches("確認中…").count(), 0);
-        assert!(rust_production.contains("最終更新 {}"));
+        assert!(rust_production.contains("前回受信 {}"));
     }
 
     #[test]
@@ -35686,6 +35843,131 @@ mod tests {
 
         assert!(!state.authenticated);
         assert_eq!(state.status_level(), "warning");
+    }
+
+    #[test]
+    fn issue_360_main_graph_and_status_contract_is_single_projection() {
+        let app = include_str!("../ui/app.slint");
+        let components = include_str!("../ui/components.slint");
+        let graph = components
+            .split("export component GraphWindow inherits Window {")
+            .nth(1)
+            .and_then(|body| body.split("export component ThreadsWindow").next())
+            .expect("GraphWindow");
+        let quota = components
+            .split("export component RemainingQuota inherits Rectangle {")
+            .nth(1)
+            .and_then(|body| body.split("component DaySegment").next())
+            .expect("RemainingQuota");
+        let week = components
+            .split("export component WeekGauge inherits Rectangle {")
+            .nth(1)
+            .and_then(|body| body.split("component ThreadModelStat").next())
+            .expect("WeekGauge");
+        let status = components
+            .split("export component StatusBanner inherits Rectangle {")
+            .nth(1)
+            .and_then(|body| body.split("export component TimeZoneSettingsWindow").next())
+            .expect("StatusBanner");
+
+        for marker in [
+            "private property <length> main-content-x: 22px;",
+            "private property <length> main-content-y: 14px;",
+            "private property <length> main-content-width: 856px;",
+            "private property <length> main-content-height: 452px;",
+            "private property <length> main-quota-y: 60px;",
+            "private property <length> main-week-y: 150px;",
+            "private property <length> main-status-y: 410px;",
+        ] {
+            assert!(app.contains(marker), "Main geometry marker: {marker}");
+        }
+        for marker in [
+            "x: 14px;\n        y: 20px;\n        width: parent.width - 252px;",
+            "x: parent.width - 224px;\n        y: 20px;\n        width: 210px;",
+            "x: 14px;\n        y: 70px;\n        width: parent.width - 28px;",
+            "height: 6px;",
+        ] {
+            assert!(quota.contains(marker), "quota geometry marker: {marker}");
+        }
+        for marker in [
+            "y: 5px;",
+            "y: 24px;",
+            "height: 20px;",
+            "y: 49px;",
+            "reset-label",
+            "observed-label",
+        ] {
+            assert!(week.contains(marker), "week gauge marker: {marker}");
+        }
+        for marker in [
+            "height: 42px;",
+            "x: 10px;\n        y: 17px;\n        width: 8px;\n        height: 8px;",
+            "x: 28px;\n        y: 3px;\n        width: root.show-action ? parent.width - root.action-width - 48px : parent.width - 250px;",
+            "x: 28px;\n        y: 20px;",
+            "x: parent.width - 222px;\n        y: 3px;\n        width: 210px;",
+            "DesignTokens.main-status-error-background",
+            "DesignTokens.main-status-warning-background",
+            "DesignTokens.main-status-normal-background",
+        ] {
+            assert!(status.contains(marker), "status geometry marker: {marker}");
+        }
+        for marker in [
+            "private property <length> content-x:",
+            "private property <length> history-toggle-y: 144px;",
+            "x: parent.width - 108px;",
+            "x: parent.width - 244px;",
+            "y: 42px;",
+            "y: 84px;",
+            "y: root.history-toggle-y + 32px;",
+        ] {
+            assert!(graph.contains(marker), "graph geometry marker: {marker}");
+        }
+
+        let japanese = I18n::from_parts(codex_info::i18n::Language::Japanese, chrono_tz::Tz::UTC);
+        assert_eq!(
+            japanese.text(codex_info::i18n::TextKey::QuotaNearlyGone),
+            "残量は 2% 以下です。"
+        );
+        assert_eq!(
+            japanese.text(codex_info::i18n::TextKey::QuotaLow),
+            "残量は 10% 以下です。"
+        );
+        assert_eq!(
+            japanese.text(codex_info::i18n::TextKey::LastUpdated),
+            "前回受信"
+        );
+
+        let mut danger = CodexInfoState::preview("zero");
+        danger.i18n = japanese;
+        assert_eq!(danger.status_level(), "error");
+        assert_eq!(native_status_title(&danger), "残量不足");
+        assert_eq!(danger.normal_status(), "残量は 2% 以下です。");
+        assert_eq!(
+            normal_status_text(5.0, 19 * 3_600, Some("12:34")),
+            "残量は 10% 以下です。"
+        );
+        assert_eq!(
+            normal_status_text(50.0, 19 * 3_600, Some("12:34")),
+            "24 時間以内に利用枠がリセットされます。"
+        );
+        assert_eq!(
+            normal_status_text(50.0, i64::MAX, Some("12:34")),
+            "前回受信 12:34"
+        );
+
+        let english = I18n::from_parts(codex_info::i18n::Language::English, chrono_tz::Tz::UTC);
+        let mut english_danger = CodexInfoState::preview("zero");
+        english_danger.i18n = english.clone();
+        assert_eq!(native_status_title(&english_danger), "Quota critical");
+        let mut english_warning = CodexInfoState::preview("warning");
+        english_warning.i18n = english.clone();
+        assert_eq!(native_status_title(&english_warning), "Quota warning");
+        let mut english_reset = CodexInfoState::preview("reset-warning");
+        english_reset.i18n = english.clone();
+        assert_eq!(native_status_title(&english_reset), "Reset soon");
+        let mut english_ready = CodexInfoState::preview("normal");
+        english_ready.i18n = english;
+        assert_eq!(native_status_title(&english_ready), "Ready");
     }
 
     #[test]

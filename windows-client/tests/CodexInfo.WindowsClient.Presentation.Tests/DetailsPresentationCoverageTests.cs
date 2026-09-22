@@ -123,11 +123,15 @@ public sealed class DetailsPresentationCoverageTests
         Assert.True(graph.HasNoPoints);
         Assert.Empty(graph.Points);
         Assert.Equal(0, graph.SelectedPeriodEndAt);
+        Assert.Equal(main.SelectedAccountText, graph.SelectedAccountValueText);
+        Assert.Equal($"{graph.Texts.Account}｜{graph.SelectedAccountValueText}", graph.SelectedAccountText);
+        Assert.Equal(graph.Texts.UnavailableValue, graph.SelectedPeriodValueText);
 
         graph.SelectedPeriod = second;
         Assert.True(graph.HasPoints);
         Assert.Equal(second.Id, graph.SelectedPeriod?.Id);
         Assert.Equal($"{graph.Texts.PeriodSelectorHeading}｜{second.Label}", graph.SelectedPeriodText);
+        Assert.Equal(second.Label, graph.SelectedPeriodValueText);
 
         graph.SelectedMetric = graph.Texts.Tokens;
         Assert.False(graph.IsDollars);
