@@ -167,7 +167,9 @@ def _selection_for_path(path: str) -> PathSelection:
         return PathSelection(frozenset({"LINUX_BACKEND"}), True, languages)
     if path in LINUX_UI_EXACT:
         return PathSelection(frozenset({"LINUX_UI"}), False)
-    if path.startswith(("ui/", "assets/")):
+    if path.startswith("ui/"):
+        return PathSelection(frozenset({"LINUX_BACKEND", "LINUX_UI"}), True)
+    if path.startswith("assets/"):
         return PathSelection(frozenset({"LINUX_UI"}), True)
     if path in LINUX_SHARED_EXACT or path.startswith(".cargo/"):
         languages = (

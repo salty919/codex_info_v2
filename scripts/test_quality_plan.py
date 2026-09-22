@@ -20,8 +20,8 @@ class QualityPlanTests(unittest.TestCase):
                 ("rust-format", "rust-test"),
             ),
             "ui/app.slint": (
-                ("LINUX_UI",),
-                ("linux-ui-contract",),
+                ("LINUX_BACKEND", "LINUX_UI"),
+                ("rust-format", "rust-test", "linux-ui-contract"),
             ),
             "windows-client/src/CodexInfo.WindowsClient/MainWindow.axaml.cs": (
                 ("WINDOWS",), ("windows-contract",)

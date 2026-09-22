@@ -35,15 +35,27 @@ case "$1" in
         echo 'regression-guard: PASS check=rust-format'
         ;;
     --test)
-        # The product is a Cargo workspace. A root-package-only invocation
-        # silently skips recorder/writer/reader unit tests, allowing a daemon
-        # data regression to pass this gate. Keep the gate aligned with the
-        # release workflow and execute every workspace target once.
-        test_output="$(cargo test --locked --workspace --all-targets -- --nocapture 2>&1)" || {
+        # Keep the local gate byte-for-byte aligned with the native CI test
+        # selection so source oracles and coverage-only execution behavior
+        # cannot first fail after push.
+        cargo llvm-cov --version 2>/dev/null | grep -Eq '^cargo-llvm-cov 0\.9\.0([[:space:]]|$)' ||
+            fail 'cargo-llvm-cov 0.9.0 is required for --test'
+        mkdir -p artifacts/codacy-coverage-rust
+        report=artifacts/codacy-coverage-rust/rust.cobertura.xml
+        rm -f -- "$report"
+        test_output="$(cargo llvm-cov --workspace --locked --all-targets --cobertura \
+            --output-path artifacts/codacy-coverage-rust/rust.cobertura.xml \
+            -- --nocapture 2>&1)" || {
             printf '%s\n' "$test_output" >&2
             fail 'Rust tests failed'
         }
         printf '%s\n' "$test_output"
+        [[ -s "$report" ]] || fail 'Rust Cobertura report is empty'
+        grep -Eq 'lines-valid="[1-9][0-9]*"' "$report" ||
+            fail 'Rust Cobertura report has no valid lines'
+        if grep -Eq 'filename="(/|[A-Za-z]:[\\/])' "$report"; then
+            fail 'Rust Cobertura contains a runner-specific path'
+        fi
         # A repository may legitimately contain a zero-test binary target.
         # Require positive evidence somewhere in the selected Rust test run;
         # do not enforce a brittle test-name inventory or arbitrary count.
@@ -142,8 +154,10 @@ case "$1" in
         module_tests=(
             cleanup_rejects_replaced_generation_without_touching_replacement
             crash_before_marker_is_recovered_without_permanent_block
+            finish_root_lock_unlocks_while_child_lives_and_preserves_operation_error
             foreign_root_entry_blocks_prepare_without_removal
             inherited_owner_lock_preserves_generation_until_child_exit
+            inherited_root_lock_remains_busy_after_parent_drop_until_child_exit
             live_generation_is_kept_and_dropped_generation_is_recovered
             online_backup_is_private_and_source_is_unchanged
             source_symlink_is_rejected_without_cache_growth
@@ -161,7 +175,7 @@ case "$1" in
         for test_name in "${main_tests[@]}"; do
             run_exact_test --bin=codex_info "tests::$test_name"
         done
-        echo 'regression-guard: PASS check=rust-app-server-isolation cases=12'
+        echo 'regression-guard: PASS check=rust-app-server-isolation cases=14'
         ;;
     --recorder-gap)
         run_exact_test --bin=codex_info \

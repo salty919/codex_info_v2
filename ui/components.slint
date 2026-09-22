@@ -70,8 +70,9 @@ export struct UiStrings {
 export component WindowControlButton inherits Rectangle {
     in property <string> glyph;
     in property <bool> destructive: false;
+    in property <length> control-width: 36px;
     callback activated();
-    width: 36px;
+    width: root.control-width;
     height: 28px;
     border-radius: 4px;
     border-width: 1px;
@@ -103,24 +104,29 @@ export component WindowControlButton inherits Rectangle {
 export component WindowControls inherits Rectangle {
     in property <bool> show-maximize: false;
     in property <bool> maximized: false;
+    in property <bool> compact: false;
+    private property <length> control-width: root.compact ? 30px : 36px;
     callback minimize();
     callback toggle-maximize();
     callback close();
-    width: root.show-maximize ? 108px : 72px;
+    width: root.show-maximize ? 3 * root.control-width : 2 * root.control-width;
     height: 28px;
 
     WindowControlButton {
         x: 0px;
+        control-width: root.control-width;
         glyph: "-";
         activated => { root.minimize(); }
     }
     if root.show-maximize : WindowControlButton {
-        x: 36px;
+        x: root.control-width;
+        control-width: root.control-width;
         glyph: root.maximized ? "❐" : "□";
         activated => { root.toggle-maximize(); }
     }
     WindowControlButton {
-        x: root.show-maximize ? 72px : 36px;
+        x: root.show-maximize ? 2 * root.control-width : root.control-width;
+        control-width: root.control-width;
         glyph: "×";
         destructive: true;
         activated => { root.close(); }
@@ -214,14 +220,15 @@ export component MainAccountSelect inherits Rectangle {
     in property <[MainAccountOption]> model;
     in property <int> current-index: 0;
     in property <string> empty-label;
+    in property <string> field-label;
     callback selected(string);
     private property <bool> enabled: root.model.length > 0;
     property <length> item-height: 32px;
-    height: 36px;
+    height: 44px;
     border-radius: DesignTokens.radius-control;
     border-width: 1px;
-    border-color: popup.is-open ? DesignTokens.accent-primary : DesignTokens.graph-control-border;
-    background: root.enabled ? DesignTokens.graph-control-surface : DesignTokens.canvas;
+    border-color: popup.is-open ? DesignTokens.accent-primary : DesignTokens.main-command-border;
+    background: root.enabled ? DesignTokens.main-command : DesignTokens.main-canvas;
 
     Text {
         x: 10px;
@@ -236,12 +243,25 @@ export component MainAccountSelect inherits Rectangle {
     }
     Text {
         x: 28px;
+        y: 4px;
         width: parent.width - 54px;
-        height: parent.height;
+        height: 11px;
+        text: root.field-label;
+        color: DesignTokens.accent-primary;
+        font-size: 9px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Text {
+        x: 28px;
+        y: 15px;
+        width: parent.width - 54px;
+        height: parent.height - 18px;
         text: root.enabled && root.current-index >= 0 && root.current-index < root.model.length
             ? root.model[root.current-index].label : root.empty-label;
-        color: root.enabled ? DesignTokens.text-primary : DesignTokens.text-muted;
-        font-size: DesignTokens.text-caption;
+        color: root.enabled ? DesignTokens.main-text-primary : DesignTokens.text-muted;
+        font-size: 11px;
+        font-weight: 600;
         vertical-alignment: center;
         overflow: elide;
     }
@@ -466,7 +486,6 @@ export component GraphSelect inherits Rectangle {
 
 export component Header inherits Rectangle {
     in property <UiStrings> strings;
-    in property <string> period-label;
     in property <bool> show-graph: false;
     in property <[MainAccountOption]> account-options;
     in property <int> selected-account-index: 0;
@@ -477,80 +496,97 @@ export component Header inherits Rectangle {
     callback begin-window-drag();
     callback minimize-window();
     callback close-window();
-    property <length> settings-button-width: 82px;
-    property <length> legal-button-width: 104px;
-    property <length> graph-button-width: 118px;
-    property <length> account-select-width: 235px;
-    property <length> window-control-width: 72px;
+    property <length> settings-button-width: 70px;
+    property <length> legal-button-width: 84px;
+    property <length> graph-button-width: 70px;
+    property <length> account-select-width: 250px;
+    property <length> window-control-width: 60px;
     private property <bool> show-account-selector: root.account-options.length > 0;
-    // Keep the move target before all legal/graph/window controls so a
-    // frameless button click is never interpreted as a window move.
-    private property <length> settings-x: root.width - root.window-control-width - 8px - root.settings-button-width;
-    private property <length> legal-x: root.settings-x - 8px - root.legal-button-width;
-    private property <length> graph-x: root.legal-x - (root.show-graph ? 8px + root.graph-button-width : 0px);
-    private property <length> account-x: root.graph-x - (root.show-account-selector ? 8px + root.account-select-width : 0px);
-    private property <length> action-start: root.account-x;
-    height: 48px;
+    private property <length> account-x: 220px;
+    private property <length> settings-x: root.width - root.window-control-width - 16px - root.settings-button-width;
+    private property <length> legal-x: root.settings-x - 4px - root.legal-button-width;
+    private property <length> graph-x: root.legal-x - 4px - root.graph-button-width;
+    height: 52px;
 
     WindowDragArea {
         x: 0px;
         y: 0px;
-        width: root.action-start;
+        width: root.graph-x;
         height: parent.height;
         begin-drag => { root.begin-window-drag(); }
     }
 
-    Text {
+    app-mark := Rectangle {
         x: 0px;
-        y: 0px;
-        width: max(120px, root.action-start - 8px);
-        height: 24px;
-        text: root.strings.usage-status + " · " + root.strings.product-version;
-        color: DesignTokens.text-primary;
-        font-size: 18px;
+        y: 8px;
+        width: 36px;
+        height: 36px;
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: DesignTokens.accent-primary;
+        background: DesignTokens.main-app-mark;
+        Text {
+            width: parent.width;
+            height: parent.height;
+            text: "◈";
+            color: DesignTokens.main-text-primary;
+            font-size: 20px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    Text {
+        x: 46px;
+        y: 3px;
+        width: 154px;
+        height: 28px;
+        text: root.strings.usage-status;
+        color: DesignTokens.main-heading;
+        font-size: 22px;
         font-weight: 700;
         vertical-alignment: center;
         overflow: elide;
     }
     Text {
-        x: 0px;
-        y: 25px;
-        width: max(120px, root.action-start - 8px);
-        height: 19px;
-        text: root.period-label;
-        color: DesignTokens.text-secondary;
-        font-size: DesignTokens.text-caption;
+        x: 46px;
+        y: 31px;
+        width: 154px;
+        height: 17px;
+        text: root.strings.product-version;
+        color: DesignTokens.main-label;
+        font-size: 12px;
         vertical-alignment: center;
         overflow: elide;
     }
     MainAccountSelect {
         x: root.account-x;
-        y: 6px;
-        width: root.account-select-width;
-        height: 36px;
+        y: 4px;
+        width: 250px;
+        height: 44px;
         visible: root.show-account-selector;
         model: root.account-options;
         empty-label: root.strings.account-selector-heading;
+        field-label: root.strings.account-selector-heading;
         current-index: root.selected-account-index;
         selected(value) => { root.select-account(value); }
     }
     Rectangle {
         x: root.graph-x;
-        y: 6px;
+        y: 10px;
         width: root.graph-button-width;
-        height: 36px;
-        border-radius: DesignTokens.radius-control;
+        height: 32px;
+        border-radius: 6px;
         border-width: 1px;
-        border-color: DesignTokens.border-subtle;
-        background: DesignTokens.raised;
+        border-color: DesignTokens.main-command-border;
+        background: DesignTokens.main-command;
         visible: root.show-graph;
         Text {
-            x: 8px;
-            width: parent.width - 16px;
+            x: 4px;
+            width: parent.width - 8px;
             height: parent.height;
-            text: root.strings.usage-trend;
-            color: DesignTokens.text-primary;
-            font-size: DesignTokens.text-body;
+            text: "▥ " + root.strings.graph;
+            color: DesignTokens.main-text-primary;
+            font-size: 12px;
             font-weight: 700;
             horizontal-alignment: center;
             vertical-alignment: center;
@@ -560,20 +596,20 @@ export component Header inherits Rectangle {
     }
     Rectangle {
         x: root.legal-x;
-        y: 6px;
+        y: 10px;
         width: root.legal-button-width;
-        height: 36px;
-        border-radius: DesignTokens.radius-control;
+        height: 32px;
+        border-radius: 6px;
         border-width: 1px;
-        border-color: DesignTokens.border-subtle;
-        background: DesignTokens.raised;
+        border-color: DesignTokens.main-command-border;
+        background: DesignTokens.main-command;
         Text {
-            x: 8px;
-            width: parent.width - 16px;
+            x: 4px;
+            width: parent.width - 8px;
             height: parent.height;
-            text: root.strings.legal-notices;
-            color: DesignTokens.text-primary;
-            font-size: DesignTokens.text-body;
+            text: "ⓘ " + root.strings.legal-notices;
+            color: DesignTokens.main-text-primary;
+            font-size: 12px;
             font-weight: 700;
             horizontal-alignment: center;
             vertical-alignment: center;
@@ -585,20 +621,20 @@ export component Header inherits Rectangle {
     }
     Rectangle {
         x: root.settings-x;
-        y: 6px;
+        y: 10px;
         width: root.settings-button-width;
-        height: 36px;
-        border-radius: DesignTokens.radius-control;
+        height: 32px;
+        border-radius: 6px;
         border-width: 1px;
-        border-color: DesignTokens.border-subtle;
-        background: DesignTokens.raised;
+        border-color: DesignTokens.main-command-border;
+        background: DesignTokens.main-command;
         Text {
-            x: 8px;
-            width: parent.width - 16px;
+            x: 4px;
+            width: parent.width - 8px;
             height: parent.height;
-            text: root.strings.settings;
-            color: DesignTokens.text-primary;
-            font-size: DesignTokens.text-body;
+            text: "⚙ " + root.strings.settings;
+            color: DesignTokens.main-text-primary;
+            font-size: 12px;
             font-weight: 700;
             horizontal-alignment: center;
             vertical-alignment: center;
@@ -608,8 +644,9 @@ export component Header inherits Rectangle {
     }
     WindowControls {
         x: parent.width - root.window-control-width;
-        y: 10px;
+        y: 12px;
         show-maximize: false;
+        compact: true;
         minimize => { root.minimize-window(); }
         close => { root.close-window(); }
     }
@@ -622,66 +659,69 @@ export component RemainingQuota inherits Rectangle {
     in property <string> estimated-cost-label;
     in property <float> remaining-percent;
     in property <bool> has-quota-percent: true;
-    height: 96px;
-    background: DesignTokens.raised;
+    height: 82px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: DesignTokens.main-section-border;
+    background: DesignTokens.main-section;
 
     Text {
-        x: 20px;
-        y: 9px;
-        width: parent.width - 40px;
-        height: 18px;
+        x: 14px;
+        y: 6px;
+        width: parent.width - 28px;
+        height: 16px;
         text: root.quota-title;
-        color: DesignTokens.text-secondary;
-        font-size: DesignTokens.text-caption;
+        color: DesignTokens.main-label;
+        font-size: 12px;
         font-weight: 700;
         vertical-alignment: center;
     }
     Text {
-        x: 20px;
-        y: 25px;
-        width: parent.width - 268px;
-        height: 48px;
+        x: 14px;
+        y: 20px;
+        width: parent.width - 252px;
+        height: 46px;
         text: remaining-label;
-        color: DesignTokens.accent-primary;
-        font-size: 40px;
+        color: DesignTokens.main-text-primary;
+        font-size: 36px;
         font-weight: 700;
         vertical-alignment: center;
         overflow: elide;
     }
     Text {
-        x: parent.width - 236px;
-        y: 25px;
-        width: 216px;
-        height: 48px;
+        x: parent.width - 224px;
+        y: 20px;
+        width: 210px;
+        height: 46px;
         text: root.estimated-cost-label;
         visible: root.has-quota-percent;
-        color: DesignTokens.text-secondary;
-        font-size: 13px;
+        color: DesignTokens.main-estimate;
+        font-size: 20px;
         font-weight: 700;
         horizontal-alignment: right;
         vertical-alignment: center;
     }
     if root.has-quota-percent : Rectangle {
-        x: 20px;
-        y: 81px;
-        width: parent.width - 40px;
-        height: 8px;
+        x: 14px;
+        y: 70px;
+        width: parent.width - 28px;
+        height: 6px;
         // Avoid a rounded clip here. Slint's X11 software renderer leaks this
         // specific dynamic full-width clip into later rows at 100%. The fill
         // stays a simple left-to-right bar in every boundary state.
         background: DesignTokens.accent-muted;
     }
     if root.has-quota-percent && root.remaining-percent > 0 : Rectangle {
-        x: 20px;
-        y: 81px;
+        x: 14px;
+        y: 70px;
         // Keep the software renderer away from its exact parent-width clip
         // edge. 0.01px is sub-pixel at the supported scale and renders as a
         // visually full 100% bar without corrupting subsequent rows.
         width: min(
-            parent.width - 40.01px,
-            (parent.width - 40px) * min(100, max(0, root.remaining-percent)) / 100
+            parent.width - 28.01px,
+            (parent.width - 28px) * min(100, max(0, root.remaining-percent)) / 100
         );
-        height: 8px;
+        height: 6px;
         background: DesignTokens.accent-primary;
     }
 }
@@ -698,6 +738,7 @@ component DayFill inherits Rectangle {
 component ActionButton inherits Rectangle {
     in property <string> text;
     in property <bool> primary: false;
+    in property <bool> refresh-style: false;
     in property <bool> enabled: true;
     // Close buttons must hide their window on pointer-down. Other actions keep
     // the normal click-on-release behavior so they are not triggered twice.
@@ -713,8 +754,11 @@ component ActionButton inherits Rectangle {
     height: DesignTokens.control-height;
     border-radius: DesignTokens.radius-control;
     border-width: 1px;
-    border-color: root.primary ? DesignTokens.accent-primary : DesignTokens.border-subtle;
-    background: root.primary
+    border-color: root.refresh-style ? DesignTokens.main-refresh-border
+        : root.primary ? DesignTokens.accent-primary : DesignTokens.border-subtle;
+    background: root.refresh-style
+        ? (touch-area.pressed ? DesignTokens.graph-control-hover : DesignTokens.main-refresh)
+        : root.primary
         ? (touch-area.pressed ? DesignTokens.accent-muted : DesignTokens.accent-primary)
         : (touch-area.pressed ? DesignTokens.graph-control-selected : DesignTokens.raised);
 
@@ -723,7 +767,8 @@ component ActionButton inherits Rectangle {
         width: parent.width - 16px;
         height: parent.height;
         text: root.text;
-        color: root.primary ? DesignTokens.canvas : DesignTokens.text-primary;
+        color: root.refresh-style ? DesignTokens.main-text-primary
+            : root.primary ? DesignTokens.canvas : DesignTokens.text-primary;
         font-size: DesignTokens.text-body;
         font-weight: 700;
         horizontal-alignment: center;
@@ -753,83 +798,94 @@ export component WeekGauge inherits Rectangle {
     in property <string> remaining-label;
     in property <string> reset-label;
     in property <string> observed-label;
-    property <length> segment-width: (root.width - 64px) / 7;
-    height: 76px;
-    background: DesignTokens.raised;
+    in property <bool> show-gauge: true;
+    property <length> segment-width: (root.width - 48px) / 7;
+    height: 78px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: DesignTokens.main-section-border;
+    background: DesignTokens.main-section;
 
     Text {
-        x: 20px;
-        y: 7px;
-        width: parent.width - 40px;
+        x: 12px;
+        y: 5px;
+        width: parent.width - 24px;
         height: 18px;
         text: root.remaining-label;
-        color: DesignTokens.text-secondary;
-        font-size: DesignTokens.text-caption;
+        color: DesignTokens.main-label;
+        font-size: 12px;
         font-weight: 600;
         vertical-alignment: center;
         overflow: elide;
     }
     DaySegment {
-        x: 20px;
-        y: 26px;
-        width: (parent.width - 64px) / 7;
+        x: 12px;
+        y: 24px;
+        width: root.segment-width;
         height: 20px;
         fill: root.remaining-days;
+        visible: root.show-gauge;
     }
     DaySegment {
-        x: 20px + (parent.width - 64px) / 7 + 4px;
-        y: 26px;
-        width: (parent.width - 64px) / 7;
+        x: 12px + root.segment-width + 4px;
+        y: 24px;
+        width: root.segment-width;
         height: 20px;
         fill: root.remaining-days - 1;
+        visible: root.show-gauge;
     }
     DaySegment {
-        x: 20px + 2 * ((parent.width - 64px) / 7 + 4px);
-        y: 26px;
-        width: (parent.width - 64px) / 7;
+        x: 12px + 2 * (root.segment-width + 4px);
+        y: 24px;
+        width: root.segment-width;
         height: 20px;
         fill: root.remaining-days - 2;
+        visible: root.show-gauge;
     }
     DaySegment {
-        x: 20px + 3 * ((parent.width - 64px) / 7 + 4px);
-        y: 26px;
-        width: (parent.width - 64px) / 7;
+        x: 12px + 3 * (root.segment-width + 4px);
+        y: 24px;
+        width: root.segment-width;
         height: 20px;
         fill: root.remaining-days - 3;
+        visible: root.show-gauge;
     }
     DaySegment {
-        x: 20px + 4 * ((parent.width - 64px) / 7 + 4px);
-        y: 26px;
-        width: (parent.width - 64px) / 7;
+        x: 12px + 4 * (root.segment-width + 4px);
+        y: 24px;
+        width: root.segment-width;
         height: 20px;
         fill: root.remaining-days - 4;
+        visible: root.show-gauge;
     }
     DaySegment {
-        x: 20px + 5 * ((parent.width - 64px) / 7 + 4px);
-        y: 26px;
-        width: (parent.width - 64px) / 7;
+        x: 12px + 5 * (root.segment-width + 4px);
+        y: 24px;
+        width: root.segment-width;
         height: 20px;
         fill: root.remaining-days - 5;
+        visible: root.show-gauge;
     }
     DaySegment {
-        x: 20px + 6 * ((parent.width - 64px) / 7 + 4px);
-        y: 26px;
-        width: (parent.width - 64px) / 7;
+        x: 12px + 6 * (root.segment-width + 4px);
+        y: 24px;
+        width: root.segment-width;
         height: 20px;
         fill: root.remaining-days - 6;
+        visible: root.show-gauge;
     }
-    if root.remaining-days > 0 : DayFill { x: 20px; y: 26px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days)); height: 20px; }
-    if root.remaining-days - 1 > 0 : DayFill { x: 20px + root.segment-width + 4px; y: 26px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 1)); height: 20px; }
-    if root.remaining-days - 2 > 0 : DayFill { x: 20px + 2 * (root.segment-width + 4px); y: 26px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 2)); height: 20px; }
-    if root.remaining-days - 3 > 0 : DayFill { x: 20px + 3 * (root.segment-width + 4px); y: 26px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 3)); height: 20px; }
-    if root.remaining-days - 4 > 0 : DayFill { x: 20px + 4 * (root.segment-width + 4px); y: 26px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 4)); height: 20px; }
-    if root.remaining-days - 5 > 0 : DayFill { x: 20px + 5 * (root.segment-width + 4px); y: 26px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 5)); height: 20px; }
-    if root.remaining-days - 6 > 0 : DayFill { x: 20px + 6 * (root.segment-width + 4px); y: 26px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 6)); height: 20px; }
-    Text { x: 20px; y: 51px; width: (parent.width - 48px) / 2; height: 18px;
-        text: root.reset-label; color: DesignTokens.text-muted; font-size: 11px;
+    if root.show-gauge && root.remaining-days > 0 : DayFill { x: 12px; y: 24px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days)); height: 20px; }
+    if root.show-gauge && root.remaining-days - 1 > 0 : DayFill { x: 12px + root.segment-width + 4px; y: 24px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 1)); height: 20px; }
+    if root.show-gauge && root.remaining-days - 2 > 0 : DayFill { x: 12px + 2 * (root.segment-width + 4px); y: 24px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 2)); height: 20px; }
+    if root.show-gauge && root.remaining-days - 3 > 0 : DayFill { x: 12px + 3 * (root.segment-width + 4px); y: 24px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 3)); height: 20px; }
+    if root.show-gauge && root.remaining-days - 4 > 0 : DayFill { x: 12px + 4 * (root.segment-width + 4px); y: 24px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 4)); height: 20px; }
+    if root.show-gauge && root.remaining-days - 5 > 0 : DayFill { x: 12px + 5 * (root.segment-width + 4px); y: 24px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 5)); height: 20px; }
+    if root.show-gauge && root.remaining-days - 6 > 0 : DayFill { x: 12px + 6 * (root.segment-width + 4px); y: 24px; width: min(root.segment-width - 1px, root.segment-width * min(1, root.remaining-days - 6)); height: 20px; }
+    Text { x: 12px; y: 49px; width: (parent.width - 32px) / 2; height: 20px;
+        text: root.reset-label; color: DesignTokens.main-label; font-size: 11px;
         vertical-alignment: center; overflow: elide; }
-    Text { x: 28px + (parent.width - 48px) / 2; y: 51px; width: (parent.width - 48px) / 2; height: 18px;
-        text: root.observed-label; color: DesignTokens.text-muted; font-size: 11px;
+    Text { x: 20px + (parent.width - 32px) / 2; y: 49px; width: (parent.width - 32px) / 2; height: 20px;
+        text: root.observed-label; color: DesignTokens.main-label; font-size: 11px;
         horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
 }
 
@@ -871,6 +927,7 @@ component ThreadModelStat inherits Rectangle {
 export component AccountActivity inherits Rectangle {
     in property <UiStrings> strings;
     in property <string> active-thread-count-label;
+    in property <bool> show-content: true;
     in property <bool> has-active-thread: false;
     in property <int> active-thread-count: 0;
     in property <int> sol-count: 0;
@@ -879,87 +936,95 @@ export component AccountActivity inherits Rectangle {
     in property <int> astra-count: 0;
     in property <int> other-count: 0;
     callback open-threads();
-    height: 52px;
-    border-radius: DesignTokens.radius-surface;
-    background: DesignTokens.raised;
+    private property <length> model-area-x: 260px;
+    private property <length> model-stat-width: (root.width - 348px) / 5;
+    height: 56px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: DesignTokens.main-section-border;
+    background: DesignTokens.main-section;
 
     Text {
-        x: 20px;
-        y: 7px;
-        width: 200px;
+        x: 12px;
+        y: 5px;
+        width: 240px;
         height: 14px;
+        visible: root.show-content;
         text: root.strings.active-threads;
-        color: DesignTokens.text-muted;
+        color: DesignTokens.main-label;
         font-size: 11px;
         font-weight: 600;
         vertical-alignment: center;
     }
-    if root.has-active-thread : Text {
-        x: 20px;
-        y: 20px;
-        width: 200px;
-        height: 24px;
+    if root.show-content && root.has-active-thread : Text {
+        x: 12px;
+        y: 18px;
+        width: 240px;
+        height: 30px;
         text: root.active-thread-count-label;
-        color: DesignTokens.accent-primary;
-        font-size: 18px;
+        color: DesignTokens.main-text-primary;
+        font-size: 22px;
         font-weight: 700;
         vertical-alignment: center;
     }
-    if root.has-active-thread : ThreadModelStat {
-        x: 240px;
-        y: 5px;
+    if root.show-content && root.has-active-thread : ThreadModelStat {
+        x: root.model-area-x;
+        y: 7px;
+        width: root.model-stat-width;
         label: "SOL";
         count: root.sol-count;
-        indicator-color: DesignTokens.graph-remaining;
+        indicator-color: DesignTokens.main-thread-sol;
     }
-    if root.has-active-thread : ThreadModelStat {
-        x: 320px;
-        y: 5px;
-        width: 92px;
+    if root.show-content && root.has-active-thread : ThreadModelStat {
+        x: root.model-area-x + root.model-stat-width;
+        y: 7px;
+        width: root.model-stat-width;
         label: "TERRA";
         count: root.terra-count;
-        indicator-color: DesignTokens.graph-terra;
+        indicator-color: DesignTokens.main-thread-terra;
     }
-    if root.has-active-thread : ThreadModelStat {
-        x: 412px;
-        y: 5px;
+    if root.show-content && root.has-active-thread : ThreadModelStat {
+        x: root.model-area-x + 2 * root.model-stat-width;
+        y: 7px;
+        width: root.model-stat-width;
         label: "LUNA";
         count: root.luna-count;
-        indicator-color: DesignTokens.graph-luna;
+        indicator-color: DesignTokens.main-thread-luna;
     }
-    if root.has-active-thread : ThreadModelStat {
-        x: 492px;
-        y: 5px;
-        width: 92px;
+    if root.show-content && root.has-active-thread : ThreadModelStat {
+        x: root.model-area-x + 3 * root.model-stat-width;
+        y: 7px;
+        width: root.model-stat-width;
         label: "ASTRA";
         count: root.astra-count;
-        indicator-color: DesignTokens.graph-astra;
+        indicator-color: DesignTokens.main-thread-astra;
     }
-    if root.has-active-thread : ThreadModelStat {
-        x: 584px;
-        y: 5px;
-        width: 100px;
+    if root.show-content && root.has-active-thread : ThreadModelStat {
+        x: root.model-area-x + 4 * root.model-stat-width;
+        y: 7px;
+        width: root.model-stat-width;
         label: root.strings.other;
         count: root.other-count;
-        indicator-color: DesignTokens.text-muted;
+        indicator-color: DesignTokens.main-label;
     }
-    if root.has-active-thread : ActionButton {
-        x: parent.width - 112px;
-        y: 14px;
-        width: 100px;
-        height: 24px;
+    if root.show-content && root.has-active-thread : ActionButton {
+        x: parent.width - 80px;
+        y: 13px;
+        width: 68px;
+        height: 30px;
         text: root.strings.details;
         primary: false;
+        refresh-style: true;
         clicked => { root.open-threads(); }
     }
-    if !root.has-active-thread : Text {
-        x: 20px;
-        y: 23px;
-        width: parent.width - 40px;
+    if root.show-content && !root.has-active-thread : Text {
+        x: 12px;
+        y: 24px;
+        width: parent.width - 24px;
         height: 20px;
         text: root.strings.no-running-threads;
-        color: DesignTokens.text-muted;
-        font-size: DesignTokens.text-caption;
+        color: DesignTokens.main-label;
+        font-size: 12px;
         vertical-alignment: center;
     }
 }
@@ -1587,6 +1652,7 @@ export component ThreadsWindow inherits Window {
 
 export component ModelUsage inherits Rectangle {
     in property <UiStrings> strings;
+    in property <bool> has-data: false;
     in property <string> model-names;
     in property <string> input-token-rows;
     in property <string> input-cost-rows;
@@ -1596,54 +1662,66 @@ export component ModelUsage inherits Rectangle {
     in property <string> output-cost-rows;
     property <length> model-column-width: 108px;
     property <length> group-gap: 4px;
-    property <length> group-width: (root.width - 40px - root.model-column-width - 3 * root.group-gap) / 3;
+    property <length> group-width: (root.width - 24px - root.model-column-width - 3 * root.group-gap) / 3;
     property <length> dollar-width: 50px;
-    height: 100px;
-    border-radius: DesignTokens.radius-surface;
-    background: DesignTokens.raised;
+    height: 102px;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: DesignTokens.main-section-border;
+    background: DesignTokens.main-section;
 
-    Text { x: 20px; y: 9px; width: root.model-column-width; height: 16px;
-        text: root.strings.model; color: DesignTokens.text-muted;
+    Text { x: 12px; y: 7px; width: root.model-column-width; height: 18px;
+        text: root.strings.model; color: DesignTokens.main-label;
         font-size: DesignTokens.text-caption; vertical-alignment: center; overflow: elide; }
-    Text { x: 20px + root.model-column-width + root.group-gap; y: 9px; width: root.group-width - root.dollar-width; height: 16px;
-        text: root.strings.input; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption;
+    Text { x: 12px + root.model-column-width + root.group-gap; y: 7px; width: root.group-width - root.dollar-width; height: 18px;
+        text: root.strings.input; color: DesignTokens.main-label; font-size: DesignTokens.text-caption;
         horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
-    Text { x: 20px + root.model-column-width + root.group-gap + root.group-width - root.dollar-width; y: 9px; width: root.dollar-width; height: 16px;
-        text: "$"; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption;
+    Text { x: 12px + root.model-column-width + root.group-gap + root.group-width - root.dollar-width; y: 7px; width: root.dollar-width; height: 18px;
+        text: "$"; color: DesignTokens.main-label; font-size: DesignTokens.text-caption;
         horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
-    Text { x: 20px + root.model-column-width + 2 * root.group-gap + root.group-width; y: 9px; width: root.group-width - root.dollar-width; height: 16px;
-        text: root.strings.cached; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption;
+    Text { x: 12px + root.model-column-width + 2 * root.group-gap + root.group-width; y: 7px; width: root.group-width - root.dollar-width; height: 18px;
+        text: root.strings.cached; color: DesignTokens.main-label; font-size: DesignTokens.text-caption;
         horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
-    Text { x: 20px + root.model-column-width + 2 * root.group-gap + 2 * root.group-width - root.dollar-width; y: 9px; width: root.dollar-width; height: 16px;
-        text: "$"; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption;
+    Text { x: 12px + root.model-column-width + 2 * root.group-gap + 2 * root.group-width - root.dollar-width; y: 7px; width: root.dollar-width; height: 18px;
+        text: "$"; color: DesignTokens.main-label; font-size: DesignTokens.text-caption;
         horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
-    Text { x: 20px + root.model-column-width + 3 * root.group-gap + 2 * root.group-width; y: 9px; width: root.group-width - root.dollar-width; height: 16px;
-        text: root.strings.output; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption;
+    Text { x: 12px + root.model-column-width + 3 * root.group-gap + 2 * root.group-width; y: 7px; width: root.group-width - root.dollar-width; height: 18px;
+        text: root.strings.output; color: DesignTokens.main-label; font-size: DesignTokens.text-caption;
         horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
-    Text { x: 20px + root.model-column-width + 3 * root.group-gap + 3 * root.group-width - root.dollar-width; y: 9px; width: root.dollar-width; height: 16px;
-        text: "$"; color: DesignTokens.text-muted; font-size: DesignTokens.text-caption;
+    Text { x: 12px + root.model-column-width + 3 * root.group-gap + 3 * root.group-width - root.dollar-width; y: 7px; width: root.dollar-width; height: 18px;
+        text: "$"; color: DesignTokens.main-label; font-size: DesignTokens.text-caption;
         horizontal-alignment: right; vertical-alignment: center; overflow: elide; }
-    Text { x: 20px; y: 30px; width: root.model-column-width; height: 60px;
-        text: root.model-names; color: DesignTokens.text-primary;
+    Text { x: 12px; y: 28px; width: root.model-column-width; height: 66px;
+        visible: root.has-data; text: root.model-names; color: DesignTokens.main-text-primary;
         font-size: DesignTokens.text-caption; vertical-alignment: top; overflow: elide; }
-    Text { x: 20px + root.model-column-width + root.group-gap; y: 30px; width: root.group-width - root.dollar-width; height: 60px;
-        text: root.input-token-rows; color: DesignTokens.text-primary;
+    Text { x: 12px + root.model-column-width + root.group-gap; y: 28px; width: root.group-width - root.dollar-width; height: 66px;
+        visible: root.has-data; text: root.input-token-rows; color: DesignTokens.main-text-primary;
         font-size: DesignTokens.text-caption; horizontal-alignment: right; vertical-alignment: top; overflow: elide; }
-    Text { x: 20px + root.model-column-width + root.group-gap + root.group-width - root.dollar-width; y: 30px; width: root.dollar-width; height: 60px;
-        text: root.input-cost-rows; color: DesignTokens.text-primary;
+    Text { x: 12px + root.model-column-width + root.group-gap + root.group-width - root.dollar-width; y: 28px; width: root.dollar-width; height: 66px;
+        visible: root.has-data; text: root.input-cost-rows; color: DesignTokens.main-text-primary;
         font-size: DesignTokens.text-caption; horizontal-alignment: right; vertical-alignment: top; overflow: elide; }
-    Text { x: 20px + root.model-column-width + 2 * root.group-gap + root.group-width; y: 30px; width: root.group-width - root.dollar-width; height: 60px;
-        text: root.cached-token-rows; color: DesignTokens.text-primary;
+    Text { x: 12px + root.model-column-width + 2 * root.group-gap + root.group-width; y: 28px; width: root.group-width - root.dollar-width; height: 66px;
+        visible: root.has-data; text: root.cached-token-rows; color: DesignTokens.main-text-primary;
         font-size: DesignTokens.text-caption; horizontal-alignment: right; vertical-alignment: top; overflow: elide; }
-    Text { x: 20px + root.model-column-width + 2 * root.group-gap + 2 * root.group-width - root.dollar-width; y: 30px; width: root.dollar-width; height: 60px;
-        text: root.cached-cost-rows; color: DesignTokens.text-primary;
+    Text { x: 12px + root.model-column-width + 2 * root.group-gap + 2 * root.group-width - root.dollar-width; y: 28px; width: root.dollar-width; height: 66px;
+        visible: root.has-data; text: root.cached-cost-rows; color: DesignTokens.main-text-primary;
         font-size: DesignTokens.text-caption; horizontal-alignment: right; vertical-alignment: top; overflow: elide; }
-    Text { x: 20px + root.model-column-width + 3 * root.group-gap + 2 * root.group-width; y: 30px; width: root.group-width - root.dollar-width; height: 60px;
-        text: root.output-token-rows; color: DesignTokens.text-primary;
+    Text { x: 12px + root.model-column-width + 3 * root.group-gap + 2 * root.group-width; y: 28px; width: root.group-width - root.dollar-width; height: 66px;
+        visible: root.has-data; text: root.output-token-rows; color: DesignTokens.main-text-primary;
         font-size: DesignTokens.text-caption; horizontal-alignment: right; vertical-alignment: top; overflow: elide; }
-    Text { x: 20px + root.model-column-width + 3 * root.group-gap + 3 * root.group-width - root.dollar-width; y: 30px; width: root.dollar-width; height: 60px;
-        text: root.output-cost-rows; color: DesignTokens.text-primary;
+    Text { x: 12px + root.model-column-width + 3 * root.group-gap + 3 * root.group-width - root.dollar-width; y: 28px; width: root.dollar-width; height: 66px;
+        visible: root.has-data; text: root.output-cost-rows; color: DesignTokens.main-text-primary;
         font-size: DesignTokens.text-caption; horizontal-alignment: right; vertical-alignment: top; overflow: elide; }
+    if !root.has-data : Text {
+        x: 12px;
+        y: 28px;
+        width: parent.width - 24px;
+        height: 66px;
+        text: root.strings.no-records;
+        color: DesignTokens.main-label;
+        font-size: 12px;
+        vertical-alignment: center;
+    }
 }
 
 export component StatusBanner inherits Rectangle {
@@ -1652,29 +1730,35 @@ export component StatusBanner inherits Rectangle {
     in property <string> detail;
     in property <string> last-received;
     in property <string> level: "info";
-    in property <bool> show-retry: false;
-    callback retry();
+    in property <bool> show-action: false;
+    in property <string> action-text;
+    in property <bool> action-enabled: true;
+    callback action();
+    private property <length> action-width: root.action-text == root.strings.retry ? 92px : 112px;
     height: 42px;
-    border-radius: DesignTokens.radius-control;
-    border-color: level == "error" ? DesignTokens.danger :
-        level == "warning" ? DesignTokens.warning : DesignTokens.border-subtle;
-    background: DesignTokens.raised;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: level == "error" ? DesignTokens.main-status-error-border :
+        level == "warning" ? DesignTokens.main-status-warning-border : DesignTokens.main-status-normal-border;
+    background: level == "error" ? DesignTokens.main-status-error-background :
+        level == "warning" ? DesignTokens.main-status-warning-background : DesignTokens.main-status-normal-background;
 
     Rectangle {
         x: 10px;
         y: 17px;
-        width: 7px;
-        height: 7px;
-        background: level == "error" ? DesignTokens.danger :
-            level == "warning" ? DesignTokens.warning : DesignTokens.success;
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        background: level == "error" ? DesignTokens.main-status-error-accent :
+            level == "warning" ? DesignTokens.main-status-warning-accent : DesignTokens.main-status-normal-accent;
     }
     Text {
         x: 28px;
         y: 3px;
-        width: parent.width - (root.show-retry ? 330px : 250px);
+        width: root.show-action ? parent.width - root.action-width - 48px : parent.width - 250px;
         height: 17px;
         text: root.title;
-        color: DesignTokens.text-primary;
+        color: DesignTokens.main-text-primary;
         font-weight: 700;
         font-size: DesignTokens.text-caption;
         vertical-alignment: center;
@@ -1683,35 +1767,38 @@ export component StatusBanner inherits Rectangle {
     Text {
         x: 28px;
         y: 20px;
-        width: parent.width - (root.show-retry ? 130px : 40px);
+        width: root.show-action ? parent.width - root.action-width - 48px : parent.width - 40px;
         height: 18px;
         text: root.detail;
-        color: DesignTokens.text-secondary;
+        color: DesignTokens.main-label;
         font-size: 11px;
         vertical-alignment: center;
         overflow: elide;
     }
     Text {
-        x: parent.width - (root.show-retry ? 302px : 222px);
+        x: parent.width - 222px;
         y: 3px;
         width: 210px;
         height: 17px;
         text: root.last-received;
-        color: DesignTokens.text-muted;
+        visible: !root.show-action;
+        color: DesignTokens.main-label;
         font-size: 11px;
         horizontal-alignment: right;
         vertical-alignment: center;
         overflow: elide;
     }
     ActionButton {
-        x: parent.width - 84px;
-        y: 5px;
-        width: 76px;
-        height: 32px;
-        text: root.strings.retry;
-        visible: root.show-retry;
+        x: parent.width - root.action-width - 8px;
+        y: 7px;
+        width: root.action-width;
+        height: 28px;
+        text: root.action-text;
+        visible: root.show-action;
+        enabled: root.action-enabled;
         primary: false;
-        clicked => { root.retry(); }
+        refresh-style: true;
+        clicked => { root.action(); }
     }
 }
 

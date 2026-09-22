@@ -179,27 +179,68 @@ def rgb(x, y):
     return data[i + 2], data[i + 1], data[i]
 def near(a, b, tolerance=24):
     return sqrt(sum((a[i] - b[i]) ** 2 for i in range(3))) <= tolerance
-failure_pixels = sum(
-    near(rgb(x, y), (239, 106, 106))
-    for y in range(180, 280)
-    for x in range(35, 720)
-)
-cta_pixels = sum(
-    near(rgb(x, y), (86, 178, 245))
-    for y in range(150, 250)
-    for x in range(35, 430)
-)
-if failure_pixels < 20:
-    print(f'selected-endpoint failure text is missing: pixels={failure_pixels}', file=sys.stderr)
+def count_near(bounds, color, tolerance=8):
+    x0, y0, x1, y1 = bounds
+    return sum(
+        near(rgb(x, y), color, tolerance)
+        for y in range(y0, y1)
+        for x in range(x0, x1)
+    )
+status_bounds = (22, 424, 878, 466)
+title_bounds = (50, 427, 766, 444)
+detail_bounds = (50, 444, 766, 462)
+accent_bounds = (32, 441, 40, 449)
+retry_bounds = (778, 431, 870, 459)
+error_background = (58, 29, 36)
+error_border = (142, 61, 77)
+error_accent = (224, 107, 122)
+main_text = (242, 246, 252)
+main_label = (168, 183, 202)
+retry_background = (41, 73, 104)
+retry_border = (71, 118, 159)
+background_pixels = count_near(status_bounds, error_background)
+border_pixels = count_near(status_bounds, error_border)
+accent_pixels = count_near(accent_bounds, error_accent)
+title_pixels = count_near(title_bounds, main_text)
+detail_pixels = count_near(detail_bounds, main_label)
+retry_background_pixels = count_near(retry_bounds, retry_background)
+retry_border_pixels = count_near(retry_bounds, retry_border)
+retry_text_pixels = count_near(retry_bounds, main_text)
+if background_pixels < 20000:
+    print(f'selected-endpoint error background is missing: pixels={background_pixels}', file=sys.stderr)
     raise SystemExit(75)
-if cta_pixels < 500:
-    print(f'failure recovery action is missing: pixels={cta_pixels}', file=sys.stderr)
+if border_pixels < 1000:
+    print(f'selected-endpoint error border is missing: pixels={border_pixels}', file=sys.stderr)
     raise SystemExit(75)
-print(f'x11-startup-failure-port-gate: PASS (window retained, selected-endpoint failure pixels={failure_pixels}, recovery pixels={cta_pixels})')
+if accent_pixels < 20:
+    print(f'selected-endpoint error accent is missing: pixels={accent_pixels}', file=sys.stderr)
+    raise SystemExit(75)
+if title_pixels < 20:
+    print(f'selected-endpoint error title is missing: pixels={title_pixels}', file=sys.stderr)
+    raise SystemExit(75)
+if detail_pixels < 20:
+    print(f'selected-endpoint error detail is missing: pixels={detail_pixels}', file=sys.stderr)
+    raise SystemExit(75)
+if retry_background_pixels < 1200:
+    print(f'failure Retry background is missing: pixels={retry_background_pixels}', file=sys.stderr)
+    raise SystemExit(75)
+if retry_border_pixels < 100:
+    print(f'failure Retry border is missing: pixels={retry_border_pixels}', file=sys.stderr)
+    raise SystemExit(75)
+if retry_text_pixels < 20:
+    print(f'failure Retry text is missing: pixels={retry_text_pixels}', file=sys.stderr)
+    raise SystemExit(75)
+print(
+    'x11-startup-failure-port-gate: PASS '
+    f'(window retained, error background={background_pixels}, border={border_pixels}, '
+    f'accent={accent_pixels}, title={title_pixels}, detail={detail_pixels}, '
+    f'Retry background={retry_background_pixels}, border={retry_border_pixels}, '
+    f'text={retry_text_pixels})'
+)
 PY
 }
 failure_frame_ready=0
-for _ in $(seq 1 "$((121 - failure_attempt))"); do
+for _ in $(seq 1 120); do
     kill -0 "$failure_pid" 2>/dev/null || fail 'failure-port GUI exited before rendering'
     if xwd -silent -id "$failure_window_id" -out "$temp_root/failure.xwd" 2>/dev/null; then
         if validate_failure_image "$temp_root/failure.xwd" >"$temp_root/failure-check.out" 2>"$temp_root/failure-check.err"; then
