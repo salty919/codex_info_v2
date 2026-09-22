@@ -274,7 +274,8 @@ component順や表示所有者を変更しない。
   確認中・再試行のうち該当する単一CTAだけを末尾StatusBannerに置く。認証要求の
   StatusBannerはWindowsと同じwarning配色を使う。
 - Mainのcanvasは`#0E141E`、通常cardはbackground `#151F2D`・border `#263548`/`1px`・
-  radius `8px`とする。status cardだけはWindowsのnormal
+  radius `8px`とする。各Main cardのrootを唯一の外枠とし、同じcardを囲む追加wrapper frameを
+  重ねない。status cardだけはWindowsのnormal
   `#143426/#276C49/#4FB878`、warning `#3A2A13/#8A651F/#D5A43A`、error
   `#3A1D24/#8E3D4D/#E06B7A`（background/border/accent）を使い、状態によってcanvas全体を
   着色しない。
@@ -298,6 +299,9 @@ component順や表示所有者を変更しない。
 - エラーは既存値を保持するか未取得として明示し、0や100を仮の有効値として表示しない。
 - 数値、単位、説明、状態、操作の文字サイズと太さに役割差を付ける。細すぎるフォント、薄すぎる文字、
   余白だけで分断されたカードは採用しない。
+- `ui/components.slint`のMain component root styleを変更する場合は、同fileを`include_str!`で参照する
+  既存Rust source oracleを逆引きし、Issue固有testと実画面gateに加えてworkspace/all-targets testを
+  実行する。focused selectorまたはpixel gateだけで既存source oracleとの整合をverifiedにしない。
 
 ### 4.2 Trends / Graph（master: `CUM-138-06`）
 

@@ -47486,19 +47486,60 @@ mod tests {
     #[test]
     fn non_graph_surfaces_do_not_add_outer_frames() {
         let source = include_str!("../ui/components.slint");
-        for name in [
-            "export component RemainingQuota inherits Rectangle {",
-            "export component WeekGauge inherits Rectangle {",
-            "export component AccountActivity inherits Rectangle {",
-            "export component ModelUsage inherits Rectangle {",
-            "export component StatusBanner inherits Rectangle {",
+        for (name, end, status) in [
+            (
+                "export component RemainingQuota inherits Rectangle {",
+                "component DaySegment inherits Rectangle {",
+                false,
+            ),
+            (
+                "export component WeekGauge inherits Rectangle {",
+                "component ThreadModelStat inherits Rectangle {",
+                false,
+            ),
+            (
+                "export component AccountActivity inherits Rectangle {",
+                "export component LegalNoticeWindow inherits Window {",
+                false,
+            ),
+            (
+                "export component ModelUsage inherits Rectangle {",
+                "export component StatusBanner inherits Rectangle {",
+                false,
+            ),
+            (
+                "export component StatusBanner inherits Rectangle {",
+                "export component TimeZoneSettingsWindow inherits Window {",
+                true,
+            ),
         ] {
-            let body = source.split(name).nth(1).expect(name);
-            let header = body.lines().take(12).collect::<Vec<_>>().join("\n");
-            assert!(
-                !header.contains("border-width: 1px;"),
-                "unexpected frame: {name}"
+            let body = source
+                .split(name)
+                .nth(1)
+                .and_then(|body| body.split(end).next())
+                .expect(name);
+            let root_style = body.split("\n\n    ").next().expect("Main card root style");
+            assert_eq!(
+                body.matches("border-width: 1px;").count(),
+                1,
+                "Main card must have exactly one root frame: {name}"
             );
+            assert!(
+                root_style.contains("border-width: 1px;"),
+                "frame must belong to the Main card root: {name}"
+            );
+            assert!(
+                root_style.contains("border-radius: 8px;"),
+                "missing radius: {name}"
+            );
+            if status {
+                assert!(root_style.contains("DesignTokens.main-status-normal-border"));
+                assert!(root_style.contains("DesignTokens.main-status-warning-border"));
+                assert!(root_style.contains("DesignTokens.main-status-error-border"));
+            } else {
+                assert!(root_style.contains("border-color: DesignTokens.main-section-border;"));
+                assert!(root_style.contains("background: DesignTokens.main-section;"));
+            }
         }
     }
 
