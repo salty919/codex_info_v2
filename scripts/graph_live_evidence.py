@@ -757,7 +757,8 @@ def _model_segments(
             causes.append("model_token_anomaly" if metric == "tokens" else "model_dollar_anomaly")
         previous_value = projection[previous].value
         current_value = projection[index].value
-        assert previous_value is not None and current_value is not None
+        if previous_value is None or current_value is None:
+            raise EvidenceError("exact model anchors must have finite values")
         if current_value < previous_value:
             causes.append("model_token_anomaly" if metric == "tokens" else "model_dollar_anomaly")
         style = (
@@ -1812,7 +1813,6 @@ def capture(
     if not isinstance(periods, list):
         raise EvidenceError("periods response history_periods is not an array")
     period = _select_period(periods, period_id, account_id)
-    encoded_period = urllib.parse.quote(period["id"], safe="")
     samples: list[dict[str, Any]] = []
     gaps: list[dict[str, Any]] = []
     cursor: str | None = None

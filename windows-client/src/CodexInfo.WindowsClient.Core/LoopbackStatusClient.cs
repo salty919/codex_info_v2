@@ -3421,7 +3421,8 @@ public sealed class LoopbackStatusClient :
     private static bool HasUnicodeScalarLength(string value, int minimum, int maximum)
     {
         var scalarCount = 0;
-        for (var index = 0; index < value.Length; index++)
+        var index = 0;
+        while (index < value.Length)
         {
             var character = value[index];
             if (char.IsHighSurrogate(character))
@@ -3431,11 +3432,16 @@ public sealed class LoopbackStatusClient :
                     return false;
                 }
 
-                index++;
+                index += 2;
             }
-            else if (char.IsLowSurrogate(character))
+            else
             {
-                return false;
+                if (char.IsLowSurrogate(character))
+                {
+                    return false;
+                }
+
+                index++;
             }
 
             scalarCount++;
