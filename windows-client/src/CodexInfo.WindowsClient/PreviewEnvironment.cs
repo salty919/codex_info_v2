@@ -240,9 +240,9 @@ public sealed class PreviewLoopbackClient : ILoopbackHealthClient, ILoopbackDeta
         new("tree-root", "Release orchestration root", null, "gpt-preview-astra", "ASTRA", 12_400, 4_000, 16_000, now - 5_400, now - 300, false, 0, false),
         new("tree-child-a", "Windows client visual verification", "tree-root", "gpt-preview-sol", "SOL", 6_800, 2_900, 16_000, now - 4_800, now - 420, true, 1, false),
         new("tree-grandchild-a1", "Direct child layout checks", "tree-child-a", "gpt-preview-luna", "LUNA", 3_900, 1_600, 16_000, now - 3_900, now - 540, true, 2, false),
-        new("tree-grandchild-a2", "Distant sibling route and arrow checks", "tree-child-a", "gpt-preview-astra", "ASTRA", 3_700, 1_400, 16_000, now - 3_600, now - 480, true, 2, false),
+        new("tree-greatgrandchild-a1", "Deep accessibility route checks", "tree-grandchild-a1", "gpt-preview-astra", "ASTRA", 3_700, 1_400, 16_000, now - 3_600, now - 480, true, 3, false),
         new("tree-child-b", "Native accessibility evidence review", "tree-root", "gpt-preview-terra", "TERRA", 5_600, 2_700, 16_000, now - 2_700, now - 240, true, 1, false),
         new("tree-grandchild-b1", "UI Automation bounds", "tree-child-b", "gpt-preview-sol", "SOL", 2_800, 1_100, 16_000, now - 2_100, now - 180, true, 2, false),
-        new("tree-grandchild-b2", "Text wrapping and tooltip coverage", "tree-child-b", "gpt-preview-luna", "LUNA", 2_400, 900, 16_000, now - 1_800, now - 120, true, 2, false),
+        new("tree-greatgrandchild-b1", "Text wrapping and tooltip coverage", "tree-grandchild-b1", "gpt-preview-luna", "LUNA", 2_400, 900, 16_000, now - 1_800, now - 120, true, 3, false),
     ];
 }

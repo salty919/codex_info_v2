@@ -78,6 +78,7 @@ public sealed class ThreadsWindowLayoutTests
         Assert.Equal(expectedListWidth.ToString(), treeControl.Attribute("Width")?.Value);
         Assert.Equal("{Binding TreeSurfaceHeight}", treeControl.Attribute("Height")?.Value);
         Assert.Equal("{Binding TreeConnections}", treeControl.Attribute("Connections")?.Value);
+        Assert.Equal("{Binding TreeRootRows}", treeControl.Attribute("RootRows")?.Value);
 
         var title = BoundText(row, "{Binding Title}");
         Assert.Equal("0", title.Attribute("Grid.Column")?.Value);
@@ -178,64 +179,83 @@ public sealed class ThreadsWindowLayoutTests
     }
 
     [Fact]
-    public void ThreadTreeConnectionsUseConventionalPortsAndSharedRails()
+    public void ThreadTreeConnectionsUseCenteredPortsSharedRailsAndJunctions()
     {
         const double treeSurfaceWidth = 860;
         const double cardLeft = 80;
         const double railX = 10;
-        const double childPortY = 116;
-        const double childCardY = 116;
+        const double nestedRailX = 26;
+        const double row0CenterY = 48;
+        const double row1CenterY = 144;
+        const double row2CenterY = 240;
+        const double row3CenterY = 336;
+        const double row4CenterY = 432;
+        const double row7CenterY = 720;
         var direct = ThreadTreeControl.BuildGeometry(
             treeSurfaceWidth,
             192,
             [new ThreadTreeConnection(0, 1, 0)]);
         Assert.Contains(direct.Segments, segment =>
-            segment.Start == new Point(cardLeft, 76) &&
-            segment.End == new Point(railX, 76));
+            segment.Start == new Point(cardLeft, row0CenterY) &&
+            segment.End == new Point(railX, row0CenterY));
         Assert.Contains(direct.Segments, segment =>
-            segment.Start == new Point(railX, 76) &&
-            segment.End == new Point(railX, childPortY));
+            segment.Start == new Point(railX, row0CenterY) &&
+            segment.End == new Point(railX, row1CenterY));
         Assert.Contains(direct.Segments, segment =>
-            segment.Start == new Point(railX, childPortY) &&
-            segment.End == new Point(cardLeft, childPortY));
+            segment.Start == new Point(railX, row1CenterY) &&
+            segment.End == new Point(cardLeft, row1CenterY));
         Assert.Contains(direct.Segments, segment =>
-            segment.Start == new Point(cardLeft, childCardY) &&
-            segment.End == new Point(cardLeft - 7, childCardY - 5));
+            segment.Start == new Point(cardLeft, row1CenterY) &&
+            segment.End == new Point(cardLeft - 7, row1CenterY - 5));
         Assert.Contains(direct.Segments, segment =>
-            segment.Start == new Point(cardLeft, childCardY) &&
-            segment.End == new Point(cardLeft - 7, childCardY + 5));
-        Assert.Null(direct.JunctionDot);
+            segment.Start == new Point(cardLeft, row1CenterY) &&
+            segment.End == new Point(cardLeft - 7, row1CenterY + 5));
+        Assert.Contains(new Point(railX, row0CenterY), direct.Junctions);
+        Assert.Contains(new Point(railX, row1CenterY), direct.Junctions);
+
+        var root = ThreadTreeControl.BuildGeometry(treeSurfaceWidth, 96, [], [0]);
+        Assert.Contains(root.Segments, segment =>
+            segment.Start == new Point(railX, row0CenterY) &&
+            segment.End == new Point(cardLeft, row0CenterY));
+        Assert.Contains(root.Segments, segment =>
+            segment.Start == new Point(cardLeft, row0CenterY) &&
+            segment.End == new Point(cardLeft - 7, row0CenterY - 5));
+        Assert.Contains(root.Segments, segment =>
+            segment.Start == new Point(cardLeft, row0CenterY) &&
+            segment.End == new Point(cardLeft - 7, row0CenterY + 5));
 
         var nested = ThreadTreeControl.BuildGeometry(
             treeSurfaceWidth,
             288,
             [new ThreadTreeConnection(0, 1, 0), new ThreadTreeConnection(1, 2, 1)]);
         Assert.Contains(nested.Segments, segment =>
-            segment.Start == new Point(cardLeft, 172) &&
-            segment.End == new Point(26, 172));
+            segment.Start == new Point(cardLeft, row1CenterY) &&
+            segment.End == new Point(nestedRailX, row1CenterY));
         Assert.Contains(nested.Segments, segment =>
-            segment.Start == new Point(26, 172) &&
-            segment.End == new Point(26, 212));
+            segment.Start == new Point(nestedRailX, row1CenterY) &&
+            segment.End == new Point(nestedRailX, row2CenterY));
         Assert.Contains(nested.Segments, segment =>
-            segment.Start == new Point(26, 212) &&
-            segment.End == new Point(cardLeft, 212));
+            segment.Start == new Point(nestedRailX, row2CenterY) &&
+            segment.End == new Point(cardLeft, row2CenterY));
+        Assert.Contains(new Point(nestedRailX, row1CenterY), nested.Junctions);
+        Assert.Contains(new Point(nestedRailX, row2CenterY), nested.Junctions);
 
         var distant = ThreadTreeControl.BuildGeometry(
             treeSurfaceWidth,
             384,
             [new ThreadTreeConnection(0, 3, 0)]);
         Assert.Contains(distant.Segments, segment =>
-            segment.Start == new Point(cardLeft, 76) &&
-            segment.End == new Point(railX, 76));
+            segment.Start == new Point(cardLeft, row0CenterY) &&
+            segment.End == new Point(railX, row0CenterY));
         Assert.Contains(distant.Segments, segment =>
-            segment.Start == new Point(railX, 76) &&
-            segment.End == new Point(railX, 308));
+            segment.Start == new Point(railX, row0CenterY) &&
+            segment.End == new Point(railX, row3CenterY));
         Assert.Contains(distant.Segments, segment =>
-            segment.Start == new Point(railX, 308) &&
-            segment.End == new Point(cardLeft, 308));
+            segment.Start == new Point(railX, row3CenterY) &&
+            segment.End == new Point(cardLeft, row3CenterY));
         Assert.Contains(distant.Segments, segment =>
-            segment.Start == new Point(cardLeft, 308) &&
-            segment.End == new Point(cardLeft - 7, 303));
+            segment.Start == new Point(cardLeft, row3CenterY) &&
+            segment.End == new Point(cardLeft - 7, row3CenterY - 5));
 
         var threeChildren = ThreadTreeControl.BuildGeometry(
             treeSurfaceWidth,
@@ -246,19 +266,20 @@ public sealed class ThreadsWindowLayoutTests
                 new ThreadTreeConnection(0, 3, 0),
             ]);
         Assert.Contains(threeChildren.Segments, segment =>
-            segment.Start == new Point(cardLeft, 76) && segment.End == new Point(railX, 76));
+            segment.Start == new Point(cardLeft, row0CenterY) && segment.End == new Point(railX, row0CenterY));
         Assert.Contains(threeChildren.Segments, segment =>
-            segment.Start == new Point(railX, 76) && segment.End == new Point(railX, 308));
+            segment.Start == new Point(railX, row0CenterY) && segment.End == new Point(railX, row3CenterY));
         Assert.Contains(threeChildren.Segments, segment =>
-            segment.Start == new Point(railX, 212) && segment.End == new Point(cardLeft, 212));
+            segment.Start == new Point(railX, row2CenterY) && segment.End == new Point(cardLeft, row2CenterY));
         Assert.Contains(threeChildren.Segments, segment =>
-            segment.Start == new Point(railX, 308) && segment.End == new Point(cardLeft, 308));
+            segment.Start == new Point(railX, row3CenterY) && segment.End == new Point(cardLeft, row3CenterY));
         Assert.Contains(threeChildren.Segments, segment =>
-            segment.Start == new Point(cardLeft, 212) && segment.End == new Point(cardLeft - 7, 207));
+            segment.Start == new Point(cardLeft, row2CenterY) && segment.End == new Point(cardLeft - 7, row2CenterY - 5));
         Assert.Equal(
             1,
             threeChildren.Segments.Count(segment =>
-                segment.Start == new Point(railX, 76) && segment.End == new Point(railX, 308)));
+                segment.Start == new Point(railX, row0CenterY) && segment.End == new Point(railX, row3CenterY)));
+        Assert.Equal(4, threeChildren.Junctions.Count);
 
         var mixedBranching = ThreadTreeControl.BuildGeometry(
             treeSurfaceWidth,
@@ -273,15 +294,15 @@ public sealed class ThreadsWindowLayoutTests
                 new ThreadTreeConnection(0, 7, 0),
             ]);
         Assert.Contains(mixedBranching.Segments, segment =>
-            segment.Start == new Point(cardLeft, 172) && segment.End == new Point(26, 172));
+            segment.Start == new Point(cardLeft, row1CenterY) && segment.End == new Point(nestedRailX, row1CenterY));
         Assert.Contains(mixedBranching.Segments, segment =>
-            segment.Start == new Point(26, 172) && segment.End == new Point(26, 308));
+            segment.Start == new Point(nestedRailX, row1CenterY) && segment.End == new Point(nestedRailX, row3CenterY));
         Assert.Contains(mixedBranching.Segments, segment =>
-            segment.Start == new Point(cardLeft, 76) && segment.End == new Point(railX, 76));
+            segment.Start == new Point(cardLeft, row0CenterY) && segment.End == new Point(railX, row0CenterY));
         Assert.Contains(mixedBranching.Segments, segment =>
-            segment.Start == new Point(railX, 76) && segment.End == new Point(railX, 692));
+            segment.Start == new Point(railX, row0CenterY) && segment.End == new Point(railX, row7CenterY));
         Assert.Contains(mixedBranching.Segments, segment =>
-            segment.Start == new Point(railX, 404) && segment.End == new Point(cardLeft, 404));
+            segment.Start == new Point(railX, row4CenterY) && segment.End == new Point(cardLeft, row4CenterY));
 
         var document = XDocument.Parse(LoadRepositoryFile(
             "windows-client", "src", "CodexInfo.WindowsClient", "ThreadsWindow.axaml"));
@@ -289,6 +310,10 @@ public sealed class ThreadsWindowLayoutTests
             Assert.Single(document.Descendants(
                 XName.Get("ThreadTreeControl", "using:CodexInfo.WindowsClient.Controls")))
             .Attribute("Connections")?.Value);
+        Assert.Equal("{Binding TreeRootRows}",
+            Assert.Single(document.Descendants(
+                XName.Get("ThreadTreeControl", "using:CodexInfo.WindowsClient.Controls")))
+            .Attribute("RootRows")?.Value);
 
         var linuxThreads = LoadRepositoryFile("ui", "components.slint")
             .Split("export component ThreadsWindow inherits Window {")[1]

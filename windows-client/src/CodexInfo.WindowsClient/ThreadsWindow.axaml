@@ -144,7 +144,8 @@
                                 VerticalAlignment="Top"
                                 ZIndex="1"
                                 IsHitTestVisible="False"
-                                Connections="{Binding TreeConnections}" />
+                                Connections="{Binding TreeConnections}"
+                                RootRows="{Binding TreeRootRows}" />
       </Grid>
     </ScrollViewer>
   </Grid>

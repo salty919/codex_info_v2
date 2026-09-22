@@ -505,6 +505,7 @@ public sealed class DetailsPresentationCoverageTests
 
         Assert.Equal(2, threads.Threads.Count);
         Assert.All(threads.Threads, item => Assert.InRange(item.TreeDepth, 0, 3));
+        Assert.Equal([0, 1], threads.TreeRootRows);
 
         var orphan = Assert.Single(threads.Threads, item => item.Id == "orphan");
         var root = Assert.Single(threads.Threads, item => item.Id == "root");
@@ -552,6 +553,7 @@ public sealed class DetailsPresentationCoverageTests
                 new ThreadTreeConnection(0, 3, 0),
             ],
             threads.TreeConnections);
+        Assert.Equal([0], threads.TreeRootRows);
         Assert.True(threads.TreeSurfaceHeight >= 4 * 96);
         Assert.True(threads.Threads[0].IsRootThread);
         Assert.False(threads.Threads[1].IsRootThread);
@@ -652,6 +654,7 @@ public sealed class DetailsPresentationCoverageTests
         Assert.All(threads.TreeConnections.Where(connection => connection.ParentRow is 1 or 4),
             connection => Assert.Equal(1, connection.ParentDepth));
         Assert.All(threads.TreeConnections, connection => Assert.True(connection.ChildRow > connection.ParentRow));
+        Assert.Equal([0], threads.TreeRootRows);
     }
 
     [Fact]

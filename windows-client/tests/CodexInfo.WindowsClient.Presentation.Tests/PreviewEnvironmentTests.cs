@@ -83,8 +83,10 @@ public sealed class PreviewEnvironmentTests
                 Assert.Equal(7, threads.Count);
                 Assert.Equal("tree-root", threads[0].Id);
                 Assert.Equal(2, threads.Count(thread => thread.ParentId == "tree-root"));
-                Assert.Equal(2, threads.Count(thread => thread.ParentId == "tree-child-a"));
-                Assert.Equal(2, threads.Count(thread => thread.ParentId == "tree-child-b"));
+                Assert.Equal(1, threads.Count(thread => thread.ParentId == "tree-child-a"));
+                Assert.Equal(1, threads.Count(thread => thread.ParentId == "tree-grandchild-a1"));
+                Assert.Equal(1, threads.Count(thread => thread.ParentId == "tree-child-b"));
+                Assert.Equal(1, threads.Count(thread => thread.ParentId == "tree-grandchild-b1"));
                 Assert.Contains(threads, thread => thread.ModelLabel == "ASTRA");
                 Assert.All(threads, thread => Assert.False(thread.IsOrphan));
             }

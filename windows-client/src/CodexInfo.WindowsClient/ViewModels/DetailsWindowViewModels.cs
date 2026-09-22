@@ -1704,6 +1704,8 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
 
     public IReadOnlyList<ThreadTreeConnection> TreeConnections { get; private set; } = Array.Empty<ThreadTreeConnection>();
 
+    public IReadOnlyList<int> TreeRootRows { get; private set; } = Array.Empty<int>();
+
     public int TreeSurfaceHeight => Math.Max(96, threads.Count * 96);
 
     public UiText Texts => LocalizationService.Current;
@@ -1811,10 +1813,12 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
                 resourceThreads = Array.Empty<ApiThreadDetails>();
                 threads.Clear();
                 TreeConnections = Array.Empty<ThreadTreeConnection>();
+                TreeRootRows = Array.Empty<int>();
                 hasLoadError = false;
                 Notify(nameof(HasThreads));
                 Notify(nameof(HasNoThreads));
                 Notify(nameof(TreeConnections));
+                Notify(nameof(TreeRootRows));
                 Notify(nameof(TreeSurfaceHeight));
                 Notify(nameof(HasLoadError));
                 if (resourceClient is null)
@@ -1940,6 +1944,7 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
     {
         threads.Clear();
         var connections = new List<ThreadTreeConnection>();
+        var rootRows = new List<int>();
         var source = main.IsSelectedAccountHistorical
             ? Array.Empty<ApiThreadDetails>()
             : resourceClient is not null
@@ -1958,10 +1963,15 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
                 var thread = ordered[index];
                 var parentExists = thread.ParentId is { } parentId && byId.ContainsKey(parentId);
                 var displayDepth = 0;
-                if (parentExists && thread.ParentId is { } connectionParentId && rowById.TryGetValue(connectionParentId, out var parentRow))
+                var hasValidParent = parentExists && !thread.IsOrphan;
+                if (hasValidParent && thread.ParentId is { } connectionParentId && rowById.TryGetValue(connectionParentId, out var parentRow))
                 {
                     displayDepth = Math.Min(displayDepthById.GetValueOrDefault(connectionParentId) + 1, 32);
                     connections.Add(new ThreadTreeConnection(parentRow, index, displayDepth - 1));
+                }
+                else
+                {
+                    rootRows.Add(index);
                 }
                 displayDepthById[thread.Id] = displayDepth;
                 var parentTitle = thread.ParentId is { } id && byId.TryGetValue(id, out var parent)
@@ -1973,10 +1983,12 @@ public sealed class ThreadsWindowViewModel : INotifyPropertyChanged, IDisposable
         }
 
         TreeConnections = connections.AsReadOnly();
+        TreeRootRows = rootRows.AsReadOnly();
 
         Notify(nameof(HasThreads));
         Notify(nameof(HasNoThreads));
         Notify(nameof(TreeConnections));
+        Notify(nameof(TreeRootRows));
         Notify(nameof(TreeSurfaceHeight));
     }
 
