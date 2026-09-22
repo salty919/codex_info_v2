@@ -182,7 +182,7 @@ public sealed class ThreadsWindowLayoutTests
     {
         const double treeSurfaceWidth = 860;
         const double cardLeft = 80;
-        const double railX = 24;
+        const double railX = 10;
         const double childPortY = 116;
         const double childCardY = 116;
         var direct = ThreadTreeControl.BuildGeometry(
@@ -212,12 +212,12 @@ public sealed class ThreadsWindowLayoutTests
             [new ThreadTreeConnection(0, 1, 0), new ThreadTreeConnection(1, 2, 1)]);
         Assert.Contains(nested.Segments, segment =>
             segment.Start == new Point(cardLeft, 172) &&
-            segment.End == new Point(36, 172));
+            segment.End == new Point(26, 172));
         Assert.Contains(nested.Segments, segment =>
-            segment.Start == new Point(36, 172) &&
-            segment.End == new Point(36, 212));
+            segment.Start == new Point(26, 172) &&
+            segment.End == new Point(26, 212));
         Assert.Contains(nested.Segments, segment =>
-            segment.Start == new Point(36, 212) &&
+            segment.Start == new Point(26, 212) &&
             segment.End == new Point(cardLeft, 212));
 
         var distant = ThreadTreeControl.BuildGeometry(
@@ -273,9 +273,9 @@ public sealed class ThreadsWindowLayoutTests
                 new ThreadTreeConnection(0, 7, 0),
             ]);
         Assert.Contains(mixedBranching.Segments, segment =>
-            segment.Start == new Point(cardLeft, 172) && segment.End == new Point(36, 172));
+            segment.Start == new Point(cardLeft, 172) && segment.End == new Point(26, 172));
         Assert.Contains(mixedBranching.Segments, segment =>
-            segment.Start == new Point(36, 172) && segment.End == new Point(36, 308));
+            segment.Start == new Point(26, 172) && segment.End == new Point(26, 308));
         Assert.Contains(mixedBranching.Segments, segment =>
             segment.Start == new Point(cardLeft, 76) && segment.End == new Point(railX, 76));
         Assert.Contains(mixedBranching.Segments, segment =>

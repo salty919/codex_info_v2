@@ -13,9 +13,11 @@ internal static class ThreadTreeLayout
 {
     public const double RowHeight = 96;
     public const double CardLeft = 80;
-    public const double RailBaseX = 24;
-    public const double RailStep = 12;
-    public const int MaximumDepth = 4;
+    // Keep the root rail at the outside edge of the blank gutter and move
+    // descendants inward in the same fixed columns as the reference tree.
+    public const double RailBaseX = 10;
+    public const double RailStep = 16;
+    public const int MaximumDepth = 3;
 }
 
 internal sealed record ThreadTreeGeometry(
