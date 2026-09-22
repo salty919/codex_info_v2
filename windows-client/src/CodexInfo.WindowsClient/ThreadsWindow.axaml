@@ -31,8 +31,8 @@
       <Setter Property="BorderBrush" Value="#263548" />
       <Setter Property="BorderThickness" Value="1" />
       <Setter Property="CornerRadius" Value="6" />
-      <Setter Property="Height" Value="56" />
-      <Setter Property="Padding" Value="8,4" />
+      <Setter Property="Height" Value="92" />
+      <Setter Property="Padding" Value="0" />
     </Style>
     <Style Selector="Button.window-control">
       <Setter Property="Width" Value="32" />
@@ -48,7 +48,7 @@
       <Setter Property="Foreground" Value="#F2F6FC" />
     </Style>
   </Window.Styles>
-  <Grid Margin="20" RowDefinitions="Auto,Auto,*" RowSpacing="6">
+  <Grid Margin="20" RowDefinitions="30,14,384" RowSpacing="6">
     <Grid ColumnDefinitions="*,Auto" Background="Transparent" PointerPressed="OnTitlePointerPressed">
       <StackPanel VerticalAlignment="Center"><TextBlock FontSize="22" FontWeight="SemiBold" Text="{Binding Texts.RunningThreads}" /></StackPanel>
       <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2">
@@ -58,7 +58,7 @@
     </Grid>
     <TextBlock Grid.Row="1" Classes="label" Text="{Binding DetailsStatusText}" />
     <ScrollViewer Grid.Row="2"
-                  Height="360"
+                  Height="384"
                   VerticalAlignment="Top"
                   HorizontalScrollBarVisibility="Disabled"
                   VerticalScrollBarVisibility="Auto">
@@ -67,42 +67,72 @@
         <ItemsControl IsVisible="{Binding HasThreads}" ItemsSource="{Binding Threads}">
           <ItemsControl.ItemTemplate>
             <DataTemplate x:DataType="vm:ThreadItemViewModel">
-              <Border Classes="thread-card"
-                      Margin="0,0,0,4"
-                      AutomationProperties.Name="{Binding Title}">
-                <Grid>
-                  <tree:ThreadTreeControl Width="64" HorizontalAlignment="Left" IsHitTestVisible="False"
-                    TreeDepth="{Binding TreeDepth}" ConnectedToParent="{Binding ConnectedToParent}"
-                    HasChildren="{Binding HasChildren}" HasNextSibling="{Binding HasNextSibling}"
-                    AncestorGuide1="{Binding AncestorGuide1}" AncestorGuide2="{Binding AncestorGuide2}" AncestorGuide3="{Binding AncestorGuide3}" />
-                  <Grid Margin="72,0,0,0"
-                        ColumnDefinitions="*,190,180,130"
-                        RowDefinitions="20,18"
-                        ColumnSpacing="10">
-                    <TextBlock FontSize="14"
+              <Grid Height="96">
+                <Border Classes="thread-card"
+                        Margin="0,0,0,4"
+                        AutomationProperties.Name="{Binding Title}">
+                  <Grid>
+                    <Grid Margin="72,0,0,0"
+                          ColumnDefinitions="110,242,190,180"
+                          ColumnSpacing="10">
+                    <TextBlock Grid.Column="0"
+                               Classes="label"
+                               FontWeight="SemiBold"
+                               VerticalAlignment="Center"
+                               Text="{Binding RoleStatusText}"
+                               TextWrapping="Wrap" />
+                    <TextBlock Grid.Column="1"
+                               FontSize="14"
                                FontWeight="SemiBold"
                                VerticalAlignment="Center"
                                AutomationProperties.AutomationId="{Binding Id}"
+                               AutomationProperties.Name="{Binding Title}"
                                Text="{Binding Title}"
+                               TextWrapping="Wrap"
+                               MaxLines="2"
                                TextTrimming="CharacterEllipsis"
-                               ToolTip.Tip="{Binding Id}" />
-                    <TextBlock Grid.Column="1" Classes="label" VerticalAlignment="Center" Text="{Binding ModelText}" TextTrimming="CharacterEllipsis" />
-                    <TextBlock Grid.Column="2" Classes="label" VerticalAlignment="Center" Text="{Binding ContextText}" TextTrimming="CharacterEllipsis" />
-                    <TextBlock Grid.Column="3" Classes="label" HorizontalAlignment="Right" VerticalAlignment="Center" Text="{Binding AgeText}" TextTrimming="CharacterEllipsis" />
-
-                    <TextBlock Grid.Row="1" Classes="label" VerticalAlignment="Center" Text="{Binding ParentText}" TextTrimming="CharacterEllipsis" />
-                    <Grid Grid.Row="1" Grid.Column="1"
-                          ColumnDefinitions="*,Auto"
-                          ColumnSpacing="8"
-                          VerticalAlignment="Center">
-                      <TextBlock Grid.Column="0" Classes="label" Text="{Binding RoleText}" />
-                      <TextBlock Grid.Column="1" Classes="label" Text="{Binding DepthText}" />
+                               ToolTip.Tip="{Binding Title}" />
+                    <StackPanel Grid.Column="2" Spacing="4" VerticalAlignment="Center">
+                      <TextBlock Classes="label" Text="{Binding ModelText}" TextTrimming="CharacterEllipsis" />
+                      <TextBlock Classes="label"
+                                 IsVisible="{Binding HasContextUsage}"
+                                 Text="{Binding ContextUsageText}"
+                                 TextWrapping="Wrap"
+                                 MaxLines="2" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="3" Spacing="2" VerticalAlignment="Center">
+                      <TextBlock Classes="label"
+                                 HorizontalAlignment="Right"
+                                 IsVisible="{Binding HasElapsedMinutes}"
+                                 Text="{Binding ElapsedMinutesText}"
+                                 TextTrimming="CharacterEllipsis" />
+                      <TextBlock Classes="label"
+                                 HorizontalAlignment="Right"
+                                 IsVisible="{Binding HasInstructionMinutes}"
+                                 Text="{Binding InstructionMinutesText}"
+                                 TextTrimming="CharacterEllipsis" />
+                      <TextBlock Classes="label"
+                                 HorizontalAlignment="Right"
+                                 IsVisible="{Binding HasDisplayToken}"
+                                 Text="{Binding DisplayTokenText}"
+                                 TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
                     </Grid>
-                    <TextBlock Grid.Row="1" Grid.Column="2" Classes="label" VerticalAlignment="Center" Text="{Binding TokenText}" TextTrimming="CharacterEllipsis" />
-                    <TextBlock Grid.Row="1" Grid.Column="3" Classes="label" HorizontalAlignment="Right" VerticalAlignment="Center" Text="{Binding InstructionAgeText}" TextTrimming="CharacterEllipsis" />
                   </Grid>
-                </Grid>
-              </Border>
+                </Border>
+                <tree:ThreadTreeControl Width="64"
+                                        Height="96"
+                                        HorizontalAlignment="Left"
+                                        VerticalAlignment="Top"
+                                        IsHitTestVisible="False"
+                                        TreeDepth="{Binding TreeDepth}"
+                                        ConnectedToParent="{Binding ConnectedToParent}"
+                                        HasChildren="{Binding HasChildren}"
+                                        HasNextSibling="{Binding HasNextSibling}"
+                                        AncestorGuide1="{Binding AncestorGuide1}"
+                                        AncestorGuide2="{Binding AncestorGuide2}"
+                                        AncestorGuide3="{Binding AncestorGuide3}" />
+              </Grid>
             </DataTemplate>
           </ItemsControl.ItemTemplate>
         </ItemsControl>

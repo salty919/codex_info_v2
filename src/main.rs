@@ -18487,6 +18487,57 @@ fn thread_presentation_rows(threads: &[ActiveThread]) -> Vec<ThreadPresentationR
     rows
 }
 
+const THREAD_TITLE_LINE_UNITS: usize = 32;
+const THREAD_TITLE_ELLIPSIS_UNITS: usize = 2;
+
+fn thread_title_display_units(character: char) -> usize {
+    if character.is_ascii() {
+        1
+    } else {
+        2
+    }
+}
+
+fn format_thread_title_for_display(title: &str) -> String {
+    let mut first = String::new();
+    let mut second = String::new();
+    let mut first_units = 0;
+    let mut second_units = 0;
+    let mut in_second_line = false;
+    let mut overflow = false;
+
+    for character in title.chars() {
+        let units = thread_title_display_units(character);
+        if !in_second_line && first_units + units <= THREAD_TITLE_LINE_UNITS {
+            first.push(character);
+            first_units += units;
+            continue;
+        }
+        in_second_line = true;
+        if second_units + units <= THREAD_TITLE_LINE_UNITS {
+            second.push(character);
+            second_units += units;
+        } else {
+            overflow = true;
+            break;
+        }
+    }
+
+    if second.is_empty() {
+        return first;
+    }
+    if overflow {
+        while second_units + THREAD_TITLE_ELLIPSIS_UNITS > THREAD_TITLE_LINE_UNITS {
+            let Some(character) = second.pop() else {
+                break;
+            };
+            second_units = second_units.saturating_sub(thread_title_display_units(character));
+        }
+        second.push('…');
+    }
+    format!("{first}\n{second}")
+}
+
 fn active_thread_rows_at_with_i18n(
     threads: &[ActiveThread],
     now: i64,
@@ -18496,41 +18547,18 @@ fn active_thread_rows_at_with_i18n(
         .into_iter()
         .map(|presentation| {
             let thread = &threads[presentation.index];
+            let bounded_title =
+                security::shorten_unicode(&thread.title, security::MAX_THREAD_TITLE_SCALARS);
             let relation = if thread.is_subagent {
-                let depth = if presentation.connected_to_parent {
-                    i32::try_from(presentation.forest_depth).ok()
-                } else {
-                    thread.depth.filter(|depth| *depth > 0)
-                };
-                match depth {
-                    Some(depth) if depth > 99 => format!("{} D99+", i18n.text(TextKey::SubRole)),
-                    Some(depth) => format!("{} D{depth}", i18n.text(TextKey::SubRole)),
-                    None => i18n.text(TextKey::SubRole).to_owned(),
-                }
+                i18n.text(TextKey::SubRole)
             } else {
-                i18n.text(TextKey::MainRole).to_owned()
+                i18n.text(TextKey::MainRole)
             };
-            let parent_title = thread
-                .parent_thread_id
-                .as_deref()
-                .map(|parent_id| {
-                    threads
-                        .iter()
-                        .find(|candidate| candidate.id == parent_id)
-                        .map(|parent| i18n.format_parent_title(&parent.title))
-                        .unwrap_or_else(|| i18n.text(TextKey::ParentNotRunning).to_owned())
-                })
-                .unwrap_or_default();
             ActiveThreadRow {
                 relation: relation.into(),
                 is_main: !thread.is_subagent,
-                title: security::shorten_unicode(&thread.title, security::MAX_THREAD_TITLE_SCALARS)
-                    .into(),
-                parent_title: security::shorten_unicode(
-                    &parent_title,
-                    security::MAX_THREAD_TITLE_SCALARS,
-                )
-                .into(),
+                title: format_thread_title_for_display(&bounded_title).into(),
+                full_title: thread.title.clone().into(),
                 model: security::shorten_unicode(
                     &thread.model_label,
                     security::MAX_ACCOUNT_ACTIVITY_LABEL_SCALARS,
@@ -18539,19 +18567,26 @@ fn active_thread_rows_at_with_i18n(
                 tokens: thread
                     .total_tokens
                     .map(|total| i18n.format_token_value(total))
-                    .unwrap_or_else(|| "—".to_owned())
+                    .unwrap_or_default()
                     .into(),
                 context_usage: match (thread.context_usage_tokens, thread.context_window_tokens) {
                     (Some(used), Some(window)) if window > 0 => format!(
-                        "{} / {}",
+                        "{}\n{} / {}",
                         i18n.format_context_usage(used, window),
+                        i18n.format_grouped_unsigned(u128::from(used)),
                         i18n.format_token_value(window)
                     ),
-                    _ => "—".to_owned(),
+                    _ => String::new(),
                 }
                 .into(),
-                thread_age: i18n.format_elapsed(now, thread.created_at).into(),
-                instruction_age: i18n.format_elapsed(now, thread.last_user_message_at).into(),
+                thread_age: i18n
+                    .format_elapsed_minutes(now, thread.created_at)
+                    .unwrap_or_default()
+                    .into(),
+                instruction_age: i18n
+                    .format_elapsed_minutes(now, thread.last_user_message_at)
+                    .unwrap_or_default()
+                    .into(),
                 tree_depth: i32::try_from(presentation.forest_depth).unwrap_or(i32::MAX),
                 connected_to_parent: presentation.connected_to_parent,
                 has_children: presentation.has_children,
@@ -33344,7 +33379,9 @@ mod tests {
                 id: "parent".into(),
                 created_at: Some(10),
                 updated_at: 20,
-                title: "親タイトル".into(),
+                title:
+                    "親スレッドの完全なタイトルは表示が二行を超えてもアクセシビリティへ保持される"
+                        .into(),
                 model: "model-parent".into(),
                 model_label: "model-parent".into(),
                 total_tokens: Some(u64::MAX),
@@ -33390,24 +33427,32 @@ mod tests {
         let rows = active_thread_rows_at(&threads, 20);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].relation.as_str(), "メイン");
+        assert_eq!(rows[0].full_title.as_str(), threads[0].title.as_str());
         assert_eq!(
             rows[0].tokens.as_str(),
             "18,446,744,073,709,551,615トークン"
         );
-        assert_eq!(rows[0].context_usage.as_str(), "87.1% / 258,400トークン");
-        assert_eq!(rows[1].relation.as_str(), "サブ D1");
-        assert_eq!(rows[1].context_usage.as_str(), "—");
+        assert_eq!(
+            rows[0].context_usage.as_str(),
+            "87.1%\n225,000 / 258,400トークン"
+        );
+        assert_eq!(rows[1].relation.as_str(), "サブ");
+        assert_eq!(rows[1].context_usage.as_str(), "");
         assert_eq!(rows[1].tree_depth, 1);
         assert!(rows[1].connected_to_parent);
         assert!(!rows[1].has_next_sibling);
-        assert_eq!(rows[1].parent_title.as_str(), "親: 親タイトル");
-        assert_eq!(rows[1].thread_age.as_str(), "10秒");
-        assert_eq!(rows[1].instruction_age.as_str(), "2秒");
-        assert_eq!(rows[2].relation.as_str(), "サブ D99+");
+        assert_eq!(rows[1].thread_age.as_str(), "0分");
+        assert_eq!(rows[1].instruction_age.as_str(), "0分");
+        assert_eq!(rows[2].relation.as_str(), "サブ");
         assert_eq!(rows[2].tree_depth, 0);
         assert!(!rows[2].connected_to_parent);
-        assert_eq!(rows[2].parent_title.as_str(), "親スレッドは現在非実行");
-        assert_eq!(rows[2].tokens.as_str(), "—");
+        assert_eq!(rows[2].tokens.as_str(), "");
+        assert_eq!(rows[2].thread_age.as_str(), "");
+        assert_eq!(rows[2].instruction_age.as_str(), "");
+
+        let minute_rows = active_thread_rows_at(&threads, 7_210);
+        assert_eq!(minute_rows[0].thread_age.as_str(), "120分");
+        assert_eq!(minute_rows[0].instruction_age.as_str(), "119分");
     }
 
     #[test]
@@ -33505,10 +33550,10 @@ mod tests {
             .iter()
             .map(|row| (row.title.as_str(), row))
             .collect::<BTreeMap<_, _>>();
-        assert_eq!(rows_by_title["child-new"].relation.as_str(), "サブ D1");
-        assert_eq!(rows_by_title["grand"].relation.as_str(), "サブ D2");
-        assert_eq!(rows_by_title["sibling"].relation.as_str(), "サブ D1");
-        assert_eq!(rows_by_title["orphan"].relation.as_str(), "サブ D7");
+        assert_eq!(rows_by_title["child-new"].relation.as_str(), "サブ");
+        assert_eq!(rows_by_title["grand"].relation.as_str(), "サブ");
+        assert_eq!(rows_by_title["sibling"].relation.as_str(), "サブ");
+        assert_eq!(rows_by_title["orphan"].relation.as_str(), "サブ");
         assert_eq!(rows_by_title["parentless"].relation.as_str(), "サブ");
         assert_eq!(rows_by_title["root-a"].relation.as_str(), "メイン");
     }
@@ -35130,13 +35175,15 @@ mod tests {
         for marker in [
             "width: 2px;",
             "height: root.thread-row-height;",
-            "property <length> tree-base-x: 24px;",
-            "property <length> tree-depth-step: 16px;",
-            "property <length> tree-junction-y: 36px;",
+            "property <length> tree-base-x: 8px;",
+            "property <length> tree-depth-step: 12px;",
+            "property <length> tree-junction-y: 48px;",
+            "property <length> tree-gutter-width: 64px;",
+            "property <length> tree-junction-end-x: self.tree-gutter-width - 5px;",
             "x: parent.tree-base-x + parent.tree-depth-step;",
             "x: parent.tree-base-x + 2 * parent.tree-depth-step;",
             "y: parent.tree-junction-y - 1px;",
-            "width: parent.title-x - self.x - 20px;",
+            "width: parent.tree-junction-end-x - self.x;",
             "background: DesignTokens.warning;",
             "height: root.thread-row-height - parent.tree-junction-y;",
             "border-radius: 2px;",
@@ -35171,16 +35218,17 @@ mod tests {
     fn thread_rails_keep_every_text_lane_outside_the_tree_gutter() {
         let source = include_str!("../ui/components.slint");
         for marker in [
-            "property <length> tree-base-x: 24px;",
-            "property <length> tree-depth-step: 16px;",
-            "property <length> tree-junction-y: 36px;",
-            "x: root.single-thread ? 20px : 72px;",
-            ": 172px + self.display-depth * 24px;",
-            "width: parent.title-x - self.x - 20px;",
-            "x: parent.title-x - 24px;",
-            "if !root.single-thread && row.ancestor-guide-1 : Rectangle {",
-            "if !root.single-thread && row.connected-to-parent : Rectangle {",
-            "if !root.single-thread && row.has-children : Rectangle {",
+            "property <length> tree-base-x: 8px;",
+            "property <length> tree-depth-step: 12px;",
+            "property <length> tree-junction-y: 48px;",
+            "role-lane := Rectangle {\n                    x: 72px;",
+            "property <length> tree-gutter-width: 64px;",
+            "property <length> tree-junction-end-x: self.tree-gutter-width - 5px;",
+            "width: parent.tree-junction-end-x - self.x;",
+            "x: parent.tree-junction-end-x - 3px;",
+            "if row.ancestor-guide-1 : Rectangle {",
+            "if row.connected-to-parent : Rectangle {",
+            "if row.has-children : Rectangle {",
         ] {
             assert!(
                 source.contains(marker),
@@ -47595,51 +47643,157 @@ mod tests {
             .nth(1)
             .expect("thread-list clip rectangle");
         assert!(thread_list_clip.contains("y: 76px;"));
-        assert!(thread_list_clip.contains("width: 840px;"));
+        assert!(thread_list_clip.contains("width: 860px;"));
         assert!(thread_list_clip.contains("height: 384px;"));
         assert!(thread_list_clip.contains("clip: true;"));
         assert!(thread_list_clip.contains("thread-list := ListView {"));
     }
 
     #[test]
-    fn threads_window_uses_readable_primary_metadata_layout() {
+    fn issue_362_linux_threads_window_uses_fixed_four_row_contract() {
         let threads = include_str!("../ui/components.slint")
             .split("export component ThreadsWindow inherits Window {")
             .nth(1)
             .expect("ThreadsWindow");
-        assert!(threads.contains("property <bool> single-thread: root.thread-rows.length == 1;"));
-        assert!(threads
-            .contains("property <length> thread-row-height: root.single-thread ? 384px : 128px;"));
-        assert!(threads.contains("height: root.thread-row-height;"));
-        assert!(threads.contains("font-size: root.single-thread ? 28px : 20px;"));
-        assert!(threads.contains("font-size: root.single-thread ? 22px : 18px;"));
-        assert!(threads.contains("font-size: 28px;"));
-        assert!(threads.contains("font-size: 24px;"));
-        assert!(threads.contains("font-size: 18px;"));
-        assert!(threads.contains("width: root.single-thread ? 90px : 78px;"));
-        assert!(threads.contains("width: 268px;"));
-        assert!(threads.contains("text: row.model;"));
-        assert!(threads.contains("text: root.strings.running + \" \" + row.thread-age;"));
-        assert!(threads.contains("text: root.strings.instruction + \" \" + row.instruction-age;"));
-        assert!(threads.contains("text: root.strings.running;"));
-        assert!(threads.contains("text: root.strings.instruction;"));
-        assert!(threads.contains("text: root.strings.tokens;"));
-        assert!(threads.contains("text: row.tokens;"));
-        assert!(threads.contains("text: row.context-usage;"));
-        assert!(threads.contains("text: root.strings.context-usage;"));
-        assert!(threads.contains("text: row.context-usage;"));
-        assert!(threads.contains("text: root.strings.context-usage;"));
-        assert!(threads.contains("width: parent.width - 486px;"));
-        assert!(threads.contains("property <bool> has-parent-title: row.parent-title != \"\";"));
-        assert!(threads.contains("visible: !root.single-thread || parent.has-parent-title;"));
-        assert!(threads.contains("y: parent.has-parent-title ? 132px : 84px;"));
-        assert!(!threads.contains("row.elapsed"));
-        assert!(threads.contains("x: root.single-thread ? 400px : parent.width - 560px;"));
-        assert!(threads.contains("x: parent.width - 300px;"));
+
+        for marker in [
+            "preferred-width: 900px;",
+            "preferred-height: 480px;",
+            "header-panel := Rectangle {\n        x: 20px;\n        y: 20px;\n        width: 860px;\n        height: 30px;",
+            "thread-count := Text {\n        x: 20px;\n        y: 56px;\n        width: 860px;\n        height: 14px;",
+            "thread-list-clip := Rectangle {\n        x: 20px;\n        y: 76px;\n        width: 860px;\n        height: 384px;",
+            "property <length> thread-row-height: 96px;",
+            "row-card := Rectangle {\n                    width: parent.width;\n                    height: 92px;",
+            "role-lane := Rectangle {\n                    x: 72px;\n                    width: 110px;",
+            "title-lane := Rectangle {\n                    x: 192px;\n                    width: 242px;",
+            "model-lane := Rectangle {\n                    x: 444px;\n                    width: 190px;",
+            "time-lane := Rectangle {\n                    x: 644px;\n                    width: 180px;",
+            "text: row.relation + \" · \" + root.strings.running;",
+            "text: row.model;",
+            "text: root.strings.context-usage + \" \" + row.context-usage;",
+            "text: root.strings.running + \" \" + row.thread-age;",
+            "text: root.strings.instruction + \" \" + row.instruction-age;",
+            "text: row.tokens;",
+            "visible: row.context-usage != \"\";",
+            "visible: row.thread-age != \"\";",
+            "visible: row.instruction-age != \"\";",
+            "visible: row.tokens != \"\";",
+            "property <length> tree-base-x: 8px;",
+            "property <length> tree-depth-step: 12px;",
+            "property <length> tree-junction-y: 48px;",
+            "property <length> tree-gutter-width: 64px;",
+            "property <length> tree-junction-end-x: self.tree-gutter-width - 5px;",
+            "width: parent.tree-junction-end-x - self.x;",
+            "x: parent.tree-junction-end-x - 3px;",
+            "width: 6px;",
+            "height: row.has-next-sibling ? root.thread-row-height : parent.tree-junction-y;",
+            "height: root.thread-row-height - parent.tree-junction-y;",
+        ] {
+            assert!(threads.contains(marker), "missing Linux Threads contract: {marker}");
+        }
+
+        assert_eq!(384 / 96, 4, "the viewport must contain four complete rows");
+        assert_eq!(96 - 92, 4, "each row must leave a four pixel gap");
+        assert!(!threads.contains("single-thread"));
+        assert!(!threads.contains("row.parent-title"));
+
+        let title_lane = threads
+            .split("title-lane := Rectangle {")
+            .nth(1)
+            .and_then(|source| source.split("model-lane := Rectangle {").next())
+            .expect("title lane");
+        for marker in [
+            "text: row.title;",
+            "accessible-label: row.full-title;",
+            "wrap: char-wrap;",
+            "overflow: clip;",
+        ] {
+            assert!(
+                title_lane.contains(marker),
+                "missing title contract: {marker}"
+            );
+        }
+        assert!(!title_lane.contains("wrap: word-wrap;"));
+        assert!(!title_lane.contains("overflow: elide;"));
+
+        let production = include_str!("main.rs")
+            .split_once("#[cfg(test)]\nmod tests {")
+            .map_or(include_str!("main.rs"), |(production, _)| production);
+        let projection = production
+            .split("fn active_thread_rows_at_with_i18n(")
+            .nth(1)
+            .and_then(|source| source.split("fn sync_threads_window(").next())
+            .expect("active thread presentation projection");
+        assert!(!projection.contains("D99+"));
+        assert!(!projection.contains(" D{depth}"));
+        assert!(!projection.contains("ParentNotRunning"));
+        assert!(!projection.contains("format_parent_title"));
+        assert!(!projection.contains("\"—\""));
     }
 
     #[test]
-    fn single_thread_preview_uses_the_full_detail_viewport() {
+    fn issue_362_linux_thread_title_wraps_two_cjk_lines_before_ellipsis() {
+        const TITLE_LANE_WIDTH_PX: usize = 242;
+        const CJK_GLYPH_WIDTH_PX: usize = 14;
+        const TITLE_HORIZONTAL_SAFETY_PX: usize = 18;
+        let cjk_per_line = (TITLE_LANE_WIDTH_PX - TITLE_HORIZONTAL_SAFETY_PX) / CJK_GLYPH_WIDTH_PX;
+        assert_eq!(16, cjk_per_line);
+
+        let display = |title: String| {
+            let rows = active_thread_rows_at(
+                &[ActiveThread {
+                    id: "title-fixture".into(),
+                    title: title.clone(),
+                    model: "gpt-5.6-luna".into(),
+                    model_label: "LUNA".into(),
+                    ..ActiveThread::default()
+                }],
+                0,
+            );
+            (rows[0].title.to_string(), rows[0].full_title.to_string())
+        };
+
+        let one_line = "表".repeat(cjk_per_line);
+        assert_eq!((one_line.clone(), one_line.clone()), display(one_line));
+
+        let second_line = format!("{}{}", "表".repeat(cjk_per_line), "追加題");
+        assert_eq!(
+            (
+                format!("{}\n追加題", "表".repeat(cjk_per_line)),
+                second_line.clone()
+            ),
+            display(second_line)
+        );
+
+        let two_lines = "表".repeat(cjk_per_line * 2);
+        assert_eq!(
+            (
+                format!(
+                    "{}\n{}",
+                    "表".repeat(cjk_per_line),
+                    "表".repeat(cjk_per_line)
+                ),
+                two_lines.clone(),
+            ),
+            display(two_lines)
+        );
+
+        let overflow = "表".repeat(cjk_per_line * 2 + 1);
+        assert_eq!(
+            (
+                format!(
+                    "{}\n{}…",
+                    "表".repeat(cjk_per_line),
+                    "表".repeat(cjk_per_line - 1)
+                ),
+                overflow.clone(),
+            ),
+            display(overflow)
+        );
+    }
+
+    #[test]
+    fn single_thread_preview_uses_the_same_fixed_row_contract() {
         let source = include_str!("main.rs")
             .split_once("#[cfg(test)]\nmod tests")
             .map(|(source, _)| source)
@@ -47647,6 +47801,12 @@ mod tests {
         assert!(source.contains("Some(\"multi-thread\" | \"single-thread\")"));
         let state = CodexInfoState::preview("single-thread");
         assert_eq!(state.active_threads.len(), 1);
+        let threads = include_str!("../ui/components.slint")
+            .split("export component ThreadsWindow inherits Window {")
+            .nth(1)
+            .expect("ThreadsWindow");
+        assert!(threads.contains("property <length> thread-row-height: 96px;"));
+        assert!(!threads.contains("single-thread:"));
     }
 
     #[test]
@@ -47660,13 +47820,13 @@ mod tests {
             .nth(1)
             .and_then(|source| source.split("thread-list-clip := Rectangle {").next())
             .expect("fixed header panel");
-        assert!(header.contains("x: 30px;"));
+        assert!(header.contains("x: 20px;"));
         assert!(header.contains("y: 20px;"));
-        assert!(header.contains("width: 840px;"));
-        assert!(header.contains("height: 48px;"));
+        assert!(header.contains("width: 860px;"));
+        assert!(header.contains("height: 30px;"));
         assert!(header.contains("background: DesignTokens.canvas;"));
         assert!(header.contains("font-size: 22px;"));
-        assert!(header.contains("font-size: 16px;"));
+        assert!(header.contains("font-size: 12px;"));
         assert!(header.contains("z: 2;"));
     }
 
