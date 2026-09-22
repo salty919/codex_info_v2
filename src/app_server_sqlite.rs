@@ -98,60 +98,63 @@ impl PreparedGeneration {
             .lock()
             .map_err(|_| GenerationError::new(GenerationErrorKind::Io))?;
         let cache_root = prepare_private_root(cache_root)?;
-        let _root_lock = acquire_root_lock(&cache_root)?;
-        recover_stale_generations(&cache_root)?;
+        let root_lock = acquire_root_lock(&cache_root)?;
+        let prepared = (|| {
+            recover_stale_generations(&cache_root)?;
 
-        let before = root_entry_names(&cache_root)?;
-        let generation_name = next_generation_name();
-        let generation_path = cache_root.join(&generation_name);
-        create_private_directory(&generation_path)?;
-        let (generation_directory, _) = open_generation_directory(&generation_path)?;
-        let mut generation_directory = Some(File::from(generation_directory));
+            let before = root_entry_names(&cache_root)?;
+            let generation_name = next_generation_name();
+            let generation_path = cache_root.join(&generation_name);
+            create_private_directory(&generation_path)?;
+            let (generation_directory, _) = open_generation_directory(&generation_path)?;
+            let mut generation_directory = Some(File::from(generation_directory));
 
-        let mut owned_lock = None;
-        let created = (|| {
-            let lock = create_private_file(&generation_path.join(LOCK_FILE))?;
-            rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-                .map_err(|_| GenerationError::new(GenerationErrorKind::Io))?;
-            owned_lock = Some(lock);
-            let marker = format!("{MARKER_VERSION}\n{generation_name}\n");
-            let mut marker_file = create_private_file(&generation_path.join(MARKER_FILE))?;
-            use std::io::Write;
-            marker_file
-                .write_all(marker.as_bytes())
-                .and_then(|()| marker_file.sync_all())
-                .map_err(|_| GenerationError::new(GenerationErrorKind::Io))?;
-            snapshot_state_database(codex_root, &generation_path)?;
-            validate_generation_at(
-                &generation_path,
-                generation_directory
-                    .as_ref()
-                    .expect("generation directory is retained until prepare succeeds"),
-            )?;
+            let mut owned_lock = None;
+            let created = (|| {
+                let lock = create_private_file(&generation_path.join(LOCK_FILE))?;
+                rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                    .map_err(|_| GenerationError::new(GenerationErrorKind::Io))?;
+                owned_lock = Some(lock);
+                let marker = format!("{MARKER_VERSION}\n{generation_name}\n");
+                let mut marker_file = create_private_file(&generation_path.join(MARKER_FILE))?;
+                use std::io::Write;
+                marker_file
+                    .write_all(marker.as_bytes())
+                    .and_then(|()| marker_file.sync_all())
+                    .map_err(|_| GenerationError::new(GenerationErrorKind::Io))?;
+                snapshot_state_database(codex_root, &generation_path)?;
+                validate_generation_at(
+                    &generation_path,
+                    generation_directory
+                        .as_ref()
+                        .expect("generation directory is retained until prepare succeeds"),
+                )?;
 
-            let mut expected = before;
-            expected.insert(generation_name);
-            if root_entry_names(&cache_root)? != expected {
-                return Err(GenerationError::new(GenerationErrorKind::UnsafeGeneration));
+                let mut expected = before;
+                expected.insert(generation_name);
+                if root_entry_names(&cache_root)? != expected {
+                    return Err(GenerationError::new(GenerationErrorKind::UnsafeGeneration));
+                }
+                Ok(Self {
+                    cache_root: cache_root.clone(),
+                    path: generation_path.clone(),
+                    directory: generation_directory
+                        .take()
+                        .expect("successful prepare retains the generation directory"),
+                    _lock: owned_lock
+                        .take()
+                        .expect("successful prepare retains the acquired generation lock"),
+                })
+            })();
+
+            if created.is_err() && owned_lock.is_some() {
+                if let Some(directory) = generation_directory.as_ref() {
+                    let _ = remove_generation_files(&generation_path, directory, false);
+                }
             }
-            Ok(Self {
-                cache_root: cache_root.clone(),
-                path: generation_path.clone(),
-                directory: generation_directory
-                    .take()
-                    .expect("successful prepare retains the generation directory"),
-                _lock: owned_lock
-                    .take()
-                    .expect("successful prepare retains the acquired generation lock"),
-            })
+            created
         })();
-
-        if created.is_err() && owned_lock.is_some() {
-            if let Some(directory) = generation_directory.as_ref() {
-                let _ = remove_generation_files(&generation_path, directory, false);
-            }
-        }
-        created
+        finish_root_lock(root_lock, prepared)
     }
 
     pub fn path(&self) -> &Path {
@@ -170,8 +173,9 @@ impl PreparedGeneration {
         let _serial = PREPARE_LOCK
             .lock()
             .map_err(|_| GenerationError::new(GenerationErrorKind::Io))?;
-        let _root_lock = acquire_root_lock(&self.cache_root)?;
-        remove_owned_generation(&self.path, &self.directory)
+        let root_lock = acquire_root_lock(&self.cache_root)?;
+        let removed = remove_owned_generation(&self.path, &self.directory);
+        finish_root_lock(root_lock, removed)
     }
 
     #[cfg(test)]
@@ -300,6 +304,30 @@ fn acquire_root_lock(root: &Path) -> Result<File, GenerationError> {
 #[cfg(not(unix))]
 fn acquire_root_lock(_root: &Path) -> Result<File, GenerationError> {
     Err(GenerationError::new(GenerationErrorKind::UnsafeRoot))
+}
+
+#[cfg(unix)]
+fn release_root_lock(lock: &File) -> Result<(), GenerationError> {
+    rustix::fs::flock(lock, rustix::fs::FlockOperation::Unlock)
+        .map_err(|_| GenerationError::new(GenerationErrorKind::Io))
+}
+
+#[cfg(not(unix))]
+fn release_root_lock(_lock: &File) -> Result<(), GenerationError> {
+    Err(GenerationError::new(GenerationErrorKind::UnsafeRoot))
+}
+
+fn finish_root_lock<T>(
+    lock: File,
+    operation: Result<T, GenerationError>,
+) -> Result<T, GenerationError> {
+    let released = release_root_lock(&lock);
+    drop(lock);
+    match (operation, released) {
+        (Err(error), _) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(error),
+    }
 }
 
 #[cfg(unix)]
@@ -854,7 +882,39 @@ mod tests {
 
     fn initialize_root_lock_file(root: &Path) {
         let lock = acquire_root_lock(root).unwrap();
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::Unlock).unwrap();
+        release_root_lock(&lock).unwrap();
+    }
+
+    #[test]
+    fn explicit_root_unlock_is_not_retained_by_an_inherited_child_descriptor() {
+        let fixture = Fixture::new();
+        create_private_directory(&fixture.cache).unwrap();
+        let root_lock = acquire_root_lock(&fixture.cache).unwrap();
+        let inherited = root_lock.try_clone().unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::from(inherited))
+            .spawn()
+            .unwrap();
+
+        let release_result = release_root_lock(&root_lock);
+        drop(root_lock);
+        let reacquired = acquire_root_lock(&fixture.cache);
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        release_result.unwrap();
+        assert!(
+            reacquired.is_ok(),
+            "an inherited descriptor must not retain an explicitly released root lock"
+        );
+    }
+
+    #[test]
+    fn prepare_and_cleanup_both_finish_the_root_lock_explicitly() {
+        let source = include_str!("app_server_sqlite.rs");
+        let invocation = concat!("finish_root_", "lock(root_lock, ");
+        assert_eq!(source.matches(invocation).count(), 2);
     }
 
     #[test]

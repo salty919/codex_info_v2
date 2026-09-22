@@ -19009,6 +19009,11 @@ impl CodexInfoState {
             // A closed account has no live reset countdown or low-quota
             // warning. Its quota is the value at the final observation.
             "info"
+        } else if !self.authenticated && !self.checking {
+            // AuthRequired uses the same warning surface as the Windows Main.
+            // Keep Initializing (`checking`) informational while authentication
+            // state is still being resolved.
+            "warning"
         } else if self.reset_at.is_some() && self.seconds_to_reset().abs() <= 86_400
             || (self.has_quota_percent && self.remaining_percent.unwrap_or(0.0) <= 10.0)
         {
@@ -23517,10 +23522,10 @@ mod tests {
         assert!(!header.contains("callback open-threads();"));
         assert!(
             header.find("MainAccountSelect {").unwrap()
-                < header.find("root.strings.usage-trend").unwrap()
+                < header.find("root.strings.graph").unwrap()
         );
         assert!(
-            header.find("root.strings.usage-trend").unwrap()
+            header.find("root.strings.graph").unwrap()
                 < header.find("root.strings.legal-notices").unwrap()
         );
         assert!(
@@ -23554,6 +23559,188 @@ mod tests {
             assert!(
                 app.contains(marker) || components.contains(marker),
                 "missing Linux Settings marker: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_349_linux_main_uses_fixed_windows_geometry_and_stable_rows() {
+        let app = include_str!("../ui/app.slint");
+        let components = include_str!("../ui/components.slint");
+        let theme = include_str!("../ui/theme.slint");
+
+        for marker in [
+            "preferred-width: 900px;",
+            "preferred-height: 480px;",
+            "private property <length> main-content-x: 22px;",
+            "private property <length> main-content-y: 14px;",
+            "private property <length> main-content-width: 856px;",
+            "private property <length> main-content-height: 452px;",
+            "private property <length> main-header-y: 0px;",
+            "private property <length> main-quota-y: 60px;",
+            "private property <length> main-week-y: 150px;",
+            "private property <length> main-activity-y: 236px;",
+            "private property <length> main-model-y: 300px;",
+            "private property <length> main-status-y: 410px;",
+        ] {
+            assert!(
+                app.contains(marker),
+                "missing fixed Main geometry: {marker}"
+            );
+        }
+
+        for conditional_row in [
+            "if root.has-usage : RemainingQuota",
+            "if root.has-usage && root.has-quota-percent && !root.historical-account : WeekGauge",
+            "if !root.historical-account && !root.account-view-loading : AccountActivity",
+            "if root.has-model-usage : ModelUsage",
+        ] {
+            assert!(
+                !app.contains(conditional_row),
+                "Main row still reflows when state changes: {conditional_row}"
+            );
+        }
+        for alternate_main in [
+            "if root.authenticated || root.historical-account || root.account-view-loading : Rectangle",
+            "if !root.authenticated && !root.historical-account && !root.account-view-loading : VerticalLayout",
+            "AuthPanel {",
+        ] {
+            assert!(
+                !app.contains(alternate_main),
+                "authentication still replaces the fixed six-row Main: {alternate_main}"
+            );
+        }
+        assert!(app.contains(
+            "show-content: root.authenticated && !root.historical-account && !root.account-view-loading;"
+        ));
+        assert!(app.contains(
+            "private property <bool> show-data-cards: root.authenticated || root.historical-account || root.account-view-loading;"
+        ));
+        assert_eq!(app.matches("visible: root.show-data-cards;").count(), 4);
+        assert!(app.contains("show-action: !root.authenticated || root.has-error;"));
+        assert!(app.contains("action-enabled: !root.checking;"));
+
+        let component = |start: &str, end: &str| {
+            components
+                .split(start)
+                .nth(1)
+                .and_then(|source| source.split(end).next())
+                .unwrap_or_else(|| panic!("missing component boundary: {start}"))
+        };
+        let header = component(
+            "export component Header inherits Rectangle {",
+            "export component RemainingQuota",
+        );
+        assert!(header.contains("height: 52px;"));
+        assert!(header.contains("app-mark := Rectangle {"));
+        assert!(header.contains("text: \"◈\";"));
+        assert!(header.contains("text: root.strings.product-version;"));
+        assert!(!header.contains("period-label"));
+        assert!(header.contains("width: 250px;"));
+        assert!(header.contains("height: 44px;"));
+        assert!(!header.contains("callback open-threads();"));
+        let account_select = component(
+            "export component MainAccountSelect inherits Rectangle {",
+            "export component Header inherits Rectangle {",
+        );
+        assert!(account_select.contains("text: \"●\";"));
+        assert!(account_select.contains("color: #5DC98A;"));
+
+        let sections = [
+            (
+                "export component RemainingQuota inherits Rectangle {",
+                "component DaySegment inherits Rectangle {",
+                "height: 82px;",
+            ),
+            (
+                "export component WeekGauge inherits Rectangle {",
+                "component ThreadModelStat inherits Rectangle {",
+                "height: 78px;",
+            ),
+            (
+                "export component AccountActivity inherits Rectangle {",
+                "export component LegalNoticeWindow inherits Window {",
+                "height: 56px;",
+            ),
+            (
+                "export component ModelUsage inherits Rectangle {",
+                "export component StatusBanner inherits Rectangle {",
+                "height: 102px;",
+            ),
+        ];
+        for (start, end, height) in sections {
+            let body = component(start, end);
+            assert!(body.contains(height), "wrong section height: {start}");
+            assert!(body.contains("background: DesignTokens.main-section;"));
+            assert!(body.contains("border-color: DesignTokens.main-section-border;"));
+            assert!(body.contains("border-width: 1px;"));
+            assert!(body.contains("border-radius: 8px;"));
+        }
+
+        let quota = component(
+            "export component RemainingQuota inherits Rectangle {",
+            "component DaySegment inherits Rectangle {",
+        );
+        assert!(quota.contains("width: parent.width - 28px;"));
+        assert!(quota.contains("height: 6px;"));
+
+        let week = component(
+            "export component WeekGauge inherits Rectangle {",
+            "component ThreadModelStat inherits Rectangle {",
+        );
+        assert!(
+            week.contains("height: 20px;"),
+            "Linux seven-day gauge was replaced"
+        );
+        assert!(week.contains("reset-label"));
+        assert!(week.contains("observed-label"));
+
+        let activity = component(
+            "export component AccountActivity inherits Rectangle {",
+            "export component LegalNoticeWindow inherits Window {",
+        );
+        assert!(activity.contains("width: 68px;\n        height: 30px;"));
+        assert!(
+            activity.contains("if root.show-content && root.has-active-thread : ActionButton {")
+        );
+        assert!(activity.contains("if root.show-content && !root.has-active-thread : Text {"));
+
+        let status = component(
+            "export component StatusBanner inherits Rectangle {",
+            "export component TimeZoneSettingsWindow inherits Window {",
+        );
+        assert!(status.contains("height: 42px;"));
+        assert!(status.contains("background: level == \"error\""));
+        assert!(status.contains("DesignTokens.main-status-error-background"));
+        assert!(status.contains("DesignTokens.main-status-warning-background"));
+        assert!(status.contains("DesignTokens.main-status-normal-background"));
+        assert!(status.contains("border-width: 1px;"));
+        assert!(status.contains("in property <bool> show-action: false;"));
+        assert!(status.contains("in property <string> action-text;"));
+        assert!(status.contains("in property <bool> action-enabled: true;"));
+        assert!(status.contains("visible: root.show-action;"));
+        assert!(status.contains("enabled: root.action-enabled;"));
+
+        for marker in [
+            "main-canvas: #0e141e;",
+            "main-section: #151f2d;",
+            "main-section-border: #263548;",
+            "main-heading: #e9eff8;",
+            "main-text-primary: #f2f6fc;",
+            "main-label: #a8b7ca;",
+            "main-status-normal-background: #143426;",
+            "main-status-normal-border: #276c49;",
+            "main-status-normal-accent: #4fb878;",
+            "main-status-warning-background: #3a2a13;",
+            "main-status-warning-border: #8a651f;",
+            "main-status-warning-accent: #d5a43a;",
+            "main-status-error-background: #3a1d24;",
+            "main-status-error-border: #8e3d4d;",
+            "main-status-error-accent: #e06b7a;",
+        ] {
+            assert!(
+                theme.contains(marker),
+                "missing Windows Main color: {marker}"
             );
         }
     }
@@ -34739,8 +34926,8 @@ mod tests {
             .nth(1)
             .and_then(|source| source.split("export component RemainingQuota").next())
             .expect("Header component");
-        assert!(header.contains("private property <length> action-start:"));
-        assert!(header.contains("width: root.action-start;"));
+        assert!(header.contains("private property <length> graph-x:"));
+        assert!(header.contains("width: root.graph-x;"));
         let threads = components
             .split("export component ThreadsWindow inherits Window {")
             .nth(1)
@@ -34839,8 +35026,11 @@ mod tests {
 
         let source = include_str!("../ui/components.slint");
         assert!(source.contains("product-version: string"));
-        let marker = "root.strings.usage-status + \" · \" + root.strings.product-version";
+        let marker = "text: root.strings.product-version;";
         assert_eq!(source.matches(marker).count(), 1);
+        assert!(
+            !source.contains("root.strings.usage-status + \" · \" + root.strings.product-version")
+        );
         assert!(
             !source.contains("root.strings.usage-trend + \" · \" + root.strings.product-version")
         );
@@ -35410,16 +35600,24 @@ mod tests {
         assert!(account.contains("label: \"TERRA\";"));
         assert!(account.contains("label: \"LUNA\";"));
         assert!(account.contains("label: root.strings.other;"));
-        assert!(account.contains("if root.has-active-thread : ActionButton {"));
-        assert!(account.contains("if !root.has-active-thread : Text {"));
+        assert!(account.contains("if root.show-content && root.has-active-thread : ActionButton {"));
+        assert!(account.contains("if root.show-content && !root.has-active-thread : Text {"));
         assert!(account.contains("text: root.strings.no-running-threads;"));
-        assert!(account.contains("x: parent.width - 112px;"));
-        assert!(account.contains("width: 100px;\n        height: 24px;"));
+        assert!(account.contains("x: parent.width - 80px;"));
+        assert!(account.contains("width: 68px;\n        height: 30px;"));
         let japanese = I18n::from_parts(codex_info::i18n::Language::Japanese, chrono_tz::Tz::UTC);
         assert_eq!(
             japanese.text(codex_info::i18n::TextKey::NoRunningThreads),
             "実行中のスレッドはありません"
         );
+    }
+
+    #[test]
+    fn issue_349_auth_required_uses_windows_warning_status_surface() {
+        let state = CodexInfoState::preview("auth");
+
+        assert!(!state.authenticated);
+        assert_eq!(state.status_level(), "warning");
     }
 
     #[test]
@@ -47288,19 +47486,60 @@ mod tests {
     #[test]
     fn non_graph_surfaces_do_not_add_outer_frames() {
         let source = include_str!("../ui/components.slint");
-        for name in [
-            "export component RemainingQuota inherits Rectangle {",
-            "export component WeekGauge inherits Rectangle {",
-            "export component AccountActivity inherits Rectangle {",
-            "export component ModelUsage inherits Rectangle {",
-            "export component StatusBanner inherits Rectangle {",
+        for (name, end, status) in [
+            (
+                "export component RemainingQuota inherits Rectangle {",
+                "component DaySegment inherits Rectangle {",
+                false,
+            ),
+            (
+                "export component WeekGauge inherits Rectangle {",
+                "component ThreadModelStat inherits Rectangle {",
+                false,
+            ),
+            (
+                "export component AccountActivity inherits Rectangle {",
+                "export component LegalNoticeWindow inherits Window {",
+                false,
+            ),
+            (
+                "export component ModelUsage inherits Rectangle {",
+                "export component StatusBanner inherits Rectangle {",
+                false,
+            ),
+            (
+                "export component StatusBanner inherits Rectangle {",
+                "export component TimeZoneSettingsWindow inherits Window {",
+                true,
+            ),
         ] {
-            let body = source.split(name).nth(1).expect(name);
-            let header = body.lines().take(12).collect::<Vec<_>>().join("\n");
-            assert!(
-                !header.contains("border-width: 1px;"),
-                "unexpected frame: {name}"
+            let body = source
+                .split(name)
+                .nth(1)
+                .and_then(|body| body.split(end).next())
+                .expect(name);
+            let root_style = body.split("\n\n    ").next().expect("Main card root style");
+            assert_eq!(
+                body.matches("border-width: 1px;").count(),
+                1,
+                "Main card must have exactly one root frame: {name}"
             );
+            assert!(
+                root_style.contains("border-width: 1px;"),
+                "frame must belong to the Main card root: {name}"
+            );
+            assert!(
+                root_style.contains("border-radius: 8px;"),
+                "missing radius: {name}"
+            );
+            if status {
+                assert!(root_style.contains("DesignTokens.main-status-normal-border"));
+                assert!(root_style.contains("DesignTokens.main-status-warning-border"));
+                assert!(root_style.contains("DesignTokens.main-status-error-border"));
+            } else {
+                assert!(root_style.contains("border-color: DesignTokens.main-section-border;"));
+                assert!(root_style.contains("background: DesignTokens.main-section;"));
+            }
         }
     }
 

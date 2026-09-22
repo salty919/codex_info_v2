@@ -263,19 +263,45 @@ component順や表示所有者を変更しない。
   `Header→RemainingQuota→WeekGauge→AccountActivity→ModelUsage→StatusBanner`で固定する。
   残量を最初の主値とし、状態は常時viewport内のStatusBannerだけが所有する。状態を上段の
   duplicate cardへ増やさず、StatusBannerが末尾でもBack/Close/復旧CTAを隠さない。
+- 両platformのMain clientは`900×480 logical`、外周は左右`22px`・上下`14px`、内容幅は
+  `856px`とする。6行の`y/height`はclient座標で順に`14/52`、`74/82`、`164/78`、
+  `250/56`、`314/102`、`424/42`とし、行間は全て`8px`、末尾余白は`14px`とする。
+  current/historical account、thread/model/quotaの0件・未取得、warning/error、last-good保持で
+  行またはcardを脱着・再flowせず、各固定行の内容だけを状態に応じて表示する。startup loadingは
+  Headerを同じ位置に保持し、2行目から6行目までを単一surfaceで覆う。
+  認証要求でも別のAuthPanelへ置換せず同じ6行の割当を保持する。Windowsの
+  `ShowAuthenticatedContent=false`と同様に中央4 data cardは非表示にし、認証開始・認証ページ・
+  確認中・再試行のうち該当する単一CTAだけを末尾StatusBannerに置く。認証要求の
+  StatusBannerはWindowsと同じwarning配色を使う。
+- Mainのcanvasは`#0E141E`、通常cardはbackground `#151F2D`・border `#263548`/`1px`・
+  radius `8px`とする。各Main cardのrootを唯一の外枠とし、同じcardを囲む追加wrapper frameを
+  重ねない。status cardだけはWindowsのnormal
+  `#143426/#276C49/#4FB878`、warning `#3A2A13/#8A651F/#D5A43A`、error
+  `#3A1D24/#8E3D4D/#E06B7A`（background/border/accent）を使い、状態によってcanvas全体を
+  着色しない。
+- Headerは`210px / 250px / 残幅`の3列と`10px`列間隔を使い、左列に`36×36px`のmark、
+  `22px`の利用状況title、`12px`のversionを置く。account selectorは`250×44px`とし、
+  右列に推移、法的通知、設定、最小化、閉じるを置く。期間labelをHeaderへ重複表示しない。
 - RemainingQuotaはWindowsの単一card内で主値と概算を並べ、その下のbarをcard内の利用可能幅
-  全体へ伸ばす。WeekGaugeはLinuxのlabel上段＋7区分barを使い、その下にreset時刻とWindowsの
-  観測時刻を残す。quota値、期間境界、reset/observed epochをUIで再計算しない。
+  全体（左右`14px`を除く`828px`、高さ`6px`）へ伸ばす。WeekGaugeはLinuxのlabel上段＋
+  `20px`高の7区分barを使い、その下にreset時刻とWindowsの観測時刻を残す。quota値、期間境界、
+  reset/observed epochをUIで再計算しない。
 - AccountActivityはWindowsのtotal＋model別件数構成を使う。0件ではempty表示だけを出して
-  `Details`を表示せず、1件以上でだけ`Details`を表示する。
+  `Details`を表示せず、1件以上でだけ`68×30px`の`Details`を表示する。historical accountでは
+  live件数を表示しないが、`56px`の固定card自体は保持する。
 - ModelUsageはLinuxの単一table構成を使い、各modelのInput/Cached input/Outputについてtokenと
-  隣接する概算ドルを同じrowに置く。値の意味は`MODEL-USAGE-DISPLAY-01`を変更しない。
+  隣接する概算ドルを同じrowに置く。0件でも`102px`の固定cardと見出しを保持してemptyを明示する。
+  値の意味は`MODEL-USAGE-DISPLAY-01`を変更しない。
 - StatusBannerはWindowsのstate title、detail、該当する単一CTA、最終受信表示の構成を使う。
   選択accountのID/labelをtitleまたはdetailへ重複表示しない。
-- 0%、中間、100%、未取得、警告、危険、APIエラー、認証要求で同じ構造を保つ。
+- 0%、中間、100%、未取得、警告、危険、APIエラーで同じcard構造を保つ。認証要求では同じ
+  Header・6行の割当・末尾Statusを保ち、中央4 data cardの非表示だけを切り替える。
 - エラーは既存値を保持するか未取得として明示し、0や100を仮の有効値として表示しない。
 - 数値、単位、説明、状態、操作の文字サイズと太さに役割差を付ける。細すぎるフォント、薄すぎる文字、
   余白だけで分断されたカードは採用しない。
+- `ui/components.slint`のMain component root styleを変更する場合は、同fileを`include_str!`で参照する
+  既存Rust source oracleを逆引きし、Issue固有testと実画面gateに加えてworkspace/all-targets testを
+  実行する。focused selectorまたはpixel gateだけで既存source oracleとの整合をverifiedにしない。
 
 ### 4.2 Trends / Graph（master: `CUM-138-06`）
 

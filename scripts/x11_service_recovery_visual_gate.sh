@@ -56,6 +56,10 @@ ready_threads="$temp_root/ready-threads.json"
 current_headers="$temp_root/ready-current.headers"
 threads_headers="$temp_root/ready-threads.headers"
 reference_frame="$temp_root/thread-summary-reference.xwd"
+account_frame="$temp_root/account-menu.xwd"
+idle_frame="$temp_root/idle.xwd"
+auth_frame="$temp_root/auth.xwd"
+full_frame="$temp_root/full.xwd"
 thread_reference_dir="$temp_root/thread-summary-reference"
 service_starttime=''
 recorder_starttime=''
@@ -132,12 +136,12 @@ if stride < 3:
     raise SystemExit("reference image pixel stride is invalid")
 
 components = {
-    "total": ((50, 284, 250, 308), (86, 178, 245)),
-    "sol": ((270, 286, 350, 308), (86, 178, 245)),
-    "terra": ((350, 286, 442, 308), (93, 201, 138)),
-    "luna": ((442, 286, 522, 308), (230, 162, 60)),
-    "astra": ((522, 286, 614, 308), (239, 106, 106)),
-    "other": ((614, 286, 714, 308), (120, 135, 156)),
+    "total": ((34, 268, 262, 298), (242, 246, 252)),
+    "sol": ((282, 270, 384, 298), (183, 155, 255)),
+    "terra": ((384, 270, 485, 298), (113, 211, 154)),
+    "luna": ((485, 270, 587, 298), (241, 179, 90)),
+    "astra": ((587, 270, 688, 298), (232, 110, 159)),
+    "other": ((688, 270, 790, 298), (168, 183, 202)),
 }
 
 def rgb(x, y):
@@ -184,12 +188,12 @@ if stride < 3:
     raise SystemExit("real-service image pixel stride is invalid")
 
 components = {
-    "total": ((50, 284, 250, 308), (86, 178, 245)),
-    "sol": ((270, 286, 350, 308), (86, 178, 245)),
-    "terra": ((350, 286, 442, 308), (93, 201, 138)),
-    "luna": ((442, 286, 522, 308), (230, 162, 60)),
-    "astra": ((522, 286, 614, 308), (239, 106, 106)),
-    "other": ((614, 286, 714, 308), (120, 135, 156)),
+    "total": ((34, 268, 262, 298), (242, 246, 252)),
+    "sol": ((282, 270, 384, 298), (183, 155, 255)),
+    "terra": ((384, 270, 485, 298), (113, 211, 154)),
+    "luna": ((485, 270, 587, 298), (241, 179, 90)),
+    "astra": ((587, 270, 688, 298), (232, 110, 159)),
+    "other": ((688, 270, 790, 298), (168, 183, 202)),
 }
 
 def rgb(x, y):
@@ -217,6 +221,257 @@ values = [1, 1, 0, 0, 0, 0]
 if sum(values[1:]) != values[0]:
     raise SystemExit("thread summary fixture invariant is invalid")
 print(f"x11-service-recovery-visual-gate: thread summary PASS {values}")
+PY
+}
+
+assert_fixed_main_layout() {
+    local frame_path="$1" status_kind="$2"
+    python3 - "$frame_path" "$status_kind" <<'PY'
+import pathlib
+import struct
+import sys
+from math import sqrt
+
+data = pathlib.Path(sys.argv[1]).read_bytes()
+status_kind = sys.argv[2]
+header = struct.unpack(">25I", data[:100])
+header_size, width, height, bytes_per_line, colors = (
+    header[0], header[4], header[5], header[12], header[19]
+)
+if (width, height) != (900, 480):
+    raise SystemExit(f"fixed Main size differs: {width}x{height}")
+offset = header_size + colors * 12
+stride = bytes_per_line // width
+if stride < 3:
+    raise SystemExit("fixed Main pixel stride is invalid")
+
+def rgb(x, y):
+    index = offset + y * bytes_per_line + x * stride
+    return data[index + 2], data[index + 1], data[index]
+
+def near(value, target, tolerance=18):
+    return sqrt(sum((value[index] - target[index]) ** 2 for index in range(3))) <= tolerance
+
+def require_pixel(x, y, color, label):
+    value = rgb(x, y)
+    if not near(value, color):
+        raise SystemExit(f"{label} differs at ({x},{y}): actual={value} expected={color}")
+
+canvas = (14, 20, 30)
+section = (21, 31, 45)
+section_border = (38, 53, 72)
+for x, y in ((5, 5), (450, 69), (450, 159), (450, 245), (450, 309), (450, 419), (450, 470)):
+    require_pixel(x, y, canvas, "Main canvas/gap")
+
+# AuthRequired matches the Windows fixed Grid: the four data cards are hidden,
+# while their row allocations and the final Status row stay in place.
+content_rows = (
+    ("quota", 74, 155),
+    ("week", 164, 241),
+    ("activity", 250, 305),
+    ("model", 314, 415),
+)
+if status_kind == "auth":
+    for name, top, bottom in content_rows:
+        for y in (top, (top + bottom) // 2, bottom):
+            require_pixel(450, y, canvas, f"auth {name} blank row")
+    require_pixel(22, 100, canvas, "auth left blank row")
+    require_pixel(877, 100, canvas, "auth right blank row")
+else:
+    # The four visible content cards prove the 22px side margin and exact
+    # global row boundaries. Center samples avoid every text column.
+    for name, top, bottom in content_rows:
+        require_pixel(450, top, section_border, f"{name} top border")
+        require_pixel(450, top + 1, section, f"{name} interior")
+        require_pixel(450, bottom, section_border, f"{name} bottom border")
+    require_pixel(21, 100, canvas, "left outer margin")
+    require_pixel(22, 100, section_border, "left card border")
+    require_pixel(23, 100, section, "left card interior")
+    require_pixel(876, 100, section, "right card interior")
+    require_pixel(877, 100, section_border, "right card border")
+    require_pixel(878, 100, canvas, "right outer margin")
+
+if status_kind == "normal":
+    status_background = (20, 52, 38)
+    status_border = (39, 108, 73)
+elif status_kind == "auth":
+    status_background = (58, 42, 19)
+    status_border = (138, 101, 31)
+elif status_kind == "error":
+    status_background = (58, 29, 36)
+    status_border = (142, 61, 77)
+else:
+    raise SystemExit(f"unknown fixed Main status kind: {status_kind}")
+require_pixel(450, 424, status_border, "status top border")
+require_pixel(450, 425, status_background, "status interior")
+require_pixel(450, 465, status_border, "status bottom border")
+print(f"x11-service-recovery-visual-gate: fixed layout {status_kind} PASS")
+PY
+}
+
+assert_activity_visual_state() {
+    local frame_path="$1" expected="$2"
+    python3 - "$frame_path" "$expected" <<'PY'
+import pathlib
+import struct
+import sys
+from math import sqrt
+
+data = pathlib.Path(sys.argv[1]).read_bytes()
+expected = sys.argv[2]
+header = struct.unpack(">25I", data[:100])
+offset = header[0] + header[19] * 12
+width, bytes_per_line = header[4], header[12]
+stride = bytes_per_line // width
+
+def rgb(x, y):
+    index = offset + y * bytes_per_line + x * stride
+    return data[index + 2], data[index + 1], data[index]
+
+def near(value, target, tolerance=18):
+    return sqrt(sum((value[index] - target[index]) ** 2 for index in range(3))) <= tolerance
+
+button_pixels = sum(
+    near(rgb(x, y), (41, 73, 104))
+    for y in range(263, 293)
+    for x in range(798, 866)
+)
+if expected == "active" and button_pixels < 500:
+    raise SystemExit(f"active Details button is missing: pixels={button_pixels}")
+if expected == "empty" and button_pixels > 20:
+    raise SystemExit(f"empty activity still shows Details: pixels={button_pixels}")
+if expected not in ("active", "empty"):
+    raise SystemExit(f"unknown activity state: {expected}")
+print(f"x11-service-recovery-visual-gate: activity {expected} PASS")
+PY
+}
+
+assert_account_visual_state() {
+    local closed_frame="$1" open_frame="$2"
+    python3 - "$closed_frame" "$open_frame" <<'PY'
+import pathlib
+import struct
+import sys
+from math import sqrt
+
+def image(path):
+    data = pathlib.Path(path).read_bytes()
+    header = struct.unpack(">25I", data[:100])
+    if (header[4], header[5]) != (900, 480):
+        raise SystemExit("account Main image size differs")
+    offset = header[0] + header[19] * 12
+    stride = header[12] // header[4]
+    def rgb(x, y):
+        index = offset + y * header[12] + x * stride
+        return data[index + 2], data[index + 1], data[index]
+    return rgb
+
+def near(value, target, tolerance=18):
+    return sqrt(sum((value[index] - target[index]) ** 2 for index in range(3))) <= tolerance
+
+closed = image(sys.argv[1])
+opened = image(sys.argv[2])
+green = (93, 201, 138)
+closed_green = sum(
+    near(closed(x, y), green)
+    for y in range(18, 62)
+    for x in range(242, 272)
+)
+open_green = sum(
+    near(opened(x, y), green)
+    for y in range(62, 96)
+    for x in range(242, 278)
+)
+selected = sum(
+    near(opened(x, y), (36, 77, 116))
+    for y in range(62, 96)
+    for x in range(242, 662)
+)
+if closed_green < 5:
+    raise SystemExit(f"current account marker is missing from Header: pixels={closed_green}")
+if open_green < 5 or selected < 1000:
+    raise SystemExit(
+        f"account menu/current marker is missing: green={open_green} selected={selected}"
+    )
+print("x11-service-recovery-visual-gate: account current/menu PASS")
+PY
+}
+
+assert_main_fixture_detail() {
+    local frame_path="$1" fixture_kind="$2"
+    python3 - "$frame_path" "$fixture_kind" <<'PY'
+import pathlib
+import struct
+import sys
+from math import sqrt
+
+data = pathlib.Path(sys.argv[1]).read_bytes()
+fixture_kind = sys.argv[2]
+header = struct.unpack(">25I", data[:100])
+if (header[4], header[5]) != (900, 480):
+    raise SystemExit(f"{fixture_kind} Main image size differs")
+offset = header[0] + header[19] * 12
+bytes_per_line = header[12]
+stride = bytes_per_line // header[4]
+
+def rgb(x, y):
+    index = offset + y * bytes_per_line + x * stride
+    return data[index + 2], data[index + 1], data[index]
+
+def near(value, target, tolerance=18):
+    return sqrt(sum((value[index] - target[index]) ** 2 for index in range(3))) <= tolerance
+
+if fixture_kind == "normal":
+    segment_pixel = [
+        near(rgb(x, 198), (86, 178, 245)) or near(rgb(x, 198), (50, 103, 153))
+        for x in range(34, 866)
+    ]
+    runs = []
+    start = None
+    for index, present in enumerate(segment_pixel + [False]):
+        if present and start is None:
+            start = index
+        elif not present and start is not None:
+            runs.append((start + 34, index + 34))
+            start = None
+    if len(runs) != 7 or any(right - left < 100 for left, right in runs):
+        raise SystemExit(f"Linux seven-day gauge differs: runs={runs}")
+    label = (168, 183, 202)
+    reset_pixels = sum(
+        near(rgb(x, y), label, 55)
+        for y in range(213, 233)
+        for x in range(34, 430)
+    )
+    observed_pixels = sum(
+        near(rgb(x, y), label, 55)
+        for y in range(213, 233)
+        for x in range(430, 866)
+    )
+    model_pixels = sum(
+        near(rgb(x, y), (242, 246, 252), 48)
+        for y in range(342, 410)
+        for x in range(34, 866)
+    )
+    if reset_pixels < 20 or observed_pixels < 20 or model_pixels < 50:
+        raise SystemExit(
+            "Linux week/model details are incomplete: "
+            f"reset={reset_pixels} observed={observed_pixels} model={model_pixels}"
+        )
+elif fixture_kind == "auth":
+    action_pixels = sum(
+        near(rgb(x, y), (41, 73, 104))
+        for y in range(431, 459)
+        for x in range(758, 870)
+    )
+    if action_pixels < 1000:
+        raise SystemExit(f"auth Status action is missing: pixels={action_pixels}")
+elif fixture_kind == "full":
+    bar_pixels = sum(near(rgb(x, 146), (86, 178, 245)) for x in range(36, 864))
+    if bar_pixels < 824 or not near(rgb(863, 146), (86, 178, 245)):
+        raise SystemExit(f"100% quota bar does not fill its 828px row: pixels={bar_pixels}")
+else:
+    raise SystemExit(f"unknown Main fixture detail: {fixture_kind}")
+print(f"x11-service-recovery-visual-gate: {fixture_kind} detail PASS")
 PY
 }
 
@@ -767,12 +1022,118 @@ if ((reference_ready != 1)); then
     [[ -n "$reference_error" ]] && printf '%s\n' "$reference_error" >&2
     fail 'reference thread-summary components did not render exactly'
 fi
-rm -- "$reference_frame"
+assert_fixed_main_layout "$reference_frame" normal \
+    || fail 'active preview does not use the fixed six-row Main layout'
+assert_activity_visual_state "$reference_frame" active \
+    || fail 'active preview does not show the bounded Details action'
+assert_main_fixture_detail "$reference_frame" normal \
+    || fail 'Linux seven-day/reset/observed/model details did not render'
+
+# MainAccountSelect is the Linux identity authority. Capture both its closed
+# Header marker and its open one-row menu from the same current-account
+# fixture; opening the popup must not resize or move the 900x480 Main client.
+window_action "$reference_window_id" 367 40 click
+account_ready=0
+for _ in $(seq 1 40); do
+    if xwd -silent -id "$reference_window_id" -out "$account_frame" 2>/dev/null &&
+        assert_account_visual_state "$reference_frame" "$account_frame" >/dev/null 2>&1; then
+        account_ready=1
+        break
+    fi
+    sleep 0.1
+done
+if ((account_ready != 1)); then
+    assert_account_visual_state "$reference_frame" "$account_frame" || true
+    fail 'current account marker/menu did not render at the fixed Header position'
+fi
+assert_account_visual_state "$reference_frame" "$account_frame"
+rm -- "$account_frame" "$reference_frame"
 terminate_owned "$reference_ui_pid" reference-UI "$reference_ui_starttime" "$binary" \
     || fail 'reference UI did not stop cleanly'
 reference_ui_pid=''
 reference_ui_starttime=''
 reference_window_id=''
+
+# Reuse the same candidate, display, dimensions, and fonts for the remaining
+# finite Main states: empty activity, authentication required, and a 100%
+# quota endpoint. Each state keeps the same six rows and changes content only.
+for preview_kind in idle auth full; do
+    case "$preview_kind" in
+        idle)
+            preview_frame="$idle_frame"
+            expected_layout=normal
+            expected_activity=empty
+            expected_detail=''
+            ;;
+        auth)
+            preview_frame="$auth_frame"
+            expected_layout=auth
+            expected_activity=empty
+            expected_detail=auth
+            ;;
+        full)
+            preview_frame="$full_frame"
+            expected_layout=normal
+            expected_activity=active
+            expected_detail=full
+            ;;
+    esac
+    preview_log="$temp_root/$preview_kind-ui.log"
+    env "${common_env[@]}" CODEX_INFO_UI_CLIENT_ONLY=1 CODEX_INFO_PREVIEW="$preview_kind" \
+        CODEX_INFO_PREVIEW_SIZE=900x480 "$binary" --ui --port "$port" \
+        >"$preview_log" 2>&1 &
+    reference_ui_pid="$!"
+    reference_ui_starttime="$(proc_starttime "$reference_ui_pid")"
+    [[ "$reference_ui_starttime" =~ ^[0-9]+$ ]] \
+        || fail "$preview_kind UI starttime could not be recorded"
+    preview_ready=0
+    for _ in $(seq 1 100); do
+        kill -0 "$reference_ui_pid" 2>/dev/null || {
+            sed -n '1,160p' "$preview_log" >&2 || true
+            fail "$preview_kind UI exited before rendering"
+        }
+        reference_window_id=''
+        while read -r candidate; do
+            candidate_pid="$(xprop -id "$candidate" _NET_WM_PID 2>/dev/null | awk -F'= ' '{print $2}' | tr -d '[:space:]')"
+            if [[ "$candidate_pid" == "$reference_ui_pid" ]]; then
+                reference_window_id="$candidate"
+                break
+            fi
+        done < <(xwininfo -root -tree 2>/dev/null | awk '/^ +0x[0-9a-f]+/ { print $1 }')
+        if [[ -n "$reference_window_id" ]] &&
+            xwd -silent -id "$reference_window_id" -out "$preview_frame" 2>/dev/null &&
+            assert_fixed_main_layout "$preview_frame" "$expected_layout" >/dev/null 2>&1 &&
+            assert_activity_visual_state "$preview_frame" "$expected_activity" >/dev/null 2>&1 &&
+            { [[ -z "$expected_detail" ]] ||
+                assert_main_fixture_detail "$preview_frame" "$expected_detail" >/dev/null 2>&1; }; then
+            preview_ready=1
+            break
+        fi
+        rm -f -- "$preview_frame"
+        sleep 0.1
+    done
+    if ((preview_ready != 1)); then
+        sed -n '1,160p' "$preview_log" >&2 || true
+        if [[ -f "$preview_frame" ]]; then
+            assert_fixed_main_layout "$preview_frame" "$expected_layout" || true
+            assert_activity_visual_state "$preview_frame" "$expected_activity" || true
+            [[ -z "$expected_detail" ]] \
+                || assert_main_fixture_detail "$preview_frame" "$expected_detail" || true
+        fi
+        fail "$preview_kind did not retain the fixed six-row Main layout"
+    fi
+    assert_fixed_main_layout "$preview_frame" "$expected_layout"
+    assert_activity_visual_state "$preview_frame" "$expected_activity"
+    [[ -z "$expected_detail" ]] \
+        || assert_main_fixture_detail "$preview_frame" "$expected_detail"
+    rm -- "$preview_frame"
+    terminate_owned "$reference_ui_pid" "$preview_kind-reference-UI" \
+        "$reference_ui_starttime" "$binary" \
+        || fail "$preview_kind reference UI did not stop cleanly"
+    reference_ui_pid=''
+    reference_ui_starttime=''
+    reference_window_id=''
+done
 
 env -u CODEX_INFO_PREVIEW -u CODEX_INFO_PREVIEW_SIZE "${common_env[@]}" "$binary" --ui --port "$port" \
     >"$temp_root/ui.log" 2>&1 &
@@ -799,7 +1160,10 @@ assert_threads_window_closed "$ui_pid" "$window_id"
 
 capture_state() {
     local expected="$1" baseline="${2:-}"
+    local status_kind="$expected"
+    [[ "$status_kind" == ready ]] && status_kind=normal
     xwd -silent -id "$window_id" -out "$frame" 2>/dev/null || return 1
+    assert_fixed_main_layout "$frame" "$status_kind" || return 1
     python3 - "$frame" "$expected" "$baseline" <<'PY'
 import struct
 import sys
@@ -820,12 +1184,12 @@ def near(value, target, tolerance=24):
     return sqrt(sum((value[i] - target[i]) ** 2 for i in range(3))) <= tolerance
 # Restrict danger-color detection to the fixed StatusBanner region. ASTRA uses
 # the same color in the normal model summary and must not make a ready frame fail.
-red = sum(near(rgb(x, y), (239, 106, 106)) for y in range(400, 460) for x in range(20, 880))
+red = sum(near(rgb(x, y), (224, 107, 122)) for y in range(424, 466) for x in range(22, 878))
 # The quota fill is at a fixed y on the authenticated main surface. The
 # auth panel's primary button is lower, so this rejects a false-ready
 # frame.
-blue = sum(near(rgb(x, y), (86, 178, 245), 18) for y in range(150, 170) for x in range(10, width))
-model_text = sum(near(rgb(x, y), (245, 247, 251), 48) for y in range(324, 390) for x in range(10, width))
+blue = sum(near(rgb(x, y), (86, 178, 245), 18) for y in range(140, 154) for x in range(22, 878))
+model_text = sum(near(rgb(x, y), (242, 246, 252), 48) for y in range(336, 410) for x in range(22, 878))
 if expected == "error":
     if red < 20 or blue < 500:
         raise SystemExit(f"error frame missing retained payload/status: red={red} blue={blue}")
@@ -847,7 +1211,12 @@ if baseline_path:
         return baseline[index + 2], baseline[index + 1], baseline[index]
     # Compare stable authenticated payload surfaces. The status banner is
     # intentionally excluded because its text/color changes on outage.
-    payload_rects = ((10, 66, 890, 162), (10, 254, 890, 324), (10, 324, 890, 394))
+    payload_rects = (
+        (22, 74, 878, 156),
+        (22, 164, 878, 242),
+        (22, 250, 878, 306),
+        (22, 314, 878, 416),
+    )
     changed = total = 0
     for left, top, right, bottom in payload_rects:
         for y in range(top, bottom):
@@ -866,7 +1235,10 @@ for _ in $(seq 1 60); do
     if capture_state ready >/dev/null 2>/dev/null; then ready_capture=1; break; fi
     sleep 0.25
 done
-((ready_capture == 1)) || fail 'real-service UI did not render a ready details generation'
+if ((ready_capture != 1)); then
+    capture_state ready || true
+    fail 'real-service UI did not render a ready details generation'
+fi
 cp -- "$frame" "$ready_frame"
 assert_thread_summary_components "$ready_frame" \
     || fail 'Main thread total and per-model components differ from the one-SOL wire bundle'
@@ -874,9 +1246,9 @@ assert_thread_summary_components "$ready_frame" \
 # Exercise the actual lazy boundary: the authenticated main window has already
 # rendered with period metadata, and only this user action may materialize the
 # selected history page and graph window.
-# At 900px the Main content begins at x=30, and Header graph-x=440 with
-# width=118, so x=529 targets the fixed center of the rendered Graph button.
-window_action "$window_id" 529 30 click
+# At 900px the Main content begins at x=22, and Header graph-x=548 with
+# width=70, so x=605 targets the fixed center of the rendered Graph button.
+window_action "$window_id" 605 40 click
 for _ in $(seq 1 100); do
     while read -r candidate; do
         [[ "$candidate" != "$window_id" ]] || continue

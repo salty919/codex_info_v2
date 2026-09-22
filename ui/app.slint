@@ -1,7 +1,7 @@
 // Copyright (C) 2026 salty919
 // SPDX-License-Identifier: GPL-3.0-only
 
-import { UiStrings, MainAccountOption, Header, WindowDragArea, RemainingQuota, WeekGauge, AccountActivity, ModelUsage, StatusBanner, AuthPanel, GraphWindow, ThreadsWindow, LegalNoticeWindow, TimeZoneSettingsWindow } from "components.slint";
+import { UiStrings, MainAccountOption, Header, WindowDragArea, RemainingQuota, WeekGauge, AccountActivity, ModelUsage, StatusBanner, GraphWindow, ThreadsWindow, LegalNoticeWindow, TimeZoneSettingsWindow } from "components.slint";
 import { DesignTokens } from "theme.slint";
 import "../assets/NotoSansJP.ttf";
 import "../assets/NotoSansKR.otf";
@@ -22,7 +22,7 @@ export component MainWindow inherits Window {
     no-frame: true;
     resize-border-width: 0px;
     title: root.window-title;
-    background: DesignTokens.canvas;
+    background: DesignTokens.main-canvas;
     default-font-family: root.strings.font-family;
 
     changed maximized => {
@@ -79,7 +79,19 @@ export component MainWindow inherits Window {
     in-out property <string> status-level: "info";
     in-out property <float> remaining-percent: 0;
     in-out property <float> remaining-days: 0;
-    private property <length> content-width: root.width > 800px ? DesignTokens.content-max-width : root.width - 2 * DesignTokens.outer-margin-compact;
+    // Main shares the Windows client's fixed 900x480 client geometry. State
+    // changes replace content inside these rows and never move a later row.
+    private property <length> main-content-x: 22px;
+    private property <length> main-content-y: 14px;
+    private property <length> main-content-width: 856px;
+    private property <length> main-content-height: 452px;
+    private property <length> main-header-y: 0px;
+    private property <length> main-quota-y: 60px;
+    private property <length> main-week-y: 150px;
+    private property <length> main-activity-y: 236px;
+    private property <length> main-model-y: 300px;
+    private property <length> main-status-y: 410px;
+    private property <bool> show-data-cards: root.authenticated || root.historical-account || root.account-view-loading;
     callback begin-auth();
     callback check-auth();
     callback retry();
@@ -99,24 +111,8 @@ export component MainWindow inherits Window {
         y: 0px;
         width: root.width;
         height: root.height;
-        background: DesignTokens.canvas;
+        background: DesignTokens.main-canvas;
         z: -10;
-    }
-    if root.status-level == "warning" : Rectangle {
-        x: 0px;
-        y: 0px;
-        width: root.width;
-        height: root.height;
-        background: DesignTokens.canvas-warning;
-        z: -9;
-    }
-    if root.status-level == "error" : Rectangle {
-        x: 0px;
-        y: 0px;
-        width: root.width;
-        height: root.height;
-        background: DesignTokens.canvas-error;
-        z: -9;
     }
     WindowDragArea {
         x: 0px;
@@ -128,24 +124,22 @@ export component MainWindow inherits Window {
     }
 
     Rectangle {
-        x: root.width > 800px ? (root.width - DesignTokens.content-max-width) / 2 : DesignTokens.outer-margin-compact;
-        y: DesignTokens.outer-margin-compact;
-        width: root.content-width;
-        height: root.height - self.y - DesignTokens.outer-margin-compact;
+        x: root.main-content-x;
+        y: root.main-content-y;
+        width: root.main-content-width;
+        height: root.main-content-height;
 
-        if root.authenticated || root.historical-account || root.account-view-loading : VerticalLayout {
+        Rectangle {
             x: 0px;
             y: 0px;
-            width: root.content-width;
+            width: root.main-content-width;
             height: parent.height;
-            spacing: DesignTokens.space-2;
-            alignment: start;
             Header {
+                x: 0px;
+                y: root.main-header-y;
                 strings: root.strings;
-                width: root.content-width;
-                preferred-width: root.content-width;
-                horizontal-stretch: 1;
-                period-label: root.model-usage-period;
+                width: root.main-content-width;
+                height: 52px;
                 show-graph: root.authenticated && !root.account-view-loading;
                 account-options: root.account-options;
                 selected-account-index: root.selected-account-index;
@@ -157,31 +151,42 @@ export component MainWindow inherits Window {
                 minimize-window => { root.minimize-window(); }
                 close-window => { root.close-window(); }
             }
-            if root.has-usage : RemainingQuota {
-                width: root.content-width;
-                preferred-width: root.content-width;
-                horizontal-stretch: 1;
+            RemainingQuota {
+                x: 0px;
+                y: root.main-quota-y;
+                width: root.main-content-width;
+                height: 82px;
+                visible: root.show-data-cards;
                 quota-title: root.quota-title;
                 remaining-label: root.remaining-label;
                 remaining-percent: root.remaining-percent;
-                has-quota-percent: root.has-quota-percent;
+                has-quota-percent: root.has-usage && root.has-quota-percent;
                 estimated-cost-label: root.estimated-cost-label;
             }
-            if root.has-usage && root.has-quota-percent && !root.historical-account : WeekGauge {
-                width: root.content-width;
-                preferred-width: root.content-width;
-                horizontal-stretch: 1;
+            WeekGauge {
+                x: 0px;
+                y: root.main-week-y;
+                width: root.main-content-width;
+                height: 78px;
+                visible: root.show-data-cards;
                 remaining-days: root.remaining-days;
-                remaining-label: root.week-label;
-                reset-label: root.reset-label;
-                observed-label: root.observed-label;
+                remaining-label: root.has-usage && root.has-quota-percent && !root.historical-account
+                    ? root.week-label : root.strings.no-records;
+                reset-label: root.has-usage && root.has-quota-percent && !root.historical-account
+                    ? root.reset-label : "";
+                observed-label: root.has-usage && root.has-quota-percent && !root.historical-account
+                    ? root.observed-label : "";
+                show-gauge: root.has-usage && root.has-quota-percent && !root.historical-account;
             }
-            if !root.historical-account && !root.account-view-loading : AccountActivity {
+            AccountActivity {
+                x: 0px;
+                y: root.main-activity-y;
                 strings: root.strings;
                 active-thread-count-label: root.active-thread-count-label;
-                width: root.content-width;
-                preferred-width: root.content-width;
-                horizontal-stretch: 1;
+                width: root.main-content-width;
+                height: 56px;
+                visible: root.show-data-cards;
+                show-content: root.authenticated && !root.historical-account && !root.account-view-loading;
                 has-active-thread: root.has-active-thread;
                 active-thread-count: root.active-thread-count;
                 sol-count: root.active-thread-sol-count;
@@ -191,11 +196,14 @@ export component MainWindow inherits Window {
                 other-count: root.active-thread-other-count;
                 open-threads => { root.open-threads(); }
             }
-            if root.has-model-usage : ModelUsage {
+            ModelUsage {
+                x: 0px;
+                y: root.main-model-y;
                 strings: root.strings;
-                width: root.content-width;
-                preferred-width: root.content-width;
-                horizontal-stretch: 1;
+                width: root.main-content-width;
+                height: 102px;
+                visible: root.show-data-cards;
+                has-data: root.has-model-usage;
                 model-names: root.model-usage-names;
                 input-token-rows: root.model-usage-input-tokens;
                 input-cost-rows: root.model-usage-input-costs;
@@ -205,24 +213,37 @@ export component MainWindow inherits Window {
                 output-cost-rows: root.model-usage-output-costs;
             }
             StatusBanner {
+                x: 0px;
+                y: root.main-status-y;
                 strings: root.strings;
-                width: root.content-width;
-                preferred-width: root.content-width;
-                horizontal-stretch: 1;
+                width: root.main-content-width;
+                height: 42px;
                 title: root.status-title;
                 detail: root.status;
                 last-received: root.status-last-received;
                 level: root.status-level;
-                show-retry: root.has-error;
-                retry => { root.retry(); }
+                show-action: !root.authenticated || root.has-error;
+                action-text: root.service-unavailable || (root.authenticated && root.has-error)
+                    ? root.strings.retry
+                    : root.checking
+                        ? root.strings.checking
+                        : root.has-auth-url ? root.strings.open-auth-page : root.strings.start-auth;
+                action-enabled: !root.checking;
+                action => {
+                    if (root.service-unavailable || root.authenticated) {
+                        root.retry();
+                    } else {
+                        root.begin-auth();
+                    }
+                }
             }
         }
-        if (root.authenticated || root.historical-account || root.account-view-loading) && root.startup-loading : Rectangle {
+        if root.startup-loading : Rectangle {
             x: 0px;
-            y: 48px;
+            y: root.main-quota-y;
             width: parent.width;
-            height: parent.height - 48px;
-            background: DesignTokens.canvas;
+            height: parent.height - root.main-quota-y;
+            background: DesignTokens.main-canvas;
             z: 5;
             Text {
                 x: 0px;
@@ -234,44 +255,6 @@ export component MainWindow inherits Window {
                 font-size: DesignTokens.text-body;
                 horizontal-alignment: center;
                 vertical-alignment: center;
-            }
-        }
-        if !root.authenticated && !root.historical-account && !root.account-view-loading : VerticalLayout {
-            x: 0px;
-            y: 0px;
-            width: root.content-width;
-            height: parent.height;
-            spacing: DesignTokens.space-2;
-            alignment: start;
-            Header {
-                strings: root.strings;
-                width: root.content-width;
-                preferred-width: root.content-width;
-                horizontal-stretch: 1;
-                period-label: "";
-                show-graph: false;
-                account-options: root.account-options;
-                selected-account-index: root.selected-account-index;
-                select-account(value) => { root.select-account(value); }
-                open-legal-notice => { root.open-legal-notice(); }
-                open-settings => { root.open-settings(); }
-                begin-window-drag => { root.begin-window-drag(); }
-                minimize-window => { root.minimize-window(); }
-                close-window => { root.close-window(); }
-            }
-            AuthPanel {
-                strings: root.strings;
-                width: root.content-width;
-                preferred-width: root.content-width;
-                horizontal-stretch: 1;
-                has-auth-url: root.has-auth-url;
-                checking: root.checking;
-                status: root.status;
-                has-error: root.has-error;
-                service-unavailable: root.service-unavailable;
-                begin-auth => { root.begin-auth(); }
-                check-auth => { root.check-auth(); }
-                retry => { root.retry(); }
             }
         }
     }
