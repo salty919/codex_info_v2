@@ -3323,9 +3323,9 @@ try {
         return $false
     }
     $fixtureRows = @(
-        @{ Title = 'E2E root task'; Id = 'e2e-root'; Model = 'TERRA'; Column = 'Depth 0' },
-        @{ Title = 'E2E child task'; Id = 'e2e-child'; Model = 'LUNA'; Column = 'Depth 1' },
-        @{ Title = 'E2E orphan task'; Id = 'e2e-orphan'; Model = 'SOL'; Column = 'missing-parent' }
+        @{ Title = 'E2E root task'; Id = 'e2e-root'; Model = 'TERRA' },
+        @{ Title = 'E2E child task'; Id = 'e2e-child'; Model = 'LUNA' },
+        @{ Title = 'E2E orphan task'; Id = 'e2e-orphan'; Model = 'SOL' }
     )
     if ($Fixture) {
         foreach ($row in $fixtureRows) {
@@ -3337,10 +3337,37 @@ try {
             }
             Assert-E2E ([string]$rowElement.Current.Name -eq $row.Title) "Threads row identity/title mismatch: $($row.Id)"
             Assert-E2E (@($threadTexts | Where-Object { $_ -eq $row.Model }).Count -gt 0) "Threads model column missing: $($row.Model)"
-            Assert-E2E (@($threadTexts | Where-Object { $_ -like "*$($row.Column)*" }).Count -gt 0) "Threads metadata column missing: $($row.Column)"
         }
-        Assert-E2E (@($threadTexts | Where-Object { $_ -like '*Parent: e2e-root*' }).Count -gt 0) 'Child parent column is missing.'
-        Assert-E2E (@($threadTexts | Where-Object { $_ -like '*Parent: missing-parent*' }).Count -gt 0) 'Orphan parent column is missing.'
+
+        $flattenedFixtureRows = $threadTexts -join "`n"
+        Assert-E2E ([regex]::IsMatch($flattenedFixtureRows, '(?m)^Sub\s+.\s+Active$')) `
+            'Child role and active state are missing.'
+
+        foreach ($contextCase in @(
+                @{ Id = 'e2e-root'; Percent = 'Context 5%'; Usage = '800 / 16,000 Tokens' },
+                @{ Id = 'e2e-child'; Percent = 'Context 2.5%'; Usage = '400 / 16,000 Tokens' })) {
+            Assert-E2E ($flattenedFixtureRows.IndexOf($contextCase.Percent, [StringComparison]::Ordinal) -ge 0) `
+                "Threads context percent missing: $($contextCase.Id)"
+            Assert-E2E ($flattenedFixtureRows.IndexOf($contextCase.Usage, [StringComparison]::Ordinal) -ge 0) `
+                "Threads context usage/limit missing: $($contextCase.Id)"
+        }
+        Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Context [0-9]+(?:\.[0-9]+)?%$').Count -eq 2) `
+            'Orphan row must hide missing context.'
+        Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Elapsed [0-9][0-9,]* min$').Count -eq 3) `
+            'Threads elapsed values must use minute text.'
+        Assert-E2E ([regex]::Matches($flattenedFixtureRows, '(?m)^Instruction [0-9][0-9,]* min$').Count -eq 2) `
+            'Root/child instruction values must use minute text and the orphan value must be hidden.'
+        foreach ($forbidden in @(
+                @{ Pattern = '\bDepth\s+[0-9]+\b'; Label = 'Depth <n>' },
+                @{ Pattern = '\bD[0-9]+\b'; Label = 'Dn' },
+                @{ Pattern = 'Parent:'; Label = 'Parent:' },
+                @{ Pattern = 'missing-parent'; Label = 'missing-parent' },
+                @{ Pattern = '\bUnavailable\b|\u672A\u53D6\u5F97'; Label = 'unavailable text' },
+                @{ Pattern = 'Context\s+(?:-|\u2014)'; Label = 'context placeholder' },
+                @{ Pattern = '(?:Instruction|\u6307\u793A)\s+(?:-|\u2014)'; Label = 'instruction placeholder' })) {
+            Assert-E2E (-not [regex]::IsMatch($flattenedFixtureRows, $forbidden.Pattern)) `
+                "Threads rows expose forbidden metadata: $($forbidden.Label)"
+        }
     }
     else {
         # Real data mode accepts the server's row identities, but still

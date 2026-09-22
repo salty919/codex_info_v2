@@ -196,7 +196,7 @@ export struct ActiveThreadRow {
     relation: string,
     is-main: bool,
     title: string,
-    parent-title: string,
+    full-title: string,
     model: string,
     tokens: string,
     context-usage: string,
@@ -1221,12 +1221,9 @@ export component ThreadsWindow inherits Window {
     callback begin-window-drag();
     callback minimize-window();
     callback close-window();
-    // A lone thread gets the complete detail viewport so the information is
-    // not stranded in a small strip at the top. With multiple threads, keep a
-    // Three complete cards fit in the 384px viewport. 128px is the compact
-    // multi-thread unit; the single-thread detail card remains 384px.
-    property <bool> single-thread: root.thread-rows.length == 1;
-    property <length> thread-row-height: root.single-thread ? 384px : 128px;
+    // The 384px list viewport owns four complete 96px rows. Each row contains
+    // a 92px card and a 4px gap, independent of the number of active threads.
+    property <length> thread-row-height: 96px;
 
     Rectangle {
         x: 0px;
@@ -1246,10 +1243,10 @@ export component ThreadsWindow inherits Window {
     }
 
     header-panel := Rectangle {
-        x: 30px;
+        x: 20px;
         y: 20px;
-        width: 840px;
-        height: 48px;
+        width: 860px;
+        height: 30px;
         background: DesignTokens.canvas;
         z: 2;
         WindowDragArea {
@@ -1262,8 +1259,8 @@ export component ThreadsWindow inherits Window {
         Text {
             x: 0px;
             y: 0px;
-            width: parent.width - 188px;
-            height: 48px;
+            width: parent.width - 82px;
+            height: 30px;
             text: root.strings.active-threads;
             color: DesignTokens.text-primary;
             font-size: 22px;
@@ -1271,21 +1268,9 @@ export component ThreadsWindow inherits Window {
             vertical-alignment: center;
             z: 2;
         }
-        Text {
-            x: parent.width - 180px;
-            y: 0px;
-            width: 84px;
-            height: 48px;
-            text: root.thread-count-label;
-            color: DesignTokens.text-secondary;
-            font-size: 16px;
-            horizontal-alignment: right;
-            vertical-alignment: center;
-            z: 2;
-        }
         WindowControls {
             x: parent.width - 72px;
-            y: 10px;
+            y: 1px;
             show-maximize: false;
             z: 3;
             minimize => { root.minimize-window(); }
@@ -1293,361 +1278,216 @@ export component ThreadsWindow inherits Window {
         }
     }
 
-        thread-list-clip := Rectangle {
-            x: 30px;
-            y: 76px;
-            width: 840px;
-            height: 384px;
-            clip: true;
+    thread-count := Text {
+        x: 20px;
+        y: 56px;
+        width: 860px;
+        height: 14px;
+        text: root.thread-count-label;
+        color: DesignTokens.text-secondary;
+        font-size: 12px;
+        vertical-alignment: center;
+    }
 
-            thread-list := ListView {
-                width: parent.width;
-                height: parent.height;
-                viewport-width: self.width;
+    thread-list-clip := Rectangle {
+        x: 20px;
+        y: 76px;
+        width: 860px;
+        height: 384px;
+        clip: true;
 
-                for row[index] in root.thread-rows: Rectangle {
-                    width: thread-list.visible-width;
-                    height: root.thread-row-height;
+        thread-list := ListView {
+            width: parent.width;
+            height: parent.height;
+            viewport-width: self.width;
+
+            for row[index] in root.thread-rows: Rectangle {
+                width: thread-list.visible-width;
+                height: root.thread-row-height;
+                background: DesignTokens.canvas;
+                property <int> display-depth: min(row.tree-depth, 3);
+                property <length> tree-gutter-width: 64px;
+                property <length> tree-base-x: 8px;
+                property <length> tree-depth-step: 12px;
+                property <length> tree-junction-y: 48px;
+                property <length> tree-junction-end-x: self.tree-gutter-width - 5px;
+
+                row-card := Rectangle {
+                    width: parent.width;
+                    height: 92px;
                     background: mod(index, 2) == 0 ? DesignTokens.raised : DesignTokens.canvas;
-                    // Keep the tree in a dedicated gutter.  The title starts
-                    // far enough to the right that a rail never touches a
-                    // glyph, while the fixed 20px step keeps depth 0..3
-                    // readable even when the list contains a deep forest.
-                    property <int> display-depth: min(row.tree-depth, 3);
-                    // The tree owns a dedicated left gutter. It must never
-                    // share the relation, title, or metadata text lanes.
-                    property <length> tree-base-x: 24px;
-                    property <length> tree-depth-step: 16px;
-                    property <length> tree-junction-y: 36px;
-                    property <bool> has-parent-title: row.parent-title != "";
-                    property <length> title-x: root.single-thread
-                        ? 100px
-                        : 172px + self.display-depth * 24px;
+                    border-width: 1px;
+                    border-color: DesignTokens.border-subtle;
+                    border-radius: 6px;
+                }
 
-                    Rectangle {
-                        x: 16px;
-                        y: parent.height - 1px;
-                        width: parent.width - 32px;
-                        height: 1px;
-                        background: DesignTokens.border-subtle;
-                        opacity: 0.7;
-                    }
+                // Every vertical rail owns the full 96px stride where the
+                // relationship continues. A parent's lower half and its first
+                // child's upper half therefore meet at the same row boundary.
+                if row.ancestor-guide-1 : Rectangle {
+                    x: parent.tree-base-x;
+                    y: 0px;
+                    width: 2px;
+                    height: root.thread-row-height;
+                    background: DesignTokens.warning;
+                    opacity: 0.72;
+                }
+                if row.ancestor-guide-2 : Rectangle {
+                    x: parent.tree-base-x + parent.tree-depth-step;
+                    y: 0px;
+                    width: 2px;
+                    height: root.thread-row-height;
+                    background: DesignTokens.warning;
+                    opacity: 0.72;
+                }
+                if row.ancestor-guide-3 : Rectangle {
+                    x: parent.tree-base-x + 2 * parent.tree-depth-step;
+                    y: 0px;
+                    width: 2px;
+                    height: root.thread-row-height;
+                    background: DesignTokens.warning;
+                    opacity: 0.72;
+                }
+                if row.connected-to-parent : Rectangle {
+                    x: parent.tree-base-x + (parent.display-depth - 1) * parent.tree-depth-step;
+                    y: 0px;
+                    width: 2px;
+                    height: row.has-next-sibling ? root.thread-row-height : parent.tree-junction-y;
+                    background: DesignTokens.warning;
+                    opacity: 0.72;
+                }
+                if row.connected-to-parent : Rectangle {
+                    x: parent.tree-base-x + (parent.display-depth - 1) * parent.tree-depth-step;
+                    y: parent.tree-junction-y - 1px;
+                    width: parent.tree-junction-end-x - self.x;
+                    height: 2px;
+                    background: DesignTokens.warning;
+                    opacity: 0.72;
+                }
+                if row.connected-to-parent : Rectangle {
+                    x: parent.tree-junction-end-x - 3px;
+                    y: parent.tree-junction-y - 3px;
+                    width: 6px;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: DesignTokens.warning;
+                    opacity: 0.82;
+                }
+                if row.has-children : Rectangle {
+                    x: parent.tree-base-x + min(parent.display-depth, 3) * parent.tree-depth-step;
+                    y: parent.tree-junction-y;
+                    width: 2px;
+                    height: root.thread-row-height - parent.tree-junction-y;
+                    background: DesignTokens.warning;
+                    opacity: 0.72;
+                }
 
+                role-lane := Rectangle {
+                    x: 72px;
+                    width: 110px;
+                    height: 92px;
                     Text {
-                        x: root.single-thread ? 20px : 72px;
-                        y: root.single-thread ? 24px : 8px;
-                        width: root.single-thread ? 90px : 78px;
-                        height: root.single-thread ? 34px : 24px;
-                        text: row.relation;
+                        width: parent.width;
+                        height: parent.height;
+                        text: row.relation + " · " + root.strings.running;
                         color: row.is-main ? DesignTokens.accent-primary : DesignTokens.warning;
-                        font-size: root.single-thread ? 18px : 16px;
+                        font-size: 14px;
                         font-weight: 700;
                         vertical-alignment: center;
+                        wrap: word-wrap;
                     }
-
-                    // Parent/child rails are geometric primitives rather than a
-                    // glyph.  The vertical rail from a parent ends at the same
-                    // 28px title-center junction as the child branch; a rail
-                    // continues through the row only when another sibling still
-                    // needs the path.  This makes depth, sibling order, and
-                    // orphan roots unambiguous without drawing lines through
-                    // the relation labels or titles.
-                    if !root.single-thread && row.ancestor-guide-1 : Rectangle {
-                        x: parent.tree-base-x;
-                        y: 0px;
-                        width: 2px;
-                        height: root.thread-row-height;
-                        background: DesignTokens.warning;
-                        opacity: 0.72;
-                    }
-                    if !root.single-thread && row.ancestor-guide-2 : Rectangle {
-                        x: parent.tree-base-x + parent.tree-depth-step;
-                        y: 0px;
-                        width: 2px;
-                        height: root.thread-row-height;
-                        background: DesignTokens.warning;
-                        opacity: 0.72;
-                    }
-                    if !root.single-thread && row.ancestor-guide-3 : Rectangle {
-                        x: parent.tree-base-x + 2 * parent.tree-depth-step;
-                        y: 0px;
-                        width: 2px;
-                        height: root.thread-row-height;
-                        background: DesignTokens.warning;
-                        opacity: 0.72;
-                    }
-                    if !root.single-thread && row.connected-to-parent : Rectangle {
-                        x: parent.tree-base-x + (parent.display-depth - 1) * parent.tree-depth-step;
-                        y: 0px;
-                        width: 2px;
-                        height: row.has-next-sibling ? root.thread-row-height : parent.tree-junction-y;
-                        background: DesignTokens.warning;
-                        opacity: 0.72;
-                    }
-                    if !root.single-thread && row.connected-to-parent : Rectangle {
-                        x: parent.tree-base-x + (parent.display-depth - 1) * parent.tree-depth-step;
-                        y: parent.tree-junction-y - 1px;
-                        width: parent.title-x - self.x - 20px;
-                        height: 2px;
-                        background: DesignTokens.warning;
-                        opacity: 0.72;
-                    }
-                    if !root.single-thread && row.connected-to-parent : Rectangle {
-                        x: parent.title-x - 24px;
-                        y: parent.tree-junction-y - 2px;
-                        width: 4px;
-                        height: 4px;
-                        border-radius: 2px;
-                        background: DesignTokens.warning;
-                        opacity: 0.82;
-                    }
-                    if !root.single-thread && row.has-children : Rectangle {
-                        x: parent.tree-base-x + min(parent.display-depth, 2) * parent.tree-depth-step;
-                        y: parent.tree-junction-y;
-                        width: 2px;
-                        height: root.thread-row-height - parent.tree-junction-y;
-                        background: DesignTokens.warning;
-                        opacity: 0.72;
-                    }
+                }
+                title-lane := Rectangle {
+                    x: 192px;
+                    width: 242px;
+                    height: 92px;
                     Text {
-                        x: parent.title-x;
-                        y: root.single-thread ? 24px : 10px;
-                        width: parent.width - parent.title-x - 284px;
-                        height: root.single-thread ? 48px : 34px;
+                        y: 26px;
+                        width: parent.width;
+                        height: 40px;
                         text: row.title;
+                        accessible-role: text;
+                        accessible-label: row.full-title;
                         color: DesignTokens.text-primary;
-                        font-size: root.single-thread ? 28px : 20px;
+                        font-size: 14px;
                         font-weight: 700;
                         vertical-alignment: center;
-                        overflow: elide;
+                        wrap: char-wrap;
+                        overflow: clip;
                     }
+                }
+                model-lane := Rectangle {
+                    x: 444px;
+                    width: 190px;
+                    height: 92px;
                     Text {
-                        x: parent.width - 284px;
-                        y: root.single-thread ? 24px : 10px;
-                        width: 268px;
-                        height: root.single-thread ? 48px : 34px;
+                        y: 21px;
+                        width: parent.width;
+                        height: 20px;
                         text: row.model;
                         color: DesignTokens.text-secondary;
-                        font-size: root.single-thread ? 22px : 18px;
+                        font-size: 13px;
                         font-weight: 600;
-                        horizontal-alignment: right;
-                        vertical-alignment: center;
-                    }
-                    Text {
-                        x: parent.title-x;
-                        y: root.single-thread ? 84px : 48px;
-                        width: root.single-thread
-                            ? parent.width - parent.title-x - 16px
-                            : parent.width - parent.title-x - 300px;
-                        height: root.single-thread ? 30px : 24px;
-                        text: row.parent-title;
-                        color: DesignTokens.text-muted;
-                        font-size: root.single-thread ? 16px : 15px;
-                        visible: !root.single-thread || parent.has-parent-title;
                         vertical-alignment: center;
                         overflow: elide;
                     }
                     Text {
-                        x: parent.width - 284px;
-                        y: 45px;
-                        width: 268px;
-                        height: 17px;
-                        text: root.strings.context-usage;
+                        y: 47px;
+                        width: parent.width;
+                        height: 26px;
+                        text: root.strings.context-usage + " " + row.context-usage;
                         color: DesignTokens.text-secondary;
-                        font-size: 14px;
-                        font-weight: 600;
-                        horizontal-alignment: right;
+                        font-size: 12px;
                         vertical-alignment: center;
-                        visible: !root.single-thread;
+                        wrap: word-wrap;
+                        visible: row.context-usage != "";
                     }
+                }
+                time-lane := Rectangle {
+                    x: 644px;
+                    width: 180px;
+                    height: 92px;
                     Text {
-                        x: parent.width - 284px;
-                        y: 62px;
-                        width: 268px;
+                        y: 16px;
+                        width: parent.width;
                         height: 18px;
-                        text: row.context-usage;
-                        color: DesignTokens.text-secondary;
-                        font-size: 14px;
-                        font-weight: 600;
-                        horizontal-alignment: right;
-                        vertical-alignment: center;
-                        visible: !root.single-thread;
-                    }
-                    Rectangle {
-                        x: root.single-thread ? 400px : parent.width - 560px;
-                        y: root.single-thread
-                            ? (parent.has-parent-title ? 148px : 100px)
-                            : 80px;
-                        width: 1px;
-                        height: root.single-thread
-                            ? (parent.has-parent-title ? 90px : 138px)
-                            : 36px;
-                        background: DesignTokens.border-subtle;
-                    }
-                    Rectangle {
-                        x: parent.width - 300px;
-                        y: 80px;
-                        width: 1px;
-                        height: 36px;
-                        background: DesignTokens.border-subtle;
-                        visible: !root.single-thread;
-                    }
-                    Text {
-                        // Keep the metadata columns aligned across the tree;
-                        // indentation belongs to the title, not to the facts.
-                        x: 100px;
-                        y: 84px;
-                        width: 160px;
-                        height: 28px;
                         text: root.strings.running + " " + row.thread-age;
                         color: DesignTokens.text-secondary;
-                        font-size: 18px;
-                        font-weight: 600;
-                        visible: !root.single-thread;
+                        font-size: 12px;
+                        horizontal-alignment: right;
                         vertical-alignment: center;
+                        overflow: elide;
+                        visible: row.thread-age != "";
                     }
                     Text {
-                        x: parent.width - 540px;
-                        y: 84px;
-                        width: 220px;
-                        height: 28px;
+                        y: 38px;
+                        width: parent.width;
+                        height: 18px;
                         text: root.strings.instruction + " " + row.instruction-age;
                         color: DesignTokens.text-secondary;
-                        font-size: 18px;
-                        font-weight: 600;
-                        visible: !root.single-thread;
+                        font-size: 12px;
+                        horizontal-alignment: right;
                         vertical-alignment: center;
+                        overflow: elide;
+                        visible: row.instruction-age != "";
                     }
                     Text {
-                        x: parent.width - 284px;
-                        y: 84px;
-                        width: 268px;
-                        height: 28px;
+                        y: 60px;
+                        width: parent.width;
+                        height: 18px;
                         text: row.tokens;
                         color: DesignTokens.text-primary;
-                        font-size: 18px;
+                        font-size: 12px;
                         font-weight: 600;
-                        visible: !root.single-thread;
                         horizontal-alignment: right;
                         vertical-alignment: center;
-                    }
-                    if root.single-thread : Rectangle {
-                        x: 16px;
-                        y: parent.has-parent-title ? 132px : 84px;
-                        width: parent.width - 32px;
-                        height: 1px;
-                        background: DesignTokens.border-subtle;
-                        opacity: 0.8;
-                    }
-                    if root.single-thread : Text {
-                        x: 100px;
-                        y: parent.has-parent-title ? 148px : 100px;
-                        width: 280px;
-                        height: 24px;
-                        text: root.strings.running;
-                        color: DesignTokens.text-muted;
-                        font-size: 16px;
-                        font-weight: 700;
-                        vertical-alignment: center;
-                    }
-                    if root.single-thread : Text {
-                        x: 440px;
-                        y: parent.has-parent-title ? 148px : 100px;
-                        width: 300px;
-                        height: 24px;
-                        text: root.strings.instruction;
-                        color: DesignTokens.text-muted;
-                        font-size: 16px;
-                        font-weight: 700;
-                        vertical-alignment: center;
-                    }
-                    if root.single-thread : Text {
-                        x: 100px;
-                        y: parent.has-parent-title ? 174px : 126px;
-                        width: 280px;
-                        height: parent.has-parent-title ? 52px : 76px;
-                        text: row.thread-age;
-                        color: DesignTokens.text-primary;
-                        font-size: 28px;
-                        font-weight: 700;
-                        vertical-alignment: center;
-                    }
-                    if root.single-thread : Text {
-                        x: 440px;
-                        y: parent.has-parent-title ? 174px : 126px;
-                        width: 300px;
-                        height: parent.has-parent-title ? 52px : 76px;
-                        text: row.instruction-age;
-                        color: DesignTokens.text-primary;
-                        font-size: 28px;
-                        font-weight: 700;
-                        vertical-alignment: center;
-                    }
-                    if root.single-thread : Rectangle {
-                        x: 16px;
-                        y: parent.has-parent-title ? 250px : 226px;
-                        width: parent.width - 32px;
-                        height: 1px;
-                        background: DesignTokens.border-subtle;
-                        opacity: 0.8;
-                    }
-                    if root.single-thread : Text {
-                        x: 100px;
-                        y: parent.has-parent-title ? 266px : 242px;
-                        width: 320px;
-                        height: 24px;
-                        text: root.strings.context-usage;
-                        color: DesignTokens.text-muted;
-                        font-size: 16px;
-                        font-weight: 700;
-                        vertical-alignment: center;
-                    }
-                    if root.single-thread : Text {
-                        x: 100px;
-                        y: parent.has-parent-title ? 292px : 268px;
-                        width: 320px;
-                        height: parent.has-parent-title ? 52px : 76px;
-                        text: row.context-usage;
-                        color: DesignTokens.text-primary;
-                        font-size: 24px;
-                        font-weight: 700;
-                        horizontal-alignment: left;
-                        vertical-alignment: center;
-                    }
-                    if root.single-thread : Rectangle {
-                        x: 440px;
-                        y: parent.has-parent-title ? 260px : 236px;
-                        width: 1px;
-                        height: parent.has-parent-title ? 94px : 108px;
-                        background: DesignTokens.border-subtle;
-                    }
-                    if root.single-thread : Text {
-                        x: 470px;
-                        y: parent.has-parent-title ? 292px : 268px;
-                        width: parent.width - 486px;
-                        height: parent.has-parent-title ? 52px : 76px;
-                        text: row.tokens;
-                        color: DesignTokens.text-primary;
-                        font-size: 24px;
-                        font-weight: 700;
-                        horizontal-alignment: right;
-                        vertical-alignment: center;
-                    }
-                    if root.single-thread : Text {
-                        x: 470px;
-                        y: parent.has-parent-title ? 266px : 242px;
-                        width: parent.width - 486px;
-                        height: 24px;
-                        text: root.strings.tokens;
-                        color: DesignTokens.text-muted;
-                        font-size: 16px;
-                        font-weight: 700;
-                        horizontal-alignment: right;
-                        vertical-alignment: center;
+                        overflow: elide;
+                        visible: row.tokens != "";
                     }
                 }
             }
         }
+    }
 }
 
 export component ModelUsage inherits Rectangle {

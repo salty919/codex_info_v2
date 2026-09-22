@@ -624,6 +624,13 @@ impl I18n {
         self.unit_text(amount, unit)
     }
 
+    pub fn format_elapsed_minutes(&self, now: i64, timestamp: Option<i64>) -> Option<String> {
+        let timestamp = timestamp?;
+        DateTime::<Utc>::from_timestamp(timestamp, 0)?;
+        let minutes = now.saturating_sub(timestamp).max(0) / 60;
+        Some(self.unit_text(minutes, Unit::Minute))
+    }
+
     pub fn format_period_remaining(&self, seconds: i64, kind: PeriodKind) -> String {
         let seconds = seconds.max(0);
         if seconds < 60 {

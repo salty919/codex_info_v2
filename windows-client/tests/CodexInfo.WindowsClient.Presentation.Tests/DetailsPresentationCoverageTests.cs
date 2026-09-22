@@ -448,7 +448,7 @@ public sealed class DetailsPresentationCoverageTests
     }
 
     [Fact]
-    public void ThreadsWindow_ViewportShowsSixCardsAndScrollsOnlyTheList()
+    public void ThreadsWindow_ViewportShowsFour96PixelRowsAndScrollsOnlyTheList()
     {
         var source = LoadRepositoryFile("windows-client", "src", "CodexInfo.WindowsClient", "ThreadsWindow.axaml");
         var document = XDocument.Parse(source);
@@ -467,11 +467,11 @@ public sealed class DetailsPresentationCoverageTests
             .Single(element => element.Name.LocalName == "Style" && element.Attribute("Selector")?.Value == "Border.thread-card");
         var cardHeightSetter = cardStyle.Descendants()
             .Single(element => element.Name.LocalName == "Setter" && element.Attribute("Property")?.Value == "Height");
-        Assert.Equal("56", cardHeightSetter.Attribute("Value")?.Value);
+        Assert.Equal("92", cardHeightSetter.Attribute("Value")?.Value);
 
-        const int cardHeight = 56;
+        const int cardHeight = 92;
         const int cardGap = 4;
-        const int visibleCardCount = 6;
+        const int visibleCardCount = 4;
         const int viewportHeight = cardHeight * visibleCardCount + cardGap * visibleCardCount;
 
         var listScrollViewer = Assert.Single(document.Descendants(), element => element.Name.LocalName == "ScrollViewer");
