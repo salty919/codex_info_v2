@@ -69,10 +69,10 @@
             <DataTemplate x:DataType="vm:ThreadItemViewModel">
               <Grid Height="96">
                 <Border Classes="thread-card"
-                        Margin="0,0,0,4"
+                        Margin="72,0,0,4"
                         AutomationProperties.Name="{Binding Title}">
                   <Grid>
-                    <Grid Margin="72,0,0,0"
+                    <Grid Margin="0"
                           ColumnDefinitions="110,242,190,180"
                           ColumnSpacing="10">
                     <TextBlock Grid.Column="0"
@@ -91,6 +91,7 @@
                                TextWrapping="Wrap"
                                MaxLines="2"
                                TextTrimming="CharacterEllipsis"
+                               AutomationProperties.HelpText="{Binding Title}"
                                ToolTip.Tip="{Binding Title}" />
                     <StackPanel Grid.Column="2" Spacing="4" VerticalAlignment="Center">
                       <TextBlock Classes="label" Text="{Binding ModelText}" TextTrimming="CharacterEllipsis" />
@@ -98,7 +99,9 @@
                                  IsVisible="{Binding HasContextUsage}"
                                  Text="{Binding ContextUsageText}"
                                  TextWrapping="Wrap"
-                                 MaxLines="2" />
+                                 MaxLines="2"
+                                 AutomationProperties.Name="{Binding ContextUsageText}"
+                                 ToolTip.Tip="{Binding ContextUsageText}" />
                     </StackPanel>
                     <StackPanel Grid.Column="3" Spacing="2" VerticalAlignment="Center">
                       <TextBlock Classes="label"

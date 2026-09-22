@@ -487,7 +487,7 @@ public sealed class DetailsPresentationCoverageTests
 
         var card = document.Descendants()
             .Single(element => element.Name.LocalName == "Border" && element.Attribute("Classes")?.Value == "thread-card");
-        Assert.Equal("0,0,0,4", card.Attribute("Margin")?.Value);
+        Assert.Equal("72,0,0,4", card.Attribute("Margin")?.Value);
     }
 
     [Fact]

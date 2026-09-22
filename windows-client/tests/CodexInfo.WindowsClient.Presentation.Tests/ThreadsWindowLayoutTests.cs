@@ -65,6 +65,7 @@ public sealed class ThreadsWindowLayoutTests
         Assert.Equal(expectedRowHeight, cardHeight + cardGap);
         Assert.Equal(expectedVisibleRows, viewportHeight / (cardHeight + cardGap));
         Assert.Equal("0", StyleSetter(cardStyle, "Padding"));
+        Assert.Equal($"{expectedGutterWidth},0,0,4", card.Attribute("Margin")?.Value);
 
         var row = Assert.Single(card.Descendants(Avalonia + "Grid"),
             element => element.Attribute("ColumnDefinitions") is not null);
@@ -75,7 +76,7 @@ public sealed class ThreadsWindowLayoutTests
         Assert.Equal(
             [expectedRoleWidth, expectedTitleWidth, expectedModelWidth, expectedTimeWidth],
             laneWidths);
-        Assert.Equal($"{expectedGutterWidth},0,0,0", row.Attribute("Margin")?.Value);
+        Assert.Equal("0", row.Attribute("Margin")?.Value);
         Assert.Equal(expectedColumnGap.ToString(), row.Attribute("ColumnSpacing")?.Value);
         var treeControl = Assert.Single(document.Descendants(
             XName.Get("ThreadTreeControl", "using:CodexInfo.WindowsClient.Controls")));
@@ -87,6 +88,8 @@ public sealed class ThreadsWindowLayoutTests
         Assert.Equal("2", title.Attribute("MaxLines")?.Value);
         Assert.Equal("CharacterEllipsis", title.Attribute("TextTrimming")?.Value);
         Assert.Equal("{Binding Title}", title.Attribute("AutomationProperties.Name")?.Value);
+        Assert.Equal("{Binding Title}", title.Attribute("AutomationProperties.HelpText")?.Value);
+        Assert.Equal("{Binding Title}", title.Attribute("ToolTip.Tip")?.Value);
         Assert.Equal("{Binding Title}", card.Attribute("AutomationProperties.Name")?.Value);
 
         var role = BoundText(row, "{Binding RoleStatusText}");
@@ -99,6 +102,8 @@ public sealed class ThreadsWindowLayoutTests
         Assert.Equal("Wrap", context.Attribute("TextWrapping")?.Value);
         Assert.Equal("2", context.Attribute("MaxLines")?.Value);
         Assert.Null(context.Attribute("TextTrimming"));
+        Assert.Equal("{Binding ContextUsageText}", context.Attribute("AutomationProperties.Name")?.Value);
+        Assert.Equal("{Binding ContextUsageText}", context.Attribute("ToolTip.Tip")?.Value);
         var elapsed = BoundText(row, "{Binding ElapsedMinutesText}");
         Assert.Equal("3", elapsed.Parent?.Attribute("Grid.Column")?.Value);
         Assert.Equal("{Binding HasElapsedMinutes}", elapsed.Attribute("IsVisible")?.Value);
